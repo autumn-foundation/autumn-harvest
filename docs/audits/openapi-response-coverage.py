@@ -293,6 +293,179 @@ def overridden_by_with_status(body: str, call_open_paren: int) -> bool:
     return after.lstrip().startswith(".with_status(")
 
 
+# The OpenAPI type of each Rust scalar a query struct uses. An unlisted type is
+# reported, not guessed at.
+WIRE_TYPES = {
+    "String": "string",
+    "Uuid": "string",
+    "uuid::Uuid": "string",
+    "bool": "boolean",
+    "f32": "number",
+    "f64": "number",
+    **{
+        kind: "integer"
+        for kind in (
+            "i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize".split()
+        )
+    },
+}
+
+# A parameter that carries the raw request body.
+BYTE_PARAMETER = re.compile(
+    r"\b([a-z_][a-z_0-9]*)\s*:\s*&?\s*(?:(?:axum::body::)?Bytes\b|\[u8\])"
+)
+
+# A body parse, with an optional turbofish type and the variable it reads.
+FROM_SLICE = re.compile(
+    r"serde_json::from_slice(?:::<\s*([A-Za-z0-9_:]+)\s*>)?\s*\(\s*&?\s*([a-z_][a-z_0-9]*)\s*\)"
+)
+
+
+def function_parts(source: str, name: str) -> tuple[str, str, str] | None:
+    """The parameter list, return clause and block of a free function."""
+    found = re.search(r"\b(?:async )?fn %s\s*[(<]" % re.escape(name), source)
+    if found is None:
+        return None
+    opener = source.find("(", found.start())
+    params = balanced(source[opener:])
+    brace = source.find("{", opener + len(params))
+    if brace < 0:
+        return None
+    returns = source[opener + len(params) : brace]
+    return params, returns, balanced(source[brace:], "{", "}")
+
+
+def byte_parameters(params: str) -> set[str]:
+    """Names of the parameters that carry the raw request body."""
+    return set(BYTE_PARAMETER.findall(params))
+
+
+def raw_body_parses(source: str, handler: str) -> list[tuple[str | None, bool]]:
+    """`(type, guarded)` for each raw-body parse in a handler and its helpers.
+
+    The type comes from a turbofish, then from a `let` binding in the same
+    statement, then from a `Result<T, _>` return type. It is `None` when none
+    of those names it. A parse is guarded when an `.is_empty()` test on the
+    same variable comes before it, since the handler then runs without a body.
+    """
+    handler_parts = function_parts(source, handler)
+    if handler_parts is None:
+        return []
+    names = [handler] + called_helpers(source, handler_parts[2])
+    parses: list[tuple[str | None, bool]] = []
+    for name in names:
+        parts = function_parts(source, name)
+        if parts is None:
+            continue
+        params, returns, block = parts
+        carriers = byte_parameters(params)
+        for hit in FROM_SLICE.finditer(block):
+            variable = hit.group(2)
+            if variable not in carriers:
+                continue
+            before = block[: hit.start()]
+            parses.append(
+                (
+                    parse_type(hit.group(1), before, returns),
+                    re.search(r"\b%s\.is_empty\(\)" % re.escape(variable), before) is not None,
+                )
+            )
+    return parses
+
+
+def parse_type(turbofish: str | None, before: str, returns: str) -> str | None:
+    """The struct a `from_slice` call yields, or `None` when it is unnamed."""
+    if turbofish:
+        return turbofish.split("::")[-1]
+    statement = before[before.rfind(";") + 1 :]
+    binding = re.search(r"\blet\s+(?:mut\s+)?[a-z_0-9]+\s*:\s*([A-Za-z0-9_:]+)\s*=", statement)
+    if binding:
+        return binding.group(1).split("::")[-1]
+    result = re.search(r"->\s*Result<\s*([A-Za-z0-9_:]+)\s*,", returns)
+    return result.group(1).split("::")[-1] if result else None
+
+
+def struct_fields(struct: str) -> list[tuple[str, str, bool]]:
+    """`(name, type, mandatory)` for each field serde reads from the wire."""
+    fields: list[tuple[str, str, bool]] = []
+    attributes: list[str] = []
+    for line in struct.split("\n"):
+        text = line.strip()
+        if text.startswith("#["):
+            attributes.append(text)
+            continue
+        if not text or text.startswith("//") or text in ("{", "}"):
+            continue
+        field = re.match(r"(?:pub(?:\([a-z]+\))?\s+)?([a-z_0-9]+)\s*:\s*(.+?),?$", text)
+        if not field:
+            attributes = []
+            continue
+        name, declared_type = field.group(1), field.group(2)
+        joined = " ".join(attributes)
+        skipped = re.search(r"serde\([^)]*\bskip\b", joined) and "skip_serializing_if" not in joined
+        if not skipped:
+            optional = "default" in joined or declared_type.startswith("Option<")
+            fields.append((name, declared_type, not optional))
+        attributes = []
+    return fields
+
+
+def wire_type(declared_type: str) -> str | None:
+    """The OpenAPI type of a Rust field type, unwrapping one `Option`."""
+    inner = re.fullmatch(r"Option<\s*(.+?)\s*>", declared_type)
+    return WIRE_TYPES.get(inner.group(1) if inner else declared_type)
+
+
+def query_struct_findings(
+    method: str, path: str, params: str, route: dict, find_struct
+) -> list[str]:
+    """Check 6: a `Query<T>` struct and the route's query parameters agree."""
+    extractor = re.search(r"Query\(\s*[a-z_0-9]+\s*\)\s*:\s*Query<([A-Za-z0-9_]+)>", params)
+    if extractor is None:
+        return []
+    name = extractor.group(1)
+    struct = find_struct(name)
+    if struct is None:
+        return []
+    documented = {
+        entry["name"]: entry for entry in route.get("params", []) if entry.get("in") == "query"
+    }
+    where = "  %s %s: `%%s`" % (method, path)
+    found: list[str] = []
+    fields = struct_fields(struct)
+    for field, declared_type, mandatory in fields:
+        entry = documented.get(field)
+        if entry is None:
+            found.append(
+                where % field + " is accepted by %s but the contract does not document it" % name
+            )
+            continue
+        kind = wire_type(declared_type)
+        if kind is None:
+            found.append(
+                where % field + " has type %s, which maps to no OpenAPI type" % declared_type
+            )
+        elif entry.get("type") != kind:
+            found.append(
+                where % field
+                + " is %s in %s but the contract says %s" % (kind, name, entry.get("type"))
+            )
+        if mandatory and entry.get("required") is not True:
+            found.append(
+                where % field
+                + " is mandatory in %s but the contract marks it optional" % name
+            )
+        if not mandatory and entry.get("required") is True:
+            found.append(
+                where % field
+                + " is optional in %s but the contract marks it required" % name
+            )
+    accepted = {field for field, _, _ in fields}
+    for key in documented.keys() - accepted:
+        found.append(where % key + " is documented but %s does not accept it" % name)
+    return found
+
+
 def declared_statuses(route: dict) -> set[int]:
     statuses = {route["success_response"]["status"]}
     statuses |= {entry["status"] for entry in route.get("additional_responses", [])}
@@ -388,11 +561,16 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
 
     body_findings: list[str] = []
     undocumented: list[str] = []
+    required_findings: list[str] = []
+    unresolved: list[str] = []
+    typed_query: list[str] = []
     for method, path, handler in routes:
         params = handler_parameters(source, handler)
         route = by_route.get((method, path))
         if params is None or route is None:
             continue
+        typed_query += query_struct_findings(method, path, params, route, find_struct)
+
         # A bare `Json<T>` means the body is mandatory; `Result<Json<T>, _>` and
         # `Option<Json<T>>` leave that to the handler. All three still name the
         # struct whose fields serde accepts, which is what check 3 needs.
@@ -402,36 +580,96 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
             or re.search(r"Result<Json<([A-Za-z0-9_]+)>", params)
             or re.search(r"Option<Json<([A-Za-z0-9_]+)>>", params)
         )
-        if extractor is None or extractor.group(1) == "Value":
-            continue
-        struct = find_struct(extractor.group(1))
-        if struct is None:
-            continue
+        # (struct name, whether the body is mandatory) for each parse.
+        parses: list[tuple[str, bool]] = []
+        if extractor is not None and extractor.group(1) != "Value":
+            parses.append((extractor.group(1), bool(bare)))
+        mandatory_body = bool(bare)
+        if byte_parameters(params):
+            for name, guarded in raw_body_parses(source, handler):
+                if name is None:
+                    unresolved.append(
+                        "  %s %s: cannot resolve the body type of a "
+                        "`serde_json::from_slice` call" % (method, path)
+                    )
+                elif name != "Value":
+                    parses.append((name, not guarded))
+                    mandatory_body |= not guarded
+
+        request_body = route.get("request_body") or {}
+        if mandatory_body and request_body.get("required") is not True:
+            required_findings.append(
+                "  %s %s: the body is mandatory in the handler but the contract "
+                "does not mark it required" % (method, path)
+            )
         declared = {
             field["name"]: field.get("required", False)
-            for field in (route.get("request_body") or {}).get("fields", []) or []
+            for field in request_body.get("fields", []) or []
         }
-        for name in (mandatory_fields(struct) if bare else []):
-            if declared.get(name) is not True:
-                body_findings.append(
-                    "  %s %s: `%s` is mandatory in %s but the contract does not "
-                    "mark it required" % (method, path, name, extractor.group(1))
-                )
-        # An empty field list is a free-form body, documented by prose.
-        if declared:
-            for name in accepted_fields(struct):
-                if name not in declared:
-                    undocumented.append(
-                        "  %s %s: `%s` is accepted by %s but the contract does "
-                        "not document it" % (method, path, name, extractor.group(1))
+        for name, mandatory in parses:
+            struct = find_struct(name)
+            if struct is None:
+                continue
+            for field in (mandatory_fields(struct) if mandatory else []):
+                if declared.get(field) is not True:
+                    body_findings.append(
+                        "  %s %s: `%s` is mandatory in %s but the contract does not "
+                        "mark it required" % (method, path, field, name)
                     )
+            # An empty field list is a free-form body, documented by prose.
+            if declared:
+                for field in accepted_fields(struct):
+                    if field not in declared:
+                        undocumented.append(
+                            "  %s %s: `%s` is accepted by %s but the contract does "
+                            "not document it" % (method, path, field, name)
+                        )
 
     return {
         "statuses": sorted(set(findings)),
         "mandatory": sorted(set(body_findings)),
         "undocumented": sorted(set(undocumented)),
         "query_keys": sorted(set(query_findings)),
+        "body_required": sorted(set(required_findings)),
+        "unresolved": sorted(set(unresolved)),
+        "query_params": sorted(set(typed_query)),
     }
+
+
+# (check, title, advice) for each finding list `audit` returns, in print order.
+CHECKS = [
+    (
+        "statuses",
+        "Undeclared statuses",
+        "Declare each in docs/api-contract.json. A status that carries a body "
+        "belongs in additional_responses with its fields; one that does not "
+        "belongs in error_responses.",
+    ),
+    ("mandatory", "Unmarked mandatory body fields", None),
+    ("undocumented", "Undocumented body fields", None),
+    (
+        "query_keys",
+        "Undocumented query keys",
+        "Add each to the route's `params` in docs/api-contract.json. An alias "
+        "of a documented key needs no entry of its own.",
+    ),
+    (
+        "body_required",
+        "Mandatory bodies marked optional",
+        "Set the route's `request_body.required` to true.",
+    ),
+    (
+        "unresolved",
+        "Unresolved body types",
+        "Name the type in the source, for example `from_slice::<T>(..)`.",
+    ),
+    (
+        "query_params",
+        "Typed query mismatches",
+        "Give each `Query<T>` field one entry in the route's `params`, with "
+        "the same name, type and required flag.",
+    ),
+]
 
 
 def main() -> int:
@@ -447,36 +685,17 @@ def main() -> int:
         return 1
 
     found = audit(source, contract, struct_body)
-    findings = found["statuses"]
-    body_findings = found["mandatory"]
-    undocumented = found["undocumented"]
-    query_findings = found["query_keys"]
-
     print("OpenAPI contract coverage — %d routes scanned" % len(routes))
-    print("Undeclared statuses: %d" % len(findings))
-    print("Unmarked mandatory body fields: %d" % len(body_findings))
-    print("Undocumented body fields: %d" % len(undocumented))
-    print("Undocumented query keys: %d" % len(query_findings))
-    if not findings and not body_findings and not undocumented and not query_findings:
+    for check, title, _ in CHECKS:
+        print("%s: %d" % (title, len(found[check])))
+    if not any(found.values()):
         return 0
 
-    if findings:
-        print("\nUndeclared statuses:\n" + "\n".join(findings))
-        print(
-            "\nDeclare each in docs/api-contract.json. A status that carries a "
-            "body belongs in additional_responses with its fields; one that does "
-            "not belongs in error_responses."
-        )
-    if body_findings:
-        print("\nUnmarked mandatory body fields:\n" + "\n".join(body_findings))
-    if undocumented:
-        print("\nUndocumented body fields:\n" + "\n".join(undocumented))
-    if query_findings:
-        print("\nUndocumented query keys:\n" + "\n".join(query_findings))
-        print(
-            "\nAdd each to the route's `params` in docs/api-contract.json. An "
-            "alias of a documented key needs no entry of its own."
-        )
+    for check, title, advice in CHECKS:
+        if found[check]:
+            print("\n%s:\n" % title + "\n".join(found[check]))
+            if advice:
+                print("\n" + advice)
     print("\nThen run scripts/regenerate-openapi.sh.")
     return 1
 
@@ -875,6 +1094,8 @@ def self_test() -> int:
             problems += ["%s: unexpected %s" % (check, f.strip()) for f in extra]
         for check in expected.keys() - found.keys():
             problems.append("%s: no such check" % check)
+        if found.keys() != {check for check, _, _ in CHECKS}:
+            problems.append("CHECKS does not list every check `audit` returns")
         status = "ok" if not problems else "FAIL"
         print("%s  %s" % (status, name))
         for problem in problems:
