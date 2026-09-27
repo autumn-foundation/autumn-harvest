@@ -35,16 +35,17 @@ so each one gets its own issue.
 | 7 | (a) counters at the event sites; (b) a sampler over process-global atomics; (c) gauges | (a). The worker counts fallbacks and recoveries. The background publisher counts each dropped hint at the drop site, through a process-global recorder. The plugin runner and `Worker::new` set it with `dispatch::set_dropped_hint_recorder`. |
 | 8 | (a) ack each lease after its claim (today); (b) claim all, ack all, then start the tasks; (c) start each task after its claim, ack all at the end | (b). The ack still comes before the task starts, so the crash matrix does not change. The cost is that the first task waits for the other claims in the read. |
 | 9 | (a) one pipeline for all `XPENDING`, one for all `XCLAIM`; (b) `XAUTOCLAIM`; (c) concurrent commands on the multiplexed connection | (c). It costs about one round trip, like (a), and each command keeps its own result. A pipeline fails as a whole, and retrying it would repeat claims that already ran. `XAUTOCLAIM` needs Redis 6.2. |
-| 10 | (a) a tunable batch only; (b) a lease per queue so one worker sweeps; (c) a shared cursor in Redis | All three. The cursor travels as an opaque string, so the channel trait never sees the Postgres cursor type. The lease TTL is three times the larger of `reconcile_interval` and `poll_interval`. |
+| 10 | (a) a tunable batch only; (b) a lease per queue so one worker sweeps; (c) a shared cursor in Redis | All three. The cursor travels as an opaque string, so the channel trait never sees the Postgres cursor type. The lease TTL is three times the larger of `reconcile_interval` and `poll_interval`, plus two call timeouts. |
 
 ## 4. Reverse brainstorm: how to make this lose work or mislead an operator
 
 | Attack | Defence |
 |--------|---------|
 | A wrapped owner runs as a SAVEPOINT with no outer scope, and publishes before the outer commit | Today the same hint goes to the background publisher at once, which is earlier still. The wrap is never worse. A reference to a row that is not visible gets three short releases, and the sweep is the floor. |
-| A batched ack runs after a task starts, so the task can wake its own row and a stale ack deletes the new marker | The worker acks the whole read before it starts any task. No task of this read runs before its ack. |
+| A batched ack runs after a task starts, so the task can wake its own row and a stale ack deletes the new marker | Each task starts only after the batch that acks its lease. No task runs before its ack. |
+| A slow later claim holds back the tasks already claimed in the read | A batch goes out 50 ms after a claim while the claims go on, so a claimed task never waits on a later claim. |
 | A crash after the claims and before the batched ack | The references stay in the pending entries list. Recovery redelivers them, each row reads `RUNNING`, and each reference is acked. This is row 2 of the crash matrix. |
-| A sweep lease holder stops sweeping but keeps its lease | The holder renews the lease at the start of each sweep. A sweep that fails on a Postgres error gives the lease back. A lease that is not renewed expires after its TTL, three times the larger of `reconcile_interval` and `poll_interval`. The TTL covers the real renewal period, which a blocking read can stretch past one reconcile interval. |
+| A sweep lease holder stops sweeping but keeps its lease | The holder renews the lease at the start of each sweep. A sweep that fails on a Postgres error gives the lease back. A lease that is not renewed expires after its TTL, three times the larger of `reconcile_interval` and `poll_interval`, plus two call timeouts. The TTL covers the real renewal period, which a blocking read can stretch past one reconcile interval. |
 | Redis fails in the middle of a sweep | The worker makes no further Redis call for that sweep. The lease expires after its TTL, and a peer takes the queue. |
 | A lease holder shuts down | The worker releases its leases on stop, best effort. A lease it fails to release expires after its TTL. |
 | A lease moves to a peer, and the sweep walk restarts at the head of the backlog | The holder saves each cursor in Redis after a successful sweep. A new holder resumes from it. |
@@ -117,9 +118,12 @@ A multi-angle review of the first cut changed these points:
   queue never forces a retry of claims that already ran, so one bad queue does
   not block the rest.
 - **Item 10.** The range of `reconcile_batch` is now 1 to 10000. The lease TTL
-  is three times the larger of the two intervals. The holder renews at sweep
-  start and releases its leases on stop. `hold_reconcile_leases` returns the
+  is three times the larger of the two intervals, plus two call timeouts. The
+  holder renews at sweep start and releases its leases on stop. `hold_reconcile_leases` returns the
   held leases, each with its saved cursor. A later Codex review added the saved
   cursor and the renewal after slow page reads. A failed renewal publishes
-  nothing, so a lease a peer took is never swept twice.
+  nothing, so a lease a peer took is never swept twice. The cursors move
+  only after a successful publish.
+- **Item 8, later.** A claimed task no longer waits for the whole read. A
+  batch goes out 50 ms after a claim, while the claims go on.
 - **API contract.** The OpenAPI document is regenerated.

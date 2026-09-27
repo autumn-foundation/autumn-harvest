@@ -218,13 +218,16 @@ queue, so a fleet of N workers read N pages per queue per interval. Now each
 queue has a sweep lease in Redis. The worker that holds it sweeps the queue and
 renews the lease at the start of each sweep. Its peers skip that queue. The
 lease TTL is three times the larger of `reconcile_interval_ms` and
-`poll_interval_ms`. The lease fails open, because the sweep is the floor:
+`poll_interval_ms`, plus 10 s. The 10 s covers the renewal and the publish,
+each capped at the 5 s call timeout, so a live holder keeps its lease until
+its publish ends. The lease fails open, because the sweep is the floor:
 
 - A lease call that fails sweeps every queue.
 - A sweep that fails on a Postgres error gives its leases back, so a peer
   sweeps next time.
 - A sweep whose publish to Redis fails makes no further Redis call. Its lease
-  expires after the TTL.
+  expires after the TTL. Its walk does not move, so the next sweep publishes
+  the same page.
 - A worker that stops releases its leases, best effort. A lease that is not
   renewed expires after the TTL.
 
@@ -265,7 +268,7 @@ Postgres and a real Redis, and they reach the window by two different routes.
 
 `crash_between_claim_commit_and_ack_neither_loses_nor_duplicates` kills the
 child on the **workflow** task. It uses a channel wrapper that aborts the
-process inside `ack`.
+process inside `ack_many`.
 
 `crash_on_the_activity_claim_neither_loses_nor_duplicates` kills the child on
 the **activity** task. It uses the `DISPATCH_AFTER_CLAIM_BEFORE_ACK` chaos

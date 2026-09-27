@@ -38,9 +38,11 @@ its brainstorm, reverse brainstorm and six hats, is
   export the three counters yet.
 - **Batched acks (item 8).** `TaskDispatch::ack_many`, with a default body
   that acks each lease. Redis overrides it with one atomic pipeline. The
-  worker claims every lease of a read, acks them in one call, and only then
-  starts the claimed tasks. No task starts before its ack, so the crash matrix
-  does not change. A wrapper `TaskDispatch` must forward `ack_many` and the
+  worker claims the leases of a read in turn and acks them in `ack_many`
+  batches. A batch goes out when the claims end, or 50 ms after a claim, so a
+  slow later claim never holds back a claimed task. Each task starts only
+  after its batch. No task starts before its ack, so the crash matrix does not
+  change. A wrapper `TaskDispatch` must forward `ack_many` and the
   two lease methods. Otherwise it falls back to one ack per lease and a sweep
   on every worker.
 - **Recovery round trips (item 9).** One step reads every pending entries
@@ -52,12 +54,14 @@ its brainstorm, reverse brainstorm and six hats, is
   per-queue sweep lease in Redis (`<prefix>:dispatch:<queue>:reconcile`) lets
   one worker sweep each queue. The holder renews the lease at the start of
   each sweep. Its TTL is three times the larger of the reconcile and poll
-  intervals. The lease fails open. A failed lease call sweeps every queue. A
+  intervals, plus two 5 s call timeouts, so a live holder keeps it through
+  its publish. The lease fails open. A failed lease call sweeps every queue. A
   sweep that fails on Postgres gives its leases back. After a Redis failure,
   the lease expires. A stopping worker releases its leases, best effort. Slow
   page reads renew the lease before the publish, and a queue a peer took is
   dropped from that publish. A failed renewal publishes nothing, and the
-  worker claims through Postgres for a cooldown. The holder saves each
+  worker claims through Postgres for a cooldown. The cursors move only after
+  a successful publish, so a failed publish is retried from the same page. The holder saves each
   queue's cursor in Redis after a successful sweep, and a new holder resumes
   from it (`TaskDispatch::save_reconcile_cursors`).
 
@@ -70,9 +74,13 @@ upgrade note, so each stays open on #1429.
 - `dispatch_tests.rs`: `a_resume_publishes_its_wake_after_commit` and
   `the_mutex_reclaim_publishes_its_wake_after_commit` failed before the wrap.
   A commit-checking channel saw the wake leave through the background
-  publisher. `the_worker_acks_each_read_in_one_batch` failed with nine
+  publisher. `the_worker_acks_each_read_in_batches` failed with nine
   single acks. All three pass now. The fallback, recovery and sweep-lease
   cases pass too.
+- Later red tests from review: `a_failed_renewal_publishes_nothing`,
+  `a_failed_publish_leaves_the_walk_where_it_was` and
+  `a_slow_disposal_does_not_hold_back_a_claimed_task` in `dispatch_tests.rs`,
+  and the unit test `a_sweep_lease_outlives_its_publish`.
 - `dispatch_redis.rs`: `ack_many`, cross-queue recovery, a malformed entry
   in one queue, and the lease hold, renew, release and expiry cases, against a
   real Redis.

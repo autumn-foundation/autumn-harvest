@@ -25990,7 +25990,8 @@ const DISPATCH_CALL_TIMEOUT: Duration = Duration::from_secs(5);
 /// Renewal periods a sweep lease lasts without a renewal (issue #1429).
 ///
 /// The holder renews its lease at every sweep. A holder that dies leaves its
-/// queues unswept for at most this many periods, then a peer takes over.
+/// queues unswept for at most this many periods plus two call timeouts. Then a
+/// peer takes over. See [`reconcile_lease_ttl`].
 const RECONCILE_LEASE_INTERVALS: u32 = 3;
 
 /// Apply a lease's saved cursor to the local walk (issue #1429).
@@ -26019,6 +26020,25 @@ fn apply_reconcile_lease(
     }
 }
 
+/// Move the walk of each swept queue past the page it published (issue #1429).
+///
+/// A queue a peer took keeps its old cursor. The peer's walk owns it now.
+fn advance_reconcile_cursors(
+    cursors: &mut std::collections::HashMap<String, crate::queue::DispatchCursor>,
+    walked: Vec<(String, Option<crate::queue::DispatchCursor>)>,
+    leased: &[String],
+) {
+    for (queue, cursor) in walked {
+        if !leased.contains(&queue) {
+            continue;
+        }
+        match cursor {
+            Some(cursor) => cursors.insert(queue, cursor),
+            None => cursors.remove(&queue),
+        };
+    }
+}
+
 /// Keep only the queues whose lease a renewal still holds (issue #1429).
 fn retain_renewed(
     leased: &mut Vec<String>,
@@ -26035,6 +26055,19 @@ fn retain_renewed(
 /// read for the poll interval, so the period is the longer of the two.
 fn reconcile_lease_period(settings: &crate::dispatch::DispatchSettings) -> Duration {
     settings.reconcile_interval.max(settings.poll_interval)
+}
+
+/// How long one hold of a sweep lease lasts (issue #1429).
+///
+/// A sweep renews when its reads take one period. A sweep that does not renew
+/// publishes within one period and one call timeout of its hold. A sweep that
+/// renews spends at most one call timeout on the renewal and one on the
+/// publish. The two call timeouts cover both cases, so a peer never takes a
+/// queue that a live holder is still publishing.
+fn reconcile_lease_ttl(settings: &crate::dispatch::DispatchSettings) -> Duration {
+    reconcile_lease_period(settings)
+        .saturating_mul(RECONCILE_LEASE_INTERVALS)
+        .saturating_add(DISPATCH_CALL_TIMEOUT.saturating_mul(2))
 }
 
 /// Run one channel call under [`DISPATCH_CALL_TIMEOUT`].
@@ -26250,6 +26283,30 @@ impl DispatchLoopState {
             }
         }
     }
+}
+
+/// How long a claimed task waits for the rest of its read (issue #1429).
+///
+/// The worker acks a read in batches and starts each task only after its ack.
+/// A later reference of the read can wait on the pool or on a slow channel
+/// call. After this bound the worker acks and starts the tasks it holds, while
+/// the claims go on.
+const DISPATCH_START_BOUND: Duration = Duration::from_millis(50);
+
+/// The references of one read that wait for their ack (issue #1429).
+#[derive(Debug, Default)]
+struct ReadBatch {
+    /// Leases to ack, claimed or not.
+    acks: Vec<crate::dispatch::DispatchLease>,
+    /// Claimed tasks, each started after its ack.
+    claimed: Vec<(TaskQueueItem, Option<DispatchReservation>)>,
+}
+
+/// Lock a [`ReadBatch`]. No code panics while it holds the lock.
+fn lock_read_batch(batch: &Mutex<ReadBatch>) -> std::sync::MutexGuard<'_, ReadBatch> {
+    batch
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// One reference claimed through the channel that does not hold its permit yet.
@@ -28386,9 +28443,11 @@ impl Worker {
 
     /// Claim, ack and start one read of references (issue #1429).
     ///
-    /// Each lease is claimed first. The leases to drop then go in one
-    /// `ack_many`. Only then do the claimed tasks start, so no task runs
-    /// before its ack.
+    /// The leases are claimed in turn. The leases to drop go out in
+    /// `ack_many` batches, and each claimed task starts only after its batch,
+    /// so no task runs before its ack. A batch goes out when the claims end,
+    /// or `DISPATCH_START_BOUND` after a claim, whichever comes first. A slow
+    /// later claim therefore never holds back a task already claimed.
     ///
     /// Returns `true` when at least one task was dispatched.
     async fn dispose_read(
@@ -28399,62 +28458,112 @@ impl Worker {
         state: &mut DispatchLoopState,
         leases: Vec<crate::dispatch::DispatchLease>,
     ) -> bool {
-        let mut acks = Vec::new();
-        let mut claimed = Vec::new();
-        for lease in leases {
-            if self.shutdown.is_cancelled() {
-                // Give the reference straight back so a peer serves it now.
-                let _ = dispatch_call(installed.channel.release(&lease, Duration::ZERO), "release")
-                    .await;
-                continue;
-            }
-            if !dispatch_kind_admitted(
-                lease.kind,
-                Self::free_permits(&self.workflow_semaphore, &self.dispatch_reserved_workflow),
-                Self::free_permits(&self.activity_semaphore, &self.dispatch_reserved_activity),
-            ) {
-                // No permit for this pool. Give the reference straight back, so
-                // a peer with capacity reads it on its next poll.
-                let _ = dispatch_call(installed.channel.release(&lease, Duration::ZERO), "release")
-                    .await;
-                continue;
-            }
-            // The reservation is taken before the claim and lives until the
-            // spawned task holds its permit. See [`DispatchReservation`].
-            let reservation = match lease.kind {
-                Some(crate::dispatch::DispatchKind::Workflow) => {
-                    Some(DispatchReservation::new(&self.dispatch_reserved_workflow))
-                }
-                Some(crate::dispatch::DispatchKind::Activity) => {
-                    Some(DispatchReservation::new(&self.dispatch_reserved_activity))
-                }
-                None => None,
-            };
-            if let Some(task) = self
-                .consume_reference(pool, shard, installed, state, lease, &mut acks)
-                .await
-            {
-                claimed.push((task, reservation));
-            }
-        }
+        let batch = Mutex::new(ReadBatch::default());
+        let claims_done = AtomicBool::new(false);
+        let claimed_wake = tokio::sync::Notify::new();
+        let done_wake = tokio::sync::Notify::new();
 
-        if !acks.is_empty()
-            && let Err(error) = dispatch_call(installed.channel.ack_many(&acks), "ack").await
-        {
+        let claims = async {
+            for lease in leases {
+                if self.shutdown.is_cancelled() {
+                    // Give the reference straight back so a peer serves it now.
+                    let _ =
+                        dispatch_call(installed.channel.release(&lease, Duration::ZERO), "release")
+                            .await;
+                    continue;
+                }
+                if !dispatch_kind_admitted(
+                    lease.kind,
+                    Self::free_permits(&self.workflow_semaphore, &self.dispatch_reserved_workflow),
+                    Self::free_permits(&self.activity_semaphore, &self.dispatch_reserved_activity),
+                ) {
+                    // No permit for this pool. Give the reference straight back,
+                    // so a peer with capacity reads it on its next poll.
+                    let _ =
+                        dispatch_call(installed.channel.release(&lease, Duration::ZERO), "release")
+                            .await;
+                    continue;
+                }
+                // The reservation is taken before the claim and lives until the
+                // spawned task holds its permit. See [`DispatchReservation`].
+                let reservation = match lease.kind {
+                    Some(crate::dispatch::DispatchKind::Workflow) => {
+                        Some(DispatchReservation::new(&self.dispatch_reserved_workflow))
+                    }
+                    Some(crate::dispatch::DispatchKind::Activity) => {
+                        Some(DispatchReservation::new(&self.dispatch_reserved_activity))
+                    }
+                    None => None,
+                };
+                let mut acks = Vec::new();
+                let task = self
+                    .consume_reference(pool, shard, installed, state, lease, &mut acks)
+                    .await;
+                let claimed = task.is_some();
+                {
+                    let mut pending = lock_read_batch(&batch);
+                    pending.acks.append(&mut acks);
+                    if let Some(task) = task {
+                        pending.claimed.push((task, reservation));
+                    }
+                }
+                if claimed {
+                    claimed_wake.notify_one();
+                }
+            }
+            claims_done.store(true, Ordering::Release);
+            done_wake.notify_one();
+        };
+
+        // Acks and starts the claimed tasks while the claims go on. A task
+        // waits at most `DISPATCH_START_BOUND` for later claims, and it still
+        // starts only after its ack.
+        let starts = async {
+            let mut dispatched = false;
+            let mut ack_error = None;
+            loop {
+                let done = AtomicBool::load(&claims_done, Ordering::Acquire);
+                if !done {
+                    if lock_read_batch(&batch).claimed.is_empty() {
+                        tokio::select! {
+                            () = claimed_wake.notified() => {}
+                            () = done_wake.notified() => {}
+                        }
+                        continue;
+                    }
+                    tokio::select! {
+                        () = tokio::time::sleep(DISPATCH_START_BOUND) => {}
+                        () = done_wake.notified() => {}
+                    }
+                }
+                let ReadBatch { acks, claimed } = std::mem::take(&mut *lock_read_batch(&batch));
+                if !acks.is_empty()
+                    && let Err(error) =
+                        dispatch_call(installed.channel.ack_many(&acks), "ack").await
+                {
+                    ack_error.get_or_insert(error);
+                }
+                dispatched |= !claimed.is_empty();
+                for (task, reservation) in claimed {
+                    tracing::debug!(
+                        task_id = %task.id,
+                        task_type = %task.task_type,
+                        queue = %task.queue_name,
+                        "claimed task (dispatch)"
+                    );
+                    self.dispatch_task(task, pool, reservation);
+                }
+                if done {
+                    return (dispatched, ack_error);
+                }
+            }
+        };
+
+        let ((), (dispatched, ack_error)) = tokio::join!(claims, starts);
+        if let Some(error) = ack_error {
             // Each claim is durable either way. An unacked reference costs one
             // redelivery, which finds its row not claimable and acks it.
             self.log_dispatch_error(state, &error, "dispatch ack failed");
-        }
-
-        let dispatched = !claimed.is_empty();
-        for (task, reservation) in claimed {
-            tracing::debug!(
-                task_id = %task.id,
-                task_type = %task.task_type,
-                queue = %task.queue_name,
-                "claimed task (dispatch)"
-            );
-            self.dispatch_task(task, pool, reservation);
         }
         dispatched
     }
@@ -28528,9 +28637,10 @@ impl Worker {
 
     /// Claim the row one reference names, then queue its ack or release it.
     ///
-    /// Returns the claimed task. The caller starts it after the whole read is
-    /// acked. A lease to drop goes onto `acks`, so the read costs one
-    /// `ack_many` round trip (issue #1429). A release still goes out at once.
+    /// Returns the claimed task. The caller starts it after its lease is
+    /// acked. A lease to drop goes onto `acks`, so the caller acks a read in
+    /// few `ack_many` round trips (issue #1429). A release still goes out at
+    /// once.
     async fn consume_reference(
         &self,
         pool: &DbPool,
@@ -28658,8 +28768,10 @@ impl Worker {
         installed: &crate::dispatch::InstalledDispatch,
         state: &mut DispatchLoopState,
     ) -> bool {
-        let (mut leased, lease_held) = self.reconcile_lease_queues(installed, state).await;
+        // Taken before the hold call. The lease runs from when Redis runs the
+        // hold, which is never earlier, so the check below is conservative.
         let held_at = std::time::Instant::now();
+        let (mut leased, lease_held) = self.reconcile_lease_queues(installed, state).await;
         let mut conn = match acquire_shard_conn(
             pool,
             shard_acquire_bound(false, self.config.poll_interval),
@@ -28678,8 +28790,8 @@ impl Worker {
 
         let batch = installed.settings.reconcile_batch;
         let mut hints = Vec::new();
-        // The cursors are applied after every queue is read and the leases are
-        // renewed. A failed read or renewal leaves the walk where it was.
+        // The cursors are applied only after the publish. A failed read, renewal
+        // or publish leaves the walk where it was.
         let mut walked: Vec<(String, Option<crate::queue::DispatchCursor>)> = Vec::new();
         for queue in &leased {
             let after = state.reconcile_cursors.get(queue).cloned();
@@ -28702,6 +28814,19 @@ impl Worker {
             ));
             hints.extend(page.hints);
         }
+
+        // The throttle metrics ride on this sweep. The Postgres poll path
+        // emits them from an idle `poll_once`, which the dispatch path never
+        // runs. Without this the series would go dark under dispatch. The
+        // sweep already holds a connection and runs once per reconcile
+        // interval, so this costs one read per interval rather than one per
+        // poll. The read comes before the renewal check, so the check counts
+        // its time.
+        self.emit_throttle_metrics(&mut conn).await;
+        // The connection goes back before the channel calls, which the
+        // database has no part in.
+        drop(conn);
+
         // Slow page reads can outlast a lease. A renewal keeps a peer from
         // sweeping the same queues while this sweep publishes. A queue a peer
         // took meanwhile is the peer's to publish.
@@ -28712,7 +28837,6 @@ impl Worker {
                     // A failed renewal can hide a lost lease, so this sweep
                     // publishes nothing. The Postgres claim path keeps the
                     // floor until the cooldown ends.
-                    drop(conn);
                     self.enter_degraded(
                         state,
                         &error,
@@ -28723,39 +28847,14 @@ impl Worker {
                 }
             }
         }
-        for (queue, cursor) in walked {
-            if !leased.contains(&queue) {
-                continue;
-            }
-            match cursor {
-                Some(cursor) => state.reconcile_cursors.insert(queue, cursor),
-                None => state.reconcile_cursors.remove(&queue),
-            };
-        }
 
-        // The throttle metrics ride on this sweep. The Postgres poll path
-        // emits them from an idle `poll_once`, which the dispatch path never
-        // runs. Without this the series would go dark under dispatch. The
-        // sweep already holds a connection and runs once per reconcile
-        // interval, so this costs one read per interval rather than one per
-        // poll.
-        self.emit_throttle_metrics(&mut conn).await;
-
-        if hints.is_empty() {
-            drop(conn);
-            if lease_held {
-                self.save_reconcile_cursors(installed, state, &leased).await;
-            }
-            return true;
-        }
-        // The connection goes back before the publish: the publish is a channel
-        // round trip that the database has no part in.
-        drop(conn);
-        if let Err(error) =
-            dispatch_call(installed.channel.publish(&hints), "reconcile publish").await
+        if !hints.is_empty()
+            && let Err(error) =
+                dispatch_call(installed.channel.publish(&hints), "reconcile publish").await
         {
             // No lease release here. Redis just failed, so a release would cost
             // one more timeout before the fallback. The lease expires instead.
+            // The next sweep reads the same pages again.
             self.enter_degraded(
                 state,
                 &error,
@@ -28764,6 +28863,7 @@ impl Worker {
             );
             return false;
         }
+        advance_reconcile_cursors(&mut state.reconcile_cursors, walked, &leased);
         // The cursors are saved only after the publish, so a new holder never
         // skips a page that was not published.
         if lease_held {
@@ -28808,7 +28908,7 @@ impl Worker {
         }
     }
 
-    /// Take or renew the sweep leases of `queues` for three renewal periods.
+    /// Take or renew the sweep leases of `queues` for one lease TTL.
     async fn hold_reconcile_leases(
         &self,
         installed: &crate::dispatch::InstalledDispatch,
@@ -28818,8 +28918,7 @@ impl Worker {
             installed.channel.hold_reconcile_leases(
                 queues,
                 &self.config.worker_id,
-                reconcile_lease_period(&installed.settings)
-                    .saturating_mul(RECONCILE_LEASE_INTERVALS),
+                reconcile_lease_ttl(&installed.settings),
             ),
             "reconcile lease",
         )
@@ -42397,6 +42496,34 @@ mod tests {
         assert_eq!(leased, vec!["a".to_owned()]);
         assert_eq!(hints.len(), 1);
         assert_eq!(hints[0].queue_name, "a");
+    }
+
+    /// A sweep lease outlives the longest sweep its holder can run
+    /// (issue #1429).
+    ///
+    /// A sweep that does not renew reads for less than one period, then
+    /// publishes within one call timeout. A sweep that renews spends at most
+    /// one call timeout on the renewal and one on the publish.
+    #[test]
+    fn a_sweep_lease_outlives_its_publish() {
+        for (reconcile, poll) in [(1_000, 20), (20, 1_000), (60_000, 20), (1, 1)] {
+            let settings = crate::dispatch::DispatchSettings {
+                reconcile_interval: Duration::from_millis(reconcile),
+                poll_interval: Duration::from_millis(poll),
+                ..crate::dispatch::DispatchSettings::default()
+            };
+            let period = reconcile_lease_period(&settings);
+            let ttl = reconcile_lease_ttl(&settings);
+            assert!(
+                ttl >= period + DISPATCH_CALL_TIMEOUT,
+                "{ttl:?} must cover the reads and the publish"
+            );
+            assert!(
+                ttl >= DISPATCH_CALL_TIMEOUT * 2,
+                "{ttl:?} must cover the renewal and the publish"
+            );
+            assert!(ttl >= period * RECONCILE_LEASE_INTERVALS);
+        }
     }
 
     #[cfg(feature = "testing")]

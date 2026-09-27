@@ -2088,10 +2088,10 @@ impl TaskDispatch for AckCountingDispatch {
     }
 }
 
-/// The worker disposes of each read with one `ack_many`, never one `ack` per
-/// lease. It starts no task of a read before that read is acked (issue #1429).
+/// The worker disposes of each read with `ack_many` batches, never one `ack`
+/// per lease. It starts no task before the batch that acks it (issue #1429).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_worker_acks_each_read_in_one_batch() {
+async fn the_worker_acks_each_read_in_batches() {
     let _serial = DISPATCH_SERIAL.lock().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let channel = Arc::new(AckCountingDispatch::default());
@@ -2153,6 +2153,8 @@ struct LeaseSwitchDispatch {
     fail_lease: std::sync::atomic::AtomicBool,
     /// The lease call that fails, counted from 1. Zero fails none.
     fail_hold_call: AtomicUsize,
+    /// Publish calls still to fail.
+    fail_publishes: AtomicUsize,
     hold_calls: AtomicUsize,
     releases: AtomicUsize,
     cursors: std::sync::Mutex<std::collections::HashMap<String, String>>,
@@ -2173,6 +2175,17 @@ impl TaskDispatch for LeaseSwitchDispatch {
             .lock()
             .expect("publish log")
             .push(hints.iter().map(|hint| hint.task_id).collect());
+        if self
+            .fail_publishes
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(autumn_harvest::HarvestError::Dispatch(
+                "injected publish failure".to_string(),
+            ));
+        }
         self.inner.publish(hints).await
     }
 
@@ -2450,6 +2463,187 @@ async fn a_failed_renewal_publishes_nothing() {
         !channel.inner.published_ids().contains(&task_id),
         "a sweep whose renewal failed must not publish"
     );
+}
+
+/// A worker config with a build id, so the rows of [`seed_gated_rows`] stay
+/// unclaimable. A worker with an empty build id claims any build.
+fn gated_worker_config(queue: &str) -> WorkerRuntimeConfig {
+    WorkerRuntimeConfig {
+        build_id: "dispatch-test-build".to_string(),
+        ..worker_config(queue, vec![ShardId::new(0)])
+    }
+}
+
+/// A failed publish does not move the walk. The next sweep publishes the same
+/// page again (issue #1429).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_publish_leaves_the_walk_where_it_was() {
+    let _serial = DISPATCH_SERIAL.lock().await;
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let queue = unique_queue("lease_retry");
+    let _cleanup = SeededQueueGuard {
+        url: url.clone(),
+        queue: queue.clone(),
+    };
+
+    let mut conn = connect(&url).await;
+    autumn_harvest::dispatch::uninstall();
+    seed_gated_rows(&mut conn, &queue, 250, 5).await;
+
+    let channel = Arc::new(LeaseSwitchDispatch::default());
+    channel.grant.store(true, Ordering::SeqCst);
+    channel.fail_publishes.store(1, Ordering::SeqCst);
+    autumn_harvest::dispatch::install(
+        Arc::clone(&channel) as Arc<dyn TaskDispatch>,
+        DispatchSettings {
+            reconcile_batch: 100,
+            ..dispatch_settings()
+        },
+    );
+    let _guard = InstalledGuard;
+
+    let pool = build_pool(&url);
+    let worker = Arc::new(make_worker_with(
+        gated_worker_config(&queue),
+        vec![wf_info("dispatch_trivial", trivial_workflow)],
+        vec![],
+        empty_shared_state(),
+    ));
+
+    with_worker(worker, pool, async {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while channel.publishes.lock().expect("publish log").len() < 2 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the second sweep must publish"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+
+    let publishes = channel.publishes.lock().expect("publish log").clone();
+    assert_eq!(
+        publishes[1], publishes[0],
+        "the sweep after a failed publish must publish the same page"
+    );
+}
+
+/// A channel whose `release` answers slowly, like a slow Redis.
+#[derive(Debug, Default)]
+struct SlowReleaseDispatch {
+    inner: MemoryDispatch,
+    releases_done: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl TaskDispatch for SlowReleaseDispatch {
+    async fn publish(
+        &self,
+        hints: &[autumn_harvest::dispatch::DispatchHint],
+    ) -> autumn_harvest::HarvestResult<()> {
+        self.inner.publish(hints).await
+    }
+
+    async fn next(
+        &self,
+        queues: &[String],
+        consumer: &str,
+        max: usize,
+        wait: Duration,
+    ) -> autumn_harvest::HarvestResult<Vec<autumn_harvest::dispatch::DispatchLease>> {
+        self.inner.next(queues, consumer, max, wait).await
+    }
+
+    async fn ack(
+        &self,
+        lease: &autumn_harvest::dispatch::DispatchLease,
+    ) -> autumn_harvest::HarvestResult<()> {
+        self.inner.ack(lease).await
+    }
+
+    async fn ack_many(
+        &self,
+        leases: &[autumn_harvest::dispatch::DispatchLease],
+    ) -> autumn_harvest::HarvestResult<()> {
+        self.inner.ack_many(leases).await
+    }
+
+    async fn release(
+        &self,
+        lease: &autumn_harvest::dispatch::DispatchLease,
+        delay: Duration,
+    ) -> autumn_harvest::HarvestResult<()> {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let released = self.inner.release(lease, delay).await;
+        self.releases_done.fetch_add(1, Ordering::SeqCst);
+        released
+    }
+
+    async fn maintain(
+        &self,
+        queues: &[String],
+    ) -> autumn_harvest::HarvestResult<autumn_harvest::dispatch::DispatchMaintenance> {
+        self.inner.maintain(queues).await
+    }
+}
+
+/// A claimed task starts while a later reference of the same read waits on a
+/// slow channel call (issue #1429).
+///
+/// The read holds a claimable row, then a gated row. The gated row's release
+/// takes three seconds. The claimed task must not wait for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_disposal_does_not_hold_back_a_claimed_task() {
+    let _serial = DISPATCH_SERIAL.lock().await;
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let queue = unique_queue("slow_release");
+    let _cleanup = SeededQueueGuard {
+        url: url.clone(),
+        queue: queue.clone(),
+    };
+
+    let mut conn = connect(&url).await;
+    autumn_harvest::dispatch::uninstall();
+    let exec_id = start_on(&mut conn, "dispatch_trivial", &queue).await;
+    let claimable = workflow_task_id(&mut conn, exec_id).await;
+    seed_gated_rows(&mut conn, &queue, 1, 5).await;
+    let page = autumn_harvest::queue::due_dispatch_hints_page(&mut conn, &queue, 10, None)
+        .await
+        .expect("page");
+    assert_eq!(page.hints.len(), 2);
+    let mut hints = page.hints;
+    hints.sort_by_key(|hint| hint.task_id != claimable);
+
+    let channel = Arc::new(SlowReleaseDispatch::default());
+    channel.inner.publish(&hints).await.expect("publish");
+    autumn_harvest::dispatch::install(
+        Arc::clone(&channel) as Arc<dyn TaskDispatch>,
+        DispatchSettings {
+            reconcile_interval: Duration::from_secs(60),
+            ..dispatch_settings()
+        },
+    );
+    let _guard = InstalledGuard;
+
+    let pool = build_pool(&url);
+    let worker = Arc::new(make_worker_with(
+        gated_worker_config(&queue),
+        vec![wf_info("dispatch_trivial", trivial_workflow)],
+        vec![],
+        empty_shared_state(),
+    ));
+
+    let mut check = connect(&url).await;
+    with_worker(worker, pool, async {
+        wait_for_state(&mut check, exec_id, &["COMPLETED"], Duration::from_secs(30)).await;
+        assert_eq!(
+            AtomicUsize::load(&channel.releases_done, Ordering::SeqCst),
+            0,
+            "the claimed task must finish before the slow release returns"
+        );
+    })
+    .await;
 }
 
 /// A new lease holder resumes the walk from the cursor the last holder saved
