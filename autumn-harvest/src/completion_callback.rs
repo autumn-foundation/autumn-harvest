@@ -2520,12 +2520,13 @@ async fn dead_letter_entry_with_current_payload(
 }
 
 /// Bulk-record every `Delivered` outcome from one scanner tick in a single
-/// round trip: `UPDATE ... FROM
-/// unnest($ids, $attempts, $statuses)`, joined on `(id, attempt)` exactly
-/// like the per-row path's `.find(row.id).filter(attempt.eq(row.attempt))`
-/// guard -- a row whose `attempt` no longer matches (superseded by a later
-/// reclaim, see `apply_outcome`'s doc comment) is silently skipped by the
-/// join instead of updated, the same no-op the per-row guard produced.
+/// round trip: `UPDATE ... FROM unnest($ids, $attempts, $statuses)`. The
+/// join is on `(id, attempt)`, exactly like the per-row path's
+/// `.find(row.id).filter(attempt.eq(row.attempt))` guard. A row whose
+/// `attempt` no longer matches is silently skipped by the join instead
+/// of updated -- the same no-op the per-row guard produced. That can
+/// happen when a later reclaim supersedes the row; see `apply_outcome`'s
+/// doc comment.
 ///
 /// A no-op on an empty batch: the caller only invokes this when at least
 /// one row resolved `Delivered`.
@@ -2621,13 +2622,12 @@ async fn apply_backoff_outcomes_batch(
 /// writes are atomic).
 ///
 /// Only the `DeadLetter` branch is still reachable from the main per-tick
-/// scanner loop: `Delivered` and `Backoff` outcomes there are
-/// recorded via [`apply_delivered_outcomes_batch`] /
-/// [`apply_backoff_outcomes_batch`] instead, one round trip per outcome
-/// kind per tick rather than one per row. The pre-dispatch exceptional
-/// paths (SSRF re-check failure, payload serialization failure) still call
-/// this directly with `DeadLetter`, since they run per-row before the
-/// batch's outcomes are even classified.
+/// scanner loop. `Delivered` and `Backoff` outcomes there are recorded via
+/// [`apply_delivered_outcomes_batch`] / [`apply_backoff_outcomes_batch`]
+/// instead: one round trip per outcome kind per tick, not one per row.
+/// The pre-dispatch exceptional paths (SSRF re-check failure, payload
+/// serialization failure) still call this directly with `DeadLetter`.
+/// They run per-row, before the batch's outcomes are even classified.
 #[cfg(feature = "db")]
 async fn apply_outcome(
     conn: &mut diesel_async::AsyncPgConnection,
@@ -2893,15 +2893,15 @@ async fn fire_due_on_conn(
     let backoff_now = Utc::now();
 
     // Classify every attempt's outcome first, sorting rows into three
-    // buckets by action kind, then write each bucket in one round trip
-    // instead of one `apply_outcome` call per row (issue #921 follow-up:
-    // the classify/apply split here is unchanged, only how the resulting
-    // actions get written). `Delivered` and `Backoff` are the common
-    // paths and are batched below; `DeadLetter` keeps the per-row
-    // transaction `apply_outcome` already used -- its fence-check +
-    // `FOR UPDATE` re-read + DLQ insert are a documented atomicity
-    // guarantee (`dead_letter_entry_with_current_payload`) this change
-    // does not touch.
+    // buckets by action kind. Then write each bucket in one round trip,
+    // instead of one `apply_outcome` call per row. The classify/apply
+    // split itself is unchanged; only how the resulting actions get
+    // written is new. `Delivered` and `Backoff` are the common paths and
+    // are batched below. `DeadLetter` keeps the per-row transaction
+    // `apply_outcome` already used. Its fence-check + `FOR UPDATE`
+    // re-read + DLQ insert are a documented atomicity guarantee, named
+    // on `dead_letter_entry_with_current_payload`. This change does not
+    // touch that guarantee.
     let mut delivered_rows: Vec<(Uuid, i32, u16)> = Vec::new();
     let mut backoff_rows: Vec<BackoffOutcomeRow> = Vec::new();
     let mut dead_letter_rows: Vec<(ClaimedDeliveryRow, OutcomeAction)> = Vec::new();

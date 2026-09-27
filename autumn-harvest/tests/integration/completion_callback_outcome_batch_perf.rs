@@ -4,28 +4,29 @@
 //!
 //! `fire_due_on_conn` (`autumn-harvest/src/completion_callback.rs`) claims
 //! up to `COMPLETION_DELIVERY_FIRE_BATCH_SIZE` (100) due rows in one
-//! statement, dispatches every claimed delivery's HTTP POST concurrently,
-//! then walks the batch a second time and calls `apply_outcome` on each
-//! row's own turn through the loop. Every `Delivered` or `Backoff` outcome
-//! opens its own `UPDATE harvest_completion_deliveries ... WHERE id = $id
-//! AND attempt = $attempt` round trip, so a tick that resolves N rows
-//! issues 1 batched claim plus N independent outcome-recording statements
-//! -- exactly the shape this persona's charter names: "Workflow/activity
+//! statement, and dispatches every claimed delivery's HTTP POST
+//! concurrently. It then walks the batch a second time and calls
+//! `apply_outcome` on each row's own turn through the loop. Every
+//! `Delivered` or `Backoff` outcome opens its own
+//! `UPDATE harvest_completion_deliveries ... WHERE id = $id AND attempt =
+//! $attempt` round trip. A tick that resolves N rows issues 1 batched
+//! claim, plus N independent outcome-recording statements. That is
+//! exactly the shape this persona's charter names: "Workflow/activity
 //! bookkeeping queries (Harvest) that are individually trivial and
 //! collectively dominant... find them by `calls`."
 //!
 //! The fix batches the `Delivered` and `Backoff` paths into two
-//! `UPDATE ... FROM unnest(...)` statements (one round trip per outcome
-//! kind per tick, regardless of how many rows land in that kind), leaving
-//! the rarer `DeadLetter` path's per-row transaction (fence-check +
-//! `FOR UPDATE` re-read + DLQ insert, all load-bearing for the anti-PII-
-//! resurrection CAS documented on `dead_letter_entry_with_current_payload`)
-//! untouched.
+//! `UPDATE ... FROM unnest(...)` statements. That is one round trip per
+//! outcome kind per tick, regardless of how many rows land in that kind.
+//! It leaves the rarer `DeadLetter` path's per-row transaction untouched
+//! (fence-check + `FOR UPDATE` re-read + DLQ insert). That transaction is
+//! load-bearing for the anti-PII-resurrection CAS documented on
+//! `dead_letter_entry_with_current_payload`.
 //!
 //! Evidence here is `pg_stat_statements` call and buffer counts, never
 //! wall-clock. This harness follows the same shape as
 //! `completion_trigger_outbox_queue_perf.rs`: a fresh, uniquely-named,
-//! fully-migrated database per measurement point, `pg_stat_statements`
+//! fully-migrated database per measurement point. `pg_stat_statements` is
 //! reset immediately before the measured call and snapshotted immediately
 //! after it.
 
@@ -113,8 +114,9 @@ fn build_test_pool(database_url: &str) -> DbPool {
 // A realistic tick mixes successful and failing deliveries; a harness that
 // only ever exercises the `Delivered` path would leave the `Backoff` batch
 // unmeasured. The outcome is derived from the numeric suffix baked into
-// `target_url` at seed time, not from call order, so it is stable
-// regardless of how `join_all` interleaves the concurrent dispatch futures.
+// `target_url` at seed time, not from call order. So it stays stable
+// regardless of how `join_all` interleaves the concurrent dispatch
+// futures.
 struct ParityDeliverer;
 
 impl CompletionCallbackDeliverer for ParityDeliverer {
@@ -145,11 +147,11 @@ fn install_config() {
         secret: CallbackSecret::new(b"perf-harness-secret".to_vec()),
         ssrf_policy: SsrfPolicy::new(HostAllowlist::new().with_pattern("api.example.com")),
         default_targets: Vec::new(),
-        // 5 attempts: at attempt 1 (the only attempt this harness's single
-        // scanner tick makes), every failing row is still under budget, so
-        // it takes the `Backoff` branch, never `DeadLetter`. That keeps the
-        // measured tick's writes concentrated in the two batched paths this
-        // investigation targets.
+        // 5 attempts. This harness's single scanner tick only ever makes
+        // attempt 1, so every failing row is still under budget and takes
+        // the `Backoff` branch, never `DeadLetter`. That keeps the
+        // measured tick's writes concentrated in the two batched paths
+        // this investigation targets.
         retry_policy: RetryPolicy::exponential(5, std::time::Duration::from_secs(30)),
     }));
 }
@@ -264,13 +266,13 @@ async fn snapshot_statements(conn: &mut AsyncPgConnection, db_name: &str) -> Vec
     )
 }
 
-/// Is `row` one of the outcome-recording writes this investigation targets
-/// -- an `UPDATE` against `harvest_completion_deliveries` that is *not* the
-/// claim statement? The claim query is the only one that joins a
-/// `candidate` CTE, so excluding that leaves exactly the outcome writes on
-/// both sides of the fix: three distinct per-row statement shapes before it
-/// (`Delivered`/`Backoff`/`DeadLetter`), two batched-plus-one-per-row shapes
-/// after it.
+/// Is `row` one of the outcome-recording writes this investigation
+/// targets -- an `UPDATE` against `harvest_completion_deliveries` that is
+/// *not* the claim statement? The claim query is the only one that joins
+/// a `candidate` CTE. Excluding that leaves exactly the outcome writes.
+/// There are three distinct per-row statement shapes before this fix
+/// (`Delivered`/`Backoff`/`DeadLetter`), and two batched-plus-one-per-row
+/// shapes after it.
 fn is_outcome_write_statement(row: &StatRow) -> bool {
     let q = row.query.to_ascii_lowercase();
     q.starts_with("update")
@@ -632,10 +634,10 @@ async fn read_outcomes(conn: &mut AsyncPgConnection) -> Vec<DeliveryOutcomeRow> 
 
 /// Proves the batched outcome-recording path leaves every row in exactly
 /// the state the per-row `apply_outcome` path would have: same `state`,
-/// same `attempt`, same `last_status`/`last_error`, and `delivered_at` set
-/// on exactly the same rows. Runs against the fixed code path (this test
-/// is not `#[ignore]`d), so it is a permanent regression guard, not a
-/// one-off comparison.
+/// same `attempt`, same `last_status`/`last_error`. `delivered_at` is set
+/// on exactly the same rows too. This test is not `#[ignore]`d, so it
+/// runs against the fixed code path on every normal test run. That makes
+/// it a permanent regression guard, not a one-off comparison.
 #[tokio::test]
 async fn scanner_records_identical_outcomes_for_a_mixed_delivered_and_backoff_batch() {
     let _guard = TEST_SERIAL.lock().await;
@@ -652,9 +654,9 @@ async fn scanner_records_identical_outcomes_for_a_mixed_delivered_and_backoff_ba
     drop(config);
 
     let exec_id = Uuid::new_v4();
-    // 21 rows: an odd count exercises an unbalanced Delivered/Backoff split
-    // (11 even-index Delivered, 10 odd-index Backoff), and is well under
-    // one claim batch so every row resolves in a single tick.
+    // 21 rows: an odd count exercises an unbalanced Delivered/Backoff
+    // split (11 even-index Delivered, 10 odd-index Backoff). It is well
+    // under one claim batch, so every row resolves in a single tick.
     let rows = build_rows(exec_id, 21, &retry_policy_json, max_attempts);
     seed_rows(&mut seed_conn, &rows).await;
 
@@ -731,9 +733,9 @@ async fn scanner_handles_a_single_row_batch() {
     assert_eq!(outcomes[0].state, "DELIVERED");
 }
 
-/// Retry exhaustion (`DeadLetter`) is untouched by this fix -- still one
-/// transaction per row -- and still resolves correctly alongside a batch
-/// that also contains `Delivered`/`Backoff` rows.
+/// Retry exhaustion (`DeadLetter`) is untouched by this fix. It still
+/// takes one transaction per row, and still resolves correctly alongside
+/// a batch that also contains `Delivered`/`Backoff` rows.
 #[tokio::test]
 async fn scanner_dead_letters_alongside_a_batched_delivered_and_backoff_mix() {
     let _guard = TEST_SERIAL.lock().await;
