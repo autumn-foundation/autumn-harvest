@@ -462,11 +462,11 @@ def raw_body_parses(source: str, handler: str) -> list[tuple[str | None, bool, b
         params, returns, block = parts
         byte_names = byte_parameters(params)
         states = receiving_parameters(handler_block, helper, params, carriers)
-        for name, (guarded, tolerant) in states.items():
+        for name, (optional, tolerant) in states.items():
             if name not in byte_names:
                 continue
             found = block_parses(block, {name}, returns)
-            parses += [(kind, o or guarded or tolerant, t or tolerant) for kind, o, t in found]
+            parses += [(kind, o or optional, t or tolerant) for kind, o, t in found]
     return parses
 
 
@@ -489,12 +489,13 @@ def split_top_level(text: str) -> list[str]:
 def receiving_parameters(
     block: str, helper: str, params: str, variables: set[str]
 ) -> dict[str, tuple[bool, bool]]:
-    """`(guarded, tolerant)` for each `helper` parameter that gets a variable.
+    """`(optional, tolerant)` for each `helper` parameter that gets a variable.
 
     Each argument maps to the parameter at its position. A `self` receiver is
     skipped, since a call does not pass it in the argument list. A parameter
-    is guarded when every call that fills it sits behind an `.is_empty()`
-    guard. It is tolerant when every such call turns the error into a value.
+    is optional when every call that fills it is guarded by `.is_empty()` or
+    turns the error into a value. It is tolerant when every such call turns
+    the error into a value.
     """
     # A pattern such as `Extension(state): ..` keeps its slot with no name, so
     # the parameters after it keep their positions.
@@ -515,8 +516,8 @@ def receiving_parameters(
             if not passed or not name:
                 continue
             guarded = any(guards(block, call.start(), variable) for variable in passed)
-            was_guarded, was_tolerant = states.get(name, (True, True))
-            states[name] = (was_guarded and guarded, was_tolerant and tolerant)
+            was_optional, was_tolerant = states.get(name, (True, True))
+            states[name] = (was_optional and (guarded or tolerant), was_tolerant and tolerant)
     return states
 
 
@@ -569,8 +570,11 @@ def guards(block: str, position: int, variable: str) -> bool:
         # The whole condition must hold for every empty body, or for none.
         # `body.is_empty() && x` can skip the arm, and `!body.is_empty() || x`
         # can take it with an empty body.
-        joined = block[test.end() : opener]
-        if ("||" if test.group(1) else "&&") in joined:
+        # Only `||` may follow `body.is_empty()`, and only `&&` may follow
+        # `!body.is_empty()`. Anything else, such as `== false`, can flip it.
+        joined = block[test.end() : opener].strip()
+        allowed, banned = ("&&", "||") if test.group(1) else ("||", "&&")
+        if joined and (not joined.startswith(allowed) or banned in joined):
             continue
         taken = balanced(block[opener:], "{", "}")
         taken_end = end = opener + len(taken)
@@ -1519,6 +1523,8 @@ pub fn harvest_api_router() -> Router {
         .route("/e/compound-guard", post(e_compound_guard))
         .route("/e/either-guard", post(e_either_guard))
         .route("/e/inspected", post(e_inspected))
+        .route("/e/mixed-calls", post(e_mixed_calls))
+        .route("/e/compared-guard", post(e_compared_guard))
 }
 
 async fn e_wrapped(body: Bytes) -> Response {
@@ -1996,6 +2002,22 @@ async fn e_either_guard(body: Bytes) -> Result<Response, Response> {
 async fn e_inspected(body: Bytes) -> Response {
     let valid = serde_json::from_slice::<Gadget>(&body).is_ok();
     StatusCode::OK.into_response()
+}
+
+async fn e_mixed_calls(body: Bytes) -> Response {
+    if !body.is_empty() {
+        let gadget = parse_gadget(&body)?;
+    }
+    let again = parse_gadget(&body).ok();
+    StatusCode::OK.into_response()
+}
+
+async fn e_compared_guard(body: Bytes) -> Result<Response, Response> {
+    if body.is_empty() == false {
+        return Ok(StatusCode::OK.into_response());
+    }
+    let gadget = serde_json::from_slice::<Gadget>(&body).map_err(reject)?;
+    Ok(StatusCode::OK.into_response())
 }
 
 async fn e_documented(Query(query): Query<Documented>) -> Response {
@@ -3032,6 +3054,29 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             )
         ],
         {},
+    ),
+    (
+        "a helper reached by a guarded call and a tolerant call is optional",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST", "/e/mixed-calls", 200, request_body=body_of(("name", True), required=False)
+            )
+        ],
+        {},
+    ),
+    (
+        "an empty-body test compared to a value is no guard",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/compared-guard",
+                200,
+                request_body=body_of(("name", True), required=False),
+            )
+        ],
+        {"body_required": ["POST /e/compared-guard: the body is mandatory"]},
     ),
     (
         "a malformed contract entry does not crash the audit",
