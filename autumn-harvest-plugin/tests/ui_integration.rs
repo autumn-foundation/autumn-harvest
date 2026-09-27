@@ -6973,6 +6973,56 @@ async fn ui_dag_retry_error_renders_human_message() {
     );
 }
 
+// Issue #1723: a commit that fails on a stale confirm page keeps the reason
+// the operator typed. The handler renders the page in place, not a redirect.
+#[tokio::test]
+async fn ui_dag_retry_commit_failure_keeps_entered_reason() {
+    let (url, _c) = setup_test_database_url().await;
+    let app = build_dag957_ui_app(&url, true, vec![]);
+
+    // The run completed after the confirm page loaded, so the commit gets 409.
+    let ia = autumn_harvest::ActivityExecId::new();
+    let events = vec![
+        dag957_sched("dag957_step_a", ia),
+        dag957_started(ia),
+        dag957_completed(ia),
+        autumn_harvest::WorkflowEvent::WorkflowCompleted {
+            output: Value::Null,
+        },
+    ];
+    let exec_id = dag957_seed_run(&url, "dag957_linear", "graph-stale", events, "COMPLETED").await;
+
+    let (status, headers, html) = post_form(
+        &app,
+        &format!("/dags/dag957_linear/runs/{exec_id}/retry"),
+        "from_node=dag957_step_a&reason=INC-4711%3A+stale+lock+on+step+a",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "headers: {headers:?} body: {html}");
+    assert!(
+        html.contains("INC-4711: stale lock on step a"),
+        "the operator's reason must stay on the page: {html}"
+    );
+    assert!(html.contains("Retry not started."), "error banner: {html}");
+    assert!(
+        html.contains("succeeded"),
+        "the 409 reason is shown: {html}"
+    );
+    assert!(
+        !html.contains("Confirm retry"),
+        "a run that cannot retry offers no commit: {html}"
+    );
+
+    // No fork started, so no audit row exists.
+    let count = dag957_audit_rows(
+        &url,
+        autumn_harvest::audit::OP_DAG_RETRY,
+        autumn_harvest::audit::SOURCE_UI,
+    )
+    .await;
+    assert_eq!(count, 0, "a failed commit writes no dag.retry audit row");
+}
+
 // I-F
 #[tokio::test]
 async fn ui_dag_run_graph_classic_dag_degraded() {
