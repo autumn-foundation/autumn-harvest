@@ -700,30 +700,65 @@ def chain_state(after: str) -> str:
     `"open"`, since the code after it decides. Other methods carry the error
     on.
     """
-    state = "result"
+    return walk_chain(after)[0]
+
+
+# Inspections that turn a `Result` or an `Option` into a boolean.
+INSPECTIONS = frozenset({"is_ok", "is_err", "is_ok_and", "is_err_and", "is_some", "is_none"})
+
+
+def walk_chain(after: str) -> tuple[str, str | None, str]:
+    """`(verdict, last inspection, text after the chain)` for `chain_state`."""
+    state, inspection = "result", None
     rest = after
     while True:
         rest = rest.lstrip()
         if rest.startswith("?"):
-            return "reject"
+            return "reject", inspection, rest
         call = re.match(r"\.\s*([a-z_][a-z_0-9]*)\s*\(", rest)
         if call is None:
-            return "open" if state == "result" else "tolerate"
+            return ("open" if state == "result" else "tolerate"), inspection, rest
         method = call.group(1)
         if method in ("unwrap", "expect") and state != "value":
-            return "reject"
+            return "reject", inspection, rest
         if method == "ok" and state == "result":
             state = "option"
         elif method in ("ok_or", "ok_or_else") and state == "option":
             state = "result"
-        elif method in ("unwrap_or", "unwrap_or_default", "unwrap_or_else"):
-            state = "value"
-        elif method in ("is_ok", "is_err", "is_ok_and", "is_err_and", "is_some", "is_none"):
-            state = "value"
-        elif method in ("map_or", "map_or_else"):
+        elif method in INSPECTIONS:
+            state, inspection = "value", method
+        elif method in (
+            "unwrap_or",
+            "unwrap_or_default",
+            "unwrap_or_else",
+            "map_or",
+            "map_or_else",
+        ):
             state = "value"
         opener = call.end() - 1
         rest = rest[opener + len(balanced(rest[opener:])) :]
+
+
+def inspection_rejects(before: str, inspection: str, rest: str) -> bool:
+    """Whether an `if` on an inspected parse sends a failed parse to a rejection.
+
+    `if parse.is_err() { .. }` runs its block on failure. `if parse.is_ok()`
+    runs its `else` on failure. A leading `!` swaps the two. The parse is
+    mandatory when that failure arm rejects, as `rejecting_exit` reads it.
+    """
+    condition = re.search(r"\bif\s+(!\s*)?(?:serde_json::)?$", before)
+    if condition is None or not rest.startswith("{"):
+        return False
+    taken = balanced(rest, "{", "}")
+    after_taken = rest[len(taken) :]
+    otherwise = None
+    if re.match(r"\s*else\s*\{", after_taken):
+        otherwise = balanced(after_taken[after_taken.index("{") :], "{", "}")
+    on_failure = inspection in ("is_err", "is_err_and", "is_none")
+    if condition.group(1):
+        on_failure = not on_failure
+    failure_arm = taken if on_failure else otherwise
+    return failure_arm is not None and rejecting_exit(failure_arm)
 
 
 def chain_rejects(after: str) -> bool:
@@ -760,8 +795,9 @@ def discards_error(before: str, after: str) -> bool:
     `if let Ok(..) =` before it, unless its `else` returns or builds an error.
     A `match` that handles `Err` is not read, so it counts as mandatory.
     """
-    if chain_state(after) == "tolerate":
-        return True
+    verdict, inspection, rest = walk_chain(after)
+    if verdict == "tolerate":
+        return not (inspection and inspection_rejects(before, inspection, rest))
     # A standalone `let Ok(..) = parse else { .. }` tolerates the error when its
     # fallback lets the request through. An `if let` has a block, not `else`,
     # right after the call, so it never matches here.
@@ -1565,6 +1601,8 @@ pub fn harvest_api_router() -> Router {
         .route("/e/if-let-json", post(e_if_let_json))
         .route("/e/raw-let-else", post(e_raw_let_else))
         .route("/e/map-or", post(e_map_or))
+        .route("/e/is-err-reject", post(e_is_err_reject))
+        .route("/e/is-ok-reject", post(e_is_ok_reject))
 }
 
 async fn e_wrapped(body: Bytes) -> Response {
@@ -2104,6 +2142,22 @@ async fn e_raw_let_else(body: Bytes) -> Result<Response, Response> {
 async fn e_map_or(body: Bytes) -> Response {
     let name = serde_json::from_slice::<Gadget>(&body).map_or(String::new(), |g| g.name);
     StatusCode::OK.into_response()
+}
+
+async fn e_is_err_reject(body: Bytes) -> Result<Response, Response> {
+    if serde_json::from_slice::<Gadget>(&body).is_err() {
+        return Err(reject());
+    }
+    Ok(StatusCode::OK.into_response())
+}
+
+async fn e_is_ok_reject(body: Bytes) -> Result<Response, Response> {
+    if serde_json::from_slice::<Gadget>(&body).is_ok() {
+        tracing::debug!("valid");
+    } else {
+        return Err(reject());
+    }
+    Ok(StatusCode::OK.into_response())
 }
 
 async fn e_documented(Query(query): Query<Documented>) -> Response {
@@ -3216,6 +3270,20 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             for path in ("/e/raw-let-else", "/e/map-or")
         ],
         {},
+    ),
+    (
+        "an inspection that decides a rejecting branch is mandatory",
+        FIXTURE_EDGES,
+        [
+            fixture_route("POST", path, 200, request_body=body_of(("name", True), required=False))
+            for path in ("/e/is-err-reject", "/e/is-ok-reject")
+        ],
+        {
+            "body_required": [
+                "POST /e/is-err-reject: the body is mandatory",
+                "POST /e/is-ok-reject: the body is mandatory",
+            ]
+        },
     ),
     (
         "a malformed contract entry does not crash the audit",
