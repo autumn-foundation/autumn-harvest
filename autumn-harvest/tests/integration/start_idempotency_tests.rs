@@ -751,6 +751,7 @@ async fn a_replaced_failed_run_still_reads_as_failed() {
             first,
             WorkflowIdReusePolicy::AllowDuplicate,
         ),
+        None,
     )
     .await
     .expect("first start");
@@ -780,6 +781,7 @@ async fn a_replaced_failed_run_still_reads_as_failed() {
             second,
             WorkflowIdReusePolicy::AllowDuplicateFailedOnly,
         ),
+        None,
     )
     .await
     .expect("replacing start");

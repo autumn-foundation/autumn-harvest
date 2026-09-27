@@ -18389,7 +18389,7 @@ async fn persist_workflow_continue_as_new_with_verdict(
     new_workflow_type: Option<String>,
     verdict: ContinueAsNewVerdict,
 ) -> HarvestResult<bool> {
-    use crate::schema::{harvest_events, harvest_signals, harvest_workflow_executions};
+    use crate::schema::{harvest_signals, harvest_workflow_executions};
 
     let offloader = registry.payload_offloader();
 

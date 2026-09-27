@@ -80,6 +80,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          build_reachability_fanout_perf
 linux        autumn-harvest         integration                      -                          business_day_timer_tests
 linux        autumn-harvest         integration                      -                          canary_tests
+linux        autumn-harvest         integration                      -                          cancellation_tests
 linux        autumn-harvest         integration                      -                          capability_miss_tests
 linux        autumn-harvest         integration                      -                          chain_timeout_tests
 linux        autumn-harvest         integration                      -                          child_fanout_batch_perf
@@ -108,6 +109,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          mutex_lease_reclaim_perf
 linux        autumn-harvest         integration                      -                          mutex_tests
 linux        autumn-harvest         integration                      -                          panic_containment_tests
+linux        autumn-harvest         integration                      -                          pause_tests
 linux        autumn-harvest         integration                      -                          poison_pill_reclaim_perf
 linux        autumn-harvest         integration                      -                          queue_pause_success_metric_tests
 linux        autumn-harvest         integration                      -                          queue_pause_tests
@@ -119,6 +121,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          quota_supersede_ordering_tests
 linux        autumn-harvest         integration                      -                          rate_limit_bucket_gc_tests
 linux        autumn-harvest         integration                      -                          rate_limit_key
+linux        autumn-harvest         integration                      -                          redrive_tests
 linux        autumn-harvest         integration                      -                          retention_overrides_tests
 linux        autumn-harvest         integration                      -                          retention_summary_tests
 linux        autumn-harvest         integration                      -                          retry_after_tests
@@ -146,6 +149,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          workflow_pause_claim_recheck_tests
 linux        autumn-harvest         integration                      -                          workflow_reachability_samples_tests
 linux        autumn-harvest         integration                      -                          workflow_retry_tests
+linux        autumn-harvest         integration                      -                          workflow_task_timeout_tests
 linux        autumn-harvest         integration                      hot-code-swap,testing      hot_code_swap_tests
 linux        autumn-harvest         integration                      testing                    backup_verify_refs_batch_perf
 linux        autumn-harvest         integration                      testing                    backup_verify_retention_batch_perf

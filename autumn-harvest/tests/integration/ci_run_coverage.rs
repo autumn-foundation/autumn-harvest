@@ -213,7 +213,6 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ("core:audit_tests", ALLOWLIST_DEBT_REASON),
     ("core:build_routing_tests", ALLOWLIST_DEBT_REASON),
     ("core:cache_delta_load_tests", ALLOWLIST_DEBT_REASON),
-    ("core:cancellation_tests", ALLOWLIST_DEBT_REASON),
     ("core:chaos_tests", ALLOWLIST_CHAOS_REASON),
     ("core:child_policy_tests", ALLOWLIST_DEBT_REASON),
     ("core:cross_workflow_cancel_tests", ALLOWLIST_DEBT_REASON),
@@ -221,11 +220,9 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ("core:debounce_tests", ALLOWLIST_DEBT_REASON),
     ("core:delayed_start_tests", ALLOWLIST_DEBT_REASON),
     ("core:legal_hold_tests", ALLOWLIST_DEBT_REASON),
-    ("core:pause_tests", ALLOWLIST_DEBT_REASON),
     ("core:payload_offload_db_tests", ALLOWLIST_DEBT_REASON),
     ("core:poison_pill_tests", ALLOWLIST_DEBT_REASON),
     ("core:queue_fairness_tests", ALLOWLIST_DEBT_REASON),
-    ("core:redrive_tests", ALLOWLIST_DEBT_REASON),
     ("core:replay_canary_tests", ALLOWLIST_TESTING_REASON),
     ("core:replayer_integration_tests", ALLOWLIST_TESTING_REASON),
     ("core:retry_now_tests", ALLOWLIST_DEBT_REASON),
@@ -248,7 +245,6 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ("core:transactional_activity_tests", ALLOWLIST_DEBT_REASON),
     ("core:typed_stubs_tests", ALLOWLIST_DEBT_REASON),
     ("core:updt_with_start_tests", ALLOWLIST_DEBT_REASON),
-    ("core:workflow_task_timeout_tests", ALLOWLIST_DEBT_REASON),
     // ── plugin (autumn-harvest-plugin/tests) ──
     ("plugin:archival_integration", ALLOWLIST_DEBT_REASON),
     ("plugin:batch_operations_integration", ALLOWLIST_DEBT_REASON),
@@ -1076,10 +1072,6 @@ const FEATURE_GATE_EXEMPT: &[(&str, &str)] = &[
     (
         "chaos_tests",
         "chaos-feature-gated: runs in the dedicated nightly chaos.yml job",
-    ),
-    (
-        "wasm_activities_tests",
-        "wasm-activities is an opt-in R&D feature with an MSRV above the crate's",
     ),
 ];
 
