@@ -827,27 +827,41 @@ def rejects_result_body(params: str, block: str) -> bool:
     return found is not None and error_rejects(found.group(1), block)
 
 
-def error_rejects(name: str, block: str, seen: frozenset[str] = frozenset()) -> bool:
+def error_rejects(
+    name: str, block: str, seen: frozenset[str] = frozenset(), bound_at: int = -1
+) -> bool:
     """Whether the handler rejects the error of the `Result` extractor `name`.
 
     `rejects_result_body` gives the forms it reads. A move into another name,
     such as `let captured = body;`, is followed. A pattern can read the
     extractor by value, borrowed, or through `as_ref()` or `as_mut()`.
-    Comments and literals are masked, so a call in them is no use.
+    Comments and literals are masked, so a call in them is no use. A later
+    `let` that gives `name` a new value ends the extractor. `bound_at` is where
+    a move created `name`, so that `let` is no such end.
     """
     if not seen:
         block = masked_source(block)
     variable = re.escape(name)
+    shadows = [(start, end) for start, end in shadowing_lets(block, name) if start > bound_at]
+
+    def live(position: int) -> bool:
+        """Whether `name` at `position` is still the extractor, not a new binding."""
+        return not any(
+            end <= position and same_scope(block, start, position) for start, end in shadows
+        )
+
     moved = r"\blet\s+(?:mut\s+)?([a-z_][a-z_0-9]*)\s*(?::[^=;]*)?=\s*%s\s*;" % variable
     for alias in re.finditer(moved, block):
-        if alias.group(1) not in seen | {name}:
-            if error_rejects(alias.group(1), block, seen | {name}):
+        if alias.group(1) not in seen | {name} and live(alias.start()):
+            if error_rejects(alias.group(1), block, seen | {name}, alias.start()):
                 return True
     borrow = r"(?:&\s*(?:mut\s+)?)?"
     method = r"(?:\s*\.\s*as_(?:ref|mut)\s*\(\s*\))?"
     # The extractor as a pattern reads it: by value, borrowed or through `as_ref`.
     read = borrow + variable + method
     for use in re.finditer(r"(?<![.\w])%s\b" % variable, block):
+        if not live(use.start()):
+            continue
         verdict, inspection, rest = walk_chain(block[use.end() :])
         # A chain that still holds the error and is the value of the block
         # hands that error to the caller, so it rejects like `?` does.
@@ -859,13 +873,15 @@ def error_rejects(name: str, block: str, seen: frozenset[str] = frozenset()) -> 
             return True
     scrutinee = r"\bmatch\s+%s\s*\{" % read
     for match in re.finditer(scrutinee, block):
+        if not live(match.start()):
+            continue
         arms = balanced(block[match.end() - 1 :], "{", "}")
         for failure in error_arms(arms):
             if arm_rejects(match_arm(arms, failure.start()), failure.group(1)):
                 return True
     for binding in re.finditer(r"\blet\s+Ok\s*\([^;=]*?\)\s*=\s*%s\s*else\s*\{" % read, block):
         otherwise = balanced(block[binding.end() - 1 :], "{", "}")
-        if rejecting_exit(otherwise):
+        if live(binding.start()) and rejecting_exit(otherwise):
             return True
     # After `let Err(e) = body else { .. };`, the rest of the scope runs only on
     # failure, so it is the failure arm.
@@ -873,21 +889,47 @@ def error_rejects(name: str, block: str, seen: frozenset[str] = frozenset()) -> 
     for binding in re.finditer(bound_err, block):
         otherwise = balanced(block[binding.end() - 1 :], "{", "}")
         rest = block[binding.end() - 1 + len(otherwise) :].lstrip().lstrip(";")
-        if arm_rejects(scope_rest(rest), binding.group(1)):
+        if live(binding.start()) and arm_rejects(scope_rest(rest), binding.group(1)):
             return True
     failed = r"\bif\s+let\s+Err\s*\(\s*%s([a-z_][a-z_0-9]*)?[^=]*=\s*%s\s*\{" % (BINDING, read)
     for tested in re.finditer(failed, block):
         taken = balanced(block[tested.end() - 1 :], "{", "}")
+        if not live(tested.start()):
+            continue
         if rejecting_exit(taken) or rejecting_arm(taken, tested.group(1)):
             return True
     for tested in re.finditer(r"\bif\s+let\s+Ok\s*\([^;=]*?\)\s*=\s*%s\s*\{" % read, block):
         taken = balanced(block[tested.end() - 1 :], "{", "}")
         rest = block[tested.end() - 1 + len(taken) :]
-        if re.match(r"\s*else\s*\{", rest):
+        if live(tested.start()) and re.match(r"\s*else\s*\{", rest):
             otherwise = balanced(rest[rest.index("{") :], "{", "}")
             if rejecting_exit(otherwise):
                 return True
     return False
+
+
+def shadowing_lets(block: str, name: str) -> list[tuple[int, int]]:
+    """`(start, end)` of each `let <name> = ..;` that makes `name` a new value.
+
+    After that statement, `name` in the same scope is no longer the extractor.
+    A value that reads `name` itself, such as `let body = body;`, can still
+    hold the extractor, so it is no shadow.
+    """
+    variable = re.escape(name)
+    found: list[tuple[int, int]] = []
+    for binding in re.finditer(r"\blet\s+(?:mut\s+)?%s\s*(?::[^=;]*)?=(?!=)" % variable, block):
+        depth, end = 0, len(block)
+        for index in range(binding.end(), len(block)):
+            char = block[index]
+            depth += char in "([{"
+            depth -= char in ")]}"
+            if depth < 0 or (depth == 0 and char == ";"):
+                end = index
+                break
+        value = block[binding.end() : end]
+        if not re.search(r"(?<![.\w])%s\b" % variable, value):
+            found.append((binding.start(), end))
+    return found
 
 
 def scope_rest(text: str) -> str:
@@ -1354,7 +1396,7 @@ def struct_fields(struct: str) -> list[tuple[str, str, bool, tuple[str, ...]]]:
     optional.
     """
     # A block comment can nest or span lines, so comments are masked first.
-    struct = code_only(struct, literals=False)
+    struct = canonical_paths(code_only(struct, literals=False))
     opener = struct.index("{")
     container = without_comment_lines(struct[:opener])
     all_default = re.search(r"serde\([^)]*\bdefault\b", container) is not None
@@ -1459,6 +1501,23 @@ def declared_statuses(route: dict) -> set[int]:
     return statuses
 
 
+# A path through `std` or `core` to `Result` or `Option`, and the type before
+# a variant, such as `std::result::Result::Err`. Only spaces and tabs are
+# matched, so a rename keeps every line.
+PRELUDE_PATH = re.compile(r"(?<![\w:])(?:::[ \t]*)?(?:std|core)[ \t]*::[ \t]*(?:result|option)[ \t]*::[ \t]*")
+VARIANT_PATH = re.compile(r"\b(?:Result|Option)[ \t]*::[ \t]*(?=(?:Ok|Err|Some|None)\b)")
+
+
+def canonical_paths(text: str) -> str:
+    """`text` with each qualified path to `Result`, `Option` or a variant cut.
+
+    `std::option::Option<T>` is `Option<T>`, and `std::result::Result::Err(e)`
+    is `Err(e)`. Every check then reads the short name only, so no check needs
+    its own rule for a path.
+    """
+    return VARIANT_PATH.sub("", PRELUDE_PATH.sub("", text))
+
+
 def canonical_extractors(source: str) -> str:
     """`source` with each imported alias of `Query` or `Json` renamed to it.
 
@@ -1475,7 +1534,7 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
     """Every finding, by check. `find_struct` maps a struct name to its block."""
     # A rename keeps every line, so line numbers still point at the source.
     lines = source.split("\n")
-    source = canonical_extractors(source)
+    source = canonical_paths(canonical_extractors(source))
     SOURCE[0] = source
     by_route = {(r["method"], r["path"]): r for r in contract["routes"]}
     routes = router_routes(source)
@@ -2124,6 +2183,11 @@ pub fn harvest_api_router() -> Router {
         .route("/e/json-alias", post(e_json_alias))
         .route("/e/json-tail-result", post(e_json_tail_result))
         .route("/e/json-return-map", post(e_json_return_map))
+        .route("/e/json-shadowed", post(e_json_shadowed))
+        .route("/e/json-std-err", post(e_json_std_err))
+        .route("/e/json-core-err", post(e_json_core_err))
+        .route("/e/qualified-option-body", post(e_qualified_option_body))
+        .route("/e/qualified-option-query", get(e_qualified_option_query))
         .route("/e/is-err-tail-helper", post(e_is_err_tail_helper))
         .route("/e/helper-default", post(e_helper_default))
         .route("/e/unknown-helper", post(e_unknown_helper))
@@ -2939,6 +3003,47 @@ async fn e_json_tail_result(body: Result<Json<Gadget>, JsonRejection>) -> Result
 
 async fn e_json_return_map(body: Result<Json<Gadget>, JsonRejection>) -> Result<Response, JsonRejection> {
     return body.map(|Json(gadget)| StatusCode::OK.into_response());
+}
+
+async fn e_json_shadowed(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    let value = match body {
+        Ok(Json(gadget)) => gadget,
+        Err(_) => return StatusCode::OK.into_response(),
+    };
+    let body = Some(value);
+    let gadget = body.unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_json_std_err(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    match body {
+        std::result::Result::Ok(Json(gadget)) => StatusCode::OK.into_response(),
+        std::result::Result::Err(e) => return e.into_response(),
+    }
+}
+
+async fn e_json_core_err(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    match body {
+        ::core::result::Result::Ok(Json(gadget)) => StatusCode::OK.into_response(),
+        Result::Err(_) => invalid_body(),
+    }
+}
+
+async fn e_qualified_option_body(Json(body): Json<QualifiedNote>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn e_qualified_option_query(Query(query): Query<QualifiedPage>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+struct QualifiedNote {
+    name: String,
+    note: std::option::Option<String>,
+}
+
+struct QualifiedPage {
+    page: ::core::option::Option<u32>,
 }
 
 async fn e_is_err_tail_helper(body: Result<Json<Gadget>, JsonRejection>) -> Response {
@@ -4704,6 +4809,52 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
                 "POST /e/json-return-map: the body is mandatory",
             ]
         },
+    ),
+    (
+        "a shadowed extractor name is no extractor use",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/json-shadowed",
+                200,
+                request_body=body_of(("name", False), required=False),
+            )
+        ],
+        {},
+    ),
+    (
+        "a path-qualified Err arm that rejects makes the body mandatory",
+        FIXTURE_EDGES,
+        [
+            fixture_route("POST", path, 200, request_body=body_of(("name", True), required=False))
+            for path in ("/e/json-std-err", "/e/json-core-err")
+        ],
+        {
+            "body_required": [
+                "POST /e/json-std-err: the body is mandatory",
+                "POST /e/json-core-err: the body is mandatory",
+            ]
+        },
+    ),
+    (
+        "a path-qualified Option field is optional",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/qualified-option-body",
+                200,
+                request_body=body_of(("name", True), ("note", False)),
+            ),
+            fixture_route(
+                "GET",
+                "/e/qualified-option-query",
+                200,
+                params=[query_param("page", "integer", False)],
+            ),
+        ],
+        {},
     ),
     (
         "an Err arm whose value is a type path builds a value",
