@@ -38,16 +38,26 @@ for f in "$doc" "$src"; do
   fi
 done
 
-# The doc's example: its SourceBinding::starts(...) call is unique in the
-# chapter. Read to the fence's own closing ``` rather than a fixed line
-# count -- flagged in review: a fixed `-A N` window silently stops
-# validating anything appended after that offset but still inside the
-# fence, so a later edit could grow the example, drift from the compiled
-# copy, and still print OK.
-doc_block="$(awk '
-  /SourceBinding::starts\("orders", "orders", "order_flow"\)/ { flag = 1 }
-  flag && /^```$/ { exit }
-  flag { print }
+# The doc's example: find the ```rust fence that contains the unique
+# SourceBinding::starts(...) anchor, then take that fence's ENTIRE content
+# -- from right after the opening ```rust to right before the closing ```
+# -- not just from the anchor onward. Flagged in review: anchoring the
+# start of the window to the anchor line itself ignores anything prepended
+# between the opening fence and the anchor (e.g. a bad `let` inserted
+# above the call), which would still be inside the compiled example's
+# fence but outside this script's comparison.
+doc_block="$(python3 -c '
+import re
+import sys
+
+with open(sys.argv[1]) as f:
+    text = f.read()
+
+anchor = "SourceBinding::starts(\"orders\", \"orders\", \"order_flow\")"
+for m in re.finditer(r"```rust\n(.*?)\n```", text, re.DOTALL):
+    if anchor in m.group(1):
+        print(m.group(1))
+        sys.exit(0)
 ' "$doc")"
 
 if [ -z "$doc_block" ]; then
