@@ -364,6 +364,17 @@ struct WorkflowFormEcho {
     trigger_update: Option<WorkflowTriggerUpdateEcho>,
 }
 
+impl WorkflowFormEcho {
+    /// True when this echo carries a real failure.
+    /// `render_workflow_detail` uses this to tell its two callers apart.
+    /// One is the plain `GET`, always with an empty echo. The other is a
+    /// mutation handler re-rendering in place after a genuine failure
+    /// (issue #1737).
+    const fn is_mutation_failure(&self) -> bool {
+        self.signal.is_some() || self.reset.is_some() || self.trigger_update.is_some()
+    }
+}
+
 #[derive(Debug)]
 struct WorkflowSignalEcho {
     signal_name: String,
@@ -5335,7 +5346,7 @@ fn render_workflow_list(
         (render_pagination(page, limit, limit_raw, has_next, state_filter, workflow_name_filter, search_attr_filter, started_after_raw, started_before_raw, exec_id_search, page_error))
     };
 
-    layout("Workflows · Vantage", &body, "")
+    layout("Workflows · Vantage", &body, "", None)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6205,7 +6216,13 @@ fn render_workflow_detail(
         }
     };
 
-    layout(&title, &body, "../")
+    // `form_echo` is non-empty exactly when this markup is the direct
+    // response to a POST. That POST is at `.../workflows/{id}/signal`
+    // (or `/reset`, `/trigger-update`), one path segment deeper than the
+    // plain `GET` this same function also serves. Correct the base only
+    // then -- see `layout`'s doc comment (issue #1737, Codex review).
+    let canonical_base = form_echo.is_mutation_failure().then_some("../");
+    layout(&title, &body, "../", canonical_base)
 }
 
 /// Per-row checkpoint rendering decision for the pending-activities table, after
@@ -6719,13 +6736,29 @@ fn js_escape(s: &str) -> String {
         .replace('\u{2029}', "\\u2029")
 }
 
-fn layout(title: &str, body: &Markup, base_href: &str) -> Markup {
+/// `canonical_base`, when `Some`, emits a `<base href="...">`. This makes
+/// every relative link and form action in `body` resolve against the
+/// page's normal URL. That matters when the response actually came back
+/// from a different, deeper URL (issue #1737 -- Codex review).
+///
+/// Vantage renders this exact `body` markup, unchanged, as a direct 200
+/// response to a POST. That POST goes to `.../workflows/{id}/signal` (or
+/// `/reset`, `/trigger-update`) on a genuine failure, instead of
+/// redirecting. Every relative href and form action in `body` is written
+/// assuming the document's URL is `.../workflows/{id}` -- one path
+/// segment shallower. Left uncorrected, resubmitting the reopened form
+/// would target `.../workflows/{id}/{id}/signal` and 404, and the header
+/// nav links would misresolve the same way.
+fn layout(title: &str, body: &Markup, base_href: &str, canonical_base: Option<&str>) -> Markup {
     html! {
         (PreEscaped("<!DOCTYPE html>"))
         html lang="en" {
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width,initial-scale=1";
+                @if let Some(base) = canonical_base {
+                    base href=(base);
+                }
                 title { (title) }
                 style { (PreEscaped(STYLE)) }
             }
@@ -7714,7 +7747,7 @@ async fn workflow_timeline_ui(
     );
     let title = format!("Timeline · {} · Vantage", execution.workflow_name);
     let body = render_timeline_body(&timeline, &execution, now);
-    Ok(layout(&title, &body, "../../"))
+    Ok(layout(&title, &body, "../../", None))
 }
 
 /// Build the timeline page body (back link + heading + Gantt). Extracted from
@@ -13321,7 +13354,7 @@ mod tests {
     #[test]
     fn layout_escapes_title_but_keeps_body_markup() {
         let body = html! { p { "hello" } };
-        let html = layout("<evil>", &body, "").into_string();
+        let html = layout("<evil>", &body, "", None).into_string();
         assert!(html.contains("<title>&lt;evil&gt;</title>"));
         assert!(html.contains("<p>hello</p>"));
         assert!(html.contains("🔭 Vantage"));
@@ -14145,7 +14178,7 @@ mod tests {
     #[test]
     fn layout_includes_workers_nav_link() {
         let body = html! { p { "test" } };
-        let html = layout("Test", &body, "").into_string();
+        let html = layout("Test", &body, "", None).into_string();
         assert!(
             html.contains("workers"),
             "layout must include a Workers nav link"
@@ -14590,7 +14623,7 @@ mod tests {
     #[test]
     fn layout_includes_schedules_nav_link() {
         let body = html! { p { "test" } };
-        let html = layout("Test", &body, "").into_string();
+        let html = layout("Test", &body, "", None).into_string();
         assert!(
             html.contains("schedules"),
             "layout must include schedules nav link"
@@ -15357,6 +15390,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mutation_failure_render_carries_a_canonical_base() {
+        // The plain GET has no echo, so no base correction is needed
+        // (Codex review, issue #1737). The document's own URL already
+        // matches what every relative link in the page assumes.
+        let plain = render_detail_with_echo(&WorkflowFormEcho::default());
+        assert!(
+            !plain.contains("<base "),
+            "the plain GET must not carry a <base> override: {plain}"
+        );
+
+        // A mutation-failure render is the direct response to a POST one
+        // path segment deeper (.../workflows/{id}/signal). It must
+        // correct relative resolution back to .../workflows/{id}.
+        // Otherwise a resubmit targets .../workflows/{id}/{id}/signal and
+        // 404s.
+        let echo = WorkflowFormEcho {
+            signal: Some(WorkflowSignalEcho {
+                signal_name: "approve".to_string(),
+                payload: String::new(),
+                error: "downstream rejected the signal".to_string(),
+            }),
+            ..Default::default()
+        };
+        let failed = render_detail_with_echo(&echo);
+        assert!(
+            failed.contains("<base href=\"../\">"),
+            "a mutation-failure render must carry the canonical base: {failed}"
+        );
+    }
+
     // ── Build Routing page unit tests (issue #362 — Red Phase) ─────────────
 
     #[test]
@@ -15377,7 +15441,7 @@ mod tests {
     #[test]
     fn layout_includes_build_routing_nav_link() {
         let body = html! { p { "test" } };
-        let html = layout("Test", &body, "").into_string();
+        let html = layout("Test", &body, "", None).into_string();
         assert!(
             html.contains("build-routing"),
             "base layout must include a Build Routing nav link"
