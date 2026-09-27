@@ -42,10 +42,10 @@ its brainstorm, reverse brainstorm and six hats, is
   does not change. A wrapper `TaskDispatch` must forward `ack_many` and the
   two lease methods. Otherwise it falls back to one ack per lease and a sweep
   on every worker.
-- **Recovery round trips (item 9).** One pipeline reads every pending entries
-  list, and a second claims every idle entry, for all queues at once. A failed
-  pipeline falls back to one queue at a time, so one bad queue does not block
-  the rest.
+- **Recovery round trips (item 9).** One step reads every pending entries
+  list, and a second claims every idle entry, for all queues at once. The
+  commands go out together on the multiplexed connection, and each keeps its
+  own result. One bad queue does not block the rest, and no claim runs twice.
 - **Sweep fan-out (item 10).** `[harvest.redis] reconcile_batch` (default
   1000, range 1 to 10000, env `AUTUMN_HARVEST_REDIS__RECONCILE_BATCH`). A
   per-queue sweep lease in Redis (`<prefix>:dispatch:<queue>:reconcile`) lets

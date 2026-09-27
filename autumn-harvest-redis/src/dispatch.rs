@@ -870,12 +870,13 @@ impl RedisDispatch {
     /// Re-add every entry that has been idle in the pending entries list
     /// longer than the visibility timeout, for every queue.
     ///
-    /// Each step is one round trip for all queues (issue #1429). One pipeline
-    /// reads every pending entries list. A second claims the idle entries of
-    /// every queue that has one. The discard and the requeue follow as batches.
+    /// Each step serves all queues at once (issue #1429). One step reads every
+    /// pending entries list. A second claims the idle entries of every queue
+    /// that has one. The discard and the requeue follow as batches.
     ///
-    /// A pipeline fails as a whole when one queue fails. The step then runs one
-    /// queue at a time, so one bad queue does not block the rest.
+    /// Each queue's command is sent at once on the multiplexed connection, so a
+    /// step costs about one round trip. Each command has its own result, so
+    /// one bad queue does not block the rest.
     async fn recover_queues(&self, queues: &[String]) -> RedisAdapterResult<usize> {
         if queues.is_empty() {
             return Ok(0);
@@ -958,39 +959,33 @@ impl RedisDispatch {
         keys: &[String],
     ) -> RedisAdapterResult<Vec<Option<StreamPendingCountReply>>> {
         let group = &self.config.consumer_group;
-        let mut conn = self.conn.clone();
-        let mut pipe = redis::pipe();
-        for key in keys {
-            pipe.xpending_count(key, group, "-", "+", RECOVER_BATCH);
-        }
-        let batch: RedisAdapterResult<Vec<StreamPendingCountReply>> =
-            pipe.query_async(&mut conn).await.map_err(Into::into);
-        if let Ok(replies) = batch {
-            return Ok(replies.into_iter().map(Some).collect());
-        }
-
-        let mut replies = Vec::with_capacity(keys.len());
-        let mut last_error = None;
-        for (queue, key) in queues.iter().zip(keys) {
-            let reply: redis::RedisResult<StreamPendingCountReply> = conn
-                .xpending_count(key, group, "-", "+", RECOVER_BATCH)
-                .await;
-            match reply {
-                Ok(reply) => replies.push(Some(reply)),
-                Err(err) => {
-                    tracing::warn!(queue = %queue, error = %err, "recovery skipped a queue");
-                    if is_nogroup(&err) {
-                        let _ = self.ensure_group(queue, true).await;
-                    }
-                    last_error = Some(err);
-                    replies.push(None);
+        let replies = futures::future::join_all(keys.iter().map(|key| {
+            let mut conn = self.conn.clone();
+            async move {
+                conn.xpending_count::<_, _, _, _, _, StreamPendingCountReply>(
+                    key,
+                    group,
+                    "-",
+                    "+",
+                    RECOVER_BATCH,
+                )
+                .await
+            }
+        }))
+        .await;
+        let mut healed = Vec::new();
+        for (queue, reply) in queues.iter().zip(&replies) {
+            if let Err(err) = reply {
+                tracing::warn!(queue = %queue, error = %err, "recovery skipped a queue");
+                if is_nogroup(err) {
+                    healed.push(queue);
                 }
             }
         }
-        match last_error {
-            Some(err) if replies.iter().all(Option::is_none) => Err(err.into()),
-            _ => Ok(replies),
+        for queue in healed {
+            let _ = self.ensure_group(queue, true).await;
         }
+        settle_replies(replies)
     }
 
     /// Claim the idle entries of each queue to the recovery consumer.
@@ -1000,55 +995,34 @@ impl RedisDispatch {
     /// to make the work deliverable again is to re-add it.
     ///
     /// Returns one reply per queue, `None` for a queue whose claim failed. An
-    /// error comes back only when every queue failed.
+    /// error comes back only when every queue failed. Each claim has its own
+    /// result, so a failed queue never costs the claims of the others.
     async fn claim_replies(
         &self,
         to_claim: &[(&str, &str, Vec<String>)],
         visibility_ms: u64,
     ) -> RedisAdapterResult<Vec<Option<StreamClaimReply>>> {
         let group = &self.config.consumer_group;
-        let mut conn = self.conn.clone();
-        let mut pipe = redis::pipe();
-        for (_, key, idle) in to_claim {
-            pipe.xclaim(
-                *key,
-                group,
-                RECOVERY_CONSUMER,
-                visibility_ms,
-                idle.as_slice(),
-            );
-        }
-        let batch: RedisAdapterResult<Vec<StreamClaimReply>> =
-            pipe.query_async(&mut conn).await.map_err(Into::into);
-        if let Ok(replies) = batch {
-            return Ok(replies.into_iter().map(Some).collect());
-        }
-
-        let mut replies = Vec::with_capacity(to_claim.len());
-        let mut last_error = None;
-        for (queue, key, idle) in to_claim {
-            let reply: redis::RedisResult<StreamClaimReply> = conn
-                .xclaim(
+        let replies = futures::future::join_all(to_claim.iter().map(|(_, key, idle)| {
+            let mut conn = self.conn.clone();
+            async move {
+                conn.xclaim::<_, _, _, _, _, StreamClaimReply>(
                     *key,
                     group,
                     RECOVERY_CONSUMER,
                     visibility_ms,
                     idle.as_slice(),
                 )
-                .await;
-            match reply {
-                Ok(reply) => replies.push(Some(reply)),
-                Err(err) => {
-                    tracing::warn!(queue = %queue, error = %err, "recovery skipped a queue");
-                    last_error = Some(err);
-                    replies.push(None);
-                }
+                .await
+            }
+        }))
+        .await;
+        for ((queue, _, _), reply) in to_claim.iter().zip(&replies) {
+            if let Err(err) = reply {
+                tracing::warn!(queue = %queue, error = %err, "recovery skipped a queue");
             }
         }
-        match last_error {
-            Some(err) if replies.iter().all(Option::is_none) => Err(err.into()),
-            _ => Ok(replies),
-        }
+        settle_replies(replies)
     }
 }
 
@@ -1243,6 +1217,25 @@ fn entry_payload(map: &HashMap<String, redis::Value>) -> Option<String> {
         redis::Value::BulkString(bytes) => std::str::from_utf8(bytes).ok().map(ToString::to_string),
         redis::Value::SimpleString(text) => Some(text.clone()),
         _ => None,
+    }
+}
+
+/// One `Option` per reply, or the last error when every reply failed.
+fn settle_replies<T>(replies: Vec<redis::RedisResult<T>>) -> RedisAdapterResult<Vec<Option<T>>> {
+    let mut last_error = None;
+    let mut settled = Vec::with_capacity(replies.len());
+    for reply in replies {
+        match reply {
+            Ok(reply) => settled.push(Some(reply)),
+            Err(err) => {
+                last_error = Some(err);
+                settled.push(None);
+            }
+        }
+    }
+    match last_error {
+        Some(err) if settled.iter().all(Option::is_none) => Err(err.into()),
+        _ => Ok(settled),
     }
 }
 
@@ -1513,6 +1506,24 @@ mod tests {
     #[test]
     fn promote_script_compiles() {
         let _ = Script::new(PROMOTE_MARKED_LUA);
+    }
+
+    /// A failed queue keeps its own slot. The other replies survive, so a
+    /// claim that ran is never retried (issue #1429).
+    #[test]
+    fn settle_replies_keeps_the_replies_that_succeeded() {
+        let failed = || {
+            Err::<u8, _>(RedisError::from((
+                redis::ErrorKind::ResponseError,
+                "NOGROUP",
+            )))
+        };
+
+        let mixed = settle_replies(vec![Ok(1_u8), failed(), Ok(3)]).expect("one success is enough");
+        assert_eq!(mixed, vec![Some(1), None, Some(3)]);
+
+        assert!(settle_replies(vec![failed(), failed()]).is_err());
+        assert_eq!(settle_replies::<u8>(Vec::new()).expect("empty"), Vec::new());
     }
 
     #[test]

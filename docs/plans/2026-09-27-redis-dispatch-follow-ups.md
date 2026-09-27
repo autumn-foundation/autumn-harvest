@@ -23,7 +23,7 @@ so each one gets its own issue.
 | 6 | Effective config | Do | Add a `redis` section to the admin config view. |
 | 7 | Metrics | Do | Three counters, two alerts, runbook sections and panels. |
 | 8 | Batched acks | Do | `TaskDispatch::ack_many` with a default body. |
-| 9 | Recovery round trips | Do | Pipeline `XPENDING` and `XCLAIM` across queues. |
+| 9 | Recovery round trips | Do | Send `XPENDING` and `XCLAIM` for all queues at once. |
 | 10 | Sweep fan-out | Do | Make `reconcile_batch` tunable, 1 to 10000. Add a per-queue sweep lease. |
 
 ## 3. Brainstorm
@@ -34,7 +34,7 @@ so each one gets its own issue.
 | 6 | (a) a `redis` section in core, filled by the plugin; (b) a plugin wrapper view; (c) a generic `dispatch` section | (a). The key names match `[harvest.redis]`, so an operator finds them. The endpoint is the redacted URL. |
 | 7 | (a) counters at the event sites; (b) a sampler over process-global atomics; (c) gauges | (a). The worker counts fallbacks and recoveries. The background publisher counts each dropped hint at the drop site, through a process-global recorder. The plugin runner and `Worker::new` set it with `dispatch::set_dropped_hint_recorder`. |
 | 8 | (a) ack each lease after its claim (today); (b) claim all, ack all, then start the tasks; (c) start each task after its claim, ack all at the end | (b). The ack still comes before the task starts, so the crash matrix does not change. The cost is that the first task waits for the other claims in the read. |
-| 9 | (a) one pipeline for all `XPENDING`, one for all `XCLAIM`; (b) `XAUTOCLAIM` | (a). `XAUTOCLAIM` needs Redis 6.2, and it is still one call per queue. |
+| 9 | (a) one pipeline for all `XPENDING`, one for all `XCLAIM`; (b) `XAUTOCLAIM`; (c) concurrent commands on the multiplexed connection | (c). It costs about one round trip, like (a), and each command keeps its own result. A pipeline fails as a whole, and retrying it would repeat claims that already ran. `XAUTOCLAIM` needs Redis 6.2. |
 | 10 | (a) a tunable batch only; (b) a lease per queue so one worker sweeps; (c) a shared cursor in Redis | (a) plus (b). (c) leaks the Postgres cursor type into the channel trait. The lease TTL is three times the larger of `reconcile_interval` and `poll_interval`. Each worker keeps its own cursor when it loses a lease. |
 
 ## 4. Reverse brainstorm: how to make this lose work or mislead an operator
@@ -110,8 +110,10 @@ A multi-angle review of the first cut changed these points:
   site. The sampler and its atomic swap are gone.
 - **Item 8.** The end-to-end wrappers forward `ack_many` and the two lease
   methods.
-- **Item 9.** Recovery falls back to one queue at a time when a pipeline
-  fails, so one bad queue does not block the rest.
+- **Item 9.** Recovery sends each queue's command at once on the multiplexed
+  connection, not in one pipeline. Each command has its own result. A failed
+  queue never forces a retry of claims that already ran, so one bad queue does
+  not block the rest.
 - **Item 10.** The range of `reconcile_batch` is now 1 to 10000. The lease TTL
   is three times the larger of the two intervals. The holder renews at sweep
   start and releases its leases on stop. A worker keeps its cursor across a
