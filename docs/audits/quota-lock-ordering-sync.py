@@ -451,6 +451,19 @@ def extract_function(text: str, name: str) -> str | None:
     exactly; only the RETURNED span is read from unmasked `text`, so a
     real comment or string inside the function body is preserved verbatim
     in what gets compared.
+
+    The body's opening brace is found only after skipping the parameter
+    list's own balanced parens (`find_matching_paren`, reusing the same
+    helper the call-site guard's argument-list matching needs). A
+    follow-up round found the earlier "first `{` after the signature"
+    search could stop at a brace inside the parameter list itself — a
+    const-generic block expression in a parameter's type, `x: [();
+    { const N: usize = 1; N }]`, is valid Rust — and extract only the
+    signature prefix as if it were the whole function. None of the six
+    functions this script actually tracks has anything like that in its
+    signature; a brace surviving in a return type or `where` clause after
+    the parameter list closes remains unhandled, the same declared,
+    bounded stopping point as the alias-tracking limit above.
     """
     masked = mask_comments_and_strings(text)
     sig_re = re.compile(FN_SIGNATURE_RE_TEMPLATE.format(name=re.escape(name)))
@@ -458,7 +471,8 @@ def extract_function(text: str, name: str) -> str | None:
     if not m:
         return None
     start = m.start() + 1  # skip the leading newline
-    open_brace = masked.index("{", m.end())
+    params_close = find_matching_paren(masked, m.end() - 1)
+    open_brace = masked.index("{", params_close)
     end = find_matching_brace(text, open_brace)
     return text[start:end]
 
