@@ -128,6 +128,7 @@ prints the N=9..24 collision sweep this docstring's findings came from.
 """
 import argparse
 import re
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -802,19 +803,47 @@ async fn only_if_db_enabled() {}
     assert cfg_is_enabled("unix", set()) is True
     assert cfg_is_enabled("not(unix)", set()) is False
 
-    assert enabled_features_for_row("autumn-harvest", "-") == {
-        "db",
-        "unified-dag-execution",
-        "tls",
-    }
-    assert enabled_features_for_row("autumn-harvest", "testing,debugger") == {
-        "db",
-        "unified-dag-execution",
-        "tls",
-        "testing",
-        "debugger",
-    }
-    assert enabled_features_for_row("autumn-harvest-plugin", "-") == set()
+    # crate_default_features/enabled_features_for_row: exercise the real
+    # Cargo.toml-parsing path against a disposable fixture tree, not today's
+    # live `autumn-harvest` default set. An earlier version of this self-test
+    # asserted that live set directly and broke the day `tls` joined it
+    # (issue #1717) — a legitimate default-feature change, not a harness bug,
+    # tripping the same gate this refresh exists to fix (Codex review, this
+    # harness's own fifth PR round). `global REPO_ROOT` is safe here: every
+    # reader of it (`crate_default_features`, `target_path`) re-reads the
+    # module global inside its own body rather than capturing it at import
+    # time, so redirecting it for the fixture's lifetime is enough.
+    global REPO_ROOT
+    real_repo_root = REPO_ROOT
+    fixture_root = Path(tempfile.mkdtemp())
+    (fixture_root / "fixture-crate").mkdir()
+    (fixture_root / "fixture-crate" / "Cargo.toml").write_text(
+        '[features]\ndefault = ["alpha", "beta"]\n'
+    )
+    (fixture_root / "no-features-crate").mkdir()
+    (fixture_root / "no-features-crate" / "Cargo.toml").write_text(
+        '[package]\nname = "no-features-crate"\n'
+    )
+    REPO_ROOT = fixture_root
+    _DEFAULT_FEATURES_CACHE.clear()
+    try:
+        assert crate_default_features("fixture-crate") == {"alpha", "beta"}
+        assert crate_default_features("no-features-crate") == set()
+        assert crate_default_features("missing-crate") == set(), (
+            "no Cargo.toml at all matches Cargo's own no-default-features behavior"
+        )
+        assert enabled_features_for_row("fixture-crate", "-") == {"alpha", "beta"}
+        assert enabled_features_for_row("fixture-crate", "gamma,delta") == {
+            "alpha",
+            "beta",
+            "gamma",
+            "delta",
+        }
+        assert enabled_features_for_row("no-features-crate", "-") == set()
+    finally:
+        REPO_ROOT = real_repo_root
+        _DEFAULT_FEATURES_CACHE.clear()
+        shutil.rmtree(fixture_root)
 
     # enumerate_qualified_tests: qualified paths (mod-name-prefixed, no file
     # stem — the caller adds that) and their cfg conditions, for a nested
