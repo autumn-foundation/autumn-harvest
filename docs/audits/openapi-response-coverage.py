@@ -847,7 +847,7 @@ def error_rejects(name: str, block: str, seen: frozenset[str] = frozenset()) -> 
         for failure in error_arms(arms):
             if arm_rejects(match_arm(arms, failure.start()), failure.group(1)):
                 return True
-    for binding in re.finditer(r"\blet\s+Ok\s*\(.*?\)\s*=\s*%s\s*else\s*\{" % read, block):
+    for binding in re.finditer(r"\blet\s+Ok\s*\([^;=]*?\)\s*=\s*%s\s*else\s*\{" % read, block):
         otherwise = balanced(block[binding.end() - 1 :], "{", "}")
         if rejecting_exit(otherwise):
             return True
@@ -864,7 +864,7 @@ def error_rejects(name: str, block: str, seen: frozenset[str] = frozenset()) -> 
         taken = balanced(block[tested.end() - 1 :], "{", "}")
         if rejecting_exit(taken) or rejecting_arm(taken, tested.group(1)):
             return True
-    for tested in re.finditer(r"\bif\s+let\s+Ok\s*\(.*?\)\s*=\s*%s\s*\{" % read, block):
+    for tested in re.finditer(r"\bif\s+let\s+Ok\s*\([^;=]*?\)\s*=\s*%s\s*\{" % read, block):
         taken = balanced(block[tested.end() - 1 :], "{", "}")
         rest = block[tested.end() - 1 + len(taken) :]
         if re.match(r"\s*else\s*\{", rest):
@@ -1080,8 +1080,9 @@ def fallback_rejects(method: str, arguments: str, state: str = "result") -> bool
         return state == "result" or builds_rejection(fallback + "(")
     bound, body = closure.group(1), closure.group(2)
     # A helper can build a rejection without the error, as `builds_rejection`
-    # reads it. A type path such as `Gadget::default()` builds a value.
-    if builds_rejection(closure_value(body)):
+    # reads it. A type path such as `Gadget::default()` builds a value. An
+    # explicit `return` of a rejection also rejects.
+    if builds_rejection(closure_value(body)) or rejecting_exit(body):
         return True
     if bound is None or bound == "_":
         return False
@@ -2100,6 +2101,8 @@ pub fn harvest_api_router() -> Router {
         .route("/e/or-exit-then-unwrap", post(e_or_exit_then_unwrap))
         .route("/e/nested-param-comment", post(e_nested_param_comment))
         .route("/e/local-from-slice", post(e_local_from_slice))
+        .route("/e/closure-return", post(e_closure_return))
+        .route("/e/multiline-let-else", post(e_multiline_let_else))
 }
 
 async fn e_wrapped(body: Bytes) -> Response {
@@ -3074,6 +3077,19 @@ async fn e_nested_param_comment(/* outer /* inner */ ghost: Json<Gadget>, */) ->
 
 async fn e_local_from_slice(body: Bytes) -> Response {
     let gadget = from_slice::<Gadget>(&body);
+    StatusCode::OK.into_response()
+}
+
+async fn e_closure_return(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    body.map_or_else(|_| { return invalid_body(); }, |Json(gadget)| accept(gadget))
+}
+
+async fn e_multiline_let_else(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    let Ok(Json(Gadget {
+        name,
+    })) = body else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
     StatusCode::OK.into_response()
 }
 
@@ -4805,6 +4821,26 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             for path in ("/e/nested-param-comment", "/e/local-from-slice")
         ],
         {},
+    ),
+    (
+        "a closure that returns a rejection and a multi-line let-else are mandatory",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                path,
+                200,
+                request_body=body_of(("name", True), required=False),
+                error_responses=[{"status": 400}],
+            )
+            for path in ("/e/closure-return", "/e/multiline-let-else")
+        ],
+        {
+            "body_required": [
+                "POST /e/closure-return: the body is mandatory",
+                "POST /e/multiline-let-else: the body is mandatory",
+            ]
+        },
     ),
     (
         "a malformed contract entry does not crash the audit",
