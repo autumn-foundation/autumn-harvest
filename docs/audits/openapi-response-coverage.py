@@ -495,14 +495,23 @@ def parts_at(source: str, start: int) -> tuple[str, str, str] | None:
     parameter list has its comments removed, so a comment that names an
     extractor is not read as one.
     """
-    opener = source.find("(", start)
-    params = balanced(source[opener:])
-    brace = source.find("{", opener + len(params))
+    # Brackets are matched on a copy with literals blanked, so a `{` in a
+    # string or a char literal does not end a block early or late.
+    masked = masked_source(source)
+    opener = masked.find("(", start)
+    params = source[opener : opener + len(balanced(masked[opener:]))]
+    brace = masked.find("{", opener + len(params))
     if brace < 0:
         return None
     returns = source[opener + len(params) : brace]
     code = re.sub(r"//[^\n]*|/\*.*?\*/", "", params, flags=re.S)
-    return code, returns, balanced(source[brace:], "{", "}")
+    return code, returns, source[brace : brace + len(balanced(masked[brace:], "{", "}"))]
+
+
+@functools.lru_cache(maxsize=None)
+def masked_source(source: str) -> str:
+    """`source` through `code_only`, computed once per source."""
+    return code_only(source)
 
 
 def byte_parameters(params: str) -> set[str]:
@@ -738,7 +747,9 @@ def error_rejects(name: str, block: str, seen: frozenset[str] = frozenset()) -> 
             return True
         if inspection and inspection_rejects(block[: use.start()], inspection, rest):
             return True
-    scrutinee = r"\bmatch\s+&?\s*%s(?:\s*\.\s*as_ref\s*\(\s*\))?\s*\{" % variable
+    borrow = r"(?:&\s*(?:mut\s+)?)?"
+    method = r"(?:\s*\.\s*as_(?:ref|mut)\s*\(\s*\))?"
+    scrutinee = r"\bmatch\s+%s%s%s\s*\{" % (borrow, variable, method)
     for match in re.finditer(scrutinee, block):
         arms = balanced(block[match.end() - 1 :], "{", "}")
         for failure in error_arms(arms):
@@ -1908,6 +1919,7 @@ pub fn harvest_api_router() -> Router {
         .route("/e/commented-parse", post(e_commented_parse))
         .route("/e/let-else-json", post(e_let_else_json))
         .route("/e/map-or-helper", post(e_map_or_helper))
+        .route("/e/match-mut", post(e_match_mut))
 }
 
 async fn e_wrapped(body: Bytes) -> Response {
@@ -2720,6 +2732,14 @@ async fn e_let_else_json(body: Result<Json<Gadget>, JsonRejection>) -> Json<Gadg
 
 async fn e_map_or_helper(body: Result<Json<Gadget>, JsonRejection>) -> Response {
     body.map_or(invalid_body(), |Json(gadget)| accept(gadget))
+}
+
+async fn e_match_mut(mut body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    match &mut body {
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        Ok(Json(gadget)) => gadget.name.clear(),
+    }
+    StatusCode::OK.into_response()
 }
 
 fn invalid_body() -> Response {
@@ -4250,6 +4270,20 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             )
         ],
         {"body_required": ["POST /e/map-or-helper: the body is mandatory"]},
+    ),
+    (
+        "a match on a mutable borrow of a Result extractor is read",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/match-mut",
+                200,
+                request_body=body_of(("name", True), required=False),
+                error_responses=[{"status": 400}],
+            )
+        ],
+        {"body_required": ["POST /e/match-mut: the body is mandatory"]},
     ),
     (
         "a malformed contract entry does not crash the audit",
