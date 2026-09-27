@@ -1099,6 +1099,15 @@ impl HarvestRunner {
             })?;
         }
 
+        // Serialize this call's dispatch-install-through-commit-or-unwind
+        // span against every other overlapping `start` call (Codex review,
+        // issue #1429 follow-up). See `DISPATCH_START_LOCK`'s own doc
+        // comment for the race this closes. Held only until just after
+        // `dispatch_guard.commit()` below, not for the rest of this
+        // function. Everything after commit no longer touches dispatch
+        // state a racing start could observe mid-resolution.
+        let dispatch_start_guard = DISPATCH_START_LOCK.lock().await;
+
         // Issue #1312: install the process-global dispatch channel(s) BEFORE
         // the worker is constructed, and in every mode. An API-only process
         // owns no worker but still publishes references for the fleet, so
@@ -1207,6 +1216,7 @@ impl HarvestRunner {
             guard.commit();
         }
         dispatch_guard.commit();
+        drop(dispatch_start_guard);
         prepared.effective_config.dispatch = Some(dispatch_config_view(
             &config.redis,
             dispatch_installed,
@@ -1668,6 +1678,35 @@ enum DispatchInstallKind {
         autumn_harvest::dispatch::TopologySnapshot,
     ),
 }
+
+/// Serializes `start`'s dispatch-install-through-commit-or-unwind span
+/// across overlapping calls (Codex review, issue #1429 follow-up).
+///
+/// Two overlapping `start` calls can each install their own topology.
+/// Each one snapshots whatever the other's still-uncommitted install just
+/// put in the slot. Consider runner A installing first, then runner B
+/// installing over it, snapshotting A's topology as it does. Suppose A
+/// then fails and unwinds. That unwind is a no-op: the slot no longer
+/// carries A's generation, since B has since replaced it. Suppose B then
+/// *also* fails and unwinds. B's own generation still matches, so its
+/// restore succeeds, and it puts back the snapshot it captured earlier.
+///
+/// That snapshot is A's own topology. But A already returned `Err` and
+/// abandoned it; it was never committed. It is not the topology that was
+/// actually live before either of these two starts began. Nothing owns
+/// this resurrected topology. A kept no reference to it once it unwound.
+/// It stays installed indefinitely, looking live to `/admin/config` and
+/// to the next `is_installed()` check, with no worker ever consuming
+/// through it.
+///
+/// Holding this lock for `start`'s whole install-through-resolution
+/// span, not only around the install call itself, closes that gap. The
+/// *next* racing `start` cannot even take its own snapshot until the
+/// current one has fully committed or fully unwound. Its snapshot then
+/// always captures a topology in one of those two resolved states. It
+/// can never capture a concurrent start's own uncommitted,
+/// possibly-about-to-fail one.
+static DISPATCH_START_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Uninstall the process-global dispatch channel(s) when startup fails later.
 ///
@@ -2794,6 +2833,35 @@ mod tests {
             "a committed guard must leave the channel installed"
         );
         autumn_harvest::dispatch::uninstall();
+    }
+
+    /// `DISPATCH_START_LOCK` must serialize `start`'s
+    /// install-through-commit-or-unwind span across overlapping calls
+    /// (Codex review, issue #1429 follow-up).
+    ///
+    /// Without it, a second overlapping `start` could snapshot a first
+    /// call's still-uncommitted, about-to-fail install. Suppose both then
+    /// fail and unwind. The second one's restore can then resurrect the
+    /// first one's already-abandoned topology, instead of the state that
+    /// was actually live before either started. See `DISPATCH_START_LOCK`'s
+    /// own doc comment for the full race.
+    ///
+    /// This pins the primitive itself. A second attempt must not acquire
+    /// the lock while the first holds it. It must succeed once the first
+    /// releases it.
+    #[tokio::test]
+    async fn dispatch_start_lock_serializes_overlapping_starts() {
+        let first = super::DISPATCH_START_LOCK.lock().await;
+        assert!(
+            super::DISPATCH_START_LOCK.try_lock().is_err(),
+            "a second start's own install must not begin while this one still holds the lock, \
+             mid install-through-commit-or-unwind"
+        );
+        drop(first);
+        assert!(
+            super::DISPATCH_START_LOCK.try_lock().is_ok(),
+            "the lock must be available again once its holder resolves, one way or the other"
+        );
     }
 
     /// A queue name the channel key
