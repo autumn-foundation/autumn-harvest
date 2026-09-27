@@ -1376,6 +1376,28 @@ impl HarvestRunner {
     /// falls through to Postgres. `dispatch::uninstall_if_current`/
     /// `uninstall_all_shards_if_current` are no-ops once the generation(s)
     /// this runner captured at install time no longer match.
+    ///
+    /// Also serializes against `DISPATCH_START_LOCK` for that same check
+    /// (Codex review, issue #1429 follow-up, once more). Without it, this
+    /// call could run its generation check while a replacement `start`
+    /// sits between its own install and its eventual commit or unwind.
+    /// This runner's generation would not be current yet -- the
+    /// replacement's is -- so this call would correctly leave the slot
+    /// alone.
+    ///
+    /// But suppose that replacement later fails. Its own unwind restores
+    /// the snapshot it captured. That snapshot is this runner's
+    /// already-stopped topology, with this runner's own original
+    /// generation. Nothing then cleans it back up. It stays installed
+    /// indefinitely, looking live with no worker consuming through it.
+    ///
+    /// Waiting for the same lock a racing `start` holds for its whole
+    /// install-through-resolution span closes that gap. This call's own
+    /// check then always runs after that span ends, one way or the
+    /// other. It either finds the replacement's own, still-uncontested
+    /// generation, a clean and correct no-op. Or it finds this runner's
+    /// own generation restored by that replacement's unwind, which this
+    /// call then correctly tears down itself.
     pub async fn stop(self) {
         let Self {
             api_runtime: _,
@@ -1391,10 +1413,15 @@ impl HarvestRunner {
             dispatch_metrics_sampler,
         } = self;
 
-        if !dispatch_shard_generations.is_empty() {
-            autumn_harvest::dispatch::uninstall_all_shards_if_current(&dispatch_shard_generations);
-        } else if let Some(generation) = dispatch_install_generation {
-            autumn_harvest::dispatch::uninstall_if_current(generation);
+        {
+            let _dispatch_start_guard = DISPATCH_START_LOCK.lock().await;
+            if !dispatch_shard_generations.is_empty() {
+                autumn_harvest::dispatch::uninstall_all_shards_if_current(
+                    &dispatch_shard_generations,
+                );
+            } else if let Some(generation) = dispatch_install_generation {
+                autumn_harvest::dispatch::uninstall_if_current(generation);
+            }
         }
 
         if let Some((cancel, handle)) = dispatch_metrics_sampler {
@@ -1679,8 +1706,9 @@ enum DispatchInstallKind {
     ),
 }
 
-/// Serializes `start`'s dispatch-install-through-commit-or-unwind span
-/// across overlapping calls (Codex review, issue #1429 follow-up).
+/// Serializes `start`'s dispatch-install-through-commit-or-unwind span,
+/// and `stop`'s own generation check, against every other overlapping
+/// call to either (Codex review, issue #1429 follow-up).
 ///
 /// Two overlapping `start` calls can each install their own topology.
 /// Each one snapshots whatever the other's still-uncommitted install just
@@ -1706,6 +1734,14 @@ enum DispatchInstallKind {
 /// always captures a topology in one of those two resolved states. It
 /// can never capture a concurrent start's own uncommitted,
 /// possibly-about-to-fail one.
+///
+/// `HarvestRunner::stop` holds this too, for its own generation check
+/// (Codex review, issue #1429 follow-up). See its own doc comment for
+/// the matching race on that side. A `stop` call whose generation check
+/// runs while a replacement `start` is mid-span can see itself already
+/// superseded and correctly leave the slot alone. That same
+/// replacement's later unwind can then restore its own topology right
+/// back, with nothing left to notice and clean it up again.
 static DISPATCH_START_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Uninstall the process-global dispatch channel(s) when startup fails later.
@@ -3138,6 +3174,62 @@ mod tests {
         assert!(
             autumn_harvest::dispatch::installed().is_none(),
             "stop must uninstall the channel the runner installed"
+        );
+    }
+
+    /// `stop`'s own generation check must wait for a racing `start` that
+    /// is mid install-through-resolution, not run ahead of it (Codex
+    /// review, issue #1429 follow-up).
+    ///
+    /// Without `DISPATCH_START_LOCK`, `stop`'s check could run while a
+    /// replacement `start` sits between its own install and its eventual
+    /// unwind. This runner's generation would not be current yet, so
+    /// `stop` would leave the slot alone -- correctly, at that instant.
+    ///
+    /// Suppose the replacement then failed and unwound. Its own restore
+    /// would put this runner's original topology right back, with
+    /// nothing left watching to clean it up again. This pins that
+    /// `stop` now blocks on the same lock a racing `start` holds. So its
+    /// check always runs after that span ends, one way or the other.
+    #[test]
+    fn stop_waits_for_a_racing_starts_install_span_before_its_own_check() {
+        let _lock = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|error| {
+            DISPATCH_TEST_LOCK.clear_poison();
+            error.into_inner()
+        });
+        autumn_harvest::dispatch::uninstall();
+
+        let generation = autumn_harvest::dispatch::install(
+            std::sync::Arc::new(autumn_harvest::dispatch::MemoryDispatch::new()),
+            autumn_harvest::dispatch::DispatchSettings::default(),
+        );
+        let runner = runner_owning_dispatch(Some(generation));
+
+        block_on(async {
+            let local = tokio::task::LocalSet::new();
+            local
+                .run_until(async {
+                    // Simulate a racing `start` mid install-through-resolution:
+                    // hold the same lock `stop` must wait for.
+                    let guard = super::DISPATCH_START_LOCK.lock().await;
+                    let stop_handle = tokio::task::spawn_local(runner.stop());
+
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    assert!(
+                        autumn_harvest::dispatch::installed().is_some(),
+                        "stop's generation check must not run while a racing start \
+                         holds DISPATCH_START_LOCK"
+                    );
+
+                    drop(guard);
+                    stop_handle.await.expect("stop must complete");
+                })
+                .await;
+        });
+
+        assert!(
+            autumn_harvest::dispatch::installed().is_none(),
+            "stop must uninstall its own channel once the lock is free"
         );
     }
 
