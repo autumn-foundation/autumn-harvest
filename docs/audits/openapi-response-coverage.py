@@ -494,6 +494,9 @@ ERROR_TOKENS = r"AutumnError::|\bErr\(|StatusCode::(?!(?:%s)\b)[A-Z_]+\b" % SUCC
 # `Gadget::default()` starts with a capital, so it does not match.
 FREE_CALL = r"(?:return\s+)?([a-z_][a-z_0-9]*)\s*\("
 
+# The `ref` and `mut` markers a pattern binding can carry, as in `ref failed`.
+BINDING = r"(?:ref\s+)?(?:mut\s+)?"
+
 # A return type that can carry a rejection rather than a plain value. A bare
 # `Json<T>` is always sent as 200, so it is a success, not a rejection.
 RESPONSE_TYPE = r"Response|Rejection|Error|StatusCode|Result|\("
@@ -824,7 +827,10 @@ def error_rejects(name: str, block: str, seen: frozenset[str] = frozenset()) -> 
     `rejects_result_body` gives the forms it reads. A move into another name,
     such as `let captured = body;`, is followed. A pattern can read the
     extractor by value, borrowed, or through `as_ref()` or `as_mut()`.
+    Comments and literals are masked, so a call in them is no use.
     """
+    if not seen:
+        block = masked_source(block)
     variable = re.escape(name)
     moved = r"\blet\s+(?:mut\s+)?([a-z_][a-z_0-9]*)\s*(?::[^=;]*)?=\s*%s\s*;" % variable
     for alias in re.finditer(moved, block):
@@ -853,13 +859,13 @@ def error_rejects(name: str, block: str, seen: frozenset[str] = frozenset()) -> 
             return True
     # After `let Err(e) = body else { .. };`, the rest of the scope runs only on
     # failure, so it is the failure arm.
-    bound_err = r"\blet\s+Err\s*\(\s*([a-z_][a-z_0-9]*)?[^=]*=\s*%s\s*else\s*\{" % read
+    bound_err = r"\blet\s+Err\s*\(\s*%s([a-z_][a-z_0-9]*)?[^=]*=\s*%s\s*else\s*\{" % (BINDING, read)
     for binding in re.finditer(bound_err, block):
         otherwise = balanced(block[binding.end() - 1 :], "{", "}")
         rest = block[binding.end() - 1 + len(otherwise) :].lstrip().lstrip(";")
         if arm_rejects(scope_rest(rest), binding.group(1)):
             return True
-    failed = r"\bif\s+let\s+Err\s*\(\s*([a-z_][a-z_0-9]*)?[^=]*=\s*%s\s*\{" % read
+    failed = r"\bif\s+let\s+Err\s*\(\s*%s([a-z_][a-z_0-9]*)?[^=]*=\s*%s\s*\{" % (BINDING, read)
     for tested in re.finditer(failed, block):
         taken = balanced(block[tested.end() - 1 :], "{", "}")
         if rejecting_exit(taken) or rejecting_arm(taken, tested.group(1)):
@@ -970,7 +976,9 @@ def error_arms(arms: str) -> list[re.Match]:
     pattern sits at depth 1 and follows `{`, `,` or `}`. A guarded arm can
     fall through to a later arm, so every one is returned.
     """
-    catch_all = re.compile(r"([a-z_][a-z_0-9]*)(?=\s*(?:if\b[^{}]*?)?=>|\s*@\s*(?:Err\b|_))")
+    catch_all = re.compile(
+        BINDING + r"([a-z_][a-z_0-9]*)(?=\s*(?:if\b[^{}]*?)?=>|\s*@\s*(?:Err\b|_))"
+    )
     found: list[re.Match] = []
     depth = 0
     for index, char in enumerate(arms):
@@ -979,7 +987,7 @@ def error_arms(arms: str) -> list[re.Match]:
         elif char in ")]}":
             depth -= 1
         elif depth == 1 and (char == "E" or char == "_" or char.islower()):
-            pattern = re.compile(r"Err\s*\(\s*([a-z_][a-z_0-9]*)?").match(arms, index)
+            pattern = re.compile(r"Err\s*\(\s*%s([a-z_][a-z_0-9]*)?" % BINDING).match(arms, index)
             pattern = pattern or catch_all.match(arms, index)
             if pattern and arms[:index].rstrip()[-1:] in ("{", ",", "}", "|"):
                 found.append(pattern)
@@ -1080,9 +1088,10 @@ def fallback_rejects(method: str, arguments: str, state: str = "result") -> bool
         return state == "result" or builds_rejection(fallback + "(")
     bound, body = closure.group(1), closure.group(2)
     # A helper can build a rejection without the error, as `builds_rejection`
-    # reads it. A type path such as `Gadget::default()` builds a value. An
-    # explicit `return` of a rejection also rejects.
-    if builds_rejection(closure_value(body)) or rejecting_exit(body):
+    # reads it. A type path such as `Gadget::default()` builds a value. A
+    # `return` in a closure gives the closure value, so it is read the same way.
+    returned = re.findall(r"\breturn\b\s*([^;}]*)", body)
+    if any(builds_rejection(value.strip()) for value in [closure_value(body), *returned]):
         return True
     if bound is None or bound == "_":
         return False
@@ -2101,8 +2110,12 @@ pub fn harvest_api_router() -> Router {
         .route("/e/or-exit-then-unwrap", post(e_or_exit_then_unwrap))
         .route("/e/nested-param-comment", post(e_nested_param_comment))
         .route("/e/local-from-slice", post(e_local_from_slice))
-        .route("/e/closure-return", post(e_closure_return))
+        .route("/e/closure-return-reject", post(e_closure_return_reject))
         .route("/e/multiline-let-else", post(e_multiline_let_else))
+        .route("/e/closure-return-value", post(e_closure_return_value))
+        .route("/e/commented-unwrap", post(e_commented_unwrap))
+        .route("/e/ref-catch-all", post(e_ref_catch_all))
+        .route("/e/ref-err-handed", post(e_ref_err_handed))
 }
 
 async fn e_wrapped(body: Bytes) -> Response {
@@ -3080,7 +3093,7 @@ async fn e_local_from_slice(body: Bytes) -> Response {
     StatusCode::OK.into_response()
 }
 
-async fn e_closure_return(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+async fn e_closure_return_reject(body: Result<Json<Gadget>, JsonRejection>) -> Response {
     body.map_or_else(|_| { return invalid_body(); }, |Json(gadget)| accept(gadget))
 }
 
@@ -3091,6 +3104,37 @@ async fn e_multiline_let_else(body: Result<Json<Gadget>, JsonRejection>) -> Resp
         return StatusCode::BAD_REQUEST.into_response();
     };
     StatusCode::OK.into_response()
+}
+
+async fn e_closure_return_value(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    let gadget = body.map(|Json(gadget)| gadget).unwrap_or_else(|_| {
+        return Gadget::default();
+    });
+    accept(gadget)
+}
+
+async fn e_commented_unwrap(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    // body.unwrap() would reject a missing body.
+    let _note = "body.unwrap()";
+    match body {
+        Ok(Json(gadget)) => accept(gadget),
+        Err(_) => StatusCode::OK.into_response(),
+    }
+}
+
+async fn e_ref_catch_all(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    let gadget = match body {
+        Ok(Json(gadget)) => gadget,
+        ref failed => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    accept(gadget)
+}
+
+async fn e_ref_err_handed(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    match body {
+        Ok(Json(gadget)) => accept(gadget),
+        Err(ref rejection) => replay(rejection),
+    }
 }
 
 fn invalid_body() -> Response {
@@ -4833,14 +4877,42 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
                 request_body=body_of(("name", True), required=False),
                 error_responses=[{"status": 400}],
             )
-            for path in ("/e/closure-return", "/e/multiline-let-else")
+            for path in ("/e/closure-return-reject", "/e/multiline-let-else")
         ],
         {
             "body_required": [
-                "POST /e/closure-return: the body is mandatory",
+                "POST /e/closure-return-reject: the body is mandatory",
                 "POST /e/multiline-let-else: the body is mandatory",
             ]
         },
+    ),
+    (
+        "a ref or mut catch-all arm that rejects is mandatory",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/ref-catch-all",
+                200,
+                request_body=body_of(("name", True), required=False),
+                error_responses=[{"status": 400}],
+            )
+        ],
+        {"body_required": ["POST /e/ref-catch-all: the body is mandatory"]},
+    ),
+    (
+        "a value return, a commented unwrap and a ref Err hand-on stay optional",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                path,
+                200,
+                request_body=body_of(("name", True), required=False),
+            )
+            for path in ("/e/closure-return-value", "/e/commented-unwrap", "/e/ref-err-handed")
+        ],
+        {},
     ),
     (
         "a malformed contract entry does not crash the audit",
