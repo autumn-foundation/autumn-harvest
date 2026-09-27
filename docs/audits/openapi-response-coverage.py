@@ -1009,18 +1009,29 @@ def inspection_rejects(before: str, inspection: str, rest: str) -> bool:
     `if parse.is_err() { .. }` runs its block on failure. `if parse.is_ok()`
     runs its `else` on failure. A leading `!` swaps the two. The parse is
     mandatory when that failure arm rejects, as `rejecting_exit` reads it.
+
+    A term true on every failure keeps a `||` condition true. A term false on
+    every failure keeps an `&&` condition false, unless a `||` follows. Any
+    other join, or `is_err_and`, whose predicate may be false, leaves no arm
+    certain.
     """
     condition = re.search(r"\bif\s+(!\s*)?(?:serde_json::)?$", before)
-    if condition is None or not rest.startswith("{"):
+    opener = rest.find("{")
+    if condition is None or opener < 0 or inspection == "is_err_and":
         return False
-    taken = balanced(rest, "{", "}")
-    after_taken = rest[len(taken) :]
+    on_failure = inspection in ("is_err", "is_none")
+    if condition.group(1):
+        on_failure = not on_failure
+    joined = rest[:opener].strip()
+    if joined and on_failure and not joined.startswith("||"):
+        return False
+    if joined and not on_failure and (not joined.startswith("&&") or "||" in joined):
+        return False
+    taken = balanced(rest[opener:], "{", "}")
+    after_taken = rest[opener + len(taken) :]
     otherwise = None
     if re.match(r"\s*else\s*\{", after_taken):
         otherwise = balanced(after_taken[after_taken.index("{") :], "{", "}")
-    on_failure = inspection in ("is_err", "is_err_and", "is_none")
-    if condition.group(1):
-        on_failure = not on_failure
     failure_arm = taken if on_failure else otherwise
     return failure_arm is not None and rejecting_exit(failure_arm)
 
@@ -1931,6 +1942,10 @@ pub fn harvest_api_router() -> Router {
         .route("/e/await-default", post(e_await_default))
         .route("/e/borrowed-let-else", post(e_borrowed_let_else))
         .route("/e/as-ref-if-let-err", post(e_as_ref_if_let_err))
+        .route("/e/is-err-and", post(e_is_err_and))
+        .route("/e/is-err-or", post(e_is_err_or))
+        .route("/e/is-ok-and-then", post(e_is_ok_and_then))
+        .route("/e/is-ok-and-or", post(e_is_ok_and_or))
 }
 
 async fn e_wrapped(body: Bytes) -> Response {
@@ -2774,6 +2789,38 @@ async fn e_as_ref_if_let_err(body: Result<Json<Gadget>, JsonRejection>) -> Respo
         return StatusCode::BAD_REQUEST.into_response();
     }
     StatusCode::OK.into_response()
+}
+
+async fn e_is_err_and(body: Bytes) -> Result<Response, Response> {
+    if serde_json::from_slice::<Gadget>(&body).is_err_and(|_| false) {
+        return Err(reject());
+    }
+    Ok(StatusCode::OK.into_response())
+}
+
+async fn e_is_err_or(body: Bytes) -> Result<Response, Response> {
+    if serde_json::from_slice::<Gadget>(&body).is_err() || force_reject() {
+        return Err(reject());
+    }
+    Ok(StatusCode::OK.into_response())
+}
+
+async fn e_is_ok_and_then(body: Bytes) -> Result<Response, Response> {
+    if serde_json::from_slice::<Gadget>(&body).is_ok() && ready() {
+        tracing::debug!("valid");
+    } else {
+        return Err(reject());
+    }
+    Ok(StatusCode::OK.into_response())
+}
+
+async fn e_is_ok_and_or(body: Bytes) -> Result<Response, Response> {
+    if serde_json::from_slice::<Gadget>(&body).is_ok() && ready() || lenient() {
+        tracing::debug!("valid");
+    } else {
+        return Err(reject());
+    }
+    Ok(StatusCode::OK.into_response())
 }
 
 fn invalid_body() -> Response {
@@ -4351,6 +4398,29 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
                 "POST /e/as-ref-if-let-err: the body is mandatory",
             ]
         },
+    ),
+    (
+        "a joined inspection whose failure always takes the rejecting arm is mandatory",
+        FIXTURE_EDGES,
+        [
+            fixture_route("POST", path, 200, request_body=body_of(("name", True), required=False))
+            for path in ("/e/is-err-or", "/e/is-ok-and-then")
+        ],
+        {
+            "body_required": [
+                "POST /e/is-err-or: the body is mandatory",
+                "POST /e/is-ok-and-then: the body is mandatory",
+            ]
+        },
+    ),
+    (
+        "an inspection that a failure may bypass is tolerant",
+        FIXTURE_EDGES,
+        [
+            fixture_route("POST", path, 200, request_body=body_of(("name", False), required=False))
+            for path in ("/e/is-err-and", "/e/is-ok-and-or")
+        ],
+        {},
     ),
     (
         "a malformed contract entry does not crash the audit",
