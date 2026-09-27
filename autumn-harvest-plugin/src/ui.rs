@@ -2447,6 +2447,11 @@ async fn signal_workflow_ui(
             }),
             ..Default::default()
         };
+        // Release the mutation connection before checking out another one
+        // inside `render_workflow_detail_page` (Codex review, issue #1737).
+        // A pool sized for one connection would otherwise wait forever:
+        // `conn` stays alive, unreleased, until the function returns.
+        drop(conn);
         let markup = render_workflow_detail_page(
             api_state,
             id,
@@ -2586,6 +2591,9 @@ async fn reset_workflow_ui(
             }),
             ..Default::default()
         };
+        // Release the mutation connection first, for the same reason as
+        // `signal_workflow_ui` (Codex review, issue #1737).
+        drop(conn);
         let markup = render_workflow_detail_page(
             api_state,
             id,
@@ -2652,6 +2660,10 @@ async fn trigger_update_ui(
                     }),
                     ..Default::default()
                 };
+                // Release the mutation connection first, for the same
+                // reason as `signal_workflow_ui` (Codex review, issue
+                // #1737).
+                drop(conn);
                 let markup = render_workflow_detail_page(
                     api_state,
                     id,
@@ -2742,6 +2754,9 @@ async fn trigger_update_ui(
             }),
             ..Default::default()
         };
+        // Release the mutation connection first, for the same reason as
+        // `signal_workflow_ui` (Codex review, issue #1737).
+        drop(conn);
         let markup = render_workflow_detail_page(
             api_state,
             id,
@@ -5862,7 +5877,7 @@ fn render_workflow_detail(
                 form method="post" action={ (exec_id_str) "/reset" } style="margin-top:8px;background:#1e293b;border:1px solid #334155;border-radius:6px;padding:12px;display:flex;flex-direction:column;gap:8px;min-width:280px" {
                     label style="font-size:12px;color:#94a3b8" {
                         "Event # (1-based, as shown in timeline)"
-                        input type="number" name="reset_to_event_id" min="1" required placeholder="1"
+                        input type="text" inputmode="numeric" pattern="[0-9]*" name="reset_to_event_id" required placeholder="1"
                             value=[form_echo.reset.as_ref().map(|e| e.reset_to_event_id.as_str())]
                             style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px";
                     }
