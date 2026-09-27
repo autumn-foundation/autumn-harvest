@@ -1352,7 +1352,8 @@ key_prefix = "from_toml"
 
     #[test]
     fn redacted_url_ignores_an_at_sign_after_the_authority() {
-        // A password in the path or query must not make the host disappear.
+        // An `@` in the query must not make the host disappear. The query
+        // itself is hidden (issue #1429).
         let config = HarvestRedisConfig {
             url: Some("redis://cache.internal:6379/0?token=a@b".to_owned()),
             ..HarvestRedisConfig::default()
@@ -1360,7 +1361,7 @@ key_prefix = "from_toml"
 
         assert_eq!(
             config.redacted_url().as_deref(),
-            Some("redis://cache.internal:6379/0?token=a@b")
+            Some("redis://cache.internal:6379/0?<redacted>")
         );
     }
 
@@ -1393,7 +1394,7 @@ key_prefix = "from_toml"
 
         let redacted = config.redacted_url().expect("a url is set");
 
-        assert_eq!(redacted, "rediss://host/0?x=1");
+        assert_eq!(redacted, "rediss://host/0?<redacted>");
         assert!(!redacted.contains("pw"));
     }
 
