@@ -53,17 +53,17 @@ so does an `if let Err(..)` block. An `if` on `.is_err()` or `.is_ok()` counts
 when its failing branch rejects. A raw-byte parse is mandatory unless an `if` on
 `.is_empty()` lets an empty body skip it. The parse must be in the arm that runs
 for a non-empty body, and the empty-body arm must not reject. An earlier
-`if body.is_empty() { .. }` also counts when its block returns `Ok(..)` and no
-error. Only a return at the top level of that block counts. A return inside a
-nested `if`, `match` or closure may not run. A parse that turns its error into a
-value is optional too, such as `.ok()`, `.unwrap_or_default()` or an
-`if let Ok(..)` whose `else` does not reject. A `match` on the parse is optional
-when it has an `Err` or catch-all arm and no such arm rejects. A fallback that
-rejects the error, such as `.map_or_else(|e| reject(e), ..)`, keeps the parse
-mandatory. A guard or a tolerant call at a helper call site carries into the
-helper. Check 2 applies to every parse that does not tolerate its error, since a
-body that is present must then carry the mandatory fields. A bare `Json<T>` and
-a rejecting `Result<Json<T>, _>` are such parses.
+`if body.is_empty() { .. }` also counts when its block returns `Ok(..)` or a 2xx
+status, and no error. Only a return at the top level of that block counts. A
+return inside a nested `if`, `match` or closure may not run. A parse that turns
+its error into a value is optional too, such as `.ok()`, `.unwrap_or_default()`
+or an `if let Ok(..)` whose `else` does not reject. A `match` on the parse is
+optional when it has an `Err` or catch-all arm and no such arm rejects. A
+fallback that rejects the error, such as `.map_or_else(|e| reject(e), ..)`,
+keeps the parse mandatory. A guard or a tolerant call at a helper call site
+carries into the helper. Check 2 applies to every parse that does not tolerate
+its error, since a body that is present must then carry the mandatory fields. A
+bare `Json<T>` and a rejecting `Result<Json<T>, _>` are such parses.
 
 Check 4 reads the routes that take a `RawQuery` and parse the pairs by hand. A
 key those parsers match is a parameter the route accepts, so a key the contract
@@ -609,9 +609,10 @@ def guards(block: str, position: int, variable: str) -> bool:
 
     The test counts when the parse is in the arm that runs for a non-empty
     body. That is the `else` of `if body.is_empty()`, or the condition or
-    block of `if !body.is_empty()` when its `else` does not reject. A plain `if body.is_empty() { .. }` before
-    the parse also counts when its block returns `Ok(..)` and no error. Any
-    other use, such as a log field, is no guard.
+    block of `if !body.is_empty()` when its `else` does not reject. A plain
+    `if body.is_empty() { .. }` before the parse also counts when its block
+    returns `Ok(..)` or a 2xx status, and no error. Any other use, such as a
+    log field, is no guard.
     """
     pattern = r"\bif\s+(!\s*)?%s\.is_empty\(\)" % re.escape(variable)
     for test in re.finditer(pattern, block[:position]):
@@ -643,7 +644,8 @@ def guards(block: str, position: int, variable: str) -> bool:
             return True
         # An early return counts only for a parse after the whole `if`. A
         # parse inside the empty-body arm runs before that return.
-        early_return = re.search(r"\breturn\s+Ok\(", unconditional(taken))
+        success = r"\breturn\s+(?:Ok\(|StatusCode::(?:%s)\b)" % SUCCESS_NAMES
+        early_return = re.search(success, unconditional(taken))
         after_if = position >= end and same_scope(block, test.start(), position)
         if not test.group(1) and after_if and early_return and not re.search(ERROR_TOKENS, taken):
             return True
@@ -739,12 +741,13 @@ def rejecting_arm(arm: str, bound: str | None) -> bool:
 def error_arms(arms: str) -> list[re.Match]:
     """Each top-level arm pattern of this `match` that can receive an `Err`.
 
-    That is an `Err(..)` pattern, or a catch-all `_` or binding. Group 1 is the
+    That is an `Err(..)` pattern, a catch-all `_` or binding, or a binding
+    such as `error @ Err(_)`. Group 1 is the
     name the arm binds, if any. `arms` includes the outer braces, so an arm
     pattern sits at depth 1 and follows `{`, `,` or `}`. A guarded arm can
     fall through to a later arm, so every one is returned.
     """
-    catch_all = re.compile(r"([a-z_][a-z_0-9]*)(?=\s*(?:if\b[^{}]*?)?=>)")
+    catch_all = re.compile(r"([a-z_][a-z_0-9]*)(?=\s*(?:if\b[^{}]*?)?=>|\s*@\s*(?:Err\b|_))")
     found: list[re.Match] = []
     depth = 0
     for index, char in enumerate(arms):
@@ -1232,9 +1235,9 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
         # mandatory when its error rejects. `Option<Json<T>>` is optional. All
         # three still name the struct whose fields serde accepts, which is what
         # check 3 needs.
-        bare = re.search(
-            r"%s\(\s*[a-z_0-9]+\s*\)\s*:\s*%s<\s*([A-Za-z0-9_:]+)\s*>" % (JSON, JSON), params
-        )
+        # The binding is `Json(body)` or a plain name such as `mut body`.
+        binding = r"(?:%s\(\s*[a-z_0-9]+\s*\)|(?:mut\s+)?[a-z_][a-z_0-9]*)" % JSON
+        bare = re.search(r"%s\s*:\s*%s<\s*([A-Za-z0-9_:]+)\s*>" % (binding, JSON), params)
         extractor = (
             bare
             or re.search(r"Result<\s*%s<\s*([A-Za-z0-9_:]+)\s*>" % JSON, params)
@@ -1733,6 +1736,9 @@ pub fn harvest_api_router() -> Router {
         .route("/e/query-if-let-err", get(e_query_if_let_err))
         .route("/e/json-if-let-err-ok", post(e_json_if_let_err_ok))
         .route("/e/negated-else-rejects", post(e_negated_else_rejects))
+        .route("/e/named-json", post(e_named_json))
+        .route("/e/status-early-return", post(e_status_early_return))
+        .route("/e/at-binding", post(e_at_binding))
 }
 
 async fn e_wrapped(body: Bytes) -> Response {
@@ -2409,6 +2415,28 @@ async fn e_negated_else_rejects(body: Bytes) -> Result<Response, Response> {
         return Err(reject());
     }
     Ok(StatusCode::OK.into_response())
+}
+
+async fn e_named_json(mut body: axum::Json<Gadget>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn e_status_early_return(body: Bytes) -> Response {
+    if body.is_empty() {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+    let gadget = match serde_json::from_slice::<Gadget>(&body) {
+        Ok(gadget) => gadget,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    StatusCode::OK.into_response()
+}
+
+async fn e_at_binding(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    match body {
+        Ok(Json(gadget)) => accept(gadget),
+        error @ Err(_) => StatusCode::BAD_REQUEST.into_response(),
+    }
 }
 
 async fn e_documented(Query(query): Query<Documented>) -> Response {
@@ -3717,6 +3745,41 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             )
         ],
         {"body_required": ["POST /e/negated-else-rejects: the body is mandatory"]},
+    ),
+    (
+        "a named Json<T> is read and mandatory, as is an at-binding Err arm that rejects",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                path,
+                200,
+                request_body=body_of(("name", True), required=False),
+                error_responses=[{"status": 400}],
+            )
+            for path in ("/e/named-json", "/e/at-binding")
+        ],
+        {
+            "body_required": [
+                "POST /e/named-json: the body is mandatory",
+                "POST /e/at-binding: the body is mandatory",
+            ]
+        },
+    ),
+    (
+        "an early return of a 2xx StatusCode lets an empty body through",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/status-early-return",
+                200,
+                request_body=body_of(("name", True), required=False),
+                additional_responses=[{"status": 204}],
+                error_responses=[{"status": 400}],
+            )
+        ],
+        {},
     ),
     (
         "a malformed contract entry does not crash the audit",
