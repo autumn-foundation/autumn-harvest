@@ -523,5 +523,15 @@ harness = false
 name = "payload_codec_profile"
 harness = false
 
+# Deterministic (non-criterion) instruction/allocation-count profiling harness
+# for `circuit_breaker::CircuitBreakerRegistry::{on_dispatch, on_result}` --
+# the per-attempt breaker check `worker.rs` runs around every dispatch of a
+# circuit-breaker-guarded activity (issue #369). No feature requirement:
+# `circuit_breaker.rs` is pure and unconditional (no DB access). See
+# `benches/circuit_breaker_dispatch_profile.rs`.
+[[bench]]
+name = "circuit_breaker_dispatch_profile"
+harness = false
+
 [lints]
 workspace = true
