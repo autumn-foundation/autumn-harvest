@@ -2308,7 +2308,7 @@ async fn a_worker_sweeps_only_the_queues_whose_lease_it_holds() {
 
 /// A sweep whose publish fails makes no further Redis call, so the fallback
 /// is not delayed. The lease expires. A stopping worker then releases its
-/// leases, so a peer sweeps at once (issue #1429).
+/// leases, even after its owner uninstalled the channel (issue #1429).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_publish_keeps_the_lease_and_a_stop_releases_it() {
     let _serial = DISPATCH_SERIAL.lock().await;
@@ -2341,6 +2341,9 @@ async fn a_failed_publish_keeps_the_lease_and_a_stop_releases_it() {
             0,
             "a failed publish must not call Redis again to release the lease"
         );
+        // `HarvestRunner::stop` uninstalls the channel before it joins the
+        // worker. The release at exit must not depend on the slot.
+        autumn_harvest::dispatch::uninstall();
     })
     .await;
 

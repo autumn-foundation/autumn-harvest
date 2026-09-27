@@ -28915,6 +28915,10 @@ impl Worker {
         let mut dispatch_state = DispatchLoopState::new();
         // A channel this loop refuses is logged once, not once per iteration.
         let mut dispatch_refusal_logged = false;
+        // The channel this loop last swept through. The owner can uninstall the
+        // channel before it joins the worker, so the lease release at exit
+        // uses this handle, not the slot (issue #1429).
+        let mut swept_through: Option<crate::dispatch::InstalledDispatch> = None;
 
         while !self.shutdown.is_cancelled() {
             // Do not claim while this pool's registration is unverified: an
@@ -28942,11 +28946,11 @@ impl Worker {
             // permutation still governs the `poll_once` fallback.
             if let Some(installed) = crate::dispatch::installed() {
                 if dispatch_allowed {
-                    if self
+                    let dispatched = self
                         .run_dispatch_iteration(pool, shard, &installed, &mut dispatch_state)
-                        .await
-                        && let Some(shard) = shard
-                    {
+                        .await;
+                    swept_through = Some(installed);
+                    if dispatched && let Some(shard) = shard {
                         self.registry
                             .telemetry()
                             .metrics
@@ -29026,7 +29030,7 @@ impl Worker {
 
         // A stopping worker gives its sweep leases back, so a peer sweeps
         // without waiting for them to expire (issue #1429).
-        if dispatch_allowed && let Some(installed) = crate::dispatch::installed() {
+        if let Some(installed) = swept_through {
             self.release_reconcile_leases(&installed, &self.config.queues)
                 .await;
         }
