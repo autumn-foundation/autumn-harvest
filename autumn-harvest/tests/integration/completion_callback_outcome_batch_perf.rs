@@ -688,7 +688,11 @@ async fn scanner_records_identical_outcomes_for_a_mixed_delivered_and_backoff_ba
         } else {
             assert_eq!(row.state, "PENDING", "odd index {idx} should back off");
             assert_eq!(row.last_status, Some(500));
-            assert!(row.last_error.is_none() || row.last_error.is_some());
+            assert_eq!(
+                row.last_error, None,
+                "ParityDeliverer's 500 carries no transport_error, so classify_outcome's \
+                 Backoff branch should pass last_error = None through the batched write"
+            );
             assert!(
                 !row.delivered_at_is_set,
                 "a backed-off row must not set delivered_at"
