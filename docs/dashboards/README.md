@@ -103,7 +103,9 @@ lifecycle; workflow health (timeouts / SLA / non-determinism); admission &
 pacing; activities; circuit breakers; queues & workers; timers; schedules &
 triggers; DLQ & quarantine; cache, retention & shards; concurrency & rate
 limits; payloads & offload; webhooks, sessions & queries; and a final
-readiness-checks row of text panels.
+readiness-checks row of text panels. An always-expanded **Redis dispatch** row
+(issue #1312) sits at the end. Its three panels stay empty on a process
+without the Redis dispatch channel.
 
 ## Alert ↔ Panel Mapping
 
@@ -151,6 +153,8 @@ panel finds the way back to the rule and its runbook section.
 | `harvest_replication_rpo_unknown` | Cross-region DR → *RPO known (0 = readable but unmeasurable)* |
 | `harvest_audit_export_lag_high` | Audit export to SIEM → *Audit export lag (oldest unshipped audit record)*, with *Audit records exported* to tell a sink outage from a quiet fleet |
 | `harvest_audit_export_unobservable` | Audit export to SIEM → *Audit export observed (0 = the lag panel above is STALE)* |
+| `harvest_dispatch_hints_dropped` | Redis dispatch | Dispatch hints dropped (publisher queue full) | [runbook](../runbooks/harvest-alerts.md#harvest_dispatch_hints_dropped) |
+| `harvest_dispatch_fallback` | Redis dispatch | Dispatch fallbacks to the Postgres claim path (companion: Dispatch references recovered from a stalled consumer) | [runbook](../runbooks/harvest-alerts.md#harvest_dispatch_fallback) |
 
 ### Readiness-style alerts (no native metric)
 

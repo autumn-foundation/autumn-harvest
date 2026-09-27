@@ -518,6 +518,152 @@ backlogged queue.
 Escalate if backlog growth persists for two alert windows after workers are
 fresh, or if the queue backs a customer-facing workflow with a breached SLA.
 
+## harvest_dispatch_hints_dropped
+
+The Redis dispatch publisher (issue #1312) dropped hints because its queue was
+full. The queue holds 10,000 hints. No work is lost. Every task row stays
+`PENDING` in Postgres, and the reconcile sweep republishes it within one
+`reconcile_interval_ms`. The cost is dispatch latency. The operator guide is
+[`docs/operations/redis-dispatch.md`](../operations/redis-dispatch.md).
+
+### Triage steps
+
+1. Check whether `harvest_dispatch_fallback` fires too. If it does, Redis is
+   the cause. Follow [`harvest_dispatch_fallback`](#harvest_dispatch_fallback)
+   first.
+2. Read the channel settings:
+   `curl -s .../api/harvest/admin/config | jq '.redis'`. Confirm `installed` is
+   `true`. Note `endpoint` and `key_prefix`. The endpoint carries no
+   credentials, so add them from your secret store.
+3. Check Redis from the dropping host: `redis-cli -u <endpoint> PING` must
+   answer `PONG`. Then run `redis-cli -u <endpoint> --latency` for a minute.
+4. Find the dropping process:
+   `sum by (instance) (increase(harvest_dispatch_hints_dropped_total[5m]))`.
+   An API-only process publishes hints too, so the source can be a process
+   with no worker.
+5. Compare the drops with the enqueue rate,
+   `sum(rate(harvest_workflow_started_total[5m]))`. Drops that track a start
+   burst are a capacity limit, not an outage.
+6. Search the process log for
+   `the dispatch publisher queue is full`. The warning repeats at most once per
+   30 s and carries the running `dropped` count.
+
+### Likely causes
+
+- Redis is unreachable or slow, so the publisher cannot drain its queue.
+- An enqueue burst outruns the publish rate. Examples are a bulk start, a
+  schedule catch-up and a large DLQ redrive.
+- Network latency or packet loss between the process and Redis.
+- Redis is saturated: memory near `maxmemory`, a slow command, or a
+  persistence fork.
+
+### False positives
+
+A short burst during a bulk start can drop hints with no fault. The rule
+ignores one burst, but a long bulk load still fires it. A drop is always real,
+but it costs latency only.
+
+### Safe actions
+
+- Leave the task rows alone. The reconcile sweep republishes each dropped row.
+  Do not re-enqueue or redrive work to recover it.
+- Fix Redis reachability or latency first. The drops stop when the publisher
+  drains its queue.
+- Pace large enqueue bursts, for example with smaller start batches or a start
+  throttle.
+- If Redis stays unhealthy, turn Redis dispatch off. Unset `harvest.redis.url`,
+  or set `AUTUMN_HARVEST_REDIS__URL` to the empty string, and restart. See
+  [How to turn it off](../operations/redis-dispatch.md#how-to-turn-it-off).
+
+### Escalation criteria
+
+Escalate to the Redis owner when drops continue after the enqueue burst ends.
+Escalate when `harvest_queue_schedule_to_start_high` fires together with this
+alert, because the added latency then breaches a queue SLA.
+
+## harvest_dispatch_fallback
+
+Workers could not use the Redis dispatch channel (issue #1312), so they claim
+from Postgres for a cooldown. Work continues. Throughput falls to the Postgres
+claim-path numbers, so a deep backlog drains more slowly. The cooldown starts
+at the poll interval, doubles with each consecutive channel failure and stops
+at 30 s. Only a successful reference read ends it. The operator guide is
+[`docs/operations/redis-dispatch.md`](../operations/redis-dispatch.md).
+
+### Triage steps
+
+1. Read the `reason` label. It names the channel call that failed.
+
+   | `reason` | Failed call |
+   |---|---|
+   | `read` | The blocking reference read returned an error. |
+   | `read_timeout` | The reference read did not answer in time. |
+   | `maintain` | The maintenance pass failed. It promotes delayed references and recovers unacked ones. |
+   | `publish` | The reconcile sweep could not publish its page of rows. |
+
+2. Read the channel settings:
+   `curl -s .../api/harvest/admin/config | jq '.redis'`. Confirm `installed` is
+   `true`. Note `endpoint`, `key_prefix` and `consumer_group`.
+3. From a worker host, run `redis-cli -u <endpoint> PING`. Expect `PONG`. If
+   it fails, check DNS, firewall rules, the Redis port and the credentials.
+4. Search the worker log for `dispatch read failed`,
+   `dispatch read timed out`, `dispatch maintenance failed` or
+   `dispatch reconcile publish failed`. The log line is throttled, and the
+   counter is not.
+5. Check the recovered rate,
+   `sum(increase(harvest_dispatch_recovered_total[5m]))`. A non-zero rate
+   means workers crash or stall between a read and its ack. Run
+   `harvest worker health --output json` to find restarting or stale workers.
+6. Confirm that work still flows. `harvest_queue_depth` must fall, and
+   `harvest_workflow_terminal_total` must keep rising.
+
+### Likely causes
+
+- Redis is down, restarting or failing over.
+- A network partition, a DNS change or a firewall rule between the workers and
+  Redis.
+- Redis is slow: memory pressure, a blocking command or a persistence fork.
+  This cause shows as `read_timeout`.
+- Only `read` or `read_timeout` fails while `maintain` and `publish` succeed.
+  The reads use their own connection, and that connection alone is unhealthy.
+- The Redis credentials changed, and `harvest.redis.url` still holds the old
+  ones.
+
+### False positives
+
+A Redis failover or restart causes a short fallback burst. The rule ignores a
+single failure. A planned Redis maintenance window fires this alert, so
+silence the rule for that window. The fallback is the designed behaviour, and
+no work is at risk.
+
+### Safe actions
+
+- Let the fallback run. Workers keep claiming from Postgres, and no row
+  changes. Nothing needs to drain.
+- Restore Redis reachability. A worker returns to the channel after its next
+  successful reference read, within 30 s. The reconcile sweep refills empty
+  streams within one `reconcile_interval_ms`.
+- If Redis stays unavailable, turn Redis dispatch off. Unset
+  `harvest.redis.url`, or set `AUTUMN_HARVEST_REDIS__URL` to the empty string,
+  and restart. See
+  [How to turn it off](../operations/redis-dispatch.md#how-to-turn-it-off).
+- **Do not restart with the URL still set while Redis is down.** A configured
+  URL that cannot connect fails startup, so the restarted process does not
+  come back.
+- Do not run `FLUSHALL` on a shared Redis. Leftover dispatch keys are inert.
+- For a non-zero recovered rate, fix the worker that crashes or stalls.
+  Recovery re-delivers its references, and the Postgres claim still admits each
+  row once.
+
+### Escalation criteria
+
+Escalate to the Redis owner when fallbacks continue for one alert window after
+Redis reports healthy. Escalate when the backlog grows during the fallback and
+`harvest_queue_backlog_growth` or `harvest_queue_schedule_to_start_high`
+fires: the Postgres claim path then cannot carry the load. Escalate when the
+recovered rate stays non-zero, because a worker keeps crashing or stalling
+between a read and its ack.
+
 ## harvest_activity_failure_surge
 
 ### Triage steps

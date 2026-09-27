@@ -27,6 +27,7 @@ which alerts are enforceable today and which need another exported signal:
 | #161 | Shard health/readiness report. |
 | #171 | Build-id routing. The `no_compatible_worker` alert is marked pending until a native bounded management signal is exported. |
 | #501 | Schedule-to-start latency histogram and oldest-pending-age gauge — the primary queue-saturation page signals. |
+| #1312 / #1429 | Redis dispatch channel and its counters. The `harvest_dispatch_hints_dropped` and `harvest_dispatch_fallback` rules fire only on a process with Redis dispatch installed. |
 
 Pending rules are intentionally not presented as enforceable. That keeps the
 pack honest; nothing good happens when an alert pretends an API exists.
@@ -51,6 +52,9 @@ Harvest metric names that are expected after Prometheus normalization:
 | `harvest.schedule.runs` | `harvest_schedule_runs_total` |
 | `harvest.schedule.skipped` | `harvest_schedule_skipped_total` |
 | `harvest.retention.deleted` | `harvest_retention_deleted_total` |
+| `harvest.dispatch.hints_dropped` | `harvest_dispatch_hints_dropped_total` |
+| `harvest.dispatch.fallbacks` | `harvest_dispatch_fallbacks_total` |
+| `harvest.dispatch.recovered` | `harvest_dispatch_recovered_total` |
 
 Use only bounded labels from ADR-0001/#138: `workflow`, `activity`, `queue`,
 `status`, `shard`, `kind`, `name`, and `reason`. Never use `execution.id`,

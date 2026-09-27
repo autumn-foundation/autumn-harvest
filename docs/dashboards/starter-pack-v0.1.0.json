@@ -6580,6 +6580,166 @@
         }
       ],
       "description": "A complete by-id fan-out found more than one live run of one business key (issue #1313). Evidence of a key pinned to one shard while an unpinned start of it hashed to another, or of a shard drained during a topology change while an unpinned start of the same key stayed live elsewhere -- neither requires the other. Not the race issue #1313 names, which is invisible to any single fan-out by construction; this is the observable proxy for its precondition."
+    },
+    {
+      "id": 596511,
+      "type": "row",
+      "title": "Redis dispatch (issue #1312)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 199
+      },
+      "panels": []
+    },
+    {
+      "id": 594870,
+      "type": "timeseries",
+      "title": "Dispatch hints dropped (publisher queue full)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 200
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "lineWidth": 1
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(increase(harvest_dispatch_hints_dropped_total[$__rate_interval]))",
+          "legendFormat": "hints dropped",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Alert: harvest_dispatch_hints_dropped (docs/runbooks/harvest-alerts.md#harvest_dispatch_hints_dropped) Dispatch hints the background publisher dropped because its bounded queue (10,000 hints) was full. The reconcile sweep republishes each dropped row within one reconcile_interval_ms, so a drop costs latency, never work. A steady rate means Redis is slow or unreachable, or the enqueue rate outruns the channel. Zero on a process without Redis dispatch."
+    },
+    {
+      "id": 401004,
+      "type": "timeseries",
+      "title": "Dispatch fallbacks to the Postgres claim path",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 200
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "lineWidth": 1
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (reason) (increase(harvest_dispatch_fallbacks_total[$__rate_interval]))",
+          "legendFormat": "{{reason}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Alert: harvest_dispatch_fallback (docs/runbooks/harvest-alerts.md#harvest_dispatch_fallback) Failed Redis channel calls, by the call that failed (maintain, read, read_timeout, publish). Each failure sends a worker to the Postgres claim path for a cooldown. Work continues, at the Postgres claim-path throughput. The cooldown starts at the poll interval, doubles per failed read and stops at 30 s."
+    },
+    {
+      "id": 629907,
+      "type": "timeseries",
+      "title": "Dispatch references recovered from a stalled consumer",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 208
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "lineWidth": 1
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(increase(harvest_dispatch_recovered_total[$__rate_interval]))",
+          "legendFormat": "references recovered",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "References a maintenance pass took back from a consumer that stopped acking. A reference is recovered after it stays unacked for visibility_timeout_ms. A non-zero rate means workers crash or stall between a read and its ack. Nothing is lost: the Postgres claim stays the only writer. See docs/runbooks/harvest-alerts.md#harvest_dispatch_fallback for triage."
     }
   ]
 }

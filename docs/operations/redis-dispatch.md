@@ -46,6 +46,12 @@ measured gain. The same assay measures that cost directly: paced at 86.52
 workflows/sec against an emptying queue, dispatch-latency p99 was 426.96 ms
 with the channel and 146.09 ms without it.
 
+That tail figure predates the sampler fix of issue #1428.
+[`docs/assays/0009-redis-dispatch-tail-latency-post-sampler-fix.md`](../assays/0009-redis-dispatch-tail-latency-post-sampler-fix.md)
+re-ran the same paced shape after the fix. The channel p99 fell to 50.02 ms,
+against 27.97 ms without it. That clears the 250 ms line, so issue #1429
+closes its tail-latency item on that evidence.
+
 Redis dispatch does not raise durability, and it is not a way to survive a
 Postgres outage. Postgres remains required.
 
@@ -59,6 +65,7 @@ consumer_group = "harvest_workers"
 visibility_timeout_ms = 60000
 poll_interval_ms = 20
 reconcile_interval_ms = 1000
+reconcile_batch = 1000
 ```
 
 | Key | Default | Meaning |
@@ -69,6 +76,7 @@ reconcile_interval_ms = 1000
 | `visibility_timeout_ms` | `60000` | How long a delivered reference may stay unacked before another worker recovers it. |
 | `poll_interval_ms` | `20` | Wait for one blocking read when the channel is idle. |
 | `reconcile_interval_ms` | `1000` | Interval of the reconcile sweep over due `PENDING` rows. |
+| `reconcile_batch` | `1000` | Most rows one sweep reads per queue. |
 
 Configuration validation bounds every key. `key_prefix` must not be empty,
 because every key the channel owns carries it, and an empty prefix collides
@@ -76,7 +84,9 @@ with unrelated keys in a shared Redis. `consumer_group` must not be empty,
 because Redis rejects an empty group name. `poll_interval_ms` must be between
 1 and 5000, because the worker checks shutdown between blocking reads.
 `visibility_timeout_ms` must be at least 1000, because the timeout has to
-outlast one Postgres claim. `reconcile_interval_ms` must be at least 1. The
+outlast one Postgres claim. `reconcile_interval_ms` must be at least 1. `reconcile_batch` must be between
+1 and 100000, because a zero batch never moves the sweep cursor and one query
+must not read a whole deep backlog. The
 `autumn-harvest-redis` crate repeats the prefix and group checks at connect.
 
 Queue names must not contain `:`. The colon separates the parts of every key
@@ -93,6 +103,7 @@ AUTUMN_HARVEST_REDIS__CONSUMER_GROUP=harvest_workers
 AUTUMN_HARVEST_REDIS__VISIBILITY_TIMEOUT_MS=60000
 AUTUMN_HARVEST_REDIS__POLL_INTERVAL_MS=20
 AUTUMN_HARVEST_REDIS__RECONCILE_INTERVAL_MS=1000
+AUTUMN_HARVEST_REDIS__RECONCILE_BATCH=1000
 ```
 
 An empty `AUTUMN_HARVEST_REDIS__URL` means "off", which matches
@@ -159,6 +170,7 @@ With the default prefix and a queue named `email`:
 | `harvest:dispatch:email:delayed` | sorted set | References parked until their due time, scored by that time |
 | `harvest:dispatch:email:delayed:payloads` | hash | Payload of each parked reference, keyed by task id |
 | `harvest:dispatch:marker:<task_id>` | string | Publish marker that makes a publish idempotent per task id |
+| `harvest:dispatch:email:reconcile` | string | Reconcile sweep lease. The value names the worker that sweeps the queue |
 
 `autumn-harvest-redis/src/naming.rs` is the single source of truth for the key
 shape. The older `harvest:queue:*`, `harvest:scheduled:*` and `harvest:dlq:*`
@@ -196,6 +208,19 @@ through this sweep. Redis persistence is therefore not required for
 correctness. A publish with the same due time as the held reference is a
 no-op, but only after the channel verifies the reference still exists. A
 marker whose reference vanished is rewritten, and the reference is recreated.
+
+**One worker sweeps each queue.** Before issue #1429 every worker swept every
+queue, so a fleet of N workers read N pages per queue per interval. Now each
+queue has a sweep lease in Redis. The worker that holds it sweeps the queue and
+renews the lease at each sweep. Its peers skip that queue. The lease fails open
+in three ways, because the sweep is the floor:
+
+- A lease call that fails sweeps every queue.
+- A sweep that fails gives its leases back, so a peer sweeps next time.
+- A lease that is not renewed expires after three reconcile intervals.
+
+Every worker still reads the throttle metrics at each interval. Only the page
+read moves to the lease holder.
 
 **The Postgres claim is still the only `PENDING -> RUNNING` writer.** A
 reference grants nothing. Two workers that somehow both hold a reference for
@@ -248,6 +273,29 @@ The fallback is the important one, and its scope is exact. It covers the
 Postgres claim path, so availability with Redis down equals availability with
 Redis absent. It does not cover **boot**: a configured URL that cannot connect
 fails startup instead, in every mode.
+
+## Metrics and alerts
+
+Issue #1429 adds three counters. They appear only on a process with the
+channel installed.
+
+| Metric | Prometheus series | Meaning |
+|--------|-------------------|---------|
+| `harvest.dispatch.hints_dropped` | `harvest_dispatch_hints_dropped_total` | Hints the background publisher dropped because its queue (10,000 hints) was full. The reconcile sweep republishes each row, so a drop costs latency, never work. |
+| `harvest.dispatch.fallbacks{reason}` | `harvest_dispatch_fallbacks_total` | Failed channel calls that sent a worker to the Postgres claim path for a cooldown. `reason` is `maintain`, `read`, `read_timeout` or `publish`. |
+| `harvest.dispatch.recovered` | `harvest_dispatch_recovered_total` | References a maintenance pass recovered from a consumer that stopped acking. A non-zero rate means workers crash or stall between a read and its ack. |
+
+The starter alert pack carries two rules on them. Both are ticket severity.
+
+| Alert | Fires when | Runbook |
+|-------|------------|---------|
+| `harvest_dispatch_hints_dropped` | Hints drop in every 5-minute window for 10 minutes | [runbook](../runbooks/harvest-alerts.md#harvest_dispatch_hints_dropped) |
+| `harvest_dispatch_fallback` | Fallbacks occur in every 5-minute window for 10 minutes | [runbook](../runbooks/harvest-alerts.md#harvest_dispatch_fallback) |
+
+The starter dashboard shows all three counters in its **Redis dispatch** row.
+`GET /api/harvest/admin/config` reports the channel settings in its `redis`
+section. The section includes `installed`, the credential-free `endpoint` and
+the effective `key_prefix`.
 
 ## Limits in v1
 

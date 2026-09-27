@@ -1421,6 +1421,84 @@
         "Worker logs for '[audit_export] failed to acquire a connection for the export tick' or 'timed out acquiring a connection for the export tick' (the dedicated export task, issue #1269), or '[audit_export] failed to get connection to shard' / 'timed out acquiring a connection for this shard' (an embedder driving fire_due_audit_exports by hand)"
       ],
       "runbook": "docs/runbooks/harvest-alerts.md#harvest_audit_export_unobservable"
+    },
+    {
+      "id": "harvest_dispatch_hints_dropped",
+      "status": "enforceable",
+      "signal_source": "harvest.dispatch.hints_dropped - dispatch hints the background publisher dropped because its bounded queue (10,000 hints) was full (issue #1429). Unlabelled. Emitted only by a process with Redis dispatch installed.",
+      "default_threshold": "Ticket when hints drop in every 5-minute window for 10 minutes. One short burst does not fire.",
+      "severity": "ticket",
+      "owner_persona": "platform on-call",
+      "description": "The Redis dispatch publisher cannot keep up. Its queue is full, so new hints are dropped. No work is lost: every task row stays PENDING in Postgres, and the reconcile sweep republishes it within one reconcile_interval_ms. The cost is dispatch latency. A sustained rate means Redis is slow or unreachable, or the enqueue rate outruns the channel.",
+      "first_action": "curl -s .../api/harvest/admin/config | jq '.redis'",
+      "dependencies": [
+        {
+          "ref": "#1312",
+          "status": "shipped",
+          "surface": "Redis dispatch channel and its Postgres fallback"
+        },
+        {
+          "ref": "#1429",
+          "status": "shipped",
+          "surface": "harvest.dispatch.hints_dropped"
+        }
+      ],
+      "prometheus": {
+        "mode": "native",
+        "notes": "The 5m window with a 10m for clause ignores a single burst. A burst clears the window before the for clause elapses. increase() does not count the first sample of a new series, so the first drop in a process is invisible. A sustained drop rate is not affected. Read this alert together with harvest_dispatch_fallback: drops during a fallback storm share one cause, which is Redis.",
+        "expressions": [
+          {
+            "name": "harvest_dispatch_hints_dropped",
+            "expr": "sum(increase(harvest_dispatch_hints_dropped_total[5m])) > 0",
+            "for": "10m"
+          }
+        ]
+      },
+      "management_checks": [
+        "GET /api/harvest/admin/config (redis section: installed, endpoint, key_prefix, consumer_group, poll_interval_ms, reconcile_interval_ms)",
+        "redis-cli -u <endpoint> PING",
+        "harvest worker health --output json"
+      ],
+      "runbook": "docs/runbooks/harvest-alerts.md#harvest_dispatch_hints_dropped"
+    },
+    {
+      "id": "harvest_dispatch_fallback",
+      "status": "enforceable",
+      "signal_source": "harvest.dispatch.fallbacks{reason} - one per failed Redis channel call that sends a worker to the Postgres claim path for a cooldown (issue #1429). reason is maintain, read, read_timeout or publish.",
+      "default_threshold": "Ticket when fallbacks occur in every 5-minute window for 10 minutes. One transient failure does not fire.",
+      "severity": "ticket",
+      "owner_persona": "platform on-call",
+      "description": "Workers cannot use the Redis dispatch channel and run on the Postgres claim path. Work continues, at the Postgres claim-path throughput, so a deep backlog drains more slowly. The cooldown starts at the poll interval, doubles with each consecutive failure and stops at 30 s. Only a successful reference read ends it. The usual cause is Redis unreachable or slow. The reason label names the call that failed.",
+      "first_action": "curl -s .../api/harvest/admin/config | jq '.redis'",
+      "dependencies": [
+        {
+          "ref": "#1312",
+          "status": "shipped",
+          "surface": "Redis dispatch channel and its Postgres fallback"
+        },
+        {
+          "ref": "#1429",
+          "status": "shipped",
+          "surface": "harvest.dispatch.fallbacks, harvest.dispatch.recovered and the redis section of GET /api/harvest/admin/config"
+        }
+      ],
+      "prometheus": {
+        "mode": "native",
+        "notes": "A fully unreachable Redis produces about one fallback per worker every 30 s once the cooldown reaches its cap, so the rule fires on a sustained outage. A single failure clears the 5m window before the 10m for clause elapses. Watch harvest_dispatch_recovered_total beside this rule: a non-zero recovered rate means workers crash or stall between a read and its ack.",
+        "expressions": [
+          {
+            "name": "harvest_dispatch_fallback",
+            "expr": "sum by (reason) (increase(harvest_dispatch_fallbacks_total[5m])) > 0",
+            "for": "10m"
+          }
+        ]
+      },
+      "management_checks": [
+        "GET /api/harvest/admin/config (redis section: installed, endpoint, key_prefix, consumer_group, poll_interval_ms, reconcile_interval_ms)",
+        "redis-cli -u <endpoint> PING",
+        "harvest worker health --output json"
+      ],
+      "runbook": "docs/runbooks/harvest-alerts.md#harvest_dispatch_fallback"
     }
   ]
 }

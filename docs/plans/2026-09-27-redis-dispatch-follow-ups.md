@@ -33,7 +33,7 @@ so each one gets its own issue.
 | 2 | (a) wrap each owner in `buffered_settled`; (b) a post-commit hook in the connection; (c) publish from the caller after return | (a). Diesel-async has no commit hook. (c) spreads one rule over many callers. |
 | 6 | (a) a `redis` section in core, filled by the plugin; (b) a plugin wrapper view; (c) a generic `dispatch` section | (a). The key names match `[harvest.redis]`, so an operator finds them. The endpoint is the redacted URL. |
 | 7 | (a) counters at the event sites; (b) a sampler over process-global atomics; (c) gauges | (a) for fallbacks and recoveries, which the worker sees. (b) for dropped hints, because the drop site has no telemetry handle. |
-| 8 | (a) ack each lease after its claim (today); (b) claim all, ack all, then start the tasks; (c) start each task after its claim, ack all at the end | (c). (b) delays the first task by every claim in the read. |
+| 8 | (a) ack each lease after its claim (today); (b) claim all, ack all, then start the tasks; (c) start each task after its claim, ack all at the end | (b). The ack still comes before the task starts, so the crash matrix does not change. The cost is that the first task waits for the other claims in the read. |
 | 9 | (a) one pipeline for all `XPENDING`, one for all `XCLAIM`; (b) `XAUTOCLAIM` | (a). `XAUTOCLAIM` needs Redis 6.2, and it is still one call per queue. |
 | 10 | (a) a tunable batch only; (b) a lease per queue so one worker sweeps; (c) a shared cursor in Redis | (a) plus (b). (c) leaks the Postgres cursor type into the channel trait. |
 
@@ -42,8 +42,8 @@ so each one gets its own issue.
 | Attack | Defence |
 |--------|---------|
 | A wrapped owner runs as a SAVEPOINT with no outer scope, and publishes before the outer commit | Today the same hint goes to the background publisher at once, which is earlier still. The wrap is never worse. A reference to a row that is not visible gets three short releases, and the sweep is the floor. |
-| A deferred ack deletes the marker of a reference that a wake just replaced | The next publish finds no marker and adds a second reference. The claim is still the only writer, so the second reference finds the row not claimable and is acked. The cost is one extra reference. |
-| A crash after a task starts and before the batched ack | The reference stays in the pending entries list. Recovery redelivers it, the row reads `RUNNING` or terminal, and the reference is acked. This is row 2 of the crash matrix. |
+| A batched ack runs after a task starts, so the task can wake its own row and a stale ack deletes the new marker | The worker acks the whole read before it starts any task. No task of this read runs before its ack. |
+| A crash after the claims and before the batched ack | The references stay in the pending entries list. Recovery redelivers them, each row reads `RUNNING`, and each reference is acked. This is row 2 of the crash matrix. |
 | A sweep lease holder stops sweeping but keeps its lease | The holder renews only after a sweep succeeds. A failed sweep deletes the lease. A lease that is not renewed expires after three intervals. |
 | Redis refuses the lease call | The worker sweeps anyway. The floor fails open. |
 | A peer serves a different queue set | The lease is per queue, so each queue has its own holder among the workers that poll it. |
@@ -62,8 +62,8 @@ so each one gets its own issue.
   change there small and local.
 - **Black (risks).** The sweep lease touches the durability floor. It must fail
   open, and it must never outlive a failed sweep. Deferred acks widen the
-  crash window from one claim to one read. Both need tests against a real
-  Redis.
+  crash window from one claim to one read, and delay the first task by the
+  other claims of the read. Both need tests against a real Redis.
 - **Yellow (benefits).** A fleet of N workers sweeps each queue once per
   interval, not N times. The operator can see the channel in the admin view
   and in metrics. Acks and recovery cost one round trip each per pass.
