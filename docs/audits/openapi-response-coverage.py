@@ -35,16 +35,17 @@ parsed strictly, so check 2 reads its mandatory fields. An empty field list on
 any other body is checked.
 
 A handler can also take the raw `Bytes` and call `serde_json::from_slice`
-itself. Checks 2, 3 and 5 read that parse when it reads a parameter of type
+itself. An import alias, such as `use serde_json::from_slice as decode;`, is
+read too. Checks 2, 3 and 5 read that parse when it reads a parameter of type
 `Bytes`, `&[u8]` or `Vec<u8>`. The parse can be in the handler, or in a helper
 one level down that the handler passes the body to. In a helper, only the
 parameter at the position of the body argument is a body. A move into another
-name, such as `let captured = body;`, is followed. A copy through a call, such as
-`body.to_vec()`, is not read. The type comes from
-a turbofish, then from a typed `let` in the same statement, then from a
-`Result<T, _>` return type. The last two apply only when the call ends its
-expression, since a `.map(..)` after it yields another type. A `Value` body is
-free-form, so checks 2 and 3 skip it. Check 5 still reads it.
+name, such as `let captured = body;`, is followed. A copy through a call, such
+as `body.to_vec()`, is not read. The type comes from a turbofish, then from a
+typed `let` in the same statement, then from a `Result<T, _>` return type. The
+last two apply only when the call ends its expression, since a `.map(..)` after
+it yields another type. A `Value` body is free-form, so checks 2 and 3 skip it.
+Check 5 still reads it.
 
 Check 5 treats a bare `Json<T>` as mandatory, since axum rejects a request
 without it. A `Result<Json<T>, _>` is mandatory when the handler rejects its
@@ -52,13 +53,14 @@ error, through `?`, `.map_err(..)?`, or an `Err` arm that builds an error or
 returns the rejection it binds. An `Err` arm that returns a helper, or whose
 value is a call to a helper that can build a rejection, rejects, unless it hands
 its error to that helper. A move of the extractor into another name is followed.
-Such a helper can recover the request, as the start route does (#808). A
-catch-all `_` arm counts as an `Err` arm, and so does an `if let Err(..)` block
-or the code after `let Err(..) = body else { .. };`. An `if` on `.is_err()` or
-`.is_ok()` counts when its failing branch rejects. A raw-byte parse is mandatory
-unless an `if` on `.is_empty()` lets an empty body skip it. The parse must be in
-the arm that runs for a non-empty body, and the empty-body arm must not reject.
-An earlier `if body.is_empty() { .. }` also counts when its block returns a
+Such a helper can recover the request, as the start route does (#808). A guard
+on an arm is not evaluated, so a rejecting guarded arm counts. A catch-all `_`
+arm counts as an `Err` arm, and so does an `if let Err(..)` block or the code
+after `let Err(..) = body else { .. };`. An `if` on `.is_err()` or `.is_ok()`
+counts when its failing branch rejects. A raw-byte parse is mandatory unless an
+`if` on `.is_empty()` lets an empty body skip it. The parse must be in the arm
+that runs for a non-empty body, and the empty-body arm must not reject. An
+earlier `if body.is_empty() { .. }` also counts when its block returns a
 success, such as `Ok(..)`, a 2xx status or `Json(..)`, and no error. Only a
 return at the top level of that block counts. A return inside a nested `if`,
 `match` or closure may not run. A parse that turns its error into a value is
@@ -452,9 +454,25 @@ BYTE_PARAMETER = re.compile(
     r"(?:(?:[a-z_]+::)*Bytes\b|\[u8\]|Vec<u8>)"
 )
 
-# A `serde_json::from_slice` call, or an imported `from_slice`: its turbofish,
-# if any, then its argument list. `Uuid::from_slice` is no body parse.
-FROM_SLICE = re.compile(r"(?:(?<=\bserde_json::)|(?<![\w:]))from_slice\s*(?:::<|\()")
+
+@functools.lru_cache(maxsize=None)
+def from_slice_calls(source: str) -> re.Pattern:
+    """A `serde_json::from_slice` call, or an imported one, in `source`.
+
+    The match runs to the turbofish, if any, or the argument list. It also
+    reads an import alias, such as `use serde_json::from_slice as decode;`, and
+    a module alias, such as `use serde_json as json;`. `Uuid::from_slice` is
+    no body parse.
+    """
+    names = {"from_slice"} | set(
+        re.findall(r"\bserde_json::(?:\{[^}]*?)?\bfrom_slice\s+as\s+([a-z_]\w*)", source)
+    )
+    modules = {"serde_json"} | set(re.findall(r"\buse\s+serde_json\s+as\s+([a-z_]\w*)\s*;", source))
+    return re.compile(
+        r"(?:\b(?:%s)::|(?<![\w:]))(?:%s)\s*(?:::<|\()"
+        % ("|".join(sorted(modules)), "|".join(sorted(names)))
+    )
+
 
 # The `StatusCode` names for a 2xx status.
 SUCCESS_NAMES = "|".join(sorted(name for name, status in NAMED.items() if 200 <= status < 300))
@@ -697,7 +715,7 @@ def block_parses(
 ) -> list[tuple[str | None, bool, bool]]:
     """`(type, optional, tolerant)` for each `from_slice` call that reads a carrier."""
     parses: list[tuple[str | None, bool, bool]] = []
-    for hit in FROM_SLICE.finditer(block):
+    for hit in from_slice_calls(SOURCE[0]).finditer(block):
         turbofish = None
         opener = hit.end() - 1
         if block[opener] == "<":
@@ -932,7 +950,8 @@ def error_arms(arms: str) -> list[re.Match]:
     """Each top-level arm pattern of this `match` that can receive an `Err`.
 
     That is an `Err(..)` pattern, a catch-all `_` or binding, or a binding
-    such as `error @ Err(_)`. Group 1 is the
+    such as `error @ Err(_)`. A guard is not evaluated, so a rejecting arm
+    counts even when a guard limits it to some errors. Group 1 is the
     name the arm binds, if any. `arms` includes the outer braces, so an arm
     pattern sits at depth 1 and follows `{`, `,` or `}`. A guarded arm can
     fall through to a later arm, so every one is returned.
@@ -1132,6 +1151,10 @@ def inspection_rejects(before: str, inspection: str, rest: str) -> bool:
     if re.match(r"\s*else\s*\{", after_taken):
         otherwise = balanced(after_taken[after_taken.index("{") :], "{", "}")
     failure_arm = taken if on_failure else otherwise
+    # With no `else`, a failure falls through past the `if`. When the arm for
+    # success always returns, the rest of the scope runs only on failure.
+    if failure_arm is None and re.search(r"\breturn\b", unconditional(taken)):
+        failure_arm = scope_rest(after_taken)
     return failure_arm is not None and rejecting_exit(failure_arm)
 
 
@@ -1918,6 +1941,9 @@ struct Thing {
 
 # Shapes that once slipped past the audit or failed it on correct code.
 FIXTURE_EDGES = r"""
+use serde_json::from_slice as decode;
+use serde_json as json;
+
 pub fn harvest_api_router() -> Router {
     Router::new()
         .route("/e/wrapped", post(e_wrapped))
@@ -2051,6 +2077,10 @@ pub fn harvest_api_router() -> Router {
         .route("/e/raw-alias", post(e_raw_alias))
         .route("/e/json-helper-default", post(e_json_helper_default))
         .route("/e/let-err-else", post(e_let_err_else))
+        .route("/e/aliased-decode", post(e_aliased_decode))
+        .route("/e/module-alias", post(e_module_alias))
+        .route("/e/ok-return-then-reject", post(e_ok_return_then_reject))
+        .route("/e/raw-guarded-arms", post(e_raw_guarded_arms))
 }
 
 async fn e_wrapped(body: Bytes) -> Response {
@@ -2971,6 +3001,32 @@ async fn e_let_err_else(body: Result<Json<Gadget>, JsonRejection>) -> Response {
         return StatusCode::OK.into_response();
     };
     rejection.into_response()
+}
+
+async fn e_aliased_decode(body: Bytes) -> Result<Response, Response> {
+    let gadget = decode::<Gadget>(&body).map_err(|_| reject())?;
+    Ok(StatusCode::OK.into_response())
+}
+
+async fn e_module_alias(body: Bytes) -> Result<Response, Response> {
+    let gadget = json::from_slice::<Gadget>(&body).map_err(|_| reject())?;
+    Ok(StatusCode::OK.into_response())
+}
+
+async fn e_ok_return_then_reject(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    if body.is_ok() {
+        return StatusCode::OK.into_response();
+    }
+    StatusCode::BAD_REQUEST.into_response()
+}
+
+async fn e_raw_guarded_arms(body: Bytes) -> Response {
+    let gadget = match serde_json::from_slice::<Gadget>(&body) {
+        Ok(gadget) => gadget,
+        Err(e) if !e.is_eof() => return StatusCode::BAD_REQUEST.into_response(),
+        Err(_) => Gadget::default(),
+    };
+    StatusCode::OK.into_response()
 }
 
 fn invalid_body() -> Response {
@@ -4624,6 +4680,41 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             )
         ],
         {},
+    ),
+    (
+        "an aliased deserializer and a fallthrough after a positive guard are read",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                path,
+                200,
+                request_body=body_of(("name", True), required=False),
+                error_responses=[{"status": 400}],
+            )
+            for path in ("/e/aliased-decode", "/e/module-alias", "/e/ok-return-then-reject")
+        ],
+        {
+            "body_required": [
+                "POST /e/aliased-decode: the body is mandatory",
+                "POST /e/module-alias: the body is mandatory",
+                "POST /e/ok-return-then-reject: the body is mandatory",
+            ]
+        },
+    ),
+    (
+        "a guarded rejecting Err arm makes a raw parse mandatory, since no guard is evaluated",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/raw-guarded-arms",
+                200,
+                request_body=body_of(("name", True), required=False),
+                error_responses=[{"status": 400}],
+            )
+        ],
+        {"body_required": ["POST /e/raw-guarded-arms: the body is mandatory"]},
     ),
     (
         "a malformed contract entry does not crash the audit",
