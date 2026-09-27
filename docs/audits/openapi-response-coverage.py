@@ -63,19 +63,21 @@ that runs for a non-empty body, and the empty-body arm must not reject. An
 earlier `if body.is_empty() { .. }` also counts when its block returns a
 success, such as `Ok(..)`, a 2xx status or `Json(..)`, and no error. Only a
 return at the top level of that block counts. A return inside a nested `if`,
-`match` or closure may not run. A parse that turns its error into a value is
-optional too, such as `.ok()`, `.unwrap_or_default()` or an `if let Ok(..)`
-whose `else` does not reject. A `match` on the parse is optional when it has an
-`Err` or catch-all arm and no such arm rejects. A fallback that rejects the
-error, such as `.map_or_else(|e| reject(e), ..)`, keeps the parse mandatory. So
-does a fallback that calls a helper that can build a rejection. The helper's
-return type decides: a response, an error or a `Result` can be a rejection, and
-a plain value type such as `Gadget` is not. A helper the audit cannot find
-counts as a rejection. An `.or_else(..)` whose fallback yields `Ok(..)` on every
-path makes a later `?` tolerant. A guard or a tolerant call at a helper call
-site carries into the helper. Check 2 applies to every parse that does not
-tolerate its error, since a body that is present must then carry the mandatory
-fields. A bare `Json<T>` and a rejecting `Result<Json<T>, _>` are such parses.
+`match` or closure may not run. A parse result stored by `let parsed = ..;` is
+read where it is used, and stays strict when it is unused or passed on. A parse
+that turns its error into a value is optional too, such as `.ok()`,
+`.unwrap_or_default()` or an `if let Ok(..)` whose `else` does not reject. A
+`match` on the parse is optional when it has an `Err` or catch-all arm and no
+such arm rejects. A fallback that rejects the error, such as
+`.map_or_else(|e| reject(e), ..)`, keeps the parse mandatory. So does a fallback
+that calls a helper that can build a rejection. The helper's return type
+decides: a response, an error or a `Result` can be a rejection, and a plain
+value type such as `Gadget` is not. A helper the audit cannot find counts as a
+rejection. An `.or_else(..)` whose fallback yields `Ok(..)` on every path makes
+a later `?` tolerant. A guard or a tolerant call at a helper call site carries
+into the helper. Check 2 applies to every parse that does not tolerate its
+error, since a body that is present must then carry the mandatory fields. A bare
+`Json<T>` and a rejecting `Result<Json<T>, _>` are such parses.
 
 Check 4 reads the routes that take a `RawQuery` and parse the pairs by hand. A
 key those parsers match is a parameter the route accepts, so a key the contract
@@ -461,17 +463,19 @@ def from_slice_calls(source: str) -> re.Pattern:
 
     The match runs to the turbofish, if any, or the argument list. It also
     reads an import alias, such as `use serde_json::from_slice as decode;`, and
-    a module alias, such as `use serde_json as json;`. `Uuid::from_slice` is
-    no body parse.
+    a module alias, such as `use serde_json as json;`. A bare `from_slice`
+    counts only when the source imports it from serde_json. `Uuid::from_slice`
+    and a local `from_slice` are no body parse.
     """
-    names = {"from_slice"} | set(
-        re.findall(r"\bserde_json::(?:\{[^}]*?)?\bfrom_slice\s+as\s+([a-z_]\w*)", source)
-    )
+    names = set(re.findall(r"\bserde_json::(?:\{[^}]*?)?\bfrom_slice\s+as\s+([a-z_]\w*)", source))
+    # A bare `from_slice` counts only when the source imports it from serde_json.
+    imported = r"\buse\s+serde_json::(?:from_slice\s*;|\{[^}]*\bfrom_slice\b(?!\s+as\b)|\*\s*;)"
+    if re.search(imported, source):
+        names.add("from_slice")
     modules = {"serde_json"} | set(re.findall(r"\buse\s+serde_json\s+as\s+([a-z_]\w*)\s*;", source))
-    return re.compile(
-        r"(?:\b(?:%s)::|(?<![\w:]))(?:%s)\s*(?:::<|\()"
-        % ("|".join(sorted(modules)), "|".join(sorted(names)))
-    )
+    qualified = r"\b(?:%s)::from_slice" % "|".join(sorted(modules))
+    bare = r"|(?<![\w:])(?:%s)" % "|".join(sorted(names)) if names else ""
+    return re.compile(r"(?:%s%s)\s*(?:::<|\()" % (qualified, bare))
 
 
 # The `StatusCode` names for a 2xx status.
@@ -524,7 +528,8 @@ def parts_at(source: str, start: int) -> tuple[str, str, str] | None:
     if brace < 0:
         return None
     returns = source[opener + len(params) : brace]
-    code = re.sub(r"//[^\n]*|/\*.*?\*/", "", params, flags=re.S)
+    # The masked copy blanks nested comments too.
+    code = masked[opener : opener + len(params)]
     return code, returns, source[brace : brace + len(balanced(masked[brace:], "{", "}"))]
 
 
@@ -729,6 +734,14 @@ def block_parses(
         before = block[: hit.start()]
         after = block[opener + len(call) :]
         tolerant = discards_error(before, after)
+        # A result stored by `let parsed = ..;` is read where it is used. It stays
+        # strict when it is never used or is passed on, since a callee may reject.
+        stored = re.search(r"\blet\s+(?:mut\s+)?([a-z_][a-z_0-9]*)\s*(?::[^=;]*)?=\s*$", before)
+        if not tolerant and stored and after.lstrip().startswith(";"):
+            name = re.escape(stored.group(1))
+            used = re.search(r"(?<![.\w])%s\b" % name, after)
+            passed = re.search(r"[(,]\s*&?\s*(?:mut\s+)?%s\b" % name, after)
+            tolerant = bool(used) and not passed and not error_rejects(stored.group(1), after)
         optional = tolerant or guards(block, hit.start(), root.group(1))
         # A body read through an index, a method or a generic type is not
         # something the audit can type, so it is reported.
@@ -879,7 +892,8 @@ def error_exits_before(block: str, variable: str, read: str, position: int) -> b
     returns a success on every path. A later `?` or `unwrap` then sees only
     `Ok`, so it rejects nothing. The `if` must be in the scope of the use.
     """
-    tested = r"\bif\s+(?:!\s*%s\s*\.\s*is_ok|%s\s*\.\s*is_err)\s*\(\s*\)\s*\{" % (
+    # A `|| x` after the test keeps the arm entered on every error.
+    tested = r"\bif\s+(?:!\s*%s\s*\.\s*is_ok|%s\s*\.\s*is_err)\s*\(\s*\)\s*(?:\|\|[^{&]*)?\{" % (
         variable,
         variable,
     )
@@ -2081,6 +2095,11 @@ pub fn harvest_api_router() -> Router {
         .route("/e/module-alias", post(e_module_alias))
         .route("/e/ok-return-then-reject", post(e_ok_return_then_reject))
         .route("/e/raw-guarded-arms", post(e_raw_guarded_arms))
+        .route("/e/stored-parse", post(e_stored_parse))
+        .route("/e/stored-parse-strict", post(e_stored_parse_strict))
+        .route("/e/or-exit-then-unwrap", post(e_or_exit_then_unwrap))
+        .route("/e/nested-param-comment", post(e_nested_param_comment))
+        .route("/e/local-from-slice", post(e_local_from_slice))
 }
 
 async fn e_wrapped(body: Bytes) -> Response {
@@ -3026,6 +3045,35 @@ async fn e_raw_guarded_arms(body: Bytes) -> Response {
         Err(e) if !e.is_eof() => return StatusCode::BAD_REQUEST.into_response(),
         Err(_) => Gadget::default(),
     };
+    StatusCode::OK.into_response()
+}
+
+async fn e_stored_parse(body: Bytes) -> Response {
+    let parsed = serde_json::from_slice::<Gadget>(&body);
+    let gadget = parsed.unwrap_or_default();
+    StatusCode::OK.into_response()
+}
+
+async fn e_stored_parse_strict(body: Bytes) -> Result<Response, Response> {
+    let parsed = serde_json::from_slice::<Gadget>(&body);
+    let gadget = parsed.map_err(|_| reject())?;
+    Ok(StatusCode::OK.into_response())
+}
+
+async fn e_or_exit_then_unwrap(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    if body.is_err() || maintenance() {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+    let Json(gadget) = body.unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_nested_param_comment(/* outer /* inner */ ghost: Json<Gadget>, */) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn e_local_from_slice(body: Bytes) -> Response {
+    let gadget = from_slice::<Gadget>(&body);
     StatusCode::OK.into_response()
 }
 
@@ -4715,6 +4763,48 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             )
         ],
         {"body_required": ["POST /e/raw-guarded-arms: the body is mandatory"]},
+    ),
+    (
+        "a stored parse result is read where it is used",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/stored-parse",
+                200,
+                request_body=body_of(("name", False), required=False),
+            ),
+            fixture_route(
+                "POST",
+                "/e/stored-parse-strict",
+                200,
+                request_body=body_of(("name", True), required=False),
+            ),
+        ],
+        {"body_required": ["POST /e/stored-parse-strict: the body is mandatory"]},
+    ),
+    (
+        "an unwrap after an OR guard that exits on every error with success is tolerant",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/or-exit-then-unwrap",
+                200,
+                request_body=body_of(("name", False), required=False),
+                additional_responses=[{"status": 204}],
+            )
+        ],
+        {},
+    ),
+    (
+        "a nested comment in a parameter list and an unimported from_slice are no body",
+        FIXTURE_EDGES,
+        [
+            fixture_route("POST", path, 200)
+            for path in ("/e/nested-param-comment", "/e/local-from-slice")
+        ],
+        {},
     ),
     (
         "a malformed contract entry does not crash the audit",
