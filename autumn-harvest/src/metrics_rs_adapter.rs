@@ -52,8 +52,9 @@ use crate::telemetry::{
     METRIC_COMPLETION_TRIGGER_FIRED, METRIC_COMPLETION_TRIGGER_SKIPPED,
     METRIC_CONCURRENCY_RESIDUAL_OVER_LIMIT, METRIC_CONCURRENCY_SUPERSEDED,
     METRIC_CONNECTOR_DISPATCHED, METRIC_CONNECTOR_LAG, METRIC_CONNECTOR_POISONED,
-    METRIC_CONNECTOR_RECEIVED, METRIC_DEBOUNCE_FIRED, METRIC_DLQ_ENTRIES, METRIC_DLQ_REDRIVEN,
-    METRIC_EXTERNAL_BY_ID_FOUND_OVER_INCOMPLETE_FANOUT, METRIC_EXTERNAL_BY_ID_INDETERMINATE_SHARD,
+    METRIC_CONNECTOR_RECEIVED, METRIC_DEBOUNCE_FIRED, METRIC_DISPATCH_DROPPED_HINTS,
+    METRIC_DLQ_ENTRIES, METRIC_DLQ_REDRIVEN, METRIC_EXTERNAL_BY_ID_FOUND_OVER_INCOMPLETE_FANOUT,
+    METRIC_EXTERNAL_BY_ID_INDETERMINATE_SHARD, METRIC_EXTERNAL_BY_ID_OTHER_LIVE_OBSERVED,
     METRIC_EXTERNAL_CANCEL_BY_ID_OLDEST_PENDING_AGE, METRIC_EXTERNAL_CANCEL_SENT,
     METRIC_EXTERNAL_SIGNAL_BY_ID_OLDEST_PENDING_AGE, METRIC_EXTERNAL_SIGNAL_SENT,
     METRIC_LABEL_ACTION, METRIC_LABEL_ACTIVITY, METRIC_LABEL_ACTIVITY_NAME, METRIC_LABEL_BUILD_ID,
@@ -318,6 +319,11 @@ impl MetricsRecorder for MetricsRsRecorder {
             METRIC_LABEL_SHARD => shard.to_string(),
         )
         .set(depth as f64);
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn record_dispatch_dropped_hints(&self, total: u64) {
+        gauge!(METRIC_DISPATCH_DROPPED_HINTS).set(total as f64);
     }
 
     fn record_queue_paused(&self, queue: &str, paused: bool) {
@@ -743,6 +749,14 @@ impl MetricsRecorder for MetricsRsRecorder {
     fn record_external_by_id_found_over_incomplete_fanout(&self, shard: u16) {
         counter!(
             METRIC_EXTERNAL_BY_ID_FOUND_OVER_INCOMPLETE_FANOUT,
+            METRIC_LABEL_SHARD => shard.to_string(),
+        )
+        .increment(1);
+    }
+
+    fn record_external_by_id_other_live_observed(&self, shard: u16) {
+        counter!(
+            METRIC_EXTERNAL_BY_ID_OTHER_LIVE_OBSERVED,
             METRIC_LABEL_SHARD => shard.to_string(),
         )
         .increment(1);
@@ -1345,6 +1359,7 @@ mod tests {
         rec.record_timer_started(30.0);
         rec.record_queue_depth("q", 5);
         rec.record_dlq_entries(0, 2);
+        rec.record_dispatch_dropped_hints(0);
         rec.record_schedule_run("workflow", "nightly");
         rec.record_schedule_skipped("workflow", "nightly", "paused");
         rec.record_schedule_decision_write_failed();
@@ -1375,6 +1390,8 @@ mod tests {
         rec.record_external_signal_by_id_oldest_pending_indeterminate_age(0.0);
         rec.record_external_cancel_by_id_oldest_pending_indeterminate_age(0.0);
         rec.record_external_by_id_found_over_incomplete_fanout(0);
+        // Issue #1313: by-id other-live-run observability.
+        rec.record_external_by_id_other_live_observed(0);
     }
 
     // -----------------------------------------------------------------------

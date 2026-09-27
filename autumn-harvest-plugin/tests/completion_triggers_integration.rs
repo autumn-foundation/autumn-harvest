@@ -31,7 +31,6 @@ use autumn_harvest_plugin::api::{
 
 static TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 use autumn_harvest_plugin::HarvestDbPool;
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -309,7 +308,7 @@ fn build_app(pool: &DbPool) -> HarvestApiApp {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::default(),
     ));
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 async fn get_json(app: &HarvestApiApp, uri: &str) -> (StatusCode, Value) {
@@ -1339,7 +1338,7 @@ async fn test_trigger_cross_shard() {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         router.clone(),
     ));
-    let app = harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(api_state);
 
     let mut trigger_id = uuid::Uuid::new_v4();
     let mut source_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
@@ -1797,7 +1796,7 @@ async fn test_trigger_outbox_retry_and_sweep() {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         router.clone(),
     ));
-    let app = harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(api_state);
 
     let mut trigger_id = uuid::Uuid::new_v4();
     let mut source_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
@@ -2019,7 +2018,7 @@ async fn test_trigger_cross_shard_queue_preservation() {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         router.clone(),
     ));
-    let app = harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(api_state);
 
     let mut trigger_id = uuid::Uuid::new_v4();
     let mut source_exec_id = ExecutionId::new_for_shard(ShardId::new(1)); // Source runs on Shard 1
@@ -2201,7 +2200,7 @@ async fn test_trigger_compensating_rollback() {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         router.clone(),
     ));
-    let app = harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(api_state);
 
     let trigger_id = uuid::Uuid::new_v4();
 
@@ -2293,7 +2292,7 @@ async fn test_trigger_compensating_rollback_restores_existing() {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         router.clone(),
     ));
-    let app = harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(api_state);
 
     // 2. Post to /admin/completion-triggers with updated values.
     // Shard 0 will succeed to update, but Shard 1 will fail.

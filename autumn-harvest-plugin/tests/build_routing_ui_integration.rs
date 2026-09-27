@@ -17,7 +17,6 @@ use autumn_harvest::{StartWorkflowParams, start_or_load_workflow_execution};
 use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime};
 use autumn_harvest_plugin::ui::harvest_ui_router;
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -57,10 +56,6 @@ fn build_test_pool(database_url: &str) -> DbPool {
         .max_size(4)
         .build()
         .expect("failed to build test pool")
-}
-
-fn test_app_state() -> AppState {
-    AppState::for_test().with_profile("test")
 }
 
 fn minimal_registry() -> Arc<HandlerRegistry> {
@@ -217,7 +212,7 @@ async fn build_routing_page_is_reachable_via_nav() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
     let api_state = build_api_state_with_pool(&pool);
-    let app = harvest_ui_router(api_state).with_state(test_app_state());
+    let app = harvest_ui_router(api_state);
 
     let (status, html) = fetch_html(&app, "/build-routing").await;
     assert_eq!(status, StatusCode::OK, "build-routing page must return 200");
@@ -251,7 +246,7 @@ async fn build_routing_empty_state_shows_docs_link() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
     let api_state = build_api_state_with_pool(&pool);
-    let app = harvest_ui_router(api_state).with_state(test_app_state());
+    let app = harvest_ui_router(api_state);
 
     let (status, html) = fetch_html(&app, "/build-routing").await;
     assert_eq!(status, StatusCode::OK);
@@ -276,7 +271,7 @@ async fn workflows_page_nav_includes_build_routing() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
     let api_state = build_api_state_with_pool(&pool);
-    let app = harvest_ui_router(api_state).with_state(test_app_state());
+    let app = harvest_ui_router(api_state);
 
     let (status, html) = fetch_html(&app, "/workflows").await;
     assert_eq!(status, StatusCode::OK);
@@ -312,7 +307,7 @@ async fn workers_page_nav_includes_build_routing() {
     .unwrap();
 
     let api_state = build_api_state_with_pool(&pool);
-    let app = harvest_ui_router(api_state).with_state(test_app_state());
+    let app = harvest_ui_router(api_state);
 
     let (status, html) = fetch_html(&app, "/workers").await;
     assert_eq!(status, StatusCode::OK);
@@ -337,7 +332,7 @@ async fn workers_page_has_build_id_filter() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
     let api_state = build_api_state_with_pool(&pool);
-    let app = harvest_ui_router(api_state).with_state(test_app_state());
+    let app = harvest_ui_router(api_state);
 
     let (status, html) = fetch_html(&app, "/workers").await;
     assert_eq!(status, StatusCode::OK);
@@ -353,7 +348,7 @@ async fn api_get_build_routing_returns_json() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
     let api_state = build_api_state_with_pool(&pool);
-    let app = autumn_harvest_plugin::harvest_api_router(api_state).with_state(test_app_state());
+    let app = autumn_harvest_plugin::harvest_api_router(api_state);
 
     let (status, json) = get_json(&app, "/admin/build-routing").await;
     assert_eq!(
@@ -387,7 +382,7 @@ async fn api_set_build_policy_works() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
     let api_state = build_api_state_with_pool(&pool);
-    let app = autumn_harvest_plugin::harvest_api_router(api_state).with_state(test_app_state());
+    let app = autumn_harvest_plugin::harvest_api_router(api_state);
 
     let (status, json) = post_json(
         &app,
@@ -407,7 +402,7 @@ async fn api_declare_compat_works() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
     let api_state = build_api_state_with_pool(&pool);
-    let app = autumn_harvest_plugin::harvest_api_router(api_state).with_state(test_app_state());
+    let app = autumn_harvest_plugin::harvest_api_router(api_state);
 
     let (status, json) = post_json(
         &app,
@@ -430,7 +425,7 @@ async fn api_list_compat_works() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
     let api_state = build_api_state_with_pool(&pool);
-    let app = autumn_harvest_plugin::harvest_api_router(api_state).with_state(test_app_state());
+    let app = autumn_harvest_plugin::harvest_api_router(api_state);
 
     // Seed a compat entry directly.
     let mut conn = AsyncPgConnection::establish(&database_url).await.unwrap();
@@ -452,7 +447,7 @@ async fn api_revoke_compat_works() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
     let api_state = build_api_state_with_pool(&pool);
-    let app = autumn_harvest_plugin::harvest_api_router(api_state).with_state(test_app_state());
+    let app = autumn_harvest_plugin::harvest_api_router(api_state);
 
     // Seed the entry.
     let mut conn = AsyncPgConnection::establish(&database_url).await.unwrap();
@@ -535,7 +530,7 @@ async fn api_retire_build_returns_conflict_when_not_safe() {
         .unwrap();
 
     let api_state = build_api_state_with_pool(&pool);
-    let app = autumn_harvest_plugin::harvest_api_router(api_state).with_state(test_app_state());
+    let app = autumn_harvest_plugin::harvest_api_router(api_state);
 
     let (status, json) = post_json(
         &app,
@@ -561,7 +556,7 @@ async fn api_retire_build_returns_ok_when_safe() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
     let api_state = build_api_state_with_pool(&pool);
-    let app = autumn_harvest_plugin::harvest_api_router(api_state).with_state(test_app_state());
+    let app = autumn_harvest_plugin::harvest_api_router(api_state);
 
     // No executions at all — build "sha-old" is trivially safe to retire.
     let (status, json) = post_json(
@@ -586,7 +581,7 @@ async fn ui_set_policy_form_action_redirects_with_flash() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
     let api_state = build_api_state_with_pool(&pool);
-    let app = harvest_ui_router(api_state).with_state(test_app_state());
+    let app = harvest_ui_router(api_state);
 
     let (status, headers, _body) = post_form(
         &app,
@@ -616,7 +611,7 @@ async fn ui_declare_compat_form_action_redirects() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
     let api_state = build_api_state_with_pool(&pool);
-    let app = harvest_ui_router(api_state).with_state(test_app_state());
+    let app = harvest_ui_router(api_state);
 
     let (status, headers, _body) = post_form(
         &app,
@@ -645,7 +640,7 @@ async fn ui_revoke_compat_form_action_redirects() {
     declare_compat(&mut conn, "sha-v2", "sha-v1").await.unwrap();
 
     let api_state = build_api_state_with_pool(&pool);
-    let app = harvest_ui_router(api_state).with_state(test_app_state());
+    let app = harvest_ui_router(api_state);
 
     let (status, headers, _body) = post_form(
         &app,
@@ -665,7 +660,7 @@ async fn ui_retire_form_action_redirects_with_safe_confirmation() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
     let api_state = build_api_state_with_pool(&pool);
-    let app = harvest_ui_router(api_state).with_state(test_app_state());
+    let app = harvest_ui_router(api_state);
 
     // No executions — trivially safe.
     let (status, headers, _body) =
@@ -693,7 +688,7 @@ async fn build_routing_page_shows_seeded_policy_and_reachability() {
         .unwrap();
 
     let api_state = build_api_state_with_pool(&pool);
-    let app = harvest_ui_router(api_state).with_state(test_app_state());
+    let app = harvest_ui_router(api_state);
 
     let (status, html) = fetch_html(&app, "/build-routing").await;
     assert_eq!(status, StatusCode::OK);
@@ -725,7 +720,7 @@ async fn build_routing_page_shows_compat_graph() {
     declare_compat(&mut conn, "sha-v2", "sha-v1").await.unwrap();
 
     let api_state = build_api_state_with_pool(&pool);
-    let app = harvest_ui_router(api_state).with_state(test_app_state());
+    let app = harvest_ui_router(api_state);
 
     let (status, html) = fetch_html(&app, "/build-routing").await;
     assert_eq!(status, StatusCode::OK);
@@ -753,7 +748,7 @@ async fn build_routing_page_displays_flash_message() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
     let api_state = build_api_state_with_pool(&pool);
-    let app = harvest_ui_router(api_state).with_state(test_app_state());
+    let app = harvest_ui_router(api_state);
 
     let (status, html) =
         fetch_html(&app, "/build-routing?flash=Policy%20updated%20successfully").await;
@@ -845,8 +840,7 @@ async fn two_build_rolling_deploy_full_lifecycle() {
 
     // Step 2: Shift active policy to sha-v2 via API.
     let api_state = build_api_state_with_pool(&pool);
-    let api_app =
-        autumn_harvest_plugin::harvest_api_router(api_state.clone()).with_state(test_app_state());
+    let api_app = autumn_harvest_plugin::harvest_api_router(api_state.clone());
 
     let (status, _) = post_json(
         &api_app,
@@ -964,7 +958,7 @@ async fn workers_page_build_id_filter_works() {
     .unwrap();
 
     let api_state = build_api_state_with_pool(&pool);
-    let app = harvest_ui_router(api_state).with_state(test_app_state());
+    let app = harvest_ui_router(api_state);
 
     // Unfiltered: both workers appear.
     let (status, html) = fetch_html(&app, "/workers").await;

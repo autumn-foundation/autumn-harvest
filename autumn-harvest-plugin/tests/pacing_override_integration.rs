@@ -43,7 +43,6 @@ use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -240,7 +239,7 @@ fn build_app(
         ShardRouter::default(),
     ));
 
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 /// Sharded variant of [`build_app`] -- lets a caller install an arbitrary
@@ -273,7 +272,7 @@ fn build_sharded_app(
         router,
     ));
 
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 /// An app whose storage pool is installed but whose runtime is not.
@@ -288,7 +287,7 @@ fn build_app_with_storage_pool_but_no_runtime(pool: &DbPool) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
     api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 // ── HTTP helpers ─────────────────────────────────────────────────────────────

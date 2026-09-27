@@ -113,10 +113,28 @@ notification, per
 [the configuration these numbers were taken at](#the-configuration-these-numbers-were-taken-at).
 
 Neither point says whether Harvest is faster or slower than anything else.
-This suite has not run another engine's benchmark, and a competitor's own
-published figure would carry accuracy and staleness this project cannot vouch
-for. A comparison worth trusting re-runs both engines on the same hardware,
-which is why this suite ships in the repo — see [Reproducing](#reproducing).
+This suite still runs no competitor, and a competitor's own published figure
+would carry accuracy and staleness this project cannot vouch for. A comparison
+worth trusting re-runs both engines on the same hardware, which is why this
+suite ships in the repo — see [Reproducing](#reproducing).
+
+**One such comparison has now been run on this page's own workflow, and
+Harvest lost it.** It is reported in the assay ledger rather than here, and
+the engine is deliberately not named on this page: issue #1309's acceptance
+criterion is that no competitor figure appears on it, and
+`benchmarks_docs.rs` enforces that. See
+[the assay ledger](assays/README.md), entries 10 and 11, for the measured
+numbers, the pre-registration that fixed in advance what they may not be read
+to mean, and the depth diagnostic that separates a known claim-path defect
+from an architectural gap.
+
+Two things about that result belong here, because they bear on this page's
+own numbers rather than on any other engine. The first is that the margin
+widened sharply with backlog depth, which is the `#786`/`#1177` claim path
+this page already cross-references: the Postgres arm fell 4.2x between a
+500-row and a 2,000-row backlog. The second is that the Redis dispatch
+channel did not fall at all over the same range, which is what an operator
+choosing between the two modes actually needs to know.
 
 ### Results by release
 

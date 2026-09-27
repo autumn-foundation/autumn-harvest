@@ -452,6 +452,14 @@ pub const METRIC_SHARD_FENCED: &str = "harvest.shard.fenced";
 /// Gauge: current number of entries in the dead letter queue.
 pub const METRIC_DLQ_ENTRIES: &str = "harvest.dlq.entries";
 
+/// Gauge: cumulative hints the dispatch background publisher has dropped
+/// because its bounded queue was full (issue #1429).
+///
+/// A dropped hint costs latency, not correctness: the row stays `PENDING`
+/// and the reconcile sweep republishes it. A sustained non-zero rate means
+/// the publisher queue is undersized for the enqueue rate.
+pub const METRIC_DISPATCH_DROPPED_HINTS: &str = "harvest.dispatch.dropped_hints";
+
 /// Gauge: `1` while a task queue is paused by an operator, `0` once it resumes
 /// (issue #619).
 ///
@@ -612,6 +620,28 @@ pub const METRIC_EXTERNAL_CANCEL_BY_ID_OLDEST_PENDING_AGE: &str =
 /// only, per ADR-0001 §7.
 pub const METRIC_EXTERNAL_BY_ID_FOUND_OVER_INCOMPLETE_FANOUT: &str =
     "harvest.external_signal.by_id_found_over_incomplete_fanout";
+
+/// Counter: a by-id fan-out completed and found more than one live run
+/// of the same business key (issue #1146). Issue #1313 records the
+/// residual bound this counter is evidence for.
+///
+/// `(workflow_name, workflow_id)` uniqueness is shard-local. Two paths
+/// make this fire. A key pinned to one shard while an unpinned start of
+/// it hashes to another is one. Draining a shard, so a later unpinned
+/// start of the same key rehashes elsewhere while the old run stays
+/// live, is the other. Neither pinning is required.
+///
+/// It is the observable proxy for the precondition behind issue
+/// #1313's race. The race itself is a run that starts mid fan-out. No
+/// counter can see that instant. Two live runs surviving a complete
+/// fan-out is different: it is real, and it is countable. Labelled
+/// `shard` (the winning run's shard) only, per ADR-0001 §7.
+///
+/// Distinct from [`METRIC_EXTERNAL_BY_ID_FOUND_OVER_INCOMPLETE_FANOUT`]:
+/// that counter fires over a partial view, a shard that could not be
+/// read. This one fires over a complete view that is still ambiguous.
+pub const METRIC_EXTERNAL_BY_ID_OTHER_LIVE_OBSERVED: &str =
+    "harvest.external_signal.by_id_other_live_observed";
 
 /// OpenTelemetry span attribute: the signal name for `signal_external_workflow` spans.
 ///
@@ -2766,6 +2796,16 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (shard, depth);
     }
 
+    /// Cumulative hints the dispatch background publisher has dropped because
+    /// its bounded queue was full (issue #1429).
+    ///
+    /// Emitted by a periodic in-process sampler, no label. Maps to the gauge
+    /// `harvest_dispatch_dropped_hints`. Not incremental: each call carries
+    /// the running total from [`crate::dispatch::dropped_hints`].
+    fn record_dispatch_dropped_hints(&self, total: u64) {
+        let _ = total;
+    }
+
     /// Whether a task queue is currently held by an operator queue pause
     /// (issue #619): `paused = true` while the hold is in effect, `false` for
     /// one cycle after it is released so the series drops rather than going
@@ -3315,6 +3355,15 @@ pub trait MetricsRecorder: Send + Sync {
     ///
     /// Maps to the counter [`METRIC_EXTERNAL_BY_ID_FOUND_OVER_INCOMPLETE_FANOUT`].
     fn record_external_by_id_found_over_incomplete_fanout(&self, shard: u16) {
+        let _ = shard;
+    }
+
+    /// A by-id fan-out completed and found more than one live run of the
+    /// same business key (issue #1146; issue #1313). `shard` is the
+    /// winning run's shard.
+    ///
+    /// Maps to the counter [`METRIC_EXTERNAL_BY_ID_OTHER_LIVE_OBSERVED`].
+    fn record_external_by_id_other_live_observed(&self, shard: u16) {
         let _ = shard;
     }
 
@@ -4652,6 +4701,7 @@ mod tests {
         rec.record_external_signal_by_id_oldest_pending_indeterminate_age(0.0);
         rec.record_external_cancel_by_id_oldest_pending_indeterminate_age(30.5);
         rec.record_external_by_id_found_over_incomplete_fanout(2);
+        rec.record_external_by_id_other_live_observed(1);
         assert_eq!(
             METRIC_EXTERNAL_CANCEL_SENT,
             "harvest.workflow.external_cancel.sent"
@@ -4671,6 +4721,10 @@ mod tests {
         assert_eq!(
             METRIC_EXTERNAL_BY_ID_FOUND_OVER_INCOMPLETE_FANOUT,
             "harvest.external_signal.by_id_found_over_incomplete_fanout"
+        );
+        assert_eq!(
+            METRIC_EXTERNAL_BY_ID_OTHER_LIVE_OBSERVED,
+            "harvest.external_signal.by_id_other_live_observed"
         );
     }
 

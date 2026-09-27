@@ -189,6 +189,9 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     "harvest_worker_slot_target",
     "harvest_shard_stranded_pending",
     "harvest_shard_dispatched_total",
+    // Issue #1429 — dispatch background publisher backpressure (bare gauge,
+    // no label, one series per process).
+    "harvest_dispatch_dropped_hints",
     // Issue #954 — cross-region DR. Four gauges (bare) and one counter.
     "harvest_replication_lag_seconds",
     "harvest_replication_lag_bytes",
@@ -221,6 +224,9 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     "harvest_external_signal_by_id_oldest_pending_indeterminate_age",
     "harvest_external_cancel_by_id_oldest_pending_indeterminate_age",
     "harvest_external_signal_by_id_found_over_incomplete_fanout_total",
+    // Issue #1313 — the observable proxy for the by-id fan-out race's
+    // precondition.
+    "harvest_external_signal_by_id_other_live_observed_total",
 ];
 
 /// Per-series label ground truth (Prometheus-normalized label names),
@@ -328,6 +334,7 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     ("harvest_queue_dispatched", &["queue"]),
     ("harvest_shard_stranded_pending", &["shard"]),
     ("harvest_shard_dispatched", &["shard"]),
+    ("harvest_dispatch_dropped_hints", &[]),
     // Issue #954 — cross-region DR. All `{shard}`-only: a standby's
     // `application_name` is operator-chosen and unbounded (ADR-0001 §7).
     ("harvest_replication_lag_seconds", &["shard"]),
@@ -415,6 +422,10 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     ),
     (
         "harvest_external_signal_by_id_found_over_incomplete_fanout",
+        &["shard"],
+    ),
+    (
+        "harvest_external_signal_by_id_other_live_observed",
         &["shard"],
     ),
 ];

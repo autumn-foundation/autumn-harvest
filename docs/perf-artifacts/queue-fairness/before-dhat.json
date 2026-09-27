@@ -1,0 +1,253 @@
+{"dhatFileVersion":2
+,"mode":"heap","verb":"Allocated"
+,"bklt":true,"bkacc":true
+,"tu":"instrs","Mtu":"Minstr"
+,"tuth":500
+,"cmd":"/home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b"
+,"pid":6528
+,"te":246459917
+,"tg":246449280
+,"pps":
+ [{"tb":472,"tbk":1
+  ,"tl":177685
+  ,"mb":472,"mbk":1
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":3233,"wb":1482
+  ,"acc":[213,-3,157,-4,0,-8,211,-8,98,-8,14,-8,20,-16,14,-8,25,-8,15,-8,11,-16,1,-8,9,-8,3,-4,15,14,-3,5,-8,0,-2,1,-6,0,-8,4,-8,8,-8,0,-16,1,-16,0,-4,10,-20,0,-8,17,-4,4,-4,3,-8,5,-88,1,-136,0,-8,1]
+  ,"fs":[1,2,3,4,5,6]
+  }
+ ,{"tb":360,"tbk":2
+  ,"tl":176774
+  ,"mb":240,"mbk":1
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":6935,"wb":5541
+  ,"fs":[1,7,8,5,6]
+  }
+ ,{"tb":1024,"tbk":1
+  ,"tl":176825
+  ,"mb":1024,"mbk":1
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":10740,"wb":5699
+  ,"acc":[24,-246,18,-332,16,-445,15]
+  ,"fs":[1,9,10,11,12,8,5,6]
+  }
+ ,{"tb":32,"tbk":1
+  ,"tl":326
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":32,"wb":32
+  ,"acc":[-32,2]
+  ,"fs":[13,14,5,6]
+  }
+ ,{"tb":152,"tbk":1
+  ,"tl":296
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":24,"wb":16
+  ,"acc":[-8,3,-8,2,-136,0]
+  ,"fs":[15,16,17,18,5,6]
+  }
+ ,{"tb":32,"tbk":1
+  ,"tl":212
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":0,"wb":32
+  ,"acc":[-32,1]
+  ,"fs":[13,19,18,5,6]
+  }
+ ,{"tb":4,"tbk":1
+  ,"tl":245930612
+  ,"mb":0,"mbk":0
+  ,"gb":4,"gbk":1
+  ,"eb":0,"ebk":0
+  ,"rb":0,"wb":4
+  ,"acc":[-4,1]
+  ,"fs":[1,20,21,6]
+  }
+ ,{"tb":544,"tbk":1
+  ,"tl":245935938
+  ,"mb":0,"mbk":0
+  ,"gb":544,"gbk":1
+  ,"eb":544,"ebk":1
+  ,"rb":76,"wb":60
+  ,"acc":[-16,3,-80,0,-40,2,-402,0,-2,4,-4,0]
+  ,"fs":[1,22,21,6]
+  }
+ ,{"tb":384,"tbk":1
+  ,"tl":245926778
+  ,"mb":0,"mbk":0
+  ,"gb":384,"gbk":1
+  ,"eb":0,"ebk":0
+  ,"rb":5120352,"wb":384
+  ,"acc":[-8,2,-8,20003,-8,20002,-8,2,-8,20002,-8,20001,-8,2,-8,20002,-8,20001,-8,2,-8,20003,-8,20002,-8,2,-8,20002,-8,20001,-8,2,-8,20002,-8,20001,-8,2,-8,20003,-8,20002,-8,2,-8,20002,-8,20001,-8,2,-8,20002,-8,20001,-8,2,-8,20003,-8,20002,-8,2,-8,20002,-8,20001,-8,2,-8,20002,-8,20001,-8,2,-8,20003,-8,20002,-8,2,-8,20002,-8,20001,-8,2,-8,20002,-8,20001,-8,2,-8,20003,-8,20002]
+  ,"fs":[1,23,24,25,26,27,6]
+  }
+ ,{"tb":192,"tbk":16
+  ,"tl":3934756734
+  ,"mb":0,"mbk":0
+  ,"gb":192,"gbk":16
+  ,"eb":0,"ebk":0
+  ,"rb":5600044,"wb":118
+  ,"acc":[-7,39126,17864,-4,0]
+  ,"fs":[1,28,29,24,25,26,27,6]
+  }
+ ,{"tb":7,"tbk":1
+  ,"tl":245917149
+  ,"mb":0,"mbk":0
+  ,"gb":7,"gbk":1
+  ,"eb":0,"ebk":0
+  ,"rb":140014,"wb":7
+  ,"acc":[-7,20003]
+  ,"fs":[1,30,31,25,26,27,6]
+  }
+ ,{"tb":148,"tbk":1
+  ,"tl":2611
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":211,"wb":110
+  ,"acc":[-32,0,-8,2,-16,3,-4,2,-4,1,-8,2,-16,3,-4,2,-4,1,-8,2,-16,3,-4,2,-4,1,-2,6,7,-13,5,-2,3,2,1]
+  ,"fs":[1,32,33,34,25,26,27,6]
+  }
+ ,{"tb":37,"tbk":5
+  ,"tl":1229575065
+  ,"mb":0,"mbk":0
+  ,"gb":37,"gbk":5
+  ,"eb":0,"ebk":0
+  ,"rb":740051,"wb":37
+  ,"fs":[1,30,35,25,26,27,6]
+  }
+ ,{"tb":280,"tbk":1
+  ,"tl":245915135
+  ,"mb":0,"mbk":0
+  ,"gb":280,"gbk":1
+  ,"eb":0,"ebk":0
+  ,"rb":7680231,"wb":216
+  ,"acc":[-8,2,-8,20002,-12,20001,-4,0,-8,2,-8,20002,-12,20001,-4,1,-32,0,-8,2,-8,20002,-8,40001,-4,20001,-4,1,-32,0,-8,2,-8,20002,-12,20001,-4,0,-8,2,-8,20002,-12,20001,-4,0,-8,2,-8,20002,-12,20001,-4,1,60008,-21,65535,20002,2]
+  ,"fs":[1,32,33,36,25,26,27,6]
+  }
+ ,{"tb":7680000,"tbk":20000
+  ,"tl":244449644
+  ,"mb":384,"mbk":1
+  ,"gb":384,"gbk":1
+  ,"eb":0,"ebk":0
+  ,"rb":6400000,"wb":6400000
+  ,"acc":[-20,40000,-4,0,-20,40000,-4,0,-20,40000,-4,0,-20,40000,-4,0,-20,40000,-4,0,-20,40000,-4,0,-20,40000,-4,0,-20,40000,-4,0,-20,40000,-4,0,-20,40000,-4,0,-20,40000,-4,0,-20,40000,-4,0,-20,40000,-4,0,-20,40000,-4,0,-20,40000,-4,0,-20,40000,-4,0]
+  ,"fs":[1,37,38,25,26,27,6]
+  }
+ ,{"tb":7680000,"tbk":20000
+  ,"tl":141169644
+  ,"mb":384,"mbk":1
+  ,"gb":384,"gbk":1
+  ,"eb":0,"ebk":0
+  ,"rb":48940712,"wb":40164432
+  ,"acc":[-16,17950,-8,33640,-16,25612,-8,65338,-16,7556,-8,50037,-16,20038,-8,8186,-16,33064,-8,18511,-16,40888,-8,19393,-16,29064,-8,5121,-16,17372,-8,48263,-16,3872,-8,21182,-16,43384,-8,50231,-16,17536,-8,8144,-16,56284,-8,28751,-16,20364,-8,42648,-16,50468,-8,52466,-16,14464,-8,60000,-24,0]
+  ,"fs":[1,39,40,25,26,27,6]
+  }
+ ,{"tb":1280000,"tbk":20000
+  ,"tl":138129644
+  ,"mb":64,"mbk":1
+  ,"gb":64,"gbk":1
+  ,"eb":0,"ebk":0
+  ,"rb":320000,"wb":320000
+  ,"acc":[-16,40000,-48,0]
+  ,"fs":[1,41,42,43,40,25,26,27,6]
+  }
+ ,{"tb":21600000,"tbk":40000
+  ,"tl":68260000
+  ,"mb":720,"mbk":1
+  ,"gb":720,"gbk":1
+  ,"eb":0,"ebk":0
+  ,"rb":12320000,"wb":14880000
+  ,"fs":[1,44,45,40,25,26,27,6]
+  }
+ ,{"tb":2220000,"tbk":300000
+  ,"tl":580261416
+  ,"mb":111,"mbk":15
+  ,"gb":111,"gbk":15
+  ,"eb":0,"ebk":0
+  ,"rb":0,"wb":2220000
+  ,"fs":[1,46,45,40,25,26,27,6]
+  }
+ ,{"tb":140000,"tbk":20000
+  ,"tl":16460000
+  ,"mb":7,"mbk":1
+  ,"gb":7,"gbk":1
+  ,"eb":0,"ebk":0
+  ,"rb":0,"wb":140000
+  ,"acc":[-7,20000]
+  ,"fs":[1,47,48,40,25,26,27,6]
+  }
+ ,{"tb":1024,"tbk":1
+  ,"tl":3729
+  ,"mb":0,"mbk":0
+  ,"gb":0,"gbk":0
+  ,"eb":0,"ebk":0
+  ,"rb":75,"wb":70
+  ,"acc":[-30,2,3,2,3,-5,2,3,-4,2,3,-18,2,3,-7,2,-954,0]
+  ,"fs":[1,49,50,51,52,53,25,26,27,6]
+  }
+ ]
+,"ftbl":
+ ["[root]"
+ ,"0x4846828: malloc (in /usr/libexec/valgrind/vgpreload_dhat-amd64-linux.so)"
+ ,"0x49FFE7E: __fopen_internal (iofopen.c:65)"
+ ,"0x49FFE7E: fopen@@GLIBC_2.2.5 (iofopen.c:86)"
+ ,"0x4A180B5: pthread_getattr_np@@GLIBC_2.32 (pthread_getattr_np.c:85)"
+ ,"0x1319AD: std::rt::lang_start_internal (in /home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b)"
+ ,"0x1218B4: main (in /home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b)"
+ ,"0x4A00D84: getdelim (iogetdelim.c:65)"
+ ,"0x4A1820E: pthread_getattr_np@@GLIBC_2.32 (pthread_getattr_np.c:122)"
+ ,"0x49FF1B4: _IO_file_doallocate (filedoalloc.c:101)"
+ ,"0x4A0F523: _IO_doallocbuf (genops.c:347)"
+ ,"0x4A0C883: _IO_file_underflow@@GLIBC_2.2.5 (fileops.c:486)"
+ ,"0x4A00E0F: getdelim (iogetdelim.c:77)"
+ ,"0x484DB80: realloc (in /usr/libexec/valgrind/vgpreload_dhat-amd64-linux.so)"
+ ,"0x4A17F79: pthread_getattr_np@@GLIBC_2.32 (pthread_getattr_np.c:180)"
+ ,"0x484D953: calloc (in /usr/libexec/valgrind/vgpreload_dhat-amd64-linux.so)"
+ ,"0x4A13E7A: __pthread_attr_extension (pthread_attr_extension.c:28)"
+ ,"0x4A141BF: pthread_attr_setaffinity_np@@GLIBC_2.32 (pthread_attr_setaffinity.c:45)"
+ ,"0x4A18007: pthread_getattr_np@@GLIBC_2.32 (pthread_getattr_np.c:194)"
+ ,"0x4A141D8: pthread_attr_setaffinity_np@@GLIBC_2.32 (pthread_attr_setaffinity.c:51)"
+ ,"0x133187: std::sys::pal::unix::stack_overflow::thread_info::set_current_info (in /home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b)"
+ ,"0x131ADE: std::rt::lang_start_internal (in /home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b)"
+ ,"0x13338C: std::sys::pal::unix::stack_overflow::thread_info::set_current_info (in /home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b)"
+ ,"0x121A3B: <alloc::vec::Vec<T> as alloc::vec::spec_from_iter_nested::SpecFromIterNested<T,I>>::from_iter (in /home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b)"
+ ,"0x1208D3: queue_fairness_profile::main (in /home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b)"
+ ,"0x11F402: std::sys::backtrace::__rust_begin_short_backtrace (in /home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b)"
+ ,"0x11F3F8: std::rt::lang_start::{{closure}} (in /home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b)"
+ ,"0x131BA5: std::rt::lang_start_internal (in /home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b)"
+ ,"0x160397: alloc::fmt::format::format_inner (in /home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b)"
+ ,"0x121A9F: <alloc::vec::Vec<T> as alloc::vec::spec_from_iter_nested::SpecFromIterNested<T,I>>::from_iter (in /home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b)"
+ ,"0x1608BE: <alloc::string::String as core::clone::Clone>::clone (in /home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b)"
+ ,"0x120941: queue_fairness_profile::main (in /home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b)"
+ ,"0x11FE89: hashbrown::raw::RawTable<T,A>::reserve_rehash (in /home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b)"
+ ,"0x12081F: hashbrown::map::HashMap<K,V,S,A>::insert (in /home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b)"
+ ,"0x120953: queue_fairness_profile::main (in /home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b)"
+ ,"0x120D21: queue_fairness_profile::main (in /home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b)"
+ ,"0x120D31: queue_fairness_profile::main (in /home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b)"
+ ,"0x12191A: <alloc::vec::Vec<T> as alloc::vec::spec_from_iter_nested::SpecFromIterNested<T,I>>::from_iter (in /home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b)"
+ ,"0x120A63: queue_fairness_profile::main (in /home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b)"
+ ,"0x11F017: autumn_harvest::queue_fairness::weighted_queue_order (in /home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b)"
+ ,"0x120A86: queue_fairness_profile::main (in /home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b)"
+ ,"0x123209: alloc::raw_vec::RawVecInner<A>::finish_grow (in /home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b)"
+ ,"0x123149: alloc::raw_vec::RawVec<T,A>::grow_one (in /home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b)"
+ ,"0x11F214: autumn_harvest::queue_fairness::weighted_queue_order (in /home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b)"
+ ,"0x122322: <alloc::vec::Vec<T> as alloc::vec::spec_from_iter::SpecFromIter<T,I>>::from_iter (in /home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b)"
+ ,"0x11F2B3: autumn_harvest::queue_fairness::weighted_queue_order (in /home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b)"
+ ,"0x122384: <alloc::vec::Vec<T> as alloc::vec::spec_from_iter::SpecFromIter<T,I>>::from_iter (in /home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b)"
+ ,"0x1221E3: <alloc::vec::Vec<T,A> as alloc::vec::spec_extend::SpecExtend<T,I>>::spec_extend (in /home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b)"
+ ,"0x11F2CE: autumn_harvest::queue_fairness::weighted_queue_order (in /home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b)"
+ ,"0x136DBD: std::sync::once::Once::call_once_force::{{closure}} (in /home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b)"
+ ,"0x134E26: std::sys::sync::once::futex::Once::call (in /home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b)"
+ ,"0x137234: std::sync::once_lock::OnceLock<T>::initialize (in /home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b)"
+ ,"0x1312EC: std::io::stdio::_print (in /home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b)"
+ ,"0x120B7A: queue_fairness_profile::main (in /home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b)"
+ ]
+}

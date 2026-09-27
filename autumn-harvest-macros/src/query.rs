@@ -107,19 +107,9 @@ pub fn query_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // Skip the leading ctx param when building type hints and dispatch args.
     let params: Vec<_> = func.sig.inputs.iter().skip(1).collect();
-    let param_names: Vec<_> = params
-        .iter()
-        .filter_map(|arg| {
-            if let syn::FnArg::Typed(pt) = arg
-                && let syn::Pat::Ident(ident) = &*pt.pat
-            {
-                return Some(&ident.ident);
-            }
-            None
-        })
-        .collect();
+    let param_names: Vec<_> = crate::attr_util::param_idents(&params);
 
-    let input_type_hint = build_input_type_hint(&params);
+    let input_type_hint = crate::attr_util::arg_type_hint(&params);
     let output_type_hint = crate::extract_ok_type_hint(&func.sig.output);
 
     let dispatch = build_query_dispatch(fn_name, &param_names);
@@ -264,30 +254,6 @@ fn build_query_dispatch(fn_name: &syn::Ident, param_names: &[&syn::Ident]) -> To
                 })
         }
     }
-}
-
-/// Returns a `String` describing the input parameters for `input_type_hint`.
-fn build_input_type_hint(params: &[&syn::FnArg]) -> String {
-    if params.is_empty() {
-        return "()".to_string();
-    }
-    if params.len() == 1
-        && let syn::FnArg::Typed(pt) = params[0]
-    {
-        return crate::type_name_hint(&pt.ty);
-    }
-    // Multiple params: show as tuple
-    let parts: Vec<_> = params
-        .iter()
-        .filter_map(|arg| {
-            if let syn::FnArg::Typed(pt) = arg {
-                Some(crate::type_name_hint(&pt.ty))
-            } else {
-                None
-            }
-        })
-        .collect();
-    format!("({})", parts.join(", "))
 }
 
 // ── Characterization tests ──────────────────────────────────────────────────

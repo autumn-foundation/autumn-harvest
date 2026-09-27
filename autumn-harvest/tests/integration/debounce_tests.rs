@@ -23,6 +23,7 @@
 //! AC11 — operator visibility: list_pending_debounce returns the pending record with
 //!         the expected fields
 
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -30,12 +31,15 @@ use autumn_harvest::debounce::{
     AdmitDebounceParams, DebounceStartOptions, admit_debounced_start, fire_due_debounced_starts,
     list_pending_debounce,
 };
+use autumn_harvest::shard::ShardedDbPool;
 use autumn_harvest::telemetry::MetricsRecorder;
-use autumn_harvest::types::{ExecutionId, WorkflowIdReusePolicy};
+use autumn_harvest::types::{ExecutionId, ShardId, WorkflowIdReusePolicy};
+use autumn_harvest::worker::DbPool;
 use autumn_harvest::{StartWorkflowParams, start_or_load_workflow_execution};
 use chrono::Utc;
 use diesel_async::AsyncPgConnection;
 use diesel_async::SimpleAsyncConnection;
+use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -85,6 +89,38 @@ async fn setup_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
         .expect("migrations");
 
     (conn, container)
+}
+
+/// Derive a running container's own Postgres URL (issue #1362). Needed to
+/// build a second, independent `DbPool` aimed at the same physical database
+/// `setup_db` already connected to, for the multi-shard tests below.
+async fn container_url(container: &ContainerAsync<Postgres>) -> String {
+    let host = container.get_host().await.expect("host");
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    format!("postgresql://postgres:postgres@{host}:{port}/postgres")
+}
+
+/// Build a connection pool for a database URL (issue #1362), to construct a
+/// `ShardedDbPool` test fixture.
+fn build_test_pool(database_url: &str) -> DbPool {
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(database_url);
+    deadpool::managed::Pool::builder(manager)
+        .max_size(4)
+        .build()
+        .expect("failed to build test pool")
+}
+
+/// Build a pool aimed at an address nothing listens on (issue #1362), so
+/// `.get()` fails fast with no live database. Mirrors `shard.rs`'s own
+/// `test_pool()` unit-test helper.
+fn unreachable_pool() -> DbPool {
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+        "postgres://unused-host-for-test/db",
+    );
+    deadpool::managed::Pool::builder(manager)
+        .max_size(1)
+        .build()
+        .expect("pool builds without connecting")
 }
 
 /// Count rows in harvest_debounce for a given workflow_name + debounce_key.
@@ -913,4 +949,288 @@ async fn admit_rejects_empty_workflow_id_before_writing_a_row() {
 
     // No row was written.
     assert_eq!(debounce_row_count(&mut conn, wf, key).await, 0);
+}
+
+// ── Legacy empty-workflow_id row healing (issue #1430) ──────────────────────
+//
+// A row admitted before #1353's guard shipped can hold a stored empty
+// workflow_id. The ON CONFLICT upsert kept that stored id unconditionally.
+// A later valid request for the same key then merged its input into the
+// poisoned row. Its own accepted outcome came back with an empty id. The
+// scanner later deleted the whole row as unfireable. That silently dropped
+// the new request along with the legacy one. Admission must instead heal
+// the stored id to the new request's valid id.
+
+/// Seed a pre-#1353 debounce row directly. The empty-id check postdates
+/// such a row, so only a direct table write can produce one.
+async fn seed_legacy_empty_id_debounce_row(conn: &mut AsyncPgConnection, wf: &str, key: &str) {
+    use diesel_async::RunQueryDsl;
+
+    diesel::sql_query(
+        "INSERT INTO harvest_debounce
+            (workflow_name, debounce_key, workflow_id, queue_name, last_input,
+             start_options, effective_fire_at, max_fire_at)
+         VALUES ($1, $2, '', 'default', '{\"legacy\": true}'::jsonb,
+                 '{}'::jsonb, NOW() + INTERVAL '1 hour', NOW() + INTERVAL '1 hour')",
+    )
+    .bind::<diesel::sql_types::Text, _>(wf)
+    .bind::<diesel::sql_types::Text, _>(key)
+    .execute(conn)
+    .await
+    .expect("seed legacy row");
+}
+
+#[tokio::test]
+async fn admit_heals_a_legacy_empty_workflow_id_row_to_the_new_valid_id() {
+    let (mut conn, _c) = setup_db().await;
+
+    let wf = "legacy_heal_wf";
+    let key = "tenant:legacy-heal";
+    seed_legacy_empty_id_debounce_row(&mut conn, wf, key).await;
+
+    let window = Duration::from_millis(1);
+    let max_wait = Duration::from_secs(60);
+    let new_id = "legacy-heal-valid-001";
+    let outcome = admit_debounced_start_ungated(
+        &mut conn,
+        admit_params(
+            wf,
+            key,
+            new_id,
+            serde_json::json!({"fresh": true}),
+            window,
+            max_wait,
+        ),
+    )
+    .await
+    .expect("admit onto the legacy row");
+
+    assert_eq!(
+        outcome.workflow_id, new_id,
+        "a new valid request must heal a legacy empty-id row's stored id, not inherit the poison"
+    );
+    assert_eq!(debounce_row_count(&mut conn, wf, key).await, 1);
+
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let metrics = no_op_metrics();
+    let fired = fire_due_debounced_starts(&mut conn, &None, &[], &metrics)
+        .await
+        .expect("fire");
+    assert_eq!(
+        fired, 1,
+        "the healed row must fire, not be dropped as poison"
+    );
+    assert_eq!(debounce_row_count(&mut conn, wf, key).await, 0);
+    assert_eq!(
+        execution_count(&mut conn, wf, new_id).await,
+        1,
+        "the execution must start under the new request's valid id"
+    );
+}
+
+// Healing must only replace a stored empty id. It must not turn the
+// workflow_id column into always-overwrite. A healed row is a normal row
+// from that point on. A second, later admission with a different valid id
+// must still lose to the row's own, now-healed, first id. That matches how
+// two ordinary admissions already behave.
+#[tokio::test]
+async fn a_second_distinct_valid_id_does_not_override_an_already_healed_row() {
+    use diesel_async::RunQueryDsl;
+
+    let (mut conn, _c) = setup_db().await;
+
+    let wf = "legacy_heal_second_wf";
+    let key = "tenant:legacy-heal-second";
+    seed_legacy_empty_id_debounce_row(&mut conn, wf, key).await;
+
+    let window = Duration::from_secs(60);
+    let max_wait = Duration::from_secs(60);
+    let healed_id = "legacy-heal-first-001";
+    let other_id = "legacy-heal-second-002";
+
+    let first = admit_debounced_start_ungated(
+        &mut conn,
+        admit_params(
+            wf,
+            key,
+            healed_id,
+            serde_json::json!({"seq": 1}),
+            window,
+            max_wait,
+        ),
+    )
+    .await
+    .expect("heal the legacy row");
+    assert_eq!(first.workflow_id, healed_id);
+
+    let second = admit_debounced_start_ungated(
+        &mut conn,
+        admit_params(
+            wf,
+            key,
+            other_id,
+            serde_json::json!({"seq": 2}),
+            window,
+            max_wait,
+        ),
+    )
+    .await
+    .expect("second admission onto the now-healed row");
+    assert_eq!(
+        second.workflow_id, healed_id,
+        "a second, distinct valid id must not override an already-healed row"
+    );
+
+    diesel::sql_query(
+        "UPDATE harvest_debounce SET effective_fire_at = NOW() - INTERVAL '1 second'",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("force effective_fire_at into the past");
+
+    let metrics = no_op_metrics();
+    let fired = fire_due_debounced_starts(&mut conn, &None, &[], &metrics)
+        .await
+        .expect("fire");
+    assert_eq!(fired, 1);
+    assert_eq!(
+        execution_count(&mut conn, wf, healed_id).await,
+        1,
+        "the execution must start under the FIRST healed id"
+    );
+    assert_eq!(execution_count(&mut conn, wf, other_id).await, 0);
+}
+
+// ── Multi-shard scanning (issue #1362) ──────────────────────────────────────
+//
+// `harvest_debounce` shards by physical database, not by a `shard_id`
+// column (see `fire_due_debounced_starts`'s own doc comment). These tests
+// therefore use two genuinely separate Postgres containers, one per shard.
+
+// The multi-shard branch (`Some(sp) if !shard_assignments.is_empty()`) had
+// no integration coverage before this test: every existing call in this
+// file passes `&None` and `&[]`. Each shard's own due row must fire on a
+// single scanner tick that is assigned both shards.
+#[tokio::test]
+async fn fire_due_debounced_starts_fires_each_assigned_shards_own_due_row() {
+    let (mut conn0, container0) = setup_db().await;
+    let (mut conn1, container1) = setup_db().await;
+
+    let window = Duration::from_millis(1);
+    let max_wait = Duration::from_secs(60);
+
+    admit_debounced_start_ungated(
+        &mut conn0,
+        admit_params(
+            "shard0_wf",
+            "tenant:shard0",
+            "shard0-wf-1",
+            serde_json::json!({}),
+            window,
+            max_wait,
+        ),
+    )
+    .await
+    .expect("admit on shard 0");
+    admit_debounced_start_ungated(
+        &mut conn1,
+        admit_params(
+            "shard1_wf",
+            "tenant:shard1",
+            "shard1-wf-1",
+            serde_json::json!({}),
+            window,
+            max_wait,
+        ),
+    )
+    .await
+    .expect("admit on shard 1");
+
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+    let mut pools = BTreeMap::new();
+    pools.insert(
+        ShardId::new(0),
+        build_test_pool(&container_url(&container0).await),
+    );
+    pools.insert(
+        ShardId::new(1),
+        build_test_pool(&container_url(&container1).await),
+    );
+    let sharded_pool = ShardedDbPool::from_map(pools, ShardId::new(0));
+
+    let metrics = no_op_metrics();
+    let fired = fire_due_debounced_starts(
+        &mut conn0,
+        &Some(sharded_pool),
+        &[ShardId::new(0), ShardId::new(1)],
+        &metrics,
+    )
+    .await
+    .expect("fire across both shards");
+
+    assert_eq!(fired, 2, "each assigned shard's own due row must fire");
+    assert_eq!(
+        execution_count(&mut conn0, "shard0_wf", "shard0-wf-1").await,
+        1
+    );
+    assert_eq!(
+        execution_count(&mut conn1, "shard1_wf", "shard1-wf-1").await,
+        1
+    );
+}
+
+// No test (unit or integration) covered "shard A's connection fails under
+// `LogAndSkip`, and the loop still proceeds to shard B" before this. A
+// regression turning the `continue` in `fire_due_debounced_starts_with_codecs`
+// into a `return`/`break` would pass every other existing test here.
+#[tokio::test]
+async fn fire_due_debounced_starts_skips_an_unreachable_shard_and_still_fires_the_next() {
+    let (mut conn1, container1) = setup_db().await;
+
+    let window = Duration::from_millis(1);
+    let max_wait = Duration::from_secs(60);
+
+    admit_debounced_start_ungated(
+        &mut conn1,
+        admit_params(
+            "shard1_only_wf",
+            "tenant:shard1-only",
+            "shard1-only-wf-1",
+            serde_json::json!({}),
+            window,
+            max_wait,
+        ),
+    )
+    .await
+    .expect("admit on shard 1");
+
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+    let mut pools = BTreeMap::new();
+    pools.insert(ShardId::new(0), unreachable_pool());
+    pools.insert(
+        ShardId::new(1),
+        build_test_pool(&container_url(&container1).await),
+    );
+    let sharded_pool = ShardedDbPool::from_map(pools, ShardId::new(0));
+
+    let metrics = no_op_metrics();
+    let fired = fire_due_debounced_starts(
+        &mut conn1,
+        &Some(sharded_pool),
+        &[ShardId::new(0), ShardId::new(1)],
+        &metrics,
+    )
+    .await
+    .expect("shard 0's connect failure must be logged and skipped, not propagated");
+
+    assert_eq!(
+        fired, 1,
+        "shard 1's due row must still fire despite shard 0 being unreachable"
+    );
+    assert_eq!(
+        execution_count(&mut conn1, "shard1_only_wf", "shard1-only-wf-1").await,
+        1
+    );
 }

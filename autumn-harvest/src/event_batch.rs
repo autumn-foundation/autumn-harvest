@@ -183,6 +183,16 @@ pub async fn admit_batched_start_with_codecs(
             buffered_payloads = harvest_event_batches.buffered_payloads || EXCLUDED.buffered_payloads,
             fire_at           = LEAST(harvest_event_batches.fire_at, EXCLUDED.fire_at),
             updated_at        = NOW(),
+            -- workflow_id is first-request-wins, matching every other field
+            -- left out of this list. One exception (issue #1430): a row
+            -- admitted before the #1353 empty-id check shipped can hold a
+            -- stored empty id. Such a row can never start. Heal it to this
+            -- request's valid id instead of merging this payload into a row
+            -- fire_claimed_batch_row's delete-and-audit path can only drop.
+            workflow_id = CASE
+                WHEN harvest_event_batches.workflow_id = '' THEN EXCLUDED.workflow_id
+                ELSE harvest_event_batches.workflow_id
+            END,
             -- issue #921 review (Codex P2): every field of `start_options`
             -- other than this one is deliberately first-request-wins (the
             -- row created by the first admission in a batch group is what
@@ -868,26 +878,58 @@ pub async fn fire_due_event_batches_with_codecs(
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<usize> {
+    fire_due_event_batches_on_conn_shard(
+        conn,
+        None,
+        sharded_pool.as_ref(),
+        shard_assignments,
+        metrics,
+        codecs,
+    )
+    .await
+}
+
+/// [`fire_due_event_batches_with_codecs`] for a caller that knows `conn`'s
+/// shard. See [`crate::shard::connect_or_reuse`].
+#[cfg(feature = "db")]
+pub(crate) async fn fire_due_event_batches_on_conn_shard(
+    conn: &mut diesel_async::AsyncPgConnection,
+    conn_shard: Option<crate::types::ShardId>,
+    sharded_pool: Option<&crate::shard::ShardedDbPool>,
+    shard_assignments: &[crate::types::ShardId],
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<usize> {
     let mut fired_count = 0usize;
     let mut deferred_to_spawn = Vec::new();
 
+    // Scans each assigned shard's own `harvest_event_batches` table in turn.
+    // Unlike debounce/throttle, a shard connection failure here aborts the
+    // whole scan. It does not log the failure and skip the shard
+    // (issue #1362).
     if let Some(pool) = sharded_pool {
         for shard_id in shard_assignments {
-            if let Some(shard_pool) = pool.exact_pool_for(*shard_id) {
-                let mut shard_conn = shard_pool
-                    .get()
-                    .await
-                    .map_err(|e| crate::error::HarvestError::Database(e.to_string()))?;
-                let (fired, deferred) = fire_due_on_conn(
-                    &mut shard_conn,
-                    Some(shard_id.as_i32()),
-                    Some(metrics),
-                    codecs,
-                )
-                .await?;
-                fired_count += fired.len();
-                deferred_to_spawn.extend(deferred);
-            }
+            let Some(mut shard_conn) = crate::shard::connect_or_reuse(
+                conn,
+                conn_shard,
+                pool,
+                *shard_id,
+                "event_batch",
+                crate::shard::ShardConnectError::Abort,
+            )
+            .await?
+            else {
+                continue;
+            };
+            let (fired, deferred) = fire_due_on_conn(
+                &mut shard_conn,
+                Some(shard_id.as_i32()),
+                Some(metrics),
+                codecs,
+            )
+            .await?;
+            fired_count += fired.len();
+            deferred_to_spawn.extend(deferred);
         }
     } else {
         let (fired, deferred) = fire_due_on_conn(conn, None, Some(metrics), codecs).await?;

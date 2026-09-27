@@ -1544,3 +1544,127 @@ async fn a_workflow_reference_waits_for_a_workflow_permit() {
     })
     .await;
 }
+
+/// A stale reference must not spend a claimable sibling's share of the same
+/// batch (Codex review, issue #1429).
+///
+/// `dispatch_leases` used to increment `claimed_workflow` before calling
+/// `consume_reference`, for every workflow-kind lease regardless of outcome.
+/// A terminal row's redelivered reference is never actually claimed
+/// (`ReferenceDisposition::AlreadyTerminal`), yet it still spent the share.
+/// With `share_workflow` at 1, that alone exhausted it. A genuinely
+/// claimable workflow reference right behind it in the same batch then
+/// failed `dispatch_kind_within_share`. It went back to `to_release`,
+/// even with a free workflow permit sitting right there. The share is
+/// only meant to bound what this shard actually dispatches, so only
+/// `ReferenceDisposition::Dispatched` may spend it now.
+///
+/// This publishes a terminal row's reference and a claimable one together,
+/// in that order, in one batch. The claimable one must never appear in
+/// `released_ids`. Under the old code it always would. Exhausting the
+/// share sent it back for a later poll, instead of claiming it on the
+/// spot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stale_reference_does_not_spend_a_sibling_lease_share() {
+    let _serial = DISPATCH_SERIAL.lock().await;
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let queue = unique_queue("f8_share");
+    let _cleanup = SeededQueueGuard {
+        url: url.clone(),
+        queue: queue.clone(),
+    };
+
+    let channel = Arc::new(MemoryDispatch::new());
+    let _guard = install(&channel);
+
+    let mut conn = connect(&url).await;
+    let stale_exec = start_on(&mut conn, "dispatch_trivial", &queue).await;
+
+    let pool = build_pool(&url);
+    let mut check = connect(&url).await;
+    let worker1 = Arc::new(make_worker_with(
+        worker_config(&queue, vec![ShardId::new(0)]),
+        vec![wf_info("dispatch_trivial", trivial_workflow)],
+        vec![],
+        empty_shared_state(),
+    ));
+    with_worker(worker1, pool.clone(), async {
+        wait_for_state(
+            &mut check,
+            stale_exec,
+            &["COMPLETED"],
+            Duration::from_secs(30),
+        )
+        .await;
+    })
+    .await;
+    let stale_task = tasks_for(&mut check, stale_exec)
+        .await
+        .into_iter()
+        .next()
+        .expect("one workflow task");
+    assert_ne!(stale_task.state, "PENDING");
+
+    // Started only after the first worker shuts down, so nothing claims it
+    // before the manual publish below delivers it alongside the stale one.
+    let claimable_exec = start_on(&mut conn, "dispatch_trivial", &queue).await;
+    let claimable_task = tasks_for(&mut check, claimable_exec)
+        .await
+        .into_iter()
+        .next()
+        .expect("one workflow task");
+    assert_eq!(claimable_task.state, "PENDING");
+
+    // One call, so one batch read delivers both in this order: the stale
+    // reference this shard cannot actually claim, right before the one it
+    // can.
+    channel
+        .publish(&[
+            autumn_harvest::dispatch::DispatchHint {
+                task_id: stale_task.id,
+                queue_name: queue.clone(),
+                scheduled_at: chrono::Utc::now(),
+                priority: 0,
+                shard: None,
+                kind: Some(autumn_harvest::dispatch::DispatchKind::Workflow),
+            },
+            autumn_harvest::dispatch::DispatchHint {
+                task_id: claimable_task.id,
+                queue_name: queue.clone(),
+                scheduled_at: chrono::Utc::now(),
+                priority: 0,
+                shard: None,
+                kind: Some(autumn_harvest::dispatch::DispatchKind::Workflow),
+            },
+        ])
+        .await
+        .expect("publish both references");
+
+    let config = WorkerRuntimeConfig {
+        max_concurrent_workflows: 1,
+        max_concurrent_activities: 8,
+        ..worker_config(&queue, vec![ShardId::new(0)])
+    };
+    let worker2 = Arc::new(make_worker_with(
+        config,
+        vec![wf_info("dispatch_trivial", trivial_workflow)],
+        vec![],
+        empty_shared_state(),
+    ));
+    with_worker(worker2, pool, async {
+        wait_for_state(
+            &mut check,
+            claimable_exec,
+            &["COMPLETED"],
+            Duration::from_secs(10),
+        )
+        .await;
+    })
+    .await;
+
+    assert!(
+        !channel.released_ids().contains(&claimable_task.id),
+        "a claimable reference must be dispatched straight out of the same \
+         batch as a stale sibling, not released back for a later poll"
+    );
+}

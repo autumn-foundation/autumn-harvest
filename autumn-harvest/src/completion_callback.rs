@@ -2843,26 +2843,46 @@ pub async fn fire_due_completion_deliveries(
     sharded_pool: &Option<crate::shard::ShardedDbPool>,
     shard_assignments: &[crate::types::ShardId],
 ) -> crate::error::HarvestResult<usize> {
+    fire_due_completion_deliveries_on_conn_shard(
+        conn,
+        None,
+        sharded_pool.as_ref(),
+        shard_assignments,
+    )
+    .await
+}
+
+/// [`fire_due_completion_deliveries`] for a caller that knows `conn`'s shard.
+/// See [`crate::shard::connect_or_reuse`].
+#[cfg(feature = "db")]
+pub(crate) async fn fire_due_completion_deliveries_on_conn_shard(
+    conn: &mut diesel_async::AsyncPgConnection,
+    conn_shard: Option<crate::types::ShardId>,
+    sharded_pool: Option<&crate::shard::ShardedDbPool>,
+    shard_assignments: &[crate::types::ShardId],
+) -> crate::error::HarvestResult<usize> {
     let Some(config) = read_global_callback_config() else {
         return Ok(0);
     };
 
     let mut total = 0usize;
 
+    // Scans each assigned shard's own `harvest_completion_deliveries` table
+    // in turn (issue #1362).
     match sharded_pool {
         Some(sp) if !shard_assignments.is_empty() => {
             for shard in shard_assignments {
-                let Some(pool) = sp.exact_pool_for(*shard).cloned() else {
+                let Some(mut shard_conn) = crate::shard::connect_or_reuse(
+                    conn,
+                    conn_shard,
+                    sp,
+                    *shard,
+                    "completion_callback",
+                    crate::shard::ShardConnectError::LogAndSkip,
+                )
+                .await?
+                else {
                     continue;
-                };
-                let mut shard_conn = match pool.get().await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::error!(
-                            "[completion_callback] failed to get connection to shard {shard:?}: {e:?}"
-                        );
-                        continue;
-                    }
                 };
                 total += fire_due_on_conn(&mut shard_conn, &config, Some(shard.as_i32())).await?;
             }

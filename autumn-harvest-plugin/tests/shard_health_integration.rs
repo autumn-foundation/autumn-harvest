@@ -14,7 +14,6 @@ use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -383,7 +382,7 @@ async fn three_shard_rollout_gate_tracks_missing_added_and_stale_worker_coverage
             SchedulerMonitor::offline(),
         ),
     );
-    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(state);
 
     let (status, body) = get_json(&app, "/admin/shards/health").await;
 
@@ -441,7 +440,7 @@ async fn single_shard_ready_state_uses_shard_zero_response_shape() {
             SchedulerMonitor::offline(),
         ),
     );
-    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(state);
 
     let (status, body) = get_json(&app, "/admin/shards/health").await;
 
@@ -479,7 +478,7 @@ async fn writable_shard_reports_degraded_codes_and_worker_counts() {
             SchedulerMonitor::offline(),
         ),
     );
-    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(state);
 
     let (status, body) = get_json(&app, "/admin/shards/health").await;
 
@@ -523,7 +522,7 @@ async fn unreachable_writable_shard_reports_unavailable_reason_code() {
             SchedulerMonitor::offline(),
         ),
     );
-    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(state);
 
     let (status, body) = get_json(&app, "/admin/shards/health").await;
 
@@ -553,7 +552,7 @@ async fn health_endpoint_can_enforce_writable_shard_readiness() {
         ),
     );
     state.set_health_requires_shard_readiness(true);
-    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("prod"));
+    let app = harvest_api_router(state);
 
     let (status, body) = get_json(&app, "/health").await;
 
@@ -590,7 +589,7 @@ async fn health_endpoint_enforces_unavailable_writable_shard_readiness() {
         ),
     );
     state.set_health_requires_shard_readiness(true);
-    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("prod"));
+    let app = harvest_api_router(state);
 
     let (status, body) = get_json(&app, "/health").await;
 
@@ -624,7 +623,7 @@ async fn readable_only_candidate_without_workers_lists_promotion_blockers() {
             SchedulerMonitor::offline(),
         ),
     );
-    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(state);
 
     let (status, body) = get_json(&app, "/admin/shards/health?candidate_shard=1").await;
 
@@ -657,7 +656,7 @@ async fn writable_shard_with_missing_queue_coverage_is_degraded() {
             SchedulerMonitor::offline(),
         ),
     );
-    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(state);
 
     let (status, body) = get_json(&app, "/admin/shards/health").await;
 
@@ -688,7 +687,7 @@ async fn stale_worker_coverage_makes_writable_shard_degraded() {
             SchedulerMonitor::offline(),
         ),
     );
-    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(state);
 
     let (status, body) = get_json(&app, "/admin/shards/health").await;
 
@@ -721,7 +720,7 @@ async fn stale_scheduler_coverage_makes_scheduled_writable_shard_degraded() {
             SchedulerMonitor::new(1),
         ),
     );
-    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(state);
 
     let (status, body) = get_json(&app, "/admin/shards/health").await;
 
@@ -762,7 +761,7 @@ async fn unreachable_shard_returns_partial_health_for_reachable_shards() {
             SchedulerMonitor::offline(),
         ),
     );
-    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(state);
 
     let (status, body) = get_json(&app, "/admin/shards/health").await;
 
@@ -824,7 +823,7 @@ async fn migration_mismatch_marks_only_affected_shard_degraded() {
             SchedulerMonitor::offline(),
         ),
     );
-    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(state);
 
     let (status, body) = get_json(&app, "/admin/shards/health").await;
 
@@ -864,7 +863,7 @@ async fn router_only_writable_shard_is_reported_unavailable() {
             SchedulerMonitor::offline(),
         ),
     );
-    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(state);
 
     let (status, body) = get_json(&app, "/admin/shards/health").await;
 

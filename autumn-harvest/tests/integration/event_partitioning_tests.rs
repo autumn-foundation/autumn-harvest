@@ -9565,11 +9565,63 @@ async fn maintain_with_progress_ticks_while_extending_the_lookahead_window() {
     );
 }
 
+/// Seed one execution that pins its cohort's partition until it is
+/// collected, for
+/// `catch_up_target_bounds_the_resume_cycle_when_the_backlog_outgrows_the_budget`.
+async fn seed_pinning_execution(
+    conn: &mut AsyncPgConnection,
+    workflow_id: &str,
+    days_ago: i64,
+) -> uuid::Uuid {
+    let ts = Utc::now() - chrono::Duration::days(days_ago);
+    let exec = insert_execution(conn, "catchup_wf", workflow_id, ts, None).await;
+    autumn_harvest::store::append_events(conn, ExecutionId::from_uuid(exec), &sample_events(), 0)
+        .await
+        .expect("seed");
+    backdate_events(conn, exec, ts).await;
+    exec
+}
+
+/// Delete every execution in `execs`, collecting each one and unblocking its
+/// cohort's partition for dropping.
+async fn collect_pinning_executions(conn: &mut AsyncPgConnection, execs: &[uuid::Uuid]) {
+    for exec in execs {
+        diesel::sql_query("DELETE FROM harvest_workflow_executions WHERE id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(*exec)
+            .execute(conn)
+            .await
+            .expect("collect the pinning execution, unblocking its cohort");
+    }
+}
+
+/// Run bounded catch-up passes, one attempt each, until `target_total`
+/// partitions have dropped or `max_passes` is exhausted. Returns the total
+/// dropped.
+async fn drain_catch_up_cycle(
+    conn: &mut AsyncPgConnection,
+    opts: &SweepOptions,
+    mut resume_after: Option<DateTime<Utc>>,
+    mut catch_up_target: Option<DateTime<Utc>>,
+    target_total: usize,
+    max_passes: usize,
+) -> usize {
+    let mut dropped_total = 0usize;
+    for _ in 0..max_passes {
+        if dropped_total == target_total {
+            break;
+        }
+        let now = Utc::now();
+        let outcome = partition::maintain(conn, now, 0, opts, resume_after, catch_up_target)
+            .await
+            .expect("catch-up pass");
+        dropped_total += outcome.sweep.dropped.len();
+        resume_after = outcome.sweep.next_resume;
+        catch_up_target = outcome.sweep.catch_up_target;
+    }
+    dropped_total
+}
+
 #[tokio::test]
-// One scenario, driven pass by pass. Splitting it would scatter the
-// multi-pass cycle this test proves converges, across helpers that run
-// in this order once each.
-#[allow(clippy::too_many_lines)]
 async fn catch_up_target_bounds_the_resume_cycle_when_the_backlog_outgrows_the_budget() {
     // Review finding: a backlog can gain an eligible partition at
     // least as fast as `max_attempts` attempts one. That alone never
@@ -9595,19 +9647,7 @@ async fn catch_up_target_bounds_the_resume_cycle_when_the_backlog_outgrows_the_b
     // then.
     let mut execs = Vec::new();
     for (n, days_ago) in [4_i64, 3, 2].into_iter().enumerate() {
-        let ts = Utc::now() - chrono::Duration::days(days_ago);
-        let exec =
-            insert_execution(&mut conn, "catchup_wf", &format!("catchup-{n}"), ts, None).await;
-        autumn_harvest::store::append_events(
-            &mut conn,
-            ExecutionId::from_uuid(exec),
-            &sample_events(),
-            0,
-        )
-        .await
-        .expect("seed");
-        backdate_events(&mut conn, exec, ts).await;
-        execs.push(exec);
+        execs.push(seed_pinning_execution(&mut conn, &format!("catchup-{n}"), days_ago).await);
     }
 
     let opts = SweepOptions {
@@ -9636,18 +9676,7 @@ async fn catch_up_target_bounds_the_resume_cycle_when_the_backlog_outgrows_the_b
     // Simulate the backlog growing at least as fast as the budget can
     // attempt a partition. A FOURTH cohort becomes eligible before pass
     // 2 runs: the exact race the finding describes.
-    let ts4 = Utc::now() - chrono::Duration::days(1);
-    let late_exec = insert_execution(&mut conn, "catchup_wf", "catchup-3", ts4, None).await;
-    autumn_harvest::store::append_events(
-        &mut conn,
-        ExecutionId::from_uuid(late_exec),
-        &sample_events(),
-        0,
-    )
-    .await
-    .expect("seed");
-    backdate_events(&mut conn, late_exec, ts4).await;
-    execs.push(late_exec);
+    execs.push(seed_pinning_execution(&mut conn, "catchup-3", 1).await);
 
     // Pass 2: a later `now`, with the freshly grown backlog. Old code
     // would recompute this pass's own target as ITS OWN `now`, every
@@ -9683,29 +9712,16 @@ async fn catch_up_target_bounds_the_resume_cycle_when_the_backlog_outgrows_the_b
     // -- must eventually drop all four partitions. None may be skipped
     // forever, including the two the cursor has already passed once
     // while they were still blocked.
-    for exec in &execs {
-        diesel::sql_query("DELETE FROM harvest_workflow_executions WHERE id = $1")
-            .bind::<diesel::sql_types::Uuid, _>(*exec)
-            .execute(&mut conn)
-            .await
-            .expect("collect the pinning execution, unblocking its cohort");
-    }
-
-    let mut resume_after = outcome_2.sweep.next_resume;
-    let mut catch_up_target = outcome_2.sweep.catch_up_target;
-    let mut dropped_total = 0usize;
-    for _ in 0..20 {
-        if dropped_total == 4 {
-            break;
-        }
-        let now = Utc::now();
-        let outcome = partition::maintain(&mut conn, now, 0, &opts, resume_after, catch_up_target)
-            .await
-            .expect("catch-up pass");
-        dropped_total += outcome.sweep.dropped.len();
-        resume_after = outcome.sweep.next_resume;
-        catch_up_target = outcome.sweep.catch_up_target;
-    }
+    collect_pinning_executions(&mut conn, &execs).await;
+    let dropped_total = drain_catch_up_cycle(
+        &mut conn,
+        &opts,
+        outcome_2.sweep.next_resume,
+        outcome_2.sweep.catch_up_target,
+        4,
+        20,
+    )
+    .await;
     assert_eq!(
         dropped_total, 4,
         "every partition in the original backlog, plus the one that arrived mid-cycle, \

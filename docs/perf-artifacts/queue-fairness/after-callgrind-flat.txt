@@ -1,0 +1,58 @@
+--------------------------------------------------------------------------------
+Profile data file '/tmp/qf-profile/cg-after.out' (creator: callgrind-3.22.0)
+--------------------------------------------------------------------------------
+I1 cache: 
+D1 cache: 
+LL cache: 
+Timerange: Basic block 0 - 24254514
+Trigger: Program termination
+Profiled target:  /home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b (PID 13191, part 1)
+Events recorded:  Ir
+Events shown:     Ir
+Event sort order: Ir
+Thresholds:       98
+Include dirs:     
+User annotated:   
+Auto-annotation:  on
+
+--------------------------------------------------------------------------------
+Ir                   
+--------------------------------------------------------------------------------
+195,530,354 (100.0%)  PROGRAM TOTALS
+
+--------------------------------------------------------------------------------
+Ir                   file:function
+--------------------------------------------------------------------------------
+33,480,976 (17.12%)  ???:<core::hash::sip::Hasher<S> as core::hash::Hasher>::write [/home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b]
+30,300,000 (15.50%)  ./math/../sysdeps/ieee754/dbl-64/e_pow.c:__ieee754_pow_fma [/usr/lib/x86_64-linux-gnu/libm.so.6]
+28,800,837 (14.73%)  ???:core::hash::BuildHasher::hash_one [/home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b]
+23,145,269 (11.84%)  ???:core::slice::sort::shared::smallsort::insertion_sort_shift_left [/home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b]
+18,840,000 ( 9.64%)  ???:<core::iter::adapters::map::Map<I,F> as core::iter::traits::iterator::Iterator>::fold [/home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b]
+17,886,875 ( 9.15%)  ???:autumn_harvest::queue_fairness::weighted_queue_order [/home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b]
+ 6,600,000 ( 3.38%)  ./math/./w_pow_template.c:pow@@GLIBC_2.29 [/usr/lib/x86_64-linux-gnu/libm.so.6]
+ 5,578,125 ( 2.85%)  ???:rand_chacha::guts::refill_wide::impl_avx2 [/home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b]
+ 5,362,184 ( 2.74%)  ./malloc/./malloc/malloc.c:_int_free [/usr/lib/x86_64-linux-gnu/libc.so.6]
+ 3,601,472 ( 1.84%)  ./malloc/./malloc/malloc.c:malloc [/usr/lib/x86_64-linux-gnu/libc.so.6]
+ 2,605,198 ( 1.33%)  ./malloc/./malloc/malloc.c:_int_malloc [/usr/lib/x86_64-linux-gnu/libc.so.6]
+ 2,280,000 ( 1.17%)  ./string/../sysdeps/x86_64/multiarch/memcmp-avx2-movbe.S:__memcmp_avx2_movbe [/usr/lib/x86_64-linux-gnu/libc.so.6]
+ 2,240,924 ( 1.15%)  ./malloc/./malloc/malloc.c:free [/usr/lib/x86_64-linux-gnu/libc.so.6]
+ 1,760,000 ( 0.90%)  ???:alloc::raw_vec::RawVecInner<A>::finish_grow [/home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b]
+ 1,500,000 ( 0.77%)  ./math/../sysdeps/ieee754/dbl-64/math_config.h:__ieee754_pow_fma
+ 1,460,125 ( 0.75%)  ./malloc/./malloc/malloc.c:realloc [/usr/lib/x86_64-linux-gnu/libc.so.6]
+ 1,440,072 ( 0.74%)  ./malloc/./malloc/malloc.c:_int_realloc [/usr/lib/x86_64-linux-gnu/libc.so.6]
+ 1,079,622 ( 0.55%)  ./malloc/./malloc/malloc.c:_int_free_merge_chunk [/usr/lib/x86_64-linux-gnu/libc.so.6]
+ 1,000,339 ( 0.51%)  ???:<alloc::vec::Vec<T> as alloc::vec::spec_from_iter_nested::SpecFromIterNested<T,I>>::from_iter [/home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b]
+   800,643 ( 0.41%)  ???:queue_fairness_profile::main [/home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b]
+   720,252 ( 0.37%)  ???:__rustc::__rdl_alloc [/home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b]
+   720,000 ( 0.37%)  ???:alloc::raw_vec::RawVecInner<A>::reserve::do_reserve_and_handle [/home/user/autumn-harvest/target/release/deps/queue_fairness_profile-7c351c60dec8f16b]
+   719,748 ( 0.37%)  ./malloc/./malloc/malloc.c:_int_free_maybe_consolidate [/usr/lib/x86_64-linux-gnu/libc.so.6]
+
+--------------------------------------------------------------------------------
+The following files chosen for auto-annotation could not be found:
+--------------------------------------------------------------------------------
+  ./malloc/./malloc/malloc.c
+  ./math/../sysdeps/ieee754/dbl-64/e_pow.c
+  ./math/../sysdeps/ieee754/dbl-64/math_config.h
+  ./math/./w_pow_template.c
+  ./string/../sysdeps/x86_64/multiarch/memcmp-avx2-movbe.S
+

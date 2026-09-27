@@ -125,7 +125,7 @@ fn build_api_app(pool: HarvestDbPool, router: ShardRouter) -> HarvestApiApp {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         router,
     ));
-    harvest_api_router(api_state).with_state(autumn_web::AppState::for_test())
+    harvest_api_router(api_state)
 }
 
 async fn read_json_response(response: axum::response::Response) -> Value {

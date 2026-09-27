@@ -297,7 +297,66 @@ const INIT_SQL: &str = concat!(
     ),
     // issue #1312: the fenced by-id claim reads the DR generation row, so this
     // bundle carries the cross-region DR tables.
-    include_str!("../../migrations/20260726000000_harvest_shard_generation/up.sql")
+    include_str!("../../migrations/20260726000000_harvest_shard_generation/up.sql"),
+    "\n",
+    // issue #1317: migrated_run_terminal_at column on
+    // harvest_workflow_executions. REQUIRED for the same reason as the
+    // #945/#964/#1127/#1227 columns above. `WorkflowExecution::as_select()`
+    // names every column, so every read-back in this suite (and in every
+    // suite that borrows `setup_test_database_url_or_env` from here) fails.
+    // The failure names `column
+    // harvest_workflow_executions.migrated_run_terminal_at does not exist`,
+    // even for a plain root start with nothing to do with shard
+    // rebalancing. This gap goes uncaught locally with
+    // `HARVEST_TEST_DATABASE_URL` set, since that path migrates from the
+    // full `migrations/` directory, not from this partial bundle.
+    include_str!("../../migrations/20260915231809_harvest_migrated_seal_terminal_at/up.sql"),
+    "\n",
+    // issue #1317 review (P1 follow-up): staging_vacated_state column on
+    // harvest_workflow_executions, required for the same reason as the
+    // migrated_run_terminal_at column above -- `WorkflowExecution::as_select()`
+    // names it unconditionally.
+    include_str!("../../migrations/20260916151612_harvest_staging_vacated_state/up.sql"),
+    "\n",
+    // issue #1596 review: staging_vacated_by column on
+    // harvest_workflow_executions, required for the same reason as the
+    // staging_vacated_state column above -- `WorkflowExecution::as_select()`
+    // names it unconditionally.
+    include_str!("../../migrations/20260920014641_harvest_staging_vacated_by/up.sql"),
+    "\n",
+    // Issue #1685 root cause: this migration was never added here when it
+    // landed. Every testcontainers-provisioned test database was missing
+    // `target_shard`/`target_workflow_name` on `harvest_completion_trigger_fires`.
+    // `completion_trigger.rs` inserts into that table unconditionally. That
+    // insert runs inside the same decision-cycle transaction that marks a
+    // source workflow COMPLETED. The missing column failed the insert with a
+    // Postgres "column does not exist" error, on every attempt. The failed
+    // insert rolled back the whole transaction, including the source's own
+    // completion. The task then retried the identical failure forever, so
+    // any test on this path hung until its outer wait timed out.
+    //
+    // A persistent, already-migrated `HARVEST_TEST_DATABASE_URL` database
+    // never showed this bug. It already carried the column, from being
+    // migrated over time. Only a throwaway testcontainers database,
+    // provisioned solely from this constant, was affected. See the
+    // CI-health report series under `docs/rnd/*-ci-health-semaphore-*.md`
+    // for the full investigation this closes.
+    include_str!("../../migrations/20260920215812_harvest_completion_trigger_fires_target/up.sql"),
+    "\n",
+    // issue #1402: timer_fires_at column on harvest_task_queue. REQUIRED, not
+    // optional. `queue::reschedule_task`'s changeset names this column
+    // unconditionally. The repend queries that clear it --
+    // `primary_repend_workflow_task_query`,
+    // `release_suspended_workflow_claim_query`, and the three backoff-retry
+    // requeue queries -- do too. Without it, every one of those writes fails
+    // with `column "timer_fires_at" of relation "harvest_task_queue" does
+    // not exist`. That failure takes the same silent-rollback,
+    // retried-forever, eventual-timeout shape as the #1685/#1596/#1317 gaps
+    // above. It is the same omission class, caught the same way. A local
+    // run with `HARVEST_TEST_DATABASE_URL` set does not catch this gap;
+    // that path migrates from the full `migrations/` directory, not from
+    // this deliberately partial bundle.
+    include_str!("../../migrations/20260921011505_harvest_task_queue_timer_fires_at/up.sql")
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
@@ -423,7 +482,19 @@ const LEGACY_INIT_SQL: &str = concat!(
     // every deployment that never runs a rebalance.
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_to_shard INTEGER NULL;\n",
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_at TIMESTAMPTZ NULL;\n",
-    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_from_shards JSONB NULL;\n"
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_from_shards JSONB NULL;\n",
+    // issue #1317: WorkflowExecution::as_select() also references this
+    // column, for the same reason as the three rebalancing columns above.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_run_terminal_at TIMESTAMPTZ NULL;\n",
+    // fresh review, P1 follow-up: WorkflowExecution::as_select() also
+    // references this column, for the same reason as the column above.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_run_terminal_state TEXT NULL;\n",
+    // issue #1317 review (P1 follow-up): WorkflowExecution::as_select() also
+    // references this column, for the same reason as the column above.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS staging_vacated_state TEXT NULL;\n",
+    // issue #1596 review: WorkflowExecution::as_select() also references
+    // this column, for the same reason as the column above.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS staging_vacated_by UUID NULL;\n"
 );
 
 /// Start a Postgres container with the harvest schema applied and return
@@ -1326,7 +1397,7 @@ pub(crate) async fn wait_for_execution_state(
 /// for tests whose expected wall-clock (e.g. many genuinely-concurrent
 /// children each sleeping for real time) can exceed the 10s default under
 /// resource-constrained CI runners.
-async fn wait_for_execution_state_with_timeout(
+pub(crate) async fn wait_for_execution_state_with_timeout(
     database_url: &str,
     exec_id: ExecutionId,
     expected_state: &str,

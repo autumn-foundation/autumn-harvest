@@ -25,6 +25,13 @@ The raw Axum process listens on `http://localhost:8082`.
 - Runner health route: `GET /`
 - Harvest API: `GET /api/harvest/health`
 - Start workflow: `POST /api/harvest/workflows/standalone_order/start`
+- Prometheus scrape endpoint: `GET /metrics` — `HarvestMetricsRecorder::render_prometheus()`
+  (issue #1611), the framework-neutral counterpart of the plugin path's
+  `/actuator/prometheus`. No `autumn_web::actuator` endpoint is mounted here at all.
+
+```bash
+curl -s http://localhost:8082/metrics | grep ^harvest_
+```
 
 Run the deployment preflight before starting work:
 

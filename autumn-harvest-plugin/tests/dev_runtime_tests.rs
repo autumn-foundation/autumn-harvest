@@ -2540,3 +2540,109 @@ fn the_getting_started_chapter_leads_with_the_zero_setup_path() {
         "deliberately not --release: on a fresh clone the compile dominates the metric"
     );
 }
+
+// ---------------------------------------------------------------------------
+// issue #1322 — a keyword-shaped token that is not a keyword
+// ---------------------------------------------------------------------------
+
+#[test]
+fn redaction_withholds_a_keyword_shaped_token_that_is_not_a_keyword() {
+    // A mistyped URL that lost its `://` scans as the "keyword" `postgres`. It
+    // has no `password=` option, so a scanner that accepts any token as a
+    // keyword lets the whole string through, credential included.
+    for dsn in [
+        "postgres=//alice:hunter2@db/harvest",
+        "postgresql=//alice:hunter2@db/harvest",
+        "notakeyword=alice:hunter2@db",
+    ] {
+        let redacted = redact_dsn(dsn);
+        assert!(
+            !redacted.contains("hunter2"),
+            "the password survived redaction: {dsn} -> {redacted}"
+        );
+        assert_ne!(
+            redacted, dsn,
+            "an unrecognized keyword must not be echoed back whole: {dsn}"
+        );
+    }
+}
+
+#[test]
+fn redaction_still_accepts_every_recognized_keyword() {
+    // The withholding above must not swallow a legitimate keyword DSN. Every
+    // libpq keyword `is_connection_keyword` allows is exercised here, so a
+    // typo in the allow-list itself — not just a missing one — shows up.
+    let dsn = "application_name=app channel_binding=require \
+               client_encoding=utf8 connect_timeout=5 dbname=harvest_dev \
+               fallback_application_name=app gssdelegation=1 gssencmode=disable \
+               gsslib=gssapi host=localhost hostaddr=127.0.0.1 keepalives=1 \
+               keepalives_count=3 keepalives_idle=5 keepalives_interval=5 \
+               krbsrvname=postgres load_balance_hosts=disable options=-c \
+               passfile=pgpass password=hunter2 port=5432 replication=off \
+               require_auth=scram-sha-256 requirepeer=postgres requiressl=0 \
+               scram_client_key=x scram_server_key=x service=svc \
+               ssl_max_protocol_version=TLSv1.3 ssl_min_protocol_version=TLSv1.2 \
+               sslcert=cert.pem sslcertmode=disable sslcompression=0 \
+               sslcrl=crl.pem sslcrldir=dir sslkey=key.pem sslmode=disable \
+               sslnegotiation=postgres sslpassword=certpw sslrootcert=root.pem \
+               sslsni=1 target_session_attrs=any tcp_user_timeout=0 user=u";
+    let redacted = redact_dsn(dsn);
+    assert!(!redacted.contains("hunter2"), "{redacted}");
+    assert!(redacted.contains("host=localhost"), "{redacted}");
+    assert!(redacted.contains("dbname=harvest_dev"), "{redacted}");
+    assert!(redacted.contains("sslmode=disable"), "{redacted}");
+    assert!(redacted.contains("target_session_attrs=any"), "{redacted}");
+}
+
+#[test]
+fn redaction_of_a_keyword_dsn_with_no_password_round_trips_byte_for_byte() {
+    // The keyword/value branch's "nothing to redact" claim, checked the same
+    // way the URI branch's equivalent test is: an exact `assert_eq!`, not
+    // just a substring check.
+    let dsn = "host=localhost dbname=harvest_dev user=u sslmode=disable";
+    assert_eq!(redact_dsn(dsn), dsn);
+}
+
+#[test]
+fn redaction_withholds_a_dsn_with_no_option_at_all() {
+    // A DSN with no `=` anywhere yields zero options from the scanner. The
+    // withholding loop never runs, so the string used to come back whole. A
+    // dropped scheme is at least as easy a typo as a keyword-shaped one.
+    for dsn in [
+        "alice:hunter2@db",
+        "//alice:hunter2@db/harvest",
+        "postgres:alice:hunter2@db/harvest",
+    ] {
+        let redacted = redact_dsn(dsn);
+        assert!(
+            !redacted.contains("hunter2"),
+            "the password survived redaction: {dsn} -> {redacted}"
+        );
+        assert_ne!(
+            redacted, dsn,
+            "a DSN with no recognized option must not be echoed back whole: {dsn}"
+        );
+    }
+}
+
+#[test]
+fn redaction_withholds_a_bare_token_next_to_a_real_option() {
+    // A bare token is skipped by the lenient `keyword_options` scanner. That
+    // holds even when a real option follows it, so the token itself —
+    // credential included — was never checked (issue #1322).
+    for dsn in [
+        "alice:hunter2@db host=localhost",
+        "postgres//alice:hunter2@db host=localhost",
+    ] {
+        let redacted = redact_dsn(dsn);
+        assert!(
+            !redacted.contains("hunter2"),
+            "the password survived redaction: {dsn} -> {redacted}"
+        );
+        assert_ne!(
+            redacted, dsn,
+            "a bare token must not be echoed back whole just because a real \
+             option follows it: {dsn}"
+        );
+    }
+}

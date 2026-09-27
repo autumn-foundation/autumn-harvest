@@ -2058,3 +2058,112 @@ async fn pause_during_inflight_decision_task_discards_pending_commands() {
     worker.shutdown();
     let _ = worker_handle.await;
 }
+
+// ---------------------------------------------------------------------------
+// Issue #1347: the early, non-locking pause fast path in
+// `process_workflow_task` had no ownership guard. It called
+// `queue::park_workflow_task` directly. That function parks a row by task id
+// alone. It has no worker_id check. A stale dispatcher whose claim already
+// moved to a new owner could still clear that owner's claim on this path.
+// This was the one #1184 site this class of guard had not yet reached.
+//
+// This test steals the task's claim while the decision task is mid-flight,
+// then pauses. The theft simulates a poison-pill reclaim, an operator
+// requeue, or a concurrent claim race. The stale dispatcher must find its
+// claim gone and leave the new owner's row untouched, exactly like the
+// sibling guards in `terminal_write_ownership_tests.rs`.
+// ---------------------------------------------------------------------------
+
+async fn steal_task_claim(conn: &mut AsyncPgConnection, exec_id: ExecutionId) {
+    use autumn_harvest::schema::harvest_task_queue as t;
+    diesel::update(
+        t::table
+            .filter(t::workflow_exec_id.eq(Some(exec_id.as_uuid())))
+            .filter(t::task_type.eq("workflow")),
+    )
+    .set(t::worker_id.eq(Some("thief")))
+    .execute(conn)
+    .await
+    .expect("transfer the claim");
+}
+
+async fn task_owner_and_state(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> (Option<String>, String) {
+    use autumn_harvest::schema::harvest_task_queue as t;
+    t::table
+        .filter(t::workflow_exec_id.eq(Some(exec_id.as_uuid())))
+        .filter(t::task_type.eq("workflow"))
+        .select((t::worker_id, t::state))
+        .first(conn)
+        .await
+        .expect("the task row survives an undecided dispatch")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pause_fast_path_makes_no_terminal_decision_when_the_claim_moved() {
+    let (url, _c) = setup().await;
+    let pool = build_pool(&url);
+    let mut conn = connect(&url).await;
+
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![wf_info("slow_timer_wf_1347", slow_timer_wf)],
+        vec![],
+    ));
+    let exec_id = start(&mut conn, "slow_timer_wf_1347", "inflight-pause-1347").await;
+
+    let worker = Arc::new(make_worker(registry));
+    let worker_pool = pool.clone();
+    let worker_ref = worker.clone();
+    let worker_handle = tokio::spawn(async move {
+        let _ = tokio::time::timeout(Duration::from_secs(25), worker_ref.run(&worker_pool)).await;
+    });
+
+    // Land the claim theft and the pause while the decision task is
+    // mid-flight. The worker has claimed it, but the handler is still in its
+    // 300ms sleep. So the fast path has not run yet.
+    wait_for_task_claimed(&mut conn, exec_id).await;
+    steal_task_claim(&mut conn, exec_id).await;
+    pause_workflow_execution(
+        &mut conn,
+        exec_id,
+        Some("mid-flight-claim-theft"),
+        "oncall",
+        &NoOpMetrics,
+    )
+    .await
+    .expect("pause should succeed on a running execution");
+    assert_eq!(get_state(&mut conn, exec_id).await, "PAUSED");
+
+    // Give the in-flight handler ample time to finish its sleep, reach the
+    // fast-path pause check, and find its claim gone.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    assert_eq!(
+        get_state(&mut conn, exec_id).await,
+        "PAUSED",
+        "execution must remain paused"
+    );
+    assert!(
+        !history(&mut conn, exec_id)
+            .await
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::TimerStarted { .. })),
+        "a dispatcher that lost the claim must not persist new commands"
+    );
+
+    let (worker_id, state) = task_owner_and_state(&mut conn, exec_id).await;
+    assert_eq!(
+        state, "RUNNING",
+        "the stolen row's state must be untouched by the stale dispatcher"
+    );
+    assert_eq!(
+        worker_id.as_deref(),
+        Some("thief"),
+        "the claim transfer must be untouched by the stale dispatcher's park attempt"
+    );
+
+    worker.shutdown();
+    let _ = worker_handle.await;
+}

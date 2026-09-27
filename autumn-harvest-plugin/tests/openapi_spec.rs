@@ -19,7 +19,6 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use autumn_harvest_plugin::api::{HarvestApiState, harvest_api_router};
 use autumn_harvest_plugin::management_api_routes;
 use autumn_harvest_plugin::openapi::{openapi_document, openapi_json};
-use autumn_web::AppState;
 use autumn_web::reexports::axum::Router;
 use autumn_web::reexports::axum::body::Body;
 use autumn_web::reexports::axum::routing::get;
@@ -515,6 +514,84 @@ fn parameter_names(operation: &Value) -> BTreeSet<String> {
         .collect()
 }
 
+/// Issue #1411 (item 3): the with-start routes cap the serialized start
+/// input (and, for signal-with-start, the signal payload) at a configured
+/// byte limit. `check_sws_payload_cap` returns `PayloadTooLarge`, which
+/// `map_error` turns into 413. Both routes must declare it, matching the
+/// sibling `POST /workflows/{workflow_name}/start` route.
+#[test]
+fn with_start_routes_document_payload_too_large() {
+    let contract: Value = serde_json::from_str(API_CONTRACT_JSON).expect("contract must parse");
+    let routes = contract["routes"].as_array().unwrap();
+
+    for (method, path) in [
+        ("POST", "/workflows/{workflow_name}/signal-with-start"),
+        ("POST", "/workflows/{workflow_name}/update-with-start"),
+    ] {
+        let route = routes
+            .iter()
+            .find(|route| route["method"] == method && route["path"] == path)
+            .unwrap_or_else(|| panic!("{method} {path} is missing from the contract"));
+        let responses = route["error_responses"].as_array().unwrap();
+        assert!(
+            responses.iter().any(|entry| entry["status"] == 413),
+            "{method} {path} must declare 413 for an oversized payload"
+        );
+    }
+}
+
+/// Issue #1411 (item 3): the bulk DLQ routes deserialize the body themselves
+/// and reject an empty one with 400, so the body is mandatory. They also
+/// accept `dead_letter_id` and `task_type` (replay/discard) and `shard_id`
+/// (all three) to scope a bulk operation, none of which was documented.
+#[test]
+fn dlq_bulk_routes_document_required_body_and_scoping_fields() {
+    let contract: Value = serde_json::from_str(API_CONTRACT_JSON).expect("contract must parse");
+    let routes = contract["routes"].as_array().unwrap();
+
+    let route = |method: &str, path: &str| {
+        routes
+            .iter()
+            .find(|route| route["method"] == method && route["path"] == path)
+            .unwrap_or_else(|| panic!("{method} {path} is missing from the contract"))
+    };
+    let field_names = |body: &Value| -> BTreeSet<String> {
+        body["fields"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|field| field["name"].as_str())
+            .map(str::to_owned)
+            .collect()
+    };
+
+    for (path, expected_fields) in [
+        (
+            "/dead-letters/replay",
+            vec!["dead_letter_id", "task_type", "shard_id"],
+        ),
+        (
+            "/dead-letters/discard",
+            vec!["dead_letter_id", "task_type", "shard_id"],
+        ),
+        ("/dlq/redrive", vec!["shard_id"]),
+    ] {
+        let body = &route("POST", path)["request_body"];
+        assert_eq!(
+            body["required"],
+            Value::Bool(true),
+            "POST {path}: an empty body is rejected with 400, so the body is required"
+        );
+        let fields = field_names(body);
+        for expected in expected_fields {
+            assert!(
+                fields.contains(expected),
+                "POST {path}: body omits documented field {expected}"
+            );
+        }
+    }
+}
+
 /// A rejection the handler forwards unchanged keeps its own media type.
 #[test]
 fn forwarded_extractor_rejections_declare_their_representation() {
@@ -696,8 +773,7 @@ async fn the_route_does_not_take_the_application_root_path() {
 
     let app = Router::new()
         .route("/openapi.json", get(app_document))
-        .nest("/api/harvest", harvest_api_router(HarvestApiState::new()))
-        .with_state(AppState::for_test());
+        .nest("/api/harvest", harvest_api_router(HarvestApiState::new()));
 
     let harvest = body_of(app.clone(), "/api/harvest/openapi.json").await;
     assert_eq!(
@@ -730,7 +806,7 @@ async fn body_of(app: Router<()>, uri: &str) -> Value {
 /// AC1 and AC7: the served endpoint answers 200 with exactly the artifact.
 #[tokio::test]
 async fn served_endpoint_returns_the_document() {
-    let app = harvest_api_router(HarvestApiState::new()).with_state(AppState::for_test());
+    let app = harvest_api_router(HarvestApiState::new());
     let request = Request::builder()
         .method(Method::GET)
         .uri("/openapi.json")

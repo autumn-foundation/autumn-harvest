@@ -1,0 +1,44 @@
+-- before-terminal-churn --
+-- Captured manually via psql against the pre-#1643 query text (the Rust
+-- harness's literal_count_stalled_candidates_sql helper reads the current,
+-- post-fix count_stalled_candidates_query() and cannot reproduce a pre-fix
+-- query; the harness's HTTP path also cannot run against a reverted src
+-- tree without recompiling the whole crate). Fixture: identical to the
+-- after-terminal-churn regime (50,000 terminal executions with events 5
+-- minutes old, 2,970 healthy + 30 stalled active executions), applied via
+-- autumn_harvest::test_init_sql() then this exact query with the pre-#1643
+-- SQL text, minutes=60, cap=51.
+
+SELECT COUNT(*)::BIGINT AS cnt FROM (
+    SELECT 1 FROM harvest_workflow_executions e
+    WHERE e.state IN ('RUNNING', 'SUSPENDED')
+    AND NOT EXISTS (
+        SELECT 1 FROM harvest_events ev
+        WHERE ev.workflow_exec_id = e.id
+        AND ev.timestamp >= NOW() - (60 * INTERVAL '1 minute')
+    )
+    AND ( ... OR-block, unchanged ... )
+    LIMIT 51
+) t;
+
+Aggregate  (cost=117328.57..117328.58 rows=1 width=8) (actual time=46.189..46.193 rows=1 loops=1)
+  Buffers: shared hit=12175
+  ->  Limit  (cost=0.71..117327.94 rows=51 width=4) (actual time=46.082..46.179 rows=30 loops=1)
+        Buffers: shared hit=12175
+        ->  Nested Loop Anti Join  (cost=0.71..179442.35 rows=78 width=4) (actual time=15.359..15.453 rows=30 loops=1)
+              Buffers: shared hit=12175
+              ->  Index Scan using idx_harvest_we_non_terminal_wf_name on harvest_workflow_executions e (actual rows=3000 loops=1)
+                    Buffers: shared hit=205
+                    [OR-block SubPlans, ~132 buffers total]
+              ->  Index Only Scan using idx_harvest_events_exec_last on harvest_events ev
+                    (cost=0.42..3.90 rows=3 width=16) (actual time=0.003..0.003 rows=1 loops=3000)
+                    Index Cond: ((workflow_exec_id = e.id) AND ("timestamp" >= (now() - '01:00:00'::interval)))
+                    Heap Fetches: 2970
+                    Buffers: shared hit=11970
+Execution Time: 2663.651 ms
+
+Confirms the pre-fix query's cost is independent of terminal-execution event
+age: 12,175 buffers here, identical to before-execution-heavy and
+before-event-write-heavy. The per-row correlated anti-join only ever probes
+harvest_events for the 3,000 active-state candidate rows; it never touches
+a terminal execution's events regardless of how recent they are.

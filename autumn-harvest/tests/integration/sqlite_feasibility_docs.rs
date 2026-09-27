@@ -776,9 +776,31 @@ fn derived_totals_agree_with_the_table_and_the_tree() {
         .count();
     assert!(
         report.contains(&format!("**{migrations} migrations**")),
-        "the report should state \"**{migrations} migrations**\"; a live count \
-         finds {migrations} migration directories"
+        "the report states {}; a live count finds {migrations} migration \
+         directories. Update the report to \"**{migrations} migrations**\"",
+        stated_migration_count(&report).map_or_else(
+            || "no \"**N migrations**\" figure".to_string(),
+            |stated| format!("\"**{stated} migrations**\"")
+        )
     );
+}
+
+/// Return the migration count the report currently states, if a bold
+/// `**N migrations**` figure is present.
+///
+/// The panic message above quotes this alongside the live count. Without it,
+/// a failing assertion could only ever interpolate the live count on both
+/// sides of its sentence. A reader could not tell from the message alone
+/// what the report actually says versus what is live.
+fn stated_migration_count(report: &str) -> Option<usize> {
+    let digits_end = report.find(" migrations**")?;
+    let digits_start = report[..digits_end]
+        .rfind(|c: char| !c.is_ascii_digit())
+        .map_or(0, |i| i + 1);
+    if digits_start >= digits_end || !report[..digits_start].ends_with("**") {
+        return None;
+    }
+    report[digits_start..digits_end].parse().ok()
 }
 
 #[test]

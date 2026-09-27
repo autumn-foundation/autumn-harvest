@@ -203,9 +203,16 @@ const ALLOWLIST_CHAOS_REASON: &str = "chaos-feature-gated (issue #940): DOES run
 const ALLOWLIST_PERF_EVIDENCE_REASON: &str = "manual pg_stat_statements perf-evidence generator (issue #1620): its \
      one test is #[ignore]d by design, run by hand per docs/performance-outbox-start-relay.md's `Reproduce` \
      section against a real local Postgres — no CI run should execute it automatically. Not a coverage gap.";
+const ALLOWLIST_EVIDENCE_HARNESS_REASON: &str = "single-purpose evidence-capture harness (Ledger, \
+     issue #1272) — its only test is #[ignore]d by design (500k-row fixture, VACUUM FULL); a manifest \
+     row would add a CI step that compiles it but runs nothing. Invoked manually with --ignored.";
 
 const ALLOWLIST: &[(&str, &str)] = &[
     // ── core (autumn-harvest/tests/integration) ──
+    (
+        "core:audit_log_unexported_idx_write_cost_perf",
+        ALLOWLIST_EVIDENCE_HARNESS_REASON,
+    ),
     ("core:audit_tests", ALLOWLIST_DEBT_REASON),
     ("core:build_routing_tests", ALLOWLIST_DEBT_REASON),
     ("core:cache_delta_load_tests", ALLOWLIST_DEBT_REASON),
@@ -244,7 +251,6 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ("core:transactional_activity_tests", ALLOWLIST_DEBT_REASON),
     ("core:typed_stubs_tests", ALLOWLIST_DEBT_REASON),
     ("core:updt_with_start_tests", ALLOWLIST_DEBT_REASON),
-    ("core:workflow_handle_tests", ALLOWLIST_DEBT_REASON),
     ("core:workflow_task_timeout_tests", ALLOWLIST_DEBT_REASON),
     // ── plugin (autumn-harvest-plugin/tests) ──
     ("plugin:archival_integration", ALLOWLIST_DEBT_REASON),
@@ -430,7 +436,7 @@ fn parse_manifest() -> Vec<SuiteRow> {
 /// or a filter whose first `::`-segment prefixes the module name — a partial
 /// `module::test` filter never credits the whole module).
 ///
-/// `autumn-harvest` has `default = ["db", "unified-dag-execution"]`; the runner
+/// `autumn-harvest` has `default = ["db", "unified-dag-execution", "tls"]`; the runner
 /// keeps defaults for `linux`/`linuxpart` integration rows (Docker Postgres) and strips them
 /// (`--no-default-features`) for `allos` integration rows (no live DB). So a
 /// `linux` integration row always has `db`; an `allos` integration row has it

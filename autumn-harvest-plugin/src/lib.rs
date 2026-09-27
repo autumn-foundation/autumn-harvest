@@ -86,8 +86,9 @@ pub mod openapi;
 pub mod metrics_scrape;
 
 pub use api::{
-    HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
-    management_api_request_fields, management_api_response_fields, management_api_routes,
+    HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, StandaloneAdminAuth,
+    harvest_api_router, management_api_request_fields, management_api_response_fields,
+    management_api_routes,
 };
 pub use config::{
     HarvestBatchConfig, HarvestDatabaseConfig, HarvestMode, HarvestOutboxConfig,
