@@ -55,6 +55,7 @@ its block returns `Ok(..)` and no error. Only a return at the top level of that
 block counts. A return inside a nested `if`, `match` or closure may not run. A
 parse that turns its error into a value is optional too, such as `.ok()`,
 `.unwrap_or_default()` or an `if let Ok(..)` whose `else` does not reject. A
+`match` on the parse is optional when no top-level `Err` arm rejects. A
 guard or a tolerant call at a helper call site carries into the helper. Check 2
 applies to every parse that does not tolerate its error, since a body that is
 present must then carry the mandatory fields. A bare `Json<T>` and a rejecting
@@ -84,7 +85,8 @@ helper it shares.
 
 Check 6 compares every `Query<T>` struct of a route with its `in: query`
 parameters. An `Option<Query<T>>` makes every field optional, since an absent
-query string yields `None`. `WIRE_TYPES` gives the OpenAPI type of a field after
+query string yields `None`. A `Result<Query<T>, _>` does the same when the
+handler does not reject its error, as check 5 reads it. `WIRE_TYPES` gives the OpenAPI type of a field after
 the audit removes one `Option`. A field is optional when it is an `Option` or
 has a serde default, on the field or on the struct. By default, serde ignores an
 unknown query key, so a documented key that no struct has is a finding.
@@ -653,9 +655,15 @@ def rejects_result_body(params: str, block: str) -> bool:
     optional.
     """
     found = re.search(r"\b([a-z_][a-z_0-9]*)\s*:\s*Result<\s*%s<" % JSON, params)
-    if found is None:
-        return False
-    variable = re.escape(found.group(1))
+    return found is not None and error_rejects(found.group(1), block)
+
+
+def error_rejects(name: str, block: str) -> bool:
+    """Whether the handler rejects the error of the `Result` extractor `name`.
+
+    `rejects_result_body` gives the forms it reads.
+    """
+    variable = re.escape(name)
     for use in re.finditer(r"(?<![.\w])%s\b" % variable, block):
         if chain_rejects(block[use.end() :]):
             return True
@@ -838,11 +846,21 @@ def discards_error(before: str, after: str) -> bool:
     A method chain after the call does so when `chain_state` ends it on an
     `Option` or a value, as `.ok()` or `.unwrap_or_default()` does. So does
     `if let Ok(..) =` before it, unless its `else` returns or builds an error.
-    A `match` that handles `Err` is not read, so it counts as mandatory.
+    A `match` on the parse tolerates it when it has a top-level `Err` arm and
+    no such arm rejects.
     """
     verdict, inspection, rest = walk_chain(after)
     if verdict == "tolerate":
         return not (inspection and inspection_rejects(before, inspection, rest))
+    arms = re.match(r"\s*\{", after)
+    if arms and re.search(r"\bmatch\s+(?:serde_json::)?$", before):
+        arms = balanced(after[arms.end() - 1 :], "{", "}")
+        failures = top_level_errs(arms)
+        return bool(failures) and not any(
+            rejecting_exit(arm) or rejecting_arm(arm, failure.group(1))
+            for failure in failures
+            for arm in [match_arm(arms, failure.start())]
+        )
     # A standalone `let Ok(..) = parse else { .. }` tolerates the error when its
     # fallback lets the request through. An `if let` has a block, not `else`,
     # right after the call, so it never matches here.
@@ -1148,7 +1166,12 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
             name = query.group(1).split("::")[-1]
             # An absent query string turns `Option<Query<T>>` into `None`, so
             # none of its fields is mandatory.
-            wrapped = re.search(r"Option<\s*(?:[a-z_]+::)*$", params[: query.start()]) is not None
+            # A `Result<Query<T>, _>` whose error the handler tolerates acts the same.
+            prefix = params[: query.start()]
+            wrapped = re.search(r"Option<\s*(?:[a-z_]+::)*$", prefix) is not None
+            result = re.search(r"\b([a-z_][a-z_0-9]*)\s*:\s*Result<\s*(?:[a-z_]+::)*$", prefix)
+            if result and not error_rejects(result.group(1), handler_body(source, handler) or ""):
+                wrapped = True
             struct = find_struct(name)
             if struct is None:
                 unresolved.append(missing % (method, path, name))
@@ -1650,6 +1673,10 @@ pub fn harvest_api_router() -> Router {
         .route("/e/is-ok-reject", post(e_is_ok_reject))
         .route("/e/teapot-else", post(e_teapot_else))
         .route("/e/teapot-arm", post(e_teapot_arm))
+        .route("/e/raw-match-ok", post(e_raw_match_ok))
+        .route("/e/raw-match-reject", post(e_raw_match_reject))
+        .route("/e/query-result-ok", get(e_query_result_ok))
+        .route("/e/query-result-reject", get(e_query_result_reject))
 }
 
 async fn e_wrapped(body: Bytes) -> Response {
@@ -2219,6 +2246,37 @@ async fn e_teapot_arm(body: Result<Json<Gadget>, JsonRejection>) -> Response {
         Ok(Json(gadget)) => StatusCode::OK.into_response(),
         Err(_) => StatusCode::METHOD_NOT_ALLOWED.into_response(),
     }
+}
+
+async fn e_raw_match_ok(body: Bytes) -> Result<Response, Response> {
+    let gadget = match serde_json::from_slice::<Gadget>(&body) {
+        Ok(gadget) => gadget,
+        Err(_) => return Ok(StatusCode::NO_CONTENT.into_response()),
+    };
+    Ok(StatusCode::OK.into_response())
+}
+
+async fn e_raw_match_reject(body: Bytes) -> Result<Response, Response> {
+    let gadget = match serde_json::from_slice::<Gadget>(&body) {
+        Ok(gadget) => gadget,
+        Err(_) => return Err(reject()),
+    };
+    Ok(StatusCode::OK.into_response())
+}
+
+async fn e_query_result_ok(query: Result<Query<Documented>, QueryRejection>) -> Response {
+    let kind = match query {
+        Ok(Query(query)) => query.kind,
+        Err(_) => String::from("all"),
+    };
+    StatusCode::OK.into_response()
+}
+
+async fn e_query_result_reject(
+    query: Result<axum::extract::Query<Documented>, QueryRejection>,
+) -> Result<Response, Response> {
+    let Query(query) = query.map_err(|_| reject())?;
+    Ok(StatusCode::OK.into_response())
 }
 
 async fn e_documented(Query(query): Query<Documented>) -> Response {
@@ -3377,6 +3435,42 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             )
         ],
         {},
+    ),
+    (
+        "a raw match whose Err arm lets the request through is tolerant",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/raw-match-ok",
+                200,
+                request_body=body_of(("name", False), required=False),
+                additional_responses=[{"status": 204}],
+            )
+        ],
+        {},
+    ),
+    (
+        "a raw match whose Err arm rejects is mandatory",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/raw-match-reject",
+                200,
+                request_body=body_of(("name", True), required=False),
+            )
+        ],
+        {"body_required": ["POST /e/raw-match-reject: the body is mandatory"]},
+    ),
+    (
+        "a Result<Query<T>> is optional when its error is tolerated, strict when it rejects",
+        FIXTURE_EDGES,
+        [
+            fixture_route("GET", path, 200, params=[query_param("kind", "string", False)])
+            for path in ("/e/query-result-ok", "/e/query-result-reject")
+        ],
+        {"query_params": ["GET /e/query-result-reject: `kind` is mandatory in Documented"]},
     ),
     (
         "a malformed contract entry does not crash the audit",
