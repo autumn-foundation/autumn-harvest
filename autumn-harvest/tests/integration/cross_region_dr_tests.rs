@@ -2109,16 +2109,31 @@ async fn two_regions(tag: &str) -> Option<Regions> {
 
     let conninfo = server_side_conninfo(&mut a, &admin, &primary_db).await;
     let mut b = connect(&standby_url).await;
+    // The migrations seed some tables, such as `harvest_calendars`, in both
+    // databases. The initial copy of such a table then fails on a duplicate
+    // key and retries forever. A real standby starts empty, so the standby
+    // here is emptied first. The copy then brings the primary's rows.
+    b.batch_execute(
+        "DO $$ DECLARE tables text; BEGIN \
+           SELECT string_agg(format('%I.%I', schemaname, tablename), ', ') INTO tables \
+             FROM pg_tables \
+            WHERE schemaname NOT IN ('pg_catalog', 'information_schema') \
+              AND tablename <> '__diesel_schema_migrations'; \
+           IF tables IS NOT NULL THEN EXECUTE 'TRUNCATE ' || tables || ' CASCADE'; END IF; \
+         END $$;",
+    )
+    .await
+    .expect("empty the standby before the initial copy");
     let create_subscription = format!(
         "CREATE SUBSCRIPTION {sub} CONNECTION '{conninfo}' PUBLICATION harvest_dr \
          WITH (create_slot = false, slot_name = '{slot}', copy_data = true)"
     );
     // `copy_data = true` blocks until the STANDBY's Postgres *server* process
-    // (not this test client) reaches the primary at `conninfo` and finishes an
-    // initial table sync — reachability that depends on the runner's own
-    // container networking, not on this test's logic, and that Postgres places
-    // no timeout on. A bad or momentarily-unreachable address here therefore
-    // hangs this `.await` forever rather than erroring, which is exactly what
+    // reaches the primary at `conninfo`. This test client does not make that
+    // connection. It depends on the runner's container networking, not on
+    // this test's logic, and Postgres places no timeout on it. A bad or
+    // momentarily-unreachable address here therefore hangs this `.await`
+    // forever rather than erroring, which is exactly what
     // pinned `Test DB (linux, shard 1)` for a full 6-hour CI job on a run whose
     // diff never touched this file (see the PR discussion this comment was
     // added from). Bounding it turns that into a fast, clear skip — consistent
@@ -2151,13 +2166,36 @@ async fn two_regions(tag: &str) -> Option<Regions> {
         }
     }
 
-    Some(Regions {
+    let regions = Regions {
         primary_url,
         primary_db,
         standby_url,
         slot,
         sub,
-    })
+    };
+    // `CREATE SUBSCRIPTION` returns before the initial copy ends. Sync workers
+    // copy each table on their own, so one table can lag behind another. A
+    // test that drops the subscription too early loses the rows that are not
+    // copied yet. One such loss was a `harvest_workflow_executions` row: the
+    // promoted region then failed an append on `harvest_events_workflow_exec_id_fkey`.
+    // So the topology is ready only when every table is in state `r` (ready).
+    // From then on one apply worker applies changes in commit order.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        let syncing = count_on(
+            &regions.standby_url,
+            "SELECT COUNT(*) AS n FROM pg_subscription_rel WHERE srsubstate <> 'r'",
+        )
+        .await;
+        if syncing == 0 {
+            return Some(regions);
+        }
+        if std::time::Instant::now() >= deadline {
+            regions.teardown().await;
+            panic!("{tag}: {syncing} table(s) did not finish the initial sync within 120s");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
 }
 
 macro_rules! require_regions {
