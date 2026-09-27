@@ -522,9 +522,10 @@ fresh, or if the queue backs a customer-facing workflow with a breached SLA.
 
 The Redis dispatch publisher (issue #1312) dropped hints because its queue was
 full. The queue holds 10,000 hints. No work is lost. Every task row stays
-`PENDING` in Postgres, and the reconcile sweep republishes it within one
-`reconcile_interval_ms`. The cost is dispatch latency. The operator guide is
-[`docs/operations/redis-dispatch.md`](../operations/redis-dispatch.md).
+`PENDING` in Postgres, and the reconcile sweep republishes it on a later
+sweep, usually the next one. A backlog deeper than `reconcile_batch` takes one
+`reconcile_interval_ms` per page. The cost is dispatch latency. The operator
+guide is [`docs/operations/redis-dispatch.md`](../operations/redis-dispatch.md).
 
 ### Triage steps
 
@@ -642,7 +643,8 @@ no work is at risk.
   changes. Nothing needs to drain.
 - Restore Redis reachability. A worker returns to the channel after its next
   successful reference read, within 30 s. The reconcile sweep refills empty
-  streams within one `reconcile_interval_ms`.
+  streams on a later sweep, usually the next one. A backlog deeper than
+  `reconcile_batch` takes one `reconcile_interval_ms` per page.
 - If Redis stays unavailable, turn Redis dispatch off. Unset
   `harvest.redis.url`, or set `AUTUMN_HARVEST_REDIS__URL` to the empty string,
   and restart. See

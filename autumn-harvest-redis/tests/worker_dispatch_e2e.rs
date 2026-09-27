@@ -320,12 +320,38 @@ impl TaskDispatch for CountingDispatch {
         self.inner.ack(lease).await
     }
 
+    // The batch and lease methods are forwarded, so these cases run the Redis
+    // implementations under a real worker (issue #1429).
+    async fn ack_many(&self, leases: &[DispatchLease]) -> HarvestResult<()> {
+        self.acked.fetch_add(leases.len(), AtomicOrdering::Relaxed);
+        self.inner.ack_many(leases).await
+    }
+
     async fn release(&self, lease: &DispatchLease, delay: Duration) -> HarvestResult<()> {
         self.inner.release(lease, delay).await
     }
 
     async fn maintain(&self, queues: &[String]) -> HarvestResult<DispatchMaintenance> {
         self.inner.maintain(queues).await
+    }
+
+    async fn hold_reconcile_leases(
+        &self,
+        queues: &[String],
+        consumer: &str,
+        ttl: Duration,
+    ) -> HarvestResult<Vec<String>> {
+        self.inner
+            .hold_reconcile_leases(queues, consumer, ttl)
+            .await
+    }
+
+    async fn release_reconcile_leases(
+        &self,
+        queues: &[String],
+        consumer: &str,
+    ) -> HarvestResult<()> {
+        self.inner.release_reconcile_leases(queues, consumer).await
     }
 }
 
@@ -1342,9 +1368,10 @@ fn wait_for_child(child: &mut std::process::Child, deadline: Duration) -> std::p
 // The child worker.
 // ---------------------------------------------------------------------------
 
-/// A channel that aborts the process inside `ack`.
+/// A channel that aborts the process inside `ack` and `ack_many`.
 ///
-/// The worker acks a reference immediately after the Postgres claim commits.
+/// The worker acks a read after its Postgres claims commit, before any task
+/// starts.
 /// An abort here reproduces the crash window of the acceptance criterion. The
 /// row is `RUNNING`, and the reference is still in the pending entries list.
 #[derive(Debug)]
@@ -1369,6 +1396,11 @@ impl TaskDispatch for AbortBeforeAck {
     }
 
     async fn ack(&self, _lease: &DispatchLease) -> HarvestResult<()> {
+        eprintln!("child: aborting after the claim commit and before the ack");
+        std::process::abort();
+    }
+
+    async fn ack_many(&self, _leases: &[DispatchLease]) -> HarvestResult<()> {
         eprintln!("child: aborting after the claim commit and before the ack");
         std::process::abort();
     }

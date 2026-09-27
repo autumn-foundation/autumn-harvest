@@ -1,3 +1,5 @@
+#[cfg(feature = "db")]
+use crate::dispatch::BufferedSettledExt as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -2753,6 +2755,7 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
                         .map_err(crate::error::database_error)?;
                         Ok(true)
                     }))
+                    .buffered_settled()
                     .await;
                 match resolved {
                     Ok(false) => {

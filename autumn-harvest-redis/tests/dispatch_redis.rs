@@ -577,7 +577,13 @@ async fn a_malformed_entry_does_not_block_recovery_in_another_queue() {
     let Some(fixture) = try_start(Duration::from_millis(300)).await else {
         return;
     };
-    let queues = vec!["bad_q".to_string(), "good_q".to_string()];
+    // An idle queue comes first, so a misaligned reply would hit the wrong
+    // stream.
+    let queues = vec![
+        "empty_q".to_string(),
+        "bad_q".to_string(),
+        "good_q".to_string(),
+    ];
     let (bad_id, good_id) = (Uuid::new_v4(), Uuid::new_v4());
 
     // Real publishes create both consumer groups.
@@ -1065,6 +1071,36 @@ async fn a_republish_restores_a_parked_reference_that_vanished() {
     assert_eq!(leases[0].task_id, task_id);
 }
 
+/// A queue whose consumer group vanished does not block recovery in the
+/// other queues (issue #1429).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lost_group_does_not_block_recovery_in_another_queue() {
+    let Some(fixture) = try_start(Duration::from_millis(300)).await else {
+        return;
+    };
+    let queues = vec!["lost_q".to_string(), "kept_q".to_string()];
+    let (lost_id, kept_id) = (Uuid::new_v4(), Uuid::new_v4());
+
+    fixture
+        .dispatch
+        .publish(&[
+            hint("lost_q", lost_id, Utc::now()),
+            hint("kept_q", kept_id, Utc::now()),
+        ])
+        .await
+        .expect("publish");
+    let leases = read(&fixture, &queues, 10).await;
+    assert_eq!(leases.len(), 2);
+    fixture.destroy_group("lost_q").await;
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let counts = fixture.dispatch.maintain(&queues).await.expect("maintain");
+    assert_eq!(counts.recovered, 1, "the intact queue must still recover");
+    let again = read(&fixture, &["kept_q".to_string()], 10).await;
+    assert_eq!(again.len(), 1);
+    assert_eq!(again[0].task_id, kept_id);
+}
+
 /// One consumer holds each queue's reconcile lease. The holder renews it, a
 /// peer waits for it, and a release hands it over (issue #1429).
 #[tokio::test(flavor = "multi_thread")]
@@ -1080,29 +1116,21 @@ async fn one_consumer_holds_each_reconcile_lease() {
         .hold_reconcile_leases(&both, "w1", ttl)
         .await
         .expect("hold");
-    assert_eq!(
-        first,
-        vec![true, true],
-        "free leases go to the first caller"
-    );
+    assert_eq!(first, both, "free leases go to the first caller");
 
     let peer = fixture
         .dispatch
         .hold_reconcile_leases(&both, "w2", ttl)
         .await
         .expect("hold");
-    assert_eq!(
-        peer,
-        vec![false, false],
-        "a held lease stays with its holder"
-    );
+    assert!(peer.is_empty(), "a held lease stays with its holder");
 
     let renewed = fixture
         .dispatch
         .hold_reconcile_leases(&both, "w1", ttl)
         .await
         .expect("renew");
-    assert_eq!(renewed, vec![true, true], "the holder renews its leases");
+    assert_eq!(renewed, both, "the holder renews its leases");
 
     fixture
         .dispatch
@@ -1114,11 +1142,7 @@ async fn one_consumer_holds_each_reconcile_lease() {
         .hold_reconcile_leases(&both, "w2", ttl)
         .await
         .expect("hold");
-    assert_eq!(
-        still,
-        vec![false, false],
-        "a non-holder cannot release a lease"
-    );
+    assert!(still.is_empty(), "a non-holder cannot release a lease");
 
     fixture
         .dispatch
@@ -1130,11 +1154,7 @@ async fn one_consumer_holds_each_reconcile_lease() {
         .hold_reconcile_leases(&both, "w2", ttl)
         .await
         .expect("hold");
-    assert_eq!(
-        handed,
-        vec![true, false],
-        "a released lease goes to the peer"
-    );
+    assert_eq!(handed, both[..1], "a released lease goes to the peer");
 }
 
 /// A lease the holder stops renewing expires, and a peer takes it.
@@ -1150,7 +1170,7 @@ async fn an_unrenewed_reconcile_lease_expires() {
         .hold_reconcile_leases(&queue, "w1", Duration::from_millis(150))
         .await
         .expect("hold");
-    assert_eq!(first, vec![true]);
+    assert_eq!(first, queue);
 
     tokio::time::sleep(Duration::from_millis(300)).await;
     let peer = fixture
@@ -1158,5 +1178,34 @@ async fn an_unrenewed_reconcile_lease_expires() {
         .hold_reconcile_leases(&queue, "w2", Duration::from_secs(30))
         .await
         .expect("hold");
-    assert_eq!(peer, vec![true], "an expired lease goes to the next caller");
+    assert_eq!(peer, queue, "an expired lease goes to the next caller");
+}
+
+/// A renewal extends the lease, so a peer still cannot take it after the
+/// first TTL passes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_renewal_extends_the_reconcile_lease() {
+    let Some(fixture) = try_start(Duration::from_secs(60)).await else {
+        return;
+    };
+    let queue = vec!["lease_renewal".to_string()];
+
+    fixture
+        .dispatch
+        .hold_reconcile_leases(&queue, "w1", Duration::from_millis(150))
+        .await
+        .expect("hold");
+    fixture
+        .dispatch
+        .hold_reconcile_leases(&queue, "w1", Duration::from_secs(30))
+        .await
+        .expect("renew");
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let peer = fixture
+        .dispatch
+        .hold_reconcile_leases(&queue, "w2", Duration::from_secs(30))
+        .await
+        .expect("hold");
+    assert!(peer.is_empty(), "a renewed lease outlives its first TTL");
 }

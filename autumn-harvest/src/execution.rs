@@ -1244,10 +1244,6 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
         enqueue.scheduled_at = target_start_time;
     }
 
-    // The start publishes its hints after this transaction commits (issue
-    // #1429). Under a caller's scope the hints stay with the caller. As a
-    // SAVEPOINT with no scope they publish at release, which is never earlier
-    // than the background publisher did before.
     let main_result = Box::pin(conn.transaction::<(
         StartedWorkflowExecution,
         Vec<DeferredTriggerStart>,
@@ -1953,7 +1949,6 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
             }
         }
     }))
-    .buffered_settled()
     .await;
 
     let mut cancel_metrics = pre_check_cancel_metrics;

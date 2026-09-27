@@ -10,32 +10,52 @@ its brainstorm, reverse brainstorm and six hats, is
 - **Tail latency (item 1), closed by evidence.** Assay #9 re-ran the paced
   shape after the sampler fix of #1428. The channel p99 is 50.02 ms against
   the 250 ms line. No code change.
-- **Buffering scopes (item 2).** Nineteen transaction owners in `timeout.rs`,
-  `execution.rs`, `poison_pill.rs` and `context.rs`, plus the mutex reclaim in
-  the timeout scanner, now publish their hints after they commit. Each site
-  chains the new `dispatch::BufferedSettledExt::buffered_settled()` before its
-  `.await`, so no transaction body moves. A wrapped owner under an outer scope
-  leaves its hints with that scope, as before.
+- **Buffering scopes (item 2).** More transaction owners now publish their
+  hints after they commit. The owners are 9 sites in `timeout.rs` plus the
+  mutex reclaim of the timeout scanner, and 7 top-level sites in
+  `execution.rs`. The `poison_pill.rs` quarantine and `context.rs`
+  `run_transactional` are owners too. The fire paths of debounce, throttle,
+  event batch and the completion-trigger outbox own their nested starts, so
+  they are wrapped as well. Each site chains the new
+  `dispatch::BufferedSettledExt::buffered_settled()` before its `.await`, so
+  no transaction body moves. A wrapped owner under an outer scope leaves its
+  hints with that scope, as before. The start-collect transaction is not
+  wrapped. It often runs as a SAVEPOINT, and a scope there would block on
+  Redis inside the caller's open transaction. A wrapped owner awaits its
+  publish after commit, so a stalled Redis delays that caller by up to the
+  5 s response timeout.
 - **Effective config (item 6).** `GET /admin/config` has a `redis` section:
   `installed`, the credential-free `endpoint`, the effective `key_prefix`, and
   every `[harvest.redis]` tuning key. `installed` is the install result, not
-  the config.
+  the config. The endpoint drops any userinfo and replaces any query or
+  fragment, because a unix-socket URL can carry `?pass=`.
 - **Metrics (item 7).** Three counters: `harvest.dispatch.hints_dropped`,
   `harvest.dispatch.fallbacks{reason}` and `harvest.dispatch.recovered`. Two
   ticket alerts, runbook sections, a dashboard row, and metrics-rs bridges.
+  The background publisher counts each dropped hint at the drop site, through
+  `dispatch::set_dropped_hint_recorder`. The built-in scrape endpoint does not
+  export the three counters yet.
 - **Batched acks (item 8).** `TaskDispatch::ack_many`, with a default body
   that acks each lease. Redis overrides it with one atomic pipeline. The
   worker claims every lease of a read, acks them in one call, and only then
   starts the claimed tasks. No task starts before its ack, so the crash matrix
-  does not change.
+  does not change. A wrapper `TaskDispatch` must forward `ack_many` and the
+  two lease methods. Otherwise it falls back to one ack per lease and a sweep
+  on every worker.
 - **Recovery round trips (item 9).** One pipeline reads every pending entries
-  list, and a second claims every idle entry, for all queues at once.
+  list, and a second claims every idle entry, for all queues at once. A failed
+  pipeline falls back to one queue at a time, so one bad queue does not block
+  the rest.
 - **Sweep fan-out (item 10).** `[harvest.redis] reconcile_batch` (default
-  1000, range 1 to 100000, env `AUTUMN_HARVEST_REDIS__RECONCILE_BATCH`). A
+  1000, range 1 to 10000, env `AUTUMN_HARVEST_REDIS__RECONCILE_BATCH`). A
   per-queue sweep lease in Redis (`<prefix>:dispatch:<queue>:reconcile`) lets
-  one worker sweep each queue. The lease fails open: a failed lease call
-  sweeps every queue, a failed sweep gives its leases back, and an unrenewed
-  lease expires after three intervals.
+  one worker sweep each queue. The holder renews the lease at the start of
+  each sweep. Its TTL is three times the larger of the reconcile and poll
+  intervals. The lease fails open. A failed lease call sweeps every queue. A
+  sweep that fails on Postgres gives its leases back. After a Redis failure,
+  the lease expires. A stopping worker releases its leases, best effort. A
+  worker keeps its sweep cursor when it loses a lease, so a hand-over does not
+  restart the walk.
 
 **Deferred.** Items 3 (multi-shard), 4 (priority and sticky streams) and 5
 (Redis Cluster) change where a reference lives. Each needs its own design and

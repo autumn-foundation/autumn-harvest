@@ -6641,7 +6641,7 @@
           }
         }
       ],
-      "description": "Alert: harvest_dispatch_hints_dropped (docs/runbooks/harvest-alerts.md#harvest_dispatch_hints_dropped) Dispatch hints the background publisher dropped because its bounded queue (10,000 hints) was full. The reconcile sweep republishes each dropped row within one reconcile_interval_ms, so a drop costs latency, never work. A steady rate means Redis is slow or unreachable, or the enqueue rate outruns the channel. Zero on a process without Redis dispatch."
+      "description": "Alert: harvest_dispatch_hints_dropped (docs/runbooks/harvest-alerts.md#harvest_dispatch_hints_dropped) Dispatch hints the background publisher dropped because its bounded queue (10,000 hints) was full. The reconcile sweep republishes each dropped row on a later sweep, usually the next one. A backlog deeper than reconcile_batch takes one reconcile_interval_ms per page. A drop costs latency, never work. A steady rate means Redis is slow or unreachable, or the enqueue rate outruns the channel. On a process without Redis dispatch the series is absent, so the panel is empty."
     },
     {
       "id": 401004,
@@ -6690,7 +6690,7 @@
           }
         }
       ],
-      "description": "Alert: harvest_dispatch_fallback (docs/runbooks/harvest-alerts.md#harvest_dispatch_fallback) Failed Redis channel calls, by the call that failed (maintain, read, read_timeout, publish). Each failure sends a worker to the Postgres claim path for a cooldown. Work continues, at the Postgres claim-path throughput. The cooldown starts at the poll interval, doubles per failed read and stops at 30 s."
+      "description": "Alert: harvest_dispatch_fallback (docs/runbooks/harvest-alerts.md#harvest_dispatch_fallback) Failed Redis channel calls, by the call that failed (maintain, read, read_timeout, publish). Each failure sends a worker to the Postgres claim path for a cooldown. Work continues, at the Postgres claim-path throughput. The cooldown starts at the poll interval, doubles per consecutive channel failure and stops at 30 s."
     },
     {
       "id": 629907,

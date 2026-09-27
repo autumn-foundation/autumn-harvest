@@ -458,7 +458,7 @@ pub const METRIC_DISPATCH_HINTS_DROPPED: &str = "harvest.dispatch.hints_dropped"
 
 /// Counter: a worker fell back to the Postgres claim path (issue #1429).
 ///
-/// Incremented once for each channel call that fails and opens a cooldown.
+/// A worker adds one for each failed channel call that opens a cooldown.
 /// Labelled `{reason}`: `maintain`, `read`, `read_timeout` or `publish`.
 pub const METRIC_DISPATCH_FALLBACKS: &str = "harvest.dispatch.fallbacks";
 

@@ -49,8 +49,10 @@ with the channel and 146.09 ms without it.
 That tail figure predates the sampler fix of issue #1428.
 [`docs/assays/0009-redis-dispatch-tail-latency-post-sampler-fix.md`](../assays/0009-redis-dispatch-tail-latency-post-sampler-fix.md)
 re-ran the same paced shape after the fix. The channel p99 fell to 50.02 ms,
-against 27.97 ms without it. That clears the 250 ms line, so issue #1429
-closes its tail-latency item on that evidence.
+against 27.97 ms without the channel. That clears the 250 ms line, so issue
+#1429 closes its tail-latency item on that evidence. The assay cannot separate
+the fix from other changes, such as a different host, a lockfile bump and
+`worker.rs` changes. See its row in the [assay index](../assays/README.md).
 
 Redis dispatch does not raise durability, and it is not a way to survive a
 Postgres outage. Postgres remains required.
@@ -84,9 +86,9 @@ with unrelated keys in a shared Redis. `consumer_group` must not be empty,
 because Redis rejects an empty group name. `poll_interval_ms` must be between
 1 and 5000, because the worker checks shutdown between blocking reads.
 `visibility_timeout_ms` must be at least 1000, because the timeout has to
-outlast one Postgres claim. `reconcile_interval_ms` must be at least 1. `reconcile_batch` must be between
-1 and 100000, because a zero batch never moves the sweep cursor and one query
-must not read a whole deep backlog. The
+outlast one Postgres claim. `reconcile_interval_ms` must be at least 1.
+`reconcile_batch` must be between 1 and 10000. A zero batch never moves the
+sweep cursor, and one query must not read a whole deep backlog. The
 `autumn-harvest-redis` crate repeats the prefix and group checks at connect.
 
 Queue names must not contain `:`. The colon separates the parts of every key
@@ -159,8 +161,9 @@ namespaces an environment keeps that namespace.
 An upgrade moves a non-default shard to a new key family. References that the
 previous release published for that shard stay in the old stream, and no worker
 reads them again. Nothing is lost: the rows are still `PENDING` in Postgres,
-and the reconcile sweep republishes them into the new family within one
-`reconcile_interval`. Delete the old keys at leisure with a prefix scan.
+and the reconcile sweep republishes them into the new family on a later
+sweep, usually the next one. A backlog deeper than `reconcile_batch` takes one
+interval per page. Delete the old keys at leisure with a prefix scan.
 
 With the default prefix and a queue named `email`:
 
@@ -212,15 +215,29 @@ marker whose reference vanished is rewritten, and the reference is recreated.
 **One worker sweeps each queue.** Before issue #1429 every worker swept every
 queue, so a fleet of N workers read N pages per queue per interval. Now each
 queue has a sweep lease in Redis. The worker that holds it sweeps the queue and
-renews the lease at each sweep. Its peers skip that queue. The lease fails open
-in three ways, because the sweep is the floor:
+renews the lease at the start of each sweep. Its peers skip that queue. The
+lease TTL is three times the larger of `reconcile_interval_ms` and
+`poll_interval_ms`. The lease fails open, because the sweep is the floor:
 
 - A lease call that fails sweeps every queue.
-- A sweep that fails gives its leases back, so a peer sweeps next time.
-- A lease that is not renewed expires after three reconcile intervals.
+- A sweep that fails on a Postgres error gives its leases back, so a peer
+  sweeps next time.
+- A sweep whose publish to Redis fails makes no further Redis call. Its lease
+  expires after the TTL.
+- A worker that stops releases its leases, best effort. A lease that is not
+  renewed expires after the TTL.
+
+A worker keeps its sweep cursor when it loses a lease. A stale cursor wraps on
+the next short page, so a hand-over does not restart the walk. A due row that
+the channel does not hold is published on a later sweep, usually the next one.
+A backlog deeper than `reconcile_batch` takes one interval per page.
 
 Every worker still reads the throttle metrics at each interval. Only the page
 read moves to the lease holder.
+
+A custom `TaskDispatch` wrapper must forward `ack_many`,
+`hold_reconcile_leases` and `release_reconcile_leases`. Otherwise it falls
+back to one ack per lease, and every worker sweeps every queue.
 
 **The Postgres claim is still the only `PENDING -> RUNNING` writer.** A
 reference grants nothing. Two workers that somehow both hold a reference for
@@ -256,10 +273,10 @@ wrapper, so the two cases do not share one failure mode.
 | Situation | Behaviour | What the operator sees |
 |-----------|-----------|------------------------|
 | Redis unreachable at startup | Startup fails | One error naming the endpoint in credential-free form |
-| Redis becomes unreachable while running | The worker enters a Postgres-only mode for a cooldown, then probes the channel again. The cooldown starts at the poll interval, doubles per failed reference read and stops at 30 s. Only a successful reference read clears it, because `maintain` and `publish` run on a different connection | Throughput returns to the Postgres numbers; work continues |
+| Redis becomes unreachable while running | The worker enters a Postgres-only mode for a cooldown, then probes the channel again. The cooldown starts at the poll interval, doubles per consecutive channel failure and stops at 30 s. Only a successful reference read clears it, because `maintain` and `publish` run on a different connection | Throughput returns to the Postgres numbers; work continues |
 | A malformed entry reaches a stream | The worker acks and deletes it | One warning naming the entry id |
 | A reference names a task kind with no free permit on this worker | The reference goes back to the stream for a peer | No error; a peer with capacity claims the row |
-| Redis returns and the streams are empty | The reconcile sweep refills them | A latency bump of at most one reconcile interval |
+| Redis returns and the streams are empty | The reconcile sweep refills them | A latency bump, usually one reconcile interval. A backlog deeper than `reconcile_batch` takes one interval per page |
 | A row is `PENDING` but a claim gate holds it | The reference is released with exponential backoff, capped | No error; the row waits for its gate |
 | A reference names a row that is absent | Three short releases, then an ack | No error; this covers a publish that raced its own transaction |
 | `[harvest.redis] url` set on a build without the `redis` feature | Startup fails at config validation | An error naming the `redis` cargo feature |
@@ -274,10 +291,18 @@ Postgres claim path, so availability with Redis down equals availability with
 Redis absent. It does not cover **boot**: a configured URL that cannot connect
 fails startup instead, in every mode.
 
+A slow Redis also reaches the callers that publish. A transaction owner with a
+buffering scope awaits its publish after it commits. A stalled Redis therefore
+delays that caller by up to the 5 s response timeout. No work is lost, and the
+reconcile sweep still republishes the row.
+
 ## Metrics and alerts
 
 Issue #1429 adds three counters. They appear only on a process with the
-channel installed.
+channel installed. The plugin's built-in scrape endpoint
+(`with_metrics_scrape()`, `HarvestMetricsRecorder`) does not export them yet.
+Use the `metrics-rs` adapter or another recorder, as
+[`docs/telemetry.md`](../telemetry.md) describes.
 
 | Metric | Prometheus series | Meaning |
 |--------|-------------------|---------|

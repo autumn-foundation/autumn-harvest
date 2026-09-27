@@ -63,10 +63,9 @@ const REDIS_VISIBILITY_TIMEOUT_FLOOR_MS: u64 = 1_000;
 
 /// Highest accepted `harvest.redis.reconcile_batch` (issue #1429).
 ///
-/// A sweep reads up to one batch per queue in one query and holds a pool
-/// connection while it reads. The ceiling keeps one sweep from reading a
-/// whole deep backlog at once.
-const REDIS_RECONCILE_BATCH_CEILING: u32 = 100_000;
+/// A sweep reads each queue in one query of up to one batch, and publishes
+/// the page in one Redis call. The ceiling keeps one call from blocking Redis.
+const REDIS_RECONCILE_BATCH_CEILING: u32 = 10_000;
 
 /// Redis dispatch channel settings (issue #1312).
 ///
@@ -760,10 +759,13 @@ fn parse_orphan_startup_action(key: &str, value: &str) -> Result<OrphanStartupAc
 /// A caller prints this instead of a URL that may still hold a password.
 const REDACTED_URL: &str = "<redacted>";
 
-/// Remove the `user:password@` part of a URL authority.
+/// Remove the `user:password@` part of a URL authority, and hide the query.
 ///
 /// The scan is bounded to the authority: the first `/`, `?` or `#` after the
-/// scheme ends it. An `@` later in the path or the query is left alone.
+/// scheme ends it. An `@` later in the path is left alone.
+///
+/// A query or fragment becomes `?<redacted>` (issue #1429). A Redis URL can
+/// carry a password there, as in `redis+unix://host/run/redis.sock?pass=x`.
 ///
 /// The function fails closed and returns [`REDACTED_URL`] when it cannot
 /// isolate the authority (issue #1312). Two inputs reach that path. A string
@@ -773,6 +775,18 @@ const REDACTED_URL: &str = "<redacted>";
 /// valid host and port. Returning the input unchanged in either case would
 /// print the password.
 fn redact_userinfo(url: &str) -> String {
+    let Some(query_start) = url.find(['?', '#']) else {
+        return redact_authority(url);
+    };
+    let base = redact_authority(&url[..query_start]);
+    if base == REDACTED_URL {
+        return base;
+    }
+    format!("{base}?{REDACTED_URL}")
+}
+
+/// [`redact_userinfo`] for a URL with no query and no fragment.
+fn redact_authority(url: &str) -> String {
     let Some(scheme_end) = url.find("://") else {
         return REDACTED_URL.to_owned();
     };
@@ -1282,6 +1296,28 @@ key_prefix = "from_toml"
         assert_eq!(config.redis.url.as_deref(), Some("redis://127.0.0.1:6379"));
     }
 
+    /// A unix-socket URL carries its password in the query. The admin view
+    /// serves this form, so the query must go (issue #1429).
+    #[test]
+    fn redacted_url_hides_a_query_string_password() {
+        for url in [
+            "redis+unix://localhost/run/redis.sock?pass=hunter2",
+            "redis://cache:6379/0?password=hunter2",
+            "redis://ops:hunter2@cache:6379/0?user=ops#frag",
+        ] {
+            let config = HarvestRedisConfig {
+                url: Some(url.to_owned()),
+                ..HarvestRedisConfig::default()
+            };
+            let redacted = config.redacted_url().expect("a url is set");
+            assert!(
+                !redacted.contains("hunter2"),
+                "leaked from {url}: {redacted}"
+            );
+            assert!(redacted.ends_with("?<redacted>"), "got {redacted}");
+        }
+    }
+
     #[test]
     fn redacted_url_is_none_when_dispatch_is_off() {
         assert_eq!(HarvestRedisConfig::default().redacted_url(), None);
@@ -1453,11 +1489,11 @@ key_prefix = "from_toml"
         );
     }
 
-    /// Every worker reads up to one batch per queue per interval. The ceiling
-    /// keeps one sweep from reading a whole backlog in one query (issue #1429).
+    /// The ceiling keeps one sweep from reading a whole backlog in one query
+    /// (issue #1429).
     #[test]
     fn harvest_config_redis_rejects_a_reconcile_batch_above_the_ceiling() {
-        let env = MockEnv::new().with("AUTUMN_HARVEST_REDIS__RECONCILE_BATCH", "100001");
+        let env = MockEnv::new().with("AUTUMN_HARVEST_REDIS__RECONCILE_BATCH", "10001");
 
         let error = HarvestRuntimeConfig::load_with_env(&env)
             .expect_err("a reconcile batch above the ceiling must fail validation");

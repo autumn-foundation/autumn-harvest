@@ -8,6 +8,8 @@
 
 use crate::debounce::DebounceStartOptions;
 #[cfg(feature = "db")]
+use crate::dispatch::BufferedSettledExt as _;
+#[cfg(feature = "db")]
 use crate::error::{HarvestError, HarvestResult};
 #[cfg(feature = "db")]
 use crate::types::ExecutionId;
@@ -420,6 +422,7 @@ pub async fn admit_batched_start_with_codecs(
                 cancel_metrics,
             ))
         }))
+        .buffered_settled()
         .await?;
 
     for check in &deferred_checks {
@@ -581,6 +584,7 @@ async fn fire_due_on_conn(
                 Ok(None)
             }
         }))
+        .buffered_settled()
         .await?;
 
         if let Some((exec_id, deferred, checks, cancel_metrics)) = processed {

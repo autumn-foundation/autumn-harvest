@@ -51,6 +51,8 @@
 //!
 //! [`WorkerConfig::default_debounce_max_wait`]: crate::builder::WorkerConfig::default_debounce_max_wait
 
+#[cfg(feature = "db")]
+use crate::dispatch::BufferedSettledExt as _;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -875,6 +877,7 @@ async fn fire_due_on_conn(
             Ok(results)
         }),
     )
+    .buffered_settled()
     .await?;
 
     Ok(fired)

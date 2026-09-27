@@ -851,9 +851,11 @@ async fn a_channel_failure_counts_a_fallback() {
         !fallbacks.is_empty(),
         "a failing channel must count at least one fallback"
     );
+    // MemoryDispatch fails `next` and `publish`, never `maintain`, and it
+    // answers at once. Only these two labels can appear.
     for reason in &fallbacks {
         assert!(
-            ["maintain", "read", "read_timeout", "publish"].contains(&reason.as_str()),
+            ["read", "publish"].contains(&reason.as_str()),
             "unexpected fallback reason {reason}"
         );
     }
@@ -1691,22 +1693,26 @@ tokio::task_local! {
 struct PublishRecord {
     task_id: uuid::Uuid,
     /// The row was `PENDING` to a separate connection at publish time.
-    committed: bool,
+    pending: bool,
+    /// The owner's connection had no open transaction at publish time.
+    owner_committed: bool,
     /// The owner's own task published the hint, not the background publisher.
     on_owner_task: bool,
 }
 
 /// A channel that checks each hint against the database as it arrives.
 ///
-/// A separate connection reads the named row. A hint published before its
-/// transaction commits therefore reads as uncommitted. The task-local flag
-/// separates a publish after the owner's commit from one the background
-/// publisher sends while the transaction is still open.
+/// A separate connection reads the named row and the owner connection's
+/// state in `pg_stat_activity`. A publish inside the owner's transaction sees
+/// `idle in transaction` or `active` there. The task-local flag separates a
+/// publish by the owner from one the background publisher sends.
 #[derive(Debug)]
 struct CommitCheckingDispatch {
     url: String,
     inner: MemoryDispatch,
     records: std::sync::Mutex<Vec<PublishRecord>>,
+    /// Backend pid of the owner's connection. Zero until a case sets it.
+    owner_pid: std::sync::atomic::AtomicI32,
 }
 
 impl CommitCheckingDispatch {
@@ -1715,7 +1721,23 @@ impl CommitCheckingDispatch {
             url: url.to_owned(),
             inner: MemoryDispatch::new(),
             records: std::sync::Mutex::new(Vec::new()),
+            owner_pid: std::sync::atomic::AtomicI32::new(0),
         }
+    }
+
+    /// Record the backend pid of the owner's connection.
+    async fn watch_owner(&self, conn: &mut AsyncPgConnection) {
+        #[derive(diesel::QueryableByName)]
+        struct Pid {
+            #[diesel(sql_type = diesel::sql_types::Integer)]
+            pid: i32,
+        }
+        let pid = diesel::sql_query("SELECT pg_backend_pid() AS pid")
+            .get_result::<Pid>(conn)
+            .await
+            .expect("read the owner pid")
+            .pid;
+        self.owner_pid.store(pid, Ordering::SeqCst);
     }
 
     fn records_for(&self, task_id: uuid::Uuid) -> Vec<PublishRecord> {
@@ -1741,6 +1763,16 @@ impl TaskDispatch for CommitCheckingDispatch {
     ) -> autumn_harvest::HarvestResult<()> {
         let on_owner_task = OWNER_TASK.try_with(|()| ()).is_ok();
         let mut conn = connect(&self.url).await;
+        let owner_pid = std::sync::atomic::AtomicI32::load(&self.owner_pid, Ordering::SeqCst);
+        let owner_state: Option<String> =
+            diesel::sql_query("SELECT state AS value FROM pg_stat_activity WHERE pid = $1")
+                .bind::<diesel::sql_types::Integer, _>(owner_pid)
+                .get_result::<TextValue>(&mut conn)
+                .await
+                .optional()
+                .expect("read the owner state")
+                .map(|row| row.value);
+        let owner_committed = owner_state.as_deref() == Some("idle");
         for hint in hints {
             let state: Option<String> =
                 diesel::sql_query("SELECT state AS value FROM harvest_task_queue WHERE id = $1")
@@ -1755,7 +1787,8 @@ impl TaskDispatch for CommitCheckingDispatch {
                 .expect("publish records")
                 .push(PublishRecord {
                     task_id: hint.task_id,
-                    committed: state.as_deref() == Some("PENDING"),
+                    pending: state.as_deref() == Some("PENDING"),
+                    owner_committed,
                     on_owner_task,
                 });
         }
@@ -1838,8 +1871,12 @@ fn assert_published_after_commit(channel: &CommitCheckingDispatch, task_id: uuid
              not from the owner after its commit: {record:?}"
         );
         assert!(
-            record.committed,
-            "the hint for {task_id} named a row that was not committed: {record:?}"
+            record.owner_committed,
+            "the hint for {task_id} left while its owner's transaction was open: {record:?}"
+        );
+        assert!(
+            record.pending,
+            "the hint for {task_id} named a row that is not pending: {record:?}"
         );
     }
 }
@@ -1866,6 +1903,7 @@ async fn a_resume_publishes_its_wake_after_commit() {
     .expect("pause");
     settle_background_publisher().await;
     channel.clear();
+    channel.watch_owner(&mut conn).await;
 
     OWNER_TASK
         .scope(
@@ -1896,6 +1934,12 @@ async fn the_mutex_reclaim_publishes_its_wake_after_commit() {
     let holder = start(&mut conn, "dispatch_trivial").await;
     let waiter = start(&mut conn, "dispatch_trivial").await;
     let waiter_task = workflow_task_id(&mut conn, waiter).await;
+    settle_background_publisher().await;
+    channel.clear();
+    channel.watch_owner(&mut conn).await;
+
+    // The lease is seeded right before the pass, so no other test's timeout
+    // pass reclaims it first.
     let lock_key = format!("dispatch-reclaim-{}", uuid::Uuid::new_v4());
     diesel::sql_query(
         "INSERT INTO harvest_mutex_locks (lock_key, holder_exec_id, lock_seq, acquired_at, \
@@ -1917,8 +1961,6 @@ async fn the_mutex_reclaim_publishes_its_wake_after_commit() {
     .execute(&mut conn)
     .await
     .expect("seed a waiter");
-    settle_background_publisher().await;
-    channel.clear();
 
     OWNER_TASK
         .scope(
@@ -1947,12 +1989,28 @@ async fn the_mutex_reclaim_publishes_its_wake_after_commit() {
 // Batched acks (issue #1429 item 8)
 // ---------------------------------------------------------------------------
 
-/// Counts single acks and batched acks.
+/// Activity runs that started, for the ack-before-start check.
+static PROBE_ACTIVITY_STARTS: AtomicUsize = AtomicUsize::new(0);
+
+fn probe_echo_activity(
+    _ctx: &autumn_harvest::ActivityContext,
+    input: serde_json::Value,
+) -> BoxFut<'_> {
+    PROBE_ACTIVITY_STARTS.fetch_add(1, Ordering::SeqCst);
+    Box::pin(async move { Ok(input) })
+}
+
+/// Counts single acks and batched acks, and checks that no activity of a read
+/// starts before that read is acked.
 #[derive(Debug, Default)]
 struct AckCountingDispatch {
     inner: MemoryDispatch,
     single: AtomicUsize,
     batches: AtomicUsize,
+    /// Activity leases acked so far.
+    activity_acked: AtomicUsize,
+    /// Batches that found an activity already running before its ack.
+    early_starts: AtomicUsize,
 }
 
 #[async_trait::async_trait]
@@ -1987,6 +2045,18 @@ impl TaskDispatch for AckCountingDispatch {
         leases: &[autumn_harvest::dispatch::DispatchLease],
     ) -> autumn_harvest::HarvestResult<()> {
         self.batches.fetch_add(1, Ordering::SeqCst);
+        // A worker that starts tasks before the ack would run them during this
+        // pause, and the start count would pass the acked count.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let started = AtomicUsize::load(&PROBE_ACTIVITY_STARTS, Ordering::SeqCst);
+        if started > AtomicUsize::load(&self.activity_acked, Ordering::SeqCst) {
+            self.early_starts.fetch_add(1, Ordering::SeqCst);
+        }
+        let activities = leases
+            .iter()
+            .filter(|lease| lease.kind == Some(autumn_harvest::dispatch::DispatchKind::Activity))
+            .count();
+        self.activity_acked.fetch_add(activities, Ordering::SeqCst);
         self.inner.ack_many(leases).await
     }
 
@@ -2007,7 +2077,7 @@ impl TaskDispatch for AckCountingDispatch {
 }
 
 /// The worker disposes of each read with one `ack_many`, never one `ack` per
-/// lease (issue #1429).
+/// lease, and starts no task of a read before that read is acked (issue #1429).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_worker_acks_each_read_in_one_batch() {
     let _serial = DISPATCH_SERIAL.lock().await;
@@ -2025,15 +2095,26 @@ async fn the_worker_acks_each_read_in_one_batch() {
     let pool = build_pool(&url);
     let worker = Arc::new(make_worker(
         vec![wf_info("dispatch_two_activities", two_activity_workflow)],
-        vec![act_info("echo", echo_activity, None)],
+        vec![act_info("echo", probe_echo_activity, None)],
         empty_shared_state(),
     ));
+    PROBE_ACTIVITY_STARTS.store(0, Ordering::SeqCst);
 
     let mut check = connect(&url).await;
     with_worker(worker, pool, async {
         wait_for_state(&mut check, exec_id, &["COMPLETED"], Duration::from_secs(30)).await;
     })
     .await;
+
+    assert_eq!(
+        AtomicUsize::load(&channel.early_starts, Ordering::SeqCst),
+        0,
+        "an activity started before the read that claimed it was acked"
+    );
+    assert!(
+        AtomicUsize::load(&PROBE_ACTIVITY_STARTS, Ordering::SeqCst) >= 2,
+        "both activities must run"
+    );
 
     assert_eq!(
         AtomicUsize::load(&channel.single, Ordering::SeqCst),
@@ -2051,11 +2132,12 @@ async fn the_worker_acks_each_read_in_one_batch() {
 // Reconcile sweep lease (issue #1429 item 10)
 // ---------------------------------------------------------------------------
 
-/// A channel whose reconcile leases a test grants or denies.
+/// A channel whose reconcile leases a test grants, denies or fails.
 #[derive(Debug, Default)]
 struct LeaseSwitchDispatch {
     inner: MemoryDispatch,
     grant: std::sync::atomic::AtomicBool,
+    fail_lease: std::sync::atomic::AtomicBool,
     releases: AtomicUsize,
 }
 
@@ -2105,14 +2187,17 @@ impl TaskDispatch for LeaseSwitchDispatch {
         queues: &[String],
         _consumer: &str,
         _ttl: Duration,
-    ) -> autumn_harvest::HarvestResult<Vec<bool>> {
-        Ok(vec![
-            std::sync::atomic::AtomicBool::load(
-                &self.grant,
-                Ordering::SeqCst
-            );
-            queues.len()
-        ])
+    ) -> autumn_harvest::HarvestResult<Vec<String>> {
+        if std::sync::atomic::AtomicBool::load(&self.fail_lease, Ordering::SeqCst) {
+            return Err(autumn_harvest::HarvestError::Dispatch(
+                "injected lease failure".to_string(),
+            ));
+        }
+        if std::sync::atomic::AtomicBool::load(&self.grant, Ordering::SeqCst) {
+            Ok(queues.to_vec())
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     async fn release_reconcile_leases(
@@ -2125,11 +2210,15 @@ impl TaskDispatch for LeaseSwitchDispatch {
     }
 }
 
+/// The queue the sweep-lease cases use, so no other suite's worker claims
+/// their rows.
+const LEASE_QUEUE: &str = "dispatch_lease_q";
+
 /// Start a workflow with no channel installed, so no reference names its row.
 async fn start_unpublished(url: &str) -> (ExecutionId, uuid::Uuid) {
     autumn_harvest::dispatch::uninstall();
     let mut conn = connect(url).await;
-    let exec_id = start(&mut conn, "dispatch_trivial").await;
+    let exec_id = start_on(&mut conn, "dispatch_trivial", LEASE_QUEUE).await;
     let task_id = workflow_task_id(&mut conn, exec_id).await;
     (exec_id, task_id)
 }
@@ -2150,7 +2239,8 @@ async fn a_worker_sweeps_only_the_queues_whose_lease_it_holds() {
     let _guard = InstalledGuard;
 
     let pool = build_pool(&url);
-    let worker = Arc::new(make_worker(
+    let worker = Arc::new(make_worker_with(
+        worker_config(LEASE_QUEUE, vec![ShardId::new(0)]),
         vec![wf_info("dispatch_trivial", trivial_workflow)],
         vec![],
         empty_shared_state(),
@@ -2191,7 +2281,8 @@ async fn a_failed_sweep_gives_its_reconcile_leases_back() {
     let _guard = InstalledGuard;
 
     let pool = build_pool(&url);
-    let worker = Arc::new(make_worker(
+    let worker = Arc::new(make_worker_with(
+        worker_config(LEASE_QUEUE, vec![ShardId::new(0)]),
         vec![wf_info("dispatch_trivial", trivial_workflow)],
         vec![],
         empty_shared_state(),
@@ -2208,4 +2299,37 @@ async fn a_failed_sweep_gives_its_reconcile_leases_back() {
         }
     })
     .await;
+}
+
+/// A lease call that fails does not stop the sweep. The durability floor
+/// fails open and sweeps every queue (issue #1429).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_lease_call_sweeps_every_queue() {
+    let _serial = DISPATCH_SERIAL.lock().await;
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let (exec_id, task_id) = start_unpublished(&url).await;
+
+    let channel = Arc::new(LeaseSwitchDispatch::default());
+    channel.fail_lease.store(true, Ordering::SeqCst);
+    autumn_harvest::dispatch::install(
+        Arc::clone(&channel) as Arc<dyn TaskDispatch>,
+        dispatch_settings(),
+    );
+    let _guard = InstalledGuard;
+
+    let pool = build_pool(&url);
+    let worker = Arc::new(make_worker_with(
+        worker_config(LEASE_QUEUE, vec![ShardId::new(0)]),
+        vec![wf_info("dispatch_trivial", trivial_workflow)],
+        vec![],
+        empty_shared_state(),
+    ));
+
+    let mut check = connect(&url).await;
+    with_worker(worker, pool, async {
+        wait_for_state(&mut check, exec_id, &["COMPLETED"], Duration::from_secs(30)).await;
+    })
+    .await;
+
+    assert!(channel.inner.published_ids().contains(&task_id));
 }

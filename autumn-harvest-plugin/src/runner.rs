@@ -1106,7 +1106,7 @@ impl HarvestRunner {
         if dispatch_installed {
             // An API-only process drops hints too, and it builds no worker to
             // set the recorder (issue #1429).
-            autumn_harvest::dispatch::set_metrics_recorder(Arc::clone(
+            autumn_harvest::dispatch::set_dropped_hint_recorder(Arc::clone(
                 &registry.telemetry().metrics,
             ));
         }
@@ -2201,8 +2201,9 @@ mod tests {
             "a caller that already ran the gate must be able to say so",
         );
     }
+
     /// Every `[harvest.redis]` tuning key reaches the worker settings
-    /// (issue #1429). Before this, `reconcile_batch` was fixed at its default.
+    /// (issue #1429).
     #[test]
     fn dispatch_settings_carry_every_redis_tuning_key() {
         let redis = crate::config::HarvestRedisConfig {

@@ -1429,7 +1429,7 @@
       "default_threshold": "Ticket when hints drop in every 5-minute window for 10 minutes. One short burst does not fire.",
       "severity": "ticket",
       "owner_persona": "platform on-call",
-      "description": "The Redis dispatch publisher cannot keep up. Its queue is full, so new hints are dropped. No work is lost: every task row stays PENDING in Postgres, and the reconcile sweep republishes it within one reconcile_interval_ms. The cost is dispatch latency. A sustained rate means Redis is slow or unreachable, or the enqueue rate outruns the channel.",
+      "description": "The Redis dispatch publisher cannot keep up. Its queue is full, so new hints are dropped. No work is lost: every task row stays PENDING in Postgres, and the reconcile sweep republishes it on a later sweep, usually the next one. A backlog deeper than reconcile_batch takes one reconcile_interval_ms per page. The cost is dispatch latency. A sustained rate means Redis is slow or unreachable, or the enqueue rate outruns the channel.",
       "first_action": "curl -s .../api/harvest/admin/config | jq '.redis'",
       "dependencies": [
         {
@@ -1455,7 +1455,7 @@
         ]
       },
       "management_checks": [
-        "GET /api/harvest/admin/config (redis section: installed, endpoint, key_prefix, consumer_group, poll_interval_ms, reconcile_interval_ms)",
+        "GET /api/harvest/admin/config (redis section: installed, endpoint, key_prefix, consumer_group, visibility_timeout_ms, poll_interval_ms, reconcile_interval_ms, reconcile_batch)",
         "redis-cli -u <endpoint> PING",
         "harvest worker health --output json"
       ],
@@ -1494,7 +1494,7 @@
         ]
       },
       "management_checks": [
-        "GET /api/harvest/admin/config (redis section: installed, endpoint, key_prefix, consumer_group, poll_interval_ms, reconcile_interval_ms)",
+        "GET /api/harvest/admin/config (redis section: installed, endpoint, key_prefix, consumer_group, visibility_timeout_ms, poll_interval_ms, reconcile_interval_ms, reconcile_batch)",
         "redis-cli -u <endpoint> PING",
         "harvest worker health --output json"
       ],

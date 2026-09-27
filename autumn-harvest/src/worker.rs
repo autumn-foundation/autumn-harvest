@@ -25987,10 +25987,10 @@ const DISPATCH_PARKED_ROW_RELEASES: u32 = 3;
 /// path a returned error takes.
 const DISPATCH_CALL_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Reconcile intervals a sweep lease lasts without a renewal (issue #1429).
+/// Renewal periods a sweep lease lasts without a renewal (issue #1429).
 ///
-/// The holder renews its lease at every sweep. A holder that stops leaves its
-/// queues unswept for at most this many intervals, then a peer takes over.
+/// The holder renews its lease at every sweep. A holder that dies leaves its
+/// queues unswept for at most this many periods, then a peer takes over.
 const RECONCILE_LEASE_INTERVALS: u32 = 3;
 
 /// Run one channel call under [`DISPATCH_CALL_TIMEOUT`].
@@ -26416,7 +26416,9 @@ impl Worker {
             }
 
             // The publisher counts dropped hints on this recorder (issue #1429).
-            crate::dispatch::set_metrics_recorder(Arc::clone(&registry.telemetry().metrics));
+            // The plugin runner sets it too. An embedder can install a channel
+            // with no runner, so the worker sets it as well.
+            crate::dispatch::set_dropped_hint_recorder(Arc::clone(&registry.telemetry().metrics));
         }
 
         let mut ineligible_activities = Vec::new();
@@ -28578,7 +28580,9 @@ impl Worker {
     ///
     /// Each worker reads only the queues whose sweep lease it holds
     /// (issue #1429). Every worker still emits the throttle metrics below.
-    /// A failed sweep gives its leases up, so a peer sweeps next.
+    /// A sweep that fails on Postgres gives its leases up, so a peer sweeps
+    /// next. A worker keeps its cursor when it loses a lease. A stale cursor
+    /// wraps on the next short page, so a hand-over never restarts the walk.
     ///
     /// Returns `false` when a channel call failed, so the caller can enter
     /// degraded mode. A database failure returns `true`: the database is not
@@ -28589,7 +28593,7 @@ impl Worker {
         installed: &crate::dispatch::InstalledDispatch,
         state: &mut DispatchLoopState,
     ) -> bool {
-        let leased = self.reconcile_lease_queues(installed, state).await;
+        let (leased, lease_held) = self.reconcile_lease_queues(installed, state).await;
         let mut conn = match acquire_shard_conn(
             pool,
             shard_acquire_bound(false, self.config.poll_interval),
@@ -28599,7 +28603,9 @@ impl Worker {
             Ok(conn) => conn,
             Err(error) => {
                 tracing::warn!(error = %error, "failed to get connection for the dispatch reconcile sweep");
-                self.release_reconcile_leases(installed, &leased).await;
+                if lease_held {
+                    self.release_reconcile_leases(installed, &leased).await;
+                }
                 return true;
             }
         };
@@ -28618,7 +28624,9 @@ impl Worker {
                 Err(error) => {
                     tracing::warn!(error = %error, queue = %queue, "dispatch reconcile read failed");
                     drop(conn);
-                    self.release_reconcile_leases(installed, &leased).await;
+                    if lease_held {
+                        self.release_reconcile_leases(installed, &leased).await;
+                    }
                     return true;
                 }
             };
@@ -28628,11 +28636,6 @@ impl Worker {
             ));
             hints.extend(page.hints);
         }
-        // A queue a peer sweeps drops its cursor. If the lease comes back, the
-        // walk starts again at the top.
-        state
-            .reconcile_cursors
-            .retain(|queue, _| leased.contains(queue));
         for (queue, cursor) in walked {
             match cursor {
                 Some(cursor) => state.reconcile_cursors.insert(queue, cursor),
@@ -28657,13 +28660,14 @@ impl Worker {
         if let Err(error) =
             dispatch_call(installed.channel.publish(&hints), "reconcile publish").await
         {
+            // No lease release here. Redis just failed, so a release would cost
+            // one more timeout before the fallback. The lease expires instead.
             self.enter_degraded(
                 state,
                 &error,
                 DispatchFallback::Publish,
                 &installed.settings,
             );
-            self.release_reconcile_leases(installed, &leased).await;
             return false;
         }
         // A publish success does not clear the degraded window either. The
@@ -28672,50 +28676,46 @@ impl Worker {
         true
     }
 
-    /// The queues this worker sweeps now (issue #1429).
+    /// The queues this worker sweeps now, and whether it holds their leases
+    /// (issue #1429).
     ///
     /// One worker holds each queue's sweep lease, so a fleet reads each queue
     /// once per interval, not once per worker. The sweep is the durability
     /// floor, so the lease fails open: a lease call that fails sweeps every
-    /// queue.
+    /// queue, and the flag is `false`.
+    ///
+    /// The worker renews the lease once per loop iteration. An idle iteration
+    /// blocks on the read for the poll interval, so the TTL covers the longer
+    /// of the two periods.
     async fn reconcile_lease_queues(
         &self,
         installed: &crate::dispatch::InstalledDispatch,
         state: &mut DispatchLoopState,
-    ) -> Vec<String> {
-        let queues = &self.config.queues;
-        let ttl = installed
-            .settings
+    ) -> (Vec<String>, bool) {
+        let settings = &installed.settings;
+        let ttl = settings
             .reconcile_interval
+            .max(settings.poll_interval)
             .saturating_mul(RECONCILE_LEASE_INTERVALS);
         let held = dispatch_call(
-            installed
-                .channel
-                .hold_reconcile_leases(queues, &self.config.worker_id, ttl),
+            installed.channel.hold_reconcile_leases(
+                &self.config.queues,
+                &self.config.worker_id,
+                ttl,
+            ),
             "reconcile lease",
         )
         .await;
         match held {
-            Ok(held) if held.len() == queues.len() => queues
-                .iter()
-                .zip(held)
-                .filter_map(|(queue, held)| held.then(|| queue.clone()))
-                .collect(),
-            Ok(_) => {
-                let error = HarvestError::Dispatch(
-                    "the reconcile lease reply does not match the queue count".to_string(),
-                );
-                self.log_dispatch_error(state, &error, "dispatch reconcile lease failed");
-                queues.clone()
-            }
+            Ok(held) => (held, true),
             Err(error) => {
                 self.log_dispatch_error(state, &error, "dispatch reconcile lease failed");
-                queues.clone()
+                (self.config.queues.clone(), false)
             }
         }
     }
 
-    /// Give up the sweep leases after a failed sweep, so a peer sweeps next.
+    /// Give up sweep leases, so a peer sweeps next.
     ///
     /// A failed release is harmless. The lease expires on its own.
     async fn release_reconcile_leases(
@@ -28897,6 +28897,13 @@ impl Worker {
             } else {
                 tokio::time::sleep(self.config.poll_interval).await;
             }
+        }
+
+        // A stopping worker gives its sweep leases back, so a peer sweeps
+        // without waiting for them to expire (issue #1429).
+        if dispatch_allowed && let Some(installed) = crate::dispatch::installed() {
+            self.release_reconcile_leases(&installed, &self.config.queues)
+                .await;
         }
     }
 
@@ -42168,6 +42175,7 @@ mod tests {
     #[cfg(feature = "testing")]
     #[test]
     fn the_sharded_runtime_rejection_reads_as_one_sentence() {
+        let _guard = crate::dispatch::TEST_INSTALL_LOCK.blocking_lock();
         let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
         let channel = Arc::new(crate::dispatch::MemoryDispatch::new());
         crate::dispatch::install(

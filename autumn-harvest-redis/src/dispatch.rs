@@ -819,12 +819,14 @@ impl RedisDispatch {
     }
 
     /// Take or renew the sweep lease of each queue in one round trip.
+    ///
+    /// Returns the queues whose lease `consumer` holds, in input order.
     async fn hold_leases_inner(
         &self,
         queues: &[String],
         consumer: &str,
         ttl: Duration,
-    ) -> RedisAdapterResult<Vec<bool>> {
+    ) -> RedisAdapterResult<Vec<String>> {
         if queues.is_empty() {
             return Ok(Vec::new());
         }
@@ -838,7 +840,12 @@ impl RedisDispatch {
         invocation.arg(consumer).arg(ttl_ms);
         let mut conn = self.conn.clone();
         let held: Vec<i64> = invocation.invoke_async(&mut conn).await?;
-        Ok(held.into_iter().map(|flag| flag == 1).collect())
+        Ok(queues
+            .iter()
+            .zip(held)
+            .filter(|(_, flag)| *flag == 1)
+            .map(|(queue, _)| queue.clone())
+            .collect())
     }
 
     /// Delete each sweep lease that `consumer` still holds.
@@ -866,54 +873,47 @@ impl RedisDispatch {
     /// Each step is one round trip for all queues (issue #1429). One pipeline
     /// reads every pending entries list. A second claims the idle entries of
     /// every queue that has one. The discard and the requeue follow as batches.
+    ///
+    /// A pipeline fails as a whole when one queue fails. The step then runs one
+    /// queue at a time, so one bad queue does not block the rest.
     async fn recover_queues(&self, queues: &[String]) -> RedisAdapterResult<usize> {
         if queues.is_empty() {
             return Ok(0);
         }
         self.ensure_groups(queues, false).await?;
         let keys: Vec<String> = queues.iter().map(|queue| self.stream_key(queue)).collect();
-        let mut conn = self.conn.clone();
 
-        let mut pending_pipe = redis::pipe();
-        for key in &keys {
-            pending_pipe.xpending_count(key, &self.config.consumer_group, "-", "+", RECOVER_BATCH);
-        }
-        let pending: Vec<StreamPendingCountReply> = pending_pipe.query_async(&mut conn).await?;
+        let pending = self.pending_replies(queues, &keys).await?;
 
         let visibility_ms = self.visibility_ms();
         let threshold = usize::try_from(visibility_ms).unwrap_or(usize::MAX);
-        let mut claim_pipe = redis::pipe();
-        let mut claimed_queues = Vec::new();
+        let mut to_claim: Vec<(&str, &str, Vec<String>)> = Vec::new();
         for ((queue, key), reply) in queues.iter().zip(&keys).zip(&pending) {
-            let idle: Vec<&str> = reply
+            let Some(reply) = reply else {
+                continue;
+            };
+            let idle: Vec<String> = reply
                 .ids
                 .iter()
                 .filter(|entry| entry.last_delivered_ms >= threshold)
-                .map(|entry| entry.id.as_str())
+                .map(|entry| entry.id.clone())
                 .collect();
-            if idle.is_empty() {
-                continue;
+            if !idle.is_empty() {
+                to_claim.push((queue.as_str(), key.as_str(), idle));
             }
-            // XCLAIM moves the entries to a sentinel consumer so their payloads
-            // can be read. `XREADGROUP >` never returns a pending entry, so the
-            // only way to make the work deliverable again is to re-add it.
-            claim_pipe.xclaim(
-                key,
-                &self.config.consumer_group,
-                RECOVERY_CONSUMER,
-                visibility_ms,
-                &idle,
-            );
-            claimed_queues.push((queue.as_str(), key.as_str()));
         }
-        if claimed_queues.is_empty() {
+        if to_claim.is_empty() {
             return Ok(0);
         }
-        let claimed: Vec<StreamClaimReply> = claim_pipe.query_async(&mut conn).await?;
+        let claimed = self.claim_replies(&to_claim, visibility_ms).await?;
+        let claimed_queues = to_claim.iter().map(|(queue, key, _)| (*queue, *key));
 
         let mut recovered = Vec::new();
         let mut malformed = Vec::new();
-        for ((queue_name, key), reply) in claimed_queues.into_iter().zip(claimed) {
+        for ((queue_name, key), reply) in claimed_queues.zip(claimed) {
+            let Some(reply) = reply else {
+                continue;
+            };
             for entry in reply.ids {
                 let Some(payload) = entry_payload(&entry.map) else {
                     tracing::warn!(
@@ -946,6 +946,110 @@ impl RedisDispatch {
         self.requeue_batch(&recovered, Utc::now()).await?;
         Ok(count)
     }
+
+    /// Read the pending entries list of every queue.
+    ///
+    /// Returns one reply per queue, `None` for a queue whose read failed. A
+    /// queue whose group is gone is healed for the next pass. An error comes
+    /// back only when every queue failed.
+    async fn pending_replies(
+        &self,
+        queues: &[String],
+        keys: &[String],
+    ) -> RedisAdapterResult<Vec<Option<StreamPendingCountReply>>> {
+        let group = &self.config.consumer_group;
+        let mut conn = self.conn.clone();
+        let mut pipe = redis::pipe();
+        for key in keys {
+            pipe.xpending_count(key, group, "-", "+", RECOVER_BATCH);
+        }
+        let batch: RedisAdapterResult<Vec<StreamPendingCountReply>> =
+            pipe.query_async(&mut conn).await.map_err(Into::into);
+        if let Ok(replies) = batch {
+            return Ok(replies.into_iter().map(Some).collect());
+        }
+
+        let mut replies = Vec::with_capacity(keys.len());
+        let mut last_error = None;
+        for (queue, key) in queues.iter().zip(keys) {
+            let reply: redis::RedisResult<StreamPendingCountReply> = conn
+                .xpending_count(key, group, "-", "+", RECOVER_BATCH)
+                .await;
+            match reply {
+                Ok(reply) => replies.push(Some(reply)),
+                Err(err) => {
+                    tracing::warn!(queue = %queue, error = %err, "recovery skipped a queue");
+                    if is_nogroup(&err) {
+                        let _ = self.ensure_group(queue, true).await;
+                    }
+                    last_error = Some(err);
+                    replies.push(None);
+                }
+            }
+        }
+        match last_error {
+            Some(err) if replies.iter().all(Option::is_none) => Err(err.into()),
+            _ => Ok(replies),
+        }
+    }
+
+    /// Claim the idle entries of each queue to the recovery consumer.
+    ///
+    /// XCLAIM moves the entries to a sentinel consumer so their payloads can
+    /// be read. `XREADGROUP >` never returns a pending entry, so the only way
+    /// to make the work deliverable again is to re-add it.
+    ///
+    /// Returns one reply per queue, `None` for a queue whose claim failed. An
+    /// error comes back only when every queue failed.
+    async fn claim_replies(
+        &self,
+        to_claim: &[(&str, &str, Vec<String>)],
+        visibility_ms: u64,
+    ) -> RedisAdapterResult<Vec<Option<StreamClaimReply>>> {
+        let group = &self.config.consumer_group;
+        let mut conn = self.conn.clone();
+        let mut pipe = redis::pipe();
+        for (_, key, idle) in to_claim {
+            pipe.xclaim(
+                *key,
+                group,
+                RECOVERY_CONSUMER,
+                visibility_ms,
+                idle.as_slice(),
+            );
+        }
+        let batch: RedisAdapterResult<Vec<StreamClaimReply>> =
+            pipe.query_async(&mut conn).await.map_err(Into::into);
+        if let Ok(replies) = batch {
+            return Ok(replies.into_iter().map(Some).collect());
+        }
+
+        let mut replies = Vec::with_capacity(to_claim.len());
+        let mut last_error = None;
+        for (queue, key, idle) in to_claim {
+            let reply: redis::RedisResult<StreamClaimReply> = conn
+                .xclaim(
+                    *key,
+                    group,
+                    RECOVERY_CONSUMER,
+                    visibility_ms,
+                    idle.as_slice(),
+                )
+                .await;
+            match reply {
+                Ok(reply) => replies.push(Some(reply)),
+                Err(err) => {
+                    tracing::warn!(queue = %queue, error = %err, "recovery skipped a queue");
+                    last_error = Some(err);
+                    replies.push(None);
+                }
+            }
+        }
+        match last_error {
+            Some(err) if replies.iter().all(Option::is_none) => Err(err.into()),
+            _ => Ok(replies),
+        }
+    }
 }
 
 #[async_trait]
@@ -976,7 +1080,7 @@ impl TaskDispatch for RedisDispatch {
         queues: &[String],
         consumer: &str,
         ttl: Duration,
-    ) -> HarvestResult<Vec<bool>> {
+    ) -> HarvestResult<Vec<String>> {
         harvest(self.hold_leases_inner(queues, consumer, ttl).await)
     }
 
@@ -1231,25 +1335,6 @@ end
 return written
 ";
 
-/// Lua script that gives delivered entries back to their stream.
-///
-/// Keys:
-/// - `KEYS[1]`: the queue's dispatch stream.
-/// - `KEYS[2]`: the queue's delayed sorted set.
-/// - `KEYS[3]`: the queue's delayed payload hash.
-/// - `KEYS[4..]`: one dedupe marker per entry, in entry order.
-///
-/// Arguments:
-/// - `ARGV[1]`: now, in unix milliseconds.
-/// - `ARGV[2]`: dedupe marker TTL, in seconds.
-/// - `ARGV[3]`: the consumer group name.
-/// - `ARGV[4n..]`: entry id, task id, delivery time in unix milliseconds, the
-///   row's due time in unix milliseconds, and payload, per entry.
-///
-/// The old entry is acked and deleted, so the pending entries list never holds
-/// a reference the worker gave back. The marker then names the new location, so
-/// a republish can verify it. See [`PUBLISH_LUA`] for why that matters. Returns
-/// the number of entries handled.
 /// Take or renew one reconcile sweep lease per key (issue #1429).
 ///
 /// KEYS are the lease keys. ARGV is the consumer, then the TTL in
@@ -1288,6 +1373,25 @@ end
 return released
 ";
 
+/// Lua script that gives delivered entries back to their stream.
+///
+/// Keys:
+/// - `KEYS[1]`: the queue's dispatch stream.
+/// - `KEYS[2]`: the queue's delayed sorted set.
+/// - `KEYS[3]`: the queue's delayed payload hash.
+/// - `KEYS[4..]`: one dedupe marker per entry, in entry order.
+///
+/// Arguments:
+/// - `ARGV[1]`: now, in unix milliseconds.
+/// - `ARGV[2]`: dedupe marker TTL, in seconds.
+/// - `ARGV[3]`: the consumer group name.
+/// - `ARGV[4n..]`: entry id, task id, delivery time in unix milliseconds, the
+///   row's due time in unix milliseconds, and payload, per entry.
+///
+/// The old entry is acked and deleted, so the pending entries list never holds
+/// a reference the worker gave back. The marker then names the new location, so
+/// a republish can verify it. See [`PUBLISH_LUA`] for why that matters. Returns
+/// the number of entries handled.
 const REQUEUE_LUA: &str = r"
 local stream = KEYS[1]
 local delayed = KEYS[2]
@@ -1409,6 +1513,12 @@ mod tests {
     #[test]
     fn promote_script_compiles() {
         let _ = Script::new(PROMOTE_MARKED_LUA);
+    }
+
+    #[test]
+    fn lease_scripts_compile() {
+        let _ = Script::new(HOLD_LEASE_LUA);
+        let _ = Script::new(RELEASE_LEASE_LUA);
     }
 
     #[test]
