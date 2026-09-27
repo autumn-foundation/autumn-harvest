@@ -7054,9 +7054,9 @@ pub const fn management_api_request_fields()
             ]),
         ),
         ("POST", "/admin/schedules/{id}/pause", Some(&["reason"])),
-        // Resume accepts an optional body for forward-compatibility but reason is not persisted
-        // (pause_reason is cleared on resume and AuditRecord has no free-text notes field).
-        ("POST", "/admin/schedules/{id}/resume", Some(&[])),
+        // Resume accepts `reason` for symmetry with pause, then ignores it. Resume clears
+        // pause_reason, and AuditRecord has no free-text notes field.
+        ("POST", "/admin/schedules/{id}/resume", Some(&["reason"])),
         (
             "POST",
             "/admin/schedules/{id}/backfill",

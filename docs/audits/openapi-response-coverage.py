@@ -566,6 +566,12 @@ def guards(block: str, position: int, variable: str) -> bool:
         opener = block.find("{", test.end())
         if opener < 0:
             continue
+        # The whole condition must hold for every empty body, or for none.
+        # `body.is_empty() && x` can skip the arm, and `!body.is_empty() || x`
+        # can take it with an empty body.
+        joined = block[test.end() : opener]
+        if ("||" if test.group(1) else "&&") in joined:
+            continue
         taken = balanced(block[opener:], "{", "}")
         taken_end = end = opener + len(taken)
         while re.match(r"\s*else\b", block[end:]):
@@ -660,7 +666,8 @@ def chain_state(after: str) -> str:
     The chain moves from a `Result` to an `Option` through `.ok()`, back
     through `.ok_or(..)` or `.ok_or_else(..)`, and to a plain value through an
     `.unwrap_or*` call. A `?`, `.unwrap()` or `.expect(..)` on a `Result` or an
-    `Option` stops the handler, so the chain is `"reject"`. A chain that ends
+    `Option` stops the handler, so the chain is `"reject"`. An inspection such
+    as `.is_ok()` also yields a plain value. A chain that ends
     on an `Option` or a value is `"tolerate"`. One that ends on a `Result` is
     `"open"`, since the code after it decides. Other methods carry the error
     on.
@@ -682,6 +689,8 @@ def chain_state(after: str) -> str:
         elif method in ("ok_or", "ok_or_else") and state == "option":
             state = "result"
         elif method in ("unwrap_or", "unwrap_or_default", "unwrap_or_else"):
+            state = "value"
+        elif method in ("is_ok", "is_err", "is_ok_and", "is_err_and", "is_some", "is_none"):
             state = "value"
         opener = call.end() - 1
         rest = rest[opener + len(balanced(rest[opener:])) :]
@@ -1507,6 +1516,9 @@ pub fn harvest_api_router() -> Router {
         .route("/e/nested-guard", post(e_nested_guard))
         .route("/e/ok-then-err", post(e_ok_then_err))
         .route("/e/wrapped-field", get(e_wrapped_field))
+        .route("/e/compound-guard", post(e_compound_guard))
+        .route("/e/either-guard", post(e_either_guard))
+        .route("/e/inspected", post(e_inspected))
 }
 
 async fn e_wrapped(body: Bytes) -> Response {
@@ -1963,6 +1975,27 @@ struct WrappedField {
     page: Option<
         u32,
     >,
+}
+
+async fn e_compound_guard(body: Bytes) -> Result<Response, Response> {
+    if body.is_empty() && allow_missing() {
+        return Ok(StatusCode::OK.into_response());
+    }
+    let gadget = serde_json::from_slice::<Gadget>(&body).map_err(reject)?;
+    Ok(StatusCode::OK.into_response())
+}
+
+async fn e_either_guard(body: Bytes) -> Result<Response, Response> {
+    if body.is_empty() || dry_run() {
+        return Ok(StatusCode::OK.into_response());
+    }
+    let gadget = serde_json::from_slice::<Gadget>(&body).map_err(reject)?;
+    Ok(StatusCode::OK.into_response())
+}
+
+async fn e_inspected(body: Bytes) -> Response {
+    let valid = serde_json::from_slice::<Gadget>(&body).is_ok();
+    StatusCode::OK.into_response()
 }
 
 async fn e_documented(Query(query): Query<Documented>) -> Response {
@@ -2970,6 +3003,32 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
         [
             fixture_route(
                 "GET", "/e/wrapped-field", 200, params=[query_param("page", "integer", False)]
+            )
+        ],
+        {},
+    ),
+    (
+        "an empty-body test joined by && is no guard, one joined by || is",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/compound-guard",
+                200,
+                request_body=body_of(("name", True), required=False),
+            ),
+            fixture_route(
+                "POST", "/e/either-guard", 200, request_body=body_of(("name", True), required=False)
+            ),
+        ],
+        {"body_required": ["POST /e/compound-guard: the body is mandatory"]},
+    ),
+    (
+        "a parse inspected with is_ok is tolerant",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST", "/e/inspected", 200, request_body=body_of(("name", False), required=False)
             )
         ],
         {},
