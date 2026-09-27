@@ -309,6 +309,11 @@ def documented_as(spellings: tuple[str, ...], documented) -> str | None:
     return next((name for name in spellings if name in documented), None)
 
 
+def without_comment_lines(text: str) -> str:
+    """The text without its comment lines, so a doc comment is not code."""
+    return "\n".join(line for line in text.split("\n") if not line.strip().startswith("//"))
+
+
 def unreadable_serde(struct: str) -> list[str]:
     """Serde attributes in a struct that change wire names in ways not read.
 
@@ -316,7 +321,7 @@ def unreadable_serde(struct: str) -> list[str]:
     guessed at. A plain `rename = ".."` and `alias = ".."` are read.
     """
     found: set[str] = set()
-    for attribute in re.findall(r"#\[serde\(([^\]]*)\)\]", struct):
+    for attribute in re.findall(r"#\[serde\(([^\]]*)\)\]", without_comment_lines(struct)):
         found |= set(re.findall(r"\b(rename_all|flatten)\b", attribute))
         if re.search(r"\brename\s*\(", attribute):
             found.add("rename(..)")
@@ -382,8 +387,11 @@ BYTE_PARAMETER = re.compile(
 # A `from_slice` call: its turbofish, if any, then its argument list.
 FROM_SLICE = re.compile(r"\bfrom_slice\s*(?:::<|\()")
 
-# A token that marks a block as an error path.
-ERROR_TOKENS = r"AutumnError::|StatusCode::|\bErr\("
+# A token that marks a block as an error path: an `AutumnError`, an `Err(..)`,
+# or a `StatusCode::` name for a 4xx or 5xx status. A 2xx status is no error.
+ERROR_TOKENS = r"AutumnError::|\bErr\(|StatusCode::(?:%s)\b" % "|".join(
+    sorted(name for name, status in NAMED.items() if status >= 400)
+)
 
 # A `Json` extractor, bare or with a path such as `axum::Json`.
 JSON = r"(?:[a-z_]+::)*Json"
@@ -545,7 +553,8 @@ def rejects_result_body(params: str, block: str) -> bool:
     """Whether a `Result<Json<T>, _>` body is mandatory, since its error rejects.
 
     The body is mandatory when the handler applies `?` or `.map_err(..)` to it,
-    or when the `Err` arm of a `match` on it builds an error. An `Err` arm that
+    when the `Err` arm of a `match` on it builds an error, or when the `else`
+    of a `let Ok(..) = body else` builds an error or returns. An `Err` arm that
     hands the request on, for example to replay a committed key, leaves it
     optional.
     """
@@ -559,6 +568,10 @@ def rejects_result_body(params: str, block: str) -> bool:
         arms = balanced(block[match.end() - 1 :], "{", "}")
         failure = re.search(r"\bErr\s*\(", arms)
         if failure and re.search(ERROR_TOKENS, match_arm(arms, failure.start())):
+            return True
+    for binding in re.finditer(r"\blet\s+Ok\s*\(.*?\)\s*=\s*%s\s+else\s*\{" % variable, block):
+        otherwise = balanced(block[binding.end() - 1 :], "{", "}")
+        if re.search(r"\breturn\b|" + ERROR_TOKENS, otherwise):
             return True
     return False
 
@@ -656,7 +669,8 @@ def struct_fields(struct: str) -> list[tuple[str, str, bool, tuple[str, ...]]]:
     optional.
     """
     opener = struct.index("{")
-    all_default = re.search(r"serde\([^)]*\bdefault\b", struct[:opener]) is not None
+    container = without_comment_lines(struct[:opener])
+    all_default = re.search(r"serde\([^)]*\bdefault\b", container) is not None
     fields: list[tuple[str, str, bool, tuple[str, ...]]] = []
     attributes: list[str] = []
     # An attribute that rustfmt splits over several lines stays open until its
@@ -1308,6 +1322,9 @@ pub fn harvest_api_router() -> Router {
         .route("/e/shadowed", post(e_shadowed))
         .route("/e/empty-fields", post(e_empty_fields))
         .route("/e/err-first", post(e_err_first))
+        .route("/e/let-else", post(e_let_else))
+        .route("/e/err-succeeds", post(e_err_succeeds))
+        .route("/e/documented", get(e_documented))
 }
 
 async fn e_wrapped(body: Bytes) -> Response {
@@ -1594,6 +1611,30 @@ async fn e_err_first(body: Result<Json<Gadget>, JsonRejection>) -> Response {
         }
     };
     StatusCode::OK.into_response()
+}
+
+async fn e_let_else(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    let Ok(Json(gadget)) = body else {
+        return AutumnError::bad_request_msg("a body is required").into_response();
+    };
+    StatusCode::OK.into_response()
+}
+
+async fn e_err_succeeds(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    let gadget = match body {
+        Ok(Json(gadget)) => gadget,
+        Err(_) => return StatusCode::NO_CONTENT.into_response(),
+    };
+    StatusCode::OK.into_response()
+}
+
+async fn e_documented(Query(query): Query<Documented>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+/// Other types use `#[serde(default)]` and `#[serde(flatten)]`. This one does not.
+struct Documented {
+    kind: String,
 }
 
 async fn e_wrapped_attribute(Query(query): Query<WrappedAttribute>) -> Response {
@@ -2328,6 +2369,43 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             )
         ],
         {},
+    ),
+    (
+        "a let-else that rejects a Result<Json<T>> body makes it mandatory",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/let-else",
+                200,
+                request_body=body_of(("name", False), required=False),
+                error_responses=[{"status": 400}],
+            )
+        ],
+        {
+            "body_required": ["POST /e/let-else: the body is mandatory"],
+            "mandatory": ["POST /e/let-else: `name` is mandatory in Gadget"],
+        },
+    ),
+    (
+        "an Err arm that returns a success status does not reject",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/err-succeeds",
+                200,
+                request_body=body_of(("name", False), required=False),
+                additional_responses=[{"status": 204}],
+            )
+        ],
+        {},
+    ),
+    (
+        "a doc comment that names a serde attribute is not one",
+        FIXTURE_EDGES,
+        [fixture_route("GET", "/e/documented", 200, params=[query_param("kind", "string", False)])],
+        {"query_params": ["GET /e/documented: `kind` is mandatory in Documented"]},
     ),
     (
         "a malformed contract entry does not crash the audit",
