@@ -53,6 +53,7 @@ use autumn_harvest::shard_rebalance::{
     resolve_execution_shard_holding, resume_incomplete_migrations, set_legal_hold_forwarded,
     stage_copy, verify_target_copy,
 };
+use autumn_harvest::stall_diagnosis;
 use autumn_harvest::store;
 use autumn_harvest::types::{ExecutionId, ShardId};
 
@@ -396,6 +397,27 @@ async fn deliver_signal(
 struct ScalarText {
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     value: Option<String>,
+}
+
+/// A `harvest_shard_migrations.staged_task` read, for issue #1402's
+/// coverage of `activate_target`'s re-pend.
+#[derive(diesel::QueryableByName)]
+struct StagedPayload {
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Jsonb>)]
+    staged_task: Option<serde_json::Value>,
+}
+
+/// A `harvest_task_queue` timer-provenance read, for issue #1402's
+/// coverage of `activate_target`'s re-pend.
+#[derive(Debug, diesel::QueryableByName)]
+#[allow(clippy::struct_field_names)] // all three genuinely are timestamps
+struct TaskProvenance {
+    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+    scheduled_at: chrono::DateTime<Utc>,
+    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+    created_at: chrono::DateTime<Utc>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
+    timer_fires_at: Option<chrono::DateTime<Utc>>,
 }
 
 #[derive(diesel::QueryableByName)]
@@ -1242,6 +1264,144 @@ async fn a_signal_arriving_after_cutover_is_retried_then_delivered_to_the_target
         0
     );
     assert_eq!(authoritative_shards(&shards, exec_id).await, vec![TARGET]);
+}
+
+/// Issue #1402 (the original ask, and the false-positive risk the
+/// `activate_target` re-pend's `created_at` fix closes). A workflow task
+/// row can be genuinely timer-owned before migration:
+/// `scheduled_at = timer_fires_at = fires_at`, exactly what
+/// `queue::reschedule_task` produces. `activate_target` re-pends that
+/// row for an unrelated reason: a signal is already waiting at
+/// activation time. The unfired timer is still there, now unrelated.
+/// `activate_target` must refresh `created_at` and clear
+/// `timer_fires_at` in the same statement. Otherwise `stall_diagnosis`
+/// could misattribute the signal wake to that stale timer and report a
+/// false `timer_overdue`.
+#[tokio::test]
+async fn activation_repend_does_not_misattribute_a_stale_timer_to_the_new_signal_wake() {
+    let shards = setup_two_shards().await;
+    // The standard timer-parked, replay-consistent fixture: a real
+    // `TimerStarted` event plus the matching `harvest_timers`/
+    // `harvest_task_queue` rows `park_on_timer` inserts, 7 days out.
+    // Quiescence refuses to migrate a `PENDING` row already due
+    // (`scheduled_at <= NOW()`). So cutover needs it in the future right
+    // up to the moment it is staged.
+    let exec_id = quiescent_fixture(&shards, "repend-timer-safety").await;
+
+    let mut source = shards.source().await;
+    begin_migration(&mut source, exec_id, SOURCE, TARGET)
+        .await
+        .expect("begin");
+    let mut target = shards.target().await;
+    stage_copy(&mut source, &mut target, exec_id, TARGET)
+        .await
+        .expect("stage");
+    verify_target_copy(&mut source, &mut target, exec_id, &codecs())
+        .await
+        .expect("verify");
+
+    // Now simulate time passing between staging and activation. The
+    // timer was 7 days out at staging time, satisfying quiescence. It
+    // has since become overdue -- exactly `queue::reschedule_task`'s
+    // shape: `scheduled_at = timer_fires_at = fires_at`, `created_at`
+    // older than all three. `stage_copy` already copied `harvest_timers`
+    // onto the target; rewrite it there. The workflow task row itself is
+    // not live on the target yet. `activate_target` restores it from the
+    // `staged_task` JSONB captured on the source at stage time, so that
+    // payload is rewritten instead. Neither touches the event history
+    // verification already checked byte-for-byte.
+    let fires_at = Utc::now() - Duration::hours(2);
+    diesel::sql_query("UPDATE harvest_timers SET fires_at = $1 WHERE workflow_exec_id = $2")
+        .bind::<diesel::sql_types::Timestamptz, _>(fires_at)
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut target)
+        .await
+        .expect("backdate the timer copied onto the target");
+
+    let staged: StagedPayload = diesel::sql_query(
+        "SELECT staged_task FROM harvest_shard_migrations WHERE execution_id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .get_result(&mut source)
+    .await
+    .expect("load the staged task payload");
+    let mut payload = staged
+        .staged_task
+        .expect("a timer-parked execution stages a workflow task row");
+    payload["scheduled_at"] = json!(fires_at);
+    payload["created_at"] = json!(fires_at - Duration::hours(1));
+    payload["timer_fires_at"] = json!(fires_at);
+    diesel::sql_query(
+        "UPDATE harvest_shard_migrations SET staged_task = $1 WHERE execution_id = $2",
+    )
+    .bind::<diesel::sql_types::Jsonb, _>(&payload)
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut source)
+    .await
+    .expect("rewrite the staged task payload");
+
+    // A signal already waiting on the target at activation time -- the
+    // shape `activate_target`'s re-pend branch targets, whichever path
+    // put it there.
+    deliver_signal(&mut target, exec_id, "poke", None).await;
+
+    assert!(
+        commit_cutover(&mut source, exec_id, TARGET)
+            .await
+            .expect("cutover"),
+        "the source's own live task row is untouched and still due in 7 \
+         days, so cutover's quiescence re-check must still pass"
+    );
+    activate_target(&mut source, &mut target, exec_id)
+        .await
+        .expect("activate");
+
+    let mut target2 = shards.target().await;
+    let row: TaskProvenance = diesel::sql_query(
+        "SELECT scheduled_at, created_at, timer_fires_at FROM harvest_task_queue \
+          WHERE workflow_exec_id = $1 AND task_type = 'workflow'",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .get_result(&mut target2)
+    .await
+    .expect("load the repended task row");
+
+    assert!(
+        row.timer_fires_at.is_none(),
+        "the signal wake must clear the stale timer marker: {row:?}",
+    );
+    assert!(
+        (row.created_at - row.scheduled_at).num_seconds().abs() < 2,
+        "created_at must be refreshed alongside scheduled_at (issue #1191 \
+         fingerprint), so a later saturated-dispatch delay cannot be \
+         misread as this stale timer's own wake: {row:?}",
+    );
+
+    // And stall_diagnosis, fed these exact facts, must not misattribute
+    // the signal wake to the stale, unfired timer.
+    let facts = stall_diagnosis::WorkflowTaskFacts {
+        state: "PENDING".to_string(),
+        has_worker: false,
+        queue_name: "default".to_string(),
+        scheduled_at: row.scheduled_at,
+        queue_paused: false,
+        has_live_worker: true,
+        claimant_is_live: None,
+        created_at: Some(row.created_at),
+        timer_fires_at: row.timer_fires_at,
+    };
+    let inputs = stall_diagnosis::DiagnosisInputs {
+        timers: vec![stall_diagnosis::PendingTimerFacts { fires_at }],
+        workflow_task: Some(facts),
+        ..Default::default()
+    };
+    let verdict = stall_diagnosis::classify_execution(&inputs, Utc::now())
+        .expect("non-terminal execution must yield a verdict");
+    assert_ne!(
+        verdict.kind(),
+        "timer_overdue",
+        "the stale timer must not be attributed to this signal-driven repend: {verdict:?}"
+    );
 }
 
 #[tokio::test]

@@ -193,6 +193,30 @@ the target database:
   applied; repeat `--database-url` once per shard. See
   [`sharding.md`](../sharding.md).
 
+## TLS for LISTEN/NOTIFY connections
+
+Workers and result waits open their own LISTEN connection. The URL comes from
+`with_notification_database_url` or `with_shard_notification_database_urls`.
+The `sslmode` in that URL sets the transport:
+
+| `sslmode` | Transport |
+|---|---|
+| `disable`, `prefer`, or not set | Plaintext, as before. `prefer` never encrypts listener traffic. |
+| `require` | TLS. The chain and the hostname are verified. |
+
+- The trust store is the platform store. To trust a private CA, such as the
+  RDS CA, set `SSL_CERT_FILE` or `SSL_CERT_DIR`. These variables replace the
+  platform store.
+- TLS needs the `tls` feature. It is on by default. Without it, a `require`
+  URL gets a configuration error.
+- A listener URL with `verify-ca` or `verify-full` does not parse yet. Use
+  `require`. It already verifies the chain and the hostname.
+- A result wait (`result_raw`, `result_raw_with_timeout`,
+  `result_snapshot_with_wait`) does not fail when the listener cannot connect
+  within 5 s. It logs a warning and polls every 500 ms. After 30 s it tries
+  the listener again. A configuration error is still returned. Examples are a
+  URL that does not parse, or a `require` URL without the `tls` feature.
+
 ## Dashboard
 
 `http://localhost:3000/api/harvest/ui` shows live executions, event histories,

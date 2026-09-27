@@ -1455,9 +1455,13 @@ pub async fn load_history_since_inflated(
 
 /// Load raw `harvest_events` rows for `exec_id` with `id > after_row_id`.
 ///
-/// Returns rows ordered by `id ASC`. The `id` column is the `BIGSERIAL` primary
-/// key and serves as the SSE resume cursor (`Last-Event-ID`). Pass `-1` for
-/// `after_row_id` to load all events.
+/// Returns rows ordered by `id ASC`. The `id` column is the shard-local
+/// `BIGSERIAL` primary key. An SSE stream may resume across a shard
+/// migration. Its caller must first translate the wire cursor (`event_id`)
+/// to this connection's own `id`, via [`row_id_for_event_id`] (issue
+/// #1405). `id` itself is never a safe cursor to hand a client, since a
+/// migration does not copy it. Pass `-1` for `after_row_id` to load all
+/// events.
 ///
 /// # Errors
 ///

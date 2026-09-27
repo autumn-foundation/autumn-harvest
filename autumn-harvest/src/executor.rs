@@ -23,7 +23,7 @@ use crate::telemetry::{
     ATTR_EXECUTION_ID, ATTR_QUEUE, ATTR_REPLAY, ATTR_SHARD_ID, ATTR_WORKFLOW_ID, MetricsRecorder,
     NoOpMetrics,
 };
-use crate::types::ExecutionId;
+use crate::types::{ExecutionId, ShardId};
 
 /// The outcome of running a workflow function through the executor.
 #[derive(Debug)]
@@ -1721,6 +1721,15 @@ pub async fn run_workflow_with_state_advancing_clock(
     // pause/resume/redrive-shifted `deadline_at`) so `ctx.deadline()` matches
     // the timeout scanner rather than a stale start+timeout recompute.
     .with_deadline(span_meta.and_then(|m| m.deadline_at))
+    // Issue #1405: thread the row's current shard. A `ParentShard` child
+    // then places on where this run actually lives, not the origin bits
+    // `exec_id` encodes. Lets a WorkflowTestEnv run exercise a rebalanced
+    // parent.
+    .with_current_shard_id(
+        span_meta
+            .and_then(|m| i32::try_from(m.shard_id).ok())
+            .map(ShardId::new),
+    )
     // Issue #698: thread the spawning parent's execution id so a child workflow
     // can read it via `ctx.info()` / `ctx.parent_execution_id()`.
     .with_parent_execution_id(span_meta.and_then(|m| m.parent_execution_id))
@@ -1829,6 +1838,15 @@ pub async fn run_workflow_with_state_history_policy_and_caps(
     // pause/resume/redrive-shifted `deadline_at`) so `ctx.deadline()` matches
     // the timeout scanner rather than a stale start+timeout recompute.
     .with_deadline(span_meta.and_then(|m| m.deadline_at))
+    // Issue #1405: thread the row's current shard (`span_meta.shard_id` is
+    // read live from the execution row, see worker.rs). A `ParentShard`
+    // child then places where this run actually lives, not the origin bits
+    // `exec_id` encodes.
+    .with_current_shard_id(
+        span_meta
+            .and_then(|m| i32::try_from(m.shard_id).ok())
+            .map(ShardId::new),
+    )
     // Issue #698: thread the spawning parent's execution id so a child workflow
     // can read it via `ctx.info()` / `ctx.parent_execution_id()`.
     .with_parent_execution_id(span_meta.and_then(|m| m.parent_execution_id))

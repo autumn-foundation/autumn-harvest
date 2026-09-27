@@ -284,15 +284,13 @@ pub async fn release_claim_if_queue_paused(
     task_id: uuid::Uuid,
     worker_id: &str,
 ) -> HarvestResult<bool> {
-    use diesel_async::RunQueryDsl;
-
-    let released = diesel::sql_query(release_claim_if_queue_paused_query())
-        .bind::<diesel::sql_types::Uuid, _>(task_id)
-        .bind::<diesel::sql_types::Text, _>(worker_id)
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error)?;
-    Ok(released > 0)
+    crate::queue::release_claim_via(
+        conn,
+        release_claim_if_queue_paused_query(),
+        task_id,
+        worker_id,
+    )
+    .await
 }
 
 /// The shared prefix of both claim-release statements.
@@ -353,15 +351,7 @@ pub async fn release_claim(
     task_id: uuid::Uuid,
     worker_id: &str,
 ) -> HarvestResult<bool> {
-    use diesel_async::RunQueryDsl;
-
-    let released = diesel::sql_query(release_claim_query())
-        .bind::<diesel::sql_types::Uuid, _>(task_id)
-        .bind::<diesel::sql_types::Text, _>(worker_id)
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error)?;
-    Ok(released > 0)
+    crate::queue::release_claim_via(conn, release_claim_query(), task_id, worker_id).await
 }
 
 /// SQL for [`try_lock_queue_for_claim`], exposed for shape tests.

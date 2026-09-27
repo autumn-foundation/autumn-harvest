@@ -286,6 +286,197 @@ pub async fn notify_workflow_progress(
 }
 
 // ---------------------------------------------------------------------------
+// Listener connections (TLS: issue #1717)
+// ---------------------------------------------------------------------------
+
+/// The transport a listener connection uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListenTransport {
+    /// Plaintext, through `NoTls`.
+    Plain,
+    /// TLS, with a verified certificate chain and hostname.
+    Tls,
+}
+
+/// Select the listener transport from the DSN's own `sslmode`.
+///
+/// Only `require` selects TLS, because `NoTls` cannot satisfy it. `disable`,
+/// `prefer` and an absent `sslmode` stay plaintext. That is the behavior before
+/// issue #1717, and it matches a pool built with `NoTls`. Thus a server with a
+/// self-signed certificate does not break a `prefer` DSN.
+fn listen_transport(config: &tokio_postgres::Config) -> ListenTransport {
+    match config.get_ssl_mode() {
+        tokio_postgres::config::SslMode::Require => ListenTransport::Tls,
+        _ => ListenTransport::Plain,
+    }
+}
+
+/// Render an error and each error in its `source()` chain.
+///
+/// `tokio_postgres` shows a TLS failure as "error performing TLS handshake".
+/// The real cause is only in `source()`. A cause that the text already
+/// contains is not added again.
+fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        if !out.contains(&text) {
+            out.push_str(": ");
+            out.push_str(&text);
+        }
+        source = cause.source();
+    }
+    out
+}
+
+/// The error for a listener connection that failed to open.
+fn connect_error(error: &tokio_postgres::Error) -> HarvestError {
+    HarvestError::Database(format!("pg connect failed: {}", error_chain(error)))
+}
+
+/// An open LISTEN connection.
+struct ListenConnection {
+    /// Client handle. The connection closes when it drops.
+    client: tokio_postgres::Client,
+    /// Notifications that the driver task forwards.
+    rx: tokio::sync::mpsc::Receiver<tokio_postgres::Notification>,
+    /// The task that drives the connection.
+    driver: tokio::task::JoinHandle<()>,
+}
+
+/// Open a LISTEN connection with the transport that the DSN asks for.
+///
+/// `error_message` is the log message for a connection error after the open.
+async fn open_listen_connection(
+    database_url: &str,
+    error_message: &'static str,
+) -> HarvestResult<ListenConnection> {
+    // A DSN that does not parse is a permanent misconfiguration, not an outage.
+    // A result wait returns a `Config` error and does not poll over it.
+    let config: tokio_postgres::Config = database_url.parse().map_err(|e| {
+        HarvestError::Config(format!(
+            "invalid notification database URL: {}",
+            error_chain(&e)
+        ))
+    })?;
+    match listen_transport(&config) {
+        ListenTransport::Plain => {
+            let (client, connection) = config
+                .connect(tokio_postgres::NoTls)
+                .await
+                .map_err(|e| connect_error(&e))?;
+            Ok(spawn_listen_driver(client, connection, error_message))
+        }
+        ListenTransport::Tls => open_tls_listen_connection(&config, error_message).await,
+    }
+}
+
+/// Open a verified TLS LISTEN connection.
+#[cfg(feature = "tls")]
+async fn open_tls_listen_connection(
+    config: &tokio_postgres::Config,
+    error_message: &'static str,
+) -> HarvestResult<ListenConnection> {
+    let tls = tokio_postgres_rustls::MakeRustlsConnect::new(tls_client_config()?);
+    let (client, connection) = config.connect(tls).await.map_err(|e| connect_error(&e))?;
+    Ok(spawn_listen_driver(client, connection, error_message))
+}
+
+/// Refuse `sslmode=require` when the crate has no TLS support.
+#[cfg(not(feature = "tls"))]
+#[allow(clippy::unused_async, reason = "the signature matches the `tls` build")]
+async fn open_tls_listen_connection(
+    _config: &tokio_postgres::Config,
+    _error_message: &'static str,
+) -> HarvestResult<ListenConnection> {
+    Err(HarvestError::Config(
+        "sslmode=require needs the `tls` feature of autumn-harvest".to_string(),
+    ))
+}
+
+/// The rustls configuration for listener connections.
+///
+/// The trust store is read once per process. A failed read is not cached, so
+/// a later connection tries again.
+#[cfg(feature = "tls")]
+fn tls_client_config() -> HarvestResult<rustls::ClientConfig> {
+    static CONFIG: std::sync::OnceLock<rustls::ClientConfig> = std::sync::OnceLock::new();
+    if let Some(config) = CONFIG.get() {
+        return Ok(config.clone());
+    }
+    let built = build_tls_client_config()?;
+    Ok(CONFIG.get_or_init(|| built).clone())
+}
+
+/// Build a rustls configuration that trusts the platform trust store.
+///
+/// The chain and the hostname are always verified, as in `harvest migrate`
+/// (issue #1240). `SSL_CERT_FILE` or `SSL_CERT_DIR` can point at a private CA.
+/// The `ring` provider is explicit, because `ClientConfig::builder()` panics
+/// when no process-wide provider is installed.
+#[cfg(feature = "tls")]
+fn build_tls_client_config() -> HarvestResult<rustls::ClientConfig> {
+    let native = rustls_native_certs::load_native_certs();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add_parsable_certificates(native.certs);
+    if roots.is_empty() {
+        return Err(HarvestError::Config(format!(
+            "sslmode=require: the platform trust store has no usable certificates. \
+             Install the ca-certificates package, or set SSL_CERT_FILE. \
+             Loader errors: {:?}",
+            native.errors
+        )));
+    }
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| HarvestError::Config(format!("rustls configuration failed: {e}")))?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(config)
+}
+
+/// Spawn the task that drives a LISTEN connection.
+///
+/// The task calls `poll_message()` to get each notification. The default
+/// `Future` implementation of the connection discards them.
+fn spawn_listen_driver<S, T>(
+    client: tokio_postgres::Client,
+    mut connection: tokio_postgres::Connection<S, T>,
+    error_message: &'static str,
+) -> ListenConnection
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (tx, rx) = tokio::sync::mpsc::channel(128);
+    let driver = tokio::spawn(async move {
+        use futures::future::poll_fn;
+
+        loop {
+            match poll_fn(|cx| connection.poll_message(cx)).await {
+                Some(Ok(tokio_postgres::AsyncMessage::Notification(n))) => {
+                    // A send error means the listener dropped. Shut down.
+                    if tx.send(n).await.is_err() {
+                        break;
+                    }
+                }
+                // Notices and other async messages are ignored.
+                Some(Ok(_)) => {}
+                Some(Err(e)) => {
+                    tracing::error!(error = %error_chain(&e), "{error_message}");
+                    break;
+                }
+                // The connection closed cleanly.
+                None => break,
+            }
+        }
+    });
+    ListenConnection { client, rx, driver }
+}
+
+// ---------------------------------------------------------------------------
 // QueueListener (using tokio-postgres)
 // ---------------------------------------------------------------------------
 
@@ -313,46 +504,17 @@ impl QueueListener {
     /// [`Notification`]s through an internal channel. The connection stays
     /// alive as long as this `QueueListener` is held.
     ///
+    /// `sslmode=require` in `database_url` selects verified TLS. Other modes
+    /// connect in plaintext (issue #1717).
+    ///
     /// # Errors
     ///
     /// Returns [`HarvestError::Database`] if the connection or LISTEN fails.
+    /// Returns [`HarvestError::Config`] if the URL does not parse, or if TLS
+    /// cannot be configured.
     pub async fn connect(database_url: &str, queues: &[String]) -> HarvestResult<Self> {
-        let (client, mut connection) = tokio_postgres::connect(database_url, tokio_postgres::NoTls)
-            .await
-            .map_err(|e| HarvestError::Database(format!("pg connect failed: {e}")))?;
-
-        // Channel for forwarding notifications from the connection driver.
-        let (tx, rx) = tokio::sync::mpsc::channel(128);
-
-        // Spawn a task that drives the connection via poll_message() so we can
-        // intercept Notification async messages instead of discarding them (which
-        // is what the default Future impl does).
-        let handle = tokio::spawn(async move {
-            use futures::future::poll_fn;
-
-            loop {
-                let msg = poll_fn(|cx| connection.poll_message(cx)).await;
-                match msg {
-                    Some(Ok(tokio_postgres::AsyncMessage::Notification(n))) => {
-                        if tx.send(n).await.is_err() {
-                            // Receiver dropped -- listener was dropped, shut down.
-                            break;
-                        }
-                    }
-                    Some(Ok(_)) => {
-                        // Notices and other async messages -- ignore.
-                    }
-                    Some(Err(e)) => {
-                        tracing::error!(error = %e, "postgres listener connection error");
-                        break;
-                    }
-                    None => {
-                        // Connection closed cleanly.
-                        break;
-                    }
-                }
-            }
-        });
+        let ListenConnection { client, rx, driver } =
+            open_listen_connection(database_url, "postgres listener connection error").await?;
 
         // Subscribe to all queue channels.
         for queue in queues {
@@ -362,14 +524,17 @@ impl QueueListener {
                 .batch_execute(&format!("LISTEN {quoted_channel}"))
                 .await
                 .map_err(|e| {
-                    HarvestError::Database(format!("LISTEN {quoted_channel} failed: {e}"))
+                    HarvestError::Database(format!(
+                        "LISTEN {quoted_channel} failed: {}",
+                        error_chain(&e)
+                    ))
                 })?;
         }
 
         Ok(Self {
             _client: client,
             rx,
-            _connection_handle: handle,
+            _connection_handle: driver,
             queues: queues.to_vec(),
         })
     }
@@ -433,46 +598,30 @@ pub struct WorkflowEventListener {
 impl WorkflowEventListener {
     /// Connect to Postgres and subscribe to the `harvest_events` channel.
     ///
+    /// `sslmode=require` in `database_url` selects verified TLS. Other modes
+    /// connect in plaintext (issue #1717).
+    ///
     /// # Errors
     ///
     /// Returns [`HarvestError::Database`] if the connection or LISTEN fails.
+    /// Returns [`HarvestError::Config`] if the URL does not parse, or if TLS
+    /// cannot be configured.
     pub async fn connect(database_url: &str) -> HarvestResult<Self> {
-        let (client, mut connection) = tokio_postgres::connect(database_url, tokio_postgres::NoTls)
-            .await
-            .map_err(|e| HarvestError::Database(format!("pg connect failed: {e}")))?;
-
-        let (tx, rx) = tokio::sync::mpsc::channel(128);
-        let handle = tokio::spawn(async move {
-            use futures::future::poll_fn;
-
-            loop {
-                let msg = poll_fn(|cx| connection.poll_message(cx)).await;
-                match msg {
-                    Some(Ok(tokio_postgres::AsyncMessage::Notification(n))) => {
-                        if tx.send(n).await.is_err() {
-                            break;
-                        }
-                    }
-                    Some(Ok(_)) => {}
-                    Some(Err(e)) => {
-                        tracing::error!(error = %e, "postgres workflow event listener error");
-                        break;
-                    }
-                    None => break,
-                }
-            }
-        });
+        let ListenConnection { client, rx, driver } =
+            open_listen_connection(database_url, "postgres workflow event listener error").await?;
 
         let channel = quote_pg_identifier(workflow_events_channel());
         client
             .batch_execute(&format!("LISTEN {channel}"))
             .await
-            .map_err(|e| HarvestError::Database(format!("LISTEN {channel} failed: {e}")))?;
+            .map_err(|e| {
+                HarvestError::Database(format!("LISTEN {channel} failed: {}", error_chain(&e)))
+            })?;
 
         Ok(Self {
             _client: client,
             rx,
-            _connection_handle: handle,
+            _connection_handle: driver,
         })
     }
 
@@ -530,46 +679,31 @@ pub struct WorkflowProgressListener {
 impl WorkflowProgressListener {
     /// Connect to Postgres and subscribe to `exec_id`'s progress channel.
     ///
+    /// `sslmode=require` in `database_url` selects verified TLS. Other modes
+    /// connect in plaintext (issue #1717).
+    ///
     /// # Errors
     ///
     /// Returns [`HarvestError::Database`] if the connection or LISTEN fails.
+    /// Returns [`HarvestError::Config`] if the URL does not parse, or if TLS
+    /// cannot be configured.
     pub async fn connect(database_url: &str, exec_id: Uuid) -> HarvestResult<Self> {
-        let (client, mut connection) = tokio_postgres::connect(database_url, tokio_postgres::NoTls)
-            .await
-            .map_err(|e| HarvestError::Database(format!("pg connect failed: {e}")))?;
-
-        let (tx, rx) = tokio::sync::mpsc::channel(128);
-        let handle = tokio::spawn(async move {
-            use futures::future::poll_fn;
-
-            loop {
-                let msg = poll_fn(|cx| connection.poll_message(cx)).await;
-                match msg {
-                    Some(Ok(tokio_postgres::AsyncMessage::Notification(n))) => {
-                        if tx.send(n).await.is_err() {
-                            break;
-                        }
-                    }
-                    Some(Ok(_)) => {}
-                    Some(Err(e)) => {
-                        tracing::error!(error = %e, "postgres workflow progress listener error");
-                        break;
-                    }
-                    None => break,
-                }
-            }
-        });
+        let ListenConnection { client, rx, driver } =
+            open_listen_connection(database_url, "postgres workflow progress listener error")
+                .await?;
 
         let channel = quote_pg_identifier(&workflow_progress_channel(exec_id));
         client
             .batch_execute(&format!("LISTEN {channel}"))
             .await
-            .map_err(|e| HarvestError::Database(format!("LISTEN {channel} failed: {e}")))?;
+            .map_err(|e| {
+                HarvestError::Database(format!("LISTEN {channel} failed: {}", error_chain(&e)))
+            })?;
 
         Ok(Self {
             _client: client,
             rx,
-            _connection_handle: handle,
+            _connection_handle: driver,
         })
     }
 
@@ -671,6 +805,165 @@ mod tests {
         let deserialized: WorkflowEventNotifyPayload =
             serde_json::from_str(&json).expect("deserialize");
         assert_eq!(original, deserialized);
+    }
+
+    // ── TLS for listener connections (issue #1717) ───────────────────────
+
+    fn transport_for(dsn: &str) -> ListenTransport {
+        let config: tokio_postgres::Config = dsn.parse().expect("test DSN parses");
+        listen_transport(&config)
+    }
+
+    #[test]
+    fn only_sslmode_require_selects_tls() {
+        let base = "postgres://u:p@db.internal/harvest";
+        assert_eq!(transport_for(base), ListenTransport::Plain);
+        assert_eq!(
+            transport_for(&format!("{base}?sslmode=disable")),
+            ListenTransport::Plain
+        );
+        assert_eq!(
+            transport_for(&format!("{base}?sslmode=prefer")),
+            ListenTransport::Plain
+        );
+        assert_eq!(
+            transport_for(&format!("{base}?sslmode=require")),
+            ListenTransport::Tls
+        );
+    }
+
+    #[test]
+    fn keyword_dsn_with_sslmode_require_selects_tls() {
+        assert_eq!(
+            transport_for("host=db.internal dbname=harvest sslmode=require"),
+            ListenTransport::Tls
+        );
+        assert_eq!(
+            transport_for("host=db.internal dbname=harvest"),
+            ListenTransport::Plain
+        );
+    }
+
+    /// An `SSLRequest` message: length 8, then the code 80877103.
+    #[cfg(feature = "tls")]
+    const SSL_REQUEST: [u8; 8] = [0, 0, 0, 8, 4, 210, 22, 47];
+
+    /// Open a listener connection to a fake server, and record what arrives.
+    ///
+    /// The fake server reads the first message header. When `answer_tls` is
+    /// true, it accepts TLS with `S` and also reads the next byte.
+    async fn first_bytes_sent(sslmode: &str, answer_tls: bool) -> ([u8; 8], Option<u8>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let server = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake server");
+        let port = server.local_addr().expect("fake server address").port();
+        let accept = tokio::spawn(async move {
+            let (mut socket, _) = server.accept().await.expect("accept");
+            let mut header = [0_u8; 8];
+            socket
+                .read_exact(&mut header)
+                .await
+                .expect("message header");
+            if !answer_tls {
+                return (header, None);
+            }
+            socket.write_all(b"S").await.expect("accept TLS");
+            let mut next = [0_u8; 1];
+            let next = socket.read_exact(&mut next).await.ok().map(|_| next[0]);
+            (header, next)
+        });
+        let url = format!("postgres://u@127.0.0.1:{port}/db?sslmode={sslmode}");
+        let client = tokio::spawn(async move {
+            open_listen_connection(&url, "test listener error")
+                .await
+                .map(|_| ())
+        });
+        let seen = tokio::time::timeout(Duration::from_secs(10), accept)
+            .await
+            .expect("fake server sees the client")
+            .expect("fake server task");
+        client.abort();
+        seen
+    }
+
+    #[cfg(feature = "tls")]
+    #[tokio::test]
+    async fn sslmode_require_starts_a_tls_handshake() {
+        let (header, next) = first_bytes_sent("require", true).await;
+        assert_eq!(header, SSL_REQUEST);
+        // 0x16 is the TLS handshake record type, so this is a ClientHello.
+        // A `NoTls` connector sends nothing after the server accepts TLS.
+        assert_eq!(next, Some(0x16), "sslmode=require must send a ClientHello");
+    }
+
+    #[tokio::test]
+    async fn sslmode_prefer_stays_plaintext() {
+        let (header, _) = first_bytes_sent("prefer", false).await;
+        // A startup message carries protocol version 3.0 after its length.
+        assert_eq!(header[4..], [0, 3, 0, 0], "prefer must not send SSLRequest");
+    }
+
+    #[cfg(not(feature = "tls"))]
+    #[tokio::test]
+    async fn sslmode_require_without_the_tls_feature_is_a_config_error() {
+        let result = open_listen_connection(
+            "postgres://u@127.0.0.1:1/db?sslmode=require",
+            "test listener error",
+        )
+        .await
+        .map(|_| ());
+        assert!(
+            matches!(&result, Err(HarvestError::Config(m)) if m.contains("`tls` feature")),
+            "{:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_dsn_is_a_config_error() {
+        let result = open_listen_connection(
+            "postgres://u@127.0.0.1:1/db?sslmode=verify-full",
+            "test listener error",
+        )
+        .await
+        .map(|_| ());
+        assert!(
+            matches!(&result, Err(HarvestError::Config(m)) if m.contains("sslmode")),
+            "{:?}",
+            result.err()
+        );
+    }
+
+    #[derive(Debug)]
+    struct Layer(&'static str, Option<Box<Self>>);
+
+    impl std::fmt::Display for Layer {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    impl std::error::Error for Layer {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1.as_deref().map(|e| e as _)
+        }
+    }
+
+    #[test]
+    fn error_chain_names_every_cause() {
+        let error = Layer(
+            "error performing TLS handshake",
+            Some(Box::new(Layer(
+                "invalid peer certificate",
+                Some(Box::new(Layer("UnknownIssuer", None))),
+            ))),
+        );
+        assert_eq!(
+            error_chain(&error),
+            "error performing TLS handshake: invalid peer certificate: UnknownIssuer"
+        );
     }
 
     // ── publish_progress channel (issue #791) ────────────────────────────
