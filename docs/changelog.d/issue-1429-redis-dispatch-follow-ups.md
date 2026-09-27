@@ -19,9 +19,10 @@ its brainstorm, reverse brainstorm and six hats, is
   they are wrapped as well. Each site chains the new
   `dispatch::BufferedSettledExt::buffered_settled()` before its `.await`, so
   no transaction body moves. A wrapped owner under an outer scope leaves its
-  hints with that scope, as before. The start-collect transaction is not
-  wrapped. It often runs as a SAVEPOINT, and a scope there would block on
-  Redis inside the caller's open transaction. A wrapped owner awaits its
+  hints with that scope, as before. The start, cancel and terminate collect
+  helpers are not wrapped. They often run as a SAVEPOINT, and a scope there
+  would publish inside the caller's open transaction. The standalone cancel
+  and terminate wrappers carry the scope instead. A wrapped owner awaits its
   publish after commit, so a stalled Redis delays that caller by up to the
   5 s response timeout.
 - **Effective config (item 6).** `GET /admin/config` has a `redis` section:

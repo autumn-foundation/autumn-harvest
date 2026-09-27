@@ -605,30 +605,50 @@ impl RedisDispatch {
         let now_ms = Utc::now().timestamp_millis();
         let due_ms = due.timestamp_millis();
         let ttl = self.dedupe_ttl_secs();
+        // Every queue gets its call, even after one fails (issue #1429). A
+        // recovery pass claimed all of these entries already, so an entry left
+        // out waits for another visibility timeout.
+        let mut first_error = None;
         for (queue, batch) in by_queue {
-            let mut invocation = self.requeue_script.prepare_invoke();
-            invocation
-                .key(self.stream_key(queue))
-                .key(self.delayed_key(queue))
-                .key(self.payloads_key(queue));
-            for (_, reference) in &batch {
-                invocation.key(self.marker_key(reference.task_id));
+            if let Err(error) = self.requeue_queue(queue, &batch, now_ms, due_ms, ttl).await {
+                tracing::warn!(queue = %queue, error = %error, "requeue failed for a queue");
+                first_error.get_or_insert(error);
             }
-            invocation
-                .arg(now_ms)
-                .arg(ttl)
-                .arg(self.config.consumer_group.as_str());
-            for (handle, reference) in &batch {
-                invocation
-                    .arg(handle_entry_id(handle))
-                    .arg(reference.task_id.to_string())
-                    .arg(due_ms)
-                    .arg(reference.marker_value())
-                    .arg(serde_json::to_string(reference)?);
-            }
-            let mut conn = self.conn.clone();
-            let _: i64 = invocation.invoke_async(&mut conn).await?;
         }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// Run [`REQUEUE_LUA`] for one queue's entries.
+    async fn requeue_queue(
+        &self,
+        queue: &str,
+        batch: &[(&String, &DispatchRef)],
+        now_ms: i64,
+        due_ms: i64,
+        ttl: i64,
+    ) -> RedisAdapterResult<()> {
+        let mut invocation = self.requeue_script.prepare_invoke();
+        invocation
+            .key(self.stream_key(queue))
+            .key(self.delayed_key(queue))
+            .key(self.payloads_key(queue));
+        for (_, reference) in batch {
+            invocation.key(self.marker_key(reference.task_id));
+        }
+        invocation
+            .arg(now_ms)
+            .arg(ttl)
+            .arg(self.config.consumer_group.as_str());
+        for (handle, reference) in batch {
+            invocation
+                .arg(handle_entry_id(handle))
+                .arg(reference.task_id.to_string())
+                .arg(due_ms)
+                .arg(reference.marker_value())
+                .arg(serde_json::to_string(reference)?);
+        }
+        let mut conn = self.conn.clone();
+        let _: i64 = invocation.invoke_async(&mut conn).await?;
         Ok(())
     }
 
@@ -974,11 +994,15 @@ impl RedisDispatch {
                 recovered.push((entry.id, reference));
             }
         }
+        // The requeue runs first, and a failed discard does not skip it. Both
+        // work on entries this pass already claimed.
+        let count = recovered.len();
+        let requeued = self.requeue_batch(&recovered, Utc::now()).await;
         // An entry the pass cannot read stays pending unless it is discarded
         // here. See [`RedisDispatch::discard_entries`].
-        self.discard_entries(&malformed).await?;
-        let count = recovered.len();
-        self.requeue_batch(&recovered, Utc::now()).await?;
+        let discarded = self.discard_entries(&malformed).await;
+        requeued?;
+        discarded?;
         Ok(count)
     }
 

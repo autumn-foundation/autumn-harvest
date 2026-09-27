@@ -3525,7 +3525,6 @@ pub async fn cancel_workflow_execution_collect(
                 closed_children,
             ))
         }))
-        .buffered_settled()
         .await?;
 
     let mut deferred_checks = Vec::new();
@@ -3571,7 +3570,9 @@ pub async fn cancel_workflow_execution(
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> HarvestResult<CancelledWorkflowExecution> {
     let (cancel_result, deferred_starts, deferred_checks, deferred_terminal) =
-        cancel_workflow_execution_collect(conn, exec_id, reason, Some(metrics)).await?;
+        cancel_workflow_execution_collect(conn, exec_id, reason, Some(metrics))
+            .buffered_settled()
+            .await?;
 
     for check in deferred_checks {
         let _ = check_and_report_unfinished_handlers(conn, check.0, &check.1, Some(metrics)).await;
@@ -5852,7 +5853,6 @@ pub async fn terminate_workflow_execution_collect(
                 closed_children,
             ))
         }))
-        .buffered_settled()
         .await?;
 
     let mut deferred_checks = Vec::new();
@@ -5910,7 +5910,9 @@ pub async fn terminate_workflow_execution(
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> HarvestResult<CancelledWorkflowExecution> {
     let (cancel_result, deferred_starts, deferred_checks, deferred_terminal) =
-        terminate_workflow_execution_collect(conn, exec_id, reason).await?;
+        terminate_workflow_execution_collect(conn, exec_id, reason)
+            .buffered_settled()
+            .await?;
 
     for check in deferred_checks {
         let _ = check_and_report_unfinished_handlers(conn, check.0, &check.1, Some(metrics)).await;
