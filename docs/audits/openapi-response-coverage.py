@@ -38,7 +38,8 @@ A handler can also take the raw `Bytes` and call `serde_json::from_slice`
 itself. An import alias, such as `use serde_json::from_slice as decode;`, is
 read too. Checks 2, 3 and 5 read that parse when it reads a parameter of type
 `Bytes`, `&[u8]` or `Vec<u8>`. The parse can be in the handler, or in a helper
-one level down that the handler passes the body to. In a helper, only the
+that the handler passes the body to, at any depth up to `HELPER_DEPTH`. A
+recursive helper is read once per chain of calls. In a helper, only the
 parameter at the position of the body argument is a body. A move into another
 name, such as `let captured = body;`, is followed. A copy through a call, such
 as `body.to_vec()`, is not read. The type comes from a turbofish, then from a
@@ -626,7 +627,8 @@ def raw_body_parses(source: str, handler: str) -> list[tuple[str | None, bool, b
     the helper call site carries into the helper.
 
     A helper counts only when the handler passes it a body variable, and only
-    the helper parameters that receive the body are read as bodies. The type
+    the helper parameters that receive the body are read as bodies. A helper
+    that passes the body on is followed too, as `carrier_parses` reads it. The type
     comes from a turbofish, then from a `let` binding in the same statement,
     then from a `Result<T, _>` return type. It is `None` when none of those
     names it, or when the call reads the body in a form the audit cannot read.
@@ -637,20 +639,55 @@ def raw_body_parses(source: str, handler: str) -> list[tuple[str | None, bool, b
     # `source` is masked, so a call in a comment or a string is no parse.
     handler_block = handler_found[2]
     carriers = moved_names(handler_block, byte_parameters(handler_found[0]))
-    returns = handler_found[1]
-    parses = block_parses(handler_block, carriers, returns)
-    for helper in called_helpers(source, handler_block):
+    return carrier_parses(source, handler_block, carriers, handler_found[1])
+
+
+# How many helper calls deep `carrier_parses` follows a body before it gives up.
+HELPER_DEPTH = 8
+
+
+def carrier_parses(
+    source: str,
+    block: str,
+    carriers: dict[str, int],
+    returns: str,
+    optional: bool = False,
+    tolerant: bool = False,
+    path: frozenset[tuple[str, str]] = frozenset(),
+) -> list[tuple[str | None, bool, bool]]:
+    """`(type, optional, tolerant)` for each parse of a carrier in `block` and below.
+
+    Each helper that `block` passes a carrier to is read the same way, with
+    the receiving parameter as its carrier. A guard or a tolerant call at a
+    call site carries into every level below it. `path` holds each
+    `(helper, parameter)` already on this chain of calls, so a recursive
+    helper is read once. A chain deeper than `HELPER_DEPTH` is a `None` type,
+    so the audit reports it and fails closed.
+    """
+    found = block_parses(block, carriers, returns)
+    parses = [(kind, o or optional, t or tolerant) for kind, o, t in found]
+    for helper in called_helpers(source, block):
         parts = function_parts(source, helper)
         if parts is None:
             continue
-        params, returns, block = parts
+        params, helper_returns, helper_block = parts
         byte_names = byte_parameters(params)
-        states = receiving_parameters(handler_block, helper, params, carriers)
-        for name, (optional, tolerant) in states.items():
-            if name not in byte_names:
+        states = receiving_parameters(block, helper, params, carriers)
+        for name, (guarded, discarded) in states.items():
+            if name not in byte_names or (helper, name) in path:
                 continue
-            found = block_parses(block, moved_names(block, {name}), returns)
-            parses += [(kind, o or optional, t or tolerant) for kind, o, t in found]
+            if len(path) >= HELPER_DEPTH:
+                parses.append((None, optional or guarded, tolerant or discarded))
+                continue
+            parses += carrier_parses(
+                source,
+                helper_block,
+                moved_names(helper_block, {name}),
+                helper_returns,
+                optional or guarded,
+                tolerant or discarded,
+                path | {(helper, name)},
+            )
     return parses
 
 
@@ -2237,6 +2274,8 @@ pub fn harvest_api_router() -> Router {
         .route("/e/json-shadowed", post(e_json_shadowed))
         .route("/e/json-default-guard", post(e_json_default_guard))
         .route("/e/raw-shadowed", post(e_raw_shadowed))
+        .route("/e/raw-two-level", post(e_raw_two_level))
+        .route("/e/raw-recursive", post(e_raw_recursive))
         .route("/e/helper-in-comment", get(e_helper_in_comment))
         .route("/e/json-std-err", post(e_json_std_err))
         .route("/e/json-core-err", post(e_json_core_err))
@@ -3079,6 +3118,35 @@ async fn e_json_default_guard(body: Result<Json<Gadget>, JsonRejection>) -> Json
 async fn e_raw_shadowed(body: Bytes) -> Response {
     let body = b"{}";
     let gadget = serde_json::from_slice::<Gadget>(&body).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_raw_two_level(body: Bytes) -> Response {
+    decode_outer(&body)
+}
+
+fn decode_outer(raw: &[u8]) -> Response {
+    decode_inner(raw)
+}
+
+fn decode_inner(bytes: &[u8]) -> Response {
+    let gadget = serde_json::from_slice::<Gadget>(bytes).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_raw_recursive(body: Bytes) -> Response {
+    decode_ping(&body, 3)
+}
+
+fn decode_ping(raw: &[u8], depth: u32) -> Response {
+    decode_pong(raw, depth)
+}
+
+fn decode_pong(raw: &[u8], depth: u32) -> Response {
+    if depth > 0 {
+        return decode_ping(raw, depth - 1);
+    }
+    let gadget = serde_json::from_slice::<Gadget>(raw).unwrap();
     StatusCode::OK.into_response()
 }
 
@@ -4925,6 +4993,20 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             )
         ],
         {},
+    ),
+    (
+        "a raw body passed through two helpers, or a recursive one, is read",
+        FIXTURE_EDGES,
+        [
+            fixture_route("POST", path, 200, request_body=body_of(("name", True), required=False))
+            for path in ("/e/raw-two-level", "/e/raw-recursive")
+        ],
+        {
+            "body_required": [
+                "POST /e/raw-two-level: the body is mandatory",
+                "POST /e/raw-recursive: the body is mandatory",
+            ]
+        },
     ),
     (
         "a helper named in a comment or a string is not called",
