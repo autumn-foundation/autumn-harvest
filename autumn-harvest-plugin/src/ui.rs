@@ -1041,9 +1041,9 @@ async fn dag_retry_confirm_ui(
 /// (a partial success), redirects to the *new* run with a warning flash rather
 /// than misreporting it as a failure.
 ///
-/// A genuine failure (400/404/409) starts no run. The handler then renders the
-/// confirm page again in place, with the error and the reason the operator
-/// typed (issue #1723). A fresh dry run supplies the current node list. The
+/// A failure that starts no run (400/404/409 or an internal error) renders the
+/// confirm page again in place. The page shows the error and the reason the
+/// operator typed (issue #1723). A fresh dry run supplies the current node list. The
 /// dry run writes nothing, so this path adds no audit row. Admin-gated at the
 /// router.
 async fn dag_retry_commit_ui(
@@ -1143,14 +1143,18 @@ fn dag_detail_relative_url(dag_name: &str, run: &str, flash: Option<&str>) -> St
     url
 }
 
+/// Banner note after a failed commit when the fresh dry run passes.
+const DAG_RETRY_PLAN_REFRESHED: &str =
+    "The node list below is current. Check it before you confirm again.";
+
 /// Render the retry confirm page from a dry-run outcome: on success, the
 /// widened re-execute list + carried-over list + an editable required reason and
 /// a Confirm form (`POSTing` to the same URL); on failure, the human message.
 ///
-/// `reason` fills the textarea. `commit_error` is set only when a commit failed
-/// (issue #1723). The page then shows the error in a focused banner. If the
-/// fresh dry run also fails, no form is offered. A read-only copy of `reason`
-/// stays on the page, so the operator does not lose it.
+/// `reason` fills the textarea. The handler sets `commit_error` only when a
+/// commit fails (issue #1723). The page then shows the error in a focused
+/// banner. If the fresh dry run also fails, the page offers no form. A
+/// read-only copy of `reason` stays on the page, so the operator keeps it.
 fn render_dag_retry_confirm(
     dag_name: &str,
     run_exec_id: &str,
@@ -1159,17 +1163,23 @@ fn render_dag_retry_confirm(
     outcome: Result<DagRetryResponse, DagRetryFailure>,
     commit_error: Option<&str>,
 ) -> Markup {
-    let commit_banner = html! {
-        @if let Some(error) = commit_error {
-            div.degraded-banner role="status" tabindex="-1" autofocus {
-                strong { "Retry not started. " } (error)
+    // One focused banner holds every message, so assistive tech reads them all.
+    // The wording does not claim that no run exists. A double click can fork
+    // on the first POST and fail on the second.
+    let commit_banner = |detail: Option<&str>| {
+        html! {
+            @if let Some(error) = commit_error {
+                div.degraded-banner role="status" tabindex="-1" autofocus {
+                    strong { "This request did not start a retry. " } (error)
+                    @if let Some(detail) = detail { br; (detail) }
+                }
             }
         }
     };
     let body = match outcome {
         Ok(plan) => html! {
             h2 { "Confirm retry of DAG " code { (dag_name) } }
-            (commit_banner)
+            (commit_banner(Some(DAG_RETRY_PLAN_REFRESHED)))
             p { "Source run: " code { (run_exec_id) } }
             p { "Retry from node: " code { (from_node) } }
             div class="card" {
@@ -1205,19 +1215,21 @@ fn render_dag_retry_confirm(
         },
         Err(failure) => {
             let message = failure.human_message();
+            // The dry-run message goes in the banner only when it adds information.
+            let current_state = format!("Current state: {message}");
+            let detail = (commit_error != Some(message.as_str())).then_some(current_state.as_str());
             html! {
-                (commit_banner)
-                // Show the dry-run message only when it adds information.
-                @if commit_error != Some(message.as_str()) {
-                    div class="banner Warning" { (message) }
-                }
+                h2 { "Retry DAG " code { (dag_name) } }
+                (commit_banner(detail))
                 @if commit_error.is_some() {
                     p {
                         label {
-                            "Your reason (not saved) "
+                            "Your reason (read-only; copy it before you leave this page) "
                             textarea readonly[true] rows="2" cols="60" { (reason) }
                         }
                     }
+                } @else {
+                    div class="banner Warning" { (message) }
                 }
                 p {
                     a class="back" href=(dag_detail_relative_url(dag_name, run_exec_id, None)) {
@@ -6857,12 +6869,10 @@ fn dag_retry_success_flash(new_run: &str) -> String {
     format!("Retry started — new run {new_run}")
 }
 
-/// Warning-flash text for the audit-write-after-fork case (issue #957, Codex
-/// review): the fork **committed** (a new run exists) but the `dag.retry` audit
-/// row could not be written. This is a partial success — the operator must be
-/// able to find the run that actually started, so we name it and flag the
-/// missing audit record distinctly from the hard "Retry failed" message used
-/// for real failures (400/404/409).
+/// Warning-flash text for the audit-write-after-fork case (issue #957).
+/// The fork committed, so a new run exists, but the `dag.retry` audit row
+/// could not be written. This is a partial success. The flash names the new
+/// run, so the operator can find it, and calls out the missing audit record.
 fn dag_retry_audit_warning_flash(new_run: &str) -> String {
     format!("Retry started — new run {new_run} — but the audit record could not be written")
 }
@@ -6885,7 +6895,7 @@ enum DagRetryCommitNext {
 ///
 /// Every other failure starts no run. It returns `Redisplay`, so the handler
 /// keeps the operator on the confirm page with the reason they typed. A
-/// redirect to the DAG page lost that reason (issue #1723). Flash text is not
+/// redirect to the DAG page loses that reason (issue #1723). Flash text is not
 /// encoded. The caller percent-encodes it once.
 fn dag_retry_commit_next(
     outcome: Result<DagRetryResponse, DagRetryFailure>,
@@ -15808,16 +15818,11 @@ mod tests {
             flash.contains("forked-run-xyz"),
             "success flash must name the new run: {flash}"
         );
-        assert!(
-            !flash.contains("Retry failed"),
-            "success must not use the failure message: {flash}"
-        );
     }
 
-    // Codex review (issue #957): AuditFailed is a PARTIAL SUCCESS — the fork
-    // committed, so redirect to the NEW run with a distinct warning, never the
-    // hard "Retry failed" pointing back at the source (which would hide the run
-    // that actually started).
+    // Issue #957: AuditFailed is a partial success because the fork committed.
+    // The redirect opens the new run with a warning. Showing the form again
+    // would invite a second click and a second fork (issue #1723).
     #[test]
     fn dag_retry_commit_next_surfaces_new_run_on_audit_failure() {
         let failure = DagRetryFailure::AuditFailed {
@@ -15842,17 +15847,13 @@ mod tests {
             "warning flash must name the new run so the operator can find it: {flash}"
         );
         assert!(
-            !flash.contains("Retry failed"),
-            "audit failure is a partial success and must NOT use the hard failure message: {flash}"
-        );
-        assert!(
             flash.contains("audit record"),
             "warning flash must call out the missing audit record: {flash}"
         );
     }
 
     // Issue #1723: a genuine failure starts no run. The operator stays on the
-    // confirm page, so the reason they typed is not lost.
+    // confirm page and keeps the reason they typed.
     #[test]
     fn dag_retry_commit_next_redisplays_the_form_on_real_failure() {
         let failures = vec![
@@ -15912,7 +15913,10 @@ mod tests {
             !html.contains(&dag_retry_default_reason("step_b")),
             "the default reason must not replace the operator's reason: {html}"
         );
-        assert!(html.contains("Retry not started."), "error banner: {html}");
+        assert!(
+            html.contains("This request did not start a retry."),
+            "error banner: {html}"
+        );
         assert!(html.contains("database unavailable"), "error text: {html}");
         assert!(
             html.contains(r#"role="status" tabindex="-1" autofocus"#),
@@ -15920,7 +15924,15 @@ mod tests {
         );
         assert!(html.contains("step_c"), "the current plan is shown: {html}");
         assert!(
-            html.contains("Confirm retry"),
+            html.contains(DAG_RETRY_PLAN_REFRESHED),
+            "the banner says the plan is current: {html}"
+        );
+        assert!(
+            html.contains(r#"name="from_node" value="step_b""#),
+            "the form keeps the node to retry: {html}"
+        );
+        assert!(
+            html.contains(r#"type="submit""#),
             "the form is offered: {html}"
         );
     }
@@ -15943,7 +15955,14 @@ mod tests {
             html.contains(&format!("{DAG_RETRY_TEST_REASON}</textarea>")),
             "the operator's reason must stay on the page: {html}"
         );
-        assert!(html.contains("readonly"), "the reason is read-only: {html}");
+        assert!(
+            html.contains("<textarea readonly"),
+            "the reason is read-only: {html}"
+        );
+        assert!(
+            html.contains("<h2>Retry DAG"),
+            "the page has a heading: {html}"
+        );
         assert!(
             !html.contains("Confirm retry"),
             "no commit is offered without a current plan: {html}"
@@ -15955,7 +15974,8 @@ mod tests {
         );
     }
 
-    // Issue #1723: when the two failures differ, both messages are shown.
+    // Issue #1723: when the two failures differ, both messages are shown in
+    // the one focused banner, so assistive tech reads both.
     #[test]
     fn render_dag_retry_confirm_shows_both_messages_when_they_differ() {
         let html = render_dag_retry_confirm(
@@ -15973,7 +15993,14 @@ mod tests {
             html.contains("database unavailable"),
             "commit error: {html}"
         );
-        assert!(html.contains("DAG run succeeded"), "dry-run error: {html}");
+        assert!(
+            html.contains("<br>Current state: DAG run succeeded"),
+            "the dry-run error shares the focused banner: {html}"
+        );
+        assert!(
+            !html.contains("banner Warning"),
+            "no second, unfocused banner: {html}"
+        );
     }
 
     // Issue #1723: the GET confirm page does not change. It shows no commit
@@ -15991,7 +16018,7 @@ mod tests {
         )
         .into_string();
         assert!(ok.contains(&format!("{default_reason}</textarea>")), "{ok}");
-        assert!(!ok.contains("Retry not started."), "{ok}");
+        assert!(!ok.contains("did not start a retry"), "{ok}");
 
         let err = render_dag_retry_confirm(
             "graph_linear",
@@ -16004,8 +16031,8 @@ mod tests {
             None,
         )
         .into_string();
-        assert!(!err.contains("readonly"), "{err}");
-        assert!(!err.contains("Retry not started."), "{err}");
+        assert!(!err.contains("<textarea readonly"), "{err}");
+        assert!(!err.contains("did not start a retry"), "{err}");
         assert!(err.contains("DAG run succeeded"), "{err}");
     }
 

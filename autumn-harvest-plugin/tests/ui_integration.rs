@@ -7003,7 +7003,10 @@ async fn ui_dag_retry_commit_failure_keeps_entered_reason() {
         html.contains("INC-4711: stale lock on step a"),
         "the operator's reason must stay on the page: {html}"
     );
-    assert!(html.contains("Retry not started."), "error banner: {html}");
+    assert!(
+        html.contains("This request did not start a retry."),
+        "error banner: {html}"
+    );
     assert!(
         html.contains("succeeded"),
         "the 409 reason is shown: {html}"
@@ -7013,14 +7016,18 @@ async fn ui_dag_retry_commit_failure_keeps_entered_reason() {
         "a run that cannot retry offers no commit: {html}"
     );
 
-    // No fork started, so no audit row exists.
+    // The 409 comes before the fork, and the redisplay's dry run writes
+    // nothing. So no audit row exists.
     let count = dag957_audit_rows(
         &url,
         autumn_harvest::audit::OP_DAG_RETRY,
         autumn_harvest::audit::SOURCE_UI,
     )
     .await;
-    assert_eq!(count, 0, "a failed commit writes no dag.retry audit row");
+    assert_eq!(
+        count, 0,
+        "a pre-fork rejection and its dry run write no dag.retry audit row"
+    );
 }
 
 // I-F
