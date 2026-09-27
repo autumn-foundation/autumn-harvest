@@ -1214,6 +1214,214 @@ impl HandlerRegistry {
                 per.max(self.max_activity_input_bytes)
             })
     }
+
+    /// Resolve the declared `execution_timeout`/`sla`/ceiling for a
+    /// scheduler-initiated start of `name` (issue #1412).
+    ///
+    /// `name` is a registered workflow's own name. `name` can also be a
+    /// DAG's shadow `WorkflowInfo` name (`DagInfo::as_workflow_info`
+    /// registers a DAG under its own name). One lookup covers both kinds.
+    ///
+    /// Returns raw declared values. This function clamps nothing. A caller
+    /// applies the ceiling to `execution_timeout` itself. A caller also
+    /// clamps `sla` to `execution_timeout` itself, when needed. Behavior
+    /// does not change from before this extraction. This function
+    /// centralizes the lookup only, not the downstream policy.
+    ///
+    /// Every field is `None` when `name` is not registered and the
+    /// registry declares no fleet-wide ceiling.
+    #[must_use]
+    pub fn resolve_dispatch_deadline(&self, name: &str) -> DispatchDeadline {
+        let info = self.workflows.get(name);
+        let execution_timeout = info
+            .and_then(|info| info.execution_timeout)
+            .and_then(|d| chrono::Duration::from_std(d).ok());
+        let sla = info
+            .and_then(|info| info.sla)
+            .and_then(|d| chrono::Duration::from_std(d).ok());
+        let max_execution_timeout_ceiling = self
+            .max_workflow_execution_timeout
+            .and_then(|d| chrono::Duration::from_std(d).ok());
+        DispatchDeadline {
+            execution_timeout,
+            sla,
+            max_execution_timeout_ceiling,
+        }
+    }
+}
+
+/// Return type of [`HandlerRegistry::resolve_dispatch_deadline`] (issue #1412).
+///
+/// A named struct, not a same-typed tuple. A caller cannot silently
+/// transpose `execution_timeout`/`sla`/the ceiling at a new call site — a
+/// mismatched field name fails to compile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DispatchDeadline {
+    pub execution_timeout: Option<chrono::Duration>,
+    pub sla: Option<chrono::Duration>,
+    pub max_execution_timeout_ceiling: Option<chrono::Duration>,
+}
+
+#[cfg(test)]
+mod resolve_dispatch_deadline_tests {
+    use super::*;
+
+    /// Build a bare `WorkflowInfo` with only the deadline fields set.
+    fn deadline_info_fixture(
+        name: &'static str,
+        execution_timeout: Option<std::time::Duration>,
+        sla: Option<std::time::Duration>,
+    ) -> WorkflowInfo {
+        WorkflowInfo {
+            quota: None,
+            declared_activities: None,
+            declared_children: None,
+            mcp: false,
+            name,
+            module: "tests",
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            execution_timeout,
+            chain_execution_timeout: None,
+            concurrency: None,
+            debounce: None,
+            batch: None,
+            throttle: None,
+            max_input_bytes: None,
+            sla,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+            retry_policy: None,
+        }
+    }
+
+    #[test]
+    fn unregistered_name_resolves_to_none() {
+        let registry = HandlerRegistry::new(vec![], vec![]);
+        assert_eq!(
+            registry.resolve_dispatch_deadline("no_such_workflow"),
+            DispatchDeadline {
+                execution_timeout: None,
+                sla: None,
+                max_execution_timeout_ceiling: None,
+            }
+        );
+    }
+
+    #[test]
+    fn declared_values_are_propagated_raw() {
+        let registry = HandlerRegistry::new(
+            vec![deadline_info_fixture(
+                "wf",
+                Some(std::time::Duration::from_secs(60)),
+                Some(std::time::Duration::from_secs(30)),
+            )],
+            vec![],
+        );
+        assert_eq!(
+            registry.resolve_dispatch_deadline("wf"),
+            DispatchDeadline {
+                execution_timeout: Some(chrono::Duration::seconds(60)),
+                sla: Some(chrono::Duration::seconds(30)),
+                max_execution_timeout_ceiling: None,
+            }
+        );
+    }
+
+    #[test]
+    fn undeclared_values_resolve_to_none() {
+        let registry = HandlerRegistry::new(vec![deadline_info_fixture("wf", None, None)], vec![]);
+        assert_eq!(
+            registry.resolve_dispatch_deadline("wf"),
+            DispatchDeadline {
+                execution_timeout: None,
+                sla: None,
+                max_execution_timeout_ceiling: None,
+            }
+        );
+    }
+
+    #[test]
+    fn ceiling_is_read_from_the_registry_regardless_of_name() {
+        let registry = HandlerRegistry::new(vec![], vec![])
+            .with_max_workflow_execution_timeout(Some(std::time::Duration::from_secs(3600)));
+        assert_eq!(
+            registry.resolve_dispatch_deadline("no_such_workflow"),
+            DispatchDeadline {
+                execution_timeout: None,
+                sla: None,
+                max_execution_timeout_ceiling: Some(chrono::Duration::seconds(3600)),
+            }
+        );
+    }
+
+    #[test]
+    fn ceiling_is_never_applied_to_the_declared_value_here() {
+        // resolve_dispatch_deadline returns raw declared values; clamping
+        // against the ceiling is each call site's own concern, unchanged
+        // from before this extraction (issue #1412).
+        let registry = HandlerRegistry::new(
+            vec![deadline_info_fixture(
+                "wf",
+                Some(std::time::Duration::from_secs(7200)),
+                None,
+            )],
+            vec![],
+        )
+        .with_max_workflow_execution_timeout(Some(std::time::Duration::from_secs(3600)));
+        assert_eq!(
+            registry.resolve_dispatch_deadline("wf"),
+            DispatchDeadline {
+                execution_timeout: Some(chrono::Duration::seconds(7200)),
+                sla: None,
+                max_execution_timeout_ceiling: Some(chrono::Duration::seconds(3600)),
+            }
+        );
+    }
+
+    /// A DAG's shadow `WorkflowInfo` resolves through the exact same code
+    /// path as a plain `#[workflow]` (issue #1412). `DagInfo::as_workflow_info`
+    /// propagates `execution_timeout`/`sla` verbatim onto that shadow entry,
+    /// and `HandlerRegistry::new` indexes it into `self.workflows` under the
+    /// DAG's own name like any other `WorkflowInfo`.
+    #[test]
+    fn dag_shadow_workflow_info_resolves_like_a_plain_workflow() {
+        let dag = crate::info::DagInfo {
+            name: "my_dag",
+            module: "tests",
+            schedule: None,
+            catchup: false,
+            max_active_runs: 1,
+            default_queue: None,
+            builder: |_| {},
+            workflow_handler: Some(|_ctx, input| Box::pin(async move { Ok(input) })),
+            jitter: std::time::Duration::ZERO,
+            overlap_policy: crate::policy::OverlapPolicy::Skip,
+            buffer_all_max: 100,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            mcp: false,
+            execution_timeout: Some(std::time::Duration::from_secs(120)),
+            sla: Some(std::time::Duration::from_secs(90)),
+        };
+        let shadow_workflow_info = dag
+            .as_workflow_info()
+            .expect("workflow_handler is Some, so as_workflow_info must be Some");
+        let registry = HandlerRegistry::new(vec![shadow_workflow_info], vec![]);
+        assert_eq!(
+            registry.resolve_dispatch_deadline("my_dag"),
+            DispatchDeadline {
+                execution_timeout: Some(chrono::Duration::seconds(120)),
+                sla: Some(chrono::Duration::seconds(90)),
+                max_execution_timeout_ceiling: None,
+            }
+        );
+    }
 }
 
 impl std::fmt::Debug for HandlerRegistry {
@@ -5869,6 +6077,68 @@ pub(crate) const fn dispatch_allowed_for_span(
     shard_assignments <= 1 && pool_shards <= 1
 }
 
+/// Captures each of `assignments`' own per-shard dispatch channel, for
+/// [`Worker::new`] to hold for the rest of the worker's life. Reports in
+/// the same pass whether every assigned shard was covered (issue #1429;
+/// Codex review, issue #1429 follow-up, twice over).
+///
+/// `Worker::run` used to decide this multi-shard span's channels itself, by
+/// re-reading `dispatch::installed_for_shard` right before spawning the
+/// poll loop. That read ran inside a `tokio::spawn`ed task, scheduled
+/// after `Worker::new`'s own coverage validation, not synchronously with
+/// it. A second `HarvestRunner::start` for an overlapping shard set could
+/// install its own topology in that gap. This worker's poll loop would
+/// then hold the *other* runner's channels, for shards it was never
+/// validated against. That pairs the other runner's Redis endpoints with
+/// this runner's own database pools, for the rest of this worker's life.
+/// Calling this here instead, synchronously with construction's own
+/// coverage check, closed *that* gap.
+///
+/// It reopened a narrower one one level up. `HarvestRunner::start` installs
+/// this runtime's own topology, then does further fallible work — at
+/// least one `.await` — before it ever reaches `Worker::new`. A second,
+/// overlapping `start` call can still install its own topology in *that*
+/// gap, ahead of this call.
+///
+/// `expected_generations` closes it. Pass the generations
+/// `dispatch::install_shards` returned to that install call. Each shard's
+/// capture here is only accepted while its live channel still carries
+/// exactly that generation. A later, unrelated install mints a new
+/// generation from the shared counter. So a mismatch can only mean a
+/// stranger's install landed in the gap. That shard is left out of the
+/// map, same as if nothing were installed for it, rather than silently
+/// captured from the stranger.
+///
+/// `expected_generations = None` is the direct-embedder path. There is no
+/// separate install call's return value to compare against. So this
+/// simply captures whatever is live right now, as it always did before
+/// the race above was found.
+///
+/// Coverage and capture read the same value for each shard, in one pass,
+/// via [`crate::dispatch::installed_for_shards`]. So there is no
+/// separate window between "checked covered" and "captured" for a
+/// racing install to land in either. The capture itself has no such
+/// gap, between one shard's own read and the next, either (Codex review,
+/// issue #1429 follow-up, a third time over). Every shard's
+/// entry here comes from one `INSTALLED_BY_SHARD` snapshot, not a fresh
+/// read per shard that a concurrent [`crate::dispatch::install_shards`]
+/// call could interleave with. An empty `assignments` (the
+/// unsharded/default span) is never covered here. It has no shard
+/// identity to look up, so it needs the
+/// single-shard channel (`dispatch::install`), not this path.
+#[must_use]
+fn capture_shard_dispatch(
+    assignments: &[crate::types::ShardId],
+    expected_generations: Option<&[(crate::types::ShardId, u64)]>,
+) -> (
+    std::collections::HashMap<crate::types::ShardId, crate::dispatch::InstalledDispatch>,
+    bool,
+) {
+    let map = crate::dispatch::installed_for_shards(assignments, expected_generations);
+    let covered = !assignments.is_empty() && map.len() == assignments.len();
+    (map, covered)
+}
+
 /// Whether a shard's poll loop may claim tasks, given that shard's pending
 /// fleet-registration state (issue #804, Codex round-54 P1).
 ///
@@ -8992,8 +9262,21 @@ async fn process_mutex_releases_from_commands(
     releases.sort_by(|a, b| a.0.cmp(&b.0));
     let metrics_enabled = metrics.is_enabled();
 
-    let held_secs = conn
-        .transaction::<Vec<f64>, HarvestError, _>(async |conn| {
+    // `release_lock` wakes the freed key's new head of line, which raises a
+    // dispatch hint (issue #1429). A hint published before the COMMIT below
+    // names a row no reader outside this transaction can see yet. The
+    // buffering scope holds it until the commit, matching every other
+    // transaction owner that calls `wake_workflow_task`.
+    //
+    // This call runs inside the worker's own outer `buffered` scope around
+    // the whole task body. So `buffered_settled` is a documented no-op
+    // passthrough here (Codex review, issue #1429). A rolled-back release
+    // transaction would otherwise leave its wake hint in the outer buffer,
+    // for `dispatch_task` to publish unconditionally regardless. Use
+    // `buffered_checkpoint` instead, matching the fix already applied to
+    // `ctx.run_transactional`'s own transactional-activity wake.
+    let held_secs = crate::dispatch::buffered_checkpoint(Box::pin(
+        conn.transaction::<Vec<f64>, HarvestError, _>(async |conn| {
             let releases = releases.clone();
             let mut held = Vec::new();
             for (key, lock_seq) in releases {
@@ -9008,8 +9291,9 @@ async fn process_mutex_releases_from_commands(
                 }
             }
             Ok(held)
-        })
-        .await?;
+        }),
+    ))
+    .await?;
 
     for secs in held_secs {
         metrics.record_mutex_held(workflow_name, secs);
@@ -23830,7 +24114,20 @@ fn spawn_queue_depth_sampler(
             // single-pool path that skipped the sample on read failure (#522).
             let mut read_failed = false;
             for pool in &pools {
-                let mut conn = match pool.get().await {
+                // Selected against `cancel` (issue #1426), mirroring
+                // `spawn_schedule_overdue_sampler`. A cancelled acquisition
+                // abandons the rest of this tick's shards, same as any
+                // other read failure. The tail check below then exits the
+                // loop.
+                let get_result = tokio::select! {
+                    () = cancel.cancelled() => None,
+                    result = pool.get() => Some(result),
+                };
+                let Some(get_result) = get_result else {
+                    read_failed = true;
+                    break;
+                };
+                let mut conn = match get_result {
                     Ok(conn) => conn,
                     Err(error) => {
                         tracing::debug!(
@@ -23944,7 +24241,20 @@ fn spawn_concurrency_sampler(
             // doesn't under-report concurrency during a storage outage (#522).
             let mut read_failed = false;
             for pool in &pools {
-                let mut conn = match pool.get().await {
+                // Selected against `cancel` (issue #1426), mirroring
+                // `spawn_schedule_overdue_sampler`. A cancelled acquisition
+                // abandons the rest of this tick's shards, same as any
+                // other read failure. The tail check below then exits the
+                // loop.
+                let get_result = tokio::select! {
+                    () = cancel.cancelled() => None,
+                    result = pool.get() => Some(result),
+                };
+                let Some(get_result) = get_result else {
+                    read_failed = true;
+                    break;
+                };
+                let mut conn = match get_result {
                     Ok(conn) => conn,
                     Err(error) => {
                         tracing::debug!(
@@ -24054,7 +24364,20 @@ fn spawn_rate_limit_sampler(
             // doesn't under-report available tokens during a storage outage (#522).
             let mut read_failed = false;
             for pool in &pools {
-                let mut conn = match pool.get().await {
+                // Selected against `cancel` (issue #1426), mirroring
+                // `spawn_schedule_overdue_sampler`. A cancelled acquisition
+                // abandons the rest of this tick's shards, same as any
+                // other read failure. The tail check below then exits the
+                // loop.
+                let get_result = tokio::select! {
+                    () = cancel.cancelled() => None,
+                    result = pool.get() => Some(result),
+                };
+                let Some(get_result) = get_result else {
+                    read_failed = true;
+                    break;
+                };
+                let mut conn = match get_result {
                     Ok(conn) => conn,
                     Err(error) => {
                         tracing::debug!(
@@ -24137,7 +24460,15 @@ fn spawn_dlq_depth_sampler(
                 () = tokio::time::sleep(interval) => {}
             }
 
-            let mut conn = match pool.get().await {
+            // Selected against `cancel` (issue #1426). See the comment
+            // above `spawn_worker_heartbeat`'s own `pool.get()` call for
+            // why an unselected acquisition here can park shutdown
+            // forever.
+            let get_result = tokio::select! {
+                () = cancel.cancelled() => break,
+                result = pool.get() => result,
+            };
+            let mut conn = match get_result {
                 Ok(conn) => conn,
                 Err(error) => {
                     tracing::debug!(
@@ -24207,7 +24538,20 @@ fn spawn_queue_pause_sampler(
             let mut read_failed = false;
 
             for pool in &pools {
-                let Ok(mut conn) = pool.get().await else {
+                // Selected against `cancel` (issue #1426), mirroring
+                // `spawn_schedule_overdue_sampler`. A cancelled acquisition
+                // abandons the rest of this tick's shards, same as any
+                // other read failure. The tail check below then exits the
+                // loop.
+                let get_result = tokio::select! {
+                    () = cancel.cancelled() => None,
+                    result = pool.get() => Some(result),
+                };
+                let Some(get_result) = get_result else {
+                    read_failed = true;
+                    break;
+                };
+                let Ok(mut conn) = get_result else {
                     read_failed = true;
                     continue;
                 };
@@ -24232,6 +24576,48 @@ fn spawn_queue_pause_sampler(
             }
             previously_paused = next_previously_paused;
 
+            if cancel.is_cancelled() {
+                break;
+            }
+        }
+    })
+}
+
+/// Spawn the dispatch dropped-hints gauge sampler (issue #1429).
+///
+/// Emits `harvest.dispatch.dropped_hints`, the running total of hints the
+/// dispatch background publisher has dropped because its bounded queue was
+/// full. Reads no database: [`crate::dispatch::dropped_hints`] is a plain
+/// in-process counter, so this sampler runs on every build, not only under
+/// the `db` feature. A dropped hint costs latency, not correctness. The row
+/// stays `PENDING` and the reconcile sweep republishes it. This is a health
+/// signal, not a durability one.
+///
+/// `pub`, not worker-private: the dispatch background publisher installs
+/// unconditionally at startup (issue #1312), including in an API-only
+/// process with `worker_enabled = false`. Such a process still needs this
+/// sampler. A caller with no [`Worker`] at all (`autumn-harvest-plugin`'s
+/// `HarvestRunner`) spawns it directly rather than through
+/// [`Worker::spawn_monitoring_tasks`], which only runs once a `Worker`
+/// exists.
+#[must_use]
+pub fn spawn_dispatch_metrics_sampler(
+    cancel: CancellationToken,
+    telemetry: Arc<crate::telemetry::TelemetryConfig>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if !telemetry.metrics.is_enabled() {
+            return;
+        }
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => break,
+                () = tokio::time::sleep(interval) => {}
+            }
+            telemetry
+                .metrics
+                .record_dispatch_dropped_hints(crate::dispatch::dropped_hints());
             if cancel.is_cancelled() {
                 break;
             }
@@ -24483,19 +24869,27 @@ fn spawn_replication_sampler(
             }
 
             for (shard_id, shard_pool) in &targets {
-                if sample_one_shard(
+                match sample_one_shard(
                     *shard_id,
                     shard_pool,
                     &telemetry,
                     watermark_retain,
                     interval,
                     &slot_prefix,
+                    &cancel,
                 )
                 .await
-                    == ShardSample::Fenced
                 {
-                    cancel.cancel();
-                    return;
+                    ShardSample::Fenced => {
+                        cancel.cancel();
+                        return;
+                    }
+                    // Issue #1426: the loop received a cancellation signal
+                    // while acquiring this shard's connection. Abandon the
+                    // remaining targets this tick rather than keep probing
+                    // them one by one against an already-cancelled token.
+                    ShardSample::Cancelled => break,
+                    ShardSample::Continue => {}
                 }
             }
         }
@@ -24511,6 +24905,10 @@ enum ShardSample {
     /// This worker has lost write authority for the shard. The caller stops
     /// the **whole** worker — see `spawn_replication_sampler`.
     Fenced,
+    /// The loop received a cancellation signal while acquiring this
+    /// shard's connection (issue #1426). The caller stops sampling the
+    /// remaining targets this tick.
+    Cancelled,
 }
 
 /// One shard's DR sample: self-fence check, watermark beat, gauges.
@@ -24518,7 +24916,12 @@ enum ShardSample {
 /// Split out of the sampler loop only because that loop outgrew the line
 /// budget; the ordering commentary that matters lives here, with the steps it
 /// describes.
+///
+/// The cancel-aware acquisition added for issue #1426 pushed this function
+/// itself past the same line limit. The ordering commentary above still
+/// argues against splitting it further.
 #[cfg(feature = "db")]
+#[allow(clippy::too_many_lines)]
 async fn sample_one_shard(
     shard_id: crate::types::ShardId,
     shard_pool: &DbPool,
@@ -24526,9 +24929,19 @@ async fn sample_one_shard(
     watermark_retain: Duration,
     sample_interval: Duration,
     slot_prefix: &str,
+    cancel: &CancellationToken,
 ) -> ShardSample {
     let shard_u16 = u16::try_from(shard_id.as_i32()).unwrap_or(0);
-    let Ok(mut conn) = shard_pool.get().await else {
+    // Selected against `cancel` (issue #1426): an unselected `pool.get()`
+    // here can park shutdown forever.
+    let get_result = tokio::select! {
+        () = cancel.cancelled() => None,
+        result = shard_pool.get() => Some(result),
+    };
+    let Some(get_result) = get_result else {
+        return ShardSample::Cancelled;
+    };
+    let Ok(mut conn) = get_result else {
         // A pool that cannot be reached is already covered by the worker's own
         // liveness signals; a DR sample is not worth a second alarm for the
         // same condition.
@@ -24708,7 +25121,15 @@ fn spawn_stranded_work_sampler(
                 // (queue, required_capabilities, ...) so coverage can honour the
                 // same eligibility claim_task enforces (issue #522 review).
                 let mut demands: Vec<crate::queue::ClaimablePendingDemand> = {
-                    let mut conn = match shard_pool.get().await {
+                    // Selected against `cancel` (issue #1426): an unselected
+                    // `pool.get()` here can park shutdown forever. Cancellation
+                    // abandons the remaining shards this tick, same as the
+                    // multi-pool samplers above.
+                    let get_result = tokio::select! {
+                        () = cancel.cancelled() => break,
+                        result = shard_pool.get() => result,
+                    };
+                    let mut conn = match get_result {
                         Ok(conn) => conn,
                         Err(error) => {
                             tracing::debug!(
@@ -24755,7 +25176,13 @@ fn spawn_stranded_work_sampler(
                 // collapsed to queue names) so the capability check below can see
                 // each worker's polled queues *and* labels.
                 let covering_workers: Vec<crate::workers::WorkerRow> = {
-                    let Ok(mut conn) = shard_pool.get().await else {
+                    // Selected against `cancel` (issue #1426); see the demands
+                    // acquisition above.
+                    let get_result = tokio::select! {
+                        () = cancel.cancelled() => break,
+                        result = shard_pool.get() => result,
+                    };
+                    let Ok(mut conn) = get_result else {
                         continue;
                     };
                     let filters = crate::workers::WorkerFilters {
@@ -24783,7 +25210,13 @@ fn spawn_stranded_work_sampler(
                 // claim_task enforces. On load failure fall back to an empty set
                 // (exact-match / legacy-worker rules still apply).
                 let compat_set = {
-                    let Ok(mut conn) = shard_pool.get().await else {
+                    // Selected against `cancel` (issue #1426); see the demands
+                    // acquisition above.
+                    let get_result = tokio::select! {
+                        () = cancel.cancelled() => break,
+                        result = shard_pool.get() => result,
+                    };
+                    let Ok(mut conn) = get_result else {
                         continue;
                     };
                     crate::build_routing::load_compat_set(&mut conn)
@@ -24989,6 +25422,18 @@ pub struct Worker {
     /// `tokio::sync::Semaphore`/`OwnedSemaphorePermit` map -- see
     /// [`crate::sessions::SessionSlotRegistry`]'s doc comment for why.
     session_slots_in_use: crate::sessions::SessionSlotRegistry,
+    /// Each assigned shard's per-shard dispatch channel, captured once at
+    /// construction (issue #1429 follow-up). See the capture site in
+    /// [`Worker::new`] for why this is decided here rather than later, at
+    /// `run` time.
+    shard_dispatch:
+        std::collections::HashMap<crate::types::ShardId, crate::dispatch::InstalledDispatch>,
+    /// The single-shard global dispatch channel, captured once at
+    /// construction (Codex review, issue #1429 follow-up). See the capture
+    /// site in [`Worker::new_with_expected_shard_generations`] and the
+    /// read site in [`Worker::run_poll_loop`] for why this is captured
+    /// rather than read live, mirroring `shard_dispatch` above.
+    global_dispatch: Option<crate::dispatch::InstalledDispatch>,
 }
 
 struct WorkerMonitoringHandles {
@@ -25030,6 +25475,9 @@ struct WorkerMonitoringHandles {
     schedule_overdue_sampler: Option<tokio::task::JoinHandle<()>>,
     /// Paused-queue gauge sampler (issue #619). `None` without the `db` feature.
     queue_pause_sampler: Option<tokio::task::JoinHandle<()>>,
+    /// Dispatch dropped-hints gauge sampler (issue #1429). Reads no database,
+    /// so it runs on every build regardless of the `db` feature.
+    dispatch_metrics_sampler: tokio::task::JoinHandle<()>,
     /// Adaptive slot-tuner control loops (issue #548). Empty when no tuner
     /// is configured.
     slot_tuners: Vec<tokio::task::JoinHandle<()>>,
@@ -25074,7 +25522,15 @@ fn spawn_pause_auto_resumer(
                 () = tokio::time::sleep(interval) => {}
             }
 
-            match pool.get().await {
+            // Selected against `cancel` (issue #1426). See the comment
+            // above `spawn_worker_heartbeat`'s own `pool.get()` call for
+            // why an unselected acquisition here can park shutdown
+            // forever.
+            let get_result = tokio::select! {
+                () = cancel.cancelled() => break,
+                result = pool.get() => result,
+            };
+            match get_result {
                 Ok(mut conn) => {
                     match crate::execution::auto_resume_expired_pauses(
                         &mut conn,
@@ -25150,7 +25606,20 @@ fn spawn_history_oversized_sampler(
             // (#522).
             let mut read_failed = false;
             for pool in &pools {
-                let mut conn = match pool.get().await {
+                // Selected against `cancel` (issue #1426), mirroring
+                // `spawn_schedule_overdue_sampler`. A cancelled acquisition
+                // abandons the rest of this tick's shards, same as any
+                // other read failure. The tail check below then exits the
+                // loop.
+                let get_result = tokio::select! {
+                    () = cancel.cancelled() => None,
+                    result = pool.get() => Some(result),
+                };
+                let Some(get_result) = get_result else {
+                    read_failed = true;
+                    break;
+                };
+                let mut conn = match get_result {
                     Ok(conn) => conn,
                     Err(error) => {
                         tracing::debug!(
@@ -25427,7 +25896,20 @@ fn spawn_workflow_active_sampler(
             let mut per_shard: Vec<Vec<(String, ActiveWorkflowState, u64)>> = Vec::new();
             let mut read_failed = false;
             for pool in &pools {
-                let mut conn = match pool.get().await {
+                // Selected against `cancel` (issue #1426), mirroring
+                // `spawn_schedule_overdue_sampler`. A cancelled acquisition
+                // abandons the rest of this tick's shards, same as any
+                // other read failure. The tail check below then exits the
+                // loop.
+                let get_result = tokio::select! {
+                    () = cancel.cancelled() => None,
+                    result = pool.get() => Some(result),
+                };
+                let Some(get_result) = get_result else {
+                    read_failed = true;
+                    break;
+                };
+                let mut conn = match get_result {
                     Ok(conn) => conn,
                     Err(error) => {
                         tracing::debug!(
@@ -25643,11 +26125,167 @@ async fn dispatch_call<T>(
     call: impl std::future::Future<Output = HarvestResult<T>>,
     what: &'static str,
 ) -> HarvestResult<T> {
-    (tokio::time::timeout(DISPATCH_CALL_TIMEOUT, call).await).unwrap_or_else(|_| {
+    dispatch_call_with_timeout(call, what, DISPATCH_CALL_TIMEOUT).await
+}
+
+/// Run one channel call under an explicit deadline, rather than the flat
+/// [`DISPATCH_CALL_TIMEOUT`] (Codex review, issue #1429).
+///
+/// A batched multi-queue call (`ack_many`, `release_many`) is one round
+/// trip per distinct queue inside the channel implementation, not one
+/// round trip overall. See `ack_many_inner`'s/`requeue_batch`'s own doc
+/// comments for why. A flat deadline sized for a single round trip can
+/// then fire partway through that loop. `tokio::time::timeout` drops the
+/// whole future on expiry. A queue the loop had not yet reached is then
+/// never attempted at all, not merely left for a later retry. That
+/// silently breaks the "every queue is attempted" contract those two
+/// document.
+/// Scaling the deadline by the distinct queue count keeps a single-queue
+/// call's timeout unchanged and gives a multi-queue call the same budget
+/// per queue.
+async fn dispatch_call_with_timeout<T>(
+    call: impl std::future::Future<Output = HarvestResult<T>>,
+    what: &'static str,
+    timeout: Duration,
+) -> HarvestResult<T> {
+    (tokio::time::timeout(timeout, call).await).unwrap_or_else(|_| {
         Err(HarvestError::Dispatch(format!(
-            "dispatch {what} did not answer within {DISPATCH_CALL_TIMEOUT:?}"
+            "dispatch {what} did not answer within {timeout:?}"
         )))
     })
+}
+
+/// The deadline for a batched multi-queue channel call (Codex review, issue
+/// #1429). It scales by how many distinct queues the call touches. It also
+/// scales by how many sequential round trips the channel makes per queue.
+/// See [`dispatch_call_with_timeout`] for why a flat deadline is not
+/// enough.
+///
+/// `round_trips_per_queue` must match the channel call's *pipelined*
+/// implementation. `ack_many_inner` does two round trips per queue: an
+/// `XACK`/`XDEL` pipeline, then a separate marker-cleanup script.
+/// `release_many_inner` / `requeue_batch` and the dispatch read's own
+/// non-blocking pass are one round trip per queue.
+///
+/// `lease_count` covers a different implementation entirely (Codex review,
+/// issue #1429 follow-up). `TaskDispatch::ack_many`/`release_many`'s own
+/// default falls back to one round trip per *lease*, not per queue, for a
+/// channel with no batched override. A queue-scaled budget alone would
+/// starve that fallback the same way a flat one starved the pipelined
+/// path. A single busy queue with many leases would get only that
+/// queue's round-trip allowance, however many leases it actually holds.
+/// The deadline is sized for whichever cost model turns out to be true,
+/// not the one this call site's installed channel happens to use. Pass
+/// `0` from a call site with no lease batch, such as the dispatch read.
+fn dispatch_batch_timeout(
+    distinct_queues: usize,
+    round_trips_per_queue: usize,
+    lease_count: usize,
+) -> Duration {
+    let queue_rounds = distinct_queues
+        .max(1)
+        .saturating_mul(round_trips_per_queue.max(1));
+    DISPATCH_CALL_TIMEOUT
+        .saturating_mul(u32::try_from(queue_rounds.max(lease_count)).unwrap_or(u32::MAX))
+}
+
+/// Per-shard block duration for a dispatch-channel read during multi-shard
+/// round-robin scanning (Codex review, issue #1429).
+///
+/// `run_poll_loop_multi` visits shard channels sequentially in one `for`
+/// loop. A read that blocks for the full configured `poll_interval` (the
+/// single-shard contract, C4) therefore serializes every idle shard's turn
+/// behind it. With `n` shards and work on only one, that shard could wait up
+/// to `(n - 1) * poll_interval` between reads. That holds even while a free
+/// permit and work were both available the whole time.
+const MULTI_SHARD_DISPATCH_READ_BLOCK: Duration = Duration::from_millis(10);
+
+/// The block duration a dispatch-channel read uses for one iteration.
+///
+/// `shard_count` is the number of shards the caller's round-robin visits
+/// this scan. `1` (single shard) returns `poll_interval` unchanged: there is
+/// no peer shard to starve, so the long-poll read stays byte-for-byte the
+/// pre-#1429 behaviour (contract C4). More than one caps the block at
+/// [`MULTI_SHARD_DISPATCH_READ_BLOCK`], so an idle shard's read returns
+/// quickly and the round-robin keeps moving instead of parking behind it.
+/// `run_poll_loop_multi`'s own "all idle" NOTIFY-listener wait already
+/// supplies the poll_interval-scale sleep once no shard has work. So
+/// shortening this block adds no extra round trips when every shard is
+/// genuinely idle.
+#[must_use]
+const fn dispatch_read_block(shard_count: usize, poll_interval: Duration) -> Duration {
+    if shard_count > 1 && poll_interval.as_nanos() > MULTI_SHARD_DISPATCH_READ_BLOCK.as_nanos() {
+        MULTI_SHARD_DISPATCH_READ_BLOCK
+    } else {
+        poll_interval
+    }
+}
+
+/// Cap on `maintain`/reconcile-publish during one shard's turn in a
+/// multi-shard round-robin (Codex review, issue #1429 follow-up).
+///
+/// `run_poll_loop_multi` awaits each shard's whole turn sequentially, not
+/// only its read. `dispatch_read_block` already bounds the read half, at
+/// [`MULTI_SHARD_DISPATCH_READ_BLOCK`]. `maintain` and the reconcile
+/// sweep's publish still ran under the flat five-second
+/// [`DISPATCH_CALL_TIMEOUT`]. That bound is sized for a single-shard
+/// worker with no sibling shard waiting its turn. One stalled shard's
+/// `maintain` or publish call could still park every other shard's turn
+/// behind it, for up to five seconds. That held whenever that shard's own
+/// maintenance or reconcile interval came due. Five hundred milliseconds
+/// bounds that blast radius across a fleet of shards. It stays long
+/// enough that an ordinary Redis round trip under load never spuriously
+/// trips it.
+const MULTI_SHARD_DISPATCH_MAINTENANCE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// The deadline `maintain`/reconcile-publish uses for one shard's turn.
+///
+/// `1` (single shard) keeps the flat [`DISPATCH_CALL_TIMEOUT`], unchanged:
+/// there is no sibling shard to starve. More than one caps it at
+/// [`MULTI_SHARD_DISPATCH_MAINTENANCE_TIMEOUT`], the maintenance-call
+/// mirror of [`dispatch_read_block`].
+#[must_use]
+const fn dispatch_maintenance_timeout(shard_count: usize) -> Duration {
+    if shard_count > 1 {
+        MULTI_SHARD_DISPATCH_MAINTENANCE_TIMEOUT
+    } else {
+        DISPATCH_CALL_TIMEOUT
+    }
+}
+
+/// The deadline for the reconcile sweep's publish call (Codex review, issue
+/// #1429 follow-up).
+///
+/// `run_dispatch_reconcile` collects `hints` across every configured queue
+/// before it calls `publish` once. Unlike `maintain`,
+/// `RedisDispatch::publish_inner` then processes those hints queue by
+/// queue, one round trip per distinct queue, sequentially. That is the same
+/// shape `ack_many_inner`/`requeue_batch` already document. Budgeting that
+/// call with [`dispatch_maintenance_timeout`] alone sizes it for one round
+/// trip. A sweep that gathered due references from several queues at once
+/// could then time out partway through. By then the reconcile cursor for
+/// every queue has already advanced past what this call was meant to
+/// publish.
+///
+/// This scales [`dispatch_maintenance_timeout`]'s own per-shard-turn
+/// budget by the number of distinct queues in `hints`, mirroring how
+/// [`dispatch_batch_timeout`] scales the single-shard budget for
+/// `ack_many`/`release_many`. A multi-shard turn keeps its tight
+/// per-queue cap, rather than trading away the head-of-line-blocking
+/// bound `dispatch_maintenance_timeout` exists for.
+#[must_use]
+fn dispatch_reconcile_publish_timeout(
+    shard_count: usize,
+    hints: &[crate::dispatch::DispatchHint],
+) -> Duration {
+    let distinct_queues = hints
+        .iter()
+        .map(|hint| hint.queue_name.as_str())
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+        .max(1);
+    dispatch_maintenance_timeout(shard_count)
+        .saturating_mul(u32::try_from(distinct_queues).unwrap_or(u32::MAX))
 }
 
 /// How many references one read asks for (issue #1312).
@@ -25656,17 +26294,35 @@ async fn dispatch_call<T>(
 /// on an activity permit. `None` means both pools are full: a read now would
 /// hold references that nothing can start, so the caller sleeps instead.
 ///
-/// The sum of the two is the bound. A read never asks for more than the worker
-/// can start, and it never floors to one when no permit is free.
-const fn dispatch_read_size(free_workflow: usize, free_activity: usize) -> Option<usize> {
+/// The sum of the two is the bound, capped at [`DISPATCH_READ_MAX`]. A read
+/// never asks for more than the worker can start, and it never floors to one
+/// when no permit is free.
+///
+/// `shard_count` bounds it further to a fair share of what is free (Codex
+/// review, issue #1429). `run_poll_loop_multi`'s round-robin calls this once
+/// per shard per scan. An uncapped read let the first shard visited claim
+/// the worker's entire free-permit budget in one call, starving every
+/// sibling shard until those tasks finished. `1` (single shard) divides by
+/// one and changes nothing, so the pre-#1429 behaviour is unchanged there.
+const fn dispatch_read_size(
+    free_workflow: usize,
+    free_activity: usize,
+    shard_count: usize,
+) -> Option<usize> {
     let free = free_workflow.saturating_add(free_activity);
     if free == 0 {
         return None;
     }
-    if free < DISPATCH_READ_MAX {
+    let share = free.div_ceil(if shard_count == 0 { 1 } else { shard_count });
+    let bound = if DISPATCH_READ_MAX < share {
+        DISPATCH_READ_MAX
+    } else {
+        share
+    };
+    if free < bound {
         Some(free)
     } else {
-        Some(DISPATCH_READ_MAX)
+        Some(bound)
     }
 }
 
@@ -25860,6 +26516,37 @@ const fn dispatch_kind_admitted(
     }
 }
 
+/// Whether one more lease of `kind` fits this shard's own fair share of its
+/// pool this batch (Codex review, issue #1429).
+///
+/// [`dispatch_read_size`] bounds the whole batch to a fair share of the
+/// *sum* of both pools. That alone does not stop this shard's own claims
+/// from exhausting one kind's pool alone. [`dispatch_kind_admitted`] only
+/// checks the live global total, with no per-shard ceiling. A shard visited
+/// early in a multi-shard round-robin may have a channel that holds mostly
+/// one kind. It could then claim every sibling's share of that kind before
+/// their own turn comes up. Each kind therefore also gets its own
+/// shard-count share (`share_workflow`, `share_activity`). This function
+/// checks that share. It compares the share against how many of that kind
+/// `dispatch_leases` has already claimed this batch (`claimed_workflow`,
+/// `claimed_activity`), rather than against the pool's live total.
+///
+/// `None` is a reference of unknown type. It has no kind-specific pool to
+/// exhaust, so it is always within share.
+const fn dispatch_kind_within_share(
+    kind: Option<crate::dispatch::DispatchKind>,
+    claimed_workflow: usize,
+    share_workflow: usize,
+    claimed_activity: usize,
+    share_activity: usize,
+) -> bool {
+    match kind {
+        Some(crate::dispatch::DispatchKind::Workflow) => claimed_workflow < share_workflow,
+        Some(crate::dispatch::DispatchKind::Activity) => claimed_activity < share_activity,
+        None => true,
+    }
+}
+
 /// Where the next reconcile sweep of one queue starts (issue #1312).
 ///
 /// A full page means rows may still sit below it, so the walk continues from
@@ -25936,6 +26623,29 @@ fn reference_outcome(
     ))
 }
 
+/// What one lease still owes the channel after
+/// [`Worker::consume_reference`] decides its outcome, carrying the lease
+/// back to its caller for that.
+///
+/// [`Worker::dispatch_leases`] collects these across a whole read.
+/// It settles them in one `ack_many`/`release_many` call, instead of
+/// one channel round trip per lease (Codex review, issue #1429).
+#[derive(Debug, PartialEq, Eq)]
+enum ReferenceDisposition {
+    /// Claimed and dispatched. The lease still owes an `ack`.
+    Dispatched(crate::dispatch::DispatchLease),
+    /// Not claimed; the row is already terminal. The lease owes an `ack`.
+    AlreadyTerminal(crate::dispatch::DispatchLease),
+    /// Not claimed and retryable. The lease owes a `release` after this
+    /// delay.
+    Retry(crate::dispatch::DispatchLease, Duration),
+    /// [`Worker::retry_reference`] already disposed of this lease, on a
+    /// pool or probe failure. That path is a single lease's own error
+    /// recovery, not the common claim path this batches. Nothing left
+    /// for the caller to settle.
+    Handled,
+}
+
 impl Worker {
     /// Create a new worker from validated config and a handler registry.
     ///
@@ -25943,6 +26653,44 @@ impl Worker {
     ///
     /// Returns [`HarvestError::Config`] if the config fails validation.
     pub fn new(config: WorkerRuntimeConfig, registry: Arc<HandlerRegistry>) -> HarvestResult<Self> {
+        Self::new_with_expected_shard_generations(config, registry, None)
+    }
+
+    /// As [`Worker::new`], but verifies each of `expected_shard_generations`'
+    /// shards against the generation its own install call stamped. This
+    /// happens before this construction captures it (Codex review, issue
+    /// #1429 follow-up).
+    ///
+    /// `HarvestRunner::start` installs this runtime's own per-shard dispatch
+    /// topology, then does further fallible work — at least one `.await` —
+    /// before it ever reaches `Worker::new`. A second, overlapping `start`
+    /// call can install its own topology into that gap. Plain `Worker::new`
+    /// re-reads the global slot at construction time, synchronously with
+    /// its own coverage check. But it cannot distinguish two channels. One
+    /// was installed a moment ago, by this runtime's own call. The other
+    /// is a stranger's, that landed in the gap before this call ran.
+    ///
+    /// Pass the generations `dispatch::install_shards`/`install_for_shard`
+    /// returned to that install call here instead. See
+    /// [`capture_shard_dispatch`] for what a mismatch means and how it is
+    /// handled.
+    ///
+    /// Most callers, including every test in this crate, are a direct
+    /// embedder with no separate install call to compare against. They
+    /// have nothing to pass here. Call [`Worker::new`] instead. That is
+    /// exactly this with `expected_shard_generations: None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Config`] if the config fails validation. Also
+    /// returns it if a dispatch channel is installed but a multi-shard span
+    /// it needs does not have full per-shard coverage. That includes a
+    /// shard whose channel a racing install has since replaced.
+    pub fn new_with_expected_shard_generations(
+        config: WorkerRuntimeConfig,
+        registry: Arc<HandlerRegistry>,
+        expected_shard_generations: Option<&[(crate::types::ShardId, u64)]>,
+    ) -> HarvestResult<Self> {
         // Resolve auto (empty) shard assignments against the pool that is now
         // final (issue #961, AC1). `From<WorkerConfig>` deliberately does NOT
         // run this — a runner assigns `sharded_pool` onto the runtime config
@@ -25985,14 +26733,39 @@ impl Worker {
         crate::builder::validate_activity_rate_limits(registry.activities.values())
             .map_err(|err| HarvestError::Config(err.to_string()))?;
 
-        // Redis dispatch is single-shard in v1 (issue #1312). The channel
-        // carries a task id and no connection. A worker that drains several
-        // shards cannot tell which pool holds the named row. A reference read
-        // on one shard would then be claimed against another shard's database
-        // and always miss. Reject the combination at startup rather than let
-        // it degrade to a silent no-claim loop. `shard` on `DispatchHint`
-        // carries the follow-up that lifts this limit.
-        if crate::dispatch::installed().is_some() {
+        // A worker that spans several shards cannot tell, from a task id
+        // alone, which shard's database holds the named row. A
+        // single-channel read on one shard would then be claimed against
+        // another shard's database and always miss. `Worker::new` therefore
+        // requires either a single-shard span with the single-shard channel
+        // installed (`dispatch::install`). Or it requires a per-shard
+        // channel installed for every one of this worker's
+        // `shard_assignments` (`dispatch::install_for_shard`, issue #1429).
+        // The multi-shard poll loop reads and claims each shard against its
+        // own matching pair.
+        //
+        // Capture happens in the same pass as the coverage check below, not
+        // a separate one after it (Codex review, issue #1429 follow-up). A
+        // racing install landing between two separate reads could make the
+        // check see one set of channels and the capture see another. That
+        // would silently start this worker on an incomplete
+        // `shard_dispatch` it never actually validated. See
+        // `capture_shard_dispatch`'s own doc comment for the
+        // `expected_shard_generations` half of this.
+        let (shard_dispatch, shard_dispatch_covered) =
+            capture_shard_dispatch(&config.shard_assignments, expected_shard_generations);
+
+        // Captured once here, alongside `shard_dispatch` above, rather than
+        // read live in `run_poll_loop` (Codex review, issue #1429 follow-up).
+        // A live `dispatch::installed()` read in that loop could pick up a
+        // *later*, unrelated install -- a replacement runner's own global
+        // slot. That could land well after this worker was constructed.
+        // This worker's own database pool was never validated against
+        // that channel. `shard_dispatch` above is captured rather than
+        // read live for exactly the same reason.
+        let mut global_dispatch = None;
+
+        if crate::dispatch::is_installed() {
             let shard_count = config.shard_assignments.len();
             #[cfg(feature = "db")]
             let pool_shards = config
@@ -26001,12 +26774,26 @@ impl Worker {
                 .map_or(0, crate::shard::ShardedDbPool::len);
             #[cfg(not(feature = "db"))]
             let pool_shards = 0;
-            if !dispatch_allowed_for_span(shard_count, pool_shards) {
+            // A direct embedder may install both the global slot and a
+            // complete set of per-shard channels (Codex review, issue
+            // #1429). `install_for_shard`'s own doc comment says the
+            // global slot stays untouched, so that combination is a
+            // supported state, not stale runner state. The multi-shard
+            // poll loop only ever reads the per-shard pair regardless. A
+            // wide span is covered whenever either condition holds on its
+            // own, not only when the global slot's span is one.
+            global_dispatch = crate::dispatch::installed();
+            let single_shard_channel = global_dispatch.is_some();
+            let covered = (single_shard_channel
+                && dispatch_allowed_for_span(shard_count, pool_shards))
+                || shard_dispatch_covered;
+            if !covered {
                 return Err(HarvestError::Config(format!(
                     "a dispatch channel is installed and this worker spans \
                      {shard_count} shard assignments and {pool_shards} sharded pool \
-                     entries; dispatch supports single-shard runtimes only in v1 \
-                     (issue #1312)"
+                     entries; a wide span needs either a single-shard channel and \
+                     a span of one, or a per-shard channel installed for every \
+                     assigned shard (issue #1429)"
                 )));
             }
 
@@ -26070,6 +26857,8 @@ impl Worker {
                 std::collections::HashMap::new(),
             )),
             session_slots_in_use: crate::sessions::new_session_slot_registry(),
+            shard_dispatch,
+            global_dispatch,
         })
     }
 
@@ -26596,10 +27385,27 @@ impl Worker {
 
         let shard_listeners = self.build_shard_listeners(&shard_targets).await;
 
+        // Use each assigned shard's dispatch channel, captured once by
+        // `Worker::new` and held for the whole loop (Codex review, issue
+        // #1429 follow-up). A `None` entry here means dispatch was never
+        // installed for this span; that shard then polls Postgres, same as
+        // no channel at all.
+        //
+        // This reads `self.shard_dispatch`, not `dispatch::installed_for_shard`
+        // again. See `Worker::new`'s own capture site for why re-reading
+        // global state here is risky. This task starts well after that
+        // validation, in exactly the gap a racing, overlapping runner's
+        // own install could land in.
+        let shard_dispatch: Vec<Option<crate::dispatch::InstalledDispatch>> = shard_targets
+            .iter()
+            .map(|(shard, _)| self.shard_dispatch.get(shard).cloned())
+            .collect();
+
         self.run_poll_loop_multi(
             shard_targets.clone(),
             shard_listeners,
             &registration_pending_per_shard,
+            &shard_dispatch,
         )
         .await;
 
@@ -26659,11 +27465,20 @@ impl Worker {
         shard_targets: Vec<(crate::types::ShardId, DbPool)>,
         mut shard_listeners: Vec<Option<crate::notify::QueueListener>>,
         registration_pending_per_shard: &[Arc<AtomicBool>],
+        shard_dispatch: &[Option<crate::dispatch::InstalledDispatch>],
     ) {
         let n = shard_targets.len();
         // Rotating start index prevents the first shard from being permanently
         // favoured when multiple shards have work (fix #4).
         let mut start_idx = 0usize;
+        // One dispatch-loop state per shard (issue #1429), inert for a shard
+        // with no channel installed. Persisted across iterations, unlike
+        // `shard_dispatch` itself: the reconcile cursor and the degraded-mode
+        // cooldown must survive from one iteration to the next.
+        let mut dispatch_states: Vec<DispatchLoopState> = shard_targets
+            .iter()
+            .map(|_| DispatchLoopState::new())
+            .collect();
 
         while !self.shutdown.is_cancelled() {
             let mut any_claimed = false;
@@ -26682,26 +27497,37 @@ impl Worker {
                 )) {
                     continue;
                 }
-                if self
-                    .poll_once(
+                // Issue #1429: a shard with its own dispatch channel installed
+                // reads and claims through it, exactly like the single-pool
+                // loop's dispatch branch. A shard with none polls Postgres,
+                // unchanged.
+                let dispatched: u32 = if let Some(installed) = &shard_dispatch[idx] {
+                    self.run_dispatch_iteration(
                         &shard_targets[idx].1,
-                        shard_acquire_bound(true, self.config.poll_interval),
                         Some(shard_targets[idx].0),
+                        installed,
+                        &mut dispatch_states[idx],
+                        n,
                     )
                     .await
-                {
+                } else {
+                    u32::from(
+                        self.poll_once(
+                            &shard_targets[idx].1,
+                            shard_acquire_bound(true, self.config.poll_interval),
+                            Some(shard_targets[idx].0),
+                        )
+                        .await,
+                    )
+                };
+                if dispatched > 0 {
                     any_claimed = true;
-                    // Per-shard dispatch counter (issue #961, AC5). Emitted
-                    // here rather than inside `poll_once`/`dispatch_task`
-                    // because a task row carries no `shard_id` column — "which
-                    // shard" *is* "which pool", and only the poll loop knows
-                    // which pool it just claimed from. `poll_once` returns
-                    // `true` exactly when it dispatched, so this counts
-                    // dispatches, not poll attempts.
-                    self.registry
-                        .telemetry()
-                        .metrics
-                        .record_shard_dispatched(shard_metric_label(shard_targets[idx].0));
+                    // Per-shard dispatch counter (issue #961, AC5), once per
+                    // dispatched task (issue #1429, Codex review) rather than
+                    // once per poll call. A batched dispatch-channel read may
+                    // claim several leases in one `run_dispatch_iteration`
+                    // call, and `poll_once` always dispatches at most one.
+                    self.record_shard_dispatched_many(shard_targets[idx].0, dispatched);
                     // Advance start past the shard that just claimed so the
                     // next hot iteration tries the next shard first.
                     start_idx = (idx + 1) % n;
@@ -26855,6 +27681,9 @@ impl Worker {
             && let Err(error) = handle.await
         {
             tracing::warn!(error = %error, "queue pause sampler failed during shutdown");
+        }
+        if let Err(error) = monitors.dispatch_metrics_sampler.await {
+            tracing::warn!(error = %error, "dispatch metrics sampler failed during shutdown");
         }
         for handle in monitors.slot_tuners {
             if let Err(error) = handle.await {
@@ -27266,6 +28095,12 @@ impl Worker {
         ));
         #[cfg(not(feature = "db"))]
         let queue_pause_sampler: Option<tokio::task::JoinHandle<()>> = None;
+        // Issue #1429: no database read, so this runs on every build.
+        let dispatch_metrics_sampler = spawn_dispatch_metrics_sampler(
+            self.shutdown.clone(),
+            self.registry.telemetry().clone(),
+            self.config.poll_interval,
+        );
         // Poison-pill reclaimer, pause auto-resumer, and timeout checker all run
         // per-shard so that orphaned tasks, over-long pauses, and timed-out
         // tasks/executions on every assigned shard are recovered (fix #3,
@@ -27325,7 +28160,7 @@ impl Worker {
         let timeout_checkers: Vec<_> = shard_pools_for_monitors
             .iter()
             .map(|(shard_pool, shard)| {
-                crate::timeout::spawn_timeout_checker_for_shard(
+                crate::timeout::spawn_timeout_checker_on_shard_pool(
                     shard_pool.clone(),
                     self.shutdown.clone(),
                     self.config.poll_interval,
@@ -27336,6 +28171,9 @@ impl Worker {
                     self.registry.circuit_breakers(),
                     self.config.max_workflow_history_events,
                     worker_stale_secs,
+                    *shard,
+                    // `shard_pool` is this shard's own pool: see how
+                    // `shard_pools_for_monitors` pairs them above.
                     *shard,
                     self.registry.payload_codecs().clone(),
                     self.config.codec_rotation_batch_size,
@@ -27749,6 +28587,7 @@ impl Worker {
             replication_sampler,
             schedule_overdue_sampler,
             queue_pause_sampler,
+            dispatch_metrics_sampler,
             slot_tuners,
             workflow_slot_target,
             activity_slot_target,
@@ -27827,19 +28666,39 @@ impl Worker {
     /// outcome table in [`reference_outcome`]. Maintenance and the reconcile
     /// sweep run on their own intervals from here.
     ///
-    /// Returns `true` when at least one task was dispatched.
+    /// Returns how many tasks were dispatched (Codex review, issue #1429).
+    /// A batched read can claim more than one lease in a single call. A
+    /// caller that counts dispatches needs the real total, not a bool.
     ///
     /// On a channel error it enters degraded mode. The worker then drains
     /// through [`Self::drain_postgres`] until the cooldown elapses. Availability
     /// equals the Postgres path while the channel is unreachable.
+    ///
+    /// `shard_count` follows [`dispatch_read_block`] and [`dispatch_read_size`]
+    /// (Codex review, issue #1429). More than one bounds the channel read's
+    /// block duration and its size. That keeps a caller round-robining
+    /// several shards from parking behind one idle shard's full
+    /// `poll_interval`. It also stops one busy shard from claiming every
+    /// sibling's fair share of free permits. `1` (single shard) leaves both
+    /// unbounded, byte-for-byte the pre-#1429 behaviour.
+    ///
+    /// `shard_count` also bounds `maintain` and the reconcile sweep's
+    /// publish through [`dispatch_maintenance_timeout`] (Codex review,
+    /// issue #1429 follow-up). The read bound alone left this turn's
+    /// other two channel calls under the flat, single-shard-sized
+    /// [`DISPATCH_CALL_TIMEOUT`]. One stalled shard's maintenance or
+    /// reconcile call could then still park every sibling shard's turn
+    /// behind it, for up to five seconds.
     async fn run_dispatch_iteration(
         &self,
         pool: &DbPool,
         shard: Option<crate::types::ShardId>,
         installed: &crate::dispatch::InstalledDispatch,
         state: &mut DispatchLoopState,
-    ) -> bool {
+        shard_count: usize,
+    ) -> u32 {
         let settings = &installed.settings;
+        let block_for = dispatch_read_block(shard_count, settings.poll_interval);
 
         // Degraded mode (issue #1312). The channel failed recently, so this
         // iteration does not touch it. A channel call that fails costs the poll
@@ -27847,58 +28706,86 @@ impl Worker {
         // below the Postgres rate. The cooldown expires on its own, and the
         // next iteration probes the channel again.
         if state.degraded.is_degraded() {
-            return self.drain_postgres(pool, shard).await;
+            return self.drain_postgres(pool, shard, shard_count).await;
         }
 
         // A maintenance success does not clear the degraded window. Only a
         // successful reference read does. See
         // [`DispatchDegradation::record_read_success`].
         if DispatchLoopState::due(&mut state.maintained, settings.poll_interval)
-            && let Err(error) = dispatch_call(
+            && let Err(error) = dispatch_call_with_timeout(
                 installed.channel.maintain(&self.config.queues),
                 "maintenance",
+                dispatch_maintenance_timeout(shard_count),
             )
             .await
         {
             self.enter_degraded(state, &error, "dispatch maintenance failed", settings);
-            return self.drain_postgres(pool, shard).await;
+            return self.drain_postgres(pool, shard, shard_count).await;
         }
 
         if DispatchLoopState::due(&mut state.reconciled, settings.reconcile_interval)
-            && !self.run_dispatch_reconcile(pool, installed, state).await
+            && !self
+                .run_dispatch_reconcile(pool, installed, state, shard_count)
+                .await
         {
-            return self.drain_postgres(pool, shard).await;
+            return self.drain_postgres(pool, shard, shard_count).await;
         }
 
-        // One read sized to the free permits of each pool, so the worker never
-        // holds more references than it can start. The semaphores gate
-        // execution, not claiming, so this is a bound and not a guarantee.
+        // One read sized to a fair share of the free permits of each pool
+        // (issue #1429). So the worker never holds more references than it
+        // can start, and one shard cannot claim every sibling's share in a
+        // multi-shard round-robin. The semaphores gate execution, not
+        // claiming, so this is a bound and not a guarantee.
         let Some(want) = dispatch_read_size(
             self.workflow_semaphore.available_permits(),
             self.activity_semaphore.available_permits(),
+            shard_count,
         ) else {
             // Both pools are full. A reference read now would sit in this
             // worker's hands until a permit frees, which keeps it from a peer
-            // that has one. Sleep one poll interval instead.
+            // that has one. Wait for a permit to free, capped at one poll
+            // interval (issue #1429). A bare sleep here held every claim on
+            // this worker idle for the whole interval. That happened even
+            // when a running task finished and freed a permit a moment
+            // later. Acquiring and immediately dropping a permit only
+            // detects that one is free. It never withholds it from a peer
+            // or from this same call's own `dispatch_kind_admitted` check on
+            // the next iteration.
             tokio::select! {
                 () = self.shutdown.cancelled() => {}
                 () = tokio::time::sleep(self.config.poll_interval) => {}
+                Ok(permit) = self.workflow_semaphore.acquire() => { drop(permit); }
+                Ok(permit) = self.activity_semaphore.acquire() => { drop(permit); }
             }
-            return false;
+            return 0;
         };
 
-        // The read blocks for `poll_interval` by contract, so its cap is that
-        // wait plus the call timeout (contract C4). The shutdown arm gives a
-        // stopping worker its exit without waiting out the read.
+        // The read blocks for `block_for` (contract C4 for a single shard;
+        // capped by `dispatch_read_block` when round-robining several). Its
+        // cap is that wait plus a call timeout scaled by queue count
+        // (Codex review, issue #1429), same as
+        // [`dispatch_batch_timeout`]/[`dispatch_call_with_timeout`].
+        // A channel read across many queues does at least one round trip
+        // per queue before its own blocking phase even starts. See
+        // `read_across_queues`'s doc comment. A flat call timeout sized
+        // for one round trip can then fire before that pass alone
+        // finishes. `tokio::time::timeout` drops the whole future on
+        // expiry. An entry the read had already claimed from an earlier
+        // queue then never reaches the channel's own requeue-on-drop
+        // path. It sits pending until visibility recovery, not just
+        // delayed. The shutdown arm gives a stopping worker its exit
+        // without waiting out the read.
+        let read_timeout = block_for + dispatch_batch_timeout(self.config.queues.len(), 1, 0);
         let read = tokio::select! {
-            () = self.shutdown.cancelled() => return false,
+            () = self.shutdown.cancelled() => return 0,
             result = tokio::time::timeout(
-                settings.poll_interval + DISPATCH_CALL_TIMEOUT,
+                read_timeout,
                 installed.channel.next(
                     &self.config.queues,
                     &self.config.worker_id,
                     want,
-                    settings.poll_interval,
+                    block_for,
                 ),
             ) => result,
         };
@@ -27910,40 +28797,91 @@ impl Worker {
             }
             Ok(Err(error)) => {
                 self.enter_degraded(state, &error, "dispatch read failed", settings);
-                return self.drain_postgres(pool, shard).await;
+                return self.drain_postgres(pool, shard, shard_count).await;
             }
             Err(_) => {
                 let error = HarvestError::Dispatch(format!(
-                    "dispatch read did not answer within {:?}",
-                    settings.poll_interval + DISPATCH_CALL_TIMEOUT
+                    "dispatch read did not answer within {read_timeout:?}"
                 ));
                 self.enter_degraded(state, &error, "dispatch read timed out", settings);
-                return self.drain_postgres(pool, shard).await;
+                return self.drain_postgres(pool, shard, shard_count).await;
             }
         };
 
-        let mut dispatched = false;
-        for lease in leases {
+        self.dispatch_leases(pool, shard, installed, state, leases, shard_count)
+            .await
+    }
+
+    /// Claim and dispatch each lease from one dispatch-channel read.
+    ///
+    /// Returns how many were actually dispatched (issue #1429; extracted
+    /// from [`Self::run_dispatch_iteration`] to keep that function's line
+    /// count under clippy's `too_many_lines` threshold).
+    async fn dispatch_leases(
+        &self,
+        pool: &DbPool,
+        shard: Option<crate::types::ShardId>,
+        installed: &crate::dispatch::InstalledDispatch,
+        state: &mut DispatchLoopState,
+        leases: Vec<crate::dispatch::DispatchLease>,
+        shard_count: usize,
+    ) -> u32 {
+        let mut dispatched = 0u32;
+        // Leases this iteration gives straight back with no claim attempt
+        // (shutdown, or no free permit for the pool a reference needs). None
+        // of these was ever claimed, so batching their disposal costs only a
+        // little latency on an already-released reference, never a lost or
+        // duplicated one. One `release_many` call replaces one `release` call
+        // per such lease (issue #1429).
+        let mut to_release: Vec<(crate::dispatch::DispatchLease, Duration)> = Vec::new();
+        // Leases `consume_reference` claimed and dispatched, or found already
+        // terminal. One `ack_many` call replaces one `ack` call per such
+        // lease (Codex review, issue #1429). A normal batch used to pay up to
+        // `DISPATCH_READ_MAX` separate acknowledgement round trips, despite
+        // `ack_many` already existing on the trait.
+        let mut to_ack: Vec<crate::dispatch::DispatchLease> = Vec::new();
+        // Each kind's fair share of this batch, snapshotted once per shard's
+        // turn. See [`dispatch_kind_within_share`] for why the read-size
+        // share is not enough on its own (Codex review, issue #1429).
+        let divisor = shard_count.max(1);
+        let share_workflow =
+            Self::free_permits(&self.workflow_semaphore, &self.dispatch_reserved_workflow)
+                .div_ceil(divisor);
+        let share_activity =
+            Self::free_permits(&self.activity_semaphore, &self.dispatch_reserved_activity)
+                .div_ceil(divisor);
+        let mut claimed_workflow = 0usize;
+        let mut claimed_activity = 0usize;
+        let mut leases = leases.into_iter();
+        while let Some(lease) = leases.next() {
             if self.shutdown.is_cancelled() {
-                // Give the reference straight back so a peer serves it now.
-                let _ = dispatch_call(installed.channel.release(&lease, Duration::ZERO), "release")
-                    .await;
-                continue;
+                // Give every remaining reference straight back so a peer
+                // serves them now.
+                to_release.push((lease, Duration::ZERO));
+                to_release.extend(leases.map(|lease| (lease, Duration::ZERO)));
+                break;
             }
-            if !dispatch_kind_admitted(
+            if !dispatch_kind_within_share(
+                lease.kind,
+                claimed_workflow,
+                share_workflow,
+                claimed_activity,
+                share_activity,
+            ) || !dispatch_kind_admitted(
                 lease.kind,
                 Self::free_permits(&self.workflow_semaphore, &self.dispatch_reserved_workflow),
                 Self::free_permits(&self.activity_semaphore, &self.dispatch_reserved_activity),
             ) {
-                // No permit for this pool. Give the reference straight back, so
-                // a peer with capacity reads it on its next poll.
-                let _ = dispatch_call(installed.channel.release(&lease, Duration::ZERO), "release")
-                    .await;
+                // No permit for this pool, or this shard's own share of it is
+                // already spent this batch. Give the reference straight
+                // back, so a peer with capacity reads it on its next poll.
+                to_release.push((lease, Duration::ZERO));
                 continue;
             }
             // The reservation is taken before the claim and lives until the
             // spawned task holds its permit. See [`DispatchReservation`].
-            let reservation = match lease.kind {
+            let kind = lease.kind;
+            let reservation = match kind {
                 Some(crate::dispatch::DispatchKind::Workflow) => {
                     Some(DispatchReservation::new(&self.dispatch_reserved_workflow))
                 }
@@ -27952,9 +28890,73 @@ impl Worker {
                 }
                 None => None,
             };
-            dispatched |= self
-                .consume_reference(pool, shard, installed, state, lease, reservation)
-                .await;
+            match self
+                .consume_reference(pool, shard, installed, lease, reservation, shard_count)
+                .await
+            {
+                ReferenceDisposition::Dispatched(lease) => {
+                    dispatched += 1;
+                    // Only a reference this shard actually dispatched spends
+                    // its share of the pool (Codex review, issue #1429). A
+                    // stale, gated, or otherwise unclaimable reference used
+                    // to spend it too, before `consume_reference` ever ran.
+                    // That could exhaust the share on references this shard
+                    // never ran. Every later claimable lease of the same
+                    // kind in this batch would then go back to
+                    // `to_release`, even with ready capacity left.
+                    match kind {
+                        Some(crate::dispatch::DispatchKind::Workflow) => claimed_workflow += 1,
+                        Some(crate::dispatch::DispatchKind::Activity) => claimed_activity += 1,
+                        None => {}
+                    }
+                    to_ack.push(lease);
+                }
+                ReferenceDisposition::AlreadyTerminal(lease) => to_ack.push(lease),
+                ReferenceDisposition::Retry(lease, delay) => to_release.push((lease, delay)),
+                ReferenceDisposition::Handled => {}
+            }
+        }
+        // A failed batched call is still self-healing. A stuck ack costs one
+        // redelivery; a stuck release costs one visibility-timeout wait. So
+        // neither error changes what this call returns. But swallowing it
+        // silently, with no log at all, was strictly worse than the
+        // per-lease path it replaced (Codex review, issue #1429). An ACL
+        // may permit reads but deny writes, or one queue's key may carry
+        // the wrong type. Either would then stay invisible until an
+        // operator noticed the redelivery rate. `log_dispatch_error`
+        // restores that visibility,
+        // throttled the same way a read/maintain/reconcile failure already
+        // is.
+        if !to_ack.is_empty() {
+            let queues: HashSet<&str> = to_ack.iter().map(|l| l.queue_name.as_str()).collect();
+            // Two round trips per queue for the pipelined path
+            // (`ack_many_inner`'s XACK/XDEL pipeline, then its separate
+            // marker-cleanup script). Or one round trip per lease for the
+            // trait's default fallback (Codex review, issue #1429
+            // follow-up) — whichever this installed channel actually costs.
+            let timeout = dispatch_batch_timeout(queues.len(), 2, to_ack.len());
+            if let Err(error) =
+                dispatch_call_with_timeout(installed.channel.ack_many(&to_ack), "ack", timeout)
+                    .await
+            {
+                self.log_dispatch_error(state, &error, "dispatch batched ack failed");
+            }
+        }
+        if !to_release.is_empty() {
+            let queues: HashSet<&str> = to_release
+                .iter()
+                .map(|(lease, _)| lease.queue_name.as_str())
+                .collect();
+            let timeout = dispatch_batch_timeout(queues.len(), 1, to_release.len());
+            if let Err(error) = dispatch_call_with_timeout(
+                installed.channel.release_many(&to_release),
+                "release",
+                timeout,
+            )
+            .await
+            {
+                self.log_dispatch_error(state, &error, "dispatch batched release failed");
+            }
         }
         dispatched
     }
@@ -27976,27 +28978,89 @@ impl Worker {
     /// call. A channel call that fails can cost the poll interval plus the call
     /// timeout. One claim per call is a throughput collapse, not a fallback.
     ///
-    /// Returns `true` when at least one task was dispatched.
-    async fn drain_postgres(&self, pool: &DbPool, shard: Option<crate::types::ShardId>) -> bool {
-        let mut dispatched = false;
+    /// `shard_count` follows [`dispatch_read_block`] (Codex review, issue
+    /// #1429). The closing wait is capped the same way the channel read
+    /// is. So one shard's degraded-mode fallback does not park a
+    /// multi-shard round-robin behind it for a full `poll_interval`. The
+    /// connection wait is bounded too, the same bound `poll_once`'s
+    /// sibling branches already use. More than one also caps the drain
+    /// loop itself at one claim. Unbounded draining of a large or
+    /// continuously-refilled backlog on one degraded shard would otherwise
+    /// starve every later shard's turn. That holds for as long as that
+    /// backlog kept it busy, which the closing-wait cap alone does not
+    /// prevent. `1` (single shard) keeps draining the whole backlog before
+    /// its wait, unchanged.
+    ///
+    /// The closing wait only runs when the loop exits idle, not when a
+    /// multi-shard turn exits after its one claim (Codex review, issue
+    /// #1429 follow-up). Waiting after a successful claim capped a
+    /// continuously-backlogged shard's throughput at one claim per
+    /// `dispatch_read_block`. Its current low multi-shard bound gives
+    /// roughly a hundred claims per second per worker, far below the
+    /// uncapped rate the pre-multi-shard fallback drained at. Returning
+    /// immediately after a claim instead lets the round-robin revisit this
+    /// shard on its very next turn, with no artificial pace on real work.
+    ///
+    /// Returns how many tasks were dispatched (`poll_once` claims at most one
+    /// per call, so this is the number of loop iterations that claimed).
+    async fn drain_postgres(
+        &self,
+        pool: &DbPool,
+        shard: Option<crate::types::ShardId>,
+        shard_count: usize,
+    ) -> u32 {
+        let mut dispatched = 0u32;
+        let mut idle = false;
         while !self.shutdown.is_cancelled() {
             if !self
                 .poll_once(
                     pool,
-                    shard_acquire_bound(false, self.config.poll_interval),
+                    shard_acquire_bound(shard_count > 1, self.config.poll_interval),
                     shard,
                 )
                 .await
             {
+                idle = true;
                 break;
             }
-            dispatched = true;
+            dispatched += 1;
+            if shard_count > 1 {
+                break;
+            }
         }
-        tokio::select! {
-            () = self.shutdown.cancelled() => {}
-            () = tokio::time::sleep(self.config.poll_interval) => {}
+        // The wait only paces an idle poll (issue #1429 review). A
+        // multi-shard turn that just claimed a row returns immediately
+        // instead. The round-robin can then rotate to the next shard,
+        // rather than sitting out `dispatch_read_block` with backlog
+        // still waiting. Single-shard mode only ever exits this loop
+        // idle, so it always waits, unchanged.
+        if idle {
+            let wait = dispatch_read_block(shard_count, self.config.poll_interval);
+            tokio::select! {
+                () = self.shutdown.cancelled() => {}
+                () = tokio::time::sleep(wait) => {}
+            }
         }
         dispatched
+    }
+
+    /// Emit [`Metrics::record_shard_dispatched`] once per dispatched task
+    /// (Codex review, issue #1429).
+    ///
+    /// A batched dispatch-channel read can claim several leases in one
+    /// `run_dispatch_iteration` call. Emitting the counter once per call
+    /// regardless of the batch size under-reported by up to
+    /// `DISPATCH_READ_MAX`. So the per-shard dispatch-rate dashboard no
+    /// longer matched the counter's documented meaning. A no-op for `count
+    /// == 0`.
+    fn record_shard_dispatched_many(&self, shard: crate::types::ShardId, count: u32) {
+        let label = shard_metric_label(shard);
+        for _ in 0..count {
+            self.registry
+                .telemetry()
+                .metrics
+                .record_shard_dispatched(label);
+        }
     }
 
     /// Log a channel error and open the degraded-mode cooldown it earns.
@@ -28018,26 +29082,27 @@ impl Worker {
         }
     }
 
-    /// Claim the row one reference names, then ack or release the reference.
+    /// Claim the row one reference names, then say what its caller still
+    /// owes it.
     ///
-    /// Returns `true` when the row was claimed and dispatched.
+    /// Returns the disposition [`Worker::dispatch_leases`] settles.
     ///
-    /// One reference is disposed of per call. [`crate::dispatch::TaskDispatch`]
-    /// takes one lease per `ack` and per `release`, so a batched disposal for
-    /// the whole read would need a trait change. That is a follow-up, not a
-    /// change this path can make on its own.
+    /// `shard_count` follows [`dispatch_read_block`] (Codex review, issue
+    /// #1429). More than one bounds the pool-connection wait, the same
+    /// bound `poll_once`'s sibling branches already use. So an exhausted
+    /// pool on this shard cannot strand the round-robin's other shards.
     async fn consume_reference(
         &self,
         pool: &DbPool,
         shard: Option<crate::types::ShardId>,
         installed: &crate::dispatch::InstalledDispatch,
-        state: &mut DispatchLoopState,
         lease: crate::dispatch::DispatchLease,
         reservation: Option<DispatchReservation>,
-    ) -> bool {
+        shard_count: usize,
+    ) -> ReferenceDisposition {
         let mut conn = match acquire_shard_conn(
             pool,
-            shard_acquire_bound(false, self.config.poll_interval),
+            shard_acquire_bound(shard_count > 1, self.config.poll_interval),
         )
         .await
         {
@@ -28047,7 +29112,7 @@ impl Worker {
                 // The pool is unavailable, not the row, so give the reference
                 // straight back and let the next iteration try again.
                 self.retry_reference(installed, &lease).await;
-                return false;
+                return ReferenceDisposition::Handled;
             }
         };
 
@@ -28072,17 +29137,13 @@ impl Worker {
                 // pending list; recovery redelivers it, the row reads
                 // `RUNNING`, and the redelivered reference is acked.
                 //
-                // The pool connection goes back before the ack. The ack is a
-                // round trip to the channel. Holding a connection across it
-                // would keep one connection busy per in-flight reference, for a
-                // call the database has no part in (issue #1312 review).
+                // The pool connection goes back before the caller's batched
+                // ack. The ack is a round trip to the channel. Holding a
+                // connection across it would keep one connection busy per
+                // in-flight reference, for a call the database has no part
+                // in (issue #1312 review).
                 drop(conn);
                 chaos_point!(DISPATCH_AFTER_CLAIM_BEFORE_ACK);
-                if let Err(error) = dispatch_call(installed.channel.ack(&lease), "ack").await {
-                    // The claim is durable either way. A failed ack costs one
-                    // redelivery, which finds the row `RUNNING` and acks.
-                    self.log_dispatch_error(state, &error, "dispatch ack failed after a claim");
-                }
                 tracing::debug!(
                     task_id = %task.id,
                     task_type = %task.task_type,
@@ -28090,7 +29151,7 @@ impl Worker {
                     "claimed task (dispatch)"
                 );
                 self.dispatch_task(task, pool, reservation);
-                true
+                ReferenceDisposition::Dispatched(lease)
             }
             Ok(None) => {
                 let probe = match queue::dispatch_probe(&mut conn, lease.task_id).await {
@@ -28099,7 +29160,7 @@ impl Worker {
                         tracing::warn!(error = %error, task_id = %lease.task_id, "dispatch probe failed");
                         drop(conn);
                         self.retry_reference(installed, &lease).await;
-                        return false;
+                        return ReferenceDisposition::Handled;
                     }
                 };
                 let outcome = reference_outcome(
@@ -28108,27 +29169,19 @@ impl Worker {
                     chrono::Utc::now(),
                     &installed.settings,
                 );
-                // Same reason as the claimed arm: the disposal is a channel
-                // round trip, so the connection goes back first.
+                // Same reason as the claimed arm: disposal is a channel round
+                // trip the caller batches, so the connection goes back first.
                 drop(conn);
-                let result = match outcome {
-                    ReferenceOutcome::Ack => {
-                        dispatch_call(installed.channel.ack(&lease), "ack").await
-                    }
-                    ReferenceOutcome::Release(delay) => {
-                        dispatch_call(installed.channel.release(&lease, delay), "release").await
-                    }
-                };
-                if let Err(error) = result {
-                    self.log_dispatch_error(state, &error, "dispatch reference disposal failed");
+                match outcome {
+                    ReferenceOutcome::Ack => ReferenceDisposition::AlreadyTerminal(lease),
+                    ReferenceOutcome::Release(delay) => ReferenceDisposition::Retry(lease, delay),
                 }
-                false
             }
             Err(error) => {
                 tracing::error!(error = %error, task_id = %lease.task_id, "failed to claim a dispatched task");
                 drop(conn);
                 self.retry_reference(installed, &lease).await;
-                false
+                ReferenceDisposition::Handled
             }
         }
     }
@@ -28148,15 +29201,21 @@ impl Worker {
     /// Returns `false` when a channel call failed, so the caller can enter
     /// degraded mode. A database failure returns `true`: the database is not
     /// the channel, and the Postgres claim path cannot help with it.
+    ///
+    /// `shard_count` follows [`dispatch_read_block`] (Codex review, issue
+    /// #1429). More than one bounds the pool-connection wait, the same
+    /// bound `poll_once`'s sibling branches already use. So an exhausted
+    /// pool on this shard cannot strand the round-robin's other shards.
     async fn run_dispatch_reconcile(
         &self,
         pool: &DbPool,
         installed: &crate::dispatch::InstalledDispatch,
         state: &mut DispatchLoopState,
+        shard_count: usize,
     ) -> bool {
         let mut conn = match acquire_shard_conn(
             pool,
-            shard_acquire_bound(false, self.config.poll_interval),
+            shard_acquire_bound(shard_count > 1, self.config.poll_interval),
         )
         .await
         {
@@ -28210,8 +29269,12 @@ impl Worker {
         // The connection goes back before the publish: the publish is a channel
         // round trip that the database has no part in.
         drop(conn);
-        if let Err(error) =
-            dispatch_call(installed.channel.publish(&hints), "reconcile publish").await
+        if let Err(error) = dispatch_call_with_timeout(
+            installed.channel.publish(&hints),
+            "reconcile publish",
+            dispatch_reconcile_publish_timeout(shard_count, &hints),
+        )
+        .await
         {
             self.enter_degraded(
                 state,
@@ -28266,9 +29329,35 @@ impl Worker {
     /// The single-pool poll loop.
     ///
     /// `dispatch_allowed` is the run-start decision of
-    /// [`dispatch_allowed_for_span`]. The multi-shard loop
-    /// (`run_poll_loop_multi`) has no dispatch branch at all, so every loop
-    /// `run_multi_shard` starts is on the Postgres path by construction.
+    /// [`dispatch_allowed_for_span`], gating the single global dispatch
+    /// slot. A per-shard channel installed for `shard` overrides it (issue
+    /// #1429 review). This loop always polls exactly one shard (or none),
+    /// so a channel already scoped to that shard is unambiguous. That holds
+    /// regardless of how many other shards the worker's `ShardedDbPool`
+    /// has. The multi-shard loop (`run_poll_loop_multi`) has its own,
+    /// per-shard dispatch branch (issue #1429). Each shard reads and claims
+    /// through its own installed channel when one exists, and polls
+    /// Postgres otherwise.
+    ///
+    /// `shard`'s per-shard channel comes from `self.shard_dispatch`, the map
+    /// `Worker::new` captured once at construction. It is not a live
+    /// `dispatch::installed_for_shard(shard)` read here (Codex review,
+    /// issue #1429 follow-up). This loop runs for the whole life of the
+    /// worker, well past construction. A live read here could pick up a
+    /// *later*, unrelated install for `shard` — a replacement runner's own
+    /// topology. It would then start reading and claiming through a Redis
+    /// endpoint this worker's own database pool was never validated
+    /// against.
+    ///
+    /// The single global slot fallback (`self.global_dispatch`, a few
+    /// lines below) is captured at construction too, for the same reason
+    /// (Codex review, issue #1429 follow-up). A live `dispatch::installed()`
+    /// read here could pick up a replacement runner's own global-slot
+    /// install. This worker's own database pool was never validated
+    /// against that channel's key space. It could then start reading
+    /// references meant for a different runner, while its reconcile sweep
+    /// keeps publishing this pool's own rows into the replacement's
+    /// namespace.
     async fn run_poll_loop(
         &self,
         pool: &DbPool,
@@ -28307,17 +29396,32 @@ impl Worker {
             // reconcile sweep publishes in `(priority DESC, scheduled_at ASC)`
             // order, so priority is best effort under dispatch. The weighted
             // permutation still governs the `poll_once` fallback.
-            if let Some(installed) = crate::dispatch::installed() {
+            //
+            // Prefer a per-shard channel installed for exactly this loop's
+            // one polled shard (issue #1429 review). `dispatch_allowed`
+            // gates only the single global slot. It refuses a worker
+            // spanning more than one *pool* shard, because that slot cannot
+            // tell which shard a reference belongs to. A per-shard channel
+            // has no such ambiguity. It is already scoped to `shard` by
+            // construction. So it stays eligible even when a sibling shard
+            // in the same `ShardedDbPool` this worker was never assigned
+            // also has an installed channel. Without this, a worker
+            // assigned to exactly one shard of a multi-shard pool silently
+            // fell back to Postgres. That happened despite a matching
+            // per-shard channel sitting installed and unused, while
+            // `/admin/config` still reported dispatch as installed.
+            let per_shard_installed =
+                shard.and_then(|shard| self.shard_dispatch.get(&shard).cloned());
+            let dispatch_allowed = per_shard_installed.is_some() || dispatch_allowed;
+            if let Some(installed) = per_shard_installed.or_else(|| self.global_dispatch.clone()) {
                 if dispatch_allowed {
-                    if self
-                        .run_dispatch_iteration(pool, shard, &installed, &mut dispatch_state)
-                        .await
+                    let dispatched = self
+                        .run_dispatch_iteration(pool, shard, &installed, &mut dispatch_state, 1)
+                        .await;
+                    if dispatched > 0
                         && let Some(shard) = shard
                     {
-                        self.registry
-                            .telemetry()
-                            .metrics
-                            .record_shard_dispatched(shard_metric_label(shard));
+                        self.record_shard_dispatched_many(shard, dispatched);
                     }
                     continue;
                 }
@@ -28328,8 +29432,10 @@ impl Worker {
                         worker_id = %self.config.worker_id,
                         shard_assignments = self.config.shard_assignments.len(),
                         "a dispatch channel is installed but this worker spans more than one \
-                         shard; dispatch supports single-shard runtimes only in v1 (issue \
-                         #1312). This worker claims through postgres"
+                         shard; the single-pool poll loop cannot route a reference to the \
+                         right shard's pool (issue #1312). A multi-shard runtime needs a \
+                         per-shard channel and the multi-shard poll loop (issue #1429). This \
+                         worker claims through postgres"
                     );
                 }
             }
@@ -28881,10 +29987,18 @@ impl Worker {
                 crate::queue_fairness::weighted_queue_order(&pairs, &mut rand::thread_rng());
 
             for queue_name in &ordered {
-                let single_queue = std::slice::from_ref(queue_name);
+                // `claim_task_on_shard` takes `&[String]`. `ordered` now
+                // borrows its names from `self.config.queues` instead of
+                // cloning all of them up front (issue #515 Bolt follow-up).
+                // Building the one-element slice therefore needs one owned
+                // String here, instead of `std::slice::from_ref`. This only
+                // allocates for a queue actually tried, not for the whole
+                // permutation. A claim that succeeds on the first
+                // (typically highest-weight) queue never pays for the rest.
+                let single_queue = [(*queue_name).to_owned()];
                 match queue::claim_task_on_shard(
                     &mut conn,
-                    single_queue,
+                    &single_queue,
                     &self.config.worker_id,
                     &self.config.build_id,
                     self.config.priority_aging_secs,
@@ -30286,6 +31400,17 @@ pub(crate) fn under_provisioned_shard_pools(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes every test below that installs or uninstalls a dispatch
+    /// channel, global or per-shard (Codex review, issue #1429).
+    ///
+    /// `crate::dispatch`'s install state is process-global, so two such
+    /// tests running concurrently (`cargo test`'s default) can see each
+    /// other's channel. `a_fully_covered_multi_shard_runtime_is_accepted_alongside_a_global_channel`
+    /// installing per-shard channels while `the_sharded_runtime_rejection_reads_as_one_sentence`
+    /// checks a global-only install, for example, turns an expected
+    /// rejection into a spurious acceptance.
+    static DISPATCH_INSTALL_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Pins [`NEW_WORKFLOW_EXECUTION_COLUMNS`], and therefore
     /// [`ROWS_PER_EXECUTION_INSERT_CHUNK`], to `NewWorkflowExecution`'s real
@@ -39048,6 +40173,7 @@ mod tests {
             capability_misses: 0,
             capability_miss_workers: Vec::new(),
             capability_miss_handler: None,
+            timer_fires_at: None,
         }
     }
 
@@ -41413,14 +42539,42 @@ mod tests {
 
     #[test]
     fn a_read_is_sized_to_the_free_permits_of_both_pools() {
-        assert_eq!(dispatch_read_size(0, 0), None, "no permit means no read");
-        assert_eq!(dispatch_read_size(1, 0), Some(1));
-        assert_eq!(dispatch_read_size(0, 1), Some(1));
-        assert_eq!(dispatch_read_size(2, 3), Some(5));
+        assert_eq!(dispatch_read_size(0, 0, 1), None, "no permit means no read");
+        assert_eq!(dispatch_read_size(1, 0, 1), Some(1));
+        assert_eq!(dispatch_read_size(0, 1, 1), Some(1));
+        assert_eq!(dispatch_read_size(2, 3, 1), Some(5));
         assert_eq!(
-            dispatch_read_size(1_000, 1_000),
+            dispatch_read_size(1_000, 1_000, 1),
             Some(DISPATCH_READ_MAX),
             "a read never asks for more than the cap"
+        );
+    }
+
+    #[test]
+    fn a_read_is_capped_to_a_fair_share_across_shards() {
+        // Codex review, issue #1429. An uncapped read let the first shard
+        // visited in a multi-shard round-robin claim every free permit,
+        // starving its siblings until those tasks finished.
+        assert_eq!(
+            dispatch_read_size(100, 100, 4),
+            Some(50),
+            "200 free permits split four ways is a share of 50, well under the cap"
+        );
+        assert_eq!(
+            dispatch_read_size(2, 1, 4),
+            Some(1),
+            "a fair share always rounds up, so a shard sees at least one row \
+             it is entitled to rather than none"
+        );
+        assert_eq!(
+            dispatch_read_size(0, 0, 4),
+            None,
+            "no free permit means no read regardless of shard count"
+        );
+        assert_eq!(
+            dispatch_read_size(1_000, 1_000, 4),
+            Some(DISPATCH_READ_MAX),
+            "the fair share still yields to the absolute cap"
         );
     }
 
@@ -41503,6 +42657,211 @@ mod tests {
         );
     }
 
+    /// A shard's batch must not spend a sibling's share of one kind's pool.
+    /// It must not do so even while the pool's live total still reads free
+    /// (Codex review, issue #1429). `dispatch_read_size` bounds the whole
+    /// batch to a fair share of the sum of both pools. A batch of one kind
+    /// alone can still claim every free permit of that kind. It can do so
+    /// before a sibling shard's own turn comes up in the round-robin.
+    #[test]
+    fn a_shard_cannot_spend_a_sibling_s_share_of_one_kind() {
+        use crate::dispatch::DispatchKind;
+        // Four free workflow permits, four shards: each shard's own share is
+        // one, however many workflow-kind leases its own batch holds.
+        assert!(dispatch_kind_within_share(
+            Some(DispatchKind::Workflow),
+            0,
+            1,
+            0,
+            1
+        ));
+        assert!(
+            !dispatch_kind_within_share(Some(DispatchKind::Workflow), 1, 1, 0, 1),
+            "this shard already claimed its one-of-four share this batch"
+        );
+        assert!(
+            !dispatch_kind_within_share(Some(DispatchKind::Activity), 25, 25, 0, 0),
+            "a spent activity share blocks further activity leases even at zero workflow share"
+        );
+        assert!(
+            dispatch_kind_within_share(None, 999, 0, 999, 0),
+            "an untyped reference has no kind-specific pool to exhaust"
+        );
+    }
+
+    /// A single-queue, single-round-trip batch keeps the flat deadline
+    /// unchanged. An N-queue batch gets N times the per-queue budget. A
+    /// call needing several round trips per queue gets that multiplier
+    /// too (Codex review, issue #1429).
+    #[test]
+    fn dispatch_batch_timeout_scales_with_distinct_queue_count() {
+        assert_eq!(
+            dispatch_batch_timeout(1, 1, 0),
+            DISPATCH_CALL_TIMEOUT,
+            "a single-queue, single-round-trip batch must not regress the flat deadline"
+        );
+        assert_eq!(dispatch_batch_timeout(3, 1, 0), DISPATCH_CALL_TIMEOUT * 3);
+        assert_eq!(
+            dispatch_batch_timeout(0, 1, 0),
+            DISPATCH_CALL_TIMEOUT,
+            "an empty batch still gets at least one queue's worth of budget"
+        );
+        assert_eq!(
+            dispatch_batch_timeout(3, 2, 0),
+            DISPATCH_CALL_TIMEOUT * 6,
+            "ack_many's two round trips per queue must both be budgeted"
+        );
+        assert_eq!(
+            dispatch_batch_timeout(3, 0, 0),
+            DISPATCH_CALL_TIMEOUT * 3,
+            "a call still makes at least one round trip per queue"
+        );
+    }
+
+    /// A default `TaskDispatch::ack_many`/`release_many` fallback makes one
+    /// round trip per lease, not per queue (Codex review, issue #1429
+    /// follow-up). A single busy queue holding many leases must still get
+    /// a budget covering all of them, not just that one queue's own
+    /// queue-scaled allowance.
+    #[test]
+    fn dispatch_batch_timeout_covers_a_lease_scaled_fallback_too() {
+        assert_eq!(
+            dispatch_batch_timeout(1, 2, 64),
+            DISPATCH_CALL_TIMEOUT * 64,
+            "64 leases on one queue must outweigh that queue's own 2-round-trip allowance"
+        );
+        assert_eq!(
+            dispatch_batch_timeout(3, 2, 4),
+            DISPATCH_CALL_TIMEOUT * 6,
+            "a lease count smaller than the queue-scaled budget must not shrink it"
+        );
+    }
+
+    /// A single-shard turn keeps `maintain`'s flat deadline unchanged. A
+    /// multi-shard turn gets the short bound instead (Codex review, issue
+    /// #1429 follow-up). One stalled shard's maintenance call must not
+    /// park every sibling shard's turn behind it for the full five
+    /// seconds. `dispatch_reconcile_publish_timeout` builds its own,
+    /// queue-scaled deadline on top of this same per-shard-turn unit; see
+    /// its own test for that.
+    #[test]
+    fn dispatch_maintenance_timeout_is_bounded_only_for_multi_shard_turns() {
+        assert_eq!(
+            dispatch_maintenance_timeout(1),
+            DISPATCH_CALL_TIMEOUT,
+            "a single-shard turn has no sibling to starve, so the flat deadline stays"
+        );
+        assert_eq!(
+            dispatch_maintenance_timeout(2),
+            MULTI_SHARD_DISPATCH_MAINTENANCE_TIMEOUT,
+            "a multi-shard turn must use the short, round-robin-safe bound"
+        );
+        assert!(
+            MULTI_SHARD_DISPATCH_MAINTENANCE_TIMEOUT < DISPATCH_CALL_TIMEOUT,
+            "the multi-shard bound must actually be shorter than the flat deadline"
+        );
+    }
+
+    fn reconcile_hint(queue: &str) -> crate::dispatch::DispatchHint {
+        crate::dispatch::DispatchHint {
+            task_id: uuid::Uuid::new_v4(),
+            queue_name: queue.to_string(),
+            scheduled_at: chrono::Utc::now(),
+            priority: 0,
+            shard: None,
+            kind: None,
+        }
+    }
+
+    /// `publish` is one round trip per distinct queue, not one round trip
+    /// overall. The reconcile-publish deadline scales the same way
+    /// `dispatch_batch_timeout` scales `ack_many`/`release_many` (Codex
+    /// review, issue #1429 follow-up).
+    ///
+    /// A single-shard turn keeps `dispatch_maintenance_timeout`'s own flat
+    /// deadline as its per-queue unit. A multi-shard turn keeps that
+    /// function's short, round-robin-safe bound as its per-queue unit
+    /// instead. Either way, several queues in one sweep must not share a
+    /// single queue's worth of budget.
+    #[test]
+    fn dispatch_reconcile_publish_timeout_scales_with_distinct_queue_count() {
+        let one_queue = [reconcile_hint("default")];
+        let three_queues = [
+            reconcile_hint("default"),
+            reconcile_hint("priority"),
+            reconcile_hint("bulk"),
+        ];
+        let three_queues_one_duplicated = [
+            reconcile_hint("default"),
+            reconcile_hint("default"),
+            reconcile_hint("priority"),
+        ];
+
+        assert_eq!(
+            dispatch_reconcile_publish_timeout(1, &one_queue),
+            DISPATCH_CALL_TIMEOUT,
+            "a single queue on a single-shard turn must not regress the flat deadline"
+        );
+        assert_eq!(
+            dispatch_reconcile_publish_timeout(1, &three_queues),
+            DISPATCH_CALL_TIMEOUT * 3,
+            "three distinct queues on a single-shard turn must get three times the budget"
+        );
+        assert_eq!(
+            dispatch_reconcile_publish_timeout(1, &three_queues_one_duplicated),
+            DISPATCH_CALL_TIMEOUT * 2,
+            "the budget must count distinct queues, not hints"
+        );
+        assert_eq!(
+            dispatch_reconcile_publish_timeout(1, &[]),
+            DISPATCH_CALL_TIMEOUT,
+            "an empty hint list still gets at least one queue's worth of budget"
+        );
+        assert_eq!(
+            dispatch_reconcile_publish_timeout(2, &three_queues),
+            MULTI_SHARD_DISPATCH_MAINTENANCE_TIMEOUT * 3,
+            "a multi-shard turn scales its own short per-queue bound instead of the flat one"
+        );
+    }
+
+    /// A scaled deadline must not cut off a multi-queue call the flat
+    /// [`DISPATCH_CALL_TIMEOUT`] alone would have (Codex review, issue
+    /// #1429).
+    ///
+    /// `tokio::time::timeout` drops the whole future on expiry. A call
+    /// stands in for a 3-queue `ack_many_inner` loop here, taking longer
+    /// than one queue's flat budget but well inside three queues' worth.
+    /// It must still be allowed to finish.
+    #[tokio::test(start_paused = true)]
+    async fn dispatch_call_with_timeout_survives_what_a_flat_deadline_would_cut_off() {
+        let call = async {
+            tokio::time::sleep(DISPATCH_CALL_TIMEOUT + Duration::from_secs(1)).await;
+            Ok::<(), HarvestError>(())
+        };
+        let result =
+            dispatch_call_with_timeout(call, "test", dispatch_batch_timeout(3, 1, 0)).await;
+        assert!(
+            result.is_ok(),
+            "a 3-queue budget must cover a call past the flat one-queue deadline"
+        );
+    }
+
+    /// A call that never answers must still time out under a scaled
+    /// deadline, same as under the flat one (Codex review, issue #1429).
+    #[tokio::test(start_paused = true)]
+    async fn dispatch_call_with_timeout_still_bounds_a_stuck_call() {
+        let result = dispatch_call_with_timeout(
+            std::future::pending::<HarvestResult<()>>(),
+            "test",
+            DISPATCH_CALL_TIMEOUT,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "a call that never answers must still time out"
+        );
+    }
+
     /// A channel installed after the
     /// worker was built must not put a multi-shard loop on the dispatch path.
     #[test]
@@ -41522,6 +42881,54 @@ mod tests {
             "two pooled shards cannot resolve a reference to a pool"
         );
         assert!(!dispatch_allowed_for_span(4, 4), "a wide worker is refused");
+    }
+
+    /// A multi-shard span may still dispatch, but only when every assigned
+    /// shard has its own channel installed (issue #1429).
+    #[cfg(feature = "testing")]
+    #[test]
+    fn per_shard_dispatch_requires_full_coverage() {
+        let _serial = DISPATCH_INSTALL_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::dispatch::uninstall_all_shards();
+
+        let shard_a = crate::types::ShardId::new(1);
+        let shard_b = crate::types::ShardId::new(2);
+        let covers =
+            |assignments: &[crate::types::ShardId]| capture_shard_dispatch(assignments, None).1;
+
+        assert!(!covers(&[]), "an empty span has no shard identity to cover");
+        assert!(
+            !covers(&[shard_a, shard_b]),
+            "neither shard has a channel yet"
+        );
+
+        crate::dispatch::install_for_shard(
+            shard_a,
+            std::sync::Arc::new(crate::dispatch::MemoryDispatch::new()),
+            crate::dispatch::DispatchSettings::default(),
+        );
+        assert!(
+            !covers(&[shard_a, shard_b]),
+            "shard_b still has no channel, so the span is not fully covered"
+        );
+        assert!(
+            covers(&[shard_a]),
+            "a span of only the covered shard is fully covered"
+        );
+
+        crate::dispatch::install_for_shard(
+            shard_b,
+            std::sync::Arc::new(crate::dispatch::MemoryDispatch::new()),
+            crate::dispatch::DispatchSettings::default(),
+        );
+        assert!(
+            covers(&[shard_a, shard_b]),
+            "both assigned shards now have their own channel"
+        );
+
+        crate::dispatch::uninstall_all_shards();
     }
 
     /// A full page means the walk may
@@ -41652,6 +43059,9 @@ mod tests {
     #[cfg(feature = "testing")]
     #[test]
     fn the_sharded_runtime_rejection_reads_as_one_sentence() {
+        let _serial = DISPATCH_INSTALL_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
         let channel = Arc::new(crate::dispatch::MemoryDispatch::new());
         crate::dispatch::install(
@@ -41670,6 +43080,306 @@ mod tests {
             !message.contains("  "),
             "the rejection message has a run of spaces: {message}"
         );
-        assert!(message.contains("single-shard runtimes only"), "{message}");
+        assert!(
+            message.contains("per-shard channel installed for every assigned shard"),
+            "{message}"
+        );
+    }
+
+    /// A multi-shard runtime is accepted once every assigned shard has its
+    /// own per-shard channel (issue #1429), the counterpart to
+    /// `the_sharded_runtime_rejection_reads_as_one_sentence` above.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn a_fully_covered_multi_shard_runtime_is_accepted() {
+        let _serial = DISPATCH_INSTALL_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::dispatch::uninstall_all_shards();
+        let shard_0 = crate::types::ShardId::new(0);
+        let shard_1 = crate::types::ShardId::new(1);
+        for shard in [shard_0, shard_1] {
+            crate::dispatch::install_for_shard(
+                shard,
+                Arc::new(crate::dispatch::MemoryDispatch::new()),
+                crate::dispatch::DispatchSettings::default(),
+            );
+        }
+
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let config = WorkerRuntimeConfig {
+            shard_assignments: vec![shard_0, shard_1],
+            ..default_runtime_config()
+        };
+        let result = Worker::new(config, registry);
+        crate::dispatch::uninstall_all_shards();
+
+        assert!(
+            result.is_ok(),
+            "full per-shard coverage must accept a multi-shard runtime, got {:?}",
+            result.err()
+        );
+    }
+
+    /// A multi-shard runtime with full per-shard coverage is accepted even
+    /// when a global channel also happens to be installed (Codex review,
+    /// issue #1429).
+    ///
+    /// `install_for_shard`'s own doc comment says it leaves the
+    /// independent global slot untouched, so a caller can hold both at
+    /// once. `run_poll_loop_multi` only ever reads the per-shard pair.
+    /// The global slot's own span (here, wider than one) must not veto
+    /// coverage this worker never uses it for.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn a_fully_covered_multi_shard_runtime_is_accepted_alongside_a_global_channel() {
+        let _serial = DISPATCH_INSTALL_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::dispatch::uninstall_all_shards();
+        let shard_0 = crate::types::ShardId::new(0);
+        let shard_1 = crate::types::ShardId::new(1);
+        for shard in [shard_0, shard_1] {
+            crate::dispatch::install_for_shard(
+                shard,
+                Arc::new(crate::dispatch::MemoryDispatch::new()),
+                crate::dispatch::DispatchSettings::default(),
+            );
+        }
+        crate::dispatch::install(
+            Arc::new(crate::dispatch::MemoryDispatch::new())
+                as Arc<dyn crate::dispatch::TaskDispatch>,
+            crate::dispatch::DispatchSettings::default(),
+        );
+
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let config = WorkerRuntimeConfig {
+            shard_assignments: vec![shard_0, shard_1],
+            ..default_runtime_config()
+        };
+        let result = Worker::new(config, registry);
+        crate::dispatch::uninstall();
+        crate::dispatch::uninstall_all_shards();
+
+        assert!(
+            result.is_ok(),
+            "full per-shard coverage must accept a multi-shard runtime even \
+             with a global channel also installed, got {:?}",
+            result.err()
+        );
+    }
+
+    /// `Worker::new` captures each assigned shard's channel at construction,
+    /// not later at `run` time (Codex review, issue #1429 follow-up).
+    ///
+    /// A replacement runner's own install can land in the gap between this
+    /// construction and the later `tokio::spawn`ed task that used to
+    /// re-read `dispatch::installed_for_shard`. This worker would then
+    /// hold the *other* runner's channels for the rest of its life, even
+    /// though `per_shard_dispatch_covers` validated a completely
+    /// different set at construction. This pins that the captured channel
+    /// still matches the one installed at `Worker::new` time, after a
+    /// later install replaces it.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn worker_new_captures_shard_channels_immune_to_a_later_install() {
+        let _serial = DISPATCH_INSTALL_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::dispatch::uninstall_all_shards();
+        let shard_0 = crate::types::ShardId::new(0);
+        let shard_1 = crate::types::ShardId::new(1);
+        let original_shard_0_channel = Arc::new(crate::dispatch::MemoryDispatch::new())
+            as Arc<dyn crate::dispatch::TaskDispatch>;
+        crate::dispatch::install_for_shard(
+            shard_0,
+            Arc::clone(&original_shard_0_channel),
+            crate::dispatch::DispatchSettings::default(),
+        );
+        crate::dispatch::install_for_shard(
+            shard_1,
+            Arc::new(crate::dispatch::MemoryDispatch::new()),
+            crate::dispatch::DispatchSettings::default(),
+        );
+
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let config = WorkerRuntimeConfig {
+            shard_assignments: vec![shard_0, shard_1],
+            ..default_runtime_config()
+        };
+        let worker = Worker::new(config, registry).expect("full per-shard coverage must accept");
+
+        // A second, "overlapping" runner replaces shard 0's channel after
+        // this worker was already constructed and validated.
+        crate::dispatch::install_for_shard(
+            shard_0,
+            Arc::new(crate::dispatch::MemoryDispatch::new()),
+            crate::dispatch::DispatchSettings::default(),
+        );
+
+        let captured = worker
+            .shard_dispatch
+            .get(&shard_0)
+            .expect("shard 0 must have a captured channel");
+        assert!(
+            Arc::ptr_eq(&captured.channel, &original_shard_0_channel),
+            "the captured channel must still be the one installed at construction, not the \
+             later replacement"
+        );
+
+        crate::dispatch::uninstall_all_shards();
+    }
+
+    /// `Worker::new` captures the single global-slot channel once at
+    /// construction, the counterpart to
+    /// `worker_new_captures_shard_channels_immune_to_a_later_install` above
+    /// for the non-sharded case (Codex review, issue #1429 follow-up).
+    ///
+    /// A replacement runner's own global-slot install must not redirect
+    /// this worker's `run_poll_loop` mid-flight. This worker's own
+    /// database pool was never validated against that channel's key
+    /// space.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn worker_new_captures_the_global_channel_immune_to_a_later_install() {
+        let _serial = DISPATCH_INSTALL_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::dispatch::uninstall();
+        let original_channel = Arc::new(crate::dispatch::MemoryDispatch::new())
+            as Arc<dyn crate::dispatch::TaskDispatch>;
+        crate::dispatch::install(
+            Arc::clone(&original_channel),
+            crate::dispatch::DispatchSettings::default(),
+        );
+
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(default_runtime_config(), registry)
+            .expect("a single-shard span must accept");
+
+        // A second, "overlapping" runner replaces the global slot after this
+        // worker was already constructed and validated.
+        crate::dispatch::install(
+            Arc::new(crate::dispatch::MemoryDispatch::new()),
+            crate::dispatch::DispatchSettings::default(),
+        );
+
+        let captured = worker
+            .global_dispatch
+            .as_ref()
+            .expect("the global channel must have been captured at construction");
+        assert!(
+            Arc::ptr_eq(&captured.channel, &original_channel),
+            "the captured channel must still be the one installed at construction, not the \
+             later replacement"
+        );
+
+        crate::dispatch::uninstall();
+    }
+
+    /// `Worker::new_with_expected_shard_generations` must refuse to start
+    /// when a racing install already replaced the topology *before*
+    /// `Worker::new` ever runs. That is a gap
+    /// `worker_new_captures_shard_channels_immune_to_a_later_install` above
+    /// does not cover, since that race lands after construction, not
+    /// before it (Codex review, issue #1429 follow-up).
+    #[cfg(feature = "testing")]
+    #[test]
+    fn worker_new_refuses_a_shard_generation_a_racing_install_already_replaced() {
+        let _serial = DISPATCH_INSTALL_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::dispatch::uninstall_all_shards();
+        let shard_0 = crate::types::ShardId::new(0);
+        let shard_1 = crate::types::ShardId::new(1);
+
+        // Runner A's own install. `HarvestRunner::start` carries these exact
+        // generations forward to `Worker::new_with_expected_shard_generations`.
+        let generation_0 = crate::dispatch::install_for_shard(
+            shard_0,
+            Arc::new(crate::dispatch::MemoryDispatch::new()),
+            crate::dispatch::DispatchSettings::default(),
+        );
+        let generation_1 = crate::dispatch::install_for_shard(
+            shard_1,
+            Arc::new(crate::dispatch::MemoryDispatch::new()),
+            crate::dispatch::DispatchSettings::default(),
+        );
+
+        // Runner B races ahead of A's own `Worker::new` call and replaces
+        // shard 0's channel with its own, unrelated install.
+        crate::dispatch::install_for_shard(
+            shard_0,
+            Arc::new(crate::dispatch::MemoryDispatch::new()),
+            crate::dispatch::DispatchSettings::default(),
+        );
+
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let config = WorkerRuntimeConfig {
+            shard_assignments: vec![shard_0, shard_1],
+            ..default_runtime_config()
+        };
+        let result = Worker::new_with_expected_shard_generations(
+            config,
+            registry,
+            Some(&[(shard_0, generation_0), (shard_1, generation_1)]),
+        );
+        crate::dispatch::uninstall_all_shards();
+
+        assert!(
+            result.is_err(),
+            "a shard whose generation a racing install already replaced must not be silently \
+             captured from the stranger's channel"
+        );
+    }
+
+    /// The positive case of the test above. When nothing raced ahead of it,
+    /// `Worker::new_with_expected_shard_generations` accepts the caller's
+    /// own generations and captures exactly the channels they name.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn worker_new_accepts_matching_expected_shard_generations() {
+        let _serial = DISPATCH_INSTALL_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::dispatch::uninstall_all_shards();
+        let shard_0 = crate::types::ShardId::new(0);
+        let shard_1 = crate::types::ShardId::new(1);
+        let channel_0 = Arc::new(crate::dispatch::MemoryDispatch::new())
+            as Arc<dyn crate::dispatch::TaskDispatch>;
+
+        let generation_0 = crate::dispatch::install_for_shard(
+            shard_0,
+            Arc::clone(&channel_0),
+            crate::dispatch::DispatchSettings::default(),
+        );
+        let generation_1 = crate::dispatch::install_for_shard(
+            shard_1,
+            Arc::new(crate::dispatch::MemoryDispatch::new()),
+            crate::dispatch::DispatchSettings::default(),
+        );
+
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let config = WorkerRuntimeConfig {
+            shard_assignments: vec![shard_0, shard_1],
+            ..default_runtime_config()
+        };
+        let worker = Worker::new_with_expected_shard_generations(
+            config,
+            registry,
+            Some(&[(shard_0, generation_0), (shard_1, generation_1)]),
+        )
+        .expect("matching generations must be accepted");
+
+        let captured = worker
+            .shard_dispatch
+            .get(&shard_0)
+            .expect("shard 0 must have a captured channel");
+        assert!(
+            Arc::ptr_eq(&captured.channel, &channel_0),
+            "the captured channel must be the one this runtime's own install stamped"
+        );
+
+        crate::dispatch::uninstall_all_shards();
     }
 }

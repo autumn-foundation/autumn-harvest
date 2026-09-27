@@ -1466,9 +1466,10 @@ async fn sse_stream_end_block_carries_id_execution_id_and_state() {
     );
 }
 
-/// Issue #1458: a reconnect with `Last-Event-ID` set to the last row the
-/// client already saw yields an empty backfill. The `stream-end` block must
-/// then echo that client-supplied id, not `-1` or a stale value.
+/// Issue #1458 (semantics updated for #1405): a reconnect with
+/// `Last-Event-ID` set to the last `event_id` the client already saw yields
+/// an empty backfill. The `stream-end` block must then echo that
+/// client-supplied `event_id`, not `-1` or a stale value.
 #[tokio::test]
 async fn sse_stream_end_uses_last_event_id_header_when_backfill_is_empty() {
     let (url, _container) = setup_database().await;
@@ -1495,9 +1496,9 @@ async fn sse_stream_end_uses_last_event_id_header_when_backfill_is_empty() {
     .await;
     mark_completed(&mut conn, exec_id, json!(null)).await;
 
-    let last_row_id: i64 = harvest_events::table
+    let last_event_id: i32 = harvest_events::table
         .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
-        .select(harvest_events::id)
+        .select(harvest_events::event_id)
         .order(harvest_events::id.desc())
         .first(&mut conn)
         .await
@@ -1509,7 +1510,7 @@ async fn sse_stream_end_uses_last_event_id_header_when_backfill_is_empty() {
             Request::builder()
                 .method("GET")
                 .uri(format!("/executions/{exec_id}/events/stream"))
-                .header("last-event-id", last_row_id.to_string())
+                .header("last-event-id", last_event_id.to_string())
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1532,9 +1533,46 @@ async fn sse_stream_end_uses_last_event_id_header_when_backfill_is_empty() {
 
     assert_eq!(
         end_block.trim_start().lines().next(),
-        Some(format!("id: {last_row_id}")).as_deref(),
+        Some(format!("id: {last_event_id}")).as_deref(),
         "an empty backfill must echo the client's own Last-Event-ID as id: {end_block}"
     );
+}
+
+/// Issue #1405: `event_id` is `i32`. A non-numeric `Last-Event-ID` must
+/// still return 400, exactly as it did when the cursor was `i64`.
+#[tokio::test]
+async fn sse_stream_rejects_a_non_numeric_last_event_id() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app_with(
+        &pool,
+        &AppConfig {
+            admin: true,
+            codecs: false,
+            decode_on_read: false,
+            notification_url: Some(&url),
+        },
+    );
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+    let exec_id = seed_running(&mut conn, "sse-invalid-cursor", json!({})).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/executions/{exec_id}/events/stream"))
+                .header("last-event-id", "not-a-number")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("request must complete");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read error body");
+    let json: Value = serde_json::from_slice(&bytes).expect("error body must be JSON");
+    assert_eq!(json["error"], "invalid_last_event_id");
 }
 
 /// AC6: decode-only-when-admin. On an ungated route, a non-admin caller
