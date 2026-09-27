@@ -2909,9 +2909,24 @@ mod db {
                     // A wake that arrived after the cutover is a staged
                     // signal row with nothing scheduled to consume it.
                     // Re-pend now.
+                    //
+                    // Also stamps `created_at` and clears `timer_fires_at`
+                    // (issue #1402). The restored row's own `created_at`/
+                    // `timer_fires_at` are whatever they were at stage
+                    // time. They may still name a durable timer's own
+                    // deadline, if one armed this row before the
+                    // migration started. This re-pend hands the row to
+                    // the signal instead. Without refreshing both,
+                    // `stall_diagnosis` could later mistake this signal
+                    // wake for that timer's. That fingerprint is issue
+                    // #1191's `wake_source_repended_this_row`. Every
+                    // other repend of a workflow-type row already leaves
+                    // it.
                     diesel::sql_query(
                         "UPDATE harvest_task_queue t \
                             SET state = 'PENDING', scheduled_at = NOW(), \
+                                created_at = clock_timestamp(), \
+                                timer_fires_at = NULL, \
                                 wake_requested = FALSE \
                           WHERE t.workflow_exec_id = $1 AND t.task_type = 'workflow' \
                             AND t.state IN ('PENDING', 'RUNNING') \

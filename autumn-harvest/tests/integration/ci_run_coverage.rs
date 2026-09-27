@@ -248,7 +248,6 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ("core:transactional_activity_tests", ALLOWLIST_DEBT_REASON),
     ("core:typed_stubs_tests", ALLOWLIST_DEBT_REASON),
     ("core:updt_with_start_tests", ALLOWLIST_DEBT_REASON),
-    ("core:workflow_handle_tests", ALLOWLIST_DEBT_REASON),
     ("core:workflow_task_timeout_tests", ALLOWLIST_DEBT_REASON),
     // ── plugin (autumn-harvest-plugin/tests) ──
     ("plugin:archival_integration", ALLOWLIST_DEBT_REASON),
@@ -430,7 +429,7 @@ fn parse_manifest() -> Vec<SuiteRow> {
 /// or a filter whose first `::`-segment prefixes the module name — a partial
 /// `module::test` filter never credits the whole module).
 ///
-/// `autumn-harvest` has `default = ["db", "unified-dag-execution"]`; the runner
+/// `autumn-harvest` has `default = ["db", "unified-dag-execution", "tls"]`; the runner
 /// keeps defaults for `linux`/`linuxpart` integration rows (Docker Postgres) and strips them
 /// (`--no-default-features`) for `allos` integration rows (no live DB). So a
 /// `linux` integration row always has `db`; an `allos` integration row has it
