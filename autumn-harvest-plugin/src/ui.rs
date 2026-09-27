@@ -6221,8 +6221,18 @@ fn render_workflow_detail(
     // (or `/reset`, `/trigger-update`), one path segment deeper than the
     // plain `GET` this same function also serves. Correct the base only
     // then -- see `layout`'s doc comment (issue #1737, Codex review).
-    let canonical_base = form_echo.is_mutation_failure().then_some("../");
-    layout(&title, &body, "../", canonical_base)
+    //
+    // The base must include `exec_id_str`, not just go up to
+    // `.../workflows/`. A query-only link like `workflow_detail_href`'s
+    // (`?event_page=3`) keeps the base's whole path and only replaces
+    // the query. A base missing the id therefore loses it from those
+    // links (issue #1737). An `id/cancel`-style path reference still
+    // resolves correctly either way. It merges with the base's parent
+    // directory regardless of what its last segment is.
+    let canonical_base = form_echo
+        .is_mutation_failure()
+        .then(|| format!("../{exec_id_str}"));
+    layout(&title, &body, "../", canonical_base.as_deref())
 }
 
 /// Per-row checkpoint rendering decision for the pending-activities table, after
@@ -15392,10 +15402,36 @@ mod tests {
 
     #[test]
     fn mutation_failure_render_carries_a_canonical_base() {
+        // A fixed id, not `stub_execution`'s random one, so the expected
+        // `<base>` string below is deterministic.
+        let mut execution = stub_execution();
+        execution.id = uuid::Uuid::nil();
+        let blocked = stub_blocked_on();
+        let render = |echo: &WorkflowFormEcho| -> String {
+            render_workflow_detail(
+                &execution,
+                0,
+                &[],
+                &[],
+                &[],
+                false,
+                &[],
+                0,
+                &blocked,
+                None,
+                None,
+                None,
+                None,
+                &WorkflowLogsPanelData::default(),
+                echo,
+            )
+            .into_string()
+        };
+
         // The plain GET has no echo, so no base correction is needed
         // (Codex review, issue #1737). The document's own URL already
         // matches what every relative link in the page assumes.
-        let plain = render_detail_with_echo(&WorkflowFormEcho::default());
+        let plain = render(&WorkflowFormEcho::default());
         assert!(
             !plain.contains("<base "),
             "the plain GET must not carry a <base> override: {plain}"
@@ -15403,9 +15439,11 @@ mod tests {
 
         // A mutation-failure render is the direct response to a POST one
         // path segment deeper (.../workflows/{id}/signal). It must
-        // correct relative resolution back to .../workflows/{id}.
-        // Otherwise a resubmit targets .../workflows/{id}/{id}/signal and
-        // 404s.
+        // correct relative resolution back to .../workflows/{id},
+        // including the id itself. A base of just `../` loses the id
+        // from query-only links like `workflow_detail_href`'s (issue
+        // #1737). Otherwise a resubmit targets
+        // .../workflows/{id}/{id}/signal and 404s.
         let echo = WorkflowFormEcho {
             signal: Some(WorkflowSignalEcho {
                 signal_name: "approve".to_string(),
@@ -15414,10 +15452,12 @@ mod tests {
             }),
             ..Default::default()
         };
-        let failed = render_detail_with_echo(&echo);
+        let failed = render(&echo);
+        let expected_base = format!("<base href=\"../{}\">", execution.id);
         assert!(
-            failed.contains("<base href=\"../\">"),
-            "a mutation-failure render must carry the canonical base: {failed}"
+            failed.contains(&expected_base),
+            "a mutation-failure render must carry the canonical base \
+             (including the id): {failed}"
         );
     }
 
