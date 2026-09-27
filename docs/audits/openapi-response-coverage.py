@@ -304,9 +304,42 @@ def function_body(source: str, name: str) -> str | None:
     return parts[2] if parts else None
 
 
-# The path segments that name a crate root, not a module. A reference through
-# one of them is read like a bare name.
-CRATE_ROOTS = frozenset({"crate", "self", "super", "autumn_harvest", "autumn_harvest_plugin"})
+# The crates the audit scans, by the name a path uses for them.
+SCANNED_CRATES = frozenset({"autumn_harvest", "autumn_harvest_plugin"})
+
+# The audited source's own crate and module. A fixture is the crate `crate`
+# at its root. `audit` sets it.
+LOCAL: list[str] = ["autumn_harvest_plugin", "api"]
+
+
+def location(crate: str, *modules: str) -> str:
+    """A definition's place: its crate, then its module path."""
+    return "::".join(part for part in (crate, *modules) if part)
+
+
+def qualified_match(qualifier: list[str], place: str) -> bool:
+    """Whether a path `qualifier` reaches a definition at `place`.
+
+    `place` is a crate, then its module path, as `location` builds it. A
+    qualifier that starts with `crate`, or with a scanned crate's name, names
+    a module path from that crate's root, so it must match `place` whole. One
+    that starts with `self` or `super` is local. Any other qualifier must
+    equal the trailing modules of `place`, so `a::b` reaches `x::a::b` but not
+    `x::b`. An external crate matches nothing, so its item is unresolved.
+    This is the one resolver for structs, functions and type aliases.
+    """
+    segments = place.split("::")
+    crate, modules = segments[0], segments[1:]
+    wanted = [part for part in qualifier if part]
+    if wanted and wanted[0] == "crate":
+        return [crate, *modules] == [LOCAL[0], *wanted[1:]]
+    if wanted and wanted[0] in SCANNED_CRATES:
+        return [crate, *modules] == wanted
+    if wanted and wanted[0] in ("self", "super"):
+        wanted = wanted[1:]
+        if crate != LOCAL[0]:
+            return False
+    return len(wanted) <= len(modules) and modules[len(modules) - len(wanted) :] == wanted
 
 
 def block_owners(source: str, keyword: str) -> list[tuple[int, int, str]]:
@@ -339,15 +372,17 @@ def owner_at(owners: list[tuple[int, int, str]], position: int) -> str | None:
 
 
 @functools.lru_cache(maxsize=None)
-def function_index(source: str) -> dict[str, list[tuple[int, str | None]]]:
-    """Every definition of each function in `source`: `(start, owner)` by name.
+def function_index(source: str) -> dict[str, list[tuple[int, str | None, str]]]:
+    """Every definition of each function in `source`: `(start, owner, modules)`.
 
     The owner is the type of the `impl` block or the name of the `trait` that
-    holds the definition, or `None` for a free function. Every fn lookup in
-    the audit reads this one index through `resolve_function`.
+    holds the definition, or `None` for a free function. `modules` is the
+    path of the inline `mod` blocks that hold it. Every fn lookup in the audit
+    reads this one index through `resolve_function`.
     """
     owners = block_owners(source, "impl") + block_owners(source, "trait")
-    index: dict[str, list[tuple[int, str | None]]] = {}
+    modules = block_owners(source, "mod")
+    index: dict[str, list[tuple[int, str | None, str]]] = {}
     for found in re.finditer(r"\b(?:async )?fn ([A-Za-z_][A-Za-z_0-9]*)\s*[(<]", source):
         # A declaration with no body, as in a trait, is no definition.
         opener = source.find("(", found.start())
@@ -355,7 +390,9 @@ def function_index(source: str) -> dict[str, list[tuple[int, str | None]]]:
         head = re.match(r"[^;{]*", source[after:])
         if source[after + head.end() : after + head.end() + 1] != "{":
             continue
-        index.setdefault(found.group(1), []).append((found.start(), owner_at(owners, found.start())))
+        inline = [name for start, end, name in sorted(modules) if start < found.start() < end]
+        entry = (found.start(), owner_at(owners, found.start()), "::".join(inline))
+        index.setdefault(found.group(1), []).append(entry)
     return index
 
 
@@ -365,24 +402,36 @@ def resolve_function(source: str, name: str, qualifier: str | None = None) -> li
     `qualifier` is `None` for a bare call, `"."` for a method call, or the path
     before the name, as in `Decoder::`. A bare call reaches a free function. A
     method call reaches any method of that name. A type path reaches that
-    type's methods only. `Self` reaches any method, and a module path any free
-    function. A caller treats more than one result as ambiguous.
+    type's methods only, and `Self` any method. The modules before it, or a
+    module path alone, must match as `qualified_match` reads them. A caller
+    treats more than one result as ambiguous.
     """
     definitions = function_index(source).get(name, [])
     if qualifier is None:
-        return [start for start, owner in definitions if owner is None]
+        return [start for start, owner, _ in definitions if owner is None]
     if qualifier.strip() == ".":
-        return [start for start, owner in definitions if owner is not None]
+        return [start for start, owner, _ in definitions if owner is not None]
     segments = [
         re.sub(r"\s*<.*", "", part).strip() for part in qualifier.split("::") if part.strip()
     ]
-    segments = [part for part in segments if part not in CRATE_ROOTS]
     last = segments[-1] if segments else None
-    if last is None or last[0].islower():
-        return [start for start, owner in definitions if owner is None]
-    if last == "Self":
-        return [start for start, owner in definitions if owner is not None]
-    return [start for start, owner in definitions if owner == last]
+    if last is not None and last[0].isupper():
+        path = segments[:-1]
+
+        def wanted(owner: str | None) -> bool:
+            return owner is not None and (last == "Self" or owner == last)
+
+    else:
+        path = segments
+
+        def wanted(owner: str | None) -> bool:
+            return owner is None
+
+    return [
+        start
+        for start, owner, modules in definitions
+        if wanted(owner) and qualified_match(path, location(LOCAL[0], LOCAL[1], modules))
+    ]
 
 
 def called_helpers(source: str, body: str) -> list[int]:
@@ -413,9 +462,12 @@ def struct_body(reference: str) -> str | None:
     return resolve_struct(defined_structs(), reference)
 
 
-def struct_index(source: str, module: str = "") -> dict[str, list[tuple[str, str]]]:
-    """Every struct in `source`: `(module path, block)` by bare name.
+def struct_index(
+    source: str, module: str = "", crate: str = "crate"
+) -> dict[str, list[tuple[str, str]]]:
+    """Every struct in `source`: `(place, block)` by bare name.
 
+    The place is the crate, then the module path, as `location` builds it.
     `module` is the path of the file itself. An inline `mod name { .. }` adds
     its name to the path of each struct inside it.
     """
@@ -424,10 +476,10 @@ def struct_index(source: str, module: str = "") -> dict[str, list[tuple[str, str
     index: dict[str, list[tuple[str, str]]] = {}
     for found in re.finditer(r"\bstruct ([A-Za-z_][A-Za-z_0-9]*)\s*\{", code):
         inline = [name for start, end, name in sorted(modules) if start < found.start() < end]
-        path = "::".join(part for part in [module, *inline] if part)
+        place = location(crate, module, *inline)
         block = struct_text(source, found)
-        STRUCT_MODULES[block] = path
-        index.setdefault(found.group(1), []).append((path, block))
+        STRUCT_MODULES[block] = place
+        index.setdefault(found.group(1), []).append((place, block))
     return index
 
 
@@ -442,7 +494,8 @@ def defined_structs() -> dict[str, list[tuple[str, str]]]:
     for crate in CRATES:
         root = ROOT / crate / "src"
         for path in sorted(root.rglob("*.rs")):
-            for name, found in struct_index(path.read_text(), module_path(root, path)).items():
+            text, place = path.read_text(), module_path(root, path)
+            for name, found in struct_index(text, place, crate.replace("-", "_")).items():
                 index.setdefault(name, []).extend(found)
     return index
 
@@ -451,15 +504,12 @@ def resolve_struct(index: dict[str, list[tuple[str, str]]], reference: str) -> s
     """The block of the one struct `reference` names, or `None`.
 
     A qualified reference, such as `module_b::Filter`, keeps only the structs
-    whose module path ends in that module. A crate root such as `crate` or
-    `autumn_harvest` is no module. More than one match, or none, is `None`, so
-    the audit reports the struct and fails closed.
+    that `qualified_match` reaches. More than one match, or none, is `None`,
+    so the audit reports the struct and fails closed.
     """
     segments = [part.strip() for part in reference.split("::") if part.strip()]
-    qualifier = [part for part in segments[:-1] if part not in CRATE_ROOTS]
     found = index.get(segments[-1], []) if segments else []
-    if qualifier:
-        found = [(path, block) for path, block in found if path.split("::")[-1] == qualifier[-1]]
+    found = [(place, block) for place, block in found if qualified_match(segments[:-1], place)]
     return found[0][1] if len(found) == 1 else None
 
 
@@ -579,7 +629,8 @@ def struct_layout(
         text = re.sub(r"\s*,\s*([>)])", r"\1", re.sub(r"([<(])\s+", r"\1", text))
         field = re.match(r"(?:pub(?:\([^)]*\))?\s+)?(?:r#)?([a-z_0-9]+)\s*:\s*(.+?),?$", text)
         if field:
-            resolved, unread = resolve_field_type(field.group(2), STRUCT_MODULES.get(original, ""))
+            place = STRUCT_MODULES.get(original, location(LOCAL[0], LOCAL[1]))
+            resolved, unread = resolve_field_type(field.group(2), place)
             fields.append((field.group(1), resolved, serde_items(" ".join(attributes)), unread))
         attributes = []
     return container, fields
@@ -764,7 +815,9 @@ TYPE_ALIASES: list[dict[str, list[TypeAlias]]] = [{}]
 STRUCT_MODULES: dict[str, str] = {}
 
 
-def type_aliases_in(source: str, module: str = "") -> dict[str, list[TypeAlias]]:
+def type_aliases_in(
+    source: str, module: str = "", crate: str = "crate"
+) -> dict[str, list[TypeAlias]]:
     """Each `type Name<P, ..> = Target;` in `source`, by name, with its module.
 
     `module` is the path of the file itself. An inline `mod name { .. }` adds
@@ -782,10 +835,10 @@ def type_aliases_in(source: str, module: str = "") -> dict[str, list[TypeAlias]]
         head = code[: alias.start()]
         if head.count("{") - head.count("}") != len(inline):
             continue
-        path = "::".join(part for part in [module, *inline] if part)
+        place = location(crate, module, *inline)
         parameters = [part.strip() for part in split_expression(alias.group(2) or "", ",", types=True)]
         target = canonical_paths(alias.group(3).strip())
-        found.setdefault(alias.group(1), []).append((path, parameters, target))
+        found.setdefault(alias.group(1), []).append((place, parameters, target))
     return found
 
 
@@ -796,7 +849,8 @@ def crate_type_aliases() -> dict[str, list[TypeAlias]]:
     for crate in CRATES:
         root = ROOT / crate / "src"
         for path in sorted(root.rglob("*.rs")):
-            for name, aliases in type_aliases_in(path.read_text(), module_path(root, path)).items():
+            text, place = path.read_text(), module_path(root, path)
+            for name, aliases in type_aliases_in(text, place, crate.replace("-", "_")).items():
                 found.setdefault(name, []).extend(aliases)
     return found
 
@@ -819,11 +873,12 @@ def pick_alias(qualifier: list[str], name: str, module: str) -> tuple[TypeAlias 
     """
     every = TYPE_ALIASES[0].get(name, [])
     if qualifier:
-        found = [alias for alias in every if alias[0].split("::")[-1] == qualifier[-1]]
+        found = [alias for alias in every if qualified_match(qualifier, alias[0])]
         return (found[0], False) if len(found) == 1 else (None, len(found) > 1)
     if not every:
         return None, False
-    if len(every) == 1 and every[0][0] in (module, ""):
+    root = module.split("::")[0]
+    if len(every) == 1 and every[0][0] in (module, root):
         return every[0], False
     return None, True
 
@@ -843,8 +898,7 @@ def resolve_field_type(declared_type: str, module: str = "") -> tuple[str, str |
         head = re.fullmatch(r"\s*((?:[A-Za-z_]\w*\s*::\s*)*)([A-Z]\w*)\s*(?:<(.*)>)?\s*", declared_type)
         if head is None:
             return declared_type, None
-        path = [part.strip() for part in head.group(1).split("::") if part.strip()]
-        qualifier = [part for part in path if part not in CRATE_ROOTS]
+        qualifier = [part.strip() for part in head.group(1).split("::") if part.strip()]
         alias, unreadable = pick_alias(qualifier, head.group(2), module)
         if unreadable:
             return declared_type, head.group(2)
@@ -1159,6 +1213,41 @@ FREE_CALL_HEAD = r"(?<![\w.:])([a-z_][a-z_0-9]*)%s" % TURBOFISH
 FREE_CALL_NAME = FREE_CALL_HEAD + r"\s*\("
 
 
+# Views that read a whole carrier: `.as_ref()`, `.as_slice()`, `.deref()`,
+# `.clone()` or a full `[..]` slice.
+WHOLE_VIEW = r"(?:\.\s*(?:as_ref|as_slice|as_bytes|deref|clone)\s*\(\s*\)|\[\s*\.\.\s*\])"
+
+
+def argument_root(argument: str) -> tuple[str | None, bool]:
+    """The variable an argument reads, and whether it reads all of it.
+
+    `&`, `&mut`, `*` and grouping parentheses are stripped, and so are whole
+    views in `WHOLE_VIEW`. What is left must be a plain name, which is then
+    the root, read whole. A name followed by anything else, such as
+    `body[4..]` or `body.to_vec()`, is the root, read in a form the audit
+    cannot type. Any other argument has no root. Every carrier and argument
+    reader in the audit strips borrows through this one step.
+    """
+    text = argument.strip().rstrip(",").strip()
+    while True:
+        lead = re.match(r"(?:&\s*(?:mut\b)?|\*)\s*", text)
+        if lead and lead.end():
+            text = text[lead.end() :].strip()
+            continue
+        if text.startswith("(") and len(balanced(text)) == len(text):
+            text = text[1:-1].strip()
+            continue
+        view = re.search(r"\s*%s$" % WHOLE_VIEW, text)
+        if view and view.start():
+            text = text[: view.start()].strip()
+            continue
+        break
+    if re.fullmatch(r"[a-z_][a-z_0-9]*", text) and text not in ("mut", "self") or text == "self":
+        return text, True
+    head = re.match(r"([a-z_][a-z_0-9]*)\b", text)
+    return (head.group(1), False) if head and head.group(1) != "mut" else (None, False)
+
+
 def outside_calls(argument: str) -> str:
     """`argument` with the argument list of each call in it blanked.
 
@@ -1295,12 +1384,11 @@ def receiving_parameters(
         arguments = split_top_level(raw[1:-1].replace("->", ""))
         tolerant = discards_error(block[: call.start()], block[call.end() - 1 + len(raw) :])
         for index, argument in enumerate(arguments):
-            direct = r"&?\s*(?:mut\s+)?%s(?:\s*\.\s*clone\s*\(\s*\))?"
             passed = [
                 v
                 for v, bound_at in variables.items()
                 if (
-                    re.fullmatch(direct % re.escape(v), argument.strip())
+                    argument_root(argument) == (v, True)
                     if qualified
                     else re.search(r"(?<![.\w])%s\b" % re.escape(v), outside_calls(argument))
                 )
@@ -1332,10 +1420,10 @@ def block_parses(
             opener = block.find("(", opener + len(turbofish) + 2)
         call = balanced(block[opener:])
         argument = call[1:-1].strip().rstrip(",").strip()
-        root = re.match(r"&?\s*([a-z_][a-z_0-9]*)", argument)
-        if root is None or root.group(1) not in carriers:
+        root, whole = argument_root(argument)
+        if root is None or root not in carriers:
             continue
-        if not live_binding(block, root.group(1), hit.start(), carriers[root.group(1)]):
+        if not live_binding(block, root, hit.start(), carriers[root]):
             continue
         before = block[: hit.start()]
         after = block[opener + len(call) :]
@@ -1348,10 +1436,10 @@ def block_parses(
             used = re.search(r"(?<![.\w])%s\b" % name, after)
             passed = re.search(r"[(,]\s*&?\s*(?:mut\s+)?%s\b" % name, after)
             tolerant = bool(used) and not passed and not error_rejects(stored.group(1), after)
-        optional = tolerant or guards(block, hit.start(), root.group(1))
+        optional = tolerant or guards(block, hit.start(), root)
         # A body read through an index, a method or a generic type is not
         # something the audit can type, so it is reported.
-        if re.sub(r"^&\s*", "", argument) != root.group(1):
+        if not whole:
             kind = None
         elif turbofish is not None and not re.fullmatch(r"[A-Za-z0-9_:]+", turbofish):
             kind = None
@@ -2364,8 +2452,6 @@ ALIAS_TARGETS = {
     "from_slice": "serde_json::from_slice",
 }
 
-# A type that an extractor alias can hide.
-EXTRACTOR_LIKE = r"\b(?:Query|Json|Bytes)\b"
 
 # The import paths the audit trusts for each aliased kind. An alias of a
 # same-named item from any other path, such as `crate::signed::Query`, is not
@@ -2378,6 +2464,21 @@ SUPPORTED_PATHS = {
     "axum::body::Bytes": "Bytes",
     "serde_json::from_slice": "from_slice",
 }
+
+
+def extractor_kind(path: str) -> str | None:
+    """The supported kind a path names, or `None`.
+
+    A bare `Query`, `Json` or `Bytes` names the one in scope, which the `use`
+    aliases have already made canonical. A qualified path counts only when
+    `SUPPORTED_PATHS` trusts it, after the `autumn_web::reexports::` prefix
+    is cut. Both the `use` aliases and the `type` aliases ask this.
+    """
+    path = re.sub(r"\s", "", path).lstrip(":")
+    path = re.sub(r"^autumn_web::reexports::", "", path)
+    if "::" not in path:
+        return path if path in ("Query", "Json", "Bytes") else None
+    return SUPPORTED_PATHS.get(path)
 
 
 def use_leaves(statement: str) -> list[tuple[str, str | None]]:
@@ -2427,7 +2528,7 @@ def alias_declarations(code: str) -> list[tuple[tuple[int, int], tuple[int, int]
     for use in re.finditer(r"\buse\b[^;]*;", code):
         scope, span = alias_scope(code, use.start()), use.span()
         for path, alias in use_leaves(use.group(0)):
-            kind = SUPPORTED_PATHS.get(path)
+            kind = extractor_kind(path) if "::" in path else None
             call = r"(?=\s*(?:::<|\())"
             if kind and alias:
                 pattern = r"(?<![\w:.])%s\b%s" % (alias, call if kind == "from_slice" else "")
@@ -2445,12 +2546,21 @@ def alias_declarations(code: str) -> list[tuple[tuple[int, int], tuple[int, int]
     for declared in re.finditer(r"\btype\s+([A-Z]\w*)\s*(<[^=;]*?>)?\s*=\s*([^;]+);", code):
         name, parameters, target = declared.group(1), declared.group(2) or "", declared.group(3).strip()
         scope, span = alias_scope(code, declared.start()), declared.span()
-        plain = re.fullmatch(r"(?:[a-z_]+::)*(Query|Json|Bytes)\s*(<.*>)?", target)
-        if plain and re.sub(r"\s", "", parameters) == re.sub(r"\s", "", plain.group(2) or ""):
-            found.append((scope, span, r"(?<![\w:])%s\b" % name, plain.group(1)))
-        elif plain and not parameters:
+        plain = re.fullmatch(r"((?:[A-Za-z_]\w*\s*::\s*)*(?:Query|Json|Bytes))\s*(<.*>)?", target)
+        kind = extractor_kind(plain.group(1)) if plain else None
+        # Only a supported extractor counts. A same-named type from another
+        # path, such as `crate::signed::Query`, is left alone.
+        named = [
+            hit
+            for hit in re.finditer(r"((?:[A-Za-z_]\w*\s*::\s*)*)\b(Query|Json|Bytes)\b", target)
+            if extractor_kind(hit.group(0))
+        ]
+        if kind and re.sub(r"\s", "", parameters) == re.sub(r"\s", "", plain.group(2) or ""):
+            found.append((scope, span, r"(?<![\w:])%s\b" % name, kind))
+        elif kind and not parameters:
+            target = kind + (plain.group(2) or "")
             found.append((scope, span, r"(?<![\w:])%s\b(?!\s*<)" % name, target))
-        elif re.search(EXTRACTOR_LIKE, target):
+        elif named:
             found.append((scope, span, name, None))
     return found
 
@@ -2543,6 +2653,7 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
     SOURCE[0] = code
     aliases = getattr(find_struct, "aliases", None)
     TYPE_ALIASES[0] = crate_type_aliases() if aliases is None else aliases
+    LOCAL[:] = getattr(find_struct, "local", ("autumn_harvest_plugin", "api"))
     by_route = {(r["method"], r["path"]): r for r in contract["routes"]}
     routes = router_routes(source)
 
@@ -2866,6 +2977,7 @@ def fixture_struct(source: str):
         return resolve_struct(index, reference)
 
     find.aliases = type_aliases_in(source)
+    find.local = ("crate", "")
     return find
 
 
@@ -3191,6 +3303,9 @@ pub fn harvest_api_router() -> Router {
         .route("/n/lenient-decoder", post(n_lenient_decoder))
         .route("/n/strict-decoder", post(n_strict_decoder))
         .route("/n/ambiguous-method", post(n_ambiguous_method))
+        .route("/n/wrong-prefix-struct", get(n_wrong_prefix_struct))
+        .route("/n/crate-path-struct", get(n_crate_path_struct))
+        .route("/n/module-helper", post(n_module_helper))
         .route("/n/maybe-fields", post(n_maybe_fields))
         .route("/n/loose-field", post(n_loose_field))
 }
@@ -3209,6 +3324,29 @@ mod module_b {
 
 async fn n_qualified_struct(Query(filter): Query<module_b::Filter>) -> Response {
     StatusCode::OK.into_response()
+}
+
+async fn n_wrong_prefix_struct(Query(filter): Query<other::module_b::Filter>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn n_crate_path_struct(Query(filter): Query<crate::module_b::Filter>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+fn decode_raw(raw: &[u8]) -> Response {
+    let gadget = serde_json::from_slice::<Gadget>(raw).unwrap();
+    StatusCode::OK.into_response()
+}
+
+mod helpers {
+    fn decode_raw(raw: &[u8]) -> Response {
+        StatusCode::OK.into_response()
+    }
+}
+
+async fn n_module_helper(body: Bytes) -> Response {
+    helpers::decode_raw(&body)
 }
 
 async fn n_ambiguous_struct(Query(filter): Query<Filter>) -> Response {
@@ -3436,6 +3574,9 @@ pub fn harvest_api_router() -> Router {
         .route("/e/raw-std-reader", post(e_raw_std_reader))
         .route("/e/extension-decode", post(e_extension_decode))
         .route("/e/nested-or-inspection", post(e_nested_or_inspection))
+        .route("/e/mut-borrow-parse", post(e_mut_borrow_parse))
+        .route("/e/partial-slice-parse", post(e_partial_slice_parse))
+        .route("/e/signed-type-alias", get(e_signed_type_alias))
         .route("/e/or-and-empty-guard", post(e_or_and_empty_guard))
         .route("/e/nested-and-error-exit", post(e_nested_and_error_exit))
         .route("/e/unknown-receiver-method", post(e_unknown_receiver_method))
@@ -3509,7 +3650,7 @@ async fn e_wrapped(body: Bytes) -> Response {
 }
 
 async fn e_sliced(body: Bytes) -> Response {
-    let widget: Gadget = serde_json::from_slice(&body[..]).unwrap_or_default();
+    let widget: Gadget = serde_json::from_slice(&body[1..]).unwrap_or_default();
     StatusCode::OK.into_response()
 }
 
@@ -4608,6 +4749,22 @@ async fn e_raw_associated_helper(body: Bytes) -> Response {
 
 async fn e_raw_method_helper(body: Bytes, decoder: GadgetDecoder) -> Response {
     decoder.decode_owned(&body)
+}
+
+async fn e_mut_borrow_parse(mut body: Bytes) -> Response {
+    let gadget = serde_json::from_slice::<Gadget>(&mut body).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_partial_slice_parse(body: Bytes) -> Response {
+    let gadget = serde_json::from_slice::<Gadget>(&body[4..]).unwrap();
+    StatusCode::OK.into_response()
+}
+
+type SignedQuery<T> = crate::signed::Query<T>;
+
+async fn e_signed_type_alias(query: SignedQuery<Cursor>) -> Response {
+    StatusCode::OK.into_response()
 }
 
 async fn e_nested_or_inspection(body: Result<Json<Gadget>, JsonRejection>) -> Response {
@@ -6944,6 +7101,31 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
         {"unresolved": ["GET /n/ambiguous-struct: cannot find struct Filter"]},
     ),
     (
+        "a qualified path matches its whole module suffix",
+        FIXTURE_NAMES,
+        [
+            fixture_route(
+                "GET",
+                "/n/wrong-prefix-struct",
+                200,
+                params=[query_param("wanted", "integer", False)],
+            ),
+            fixture_route(
+                "GET",
+                "/n/crate-path-struct",
+                200,
+                params=[query_param("wanted", "integer", False)],
+            ),
+            fixture_route(
+                "POST",
+                "/n/module-helper",
+                200,
+                request_body=body_of(("name", False), required=False),
+            ),
+        ],
+        {"unresolved": ["GET /n/wrong-prefix-struct: cannot find struct Filter"]},
+    ),
+    (
         "a qualified method picks its impl type, and an ambiguous method fails closed",
         FIXTURE_NAMES,
         [
@@ -7068,6 +7250,37 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             ],
             "unresolved": ["POST /e/unknown-receiver-method: cannot read a `from_slice` call"],
         },
+    ),
+    (
+        "a borrowed carrier is read through its borrow, and a partial slice fails closed",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/mut-borrow-parse",
+                200,
+                request_body=body_of(("name", True), required=False),
+            ),
+            fixture_route(
+                "POST",
+                "/e/partial-slice-parse",
+                200,
+                request_body=body_of(("name", True), required=False),
+            ),
+        ],
+        {
+            "body_required": [
+                "POST /e/mut-borrow-parse: the body is mandatory",
+                "POST /e/partial-slice-parse: the body is mandatory",
+            ],
+            "unresolved": ["POST /e/partial-slice-parse: cannot read a `from_slice` call"],
+        },
+    ),
+    (
+        "a type alias of a Query from another crate is no extractor",
+        FIXTURE_EDGES,
+        [fixture_route("GET", "/e/signed-type-alias", 200, params=[])],
+        {},
     ),
     (
         "a guard is judged by its top-level && and || only, on every guard path",
