@@ -479,6 +479,51 @@ def from_slice_calls(source: str) -> re.Pattern:
     return re.compile(r"(?:%s%s)\s*(?:::<|\()" % (qualified, bare))
 
 
+@functools.lru_cache(maxsize=None)
+def module_uses(source: str) -> str:
+    """The `use` statements of `source` at brace depth 0, joined.
+
+    Only a module-level `use` holds for the whole file. A `use` inside a
+    function or a block holds only in that block, as `from_slice_hits` reads it.
+    """
+    depth, uses = 0, []
+    for token in re.finditer(r"[{}]|\buse\b[^;{}]*(?:\{[^}]*\}[^;]*)?;", source):
+        if token.group(0) == "{":
+            depth += 1
+        elif token.group(0) == "}":
+            depth -= 1
+        elif depth == 0:
+            uses.append(token.group(0))
+    return "\n".join(uses)
+
+
+def enclosing_block(block: str, position: int) -> tuple[int, int]:
+    """`(start, end)` of the innermost `{ .. }` in `block` that holds `position`."""
+    depth = 0
+    for index in range(position - 1, -1, -1):
+        depth += block[index] == "}"
+        depth -= block[index] == "{"
+        if depth < 0:
+            return index, index + len(balanced(block[index:], "{", "}"))
+    return 0, len(block)
+
+
+def from_slice_hits(block: str) -> list[re.Match]:
+    """Each `from_slice` call in `block`, read with the imports in its scope.
+
+    A module-level `use` holds everywhere. A `use` inside `block` holds in
+    the innermost block that holds it, before or after the statement, as in
+    Rust. A `use` in another function does not reach `block`.
+    """
+    hits = {hit.start(): hit for hit in from_slice_calls(module_uses(SOURCE[0])).finditer(block)}
+    for statement in re.finditer(r"\buse\b[^;]*;", block):
+        start, end = enclosing_block(block, statement.start())
+        for hit in from_slice_calls(statement.group(0)).finditer(block):
+            if start <= hit.start() < end:
+                hits.setdefault(hit.start(), hit)
+    return [hits[start] for start in sorted(hits)]
+
+
 # The `StatusCode` names for a 2xx status.
 SUCCESS_NAMES = "|".join(sorted(name for name, status in NAMED.items() if 200 <= status < 300))
 
@@ -730,6 +775,15 @@ def split_top_level(text: str) -> list[str]:
 # A word before `(` that is a keyword, not a call.
 NOT_CALLS = frozenset({"if", "match", "while", "for", "return", "in", "loop", "move", "fn"})
 
+# An optional turbofish between a helper name and its `(`, as in `decode::<T>(`.
+TURBOFISH = r"(?:\s*::\s*<[^()]*?>)?"
+
+# A free call: a lowercase name, not a method or a path, with an optional
+# turbofish. Group 1 is the name. `handoffs` and `receiving_parameters` read
+# every helper call through this one pattern.
+FREE_CALL_HEAD = r"(?<![\w.:])([a-z_][a-z_0-9]*)%s" % TURBOFISH
+FREE_CALL_NAME = FREE_CALL_HEAD + r"\s*\("
+
 
 def outside_calls(argument: str) -> str:
     """`argument` with the argument list of each call in it blanked.
@@ -758,7 +812,7 @@ def handoffs(
     read their helpers through this one step.
     """
     found = []
-    names = set(re.findall(r"(?<![\w.:])([a-z_][a-z_0-9]*)\s*\(", block))
+    names = set(re.findall(FREE_CALL_NAME, block))
     for helper in sorted(names - NOT_CALLS - GENERIC_HELPERS):
         parts = function_parts(source, helper)
         states = receiving_parameters(block, helper, parts[0] if parts else "", carriers)
@@ -788,7 +842,7 @@ def receiving_parameters(
         plain = re.match(r"(?:mut\s+)?([a-z_][a-z_0-9]*)\s*:", item)
         names.append(plain.group(1) if plain else None)
     states: dict[str, tuple[bool, bool]] = {}
-    for call in re.finditer(r"(?<![\w.:])%s\s*\(" % re.escape(helper), block):
+    for call in re.finditer(r"(?<![\w.:])%s%s\s*\(" % (re.escape(helper), TURBOFISH), block):
         raw = balanced(block[call.end() - 1 :])
         arguments = split_top_level(raw[1:-1].replace("->", ""))
         tolerant = discards_error(block[: call.start()], block[call.end() - 1 + len(raw) :])
@@ -817,7 +871,7 @@ def block_parses(
     `let` gave a new value is no carrier after that `let`.
     """
     parses: list[tuple[str | None, bool, bool]] = []
-    for hit in from_slice_calls(SOURCE[0]).finditer(block):
+    for hit in from_slice_hits(block):
         turbofish = None
         opener = hit.end() - 1
         if block[opener] == "<":
@@ -955,12 +1009,16 @@ def error_rejects(
     # The extractor as a pattern reads it: by value, borrowed or through `as_ref`.
     read = borrow + variable + method
     for use in re.finditer(r"(?<![.\w])%s\b" % variable, block):
-        if not live(use.start()):
+        if not live(use.start()) or binds_name(block, use.start(), use.end()):
             continue
         verdict, inspection, rest = walk_chain(block[use.end() :])
         # A chain that still holds the error and is the value of the block
         # hands that error to the caller, so it rejects like `?` does.
         if verdict == "open" and yields_block_value(block[: use.start()], rest):
+            verdict = "reject"
+        # Any other use that still holds the error is strict, unless it is a
+        # form that another part of this function reads.
+        if verdict == "open" and not read_elsewhere(block, use.start(), rest):
             verdict = "reject"
         if verdict == "reject" and not error_exits_before(block, variable, read, use.start()):
             return True
@@ -1014,13 +1072,68 @@ def live_binding(block: str, name: str, position: int, bound_at: int = -1) -> bo
 
     `bound_at` is where a `let` created `name`, or -1 for a parameter. A later
     `let` that gives `name` a new value ends it for the rest of that scope, as
-    `shadowing_lets` reads it. The Result-extractor scan and the raw-body
-    carriers both ask this.
+    `shadowing_lets` reads it. A pattern that binds `name` ends it in the
+    code that pattern guards, as `pattern_scopes` reads it. The
+    Result-extractor scan and the raw-body carriers both ask this.
     """
-    return not any(
+    if any(
         bound_at < start and end <= position and same_scope(block, start, position)
         for start, end in shadowing_lets(block, name)
+    ):
+        return False
+    return not any(
+        bound_at < bind and scope_start <= position < scope_end
+        for bind, _, scope_start, scope_end in pattern_scopes(block, name)
     )
+
+
+@functools.lru_cache(maxsize=None)
+def pattern_scopes(block: str, name: str) -> list[tuple[int, int, int, int]]:
+    """`(start, end, scope start, scope end)` for each pattern that binds `name`.
+
+    A pattern is a `match` arm before `=>`, or the pattern of an `if let`, a
+    `while let` or a destructuring `let`, before its `=`. A plain
+    `let name = ..` is not read here, since `shadowing_lets` reads it. The
+    scope is the arm, the block of the `if let` or `while let`, or the rest of
+    the block after the `let` statement.
+    """
+    found: list[tuple[int, int, int, int]] = []
+    for hit in re.finditer(r"(?<![.\w])%s\b" % re.escape(name), block):
+        ahead = re.match(r"[^;{}]*?(=>|(?<![=!<>])=(?![=>]))", block[hit.end() :])
+        if ahead is None or re.match(r"\s*:(?!:)", block[hit.end() :]):
+            continue
+        marker = hit.end() + ahead.start(1)
+        after = marker + len(ahead.group(1))
+        # A `,` after more closers than openers leaves the pattern, as in an
+        # arm value `handle(body),` before the next arm's `=>`.
+        depth = 0
+        for char in block[hit.end() : marker]:
+            depth += char in "(["
+            depth -= char in ")]"
+            if char == "," and depth < 0:
+                break
+        else:
+            depth = None
+        if depth is not None:
+            continue
+        statement = block.rfind(";", 0, hit.start())
+        head = block[max(statement, block.rfind("{", 0, hit.start()), block.rfind("}", 0, hit.start())) + 1 : hit.start()]
+        if ahead.group(1) == "=>":
+            rest = block[after:]
+            opener = len(rest) - len(rest.lstrip())
+            if rest[opener : opener + 1] == "{":
+                end = after + opener + len(balanced(rest[opener:], "{", "}"))
+            else:
+                end = after + len(scope_rest(rest.replace(",", ";")))
+            found.append((hit.start(), hit.end(), after, end))
+        elif re.search(r"\b(?:if|while)\s+let\b", head):
+            opener = block.find("{", after)
+            if opener >= 0:
+                found.append((hit.start(), hit.end(), opener, opener + len(balanced(block[opener:], "{", "}"))))
+        elif re.search(r"\blet\b", head) and not re.fullmatch(r"\s*let\s+(?:mut\s+)?", head):
+            stop = after + len(scope_rest(block[after:]).split(";")[0])
+            found.append((hit.start(), hit.end(), stop, enclosing_block(block, hit.start())[1]))
+    return found
 
 
 @functools.lru_cache(maxsize=None)
@@ -1028,8 +1141,10 @@ def shadowing_lets(block: str, name: str) -> list[tuple[int, int]]:
     """`(start, end)` of each `let <name> = ..;` that makes `name` a new value.
 
     After that statement, `name` in the same scope is no longer the extractor.
-    A value that reads `name` itself, such as `let body = body;`, can still
-    hold the extractor, so it is no shadow.
+    A value that is `name` itself, or a method chain on it that still holds
+    the error, such as `let body = body;` or `let body = body.map_err(f);`,
+    keeps the extractor, so it is no shadow. Any other value, such as
+    `match body { .. }`, is a new value.
     """
     variable = re.escape(name)
     found: list[tuple[int, int]] = []
@@ -1042,9 +1157,13 @@ def shadowing_lets(block: str, name: str) -> list[tuple[int, int]]:
             if depth < 0 or (depth == 0 and char == ";"):
                 end = index
                 break
-        value = block[binding.end() : end]
-        if not re.search(r"(?<![.\w])%s\b" % variable, value):
-            found.append((binding.start(), end))
+        value = block[binding.end() : end].strip()
+        lead = re.match(r"&?\s*(?:mut\s+)?%s\b" % variable, value)
+        if lead:
+            verdict, _, rest = walk_chain(value[lead.end() :])
+            if verdict != "tolerate" and not rest.strip():
+                continue
+        found.append((binding.start(), end))
     return found
 
 
@@ -1057,6 +1176,53 @@ def scope_rest(text: str) -> str:
         if depth < 0:
             return text[:index]
     return text
+
+
+def binds_name(block: str, start: int, end: int) -> bool:
+    """Whether the name at `start..end` is bound there, not read.
+
+    That is the pattern of a `let`, as in `let body = ..`, or a field name or
+    a type ascription, as in `body: T`. A field shorthand such as
+    `Payload { body }` still reads the name.
+    """
+    bound = re.search(r"\blet\s+(?:mut\s+)?$", block[:start]) is not None
+    if bound or re.match(r"\s*:(?!:)", block[end:]) is not None:
+        return True
+    name = block[start:end]
+    return any(bind == start for bind, _, _, _ in pattern_scopes(block, name))
+
+
+def read_elsewhere(block: str, position: int, rest: str) -> bool:
+    """Whether an extractor use at `position` is a form `error_rejects` reads.
+
+    `rest` is the text after the use and its method chain. The forms are the
+    whole value of a `match`, an `if let` or a `while let`, a let-else, a
+    move into another name, and a direct argument of a helper that the audit
+    can find. Any other use, such as an argument of a macro or a method, or a
+    field read, is not read. The audit treats it as strict and fails closed.
+    """
+    before = block[:position]
+    borrow = r"\s*(?:&\s*(?:mut\s+)?)?$"
+    scrutinee = r"(?:\bmatch|\b(?:if|while)\s+let\s[^=;{}]*=)" + borrow
+    if re.search(scrutinee, before) and rest.lstrip().startswith("{"):
+        return True
+    if re.search(r"\blet\s[^=;{}]*=" + borrow, before) and re.match(r"\s*(?:;|else\b)", rest):
+        return True
+    depth = 0
+    for index in range(position - 1, -1, -1):
+        depth += before[index] in ")]}"
+        depth -= before[index] in "([{"
+        if depth < 0:
+            if before[index] != "(":
+                return False
+            call = re.search(FREE_CALL_HEAD + r"\s*$", before[:index])
+            if call is None or call.group(1) in NOT_CALLS:
+                return False
+            return function_parts(SOURCE[0], call.group(1)) is not None
+        if depth == 0 and before[index] in ",;":
+            if before[index] == ";":
+                return False
+    return False
 
 
 def yields_block_value(before: str, rest: str) -> bool:
@@ -1114,17 +1280,27 @@ def arm_rejects(arm: str, bound: str | None) -> bool:
     """Whether an arm that receives an extractor error rejects the request.
 
     It rejects as `rejecting_arm` reads it. It also rejects when it exits as
-    `rejecting_exit` reads it, or when its value is a call to a free function,
-    unless it hands the error it binds to a helper. Such a helper can recover
-    the request, as the start route does (#808). A type path such as
+    `rejecting_exit` reads it, or when its value is a call to a free function.
+    A call that hands the bound error to a helper is the one exception, since
+    such a helper can recover the request, as the start route does (#808).
+    The exception covers that call only. Any other exit of the arm that
+    rejects still makes the arm reject. A type path such as
     `Gadget::default()` builds a value.
     """
     if rejecting_arm(arm, bound):
         return True
     if bound is not None and bound != "_":
-        handed = r"\b[A-Za-z_][\w:]*\s*\([^;]*\b%s\b" % re.escape(bound)
+        handed = r"(?:return\s+)?[A-Za-z_][\w:]*\s*\([^;]*\b%s\b" % re.escape(bound)
         if re.search(handed, arm):
-            return False
+            # The handoff excuses only itself. Every other exit of the arm
+            # is still read through `success_value`.
+            if re.search(r"\b(?:panic|unreachable|todo)!", arm):
+                return True
+            for returned in re.findall(r"\breturn\b\s*([^;}]*)", arm):
+                if not re.match(handed, returned.strip()) and not success_value(returned):
+                    return True
+            value = closure_value(arm)
+            return not re.match(handed, value) and builds_rejection(value)
     return rejecting_exit(arm) or builds_rejection(closure_value(arm))
 
 
@@ -2358,6 +2534,12 @@ pub fn harvest_api_router() -> Router {
         .route("/e/raw-two-level", post(e_raw_two_level))
         .route("/e/raw-recursive", post(e_raw_recursive))
         .route("/e/json-handoff", post(e_json_handoff))
+        .route("/e/raw-turbofish-helper", post(e_raw_turbofish_helper))
+        .route("/e/err-observe-then-reject", post(e_err_observe_then_reject))
+        .route("/e/alias-out-of-scope", post(e_alias_out_of_scope))
+        .route("/e/matches-macro", post(e_matches_macro))
+        .route("/e/unknown-macro", post(e_unknown_macro))
+        .route("/e/rebound-match", post(e_rebound_match))
         .route("/e/json-handoff-unknown", post(e_json_handoff_unknown))
         .route("/e/json-handoff-tolerant", post(e_json_handoff_tolerant))
         .route("/e/raw-nested-argument", post(e_raw_nested_argument))
@@ -3293,6 +3475,58 @@ struct LooseLimit {
 
 struct NamedLimit {
     limit: String,
+}
+
+async fn e_raw_turbofish_helper(body: Bytes) -> Response {
+    decode_as::<Gadget>(&body)
+}
+
+fn decode_as<T>(raw: &[u8]) -> Response {
+    let value = serde_json::from_slice::<Gadget>(raw).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_err_observe_then_reject(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    match body {
+        Ok(Json(gadget)) => StatusCode::OK.into_response(),
+        Err(error) => {
+            observe_rejection(error);
+            invalid_body()
+        }
+    }
+}
+
+fn observe_rejection(error: JsonRejection) {}
+
+fn scoped_alias_parse(raw: &[u8]) -> Gadget {
+    use serde_json::from_slice as parse_scoped;
+    parse_scoped(raw).unwrap()
+}
+
+async fn e_alias_out_of_scope(body: Bytes) -> Response {
+    let size = parse_scoped(&body);
+    StatusCode::OK.into_response()
+}
+
+async fn e_matches_macro(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    if matches!(body, Err(_)) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    StatusCode::OK.into_response()
+}
+
+async fn e_unknown_macro(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    my_check!(body);
+    StatusCode::OK.into_response()
+}
+
+async fn e_rebound_match(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    let body = match body {
+        Ok(Json(gadget)) => gadget,
+        Err(_) => Gadget::default(),
+    };
+    let name = body.name.clone();
+    StatusCode::OK.into_response()
 }
 
 async fn e_helper_in_comment() -> Response {
@@ -5210,6 +5444,78 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
                 "GET /e/conflicting-query-key: `limit` has conflicting types",
             ]
         },
+    ),
+    (
+        "a helper called with a turbofish gets the raw body",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/raw-turbofish-helper",
+                200,
+                request_body=body_of(("name", True), required=False),
+            )
+        ],
+        {"body_required": ["POST /e/raw-turbofish-helper: the body is mandatory"]},
+    ),
+    (
+        "an Err arm that hands its error on and then rejects is mandatory",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/err-observe-then-reject",
+                200,
+                request_body=body_of(("name", True), required=False),
+            )
+        ],
+        {"body_required": ["POST /e/err-observe-then-reject: the body is mandatory"]},
+    ),
+    (
+        "a from_slice alias in another function is out of scope",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/alias-out-of-scope",
+                200,
+                request_body=body_of(("name", False), required=False),
+            )
+        ],
+        {},
+    ),
+    (
+        "a Result extractor in a macro is strict",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                path,
+                200,
+                request_body=body_of(("name", True), required=False),
+                error_responses=[{"status": 400}],
+            )
+            for path in ("/e/matches-macro", "/e/unknown-macro")
+        ],
+        {
+            "body_required": [
+                "POST /e/matches-macro: the body is mandatory",
+                "POST /e/unknown-macro: the body is mandatory",
+            ]
+        },
+    ),
+    (
+        "a name rebound to a match value is no longer the extractor",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/rebound-match",
+                200,
+                request_body=body_of(("name", False), required=False),
+            )
+        ],
+        {},
     ),
     (
         "a helper named in a comment or a string is not called",
