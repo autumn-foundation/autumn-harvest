@@ -2037,19 +2037,42 @@ struct Regions {
 
 impl Regions {
     async fn teardown(&self) {
-        if let Ok(mut b) = AsyncPgConnection::establish(&self.standby_url).await {
-            let _ = b
-                .batch_execute(&format!("DROP SUBSCRIPTION IF EXISTS {}", self.sub))
-                .await;
+        // `DROP SUBSCRIPTION` can deadlock against a sync worker that is still
+        // creating its slot. Each step is therefore bounded. A step that times
+        // out is logged and skipped, so cleanup never pins a CI shard.
+        let bound = std::time::Duration::from_secs(30);
+        let drop_subscription = async {
+            if let Ok(mut b) = AsyncPgConnection::establish(&self.standby_url).await {
+                let _ = b
+                    .batch_execute(&format!("DROP SUBSCRIPTION IF EXISTS {}", self.sub))
+                    .await;
+            }
+        };
+        if tokio::time::timeout(bound, drop_subscription)
+            .await
+            .is_err()
+        {
+            eprintln!(
+                "teardown: DROP SUBSCRIPTION {} did not finish within 30s, skipped",
+                self.sub
+            );
         }
-        if let Ok(mut a) = AsyncPgConnection::establish(&self.primary_url).await {
-            let _ = diesel::sql_query(
-                "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots \
-                 WHERE slot_name = $1",
-            )
-            .bind::<diesel::sql_types::Text, _>(self.slot.clone())
-            .execute(&mut a)
-            .await;
+        let drop_slot = async {
+            if let Ok(mut a) = AsyncPgConnection::establish(&self.primary_url).await {
+                let _ = diesel::sql_query(
+                    "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots \
+                     WHERE slot_name = $1",
+                )
+                .bind::<diesel::sql_types::Text, _>(self.slot.clone())
+                .execute(&mut a)
+                .await;
+            }
+        };
+        if tokio::time::timeout(bound, drop_slot).await.is_err() {
+            eprintln!(
+                "teardown: dropping slot {} did not finish within 30s, skipped",
+                self.slot
+            );
         }
     }
 }
