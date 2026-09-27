@@ -102,6 +102,17 @@ generality would need real static analysis, not text scanning. Past
 this point, a finding in this family is a documented limitation of the
 approach, not a fix this script can keep absorbing indefinitely.
 
+`extract_function` itself had a gap at its very first step: it searched
+for a tracked function's signature in unmasked text, so a signature-shaped
+line inside a preceding block comment or doc-comment code example (typed
+out as sample usage) could match instead of the real function further
+down — extracting and comparing two copies' documentation examples
+instead of their real implementations, with no error to signal it.
+Signature and opening-brace search now run over comment/string-masked
+text; only the function span actually returned is read back from the
+original, so real comments and strings inside a tracked function's body
+still compare byte-for-byte as before.
+
 Function extraction matches braces through `find_matching_brace`, not a
 raw character count. Codex review on PR #1696 found the raw count could
 be desynced by a brace inside a line comment, a block comment, or a
@@ -426,13 +437,28 @@ def extract_function(text: str, name: str) -> str | None:
     attributes above the signature are not included — deliberately, so the
     two copies' shared line-number-dependent `#[cfg(...)]` placement never
     causes a false divergence unrelated to the algorithm itself.
+
+    The signature itself is searched for in comment/string-masked text.
+    Codex review on PR #1696 found the earlier unmasked search could match
+    a signature-shaped line sitting inside a preceding block comment or
+    doc-comment code example (`fn snapshot_quota_policies() { ... }` typed
+    out as sample usage) instead of the real function further down, and
+    extraction would then follow that fake signature's own (separately
+    balanced, so no crash) braces — silently comparing two copies'
+    documentation examples instead of their real implementations. Masked
+    text has the same length and offsets as `text`, so a match found in it
+    locates the real signature and opening brace in the original text
+    exactly; only the RETURNED span is read from unmasked `text`, so a
+    real comment or string inside the function body is preserved verbatim
+    in what gets compared.
     """
+    masked = mask_comments_and_strings(text)
     sig_re = re.compile(FN_SIGNATURE_RE_TEMPLATE.format(name=re.escape(name)))
-    m = sig_re.search(text)
+    m = sig_re.search(masked)
     if not m:
         return None
     start = m.start() + 1  # skip the leading newline
-    open_brace = text.index("{", m.end())
+    open_brace = masked.index("{", m.end())
     end = find_matching_brace(text, open_brace)
     return text[start:end]
 
