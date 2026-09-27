@@ -459,31 +459,14 @@ def raw_body_parses(source: str, handler: str) -> list[tuple[str | None, bool, b
         if parts is None:
             continue
         params, returns, block = parts
-        receivers = receiving_parameters(handler_block, helper, params, carriers)
-        found = block_parses(block, receivers & byte_parameters(params), returns)
-        if not found:
-            continue
-        guarded, tolerant = call_site_state(handler_block, helper, carriers)
-        parses += [(kind, o or guarded or tolerant, t or tolerant) for kind, o, t in found]
+        byte_names = byte_parameters(params)
+        states = receiving_parameters(handler_block, helper, params, carriers)
+        for name, (guarded, tolerant) in states.items():
+            if name not in byte_names:
+                continue
+            found = block_parses(block, {name}, returns)
+            parses += [(kind, o or guarded or tolerant, t or tolerant) for kind, o, t in found]
     return parses
-
-
-def call_site_state(block: str, helper: str, variables: set[str]) -> tuple[bool, bool]:
-    """Whether every call to `helper` that passes a body is guarded, or tolerant.
-
-    A call is guarded when an `.is_empty()` guard lets an empty body skip it. A
-    call is tolerant when it turns the helper's error into a value.
-    """
-    guarded = tolerant = True
-    for call in re.finditer(r"\b%s\s*\(" % re.escape(helper), block):
-        arguments = balanced(block[call.end() - 1 :])
-        passed = [v for v in variables if re.search(r"\b%s\b" % re.escape(v), arguments)]
-        if not passed:
-            continue
-        after = block[call.end() - 1 + len(arguments) :]
-        guarded &= any(guards(block, call.start(), variable) for variable in passed)
-        tolerant &= discards_error(block[: call.start()], after)
-    return guarded, tolerant
 
 
 def split_top_level(text: str) -> list[str]:
@@ -502,11 +485,15 @@ def split_top_level(text: str) -> list[str]:
     return items
 
 
-def receiving_parameters(block: str, helper: str, params: str, variables: set[str]) -> set[str]:
-    """The `helper` parameters that a call in the block passes a variable to.
+def receiving_parameters(
+    block: str, helper: str, params: str, variables: set[str]
+) -> dict[str, tuple[bool, bool]]:
+    """`(guarded, tolerant)` for each `helper` parameter that gets a variable.
 
     Each argument maps to the parameter at its position. A `self` receiver is
-    skipped, since a call does not pass it in the argument list.
+    skipped, since a call does not pass it in the argument list. A parameter
+    is guarded when every call that fills it sits behind an `.is_empty()`
+    guard. It is tolerant when every such call turns the error into a value.
     """
     # A pattern such as `Extension(state): ..` keeps its slot with no name, so
     # the parameters after it keep their positions.
@@ -516,14 +503,20 @@ def receiving_parameters(block: str, helper: str, params: str, variables: set[st
             continue
         plain = re.match(r"(?:mut\s+)?([a-z_][a-z_0-9]*)\s*:", item)
         names.append(plain.group(1) if plain else None)
-    receivers: set[str] = set()
+    states: dict[str, tuple[bool, bool]] = {}
     for call in re.finditer(r"\b%s\s*\(" % re.escape(helper), block):
-        arguments = split_top_level(balanced(block[call.end() - 1 :])[1:-1].replace("->", ""))
+        raw = balanced(block[call.end() - 1 :])
+        arguments = split_top_level(raw[1:-1].replace("->", ""))
+        tolerant = discards_error(block[: call.start()], block[call.end() - 1 + len(raw) :])
         for index, argument in enumerate(arguments):
-            mentions = any(re.search(r"\b%s\b" % re.escape(v), argument) for v in variables)
-            if mentions and index < len(names) and names[index]:
-                receivers.add(names[index])
-    return receivers
+            passed = [v for v in variables if re.search(r"\b%s\b" % re.escape(v), argument)]
+            name = names[index] if index < len(names) else None
+            if not passed or not name:
+                continue
+            guarded = any(guards(block, call.start(), variable) for variable in passed)
+            was_guarded, was_tolerant = states.get(name, (True, True))
+            states[name] = (was_guarded and guarded, was_tolerant and tolerant)
+    return states
 
 
 def block_parses(
@@ -613,7 +606,7 @@ def rejects_result_body(params: str, block: str) -> bool:
     scrutinee = r"\bmatch\s+&?\s*%s(?:\s*\.\s*as_ref\s*\(\s*\))?\s*\{" % variable
     for match in re.finditer(scrutinee, block):
         arms = balanced(block[match.end() - 1 :], "{", "}")
-        failure = re.search(r"\bErr\s*\(\s*([a-z_][a-z_0-9]*)?", arms)
+        failure = top_level_err(arms)
         if failure and rejecting_arm(match_arm(arms, failure.start()), failure.group(1)):
             return True
     for binding in re.finditer(r"\blet\s+Ok\s*\(.*?\)\s*=\s*%s\s+else\s*\{" % variable, block):
@@ -639,6 +632,25 @@ def rejecting_arm(arm: str, bound: str | None) -> bool:
     returned = r"\breturn\s+(?:Err\(\s*)?%s\b(?!\s*[,)])" % name
     converted = r"\b%s\s*\.\s*(?:into_response|into)\s*\(\s*\)" % name
     return re.search(returned + "|" + converted, arm) is not None
+
+
+def top_level_err(arms: str) -> re.Match | None:
+    """The `Err(..)` pattern that starts an arm of this `match`, not a nested one.
+
+    `arms` includes the outer braces, so an arm pattern sits at depth 1 and
+    follows `{`, `,` or `}`.
+    """
+    depth = 0
+    for index, char in enumerate(arms):
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+        elif depth == 1 and char == "E":
+            found = re.compile(r"Err\s*\(\s*([a-z_][a-z_0-9]*)?").match(arms, index)
+            if found and arms[:index].rstrip()[-1:] in ("{", ",", "}", "|"):
+                return found
+    return None
 
 
 def match_arm(arms: str, start: int) -> str:
@@ -1428,6 +1440,8 @@ pub fn harvest_api_router() -> Router {
         .route("/e/unwrapped", post(e_unwrapped))
         .route("/e/borrowed-match", post(e_borrowed_match))
         .route("/e/parse-then-return", post(e_parse_then_return))
+        .route("/e/nested-err", post(e_nested_err))
+        .route("/e/split-calls", post(e_split_calls))
 }
 
 async fn e_wrapped(body: Bytes) -> Response {
@@ -1796,6 +1810,31 @@ async fn e_parse_then_return(body: Bytes) -> Result<Response, Response> {
         return Ok(StatusCode::OK.into_response());
     }
     Ok(StatusCode::OK.into_response())
+}
+
+async fn e_nested_err(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    let gadget = match body {
+        Ok(Json(gadget)) => match check(&gadget) {
+            Err(_) => fallback(),
+            Ok(value) => value,
+        },
+        Err(rejection) => return rejection.into_response(),
+    };
+    StatusCode::OK.into_response()
+}
+
+fn decode_pair(first: &[u8], second: &[u8]) -> Result<Gadget, Response> {
+    let gadget = serde_json::from_slice::<Gadget>(first).map_err(reject)?;
+    let cursor = serde_json::from_slice::<Cursor>(second).map_err(reject)?;
+    Ok(gadget)
+}
+
+async fn e_split_calls(body: Bytes) -> Response {
+    if !body.is_empty() {
+        let gadget = decode_pair(&body, STORED)?;
+    }
+    let other = decode_pair(STORED, &body).ok();
+    StatusCode::OK.into_response()
 }
 
 async fn e_documented(Query(query): Query<Documented>) -> Response {
@@ -2704,6 +2743,29 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             )
         ],
         {"body_required": ["POST /e/parse-then-return: the body is mandatory"]},
+    ),
+    (
+        "only the top-level Err arm decides a Result<Json<T>> body",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST", "/e/nested-err", 200, request_body=body_of(("name", True), required=False)
+            )
+        ],
+        {"body_required": ["POST /e/nested-err: the body is mandatory"]},
+    ),
+    (
+        "each helper parameter keeps the state of the calls that fill it",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/split-calls",
+                200,
+                request_body=body_of(("name", True), ("offset", False), required=False),
+            )
+        ],
+        {},
     ),
     (
         "a malformed contract entry does not crash the audit",
