@@ -452,6 +452,14 @@ pub const METRIC_SHARD_FENCED: &str = "harvest.shard.fenced";
 /// Gauge: current number of entries in the dead letter queue.
 pub const METRIC_DLQ_ENTRIES: &str = "harvest.dlq.entries";
 
+/// Gauge: cumulative hints the dispatch background publisher has dropped
+/// because its bounded queue was full (issue #1429).
+///
+/// A dropped hint costs latency, not correctness: the row stays `PENDING`
+/// and the reconcile sweep republishes it. A sustained non-zero rate means
+/// the publisher queue is undersized for the enqueue rate.
+pub const METRIC_DISPATCH_DROPPED_HINTS: &str = "harvest.dispatch.dropped_hints";
+
 /// Gauge: `1` while a task queue is paused by an operator, `0` once it resumes
 /// (issue #619).
 ///
@@ -2786,6 +2794,16 @@ pub trait MetricsRecorder: Send + Sync {
     /// Maps to the gauge `harvest_dlq_entries{shard}`.
     fn record_dlq_entries(&self, shard: u16, depth: u64) {
         let _ = (shard, depth);
+    }
+
+    /// Cumulative hints the dispatch background publisher has dropped because
+    /// its bounded queue was full (issue #1429).
+    ///
+    /// Emitted by a periodic in-process sampler, no label. Maps to the gauge
+    /// `harvest_dispatch_dropped_hints`. Not incremental: each call carries
+    /// the running total from [`crate::dispatch::dropped_hints`].
+    fn record_dispatch_dropped_hints(&self, total: u64) {
+        let _ = total;
     }
 
     /// Whether a task queue is currently held by an operator queue pause

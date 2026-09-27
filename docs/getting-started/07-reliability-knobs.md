@@ -227,7 +227,11 @@ run with a fresh deadline:
 async fn subscription_entity(ctx: &WorkflowContext, state: SubState) -> Result<SubState, String> {
     // Fires on history size OR ~80% of the execution_timeout budget.
     if ctx.should_continue_as_new() {
-        ctx.continue_as_new(serde_json::to_value(&state).unwrap()).await?;
+        // continue_as_new returns HarvestResult<()>; map_err converts it
+        // since this workflow's own error type is String.
+        ctx.continue_as_new(serde_json::to_value(&state).map_err(|e| e.to_string())?)
+            .await
+            .map_err(|e| e.to_string())?;
     }
     // ... one cycle of durable work ...
     Ok(state)

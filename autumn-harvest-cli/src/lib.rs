@@ -1797,6 +1797,13 @@ enum AuditCommand {
         /// Upper bound (exclusive), RFC 3339.
         #[arg(long)]
         before: Option<String>,
+        /// Row id tiebreaker for `--before` (issue #1408).
+        ///
+        /// Pass the prior page's last row id, alongside `--before`, to page
+        /// past rows tied on that timestamp. Has no effect without
+        /// `--before`.
+        #[arg(long)]
+        before_id: Option<String>,
         /// Maximum number of records to return [1–500].
         #[arg(long, value_parser = clap::value_parser!(i64).range(1..=500))]
         limit: Option<i64>,
@@ -3410,10 +3417,13 @@ enum EventsCommand {
     Tail {
         /// Workflow execution ID to watch.
         execution_id: String,
-        /// Resume from this event row ID (Last-Event-ID header).
-        /// Events with id > this value are replayed before entering live-tail mode.
+        /// Resume from this `event_id` (issue #1405), sent as the
+        /// Last-Event-ID header. NOT the shard-local `harvest_events.id` --
+        /// this is the per-execution sequence number the server's `id:`
+        /// SSE field carries. Events after it are replayed before entering
+        /// live-tail mode.
         #[arg(long)]
-        last_event_id: Option<i64>,
+        last_event_id: Option<i32>,
     },
 }
 
@@ -4727,7 +4737,7 @@ pub fn format_backup_verify_text(report: &RestoreVerifyReport) -> String {
             replay.unreadable,
             replay.unreadable
         );
-    } else if replay.unreadable > 0 {
+    } else if replay.unreadable > 0 && replay.skipped_no_handler == 0 {
         // Every sample that reached this check was unreadable, and none
         // replayed at all. This is distinct from the branch below, where
         // nothing replayed because no handler was registered. Handlers may
@@ -4741,6 +4751,23 @@ pub fn format_backup_verify_text(report: &RestoreVerifyReport) -> String {
              history failed to read; see the history_unreadable finding above for the cause. \
              Registering workflow handlers will not fix this.",
             replay.sampled, replay.unreadable
+        );
+    } else if replay.unreadable > 0 {
+        // Nothing replayed, for two separate reasons at once: some samples
+        // were unreadable, others had no registered handler. A fleet-wide
+        // merge across shards can produce this mix (issue #1410). Name both
+        // counts. Registering handlers fixes only the second group.
+        let _ = writeln!(
+            out,
+            "  replay: NOT VERIFIED — {} sampled, {} unreadable, {} skipped (no handler), \
+             0 replayed. {} history/histories failed to read; see the history_unreadable \
+             finding above for the cause. {} had no registered handler. Registering \
+             handlers may fix part of this, not all of it.",
+            replay.sampled,
+            replay.unreadable,
+            replay.skipped_no_handler,
+            replay.unreadable,
+            replay.skipped_no_handler
         );
     } else {
         let _ = writeln!(
@@ -7661,7 +7688,7 @@ pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
 async fn run_events_tail(
     cli: &Cli,
     execution_id: &str,
-    last_event_id: Option<i64>,
+    last_event_id: Option<i32>,
 ) -> Result<(), CliError> {
     let path = format!("/executions/{}", path_segment(execution_id));
     let url = format!(
@@ -11700,6 +11727,7 @@ fn audit_request(command: &AuditCommand) -> ApiRequest {
             status,
             since,
             before,
+            before_id,
             limit,
         } => {
             let mut params: Vec<(&'static str, String)> = Vec::new();
@@ -11723,6 +11751,9 @@ fn audit_request(command: &AuditCommand) -> ApiRequest {
             }
             if let Some(v) = before {
                 params.push(("before", v.clone()));
+            }
+            if let Some(v) = before_id {
+                params.push(("before_id", v.clone()));
             }
             if let Some(v) = limit {
                 params.push(("limit", v.to_string()));

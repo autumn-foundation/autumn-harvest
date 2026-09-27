@@ -119,6 +119,7 @@ resume, not because anything is wrong.
 | `replay_divergence` | A sampled history no longer replays against the deployed workflow code. Not caused by the restore; caused by a code/history mismatch. Fix by rolling *back* the workflow code, then resume (see `nondeterminism-block.md`). |
 | `external_effect_rolled_back` | The caller recorded a signal/cancel/await as **delivered**, but the target's shard shows no trace of the effect — the cross-shard analogue of `child_terminal_rolled_back`. Adjudicated per effect: a delivered *cancel* requires the target to be terminal; a resolved *await* requires the target's continue-as-new **chain head** to be terminal (a `CONTINUED_AS_NEW` target alone is not proof — see §4.2(c)); a delivered *signal* is matched **exactly by its `idempotency_key`** when the caller supplied one, else by channel name. The *signal* lookup walks the target's **successor chain** (`continued_from_exec_id` / `retry_of_exec_id`), because both continue-as-new and workflow-level retry reassign `harvest_signals` rows to the successor; the *await* check walks the continue-as-new chain via each predecessor's own `WorkflowContinuedAsNew` event, matching the engine's `read_external_await_outcome`. Adjudicated whether or not the **caller** is itself terminal — the assertion does not expire when the caller completes. Repair by restoring the target shard to a point at or after the caller's, per §6. Nothing retries this: the caller has already recorded the terminal and will never re-request. |
 | `replay_workflow_failed` | A sampled **non-terminal** history replays to a workflow *error* under the deployed code. Because the sample is drawn only from runs with no recorded terminal failure, this means the deployed handler now errors where the live run had not. Same remedy as `replay_divergence`: roll the workflow code *back*, then resume. |
+| `completion_trigger_fire_lost` | The source shard confirms a cross-shard completion-trigger relay delivered (`harvest_completion_trigger_fires.outcome IS NULL`, its outbox row gone), but the target execution is absent AND the target shard's restore point predates the fire by more than the cross-shard clock-skew tolerance. The target shard's snapshot cannot possibly hold the delivery — see §4.2(d). |
 
 A report containing any of these exits **1**. Do not start workers.
 
@@ -293,7 +294,86 @@ ack, it refuses; with the ack, it still only reads.
   `probe_failed` (→ `undetermined`, exit 2) rather than reporting a clean
   prefix: a single execution carrying more reference events than one page
   (raise `--probe-limit`), and hitting the internal page ceiling.
-- **(d) A machine-readable report** (`--format json`) with a nonzero exit on any
+- **(d) Completion-trigger relay coherence** (issue #1401). A
+  `harvest_completion_trigger_fires` row with `outcome IS NULL` is set the
+  moment the trigger fires, before any relay attempt — it is not by itself
+  proof of delivery. **Confirmed delivered** additionally requires the
+  matching `harvest_completion_trigger_outbox` row to be gone: the relay
+  deletes it only after the target-shard start commits, or an any-state
+  existence check finds the target already there. A fire still waiting on
+  the outbox scanner, or parked behind a quota backoff, keeps its outbox row
+  and is never adjudicated. A permanently rejected relay (oversized input
+  payload) resolves the fires row too, the same way an admission-gate block
+  does, so it is excluded outright rather than misread as a lost delivery.
+
+  For a confirmed-delivered fire, the target's business key is
+  `target_workflow_name` plus the deterministic
+  `completion-trigger-{trigger_id}-{source_exec_id}`, checked on
+  `target_shard` — both recorded on the fires row itself AT RELAY TIME
+  (migration `20260920215812`). Reading the historical values this way,
+  rather than reconstructing them, closes two gaps a fleet-wide restore
+  drill can otherwise hit: a fire relayed while some shard was DRAINED
+  (readable, not writable) would resolve to a different shard if the
+  target shard were re-derived from today's topology; and
+  `sync_completion_triggers` can update an existing trigger's
+  `target_workflow_name` in place, so a fire predating that update would be
+  checked against the wrong name if joined to the CURRENT trigger row.
+
+  An absent target is checked against `harvest_execution_summaries` by
+  business key FIRST — proven retention stays silent regardless of
+  timestamps. Without a summary, an absent target with no timestamp
+  evidence either way is `completion_trigger_fire_unproven` (`undetermined`,
+  exit 2); an absent target whose shard's restore point predates the fire by
+  more than `VerifyOptions::max_skew_secs` (default 60s, the same
+  cross-shard clock-skew tolerance `restore_point_skew` uses — see §6.3) is
+  `completion_trigger_fire_lost` (`incoherent`, exit 1) — the restore point
+  proves the target snapshot cannot hold the delivery. `fired_at` and the
+  restore point come from two different Postgres hosts' clocks, so a gap no
+  larger than that tolerance stays `undetermined` instead (Codex follow-up
+  x5), never treated as proof. A RECORDED same-shard fire is never checked:
+  it commits atomically with the target start and cannot be split by a
+  skewed restore.
+
+  **Residual limitation** (Codex follow-up x2). A target that ran,
+  completed, and was retention-collected can itself have been its shard's
+  newest event. If nothing else touched that shard afterward, deleting it
+  pulls the visible restore point back to before `fired_at`, misreading a
+  coherent restore as `completion_trigger_fire_lost`. Enabling
+  `harvest_execution_summaries` closes this, since it is checked first and
+  wins regardless of the timestamp — but only within the summary's OWN
+  retention horizon (`--summary-age`). `harvest_completion_trigger_fires`
+  has no cleanup path, so a fire outlives its target's summary once that
+  summary ages out. This gap is not limited to summaries being disabled:
+  it recurs for old fires under ANY finite summary horizon. Closing it
+  unconditionally needs a genuine durable restore-point marker — exactly
+  the durable-marker work issue #1401 chose not to require. Tracked as a
+  possible follow-up: tying fires-table retention to the summary horizon.
+
+  **Pre-migration fires** (rows written before `20260920215812` shipped)
+  carry no recorded `target_shard`/`target_workflow_name` and fall back to
+  the old reconstruction: the target shard via
+  `ShardRouter::pick_for_new_workflow` (needs every fleet shard supplied,
+  the same convention `uninspected_shard_reference` already carries — a
+  partial `--shard` list can route the hash prediction wrong; also blind to
+  a HISTORICAL drain, same as above) and the target name via the CURRENT
+  trigger definition (blind to a since-changed name, same as above). A
+  drain-blind pick that happens to land on the fire's own source shard is
+  NOT treated as a same-shard commit. It is reported as
+  `completion_trigger_fire_unproven` instead, since a historical drain could
+  make that pick wrong in either direction. These reconstruction gaps are
+  residual, unfixable-after-the-fact limitations for data written before the
+  migration only.
+
+  **Fires rejected before this fix shipped.** A permanently rejected relay
+  (oversized input payload) now resolves `fires.outcome` to
+  `payload_too_large` in the same transaction as the outbox delete, so
+  verify excludes it like any other resolved fire. A fire an older build
+  rejected the same way, before that write existed, was left with
+  `outcome IS NULL` and no outbox row — indistinguishable after the fact
+  from a genuinely lost relay, since nothing durable records which case
+  applies. This is a residual, unfixable-after-the-fact gap for fires
+  rejected before this deploy only, not tied to the migration date above.
+- **(e) A machine-readable report** (`--format json`) with a nonzero exit on any
   failed check.
 
 ### 4.3 Replay honesty — read this before trusting a `clean` verdict
@@ -480,6 +560,15 @@ Verify computes the newest event timestamp on each shard and reports
 raises `restore_point_skew` (advisory). Treat a nonzero skew as a prompt to look
 hard at the cross-shard classes; treat a skew larger than your longest child
 workflow as a reason to restore again.
+
+`completion_trigger_fire_lost` (§4.2(d)) applies this same restore-point signal
+**per fire**, not just fleet-wide: a target shard's newest event compared
+against the fire's own `fired_at`. This resolves the common case decisively —
+without needing a `harvest_execution_summaries` row — leaving only a genuinely
+indeterminate absence as `completion_trigger_fire_unproven`. The per-fire
+comparison requires the gap to exceed the SAME skew tolerance
+(`max_skew_secs`) this section's fleet-wide check uses, since the two
+timestamps come from different shards' Postgres clocks (Codex follow-up x5).
 
 ---
 

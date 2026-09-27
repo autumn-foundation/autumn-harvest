@@ -322,7 +322,41 @@ const INIT_SQL: &str = concat!(
     // harvest_workflow_executions, required for the same reason as the
     // staging_vacated_state column above -- `WorkflowExecution::as_select()`
     // names it unconditionally.
-    include_str!("../../migrations/20260920014641_harvest_staging_vacated_by/up.sql")
+    include_str!("../../migrations/20260920014641_harvest_staging_vacated_by/up.sql"),
+    "\n",
+    // Issue #1685 root cause: this migration was never added here when it
+    // landed. Every testcontainers-provisioned test database was missing
+    // `target_shard`/`target_workflow_name` on `harvest_completion_trigger_fires`.
+    // `completion_trigger.rs` inserts into that table unconditionally. That
+    // insert runs inside the same decision-cycle transaction that marks a
+    // source workflow COMPLETED. The missing column failed the insert with a
+    // Postgres "column does not exist" error, on every attempt. The failed
+    // insert rolled back the whole transaction, including the source's own
+    // completion. The task then retried the identical failure forever, so
+    // any test on this path hung until its outer wait timed out.
+    //
+    // A persistent, already-migrated `HARVEST_TEST_DATABASE_URL` database
+    // never showed this bug. It already carried the column, from being
+    // migrated over time. Only a throwaway testcontainers database,
+    // provisioned solely from this constant, was affected. See the
+    // CI-health report series under `docs/rnd/*-ci-health-semaphore-*.md`
+    // for the full investigation this closes.
+    include_str!("../../migrations/20260920215812_harvest_completion_trigger_fires_target/up.sql"),
+    "\n",
+    // issue #1402: timer_fires_at column on harvest_task_queue. REQUIRED, not
+    // optional. `queue::reschedule_task`'s changeset names this column
+    // unconditionally. The repend queries that clear it --
+    // `primary_repend_workflow_task_query`,
+    // `release_suspended_workflow_claim_query`, and the three backoff-retry
+    // requeue queries -- do too. Without it, every one of those writes fails
+    // with `column "timer_fires_at" of relation "harvest_task_queue" does
+    // not exist`. That failure takes the same silent-rollback,
+    // retried-forever, eventual-timeout shape as the #1685/#1596/#1317 gaps
+    // above. It is the same omission class, caught the same way. A local
+    // run with `HARVEST_TEST_DATABASE_URL` set does not catch this gap;
+    // that path migrates from the full `migrations/` directory, not from
+    // this deliberately partial bundle.
+    include_str!("../../migrations/20260921011505_harvest_task_queue_timer_fires_at/up.sql")
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression

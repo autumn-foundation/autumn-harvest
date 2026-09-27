@@ -571,6 +571,12 @@ pub struct TaskQueueItem {
     /// `0 -> 1` and a mismatch resets to `1` — the same row either way.
     #[serde(default)]
     pub capability_miss_handler: Option<String>,
+    /// The `fires_at` of the durable timer this row is armed for (issue
+    /// #1402). Set only by `queue::reschedule_task`. Survives a later
+    /// `scheduled_at` drift with the same wake reason. `NULL` when no timer
+    /// owns this row, or once a different wake reason repends it.
+    #[serde(default)]
+    pub timer_fires_at: Option<DateTime<Utc>>,
 }
 
 /// Insert struct for enqueuing a new task.
@@ -1350,6 +1356,12 @@ pub struct CompletionTriggerFireDb {
     /// NULL = fired; `condition_unmet` / `condition_invalid` =
     /// resolved-skipped by the output guard (issue #810).
     pub outcome: Option<String>,
+    /// The target shard resolved at relay time (issue #1401). NULL on a
+    /// resolved-skip row or a pre-migration row.
+    pub target_shard: Option<i32>,
+    /// The target workflow name resolved at relay time (issue #1401). NULL
+    /// on a resolved-skip row or a pre-migration row.
+    pub target_workflow_name: Option<String>,
 }
 
 /// Insertable model for registering a fired completion trigger.
@@ -1360,6 +1372,13 @@ pub struct NewCompletionTriggerFireDb {
     pub trigger_id: Uuid,
     /// NULL = fired; Some(reason) = resolved-skipped (issue #810).
     pub outcome: Option<String>,
+    /// The target shard resolved at relay time. `None` for a resolved-skip
+    /// row, which never picks a target (issue #1401).
+    pub target_shard: Option<i32>,
+    /// `harvest_completion_triggers.target_workflow_name` at relay time,
+    /// captured because that column can change after the fire (issue
+    /// #1401). `None` for a resolved-skip row.
+    pub target_workflow_name: Option<String>,
 }
 
 /// Queryable model representing a deferred completion trigger outbox task.

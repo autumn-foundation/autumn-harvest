@@ -18,10 +18,16 @@ mod alert_pack_docs;
 mod audit_export_docs;
 #[cfg(feature = "db")]
 mod audit_export_tests;
+#[cfg(feature = "db")]
+mod audit_log_unexported_idx_write_cost_perf;
 mod audit_tests;
 #[cfg(feature = "db")]
 mod auto_heartbeat_tests;
 mod awaitables_tests;
+#[cfg(all(feature = "db", feature = "testing"))]
+mod backup_verify_refs_batch_perf;
+#[cfg(all(feature = "db", feature = "testing"))]
+mod backup_verify_retention_batch_perf;
 #[cfg(all(feature = "db", feature = "testing"))]
 mod backup_verify_tests;
 #[cfg(feature = "db")]
@@ -47,6 +53,8 @@ mod chaos_catalogue_drift;
 mod chaos_docs;
 #[cfg(feature = "chaos")]
 mod chaos_tests;
+#[cfg(feature = "db")]
+mod child_fanout_batch_perf;
 mod child_fanout_tests;
 mod child_policy_tests;
 #[cfg(feature = "db")]
@@ -167,6 +175,7 @@ mod queue_pause_tests;
 mod quota_enforcement_tests;
 mod quota_history_bytes_perf_tests;
 mod quota_lock_ordering_tests;
+mod quota_reconcile_candidate_scan_perf_tests;
 mod quota_reconcile_tests;
 mod quota_supersede_ordering_tests;
 mod rate_limit_bucket_gc_tests;
@@ -245,6 +254,8 @@ mod transactional_activity_tests;
 mod transactional_start_tests;
 #[cfg(feature = "db")]
 mod triage_tests;
+#[cfg(feature = "db")]
+mod typed_stub_deferred_admission_tests;
 #[cfg(feature = "db")]
 mod typed_stubs_tests;
 mod typed_workflow_failure_tests;
