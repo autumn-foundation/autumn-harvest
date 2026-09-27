@@ -2896,8 +2896,7 @@ async fn fire_due_on_conn(
     // guarantee (`dead_letter_entry_with_current_payload`) this change
     // does not touch.
     let mut delivered_rows: Vec<(Uuid, i32, u16)> = Vec::new();
-    let mut backoff_rows: Vec<(Uuid, i32, DateTime<Utc>, Option<u16>, Option<String>)> =
-        Vec::new();
+    let mut backoff_rows: Vec<(Uuid, i32, DateTime<Utc>, Option<u16>, Option<String>)> = Vec::new();
     let mut dead_letter_rows: Vec<(ClaimedDeliveryRow, OutcomeAction)> = Vec::new();
 
     for ((row, _body, _headers), attempt_outcome) in dispatchable.into_iter().zip(attempt_outcomes)
@@ -2937,7 +2936,13 @@ async fn fire_due_on_conn(
                 last_status,
                 last_error,
             } => {
-                backoff_rows.push((row.id, row.attempt, next_attempt_at, last_status, last_error));
+                backoff_rows.push((
+                    row.id,
+                    row.attempt,
+                    next_attempt_at,
+                    last_status,
+                    last_error,
+                ));
             }
             OutcomeAction::DeadLetter { .. } => {
                 dead_letter_rows.push((row, action));

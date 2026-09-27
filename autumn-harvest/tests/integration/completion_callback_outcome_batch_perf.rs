@@ -157,7 +157,12 @@ fn install_config() {
 /// Seeds `n` production-shaped, already-due delivery rows for one execution.
 /// Half resolve `Delivered` (even index), half `Backoff` (odd index) --
 /// see `ParityDeliverer`.
-fn build_rows(exec_id: Uuid, n: usize, retry_policy_json: &serde_json::Value) -> Vec<Row> {
+fn build_rows(
+    exec_id: Uuid,
+    n: usize,
+    retry_policy_json: &serde_json::Value,
+    max_attempts: i32,
+) -> Vec<Row> {
     (0..n)
         .map(|i| Row {
             id: Uuid::new_v4(),
@@ -166,6 +171,7 @@ fn build_rows(exec_id: Uuid, n: usize, retry_policy_json: &serde_json::Value) ->
             target_url: format!("https://api.example.com/completion-callback/{i}"),
             payload: json!({"perf_index": i, "result": {"ok": true}}),
             retry_policy: retry_policy_json.clone(),
+            max_attempts,
         })
         .collect()
 }
@@ -177,6 +183,7 @@ struct Row {
     target_url: String,
     payload: serde_json::Value,
     retry_policy: serde_json::Value,
+    max_attempts: i32,
 }
 
 async fn seed_rows(conn: &mut AsyncPgConnection, rows: &[Row]) {
@@ -193,7 +200,7 @@ async fn seed_rows(conn: &mut AsyncPgConnection, rows: &[Row]) {
             event_filter: json!({"AnyTerminal": null}),
             terminal_state: "Completed",
             payload: r.payload.clone(),
-            max_attempts: 5,
+            max_attempts: r.max_attempts,
             retry_policy: r.retry_policy.clone(),
             next_attempt_at: Utc::now() - chrono::Duration::seconds(1),
         })
@@ -331,10 +338,11 @@ async fn measure_one_batch(admin: &str, n: usize) -> SizePoint {
 
     let config = GLOBAL_CALLBACK_CONFIG.read().unwrap().clone().unwrap();
     let retry_policy_json = serde_json::to_value(&config.retry_policy).unwrap();
+    let max_attempts = i32::try_from(config.retry_policy.max_attempts).unwrap();
     drop(config);
 
     let exec_id = Uuid::new_v4();
-    let rows = build_rows(exec_id, n, &retry_policy_json);
+    let rows = build_rows(exec_id, n, &retry_policy_json, max_attempts);
     seed_rows(&mut seed_conn, &rows).await;
 
     let _pool = build_test_pool(&db_url);
@@ -481,10 +489,11 @@ async fn zz_capture_completion_callback_outcome_batch_explain() {
 
     let config = GLOBAL_CALLBACK_CONFIG.read().unwrap().clone().unwrap();
     let retry_policy_json = serde_json::to_value(&config.retry_policy).unwrap();
+    let max_attempts = i32::try_from(config.retry_policy.max_attempts).unwrap();
     drop(config);
 
     let exec_id = Uuid::new_v4();
-    let rows = build_rows(exec_id, 100, &retry_policy_json);
+    let rows = build_rows(exec_id, 100, &retry_policy_json, max_attempts);
     seed_rows(&mut seed_conn, &rows).await;
 
     // Claim the batch exactly as the scanner would, so the EXPLAIN below
@@ -634,13 +643,14 @@ async fn scanner_records_identical_outcomes_for_a_mixed_delivered_and_backoff_ba
         .expect("seed connection");
     let config = GLOBAL_CALLBACK_CONFIG.read().unwrap().clone().unwrap();
     let retry_policy_json = serde_json::to_value(&config.retry_policy).unwrap();
+    let max_attempts = i32::try_from(config.retry_policy.max_attempts).unwrap();
     drop(config);
 
     let exec_id = Uuid::new_v4();
     // 21 rows: an odd count exercises an unbalanced Delivered/Backoff split
     // (11 even-index Delivered, 10 odd-index Backoff), and is well under
     // one claim batch so every row resolves in a single tick.
-    let rows = build_rows(exec_id, 21, &retry_policy_json);
+    let rows = build_rows(exec_id, 21, &retry_policy_json, max_attempts);
     seed_rows(&mut seed_conn, &rows).await;
 
     let mut op_conn = AsyncPgConnection::establish(&db_url)
@@ -664,7 +674,10 @@ async fn scanner_records_identical_outcomes_for_a_mixed_delivered_and_backoff_ba
             assert_eq!(row.state, "DELIVERED", "even index {idx} should deliver");
             assert_eq!(row.last_status, Some(204));
             assert_eq!(row.last_error, None);
-            assert!(row.delivered_at_is_set, "delivered row must set delivered_at");
+            assert!(
+                row.delivered_at_is_set,
+                "delivered row must set delivered_at"
+            );
         } else {
             assert_eq!(row.state, "PENDING", "odd index {idx} should back off");
             assert_eq!(row.last_status, Some(500));
@@ -693,10 +706,11 @@ async fn scanner_handles_a_single_row_batch() {
         .expect("seed connection");
     let config = GLOBAL_CALLBACK_CONFIG.read().unwrap().clone().unwrap();
     let retry_policy_json = serde_json::to_value(&config.retry_policy).unwrap();
+    let max_attempts = i32::try_from(config.retry_policy.max_attempts).unwrap();
     drop(config);
 
     let exec_id = Uuid::new_v4();
-    let rows = build_rows(exec_id, 1, &retry_policy_json);
+    let rows = build_rows(exec_id, 1, &retry_policy_json, max_attempts);
     seed_rows(&mut seed_conn, &rows).await;
 
     let mut op_conn = AsyncPgConnection::establish(&db_url)
@@ -736,10 +750,11 @@ async fn scanner_dead_letters_alongside_a_batched_delivered_and_backoff_mix() {
         .expect("seed connection");
     let config = GLOBAL_CALLBACK_CONFIG.read().unwrap().clone().unwrap();
     let retry_policy_json = serde_json::to_value(&config.retry_policy).unwrap();
+    let max_attempts = i32::try_from(config.retry_policy.max_attempts).unwrap();
     drop(config);
 
     let exec_id = Uuid::new_v4();
-    let rows = build_rows(exec_id, 10, &retry_policy_json);
+    let rows = build_rows(exec_id, 10, &retry_policy_json, max_attempts);
     seed_rows(&mut seed_conn, &rows).await;
 
     let mut op_conn = AsyncPgConnection::establish(&db_url)
@@ -776,5 +791,8 @@ async fn scanner_dead_letters_alongside_a_batched_delivered_and_backoff_mix() {
     .get_result(&mut seed_conn)
     .await
     .expect("count dead letters");
-    assert_eq!(dlq_count.n, 5, "one dead letter per exhausted odd-index row");
+    assert_eq!(
+        dlq_count.n, 5,
+        "one dead letter per exhausted odd-index row"
+    );
 }
