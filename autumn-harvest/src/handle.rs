@@ -2270,14 +2270,31 @@ impl WorkflowHandle {
         // `execute_query_in_process` below, re-resolves its own connection
         // for that execution's own id. That re-resolve already follows ITS
         // forwarding pointer correctly.
-        crate::execution::resolve_live_attempt(
+        let (mut execution, _shard) = crate::execution::resolve_live_attempt(
             &mut conn,
             &self.client.inner.pools,
             shard,
             self.exec_id,
         )
-        .await
-        .map(|(execution, _shard)| execution)
+        .await?;
+        // A start-replace seals a finished run `CONTINUED_AS_NEW` with no
+        // event. Report the outcome its own history records, not a success.
+        if execution.state == "CONTINUED_AS_NEW" {
+            let replaced_id = ExecutionId::from_uuid(execution.id);
+            let (mut replaced_conn, _) =
+                crate::shard_rebalance::conn_for_execution_forwarded_with_shard(
+                    &self.client.inner.pools,
+                    replaced_id,
+                )
+                .await?;
+            if let Some(state) =
+                crate::execution::replaced_run_outcome_state(&mut replaced_conn, replaced_id)
+                    .await?
+            {
+                execution.state = state.to_string();
+            }
+        }
+        Ok(execution)
     }
 
     /// Execute a registered query handler in-process by replaying event history.

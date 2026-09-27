@@ -1013,3 +1013,184 @@ fn allowlist_entries_are_unique() {
         assert!(seen.insert(k), "duplicate ALLOWLIST entry: {k}");
     }
 }
+
+// ── Feature-gate coverage (DB or not) ───────────────────────────────────────
+
+/// Features a core suite needs to compile, from its `mod.rs` cfg and its own
+/// leading `#![cfg]`. `db` is left out: the DB guard above owns it.
+fn core_required_features(mod_cfg: &str, source: &str) -> BTreeSet<String> {
+    let mut text = mod_cfg.to_string();
+    for line in source.lines() {
+        let t = line.trim();
+        if t.starts_with("#![cfg(") {
+            text.push_str(t);
+        }
+    }
+    let mut out = BTreeSet::new();
+    let mut rest = text.as_str();
+    while let Some(idx) = rest.find("feature = \"") {
+        let after = &rest[idx + "feature = \"".len()..];
+        let Some(end) = after.find('"') else { break };
+        let feat = &after[..end];
+        if feat != "db" {
+            out.insert(feat.to_string());
+        }
+        rest = &after[end..];
+    }
+    out
+}
+
+/// The features one manifest row compiles the core `integration` target with.
+///
+/// A `linux` or `linuxpart` row keeps the crate defaults. An `allos` row
+/// strips them (`--no-default-features`), so it has only what it lists.
+fn core_row_features(row: &SuiteRow) -> BTreeSet<String> {
+    let mut feats: BTreeSet<String> = row.feature_set().into_iter().map(str::to_string).collect();
+    if row.is_live_db() {
+        for default in ["db", "unified-dag-execution", "tls"] {
+            feats.insert(default.to_string());
+        }
+    }
+    feats
+}
+
+/// True when some executing row selects `module` whole and compiles it.
+fn core_module_executes(rows: &[SuiteRow], module: &str, required: &BTreeSet<String>) -> bool {
+    rows.iter().any(|r| {
+        if r.krate != "autumn-harvest" || r.target != "integration" || !r.runs() {
+            return false;
+        }
+        if !(r.filter == "-" || (!r.filter.contains("::") && module.starts_with(&r.filter))) {
+            return false;
+        }
+        let feats = core_row_features(r);
+        required.iter().all(|f| feats.contains(f))
+    })
+}
+
+/// Core suites whose required features no manifest row enables, with the reason.
+///
+/// Each entry must still be gated and still be unexecuted, so this list only
+/// shrinks. The DB guard above covers the `db` feature separately.
+const FEATURE_GATE_EXEMPT: &[(&str, &str)] = &[
+    (
+        "chaos_tests",
+        "chaos-feature-gated: runs in the dedicated nightly chaos.yml job",
+    ),
+    (
+        "wasm_activities_tests",
+        "wasm-activities is an opt-in R&D feature with an MSRV above the crate's",
+    ),
+];
+
+/// A suite behind a feature gate can compile in every CI job and still run in
+/// none. The unified-DAG suites were such a gap: no row enabled both
+/// `testing` and `unified-dag-execution`, so 31 `dag_unified_tests` never ran.
+/// The DB guard above missed it because those suites need no database.
+#[test]
+fn every_feature_gated_core_suite_executes_in_some_row() {
+    let rows = parse_manifest();
+    let core_dir = core_integration_dir();
+    let mut unexecuted = Vec::new();
+    let mut gated = BTreeSet::new();
+    let mut executing = BTreeSet::new();
+
+    let mut pending_cfg = String::new();
+    for line in CORE_MOD_RS.lines() {
+        let t = line.trim();
+        if t.starts_with("#[cfg(") {
+            pending_cfg = t.to_string();
+            continue;
+        }
+        let Some(rest) = t.strip_prefix("mod ") else {
+            if !t.is_empty() {
+                pending_cfg.clear();
+            }
+            continue;
+        };
+        let name = rest.trim_end_matches(';').trim().to_string();
+        let cfg = std::mem::take(&mut pending_cfg);
+        let path = core_dir.join(format!("{name}.rs"));
+        if !path.is_file() || SELF_EXCLUDE.contains(&name.as_str()) {
+            continue;
+        }
+        let src = read_source(&path);
+        if is_db_harness_only(&src) || all_tests_ignored(&src) {
+            continue;
+        }
+        let required = core_required_features(&cfg, &src);
+        if required.is_empty() {
+            continue;
+        }
+        gated.insert(name.clone());
+        if core_module_executes(&rows, &name, &required) {
+            executing.insert(name);
+            continue;
+        }
+        if FEATURE_GATE_EXEMPT.iter().any(|(m, _)| *m == name) {
+            continue;
+        }
+        let feats = required.into_iter().collect::<Vec<_>>().join(",");
+        unexecuted.push(format!(
+            "{name} (add manifest line `linux  autumn-harvest  integration  {feats}  {name}`)"
+        ));
+    }
+
+    assert!(
+        unexecuted.is_empty(),
+        "these feature-gated core suites compile but no manifest row enables their features, \
+         so CI never executes them:\n  {}",
+        unexecuted.join("\n  ")
+    );
+    let stale: Vec<&str> = FEATURE_GATE_EXEMPT
+        .iter()
+        .map(|(m, _)| *m)
+        .filter(|m| !gated.contains(*m) || executing.contains(*m))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "FEATURE_GATE_EXEMPT has entries that now execute or are no longer gated; remove them:\n  {}",
+        stale.join("\n  ")
+    );
+}
+
+#[test]
+fn core_row_features_keep_defaults_only_on_live_db_rows() {
+    let linux = SuiteRow {
+        osclass: "linux".into(),
+        krate: "autumn-harvest".into(),
+        target: "integration".into(),
+        features: "testing".into(),
+        filter: "dag_unified_tests".into(),
+    };
+    let allos = SuiteRow {
+        osclass: "allos".into(),
+        ..linux_clone(&linux)
+    };
+    assert!(core_row_features(&linux).contains("unified-dag-execution"));
+    assert!(!core_row_features(&allos).contains("unified-dag-execution"));
+    let required: BTreeSet<String> = ["testing", "unified-dag-execution"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    assert!(core_module_executes(
+        &[linux],
+        "dag_unified_tests",
+        &required
+    ));
+    assert!(!core_module_executes(
+        &[allos],
+        "dag_unified_tests",
+        &required
+    ));
+}
+
+fn linux_clone(row: &SuiteRow) -> SuiteRow {
+    SuiteRow {
+        osclass: row.osclass.clone(),
+        krate: row.krate.clone(),
+        target: row.target.clone(),
+        features: row.features.clone(),
+        filter: row.filter.clone(),
+    }
+}

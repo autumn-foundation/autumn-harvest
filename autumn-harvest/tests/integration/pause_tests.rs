@@ -2167,3 +2167,101 @@ async fn pause_fast_path_makes_no_terminal_decision_when_the_claim_moved() {
     worker.shutdown();
     let _ = worker_handle.await;
 }
+
+// ── Workflow task timeout against the locked execution state ────────────────
+
+/// Make the execution's workflow task look claimed and past its
+/// start-to-close deadline, so the next scanner pass times it out.
+async fn make_workflow_task_overdue(conn: &mut AsyncPgConnection, exec_id: ExecutionId) {
+    diesel::sql_query(
+        "UPDATE harvest_task_queue \
+            SET state = 'RUNNING', worker_id = 'gone-worker', \
+                started_at = NOW() - INTERVAL '10 minutes', \
+                start_to_close = INTERVAL '1 second' \
+          WHERE workflow_exec_id = $1 AND task_type = 'workflow'",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(conn)
+    .await
+    .expect("make the workflow task overdue");
+}
+
+async fn scan_timeouts_once(conn: &mut AsyncPgConnection) {
+    autumn_harvest::timeout::enforce_timeouts_once(
+        conn,
+        &NoOpMetrics,
+        Duration::from_secs(5),
+        &None,
+        &[],
+        None,
+        None,
+        60,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+        0,
+    )
+    .await
+    .expect("timeout enforcement should succeed");
+}
+
+#[tokio::test]
+async fn a_workflow_task_timeout_on_a_paused_run_clears_the_pause_record() {
+    // A dispatched workflow task keeps running under pause (issue #383), so its
+    // start-to-close deadline still applies. The timeout seals the run, as the
+    // quarantine path does. The sealed row must not also read as paused.
+    let (url, _c) = setup().await;
+    let mut conn = connect(&url).await;
+    let exec_id = start(&mut conn, "wf", "wft-timeout-paused").await;
+    make_workflow_task_overdue(&mut conn, exec_id).await;
+    pause_workflow_execution(&mut conn, exec_id, Some("hold"), "oncall", &NoOpMetrics)
+        .await
+        .expect("pause should succeed");
+
+    scan_timeouts_once(&mut conn).await;
+
+    assert_eq!(get_state(&mut conn, exec_id).await, "TIMED_OUT");
+    assert_eq!(
+        pause_columns(&mut conn, exec_id).await,
+        (None, None, None),
+        "a TIMED_OUT run must not keep its pause record"
+    );
+}
+
+#[tokio::test]
+async fn a_workflow_task_timeout_never_rewrites_a_sealed_run() {
+    // The timeout scan filters on task state only. A run that another path
+    // already sealed can still own an open workflow task. The timeout must
+    // close that task and keep the run's recorded outcome.
+    let (url, _c) = setup().await;
+    let mut conn = connect(&url).await;
+    let exec_id = start(&mut conn, "wf", "wft-timeout-sealed").await;
+    make_workflow_task_overdue(&mut conn, exec_id).await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions \
+            SET state = 'COMPLETED', completed_at = NOW(), output = '1'::jsonb \
+          WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("seal the run COMPLETED");
+
+    scan_timeouts_once(&mut conn).await;
+
+    assert_eq!(get_state(&mut conn, exec_id).await, "COMPLETED");
+    use autumn_harvest::schema::harvest_task_queue as t;
+    let task_state: String = t::table
+        .filter(t::workflow_exec_id.eq(Some(exec_id.as_uuid())))
+        .filter(t::task_type.eq("workflow"))
+        .select(t::state)
+        .first(&mut conn)
+        .await
+        .expect("the workflow task must exist");
+    assert_eq!(task_state, "FAILED", "the orphan task is closed");
+    assert!(
+        !history(&mut conn, exec_id)
+            .await
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::WorkflowFailed { .. })),
+        "no WorkflowFailed may be appended to a sealed run"
+    );
+}

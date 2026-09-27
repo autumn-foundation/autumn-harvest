@@ -726,3 +726,87 @@ async fn purge_deletes_only_expired_rows() {
         "the expired claim is gone"
     );
 }
+
+// ── A start-replace keeps the replaced run's outcome ────────────────────────
+
+#[tokio::test]
+async fn a_replaced_failed_run_still_reads_as_failed() {
+    // `AllowDuplicateFailedOnly` replaces a FAILED prior by sealing it
+    // `CONTINUED_AS_NEW`, with no event. Nothing continued that run. An
+    // `await_external_workflow` on it once waited forever for a
+    // `WorkflowContinuedAsNew` event that was never written.
+    use autumn_harvest::event::WorkflowEvent;
+    use autumn_harvest::execution::{
+        ExternalAwaitOutcome, ExternalAwaitReadResult, read_external_await_outcome,
+        start_or_load_workflow_execution,
+    };
+
+    let (mut conn, _container) = setup_db().await;
+    let first = ExecutionId::new_for_shard(ShardId::new(0));
+    start_or_load_workflow_execution(
+        &mut conn,
+        params(
+            "wf",
+            "replace-me",
+            first,
+            WorkflowIdReusePolicy::AllowDuplicate,
+        ),
+    )
+    .await
+    .expect("first start");
+    autumn_harvest::store::append_single_event(
+        &mut conn,
+        first,
+        WorkflowEvent::workflow_failed("boom"),
+    )
+    .await
+    .expect("append WorkflowFailed");
+    conn.batch_execute(&format!(
+        "UPDATE harvest_workflow_executions SET state = 'FAILED', error = 'boom', \
+         completed_at = NOW() WHERE id = '{}'; \
+         UPDATE harvest_task_queue SET state = 'FAILED' WHERE workflow_exec_id = '{}'",
+        first.as_uuid(),
+        first.as_uuid()
+    ))
+    .await
+    .expect("seal the first run FAILED");
+
+    let second = ExecutionId::new_for_shard(ShardId::new(0));
+    let started = start_or_load_workflow_execution(
+        &mut conn,
+        params(
+            "wf",
+            "replace-me",
+            second,
+            WorkflowIdReusePolicy::AllowDuplicateFailedOnly,
+        ),
+    )
+    .await
+    .expect("replacing start");
+    assert!(started.created, "a FAILED prior is replaced");
+    assert_eq!(
+        scalar_i64(
+            &mut conn,
+            &format!(
+                "SELECT COUNT(*) AS n FROM harvest_workflow_executions \
+                 WHERE id = '{}' AND state = 'CONTINUED_AS_NEW'",
+                first.as_uuid()
+            ),
+        )
+        .await,
+        1,
+        "the prior is sealed CONTINUED_AS_NEW to free its business key"
+    );
+
+    match read_external_await_outcome(&mut conn, first)
+        .await
+        .expect("read outcome")
+    {
+        ExternalAwaitReadResult::Terminal(ExternalAwaitOutcome::Terminal {
+            reason_code, ..
+        }) => {
+            assert_eq!(reason_code, "target_failed");
+        }
+        _ => panic!("a replaced FAILED run must read as a terminal failure"),
+    }
+}

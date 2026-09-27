@@ -358,6 +358,78 @@ pub async fn append_events_offloaded_with_codecs(
     Ok(inserted)
 }
 
+/// Append events like [`append_events_offloaded_with_codecs`], but apply
+/// `patch` to the encoded rows before the INSERT.
+///
+/// Continue-as-new must carry the predecessor's stored `last_completion_result`
+/// into the successor's `WorkflowStarted` byte-identical. A second encode would
+/// wrap ciphertext in ciphertext (issue #1243). The value used to be patched in
+/// with an UPDATE after the INSERT. That was a third in-place writer of
+/// `harvest_events.event_data`, which the append-only invariant forbids. The
+/// patch now runs on the rows before they are written, so the row is inserted
+/// once, complete.
+///
+/// The patch runs after offload, so an offload envelope in the patched value
+/// is never offloaded again.
+///
+/// # Errors
+///
+/// Same as [`append_events_offloaded_with_codecs`].
+#[cfg(feature = "db")]
+pub(crate) async fn append_events_offloaded_with_codecs_and_patch(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    events: &[WorkflowEvent],
+    start_id: i32,
+    offloader: Option<&crate::payload_store::PayloadOffloader>,
+    codecs: &crate::payload_codec::PayloadCodecs,
+    patch: impl FnOnce(&mut [NewHarvestEvent<'_>]),
+) -> HarvestResult<usize> {
+    if events.is_empty() {
+        return Ok(0);
+    }
+
+    let mut rows = events_to_insert_rows_from_with_codecs(exec_id, events, start_id, codecs)?;
+    let mut all_refs: Vec<crate::payload_store::OffloadedRef> = Vec::new();
+    if let Some(offloader) = offloader {
+        for row in &mut rows {
+            let refs = offloader.offload_event_value(&mut row.event_data).await?;
+            all_refs.extend(refs);
+        }
+    }
+    patch(&mut rows);
+
+    // One transaction for the fence, the events and the refs, for the reasons
+    // `append_events_offloaded_with_codecs` gives.
+    let inserted = Box::pin(conn.transaction::<usize, crate::error::HarvestError, _>(
+        async |conn| {
+            crate::replication::assert_fence(conn, exec_id.shard()).await?;
+            let inserted = diesel::insert_into(harvest_events::table)
+                .values(&rows)
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+            if !all_refs.is_empty() {
+                insert_payload_refs(conn, exec_id, &all_refs).await?;
+            }
+            Ok(inserted)
+        },
+    ))
+    .await?;
+
+    if let Some(last_event) = events.last() {
+        crate::notify::notify_workflow_events_appended(
+            conn,
+            exec_id.as_uuid(),
+            inserted,
+            last_event.type_name(),
+        )
+        .await?;
+    }
+
+    Ok(inserted)
+}
+
 /// Postgres's per-statement bind-parameter ceiling (issue #1589). Mirrors
 /// `queue::enqueue_batch`'s identical constant -- kept as a separate copy
 /// here since the two chunkers bound different row shapes.
