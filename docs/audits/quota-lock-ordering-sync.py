@@ -63,11 +63,14 @@ unused) while the loop kept iterating the untouched original, and when
 the wrapper was merely named inside a comment. Tying the loop's variable
 to the assignment's, over comment/string-masked text, closes both. A
 further round found that tying the NAME alone was still not enough:
-shadowing the binding again, or reordering the result back in place with
-a mutating call like `.sort_by(...)`, both pass a check that only
-confirms the same identifier reaches a later loop. `check_call_site_guard`
-also rejects any rebinding or `_MUTATING_VEC_METHODS` call on the
-variable between the assignment and the loop.
+shadowing the binding again, reordering the result back in place with a
+mutating call, or reaching it through an index/slice projection
+(`due_rows[..].reverse()`) all pass a check that only confirms the same
+identifier reaches a later loop. Rather than keep enumerating mutating
+shapes to reject — the pattern the next two review rounds fell into —
+`check_call_site_guard` now WHITELISTS the few read-only queries the real
+code needs (`_ALLOWED_READ_ONLY_METHODS`) and fails on any other mention
+of the variable at all between the assignment and the loop.
 
 Function extraction matches braces through `find_matching_brace`, not a
 raw character count. Codex review on PR #1696 found the raw count could
@@ -142,10 +145,15 @@ CALL_SITE_GUARDS = [
 
 FN_SIGNATURE_RE_TEMPLATE = r"\n(?:async )?fn {name}\s*\("
 
-# Matches a raw string's opening delimiter: r, r#"..., r##"..., etc. Requires
-# the quote immediately after the hashes, so a raw identifier like `r#type`
-# (no quote) is never mistaken for one.
-_RAW_STRING_OPEN_RE = re.compile(r'r(#*)"')
+# Matches a raw (or raw byte/raw C) string's opening delimiter: r"..., br"...,
+# cr"..., r#"..., etc. Requires the quote immediately after the hashes, so a
+# raw identifier like `r#type` (no quote) is never mistaken for one. The
+# leading negative lookbehind requires a token boundary before the `b`/`c`/`r`:
+# Codex review on PR #1696 found that without it, an identifier merely ending
+# in `r` right before an ordinary string — `bar"\"}"`, a valid adjacent macro
+# token pair — matched at that trailing `r` and misclassified the following
+# normal, escape-aware string as a raw one.
+_RAW_STRING_OPEN_RE = re.compile(r'(?<![A-Za-z0-9_])(?:b|c)?r(#*)"')
 
 
 def _skip_line_comment(text: str, i: int) -> int:
@@ -375,14 +383,21 @@ def extract_function(text: str, name: str) -> str | None:
 # ordering the wrapper just established — the same hazard as skipping the
 # wrapper entirely, just one step removed. Read-only calls (`.len()`,
 # `.is_empty()`, `.iter()`, ...) are deliberately not in this list.
-_MUTATING_VEC_METHODS = (
-    "sort", "sort_by", "sort_by_key", "sort_by_cached_key", "sort_unstable",
-    "sort_unstable_by", "sort_unstable_by_key", "reverse", "shuffle", "swap", "retain",
-    "retain_mut", "truncate", "extend", "extend_from_slice", "push", "pop",
-    "clear", "append", "drain", "insert", "remove", "swap_remove",
-    "rotate_left", "rotate_right", "dedup", "dedup_by", "dedup_by_key",
-    "fill", "resize",
-)
+# The only intervening uses of the ordering wrapper's result variable that
+# check_call_site_guard accepts between the assignment and the firing
+# loop: plain, argument-free, read-only queries. Everything else —
+# rebinding, direct assignment, indexing, a slice projection, or any
+# method call not on this list, mutating or not — fails the guard.
+#
+# This is deliberately a whitelist, not a blacklist of mutating methods.
+# Codex review on PR #1696 needed three rounds to close a blacklist
+# (`.sort_by(...)`, then `.sort_by_cached_key(...)`, then
+# `due_rows[..].reverse()` bypassing the method-name match entirely) --
+# each fix just narrowed the next gap. A blacklist can only ever list the
+# mutations someone thought of; a whitelist of the few reads the real
+# code actually needs rejects everything ELSE by construction, including
+# whatever mutating or reordering shape a future Rust API adds.
+_ALLOWED_READ_ONLY_METHODS = ("len", "is_empty")
 
 
 def check_call_site_guard(text: str, file_label: str, enclosing_fn: str, wrapper_call: str) -> str | None:
@@ -392,20 +407,19 @@ def check_call_site_guard(text: str, file_label: str, enclosing_fn: str, wrapper
     (so a mention of `wrapper_call` in a comment cannot count), then
     requires a `let <var> = wrapper_call(...)[.await][?];`-shaped
     assignment followed later by a `for _ in <var>` loop over that SAME
-    variable, with nothing in between that rebinds or mutates `var`.
-    Matching the wrapper call and a loop independently, without tying them
-    to one variable, is not enough: Codex review on PR #1696 found that
-    calling the wrapper on a discarded clone (`wrapper_call(conn,
-    due_rows.clone()).await?;`, result unused) still left a textual call
-    before a textual loop over the untouched original `due_rows`. A
-    follow-up round found that tying the name alone still was not enough
-    either: shadowing the binding again (`let due_rows = wrapper(...)
-    .await?; let due_rows = original_claim_order; for row in due_rows`)
-    or reordering the result back in place
-    (`due_rows.sort_by(claim_order); for row in due_rows`) both pass a
-    check that only confirms the SAME name reaches a later loop, while
-    reintroducing the exact claim-order-firing bug this guard exists to
-    catch.
+    variable, with every intervening mention of `var` limited to an
+    `_ALLOWED_READ_ONLY_METHODS` call. Matching the wrapper call and a
+    loop independently, without tying them to one variable, is not
+    enough: Codex review on PR #1696 found that calling the wrapper on a
+    discarded clone (`wrapper_call(conn, due_rows.clone()).await?;`,
+    result unused) still left a textual call before a textual loop over
+    the untouched original `due_rows`. Tying the SAME name to both was
+    not enough either: shadowing the binding again, reordering the result
+    in place with a mutating method, or reaching it through an index or
+    slice projection all pass a check that only confirms the identifier
+    matches. Whitelisting the few reads the real code needs, and failing
+    on anything else, closes the whole class at once rather than one
+    mutating shape at a time.
     """
     body = extract_function(text, enclosing_fn)
     if body is None:
@@ -436,25 +450,18 @@ def check_call_site_guard(text: str, file_label: str, enclosing_fn: str, wrapper
         )
 
     intervening = masked[assign_match.end() : loop_match.start()]
-    intervening_re = re.compile(
-        r"\blet\s+(?:mut\s+)?"
-        + re.escape(var)
-        + r"\b\s*="
-        + r"|\b"
-        + re.escape(var)
-        + r"\b\s*=(?!=)"
-        + r"|\b"
-        + re.escape(var)
-        + r"\b\s*\.\s*(?:"
-        + "|".join(_MUTATING_VEC_METHODS)
-        + r")\s*\("
+    allowed_read_re = re.compile(
+        r"\b" + re.escape(var) + r"\b\s*\.\s*(?:" + "|".join(_ALLOWED_READ_ONLY_METHODS) + r")\s*\(\s*\)"
     )
-    mutate_match = intervening_re.search(intervening)
-    if mutate_match is not None:
+    remaining = allowed_read_re.sub("", intervening)
+    stray_match = re.search(r"\b" + re.escape(var) + r"\b", remaining)
+    if stray_match is not None:
+        window = remaining[max(0, stray_match.start() - 20) : stray_match.start() + 20].strip()
         return (
-            f"{file_label}::{enclosing_fn}: `{var}` is rebound or mutated "
-            f"({mutate_match.group(0).strip()!r}) between the ordering assignment "
-            f"and the loop, so the loop is not guaranteed to consume the reordered batch"
+            f"{file_label}::{enclosing_fn}: `{var}` is referenced again between the "
+            f"ordering assignment and the loop (near {window!r}) in a way this check "
+            f"does not recognize as read-only ({', '.join(_ALLOWED_READ_ONLY_METHODS)} "
+            "only), so the loop is not guaranteed to consume the reordered batch"
         )
     return None
 
