@@ -1079,6 +1079,49 @@ async fn a_persistently_broken_queue_is_not_masked_by_a_healthy_sibling() {
     );
 }
 
+/// Every configured queue erroring immediately must end the blocking wait
+/// early, not spin for the whole budget (Codex review, issue #1429
+/// follow-up).
+///
+/// An immediate error -- `WRONGTYPE`, an ACL rejection -- returns at once.
+/// It consumes none of a blocking read's own wait slice, unlike a real
+/// timeout. Before this fix, the rotation kept retrying every queue until
+/// the wall-clock deadline elapsed, issuing Redis commands in a tight
+/// loop for the whole wait. This pins that a full lap of nothing but
+/// immediate errors now ends the wait early instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_queue_erroring_immediately_ends_the_wait_early() {
+    let Some(fixture) = try_start(Duration::from_secs(60)).await else {
+        return;
+    };
+    let queues = vec!["broken-a".to_string(), "broken-b".to_string()];
+
+    let mut raw = fixture.raw.clone();
+    for queue in &queues {
+        let _: () = redis::cmd("SET")
+            .arg(fixture.stream_key(queue))
+            .arg("not-a-stream")
+            .query_async(&mut raw)
+            .await
+            .expect("corrupt the queue's stream key");
+    }
+
+    let wait = Duration::from_secs(3);
+    let started = Instant::now();
+    let result = fixture.dispatch.next(&queues, "consumer-1", 10, wait).await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        result.is_err(),
+        "every queue erroring immediately must still surface as an error"
+    );
+    assert!(
+        elapsed < wait / 2,
+        "a full lap of immediate errors must end the wait early, not spin for \
+         the whole budget; elapsed was {elapsed:?} against a {wait:?} wait"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn every_queue_is_served_when_the_read_cap_is_one() {
     let Some(fixture) = try_start(Duration::from_secs(60)).await else {

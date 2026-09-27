@@ -6103,24 +6103,29 @@ pub(crate) const fn dispatch_allowed_for_span(
 /// `expected_generations` closes it. Pass the generations
 /// `dispatch::install_shards` returned to that install call. Each shard's
 /// capture here is only accepted while its live channel still carries
-/// exactly that generation, via
-/// [`crate::dispatch::installed_for_shard_if_current`]. A later, unrelated
-/// install mints a new generation from the shared counter. So a mismatch
-/// can only mean a stranger's install landed in the gap. That shard is
-/// left out of the map, same as if nothing were installed for it, rather
-/// than silently captured from the stranger.
+/// exactly that generation. A later, unrelated install mints a new
+/// generation from the shared counter. So a mismatch can only mean a
+/// stranger's install landed in the gap. That shard is left out of the
+/// map, same as if nothing were installed for it, rather than silently
+/// captured from the stranger.
 ///
 /// `expected_generations = None` is the direct-embedder path. There is no
 /// separate install call's return value to compare against. So this
 /// simply captures whatever is live right now, as it always did before
 /// the race above was found.
 ///
-/// Coverage and capture read the same value for each shard, in one pass.
-/// So there is no separate window between "checked covered" and
-/// "captured" for a racing install to land in either. An empty
-/// `assignments` (the unsharded/default span) is never covered here. It
-/// has no shard identity to look up, so it needs the single-shard channel
-/// (`dispatch::install`), not this path.
+/// Coverage and capture read the same value for each shard, in one pass,
+/// via [`crate::dispatch::installed_for_shards`]. So there is no
+/// separate window between "checked covered" and "captured" for a
+/// racing install to land in either. The capture itself has no such
+/// gap, between one shard's own read and the next, either (Codex review,
+/// issue #1429 follow-up, a third time over). Every shard's
+/// entry here comes from one `INSTALLED_BY_SHARD` snapshot, not a fresh
+/// read per shard that a concurrent [`crate::dispatch::install_shards`]
+/// call could interleave with. An empty `assignments` (the
+/// unsharded/default span) is never covered here. It has no shard
+/// identity to look up, so it needs the
+/// single-shard channel (`dispatch::install`), not this path.
 #[must_use]
 fn capture_shard_dispatch(
     assignments: &[crate::types::ShardId],
@@ -6129,23 +6134,7 @@ fn capture_shard_dispatch(
     std::collections::HashMap<crate::types::ShardId, crate::dispatch::InstalledDispatch>,
     bool,
 ) {
-    let mut map = std::collections::HashMap::with_capacity(assignments.len());
-    for shard in assignments {
-        let installed = expected_generations.map_or_else(
-            || crate::dispatch::installed_for_shard(*shard),
-            |expected| {
-                expected
-                    .iter()
-                    .find(|(candidate, _)| candidate == shard)
-                    .and_then(|(_, generation)| {
-                        crate::dispatch::installed_for_shard_if_current(*shard, *generation)
-                    })
-            },
-        );
-        if let Some(installed) = installed {
-            map.insert(*shard, installed);
-        }
-    }
+    let map = crate::dispatch::installed_for_shards(assignments, expected_generations);
     let covered = !assignments.is_empty() && map.len() == assignments.len();
     (map, covered)
 }

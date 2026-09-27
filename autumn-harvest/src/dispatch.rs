@@ -468,6 +468,51 @@ pub fn installed_for_shard_if_current(
     installed_for_shard(shard).filter(|installed| installed.generation == generation)
 }
 
+/// Each of `assignments`' own per-shard channel, all read from one
+/// `INSTALLED_BY_SHARD` snapshot (Codex review, issue #1429 follow-up).
+///
+/// [`installed_for_shard`] called once per shard, in a caller's own loop,
+/// takes a separate read-lock acquisition each time. A concurrent
+/// [`install_shards`] call can replace the whole map between two of
+/// those reads. The loop could then see one shard from the map before
+/// the replacement, and another shard from the map after it. Each
+/// individual read still returns `Some`, so nothing
+/// about either read looks wrong on its own. The loop ends up mixing two
+/// different topologies into one captured result. This reads the whole
+/// map exactly once, so every shard in the result comes from the same
+/// point in time.
+///
+/// When `expected_generations` is given, a shard's entry is kept only
+/// while it still carries exactly the generation named for it there.
+/// That is the same contract [`installed_for_shard_if_current`]
+/// enforces, checked here against this one snapshot instead of a fresh
+/// read per shard. `expected_generations = None` keeps whatever this
+/// snapshot holds for each assigned shard, with no generation check.
+#[must_use]
+pub fn installed_for_shards(
+    assignments: &[crate::types::ShardId],
+    expected_generations: Option<&[(crate::types::ShardId, u64)]>,
+) -> std::collections::HashMap<crate::types::ShardId, InstalledDispatch> {
+    let Ok(snapshot) = INSTALLED_BY_SHARD.read() else {
+        return std::collections::HashMap::new();
+    };
+    let Some(installed_map) = snapshot.as_ref() else {
+        return std::collections::HashMap::new();
+    };
+    assignments
+        .iter()
+        .filter_map(|shard| {
+            let installed = installed_map.get(shard)?;
+            let current = expected_generations.is_none_or(|expected| {
+                expected.iter().any(|(candidate, generation)| {
+                    candidate == shard && installed.generation == *generation
+                })
+            });
+            current.then(|| (*shard, installed.clone()))
+        })
+        .collect()
+}
+
 /// Remove every per-shard channel. Tests use this between cases.
 ///
 /// Also stops the background publisher, mirroring [`uninstall`] (Codex

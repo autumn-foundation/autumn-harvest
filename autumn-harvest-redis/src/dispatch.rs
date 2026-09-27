@@ -810,6 +810,21 @@ impl RedisDispatch {
         if !any_ready && !wait.is_zero() && !ordered.is_empty() {
             let deadline = Instant::now() + wait;
             let mut rotation = 0usize;
+            // Consecutive immediate errors, reset on every successful read
+            // (Codex review, issue #1429 follow-up). An immediate error --
+            // a wrong-typed key, an ACL rejection -- returns at once. It
+            // consumes none of `slice`'s blocking wait, unlike a real
+            // timeout. A queue that keeps failing this way lets the loop
+            // spin far faster than one blocking call per `slice`. It
+            // issues Redis commands in a tight loop for the rest of
+            // `wait` instead.
+            //
+            // Once every queue in `ordered` has failed back to back, with
+            // no successful read between them, a further lap cannot show
+            // anything new. Break and return the accumulated error
+            // instead of burning
+            // through the rest of the wait budget on the same failure.
+            let mut consecutive_errors = 0usize;
             while !any_ready && remaining > 0 {
                 let Some(budget) = deadline.checked_duration_since(Instant::now()) else {
                     break;
@@ -841,6 +856,7 @@ impl RedisDispatch {
                     .await
                 {
                     Ok(blocked) => {
+                        consecutive_errors = 0;
                         let delivered: usize =
                             blocked.keys.iter().map(|stream| stream.ids.len()).sum();
                         if delivered > 0 {
@@ -851,6 +867,10 @@ impl RedisDispatch {
                     }
                     Err(error) => {
                         first_error.get_or_insert(error);
+                        consecutive_errors += 1;
+                        if consecutive_errors >= ordered.len() {
+                            break;
+                        }
                     }
                 }
                 rotation += 1;
