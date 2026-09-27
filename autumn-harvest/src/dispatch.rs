@@ -555,10 +555,10 @@ pub fn uninstall_all_shards() {
 /// own successful install) still reports Redis dispatch as installed.
 ///
 /// A caller turning Redis dispatch off for this process calls this instead
-/// of `uninstall()` followed by `uninstall_all_shards()`. That is the one
-/// legitimate use here: every other clear needs to undo specifically its
-/// own earlier install (see
-/// [`uninstall_if_current`]/[`uninstall_all_shards_if_current`]).
+/// of `uninstall()` followed by `uninstall_all_shards()`. A caller whose
+/// own startup can still fail after that same clear uses
+/// [`uninstall_all_capturing`] instead. It can then undo the clear on
+/// that later failure (Codex review, issue #1429 follow-up).
 pub fn uninstall_all() {
     let _guard = lock(&DISPATCH_SLOT_LOCK);
     if let Ok(mut slot) = INSTALLED.write() {
@@ -568,6 +568,66 @@ pub fn uninstall_all() {
         *slot = None;
     }
     ANY_INSTALLED.store(false, Ordering::Relaxed);
+    stop_publisher();
+}
+
+/// As [`uninstall_all`], but returns a [`TopologySnapshot`] of both slots
+/// as they stood immediately before the clear (Codex review, issue #1429
+/// follow-up).
+///
+/// A caller turning Redis dispatch off for *this* startup, while a still-
+/// running previous runtime owns whatever this clears, keeps this
+/// snapshot. A later step in that same startup can still fail. On that
+/// failure, [`restore_cleared_if_still_empty`] puts the previous topology
+/// back. The still-running previous runtime is then not left stranded
+/// on the Postgres fallback for a clear its replacement never actually
+/// committed to.
+pub fn uninstall_all_capturing() -> TopologySnapshot {
+    let _guard = lock(&DISPATCH_SLOT_LOCK);
+    let previous = TopologySnapshot {
+        single: INSTALLED.read().ok().and_then(|slot| slot.clone()),
+        shards: INSTALLED_BY_SHARD.read().ok().and_then(|slot| slot.clone()),
+    };
+    if let Ok(mut slot) = INSTALLED.write() {
+        *slot = None;
+    }
+    if let Ok(mut slot) = INSTALLED_BY_SHARD.write() {
+        *slot = None;
+    }
+    ANY_INSTALLED.store(false, Ordering::Relaxed);
+    stop_publisher();
+    previous
+}
+
+/// Undo [`uninstall_all_capturing`], restoring the topology `snapshot`
+/// names, but only while both dispatch slots are still empty (Codex
+/// review, issue #1429 follow-up).
+///
+/// Neither the clear nor this restore mints a generation, unlike
+/// [`install_single`]/[`install_shards`] and their own
+/// [`restore_single_if_current`]/[`restore_shards_if_current`]
+/// counterparts. There is nothing to compare against, so this checks that
+/// both slots are still empty instead. A later, unrelated install may
+/// have already populated one or both slots since `snapshot` was
+/// captured. Restoring over it would discard that install instead of
+/// the failed startup this call is meant to undo. So this leaves both
+/// slots alone whenever either is no longer empty.
+pub fn restore_cleared_if_still_empty(snapshot: &TopologySnapshot) {
+    let _guard = lock(&DISPATCH_SLOT_LOCK);
+    let still_empty = INSTALLED.read().is_ok_and(|slot| slot.is_none())
+        && INSTALLED_BY_SHARD.read().is_ok_and(|slot| slot.is_none());
+    if !still_empty {
+        return;
+    }
+    if let Ok(mut slot) = INSTALLED.write() {
+        slot.clone_from(&snapshot.single);
+    }
+    if let Ok(mut slot) = INSTALLED_BY_SHARD.write() {
+        slot.clone_from(&snapshot.shards);
+    }
+    let any_installed =
+        snapshot.single.is_some() || snapshot.shards.as_ref().is_some_and(|map| !map.is_empty());
+    ANY_INSTALLED.store(any_installed, Ordering::Relaxed);
     stop_publisher();
 }
 

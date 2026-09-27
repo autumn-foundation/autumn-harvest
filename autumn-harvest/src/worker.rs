@@ -25428,6 +25428,12 @@ pub struct Worker {
     /// `run` time.
     shard_dispatch:
         std::collections::HashMap<crate::types::ShardId, crate::dispatch::InstalledDispatch>,
+    /// The single-shard global dispatch channel, captured once at
+    /// construction (Codex review, issue #1429 follow-up). See the capture
+    /// site in [`Worker::new_with_expected_shard_generations`] and the
+    /// read site in [`Worker::run_poll_loop`] for why this is captured
+    /// rather than read live, mirroring `shard_dispatch` above.
+    global_dispatch: Option<crate::dispatch::InstalledDispatch>,
 }
 
 struct WorkerMonitoringHandles {
@@ -26749,6 +26755,16 @@ impl Worker {
         let (shard_dispatch, shard_dispatch_covered) =
             capture_shard_dispatch(&config.shard_assignments, expected_shard_generations);
 
+        // Captured once here, alongside `shard_dispatch` above, rather than
+        // read live in `run_poll_loop` (Codex review, issue #1429 follow-up).
+        // A live `dispatch::installed()` read in that loop could pick up a
+        // *later*, unrelated install -- a replacement runner's own global
+        // slot. That could land well after this worker was constructed.
+        // This worker's own database pool was never validated against
+        // that channel. `shard_dispatch` above is captured rather than
+        // read live for exactly the same reason.
+        let mut global_dispatch = None;
+
         if crate::dispatch::is_installed() {
             let shard_count = config.shard_assignments.len();
             #[cfg(feature = "db")]
@@ -26766,7 +26782,8 @@ impl Worker {
             // poll loop only ever reads the per-shard pair regardless. A
             // wide span is covered whenever either condition holds on its
             // own, not only when the global slot's span is one.
-            let single_shard_channel = crate::dispatch::installed().is_some();
+            global_dispatch = crate::dispatch::installed();
+            let single_shard_channel = global_dispatch.is_some();
             let covered = (single_shard_channel
                 && dispatch_allowed_for_span(shard_count, pool_shards))
                 || shard_dispatch_covered;
@@ -26841,6 +26858,7 @@ impl Worker {
             )),
             session_slots_in_use: crate::sessions::new_session_slot_registry(),
             shard_dispatch,
+            global_dispatch,
         })
     }
 
@@ -29331,11 +29349,15 @@ impl Worker {
     /// endpoint this worker's own database pool was never validated
     /// against.
     ///
-    /// The single global slot fallback (`dispatch::installed()`, a few
-    /// lines below) stays a live read. It is the one channel a
-    /// hot-swapping direct embedder is meant to be able to replace without
-    /// a worker restart. A true single-shard span has no second database
-    /// pool for a stranger's channel to be paired with by mistake.
+    /// The single global slot fallback (`self.global_dispatch`, a few
+    /// lines below) is captured at construction too, for the same reason
+    /// (Codex review, issue #1429 follow-up). A live `dispatch::installed()`
+    /// read here could pick up a replacement runner's own global-slot
+    /// install. This worker's own database pool was never validated
+    /// against that channel's key space. It could then start reading
+    /// references meant for a different runner, while its reconcile sweep
+    /// keeps publishing this pool's own rows into the replacement's
+    /// namespace.
     async fn run_poll_loop(
         &self,
         pool: &DbPool,
@@ -29391,7 +29413,7 @@ impl Worker {
             let per_shard_installed =
                 shard.and_then(|shard| self.shard_dispatch.get(&shard).cloned());
             let dispatch_allowed = per_shard_installed.is_some() || dispatch_allowed;
-            if let Some(installed) = per_shard_installed.or_else(crate::dispatch::installed) {
+            if let Some(installed) = per_shard_installed.or_else(|| self.global_dispatch.clone()) {
                 if dispatch_allowed {
                     let dispatched = self
                         .run_dispatch_iteration(pool, shard, &installed, &mut dispatch_state, 1)
@@ -43205,6 +43227,53 @@ mod tests {
         );
 
         crate::dispatch::uninstall_all_shards();
+    }
+
+    /// `Worker::new` captures the single global-slot channel once at
+    /// construction, the counterpart to
+    /// `worker_new_captures_shard_channels_immune_to_a_later_install` above
+    /// for the non-sharded case (Codex review, issue #1429 follow-up).
+    ///
+    /// A replacement runner's own global-slot install must not redirect
+    /// this worker's `run_poll_loop` mid-flight. This worker's own
+    /// database pool was never validated against that channel's key
+    /// space.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn worker_new_captures_the_global_channel_immune_to_a_later_install() {
+        let _serial = DISPATCH_INSTALL_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::dispatch::uninstall();
+        let original_channel = Arc::new(crate::dispatch::MemoryDispatch::new())
+            as Arc<dyn crate::dispatch::TaskDispatch>;
+        crate::dispatch::install(
+            Arc::clone(&original_channel),
+            crate::dispatch::DispatchSettings::default(),
+        );
+
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(default_runtime_config(), registry)
+            .expect("a single-shard span must accept");
+
+        // A second, "overlapping" runner replaces the global slot after this
+        // worker was already constructed and validated.
+        crate::dispatch::install(
+            Arc::new(crate::dispatch::MemoryDispatch::new()),
+            crate::dispatch::DispatchSettings::default(),
+        );
+
+        let captured = worker
+            .global_dispatch
+            .as_ref()
+            .expect("the global channel must have been captured at construction");
+        assert!(
+            Arc::ptr_eq(&captured.channel, &original_channel),
+            "the captured channel must still be the one installed at construction, not the \
+             later replacement"
+        );
+
+        crate::dispatch::uninstall();
     }
 
     /// `Worker::new_with_expected_shard_generations` must refuse to start
