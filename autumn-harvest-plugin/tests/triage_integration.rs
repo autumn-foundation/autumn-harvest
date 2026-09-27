@@ -23,7 +23,6 @@ use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -86,7 +85,7 @@ fn build_app_with_router(pool: HarvestDbPool, router: ShardRouter) -> HarvestApi
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         router,
     ));
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 fn build_app(pool: &DbPool) -> HarvestApiApp {
@@ -136,7 +135,7 @@ fn router_for(shards: &[i32]) -> ShardRouter {
 /// exercise the admin-guard rejection: without an admin session, admin-only
 /// routes return 401 before reaching the handler (no storage needed).
 fn build_unauth_app() -> HarvestApiApp {
-    harvest_api_router(HarvestApiState::new()).with_state(AppState::for_test())
+    harvest_api_router(HarvestApiState::new())
 }
 
 async fn scrub(conn: &mut AsyncPgConnection) {

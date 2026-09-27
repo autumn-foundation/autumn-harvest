@@ -38,6 +38,7 @@ mod subst;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
+use crate::Model;
 use crate::mir::ast::{Body, Local, MirDoc, Operand, Statement, StaticItem, Terminator};
 use crate::model::callee::{CalleePath, TypeName};
 use crate::util::{
@@ -232,17 +233,57 @@ pub struct Program {
     /// even where no source root can be read, which is exactly why the index
     /// falls back to it.
     drop_glue_untyped: Vec<String>,
+    /// `[[trusted]]` crate names from the **merged** model (builtin plus
+    /// every `--model` overlay). [`is_trusted_crate`] reads this, never
+    /// `Model::builtin_ref()`. A `--model` overlay that adds a trusted
+    /// crate then takes effect here too, not only in `Model::classify` at
+    /// the analysis stage.
+    trusted_crates: BTreeSet<String>,
 }
 
 impl Program {
-    /// Build the resolution tables. Unresolvable impl headers are kept and surface as
-    /// `missing-body` boundaries when called.
+    /// Build the resolution tables against the **builtin** model only — no
+    /// `--model` overlay's `[[trusted]]` rows are visible to
+    /// [`Self::resolve_call`]. Callers that load an overlay (the CLI pipeline)
+    /// must use [`Self::build_with_model`] instead; this entry point exists for
+    /// callers (tests, mostly) with no overlay to merge.
     ///
     /// # Errors
     /// Only on i/o failure reading a source root that exists but is unreadable.
     pub fn build(docs: Vec<MirDoc>, sources: &SourceRoots) -> crate::Result<Self> {
+        // A builtin model that fails to parse is a bug the model's own
+        // tests catch. Here the honest fallback is "no additional trusted
+        // crates", which is exactly `is_trusted_crate`'s behaviour before
+        // this field existed (std/core/alloc only).
+        let trusted = Model::builtin_ref()
+            .map(|model| model.trusted.iter().map(|c| c.name.clone()).collect())
+            .unwrap_or_default();
+        Ok(Self::build_with_trusted(docs, sources, trusted))
+    }
+
+    /// [`Self::build`], but [`Self::resolve_call`]'s `[[trusted]]` crate check
+    /// reads `model` — the merged model, builtin plus every `--model` overlay —
+    /// instead of only the builtin one.
+    ///
+    /// # Errors
+    /// Only on i/o failure reading a source root that exists but is unreadable.
+    pub fn build_with_model(
+        docs: Vec<MirDoc>,
+        sources: &SourceRoots,
+        model: &Model,
+    ) -> crate::Result<Self> {
+        let trusted = model.trusted.iter().map(|c| c.name.clone()).collect();
+        Ok(Self::build_with_trusted(docs, sources, trusted))
+    }
+
+    fn build_with_trusted(
+        docs: Vec<MirDoc>,
+        sources: &SourceRoots,
+        trusted_crates: BTreeSet<String>,
+    ) -> Self {
         let mut program = Self {
             docs,
+            trusted_crates,
             ..Self::default()
         };
         program.index_bodies();
@@ -252,7 +293,13 @@ impl Program {
         program.index_impls();
         program.index_drop_glue();
         program.index_rta();
-        Ok(program)
+        program
+    }
+
+    /// `std`/`core`/`alloc`, or a `[[trusted]]` crate of the model this
+    /// [`Program`] was built with.
+    fn is_trusted_crate(&self, root: &str) -> bool {
+        matches!(root, "std" | "core" | "alloc") || self.trusted_crates.contains(root)
     }
 
     // ── indexing ────────────────────────────────────────────────────────────
@@ -878,7 +925,7 @@ impl Program {
             if self.crates.contains(root) {
                 return Resolution::Boundary(BoundaryKind::MissingBody, callee.trim().to_string());
             }
-            if !is_trusted_crate(root) {
+            if !self.is_trusted_crate(root) {
                 return Resolution::Boundary(
                     BoundaryKind::ExternalCrateBody,
                     callee.trim().to_string(),
@@ -1379,16 +1426,6 @@ fn closure_owner(path: &str) -> &str {
 struct CallSite<'a> {
     dest: &'a crate::mir::ast::Place,
     args: &'a [Operand],
-}
-
-/// A crate whose body the analyzer never has, but whose behaviour is modelled as
-/// pure taint propagation. Kept in step with the `[[trusted]]` table's intent;
-/// `Model::classify` is the authority at analysis time, this list only decides
-/// whether a *rooted* path with no body is a boundary.
-fn is_trusted_crate(root: &str) -> bool {
-    crate::Model::builtin_ref()
-        .map(|model| model.trusted.iter().any(|c| c.name == root))
-        .unwrap_or(matches!(root, "std" | "core" | "alloc"))
 }
 
 /// `{async fn body of m::f()}` → `m::f`.

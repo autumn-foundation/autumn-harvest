@@ -260,6 +260,36 @@ fn strip_line_comments(text: &str) -> String {
         .join("\n")
 }
 
+// The `-D warnings` build below runs with `--message-format=json`, so rustc's
+// diagnostics land on stdout as one JSON object per line, not on stderr.
+// `output.stderr` alone only ever shows cargo's own progress narration
+// ("Compiling ...") and its terse summary ("could not compile ... due to N
+// previous errors"). It never shows the lint that was actually denied.
+// A real failure here (e.g. `dead_code`) then has no diagnostic in the panic
+// message itself. Reproducing it needs a local rebuild or the full raw CI log.
+fn rendered_compiler_errors(stdout: &[u8]) -> String {
+    let rendered: Vec<String> = String::from_utf8_lossy(stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|m| m.get("reason").and_then(serde_json::Value::as_str) == Some("compiler-message"))
+        .filter_map(|m| {
+            let message = m.get("message")?;
+            if message.get("level").and_then(serde_json::Value::as_str) != Some("error") {
+                return None;
+            }
+            message
+                .get("rendered")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
+    if rendered.is_empty() {
+        "<no rustc error diagnostics found in the build's JSON messages>".to_string()
+    } else {
+        rendered.join("\n")
+    }
+}
+
 #[test]
 fn seeded_corpus_is_clean_under_the_syntactic_layer() {
     // (a) det_check: zero findings at ANY severity, and zero suppressions.
@@ -351,7 +381,9 @@ fn seeded_corpus_is_clean_under_the_syntactic_layer() {
         output.status.success(),
         "the corpus must build with `-D warnings` — that build is the \
          proof that HVG001–HVG011 report nothing at any severity.\n\
-         --- stderr ---\n{}",
+         --- rustc diagnostics ---\n{}\n\
+         --- cargo stderr ---\n{}",
+        rendered_compiler_errors(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
 

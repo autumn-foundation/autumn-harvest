@@ -37,7 +37,7 @@ current for the audited revision, not as prose.
 | Is harvest's determinism core backend-portable? | **Yes, already.** It consumes plain values (`ExecutionId`, `Vec<WorkflowEvent>`, a handler `fn`, JSON) — no connection, no trait object. |
 | Is harvest's *coordination* layer backend-portable? | **No.** Multi-worker claim, push notification, and cross-connection locking are the three load-bearing Postgres features, and SQLite substitutes them only by dropping capability. |
 | Did the prototype work? | **Yes — 4/4 durability scenarios**, plus cross-backend replay. Now productized. |
-| Should core grow a `StorageBackend` trait? | **No.** Buildable, but costed below at a scale the benefit does not justify — 25 of 57 coupled modules are portable only by dropping a capability or reimplementing wholesale, for a use case that does not share the Postgres concurrency model. |
+| Should core grow a `StorageBackend` trait? | **No.** Buildable, but costed below at a scale the benefit does not justify — 25 of 58 coupled modules are portable only by dropping a capability or reimplementing wholesale, for a use case that does not share the Postgres concurrency model. |
 | What shipped instead? | `autumn-harvest-sqlite` — reuses the determinism core wholesale, reimplements persistence only. |
 
 The one-sentence version: **the valuable half of harvest is already portable
@@ -54,23 +54,23 @@ module counts at the audited revision, recomputed by CI:
 
 | Mechanism | Reach | Portable? |
 |---|---|---|
-| `diesel` query layer | 57 modules | Query construction is mechanical; the *type* layer is not. |
+| `diesel` query layer | 58 modules | Query construction is mechanical; the *type* layer is not. |
 | `skip-locked` claim (`FOR UPDATE SKIP LOCKED`) | 15 modules | Only by dropping multi-worker concurrency. |
 | `row-lock` blocking row lock (Diesel `.for_update()`) | 17 modules | Subsumed by the single write lock. |
-| `interval-sql` (`INTERVAL '…'`, `make_interval()`) | 13 modules | Yes — integer epoch milliseconds. |
-| `raw-sql` — reaches for Diesel's raw-SQL escape hatch (`sql::<…>`, `sql_query`) | 39 modules | Case by case — the SQL must be read, not inferred from the ORM. |
-| `raw-pg-sql` — *identified* Postgres-only syntax within that SQL (JSONB `#>>`/`@>`, `::TYPE` casts in either case, `EXTRACT(EPOCH …)`, `JOIN LATERAL`, `~` regex) | 27 modules | Mostly — but each is a hand rewrite, and `~` has no SQLite equivalent at all. |
-| `advisory-lock` (`pg_advisory_*` / `pg_try_advisory_*`) | 12 modules | Subsumed by the single write lock. |
+| `interval-sql` (`INTERVAL '…'`, `make_interval()`) | 14 modules | Yes — integer epoch milliseconds. |
+| `raw-sql` — reaches for Diesel's raw-SQL escape hatch (`sql::<…>`, `sql_query`) | 40 modules | Case by case — the SQL must be read, not inferred from the ORM. |
+| `raw-pg-sql` — *identified* Postgres-only syntax within that SQL (JSONB `#>>`/`@>`, `::TYPE` casts in either case, `EXTRACT(EPOCH …)`, `JOIN LATERAL`, `~` regex) | 28 modules | Mostly — but each is a hand rewrite, and `~` has no SQLite equivalent at all. |
+| `advisory-lock` (`pg_advisory_*` / `pg_try_advisory_*`) | 13 modules | Subsumed by the single write lock. |
 | `to_regclass` table-existence probes | 9 modules | Yes — `sqlite_master` lookup. |
 | `listen/notify` push wakeups | 4 modules | No — polling is a degradation, not a translation. |
 | `gen_random_uuid` server-side ids | 1 module | Yes — mint application-side. |
 
-Plus **100 migrations** written in Postgres DDL (`JSONB`, `TIMESTAMPTZ`,
+Plus **112 migrations** written in Postgres DDL (`JSONB`, `TIMESTAMPTZ`,
 `INTERVAL`, `UUID`, partial indexes, `gen_random_uuid()` defaults), none of
 which apply to SQLite. The SQLite crate does not translate them; it declares
 its own schema.
 
-**57 of the 112 core modules** exhibit at least one mechanism — a shade under
+**58 of the 113 core modules** exhibit at least one mechanism — a shade under
 half. That ratio is the headline finding, and it cuts *both* ways: the
 determinism core really is clean, and the persistence layer really is
 saturated.
@@ -107,7 +107,7 @@ have grown past that round's 18 as new Postgres-only syntax lands; each module
 the open rule newly catches has so far already been (b) or (c). The counts move;
 the classifications do not.
 
-That 39 of the 57 coupled modules hand-write SQL is therefore the more
+That 40 of the 58 coupled modules hand-write SQL is therefore the more
 decision-relevant number than any dialect tally. It is the volume of query text
 a second backend must re-author by hand, and it is knowable exactly.
 
@@ -168,7 +168,7 @@ Classification rule:
 | `calendar` | diesel | (a) | Plain CRUD. |
 | `codec_rotation` | diesel, interval-sql, raw-pg-sql, raw-sql, to_regclass | (b) | Lazy re-encryption sweep (issue #948). Every Postgres-ism is a rewrite, not a capability: `::jsonb`/`::TEXT` casts, a `JOIN LATERAL` over the payload-field allowlist, a `~` regex validating the stored key id, and a `to_regclass` probe for the cursor table. The `~` check is the only awkward one — validate the key id in Rust, as the decoder already does. No claim, no lock: the sweep is a batched scan whose writes are compare-and-swaps. |
 | `completion_callback` | diesel, skip-locked, row-lock, to_regclass, raw-sql | (c) | Two-transaction claim scanner; multi-worker delivery dropped. |
-| `completion_trigger` | diesel, skip-locked, advisory-lock, raw-sql | (c) | Terminal-commit fan-out; claim semantics dropped. |
+| `completion_trigger` | diesel, interval-sql, skip-locked, advisory-lock, raw-sql | (c) | Terminal-commit fan-out; claim semantics dropped. The outbox relay's backoff deadlines are computed as `clock_timestamp() + make_interval(secs => …)` (issue #1392) — integer epoch ms for the interval arithmetic, as `build_routing` does. |
 | `concurrency` | diesel, skip-locked, advisory-lock, raw-pg-sql, raw-sql | (c) | Was a pure consumer of the claim invariant; the latest-wins supersede path (#811) added a `pg_advisory_xact_lock(hashtext(key)::bigint)` critical section and a raw candidate scan of its own. Per-key fleet limits are meaningless single-writer, and the advisory lock is subsumed by the single write lock. |
 | `context` | diesel, listen/notify | (c) | Wakeup path; no push primitive exists. |
 | `cross_shard_child` | diesel, interval-sql, raw-pg-sql, raw-sql, row-lock, to_regclass | (c) | The cross-shard child relay (#956). Not a translation problem — the module exists **because** there is more than one database. A single-file SQLite deployment has exactly one shard, so the whole capability (placement, the relay, the outbox row) has nothing to do and would be dropped wholesale, exactly like the per-key fleet limits in `concurrency`. Its own mechanisms are mild (Diesel, one `FOR UPDATE` on the parent row before the terminal append — subsumed by the single write lock — a raw `INTERVAL` retry-backoff predicate that would become integer epoch ms exactly as `build_routing` does, and a `to_regclass('…')::text` probe that lets the relay skip quietly on a database whose migrations have not run — `sqlite_master` answers the same question); the coupling is architectural, not syntactic. |
@@ -177,7 +177,7 @@ Classification rule:
 | `erase` | diesel, row-lock | (b) | Scrub holds a row lock; subsumed by the single write lock. |
 | `error` | diesel, skip-locked | (c) | **Comment-only consumer, like `concurrency` above and `store` below.** `SuspendedClaimAmbiguous` (issue #1182) represents the ambiguity a `SKIP LOCKED` claim probe can produce; a single-writer engine has no such ambiguity to represent, so the variant itself would not exist there. |
 | `event_batch` | diesel, skip-locked, to_regclass, raw-pg-sql, raw-sql | (c) | Scanner claim. |
-| `execution` | diesel, skip-locked, row-lock, interval-sql, raw-pg-sql, raw-sql | (c) | Start/reuse matrix under `FOR UPDATE`; row-lock ordering is load-bearing. |
+| `execution` | diesel, skip-locked, row-lock, advisory-lock, interval-sql, raw-pg-sql, raw-sql | (c) | Start/reuse matrix under `FOR UPDATE`; row-lock ordering is load-bearing. Issue #1596 review added `pg_advisory_xact_lock(hashtext(key)::bigint)` ahead of the row lock, closing an admission race between concurrent starts and a reconciled seal; subsumed by the single write lock. |
 | `external_target_location` | diesel | (c) | Placement-aware resolution for `workflow_id`-addressed signal/cancel (#1146). Like `cross_shard_child` above, the coupling is **architectural, not syntactic**: the module exists *because* there is more than one database. It answers "which shard holds this business key?" by fanning a read across every expected shard and merging the per-shard answers. A single-file SQLite deployment has exactly one shard, so the fan-out has nothing to do — the engine's own single-shard short-circuit already skips it — and the whole module would be dropped, leaving the shard-local resolver it delegates to (`execution::resolve_execution_id_by_workflow_id`) as the entire answer. Its lone mechanism is the `AsyncPgConnection` in its signatures. |
 | `external_task` | diesel, row-lock | (b) | `find_by_token_locked` serialises completion/failure; subsumed. |
 | `handle` | diesel | (a) | Read paths. |
@@ -194,6 +194,7 @@ Classification rule:
 | `queue` | diesel, skip-locked, row-lock, advisory-lock, listen/notify, interval-sql, raw-pg-sql, raw-sql | (c) | The claim path itself. Reimplemented on `BEGIN IMMEDIATE`. |
 | `queue_pause` | diesel, skip-locked, advisory-lock, raw-pg-sql, raw-sql | (c) | Claim-time gate. |
 | `quota` | advisory-lock, diesel, raw-pg-sql, raw-sql | (b) | Admission-time check inside the start transaction, no scanner. `pg_advisory_xact_lock(hashtext(key)::bigint)` serialises concurrent admissions for the same key — subsumed by the single write lock. The `history_bytes` aggregate sums `pg_column_size(event_data)`; SQLite's `length(event_data)` is a direct substitute. |
+| `quota_reconcile` | diesel, raw-sql | (b) | Periodic backfill sweep for pre-upgrade `quota_key` rows (issue #1226). Its own SQL text is a `SELECT ... LIMIT $3` and one `UPDATE ... WHERE id = $2 AND quota_key IS NULL`, with no token the audit's `raw-pg-sql` list matches (the candidate scan's `ANY($1)` array bind is genuinely Postgres-specific, but is a dialect rewrite -- an `IN (?, ?, ...)` placeholder list -- not a capability gap, and outside what that list enumerates). It is (b) rather than (a) only because the SQL is hand-written and must be read rather than inferred from the ORM. Two mechanisms live one call away rather than in this module's own source, so they are attributed to the modules that actually contain them, matching how `execution`'s row treats the identical pattern: the write takes `pg_advisory_xact_lock` through `quota::lock_quota_key` (counted on `quota`'s row) to serialize with a concurrent admission for the same key -- `WHERE quota_key IS NULL` on both the scan and the write is what makes two concurrent SWEEPS safe on its own, the lock exists for the admission race specifically -- and every write asserts the cross-region DR fence through `replication::assert_fence` (counted on `replication`'s row), the ordinary-CRUD half that row already notes "would survive" a port. |
 | `replication` | advisory-lock, diesel, interval-sql, raw-pg-sql, raw-sql | (c) | Cross-region DR fencing and RPO measurement (issue #954). The **most** Postgres-bound module in the inventory: it reads `pg_stat_replication`, `pg_replication_slots`, `pg_current_wal_lsn()` and the `pg_lsn` type, none of which SQLite has in any form — there is no replication to observe, so there is nothing to translate. The fencing epoch itself is ordinary CRUD and would survive; the measurement half does not. Advisory lock subsumed by the single write lock; `make_interval(secs => …)` as epoch ms. |
 | `reset` | diesel, row-lock | (b) | Fork takes a row lock before appending; subsumed. |
 | `retention` | diesel, skip-locked, row-lock, raw-pg-sql, raw-sql | (c) | Batched delete scanner with claim. |
@@ -207,7 +208,7 @@ Classification rule:
 | `start_idempotency` | diesel, to_regclass, interval-sql, raw-sql | (b) | `ON CONFLICT` upsert has a direct SQLite form. |
 | `store` | diesel, skip-locked, row-lock | (c) | **Consumer of the claim invariant — issues no `SKIP LOCKED` SQL of its own.** Event append itself is (a); its TOCTOU assumption is not. |
 | `testing` | diesel | (a) | Test-only helpers. |
-| `throttle` | diesel, skip-locked, to_regclass, gen_random_uuid, raw-sql | (c) | Token-bucket scanner claim; the accrual formula itself (issue #945) now lives behind `queue::effective_available_tokens_expr`, so `throttle` reaches `sql_query` but no longer embeds Postgres-only dialect syntax directly. |
+| `throttle` | diesel, skip-locked, to_regclass, gen_random_uuid, raw-pg-sql, raw-sql | (c) | Token-bucket scanner claim; the accrual formula itself (issue #945) lives behind `queue::effective_available_tokens_expr`. Issue #1230 Finding 2 added its own `sql_query`: a pre-fire pass resolves every distinct quota key's real advisory-lock id with one `hashtext(n)` round trip over `unnest($1::text[])`, so rows sort by lock id instead of by string, closing an ABBA deadlock the earlier string-sort left open. |
 | `timeout` | diesel, skip-locked, row-lock, advisory-lock, raw-pg-sql, raw-sql | (c) | The scanner family; lock ordering vs the claim path is load-bearing. |
 | `usage` | diesel, raw-pg-sql, raw-sql | (b) | Aggregate reads, but through `JOIN LATERAL`, `EXTRACT(EPOCH …)` and `::` casts. Rewrite as a correlated subquery + `strftime`/`CAST`. |
 | `version_gate_retirement` | diesel, raw-pg-sql, raw-sql | (b) | Marker scan over JSONB `#>>` with a `~ '^[0-9]{1,19}$'` guard. SQLite has no regex — substitute `GLOB`/`CAST`. |
@@ -216,7 +217,7 @@ Classification rule:
 | `worker` | diesel, skip-locked, row-lock, advisory-lock, listen/notify, raw-pg-sql, raw-sql | (c) | The dispatch loop; wakeups and persistence are interleaved. |
 | `workers` | diesel, interval-sql, raw-pg-sql, raw-sql | (b) | Fleet registry rows, but the sticky-lease filter embeds `NOW()` and the capability-miss fleet lookup adds an `INTERVAL` liveness window plus a `queues @> to_jsonb($2::text)` containment test. SQLite: `CURRENT_TIMESTAMP`/epoch ms; JSON1 `EXISTS (SELECT 1 FROM json_each(queues) …)` for the containment. |
 
-**Totals: (a) 8 · (b) 24 · (c) 25.**
+**Totals: (a) 8 · (b) 25 · (c) 25.**
 
 The shape matters more than the totals. The (a) column is genuinely
 mechanical CRUD. The (b) column is dominated by **pessimistic row locking**:
@@ -321,7 +322,7 @@ absence of demand for what it would buy.
 
 | Component | Scope |
 |---|---|
-| Trait definition + Postgres impl | ~57 modules touched |
+| Trait definition + Postgres impl | ~58 modules touched |
 | Rewriting scanners against the trait | ~13 modules, each with a concurrency contract to re-specify |
 | Type-layer abstraction | `models.rs` + `schema.rs` wholesale |
 | Test matrix | Every DB-gated suite runs twice, with per-backend expectations where semantics diverge |
@@ -366,13 +367,13 @@ disputed:
 
 - **25 modules are class (c)** — portable only by dropping a capability or
   reimplementing wholesale — against 8 that are trivially trait-able.
-- **39 modules reach for raw SQL**, so their portability cannot be read off
+- **40 modules reach for raw SQL**, so their portability cannot be read off
   their Diesel usage at all.
 - The **capability losses are documented and unavoidable** on the single-writer
   side (*Known capability losses*, below), so the second backend is not the same
   product with a different file on disk.
 - The companion crate delivered that capability at **structurally zero cost** to
-  the Postgres path, against a seam sized above at ~57 modules touched.
+  the Postgres path, against a seam sized above at ~58 modules touched.
 
 Each subsection below is a cost, weighed against that. None is offered as a
 proof that the trait is impossible; the previous section establishes that it is

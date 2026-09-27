@@ -15,8 +15,8 @@ to command-emitting **sinks**. Every `#[workflow]` fn gets one of three verdicts
   model version and boundary set.
 * `nondeterminism-found` — with a hop-by-hop source→sink trace naming each helper
   and its generic substitutions.
-* `unknown` — with the analysis boundary named. One of twelve
-  (`cargo harvest-verify --list-boundaries`), all twelve reachable.
+* `unknown` — with the analysis boundary named. One of fourteen
+  (`cargo harvest-verify --list-boundaries`), all fourteen reachable.
 
 The knowledge is **data, not code**: `harvest-verify.model.toml` classifies all
 160 public `WorkflowContext` methods, and `--model extra.toml` overlays new rows
@@ -86,7 +86,7 @@ it is the most useful result the prototype has produced.
   flag, the exit-code contract, how to read a trace, the allowlist format,
   extending the model, and a GitHub Actions recipe.
 * [`docs/rnd/determinism-static-analysis.md`](../docs/rnd/determinism-static-analysis.md)
-  — the feasibility report: substrates weighed, the taint model, all twelve
+  — the feasibility report: substrates weighed, the taint model, all fourteen
   soundness boundaries, the success metrics with the test that asserts each, and
   the go/no-go. **Read the boundaries section before quoting a verdict.**
 * [`docs/workflow-determinism-guide.md`](../docs/workflow-determinism-guide.md) —

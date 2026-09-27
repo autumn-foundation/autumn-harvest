@@ -376,6 +376,16 @@ pub struct LineageWalk {
 
 impl LineageWalk {
     /// Start a walk rooted at `root_id`.
+    ///
+    /// `visited` and `nodes` start unsized. `limits.max_nodes` is the
+    /// walk's hard *ceiling* -- an operator-accepted request can set it as
+    /// high as `LINEAGE_MAX_NODES_CEILING`. It is not a prediction of this
+    /// walk's actual size, and most triage calls target a small or leaf
+    /// family. An earlier cut of this fix reserved the ceiling up front
+    /// here (Codex review on the PR that introduced it). That would make
+    /// every sparse walk pay for the rare wide one. Both collections
+    /// instead grow incrementally, right-sized per level, in
+    /// [`admit_level`](Self::admit_level).
     #[must_use]
     pub fn new(root_id: ExecutionId, limits: LineageLimits) -> Self {
         let mut visited = HashSet::new();
@@ -441,7 +451,43 @@ impl LineageWalk {
                 .then_with(|| a.exec_id.as_uuid().cmp(&b.exec_id.as_uuid()))
         });
 
-        let mut next = Vec::new();
+        // Every row is at least attempted against `visited` -- even a
+        // duplicate or a budget-rejected one is inserted there. So
+        // `rows.len()` bounds how much `visited` can grow this call. Sizing
+        // from this level's own batch is deliberate, not from
+        // `limits.max_nodes`. An earlier cut of this fix reserved the
+        // walk's whole ceiling up front instead. That would make a sparse
+        // walk pay for the rare wide one (Codex review).
+        self.visited.reserve(rows.len());
+
+        // `next` only grows for rows actually admitted, which can never
+        // exceed the live budget. So it is capped by `remaining_budget()`,
+        // not by `rows.len()` alone. A multi-shard caller can merge
+        // `remaining_budget + 1` rows per shard into one `rows` batch. The
+        // fetch-window sentinel `note_saturated_fetch_window` documents
+        // this. So `rows.len()` alone can run well past what this call
+        // could ever admit (Codex review). `next` is fresh every call,
+        // never reused across levels. So a single `with_capacity` here
+        // costs one allocation for its whole lifetime, no regrowth.
+        //
+        // `self.nodes`, in contrast, is NOT sized here despite growing for
+        // exactly the same rows `next` does. `self.nodes` persists across
+        // every `admit_level` call for the whole walk. A `reserve` on it
+        // here interacts badly with `Vec`'s amortized doubling. Each level
+        // that must grow jumps to double *whatever `self.nodes`' capacity
+        // already was*, not to this level's own small top-up. Those jumps
+        // do not line up with the walk's real total. This was measured
+        // directly (Codex review, backed by this page's own dhat
+        // artifacts). On this harness's 9-level, 999-row shape, reserving
+        // `self.nodes` per level left it at capacity 1776 for 999 rows
+        // (23,398,800 bytes at this allocation site). Plain `push`-driven
+        // growth's capacity 1024 (13,899,200 bytes) does better. That is a
+        // regression, not a saving, at the exact site this fix's first
+        // cut claimed as a win. `self.nodes` is left growing from `push`
+        // alone, same as `by_parent` above and for the same reason: no
+        // reservation beats guessing wrong.
+        let admittable = rows.len().min(self.remaining_budget());
+        let mut next = Vec::with_capacity(admittable);
         for row in rows {
             let uuid = row.exec_id.as_uuid();
             // Cycle/duplicate guard. Also rejects a self-parent row (the root
@@ -569,6 +615,20 @@ impl LineageWalk {
         // Group by parent, then walk down from the root. Recursion depth is
         // bounded by `max_depth` (≤ LINEAGE_MAX_DEPTH_CEILING), so this cannot
         // overflow the stack.
+        //
+        // Left growing from empty, deliberately. `self.nodes.len()` bounds
+        // the number of distinct parents -- every row has at most one.
+        // That bound can be extremely loose, though. A broad, shallow tree
+        // has many children directly under one parent -- exactly the wide
+        // fan-out shape this endpoint exists for. Such a tree has
+        // `self.nodes.len()` rows and as few as one distinct parent. An
+        // earlier cut of this fix reserved `self.nodes.len()` here. That
+        // traded a real growth-step cost this walk's dominant shape rarely
+        // pays for a worst-case over-allocation it always would (Codex
+        // review). Unlike `nodes`, `next` and `node.children` below, there
+        // is no cheap tight bound on the real distinct-parent count without
+        // a second pass over `self.nodes`. That pass would itself hash
+        // every row's parent id, undoing the saving it exists to buy.
         let mut by_parent: HashMap<uuid::Uuid, Vec<LineageChildRow>> = HashMap::new();
         for row in self.nodes {
             if let Some(parent) = row.parent_id {
@@ -622,6 +682,11 @@ fn attach_children(
     let Some(rows) = by_parent.remove(&parent_uuid) else {
         return;
     };
+    // `rows.len()` is `node`'s exact, already-known child count. Reserving
+    // it up front means the loop below never grows `node.children` one
+    // `push` at a time. It starts at `Vec::new()`, per `LineageNode`'s own
+    // construction.
+    node.children.reserve_exact(rows.len());
     for row in rows {
         let mut child = LineageNode {
             execution_id: row.exec_id.to_string(),

@@ -1,0 +1,11 @@
+-- after-terminal-churn: count_stalled_candidates statement(s) after one real GET /admin/status request --
+events_per_healthy_execution=1
+stalled_count_returned=30
+total_calls=1
+total_buffers=2094
+request_total_buffers=20056
+buffers_pct_of_request=10.4
+
+calls=1 shared_blks_hit=2094 shared_blks_read=0 total_buffers=2094
+query=WITH recent_event_execs AS MATERIALIZED ( SELECT DISTINCT workflow_exec_id FROM harvest_events WHERE timestamp >= NOW() - ($1 * INTERVAL $3) ) SELECT COUNT(*)::BIGINT AS cnt FROM ( SELECT $4 FROM harvest_workflow_executions e WHERE e.state IN ($5, $6) AND NOT EXISTS ( SELECT $7 FROM recent_event_execs r WHERE r.workflow_exec_id = e.id ) AND ( EXISTS ( SELECT $8 FROM harvest_task_queue WHERE workflow_exec_id = e.id AND state IN ($9,$10,$11,$12) ) OR EXISTS ( SELECT $13 FROM harvest_workflow_executions c WHERE c.parent_id = e.id AND c.state NOT IN ( $14,$15,$16, $17,$18,$19 ) ) OR EXISTS ( SELECT $20 FROM harvest_signals WHERE workflow_exec_id = e.id AND consumed = $21 ) OR NOT EXISTS ( SELECT $22 FROM harvest_timers WHERE workflow_exec_id = e.id AND fired = $23 AND fires_at > NOW() ) OR EXISTS ( SELECT $24 FROM harvest_timers WHERE workflow_exec_id = e.id AND fired = $25 AND fires_at <= NOW() ) ) LIMIT $2 ) t
+

@@ -42,6 +42,8 @@ pub mod prelude;
 pub mod queue_coverage;
 pub mod replay_diagnosis;
 pub mod runner;
+/// Cross-site request rejection for Vantage and DLQ mutations (issue #1278).
+pub mod same_origin;
 pub mod schedule_runs;
 pub mod shard_fanout;
 pub mod shard_health;
@@ -84,8 +86,9 @@ pub mod openapi;
 pub mod metrics_scrape;
 
 pub use api::{
-    HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
-    management_api_request_fields, management_api_response_fields, management_api_routes,
+    HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, StandaloneAdminAuth,
+    harvest_api_router, management_api_request_fields, management_api_response_fields,
+    management_api_routes,
 };
 pub use config::{
     HarvestBatchConfig, HarvestDatabaseConfig, HarvestMode, HarvestOutboxConfig,

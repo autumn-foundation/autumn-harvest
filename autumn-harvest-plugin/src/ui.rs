@@ -9,9 +9,8 @@
 use std::fmt::Write as _;
 use std::sync::Arc;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use autumn_web::AppState;
 use autumn_web::error::AutumnError;
 use autumn_web::extract::{Path, Query};
 use autumn_web::reexports::axum;
@@ -63,11 +62,12 @@ use autumn_harvest::schema::{
     harvest_signals, harvest_task_queue, harvest_timers, harvest_workflow_executions,
 };
 use autumn_harvest::signal::send_signal;
-use autumn_harvest::start_or_load_workflow_execution_with_metrics;
-use autumn_harvest::store::admit_update_event;
+use autumn_harvest::start_or_load_workflow_execution_with_metrics_and_codecs;
+use autumn_harvest::store::admit_update_event_with_codecs;
 use autumn_harvest::types::{
     ExecutionId as HarvestExecutionId, Priority, ShardId, UpdateId, WorkflowIdReusePolicy,
 };
+use autumn_harvest::worker::DispatchDeadline;
 use autumn_harvest::workers::{WorkerFilters, WorkerHealth, WorkerRow, list_workers};
 use autumn_harvest::{
     StepKind, StepOutcome, Timeline, TimelineRollup, TimelineStep, derive_timeline,
@@ -199,7 +199,7 @@ code.sample{display:inline-block;margin:0 4px 2px 0;font-size:11px;color:#cbd5e1
 .kv .v{color:#e2e8f0;word-break:break-all}
 pre{background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:6px;padding:12px;overflow:auto;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;margin:0}
 .error-banner{background:#7f1d1d;color:#fee2e2;padding:10px 14px;border-radius:6px;margin-bottom:16px;font-size:13px}
-.filters .field-error{display:block;background:#7f1d1d;color:#fee2e2;padding:2px 8px;border-radius:4px;font-size:11px;margin-top:4px}
+.field-error{display:block;background:#7f1d1d;color:#fee2e2;padding:2px 8px;border-radius:4px;font-size:11px;margin-top:4px}
 .empty{color:#94a3b8;font-style:italic;padding:24px;text-align:center}
 .detail-row{display:flex;gap:16px;align-items:center;margin-bottom:16px;flex-wrap:wrap}
 .detail-row .back{color:#93c5fd;font-size:13px}
@@ -250,9 +250,9 @@ footer{padding:20px 24px;color:#94a3b8;font-size:12px;text-align:center;border-t
 #[derive(Debug, Deserialize)]
 pub(crate) struct WorkflowListParams {
     #[serde(default)]
-    page: Option<i64>,
+    page: Option<String>,
     #[serde(default)]
-    limit: Option<i64>,
+    limit: Option<String>,
     #[serde(default)]
     state: Option<String>,
     #[serde(default)]
@@ -274,15 +274,23 @@ pub(crate) struct WorkflowListParams {
 
 #[derive(Debug, Deserialize, Default)]
 pub(crate) struct WorkflowDetailParams {
+    // `event_page`/`jump_event` are `String`, not `i64`. This is the same
+    // fix as `page`/`limit` on the Workflows, Workers, DLQ and Schedules
+    // pages (#1540/#1560/#1588/#1619), and as `node`/`refresh` on the DAG
+    // detail page. An `i64`-typed field fails axum's query deserialization
+    // on non-numeric text with a bare 400 before this handler -- or the
+    // `log_level` filter -- ever runs. Unlike a list page, that also
+    // discards the whole execution view: status, blocked-on panel, activity
+    // attempts, signals panel and the event timeline (issue #1627).
     /// Zero-based page index for the event timeline.
     #[serde(default)]
-    event_page: Option<i64>,
+    event_page: Option<String>,
     /// Flash message to display at the top of the detail page.
     #[serde(default)]
     flash: Option<String>,
     /// Jump to the page containing this 1-based event number.
     #[serde(default)]
-    jump_event: Option<i64>,
+    jump_event: Option<String>,
     /// Level filter for the durable workflow-logs panel (issue #790):
     /// `info` | `warn` | `error`. Absent or unrecognised means "all levels".
     #[serde(default)]
@@ -320,7 +328,12 @@ struct WorkflowSignalForm {
 
 #[derive(Debug, Deserialize)]
 struct WorkflowResetForm {
-    reset_to_event_id: i64,
+    /// Raw submitted text, not `i64`. A malformed value must reach the
+    /// handler as text. It then redisplays as a flash error, instead of
+    /// aborting the request at the `Form` extractor. See
+    /// `parse_reset_to_event_id`.
+    #[serde(default)]
+    reset_to_event_id: String,
     #[serde(default)]
     reason: Option<String>,
 }
@@ -364,10 +377,15 @@ struct BlockedOnData {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct WorkerListParams {
+    // `page`/`limit` are `String`, not `i64`. See `list_workers_ui`'s
+    // handling for why: an `i64`-typed field fails axum's query
+    // deserialization on non-numeric text with a bare 400 before this
+    // handler ever runs. That discards every other filter already on the
+    // URL.
     #[serde(default)]
-    page: Option<i64>,
+    page: Option<String>,
     #[serde(default)]
-    limit: Option<i64>,
+    limit: Option<String>,
     /// Filter by lifecycle status: `Active`, `Draining`, or `Stopped`.
     #[serde(default)]
     status: Option<String>,
@@ -380,9 +398,11 @@ pub(crate) struct WorkerListParams {
     /// Filter by build ID (exact match).
     #[serde(default)]
     build_id: Option<String>,
-    /// Auto-refresh interval in seconds (emits a `<meta http-equiv="refresh">` tag).
+    /// Auto-refresh interval in seconds (emits a `<meta http-equiv="refresh">`
+    /// tag). `String`, not `u64` — same fix as `page`/`limit` above (issue
+    /// #1604), reusing `parse_refresh_query_field` (issue #1630).
     #[serde(default)]
-    refresh: Option<u64>,
+    refresh: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -416,10 +436,15 @@ struct BuildRoutingRetireForm {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct DeadLetterListParams {
+    // `page`/`limit` are `String`, not `i64` — same fix as
+    // `WorkerListParams` and `WorkflowListParams` (#1540/#1560). An
+    // `i64`-typed field fails axum's query deserialization on non-numeric
+    // text with a bare 400 before this handler ever runs. That discards
+    // every other filter already on the URL.
     #[serde(default)]
-    page: Option<i64>,
+    page: Option<String>,
     #[serde(default)]
-    limit: Option<i64>,
+    limit: Option<String>,
     #[serde(default)]
     workflow_name: Option<String>,
     #[serde(default)]
@@ -430,8 +455,10 @@ pub(crate) struct DeadLetterListParams {
     failed_before: Option<String>,
     #[serde(default)]
     shard_id: Option<String>,
+    // `refresh` is `String`, not `u64` — same fix as `page`/`limit` above
+    // (issue #1604), reusing `parse_refresh_query_field` (issue #1630).
     #[serde(default)]
-    refresh: Option<u64>,
+    refresh: Option<String>,
     #[serde(default)]
     flash: Option<String>,
     /// `summary` switches to the root-cause aggregation view (issue #385).
@@ -603,7 +630,7 @@ fn worker_sort_key(row: &WorkerRow) -> (u8, u8, &str) {
 }
 
 /// Build the Vantage dashboard router.
-pub fn harvest_ui_router(api_state: HarvestApiState) -> Router<AppState> {
+pub fn harvest_ui_router(api_state: HarvestApiState) -> Router<()> {
     let require_admin = middleware::from_fn_with_state(api_state.clone(), require_harvest_admin);
 
     Router::new()
@@ -685,6 +712,13 @@ pub fn harvest_ui_router(api_state: HarvestApiState) -> Router<AppState> {
             post(lift_gate_ui).route_layer(require_admin),
         )
         .layer(Extension(api_state))
+        // issue #1278: reject a cross-site POST before it reaches any
+        // handler or admin check. The guard then covers every mutation
+        // uniformly, admin-gated and ungated alike. The outermost `.layer()`
+        // call runs first, ahead of the per-route `require_admin` above.
+        .layer(axum::middleware::from_fn(
+            crate::same_origin::require_same_origin,
+        ))
 }
 
 async fn index() -> axum::response::Redirect {
@@ -706,10 +740,16 @@ struct DagUiSummary {
 struct DagDetailParams {
     #[serde(default)]
     run: Option<String>,
+    // `node`/`refresh` are `String`, not `usize`/`u64` — same fix as
+    // `page`/`limit` on the Workflows, Workers, DLQ and Schedules pages
+    // (#1540/#1560/#1588/#1619). A numeric-typed field fails axum's query
+    // deserialization on non-numeric text with a bare 400 before this
+    // handler ever runs. That discards the selected run and every other
+    // query param already on the URL.
     #[serde(default)]
-    node: Option<usize>,
+    node: Option<String>,
     #[serde(default)]
-    refresh: Option<u64>,
+    refresh: Option<String>,
     #[serde(default)]
     flash: Option<String>,
 }
@@ -855,14 +895,28 @@ async fn dag_detail_ui(
         DagGraphView::NoRun
     };
 
+    let (node, node_error) = parse_dag_node_query_field(params.node.as_deref());
+    let (mut refresh, refresh_error) = parse_refresh_query_field(params.refresh.as_deref());
+    // A valid `refresh` alongside an invalid `node` must not auto-reload.
+    // `layout_dag_detail` emits `refresh` as a bare `meta http-equiv`, with
+    // no target URL to drop the bad `node` from. Reloading the same URL
+    // would repeat the error forever, redoing this page's DB reads on
+    // every tick. Suppress refresh instead; the flash still names the bad
+    // value so the operator can fix the URL by hand.
+    if node_error.is_some() {
+        refresh = None;
+    }
+
     Ok(render_dag_detail(
         &dag_name,
         &dag,
         &runs,
         selected_run,
-        params.node,
-        params.refresh,
+        node,
+        refresh,
         params.flash.as_deref(),
+        node_error.as_deref(),
+        refresh_error.as_deref(),
         view,
     ))
 }
@@ -947,6 +1001,65 @@ struct DagRetryCommitForm {
     reason: String,
 }
 
+/// The operator's submitted retry `reason` and a genuine commit failure.
+/// Echoed back into the confirm page's already-open form, instead of being
+/// lost on a redirect (issue #1723).
+///
+/// Both fields are `None` on the plain `GET`. Nothing has failed yet, so the
+/// auto-generated default reason applies. `dag_retry_commit_ui` fills them on
+/// a real commit failure. It then renders the confirm page directly, rather
+/// than redirecting. A redirect can only carry a flash string. That string
+/// has no slot for the reason the operator typed. Redirecting the reason
+/// would also put it in the browser's history and any proxy or server
+/// access log.
+#[derive(Debug, Default)]
+struct DagRetryEcho {
+    reason: Option<String>,
+    error: Option<String>,
+}
+
+/// Loads a fresh dry-run outcome and renders the retry confirm page.
+///
+/// Shared by the `GET` route and, on a genuine commit failure, by
+/// `dag_retry_commit_ui` (issue #1723). The dry run is re-run rather than
+/// reused, so the redisplayed node list reflects current state. The two-step
+/// confirm/commit split exists precisely because that state can change
+/// between the two requests.
+async fn render_dag_retry_confirm_page(
+    api_state: &HarvestApiState,
+    headers: &axum::http::HeaderMap,
+    dag_name: &str,
+    run_exec_id: &str,
+    from_node: &str,
+    echo: &DagRetryEcho,
+    route_or_command: &'static str,
+) -> Markup {
+    let actor = api_state.extract_actor(headers);
+    let default_reason = dag_retry_default_reason(from_node);
+    let reason = echo.reason.as_deref().unwrap_or(&default_reason);
+    let outcome = retry_dag_run_inner(
+        api_state,
+        dag_name,
+        run_exec_id,
+        headers,
+        vec![from_node.to_string()],
+        reason.to_string(),
+        actor,
+        true,
+        route_or_command,
+        Some(SOURCE_UI),
+    )
+    .await;
+    render_dag_retry_confirm(
+        dag_name,
+        run_exec_id,
+        from_node,
+        reason,
+        echo.error.as_deref(),
+        outcome,
+    )
+}
+
 /// GET the retry confirm page: run a **dry-run** retry through the shared,
 /// audited `retry_dag_run_inner` so the operator sees the authoritative widened
 /// node list (`nodes_to_re_execute`) before committing. On any endpoint error
@@ -959,28 +1072,17 @@ async fn dag_retry_confirm_ui(
     Query(params): Query<DagRetryConfirmParams>,
 ) -> Result<Markup, AutumnError> {
     let from_node = params.from_node.unwrap_or_default();
-    let actor = api_state.extract_actor(&headers);
-    let reason = dag_retry_default_reason(&from_node);
-    let outcome = retry_dag_run_inner(
+    let markup = render_dag_retry_confirm_page(
         &api_state,
-        &dag_name,
-        &run_exec_id,
         &headers,
-        vec![from_node.clone()],
-        reason.clone(),
-        actor,
-        true,
-        "GET /ui/dags/{dag_name}/runs/{run_exec_id}/retry",
-        Some(SOURCE_UI),
-    )
-    .await;
-    Ok(render_dag_retry_confirm(
         &dag_name,
         &run_exec_id,
         &from_node,
-        &reason,
-        outcome,
-    ))
+        &DagRetryEcho::default(),
+        "GET /ui/dags/{dag_name}/runs/{run_exec_id}/retry",
+    )
+    .await;
+    Ok(markup)
 }
 
 /// POST the retry commit: run the fork through `retry_dag_run_inner`
@@ -988,8 +1090,10 @@ async fn dag_retry_confirm_ui(
 /// `source = ui`. Redirects back to the DAG page with a success flash naming
 /// the new run. If the fork committed but the audit row failed to write
 /// (a partial success), redirects to the *new* run with a warning flash rather
-/// than misreporting it as a failure. A genuine failure (400/404/409) redirects
-/// to the source run with a "Retry failed" flash. Admin-gated at the router.
+/// than misreporting it as a failure. A genuine failure (400/404/409) renders
+/// the confirm page in place instead of redirecting. The submitted reason and
+/// the failure itself are both preserved (issue #1723; see `DagRetryEcho`).
+/// Admin-gated at the router.
 async fn dag_retry_commit_ui(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
@@ -1015,6 +1119,37 @@ async fn dag_retry_commit_ui(
         Some(SOURCE_UI),
     )
     .await;
+
+    // A genuine failure is any outcome but a successful fork or the
+    // `AuditFailed` partial success. It used to redirect to the unrelated DAG
+    // detail page with only a generic "Retry failed" flash. The operator's
+    // edited `reason` had no slot to survive that redirect. The two-step
+    // confirm/commit split exists so a stale dry run can lose a race against
+    // a concurrent change. Issue #1723's repro: a competing retry seals the
+    // source run between the confirm page loading and this submit. A real
+    // failure here is the *expected* outcome of that race, not a rare edge.
+    // So losing the operator's typed input on it was common, not theoretical.
+    match &outcome {
+        Err(failure) if !matches!(failure, DagRetryFailure::AuditFailed { .. }) => {
+            let echo = DagRetryEcho {
+                reason: Some(form.reason.clone()),
+                error: Some(failure.human_message()),
+            };
+            let markup = render_dag_retry_confirm_page(
+                &api_state,
+                &headers,
+                &dag_name,
+                &run_exec_id,
+                &form.from_node,
+                &echo,
+                "POST /ui/dags/{dag_name}/runs/{run_exec_id}/retry",
+            )
+            .await;
+            return Ok(markup.into_response());
+        }
+        _ => {}
+    }
+
     let (target_run, flash_text) = dag_retry_commit_redirect(outcome, &run_exec_id);
     let flash = url_encode(&flash_text);
     let redirect_url = dag_detail_relative_url(&dag_name, &target_run, Some(&flash));
@@ -1037,11 +1172,18 @@ fn dag_detail_relative_url(dag_name: &str, run: &str, flash: Option<&str>) -> St
 /// Render the retry confirm page from a dry-run outcome: on success, the
 /// widened re-execute list + carried-over list + an editable required reason and
 /// a Confirm form (`POSTing` to the same URL); on failure, the human message.
+///
+/// `reason` pre-fills the textarea: either the auto-generated default (the
+/// first-visit `GET`), or the operator's own submission. That submission is
+/// echoed back after a genuine commit failure (issue #1723). `commit_error`,
+/// when present, is that failure's message, shown inline next to the field
+/// rather than lost on a redirect.
 fn render_dag_retry_confirm(
     dag_name: &str,
     run_exec_id: &str,
     from_node: &str,
-    default_reason: &str,
+    reason: &str,
+    commit_error: Option<&str>,
     outcome: Result<DagRetryResponse, DagRetryFailure>,
 ) -> Markup {
     let body = match outcome {
@@ -1074,20 +1216,52 @@ fn render_dag_retry_confirm(
                 p {
                     label {
                         "Reason (required) "
-                        textarea name="reason" required[true] rows="2" cols="60" { (default_reason) }
+                        textarea name="reason" required[true] rows="2" cols="60" { (reason) }
                     }
+                }
+                @if let Some(error) = commit_error {
+                    span.field-error role="alert" { "Retry failed: " (error) }
                 }
                 button type="submit" class="btn reset" { "Confirm retry" }
             }
         },
-        Err(failure) => html! {
-            div class="banner Warning" { (failure.human_message()) }
-            p {
-                a class="back" href=(dag_detail_relative_url(dag_name, run_exec_id, None)) {
-                    "← Back to run"
+        Err(dry_run_failure) => {
+            let dry_run_message = dry_run_failure.human_message();
+            html! {
+                div class="banner Warning" { (dry_run_message) }
+                // Codex review (issue #1723): the refreshed dry run this
+                // function's caller re-runs for redisplay can itself fail.
+                // That is exactly what happens in the race this fix targets,
+                // where a competing retry has already sealed the source run.
+                // Dropping `reason` here on that second failure would
+                // silently repeat the very bug this fix exists to close.
+                //
+                // Only shown when `commit_error` is `Some`. On the plain
+                // first-visit `GET` failure, nothing has been submitted yet,
+                // so `reason` is just the auto-generated default, not the
+                // operator's own input.
+                @if let Some(error) = commit_error {
+                    p {
+                        "Your submitted reason (preserved, but this run can \
+                         no longer be retried from here): "
+                        code { (reason) }
+                    }
+                    // Codex review (issue #1723): the banner above is the
+                    // *refreshed* dry run's own failure, not necessarily what
+                    // the operator's actual commit attempt failed with. Show
+                    // the original commit failure too, when it differs, so a
+                    // divergent diagnosis is never silently dropped.
+                    @if error != dry_run_message {
+                        p { "The retry attempt itself failed with: " (error) }
+                    }
+                }
+                p {
+                    a class="back" href=(dag_detail_relative_url(dag_name, run_exec_id, None)) {
+                        "← Back to run"
+                    }
                 }
             }
-        },
+        }
     };
     layout_dag_detail(
         &format!("Retry DAG {dag_name} · Vantage"),
@@ -1102,11 +1276,18 @@ async fn list_workflows_ui(
     Extension(api_state): Extension<HarvestApiState>,
     Query(params): Query<WorkflowListParams>,
 ) -> Result<Markup, AutumnError> {
-    let limit = params
-        .limit
-        .unwrap_or(DEFAULT_PAGE_SIZE)
-        .clamp(1, MAX_PAGE_SIZE);
-    let page = params.page.unwrap_or(0).max(0);
+    // Issue: `page`/`limit` were still typed `Option<i64>` directly on this
+    // struct — the two fields left over after #1333 fixed every other
+    // filter here. A non-numeric value on either aborted the whole page
+    // with a bare, unstyled 400. That 400 landed before the filter form or
+    // any workflow row rendered. It discarded every filter the operator
+    // had entered. `parse_page_query_field`/`parse_limit_query_field`
+    // degrade to a default and report the bad value inline instead, the
+    // same "one field costs, not the page" contract as
+    // `parse_started_bound`.
+    let (limit, limit_raw, limit_error) =
+        parse_limit_query_field(params.limit.as_deref(), DEFAULT_PAGE_SIZE);
+    let (page, _page_raw, page_error) = parse_page_query_field(params.page.as_deref());
     let offset = page.saturating_mul(limit);
 
     let state_filter = params
@@ -1207,7 +1388,113 @@ async fn list_workflows_ui(
         exec_id_search.as_deref(),
         active_gate_count,
         &unavailable_shards,
+        &limit_raw,
+        limit_error.as_deref(),
+        page_error.as_deref(),
     ))
+}
+
+/// Parses the workflow list page's `page` query parameter (zero-based).
+///
+/// A non-numeric value falls back to page 0 and reports the bad value
+/// inline, instead of aborting the whole page render. Returns
+/// `(page, raw_display, error)`, the same contract as
+/// [`parse_shard_id_filter`].
+fn parse_page_query_field(raw: Option<&str>) -> (i64, String, Option<String>) {
+    let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return (0, String::new(), None);
+    };
+    trimmed.parse::<i64>().map_or_else(
+        |_| {
+            (
+                0,
+                trimmed.to_string(),
+                Some(format!(
+                    "Invalid page '{trimmed}'; expected a whole number. Showing page 1."
+                )),
+            )
+        },
+        // A well-formed but negative page number is clamped, not rejected.
+        // The raw text is left empty so a caller displays the clamped
+        // value, not the pre-clamp text. This matches the pre-fix
+        // `.unwrap_or(0).max(0)` display.
+        |parsed| (parsed.max(0), String::new(), None),
+    )
+}
+
+/// Parses a list page's `limit` ("Per page") query parameter.
+///
+/// Same contract as [`parse_page_query_field`], falling back to `default`
+/// instead of aborting the page. `default` lets callers keep their own
+/// per-page default on a parse failure. The DLQ page's default is 50, not
+/// the Workflows/Workers pages' 25, and this shared helper must not
+/// silently override that.
+fn parse_limit_query_field(raw: Option<&str>, default: i64) -> (i64, String, Option<String>) {
+    let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return (default, String::new(), None);
+    };
+    trimmed.parse::<i64>().map_or_else(
+        |_| {
+            (
+                default,
+                trimmed.to_string(),
+                Some(format!(
+                    "Invalid limit '{trimmed}'; expected a whole number. Showing {default} per page."
+                )),
+            )
+        },
+        // Same as `parse_page_query_field`: a well-formed but out-of-range
+        // limit is clamped silently, the pre-fix behavior. The raw text is
+        // left empty rather than displayed alongside a different effective
+        // value.
+        |parsed| (parsed.clamp(1, MAX_PAGE_SIZE), String::new(), None),
+    )
+}
+
+/// Parses the DAG detail page's `node` query parameter — a 0-based index
+/// into the rendered run graph.
+///
+/// A non-numeric value falls back to no node selected and reports the bad
+/// value inline, instead of aborting the whole page (see
+/// `parse_page_query_field`). An out-of-range but well-formed index is left
+/// as-is: `render_dag_run_graph_section` already looks it up with
+/// `nodes.get(idx)` and renders no panel when it misses.
+fn parse_dag_node_query_field(raw: Option<&str>) -> (Option<usize>, Option<String>) {
+    let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return (None, None);
+    };
+    trimmed.parse::<usize>().map_or_else(
+        |_| {
+            (
+                None,
+                Some(format!(
+                    "Invalid node '{trimmed}'; expected a whole number. No node selected."
+                )),
+            )
+        },
+        |parsed| (Some(parsed), None),
+    )
+}
+
+/// Parses a page's `refresh` (auto-refresh interval, in seconds) query
+/// parameter. Same contract as [`parse_dag_node_query_field`]: a
+/// non-numeric value falls back to auto-refresh disabled and reports the
+/// bad value inline, instead of aborting the whole page.
+fn parse_refresh_query_field(raw: Option<&str>) -> (Option<u64>, Option<String>) {
+    let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return (None, None);
+    };
+    trimmed.parse::<u64>().map_or_else(
+        |_| {
+            (
+                None,
+                Some(format!(
+                    "Invalid refresh '{trimmed}'; expected a whole number of seconds. Auto-refresh disabled."
+                )),
+            )
+        },
+        |parsed| (Some(parsed), None),
+    )
 }
 
 /// Parses an optional RFC 3339 `started_after`/`started_before` filter bound
@@ -1238,6 +1525,68 @@ fn parse_started_bound(
     )
 }
 
+/// Parses the workflow detail page's `jump_event` query parameter (a
+/// 1-based event number to jump to).
+///
+/// Same contract as [`parse_dag_node_query_field`]. A non-numeric value
+/// falls back to no jump; `event_page` applies instead. It reports the bad
+/// value inline, instead of aborting the whole page (issue #1627).
+fn parse_jump_event_query_field(raw: Option<&str>) -> (Option<i64>, Option<String>) {
+    let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return (None, None);
+    };
+    trimmed.parse::<i64>().map_or_else(
+        |_| {
+            (
+                None,
+                Some(format!(
+                    "Invalid jump_event '{trimmed}'; expected a whole number. Jump ignored."
+                )),
+            )
+        },
+        |parsed| (Some(parsed), None),
+    )
+}
+
+/// Resolves the workflow detail page's event-timeline page index from the
+/// raw `event_page`/`jump_event` query values.
+///
+/// A valid `jump_event` wins over `event_page`. A non-numeric `event_page`
+/// or `jump_event` does not abort the page (issue #1627). Each degrades on
+/// its own and reports the bad value. A typo in one field never costs the
+/// operator the other field, or the rest of the page.
+///
+/// A valid `jump_event` also suppresses a bad `event_page`'s error.
+/// `jump_event` alone decides the shown page in that case. Naming the
+/// `event_page` fallback would claim a page other than the one on screen
+/// (Codex review, PR #1652). `dag_detail_ui` applies the same suppression
+/// to `refresh` alongside a bad `node`.
+///
+/// Returns `(event_page, event_page_error, jump_event_error)`.
+fn resolve_workflow_detail_event_page(
+    event_page_raw: Option<&str>,
+    jump_event_raw: Option<&str>,
+    page_size: i64,
+) -> (i64, Option<String>, Option<String>) {
+    let (event_page_from_query, _event_page_raw, event_page_error) =
+        parse_page_query_field(event_page_raw);
+    let (jump_event, jump_event_error) = parse_jump_event_query_field(jump_event_raw);
+    let event_page = jump_event.map_or(event_page_from_query, |jump| {
+        // `saturating_sub`, not `-`: `jump` is unclamped user input, and
+        // `i64::MIN - 1` overflows. Saturating leaves `i64::MIN` itself,
+        // which `.max(0)` still clamps to 0 like any other very-negative
+        // jump_event (Snag repro, boundary tour on `jump_event`).
+        let jump_zero = jump.saturating_sub(1).max(0);
+        jump_zero / page_size
+    });
+    let event_page_error = if jump_event.is_some() {
+        None
+    } else {
+        event_page_error
+    };
+    (event_page, event_page_error, jump_event_error)
+}
+
 #[allow(clippy::too_many_lines)]
 async fn workflow_detail_ui(
     Extension(api_state): Extension<HarvestApiState>,
@@ -1255,12 +1604,11 @@ async fn workflow_detail_ui(
 
     // Resolve event_page before any DB queries so we can use OFFSET/LIMIT directly.
     let page_size = DETAIL_EVENT_PAGE_SIZE;
-    let event_page = if let Some(jump) = params.jump_event {
-        let jump_zero = (jump - 1).max(0);
-        jump_zero / page_size
-    } else {
-        params.event_page.unwrap_or(0).max(0)
-    };
+    let (event_page, event_page_error, jump_event_error) = resolve_workflow_detail_event_page(
+        params.event_page.as_deref(),
+        params.jump_event.as_deref(),
+        page_size,
+    );
 
     // Total event count — used for pagination controls.
     let total_events: i64 = harvest_events::table
@@ -1492,6 +1840,8 @@ async fn workflow_detail_ui(
         event_page,
         &blocked_on,
         params.flash.as_deref(),
+        event_page_error.as_deref(),
+        jump_event_error.as_deref(),
         continue_as_new_threshold,
         &WorkflowLogsPanelData {
             lines: &log_lines,
@@ -2019,6 +2369,37 @@ async fn signal_workflow_ui(
     Ok(axum::response::Redirect::to(&redirect_url).into_response())
 }
 
+/// Parse the "Reset to event N" field (1-based, matching the timeline "#"
+/// column) from its raw submitted text.
+///
+/// `WorkflowResetForm` types this field as `String`, not `i64`. axum's
+/// `Form` extractor runs `serde` deserialization before the handler body
+/// executes. A field typed directly as `i64` therefore rejects the whole
+/// request with a bare, unstyled 400 on a non-numeric value. No HTML
+/// renders, and the operator's entered reason is never read. That is the
+/// same page-abort mechanism #1333/#1378/#1420/#1437 fixed for the list
+/// pages' filter fields.
+///
+/// This form differs from those filters. It is not a filter; it is the
+/// runbook's destructive recovery action. Operators use it for a stuck
+/// child workflow or a non-determinism failure (`docs/vantage-ui.md`
+/// scenarios 3 and 4). Parsing here keeps a malformed value inside the
+/// handler. It then renders as the same flash-redirect error
+/// `signal_workflow_ui` already produces for an invalid JSON payload.
+///
+/// Range and existence validation — does this event id exist on this
+/// execution — stays downstream in `validate_reset_point`. This function
+/// rejects only text that is not a whole number.
+fn parse_reset_to_event_id(raw: &str) -> Result<i64, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("event number is required".to_string());
+    }
+    trimmed
+        .parse::<i64>()
+        .map_err(|_| format!("invalid event number '{trimmed}'; expected a whole number"))
+}
+
 async fn reset_workflow_ui(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
@@ -2038,22 +2419,29 @@ async fn reset_workflow_ui(
         .to_string();
 
     // The form shows 1-based event numbers (matching the timeline "#" column).
-    // The reset API accepts 0-based event IDs.
-    let reset_to_event_id = form.reset_to_event_id.saturating_sub(1);
-
-    let request = WorkflowResetRequest {
-        reset_to_event_id: Some(reset_to_event_id),
-        reset_point: None,
-        reason,
-        operator_id: actor.clone(),
-        signal_reapply: ResetSignalReapplyPolicy::default(),
-        allow_terminal_source: false,
-        refuse_erased_source: false,
+    // The reset API accepts 0-based event IDs. A malformed value is rejected
+    // here, inside the handler, instead of guessing an event number the
+    // operator never typed. This mirrors the reject-rather-than-guess rule
+    // #1437's bulk-action fix applied to a mutating endpoint.
+    let reset_result = match parse_reset_to_event_id(&form.reset_to_event_id) {
+        Ok(event_number) => {
+            let request = WorkflowResetRequest {
+                reset_to_event_id: Some(event_number.saturating_sub(1)),
+                reset_point: None,
+                reason,
+                operator_id: actor.clone(),
+                signal_reapply: ResetSignalReapplyPolicy::default(),
+                allow_terminal_source: false,
+                refuse_erased_source: false,
+            };
+            let runtime = api_state.runtime().ok();
+            let registry = runtime.as_ref().map(|r| r.registry().as_ref());
+            reset_workflow_execution(&mut conn, exec_id, request, registry)
+                .await
+                .map_err(|e| e.to_string())
+        }
+        Err(e) => Err(e),
     };
-
-    let runtime = api_state.runtime().ok();
-    let registry = runtime.as_ref().map(|r| r.registry().as_ref());
-    let reset_result = reset_workflow_execution(&mut conn, exec_id, request, registry).await;
     let (status, error_summary, flash) = match &reset_result {
         Ok(result) => (
             STATUS_SUCCEEDED,
@@ -2063,14 +2451,11 @@ async fn reset_workflow_ui(
                 result.new_exec_id
             )),
         ),
-        Err(e) => {
-            let msg = e.to_string();
-            (
-                STATUS_FAILED,
-                Some(msg.clone()),
-                url_encode(&format!("Reset failed: {msg}")),
-            )
-        }
+        Err(msg) => (
+            STATUS_FAILED,
+            Some(msg.clone()),
+            url_encode(&format!("Reset failed: {msg}")),
+        ),
     };
     let _ = insert_audit(
         &mut conn,
@@ -2144,13 +2529,15 @@ async fn trigger_update_ui(
     let ui_metrics = ui_runtime
         .as_ref()
         .map(|r| r.registry().telemetry().metrics.as_ref());
-    let (status, error_summary, flash) = match admit_update_event(
+    let ui_codecs = api_state.payload_codecs();
+    let (status, error_summary, flash) = match admit_update_event_with_codecs(
         &mut conn,
         exec_id,
         update_id,
         form.update_name.clone(),
         payload_json,
         ui_metrics,
+        &ui_codecs,
     )
     .await
     {
@@ -2215,11 +2602,22 @@ async fn list_dead_letters_ui(
     // Read-path payload decoding (issue #608): the page is admin-gated, so an
     // arriving request passes the same predicate the decoder re-checks.
     let decoder = read_path_decoder(&api_state, extension_session(maybe_session)).await;
-    let limit = params
-        .limit
-        .unwrap_or(DEFAULT_DLQ_PAGE_SIZE)
-        .clamp(1, MAX_PAGE_SIZE);
-    let page = params.page.unwrap_or(0).max(0);
+    // Issue: `page`/`limit` were still typed `Option<i64>` directly on
+    // `DeadLetterListParams`. That is the same page-abort mechanism
+    // #1540/#1560 already fixed on the Workflows and Workers pages. A
+    // non-numeric value on either reaches this struct through a
+    // hand-edited URL, a bookmarked link, or a mistyped "Per page".
+    // Any of those failed axum's own query deserialization with a bare
+    // 400. That 400 landed before this handler, or the filter form, ever
+    // ran. It discarded every filter (`workflow_name`, `task_kind`,
+    // `failed_after`, `failed_before`, `shard_id`) the operator had
+    // already entered. This is the DLQ page an operator is
+    // mid-incident-triage on, per docs/runbooks/harvest-alerts.md and
+    // seven other runbooks that point here. Degrade to a default and
+    // report the bad value inline instead.
+    let (limit, limit_raw, limit_error) =
+        parse_limit_query_field(params.limit.as_deref(), DEFAULT_DLQ_PAGE_SIZE);
+    let (page, _page_raw, page_error) = parse_page_query_field(params.page.as_deref());
     let offset = page.saturating_mul(limit);
     let (filters, filter_raw) = parse_dead_letter_ui_filters(
         params.workflow_name.as_deref(),
@@ -2228,6 +2626,10 @@ async fn list_dead_letters_ui(
         params.failed_before.as_deref(),
         params.shard_id.as_deref(),
     );
+
+    // Same fix, `refresh` (issue #1604): reuses the DAG-detail page's own
+    // `parse_refresh_query_field` (issue #1630).
+    let (refresh, refresh_error) = parse_refresh_query_field(params.refresh.as_deref());
 
     let pool = api_state.storage_pool().map_err(map_error)?;
 
@@ -2239,7 +2641,10 @@ async fn list_dead_letters_ui(
             &filter_raw,
             params.group_by.as_deref(),
             limit,
-            params.refresh,
+            &limit_raw,
+            limit_error.as_deref(),
+            refresh,
+            refresh_error.as_deref(),
             params.flash.as_deref(),
         )
         .await;
@@ -2316,10 +2721,14 @@ async fn list_dead_letters_ui(
         is_multi_shard,
         page,
         limit,
+        &limit_raw,
         has_next,
         total_for_pagination,
-        params.refresh,
+        refresh,
+        refresh_error.as_deref(),
         params.flash.as_deref(),
+        limit_error.as_deref(),
+        page_error.as_deref(),
     ))
 }
 
@@ -2500,19 +2909,33 @@ async fn load_dead_letters_from_shards_for_ui(
                 let rows = query_dead_letters_for_ui(&mut conn, filters, limit)
                     .await
                     .map_err(|e| e.to_string())?;
+                // Deduplicated. Two dead letters can share one execution.
+                // An `unnest($1::uuid[])` id appearing twice would run the
+                // per-id LATERAL event lookup twice for that id. The rendered
+                // event count would double instead of staying capped at 10.
+                let exec_ids: Vec<uuid::Uuid> = rows
+                    .iter()
+                    .filter_map(|d| d.workflow_exec_id)
+                    .collect::<HashSet<_>>()
+                    .into_iter()
+                    .collect();
+                let (names, events) = load_dead_letter_details_batch(&mut conn, &exec_ids)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 let mut out = Vec::with_capacity(rows.len());
                 for dead_letter in rows {
-                    let workflow_name = load_dead_letter_workflow_name(&mut conn, &dead_letter)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    let events = load_dead_letter_events(&mut conn, &dead_letter)
-                        .await
-                        .map_err(|e| e.to_string())?;
+                    let workflow_name = dead_letter
+                        .workflow_exec_id
+                        .and_then(|id| names.get(&id).cloned());
+                    let row_events = dead_letter
+                        .workflow_exec_id
+                        .and_then(|id| events.get(&id).cloned())
+                        .unwrap_or_default();
                     out.push(DeadLetterUiRow {
                         shard_id,
                         dead_letter,
                         workflow_name,
-                        events,
+                        events: row_events,
                     });
                 }
                 Ok(out)
@@ -2601,39 +3024,71 @@ async fn count_dead_letters_for_ui(
     query.count().get_result(conn).await.map_err(database_error)
 }
 
-async fn load_dead_letter_workflow_name(
+/// Batched replacement for two lookups this function used to run once per
+/// dead letter in a page (`load_dead_letter_workflow_name` and
+/// `load_dead_letter_events`). A page holds up to `MAX_PAGE_SIZE` (200) rows.
+/// The old shape issued up to 400 extra round trips per page load. Each
+/// round trip was cheap alone, an index lookup or less. The count stayed
+/// invisible in a buffer-ranked profile and dominant in a calls-ranked one.
+///
+/// Returns `(workflow_name_by_exec_id, last_10_events_by_exec_id)`. A dead
+/// letter absent from a map had no matching row. That matches the `None` or
+/// empty `Vec` the old per-row functions returned for the same case.
+async fn load_dead_letter_details_batch(
     conn: &mut AsyncPgConnection,
-    dead_letter: &DeadLetter,
-) -> HarvestResult<Option<String>> {
-    let Some(exec_id) = dead_letter.workflow_exec_id else {
-        return Ok(None);
-    };
-    harvest_workflow_executions::table
-        .find(exec_id)
-        .select(harvest_workflow_executions::workflow_name)
-        .first(conn)
-        .await
-        .optional()
-        .map_err(database_error)
-}
+    exec_ids: &[uuid::Uuid],
+) -> HarvestResult<(
+    HashMap<uuid::Uuid, String>,
+    HashMap<uuid::Uuid, Vec<HarvestEvent>>,
+)> {
+    if exec_ids.is_empty() {
+        return Ok((HashMap::new(), HashMap::new()));
+    }
 
-async fn load_dead_letter_events(
-    conn: &mut AsyncPgConnection,
-    dead_letter: &DeadLetter,
-) -> HarvestResult<Vec<HarvestEvent>> {
-    let Some(exec_id) = dead_letter.workflow_exec_id else {
-        return Ok(Vec::new());
-    };
-    let mut events = harvest_events::table
-        .filter(harvest_events::workflow_exec_id.eq(exec_id))
-        .order(harvest_events::event_id.desc())
-        .limit(10)
-        .select(HarvestEvent::as_select())
-        .load(conn)
+    let names: HashMap<uuid::Uuid, String> = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::id.eq_any(exec_ids))
+        .select((
+            harvest_workflow_executions::id,
+            harvest_workflow_executions::workflow_name,
+        ))
+        .load::<(uuid::Uuid, String)>(conn)
         .await
-        .map_err(database_error)?;
-    events.reverse();
-    Ok(events)
+        .map_err(database_error)?
+        .into_iter()
+        .collect();
+
+    // One `LATERAL`-per-id "last 10" query instead of N separate
+    // `ORDER BY ... LIMIT 10` queries. Each `LATERAL` subquery uses the
+    // same `idx_harvest_events_exec (workflow_exec_id, event_id)` index
+    // the old per-row query relied on. The outer `ORDER BY` groups each
+    // id's rows in ascending `event_id` order already, so no per-group
+    // reverse step is needed here. The old function fetched descending
+    // order and reversed each group in Rust instead.
+    let rows: Vec<HarvestEvent> = diesel::sql_query(
+        "SELECT e.id, e.workflow_exec_id, e.event_id, e.event_type, e.event_data, e.timestamp \
+         FROM unnest($1::uuid[]) AS w(exec_id) \
+         CROSS JOIN LATERAL ( \
+             SELECT * FROM harvest_events \
+             WHERE workflow_exec_id = w.exec_id \
+             ORDER BY event_id DESC \
+             LIMIT 10 \
+         ) e \
+         ORDER BY e.workflow_exec_id, e.event_id",
+    )
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(exec_ids)
+    .load(conn)
+    .await
+    .map_err(database_error)?;
+
+    let mut events: HashMap<uuid::Uuid, Vec<HarvestEvent>> = HashMap::new();
+    for event in rows {
+        events
+            .entry(event.workflow_exec_id)
+            .or_default()
+            .push(event);
+    }
+
+    Ok((names, events))
 }
 
 // ---------------------------------------------------------------------------
@@ -2664,11 +3119,24 @@ async fn list_workers_ui(
     let (shard_filter, shard_raw, shard_error) =
         parse_shard_id_filter("shard", params.shard.as_deref());
 
-    let limit = params
-        .limit
-        .unwrap_or(DEFAULT_PAGE_SIZE)
-        .clamp(1, MAX_PAGE_SIZE);
-    let page = params.page.unwrap_or(0).max(0);
+    // Issue: `page`/`limit` were still typed `Option<i64>` directly on
+    // `WorkerListParams` — the two fields left over after status/stale/shard
+    // above got this same fix. A non-numeric value on either reaches this
+    // struct through a hand-edited URL or a bookmarked link past the
+    // current worker count. A pasted "Per page" value reaches it too. Any
+    // of those failed axum's own query deserialization with a bare 400.
+    // That happened before the filter form or any worker row rendered. It
+    // discarded every other filter the operator had already entered. Same
+    // fix as `parse_page_query_field`/`parse_limit_query_field` on the
+    // Workflows page (#1540): degrade to a default and report the bad
+    // value inline instead of aborting the page.
+    let (limit, limit_raw, limit_error) =
+        parse_limit_query_field(params.limit.as_deref(), DEFAULT_PAGE_SIZE);
+    let (page, _page_raw, page_error) = parse_page_query_field(params.page.as_deref());
+
+    // Same fix, `refresh` (issue #1604): reuses the DAG-detail page's own
+    // `parse_refresh_query_field` (issue #1630).
+    let (refresh, refresh_error) = parse_refresh_query_field(params.refresh.as_deref());
     let offset = page.saturating_mul(limit);
 
     let stale_threshold = api_state.worker_stale_threshold();
@@ -2766,7 +3234,11 @@ async fn list_workers_ui(
         &stale_raw,
         stale_error.as_deref(),
         build_id_filter,
-        params.refresh,
+        refresh,
+        refresh_error.as_deref(),
+        &limit_raw,
+        limit_error.as_deref(),
+        page_error.as_deref(),
     ))
 }
 
@@ -3177,19 +3649,26 @@ fn render_dead_letters_page(
     is_multi_shard: bool,
     page: i64,
     limit: i64,
+    limit_raw: &str,
     has_next: bool,
     total_matching: usize,
     refresh: Option<u64>,
+    refresh_error: Option<&str>,
     flash: Option<&str>,
+    limit_error: Option<&str>,
+    page_error: Option<&str>,
 ) -> Markup {
     let body = html! {
         h2 { "Dead Letters" }
         @if let Some(message) = flash {
             div.flash role="status" tabindex="-1" autofocus { (message) }
         }
-        (render_dead_letter_view_toggle(filters, filter_raw, limit, refresh, None, false))
-        (render_dead_letter_filters(filters, filter_raw, limit, refresh))
-        (render_dead_letter_bulk_actions(filters, filter_raw, limit, refresh, total_matching))
+        @if let Some(error) = refresh_error {
+            span.field-error role="alert" { (error) }
+        }
+        (render_dead_letter_view_toggle(filters, filter_raw, limit, limit_raw, refresh, None, false))
+        (render_dead_letter_filters(filters, filter_raw, limit, limit_raw, limit_error, refresh))
+        (render_dead_letter_bulk_actions(filters, filter_raw, limit, limit_raw, refresh, total_matching))
 
         @if rows.is_empty() && shard_errors.is_empty() {
             div.card.empty {
@@ -3211,10 +3690,10 @@ fn render_dead_letters_page(
                 }
             }
 
-            (render_dead_letter_table(rows, filters, filter_raw, limit, refresh))
+            (render_dead_letter_table(rows, filters, filter_raw, limit, limit_raw, refresh))
         }
 
-        (render_dead_letter_pagination(page, limit, has_next, filters, filter_raw, refresh))
+        (render_dead_letter_pagination(page, limit, limit_raw, has_next, filters, filter_raw, refresh, page_error))
     };
 
     // `dead_letter_return_to_path` deliberately excludes `page`. It names
@@ -3227,7 +3706,7 @@ fn render_dead_letters_page(
     // reusing that path (found in review, PR #1396).
     let refresh_target = format!(
         "../ui/dead-letters?page={page}{}",
-        build_dead_letter_query_string(limit, filters, filter_raw, refresh)
+        build_dead_letter_query_string(limit, limit_raw, filters, filter_raw, refresh)
     );
     layout_dead_letters("Dead Letters · Vantage", &body, refresh, &refresh_target)
 }
@@ -3245,7 +3724,10 @@ async fn render_dead_letters_summary_view(
     filter_raw: &DeadLetterUiFilterRaw,
     group_by_raw: Option<&str>,
     limit: i64,
+    limit_raw: &str,
+    limit_error: Option<&str>,
     refresh: Option<u64>,
+    refresh_error: Option<&str>,
     flash: Option<&str>,
 ) -> Result<Markup, AutumnError> {
     let group_by = parse_dlq_summary_group_by(group_by_raw)?;
@@ -3277,9 +3759,12 @@ async fn render_dead_letters_summary_view(
         @if let Some(message) = flash {
             div.flash role="status" tabindex="-1" autofocus { (message) }
         }
-        (render_dead_letter_view_toggle(filters, filter_raw, limit, refresh, Some(&group_by_value), true))
-        (render_dead_letter_filters(filters, filter_raw, limit, refresh))
-        (render_dlq_summary_group_by_form(filters, filter_raw, limit, refresh, &group_by))
+        @if let Some(error) = refresh_error {
+            span.field-error role="alert" { (error) }
+        }
+        (render_dead_letter_view_toggle(filters, filter_raw, limit, limit_raw, refresh, Some(&group_by_value), true))
+        (render_dead_letter_filters(filters, filter_raw, limit, limit_raw, limit_error, refresh))
+        (render_dlq_summary_group_by_form(filters, filter_raw, limit, limit_raw, refresh, &group_by))
 
         @for (shard_id, error) in &shard_errors {
             div.shard-error {
@@ -3299,7 +3784,7 @@ async fn render_dead_letters_summary_view(
                 }
             }
         } @else {
-            (render_dlq_summary_table(&response, &group_by, filters, filter_raw, limit, refresh))
+            (render_dlq_summary_table(&response, &group_by, filters, filter_raw, limit, limit_raw, refresh))
         }
     };
 
@@ -3310,7 +3795,7 @@ async fn render_dead_letters_summary_view(
     };
     let refresh_target = format!(
         "../ui/dead-letters?view=summary{}{group_by_query}",
-        build_dead_letter_query_string(limit, filters, filter_raw, refresh)
+        build_dead_letter_query_string(limit, limit_raw, filters, filter_raw, refresh)
     );
     Ok(layout_dead_letters(
         "Dead Letters · Summary · Vantage",
@@ -3405,11 +3890,12 @@ fn render_dead_letter_view_toggle(
     filters: &DeadLetterUiFilters,
     filter_raw: &DeadLetterUiFilterRaw,
     limit: i64,
+    limit_raw: &str,
     refresh: Option<u64>,
     group_by_value: Option<&str>,
     summary_active: bool,
 ) -> Markup {
-    let base = build_dead_letter_query_string(limit, filters, filter_raw, refresh);
+    let base = build_dead_letter_query_string(limit, limit_raw, filters, filter_raw, refresh);
     let list_href = if base.is_empty() {
         "dead-letters".to_string()
     } else {
@@ -3438,6 +3924,7 @@ fn render_dlq_summary_group_by_form(
     filters: &DeadLetterUiFilters,
     filter_raw: &DeadLetterUiFilterRaw,
     limit: i64,
+    limit_raw: &str,
     refresh: Option<u64>,
     selected: &[autumn_harvest::dlq::DlqGroupDimension],
 ) -> Markup {
@@ -3464,7 +3951,13 @@ fn render_dlq_summary_group_by_form(
         form.filters method="get" action="dead-letters" {
             input type="hidden" name="view" value="summary";
             (render_dead_letter_hidden_filters_raw(filters, filter_raw))
-            @if limit != DEFAULT_DLQ_PAGE_SIZE {
+            // Prefer `limit_raw` (non-empty only on a genuine parse
+            // failure). An unresolved invalid limit then survives this
+            // resubmission instead of silently reverting. Same reasoning
+            // as `build_dead_letter_query_string`.
+            @if !limit_raw.is_empty() {
+                input type="hidden" name="limit" value=(limit_raw);
+            } @else if limit != DEFAULT_DLQ_PAGE_SIZE {
                 input type="hidden" name="limit" value=(limit);
             }
             @if let Some(refresh) = refresh {
@@ -3505,6 +3998,7 @@ fn render_dlq_summary_table(
     filters: &DeadLetterUiFilters,
     filter_raw: &DeadLetterUiFilterRaw,
     limit: i64,
+    limit_raw: &str,
     refresh: Option<u64>,
 ) -> Markup {
     html! {
@@ -3552,7 +4046,7 @@ fn render_dlq_summary_table(
                             @if is_other {
                                 "—"
                             } @else {
-                                @let (href, partial) = dlq_summary_drilldown_href(&group.key, group_by, filters, filter_raw, limit, refresh);
+                                @let (href, partial) = dlq_summary_drilldown_href(&group.key, group_by, filters, filter_raw, limit, limit_raw, refresh);
                                 a href=(href) title=[partial.then_some("Some dimensions have no list-view filter — results may include extra rows from other groups")] {
                                     @if partial {
                                         "View entries (partial filter) →"
@@ -3590,6 +4084,7 @@ fn dlq_summary_drilldown_href(
     filters: &DeadLetterUiFilters,
     filter_raw: &DeadLetterUiFilterRaw,
     limit: i64,
+    limit_raw: &str,
     refresh: Option<u64>,
 ) -> (String, bool) {
     use autumn_harvest::dlq::DlqGroupDimension;
@@ -3641,7 +4136,7 @@ fn dlq_summary_drilldown_href(
         }
     }
 
-    let query = build_dead_letter_query_string(limit, &drill, &drill_raw, refresh);
+    let query = build_dead_letter_query_string(limit, limit_raw, &drill, &drill_raw, refresh);
     let href = if query.is_empty() {
         "dead-letters".to_string()
     } else {
@@ -3654,11 +4149,21 @@ fn render_dead_letter_filters(
     filters: &DeadLetterUiFilters,
     filter_raw: &DeadLetterUiFilterRaw,
     limit: i64,
+    limit_raw: &str,
+    limit_error: Option<&str>,
     refresh: Option<u64>,
 ) -> Markup {
     let workflow_name = filters.workflow_name.as_deref().unwrap_or("");
     let task_kind = filters.task_kind.map(DeadLetterTaskKind::as_label);
     let refresh_value = refresh.map(|secs| secs.to_string()).unwrap_or_default();
+    // Echo exactly what the operator typed on a parse failure, matching the
+    // Workflows and Workers pages' `render_filters`/`render_worker_filters`.
+    // Falls back to the resolved value when the field was absent or valid.
+    let limit_value = if limit_raw.is_empty() {
+        limit.to_string()
+    } else {
+        limit_raw.to_string()
+    };
 
     html! {
         form.filters method="get" action="dead-letters" {
@@ -3707,7 +4212,15 @@ fn render_dead_letter_filters(
             }
             label {
                 "Per page"
-                input type="number" name="limit" min="1" max=(MAX_PAGE_SIZE) value=(limit);
+                // `type="text"`, not `type="number"`. A number input
+                // sanitizes an invalid value (e.g. "not-a-number") to blank
+                // at render time. The operator could then never see or
+                // correct their own bad input. Matches the Workflows and
+                // Workers pages' "Per page" fields.
+                input type="text" inputmode="numeric" pattern="[0-9]*" name="limit" value=(limit_value);
+                @if let Some(error) = limit_error {
+                    span.field-error role="alert" { (error) }
+                }
             }
             label {
                 "Refresh"
@@ -3730,10 +4243,11 @@ fn render_dead_letter_bulk_actions(
     filters: &DeadLetterUiFilters,
     filter_raw: &DeadLetterUiFilterRaw,
     limit: i64,
+    limit_raw: &str,
     refresh: Option<u64>,
     total_matching: usize,
 ) -> Markup {
-    let return_to = dead_letter_return_to_path(filters, filter_raw, limit, refresh);
+    let return_to = dead_letter_return_to_path(filters, filter_raw, limit, limit_raw, refresh);
     let action_limit = dead_letter_bulk_action_limit(total_matching);
     let replay_label = dead_letter_bulk_action_label("Replay", action_limit, total_matching);
     let discard_label = dead_letter_bulk_action_label("Discard", action_limit, total_matching);
@@ -3790,9 +4304,10 @@ fn render_dead_letter_table(
     filters: &DeadLetterUiFilters,
     filter_raw: &DeadLetterUiFilterRaw,
     limit: i64,
+    limit_raw: &str,
     refresh: Option<u64>,
 ) -> Markup {
-    let return_to = dead_letter_return_to_path(filters, filter_raw, limit, refresh);
+    let return_to = dead_letter_return_to_path(filters, filter_raw, limit, limit_raw, refresh);
     html! {
         table {
             thead {
@@ -3965,16 +4480,22 @@ fn render_dead_letter_hidden_filters(filters: &DeadLetterUiFilters) -> Markup {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_dead_letter_pagination(
     page: i64,
     limit: i64,
+    limit_raw: &str,
     has_next: bool,
     filters: &DeadLetterUiFilters,
     filter_raw: &DeadLetterUiFilterRaw,
     refresh: Option<u64>,
+    page_error: Option<&str>,
 ) -> Markup {
-    let base = build_dead_letter_query_string(limit, filters, filter_raw, refresh);
+    let base = build_dead_letter_query_string(limit, limit_raw, filters, filter_raw, refresh);
     html! {
+        @if let Some(error) = page_error {
+            span.field-error role="alert" { (error) }
+        }
         div.pagination {
             @if page > 0 {
                 a href={ "dead-letters?page=" (page - 1) (PreEscaped(&base)) } {
@@ -3999,12 +4520,20 @@ fn render_dead_letter_pagination(
 
 fn build_dead_letter_query_string(
     limit: i64,
+    limit_raw: &str,
     filters: &DeadLetterUiFilters,
     filter_raw: &DeadLetterUiFilterRaw,
     refresh: Option<u64>,
 ) -> String {
     let mut out = String::new();
-    if limit != DEFAULT_DLQ_PAGE_SIZE {
+    // `limit_raw` is non-empty only on a genuine parse failure (see
+    // `parse_limit_query_field`), never for a valid-but-clamped value. An
+    // invalid limit the operator has not yet corrected must not silently
+    // vanish from a Next/Previous link. Same as the Workflows/Workers
+    // pages' own query-string builders.
+    if !limit_raw.is_empty() {
+        let _ = write!(out, "&limit={}", url_encode(limit_raw));
+    } else if limit != DEFAULT_DLQ_PAGE_SIZE {
         let _ = write!(out, "&limit={limit}");
     }
     if let Some(workflow_name) = filters.workflow_name.as_deref() {
@@ -4045,9 +4574,10 @@ fn dead_letter_return_to_path(
     filters: &DeadLetterUiFilters,
     filter_raw: &DeadLetterUiFilterRaw,
     limit: i64,
+    limit_raw: &str,
     refresh: Option<u64>,
 ) -> String {
-    let query = build_dead_letter_query_string(limit, filters, filter_raw, refresh);
+    let query = build_dead_letter_query_string(limit, limit_raw, filters, filter_raw, refresh);
     if query.is_empty() {
         "../ui/dead-letters".to_string()
     } else {
@@ -4156,11 +4686,19 @@ fn render_workers_page(
     stale_error: Option<&str>,
     build_id_filter: Option<&str>,
     refresh: Option<u64>,
+    refresh_error: Option<&str>,
+    limit_raw: &str,
+    limit_error: Option<&str>,
+    page_error: Option<&str>,
 ) -> Markup {
     let total_workers: usize = grouped.iter().map(|(_, rows)| rows.len()).sum();
 
     let body = html! {
         h2 { "Workers" }
+
+        @if let Some(error) = refresh_error {
+            span.field-error role="alert" { (error) }
+        }
 
         // Fleet health banner
         (render_fleet_banner(stats, banner_state))
@@ -4169,7 +4707,7 @@ fn render_workers_page(
         (render_paused_queues_banner(&paused_queues.rows, &paused_queues.unreadable_shards))
 
         // Filters
-        (render_worker_filters(status_filter, status_raw, status_error, shard_raw, shard_error, stale_only, stale_raw, stale_error, build_id_filter, limit))
+        (render_worker_filters(status_filter, status_raw, status_error, shard_raw, shard_error, stale_only, stale_raw, stale_error, build_id_filter, limit, limit_raw, limit_error))
 
         // Worker table (grouped by shard if multi-shard)
         @if total_workers == 0 && shard_errors.is_empty() {
@@ -4202,7 +4740,7 @@ fn render_workers_page(
             }
         }
 
-        (render_worker_pagination(page, limit, has_next, status_raw, shard_raw, stale_raw, build_id_filter))
+        (render_worker_pagination(page, limit, limit_raw, has_next, status_raw, shard_raw, stale_raw, build_id_filter, page_error))
     };
 
     layout_workers("Workers · Vantage", &body, refresh)
@@ -4296,8 +4834,18 @@ fn render_worker_filters(
     stale_error: Option<&str>,
     build_id_filter: Option<&str>,
     limit: i64,
+    limit_raw: &str,
+    limit_error: Option<&str>,
 ) -> Markup {
     let build_id_value = build_id_filter.unwrap_or("");
+    // Echo exactly what the operator typed on a parse failure, matching the
+    // Workflows page's `render_filters`. Fall back to the resolved value
+    // when the field was absent or already valid.
+    let limit_value = if limit_raw.is_empty() {
+        limit.to_string()
+    } else {
+        limit_raw.to_string()
+    };
     html! {
         form.filters method="get" action="workers" {
             label {
@@ -4346,7 +4894,16 @@ fn render_worker_filters(
             }
             label {
                 "Per page"
-                input type="number" name="limit" min="1" max=(MAX_PAGE_SIZE) value=(limit);
+                // `type="text"`, not `type="number"`. A number input
+                // sanitizes an invalid value (e.g. "not-a-number") to
+                // blank at render time. The operator could then never see
+                // or correct their own bad input. Matches the Workflows
+                // page's "Per page" field and this page's own `shard`
+                // filter.
+                input type="text" inputmode="numeric" pattern="[0-9]*" name="limit" value=(limit_value);
+                @if let Some(error) = limit_error {
+                    span.field-error role="alert" { (error) }
+                }
             }
             button type="submit" { "Apply" }
             a.reset href="workers" { "Reset" }
@@ -4354,17 +4911,30 @@ fn render_worker_filters(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_worker_pagination(
     page: i64,
     limit: i64,
+    limit_raw: &str,
     has_next: bool,
     status_raw: &str,
     shard_raw: &str,
     stale_raw: &str,
     build_id_filter: Option<&str>,
+    page_error: Option<&str>,
 ) -> Markup {
-    let base = build_worker_query_string(limit, status_raw, shard_raw, stale_raw, build_id_filter);
+    let base = build_worker_query_string(
+        limit,
+        limit_raw,
+        status_raw,
+        shard_raw,
+        stale_raw,
+        build_id_filter,
+    );
     html! {
+        @if let Some(error) = page_error {
+            span.field-error role="alert" { (error) }
+        }
         div.pagination {
             @if page > 0 {
                 a href={ "workers?page=" (page - 1) (PreEscaped(&base)) } {
@@ -4389,13 +4959,21 @@ fn render_worker_pagination(
 
 fn build_worker_query_string(
     limit: i64,
+    limit_raw: &str,
     status_raw: &str,
     shard_raw: &str,
     stale_raw: &str,
     build_id_filter: Option<&str>,
 ) -> String {
     let mut out = String::new();
-    if limit != DEFAULT_PAGE_SIZE {
+    // `limit_raw` is non-empty only on a genuine parse failure (see
+    // `parse_limit_query_field`), never for a valid-but-clamped value. An
+    // invalid limit the operator has not yet corrected must not silently
+    // vanish from a Next/Previous link — same as the Workflows page's
+    // `build_query_string`.
+    if !limit_raw.is_empty() {
+        let _ = write!(out, "&limit={}", url_encode(limit_raw));
+    } else if limit != DEFAULT_PAGE_SIZE {
         let _ = write!(out, "&limit={limit}");
     }
     // Carry the raw text (not the parsed value) so an invalid value's inline
@@ -4497,6 +5075,9 @@ fn render_workflow_list(
     exec_id_search: Option<&str>,
     active_gate_count: usize,
     unavailable_shards: &[UnavailableShard],
+    limit_raw: &str,
+    limit_error: Option<&str>,
+    page_error: Option<&str>,
 ) -> Markup {
     // Issue #756: name the unreachable shard(s) so a partial list is not read
     // as the authoritative fleet state.
@@ -4533,7 +5114,7 @@ fn render_workflow_list(
             }
         }
 
-        (render_filters(state_filter, workflow_name_filter, search_attr_filter, started_after_raw, started_after_error, started_before_raw, started_before_error, exec_id_search, limit))
+        (render_filters(state_filter, workflow_name_filter, search_attr_filter, started_after_raw, started_after_error, started_before_raw, started_before_error, exec_id_search, limit, limit_raw, limit_error))
 
         @if workflows.is_empty() {
             div.card.empty { "No workflows match this filter." }
@@ -4567,7 +5148,7 @@ fn render_workflow_list(
             }
         }
 
-        (render_pagination(page, limit, has_next, state_filter, workflow_name_filter, search_attr_filter, started_after_raw, started_before_raw, exec_id_search))
+        (render_pagination(page, limit, limit_raw, has_next, state_filter, workflow_name_filter, search_attr_filter, started_after_raw, started_before_raw, exec_id_search, page_error))
     };
 
     layout("Workflows · Vantage", &body, "")
@@ -4584,11 +5165,21 @@ fn render_filters(
     started_before_error: Option<&str>,
     exec_id_search: Option<&str>,
     limit: i64,
+    limit_raw: &str,
+    limit_error: Option<&str>,
 ) -> Markup {
     let (attr_key, attr_value) =
         search_attr_filter.map_or(("", ""), |(k, v)| (k.as_str(), v.as_str()));
     let workflow_name_value = workflow_name_filter.unwrap_or("");
     let exec_id_search_value = exec_id_search.unwrap_or("");
+    // Echo exactly what the operator typed on a parse failure, matching
+    // `started_after`/`started_before`. Fall back to the resolved value
+    // when the field was absent or already valid.
+    let limit_value = if limit_raw.is_empty() {
+        limit.to_string()
+    } else {
+        limit_raw.to_string()
+    };
 
     html! {
         form.filters method="get" action="workflows" {
@@ -4638,7 +5229,16 @@ fn render_filters(
             }
             label {
                 "Per page"
-                input type="number" name="limit" min="1" max=(MAX_PAGE_SIZE) value=(limit);
+                // `type="text"`, not `type="number"`. A number input
+                // sanitizes an invalid value (e.g. "not-a-number") to
+                // blank at render time. The operator could then never see
+                // or correct their own bad input. This matches the Workers
+                // page's `shard` filter, the other redisplayable numeric
+                // field in this file.
+                input type="text" inputmode="numeric" pattern="[0-9]*" name="limit" value=(limit_value);
+                @if let Some(error) = limit_error {
+                    span.field-error role="alert" { (error) }
+                }
             }
             button type="submit" { "Apply" }
             a.reset href="workflows" { "Reset" }
@@ -4650,6 +5250,7 @@ fn render_filters(
 fn render_pagination(
     page: i64,
     limit: i64,
+    limit_raw: &str,
     has_next: bool,
     state_filter: Option<&str>,
     workflow_name_filter: Option<&str>,
@@ -4657,9 +5258,11 @@ fn render_pagination(
     started_after_raw: &str,
     started_before_raw: &str,
     exec_id_search: Option<&str>,
+    page_error: Option<&str>,
 ) -> Markup {
     let base_query = build_query_string(
         limit,
+        limit_raw,
         state_filter,
         workflow_name_filter,
         search_attr_filter,
@@ -4669,6 +5272,9 @@ fn render_pagination(
     );
 
     html! {
+        @if let Some(error) = page_error {
+            span.field-error role="alert" { (error) }
+        }
         div.pagination {
             @if page > 0 {
                 a href={ "workflows?page=" (page - 1) (PreEscaped(&base_query)) } {
@@ -4694,6 +5300,7 @@ fn render_pagination(
 #[allow(clippy::too_many_arguments)]
 fn build_query_string(
     limit: i64,
+    limit_raw: &str,
     state_filter: Option<&str>,
     workflow_name_filter: Option<&str>,
     search_attr_filter: Option<&(String, String)>,
@@ -4702,7 +5309,14 @@ fn build_query_string(
     exec_id_search: Option<&str>,
 ) -> String {
     let mut out = String::new();
-    if limit != DEFAULT_PAGE_SIZE {
+    // `limit_raw` is non-empty only on a genuine parse failure (see
+    // `parse_limit_query_field`), never for a valid-but-clamped value. An
+    // invalid limit the operator has not yet corrected must not silently
+    // vanish from a Next/Previous link, the same carry-through as
+    // `started_after`/`started_before` below.
+    if !limit_raw.is_empty() {
+        let _ = write!(out, "&limit={}", url_encode(limit_raw));
+    } else if limit != DEFAULT_PAGE_SIZE {
         let _ = write!(out, "&limit={limit}");
     }
     if let Some(state) = state_filter {
@@ -4939,6 +5553,8 @@ fn render_workflow_detail(
     event_page: i64,
     blocked_on: &BlockedOnData,
     flash: Option<&str>,
+    event_page_error: Option<&str>,
+    jump_event_error: Option<&str>,
     continue_as_new_threshold: Option<u64>,
     logs: &WorkflowLogsPanelData<'_>,
 ) -> Markup {
@@ -5002,6 +5618,13 @@ fn render_workflow_detail(
 
         @if let Some(message) = flash {
             div.flash role="status" tabindex="-1" autofocus { (message) }
+        }
+
+        @if let Some(error) = event_page_error {
+            span.field-error role="alert" { (error) }
+        }
+        @if let Some(error) = jump_event_error {
+            span.field-error role="alert" { (error) }
         }
 
         @if let Some(error) = execution.error.as_deref() {
@@ -5358,9 +5981,11 @@ fn render_workflow_detail(
                         }
                         a href=(workflow_detail_href(last_page, selected_log_level)) { "Jump to latest" }
                         form method="get" style="display:inline-flex;gap:6px;align-items:center;margin-left:8px" {
-                            label style="font-size:12px;color:#94a3b8" { "Jump to event:" }
-                            input type="number" name="jump_event" min="1" max=(total_events) placeholder="N"
-                                style="width:70px;background:#1e293b;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:4px 6px;font-size:12px";
+                            label style="font-size:12px;color:#94a3b8;display:inline-flex;align-items:center;gap:6px" {
+                                "Jump to event:"
+                                input type="number" name="jump_event" min="1" max=(total_events) placeholder="N"
+                                    style="width:70px;background:#1e293b;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:4px 6px;font-size:12px";
+                            }
                             button type="submit" style="background:#2563eb;color:#fff;border:0;border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer" { "Go" }
                         }
                     }
@@ -6918,11 +7543,19 @@ fn render_dag_detail(
     selected_node: Option<usize>,
     refresh: Option<u64>,
     flash: Option<&str>,
+    node_error: Option<&str>,
+    refresh_error: Option<&str>,
     view: DagGraphView<'_>,
 ) -> Markup {
     let body = html! {
         @if let Some(message) = flash {
             div class="flash" role="status" tabindex="-1" autofocus { (message) }
+        }
+        @if let Some(error) = node_error {
+            span.field-error role="alert" { (error) }
+        }
+        @if let Some(error) = refresh_error {
+            span.field-error role="alert" { (error) }
         }
         h2 { "DAG " code { (dag_name) } " runs" }
         @if let Some(run_id) = selected_run {
@@ -7829,10 +8462,16 @@ type ShardScheduleResult = (ShardId, Result<Vec<HarvestSchedule>, String>);
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ScheduleListParams {
+    // `page`/`limit` are `String`, not `i64` — same fix as
+    // `WorkerListParams`, `WorkflowListParams` and `DeadLetterListParams`
+    // (#1540/#1560/#1588). An `i64`-typed field fails axum's query
+    // deserialization on non-numeric text with a bare 400 before this
+    // handler ever runs. That discards every other filter already on the
+    // URL.
     #[serde(default)]
-    page: Option<i64>,
+    page: Option<String>,
     #[serde(default)]
-    limit: Option<i64>,
+    limit: Option<String>,
     #[serde(default)]
     target: Option<String>,
     /// "Workflow", "Dag", or empty/absent for All.
@@ -7846,8 +8485,10 @@ pub(crate) struct ScheduleListParams {
     health: Option<String>,
     #[serde(default)]
     shard_id: Option<String>,
+    // `refresh` is `String`, not `u64` — same fix as `page`/`limit` above
+    // (issue #1604), reusing `parse_refresh_query_field` (issue #1630).
     #[serde(default)]
-    refresh: Option<u64>,
+    refresh: Option<String>,
     #[serde(default)]
     flash: Option<String>,
 }
@@ -7976,6 +8617,13 @@ const fn schedule_is_resumable(row: &HarvestSchedule) -> bool {
 /// `max_runs = 0` is **unlimited**, not "spent": the `max > 0` guard is the
 /// engine's convention at every bound check (and is pinned by
 /// `backfill_max_runs_zero_is_treated_as_unlimited`).
+///
+/// This check judges the `end_at` bound against the jitter-adjusted pending
+/// fire time, not the raw slot (issue #1293). The scheduler's own secondary
+/// `end_at` guard in `scheduler.rs` rejects a fire whose `effective_fire_time`
+/// is at or past `end_at`. It rejects the fire even when the raw slot is
+/// still before `end_at`. Reading the raw slot here would call such a row
+/// healthy until a tick happens to stamp `exhausted_at`.
 fn schedule_is_bounded_out(row: &HarvestSchedule, now: DateTime<Utc>) -> bool {
     if row.exhausted_at.is_some() {
         return true;
@@ -7995,10 +8643,13 @@ fn schedule_is_bounded_out(row: &HarvestSchedule, now: DateTime<Utc>) -> bool {
     // the cutoff is still legal and will be processed once the clock has passed
     // it (we would call it exhausted). Fall back to the wall clock only when
     // there is no pending slot to judge.
-    row.end_at.is_some_and(|end_at| {
-        row.next_run_at
-            .map_or(now >= end_at, |next_run_at| next_run_at >= end_at)
-    })
+    //
+    // `effective_fire_time` returns `None` for `jitter_secs <= 0`, so an
+    // unjittered schedule falls back to the raw slot below.
+    let pending = crate::api::effective_fire_time(row.id, row.next_run_at, row.jitter_secs)
+        .or(row.next_run_at);
+    row.end_at
+        .is_some_and(|end_at| pending.map_or(now >= end_at, |t| t >= end_at))
 }
 
 /// Derive a row's health flags. Pure: every badge, sort and summary decision on
@@ -8343,12 +8994,20 @@ async fn list_schedules_ui(
     Extension(api_state): Extension<HarvestApiState>,
     Query(params): Query<ScheduleListParams>,
 ) -> Result<Markup, AutumnError> {
-    let limit = params
-        .limit
-        .unwrap_or(DEFAULT_SCHEDULE_PAGE_SIZE)
-        .clamp(1, MAX_PAGE_SIZE);
-    let page = params.page.unwrap_or(0).max(0);
+    // `page`/`limit` used to `?`-propagate a bare 400 on a non-numeric
+    // value. That aborted the whole request before the filter form ever
+    // rendered. It is the same mechanism #1540/#1560/#1588 already fixed
+    // on the Workflows, Workers and DLQ pages. Degrade to a default and
+    // report the bad value inline instead, matching those pages' own
+    // `parse_page_query_field`/`parse_limit_query_field` use.
+    let (limit, limit_raw, limit_error) =
+        parse_limit_query_field(params.limit.as_deref(), DEFAULT_SCHEDULE_PAGE_SIZE);
+    let (page, _page_raw, page_error) = parse_page_query_field(params.page.as_deref());
     let offset = page.saturating_mul(limit);
+
+    // Same fix, `refresh` (issue #1604): reuses the DAG-detail page's own
+    // `parse_refresh_query_field` (issue #1630).
+    let (refresh, refresh_error) = parse_refresh_query_field(params.refresh.as_deref());
 
     // The page used to `?`-propagate each of these on a bad value. That
     // aborted the whole request with a bare 400 before the filter form
@@ -8436,12 +9095,16 @@ async fn list_schedules_ui(
         &decisions,
         page,
         limit,
+        &limit_raw,
         has_next,
         total_filtered,
         &unhealthy_summary,
         &distribution,
-        params.refresh,
+        refresh,
+        refresh_error.as_deref(),
         params.flash.as_deref(),
+        limit_error.as_deref(),
+        page_error.as_deref(),
     ))
 }
 
@@ -8863,27 +9526,25 @@ async fn execute_schedule_trigger_ui(
     // `dag_name`, which is also the key `DagInfo::as_workflow_info()`
     // registers a DAG's shadow `WorkflowInfo` under in `registry.workflows`.
     // So this ONE lookup already resolves both a workflow's AND a DAG's
-    // declared `sla`/`execution_timeout` (issue #743 review, PR #1141
-    // finding #6) -- the previous "DAGs have no SLA concept" framing predates
-    // DAG-level `sla`/`execution_timeout` support and only ever described the
-    // caller's mental model, not an actual code gap; `execution_timeout`
-    // itself was genuinely never resolved here, unlike `sla`.
-    let (sla, wf_default_retry_policy, execution_timeout) = runtime
+    // declared `sla`/`execution_timeout`.
+    let (raw_sla, wf_default_retry_policy, raw_execution_timeout) = runtime
         .registry()
         .workflows
         .get(workflow_name)
         .map_or((None, None, None), |info| {
-            (
-                crate::api::clamp_info_default_sla(info.sla, info.execution_timeout),
-                info.retry_policy.clone(),
-                info.execution_timeout
-                    .and_then(|d| chrono::Duration::from_std(d).ok()),
-            )
+            (info.sla, info.retry_policy.clone(), info.execution_timeout)
         });
-    let max_execution_timeout_ceiling = runtime
-        .registry()
-        .max_workflow_execution_timeout
-        .and_then(|d| chrono::Duration::from_std(d).ok());
+    let sla = crate::api::clamp_info_default_sla(raw_sla, raw_execution_timeout);
+    // Issue #1412: thread the declared execution_timeout and the fleet-wide
+    // ceiling via the same shared lookup the scheduler and DAG-backfill paths
+    // use. `raw_sla`/`raw_execution_timeout` above still separately feed the
+    // `sla` clamp -- `resolve_dispatch_deadline` returns an unclamped `sla`
+    // too, so it is discarded here.
+    let DispatchDeadline {
+        execution_timeout,
+        max_execution_timeout_ceiling,
+        ..
+    } = runtime.registry().resolve_dispatch_deadline(workflow_name);
     // Schedule-level retry_policy takes precedence over the workflow-type default,
     // mirroring the automated tick, backfill, and API trigger-now paths.
     let ui_trigger_retry_policy = row
@@ -8894,7 +9555,7 @@ async fn execute_schedule_trigger_ui(
 
     // Provenance ref for a manual UI schedule trigger is the schedule id (#740).
     let ui_schedule_id_str = row.id.to_string();
-    let result = start_or_load_workflow_execution_with_metrics(
+    let result = start_or_load_workflow_execution_with_metrics_and_codecs(
         conn,
         StartWorkflowParams {
             workflow_name,
@@ -8947,6 +9608,7 @@ async fn execute_schedule_trigger_ui(
         },
         Some(runtime.registry().telemetry().metrics.as_ref()),
         None,
+        runtime.registry().payload_codecs(),
     )
     .await;
     let (status, outcome) = if result.is_ok() {
@@ -9348,9 +10010,10 @@ fn schedule_return_to_path(
     filters: &ScheduleUiFilters,
     filter_raw: &ScheduleUiFilterRaw,
     limit: i64,
+    limit_raw: &str,
     refresh: Option<u64>,
 ) -> String {
-    let query = build_schedule_query_string(limit, filters, filter_raw, refresh);
+    let query = build_schedule_query_string(limit, limit_raw, filters, filter_raw, refresh);
     if query.is_empty() {
         "../schedules".to_string()
     } else {
@@ -9391,6 +10054,7 @@ fn render_schedules_page(
     decisions: &std::collections::HashMap<uuid::Uuid, Vec<ScheduleDecision>>,
     page: i64,
     limit: i64,
+    limit_raw: &str,
     has_next: bool,
     total_filtered: usize,
     // Unhealthy counts over the whole *filtered* set, not just this page: the
@@ -9399,7 +10063,10 @@ fn render_schedules_page(
     unhealthy_summary: &str,
     distribution: &str,
     refresh: Option<u64>,
+    refresh_error: Option<&str>,
     flash: Option<&str>,
+    limit_error: Option<&str>,
+    page_error: Option<&str>,
 ) -> Markup {
     // The "show only unhealthy" link forces `health=Unhealthy`, so it clears
     // any stale health error the same way it clears the parsed override.
@@ -9414,20 +10081,23 @@ fn render_schedules_page(
         @if let Some(message) = flash {
             div.flash role="status" tabindex="-1" autofocus { (message) }
         }
+        @if let Some(error) = refresh_error {
+            span.field-error role="alert" { (error) }
+        }
 
         @if !unhealthy_summary.is_empty() {
             div.card.unhealthy-summary role="status" {
                 strong { "Needs attention: " }
                 (unhealthy_summary)
                 " — "
-                a href={ "schedules?health=Unhealthy" (PreEscaped(&build_schedule_query_string(limit, &ScheduleUiFilters { health: ScheduleHealthFilter::All, ..filters.clone() }, &unhealthy_link_raw, refresh))) } {
+                a href={ "schedules?health=Unhealthy" (PreEscaped(&build_schedule_query_string(limit, limit_raw, &ScheduleUiFilters { health: ScheduleHealthFilter::All, ..filters.clone() }, &unhealthy_link_raw, refresh))) } {
                     "show only unhealthy"
                 }
             }
         }
 
-        (render_schedule_filters(filters, filter_raw, limit, refresh))
-        (render_schedule_bulk_actions(filters, filter_raw, limit, refresh, total_filtered, distribution))
+        (render_schedule_filters(filters, filter_raw, limit, limit_raw, limit_error, refresh))
+        (render_schedule_bulk_actions(filters, filter_raw, limit, limit_raw, refresh, total_filtered, distribution))
 
         @if rows.is_empty() && shard_errors.is_empty() {
             div.card.empty {
@@ -9453,7 +10123,7 @@ fn render_schedules_page(
             div."table-scroll" { (render_schedule_table(rows, is_multi_shard, decisions)) }
         }
 
-        (render_schedule_pagination(page, limit, has_next, filters, filter_raw, refresh))
+        (render_schedule_pagination(page, limit, limit_raw, has_next, filters, filter_raw, refresh, page_error))
     };
 
     // Auto-refresh must keep the operator on the page they were reading,
@@ -9463,7 +10133,7 @@ fn render_schedules_page(
     // back on page 0 without harm; a repeating reload cannot).
     let refresh_target = format!(
         "schedules?page={page}{}",
-        build_schedule_query_string(limit, filters, filter_raw, refresh)
+        build_schedule_query_string(limit, limit_raw, filters, filter_raw, refresh)
     );
     layout_schedules("Schedules · Vantage", &body, refresh, "", &refresh_target)
 }
@@ -9472,10 +10142,21 @@ fn render_schedule_filters(
     filters: &ScheduleUiFilters,
     filter_raw: &ScheduleUiFilterRaw,
     limit: i64,
+    limit_raw: &str,
+    limit_error: Option<&str>,
     refresh: Option<u64>,
 ) -> Markup {
     let target_val = filters.target.as_deref().unwrap_or("");
     let refresh_value = refresh.map(|s| s.to_string()).unwrap_or_default();
+    // Echo exactly what the operator typed on a parse failure, matching the
+    // Workflows/Workers/DLQ pages' own `render_filters`/
+    // `render_worker_filters`/`render_dead_letter_filters`. Falls back to
+    // the resolved value when the field was absent or valid.
+    let limit_value = if limit_raw.is_empty() {
+        limit.to_string()
+    } else {
+        limit_raw.to_string()
+    };
 
     html! {
         form.filters method="get" action="schedules" {
@@ -9534,7 +10215,15 @@ fn render_schedule_filters(
             }
             label {
                 "Per page"
-                input type="number" name="limit" min="1" max=(MAX_PAGE_SIZE) value=(limit);
+                // `type="text"`, not `type="number"`. A number input
+                // sanitizes an invalid value (e.g. "not-a-number") to blank
+                // at render time. The operator could then never see or
+                // correct their own bad input. Matches the Workflows,
+                // Workers and DLQ pages' "Per page" fields.
+                input type="text" inputmode="numeric" pattern="[0-9]*" name="limit" value=(limit_value);
+                @if let Some(error) = limit_error {
+                    span.field-error role="alert" { (error) }
+                }
             }
             label {
                 "Refresh"
@@ -9557,12 +10246,13 @@ fn render_schedule_bulk_actions(
     filters: &ScheduleUiFilters,
     filter_raw: &ScheduleUiFilterRaw,
     limit: i64,
+    limit_raw: &str,
     refresh: Option<u64>,
     total_matching: usize,
     distribution: &str,
 ) -> Markup {
-    let return_qs = build_schedule_query_string(limit, filters, filter_raw, refresh);
-    let return_to = schedule_return_to_path(filters, filter_raw, limit, refresh);
+    let return_qs = build_schedule_query_string(limit, limit_raw, filters, filter_raw, refresh);
+    let return_to = schedule_return_to_path(filters, filter_raw, limit, limit_raw, refresh);
     let dist_suffix = if distribution.is_empty() {
         String::new()
     } else {
@@ -9943,16 +10633,22 @@ fn schedule_state_badge(is_paused: bool) -> Markup {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_schedule_pagination(
     page: i64,
     limit: i64,
+    limit_raw: &str,
     has_next: bool,
     filters: &ScheduleUiFilters,
     filter_raw: &ScheduleUiFilterRaw,
     refresh: Option<u64>,
+    page_error: Option<&str>,
 ) -> Markup {
-    let base = build_schedule_query_string(limit, filters, filter_raw, refresh);
+    let base = build_schedule_query_string(limit, limit_raw, filters, filter_raw, refresh);
     html! {
+        @if let Some(error) = page_error {
+            span.field-error role="alert" { (error) }
+        }
         div.pagination {
             @if page > 0 {
                 a href={ "schedules?page=" (page - 1) (PreEscaped(&base)) } {
@@ -9975,12 +10671,20 @@ fn render_schedule_pagination(
 
 fn build_schedule_query_string(
     limit: i64,
+    limit_raw: &str,
     filters: &ScheduleUiFilters,
     filter_raw: &ScheduleUiFilterRaw,
     refresh: Option<u64>,
 ) -> String {
     let mut out = String::new();
-    if limit != DEFAULT_SCHEDULE_PAGE_SIZE {
+    // `limit_raw` is non-empty only on a genuine parse failure (see
+    // `parse_limit_query_field`), never for a valid-but-clamped value. An
+    // invalid limit the operator has not yet corrected must not silently
+    // vanish from a Next/Previous link. Same as the Workflows/Workers/DLQ
+    // pages' own query-string builders.
+    if !limit_raw.is_empty() {
+        let _ = write!(out, "&limit={}", url_encode(limit_raw));
+    } else if limit != DEFAULT_SCHEDULE_PAGE_SIZE {
         let _ = write!(out, "&limit={limit}");
     }
     if let Some(ref target) = filters.target {
@@ -10026,16 +10730,29 @@ fn build_schedule_query_string(
 /// Query parameters for the preview drill-down.
 #[derive(Debug, Deserialize)]
 pub(crate) struct SchedulePreviewUiParams {
-    /// Number of fire times to project. Clamped to 1..=100 by the API.
+    // `count` is `String`, not `usize`. Same fix as `page`/`limit` on the
+    // Workflows, Workers, DLQ and Schedules pages. Same fix as `node`/
+    // `refresh` on the DAG detail page (#1333/#1378/#1420/#1437/#1540/
+    // #1560/#1588/#1619/#1630). A numeric-typed field fails axum's query
+    // deserialization on non-numeric text. It fails with a bare 400 before
+    // this handler ever runs. That discards the whole preview page for a
+    // bookmarked or hand-edited `?count=` value. Clamped to 1..=100 by the
+    // API.
     #[serde(default)]
-    count: Option<usize>,
+    count: Option<String>,
 }
 
 /// Query parameters for the run-history drill-down.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ScheduleRunsUiParams {
+    // `limit` is `String`, not `i64`. Same fix as `count` above and as
+    // `page`/`limit` on the list pages (#1333/#1378/#1420/#1437/#1540/
+    // #1560/#1588/#1619). A numeric-typed field fails axum's query
+    // deserialization on non-numeric text. It fails with a bare 400 before
+    // this handler ever runs. That discards the `origin`/`state` filters
+    // already on the URL, along with everything else on the page.
     #[serde(default)]
-    limit: Option<i64>,
+    limit: Option<String>,
     #[serde(default)]
     cursor: Option<String>,
     #[serde(default)]
@@ -10053,6 +10770,11 @@ pub(crate) struct ScheduleRunsUiParams {
 #[derive(Debug, Clone, Default)]
 struct ScheduleRunsView {
     limit: Option<i64>,
+    /// The raw, unparsed `limit` text on a parse failure. Echoed back into
+    /// the "Rows" field so the operator's own bad input stays visible,
+    /// instead of silently reverting to blank. Empty when `limit` parsed
+    /// cleanly or was omitted.
+    limit_raw: String,
     origin: Option<String>,
     state: Option<String>,
 }
@@ -10061,7 +10783,15 @@ impl ScheduleRunsView {
     /// Query-string suffix (leading `&`) carrying the filters, for the next-page link.
     fn query_suffix(&self) -> String {
         let mut out = String::new();
-        if let Some(limit) = self.limit {
+        // Codex review finding on this PR: prefer `limit_raw` over `limit`
+        // when a parse failure left it set. Otherwise the Next link would
+        // drop the operator's bad text, and its `role="alert"` context,
+        // on the very click meant to keep their place. It would silently
+        // revert to the default instead of carrying the correction
+        // forward.
+        if !self.limit_raw.is_empty() {
+            let _ = write!(out, "&limit={}", url_encode(&self.limit_raw));
+        } else if let Some(limit) = self.limit {
             let _ = write!(out, "&limit={limit}");
         }
         if let Some(ref origin) = self.origin {
@@ -10108,10 +10838,7 @@ async fn schedule_preview_ui(
     Query(params): Query<SchedulePreviewUiParams>,
 ) -> Result<Markup, AutumnError> {
     let (row, shard_id) = load_schedule_for_drilldown(&api_state, &id_str).await?;
-    let count = params
-        .count
-        .unwrap_or(SCHEDULE_PREVIEW_DEFAULT_COUNT)
-        .clamp(1, 100);
+    let (count, count_error) = parse_schedule_preview_count_query_field(params.count.as_deref());
     // Pass the row through rather than the id: `compute_schedule_preview`'s own
     // lookup stops at the first unreachable shard, which would fail a preview
     // for a schedule the resilient resolver above already found on a later one.
@@ -10123,12 +10850,42 @@ async fn schedule_preview_ui(
     )
     .await?;
     Ok(render_schedule_preview_page(
-        &row, shard_id, &preview, count,
+        &row,
+        shard_id,
+        &preview,
+        count,
+        count_error.as_deref(),
     ))
 }
 
 /// Default number of projected fire times on the preview drill-down.
 const SCHEDULE_PREVIEW_DEFAULT_COUNT: usize = 10;
+
+/// Parses the preview page's `count` query parameter — how many fire times
+/// to project.
+///
+/// A non-numeric value falls back to [`SCHEDULE_PREVIEW_DEFAULT_COUNT`] and
+/// reports the bad value inline, instead of aborting the whole page. Same
+/// contract as [`parse_dag_node_query_field`]. This page has no form field
+/// backing `count` — it is link/URL-driven only. So the caller renders the
+/// error as a page-level notice, rather than next to a control.
+fn parse_schedule_preview_count_query_field(raw: Option<&str>) -> (usize, Option<String>) {
+    let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return (SCHEDULE_PREVIEW_DEFAULT_COUNT, None);
+    };
+    trimmed.parse::<usize>().map_or_else(
+        |_| {
+            (
+                SCHEDULE_PREVIEW_DEFAULT_COUNT,
+                Some(format!(
+                    "Invalid count '{trimmed}'; expected a whole number. \
+                     Showing {SCHEDULE_PREVIEW_DEFAULT_COUNT} entries."
+                )),
+            )
+        },
+        |parsed| (parsed.clamp(1, 100), None),
+    )
+}
 
 #[allow(clippy::too_many_lines)]
 fn render_schedule_preview_page(
@@ -10136,14 +10893,18 @@ fn render_schedule_preview_page(
     shard_id: ShardId,
     preview: &crate::api::SchedulePreview,
     count: usize,
+    count_error: Option<&str>,
 ) -> Markup {
     let id_str = row.id.to_string();
     let body = html! {
+        @if let Some(error) = count_error {
+            span.field-error role="alert" { (error) }
+        }
         h2 { "Fire-time preview — " code { (schedule_target_name(row)) } }
         (render_schedule_drilldown_header(row, shard_id, "preview"))
 
         @if preview.is_paused || row.auto_paused_at.is_some() {
-            div.degraded-banner role="status" {
+            div.degraded-banner role="status" tabindex="-1" autofocus {
                 @if row.auto_paused_at.is_some() && !preview.is_paused {
                     strong { "Schedule is auto-paused. " }
                     "The scheduler excludes auto-paused schedules from firing (#360), "
@@ -10158,7 +10919,7 @@ fn render_schedule_preview_page(
             }
         }
         @if let Some(ref reason) = preview.exhausted_reason {
-            div.degraded-banner role="status" {
+            div.degraded-banner role="status" tabindex="-1" autofocus {
                 strong { "Schedule is exhausted. " }
                 "It will never fire again (" (reason) ")."
             }
@@ -10276,10 +11037,19 @@ async fn schedule_runs_ui(
 ) -> Result<Markup, AutumnError> {
     let (row, shard_id) = load_schedule_for_drilldown(&api_state, &id_str).await?;
 
-    // Build the query through the endpoint's own parser so the UI applies the
-    // same clamping, vocabulary validation and cursor format as the API.
+    // `limit` is parsed here, ahead of the endpoint's own parser below. A
+    // non-numeric value then degrades to the default, instead of ever
+    // reaching `from_query_pairs` as bad input. This matches how the list
+    // pages' `page`/`limit` fields are parsed before their own filters are
+    // built.
+    let (limit, limit_raw, limit_error) =
+        parse_schedule_runs_limit_query_field(params.limit.as_deref());
+
+    // Build the rest of the query through the endpoint's own parser. The UI
+    // then applies the same clamping, vocabulary validation and cursor
+    // format as the API.
     let mut pairs: Vec<(String, String)> = Vec::new();
-    if let Some(limit) = params.limit {
+    if let Some(limit) = limit {
         pairs.push(("limit".to_string(), limit.to_string()));
     }
     if let Some(ref cursor) = params.cursor {
@@ -10300,7 +11070,8 @@ async fn schedule_runs_ui(
             .map_err(AutumnError::bad_request_msg)?;
 
     let view = ScheduleRunsView {
-        limit: params.limit,
+        limit,
+        limit_raw,
         origin: params
             .origin
             .as_deref()
@@ -10322,7 +11093,58 @@ async fn schedule_runs_ui(
         &response,
         &view,
         params.flash.as_deref(),
+        limit_error.as_deref(),
     ))
+}
+
+/// Parses the run-history page's `limit` query parameter.
+///
+/// A non-numeric value falls back to no limit — the endpoint's own default,
+/// [`crate::schedule_runs::DEFAULT_LIMIT`]. It reports the bad value
+/// inline, next to the "Rows" field, instead of aborting the whole page.
+/// Same contract as [`parse_limit_query_field`] on the list pages,
+/// including echoing the raw text back for redisplay.
+///
+/// A numeric-but-out-of-range value (`limit=0`, `limit=100000`) is clamped
+/// silently to `[1, MAX_LIMIT]`, matching [`parse_limit_query_field`]'s own
+/// contract. It is not left for
+/// [`crate::schedule_runs::ScheduleRunsParams::from_query_pairs`] to
+/// reject.
+///
+/// Codex review finding on this PR: the "Rows" field used to be
+/// `type="number" min="1"`, which a browser refuses to submit below 1.
+/// The fix below switched it to a text control, to keep bad text visible
+/// (see `per_page_input_is_a_text_control_that_can_hold_invalid_text`).
+/// That drops the browser-side floor. Without clamping here, a `0` typed
+/// into the now-unconstrained field reaches `from_query_pairs`. It then
+/// rejects the value and aborts the whole page — reintroducing the exact
+/// defect class this PR exists to close.
+fn parse_schedule_runs_limit_query_field(
+    raw: Option<&str>,
+) -> (Option<i64>, String, Option<String>) {
+    let Some(trimmed) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return (None, String::new(), None);
+    };
+    trimmed.parse::<i64>().map_or_else(
+        |_| {
+            (
+                None,
+                trimmed.to_string(),
+                Some(format!(
+                    "Invalid limit '{trimmed}'; expected a whole number. \
+                     Showing {} per page.",
+                    crate::schedule_runs::DEFAULT_LIMIT
+                )),
+            )
+        },
+        |parsed| {
+            (
+                Some(parsed.clamp(1, crate::schedule_runs::MAX_LIMIT)),
+                String::new(),
+                None,
+            )
+        },
+    )
 }
 
 #[allow(clippy::too_many_lines)]
@@ -10332,6 +11154,7 @@ fn render_schedule_runs_page(
     response: &crate::schedule_runs::ScheduleRunsResponse,
     view: &ScheduleRunsView,
     flash: Option<&str>,
+    limit_error: Option<&str>,
 ) -> Markup {
     use crate::shard_fanout::FanoutStatus;
 
@@ -10354,13 +11177,13 @@ fn render_schedule_runs_page(
         }
 
         (render_schedule_drilldown_header(row, shard_id, "runs"))
-        (render_schedule_runs_filters(&id_str, view))
+        (render_schedule_runs_filters(&id_str, view, limit_error))
 
         // AC7: a partial cross-shard answer is always visible, never silently
         // truncated data.
         @match response.status {
             FanoutStatus::Partial => {
-                div.degraded-banner role="status" {
+                div.degraded-banner role="status" tabindex="-1" autofocus {
                     strong { "Some shards unreachable. " }
                     "This history and its summary cover only the shards that answered; "
                     "counts may be understated."
@@ -10368,7 +11191,7 @@ fn render_schedule_runs_page(
                 }
             }
             FanoutStatus::Unavailable => {
-                div.degraded-banner role="status" {
+                div.degraded-banner role="status" tabindex="-1" autofocus {
                     strong { "No shard could be reached. " }
                     "No run history could be read, so this page shows nothing rather "
                     "than an empty history — retry once shards recover."
@@ -10484,17 +11307,35 @@ fn render_schedule_runs_page(
 /// Filter/limit controls for the run history. The endpoint has always accepted
 /// `limit`/`origin`/`state`; without a form they were reachable only by editing
 /// the URL by hand.
-fn render_schedule_runs_filters(id_str: &str, view: &ScheduleRunsView) -> Markup {
-    let limit_val = view.limit.map(|l| l.to_string()).unwrap_or_default();
+fn render_schedule_runs_filters(
+    id_str: &str,
+    view: &ScheduleRunsView,
+    limit_error: Option<&str>,
+) -> Markup {
+    // Echo exactly what the operator typed on a parse failure, matching the
+    // Workers page's `render_worker_filters`. Fall back to the resolved
+    // value when the field was absent or already valid.
+    let limit_val = if view.limit_raw.is_empty() {
+        view.limit.map(|l| l.to_string()).unwrap_or_default()
+    } else {
+        view.limit_raw.clone()
+    };
     let origin_val = view.origin.as_deref().unwrap_or("");
     let state_val = view.state.as_deref().unwrap_or("");
     html! {
         form.filters method="get" action=(schedule_drilldown_href(id_str, "runs")) {
             label {
                 "Rows"
-                input type="number" name="limit" min="1"
-                    max=(crate::schedule_runs::MAX_LIMIT) value=(limit_val)
-                    placeholder=(crate::schedule_runs::DEFAULT_LIMIT);
+                // `type="text"`, not `type="number"`. A number input
+                // sanitizes an invalid value (e.g. "not-a-number") to
+                // blank at render time. The operator could then never see
+                // or correct their own bad input. Matches the Workers
+                // page's "Per page" field.
+                input type="text" inputmode="numeric" pattern="[0-9]*" name="limit"
+                    value=(limit_val) placeholder=(crate::schedule_runs::DEFAULT_LIMIT);
+                @if let Some(error) = limit_error {
+                    span.field-error role="alert" { (error) }
+                }
             }
             label {
                 "Origin"
@@ -10835,7 +11676,9 @@ fn render_schedule_backfill_form(
         (render_schedule_drilldown_header(row, shard_id, "backfill"))
 
         @if let Some(message) = error {
-            div.degraded-banner role="status" { strong { "Backfill not started. " } (message) }
+            div.degraded-banner role="status" tabindex="-1" autofocus {
+                strong { "Backfill not started. " } (message)
+            }
         }
 
         div.card {
@@ -10932,7 +11775,7 @@ fn render_schedule_backfill_confirm(
                 }
             }
             @if let Some(ref warning) = dry_run.paused_schedule_warning {
-                div.degraded-banner role="status" { (warning) }
+                div.degraded-banner role="status" tabindex="-1" autofocus { (warning) }
             }
             @if !dry_run.planned_timestamps.is_empty() {
                 h3 { "Planned fire times" }
@@ -11258,6 +12101,27 @@ fn layout_schedules(
 mod tests {
     use super::*;
 
+    /// GREEN -- the fix under test (Snag repro, boundary tour on
+    /// `jump_event`). The fix in #1627 handles a non-numeric `jump_event`.
+    /// It also handles a small negative one (`-5`, see
+    /// `resolve_workflow_detail_event_page_clamps_a_negative_jump_event_to_zero`).
+    /// But `resolve_workflow_detail_event_page`'s prior `(jump - 1).max(0)`
+    /// still overflowed on `i64::MIN`. `i64::MIN - 1` cannot be
+    /// represented. A debug build panicked on that instead of degrading,
+    /// the default for `cargo test` and `cargo dev`. A GET to
+    /// `/ui/workflows/{exec_id}?jump_event=-9223372036854775808` reached
+    /// this exact call in `workflow_detail_ui`, with no other validation
+    /// in front of it. `saturating_sub` degrades it like any other
+    /// very-negative value instead: page 0, no error.
+    #[test]
+    fn resolve_workflow_detail_event_page_does_not_overflow_on_i64_min_jump_event() {
+        let (page, page_error, jump_error) =
+            resolve_workflow_detail_event_page(None, Some("-9223372036854775808"), 100);
+        assert_eq!(page, 0);
+        assert_eq!(page_error, None);
+        assert_eq!(jump_error, None);
+    }
+
     /// GREEN: a valid bound parses, and the raw display echoes the
     /// caller-supplied text (not a re-formatted RFC 3339 string) with no error.
     #[test]
@@ -11308,6 +12172,492 @@ mod tests {
         assert_eq!(
             parse_started_bound(Some("   "), "started_after"),
             (None, String::new(), None)
+        );
+    }
+
+    /// Codex review finding on this PR: on a successful parse, `raw` must be
+    /// empty, not an echo of the input. `render_filters`/`build_query_string`
+    /// treat a non-empty raw as "still invalid, keep displaying the bad
+    /// text". Echoing valid text there is harmless when it already matches
+    /// the resolved value. See the clamping test below for where it is not.
+    #[test]
+    fn parse_page_query_field_accepts_valid_values() {
+        assert_eq!(parse_page_query_field(Some("3")), (3, String::new(), None));
+        assert_eq!(
+            parse_page_query_field(Some("  7  ")),
+            (7, String::new(), None)
+        );
+    }
+
+    /// Codex review finding on this PR: a negative page number parses. It is
+    /// a well-formed whole number, and is clamped, matching the pre-fix
+    /// `.unwrap_or(0).max(0)` behavior. `raw` must stay empty, though, so a
+    /// caller displays the clamped `0`, not the pre-clamp `"-5"` alongside
+    /// it.
+    #[test]
+    fn parse_page_query_field_clamps_negative_values_to_zero() {
+        assert_eq!(parse_page_query_field(Some("-5")), (0, String::new(), None));
+    }
+
+    /// GREEN -- the fix under test: a non-numeric `page` no longer aborts
+    /// the whole `/workflows` response. It degrades to page 0 while naming
+    /// the bad value, so every other filter the operator entered survives.
+    #[test]
+    fn parse_page_query_field_rejects_non_numeric_text_without_erroring() {
+        let (page, raw, error) = parse_page_query_field(Some("not-a-number"));
+        assert_eq!(page, 0, "an invalid page falls back to page 0");
+        assert_eq!(raw, "not-a-number", "the raw text is echoed back");
+        let message = error.expect("an invalid page must carry a redisplayable error");
+        assert!(
+            message.contains("not-a-number") && message.contains("page"),
+            "the error names the bad value and the field: {message}"
+        );
+    }
+
+    #[test]
+    fn parse_page_query_field_blank_or_missing_is_not_an_error() {
+        assert_eq!(parse_page_query_field(None), (0, String::new(), None));
+        assert_eq!(
+            parse_page_query_field(Some("   ")),
+            (0, String::new(), None)
+        );
+    }
+
+    #[test]
+    fn parse_limit_query_field_accepts_valid_values() {
+        assert_eq!(
+            parse_limit_query_field(Some("50"), DEFAULT_PAGE_SIZE),
+            (50, String::new(), None)
+        );
+    }
+
+    /// Codex review finding on this PR: a well-formed but out-of-range limit
+    /// (`0`, `100000`) is clamped, matching the pre-fix `.clamp(1,
+    /// MAX_PAGE_SIZE)` behavior. `raw` must stay empty here. Before this
+    /// fix, `render_filters` preferred a non-empty `raw` over the resolved
+    /// `limit`. The "Per page" field then displayed the pre-clamp text
+    /// (`"100000"`). Pagination actually used the clamped value (`200`) —
+    /// a silent mismatch with no error explaining it.
+    #[test]
+    fn parse_limit_query_field_clamps_out_of_range_values() {
+        assert_eq!(
+            parse_limit_query_field(Some("0"), DEFAULT_PAGE_SIZE),
+            (1, String::new(), None)
+        );
+        assert_eq!(
+            parse_limit_query_field(Some("100000"), DEFAULT_PAGE_SIZE),
+            (MAX_PAGE_SIZE, String::new(), None)
+        );
+    }
+
+    /// GREEN -- the fix under test: a non-numeric `limit` no longer aborts
+    /// the whole `/workflows` response. It degrades to `DEFAULT_PAGE_SIZE`
+    /// while naming the bad value, matching `parse_page_query_field`.
+    #[test]
+    fn parse_limit_query_field_rejects_non_numeric_text_without_erroring() {
+        let (limit, raw, error) = parse_limit_query_field(Some("a-lot"), DEFAULT_PAGE_SIZE);
+        assert_eq!(
+            limit, DEFAULT_PAGE_SIZE,
+            "an invalid limit falls back to the default page size"
+        );
+        assert_eq!(raw, "a-lot", "the raw text is echoed back");
+        let message = error.expect("an invalid limit must carry a redisplayable error");
+        assert!(
+            message.contains("a-lot") && message.contains("limit"),
+            "the error names the bad value and the field: {message}"
+        );
+    }
+
+    /// The DLQ page's default page size (50) differs from the
+    /// Workflows/Workers pages' (25). `parse_limit_query_field`'s `default`
+    /// parameter must fall back to the caller's own default on a parse
+    /// failure, not silently substitute `DEFAULT_PAGE_SIZE`.
+    #[test]
+    fn parse_limit_query_field_uses_the_callers_default_not_a_hardcoded_one() {
+        assert_eq!(
+            parse_limit_query_field(None, DEFAULT_DLQ_PAGE_SIZE),
+            (DEFAULT_DLQ_PAGE_SIZE, String::new(), None)
+        );
+        let (limit, raw, error) = parse_limit_query_field(Some("a-lot"), DEFAULT_DLQ_PAGE_SIZE);
+        assert_eq!(
+            limit, DEFAULT_DLQ_PAGE_SIZE,
+            "an invalid limit falls back to the DLQ page's own default, not 25"
+        );
+        assert_eq!(raw, "a-lot");
+        assert!(
+            error.is_some_and(|message| message.contains(&DEFAULT_DLQ_PAGE_SIZE.to_string())),
+            "the error should name the DLQ page's own default"
+        );
+    }
+
+    #[test]
+    fn parse_dag_node_query_field_accepts_valid_values() {
+        assert_eq!(parse_dag_node_query_field(Some("3")), (Some(3), None));
+        assert_eq!(parse_dag_node_query_field(Some("  7  ")), (Some(7), None));
+    }
+
+    #[test]
+    fn parse_dag_node_query_field_blank_or_missing_is_not_an_error() {
+        assert_eq!(parse_dag_node_query_field(None), (None, None));
+        assert_eq!(parse_dag_node_query_field(Some("   ")), (None, None));
+    }
+
+    /// GREEN -- the fix under test: a non-numeric `node` no longer aborts
+    /// the whole `/dags/{name}` response with axum's bare 400. It degrades
+    /// to no node selected while naming the bad value, matching
+    /// `parse_page_query_field`.
+    #[test]
+    fn parse_dag_node_query_field_rejects_non_numeric_text_without_erroring() {
+        let (node, error) = parse_dag_node_query_field(Some("not-a-number"));
+        assert_eq!(node, None, "an invalid node falls back to no selection");
+        let message = error.expect("an invalid node must carry a redisplayable error");
+        assert!(
+            message.contains("not-a-number") && message.contains("node"),
+            "the error names the bad value and the field: {message}"
+        );
+    }
+
+    /// A well-formed but out-of-range node index is left as-is, not
+    /// rejected. `render_dag_run_graph_section` already looks it up with
+    /// `nodes.get(idx)` and renders no panel on a miss.
+    #[test]
+    fn parse_dag_node_query_field_leaves_out_of_range_values_for_the_caller() {
+        assert_eq!(parse_dag_node_query_field(Some("9999")), (Some(9999), None));
+    }
+
+    #[test]
+    fn parse_refresh_query_field_accepts_valid_values() {
+        assert_eq!(parse_refresh_query_field(Some("30")), (Some(30), None));
+    }
+
+    #[test]
+    fn parse_refresh_query_field_blank_or_missing_is_not_an_error() {
+        assert_eq!(parse_refresh_query_field(None), (None, None));
+        assert_eq!(parse_refresh_query_field(Some("   ")), (None, None));
+    }
+
+    /// GREEN -- the fix under test: a non-numeric `refresh` no longer
+    /// aborts the whole `/dags/{name}` response with axum's bare 400. It
+    /// degrades to auto-refresh disabled while naming the bad value.
+    #[test]
+    fn parse_refresh_query_field_rejects_non_numeric_text_without_erroring() {
+        let (refresh, error) = parse_refresh_query_field(Some("not-a-number"));
+        assert_eq!(refresh, None, "an invalid refresh disables auto-refresh");
+        let message = error.expect("an invalid refresh must carry a redisplayable error");
+        assert!(
+            message.contains("not-a-number") && message.contains("refresh"),
+            "the error names the bad value and the field: {message}"
+        );
+    }
+
+    // ── issue #1627: Workflow Detail page 400-aborts on a non-numeric
+    // `event_page`/`jump_event` ──
+
+    #[test]
+    fn parse_jump_event_query_field_accepts_valid_values() {
+        assert_eq!(parse_jump_event_query_field(Some("12")), (Some(12), None));
+        assert_eq!(parse_jump_event_query_field(Some("  7  ")), (Some(7), None));
+    }
+
+    #[test]
+    fn parse_jump_event_query_field_blank_or_missing_is_not_an_error() {
+        assert_eq!(parse_jump_event_query_field(None), (None, None));
+        assert_eq!(parse_jump_event_query_field(Some("   ")), (None, None));
+    }
+
+    /// GREEN -- the fix under test: a non-numeric `jump_event` no longer
+    /// aborts the whole `/workflows/{id}` response with axum's bare 400
+    /// (issue #1627). It degrades to no jump -- `event_page` applies
+    /// instead -- while naming the bad value, matching
+    /// `parse_dag_node_query_field`.
+    #[test]
+    fn parse_jump_event_query_field_rejects_non_numeric_text_without_erroring() {
+        let (jump_event, error) = parse_jump_event_query_field(Some("not-a-number"));
+        assert_eq!(
+            jump_event, None,
+            "an invalid jump_event falls back to no jump"
+        );
+        let message = error.expect("an invalid jump_event must carry a redisplayable error");
+        assert!(
+            message.contains("not-a-number") && message.contains("jump_event"),
+            "the error names the bad value and the field: {message}"
+        );
+    }
+
+    /// A negative `jump_event` parses -- it is a well-formed whole number --
+    /// and is clamped to page 0 downstream, not rejected. Matches
+    /// `parse_page_query_field_clamps_negative_values_to_zero`.
+    #[test]
+    fn parse_jump_event_query_field_accepts_negative_values() {
+        assert_eq!(parse_jump_event_query_field(Some("-5")), (Some(-5), None));
+    }
+
+    /// `jump_event` wins over `event_page` when both are present and valid.
+    #[test]
+    fn resolve_workflow_detail_event_page_prefers_a_valid_jump_event() {
+        let (page, page_error, jump_error) =
+            resolve_workflow_detail_event_page(Some("5"), Some("101"), 100);
+        assert_eq!(page, 1, "event 101 (1-based) falls on page index 1");
+        assert_eq!(page_error, None);
+        assert_eq!(jump_error, None);
+    }
+
+    /// Codex review, PR #1652: a valid `jump_event` must suppress a bad
+    /// `event_page`'s error. `event_page` plays no part in the shown page
+    /// once `jump_event` wins, so naming its fallback ("Showing page 1")
+    /// would contradict the page actually on screen.
+    #[test]
+    fn resolve_workflow_detail_event_page_suppresses_a_moot_event_page_error() {
+        let (page, page_error, jump_error) =
+            resolve_workflow_detail_event_page(Some("not-a-number"), Some("501"), 100);
+        assert_eq!(page, 5, "the valid jump_event alone decides the page");
+        assert_eq!(
+            page_error, None,
+            "a bad event_page must not report once jump_event overrides it"
+        );
+        assert_eq!(jump_error, None);
+    }
+
+    /// GREEN -- the fix under test: a non-numeric `event_page` no longer
+    /// aborts the page. It degrades to page 0 and reports the bad value,
+    /// exactly like the four already-fixed sibling list pages.
+    #[test]
+    fn resolve_workflow_detail_event_page_rejects_non_numeric_event_page_without_erroring() {
+        let (page, page_error, jump_error) =
+            resolve_workflow_detail_event_page(Some("not-a-number"), None, 100);
+        assert_eq!(page, 0);
+        assert!(page_error.is_some_and(|e| e.contains("not-a-number")));
+        assert_eq!(jump_error, None);
+    }
+
+    /// GREEN -- the fix under test: a non-numeric `jump_event` no longer
+    /// aborts the page. It degrades to `event_page`'s own value (or 0)
+    /// instead, and reports the bad `jump_event` value.
+    #[test]
+    fn resolve_workflow_detail_event_page_rejects_non_numeric_jump_event_without_erroring() {
+        let (page, page_error, jump_error) =
+            resolve_workflow_detail_event_page(Some("2"), Some("not-a-number"), 100);
+        assert_eq!(page, 2, "falls back to the valid event_page");
+        assert_eq!(page_error, None);
+        assert!(jump_error.is_some_and(|e| e.contains("not-a-number")));
+    }
+
+    /// A bad `event_page` and a bad `jump_event` at the same time must both
+    /// report, not hide one another. The page still degrades to 0.
+    #[test]
+    fn resolve_workflow_detail_event_page_reports_both_errors_when_both_are_invalid() {
+        let (page, page_error, jump_error) =
+            resolve_workflow_detail_event_page(Some("nope"), Some("also-nope"), 100);
+        assert_eq!(page, 0);
+        assert!(page_error.is_some_and(|e| e.contains("nope")));
+        assert!(jump_error.is_some_and(|e| e.contains("also-nope")));
+    }
+
+    /// A negative `jump_event` degrades to page 0 with no error -- the same
+    /// pre-fix behavior `.max(0)` already gave a negative computed index.
+    #[test]
+    fn resolve_workflow_detail_event_page_clamps_a_negative_jump_event_to_zero() {
+        let (page, page_error, jump_error) =
+            resolve_workflow_detail_event_page(None, Some("-5"), 100);
+        assert_eq!(page, 0);
+        assert_eq!(page_error, None);
+        assert_eq!(jump_error, None);
+    }
+
+    /// `jump_event=0` is out of the documented 1-based range. It is left as
+    /// a lenient alias for the first page, not rejected. This matches the
+    /// pre-fix `(0 - 1).max(0)` arithmetic exactly.
+    #[test]
+    fn resolve_workflow_detail_event_page_treats_jump_event_zero_as_page_zero() {
+        let (page, page_error, jump_error) =
+            resolve_workflow_detail_event_page(None, Some("0"), 100);
+        assert_eq!(page, 0);
+        assert_eq!(page_error, None);
+        assert_eq!(jump_error, None);
+    }
+
+    #[test]
+    fn parse_schedule_preview_count_query_field_accepts_valid_values() {
+        assert_eq!(
+            parse_schedule_preview_count_query_field(Some("25")),
+            (25, None)
+        );
+    }
+
+    #[test]
+    fn parse_schedule_preview_count_query_field_blank_or_missing_is_not_an_error() {
+        assert_eq!(
+            parse_schedule_preview_count_query_field(None),
+            (SCHEDULE_PREVIEW_DEFAULT_COUNT, None)
+        );
+        assert_eq!(
+            parse_schedule_preview_count_query_field(Some("   ")),
+            (SCHEDULE_PREVIEW_DEFAULT_COUNT, None)
+        );
+    }
+
+    /// A well-formed but out-of-range count is clamped, matching the
+    /// pre-fix `.clamp(1, 100)` behavior.
+    #[test]
+    fn parse_schedule_preview_count_query_field_clamps_out_of_range_values() {
+        assert_eq!(
+            parse_schedule_preview_count_query_field(Some("0")),
+            (1, None)
+        );
+        assert_eq!(
+            parse_schedule_preview_count_query_field(Some("1000")),
+            (100, None)
+        );
+    }
+
+    /// GREEN -- the fix under test: `count` was typed `Option<usize>`
+    /// directly on `SchedulePreviewUiParams`. A non-numeric value then
+    /// failed axum's own query deserialization with a bare 400. That
+    /// happened before `schedule_preview_ui` ever ran, aborting the whole
+    /// preview page. It now degrades to `SCHEDULE_PREVIEW_DEFAULT_COUNT`
+    /// while naming the bad value, matching `parse_dag_node_query_field`.
+    #[test]
+    fn parse_schedule_preview_count_query_field_rejects_non_numeric_text_without_erroring() {
+        let (count, error) = parse_schedule_preview_count_query_field(Some("not-a-number"));
+        assert_eq!(
+            count, SCHEDULE_PREVIEW_DEFAULT_COUNT,
+            "an invalid count falls back to the page's default"
+        );
+        let message = error.expect("an invalid count must carry a redisplayable error");
+        assert!(
+            message.contains("not-a-number") && message.contains("count"),
+            "the error names the bad value and the field: {message}"
+        );
+    }
+
+    #[test]
+    fn parse_schedule_runs_limit_query_field_accepts_valid_values() {
+        assert_eq!(
+            parse_schedule_runs_limit_query_field(Some("50")),
+            (Some(50), String::new(), None)
+        );
+    }
+
+    #[test]
+    fn parse_schedule_runs_limit_query_field_blank_or_missing_is_not_an_error() {
+        assert_eq!(
+            parse_schedule_runs_limit_query_field(None),
+            (None, String::new(), None)
+        );
+        assert_eq!(
+            parse_schedule_runs_limit_query_field(Some("   ")),
+            (None, String::new(), None)
+        );
+    }
+
+    /// Codex review finding on this PR: a well-formed but out-of-range
+    /// limit (`0`, `100000`) is clamped here, not left for
+    /// `ScheduleRunsParams::from_query_pairs` to reject. The "Rows" field
+    /// is a text control with no browser-side floor. An unclamped `0`
+    /// would reach `from_query_pairs` and abort the whole page — the
+    /// exact defect class this PR exists to close.
+    #[test]
+    fn parse_schedule_runs_limit_query_field_clamps_out_of_range_values() {
+        assert_eq!(
+            parse_schedule_runs_limit_query_field(Some("0")),
+            (Some(1), String::new(), None)
+        );
+        assert_eq!(
+            parse_schedule_runs_limit_query_field(Some("100000")),
+            (Some(crate::schedule_runs::MAX_LIMIT), String::new(), None)
+        );
+    }
+
+    /// GREEN -- the fix under test: `limit` was typed `Option<i64>` directly
+    /// on `ScheduleRunsUiParams`. A non-numeric value then failed axum's
+    /// own query deserialization with a bare 400. That happened before
+    /// `schedule_runs_ui` ever ran, discarding the `origin`/`state`
+    /// filters already on the URL along with the rest of the page. It now
+    /// degrades to no limit (the endpoint's own default) while naming the
+    /// bad value. It also echoes the raw text back for redisplay, matching
+    /// `parse_limit_query_field`.
+    #[test]
+    fn parse_schedule_runs_limit_query_field_rejects_non_numeric_text_without_erroring() {
+        let (limit, raw, error) = parse_schedule_runs_limit_query_field(Some("not-a-number"));
+        assert_eq!(limit, None, "an invalid limit falls back to no override");
+        assert_eq!(raw, "not-a-number", "the raw text is echoed for redisplay");
+        let message = error.expect("an invalid limit must carry a redisplayable error");
+        assert!(
+            message.contains("not-a-number") && message.contains("limit"),
+            "the error names the bad value and the field: {message}"
+        );
+    }
+
+    /// Codex review finding on this PR: the Next link used to be built
+    /// from `limit` alone. A parse failure leaves `limit` at `None`. The
+    /// operator's bad text — and the error naming it — then silently
+    /// vanished on the very click meant to preserve their place.
+    #[test]
+    fn schedule_runs_view_query_suffix_carries_the_invalid_raw_limit() {
+        let view = ScheduleRunsView {
+            limit: None,
+            limit_raw: "not-a-number".to_string(),
+            origin: Some("scheduled".to_string()),
+            state: None,
+        };
+        assert_eq!(view.query_suffix(), "&limit=not-a-number&origin=scheduled");
+    }
+
+    /// A clean, already-resolved `limit` still round-trips as before.
+    #[test]
+    fn schedule_runs_view_query_suffix_carries_the_resolved_limit_when_valid() {
+        let view = ScheduleRunsView {
+            limit: Some(5),
+            limit_raw: String::new(),
+            origin: None,
+            state: None,
+        };
+        assert_eq!(view.query_suffix(), "&limit=5");
+    }
+
+    /// Codex review finding on this PR: a `type="number"` input sanitizes an
+    /// invalid value to blank at render time in a real browser. The
+    /// operator could then never see or edit the exact text they typed.
+    /// That holds even though the HTML source already carried it — and
+    /// thus this test, if it only checked `contains("not-a-number")`. The
+    /// "Per page" field must be a text control, matching the Workers page's
+    /// `shard` filter.
+    #[test]
+    fn per_page_input_is_a_text_control_that_can_hold_invalid_text() {
+        let markup = render_filters(
+            None,
+            None,
+            None,
+            "",
+            None,
+            "",
+            None,
+            None,
+            DEFAULT_PAGE_SIZE,
+            "not-a-number",
+            Some("invalid limit 'not-a-number'"),
+        )
+        .into_string();
+        assert!(
+            markup
+                .contains(r#"input type="text" inputmode="numeric" pattern="[0-9]*" name="limit""#),
+            "the Per page field must be a text control, not type=\"number\": {markup}"
+        );
+        assert!(
+            markup.contains("value=\"not-a-number\""),
+            "the operator's invalid input must be preserved: {markup}"
+        );
+    }
+
+    #[test]
+    fn parse_limit_query_field_blank_or_missing_is_not_an_error() {
+        assert_eq!(
+            parse_limit_query_field(None, DEFAULT_PAGE_SIZE),
+            (DEFAULT_PAGE_SIZE, String::new(), None)
+        );
+        assert_eq!(
+            parse_limit_query_field(Some("   "), DEFAULT_PAGE_SIZE),
+            (DEFAULT_PAGE_SIZE, String::new(), None)
         );
     }
 
@@ -11769,19 +13119,28 @@ mod tests {
     #[test]
     fn build_query_string_omits_default_limit() {
         assert_eq!(
-            build_query_string(DEFAULT_PAGE_SIZE, None, None, None, "", "", None),
+            build_query_string(DEFAULT_PAGE_SIZE, "", None, None, None, "", "", None),
             ""
         );
         assert_eq!(
-            build_query_string(10, None, None, None, "", "", None),
+            build_query_string(10, "", None, None, None, "", "", None),
             "&limit=10"
         );
         assert_eq!(
-            build_query_string(DEFAULT_PAGE_SIZE, Some("FAILED"), None, None, "", "", None),
+            build_query_string(
+                DEFAULT_PAGE_SIZE,
+                "",
+                Some("FAILED"),
+                None,
+                None,
+                "",
+                "",
+                None
+            ),
             "&state=FAILED"
         );
         assert_eq!(
-            build_query_string(50, Some("with space"), None, None, "", "", None),
+            build_query_string(50, "", Some("with space"), None, None, "", "", None),
             "&limit=50&state=with%20space"
         );
     }
@@ -11791,6 +13150,7 @@ mod tests {
         assert_eq!(
             build_query_string(
                 DEFAULT_PAGE_SIZE,
+                "",
                 None,
                 Some("onboarding"),
                 None,
@@ -11802,7 +13162,7 @@ mod tests {
         );
         let pair = ("tenant".to_string(), "acme".to_string());
         assert_eq!(
-            build_query_string(DEFAULT_PAGE_SIZE, None, None, Some(&pair), "", "", None),
+            build_query_string(DEFAULT_PAGE_SIZE, "", None, None, Some(&pair), "", "", None),
             "&search_attr_key=tenant&search_attr_value=acme"
         );
     }
@@ -11815,12 +13175,51 @@ mod tests {
     #[test]
     fn build_query_string_preserves_invalid_date_text_for_pagination() {
         assert_eq!(
-            build_query_string(DEFAULT_PAGE_SIZE, None, None, None, "yesterday", "", None),
+            build_query_string(
+                DEFAULT_PAGE_SIZE,
+                "",
+                None,
+                None,
+                None,
+                "yesterday",
+                "",
+                None
+            ),
             "&started_after=yesterday"
         );
         assert_eq!(
-            build_query_string(DEFAULT_PAGE_SIZE, None, None, None, "", "not-a-date", None),
+            build_query_string(
+                DEFAULT_PAGE_SIZE,
+                "",
+                None,
+                None,
+                None,
+                "",
+                "not-a-date",
+                None
+            ),
             "&started_before=not-a-date"
+        );
+    }
+
+    /// Same Codex finding, the `limit` field. `limit_raw` is non-empty only
+    /// on a genuine parse failure (`parse_limit_query_field`). It must
+    /// override the resolved `limit` in the link, rather than being
+    /// dropped alongside it.
+    #[test]
+    fn build_query_string_preserves_invalid_limit_text_for_pagination() {
+        assert_eq!(
+            build_query_string(
+                DEFAULT_PAGE_SIZE,
+                "not-a-number",
+                None,
+                None,
+                None,
+                "",
+                "",
+                None
+            ),
+            "&limit=not-a-number"
         );
     }
 
@@ -11833,6 +13232,7 @@ mod tests {
         assert_eq!(
             build_query_string(
                 DEFAULT_PAGE_SIZE,
+                "",
                 None,
                 None,
                 None,
@@ -11856,6 +13256,7 @@ mod tests {
             &filters,
             &filter_raw,
             DEFAULT_DLQ_PAGE_SIZE,
+            "",
             None,
             250,
         )
@@ -11892,9 +13293,15 @@ mod tests {
             shard_id: String::new(),
             shard_id_error: None,
         };
-        let html =
-            render_dead_letter_bulk_actions(&filters, &filter_raw, DEFAULT_DLQ_PAGE_SIZE, None, 5)
-                .into_string();
+        let html = render_dead_letter_bulk_actions(
+            &filters,
+            &filter_raw,
+            DEFAULT_DLQ_PAGE_SIZE,
+            "",
+            None,
+            5,
+        )
+        .into_string();
         assert!(
             !html.contains("name=\"task_kind\""),
             "the invalid task_kind must never be submitted as a bulk-action selector: {html}"
@@ -11928,6 +13335,7 @@ mod tests {
             &filters,
             &filter_raw,
             DEFAULT_DLQ_PAGE_SIZE,
+            "",
             None,
             1_200,
         )
@@ -12041,6 +13449,53 @@ mod tests {
         );
     }
 
+    /// GREEN — the fix under test. `reset_to_event_id` used to be typed
+    /// `i64` straight on the `Form<..>` extractor struct for the "Reset to
+    /// event N" action. A non-numeric value failed axum's own form
+    /// deserialization. That aborted the request with a bare framework 400.
+    /// The handler never ran. The operator's reason was never read, and no
+    /// flash message could render. Reset is not a filter; it is the
+    /// runbook's destructive recovery action for a stuck child workflow or
+    /// a non-determinism failure. A malformed value must be rejected with a
+    /// clear error. It must never be silently defaulted to some other
+    /// event.
+    #[test]
+    fn parse_reset_to_event_id_accepts_valid_values() {
+        assert_eq!(parse_reset_to_event_id("1"), Ok(1));
+        assert_eq!(parse_reset_to_event_id("  42  "), Ok(42));
+        assert_eq!(parse_reset_to_event_id("0"), Ok(0));
+        assert_eq!(parse_reset_to_event_id("-3"), Ok(-3));
+    }
+
+    #[test]
+    fn parse_reset_to_event_id_rejects_non_numeric_text() {
+        let err = parse_reset_to_event_id("abc").expect_err("must reject non-numeric text");
+        assert!(
+            err.contains("abc"),
+            "the error must name the bad value: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_reset_to_event_id_rejects_a_fraction() {
+        // A `type="number"` input's `step="1"` default blocks this in a
+        // real browser. A bare `Form` POST from any other client is still a
+        // reachable path. It must not 400 before the handler runs.
+        assert!(parse_reset_to_event_id("1.5").is_err());
+    }
+
+    #[test]
+    fn parse_reset_to_event_id_rejects_i64_overflow() {
+        assert!(parse_reset_to_event_id("99999999999999999999").is_err());
+    }
+
+    #[test]
+    fn parse_reset_to_event_id_rejects_blank_or_missing() {
+        let err = parse_reset_to_event_id("").expect_err("empty text must be rejected");
+        assert!(err.contains("required"), "error must explain why: {err}");
+        assert!(parse_reset_to_event_id("   ").is_err());
+    }
+
     /// GREEN — the fix under test: `shard`/`shard_id` used to be typed
     /// `Option<i32>` straight on the `Query<..>` extractor struct on all
     /// three list pages. A non-numeric value failed axum's own query
@@ -12112,8 +13567,15 @@ mod tests {
                     .to_string(),
             ),
         };
-        let html = render_dead_letter_filters(&filters, &filter_raw, DEFAULT_DLQ_PAGE_SIZE, None)
-            .into_string();
+        let html = render_dead_letter_filters(
+            &filters,
+            &filter_raw,
+            DEFAULT_DLQ_PAGE_SIZE,
+            "",
+            None,
+            None,
+        )
+        .into_string();
         assert!(
             html.contains("field-error") && html.contains("zombie"),
             "task_kind error must render inline: {html}"
@@ -12150,7 +13612,7 @@ mod tests {
             shard_id_error: Some("bad shard_id".to_string()),
         };
         let query =
-            build_dead_letter_query_string(DEFAULT_DLQ_PAGE_SIZE, &filters, &filter_raw, None);
+            build_dead_letter_query_string(DEFAULT_DLQ_PAGE_SIZE, "", &filters, &filter_raw, None);
         assert!(
             query.contains("task_kind=zombie"),
             "invalid task_kind must round-trip: {query}"
@@ -12162,6 +13624,84 @@ mod tests {
         assert!(
             query.contains("shard_id=north"),
             "invalid shard_id must round-trip: {query}"
+        );
+    }
+
+    /// Same fix as the Workers page's own
+    /// `render_worker_pagination_shows_page_error`. An invalid `page` value
+    /// must render its error inline, above the Previous/Next controls.
+    /// This page has no backing form field for `page`.
+    #[test]
+    fn render_dead_letter_pagination_shows_page_error() {
+        let filters = DeadLetterUiFilters::default();
+        let filter_raw = DeadLetterUiFilterRaw::default();
+        let html = render_dead_letter_pagination(
+            0,
+            DEFAULT_DLQ_PAGE_SIZE,
+            "",
+            false,
+            &filters,
+            &filter_raw,
+            None,
+            Some("Invalid page 'nope'; expected a whole number. Showing page 1."),
+        )
+        .into_string();
+        assert!(
+            html.contains("field-error") && html.contains("Invalid page 'nope'"),
+            "the page error must render inline: {html}"
+        );
+    }
+
+    /// Same fix as the Workflows/Workers pages' own
+    /// `build_query_string_preserves_invalid_limit_text_for_pagination`/
+    /// `build_worker_query_string_preserves_invalid_limit_text_for_pagination`:
+    /// `limit_raw` is non-empty only on a genuine parse failure. It must
+    /// override the resolved `limit` in the Next/Previous link instead of
+    /// being silently dropped alongside it.
+    #[test]
+    fn build_dead_letter_query_string_preserves_invalid_limit_text_for_pagination() {
+        let filters = DeadLetterUiFilters::default();
+        let filter_raw = DeadLetterUiFilterRaw::default();
+        assert_eq!(
+            build_dead_letter_query_string(
+                DEFAULT_DLQ_PAGE_SIZE,
+                "not-a-number",
+                &filters,
+                &filter_raw,
+                None
+            ),
+            "&limit=not-a-number"
+        );
+    }
+
+    /// Same "browser sanitizes an invalid number input to blank" defect the
+    /// Workflows/Workers pages already fixed
+    /// (`per_page_input_is_a_text_control_that_can_hold_invalid_text`). The
+    /// DLQ page's "Per page" field must be a text control too.
+    #[test]
+    fn dead_letter_per_page_input_is_a_text_control_that_can_hold_invalid_text() {
+        let filters = DeadLetterUiFilters::default();
+        let filter_raw = DeadLetterUiFilterRaw::default();
+        let html = render_dead_letter_filters(
+            &filters,
+            &filter_raw,
+            DEFAULT_DLQ_PAGE_SIZE,
+            "not-a-number",
+            Some("invalid limit 'not-a-number'"),
+            None,
+        )
+        .into_string();
+        assert!(
+            html.contains(r#"input type="text" inputmode="numeric" pattern="[0-9]*" name="limit""#),
+            "the Per page field must be a text control, not type=\"number\": {html}"
+        );
+        assert!(
+            html.contains("value=\"not-a-number\""),
+            "the operator's invalid input must be preserved: {html}"
+        );
+        assert!(
+            html.contains("field-error") && html.contains("invalid limit"),
+            "the limit error must render inline: {html}"
         );
     }
 
@@ -12197,6 +13737,7 @@ mod tests {
             &filters,
             &filter_raw,
             DEFAULT_DLQ_PAGE_SIZE,
+            "",
             None,
         );
         assert!(
@@ -12232,6 +13773,7 @@ mod tests {
             &filters,
             &filter_raw,
             DEFAULT_DLQ_PAGE_SIZE,
+            "",
             None,
         );
         assert!(
@@ -12341,14 +13883,14 @@ mod tests {
     #[test]
     fn build_worker_query_string_empty_defaults() {
         assert_eq!(
-            build_worker_query_string(DEFAULT_PAGE_SIZE, "", "", "", None),
+            build_worker_query_string(DEFAULT_PAGE_SIZE, "", "", "", "", None),
             ""
         );
     }
 
     #[test]
     fn build_worker_query_string_includes_all_params() {
-        let q = build_worker_query_string(10, "Active", "1", "true", None);
+        let q = build_worker_query_string(10, "", "Active", "1", "true", None);
         assert!(q.contains("limit=10"));
         assert!(q.contains("status=Active"));
         assert!(q.contains("shard=1"));
@@ -12361,7 +13903,7 @@ mod tests {
     /// filter and its inline error (Codex review, #1378 P2).
     #[test]
     fn build_worker_query_string_carries_invalid_raw_values() {
-        let q = build_worker_query_string(DEFAULT_PAGE_SIZE, "zombie", "north", "True", None);
+        let q = build_worker_query_string(DEFAULT_PAGE_SIZE, "", "zombie", "north", "True", None);
         assert!(
             q.contains("status=zombie"),
             "an invalid status must still round-trip through pagination: {q}"
@@ -12373,6 +13915,19 @@ mod tests {
         assert!(
             q.contains("stale=True"),
             "an invalid stale value must still round-trip through pagination: {q}"
+        );
+    }
+
+    /// Same Codex finding as the Workflows page's
+    /// `build_query_string_preserves_invalid_limit_text_for_pagination`.
+    /// `limit_raw` is non-empty only on a genuine parse failure. It must
+    /// override the resolved `limit` in the Next/Previous link rather than
+    /// being silently dropped alongside it.
+    #[test]
+    fn build_worker_query_string_preserves_invalid_limit_text_for_pagination() {
+        assert_eq!(
+            build_worker_query_string(DEFAULT_PAGE_SIZE, "not-a-number", "", "", "", None),
+            "&limit=not-a-number"
         );
     }
 
@@ -12592,7 +14147,13 @@ mod tests {
         let filters = ScheduleUiFilters::default();
         let filter_raw = ScheduleUiFilterRaw::default();
         assert_eq!(
-            build_schedule_query_string(DEFAULT_SCHEDULE_PAGE_SIZE, &filters, &filter_raw, None),
+            build_schedule_query_string(
+                DEFAULT_SCHEDULE_PAGE_SIZE,
+                "",
+                &filters,
+                &filter_raw,
+                None
+            ),
             ""
         );
     }
@@ -12613,7 +14174,7 @@ mod tests {
             shard_id: "2".to_string(),
             ..ScheduleUiFilterRaw::default()
         };
-        let q = build_schedule_query_string(10, &filters, &filter_raw, Some(30));
+        let q = build_schedule_query_string(10, "", &filters, &filter_raw, Some(30));
         assert!(q.contains("health=Unhealthy"), "missing health: {q}");
         assert!(q.contains("limit=10"), "missing limit: {q}");
         assert!(q.contains("target=payment"), "missing target: {q}");
@@ -12638,8 +14199,13 @@ mod tests {
             shard_id_error: Some("bad shard_id".to_string()),
             ..ScheduleUiFilterRaw::default()
         };
-        let q =
-            build_schedule_query_string(DEFAULT_SCHEDULE_PAGE_SIZE, &filters, &filter_raw, None);
+        let q = build_schedule_query_string(
+            DEFAULT_SCHEDULE_PAGE_SIZE,
+            "",
+            &filters,
+            &filter_raw,
+            None,
+        );
         assert!(
             q.contains("kind=zombie"),
             "an invalid kind must still round-trip through pagination: {q}"
@@ -12647,6 +14213,29 @@ mod tests {
         assert!(
             q.contains("shard_id=north"),
             "an invalid shard_id must still round-trip through pagination: {q}"
+        );
+    }
+
+    /// Same fix as the Workflows/Workers/DLQ pages' own
+    /// `build_query_string_preserves_invalid_limit_text_for_pagination`/
+    /// `build_worker_query_string_preserves_invalid_limit_text_for_pagination`/
+    /// `build_dead_letter_query_string_preserves_invalid_limit_text_for_pagination`:
+    /// `limit_raw` is non-empty only on a genuine parse failure. It must
+    /// override the resolved `limit` in the Next/Previous link instead of
+    /// being silently dropped alongside it.
+    #[test]
+    fn build_schedule_query_string_preserves_invalid_limit_text_for_pagination() {
+        let filters = ScheduleUiFilters::default();
+        let filter_raw = ScheduleUiFilterRaw::default();
+        assert_eq!(
+            build_schedule_query_string(
+                DEFAULT_SCHEDULE_PAGE_SIZE,
+                "not-a-number",
+                &filters,
+                &filter_raw,
+                None
+            ),
+            "&limit=not-a-number"
         );
     }
 
@@ -12713,17 +14302,77 @@ mod tests {
             &std::collections::HashMap::new(),
             2,
             50,
+            "",
             false,
             0,
             "",
             "",
             Some(30),
             None,
+            None,
+            None,
+            None,
         )
         .into_string();
         assert!(
             html.contains("url=schedules?page=2"),
             "refresh target must preserve page=2: {html}"
+        );
+    }
+
+    /// Same fix as the DLQ page's own
+    /// `render_dead_letter_pagination_shows_page_error`. An invalid `page`
+    /// value must render its error inline, above the Previous/Next
+    /// controls. This page has no backing form field for `page`.
+    #[test]
+    fn render_schedule_pagination_shows_page_error() {
+        let filters = ScheduleUiFilters::default();
+        let filter_raw = ScheduleUiFilterRaw::default();
+        let html = render_schedule_pagination(
+            0,
+            DEFAULT_SCHEDULE_PAGE_SIZE,
+            "",
+            false,
+            &filters,
+            &filter_raw,
+            None,
+            Some("Invalid page 'nope'; expected a whole number. Showing page 1."),
+        )
+        .into_string();
+        assert!(
+            html.contains("field-error") && html.contains("Invalid page 'nope'"),
+            "the page error must render inline: {html}"
+        );
+    }
+
+    /// Same "browser sanitizes an invalid number input to blank" defect the
+    /// Workflows/Workers/DLQ pages already fixed
+    /// (`per_page_input_is_a_text_control_that_can_hold_invalid_text`). The
+    /// Schedules page's "Per page" field must be a text control too.
+    #[test]
+    fn schedule_per_page_input_is_a_text_control_that_can_hold_invalid_text() {
+        let filters = ScheduleUiFilters::default();
+        let filter_raw = ScheduleUiFilterRaw::default();
+        let html = render_schedule_filters(
+            &filters,
+            &filter_raw,
+            DEFAULT_SCHEDULE_PAGE_SIZE,
+            "not-a-number",
+            Some("invalid limit 'not-a-number'"),
+            None,
+        )
+        .into_string();
+        assert!(
+            html.contains(r#"input type="text" inputmode="numeric" pattern="[0-9]*" name="limit""#),
+            "the Per page field must be a text control, not type=\"number\": {html}"
+        );
+        assert!(
+            html.contains("value=\"not-a-number\""),
+            "the operator's invalid input must be preserved: {html}"
+        );
+        assert!(
+            html.contains("field-error") && html.contains("invalid limit"),
+            "the limit error must render inline: {html}"
         );
     }
 
@@ -12963,6 +14612,7 @@ mod tests {
             capability_misses: 0,
             capability_miss_workers: Vec::new(),
             capability_miss_handler: None,
+            timer_fires_at: None,
         }
     }
 
@@ -13081,6 +14731,10 @@ mod tests {
             started_by: None,
             history_bloat_warned_at: None,
             triage_note: None,
+            migrated_run_terminal_at: None,
+            migrated_run_terminal_state: None,
+            staging_vacated_state: None,
+            staging_vacated_by: None,
         }
     }
 
@@ -13275,6 +14929,8 @@ mod tests {
             0,
             &blocked,
             None,
+            None,
+            None,
             Some(10_000),
             &WorkflowLogsPanelData::default(),
         )
@@ -13310,6 +14966,8 @@ mod tests {
             &blocked,
             None,
             None,
+            None,
+            None,
             &WorkflowLogsPanelData::default(),
         )
         .into_string();
@@ -13338,6 +14996,8 @@ mod tests {
             &[],
             0,
             &blocked,
+            None,
+            None,
             None,
             Some(500),
             &WorkflowLogsPanelData::default(),
@@ -13428,9 +15088,13 @@ mod tests {
             false,
             2,
             50,
+            "",
             false,
             0,
             Some(30),
+            None,
+            None,
+            None,
             None,
         )
         .into_string();
@@ -13627,6 +15291,8 @@ mod tests {
             None,
             None,
             DEFAULT_PAGE_SIZE,
+            "",
+            None,
         )
         .into_string();
         assert!(
@@ -13648,6 +15314,8 @@ mod tests {
             Some("Unknown stale value 'True'; expected 'true' or 'false'. Filter not applied."),
             None,
             DEFAULT_PAGE_SIZE,
+            "",
+            None,
         )
         .into_string();
         assert!(
@@ -13682,11 +15350,74 @@ mod tests {
             None,
             None,
             DEFAULT_PAGE_SIZE,
+            "",
+            None,
         )
         .into_string();
         assert!(
             html.contains("option value=\"zombie\" selected"),
             "the invalid status must be echoed back as the selected option: {html}"
+        );
+    }
+
+    /// GREEN — the fix under test: the Workers page's "Per page" field is
+    /// a text control. This matches the Workflows page's own fix (Codex
+    /// review on #1540). A `type="number"` input sanitizes an invalid
+    /// value to blank at render time. The operator could then never see
+    /// or correct their own bad input, even though the HTML source
+    /// already carried it.
+    #[test]
+    fn worker_per_page_input_is_a_text_control_that_can_hold_invalid_text() {
+        let html = render_worker_filters(
+            None,
+            "",
+            None,
+            "",
+            None,
+            false,
+            "",
+            None,
+            None,
+            DEFAULT_PAGE_SIZE,
+            "not-a-number",
+            Some("Invalid limit 'not-a-number'; expected a whole number. Showing 50 per page."),
+        )
+        .into_string();
+        assert!(
+            html.contains(r#"input type="text" inputmode="numeric" pattern="[0-9]*" name="limit""#),
+            "the Per page field must be a text control, not type=\"number\": {html}"
+        );
+        assert!(
+            html.contains("value=\"not-a-number\""),
+            "the operator's invalid input must be preserved: {html}"
+        );
+        assert!(
+            html.contains("field-error") && html.contains("not-a-number"),
+            "the limit error must render inline: {html}"
+        );
+    }
+
+    /// GREEN — the fix under test: an invalid `page` value renders a
+    /// `field-error` above the pagination controls. Those controls have no
+    /// backing form field of their own, matching the Workflows page's
+    /// `render_pagination`.
+    #[test]
+    fn render_worker_pagination_shows_page_error() {
+        let html = render_worker_pagination(
+            0,
+            DEFAULT_PAGE_SIZE,
+            "",
+            false,
+            "",
+            "",
+            "",
+            None,
+            Some("Invalid page 'nope'; expected a whole number. Showing page 1."),
+        )
+        .into_string();
+        assert!(
+            html.contains("field-error") && html.contains("Invalid page 'nope'"),
+            "the page error must render inline: {html}"
         );
     }
 
@@ -13786,7 +15517,7 @@ mod tests {
 
     #[test]
     fn build_worker_query_string_includes_build_id() {
-        let q = build_worker_query_string(DEFAULT_PAGE_SIZE, "", "", "", Some("abc123"));
+        let q = build_worker_query_string(DEFAULT_PAGE_SIZE, "", "", "", "", Some("abc123"));
         assert!(
             q.contains("build_id=abc123"),
             "query string must include build_id"
@@ -14148,6 +15879,156 @@ mod tests {
         assert!(
             flash.contains("Retry failed"),
             "a real failure must use the hard failure message: {flash}"
+        );
+    }
+
+    // Issue #1723 fix: a submitted reason and a commit-failure message must
+    // both reach the redisplayed confirm page. They replace the
+    // auto-generated default reason and the earlier no-error state.
+    #[test]
+    fn render_dag_retry_confirm_echoes_submitted_reason_and_commit_error() {
+        let plan = DagRetryResponse {
+            dry_run: true,
+            dag_name: "graph_linear".to_string(),
+            source_run_exec_id: "source-run".to_string(),
+            reset_to_event_id: 3,
+            nodes_to_re_execute: vec!["step_b".to_string()],
+            nodes_carried_over: vec![],
+            new_run_exec_id: None,
+            events_carried_over: None,
+        };
+        let markup = render_dag_retry_confirm(
+            "graph_linear",
+            "source-run",
+            "step_b",
+            "retrying after upstream API fix, ticket JIRA-4521",
+            Some("DAG run succeeded"),
+            Ok(plan),
+        )
+        .into_string();
+        assert!(
+            markup.contains("retrying after upstream API fix, ticket JIRA-4521"),
+            "the operator's submitted reason must survive a redisplay: {markup}"
+        );
+        assert!(
+            !markup.contains("retry from node step_b via Vantage"),
+            "the auto-generated default reason must not silently replace the \
+             operator's own submission: {markup}"
+        );
+        assert!(
+            markup.contains("DAG run succeeded"),
+            "the commit failure must be shown inline on the redisplayed \
+             form, not only in a since-vanished redirect flash: {markup}"
+        );
+    }
+
+    // The plain first-visit GET has nothing to echo: no commit has happened
+    // yet. So no error renders, and the textarea carries the auto-generated
+    // default reason unchanged.
+    #[test]
+    fn render_dag_retry_confirm_shows_no_error_when_nothing_failed_yet() {
+        let plan = DagRetryResponse {
+            dry_run: true,
+            dag_name: "graph_linear".to_string(),
+            source_run_exec_id: "source-run".to_string(),
+            reset_to_event_id: 3,
+            nodes_to_re_execute: vec!["step_b".to_string()],
+            nodes_carried_over: vec![],
+            new_run_exec_id: None,
+            events_carried_over: None,
+        };
+        let markup = render_dag_retry_confirm(
+            "graph_linear",
+            "source-run",
+            "step_b",
+            "retry from node step_b via Vantage",
+            None,
+            Ok(plan),
+        )
+        .into_string();
+        // Not `!markup.contains("field-error")`: that substring also
+        // appears in the page's shared, always-embedded stylesheet
+        // (`.field-error{...}`). So it is true on every page, regardless of
+        // whether the error span itself renders. `role="alert"` only ever
+        // appears on that span.
+        assert!(
+            !markup.contains(r#"role="alert""#),
+            "a first-visit confirm page must show no error banner: {markup}"
+        );
+    }
+
+    // Codex review (issue #1723): the confirm page's caller re-runs the dry
+    // run for a current node list on a commit failure. That refreshed dry
+    // run can itself fail — exactly the race this fix targets, where a
+    // competing retry has already sealed the source run. The `Err` branch
+    // must still preserve the operator's submitted reason in that case,
+    // not just on the `Ok` branch covered by the sibling test above.
+    #[test]
+    fn render_dag_retry_confirm_preserves_reason_when_the_refreshed_dry_run_also_fails() {
+        let failure = DagRetryFailure::StateConflict("DAG run terminated".to_string());
+        let markup = render_dag_retry_confirm(
+            "graph_linear",
+            "source-run",
+            "step_b",
+            "retrying after upstream API fix, ticket JIRA-4521",
+            Some("DAG run terminated"),
+            Err(failure),
+        )
+        .into_string();
+        assert!(
+            markup.contains("retrying after upstream API fix, ticket JIRA-4521"),
+            "the operator's submitted reason must survive even when the \
+             redisplay's own fresh dry run also fails: {markup}"
+        );
+    }
+
+    // Codex review (issue #1723): the banner shows the *refreshed* dry run's
+    // own failure, which is not necessarily what the operator's actual
+    // commit attempt failed with. When the two diagnoses differ, both must
+    // reach the operator, not just the redisplay's own fresh failure.
+    #[test]
+    fn render_dag_retry_confirm_shows_original_commit_error_when_it_differs_from_the_refreshed_dry_run()
+     {
+        let refreshed_failure =
+            DagRetryFailure::StateConflict("DAG run terminated by a competing retry".to_string());
+        let markup = render_dag_retry_confirm(
+            "graph_linear",
+            "source-run",
+            "step_b",
+            "retrying after upstream API fix, ticket JIRA-4521",
+            Some("node step_b already retried by another operator"),
+            Err(refreshed_failure),
+        )
+        .into_string();
+        assert!(
+            markup.contains("DAG run terminated by a competing retry"),
+            "the refreshed dry run's own failure must still show: {markup}"
+        );
+        assert!(
+            markup.contains("node step_b already retried by another operator"),
+            "a diverging original commit failure must not be silently \
+             dropped in favour of the refreshed dry run's own message: \
+             {markup}"
+        );
+    }
+
+    // The plain first-visit `GET` failure (no prior submission) must not
+    // claim to be preserving a reason that was never the operator's own.
+    #[test]
+    fn render_dag_retry_confirm_shows_no_preserved_reason_on_first_visit_dry_run_failure() {
+        let failure = DagRetryFailure::StateConflict("DAG run succeeded".to_string());
+        let markup = render_dag_retry_confirm(
+            "graph_linear",
+            "source-run",
+            "step_b",
+            "retry from node step_b via Vantage",
+            None,
+            Err(failure),
+        )
+        .into_string();
+        assert!(
+            !markup.contains("Your submitted reason"),
+            "a first-visit dry-run failure has nothing to preserve: {markup}"
         );
     }
 
@@ -15018,6 +16899,8 @@ mod tests {
             &blocked,
             None,
             None,
+            None,
+            None,
             logs,
         )
         .into_string()
@@ -15135,6 +17018,8 @@ mod tests {
             &blocked,
             None,
             None,
+            None,
+            None,
             &WorkflowLogsPanelData {
                 lines: &[],
                 admin: true,
@@ -15147,6 +17032,94 @@ mod tests {
         assert!(
             html.contains("?event_page=3&amp;log_level=warn"),
             "a level-filter link must carry the current event page"
+        );
+    }
+
+    #[test]
+    fn jump_to_event_control_has_a_programmatically_associated_label() {
+        // Every other `label`/control pair in this file relies on the
+        // dashboard's own convention: a `<label>` wraps its control. The
+        // browser associates the two even with no `for`/`id` pair. This
+        // control alone rendered the label and the input as siblings, so a
+        // screen reader announced the field with no accessible name at all.
+        // Assert the wrapping structurally: the `jump_event` input must sit
+        // between the `<label>` carrying "Jump to event:" and its close tag.
+        let execution = stub_execution();
+        let blocked = stub_blocked_on();
+        let html = render_workflow_detail(
+            &execution,
+            150, // total_events, past DETAIL_EVENT_PAGE_SIZE so the control renders
+            &[],
+            &[],
+            &[],
+            false,
+            &[],
+            0,
+            &blocked,
+            None,
+            None,
+            None,
+            None,
+            &WorkflowLogsPanelData {
+                lines: &[],
+                admin: true,
+                ..Default::default()
+            },
+        )
+        .into_string();
+
+        let label_text_pos = html
+            .find("Jump to event:")
+            .expect("the jump-to-event control must render past the pagination threshold");
+        let label_open = html[..label_text_pos]
+            .rfind("<label")
+            .expect("\"Jump to event:\" must be inside a <label>");
+        let label_close = label_text_pos
+            + html[label_text_pos..]
+                .find("</label>")
+                .expect("the label must be closed");
+        let input_pos = html
+            .find("name=\"jump_event\"")
+            .expect("the jump_event input must render");
+        assert!(
+            label_open < input_pos && input_pos < label_close,
+            "the jump_event input must be a descendant of its <label>, not a \
+             sibling -- otherwise it has no programmatic accessible name"
+        );
+    }
+
+    /// GREEN -- the fix under test (issue #1627): `event_page_error` and
+    /// `jump_event_error` must render inline, matching
+    /// `render_dead_letter_pagination_shows_page_error`/
+    /// `render_worker_pagination_shows_page_error`.
+    #[test]
+    fn render_workflow_detail_shows_event_page_and_jump_event_errors() {
+        let execution = stub_execution();
+        let blocked = stub_blocked_on();
+        let html = render_workflow_detail(
+            &execution,
+            0,
+            &[],
+            &[],
+            &[],
+            false,
+            &[],
+            0,
+            &blocked,
+            None,
+            Some("Invalid page 'nope'; expected a whole number. Showing page 1."),
+            Some("Invalid jump_event 'zap'; expected a whole number. Jump ignored."),
+            None,
+            &WorkflowLogsPanelData::default(),
+        )
+        .into_string();
+        assert!(
+            html.contains("field-error") && html.contains("Invalid page 'nope'"),
+            "the event_page error must render inline: {html}"
+        );
+        assert!(
+            html.contains("Invalid jump_event 'zap'"),
+            "the jump_event error must render inline: {html}"
         );
     }
 
@@ -15597,7 +17570,8 @@ mod tests {
             remaining_runs: None,
             exhausted_reason: None,
         };
-        let html = render_schedule_preview_page(&row, ShardId::new(0), &preview, 10).into_string();
+        let html =
+            render_schedule_preview_page(&row, ShardId::new(0), &preview, 10, None).into_string();
         assert!(
             html.contains("2026-09-01 12:00:00"),
             "original instant missing: {html}"
@@ -15638,7 +17612,8 @@ mod tests {
             remaining_runs: Some(0),
             exhausted_reason: Some("max_runs_exhausted".to_string()),
         };
-        let html = render_schedule_preview_page(&row, ShardId::new(0), &preview, 10).into_string();
+        let html =
+            render_schedule_preview_page(&row, ShardId::new(0), &preview, 10, None).into_string();
         assert!(
             html.contains("max_runs_exhausted"),
             "must name the exhaustion reason: {html}"
@@ -15663,7 +17638,8 @@ mod tests {
             remaining_runs: None,
             exhausted_reason: None,
         };
-        let html = render_schedule_preview_page(&row, ShardId::new(0), &preview, 10).into_string();
+        let html =
+            render_schedule_preview_page(&row, ShardId::new(0), &preview, 10, None).into_string();
         assert!(html.contains("paused") || html.contains("Paused"));
         assert!(
             html.contains("operator hold"),
@@ -15736,6 +17712,7 @@ mod tests {
             &response,
             &ScheduleRunsView::default(),
             None,
+            None,
         )
         .into_string();
 
@@ -15803,6 +17780,7 @@ mod tests {
             &response,
             &ScheduleRunsView::default(),
             None,
+            None,
         )
         .into_string();
         assert!(
@@ -15831,6 +17809,7 @@ mod tests {
             &response,
             &ScheduleRunsView::default(),
             None,
+            None,
         )
         .into_string();
         assert!(
@@ -15857,6 +17836,7 @@ mod tests {
             ShardId::new(0),
             &response,
             &ScheduleRunsView::default(),
+            None,
             None,
         )
         .into_string();
@@ -16198,9 +18178,11 @@ mod tests {
             &response,
             &ScheduleRunsView {
                 limit: Some(5),
+                limit_raw: String::new(),
                 origin: Some("scheduled".to_string()),
                 state: None,
             },
+            None,
             None,
         )
         .into_string();
@@ -16244,6 +18226,7 @@ mod tests {
             &response,
             &ScheduleRunsView::default(),
             Some("Backfill dispatched 6 of 6 planned run(s); 0 skipped, 1 failed."),
+            None,
         )
         .into_string();
         assert!(
@@ -16442,7 +18425,8 @@ mod tests {
             kind_error: Some("bad kind".to_string()),
             ..ScheduleUiFilterRaw::default()
         };
-        let path = schedule_return_to_path(&filters, &filter_raw, DEFAULT_SCHEDULE_PAGE_SIZE, None);
+        let path =
+            schedule_return_to_path(&filters, &filter_raw, DEFAULT_SCHEDULE_PAGE_SIZE, "", None);
         assert_eq!(path, "../schedules?kind=zombie");
     }
 
@@ -16450,7 +18434,8 @@ mod tests {
     fn schedule_return_to_path_is_bare_schedules_when_no_filters_are_set() {
         let filters = ScheduleUiFilters::default();
         let filter_raw = ScheduleUiFilterRaw::default();
-        let path = schedule_return_to_path(&filters, &filter_raw, DEFAULT_SCHEDULE_PAGE_SIZE, None);
+        let path =
+            schedule_return_to_path(&filters, &filter_raw, DEFAULT_SCHEDULE_PAGE_SIZE, "", None);
         assert_eq!(path, "../schedules");
     }
 
@@ -16465,6 +18450,7 @@ mod tests {
             &filters,
             &filter_raw,
             DEFAULT_SCHEDULE_PAGE_SIZE,
+            "",
             None,
             3,
             "3 Workflow",
@@ -16629,6 +18615,7 @@ mod tests {
         };
         let qs = build_schedule_query_string(
             DEFAULT_SCHEDULE_PAGE_SIZE,
+            "",
             &ScheduleUiFilters {
                 health: ScheduleHealthFilter::All,
                 ..filters
@@ -16947,7 +18934,8 @@ mod tests {
             remaining_runs: None,
             exhausted_reason: None,
         };
-        let html = render_schedule_preview_page(&row, ShardId::new(0), &preview, 10).into_string();
+        let html =
+            render_schedule_preview_page(&row, ShardId::new(0), &preview, 10, None).into_string();
         assert!(
             html.contains("auto-paused"),
             "the banner must name auto-pause: {html}"
@@ -16960,6 +18948,85 @@ mod tests {
             !html.contains("produces no future firings"),
             "must not blame the expression for an auto-pause: {html}"
         );
+    }
+
+    // -- issue #1293 regression --
+
+    /// The scheduler's secondary `end_at` guard in `scheduler.rs` rejects a
+    /// fire when the jitter-adjusted `effective_fire_time` is at or past
+    /// `end_at`. It rejects the fire even when the raw slot is still before
+    /// `end_at`. This predicate must judge the same pending time. Otherwise
+    /// the badge, the filter and the sort report the schedule as healthy. The
+    /// tick never fires it again.
+    #[test]
+    fn end_at_exhaustion_accounts_for_jitter() {
+        let now = chrono::Utc::now();
+        let id = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000001293")
+            .expect("valid fixture uuid");
+        let next_run_at = chrono::DateTime::parse_from_rfc3339("2026-09-01T12:00:00Z")
+            .expect("valid fixture timestamp")
+            .with_timezone(&chrono::Utc);
+        let jitter_secs = 300i64;
+
+        let offset = autumn_harvest::policy::compute_jitter_offset(
+            id,
+            next_run_at,
+            std::time::Duration::from_secs(jitter_secs.cast_unsigned()),
+        );
+        let effective_fire_time = next_run_at
+            + chrono::Duration::from_std(offset).expect("offset fits in a chrono duration");
+        assert!(
+            effective_fire_time > next_run_at,
+            "fixture needs a non-zero offset to exercise the jitter path"
+        );
+
+        // The raw slot is still before end_at. Its jitter-adjusted fire time
+        // is not. The tick never dispatches this slot.
+        let row = HarvestSchedule {
+            id,
+            next_run_at: Some(next_run_at),
+            jitter_secs,
+            end_at: Some(effective_fire_time),
+            ..make_schedule(Some("jittered_wf"), None, false)
+        };
+        assert!(
+            schedule_is_bounded_out(&row, now),
+            "a slot whose jitter-adjusted fire time is at/past end_at is bounded out"
+        );
+
+        // An unjittered schedule still judges the raw slot only. The common
+        // case must not regress.
+        let unjittered = HarvestSchedule {
+            next_run_at: Some(next_run_at),
+            jitter_secs: 0,
+            end_at: Some(next_run_at + chrono::Duration::minutes(1)),
+            ..make_schedule(Some("plain_wf"), None, false)
+        };
+        assert!(!schedule_is_bounded_out(&unjittered, now));
+    }
+
+    /// A jittered schedule with no pending slot still falls back to the wall
+    /// clock. `effective_fire_time` returns `None` when `next_run_at` is
+    /// `None`, regardless of `jitter_secs`.
+    #[test]
+    fn end_at_exhaustion_falls_back_to_wall_clock_with_no_pending_slot() {
+        let now = chrono::Utc::now();
+
+        let no_slot_past_cutoff = HarvestSchedule {
+            next_run_at: None,
+            jitter_secs: 300,
+            end_at: Some(now - chrono::Duration::hours(1)),
+            ..make_schedule(Some("no_slot_jittered"), None, false)
+        };
+        assert!(schedule_is_bounded_out(&no_slot_past_cutoff, now));
+
+        let no_slot_before_cutoff = HarvestSchedule {
+            next_run_at: None,
+            jitter_secs: 300,
+            end_at: Some(now + chrono::Duration::hours(1)),
+            ..make_schedule(Some("no_slot_jittered_ok"), None, false)
+        };
+        assert!(!schedule_is_bounded_out(&no_slot_before_cutoff, now));
     }
 
     /// The backfill confirmation interpolates the schedule UUID into its

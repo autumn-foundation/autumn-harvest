@@ -187,6 +187,106 @@ jobs:
         # skipped ("command not found") and neither variable ends up set. See
         # scripts/check-no-powershell-env-syntax.sh.
         run: ./scripts/check-no-powershell-env-syntax.sh
+      - name: Check CHANGELOG connector migration version
+        # Guards a real, reproduced-live defect: CHANGELOG.md's [0.6.0]
+        # "Add broker event-source connectors" entry (issue #944) cited
+        # migration `20260719000000` for harvest_connector_dead_letters,
+        # but that version belongs to a different, already-shipped core
+        # migration (harvest_workflow_logs, issue #790, correctly cited two
+        # entries below in the same section). The connector migration's
+        # real on-disk version is `20260719900000`, deliberately bumped to
+        # avoid colliding with core under Diesel's single, source-blind
+        # __diesel_schema_migrations keyspace. docs/upgrading/0.6.0.md sends
+        # an upgrading operator straight to this CHANGELOG.md section to
+        # find 0.6.0's migrations. See
+        # scripts/check-changelog-connector-migration-version.sh.
+        run: ./scripts/check-changelog-connector-migration-version.sh
+      - name: Check broker-connectors dead-letter-sink example
+        # Guards a real, reproduced-live defect: chapter 13's "(a) record
+        # into harvest -- the default mode" example -- the option for a
+        # directly-constructed ConnectorRuntime, the exact audience the
+        # section addresses -- installed RecordingDeadLetterSink, an
+        # in-memory, test-only sink per its own doc comment
+        # (autumn-harvest-plugin/src/connector/dead_letter.rs). It never
+        # writes harvest_connector_dead_letters -- that is
+        # PostgresDeadLetterSink, which is what HarvestPlugin itself
+        # installs as the real default (autumn-harvest-plugin/src/plugin.rs).
+        # A newcomer who copies the example gets a runtime that compiles,
+        # runs, and acknowledges poison messages with no error, but never
+        # durably records them: they vanish on restart. See
+        # scripts/check-broker-connector-dead-letter-sink-example.sh.
+        run: ./scripts/check-broker-connector-dead-letter-sink-example.sh
+      - name: Check claude-agent-daemon runtime artifacts are git-ignored
+        # Guards a real, reproduced-live defect: examples/claude-agent-daemon's
+        # README tells the reader to run every `agentd` command "from the
+        # repository root", and the daemon's own defaults (`agentd.db`,
+        # `agentd.sock`) write relative to the current directory. Nothing
+        # excluded them, so following the "Try it in one minute" walkthrough
+        # verbatim from a clean checkout leaves `git status` dirty — and,
+        # against a real API key, parks an actual conversation transcript
+        # (the doc's own words: "every prompt, tool input, and tool result")
+        # as an untracked file one `git add -A` away from being committed.
+        # See scripts/check-agentd-runtime-artifacts-ignored.sh.
+        run: ./scripts/check-agentd-runtime-artifacts-ignored.sh
+      - name: Check signals chapter's clean await_condition example
+        # Guards two real, reproduced-live compile failures an Onramp
+        # clean-room pass found in chapter 4's "Clean Declarative
+        # await_condition" example (collect_approvals_clean) -- the pattern
+        # the chapter explicitly recommends over the "tedious" manual loop
+        # right above it. Neither is a syntax error, so
+        # docs/audits/doc-snippet-syntax.py's rustfmt-only check passed both
+        # blocks clean: (1) racing wait_for_signal against
+        # await_condition_timeout with futures::future::select needs
+        # #[workflow(allow_nondeterministic_apis)], or HVG010 hard-blocks
+        # the build; (2) a plain `let mut approvals` captured by the
+        # condition closure can never also be reassigned by the loop body
+        # while that borrow is live (E0506). E0506 is a borrow-checker
+        # property, not a syntax shape, so this actually compiles the
+        # pinned block with `cargo check` (see the script's own docstring
+        # for why a text heuristic proved gameable in review) rather than
+        # pattern-matching stand-in text -- one extra `cargo check
+        # --example` in a job that already builds this crate for clippy
+        # below. See scripts/check-signals-clean-approval-example-determinism.sh.
+        run: ./scripts/check-signals-clean-approval-example-determinism.sh
+      - name: Check reliability-knobs continue_as_new checkpoint example
+        # Guards a real, reproduced-live compile failure an Onramp
+        # clean-room pass found in chapter 7's flagship deadline-aware
+        # checkpoint example: `ctx.continue_as_new(...).await?` inside a
+        # `Result<_, String>` workflow, with no real conversion from the
+        # `HarvestError` continue_as_new returns first (E0277, no
+        # `From<HarvestError> for String`). Not a syntax error, so
+        # doc-snippet-syntax.py's rustfmt-only check passed it clean. The
+        # same broken snippet also lived, unenforced, inside
+        # autumn-harvest/examples/long_lived_entity_deadline.rs's own
+        # ```rust,ignore``` module-doc illustration, so this checks both.
+        # Whether a `.map_err(...)` closure actually produces `String` is a
+        # type-checker property, not a text shape (review found two
+        # text-heuristic attempts gameable in a row -- a loose window, then
+        # an `.await.map_err(|e| e)?` identity closure), so this compiles
+        # each pinned snippet with `cargo check` rather than pattern-
+        # matching stand-in text. See
+        # scripts/check-continue-as-new-checkpoint-example.sh.
+        run: ./scripts/check-continue-as-new-checkpoint-example.sh
+      - name: Check operations chapter's preflight declared-deps example
+        # Guards two real, reproduced-live compile failures an Onramp
+        # clean-room pass found in chapter 10's flagship
+        # "Catching a forgotten registration before rollout" example: (1)
+        # `ctx.execute_activity(...).await?` and the spawn_child_workflow
+        # call below it are `HarvestResult<_>`, but the workflow returns
+        # `Result<_, String>` with no `From<HarvestError> for String` --
+        # same defect class as chapter 7's continue_as_new example (PR
+        # #1700); (2) even with `.map_err(...)` added, execute_activity's
+        # generic output type is left unconstrained by a discarded bare
+        # statement, which current stable rustc denies by default on every
+        # edition (`dependency_on_unit_never_type_fallback`), confirmed
+        # live against a standalone edition-2021 crate matching chapter 1's
+        # own pinned tutorial edition. Neither is a syntax error, so
+        # doc-snippet-syntax.py's rustfmt-only check passes this block
+        # clean. This actually compiles the pinned block with `cargo check`
+        # rather than pattern-matching stand-in text, matching the sibling
+        # guards above. See
+        # scripts/check-preflight-declared-deps-example.sh.
+        run: ./scripts/check-preflight-declared-deps-example.sh
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Clippy autumn-harvest
@@ -226,6 +326,27 @@ jobs:
         run: cargo clippy -p autumn-harvest-cli --all-targets -- -D warnings
       - name: Clippy autumn-harvest-sqlite
         run: cargo clippy -p autumn-harvest-sqlite --all-targets -- -D warnings
+      # Same issue #962 rule as every other crate on this page: a workspace
+      # member gets NO clippy coverage without its own step, and these three
+      # standalone example crates (each its own `examples/*/Cargo.toml`
+      # workspace member, not a `--example` target under `autumn-harvest`)
+      # never got one. Unlike claude-agent-daemon/autumn-harvest-redis below,
+      # no `--no-deps` is needed: all three use `autumn-harvest`'s default
+      # features (plus `db`/`testing`), so they do not inherit that crate's
+      # no-default-features warnings.
+      - name: Clippy saga-choreography example
+        run: cargo clippy -p saga-choreography --all-targets -- -D warnings
+      - name: Clippy billing-autumn-web example
+        run: cargo clippy -p billing-autumn-web --all-targets -- -D warnings
+      - name: Clippy standalone-runner example
+        run: cargo clippy -p standalone-runner --all-targets -- -D warnings
+      # Same issue #962 rule as the verify and redis crates below: a new
+      # workspace member gets NO clippy coverage without its own step here.
+      # `--no-deps` scopes the deny to the example, because it depends on
+      # `autumn-harvest` with `default-features = false`, and the core crate
+      # carries pre-existing warnings in that configuration.
+      - name: Clippy claude-agent-daemon example
+        run: cargo clippy -p claude-agent-daemon --all-targets --no-deps -- -D warnings
       # Issue #1312: the Redis dispatch channel. Same issue #962 rule as the
       # verify crate below -- a workspace member gets NO clippy coverage
       # without its own step here.
@@ -329,6 +450,21 @@ jobs:
       - name: Run docs/rnd/determinism-static-analysis.md guards (also on docs-only PRs)
         run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration determinism_static_analysis_docs::"
 
+      # Issue #1272: same reasoning as the five steps above, for the
+      # audit-export "opt-in, one cost is not zero" caveat. `docs/audit-export.md`
+      # and `docs/changelog.d/pr-953-audit-export.md` both match the docs-only
+      # filter, so a PR that edits only one of them — dropping the partial-index
+      # cost caveat, restoring the retracted "zero-cost when unconfigured"
+      # wording — sets `code=false` and skips the entire `test` matrix. That is
+      # precisely the change class these guards exist to catch, so they run
+      # here in the ungated `lint` job.
+      #
+      # Guarded by `audit_export_docs::guards_run_on_docs_only_changes`, which
+      # fails if this step is removed or becomes conditional. Quoted for the
+      # same trailing-`::` YAML reason as above.
+      - name: Run audit-export opt-in-cost guards (also on docs-only PRs)
+        run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration audit_export_docs::"
+
       # Folio corpus harness: internal link check across all of docs/ (see
       # docs/audits/corpus-link-check.py). Same reasoning as the docs-only
       # guards above — a broken link is exactly the change class a docs-only
@@ -356,6 +492,32 @@ jobs:
       # convention above.
       - name: Folio config/CLI drift scan (docs/audits/config-cli-drift.py)
         run: python3 docs/audits/config-cli-drift.py
+
+      # Folio corpus harness: audit-catalog coverage scan (see
+      # docs/audits/audit-catalog-coverage.py). docs/audits/README.md is
+      # itself a docs page — the catalog a contributor reads to find out
+      # which audit scripts exist and whether each is wired into CI. This
+      # fails the build if a script lands in docs/audits/ without a row
+      # naming it there, so the catalog cannot silently fall behind the
+      # directory it describes. Pure Python stdlib, no deps, no network.
+      - name: Folio audit-catalog coverage (docs/audits/audit-catalog-coverage.py)
+        run: python3 docs/audits/audit-catalog-coverage.py
+
+      # Folio corpus harness: Rust syntax check for every ```rust fence in
+      # docs/getting-started/*.md and README.md (see
+      # docs/audits/doc-snippet-syntax.py). These are the front-door
+      # snippets — the fastest documented path promises "nothing to
+      # configure", and every later chapter's fenced block is something a
+      # reader on that path copies into their own editor. Uses only
+      # `rustfmt` (installed above via `components: rustfmt`), never
+      # `cargo`, so it costs a couple of seconds and needs no network or
+      # `target/`. It is a syntax check, not a compile check — see the
+      # script's own docstring for why that scope is deliberate. Exits 1
+      # only on a block that fails to parse and is not a documented
+      # fragment exception (a bare `.method(...)` continuation line, listed
+      # by name in the script).
+      - name: Folio doc-snippet syntax check (docs/audits/doc-snippet-syntax.py)
+        run: python3 docs/audits/doc-snippet-syntax.py
 
       # Comment hygiene across the Rust sources (see
       # docs/audits/comment-hygiene.py). Two tiers, and the split is the
@@ -636,6 +798,18 @@ jobs:
       - name: Run plugin connector tests (issue #944)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 2
         run: cargo test -p autumn-harvest-plugin --features connectors --lib connector
+      # Issue #1287 review: the manifest's `dev_runtime_tests` row (features
+      # `dev-runtime`) and `dev_runtime_managed` row (`compileonly`, so
+      # `--no-run` only) never exercise this crate's `--lib` target, so the
+      # inline `#[cfg(test)]` unit tests inside `src/dev/reaper.rs` and
+      # `src/dev/acquire.rs` — including the Windows-specific
+      # `directory_is_ours` regression tests this issue added — were never
+      # actually built or run on any OS. `dev-runtime-managed` (a superset of
+      # `dev-runtime`) covers both files' tests in one step, on every OS this
+      # job's matrix runs, `windows-latest` included.
+      - name: Run plugin lib tests (dev-runtime-managed feature, issue #1287)
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 2
+        run: cargo test -p autumn-harvest-plugin --features dev-runtime-managed --lib
       # Issue #1312. The `redis` feature changes two config paths: it accepts
       # `[harvest.redis] url` instead of rejecting it, and it compiles the
       # channel install. `--lib` without the feature covers neither, so the
@@ -679,12 +853,40 @@ jobs:
       - name: Run autumn-harvest-sqlite tests (issue #1068)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 3
         run: cargo test -p autumn-harvest-sqlite
+      # The agent-daemon example's suite is offline: a scripted stub model, no
+      # API key, and no network. Linux only, because the daemon's control
+      # surface is a Unix domain socket.
+      - name: Run claude-agent-daemon example tests
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true' && matrix.shard == 3
+        run: cargo test -p claude-agent-daemon
       # Issue #1312. `--lib` only: the crate's integration suites need a live
       # Redis (and, for the end-to-end suite, a live Postgres), so they run on
       # the Docker-backed `test-db-linux` job through the manifest instead.
       - name: Run autumn-harvest-redis unit tests (issue #1312)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 3
         run: cargo test -p autumn-harvest-redis --lib
+      # No CI job ever built or ran these three example crates' own test
+      # suites. Each ships real, in-memory (`WorkflowSimulator`) tests for the
+      # documented pattern it exists to demonstrate -- saga-choreography's
+      # signal/child-workflow saga (docs/getting-started/04-signals.md tells a
+      # reader to run `cargo test -p saga-choreography` directly),
+      # billing-autumn-web's checkout saga (README.md's first pointer past
+      # hello-world), and standalone-runner's external-runner mode -- but
+      # nothing before this step exercised any of them beyond `cargo build`.
+      # The only existing coverage was narrow grep guards for specific past
+      # docs defects (check-search-attr-query-syntax.sh,
+      # check-readme-testing-dep-version.sh, check-no-powershell-env-syntax.sh),
+      # none of which touch the crates' own assertions. None need a live
+      # database, so they run here rather than on `test-db-linux`.
+      - name: Run saga-choreography example tests
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 0
+        run: cargo test -p saga-choreography
+      - name: Run billing-autumn-web example tests
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 1
+        run: cargo test -p billing-autumn-web
+      - name: Run standalone-runner example tests
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 2
+        run: cargo test -p standalone-runner
       - name: Run business_metrics example tests (issue #758)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 0
         run: cargo test -p autumn-harvest --no-default-features --features testing --example business_metrics
@@ -843,8 +1045,145 @@ jobs:
       # SEMAPHORE_SHARD_COUNT below MUST equal this list's length -- GitHub
       # Actions matrix expressions can't derive one from the other, so keep
       # them in sync by hand when changing the shard count.
+      #
+      # 21, not 11 (issue #1685 review; see also PR #1703's
+      # `docs/audits/shard-weight-drift.py`, a report-only harness that
+      # independently reaches the same "no N is collision-free" finding
+      # below with a more careful count -- it resolves substring-matched
+      # manifest filters and plugin-crate rows this comment's own earlier
+      # drafts undercounted). 11 was chosen (issue #1267) to break a 10-row
+      # gap between `integration_e2e` and `quota_enforcement_tests`, the
+      # manifest's two largest suites at the time. The manifest keeps
+      # growing alphabetically, and their gap silently drifted back onto a
+      # value 11 cannot tolerate either. That drift is real and confirmed.
+      #
+      # This comment went through eight rounds of correction (kept here
+      # rather than silently rewritten, since a later commit's diff is not
+      # where a future reader will look for this history):
+      #
+      # Round 1 computed weight from `autumn-harvest/integration` rows
+      # only, flattening every `autumn-harvest-plugin` row to weight 1
+      # (`ui_integration` alone is 148 tests) -- and separately mislabeled
+      # which shard was heaviest under that undercount (claimed shard 0 at
+      # 323). Chose 17.
+      #
+      # Round 2 (Codex review) fixed the mislabeling -- shard 7, not shard
+      # 0, was actually heaviest (323 vs shard 0's 268) -- but left the
+      # plugin-row undercount itself in place. Still chose 17.
+      #
+      # Round 3 (Codex review) found the real bug behind both: five
+      # manifest `filter` values are Cargo substring/prefix matches, not
+      # filenames, so the naive per-row weight lookup silently scored them
+      # 0. Switched to PR #1703's `docs/audits/shard-weight-drift.py`, a
+      # harness that resolves plugin-crate rows and substring filters
+      # correctly, and re-swept N=9-24 with it. 20 came out best in that
+      # range (max 247, versus 17's true max, which is higher than round
+      # 2 ever computed). Chose 20.
+      #
+      # Round 4: this PR's own live CI reproduced the
+      # `quota_enforcement_tests` hang again, on shard 4 under the new
+      # N=20 layout -- a shard confirmed isolated from every other heavy
+      # (>=30-test) suite. An earlier draft of this history claimed that
+      # recurrence "confirms shard load is not the cause"; Codex review
+      # correctly narrowed that to "rules out heavy-suite collision as a
+      # necessary condition," since one occurrence on a shard still running
+      # seven smaller suites cannot rule out load-sensitivity in general.
+      # No shard-count change.
+      #
+      # Round 5 (this one, Codex review): the N=9-24 sweep behind round 3's
+      # choice only covered the sharded `run linux` step. The same job also
+      # runs `Integration suites (partitioned harvest_events layout)`
+      # unconditionally on `matrix.shard == 0` (below), re-running 9 more
+      # rows -- including a full second pass of `integration_e2e`, 118
+      # tests -- worth a fixed +188 that ALWAYS lands on shard 0 regardless
+      # of N. Under round 3's N=20, shard 0's own sharded rows already
+      # totaled 247 (`ui_integration` landed there); adding the fixed +188
+      # makes shard 0's true total 435 -- worse than the original N=11's
+      # own true max of 426. N=20 was, corrected, one of the WORST choices
+      # in the swept range, not the best.
+      #
+      # Re-swept N=9-24 with the fixed +188 correctly added to shard 0's
+      # total for every candidate. Best true max in that range: N=24 (261)
+      # and N=23 (262), essentially tied. Chose N=21 (true max 287, ~13%
+      # worse than the N=24/23 optimum) instead, for one reason with any
+      # independent merit left: `quota_enforcement_tests` lands on shard 2
+      # at N=21 with no co-resident heavy (>=30-test) suite, versus a
+      # 3-way collision at N=23 and a 2-way collision with `ui_integration`
+      # at N=24. That isolation is NOT established to help the actual hang
+      # (see below) -- it is the one property this fix can still honestly
+      # claim, at a real but small cost in overall balance.
+      #
+      # Round 6 (Codex review): round 5's own "426" figure for N=11 was
+      # never re-derived with the same +188 addition -- it was carried over
+      # from the ORIGINAL (pre-linuxpart-fix) sweep, where 426 was a
+      # different shard's total (shard 7), not shard 0's. Actually running
+      # the harness at N=11 finds shard 0 alone already totals 417 on the
+      # sharded rows -- nearly the old "max" by itself, before the fixed
+      # pass is even added. With it: shard 0's true total at N=11 is 605,
+      # not 426. That retracts round 5's claim that N=20 (435) was worse
+      # than doing nothing: N=20 is still better than N=11, just not the
+      # best available. Full corrected sweep (all of N=9-24, not a spot
+      # check): true max ranges from N=24's 261 (best) through N=11's 605
+      # (worst); N=21's 287 is third-best overall, ~53% below the true
+      # N=11 baseline (605), not the ~13%-worse-than-optimum framing round
+      # 5 gave in isolation. The N=21 choice itself is unchanged -- it
+      # remains the best option that also keeps `quota_enforcement_tests`
+      # isolated (checked directly: N=18, the next lower true-max candidate
+      # that also isolates it, is 316, still worse than N=21's 287).
+      #
+      # Round 7 (Codex review): round 6's isolation check above named only
+      # N=18 and N=20 as the other isolating candidates. Testing every
+      # N=9-24 directly against the harness's own heavy-collision function,
+      # rather than the two that had already come up in conversation, finds
+      # THREE more: N=9, N=10, N=14 all isolate `quota_enforcement_tests`
+      # too. None beats N=21 (their true maxima are 472, 520, and 429 --
+      # all worse than 287), so the shipped shard count does not change.
+      # Only the claim of an exhaustive check was wrong; it is exhaustive
+      # now (see the report's "🔍 Sixth correction" for the full N=9-24
+      # isolation table).
+      #
+      # No shard count in 9-24 is collision-free (confirmed, this round,
+      # under the corrected accounting too) -- a durable fix needs a
+      # weight-aware assignment that also accounts for the linuxpart pass,
+      # not a bigger modulus, and that is a bigger change than this fix
+      # attempts.
+      #
+      # Round 8 (Codex review): every round above measured test-WEIGHT
+      # redistribution and called the result a "CI-cost improvement." It
+      # isn't one. Ten more matrix jobs (11 -> 21) each pay their own fixed
+      # setup cost -- checkout, toolchain install, `rust-cache` restore,
+      # disk pruning, four Docker pulls -- regardless of how many tests
+      # they run; the 151 manifest rows are only redistributed, not
+      # reduced. Total GitHub Actions runner-minutes per run almost
+      # certainly goes UP, not down. Fitting `duration = fixed + rate *
+      # weight` against ten real `Test DB (linux, shard N)` job timings
+      # (from an unrelated PR's N=11 run, so uncontaminated by this PR's
+      # own changes) gives a rough fixed cost of ~16 min/job -- noisy, but
+      # not negligible: ~160 extra runner-minutes per CI run for the ten
+      # new jobs. The wall-clock benefit for the slowest shard specifically
+      # is real but smaller than the weight ratio implies once that fixed
+      # cost is included: ~30% (about 37.7 -> 26.5 min by the same fit),
+      # not 52.6%. That benefit also assumes the runner pool has spare
+      # concurrency for the extra jobs -- unverified this session; a
+      # constrained pool could queue the new shards and erode or eliminate
+      # the latency win while still paying the extra fixed cost. See the
+      # report's "🔍 Seventh correction" for the full derivation.
+      #
+      # Whether shard load explains `quota_enforcement_tests`'s recurring,
+      # exactly-at-the-configured-timeout hang at all -- named by the "🚦
+      # Semaphore" CI-health report series
+      # (docs/rnd/2026-09-*-ci-health-semaphore-quota-outbox-*.md) and
+      # multiple concurrent PRs (#1697, #1698, #1699, #1706 at the time of
+      # this fix) -- is NOT established, and this PR's own first CI run
+      # (see the report) reproduced the hang on an isolated shard, which
+      # rules out heavy-suite collision as a NECESSARY condition (not shard
+      # load or probabilistic causes in general -- see the report for that
+      # distinction). This change is offered as a real, measured
+      # worst-case wall-clock latency improvement for the slowest shard,
+      # traded against higher total compute cost -- not a CI-cost
+      # improvement, and not a claimed fix for the hang.
       matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -863,6 +1202,39 @@ jobs:
             /usr/local/share/boost /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
           sudo docker image prune --all --force > /dev/null 2>&1 || true
           df -h /
+      # The prune above guarantees every shard pulls its testcontainer images
+      # from a cold cache. `testcontainers` itself retries nothing on a pull,
+      # so a transient registry blip (a real one: "bytes remaining on stream"
+      # failed this exact job on issue #1287's PR) fails whichever live-DB
+      # test happened to trigger the pull -- not a real test bug. Retrying
+      # the pull here, in its own step with its own budget, turns that into a
+      # retried infrastructure step instead of a flaky test.
+      #
+      # Every tag this job's suites actually request, not just the
+      # testcontainers-modules default (Codex review: the default alone left
+      # the suites that override it just as exposed as before):
+      # `postgres:11-alpine` (the unoverridden default -- `autumn-web`'s own
+      # `TestDb`, used by e.g. the webhook suites), `postgres:16` (the tag
+      # ~220 of this repo's own DB suites request via `.with_tag("16")`),
+      # `postgres:16-alpine` (one outlier suite's override), and `redis:5.0`
+      # (Redis's default, un-overridden anywhere; needed by the issue #1312
+      # dispatch suites this job also forces via HARVEST_TEST_REQUIRE_REDIS
+      # below).
+      - name: Pre-pull Docker test images (retry transient pull failures)
+        if: needs.changes.outputs.code == 'true'
+        shell: bash
+        run: |
+          for image in postgres:11-alpine postgres:16 postgres:16-alpine redis:5.0; do
+            for attempt in 1 2 3 4 5; do
+              if docker pull "$image"; then
+                continue 2
+              fi
+              echo "pull of $image failed (attempt $attempt/5)"
+              sleep $((attempt * 5))
+            done
+            echo "::error::failed to pull $image after 5 attempts"
+            exit 1
+          done
       - name: Run Linux Docker-backed manifest suites (shard)
         if: needs.changes.outputs.code == 'true'
         shell: bash
@@ -882,7 +1254,7 @@ jobs:
           # into a panic, so "the Redis suites stopped testing anything" is a
           # red build here rather than a silent green.
           HARVEST_TEST_REQUIRE_REDIS: "1"
-          SEMAPHORE_SHARD_COUNT: "10"
+          SEMAPHORE_SHARD_COUNT: "21"
           SEMAPHORE_SHARD_INDEX: ${{ matrix.shard }}
         run: bash .github/ci/run-suites.sh run linux
       # Issue #958, AC2: re-run the store/replay/retention suites against the

@@ -82,15 +82,37 @@ const PLUGIN_HARVEST_MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrati
 /// rather than guessing: applying the sets to the app database for an unknown
 /// mode could create Harvest tables in the wrong place, while registering only
 /// the outbox would let migration-only commands report false success.
-fn register_plugin_migrations(app: AppBuilder) -> AppBuilder {
+/// `require_embedded` is set only by the dev runtime (issue #1291): when
+/// true, a resolved mode other than `Embedded` panics rather than silently
+/// registering split/external migrations. The dev runtime's own startup gate
+/// already refuses this earlier; this is a backstop for ambient
+/// configuration changing in the narrow window since that check.
+fn register_plugin_migrations(app: AppBuilder, require_embedded: bool) -> AppBuilder {
     let app = app.plugin_migrations("autumn-harvest-plugin (outbox)", OUTBOX_MIGRATIONS);
 
-    match migration_registration_mode(HarvestRuntimeConfig::load()) {
+    let mode = migration_registration_mode(HarvestRuntimeConfig::load());
+    assert!(
+        !embedded_harvest_mode_violated(require_embedded, mode),
+        "harvest dev runtime requires embedded Harvest storage, but ambient configuration now \
+         resolves harvest.mode to {mode:?}. This should be unreachable: the dev runtime's own \
+         startup gate (issue #1291) already refuses this case, so ambient configuration must \
+         have changed since that check"
+    );
+    match mode {
         HarvestMode::Embedded => app
             .plugin_migrations("autumn-harvest", HARVEST_MIGRATIONS)
             .plugin_migrations("autumn-harvest-plugin", PLUGIN_HARVEST_MIGRATIONS),
         HarvestMode::Split | HarvestMode::External => app,
     }
+}
+
+/// Whether the dev runtime's embedded-only backstop (issue #1291) should
+/// refuse. True only when the caller requires embedded storage and the
+/// resolved mode is not `Embedded`. Pure so both call sites --
+/// [`register_plugin_migrations`] and `start_harvest_runtime` -- share one
+/// unit-testable decision instead of duplicating the boolean logic.
+const fn embedded_harvest_mode_violated(require_embedded: bool, mode: HarvestMode) -> bool {
+    require_embedded && !matches!(mode, HarvestMode::Embedded)
 }
 
 /// Resolve the topology before migration registration. This must be fail-fast:
@@ -138,10 +160,13 @@ struct HarvestRuntimeSlot {
     connectors: Vec<ConnectorRegistration>,
 }
 
+/// Wraps the nested management-API router in the embedder's auth layer.
+///
+/// Operates on `Router<()>` because both exported routers are state-free
+/// (issue #1606). The router is converted to `Router<AppState>` once, at the
+/// `AppBuilder::nest` boundary below.
 type ApiMiddlewareFn = Box<
-    dyn FnOnce(
-            autumn_web::reexports::axum::Router<autumn_web::AppState>,
-        ) -> autumn_web::reexports::axum::Router<autumn_web::AppState>
+    dyn FnOnce(autumn_web::reexports::axum::Router<()>) -> autumn_web::reexports::axum::Router<()>
         + Send
         + Sync,
 >;
@@ -234,6 +259,14 @@ pub struct HarvestPlugin {
     /// [`Self::with_metrics_scrape`] (feature `metrics`).
     #[cfg(feature = "metrics")]
     metrics_scrape_enabled: bool,
+    /// Refuse to build unless ambient Harvest configuration resolves to
+    /// `embedded` mode (issue #1291). Set only by the dev runtime
+    /// (`crate::dev`) via [`Self::require_embedded_harvest_mode`]; every
+    /// ordinary embedder leaves this `false` and keeps full `split`/
+    /// `external` support. This is a backstop: the dev runtime's own
+    /// startup gate already refuses this case earlier. It only matters if
+    /// ambient configuration changed in the narrow window since.
+    require_embedded_harvest_mode: bool,
 }
 
 /// One registered broker connector: a binding plus the source that feeds it.
@@ -312,6 +345,7 @@ impl HarvestPlugin {
             connectors: Vec::new(),
             #[cfg(feature = "metrics")]
             metrics_scrape_enabled: false,
+            require_embedded_harvest_mode: false,
         }
     }
 
@@ -774,6 +808,24 @@ impl HarvestPlugin {
         });
         self
     }
+
+    /// Refuse to build, and refuse to start, unless ambient Harvest
+    /// configuration resolves to `embedded` mode (issue #1291).
+    ///
+    /// Crate-internal: only the dev runtime (`crate::dev`) calls this. It
+    /// owns one ephemeral cluster and has no second database to offer
+    /// `split`/`external` storage. It already refuses ambient non-embedded
+    /// configuration before this plugin is ever built. This flag is a
+    /// backstop against ambient configuration changing in the narrow window
+    /// since that check. It is checked again both at build time
+    /// ([`register_plugin_migrations`]) and at startup
+    /// ([`start_harvest_runtime`]).
+    #[cfg(feature = "dev-runtime")]
+    #[must_use]
+    pub(crate) const fn require_embedded_harvest_mode(mut self) -> Self {
+        self.require_embedded_harvest_mode = true;
+        self
+    }
 }
 
 /// Validate every registered binding, then spawn one consumer loop per binding.
@@ -1051,15 +1103,20 @@ impl Plugin for HarvestPlugin {
             connectors,
             #[cfg(feature = "metrics")]
             metrics_scrape_enabled,
+            require_embedded_harvest_mode,
         } = self;
         #[cfg(not(feature = "mcp"))]
         let _ = (mcp_tool_middleware, mcp_tools_enabled, mcp_tools_prefix);
 
         // Autumn owns migrations for every set that lives in the application
         // database (autumn-web 0.7). See `register_plugin_migrations`.
-        let app = register_plugin_migrations(app);
+        let app = register_plugin_migrations(app, require_embedded_harvest_mode);
 
         let api_state = HarvestApiState::new();
+        // Issue #1291: mirror onto `api_state` so `start_harvest_runtime` --
+        // which only receives `api_state`, not this consumed `HarvestPlugin`
+        // -- can also refuse a non-embedded ambient mode.
+        api_state.set_require_embedded_harvest_mode(require_embedded_harvest_mode);
 
         // Issue #355: one shared `HarvestMetricsRecorder` instance backs both
         // the engine-side `MetricsRecorder` (installed on `builder` before it
@@ -1425,39 +1482,26 @@ impl Plugin for HarvestPlugin {
 
         if let Some(path) = api_path {
             let ui_router = harvest_ui_router(api_state.clone());
-            // Clone the state for the token layer only when it will be installed,
-            // so a disabled deployment does an identical amount of work as before.
-            let token_layer_state = api_tokens_enabled.then(|| api_state.clone());
-            let mut router = harvest_api_router(api_state).nest("/ui", ui_router);
-            // Issue #776: install the class-aware read-only enforcement layer
-            // BEFORE the embedder's auth middleware wraps the router, so the
-            // request order is: embedder auth mw (sets Session) → this layer
-            // (reads Session + method + nest-stripped path) → per-route
-            // require_admin → handler. Applied to the combined router so it
-            // also covers the nested /ui sub-router (which, being unclassified,
-            // fails closed → 403 for read-only principals). Only installed
-            // under api_with_role_auth; the default and api_with_auth paths are
-            // byte-for-byte unchanged (AC6).
-            if role_auth_enabled {
-                router = router.layer(autumn_web::reexports::axum::middleware::from_fn(
-                    crate::api::enforce_read_only_class,
-                ));
-            }
-            // Issue #942: install the scoped-API-token verification + scope layer
-            // OUTSIDE the read-only-class layer (so it runs first: verify token →
-            // set TokenPrincipal / authoritative actor → deny read-scope mutation)
-            // and INSIDE the embedder's auth middleware. Only installed under
-            // enable_api_tokens(); the default path is byte-for-byte unchanged (AC7).
-            if let Some(state) = token_layer_state {
-                router = router.layer(autumn_web::reexports::axum::middleware::from_fn_with_state(
-                    state,
-                    crate::api_token::enforce_token_scope,
-                ));
-            }
+            let router = harvest_api_router(api_state.clone()).nest("/ui", ui_router);
+            // The layer stack and its load-bearing ordering live in
+            // `apply_admin_auth_layers`, which the standalone mount path also
+            // calls (issue #1608), so the two cannot drift. Neither layer is
+            // installed unless its opt-in is set, so the default and
+            // api_with_auth paths are byte-for-byte unchanged (AC6, AC7).
+            let mut router = crate::api::apply_admin_auth_layers(
+                router,
+                &api_state,
+                api_tokens_enabled,
+                role_auth_enabled,
+            );
             if let Some(mw) = api_middleware {
                 router = mw(router);
             }
-            app.nest(&path, router)
+            // `AppBuilder::nest` takes a `Router<AppState>`. The router is
+            // `Router<()>`, so it declares the state type it never reads
+            // (issue #1606). No handler in either router takes a `State`
+            // extractor for it.
+            app.nest(&path, router.with_state(()))
         } else {
             let _ = api_tokens_enabled;
             app
@@ -1636,6 +1680,21 @@ async fn start_harvest_runtime(
     let app_config = resolve_app_config(state);
     let harvest_config = HarvestRuntimeConfig::load()
         .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
+    // Issue #1291 backstop: the dev runtime already refused a non-embedded
+    // ambient mode before this plugin was even built. This only fires if
+    // ambient configuration changed in the narrow window since that check.
+    if embedded_harvest_mode_violated(
+        api_state.require_embedded_harvest_mode(),
+        harvest_config.mode,
+    ) {
+        return Err(AutumnError::service_unavailable_msg(format!(
+            "harvest dev runtime requires embedded Harvest storage, but ambient configuration \
+             now resolves harvest.mode to {:?}. This should be unreachable: the dev runtime's \
+             own startup gate already refuses this case, so ambient configuration must have \
+             changed since that check",
+            harvest_config.mode
+        )));
+    }
     let workflow_result_notification_url = harvest_database_url(&app_config, &harvest_config)?;
     api_state.set_health_requires_shard_readiness(harvest_config.readiness.require_shard_readiness);
     api_state
@@ -2010,6 +2069,13 @@ async fn start_harvest_runtime(
                 let metrics = registry
                     .as_ref()
                     .map(|r| std::sync::Arc::clone(&r.telemetry().metrics));
+                // Issue #1243: `input` above is payload-bearing. Fall back to
+                // the identity registry only in the boot window where the
+                // registry extension is not yet installed.
+                let codecs = registry
+                    .as_ref()
+                    .map(|r| r.payload_codecs().clone())
+                    .unwrap_or_default();
                 let (owner, runbook_url, severity, info_sla, info_retry_policy) = registry
                     .and_then(|registry| {
                         registry.workflows.get("webhook_delivery").map(|wf| {
@@ -2135,11 +2201,12 @@ async fn start_harvest_runtime(
                     // webhook delivery is in-flight continuation of already-committed
                     // work and must not be permanently dropped by a boot/DB blip it
                     // cannot retry past.
-                    match autumn_harvest::execution::start_or_load_workflow_execution_with_metrics(
+                    match autumn_harvest::execution::start_or_load_workflow_execution_with_metrics_and_codecs(
                         &mut conn,
                         start_params,
                         metrics_ref,
                         Some(autumn_harvest::admission_gate::GateMode::CheckCached),
+                        &codecs,
                     )
                     .await
                     {
@@ -3560,6 +3627,25 @@ mod tests {
         migration_registration_mode(Err(autumn_web::config::ConfigError::Validation(
             "bad mode".to_owned(),
         )));
+    }
+
+    /// The pinned-mode backstop (issue #1291), unit-tested at the pure
+    /// predicate both `register_plugin_migrations` and
+    /// `start_harvest_runtime` share.
+    #[test]
+    fn embedded_harvest_mode_violated_only_when_required_and_not_embedded() {
+        assert!(!embedded_harvest_mode_violated(
+            false,
+            HarvestMode::Embedded
+        ));
+        assert!(!embedded_harvest_mode_violated(false, HarvestMode::Split));
+        assert!(!embedded_harvest_mode_violated(
+            false,
+            HarvestMode::External
+        ));
+        assert!(!embedded_harvest_mode_violated(true, HarvestMode::Embedded));
+        assert!(embedded_harvest_mode_violated(true, HarvestMode::Split));
+        assert!(embedded_harvest_mode_violated(true, HarvestMode::External));
     }
 
     /// Pins the ownership split itself: under `Embedded` the plugin migrates

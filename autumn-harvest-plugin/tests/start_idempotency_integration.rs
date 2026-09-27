@@ -34,7 +34,6 @@ use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -163,7 +162,7 @@ fn build_app(pool: &DbPool, infos: Vec<WorkflowInfo>) -> HarvestApiApp {
         ShardRouter::default(),
     ));
 
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 /// POST a start, optionally supplying an `Idempotency-Key` header.
@@ -558,7 +557,7 @@ async fn multi_shard_same_key_converges_on_one_execution() {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         router,
     ));
-    let app = harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(api_state);
 
     // Two same-key starts, each with an OMITTED workflow_id (auto-generated).
     let (s1, b1) = post_start(
@@ -648,7 +647,7 @@ async fn explicit_workflow_id_keyed_start_preserves_reject_duplicate() {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         router,
     ));
-    let app = harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(api_state);
 
     // Prior run: explicit workflow_id, NO key → routes by workflow_id.
     let (s0, b0) = post_start(
@@ -745,7 +744,7 @@ async fn auto_generated_workflow_id_belongs_to_the_key_shard() {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         router,
     ));
-    let app = harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(api_state);
 
     // Keyed start OMITTING workflow_id (auto-generated + minted onto the key shard).
     let (s1, b1) = post_start(
@@ -808,7 +807,7 @@ async fn explicit_reuse_of_a_keyed_auto_workflow_id_is_seen_uniqueness_preserved
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         router,
     ));
-    let app = harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(api_state);
 
     // Keyed start OMITTING workflow_id → minted onto the key shard.
     let (s1, b1) = post_start(
@@ -929,8 +928,7 @@ async fn keyed_replay_bypasses_a_raised_admission_gate() {
         set_global_admission_gate_cache(Some(api_state.gate_cache()));
     };
 
-    let app =
-        harvest_api_router(api_state.clone()).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(api_state.clone());
 
     // 1. Gate raised → a FRESH keyed start is rejected (503), as today.
     raise_gate();

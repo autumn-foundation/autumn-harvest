@@ -296,10 +296,18 @@ where one exists.
   cross-shard workflow composition — an explicit scope boundary in the
   [sharding contract](sharding.md), not a bug, but a limit to know before you
   design around shards.
-- **No first-party benchmarks yet.** harvest publishes no reproducible
-  performance numbers today, so throughput/latency claims here are deliberately
-  absent. Planned: a reproducible end-to-end benchmark suite
-  ([#941](https://github.com/autumn-foundation/autumn-harvest/issues/941)).
+- **No cross-engine benchmark on equal hardware.** harvest now publishes its
+  own reproducible end-to-end numbers and the harness that produces them
+  ([`benchmarks.md`](benchmarks.md),
+  [#941](https://github.com/autumn-foundation/autumn-harvest/issues/941)), so
+  this page no longer has to omit performance entirely. What is still missing
+  is the thing a comparison page actually needs: **every engine measured on
+  one machine, each tuned by someone who operates it.** No cell on this page
+  claims a throughput or latency comparison against another engine, and none
+  will until that exists. A competitor's own published figure is not a
+  substitute — it carries hardware, configuration and staleness this project
+  cannot vouch for, and its unit is usually per-action or per-state-transition
+  rather than per-workflow.
 
 ---
 

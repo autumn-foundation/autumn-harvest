@@ -1178,6 +1178,8 @@ pub struct ReplayDebugger {
     history_policy: WorkflowHistoryPolicy,
     build_id: Option<String>,
     payload_limits: crate::executor::ReplayPayloadLimits,
+    default_activity_retry_policy: Option<crate::policy::RetryPolicy>,
+    default_activity_start_to_close: Option<Duration>,
     declarative_queries: Vec<crate::info::QueryHandlerInfo>,
     declarative_updates: Vec<crate::info::UpdateHandlerInfo>,
     payload_offloader: Option<std::sync::Arc<crate::payload_store::PayloadOffloader>>,
@@ -1213,6 +1215,8 @@ impl ReplayDebugger {
             history_policy: WorkflowHistoryPolicy::default(),
             build_id: None,
             payload_limits: crate::executor::ReplayPayloadLimits::default(),
+            default_activity_retry_policy: None,
+            default_activity_start_to_close: None,
             declarative_queries: Vec::new(),
             declarative_updates: Vec::new(),
             payload_offloader: None,
@@ -1370,6 +1374,24 @@ impl ReplayDebugger {
     #[must_use]
     pub const fn payload_offload_threshold(mut self, threshold: Option<u64>) -> Self {
         self.payload_limits.offload_threshold = threshold;
+        self
+    }
+
+    /// Apply the candidate build's local-activity defaults (#620).
+    ///
+    /// These defaults live in worker configuration, not history. Pass `retry`
+    /// then `start_to_close` from
+    /// [`WorkerConfig::with_default_activity_retry_policy`](crate::worker::WorkerConfig::with_default_activity_retry_policy)
+    /// and
+    /// [`WorkerConfig::with_default_activity_start_to_close`](crate::worker::WorkerConfig::with_default_activity_start_to_close).
+    #[must_use]
+    pub fn activity_defaults(
+        mut self,
+        retry: Option<crate::policy::RetryPolicy>,
+        start_to_close: Option<Duration>,
+    ) -> Self {
+        self.default_activity_retry_policy = retry;
+        self.default_activity_start_to_close = start_to_close;
         self
     }
 
@@ -1533,6 +1555,11 @@ impl ReplayDebugger {
             self.payload_limits.max_workflow_input,
         )
         .with_payload_offload_threshold(self.payload_limits.offload_threshold);
+
+        ctx = ctx.with_activity_defaults(
+            self.default_activity_retry_policy.clone(),
+            self.default_activity_start_to_close,
+        );
 
         if let Some(workflow_id) = snapshot.workflow_id.clone() {
             ctx = ctx.with_workflow_id(workflow_id);

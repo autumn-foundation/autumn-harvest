@@ -45,7 +45,6 @@ use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -432,8 +431,7 @@ fn build_app_with_state(pool: &DbPool) -> (HarvestApiApp, HarvestApiState) {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::default(),
     ));
-    let app =
-        harvest_api_router(api_state.clone()).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(api_state.clone());
     (app, api_state)
 }
 
@@ -472,7 +470,7 @@ fn build_app_two_shard_dead_second(live_pool: &DbPool) -> HarvestApiApp {
             ShardId::new(0),
         ),
     ));
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 async fn get(app: &HarvestApiApp, uri: &str) -> (StatusCode, Value) {

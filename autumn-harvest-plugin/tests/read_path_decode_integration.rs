@@ -20,6 +20,7 @@
 
 use std::sync::Arc;
 
+use autumn_harvest::models::NewHarvestEvent;
 use autumn_harvest::payload_codec::{
     CodecError, PayloadCodec, PayloadCodecs, UNDECODABLE_MARKER_KEY,
     UNDECODABLE_REASON_UNKNOWN_CODEC,
@@ -39,7 +40,6 @@ use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -182,7 +182,7 @@ fn build_app_with(pool: &DbPool, config: &AppConfig<'_>) -> HarvestApiApp {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::default(),
     ));
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 /// The full decode-enabled admin app.
@@ -269,6 +269,44 @@ async fn get_json(app: &HarvestApiApp, uri: &str) -> (StatusCode, Value) {
 }
 
 // ── Seeding helpers ──────────────────────────────────────────────────────────
+
+/// Undo the identity codec's collision-escape nesting (issue #1253) on the
+/// `WorkflowStarted` event's `input`, restoring it to `encoded_input`
+/// exactly as given.
+///
+/// `seed_running` starts the workflow through `start_or_load_workflow_execution`,
+/// the real engine path. It always encodes the `WorkflowStarted` event
+/// through identity codecs. Suppose a caller hands `seed_running` an
+/// already-envelope-shaped `input`, to simulate a foreign codec-encrypting
+/// write (as `describe_and_history_pages_emit_decoded_payloads` does). The
+/// escape guard then sees a collision and wraps it a second time. That is
+/// correct for a real caller, whose plaintext coincidentally looks like an
+/// envelope. Here it is a test artifact: this fixture wants the SINGLE
+/// codec-encoded shape a real deployment stores, not identity's defensive
+/// double wrap. This patches the stored event back to that shape.
+async fn reset_workflow_started_input(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    encoded_input: Value,
+) {
+    let mut event_data: Value = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+        .filter(harvest_events::event_id.eq(0))
+        .select(harvest_events::event_data)
+        .first(conn)
+        .await
+        .expect("load WorkflowStarted row");
+    event_data["data"]["input"] = encoded_input;
+    diesel::update(
+        harvest_events::table
+            .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+            .filter(harvest_events::event_id.eq(0)),
+    )
+    .set(harvest_events::event_data.eq(event_data))
+    .execute(conn)
+    .await
+    .expect("restore WorkflowStarted input");
+}
 
 async fn seed_running(
     conn: &mut AsyncPgConnection,
@@ -359,9 +397,32 @@ async fn append_events(
     // Raw load: the seeded history may already carry non-identity envelopes,
     // which the strict identity-only `load_history` would refuse to load.
     let history = store::load_history_undecoded(conn, exec_id).await.unwrap();
-    store::append_events(conn, exec_id, events, history.next_event_id)
+    // Raw insert, not `store::append_events`: these fixtures hand-build an
+    // already-enveloped payload field (`envelope_for` et al.) to reproduce a
+    // codec deployment's on-disk shape (module doc above). `append_events`
+    // runs every field through the identity codec's `encode_payload`. That
+    // now escapes anything already shaped like an envelope, by nesting it
+    // (issue #1253). A second pass here would corrupt the fixture's
+    // hand-built shape instead of storing it verbatim.
+    let rows: Vec<NewHarvestEvent> = events
+        .iter()
+        .enumerate()
+        .map(|(i, event)| {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let event_id = history.next_event_id + i as i32;
+            NewHarvestEvent {
+                workflow_exec_id: exec_id.as_uuid(),
+                event_id,
+                event_type: event.type_name(),
+                event_data: serde_json::to_value(event).expect("serialize seed event"),
+            }
+        })
+        .collect();
+    diesel::insert_into(harvest_events::table)
+        .values(&rows)
+        .execute(conn)
         .await
-        .expect("append events");
+        .expect("insert seed events");
 }
 
 /// Seeds a pending activity task-queue row (the row backing the `/stack`
@@ -842,12 +903,9 @@ async fn describe_and_history_pages_emit_decoded_payloads() {
 
     // The workflow input itself is an envelope (identity persistence stores
     // it verbatim), plus an envelope-bearing activity event.
-    let exec_id = seed_running(
-        &mut conn,
-        "describe-decoded",
-        envelope_for(&json!({"user": "pii-alpha"})),
-    )
-    .await;
+    let started_input = envelope_for(&json!({"user": "pii-alpha"}));
+    let exec_id = seed_running(&mut conn, "describe-decoded", started_input.clone()).await;
+    reset_workflow_started_input(&mut conn, exec_id, started_input).await;
     append_events(
         &mut conn,
         exec_id,
@@ -1338,6 +1396,185 @@ async fn sse_stream_emits_decoded_frames_and_writes_decode_audit_at_open() {
     assert_eq!(audit[0].0.as_deref(), Some(exec_id.to_string().as_str()));
 }
 
+/// Issue #1458: the terminal `stream-end` block must match
+/// `docs/management-api.md`'s "Terminal marker" section. That section shows
+/// an `id:` line and a `data` object with `reason`, `execution_id`, and
+/// `state`. Today's code sends only `reason`, with no `id:` line.
+#[tokio::test]
+async fn sse_stream_end_block_carries_id_execution_id_and_state() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app_with(
+        &pool,
+        &AppConfig {
+            admin: true,
+            codecs: false,
+            decode_on_read: false,
+            notification_url: Some(&url),
+        },
+    );
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+
+    let exec_id = seed_running(&mut conn, "sse-terminal-marker", json!({})).await;
+    append_events(
+        &mut conn,
+        exec_id,
+        &[WorkflowEvent::WorkflowCompleted {
+            output: json!(null),
+        }],
+    )
+    .await;
+    mark_completed(&mut conn, exec_id, json!(null)).await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/executions/{exec_id}/events/stream"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("open SSE stream");
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        axum::body::to_bytes(response.into_body(), usize::MAX),
+    )
+    .await
+    .expect("terminal execution's stream must close after backfill")
+    .expect("read SSE body");
+    let stream_text = String::from_utf8_lossy(&bytes);
+
+    let end_block = stream_text
+        .split("\n\n")
+        .find(|block| block.contains("event: stream-end"))
+        .unwrap_or_else(|| panic!("no stream-end block in: {stream_text}"));
+
+    assert!(
+        end_block.trim_start().starts_with("id: "),
+        "stream-end block must start with an id: line: {end_block}"
+    );
+    assert!(
+        end_block.contains(&format!("\"execution_id\":\"{exec_id}\"")),
+        "stream-end data must carry execution_id: {end_block}"
+    );
+    assert!(
+        end_block.contains("\"state\":\"COMPLETED\""),
+        "stream-end data must carry the raw state: {end_block}"
+    );
+}
+
+/// Issue #1458 (semantics updated for #1405): a reconnect with
+/// `Last-Event-ID` set to the last `event_id` the client already saw yields
+/// an empty backfill. The `stream-end` block must then echo that
+/// client-supplied `event_id`, not `-1` or a stale value.
+#[tokio::test]
+async fn sse_stream_end_uses_last_event_id_header_when_backfill_is_empty() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app_with(
+        &pool,
+        &AppConfig {
+            admin: true,
+            codecs: false,
+            decode_on_read: false,
+            notification_url: Some(&url),
+        },
+    );
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+
+    let exec_id = seed_running(&mut conn, "sse-reconnect-terminal", json!({})).await;
+    append_events(
+        &mut conn,
+        exec_id,
+        &[WorkflowEvent::WorkflowCompleted {
+            output: json!(null),
+        }],
+    )
+    .await;
+    mark_completed(&mut conn, exec_id, json!(null)).await;
+
+    let last_event_id: i32 = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+        .select(harvest_events::event_id)
+        .order(harvest_events::id.desc())
+        .first(&mut conn)
+        .await
+        .unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/executions/{exec_id}/events/stream"))
+                .header("last-event-id", last_event_id.to_string())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("open SSE stream");
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        axum::body::to_bytes(response.into_body(), usize::MAX),
+    )
+    .await
+    .expect("terminal execution's stream must close after backfill")
+    .expect("read SSE body");
+    let stream_text = String::from_utf8_lossy(&bytes);
+
+    let end_block = stream_text
+        .split("\n\n")
+        .find(|block| block.contains("event: stream-end"))
+        .unwrap_or_else(|| panic!("no stream-end block in: {stream_text}"));
+
+    assert_eq!(
+        end_block.trim_start().lines().next(),
+        Some(format!("id: {last_event_id}")).as_deref(),
+        "an empty backfill must echo the client's own Last-Event-ID as id: {end_block}"
+    );
+}
+
+/// Issue #1405: `event_id` is `i32`. A non-numeric `Last-Event-ID` must
+/// still return 400, exactly as it did when the cursor was `i64`.
+#[tokio::test]
+async fn sse_stream_rejects_a_non_numeric_last_event_id() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app_with(
+        &pool,
+        &AppConfig {
+            admin: true,
+            codecs: false,
+            decode_on_read: false,
+            notification_url: Some(&url),
+        },
+    );
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+    let exec_id = seed_running(&mut conn, "sse-invalid-cursor", json!({})).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/executions/{exec_id}/events/stream"))
+                .header("last-event-id", "not-a-number")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("request must complete");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read error body");
+    let json: Value = serde_json::from_slice(&bytes).expect("error body must be JSON");
+    assert_eq!(json["error"], "invalid_last_event_id");
+}
+
 /// AC6: decode-only-when-admin. On an ungated route, a non-admin caller
 /// (flag on, no session) receives today's bytes — the stored ciphertext.
 #[tokio::test]
@@ -1406,12 +1643,9 @@ async fn audit_row_written_once_per_request_and_contains_no_payload_content() {
         .expect("envelope data is base64 text")
         .to_string();
 
-    let exec_id = seed_running(
-        &mut conn,
-        "audit-once",
-        envelope_for(&json!({"pii": "pii-alpha"})),
-    )
-    .await;
+    let started_input = envelope_for(&json!({"pii": "pii-alpha"}));
+    let exec_id = seed_running(&mut conn, "audit-once", started_input.clone()).await;
+    reset_workflow_started_input(&mut conn, exec_id, started_input).await;
     append_events(
         &mut conn,
         exec_id,

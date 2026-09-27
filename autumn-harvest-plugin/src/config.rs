@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
+use autumn_harvest::dispatch::DEFAULT_DISPATCH_RECONCILE_BATCH;
 use autumn_web::config::{ConfigError, DatabaseConfig, Env, OsEnv};
 use serde::Deserialize;
 
@@ -80,6 +81,8 @@ pub struct HarvestRedisConfig {
     pub poll_interval_ms: u64,
     /// Interval for the reconcile sweep over due `PENDING` rows.
     pub reconcile_interval_ms: u64,
+    /// Row cap for one reconcile sweep per queue (issue #1429).
+    pub reconcile_batch: usize,
 }
 
 /// What to do when workflow-type reachability finds an orphaned type at
@@ -224,6 +227,9 @@ impl HarvestRuntimeConfig {
         if let Some(reconcile_interval_ms) = partial.redis.reconcile_interval_ms {
             self.redis.reconcile_interval_ms = reconcile_interval_ms;
         }
+        if let Some(reconcile_batch) = partial.redis.reconcile_batch {
+            self.redis.reconcile_batch = reconcile_batch;
+        }
     }
 
     fn apply_env_overrides(&mut self, env: &dyn Env) -> Result<(), ConfigError> {
@@ -326,6 +332,10 @@ impl HarvestRuntimeConfig {
                 "AUTUMN_HARVEST_REDIS__RECONCILE_INTERVAL_MS",
                 &reconcile_interval_ms,
             )?;
+        }
+        if let Ok(reconcile_batch) = env.var("AUTUMN_HARVEST_REDIS__RECONCILE_BATCH") {
+            self.redis.reconcile_batch =
+                parse_usize("AUTUMN_HARVEST_REDIS__RECONCILE_BATCH", &reconcile_batch)?;
         }
 
         Ok(())
@@ -435,6 +445,11 @@ impl HarvestRuntimeConfig {
                 "harvest.redis.reconcile_interval_ms must be at least 1".to_owned(),
             ));
         }
+        if self.redis.reconcile_batch < 1 {
+            return Err(ConfigError::Validation(
+                "harvest.redis.reconcile_batch must be at least 1".to_owned(),
+            ));
+        }
 
         if self.redis.url.is_some() && !cfg!(feature = "redis") {
             return Err(ConfigError::Validation(
@@ -447,6 +462,77 @@ impl HarvestRuntimeConfig {
 
         Ok(())
     }
+}
+
+/// Where a resolved `harvest.mode` value came from (issue #1291).
+///
+/// A refusal that only names the resolved mode leaves a developer guessing
+/// where it came from. This says exactly that, so a refusal message can name
+/// the variable or file to change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HarvestModeSource {
+    /// No override anywhere. The value is the built-in default, `embedded`.
+    Default,
+    /// The `AUTUMN_HARVEST__MODE` environment variable set it.
+    Env,
+    /// This config file set it, in its `[harvest]` table.
+    ConfigFile(PathBuf),
+}
+
+impl std::fmt::Display for HarvestModeSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Default => write!(f, "the built-in default"),
+            Self::Env => write!(f, "the AUTUMN_HARVEST__MODE environment variable"),
+            Self::ConfigFile(path) => write!(f, "{}", path.display()),
+        }
+    }
+}
+
+/// Resolve `harvest.mode` and say where the value came from.
+///
+/// A narrow twin of [`HarvestRuntimeConfig::load_with_env`]. It reads the
+/// same config files under the same precedence — root file, then
+/// profile-specific file, then environment — but tracks one field only.
+/// A caller that must name the responsible variable or file reads the
+/// source here. The dev runtime's startup gate does this (issue #1291). A
+/// fully loaded [`HarvestRuntimeConfig`] drops that provenance.
+///
+/// # Errors
+///
+/// Returns [`ConfigError`] when a config file cannot be read or parsed, or
+/// when `AUTUMN_HARVEST__MODE` names an unrecognised mode.
+pub fn resolve_harvest_mode_source(
+    env: &dyn Env,
+) -> Result<(HarvestMode, HarvestModeSource), ConfigError> {
+    let profile = resolve_profile(env);
+    let mut mode = HarvestMode::default();
+    let mut source = HarvestModeSource::Default;
+
+    let root_path = find_config_file_named("autumn.toml", env);
+    if let Some(root) = load_partial_root(&root_path)?
+        && let Some(configured) = root.harvest.mode
+    {
+        mode = configured;
+        source = HarvestModeSource::ConfigFile(root_path);
+    }
+
+    if let Some(profile) = &profile {
+        let profile_path = find_config_file_named(&format!("autumn-{profile}.toml"), env);
+        if let Some(root) = load_partial_root(&profile_path)?
+            && let Some(configured) = root.harvest.mode
+        {
+            mode = configured;
+            source = HarvestModeSource::ConfigFile(profile_path);
+        }
+    }
+
+    if let Ok(raw) = env.var("AUTUMN_HARVEST__MODE") {
+        mode = parse_mode(&raw)?;
+        source = HarvestModeSource::Env;
+    }
+
+    Ok((mode, source))
 }
 
 impl Default for HarvestRuntimeConfig {
@@ -486,6 +572,7 @@ impl Default for HarvestRedisConfig {
             visibility_timeout_ms: 60_000,
             poll_interval_ms: 20,
             reconcile_interval_ms: 1_000,
+            reconcile_batch: DEFAULT_DISPATCH_RECONCILE_BATCH,
         }
     }
 }
@@ -581,6 +668,7 @@ struct PartialHarvestRedisConfig {
     visibility_timeout_ms: Option<u64>,
     poll_interval_ms: Option<u64>,
     reconcile_interval_ms: Option<u64>,
+    reconcile_batch: Option<usize>,
 }
 
 fn find_config_file_named(filename: &str, env: &dyn Env) -> PathBuf {
@@ -732,6 +820,12 @@ fn parse_u64(key: &str, value: &str) -> Result<u64, ConfigError> {
 fn parse_u32(key: &str, value: &str) -> Result<u32, ConfigError> {
     value
         .parse::<u32>()
+        .map_err(|_| ConfigError::Validation(format!("invalid integer for {key}: {value:?}")))
+}
+
+fn parse_usize(key: &str, value: &str) -> Result<usize, ConfigError> {
+    value
+        .parse::<usize>()
         .map_err(|_| ConfigError::Validation(format!("invalid integer for {key}: {value:?}")))
 }
 
@@ -1041,6 +1135,10 @@ orphaned_workflows = "explode"
         assert_eq!(config.redis.visibility_timeout_ms, 60_000);
         assert_eq!(config.redis.poll_interval_ms, 20);
         assert_eq!(config.redis.reconcile_interval_ms, 1_000);
+        assert_eq!(
+            config.redis.reconcile_batch,
+            DEFAULT_DISPATCH_RECONCILE_BATCH
+        );
     }
 
     #[test]
@@ -1055,6 +1153,7 @@ consumer_group = "acme_workers"
 visibility_timeout_ms = 30000
 poll_interval_ms = 5
 reconcile_interval_ms = 250
+reconcile_batch = 500
 "#,
         );
         let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref());
@@ -1067,6 +1166,7 @@ reconcile_interval_ms = 250
         assert_eq!(config.redis.visibility_timeout_ms, 30_000);
         assert_eq!(config.redis.poll_interval_ms, 5);
         assert_eq!(config.redis.reconcile_interval_ms, 250);
+        assert_eq!(config.redis.reconcile_batch, 500);
     }
 
     #[test]
@@ -1085,7 +1185,8 @@ key_prefix = "from_toml"
             .with("AUTUMN_HARVEST_REDIS__CONSUMER_GROUP", "env_workers")
             .with("AUTUMN_HARVEST_REDIS__VISIBILITY_TIMEOUT_MS", "15000")
             .with("AUTUMN_HARVEST_REDIS__POLL_INTERVAL_MS", "40")
-            .with("AUTUMN_HARVEST_REDIS__RECONCILE_INTERVAL_MS", "2000");
+            .with("AUTUMN_HARVEST_REDIS__RECONCILE_INTERVAL_MS", "2000")
+            .with("AUTUMN_HARVEST_REDIS__RECONCILE_BATCH", "750");
 
         let config = HarvestRuntimeConfig::load_with_env(&env).expect("harvest config should load");
 
@@ -1094,6 +1195,7 @@ key_prefix = "from_toml"
         assert_eq!(config.redis.visibility_timeout_ms, 15_000);
         assert_eq!(config.redis.poll_interval_ms, 40);
         assert_eq!(config.redis.reconcile_interval_ms, 2_000);
+        assert_eq!(config.redis.reconcile_batch, 750);
     }
 
     #[test]
@@ -1130,6 +1232,19 @@ key_prefix = "from_toml"
                 .to_string()
                 .contains("harvest.redis.reconcile_interval_ms"),
             "expected a redis reconcile_interval_ms validation error, got {error}"
+        );
+    }
+
+    #[test]
+    fn harvest_config_redis_rejects_a_zero_reconcile_batch() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST_REDIS__RECONCILE_BATCH", "0");
+
+        let error = HarvestRuntimeConfig::load_with_env(&env)
+            .expect_err("a zero reconcile batch must fail validation");
+
+        assert!(
+            error.to_string().contains("harvest.redis.reconcile_batch"),
+            "expected a redis reconcile_batch validation error, got {error}"
         );
     }
 
@@ -1339,6 +1454,110 @@ key_prefix = "from_toml"
         let env = MockEnv::new();
 
         HarvestRuntimeConfig::load_with_env(&env).expect("the redis defaults must validate");
+    }
+
+    // -----------------------------------------------------------------
+    // `resolve_harvest_mode_source` (issue #1291)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn mode_source_defaults_to_embedded_with_no_override() {
+        let env = MockEnv::new();
+        let (mode, source) = resolve_harvest_mode_source(&env).expect("resolution should succeed");
+        assert_eq!(mode, HarvestMode::Embedded);
+        assert_eq!(source, HarvestModeSource::Default);
+    }
+
+    #[test]
+    fn mode_source_names_the_environment_variable() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST__MODE", "split");
+        let (mode, source) = resolve_harvest_mode_source(&env).expect("resolution should succeed");
+        assert_eq!(mode, HarvestMode::Split);
+        assert_eq!(source, HarvestModeSource::Env);
+    }
+
+    #[test]
+    fn mode_source_names_the_root_config_file() {
+        let dir = unique_temp_dir("harvest-mode-source-root");
+        let root_path = dir.join("autumn.toml");
+        write_file(
+            &root_path,
+            r#"
+[harvest]
+mode = "external"
+
+[harvest.database]
+url = "postgres://harvest:harvest@localhost:5432/harvest"
+"#,
+        );
+        let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref());
+
+        let (mode, source) = resolve_harvest_mode_source(&env).expect("resolution should succeed");
+
+        assert_eq!(mode, HarvestMode::External);
+        assert_eq!(source, HarvestModeSource::ConfigFile(root_path));
+    }
+
+    #[test]
+    fn mode_source_prefers_the_profile_file_over_the_root_file() {
+        let dir = unique_temp_dir("harvest-mode-source-profile");
+        write_file(
+            &dir.join("autumn.toml"),
+            r#"
+[harvest]
+mode = "embedded"
+"#,
+        );
+        let profile_path = dir.join("autumn-dev.toml");
+        write_file(
+            &profile_path,
+            r#"
+[harvest]
+mode = "split"
+
+[harvest.database]
+url = "postgres://harvest:harvest@localhost:5432/harvest"
+"#,
+        );
+        let env = MockEnv::new()
+            .with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref())
+            .with("AUTUMN_PROFILE", "dev");
+
+        let (mode, source) = resolve_harvest_mode_source(&env).expect("resolution should succeed");
+
+        assert_eq!(mode, HarvestMode::Split);
+        assert_eq!(source, HarvestModeSource::ConfigFile(profile_path));
+    }
+
+    #[test]
+    fn mode_source_env_overrides_a_config_file() {
+        let dir = unique_temp_dir("harvest-mode-source-env-over-file");
+        write_file(
+            &dir.join("autumn.toml"),
+            r#"
+[harvest]
+mode = "split"
+
+[harvest.database]
+url = "postgres://harvest:harvest@localhost:5432/harvest"
+"#,
+        );
+        let env = MockEnv::new()
+            .with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref())
+            .with("AUTUMN_HARVEST__MODE", "embedded");
+
+        let (mode, source) = resolve_harvest_mode_source(&env).expect("resolution should succeed");
+
+        assert_eq!(mode, HarvestMode::Embedded);
+        assert_eq!(source, HarvestModeSource::Env);
+    }
+
+    #[test]
+    fn mode_source_rejects_an_unrecognised_environment_value() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST__MODE", "sideways");
+        let error = resolve_harvest_mode_source(&env)
+            .expect_err("an unrecognised mode must fail resolution");
+        assert!(error.to_string().contains("sideways"), "{error}");
     }
 
     fn unique_temp_dir(label: &str) -> PathBuf {

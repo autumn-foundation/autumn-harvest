@@ -32,23 +32,58 @@
 //!   covered in the plugin crate's `codec_rotation_admin_integration.rs`.
 //! - **AC8** (composition with offload / erasure) —
 //!   [`offload_envelopes_and_tombstones_survive_a_sweep_untouched`].
+//! - **Issue #1251** (a sweep batch cannot commit a row under a key retired
+//!   mid-batch) —
+//!   [`a_batch_pinned_to_a_key_blocks_its_retirement_through_a_double_rotation`].
+//! - **Issue #1257** (`write_cursor` is a compare-and-swap; DR fencing on the
+//!   cursor writers) — [`a_stale_cursor_write_cannot_overwrite_newer_progress`],
+//!   [`a_stale_rewind_cannot_decrease_rows_reencrypted`],
+//!   [`a_deliberate_rewind_to_zero_always_applies`], and
+//!   [`a_new_active_key_always_starts_a_fresh_pass`] cover the CAS guard.
+//!   `cross_region_dr_tests.rs`'s `a_fenced_worker_cannot_advance_the_rotation_cursor`
+//!   and `a_fenced_sweep_that_converts_nothing_still_fails_closed` cover the
+//!   fencing.
+//! - **Issue #1258** (the revalidation deadline is its own column, not
+//!   `updated_at`) —
+//!   [`an_ordinary_advancing_write_does_not_reset_the_revalidation_deadline`],
+//!   [`a_busy_shard_still_revalidates_once_the_deadline_is_due`],
+//!   [`a_fresh_pass_under_a_different_key_arms_its_own_deadline`], and
+//!   [`a_claimed_idle_revalidation_still_bumps_updated_at`] (Codex review).
+//!
+//! # Issue #1244: the two structural fleet-wide preconditions
+//!
+//! - **Durable write fence, replacing operator attestation** —
+//!   [`retirement_waits_for_the_staleness_window_even_at_a_zero_census`],
+//!   [`retirement_via_the_structural_gate_refuses_a_purely_local_flip`]
+//!   (the "another live writer" hazard), and
+//!   [`retirement_recheck_catches_a_row_that_commits_after_the_first_zero_census`]
+//!   (the "uncommitted append" hazard).
+//! - **Reader-capability handshake before activation** —
+//!   [`activation_is_refused_while_a_live_worker_cannot_read_the_keyed_envelope`],
+//!   [`activation_succeeds_once_every_live_worker_advertises_the_keyed_envelope`],
+//!   [`activation_ignores_a_worker_whose_heartbeat_is_stale`].
+//! - **Bounded staleness** —
+//!   [`refresh_active_codec_key_picks_up_a_fleet_wide_activation_from_another_process`].
 //!
 //! Runs against `HARVEST_TEST_DATABASE_URL` when set (each test gets its own
 //! throwaway database, because the rotation census is shard-wide by design),
 //! otherwise against a per-test Postgres container.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use autumn_harvest::codec_rotation::{
-    FleetWriteFence, load_shard_rotation_progress, load_shard_rotation_progress_against,
-    retire_codec_key, sweep_codec_reencryption_once,
+    FleetWriteFence, activate_codec_key, load_shard_rotation_progress,
+    load_shard_rotation_progress_against, refresh_active_codec_key, retire_codec_key,
+    sweep_codec_reencryption_once, write_cursor,
 };
 use autumn_harvest::erase::erasure_tombstone;
 use autumn_harvest::error::HarvestError;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::models::NewWorkflowExecution;
 use autumn_harvest::payload_codec::{
-    CODEC_ENVELOPE_KID_KEY, CODEC_LEGACY_KEY_ID, CodecError, PayloadCodec, PayloadCodecs,
+    CODEC_ENVELOPE_KEY, CODEC_ENVELOPE_KID_KEY, CODEC_LEGACY_KEY_ID, CodecError, IdentityCodec,
+    PayloadCodec, PayloadCodecs,
 };
 use autumn_harvest::shard::ShardedDbPool;
 use autumn_harvest::store;
@@ -279,6 +314,62 @@ async fn cursor_row_count(conn: &mut AsyncPgConnection) -> i64 {
             .await
             .expect("count cursor rows");
     row.n
+}
+
+/// A shard's raw cursor row, unfiltered by active key.
+///
+/// [`load_shard_rotation_progress`] only reports a cursor that matches the
+/// caller's active key. A CAS test needs the stored row regardless of which
+/// key it names, so it reads the table directly instead.
+struct CursorSnapshot {
+    active_key_id: String,
+    last_event_id: i64,
+    rows_reencrypted: i64,
+    unresolved_rows: i64,
+}
+
+async fn cursor_row(conn: &mut AsyncPgConnection, shard_id: i32) -> Option<CursorSnapshot> {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        active_key_id: String,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        last_event_id: i64,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        rows_reencrypted: i64,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        unresolved_rows: i64,
+    }
+    let rows: Vec<Row> = diesel::sql_query(
+        "SELECT active_key_id, last_event_id, rows_reencrypted, unresolved_rows \
+         FROM harvest_codec_rotation_cursor WHERE shard_id = $1",
+    )
+    .bind::<diesel::sql_types::Integer, _>(shard_id)
+    .load(conn)
+    .await
+    .expect("load cursor row");
+    rows.into_iter().next().map(|r| CursorSnapshot {
+        active_key_id: r.active_key_id,
+        last_event_id: r.last_event_id,
+        rows_reencrypted: r.rows_reencrypted,
+        unresolved_rows: r.unresolved_rows,
+    })
+}
+
+/// `harvest_codec_key_state.state` for `key_id`, or `None` when no row exists.
+async fn key_state(conn: &mut AsyncPgConnection, key_id: &str) -> Option<String> {
+    #[derive(diesel::QueryableByName)]
+    struct State {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        state: String,
+    }
+    let rows: Vec<State> =
+        diesel::sql_query("SELECT state FROM harvest_codec_key_state WHERE key_id = $1")
+            .bind::<diesel::sql_types::Text, _>(key_id)
+            .load(conn)
+            .await
+            .expect("load key state");
+    rows.into_iter().next().map(|r| r.state)
 }
 
 fn kid_of(event_data: &Value, field: &str) -> Option<String> {
@@ -702,6 +793,243 @@ async fn replay_fidelity_is_byte_identical_across_a_sweep() {
     );
 }
 
+// ── issue #1243: the production start path must honor a builder-configured
+// codec, not the identity default ────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_builder_configured_codec_encrypts_the_start_input_and_replay_round_trips_it() {
+    // Drives the real production start entry point
+    // (`execution::start_or_load_workflow_execution_collect_with_codecs`).
+    // The codec is configured the way an embedder actually configures one,
+    // via `HarvestBuilder::payload_codec_key`. Other tests in this file call
+    // `store::append_events_with_codecs` directly instead.
+    // `WorkflowStarted.input` is the first event of every execution; before
+    // issue #1243 it always went through the identity registry.
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+
+    let builder = autumn_harvest::HarvestBuilder::new().payload_codec_key("k1", XorCodec(0x11));
+    let codecs = builder.payload_codecs().clone();
+
+    let exec_id = ExecutionId::new();
+    let params = autumn_harvest::execution::StartWorkflowParams {
+        workflow_name: "codec_boundary_wf",
+        workflow_id: "codec-boundary-1",
+        exec_id,
+        input: json!({"ssn": "111-22-3333"}),
+        parent_id: None,
+        queue_name: "default",
+        execution_timeout: None,
+        memo: None,
+        search_attrs: None,
+        reuse_policy: autumn_harvest::types::WorkflowIdReusePolicy::AllowDuplicate,
+        conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
+        trace_context: None,
+        max_execution_timeout_ceiling: None,
+        chain_execution_timeout: None,
+        max_workflow_chain_timeout_ceiling: None,
+        inherited_chain_deadline_at: None,
+        concurrency_key: None,
+        concurrency_limit: None,
+        concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
+        priority: autumn_harvest::types::Priority::default(),
+        max_workflow_input_bytes: 0,
+        start_at: None,
+        delay: None,
+        max_workflow_start_delay: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        context_headers: None,
+        sla: None,
+        schedule_id: None,
+        scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
+        max_workflow_attempts_ceiling: None,
+        origin: None,
+        completion_callbacks: None,
+        start_source: autumn_harvest::StartSource::Api,
+        start_source_ref: None,
+        started_by: None,
+    };
+
+    autumn_harvest::execution::start_or_load_workflow_execution_collect_with_codecs(
+        &mut conn, params, false, false, None, None, &codecs,
+    )
+    .await
+    .expect("start with a configured codec");
+
+    // Ciphertext on disk: the raw row must carry a keyed envelope, not plaintext.
+    let raw = raw_event_data(&mut conn, exec_id).await;
+    assert_eq!(
+        kid_of(&raw[0], "input"),
+        Some("k1".to_string()),
+        "WorkflowStarted.input must be a keyed codec envelope on disk: {:?}",
+        raw[0]
+    );
+
+    // Replay round-trips: decoding through the same registry recovers the input.
+    let history = store::load_history_with_codecs(&mut conn, exec_id, &codecs)
+        .await
+        .expect("load history");
+    match &history.events[0] {
+        WorkflowEvent::WorkflowStarted { input, .. } => {
+            assert_eq!(*input, json!({"ssn": "111-22-3333"}));
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+    let report = WorkflowReplayer::new()
+        .register_fn("codec_boundary_wf", |_ctx, input| {
+            Box::pin(async move { Ok(input) })
+        })
+        .replay_from_events(history.events)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "replay must succeed decoding through the configured registry:\n{report}"
+    );
+}
+
+// ── issue #1243 review: continue-as-new must not double-encode a carried
+// `last_completion_result` ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn continue_as_new_decodes_the_carried_codec_envelope_before_reencoding_it() {
+    // `persist_workflow_continue_as_new` forwards the predecessor's STORED
+    // `last_completion_result` verbatim (issue #524), to preserve scheduled
+    // carryover across a fork without re-resolving it. Under a real codec that
+    // stored value is already a ciphertext envelope. Encoding it again on the
+    // successor's write would wrap ciphertext in ciphertext. Replay would
+    // then decode only the outer layer and hand workflow code a codec
+    // envelope instead of the real prior output.
+    use std::time::Duration;
+
+    use autumn_harvest::models::TaskQueueItem;
+    use autumn_harvest::queue::{self, EnqueueParams, TaskType};
+    use autumn_harvest::schema::{harvest_task_queue, harvest_workflow_executions};
+    use autumn_harvest::worker::{
+        HandlerRegistry, WorkflowTaskPersistence, persist_workflow_continue_as_new,
+    };
+
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+
+    let codecs = PayloadCodecs::default();
+    codecs
+        .register_key("k1", Arc::new(XorCodec(0x11)))
+        .expect("register k1");
+    codecs.set_active_key("k1").expect("activate k1");
+
+    let secret_output = json!({"secret": "prior-output"});
+    let exec_id = insert_execution(&mut conn, "cx1243_continue_as_new").await;
+    store::append_events_with_codecs(
+        &mut conn,
+        exec_id,
+        &[WorkflowEvent::WorkflowStarted {
+            input: json!({}),
+            timestamp: Utc::now(),
+            last_completion_result: Some(secret_output.clone()),
+            last_error: None,
+            scheduled_time: None,
+        }],
+        0,
+        &codecs,
+    )
+    .await
+    .expect("append predecessor WorkflowStarted");
+
+    let mut enqueue = EnqueueParams::new("default", TaskType::Workflow, json!({}));
+    enqueue.workflow_exec_id = Some(exec_id.as_uuid());
+    enqueue.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    queue::enqueue(&mut conn, &enqueue)
+        .await
+        .expect("enqueue task");
+    diesel::update(
+        harvest_task_queue::table
+            .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid()))),
+    )
+    .set((
+        harvest_task_queue::state.eq("RUNNING"),
+        harvest_task_queue::worker_id.eq(Some("worker-a")),
+        harvest_task_queue::started_at.eq(Some(Utc::now())),
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("claim task");
+    let task = harvest_task_queue::table
+        .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid())))
+        .select(TaskQueueItem::as_select())
+        .first(&mut conn)
+        .await
+        .expect("load claimed task");
+    let execution = harvest_workflow_executions::table
+        .find(exec_id.as_uuid())
+        .select(autumn_harvest::models::WorkflowExecution::as_select())
+        .first(&mut conn)
+        .await
+        .expect("reload execution");
+
+    let registry = HandlerRegistry::new(Vec::new(), Vec::new()).with_payload_codecs(codecs.clone());
+    // `carryover_result: None` forces the raw-carryover path under test --
+    // the decoded fallback is not exercised here.
+    let persistence = WorkflowTaskPersistence::new_for_test(
+        &task,
+        "worker-a",
+        exec_id,
+        1,
+        Duration::ZERO,
+        None,
+        None,
+        None,
+    );
+    let redirected_to_failure = persist_workflow_continue_as_new(
+        &mut conn,
+        &registry,
+        persistence,
+        &execution,
+        json!({}),
+        None,
+    )
+    .await
+    .expect("continue-as-new persists");
+    assert!(
+        !redirected_to_failure,
+        "a same-type continuation with no target constraints must create a successor, \
+         not redirect to a terminal failure"
+    );
+
+    let predecessor_history = store::load_history_with_codecs(&mut conn, exec_id, &codecs)
+        .await
+        .expect("load predecessor history");
+    let new_exec_id = predecessor_history
+        .events
+        .iter()
+        .find_map(|e| match e {
+            WorkflowEvent::WorkflowContinuedAsNew { new_exec_id, .. } => Some(*new_exec_id),
+            _ => None,
+        })
+        .expect("predecessor must carry a WorkflowContinuedAsNew marker");
+
+    let successor_history = store::load_history_with_codecs(&mut conn, new_exec_id, &codecs)
+        .await
+        .expect("load successor history");
+    match &successor_history.events[0] {
+        WorkflowEvent::WorkflowStarted {
+            last_completion_result,
+            ..
+        } => {
+            assert_eq!(
+                *last_completion_result,
+                Some(secret_output),
+                "the successor must see the real prior output, not a codec envelope"
+            );
+        }
+        other => panic!("unexpected successor event: {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn an_erasure_tombstone_committed_before_the_sweep_is_never_overwritten() {
     // The ordinary (non-racing) half: a row already tombstoned carries no
@@ -938,6 +1266,8 @@ async fn retirement_is_refused_while_rows_remain_and_succeeds_at_zero() {
         &codecs,
         "k1",
         FleetWriteFence::ConfirmedByOperator,
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
     )
     .await
     .expect_err("retirement must be refused while a row remains");
@@ -966,69 +1296,466 @@ async fn retirement_is_refused_while_rows_remain_and_succeeds_at_zero() {
         &codecs,
         "k1",
         FleetWriteFence::ConfirmedByOperator,
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
     )
     .await
     .expect("retirement must succeed at exactly zero remaining rows");
     assert!(codecs.codec_for_key("k1").is_none());
 }
 
+// ── issue #1244: the structural write fence ──────────────────────────────────
+
+/// `activate_codec_key` is what durably marks the superseded key "retiring".
+/// `retire_codec_key`'s default (structural) path refuses until that has held
+/// for `staleness_window` -- even though the census is a genuine zero. That
+/// is exactly the case the old boolean `FleetWriteFence` could not
+/// distinguish from "another worker has not rolled forward yet".
 #[tokio::test]
-async fn retirement_is_refused_without_an_attested_fleet_write_fence() {
-    // Codex round 3 (P1): a zero census is necessary but NOT sufficient. The
-    // registry is per-process, so the census cannot see (a) another worker that
-    // still holds the old key active and will encode under it a millisecond
-    // later, or (b) an append that already encoded under the old key and has
-    // not committed yet. Either makes a new old-key row appear *after* the gate
-    // reported zero and dropped the decoder.
-    //
-    // The gate therefore demands the half it cannot prove. This pins that an
-    // otherwise-perfect retirement -- zero rows, key registered, every shard
-    // supplied and reachable -- is still refused without the attestation, so
-    // the unprovable half can never be skipped by accident.
+async fn retirement_waits_for_the_staleness_window_even_at_a_zero_census() {
     let (url, _c) = setup_isolated_db().await;
     let codecs = two_key_registry();
-    codecs.set_active_key("k2").expect("flip");
-
     let pool = build_pool(&url);
     let sharded = ShardedDbPool::single(pool);
     let shards = [ShardId::new(0)];
 
-    // Nothing was ever written under k1: the census is a genuine zero.
+    // `two_key_registry` bootstraps k1 active only in this process's local
+    // memory (mirroring `register_key`'s "first key becomes active"
+    // convenience). An operator durably activates it too, so it has a
+    // `harvest_codec_key_state` row to demote when a newer key supersedes it.
+    activate_codec_key(&sharded, &shards, &codecs, "k1", 60)
+        .await
+        .expect("no live workers to block activation");
+    activate_codec_key(&sharded, &shards, &codecs, "k2", 60)
+        .await
+        .expect("no live workers to block activation");
+    assert_eq!(codecs.active_key_id(), "k2");
+
+    let window = Duration::from_millis(200);
     let err = retire_codec_key(
         &sharded,
         &shards,
         &codecs,
         "k1",
         FleetWriteFence::NotConfirmed,
+        window,
+        Duration::ZERO,
     )
     .await
-    .expect_err("a zero census alone must not authorise retirement");
+    .expect_err("the staleness window has not elapsed yet");
     match err {
-        HarvestError::Config(msg) => {
+        HarvestError::CodecKeyRetirementBlocked { remaining, .. } => {
             assert!(
-                msg.contains("fleet write fence"),
-                "the refusal must name the missing fence, got {msg:?}"
+                remaining
+                    .iter()
+                    .all(|r| r.reason.as_deref().is_some_and(|r| r.contains("staleness"))),
+                "{remaining:?}"
             );
         }
-        other => panic!("expected Config, got {other:?}"),
+        other => panic!("expected CodecKeyRetirementBlocked, got {other:?}"),
     }
-    assert!(
-        codecs.codec_for_key("k1").is_some(),
-        "a refused retirement must not drop the decoder"
-    );
+    assert!(codecs.codec_for_key("k1").is_some());
 
-    // The same call, with the fence attested, succeeds -- proving the refusal
-    // above was the fence and nothing else.
+    tokio::time::sleep(window + Duration::from_millis(100)).await;
+    retire_codec_key(
+        &sharded,
+        &shards,
+        &codecs,
+        "k1",
+        FleetWriteFence::NotConfirmed,
+        window,
+        Duration::ZERO,
+    )
+    .await
+    .expect("the window has now elapsed and the census is zero");
+    assert!(codecs.codec_for_key("k1").is_none());
+}
+
+/// A **local-only** flip (the old #948 behaviour, `PayloadCodecs::set_active_key`
+/// called directly rather than through `activate_codec_key`) never durably
+/// marks the superseded key "retiring". The structural gate refuses on
+/// exactly that basis. This is the regression test for the hazard #1244
+/// exists to close: a per-process flip must never be mistaken for a
+/// fleet-wide one.
+#[tokio::test]
+async fn retirement_via_the_structural_gate_refuses_a_purely_local_flip() {
+    let (url, _c) = setup_isolated_db().await;
+    let codecs = two_key_registry();
+    codecs.set_active_key("k2").expect("local-only flip");
+
+    let pool = build_pool(&url);
+    let sharded = ShardedDbPool::single(pool);
+    let shards = [ShardId::new(0)];
+
+    let err = retire_codec_key(
+        &sharded,
+        &shards,
+        &codecs,
+        "k1",
+        FleetWriteFence::NotConfirmed,
+        Duration::ZERO,
+        Duration::ZERO,
+    )
+    .await
+    .expect_err("no durable key state was ever written for k1");
+    match err {
+        HarvestError::CodecKeyRetirementBlocked { remaining, .. } => {
+            assert!(
+                remaining
+                    .iter()
+                    .all(|r| r.reason.as_deref().is_some_and(|r| r.contains("durable"))),
+                "{remaining:?}"
+            );
+        }
+        other => panic!("expected CodecKeyRetirementBlocked, got {other:?}"),
+    }
+    assert!(codecs.codec_for_key("k1").is_some());
+
+    // The escape hatch is unaffected: an operator who has confirmed the fence
+    // out of band still bypasses the durable-state requirement entirely.
     retire_codec_key(
         &sharded,
         &shards,
         &codecs,
         "k1",
         FleetWriteFence::ConfirmedByOperator,
+        Duration::ZERO,
+        Duration::ZERO,
     )
     .await
-    .expect("zero rows plus an attested fence retires the key");
+    .expect("the escape hatch skips the structural gate");
     assert!(codecs.codec_for_key("k1").is_none());
+}
+
+// ── issue #1251: retirement racing a pinned in-flight sweep batch ───────────
+
+#[tokio::test]
+async fn a_batch_pinned_to_a_key_blocks_its_retirement_through_a_double_rotation() {
+    // Issue #1251. A batch resolves its target key once and pins it before
+    // writing any row. Without the pin, this exact interleaving lets a row
+    // land under a key that retirement already dropped:
+    //
+    //   1. A batch starts, targets k2 (the active key), and pins it.
+    //   2. The active key rotates AWAY from k2 twice (k2 -> k1 -> k3), so k2
+    //      is no longer active and looks retirable.
+    //   3. `retire_codec_key("k2")` census reads zero rows -- the batch has
+    //      not committed anything yet -- and WOULD succeed without the pin.
+    //   4. The batch's write lands under k2, a key that retirement just
+    //      dropped: silent, permanent data loss.
+    //
+    // The pin closes step 3: retirement is refused for as long as the batch
+    // holds it, by construction, not by timing.
+    use autumn_harvest::codec_rotation::{
+        compare_and_swap_event, reencrypt_event_payload_fields_under,
+    };
+    use autumn_harvest::schema::harvest_events;
+
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let codecs = two_key_registry();
+    let exec_id = insert_execution(&mut conn, "pinned_retire").await;
+    append_under_key(
+        &mut conn,
+        &codecs,
+        exec_id,
+        "k1",
+        0,
+        &[started(json!({"ssn": "123-45-6789"}))],
+    )
+    .await;
+    codecs.set_active_key("k2").expect("flip to k2");
+
+    let pool = build_pool(&url);
+    let sharded = ShardedDbPool::single(pool);
+    let shards = [ShardId::new(0)];
+
+    // 1. A batch starts: it resolves k2 as its target and pins it, before
+    // reading or writing a single row.
+    let pin = codecs.pin_key_for_sweep("k2");
+
+    // 2. A double rotation moves the active key away from k2.
+    codecs.set_active_key("k1").expect("rotation 1");
+    codecs
+        .register_key("k3", Arc::new(XorCodec(0x33)))
+        .expect("register k3");
+    codecs.set_active_key("k3").expect("rotation 2");
+
+    // 3. The census would read zero rows under k2 -- the batch has not
+    // written anything yet -- but the pin refuses the retirement outright.
+    let err = retire_codec_key(
+        &sharded,
+        &shards,
+        &codecs,
+        "k2",
+        FleetWriteFence::ConfirmedByOperator,
+        Duration::ZERO,
+        Duration::ZERO,
+    )
+    .await
+    .expect_err("a pinned key must not be retirable, even at a zero census");
+    match err {
+        HarvestError::Config(msg) => {
+            assert!(
+                msg.contains("pinned"),
+                "the refusal must name the pin, got {msg:?}"
+            );
+        }
+        other => panic!("expected Config, got {other:?}"),
+    }
+    assert!(
+        codecs.codec_for_key("k2").is_some(),
+        "the refused retirement must not have dropped the decoder"
+    );
+
+    // 4. The batch continues and commits its row under its pinned target,
+    // k2 -- exactly the write the bug let land under an already-retired key.
+    let row_id: i64 = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+        .select(harvest_events::id)
+        .first(&mut conn)
+        .await
+        .expect("row id");
+    let original: Value = harvest_events::table
+        .find(row_id)
+        .select(harvest_events::event_data)
+        .first(&mut conn)
+        .await
+        .expect("read row");
+    let mut candidate = original.clone();
+    reencrypt_event_payload_fields_under(&codecs, "k2", &mut candidate)
+        .expect("the pinned target is still registered, so this succeeds");
+    let swapped = compare_and_swap_event(&mut conn, ShardId::new(0), row_id, &original, &candidate)
+        .await
+        .expect("cas");
+    assert!(swapped, "the batch's write must land");
+
+    let rows = raw_event_data(&mut conn, exec_id).await;
+    assert_eq!(
+        kid_of(&rows[0], "input"),
+        Some("k2".to_string()),
+        "the row committed under its pinned target, not a retired key"
+    );
+
+    // History must still be fully decodable: k2 was never actually retired.
+    let history = store::load_history_with_codecs(&mut conn, exec_id, &codecs)
+        .await
+        .expect("history must decode: k2 is still registered");
+    match &history.events[0] {
+        WorkflowEvent::WorkflowStarted { input, .. } => {
+            assert_eq!(input, &json!({"ssn": "123-45-6789"}));
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+
+    // While the pin is still held, retirement of k2 stays refused for the
+    // same reason, even though a row now genuinely exists under it too.
+    assert!(
+        retire_codec_key(
+            &sharded,
+            &shards,
+            &codecs,
+            "k2",
+            FleetWriteFence::ConfirmedByOperator,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .await
+        .is_err()
+    );
+
+    // Once the batch finishes and releases its pin, the ordinary census-based
+    // gate takes back over. It correctly refuses for the ordinary reason,
+    // because a row genuinely references k2 now.
+    drop(pin);
+    assert!(!codecs.is_pinned_by_sweep("k2"));
+    let err = retire_codec_key(
+        &sharded,
+        &shards,
+        &codecs,
+        "k2",
+        FleetWriteFence::ConfirmedByOperator,
+        Duration::ZERO,
+        Duration::ZERO,
+    )
+    .await
+    .expect_err("k2 genuinely has a row now; retirement must still refuse it");
+    assert!(
+        matches!(err, HarvestError::CodecKeyRetirementBlocked { .. }),
+        "the refusal reason must now be the ordinary census, not the pin: {err:?}"
+    );
+
+    // A later pass converges the row onto the current active key. Only
+    // then does retirement of k2 succeed -- the fix does not deadlock it.
+    sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+        .await
+        .expect("sweep onto k3");
+    retire_codec_key(
+        &sharded,
+        &shards,
+        &codecs,
+        "k2",
+        FleetWriteFence::ConfirmedByOperator,
+        Duration::ZERO,
+        Duration::ZERO,
+    )
+    .await
+    .expect("k2 is retirable once no row references it and no pin holds it");
+    assert!(codecs.codec_for_key("k2").is_none());
+}
+
+/// The escape hatch skips only the staleness-window *wait* (see
+/// `FleetWriteFence`'s doc). It must not also skip durably recording the
+/// retirement, or `harvest_codec_key_state` would claim a destroyed key is
+/// still merely "retiring" forever.
+#[tokio::test]
+async fn retirement_via_the_escape_hatch_still_records_the_durable_retirement() {
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let codecs = two_key_registry();
+    let pool = build_pool(&url);
+    let sharded = ShardedDbPool::single(pool);
+    let shards = [ShardId::new(0)];
+
+    activate_codec_key(&sharded, &shards, &codecs, "k1", 60)
+        .await
+        .expect("no live workers to block activation");
+    activate_codec_key(&sharded, &shards, &codecs, "k2", 60)
+        .await
+        .expect("no live workers to block activation");
+    assert_eq!(
+        key_state(&mut conn, "k1").await.as_deref(),
+        Some("retiring")
+    );
+
+    retire_codec_key(
+        &sharded,
+        &shards,
+        &codecs,
+        "k1",
+        FleetWriteFence::ConfirmedByOperator,
+        Duration::ZERO,
+        Duration::ZERO,
+    )
+    .await
+    .expect("zero rows and the escape hatch retire the key");
+
+    assert_eq!(
+        key_state(&mut conn, "k1").await.as_deref(),
+        Some("retired"),
+        "the escape hatch must not leave the durable row stuck at \"retiring\" \
+         after the key is actually gone"
+    );
+}
+
+/// The very first `activate_codec_key` call an embedder ever makes finds an
+/// empty `harvest_codec_key_state`. Nothing is there to demote. So the key
+/// this process is rotating *away from* must be seeded as `"retiring"`
+/// directly -- otherwise it would never be retirable.
+#[tokio::test]
+async fn first_activation_ever_seeds_the_outgoing_key_as_retiring() {
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let codecs = two_key_registry();
+    let pool = build_pool(&url);
+    let sharded = ShardedDbPool::single(pool);
+    let shards = [ShardId::new(0)];
+
+    assert_eq!(
+        key_state(&mut conn, "k1").await,
+        None,
+        "harvest_codec_key_state starts empty -- \"k1\" was never durable"
+    );
+
+    // The first-ever call, activating "k2" directly -- never a prior call
+    // activating the already-active "k1" first.
+    activate_codec_key(&sharded, &shards, &codecs, "k2", 60)
+        .await
+        .expect("no live workers to block activation");
+
+    assert_eq!(
+        key_state(&mut conn, "k1").await.as_deref(),
+        Some("retiring"),
+        "the outgoing key must be seeded as retiring even though it was \
+         never durably active"
+    );
+
+    retire_codec_key(
+        &sharded,
+        &shards,
+        &codecs,
+        "k1",
+        FleetWriteFence::NotConfirmed,
+        Duration::ZERO,
+        Duration::ZERO,
+    )
+    .await
+    .expect(
+        "the seeded row must satisfy the real structural staleness gate, not just the \
+         escape hatch",
+    );
+    assert_eq!(key_state(&mut conn, "k1").await.as_deref(), Some("retired"));
+}
+
+/// AC5's second required interleaving: a row that was not even written at the
+/// first census commits **during** the recheck delay. `retire_codec_key` must
+/// catch it on the second pass rather than finalizing on the first zero.
+#[tokio::test]
+async fn retirement_recheck_catches_a_row_that_commits_after_the_first_zero_census() {
+    let (url, _c) = setup_isolated_db().await;
+    let codecs = two_key_registry();
+    let exec_id = insert_execution(&mut connect(&url).await, "race").await;
+    let pool = build_pool(&url);
+    let sharded = ShardedDbPool::single(pool);
+    let shards = [ShardId::new(0)];
+
+    activate_codec_key(&sharded, &shards, &codecs, "k1", 60)
+        .await
+        .expect("no live workers to block activation");
+    activate_codec_key(&sharded, &shards, &codecs, "k2", 60)
+        .await
+        .expect("no live workers to block activation");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let write_url = url.clone();
+    let writer_codecs = two_key_registry();
+    writer_codecs
+        .set_active_key("k2")
+        .expect("mirror the fleet's active key");
+    let writer = tokio::spawn(async move {
+        // Lands after the first (zero) census but well inside the recheck
+        // delay below -- the straggling write AC5 asks for.
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        let mut conn = connect(&write_url).await;
+        append_under_key(
+            &mut conn,
+            &writer_codecs,
+            exec_id,
+            "k1",
+            0,
+            &[started(json!({"straggler": true}))],
+        )
+        .await;
+    });
+
+    let err = retire_codec_key(
+        &sharded,
+        &shards,
+        &codecs,
+        "k1",
+        FleetWriteFence::NotConfirmed,
+        Duration::ZERO,
+        Duration::from_millis(300),
+    )
+    .await
+    .expect_err("the recheck must observe the row that committed mid-delay");
+    match err {
+        HarvestError::CodecKeyRetirementBlocked { remaining, .. } => {
+            assert_eq!(remaining.len(), 1);
+            assert_eq!(remaining[0].rows, 1);
+        }
+        other => panic!("expected CodecKeyRetirementBlocked, got {other:?}"),
+    }
+    writer.await.expect("writer task");
 }
 
 #[tokio::test]
@@ -1049,6 +1776,8 @@ async fn retirement_fails_closed_on_an_unreachable_shard() {
         &codecs,
         "k1",
         FleetWriteFence::ConfirmedByOperator,
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
     )
     .await
     .expect_err("an unreadable shard must block retirement");
@@ -1081,6 +1810,8 @@ async fn retirement_with_no_shards_to_inspect_is_refused() {
         &codecs,
         "k1",
         FleetWriteFence::ConfirmedByOperator,
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
     )
     .await
     .expect_err("proving nothing must not be treated as proving zero");
@@ -1100,10 +1831,189 @@ async fn the_active_key_can_never_be_retired() {
         &codecs,
         "k1",
         FleetWriteFence::ConfirmedByOperator,
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
     )
     .await
     .expect_err("k1 is active");
     assert!(matches!(err, HarvestError::Config(_)), "{err:?}");
+}
+
+// ── issue #1244: the reader-capability handshake ──────────────────────────────
+
+/// Insert a minimal `harvest_workers` row directly, bypassing `register_worker`,
+/// so the test controls `last_heartbeat_at` and `labels` precisely.
+#[allow(clippy::cast_precision_loss)] // a heartbeat age in seconds never approaches 2^53
+async fn insert_worker_row(
+    conn: &mut AsyncPgConnection,
+    worker_id: &str,
+    heartbeat_age_secs: i64,
+    labels: &Value,
+) {
+    diesel::sql_query(
+        "INSERT INTO harvest_workers \
+             (worker_id, last_heartbeat_at, max_concurrency, host, build_id, labels) \
+         VALUES ($1, NOW() - make_interval(secs => $2::float8), 1, 'test-host', 'test-build', $3)",
+    )
+    .bind::<diesel::sql_types::Text, _>(worker_id)
+    .bind::<diesel::sql_types::Double, _>(heartbeat_age_secs as f64)
+    .bind::<diesel::sql_types::Jsonb, _>(labels)
+    .execute(conn)
+    .await
+    .expect("insert worker row");
+}
+
+#[tokio::test]
+async fn activation_is_refused_while_a_live_worker_cannot_read_the_keyed_envelope() {
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    // No `codec_envelope_version` label at all -- exactly what a pre-#948
+    // binary's row looks like.
+    insert_worker_row(&mut conn, "worker-old", 0, &json!({})).await;
+
+    let codecs = two_key_registry();
+    let pool = build_pool(&url);
+    let sharded = ShardedDbPool::single(pool);
+
+    let err = activate_codec_key(&sharded, &[ShardId::new(0)], &codecs, "k2", 60)
+        .await
+        .expect_err("a live worker cannot read a version-2 envelope");
+    match err {
+        HarvestError::CodecKeyActivationBlocked { key_id, blockers } => {
+            assert_eq!(key_id, "k2");
+            assert_eq!(blockers.len(), 1);
+            assert_eq!(blockers[0].worker_id.as_deref(), Some("worker-old"));
+            assert!(blockers[0].reachable);
+        }
+        other => panic!("expected CodecKeyActivationBlocked, got {other:?}"),
+    }
+    assert_eq!(
+        codecs.active_key_id(),
+        "k1",
+        "a refused activation must not flip the local registry"
+    );
+}
+
+#[tokio::test]
+async fn activation_succeeds_once_every_live_worker_advertises_the_keyed_envelope() {
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    insert_worker_row(
+        &mut conn,
+        "worker-new",
+        0,
+        &json!({"codec_envelope_version": 2, "codec_registered_key_ids": ["k2"]}),
+    )
+    .await;
+
+    let codecs = two_key_registry();
+    let pool = build_pool(&url);
+    let sharded = ShardedDbPool::single(pool);
+
+    activate_codec_key(&sharded, &[ShardId::new(0)], &codecs, "k2", 60)
+        .await
+        .expect("every live worker advertises version 2 and has k2 registered");
+    assert_eq!(codecs.active_key_id(), "k2");
+}
+
+/// A worker's binary can support the version-2 envelope's syntax fleet-wide
+/// before the target key's material reaches every worker's config.
+/// Envelope support alone must not be read as proof this worker can decode
+/// payloads written under the specific key being activated.
+#[tokio::test]
+async fn activation_is_refused_while_a_live_worker_lacks_the_target_key() {
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    // Envelope v2 capable, but only "k1" ever reached this worker's config --
+    // "k2" is the key this test activates.
+    insert_worker_row(
+        &mut conn,
+        "worker-partial",
+        0,
+        &json!({"codec_envelope_version": 2, "codec_registered_key_ids": ["k1"]}),
+    )
+    .await;
+
+    let codecs = two_key_registry();
+    let pool = build_pool(&url);
+    let sharded = ShardedDbPool::single(pool);
+
+    let err = activate_codec_key(&sharded, &[ShardId::new(0)], &codecs, "k2", 60)
+        .await
+        .expect_err("a live worker without k2 registered cannot decode payloads written under it");
+    match err {
+        HarvestError::CodecKeyActivationBlocked { key_id, blockers } => {
+            assert_eq!(key_id, "k2");
+            assert_eq!(blockers.len(), 1);
+            assert_eq!(blockers[0].worker_id.as_deref(), Some("worker-partial"));
+            assert!(blockers[0].reachable);
+            assert!(
+                blockers[0]
+                    .reason
+                    .as_deref()
+                    .is_some_and(|r| r.contains("k2") && r.contains("not registered")),
+                "{:?}",
+                blockers[0].reason
+            );
+        }
+        other => panic!("expected CodecKeyActivationBlocked, got {other:?}"),
+    }
+    assert_eq!(
+        codecs.active_key_id(),
+        "k1",
+        "a refused activation must not flip the local registry"
+    );
+}
+
+#[tokio::test]
+async fn activation_ignores_a_worker_whose_heartbeat_is_stale() {
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    // Version-1-only, but its heartbeat is far older than the 60s liveness
+    // window below -- a dead worker cannot silently mis-decode anything.
+    insert_worker_row(&mut conn, "worker-dead", 999, &json!({})).await;
+
+    let codecs = two_key_registry();
+    let pool = build_pool(&url);
+    let sharded = ShardedDbPool::single(pool);
+
+    activate_codec_key(&sharded, &[ShardId::new(0)], &codecs, "k2", 60)
+        .await
+        .expect("a stale worker must not block activation");
+    assert_eq!(codecs.active_key_id(), "k2");
+}
+
+// ── issue #1244: bounded-staleness refresh ────────────────────────────────────
+
+/// `refresh_active_codec_key` is the mechanism that turns a durable
+/// `activate_codec_key` write into a fact another process's `PayloadCodecs`
+/// observes. Simulated here as two independent registries sharing a
+/// database: one calls `activate_codec_key`, the other only refreshes.
+#[tokio::test]
+async fn refresh_active_codec_key_picks_up_a_fleet_wide_activation_from_another_process() {
+    let (url, _c) = setup_isolated_db().await;
+    let activator = two_key_registry();
+    let observer = two_key_registry();
+    let pool = build_pool(&url);
+    let sharded = ShardedDbPool::single(pool);
+
+    activate_codec_key(&sharded, &[ShardId::new(0)], &activator, "k2", 60)
+        .await
+        .expect("no live workers to block activation");
+    assert_eq!(observer.active_key_id(), "k1", "unaffected until refreshed");
+
+    let mut conn = connect(&url).await;
+    let flipped = refresh_active_codec_key(&mut conn, &observer)
+        .await
+        .expect("refresh");
+    assert!(flipped);
+    assert_eq!(observer.active_key_id(), "k2");
+
+    // Idempotent: refreshing again with nothing new to observe is a no-op.
+    let flipped_again = refresh_active_codec_key(&mut conn, &observer)
+        .await
+        .expect("refresh");
+    assert!(!flipped_again);
 }
 
 // ── AC7: progress reporting and the metric ───────────────────────────────────
@@ -1313,6 +2223,162 @@ async fn a_four_key_version_1_payload_is_not_counted_by_the_census() {
     );
 }
 
+/// Issue #1253: the census SQL must recognize the current nested envelope
+/// shape too, not just the two legacy flat ones.
+///
+/// A genuinely rotated real codec stays flat — see
+/// `PayloadCodecs::encode_payload`'s doc for why. The only producer of a
+/// nested row is the collision-escape guard, which fires only when the
+/// active codec is identity.
+///
+/// Register identity under a named key to exercise the escape path WITH a
+/// `kid`. This mirrors an embedder using identity as a deliberate "store
+/// in the clear" rotation key — `codec_rotation`'s own doc on
+/// `active_key_would_decrypt` describes this as supported.
+///
+/// This proves the SQL predicate's new branch against a real row. It also
+/// proves an emergent property: a value the escape guard protected gets
+/// properly re-encrypted once real rotation converts it onto an actual key.
+#[tokio::test]
+async fn a_nested_envelope_is_counted_and_swept() {
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let codecs = PayloadCodecs::default();
+    codecs
+        .register_key("k1", Arc::new(IdentityCodec))
+        .expect("register k1");
+    codecs
+        .register_key("k2", Arc::new(XorCodec(0x22)))
+        .expect("register k2");
+    codecs.set_active_key("k1").expect("activate k1");
+
+    let exec_id = insert_execution(&mut conn, "nested").await;
+    // Envelope-shaped business data: the exact collision this fix escapes.
+    let colliding = json!({
+        "_harvest_codec_envelope": 2,
+        "codec_id": "xor",
+        "data": "AAAA",
+        "kid": "k9",
+    });
+    store::append_events_with_codecs(
+        &mut conn,
+        exec_id,
+        &[started(colliding.clone())],
+        0,
+        &codecs,
+    )
+    .await
+    .expect("append events");
+
+    let rows = raw_event_data(&mut conn, exec_id).await;
+    let field = &rows[0]["data"]["input"];
+    assert_eq!(
+        field.as_object().map(serde_json::Map::len),
+        Some(1),
+        "the escaped row is nested, one top-level key: {field}"
+    );
+    assert_eq!(field[CODEC_ENVELOPE_KEY]["codec_id"], "identity");
+    assert_eq!(field[CODEC_ENVELOPE_KEY][CODEC_ENVELOPE_KID_KEY], "k1");
+
+    codecs.set_active_key("k2").expect("flip");
+    let progress = load_shard_rotation_progress(&mut conn, 0, &codecs)
+        .await
+        .expect("progress");
+    assert_eq!(
+        progress.rows_remaining(),
+        1,
+        "the nested row under the now-outgoing key k1 must be counted: {:?}",
+        progress.rows_by_key_id
+    );
+    assert_eq!(
+        sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+            .await
+            .expect("sweep"),
+        1,
+        "and must be converted onto k2 -- the escaped plaintext is now genuinely encrypted"
+    );
+
+    let converted = raw_event_data(&mut conn, exec_id).await;
+    match codecs
+        .decode_event(converted[0].clone())
+        .expect("decode after sweep")
+    {
+        WorkflowEvent::WorkflowStarted { input, .. } => {
+            assert_eq!(
+                input, colliding,
+                "the original business value survives escape, census, and re-encryption \
+                 byte-identical"
+            );
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+}
+
+/// The nested-shape sibling of `a_near_envelope_is_neither_counted_nor_swept`.
+/// Business data shaped almost, but not quite, like a nested envelope must
+/// not be counted -- here, a sibling key breaking the one-key guarantee.
+#[tokio::test]
+async fn a_nested_near_envelope_is_neither_counted_nor_swept() {
+    use autumn_harvest::schema::harvest_events;
+
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let codecs = two_key_registry();
+    let exec_id = insert_execution(&mut conn, "nested_near").await;
+    append_under_key(
+        &mut conn,
+        &codecs,
+        exec_id,
+        "k1",
+        0,
+        &[started(json!({"a": 1}))],
+    )
+    .await;
+
+    let row_id: i64 = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+        .select(harvest_events::id)
+        .first(&mut conn)
+        .await
+        .expect("row id");
+    let mut data: Value = harvest_events::table
+        .find(row_id)
+        .select(harvest_events::event_data)
+        .first(&mut conn)
+        .await
+        .expect("row");
+    // Business data shaped almost like a nested envelope: a sibling key
+    // alongside the discriminator breaks the one-key guarantee the nested
+    // shape's safety depends on.
+    data["data"]["input"] = json!({
+        "_harvest_codec_envelope": {"codec_id": "xor", "data": "AAAA"},
+        "something_else": true,
+    });
+    diesel::update(harvest_events::table.find(row_id))
+        .set(harvest_events::event_data.eq(&data))
+        .execute(&mut conn)
+        .await
+        .expect("update");
+
+    codecs.set_active_key("k2").expect("flip");
+    let progress = load_shard_rotation_progress(&mut conn, 0, &codecs)
+        .await
+        .expect("progress");
+    assert_eq!(
+        progress.rows_remaining(),
+        0,
+        "a nested near-envelope must not be counted: {:?}",
+        progress.rows_by_key_id
+    );
+    assert_eq!(
+        sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+            .await
+            .expect("sweep"),
+        0,
+        "and must not be swept either"
+    );
+}
+
 #[tokio::test]
 async fn a_registry_with_no_keyed_codecs_sweeps_nothing_and_writes_no_cursor() {
     // The zero-overhead default: an un-rotated deployment pays nothing.
@@ -1504,6 +2570,8 @@ async fn retirement_fails_closed_when_a_shards_census_errors() {
         &codecs,
         "k1",
         FleetWriteFence::ConfirmedByOperator,
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
     )
     .await
     .expect_err("a failed census must block retirement");
@@ -1542,6 +2610,8 @@ async fn retirement_refuses_a_shard_list_that_omits_a_known_shard() {
         &codecs,
         "k1",
         FleetWriteFence::ConfirmedByOperator,
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
     )
     .await
     .expect_err("an incomplete shard list must block retirement");
@@ -1565,6 +2635,8 @@ async fn retirement_refuses_an_unregistered_key_id() {
         &codecs,
         "never-registered",
         FleetWriteFence::ConfirmedByOperator,
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
     )
     .await
     .expect_err("an unregistered key proves nothing");
@@ -1904,11 +2976,12 @@ async fn a_row_committing_below_the_cursor_is_still_converted() {
          is 0 the throttle is gone and every tick is scanning the table"
     );
 
-    // Wind the cursor's clock back past the revalidation interval. That is the
-    // only thing standing between the stranded row and recovery.
+    // Wind the revalidation deadline back past the interval (issue #1258:
+    // this is its own column, not `updated_at`). That is the only thing
+    // standing between the stranded row and recovery.
     diesel::sql_query(
         "UPDATE harvest_codec_rotation_cursor \
-         SET updated_at = now() - interval '10 minutes' WHERE shard_id = 0",
+         SET next_revalidation_at = now() - interval '1 minute' WHERE shard_id = 0",
     )
     .execute(&mut conn)
     .await
@@ -2064,5 +3137,484 @@ async fn a_completed_cursor_advances_over_rows_it_has_examined() {
     assert!(
         after.completed_at.is_some(),
         "advancing over already-converted rows must not un-complete the pass"
+    );
+}
+
+// ── issue #1257: the cursor write is a compare-and-swap ──────────────────────
+
+#[tokio::test]
+async fn a_stale_cursor_write_cannot_overwrite_newer_progress() {
+    // Two sweepers can read the same cursor row and each compute their own
+    // next state from it. Without a guard, whichever write commits last wins
+    // outright, even when it started from an older read. The cursor then
+    // moves backward and `rows_reencrypted` can decrease -- the race issue
+    // #1257 reports.
+    //
+    // Exercised directly against `write_cursor`, the same way
+    // `a_stale_read_can_never_overwrite_a_committed_erasure` exercises
+    // `compare_and_swap_event` directly. The batch-oriented sweep entry
+    // point runs single-threaded on one connection. It cannot express two
+    // writers racing the same read.
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let shard = ShardId::new(0);
+
+    // The baseline both sweepers read: last_event_id 100, 50 rows converted.
+    let applied = write_cursor(&mut conn, shard, "k2", 100, 50, 0, None)
+        .await
+        .expect("baseline write");
+    assert!(applied, "an insert with no prior row must always apply");
+
+    // The winner commits progress computed from that baseline first.
+    let applied = write_cursor(&mut conn, shard, "k2", 200, 60, 0, None)
+        .await
+        .expect("winner write");
+    assert!(applied, "a forward write over the row it read must apply");
+
+    // The loser also read the 100 / 50 baseline, and only now commits its
+    // own, smaller, progress.
+    let applied = write_cursor(&mut conn, shard, "k2", 150, 55, 0, None)
+        .await
+        .expect("stale write");
+    assert!(
+        !applied,
+        "a write computed from a stale read must be dropped, not applied"
+    );
+
+    let cursor = cursor_row(&mut conn, 0).await.expect("cursor row");
+    assert_eq!(
+        cursor.last_event_id, 200,
+        "the cursor must not move backward"
+    );
+    assert_eq!(
+        cursor.rows_reencrypted, 60,
+        "the rewrite total must not decrease"
+    );
+}
+
+#[tokio::test]
+async fn a_deliberate_rewind_to_zero_always_applies() {
+    // `last_event_id = 0` is the deliberate reset a pass takes when it
+    // leaves rows unresolved (see `sweep_codec_reencryption_once`). The CAS
+    // guard must not mistake that reset for a stale write and drop it.
+    // That holds even over a stored `last_event_id` that is higher, as
+    // long as `rows_reencrypted` still holds or grows (held equal here).
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let shard = ShardId::new(0);
+
+    let applied = write_cursor(&mut conn, shard, "k2", 500, 40, 0, None)
+        .await
+        .expect("baseline write");
+    assert!(applied, "the baseline write must apply");
+
+    let applied = write_cursor(&mut conn, shard, "k2", 0, 40, 3, None)
+        .await
+        .expect("rewind write");
+    assert!(applied, "a rewind to last_event_id = 0 must always apply");
+
+    let cursor = cursor_row(&mut conn, 0).await.expect("cursor row");
+    assert_eq!(cursor.last_event_id, 0);
+    assert_eq!(cursor.unresolved_rows, 3);
+}
+
+#[tokio::test]
+async fn a_stale_rewind_cannot_decrease_rows_reencrypted() {
+    // A rewind resets `last_event_id` to 0 unconditionally, but the row it
+    // writes is still one write. The `WHERE` guard must not let that
+    // exemption carry `rows_reencrypted` down with it.
+    //
+    // Two sweepers can each read the same baseline. Each loses some of
+    // its own rows to the other's `compare_and_swap_event`. Each then
+    // lands in the `unresolved_total > 0` rewind branch with a different
+    // `rows_reencrypted_total`, computed from that one shared read.
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let shard = ShardId::new(0);
+
+    // The baseline both sweepers read: 100 rows already converted.
+    let applied = write_cursor(&mut conn, shard, "k2", 500, 100, 0, None)
+        .await
+        .expect("baseline write");
+    assert!(applied, "the baseline write must apply");
+
+    // The winner converts 30 more of its own rows, then loses the rest of
+    // its batch to the other sweeper. It rewinds at 100 + 30 = 130.
+    let applied = write_cursor(&mut conn, shard, "k2", 0, 130, 20, None)
+        .await
+        .expect("winner rewind");
+    assert!(applied, "the winner's rewind must apply");
+
+    // The loser read the SAME 100-row baseline. It converted only 20 of
+    // its own rows, and also rewinds at 100 + 20 = 120. That is lower than
+    // what is now stored, even though its own `last_event_id` write is
+    // the deliberate reset that always applies.
+    let applied = write_cursor(&mut conn, shard, "k2", 0, 120, 30, None)
+        .await
+        .expect("stale rewind");
+    assert!(
+        !applied,
+        "a rewind computed from a stale read must not decrease rows_reencrypted"
+    );
+
+    let cursor = cursor_row(&mut conn, 0).await.expect("cursor row");
+    assert_eq!(
+        cursor.rows_reencrypted, 130,
+        "the winner's higher count must survive the loser's rewind"
+    );
+}
+
+#[tokio::test]
+async fn a_new_active_key_always_starts_a_fresh_pass() {
+    // A cursor recorded against a different key belongs to a different pass
+    // entirely. Its `last_event_id` and `rows_reencrypted` are not
+    // comparable to the new key's. A fresh pass must apply even when both
+    // read lower than the old key's.
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let shard = ShardId::new(0);
+
+    write_cursor(&mut conn, shard, "k1", 900, 80, 0, None)
+        .await
+        .expect("k1 pass write");
+
+    let applied = write_cursor(&mut conn, shard, "k2", 10, 1, 0, None)
+        .await
+        .expect("k2 pass write");
+    assert!(
+        applied,
+        "a cursor write for a different active key must always apply"
+    );
+
+    let cursor = cursor_row(&mut conn, 0).await.expect("cursor row");
+    assert_eq!(cursor.active_key_id, "k2");
+    assert_eq!(cursor.last_event_id, 10);
+    assert_eq!(
+        cursor.rows_reencrypted, 1,
+        "the fresh pass's own count must land, not a value carried over"
+    );
+}
+
+// ── issue #1258: the revalidation deadline is its own column ────────────────
+
+/// An ordinary write to an already-completed cursor must not reset the
+/// revalidation deadline.
+///
+/// Before this fix, `updated_at` did two jobs: cursor liveness, and the
+/// revalidation throttle's deadline. A batch that converts nothing but still
+/// advances `last_event_id` — the steady state on a busy, already-converged
+/// shard — reset both at once. This pins the fix: the two jobs now live on
+/// separate columns, and only one of them moves here.
+#[tokio::test]
+async fn an_ordinary_advancing_write_does_not_reset_the_revalidation_deadline() {
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let codecs = two_key_registry();
+    let exec_id = insert_execution(&mut conn, "deadline_survives_advance").await;
+    append_under_key(
+        &mut conn,
+        &codecs,
+        exec_id,
+        "k1",
+        0,
+        &[started(json!({"a": 1}))],
+    )
+    .await;
+
+    codecs.set_active_key("k2").expect("flip");
+    sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+        .await
+        .expect("first pass");
+    let first = load_shard_rotation_progress(&mut conn, 0, &codecs)
+        .await
+        .expect("progress")
+        .cursor
+        .expect("cursor written");
+    assert!(
+        first.completed_at.is_some(),
+        "the pass must converge, or this test does not exercise the hazard"
+    );
+    let armed_at = first
+        .next_revalidation_at
+        .expect("a completed pass must arm the revalidation deadline");
+
+    // Ordinary busy traffic: already under the active key, nothing to
+    // convert, but the batch is non-empty and the cursor advances over it.
+    append_under_key(
+        &mut conn,
+        &codecs,
+        exec_id,
+        "k2",
+        1,
+        &[completed(json!({"b": 2}))],
+    )
+    .await;
+    sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+        .await
+        .expect("busy tick");
+    let second = load_shard_rotation_progress(&mut conn, 0, &codecs)
+        .await
+        .expect("progress")
+        .cursor
+        .expect("cursor still there");
+
+    assert!(
+        second.last_event_id > first.last_event_id,
+        "the tick must be an ordinary advancing write, or this test proves \
+         nothing"
+    );
+    assert!(
+        second.completed_at.is_some(),
+        "advancing over already-converted rows must not un-complete the pass"
+    );
+    assert_eq!(
+        second.next_revalidation_at,
+        Some(armed_at),
+        "an ordinary advancing write must not move the revalidation deadline; \
+         a busy shard that never idles would starve revalidation forever"
+    );
+    assert!(
+        second.updated_at > first.updated_at,
+        "updated_at still means last write, so the advancing write must move it"
+    );
+}
+
+/// A converged shard that keeps receiving ordinary traffic must still
+/// revalidate once the deadline comes due.
+///
+/// This is the scenario issue #1258 reports. On the single-column design, an
+/// ordinary advancing write reset the same timestamp the claim throttled on.
+/// So a shard receiving traffic within every interval never saw the claim's
+/// predicate hold. A row committed below the cursor was never found again.
+#[tokio::test]
+async fn a_busy_shard_still_revalidates_once_the_deadline_is_due() {
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let codecs = two_key_registry();
+    let exec_id = insert_execution(&mut conn, "busy_revalidation").await;
+
+    // Push the cursor high with an explicit id, so an id well below it is
+    // guaranteed free for the late arrival.
+    let encoded = encode_under(&codecs, "k1", &json!({"early": true}));
+    insert_event_at_id(&mut conn, exec_id, 10_000, 0, &encoded).await;
+
+    codecs.set_active_key("k2").expect("flip");
+    sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+        .await
+        .expect("first pass");
+    let first_pass = load_shard_rotation_progress(&mut conn, 0, &codecs)
+        .await
+        .expect("progress")
+        .cursor
+        .expect("cursor exists");
+    assert!(
+        first_pass.completed_at.is_some(),
+        "the pass must converge, or this test does not exercise the hazard"
+    );
+
+    // The late arrival: below the cursor, still on the outgoing key.
+    let late = encode_under(&codecs, "k1", &json!({"late": true}));
+    insert_event_at_id(&mut conn, exec_id, 5_000, 1, &late).await;
+
+    // Ordinary busy traffic, well before the deadline is due. Each row
+    // already carries the active key, so there is nothing to convert. The
+    // batch is still non-empty, so the cursor advances over it every tick.
+    for (i, row_id) in (10_001..10_004).enumerate() {
+        let busy = encode_under(&codecs, "k2", &json!({"busy": i}));
+        let event_id = 2 + i32::try_from(i).expect("small loop index");
+        insert_event_at_id(&mut conn, exec_id, row_id, event_id, &busy).await;
+        sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+            .await
+            .expect("busy tick before the deadline");
+    }
+    assert_eq!(
+        load_shard_rotation_progress(&mut conn, 0, &codecs)
+            .await
+            .expect("progress")
+            .rows_remaining(),
+        1,
+        "ordinary busy traffic before the deadline must not trigger an early \
+         re-census"
+    );
+
+    // Simulate the interval elapsing.
+    diesel::sql_query(
+        "UPDATE harvest_codec_rotation_cursor \
+         SET next_revalidation_at = now() - interval '1 minute' WHERE shard_id = 0",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("age the deadline");
+
+    // More busy traffic lands right at the due deadline. It must not stop
+    // the claim from firing.
+    for (i, row_id) in (10_004..10_007).enumerate() {
+        let busy = encode_under(&codecs, "k2", &json!({"busy": i}));
+        let event_id = 5 + i32::try_from(i).expect("small loop index");
+        insert_event_at_id(&mut conn, exec_id, row_id, event_id, &busy).await;
+        sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+            .await
+            .expect("busy tick at the due deadline");
+    }
+
+    assert_eq!(
+        load_shard_rotation_progress(&mut conn, 0, &codecs)
+            .await
+            .expect("progress")
+            .rows_remaining(),
+        0,
+        "once due, revalidation must still run and convert the stranded row, \
+         even on a shard that never goes idle"
+    );
+}
+
+/// A fresh pass under a different key must arm its own deadline, not
+/// inherit the previous key's.
+///
+/// `write_cursor`'s `next_revalidation_at` CASE only checked whether
+/// `completed_at` transitioned away from `NULL`. A key rotation followed by
+/// a rollback can complete a fresh pass while the STORED `completed_at` is
+/// already non-`NULL`. That value belongs to the previous key's pass, not
+/// this one. So that check alone would carry the old deadline forward
+/// instead of arming a new one.
+#[tokio::test]
+async fn a_fresh_pass_under_a_different_key_arms_its_own_deadline() {
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let codecs = two_key_registry();
+    let exec_id = insert_execution(&mut conn, "rollback_deadline").await;
+    append_under_key(
+        &mut conn,
+        &codecs,
+        exec_id,
+        "k1",
+        0,
+        &[started(json!({"a": 1}))],
+    )
+    .await;
+
+    // Forward: k1 -> k2, pass completes and arms a deadline.
+    codecs.set_active_key("k2").expect("flip to k2");
+    sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+        .await
+        .expect("forward sweep");
+    assert!(
+        load_shard_rotation_progress(&mut conn, 0, &codecs)
+            .await
+            .expect("progress")
+            .cursor
+            .expect("cursor")
+            .completed_at
+            .is_some(),
+        "the forward pass must complete, or this test does not exercise the \
+         hazard"
+    );
+
+    // Push that deadline far into the past, so a stale inherited value is
+    // unmistakably different from a freshly armed one.
+    diesel::sql_query(
+        "UPDATE harvest_codec_rotation_cursor \
+         SET next_revalidation_at = now() - interval '1 hour' WHERE shard_id = 0",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("age the k2 deadline");
+
+    // Roll back to k1. The row converts back in one tick, so this pass
+    // completes immediately. The k2 row's stale `completed_at` and
+    // deadline are still sitting in the table when the write happens.
+    codecs.set_active_key("k1").expect("roll back to k1");
+    sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+        .await
+        .expect("rollback sweep");
+
+    let cursor = load_shard_rotation_progress(&mut conn, 0, &codecs)
+        .await
+        .expect("progress")
+        .cursor
+        .expect("k1's fresh pass wrote a cursor");
+    assert_eq!(cursor.active_key_id, "k1");
+    assert!(
+        cursor.completed_at.is_some(),
+        "the rollback pass must also complete"
+    );
+    let deadline = cursor
+        .next_revalidation_at
+        .expect("a completed pass must have an armed deadline");
+    assert!(
+        deadline > Utc::now(),
+        "a fresh pass under a different key must arm its own deadline, not \
+         inherit the previous key's stale one; got {deadline:?}"
+    );
+}
+
+/// A claimed revalidation on an idle shard must still refresh `updated_at`.
+///
+/// The churn guard skips [`write_cursor`] whenever a tick changes nothing
+/// the cursor tracks. On an idle, fully-converged shard whose deadline just
+/// came due, the claim is the ONLY write that tick makes.
+///
+/// If the claim did not also touch `updated_at`, a healthy, periodically
+/// re-censused shard would read wrong. Its cursor would look as though it
+/// had never been written since the original pass completed.
+#[tokio::test]
+async fn a_claimed_idle_revalidation_still_bumps_updated_at() {
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let codecs = two_key_registry();
+    let exec_id = insert_execution(&mut conn, "idle_claim_updated_at").await;
+    append_under_key(
+        &mut conn,
+        &codecs,
+        exec_id,
+        "k1",
+        0,
+        &[started(json!({"a": 1}))],
+    )
+    .await;
+
+    codecs.set_active_key("k2").expect("flip");
+    sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+        .await
+        .expect("first pass");
+    let first = load_shard_rotation_progress(&mut conn, 0, &codecs)
+        .await
+        .expect("progress")
+        .cursor
+        .expect("cursor written");
+    assert!(
+        first.completed_at.is_some(),
+        "the pass must converge, or this test does not exercise the hazard"
+    );
+
+    // Simulate the interval elapsing, with no traffic at all in between.
+    diesel::sql_query(
+        "UPDATE harvest_codec_rotation_cursor \
+         SET next_revalidation_at = now() - interval '1 minute' WHERE shard_id = 0",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("age the deadline");
+
+    // Idle tick: no new rows, so the batch is empty and the churn guard
+    // would skip `write_cursor` entirely if the claim did not fire.
+    sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+        .await
+        .expect("idle tick at the due deadline");
+
+    let second = load_shard_rotation_progress(&mut conn, 0, &codecs)
+        .await
+        .expect("progress")
+        .cursor
+        .expect("cursor still there");
+    assert!(
+        second.next_revalidation_at > first.next_revalidation_at,
+        "the deadline must have been claimed and rearmed"
+    );
+    assert!(
+        second.updated_at > first.updated_at,
+        "the claim is the only write this idle tick makes, so it must be \
+         the one that keeps updated_at from reading as stale forever on a \
+         healthy, periodically-revalidated shard"
     );
 }

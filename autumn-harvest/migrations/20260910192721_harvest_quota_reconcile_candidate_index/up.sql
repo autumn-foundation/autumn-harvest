@@ -1,0 +1,39 @@
+-- Partial index for quota_reconcile's candidate scan (issue #1226).
+--
+-- quota_reconcile::CANDIDATE_SQL filters `quota_key IS NULL AND state IN
+-- ('RUNNING', 'PAUSED')`. The existing idx_harvest_we_state (migration
+-- 20260409000000_harvest_initial) only covers `state = 'RUNNING'`, so the
+-- PAUSED branch of that IN forced a full sequential scan of
+-- harvest_workflow_executions on every reconcile tick -- unbounded by the
+-- non-terminal row count, contrary to the module's own doc comment.
+--
+-- This index self-shrinks: a row leaves it the moment quota_reconcile (or
+-- a fresh admission) sets its quota_key, so it always covers exactly the
+-- current candidate set, not the table's full history. The `(id)` key is
+-- not just eligibility bookkeeping: quota_reconcile's candidate scan orders
+-- by `id` and resumes from a cursor, so this index also backs that keyset
+-- scan directly -- a workflow-name-leading column list would not.
+--
+-- KNOWN SCALING TRADE-OFF. CANDIDATE_SQL also filters `workflow_name =
+-- ANY($1)`, evaluated as a residual predicate against each id-ordered row
+-- this index yields, not as an index seek. In a mixed deployment with a
+-- very large non-quota'd population and few matching rows, one tick's
+-- scan can touch many discarded rows before filling `batch_size`.
+--
+-- A `(workflow_name, id)` key was considered and rejected here: it would
+-- let Postgres seek directly to matching workflow types, but could no
+-- longer serve `ORDER BY id LIMIT $3` without sorting every matching row
+-- first. That swaps today's bounded-per-tick cost against a large
+-- EXCLUDED population for a bounded-per-tick cost against a large
+-- REGISTERED backlog instead -- not a strict win. Confirming which side
+-- is actually cheaper needs `EXPLAIN ANALYZE` against production-scale
+-- data. Tracked as a follow-up, not silently accepted.
+--
+-- On a live deployment prefer the concurrent form, which cannot run inside
+-- Diesel's migration transaction:
+--   CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_harvest_we_quota_reconcile_candidates
+--       ON harvest_workflow_executions (id)
+--       WHERE quota_key IS NULL AND state IN ('RUNNING', 'PAUSED');
+CREATE INDEX IF NOT EXISTS idx_harvest_we_quota_reconcile_candidates
+    ON harvest_workflow_executions (id)
+    WHERE quota_key IS NULL AND state IN ('RUNNING', 'PAUSED');

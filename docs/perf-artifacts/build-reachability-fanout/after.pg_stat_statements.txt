@@ -1,0 +1,31 @@
+-- after: all_build_reachability() (N=50 distinct builds) --
+[
+    StatRow {
+        query: "SELECT DISTINCT build_id FROM ( SELECT assigned_build_id AS build_id FROM harvest_workflow_executions WHERE assigned_build_id IS NOT NULL AND assigned_build_id <> $1 UNION SELECT required_build_id AS build_id FROM harvest_task_queue WHERE required_build_id IS NOT NULL AND required_build_id <> $2 UNION SELECT build_id FROM harvest_workers WHERE build_id IS NOT NULL AND build_id <> $3 ) sub ORDER BY build_id",
+        calls: 1,
+        shared_blks_hit: 1949,
+        shared_blks_read: 0,
+        total_buffers: 1949,
+    },
+    StatRow {
+        query: "SELECT required_build_id AS build_id, COUNT(*) AS n FROM harvest_task_queue WHERE required_build_id IS NOT NULL AND required_build_id <> $1 AND state = $2 GROUP BY required_build_id",
+        calls: 1,
+        shared_blks_hit: 401,
+        shared_blks_read: 0,
+        total_buffers: 401,
+    },
+    StatRow {
+        query: "SELECT assigned_build_id AS build_id, COUNT(*) AS n FROM harvest_workflow_executions WHERE assigned_build_id IS NOT NULL AND assigned_build_id <> $1 AND state NOT IN ($2, $3, $4, $5, $6, $7) GROUP BY assigned_build_id",
+        calls: 1,
+        shared_blks_hit: 395,
+        shared_blks_read: 0,
+        total_buffers: 395,
+    },
+    StatRow {
+        query: "SELECT build_id, COUNT(*) FILTER ( WHERE status = $2 AND NOW() - last_heartbeat_at <= make_interval(secs => $1::float8) ) AS active_workers, COUNT(*) FILTER ( WHERE NOW() - last_heartbeat_at > make_interval(secs => $1::float8) ) AS stale_workers FROM harvest_workers WHERE build_id <> $3 GROUP BY build_id",
+        calls: 1,
+        shared_blks_hit: 54,
+        shared_blks_read: 0,
+        total_buffers: 54,
+    },
+]

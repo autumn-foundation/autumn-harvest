@@ -278,6 +278,17 @@ pub enum PartitionCommand {
         /// How many cohorts ahead of "now" the engine keeps pre-created.
         #[arg(long, value_name = "N", default_value_t = autumn_harvest::partition::DEFAULT_LOOKAHEAD_COHORTS)]
         lookahead_cohorts: u32,
+
+        /// Omit the phase-1 guard that refuses when a logical-replication
+        /// publication covers `harvest_events` without
+        /// `publish_via_partition_root`.
+        ///
+        /// Set this only when the subscriber runs the partitioned layout too.
+        /// Without it, an operator who has done exactly that could use this
+        /// override on `enable`. They could not use it on the large-table
+        /// plan — the only path large deployments are told to use.
+        #[arg(long = "allow-incompatible-publications")]
+        allow_incompatible_publications: bool,
     },
 
     /// **Convert this shard to the partitioned layout.**
@@ -1786,6 +1797,13 @@ enum AuditCommand {
         /// Upper bound (exclusive), RFC 3339.
         #[arg(long)]
         before: Option<String>,
+        /// Row id tiebreaker for `--before` (issue #1408).
+        ///
+        /// Pass the prior page's last row id, alongside `--before`, to page
+        /// past rows tied on that timestamp. Has no effect without
+        /// `--before`.
+        #[arg(long)]
+        before_id: Option<String>,
         /// Maximum number of records to return [1–500].
         #[arg(long, value_parser = clap::value_parser!(i64).range(1..=500))]
         limit: Option<i64>,
@@ -1913,6 +1931,17 @@ enum ShardCommand {
         /// Report what would move without writing anything.
         #[arg(long)]
         dry_run: bool,
+        /// Resume a prior call's candidate scan past this cursor (issue
+        /// #1317), instead of always starting at the shard's oldest
+        /// `RUNNING` row. Copy both fields verbatim from a prior report's
+        /// `next_scan_cursor`. Without this, a shard whose oldest rows are
+        /// permanently blocked (an active session, a parked child) makes
+        /// every repeated call re-examine the same rows forever.
+        #[arg(long, requires = "after_execution_id")]
+        after_created_at: Option<autumn_harvest::chrono::DateTime<autumn_harvest::chrono::Utc>>,
+        /// See `--after-created-at`; both must be supplied together.
+        #[arg(long, requires = "after_created_at")]
+        after_execution_id: Option<autumn_harvest::uuid::Uuid>,
         /// Print the raw JSON report instead of a human table.
         #[arg(long)]
         json: bool,
@@ -1934,6 +1963,40 @@ enum ShardCommand {
         #[arg(long, default_value_t = 100)]
         limit: i64,
         /// Print the raw JSON report instead of a human table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Release a rebalanced source seal's business key once its live copy
+    /// has finished (issue #1317).
+    ///
+    /// Without this, `migrated_run_terminal_at` is never populated in a
+    /// deployment that does not run its own maintenance driver. A finished
+    /// migration then keeps blocking a same-key restart forever. Safe
+    /// to run on a schedule: idempotent, and a no-op once every eligible
+    /// seal on the shard is already marked.
+    ReconcileMigratedSeals {
+        /// Shard databases, as `<ID>=<DSN>`. Supply the shard whose seals to
+        /// reconcile, plus every shard any of those seals' live copies (or
+        /// forwarding chains) may currently reside on.
+        #[arg(long = "shard", value_name = "ID=DSN", required = true)]
+        shards: Vec<String>,
+        /// The shard whose `MIGRATED` seals to sweep.
+        #[arg(long)]
+        from: i32,
+        /// Maximum seals to examine in this run.
+        #[arg(long, default_value_t = 100)]
+        limit: i64,
+        /// Resume a prior call's scan past this cursor (issue #1317 review),
+        /// instead of always starting at the shard's oldest seal. Without
+        /// this, a shard whose oldest seals are permanently still-live or
+        /// unreachable makes every repeated call re-examine the same rows
+        /// forever. Copy both fields verbatim from a prior run's resume hint.
+        #[arg(long, requires = "after_execution_id")]
+        after_migrated_at: Option<autumn_harvest::chrono::DateTime<autumn_harvest::chrono::Utc>>,
+        /// See `--after-migrated-at`; both must be supplied together.
+        #[arg(long, requires = "after_migrated_at")]
+        after_execution_id: Option<autumn_harvest::uuid::Uuid>,
+        /// Print the raw JSON count instead of a human summary.
         #[arg(long)]
         json: bool,
     },
@@ -3354,10 +3417,13 @@ enum EventsCommand {
     Tail {
         /// Workflow execution ID to watch.
         execution_id: String,
-        /// Resume from this event row ID (Last-Event-ID header).
-        /// Events with id > this value are replayed before entering live-tail mode.
+        /// Resume from this `event_id` (issue #1405), sent as the
+        /// Last-Event-ID header. NOT the shard-local `harvest_events.id` --
+        /// this is the per-execution sequence number the server's `id:`
+        /// SSE field carries. Events after it are replayed before entering
+        /// live-tail mode.
         #[arg(long)]
-        last_event_id: Option<i64>,
+        last_event_id: Option<i32>,
     },
 }
 
@@ -3574,7 +3640,9 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
     if let Commands::Shard { command } = &cli.command
         && matches!(
             command,
-            ShardCommand::Rebalance { .. } | ShardCommand::RebalanceResume { .. }
+            ShardCommand::Rebalance { .. }
+                | ShardCommand::RebalanceResume { .. }
+                | ShardCommand::ReconcileMigratedSeals { .. }
         )
     {
         return run_shard_rebalance(command, cli.actor.as_deref()).await;
@@ -4669,7 +4737,7 @@ pub fn format_backup_verify_text(report: &RestoreVerifyReport) -> String {
             replay.unreadable,
             replay.unreadable
         );
-    } else if replay.unreadable > 0 {
+    } else if replay.unreadable > 0 && replay.skipped_no_handler == 0 {
         // Every sample that reached this check was unreadable, and none
         // replayed at all. This is distinct from the branch below, where
         // nothing replayed because no handler was registered. Handlers may
@@ -4683,6 +4751,23 @@ pub fn format_backup_verify_text(report: &RestoreVerifyReport) -> String {
              history failed to read; see the history_unreadable finding above for the cause. \
              Registering workflow handlers will not fix this.",
             replay.sampled, replay.unreadable
+        );
+    } else if replay.unreadable > 0 {
+        // Nothing replayed, for two separate reasons at once: some samples
+        // were unreadable, others had no registered handler. A fleet-wide
+        // merge across shards can produce this mix (issue #1410). Name both
+        // counts. Registering handlers fixes only the second group.
+        let _ = writeln!(
+            out,
+            "  replay: NOT VERIFIED — {} sampled, {} unreadable, {} skipped (no handler), \
+             0 replayed. {} history/histories failed to read; see the history_unreadable \
+             finding above for the cause. {} had no registered handler. Registering \
+             handlers may fix part of this, not all of it.",
+            replay.sampled,
+            replay.unreadable,
+            replay.skipped_no_handler,
+            replay.unreadable,
+            replay.skipped_no_handler
         );
     } else {
         let _ = writeln!(
@@ -5072,6 +5157,21 @@ fn redact_keyword_dsn(dsn: &str) -> Option<String> {
     })
 }
 
+/// The char starting at byte offset `i`, or `None` past the end of `dsn`.
+fn peek_char(dsn: &str, i: usize) -> Option<char> {
+    dsn[i..].chars().next()
+}
+
+/// Advance `*i` past a run of Unicode whitespace, if any starts there.
+fn skip_whitespace(dsn: &str, i: &mut usize) {
+    while let Some(c) = peek_char(dsn, *i) {
+        if !c.is_whitespace() {
+            break;
+        }
+        *i += c.len_utf8();
+    }
+}
+
 /// Scan a libpq keyword/value DSN, replacing the values `replace` returns
 /// `Some` for and copying every other byte verbatim.
 ///
@@ -5080,6 +5180,13 @@ fn redact_keyword_dsn(dsn: &str) -> Option<String> {
 /// the next character in either form. A whitespace split cannot see quoting, so
 /// `password='abc sslmode=verify-full def'` would otherwise have the text
 /// *inside the password* rewritten.
+///
+/// "Whitespace" is Unicode `White_Space` (`char::is_whitespace`), matching
+/// `tokio_postgres::config`'s own `skip_ws`. It is not ASCII only.
+///
+/// The client treats a no-break space or a vertical tab as an option
+/// separator. This scan must too. Otherwise it reads two options as one
+/// and a `password` key past the separator goes unseen (issue #1321).
 ///
 /// Returns `None` for a DSN this cannot scan — an unterminated quote, a missing
 /// `=`, a value that never arrives — leaving the caller to pass the original
@@ -5094,11 +5201,10 @@ fn scan_keyword_dsn(
     let mut i = 0;
 
     while i < bytes.len() {
-        // Whitespace between options, copied verbatim.
+        // Whitespace between options, copied verbatim. See the Unicode
+        // whitespace note on this function's doc comment.
         let start = i;
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
+        skip_whitespace(dsn, &mut i);
         out.push_str(&dsn[start..i]);
         if i >= bytes.len() {
             break;
@@ -5106,8 +5212,11 @@ fn scan_keyword_dsn(
 
         // Keyword, then `=` with optional whitespace on either side.
         let key_start = i;
-        while i < bytes.len() && bytes[i] != b'=' && !bytes[i].is_ascii_whitespace() {
-            i += 1;
+        while let Some(c) = peek_char(dsn, i) {
+            if c == '=' || c.is_whitespace() {
+                break;
+            }
+            i += c.len_utf8();
         }
         let key = &dsn[key_start..i];
         // The key must be a keyword libpq actually recognizes, not merely
@@ -5122,16 +5231,12 @@ fn scan_keyword_dsn(
             return None;
         }
         let spacing_start = i;
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
+        skip_whitespace(dsn, &mut i);
         if i >= bytes.len() || bytes[i] != b'=' {
             return None;
         }
         i += 1;
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
+        skip_whitespace(dsn, &mut i);
         // A DSN that ends after `=` (`host=db password=`) has no value to read;
         // indexing here would panic before tokio-postgres could say so.
         if i >= bytes.len() {
@@ -5172,7 +5277,7 @@ fn scan_keyword_dsn(
                 }
             }
         } else {
-            while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+            while peek_char(dsn, i).is_some_and(|c| !c.is_whitespace()) {
                 if bytes[i] == b'\\' && i + 1 < bytes.len() {
                     let escaped = dsn[i + 1..].chars().next().unwrap_or_default();
                     value.push(escaped);
@@ -5978,10 +6083,12 @@ pub async fn run_partition(command: &PartitionCommand) -> Result<(), CliError> {
         PartitionCommand::Plan {
             cohort_width_secs,
             lookahead_cohorts,
+            allow_incompatible_publications,
         } => {
             let opts = autumn_harvest::partition::EnableOptions {
                 cohort_width_secs: *cohort_width_secs,
                 lookahead_cohorts: *lookahead_cohorts,
+                allow_incompatible_publications: *allow_incompatible_publications,
                 ..autumn_harvest::partition::EnableOptions::default()
             };
             opts.validate()
@@ -6085,6 +6192,7 @@ async fn run_partition_status(shards: &[String], format: DrFormat) -> Result<(),
                         &mut conn,
                         autumn_harvest::chrono::Utc::now(),
                         &autumn_harvest::partition::SweepOptions::default(),
+                        None,
                     )
                     .await
                     {
@@ -6165,6 +6273,8 @@ async fn run_partition_maintain(
             autumn_harvest::chrono::Utc::now(),
             lookahead_cohorts,
             &sweep,
+            None,
+            None,
         )
         .await
         {
@@ -6228,6 +6338,9 @@ async fn run_partition_disable(shards: &[String], format: DrFormat) -> Result<()
 /// The nonzero exit is the point: `harvest partition enable --shard a --shard b`
 /// that converted `a` and failed on `b` has left a half-converted cluster, and a
 /// zero exit would let a deployment script move on as though it had not.
+// One text/JSON report, field by field. Splitting it would scatter one
+// operator-facing rendering across helpers that only print once each.
+#[allow(clippy::too_many_lines)]
 fn emit_partition_report(
     rows: &[PartitionShardReport],
     format: DrFormat,
@@ -6291,6 +6404,13 @@ fn emit_partition_report(
                         m.sweep.dropped.len(),
                         m.sweep.straggler_rows_deleted,
                     );
+                    if m.sweep.truncated {
+                        // Issue #1270 item 1's whole reason for existing. A
+                        // pass that dropped and blocked nothing must not
+                        // read as "shard is clean". It may really mean the
+                        // pass ran out of budget before it looked at the rest.
+                        println!("  sweep: truncated, ran out of budget before finishing");
+                    }
                     if let Some(e) = &m.last_error {
                         println!("  INCOMPLETE: {e}");
                     }
@@ -6300,6 +6420,12 @@ fn emit_partition_report(
                     for b in &m.sweep.blocked {
                         println!("  blocked: {b}");
                     }
+                    // A partial catch-up: some of the lookahead window covered,
+                    // some not. Named individually so an operator can tell
+                    // exactly which range still lands in the DEFAULT partition.
+                    for b in &m.lookahead_blocked {
+                        println!("  lookahead blocked: {b}");
+                    }
                 }
                 if let Some(sweep) = &r.would_sweep {
                     println!(
@@ -6307,6 +6433,9 @@ fn emit_partition_report(
                         sweep.dropped.len(),
                         sweep.blocked.len()
                     );
+                    if sweep.truncated {
+                        println!("  sweep: truncated, ran out of budget before finishing");
+                    }
                     for b in &sweep.blocked {
                         println!("  blocked: {b}");
                     }
@@ -7506,6 +7635,13 @@ pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
         ApiMethod::Post => client.post(url),
         ApiMethod::Delete => client.delete(url),
     };
+    // Issue #1579: a bare `Accept: */*` (curl's own default) makes the
+    // server's error-page negotiation treat the request as browser
+    // navigation. It then returns an HTML error page, not the
+    // documented JSON body, on a validation error. State the CLI's
+    // real expectation here so its behavior never depends on a
+    // client-library default.
+    let builder = builder.header("Accept", "application/json");
     let builder = if let Some(token) = &cli.token {
         builder.bearer_auth(token)
     } else {
@@ -7552,7 +7688,7 @@ pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
 async fn run_events_tail(
     cli: &Cli,
     execution_id: &str,
-    last_event_id: Option<i64>,
+    last_event_id: Option<i32>,
 ) -> Result<(), CliError> {
     let path = format!("/executions/{}", path_segment(execution_id));
     let url = format!(
@@ -8014,22 +8150,7 @@ fn format_usage_table(value: &Value) -> String {
         ]);
     }
 
-    let widths = (0..rows[0].len())
-        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
-        .collect::<Vec<_>>();
-    let table = rows
-        .iter()
-        .map(|row| {
-            row.iter()
-                .enumerate()
-                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
-                .collect::<Vec<_>>()
-                .join("  ")
-                .trim_end()
-                .to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let table = render_table(&rows);
 
     format!("{summary}\n\n{table}")
 }
@@ -8130,22 +8251,7 @@ fn format_dlq_aggregate_table(value: &Value) -> String {
         rows.push(row);
     }
 
-    let widths = (0..rows[0].len())
-        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
-        .collect::<Vec<_>>();
-    let table = rows
-        .iter()
-        .map(|row| {
-            row.iter()
-                .enumerate()
-                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
-                .collect::<Vec<_>>()
-                .join("  ")
-                .trim_end()
-                .to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let table = render_table(&rows);
 
     let mut summary = format!("total: {total}  filtered: {filtered}");
     if truncated {
@@ -8196,21 +8302,7 @@ fn format_rate_limit_table(value: &Value) -> String {
         ]);
     }
 
-    let widths = (0..rows[0].len())
-        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
-        .collect::<Vec<_>>();
-    rows.iter()
-        .map(|row| {
-            row.iter()
-                .enumerate()
-                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
-                .collect::<Vec<_>>()
-                .join("  ")
-                .trim_end()
-                .to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    render_table(&rows)
 }
 
 fn format_f64(value: Option<&Value>) -> String {
@@ -8374,22 +8466,7 @@ fn format_canary_table(value: &Value) -> String {
             ]);
         }
 
-        let widths = (0..rows[0].len())
-            .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
-            .collect::<Vec<_>>();
-        let table = rows
-            .iter()
-            .map(|row| {
-                row.iter()
-                    .enumerate()
-                    .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
-                    .collect::<Vec<_>>()
-                    .join("  ")
-                    .trim_end()
-                    .to_string()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let table = render_table(&rows);
 
         let _ = writeln!(out, "\nSummary by Workflow Type:\n{table}");
     }
@@ -8434,22 +8511,7 @@ fn format_canary_table(value: &Value) -> String {
             ]);
         }
 
-        let widths = (0..rows[0].len())
-            .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
-            .collect::<Vec<_>>();
-        let table = rows
-            .iter()
-            .map(|row| {
-                row.iter()
-                    .enumerate()
-                    .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
-                    .collect::<Vec<_>>()
-                    .join("  ")
-                    .trim_end()
-                    .to_string()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let table = render_table(&rows);
 
         let _ = writeln!(out, "\nReplay Failures:\n{table}");
 
@@ -8599,22 +8661,7 @@ fn format_preflight_table(value: &Value) -> String {
         ]);
     }
 
-    let widths = (0..rows[0].len())
-        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
-        .collect::<Vec<_>>();
-    let table = rows
-        .iter()
-        .map(|row| {
-            row.iter()
-                .enumerate()
-                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
-                .collect::<Vec<_>>()
-                .join("  ")
-                .trim_end()
-                .to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let table = render_table(&rows);
 
     let findings = format_preflight_findings(checks);
     if findings.is_empty() {
@@ -8722,22 +8769,7 @@ fn format_shard_health_table(value: &Value) -> String {
         ]);
     }
 
-    let widths = (0..rows[0].len())
-        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
-        .collect::<Vec<_>>();
-    let table = rows
-        .iter()
-        .map(|row| {
-            row.iter()
-                .enumerate()
-                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
-                .collect::<Vec<_>>()
-                .join("  ")
-                .trim_end()
-                .to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let table = render_table(&rows);
 
     format!("overall_readiness: {overall}\nobserved_at: {observed_at}\n\n{table}")
 }
@@ -8788,22 +8820,7 @@ fn format_version_usage_table(value: &Value) -> String {
         ]);
     }
 
-    let widths = (0..rows[0].len())
-        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
-        .collect::<Vec<_>>();
-    let table = rows
-        .iter()
-        .map(|row| {
-            row.iter()
-                .enumerate()
-                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
-                .collect::<Vec<_>>()
-                .join("  ")
-                .trim_end()
-                .to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let table = render_table(&rows);
 
     format!("status: {status}\nobserved_at: {observed_at}\n\n{table}")
 }
@@ -9011,22 +9028,7 @@ fn format_workflow_reachability_table(value: &Value) -> String {
         ]);
     }
 
-    let widths = (0..rows[0].len())
-        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
-        .collect::<Vec<_>>();
-    let table = rows
-        .iter()
-        .map(|row| {
-            row.iter()
-                .enumerate()
-                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
-                .collect::<Vec<_>>()
-                .join("  ")
-                .trim_end()
-                .to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let table = render_table(&rows);
 
     let unavailable = value
         .get("shards")
@@ -9142,22 +9144,7 @@ fn format_activity_list_table(value: &Value) -> String {
         ]);
     }
 
-    let widths = (0..rows[0].len())
-        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
-        .collect::<Vec<_>>();
-    let table = rows
-        .iter()
-        .map(|row| {
-            row.iter()
-                .enumerate()
-                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
-                .collect::<Vec<_>>()
-                .join("  ")
-                .trim_end()
-                .to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let table = render_table(&rows);
 
     format!("status: {status}\n\n{table}")
 }
@@ -9333,22 +9320,7 @@ fn format_queue_coverage_table(value: &Value) -> String {
         ]);
     }
 
-    let widths = (0..rows[0].len())
-        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
-        .collect::<Vec<_>>();
-    let table = rows
-        .iter()
-        .map(|row| {
-            row.iter()
-                .enumerate()
-                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
-                .collect::<Vec<_>>()
-                .join("  ")
-                .trim_end()
-                .to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let table = render_table(&rows);
 
     format!(
         "status: {status}\nobserved_at: {observed_at}\ntotal_uncovered_queues: {total_uncovered}\n\n{table}{footer}{paused_note}"
@@ -9531,22 +9503,7 @@ fn format_handoff_table(value: &Value) -> String {
         ]);
     }
 
-    let widths = (0..rows[0].len())
-        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
-        .collect::<Vec<_>>();
-    let table = rows
-        .iter()
-        .map(|row| {
-            row.iter()
-                .enumerate()
-                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
-                .collect::<Vec<_>>()
-                .join("  ")
-                .trim_end()
-                .to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let table = render_table(&rows);
 
     let coverage = coverage.map_or_else(String::new, handoff_coverage_summary);
     if coverage.is_empty() {
@@ -9615,22 +9572,7 @@ fn format_workflow_children_table(value: &Value) -> String {
         ]);
     }
 
-    let widths = (0..rows[0].len())
-        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
-        .collect::<Vec<_>>();
-    let mut rendered = rows
-        .iter()
-        .map(|row| {
-            row.iter()
-                .enumerate()
-                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
-                .collect::<Vec<_>>()
-                .join("  ")
-                .trim_end()
-                .to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let mut rendered = render_table(&rows);
 
     if let Some(cursor) = value.get("next_cursor").and_then(Value::as_str) {
         rendered.push_str("\nnext_cursor: ");
@@ -9669,22 +9611,7 @@ fn format_workflow_summaries_table(value: &Value) -> String {
         ]);
     }
 
-    let widths = (0..rows[0].len())
-        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
-        .collect::<Vec<_>>();
-    let mut rendered = rows
-        .iter()
-        .map(|row| {
-            row.iter()
-                .enumerate()
-                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
-                .collect::<Vec<_>>()
-                .join("  ")
-                .trim_end()
-                .to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let mut rendered = render_table(&rows);
 
     if let Some(cursor) = value.get("next_cursor").and_then(Value::as_str) {
         rendered.push_str("\nnext_cursor: ");
@@ -9905,22 +9832,7 @@ fn format_run_chain_table(value: &Value) -> String {
         ]);
     }
 
-    let widths = (0..rows[0].len())
-        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
-        .collect::<Vec<_>>();
-    let mut rendered = rows
-        .iter()
-        .map(|row| {
-            row.iter()
-                .enumerate()
-                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
-                .collect::<Vec<_>>()
-                .join("  ")
-                .trim_end()
-                .to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let mut rendered = render_table(&rows);
 
     if let Some(workflow_id) = value.get("workflow_id").and_then(Value::as_str) {
         rendered = format!("workflow_id: {workflow_id}\n{rendered}");
@@ -9974,6 +9886,13 @@ fn format_audit_table(value: &Value) -> String {
         ]);
     }
 
+    render_table(&rows)
+}
+
+/// Render rows as a column-aligned table. Each column takes the width of its
+/// widest cell. Two spaces separate columns, and trailing padding on each
+/// line is trimmed. Callers must pass at least one row (the header).
+fn render_table(rows: &[Vec<String>]) -> String {
     let widths = (0..rows[0].len())
         .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
         .collect::<Vec<_>>();
@@ -10146,7 +10065,9 @@ fn shard_request(command: &ShardCommand) -> ApiRequest {
         // directly (issue #964); they never reach the management API. Kept in
         // the match rather than a `_` arm so a future shard subcommand is a
         // compile error here until it declares which path it takes.
-        ShardCommand::Rebalance { .. } | ShardCommand::RebalanceResume { .. } => {
+        ShardCommand::Rebalance { .. }
+        | ShardCommand::RebalanceResume { .. }
+        | ShardCommand::ReconcileMigratedSeals { .. } => {
             unreachable!("shard rebalance commands are dispatched in-process by run_cli")
         }
     }
@@ -10195,6 +10116,8 @@ async fn run_shard_rebalance(command: &ShardCommand, actor: Option<&str>) -> Res
             to,
             limit,
             dry_run,
+            after_created_at,
+            after_execution_id,
             json,
         } => {
             let targets = parse_shard_targets(shards)?;
@@ -10206,7 +10129,10 @@ async fn run_shard_rebalance(command: &ShardCommand, actor: Option<&str>) -> Res
                 ));
             }
             let pool = build_pool(&targets)?;
-            let report = autumn_harvest::shard_rebalance::migrate_quiescent_executions(
+            let after = after_created_at
+                .zip(*after_execution_id)
+                .map(|(at, id)| (at, autumn_harvest::types::ExecutionId::from_uuid(id)));
+            let report = autumn_harvest::shard_rebalance::migrate_quiescent_executions_after(
                 &pool,
                 ShardId::new(*from),
                 ShardId::new(*to),
@@ -10214,6 +10140,7 @@ async fn run_shard_rebalance(command: &ShardCommand, actor: Option<&str>) -> Res
                 *dry_run,
                 actor.unwrap_or("anonymous"),
                 &PayloadCodecs::default(),
+                after,
             )
             .await
             .map_err(|e| CliError::InvalidInput(e.to_string()))?;
@@ -10263,6 +10190,59 @@ async fn run_shard_rebalance(command: &ShardCommand, actor: Option<&str>) -> Res
             }
             Ok(())
         }
+        ShardCommand::ReconcileMigratedSeals {
+            shards,
+            from,
+            limit,
+            after_migrated_at,
+            after_execution_id,
+            json,
+        } => {
+            let targets = parse_shard_targets(shards)?;
+            require_shard(&targets, *from, "from")?;
+            let pool = build_pool(&targets)?;
+            let after = after_migrated_at
+                .zip(*after_execution_id)
+                .map(|(at, id)| (at, autumn_harvest::types::ExecutionId::from_uuid(id)));
+            let (reconciled, failures, next_cursor) =
+                autumn_harvest::shard_rebalance::reconcile_migrated_seals_after(
+                    &pool,
+                    ShardId::new(*from),
+                    *limit,
+                    after,
+                )
+                .await
+                .map_err(|e| CliError::InvalidInput(e.to_string()))?;
+
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "reconciled": reconciled,
+                        "failures": failures,
+                        "next_scan_cursor": next_cursor.map(|(at, id)| serde_json::json!({
+                            "migrated_at": at.to_rfc3339(),
+                            "execution_id": id.as_uuid(),
+                        })),
+                    }))
+                    .map_err(|e| CliError::InvalidInput(e.to_string()))?
+                );
+            } else {
+                println!("reconciled {reconciled} seal(s) on shard {from}");
+                for failure in &failures {
+                    println!("  failed    {}  ({})", failure.execution_id, failure.reason);
+                }
+                if let Some((at, id)) = next_cursor {
+                    println!(
+                        "more may remain past this window; resume with:\n  \
+                         --after-migrated-at {} --after-execution-id {}",
+                        at.to_rfc3339(),
+                        id.as_uuid()
+                    );
+                }
+            }
+            Ok(())
+        }
         ShardCommand::Health { .. } => unreachable!("health goes through the management API"),
     }
 }
@@ -10295,6 +10275,15 @@ fn format_rebalance_report(
         report.skipped(),
         report.aborted()
     );
+    if let Some((at, id)) = report.next_scan_cursor {
+        let _ = writeln!(
+            out,
+            "more may remain past this window; resume with:\n  \
+             --after-created-at {} --after-execution-id {}",
+            at.to_rfc3339(),
+            id.as_uuid()
+        );
+    }
     out
 }
 
@@ -11738,6 +11727,7 @@ fn audit_request(command: &AuditCommand) -> ApiRequest {
             status,
             since,
             before,
+            before_id,
             limit,
         } => {
             let mut params: Vec<(&'static str, String)> = Vec::new();
@@ -11761,6 +11751,9 @@ fn audit_request(command: &AuditCommand) -> ApiRequest {
             }
             if let Some(v) = before {
                 params.push(("before", v.clone()));
+            }
+            if let Some(v) = before_id {
+                params.push(("before_id", v.clone()));
             }
             if let Some(v) = limit {
                 params.push(("limit", v.to_string()));
@@ -12904,22 +12897,7 @@ fn format_retirement_check_table(value: &Value) -> String {
         ]);
     }
 
-    let widths = (0..rows[0].len())
-        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
-        .collect::<Vec<_>>();
-    let table = rows
-        .iter()
-        .map(|row| {
-            row.iter()
-                .enumerate()
-                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
-                .collect::<Vec<_>>()
-                .join("  ")
-                .trim_end()
-                .to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let table = render_table(&rows);
 
     format!("{header}\n\n{table}")
 }
@@ -16021,6 +15999,117 @@ mod usage_cli_tests {
         let rendered = format_usage_table(&value);
         assert!(rendered.contains("No usage groups found."));
     }
+
+    #[test]
+    fn render_table_pads_columns_to_their_widest_cell() {
+        let rows = vec![
+            vec!["A".to_string(), "BB".to_string()],
+            vec!["CCC".to_string(), "D".to_string()],
+        ];
+        assert_eq!(render_table(&rows), "A    BB\nCCC  D");
+    }
+
+    #[test]
+    fn render_table_trims_trailing_padding_on_each_line() {
+        let rows = vec![
+            vec!["A".to_string(), "B".to_string(), "C".to_string()],
+            vec![String::new(), String::new(), String::new()],
+        ];
+        assert_eq!(render_table(&rows), "A  B  C\n");
+    }
+
+    #[test]
+    fn render_table_handles_a_single_row() {
+        let rows = vec![vec!["HEADER".to_string()]];
+        assert_eq!(render_table(&rows), "HEADER");
+    }
+
+    #[test]
+    fn format_workflow_summaries_table_renders_rows_and_next_cursor() {
+        let value = serde_json::json!({
+            "summaries": [
+                {
+                    "execution_id": "exec-1",
+                    "workflow_name": "onboarding",
+                    "workflow_id": "wf-1",
+                    "state": "completed",
+                    "completed_at": "2026-05-18T00:00:00Z",
+                    "duration_ms": 4200,
+                    "shard_id": 3
+                }
+            ],
+            "next_cursor": "abc123"
+        });
+        let rendered = format_workflow_summaries_table(&value);
+        assert!(rendered.contains("EXEC ID"), "{rendered}");
+        assert!(rendered.contains("exec-1"), "{rendered}");
+        assert!(rendered.contains("onboarding"), "{rendered}");
+        assert!(rendered.ends_with("\nnext_cursor: abc123"), "{rendered}");
+    }
+
+    #[test]
+    fn format_workflow_summaries_table_reports_no_summaries() {
+        let value = serde_json::json!({ "summaries": [] });
+        assert_eq!(
+            format_workflow_summaries_table(&value),
+            "No execution summaries found."
+        );
+    }
+
+    #[test]
+    fn format_run_chain_table_renders_rows_workflow_id_and_head_unknown_note() {
+        let value = serde_json::json!({
+            "workflow_id": "wf-9",
+            "head_unknown": true,
+            "runs": [
+                {
+                    "sequence": 1,
+                    "exec_id": "exec-1",
+                    "run_id": "run-1",
+                    "state": "completed",
+                    "outcome": "success",
+                    "started_at": "2026-05-18T00:00:00Z",
+                    "completed_at": "2026-05-18T00:05:00Z",
+                    "continued_to_exec_id": "exec-2"
+                }
+            ]
+        });
+        let rendered = format_run_chain_table(&value);
+        assert!(rendered.starts_with("workflow_id: wf-9\n"), "{rendered}");
+        assert!(rendered.contains("exec-1"), "{rendered}");
+        assert!(rendered.contains("note: head_unknown"), "{rendered}");
+    }
+
+    #[test]
+    fn format_run_chain_table_reports_no_runs() {
+        let value = serde_json::json!({ "runs": [] });
+        assert_eq!(format_run_chain_table(&value), "No run chain found.");
+    }
+
+    #[test]
+    fn format_audit_table_renders_target_type_and_id_joined() {
+        let value = serde_json::json!([
+            {
+                "occurred_at": "2026-05-18T00:00:00Z",
+                "actor": "operator@example.com",
+                "operation": "pause",
+                "target_type": "workflow",
+                "target_id": "wf-1",
+                "status": "ok",
+                "source": "cli",
+                "error_summary": null
+            }
+        ]);
+        let rendered = format_audit_table(&value);
+        assert!(rendered.contains("workflow:wf-1"), "{rendered}");
+        assert!(rendered.contains("operator@example.com"), "{rendered}");
+    }
+
+    #[test]
+    fn format_audit_table_reports_no_records() {
+        let value = serde_json::json!([]);
+        assert_eq!(format_audit_table(&value), "No audit records found.");
+    }
 }
 
 #[cfg(test)]
@@ -18823,6 +18912,50 @@ mod migrate_cli_tests {
         let second = migrate_target_label("host=db password='unterminated", 2);
         assert_eq!(first, "<unparseable dsn> #1");
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn keyword_separators_use_unicode_whitespace_like_the_client_does() {
+        // `tokio_postgres` skips option separators with `char::is_whitespace` --
+        // the Unicode `White_Space` property, not ASCII (issue #1321).
+        //
+        // A scan that knows only ASCII reads the whole tail as ONE option.
+        // Its value contains the text `password=hunter2`. No `password` key
+        // is found, so the DSN returns whole, credential included.
+        for separator in [
+            '\u{0009}', // tab
+            '\u{000b}', // vertical tab -- ASCII, but not `is_ascii_whitespace`
+            '\u{0085}', // next line
+            '\u{00a0}', // no-break space
+            '\u{1680}', // ogham space mark
+            '\u{2003}', // em space
+            '\u{202f}', // narrow no-break space
+            '\u{3000}', // ideographic space
+        ] {
+            let dsn =
+                format!("host=db.internal{separator}password=hunter2{separator}dbname=harvest");
+            let label = migrate_target_label(&dsn, 1);
+            assert!(
+                !label.contains("hunter2"),
+                "credential leaked for {separator:?}: {label}"
+            );
+            assert!(label.contains("host=db.internal"), "{separator:?}: {label}");
+            assert!(label.contains("dbname=harvest"), "{separator:?}: {label}");
+        }
+    }
+
+    #[test]
+    fn a_no_break_space_separated_dsn_redacts_to_the_exact_expected_label() {
+        // An exact match catches a span slip that leaks the edge of a
+        // credential, not just a substring check missing it.
+        let label = migrate_target_label(
+            "host=db.internal\u{a0}password=hunter2\u{a0}dbname=harvest",
+            1,
+        );
+        assert_eq!(
+            label,
+            "host=db.internal\u{a0}password=***\u{a0}dbname=harvest"
+        );
     }
 
     // ── credential hygiene ──────────────────────────────────────────────────

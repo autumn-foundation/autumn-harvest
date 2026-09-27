@@ -1444,7 +1444,10 @@ mod tests {
         let _act = activity_semaphore.acquire_many(50).await.unwrap();
     }
 
-    #[tokio::test]
+    // Same rationale as the sibling test below: the tick count must not
+    // depend on host speed. A slow CI runner can starve real ticks and
+    // fail this test (issue #1290). `start_paused` removes that dependency.
+    #[tokio::test(start_paused = true)]
     async fn tuner_loop_applies_decision_each_tick_for_both_slot_types() {
         struct AlwaysGrow;
         impl SlotTuner for AlwaysGrow {

@@ -44,6 +44,7 @@ use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
 use autumn_harvest::types::ExecutionId;
 use autumn_harvest::worker::HandlerRegistry;
+use chrono::{Duration, Utc};
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use serde_json::Value;
@@ -51,8 +52,8 @@ use serde_json::Value;
 use crate::integration_e2e::{
     build_runtime_worker, build_test_pool, enqueue_started_workflow_task,
     insert_workflow_execution, load_child_executions_from_url, load_history_from_url,
-    load_timers_for_execution_from_url, setup_test_database_url_or_env, spawn_test_worker,
-    wait_for_execution_state,
+    load_timers_for_execution_from_url, seed_pending_timer_row, setup_test_database_url_or_env,
+    spawn_test_worker, wait_for_execution_state,
 };
 
 type WfFuture<'a> = Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>>;
@@ -363,6 +364,78 @@ fn parent_local_activity_and_timer(ctx: &WorkflowContext, _input: Value) -> WfFu
         let local = local.map_err(|e| e.to_string())?;
         timer.map_err(|e| e.to_string())?;
         Ok(serde_json::json!({"local": local}))
+    })
+}
+
+/// Issue #1247: arm a cancellable timer, cancel it, then run a local activity
+/// — all in one decision cycle. `CancelTimer` is not a durable awaitable, so
+/// `local_activity_batch_conflict` (AC8) lets this batch through. Before
+/// this fix, `extract_run_local_activity`'s catch-all silently dropped the
+/// `CancelTimer`, losing both its `TimerCancelled` event and its
+/// `harvest_timers` row delete.
+fn parent_cancel_timer_then_local_activity(ctx: &WorkflowContext, _input: Value) -> WfFuture<'_> {
+    Box::pin(async move {
+        let handle = ctx.start_timer("idle", 300);
+        handle.cancel().map_err(|e| e.to_string())?;
+        let local = ctx
+            .execute_local_activity_raw("compute_local", serde_json::json!({"n": 1}), None, None)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"local": local}))
+    })
+}
+
+/// Issue #1247: a `ctx.race()` resolved by its activity branch, followed
+/// immediately by a local activity in the SAME decision cycle. The race
+/// resolves synchronously inside its own `.await` — the winning activity's
+/// terminal is already in history on this replay. So the coroutine keeps
+/// running past it without suspending. The timer branch's loser cleanup
+/// (`CancelRaceLosers`) and the local activity both land in one batch.
+/// Before this fix `extract_run_local_activity` treated `CancelRaceLosers` as
+/// unreachable and panicked on it.
+fn parent_race_then_local_activity(ctx: &WorkflowContext, _input: Value) -> WfFuture<'_> {
+    Box::pin(async move {
+        let winner = ctx
+            .race()
+            .activity_raw("fast_activity", serde_json::json!({"n": 1}), "default")
+            .label("work")
+            .timer(std::time::Duration::from_secs(300))
+            .label("deadline")
+            .run()
+            .await
+            .map_err(|e| e.to_string())?;
+        let local = ctx
+            .execute_local_activity_raw("compute_local", serde_json::json!({"n": 1}), None, None)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"winner": winner.label, "local": local}))
+    })
+}
+
+/// Issue #1247: the ACTIVITY-loser twin of the test above. A timer loser
+/// produces no event at all. So it never exercised whether
+/// `apply_race_loser_cancellations`'s synthetic `ActivityFailed` for a
+/// cancelled loser activity reaches the in-memory history the co-batched
+/// local activity's immediate re-drive replays against.
+fn parent_race_activity_loser_then_local_activity(
+    ctx: &WorkflowContext,
+    _input: Value,
+) -> WfFuture<'_> {
+    Box::pin(async move {
+        let winner = ctx
+            .race()
+            .activity_raw("fast_activity", serde_json::json!({"n": 1}), "default")
+            .label("fast")
+            .activity_raw("slow_activity", serde_json::json!({"n": 1}), "default")
+            .label("slow")
+            .run()
+            .await
+            .map_err(|e| e.to_string())?;
+        let local = ctx
+            .execute_local_activity_raw("compute_local", serde_json::json!({"n": 1}), None, None)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"winner": winner.label, "local": local}))
     })
 }
 
@@ -1134,6 +1207,242 @@ async fn local_activity_co_batched_with_a_timer_fails_loudly_and_leaves_no_trace
     assert!(
         timers.is_empty(),
         "a rejected batch must arm no durable timer row: {timers:?}"
+    );
+}
+
+/// Issue #1247: a `CancelTimer` co-batched with a `RunLocalActivity` must
+/// keep its `TimerCancelled` event AND delete the durable `harvest_timers`
+/// row it targets. Before this fix, `extract_run_local_activity`'s
+/// catch-all silently dropped the command, so neither happened.
+///
+/// The row is seeded directly rather than armed live via `await_fire`
+/// (`seed_pending_timer_row`). It stands in for the row a real
+/// `ArmTimer { for_await: true }` cycle from an EARLIER task would have left
+/// behind. That lets this test drive the DB-delete path deterministically,
+/// instead of racing the scheduler for a live window. The workflow body
+/// itself only needs an ordinary same-cycle arm-then-cancel. The batch it
+/// produces, `[ArmTimer, CancelTimer, RunLocalActivity]`, is the exact shape
+/// the fix must handle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_timer_co_batched_with_a_local_activity_deletes_its_row_and_keeps_its_event() {
+    let (database_url, _guard) = setup_test_database_url_or_env().await;
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("connect");
+
+    let exec_id = insert_workflow_execution(&mut conn).await;
+    seed_pending_timer_row(&mut conn, exec_id, "idle", Utc::now() + Duration::hours(1)).await;
+    enqueue_started_workflow_task(&mut conn, exec_id, Value::Null).await;
+
+    let reg = registry(
+        vec![wf_info(
+            "e2e_test_workflow",
+            parent_cancel_timer_then_local_activity,
+        )],
+        vec![local_act_info("compute_local", fast_activity)],
+    );
+    let worker = build_runtime_worker("worker-1247-cancel-timer-local-activity", 2, 1, reg);
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    let parent = wait_for_execution_state(&database_url, exec_id, "COMPLETED").await;
+    worker.shutdown();
+    handle.await.expect("join");
+
+    let output = parent.output.expect("completed parent has output");
+    assert_eq!(
+        output.get("local").cloned(),
+        Some(serde_json::json!({"fast": {"n": 1}})),
+        "the local activity must still resolve: {output}"
+    );
+
+    let history = load_history_from_url(&database_url, exec_id).await;
+    let started_at = history
+        .events
+        .iter()
+        .position(|e| matches!(e, WorkflowEvent::TimerStarted { .. }));
+    let cancelled_at = history
+        .events
+        .iter()
+        .position(|e| matches!(e, WorkflowEvent::TimerCancelled { .. }));
+    let scheduled_at = history
+        .events
+        .iter()
+        .position(|e| matches!(e, WorkflowEvent::LocalActivityScheduled { .. }));
+    // `is_some()` on each side is load-bearing, not decoration.
+    // `Option<usize>` orders `None` below every `Some`, so a dropped event
+    // would pass a bare `<` comparison silently instead of failing loud.
+    assert!(
+        started_at.is_some() && started_at < cancelled_at,
+        "TimerStarted must be recorded before TimerCancelled, not dropped: {:?}",
+        history.events
+    );
+    assert!(
+        cancelled_at.is_some() && cancelled_at < scheduled_at,
+        "TimerCancelled must be recorded before LocalActivityScheduled, not dropped: {:?}",
+        history.events
+    );
+    assert!(
+        !history
+            .events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::TimerFired { .. })),
+        "a cancelled timer must never fire, seeded row included: {:?}",
+        history.events
+    );
+
+    let timers = load_timers_for_execution_from_url(&database_url, exec_id).await;
+    assert!(
+        timers.is_empty(),
+        "the CancelTimer's harvest_timers row must be deleted, not left for a later \
+         claim of this workflow task to ingest as a stale TimerFired: {timers:?}"
+    );
+}
+
+/// Issue #1247: a `ctx.race()` resolved by its activity branch, immediately
+/// followed by a local activity in the same decision cycle. The batch this
+/// composition produces is `[RecordMarker, CancelRaceLosers, RunLocalActivity]`.
+/// Before this fix, `extract_run_local_activity` treated `CancelRaceLosers` as
+/// unreachable and panicked on it. That was a regression introduced, and
+/// caught in self-review, while fixing this issue's original silent-drop bug.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn race_resolved_by_activity_then_local_activity_in_one_batch() {
+    let (database_url, _guard) = setup_test_database_url_or_env().await;
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("connect");
+
+    let exec_id = insert_workflow_execution(&mut conn).await;
+    enqueue_started_workflow_task(&mut conn, exec_id, Value::Null).await;
+
+    let reg = registry(
+        vec![wf_info(
+            "e2e_test_workflow",
+            parent_race_then_local_activity,
+        )],
+        vec![
+            act_info("fast_activity", fast_activity),
+            local_act_info("compute_local", fast_activity),
+        ],
+    );
+    let worker = build_runtime_worker("worker-1247-race-then-local-activity", 2, 1, reg);
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    let parent = wait_for_execution_state(&database_url, exec_id, "COMPLETED").await;
+    worker.shutdown();
+    handle.await.expect("join");
+
+    let output = parent.output.expect("completed parent has output");
+    assert_eq!(
+        output.get("winner").cloned(),
+        Some(serde_json::json!("work")),
+        "the activity branch must win the race: {output}"
+    );
+    assert_eq!(
+        output.get("local").cloned(),
+        Some(serde_json::json!({"fast": {"n": 1}})),
+        "the local activity must still resolve after the race: {output}"
+    );
+
+    let history = load_history_from_url(&database_url, exec_id).await;
+    assert!(
+        history
+            .events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::LocalActivityScheduled { .. })),
+        "the local activity must be scheduled, not lost alongside CancelRaceLosers: {:?}",
+        history.events
+    );
+
+    // The loser (the 300s deadline timer) must be durably cancelled in the
+    // same batch, exactly as the no-local-activity composition above proves.
+    // This pins that adding a local activity to the mix does not regress it.
+    let timers = load_timers_for_execution_from_url(&database_url, exec_id).await;
+    assert!(
+        timers.is_empty(),
+        "the losing timer's durable row must still be deleted when the winner \
+         is followed by a local activity in the same batch: {timers:?}"
+    );
+}
+
+/// Issue #1247: the ACTIVITY-loser twin. `apply_race_loser_cancellations`
+/// durably appends a synthetic `ActivityFailed` for the cancelled loser.
+/// Before this fix it never returned that event, so the local activity's
+/// immediate in-process re-drive replayed against an in-memory history
+/// missing it. A real divergence there would either fail the workflow
+/// outright or leave duplicate/missing events behind. This drives the
+/// exact composition end to end and checks for both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn race_resolved_by_activity_with_an_open_activity_loser_then_local_activity() {
+    let (database_url, _guard) = setup_test_database_url_or_env().await;
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("connect");
+
+    let exec_id = insert_workflow_execution(&mut conn).await;
+    enqueue_started_workflow_task(&mut conn, exec_id, Value::Null).await;
+
+    let reg = registry(
+        vec![wf_info(
+            "e2e_test_workflow",
+            parent_race_activity_loser_then_local_activity,
+        )],
+        vec![
+            act_info("fast_activity", fast_activity),
+            act_info("slow_activity", slow_activity),
+            local_act_info("compute_local", fast_activity),
+        ],
+    );
+    let worker = build_runtime_worker("worker-1247-race-activity-loser-local-activity", 2, 1, reg);
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    let parent = wait_for_execution_state(&database_url, exec_id, "COMPLETED").await;
+    worker.shutdown();
+    handle.await.expect("join");
+
+    let output = parent.output.expect("completed parent has output");
+    assert_eq!(
+        output.get("winner").cloned(),
+        Some(serde_json::json!("fast")),
+        "the fast activity branch must win the race: {output}"
+    );
+    assert_eq!(
+        output.get("local").cloned(),
+        Some(serde_json::json!({"fast": {"n": 1}})),
+        "the local activity must still resolve after the race: {output}"
+    );
+
+    let history = load_history_from_url(&database_url, exec_id).await;
+    let loser_failures = history
+        .events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                WorkflowEvent::ActivityFailed { error, .. }
+                    if error == "lost race to a sibling branch"
+            )
+        })
+        .count();
+    assert_eq!(
+        loser_failures, 1,
+        "the loser activity must get exactly one synthetic ActivityFailed — \
+         zero means it was lost, more than one means a divergent re-drive \
+         re-ran the cancellation: {:?}",
+        history.events
+    );
+    assert_eq!(
+        history
+            .events
+            .iter()
+            .filter(|e| matches!(e, WorkflowEvent::LocalActivityScheduled { .. }))
+            .count(),
+        1,
+        "the local activity must be scheduled exactly once, not re-emitted by \
+         a diverging replay: {:?}",
+        history.events
     );
 }
 

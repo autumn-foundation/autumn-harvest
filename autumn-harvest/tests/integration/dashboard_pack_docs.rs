@@ -89,6 +89,7 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     "harvest_workflow_start_throttled_total",
     "harvest_concurrency_superseded_total",
     "harvest_concurrency_residual_over_limit_total",
+    "harvest_quota_supersede_credit_not_shed_total",
     "harvest_scanner_tick_total",
     "harvest_saga_compensated_total",
     "harvest_saga_compensation_failed_total",
@@ -188,14 +189,21 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     "harvest_worker_slot_target",
     "harvest_shard_stranded_pending",
     "harvest_shard_dispatched_total",
+    // Issue #1429 — dispatch background publisher backpressure (bare gauge,
+    // no label, one series per process).
+    "harvest_dispatch_dropped_hints",
     // Issue #954 — cross-region DR. Four gauges (bare) and one counter.
     "harvest_replication_lag_seconds",
     "harvest_replication_lag_bytes",
     "harvest_replication_standbys",
     "harvest_replication_observable",
+    // Issue #1249 — readable-but-unmeasurable RPO signal.
+    "harvest_replication_rpo_known",
     "harvest_shard_generation",
     // Issue #953 — audit export to a SIEM sink (gauge, bare).
     "harvest_audit_export_lag",
+    // Issue #1268 — the availability companion to the lag gauge (gauge, bare).
+    "harvest_audit_export_observed",
     "harvest_shard_fenced_total",
     // Audit export to a SIEM sink (issue #953).
     "harvest_audit_exported_total",
@@ -209,6 +217,16 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     "harvest_concurrency_deferred",
     "harvest_mutex_contention_depth",
     "harvest_connector_lag",
+    // Issue #1307 — by-id fan-out observability, plus the adjacent
+    // external-cancel-sent bridge gap it fixed.
+    "harvest_workflow_external_cancel_sent_total",
+    "harvest_external_signal_by_id_indeterminate_shard_total",
+    "harvest_external_signal_by_id_oldest_pending_indeterminate_age",
+    "harvest_external_cancel_by_id_oldest_pending_indeterminate_age",
+    "harvest_external_signal_by_id_found_over_incomplete_fanout_total",
+    // Issue #1313 — the observable proxy for the by-id fan-out race's
+    // precondition.
+    "harvest_external_signal_by_id_other_live_observed_total",
 ];
 
 /// Per-series label ground truth (Prometheus-normalized label names),
@@ -262,6 +280,10 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
         "harvest_concurrency_residual_over_limit",
         &["workflow", "gap"],
     ),
+    (
+        "harvest_quota_supersede_credit_not_shed",
+        &["workflow", "gap"],
+    ),
     ("harvest_workflow_history_oversized", &["workflow"]),
     ("harvest_workflow_active", &["workflow", "state"]),
     ("harvest_saga_compensated", &["workflow", "queue"]),
@@ -312,6 +334,7 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     ("harvest_queue_dispatched", &["queue"]),
     ("harvest_shard_stranded_pending", &["shard"]),
     ("harvest_shard_dispatched", &["shard"]),
+    ("harvest_dispatch_dropped_hints", &[]),
     // Issue #954 — cross-region DR. All `{shard}`-only: a standby's
     // `application_name` is operator-chosen and unbounded (ADR-0001 §7).
     ("harvest_replication_lag_seconds", &["shard"]),
@@ -319,10 +342,12 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     // `actor`/`operation`/`target_id` are unbounded and tenant-identifying,
     // so they are deliberately never labels (ADR-0001 §7).
     ("harvest_audit_export_lag", &["shard"]),
+    ("harvest_audit_export_observed", &["shard"]),
     ("harvest_audit_exported", &["shard"]),
     ("harvest_replication_lag_bytes", &["shard"]),
     ("harvest_replication_standbys", &["shard"]),
     ("harvest_replication_observable", &["shard"]),
+    ("harvest_replication_rpo_known", &["shard"]),
     ("harvest_shard_generation", &["shard"]),
     ("harvest_shard_fenced", &["shard"]),
     ("harvest_worker_slots_in_use", &["slot_type"]),
@@ -377,6 +402,32 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     ("harvest_connector_dispatched", &["source", "outcome"]),
     ("harvest_connector_poisoned", &["source", "reason"]),
     ("harvest_connector_lag", &["source"]),
+    // Issue #1307 — by-id fan-out observability, plus the adjacent
+    // external-cancel-sent bridge gap it fixed.
+    (
+        "harvest_workflow_external_cancel_sent",
+        &["outcome", "reason_code"],
+    ),
+    (
+        "harvest_external_signal_by_id_indeterminate_shard",
+        &["shard", "kind"],
+    ),
+    (
+        "harvest_external_signal_by_id_oldest_pending_indeterminate_age",
+        &[],
+    ),
+    (
+        "harvest_external_cancel_by_id_oldest_pending_indeterminate_age",
+        &[],
+    ),
+    (
+        "harvest_external_signal_by_id_found_over_incomplete_fanout",
+        &["shard"],
+    ),
+    (
+        "harvest_external_signal_by_id_other_live_observed",
+        &["shard"],
+    ),
 ];
 
 /// Unbounded / dotted label forms that must never appear in an expression or

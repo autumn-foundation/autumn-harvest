@@ -271,7 +271,7 @@ fn build_worker_tuned(
         Worker::new(
             WorkerRuntimeConfig {
                 codec_rotation_batch_size: 0,
-                dr_fencing: false,
+                dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: worker_id.to_string(),
                 queues: queues.iter().map(|q| (*q).to_string()).collect(),
                 notification_database_url: None,
@@ -3410,6 +3410,7 @@ async fn a_failed_evidence_cleanup_rolls_back_the_registration() {
     let cleared = autumn_harvest::workers::register_worker_and_clear_stale_miss_evidence(
         &mut conn,
         &registration,
+        &[],
     )
     .await
     .expect("the happy path commits both writes");
@@ -3435,6 +3436,7 @@ async fn a_failed_evidence_cleanup_rolls_back_the_registration() {
     let failed = autumn_harvest::workers::register_worker_and_clear_stale_miss_evidence(
         &mut conn,
         &registration,
+        &[],
     )
     .await;
 
@@ -3482,6 +3484,7 @@ async fn tick_once(
         &Mutex::new(None),
         0,
         registration_pending,
+        &[],
     )
     .await;
 }
@@ -4034,7 +4037,8 @@ async fn a_timed_out_workflow_task_reset_preserves_the_capability_miss_budget() 
     .expect("seed a claimed, previously-missed task");
     assert_eq!(load_task(&url, task_id).await.capability_misses, 4);
 
-    autumn_harvest::worker::reset_timed_out_workflow_task(&pool, task_id, "slow-but-capable").await;
+    autumn_harvest::worker::reset_timed_out_workflow_task(&pool, task_id, "slow-but-capable", 0, 0)
+        .await;
 
     let task = load_task(&url, task_id).await;
     assert_eq!(

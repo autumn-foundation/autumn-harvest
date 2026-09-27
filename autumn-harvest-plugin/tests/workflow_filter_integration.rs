@@ -14,7 +14,6 @@ use autumn_harvest::worker::DbPool;
 use autumn_harvest::{StartWorkflowParams, start_or_load_workflow_execution};
 use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{HarvestApiState, harvest_api_router};
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -43,10 +42,6 @@ fn init_sql() -> Vec<u8> {
 }
 
 type HarvestApiApp = axum::Router;
-
-fn test_app_state_without_database() -> AppState {
-    AppState::for_test().with_profile("test")
-}
 
 async fn setup_single_database() -> (String, Option<ContainerAsync<Postgres>>) {
     if let Ok(admin_url) = std::env::var(LOCAL_PG_URL_ENV) {
@@ -284,7 +279,7 @@ async fn workflow_list_filters_match_expected_subsets() {
     let pool = build_pool(&database_url);
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     let onboarding_acme = seed_workflow(
         &database_url,
@@ -417,12 +412,238 @@ async fn workflow_list_filters_match_expected_subsets() {
 }
 
 #[tokio::test]
+async fn workflow_list_shows_an_orphaned_staged_migration_and_also_finds_it_explicitly() {
+    // Issue #1317: an earlier cut of this fix excluded `MIGRATING` at the
+    // query level. This is the same way the default listing already
+    // excludes `MIGRATED` (a sealed source, not a workflow). Review found
+    // a gap: it hides an execution entirely when the process crashes
+    // between `commit_cutover` and `activate_target`. The source is
+    // `MIGRATED` (also excluded) and the sole surviving copy is
+    // `MIGRATING`.
+    //
+    // The fix instead lets `MIGRATING` rows through the query. It
+    // deduplicates post-merge: a `MIGRATING` row is dropped only when a
+    // live row with the SAME id also appears in the page. That is the
+    // genuine staging-window duplicate a real cross-shard migration
+    // produces. This single-database test cannot construct that pair.
+    // Two rows cannot share a primary key in one database. So `staged`
+    // here is an ORPHAN copy: its own id, no live counterpart. That is
+    // exactly the committed-but-not-activated case the fix restores
+    // visibility for. It stays in the default listing, ordered by
+    // `created_at desc` same as any other row.
+    let (database_url, _container) = setup_single_database().await;
+    let pool = build_pool(&database_url);
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    let app = harvest_api_router(api_state);
+
+    let live = seed_workflow(
+        &database_url,
+        ShardId::new(0),
+        "entity_flow",
+        "wf-live",
+        None,
+    )
+    .await;
+    let staged = seed_workflow(
+        &database_url,
+        ShardId::new(0),
+        "entity_flow",
+        "wf-staged-migration",
+        None,
+    )
+    .await;
+    mark_state(&database_url, staged, "MIGRATING").await;
+
+    let (status, json) = get_json(&app, "/workflows").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        workflow_ids(&json),
+        vec!["wf-staged-migration".to_string(), "wf-live".to_string()],
+        "an orphaned MIGRATING copy with no live counterpart must stay visible"
+    );
+
+    let (_, json) = get_json(&app, "/workflows?state=MIGRATING").await;
+    assert_eq!(
+        workflow_ids(&json),
+        vec!["wf-staged-migration".to_string()],
+        "the diagnostic escape hatch must still find it explicitly"
+    );
+
+    let _ = live;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn sse_stream_resume_after_migration_uses_the_translated_event_id_cursor() {
+    // Issue #1405: the SSE resume cursor must be `event_id`. A shard
+    // migration copies it byte-for-byte. The cursor must not be
+    // `harvest_events.id`, a shard-local BIGSERIAL a migration deliberately
+    // does not copy. A client reconnecting with a pre-migration cursor,
+    // after the execution has moved shards, must see exactly the events it
+    // missed. It must not see a duplicate replay of history it already saw
+    // (a broken translation falling back to "from the start"). It must not
+    // see a gap either (a broken translation comparing the old cursor
+    // directly against the target's unrelated `id` sequence).
+    let ((shard0_url, shard1_url), _container) = setup_sharded_databases().await;
+    let pool = build_two_shard_pool(&shard0_url, &shard1_url);
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
+    api_state.install_storage_pool(pool.clone());
+    api_state.set_workflow_result_notification_database_urls([
+        (ShardId::new(0), shard0_url.clone()),
+        (ShardId::new(1), shard1_url.clone()),
+    ]);
+    let app = harvest_api_router(api_state);
+
+    let exec_id = seed_workflow(
+        &shard0_url,
+        ShardId::new(0),
+        "entity_flow",
+        "sse-migrate-resume",
+        None,
+    )
+    .await;
+
+    // Two more events after `WorkflowStarted` (event_id 0). Event_id 1 is
+    // what the client will report as its Last-Event-ID below. Event_id 2 is
+    // new history it has not seen yet, still written on the SOURCE shard.
+    let mut source = <AsyncPgConnection as AsyncConnection>::establish(&shard0_url)
+        .await
+        .expect("connect to source");
+    autumn_harvest::store::append_single_event(
+        &mut source,
+        exec_id,
+        autumn_harvest::event::WorkflowEvent::TimerStarted {
+            timer_id: autumn_harvest::types::TimerId::new("wake"),
+            duration_secs: 60,
+        },
+    )
+    .await
+    .expect("append event_id 1");
+    autumn_harvest::store::append_single_event(
+        &mut source,
+        exec_id,
+        autumn_harvest::event::WorkflowEvent::TimerFired {
+            timer_id: autumn_harvest::types::TimerId::new("wake"),
+        },
+    )
+    .await
+    .expect("append event_id 2");
+
+    // Re-park the workflow task `seed_workflow`'s start dispatched (issue
+    // #964 quiescence). A migration only moves a RUNNING execution with no
+    // claimed or due work; a fresh dispatch is neither.
+    diesel::sql_query(
+        "UPDATE harvest_task_queue SET state = 'PENDING', worker_id = NULL, \
+         started_at = NULL, scheduled_at = NOW() + INTERVAL '7 days' \
+         WHERE workflow_exec_id = $1 AND task_type = 'workflow'",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut source)
+    .await
+    .expect("park the workflow task");
+
+    let outcome = autumn_harvest::shard_rebalance::migrate_execution(
+        pool.sharded_pool(),
+        exec_id,
+        ShardId::new(0),
+        ShardId::new(1),
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+    )
+    .await
+    .expect("migration must not error");
+    assert!(
+        matches!(
+            outcome,
+            autumn_harvest::shard_rebalance::MigrationOutcome::Migrated { .. }
+        ),
+        "migration must complete, got {outcome:?}"
+    );
+
+    // The terminal event, written on the TARGET shard after cutover --
+    // history a pre-migration client has never seen either.
+    let mut target = <AsyncPgConnection as AsyncConnection>::establish(&shard1_url)
+        .await
+        .expect("connect to target");
+    autumn_harvest::store::append_single_event(
+        &mut target,
+        exec_id,
+        autumn_harvest::event::WorkflowEvent::WorkflowCompleted {
+            output: json!(null),
+        },
+    )
+    .await
+    .expect("append completion event (event_id 3)");
+    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+        .set((
+            harvest_workflow_executions::state.eq("COMPLETED".to_string()),
+            harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+        ))
+        .execute(&mut target)
+        .await
+        .expect("mark completed");
+
+    // Reconnect with the SOURCE-side cursor (event_id 1) -- the last event
+    // the client saw before the execution migrated away underneath it.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/executions/{exec_id}/events/stream"))
+                .header("last-event-id", "1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("open SSE stream");
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        axum::body::to_bytes(response.into_body(), usize::MAX),
+    )
+    .await
+    .expect("terminal execution's stream must close after backfill")
+    .expect("read SSE body");
+    let stream_text = String::from_utf8_lossy(&bytes);
+
+    let history_event_ids: Vec<i32> = stream_text
+        .split("\n\n")
+        .filter(|block| !block.contains("event: stream-end"))
+        .filter_map(|block| {
+            block
+                .lines()
+                .find(|l| l.starts_with("id: "))
+                .and_then(|l| l.trim_start_matches("id: ").parse::<i32>().ok())
+        })
+        .collect();
+    assert_eq!(
+        history_event_ids,
+        vec![2, 3],
+        "resume from event_id 1 across a migration must backfill exactly the \
+         events the client has not seen (event_id 2 and the completion \
+         event, event_id 3): {stream_text}"
+    );
+
+    let stream_end_block = stream_text
+        .split("\n\n")
+        .find(|block| block.contains("event: stream-end"))
+        .unwrap_or_else(|| panic!("no stream-end block in: {stream_text}"));
+    assert_eq!(
+        stream_end_block.trim_start().lines().next(),
+        Some("id: 3"),
+        "stream-end must carry the translated, migration-stable event_id: {stream_end_block}"
+    );
+}
+
+#[tokio::test]
 async fn workflow_list_invalid_filters_return_400() {
     let (database_url, _container) = setup_single_database().await;
     let pool = build_pool(&database_url);
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     let (status, body) = get_json(&app, "/workflows?state=NOT_A_STATE").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -454,7 +675,7 @@ async fn workflow_list_filters_apply_across_shards() {
     let ((shard0_url, shard1_url), _container) = setup_sharded_databases().await;
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(build_two_shard_pool(&shard0_url, &shard1_url));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     let _ = seed_workflow(
         &shard0_url,
@@ -558,7 +779,7 @@ async fn workflow_list_filter_failure_cause() {
     let pool = build_pool(&database_url);
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     let _nd_wf = seed_workflow(
         &database_url,
@@ -600,7 +821,7 @@ async fn workflow_list_filter_nd_blocked() {
     let pool = build_pool(&database_url);
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     // A RUNNING execution blocked on divergence.
     let blocked = seed_workflow(
@@ -729,7 +950,7 @@ async fn workflow_list_started_after_before_filters_are_applied() {
     let pool = build_pool(&database_url);
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     let old = seed_workflow(&database_url, ShardId::new(0), "billing", "wf-old", None).await;
     let new_wf = seed_workflow(&database_url, ShardId::new(0), "billing", "wf-new", None).await;
@@ -777,7 +998,7 @@ async fn workflow_list_exec_id_prefix_filter_applied() {
     let pool = build_pool(&database_url);
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     let exec_id = seed_workflow(
         &database_url,
@@ -811,7 +1032,7 @@ async fn workflow_list_legacy_call_returns_bare_array() {
     let pool = build_pool(&database_url);
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     let _ = seed_workflow(&database_url, ShardId::new(0), "billing", "wf-leg", None).await;
 
@@ -827,7 +1048,7 @@ async fn workflow_list_pagination_returns_envelope() {
     let pool = build_pool(&database_url);
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     // Seed 5 workflows with controlled created_at order.
     for i in 0..5u64 {
@@ -887,7 +1108,7 @@ async fn workflow_list_pagination_asc_order() {
     let pool = build_pool(&database_url);
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     for i in 0..4u64 {
         let exec_id = seed_workflow(
@@ -937,7 +1158,7 @@ async fn workflow_list_pagination_keyset_stability_under_concurrent_inserts() {
     let pool = build_pool(&database_url);
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     // Seed 4 "old" workflows with ts < 2026.
     for i in 0..4u64 {
@@ -1000,7 +1221,7 @@ async fn workflow_list_pagination_sharded_global_order() {
     let ((shard0_url, shard1_url), _container) = setup_sharded_databases().await;
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(build_two_shard_pool(&shard0_url, &shard1_url));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     // Shard 0: 3 workflows, timestamps t+0, t+20, t+40.
     // Shard 1: 3 workflows, timestamps t+10, t+30, t+50.
@@ -1098,7 +1319,7 @@ async fn workflow_search_attr_predicate_comparison_and_set() {
     let pool = build_pool(&database_url);
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     // amount/phase/retry_count fixtures. `small-amount` deliberately probes the
     // string-vs-number coercion regression: amount=100 must sort ABOVE amount=20
@@ -1201,7 +1422,7 @@ async fn workflow_search_attr_predicate_invalid_returns_400() {
     let pool = build_pool(&database_url);
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     // Unknown operator.
     let (status, body) = get_json(&app, "/workflows?search_attr_filter=amount:between:1").await;
@@ -1285,7 +1506,7 @@ async fn workflow_search_attr_predicate_applies_across_shards_with_pagination() 
     let ((shard0_url, shard1_url), _container) = setup_sharded_databases().await;
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(build_two_shard_pool(&shard0_url, &shard1_url));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     // Three matching rows spread across two shards, plus one non-matching row.
     for (url, shard, id, amount) in [
@@ -1362,7 +1583,7 @@ async fn stalled_workflow_path_applies_search_attr_predicate() {
     let pool = build_pool(&database_url);
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     let blocked = seed_workflow(
         &database_url,

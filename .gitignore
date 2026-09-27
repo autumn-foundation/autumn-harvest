@@ -12,3 +12,14 @@ __pycache__/
 # are build output, not source.
 node_modules/
 examples/typescript-client/src/harvest-api.ts
+
+# claude-agent-daemon example runtime state (issue #1493's README). The
+# documented "Try it in one minute" walkthrough runs `agentd` from the
+# repository root, and its defaults (`agentd.db`, `agentd.sock`, both
+# defined in examples/claude-agent-daemon/src) write there. Left unignored,
+# following the docs verbatim leaves the checkout dirty with a database that
+# — once run against a real key — holds every prompt, tool input, and file
+# the agent read. Guarded by
+# scripts/check-agentd-runtime-artifacts-ignored.sh.
+/agentd.db*
+/agentd.sock*

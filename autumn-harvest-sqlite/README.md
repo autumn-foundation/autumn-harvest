@@ -95,6 +95,12 @@ A complete, runnable version is in
   deterministic replay. Activity execution is therefore **at-least-once** — write
   activity bodies to be idempotent. See
   [`examples/durability.rs`](examples/durability.rs).
+- **Idempotent starts by default (issue #1068).** `start_workflow_with_id`
+  applies the `AllowDuplicate` reuse policy. A duplicate `(workflow_name,
+  workflow_id)` **attaches** to the existing, non-sealed run instead of
+  starting a second one. The new call's input is discarded. Use
+  `start_workflow_with_reuse_policy` for the full `WorkflowIdReusePolicy`
+  matrix — reject, replace-if-failed, or terminate-and-restart.
 
 ## v0.1 non-goals
 
@@ -103,8 +109,6 @@ Out of scope for this backend (tracked as issue #1068 follow-ups):
 - Distributed / multi-writer workers; multi-server crash recovery.
 - `LISTEN`/`NOTIFY` push wake-ups.
 - Schedules, the management API, DAGs, worker sessions, retention, sharding.
-- Idempotent starts / the `WorkflowIdReusePolicy` matrix — every
-  `start_workflow` call creates a new, independent execution; dedupe upstream.
 - Child workflows, external signals/cancels, local activities, updates,
   search attributes, and `continue_as_new` — a workflow reaching one of these is
   rejected **loudly, by name**, never silently dropped.
@@ -114,7 +118,10 @@ Out of scope for this backend (tracked as issue #1068 follow-ups):
 - **Docs guide:** [`docs/sqlite-backend.md`](../docs/sqlite-backend.md) — a
   task-oriented walkthrough of the whole surface.
 - **Runnable examples:** [`examples/quickstart.rs`](examples/quickstart.rs) and
-  [`examples/durability.rs`](examples/durability.rs).
+  [`examples/durability.rs`](examples/durability.rs). For a whole application on
+  this backend, see
+  [`examples/claude-agent-daemon/`](../examples/claude-agent-daemon/) — a local
+  daemon that runs Claude agent sessions as durable workflows.
 - **API reference:** `cargo doc --open -p autumn-harvest-sqlite` — the
   crate-level docs are the canonical design/contract document.
 - **Why this crate exists (and why it is not a core trait):**

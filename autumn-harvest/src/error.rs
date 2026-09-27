@@ -146,6 +146,62 @@ impl std::fmt::Display for CodecKeyShardRemainder {
     }
 }
 
+/// One worker that blocks activating a keyed codec (issue #1244).
+///
+/// Two independent reasons put a worker on this list.
+///
+/// A live worker that does not advertise support for the version-2 envelope
+/// would silently hand a `kid`-bearing payload to workflow code unchanged.
+/// It would not decode it (see
+/// [`crate::payload_codec::PayloadCodecs::set_active_key`]).
+///
+/// A live worker can support version 2 but still lack the target key id.
+/// That worker would fail to decode a payload some other worker encodes
+/// under it.
+///
+/// Activation is refused while any such worker is live, on any expected
+/// shard. `reason` (from the reachable path) says which.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CodecKeyActivationBlocker {
+    /// The shard this worker's heartbeat row was read from.
+    pub shard_id: i32,
+    /// The blocking worker's id, when the shard itself was reachable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<String>,
+    /// The blocking worker's host, when the shard itself was reachable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// `false` when the shard could not be read; activation is refused on
+    /// that basis alone, the same fail-closed posture as retirement.
+    pub reachable: bool,
+    /// Why the shard could not be read, when `reachable` is `false`. Why
+    /// this worker blocks activation, when `reachable` is `true` -- missing
+    /// envelope-version support, or the target key id not registered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl std::fmt::Display for CodecKeyActivationBlocker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.reachable {
+            let reason = self
+                .reason
+                .as_deref()
+                .unwrap_or("cannot read envelope version 2");
+            write!(
+                f,
+                "shard {}: worker {} on {} {reason}",
+                self.shard_id,
+                self.worker_id.as_deref().unwrap_or("?"),
+                self.host.as_deref().unwrap_or("?")
+            )
+        } else {
+            let reason = self.reason.as_deref().unwrap_or("unreachable");
+            write!(f, "shard {}: unreadable ({reason})", self.shard_id)
+        }
+    }
+}
+
 /// Errors produced by the autumn-harvest workflow engine.
 ///
 /// ## Examples
@@ -355,6 +411,30 @@ pub enum HarvestError {
         key_id: String,
         /// One entry per blocking shard.
         remaining: Vec<CodecKeyShardRemainder>,
+    },
+
+    /// Activating a codec key was refused because a live worker cannot read
+    /// the version-2 envelope the activation would start writing (issue
+    /// #1244).
+    ///
+    /// `blockers` names, per shard, every live worker still missing the
+    /// capability advertisement. A shard that could not be read is named too.
+    /// It blocks activation just as firmly — an uncounted shard is never
+    /// proof every worker on it is upgraded.
+    #[error(
+        "codec key id {key_id} cannot be activated: {} worker(s) or shard(s) block it ({})",
+        blockers.len(),
+        blockers
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )]
+    CodecKeyActivationBlocked {
+        /// The key id whose activation was refused.
+        key_id: String,
+        /// One entry per blocking worker or unreachable shard.
+        blockers: Vec<CodecKeyActivationBlocker>,
     },
 
     /// A payload-store operation (offload `put`, fetch `get`, or `delete`)

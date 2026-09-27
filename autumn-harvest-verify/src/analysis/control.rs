@@ -24,13 +24,16 @@
 
 use crate::mir::ast::Body;
 
-/// The CFG of one body, with post-dominance precomputed.
+/// The CFG of one body, with post-dominance and dominance precomputed.
 #[derive(Debug)]
 pub struct ControlGraph {
     labels: Vec<String>,
     successors: Vec<Vec<usize>>,
     /// `post_dominates[a][b]` — block `a` post-dominates block `b`.
     post_dominates: Vec<Vec<bool>>,
+    /// `dominates[a][b]` — block `a` dominates block `b`: every path from the
+    /// entry (`bb0`) to `b` passes through `a`.
+    dominates: Vec<Vec<bool>>,
     reachable: Vec<bool>,
 }
 
@@ -79,10 +82,12 @@ impl ControlGraph {
         }
 
         let post_dominates = post_dominance(&successors, &reachable);
+        let dominates = dominance(&successors, &reachable);
         Self {
             labels,
             successors,
             post_dominates,
+            dominates,
             reachable,
         }
     }
@@ -118,6 +123,20 @@ impl ControlGraph {
 
     fn post_dominates(&self, a: usize, b: usize) -> bool {
         self.post_dominates
+            .get(a)
+            .and_then(|row| row.get(b))
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// True when `a` dominates `b`: every path from the entry to `b` passes
+    /// through `a` (every block dominates itself). A caller uses this to
+    /// decide whether a sanitizer kill applies to a read elsewhere in the
+    /// body. A read `a` does not dominate could have executed on a path
+    /// that never reached the sanitizer at all.
+    #[must_use]
+    pub fn dominates(&self, a: usize, b: usize) -> bool {
+        self.dominates
             .get(a)
             .and_then(|row| row.get(b))
             .copied()
@@ -224,6 +243,104 @@ fn post_dominance(successors: &[Vec<usize>], reachable: &[bool]) -> Vec<Vec<bool
                 .unwrap_or(false)
                 && (a == b || can_exit.get(a).copied().unwrap_or(false))
                 && reachable.get(a).copied().unwrap_or(false);
+            if let Some(cell) = out.get_mut(a).and_then(|row| row.get_mut(b)) {
+                *cell = holds;
+            }
+        }
+    }
+    out
+}
+
+/// Iterative dominance over the forward CFG, entry at block 0.
+///
+/// The textbook data-flow equation: `dom[entry] = {entry}`, and
+/// `dom[b] = {b} ∪ (∩ dom[p] for every live predecessor p of b)` elsewhere,
+/// iterated to a fixpoint. Unlike [`post_dominance`] there is exactly one
+/// real root, never a virtual one added for several exits. So a block that
+/// is not reachable from the entry dominates nothing but itself — moot in
+/// practice, since every caller here first checks [`ControlGraph::is_live`].
+fn dominance(successors: &[Vec<usize>], reachable: &[bool]) -> Vec<Vec<bool>> {
+    let count = successors.len();
+    let mut predecessors: Vec<Vec<usize>> = vec![Vec::new(); count];
+    for (at, targets) in successors.iter().enumerate() {
+        for &target in targets {
+            if let Some(preds) = predecessors.get_mut(target) {
+                preds.push(at);
+            }
+        }
+    }
+
+    // `dom[b]` as a bit row: which blocks dominate `b`. The entry starts (and
+    // stays) dominated only by itself; every other block starts as if
+    // dominated by everything, narrowed down by the loop below.
+    let mut dom: Vec<Vec<bool>> = (0..count)
+        .map(|at| {
+            let mut row = vec![true; count];
+            if at == 0 {
+                row.fill(false);
+                if let Some(slot) = row.first_mut() {
+                    *slot = true;
+                }
+            }
+            row
+        })
+        .collect();
+
+    for _ in 0..count.saturating_add(2) {
+        let mut changed = false;
+        for b in 1..count {
+            if !reachable.get(b).copied().unwrap_or(false) {
+                continue;
+            }
+            let live_preds: Vec<usize> = predecessors
+                .get(b)
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|p| reachable.get(*p).copied().unwrap_or(false))
+                .collect();
+            if live_preds.is_empty() {
+                continue;
+            }
+            let mut row = vec![true; count];
+            for &pred in &live_preds {
+                let Some(other) = dom.get(pred) else {
+                    continue;
+                };
+                for slot in 0..count {
+                    if !other.get(slot).copied().unwrap_or(false)
+                        && let Some(cell) = row.get_mut(slot)
+                    {
+                        *cell = false;
+                    }
+                }
+            }
+            if let Some(cell) = row.get_mut(b) {
+                *cell = true;
+            }
+            if dom.get(b) != Some(&row) {
+                if let Some(slot) = dom.get_mut(b) {
+                    *slot = row;
+                }
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // Transpose into `dominates[a][b]`, dropping blocks that are not live.
+    let mut out = vec![vec![false; count]; count];
+    for b in 0..count {
+        for a in 0..count {
+            let holds = dom
+                .get(b)
+                .and_then(|row| row.get(a))
+                .copied()
+                .unwrap_or(false)
+                && reachable.get(a).copied().unwrap_or(false)
+                && reachable.get(b).copied().unwrap_or(false);
             if let Some(cell) = out.get_mut(a).and_then(|row| row.get_mut(b)) {
                 *cell = holds;
             }
@@ -357,6 +474,60 @@ mod tests {
             "an ordinary read of the same place still sees it — the exemption is \
              specific to `discriminant`, not a hole in the read rule"
         );
+    }
+
+    /// `if c { A } B` — the entry dominates everything; neither arm of the
+    /// branch dominates the join, and the join does not dominate itself's own
+    /// predecessor arm.
+    #[test]
+    fn dominance_is_the_mirror_of_post_dominance() {
+        let body = body(
+            "    bb0: {\n        switchInt(copy _1) -> [0: bb2, otherwise: bb1];\n    }\n\
+             \n    bb1: {\n        goto -> bb2;\n    }\n\
+             \n    bb2: {\n        return;\n    }\n",
+        );
+        let graph = ControlGraph::new(&body);
+        let (entry, arm, join) = (
+            graph.index_of("bb0").expect("bb0"),
+            graph.index_of("bb1").expect("bb1"),
+            graph.index_of("bb2").expect("bb2"),
+        );
+        assert!(
+            graph.dominates(entry, arm),
+            "the entry dominates every block"
+        );
+        assert!(graph.dominates(entry, join));
+        assert!(
+            graph.dominates(entry, entry),
+            "every block dominates itself"
+        );
+        assert!(
+            !graph.dominates(arm, join),
+            "the join is also reached directly from bb0, so bb1 does not dominate it"
+        );
+        assert!(
+            !graph.dominates(join, arm),
+            "dominance runs from the entry forward, never backward"
+        );
+    }
+
+    /// A straight-line chain: each block dominates every block after it.
+    #[test]
+    fn a_straight_line_chain_is_totally_ordered_by_dominance() {
+        let body = body(
+            "    bb0: {\n        goto -> bb1;\n    }\n\
+             \n    bb1: {\n        goto -> bb2;\n    }\n\
+             \n    bb2: {\n        return;\n    }\n",
+        );
+        let graph = ControlGraph::new(&body);
+        let (bb0, bb1, bb2) = (
+            graph.index_of("bb0").expect("bb0"),
+            graph.index_of("bb1").expect("bb1"),
+            graph.index_of("bb2").expect("bb2"),
+        );
+        assert!(graph.dominates(bb0, bb1) && graph.dominates(bb0, bb2));
+        assert!(graph.dominates(bb1, bb2));
+        assert!(!graph.dominates(bb1, bb0) && !graph.dominates(bb2, bb0));
     }
 
     #[test]
