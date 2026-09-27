@@ -1267,11 +1267,10 @@ fn parse_lease_reply(queue: &str, reply: &str) -> Option<ReconcileLease> {
     if reply == LEASE_NOT_HELD {
         return None;
     }
-    let (renewed, cursor) = if let Some(cursor) = reply.strip_prefix(LEASE_RENEWED) {
-        (true, cursor)
-    } else {
-        (false, reply.strip_prefix(LEASE_TAKEN).unwrap_or(""))
-    };
+    let (renewed, cursor) = reply.strip_prefix(LEASE_RENEWED).map_or_else(
+        || (false, reply.strip_prefix(LEASE_TAKEN).unwrap_or("")),
+        |cursor| (true, cursor),
+    );
     Some(ReconcileLease {
         queue: queue.to_owned(),
         cursor: (!cursor.is_empty()).then(|| cursor.to_owned()),
