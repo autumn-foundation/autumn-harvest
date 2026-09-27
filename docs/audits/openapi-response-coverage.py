@@ -720,6 +720,8 @@ def chain_state(after: str) -> str:
             state = "value"
         elif method in ("is_ok", "is_err", "is_ok_and", "is_err_and", "is_some", "is_none"):
             state = "value"
+        elif method in ("map_or", "map_or_else"):
+            state = "value"
         opener = call.end() - 1
         rest = rest[opener + len(balanced(rest[opener:])) :]
 
@@ -760,6 +762,14 @@ def discards_error(before: str, after: str) -> bool:
     """
     if chain_state(after) == "tolerate":
         return True
+    # A standalone `let Ok(..) = parse else { .. }` tolerates the error when its
+    # fallback lets the request through. An `if let` has a block, not `else`,
+    # right after the call, so it never matches here.
+    bound = r"\blet\s+Ok\s*\([^()]*\)\s*=\s*(?:serde_json::)?$"
+    fallback = re.match(r"\s*else\s*\{", after)
+    if fallback and re.search(bound, before):
+        block = balanced(after[fallback.end() - 1 :], "{", "}")
+        return not rejecting_exit(block)
     tested = r"\b(?:if|while|&&)\s+let\s+Ok\s*\([^()]*\)\s*=\s*(?:serde_json::)?$"
     if re.search(tested, before) is None:
         return False
@@ -1553,6 +1563,8 @@ pub fn harvest_api_router() -> Router {
         .route("/e/if-let-else-ok", post(e_if_let_else_ok))
         .route("/e/empty-arm-rejects", post(e_empty_arm_rejects))
         .route("/e/if-let-json", post(e_if_let_json))
+        .route("/e/raw-let-else", post(e_raw_let_else))
+        .route("/e/map-or", post(e_map_or))
 }
 
 async fn e_wrapped(body: Bytes) -> Response {
@@ -2080,6 +2092,18 @@ async fn e_if_let_json(body: Result<Json<Gadget>, JsonRejection>) -> Result<Resp
         return Err(reject());
     }
     Ok(StatusCode::OK.into_response())
+}
+
+async fn e_raw_let_else(body: Bytes) -> Result<Response, Response> {
+    let Ok(gadget) = serde_json::from_slice::<Gadget>(&body) else {
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    };
+    Ok(StatusCode::OK.into_response())
+}
+
+async fn e_map_or(body: Bytes) -> Response {
+    let name = serde_json::from_slice::<Gadget>(&body).map_or(String::new(), |g| g.name);
+    StatusCode::OK.into_response()
 }
 
 async fn e_documented(Query(query): Query<Documented>) -> Response {
@@ -3177,6 +3201,21 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             )
         ],
         {"body_required": ["POST /e/if-let-json: the body is mandatory"]},
+    ),
+    (
+        "a raw let-else that returns success and a map_or chain are tolerant",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                path,
+                200,
+                request_body=body_of(("name", False), required=False),
+                additional_responses=[{"status": 204}],
+            )
+            for path in ("/e/raw-let-else", "/e/map-or")
+        ],
+        {},
     ),
     (
         "a malformed contract entry does not crash the audit",
