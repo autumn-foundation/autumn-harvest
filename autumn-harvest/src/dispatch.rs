@@ -246,7 +246,7 @@ pub struct InstalledDispatch {
     generation: u64,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "testing"))]
 impl InstalledDispatch {
     /// An install record that no slot holds. Unit tests use it to call a
     /// resolver without a write to the process-global slot.
@@ -1139,6 +1139,8 @@ tokio::task_local! {
 /// does not read a channel must not feed one.
 ///
 /// The binding is task-local. A task that `f` spawns does not inherit it.
+// The callers need the `db` feature (issue #1431).
+#[cfg_attr(not(feature = "db"), allow(dead_code))]
 pub(crate) async fn with_bound_channel<F: Future>(
     channel: Option<Arc<dyn TaskDispatch>>,
     f: F,
@@ -1166,6 +1168,8 @@ fn publish_target() -> PublishTarget {
 /// A worker spawns its maintenance loops through this call, so their hints
 /// follow the worker's channel too. With no bound scope, this is a plain
 /// `tokio::spawn`.
+// The callers need the `db` feature (issue #1431).
+#[cfg_attr(not(feature = "db"), allow(dead_code))]
 pub(crate) fn spawn_bound<F>(f: F) -> tokio::task::JoinHandle<F::Output>
 where
     F: Future + Send + 'static,
