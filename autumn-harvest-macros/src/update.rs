@@ -122,17 +122,7 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // Skip the leading ctx param when building type hints and dispatch args.
     let params: Vec<_> = func.sig.inputs.iter().skip(1).collect();
-    let param_names: Vec<_> = params
-        .iter()
-        .filter_map(|arg| {
-            if let syn::FnArg::Typed(pt) = arg
-                && let syn::Pat::Ident(ident) = &*pt.pat
-            {
-                return Some(&ident.ident);
-            }
-            None
-        })
-        .collect();
+    let param_names: Vec<_> = crate::attr_util::param_idents(&params);
 
     let input_type_hint = crate::attr_util::arg_type_hint(&params);
     let output_type_hint = crate::extract_ok_type_hint(&func.sig.output);
