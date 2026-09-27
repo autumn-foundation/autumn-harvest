@@ -13569,6 +13569,11 @@ type WorkflowTaskRow = (
     // reason, even though every row this endpoint's own writes produce
     // sets it.
     Option<chrono::DateTime<chrono::Utc>>, // created_at
+    // Issue #1402: the timer-provenance marker `is_the_missed_timer_wake`
+    // checks. `scheduled_at` alone can stop proving ownership: a
+    // queue-pause resume credit, an orphan reclaim, or a capability-miss
+    // release can each drift it.
+    Option<chrono::DateTime<chrono::Utc>>, // timer_fires_at
 );
 
 /// The narrow task-queue projection [`build_diagnosis_report`] reads.
@@ -14227,6 +14232,10 @@ pub(crate) async fn build_diagnosis_report(
             // `wake_source_repended_this_row` reads to settle what a
             // coincidental timer-`fires_at` match cannot.
             harvest_task_queue::created_at,
+            // Issue #1402: survives a `scheduled_at` drift that
+            // `created_at` alone cannot explain (a queue-pause resume
+            // credit, an orphan reclaim, a capability-miss release).
+            harvest_task_queue::timer_fires_at,
         ))
         .first::<WorkflowTaskRow>(&mut conn)
         .await
@@ -14628,6 +14637,7 @@ pub(crate) async fn build_diagnosis_report(
             session_id,
             sticky_worker_id,
             created_at,
+            timer_fires_at,
         )| {
             WorkflowTaskFacts {
                 has_worker: worker_id.is_some(),
@@ -14661,6 +14671,7 @@ pub(crate) async fn build_diagnosis_report(
                 queue_name,
                 scheduled_at,
                 created_at,
+                timer_fires_at,
             }
         },
     );
