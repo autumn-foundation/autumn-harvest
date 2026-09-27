@@ -23,6 +23,10 @@ pub enum SqliteError {
     UnregisteredActivity(String),
 
     /// A referenced execution id does not exist in this database.
+    ///
+    /// Every public accessor that takes an `ExecutionId` returns this for an
+    /// unknown id (issue #1735). A list read never returns an empty list for
+    /// an unknown id.
     #[error("execution not found: {0}")]
     ExecutionNotFound(ExecutionId),
 

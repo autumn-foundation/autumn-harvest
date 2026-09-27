@@ -6,6 +6,9 @@
 //! and `activity_attempts` returned `Ok(vec![])`, which a caller cannot tell
 //! apart from a real run with no rows.
 
+// The `#[workflow]` macro reads the unused `_n` input through its expansion.
+#![allow(clippy::used_underscore_binding)]
+
 use autumn_harvest::prelude::*;
 use autumn_harvest_sqlite::{RunState, SqliteError, SqliteResult, SqliteRuntime};
 use chrono::Utc;
