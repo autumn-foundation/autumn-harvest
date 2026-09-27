@@ -12,8 +12,9 @@
 //! `docs/plans/2026-09-07-redis-dispatch-worker-integration.md`.
 //!
 //! The installed channel is process-global, like the mutex lease TTL and the
-//! DR config. The worker reads it at run time, and every enqueue path in the
-//! same process publishes through it.
+//! DR config. Every enqueue path in the same process publishes through it. A
+//! worker binds the channel it starts with and keeps it (issue #1431). Its
+//! reads and its task hints then ignore a later install.
 
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -286,6 +287,9 @@ static INSTALL_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 static DISPATCH_SLOT_LOCK: Mutex<()> = Mutex::new(());
 
 /// Install the process-global channel. A later call replaces the earlier one.
+///
+/// A running worker keeps the channel it bound at its start (issue #1431). A
+/// replacement reaches only workers that start after it.
 ///
 /// Returns the generation this install was stamped with. A caller that may
 /// need to undo only *this* install keeps this value, for
@@ -1106,16 +1110,52 @@ where
     outcome
 }
 
-/// Run `f` with its publishes bound to `channel` (issue #1431).
+// ---------------------------------------------------------------------------
+// Bound channel
+// ---------------------------------------------------------------------------
+
+tokio::task_local! {
+    /// The channel every publish from the current task uses (issue #1431).
+    ///
+    /// `None` means publish nothing. With no scope, a publish uses the live
+    /// slot.
+    static BOUND_CHANNEL: Option<Arc<dyn TaskDispatch>>;
+}
+
+/// Run `f` with every publish it makes bound to `channel` (issue #1431).
+///
+/// The slot is process-global, so a second runtime in the same process can
+/// replace it. A worker keeps the channel it started with. Its task hints must
+/// follow that channel. The replacement's worker would otherwise read them,
+/// probe its own database, miss, and ack them as absent.
+///
+/// `None` binds to no channel, so nothing in `f` publishes. A worker that
+/// does not read a channel must not feed one.
+///
+/// The binding is task-local. A task that `f` spawns does not inherit it.
 pub(crate) async fn with_bound_channel<F: Future>(
     channel: Option<Arc<dyn TaskDispatch>>,
     f: F,
 ) -> F::Output {
-    drop(channel);
-    f.await
+    BOUND_CHANNEL.scope(channel, f).await
 }
 
-/// Publish `hints` on the installed channel now.
+/// Where a publish from the current task goes (issue #1431).
+enum PublishTarget {
+    /// No bound scope is active. The publish uses the live slot.
+    Live,
+    /// A bound scope is active. `None` publishes nothing.
+    Bound(Option<Arc<dyn TaskDispatch>>),
+}
+
+/// The publish target of the current task.
+fn publish_target() -> PublishTarget {
+    BOUND_CHANNEL
+        .try_with(Clone::clone)
+        .map_or(PublishTarget::Live, PublishTarget::Bound)
+}
+
+/// Publish `hints` on the bound channel, or else on the installed one, now.
 ///
 /// Errors are logged and dropped. The reconcile sweep in the worker is the
 /// durability floor. It republishes every due `PENDING` row the channel does
@@ -1124,10 +1164,18 @@ pub async fn publish_now(hints: Vec<DispatchHint>) {
     if hints.is_empty() {
         return;
     }
-    let Some(installed) = installed() else {
-        return;
+    let channel = match publish_target() {
+        PublishTarget::Bound(bound) => bound,
+        PublishTarget::Live => installed().map(|installed| installed.channel),
     };
-    if let Err(error) = installed.channel.publish(&hints).await {
+    if let Some(channel) = channel {
+        publish_on(channel.as_ref(), hints).await;
+    }
+}
+
+/// Publish `hints` on `channel`, and log a failure.
+async fn publish_on(channel: &dyn TaskDispatch, hints: Vec<DispatchHint>) {
+    if let Err(error) = channel.publish(&hints).await {
         tracing::warn!(
             error = %error,
             count = hints.len(),
@@ -1242,10 +1290,19 @@ fn record_dropped_hint() {
     }
 }
 
+/// One hint in the publisher queue, with the channel it must go to.
+#[derive(Debug)]
+struct QueuedHint {
+    hint: DispatchHint,
+    /// The bound channel of the scope that queued the hint (issue #1431).
+    /// `None` means the live slot at publish time.
+    channel: Option<Arc<dyn TaskDispatch>>,
+}
+
 /// The background publisher task and the channel that feeds it.
 #[derive(Debug)]
 struct Publisher {
-    sender: tokio::sync::mpsc::Sender<DispatchHint>,
+    sender: tokio::sync::mpsc::Sender<QueuedHint>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -1266,7 +1323,16 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// The task is spawned lazily from inside a Tokio runtime. A caller with no
 /// current runtime cannot spawn one, so the hint is dropped and the reconcile
 /// sweep republishes the row.
-fn publish_in_background(mut hint: DispatchHint) {
+///
+/// A hint queued in a bound scope keeps that scope's channel (issue #1431).
+/// A scope bound to no channel drops the hint here.
+fn publish_in_background(hint: DispatchHint) {
+    let channel = match publish_target() {
+        PublishTarget::Live => None,
+        PublishTarget::Bound(Some(channel)) => Some(channel),
+        PublishTarget::Bound(None) => return,
+    };
+    let mut hint = QueuedHint { hint, channel };
     let mut slot = lock(&PUBLISHER);
     if let Some(publisher) = slot.as_ref()
         && !publisher.task.is_finished()
@@ -1298,17 +1364,52 @@ fn publish_in_background(mut hint: DispatchHint) {
 }
 
 /// Drain the publisher channel and issue one `publish` call per batch.
-async fn publisher_loop(mut receiver: tokio::sync::mpsc::Receiver<DispatchHint>) {
+async fn publisher_loop(mut receiver: tokio::sync::mpsc::Receiver<QueuedHint>) {
     while let Some(first) = receiver.recv().await {
         let mut batch = Vec::with_capacity(1);
         batch.push(first);
         while batch.len() < PUBLISH_BATCH_MAX {
             match receiver.try_recv() {
-                Ok(hint) => batch.push(hint),
+                Ok(queued) => batch.push(queued),
                 Err(_) => break,
             }
         }
-        publish_now(batch).await;
+        publish_batch(batch).await;
+    }
+}
+
+/// Publish `batch` with one call per run of hints that share a channel.
+///
+/// The publisher task has no bound scope, so a run with no channel uses the
+/// live slot.
+async fn publish_batch(batch: Vec<QueuedHint>) {
+    let mut run: Vec<DispatchHint> = Vec::new();
+    let mut run_channel: Option<Arc<dyn TaskDispatch>> = None;
+    for queued in batch {
+        if !run.is_empty() && !same_channel(run_channel.as_ref(), queued.channel.as_ref()) {
+            publish_run(run_channel.take(), std::mem::take(&mut run)).await;
+        }
+        run_channel = queued.channel;
+        run.push(queued.hint);
+    }
+    publish_run(run_channel, run).await;
+}
+
+/// True when both name the live slot, or both name the same channel.
+fn same_channel(a: Option<&Arc<dyn TaskDispatch>>, b: Option<&Arc<dyn TaskDispatch>>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        _ => false,
+    }
+}
+
+/// Publish one run of hints on its channel, or on the live slot.
+async fn publish_run(channel: Option<Arc<dyn TaskDispatch>>, hints: Vec<DispatchHint>) {
+    match channel {
+        Some(channel) if !hints.is_empty() => publish_on(channel.as_ref(), hints).await,
+        Some(_) => {}
+        None => publish_now(hints).await,
     }
 }
 

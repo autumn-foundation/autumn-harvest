@@ -1668,3 +1668,99 @@ async fn a_stale_reference_does_not_spend_a_sibling_lease_share() {
          batch as a stale sibling, not released back for a later poll"
     );
 }
+
+/// A worker built before the channel is installed binds it at the run
+/// boundary, and every claim goes through it (issue #1431).
+///
+/// `Worker::new` saw no channel here. Before the fix, the worker stayed on
+/// Postgres for its whole life and no task reached the channel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_late_install_is_adopted_at_the_run_boundary() {
+    let _serial = DISPATCH_SERIAL.lock().await;
+    let (url, _c) = setup_test_database_url_or_env().await;
+    autumn_harvest::dispatch::uninstall_all();
+    let worker = Arc::new(make_worker(
+        vec![wf_info("dispatch_two_activities", two_activity_workflow)],
+        vec![act_info("echo", echo_activity, None)],
+        empty_shared_state(),
+    ));
+    let channel = Arc::new(MemoryDispatch::new());
+    let _guard = install(&channel);
+
+    let mut conn = connect(&url).await;
+    let exec_id = start(&mut conn, "dispatch_two_activities").await;
+
+    let pool = build_pool(&url);
+    let mut check = connect(&url).await;
+    with_worker(worker, pool, async {
+        wait_for_state(&mut check, exec_id, &["COMPLETED"], Duration::from_secs(30)).await;
+    })
+    .await;
+
+    let delivered = channel.delivered_ids();
+    for task in tasks_for(&mut check, exec_id).await {
+        assert!(
+            delivered.contains(&task.id),
+            "task {} reached state {} without a delivery from the late channel",
+            task.id,
+            task.state
+        );
+    }
+}
+
+/// A replacement install does not redirect a running worker's task hints
+/// (issue #1431).
+///
+/// Runner B replaces runner A's channel while A's worker runs. The hints that
+/// A's task bodies raise must stay on A's channel. B's worker would otherwise
+/// probe its own database, miss, and ack them as absent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replacement_install_does_not_redirect_a_running_workers_hints() {
+    let _serial = DISPATCH_SERIAL.lock().await;
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let own = Arc::new(MemoryDispatch::new());
+    let _own_guard = install(&own);
+    let worker = Arc::new(make_worker(
+        vec![wf_info("dispatch_two_activities", two_activity_workflow)],
+        vec![act_info("echo", echo_activity, None)],
+        empty_shared_state(),
+    ));
+    let replacement = Arc::new(MemoryDispatch::new());
+    let _replacement_guard = install(&replacement);
+
+    // The start runs outside any worker, so its hint goes to the live slot.
+    // Wait for the background publisher, then take a snapshot.
+    let mut conn = connect(&url).await;
+    let exec_id = start(&mut conn, "dispatch_two_activities").await;
+    for _ in 0..100 {
+        if !replacement.published_ids().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let before_run = replacement.published_ids();
+
+    let pool = build_pool(&url);
+    let mut check = connect(&url).await;
+    with_worker(worker, pool, async {
+        wait_for_state(&mut check, exec_id, &["COMPLETED"], Duration::from_secs(30)).await;
+    })
+    .await;
+
+    // Every hint after the start comes from a task body of this worker.
+    assert_eq!(
+        replacement.published_ids(),
+        before_run,
+        "a running worker must not publish into the replacement channel"
+    );
+    let tasks = tasks_for(&mut check, exec_id).await;
+    assert!(tasks.len() > 1, "the run must schedule its activities");
+    let delivered = own.delivered_ids();
+    for task in &tasks {
+        assert!(
+            delivered.contains(&task.id),
+            "task {} must be delivered through the worker's own channel",
+            task.id
+        );
+    }
+}
