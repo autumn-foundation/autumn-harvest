@@ -130,7 +130,7 @@ impl CompletionCallbackDeliverer for ParityDeliverer {
                 .next()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
-            if idx % 2 == 0 {
+            if idx.is_multiple_of(2) {
                 DeliveryAttempt::success(204)
             } else {
                 DeliveryAttempt::success(500)
@@ -480,8 +480,7 @@ async fn zz_capture_completion_callback_outcome_batch_explain() {
     let _guard2 = TEST_SERIAL.lock().await;
     install_config();
 
-    let db_id = unique("ccob_explain");
-    let db_name = format!("{db_id}");
+    let db_name = unique("ccob_explain");
     let db_url = create_fresh_db(&admin, &db_name).await;
     let mut seed_conn = AsyncPgConnection::establish(&db_url)
         .await
@@ -518,13 +517,6 @@ async fn zz_capture_completion_callback_outcome_batch_explain() {
         .expect("claim rows for explain fixture");
 
     let ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
-
-    #[derive(diesel::QueryableByName)]
-    struct ExplainLine {
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        #[diesel(column_name = "QUERY PLAN")]
-        line: String,
-    }
 
     // Before: what the per-row path runs, once, for one row of the batch --
     // the statement shape that previously ran N times per tick.
@@ -594,6 +586,19 @@ async fn zz_capture_completion_callback_outcome_batch_explain() {
     )
     .expect("write after-explain artifact");
     eprintln!("explain capture complete: label={label}");
+}
+
+#[derive(diesel::QueryableByName)]
+struct ExplainLine {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    #[diesel(column_name = "QUERY PLAN")]
+    line: String,
+}
+
+#[derive(diesel::QueryableByName)]
+struct Count {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    n: i64,
 }
 
 // ── Equivalence: batched outcome writes match the per-row path exactly ─────
@@ -670,7 +675,7 @@ async fn scanner_records_identical_outcomes_for_a_mixed_delivered_and_backoff_ba
             .next()
             .and_then(|s| s.parse().ok())
             .unwrap();
-        if idx % 2 == 0 {
+        if idx.is_multiple_of(2) {
             assert_eq!(row.state, "DELIVERED", "even index {idx} should deliver");
             assert_eq!(row.last_status, Some(204));
             assert_eq!(row.last_error, None);
@@ -773,18 +778,13 @@ async fn scanner_dead_letters_alongside_a_batched_delivered_and_backoff_mix() {
             .next()
             .and_then(|s| s.parse().ok())
             .unwrap();
-        if idx % 2 == 0 {
+        if idx.is_multiple_of(2) {
             assert_eq!(row.state, "DELIVERED");
         } else {
             assert_eq!(row.state, "FAILED", "exhausted row should dead-letter");
         }
     }
 
-    #[derive(diesel::QueryableByName)]
-    struct Count {
-        #[diesel(sql_type = diesel::sql_types::BigInt)]
-        n: i64,
-    }
     let dlq_count: Count = diesel::sql_query(
         "SELECT count(*) AS n FROM harvest_dead_letters WHERE task_type = 'CALLBACK'",
     )
