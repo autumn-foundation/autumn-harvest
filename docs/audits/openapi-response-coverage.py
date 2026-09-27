@@ -821,7 +821,7 @@ def rejects_result_body(params: str, block: str) -> bool:
     hands the request on, for example to replay a committed key, leaves it
     optional.
     """
-    found = re.search(r"\b([a-z_][a-z_0-9]*)\s*:\s*Result<\s*%s<" % JSON, params)
+    found = re.search(r"\b([a-z_][a-z_0-9]*)\s*:\s*(?:[a-z_]+::)*Result<\s*%s<" % JSON, params)
     return found is not None and error_rejects(found.group(1), block)
 
 
@@ -1441,10 +1441,24 @@ def declared_statuses(route: dict) -> set[int]:
     return statuses
 
 
+def canonical_extractors(source: str) -> str:
+    """`source` with each imported alias of `Query` or `Json` renamed to it.
+
+    An alias such as `use axum::extract::Query as AxumQuery;` hides the
+    extractor from every check, so the audit reads the alias as the name.
+    """
+    for statement in re.findall(r"\buse\b[^;]*;", masked_source(source)):
+        for canonical, alias in re.findall(r"\b(Query|Json)\s+as\s+([A-Za-z_]\w*)", statement):
+            source = re.sub(r"\b%s\b" % alias, canonical, source)
+    return source
+
+
 def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
     """Every finding, by check. `find_struct` maps a struct name to its block."""
-    SOURCE[0] = source
+    # A rename keeps every line, so line numbers still point at the source.
     lines = source.split("\n")
+    source = canonical_extractors(source)
+    SOURCE[0] = source
     by_route = {(r["method"], r["path"]): r for r in contract["routes"]}
     routes = router_routes(source)
 
@@ -1477,7 +1491,9 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
 
         for reached in bodies:
             offset = source.index(reached)
-            for hit in re.finditer(r"(.{0,30})StatusCode::([A-Z_]+)", reached):
+            # A status in a comment or a string is never returned.
+            code = masked_source(reached)
+            for hit in re.finditer(r"(.{0,30})StatusCode::([A-Z_]+)", code):
                 status = NAMED.get(hit.group(2))
                 if status is None or status in declared:
                     continue
@@ -1488,11 +1504,11 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
                     "  %s %s returns %d, undeclared\n    api.rs:%d  %s"
                     % (method, path, status, line, lines[line - 1].strip()[:88])
                 )
-            for hit in re.finditer(r"AutumnError::([a-z_]+)\(", reached):
+            for hit in re.finditer(r"AutumnError::([a-z_]+)\(", code):
                 status = AUTUMN_ERROR_STATUS.get(hit.group(1))
                 if status is None or status in declared:
                     continue
-                if overridden_by_with_status(reached, hit.end() - 1):
+                if overridden_by_with_status(code, hit.end() - 1):
                     continue
                 line = source[: offset + hit.start()].count("\n") + 1
                 findings.append(
@@ -1510,7 +1526,7 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
             # A constructor passed bare, e.g. `.map_err(AutumnError::bad_request_msg)`,
             # names no call and so cannot chain `.with_status(..)`: its status is
             # always the constructor's own.
-            for hit in re.finditer(r"AutumnError::([a-z_]+)\)", reached):
+            for hit in re.finditer(r"AutumnError::([a-z_]+)\)", code):
                 status = AUTUMN_ERROR_STATUS.get(hit.group(1))
                 if status is None or status in declared:
                     continue
@@ -1548,7 +1564,9 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
             # A `Result<Query<T>, _>` whose error the handler tolerates acts the same.
             prefix = params[: query.start()]
             wrapped = re.search(r"Option<\s*(?:[a-z_]+::)*$", prefix) is not None
-            result = re.search(r"\b([a-z_][a-z_0-9]*)\s*:\s*Result<\s*(?:[a-z_]+::)*$", prefix)
+            result = re.search(
+                r"\b([a-z_][a-z_0-9]*)\s*:\s*(?:[a-z_]+::)*Result<\s*(?:[a-z_]+::)*$", prefix
+            )
             if result and not error_rejects(result.group(1), handler_body(source, handler) or ""):
                 wrapped = True
             struct = find_struct(name)
@@ -1973,6 +1991,8 @@ struct Thing {
 FIXTURE_EDGES = r"""
 use serde_json::from_slice as decode;
 use serde_json as json;
+use axum::extract::Query as AxumQuery;
+use axum::{extract::State, Json as AxumJson};
 
 pub fn harvest_api_router() -> Router {
     Router::new()
@@ -2126,6 +2146,11 @@ pub fn harvest_api_router() -> Router {
         .route("/e/short-helper", post(e_short_helper))
         .route("/e/response-config", post(e_response_config))
         .route("/e/suffix-error", post(e_suffix_error))
+        .route("/e/commented-status", get(e_commented_status))
+        .route("/e/std-result", post(e_std_result))
+        .route("/e/aliased-query", get(e_aliased_query))
+        .route("/e/aliased-json", post(e_aliased_json))
+        .route("/e/std-result-query", get(e_std_result_query))
 }
 
 async fn e_wrapped(body: Bytes) -> Response {
@@ -3179,6 +3204,29 @@ async fn e_suffix_error(body: Result<Json<Gadget>, JsonRejection>) -> Response {
 
 fn gadget_error() -> GadgetError {
     GadgetError::default()
+}
+
+async fn e_commented_status() -> Response {
+    // StatusCode::IM_A_TEAPOT is never sent.
+    let _note = "StatusCode::IM_A_TEAPOT";
+    StatusCode::OK.into_response()
+}
+
+async fn e_std_result(body: std::result::Result<Json<Gadget>, JsonRejection>) -> Response {
+    let Json(gadget) = body.unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_aliased_query(AxumQuery(cursor): AxumQuery<Cursor>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn e_aliased_json(AxumJson(gadget): AxumJson<Gadget>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn e_std_result_query(query: std::result::Result<Query<Cursor>, QueryRejection>) -> Response {
+    StatusCode::OK.into_response()
 }
 
 fn invalid_body() -> Response {
@@ -5009,6 +5057,56 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             for path in ("/e/response-config", "/e/suffix-error")
         ],
         {"body_required": ["POST /e/suffix-error: the body is mandatory"]},
+    ),
+    (
+        "a status in a comment or a string is not returned",
+        FIXTURE_EDGES,
+        [fixture_route("GET", "/e/commented-status", 200)],
+        {},
+    ),
+    (
+        "a path-qualified Result<Json<T>> body that unwraps is mandatory",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/std-result",
+                200,
+                request_body=body_of(("name", True), required=False),
+            )
+        ],
+        {"body_required": ["POST /e/std-result: the body is mandatory"]},
+    ),
+    (
+        "a path-qualified Result<Query<T>> that is not rejected makes fields optional",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "GET",
+                "/e/std-result-query",
+                200,
+                params=[query_param("offset", "integer", True)],
+            )
+        ],
+        {
+            "query_params": [
+                "GET /e/std-result-query: `offset` is optional in Cursor but the contract"
+            ]
+        },
+    ),
+    (
+        "an imported alias of Query or Json is read",
+        FIXTURE_EDGES,
+        [
+            fixture_route("GET", "/e/aliased-query", 200, params=[]),
+            fixture_route("POST", "/e/aliased-json", 200, request_body=body_of(required=False)),
+        ],
+        {
+            "query_params": ["GET /e/aliased-query: `offset` is accepted by Cursor"],
+            "mandatory": ["POST /e/aliased-json: `name` is mandatory in Gadget"],
+            "undocumented": ["POST /e/aliased-json: `name` is accepted by Gadget"],
+            "body_required": ["POST /e/aliased-json: the body is mandatory"],
+        },
     ),
     (
         "a malformed contract entry does not crash the audit",
