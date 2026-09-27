@@ -34,20 +34,21 @@ is missing from the generated client, so an ordinary request cannot be typed.
 A handler can also take the raw `Bytes` and call `serde_json::from_slice`
 itself. Checks 2, 3 and 5 read that parse when it reads a parameter of type
 `Bytes`, `&[u8]` or `Vec<u8>`. The parse can be in the handler, or in a helper
-one level down that the handler passes the body to. A copy of the body under
-another name, such as `body.to_vec()`, is not read. The type comes from a
-turbofish, then from a typed `let` in the same statement, then from a
+one level down that the handler passes the body to. In a helper, only the
+parameter at the position of the body argument is a body. A copy of the body
+under another name, such as `body.to_vec()`, is not read. The type comes from
+a turbofish, then from a typed `let` in the same statement, then from a
 `Result<T, _>` return type. The last two apply only when the call ends its
 expression, since a `.map(..)` after it yields another type. A `Value` body is
 free-form, so checks 2 and 3 skip it. Check 5 still reads it.
 
 Check 5 treats a bare `Json<T>` as mandatory, since axum rejects a request
 without it. A raw-byte parse is mandatory unless an `if` on `.is_empty()` lets
-an empty body skip it. The parse must be inside that `if` or its `else`. An
-earlier `if body.is_empty() { .. }` also counts when its block returns
-`Ok(..)` and no error. A parse that turns its error into a value is optional
-too, such as `.ok()`, `.unwrap_or_default()` or `if let Ok(..)`. Check 2
-applies only to a mandatory body.
+an empty body skip it. The parse must be in the arm that runs for a non-empty
+body. An earlier `if body.is_empty() { .. }` also counts when its block
+returns `Ok(..)` and no error. A parse that turns its error into a value is
+optional too, such as `.ok()`, `.unwrap_or_default()` or an `if let Ok(..)`
+whose `else` does not reject. Check 2 applies only to a mandatory body.
 
 Check 4 reads the routes that take a `RawQuery` and parse the pairs by hand. A
 key those parsers match is a parameter the route accepts, so a key the contract
@@ -394,7 +395,8 @@ def byte_parameters(params: str) -> set[str]:
 def raw_body_parses(source: str, handler: str) -> list[tuple[str | None, bool]]:
     """`(type, guarded)` for each raw-body parse in a handler and its helpers.
 
-    A helper counts only when the handler passes it a body variable. The type
+    A helper counts only when the handler passes it a body variable, and only
+    the helper parameters that receive the body are read as bodies. The type
     comes from a turbofish, then from a `let` binding in the same statement,
     then from a `Result<T, _>` return type. It is `None` when none of those
     names it, or when the call reads the body in a form the audit cannot read.
@@ -404,27 +406,56 @@ def raw_body_parses(source: str, handler: str) -> list[tuple[str | None, bool]]:
         return []
     handler_block = handler_found[2]
     carriers = byte_parameters(handler_found[0])
-    found = [handler_found] + [
-        function_parts(source, helper)
-        for helper in called_helpers(source, handler_block)
-        if passes_variable(handler_block, helper, carriers)
-    ]
-    parses: list[tuple[str | None, bool]] = []
-    for parts in found:
+    params, returns, block = handler_found
+    parses = block_parses(block, byte_parameters(params), returns)
+    for helper in called_helpers(source, handler_block):
+        parts = function_parts(source, helper)
         if parts is None:
             continue
         params, returns, block = parts
-        parses += block_parses(block, byte_parameters(params), returns)
+        receivers = receiving_parameters(handler_block, helper, params, carriers)
+        parses += block_parses(block, receivers & byte_parameters(params), returns)
     return parses
 
 
-def passes_variable(block: str, helper: str, variables: set[str]) -> bool:
-    """Whether a call to `helper` in the block passes one of the variables."""
+def split_top_level(text: str) -> list[str]:
+    """The comma-separated items of a list, ignoring commas in nested brackets."""
+    items, depth, current = [], 0, ""
+    for char in text:
+        depth += char in "([{<"
+        depth -= char in ")]}>"
+        if char == "," and depth == 0:
+            items.append(current.strip())
+            current = ""
+        else:
+            current += char
+    if current.strip():
+        items.append(current.strip())
+    return items
+
+
+def receiving_parameters(block: str, helper: str, params: str, variables: set[str]) -> set[str]:
+    """The `helper` parameters that a call in the block passes a variable to.
+
+    Each argument maps to the parameter at its position. A `self` receiver is
+    skipped, since a call does not pass it in the argument list.
+    """
+    # A pattern such as `Extension(state): ..` keeps its slot with no name, so
+    # the parameters after it keep their positions.
+    names: list[str | None] = []
+    for item in split_top_level(params[1:-1]):
+        if re.fullmatch(r"&?\s*(?:'[a-z_]+\s+)?(?:mut\s+)?self", item):
+            continue
+        plain = re.match(r"(?:mut\s+)?([a-z_][a-z_0-9]*)\s*:", item)
+        names.append(plain.group(1) if plain else None)
+    receivers: set[str] = set()
     for call in re.finditer(r"\b%s\s*\(" % re.escape(helper), block):
-        arguments = balanced(block[call.end() - 1 :])
-        if any(re.search(r"\b%s\b" % re.escape(name), arguments) for name in variables):
-            return True
-    return False
+        arguments = split_top_level(balanced(block[call.end() - 1 :])[1:-1].replace("->", ""))
+        for index, argument in enumerate(arguments):
+            mentions = any(re.search(r"\b%s\b" % re.escape(v), argument) for v in variables)
+            if mentions and index < len(names) and names[index]:
+                receivers.add(names[index])
+    return receivers
 
 
 def block_parses(block: str, carriers: set[str], returns: str) -> list[tuple[str | None, bool]]:
@@ -458,10 +489,11 @@ def block_parses(block: str, carriers: set[str], returns: str) -> list[tuple[str
 def guards(block: str, position: int, variable: str) -> bool:
     """Whether an `if` on `<variable>.is_empty()` lets an empty body skip the parse.
 
-    The test counts when the parse is inside that `if` or its `else`. A plain
-    `if body.is_empty() { .. }` before the parse also counts when its block
-    returns `Ok(..)` and no error. Any other use, such as a log field, is no
-    guard.
+    The test counts when the parse is in the arm that runs for a non-empty
+    body. That is the `else` of `if body.is_empty()`, or the condition or
+    block of `if !body.is_empty()`. A plain `if body.is_empty() { .. }` before
+    the parse also counts when its block returns `Ok(..)` and no error. Any
+    other use, such as a log field, is no guard.
     """
     pattern = r"\bif\s+(!\s*)?%s\.is_empty\(\)" % re.escape(variable)
     for test in re.finditer(pattern, block[:position]):
@@ -469,11 +501,13 @@ def guards(block: str, position: int, variable: str) -> bool:
         if opener < 0:
             continue
         taken = balanced(block[opener:], "{", "}")
-        end = opener + len(taken)
+        taken_end = end = opener + len(taken)
         while re.match(r"\s*else\b", block[end:]):
             branch = block.find("{", end)
             end = branch + len(balanced(block[branch:], "{", "}"))
-        if test.start() < position < end:
+        if test.group(1) and test.end() < position < taken_end:
+            return True
+        if not test.group(1) and taken_end < position < end:
             return True
         early_return = re.search(r"\breturn\s+Ok\(", taken)
         if not test.group(1) and early_return and not re.search(ERROR_TOKENS, taken):
@@ -485,13 +519,23 @@ def discards_error(before: str, after: str) -> bool:
     """Whether a parse turns its error into a value, so an empty body still runs.
 
     `.ok()`, `.unwrap_or_default()`, `.unwrap_or(..)` and `.unwrap_or_else(..)`
-    after the call do so. So does `if let Ok(..) =` before it. A `match` that
-    handles `Err` is not read, so it counts as mandatory.
+    after the call do so. So does `if let Ok(..) =` before it, unless its
+    `else` returns or builds an error. A `match` that handles `Err` is not
+    read, so it counts as mandatory.
     """
     if re.match(r"\s*\.(?:ok|unwrap_or_default|unwrap_or|unwrap_or_else)\s*\(", after):
         return True
     tested = r"\b(?:if|while|&&)\s+let\s+Ok\s*\([^()]*\)\s*=\s*(?:serde_json::)?$"
-    return re.search(tested, before) is not None
+    if re.search(tested, before) is None:
+        return False
+    opener = after.find("{")
+    if opener < 0:
+        return True
+    rest = after[opener + len(balanced(after[opener:], "{", "}")) :]
+    if not re.match(r"\s*else\b", rest):
+        return True
+    otherwise = balanced(rest[rest.index("{") :], "{", "}")
+    return not re.search(r"\breturn\b|" + ERROR_TOKENS, otherwise)
 
 
 def ends_expression(after: str) -> bool:
@@ -1180,6 +1224,11 @@ pub fn harvest_api_router() -> Router {
         .route("/e/tolerant-default", post(e_tolerant_default))
         .route("/e/tolerant-if-let", post(e_tolerant_if_let))
         .route("/e/wrapped-attribute", get(e_wrapped_attribute))
+        .route("/e/empty-arm", post(e_empty_arm))
+        .route("/e/negated-else", post(e_negated_else))
+        .route("/e/two-carriers", post(e_two_carriers))
+        .route("/e/if-let-reject", post(e_if_let_reject))
+        .route("/e/forwarded", post(e_forwarded))
 }
 
 async fn e_wrapped(body: Bytes) -> Response {
@@ -1341,6 +1390,54 @@ async fn e_tolerant_default(body: Bytes) -> Response {
 async fn e_tolerant_if_let(body: Bytes) -> Response {
     if let Ok(gadget) = serde_json::from_slice::<Gadget>(&body) {
         tracing::debug!(name = %gadget.name, "parsed");
+    }
+    StatusCode::OK.into_response()
+}
+
+async fn e_empty_arm(body: Bytes) -> Response {
+    if body.is_empty() {
+        let gadget = serde_json::from_slice::<Gadget>(&body).map_err(reject)?;
+    }
+    StatusCode::OK.into_response()
+}
+
+async fn e_negated_else(body: Bytes) -> Response {
+    if !body.is_empty() {
+        tracing::debug!("a body arrived");
+    } else {
+        let gadget = serde_json::from_slice::<Gadget>(&body).map_err(reject)?;
+    }
+    StatusCode::OK.into_response()
+}
+
+async fn forward(
+    Extension(state): Extension<State>,
+    Path((id, name)): Path<(String, String)>,
+    body: Bytes,
+) -> Response {
+    let gadget = serde_json::from_slice::<Gadget>(&body).map_err(reject)?;
+    StatusCode::OK.into_response()
+}
+
+async fn e_forwarded(Extension(state): Extension<State>, body: Bytes) -> Response {
+    forward(Extension(state), Path((ID.into(), NAME.into())), body).await
+}
+
+fn decode_both(body: &[u8], stored: &[u8]) -> Result<Gadget, Response> {
+    let cursor = serde_json::from_slice::<Cursor>(stored).map_err(reject)?;
+    serde_json::from_slice::<Gadget>(body).map_err(reject)
+}
+
+async fn e_two_carriers(body: Bytes) -> Response {
+    let gadget = decode_both(&body, STORED);
+    StatusCode::OK.into_response()
+}
+
+async fn e_if_let_reject(body: Bytes) -> Response {
+    if let Ok(gadget) = serde_json::from_slice::<Gadget>(&body) {
+        tracing::debug!(name = %gadget.name, "parsed");
+    } else {
+        return Err(reject());
     }
     StatusCode::OK.into_response()
 }
@@ -1948,6 +2045,49 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
                 "GET /e/wrapped-attribute: `rust_name` is documented but WrappedAttribute",
             ]
         },
+    ),
+    (
+        "a parse in the arm that runs for an empty body is not guarded",
+        FIXTURE_EDGES,
+        [
+            fixture_route("POST", path, 200, request_body=body_of(("name", True), required=False))
+            for path in ("/e/empty-arm", "/e/negated-else")
+        ],
+        {
+            "body_required": [
+                "POST /e/empty-arm: the body is mandatory",
+                "POST /e/negated-else: the body is mandatory",
+            ]
+        },
+    ),
+    (
+        "only the helper parameter that gets the body is a body",
+        FIXTURE_EDGES,
+        [fixture_route("POST", "/e/two-carriers", 200, request_body=GADGET_BODY)],
+        {},
+    ),
+    (
+        "a pattern parameter keeps the positions of the ones after it",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST", "/e/forwarded", 200, request_body=body_of(("name", True), required=False)
+            )
+        ],
+        {"body_required": ["POST /e/forwarded: the body is mandatory"]},
+    ),
+    (
+        "an if let Ok parse whose else rejects is mandatory",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/if-let-reject",
+                200,
+                request_body=body_of(("name", True), required=False),
+            )
+        ],
+        {"body_required": ["POST /e/if-let-reject: the body is mandatory"]},
     ),
     (
         "a malformed contract entry does not crash the audit",
