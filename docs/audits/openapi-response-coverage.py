@@ -733,7 +733,8 @@ def error_rejects(name: str, block: str, seen: frozenset[str] = frozenset()) -> 
     """Whether the handler rejects the error of the `Result` extractor `name`.
 
     `rejects_result_body` gives the forms it reads. A move into another name,
-    such as `let captured = body;`, is followed.
+    such as `let captured = body;`, is followed. A pattern can read the
+    extractor by value, borrowed, or through `as_ref()` or `as_mut()`.
     """
     variable = re.escape(name)
     moved = r"\blet\s+(?:mut\s+)?([a-z_][a-z_0-9]*)\s*(?::[^=;]*)?=\s*%s\s*;" % variable
@@ -749,22 +750,24 @@ def error_rejects(name: str, block: str, seen: frozenset[str] = frozenset()) -> 
             return True
     borrow = r"(?:&\s*(?:mut\s+)?)?"
     method = r"(?:\s*\.\s*as_(?:ref|mut)\s*\(\s*\))?"
-    scrutinee = r"\bmatch\s+%s%s%s\s*\{" % (borrow, variable, method)
+    # The extractor as a pattern reads it: by value, borrowed or through `as_ref`.
+    read = borrow + variable + method
+    scrutinee = r"\bmatch\s+%s\s*\{" % read
     for match in re.finditer(scrutinee, block):
         arms = balanced(block[match.end() - 1 :], "{", "}")
         for failure in error_arms(arms):
             if arm_rejects(match_arm(arms, failure.start()), failure.group(1)):
                 return True
-    for binding in re.finditer(r"\blet\s+Ok\s*\(.*?\)\s*=\s*%s\s+else\s*\{" % variable, block):
+    for binding in re.finditer(r"\blet\s+Ok\s*\(.*?\)\s*=\s*%s\s*else\s*\{" % read, block):
         otherwise = balanced(block[binding.end() - 1 :], "{", "}")
         if rejecting_exit(otherwise):
             return True
-    failed = r"\bif\s+let\s+Err\s*\(\s*([a-z_][a-z_0-9]*)?[^=]*=\s*%s\s*\{" % variable
+    failed = r"\bif\s+let\s+Err\s*\(\s*([a-z_][a-z_0-9]*)?[^=]*=\s*%s\s*\{" % read
     for tested in re.finditer(failed, block):
         taken = balanced(block[tested.end() - 1 :], "{", "}")
         if rejecting_exit(taken) or rejecting_arm(taken, tested.group(1)):
             return True
-    for tested in re.finditer(r"\bif\s+let\s+Ok\s*\(.*?\)\s*=\s*%s\s*\{" % variable, block):
+    for tested in re.finditer(r"\bif\s+let\s+Ok\s*\(.*?\)\s*=\s*%s\s*\{" % read, block):
         taken = balanced(block[tested.end() - 1 :], "{", "}")
         rest = block[tested.end() - 1 + len(taken) :]
         if re.match(r"\s*else\s*\{", rest):
@@ -878,6 +881,11 @@ def walk_chain(after: str) -> tuple[str, str | None, str]:
     rest = after
     while True:
         rest = rest.lstrip()
+        # `.await` passes the `Result` of an async call through unchanged.
+        awaited = re.match(r"\.\s*await\b", rest)
+        if awaited:
+            rest = rest[awaited.end() :]
+            continue
         # A `Result` that `or_else` has recovered holds no error, so `?` on it
         # cannot reject.
         if rest.startswith("?") and state == "recovered":
@@ -1920,6 +1928,9 @@ pub fn harvest_api_router() -> Router {
         .route("/e/let-else-json", post(e_let_else_json))
         .route("/e/map-or-helper", post(e_map_or_helper))
         .route("/e/match-mut", post(e_match_mut))
+        .route("/e/await-default", post(e_await_default))
+        .route("/e/borrowed-let-else", post(e_borrowed_let_else))
+        .route("/e/as-ref-if-let-err", post(e_as_ref_if_let_err))
 }
 
 async fn e_wrapped(body: Bytes) -> Response {
@@ -2738,6 +2749,29 @@ async fn e_match_mut(mut body: Result<Json<Gadget>, JsonRejection>) -> Response 
     match &mut body {
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
         Ok(Json(gadget)) => gadget.name.clear(),
+    }
+    StatusCode::OK.into_response()
+}
+
+async fn e_await_default(body: Bytes) -> Response {
+    let gadget = parse_gadget(&body).await.unwrap_or_default();
+    StatusCode::OK.into_response()
+}
+
+async fn parse_gadget(body: &Bytes) -> Result<Gadget, serde_json::Error> {
+    serde_json::from_slice(body)
+}
+
+async fn e_borrowed_let_else(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    let Ok(Json(gadget)) = &body else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    StatusCode::OK.into_response()
+}
+
+async fn e_as_ref_if_let_err(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    if let Err(_) = body.as_ref() {
+        return StatusCode::BAD_REQUEST.into_response();
     }
     StatusCode::OK.into_response()
 }
@@ -4284,6 +4318,39 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             )
         ],
         {"body_required": ["POST /e/match-mut: the body is mandatory"]},
+    ),
+    (
+        "an awaited helper parse with a fallback is tolerant",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/await-default",
+                200,
+                request_body=body_of(("name", False), required=False),
+            )
+        ],
+        {},
+    ),
+    (
+        "a let-else or if-let on a borrowed Result extractor is read",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                path,
+                200,
+                request_body=body_of(("name", True), required=False),
+                error_responses=[{"status": 400}],
+            )
+            for path in ("/e/borrowed-let-else", "/e/as-ref-if-let-err")
+        ],
+        {
+            "body_required": [
+                "POST /e/borrowed-let-else: the body is mandatory",
+                "POST /e/as-ref-if-let-err: the body is mandatory",
+            ]
+        },
     ),
     (
         "a malformed contract entry does not crash the audit",
