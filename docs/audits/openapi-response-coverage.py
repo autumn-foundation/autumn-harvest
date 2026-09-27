@@ -521,29 +521,64 @@ def byte_parameters(params: str) -> set[str]:
 
 # A comment, a string literal or a char literal. A raw string comes before a
 # plain one, so `r#"..."#` is read whole.
-NOT_CODE = re.compile(
-    r"//[^\n]*|/\*.*?\*/"
-    r'|(?<![\w])b?r(#*)".*?"\1'
-    r'|(?<![\w])b?"(?:\\.|[^"\\])*"'
-    r"|'(?:\\.|[^\\'])'",
-    re.S,
-)
+# A raw string or a byte string prefix, such as `r#"`, `br"` or `b"`.
+STRING_PREFIX = re.compile(r'b?r(#*)"|b"')
+
+# A char literal. A lifetime such as `'a` has no closing quote, so it stays.
+CHAR_LITERAL = re.compile(r"'(?:\\.|[^\\'])'")
 
 
 def code_only(block: str) -> str:
     """`block` with comments and literals blanked, at the same length.
 
     A literal keeps its first and last character. Newlines stay, so offsets
-    and line numbers do not change.
+    and line numbers do not change. A block comment can nest, as in Rust.
     """
+    out = list(block)
 
-    def blank(found: re.Match) -> str:
-        text = found.group(0)
-        keep = not text.startswith("/")
-        inner = re.sub(r"[^\n]", " ", text[1:-1] if keep else text)
-        return text[0] + inner + text[-1] if keep else inner
+    def blank(start: int, stop: int, keep: int) -> int:
+        for index in range(start + keep, stop - keep):
+            if out[index] != "\n":
+                out[index] = " "
+        return stop
 
-    return NOT_CODE.sub(blank, block)
+    index = 0
+    while index < len(block):
+        char = block[index]
+        prefix = STRING_PREFIX.match(block, index)
+        if block.startswith("//", index):
+            stop = block.find("\n", index)
+            index = blank(index, len(block) if stop < 0 else stop, 0)
+        elif block.startswith("/*", index):
+            depth, stop = 0, index
+            while stop < len(block):
+                if block.startswith("/*", stop):
+                    depth, stop = depth + 1, stop + 2
+                elif block.startswith("*/", stop):
+                    depth, stop = depth - 1, stop + 2
+                    if depth == 0:
+                        break
+                else:
+                    stop += 1
+            index = blank(index, min(stop, len(block)), 0)
+        elif prefix and prefix.group(1) is not None:
+            close = block.find('"' + prefix.group(1), prefix.end())
+            stop = len(block) if close < 0 else close + 1 + len(prefix.group(1))
+            index = blank(index, stop, 1)
+        elif char == '"' or prefix:
+            stop = block.index('"', index) + 1
+            while stop < len(block) and block[stop] != '"':
+                stop += 2 if block[stop] == "\\" else 1
+            index = blank(index, min(stop + 1, len(block)), 1)
+        elif char == "'" and CHAR_LITERAL.match(block, index):
+            index = blank(index, CHAR_LITERAL.match(block, index).end(), 1)
+        elif char.isalnum() or char == "_":
+            # A whole word, so `r"` or `b"` inside a name is no literal.
+            while index < len(block) and (block[index].isalnum() or block[index] == "_"):
+                index += 1
+        else:
+            index += 1
+    return "".join(out)
 
 
 def raw_body_parses(source: str, handler: str) -> list[tuple[str | None, bool, bool]]:
@@ -742,16 +777,16 @@ def error_rejects(name: str, block: str, seen: frozenset[str] = frozenset()) -> 
         if alias.group(1) not in seen | {name}:
             if error_rejects(alias.group(1), block, seen | {name}):
                 return True
-    for use in re.finditer(r"(?<![.\w])%s\b" % variable, block):
-        verdict, inspection, rest = walk_chain(block[use.end() :])
-        if verdict == "reject":
-            return True
-        if inspection and inspection_rejects(block[: use.start()], inspection, rest):
-            return True
     borrow = r"(?:&\s*(?:mut\s+)?)?"
     method = r"(?:\s*\.\s*as_(?:ref|mut)\s*\(\s*\))?"
     # The extractor as a pattern reads it: by value, borrowed or through `as_ref`.
     read = borrow + variable + method
+    for use in re.finditer(r"(?<![.\w])%s\b" % variable, block):
+        verdict, inspection, rest = walk_chain(block[use.end() :])
+        if verdict == "reject" and not error_exits_before(block, variable, read, use.start()):
+            return True
+        if inspection and inspection_rejects(block[: use.start()], inspection, rest):
+            return True
     scrutinee = r"\bmatch\s+%s\s*\{" % read
     for match in re.finditer(scrutinee, block):
         arms = balanced(block[match.end() - 1 :], "{", "}")
@@ -774,6 +809,28 @@ def error_rejects(name: str, block: str, seen: frozenset[str] = frozenset()) -> 
             otherwise = balanced(rest[rest.index("{") :], "{", "}")
             if rejecting_exit(otherwise):
                 return True
+    return False
+
+
+def error_exits_before(block: str, variable: str, read: str, position: int) -> bool:
+    """Whether an earlier `if` sends the extractor error to a success exit.
+
+    The `if` tests `is_err()`, `!is_ok()` or `let Err(..)`, and its block
+    returns a success on every path. A later `?` or `unwrap` then sees only
+    `Ok`, so it rejects nothing. The `if` must be in the scope of the use.
+    """
+    tested = r"\bif\s+(?:!\s*%s\s*\.\s*is_ok|%s\s*\.\s*is_err)\s*\(\s*\)\s*\{" % (
+        variable,
+        variable,
+    )
+    failed = r"\bif\s+let\s+Err\s*\([^=]*=\s*%s\s*\{" % read
+    for test in re.finditer(tested + "|" + failed, block[:position]):
+        taken = balanced(block[test.end() - 1 :], "{", "}")
+        if test.end() - 1 + len(taken) > position or not same_scope(block, test.start(), position):
+            continue
+        exits = re.search(r"\breturn\s+(?:%s)" % SUCCESS_EXIT, unconditional(taken))
+        if exits and not rejecting_exit(taken):
+            return True
     return False
 
 
@@ -1946,6 +2003,9 @@ pub fn harvest_api_router() -> Router {
         .route("/e/is-err-or", post(e_is_err_or))
         .route("/e/is-ok-and-then", post(e_is_ok_and_then))
         .route("/e/is-ok-and-or", post(e_is_ok_and_or))
+        .route("/e/exit-then-unwrap", post(e_exit_then_unwrap))
+        .route("/e/log-then-unwrap", post(e_log_then_unwrap))
+        .route("/e/nested-comment", post(e_nested_comment))
 }
 
 async fn e_wrapped(body: Bytes) -> Response {
@@ -2821,6 +2881,27 @@ async fn e_is_ok_and_or(body: Bytes) -> Result<Response, Response> {
         return Err(reject());
     }
     Ok(StatusCode::OK.into_response())
+}
+
+async fn e_exit_then_unwrap(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    if body.is_err() {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+    let Json(gadget) = body.unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_log_then_unwrap(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    if body.is_err() {
+        tracing::warn!("no body");
+    }
+    let Json(gadget) = body.unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_nested_comment(body: Bytes) -> Response {
+    /* outer /* nested */ serde_json::from_slice::<Gadget>(&body)?; */
+    StatusCode::OK.into_response()
 }
 
 fn invalid_body() -> Response {
@@ -4420,6 +4501,32 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             fixture_route("POST", path, 200, request_body=body_of(("name", False), required=False))
             for path in ("/e/is-err-and", "/e/is-ok-and-or")
         ],
+        {},
+    ),
+    (
+        "an unwrap after a guard that exits on error with success is tolerant",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/exit-then-unwrap",
+                200,
+                request_body=body_of(("name", False), required=False),
+                additional_responses=[{"status": 204}],
+            ),
+            fixture_route(
+                "POST",
+                "/e/log-then-unwrap",
+                200,
+                request_body=body_of(("name", True), required=False),
+            ),
+        ],
+        {"body_required": ["POST /e/log-then-unwrap: the body is mandatory"]},
+    ),
+    (
+        "a parse inside a nested block comment is no parse",
+        FIXTURE_EDGES,
+        [fixture_route("POST", "/e/nested-comment", 200)],
         {},
     ),
     (
