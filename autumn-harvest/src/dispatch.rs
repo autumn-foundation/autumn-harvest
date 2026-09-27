@@ -111,6 +111,15 @@ pub struct DispatchLease {
     pub kind: Option<DispatchKind>,
 }
 
+/// A reconcile sweep lease the caller holds (issue #1429).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconcileLease {
+    /// The queue the lease covers.
+    pub queue: String,
+    /// The sweep cursor the last holder saved, if any.
+    pub cursor: Option<String>,
+}
+
 /// Counters returned by one maintenance pass.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DispatchMaintenance {
@@ -208,21 +217,43 @@ pub trait TaskDispatch: Send + Sync + std::fmt::Debug {
 
     /// Take or renew the reconcile sweep lease of each queue (issue #1429).
     ///
-    /// Returns the queues whose lease `consumer` now holds for `ttl`, in the
-    /// order of `queues`. The holder sweeps those queues. One holder per queue
-    /// keeps a fleet from reading the same rows once per worker.
+    /// Returns the leases `consumer` now holds for `ttl`, in the order of
+    /// `queues`. The holder sweeps those queues. One holder per queue keeps a
+    /// fleet from reading the same rows once per worker. Each lease carries
+    /// the cursor the last holder saved, so a new holder resumes the walk.
     ///
-    /// The default grants every lease, so every worker sweeps every queue. A
-    /// wrapper must forward this method and [`Self::release_reconcile_leases`],
+    /// The default grants every lease with no cursor, so every worker sweeps
+    /// every queue from its own cursor. A wrapper must forward this method,
+    /// [`Self::save_reconcile_cursors`] and [`Self::release_reconcile_leases`],
     /// or it turns the lease off.
     async fn hold_reconcile_leases(
         &self,
         queues: &[String],
         consumer: &str,
         ttl: Duration,
-    ) -> HarvestResult<Vec<String>> {
+    ) -> HarvestResult<Vec<ReconcileLease>> {
         let _ = (consumer, ttl);
-        Ok(queues.to_vec())
+        Ok(queues
+            .iter()
+            .map(|queue| ReconcileLease {
+                queue: queue.clone(),
+                cursor: None,
+            })
+            .collect())
+    }
+
+    /// Save the sweep cursor of each queue whose lease `consumer` holds.
+    ///
+    /// `None` clears the cursor, so the next holder starts at the top. A
+    /// cursor for a lease a peer took over is ignored. The cursor is opaque
+    /// to the channel. The default does nothing.
+    async fn save_reconcile_cursors(
+        &self,
+        consumer: &str,
+        cursors: &[(String, Option<String>)],
+    ) -> HarvestResult<()> {
+        let _ = (consumer, cursors);
+        Ok(())
     }
 
     /// Give up the reconcile leases `consumer` holds on `queues`.
@@ -1531,8 +1562,16 @@ mod tests {
             .await
             .expect("hold");
 
-        assert_eq!(held, queues);
-        assert_eq!(peer, queues);
+        let names = |leases: Vec<ReconcileLease>| -> Vec<String> {
+            assert!(leases.iter().all(|lease| lease.cursor.is_none()));
+            leases.into_iter().map(|lease| lease.queue).collect()
+        };
+        assert_eq!(names(held), queues);
+        assert_eq!(names(peer), queues);
+        channel
+            .save_reconcile_cursors("w1", &[("a".to_string(), Some("c".to_string()))])
+            .await
+            .expect("save");
         channel
             .release_reconcile_leases(&queues, "w1")
             .await

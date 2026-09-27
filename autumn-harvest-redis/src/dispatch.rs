@@ -65,7 +65,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use autumn_harvest::dispatch::{
-    DispatchHint, DispatchKind, DispatchLease, DispatchMaintenance, TaskDispatch,
+    DispatchHint, DispatchKind, DispatchLease, DispatchMaintenance, ReconcileLease, TaskDispatch,
 };
 use autumn_harvest::error::{HarvestError, HarvestResult};
 use autumn_harvest::types::ShardId;
@@ -81,7 +81,7 @@ use uuid::Uuid;
 use crate::error::{RedisAdapterError, RedisAdapterResult};
 use crate::naming::{
     dispatch_delayed_key, dispatch_marker_key, dispatch_marker_prefix, dispatch_payloads_key,
-    dispatch_reconcile_lease_key, dispatch_stream_key,
+    dispatch_reconcile_cursor_key, dispatch_reconcile_lease_key, dispatch_stream_key,
 };
 use crate::redis_queue::is_busygroup;
 
@@ -246,6 +246,7 @@ pub struct RedisDispatch {
     requeue_script: Arc<Script>,
     hold_lease_script: Arc<Script>,
     release_lease_script: Arc<Script>,
+    save_cursor_script: Arc<Script>,
     /// Queues whose consumer group this process already created.
     ensured: Arc<Mutex<HashSet<String>>>,
     /// Unix milliseconds of the last promotion pass driven by a read.
@@ -290,6 +291,7 @@ impl RedisDispatch {
             requeue_script: Arc::new(Script::new(REQUEUE_LUA)),
             hold_lease_script: Arc::new(Script::new(HOLD_LEASE_LUA)),
             release_lease_script: Arc::new(Script::new(RELEASE_LEASE_LUA)),
+            save_cursor_script: Arc::new(Script::new(SAVE_CURSOR_LUA)),
             ensured: Arc::new(Mutex::new(HashSet::new())),
             last_promote_ms: Arc::new(AtomicI64::new(0)),
             last_recover_ms: Arc::new(AtomicI64::new(0)),
@@ -354,6 +356,10 @@ impl RedisDispatch {
 
     fn reconcile_lease_key(&self, queue_name: &str) -> String {
         dispatch_reconcile_lease_key(&self.config.key_prefix, queue_name)
+    }
+
+    fn reconcile_cursor_key(&self, queue_name: &str) -> String {
+        dispatch_reconcile_cursor_key(&self.config.key_prefix, queue_name)
     }
 
     fn marker_key(&self, task_id: Uuid) -> String {
@@ -820,13 +826,14 @@ impl RedisDispatch {
 
     /// Take or renew the sweep lease of each queue in one round trip.
     ///
-    /// Returns the queues whose lease `consumer` holds, in input order.
+    /// Returns the leases `consumer` holds, in input order, each with the
+    /// cursor the last holder saved.
     async fn hold_leases_inner(
         &self,
         queues: &[String],
         consumer: &str,
         ttl: Duration,
-    ) -> RedisAdapterResult<Vec<String>> {
+    ) -> RedisAdapterResult<Vec<ReconcileLease>> {
         if queues.is_empty() {
             return Ok(Vec::new());
         }
@@ -837,15 +844,46 @@ impl RedisDispatch {
         for queue in queues {
             invocation.key(self.reconcile_lease_key(queue));
         }
+        for queue in queues {
+            invocation.key(self.reconcile_cursor_key(queue));
+        }
         invocation.arg(consumer).arg(ttl_ms);
         let mut conn = self.conn.clone();
-        let held: Vec<i64> = invocation.invoke_async(&mut conn).await?;
+        let replies: Vec<String> = invocation.invoke_async(&mut conn).await?;
         Ok(queues
             .iter()
-            .zip(held)
-            .filter(|(_, flag)| *flag == 1)
-            .map(|(queue, _)| queue.clone())
+            .zip(replies)
+            .filter(|(_, reply)| reply != LEASE_NOT_HELD)
+            .map(|(queue, reply)| ReconcileLease {
+                queue: queue.clone(),
+                cursor: (!reply.is_empty()).then_some(reply),
+            })
             .collect())
+    }
+
+    /// Save or clear the sweep cursor of each queue `consumer` still leases.
+    async fn save_cursors_inner(
+        &self,
+        consumer: &str,
+        cursors: &[(String, Option<String>)],
+    ) -> RedisAdapterResult<()> {
+        if cursors.is_empty() {
+            return Ok(());
+        }
+        let mut invocation = self.save_cursor_script.prepare_invoke();
+        for (queue, _) in cursors {
+            invocation.key(self.reconcile_lease_key(queue));
+        }
+        for (queue, _) in cursors {
+            invocation.key(self.reconcile_cursor_key(queue));
+        }
+        invocation.arg(consumer).arg(RECONCILE_CURSOR_TTL_SECS);
+        for (_, cursor) in cursors {
+            invocation.arg(cursor.as_deref().unwrap_or(""));
+        }
+        let mut conn = self.conn.clone();
+        let _: i64 = invocation.invoke_async(&mut conn).await?;
+        Ok(())
     }
 
     /// Delete each sweep lease that `consumer` still holds.
@@ -1054,8 +1092,16 @@ impl TaskDispatch for RedisDispatch {
         queues: &[String],
         consumer: &str,
         ttl: Duration,
-    ) -> HarvestResult<Vec<String>> {
+    ) -> HarvestResult<Vec<ReconcileLease>> {
         harvest(self.hold_leases_inner(queues, consumer, ttl).await)
+    }
+
+    async fn save_reconcile_cursors(
+        &self,
+        consumer: &str,
+        cursors: &[(String, Option<String>)],
+    ) -> HarvestResult<()> {
+        harvest(self.save_cursors_inner(consumer, cursors).await)
     }
 
     async fn release_reconcile_leases(
@@ -1328,27 +1374,67 @@ end
 return written
 ";
 
-/// Take or renew one reconcile sweep lease per key (issue #1429).
+/// The hold reply for a lease a peer holds.
+const LEASE_NOT_HELD: &str = "-";
+
+/// Lifetime of a saved sweep cursor, in seconds.
 ///
-/// KEYS are the lease keys. ARGV is the consumer, then the TTL in
-/// milliseconds. A free lease goes to the consumer. A lease the consumer
-/// already holds gets a new TTL. A lease a peer holds stays with the peer.
-/// The reply holds one flag per key: 1 when the consumer holds the lease.
+/// A cursor outlives its lease, so a holder that dies still hands its walk
+/// over. A queue nobody sweeps for an hour starts again at the top.
+const RECONCILE_CURSOR_TTL_SECS: u64 = 3_600;
+
+/// Take or renew one reconcile sweep lease per queue (issue #1429).
+///
+/// KEYS are the lease keys, then the cursor keys, in the same queue order.
+/// ARGV is the consumer, then the TTL in milliseconds. A free lease goes to
+/// the consumer. A lease the consumer already holds gets a new TTL. A lease a
+/// peer holds stays with the peer.
+///
+/// The reply holds one string per queue: `-` when a peer holds the lease,
+/// else the saved cursor, or an empty string when none is saved.
 const HOLD_LEASE_LUA: &str = r"
+local n = #KEYS / 2
 local held = {}
-for i, key in ipairs(KEYS) do
-    local owner = redis.call('GET', key)
+for i = 1, n do
+    local owner = redis.call('GET', KEYS[i])
+    local mine = false
     if not owner then
-        redis.call('SET', key, ARGV[1], 'PX', ARGV[2])
-        held[i] = 1
+        redis.call('SET', KEYS[i], ARGV[1], 'PX', ARGV[2])
+        mine = true
     elseif owner == ARGV[1] then
-        redis.call('PEXPIRE', key, ARGV[2])
-        held[i] = 1
+        redis.call('PEXPIRE', KEYS[i], ARGV[2])
+        mine = true
+    end
+    if mine then
+        held[i] = redis.call('GET', KEYS[n + i]) or ''
     else
-        held[i] = 0
+        held[i] = '-'
     end
 end
 return held
+";
+
+/// Save or clear one sweep cursor per queue the consumer leases.
+///
+/// KEYS are the lease keys, then the cursor keys, in the same queue order.
+/// ARGV is the consumer, the cursor TTL in seconds, then one cursor per
+/// queue. An empty cursor clears the key. A queue a peer leases is skipped.
+/// The reply is the number of cursors written.
+const SAVE_CURSOR_LUA: &str = r"
+local n = #KEYS / 2
+local written = 0
+for i = 1, n do
+    if redis.call('GET', KEYS[i]) == ARGV[1] then
+        local cursor = ARGV[2 + i]
+        if cursor == '' then
+            redis.call('DEL', KEYS[n + i])
+        else
+            redis.call('SET', KEYS[n + i], cursor, 'EX', ARGV[2])
+        end
+        written = written + 1
+    end
+end
+return written
 ";
 
 /// Delete each reconcile sweep lease that the consumer still holds.
@@ -1530,6 +1616,7 @@ mod tests {
     fn lease_scripts_compile() {
         let _ = Script::new(HOLD_LEASE_LUA);
         let _ = Script::new(RELEASE_LEASE_LUA);
+        let _ = Script::new(SAVE_CURSOR_LUA);
     }
 
     #[test]

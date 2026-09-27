@@ -174,6 +174,7 @@ With the default prefix and a queue named `email`:
 | `harvest:dispatch:email:delayed:payloads` | hash | Payload of each parked reference, keyed by task id |
 | `harvest:dispatch:marker:<task_id>` | string | Publish marker that makes a publish idempotent per task id |
 | `harvest:dispatch:email:reconcile` | string | Reconcile sweep lease. The value names the worker that sweeps the queue |
+| `harvest:dispatch:email:reconcile:cursor` | string | Where the sweep walk stopped. It outlives the lease by up to one hour, so a new holder resumes the walk |
 
 `autumn-harvest-redis/src/naming.rs` is the single source of truth for the key
 shape. The older `harvest:queue:*`, `harvest:scheduled:*` and `harvest:dlq:*`
@@ -227,8 +228,10 @@ lease TTL is three times the larger of `reconcile_interval_ms` and
 - A worker that stops releases its leases, best effort. A lease that is not
   renewed expires after the TTL.
 
-A worker keeps its sweep cursor when it loses a lease. A stale cursor wraps on
-the next short page, so a hand-over does not restart the walk. A due row that
+After a successful sweep the holder saves each queue's cursor in Redis, beside
+the lease. A new holder resumes from that cursor, so a hand-over does not
+restart the walk. A sweep whose page reads outlast one renewal period renews
+its leases before it publishes. A due row that
 the channel does not hold is published on a later sweep, usually the next one.
 A backlog deeper than `reconcile_batch` takes one interval per page.
 

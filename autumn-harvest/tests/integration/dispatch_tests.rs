@@ -2132,13 +2132,18 @@ async fn the_worker_acks_each_read_in_one_batch() {
 // Reconcile sweep lease (issue #1429 item 10)
 // ---------------------------------------------------------------------------
 
-/// A channel whose reconcile leases a test grants, denies or fails.
+/// A channel whose reconcile leases a test grants, denies or fails. It keeps
+/// saved cursors in memory, like a lease store would.
 #[derive(Debug, Default)]
 struct LeaseSwitchDispatch {
     inner: MemoryDispatch,
     grant: std::sync::atomic::AtomicBool,
     fail_lease: std::sync::atomic::AtomicBool,
     releases: AtomicUsize,
+    cursors: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    saves: std::sync::Mutex<Vec<(String, Option<String>)>>,
+    /// Task ids of each publish call, in order.
+    publishes: std::sync::Mutex<Vec<Vec<uuid::Uuid>>>,
 }
 
 #[async_trait::async_trait]
@@ -2147,6 +2152,10 @@ impl TaskDispatch for LeaseSwitchDispatch {
         &self,
         hints: &[autumn_harvest::dispatch::DispatchHint],
     ) -> autumn_harvest::HarvestResult<()> {
+        self.publishes
+            .lock()
+            .expect("publish log")
+            .push(hints.iter().map(|hint| hint.task_id).collect());
         self.inner.publish(hints).await
     }
 
@@ -2187,17 +2196,42 @@ impl TaskDispatch for LeaseSwitchDispatch {
         queues: &[String],
         _consumer: &str,
         _ttl: Duration,
-    ) -> autumn_harvest::HarvestResult<Vec<String>> {
+    ) -> autumn_harvest::HarvestResult<Vec<autumn_harvest::dispatch::ReconcileLease>> {
         if std::sync::atomic::AtomicBool::load(&self.fail_lease, Ordering::SeqCst) {
             return Err(autumn_harvest::HarvestError::Dispatch(
                 "injected lease failure".to_string(),
             ));
         }
-        if std::sync::atomic::AtomicBool::load(&self.grant, Ordering::SeqCst) {
-            Ok(queues.to_vec())
-        } else {
-            Ok(Vec::new())
+        if !std::sync::atomic::AtomicBool::load(&self.grant, Ordering::SeqCst) {
+            return Ok(Vec::new());
         }
+        let cursors = self.cursors.lock().expect("cursors");
+        Ok(queues
+            .iter()
+            .map(|queue| autumn_harvest::dispatch::ReconcileLease {
+                queue: queue.clone(),
+                cursor: cursors.get(queue).cloned(),
+            })
+            .collect())
+    }
+
+    async fn save_reconcile_cursors(
+        &self,
+        _consumer: &str,
+        cursors: &[(String, Option<String>)],
+    ) -> autumn_harvest::HarvestResult<()> {
+        let mut stored = self.cursors.lock().expect("cursors");
+        for (queue, cursor) in cursors {
+            match cursor {
+                Some(cursor) => stored.insert(queue.clone(), cursor.clone()),
+                None => stored.remove(queue),
+            };
+        }
+        self.saves
+            .lock()
+            .expect("saves")
+            .extend(cursors.iter().cloned());
+        Ok(())
     }
 
     async fn release_reconcile_leases(
@@ -2338,4 +2372,88 @@ async fn a_failed_lease_call_sweeps_every_queue() {
     .await;
 
     assert!(channel.inner.published_ids().contains(&task_id));
+}
+
+/// A new lease holder resumes the walk from the cursor the last holder saved
+/// (issue #1429).
+///
+/// The saved cursor points past the first two pages of gated rows. A fresh
+/// worker's first sweep must publish the third page, which holds the
+/// claimable row. A worker that starts at the top publishes the first page.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_lease_holder_resumes_the_walk_from_the_saved_cursor() {
+    let _serial = DISPATCH_SERIAL.lock().await;
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let queue = unique_queue("lease_cursor");
+    let _cleanup = SeededQueueGuard {
+        url: url.clone(),
+        queue: queue.clone(),
+    };
+
+    let mut conn = connect(&url).await;
+    autumn_harvest::dispatch::uninstall();
+    seed_gated_rows(&mut conn, &queue, 250, 5).await;
+    let exec_id = start_on(&mut conn, "dispatch_trivial", &queue).await;
+    let claimable = workflow_task_id(&mut conn, exec_id).await;
+
+    let batch = 100;
+    let first = autumn_harvest::queue::due_dispatch_hints_page(&mut conn, &queue, batch, None)
+        .await
+        .expect("first page");
+    let second = autumn_harvest::queue::due_dispatch_hints_page(
+        &mut conn,
+        &queue,
+        batch,
+        first.cursor.as_ref(),
+    )
+    .await
+    .expect("second page");
+    let saved = second.cursor.expect("a full page carries a cursor");
+
+    let channel = Arc::new(LeaseSwitchDispatch::default());
+    channel.grant.store(true, Ordering::SeqCst);
+    channel
+        .cursors
+        .lock()
+        .expect("cursors")
+        .insert(queue.clone(), saved.encode());
+    autumn_harvest::dispatch::install(
+        Arc::clone(&channel) as Arc<dyn TaskDispatch>,
+        DispatchSettings {
+            reconcile_batch: batch,
+            ..dispatch_settings()
+        },
+    );
+    let _guard = InstalledGuard;
+
+    let pool = build_pool(&url);
+    let worker = Arc::new(make_worker_with(
+        worker_config(&queue, vec![ShardId::new(0)]),
+        vec![wf_info("dispatch_trivial", trivial_workflow)],
+        vec![],
+        empty_shared_state(),
+    ));
+
+    let mut check = connect(&url).await;
+    with_worker(worker, pool, async {
+        wait_for_state(&mut check, exec_id, &["COMPLETED"], Duration::from_secs(30)).await;
+    })
+    .await;
+
+    let publishes = channel.publishes.lock().expect("publish log").clone();
+    let first_sweep = publishes.first().expect("the sweep publishes");
+    assert!(
+        first_sweep.contains(&claimable),
+        "the first sweep must resume at the third page"
+    );
+    let first_page: Vec<uuid::Uuid> = first.hints.iter().map(|hint| hint.task_id).collect();
+    assert!(
+        first_sweep.iter().all(|id| !first_page.contains(id)),
+        "the first sweep must not restart at the top"
+    );
+    let saves = channel.saves.lock().expect("saves").clone();
+    assert!(
+        saves.contains(&(queue.clone(), None)),
+        "a sweep that wraps must clear the saved cursor"
+    );
 }

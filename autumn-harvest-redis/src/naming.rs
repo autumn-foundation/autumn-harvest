@@ -73,6 +73,15 @@ pub fn dispatch_reconcile_lease_key(prefix: &str, queue_name: &str) -> String {
     format!("{prefix}:dispatch:{queue_name}:reconcile")
 }
 
+/// Per-queue reconcile sweep cursor (issue #1429).
+///
+/// The lease holder saves its walk position here, so a new holder resumes it.
+/// The key sits beside the lease key, in the queue's own family.
+#[must_use]
+pub fn dispatch_reconcile_cursor_key(prefix: &str, queue_name: &str) -> String {
+    format!("{prefix}:dispatch:{queue_name}:reconcile:cursor")
+}
+
 /// Dedupe marker for one task id.
 ///
 /// The marker makes a publish idempotent per task id. It expires after the
@@ -140,6 +149,10 @@ mod tests {
         assert_eq!(
             dispatch_reconcile_lease_key("harvest", "email"),
             "harvest:dispatch:email:reconcile"
+        );
+        assert_eq!(
+            dispatch_reconcile_cursor_key("harvest", "email"),
+            "harvest:dispatch:email:reconcile:cursor"
         );
     }
 

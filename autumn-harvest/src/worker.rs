@@ -25993,6 +25993,14 @@ const DISPATCH_CALL_TIMEOUT: Duration = Duration::from_secs(5);
 /// queues unswept for at most this many periods, then a peer takes over.
 const RECONCILE_LEASE_INTERVALS: u32 = 3;
 
+/// How often a worker renews its sweep leases (issue #1429).
+///
+/// The worker renews once per loop iteration. An idle iteration blocks on the
+/// read for the poll interval, so the period is the longer of the two.
+fn reconcile_lease_period(settings: &crate::dispatch::DispatchSettings) -> Duration {
+    settings.reconcile_interval.max(settings.poll_interval)
+}
+
 /// Run one channel call under [`DISPATCH_CALL_TIMEOUT`].
 async fn dispatch_call<T>(
     call: impl std::future::Future<Output = HarvestResult<T>>,
@@ -28597,8 +28605,9 @@ impl Worker {
     /// Each worker reads only the queues whose sweep lease it holds
     /// (issue #1429). Every worker still emits the throttle metrics below.
     /// A sweep that fails on Postgres gives its leases up, so a peer sweeps
-    /// next. A worker keeps its cursor when it loses a lease. A stale cursor
-    /// wraps on the next short page, so a hand-over never restarts the walk.
+    /// next. After a successful sweep the holder saves its cursors with the
+    /// channel. A new holder resumes from them, so a hand-over does not
+    /// restart the walk.
     ///
     /// Returns `false` when a channel call failed, so the caller can enter
     /// degraded mode. A database failure returns `true`: the database is not
@@ -28610,6 +28619,7 @@ impl Worker {
         state: &mut DispatchLoopState,
     ) -> bool {
         let (leased, lease_held) = self.reconcile_lease_queues(installed, state).await;
+        let held_at = std::time::Instant::now();
         let mut conn = match acquire_shard_conn(
             pool,
             shard_acquire_bound(false, self.config.poll_interval),
@@ -28658,6 +28668,11 @@ impl Worker {
                 None => state.reconcile_cursors.remove(&queue),
             };
         }
+        // Slow page reads can outlast a lease. A renewal keeps a peer from
+        // sweeping the same queues while this sweep publishes.
+        if lease_held && held_at.elapsed() >= reconcile_lease_period(&installed.settings) {
+            let _ = self.hold_reconcile_leases(installed, &leased).await;
+        }
 
         // The throttle metrics ride on this sweep. The Postgres poll path
         // emits them from an idle `poll_once`, which the dispatch path never
@@ -28668,6 +28683,10 @@ impl Worker {
         self.emit_throttle_metrics(&mut conn).await;
 
         if hints.is_empty() {
+            drop(conn);
+            if lease_held {
+                self.save_reconcile_cursors(installed, state, &leased).await;
+            }
             return true;
         }
         // The connection goes back before the publish: the publish is a channel
@@ -28686,6 +28705,11 @@ impl Worker {
             );
             return false;
         }
+        // The cursors are saved only after the publish, so a new holder never
+        // skips a page that was not published.
+        if lease_held {
+            self.save_reconcile_cursors(installed, state, &leased).await;
+        }
         // A publish success does not clear the degraded window either. The
         // read path owns that window, and the publish runs on the general
         // connection.
@@ -28700,35 +28724,88 @@ impl Worker {
     /// floor, so the lease fails open: a lease call that fails sweeps every
     /// queue, and the flag is `false`.
     ///
-    /// The worker renews the lease once per loop iteration. An idle iteration
-    /// blocks on the read for the poll interval, so the TTL covers the longer
-    /// of the two periods.
+    /// A lease carries the cursor its last holder saved. That cursor replaces
+    /// this worker's own, so a hand-over resumes the walk.
     async fn reconcile_lease_queues(
         &self,
         installed: &crate::dispatch::InstalledDispatch,
         state: &mut DispatchLoopState,
     ) -> (Vec<String>, bool) {
-        let settings = &installed.settings;
-        let ttl = settings
-            .reconcile_interval
-            .max(settings.poll_interval)
-            .saturating_mul(RECONCILE_LEASE_INTERVALS);
-        let held = dispatch_call(
-            installed.channel.hold_reconcile_leases(
-                &self.config.queues,
-                &self.config.worker_id,
-                ttl,
-            ),
-            "reconcile lease",
-        )
-        .await;
+        let held = self
+            .hold_reconcile_leases(installed, &self.config.queues)
+            .await;
         match held {
-            Ok(held) => (held, true),
+            Ok(leases) => {
+                // A saved cursor is the last holder's progress, so it wins over
+                // this worker's own. A lease with no saved cursor keeps the
+                // local one.
+                for lease in &leases {
+                    if let Some(cursor) = lease
+                        .cursor
+                        .as_deref()
+                        .and_then(crate::queue::DispatchCursor::decode)
+                    {
+                        state.reconcile_cursors.insert(lease.queue.clone(), cursor);
+                    }
+                }
+                (leases.into_iter().map(|lease| lease.queue).collect(), true)
+            }
             Err(error) => {
                 self.log_dispatch_error(state, &error, "dispatch reconcile lease failed");
                 (self.config.queues.clone(), false)
             }
         }
+    }
+
+    /// Take or renew the sweep leases of `queues` for three renewal periods.
+    async fn hold_reconcile_leases(
+        &self,
+        installed: &crate::dispatch::InstalledDispatch,
+        queues: &[String],
+    ) -> HarvestResult<Vec<crate::dispatch::ReconcileLease>> {
+        dispatch_call(
+            installed.channel.hold_reconcile_leases(
+                queues,
+                &self.config.worker_id,
+                reconcile_lease_period(&installed.settings)
+                    .saturating_mul(RECONCILE_LEASE_INTERVALS),
+            ),
+            "reconcile lease",
+        )
+        .await
+    }
+
+    /// Save the sweep cursor of each leased queue, so a new holder resumes
+    /// the walk (issue #1429).
+    ///
+    /// A failed save is harmless. The next holder starts from an older cursor
+    /// or from the top.
+    async fn save_reconcile_cursors(
+        &self,
+        installed: &crate::dispatch::InstalledDispatch,
+        state: &DispatchLoopState,
+        leased: &[String],
+    ) {
+        if leased.is_empty() {
+            return;
+        }
+        let cursors: Vec<(String, Option<String>)> = leased
+            .iter()
+            .map(|queue| {
+                let cursor = state
+                    .reconcile_cursors
+                    .get(queue)
+                    .map(crate::queue::DispatchCursor::encode);
+                (queue.clone(), cursor)
+            })
+            .collect();
+        let _ = dispatch_call(
+            installed
+                .channel
+                .save_reconcile_cursors(&self.config.worker_id, &cursors),
+            "reconcile cursor save",
+        )
+        .await;
     }
 
     /// Give up sweep leases, so a peer sweeps next.

@@ -53,9 +53,10 @@ its brainstorm, reverse brainstorm and six hats, is
   each sweep. Its TTL is three times the larger of the reconcile and poll
   intervals. The lease fails open. A failed lease call sweeps every queue. A
   sweep that fails on Postgres gives its leases back. After a Redis failure,
-  the lease expires. A stopping worker releases its leases, best effort. A
-  worker keeps its sweep cursor when it loses a lease, so a hand-over does not
-  restart the walk.
+  the lease expires. A stopping worker releases its leases, best effort. Slow
+  page reads renew the lease before the publish. The holder saves each
+  queue's cursor in Redis after a successful sweep, and a new holder resumes
+  from it (`TaskDispatch::save_reconcile_cursors`).
 
 **Deferred.** Items 3 (multi-shard), 4 (priority and sticky streams) and 5
 (Redis Cluster) change where a reference lives. Each needs its own design and

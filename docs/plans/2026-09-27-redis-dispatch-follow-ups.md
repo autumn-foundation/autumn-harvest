@@ -35,7 +35,7 @@ so each one gets its own issue.
 | 7 | (a) counters at the event sites; (b) a sampler over process-global atomics; (c) gauges | (a). The worker counts fallbacks and recoveries. The background publisher counts each dropped hint at the drop site, through a process-global recorder. The plugin runner and `Worker::new` set it with `dispatch::set_dropped_hint_recorder`. |
 | 8 | (a) ack each lease after its claim (today); (b) claim all, ack all, then start the tasks; (c) start each task after its claim, ack all at the end | (b). The ack still comes before the task starts, so the crash matrix does not change. The cost is that the first task waits for the other claims in the read. |
 | 9 | (a) one pipeline for all `XPENDING`, one for all `XCLAIM`; (b) `XAUTOCLAIM`; (c) concurrent commands on the multiplexed connection | (c). It costs about one round trip, like (a), and each command keeps its own result. A pipeline fails as a whole, and retrying it would repeat claims that already ran. `XAUTOCLAIM` needs Redis 6.2. |
-| 10 | (a) a tunable batch only; (b) a lease per queue so one worker sweeps; (c) a shared cursor in Redis | (a) plus (b). (c) leaks the Postgres cursor type into the channel trait. The lease TTL is three times the larger of `reconcile_interval` and `poll_interval`. Each worker keeps its own cursor when it loses a lease. |
+| 10 | (a) a tunable batch only; (b) a lease per queue so one worker sweeps; (c) a shared cursor in Redis | All three. The cursor travels as an opaque string, so the channel trait never sees the Postgres cursor type. The lease TTL is three times the larger of `reconcile_interval` and `poll_interval`. |
 
 ## 4. Reverse brainstorm: how to make this lose work or mislead an operator
 
@@ -47,7 +47,8 @@ so each one gets its own issue.
 | A sweep lease holder stops sweeping but keeps its lease | The holder renews the lease at the start of each sweep. A sweep that fails on a Postgres error gives the lease back. A lease that is not renewed expires after its TTL, three times the larger of `reconcile_interval` and `poll_interval`. The TTL covers the real renewal period, which a blocking read can stretch past one reconcile interval. |
 | Redis fails in the middle of a sweep | The worker makes no further Redis call for that sweep. The lease expires after its TTL, and a peer takes the queue. |
 | A lease holder shuts down | The worker releases its leases on stop, best effort. A lease it fails to release expires after its TTL. |
-| A lease moves to a peer, and the sweep walk restarts at the head of the backlog | A worker keeps its cursor when it loses a lease. A stale cursor wraps on the next short page, so a hand-over does not restart the walk. |
+| A lease moves to a peer, and the sweep walk restarts at the head of the backlog | The holder saves each cursor in Redis after a successful sweep. A new holder resumes from it. |
+| Slow page reads outlast the lease, and a peer sweeps the same queue | A sweep whose reads take longer than one renewal period renews its leases before it publishes. |
 | Redis refuses the lease call | The worker sweeps anyway. The floor fails open. |
 | A peer serves a different queue set | The lease is per queue, so each queue has its own holder among the workers that poll it. |
 | `reconcile_batch = 0` stalls the cursor, or a huge batch reads a whole deep backlog in one query | Validation requires 1 to 10000. |
@@ -73,8 +74,8 @@ so each one gets its own issue.
 - **Yellow (benefits).** A fleet of N workers sweeps each queue once per
   interval, not N times. The operator can see the channel in the admin view
   and in metrics. Acks and recovery cost one round trip each per pass.
-- **Green (alternatives).** A shared sweep cursor, per-priority streams, and
-  hash-tagged keys all fit the same trait later.
+- **Green (alternatives).** Per-priority streams and hash-tagged keys fit
+  the same trait later.
 - **Blue (process).** One commit pair per item: a red test, then the fix.
   Refactor last. Run the Redis and Postgres suites locally before each push.
 
@@ -116,6 +117,7 @@ A multi-angle review of the first cut changed these points:
   not block the rest.
 - **Item 10.** The range of `reconcile_batch` is now 1 to 10000. The lease TTL
   is three times the larger of the two intervals. The holder renews at sweep
-  start and releases its leases on stop. A worker keeps its cursor across a
-  lease loss. `hold_reconcile_leases` returns the names of the held queues.
+  start and releases its leases on stop. `hold_reconcile_leases` returns the
+  held leases, each with its saved cursor. A later Codex review added the saved
+  cursor and the renewal after slow page reads.
 - **API contract.** The OpenAPI document is regenerated.

@@ -1101,6 +1101,76 @@ async fn a_lost_group_does_not_block_recovery_in_another_queue() {
     assert_eq!(again[0].task_id, kept_id);
 }
 
+/// Take or renew leases and return the held queue names.
+async fn hold(fixture: &Fixture, queues: &[String], consumer: &str, ttl: Duration) -> Vec<String> {
+    fixture
+        .dispatch
+        .hold_reconcile_leases(queues, consumer, ttl)
+        .await
+        .expect("hold")
+        .into_iter()
+        .map(|lease| lease.queue)
+        .collect()
+}
+
+/// A new lease holder receives the cursor the last holder saved. A peer
+/// cannot overwrite it, and `None` clears it (issue #1429).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_lease_holder_resumes_from_the_saved_cursor() {
+    let Some(fixture) = try_start(Duration::from_secs(60)).await else {
+        return;
+    };
+    let ttl = Duration::from_secs(30);
+    let queue = vec!["cursor_q".to_string()];
+    let hold_one = |consumer: &'static str| {
+        let dispatch = fixture.dispatch.clone();
+        let queue = queue.clone();
+        async move {
+            dispatch
+                .hold_reconcile_leases(&queue, consumer, ttl)
+                .await
+                .expect("hold")
+        }
+    };
+
+    let first = hold_one("w1").await;
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].cursor, None, "a fresh queue has no cursor");
+    fixture
+        .dispatch
+        .save_reconcile_cursors(
+            "w1",
+            &[("cursor_q".to_string(), Some("page-2".to_string()))],
+        )
+        .await
+        .expect("save");
+    fixture
+        .dispatch
+        .save_reconcile_cursors("w2", &[("cursor_q".to_string(), Some("peer".to_string()))])
+        .await
+        .expect("a peer save is ignored, not an error");
+
+    fixture
+        .dispatch
+        .release_reconcile_leases(&queue, "w1")
+        .await
+        .expect("release");
+    let handed = hold_one("w2").await;
+    assert_eq!(handed.len(), 1, "a released lease goes to the peer");
+    assert_eq!(handed[0].cursor.as_deref(), Some("page-2"));
+
+    fixture
+        .dispatch
+        .save_reconcile_cursors("w2", &[("cursor_q".to_string(), None)])
+        .await
+        .expect("clear");
+    let cleared = hold_one("w2").await;
+    assert_eq!(
+        cleared[0].cursor, None,
+        "a cleared cursor restarts the walk"
+    );
+}
+
 /// One consumer holds each queue's reconcile lease. The holder renews it, a
 /// peer waits for it, and a release hands it over (issue #1429).
 #[tokio::test(flavor = "multi_thread")]
@@ -1111,25 +1181,13 @@ async fn one_consumer_holds_each_reconcile_lease() {
     let ttl = Duration::from_secs(30);
     let both = vec!["lease_a".to_string(), "lease_b".to_string()];
 
-    let first = fixture
-        .dispatch
-        .hold_reconcile_leases(&both, "w1", ttl)
-        .await
-        .expect("hold");
+    let first = hold(&fixture, &both, "w1", ttl).await;
     assert_eq!(first, both, "free leases go to the first caller");
 
-    let peer = fixture
-        .dispatch
-        .hold_reconcile_leases(&both, "w2", ttl)
-        .await
-        .expect("hold");
+    let peer = hold(&fixture, &both, "w2", ttl).await;
     assert!(peer.is_empty(), "a held lease stays with its holder");
 
-    let renewed = fixture
-        .dispatch
-        .hold_reconcile_leases(&both, "w1", ttl)
-        .await
-        .expect("renew");
+    let renewed = hold(&fixture, &both, "w1", ttl).await;
     assert_eq!(renewed, both, "the holder renews its leases");
 
     fixture
@@ -1137,11 +1195,7 @@ async fn one_consumer_holds_each_reconcile_lease() {
         .release_reconcile_leases(&both[..1], "w2")
         .await
         .expect("release by a non-holder");
-    let still = fixture
-        .dispatch
-        .hold_reconcile_leases(&both, "w2", ttl)
-        .await
-        .expect("hold");
+    let still = hold(&fixture, &both, "w2", ttl).await;
     assert!(still.is_empty(), "a non-holder cannot release a lease");
 
     fixture
@@ -1149,11 +1203,7 @@ async fn one_consumer_holds_each_reconcile_lease() {
         .release_reconcile_leases(&both[..1], "w1")
         .await
         .expect("release");
-    let handed = fixture
-        .dispatch
-        .hold_reconcile_leases(&both, "w2", ttl)
-        .await
-        .expect("hold");
+    let handed = hold(&fixture, &both, "w2", ttl).await;
     assert_eq!(handed, both[..1], "a released lease goes to the peer");
 }
 
@@ -1165,19 +1215,11 @@ async fn an_unrenewed_reconcile_lease_expires() {
     };
     let queue = vec!["lease_expiry".to_string()];
 
-    let first = fixture
-        .dispatch
-        .hold_reconcile_leases(&queue, "w1", Duration::from_millis(150))
-        .await
-        .expect("hold");
+    let first = hold(&fixture, &queue, "w1", Duration::from_millis(150)).await;
     assert_eq!(first, queue);
 
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let peer = fixture
-        .dispatch
-        .hold_reconcile_leases(&queue, "w2", Duration::from_secs(30))
-        .await
-        .expect("hold");
+    let peer = hold(&fixture, &queue, "w2", Duration::from_secs(30)).await;
     assert_eq!(peer, queue, "an expired lease goes to the next caller");
 }
 
@@ -1190,22 +1232,10 @@ async fn a_renewal_extends_the_reconcile_lease() {
     };
     let queue = vec!["lease_renewal".to_string()];
 
-    fixture
-        .dispatch
-        .hold_reconcile_leases(&queue, "w1", Duration::from_millis(150))
-        .await
-        .expect("hold");
-    fixture
-        .dispatch
-        .hold_reconcile_leases(&queue, "w1", Duration::from_secs(30))
-        .await
-        .expect("renew");
+    hold(&fixture, &queue, "w1", Duration::from_millis(150)).await;
+    hold(&fixture, &queue, "w1", Duration::from_secs(30)).await;
 
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let peer = fixture
-        .dispatch
-        .hold_reconcile_leases(&queue, "w2", Duration::from_secs(30))
-        .await
-        .expect("hold");
+    let peer = hold(&fixture, &queue, "w2", Duration::from_secs(30)).await;
     assert!(peer.is_empty(), "a renewed lease outlives its first TTL");
 }

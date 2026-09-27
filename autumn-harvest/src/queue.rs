@@ -1939,6 +1939,42 @@ pub struct DispatchCursor {
     pub id: Uuid,
 }
 
+impl DispatchCursor {
+    /// The cursor as an opaque string a dispatch channel can store
+    /// (issue #1429).
+    ///
+    /// A new sweep-lease holder reads it back, so the walk resumes where the
+    /// last holder stopped. Postgres stores microseconds, so the round trip is
+    /// exact.
+    #[must_use]
+    pub fn encode(&self) -> String {
+        format!(
+            "{}|{}|{}",
+            self.priority,
+            self.scheduled_at.timestamp_micros(),
+            self.id
+        )
+    }
+
+    /// Read a cursor that [`Self::encode`] wrote. Returns `None` for any
+    /// other string.
+    #[must_use]
+    pub fn decode(value: &str) -> Option<Self> {
+        let mut parts = value.split('|');
+        let priority = parts.next()?.parse().ok()?;
+        let micros = parts.next()?.parse().ok()?;
+        let id = parts.next()?.parse().ok()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        Some(Self {
+            priority,
+            scheduled_at: DateTime::from_timestamp_micros(micros)?,
+            id,
+        })
+    }
+}
+
 /// One page of the reconcile sweep over one queue.
 #[derive(Debug, Clone, Default)]
 pub struct DispatchHintPage {
@@ -10932,5 +10968,31 @@ mod tests {
     fn primary_repend_returns_every_hint_column() {
         let sql = primary_repend_workflow_task_query();
         assert!(sql.contains("RETURNING id, queue_name, scheduled_at, priority, task_type"));
+    }
+}
+
+#[cfg(test)]
+mod dispatch_cursor_tests {
+    use super::*;
+
+    /// A saved cursor reads back exactly, so a new lease holder resumes at the
+    /// same row (issue #1429).
+    #[test]
+    fn a_dispatch_cursor_round_trips_through_its_encoding() {
+        let cursor = DispatchCursor {
+            priority: -3,
+            scheduled_at: DateTime::from_timestamp_micros(1_790_000_000_123_456).expect("time"),
+            id: Uuid::new_v4(),
+        };
+
+        assert_eq!(DispatchCursor::decode(&cursor.encode()), Some(cursor));
+    }
+
+    /// Any other string reads as no cursor, so the walk starts at the top.
+    #[test]
+    fn a_foreign_string_is_not_a_dispatch_cursor() {
+        for value in ["", "-", "1|2", "a|2|3", "1|2|not-a-uuid", "1|2|3|4"] {
+            assert_eq!(DispatchCursor::decode(value), None, "{value:?}");
+        }
     }
 }

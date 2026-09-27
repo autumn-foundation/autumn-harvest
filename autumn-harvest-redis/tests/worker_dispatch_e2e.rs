@@ -340,10 +340,18 @@ impl TaskDispatch for CountingDispatch {
         queues: &[String],
         consumer: &str,
         ttl: Duration,
-    ) -> HarvestResult<Vec<String>> {
+    ) -> HarvestResult<Vec<autumn_harvest::dispatch::ReconcileLease>> {
         self.inner
             .hold_reconcile_leases(queues, consumer, ttl)
             .await
+    }
+
+    async fn save_reconcile_cursors(
+        &self,
+        consumer: &str,
+        cursors: &[(String, Option<String>)],
+    ) -> HarvestResult<()> {
+        self.inner.save_reconcile_cursors(consumer, cursors).await
     }
 
     async fn release_reconcile_leases(
