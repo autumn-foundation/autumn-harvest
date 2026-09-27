@@ -1110,6 +1110,29 @@ def split_expression(
     return items
 
 
+def condition_keeps(joined: str, value: bool) -> bool:
+    """Whether `TEST <joined>` has the test's `value` whenever the test has it.
+
+    `joined` is the rest of an `if` condition after its test, such as
+    `&& ready()` or `|| (a() && b())`. Only top-level `&&` and `||` count, as
+    `split_expression` reads them, and `&&` binds tighter than `||`. A true
+    test keeps the condition true when no operator follows or the first one is
+    `||`. A false test keeps it false when every operator is `&&`. Any other
+    text after the test, such as `== false`, keeps nothing. Every guard reader
+    in the audit asks this.
+    """
+    joined = joined.strip()
+    if not joined:
+        return True
+    if not joined.startswith(("&&", "||")):
+        return False
+    operators: list[str] = []
+    split_expression(joined, "&&", "||", found=operators)
+    if value:
+        return operators[0] == "||"
+    return all(operator == "&&" for operator in operators)
+
+
 def split_top_level(text: str) -> list[str]:
     """The comma-separated items of an argument list, as `split_expression` reads it."""
     return split_expression(text, ",")
@@ -1347,16 +1370,8 @@ def guards(block: str, position: int, variable: str) -> bool:
             continue
         # The whole condition must hold for every empty body, or for none.
         # `body.is_empty() && x` can skip the arm, and `!body.is_empty() || x`
-        # can take it with an empty body.
-        # Only `||` may follow `body.is_empty()`, and only `&&` may follow
-        # `!body.is_empty()`. Anything else, such as `== false`, can flip it.
-        joined = block[test.end() : opener].strip()
-        allowed, banned = ("&&", "||") if test.group(1) else ("||", "&&")
-        # Only a top-level operator can let an empty body bypass the test. One
-        # inside parentheses belongs to a term that the outer operator joins.
-        operators: list[str] = []
-        split_expression(joined, "&&", "||", found=operators)
-        if joined and (not joined.startswith(allowed) or banned in operators):
+        # can take it with an empty body. `condition_keeps` decides.
+        if not condition_keeps(block[test.end() : opener], not test.group(1)):
             continue
         taken = balanced(block[opener:], "{", "}")
         taken_end = end = opener + len(taken)
@@ -1678,13 +1693,16 @@ def error_exits_before(block: str, variable: str, read: str, position: int) -> b
     returns a success on every path. A later `?` or `unwrap` then sees only
     `Ok`, so it rejects nothing. The `if` must be in the scope of the use.
     """
-    # A `|| x` after the test keeps the arm entered on every error.
-    tested = r"\bif\s+(?:!\s*%s\s*\.\s*is_ok|%s\s*\.\s*is_err)\s*\(\s*\)\s*(?:\|\|[^{&]*)?\{" % (
+    # The rest of the condition must keep the arm entered on every error, as
+    # `condition_keeps` reads it.
+    tested = r"\bif\s+(?:!\s*%s\s*\.\s*is_ok|%s\s*\.\s*is_err)\s*\(\s*\)([^{]*)\{" % (
         variable,
         variable,
     )
     failed = r"\bif\s+let\s+%sErr\s*\([^=]*=\s*%s\s*\{" % (PATTERN_LEAD, read)
     for test in re.finditer(tested + "|" + failed, block[:position]):
+        if test.group(1) is not None and not condition_keeps(test.group(1), True):
+            continue
         taken = balanced(block[test.end() - 1 :], "{", "}")
         if test.end() - 1 + len(taken) > position or not same_scope(block, test.start(), position):
             continue
@@ -2028,10 +2046,7 @@ def inspection_rejects(before: str, inspection: str, rest: str) -> bool:
     on_failure = inspection in ("is_err", "is_none")
     if condition.group(1):
         on_failure = not on_failure
-    joined = rest[:opener].strip()
-    if joined and on_failure and not joined.startswith("||"):
-        return False
-    if joined and not on_failure and (not joined.startswith("&&") or "||" in joined):
+    if not condition_keeps(rest[:opener], on_failure):
         return False
     taken = balanced(rest[opener:], "{", "}")
     after_taken = rest[opener + len(taken) :]
@@ -3359,6 +3374,9 @@ pub fn harvest_api_router() -> Router {
         .route("/e/raw-unknown-method", post(e_raw_unknown_method))
         .route("/e/raw-std-reader", post(e_raw_std_reader))
         .route("/e/extension-decode", post(e_extension_decode))
+        .route("/e/nested-or-inspection", post(e_nested_or_inspection))
+        .route("/e/or-and-empty-guard", post(e_or_and_empty_guard))
+        .route("/e/nested-and-error-exit", post(e_nested_and_error_exit))
         .route("/e/unknown-receiver-method", post(e_unknown_receiver_method))
         .route("/e/accessor-receiver", post(e_accessor_receiver))
         .route("/e/raw-aliased-std-reader", post(e_raw_aliased_std_reader))
@@ -4529,6 +4547,30 @@ async fn e_raw_associated_helper(body: Bytes) -> Response {
 
 async fn e_raw_method_helper(body: Bytes, decoder: GadgetDecoder) -> Response {
     decoder.decode_owned(&body)
+}
+
+async fn e_nested_or_inspection(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    if body.is_ok() && (feature_on() || fallback_on()) {
+        StatusCode::OK.into_response()
+    } else {
+        invalid_body()
+    }
+}
+
+async fn e_or_and_empty_guard(body: Bytes) -> Response {
+    if body.is_empty() || feature_on() && fallback_on() {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+    let gadget = serde_json::from_slice::<Gadget>(&body).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_nested_and_error_exit(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    if body.is_err() || (feature_on() && fallback_on()) {
+        return StatusCode::OK.into_response();
+    }
+    let Json(gadget) = body.unwrap();
+    StatusCode::OK.into_response()
 }
 
 trait DecodeExt {
@@ -6931,6 +6973,33 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             ],
             "unresolved": ["POST /e/unknown-receiver-method: cannot read a `from_slice` call"],
         },
+    ),
+    (
+        "a guard is judged by its top-level && and || only, on every guard path",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/nested-or-inspection",
+                200,
+                request_body=body_of(("name", True), required=False),
+                error_responses=[{"status": 400}],
+            ),
+            fixture_route(
+                "POST",
+                "/e/or-and-empty-guard",
+                200,
+                request_body=body_of(("name", True), required=False),
+                additional_responses=[{"status": 204}],
+            ),
+            fixture_route(
+                "POST",
+                "/e/nested-and-error-exit",
+                200,
+                request_body=body_of(("name", True), required=False),
+            ),
+        ],
+        {"body_required": ["POST /e/nested-or-inspection: the body is mandatory"]},
     ),
     (
         "a helper named in a comment or a string is not called",
