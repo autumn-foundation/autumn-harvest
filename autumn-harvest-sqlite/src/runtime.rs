@@ -824,6 +824,9 @@ impl SqliteRuntime {
     /// Returns a persistence error if the history cannot be read or a stored
     /// event cannot be parsed.
     pub fn load_history(&self, exec: ExecutionId) -> SqliteResult<Vec<WorkflowEvent>> {
+        if !store::execution_exists(&self.conn, exec)? {
+            return Err(SqliteError::ExecutionNotFound(exec));
+        }
         store::load_history(&self.conn, exec)
     }
 
@@ -846,6 +849,9 @@ impl SqliteRuntime {
         exec: ExecutionId,
         activity_name: &str,
     ) -> SqliteResult<Vec<store::ActivityAttempt>> {
+        if !store::execution_exists(&self.conn, exec)? {
+            return Err(SqliteError::ExecutionNotFound(exec));
+        }
         store::load_attempts(&self.conn, exec, activity_name)
     }
 
@@ -1142,6 +1148,9 @@ impl SqliteRuntime {
         // these (`store::running_executions` filters to `state = 'RUNNING'`), but a
         // DIRECT `run_until_blocked(sealed_exec)` must short-circuit rather than
         // re-drive a superseded run's handler.
+        if !store::execution_exists(&self.conn, exec)? {
+            return Err(SqliteError::ExecutionNotFound(exec));
+        }
         let state = store::execution_state(&self.conn, exec)?;
         if autumn_harvest::erase::is_terminal_state(&state) {
             return match state.as_str() {
