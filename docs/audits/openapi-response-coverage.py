@@ -578,7 +578,7 @@ def guards(block: str, position: int, variable: str) -> bool:
         # An early return counts only for a parse after the whole `if`. A
         # parse inside the empty-body arm runs before that return.
         early_return = re.search(r"\breturn\s+Ok\(", unconditional(taken))
-        after_if = position >= end
+        after_if = position >= end and same_scope(block, test.start(), position)
         if not test.group(1) and after_if and early_return and not re.search(ERROR_TOKENS, taken):
             return True
     return False
@@ -654,31 +654,42 @@ def top_level_errs(arms: str) -> list[re.Match]:
     return found
 
 
-# Methods that turn a `Result` error into a value, so the chain goes on.
-TOLERANT_METHODS = frozenset({"ok", "unwrap_or", "unwrap_or_default", "unwrap_or_else"})
+def chain_state(after: str) -> str:
+    """What a method chain on a `Result` does with its error.
 
-
-def chain_rejects(after: str) -> bool:
-    """Whether a method chain on a `Result` stops the handler on its error.
-
-    It does when it reaches `.unwrap()`, `.expect(..)` or a `?` before any call
-    in `TOLERANT_METHODS`. Other methods, such as `.map(..)`, `.and_then(..)`
-    and `.map_err(..)`, carry the error on.
+    The chain moves from a `Result` to an `Option` through `.ok()`, back
+    through `.ok_or(..)` or `.ok_or_else(..)`, and to a plain value through an
+    `.unwrap_or*` call. A `?`, `.unwrap()` or `.expect(..)` on a `Result` or an
+    `Option` stops the handler, so the chain is `"reject"`. A chain that ends
+    on an `Option` or a value is `"tolerate"`. One that ends on a `Result` is
+    `"open"`, since the code after it decides. Other methods carry the error
+    on.
     """
+    state = "result"
     rest = after
     while True:
         rest = rest.lstrip()
         if rest.startswith("?"):
-            return True
+            return "reject"
         call = re.match(r"\.\s*([a-z_][a-z_0-9]*)\s*\(", rest)
         if call is None:
-            return False
-        if call.group(1) in ("unwrap", "expect"):
-            return True
-        if call.group(1) in TOLERANT_METHODS:
-            return False
+            return "open" if state == "result" else "tolerate"
+        method = call.group(1)
+        if method in ("unwrap", "expect") and state != "value":
+            return "reject"
+        if method == "ok" and state == "result":
+            state = "option"
+        elif method in ("ok_or", "ok_or_else") and state == "option":
+            state = "result"
+        elif method in ("unwrap_or", "unwrap_or_default", "unwrap_or_else"):
+            state = "value"
         opener = call.end() - 1
         rest = rest[opener + len(balanced(rest[opener:])) :]
+
+
+def chain_rejects(after: str) -> bool:
+    """Whether a method chain on a `Result` stops the handler on its error."""
+    return chain_state(after) == "reject"
 
 
 def match_arm(arms: str, start: int) -> str:
@@ -705,12 +716,12 @@ def match_arm(arms: str, start: int) -> str:
 def discards_error(before: str, after: str) -> bool:
     """Whether a parse turns its error into a value, so an empty body still runs.
 
-    `.ok()`, `.unwrap_or_default()`, `.unwrap_or(..)` and `.unwrap_or_else(..)`
-    after the call do so. So does `if let Ok(..) =` before it, unless its
-    `else` returns or builds an error. A `match` that handles `Err` is not
-    read, so it counts as mandatory.
+    A method chain after the call does so when `chain_state` ends it on an
+    `Option` or a value, as `.ok()` or `.unwrap_or_default()` does. So does
+    `if let Ok(..) =` before it, unless its `else` returns or builds an error.
+    A `match` that handles `Err` is not read, so it counts as mandatory.
     """
-    if re.match(r"\s*\.(?:ok|unwrap_or_default|unwrap_or|unwrap_or_else)\s*\(", after):
+    if chain_state(after) == "tolerate":
         return True
     tested = r"\b(?:if|while|&&)\s+let\s+Ok\s*\([^()]*\)\s*=\s*(?:serde_json::)?$"
     if re.search(tested, before) is None:
@@ -723,6 +734,21 @@ def discards_error(before: str, after: str) -> bool:
         return True
     otherwise = balanced(rest[rest.index("{") :], "{", "}")
     return not re.search(r"\breturn\b|" + ERROR_TOKENS, otherwise)
+
+
+def same_scope(block: str, start: int, position: int) -> bool:
+    """Whether the block that holds `start` is still open at `position`.
+
+    An `if` nested inside another conditional closes with it, so a parse after
+    that conditional runs on paths the `if` never saw.
+    """
+    depth = 0
+    for char in block[start:position]:
+        depth += char == "{"
+        depth -= char == "}"
+        if depth < 0:
+            return False
+    return True
 
 
 def unconditional(block: str) -> str:
@@ -794,7 +820,7 @@ def struct_fields(struct: str) -> list[tuple[str, str, bool, tuple[str, ...]]]:
     attributes: list[str] = []
     # An attribute that rustfmt splits over several lines stays open until its
     # brackets balance.
-    open_attribute = ""
+    open_attribute = open_field = ""
     for line in struct[opener:].split("\n"):
         text = re.sub(r"/\*.*?\*/", "", line).strip()
         if open_attribute or text.startswith("#["):
@@ -804,8 +830,16 @@ def struct_fields(struct: str) -> list[tuple[str, str, bool, tuple[str, ...]]]:
                 open_attribute = ""
             continue
         text = re.sub(r"//.*$", "", text).strip()
+        if open_field:
+            text, open_field = open_field + " " + text, ""
         if not text or text in ("{", "}"):
             continue
+        # A type that rustfmt wraps over several lines stays open until its
+        # brackets balance.
+        if text.count("<") + text.count("(") > text.count(">") + text.count(")"):
+            open_field = text
+            continue
+        text = re.sub(r"\s*,\s*([>)])", r"\1", re.sub(r"([<(])\s+", r"\1", text))
         field = re.match(r"(?:pub(?:\([^)]*\))?\s+)?(?:r#)?([a-z_0-9]+)\s*:\s*(.+?),?$", text)
         if not field:
             attributes = []
@@ -1470,6 +1504,9 @@ pub fn harvest_api_router() -> Router {
         .route("/e/second-err", post(e_second_err))
         .route("/e/combinator", post(e_combinator))
         .route("/e/tolerant-chain", post(e_tolerant_chain))
+        .route("/e/nested-guard", post(e_nested_guard))
+        .route("/e/ok-then-err", post(e_ok_then_err))
+        .route("/e/wrapped-field", get(e_wrapped_field))
 }
 
 async fn e_wrapped(body: Bytes) -> Response {
@@ -1901,6 +1938,31 @@ async fn e_combinator(body: Result<Json<Gadget>, JsonRejection>) -> Result<Respo
 async fn e_tolerant_chain(body: Result<Json<Gadget>, JsonRejection>) -> Response {
     let name = body.map(|Json(gadget)| gadget.name).ok();
     StatusCode::OK.into_response()
+}
+
+async fn e_nested_guard(body: Bytes) -> Result<Response, Response> {
+    if allow_missing() {
+        if body.is_empty() {
+            return Ok(StatusCode::OK.into_response());
+        }
+    }
+    let gadget = serde_json::from_slice::<Gadget>(&body).map_err(reject)?;
+    Ok(StatusCode::OK.into_response())
+}
+
+async fn e_ok_then_err(body: Bytes) -> Result<Response, Response> {
+    let gadget = serde_json::from_slice::<Gadget>(&body).ok().ok_or_else(missing)?;
+    Ok(StatusCode::OK.into_response())
+}
+
+async fn e_wrapped_field(Query(query): Query<WrappedField>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+struct WrappedField {
+    page: Option<
+        u32,
+    >,
 }
 
 async fn e_documented(Query(query): Query<Documented>) -> Response {
@@ -2881,6 +2943,36 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             ),
         ],
         {"body_required": ["POST /e/combinator: the body is mandatory"]},
+    ),
+    (
+        "an empty-body test inside another if does not guard",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST", "/e/nested-guard", 200, request_body=body_of(("name", True), required=False)
+            )
+        ],
+        {"body_required": ["POST /e/nested-guard: the body is mandatory"]},
+    ),
+    (
+        "an error turned back from ok is not tolerated",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST", "/e/ok-then-err", 200, request_body=body_of(("name", True), required=False)
+            )
+        ],
+        {"body_required": ["POST /e/ok-then-err: the body is mandatory"]},
+    ),
+    (
+        "a field type wrapped over several lines is read as one field",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "GET", "/e/wrapped-field", 200, params=[query_param("page", "integer", False)]
+            )
+        ],
+        {},
     ),
     (
         "a malformed contract entry does not crash the audit",
