@@ -31,14 +31,17 @@ rejects a request that omits one. A field serde accepts but the contract omits
 is missing from the generated client, so an ordinary request cannot be typed.
 
 A handler can also take the raw `Bytes` and call `serde_json::from_slice`
-itself, in its own body or in a helper one level down. Checks 2, 3 and 5 read
-that parse when it reads a parameter of type `Bytes` or `&[u8]`. The type comes
-from a turbofish, then from a typed `let` in the same statement, then from a
+itself. Checks 2, 3 and 5 read that parse when it reads a parameter of type
+`Bytes`, `&[u8]` or `Vec<u8>`. The parse can be in the handler, or in a helper
+one level down that the handler passes the body to. The type comes from a
+turbofish, then from a typed `let` in the same statement, then from a
 `Result<T, _>` return type. A `Value` body is free-form, so the audit skips it.
 
 Check 5 treats a bare `Json<T>` as mandatory, since axum rejects a request
-without it. A raw-byte parse is mandatory unless an `.is_empty()` test on the
-same variable comes first. Check 2 applies only to a mandatory body.
+without it. A raw-byte parse is mandatory unless an `.is_empty()` test lets an
+empty body skip it. `!body.is_empty()` is such a test. So is
+`if body.is_empty() { .. }` when its block returns no error. Check 2 applies
+only to a mandatory body.
 
 Check 4 reads the routes that take a `RawQuery` and parse the pairs by hand. A
 key those parsers match is a parameter the route accepts, so a key the contract
@@ -62,15 +65,20 @@ by a helper is not followed, so this audit is a floor rather than a proof. The
 finding text names the source line, since a status can reach a route through a
 helper it shares.
 
-Check 6 compares each `Query<T>` struct with the route's `in: query`
-parameters. `WIRE_TYPES` gives the OpenAPI type of a field after one `Option` is
-removed. A field is optional when it is an `Option` or has a serde default.
-Serde ignores an unknown query key, so a documented key the struct does not
-have is a finding. The audit reads no serde attribute except `default` and
-`skip`. A `rename` thus shows as a finding, not as a silent pass.
+Check 6 compares every `Query<T>` struct of a route with its `in: query`
+parameters. `WIRE_TYPES` gives the OpenAPI type of a field after the audit
+removes one `Option`. A field is optional when it is an `Option` or has a serde
+default, on the field or on the struct. By default, serde ignores an unknown
+query key, so a documented key that no struct has is a finding.
 
-Check 7 makes the audit fail closed. A body parse with no readable type, or a
-struct the audit cannot find, is a finding and not a skip.
+The audit reads only the serde attributes `default`, `skip` and
+`skip_deserializing`. It ignores `rename` and `rename_all`, so a renamed field
+shows as a finding, not as a silent pass.
+
+Check 7 stops the audit from skipping what it cannot read. These are findings:
+a `from_slice` call it cannot read, a body type it cannot resolve, a
+`Query<..>` extractor it cannot read, and a struct it cannot find. A generic
+struct such as `struct Q<'a>` is one it cannot find.
 
 Exit code 1 on any finding. Run standalone, or run the fixtures:
 
@@ -289,8 +297,8 @@ def overridden_by_with_status(body: str, call_open_paren: int) -> bool:
     return after.lstrip().startswith(".with_status(")
 
 
-# The OpenAPI type of each Rust scalar a query struct uses. An unlisted type is
-# reported, not guessed at.
+# The OpenAPI type of each Rust scalar a query struct uses. The audit reports an
+# unlisted type. It does not guess one.
 WIRE_TYPES = {
     "String": "string",
     "Uuid": "string",
@@ -722,14 +730,16 @@ CHECKS = [
     (
         "unresolved",
         "Unresolved types",
-        "Name each body type in the source, for example `from_slice::<T>(..)`, "
-        "and keep each struct in `autumn-harvest` or `autumn-harvest-plugin`.",
+        "Name each body type in the source, for example `from_slice::<T>(..)`. "
+        "Keep each struct in `autumn-harvest` or `autumn-harvest-plugin`, and "
+        "not generic.",
     ),
     (
         "query_params",
         "Typed query mismatches",
         "Give each `Query<T>` field one entry in the route's `params`, with "
-        "the same name, type and required flag.",
+        "the same name, type and required flag. Add a field type with no "
+        "OpenAPI type to `WIRE_TYPES`.",
     ),
 ]
 
@@ -1147,7 +1157,7 @@ GADGET_BODY = body_of(("name", True))
 
 
 # (name, source, routes, expected findings by check). Each expected string must
-# appear in exactly one finding, and the check must report nothing else.
+# match exactly one finding. The check must report nothing else.
 SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
     (
         "a complete contract is clean",
