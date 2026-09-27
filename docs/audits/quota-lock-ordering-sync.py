@@ -70,7 +70,17 @@ identifier reaches a later loop. Rather than keep enumerating mutating
 shapes to reject — the pattern the next two review rounds fell into —
 `check_call_site_guard` now WHITELISTS the few read-only queries the real
 code needs (`_ALLOWED_READ_ONLY_METHODS`) and fails on any other mention
-of the variable at all between the assignment and the loop.
+of the variable at all between the assignment and the loop. A further
+round found the assignment and loop patterns themselves were too loose
+at their ENDS: `[^;]*?` backtracks through a call chained onto the
+wrapper's own result (`.await?.into_iter().rev().collect()`, still
+matching because the lazy group can expand past the wrapper's own closing
+paren to find some LATER one before the next `;`), and the loop pattern's
+`\b` boundary let an adaptor chained onto the loop's iterable
+(`due_rows.into_iter().rev()`) still count as "in `due_rows`". Matching
+the wrapper's argument list by real paren depth (`find_matching_paren`,
+over the same masked text) and requiring the loop's iterable to be
+exactly `var {` closes both.
 
 Function extraction matches braces through `find_matching_brace`, not a
 raw character count. Codex review on PR #1696 found the raw count could
@@ -297,6 +307,28 @@ def find_matching_brace(text: str, open_index: int) -> int:
     raise ValueError(f"unterminated brace starting at index {open_index}")
 
 
+def find_matching_paren(text: str, open_index: int) -> int:
+    """Return the index just past the `)` matching the `(` at `open_index`.
+
+    Callers pass text already run through `mask_comments_and_strings`, so
+    every `(`/`)` inside a comment, string, or char literal has already
+    been blanked out — a plain depth count over the masked text is safe
+    without re-doing the lexical skipping `find_matching_brace` needs.
+    """
+    n = len(text)
+    depth = 0
+    i = open_index
+    while i < n:
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    raise ValueError(f"unterminated parenthesis starting at index {open_index}")
+
+
 def mask_comments_and_strings(text: str) -> str:
     """Return a same-length copy of `text` with every line comment, block
     comment, and string literal (raw strings included) blanked out to
@@ -427,29 +459,38 @@ def check_call_site_guard(text: str, file_label: str, enclosing_fn: str, wrapper
 
     masked = mask_comments_and_strings(body)
 
-    assign_re = re.compile(
-        r"let\s+(?:mut\s+)?(\w+)\s*=\s*"
-        + re.escape(wrapper_call)
-        + r"\s*\([^;]*?\)\s*(?:\.await)?\s*\??\s*;"
-    )
-    assign_match = assign_re.search(masked)
-    if assign_match is None:
+    call_open_re = re.compile(r"let\s+(?:mut\s+)?(\w+)\s*=\s*" + re.escape(wrapper_call) + r"\s*\(")
+    call_open_match = call_open_re.search(masked)
+    if call_open_match is None:
         return (
             f"{file_label}::{enclosing_fn}: no `let <var> = {wrapper_call}(...);`-shaped "
             "assignment found — a call whose result isn't bound to a variable doesn't "
             "prove the reordered batch is what fires"
         )
 
-    var = assign_match.group(1)
-    loop_re = re.compile(r"for\s+\w+\s+in\s+" + re.escape(var) + r"\b")
-    loop_match = loop_re.search(masked, assign_match.end())
+    var = call_open_match.group(1)
+    call_close = find_matching_paren(masked, call_open_match.end() - 1)
+    tail_match = re.compile(r"\s*(?:\.await)?\s*\??\s*;").match(masked, call_close)
+    if tail_match is None:
+        return (
+            f"{file_label}::{enclosing_fn}: `{wrapper_call}`'s call is not immediately "
+            "followed by `[.await][?];` — a transformation chained onto its result "
+            "(e.g. `.into_iter().rev().collect()`) would not be caught by this check "
+            "if it were accepted here"
+        )
+    assign_end = tail_match.end()
+
+    loop_re = re.compile(r"for\s+\w+\s+in\s+" + re.escape(var) + r"\s*\{")
+    loop_match = loop_re.search(masked, assign_end)
     if loop_match is None:
         return (
             f"{file_label}::{enclosing_fn}: `{wrapper_call}`'s result is bound to `{var}`, "
-            f"but no `for _ in {var}` loop consumes it afterward"
+            f"but no `for _ in {var} {{` loop consumes it directly afterward — a further "
+            "adaptor chained onto the loop's iterable (e.g. `.into_iter().rev()`) would "
+            "not be caught by this check if it were accepted here"
         )
 
-    intervening = masked[assign_match.end() : loop_match.start()]
+    intervening = masked[assign_end : loop_match.start()]
     allowed_read_re = re.compile(
         r"\b" + re.escape(var) + r"\b\s*\.\s*(?:" + "|".join(_ALLOWED_READ_ONLY_METHODS) + r")\s*\(\s*\)"
     )
