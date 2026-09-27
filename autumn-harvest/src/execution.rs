@@ -9534,13 +9534,18 @@ pub async fn check_and_report_unfinished_handlers_batch(
 ) -> HarvestResult<()> {
     for chunk in checks.chunks(UNFINISHED_HANDLER_CHECK_CHUNK) {
         let exec_ids: Vec<ExecutionId> = chunk.iter().map(|(id, _)| *id).collect();
-        let histories = store::load_histories_undecoded_batch(conn, &exec_ids).await?;
+        let mut histories = store::load_histories_undecoded_batch(conn, &exec_ids).await?;
 
         for (exec_id, workflow_name) in chunk {
-            let Some(history) = histories.get(exec_id) else {
+            // `remove`, not `get` + `.clone()` -- review finding on PR #1739
+            // (Codex, P2). Each `exec_id` is looked up at most once per
+            // chunk. Taking ownership here avoids a full deep copy of the
+            // decoded event vector, and its JSON payloads, per execution.
+            // `HistoryMatcher::new` only needs that vector by value.
+            let Some(history) = histories.remove(exec_id) else {
                 continue;
             };
-            let matcher = crate::replay::HistoryMatcher::new(history.events.clone());
+            let matcher = crate::replay::HistoryMatcher::new(history.events);
             let count = matcher.unfinished_update_handler_count_at_end();
             if count > 0 {
                 tracing::warn!(
