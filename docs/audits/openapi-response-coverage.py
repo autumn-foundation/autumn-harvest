@@ -300,19 +300,11 @@ def declared_statuses(route: dict) -> set[int]:
     return statuses
 
 
-def main() -> int:
-    source = API.read_text()
+def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
+    """Every finding, by check. `find_struct` maps a struct name to its block."""
     lines = source.split("\n")
-    contract = json.loads(CONTRACT.read_text())
     by_route = {(r["method"], r["path"]): r for r in contract["routes"]}
-
     routes = router_routes(source)
-    if len(routes) < MIN_ROUTES:
-        print(
-            "openapi-response-coverage: the router parser found only %d routes; "
-            "it has drifted from api.rs" % len(routes)
-        )
-        return 1
 
     findings: list[str] = []
     query_findings: list[str] = []
@@ -412,7 +404,7 @@ def main() -> int:
         )
         if extractor is None or extractor.group(1) == "Value":
             continue
-        struct = struct_body(extractor.group(1))
+        struct = find_struct(extractor.group(1))
         if struct is None:
             continue
         declared = {
@@ -434,6 +426,32 @@ def main() -> int:
                         "not document it" % (method, path, name, extractor.group(1))
                     )
 
+    return {
+        "statuses": sorted(set(findings)),
+        "mandatory": sorted(set(body_findings)),
+        "undocumented": sorted(set(undocumented)),
+        "query_keys": sorted(set(query_findings)),
+    }
+
+
+def main() -> int:
+    source = API.read_text()
+    contract = json.loads(CONTRACT.read_text())
+
+    routes = router_routes(source)
+    if len(routes) < MIN_ROUTES:
+        print(
+            "openapi-response-coverage: the router parser found only %d routes; "
+            "it has drifted from api.rs" % len(routes)
+        )
+        return 1
+
+    found = audit(source, contract, struct_body)
+    findings = found["statuses"]
+    body_findings = found["mandatory"]
+    undocumented = found["undocumented"]
+    query_findings = found["query_keys"]
+
     print("OpenAPI contract coverage — %d routes scanned" % len(routes))
     print("Undeclared statuses: %d" % len(findings))
     print("Unmarked mandatory body fields: %d" % len(body_findings))
@@ -443,18 +461,18 @@ def main() -> int:
         return 0
 
     if findings:
-        print("\nUndeclared statuses:\n" + "\n".join(sorted(set(findings))))
+        print("\nUndeclared statuses:\n" + "\n".join(findings))
         print(
             "\nDeclare each in docs/api-contract.json. A status that carries a "
             "body belongs in additional_responses with its fields; one that does "
             "not belongs in error_responses."
         )
     if body_findings:
-        print("\nUnmarked mandatory body fields:\n" + "\n".join(sorted(set(body_findings))))
+        print("\nUnmarked mandatory body fields:\n" + "\n".join(body_findings))
     if undocumented:
-        print("\nUndocumented body fields:\n" + "\n".join(sorted(set(undocumented))))
+        print("\nUndocumented body fields:\n" + "\n".join(undocumented))
     if query_findings:
-        print("\nUndocumented query keys:\n" + "\n".join(sorted(set(query_findings))))
+        print("\nUndocumented query keys:\n" + "\n".join(query_findings))
         print(
             "\nAdd each to the route's `params` in docs/api-contract.json. An "
             "alias of a documented key needs no entry of its own."
@@ -463,5 +481,131 @@ def main() -> int:
     return 1
 
 
+# A fixture router and its handlers. Each self-test pairs this source with a
+# small contract and names the findings it must produce.
+FIXTURE_SOURCE = r'''
+pub fn harvest_api_router() -> Router {
+    Router::new()
+        .route("/things", post(create_thing))
+        .route("/things/{id}", get(get_thing))
+}
+
+async fn create_thing(Json(body): Json<CreateThing>) -> Response {
+    StatusCode::CREATED.into_response()
+}
+
+async fn get_thing(Path(id): Path<String>) -> Response {
+    if id.is_empty() {
+        return AutumnError::bad_request_msg("empty").into_response();
+    }
+    StatusCode::OK.into_response()
+}
+
+struct CreateThing {
+    name: String,
+    #[serde(default)]
+    note: Option<String>,
+}
+'''
+
+
+def fixture_struct(source: str):
+    """A `find_struct` that reads structs from the fixture source only."""
+
+    def find(name: str) -> str | None:
+        found = re.search(r"\bstruct %s\s*\{" % re.escape(name), source)
+        return balanced(source[found.end() - 1 :], "{", "}") if found else None
+
+    return find
+
+
+def fixture_route(method: str, path: str, status: int, **extra) -> dict:
+    route = {"method": method, "path": path, "success_response": {"status": status}}
+    route.update(extra)
+    return route
+
+
+def body_of(*fields: tuple[str, bool], required: bool = True) -> dict:
+    return {
+        "required": required,
+        "fields": [{"name": name, "required": flag} for name, flag in fields],
+    }
+
+
+# (name, source, routes, expected findings by check). Each expected string must
+# appear in exactly one finding, and the check must report nothing else.
+SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
+    (
+        "a complete contract is clean",
+        FIXTURE_SOURCE,
+        [
+            fixture_route(
+                "POST", "/things", 201, request_body=body_of(("name", True), ("note", False))
+            ),
+            fixture_route("GET", "/things/{id}", 200, error_responses=[{"status": 400}]),
+        ],
+        {},
+    ),
+    (
+        "an AutumnError constructor status is required",
+        FIXTURE_SOURCE,
+        [
+            fixture_route(
+                "POST", "/things", 201, request_body=body_of(("name", True), ("note", False))
+            ),
+            fixture_route("GET", "/things/{id}", 200),
+        ],
+        {"statuses": ["GET /things/{id} returns 400 via AutumnError::bad_request_msg"]},
+    ),
+    (
+        "a mandatory Json field is marked required",
+        FIXTURE_SOURCE,
+        [
+            fixture_route(
+                "POST", "/things", 201, request_body=body_of(("name", False), ("note", False))
+            ),
+            fixture_route("GET", "/things/{id}", 200, error_responses=[{"status": 400}]),
+        ],
+        {"mandatory": ["POST /things: `name` is mandatory in CreateThing"]},
+    ),
+    (
+        "an accepted Json field is documented",
+        FIXTURE_SOURCE,
+        [
+            fixture_route("POST", "/things", 201, request_body=body_of(("name", True))),
+            fixture_route("GET", "/things/{id}", 200, error_responses=[{"status": 400}]),
+        ],
+        {"undocumented": ["POST /things: `note` is accepted by CreateThing"]},
+    ),
+]
+
+
+def self_test() -> int:
+    """Run each fixture through `audit` and compare the findings."""
+    failures = 0
+    for name, source, routes, expected in SELF_TESTS:
+        found = audit(source, {"routes": routes}, fixture_struct(source))
+        problems: list[str] = []
+        for check, reported in found.items():
+            wanted = expected.get(check, [])
+            for needle in wanted:
+                hits = [finding for finding in reported if needle in finding]
+                if len(hits) != 1:
+                    problems.append("%s: want one finding with %r" % (check, needle))
+            extra = [f for f in reported if not any(needle in f for needle in wanted)]
+            problems += ["%s: unexpected %s" % (check, f.strip()) for f in extra]
+        for check in expected.keys() - found.keys():
+            problems.append("%s: no such check" % check)
+        status = "ok" if not problems else "FAIL"
+        print("%s  %s" % (status, name))
+        for problem in problems:
+            print("      " + problem)
+        failures += bool(problems)
+    print("\nOK: self-test passed." if not failures else "\n%d self-test failure(s)." % failures)
+    return 1 if failures else 0
+
+
 if __name__ == "__main__":
+    if sys.argv[1:] == ["--self-test"]:
+        sys.exit(self_test())
     sys.exit(main())
