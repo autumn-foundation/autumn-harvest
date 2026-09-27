@@ -2144,6 +2144,8 @@ struct LeaseSwitchDispatch {
     saves: std::sync::Mutex<Vec<(String, Option<String>)>>,
     /// Task ids of each publish call, in order.
     publishes: std::sync::Mutex<Vec<Vec<uuid::Uuid>>>,
+    /// Consumer that holds each granted queue.
+    holders: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
 #[async_trait::async_trait]
@@ -2194,7 +2196,7 @@ impl TaskDispatch for LeaseSwitchDispatch {
     async fn hold_reconcile_leases(
         &self,
         queues: &[String],
-        _consumer: &str,
+        consumer: &str,
         _ttl: Duration,
     ) -> autumn_harvest::HarvestResult<Vec<autumn_harvest::dispatch::ReconcileLease>> {
         if std::sync::atomic::AtomicBool::load(&self.fail_lease, Ordering::SeqCst) {
@@ -2206,11 +2208,16 @@ impl TaskDispatch for LeaseSwitchDispatch {
             return Ok(Vec::new());
         }
         let cursors = self.cursors.lock().expect("cursors");
+        let mut holders = self.holders.lock().expect("holders");
         Ok(queues
             .iter()
-            .map(|queue| autumn_harvest::dispatch::ReconcileLease {
-                queue: queue.clone(),
-                cursor: cursors.get(queue).cloned(),
+            .map(|queue| {
+                let previous = holders.insert(queue.clone(), consumer.to_owned());
+                autumn_harvest::dispatch::ReconcileLease {
+                    queue: queue.clone(),
+                    cursor: cursors.get(queue).cloned(),
+                    renewed: previous.as_deref() == Some(consumer),
+                }
             })
             .collect())
     }

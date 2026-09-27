@@ -25993,6 +25993,42 @@ const DISPATCH_CALL_TIMEOUT: Duration = Duration::from_secs(5);
 /// queues unswept for at most this many periods, then a peer takes over.
 const RECONCILE_LEASE_INTERVALS: u32 = 3;
 
+/// Apply a lease's saved cursor to the local walk (issue #1429).
+///
+/// A renewal keeps the local cursor, which is at least as new as the saved
+/// one. A lease that changed hands adopts the saved cursor. An empty or
+/// unreadable one clears the local cursor, so the walk starts at the top.
+fn apply_reconcile_lease(
+    cursors: &mut std::collections::HashMap<String, crate::queue::DispatchCursor>,
+    lease: &crate::dispatch::ReconcileLease,
+) {
+    if lease.renewed {
+        return;
+    }
+    match lease
+        .cursor
+        .as_deref()
+        .and_then(crate::queue::DispatchCursor::decode)
+    {
+        Some(cursor) => {
+            cursors.insert(lease.queue.clone(), cursor);
+        }
+        None => {
+            cursors.remove(&lease.queue);
+        }
+    }
+}
+
+/// Keep only the queues whose lease a renewal still holds (issue #1429).
+fn retain_renewed(
+    leased: &mut Vec<String>,
+    hints: &mut Vec<crate::dispatch::DispatchHint>,
+    renewed: &[crate::dispatch::ReconcileLease],
+) {
+    leased.retain(|queue| renewed.iter().any(|lease| &lease.queue == queue));
+    hints.retain(|hint| leased.contains(&hint.queue_name));
+}
+
 /// How often a worker renews its sweep leases (issue #1429).
 ///
 /// The worker renews once per loop iteration. An idle iteration blocks on the
@@ -28618,7 +28654,7 @@ impl Worker {
         installed: &crate::dispatch::InstalledDispatch,
         state: &mut DispatchLoopState,
     ) -> bool {
-        let (leased, lease_held) = self.reconcile_lease_queues(installed, state).await;
+        let (mut leased, lease_held) = self.reconcile_lease_queues(installed, state).await;
         let held_at = std::time::Instant::now();
         let mut conn = match acquire_shard_conn(
             pool,
@@ -28669,9 +28705,13 @@ impl Worker {
             };
         }
         // Slow page reads can outlast a lease. A renewal keeps a peer from
-        // sweeping the same queues while this sweep publishes.
-        if lease_held && held_at.elapsed() >= reconcile_lease_period(&installed.settings) {
-            let _ = self.hold_reconcile_leases(installed, &leased).await;
+        // sweeping the same queues while this sweep publishes. A queue a peer
+        // took meanwhile is the peer's to publish.
+        if lease_held
+            && held_at.elapsed() >= reconcile_lease_period(&installed.settings)
+            && let Ok(renewed) = self.hold_reconcile_leases(installed, &leased).await
+        {
+            retain_renewed(&mut leased, &mut hints, &renewed);
         }
 
         // The throttle metrics ride on this sweep. The Postgres poll path
@@ -28724,8 +28764,9 @@ impl Worker {
     /// floor, so the lease fails open: a lease call that fails sweeps every
     /// queue, and the flag is `false`.
     ///
-    /// A lease carries the cursor its last holder saved. That cursor replaces
-    /// this worker's own, so a hand-over resumes the walk.
+    /// A lease that changed hands carries the cursor its last holder saved.
+    /// That cursor replaces this worker's own, so a hand-over resumes the
+    /// walk. See [`apply_reconcile_lease`].
     async fn reconcile_lease_queues(
         &self,
         installed: &crate::dispatch::InstalledDispatch,
@@ -28736,17 +28777,8 @@ impl Worker {
             .await;
         match held {
             Ok(leases) => {
-                // A saved cursor is the last holder's progress, so it wins over
-                // this worker's own. A lease with no saved cursor keeps the
-                // local one.
                 for lease in &leases {
-                    if let Some(cursor) = lease
-                        .cursor
-                        .as_deref()
-                        .and_then(crate::queue::DispatchCursor::decode)
-                    {
-                        state.reconcile_cursors.insert(lease.queue.clone(), cursor);
-                    }
+                    apply_reconcile_lease(&mut state.reconcile_cursors, lease);
                 }
                 (leases.into_iter().map(|lease| lease.queue).collect(), true)
             }
@@ -42263,6 +42295,85 @@ mod tests {
             !degraded.is_degraded(),
             "a cooldown of zero is elapsed at once, so the next iteration probes the channel"
         );
+    }
+
+    fn lease(queue: &str, cursor: Option<&str>, renewed: bool) -> crate::dispatch::ReconcileLease {
+        crate::dispatch::ReconcileLease {
+            queue: queue.to_owned(),
+            cursor: cursor.map(str::to_owned),
+            renewed,
+        }
+    }
+
+    fn cursor_at(priority: i32) -> crate::queue::DispatchCursor {
+        crate::queue::DispatchCursor {
+            priority,
+            scheduled_at: chrono::DateTime::from_timestamp_micros(1_790_000_000_000_000)
+                .expect("time"),
+            id: uuid::Uuid::new_v4(),
+        }
+    }
+
+    /// A renewal keeps the local cursor. A lease that changed hands adopts
+    /// the saved one, and an empty saved cursor clears the local one
+    /// (issue #1429).
+    #[test]
+    fn a_lease_hand_over_adopts_the_saved_cursor() {
+        let local = cursor_at(1);
+        let saved = cursor_at(2);
+        let mut cursors = std::collections::HashMap::new();
+
+        cursors.insert("q".to_owned(), local.clone());
+        apply_reconcile_lease(&mut cursors, &lease("q", Some(&saved.encode()), true));
+        assert_eq!(
+            cursors.get("q"),
+            Some(&local),
+            "a renewal keeps its own cursor"
+        );
+
+        apply_reconcile_lease(&mut cursors, &lease("q", Some(&saved.encode()), false));
+        assert_eq!(
+            cursors.get("q"),
+            Some(&saved),
+            "a new holder adopts the saved cursor"
+        );
+
+        apply_reconcile_lease(&mut cursors, &lease("q", None, false));
+        assert_eq!(
+            cursors.get("q"),
+            None,
+            "an empty saved cursor restarts the walk"
+        );
+
+        cursors.insert("q".to_owned(), local);
+        apply_reconcile_lease(&mut cursors, &lease("q", Some("junk"), false));
+        assert_eq!(
+            cursors.get("q"),
+            None,
+            "an unreadable cursor restarts the walk"
+        );
+    }
+
+    /// A queue a peer took during a slow sweep loses its hints and its save
+    /// (issue #1429).
+    #[test]
+    fn a_renewal_drops_the_queues_a_peer_took() {
+        let hint = |queue: &str| crate::dispatch::DispatchHint {
+            task_id: uuid::Uuid::new_v4(),
+            queue_name: queue.to_owned(),
+            scheduled_at: chrono::Utc::now(),
+            priority: 0,
+            shard: None,
+            kind: None,
+        };
+        let mut leased = vec!["a".to_owned(), "b".to_owned()];
+        let mut hints = vec![hint("a"), hint("b"), hint("b")];
+
+        retain_renewed(&mut leased, &mut hints, &[lease("a", None, true)]);
+
+        assert_eq!(leased, vec!["a".to_owned()]);
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].queue_name, "a");
     }
 
     #[cfg(feature = "testing")]

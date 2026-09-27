@@ -853,11 +853,7 @@ impl RedisDispatch {
         Ok(queues
             .iter()
             .zip(replies)
-            .filter(|(_, reply)| reply != LEASE_NOT_HELD)
-            .map(|(queue, reply)| ReconcileLease {
-                queue: queue.clone(),
-                cursor: (!reply.is_empty()).then_some(reply),
-            })
+            .filter_map(|(queue, reply)| parse_lease_reply(queue, &reply))
             .collect())
     }
 
@@ -1266,6 +1262,23 @@ fn entry_payload(map: &HashMap<String, redis::Value>) -> Option<String> {
     }
 }
 
+/// Read one hold reply. `None` means a peer holds the lease.
+fn parse_lease_reply(queue: &str, reply: &str) -> Option<ReconcileLease> {
+    if reply == LEASE_NOT_HELD {
+        return None;
+    }
+    let (renewed, cursor) = if let Some(cursor) = reply.strip_prefix(LEASE_RENEWED) {
+        (true, cursor)
+    } else {
+        (false, reply.strip_prefix(LEASE_TAKEN).unwrap_or(""))
+    };
+    Some(ReconcileLease {
+        queue: queue.to_owned(),
+        cursor: (!cursor.is_empty()).then(|| cursor.to_owned()),
+        renewed,
+    })
+}
+
 /// One `Option` per reply, or the last error when every reply failed.
 fn settle_replies<T>(replies: Vec<redis::RedisResult<T>>) -> RedisAdapterResult<Vec<Option<T>>> {
     let mut last_error = None;
@@ -1377,6 +1390,12 @@ return written
 /// The hold reply for a lease a peer holds.
 const LEASE_NOT_HELD: &str = "-";
 
+/// Hold reply prefix for a lease the caller already held.
+const LEASE_RENEWED: &str = "R:";
+
+/// Hold reply prefix for a lease that just changed hands.
+const LEASE_TAKEN: &str = "F:";
+
 /// Lifetime of a saved sweep cursor, in seconds.
 ///
 /// A cursor outlives its lease, so a holder that dies still hands its walk
@@ -1391,22 +1410,23 @@ const RECONCILE_CURSOR_TTL_SECS: u64 = 3_600;
 /// peer holds stays with the peer.
 ///
 /// The reply holds one string per queue. It is `-` when a peer holds the
-/// lease. Otherwise it is the saved cursor, or empty when none is saved.
+/// lease. Otherwise it is `R:` for a renewal or `F:` for a new holder,
+/// followed by the saved cursor, which may be empty.
 const HOLD_LEASE_LUA: &str = r"
 local n = #KEYS / 2
 local held = {}
 for i = 1, n do
     local owner = redis.call('GET', KEYS[i])
-    local mine = false
+    local tag = nil
     if not owner then
         redis.call('SET', KEYS[i], ARGV[1], 'PX', ARGV[2])
-        mine = true
+        tag = 'F:'
     elseif owner == ARGV[1] then
         redis.call('PEXPIRE', KEYS[i], ARGV[2])
-        mine = true
+        tag = 'R:'
     end
-    if mine then
-        held[i] = redis.call('GET', KEYS[n + i]) or ''
+    if tag then
+        held[i] = tag .. (redis.call('GET', KEYS[n + i]) or '')
     else
         held[i] = '-'
     end
@@ -1592,6 +1612,19 @@ mod tests {
     #[test]
     fn promote_script_compiles() {
         let _ = Script::new(PROMOTE_MARKED_LUA);
+    }
+
+    /// A hold reply says who holds the lease, whether it changed hands, and
+    /// which cursor was saved (issue #1429).
+    #[test]
+    fn a_lease_reply_reads_as_ownership_and_cursor() {
+        assert_eq!(parse_lease_reply("q", "-"), None);
+        let renewed = parse_lease_reply("q", "R:1|2|3").expect("held");
+        assert!(renewed.renewed);
+        assert_eq!(renewed.cursor.as_deref(), Some("1|2|3"));
+        let taken = parse_lease_reply("q", "F:").expect("held");
+        assert!(!taken.renewed);
+        assert_eq!(taken.cursor, None);
     }
 
     /// A failed queue keeps its own slot. The other replies survive, so a

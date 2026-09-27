@@ -230,8 +230,10 @@ lease TTL is three times the larger of `reconcile_interval_ms` and
 
 After a successful sweep the holder saves each queue's cursor in Redis, beside
 the lease. A new holder resumes from that cursor, so a hand-over does not
-restart the walk. A sweep whose page reads outlast one renewal period renews
-its leases before it publishes. A due row that
+restart the walk. A worker that gets a lease back after a peer's sweep takes
+the peer's cursor, and an empty one starts the walk at the top. A sweep whose
+page reads outlast one renewal period renews its leases before it publishes.
+It publishes only the queues it still holds. A due row that
 the channel does not hold is published on a later sweep, usually the next one.
 A backlog deeper than `reconcile_batch` takes one interval per page.
 

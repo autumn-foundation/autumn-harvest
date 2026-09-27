@@ -48,7 +48,8 @@ so each one gets its own issue.
 | Redis fails in the middle of a sweep | The worker makes no further Redis call for that sweep. The lease expires after its TTL, and a peer takes the queue. |
 | A lease holder shuts down | The worker releases its leases on stop, best effort. A lease it fails to release expires after its TTL. |
 | A lease moves to a peer, and the sweep walk restarts at the head of the backlog | The holder saves each cursor in Redis after a successful sweep. A new holder resumes from it. |
-| Slow page reads outlast the lease, and a peer sweeps the same queue | A sweep whose reads take longer than one renewal period renews its leases before it publishes. |
+| Slow page reads outlast the lease, and a peer sweeps the same queue | A sweep whose reads take longer than one renewal period renews its leases before it publishes. It publishes only the queues the renewal still holds. |
+| A worker gets a lease back and resumes from its own stale cursor | The hold reply says whether the lease changed hands. A new holder adopts the saved cursor, and an empty one clears the local cursor. |
 | Redis refuses the lease call | The worker sweeps anyway. The floor fails open. |
 | A peer serves a different queue set | The lease is per queue, so each queue has its own holder among the workers that poll it. |
 | `reconcile_batch = 0` stalls the cursor, or a huge batch reads a whole deep backlog in one query | Validation requires 1 to 10000. |

@@ -118,6 +118,9 @@ pub struct ReconcileLease {
     pub queue: String,
     /// The sweep cursor the last holder saved, if any.
     pub cursor: Option<String>,
+    /// True when the caller already held the lease, so its own cursor is the
+    /// latest. False when the lease just changed hands.
+    pub renewed: bool,
 }
 
 /// Counters returned by one maintenance pass.
@@ -222,8 +225,8 @@ pub trait TaskDispatch: Send + Sync + std::fmt::Debug {
     /// fleet from reading the same rows once per worker. Each lease carries
     /// the cursor the last holder saved, so a new holder resumes the walk.
     ///
-    /// The default grants every lease with no cursor, so every worker sweeps
-    /// every queue from its own cursor. A wrapper must forward this method,
+    /// The default grants every lease as a renewal with no cursor, so every
+    /// worker sweeps every queue from its own cursor. A wrapper must forward this method,
     /// [`Self::save_reconcile_cursors`] and [`Self::release_reconcile_leases`],
     /// or it turns the lease off.
     async fn hold_reconcile_leases(
@@ -238,6 +241,7 @@ pub trait TaskDispatch: Send + Sync + std::fmt::Debug {
             .map(|queue| ReconcileLease {
                 queue: queue.clone(),
                 cursor: None,
+                renewed: true,
             })
             .collect())
     }
@@ -1563,7 +1567,11 @@ mod tests {
             .expect("hold");
 
         let names = |leases: Vec<ReconcileLease>| -> Vec<String> {
-            assert!(leases.iter().all(|lease| lease.cursor.is_none()));
+            assert!(
+                leases
+                    .iter()
+                    .all(|lease| lease.cursor.is_none() && lease.renewed)
+            );
             leases.into_iter().map(|lease| lease.queue).collect()
         };
         assert_eq!(names(held), queues);
