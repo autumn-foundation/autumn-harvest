@@ -7405,7 +7405,13 @@
       "request_body": {
         "required": false,
         "free_form": false,
-        "fields": []
+        "fields": [
+          {
+            "name": "reason",
+            "required": false,
+            "description": "Accepted for symmetry with pause, then ignored. Resume clears pause_reason."
+          }
+        ]
       },
       "success_response": {
         "status": 200,

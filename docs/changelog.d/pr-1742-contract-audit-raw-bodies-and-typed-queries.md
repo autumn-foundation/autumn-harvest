@@ -27,6 +27,10 @@ it before the scan. The fixtures also pin checks 1 and 4, which had none.
 The audit now indexes functions and structs once. A run takes about 2 s,
 not about 2 min 30 s. The speed change alone does not change any finding.
 
-No engine, schema or contract change. The real contract passes every
-check. Each of six defects seeded into a copy of the contract fails the
-audit.
+**Contract.** The stricter check 3 found one gap.
+`POST /admin/schedules/{id}/resume` accepts `reason` through
+`PauseResumeRequest`, but the contract listed no fields. The contract now
+documents it as accepted and ignored, since resume clears `pause_reason`.
+
+No engine or schema change. The real contract passes every check. Each of
+six defects seeded into a copy of the contract fails the audit.

@@ -26,10 +26,12 @@ scan already requires. A constructor passed bare, as in
 `.with_status(..)`: its status is always the constructor's own.
 
 Checks 2 and 3 resolve each `Json<T>` extractor to its struct, with or without
-a path such as `axum::Json`. A field is
-mandatory when it is neither an `Option` nor carries a serde default, since axum
-rejects a request that omits one. A field serde accepts but the contract omits
-is missing from the generated client, so an ordinary request cannot be typed.
+a path such as `axum::Json`. A field is mandatory when it is neither an
+`Option` nor carries a serde default, since axum rejects a request that omits
+one. A field serde accepts but the contract omits is missing from the
+generated client, so an ordinary request cannot be typed. Check 3 skips only a
+body the contract marks `free_form`. An empty field list on any other body is
+checked.
 
 A handler can also take the raw `Bytes` and call `serde_json::from_slice`
 itself. Checks 2, 3 and 5 read that parse when it reads a parameter of type
@@ -90,8 +92,10 @@ a `from_slice` call it cannot read, a body type it cannot resolve, a
 `Json<..>` or `Query<..>` extractor it cannot read, and a struct it cannot
 find. A generic struct such as `struct Q<'a>` is one it cannot find.
 
-A handler is found from its `async fn` line, so an earlier fn of the same name
-does not hide it. Comments in a parameter list are removed before any read.
+A helper called by bare name is found as a free function, so an earlier method
+of the same name does not hide it. A handler is found from its `async fn`
+line, so an earlier fn of the same name does not hide it. Comments in a
+parameter list are removed before any read.
 
 Exit code 1 on any finding. Run standalone, or run the fixtures:
 
@@ -223,11 +227,22 @@ def function_body(source: str, name: str) -> str | None:
 
 @functools.lru_cache(maxsize=None)
 def defined_functions(source: str) -> dict[str, int]:
-    """Where each function in the source is first defined, by name."""
-    starts: dict[str, int] = {}
+    """Where each function in the source is defined, by name.
+
+    A free function at the start of a line wins over an indented method of the
+    same name, since a call by bare name reaches the free function. A name
+    with no free function falls back to its first definition.
+    """
+    free: dict[str, int] = {}
+    first: dict[str, int] = {}
     for found in re.finditer(r"\b(?:async )?fn ([A-Za-z_][A-Za-z_0-9]*)\s*[(<]", source):
-        starts.setdefault(found.group(1), found.start())
-    return starts
+        name = found.group(1)
+        first.setdefault(name, found.start())
+        line_start = source.rfind("\n", 0, found.start()) + 1
+        prefix = source[line_start : found.start()]
+        if re.fullmatch(r"(?:pub(?:\([^)]*\))?\s+)?(?:const\s+)?(?:unsafe\s+)?", prefix):
+            free.setdefault(name, found.start())
+    return {**first, **free}
 
 
 def called_helpers(source: str, body: str) -> list[str]:
@@ -542,10 +557,31 @@ def rejects_result_body(params: str, block: str) -> bool:
         return True
     for match in re.finditer(r"\bmatch\s+%s\s*\{" % variable, block):
         arms = balanced(block[match.end() - 1 :], "{", "}")
-        failure = arms.find("Err(")
-        if failure >= 0 and re.search(ERROR_TOKENS, arms[failure + len("Err(") :]):
+        failure = re.search(r"\bErr\s*\(", arms)
+        if failure and re.search(ERROR_TOKENS, match_arm(arms, failure.start())):
             return True
     return False
+
+
+def match_arm(arms: str, start: int) -> str:
+    """The text of the `match` arm whose pattern starts at `start`.
+
+    The arm runs from its `=>` to the end of its block, or to the next comma
+    at the top level of the arm list.
+    """
+    arrow = arms.find("=>", start)
+    if arrow < 0:
+        return ""
+    rest = arms[arrow + 2 :]
+    if rest.lstrip().startswith("{"):
+        return balanced(rest[rest.index("{") :], "{", "}")
+    depth = 0
+    for index, char in enumerate(rest):
+        depth += char in "([{"
+        depth -= char in ")]}"
+        if depth < 0 or (char == "," and depth == 0):
+            return rest[:index]
+    return rest
 
 
 def discards_error(before: str, after: str) -> bool:
@@ -883,8 +919,9 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
                         "  %s %s: `%s` is mandatory in %s but the contract does not "
                         "mark it required" % (method, path, spellings[0], name)
                     )
-            # An empty field list is a free-form body, documented by prose.
-            if declared:
+            # A free-form body is documented by prose, so its fields are not
+            # checked. An empty field list on any other body is checked.
+            if not request_body.get("free_form"):
                 for spellings in accepted_fields(struct):
                     if documented_as(spellings, declared) is None:
                         undocumented.append(
@@ -1268,6 +1305,9 @@ pub fn harvest_api_router() -> Router {
         .route("/e/result-replay", post(e_result_replay))
         .route("/e/split-container", get(e_split_container))
         .route("/e/split-default", get(e_split_default))
+        .route("/e/shadowed", post(e_shadowed))
+        .route("/e/empty-fields", post(e_empty_fields))
+        .route("/e/err-first", post(e_err_first))
 }
 
 async fn e_wrapped(body: Bytes) -> Response {
@@ -1522,6 +1562,38 @@ struct SplitContainer {
 )]
 struct SplitDefault {
     kind: String,
+}
+
+impl Codec {
+    fn parse_gadget(&self, raw: &[u8]) -> u32 {
+        7
+    }
+}
+
+fn parse_gadget(body: &[u8]) -> Result<Gadget, Response> {
+    serde_json::from_slice::<Gadget>(body).map_err(reject)
+}
+
+async fn e_shadowed(body: Bytes) -> Response {
+    let gadget = parse_gadget(&body);
+    StatusCode::OK.into_response()
+}
+
+async fn e_empty_fields(body: Option<Json<Gadget>>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn e_err_first(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    let gadget = match body {
+        Err(rejection) => return replay_committed(rejection).await,
+        Ok(Json(gadget)) => {
+            if gadget.name.is_empty() {
+                return AutumnError::bad_request_msg("a name is required").into_response();
+            }
+            gadget
+        }
+    };
+    StatusCode::OK.into_response()
 }
 
 async fn e_wrapped_attribute(Query(query): Query<WrappedAttribute>) -> Response {
@@ -2206,6 +2278,56 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             ),
         ],
         {"unresolved": ["GET /e/split-container: cannot read `rename_all` in SplitContainer"]},
+    ),
+    (
+        "a free helper is found past an earlier method of the same name",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST", "/e/shadowed", 200, request_body=body_of(("name", True), required=False)
+            )
+        ],
+        {"body_required": ["POST /e/shadowed: the body is mandatory"]},
+    ),
+    (
+        "an empty field list is checked unless the body is free-form",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/empty-fields",
+                200,
+                request_body={"required": False, "free_form": False, "fields": []},
+            )
+        ],
+        {"undocumented": ["POST /e/empty-fields: `name` is accepted by Gadget"]},
+    ),
+    (
+        "a free-form body skips the field checks",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/empty-fields",
+                200,
+                request_body={"required": False, "free_form": True, "fields": []},
+            )
+        ],
+        {},
+    ),
+    (
+        "only the Err arm decides whether a Result<Json<T>> body is mandatory",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/err-first",
+                200,
+                request_body=body_of(("name", False), required=False),
+                error_responses=[{"status": 400}],
+            )
+        ],
+        {},
     ),
     (
         "a malformed contract entry does not crash the audit",
