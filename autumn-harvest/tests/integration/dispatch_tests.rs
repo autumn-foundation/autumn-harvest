@@ -2220,12 +2220,14 @@ impl TaskDispatch for LeaseSwitchDispatch {
         _consumer: &str,
         cursors: &[(String, Option<String>)],
     ) -> autumn_harvest::HarvestResult<()> {
-        let mut stored = self.cursors.lock().expect("cursors");
-        for (queue, cursor) in cursors {
-            match cursor {
-                Some(cursor) => stored.insert(queue.clone(), cursor.clone()),
-                None => stored.remove(queue),
-            };
+        {
+            let mut stored = self.cursors.lock().expect("cursors");
+            for (queue, cursor) in cursors {
+                match cursor {
+                    Some(cursor) => stored.insert(queue.clone(), cursor.clone()),
+                    None => stored.remove(queue),
+                };
+            }
         }
         self.saves
             .lock()
@@ -2397,18 +2399,18 @@ async fn a_new_lease_holder_resumes_the_walk_from_the_saved_cursor() {
     let claimable = workflow_task_id(&mut conn, exec_id).await;
 
     let batch = 100;
-    let first = autumn_harvest::queue::due_dispatch_hints_page(&mut conn, &queue, batch, None)
+    let page_one = autumn_harvest::queue::due_dispatch_hints_page(&mut conn, &queue, batch, None)
         .await
         .expect("first page");
-    let second = autumn_harvest::queue::due_dispatch_hints_page(
+    let page_two = autumn_harvest::queue::due_dispatch_hints_page(
         &mut conn,
         &queue,
         batch,
-        first.cursor.as_ref(),
+        page_one.cursor.as_ref(),
     )
     .await
     .expect("second page");
-    let saved = second.cursor.expect("a full page carries a cursor");
+    let resume_at = page_two.cursor.expect("a full page carries a cursor");
 
     let channel = Arc::new(LeaseSwitchDispatch::default());
     channel.grant.store(true, Ordering::SeqCst);
@@ -2416,7 +2418,7 @@ async fn a_new_lease_holder_resumes_the_walk_from_the_saved_cursor() {
         .cursors
         .lock()
         .expect("cursors")
-        .insert(queue.clone(), saved.encode());
+        .insert(queue.clone(), resume_at.encode());
     autumn_harvest::dispatch::install(
         Arc::clone(&channel) as Arc<dyn TaskDispatch>,
         DispatchSettings {
@@ -2441,14 +2443,15 @@ async fn a_new_lease_holder_resumes_the_walk_from_the_saved_cursor() {
     .await;
 
     let publishes = channel.publishes.lock().expect("publish log").clone();
-    let first_sweep = publishes.first().expect("the sweep publishes");
+    assert!(!publishes.is_empty(), "the sweep publishes");
+    let first_sweep = &publishes[0];
     assert!(
         first_sweep.contains(&claimable),
         "the first sweep must resume at the third page"
     );
-    let first_page: Vec<uuid::Uuid> = first.hints.iter().map(|hint| hint.task_id).collect();
+    let page_one_ids: Vec<uuid::Uuid> = page_one.hints.iter().map(|hint| hint.task_id).collect();
     assert!(
-        first_sweep.iter().all(|id| !first_page.contains(id)),
+        first_sweep.iter().all(|id| !page_one_ids.contains(id)),
         "the first sweep must not restart at the top"
     );
     let saves = channel.saves.lock().expect("saves").clone();
