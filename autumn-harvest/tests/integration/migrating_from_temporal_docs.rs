@@ -271,6 +271,503 @@ fn comparison_page_links_back_to_the_migration_guide() {
     );
 }
 
+/// Issue #1219, gap 1: a schedule-driven workflow type bypasses the
+/// app-level cutover flag entirely, since the Temporal server starts its
+/// executions directly. The playbook must say so, and must send the reader
+/// to harvest's own schedule pause and catchup primitives rather than leave
+/// them to guess.
+///
+/// Five PR reviews (Codex, all P1) found real defects here. The first said
+/// Temporal exposes a per-firing list an operator can inspect and accept or
+/// reject; it does not. The second said harvest's `CatchupPolicy::SkipAll`
+/// suppresses an entire missed interval; it does not, it fires the oldest
+/// slot. The third found the "pause after create" sequence this fix then
+/// tried left a race window for a scheduler tick to fire into. The fourth
+/// found a gap in that fix too. Letting the reader create the harvest
+/// schedule "any time before" cutover, even paused, still let a slot come
+/// due and fire on resume. The fix now creates the harvest schedule
+/// already paused, at the cutover timestamp itself, so no slot is ever
+/// due before it exists. The fifth found a side effect of that fix.
+/// Creating a schedule at an arbitrary cutover timestamp re-anchors an
+/// interval schedule's phase. `Schedule::Interval` computes its first
+/// slot from the creation moment, not from the original schedule's own
+/// phase.
+///
+/// A thirteenth review found the interval-phase advice itself does not
+/// hold up. Picking a cutover timestamp to land on the original phase
+/// assumes the reader can choose the actual insert moment.
+/// `WorkflowSchedule` and its create request take no such anchor.
+/// `Utc::now()` at the real insert sets the phase instead, later still
+/// once request and database latency are added in.
+///
+/// Capturing which engine owns a schedule-driven type's executions,
+/// and reconciling that capture, is covered separately below by
+/// `dual_run_playbook_covers_schedule_driven_capture_and_reconciliation`.
+#[test]
+fn dual_run_playbook_covers_schedule_driven_cutover() {
+    let guide = read_doc(GUIDE_PATH);
+    let playbook = flatten_whitespace(section_body(&guide, "## Dual-run cutover playbook"));
+
+    assert!(
+        playbook.contains("Temporal Schedule"),
+        "the playbook must name the schedule-driven-type gap (issue #1219): the Temporal \
+         server starts a Temporal Schedule's executions directly, bypassing the app-level flag"
+    );
+    assert!(
+        playbook.contains("CatchupWindow"),
+        "the playbook must name Temporal's real per-schedule catchup primitive, not an \
+         invented per-firing accept/reject list (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains("cutover timestamp"),
+        "the playbook must gate the missed interval and the harvest schedule's activation on \
+         one defined cutover timestamp, not on pausing alone (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains("WorkflowSchedule::with_paused(true)"),
+        "the playbook must create the harvest schedule already paused, in the same insert, \
+         not enabled-then-paused -- the gap a scheduler tick could fire into (issue #1219, \
+         PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains("An interval schedule re-anchors its phase to that creation moment")
+            && playbook.contains("Schedule::Cron"),
+        "the playbook must warn that `Schedule::Interval` re-anchors its phase to the \
+         creation moment, and offer `Schedule::Cron` for a cadence whose phase must survive \
+         the cutover (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains(
+            "Neither `WorkflowSchedule` nor its create request accepts that \
+             moment as an input"
+        ) && playbook.contains("You cannot choose it to land on the original phase"),
+        "the playbook must not imply the reader can pick a cutover timestamp to land an \
+         interval schedule on its original phase -- neither `WorkflowSchedule` nor its create \
+         request takes an anchor, the actual insert moment is `Utc::now()` at registration, \
+         and request/database latency moves it later still (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains("Do not create the harvest schedule earlier and leave it paused"),
+        "the playbook must not let the reader create the harvest schedule ahead of the \
+         cutover timestamp even paused, since a slot can still come due and fire on resume \
+         (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains("SkipAll` still fires the oldest missed slot"),
+        "the playbook must correct the record: `CatchupPolicy::SkipAll` still fires one slot, \
+         it does not suppress an entire missed interval (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains("/admin/schedules/{id}/resume"),
+        "the playbook must point to harvest's own schedule resume primitive to activate the \
+         pre-paused harvest schedule at the cutover timestamp (issue #229, issue #1219)"
+    );
+    assert!(
+        playbook.contains("CatchupPolicy"),
+        "the playbook must point to the catchup-policy primitive for the harvest schedule's \
+         backlog decision (issue #484, issue #1219)"
+    );
+}
+
+/// Issue #1219, gap 1 (continued): capturing which engine owns a
+/// schedule-driven type's executions, and reconciling that capture
+/// against Temporal's own eventual consistency and workflow-id reuse.
+///
+/// A twelfth review found two gaps in the pause-then-list capture. An
+/// eventually consistent Temporal visibility store can still lag right
+/// after the pause. The capture also never covered a rollback resuming
+/// the Temporal Schedule.
+///
+/// A fourteenth review found two more gaps. Waiting out an indexing
+/// delay is a guess, not a guarantee. Resuming the Temporal Schedule
+/// on rollback can also refire the interval harvest already covered,
+/// through its own `CatchupWindow`.
+///
+/// A sixteenth review found the describe fallback for the prior gap
+/// only ran on a harvest miss. A reused workflow id's own older
+/// execution can satisfy that miss check without ever probing
+/// Temporal.
+///
+/// An eighteenth review found the rollback-reversal rule untestable.
+/// A follow-up request carries only a workflow id, not a timestamp,
+/// so "started after this point" cannot actually be evaluated against
+/// it. Capture harvest's own ids the same way the forward direction
+/// captures Temporal's, instead of comparing against a point in time.
+#[test]
+fn dual_run_playbook_covers_schedule_driven_capture_and_reconciliation() {
+    let guide = read_doc(GUIDE_PATH);
+    let playbook = flatten_whitespace(section_body(&guide, "## Dual-run cutover playbook"));
+
+    assert!(
+        playbook.contains("Temporal's own visibility can lag behind its executions")
+            && playbook.contains("eventually consistent"),
+        "the playbook must warn that an eventually consistent Temporal visibility store can \
+         still omit a just-started or just-finished execution right after the pause, \
+         independent of the pause-then-list ordering fix (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains("A rollback of a schedule-driven type reverses this capture")
+            && playbook.contains("resume the Temporal Schedule"),
+        "the playbook must cover the reverse direction of the schedule-driven capture: a \
+         rollback pauses harvest and resumes the Temporal Schedule \
+         (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains(
+            "\"Started after this point\" is not something you can test against \
+             that id alone"
+        ) && playbook.contains("List every execution of that type harvest has ever started"),
+        "the playbook must not classify a rollback follow-up by whether its id was \"started \
+         after this point\" -- a follow-up request carries only a workflow id, not a \
+         timestamp, so that rule is untestable; it must instead capture harvest's own ids the \
+         same way the forward direction captures Temporal's (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains("A fixed wait cannot guarantee the list has converged")
+            && playbook.contains("describing the id directly against Temporal"),
+        "the playbook must not treat a fixed wait as proof that Temporal's visibility list has \
+         converged -- it must reconcile by describing the id directly against Temporal, which \
+         uses a live per-id lookup rather than the eventually consistent list \
+         (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains(
+            "A harvest match is not conclusive either, if that workflow id was \
+             ever reused"
+        ) && playbook.contains("Describe the id against Temporal unconditionally"),
+        "the playbook must not gate the Temporal describe fallback on a harvest miss -- an \
+         older, unrelated execution can already sit under a reused workflow id on harvest, \
+         satisfying a miss-only check without ever probing Temporal, so the describe must run \
+         unconditionally (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains(
+            "Resuming the Temporal Schedule can also refire the interval harvest \
+             just owned"
+        ) && playbook.contains("CatchupWindow"),
+        "the playbook must warn that resuming the Temporal Schedule on rollback can refire the \
+         interval harvest already owned via Temporal's own CatchupWindow, duplicating side \
+         effects, unless the reader excludes that interval or advances the schedule's state \
+         past it first (issue #1219, PR #1473 Codex P1)"
+    );
+}
+
+/// Issue #1219, gap 2: a follow-up operation (signal, query, update, cancel)
+/// against one already-started execution must route to whichever engine
+/// hosts it right now. It must never route by the current flag value, or
+/// by a fact fixed at start time.
+///
+/// Six PR reviews (Codex, five P1 and one P2) found real gaps here across
+/// five successive attempts at this rule. A persisted "record at start
+/// time" cannot cover a schedule-driven execution, or one that predates
+/// the record. Comparing a start time to a cutover timestamp fails when a
+/// Temporal slot fires late.
+///
+/// A live "query harvest, active beats terminal" resolution fixes both
+/// of those. It creates a new gap, though. It misroutes an ordinary
+/// completed run's own follow-ups. A terminal execution is not the same
+/// thing as a stale one.
+///
+/// The fix returns to a persisted record. This time it writes a fresh
+/// record at every new start, on either engine, overwriting the last
+/// one. A terminal execution's record still names the engine that ran
+/// it. A rollback's new start gets a fresh record of its own. Harvest's
+/// by-id resolution (issue #805) still resolves the current execution
+/// once the record names harvest. That family covers signals, queries,
+/// and cancellations only, not updates.
+///
+/// Applying the resolved-engine language to step 7's forward handoff also
+/// named the wrong engine for its final read. That execution never ran on
+/// harvest at all.
+///
+/// A later PR review found two more gaps in the persisted-record fix.
+/// Harvest's own schedule tick starts an execution the same way
+/// Temporal's schedule does. Neither has a flag decision point to write
+/// a record at.
+///
+/// The record also only ever named the current owner, not every
+/// generation a reused id ever had. A follow-up against a superseded
+/// generation needs its own captured handle from when that generation
+/// was current. Issue #805 already expects this same discipline of a
+/// stale exec id.
+///
+/// A further review found three gaps past that.
+///
+/// Writing the record after the start, not before, leaves an
+/// undetectable inconsistency if the two ever split. An execution can
+/// exist with no record, defaulting to the wrong engine.
+///
+/// Routing a schedule-driven type by which schedule is active broke a
+/// rule the guide already stated. An in-flight execution stays on the
+/// engine that started it. A pre-cutover Temporal firing would misroute
+/// once harvest's schedule took over. The fix writes the record for
+/// every harvest-side start instead, scheduled or flag-routed alike.
+/// Schedule-driven types then use the same mechanism as any other.
+///
+/// Reading an execution id and sending an update to it are two separate
+/// calls. A continue-as-new between them can seal the id before the
+/// update reaches it. `admit_update` does not follow that chain the way
+/// it follows a retry chain.
+///
+/// One more review found the reconciliation retry itself unsafe under
+/// two reuse policies. `AllowDuplicateFailedOnly` and
+/// `TerminateIfRunning` both start a genuine second execution once the
+/// first reaches a terminal state. A silently succeeded first attempt
+/// can do exactly that before the retry runs. Restrict the retry to
+/// `AllowDuplicate` or `RejectDuplicate`, the two policies that
+/// never replace a prior execution outright.
+///
+/// A tenth review found three more gaps. The scheduled-firing fix
+/// assumed a hook that does not exist. Harvest's built-in scheduler
+/// starts an execution directly. It exposes no callback for a reader to
+/// write a record at. Capture a schedule-driven type's Temporal-side
+/// ids once, at cutover, instead. The harvest-only reuse-policy advice
+/// also does not carry over to Temporal, whose own policy of the same
+/// name means something different. Retrying a lost update response is
+/// not safe either. Every admission mints a fresh update id, so a
+/// retry can run the update a second time.
+///
+/// An eleventh review found a gap in that same capture step. Querying
+/// Temporal's in-flight executions before pausing the schedule misses
+/// two cases. An execution that finishes just before the query is not
+/// in-flight, so the query skips it. A firing that starts in the gap
+/// between the query and the pause is not captured either. Both then
+/// misroute as harvest's. Pausing first, then listing every execution
+/// of that type, open and closed alike, closes both gaps.
+///
+/// A fifteenth review found the reconciliation retry itself resolves
+/// by workflow id alone. A reused id can already carry an older,
+/// unrelated execution on the named engine. Querying that id then
+/// reads as a hit, even though this attempt never actually happened.
+/// Retry by a persisted idempotency key instead, scoped to this one
+/// attempt rather than to the workflow id's whole history.
+///
+/// A seventeenth review found three more gaps in that fix. A fresh
+/// key still runs the ordinary reuse policy once. `AllowDuplicate` and
+/// `RejectDuplicate` still never create the intended replacement under
+/// a reused id. Pair the key with `TerminateIfRunning` instead, which
+/// does.
+///
+/// Retrying Temporal's own start call is not automatically idempotent
+/// after a crash either. A reconciliation call is a new call, not a
+/// transport retry of the old one. Persist a request id of your own
+/// for it instead.
+///
+/// A definitive rejection also needs its own handling. Restore the
+/// record to its prior value, since no retry will ever succeed
+/// against a permanent failure.
+#[test]
+fn dual_run_playbook_covers_follow_up_engine_routing() {
+    let guide = read_doc(GUIDE_PATH);
+    let playbook = flatten_whitespace(section_body(&guide, "## Dual-run cutover playbook"));
+
+    assert!(
+        playbook.to_lowercase().contains("follow-up"),
+        "the playbook must name follow-up operations (signal, query, update, cancel) as a \
+         distinct routing concern from a new start (issue #1219)"
+    );
+    assert!(
+        playbook.contains("WorkflowIdReusePolicy") && playbook.contains("rollback"),
+        "the playbook must name workflow-id reuse across a rollback as a hazard the \
+         resolution must survive (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains("A terminal execution is not the same thing as a")
+            && playbook.contains("misroutes it"),
+        "the playbook must distinguish an ordinary terminal execution from a superseded one \
+         -- routing every terminal run's follow-ups to the other engine breaks a plain \
+         completed-run query (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains("record before you")
+            && playbook.contains("Overwrite any earlier record for the same id"),
+        "the playbook must write the routing record before the start, not after, so a crash \
+         between the two leaves a detectable inconsistency rather than a real execution with \
+         no record -- and it must overwrite the previous record on every new start \
+         (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains("A definitive rejection is not the same as an unknown outcome")
+            && playbook.contains("Restore the record to whatever it named before this attempt"),
+        "the playbook must distinguish a definitive, permanently failing rejection (validation, \
+         authorization, a reuse-policy conflict) from a genuinely unknown crash or lost \
+         response -- a definitive rejection can never succeed on retry, so the record must be \
+         restored to its prior value rather than left pointing at an engine where nothing will \
+         ever run (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains("Querying by workflow id alone cannot tell two things apart")
+            && playbook.contains("reads as a hit"),
+        "the playbook must not resolve a pending record's crash reconciliation by querying the \
+         workflow id alone -- a reused id can already carry an older, unrelated execution on \
+         the named engine, which reads as a false hit even though the intended new start never \
+         happened (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains("Generate a fresh idempotency key for the start attempt")
+            && playbook.contains("Idempotency-Key` header (issue #808)"),
+        "the playbook must reconcile a pending record by retrying the exact same start call \
+         with a persisted idempotency key, not by re-querying the workflow id, so the retry is \
+         scoped to this specific attempt rather than to the workflow id's whole history \
+         (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains("A fresh key still runs the ordinary reuse policy once")
+            && playbook.contains("harvest repoints the key at that outcome permanently"),
+        "the playbook must warn that a fresh idempotency key does not bypass the reuse-policy \
+         matrix -- AllowDuplicate and RejectDuplicate never create the intended replacement \
+         when an older terminal execution already sits under a reused id, and harvest repoints \
+         the key at whatever they find instead (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains("WorkflowIdReusePolicy::TerminateIfRunning` for this call")
+            && playbook.contains("started_fresh"),
+        "the playbook must pair the idempotency key with a reuse policy that actually creates \
+         the intended replacement (TerminateIfRunning), not one that only ever returns or \
+         refuses a prior execution -- and tell the reader to check `started_fresh` to tell a \
+         real creation from a deduplicated repeat (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains("Treat a missing record as Temporal"),
+        "the playbook must resolve a not-yet-ported execution's missing record to Temporal \
+         (issue #1219)"
+    );
+    assert!(
+        playbook.contains("A schedule-driven type has no hook to write this record")
+            && playbook.contains("Temporal's own visibility API"),
+        "the playbook must not claim harvest's built-in scheduler exposes a callback to write \
+         the routing record -- it does not -- and must instead capture a schedule-driven \
+         type's in-flight Temporal ids once, at cutover, through Temporal's own visibility \
+         API (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains("A fresh call to Temporal's start API mints a fresh request id")
+            && playbook.contains("Generate your own request id before the first attempt"),
+        "the playbook must not claim a plain retry of Temporal's start call is automatically \
+         idempotent after a crash -- a reconciliation call is a new call, not a transport-level \
+         retry, so it mints a fresh request id unless the reader deliberately generates and \
+         persists their own before the first attempt and resupplies it on every reconciliation \
+         call (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains("Do not retry the update call itself if its result goes missing")
+            && playbook.contains("mints a fresh update id"),
+        "the playbook must warn that retrying a lost update response can run the update's own \
+         logic a second time, since every admission mints a fresh update id with no dedup key \
+         (issue #1219, PR #1473 Codex P1)"
+    );
+}
+
+/// Issue #1219, gap 2 (continued): once a follow-up knows which engine
+/// owns an execution, it still has to resolve and address that execution
+/// correctly. This covers the resolution mechanics. Among them: harvest's
+/// by-id family, the update route it lacks, and the continue-as-new race
+/// between resolving an id and using it. Also covered: the activity check
+/// a reused id needs before a new start. So is the negative flag-routing
+/// rule, and step 7's own handoff as a special case of the general rule.
+///
+/// A twelfth review found that activity check has its own race. Two
+/// concurrent requests for the same reused id can each pass it, then
+/// start on different engines. Querying both engines first does not
+/// serialize anything. Neither engine's query is transactional with
+/// the other one, or with the start. The fix names the gap. It asks
+/// the reader to hold their own lock around the whole check-then-start
+/// sequence instead.
+#[test]
+fn dual_run_playbook_covers_follow_up_resolution_mechanics() {
+    let guide = read_doc(GUIDE_PATH);
+    let playbook = flatten_whitespace(section_body(&guide, "## Dual-run cutover playbook"));
+
+    assert!(
+        playbook.contains("This record names the current owner only")
+            && playbook.contains("needs its own engine and execution id"),
+        "the playbook must scope the routing record to the current owner only, matching \
+         harvest's own by-id resolution (issue #805) -- a follow-up against a superseded \
+         generation needs its own captured handle, not a lookup through this record \
+         (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains("/workflows/by-id/{workflow_name}/{workflow_id}"),
+        "the playbook must resolve the current execution on the named engine through \
+         harvest's own by-id resolution (issue #805) once the record says harvest \
+         (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains("The family has no update route")
+            && playbook.contains("/workflows/{id}/update/{update_name}"),
+        "the playbook must not route an update through the by-id family, which does not \
+         carry one -- it must resolve the execution id first and use the exec-id update \
+         route (issue #1219, PR #1473 Codex P2)"
+    );
+    assert!(
+        playbook.contains("admit_update` resolves only a workflow-level")
+            && playbook.contains("continue-as-new chain"),
+        "the playbook must warn that the two-step update recipe (resolve id, then send \
+         update) is not atomic: a continue-as-new in between can seal the id, and \
+         `admit_update` does not follow that chain the way it follows a retry chain \
+         (issue #1219, PR #1473 Codex P2)"
+    );
+    assert!(
+        playbook.contains("is not still active")
+            && playbook.contains("Temporal's own visibility API"),
+        "the playbook must tell the reader to confirm the previous execution under a reused \
+         id is not still active on its own engine, checking both engines, before starting a \
+         new one elsewhere (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains("This check-then-start sequence has its own race")
+            && playbook.contains("application-level lock"),
+        "the playbook must name the residual race in its own check-then-start sequence -- two \
+         concurrent requests for a reused id can each observe no active run and then start on \
+         different engines, since neither engine's query is transactional with the other or \
+         with the start call -- and tell the reader to serialize it with their own \
+         application-level lock (issue #1219, PR #1473 Codex P1)"
+    );
+    assert!(
+        playbook.contains("Pause the Temporal Schedule first")
+            && playbook.contains("open and closed executions, not only the in-flight ones"),
+        "the playbook must pause the Temporal Schedule before capturing its schedule-driven \
+         type's ids, and capture open and closed executions alike -- querying in-flight \
+         executions before the pause misses one that finishes just before the query and one \
+         the schedule fires in the gap before the pause takes effect (issue #1219, PR #1473 \
+         Codex P1)"
+    );
+    assert!(
+        playbook.contains("Never route it by the flag's current value"),
+        "the playbook must state the negative rule too: never route a follow-up by \
+         re-consulting the current flag value (issue #1219)"
+    );
+    assert!(
+        playbook.contains("is a special case of step 1's general follow-up-routing rule"),
+        "step 7's cancel-signal routing must itself be framed as a special case of the \
+         general follow-up-routing rule, not a standalone exception (issue #1219)"
+    );
+    assert!(
+        playbook.contains("that record is missing or still names Temporal")
+            && playbook.contains("Temporal, not harvest"),
+        "step 7's forward handoff drains an execution that only ever ran on Temporal -- both \
+         the cancel and the final read must resolve to Temporal, since no start has ever \
+         routed this entity to harvest (issue #1219, PR #1473 Codex P1)"
+    );
+}
+
+/// Issue #1219, gap 2 (continued): the worked example's own `cancel` signal
+/// is the concrete hazard the issue names. Sent to the wrong engine, it
+/// either no-ops or spuriously starts a new execution. The commentary must
+/// cross-link the general routing rule, not just show the signal in
+/// isolation.
+#[test]
+fn worked_example_commentary_cross_links_engine_routing_rule() {
+    let guide = read_doc(GUIDE_PATH);
+    let commentary = flatten_whitespace(section_body(&guide, "### What changed, and why"));
+
+    assert!(
+        commentary.contains("(workflow_name, workflow_id) -> engine` record"),
+        "the worked example's commentary must cross-link the general engine-routing rule for \
+         its own `cancel` signal (issue #1219)"
+    );
+}
+
 #[test]
 fn ci_workflow_exercises_the_worked_example() {
     let ci = read_doc(".github/workflows/ci.yml");
@@ -386,6 +883,17 @@ fn guards_run_on_docs_only_changes() {
          must run unconditionally: a condition is how these guards would stop running on \
          docs-only PRs again. Stanza:\n{stanza}"
     );
+}
+
+/// Collapse every run of whitespace, including a hand-wrapped line break, to
+/// one space.
+///
+/// This guide hand-wraps prose at roughly 80 columns. A multi-word phrase
+/// assertion against the raw text can span a wrap point and silently miss a
+/// match that is present to a human reader. Flatten first, so a phrase
+/// assertion is robust to where the author happened to wrap the line.
+fn flatten_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Read a file with line endings normalised to `\n`.

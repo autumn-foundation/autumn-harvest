@@ -35,7 +35,6 @@ use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -91,7 +90,7 @@ fn build_app(pool: &DbPool) -> HarvestApiApp {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::default(),
     ));
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 #[allow(dead_code)]
@@ -100,7 +99,7 @@ fn build_worker(registry: Arc<HandlerRegistry>) -> Arc<Worker> {
         Worker::new(
             WorkerRuntimeConfig {
                 codec_rotation_batch_size: 0,
-                dr_fencing: false,
+                dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: "erase-worker".to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,

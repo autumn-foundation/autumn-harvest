@@ -126,6 +126,7 @@ panel finds the way back to the rule and its runbook section.
 | `harvest_retention_lag` | Cache, retention & shards | Retention deletions by shard | [runbook](../runbooks/harvest-alerts.md#harvest_retention_lag) |
 | `harvest_shard_unready` | Readiness checks | Readiness: Shard readiness (text) | [runbook](../runbooks/harvest-alerts.md#harvest_shard_unready) |
 | `harvest_shard_undrained` | Cache, retention & shards | Stranded pending tasks by shard (companion: Dispatch rate by shard) | [runbook](../runbooks/harvest-alerts.md#harvest_shard_undrained) |
+| `harvest_dispatch_dropped_hints` | Cache, retention & shards | Dispatch dropped hints | [runbook](../runbooks/harvest-alerts.md#harvest_dispatch_dropped_hints) |
 | `harvest_no_compatible_worker` | Readiness checks | Readiness: Build-routing compatibility (text) | [runbook](../runbooks/harvest-alerts.md#harvest_no_compatible_worker) |
 | `harvest_schedule_ha_domination` | Schedules & triggers | Schedule HA fire attempts | [runbook](../runbooks/harvest-alerts.md#harvest_schedule_ha_domination) |
 | `harvest_workflow_failure_rate` | Overview | Workflow failure ratio | [runbook](../runbooks/harvest-alerts.md#harvest_workflow_failure_rate) |
@@ -148,7 +149,9 @@ panel finds the way back to the rule and its runbook section.
 | `harvest_replication_lag_high` | Cross-region DR → *Measured RPO*, with *Shard write-authority generation* for failover skew |
 | `harvest_shard_fenced` | Cross-region DR → *Workers fenced (never self-healing)* |
 | `harvest_replication_unobservable` | Cross-region DR → *Replication observable (0 = the other DR panels are STALE)* |
+| `harvest_replication_rpo_unknown` | Cross-region DR → *RPO known (0 = readable but unmeasurable)* |
 | `harvest_audit_export_lag_high` | Audit export to SIEM → *Audit export lag (oldest unshipped audit record)*, with *Audit records exported* to tell a sink outage from a quiet fleet |
+| `harvest_audit_export_unobservable` | Audit export to SIEM → *Audit export observed (0 = the lag panel above is STALE)* |
 
 ### Readiness-style alerts (no native metric)
 
@@ -169,7 +172,7 @@ the API result through your own probe with bounded labels) —
 | `$datasource` | datasource | your Prometheus datasources | every panel |
 | `$workflow` | query, multi + All | `label_values(harvest_workflow_started_total, workflow)` | series carrying a `workflow` label, including `harvest_retention_deleted` (issue #737); series labelled `workflow_type` (history size, continue-as-new, payload metrics) use `workflow_type=~"$workflow"` |
 | `$queue` | query, multi + All | `label_values(harvest_queue_depth, queue)` | series carrying a `queue` label |
-| `$shard` | query, multi + All | `label_values(harvest_dlq_entries, shard)` | **only** series that carry a `shard` label (e.g. `harvest_dlq_entries`, `harvest_shard_stranded_pending`, `harvest_shard_dispatched_total`, the cross-region DR series (`harvest_replication_lag_seconds`, `harvest_replication_lag_bytes`, `harvest_replication_standbys`, `harvest_replication_observable`, `harvest_shard_generation`, `harvest_shard_fenced_total`), and the canary series) |
+| `$shard` | query, multi + All | `label_values(harvest_dlq_entries, shard)` | **only** series that carry a `shard` label (e.g. `harvest_dlq_entries`, `harvest_shard_stranded_pending`, `harvest_shard_dispatched_total`, the cross-region DR series (`harvest_replication_lag_seconds`, `harvest_replication_lag_bytes`, `harvest_replication_standbys`, `harvest_replication_observable`, `harvest_replication_rpo_known`, `harvest_shard_generation`, `harvest_shard_fenced_total`), and the canary series) |
 
 Variables are applied per-panel only where the series actually carries the
 label — applying `shard=~"$shard"` to an unlabelled series would silently
@@ -204,6 +207,25 @@ mandates `workflow`/`queue`/`shard` as the navigation dimensions) and the
 `uneditable-dashboard` rule (a starter pack is meant to be tuned in
 place). The linter validates the dashboard *model*; a manual import into a
 real Grafana ≥ 10 instance remains the final pre-merge verification step.
+
+## Adding a Panel
+
+Grafana panel `id` values must be unique across the whole file, including
+panels nested inside collapsed rows. Do not hand-pick the next integer:
+five separate PRs (ids 956, 957, 958, 959, 960) each picked the same
+"next" id as a PR merging around the same time. The JSON merges cleanly
+either way, so nothing conflicts until CI runs
+`panel_structure_is_grafana10_clean` (`dashboard_pack_docs.rs`) against
+the merged file — by which point both PRs are already in.
+
+Get a collision-resistant id instead:
+
+```sh
+python3 docs/dashboards/next-panel-id.py
+```
+
+It draws from a wide, mostly-empty range, so two branches picking one at
+the same time are unlikely to collide.
 
 ## Versioning
 

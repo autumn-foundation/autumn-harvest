@@ -288,7 +288,10 @@ async fn tool_routes_coexist_with_the_nested_management_router() {
         .routes(routes)
         .nest(
             "/api/harvest",
-            autumn_harvest_plugin::harvest_api_router(api_state),
+            // `TestApp::nest` takes a `Router<AppState>`. The router is
+            // `Router<()>`, so it declares the state type it never reads
+            // (issue #1606), exactly as `plugin.rs` does at its own nest.
+            autumn_harvest_plugin::harvest_api_router(api_state).with_state(()),
         )
         .mount_mcp("/mcp")
         .build();

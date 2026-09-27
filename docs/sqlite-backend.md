@@ -208,14 +208,22 @@ step 7.
 `workflow_id` (what `ctx.info().workflow_id` reports — idempotency-key material,
 cross-backend-identical).
 
-> **v0.1 non-idempotent-start contract.** This backend does **not** enforce
-> `(workflow_name, workflow_id)` uniqueness and does **not** apply the core's
-> `WorkflowIdReusePolicy` matrix. **Every call creates a new, independent
-> execution**, even when `workflow_id` matches a prior run — so a duplicate
-> delivery (e.g. a retried webhook) starts a second run and repeats its side
-> effects. The `workflow_id` is observability + idempotency-key *material*, not
-> an enforced start-boundary uniqueness key. **Dedupe upstream for now.** The
-> reuse-policy matrix is a tracked follow-up (issue #1068).
+> **Idempotent starts by default (issue #1068).** `start_workflow_with_id`
+> applies the `AllowDuplicate` reuse policy. A non-blank `workflow_id` that
+> matches an existing, non-sealed execution for the same `workflow_name`
+> **attaches** to it. The call returns the SAME `ExecutionId`. No second run
+> starts. **The new `input` is discarded** — a duplicate delivery, e.g. a
+> retried webhook, does not repeat side effects.
+>
+> A blank or whitespace-only `workflow_id` has no reuse key. It always
+> creates a fresh, distinct run.
+>
+> For a different policy — reject the duplicate, replace a failed run, or
+> terminate and restart — use `start_workflow_with_reuse_policy`. It applies
+> the full `WorkflowIdReusePolicy` matrix and returns a `StartOutcome`, which
+> reports whether the call attached to a prior run or started a fresh one.
+> See the rustdoc on both methods for the full matrix
+> (`cargo doc --open -p autumn-harvest-sqlite`).
 
 An oversized start input (over the 2 MiB default cap) is rejected with
 `SqliteError::PayloadTooLarge` before anything is persisted, matching the core.
@@ -267,8 +275,18 @@ match rt.outcome(exec)? {
 - **`poll_once()`** for a custom loop — e.g. a background tick where you decide
   the cadence and inspect the `bool` progress flag yourself.
 
+`poll_once()`/`run_until_idle()` drive every execution in a pass even if an
+earlier one errors — see [§11](#11-v01-non-goals-and-follow-ups) for what
+happens to a rejected execution. `run_until_blocked(exec)` is the one
+fail-fast driver, since it already targets a single execution.
+
 `outcome(exec)`, `load_history(exec)`, and `activity_attempts(exec, name)` are
 **pure reads** — they never advance a run.
+
+Every call that takes an `exec` id returns `SqliteError::ExecutionNotFound(exec)`
+when no execution has that id. This includes `run_until_blocked` and the list
+reads. A typo or a stale id gives this one typed error. It never gives an empty
+list or a generic `SQLite` error.
 
 Timers use the real wall clock (read once per decision cycle), so a run blocked
 on a `ctx.timer(...)` that is not yet due returns `WaitingTimer`; drive it again
@@ -377,12 +395,21 @@ specific command/feature:
 - **Worker sessions** (`create_session`) and **cancellable durable timers**
   (`start_timer` / `TimerHandle::…` — use the fire-once `ctx.timer(...)`).
 
+A rejected execution stays `RUNNING` and keeps erroring on every later drive.
+It does not block unrelated executions, though. `poll_once` still drives the
+rest of the fleet in the same pass (issue #1530), and `run_until_idle` still
+converges the rest of the fleet to quiescence in one call — it no longer
+stops after one internal pass the first time the broken execution errors
+(issue #1555). Both keep reporting the broken execution's error to the
+caller; neither drops it.
+
 Backend-level non-goals: distributed / multi-writer workers, `LISTEN`/`NOTIFY`
 push wake-ups, multi-server crash recovery, schedules, the management API,
-retention, worker sessions, sharding, DAGs, and the `WorkflowIdReusePolicy`
-matrix (see [§6](#6-starting-a-workflow)). These are tracked as issue #1068
-follow-ups — rejection is deliberate, so a partial, silently-wrong implementation
-never ships.
+retention, worker sessions, sharding, and DAGs. Rejection is deliberate, so a
+partial, silently-wrong implementation never ships.
+
+The `WorkflowIdReusePolicy` matrix (see [§6](#6-starting-a-workflow)) shipped
+under issue #1068. It is no longer a non-goal.
 
 Two benign bookkeeping commands are silently no-ops (they append no event and
 gate no control flow): `ctx.set_current_details(...)` and a re-park
@@ -407,6 +434,18 @@ gate no control flow): `ctx.set_current_details(...)` and a re-park
 
   ```text
   cargo run -p autumn-harvest-sqlite --example durability
+  ```
+
+- **[`examples/claude-agent-daemon/`](../examples/claude-agent-daemon/)** — a
+  whole application on this backend: a local daemon that runs Claude agent
+  sessions as durable workflows. It shows the drive loop
+  ([§7](#7-the-drive-model)), pull signals with a deadline
+  ([§8](#8-signals-pull-only)), and crash recovery
+  ([§9](#9-durability-and-crash-recovery)) in one place, and it runs with no API
+  key against a scripted offline model.
+
+  ```text
+  cargo run -p claude-agent-daemon -- serve --workspace /tmp/agent-demo
   ```
 
 For the full API/contract reference, run

@@ -36,6 +36,8 @@ const REQUIRED_ALERTS: &[&str] = &[
     "harvest_replication_unobservable",
     // Issue #953 — audit export to a SIEM sink.
     "harvest_audit_export_lag_high",
+    // Issue #1268 — the availability companion to the lag gauge.
+    "harvest_audit_export_unobservable",
 ];
 
 const REQUIRED_DRILLS: &[&str] = &[
@@ -101,11 +103,27 @@ const STABLE_PROMETHEUS_METRICS: &[&str] = &[
     // Issue #953 — audit export to a SIEM sink.
     "harvest_audit_export_lag",
     "harvest_audit_exported_total",
+    // Issue #1268 — the availability companion to the lag gauge.
+    "harvest_audit_export_observed",
     "harvest_replication_lag_bytes",
     "harvest_replication_standbys",
     "harvest_replication_observable",
+    // Issue #1249 — readable-but-unmeasurable RPO signal.
+    "harvest_replication_rpo_known",
     "harvest_shard_generation",
     "harvest_shard_fenced_total",
+    // Issue #1307 — by-id fan-out observability. No starter rule ships for
+    // these yet (no operational threshold data to pin one against); catalogued
+    // so an embedder's own alert can reference them.
+    "harvest_external_signal_by_id_indeterminate_shard_total",
+    "harvest_external_signal_by_id_oldest_pending_indeterminate_age",
+    "harvest_external_cancel_by_id_oldest_pending_indeterminate_age",
+    "harvest_external_signal_by_id_found_over_incomplete_fanout_total",
+    // The adjacent bridge fix issue #1307 made: `record_external_cancel_sent`
+    // had no `MetricsRsRecorder` implementation and silently no-opped.
+    "harvest_workflow_external_cancel_sent_total",
+    // Issue #1429 — the dispatch background publisher's dropped-hint count.
+    "harvest_dispatch_dropped_hints",
 ];
 
 #[test]
@@ -369,6 +387,56 @@ fn the_replication_down_alert_keys_on_standby_count_not_on_lag() {
     );
 }
 
+/// The dropped-hints alert must require sustained growth, not a single
+/// burst (Codex review, issue #1429 follow-up).
+///
+/// `harvest.dispatch.dropped_hints` is a running total. A bare
+/// `increase(m[15m]) > 0` clause goes true the moment any one hint drops
+/// anywhere in that window. It then stays true for the rest of the
+/// window, even if the burst cleared immediately. The alert's own runbook
+/// and `default_threshold` name that exact shape as a false positive: "a
+/// brief spike... that clears within one or two reconcile intervals".
+/// The expression must also require growth in a shorter, more recent
+/// window, so a burst that already stopped climbing does not alone
+/// satisfy it.
+///
+/// The `and` clause alone is still not enough (Codex review, issue #1429
+/// follow-up). A single dropped hint holds both clauses true for up to 5
+/// minutes. An importer with no minimum-duration gate still opens a
+/// ticket for that one-off burst. A `for` clause closes that gap. The AND
+/// expression decays to false once the burst's own 5-minute clause ages
+/// out, well short of 15 minutes. Only drops still recurring every
+/// 5-minute slice across the whole window keep the condition true long
+/// enough to satisfy `for: 15m`.
+#[test]
+fn the_dropped_hints_alert_requires_sustained_growth_not_one_burst() {
+    let pack = read_pack();
+    let rules = pack["rules"].as_array().expect("rules must be an array");
+    let rule = rules
+        .iter()
+        .find(|rule| rule["id"].as_str() == Some("harvest_dispatch_dropped_hints"))
+        .expect("dropped-hints alert must exist");
+    let expression = &rule["prometheus"]["expressions"][0];
+    let expr = expression["expr"]
+        .as_str()
+        .expect("must carry a PromQL expression");
+    assert!(
+        expr.contains("increase(harvest_dispatch_dropped_hints[15m]) > 0"),
+        "the alert must still require growth over the full window: {expr}"
+    );
+    assert!(
+        expr.contains("and increase(harvest_dispatch_dropped_hints[5m]) > 0"),
+        "the alert must also require growth in a shorter, more recent window, so a burst \
+         that already stopped climbing does not alone fire it: {expr}"
+    );
+    assert_eq!(
+        expression["for"].as_str(),
+        Some("15m"),
+        "a `for` clause must gate the fire, or a single burst's brief AND window still \
+         opens a ticket with no minimum-duration check"
+    );
+}
+
 /// A fenced worker never recovers on its own.
 #[test]
 fn the_fenced_alert_says_the_condition_is_not_self_healing() {
@@ -561,6 +629,55 @@ fn scanner_stalled_retention_expression_cannot_fire_during_the_startup_hour() {
         notes.contains("RESTART SEMANTICS"),
         "the notes must record why the startup gate needs no resets()/uptime term, so the \
          reset-aware increase() argument is not re-derived on every review"
+    );
+}
+
+/// Codex review on PR #1520, follow-up P2: `audit_export` shares the same
+/// startup hazard as `retention`. Its series also starts at zero at
+/// registration. Its own first tick can legitimately still be in flight
+/// when Prometheus evaluates a partial `[10m]` window. A bare
+/// `rate(...) == 0` would page through every healthy startup, exactly like
+/// the un-gated retention expression this pack already fixed.
+///
+/// Pin the gate textually, mirroring
+/// `scanner_stalled_retention_expression_cannot_fire_during_the_startup_hour`
+/// above, so a future edit cannot drop it.
+#[test]
+fn scanner_stalled_audit_export_expression_carries_the_same_startup_gate() {
+    let pack = read_pack();
+    let rules = pack["rules"].as_array().expect("rules must be an array");
+    let stalled = rules
+        .iter()
+        .find(|rule| rule["id"].as_str() == Some("harvest_scanner_stalled"))
+        .expect("scanner stalled alert must exist");
+    let exprs: Vec<&str> = stalled["prometheus"]["expressions"]
+        .as_array()
+        .expect("scanner stalled alert must carry PromQL expressions")
+        .iter()
+        .filter_map(|expr| expr["expr"].as_str())
+        .collect();
+    let audit_export = exprs
+        .iter()
+        .find(|expr| expr.contains("scanner=\"audit_export\""))
+        .expect("scanner stalled alert must carry an audit_export-specific expression");
+
+    assert!(
+        audit_export
+            .contains("and max_over_time(harvest_scanner_tick_total{scanner=\"audit_export\""),
+        "the audit_export expression must gate on the counter having ticked at least once, so \
+         the registration-time zero cannot page through a healthy startup: {audit_export}"
+    );
+
+    // Same label-set hazard as the retention gate. The `and` side must be a
+    // function result, not a bare selector. Otherwise the match drops
+    // __name__ on one side only, and the alert silently never fires.
+    let (_, gate) = audit_export
+        .split_once(" and ")
+        .expect("the audit_export expression must carry an `and` gate");
+    assert!(
+        !gate.trim_start().starts_with("harvest_scanner_tick_total"),
+        "the gate must not be a bare selector -- it would carry __name__ while the rate() side \
+         does not, so the `and` would match no series and the alert would never fire: {gate}"
     );
 }
 

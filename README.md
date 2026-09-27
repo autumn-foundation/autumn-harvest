@@ -72,6 +72,11 @@ Need a real reference instead of the tiny hello-world path? See:
   child workflows, version gates, signals, timers, deterministic side effects, and scheduled DAGs.
 - [`examples/standalone-runner/`](examples/standalone-runner/) for the out-of-the-box runner path:
   no Autumn plugin, just `HarvestRunner` plus a manually mounted management API router.
+- [`examples/claude-agent-daemon/`](examples/claude-agent-daemon/) for a local daemon that runs
+  Claude agent sessions as durable workflows on the embedded SQLite backend — no Postgres, no
+  Docker. Each model call and tool call is an activity, a workspace write parks on an
+  approval signal with a deadline, and killing the daemon mid-session resumes by replay instead
+  of paying for completed turns twice. It runs with no API key (a scripted offline model).
 
 ```rust
 use autumn_harvest::prelude::*;
@@ -316,9 +321,16 @@ for a compile-checked polling loop that works with and without the `db` feature.
 | [`autumn-harvest-redis`](autumn-harvest-redis/) | Optional Redis Streams dispatch channel — carries references to claimable rows; Postgres stays the source of truth |
 | [`autumn-harvest-sqlite`](autumn-harvest-sqlite/) | Optional SQLite storage backend for single-process and embedded deployments |
 
-Use `autumn-harvest-plugin` if you're building an Autumn app. Use the bare
-`autumn-harvest` crate if you want to embed the engine in another framework or
-a non-web context.
+Use `autumn-harvest-plugin` if you're building an Autumn app. For a non-web
+context — a worker or CLI process with no HTTP surface at all — use the bare
+`autumn-harvest` crate directly; it is the executor and storage layer, with
+no framework dependency of its own. To expose the management API (and, for
+the Vantage UI, `harvest_ui_router`) from a Rust service on plain Axum
+instead of autumn-web, mount `autumn-harvest-plugin`'s `harvest_api_router`
+yourself — [`examples/standalone-runner`](examples/standalone-runner/)
+demonstrates the management-API mount. Both routers return
+`axum::Router<()>`, so this path is for Axum services, not an arbitrary
+framework.
 
 ## CLI
 
@@ -362,6 +374,19 @@ a bearer token. Successful responses are printed as pretty JSON by default; use
 `--output json` for compact script-friendly output. JSON request payloads accept
 inline `--*-json` values or `--*-file PATH`; use `-` as the file path to read
 from stdin.
+
+The CLI sends `Accept: application/json` on every JSON request (issue
+#1579). Send the same header from `curl` or any other direct client of
+a JSON route. `curl` sends a bare `Accept: */*` by default. Autumn's
+error-page content negotiation treats that as browser navigation, and
+answers a validation error with a styled HTML page, not the JSON body
+this section documents.
+
+Match each route's own declared content type instead: `harvest events
+tail` sends `Accept: text/event-stream`, and so must any direct client
+of the `.../events/stream` or `.../stream` routes. `GET /admin/metrics`
+and `GET /admin/queues/scaling?format=prometheus` return Prometheus
+plain text; do not send `Accept: application/json` to either.
 
 ### Migrating a dedicated Harvest database
 
@@ -481,7 +506,7 @@ can reproduce any of them on your own hardware.
 [`docs/performance.md`](docs/performance.md) is the component-level complement:
 it publishes measured task-claim and enqueue baselines: how claim latency scales with pending-backlog depth (the
 number that answers *"when do I add a shard?"*), what five representative
-claim-path predicates cost (five more are in the query on every claim but are
+claim-path predicates cost (six more are in the query on every claim but are
 left on their cheapest null/empty path, so they are evaluated rather than
 measured — the page names them), and the `EXPLAIN (ANALYZE, BUFFERS)` plan
 behind both. Like the
@@ -1033,6 +1058,9 @@ The embedded Vantage UI (`harvest_ui_router`, typically mounted at `/api/harvest
 - The `db` feature is enabled by default and pulls Diesel + diesel-async; build
   with `--no-default-features` for pure compile-checks on systems without
   libpq.
+- The `tls` feature is enabled by default. It lets LISTEN/NOTIFY connections
+  use `sslmode=require`, and it compiles `ring`. A build with
+  `default-features = false` must list `tls` to keep it.
 
 ## Status
 

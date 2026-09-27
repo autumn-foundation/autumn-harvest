@@ -52,40 +52,44 @@ use crate::telemetry::{
     METRIC_COMPLETION_TRIGGER_FIRED, METRIC_COMPLETION_TRIGGER_SKIPPED,
     METRIC_CONCURRENCY_RESIDUAL_OVER_LIMIT, METRIC_CONCURRENCY_SUPERSEDED,
     METRIC_CONNECTOR_DISPATCHED, METRIC_CONNECTOR_LAG, METRIC_CONNECTOR_POISONED,
-    METRIC_CONNECTOR_RECEIVED, METRIC_DEBOUNCE_FIRED, METRIC_DLQ_ENTRIES, METRIC_DLQ_REDRIVEN,
-    METRIC_EXTERNAL_SIGNAL_SENT, METRIC_LABEL_ACTION, METRIC_LABEL_ACTIVITY,
-    METRIC_LABEL_ACTIVITY_NAME, METRIC_LABEL_BUILD_ID, METRIC_LABEL_DECISION,
-    METRIC_LABEL_ERROR_TYPE, METRIC_LABEL_GAP, METRIC_LABEL_KEY, METRIC_LABEL_KIND,
-    METRIC_LABEL_NAME, METRIC_LABEL_NON_RETRYABLE, METRIC_LABEL_OUTCOME, METRIC_LABEL_PATH,
-    METRIC_LABEL_PRODUCER, METRIC_LABEL_QUERY, METRIC_LABEL_QUEUE, METRIC_LABEL_RATE_LIMIT_FAMILY,
-    METRIC_LABEL_REASON, METRIC_LABEL_REASON_CODE, METRIC_LABEL_RESOURCE, METRIC_LABEL_SCANNER,
-    METRIC_LABEL_SCOPE, METRIC_LABEL_SHARD, METRIC_LABEL_SLOT_TYPE, METRIC_LABEL_SOURCE,
-    METRIC_LABEL_STATE, METRIC_LABEL_STATUS, METRIC_LABEL_TASK_TYPE, METRIC_LABEL_TRIGGER,
-    METRIC_LABEL_WORKFLOW, METRIC_LABEL_WORKFLOW_TYPE, METRIC_MUTEX_CONTENTION, METRIC_MUTEX_HELD,
-    METRIC_MUTEX_WAIT, METRIC_PAYLOAD_BYTES, METRIC_PAYLOAD_OFFLOAD_FETCH_DURATION,
-    METRIC_PAYLOAD_OFFLOADED, METRIC_PAYLOAD_REJECTED, METRIC_QUERY_DURATION, METRIC_QUEUE_DEPTH,
-    METRIC_QUEUE_DISPATCHED, METRIC_QUEUE_OLDEST_PENDING_AGE, METRIC_QUEUE_PAUSED,
-    METRIC_QUEUE_SCHEDULE_TO_START, METRIC_QUOTA_REJECTED, METRIC_RATE_LIMIT_BUCKETS_DELETED,
-    METRIC_RATE_LIMIT_REFILL_RATE, METRIC_RATE_LIMIT_THROTTLED, METRIC_RATE_LIMIT_TOKENS_AVAILABLE,
-    METRIC_RETENTION_DELETED, METRIC_SAGA_COMPENSATED, METRIC_SAGA_COMPENSATION_FAILED,
-    METRIC_SCANNER_TICK, METRIC_SCHEDULE_AUTO_PAUSED, METRIC_SCHEDULE_DECISION_WRITE_FAILED,
-    METRIC_SCHEDULE_FIRE_ATTEMPTS, METRIC_SCHEDULE_MANUAL_TRIGGER, METRIC_SCHEDULE_OVERDUE,
-    METRIC_SCHEDULE_RUNS, METRIC_SCHEDULE_SKIPPED, METRIC_SESSION_ACQUISITION,
-    METRIC_SIGNAL_RECEIVED, METRIC_SIGNAL_UNHANDLED, METRIC_SUMMARY_DELETED,
-    METRIC_TASK_CAPABILITY_MISS, METRIC_TASK_QUARANTINED, METRIC_TIMER_DURATION,
-    METRIC_TIMER_STARTED, METRIC_UPDATE_ADMITTED, METRIC_UPDATE_COMPLETED, METRIC_UPDATE_DURATION,
-    METRIC_UPDATE_FAILED, METRIC_UPDATE_REJECTED, METRIC_WEBHOOK_RECEIVED, METRIC_WEBHOOK_REJECTED,
-    METRIC_WORKER_SLOT_TARGET, METRIC_WORKER_SLOTS_AVAILABLE, METRIC_WORKER_SLOTS_IN_USE,
-    METRIC_WORKER_TUNER_DECISIONS, METRIC_WORKFLOW_ACTIVE, METRIC_WORKFLOW_CACHE_HIT,
-    METRIC_WORKFLOW_CACHE_MISS, METRIC_WORKFLOW_CHAIN_TIMEOUT, METRIC_WORKFLOW_CONTINUE_AS_NEW,
-    METRIC_WORKFLOW_DEBOUNCED, METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_BLOAT,
-    METRIC_WORKFLOW_HISTORY_OVERSIZED, METRIC_WORKFLOW_HISTORY_SIZE, METRIC_WORKFLOW_ND_BLOCKED,
-    METRIC_WORKFLOW_NON_DETERMINISM, METRIC_WORKFLOW_PANIC, METRIC_WORKFLOW_PAUSE_DURATION,
-    METRIC_WORKFLOW_PAUSED, METRIC_WORKFLOW_RETRIES, METRIC_WORKFLOW_SLA_BREACHED,
-    METRIC_WORKFLOW_START_THROTTLED, METRIC_WORKFLOW_STARTED, METRIC_WORKFLOW_TASK_TIMEOUT,
-    METRIC_WORKFLOW_TERMINAL, METRIC_WORKFLOW_TIMEOUT, METRIC_WORKFLOW_UNFINISHED_HANDLERS,
-    MetricsRecorder, PoisonReason, SessionAcquisitionOutcome, SlotType, TunerDecision,
-    WebhookOutcome, WorkflowStatus,
+    METRIC_CONNECTOR_RECEIVED, METRIC_DEBOUNCE_FIRED, METRIC_DISPATCH_DROPPED_HINTS,
+    METRIC_DLQ_ENTRIES, METRIC_DLQ_REDRIVEN, METRIC_EXTERNAL_BY_ID_FOUND_OVER_INCOMPLETE_FANOUT,
+    METRIC_EXTERNAL_BY_ID_INDETERMINATE_SHARD, METRIC_EXTERNAL_BY_ID_OTHER_LIVE_OBSERVED,
+    METRIC_EXTERNAL_CANCEL_BY_ID_OLDEST_PENDING_AGE, METRIC_EXTERNAL_CANCEL_SENT,
+    METRIC_EXTERNAL_SIGNAL_BY_ID_OLDEST_PENDING_AGE, METRIC_EXTERNAL_SIGNAL_SENT,
+    METRIC_LABEL_ACTION, METRIC_LABEL_ACTIVITY, METRIC_LABEL_ACTIVITY_NAME, METRIC_LABEL_BUILD_ID,
+    METRIC_LABEL_DECISION, METRIC_LABEL_ERROR_TYPE, METRIC_LABEL_GAP, METRIC_LABEL_KEY,
+    METRIC_LABEL_KIND, METRIC_LABEL_NAME, METRIC_LABEL_NON_RETRYABLE, METRIC_LABEL_OUTCOME,
+    METRIC_LABEL_PATH, METRIC_LABEL_PRODUCER, METRIC_LABEL_QUERY, METRIC_LABEL_QUEUE,
+    METRIC_LABEL_RATE_LIMIT_FAMILY, METRIC_LABEL_REASON, METRIC_LABEL_REASON_CODE,
+    METRIC_LABEL_RESOURCE, METRIC_LABEL_SCANNER, METRIC_LABEL_SCOPE, METRIC_LABEL_SHARD,
+    METRIC_LABEL_SLOT_TYPE, METRIC_LABEL_SOURCE, METRIC_LABEL_STATE, METRIC_LABEL_STATUS,
+    METRIC_LABEL_TASK_TYPE, METRIC_LABEL_TRIGGER, METRIC_LABEL_WORKFLOW,
+    METRIC_LABEL_WORKFLOW_TYPE, METRIC_MUTEX_CONTENTION, METRIC_MUTEX_HELD, METRIC_MUTEX_WAIT,
+    METRIC_PAYLOAD_BYTES, METRIC_PAYLOAD_OFFLOAD_FETCH_DURATION, METRIC_PAYLOAD_OFFLOADED,
+    METRIC_PAYLOAD_REJECTED, METRIC_QUERY_DURATION, METRIC_QUEUE_DEPTH, METRIC_QUEUE_DISPATCHED,
+    METRIC_QUEUE_OLDEST_PENDING_AGE, METRIC_QUEUE_PAUSED, METRIC_QUEUE_SCHEDULE_TO_START,
+    METRIC_QUOTA_REJECTED, METRIC_QUOTA_SUPERSEDE_CREDIT_NOT_SHED,
+    METRIC_RATE_LIMIT_BUCKETS_DELETED, METRIC_RATE_LIMIT_REFILL_RATE, METRIC_RATE_LIMIT_THROTTLED,
+    METRIC_RATE_LIMIT_TOKENS_AVAILABLE, METRIC_RETENTION_DELETED, METRIC_SAGA_COMPENSATED,
+    METRIC_SAGA_COMPENSATION_FAILED, METRIC_SCANNER_TICK, METRIC_SCHEDULE_AUTO_PAUSED,
+    METRIC_SCHEDULE_DECISION_WRITE_FAILED, METRIC_SCHEDULE_FIRE_ATTEMPTS,
+    METRIC_SCHEDULE_MANUAL_TRIGGER, METRIC_SCHEDULE_OVERDUE, METRIC_SCHEDULE_RUNS,
+    METRIC_SCHEDULE_SKIPPED, METRIC_SESSION_ACQUISITION, METRIC_SIGNAL_RECEIVED,
+    METRIC_SIGNAL_UNHANDLED, METRIC_SUMMARY_DELETED, METRIC_TASK_CAPABILITY_MISS,
+    METRIC_TASK_QUARANTINED, METRIC_TIMER_DURATION, METRIC_TIMER_STARTED, METRIC_UPDATE_ADMITTED,
+    METRIC_UPDATE_COMPLETED, METRIC_UPDATE_DURATION, METRIC_UPDATE_FAILED, METRIC_UPDATE_REJECTED,
+    METRIC_WEBHOOK_RECEIVED, METRIC_WEBHOOK_REJECTED, METRIC_WORKER_SLOT_TARGET,
+    METRIC_WORKER_SLOTS_AVAILABLE, METRIC_WORKER_SLOTS_IN_USE, METRIC_WORKER_TUNER_DECISIONS,
+    METRIC_WORKFLOW_ACTIVE, METRIC_WORKFLOW_CACHE_HIT, METRIC_WORKFLOW_CACHE_MISS,
+    METRIC_WORKFLOW_CHAIN_TIMEOUT, METRIC_WORKFLOW_CONTINUE_AS_NEW, METRIC_WORKFLOW_DEBOUNCED,
+    METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_BLOAT, METRIC_WORKFLOW_HISTORY_OVERSIZED,
+    METRIC_WORKFLOW_HISTORY_SIZE, METRIC_WORKFLOW_ND_BLOCKED, METRIC_WORKFLOW_NON_DETERMINISM,
+    METRIC_WORKFLOW_PANIC, METRIC_WORKFLOW_PAUSE_DURATION, METRIC_WORKFLOW_PAUSED,
+    METRIC_WORKFLOW_RETRIES, METRIC_WORKFLOW_SLA_BREACHED, METRIC_WORKFLOW_START_THROTTLED,
+    METRIC_WORKFLOW_STARTED, METRIC_WORKFLOW_TASK_TIMEOUT, METRIC_WORKFLOW_TERMINAL,
+    METRIC_WORKFLOW_TIMEOUT, METRIC_WORKFLOW_UNFINISHED_HANDLERS, MetricsRecorder, PoisonReason,
+    SessionAcquisitionOutcome, SlotType, TunerDecision, WebhookOutcome, WorkflowStatus,
 };
 
 /// [`MetricsRecorder`] implementation that forwards every sample to the
@@ -317,6 +321,11 @@ impl MetricsRecorder for MetricsRsRecorder {
         .set(depth as f64);
     }
 
+    #[allow(clippy::cast_precision_loss)]
+    fn record_dispatch_dropped_hints(&self, total: u64) {
+        gauge!(METRIC_DISPATCH_DROPPED_HINTS).set(total as f64);
+    }
+
     fn record_queue_paused(&self, queue: &str, paused: bool) {
         gauge!(
             METRIC_QUEUE_PAUSED,
@@ -391,6 +400,14 @@ impl MetricsRecorder for MetricsRsRecorder {
         .set(seconds);
     }
 
+    fn record_audit_export_observed(&self, shard: u16, observed: bool) {
+        gauge!(
+            crate::telemetry::METRIC_AUDIT_EXPORT_OBSERVED,
+            METRIC_LABEL_SHARD => shard.to_string(),
+        )
+        .set(if observed { 1.0 } else { 0.0 });
+    }
+
     fn record_audit_exported(&self, shard: u16, count: u64) {
         counter!(
             crate::telemetry::METRIC_AUDIT_EXPORTED,
@@ -423,6 +440,14 @@ impl MetricsRecorder for MetricsRsRecorder {
             METRIC_LABEL_SHARD => shard.to_string(),
         )
         .set(count as f64);
+    }
+
+    fn record_replication_rpo_known(&self, shard: u16, known: bool) {
+        gauge!(
+            crate::telemetry::METRIC_REPLICATION_RPO_KNOWN,
+            METRIC_LABEL_SHARD => shard.to_string(),
+        )
+        .set(if known { 1.0 } else { 0.0 });
     }
 
     #[allow(clippy::cast_precision_loss)]
@@ -687,6 +712,56 @@ impl MetricsRecorder for MetricsRsRecorder {
         }
     }
 
+    fn record_external_cancel_sent(&self, outcome: &str, reason_code: Option<&str>) {
+        if let Some(reason) = reason_code {
+            counter!(
+                METRIC_EXTERNAL_CANCEL_SENT,
+                METRIC_LABEL_OUTCOME => outcome.to_owned(),
+                METRIC_LABEL_REASON_CODE => reason.to_owned(),
+            )
+            .increment(1);
+        } else {
+            counter!(
+                METRIC_EXTERNAL_CANCEL_SENT,
+                METRIC_LABEL_OUTCOME => outcome.to_owned(),
+            )
+            .increment(1);
+        }
+    }
+
+    fn record_external_by_id_indeterminate_shard(&self, shard: u16, kind: &str) {
+        counter!(
+            METRIC_EXTERNAL_BY_ID_INDETERMINATE_SHARD,
+            METRIC_LABEL_SHARD => shard.to_string(),
+            METRIC_LABEL_KIND => kind.to_owned(),
+        )
+        .increment(1);
+    }
+
+    fn record_external_signal_by_id_oldest_pending_indeterminate_age(&self, age_secs: f64) {
+        gauge!(METRIC_EXTERNAL_SIGNAL_BY_ID_OLDEST_PENDING_AGE).set(age_secs);
+    }
+
+    fn record_external_cancel_by_id_oldest_pending_indeterminate_age(&self, age_secs: f64) {
+        gauge!(METRIC_EXTERNAL_CANCEL_BY_ID_OLDEST_PENDING_AGE).set(age_secs);
+    }
+
+    fn record_external_by_id_found_over_incomplete_fanout(&self, shard: u16) {
+        counter!(
+            METRIC_EXTERNAL_BY_ID_FOUND_OVER_INCOMPLETE_FANOUT,
+            METRIC_LABEL_SHARD => shard.to_string(),
+        )
+        .increment(1);
+    }
+
+    fn record_external_by_id_other_live_observed(&self, shard: u16) {
+        counter!(
+            METRIC_EXTERNAL_BY_ID_OTHER_LIVE_OBSERVED,
+            METRIC_LABEL_SHARD => shard.to_string(),
+        )
+        .increment(1);
+    }
+
     fn record_rate_limit_tokens_available(&self, key: &str, tokens: f64) {
         gauge!(
             METRIC_RATE_LIMIT_TOKENS_AVAILABLE,
@@ -918,6 +993,15 @@ impl MetricsRecorder for MetricsRsRecorder {
             METRIC_QUOTA_REJECTED,
             METRIC_LABEL_WORKFLOW => workflow.to_owned(),
             METRIC_LABEL_RESOURCE => resource.to_owned(),
+        )
+        .increment(1);
+    }
+
+    fn record_quota_supersede_credit_not_shed(&self, workflow: &str, gap: u64) {
+        counter!(
+            METRIC_QUOTA_SUPERSEDE_CREDIT_NOT_SHED,
+            METRIC_LABEL_WORKFLOW => workflow.to_owned(),
+            METRIC_LABEL_GAP => gap.to_string(),
         )
         .increment(1);
     }
@@ -1275,6 +1359,7 @@ mod tests {
         rec.record_timer_started(30.0);
         rec.record_queue_depth("q", 5);
         rec.record_dlq_entries(0, 2);
+        rec.record_dispatch_dropped_hints(0);
         rec.record_schedule_run("workflow", "nightly");
         rec.record_schedule_skipped("workflow", "nightly", "paused");
         rec.record_schedule_decision_write_failed();
@@ -1299,6 +1384,14 @@ mod tests {
         // Issue #617: chain-timeout counter bridge.
         rec.record_workflow_timeout("wf", "q");
         rec.record_workflow_chain_timeout("wf", "q");
+        // Issue #1307: by-id indeterminate-fan-out observability.
+        rec.record_external_cancel_sent("delivered", None);
+        rec.record_external_by_id_indeterminate_shard(0, "no_pool");
+        rec.record_external_signal_by_id_oldest_pending_indeterminate_age(0.0);
+        rec.record_external_cancel_by_id_oldest_pending_indeterminate_age(0.0);
+        rec.record_external_by_id_found_over_incomplete_fanout(0);
+        // Issue #1313: by-id other-live-run observability.
+        rec.record_external_by_id_other_live_observed(0);
     }
 
     // -----------------------------------------------------------------------
@@ -1977,6 +2070,98 @@ mod tests {
             )],
             "the bridge must register exactly the workflow + gap label constants, \
              with no concurrency-key label and no value swap"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Supersede-credit-not-shed bridge (issue #1228 review, P2)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bridges_quota_supersede_credit_not_shed_with_workflow_and_gap_labels() {
+        // Mirrors `bridges_concurrency_residual_over_limit_with_workflow_and_gap_labels`.
+        // A full-surface `MetricsRsRecorder` that forgets to override a new
+        // trait method silently resolves to the no-op default. The counter
+        // would then never be exported for any deployment using this
+        // adapter. A real `metrics::Recorder` captures the registered
+        // counter key so a dropped/swapped label, or an accidentally-added
+        // quota-key label (forbidden by ADR-0001 §7), is caught here.
+        type CounterKey = (String, Vec<(String, String)>);
+
+        #[derive(Default)]
+        struct CapturingRecorder {
+            counters: std::sync::Mutex<Vec<CounterKey>>,
+        }
+
+        impl metrics::Recorder for &CapturingRecorder {
+            fn describe_counter(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn describe_gauge(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn describe_histogram(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn register_counter(
+                &self,
+                key: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Counter {
+                self.counters.lock().unwrap().push((
+                    key.name().to_owned(),
+                    key.labels()
+                        .map(|l| (l.key().to_owned(), l.value().to_owned()))
+                        .collect(),
+                ));
+                metrics::Counter::noop()
+            }
+            fn register_gauge(
+                &self,
+                _: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Gauge {
+                metrics::Gauge::noop()
+            }
+            fn register_histogram(
+                &self,
+                _: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Histogram {
+                metrics::Histogram::noop()
+            }
+        }
+
+        let capture = CapturingRecorder::default();
+        metrics::with_local_recorder(&&capture, || {
+            let rec = MetricsRsRecorder;
+            rec.record_quota_supersede_credit_not_shed("doc_index", 1);
+        });
+
+        let counters = capture.counters.lock().unwrap().clone();
+        assert_eq!(
+            counters.as_slice(),
+            &[(
+                METRIC_QUOTA_SUPERSEDE_CREDIT_NOT_SHED.to_owned(),
+                vec![
+                    (METRIC_LABEL_WORKFLOW.to_owned(), "doc_index".to_owned()),
+                    (METRIC_LABEL_GAP.to_owned(), "1".to_owned()),
+                ],
+            )],
+            "the bridge must register exactly the workflow + gap label constants, \
+             with no quota-key label and no value swap"
         );
     }
 

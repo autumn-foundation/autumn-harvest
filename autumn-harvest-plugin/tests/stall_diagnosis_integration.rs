@@ -39,6 +39,8 @@ use autumn_harvest::context::{ActivityContext, WorkflowContext};
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
 use autumn_harvest::policy::CircuitBreakerPolicy;
+use autumn_harvest::queue;
+use autumn_harvest::queue_pause;
 use autumn_harvest::scheduler::{DagCatalog, SchedulerMonitor};
 use autumn_harvest::shard::ShardRouter;
 use autumn_harvest::store;
@@ -48,7 +50,6 @@ use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -193,6 +194,23 @@ fn breaker_activity() -> ActivityInfo {
     }
 }
 
+/// Same shape as [`breaker_activity`], but a millisecond-scale cooldown.
+/// Issue #1368: a test needs a breaker whose cooldown has genuinely elapsed
+/// in real time before the endpoint reads it. The short cooldown avoids an
+/// actual 30-second sleep.
+fn fast_cooldown_breaker_activity() -> ActivityInfo {
+    ActivityInfo {
+        name: "quick_probe",
+        default_queue: Some("quickpay"),
+        circuit_breaker: Some(CircuitBreakerPolicy::new(
+            3,
+            Duration::from_secs(60),
+            Duration::from_millis(150),
+        )),
+        ..breaker_activity()
+    }
+}
+
 /// A plain activity with NO circuit breaker. Required for the rate-limit tests:
 /// a breaker-tracked activity enforces its rate limit at DISPATCH (issue #369),
 /// so its bucket is deliberately never consulted at claim time.
@@ -303,6 +321,7 @@ fn build_api_state_without_local_worker(pool: &DbPool) -> (HarvestApiState, Arc<
         vec![wf_info("activity_wf", activity_workflow)],
         vec![
             breaker_activity(),
+            fast_cooldown_breaker_activity(),
             plain_activity(),
             registry_gated_activity(),
         ],
@@ -337,6 +356,7 @@ fn build_api_state_with_registry(
         ],
         vec![
             breaker_activity(),
+            fast_cooldown_breaker_activity(),
             plain_activity(),
             registry_gated_activity(),
         ],
@@ -362,7 +382,7 @@ fn build_api_state(pool: &DbPool) -> HarvestApiState {
 }
 
 fn build_api_app(state: HarvestApiState) -> axum::Router {
-    harvest_api_router(state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(state)
 }
 
 async fn get_json(app: &axum::Router, uri: &str, admin: bool) -> (StatusCode, Value) {
@@ -879,6 +899,175 @@ async fn ac5_organically_tripped_circuit_reports_a_derived_cooldown_until() {
     assert!(
         parsed > before && parsed <= before + chrono::Duration::seconds(31),
         "cooldown must land inside the policy's 30s window: {parsed} vs {before}"
+    );
+}
+
+/// Issue #1368. An organic breaker whose cooldown has ALREADY elapsed by the
+/// snapshot read, on an ALREADY-DUE row, must resolve to a healthy verdict.
+/// It must not resolve to `activity_circuit_open`.
+///
+/// `build_diagnosis_report` used to read two clocks. An early `now` came
+/// before the DB gathering queries. A later `now` came right before the
+/// circuit-breaker read, and `cooldown_until` was derived from it.
+/// `classify_execution` compared the EARLY `now` against a `cooldown_until`
+/// derived from the LATER one. For a breaker with zero remaining cooldown,
+/// `cooldown_until` pinned to the later instant, always after the stale
+/// early one. So the "already cleared" guard could never fire for this
+/// case. The fix collapses both captures into one later `now`.
+#[tokio::test]
+async fn ac5_organic_circuit_already_cleared_by_snapshot_reports_healthy() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let (api_state, registry) = build_api_state_with_registry(&pool, true);
+    // `fast_cooldown_breaker_activity()` trips at 3 failures, cooldown 150ms.
+    let trip_at = std::time::Instant::now();
+    for _ in 0..3 {
+        registry
+            .circuit_breakers()
+            .on_external_failure("quick_probe", trip_at);
+    }
+    // Sleep past the cooldown. This is the "already cleared" case: by the
+    // time the endpoint takes its snapshot, `time_until_probe_secs` reads
+    // exactly 0.0.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let app = build_api_app(api_state);
+
+    let exec_id = seed_execution(
+        &pool,
+        "activity_wf",
+        "RUNNING",
+        vec![started_event(), scheduled_activity_event()],
+    )
+    .await;
+    seed_activity_task(
+        &pool,
+        exec_id,
+        "quick_probe",
+        "quickpay",
+        "PENDING",
+        1,
+        Some("gateway 503"),
+        "NOW() - INTERVAL '1 minute'",
+    )
+    .await;
+    // The co-located worker (see `LOCAL_WORKER_ID`) -- the single-replica shape
+    // in which this process's breaker is the one that gates dispatch.
+    seed_live_worker(&pool, LOCAL_WORKER_ID, "quickpay").await;
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(
+        kind(&body),
+        "healthy_in_progress",
+        "an organic breaker whose cooldown already cleared by the snapshot \
+         read, on an already-due row, must not still read as circuit-open: \
+         {body}"
+    );
+    assert_eq!(body["health"], "healthy", "body: {body}");
+    // Issue #1371: `contributing_reason_codes` is built independently of
+    // `blocked_on` and must agree with it. A stale `circuit_open` here would
+    // contradict the endpoint's own "currently holds" contract for this
+    // exact row.
+    assert!(
+        !body["contributing_reason_codes"]
+            .as_array()
+            .expect("reason codes")
+            .iter()
+            .any(|r| r == "circuit_open"),
+        "an already-cleared organic cooldown must not contribute circuit_open: {body}"
+    );
+}
+
+/// Issue #1371, per-row rather than per-response. Two activities in ONE
+/// execution: slot A's organic cooldown has already cleared (must NOT
+/// contribute `circuit_open`), slot B's has not (must still contribute it).
+/// Proves the filter is scoped to the row whose guard actually fires, not a
+/// blanket suppression once any row's guard fires anywhere in the fan-out.
+#[tokio::test]
+async fn ac5_fan_out_omits_circuit_open_for_a_cleared_slot_but_keeps_a_still_open_sibling() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let (api_state, registry) = build_api_state_with_registry(&pool, true);
+    // Slot A: `charge_card`, 30s cooldown, tripped and left to cool -- still
+    // certainly open by the time the snapshot is read.
+    let now = std::time::Instant::now();
+    for _ in 0..3 {
+        registry
+            .circuit_breakers()
+            .on_external_failure("charge_card", now);
+    }
+    // Slot B: `quick_probe`, 150ms cooldown, tripped then slept past it.
+    let trip_at = std::time::Instant::now();
+    for _ in 0..3 {
+        registry
+            .circuit_breakers()
+            .on_external_failure("quick_probe", trip_at);
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let app = build_api_app(api_state);
+
+    let exec_id = seed_execution(
+        &pool,
+        "activity_wf",
+        "RUNNING",
+        vec![started_event(), scheduled_activity_event()],
+    )
+    .await;
+    seed_activity_task(
+        &pool,
+        exec_id,
+        "charge_card",
+        "payments",
+        "PENDING",
+        1,
+        Some("gateway 503"),
+        "NOW() - INTERVAL '1 minute'",
+    )
+    .await;
+    seed_activity_task(
+        &pool,
+        exec_id,
+        "quick_probe",
+        "quickpay",
+        "PENDING",
+        1,
+        Some("gateway 503"),
+        "NOW() - INTERVAL '1 minute'",
+    )
+    .await;
+    // One worker row covering BOTH queues: `seed_live_worker` upserts on
+    // `ON CONFLICT (worker_id) DO NOTHING`, so a second call for the same
+    // `LOCAL_WORKER_ID` would silently drop the first queue.
+    {
+        let mut conn = pool.get().await.expect("pooled conn");
+        diesel::sql_query(
+            "INSERT INTO harvest_workers \
+             (worker_id, last_heartbeat_at, status, queues, shard_assignments, \
+              max_concurrency, host) \
+             VALUES ($1, NOW(), 'Active', $2, '[0]'::jsonb, 10, 'test-host')",
+        )
+        .bind::<diesel::sql_types::Text, _>(LOCAL_WORKER_ID)
+        .bind::<diesel::sql_types::Jsonb, _>(json!(["payments", "quickpay"]))
+        .execute(&mut conn)
+        .await
+        .expect("seed worker covering both queues");
+    }
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(
+        kind(&body),
+        "activity_circuit_open",
+        "the still-open slot outranks the cleared one's healthy verdict: {body}"
+    );
+    let reasons = body["contributing_reason_codes"]
+        .as_array()
+        .expect("reasons");
+    assert!(
+        reasons.iter().any(|r| r == "circuit_open"),
+        "the still-open sibling must contribute circuit_open: {body}"
+    );
+    assert!(
+        !reasons.iter().any(|r| r == "no_live_worker"),
+        "both slots have a live poller: {body}"
     );
 }
 
@@ -1756,6 +1945,330 @@ async fn overdue_timer_still_wins_when_the_task_own_wake_was_missed() {
     let body = diagnose(&app, exec_id).await;
     assert_eq!(kind(&body), "timer_overdue", "body: {body}");
     assert_eq!(body["health"], "stalled", "body: {body}");
+}
+
+/// Issue #1402. A queue-pause resume credits held time back onto
+/// `scheduled_at` (`queue_pause::resume_shift_scheduled_at_query`). That
+/// can drift it an UNBOUNDED distance from a timer's own `fires_at` --
+/// long past both the exact match and `timer_owns_the_wake`'s tolerance.
+/// Before this fix it masked a genuinely missed wake as a healthy
+/// `sleeping_timer`. Reproduces the regression end to end against the
+/// real production write paths. `queue::reschedule_task` arms the timer.
+/// The real `queue_pause::pause_queue`/`resume_queue` pair then holds and
+/// releases the queue. The diagnose endpoint must still report
+/// `timer_overdue`.
+#[tokio::test]
+async fn overdue_timer_still_wins_after_a_queue_pause_resume_shift() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(&pool, "timer_wf", "RUNNING", vec![started_event()]).await;
+    let task_id = Uuid::new_v4();
+    // Already overdue by 2 hours before the pause ever starts -- the same
+    // shape a real hours-long operator pause leaves behind once dispatch
+    // catches up.
+    let fires_at = Utc::now() - chrono::Duration::hours(2);
+    {
+        let mut conn = pool.get().await.expect("pooled conn");
+        diesel::sql_query(
+            "INSERT INTO harvest_task_queue \
+             (id, queue_name, task_type, workflow_exec_id, input, state, priority, \
+              attempt, max_attempts, scheduled_at, worker_id) \
+             VALUES ($1, 'resume-shift-q', 'workflow', $2, '{}'::jsonb, 'RUNNING', 0, 1, 3, \
+                     NOW(), 'w-claiming')",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("seed running workflow task");
+
+        // The real production write path: `persist_started_timer` calls
+        // this with the identical value it inserts into
+        // `harvest_timers.fires_at`, which is what stamps `timer_fires_at`.
+        queue::reschedule_task(&mut conn, task_id, fires_at)
+            .await
+            .expect("arm the timer");
+
+        // `reschedule_task` never touches `created_at`, so a genuinely
+        // timer-owned row's `created_at` is its ORIGINAL creation time --
+        // older than the timer's own deadline (issue #1191 review). The
+        // seed above left it at insert time; backdate it explicitly.
+        diesel::sql_query(
+            "UPDATE harvest_task_queue SET created_at = NOW() - INTERVAL '3 hours' \
+             WHERE id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .execute(&mut conn)
+        .await
+        .expect("backdate created_at");
+
+        diesel::sql_query(
+            "INSERT INTO harvest_timers (id, workflow_exec_id, timer_id, fires_at, fired) \
+             VALUES ($1, $2, 'long_sleep', $3, false)",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .bind::<diesel::sql_types::Timestamptz, _>(fires_at)
+        .execute(&mut conn)
+        .await
+        .expect("seed the timer");
+    }
+    seed_live_worker(&pool, "w-live", "resume-shift-q").await;
+
+    // The real production pause/resume pair. `paused_at` is backdated
+    // after the pause. The credit shift then models an hours-long
+    // real-world hold, not this test's own millisecond round trip. A
+    // millisecond gap would land inside `timer_owns_the_wake`'s 2-second
+    // tolerance and pass even without issue #1402's fix. That would
+    // silently defeat the regression this test exists to pin.
+    {
+        let mut conn = pool.get().await.expect("pooled conn");
+        queue_pause::pause_queue(&mut conn, "resume-shift-q", "maintenance", "operator", None)
+            .await
+            .expect("pause the queue");
+        diesel::sql_query(
+            "UPDATE harvest_queue_pauses SET paused_at = NOW() - INTERVAL '90 minutes' \
+             WHERE queue_name = 'resume-shift-q'",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("backdate the pause");
+        queue_pause::resume_queue(&mut conn, "resume-shift-q", "operator")
+            .await
+            .expect("resume the queue");
+    }
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(
+        kind(&body),
+        "timer_overdue",
+        "the resume credit must not mask a genuinely missed timer wake: {body}"
+    );
+    assert_eq!(body["health"], "stalled", "body: {body}");
+}
+
+#[derive(diesel::QueryableByName)]
+struct ScheduledAtAndTimerFiresAt {
+    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+    scheduled_at: chrono::DateTime<Utc>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
+    timer_fires_at: Option<chrono::DateTime<Utc>>,
+}
+
+/// Issue #1402. A row already armed by `reschedule_task` before the
+/// `timer_fires_at` migration ever ran gets `NULL` from `ADD COLUMN`, not
+/// the marker. `is_the_missed_timer_wake`'s exact-match branch trusts
+/// `scheduled_at == fires_at` outright. So the row stays safe until
+/// something drifts `scheduled_at` away: a queue-pause resume, an orphan
+/// reclaim, or a capability-miss release. At that point no marker
+/// survives the drift, and the exact false negative issue #1402 fixes
+/// reopens for that one pre-existing row.
+///
+/// The migration's backfill closes this. It replays against a row seeded
+/// to look like one that predates the column, then drifts `scheduled_at`
+/// through the real `queue_pause` pair. The backfilled marker must
+/// survive the drift, same as a freshly-armed row's would.
+#[tokio::test]
+async fn migration_backfill_lets_a_pre_existing_armed_timer_survive_a_later_resume_shift() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(&pool, "timer_wf", "RUNNING", vec![started_event()]).await;
+    let task_id = Uuid::new_v4();
+    let fires_at = Utc::now() - chrono::Duration::hours(2);
+    {
+        let mut conn = pool.get().await.expect("pooled conn");
+
+        // `state`/`worker_id` modeled as `queue::reschedule_task` itself
+        // leaves them (PENDING, no claimant), but `scheduled_at` inserted
+        // directly rather than through that function, so `timer_fires_at`
+        // stays unset. That is exactly the shape `ADD COLUMN` leaves a row
+        // armed before this migration ever ran.
+        diesel::sql_query(
+            "INSERT INTO harvest_task_queue \
+             (id, queue_name, task_type, workflow_exec_id, input, state, priority, \
+              attempt, max_attempts, scheduled_at) \
+             VALUES ($1, 'premigration-backfill-q', 'workflow', $2, '{}'::jsonb, 'PENDING', 0, \
+                     1, 3, $3)",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .bind::<diesel::sql_types::Timestamptz, _>(fires_at)
+        .execute(&mut conn)
+        .await
+        .expect("seed a pre-migration-shaped armed row");
+
+        diesel::sql_query(
+            "UPDATE harvest_task_queue SET created_at = NOW() - INTERVAL '3 hours' \
+             WHERE id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .execute(&mut conn)
+        .await
+        .expect("backdate created_at");
+
+        diesel::sql_query(
+            "INSERT INTO harvest_timers (id, workflow_exec_id, timer_id, fires_at, fired) \
+             VALUES ($1, $2, 'long_sleep', $3, false)",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .bind::<diesel::sql_types::Timestamptz, _>(fires_at)
+        .execute(&mut conn)
+        .await
+        .expect("seed the timer");
+
+        // Replay the shipped migration to simulate deploying it against
+        // this already-seeded, pre-migration-shaped row. It is idempotent:
+        // `ADD COLUMN IF NOT EXISTS`, `COMMENT ON COLUMN`, and the
+        // backfill `UPDATE` all tolerate a rerun.
+        let up_sql = include_str!(
+            "../../autumn-harvest/migrations/20260921011505_harvest_task_queue_timer_fires_at/up.sql"
+        );
+        conn.batch_execute(up_sql)
+            .await
+            .expect("replay the migration's backfill");
+
+        let row: ScheduledAtAndTimerFiresAt = diesel::sql_query(
+            "SELECT scheduled_at, timer_fires_at FROM harvest_task_queue WHERE id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .get_result(&mut conn)
+        .await
+        .expect("read back the backfilled row");
+        // Compared against the row's own stored `scheduled_at`, not the
+        // Rust-side `fires_at` the row was seeded from. Postgres
+        // `TIMESTAMPTZ` rounds to microseconds, one step coarser than
+        // `chrono`'s nanosecond value. The two never compare equal
+        // directly, even though the backfill copied one from the other.
+        assert_eq!(
+            row.timer_fires_at,
+            Some(row.scheduled_at),
+            "the backfill must stamp timer_fires_at from the exact-match row's own scheduled_at"
+        );
+    }
+    seed_live_worker(&pool, "w-live", "premigration-backfill-q").await;
+
+    // The real production pause/resume pair, same as the freshly-armed
+    // case above. The whole point of the backfill is that a pre-existing
+    // row survives this identically.
+    {
+        let mut conn = pool.get().await.expect("pooled conn");
+        queue_pause::pause_queue(
+            &mut conn,
+            "premigration-backfill-q",
+            "maintenance",
+            "operator",
+            None,
+        )
+        .await
+        .expect("pause the queue");
+        diesel::sql_query(
+            "UPDATE harvest_queue_pauses SET paused_at = NOW() - INTERVAL '90 minutes' \
+             WHERE queue_name = 'premigration-backfill-q'",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("backdate the pause");
+        queue_pause::resume_queue(&mut conn, "premigration-backfill-q", "operator")
+            .await
+            .expect("resume the queue");
+    }
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(
+        kind(&body),
+        "timer_overdue",
+        "the backfilled marker must survive the resume credit just like a freshly-armed \
+         row's would: {body}"
+    );
+    assert_eq!(body["health"], "stalled", "body: {body}");
+}
+
+/// Issue #1402's original ask. Confirm a queue-pause resume of a
+/// workflow-type row that was NOT timer-owned still behaves correctly
+/// when an unrelated armed timer happens to be nearby. This row's own
+/// wake source was a signal/child/handoff -- `wake_workflow_task`'s
+/// repend fingerprint: `scheduled_at` = wake instant, `created_at` ~5s
+/// later, `timer_fires_at` unset. The resume credit must not turn it
+/// into a false `timer_overdue` for the unrelated timer sitting nearby.
+#[tokio::test]
+async fn queue_pause_resume_does_not_misattribute_an_unrelated_timer_to_a_signal_repend() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_api_app(build_api_state(&pool));
+
+    let exec_id = seed_execution(&pool, "timer_wf", "RUNNING", vec![started_event()]).await;
+    {
+        let mut conn = pool.get().await.expect("pooled conn");
+        // Armed long before the wake, unrelated to it -- the same fixture
+        // shape `overdue_timer_is_not_a_stall_when_a_different_wake_source_re_pended_the_task`
+        // uses.
+        diesel::sql_query(
+            "INSERT INTO harvest_timers (id, workflow_exec_id, timer_id, fires_at, fired) \
+             VALUES ($1, $2, 'partner_deadline', NOW() - INTERVAL '20 minutes', false)",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("seed unrelated overdue timer");
+    }
+    // `wake_workflow_task`'s re-pend fingerprint: PENDING, already due,
+    // created_at ~5s after scheduled_at, no timer marker.
+    seed_workflow_task(
+        &pool,
+        exec_id,
+        "resume-safety-q",
+        "PENDING",
+        None,
+        "NOW() - INTERVAL '30 seconds'",
+    )
+    .await;
+    {
+        let mut conn = pool.get().await.expect("pooled conn");
+        diesel::sql_query(
+            "UPDATE harvest_task_queue SET created_at = NOW() - INTERVAL '25 seconds' \
+             WHERE workflow_exec_id = $1 AND task_type = 'workflow'",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("set the repend fingerprint's created_at");
+    }
+    seed_live_worker(&pool, "w-live", "resume-safety-q").await;
+
+    // Pause and resume the queue the row happens to sit on. That is
+    // unrelated to why the row is PENDING. It still credits held time
+    // onto scheduled_at, drifting it further from the unrelated timer's
+    // fires_at than it already was.
+    {
+        let mut conn = pool.get().await.expect("pooled conn");
+        queue_pause::pause_queue(
+            &mut conn,
+            "resume-safety-q",
+            "maintenance",
+            "operator",
+            None,
+        )
+        .await
+        .expect("pause the queue");
+        queue_pause::resume_queue(&mut conn, "resume-safety-q", "operator")
+            .await
+            .expect("resume the queue");
+    }
+
+    let body = diagnose(&app, exec_id).await;
+    assert_eq!(
+        kind(&body),
+        "sleeping_timer",
+        "the unrelated timer must not be attributed to this signal-driven \
+         repend just because the queue it sits on was paused and resumed: {body}"
+    );
+    assert_eq!(body["health"], "healthy", "body: {body}");
 }
 
 /// Issue #1191. `wake_workflow_task` re-pends a parked row to PENDING. It

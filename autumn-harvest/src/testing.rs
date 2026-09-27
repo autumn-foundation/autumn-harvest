@@ -5941,19 +5941,20 @@ impl WorkflowTestEnv {
                 });
             }
 
-            let (outcome, pending_cmds, _span) = run_workflow_with_state_advancing_clock(
-                exec_id,
-                history.clone(),
-                handler,
-                input.clone(),
-                self.state.clone(),
-                span_meta.as_ref(),
-                self.metrics.clone(),
-                // Issue #790: the durable-log policy this env was configured
-                // with (`None` = the sink disabled, the default).
-                self.workflow_log_policy,
-            )
-            .await;
+            let (outcome, pending_cmds, _span, _resolved_router) =
+                run_workflow_with_state_advancing_clock(
+                    exec_id,
+                    history.clone(),
+                    handler,
+                    input.clone(),
+                    self.state.clone(),
+                    span_meta.as_ref(),
+                    self.metrics.clone(),
+                    // Issue #790: the durable-log policy this env was configured
+                    // with (`None` = the sink disabled, the default).
+                    self.workflow_log_policy,
+                )
+                .await;
 
             // Issue #790: harvest this cycle's durable-log commands before the
             // outcome is consumed. A suspension carries them on

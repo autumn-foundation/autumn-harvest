@@ -113,10 +113,28 @@ notification, per
 [the configuration these numbers were taken at](#the-configuration-these-numbers-were-taken-at).
 
 Neither point says whether Harvest is faster or slower than anything else.
-This suite has not run another engine's benchmark, and a competitor's own
-published figure would carry accuracy and staleness this project cannot vouch
-for. A comparison worth trusting re-runs both engines on the same hardware,
-which is why this suite ships in the repo — see [Reproducing](#reproducing).
+This suite still runs no competitor, and a competitor's own published figure
+would carry accuracy and staleness this project cannot vouch for. A comparison
+worth trusting re-runs both engines on the same hardware, which is why this
+suite ships in the repo — see [Reproducing](#reproducing).
+
+**One such comparison has now been run on this page's own workflow, and
+Harvest lost it.** It is reported in the assay ledger rather than here, and
+the engine is deliberately not named on this page: issue #1309's acceptance
+criterion is that no competitor figure appears on it, and
+`benchmarks_docs.rs` enforces that. See
+[the assay ledger](assays/README.md), entries 10 and 11, for the measured
+numbers, the pre-registration that fixed in advance what they may not be read
+to mean, and the depth diagnostic that separates a known claim-path defect
+from an architectural gap.
+
+Two things about that result belong here, because they bear on this page's
+own numbers rather than on any other engine. The first is that the margin
+widened sharply with backlog depth, which is the `#786`/`#1177` claim path
+this page already cross-references: the Postgres arm fell 4.2x between a
+500-row and a 2,000-row backlog. The second is that the Redis dispatch
+channel did not fall at all over the same range, which is what an operator
+choosing between the two modes actually needs to know.
 
 ### Results by release
 
@@ -321,10 +339,17 @@ happened.
   the first signal, which is four orders of magnitude more than that window — but
   the window is not *closed*, and a signal that beat a suspension would be
   recorded as a shorter round trip than it was.
-* **Nothing sweeps up after a crash.** Databases are named uniquely per run and
-  dropped on every ordinary exit, including the error paths. A panic or a Ctrl-C
-  can still leave a handful behind on a server you supplied; they are all named
-  `harvest_e2e_*` and safe to drop.
+* **A crash's databases are swept on the next run, not the same one.** Databases
+  are named uniquely per run and dropped on every ordinary exit, including the
+  error paths. A panic or a Ctrl-C skips that: dropping a database is async, so
+  the harness cannot run it from a `Drop`. Provisioning against an existing
+  server (`HARVEST_TEST_DATABASE_URL` or `HARVEST_BENCH_SHARD_URLS`) sweeps for
+  exactly this before creating its own databases: an advisory lock serializes
+  the sweep against concurrent runs, only a name matching the full minted shape
+  is ever a candidate, and a database still holding a live connection is left
+  alone. A crash between runs is therefore self-healing; no manual cleanup is
+  needed. The testcontainer path has nothing to sweep — the container itself is
+  the whole server, and destroying it reclaims everything.
 * **The throughput window does not verify every shard stayed loaded.** Each
   shard runs a fixed completion quota, and the sustained rate is taken over the
   middle half of all shards' completions pooled together. If one shard finishes
@@ -335,9 +360,13 @@ happened.
   seconds of each other, so the effect is small — but it is unmeasured, and
   closing it needs an aligned per-shard window. Tracked in
   [#1288](https://github.com/autumn-foundation/autumn-harvest/issues/1288).
-* **A supplied URL must be able to `CREATE DATABASE`.** `HARVEST_BENCH_SHARD_URLS`
-  and `HARVEST_TEST_DATABASE_URL` are treated as **admin** URLs. A role without
-  that right produces a skip notice, not an error.
+* **A supplied URL must be able to `CREATE DATABASE`, and to `CONNECT` to the
+  `postgres` database on that server.** `HARVEST_BENCH_SHARD_URLS` and
+  `HARVEST_TEST_DATABASE_URL` are treated as **admin** URLs. The
+  stale-database sweep and its advisory lock always connect through
+  `postgres` specifically, regardless of which database the URL names, so
+  that every client sweeping the same server agrees on where the lock lives.
+  A role without either right produces a skip notice, not an error.
 
 ## Relationship to the other performance pages
 

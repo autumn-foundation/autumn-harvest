@@ -19,12 +19,12 @@ use std::path::{Path, PathBuf};
 
 use autumn_harvest_plugin::dev::MAX_UNIX_SOCKET_PATH_LEN;
 use autumn_harvest_plugin::dev::{
-    BannerInputs, DatabaseSafety, DevRuntimeConfig, DiscoveryEnv, Platform, ReapDecision,
-    RefusalReason, SessionRecord, SkipReason, StorageDescription, SuspicionReason,
+    BannerInputs, DatabaseSafety, DevRuntimeConfig, DiscoveryEnv, Platform, PostmasterIdentity,
+    ReapDecision, RefusalReason, SessionRecord, SkipReason, StorageDescription, SuspicionReason,
     candidate_bin_dirs, classify_database_url, decide_reap, effective_postmaster_pid,
-    ephemeral_dsn, http_authority, parse_postmaster_pid, postgres_conf_lines, proc_stat_is_live,
-    proc_stat_start_time, record_is_self_consistent, redact_dsn, render_banner, resolve_bin_dir,
-    unix_socket_path_len, write_private_atomic,
+    ephemeral_dsn, escape_conf_string, http_authority, parse_postmaster_pid, postgres_conf_lines,
+    proc_stat_is_live, proc_stat_start_time, record_is_self_consistent, redact_dsn, render_banner,
+    resolve_bin_dir, unix_socket_path_len, write_private_atomic,
 };
 
 // ---------------------------------------------------------------------------
@@ -866,7 +866,13 @@ fn record(owner_pid: u32, postmaster_pid: Option<u32>) -> SessionRecord {
 
 #[test]
 fn reap_leaves_a_live_session_alone() {
-    let decision = decide_reap(&record(4242, Some(4243)), true, true, 99);
+    let decision = decide_reap(
+        &record(4242, Some(4243)),
+        true,
+        PostmasterIdentity::Confirmed,
+        99,
+        chrono::Utc::now(),
+    );
     assert!(
         matches!(decision, ReapDecision::Skip { .. }),
         "{decision:?}"
@@ -877,7 +883,13 @@ fn reap_leaves_a_live_session_alone() {
 fn reap_never_touches_our_own_session() {
     // The reaper runs at startup, after our own record could already exist from
     // a same-pid predecessor; identity beats liveness.
-    let decision = decide_reap(&record(4242, Some(4243)), true, true, 4242);
+    let decision = decide_reap(
+        &record(4242, Some(4243)),
+        true,
+        PostmasterIdentity::Confirmed,
+        4242,
+        chrono::Utc::now(),
+    );
     assert!(
         matches!(decision, ReapDecision::Skip { .. }),
         "{decision:?}"
@@ -886,7 +898,15 @@ fn reap_never_touches_our_own_session() {
 
 #[test]
 fn reap_stops_an_orphaned_postmaster_then_removes_the_directory() {
-    let decision = decide_reap(&record(4242, Some(4243)), false, true, 99);
+    // Steady state, token matched: the fix for issue #1295 must not regress
+    // the ordinary reap path.
+    let decision = decide_reap(
+        &record(4242, Some(4243)),
+        false,
+        PostmasterIdentity::Confirmed,
+        99,
+        chrono::Utc::now(),
+    );
     assert!(
         matches!(
             decision,
@@ -900,14 +920,145 @@ fn reap_stops_an_orphaned_postmaster_then_removes_the_directory() {
 
 #[test]
 fn reap_removes_the_directory_when_the_postmaster_is_already_gone() {
-    let decision = decide_reap(&record(4242, Some(4243)), false, false, 99);
+    // A known postmaster pid confirmed not running is proof on its own. The
+    // startup grace period (issue #1299) only ever applies when no
+    // postmaster was ever known.
+    let decision = decide_reap(
+        &record(4242, Some(4243)),
+        false,
+        PostmasterIdentity::NotRunning,
+        99,
+        chrono::Utc::now(),
+    );
     assert!(matches!(decision, ReapDecision::Remove), "{decision:?}");
 }
 
 #[test]
 fn reap_removes_a_session_that_died_before_recording_a_postmaster() {
-    let decision = decide_reap(&record(4242, None), false, false, 99);
+    // Old enough that the startup grace period (issue #1299) has passed. A
+    // record with no known postmaster this stale is confirmed dead, not
+    // merely still starting.
+    let mut aged = record(4242, None);
+    aged.created_at = chrono::Utc::now() - chrono::Duration::minutes(5);
+    let decision = decide_reap(
+        &aged,
+        false,
+        PostmasterIdentity::NotRunning,
+        99,
+        chrono::Utc::now(),
+    );
     assert!(matches!(decision, ReapDecision::Remove), "{decision:?}");
+}
+
+#[test]
+fn reap_skips_a_freshly_created_session_with_no_pid_file_yet() {
+    // Issue #1299. `pg_ctl` may have already launched Postgres before the
+    // owner was killed, and `postmaster.pid` appears only once the
+    // postmaster itself writes it. A record this new gets the benefit of the
+    // doubt rather than being read as proof no server exists.
+    let fresh = record(4242, None);
+    let decision = decide_reap(
+        &fresh,
+        false,
+        PostmasterIdentity::NotRunning,
+        99,
+        chrono::Utc::now(),
+    );
+    assert_eq!(
+        decision,
+        ReapDecision::Skip(SkipReason::PossiblyStillStarting),
+        "{decision:?}"
+    );
+}
+
+#[test]
+fn the_grace_period_boundary_is_15_seconds_not_some_other_unit() {
+    // Issue #1299 review. The other grace-period tests use margins (5
+    // minutes, ~0 seconds) wide enough that a wrong unit (15ms, 15 minutes)
+    // would not fail either. This pins the boundary itself, on one record so
+    // only the elapsed time differs between the two assertions.
+    let mut aging = record(4242, None);
+    let created_at = chrono::Utc::now() - chrono::Duration::seconds(14);
+    aging.created_at = created_at;
+
+    let still_within_grace = decide_reap(
+        &aging,
+        false,
+        PostmasterIdentity::NotRunning,
+        99,
+        created_at + chrono::Duration::seconds(14),
+    );
+    assert_eq!(
+        still_within_grace,
+        ReapDecision::Skip(SkipReason::PossiblyStillStarting),
+        "14s after creation must still be within the grace period: {still_within_grace:?}"
+    );
+
+    let past_grace = decide_reap(
+        &aging,
+        false,
+        PostmasterIdentity::NotRunning,
+        99,
+        created_at + chrono::Duration::seconds(16),
+    );
+    assert!(
+        matches!(past_grace, ReapDecision::Remove),
+        "16s after creation must be past the grace period: {past_grace:?}"
+    );
+}
+
+#[test]
+fn a_skipped_session_is_reaped_once_it_ages_past_the_grace_period() {
+    // Issue #1299 review. The same record, unmodified — `Skip` must never
+    // depend on a side effect that would re-stamp `created_at` on disk. Only
+    // the wall clock moves between the two polls.
+    let record = record(4242, None);
+
+    let first_poll = decide_reap(
+        &record,
+        false,
+        PostmasterIdentity::NotRunning,
+        99,
+        record.created_at + chrono::Duration::seconds(5),
+    );
+    assert_eq!(
+        first_poll,
+        ReapDecision::Skip(SkipReason::PossiblyStillStarting),
+        "{first_poll:?}"
+    );
+
+    let second_poll = decide_reap(
+        &record,
+        false,
+        PostmasterIdentity::NotRunning,
+        99,
+        record.created_at + chrono::Duration::seconds(16),
+    );
+    assert!(
+        matches!(second_poll, ReapDecision::Remove),
+        "the same record must be reaped once it ages out: {second_poll:?}"
+    );
+}
+
+#[test]
+fn a_tokenless_but_live_postmaster_is_skipped_not_stopped() {
+    // Issue #1295. A tokenless record used to fall back to plain liveness.
+    // A live pid at the recorded number was treated as a match. That held
+    // even when the OS had long reused that pid for something else.
+    // `decide_reap` must now skip, never `StopThenRemove`, on unknown
+    // identity: the pid could be ours, or could be a stranger.
+    let decision = decide_reap(
+        &record(4242, Some(4243)),
+        false,
+        PostmasterIdentity::Unknown,
+        99,
+        chrono::Utc::now(),
+    );
+    assert_eq!(
+        decision,
+        ReapDecision::Skip(SkipReason::PostmasterIdentityUnknown),
+        "{decision:?}"
+    );
 }
 
 #[test]
@@ -1163,11 +1314,15 @@ fn the_unix_socket_lives_inside_the_session_directory() {
     let conf = postgres_conf_lines(5432, &socket_dir).join("\n");
     // Built from the same path rather than spelled out: `Path::join` uses the
     // platform separator, so a hard-coded POSIX string asserts the separator
-    // instead of the containment this test is about.
+    // instead of the containment this test is about. Windows's separator is
+    // itself a backslash. So the expected value below goes through the same
+    // escaping the generated config does (issue #1299), not the raw path.
+    // Otherwise this fails on Windows, for the same reason the config now
+    // renders that separator doubled.
     assert!(
         conf.contains(&format!(
             "unix_socket_directories = '{}'",
-            socket_dir.display()
+            escape_conf_string(&socket_dir.to_string_lossy())
         )),
         "{conf}"
     );
@@ -1183,6 +1338,31 @@ fn a_quote_in_the_session_path_cannot_break_the_generated_config() {
     assert!(
         conf.contains("unix_socket_directories = '/tmp/o''brien/socket'"),
         "a literal quote must be doubled, per Postgres's own escaping rule: {conf}"
+    );
+}
+
+#[test]
+fn a_backslash_in_the_session_path_cannot_break_the_generated_config() {
+    // Issue #1299. Postgres's config lexer processes backslash escapes inside
+    // a single-quoted value, not just doubled quotes. An unescaped backslash
+    // decodes to a different string than the one the runtime created —
+    // verified empirically against a real `postgres -C`.
+    let conf = postgres_conf_lines(5432, Path::new(r"/tmp/bstest/a\tb")).join("\n");
+    assert!(
+        conf.contains(r"unix_socket_directories = '/tmp/bstest/a\\tb'"),
+        "a literal backslash must be doubled, or Postgres decodes it as an escape: {conf}"
+    );
+}
+
+#[test]
+fn a_backslash_and_a_quote_together_are_both_escaped_independently() {
+    // Issue #1299 review. Pins that the two escapes compose: each fires
+    // regardless of the other's output, so neither pass can undo or
+    // duplicate the other's work.
+    let conf = postgres_conf_lines(5432, Path::new(r"/tmp/a\b'c")).join("\n");
+    assert!(
+        conf.contains(r"unix_socket_directories = '/tmp/a\\b''c'"),
+        "the backslash and the quote must each be doubled on their own: {conf}"
     );
 }
 
@@ -1401,8 +1581,117 @@ fn banner_never_leaks_a_password() {
 // calls refuses nothing. These drive the real `DevRuntime::start`, which
 // rejects before it provisions anything — so they need no Postgres.
 
+/// Serializes every test in this binary that drives the real
+/// `DevRuntime::start`.
+///
+/// One of them, `starting_with_ambient_split_mode_configuration_is_refused`
+/// (issue #1291), mutates the process-wide `AUTUMN_HARVEST__MODE` and
+/// `AUTUMN_HARVEST_DATABASE__URL` env vars. `DevRuntime::start`'s new startup
+/// gate reads both from the real process environment. Left unguarded, that
+/// mutation would leak into every other `DevRuntime::start` test the harness
+/// happens to schedule at the same time. Each would then fail with
+/// `UnsupportedHarvestMode` instead of the refusal it actually asserts.
+static DEV_RUNTIME_START_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Sets or unsets one env var for a test, restoring exactly what was there
+/// before — present or absent — even if the test panics.
+///
+/// Every `DevRuntime::start` test in this file holds
+/// `DEV_RUNTIME_START_SERIAL` for as long as a guard like this is alive.
+/// This struct does no locking of its own. It assumes that lock is already
+/// held.
+struct EnvVarGuard {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    /// Set `key` to `value` for the life of this guard.
+    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let previous = std::env::var_os(key);
+        // SAFETY: the caller holds `DEV_RUNTIME_START_SERIAL` for this
+        // guard's whole life, so no concurrent test observes `key` mid-change.
+        unsafe { std::env::set_var(key, value) };
+        Self { key, previous }
+    }
+
+    /// Remove `key` for the life of this guard, whatever an inherited test
+    /// environment set it to.
+    ///
+    /// A `DevRuntime::start` test that expects a refusal OTHER than
+    /// `UnsupportedHarvestMode` must not depend on this process's ambient
+    /// environment. It must not assume that leaves Harvest mode at its
+    /// embedded default. An inherited `AUTUMN_HARVEST__MODE=split` would
+    /// otherwise make it see the new gate's refusal. That is not the refusal
+    /// it actually asserts (Codex review on issue #1291's pull request).
+    fn unset(key: &'static str) -> Self {
+        let previous = std::env::var_os(key);
+        // SAFETY: see `set`.
+        unsafe { std::env::remove_var(key) };
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        // SAFETY: see `set`.
+        unsafe {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
+
+/// Every env var `resolve_harvest_mode_source` reads, forced to a known-safe
+/// state. A `DevRuntime::start` test asserting a non-Harvest-mode refusal
+/// then sees the embedded default. This holds regardless of what the
+/// process inherited.
+///
+/// `AUTUMN_MANIFEST_DIR` is pointed at a fresh directory holding its own
+/// empty `autumn.toml`, not merely unset (Codex review, issue #1291).
+///
+/// `find_config_file_named` falls back to the process's current directory.
+/// It does this whenever the manifest directory has no matching file.
+/// Merely unsetting or emptying the directory still lets an ambient
+/// checkout-root config file leak in that way.
+///
+/// Pointing it at a real, empty file makes the lookup succeed there
+/// instead. That happens before the fallback ever runs.
+///
+/// `AUTUMN_PROFILE` is forced unset too, so no `autumn-<profile>.toml`
+/// lookup happens from that source. `resolve_profile` also falls back to
+/// `AUTUMN_IS_DEBUG` (Codex review, issue #1291), so this unsets that too.
+/// Otherwise an inherited `AUTUMN_IS_DEBUG=1`/`0` could still select a
+/// profile and reopen the same checkout-root fallback for its file.
+fn harvest_mode_env_cleared() -> [EnvVarGuard; 5] {
+    let manifest_dir = std::env::temp_dir().join(format!(
+        "autumn-harvest-plugin-embedded-manifest-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&manifest_dir).expect("manifest directory should be created");
+    std::fs::write(manifest_dir.join("autumn.toml"), "")
+        .expect("empty root config file should be written");
+    [
+        EnvVarGuard::unset("AUTUMN_HARVEST__MODE"),
+        EnvVarGuard::unset("AUTUMN_HARVEST_DATABASE__URL"),
+        EnvVarGuard::unset("AUTUMN_PROFILE"),
+        EnvVarGuard::unset("AUTUMN_IS_DEBUG"),
+        EnvVarGuard::set("AUTUMN_MANIFEST_DIR", &manifest_dir),
+    ]
+}
+
+// Holds `DEV_RUNTIME_START_SERIAL` across the `.await` below on purpose. The
+// lock keeps ambient env state stable for the whole call, mirroring the
+// `TEST_SERIAL` pattern in `start_idempotency_integration.rs`.
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn starting_against_a_remote_database_is_refused() {
+    let _guard = DEV_RUNTIME_START_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _env = harvest_mode_env_cleared();
     let error = autumn_harvest_plugin::dev::DevRuntime::start(DevRuntimeConfig {
         database_url: Some("postgres://u:p@db.prod.example.com:5432/app".to_owned()),
         // Kernel-chosen. These tests are about DSN classification, but the port
@@ -1424,10 +1713,15 @@ async fn starting_against_a_remote_database_is_refused() {
     );
 }
 
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn a_remote_database_is_refused_even_with_the_suspicious_name_opt_in() {
     // There is deliberately no override for a remote host, so the opt-in for a
     // production-shaped *name* must not double as one.
+    let _guard = DEV_RUNTIME_START_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _env = harvest_mode_env_cleared();
     let error = autumn_harvest_plugin::dev::DevRuntime::start(DevRuntimeConfig {
         database_url: Some("postgres://u:p@db.prod.example.com:5432/app".to_owned()),
         allow_suspicious_database_name: true,
@@ -1445,8 +1739,13 @@ async fn a_remote_database_is_refused_even_with_the_suspicious_name_opt_in() {
     );
 }
 
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn a_production_shaped_local_name_needs_the_explicit_opt_in() {
+    let _guard = DEV_RUNTIME_START_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _env = harvest_mode_env_cleared();
     let error = autumn_harvest_plugin::dev::DevRuntime::start(DevRuntimeConfig {
         database_url: Some("postgres://u:p@127.0.0.1:5432/myapp_production".to_owned()),
         http_port: 0,
@@ -1460,6 +1759,153 @@ async fn a_production_shaped_local_name_needs_the_explicit_opt_in() {
             autumn_harvest_plugin::dev::DevError::SuspiciousDatabase { .. }
         ),
         "{error}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1291 — the gate above only ever classifies the APPLICATION
+// database. Under `harvest.mode = split`/`external`, Harvest storage is a
+// second, independently resolved database. The gate above never sees it.
+// Ambient configuration could point the worker at a database the gate never
+// classified. The dev runtime owns one ephemeral cluster and has no second
+// database to offer. It refuses instead — see
+// `refuse_unsupported_harvest_mode` in `src/dev/mod.rs`, unit-tested there
+// (including the `autumn.toml` path) since `DevRuntime::start` calls it
+// verbatim as its first step.
+// ---------------------------------------------------------------------------
+
+// Holds `DEV_RUNTIME_START_SERIAL` across the `.await` below on purpose. The
+// lock keeps ambient env state stable for the whole call, mirroring the
+// `TEST_SERIAL` pattern in `start_idempotency_integration.rs`.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn starting_with_ambient_split_mode_configuration_is_refused() {
+    // Issue #1291's exact reproduction: a developer environment set up for a
+    // dedicated Harvest database refuses `cargo dev` rather than migrating
+    // and running a worker against it.
+    let _guard = DEV_RUNTIME_START_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _manifest = EnvVarGuard::unset("AUTUMN_MANIFEST_DIR");
+    let _mode = EnvVarGuard::set("AUTUMN_HARVEST__MODE", "split");
+    let _url = EnvVarGuard::set(
+        "AUTUMN_HARVEST_DATABASE__URL",
+        "postgres://user:pw@db.prod.example.com/harvest",
+    );
+
+    let result = autumn_harvest_plugin::dev::DevRuntime::start(DevRuntimeConfig {
+        http_port: 0,
+        ..DevRuntimeConfig::default()
+    })
+    .await;
+
+    let error = result.expect_err("split mode must refuse the dev runtime, not run it");
+    assert!(
+        matches!(
+            error,
+            autumn_harvest_plugin::dev::DevError::UnsupportedHarvestMode { .. }
+        ),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("AUTUMN_HARVEST__MODE"),
+        "the refusal must name the responsible variable: {error}"
+    );
+}
+
+// Same lock-across-`.await` rationale as the test above.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn starting_with_split_mode_from_autumn_toml_is_refused() {
+    // The other path a repo checkout can carry (issue #1291): a checked-in
+    // `autumn.toml` with `[harvest] mode = "split"` needs no environment
+    // variable at all.
+    let _guard = DEV_RUNTIME_START_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::write(
+        dir.path().join("autumn.toml"),
+        "[harvest]\nmode = \"split\"\n\n[harvest.database]\n\
+         url = \"postgres://user:pw@db.prod.example.com/harvest\"\n",
+    )
+    .expect("autumn.toml should be written");
+    let _mode = EnvVarGuard::unset("AUTUMN_HARVEST__MODE");
+    let _url = EnvVarGuard::unset("AUTUMN_HARVEST_DATABASE__URL");
+    // Unset, not just the manifest dir (Codex review, issue #1291).
+    //
+    // An inherited profile selector would resolve an ambient
+    // `autumn-<profile>.toml`. This temp dir holds no such file, so
+    // `find_config_file_named` falls back to the checkout for it. That
+    // file could override this test's root `autumn.toml` back to
+    // `embedded`.
+    let _profile = EnvVarGuard::unset("AUTUMN_PROFILE");
+    let _is_debug = EnvVarGuard::unset("AUTUMN_IS_DEBUG");
+    let _manifest = EnvVarGuard::set("AUTUMN_MANIFEST_DIR", dir.path());
+
+    let result = autumn_harvest_plugin::dev::DevRuntime::start(DevRuntimeConfig {
+        http_port: 0,
+        ..DevRuntimeConfig::default()
+    })
+    .await;
+
+    let error = result.expect_err("split mode from autumn.toml must refuse the dev runtime");
+    assert!(
+        matches!(
+            error,
+            autumn_harvest_plugin::dev::DevError::UnsupportedHarvestMode { .. }
+        ),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("autumn.toml"),
+        "the refusal must name the responsible file: {error}"
+    );
+}
+
+#[test]
+fn the_harvest_mode_gate_is_re_checked_after_provisioning() {
+    // Codex review (P1) on issue #1291's pull request. `provision_storage`
+    // can run for a long time, downloading Postgres on a clean machine.
+    // `autumn.toml` is a file this dev runtime does not own. A single check
+    // before provisioning proves nothing about ambient config once
+    // provisioning finishes. `DevRuntime::start` must re-check right before
+    // starting the server. It already re-proves its HTTP port the same way,
+    // rather than trusting the reservation from before provisioning.
+    //
+    // Asserted on the source, the same way the root-refusal ordering above
+    // is. The property is an ordering, not a single behavior. A test could
+    // not observe it without a way to mutate `autumn.toml` mid-provisioning.
+    let mod_rs = workspace_root().join("autumn-harvest-plugin/src/dev/mod.rs");
+    let body = strip_comment_lines(&std::fs::read_to_string(&mod_rs).expect("mod.rs"));
+
+    // `mod.rs` also defines `refuse_unsupported_harvest_mode` itself, and
+    // calls it from its own unit tests. So this counts every occurrence in
+    // the file rather than a fixed number. The two assertions below pin what
+    // actually matters: at least one call before `provision_storage`, and at
+    // least one between it and `spawn_server`.
+    let checks: Vec<_> = body
+        .match_indices("refuse_unsupported_harvest_mode(")
+        .collect();
+
+    let provision_call = body
+        .find("provision_storage(&config).await?")
+        .expect("DevRuntime::start must call provision_storage");
+    let spawn_call = body
+        .find("spawn_server(&config,")
+        .expect("DevRuntime::start must call spawn_server");
+
+    let before_provisioning = checks.iter().any(|(index, _)| *index < provision_call);
+    let between_provisioning_and_spawn = checks
+        .iter()
+        .any(|(index, _)| *index > provision_call && *index < spawn_call);
+    assert!(
+        before_provisioning,
+        "the mode gate must run before provisioning starts"
+    );
+    assert!(
+        between_provisioning_and_spawn,
+        "the mode gate must be re-checked after provisioning and before the server starts"
     );
 }
 
@@ -1741,6 +2187,7 @@ fn root_is_refused_before_any_session_state_is_touched() {
 }
 
 #[cfg(unix)]
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn provisioning_as_root_creates_no_session_root() {
     // The behavioural half of the same finding, which only says anything on a
@@ -1749,6 +2196,10 @@ async fn provisioning_as_root_creates_no_session_root() {
     if !autumn_harvest_plugin::dev::running_as_root() {
         return;
     }
+    let _guard = DEV_RUNTIME_START_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _env = harvest_mode_env_cleared();
     let base = tempfile::tempdir().expect("temp dir");
     let config = DevRuntimeConfig {
         session_root: Some(base.path().to_path_buf()),
@@ -1825,7 +2276,13 @@ fn a_reused_owner_pid_does_not_strand_a_session_forever() {
 
     // Same pid as ours, but the owner is *not* the recorded one: reap it.
     assert_eq!(
-        decide_reap(&record, false, true, 4242),
+        decide_reap(
+            &record,
+            false,
+            PostmasterIdentity::Confirmed,
+            4242,
+            chrono::Utc::now()
+        ),
         ReapDecision::StopThenRemove {
             postmaster_pid: 4243
         },
@@ -1834,23 +2291,40 @@ fn a_reused_owner_pid_does_not_strand_a_session_forever() {
 
     // Genuinely ours: still skipped, and still says so.
     assert_eq!(
-        decide_reap(&record, true, true, 4242),
+        decide_reap(
+            &record,
+            true,
+            PostmasterIdentity::Confirmed,
+            4242,
+            chrono::Utc::now()
+        ),
         ReapDecision::Skip(SkipReason::OwnedByThisProcess)
     );
 
     // Someone else's live session: skipped for the other reason.
     assert_eq!(
-        decide_reap(&record, true, true, 99),
+        decide_reap(
+            &record,
+            true,
+            PostmasterIdentity::Confirmed,
+            99,
+            chrono::Utc::now()
+        ),
         ReapDecision::Skip(SkipReason::OwnerAlive)
     );
 }
 
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn a_non_loopback_http_host_is_refused() {
     // Codex round 4 (P2). `http_host` is public and documented as
     // loopback-only, but a doc comment is not an enforcement — and the
     // management router is mounted with `.api(...)`, not `api_with_auth`,
     // precisely because it is supposed to be unreachable.
+    let _guard = DEV_RUNTIME_START_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _env = harvest_mode_env_cleared();
     for host in ["0.0.0.0", "::", "192.0.2.1"] {
         let error = autumn_harvest_plugin::dev::DevRuntime::start(DevRuntimeConfig {
             http_host: (*host).to_owned(),
@@ -1913,6 +2387,10 @@ fn an_unreadable_postmaster_pid_file_leaves_the_session_alone() {
     let mut stale = record(u32::MAX - 1, None);
     stale.owner_start_token = None;
     stale.data_dir = data_dir.clone();
+    // Old enough that the startup grace period (issue #1299) has passed. So
+    // this test still exercises confirmed absence, not the "might still be
+    // starting" skip a freshly created record now gets.
+    stale.created_at = chrono::Utc::now() - chrono::Duration::minutes(5);
     std::fs::write(
         session_dir.join("session.json"),
         stale.to_json().expect("json"),
@@ -1937,6 +2415,78 @@ fn an_unreadable_postmaster_pid_file_leaves_the_session_alone() {
         "with no pid file at all the session is a corpse and must be reclaimed"
     );
     assert!(!session_dir.exists(), "{}", session_dir.display());
+}
+
+#[test]
+fn a_freshly_created_session_with_no_pid_file_survives_the_full_reap_pipeline() {
+    // Issue #1299, end to end. `decide_reap` is pinned directly above; this
+    // drives the same scenario through `reap_stale_sessions` itself. `pg_ctl`
+    // can launch Postgres before the owner is killed. A record written
+    // moments ago with no `postmaster.pid` yet is not proof the cluster
+    // never started. Deleting its directory now could strand a live
+    // postmaster.
+    let base = tempfile::tempdir().expect("temp dir");
+    let root = autumn_harvest_plugin::dev::session_root(base.path()).expect("session root");
+
+    let session_dir = root.join("session-4242-0000000c");
+    let data_dir = session_dir.join("data");
+    std::fs::create_dir_all(&data_dir).expect("data dir");
+    let mut fresh = record(u32::MAX - 1, None);
+    fresh.owner_start_token = None;
+    fresh.data_dir = data_dir;
+    std::fs::write(
+        session_dir.join("session.json"),
+        fresh.to_json().expect("json"),
+    )
+    .expect("write record");
+
+    // No `postmaster.pid` at all yet, same as the real window between
+    // `pg_ctl start` and the postmaster writing its own pid file.
+    assert_eq!(
+        autumn_harvest_plugin::dev::reap_stale_sessions(&root).expect("reap"),
+        0,
+        "a record this new must not be read as proof no server exists"
+    );
+    assert!(session_dir.exists(), "{}", session_dir.display());
+}
+
+#[test]
+fn a_tokenless_but_live_postmaster_survives_the_full_reap_pipeline() {
+    // Issue #1295, end to end. Unit tests elsewhere pin `decide_reap` and
+    // `postmaster_identity` directly; this drives the same scenario through
+    // `reap_stale_sessions` itself. A session record with no postmaster
+    // start token, next to a genuinely live pid at that number, must be
+    // left alone: neither signaled nor removed.
+    let base = tempfile::tempdir().expect("temp dir");
+    let root = autumn_harvest_plugin::dev::session_root(base.path()).expect("session root");
+
+    let session_dir = root.join("session-4242-0000000b");
+    let data_dir = session_dir.join("data");
+    std::fs::create_dir_all(&data_dir).expect("data dir");
+
+    // Our own test process stands in for the "postmaster": genuinely alive,
+    // and its pid is not fabricated.
+    let live_pid = std::process::id();
+    let mut stale = record(u32::MAX - 1, Some(live_pid));
+    stale.owner_start_token = None;
+    stale.postmaster_start_token = None;
+    stale.data_dir = data_dir;
+    std::fs::write(
+        session_dir.join("session.json"),
+        stale.to_json().expect("json"),
+    )
+    .expect("write record");
+
+    assert_eq!(
+        autumn_harvest_plugin::dev::reap_stale_sessions(&root).expect("reap"),
+        0,
+        "unknown postmaster identity must not be reaped"
+    );
+    assert!(session_dir.exists(), "{}", session_dir.display());
+    assert!(
+        autumn_harvest_plugin::dev::process_is_alive(live_pid),
+        "the reaper must not have signaled the process it could not identify"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1989,4 +2539,110 @@ fn the_getting_started_chapter_leads_with_the_zero_setup_path() {
         !alias.contains("--release"),
         "deliberately not --release: on a fresh clone the compile dominates the metric"
     );
+}
+
+// ---------------------------------------------------------------------------
+// issue #1322 — a keyword-shaped token that is not a keyword
+// ---------------------------------------------------------------------------
+
+#[test]
+fn redaction_withholds_a_keyword_shaped_token_that_is_not_a_keyword() {
+    // A mistyped URL that lost its `://` scans as the "keyword" `postgres`. It
+    // has no `password=` option, so a scanner that accepts any token as a
+    // keyword lets the whole string through, credential included.
+    for dsn in [
+        "postgres=//alice:hunter2@db/harvest",
+        "postgresql=//alice:hunter2@db/harvest",
+        "notakeyword=alice:hunter2@db",
+    ] {
+        let redacted = redact_dsn(dsn);
+        assert!(
+            !redacted.contains("hunter2"),
+            "the password survived redaction: {dsn} -> {redacted}"
+        );
+        assert_ne!(
+            redacted, dsn,
+            "an unrecognized keyword must not be echoed back whole: {dsn}"
+        );
+    }
+}
+
+#[test]
+fn redaction_still_accepts_every_recognized_keyword() {
+    // The withholding above must not swallow a legitimate keyword DSN. Every
+    // libpq keyword `is_connection_keyword` allows is exercised here, so a
+    // typo in the allow-list itself — not just a missing one — shows up.
+    let dsn = "application_name=app channel_binding=require \
+               client_encoding=utf8 connect_timeout=5 dbname=harvest_dev \
+               fallback_application_name=app gssdelegation=1 gssencmode=disable \
+               gsslib=gssapi host=localhost hostaddr=127.0.0.1 keepalives=1 \
+               keepalives_count=3 keepalives_idle=5 keepalives_interval=5 \
+               krbsrvname=postgres load_balance_hosts=disable options=-c \
+               passfile=pgpass password=hunter2 port=5432 replication=off \
+               require_auth=scram-sha-256 requirepeer=postgres requiressl=0 \
+               scram_client_key=x scram_server_key=x service=svc \
+               ssl_max_protocol_version=TLSv1.3 ssl_min_protocol_version=TLSv1.2 \
+               sslcert=cert.pem sslcertmode=disable sslcompression=0 \
+               sslcrl=crl.pem sslcrldir=dir sslkey=key.pem sslmode=disable \
+               sslnegotiation=postgres sslpassword=certpw sslrootcert=root.pem \
+               sslsni=1 target_session_attrs=any tcp_user_timeout=0 user=u";
+    let redacted = redact_dsn(dsn);
+    assert!(!redacted.contains("hunter2"), "{redacted}");
+    assert!(redacted.contains("host=localhost"), "{redacted}");
+    assert!(redacted.contains("dbname=harvest_dev"), "{redacted}");
+    assert!(redacted.contains("sslmode=disable"), "{redacted}");
+    assert!(redacted.contains("target_session_attrs=any"), "{redacted}");
+}
+
+#[test]
+fn redaction_of_a_keyword_dsn_with_no_password_round_trips_byte_for_byte() {
+    // The keyword/value branch's "nothing to redact" claim, checked the same
+    // way the URI branch's equivalent test is: an exact `assert_eq!`, not
+    // just a substring check.
+    let dsn = "host=localhost dbname=harvest_dev user=u sslmode=disable";
+    assert_eq!(redact_dsn(dsn), dsn);
+}
+
+#[test]
+fn redaction_withholds_a_dsn_with_no_option_at_all() {
+    // A DSN with no `=` anywhere yields zero options from the scanner. The
+    // withholding loop never runs, so the string used to come back whole. A
+    // dropped scheme is at least as easy a typo as a keyword-shaped one.
+    for dsn in [
+        "alice:hunter2@db",
+        "//alice:hunter2@db/harvest",
+        "postgres:alice:hunter2@db/harvest",
+    ] {
+        let redacted = redact_dsn(dsn);
+        assert!(
+            !redacted.contains("hunter2"),
+            "the password survived redaction: {dsn} -> {redacted}"
+        );
+        assert_ne!(
+            redacted, dsn,
+            "a DSN with no recognized option must not be echoed back whole: {dsn}"
+        );
+    }
+}
+
+#[test]
+fn redaction_withholds_a_bare_token_next_to_a_real_option() {
+    // A bare token is skipped by the lenient `keyword_options` scanner. That
+    // holds even when a real option follows it, so the token itself —
+    // credential included — was never checked (issue #1322).
+    for dsn in [
+        "alice:hunter2@db host=localhost",
+        "postgres//alice:hunter2@db host=localhost",
+    ] {
+        let redacted = redact_dsn(dsn);
+        assert!(
+            !redacted.contains("hunter2"),
+            "the password survived redaction: {dsn} -> {redacted}"
+        );
+        assert_ne!(
+            redacted, dsn,
+            "a bare token must not be echoed back whole just because a real \
+             option follows it: {dsn}"
+        );
+    }
 }

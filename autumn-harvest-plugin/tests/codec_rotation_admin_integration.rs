@@ -25,7 +25,6 @@ use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
 use autumn_harvest_plugin::{management_api_response_fields, management_api_routes};
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -153,7 +152,7 @@ fn build_app_inner(pool: &DbPool, codecs: PayloadCodecs, admin: bool) -> Harvest
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::default(),
     ));
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 async fn get_json(app: &HarvestApiApp, uri: &str) -> (StatusCode, Value) {

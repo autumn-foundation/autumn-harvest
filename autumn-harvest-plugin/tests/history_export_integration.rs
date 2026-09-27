@@ -134,7 +134,7 @@ fn build_api_app(pool: HarvestDbPool, router: ShardRouter) -> HarvestApiApp {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         router,
     ));
-    harvest_api_router(api_state).with_state(autumn_web::AppState::for_test())
+    harvest_api_router(api_state)
 }
 
 fn build_two_shard_pool(shard0_url: &str, shard1_url: &str) -> HarvestDbPool {

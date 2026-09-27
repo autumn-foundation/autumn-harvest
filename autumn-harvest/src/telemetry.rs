@@ -359,6 +359,27 @@ pub const METRIC_REPLICATION_LAG_BYTES: &str = "harvest.replication.lag_bytes";
 /// Labelled `{shard}`.
 pub const METRIC_REPLICATION_STANDBYS: &str = "harvest.replication.standbys";
 
+/// Gauge: `1` while a shard's measured RPO is known. `0` when the
+/// replication views are readable but the RPO itself is not (issue #954,
+/// finding 2).
+///
+/// [`METRIC_REPLICATION_OBSERVABLE`] covers the views-unreadable case. It
+/// does not cover a shard whose views read fine but whose RPO has no
+/// source yet. That happens for a physical standby attached with no DR
+/// slot, before it has reported its first `replay_lag`.
+///
+/// A Prometheus gauge keeps exporting its last value. So simply skipping
+/// [`METRIC_REPLICATION_LAG_SECONDS`] in that case does not make the
+/// series stale; it freezes the dashboard at the last healthy reading.
+/// This gauge is emitted on every sampler tick the views are readable, `0`
+/// included, so it cannot go stale the same way.
+///
+/// Alerting: ticket when this is `0` while
+/// [`METRIC_REPLICATION_OBSERVABLE`] is `1` (readable but unmeasurable) — see
+/// `harvest_replication_rpo_unknown` in the starter alert pack. Labelled
+/// `{shard}`.
+pub const METRIC_REPLICATION_RPO_KNOWN: &str = "harvest.replication.rpo_known";
+
 /// Gauge: the write-authority epoch a shard's database currently reports
 /// (issue #954).
 ///
@@ -389,6 +410,25 @@ pub const METRIC_SHARD_GENERATION: &str = "harvest.shard.generation";
 /// are unbounded, user-supplied, and tenant-identifying.
 pub const METRIC_AUDIT_EXPORT_LAG: &str = "harvest.audit.export_lag";
 
+/// Gauge: `1` when the exporter observed a shard's cursor and lag this tick,
+/// `0` when it could not (issue #1268).
+///
+/// A Prometheus gauge keeps its last value. Without this signal, a shard the
+/// exporter cannot observe freezes [`METRIC_AUDIT_EXPORT_LAG`] at its last
+/// reading, commonly `0`. The threshold alert then stays silent, and
+/// `absent()` never fires, because the series still exists.
+///
+/// Covers a connection the scanner cannot acquire, a failed cursor read, and
+/// a failed lag query. It does not cover a shard missing from
+/// `shard_assignments` altogether, since no code path ever runs for it.
+/// Template a per-shard `absent()` rule from your own inventory for that
+/// case.
+///
+/// Emitted on every exporter tick that reaches a shard, delivery outcome
+/// aside. Labelled `{shard}` only, for the same cardinality reason as
+/// [`METRIC_AUDIT_EXPORT_LAG`].
+pub const METRIC_AUDIT_EXPORT_OBSERVED: &str = "harvest.audit.export_observed";
+
 /// Counter: audit records acknowledged by the sink for a shard (issue #953).
 ///
 /// Incremented by the batch size only after the cursor has actually advanced,
@@ -411,6 +451,14 @@ pub const METRIC_SHARD_FENCED: &str = "harvest.shard.fenced";
 
 /// Gauge: current number of entries in the dead letter queue.
 pub const METRIC_DLQ_ENTRIES: &str = "harvest.dlq.entries";
+
+/// Gauge: cumulative hints the dispatch background publisher has dropped
+/// because its bounded queue was full (issue #1429).
+///
+/// A dropped hint costs latency, not correctness: the row stays `PENDING`
+/// and the reconcile sweep republishes it. A sustained non-zero rate means
+/// the publisher queue is undersized for the enqueue rate.
+pub const METRIC_DISPATCH_DROPPED_HINTS: &str = "harvest.dispatch.dropped_hints";
 
 /// Gauge: `1` while a task queue is paused by an operator, `0` once it resumes
 /// (issue #619).
@@ -518,6 +566,82 @@ pub const METRIC_WORKFLOW_CACHE_MISS: &str = "harvest.workflow.cache_miss";
 /// Per ADR-0001 §7, `harvest.target.execution.id` and `harvest.signal.id` are
 /// **span-only** and must never appear as metric labels.
 pub const METRIC_EXTERNAL_SIGNAL_SENT: &str = "harvest.workflow.external_signal.sent";
+
+/// Counter: incremented once per `cancel_external_workflow` call after the
+/// terminal outcome is recorded in `harvest_events`.
+///
+/// Labels: `outcome` (`"delivered"` or `"failed"`), `reason_code` (only set
+/// when `outcome == "failed"`; values: `"target_terminal"`, `"target_unknown"`).
+/// [`METRIC_EXTERNAL_SIGNAL_SENT`]'s cancel twin.
+pub const METRIC_EXTERNAL_CANCEL_SENT: &str = "harvest.workflow.external_cancel.sent";
+
+/// Counter: a by-id fan-out could not inspect every expected shard. Its
+/// answer is `Indeterminate`, and the outbox row it was resolving stays
+/// pending (issue #1307).
+///
+/// Incremented once per uninspected shard named in the retry outcome. A row
+/// whose fan-out missed two shards increments this twice, once per shard.
+/// Labels: `shard`, `kind`
+/// ([`crate::external_target_location::UninspectedReasonKind::as_label`]).
+///
+/// This is the counter twin of the `"by-id target resolution inconclusive"`
+/// warning both outbox sweeps already log. See
+/// [`METRIC_EXTERNAL_SIGNAL_BY_ID_OLDEST_PENDING_AGE`] for the companion
+/// gauge that answers "how long has this been stuck". A rate on this counter
+/// alone cannot answer that.
+pub const METRIC_EXTERNAL_BY_ID_INDETERMINATE_SHARD: &str =
+    "harvest.external_signal.by_id_indeterminate_shard";
+
+/// Gauge: age in seconds of the oldest pending by-id **signal** outbox row a
+/// sweep left retrying because its target shard fan-out was incomplete
+/// (issue #1307).
+///
+/// `0` when the sweep left no such row pending, matching
+/// [`METRIC_QUEUE_OLDEST_PENDING_AGE`]'s convention so a drained backlog does
+/// not leave a stale reading behind. Distinguishes "retrying, will resolve"
+/// from "stuck since Tuesday" without reasoning about shard topology. Both
+/// `docs/sharding.md` and the backup-restore runbook used to name this gap
+/// as open.
+pub const METRIC_EXTERNAL_SIGNAL_BY_ID_OLDEST_PENDING_AGE: &str =
+    "harvest.external_signal.by_id_oldest_pending_indeterminate_age";
+
+/// Gauge: [`METRIC_EXTERNAL_SIGNAL_BY_ID_OLDEST_PENDING_AGE`]'s **cancel**
+/// outbox twin (issue #1307).
+pub const METRIC_EXTERNAL_CANCEL_BY_ID_OLDEST_PENDING_AGE: &str =
+    "harvest.external_cancel.by_id_oldest_pending_indeterminate_age";
+
+/// Counter: a by-id fan-out delivered over an incomplete shard fan-out — a
+/// silently ambiguous success, never surfaced before this counter (issue
+/// #1307).
+///
+/// Distinct from [`METRIC_EXTERNAL_BY_ID_INDETERMINATE_SHARD`]: that counter
+/// is a stall, where the row stays pending. This one is a delivery that went
+/// ahead on a partial view. Labelled `shard` (the shard the run was found on)
+/// only, per ADR-0001 §7.
+pub const METRIC_EXTERNAL_BY_ID_FOUND_OVER_INCOMPLETE_FANOUT: &str =
+    "harvest.external_signal.by_id_found_over_incomplete_fanout";
+
+/// Counter: a by-id fan-out completed and found more than one live run
+/// of the same business key (issue #1146). Issue #1313 records the
+/// residual bound this counter is evidence for.
+///
+/// `(workflow_name, workflow_id)` uniqueness is shard-local. Two paths
+/// make this fire. A key pinned to one shard while an unpinned start of
+/// it hashes to another is one. Draining a shard, so a later unpinned
+/// start of the same key rehashes elsewhere while the old run stays
+/// live, is the other. Neither pinning is required.
+///
+/// It is the observable proxy for the precondition behind issue
+/// #1313's race. The race itself is a run that starts mid fan-out. No
+/// counter can see that instant. Two live runs surviving a complete
+/// fan-out is different: it is real, and it is countable. Labelled
+/// `shard` (the winning run's shard) only, per ADR-0001 §7.
+///
+/// Distinct from [`METRIC_EXTERNAL_BY_ID_FOUND_OVER_INCOMPLETE_FANOUT`]:
+/// that counter fires over a partial view, a shard that could not be
+/// read. This one fires over a complete view that is still ambiguous.
+pub const METRIC_EXTERNAL_BY_ID_OTHER_LIVE_OBSERVED: &str =
+    "harvest.external_signal.by_id_other_live_observed";
 
 /// OpenTelemetry span attribute: the signal name for `signal_external_workflow` spans.
 ///
@@ -863,6 +987,33 @@ pub const METRIC_CONCURRENCY_SUPERSEDED: &str = "harvest.concurrency.superseded"
 /// [`METRIC_CONCURRENCY_SUPERSEDED`]'s cardinality rule — the concurrency key
 /// is never a label (ADR-0001 §7). `execution.id` must never appear here.
 pub const METRIC_CONCURRENCY_RESIDUAL_OVER_LIMIT: &str = "harvest.concurrency.residual_over_limit";
+
+/// Counter: a `cancel_running` admission's quota credit assumed a run would
+/// be shed, and the real supersede pass skipped it instead (issue #1228
+/// review, P2).
+///
+/// `crate::concurrency::dry_run_supersede_credit` credits an admission for
+/// the exact runs it expects `supersede_inner` to cancel a moment later.
+/// `supersede_inner` can skip one of those runs on an unexpected error and
+/// leave it running instead. A candidate's own corrupted
+/// `parent_close_policy` is one cause. A `Config` error from its terminal
+/// chokepoint, that is not the benign already-terminal race, is another.
+/// Either way, one corrupt neighbor must never wedge every future
+/// admission for the key. The admission already committed on the
+/// assumption that run was gone. So the key is now genuinely over its
+/// declared cap, not merely transiently the way
+/// [`METRIC_CONCURRENCY_RESIDUAL_OVER_LIMIT`] describes. There is no way
+/// to retract that admission by the time this is detected. Its
+/// `WorkflowStarted` event is already durable. So this counter is the
+/// alertable signal, not a rejection.
+///
+/// Incremented once per admission whose real supersede pass left at least
+/// one credited run unshed, with the count of unshed runs as its value.
+///
+/// Labeled by `workflow` (workflow type name) only, matching
+/// [`METRIC_CONCURRENCY_RESIDUAL_OVER_LIMIT`]'s cardinality rule — neither
+/// the quota key nor `execution.id` is ever a label (ADR-0001 §7).
+pub const METRIC_QUOTA_SUPERSEDE_CREDIT_NOT_SHED: &str = "harvest.quota.supersede_credit_not_shed";
 
 /// Counter: incremented exactly once per real saga compensation sequence
 /// (issue #801).
@@ -2591,6 +2742,21 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (workflow, gap);
     }
 
+    /// A `cancel_running` admission's quota credit assumed `gap` runs would
+    /// be shed, and the real supersede pass skipped them instead (issue
+    /// #1228 review, P2).
+    ///
+    /// Maps to the counter [`METRIC_QUOTA_SUPERSEDE_CREDIT_NOT_SHED`].
+    /// Unlike [`Self::record_concurrency_residual_over_limit`], the key
+    /// here is not merely transient. The admission that spent this credit
+    /// is already committed. So the key is genuinely over its declared cap
+    /// until an operator intervenes or the corrupt candidate is fixed.
+    /// Additive with a no-op default: implementing it is optional and no
+    /// existing implementor breaks.
+    fn record_quota_supersede_credit_not_shed(&self, workflow: &str, gap: u64) {
+        let _ = (workflow, gap);
+    }
+
     /// Record the current available tokens for a rate limit bucket key.
     ///
     /// Maps to the gauge `harvest.rate_limit.tokens_available{key}`.
@@ -2628,6 +2794,16 @@ pub trait MetricsRecorder: Send + Sync {
     /// Maps to the gauge `harvest_dlq_entries{shard}`.
     fn record_dlq_entries(&self, shard: u16, depth: u64) {
         let _ = (shard, depth);
+    }
+
+    /// Cumulative hints the dispatch background publisher has dropped because
+    /// its bounded queue was full (issue #1429).
+    ///
+    /// Emitted by a periodic in-process sampler, no label. Maps to the gauge
+    /// `harvest_dispatch_dropped_hints`. Not incremental: each call carries
+    /// the running total from [`crate::dispatch::dropped_hints`].
+    fn record_dispatch_dropped_hints(&self, total: u64) {
+        let _ = total;
     }
 
     /// Whether a task queue is currently held by an operator queue pause
@@ -2749,6 +2925,16 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (shard, count);
     }
 
+    /// Whether a shard's measured RPO is known (issue #954, finding 2).
+    ///
+    /// Emitted on every sampler tick the views are readable, `0` included —
+    /// like [`Self::record_replication_observable`], it must never go stale.
+    ///
+    /// Maps to the gauge [`METRIC_REPLICATION_RPO_KNOWN`].
+    fn record_replication_rpo_known(&self, shard: u16, known: bool) {
+        let _ = (shard, known);
+    }
+
     /// The write-authority epoch a shard's database currently reports
     /// (issue #954).
     ///
@@ -2766,6 +2952,20 @@ pub trait MetricsRecorder: Send + Sync {
     /// Maps to the gauge [`METRIC_AUDIT_EXPORT_LAG`].
     fn record_audit_export_lag(&self, shard: u16, seconds: f64) {
         let _ = (shard, seconds);
+    }
+
+    /// The exporter did, or did not, observe a shard's cursor and lag this
+    /// tick (issue #1268).
+    ///
+    /// Call this on **every** exporter tick that reaches a shard, whether or
+    /// not it delivers a batch. `true` when the cursor read and the lag query
+    /// both succeeded; `false` on a connection failure, a cursor read
+    /// failure, or a lag query failure. See [`METRIC_AUDIT_EXPORT_OBSERVED`]
+    /// for why this signal exists.
+    ///
+    /// Maps to the gauge [`METRIC_AUDIT_EXPORT_OBSERVED`].
+    fn record_audit_export_observed(&self, shard: u16, observed: bool) {
+        let _ = (shard, observed);
     }
 
     /// Audit records the sink acknowledged for a shard (issue #953).
@@ -3114,8 +3314,57 @@ pub trait MetricsRecorder: Send + Sync {
     }
 
     /// Record one external cancel dispatch outcome (`outcome`: `"delivered"` / `"failed"`).
+    ///
+    /// Maps to the counter [`METRIC_EXTERNAL_CANCEL_SENT`].
     fn record_external_cancel_sent(&self, outcome: &str, reason_code: Option<&str>) {
         let _ = (outcome, reason_code);
+    }
+
+    /// A by-id fan-out left one shard uninspected, on a row a sweep is
+    /// therefore leaving pending (issue #1307).
+    ///
+    /// Call once per uninspected shard, `kind` from
+    /// [`crate::external_target_location::UninspectedReasonKind::as_label`].
+    ///
+    /// Maps to the counter [`METRIC_EXTERNAL_BY_ID_INDETERMINATE_SHARD`].
+    fn record_external_by_id_indeterminate_shard(&self, shard: u16, kind: &str) {
+        let _ = (shard, kind);
+    }
+
+    /// Age in seconds of the oldest pending by-id **signal** outbox row this
+    /// sweep left retrying; `0` when none did (issue #1307).
+    ///
+    /// Call once per sweep, from [`crate::timeout::enforce_external_signals_outbox`].
+    ///
+    /// Maps to the gauge [`METRIC_EXTERNAL_SIGNAL_BY_ID_OLDEST_PENDING_AGE`].
+    fn record_external_signal_by_id_oldest_pending_indeterminate_age(&self, age_secs: f64) {
+        let _ = age_secs;
+    }
+
+    /// [`Self::record_external_signal_by_id_oldest_pending_indeterminate_age`]'s
+    /// **cancel** outbox twin (issue #1307).
+    ///
+    /// Maps to the gauge [`METRIC_EXTERNAL_CANCEL_BY_ID_OLDEST_PENDING_AGE`].
+    fn record_external_cancel_by_id_oldest_pending_indeterminate_age(&self, age_secs: f64) {
+        let _ = age_secs;
+    }
+
+    /// A by-id fan-out found a live/terminal run and delivered. One or more
+    /// expected shards could not be inspected — a silently ambiguous success
+    /// (issue #1307). `shard` is the shard the run was found on.
+    ///
+    /// Maps to the counter [`METRIC_EXTERNAL_BY_ID_FOUND_OVER_INCOMPLETE_FANOUT`].
+    fn record_external_by_id_found_over_incomplete_fanout(&self, shard: u16) {
+        let _ = shard;
+    }
+
+    /// A by-id fan-out completed and found more than one live run of the
+    /// same business key (issue #1146; issue #1313). `shard` is the
+    /// winning run's shard.
+    ///
+    /// Maps to the counter [`METRIC_EXTERNAL_BY_ID_OTHER_LIVE_OBSERVED`].
+    fn record_external_by_id_other_live_observed(&self, shard: u16) {
+        let _ = shard;
     }
 
     /// A start request was absorbed by a debounce pending record (issue #499).
@@ -3512,6 +3761,35 @@ pub fn emit_concurrency_residual_over_limit<M: MetricsRecorder + ?Sized>(
         return;
     }
     metrics.record_concurrency_residual_over_limit(workflow_name, gap);
+}
+
+/// Emit [`METRIC_QUOTA_SUPERSEDE_CREDIT_NOT_SHED`] for a skipped credited run.
+///
+/// A `cancel_running` admission's quota credit assumed `gap` runs would be
+/// shed. Its real supersede pass skipped them instead (issue #1228 review,
+/// P2).
+///
+/// Called INLINE from [`crate::execution::run_latest_wins_supersede`],
+/// right after the real supersede pass returns. Same convention as
+/// [`emit_concurrency_residual_over_limit`], and for the same reason: this
+/// is a brand-new counter with no pre-existing post-commit convention to
+/// violate. The condition it reports is itself already a rare edge case,
+/// like a corrupted `parent_close_policy` or an unexpected `Config` error
+/// on one candidate. An occasional phantom sample from a rolled-back
+/// transaction is an accepted, documented simplification, not the gap
+/// this counter exists to close.
+///
+/// Canary probe workflows (issue #796) are excluded, mirroring
+/// [`emit_workflow_terminal`].
+pub fn emit_quota_supersede_credit_not_shed<M: MetricsRecorder + ?Sized>(
+    metrics: &M,
+    workflow_name: &str,
+    gap: u64,
+) {
+    if crate::canary::is_canary_workflow(workflow_name) {
+        return;
+    }
+    metrics.record_quota_supersede_credit_not_shed(workflow_name, gap);
 }
 
 /// Default metrics recorder that discards every sample.
@@ -4391,6 +4669,7 @@ mod tests {
         rec.record_replication_observable(0, false);
         rec.record_replication_lag_bytes(0, 4_096);
         rec.record_replication_standbys(0, 1);
+        rec.record_replication_rpo_known(0, false);
         rec.record_shard_generation(0, 7);
         rec.record_shard_fenced(0);
         assert_eq!(
@@ -4402,8 +4681,51 @@ mod tests {
             "harvest.replication.lag_bytes"
         );
         assert_eq!(METRIC_REPLICATION_STANDBYS, "harvest.replication.standbys");
+        assert_eq!(
+            METRIC_REPLICATION_RPO_KNOWN,
+            "harvest.replication.rpo_known"
+        );
         assert_eq!(METRIC_SHARD_GENERATION, "harvest.shard.generation");
         assert_eq!(METRIC_SHARD_FENCED, "harvest.shard.fenced");
+    }
+
+    #[test]
+    fn by_id_indeterminate_fanout_observability_has_default_noop_impls_and_stable_names() {
+        // Issue #1307: the outbox sweeps could not previously distinguish
+        // "retrying, will resolve" from "stuck since Tuesday" except by
+        // grepping the `by-id target resolution inconclusive` warning.
+        let rec = NoOpMetrics;
+        rec.record_external_cancel_sent("delivered", None);
+        rec.record_external_cancel_sent("failed", Some("target_unknown"));
+        rec.record_external_by_id_indeterminate_shard(0, "no_pool");
+        rec.record_external_signal_by_id_oldest_pending_indeterminate_age(0.0);
+        rec.record_external_cancel_by_id_oldest_pending_indeterminate_age(30.5);
+        rec.record_external_by_id_found_over_incomplete_fanout(2);
+        rec.record_external_by_id_other_live_observed(1);
+        assert_eq!(
+            METRIC_EXTERNAL_CANCEL_SENT,
+            "harvest.workflow.external_cancel.sent"
+        );
+        assert_eq!(
+            METRIC_EXTERNAL_BY_ID_INDETERMINATE_SHARD,
+            "harvest.external_signal.by_id_indeterminate_shard"
+        );
+        assert_eq!(
+            METRIC_EXTERNAL_SIGNAL_BY_ID_OLDEST_PENDING_AGE,
+            "harvest.external_signal.by_id_oldest_pending_indeterminate_age"
+        );
+        assert_eq!(
+            METRIC_EXTERNAL_CANCEL_BY_ID_OLDEST_PENDING_AGE,
+            "harvest.external_cancel.by_id_oldest_pending_indeterminate_age"
+        );
+        assert_eq!(
+            METRIC_EXTERNAL_BY_ID_FOUND_OVER_INCOMPLETE_FANOUT,
+            "harvest.external_signal.by_id_found_over_incomplete_fanout"
+        );
+        assert_eq!(
+            METRIC_EXTERNAL_BY_ID_OTHER_LIVE_OBSERVED,
+            "harvest.external_signal.by_id_other_live_observed"
+        );
     }
 
     #[test]

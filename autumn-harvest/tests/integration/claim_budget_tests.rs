@@ -4926,3 +4926,444 @@ async fn zz_capture_concurrency_key_claim_evidence() {
         out_dir.display()
     );
 }
+
+/// `reset()` must clear every pause table, not only `harvest_queue_pauses`.
+///
+/// A row a prior scenario left in `harvest_activity_pauses` would silently
+/// contaminate the next scenario's claim-path measurement. Issue #1215
+/// found `harvest_activity_pauses` was never truncated at all. Every
+/// scenario after the first real pause seed would carry it forward.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn reset_clears_every_pause_table() {
+    use diesel::QueryableByName;
+    use diesel_async::RunQueryDsl;
+
+    #[derive(QueryableByName)]
+    struct CountRow {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+
+    let Some(bench) = bench_db_or_skip().await else {
+        return;
+    };
+    let mut conn = db::connect(&bench.url).await;
+
+    db::reset(&mut conn).await;
+    diesel::sql_query(
+        "INSERT INTO harvest_queue_pauses (queue_name, reason) VALUES ('reset-test-q', 'x')",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed a queue pause");
+    diesel::sql_query(
+        "INSERT INTO harvest_activity_pauses (activity_name, reason) VALUES ('reset-test-a', 'x')",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed an activity pause");
+
+    db::reset(&mut conn).await;
+
+    for table in ["harvest_queue_pauses", "harvest_activity_pauses"] {
+        let rows: Vec<CountRow> = diesel::sql_query(format!("SELECT COUNT(*) AS n FROM {table}"))
+            .load(&mut conn)
+            .await
+            .unwrap_or_else(|e| panic!("count {table}: {e}"));
+        assert_eq!(
+            rows[0].n, 0,
+            "reset() must truncate {table}, or a pause row seeded by one \
+             scenario leaks into the next scenario's claim-path measurement",
+        );
+    }
+}
+
+/// `claim_task()` must still exclude only the paused queue and the paused
+/// activity, even when both pause tables hold 199 rows. That is issue
+/// #1215's own reproduction scale, not just one row.
+///
+/// The 199 rows do not mean a 199-element array for both predicates. Only
+/// `paused_activities` reads the whole table, so its array is genuinely
+/// that wide here. `paused_queues` stays bound to the worker's own 2 polled
+/// queues (see `docs/performance.md`'s pause-array-size sweep). Only its
+/// one real pause among the 199 rows ever reaches the array. This test
+/// still proves exclusion holds at that table scale for both.
+///
+/// Three candidate rows, one of each shape that matters: a paused queue, a
+/// paused activity, and neither. Only the third is claimable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn claim_excludes_paused_rows_with_a_realistically_wide_pause_array() {
+    use diesel_async::RunQueryDsl;
+
+    let Some(bench) = bench_db_or_skip().await else {
+        return;
+    };
+    let mut conn = db::connect(&bench.url).await;
+    db::reset(&mut conn).await;
+
+    diesel::sql_query(
+        "INSERT INTO harvest_workers \
+           (worker_id, max_concurrency, host, build_id, queues, labels) \
+         VALUES ('scale-test-worker', 16, 'bench-host', '', '[]'::jsonb, '{}'::jsonb)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed worker");
+
+    diesel::sql_query(
+        "INSERT INTO harvest_task_queue \
+           (queue_name, task_type, activity_name, activity_id, input, state, \
+            priority, max_attempts, scheduled_at) \
+         VALUES \
+           ('scale-test-paused-queue', 'activity', 'scale-test-open-activity', \
+            gen_random_uuid(), '{}'::jsonb, 'PENDING', 0, 3, NOW() - INTERVAL '1 second'), \
+           ('scale-test-open-queue', 'activity', 'scale-test-paused-activity', \
+            gen_random_uuid(), '{}'::jsonb, 'PENDING', 0, 3, NOW() - INTERVAL '1 second'), \
+           ('scale-test-open-queue', 'activity', 'scale-test-open-activity', \
+            gen_random_uuid(), '{}'::jsonb, 'PENDING', 0, 3, NOW() - INTERVAL '1 second')",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("seed three candidate rows");
+
+    db::seed_queue_pauses(&mut conn, "scale-test-paused-queue", 199).await;
+    db::seed_activity_pauses(&mut conn, "scale-test-paused-activity", 199).await;
+    diesel::sql_query("ANALYZE harvest_task_queue")
+        .execute(&mut conn)
+        .await
+        .expect("analyze");
+
+    let queues = vec![
+        "scale-test-paused-queue".to_string(),
+        "scale-test-open-queue".to_string(),
+    ];
+    let mut claimed_activities = Vec::new();
+    loop {
+        let result = autumn_harvest::queue::claim_task(
+            &mut conn,
+            &queues,
+            "scale-test-worker",
+            "",
+            None,
+            &[],
+            &[],
+        )
+        .await
+        .expect("claim_task must not error");
+        match result {
+            Some(task) => claimed_activities.push(task.activity_name),
+            None => break,
+        }
+    }
+
+    assert_eq!(
+        claimed_activities,
+        vec![Some("scale-test-open-activity".to_string())],
+        "with a 199-row pause array on each table, claim_task() must exclude \
+         exactly the paused-queue row and the paused-activity row, claiming \
+         only the row that matches neither -- got {claimed_activities:?}",
+    );
+}
+
+/// Generates the committed evidence for the pause-array-size finding (issue
+/// #1215). The claim sort's disk-spill trigger depends on how *wide* the
+/// `<> ALL(...)` array is, not only on backlog depth.
+///
+/// Unlike [`zz_capture_queue_pause_claim_evidence`], this toggles *data*
+/// (pause-array size), not code. It uses the same style as
+/// `zz_capture_capability_labels_claim_evidence`: issue #1215 found no
+/// query-shape fix here, only a cost that scales with array width.
+///
+/// Every array here is seeded as ballast: unrelated names that exclude zero
+/// real candidate rows. A size effect cannot be explained by a change in
+/// which rows are eligible this way. Issue #1177 and #786 already
+/// established the same no-op-predicate isolation for backlog depth; this
+/// extends it to array width.
+///
+/// Three sweeps:
+/// * `activity-pause` -- `paused_activities` reads the whole table
+///   unconditionally (see the doc comment on `claim_task_query`). Array
+///   size alone should drive its cost, regardless of the worker's own bind.
+///   Crossed against `BACKLOG_SWEEP`, not just the 10,000-row headline.
+///   Issue #1215 asked to see this finding against the existing depth
+///   sweep, not a single fixed depth.
+/// * `queue-pause-bound` -- a typical worker ($2 = its own 4 polled queues).
+///   `paused_queues` pre-filters to $2. Ballast pauses on queues this
+///   worker never polls should never enter the array at all. Held at the
+///   10,000-row headline depth. This sweep asks whether ballast enters the
+///   array at all. That is a yes/no bound question the query answers
+///   identically at every depth, not a magnitude question depth could shift.
+/// * `queue-pause-wide` -- an atypical worker whose own $2 bind is itself
+///   wide (203 polled queues). That lets `paused_queues`' bound reach the
+///   same array size `queue-pause-bound` cannot. Also held at the headline
+///   depth, for the same reason.
+///
+/// Array sizes 0/1/20/199 match issue #1215's own reproduction table (its
+/// Scenario C/E rows), not its separate 10/50/200 suggestion. This way the
+/// evidence corroborates the kB figures the issue already reported, instead
+/// of producing a fresh, disconnected set of numbers.
+///
+/// `#[ignore]`d on purpose: a one-shot evidence-capture tool, not a repeatable
+/// CI assertion. See `zz_capture_queue_pause_claim_evidence` for the full
+/// rationale. No predicate on this page has an automated `Sort Method`
+/// assertion in CI. Asserting on planner-internal plan shape is fragile
+/// against Postgres version and `work_mem` drift. Every predicate here
+/// publishes a committed snapshot instead. What CI *does* gate for this
+/// finding is correctness, not the plan shape.
+/// [`claim_excludes_paused_rows_with_a_realistically_wide_pause_array`]
+/// above asserts `claim_task()` still excludes the right rows at this same
+/// pause-table scale.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[ignore = "evidence generator, not a CI assertion -- run via \
+            autumn-harvest/scripts/pause_array_size_claim_perf_repro.sh"]
+#[allow(clippy::too_many_lines)] // one-shot evidence capture, not a CI assertion
+async fn zz_capture_pause_array_size_claim_evidence() {
+    use diesel::QueryableByName;
+    use diesel_async::RunQueryDsl;
+
+    #[derive(QueryableByName)]
+    struct ExplainRow {
+        #[diesel(sql_type = diesel::sql_types::Text, column_name = "QUERY PLAN")]
+        query_plan: String,
+    }
+
+    /// Run one `EXPLAIN` against `claim_task_query()` with the given binds and
+    /// return the plan text plus the `Sort Method:` line it found, if any.
+    async fn explain_with_binds(
+        conn: &mut diesel_async::AsyncPgConnection,
+        raw: &str,
+        queue_bind: &str,
+    ) -> (String, Option<String>) {
+        let literals = [
+            "'pase-worker'".to_string(),
+            queue_bind.to_string(),
+            "''".to_string(),
+            "NULL".to_string(),
+            "ARRAY[]::text[]".to_string(),
+            "ARRAY[]::text[]".to_string(),
+        ];
+        let mut sql = raw.to_string();
+        for (i, literal) in literals.iter().enumerate().rev() {
+            sql = sql.replace(&format!("${}", i + 1), literal);
+        }
+
+        diesel::sql_query("BEGIN")
+            .execute(conn)
+            .await
+            .expect("begin");
+        let loaded: Result<Vec<ExplainRow>, _> = diesel::sql_query(format!(
+            "EXPLAIN (ANALYZE, BUFFERS, SETTINGS, TIMING OFF) {sql}"
+        ))
+        .load(conn)
+        .await;
+        diesel::sql_query("ROLLBACK")
+            .execute(conn)
+            .await
+            .expect("rollback");
+
+        let plan_text = loaded
+            .unwrap_or_else(|e| panic!("EXPLAIN failed: {e}"))
+            .into_iter()
+            .map(|r| r.query_plan)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let sort_method = plan_text
+            .lines()
+            .find(|l| l.trim_start().starts_with("Sort Method:"))
+            .map(|l| l.trim().to_string());
+        (plan_text, sort_method)
+    }
+
+    // The headline depth, used by the two queue-pause sweeps below (see
+    // their doc comments for why they hold depth fixed).
+    const BACKLOG: usize = 10_000;
+    const ARRAY_SIZES: [usize; 4] = [0, 1, 20, 199];
+
+    let Some(bench) = bench_db_or_skip().await else {
+        eprintln!("no database reachable; nothing captured");
+        return;
+    };
+
+    let out_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("autumn-harvest/ has a workspace-root parent")
+        .join("docs")
+        .join("perf-artifacts")
+        .join("pause-array-size");
+    std::fs::create_dir_all(&out_dir).expect("create artifact output directory");
+
+    let raw = autumn_harvest::queue::claim_task_query();
+    assert!(
+        !raw.contains("$7"),
+        "claim_task_query() grew a seventh bind; extend the literal \
+         substitution below before this capture can be trusted",
+    );
+
+    let mut summary_lines: Vec<String> = Vec::new();
+
+    // ── activity-pause: unconditional, no bound to escape it. Crossed
+    // against BACKLOG_SWEEP, not held at one depth -- see the doc comment.
+    for backlog in super::claim_bench_support::BACKLOG_SWEEP {
+        for size in ARRAY_SIZES {
+            let mut conn = db::connect(&bench.url).await;
+            let scenario = Scenario {
+                backlog,
+                claimers: 1,
+                queues: 4,
+                gate: ClaimGate::Baseline,
+            };
+            db::seed(&mut conn, scenario).await;
+            if size > 0 {
+                db::seed_activity_pauses(&mut conn, "pase-ballast-real", size).await;
+            }
+            diesel::sql_query("ANALYZE harvest_activity_pauses")
+                .execute(&mut conn)
+                .await
+                .expect("analyze");
+
+            let queue_bind = format!(
+                "ARRAY[{}]::text[]",
+                db::queue_names(scenario)
+                    .iter()
+                    .map(|q| format!("'{q}'"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            let (plan_text, sort_method) = explain_with_binds(&mut conn, raw, &queue_bind).await;
+            std::fs::write(
+                out_dir.join(format!("activity-pause-backlog-{backlog}-array-{size}.explain.txt")),
+                format!(
+                    "-- activity-pause: claim_task_query() @ backlog={backlog}, \
+                     paused_activities array size={size} (ballast, 0% selectivity) --\n{plan_text}\n"
+                ),
+            )
+            .expect("write explain artifact");
+            // `paused_activities` reads the table unconditionally, so the
+            // materialized array size always equals the ballast seeded.
+            summary_lines.push(format!(
+                "predicate=activity-pause ballast={size} array_size={size} backlog={backlog} {}",
+                sort_method
+                    .as_deref()
+                    .unwrap_or("Sort Method: (no Sort node)"),
+            ));
+        }
+    }
+
+    // ── queue-pause, bound-typical: $2 stays at the worker's own 4 queues ──
+    for size in ARRAY_SIZES {
+        let mut conn = db::connect(&bench.url).await;
+        let scenario = Scenario {
+            backlog: BACKLOG,
+            claimers: 1,
+            queues: 4,
+            gate: ClaimGate::Baseline,
+        };
+        db::seed(&mut conn, scenario).await;
+        if size > 0 {
+            // Ballast pauses queues this worker never polls, so they can
+            // never enter `paused_queues.names` -- see the bound in
+            // `claim_task_query`'s `paused_queues` CTE.
+            db::seed_queue_pauses(&mut conn, "pase-unpolled-queue-real", size).await;
+        }
+        diesel::sql_query("ANALYZE harvest_queue_pauses")
+            .execute(&mut conn)
+            .await
+            .expect("analyze");
+
+        let queue_bind = format!(
+            "ARRAY[{}]::text[]",
+            db::queue_names(scenario)
+                .iter()
+                .map(|q| format!("'{q}'"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let (plan_text, sort_method) = explain_with_binds(&mut conn, raw, &queue_bind).await;
+        std::fs::write(
+            out_dir.join(format!("queue-pause-bound-array-{size}.explain.txt")),
+            format!(
+                "-- queue-pause-bound: claim_task_query() @ backlog={BACKLOG}, \
+                 4-queue worker, {size} fleet-wide pauses on queues it never \
+                 polls --\n{plan_text}\n"
+            ),
+        )
+        .expect("write explain artifact");
+        // `$2` never includes the seeded ballast names here. The
+        // materialized array size stays 0 regardless of ballast seeded.
+        // Unlike the other two sweeps, this is not the same number.
+        summary_lines.push(format!(
+            "predicate=queue-pause-bound ballast={size} array_size=0 backlog={BACKLOG} {}",
+            sort_method
+                .as_deref()
+                .unwrap_or("Sort Method: (no Sort node)"),
+        ));
+    }
+
+    // ── queue-pause, wide-$2: the worker itself polls 203 queues, so the
+    // bound in `paused_queues` can reach the same width `bound-typical`
+    // cannot. Two points only (0 vs 199): this establishes the mechanism
+    // exists once the bound is wide, not a fresh threshold sweep.
+    for size in [0usize, 199] {
+        let mut conn = db::connect(&bench.url).await;
+        let scenario = Scenario {
+            backlog: BACKLOG,
+            claimers: 1,
+            queues: 4,
+            gate: ClaimGate::Baseline,
+        };
+        db::seed(&mut conn, scenario).await;
+        let mut polled = db::queue_names(scenario);
+        let extra: Vec<String> = (0..199).map(|i| format!("pase-wide-q-{i}")).collect();
+        if size > 0 {
+            for name in &extra {
+                diesel::sql_query(format!(
+                    "INSERT INTO harvest_queue_pauses (queue_name, reason) \
+                     VALUES ('{name}', 'bench-wide')"
+                ))
+                .execute(&mut conn)
+                .await
+                .expect("seed wide-bound pause");
+            }
+        }
+        diesel::sql_query("ANALYZE harvest_queue_pauses")
+            .execute(&mut conn)
+            .await
+            .expect("analyze");
+        polled.extend(extra);
+
+        let queue_bind = format!(
+            "ARRAY[{}]::text[]",
+            polled
+                .iter()
+                .map(|q| format!("'{q}'"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let (plan_text, sort_method) = explain_with_binds(&mut conn, raw, &queue_bind).await;
+        std::fs::write(
+            out_dir.join(format!("queue-pause-wide-array-{size}.explain.txt")),
+            format!(
+                "-- queue-pause-wide: claim_task_query() @ backlog={BACKLOG}, \
+                 203-queue worker (4 real + 199 empty), {size} of the 199 \
+                 empty queues paused --\n{plan_text}\n"
+            ),
+        )
+        .expect("write explain artifact");
+        // `$2` is wide enough here to include the ballast, so the
+        // materialized array size again equals the ballast seeded.
+        summary_lines.push(format!(
+            "predicate=queue-pause-wide ballast={size} array_size={size} backlog={BACKLOG} {}",
+            sort_method
+                .as_deref()
+                .unwrap_or("Sort Method: (no Sort node)"),
+        ));
+    }
+
+    std::fs::write(out_dir.join("summary.txt"), summary_lines.join("\n") + "\n")
+        .expect("write summary");
+    eprintln!(
+        "== capture complete: artifacts in {} ==\n{}",
+        out_dir.display(),
+        summary_lines.join("\n"),
+    );
+}

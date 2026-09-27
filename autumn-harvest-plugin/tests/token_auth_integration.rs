@@ -35,9 +35,9 @@ use autumn_harvest::shard::ShardRouter;
 use autumn_harvest::worker::{DbPool, HandlerRegistry};
 use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
-    HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
+    HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, StandaloneAdminAuth,
+    harvest_api_router,
 };
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -80,11 +80,8 @@ fn build_pool(url: &str) -> DbPool {
         .expect("pool should build")
 }
 
-fn api_state(pool: &DbPool, admin_boundary: bool) -> HarvestApiState {
+fn api_state(pool: &DbPool) -> HarvestApiState {
     let api_state = HarvestApiState::new();
-    if admin_boundary {
-        api_state.set_admin_auth_boundary(true);
-    }
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
         Arc::new(HandlerRegistry::new(vec![], vec![])),
@@ -99,30 +96,29 @@ fn api_state(pool: &DbPool, admin_boundary: bool) -> HarvestApiState {
     api_state
 }
 
-/// App with the embedder admin boundary set (mints/verifies under boundary) AND
-/// the token scope layer installed. This is the `api_with_auth` + tokens
-/// composition.
+/// App with the embedder admin boundary declared (mints/verifies under
+/// boundary) AND the token scope layer installed. This is the `api_with_auth`
+/// plus tokens composition.
+///
+/// Assembled through the exported [`StandaloneAdminAuth`] mount (issue #1608),
+/// not a hand-written layer stack, so this suite exercises the composition an
+/// embedder actually writes.
 fn build_app_boundary(pool: &DbPool) -> HarvestApiApp {
-    let state = api_state(pool, true);
-    harvest_api_router(state.clone())
-        .layer(axum::middleware::from_fn_with_state(
-            state,
-            autumn_harvest_plugin::api_token::enforce_token_scope,
-        ))
-        .with_state(AppState::for_test().with_profile("test"))
+    let state = api_state(pool);
+    StandaloneAdminAuth::new()
+        .with_api_tokens()
+        .with_admin_auth_boundary()
+        .mount(harvest_api_router(state.clone()), &state)
 }
 
 /// App with NO embedder boundary and the token scope layer installed. This is
 /// the standalone-token mode: a verified `mutate` token must satisfy
 /// `require_admin` via the `TokenPrincipal` extension.
 fn build_app_standalone(pool: &DbPool) -> HarvestApiApp {
-    let state = api_state(pool, false);
-    harvest_api_router(state.clone())
-        .layer(axum::middleware::from_fn_with_state(
-            state,
-            autumn_harvest_plugin::api_token::enforce_token_scope,
-        ))
-        .with_state(AppState::for_test().with_profile("test"))
+    let state = api_state(pool);
+    StandaloneAdminAuth::new()
+        .with_api_tokens()
+        .mount(harvest_api_router(state.clone()), &state)
 }
 
 async fn scrub(conn: &mut AsyncPgConnection) {

@@ -48,7 +48,6 @@ use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -160,7 +159,7 @@ fn build_app_with_admin_boundary(pool: &DbPool, boundary: bool) -> HarvestApiApp
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::default(),
     ));
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 async fn read_json(response: axum::response::Response) -> (StatusCode, Value) {
@@ -708,7 +707,7 @@ fn build_two_shard_app(pool: &DbPool) -> HarvestApiApp {
             ShardId::new(0),
         ),
     ));
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 /// AC7, the write half: `shard_id` scopes the hold to one shard, and the read

@@ -310,14 +310,27 @@ instant.** The shards are read sequentially, on separate connections to separate
 databases, with no shared snapshot — Postgres has no cross-shard transaction and
 Harvest deliberately adds no coordinator. A run of the key that starts on an
 already-read shard while a later shard is being read is therefore invisible to
-that fan-out, and a cancel can report success while it is live. This needs two
-live runs of one business key to be possible at all, which needs a deployment to
-mix pinned and unpinned starts of the same `workflow_id` — exactly the discipline
-the *Caveats* section above asks you to keep, and for exactly this reason. It is
-also strictly better than the pre-#1146 behaviour, which consulted one
-hash-derived shard and missed a second live run unconditionally rather than only
-under a race. Closing it properly means cross-shard key uniqueness, which is an
-architectural addition rather than a fix — see issue #1313 for the options.
+that fan-out. This needs two live runs of one business key to be possible at
+all, which needs a deployment to mix pinned and unpinned starts of the same
+`workflow_id` — exactly the discipline the *Caveats* section above asks you to
+keep, and for exactly this reason.
+
+**So a by-id cancel reports from a later fan-out than the one that cancelled**
+(issue #1313). The stale view only becomes a wrong answer once the cancel makes
+the run it found terminal, because that promotes the run which started during
+the fan-out to current run for the key. A cancel that ends a live run therefore
+cancels it, withholds `ExternalCancelDelivered`, and leaves the claim to the
+next sweep, whose fan-out observes the whole window the first one ran in. That
+run is then an ordinary second live copy, cancelled one per sweep until none is
+left, exactly as an ambiguous fan-out already converges. The cost is one extra
+scanner poll interval on every by-id cancel that finds a live run; a cancel
+whose target is already terminal changes nothing and still reports at once, as
+does every `ExecutionId`-addressed cancel and every single-shard deployment.
+
+This narrows the window rather than making the assertion atomic: the later
+fan-out is itself not a snapshot. Closing it outright means cross-shard key
+uniqueness, which is an architectural addition rather than a fix — see issue
+#1313 for the options.
 
 **Size each shard pool at one connection per local scanner sharing it, plus
 one.** `Worker` spawns one timeout checker per assigned shard, and each holds
@@ -358,10 +371,20 @@ append-only history and cannot be taken back, so it is only ever recorded from a
 *complete* fan-out. The consequence is that a shard which is permanently
 uninspectable *in this process* — a router whose `readable_shards` names a shard
 no pool was ever configured for, say — leaves every affected by-id request
-pending indefinitely, and a workflow awaiting the outcome waits with it. There is
-no metric for this yet; the signal is the per-row `by-id target resolution
-inconclusive` warning, which names the shard and the reason. The plugin's
-startup `missing_router_shards` check prevents the steady-state form of this
+pending indefinitely, and a workflow awaiting the outcome waits with it. The
+per-row `by-id target resolution inconclusive` warning still names the shard
+and the reason (issue #1146), and three metrics now cover what the warning
+alone could not (issue #1307): the counter
+`harvest.external_signal.by_id_indeterminate_shard`, labelled `shard` and
+`kind`, for which shard and why; the gauges
+`harvest.external_signal.by_id_oldest_pending_indeterminate_age` and its
+`external_cancel` twin, for how long a row has been stuck — the number an
+operator actually wants to alert on, since it tells "retrying, will resolve"
+apart from "stuck since Tuesday" without reasoning about shard topology; and
+the counter `harvest.external_signal.by_id_found_over_incomplete_fanout` for
+the sibling case where a live run *was* found and delivered to, but the
+answer came from an incomplete fan-out. The plugin's startup
+`missing_router_shards` check prevents the steady-state form of this
 misconfiguration; a hand-rolled embedder whose `sharded_pool` is narrower than
 its router can still reach it.
 
@@ -416,6 +439,24 @@ Every `spawn_child_workflow*` entry point has a `_placed` sibling taking a `&Chi
 | `Distributed` | `ShardRouter::pick_for_new_workflow` over `writable_shards` — the same rendezvous function a top-level start uses. |
 | `Shard(id)` | An explicit pin, validated exactly like `ShardPlacement::Shard` (unknown or drained ⇒ rejected). |
 | `ResidencyKey(key)` | An explicit residency pin, resolved through the declared map (undeclared ⇒ rejected, never hashed). |
+
+### `Distributed` during a full drain
+
+A fully-drained fleet (`writable_shards` empty — every shard mid-maintenance
+at once) is the one case a `Distributed` placement does not reject outright.
+Rejecting it would either fail the spawn terminally (the handler ABI erases
+the error type) or deadlock the drain itself: a drained shard must let its
+in-flight work finish, and a parent cannot finish while the children it
+awaits are refused.
+
+The child stays on the **parent's own shard** for the duration of the drain,
+not the deployment's configured default shard. The two differ whenever the
+parent is not itself on the default shard, and only the parent's own shard
+guarantees the child is classified local — never cross-shard — so it can
+never reach (and be rejected by) the persist-time drain check that governs
+genuine cross-shard targets. A `warn!` names the workflow and the shard on
+every occurrence, so an operator draining the fleet can see exactly which
+placed spawns degenerated while the window was open.
 
 ### Restart stability
 

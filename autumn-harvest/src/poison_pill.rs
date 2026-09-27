@@ -16,6 +16,13 @@
 //! The pure decision logic ([`quarantine_decision`]) carries no database
 //! dependency and is unit-tested without the `db` feature. The DB scanner
 //! ([`reclaim_orphaned_tasks`]) is gated behind `db`.
+//!
+//! [`reclaim_orphaned_tasks`] also runs a second, independent backstop pass
+//! (issue #1459). A `workflow` decision-cycle task can stay `RUNNING` on a
+//! worker that is still alive. This happens when the in-process timeout's
+//! own reset call fails to reach the database in time. The worker-liveness
+//! pass above never catches that case, since the worker itself never died.
+//! See [`stuck_running_tasks_query`].
 
 /// What to do with an orphaned `RUNNING` task whose claiming worker has died.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,13 +61,18 @@ pub struct ReclaimSummary {
     pub requeued: usize,
     /// Orphaned tasks quarantined to the dead-letter queue.
     pub quarantined: usize,
+    /// Stuck `workflow` tasks re-queued via the live-worker backstop path
+    /// (issue #1459). Distinct from `requeued`: that count is the
+    /// dead-worker orphan path, this one requires no worker liveness signal
+    /// at all. See [`stuck_running_tasks_query`].
+    pub stuck_requeued: usize,
 }
 
 impl ReclaimSummary {
     /// Total tasks acted on this sweep.
     #[must_use]
     pub const fn total(&self) -> usize {
-        self.requeued + self.quarantined
+        self.requeued + self.quarantined + self.stuck_requeued
     }
 }
 
@@ -71,6 +83,12 @@ impl ReclaimSummary {
 /// so an absurd `worker_heartbeat_interval` can never overflow or panic. A
 /// one-year staleness window is already far beyond any sane fleet config.
 pub const MAX_WORKER_STALE_SECS: i64 = 31_536_000;
+
+/// Upper bound (one year, in seconds) applied to the stuck-running threshold.
+///
+/// Mirrors [`MAX_WORKER_STALE_SECS`]'s overflow-safety role for
+/// [`stuck_running_tasks_query`].
+pub const MAX_STUCK_RUNNING_SECS: i64 = 31_536_000;
 
 /// SQL selecting `RUNNING` tasks whose claiming worker is no longer live.
 ///
@@ -94,6 +112,102 @@ pub const fn orphaned_running_tasks_query() -> &'static str {
        )"
 }
 
+/// SQL selecting `RUNNING` `workflow` decision-cycle tasks stuck long past any
+/// legitimate single decision cycle's budget, regardless of worker liveness
+/// (issue #1459).
+///
+/// The engine hard-cancels a workflow-task dispatch once it exceeds its
+/// configured `workflow_task_timeout` (`run_under_workflow_body_budget` in
+/// `worker.rs`). A `workflow` row still `RUNNING` well past that budget did
+/// not merely run long: its processing already stopped. The reset call
+/// (`reset_timed_out_workflow_task`) is the only thing that could still leave
+/// the row `RUNNING`. It failed — most often a database-pool connection that
+/// could not be acquired within its own bounded retry budget.
+///
+/// [`orphaned_running_tasks_query`] does not catch this case: the claiming
+/// worker is still alive, busy with other tasks, so the dead-worker liveness
+/// check never fires.
+///
+/// `activity` tasks are deliberately excluded. Their own
+/// `start_to_close_timeout` is unrelated to `workflow_task_timeout` and can
+/// legitimately keep a row `RUNNING` for a long time.
+///
+/// `$1` is the stuck-running threshold in seconds (BIGINT).
+#[must_use]
+pub const fn stuck_running_tasks_query() -> &'static str {
+    "SELECT * FROM harvest_task_queue t \
+     WHERE t.state = 'RUNNING' \
+       AND t.worker_id IS NOT NULL \
+       AND t.task_type = 'workflow' \
+       AND t.started_at IS NOT NULL \
+       AND t.started_at < NOW() - ($1::bigint * INTERVAL '1 second')"
+}
+
+/// Re-queue an orphaned task for another attempt, folding what were two
+/// separate round trips into one.
+///
+/// Runs *after* the caller already holds the row lock. That lock comes
+/// from a plain `SELECT ... FOR UPDATE` naming only `harvest_task_queue`,
+/// in [`requeue_orphan`]. This statement then combines the row-state
+/// re-check and the worker-liveness re-check into a single `UPDATE ...
+/// WHERE ... RETURNING`. It replaces what used to be a dedicated liveness
+/// `SELECT` followed by the `UPDATE`.
+///
+/// **This statement must never be the first one to touch the row in its
+/// transaction.** An `UPDATE`'s own row lock only guarantees a fresh read
+/// of *that row*, and only if it has to wait for a concurrent holder.
+/// Postgres's `EvalPlanQual` re-check re-reads the target tuple. But it
+/// evaluates the rest of the `WHERE` clause using the snapshot the
+/// statement started with, taken *before* any wait. That includes this
+/// statement's `NOT EXISTS` against `harvest_workers`. A worker that
+/// resurrects while this statement is blocked on the row lock would then
+/// be invisible to the `NOT EXISTS` check. The task would be wrongly
+/// requeued out from under a worker still processing it. Confirmed
+/// against a real Postgres: two concurrent sessions plus a third
+/// committing the resurrection mid-wait (see this PR's review history for
+/// the reproduction).
+///
+/// The caller's preceding `SELECT ... FOR UPDATE` absorbs that wait
+/// instead. By the time *this* statement runs, the row lock is already
+/// ours, so this statement can never itself block. A fresh top-level
+/// statement in `READ COMMITTED` always starts with a snapshot as of its
+/// own start. That start is after the caller's wait, if any, resolved.
+/// That is what makes the liveness check here as fresh as the dedicated
+/// `SELECT` it replaces, not merely close to it.
+///
+/// `$1` = task id, `$2` = claiming worker id, `$3` = the crash-strike
+/// count the caller observed at scan time. `$4` = the new crash-strike
+/// count to record. `$5` = the worker-stale threshold in seconds. `$6` =
+/// the current time, bound by the caller rather than read via SQL `NOW()`
+/// -- see [`requeue_orphan`]'s call site for why.
+///
+/// Returns the row's id if it was actually transitioned. Returns no row
+/// otherwise: state/worker/strikes no longer match what the scan
+/// observed, or the claiming worker is not dead after all.
+#[must_use]
+pub const fn requeue_orphan_stmt() -> &'static str {
+    "UPDATE harvest_task_queue \
+     SET state = 'PENDING', \
+         worker_id = NULL, \
+         started_at = NULL, \
+         sticky_worker_id = NULL, \
+         sticky_until = NULL, \
+         last_heartbeat_at = NULL, \
+         error = NULL, \
+         crash_strikes = $4, \
+         scheduled_at = $6 \
+     WHERE id = $1 \
+       AND state = 'RUNNING' \
+       AND worker_id = $2 \
+       AND crash_strikes = $3 \
+       AND NOT EXISTS ( \
+           SELECT 1 FROM harvest_workers w \
+           WHERE w.worker_id = $2 \
+             AND w.last_heartbeat_at > $6 - ($5::bigint * INTERVAL '1 second') \
+       ) \
+     RETURNING id"
+}
+
 // ---------------------------------------------------------------------------
 // Orphan-reclaim scanner (DB)
 // ---------------------------------------------------------------------------
@@ -110,7 +224,10 @@ mod scanner {
     use diesel_async::RunQueryDsl;
     use tokio_util::sync::CancellationToken;
 
-    use super::{ReclaimAction, ReclaimSummary, orphaned_running_tasks_query, quarantine_decision};
+    use super::{
+        ReclaimAction, ReclaimSummary, orphaned_running_tasks_query, quarantine_decision,
+        stuck_running_tasks_query,
+    };
     use crate::completion_trigger::DeferredTriggerStart;
     use crate::error::{HarvestError, HarvestResult};
     use crate::event::WorkflowEvent;
@@ -129,9 +246,14 @@ mod scanner {
             .expect("database UUIDs must round-trip into ExecutionId")
     }
 
-    /// Re-check, under a row lock, whether the worker that holds `worker_id` is
-    /// still dead. Guards against a worker that resurrected between the broad
-    /// scan and acquiring the task lock.
+    /// Re-check, under a row lock, whether the worker that holds `worker_id`
+    /// is still dead. Guards against a worker that resurrected between the
+    /// broad scan and acquiring the task lock.
+    ///
+    /// Must run as its own statement, after the caller already holds the
+    /// task row's lock. See `requeue_orphan_stmt`'s doc comment: a
+    /// statement combining this check with the row's own lock acquisition
+    /// is unsafe under lock contention.
     async fn worker_still_dead(
         conn: &mut AsyncPgConnection,
         worker_id: &str,
@@ -166,6 +288,13 @@ mod scanner {
     ) -> HarvestResult<bool> {
         use crate::schema::harvest_task_queue::dsl;
 
+        #[derive(diesel::QueryableByName)]
+        struct IdRow {
+            #[diesel(sql_type = diesel::sql_types::Uuid)]
+            #[allow(dead_code)]
+            id: uuid::Uuid,
+        }
+
         let task_id = task.id;
         let worker = task.worker_id.clone();
         let prior_strikes = task.crash_strikes;
@@ -174,22 +303,121 @@ mod scanner {
             let Some(worker_id) = worker else {
                 return Ok(false);
             };
-            // Lock the row and re-verify it is still the same orphan.
-            let current: Option<(String, Option<String>, i32)> = dsl::harvest_task_queue
+            // Lock the row first, in its own statement that names only
+            // `harvest_task_queue`. This is what makes the combined
+            // statement below safe. See `requeue_orphan_stmt`'s doc
+            // comment: the liveness re-check cannot share a statement
+            // with the row's own lock acquisition.
+            let locked: Option<uuid::Uuid> = dsl::harvest_task_queue
                 .find(task_id)
                 .for_update()
-                .select((dsl::state, dsl::worker_id, dsl::crash_strikes))
+                .select(dsl::id)
                 .first(conn)
                 .await
                 .optional()
                 .map_err(crate::error::database_error)?;
-            match current {
-                Some((state, Some(wid), strikes))
-                    if state == "RUNNING" && wid == worker_id && strikes == prior_strikes => {}
-                _ => return Ok(false),
-            }
-            if !worker_still_dead(conn, &worker_id, worker_stale_secs).await? {
+            if locked.is_none() {
                 return Ok(false);
+            }
+
+            // Now guaranteed a fresh snapshot: a new top-level statement,
+            // issued only after the lock above is already ours. This one
+            // can never itself have to wait. Re-verifies the row is still
+            // the same orphan, and re-checks the claiming worker is still
+            // dead, together in the write's own WHERE clause.
+            //
+            // `now` is read here, in Rust, rather than via SQL `NOW()`.
+            // Postgres fixes `NOW()` at the transaction's start, not the
+            // statement's. A statement issued after the lock above had to
+            // wait would still see the pre-wait time. Reading it here
+            // matches the pre-fix code, which computed `Utc::now()` at
+            // this same point -- after the row lock, not before it.
+            let now = Utc::now();
+            let updated: Option<IdRow> = diesel::sql_query(super::requeue_orphan_stmt())
+                .bind::<diesel::sql_types::Uuid, _>(task_id)
+                .bind::<diesel::sql_types::Text, _>(&worker_id)
+                .bind::<diesel::sql_types::Integer, _>(prior_strikes)
+                .bind::<diesel::sql_types::Integer, _>(new_strikes)
+                .bind::<diesel::sql_types::BigInt, _>(worker_stale_secs)
+                .bind::<diesel::sql_types::Timestamptz, _>(now)
+                .get_result(conn)
+                .await
+                .optional()
+                .map_err(crate::error::database_error)?;
+            Ok(updated.is_some())
+        }))
+        .await
+    }
+
+    /// Re-queue a `workflow` task stuck `RUNNING` past the stuck-running
+    /// backstop threshold, on a worker that may still be alive (issue #1459).
+    ///
+    /// Never touches `crash_strikes` and never quarantines. Being stuck this
+    /// way says nothing about the task itself. It means a reset attempt could
+    /// not reach the database in time, not that the task is poisonous.
+    ///
+    /// Leaving `crash_strikes` untouched matters beyond quarantine counting.
+    /// A re-claim of the row this frees still carries the same `crash_strikes`
+    /// value. `worker.rs`'s `reset_timed_out_workflow_task` also guards its
+    /// own write on `attempt`, not only `crash_strikes`. A delayed reset from
+    /// this row's PRIOR attempt then cannot match the fresh claim and undo
+    /// it. See that function's own doc comment.
+    ///
+    /// Returns `true` if the row was actually transitioned (it was still the
+    /// same stuck `RUNNING` attempt), `false` if a concurrent actor already
+    /// handled it.
+    async fn requeue_stuck_task(
+        conn: &mut AsyncPgConnection,
+        task: &TaskQueueItem,
+        stuck_running_secs: i64,
+    ) -> HarvestResult<bool> {
+        use crate::schema::harvest_task_queue::dsl;
+
+        // Row shape re-read fresh under the lock below: state, worker id,
+        // crash strikes, task type, started-at.
+        type StuckRowState = (
+            String,
+            Option<String>,
+            i32,
+            String,
+            Option<chrono::DateTime<Utc>>,
+        );
+
+        let task_id = task.id;
+        let Some(worker_id) = task.worker_id.clone() else {
+            return Ok(false);
+        };
+        let prior_strikes = task.crash_strikes;
+
+        Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
+            // Lock the row and re-verify it is still the same stuck attempt.
+            // `started_at` is re-read fresh under the lock, not taken from
+            // the pre-scan snapshot. A reset or a fresh re-claim between the
+            // scan and here always changes it. Re-checking its age here is
+            // what stops this from undoing a legitimate new attempt.
+            let current: Option<StuckRowState> = dsl::harvest_task_queue
+                .find(task_id)
+                .for_update()
+                .select((
+                    dsl::state,
+                    dsl::worker_id,
+                    dsl::crash_strikes,
+                    dsl::task_type,
+                    dsl::started_at,
+                ))
+                .first(conn)
+                .await
+                .optional()
+                .map_err(crate::error::database_error)?;
+            let cutoff = Utc::now() - chrono::Duration::seconds(stuck_running_secs);
+            match current {
+                Some((state, Some(wid), strikes, task_type, Some(started_at)))
+                    if state == "RUNNING"
+                        && wid == worker_id
+                        && strikes == prior_strikes
+                        && task_type == "workflow"
+                        && started_at < cutoff => {}
+                _ => return Ok(false),
             }
 
             diesel::update(dsl::harvest_task_queue.find(task_id))
@@ -199,18 +427,11 @@ mod scanner {
                     dsl::started_at.eq(None::<chrono::DateTime<Utc>>),
                     dsl::sticky_worker_id.eq(None::<String>),
                     dsl::sticky_until.eq(None::<chrono::DateTime<Utc>>),
-                    // Clear the dead attempt's heartbeat timestamp so the
-                    // fresh attempt is not immediately timed out by the
-                    // COALESCE(last_heartbeat_at, started_at) scanner.
-                    // heartbeat_details is preserved so a retry can still
-                    // read the last flushed checkpoint.
                     dsl::last_heartbeat_at.eq(None::<chrono::DateTime<Utc>>),
-                    // Clear the previous error: crashes don't leave a
-                    // meaningful error string, and the stale message from an
-                    // earlier clean failure would otherwise appear as
-                    // previous_failure() on the next attempt.
+                    // Mirrors `requeue_orphan_stmt`: a stale `error` from an
+                    // earlier attempt must not survive into the fresh one it
+                    // no longer describes.
                     dsl::error.eq(None::<String>),
-                    dsl::crash_strikes.eq(new_strikes),
                     dsl::scheduled_at.eq(Utc::now()),
                 ))
                 .execute(conn)
@@ -348,15 +569,17 @@ mod scanner {
             .map_err(crate::error::database_error)?;
         }
 
-        let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
+        let (mut deferred, closed_children) =
+            apply_parent_close_cascade(conn, exec_id, codecs).await?;
         let mut pending_cancel_metrics = Vec::new();
         let failed_triggers =
-            crate::completion_trigger::evaluate_triggers_for_execution_collecting(
+            crate::completion_trigger::evaluate_triggers_for_execution_collecting_with_codecs(
                 conn,
                 exec_id,
                 crate::completion_trigger::TerminalState::Failed,
                 metrics,
                 &mut pending_cancel_metrics,
+                codecs,
             )
             .await?;
         deferred.extend(failed_triggers);
@@ -377,7 +600,7 @@ mod scanner {
             // this child terminal. Mirrors the identical guard in
             // `worker::wake_parent_for_child_completion`/`_failure` and
             // `timeout::wake_parent_for_child_timeout`.
-            if crate::worker::parent_is_on_another_shard(parent_exec_id, exec_id) {
+            if crate::worker::parent_is_on_another_shard(conn, parent_exec_id, exec_id).await? {
                 tracing::debug!(
                     parent_execution_id = %parent_exec_id,
                     child_execution_id = %exec_id,
@@ -385,10 +608,11 @@ mod scanner {
                      relay's to deliver"
                 );
             } else {
-                crate::store::append_single_event(
+                crate::store::append_single_event_with_codecs(
                     conn,
                     parent_exec_id,
                     WorkflowEvent::child_workflow_failed(exec_id, error.to_string()),
+                    codecs,
                 )
                 .await?;
                 crate::queue::wake_workflow_task(conn, parent_exec_id).await?;
@@ -467,70 +691,101 @@ mod scanner {
         // workflow's (id, name, schedule_id, origin) when it was actually failed
         // RUNNING → FAILED so the schedule failure counter can be bumped (with
         // the correct origin) after commit.
+        //
+        // `fail_owning_workflow` wakes a detached parent, which raises a
+        // dispatch hint (issue #1429). This scanner runs on its own timer,
+        // outside any worker task body's catch-all buffering scope. The hint
+        // would otherwise reach the channel before this COMMIT. The
+        // buffering scope holds it until then, matching every other
+        // transaction owner that calls `wake_workflow_task`.
+        //
+        // `reclaim_orphaned_tasks` claims one row per loop iteration over an
+        // unbounded orphan set, the same shape as the outbox sweeps
+        // `buffered_settled_in_background` already covers. An inline
+        // `buffered_settled` awaits the dispatch channel's publish call
+        // after every commit. That can cost up to `DISPATCH_CALL_TIMEOUT`
+        // per quarantined row when the channel is slow (Codex review, issue
+        // #1429). It delays the rest of the sweep even though Postgres
+        // already committed. Reconciliation is the durability fallback
+        // regardless, so `buffered_settled_in_background` hands the hint to
+        // the existing non-blocking background publisher instead of
+        // awaiting it inline.
         let (acted, failed_workflow, deferred_starts, closed_children, pending_cancel_metrics) =
-            Box::pin(conn.transaction::<(
+            crate::dispatch::buffered_settled_in_background(Box::pin(conn.transaction::<(
                 bool,
                 Option<(String, String, Option<uuid::Uuid>, Option<String>)>,
                 Vec<DeferredTriggerStart>,
                 Vec<(ExecutionId, String)>,
                 Vec<crate::execution::StartCancelledRun>,
-            ), HarvestError, _>(async |conn| {
-                let Some(worker_id) = worker else {
-                    return Ok((false, None, Vec::new(), Vec::new(), Vec::new()));
-                };
-                let current: Option<(String, Option<String>, i32)> = dsl::harvest_task_queue
-                    .find(task_id)
-                    .for_update()
-                    .select((dsl::state, dsl::worker_id, dsl::crash_strikes))
-                    .first(conn)
-                    .await
-                    .optional()
-                    .map_err(crate::error::database_error)?;
-                match current {
-                    Some((state, Some(wid), strikes))
-                        if state == "RUNNING" && wid == worker_id && strikes == prior_strikes => {}
-                    _ => return Ok((false, None, Vec::new(), Vec::new(), Vec::new())),
-                }
-                if !worker_still_dead(conn, &worker_id, worker_stale_secs).await? {
-                    return Ok((false, None, Vec::new(), Vec::new(), Vec::new()));
-                }
-
-                dead_letter(conn, &entry).await?;
-
-                diesel::update(dsl::harvest_task_queue.find(task_id))
-                    .set((
-                        dsl::state.eq("FAILED"),
-                        dsl::worker_id.eq(None::<String>),
-                        dsl::crash_strikes.eq(new_strikes),
-                        dsl::error.eq(Some(error.clone())),
-                        dsl::completed_at.eq(Some(Utc::now())),
-                    ))
-                    .execute(conn)
-                    .await
-                    .map_err(crate::error::database_error)?;
-
-                let (failed_workflow, deferred, closed_children, pending_cancel_metrics) =
-                    match workflow_exec_id {
-                        Some(exec_uuid) => {
-                            fail_owning_workflow(
-                                conn,
-                                execution_id_from_uuid(exec_uuid),
-                                &error,
-                                Some(metrics),
-                                codecs,
-                            )
-                            .await?
-                        }
-                        None => (None, Vec::new(), Vec::new(), Vec::new()),
+            ), HarvestError, _>(
+                async |conn| {
+                    let Some(worker_id) = worker else {
+                        return Ok((false, None, Vec::new(), Vec::new(), Vec::new()));
                     };
-                Ok((
-                    true,
-                    failed_workflow,
-                    deferred,
-                    closed_children,
-                    pending_cancel_metrics,
-                ))
-            }))
+                    // Lock the row and re-verify it is still the same orphan.
+                    // This cannot fold the worker-liveness check into the same
+                    // statement. See `requeue_orphan_stmt`'s doc comment: a
+                    // wait on this row's lock would leave the liveness check
+                    // reading a stale pre-wait snapshot of `harvest_workers`.
+                    // `worker_still_dead` below is deliberately a separate,
+                    // later statement instead. It runs only once this lock is
+                    // already ours, so it is guaranteed a fresh snapshot.
+                    let current: Option<(String, Option<String>, i32)> = dsl::harvest_task_queue
+                        .find(task_id)
+                        .for_update()
+                        .select((dsl::state, dsl::worker_id, dsl::crash_strikes))
+                        .first(conn)
+                        .await
+                        .optional()
+                        .map_err(crate::error::database_error)?;
+                    match current {
+                        Some((state, Some(wid), strikes))
+                            if state == "RUNNING"
+                                && wid == worker_id
+                                && strikes == prior_strikes => {}
+                        _ => return Ok((false, None, Vec::new(), Vec::new(), Vec::new())),
+                    }
+                    if !worker_still_dead(conn, &worker_id, worker_stale_secs).await? {
+                        return Ok((false, None, Vec::new(), Vec::new(), Vec::new()));
+                    }
+
+                    dead_letter(conn, &entry).await?;
+
+                    diesel::update(dsl::harvest_task_queue.find(task_id))
+                        .set((
+                            dsl::state.eq("FAILED"),
+                            dsl::worker_id.eq(None::<String>),
+                            dsl::crash_strikes.eq(new_strikes),
+                            dsl::error.eq(Some(error.clone())),
+                            dsl::completed_at.eq(Some(Utc::now())),
+                        ))
+                        .execute(conn)
+                        .await
+                        .map_err(crate::error::database_error)?;
+
+                    let (failed_workflow, deferred, closed_children, pending_cancel_metrics) =
+                        match workflow_exec_id {
+                            Some(exec_uuid) => {
+                                fail_owning_workflow(
+                                    conn,
+                                    execution_id_from_uuid(exec_uuid),
+                                    &error,
+                                    Some(metrics),
+                                    codecs,
+                                )
+                                .await?
+                            }
+                            None => (None, Vec::new(), Vec::new(), Vec::new()),
+                        };
+                    Ok((
+                        true,
+                        failed_workflow,
+                        deferred,
+                        closed_children,
+                        pending_cancel_metrics,
+                    ))
+                },
+            )))
             .await?;
 
         if acted {
@@ -603,16 +858,24 @@ mod scanner {
         Ok(acted)
     }
 
-    /// Scan for `RUNNING` tasks whose claiming worker has died and reclaim them.
+    /// Reclaim `RUNNING` tasks orphaned by a dead worker, then (issue #1459)
+    /// tasks stuck long past their budget regardless of worker liveness.
     ///
-    /// Each orphan's `crash_strikes` is incremented; the task is then re-queued
-    /// (under threshold) or quarantined to the DLQ (at or over threshold) per
-    /// [`quarantine_decision`]. Runs shard-local against the connection's
-    /// database.
+    /// Each dead-worker orphan's `crash_strikes` is incremented; the task is
+    /// then re-queued (under threshold) or quarantined to the DLQ (at or over
+    /// threshold) per [`quarantine_decision`]. Runs shard-local against the
+    /// connection's database.
     ///
     /// `worker_stale_secs` is how long a worker may go without a heartbeat
     /// before its in-flight tasks are considered orphaned (typically
     /// `2 × worker_heartbeat_interval`).
+    ///
+    /// `stuck_running_secs` gates the second, independent backstop pass
+    /// ([`stuck_running_tasks_query`]): `None` disables it, so behavior is
+    /// unchanged from before issue #1459. `Some(secs)` re-queues a stuck
+    /// `workflow` task whether or not its worker is alive. This pass never
+    /// touches `crash_strikes` and never quarantines — being stuck this way
+    /// says nothing about the task itself.
     ///
     /// # Errors
     ///
@@ -621,14 +884,15 @@ mod scanner {
         conn: &mut AsyncPgConnection,
         threshold: i32,
         worker_stale_secs: i64,
+        stuck_running_secs: Option<i64>,
         metrics: &dyn MetricsRecorder,
         // Issue #1243: forwarded to the quarantine path, whose
         // `WorkflowFailed` carries a payload-bearing `details` field.
         codecs: &crate::payload_codec::PayloadCodecs,
     ) -> HarvestResult<ReclaimSummary> {
-        // Clamp once at the entry point so neither the SQL interval arithmetic
-        // nor the chrono::Duration re-check (in `worker_still_dead`) can ever
-        // overflow on an out-of-range caller value.
+        // Clamp once at the entry point. Neither the candidate scan nor
+        // the per-row liveness re-check can then overflow the SQL
+        // interval arithmetic on an out-of-range caller value.
         let worker_stale_secs = worker_stale_secs.clamp(0, super::MAX_WORKER_STALE_SECS);
         // Chaos: inject a transient DB/connection error before the orphan scan
         // (issue #940 AC1(b)). The reclaim is idempotent and the poll loop
@@ -670,6 +934,21 @@ mod scanner {
                 }
             }
         }
+
+        if let Some(stuck_running_secs) = stuck_running_secs {
+            let stuck_running_secs = stuck_running_secs.clamp(0, super::MAX_STUCK_RUNNING_SECS);
+            let stuck: Vec<TaskQueueItem> = diesel::sql_query(stuck_running_tasks_query())
+                .bind::<diesel::sql_types::BigInt, _>(stuck_running_secs)
+                .load(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+            for task in stuck {
+                if requeue_stuck_task(conn, &task, stuck_running_secs).await? {
+                    summary.stuck_requeued += 1;
+                    crate::queue::record_pending_hints(conn, &[task.id]).await;
+                }
+            }
+        }
         Ok(summary)
     }
 
@@ -677,9 +956,18 @@ mod scanner {
     /// tasks. Stops when `cancel` is triggered.
     ///
     /// Equivalent to [`spawn_poison_pill_reclaimer_for_shard`] with no shard
-    /// attributed. The shard is only used to label this loop in the
-    /// `scanner_liveness` health check (issue #797); it never affects which
-    /// tasks the loop reclaims -- that is the connection's own database.
+    /// attributed and the issue #1459 stuck-running backstop disabled. The
+    /// shard is only used to label this loop in the `scanner_liveness` health
+    /// check (issue #797); it never affects which tasks the loop reclaims --
+    /// that is the connection's own database.
+    ///
+    /// This function's signature is frozen. See
+    /// `the_public_spawn_signatures_are_unchanged_by_shard_attribution` in
+    /// `tests/integration/scanner_tick_db_tests.rs`. The reason matches why
+    /// the shard parameter never reached it. An embedder calling this
+    /// directly should not have to opt into a feature it never asked for.
+    /// Call [`spawn_poison_pill_reclaimer_for_shard`] directly to enable the
+    /// backstop.
     #[must_use]
     pub fn spawn_poison_pill_reclaimer(
         pool: diesel_async::pooled_connection::deadpool::Pool<AsyncPgConnection>,
@@ -697,6 +985,7 @@ mod scanner {
             interval,
             threshold,
             worker_stale_secs,
+            None,
             telemetry,
             None,
             payload_codecs,
@@ -724,6 +1013,10 @@ mod scanner {
         interval: std::time::Duration,
         threshold: i32,
         worker_stale_secs: i64,
+        // Issue #1459: gates the stuck-running backstop pass (a `workflow`
+        // task stuck long past its decision-cycle budget, worker liveness
+        // notwithstanding). `None` disables it, matching pre-#1459 behavior.
+        stuck_running_secs: Option<i64>,
         telemetry: std::sync::Arc<crate::telemetry::TelemetryConfig>,
         shard: Option<crate::types::ShardId>,
         // Issue #1243: owned so it can move into the spawned loop. The
@@ -747,12 +1040,24 @@ mod scanner {
                     () = cancel.cancelled() => break,
                     () = tokio::time::sleep(interval) => {}
                 }
-                match pool.get().await {
+                // Selected against `cancel` (issue #1426). Harvest configures no
+                // deadpool `Timeouts`, so `pool.get()` alone can park this task
+                // indefinitely on an exhausted shard pool. The top-of-loop select
+                // only guards the sleep between ticks. A tick already
+                // parked here would otherwise never observe shutdown. The
+                // join in `shutdown_and_cleanup_monitors` would then wait
+                // forever.
+                let get_result = tokio::select! {
+                    () = cancel.cancelled() => break,
+                    result = pool.get() => result,
+                };
+                match get_result {
                     Ok(mut conn) => {
                         match reclaim_orphaned_tasks(
                             &mut conn,
                             threshold,
                             worker_stale_secs,
+                            stuck_running_secs,
                             &*telemetry.metrics,
                             &payload_codecs,
                         )
@@ -762,6 +1067,7 @@ mod scanner {
                                 tracing::warn!(
                                     requeued = summary.requeued,
                                     quarantined = summary.quarantined,
+                                    stuck_requeued = summary.stuck_requeued,
                                     "reclaimed orphaned poison-pill tasks"
                                 );
                             }
@@ -798,6 +1104,19 @@ pub use scanner::{
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #1402: an orphan reclaim keeps the SAME wake reason a
+    /// crashed worker was already processing. It must NOT clear
+    /// `timer_fires_at` -- that would defeat the marker for a genuinely
+    /// timer-owned row recovering from a crash.
+    #[test]
+    fn requeue_orphan_stmt_preserves_the_timer_marker() {
+        let sql = requeue_orphan_stmt();
+        assert!(
+            !sql.contains("timer_fires_at"),
+            "an orphan reclaim must leave timer_fires_at untouched: {sql}"
+        );
+    }
 
     #[test]
     fn first_strike_under_threshold_requeues() {
@@ -849,11 +1168,31 @@ mod tests {
     }
 
     #[test]
-    fn reclaim_summary_total_sums_both_buckets() {
+    fn reclaim_summary_total_sums_all_three_buckets() {
         let summary = ReclaimSummary {
             requeued: 2,
             quarantined: 1,
+            stuck_requeued: 4,
         };
-        assert_eq!(summary.total(), 3);
+        assert_eq!(summary.total(), 7);
+    }
+
+    #[test]
+    fn stuck_query_targets_running_workflow_rows_past_deadline() {
+        let sql = stuck_running_tasks_query();
+        assert!(sql.contains("harvest_task_queue"), "scans the task queue");
+        assert!(sql.contains("state = 'RUNNING'"), "only RUNNING rows");
+        assert!(
+            sql.contains("task_type = 'workflow'"),
+            "activity tasks are excluded -- their own start_to_close is unrelated"
+        );
+        assert!(
+            sql.contains("started_at"),
+            "stuck is judged by wall-clock age, not worker liveness"
+        );
+        assert!(
+            !sql.contains("harvest_workers"),
+            "this backstop applies regardless of worker liveness"
+        );
     }
 }

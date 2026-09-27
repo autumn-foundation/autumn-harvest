@@ -371,6 +371,12 @@ pub mod queue_pause;
 /// `db` feature; [`quota::load_quota_usage`]/[`quota::list_quota_usage`] are
 /// DB-gated.
 pub mod quota;
+/// Registry-aware `quota_key` backfill for pre-upgrade executions (issue #1226).
+///
+/// Pure logic ([`quota_reconcile::resolve_backfill`],
+/// [`quota_reconcile::ReconcileSummary`]) compiles without the `db` feature;
+/// the sweep and its periodic spawner are DB-gated.
+pub mod quota_reconcile;
 pub mod replay;
 /// Stratified in-flight history sampling for the replay-drift gate (issue #798).
 ///
@@ -561,10 +567,15 @@ pub use execution::{
     redrive_target, resolve_execution_id_by_workflow_id, resolve_live_attempt,
     resolve_live_attempt_id, resume_live_attempt, resume_workflow_execution,
     schedule_run_state_summary, select_resolved_run, signal_with_start_workflow_execution,
-    signal_with_start_workflow_execution_with_metrics, start_or_load_workflow_execution,
-    start_or_load_workflow_execution_idempotent, start_or_load_workflow_execution_with_metrics,
-    terminate_live_attempt, terminate_workflow_execution, update_with_start_workflow_execution,
+    signal_with_start_workflow_execution_with_metrics,
+    signal_with_start_workflow_execution_with_metrics_and_codecs, start_or_load_workflow_execution,
+    start_or_load_workflow_execution_idempotent,
+    start_or_load_workflow_execution_idempotent_with_codecs,
+    start_or_load_workflow_execution_with_codecs, start_or_load_workflow_execution_with_metrics,
+    start_or_load_workflow_execution_with_metrics_and_codecs, terminate_live_attempt,
+    terminate_workflow_execution, update_with_start_workflow_execution,
     update_with_start_workflow_execution_with_metrics,
+    update_with_start_workflow_execution_with_metrics_and_codecs,
 };
 pub use executor::{WorkflowOutcome, run_workflow};
 pub use guardrail::{
@@ -712,13 +723,14 @@ pub use webhook_trigger::{
 #[cfg(feature = "hot-code-swap")]
 pub use hot_swap::{
     DECIDE_ABI_VERSION, DECIDE_FUEL, DECIDE_MAX_WALL_CLOCK, DECIDE_MEMORY_BYTES,
-    DECIDE_RUN_WALL_CLOCK, DecideOutcome, DecideRequest, DecideResponse, DecisionCache,
-    HotSwapError, LoadedWorkflowModule, MAX_CACHED_DECISION_BYTES, MAX_CACHED_DECISIONS,
-    MAX_CACHED_RESPONSE_BYTES, MAX_DECIDE_REQUEST_BYTES, MAX_DECIDE_STEPS, MAX_GUEST_TEXT_BYTES,
-    MAX_WORKFLOW_MODULE_BYTES, MIN_SIGNING_KEY_BYTES, ModuleDescriptor, ModuleHost, ModuleRegistry,
-    ModuleVerification, PreparedBinding, clamp_decide_limits, compute_module_hash,
-    default_decide_limits, encode_decide_request, is_module_hosted, module_workflow_handler,
-    sign_module_binding, verify_module_bytes, with_module_host,
+    DECIDE_RUN_FUEL_BUDGET, DECIDE_RUN_WALL_CLOCK_BACKSTOP, DecideOutcome, DecideRequest,
+    DecideResponse, DecisionCache, HotSwapError, LoadedWorkflowModule, MAX_CACHED_DECISION_BYTES,
+    MAX_CACHED_DECISIONS, MAX_CACHED_RESPONSE_BYTES, MAX_DECIDE_REQUEST_BYTES, MAX_DECIDE_STEPS,
+    MAX_GUEST_TEXT_BYTES, MAX_QUEUE_NAME_BYTES, MAX_WORKFLOW_MODULE_BYTES, MIN_SIGNING_KEY_BYTES,
+    ModuleDescriptor, ModuleHost, ModuleRegistry, ModuleVerification, PreparedBinding,
+    clamp_decide_limits, compute_module_hash, default_decide_limits, encode_decide_request,
+    is_module_hosted, module_workflow_handler, sign_module_binding, verify_module_bytes,
+    with_module_host,
 };
 #[cfg(feature = "hot-code-swap")]
 pub use hot_swap_store::{

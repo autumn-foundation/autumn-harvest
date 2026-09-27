@@ -18,7 +18,6 @@ use autumn_harvest::worker::{DbPool, HandlerRegistry};
 use autumn_harvest::{RetentionConfig, WorkflowInfo};
 use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime};
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -85,10 +84,6 @@ fn build_test_pool(database_url: &str) -> DbPool {
         .max_size(4)
         .build()
         .expect("pool build failed")
-}
-
-fn test_app_state() -> AppState {
-    AppState::for_test().with_profile("test")
 }
 
 // -------------------------------------------------------------------------
@@ -167,8 +162,7 @@ async fn start_workflow_stores_captured_trace_context_in_task_queue() {
         ShardRouter::single(),
     ));
 
-    let app: axum::Router =
-        autumn_harvest_plugin::harvest_api_router(api_state).with_state(test_app_state());
+    let app: axum::Router = autumn_harvest_plugin::harvest_api_router(api_state);
 
     // POST /workflows/echo_workflow/start — the handler emits
     // harvest.workflow.schedule and calls capture_trace_context().
@@ -274,8 +268,7 @@ async fn start_workflow_leaves_trace_context_null_when_no_propagator() {
         ShardRouter::single(),
     ));
 
-    let app: axum::Router =
-        autumn_harvest_plugin::harvest_api_router(api_state).with_state(test_app_state());
+    let app: axum::Router = autumn_harvest_plugin::harvest_api_router(api_state);
 
     let response = app
         .clone()

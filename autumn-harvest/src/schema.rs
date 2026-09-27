@@ -153,6 +153,10 @@ diesel::table! {
         /// the workflow type has no declared `QuotaPolicy` or the key could not
         /// be resolved from the input. Never read on replay -- purely an
         /// admission-time bookkeeping column backing the quota usage counts.
+        /// Also backfilled post-INSERT, once, by `quota_reconcile`'s periodic
+        /// sweep (issue #1226), for a row whose policy was declared after it
+        /// started. Guarded by `WHERE quota_key IS NULL`, so this never
+        /// overwrites a value admission already set.
         quota_key -> Nullable<Text>,
         /// Forwarding pointer for a shard-rebalanced execution (issue #964).
         /// Non-NULL exactly when `state = 'MIGRATED'`: the shard the run now
@@ -175,6 +179,38 @@ diesel::table! {
         /// of shards still holding a copy of this run's bytes. That is what a
         /// cross-residence payload erasure has to traverse.
         migrated_from_shards -> Nullable<Jsonb>,
+        /// Wall-clock a reconciler observed this seal's live copy as terminal
+        /// (issue #1317). NULL until observed.
+        ///
+        /// `is_active_conflict_state` treats `MIGRATED` as active forever, on
+        /// purpose -- the run is still live, just elsewhere. Nothing else
+        /// propagates the live copy's terminal completion back here. So a
+        /// start of the same business key attached to this seal forever,
+        /// long past the point the real run finished. Non-NULL releases the
+        /// row from that classification.
+        ///
+        /// Deliberately NOT a `state` change. Retention and erasure key off
+        /// `state = 'MIGRATED'` to protect the forwarding pointer from
+        /// deletion; this column carries the fact separately so that
+        /// protection stays intact.
+        migrated_run_terminal_at -> Nullable<Timestamptz>,
+        /// The live copy's own terminal state, recorded alongside
+        /// `migrated_run_terminal_at` (fresh review, P2 follow-up). `state`
+        /// on this row stays `MIGRATED` forever. A reuse-policy decision
+        /// that needs to distinguish a failed live copy from a successful
+        /// one reads this column instead.
+        migrated_run_terminal_state -> Nullable<Text>,
+        /// The state a shard-rebalance staging vacate sealed over (issue
+        /// #1317 review). Non-NULL only while the migration that vacated
+        /// this row is still in flight. An abort restores `state` to this
+        /// value and clears it; a successful cutover just clears it.
+        staging_vacated_state -> Nullable<Text>,
+        /// The execution id of the migration whose staging vacated this row
+        /// (issue #1596 review). Non-NULL exactly when
+        /// `staging_vacated_state` is. Lets `activate_target` finalize this
+        /// row's marker with a direct match on the vacating migration's own
+        /// execution id, with no cross-database write and no retry race.
+        staging_vacated_by -> Nullable<Uuid>,
     }
 }
 
@@ -276,6 +312,13 @@ diesel::table! {
         /// a mismatch means the evidence belongs to a frontier now behind us.
         /// `NULL` = none recorded yet, which reads as a mismatch.
         capability_miss_handler -> Nullable<Text>,
+        /// The `fires_at` of the durable timer this row is armed for (issue
+        /// #1402). Set only by `queue::reschedule_task`. Survives a later
+        /// `scheduled_at` drift with the same wake reason (a queue-pause
+        /// resume credit, an orphan reclaim, a capability-miss release).
+        /// `NULL` when no timer owns this row, or once a different wake
+        /// reason repends it.
+        timer_fires_at -> Nullable<Timestamptz>,
     }
 }
 
@@ -711,6 +754,16 @@ diesel::table! {
         /// NULL = fired; `condition_unmet` / `condition_invalid` =
         /// resolved-skipped by the output guard (issue #810).
         outcome -> Nullable<Text>,
+        /// The shard the relay resolved for the target, at relay time (issue
+        /// #1401). NULL on a resolved-skip row (no target was ever picked)
+        /// and on every pre-migration row.
+        target_shard -> Nullable<Integer>,
+        /// `harvest_completion_triggers.target_workflow_name` AT RELAY TIME
+        /// (issue #1401). `sync_completion_triggers` can update that column
+        /// in place, so a join against the CURRENT value can name a target
+        /// this specific fire never used. NULL on a resolved-skip row and on
+        /// every pre-migration row.
+        target_workflow_name -> Nullable<Text>,
     }
 }
 
@@ -1105,6 +1158,22 @@ diesel::table! {
         unresolved_rows -> Int8,
         completed_at -> Nullable<Timestamptz>,
         updated_at -> Timestamptz,
+        next_revalidation_at -> Nullable<Timestamptz>,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
+    /// Durable fleet-wide codec key lifecycle state (issue #1244). One row per
+    /// key id, `state` one of `active` / `retiring` / `retired`.
+    harvest_codec_key_state (key_id) {
+        key_id -> Text,
+        state -> Text,
+        activated_at -> Nullable<Timestamptz>,
+        retiring_since -> Nullable<Timestamptz>,
+        retired_at -> Nullable<Timestamptz>,
+        updated_at -> Timestamptz,
     }
 }
 
@@ -1201,4 +1270,5 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_mutex_waiters,
     harvest_workflow_logs,
     harvest_codec_rotation_cursor,
+    harvest_codec_key_state,
 );

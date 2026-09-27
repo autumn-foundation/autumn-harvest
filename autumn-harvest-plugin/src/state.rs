@@ -89,6 +89,12 @@ impl HarvestDbPool {
         self.sharded.pool_for(self.sharded.default_shard())
     }
 
+    /// The configured default shard's id.
+    #[must_use]
+    pub const fn default_shard(&self) -> ShardId {
+        self.sharded.default_shard()
+    }
+
     /// Return the pool that owns a given workflow execution.
     ///
     /// `ExecutionId` carries its shard identifier in the first two bytes so

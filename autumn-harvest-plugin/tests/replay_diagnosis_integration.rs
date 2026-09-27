@@ -58,7 +58,6 @@ use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -294,7 +293,7 @@ fn build_app(pool: &DbPool) -> HarvestApiApp {
     )
     .with_registered_dag_names(["classic_dag".to_string()]);
     api_state.install(runtime);
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 /// Like [`build_app`] but registers `policy_branch_wf` on a registry carrying a
@@ -323,7 +322,7 @@ fn build_app_with_history_policy(pool: &DbPool) -> HarvestApiApp {
         ShardRouter::default(),
     );
     api_state.install(runtime);
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 /// Like [`build_app`] but registers `state_reading_wf` on a registry carrying a
@@ -360,7 +359,7 @@ fn build_app_with_state(pool: &DbPool) -> HarvestApiApp {
         ShardRouter::default(),
     );
     api_state.install(runtime);
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 async fn post_diagnosis(app: &HarvestApiApp, id: &str) -> (StatusCode, Value) {
@@ -1155,7 +1154,7 @@ fn build_app_with_codecs(pool: &DbPool, decode_on: bool, codecs: PayloadCodecs) 
         ShardRouter::default(),
     );
     api_state.install(runtime);
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 /// Seed an execution whose event payloads are codec-ENCODED (envelopes), using

@@ -2,11 +2,13 @@
 //!
 //! Harvest's correctness in production depends on a fleet of background
 //! control loops that run as bare spawned Tokio tasks inside the
-//! worker/plugin process: timeout enforcement, the soft-SLA scanner, the
-//! poison-pill orphan reclaimer, the external signal/cancel outboxes, the
-//! retention janitor, the schedule ticker, and the bounded-pause
-//! auto-resumer. If one of them panics, deadlocks on a poisoned connection,
-//! or stalls on a never-returning query, it fails **silently** — and the
+//! worker/plugin process. These include timeout enforcement, the soft-SLA
+//! scanner, and the poison-pill orphan reclaimer. They also include the
+//! external signal/cancel outboxes, the retention janitor, the schedule
+//! ticker, the bounded-pause auto-resumer, and the dedicated audit-export
+//! task (issue #1269). If one of them panics, deadlocks on a poisoned
+//! connection, or stalls on a never-returning query, it fails **silently**
+//! — and the
 //! operator only finds out when a downstream correctness symptom (a workflow
 //! that should have timed out but didn't, an SLA that never fired) surfaces
 //! minutes to hours later.
@@ -49,8 +51,9 @@
 //!   `harvest.scanner.tick` counter (which carries the scrape target's own
 //!   `instance` label) to find *which* replica went quiet.
 //! * A [`Scanner`] label may cover **more than one loop instance** in one
-//!   process: a multi-shard worker spawns a timeout checker, poison-pill
-//!   reclaimer, and pause auto-resumer per assigned shard. Each instance is
+//!   process. A multi-shard worker spawns a timeout checker, poison-pill
+//!   reclaimer, pause auto-resumer, and audit-export task per assigned
+//!   shard. Each instance is
 //!   tracked separately and the health check reports the **worst** of them, so
 //!   a healthy shard cannot mask a wedged sibling. The *metric* carries a
 //!   bounded `shard` label for the same reason: without it every per-shard
@@ -106,8 +109,8 @@ use crate::types::ShardId;
 ///
 /// # Deliberate deviation from a literal "2 x poll interval" bound
 ///
-/// For the six sub-minute loops this floor, not the `2 x` multiplier, is what
-/// binds: a 500 ms loop is detected in 60 s, **not** 1 s. That is intentional,
+/// For the seven sub-minute loops, this floor binds instead of the `2 x`
+/// multiplier. A 500 ms loop is detected in 60 s, **not** 1 s. That is intentional,
 /// and `success_metric_detection_bound_holds_for_every_shipped_interval` pins
 /// it explicitly so the bound is never over-claimed.
 ///
@@ -138,7 +141,7 @@ pub const MIN_SCANNER_STALENESS_THRESHOLD: Duration = Duration::from_secs(60);
 ///
 /// # Shared liveness fate
 ///
-/// There are seven labels but **five** spawned loops: [`Sla`](Self::Sla) and
+/// There are eight labels but **six** spawned loops: [`Sla`](Self::Sla) and
 /// [`ExternalOutbox`](Self::ExternalOutbox) are enforcement responsibilities
 /// *inside* the timeout loop, not tasks of their own. All three are registered
 /// and ticked together by `spawn_timeout_checker`, so they share one loop's
@@ -172,12 +175,17 @@ pub enum Scanner {
     Schedule,
     /// The bounded-pause auto-resumer (`spawn_pause_auto_resumer`).
     PauseAutoResume,
+    /// The dedicated audit-export task
+    /// (`crate::audit_export::spawn_audit_export_checker_for_shard`, issue
+    /// #1269). Previously folded into the timeout loop; split out to its own
+    /// task so a slow sink delays nothing but its own next tick.
+    AuditExport,
 }
 
 impl Scanner {
     /// Every scanner, in a stable order. Used by tests and docs to enumerate
     /// the bounded label set.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Timeout,
         Self::Sla,
         Self::PoisonPill,
@@ -185,6 +193,7 @@ impl Scanner {
         Self::Retention,
         Self::Schedule,
         Self::PauseAutoResume,
+        Self::AuditExport,
     ];
 
     /// Stable string representation, suitable for a metric label value.
@@ -198,6 +207,7 @@ impl Scanner {
             Self::Retention => "retention",
             Self::Schedule => "schedule",
             Self::PauseAutoResume => "pause_auto_resume",
+            Self::AuditExport => "audit_export",
         }
     }
 }
@@ -278,8 +288,8 @@ pub struct ScannerStatus {
     pub has_ticked: bool,
     /// Which shard the reported instance polls, when this loop is one of the
     /// per-shard set a multi-shard worker spawns (timeout, poison-pill,
-    /// pause-auto-resume). `None` for the process-wide loops (retention,
-    /// schedule) and for single-shard deployments.
+    /// pause-auto-resume, audit-export). `None` for the process-wide loops
+    /// (retention, schedule) and for single-shard deployments.
     ///
     /// This is the *worst* instance's shard, so it names the single database
     /// most in need of attention. When more than one shard is affected, read
@@ -314,11 +324,11 @@ pub fn classify_scanner(status: &ScannerStatus) -> ScannerLivenessVerdict {
 
 /// Opaque identity of one *registered loop instance*.
 ///
-/// Minted by [`ScannerLiveness::register`]. Distinct instances of the same
-/// [`Scanner`] — the per-shard timeout checkers, poison-pill reclaimers, and
-/// pause auto-resumers a multi-shard worker spawns one of per assigned shard —
-/// each get their own id, which is what stops a healthy peer from masking a
-/// wedged sibling.
+/// Minted by [`ScannerLiveness::register`]. A multi-shard worker spawns one
+/// each, per assigned shard, of the per-shard timeout checker, poison-pill
+/// reclaimer, pause auto-resumer, and audit-export task. Distinct instances
+/// of the same [`Scanner`] each get their own id here, which is what stops a
+/// healthy peer from masking a wedged sibling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ScannerOwner {
     scanner: Scanner,
@@ -400,11 +410,12 @@ type Owners = BTreeMap<u64, OwnerState>;
 ///
 /// Each loop [`register`](Self::register)s itself at spawn time with its poll
 /// interval, receiving a [`ScannerOwner`] handle, then [`tick`](Self::tick)s
-/// **that handle** at the end of every iteration. Registration is what defines
-/// the *expected* scanner set, so a process that runs no control loops (an
-/// API-only replica) reports an empty snapshot rather than seven phantom
-/// wedged scanners; and because a tick is only reachable through a handle, a
-/// direct call to a `pub` enforcement primitive can never poison the registry.
+/// **that handle** at the end of every iteration. Registration is what
+/// defines the *expected* scanner set. A process that runs no control loops
+/// (an API-only replica) therefore reports an empty snapshot, rather than
+/// eight phantom wedged scanners. And because a tick is only reachable
+/// through a handle, a direct call to a `pub` enforcement primitive can
+/// never poison the registry.
 ///
 /// Ordinarily accessed through the process-global instance
 /// ([`global_scanner_liveness`]); it is a plain instantiable struct so tests
@@ -454,8 +465,9 @@ impl ScannerLiveness {
     /// [`register`](Self::register) for one of the **per-shard** loops.
     ///
     /// A multi-shard worker spawns one timeout checker, poison-pill reclaimer,
-    /// and pause auto-resumer per assigned shard, all sharing one [`Scanner`]
-    /// label. Recording which shard each instance polls does two things: it
+    /// pause auto-resumer, and audit-export task per assigned shard, all
+    /// sharing one [`Scanner`] label. Recording which shard each instance
+    /// polls does two things: it
     /// lets the liveness snapshot name the database left unprotected, and it
     /// supplies the `shard` metric label that keeps each instance on its own
     /// `harvest.scanner.tick` series so a healthy sibling cannot mask a
@@ -664,9 +676,9 @@ impl ScannerLiveness {
 /// The process-global control-loop liveness registry.
 ///
 /// Follows the crate's established cross-crate in-process state pattern (see
-/// `admission_gate::GLOBAL_ADMISSION_GATE_CACHE`): the loops live in the core
-/// crate while the health check that reads them lives in the plugin, and
-/// threading a handle through six spawn signatures buys nothing over a
+/// `admission_gate::GLOBAL_ADMISSION_GATE_CACHE`). The loops live in the core
+/// crate. The health check that reads them lives in the plugin instead.
+/// Threading a handle through seven spawn signatures buys nothing over a
 /// single append-only registry.
 ///
 /// Instances are tracked individually: a scanner leaves the expected set only
@@ -711,8 +723,9 @@ pub fn register_scanner(
 
 /// [`register_scanner`] for one of the **per-shard** loops.
 ///
-/// The timeout checker, poison-pill reclaimer, and pause auto-resumer are
-/// spawned one-per-assigned-shard, all under one [`Scanner`] label. Passing the
+/// The timeout checker, poison-pill reclaimer, pause auto-resumer, and
+/// audit-export task are spawned one-per-assigned-shard, all under one
+/// [`Scanner`] label. Passing the
 /// shard here both lets `scanner_liveness` name the unprotected database and
 /// puts each instance on its own `harvest.scanner.tick` series, so a healthy
 /// shard's ticks cannot hold the alert quiet while a sibling is wedged.

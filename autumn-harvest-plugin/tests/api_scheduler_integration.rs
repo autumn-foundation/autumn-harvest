@@ -31,7 +31,6 @@ use autumn_harvest_plugin::api::{
 use autumn_harvest_plugin::{
     HarvestMode, HarvestRunner, HarvestRunnerResources, HarvestRuntimeConfig,
 };
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -164,14 +163,6 @@ fn build_two_shard_pool(shard0_url: &str, shard1_url: &str) -> HarvestDbPool {
     pools.insert(ShardId::new(0), build_test_pool(shard0_url));
     pools.insert(ShardId::new(1), build_test_pool(shard1_url));
     HarvestDbPool::sharded(ShardedDbPool::from_map(pools, ShardId::new(0)))
-}
-
-fn test_app_state(pool: DbPool) -> AppState {
-    AppState::for_test().with_pool(pool).with_profile("test")
-}
-
-fn test_app_state_without_database() -> AppState {
-    AppState::for_test().with_profile("test")
 }
 
 fn build_test_worker(registry: Arc<HandlerRegistry>) -> Arc<Worker> {
@@ -812,7 +803,7 @@ fn build_sharded_dag_api_app(
         )
         .with_registered_dag_names(registered_dag_names),
     );
-    harvest_api_router(api_state).with_state(test_app_state_without_database())
+    harvest_api_router(api_state)
 }
 
 async fn assert_sharded_dag_list_and_runs(
@@ -2002,7 +1993,7 @@ fn manual_interval_pipeline_info() -> DagInfo {
 }
 
 #[tokio::test]
-async fn harvest_api_uses_installed_storage_pool_when_app_state_has_no_database() {
+async fn harvest_api_uses_the_installed_storage_pool() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
     let registry = approval_registry();
@@ -2022,7 +2013,7 @@ async fn harvest_api_uses_installed_storage_pool_when_app_state_has_no_database(
     let worker = build_test_worker(Arc::clone(&registry));
     let worker_task = spawn_test_worker(Arc::clone(&worker), pool.clone());
 
-    let app = harvest_api_router(api_state.clone()).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state.clone());
 
     let (start_status, start_json) = post_json(
         &app,
@@ -2094,7 +2085,7 @@ async fn harvest_api_workflow_details_include_parent_id_at_top_level() {
     let pool = build_test_pool(&database_url);
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     let parent = insert_workflow_on_url(
         &database_url,
@@ -2126,7 +2117,7 @@ async fn harvest_api_lists_direct_workflow_children_with_filters() {
     let pool = build_test_pool(&database_url);
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     let parent = insert_workflow_on_url(
         &database_url,
@@ -2198,7 +2189,7 @@ async fn harvest_api_filters_workflow_children_by_continued_as_new_status() {
     let pool = build_test_pool(&database_url);
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     let parent = insert_workflow_on_url(
         &database_url,
@@ -2344,7 +2335,7 @@ async fn harvest_api_lists_workflow_children_across_shards_and_paginates() {
     let ((shard0_url, shard1_url), _container) = setup_sharded_test_database_urls().await;
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(build_two_shard_pool(&shard0_url, &shard1_url));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     let mut shard0_conn = <AsyncPgConnection as AsyncConnection>::establish(&shard0_url)
         .await
@@ -2427,7 +2418,7 @@ async fn harvest_api_recursive_children_traverse_across_shards() {
     let ((shard0_url, shard1_url), _container) = setup_sharded_test_database_urls().await;
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(build_two_shard_pool(&shard0_url, &shard1_url));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     let parent = insert_workflow_on_url(
         &shard0_url,
@@ -2484,7 +2475,7 @@ async fn harvest_api_children_distinguishes_empty_parent_from_missing_parent() {
     let pool = build_test_pool(&database_url);
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     let parent = insert_workflow_on_url(
         &database_url,
@@ -2517,7 +2508,7 @@ async fn harvest_api_children_supports_recursive_depth_with_cap() {
     let pool = build_test_pool(&database_url);
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     let parent = insert_workflow_on_url(
         &database_url,
@@ -2600,7 +2591,7 @@ async fn harvest_api_duplicate_start_reuses_existing_execution() {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::single(),
     ));
-    let app = harvest_api_router(api_state).with_state(test_app_state(pool));
+    let app = harvest_api_router(api_state);
 
     let payload = json!({
         "workflow_id": "approval-duplicate",
@@ -2659,7 +2650,7 @@ async fn harvest_api_stack_endpoint_returns_shape() {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::single(),
     ));
-    let app = harvest_api_router(api_state).with_state(test_app_state(pool));
+    let app = harvest_api_router(api_state);
 
     let (start_status, start_json) = post_json(
         &app,
@@ -2700,7 +2691,7 @@ async fn harvest_api_stack_endpoint_surfaces_rate_limit_throttling() {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::single(),
     ));
-    let app = harvest_api_router(api_state).with_state(test_app_state(pool));
+    let app = harvest_api_router(api_state);
 
     let exec_id = insert_workflow_on_url(
         &database_url,
@@ -2774,7 +2765,7 @@ async fn harvest_api_stack_endpoint_surfaces_heartbeat_checkpoint() {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::single(),
     ));
-    let app = harvest_api_router(api_state).with_state(test_app_state(pool));
+    let app = harvest_api_router(api_state);
 
     let exec_id = insert_workflow_on_url(
         &database_url,
@@ -2842,7 +2833,7 @@ async fn harvest_api_stack_endpoint_truncates_oversized_heartbeat_checkpoint() {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::single(),
     ));
-    let app = harvest_api_router(api_state).with_state(test_app_state(pool));
+    let app = harvest_api_router(api_state);
 
     let exec_id = insert_workflow_on_url(
         &database_url,
@@ -2909,7 +2900,7 @@ async fn harvest_api_cancels_workflows_and_rejects_late_signals() {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::single(),
     ));
-    let app = harvest_api_router(api_state).with_state(test_app_state(pool));
+    let app = harvest_api_router(api_state);
 
     let (start_status, start_json) = post_json(
         &app,
@@ -3086,7 +3077,7 @@ async fn external_runner_processes_workflows_started_via_management_api() {
 
     api_state.install_storage_pool(web_runtime.storage_pool());
     api_state.install(web_runtime.api_runtime());
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     let (start_status, start_json) = post_json(
         &app,
@@ -3754,7 +3745,7 @@ async fn retention_janitor_deletes_only_rows_older_than_max_age_and_cascades_chi
 
     api_state.install_storage_pool(runner.storage_pool());
     api_state.install(runner.api_runtime());
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     trigger_retention_and_wait(&app).await;
 
@@ -3793,7 +3784,7 @@ async fn harvest_api_signal_does_not_wake_timer_waits_early() {
 
     let worker = build_test_worker(Arc::clone(&registry));
     let worker_task = spawn_test_worker(Arc::clone(&worker), pool.clone());
-    let app = harvest_api_router(api_state).with_state(test_app_state(pool.clone()));
+    let app = harvest_api_router(api_state);
 
     let (start_status, start_json) = post_json(
         &app,
@@ -3885,7 +3876,7 @@ async fn harvest_api_lists_and_replays_dead_letters() {
     let api_state = HarvestApiState::new();
     api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
-    let app = harvest_api_router(api_state).with_state(test_app_state(pool));
+    let app = harvest_api_router(api_state);
 
     let original_task_id = uuid::Uuid::new_v4();
     let dlq_id = {
@@ -3957,7 +3948,7 @@ async fn harvest_api_lists_workflows_and_dead_letters_across_shards() {
     let api_state = HarvestApiState::new();
     api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(build_two_shard_pool(&shard0_url, &shard1_url));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     let exec_on_zero = insert_workflow_on_url(
         &shard0_url,
@@ -4093,7 +4084,7 @@ async fn harvest_api_lists_and_triggers_manual_dags() {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::single(),
     ));
-    let app = harvest_api_router(api_state).with_state(test_app_state(pool.clone()));
+    let app = harvest_api_router(api_state);
 
     let (dags_status, dags_json) = get_json(&app, "/dags").await;
     assert_eq!(dags_status, StatusCode::OK);
@@ -4147,7 +4138,7 @@ async fn harvest_api_rejects_dag_trigger_for_workflow_without_dag_registration()
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::single(),
     ));
-    let app = harvest_api_router(api_state).with_state(test_app_state(pool.clone()));
+    let app = harvest_api_router(api_state);
 
     let (trigger_status, _trigger_json) = post_json(
         &app,
@@ -4188,7 +4179,7 @@ async fn harvest_api_rejects_dag_run_listing_for_workflow_without_dag_registrati
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::single(),
     ));
-    let app = harvest_api_router(api_state).with_state(test_app_state(pool.clone()));
+    let app = harvest_api_router(api_state);
 
     let (runs_status, _runs_json) = get_json(&app, "/dags/approval_workflow/runs").await;
 
@@ -4220,7 +4211,7 @@ async fn harvest_api_triggers_manual_only_unified_dag_on_declared_default_queue(
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::single(),
     ));
-    let app = harvest_api_router(api_state).with_state(test_app_state(pool.clone()));
+    let app = harvest_api_router(api_state);
 
     let (trigger_status, _trigger_json) = post_json(
         &app,
@@ -4266,7 +4257,7 @@ async fn harvest_api_enforces_max_active_runs_for_manual_dag_triggers() {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::single(),
     ));
-    let app = harvest_api_router(api_state).with_state(test_app_state(pool.clone()));
+    let app = harvest_api_router(api_state);
 
     let (first_status, _first_json) = post_json(
         &app,
@@ -4371,7 +4362,7 @@ async fn harvest_api_defers_manual_dag_trigger_when_schedule_is_paused() {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::single(),
     ));
-    let app = harvest_api_router(api_state).with_state(test_app_state(pool.clone()));
+    let app = harvest_api_router(api_state);
 
     let (trigger_status, trigger_json) = post_json(
         &app,
@@ -4418,7 +4409,7 @@ async fn harvest_api_patch_creates_pause_row_for_manual_only_unified_dag() {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::single(),
     ));
-    let app = harvest_api_router(api_state).with_state(test_app_state(pool.clone()));
+    let app = harvest_api_router(api_state);
 
     assert!(
         load_schedule_from_url_optional(&database_url, dag_name)
@@ -4471,7 +4462,7 @@ async fn harvest_api_rejects_workflow_schedule_creation_for_registered_dag_name(
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::single(),
     ));
-    let app = harvest_api_router(api_state).with_state(test_app_state(pool.clone()));
+    let app = harvest_api_router(api_state);
 
     let (status, body) = post_json(
         &app,
@@ -4525,7 +4516,7 @@ async fn harvest_api_lists_unscheduled_unified_dags_from_catalog() {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::single(),
     ));
-    let app = harvest_api_router(api_state).with_state(test_app_state(pool.clone()));
+    let app = harvest_api_router(api_state);
 
     let (dags_status, dags_json) = get_json(&app, "/dags").await;
     assert_eq!(dags_status, StatusCode::OK);
@@ -4672,7 +4663,7 @@ async fn harvest_api_rejects_non_dry_run_backfill_for_paused_dag_schedule() {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::single(),
     ));
-    let app = harvest_api_router(api_state).with_state(test_app_state(pool.clone()));
+    let app = harvest_api_router(api_state);
     let backfill_at = chrono::Utc::now() - chrono::Duration::hours(1);
 
     let (status, body) = post_json(
@@ -4765,7 +4756,7 @@ async fn harvest_api_backfills_legacy_dag_schedule_null_queue_on_dag_default_que
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::single(),
     ));
-    let app = harvest_api_router(api_state).with_state(test_app_state(pool.clone()));
+    let app = harvest_api_router(api_state);
     let backfill_at = chrono::Utc::now() - chrono::Duration::hours(2);
 
     let (status, body) = post_json(
@@ -4886,7 +4877,7 @@ async fn harvest_api_backfill_matches_fractional_legacy_dag_workflow_id() {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::single(),
     ));
-    let app = harvest_api_router(api_state).with_state(test_app_state(pool.clone()));
+    let app = harvest_api_router(api_state);
 
     let (status, body) = post_json(
         &app,
@@ -4964,7 +4955,7 @@ async fn harvest_api_rejects_backfill_for_unregistered_dag_schedule_row() {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::single(),
     ));
-    let app = harvest_api_router(api_state).with_state(test_app_state(pool.clone()));
+    let app = harvest_api_router(api_state);
     let backfill_at = chrono::Utc::now() - chrono::Duration::hours(2);
 
     let (status, body) = post_json(
@@ -5054,7 +5045,7 @@ async fn setup_workflow_backfill_app(
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::single(),
     ));
-    let app = harvest_api_router(api_state).with_state(test_app_state(pool));
+    let app = harvest_api_router(api_state);
     (app, schedule)
 }
 
@@ -5133,7 +5124,7 @@ async fn setup_throttled_workflow_backfill_app(
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::single(),
     ));
-    let app = harvest_api_router(api_state).with_state(test_app_state(pool));
+    let app = harvest_api_router(api_state);
     (app, schedule)
 }
 
@@ -5629,7 +5620,7 @@ async fn backfill_dag_over_window_dispatches_only_remaining_budget() {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::single(),
     ));
-    let app = harvest_api_router(api_state).with_state(test_app_state(pool.clone()));
+    let app = harvest_api_router(api_state);
 
     let from = chrono::DateTime::parse_from_rfc3339("2026-04-01T10:00:00Z")
         .unwrap()
@@ -5756,7 +5747,7 @@ async fn backfill_dag_threads_declared_execution_timeout_sla_and_fleet_ceiling()
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::single(),
     ));
-    let app = harvest_api_router(api_state).with_state(test_app_state(pool.clone()));
+    let app = harvest_api_router(api_state);
 
     let from = chrono::DateTime::parse_from_rfc3339("2026-04-01T10:00:00Z")
         .unwrap()
@@ -5889,7 +5880,7 @@ async fn backfill_workflow_threads_declared_execution_timeout_sla_and_fleet_ceil
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::single(),
     ));
-    let app = harvest_api_router(api_state).with_state(test_app_state(pool.clone()));
+    let app = harvest_api_router(api_state);
 
     let from = chrono::DateTime::parse_from_rfc3339("2026-04-01T10:00:00Z")
         .unwrap()
@@ -7500,7 +7491,7 @@ async fn schedule_pause_with_reason_records_pause_metadata() {
     let pool = build_test_pool(&database_url);
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     let id = seed_workflow_schedule_and_get_id(&database_url, "pause_metadata_wf").await;
 
@@ -7540,7 +7531,7 @@ async fn schedule_pause_idempotent_does_not_overwrite_paused_at() {
     let pool = build_test_pool(&database_url);
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     let id = seed_workflow_schedule_and_get_id(&database_url, "pause_idempotent_wf").await;
 
@@ -7600,7 +7591,7 @@ async fn schedule_resume_clears_pause_metadata() {
     let pool = build_test_pool(&database_url);
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     let id = seed_workflow_schedule_and_get_id(&database_url, "resume_clears_wf").await;
 
@@ -7655,7 +7646,7 @@ async fn schedule_resume_idempotent_when_schedule_is_not_paused() {
     let pool = build_test_pool(&database_url);
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     let id = seed_workflow_schedule_and_get_id(&database_url, "resume_idempotent_wf").await;
 
@@ -7692,7 +7683,7 @@ async fn get_schedule_by_id_returns_entry_with_pause_fields() {
     let pool = build_test_pool(&database_url);
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     let id = seed_workflow_schedule_and_get_id(&database_url, "get_by_id_wf").await;
 
@@ -7753,7 +7744,7 @@ async fn get_schedule_decisions_api_endpoints() {
     let pool = build_test_pool(&database_url);
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     let id = seed_workflow_schedule_and_get_id(&database_url, "decision_test_wf").await;
 
@@ -7948,7 +7939,7 @@ async fn api_trigger_preserves_dag_metadata() {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::single(),
     ));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     let (status, ack) = post_json_with_actor(
         &app,
@@ -8027,7 +8018,7 @@ async fn schedule_read_reports_overdue_fields() {
     let pool = build_test_pool(&database_url);
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     let now = chrono::Utc::now();
     // interval:60 => grace = 61s. 300s past its slot => overdue.
@@ -8221,7 +8212,7 @@ async fn schedule_create_response_at_capacity_is_not_overdue() {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::single(),
     ));
-    let app = harvest_api_router(api_state).with_state(test_app_state(pool));
+    let app = harvest_api_router(api_state);
 
     // Re-register via the create/upsert route with the SAME cadence, Skip+catchup.
     // Same cadence => next_run_at preserved (still 300s in the past).
@@ -8363,7 +8354,7 @@ async fn schedule_read_honors_calendar_deferred_fire() {
     let pool = build_test_pool(&database_url);
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool));
-    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+    let app = harvest_api_router(api_state);
 
     let (deferred_id, control_id) = seed_calendar_deferred_read_schedules(&database_url).await;
 
@@ -8466,7 +8457,7 @@ async fn schedule_api_surfaces_effective_execution_timeout_and_sla() {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::single(),
     ));
-    let app = harvest_api_router(api_state).with_state(test_app_state(pool));
+    let app = harvest_api_router(api_state);
 
     let (status, list) = get_json(&app, "/admin/schedules").await;
     assert_eq!(status, StatusCode::OK);

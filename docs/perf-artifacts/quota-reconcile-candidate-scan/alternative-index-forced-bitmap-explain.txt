@@ -1,0 +1,36 @@
+-- SAME unmodified CANDIDATE_SQL, alternative index present, enable_indexscan=off for one transaction to force the planner to consider the alternative index @ noise=500000 -- isolates whether the index CAN deliver a cheap plan once selected --
+Limit  (cost=16713.46..16736.80 rows=200 width=58) (actual time=4.115..6.297 rows=200 loops=1)
+  Output: id, workflow_name, input
+  Buffers: shared hit=34 read=12
+  ->  Gather Merge  (cost=16713.46..20490.00 rows=32368 width=58) (actual time=4.114..6.281 rows=200 loops=1)
+        Output: id, workflow_name, input
+        Workers Planned: 2
+        Workers Launched: 2
+        Buffers: shared hit=34 read=12
+        ->  Sort  (cost=15713.44..15753.90 rows=16184 width=58) (actual time=0.237..0.242 rows=67 loops=3)
+              Output: id, workflow_name, input
+              Sort Key: harvest_workflow_executions.id
+              Sort Method: top-N heapsort  Memory: 70kB
+              Buffers: shared hit=34 read=12
+              Worker 0:  actual time=0.055..0.055 rows=0 loops=1
+                Sort Method: quicksort  Memory: 25kB
+                Buffers: shared hit=7
+              Worker 1:  actual time=0.061..0.062 rows=0 loops=1
+                Sort Method: quicksort  Memory: 25kB
+                Buffers: shared hit=4 read=3
+              ->  Parallel Bitmap Heap Scan on public.harvest_workflow_executions  (cost=1245.45..15013.98 rows=16184 width=58) (actual time=0.095..0.137 rows=333 loops=3)
+                    Output: id, workflow_name, input
+                    Recheck Cond: ((harvest_workflow_executions.workflow_name = ANY ('{billing_saga}'::text[])) AND (harvest_workflow_executions.quota_key IS NULL) AND (harvest_workflow_executions.state = ANY ('{RUNNING,PAUSED}'::text[])))
+                    Heap Blocks: exact=23
+                    Buffers: shared hit=23 read=9
+                    Worker 0:  actual time=0.014..0.014 rows=0 loops=1
+                    Worker 1:  actual time=0.015..0.015 rows=0 loops=1
+                    ->  Bitmap Index Scan on idx_ledger_experiment_we_quota_reconcile_by_name_id  (cost=0.00..1235.74 rows=38842 width=0) (actual time=0.242..0.243 rows=1000 loops=1)
+                          Index Cond: (harvest_workflow_executions.workflow_name = ANY ('{billing_saga}'::text[]))
+                          Buffers: shared read=9
+Settings: enable_indexscan = 'off'
+Query Identifier: 8964230935475572658
+Planning:
+  Buffers: shared hit=20
+Planning Time: 0.357 ms
+Execution Time: 6.344 ms

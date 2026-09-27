@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::{HarvestError, HarvestResult};
 use crate::execution::{
-    StartWorkflowParams, StartedWorkflowExecution, start_or_load_workflow_execution,
+    StartWorkflowParams, StartedWorkflowExecution, start_or_load_workflow_execution_with_codecs,
 };
 use crate::info::DagInfo;
 use crate::models::{HarvestSchedule, NewHarvestSchedule};
@@ -27,7 +27,7 @@ use crate::policy::{OverlapPolicy, Schedule, WorkflowSchedule, compute_jitter_of
 use crate::schema::{harvest_schedules, harvest_workflow_executions};
 use crate::shard::{ShardRouter, ShardedDbPool};
 use crate::types::{ExecutionId, Priority, ShardId, WorkflowIdReusePolicy};
-use crate::worker::{DbPool, HandlerRegistry};
+use crate::worker::{DbPool, DispatchDeadline, HandlerRegistry};
 
 const DEFAULT_SCHEDULER_TICK_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -1483,23 +1483,18 @@ pub async fn trigger_unified_dag(
     // schedule-associated (issue #740).
     let schedule_ref = schedule.as_ref().map(|s| s.id.to_string());
 
-    // Issue #743 review (PR #1141, Findings #1/#3): resolve the DAG's declared
-    // execution_timeout/sla from its shadow WorkflowInfo -- the SAME lookup
-    // `tick_one_workflow_schedule`'s main dispatch path performs -- and apply
-    // the fleet-wide ceiling, so a manual/MCP trigger gets the same deadline
-    // enforcement as a scheduled tick or a manual HTTP `/workflows/{name}/start`.
-    let wf_info = registry.workflows.get(dag_name);
-    let execution_timeout = wf_info
-        .and_then(|info| info.execution_timeout)
-        .and_then(|d| chrono::Duration::from_std(d).ok());
-    let sla = wf_info
-        .and_then(|info| info.sla)
-        .and_then(|d| chrono::Duration::from_std(d).ok());
-    let max_execution_timeout_ceiling = registry
-        .max_workflow_execution_timeout
-        .and_then(|d| chrono::Duration::from_std(d).ok());
+    // Issue #1412: resolve the DAG's declared execution_timeout/sla/ceiling
+    // from its shadow WorkflowInfo. `tick_one_workflow_schedule`'s main
+    // dispatch path performs the SAME lookup. A manual/MCP trigger then
+    // gets the same deadline enforcement as a scheduled tick or a manual
+    // HTTP `/workflows/{name}/start`.
+    let DispatchDeadline {
+        execution_timeout,
+        sla,
+        max_execution_timeout_ceiling,
+    } = registry.resolve_dispatch_deadline(dag_name);
 
-    start_or_load_workflow_execution(
+    start_or_load_workflow_execution_with_codecs(
         &mut db,
         StartWorkflowParams {
             workflow_name: dag_name,
@@ -1551,6 +1546,7 @@ pub async fn trigger_unified_dag(
             started_by,
         },
         None,
+        registry.payload_codecs(),
     )
     .await
 }
@@ -4441,12 +4437,16 @@ async fn tick_one_workflow_schedule(
                 (None, None) => (None, None, None),
             }
         };
-        // Issue #743: a DAG's own shadow `WorkflowInfo` (registered under its
-        // name by `DagInfo::as_workflow_info()`) carries `sla` identically to
-        // a `#[workflow]`, so this ONE lookup covers both kinds.
-        let sla = wf_info
-            .and_then(|info| info.sla)
-            .and_then(|d| chrono::Duration::from_std(d).ok());
+        // Issue #1412: one shared lookup resolves the declared execution_timeout,
+        // sla, and fleet-wide ceiling for this fire. A DAG's own shadow
+        // `WorkflowInfo` carries these fields identically to a `#[workflow]`.
+        // `DagInfo::as_workflow_info()` registers that shadow entry under the
+        // DAG's own name, so this one lookup covers both kinds.
+        let DispatchDeadline {
+            execution_timeout,
+            sla,
+            max_execution_timeout_ceiling,
+        } = registry.resolve_dispatch_deadline(wf_name);
         tracing::info!(
             workflow_name = %wf_name, workflow_id = %workflow_id,
             scheduled_for = %scheduled_for, "harvest: dispatching scheduled workflow run"
@@ -4509,10 +4509,7 @@ async fn tick_one_workflow_schedule(
                     .and_then(|p| serde_json::to_value(&p).ok());
                 let start_options = crate::debounce::DebounceStartOptions {
                     reuse_policy: Some("reject_duplicate".to_string()),
-                    execution_timeout_secs: wf_info
-                        .and_then(|info| info.execution_timeout)
-                        .and_then(|d| chrono::Duration::from_std(d).ok())
-                        .map(|d| d.num_seconds()),
+                    execution_timeout_secs: execution_timeout.map(|d| d.num_seconds()),
                     memo: None,
                     search_attrs: None,
                     sla_secs: sla.map(|d| d.num_seconds()),
@@ -4524,13 +4521,11 @@ async fn tick_one_workflow_schedule(
                     owner: owner.map(str::to_string),
                     runbook_url: runbook_url.map(str::to_string),
                     severity: severity.map(str::to_string),
-                    // Fleet-wide execution_timeout ceiling (issue #743 review, PR
-                    // #1141 Finding #3): a throttled scheduled fire must be capped
-                    // by the same operator-configured ceiling a manual/HTTP start
-                    // applies -- parity with the chain-cap ceiling right below.
-                    max_execution_timeout_ceiling_secs: registry
-                        .max_workflow_execution_timeout
-                        .and_then(|d| chrono::Duration::from_std(d).ok())
+                    // Fleet-wide execution_timeout ceiling (issue #1412): a throttled
+                    // scheduled fire must be capped by the same operator-configured
+                    // ceiling a manual/HTTP start applies. This is parity with the
+                    // chain-cap ceiling right below.
+                    max_execution_timeout_ceiling_secs: max_execution_timeout_ceiling
                         .map(|d| d.num_seconds()),
                     // Chain-scoped lifetime cap (issue #617): workflow-type default
                     // + fleet-wide ceiling (via registry, since the core scheduler
@@ -4601,83 +4596,81 @@ async fn tick_one_workflow_schedule(
         // metrics-less wrapper discards the collected cancellations, so a
         // scheduled fire that sheds an incumbent emitted neither
         // `harvest.concurrency.superseded` nor the cancelled terminal.
-        let start_result = crate::execution::start_or_load_workflow_execution_with_metrics(
-            conn,
-            StartWorkflowParams {
-                workflow_name: wf_name,
-                workflow_id: &workflow_id,
-                exec_id,
-                input,
-                parent_id: None,
-                queue_name: dispatch_queue,
-                execution_timeout: wf_info
-                    .and_then(|info| info.execution_timeout)
-                    .and_then(|d| chrono::Duration::from_std(d).ok()),
-                memo: None,
-                search_attrs: None,
-                reuse_policy: scheduled_workflow_reuse_policy(),
-                conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
-                trace_context: None,
-                // Fleet-wide execution_timeout ceiling (issue #743 review, PR
-                // #1141 Finding #3): parity with the throttled branch above and
-                // with the chain-cap ceiling right below.
-                max_execution_timeout_ceiling: registry
-                    .max_workflow_execution_timeout
-                    .and_then(|d| chrono::Duration::from_std(d).ok()),
-                // Chain-scoped lifetime cap (issue #617): carry the workflow-type
-                // default AND the fleet-wide chain ceiling-as-default, so a whole
-                // scheduled continue-as-new chain is capped even when the workflow
-                // under-specifies (AC4). The ceiling reaches the core scheduler via
-                // the `HandlerRegistry` (it has no `api_state`), diverging from the
-                // per-run `execution_timeout` ceiling which is a pure cap, not a
-                // fleet-wide default.
-                chain_execution_timeout: wf_info
-                    .and_then(|info| info.chain_execution_timeout)
-                    .and_then(|d| chrono::Duration::from_std(d).ok()),
-                max_workflow_chain_timeout_ceiling: registry
-                    .max_workflow_chain_timeout
-                    .and_then(|d| chrono::Duration::from_std(d).ok()),
-                inherited_chain_deadline_at: None,
-                concurrency_key,
-                concurrency_limit,
-                concurrency_on_conflict,
-                priority: Priority::default(),
-                max_workflow_input_bytes: wf_info
-                    .and_then(|info| info.max_input_bytes)
-                    .map_or(registry.max_workflow_input_bytes, |per| {
-                        per.max(registry.max_workflow_input_bytes)
-                    }),
-                start_at: None,
-                delay: None,
-                max_workflow_start_delay: None,
-                owner,
-                runbook_url,
-                severity,
-                context_headers: None,
-                sla,
-                schedule_id: Some(schedule.id),
-                // Logical slot = the slot encoded in workflow_id (original_slot), so
-                // carryover ordering and the migration backfill agree (issue #488).
-                scheduled_for: Some(*original_slot),
-                workflow_attempt: 1,
-                workflow_retry_policy: schedule
-                    .retry_policy
-                    .as_ref()
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())
-                    .or_else(|| wf_info.and_then(|info| info.retry_policy.clone())),
-                retry_of_exec_id: None,
-                max_workflow_attempts_ceiling: registry.max_workflow_attempts_ceiling,
-                // Normal scheduler-tick fire — attributed as the schedule's cadence (issue #534).
-                origin: Some(crate::execution::ORIGIN_SCHEDULED),
-                completion_callbacks: None,
-                start_source: crate::types::StartSource::Schedule,
-                start_source_ref: Some(schedule_id_str.as_str()),
-                started_by: None,
-            },
-            Some(metrics.as_ref()),
-            None,
-        )
-        .await;
+        let start_result =
+            crate::execution::start_or_load_workflow_execution_with_metrics_and_codecs(
+                conn,
+                StartWorkflowParams {
+                    workflow_name: wf_name,
+                    workflow_id: &workflow_id,
+                    exec_id,
+                    input,
+                    parent_id: None,
+                    queue_name: dispatch_queue,
+                    execution_timeout,
+                    memo: None,
+                    search_attrs: None,
+                    reuse_policy: scheduled_workflow_reuse_policy(),
+                    conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
+                    trace_context: None,
+                    // Fleet-wide execution_timeout ceiling (issue #1412): parity with
+                    // the throttled branch above and with the chain-cap ceiling right
+                    // below.
+                    max_execution_timeout_ceiling,
+                    // Chain-scoped lifetime cap (issue #617): carry the workflow-type
+                    // default AND the fleet-wide chain ceiling-as-default, so a whole
+                    // scheduled continue-as-new chain is capped even when the workflow
+                    // under-specifies (AC4). The ceiling reaches the core scheduler via
+                    // the `HandlerRegistry` (it has no `api_state`), diverging from the
+                    // per-run `execution_timeout` ceiling which is a pure cap, not a
+                    // fleet-wide default.
+                    chain_execution_timeout: wf_info
+                        .and_then(|info| info.chain_execution_timeout)
+                        .and_then(|d| chrono::Duration::from_std(d).ok()),
+                    max_workflow_chain_timeout_ceiling: registry
+                        .max_workflow_chain_timeout
+                        .and_then(|d| chrono::Duration::from_std(d).ok()),
+                    inherited_chain_deadline_at: None,
+                    concurrency_key,
+                    concurrency_limit,
+                    concurrency_on_conflict,
+                    priority: Priority::default(),
+                    max_workflow_input_bytes: wf_info
+                        .and_then(|info| info.max_input_bytes)
+                        .map_or(registry.max_workflow_input_bytes, |per| {
+                            per.max(registry.max_workflow_input_bytes)
+                        }),
+                    start_at: None,
+                    delay: None,
+                    max_workflow_start_delay: None,
+                    owner,
+                    runbook_url,
+                    severity,
+                    context_headers: None,
+                    sla,
+                    schedule_id: Some(schedule.id),
+                    // Logical slot = the slot encoded in workflow_id (original_slot), so
+                    // carryover ordering and the migration backfill agree (issue #488).
+                    scheduled_for: Some(*original_slot),
+                    workflow_attempt: 1,
+                    workflow_retry_policy: schedule
+                        .retry_policy
+                        .as_ref()
+                        .and_then(|v| serde_json::from_value(v.clone()).ok())
+                        .or_else(|| wf_info.and_then(|info| info.retry_policy.clone())),
+                    retry_of_exec_id: None,
+                    max_workflow_attempts_ceiling: registry.max_workflow_attempts_ceiling,
+                    // Normal scheduler-tick fire — attributed as the schedule's cadence (issue #534).
+                    origin: Some(crate::execution::ORIGIN_SCHEDULED),
+                    completion_callbacks: None,
+                    start_source: crate::types::StartSource::Schedule,
+                    start_source_ref: Some(schedule_id_str.as_str()),
+                    started_by: None,
+                },
+                Some(metrics.as_ref()),
+                None,
+                registry.payload_codecs(),
+            )
+            .await;
         match scheduled_start_outcome(start_result) {
             Ok(outcome) => {
                 dispatched += 1;
@@ -6294,21 +6287,17 @@ async fn drain_buffered_schedule_runs(
                     (None, None) => (None, None, None),
                 }
             };
-            // Issue #743: a DAG's own shadow `WorkflowInfo` (registered under
-            // its name by `DagInfo::as_workflow_info()`) carries `sla`
-            // identically to a `#[workflow]`, so this ONE lookup covers both
-            // kinds.
-            let sla = wf_info
-                .and_then(|info| info.sla)
-                .and_then(|d| chrono::Duration::from_std(d).ok());
-
-            // Issue #743 review (PR #1141, Finding #2): the same shadow
-            // `WorkflowInfo` lookup also carries the DAG's declared
-            // `execution_timeout`, which must reach a buffered/overlap-drained
-            // fire identically to a normal tick dispatch or a manual trigger.
-            let execution_timeout = wf_info
-                .and_then(|info| info.execution_timeout)
-                .and_then(|d| chrono::Duration::from_std(d).ok());
+            // Issue #1412: one shared lookup resolves the declared execution_timeout,
+            // sla, and fleet-wide ceiling. A buffered/overlap-drained fire then gets
+            // the same deadline enforcement as a normal tick dispatch or a manual
+            // trigger. A DAG's own shadow `WorkflowInfo` carries these fields
+            // identically to a `#[workflow]`. `DagInfo::as_workflow_info()` registers
+            // that shadow entry under the DAG's own name, so this covers both kinds.
+            let DispatchDeadline {
+                execution_timeout,
+                sla,
+                max_execution_timeout_ceiling,
+            } = registry.resolve_dispatch_deadline(wf_name);
 
             tracing::info!(
                 workflow_name = %wf_name,
@@ -6379,10 +6368,9 @@ async fn drain_buffered_schedule_runs(
                         .and_then(|p| serde_json::to_value(&p).ok());
                     let start_options = crate::debounce::DebounceStartOptions {
                         reuse_policy: Some("reject_duplicate".to_string()),
-                        // Issue #743 review (PR #1141, Finding #2): thread the
-                        // DAG/workflow's declared execution_timeout into a
-                        // throttled buffered-drain fire, mirroring the normal
-                        // dispatch path just below.
+                        // Issue #1412: thread the DAG/workflow's declared
+                        // execution_timeout into a throttled buffered-drain fire,
+                        // mirroring the normal dispatch path just below.
                         execution_timeout_secs: execution_timeout.map(|d| d.num_seconds()),
                         memo: None,
                         search_attrs: None,
@@ -6395,12 +6383,9 @@ async fn drain_buffered_schedule_runs(
                         owner: owner.map(str::to_string),
                         runbook_url: runbook_url.map(str::to_string),
                         severity: severity.map(str::to_string),
-                        // Fleet-wide execution_timeout ceiling (issue #743
-                        // review, PR #1141 Finding #3): parity with the
-                        // chain-cap ceiling right below.
-                        max_execution_timeout_ceiling_secs: registry
-                            .max_workflow_execution_timeout
-                            .and_then(|d| chrono::Duration::from_std(d).ok())
+                        // Fleet-wide execution_timeout ceiling (issue #1412): parity
+                        // with the chain-cap ceiling right below.
+                        max_execution_timeout_ceiling_secs: max_execution_timeout_ceiling
                             .map(|d| d.num_seconds()),
                         // Chain-scoped lifetime cap (issue #617): workflow-type
                         // default + fleet-wide ceiling (via registry) so a throttled
@@ -6468,79 +6453,79 @@ async fn drain_buffered_schedule_runs(
             let schedule_id_str = schedule.id.to_string();
             // Latest-wins supersede counters (issue #811, Codex round 1) --
             // the buffered drain shares the tick's gap.
-            let start_result = crate::execution::start_or_load_workflow_execution_with_metrics(
-                conn,
-                crate::execution::StartWorkflowParams {
-                    workflow_name: wf_name,
-                    workflow_id: &workflow_id,
-                    exec_id,
-                    input,
-                    parent_id: None,
-                    queue_name: dispatch_queue,
-                    // Issue #743 review (PR #1141, Finding #2): thread the
-                    // DAG/workflow's declared execution_timeout into a
-                    // buffered-drain fire, mirroring the normal tick-direct
-                    // dispatch path above and this site's throttled sibling.
-                    execution_timeout,
-                    memo: None,
-                    search_attrs: None,
-                    reuse_policy: scheduled_workflow_reuse_policy(),
-                    conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
-                    trace_context: None,
-                    // Fleet-wide execution_timeout ceiling (issue #743
-                    // review, PR #1141 Finding #3): parity with the throttled
-                    // branch above and with the chain-cap ceiling right below.
-                    max_execution_timeout_ceiling: registry
-                        .max_workflow_execution_timeout
-                        .and_then(|d| chrono::Duration::from_std(d).ok()),
-                    // Chain-scoped lifetime cap (issue #617): carry the
-                    // workflow-type default AND the fleet-wide chain ceiling (via
-                    // the registry, since the core scheduler has no api_state) so a
-                    // BUFFERED continue-as-new chain is capped even when the
-                    // workflow under-specifies (AC4) — IDENTICAL to the tick-direct
-                    // start path above, and consistent with this site's own
-                    // throttled sibling.
-                    chain_execution_timeout: wf_info
-                        .and_then(|info| info.chain_execution_timeout)
-                        .and_then(|d| chrono::Duration::from_std(d).ok()),
-                    max_workflow_chain_timeout_ceiling: registry
-                        .max_workflow_chain_timeout
-                        .and_then(|d| chrono::Duration::from_std(d).ok()),
-                    inherited_chain_deadline_at: None,
-                    concurrency_key,
-                    concurrency_limit,
-                    concurrency_on_conflict,
-                    priority: Priority::default(),
-                    max_workflow_input_bytes: effective_cap,
-                    start_at: None,
-                    delay: None,
-                    max_workflow_start_delay: None,
-                    owner,
-                    runbook_url,
-                    severity,
-                    context_headers: None,
-                    sla,
-                    schedule_id: Some(schedule.id),
-                    scheduled_for: Some(scheduled_for),
-                    workflow_attempt: 1,
-                    workflow_retry_policy: schedule
-                        .retry_policy
-                        .as_ref()
-                        .and_then(|v| serde_json::from_value(v.clone()).ok())
-                        .or_else(|| wf_info.and_then(|info| info.retry_policy.clone())),
-                    retry_of_exec_id: None,
-                    max_workflow_attempts_ceiling: registry.max_workflow_attempts_ceiling,
-                    // Normal scheduler-tick fire — attributed as the schedule's cadence (issue #534).
-                    origin: Some(crate::execution::ORIGIN_SCHEDULED),
-                    completion_callbacks: None,
-                    start_source: crate::types::StartSource::Schedule,
-                    start_source_ref: Some(schedule_id_str.as_str()),
-                    started_by: None,
-                },
-                Some(metrics.as_ref()),
-                None,
-            )
-            .await;
+            let start_result =
+                crate::execution::start_or_load_workflow_execution_with_metrics_and_codecs(
+                    conn,
+                    crate::execution::StartWorkflowParams {
+                        workflow_name: wf_name,
+                        workflow_id: &workflow_id,
+                        exec_id,
+                        input,
+                        parent_id: None,
+                        queue_name: dispatch_queue,
+                        // Issue #1412: thread the DAG/workflow's declared
+                        // execution_timeout into a buffered-drain fire, mirroring the
+                        // normal tick-direct dispatch path above and this site's
+                        // throttled sibling.
+                        execution_timeout,
+                        memo: None,
+                        search_attrs: None,
+                        reuse_policy: scheduled_workflow_reuse_policy(),
+                        conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
+                        trace_context: None,
+                        // Fleet-wide execution_timeout ceiling (issue #1412): parity
+                        // with the throttled branch above and with the chain-cap
+                        // ceiling right below.
+                        max_execution_timeout_ceiling,
+                        // Chain-scoped lifetime cap (issue #617): carry the
+                        // workflow-type default AND the fleet-wide chain ceiling (via
+                        // the registry, since the core scheduler has no api_state) so a
+                        // BUFFERED continue-as-new chain is capped even when the
+                        // workflow under-specifies (AC4) — IDENTICAL to the tick-direct
+                        // start path above, and consistent with this site's own
+                        // throttled sibling.
+                        chain_execution_timeout: wf_info
+                            .and_then(|info| info.chain_execution_timeout)
+                            .and_then(|d| chrono::Duration::from_std(d).ok()),
+                        max_workflow_chain_timeout_ceiling: registry
+                            .max_workflow_chain_timeout
+                            .and_then(|d| chrono::Duration::from_std(d).ok()),
+                        inherited_chain_deadline_at: None,
+                        concurrency_key,
+                        concurrency_limit,
+                        concurrency_on_conflict,
+                        priority: Priority::default(),
+                        max_workflow_input_bytes: effective_cap,
+                        start_at: None,
+                        delay: None,
+                        max_workflow_start_delay: None,
+                        owner,
+                        runbook_url,
+                        severity,
+                        context_headers: None,
+                        sla,
+                        schedule_id: Some(schedule.id),
+                        scheduled_for: Some(scheduled_for),
+                        workflow_attempt: 1,
+                        workflow_retry_policy: schedule
+                            .retry_policy
+                            .as_ref()
+                            .and_then(|v| serde_json::from_value(v.clone()).ok())
+                            .or_else(|| wf_info.and_then(|info| info.retry_policy.clone())),
+                        retry_of_exec_id: None,
+                        max_workflow_attempts_ceiling: registry.max_workflow_attempts_ceiling,
+                        // Normal scheduler-tick fire — attributed as the schedule's cadence (issue #534).
+                        origin: Some(crate::execution::ORIGIN_SCHEDULED),
+                        completion_callbacks: None,
+                        start_source: crate::types::StartSource::Schedule,
+                        start_source_ref: Some(schedule_id_str.as_str()),
+                        started_by: None,
+                    },
+                    Some(metrics.as_ref()),
+                    None,
+                    registry.payload_codecs(),
+                )
+                .await;
 
             match scheduled_start_outcome(start_result) {
                 Ok(outcome) => {
