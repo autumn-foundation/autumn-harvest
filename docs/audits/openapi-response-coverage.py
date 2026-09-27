@@ -1071,7 +1071,9 @@ def raw_body_parses(source: str, handler: str) -> list[tuple[str | None, bool, b
     # `source` is masked, so a call in a comment or a string is no parse.
     handler_block = handler_found[2]
     carriers = moved_names(handler_block, byte_parameters(handler_found[0]))
-    return carrier_parses(source, handler_block, carriers, handler_found[1])
+    return carrier_parses(
+        source, handler_block, carriers, handler_found[1], params=handler_found[0]
+    )
 
 
 # How many helper calls deep `carrier_parses` follows a body before it gives up.
@@ -1086,6 +1088,7 @@ def carrier_parses(
     optional: bool = False,
     tolerant: bool = False,
     path: frozenset[tuple[str, str]] = frozenset(),
+    params: str = "",
 ) -> list[tuple[str | None, bool, bool]]:
     """`(type, optional, tolerant)` for each parse of a carrier in `block` and below.
 
@@ -1098,7 +1101,8 @@ def carrier_parses(
     """
     found = block_parses(block, carriers, returns)
     parses = [(kind, o or optional, t or tolerant) for kind, o, t in found]
-    for helper, parts, name, guarded, discarded in handoffs(source, block, carriers, receivers=True):
+    handed = handoffs(source, block, carriers, receivers=True, params=params)
+    for helper, parts, name, guarded, discarded in handed:
         # A helper the audit cannot find or read gets the body all the same, so
         # it is an unresolved parse, as for a `Result` extractor handoff.
         if parts is None or name is None:
@@ -1119,6 +1123,7 @@ def carrier_parses(
             optional or guarded,
             tolerant or discarded,
             path | {(helper, name)},
+            params,
         )
     return parses
 
@@ -1289,7 +1294,7 @@ BYTE_ACCESSORS = frozenset(
 
 
 def handoffs(
-    source: str, block: str, carriers: dict[str, int], receivers: bool = False
+    source: str, block: str, carriers: dict[str, int], receivers: bool = False, params: str = ""
 ) -> list[tuple[str, tuple[str, str, str] | None, str | None, bool, bool]]:
     """`(helper, parts, parameter, optional, tolerant)` for each carrier handoff.
 
@@ -1303,6 +1308,10 @@ def handoffs(
     `body.decode::<T>()`, is handed to that method's `self`, unless the method
     is one of `BYTE_ACCESSORS`. The method is found through the symbol index.
     An unknown or ambiguous one has no `parts`, so the caller fails closed.
+
+    A method call such as `x.decode(body)` reaches only the method of the
+    type that `receiver_type` finds for `x` in `block` or `params`. The audit
+    infers no other type, so a receiver of unknown type has no `parts`.
     """
     found = []
     names = set(re.findall(FREE_CALL_NAME, block))
@@ -1320,11 +1329,22 @@ def handoffs(
         if handoff_path(call)
     }
     for helper in sorted(qualified - GENERIC_HELPERS):
-        for path in sorted(p for name, p in paths if name == helper):
-            parts = function_parts(source, helper, path.rstrip(":") + "::" if path != "." else ".")
-            params = parts[0] if parts else ""
-            states = receiving_parameters(block, helper, params, carriers, qualified=path)
+        for path in sorted(p for name, p in paths if name == helper and p != "."):
+            parts = function_parts(source, helper, path.rstrip(":") + "::")
+            helper_params = parts[0] if parts else ""
+            states = receiving_parameters(block, helper, helper_params, carriers, qualified=path)
             found += [(helper, parts, name, o, t) for name, (o, t) in states.items()]
+    for call in re.finditer(QUALIFIED_CALL, block):
+        if call.group(1).strip() != "." or call.group(2) in GENERIC_HELPERS:
+            continue
+        receiver = re.search(r"(?<![\w.])([A-Za-z_]\w*)\s*$", block[: call.start()])
+        typed = receiver_type(block, params, receiver.group(1), call.start()) if receiver else None
+        parts = function_parts(source, call.group(2), typed + "::") if typed else None
+        helper_params = parts[0] if parts else ""
+        states = receiving_parameters(
+            block, call.group(2), helper_params, carriers, qualified=".", at=call.start()
+        )
+        found += [(call.group(2), parts, name, o, t) for name, (o, t) in states.items()]
     for variable, bound_at in carriers.items() if receivers else []:
         receiver = r"(?<![.\w])%s\s*\.\s*([a-z_][a-z_0-9]*)%s\s*\(" % (re.escape(variable), TURBOFISH)
         for call in re.finditer(receiver, block):
@@ -1360,8 +1380,39 @@ def handoff_path(call: re.Match) -> bool:
     return path != "serde_json::" and not re.match(r"(?:std|core|alloc)::", path)
 
 
+def receiver_type(block: str, params: str, receiver: str, position: int) -> str | None:
+    """The written type of a method call's receiver, or `None`.
+
+    `self` is `Self`. Otherwise the last `let` of that name before `position`
+    decides: its type annotation, or a value such as `Type::new(..)` or
+    `Type { .. }`. With no `let`, a parameter with a written type decides.
+    Any other receiver has no type the audit can know.
+    """
+    if receiver == "self":
+        return "Self"
+    name = re.escape(receiver)
+    binding = r"\blet\s+(?:mut\s+)?%s\s*(?::\s*([^=;]+?))?\s*=\s*([^;]+)" % name
+    bindings = list(re.finditer(binding, block[:position]))
+    head = r"&?\s*(?:mut\s+)?((?:[A-Za-z_]\w*\s*::\s*)*[A-Z]\w*)"
+    if bindings:
+        annotated, value = bindings[-1].group(1), bindings[-1].group(2)
+        if annotated:
+            typed = re.match(head, annotated.strip())
+            return typed.group(1) if typed else None
+        generic = r"(?:\s*::\s*<[^()]*?>)?"
+        built = re.match(head + generic + r"\s*(?:::\s*[a-z_]\w*\s*%s\s*\(|\{)" % generic, value.strip())
+        return built.group(1) if built else None
+    declared = re.search(r"(?<![\w.])%s\s*:\s*(?:'[a-z_]+\s+)?%s" % (name, head), params)
+    return declared.group(1) if declared else None
+
+
 def receiving_parameters(
-    block: str, helper: str, params: str, variables: dict[str, int], qualified: str | None = None
+    block: str,
+    helper: str,
+    params: str,
+    variables: dict[str, int],
+    qualified: str | None = None,
+    at: int | None = None,
 ) -> dict[str | None, tuple[bool, bool]]:
     """`(optional, tolerant)` for each `helper` parameter that gets a variable.
 
@@ -1374,7 +1425,7 @@ def receiving_parameters(
     parameter maps to `None`. With `qualified`, the calls read are the calls of
     `helper` through that path, or `.` for a method call, and a variable
     counts only as a direct argument: `body`, `&body`, `&mut body` or
-    `body.clone()`.
+    `body.clone()`. With `at`, only the call that starts there is read.
     """
     # A pattern such as `Extension(state): ..` keeps its slot with no name, so
     # the parameters after it keep their positions.
@@ -1396,6 +1447,8 @@ def receiving_parameters(
     else:
         calls = list(re.finditer(r"(?<![\w.:])%s%s\s*\(" % (re.escape(helper), TURBOFISH), block))
     for call in calls:
+        if at is not None and call.start() != at:
+            continue
         raw = balanced(block[call.end() - 1 :])
         arguments = split_top_level(raw[1:-1].replace("->", ""))
         tolerant = discards_error(block[: call.start()], block[call.end() - 1 + len(raw) :])
@@ -2567,7 +2620,12 @@ def alias_declarations(code: str) -> list[tuple[tuple[int, int], tuple[int, int]
         for path, alias in use_leaves(use.group(0)):
             kind = extractor_kind(path) if "::" in path else None
             call = r"(?=\s*(?:::<|\())"
-            if kind and alias:
+            binding = alias or path.rsplit("::", 1)[-1]
+            if binding in EXTRACTOR_NAMES and kind != binding and kind not in EXTRACTOR_NAMES:
+                # A plain import of another item with an extractor's name binds
+                # that name in scope. It is then that item, not the extractor.
+                found.append((scope, span, r"(?<![\w:.])%s\b" % binding, path))
+            elif kind and alias:
                 pattern = r"(?<![\w:.])%s\b%s" % (alias, call if kind == "from_slice" else "")
                 found.append((scope, span, pattern, ALIAS_TARGETS[kind]))
             elif path == "serde_json" and alias:
@@ -2600,6 +2658,40 @@ def alias_declarations(code: str) -> list[tuple[tuple[int, int], tuple[int, int]
         elif named:
             found.append((scope, span, name, None))
     return found
+
+
+# The extractor names an import can bind.
+EXTRACTOR_NAMES = ("Query", "Json", "Bytes")
+
+# Glob imports that bring the supported extractors, or nothing that clashes.
+TRUSTED_GLOBS = frozenset({"axum", "axum::extract", "axum::body", "bytes", "serde_json"})
+
+
+def glob_unknowns(code: str) -> list[tuple[int, int, str]]:
+    """`(scope start, scope end, name)` for each extractor name a glob may hide.
+
+    A glob import from a module the audit does not trust, such as
+    `use crate::models::*;`, may bring its own `Query`, `Json` or `Bytes`. In
+    its scope, a bare use of such a name cannot be told apart, unless a plain
+    import in the same scope binds it, since a plain import wins over a glob.
+    """
+    bound: dict[tuple[int, int], set[str]] = {}
+    globs: list[tuple[tuple[int, int], str]] = []
+    for use in re.finditer(r"\buse\b[^;]*;", code):
+        scope = alias_scope(code, use.start())
+        for path, alias in use_leaves(use.group(0)):
+            if path.endswith("::*"):
+                base = re.sub(r"^autumn_web::reexports::", "", path[:-3])
+                if base not in TRUSTED_GLOBS:
+                    globs.append((scope, base))
+            else:
+                bound.setdefault(scope, set()).add(alias or path.rsplit("::", 1)[-1])
+    return [
+        (scope[0], scope[1], name)
+        for scope, _ in globs
+        for name in EXTRACTOR_NAMES
+        if name not in bound.get(scope, set())
+    ]
 
 
 # How many passes `resolve_aliases` makes before it gives up on a chain.
@@ -2687,6 +2779,7 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
     # reads `code`. Only the route table and the query keys need literals.
     code = masked_source(source)
     unreadable = unreadable_aliases(code) + [(0, len(code), name) for name in unsettled]
+    globbed = glob_unknowns(code)
     SOURCE[0] = code
     aliases = getattr(find_struct, "aliases", None)
     TYPE_ALIASES[0] = crate_type_aliases() if aliases is None else aliases
@@ -2799,6 +2892,11 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
         for start, end, alias in unreadable:
             if start <= at < end and re.search(r"(?<![\w:])%s\b" % alias, params):
                 unresolved.append("  %s %s: cannot read the `%s` type alias" % (method, path, alias))
+        for start, end, name in globbed:
+            if start <= at < end and re.search(r"(?<![\w:])%s\b" % name, params):
+                unresolved.append(
+                    "  %s %s: cannot tell which `%s` a glob import brings" % (method, path, name)
+                )
         queries: list[tuple[str, str, bool]] = []
         for query in QUERY_EXTRACTOR.finditer(params):
             reference = query.group(1)
@@ -3262,6 +3360,35 @@ struct Cursor {
 """
 
 
+# A plain import of an unrelated `Query`, and a glob from an unknown module.
+FIXTURE_IMPORTS = r"""
+use crate::signed::Query;
+use crate::models::*;
+
+pub fn harvest_api_router() -> Router {
+    Router::new()
+        .route("/i/shadowed-query", get(i_shadowed_query))
+        .route("/i/glob-json", post(i_glob_json))
+}
+
+async fn i_shadowed_query(Query(filter): Query<Cursor>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn i_glob_json(Json(body): Json<Gadget>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+struct Cursor {
+    offset: Option<u32>,
+}
+
+struct Gadget {
+    name: String,
+}
+"""
+
+
 # Two type aliases named `Maybe`, one in a module and one at the root.
 FIXTURE_ALIAS_SCOPES = r"""
 mod domain {
@@ -3344,6 +3471,9 @@ pub fn harvest_api_router() -> Router {
         .route("/n/crate-path-struct", get(n_crate_path_struct))
         .route("/n/module-helper", post(n_module_helper))
         .route("/n/turbofish-type-helper", post(n_turbofish_type_helper))
+        .route("/n/typed-receiver", post(n_typed_receiver))
+        .route("/n/let-receiver", post(n_let_receiver))
+        .route("/n/untyped-receiver", post(n_untyped_receiver))
         .route("/n/maybe-fields", post(n_maybe_fields))
         .route("/n/loose-field", post(n_loose_field))
 }
@@ -3381,6 +3511,33 @@ mod helpers {
     fn decode_raw(raw: &[u8]) -> Response {
         StatusCode::OK.into_response()
     }
+}
+
+impl StrictReader {
+    fn read(&self, raw: &[u8]) -> Response {
+        let gadget = serde_json::from_slice::<Gadget>(raw).unwrap();
+        StatusCode::OK.into_response()
+    }
+}
+
+impl LenientReader {
+    fn read(&self, raw: &[u8]) -> Response {
+        StatusCode::OK.into_response()
+    }
+}
+
+async fn n_typed_receiver(body: Bytes, reader: LenientReader) -> Response {
+    reader.read(&body)
+}
+
+async fn n_let_receiver(body: Bytes) -> Response {
+    let reader = StrictReader::new();
+    reader.read(&body)
+}
+
+async fn n_untyped_receiver(body: Bytes) -> Response {
+    let reader = make_reader();
+    reader.read(&body)
 }
 
 async fn n_turbofish_type_helper(body: Bytes) -> Response {
@@ -7178,6 +7335,26 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
         {"unresolved": ["GET /n/wrong-prefix-struct: cannot find struct Filter"]},
     ),
     (
+        "a method call resolves through its receiver's written type, or fails closed",
+        FIXTURE_NAMES,
+        [
+            fixture_route(
+                "POST",
+                path,
+                200,
+                request_body=body_of(("name", True), required=False),
+            )
+            for path in ("/n/typed-receiver", "/n/let-receiver", "/n/untyped-receiver")
+        ],
+        {
+            "body_required": [
+                "POST /n/let-receiver: the body is mandatory",
+                "POST /n/untyped-receiver: the body is mandatory",
+            ],
+            "unresolved": ["POST /n/untyped-receiver: cannot read a `from_slice` call"],
+        },
+    ),
+    (
         "a turbofish on a type segment does not hide the helper",
         FIXTURE_NAMES,
         [
@@ -7236,6 +7413,17 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             ),
         ],
         {"unresolved": ["POST /n/loose-field: cannot read `Loose` in LooseField"]},
+    ),
+    (
+        "a plain import binds its name, and a glob from an unknown module fails closed",
+        FIXTURE_IMPORTS,
+        [
+            fixture_route("GET", "/i/shadowed-query", 200, params=[]),
+            fixture_route(
+                "POST", "/i/glob-json", 200, request_body=body_of(("name", True))
+            ),
+        ],
+        {"unresolved": ["POST /i/glob-json: cannot tell which `Json` a glob import brings"]},
     ),
     (
         "a qualified field alias picks its module, and an ambiguous bare alias fails closed",
