@@ -317,6 +317,22 @@ def location(crate: str, *modules: str) -> str:
     return "::".join(part for part in (crate, *modules) if part)
 
 
+def path_segments(path: str) -> list[str]:
+    """The names of a path, with the generic arguments of every segment cut.
+
+    `Decoder::<Config>::` is `["Decoder"]`, and `a::B<T>::c` is `["a", "B",
+    "c"]`. Brackets are matched by `split_expression`, so a `::` inside
+    generic arguments does not split. Every struct, function and alias
+    resolver reads a qualifier through this one step.
+    """
+    names = []
+    for part in split_expression(path.strip(), "::", types=True):
+        part = part.strip()
+        if part and not part.startswith("<"):
+            names.append(re.sub(r"\s*<.*$", "", part, flags=re.S).strip())
+    return names
+
+
 def qualified_match(qualifier: list[str], place: str) -> bool:
     """Whether a path `qualifier` reaches a definition at `place`.
 
@@ -411,9 +427,7 @@ def resolve_function(source: str, name: str, qualifier: str | None = None) -> li
         return [start for start, owner, _ in definitions if owner is None]
     if qualifier.strip() == ".":
         return [start for start, owner, _ in definitions if owner is not None]
-    segments = [
-        re.sub(r"\s*<.*", "", part).strip() for part in qualifier.split("::") if part.strip()
-    ]
+    segments = path_segments(qualifier)
     last = segments[-1] if segments else None
     if last is not None and last[0].isupper():
         path = segments[:-1]
@@ -507,7 +521,7 @@ def resolve_struct(index: dict[str, list[tuple[str, str]]], reference: str) -> s
     that `qualified_match` reaches. More than one match, or none, is `None`,
     so the audit reports the struct and fails closed.
     """
-    segments = [part.strip() for part in reference.split("::") if part.strip()]
+    segments = path_segments(reference)
     found = index.get(segments[-1], []) if segments else []
     found = [(place, block) for place, block in found if qualified_match(segments[:-1], place)]
     return found[0][1] if len(found) == 1 else None
@@ -750,12 +764,12 @@ WIRE_TYPES = {
 
 # A typed query extractor in any form, naming its struct. A `Query<` that this
 # does not match is reported, not skipped.
-QUERY_EXTRACTOR = re.compile(r"\bQuery<\s*([A-Za-z0-9_:]+)\s*>")
+QUERY_EXTRACTOR = re.compile(r"(?<![\w:])Query<\s*([A-Za-z0-9_:]+)\s*>")
 
 # A parameter that carries the raw request body.
 BYTE_PARAMETER = re.compile(
     r"\b([a-z_][a-z_0-9]*)\s*:\s*(?:&\s*(?:'[a-z_]+\s+)?(?:mut\s+)?)?"
-    r"(?:(?:[a-z_]+::)*Bytes\b|\[u8\]|Vec<u8>)"
+    r"(?:(?<![\w:])Bytes\b|\[u8\]|Vec<u8>)"
 )
 
 
@@ -898,8 +912,7 @@ def resolve_field_type(declared_type: str, module: str = "") -> tuple[str, str |
         head = re.fullmatch(r"\s*((?:[A-Za-z_]\w*\s*::\s*)*)([A-Z]\w*)\s*(?:<(.*)>)?\s*", declared_type)
         if head is None:
             return declared_type, None
-        qualifier = [part.strip() for part in head.group(1).split("::") if part.strip()]
-        alias, unreadable = pick_alias(qualifier, head.group(2), module)
+        alias, unreadable = pick_alias(path_segments(head.group(1)), head.group(2), module)
         if unreadable:
             return declared_type, head.group(2)
         if alias is None:
@@ -919,7 +932,7 @@ def resolve_field_type(declared_type: str, module: str = "") -> tuple[str, str |
     return declared_type, head.group(1) if head else declared_type
 
 # A `Json` extractor, bare or with a path such as `axum::Json`.
-JSON = r"(?:[a-z_]+::)*Json"
+JSON = r"(?<![\w:])Json"
 
 
 def function_parts(
@@ -1330,7 +1343,10 @@ def handoffs(
 
 # A path-qualified call or a method call. Group 1 is the path or the `.`, and
 # group 2 the last segment, as in `Decoder::decode(` or `decoder.decode(`.
-QUALIFIED_CALL = r"((?:[A-Za-z_]\w*(?:\s*<[^()]*?>)?\s*::\s*)+|\.\s*)([a-z_][a-z_0-9]*)%s\s*\(" % TURBOFISH
+QUALIFIED_CALL = (
+    r"((?:[A-Za-z_]\w*(?:\s*(?:::\s*)?<[^()]*?>)?\s*::\s*)+|\.\s*)([a-z_][a-z_0-9]*)%s\s*\("
+    % TURBOFISH
+)
 
 
 def handoff_path(call: re.Match) -> bool:
@@ -2481,6 +2497,27 @@ def extractor_kind(path: str) -> str | None:
     return SUPPORTED_PATHS.get(path)
 
 
+def canonical_extractor_paths(source: str) -> str:
+    """`source` with each trusted qualified extractor path cut to its bare name.
+
+    `axum::Json<T>` becomes `Json<T>`, and `autumn_web::reexports::axum::Json`
+    does too, as `extractor_kind` reads them. A path it does not trust, such as
+    `crate::signed::Query<T>`, is left whole, and every extractor reader
+    matches only a bare name, so that type is no extractor. A `use` statement
+    keeps its paths, since the alias layer reads them. Comments and literals
+    are left alone, and newlines stay.
+    """
+    code = code_only(source)
+    uses = [found.span() for found in re.finditer(r"\buse\b[^;]*;", code)]
+    qualified = r"(?<![\w:])(?:::\s*)?(?:[A-Za-z_]\w*\s*::\s*)+(Query|Json|Bytes)\b"
+    for found in reversed(list(re.finditer(qualified, code))):
+        if any(start <= found.start() < end for start, end in uses):
+            continue
+        if extractor_kind(found.group(0)[: found.end(1) - found.start()]):
+            source = source[: found.start()] + found.group(1) + source[found.end() :]
+    return source
+
+
 def use_leaves(statement: str) -> list[tuple[str, str | None]]:
     """`(path, alias)` for each leaf of a `use` tree.
 
@@ -2644,7 +2681,7 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
     """Every finding, by check. `find_struct` maps a struct name to its block."""
     # A rename keeps every line, so line numbers still point at the source.
     lines = source.split("\n")
-    source, unsettled = resolve_aliases(source)
+    source, unsettled = resolve_aliases(canonical_extractor_paths(source))
     source = canonical_paths(source)
     # Comments and literals are blanked once, at the same length. Every scan
     # reads `code`. Only the route table and the query keys need literals.
@@ -2783,7 +2820,7 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
                 unresolved += [unread % (method, path, a, name) for a in unreadable_serde(struct)]
             else:
                 queries.append((name, struct, wrapped))
-        if len(re.findall(r"\bQuery<", params)) > len(QUERY_EXTRACTOR.findall(params)):
+        if len(re.findall(r"(?<![\w:])Query<", params)) > len(QUERY_EXTRACTOR.findall(params)):
             unresolved.append("  %s %s: cannot read a `Query<..>` extractor" % (method, path))
         if queries:
             typed_query += query_struct_findings(method, path, route, queries)
@@ -2800,7 +2837,7 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
             or re.search(r"Result<\s*%s<\s*([A-Za-z0-9_:]+)\s*>" % JSON, params)
             or re.search(r"Option<\s*%s<\s*([A-Za-z0-9_:]+)\s*>\s*>" % JSON, params)
         )
-        if len(re.findall(r"\bJson<", params)) > (extractor is not None):
+        if len(re.findall(r"(?<![\w:])Json<", params)) > (extractor is not None):
             unresolved.append("  %s %s: cannot read a `Json<..>` extractor" % (method, path))
         # (struct name, whether the body is mandatory) for each parse.
         parses: list[tuple[str, bool]] = []
@@ -3306,6 +3343,7 @@ pub fn harvest_api_router() -> Router {
         .route("/n/wrong-prefix-struct", get(n_wrong_prefix_struct))
         .route("/n/crate-path-struct", get(n_crate_path_struct))
         .route("/n/module-helper", post(n_module_helper))
+        .route("/n/turbofish-type-helper", post(n_turbofish_type_helper))
         .route("/n/maybe-fields", post(n_maybe_fields))
         .route("/n/loose-field", post(n_loose_field))
 }
@@ -3343,6 +3381,10 @@ mod helpers {
     fn decode_raw(raw: &[u8]) -> Response {
         StatusCode::OK.into_response()
     }
+}
+
+async fn n_turbofish_type_helper(body: Bytes) -> Response {
+    StrictDecoder::<Config>::decode(&body)
 }
 
 async fn n_module_helper(body: Bytes) -> Response {
@@ -3577,6 +3619,8 @@ pub fn harvest_api_router() -> Router {
         .route("/e/mut-borrow-parse", post(e_mut_borrow_parse))
         .route("/e/partial-slice-parse", post(e_partial_slice_parse))
         .route("/e/signed-type-alias", get(e_signed_type_alias))
+        .route("/e/foreign-qualified-query", get(e_foreign_qualified_query))
+        .route("/e/inline-axum-query", get(e_inline_axum_query))
         .route("/e/or-and-empty-guard", post(e_or_and_empty_guard))
         .route("/e/nested-and-error-exit", post(e_nested_and_error_exit))
         .route("/e/unknown-receiver-method", post(e_unknown_receiver_method))
@@ -4762,6 +4806,14 @@ async fn e_partial_slice_parse(body: Bytes) -> Response {
 }
 
 type SignedQuery<T> = crate::signed::Query<T>;
+
+async fn e_foreign_qualified_query(query: crate::signed::Query<Cursor>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn e_inline_axum_query(axum::extract::Query(cursor): axum::extract::Query<Cursor>) -> Response {
+    StatusCode::OK.into_response()
+}
 
 async fn e_signed_type_alias(query: SignedQuery<Cursor>) -> Response {
     StatusCode::OK.into_response()
@@ -7126,6 +7178,19 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
         {"unresolved": ["GET /n/wrong-prefix-struct: cannot find struct Filter"]},
     ),
     (
+        "a turbofish on a type segment does not hide the helper",
+        FIXTURE_NAMES,
+        [
+            fixture_route(
+                "POST",
+                "/n/turbofish-type-helper",
+                200,
+                request_body=body_of(("name", True), required=False),
+            )
+        ],
+        {"body_required": ["POST /n/turbofish-type-helper: the body is mandatory"]},
+    ),
+    (
         "a qualified method picks its impl type, and an ambiguous method fails closed",
         FIXTURE_NAMES,
         [
@@ -7275,6 +7340,15 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             ],
             "unresolved": ["POST /e/partial-slice-parse: cannot read a `from_slice` call"],
         },
+    ),
+    (
+        "a parameter type is an extractor only through a trusted path",
+        FIXTURE_EDGES,
+        [
+            fixture_route("GET", "/e/foreign-qualified-query", 200, params=[]),
+            fixture_route("GET", "/e/inline-axum-query", 200, params=[]),
+        ],
+        {"query_params": ["GET /e/inline-axum-query: `offset` is accepted by Cursor"]},
     ),
     (
         "a type alias of a Query from another crate is no extractor",
