@@ -54,8 +54,14 @@ that either scanner's claim loop still calls the wrapper, so removing or
 bypassing that one call site would restore claim-order firing (and its
 ABBA deadlock risk) while every tracked function stayed identical.
 `CALL_SITE_GUARDS` closes it: for each scanner's `fire_due_on_conn`, it
-asserts the wrapper call appears, and appears before the per-row firing
-loop starts.
+requires a `let <var> = wrapper_call(...);`-shaped assignment followed by
+a `for _ in <var>` loop over that SAME variable — not just the wrapper
+call and a loop appearing in the right textual order. Codex review on PR
+#1696 found the weaker, order-only check still passed when the wrapper's
+result was discarded (`wrapper_call(conn, due_rows.clone()).await?;`,
+unused) while the loop kept iterating the untouched original, and when
+the wrapper was merely named inside a comment. Tying the loop's variable
+to the assignment's, over comment/string-masked text, closes both.
 
 Function extraction matches braces through `find_matching_brace`, not a
 raw character count. Codex review on PR #1696 found the raw count could
@@ -65,6 +71,11 @@ function early, silently hiding a real divergence after it; a stray `{`
 never finds its match and runs the scan past the end of the file.
 `find_matching_brace` walks the same comment/string lexical structure
 Rust itself does, so only a brace the grammar would count changes depth.
+A follow-up review round then found the raw-string handling itself
+routed a zero-hash `r"..."` (an ordinary, common raw string) through the
+escape-aware normal-string scan, so a literal like `r"\"` skipped past
+its own closing quote. `_skip_raw_string_literal` never treats `\` as an
+escape, regardless of hash count.
 
 Usage:
     python3 docs/audits/quota-lock-ordering-sync.py
@@ -105,15 +116,16 @@ FIELD_NORMALIZATIONS: dict[str, tuple[str, str]] = {
 }
 NORMALIZED_PLACEHOLDER = "row.__normalized_input_field__"
 
-# Each entry names an enclosing function, in both files, that must call
-# `wrapper_call` before `loop_pattern`'s first match — the invariant that
-# a claimed batch is reordered before any row fires. This is a structural
-# check on the CALLER, not a text comparison of the wrapper itself.
+# Each entry names an enclosing function, in both files, that must bind
+# `wrapper_call`'s result to a variable and then loop over that SAME
+# variable — the invariant that a claimed batch is reordered before any
+# row fires, and that the reordered batch (not a discarded clone, not the
+# original) is what actually fires. This is a structural check on the
+# CALLER, not a text comparison of the wrapper itself.
 CALL_SITE_GUARDS = [
     {
         "enclosing_fn": "fire_due_on_conn",
         "wrapper_call": "order_due_rows_for_deadlock_free_firing",
-        "loop_pattern": re.compile(r"for\s+\w+\s+in\s+due_rows\b"),
     },
 ]
 
@@ -149,14 +161,11 @@ def _skip_block_comment(text: str, i: int) -> int:
     return i
 
 
-def _skip_string_literal(text: str, i: int, raw_hashes: int = 0) -> int:
-    """`i` is just past the opening quote. Return the index just past the
-    closing quote (plus its hashes, for a raw string)."""
+def _skip_string_literal(text: str, i: int) -> int:
+    """`i` is just past the opening quote of a NORMAL (non-raw) string.
+    Return the index just past the closing quote. A backslash escapes the
+    next character, so an escaped quote never ends the literal early."""
     n = len(text)
-    if raw_hashes:
-        closer = '"' + "#" * raw_hashes
-        j = text.find(closer, i)
-        return n if j == -1 else j + len(closer)
     while i < n:
         if text[i] == "\\":
             i += 2
@@ -165,6 +174,25 @@ def _skip_string_literal(text: str, i: int, raw_hashes: int = 0) -> int:
             return i + 1
         i += 1
     return n
+
+
+def _skip_raw_string_literal(text: str, i: int, hashes: int) -> int:
+    """`i` is just past the opening `r#*"` of a raw string. Return the
+    index just past its closer (`"` followed by exactly `hashes` `#`s).
+
+    A raw string does no escape processing at all — not even for its own
+    quote character — so this never treats `\\` specially. Codex review on
+    PR #1696 found that routing a zero-hash raw string (plain `r"..."`,
+    the common case) through the escape-aware normal-string scan treated
+    its backslashes as escapes, so a literal like `r"\\"` (one backslash,
+    a valid, unremarkable raw string) skipped past its own closing quote
+    and ran the scan past the function or off the end of the file. `hashes
+    == 0` is a normal raw string, not a signal to fall back to escaping.
+    """
+    n = len(text)
+    closer = '"' + "#" * hashes
+    j = text.find(closer, i)
+    return n if j == -1 else j + len(closer)
 
 
 def find_matching_brace(text: str, open_index: int) -> int:
@@ -191,12 +219,12 @@ def find_matching_brace(text: str, open_index: int) -> int:
         if c == "/" and i + 1 < n and text[i + 1] == "*":
             i = _skip_block_comment(text, i)
             continue
-        if c == '"':
-            i = _skip_string_literal(text, i + 1)
-            continue
         raw_match = _RAW_STRING_OPEN_RE.match(text, i)
         if raw_match:
-            i = _skip_string_literal(text, raw_match.end(), raw_hashes=len(raw_match.group(1)))
+            i = _skip_raw_string_literal(text, raw_match.end(), len(raw_match.group(1)))
+            continue
+        if c == '"':
+            i = _skip_string_literal(text, i + 1)
             continue
         if c == "{":
             depth += 1
@@ -206,6 +234,54 @@ def find_matching_brace(text: str, open_index: int) -> int:
                 return i + 1
         i += 1
     raise ValueError(f"unterminated brace starting at index {open_index}")
+
+
+def mask_comments_and_strings(text: str) -> str:
+    """Return a same-length copy of `text` with every line comment, block
+    comment, and string literal (raw strings included) blanked out to
+    spaces (newlines kept, to leave line numbers meaningful).
+
+    `check_call_site_guard` searches for a real assignment and a real loop
+    in live code. Codex review on PR #1696 found it did not — a mention of
+    the wrapper call inside a comment (`// order_due_rows_for_deadlock_free_firing(...)`,
+    describing a bypass rather than performing one) would satisfy the same
+    regex a real call does. Searching the masked text instead means only
+    code the compiler would actually see can match.
+    """
+    n = len(text)
+    out = list(text)
+
+    def blank(lo: int, hi: int) -> None:
+        for k in range(lo, hi):
+            if out[k] != "\n":
+                out[k] = " "
+
+    i = 0
+    while i < n:
+        c = text[i]
+        if c == "/" and i + 1 < n and text[i + 1] == "/":
+            j = _skip_line_comment(text, i)
+            blank(i, j)
+            i = j
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "*":
+            j = _skip_block_comment(text, i)
+            blank(i, j)
+            i = j
+            continue
+        raw_match = _RAW_STRING_OPEN_RE.match(text, i)
+        if raw_match:
+            j = _skip_raw_string_literal(text, raw_match.end(), len(raw_match.group(1)))
+            blank(i, j)
+            i = j
+            continue
+        if c == '"':
+            j = _skip_string_literal(text, i + 1)
+            blank(i, j)
+            i = j
+            continue
+        i += 1
+    return "".join(out)
 
 
 def extract_function(text: str, name: str) -> str | None:
@@ -229,33 +305,46 @@ def extract_function(text: str, name: str) -> str | None:
     return text[start:end]
 
 
-def check_call_site_guard(
-    text: str, file_label: str, enclosing_fn: str, wrapper_call: str, loop_pattern: re.Pattern
-) -> str | None:
+def check_call_site_guard(text: str, file_label: str, enclosing_fn: str, wrapper_call: str) -> str | None:
     """Return a failure message, or `None` if the guard holds.
 
-    Finds `enclosing_fn`'s body, then requires a call to `wrapper_call`
-    that appears strictly before `loop_pattern`'s first match inside that
-    same body. Either match missing, or the call appearing at or after
-    the loop, is a failure: the ordering wrapper must run before any row
-    in the claimed batch fires.
+    Finds `enclosing_fn`'s body, masks its comments and string literals
+    (so a mention of `wrapper_call` in a comment cannot count), then
+    requires a `let <var> = wrapper_call(...)[.await][?];`-shaped
+    assignment followed later by a `for _ in <var>` loop over that SAME
+    variable. Matching the wrapper call and a loop independently, without
+    tying them to one variable, is not enough: Codex review on PR #1696
+    found that calling the wrapper on a discarded clone (`wrapper_call(conn,
+    due_rows.clone()).await?;`, result unused) still left a textual call
+    before a textual loop over the untouched original `due_rows`, which is
+    exactly the claim-order-firing bug this guard exists to catch.
     """
     body = extract_function(text, enclosing_fn)
     if body is None:
         return f"{file_label}: enclosing function `{enclosing_fn}` not found"
 
-    call_match = re.search(re.escape(wrapper_call) + r"\s*\(", body)
-    if call_match is None:
-        return f"{file_label}::{enclosing_fn}: no call to `{wrapper_call}` found"
+    masked = mask_comments_and_strings(body)
 
-    loop_match = loop_pattern.search(body)
-    if loop_match is None:
-        return f"{file_label}::{enclosing_fn}: no `{loop_pattern.pattern}` firing loop found"
-
-    if call_match.start() >= loop_match.start():
+    assign_re = re.compile(
+        r"let\s+(?:mut\s+)?(\w+)\s*=\s*"
+        + re.escape(wrapper_call)
+        + r"\s*\([^;]*?\)\s*(?:\.await)?\s*\??\s*;"
+    )
+    assign_match = assign_re.search(masked)
+    if assign_match is None:
         return (
-            f"{file_label}::{enclosing_fn}: `{wrapper_call}` is called at or after "
-            "the firing loop starts, not before it"
+            f"{file_label}::{enclosing_fn}: no `let <var> = {wrapper_call}(...);`-shaped "
+            "assignment found — a call whose result isn't bound to a variable doesn't "
+            "prove the reordered batch is what fires"
+        )
+
+    var = assign_match.group(1)
+    loop_re = re.compile(r"for\s+\w+\s+in\s+" + re.escape(var) + r"\b")
+    loop_match = loop_re.search(masked, assign_match.end())
+    if loop_match is None:
+        return (
+            f"{file_label}::{enclosing_fn}: `{wrapper_call}`'s result is bound to `{var}`, "
+            f"but no `for _ in {var}` loop consumes it afterward"
         )
     return None
 
@@ -329,13 +418,11 @@ def main() -> int:
     for guard in CALL_SITE_GUARDS:
         for label, text in ((str(DEBOUNCE.relative_to(REPO_ROOT)), debounce_text),
                             (str(THROTTLE.relative_to(REPO_ROOT)), throttle_text)):
-            error = check_call_site_guard(
-                text, label, guard["enclosing_fn"], guard["wrapper_call"], guard["loop_pattern"]
-            )
+            error = check_call_site_guard(text, label, guard["enclosing_fn"], guard["wrapper_call"])
             if error is None:
                 print(
-                    f"OK   {label}::{guard['enclosing_fn']} calls "
-                    f"`{guard['wrapper_call']}` before its firing loop"
+                    f"OK   {label}::{guard['enclosing_fn']} binds `{guard['wrapper_call']}`'s "
+                    "result and loops over it"
                 )
             else:
                 guard_failures += 1
