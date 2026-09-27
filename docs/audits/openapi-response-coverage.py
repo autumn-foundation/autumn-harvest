@@ -51,9 +51,9 @@ error, through `?`, `.map_err(..)?`, or an `Err` arm that builds an error or
 returns the rejection it binds. A raw-byte parse is mandatory unless an `if` on
 `.is_empty()` lets an empty body skip it. The parse must be in the arm that runs
 for a non-empty body. An earlier `if body.is_empty() { .. }` also counts when
-its block returns `Ok(..)` and no error. A `return` inside a nested closure, fn
-or async block does not count, since it leaves only that scope. A parse that
-turns its error into a value is optional too, such as `.ok()`,
+its block returns `Ok(..)` and no error. Only a return at the top level of that
+block counts. A return inside a nested `if`, `match` or closure may not run. A
+parse that turns its error into a value is optional too, such as `.ok()`,
 `.unwrap_or_default()` or an `if let Ok(..)` whose `else` does not reject. A
 guard or a tolerant call at a helper call site carries into the helper. Check 2
 applies to every parse that does not tolerate its error, since a body that is
@@ -388,7 +388,8 @@ QUERY_EXTRACTOR = re.compile(r"\bQuery<\s*([A-Za-z0-9_:]+)\s*>")
 
 # A parameter that carries the raw request body.
 BYTE_PARAMETER = re.compile(
-    r"\b([a-z_][a-z_0-9]*)\s*:\s*&?\s*(?:(?:[a-z_]+::)*Bytes\b|\[u8\]|Vec<u8>)"
+    r"\b([a-z_][a-z_0-9]*)\s*:\s*(?:&\s*(?:'[a-z_]+\s+)?(?:mut\s+)?)?"
+    r"(?:(?:[a-z_]+::)*Bytes\b|\[u8\]|Vec<u8>)"
 )
 
 # A `from_slice` call: its turbofish, if any, then its argument list.
@@ -576,7 +577,7 @@ def guards(block: str, position: int, variable: str) -> bool:
             return True
         # An early return counts only for a parse after the whole `if`. A
         # parse inside the empty-body arm runs before that return.
-        early_return = re.search(r"\breturn\s+Ok\(", outer_scope(taken))
+        early_return = re.search(r"\breturn\s+Ok\(", unconditional(taken))
         after_if = position >= end
         if not test.group(1) and after_if and early_return and not re.search(ERROR_TOKENS, taken):
             return True
@@ -697,23 +698,18 @@ def discards_error(before: str, after: str) -> bool:
     return not re.search(r"\breturn\b|" + ERROR_TOKENS, otherwise)
 
 
-# The start of a nested closure, fn or async block. A `return` inside one
-# leaves only that scope, not the handler.
-NESTED_SCOPE = re.compile(
-    r"(?:\|[^|]*\|\s*(?:->\s*[^{]+)?"
-    r"|\bfn\s+[a-z_0-9]+\s*(?:<[^>]*>)?\s*\([^)]*\)\s*(?:->\s*[^{]+)?"
-    r"|\basync\s+(?:move\s+)?)\{"
-)
+def unconditional(block: str) -> str:
+    """The top-level statements of a block, without any nested block.
 
-
-def outer_scope(block: str) -> str:
-    """The block without its nested closures, fns and async blocks."""
-    while True:
-        nested = NESTED_SCOPE.search(block)
-        if nested is None:
-            return block
-        inner = balanced(block[nested.end() - 1 :], "{", "}")
-        block = block[: nested.start()] + block[nested.end() - 1 + len(inner) :]
+    A `return` inside a nested `if`, `match` or closure does not run on every
+    path, so only a top-level one exits the block for certain.
+    """
+    inner = block[1:-1] if block.startswith("{") else block
+    while "{" in inner:
+        opener = inner.index("{")
+        nested = balanced(inner[opener:], "{", "}")
+        inner = inner[:opener] + inner[opener + len(nested) :]
+    return inner
 
 
 def ends_expression(after: str) -> bool:
@@ -1442,6 +1438,8 @@ pub fn harvest_api_router() -> Router {
         .route("/e/parse-then-return", post(e_parse_then_return))
         .route("/e/nested-err", post(e_nested_err))
         .route("/e/split-calls", post(e_split_calls))
+        .route("/e/lifetime", post(e_lifetime))
+        .route("/e/conditional-return", post(e_conditional_return))
 }
 
 async fn e_wrapped(body: Bytes) -> Response {
@@ -1835,6 +1833,25 @@ async fn e_split_calls(body: Bytes) -> Response {
     }
     let other = decode_pair(STORED, &body).ok();
     StatusCode::OK.into_response()
+}
+
+fn parse_borrowed<'a>(body: &'a [u8]) -> Result<Gadget, Response> {
+    serde_json::from_slice::<Gadget>(body).map_err(reject)
+}
+
+async fn e_lifetime(body: Bytes) -> Response {
+    let gadget = parse_borrowed(&body)?;
+    StatusCode::OK.into_response()
+}
+
+async fn e_conditional_return(body: Bytes) -> Result<Response, Response> {
+    if body.is_empty() {
+        if allow_missing() {
+            return Ok(StatusCode::OK.into_response());
+        }
+    }
+    let gadget = serde_json::from_slice::<Gadget>(&body).map_err(reject)?;
+    Ok(StatusCode::OK.into_response())
 }
 
 async fn e_documented(Query(query): Query<Documented>) -> Response {
@@ -2766,6 +2783,29 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             )
         ],
         {},
+    ),
+    (
+        "a byte parameter with a lifetime carries the body",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST", "/e/lifetime", 200, request_body=body_of(("name", True), required=False)
+            )
+        ],
+        {"body_required": ["POST /e/lifetime: the body is mandatory"]},
+    ),
+    (
+        "a conditional early return is no guard",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/conditional-return",
+                200,
+                request_body=body_of(("name", True), required=False),
+            )
+        ],
+        {"body_required": ["POST /e/conditional-return: the body is mandatory"]},
     ),
     (
         "a malformed contract entry does not crash the audit",
