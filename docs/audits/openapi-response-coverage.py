@@ -57,21 +57,22 @@ An `if` on `.is_err()` or `.is_ok()` counts when its failing branch rejects. A
 raw-byte parse is mandatory unless an `if` on `.is_empty()` lets an empty body
 skip it. The parse must be in the arm that runs for a non-empty body, and the
 empty-body arm must not reject. An earlier `if body.is_empty() { .. }` also
-counts when its block returns `Ok(..)` or a 2xx status, and no error. Only a
-return at the top level of that block counts. A return inside a nested `if`,
-`match` or closure may not run. A parse that turns its error into a value is
-optional too, such as `.ok()`, `.unwrap_or_default()` or an `if let Ok(..)`
-whose `else` does not reject. A `match` on the parse is optional when it has an
-`Err` or catch-all arm and no such arm rejects. A fallback that rejects the
-error, such as `.map_or_else(|e| reject(e), ..)`, keeps the parse mandatory. So
-does a fallback that calls a helper that can build a rejection. The helper's
-return type decides: a response, an error or a `Result` can be a rejection, and
-a plain value type such as `Gadget` is not. A helper the audit cannot find
-counts as a rejection. An `.or_else(..)` whose fallback yields `Ok(..)` on every
-path makes a later `?` tolerant. A guard or a tolerant call at a helper call
-site carries into the helper. Check 2 applies to every parse that does not
-tolerate its error, since a body that is present must then carry the mandatory
-fields. A bare `Json<T>` and a rejecting `Result<Json<T>, _>` are such parses.
+counts when its block returns a success, such as `Ok(..)`, a 2xx status or
+`Json(..)`, and no error. Only a return at the top level of that block counts. A
+return inside a nested `if`, `match` or closure may not run. A parse that turns
+its error into a value is optional too, such as `.ok()`, `.unwrap_or_default()`
+or an `if let Ok(..)` whose `else` does not reject. A `match` on the parse is
+optional when it has an `Err` or catch-all arm and no such arm rejects. A
+fallback that rejects the error, such as `.map_or_else(|e| reject(e), ..)`,
+keeps the parse mandatory. So does a fallback that calls a helper that can build
+a rejection. The helper's return type decides: a response, an error or a
+`Result` can be a rejection, and a plain value type such as `Gadget` is not. A
+helper the audit cannot find counts as a rejection. An `.or_else(..)` whose
+fallback yields `Ok(..)` on every path makes a later `?` tolerant. A guard or a
+tolerant call at a helper call site carries into the helper. Check 2 applies to
+every parse that does not tolerate its error, since a body that is present must
+then carry the mandatory fields. A bare `Json<T>` and a rejecting
+`Result<Json<T>, _>` are such parses.
 
 Check 4 reads the routes that take a `RawQuery` and parse the pairs by hand. A
 key those parsers match is a parameter the route accepts, so a key the contract
@@ -457,6 +458,11 @@ FROM_SLICE = re.compile(r"(?:(?<=\bserde_json::)|(?<![\w:]))from_slice\s*(?:::<|
 # The `StatusCode` names for a 2xx status.
 SUCCESS_NAMES = "|".join(sorted(name for name, status in NAMED.items() if 200 <= status < 300))
 
+# The start of a returned value that is a success: `Ok(..)`, a 2xx `StatusCode`,
+# a `Json(..)` body, which axum sends as 200, or a tuple that starts with a 2xx
+# `StatusCode`.
+SUCCESS_EXIT = r"Ok\s*\(|\(?\s*StatusCode::(?:%s)\b|(?:[a-z_]+::)*Json\s*\(" % SUCCESS_NAMES
+
 # A token that marks a block as an error path: an `AutumnError`, an `Err(..)`,
 # or a `StatusCode::` name for a status outside 2xx. A 2xx status is no error.
 ERROR_TOKENS = r"AutumnError::|\bErr\(|StatusCode::(?!(?:%s)\b)[A-Z_]+\b" % SUCCESS_NAMES
@@ -658,7 +664,7 @@ def guards(block: str, position: int, variable: str) -> bool:
     body. That is the `else` of `if body.is_empty()`, or the condition or
     block of `if !body.is_empty()` when its `else` does not reject. A plain
     `if body.is_empty() { .. }` before the parse also counts when its block
-    returns `Ok(..)` or a 2xx status, and no error. Any other use, such as a
+    returns a success that `SUCCESS_EXIT` matches, and no error. Any other use, such as a
     log field, is no guard.
     """
     pattern = r"\bif\s+(!\s*)?%s\.is_empty\(\)" % re.escape(variable)
@@ -691,8 +697,7 @@ def guards(block: str, position: int, variable: str) -> bool:
             return True
         # An early return counts only for a parse after the whole `if`. A
         # parse inside the empty-body arm runs before that return.
-        success = r"\breturn\s+(?:Ok\(|StatusCode::(?:%s)\b)" % SUCCESS_NAMES
-        early_return = re.search(success, unconditional(taken))
+        early_return = re.search(r"\breturn\s+(?:%s)" % SUCCESS_EXIT, unconditional(taken))
         after_if = position >= end and same_scope(block, test.start(), position)
         if not test.group(1) and after_if and early_return and not re.search(ERROR_TOKENS, taken):
             return True
@@ -762,14 +767,14 @@ def rejecting_exit(block: str) -> bool:
     """Whether a fallback block rejects the request.
 
     It rejects when it builds an error, panics, or returns anything other
-    than `Ok(..)` or a 2xx `StatusCode`. A 4xx or 5xx `StatusCode` is an error
+    than a success that `SUCCESS_EXIT` matches. A 4xx or 5xx `StatusCode` is an error
     token, so it rejects. It also rejects when its value is a call to a helper
     that can build a rejection, as `builds_rejection` reads it.
     """
     if re.search(ERROR_TOKENS + r"|\b(?:panic|unreachable|todo)!", block):
         return True
     for returned in re.findall(r"\breturn\b\s*([^;}]*)", block):
-        if not re.match(r"Ok\s*\(|StatusCode::(?:%s)\b" % SUCCESS_NAMES, returned.strip()):
+        if not re.match(SUCCESS_EXIT, returned.strip()):
             return True
     return builds_rejection(closure_value(block))
 
@@ -916,6 +921,8 @@ def fallback_rejects(method: str, arguments: str, state: str = "result") -> bool
         return True
     closure = re.match(r"(?:move\s+)?\|\s*([a-z_][a-z_0-9]*)?[^|]*\|(.*)", fallback, re.S)
     if closure is None:
+        if builds_rejection(fallback):
+            return True
         if not method.endswith("_else") or re.fullmatch(r"[A-Za-z_][\w:]*", fallback) is None:
             return False
         # On an `Option` the path receives no error, so its return type decides.
@@ -1899,6 +1906,8 @@ pub fn harvest_api_router() -> Router {
         .route("/e/option-fallback", post(e_option_fallback))
         .route("/e/option-default", post(e_option_default))
         .route("/e/commented-parse", post(e_commented_parse))
+        .route("/e/let-else-json", post(e_let_else_json))
+        .route("/e/map-or-helper", post(e_map_or_helper))
 }
 
 async fn e_wrapped(body: Bytes) -> Response {
@@ -2700,6 +2709,17 @@ async fn e_commented_parse(body: Bytes) -> Response {
     let raw = r#"serde_json::from_slice::<Gadget>(&body)"#;
     let brace = '{';
     StatusCode::OK.into_response()
+}
+
+async fn e_let_else_json(body: Result<Json<Gadget>, JsonRejection>) -> Json<Gadget> {
+    let Ok(Json(gadget)) = body else {
+        return Json(Gadget::default());
+    };
+    Json(gadget)
+}
+
+async fn e_map_or_helper(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    body.map_or(invalid_body(), |Json(gadget)| accept(gadget))
 }
 
 fn invalid_body() -> Response {
@@ -4204,6 +4224,32 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
         FIXTURE_EDGES,
         [fixture_route("POST", "/e/commented-parse", 200)],
         {},
+    ),
+    (
+        "a let-else that returns a Json response lets the request through",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/let-else-json",
+                200,
+                request_body=body_of(("name", False), required=False),
+            )
+        ],
+        {},
+    ),
+    (
+        "an eager map_or fallback that calls a rejecting helper is mandatory",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/map-or-helper",
+                200,
+                request_body=body_of(("name", True), required=False),
+            )
+        ],
+        {"body_required": ["POST /e/map-or-helper: the body is mandatory"]},
     ),
     (
         "a malformed contract entry does not crash the audit",
