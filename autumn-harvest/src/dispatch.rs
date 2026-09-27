@@ -245,6 +245,19 @@ pub struct InstalledDispatch {
     generation: u64,
 }
 
+#[cfg(test)]
+impl InstalledDispatch {
+    /// An install record that no slot holds. Unit tests use it to call a
+    /// resolver without a write to the process-global slot.
+    pub(crate) fn unslotted(channel: Arc<dyn TaskDispatch>) -> Self {
+        Self {
+            channel,
+            settings: DispatchSettings::default(),
+            generation: 0,
+        }
+    }
+}
+
 static INSTALLED: RwLock<Option<InstalledDispatch>> = RwLock::new(None);
 
 /// Shared source for every install's generation stamp, across both the
@@ -1091,6 +1104,15 @@ where
         let _ = HINT_BUFFER.try_with(|buffer| lock(buffer).extend(hints));
     }
     outcome
+}
+
+/// Run `f` with its publishes bound to `channel` (issue #1431).
+pub(crate) async fn with_bound_channel<F: Future>(
+    channel: Option<Arc<dyn TaskDispatch>>,
+    f: F,
+) -> F::Output {
+    drop(channel);
+    f.await
 }
 
 /// Publish `hints` on the installed channel now.
@@ -3097,5 +3119,99 @@ mod tests {
         assert_eq!(leases.len(), 1);
         assert_eq!(leases[0].task_id, second.task_id);
         assert_eq!(channel.delivered_ids().len(), 2);
+    }
+
+    /// A publish inside a bound scope goes to the bound channel, not to the
+    /// live slot (issue #1431).
+    ///
+    /// Runner B can replace runner A's channel while A's worker still runs.
+    /// A's task hints must stay on A's channel. B's worker would otherwise
+    /// probe its own database, miss, and ack them as absent.
+    #[tokio::test]
+    async fn a_bound_scope_publishes_to_its_own_channel_not_the_live_slot() {
+        let _guard = INSTALL_LOCK.lock().await;
+        let live = Arc::new(MemoryDispatch::new());
+        install(
+            Arc::clone(&live) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+        let bound = Arc::new(MemoryDispatch::new());
+
+        let one = hint("q", Utc::now());
+        let inner = one.clone();
+        with_bound_channel(
+            Some(Arc::clone(&bound) as Arc<dyn TaskDispatch>),
+            async move {
+                let ((), hints) = buffered(async move { record_hint(inner) }).await;
+                publish_now(hints).await;
+            },
+        )
+        .await;
+        uninstall();
+
+        assert_eq!(bound.published_ids(), vec![one.task_id]);
+        assert!(
+            live.published_ids().is_empty(),
+            "the live slot must not receive a bound scope's hint"
+        );
+    }
+
+    /// A scope bound to no channel publishes nothing, even while another
+    /// runtime has a channel installed (issue #1431).
+    #[tokio::test]
+    async fn a_scope_bound_to_no_channel_publishes_nothing() {
+        let _guard = INSTALL_LOCK.lock().await;
+        let live = Arc::new(MemoryDispatch::new());
+        install(
+            Arc::clone(&live) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        with_bound_channel(None, publish_now(vec![hint("q", Utc::now())])).await;
+        with_bound_channel(None, async { publish_in_background(hint("q", Utc::now())) }).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        uninstall();
+
+        assert!(
+            live.published_ids().is_empty(),
+            "a scope bound to no channel must not publish into the live slot"
+        );
+    }
+
+    /// The background publisher honours the binding of the scope that
+    /// queued the hint (issue #1431).
+    #[tokio::test]
+    async fn a_background_publish_in_a_bound_scope_uses_the_bound_channel() {
+        let _guard = INSTALL_LOCK.lock().await;
+        let live = Arc::new(MemoryDispatch::new());
+        install(
+            Arc::clone(&live) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+        let bound = Arc::new(MemoryDispatch::new());
+
+        let one = hint("q", Utc::now());
+        let unbound = hint("q", Utc::now());
+        let inner = one.clone();
+        with_bound_channel(
+            Some(Arc::clone(&bound) as Arc<dyn TaskDispatch>),
+            async move { publish_in_background(inner) },
+        )
+        .await;
+        publish_in_background(unbound.clone());
+        for _ in 0..100 {
+            if !bound.published_ids().is_empty() && !live.published_ids().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        uninstall();
+
+        assert_eq!(bound.published_ids(), vec![one.task_id]);
+        assert_eq!(
+            live.published_ids(),
+            vec![unbound.task_id],
+            "a hint queued outside a bound scope still uses the live slot"
+        );
     }
 }

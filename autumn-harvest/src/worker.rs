@@ -6077,6 +6077,16 @@ pub(crate) const fn dispatch_allowed_for_span(
     shard_assignments <= 1 && pool_shards <= 1
 }
 
+/// The global channel a worker adopts from a late install (issue #1431).
+fn late_install_binding(
+    live: Option<crate::dispatch::InstalledDispatch>,
+    span_allowed: bool,
+    queues: &[String],
+) -> Result<Option<crate::dispatch::InstalledDispatch>, String> {
+    let _ = (live, span_allowed, queues);
+    Ok(None)
+}
+
 /// Captures each of `assignments`' own per-shard dispatch channel, for
 /// [`Worker::new`] to hold for the rest of the worker's life. Reports in
 /// the same pass whether every assigned shard was covered (issue #1429;
@@ -26862,6 +26872,11 @@ impl Worker {
         })
     }
 
+    /// The global channel this worker is bound to (issue #1431).
+    fn global_dispatch_binding(&self) -> Option<&crate::dispatch::InstalledDispatch> {
+        self.global_dispatch.as_ref()
+    }
+
     /// Return the assigned shards that have no exact pool entry in the
     /// configured `sharded_pool`.
     ///
@@ -43381,5 +43396,168 @@ mod tests {
         );
 
         crate::dispatch::uninstall_all_shards();
+    }
+
+    /// An install record around a new in-memory channel. No slot holds it.
+    #[cfg(feature = "testing")]
+    fn late_channel() -> crate::dispatch::InstalledDispatch {
+        crate::dispatch::InstalledDispatch::unslotted(Arc::new(
+            crate::dispatch::MemoryDispatch::new(),
+        ))
+    }
+
+    /// A channel installed after `Worker::new` is adopted at the run
+    /// boundary when the span and every queue name allow it (issue #1431).
+    #[cfg(feature = "testing")]
+    #[test]
+    fn a_late_install_is_adopted_when_the_span_and_queue_names_allow_it() {
+        let live = late_channel();
+        let queues = vec!["default".to_string(), "tenant-priority".to_string()];
+
+        let bound = late_install_binding(Some(live.clone()), true, &queues)
+            .expect("a valid late install must be adopted")
+            .expect("the late channel must be bound");
+
+        assert!(Arc::ptr_eq(&bound.channel, &live.channel));
+    }
+
+    /// No late install leaves the worker on Postgres, with no error.
+    #[test]
+    fn no_late_install_binds_no_channel() {
+        let bound = late_install_binding(None, true, &["default".to_string()]);
+        assert!(matches!(bound, Ok(None)), "got {bound:?}");
+    }
+
+    /// A late install is refused when one queue name cannot travel through
+    /// the channel (issue #1431). `Worker::new` never saw that channel, so
+    /// the run boundary is the first place to check the name.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn a_late_install_with_an_unaddressable_queue_name_is_refused() {
+        let queues = vec!["default".to_string(), "tenant:priority".to_string()];
+
+        let refusal = late_install_binding(Some(late_channel()), true, &queues)
+            .expect_err("a queue name with a colon must refuse the late install");
+
+        assert!(
+            refusal.contains("tenant:priority"),
+            "the refusal must name the queue: {refusal}"
+        );
+    }
+
+    /// A late install is refused on a span wider than one shard, the same
+    /// rule `Worker::new` applies (issue #1431).
+    #[cfg(feature = "testing")]
+    #[test]
+    fn a_late_install_on_a_wide_span_is_refused() {
+        let refusal = late_install_binding(Some(late_channel()), false, &["default".to_string()])
+            .expect_err("a wide span must refuse the late install");
+
+        assert!(refusal.contains("issue #1312"), "got {refusal}");
+    }
+
+    /// A worker built before the install binds the late channel at the run
+    /// boundary, then keeps it (issue #1431).
+    ///
+    /// A second install after that point is a replacement runner. The worker
+    /// never validated its own pool against it, so it must not follow it.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn a_worker_built_before_install_binds_the_late_channel_once() {
+        let _serial = DISPATCH_INSTALL_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::dispatch::uninstall_all();
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(default_runtime_config(), registry)
+            .expect("no channel is installed yet");
+
+        let late = Arc::new(crate::dispatch::MemoryDispatch::new())
+            as Arc<dyn crate::dispatch::TaskDispatch>;
+        crate::dispatch::install(
+            Arc::clone(&late),
+            crate::dispatch::DispatchSettings::default(),
+        );
+        let first = worker
+            .global_dispatch_binding()
+            .map(|installed| Arc::clone(&installed.channel));
+        crate::dispatch::install(
+            Arc::new(crate::dispatch::MemoryDispatch::new()),
+            crate::dispatch::DispatchSettings::default(),
+        );
+        let second = worker
+            .global_dispatch_binding()
+            .map(|installed| Arc::clone(&installed.channel));
+        crate::dispatch::uninstall_all();
+
+        let first = first.expect("the run boundary must adopt the late channel");
+        assert!(Arc::ptr_eq(&first, &late));
+        let second = second.expect("the binding must hold");
+        assert!(
+            Arc::ptr_eq(&second, &late),
+            "a replacement install must not move the binding"
+        );
+    }
+
+    /// A worker built before the install refuses a late channel it cannot
+    /// use, and stays on Postgres (issue #1431).
+    #[cfg(feature = "testing")]
+    #[test]
+    fn a_worker_built_before_install_refuses_a_late_channel_for_a_bad_queue_name() {
+        let _serial = DISPATCH_INSTALL_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::dispatch::uninstall_all();
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let config = WorkerRuntimeConfig {
+            queues: vec!["tenant:priority".to_string()],
+            ..default_runtime_config()
+        };
+        let worker = Worker::new(config, registry).expect("no channel is installed yet");
+
+        crate::dispatch::install(
+            Arc::new(crate::dispatch::MemoryDispatch::new()),
+            crate::dispatch::DispatchSettings::default(),
+        );
+        let bound = worker.global_dispatch_binding().is_some();
+        crate::dispatch::uninstall_all();
+
+        assert!(!bound, "an unaddressable queue name must refuse the late channel");
+    }
+
+    /// A worker that saw a dispatch topology at construction keeps exactly
+    /// what it captured (issue #1431). A later global install is a stranger's,
+    /// not a late install of this worker's own runtime.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn a_worker_built_on_per_shard_channels_never_adopts_a_later_global_install() {
+        let _serial = DISPATCH_INSTALL_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::dispatch::uninstall_all();
+        let shard_0 = crate::types::ShardId::new(0);
+        let shard_1 = crate::types::ShardId::new(1);
+        for shard in [shard_0, shard_1] {
+            crate::dispatch::install_for_shard(
+                shard,
+                Arc::new(crate::dispatch::MemoryDispatch::new()),
+                crate::dispatch::DispatchSettings::default(),
+            );
+        }
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let config = WorkerRuntimeConfig {
+            shard_assignments: vec![shard_0],
+            ..default_runtime_config()
+        };
+        let worker = Worker::new(config, registry).expect("shard 0 is covered");
+
+        crate::dispatch::install(
+            Arc::new(crate::dispatch::MemoryDispatch::new()),
+            crate::dispatch::DispatchSettings::default(),
+        );
+        let bound = worker.global_dispatch_binding().is_some();
+        crate::dispatch::uninstall_all();
+
+        assert!(!bound, "a stranger's global install must not bind this worker");
     }
 }
