@@ -391,7 +391,7 @@ impl RedisProbe {
     }
 
     fn stream_key(&self, queue: &str) -> String {
-        format!("{}:dispatch:{queue}", self.prefix)
+        autumn_harvest_redis::dispatch_stream_key(&self.prefix, queue)
     }
 
     async fn stream_len(&self, queue: &str) -> i64 {
@@ -432,13 +432,24 @@ impl RedisProbe {
     }
 
     async fn marker_keys(&self) -> Vec<String> {
-        self.keys(&format!("{}:dispatch:marker:*", self.prefix))
+        // Issue #1429: a marker now nests its queue's hash tag
+        // (`{prefix:dispatch:queue}:marker:task_id`). The glob matches
+        // through the literal `{`/`}`, rather than a plain `:marker:`
+        // segment straight off the prefix.
+        self.keys(&format!("{{{}:dispatch:*}}:marker:*", self.prefix))
             .await
     }
 
     /// Delete every key under this fixture's prefix, and nothing else.
+    ///
+    /// A dispatch key nests its queue's hash tag (`{prefix:dispatch:queue}`,
+    /// issue #1429), so it starts with a literal `{` rather than with the
+    /// prefix text. A plain `prefix:*` glob does not match it. Scan the
+    /// hash-tagged namespace too, mirroring `marker_keys` above, so this
+    /// still reaches every key a Redis-loss simulation must clear.
     async fn wipe_prefix(&self) {
-        let keys = self.keys(&format!("{}:*", self.prefix)).await;
+        let mut keys = self.keys(&format!("{}:*", self.prefix)).await;
+        keys.extend(self.keys(&format!("{{{}:*", self.prefix)).await);
         if keys.is_empty() {
             return;
         }

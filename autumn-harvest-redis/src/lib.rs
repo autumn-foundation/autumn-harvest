@@ -72,19 +72,49 @@
 //!
 //! ### Limits in v1
 //!
-//! - **Single Redis instance.** Redis Cluster is not supported. The key
-//!   family spreads a queue's stream, delayed set, payload hash and markers
-//!   over several keys. No hash tag binds them to one slot. A cluster would
-//!   therefore reject the multi-key scripts.
+//! - **Single-node client.** The key family is hash-tagged per queue (issue
+//!   #1429). A queue's stream, delayed set, payload hash and markers all
+//!   carry the same `{prefix:dispatch:queue}` tag. The multi-key scripts
+//!   (`PUBLISH_LUA`, `REQUEUE_LUA`, `PROMOTE_MARKED_LUA`) therefore stay in
+//!   one Redis Cluster slot. The dispatch read (`next`) does too: it reads
+//!   one queue's stream per call, never combining several queues into one
+//!   multi-key `XREADGROUP` (Codex review, issue #1429). This crate still
+//!   connects with a single-node
+//!   [`redis::Client`]/[`ConnectionManager`](redis::aio::ConnectionManager),
+//!   not a cluster-aware client. It does not yet follow `MOVED`/`ASK`
+//!   redirects across a multi-node Cluster deployment. A cluster-aware
+//!   client is a separate follow-up.
+//! - **Upgrading from a pre-#1429 deployment leaves old keys behind.** Every
+//!   dispatch key moved from `{prefix}:dispatch:{queue}...` to the tagged
+//!   `{prefix:dispatch:queue}...` form above. No code reads the old,
+//!   untagged names any more. An old worker's live stream, delayed-set and
+//!   payload entries at those keys are therefore orphaned once every old
+//!   worker has stopped. Unlike the dedupe marker, they carry no TTL. No
+//!   task is lost: Postgres stays the source of truth, and the reconcile
+//!   sweep republishes every `PENDING` row under the new keys regardless.
+//!   The old keys just sit there. An operator upgrading a deployment with
+//!   a large backlog should `SCAN` for the old `{prefix}:dispatch:*`
+//!   pattern and `DEL` what it finds. Do that once no old worker is still
+//!   running.
 //! - **No TLS.** A `rediss://` URL is rejected at `connect` with a message
 //!   that says so. The `redis` client's TLS stack depends on an unmaintained
-//!   crate that the dependency ledger refuses; issue #1429 tracks TLS. A
-//!   plain `redis://` URL sends the password in cleartext.
-//! - **Single shard only.** A hint carries a shard slot, but a sharded
-//!   runtime rejects Redis dispatch at validation.
+//!   crate that the dependency ledger refuses. This is not one of issue
+//!   #1429's ten items; it needs its own follow-up issue. A plain
+//!   `redis://` URL sends the password in cleartext.
+//! - **One channel per shard, not one channel that spans shards.** A single
+//!   [`RedisDispatch`] instance still addresses one key family and expects
+//!   every reference it carries to belong to one database. A multi-shard
+//!   runtime therefore installs one instance per shard rather than widening
+//!   this type (issue #1429; see `autumn-harvest-plugin`'s per-shard
+//!   install and `autumn_harvest::dispatch::install_for_shard`).
 //! - **Priority is best effort.** One stream per queue delivers in arrival
-//!   order. The reconcile sweep publishes in priority order, which is the
-//!   only priority signal the channel carries.
+//!   order. A read sized to exactly one queue's ready backlog therefore sees
+//!   no priority signal at all. `COUNT` caps what Redis returns, before this
+//!   channel ever sees the candidates. The reconcile sweep publishes in
+//!   priority order instead. A read that spans queues also favors the
+//!   highest-priority candidates over lower ones (issue #1429). It does so
+//!   only among whatever surplus that span already produces, with no extra
+//!   round trip. Neither is a per-priority stream.
 //! - **Sticky affinity is best effort.** Any worker in the consumer group may
 //!   read any reference. The Postgres claim predicate still enforces the
 //!   affinity gate, and a rejected reference is released with backoff.
