@@ -48,21 +48,22 @@ free-form, so checks 2 and 3 skip it. Check 5 still reads it.
 Check 5 treats a bare `Json<T>` as mandatory, since axum rejects a request
 without it. A `Result<Json<T>, _>` is mandatory when the handler rejects its
 error, through `?`, `.map_err(..)?`, or an `Err` arm that builds an error or
-returns the rejection it binds. A catch-all `_` arm counts as an `Err` arm. An
-`if` on `.is_err()` or `.is_ok()` counts when its failing branch rejects. A raw-byte parse is mandatory unless an `if` on
+returns the rejection it binds. A catch-all `_` arm counts as an `Err` arm, and
+so does an `if let Err(..)` block. An `if` on `.is_err()` or `.is_ok()` counts
+when its failing branch rejects. A raw-byte parse is mandatory unless an `if` on
 `.is_empty()` lets an empty body skip it. The parse must be in the arm that runs
-for a non-empty body. An earlier `if body.is_empty() { .. }` also counts when
-its block returns `Ok(..)` and no error. Only a return at the top level of that
-block counts. A return inside a nested `if`, `match` or closure may not run. A
-parse that turns its error into a value is optional too, such as `.ok()`,
-`.unwrap_or_default()` or an `if let Ok(..)` whose `else` does not reject. A
-`match` on the parse is optional when it has an `Err` or catch-all arm and no
-such arm rejects. A
-fallback that rejects the error, such as `.map_or_else(|e| reject(e), ..)`,
-keeps the parse mandatory. A guard or a tolerant call at a helper call site carries into the helper. Check 2
-applies to every parse that does not tolerate its error, since a body that is
-present must then carry the mandatory fields. A bare `Json<T>` and a rejecting
-`Result<Json<T>, _>` are such parses.
+for a non-empty body, and the empty-body arm must not reject. An earlier
+`if body.is_empty() { .. }` also counts when its block returns `Ok(..)` and no
+error. Only a return at the top level of that block counts. A return inside a
+nested `if`, `match` or closure may not run. A parse that turns its error into a
+value is optional too, such as `.ok()`, `.unwrap_or_default()` or an
+`if let Ok(..)` whose `else` does not reject. A `match` on the parse is optional
+when it has an `Err` or catch-all arm and no such arm rejects. A fallback that
+rejects the error, such as `.map_or_else(|e| reject(e), ..)`, keeps the parse
+mandatory. A guard or a tolerant call at a helper call site carries into the
+helper. Check 2 applies to every parse that does not tolerate its error, since a
+body that is present must then carry the mandatory fields. A bare `Json<T>` and
+a rejecting `Result<Json<T>, _>` are such parses.
 
 Check 4 reads the routes that take a `RawQuery` and parse the pairs by hand. A
 key those parsers match is a parameter the route accepts, so a key the contract
@@ -608,7 +609,7 @@ def guards(block: str, position: int, variable: str) -> bool:
 
     The test counts when the parse is in the arm that runs for a non-empty
     body. That is the `else` of `if body.is_empty()`, or the condition or
-    block of `if !body.is_empty()`. A plain `if body.is_empty() { .. }` before
+    block of `if !body.is_empty()` when its `else` does not reject. A plain `if body.is_empty() { .. }` before
     the parse also counts when its block returns `Ok(..)` and no error. Any
     other use, such as a log field, is no guard.
     """
@@ -631,8 +632,11 @@ def guards(block: str, position: int, variable: str) -> bool:
         while re.match(r"\s*else\b", block[end:]):
             branch = block.find("{", end)
             end = branch + len(balanced(block[branch:], "{", "}"))
+        # A parse in the arm of `if !body.is_empty()` is guarded only when the
+        # `else`, which runs for an empty body, lets the request through.
         if test.group(1) and test.end() < position < taken_end:
-            return True
+            if not rejecting_exit(block[taken_end:end]):
+                return True
         # The `else` of `if body.is_empty()` is a guard only when the empty-body
         # arm itself lets the request through.
         if not test.group(1) and taken_end < position < end and not rejecting_exit(taken):
@@ -653,7 +657,7 @@ def rejects_result_body(params: str, block: str) -> bool:
     `.unwrap()` or `.expect(..)`, before any call that turns the error into a
     value. It is also mandatory when an `if` on `.is_err()` or `.is_ok()`
     sends the error to a rejection, or when any `Err` or catch-all arm of a
-    `match` on it rejects, or when the `else` of a `let Ok(..) = body else` or an
+    `match` on it rejects, or when an `if let Err(..) = body` block rejects, or when the `else` of a `let Ok(..) = body else` or an
     `if let Ok(..) = body` rejects, as `rejecting_exit` reads it. An `Err` arm that
     hands the request on, for example to replay a committed key, leaves it
     optional.
@@ -683,6 +687,11 @@ def error_rejects(name: str, block: str) -> bool:
     for binding in re.finditer(r"\blet\s+Ok\s*\(.*?\)\s*=\s*%s\s+else\s*\{" % variable, block):
         otherwise = balanced(block[binding.end() - 1 :], "{", "}")
         if rejecting_exit(otherwise):
+            return True
+    failed = r"\bif\s+let\s+Err\s*\(\s*([a-z_][a-z_0-9]*)?[^=]*=\s*%s\s*\{" % variable
+    for tested in re.finditer(failed, block):
+        taken = balanced(block[tested.end() - 1 :], "{", "}")
+        if rejecting_exit(taken) or rejecting_arm(taken, tested.group(1)):
             return True
     for tested in re.finditer(r"\bif\s+let\s+Ok\s*\(.*?\)\s*=\s*%s\s*\{" % variable, block):
         taken = balanced(block[tested.end() - 1 :], "{", "}")
@@ -1720,6 +1729,10 @@ pub fn harvest_api_router() -> Router {
         .route("/e/query-is-err", get(e_query_is_err))
         .route("/e/json-wildcard", post(e_json_wildcard))
         .route("/e/raw-wildcard-ok", post(e_raw_wildcard_ok))
+        .route("/e/json-if-let-err", post(e_json_if_let_err))
+        .route("/e/query-if-let-err", get(e_query_if_let_err))
+        .route("/e/json-if-let-err-ok", post(e_json_if_let_err_ok))
+        .route("/e/negated-else-rejects", post(e_negated_else_rejects))
 }
 
 async fn e_wrapped(body: Bytes) -> Response {
@@ -2366,6 +2379,36 @@ async fn e_raw_wildcard_ok(body: Bytes) -> Response {
         Ok(gadget) => accept(gadget),
         _ => StatusCode::NO_CONTENT.into_response(),
     }
+}
+
+async fn e_json_if_let_err(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    if let Err(rejection) = body {
+        return rejection.into_response();
+    }
+    StatusCode::OK.into_response()
+}
+
+async fn e_query_if_let_err(query: Result<Query<Documented>, QueryRejection>) -> Response {
+    if let Err(_) = query {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    StatusCode::OK.into_response()
+}
+
+async fn e_json_if_let_err_ok(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    if let Err(error) = body {
+        tracing::debug!(%error, "no body");
+    }
+    StatusCode::OK.into_response()
+}
+
+async fn e_negated_else_rejects(body: Bytes) -> Result<Response, Response> {
+    if !body.is_empty() {
+        let gadget = serde_json::from_slice::<Gadget>(&body).map_err(|_| reject())?;
+    } else {
+        return Err(reject());
+    }
+    Ok(StatusCode::OK.into_response())
 }
 
 async fn e_documented(Query(query): Query<Documented>) -> Response {
@@ -3632,6 +3675,48 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             )
         ],
         {},
+    ),
+    (
+        "an if let Err branch that rejects a Result extractor is strict",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/json-if-let-err",
+                200,
+                request_body=body_of(("name", True), required=False),
+            ),
+            fixture_route(
+                "GET",
+                "/e/query-if-let-err",
+                200,
+                params=[query_param("kind", "string", False)],
+                error_responses=[{"status": 400}],
+            ),
+            fixture_route(
+                "POST",
+                "/e/json-if-let-err-ok",
+                200,
+                request_body=body_of(("name", True), required=False),
+            ),
+        ],
+        {
+            "body_required": ["POST /e/json-if-let-err: the body is mandatory"],
+            "query_params": ["GET /e/query-if-let-err: `kind` is mandatory in Documented"],
+        },
+    ),
+    (
+        "a negated guard whose empty-body arm rejects is no guard",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/negated-else-rejects",
+                200,
+                request_body=body_of(("name", True), required=False),
+            )
+        ],
+        {"body_required": ["POST /e/negated-else-rejects: the body is mandatory"]},
     ),
     (
         "a malformed contract entry does not crash the audit",
