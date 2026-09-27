@@ -111,9 +111,10 @@ compiles the workspace, which is the slow part; the client steps take seconds.
   are described in prose on the response, not as a `oneOf`.
 - **Error responses carry no schema.** The contract records a description per
   error status, not a body shape.
-- **Most query parameters are typed `string`**, because the contract records a
-  type for only a few. A generated client sends the value as text, which is
-  what the handler parses.
+- **Hand-parsed query types are not checked.** Every parameter declares a
+  type, and the transform rejects one without it. The audit checks each
+  `Query<T>` field against its struct. A key parsed from `RawQuery` has a type
+  set by hand, and no check compares it with the parser.
 - **Inline schemas, no `$ref`.** Nothing is shared between operations, so
   `openapi-generator` names response models positionally.
 - `GET /workflows/by-id/{workflow_name}/{workflow_id}/children` declares
@@ -147,7 +148,11 @@ Five checks hold the chain together:
 5. `docs/audits/openapi-response-coverage.py`, also in `lint`, reads the
    handlers: every status a handler returns must be declared, every
    request-body field that is mandatory on the wire must be marked required,
-   and every query key a hand-rolled parser matches must be documented.
+   and every query key a hand-rolled parser matches must be documented. A
+   body the handler cannot run without must be marked required. Each
+   `Query<T>` field must be documented with its type and required flag. A
+   body parsed from raw `Bytes` counts, and a type the audit cannot resolve
+   fails the check.
 
 ## Why the document is derived, not annotated
 

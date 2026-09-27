@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Check the API contract against the handlers it describes.
 
-Four checks, all mechanical:
+Seven checks, all mechanical:
 
 1. Every HTTP status a handler can return is declared for that route.
 2. Every request-body field that is mandatory on the wire is marked required.
 3. Every request-body field the handler accepts is documented at all.
 4. Every query key a hand-rolled parser accepts is documented at all.
+5. Every body the handler cannot run without is marked required.
+6. Every `Query<T>` field is documented with its type and required flag.
+7. Every body and query type the audit reads resolves to a struct.
 
 The published OpenAPI document is generated from `docs/api-contract.json`, so
 anything missing there is missing from every generated client. This audit reads
@@ -26,6 +29,16 @@ Checks 2 and 3 resolve each `Json<T>` extractor to its struct. A field is
 mandatory when it is neither an `Option` nor carries a serde default, since axum
 rejects a request that omits one. A field serde accepts but the contract omits
 is missing from the generated client, so an ordinary request cannot be typed.
+
+A handler can also take the raw `Bytes` and call `serde_json::from_slice`
+itself, in its own body or in a helper one level down. Checks 2, 3 and 5 read
+that parse when it reads a parameter of type `Bytes` or `&[u8]`. The type comes
+from a turbofish, then from a typed `let` in the same statement, then from a
+`Result<T, _>` return type. A `Value` body is free-form, so the audit skips it.
+
+Check 5 treats a bare `Json<T>` as mandatory, since axum rejects a request
+without it. A raw-byte parse is mandatory unless an `.is_empty()` test on the
+same variable comes first. Check 2 applies only to a mandatory body.
 
 Check 4 reads the routes that take a `RawQuery` and parse the pairs by hand. A
 key those parsers match is a parameter the route accepts, so a key the contract
@@ -49,16 +62,25 @@ by a helper is not followed, so this audit is a floor rather than a proof. The
 finding text names the source line, since a status can reach a route through a
 helper it shares.
 
-A route that parses its query with a typed `Query<T>` extractor is outside check
-4, which reads match arms rather than struct fields.
+Check 6 compares each `Query<T>` struct with the route's `in: query`
+parameters. `WIRE_TYPES` gives the OpenAPI type of a field after one `Option` is
+removed. A field is optional when it is an `Option` or has a serde default.
+Serde ignores an unknown query key, so a documented key the struct does not
+have is a finding. The audit reads no serde attribute except `default` and
+`skip`. A `rename` thus shows as a finding, not as a silent pass.
 
-Exit code 1 on any finding. Run standalone:
+Check 7 makes the audit fail closed. A body parse with no readable type, or a
+struct the audit cannot find, is a finding and not a skip.
+
+Exit code 1 on any finding. Run standalone, or run the fixtures:
 
     python3 docs/audits/openapi-response-coverage.py
+    python3 docs/audits/openapi-response-coverage.py --self-test
 """
 
 from __future__ import annotations
 
+import functools
 import json
 import pathlib
 import re
@@ -167,29 +189,23 @@ def handler_body(source: str, name: str) -> str | None:
 
 def function_body(source: str, name: str) -> str | None:
     """The block of a free function, async or not, generic or not."""
-    found = re.search(r"\b(?:async )?fn %s\s*[(<]" % re.escape(name), source)
-    if found is None:
-        return None
-    opener = source.find("(", found.start())
-    brace = source.find("{", balanced_end(source, opener))
-    if brace < 0:
-        return None
-    return balanced(source[brace:], "{", "}")
+    parts = function_parts(source, name)
+    return parts[2] if parts else None
 
 
-def balanced_end(source: str, opener: int) -> int:
-    """The index just past the balanced `(..)` starting at `opener`."""
-    return opener + len(balanced(source[opener:]))
+@functools.lru_cache(maxsize=None)
+def defined_functions(source: str) -> dict[str, int]:
+    """Where each function in the source is first defined, by name."""
+    starts: dict[str, int] = {}
+    for found in re.finditer(r"\b(?:async )?fn ([A-Za-z_][A-Za-z_0-9]*)\s*[(<]", source):
+        starts.setdefault(found.group(1), found.start())
+    return starts
 
 
 def called_helpers(source: str, body: str) -> list[str]:
     """Functions defined in this file that the given body calls."""
-    names = {name for name in re.findall(r"\b([a-z_][a-z_0-9]{3,})\s*\(", body)}
-    return sorted(
-        name
-        for name in names - GENERIC_HELPERS
-        if re.search(r"\b(?:async )?fn %s\s*[(<]" % re.escape(name), source)
-    )
+    names = set(re.findall(r"\b([a-z_][a-z_0-9]{3,})\s*\(", body))
+    return sorted((names - GENERIC_HELPERS) & defined_functions(source).keys())
 
 
 def handler_parameters(source: str, name: str) -> str | None:
@@ -202,60 +218,30 @@ def handler_parameters(source: str, name: str) -> str | None:
 
 def struct_body(name: str) -> str | None:
     """The block of `struct <name> { .. }`, from either crate."""
+    return defined_structs().get(name)
+
+
+@functools.lru_cache(maxsize=None)
+def defined_structs() -> dict[str, str]:
+    """The first block of each struct in either crate, by name."""
+    blocks: dict[str, str] = {}
     for crate in CRATES:
         for path in sorted((ROOT / crate / "src").rglob("*.rs")):
             source = path.read_text()
-            found = re.search(r"\bstruct %s\s*\{" % re.escape(name), source)
-            if found:
-                return balanced(source[found.end() - 1 :], "{", "}")
-    return None
+            for found in re.finditer(r"\bstruct ([A-Za-z_][A-Za-z_0-9]*)\s*\{", source):
+                if found.group(1) not in blocks:
+                    blocks[found.group(1)] = balanced(source[found.end() - 1 :], "{", "}")
+    return blocks
 
 
 def accepted_fields(struct: str) -> list[str]:
     """Field names serde will accept from the wire."""
-    accepted: list[str] = []
-    attributes: list[str] = []
-    for line in struct.split("\n"):
-        text = line.strip()
-        if text.startswith("#["):
-            attributes.append(text)
-            continue
-        if not text or text.startswith("//") or text in ("{", "}"):
-            continue
-        field = re.match(r"(?:pub\s+)?([a-z_0-9]+)\s*:\s*(.+?),?$", text)
-        if not field:
-            attributes = []
-            continue
-        joined = " ".join(attributes)
-        skipped = re.search(r"serde\([^)]*\bskip\b", joined) and "skip_serializing_if" not in joined
-        if not skipped:
-            accepted.append(field.group(1))
-        attributes = []
-    return accepted
+    return [name for name, _, _ in struct_fields(struct)]
 
 
 def mandatory_fields(struct: str) -> list[str]:
     """Field names a caller must send, given serde's rules."""
-    mandatory: list[str] = []
-    attributes: list[str] = []
-    for line in struct.split("\n"):
-        text = line.strip()
-        if text.startswith("#["):
-            attributes.append(text)
-            continue
-        if not text or text.startswith("//") or text in ("{", "}"):
-            continue
-        field = re.match(r"(?:pub\s+)?([a-z_0-9]+)\s*:\s*(.+?),?$", text)
-        if not field:
-            attributes = []
-            continue
-        name, declared_type = field.group(1), field.group(2)
-        joined = " ".join(attributes)
-        skipped = re.search(r"serde\([^)]*\bskip\b", joined) and "skip_serializing_if" not in joined
-        if not skipped and "default" not in joined and not declared_type.startswith("Option<"):
-            mandatory.append(name)
-        attributes = []
-    return mandatory
+    return [name for name, _, mandatory in struct_fields(struct) if mandatory]
 
 
 def key_arms(body: str) -> list[tuple[str, ...]]:
@@ -302,18 +288,14 @@ WIRE_TYPES = {
     "bool": "boolean",
     "f32": "number",
     "f64": "number",
-    **{
-        kind: "integer"
-        for kind in (
-            "i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize".split()
-        )
-    },
+    **{kind: "integer" for kind in ("i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize".split())},
 }
 
+# A typed query extractor, naming its struct.
+QUERY_EXTRACTOR = re.compile(r"Query\(\s*[a-z_0-9]+\s*\)\s*:\s*Query<([A-Za-z0-9_]+)>")
+
 # A parameter that carries the raw request body.
-BYTE_PARAMETER = re.compile(
-    r"\b([a-z_][a-z_0-9]*)\s*:\s*&?\s*(?:(?:axum::body::)?Bytes\b|\[u8\])"
-)
+BYTE_PARAMETER = re.compile(r"\b([a-z_][a-z_0-9]*)\s*:\s*&?\s*(?:(?:axum::body::)?Bytes\b|\[u8\])")
 
 # A body parse, with an optional turbofish type and the variable it reads.
 FROM_SLICE = re.compile(
@@ -323,10 +305,10 @@ FROM_SLICE = re.compile(
 
 def function_parts(source: str, name: str) -> tuple[str, str, str] | None:
     """The parameter list, return clause and block of a free function."""
-    found = re.search(r"\b(?:async )?fn %s\s*[(<]" % re.escape(name), source)
-    if found is None:
+    start = defined_functions(source).get(name)
+    if start is None:
         return None
-    opener = source.find("(", found.start())
+    opener = source.find("(", start)
     params = balanced(source[opener:])
     brace = source.find("{", opener + len(params))
     if brace < 0:
@@ -416,17 +398,8 @@ def wire_type(declared_type: str) -> str | None:
     return WIRE_TYPES.get(inner.group(1) if inner else declared_type)
 
 
-def query_struct_findings(
-    method: str, path: str, params: str, route: dict, find_struct
-) -> list[str]:
+def query_struct_findings(method: str, path: str, route: dict, name: str, struct: str) -> list[str]:
     """Check 6: a `Query<T>` struct and the route's query parameters agree."""
-    extractor = re.search(r"Query\(\s*[a-z_0-9]+\s*\)\s*:\s*Query<([A-Za-z0-9_]+)>", params)
-    if extractor is None:
-        return []
-    name = extractor.group(1)
-    struct = find_struct(name)
-    if struct is None:
-        return []
     documented = {
         entry["name"]: entry for entry in route.get("params", []) if entry.get("in") == "query"
     }
@@ -452,13 +425,11 @@ def query_struct_findings(
             )
         if mandatory and entry.get("required") is not True:
             found.append(
-                where % field
-                + " is mandatory in %s but the contract marks it optional" % name
+                where % field + " is mandatory in %s but the contract marks it optional" % name
             )
         if not mandatory and entry.get("required") is True:
             found.append(
-                where % field
-                + " is optional in %s but the contract marks it required" % name
+                where % field + " is optional in %s but the contract marks it required" % name
             )
     accepted = {field for field, _, _ in fields}
     for key in documented.keys() - accepted:
@@ -564,12 +535,19 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
     required_findings: list[str] = []
     unresolved: list[str] = []
     typed_query: list[str] = []
+    missing = "  %s %s: cannot find struct %s"
     for method, path, handler in routes:
         params = handler_parameters(source, handler)
         route = by_route.get((method, path))
         if params is None or route is None:
             continue
-        typed_query += query_struct_findings(method, path, params, route, find_struct)
+        query = QUERY_EXTRACTOR.search(params)
+        if query is not None:
+            struct = find_struct(query.group(1))
+            if struct is None:
+                unresolved.append(missing % (method, path, query.group(1)))
+            else:
+                typed_query += query_struct_findings(method, path, route, query.group(1), struct)
 
         # A bare `Json<T>` means the body is mandatory; `Result<Json<T>, _>` and
         # `Option<Json<T>>` leave that to the handler. All three still name the
@@ -609,6 +587,7 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
         for name, mandatory in parses:
             struct = find_struct(name)
             if struct is None:
+                unresolved.append(missing % (method, path, name))
                 continue
             for field in (mandatory_fields(struct) if mandatory else []):
                 if declared.get(field) is not True:
@@ -660,8 +639,9 @@ CHECKS = [
     ),
     (
         "unresolved",
-        "Unresolved body types",
-        "Name the type in the source, for example `from_slice::<T>(..)`.",
+        "Unresolved types",
+        "Name each body type in the source, for example `from_slice::<T>(..)`, "
+        "and keep each struct in `autumn-harvest` or `autumn-harvest-plugin`.",
     ),
     (
         "query_params",
@@ -702,7 +682,7 @@ def main() -> int:
 
 # A fixture router and its handlers. Each self-test pairs this source with a
 # small contract and names the findings it must produce.
-FIXTURE_SOURCE = r'''
+FIXTURE_SOURCE = r"""
 pub fn harvest_api_router() -> Router {
     Router::new()
         .route("/things", post(create_thing))
@@ -725,7 +705,7 @@ struct CreateThing {
     #[serde(default)]
     note: Option<String>,
 }
-'''
+"""
 
 
 def fixture_struct(source: str):
@@ -753,7 +733,7 @@ def body_of(*fields: tuple[str, bool], required: bool = True) -> dict:
 
 # Raw-byte bodies and typed queries. Each handler shows one way the source
 # parses a body or a query.
-FIXTURE_BYTES = r'''
+FIXTURE_BYTES = r"""
 pub fn harvest_api_router() -> Router {
     Router::new()
         .route("/raw/strict", post(raw_strict))
@@ -766,6 +746,7 @@ pub fn harvest_api_router() -> Router {
         .route("/raw/other", post(raw_other))
         .route("/search", get(search))
         .route("/tagged", get(tagged))
+        .route("/lost", post(lost))
 }
 
 async fn raw_strict(headers: HeaderMap, body: axum::body::Bytes) -> Response {
@@ -848,6 +829,11 @@ async fn tagged(Query(query): Query<TaggedQuery>) -> Response {
     StatusCode::OK.into_response()
 }
 
+async fn lost(Query(query): Query<LostQuery>, body: Bytes) -> Response {
+    let widget = serde_json::from_slice::<LostBody>(&body).ok();
+    StatusCode::OK.into_response()
+}
+
 struct Widget {
     name: String,
     #[serde(default)]
@@ -864,7 +850,7 @@ struct SearchQuery {
 struct TaggedQuery {
     tags: Vec<String>,
 }
-'''
+"""
 
 WIDGET_BODY = body_of(("name", True), ("size", False))
 OPTIONAL_WIDGET = body_of(("name", True), ("size", False), required=False)
@@ -974,9 +960,7 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
         "a raw-byte body parsed in a helper is read",
         FIXTURE_BYTES,
         [
-            fixture_route(
-                "POST", "/raw/helper", 200, request_body=body_of(("name", True))
-            ),
+            fixture_route("POST", "/raw/helper", 200, request_body=body_of(("name", True))),
         ],
         {"undocumented": ["POST /raw/helper: `size` is accepted by Widget"]},
     ),
@@ -1035,7 +1019,11 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
                 params=[SEARCH_PARAMS[0], query_param("exact", "string", False), SEARCH_PARAMS[2]],
             )
         ],
-        {"query_params": ["GET /search: `exact` is boolean in SearchQuery but the contract says string"]},
+        {
+            "query_params": [
+                "GET /search: `exact` is boolean in SearchQuery but the contract says string"
+            ]
+        },
     ),
     (
         "a typed query field carries its required flag",
@@ -1054,8 +1042,8 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
         ],
         {
             "query_params": [
-                "GET /search: `term` is mandatory in SearchQuery but the contract marks it optional",
-                "GET /search: `limit` is optional in SearchQuery but the contract marks it required",
+                "GET /search: `term` is mandatory in SearchQuery",
+                "GET /search: `limit` is optional in SearchQuery",
             ]
         },
     ),
@@ -1064,7 +1052,10 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
         FIXTURE_BYTES,
         [
             fixture_route(
-                "GET", "/search", 200, params=SEARCH_PARAMS + [query_param("page", "integer", False)]
+                "GET",
+                "/search",
+                200,
+                params=SEARCH_PARAMS + [query_param("page", "integer", False)],
             )
         ],
         {"query_params": ["GET /search: `page` is documented but SearchQuery does not accept it"]},
@@ -1073,7 +1064,22 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
         "a query field with no wire type is reported",
         FIXTURE_BYTES,
         [fixture_route("GET", "/tagged", 200, params=[query_param("tags", "string", True)])],
-        {"query_params": ["GET /tagged: `tags` has type Vec<String>, which maps to no OpenAPI type"]},
+        {
+            "query_params": [
+                "GET /tagged: `tags` has type Vec<String>, which maps to no OpenAPI type"
+            ]
+        },
+    ),
+    (
+        "a struct the audit cannot find is reported",
+        FIXTURE_BYTES,
+        [fixture_route("POST", "/lost", 200, request_body=body_of(required=True))],
+        {
+            "unresolved": [
+                "POST /lost: cannot find struct LostQuery",
+                "POST /lost: cannot find struct LostBody",
+            ]
+        },
     ),
 ]
 
