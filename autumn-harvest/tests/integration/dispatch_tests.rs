@@ -566,7 +566,9 @@ async fn workflow_completes_through_the_channel() {
     }
     assert!(
         channel.acked_ids().len() >= delivered.len(),
-        "every delivered reference must be acked or released"
+        "every delivered reference must be acked or released: {} delivered, {} acked",
+        delivered.len(),
+        channel.acked_ids().len()
     );
     assert_eq!(
         channel.outstanding_leases(),
@@ -1888,9 +1890,14 @@ async fn a_resume_publishes_its_wake_after_commit() {
     let _serial = DISPATCH_SERIAL.lock().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let (channel, _guard) = install_commit_checking(&url);
+    let queue = unique_queue("resume_wake");
+    let _cleanup = SeededQueueGuard {
+        url: url.clone(),
+        queue: queue.clone(),
+    };
 
     let mut conn = connect(&url).await;
-    let exec_id = start(&mut conn, "dispatch_trivial").await;
+    let exec_id = start_on(&mut conn, "dispatch_trivial", &queue).await;
     let task_id = workflow_task_id(&mut conn, exec_id).await;
     autumn_harvest::execution::pause_workflow_execution(
         &mut conn,
@@ -1929,10 +1936,15 @@ async fn the_mutex_reclaim_publishes_its_wake_after_commit() {
     let _serial = DISPATCH_SERIAL.lock().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let (channel, _guard) = install_commit_checking(&url);
+    let queue = unique_queue("mutex_wake");
+    let _cleanup = SeededQueueGuard {
+        url: url.clone(),
+        queue: queue.clone(),
+    };
 
     let mut conn = connect(&url).await;
-    let holder = start(&mut conn, "dispatch_trivial").await;
-    let waiter = start(&mut conn, "dispatch_trivial").await;
+    let holder = start_on(&mut conn, "dispatch_trivial", &queue).await;
+    let waiter = start_on(&mut conn, "dispatch_trivial", &queue).await;
     let waiter_task = workflow_task_id(&mut conn, waiter).await;
     settle_background_publisher().await;
     channel.clear();

@@ -1171,6 +1171,49 @@ async fn a_new_lease_holder_resumes_from_the_saved_cursor() {
     );
 }
 
+/// A saved cursor outlives its lease, even when the lease is longer than the
+/// shortest cursor lifetime (issue #1429).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_saved_cursor_outlives_a_long_lease() {
+    let Some(fixture) = try_start(Duration::from_secs(60)).await else {
+        return;
+    };
+    let queue = vec!["long_lease_q".to_string()];
+    let lease_ttl = Duration::from_secs(4 * 3_600);
+    fixture
+        .dispatch
+        .hold_reconcile_leases(&queue, "w1", lease_ttl)
+        .await
+        .expect("hold");
+    fixture
+        .dispatch
+        .save_reconcile_cursors("w1", &[("long_lease_q".to_string(), Some("c".to_string()))])
+        .await
+        .expect("save");
+
+    let mut conn = fixture.raw.clone();
+    let cursor_ms: i64 = redis::cmd("PTTL")
+        .arg(format!(
+            "{}:dispatch:long_lease_q:reconcile:cursor",
+            fixture.prefix
+        ))
+        .query_async(&mut conn)
+        .await
+        .expect("pttl");
+    let lease_ms: i64 = redis::cmd("PTTL")
+        .arg(format!(
+            "{}:dispatch:long_lease_q:reconcile",
+            fixture.prefix
+        ))
+        .query_async(&mut conn)
+        .await
+        .expect("pttl");
+    assert!(
+        cursor_ms > lease_ms,
+        "the cursor ({cursor_ms} ms) must outlive its lease ({lease_ms} ms)"
+    );
+}
+
 /// One consumer holds each queue's reconcile lease. The holder renews it, a
 /// peer waits for it, and a release hands it over (issue #1429).
 #[tokio::test(flavor = "multi_thread")]

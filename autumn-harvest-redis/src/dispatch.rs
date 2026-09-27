@@ -1419,10 +1419,12 @@ const LEASE_RENEWED: &str = "R:";
 /// Hold reply prefix for a lease that just changed hands.
 const LEASE_TAKEN: &str = "F:";
 
-/// Lifetime of a saved sweep cursor, in seconds.
+/// Shortest lifetime of a saved sweep cursor, in seconds.
 ///
-/// A cursor outlives its lease, so a holder that dies still hands its walk
-/// over. A queue nobody sweeps for an hour starts again at the top.
+/// The save script keeps a cursor for at least twice its lease's remaining
+/// lifetime, and never less than this. The holder saves at every sweep, so a
+/// cursor outlives its lease, and a holder that dies still hands its walk
+/// over. A queue nobody sweeps for that long starts again at the top.
 const RECONCILE_CURSOR_TTL_SECS: u64 = 3_600;
 
 /// Take or renew one reconcile sweep lease per queue (issue #1429).
@@ -1460,19 +1462,22 @@ return held
 /// Save or clear one sweep cursor per queue the consumer leases.
 ///
 /// KEYS are the lease keys, then the cursor keys, in the same queue order.
-/// ARGV is the consumer, the cursor TTL in seconds, then one cursor per
-/// queue. An empty cursor clears the key. A queue a peer leases is skipped.
-/// The reply is the number of cursors written.
+/// ARGV is the consumer, the shortest cursor TTL in seconds, then one cursor
+/// per queue. An empty cursor clears the key. A queue a peer leases is
+/// skipped. A cursor lives for twice its lease's remaining lifetime, and no
+/// less than the shortest TTL. The reply is the number of cursors written.
 const SAVE_CURSOR_LUA: &str = r"
 local n = #KEYS / 2
 local written = 0
+local floor_ms = tonumber(ARGV[2]) * 1000
 for i = 1, n do
     if redis.call('GET', KEYS[i]) == ARGV[1] then
         local cursor = ARGV[2 + i]
         if cursor == '' then
             redis.call('DEL', KEYS[n + i])
         else
-            redis.call('SET', KEYS[n + i], cursor, 'EX', ARGV[2])
+            local lease_ms = redis.call('PTTL', KEYS[i])
+            redis.call('SET', KEYS[n + i], cursor, 'PX', math.max(floor_ms, 2 * lease_ms))
         end
         written = written + 1
     end
