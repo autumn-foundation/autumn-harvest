@@ -341,7 +341,13 @@ const INIT_SQL: &str = concat!(
     // provisioned solely from this constant, was affected. See the
     // CI-health report series under `docs/rnd/*-ci-health-semaphore-*.md`
     // for the full investigation this closes.
-    include_str!("../../migrations/20260920215812_harvest_completion_trigger_fires_target/up.sql")
+    include_str!("../../migrations/20260920215812_harvest_completion_trigger_fires_target/up.sql"),
+    "\n",
+    // Issue #1429: `dispatch_tests.rs` seeds an expired mutex lease to drive
+    // the timeout scanner's reclaim. This migration was never added here, so
+    // the seed failed on every throwaway testcontainers database. The
+    // migration creates its tables only, with `IF NOT EXISTS`.
+    include_str!("../../migrations/20260714000001_harvest_mutex_locks/up.sql")
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
