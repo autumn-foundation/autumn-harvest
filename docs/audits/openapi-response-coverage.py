@@ -377,10 +377,18 @@ def block_owners(source: str, keyword: str) -> list[tuple[int, int, str]]:
             header = re.sub(r"^\s*<[^{]*?>", "", header)
             header = header.split(" for ", 1)[-1]
             header = re.sub(r"\bwhere\b.*", "", header, flags=re.S)
+            if re.match(r"\s*&?\s*\[\s*u8\s*\]", header):
+                end = brace + len(balanced(source[brace:], "{", "}"))
+                found.append((brace, end, BYTE_SLICE))
+                continue
         name = re.match(r"\s*&?\s*(?:dyn\s+)?(?:[A-Za-z_]\w*\s*::\s*)*([A-Za-z_]\w*)", header)
         if name:
             found.append((brace, brace + len(balanced(source[brace:], "{", "}")), name.group(1)))
     return found
+
+
+# The owner name of an `impl` for `[u8]`, and the type a `[u8]` receiver has.
+BYTE_SLICE = "[u8]"
 
 
 def owner_at(owners: list[tuple[int, int, str]], position: int) -> str | None:
@@ -513,15 +521,32 @@ def expanded_path(reference: str, site: Site) -> list[str] | None:
     means the import names another crate. A name with no import is returned
     as written.
     """
+    segments, used_at = written_path(reference, site)
+    if used_at is None:
+        return segments
+    return absolute_path(segments, site_origin((site[0], used_at)))
+
+
+def written_path(reference: str, site: Site) -> tuple[list[str], int | None]:
+    """The names of `reference` with an imported first name replaced, and the import's place.
+
+    The innermost `use` that binds the first name in scope at `site`
+    decides, so `use crate::signed as axum;` makes `axum::Json` read as
+    `crate::signed::Json`. A path from `::`, `crate`, `self`, `super` or
+    `Self` has no import. The position is `None` when no import applies.
+    Symbol lookups and the extractor path trust both expand through this.
+    """
     segments = path_segments(reference)
     text, at = site
-    if not segments or at is None or segments[0] in ("crate", "self", "super", "Self"):
-        return segments
+    if not segments or at is None or reference.strip().startswith("::"):
+        return segments, None
+    if segments[0] in ("crate", "self", "super", "Self"):
+        return segments, None
     imported = innermost_use(text, segments[0], at)
     if imported is None:
-        return segments
+        return segments, None
     path, used_at = imported
-    return absolute_path(path_segments(path) + segments[1:], site_origin((text, used_at)))
+    return path_segments(path) + segments[1:], used_at
 
 
 def absolute_path(segments: list[str], origin: str) -> list[str] | None:
@@ -720,7 +745,8 @@ def resolve_symbol(kind: str, reference: str, site: Site | None = None) -> list 
             (location(LOCAL[0], LOCAL[1], modules), start, owner, public)
             for start, owner, modules, public in function_index(SOURCE[0]).get(name, [])
         ]
-        typed = qualifier[-1] if qualifier and qualifier[-1][0].isupper() else None
+        last = qualifier[-1] if qualifier else ""
+        typed = last if last[:1].isupper() or last == BYTE_SLICE else None
         if typed:
             qualifier = qualifier[:-1]
         if typed == "Self":
@@ -763,7 +789,8 @@ def called_helpers(source: str, body: str, params: str = "") -> list[int]:
         if call.group(2) in GENERIC_HELPERS:
             continue
         if call.group(1).strip() == ".":
-            targets = method_targets(body, params, call)
+            receiver = call_receiver(body, call.start())
+            targets = method_targets(body, params, receiver, call.group(2), call.start())
             # A receiver of unknown type reads every method of that name. This
             # is deliberate: a status is never dropped for want of a type.
             if targets is None:
@@ -775,20 +802,24 @@ def called_helpers(source: str, body: str, params: str = "") -> list[int]:
     return sorted(starts)
 
 
-def method_targets(block: str, params: str, call: re.Match) -> list[int] | None:
-    """The methods that a method call `call` in `block` reaches, or `None`.
+def method_targets(
+    block: str, params: str, receiver: str | None, method: str, at: int
+) -> list[int] | None:
+    """The methods that a call `receiver.method(..)` at `at` in `block` reaches, or `None`.
 
     `receiver_type` reads the receiver's written type from `block` or
-    `params`, and the call reaches that type's methods only. A `self`
+    `params`, and the call reaches that type's methods only. A raw body as
+    the receiver has its parameter's type, such as `Bytes`, `Vec` or `[u8]`,
+    so it reaches only a method of an `impl` for that type. A `self`
     receiver reaches the methods of the enclosing `impl`. `None` means the
-    receiver has no type the audit can know. The status scan and the handoff
-    scan both read method calls through this one step.
+    receiver has no type the audit can know. The status scan, the handoff
+    scan and the raw-body receiver scan all read method calls through this
+    one step.
     """
-    receiver = call_receiver(block, call.start())
-    typed = receiver_type(block, params, receiver, call.start()) if receiver else None
+    typed = receiver_type(block, params, receiver, at) if receiver else None
     if typed is None:
         return None
-    return resolve_symbol("fn", typed + "::" + call.group(2), site_in(block, call.start())) or []
+    return resolve_symbol("fn", typed + "::" + method, site_in(block, at)) or []
 
 
 def call_receiver(block: str, dot: int) -> str | None:
@@ -1808,9 +1839,13 @@ def handoffs(
             method = call.group(1)
             if method in BYTE_ACCESSORS or not live_binding(block, variable, call.start(), bound_at):
                 continue
-            # A partial carrier reaches no method the audit can follow.
+            # A partial carrier reaches no method the audit can follow. A whole
+            # one reaches only a method of an `impl` for its own type.
             partial = variable in partial_names(carriers)
-            parts = None if partial else function_parts(source, "." + method)
+            starts = (
+                None if partial else method_targets(block, params, variable, method, call.start())
+            )
+            parts = parts_at(source, starts[0]) if starts and len(starts) == 1 else None
             after = block[call.end() - 1 + len(balanced(block[call.end() - 1 :])) :]
             tolerant = discards_error(block[: call.start()], after)
             guarded = guards(block, call.start(), variable)
@@ -1850,7 +1885,8 @@ def call_sites(
         if helper in GENERIC_HELPERS or not handoff_path(call, block):
             continue
         if path == ".":
-            starts = method_targets(block, params, call) or []
+            receiver = call_receiver(block, call.start())
+            starts = method_targets(block, params, receiver, helper, call.start()) or []
             parts = parts_at(source, starts[0]) if len(starts) == 1 else None
         else:
             site = site_in(block, call.start())
@@ -1901,17 +1937,17 @@ def receiver_type(block: str, params: str, receiver: str, position: int) -> str 
     name = re.escape(receiver)
     binding = r"\blet\s+(?:mut\s+)?%s\s*(?::\s*([^=;]+?))?\s*=\s*([^;]+)" % name
     bindings = list(re.finditer(binding, block[:position]))
-    head = r"&?\s*(?:mut\s+)?((?:[A-Za-z_]\w*\s*::\s*)*[A-Z]\w*)"
+    head = r"&?\s*(?:'[a-z_]+\s+)?(?:mut\s+)?((?:[A-Za-z_]\w*\s*::\s*)*[A-Z]\w*|\[\s*u8\s*\])"
     if bindings:
         annotated, value = bindings[-1].group(1), bindings[-1].group(2)
         if annotated:
             typed = re.match(head, annotated.strip())
-            return typed.group(1) if typed else None
+            return re.sub(r"\s", "", typed.group(1)) if typed else None
         generic = r"(?:\s*::\s*<[^()]*?>)?"
         built = re.match(head + generic + r"\s*(?:::\s*[a-z_]\w*\s*%s\s*\(|\{)" % generic, value.strip())
         return built.group(1) if built else None
-    declared = re.search(r"(?<![\w.])%s\s*:\s*(?:'[a-z_]+\s+)?%s" % (name, head), params)
-    return declared.group(1) if declared else None
+    declared = re.search(r"(?<![\w.])%s\s*:\s*%s" % (name, head), params)
+    return re.sub(r"\s", "", declared.group(1)) if declared else None
 
 
 def receiving_parameters(
@@ -3091,21 +3127,37 @@ def extractor_kind(path: str) -> str | None:
 def canonical_extractor_paths(source: str) -> str:
     """`source` with each trusted qualified extractor path cut to its bare name.
 
-    `axum::Json<T>` becomes `Json<T>`, and `autumn_web::reexports::axum::Json`
-    does too, as `extractor_kind` reads them. A path it does not trust, such as
-    `crate::signed::Query<T>`, is left whole, and every extractor reader
-    matches only a bare name, so that type is no extractor. A `use` statement
+    The first name of each path goes through the scoped `use` bindings first,
+    as `written_path` reads them. The expanded path is then trusted or not,
+    as `extractor_kind` reads it. This is the one path-trust decision.
+    `axum::Json<T>` becomes `Json<T>`, and so does
+    `autumn_web::reexports::axum::Json`. A trusted `from_slice` path becomes
+    `serde_json::from_slice`. A path it does not trust, such as
+    `crate::signed::Query<T>`, is left whole. If an import rebinds its
+    first name, the path is spelled out in full, so `axum::Json` under `use
+    crate::signed as axum;` reads as `crate::signed::Json`. Every extractor
+    reader matches only a bare name, so that type is no extractor. A `use` statement
     keeps its paths, since the alias layer reads them. Comments and literals
     are left alone, and newlines stay.
     """
     code = code_only(source)
     uses = [found.span() for found in re.finditer(r"\buse\b[^;]*;", code)]
-    qualified = r"(?<![\w:])(?:::\s*)?(?:[A-Za-z_]\w*\s*::\s*)+(Query|Json|Bytes)\b"
+    qualified = r"(?<![\w:])(?:::\s*)?(?:[A-Za-z_]\w*\s*::\s*)+(Query|Json|Bytes|from_slice)\b"
     for found in reversed(list(re.finditer(qualified, code))):
         if any(start <= found.start() < end for start, end in uses):
             continue
-        if extractor_kind(found.group(0)[: found.end(1) - found.start()]):
-            source = source[: found.start()] + found.group(1) + source[found.end() :]
+        written = found.group(0)
+        segments, used_at = written_path(written, (code, found.start()))
+        kind = extractor_kind("::".join(segments))
+        if kind is not None:
+            trusted = ALIAS_TARGETS[kind]
+        elif used_at is not None:
+            # A rebound first name, as in `use crate::signed as axum;`, names
+            # that module. The path is spelled out, so no reader trusts it.
+            trusted = "::".join(segments)
+        else:
+            continue
+        source = source[: found.start()] + trusted + source[found.end() :]
     return source
 
 
@@ -4102,6 +4154,9 @@ pub fn harvest_api_router() -> Router {
         .route("/s/imported-alias", post(s_imported_alias))
         .route("/s/local-option", get(s_local_option))
         .route("/s/std-paths", get(s_std_paths))
+        .route("/s/spoofed-query", get(s_spoofed_query))
+        .route("/s/spoofed-json", post(s_spoofed_json))
+        .route("/s/reexported-query", get(s_reexported_query))
         .route("/s/imported-option", get(s_imported_option))
         .route("/s/deep-option", get(s_deep_option))
         .route("/s/imported-result", post(s_imported_result))
@@ -4131,6 +4186,26 @@ mod local_option {
 
 async fn s_std_paths(Query(page): Query<local_option::StdPathsPage>) -> Response {
     StatusCode::OK.into_response()
+}
+
+mod spoofed {
+    use crate::signed as axum;
+
+    async fn s_spoofed_query(page: axum::extract::Query<Paging>) -> Response {
+        StatusCode::OK.into_response()
+    }
+
+    async fn s_spoofed_json(body: axum::Json<Paging>) -> Response {
+        StatusCode::OK.into_response()
+    }
+}
+
+mod reexported {
+    use autumn_web::reexports::axum;
+
+    async fn s_reexported_query(page: axum::extract::Query<Paging>) -> Response {
+        StatusCode::OK.into_response()
+    }
 }
 
 mod imported_option {
@@ -4829,6 +4904,9 @@ pub fn harvest_api_router() -> Router {
         .route("/e/raw-unknown-method", post(e_raw_unknown_method))
         .route("/e/raw-std-reader", post(e_raw_std_reader))
         .route("/e/extension-decode", post(e_extension_decode))
+        .route("/e/unrelated-receiver", post(e_unrelated_receiver))
+        .route("/e/slice-receiver", post(e_slice_receiver))
+        .route("/e/spoofed-parse", post(e_spoofed_parse))
         .route("/e/nested-or-inspection", post(e_nested_or_inspection))
         .route("/e/shadowed-decode-alias", post(e_shadowed_decode_alias))
         .route("/e/wrapped-carrier", post(e_wrapped_carrier))
@@ -6185,6 +6263,44 @@ impl DecodeExt for Bytes {
 async fn e_extension_decode(body: Bytes) -> Response {
     let gadget = body.decode_body::<Gadget>();
     StatusCode::OK.into_response()
+}
+
+impl Inspector {
+    fn peek_body(&self) -> Response {
+        StatusCode::OK.into_response()
+    }
+}
+
+async fn e_unrelated_receiver(body: Bytes) -> Response {
+    body.peek_body()
+}
+
+trait DecodeSlice {
+    fn decode_slice(&self) -> Response;
+}
+
+impl DecodeSlice for [u8] {
+    fn decode_slice(&self) -> Response {
+        let gadget = serde_json::from_slice::<Gadget>(self).unwrap();
+        StatusCode::OK.into_response()
+    }
+}
+
+fn read_slice(raw: &[u8]) -> Response {
+    raw.decode_slice()
+}
+
+async fn e_slice_receiver(body: Bytes) -> Response {
+    read_slice(&body)
+}
+
+mod spoofed_parse {
+    use crate::fake as serde_json;
+
+    async fn e_spoofed_parse(body: Bytes) -> Response {
+        let gadget = serde_json::from_slice::<Gadget>(&body).unwrap();
+        StatusCode::OK.into_response()
+    }
 }
 
 async fn e_unknown_receiver_method(body: Bytes) -> Response {
@@ -8896,6 +9012,26 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
         {},
     ),
     (
+        "an extractor path is trusted only after its first name goes through the imports",
+        FIXTURE_ALIAS_SCOPES,
+        [
+            fixture_route("GET", "/s/spoofed-query", 200, params=[]),
+            fixture_route(
+                "POST",
+                "/s/spoofed-json",
+                200,
+                request_body=body_of(("limit", False), required=False),
+            ),
+            fixture_route(
+                "GET",
+                "/s/reexported-query",
+                200,
+                params=[query_param("limit", "integer", False)],
+            ),
+        ],
+        {},
+    ),
+    (
         "a field alias resolves through the import at the struct",
         FIXTURE_ALIAS_SCOPES,
         [
@@ -8944,6 +9080,30 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
                 "GET /s/dup-params/{id}: `id` is documented 2 times in path",
             ]
         },
+    ),
+    (
+        "a raw body as a receiver reaches only a method of an impl for its own type",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST", path, 200, request_body=body_of(("name", False), required=False)
+            )
+            for path in ("/e/unrelated-receiver", "/e/slice-receiver")
+        ],
+        {
+            "body_required": [
+                "POST /e/unrelated-receiver: the body is mandatory",
+                "POST /e/slice-receiver: the body is mandatory",
+            ],
+            "mandatory": ["POST /e/slice-receiver: `name` is mandatory in Gadget"],
+            "unresolved": ["POST /e/unrelated-receiver: cannot read a `from_slice` call"],
+        },
+    ),
+    (
+        "a qualified path is trusted only after its first name goes through the imports",
+        FIXTURE_EDGES,
+        [fixture_route("POST", "/e/spoofed-parse", 200, request_body=GADGET_BODY)],
+        {"unresolved": ["POST /e/spoofed-parse: cannot read a `from_slice` call"]},
     ),
     (
         "a raw body as the receiver of a method maps to self, unless the method is an accessor",
