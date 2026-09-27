@@ -36,7 +36,9 @@ any other body is checked.
 
 A handler can also take the raw `Bytes` and call `serde_json::from_slice`
 itself. An import alias, such as `use serde_json::from_slice as decode;`, is
-read too. Checks 2, 3 and 5 read that parse when it reads a parameter of type
+read too. Every scan reads the source after `resolve_aliases`. It reads each
+`use .. as ..` and `type` alias of `Query`, `Json`, `Bytes` or `from_slice`
+in its scope, and reports a type alias it cannot read. Checks 2, 3 and 5 read that parse when it reads a parameter of type
 `Bytes`, `&[u8]` or `Vec<u8>`. The parse can be in the handler, or in a helper
 that the handler passes the body to, at any depth up to `HELPER_DEPTH`. A
 recursive helper is read once per chain of calls. In a helper, only the
@@ -458,43 +460,11 @@ BYTE_PARAMETER = re.compile(
 )
 
 
-@functools.lru_cache(maxsize=None)
-def from_slice_calls(source: str) -> re.Pattern:
-    """A `serde_json::from_slice` call, or an imported one, in `source`.
-
-    The match runs to the turbofish, if any, or the argument list. It also
-    reads an import alias, such as `use serde_json::from_slice as decode;`, and
-    a module alias, such as `use serde_json as json;`. A bare `from_slice`
-    counts only when the source imports it from serde_json. `Uuid::from_slice`
-    and a local `from_slice` are no body parse.
-    """
-    names = set(re.findall(r"\bserde_json::(?:\{[^}]*?)?\bfrom_slice\s+as\s+([a-z_]\w*)", source))
-    # A bare `from_slice` counts only when the source imports it from serde_json.
-    imported = r"\buse\s+serde_json::(?:from_slice\s*;|\{[^}]*\bfrom_slice\b(?!\s+as\b)|\*\s*;)"
-    if re.search(imported, source):
-        names.add("from_slice")
-    modules = {"serde_json"} | set(re.findall(r"\buse\s+serde_json\s+as\s+([a-z_]\w*)\s*;", source))
-    qualified = r"\b(?:%s)::from_slice" % "|".join(sorted(modules))
-    bare = r"|(?<![\w:])(?:%s)" % "|".join(sorted(names)) if names else ""
-    return re.compile(r"(?:%s%s)\s*(?:::<|\()" % (qualified, bare))
-
-
-@functools.lru_cache(maxsize=None)
-def module_uses(source: str) -> str:
-    """The `use` statements of `source` at brace depth 0, joined.
-
-    Only a module-level `use` holds for the whole file. A `use` inside a
-    function or a block holds only in that block, as `from_slice_hits` reads it.
-    """
-    depth, uses = 0, []
-    for token in re.finditer(r"[{}]|\buse\b[^;{}]*(?:\{[^}]*\}[^;]*)?;", source):
-        if token.group(0) == "{":
-            depth += 1
-        elif token.group(0) == "}":
-            depth -= 1
-        elif depth == 0:
-            uses.append(token.group(0))
-    return "\n".join(uses)
+# A `serde_json::from_slice` call, up to its turbofish or its argument list.
+# `resolve_aliases` rewrites every import of it and every alias to this path
+# first, so this one pattern reads them all. `Uuid::from_slice` and a local
+# `from_slice` are no body parse.
+FROM_SLICE_CALL = re.compile(r"\bserde_json::from_slice\s*(?:::<|\()")
 
 
 def enclosing_block(block: str, position: int) -> tuple[int, int]:
@@ -506,22 +476,6 @@ def enclosing_block(block: str, position: int) -> tuple[int, int]:
         if depth < 0:
             return index, index + len(balanced(block[index:], "{", "}"))
     return 0, len(block)
-
-
-def from_slice_hits(block: str) -> list[re.Match]:
-    """Each `from_slice` call in `block`, read with the imports in its scope.
-
-    A module-level `use` holds everywhere. A `use` inside `block` holds in
-    the innermost block that holds it, before or after the statement, as in
-    Rust. A `use` in another function does not reach `block`.
-    """
-    hits = {hit.start(): hit for hit in from_slice_calls(module_uses(SOURCE[0])).finditer(block)}
-    for statement in re.finditer(r"\buse\b[^;]*;", block):
-        start, end = enclosing_block(block, statement.start())
-        for hit in from_slice_calls(statement.group(0)).finditer(block):
-            if start <= hit.start() < end:
-                hits.setdefault(hit.start(), hit)
-    return [hits[start] for start in sorted(hits)]
 
 
 # The `StatusCode` names for a 2xx status.
@@ -871,7 +825,7 @@ def block_parses(
     `let` gave a new value is no carrier after that `let`.
     """
     parses: list[tuple[str | None, bool, bool]] = []
-    for hit in from_slice_hits(block):
+    for hit in FROM_SLICE_CALL.finditer(block):
         turbofish = None
         opener = hit.end() - 1
         if block[opener] == "<":
@@ -1858,26 +1812,102 @@ def canonical_paths(text: str) -> str:
     return VARIANT_PATH.sub("", PRELUDE_PATH.sub("", text))
 
 
-def canonical_extractors(source: str) -> str:
-    """`source` with each imported alias of `Query` or `Json` renamed to it.
+# The names an alias can stand for, and the text the audit reads for each.
+ALIAS_TARGETS = {
+    "Query": "Query",
+    "Json": "Json",
+    "Bytes": "Bytes",
+    "from_slice": "serde_json::from_slice",
+}
 
-    An alias such as `use axum::extract::Query as AxumQuery;` hides the
-    extractor from every check, so the audit reads the alias as the name.
+# A type that an extractor alias can hide.
+EXTRACTOR_LIKE = r"\b(?:Query|Json|Bytes)\b"
+
+
+def alias_scope(code: str, position: int) -> tuple[int, int]:
+    """Where a declaration at `position` holds: the file at depth 0, else its block."""
+    head = code[:position]
+    if head.count("{") == head.count("}"):
+        return 0, len(code)
+    return enclosing_block(code, position)
+
+
+def alias_declarations(code: str) -> list[tuple[tuple[int, int], tuple[int, int], str, str | None]]:
+    """`(scope, declaration span, pattern, replacement)` for each alias in `code`.
+
+    It reads `use .. as ..` for `Query`, `Json`, `Bytes` and serde_json's
+    `from_slice`, a module alias of `serde_json`, a plain or glob import of
+    `from_slice`, and `type X<..> = Y<..>;`. A type alias to one of those
+    types with the same parameters is a rename. One with no parameters is
+    replaced by its target. Any other type alias that names an extractor has
+    no replacement (`None`), so the audit reports it.
     """
-    for statement in re.findall(r"\buse\b[^;]*;", masked_source(source)):
-        for canonical, alias in re.findall(r"\b(Query|Json)\s+as\s+([A-Za-z_]\w*)", statement):
-            source = re.sub(r"\b%s\b" % alias, canonical, source)
+    found = []
+    for use in re.finditer(r"\buse\b[^;]*;", code):
+        scope, span, statement = alias_scope(code, use.start()), use.span(), use.group(0)
+        for kind, alias in re.findall(r"\b(Query|Json|Bytes|from_slice)\s+as\s+([A-Za-z_]\w*)", statement):
+            if kind == "from_slice" and "serde_json" not in statement:
+                continue
+            call = r"(?=\s*(?:::<|\())" if kind == "from_slice" else ""
+            found.append((scope, span, r"(?<![\w:.])%s\b%s" % (alias, call), ALIAS_TARGETS[kind]))
+        for alias in re.findall(r"\bserde_json\s+as\s+([a-z_]\w*)", statement):
+            found.append((scope, span, r"(?<![\w:.])%s(?=\s*::)" % alias, "serde_json"))
+        if re.search(r"\bserde_json::(?:from_slice\s*;|\{[^}]*\bfrom_slice\b(?!\s+as\b)|\*\s*;)", statement):
+            found.append((scope, span, r"(?<![\w:.])from_slice(?=\s*(?:::<|\())", ALIAS_TARGETS["from_slice"]))
+    for declared in re.finditer(r"\btype\s+([A-Z]\w*)\s*(<[^=;]*?>)?\s*=\s*([^;]+);", code):
+        name, parameters, target = declared.group(1), declared.group(2) or "", declared.group(3).strip()
+        scope, span = alias_scope(code, declared.start()), declared.span()
+        plain = re.fullmatch(r"(?:[a-z_]+::)*(Query|Json|Bytes)\s*(<.*>)?", target)
+        if plain and re.sub(r"\s", "", parameters) == re.sub(r"\s", "", plain.group(2) or ""):
+            found.append((scope, span, r"(?<![\w:])%s\b" % name, plain.group(1)))
+        elif plain and not parameters:
+            found.append((scope, span, r"(?<![\w:])%s\b(?!\s*<)" % name, target))
+        elif re.search(EXTRACTOR_LIKE, target):
+            found.append((scope, span, name, None))
+    return found
+
+
+def resolve_aliases(source: str) -> str:
+    """`source` with each alias in `alias_declarations` replaced in its scope.
+
+    A module-level alias holds in the whole file. One in a block holds only in
+    that block, before or after the statement, as in Rust. Names in comments
+    and literals are not replaced. Newlines stay, so line numbers still point
+    at the source. Every scan reads the result, so no scan keeps its own alias
+    rule.
+    """
+    code = code_only(source)
+    edits: dict[int, tuple[int, str]] = {}
+    for (start, end), (skip_start, skip_end), pattern, replacement in alias_declarations(code):
+        if replacement is None:
+            continue
+        for hit in re.finditer(pattern, code[:end]):
+            if start <= hit.start() and not skip_start <= hit.start() < skip_end:
+                edits.setdefault(hit.start(), (hit.end(), replacement))
+    for position in sorted(edits, reverse=True):
+        stop, replacement = edits[position]
+        source = source[:position] + replacement + source[stop:]
     return source
+
+
+def unreadable_aliases(code: str) -> list[tuple[int, int, str]]:
+    """`(scope start, scope end, name)` for each type alias the audit cannot read."""
+    return [
+        (scope[0], scope[1], pattern)
+        for scope, _, pattern, replacement in alias_declarations(code)
+        if replacement is None
+    ]
 
 
 def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
     """Every finding, by check. `find_struct` maps a struct name to its block."""
     # A rename keeps every line, so line numbers still point at the source.
     lines = source.split("\n")
-    source = canonical_paths(canonical_extractors(source))
+    source = canonical_paths(resolve_aliases(source))
     # Comments and literals are blanked once, at the same length. Every scan
     # reads `code`. Only the route table and the query keys need literals.
     code = masked_source(source)
+    unreadable = unreadable_aliases(code)
     SOURCE[0] = code
     by_route = {(r["method"], r["path"]): r for r in contract["routes"]}
     routes = router_routes(source)
@@ -1978,6 +2008,10 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
         route = by_route.get((method, path))
         if params is None or route is None:
             continue
+        at = code.find("async fn %s(" % handler)
+        for start, end, alias in unreadable:
+            if start <= at < end and re.search(r"(?<![\w:])%s\b" % alias, params):
+                unresolved.append("  %s %s: cannot read the `%s` type alias" % (method, path, alias))
         queries: list[tuple[str, str, bool]] = []
         for query in QUERY_EXTRACTOR.finditer(params):
             name = query.group(1).split("::")[-1]
@@ -2415,6 +2449,10 @@ use serde_json::from_slice as decode;
 use serde_json as json;
 use axum::extract::Query as AxumQuery;
 use axum::{extract::State, Json as AxumJson};
+use bytes::Bytes as RequestBytes;
+
+type ApiQuery<T> = Query<T>;
+type OddQuery<T> = Result<Query<T>, QueryRejection>;
 
 pub fn harvest_api_router() -> Router {
     Router::new()
@@ -2540,6 +2578,10 @@ pub fn harvest_api_router() -> Router {
         .route("/e/matches-macro", post(e_matches_macro))
         .route("/e/unknown-macro", post(e_unknown_macro))
         .route("/e/rebound-match", post(e_rebound_match))
+        .route("/e/local-query-elsewhere", get(e_local_query_elsewhere))
+        .route("/e/renamed-bytes", post(e_renamed_bytes))
+        .route("/e/type-alias-query", get(e_type_alias_query))
+        .route("/e/odd-alias-query", get(e_odd_alias_query))
         .route("/e/json-handoff-unknown", post(e_json_handoff_unknown))
         .route("/e/json-handoff-tolerant", post(e_json_handoff_tolerant))
         .route("/e/raw-nested-argument", post(e_raw_nested_argument))
@@ -3526,6 +3568,27 @@ async fn e_rebound_match(body: Result<Json<Gadget>, JsonRejection>) -> Response 
         Err(_) => Gadget::default(),
     };
     let name = body.name.clone();
+    StatusCode::OK.into_response()
+}
+
+fn local_query_user() {
+    use axum::extract::Query as LocalQuery;
+}
+
+async fn e_local_query_elsewhere(filter: LocalQuery<Cursor>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn e_renamed_bytes(body: RequestBytes) -> Response {
+    let gadget = serde_json::from_slice::<Gadget>(&body).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_type_alias_query(query: ApiQuery<Cursor>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn e_odd_alias_query(query: OddQuery<Cursor>) -> Response {
     StatusCode::OK.into_response()
 }
 
@@ -5516,6 +5579,37 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             )
         ],
         {},
+    ),
+    (
+        "an extractor alias in another function is out of scope",
+        FIXTURE_EDGES,
+        [fixture_route("GET", "/e/local-query-elsewhere", 200, params=[])],
+        {},
+    ),
+    (
+        "an imported alias of Bytes carries the raw body",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/renamed-bytes",
+                200,
+                request_body=body_of(("name", True), required=False),
+            )
+        ],
+        {"body_required": ["POST /e/renamed-bytes: the body is mandatory"]},
+    ),
+    (
+        "a type alias of Query is read, and one the audit cannot read is reported",
+        FIXTURE_EDGES,
+        [
+            fixture_route("GET", "/e/type-alias-query", 200, params=[]),
+            fixture_route("GET", "/e/odd-alias-query", 200, params=[]),
+        ],
+        {
+            "query_params": ["GET /e/type-alias-query: `offset` is accepted by Cursor"],
+            "unresolved": ["GET /e/odd-alias-query: cannot read the `OddQuery` type alias"],
+        },
     ),
     (
         "a helper named in a comment or a string is not called",
