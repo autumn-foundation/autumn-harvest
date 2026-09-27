@@ -45,7 +45,9 @@ Check 5 treats a bare `Json<T>` as mandatory, since axum rejects a request
 without it. A raw-byte parse is mandatory unless an `if` on `.is_empty()` lets
 an empty body skip it. The parse must be inside that `if` or its `else`. An
 earlier `if body.is_empty() { .. }` also counts when its block returns
-`Ok(..)` and no error. Check 2 applies only to a mandatory body.
+`Ok(..)` and no error. A parse that turns its error into a value is optional
+too, such as `.ok()`, `.unwrap_or_default()` or `if let Ok(..)`. Check 2
+applies only to a mandatory body.
 
 Check 4 reads the routes that take a `RawQuery` and parse the pairs by hand. A
 key those parsers match is a parameter the route accepts, so a key the contract
@@ -441,7 +443,7 @@ def block_parses(block: str, carriers: set[str], returns: str) -> list[tuple[str
             continue
         before = block[: hit.start()]
         after = block[opener + len(call) :]
-        guarded = guards(block, hit.start(), root.group(1))
+        guarded = guards(block, hit.start(), root.group(1)) or discards_error(before, after)
         # A body read through an index, a method or a generic type is not
         # something the audit can type, so it is reported.
         if re.sub(r"^&\s*", "", argument) != root.group(1):
@@ -477,6 +479,19 @@ def guards(block: str, position: int, variable: str) -> bool:
         if not test.group(1) and early_return and not re.search(ERROR_TOKENS, taken):
             return True
     return False
+
+
+def discards_error(before: str, after: str) -> bool:
+    """Whether a parse turns its error into a value, so an empty body still runs.
+
+    `.ok()`, `.unwrap_or_default()`, `.unwrap_or(..)` and `.unwrap_or_else(..)`
+    after the call do so. So does `if let Ok(..) =` before it. A `match` that
+    handles `Err` is not read, so it counts as mandatory.
+    """
+    if re.match(r"\s*\.(?:ok|unwrap_or_default|unwrap_or|unwrap_or_else)\s*\(", after):
+        return True
+    tested = r"\b(?:if|while|&&)\s+let\s+Ok\s*\([^()]*\)\s*=\s*(?:serde_json::)?$"
+    return re.search(tested, before) is not None
 
 
 def ends_expression(after: str) -> bool:
@@ -531,10 +546,16 @@ def struct_fields(struct: str) -> list[tuple[str, str, bool, tuple[str, ...]]]:
     all_default = re.search(r"serde\([^)]*\bdefault\b", struct[:opener]) is not None
     fields: list[tuple[str, str, bool, tuple[str, ...]]] = []
     attributes: list[str] = []
+    # An attribute that rustfmt splits over several lines stays open until its
+    # brackets balance.
+    open_attribute = ""
     for line in struct[opener:].split("\n"):
         text = re.sub(r"/\*.*?\*/", "", line).strip()
-        if text.startswith("#["):
-            attributes.append(text)
+        if open_attribute or text.startswith("#["):
+            open_attribute += " " + text
+            if open_attribute.count("[") <= open_attribute.count("]"):
+                attributes.append(open_attribute.strip())
+                open_attribute = ""
             continue
         text = re.sub(r"//.*$", "", text).strip()
         if not text or text in ("{", "}"):
@@ -1001,7 +1022,7 @@ async fn raw_untyped(body: Bytes) -> Response {
 }
 
 async fn raw_value(body: Bytes) -> Response {
-    let value = serde_json::from_slice::<Value>(&body).ok();
+    let value = serde_json::from_slice::<Value>(&body).map_err(reject)?;
     StatusCode::OK.into_response()
 }
 
@@ -1020,7 +1041,7 @@ async fn tagged(Query(query): Query<TaggedQuery>) -> Response {
 }
 
 async fn lost(Query(query): Query<LostQuery>, body: Bytes) -> Response {
-    let widget = serde_json::from_slice::<LostBody>(&body).ok();
+    let widget = serde_json::from_slice::<LostBody>(&body).map_err(reject)?;
     StatusCode::OK.into_response()
 }
 
@@ -1155,6 +1176,10 @@ pub fn harvest_api_router() -> Router {
         .route("/e/aliased", get(e_aliased))
         .route("/e/renamed-all", get(e_renamed_all))
         .route("/e/flattened", post(e_flattened))
+        .route("/e/tolerant-ok", post(e_tolerant_ok))
+        .route("/e/tolerant-default", post(e_tolerant_default))
+        .route("/e/tolerant-if-let", post(e_tolerant_if_let))
+        .route("/e/wrapped-attribute", get(e_wrapped_attribute))
 }
 
 async fn e_wrapped(body: Bytes) -> Response {
@@ -1170,12 +1195,12 @@ async fn e_sliced(body: Bytes) -> Response {
 }
 
 async fn e_vector(body: Bytes) -> Response {
-    let widgets = serde_json::from_slice::<Vec<Gadget>>(&body).ok();
+    let widgets = serde_json::from_slice::<Vec<Gadget>>(&body).map_err(reject)?;
     StatusCode::OK.into_response()
 }
 
 async fn e_crate_bytes(body: bytes::Bytes) -> Response {
-    let widget = serde_json::from_slice::<Gadget>(&body).ok();
+    let widget = serde_json::from_slice::<Gadget>(&body).map_err(reject)?;
     StatusCode::OK.into_response()
 }
 
@@ -1183,13 +1208,13 @@ async fn e_rejects(body: Bytes) -> Response {
     if body.is_empty() {
         return AutumnError::bad_request_msg("a body is required").into_response();
     }
-    let widget = serde_json::from_slice::<Gadget>(&body).ok();
+    let widget = serde_json::from_slice::<Gadget>(&body).map_err(reject)?;
     StatusCode::OK.into_response()
 }
 
 async fn e_logged(body: Bytes) -> Response {
     tracing::debug!(empty = body.is_empty(), "parsing");
-    let widget = serde_json::from_slice::<Gadget>(&body).ok();
+    let widget = serde_json::from_slice::<Gadget>(&body).map_err(reject)?;
     StatusCode::OK.into_response()
 }
 
@@ -1198,7 +1223,7 @@ fn decode_cursor(raw: &[u8]) -> Option<Cursor> {
 }
 
 async fn e_cursor(body: Bytes) -> Response {
-    let widget = serde_json::from_slice::<Gadget>(&body).ok();
+    let widget = serde_json::from_slice::<Gadget>(&body).map_err(reject)?;
     let cursor = decode_cursor(STORED);
     StatusCode::OK.into_response()
 }
@@ -1237,13 +1262,13 @@ async fn e_json_list(Json(body): Json<Vec<Gadget>>) -> Response {
 
 async fn e_negated_log(body: Bytes) -> Response {
     tracing::debug!(has_body = !body.is_empty(), "parsing");
-    let widget = serde_json::from_slice::<Gadget>(&body).ok();
+    let widget = serde_json::from_slice::<Gadget>(&body).map_err(reject)?;
     StatusCode::OK.into_response()
 }
 
 async fn e_sized(body: Bytes) -> Response {
     let size = if body.is_empty() { 0 } else { body.len() };
-    let widget = serde_json::from_slice::<Gadget>(&body).ok();
+    let widget = serde_json::from_slice::<Gadget>(&body).map_err(reject)?;
     StatusCode::OK.into_response()
 }
 
@@ -1251,7 +1276,7 @@ async fn e_helper_reject(body: Bytes) -> Response {
     if body.is_empty() {
         return missing_body();
     }
-    let widget = serde_json::from_slice::<Gadget>(&body).ok();
+    let widget = serde_json::from_slice::<Gadget>(&body).map_err(reject)?;
     StatusCode::OK.into_response()
 }
 
@@ -1267,7 +1292,7 @@ impl Other {
 }
 
 async fn collide(body: Bytes) -> Response {
-    let widget = serde_json::from_slice::<Gadget>(&body).ok();
+    let widget = serde_json::from_slice::<Gadget>(&body).map_err(reject)?;
     StatusCode::OK.into_response()
 }
 
@@ -1283,7 +1308,7 @@ async fn e_negated_if(body: Bytes) -> Response {
     if !body.is_empty() {
         tracing::debug!("a body arrived");
     }
-    let widget = serde_json::from_slice::<Gadget>(&body).ok();
+    let widget = serde_json::from_slice::<Gadget>(&body).map_err(reject)?;
     StatusCode::OK.into_response()
 }
 
@@ -1301,6 +1326,35 @@ async fn e_renamed_all(Query(query): Query<RenamedAll>) -> Response {
 
 async fn e_flattened(Json(body): Json<Flattened>) -> Response {
     StatusCode::OK.into_response()
+}
+
+async fn e_tolerant_ok(body: Bytes) -> Response {
+    let gadget = serde_json::from_slice::<Gadget>(&body).ok();
+    StatusCode::OK.into_response()
+}
+
+async fn e_tolerant_default(body: Bytes) -> Response {
+    let gadget: Gadget = serde_json::from_slice(&body).unwrap_or_default();
+    StatusCode::OK.into_response()
+}
+
+async fn e_tolerant_if_let(body: Bytes) -> Response {
+    if let Ok(gadget) = serde_json::from_slice::<Gadget>(&body) {
+        tracing::debug!(name = %gadget.name, "parsed");
+    }
+    StatusCode::OK.into_response()
+}
+
+async fn e_wrapped_attribute(Query(query): Query<WrappedAttribute>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+struct WrappedAttribute {
+    #[serde(
+        rename = "wire_name",
+        alias = "old_name",
+    )]
+    rust_name: Option<String>,
 }
 
 struct Renamed {
@@ -1865,6 +1919,33 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             "unresolved": [
                 "GET /e/renamed-all: cannot read `rename_all` in RenamedAll",
                 "POST /e/flattened: cannot read `flatten` in Flattened",
+            ]
+        },
+    ),
+    (
+        "a parse that discards its error leaves the body optional",
+        FIXTURE_EDGES,
+        [
+            fixture_route("POST", path, 200, request_body=body_of(("name", False), required=False))
+            for path in ("/e/tolerant-ok", "/e/tolerant-default", "/e/tolerant-if-let")
+        ],
+        {},
+    ),
+    (
+        "a serde attribute over several lines is read",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "GET",
+                "/e/wrapped-attribute",
+                200,
+                params=[query_param("rust_name", "string", False)],
+            )
+        ],
+        {
+            "query_params": [
+                "GET /e/wrapped-attribute: `wire_name` is accepted by WrappedAttribute",
+                "GET /e/wrapped-attribute: `rust_name` is documented but WrappedAttribute",
             ]
         },
     ),
