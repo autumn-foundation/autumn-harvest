@@ -560,16 +560,17 @@ CHAR_LITERAL = re.compile(r"'(?:\\.|[^\\'])'")
 def code_only(block: str, literals: bool = True) -> str:
     """`block` with comments and literals blanked, at the same length.
 
-    A literal keeps its first and last character. With `literals` false, only
-    comments are blanked. Newlines stay, so offsets and line numbers do not
-    change. A block comment can nest, as in Rust.
+    A literal keeps its opening and closing delimiters, such as `b"` and `"`
+    or `r#"` and `"#`, so a second pass leaves masked text unchanged. With
+    `literals` false, only comments are blanked. Newlines stay, so offsets and
+    line numbers do not change. A block comment can nest, as in Rust.
     """
     out = list(block)
 
-    def blank(start: int, stop: int, keep: int) -> int:
-        if keep and not literals:
+    def blank(start: int, stop: int, head: int = 0, tail: int = 0) -> int:
+        if head and not literals:
             return stop
-        for index in range(start + keep, stop - keep):
+        for index in range(start + head, stop - tail):
             if out[index] != "\n":
                 out[index] = " "
         return stop
@@ -580,7 +581,7 @@ def code_only(block: str, literals: bool = True) -> str:
         prefix = STRING_PREFIX.match(block, index)
         if block.startswith("//", index):
             stop = block.find("\n", index)
-            index = blank(index, len(block) if stop < 0 else stop, 0)
+            index = blank(index, len(block) if stop < 0 else stop)
         elif block.startswith("/*", index):
             depth, stop = 0, index
             while stop < len(block):
@@ -592,18 +593,21 @@ def code_only(block: str, literals: bool = True) -> str:
                         break
                 else:
                     stop += 1
-            index = blank(index, min(stop, len(block)), 0)
+            index = blank(index, min(stop, len(block)))
         elif prefix and prefix.group(1) is not None:
             close = block.find('"' + prefix.group(1), prefix.end())
-            stop = len(block) if close < 0 else close + 1 + len(prefix.group(1))
-            index = blank(index, stop, 1)
+            tail = 1 + len(prefix.group(1))
+            stop = len(block) if close < 0 else close + tail
+            index = blank(index, stop, prefix.end() - index, tail if close >= 0 else 0)
         elif char == '"' or prefix:
-            stop = block.index('"', index) + 1
+            opener = block.index('"', index) + 1
+            stop = opener
             while stop < len(block) and block[stop] != '"':
                 stop += 2 if block[stop] == "\\" else 1
-            index = blank(index, min(stop + 1, len(block)), 1)
+            closed = stop < len(block)
+            index = blank(index, min(stop + 1, len(block)), opener - index, 1 if closed else 0)
         elif char == "'" and CHAR_LITERAL.match(block, index):
-            index = blank(index, CHAR_LITERAL.match(block, index).end(), 1)
+            index = blank(index, CHAR_LITERAL.match(block, index).end(), 1, 1)
         elif char.isalnum() or char == "_":
             # A whole word, so `r"` or `b"` inside a name is no literal.
             while index < len(block) and (block[index].isalnum() or block[index] == "_"):
@@ -630,8 +634,8 @@ def raw_body_parses(source: str, handler: str) -> list[tuple[str | None, bool, b
     handler_found = handler_parts(source, handler)
     if handler_found is None:
         return []
-    # A call in a comment or a string is no parse, so neither is read.
-    handler_block = code_only(handler_found[2])
+    # `source` is masked, so a call in a comment or a string is no parse.
+    handler_block = handler_found[2]
     carriers = moved_names(handler_block, byte_parameters(handler_found[0]))
     returns = handler_found[1]
     parses = block_parses(handler_block, carriers, returns)
@@ -639,7 +643,7 @@ def raw_body_parses(source: str, handler: str) -> list[tuple[str | None, bool, b
         parts = function_parts(source, helper)
         if parts is None:
             continue
-        params, returns, block = parts[0], parts[1], code_only(parts[2])
+        params, returns, block = parts
         byte_names = byte_parameters(params)
         states = receiving_parameters(handler_block, helper, params, carriers)
         for name, (optional, tolerant) in states.items():
@@ -650,25 +654,28 @@ def raw_body_parses(source: str, handler: str) -> list[tuple[str | None, bool, b
     return parses
 
 
-def moved_names(block: str, names: set[str]) -> set[str]:
-    """`names` plus each name that a `let` moves one of them into.
+def moved_names(block: str, names: set[str]) -> dict[str, int]:
+    """`names` plus each name that a `let` moves one of them into, with where.
 
-    `let captured = body;` makes `captured` a body too. A copy through a
-    call, such as `body.to_vec()`, is not followed.
+    `let captured = body;` makes `captured` a body too, bound at that `let`.
+    A parameter is bound at -1. A move counts only while its source still
+    holds the body, as `live_binding` reads it. A copy through a call, such
+    as `body.to_vec()`, is not followed.
     """
-    found = set(names)
+    found = {name: -1 for name in names}
     while True:
         moved = {
-            alias.group(1)
-            for name in found
+            alias.group(1): alias.start()
+            for name, bound_at in list(found.items())
             for alias in re.finditer(
                 r"\blet\s+(?:mut\s+)?([a-z_][a-z_0-9]*)\s*(?::[^=;]*)?=\s*%s\s*;" % re.escape(name),
                 block,
             )
+            if alias.group(1) not in found and live_binding(block, name, alias.start(), bound_at)
         }
-        if moved <= found:
+        if not moved:
             return found
-        found |= moved
+        found.update(moved)
 
 
 def split_top_level(text: str) -> list[str]:
@@ -688,7 +695,7 @@ def split_top_level(text: str) -> list[str]:
 
 
 def receiving_parameters(
-    block: str, helper: str, params: str, variables: set[str]
+    block: str, helper: str, params: str, variables: dict[str, int]
 ) -> dict[str, tuple[bool, bool]]:
     """`(optional, tolerant)` for each `helper` parameter that gets a variable.
 
@@ -712,7 +719,12 @@ def receiving_parameters(
         arguments = split_top_level(raw[1:-1].replace("->", ""))
         tolerant = discards_error(block[: call.start()], block[call.end() - 1 + len(raw) :])
         for index, argument in enumerate(arguments):
-            passed = [v for v in variables if re.search(r"\b%s\b" % re.escape(v), argument)]
+            passed = [
+                v
+                for v, bound_at in variables.items()
+                if re.search(r"\b%s\b" % re.escape(v), argument)
+                and live_binding(block, v, call.start(), bound_at)
+            ]
             name = names[index] if index < len(names) else None
             if not passed or not name:
                 continue
@@ -723,9 +735,13 @@ def receiving_parameters(
 
 
 def block_parses(
-    block: str, carriers: set[str], returns: str
+    block: str, carriers: dict[str, int], returns: str
 ) -> list[tuple[str | None, bool, bool]]:
-    """`(type, optional, tolerant)` for each `from_slice` call that reads a carrier."""
+    """`(type, optional, tolerant)` for each `from_slice` call that reads a carrier.
+
+    `carriers` maps each body name to where it was bound. A name that a later
+    `let` gave a new value is no carrier after that `let`.
+    """
     parses: list[tuple[str | None, bool, bool]] = []
     for hit in from_slice_calls(SOURCE[0]).finditer(block):
         turbofish = None
@@ -737,6 +753,8 @@ def block_parses(
         argument = call[1:-1].strip().rstrip(",").strip()
         root = re.match(r"&?\s*([a-z_][a-z_0-9]*)", argument)
         if root is None or root.group(1) not in carriers:
+            continue
+        if not live_binding(block, root.group(1), hit.start(), carriers[root.group(1)]):
             continue
         before = block[: hit.start()]
         after = block[opener + len(call) :]
@@ -769,7 +787,7 @@ def guards(block: str, position: int, variable: str) -> bool:
     body. That is the `else` of `if body.is_empty()`, or the condition or
     block of `if !body.is_empty()` when its `else` does not reject. A plain
     `if body.is_empty() { .. }` before the parse also counts when its block
-    returns a success that `SUCCESS_EXIT` matches, and no error. Any other use, such as a
+    returns a success, as `success_value` reads it, and no error. Any other use, such as a
     log field, is no guard.
     """
     pattern = r"\bif\s+(!\s*)?%s\.is_empty\(\)" % re.escape(variable)
@@ -802,7 +820,7 @@ def guards(block: str, position: int, variable: str) -> bool:
             return True
         # An early return counts only for a parse after the whole `if`. A
         # parse inside the empty-body arm runs before that return.
-        early_return = re.search(r"\breturn\s+(?:%s)" % SUCCESS_EXIT, unconditional(taken))
+        early_return = returns_success(unconditional(taken))
         after_if = position >= end and same_scope(block, test.start(), position)
         if not test.group(1) and after_if and early_return and not re.search(ERROR_TOKENS, taken):
             return True
@@ -835,20 +853,14 @@ def error_rejects(
     `rejects_result_body` gives the forms it reads. A move into another name,
     such as `let captured = body;`, is followed. A pattern can read the
     extractor by value, borrowed, or through `as_ref()` or `as_mut()`.
-    Comments and literals are masked, so a call in them is no use. A later
-    `let` that gives `name` a new value ends the extractor. `bound_at` is where
-    a move created `name`, so that `let` is no such end.
+    `block` has its comments and literals masked, so a call in them is no use.
+    A later `let` that gives `name` a new value ends the extractor, as
+    `live_binding` reads it. `bound_at` is where a move created `name`.
     """
-    if not seen:
-        block = masked_source(block)
     variable = re.escape(name)
-    shadows = [(start, end) for start, end in shadowing_lets(block, name) if start > bound_at]
 
     def live(position: int) -> bool:
-        """Whether `name` at `position` is still the extractor, not a new binding."""
-        return not any(
-            end <= position and same_scope(block, start, position) for start, end in shadows
-        )
+        return live_binding(block, name, position, bound_at)
 
     moved = r"\blet\s+(?:mut\s+)?([a-z_][a-z_0-9]*)\s*(?::[^=;]*)?=\s*%s\s*;" % variable
     for alias in re.finditer(moved, block):
@@ -908,6 +920,21 @@ def error_rejects(
     return False
 
 
+def live_binding(block: str, name: str, position: int, bound_at: int = -1) -> bool:
+    """Whether `name` at `position` still holds the value bound at `bound_at`.
+
+    `bound_at` is where a `let` created `name`, or -1 for a parameter. A later
+    `let` that gives `name` a new value ends it for the rest of that scope, as
+    `shadowing_lets` reads it. The Result-extractor scan and the raw-body
+    carriers both ask this.
+    """
+    return not any(
+        bound_at < start and end <= position and same_scope(block, start, position)
+        for start, end in shadowing_lets(block, name)
+    )
+
+
+@functools.lru_cache(maxsize=None)
 def shadowing_lets(block: str, name: str) -> list[tuple[int, int]]:
     """`(start, end)` of each `let <name> = ..;` that makes `name` a new value.
 
@@ -972,7 +999,7 @@ def error_exits_before(block: str, variable: str, read: str, position: int) -> b
         taken = balanced(block[test.end() - 1 :], "{", "}")
         if test.end() - 1 + len(taken) > position or not same_scope(block, test.start(), position):
             continue
-        exits = re.search(r"\breturn\s+(?:%s)" % SUCCESS_EXIT, unconditional(taken))
+        exits = returns_success(unconditional(taken))
         if exits and not rejecting_exit(taken):
             return True
     return False
@@ -982,14 +1009,14 @@ def rejecting_exit(block: str) -> bool:
     """Whether a fallback block rejects the request.
 
     It rejects when it builds an error, panics, or returns anything other
-    than a success that `SUCCESS_EXIT` matches. A 4xx or 5xx `StatusCode` is an error
+    than a success, as `success_value` reads it. A 4xx or 5xx `StatusCode` is an error
     token, so it rejects. It also rejects when its value is a call to a helper
     that can build a rejection, as `builds_rejection` reads it.
     """
     if re.search(ERROR_TOKENS + r"|\b(?:panic|unreachable|todo)!", block):
         return True
     for returned in re.findall(r"\breturn\b\s*([^;}]*)", block):
-        if not re.match(SUCCESS_EXIT, returned.strip()):
+        if not success_value(returned):
             return True
     return builds_rejection(closure_value(block))
 
@@ -1161,6 +1188,25 @@ def fallback_rejects(method: str, arguments: str, state: str = "result") -> bool
         return False
     passed = r"\b[A-Za-z_][\w:]*\s*\(\s*&?\s*%s\b" % re.escape(bound)
     return rejecting_arm(body, bound) or re.search(passed, body) is not None
+
+
+def success_value(value: str) -> bool:
+    """Whether an exit value is a success, not a rejection.
+
+    A value that `SUCCESS_EXIT` matches is a success. Any other value is a
+    success only when it is a helper call that `builds_rejection` rejects as
+    a rejection, such as a helper that returns a bare `Json<T>`. Every exit is
+    read through this one rule.
+    """
+    value = value.strip()
+    if re.match(SUCCESS_EXIT, value):
+        return True
+    return re.match(FREE_CALL, value) is not None and not builds_rejection(value)
+
+
+def returns_success(block: str) -> bool:
+    """Whether a `return` in `block` gives a success, as `success_value` reads it."""
+    return any(success_value(value) for value in re.findall(r"\breturn\b\s*([^;}]*)", block))
 
 
 def builds_rejection(value: str) -> bool:
@@ -1535,29 +1581,35 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
     # A rename keeps every line, so line numbers still point at the source.
     lines = source.split("\n")
     source = canonical_paths(canonical_extractors(source))
-    SOURCE[0] = source
+    # Comments and literals are blanked once, at the same length. Every scan
+    # reads `code`. Only the route table and the query keys need literals.
+    code = masked_source(source)
+    SOURCE[0] = code
     by_route = {(r["method"], r["path"]): r for r in contract["routes"]}
     routes = router_routes(source)
 
     findings: list[str] = []
     query_findings: list[str] = []
     for method, path, handler in routes:
-        body = handler_body(source, handler)
+        body = handler_body(code, handler)
         route = by_route.get((method, path))
         if body is None or route is None:
             continue
         declared = declared_statuses(route)
 
+        helpers = called_helpers(code, body)
         bodies = [body]
-        for helper in called_helpers(source, body):
-            reached = function_body(source, helper)
+        for helper in helpers:
+            reached = function_body(code, helper)
             if reached is not None:
                 bodies.append(reached)
 
-        params = handler_parameters(source, handler)
+        params = handler_parameters(code, handler)
         if params is not None and "RawQuery" in params:
             documented = {entry["name"] for entry in route.get("params", [])}
-            for reached in bodies:
+            # A query key is a string literal, so these blocks keep literals.
+            keyed = [handler_body(source, handler), *(function_body(source, h) for h in helpers)]
+            for reached in filter(None, keyed):
                 for arm in key_arms(reached):
                     if set(arm) & documented:
                         continue
@@ -1567,27 +1619,25 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
                     )
 
         for reached in bodies:
-            offset = source.index(reached)
-            # A status in a comment or a string is never returned.
-            code = masked_source(reached)
-            for hit in re.finditer(r"(.{0,30})StatusCode::([A-Z_]+)", code):
+            offset = code.index(reached)
+            for hit in re.finditer(r"(.{0,30})StatusCode::([A-Z_]+)", reached):
                 status = NAMED.get(hit.group(2))
                 if status is None or status in declared:
                     continue
                 if "==" in hit.group(1) or "!=" in hit.group(1):
                     continue
-                line = source[: offset + hit.start()].count("\n") + 1
+                line = code[: offset + hit.start()].count("\n") + 1
                 findings.append(
                     "  %s %s returns %d, undeclared\n    api.rs:%d  %s"
                     % (method, path, status, line, lines[line - 1].strip()[:88])
                 )
-            for hit in re.finditer(r"AutumnError::([a-z_]+)\(", code):
+            for hit in re.finditer(r"AutumnError::([a-z_]+)\(", reached):
                 status = AUTUMN_ERROR_STATUS.get(hit.group(1))
                 if status is None or status in declared:
                     continue
-                if overridden_by_with_status(code, hit.end() - 1):
+                if overridden_by_with_status(reached, hit.end() - 1):
                     continue
-                line = source[: offset + hit.start()].count("\n") + 1
+                line = code[: offset + hit.start()].count("\n") + 1
                 findings.append(
                     "  %s %s returns %d via AutumnError::%s, undeclared\n"
                     "    api.rs:%d  %s"
@@ -1603,11 +1653,11 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
             # A constructor passed bare, e.g. `.map_err(AutumnError::bad_request_msg)`,
             # names no call and so cannot chain `.with_status(..)`: its status is
             # always the constructor's own.
-            for hit in re.finditer(r"AutumnError::([a-z_]+)\)", code):
+            for hit in re.finditer(r"AutumnError::([a-z_]+)\)", reached):
                 status = AUTUMN_ERROR_STATUS.get(hit.group(1))
                 if status is None or status in declared:
                     continue
-                line = source[: offset + hit.start()].count("\n") + 1
+                line = code[: offset + hit.start()].count("\n") + 1
                 findings.append(
                     "  %s %s returns %d via AutumnError::%s (bare fn ref), "
                     "undeclared\n    api.rs:%d  %s"
@@ -1629,7 +1679,8 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
     missing = "  %s %s: cannot find struct %s"
     unread = "  %s %s: cannot read `%s` in %s"
     for method, path, handler in routes:
-        params = handler_parameters(source, handler)
+        params = handler_parameters(code, handler)
+        block = handler_body(code, handler) or ""
         route = by_route.get((method, path))
         if params is None or route is None:
             continue
@@ -1644,7 +1695,7 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
             result = re.search(
                 r"\b([a-z_][a-z_0-9]*)\s*:\s*(?:[a-z_]+::)*Result<\s*(?:[a-z_]+::)*$", prefix
             )
-            if result and not error_rejects(result.group(1), handler_body(source, handler) or ""):
+            if result and not error_rejects(result.group(1), block):
                 wrapped = True
             struct = find_struct(name)
             if struct is None:
@@ -1675,7 +1726,7 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
         # (struct name, whether the body is mandatory) for each parse.
         parses: list[tuple[str, bool]] = []
         body_type = extractor.group(1).split("::")[-1] if extractor else None
-        result_rejects = rejects_result_body(params, handler_body(source, handler) or "")
+        result_rejects = rejects_result_body(params, block)
         option_body = bool(extractor) and extractor.re.pattern.startswith("Option<")
         if body_type is not None and body_type != "Value":
             # A present `Option<Json<T>>` body is still parsed strictly, so its
@@ -1683,7 +1734,7 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
             parses.append((body_type, bool(bare) or result_rejects or option_body))
         mandatory_body = bool(bare) or result_rejects
         if byte_parameters(params):
-            for name, optional, tolerant in raw_body_parses(source, handler):
+            for name, optional, tolerant in raw_body_parses(code, handler):
                 # A parse an empty body cannot skip makes the body mandatory,
                 # whatever its type. A parse that does not tolerate its error
                 # needs the mandatory fields of any body that is present.
@@ -2184,6 +2235,9 @@ pub fn harvest_api_router() -> Router {
         .route("/e/json-tail-result", post(e_json_tail_result))
         .route("/e/json-return-map", post(e_json_return_map))
         .route("/e/json-shadowed", post(e_json_shadowed))
+        .route("/e/json-default-guard", post(e_json_default_guard))
+        .route("/e/raw-shadowed", post(e_raw_shadowed))
+        .route("/e/helper-in-comment", get(e_helper_in_comment))
         .route("/e/json-std-err", post(e_json_std_err))
         .route("/e/json-core-err", post(e_json_core_err))
         .route("/e/qualified-option-body", post(e_qualified_option_body))
@@ -3013,6 +3067,29 @@ async fn e_json_shadowed(body: Result<Json<Gadget>, JsonRejection>) -> Response 
     let body = Some(value);
     let gadget = body.unwrap();
     StatusCode::OK.into_response()
+}
+
+async fn e_json_default_guard(body: Result<Json<Gadget>, JsonRejection>) -> Json<Gadget> {
+    if body.is_err() {
+        return default_json();
+    }
+    body.unwrap()
+}
+
+async fn e_raw_shadowed(body: Bytes) -> Response {
+    let body = b"{}";
+    let gadget = serde_json::from_slice::<Gadget>(&body).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_helper_in_comment() -> Response {
+    // teapot() is not called here.
+    let note = "teapot() is not called either";
+    StatusCode::OK.into_response()
+}
+
+fn teapot() -> Response {
+    StatusCode::IM_A_TEAPOT.into_response()
 }
 
 async fn e_json_std_err(body: Result<Json<Gadget>, JsonRejection>) -> Response {
@@ -4821,6 +4898,38 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
                 request_body=body_of(("name", False), required=False),
             )
         ],
+        {},
+    ),
+    (
+        "an is_err guard that returns a helper's success value recovers",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/json-default-guard",
+                200,
+                request_body=body_of(("name", False), required=False),
+            )
+        ],
+        {},
+    ),
+    (
+        "a shadowed raw-body name is no request body",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/raw-shadowed",
+                200,
+                request_body=body_of(("name", False), required=False),
+            )
+        ],
+        {},
+    ),
+    (
+        "a helper named in a comment or a string is not called",
+        FIXTURE_EDGES,
+        [fixture_route("GET", "/e/helper-in-comment", 200)],
         {},
     ),
     (
