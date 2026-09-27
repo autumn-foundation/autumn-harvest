@@ -318,7 +318,7 @@ def defined_functions(source: str) -> dict[str, int]:
 
 def called_helpers(source: str, body: str) -> list[str]:
     """Functions defined in this file that the given body calls."""
-    names = set(re.findall(r"\b([a-z_][a-z_0-9]{3,})\s*\(", body))
+    names = set(re.findall(r"\b([a-z_][a-z_0-9]*)\s*\(", body))
     return sorted((names - GENERIC_HELPERS) & defined_functions(source).keys())
 
 
@@ -497,9 +497,10 @@ FREE_CALL = r"(?:return\s+)?([a-z_][a-z_0-9]*)\s*\("
 # The `ref` and `mut` markers a pattern binding can carry, as in `ref failed`.
 BINDING = r"(?:ref\s+)?(?:mut\s+)?"
 
-# A return type that can carry a rejection rather than a plain value. A bare
-# `Json<T>` is always sent as 200, so it is a success, not a rejection.
-RESPONSE_TYPE = r"Response|Rejection|Error|StatusCode|Result|\("
+# A return type that can carry a rejection rather than a plain value. A type
+# name matches whole or by suffix, so `ApiError` matches and `ResponseConfig`
+# does not. A bare `Json<T>` is always sent as 200, so it is a success.
+RESPONSE_TYPE = r"\w*(?:Response|Rejection|Error)\b|\b(?:StatusCode|Result)\b|\("
 
 # The source that `audit` reads, so a helper can be looked up by name.
 SOURCE = [""]
@@ -556,15 +557,18 @@ STRING_PREFIX = re.compile(r'b?r(#*)"|b"')
 CHAR_LITERAL = re.compile(r"'(?:\\.|[^\\'])'")
 
 
-def code_only(block: str) -> str:
+def code_only(block: str, literals: bool = True) -> str:
     """`block` with comments and literals blanked, at the same length.
 
-    A literal keeps its first and last character. Newlines stay, so offsets
-    and line numbers do not change. A block comment can nest, as in Rust.
+    A literal keeps its first and last character. With `literals` false, only
+    comments are blanked. Newlines stay, so offsets and line numbers do not
+    change. A block comment can nest, as in Rust.
     """
     out = list(block)
 
     def blank(start: int, stop: int, keep: int) -> int:
+        if keep and not literals:
+            return stop
         for index in range(start + keep, stop - keep):
             if out[index] != "\n":
                 out[index] = " "
@@ -1331,6 +1335,8 @@ def struct_fields(struct: str) -> list[tuple[str, str, bool, tuple[str, ...]]]:
     container attributes. A container `#[serde(default)]` makes every field
     optional.
     """
+    # A block comment can nest or span lines, so comments are masked first.
+    struct = code_only(struct, literals=False)
     opener = struct.index("{")
     container = without_comment_lines(struct[:opener])
     all_default = re.search(r"serde\([^)]*\bdefault\b", container) is not None
@@ -2116,6 +2122,10 @@ pub fn harvest_api_router() -> Router {
         .route("/e/commented-unwrap", post(e_commented_unwrap))
         .route("/e/ref-catch-all", post(e_ref_catch_all))
         .route("/e/ref-err-handed", post(e_ref_err_handed))
+        .route("/e/nested-struct-comment", post(e_nested_struct_comment))
+        .route("/e/short-helper", post(e_short_helper))
+        .route("/e/response-config", post(e_response_config))
+        .route("/e/suffix-error", post(e_suffix_error))
 }
 
 async fn e_wrapped(body: Bytes) -> Response {
@@ -3137,6 +3147,40 @@ async fn e_ref_err_handed(body: Result<Json<Gadget>, JsonRejection>) -> Response
     }
 }
 
+async fn e_nested_struct_comment(Json(haunted): Json<Haunted>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn e_short_helper(body: Bytes) -> Response {
+    let gadget = match dec(&body) {
+        Ok(gadget) => gadget,
+        Err(response) => return response,
+    };
+    StatusCode::OK.into_response()
+}
+
+fn dec(body: &Bytes) -> Result<Gadget, Response> {
+    serde_json::from_slice::<Gadget>(body).map_err(|_| StatusCode::BAD_REQUEST.into_response())
+}
+
+async fn e_response_config(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    let gadget = body.map(|Json(gadget)| gadget).unwrap_or_else(|_| default_response_config());
+    StatusCode::OK.into_response()
+}
+
+fn default_response_config() -> ResponseConfig {
+    ResponseConfig::default()
+}
+
+async fn e_suffix_error(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    let gadget = body.map(|Json(gadget)| gadget).unwrap_or_else(|_| gadget_error());
+    StatusCode::OK.into_response()
+}
+
+fn gadget_error() -> GadgetError {
+    GadgetError::default()
+}
+
 fn invalid_body() -> Response {
     rejection_response()
 }
@@ -3189,6 +3233,14 @@ struct Flattened {
 
 struct Gadget {
     name: String,
+}
+
+struct Haunted {
+    name: String,
+    /* outer /* nested */ ghost: String, */
+    /*
+    phantom: String,
+    */
 }
 
 struct Cursor {
@@ -4913,6 +4965,50 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             for path in ("/e/closure-return-value", "/e/commented-unwrap", "/e/ref-err-handed")
         ],
         {},
+    ),
+    (
+        "a nested or multi-line block comment in a struct hides its fields",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/nested-struct-comment",
+                200,
+                request_body=body_of(("name", True)),
+            )
+        ],
+        {},
+    ),
+    (
+        "a helper with a short name is followed",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/short-helper",
+                200,
+                request_body=body_of(),
+                error_responses=[{"status": 400}],
+            )
+        ],
+        {
+            "mandatory": ["POST /e/short-helper: `name` is mandatory in Gadget"],
+            "undocumented": ["POST /e/short-helper: `name` is accepted by Gadget"],
+        },
+    ),
+    (
+        "a return type matches by whole name or suffix, not by substring",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                path,
+                200,
+                request_body=body_of(("name", True), required=False),
+            )
+            for path in ("/e/response-config", "/e/suffix-error")
+        ],
+        {"body_required": ["POST /e/suffix-error: the body is mandatory"]},
     ),
     (
         "a malformed contract entry does not crash the audit",
