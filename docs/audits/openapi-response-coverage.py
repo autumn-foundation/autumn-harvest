@@ -126,7 +126,9 @@ a `from_slice` call it cannot read, a body type it cannot resolve, a
 find. A generic struct such as `struct Q<'a>` is one it cannot find.
 
 A helper called by bare name is found as a free function, so an earlier method
-of the same name does not hide it. A handler is found from its `async fn`
+of the same name does not hide it. `Type::f` and `x.f` reach methods, and a
+struct path such as `module::S` picks the struct in that module. A name the
+audit cannot pin to one definition fails closed. A handler is found from its `async fn`
 line, so an earlier fn of the same name does not hide it. Comments in a
 parameter list are removed before any read.
 
@@ -297,35 +299,101 @@ def handler_body(source: str, name: str) -> str | None:
 
 
 def function_body(source: str, name: str) -> str | None:
-    """The block of a free function, async or not, generic or not."""
+    """The block of the free function a bare call to `name` reaches."""
     parts = function_parts(source, name)
     return parts[2] if parts else None
 
 
-@functools.lru_cache(maxsize=None)
-def defined_functions(source: str) -> dict[str, int]:
-    """Where each function in the source is defined, by name.
+# The path segments that name a crate root, not a module. A reference through
+# one of them is read like a bare name.
+CRATE_ROOTS = frozenset({"crate", "self", "super", "autumn_harvest", "autumn_harvest_plugin"})
 
-    A free function at the start of a line wins over an indented method of the
-    same name, since a call by bare name reaches the free function. A name
-    with no free function falls back to its first definition.
+
+def block_owners(source: str, keyword: str) -> list[tuple[int, int, str]]:
+    """`(start, end, name)` for each `impl`, `trait` or `mod` block in `source`.
+
+    For `impl`, the name is the type the block is for, as in `impl Trait for
+    Type` or `impl<T> Type<T>`. For `trait` and `mod`, it is the declared name.
     """
-    free: dict[str, int] = {}
-    first: dict[str, int] = {}
+    found = []
+    for head in re.finditer(r"\b%s\b" % keyword, source):
+        brace = source.find("{", head.end())
+        stop = source.find(";", head.end())
+        if brace < 0 or 0 <= stop < brace:
+            continue
+        header = source[head.end() : brace]
+        if keyword == "impl":
+            header = re.sub(r"^\s*<[^{]*?>", "", header)
+            header = header.split(" for ", 1)[-1]
+            header = re.sub(r"\bwhere\b.*", "", header, flags=re.S)
+        name = re.match(r"\s*&?\s*(?:dyn\s+)?(?:[A-Za-z_]\w*\s*::\s*)*([A-Za-z_]\w*)", header)
+        if name:
+            found.append((brace, brace + len(balanced(source[brace:], "{", "}")), name.group(1)))
+    return found
+
+
+def owner_at(owners: list[tuple[int, int, str]], position: int) -> str | None:
+    """The innermost owner block that holds `position`, or `None`."""
+    holding = [(start, name) for start, end, name in owners if start < position < end]
+    return max(holding)[1] if holding else None
+
+
+@functools.lru_cache(maxsize=None)
+def function_index(source: str) -> dict[str, list[tuple[int, str | None]]]:
+    """Every definition of each function in `source`: `(start, owner)` by name.
+
+    The owner is the type of the `impl` block or the name of the `trait` that
+    holds the definition, or `None` for a free function. Every fn lookup in
+    the audit reads this one index through `resolve_function`.
+    """
+    owners = block_owners(source, "impl") + block_owners(source, "trait")
+    index: dict[str, list[tuple[int, str | None]]] = {}
     for found in re.finditer(r"\b(?:async )?fn ([A-Za-z_][A-Za-z_0-9]*)\s*[(<]", source):
-        name = found.group(1)
-        first.setdefault(name, found.start())
-        line_start = source.rfind("\n", 0, found.start()) + 1
-        prefix = source[line_start : found.start()]
-        if re.fullmatch(r"(?:pub(?:\([^)]*\))?\s+)?(?:const\s+)?(?:unsafe\s+)?", prefix):
-            free.setdefault(name, found.start())
-    return {**first, **free}
+        index.setdefault(found.group(1), []).append((found.start(), owner_at(owners, found.start())))
+    return index
 
 
-def called_helpers(source: str, body: str) -> list[str]:
-    """Functions defined in this file that the given body calls."""
-    names = set(re.findall(r"\b([a-z_][a-z_0-9]*)\s*\(", body))
-    return sorted((names - GENERIC_HELPERS) & defined_functions(source).keys())
+def resolve_function(source: str, name: str, qualifier: str | None = None) -> list[int]:
+    """Every definition of `name` that a call with this `qualifier` can reach.
+
+    `qualifier` is `None` for a bare call, `"."` for a method call, or the path
+    before the name, as in `Decoder::`. A bare call reaches a free function. A
+    method call reaches any method of that name. A type path reaches that
+    type's methods only. `Self` reaches any method, and a module path any free
+    function. A caller treats more than one result as ambiguous.
+    """
+    definitions = function_index(source).get(name, [])
+    if qualifier is None:
+        return [start for start, owner in definitions if owner is None]
+    if qualifier.strip() == ".":
+        return [start for start, owner in definitions if owner is not None]
+    segments = [
+        re.sub(r"\s*<.*", "", part).strip() for part in qualifier.split("::") if part.strip()
+    ]
+    segments = [part for part in segments if part not in CRATE_ROOTS]
+    last = segments[-1] if segments else None
+    if last is None or last[0].islower():
+        return [start for start, owner in definitions if owner is None]
+    if last == "Self":
+        return [start for start, owner in definitions if owner is not None]
+    return [start for start, owner in definitions if owner == last]
+
+
+def called_helpers(source: str, body: str) -> list[int]:
+    """Where each function in this file that `body` calls is defined.
+
+    Every call is read: bare, path-qualified and method calls. A call that
+    can reach more than one definition reads all of them, so no status a
+    helper can return is dropped.
+    """
+    starts: set[int] = set()
+    for call in re.finditer(FREE_CALL_NAME, body):
+        if call.group(1) not in GENERIC_HELPERS | NOT_CALLS:
+            starts.update(resolve_function(source, call.group(1)))
+    for call in re.finditer(QUALIFIED_CALL, body):
+        if call.group(2) not in GENERIC_HELPERS:
+            starts.update(resolve_function(source, call.group(2), call.group(1)))
+    return sorted(starts)
 
 
 def handler_parameters(source: str, name: str) -> str | None:
@@ -334,22 +402,60 @@ def handler_parameters(source: str, name: str) -> str | None:
     return parts[0] if parts else None
 
 
-def struct_body(name: str) -> str | None:
-    """The block of `struct <name> { .. }`, from either crate."""
-    return defined_structs().get(name)
+def struct_body(reference: str) -> str | None:
+    """The block of the struct `reference` names, from either crate."""
+    return resolve_struct(defined_structs(), reference)
+
+
+def struct_index(source: str, module: str = "") -> dict[str, list[tuple[str, str]]]:
+    """Every struct in `source`: `(module path, block)` by bare name.
+
+    `module` is the path of the file itself. An inline `mod name { .. }` adds
+    its name to the path of each struct inside it.
+    """
+    code = code_only(source)
+    modules = block_owners(code, "mod")
+    index: dict[str, list[tuple[str, str]]] = {}
+    for found in re.finditer(r"\bstruct ([A-Za-z_][A-Za-z_0-9]*)\s*\{", code):
+        inline = [name for start, end, name in sorted(modules) if start < found.start() < end]
+        path = "::".join(part for part in [module, *inline] if part)
+        index.setdefault(found.group(1), []).append((path, struct_text(source, found)))
+    return index
 
 
 @functools.lru_cache(maxsize=None)
-def defined_structs() -> dict[str, str]:
-    """The first block of each struct in either crate, by name."""
-    blocks: dict[str, str] = {}
+def defined_structs() -> dict[str, list[tuple[str, str]]]:
+    """Every struct in either crate, as `struct_index` reads it, by bare name.
+
+    A file's module path comes from its place under `src`, so `src/a/b.rs`
+    and `src/a/b/mod.rs` are `a::b`, and `lib.rs` and `main.rs` are the root.
+    """
+    index: dict[str, list[tuple[str, str]]] = {}
     for crate in CRATES:
-        for path in sorted((ROOT / crate / "src").rglob("*.rs")):
-            source = path.read_text()
-            for found in re.finditer(r"\bstruct ([A-Za-z_][A-Za-z_0-9]*)\s*\{", source):
-                if found.group(1) not in blocks:
-                    blocks[found.group(1)] = struct_text(source, found)
-    return blocks
+        root = ROOT / crate / "src"
+        for path in sorted(root.rglob("*.rs")):
+            parts = list(path.relative_to(root).with_suffix("").parts)
+            if parts[-1] in ("mod", "lib", "main"):
+                parts = parts[:-1]
+            for name, found in struct_index(path.read_text(), "::".join(parts)).items():
+                index.setdefault(name, []).extend(found)
+    return index
+
+
+def resolve_struct(index: dict[str, list[tuple[str, str]]], reference: str) -> str | None:
+    """The block of the one struct `reference` names, or `None`.
+
+    A qualified reference, such as `module_b::Filter`, keeps only the structs
+    whose module path ends in that module. A crate root such as `crate` or
+    `autumn_harvest` is no module. More than one match, or none, is `None`, so
+    the audit reports the struct and fails closed.
+    """
+    segments = [part.strip() for part in reference.split("::") if part.strip()]
+    qualifier = [part for part in segments[:-1] if part not in CRATE_ROOTS]
+    found = index.get(segments[-1], []) if segments else []
+    if qualifier:
+        found = [(path, block) for path, block in found if path.split("::")[-1] == qualifier[-1]]
+    return found[0][1] if len(found) == 1 else None
 
 
 def struct_text(source: str, found: re.Match) -> str:
@@ -431,17 +537,21 @@ def serde_items(attributes: str) -> list[SerdeItem]:
     return items
 
 
-def struct_layout(struct: str) -> tuple[list[SerdeItem], list[tuple[str, str, list[SerdeItem]]]]:
-    """The container serde items, and `(name, type, serde items)` for each field.
+def struct_layout(
+    struct: str,
+) -> tuple[list[SerdeItem], list[tuple[str, str, list[SerdeItem], str | None]]]:
+    """The container serde items, and each field's name, type, items and alias.
 
     Comments are removed first. An attribute or a type that rustfmt splits
-    over several lines stays open until its brackets balance. Every serde
-    reader in the audit reads a struct through this one parse.
+    over several lines stays open until its brackets balance. Each field type
+    is read through `resolve_field_type`, and the last value is the alias it
+    could not read, or `None`. Every serde reader in the audit reads a struct
+    through this one parse.
     """
     struct = canonical_paths(code_only(struct, literals=False))
     opener = struct.index("{")
     container = serde_items(without_comment_lines(struct[:opener]))
-    fields: list[tuple[str, str, list[SerdeItem]]] = []
+    fields: list[tuple[str, str, list[SerdeItem], str | None]] = []
     attributes: list[str] = []
     open_attribute = open_field = ""
     for line in struct[opener:].split("\n"):
@@ -463,7 +573,8 @@ def struct_layout(struct: str) -> tuple[list[SerdeItem], list[tuple[str, str, li
         text = re.sub(r"\s*,\s*([>)])", r"\1", re.sub(r"([<(])\s+", r"\1", text))
         field = re.match(r"(?:pub(?:\([^)]*\))?\s+)?(?:r#)?([a-z_0-9]+)\s*:\s*(.+?),?$", text)
         if field:
-            fields.append((field.group(1), field.group(2), serde_items(" ".join(attributes))))
+            resolved, unread = resolve_field_type(field.group(2))
+            fields.append((field.group(1), resolved, serde_items(" ".join(attributes)), unread))
         attributes = []
     return container, fields
 
@@ -482,8 +593,10 @@ def unreadable_serde(struct: str) -> list[str]:
     for key, form, _ in container:
         if key not in LAYOUT_KEEPING or key == "rename" and form != "=":
             found.add(key + "(..)" if form == "(" else key)
-    for _, declared_type, items in fields:
+    for _, declared_type, items, unread in fields:
         found |= unreadable_field_serde(items, declared_type)
+        if unread:
+            found.add(unread)
     return sorted(found)
 
 
@@ -634,14 +747,78 @@ RESPONSE_TYPE = r"\w*(?:Response|Rejection|Error)\b|\b(?:StatusCode|Result)\b|\(
 # The source that `audit` reads, so a helper can be looked up by name.
 SOURCE = [""]
 
+# The type aliases the audited structs can use, by name: `(parameters, target)`.
+# `audit` sets it, from the fixture source or from both crates.
+TYPE_ALIASES: list[dict[str, tuple[list[str], str]]] = [{}]
+
+
+def type_aliases_in(source: str) -> dict[str, tuple[list[str], str]]:
+    """Each `type Name<P, ..> = Target;` in `source`: `(parameters, target)`."""
+    found = {}
+    for alias in re.finditer(r"\btype\s+([A-Z]\w*)\s*(?:<([^=;]*)>)?\s*=\s*([^;]+);", code_only(source)):
+        parameters = [part.strip() for part in split_expression(alias.group(2) or "", ",", types=True)]
+        found[alias.group(1)] = (parameters, alias.group(3).strip())
+    return found
+
+
+@functools.lru_cache(maxsize=None)
+def crate_type_aliases() -> dict[str, tuple[list[str], str]]:
+    """The type aliases of both crates, as `type_aliases_in` reads them."""
+    found: dict[str, tuple[list[str], str]] = {}
+    for crate in CRATES:
+        for path in sorted((ROOT / crate / "src").rglob("*.rs")):
+            for name, alias in type_aliases_in(path.read_text()).items():
+                # Two different aliases of one name cannot be told apart, so
+                # the name is left unresolvable, and a field that uses it is
+                # unreadable.
+                found[name] = alias if found.get(name, alias) == alias else (["?"], "?")
+    return found
+
+
+def resolve_field_type(declared_type: str) -> tuple[str, str | None]:
+    """A field type with its type aliases resolved, and an alias it cannot read.
+
+    A no-parameter alias is replaced by its target. An alias whose target is
+    the same type applied to the same parameters, such as `type Maybe<T> =
+    Option<T>`, is a rename. The passes repeat up to `ALIAS_PASSES`. Any other
+    alias, or a chain that does not settle, is returned by name, so the field
+    is unreadable. A field spelled through an alias is never read as a
+    required non-`Option` by mistake.
+    """
+    aliases = TYPE_ALIASES[0]
+    for _ in range(ALIAS_PASSES):
+        head = re.fullmatch(r"\s*(?:[A-Za-z_]\w*\s*::\s*)*([A-Z]\w*)\s*(?:<(.*)>)?\s*", declared_type)
+        if head is None or head.group(1) not in aliases:
+            return declared_type, None
+        parameters, target = aliases[head.group(1)]
+        arguments = [part.strip() for part in split_expression(head.group(2) or "", ",", types=True)]
+        if not parameters and not arguments:
+            declared_type = target
+            continue
+        renamed = re.fullmatch(r"\s*([A-Za-z_][\w:]*)\s*<(.*)>\s*", target)
+        inner = split_expression(renamed.group(2), ",", types=True) if renamed else []
+        if renamed and [part.strip() for part in inner] == parameters and len(arguments) == len(parameters):
+            declared_type = "%s<%s>" % (renamed.group(1), ", ".join(arguments))
+            continue
+        return declared_type, head.group(1)
+    head = re.match(r"\s*(?:[A-Za-z_]\w*\s*::\s*)*([A-Za-z_]\w*)", declared_type)
+    return declared_type, head.group(1) if head else declared_type
+
 # A `Json` extractor, bare or with a path such as `axum::Json`.
 JSON = r"(?:[a-z_]+::)*Json"
 
 
-def function_parts(source: str, name: str) -> tuple[str, str, str] | None:
-    """The parameter list, return clause and block of a free function."""
-    start = defined_functions(source).get(name)
-    return None if start is None else parts_at(source, start)
+def function_parts(
+    source: str, name: str, qualifier: str | None = None
+) -> tuple[str, str, str] | None:
+    """The parameter list, return clause and block of the function a call reaches.
+
+    `resolve_function` reads the call. `None` means the audit cannot find the
+    function, or cannot tell which of several it is, so the caller fails
+    closed.
+    """
+    starts = resolve_function(source, name, qualifier)
+    return parts_at(source, starts[0]) if len(starts) == 1 else None
 
 
 def parts_at(source: str, start: int) -> tuple[str, str, str] | None:
@@ -934,11 +1111,17 @@ def handoffs(
     # the same file, as an associated fn or an impl method. It gets only a
     # direct argument, so a receiver such as `body.as_ref()` is no handoff.
     qualified = {call.group(2) for call in re.finditer(QUALIFIED_CALL, block) if handoff_path(call)}
+    paths = {
+        (call.group(2), re.sub(r"\s", "", call.group(1)))
+        for call in re.finditer(QUALIFIED_CALL, block)
+        if handoff_path(call)
+    }
     for helper in sorted(qualified - GENERIC_HELPERS):
-        parts = function_parts(source, helper)
-        params = parts[0] if parts else ""
-        states = receiving_parameters(block, helper, params, carriers, qualified=True)
-        found += [(helper, parts, name, o, t) for name, (o, t) in states.items()]
+        for path in sorted(p for name, p in paths if name == helper):
+            parts = function_parts(source, helper, path.rstrip(":") + "::" if path != "." else ".")
+            params = parts[0] if parts else ""
+            states = receiving_parameters(block, helper, params, carriers, qualified=path)
+            found += [(helper, parts, name, o, t) for name, (o, t) in states.items()]
     return found
 
 
@@ -959,7 +1142,7 @@ def handoff_path(call: re.Match) -> bool:
 
 
 def receiving_parameters(
-    block: str, helper: str, params: str, variables: dict[str, int], qualified: bool = False
+    block: str, helper: str, params: str, variables: dict[str, int], qualified: str | None = None
 ) -> dict[str | None, tuple[bool, bool]]:
     """`(optional, tolerant)` for each `helper` parameter that gets a variable.
 
@@ -969,9 +1152,10 @@ def receiving_parameters(
     turns the error into a value. It is tolerant when every such call turns
     the error into a value. A variable counts only outside every inner call
     of its argument, as `outside_calls` reads it. An argument with no named
-    parameter maps to `None`. With `qualified`, the calls read are the
-    path-qualified and method calls of `helper`, and a variable counts only as
-    a direct argument: `body`, `&body`, `&mut body` or `body.clone()`.
+    parameter maps to `None`. With `qualified`, the calls read are the calls of
+    `helper` through that path, or `.` for a method call, and a variable
+    counts only as a direct argument: `body`, `&body`, `&mut body` or
+    `body.clone()`.
     """
     # A pattern such as `Extension(state): ..` keeps its slot with no name, so
     # the parameters after it keep their positions.
@@ -986,7 +1170,9 @@ def receiving_parameters(
         calls = [
             call
             for call in re.finditer(QUALIFIED_CALL, block)
-            if call.group(2) == helper and handoff_path(call)
+            if call.group(2) == helper
+            and handoff_path(call)
+            and re.sub(r"\s", "", call.group(1)) == qualified
         ]
     else:
         calls = list(re.finditer(r"(?<![\w.:])%s%s\s*\(" % (re.escape(helper), TURBOFISH), block))
@@ -1905,17 +2091,17 @@ def parse_type(turbofish: str | None, before: str, after: str, returns: str) -> 
     call ends its expression, since a `.map(..)` after it yields another type.
     """
     if turbofish:
-        return turbofish.split("::")[-1]
+        return turbofish
     if not ends_expression(after):
         return None
     statement = before[before.rfind(";") + 1 :]
     binding = re.search(r"\blet\s+(?:mut\s+)?[a-z_0-9]+\s*:\s*([A-Za-z0-9_:]+)\s*=", statement)
     if binding:
-        return binding.group(1).split("::")[-1]
+        return binding.group(1)
     if re.search(r"\blet\b", statement):
         return None
     result = re.search(r"->\s*Result<\s*([A-Za-z0-9_:]+)\s*,", returns)
-    return result.group(1).split("::")[-1] if result else None
+    return result.group(1) if result else None
 
 
 def struct_fields(struct: str) -> list[tuple[str, str, bool, tuple[str, ...]]]:
@@ -1929,7 +2115,7 @@ def struct_fields(struct: str) -> list[tuple[str, str, bool, tuple[str, ...]]]:
     container, layout = struct_layout(struct)
     all_default = any(key == "default" for key, _, _ in container)
     fields: list[tuple[str, str, bool, tuple[str, ...]]] = []
-    for name, declared_type, items in layout:
+    for name, declared_type, items, _ in layout:
         keys = {key for key, _, _ in items}
         if keys & {"skip", "skip_deserializing"}:
             continue
@@ -2232,6 +2418,7 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
     code = masked_source(source)
     unreadable = unreadable_aliases(code) + [(0, len(code), name) for name in unsettled]
     SOURCE[0] = code
+    TYPE_ALIASES[0] = getattr(find_struct, "aliases", None) or crate_type_aliases()
     by_route = {(r["method"], r["path"]): r for r in contract["routes"]}
     routes = router_routes(source)
 
@@ -2247,15 +2434,16 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
         helpers = called_helpers(code, body)
         bodies = [body]
         for helper in helpers:
-            reached = function_body(code, helper)
+            reached = parts_at(code, helper)
             if reached is not None:
-                bodies.append(reached)
+                bodies.append(reached[2])
 
         params = handler_parameters(code, handler)
         if params is not None and "RawQuery" in params:
             documented = {entry["name"] for entry in route.get("params", [])}
             # A query key is a string literal, so these blocks keep literals.
-            keyed = [handler_body(source, handler), *(function_body(source, h) for h in helpers)]
+            keyed = [handler_body(source, handler)]
+            keyed += [parts[2] for parts in map(lambda at: parts_at(source, at), helpers) if parts]
             for reached in filter(None, keyed):
                 for arm in key_arms(reached):
                     if set(arm) & documented:
@@ -2337,7 +2525,8 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
                 unresolved.append("  %s %s: cannot read the `%s` type alias" % (method, path, alias))
         queries: list[tuple[str, str, bool]] = []
         for query in QUERY_EXTRACTOR.finditer(params):
-            name = query.group(1).split("::")[-1]
+            reference = query.group(1)
+            name = reference.split("::")[-1]
             # An absent query string turns `Option<Query<T>>` into `None`, so
             # none of its fields is mandatory.
             # A `Result<Query<T>, _>` whose error the handler tolerates acts the same.
@@ -2348,7 +2537,7 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
             )
             if result and not error_rejects(result.group(1), block):
                 wrapped = True
-            struct = find_struct(name)
+            struct = find_struct(reference)
             if struct is None:
                 unresolved.append(missing % (method, path, name))
             elif unreadable_serde(struct):
@@ -2376,10 +2565,10 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
             unresolved.append("  %s %s: cannot read a `Json<..>` extractor" % (method, path))
         # (struct name, whether the body is mandatory) for each parse.
         parses: list[tuple[str, bool]] = []
-        body_type = extractor.group(1).split("::")[-1] if extractor else None
+        body_type = extractor.group(1) if extractor else None
         result_rejects = rejects_result_body(params, block)
         option_body = bool(extractor) and extractor.re.pattern.startswith("Option<")
-        if body_type is not None and body_type != "Value":
+        if body_type is not None and body_type.split("::")[-1] != "Value":
             # A present `Option<Json<T>>` body is still parsed strictly, so its
             # mandatory fields are checked. A tolerant `Result` body is not.
             parses.append((body_type, bool(bare) or result_rejects or option_body))
@@ -2395,7 +2584,7 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
                         "  %s %s: cannot read a `from_slice` call or resolve its "
                         "body type" % (method, path)
                     )
-                elif name != "Value":
+                elif name.split("::")[-1] != "Value":
                     parses.append((name, not tolerant))
 
         request_body = route.get("request_body") or {}
@@ -2408,8 +2597,9 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
             field.get("name"): field.get("required", False)
             for field in request_body.get("fields", []) or []
         }
-        for name, mandatory in parses:
-            struct = find_struct(name)
+        for reference, mandatory in parses:
+            name = reference.split("::")[-1]
+            struct = find_struct(reference)
             if struct is None:
                 unresolved.append(missing % (method, path, name))
                 continue
@@ -2542,10 +2732,12 @@ struct CreateThing {
 def fixture_struct(source: str):
     """A `find_struct` that reads structs from the fixture source only."""
 
-    def find(name: str) -> str | None:
-        found = re.search(r"\bstruct %s\s*\{" % re.escape(name), source)
-        return struct_text(source, found) if found else None
+    index = struct_index(source)
 
+    def find(reference: str) -> str | None:
+        return resolve_struct(index, reference)
+
+    find.aliases = type_aliases_in(source)
     return find
 
 
@@ -2789,6 +2981,93 @@ async fn c_long_chain(query: Link10<Cursor>) -> Response {
 
 struct Cursor {
     offset: Option<u32>,
+}
+"""
+
+
+# Names with more than one definition: structs in two modules, and methods
+# of the same name on two types.
+FIXTURE_NAMES = r"""
+type Maybe<T> = Option<T>;
+type MaybeTags = Option<Vec<String>>;
+type Loose<T> = Option<Vec<T>>;
+
+pub fn harvest_api_router() -> Router {
+    Router::new()
+        .route("/n/qualified-struct", get(n_qualified_struct))
+        .route("/n/ambiguous-struct", get(n_ambiguous_struct))
+        .route("/n/lenient-decoder", post(n_lenient_decoder))
+        .route("/n/strict-decoder", post(n_strict_decoder))
+        .route("/n/ambiguous-method", post(n_ambiguous_method))
+        .route("/n/maybe-fields", post(n_maybe_fields))
+        .route("/n/loose-field", post(n_loose_field))
+}
+
+mod module_a {
+    struct Filter {
+        wanted: u32,
+    }
+}
+
+mod module_b {
+    struct Filter {
+        wanted: Option<u32>,
+    }
+}
+
+async fn n_qualified_struct(Query(filter): Query<module_b::Filter>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn n_ambiguous_struct(Query(filter): Query<Filter>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+impl StrictDecoder {
+    fn decode(raw: &[u8]) -> Response {
+        let gadget = serde_json::from_slice::<Gadget>(raw).unwrap();
+        StatusCode::OK.into_response()
+    }
+}
+
+impl LenientDecoder {
+    fn decode(raw: &[u8]) -> Response {
+        StatusCode::OK.into_response()
+    }
+}
+
+async fn n_lenient_decoder(body: Bytes) -> Response {
+    LenientDecoder::decode(&body)
+}
+
+async fn n_strict_decoder(body: Bytes) -> Response {
+    StrictDecoder::decode(&body)
+}
+
+async fn n_ambiguous_method(body: Bytes, decoder: Decoder) -> Response {
+    decoder.decode(&body)
+}
+
+async fn n_maybe_fields(Json(body): Json<MaybeFields>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn n_loose_field(Json(body): Json<LooseField>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+struct Gadget {
+    name: String,
+}
+
+struct MaybeFields {
+    name: String,
+    note: Maybe<String>,
+    tags: MaybeTags,
+}
+
+struct LooseField {
+    tags: Loose<String>,
 }
 """
 
@@ -3094,7 +3373,7 @@ async fn e_shapes(Query(query): Query<Shapes>) -> Response {
     StatusCode::OK.into_response()
 }
 
-async fn e_json_path(axum::Json(body): axum::Json<crate::model::Gadget>) -> Response {
+async fn e_json_path(axum::Json(body): axum::Json<crate::Gadget>) -> Response {
     StatusCode::OK.into_response()
 }
 
@@ -4223,7 +4502,7 @@ async fn e_unknown_helper(body: Bytes) -> Response {
 }
 
 async fn e_uuid_bytes(body: Bytes) -> Response {
-    let id = Uuid::from_slice(&body);
+    let id = Uuid::from_slice(&body[..16]);
     StatusCode::OK.into_response()
 }
 
@@ -4265,11 +4544,11 @@ async fn e_match_mut(mut body: Result<Json<Gadget>, JsonRejection>) -> Response 
 }
 
 async fn e_await_default(body: Bytes) -> Response {
-    let gadget = parse_gadget(&body).await.unwrap_or_default();
+    let gadget = parse_gadget_async(&body).await.unwrap_or_default();
     StatusCode::OK.into_response()
 }
 
-async fn parse_gadget(body: &Bytes) -> Result<Gadget, serde_json::Error> {
+async fn parse_gadget_async(body: &Bytes) -> Result<Gadget, serde_json::Error> {
     serde_json::from_slice(body)
 }
 
@@ -6396,6 +6675,72 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
                 "POST /e/raw-unknown-associated: cannot read a `from_slice` call",
             ],
         },
+    ),
+    (
+        "a qualified struct picks its module, and an ambiguous bare name fails closed",
+        FIXTURE_NAMES,
+        [
+            fixture_route(
+                "GET",
+                "/n/qualified-struct",
+                200,
+                params=[query_param("wanted", "integer", False)],
+            ),
+            fixture_route(
+                "GET",
+                "/n/ambiguous-struct",
+                200,
+                params=[query_param("wanted", "integer", False)],
+            ),
+        ],
+        {"unresolved": ["GET /n/ambiguous-struct: cannot find struct Filter"]},
+    ),
+    (
+        "a qualified method picks its impl type, and an ambiguous method fails closed",
+        FIXTURE_NAMES,
+        [
+            fixture_route(
+                "POST",
+                "/n/lenient-decoder",
+                200,
+                request_body=body_of(("name", False), required=False),
+            ),
+            fixture_route(
+                "POST",
+                "/n/strict-decoder",
+                200,
+                request_body=body_of(("name", True), required=False),
+            ),
+            fixture_route(
+                "POST",
+                "/n/ambiguous-method",
+                200,
+                request_body=body_of(("name", False), required=False),
+            ),
+        ],
+        {
+            "body_required": [
+                "POST /n/strict-decoder: the body is mandatory",
+                "POST /n/ambiguous-method: the body is mandatory",
+            ],
+            "unresolved": ["POST /n/ambiguous-method: cannot read a `from_slice` call"],
+        },
+    ),
+    (
+        "an alias of Option makes a field optional, and an alias the audit cannot read is reported",
+        FIXTURE_NAMES,
+        [
+            fixture_route(
+                "POST",
+                "/n/maybe-fields",
+                200,
+                request_body=body_of(("name", True), ("note", False), ("tags", False)),
+            ),
+            fixture_route(
+                "POST", "/n/loose-field", 200, request_body=body_of(("tags", False))
+            ),
+        ],
+        {"unresolved": ["POST /n/loose-field: cannot read `Loose` in LooseField"]},
     ),
     (
         "a helper named in a comment or a string is not called",
