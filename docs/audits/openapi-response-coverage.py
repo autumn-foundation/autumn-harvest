@@ -48,7 +48,9 @@ free-form, so checks 2 and 3 skip it. Check 5 still reads it.
 Check 5 treats a bare `Json<T>` as mandatory, since axum rejects a request
 without it. A `Result<Json<T>, _>` is mandatory when the handler rejects its
 error, through `?`, `.map_err(..)?`, or an `Err` arm that builds an error or
-returns the rejection it binds. A catch-all `_` arm counts as an `Err` arm, and
+returns the rejection it binds. An `Err` arm that returns a helper rejects,
+unless it hands its error to that helper. Such a helper can recover the request,
+as the start route does (#808). A catch-all `_` arm counts as an `Err` arm, and
 so does an `if let Err(..)` block. An `if` on `.is_err()` or `.is_ok()` counts
 when its failing branch rejects. A raw-byte parse is mandatory unless an `if` on
 `.is_empty()` lets an empty body skip it. The parse must be in the arm that runs
@@ -60,10 +62,11 @@ its error into a value is optional too, such as `.ok()`, `.unwrap_or_default()`
 or an `if let Ok(..)` whose `else` does not reject. A `match` on the parse is
 optional when it has an `Err` or catch-all arm and no such arm rejects. A
 fallback that rejects the error, such as `.map_or_else(|e| reject(e), ..)`,
-keeps the parse mandatory. A guard or a tolerant call at a helper call site
-carries into the helper. Check 2 applies to every parse that does not tolerate
-its error, since a body that is present must then carry the mandatory fields. A
-bare `Json<T>` and a rejecting `Result<Json<T>, _>` are such parses.
+keeps the parse mandatory. An `.or_else(..)` whose fallback always returns
+`Ok(..)` makes a later `?` tolerant. A guard or a tolerant call at a helper call
+site carries into the helper. Check 2 applies to every parse that does not
+tolerate its error, since a body that is present must then carry the mandatory
+fields. A bare `Json<T>` and a rejecting `Result<Json<T>, _>` are such parses.
 
 Check 4 reads the routes that take a `RawQuery` and parse the pairs by hand. A
 key those parsers match is a parameter the route accepts, so a key the contract
@@ -684,7 +687,7 @@ def error_rejects(name: str, block: str) -> bool:
     for match in re.finditer(scrutinee, block):
         arms = balanced(block[match.end() - 1 :], "{", "}")
         for failure in error_arms(arms):
-            if rejecting_arm(match_arm(arms, failure.start()), failure.group(1)):
+            if arm_rejects(match_arm(arms, failure.start()), failure.group(1)):
                 return True
     for binding in re.finditer(r"\blet\s+Ok\s*\(.*?\)\s*=\s*%s\s+else\s*\{" % variable, block):
         otherwise = balanced(block[binding.end() - 1 :], "{", "}")
@@ -718,6 +721,22 @@ def rejecting_exit(block: str) -> bool:
         if not re.match(r"Ok\s*\(|StatusCode::(?:%s)\b" % SUCCESS_NAMES, returned.strip()):
             return True
     return False
+
+
+def arm_rejects(arm: str, bound: str | None) -> bool:
+    """Whether an arm that receives an extractor error rejects the request.
+
+    It rejects as `rejecting_arm` reads it. It also rejects when it exits as
+    `rejecting_exit` reads it, unless it hands the error it binds to a helper.
+    Such a helper can recover the request, as the start route does (#808).
+    """
+    if rejecting_arm(arm, bound):
+        return True
+    if bound is not None and bound != "_":
+        handed = r"\b[A-Za-z_][\w:]*\s*\([^;]*\b%s\b" % re.escape(bound)
+        if re.search(handed, arm):
+            return False
+    return rejecting_exit(arm)
 
 
 def rejecting_arm(arm: str, bound: str | None) -> bool:
@@ -770,8 +789,10 @@ def chain_state(after: str) -> str:
     through `.ok_or(..)` or `.ok_or_else(..)`, and to a plain value through an
     `.unwrap_or*` call. A `?`, `.unwrap()` or `.expect(..)` on a `Result` or an
     `Option` stops the handler, so the chain is `"reject"`. An inspection such
-    as `.is_ok()` also yields a plain value. A chain that ends
-    on an `Option` or a value is `"tolerate"`. One that ends on a `Result` is
+    as `.is_ok()` also yields a plain value. An `.or(..)` or `.or_else(..)`
+    whose fallback always returns `Ok(..)` recovers the `Result`, so a later
+    `?` cannot reject. A chain that ends on an `Option`, a value or a recovered
+    `Result` is `"tolerate"`. One that ends on a `Result` is
     `"open"`, since the code after it decides. Other methods carry the error
     on.
     """
@@ -788,14 +809,25 @@ def walk_chain(after: str) -> tuple[str, str | None, str]:
     rest = after
     while True:
         rest = rest.lstrip()
+        # A `Result` that `or_else` has recovered holds no error, so `?` on it
+        # cannot reject.
+        if rest.startswith("?") and state == "recovered":
+            state, rest = "value", rest[1:]
+            continue
         if rest.startswith("?"):
             return "reject", inspection, rest
         call = re.match(r"\.\s*([a-z_][a-z_0-9]*)\s*\(", rest)
         if call is None:
             return ("open" if state == "result" else "tolerate"), inspection, rest
         method = call.group(1)
-        if method in ("unwrap", "expect") and state != "value":
+        if method in ("unwrap", "expect") and state not in ("value", "recovered"):
             return "reject", inspection, rest
+        if method in ("or", "or_else") and state == "result":
+            fallback = balanced(rest[call.end() - 1 :])
+            if re.search(r"\bOk\s*(?:::<[^()]*>\s*)?\(", fallback) and not re.search(
+                ERROR_TOKENS + r"|\b(?:panic|unreachable|todo)!|\?", fallback
+            ):
+                state = "recovered"
         if method == "ok" and state == "result":
             state = "option"
         elif method in ("ok_or", "ok_or_else") and state == "option":
@@ -1739,6 +1771,10 @@ pub fn harvest_api_router() -> Router {
         .route("/e/named-json", post(e_named_json))
         .route("/e/status-early-return", post(e_status_early_return))
         .route("/e/at-binding", post(e_at_binding))
+        .route("/e/json-helper-exit", post(e_json_helper_exit))
+        .route("/e/json-or-else", post(e_json_or_else))
+        .route("/e/raw-or-else", post(e_raw_or_else))
+        .route("/e/raw-or-else-err", post(e_raw_or_else_err))
 }
 
 async fn e_wrapped(body: Bytes) -> Response {
@@ -2437,6 +2473,29 @@ async fn e_at_binding(body: Result<Json<Gadget>, JsonRejection>) -> Response {
         Ok(Json(gadget)) => accept(gadget),
         error @ Err(_) => StatusCode::BAD_REQUEST.into_response(),
     }
+}
+
+async fn e_json_helper_exit(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    let gadget = match body {
+        Ok(Json(gadget)) => gadget,
+        Err(_) => return invalid_body(),
+    };
+    StatusCode::OK.into_response()
+}
+
+async fn e_json_or_else(body: Result<Json<Gadget>, JsonRejection>) -> Result<Response, Response> {
+    let Json(gadget) = body.or_else(|_| Ok::<_, JsonRejection>(Json(Gadget::default())))?;
+    Ok(StatusCode::OK.into_response())
+}
+
+async fn e_raw_or_else(body: Bytes) -> Result<Response, Response> {
+    let gadget = serde_json::from_slice::<Gadget>(&body).or_else(|_| Ok(Gadget::default()))?;
+    Ok(StatusCode::OK.into_response())
+}
+
+async fn e_raw_or_else_err(body: Bytes) -> Result<Response, Response> {
+    let gadget = serde_json::from_slice::<Gadget>(&body).or_else(|e| Err(reject(e)))?;
+    Ok(StatusCode::OK.into_response())
 }
 
 async fn e_documented(Query(query): Query<Documented>) -> Response {
@@ -3780,6 +3839,41 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             )
         ],
         {},
+    ),
+    (
+        "an Err arm that returns a helper not given the error rejects",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/json-helper-exit",
+                200,
+                request_body=body_of(("name", True), required=False),
+            )
+        ],
+        {"body_required": ["POST /e/json-helper-exit: the body is mandatory"]},
+    ),
+    (
+        "an or_else that always recovers makes a later ? tolerant",
+        FIXTURE_EDGES,
+        [
+            fixture_route("POST", path, 200, request_body=body_of(("name", False), required=False))
+            for path in ("/e/json-or-else", "/e/raw-or-else")
+        ],
+        {},
+    ),
+    (
+        "an or_else that can still fail leaves a later ? rejecting",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/raw-or-else-err",
+                200,
+                request_body=body_of(("name", True), required=False),
+            )
+        ],
+        {"body_required": ["POST /e/raw-or-else-err: the body is mandatory"]},
     ),
     (
         "a malformed contract entry does not crash the audit",
