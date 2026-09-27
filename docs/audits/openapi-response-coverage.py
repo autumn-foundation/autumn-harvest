@@ -1109,8 +1109,13 @@ def carrier_parses(
             parses.append((None, optional or guarded, tolerant or discarded))
             continue
         params, helper_returns, helper_block = parts
-        # A method that gets the body as its receiver reads it as `self`.
-        if name != "self" and name not in byte_parameters(params) or (helper, name) in path:
+        if (helper, name) in path:
+            continue
+        # A method that gets the body as its receiver reads it as `self`. A
+        # body handed to a parameter of another type cannot be followed, so
+        # it is an unresolved parse.
+        if name != "self" and name not in byte_parameters(params):
+            parses.append((None, optional or guarded, tolerant or discarded))
             continue
         if len(path) >= HELPER_DEPTH:
             parses.append((None, optional or guarded, tolerant or discarded))
@@ -1266,15 +1271,46 @@ def argument_root(argument: str) -> tuple[str | None, bool]:
     return (head.group(1), False) if head and head.group(1) != "mut" else (None, False)
 
 
-def outside_calls(argument: str) -> str:
+# Reads of a carrier that yield a plain value, not the carrier: a length, a
+# test or one element. `helper(body.len())` hands `helper` no body.
+SCALAR_READS = frozenset(
+    {
+        "len", "is_empty", "starts_with", "ends_with", "contains", "first", "last", "get",
+        "capacity", "is_ok", "is_err", "is_ok_and", "is_err_and", "is_some", "is_none",
+    }
+)
+
+
+def argument_passes(argument: str, variable: str) -> str | None:
+    """How a call argument hands on `variable`: `"direct"`, `"wrapped"` or `None`.
+
+    It is direct when the whole argument, borrows stripped, is the variable,
+    as `argument_root` reads it. It is wrapped when the variable appears
+    anywhere else in it, as in a struct literal, a tuple, an array, a
+    closure or a macro, except inside the argument list of an inner call,
+    which is its own handoff, or as the receiver of one of `SCALAR_READS`.
+    A wrapped handoff cannot be followed, so the caller fails closed.
+    """
+    if argument_root(argument) == (variable, True):
+        return "direct"
+    visible = outside_calls(argument, macros=False)
+    for found in re.finditer(r"(?<![.\w])%s\b" % re.escape(variable), visible):
+        read = re.match(r"\s*\.\s*([a-z_]\w*)\s*\(", visible[found.end() :])
+        if read is None or read.group(1) not in SCALAR_READS:
+            return "wrapped"
+    return None
+
+
+def outside_calls(argument: str, macros: bool = True) -> str:
     """`argument` with the argument list of each call in it blanked.
 
     A name inside `normalize(body)` is passed to `normalize`, not to the call
     that receives its result, so only a name outside every inner call is
-    passed on. A receiver such as `body` in `body.as_ref()` stays.
+    passed on. A receiver such as `body` in `body.as_ref()` stays. With
+    `macros` false, a macro's arguments stay, since a macro is no call.
     """
     out = argument
-    for call in re.finditer(r"[\w!>]\s*\(", argument):
+    for call in re.finditer(r"[\w!>]\s*\(" if macros else r"[\w>]\s*\(", argument):
         opener = call.end() - 1
         inner = balanced(argument[opener:])
         out = out[: opener + 1] + " " * (len(inner) - 2) + out[opener + len(inner) - 1 :]
@@ -1420,12 +1456,11 @@ def receiving_parameters(
     skipped, since a call does not pass it in the argument list. A parameter
     is optional when every call that fills it is guarded by `.is_empty()` or
     turns the error into a value. It is tolerant when every such call turns
-    the error into a value. A variable counts only outside every inner call
-    of its argument, as `outside_calls` reads it. An argument with no named
-    parameter maps to `None`. With `qualified`, the calls read are the calls of
-    `helper` through that path, or `.` for a method call, and a variable
-    counts only as a direct argument: `body`, `&body`, `&mut body` or
-    `body.clone()`. With `at`, only the call that starts there is read.
+    the error into a value. `argument_passes` decides how an argument hands
+    a variable on. A wrapped one, and an argument with no named parameter,
+    map to `None`, so the caller fails closed. With `qualified`, the calls
+    read are the calls of `helper` through that path, or `.` for a method
+    call. With `at`, only the call that starts there is read.
     """
     # A pattern such as `Extension(state): ..` keeps its slot with no name, so
     # the parameters after it keep their positions.
@@ -1453,19 +1488,17 @@ def receiving_parameters(
         arguments = split_top_level(raw[1:-1].replace("->", ""))
         tolerant = discards_error(block[: call.start()], block[call.end() - 1 + len(raw) :])
         for index, argument in enumerate(arguments):
-            passed = [
-                v
-                for v, bound_at in variables.items()
-                if (
-                    argument_root(argument) == (v, True)
-                    if qualified
-                    else re.search(r"(?<![.\w])%s\b" % re.escape(v), outside_calls(argument))
-                )
-                and live_binding(block, v, call.start(), bound_at)
+            live = [
+                v for v, bound in variables.items() if live_binding(block, v, call.start(), bound)
             ]
+            ways = {v: argument_passes(argument, v) for v in live}
+            passed = [v for v, way in ways.items() if way]
             name = names[index] if index < len(names) else None
             if not passed:
                 continue
+            # A wrapped carrier reaches no parameter the audit can follow.
+            if any(way == "wrapped" for way in ways.values()):
+                name = None
             guarded = any(guards(block, call.start(), variable) for variable in passed)
             was_optional, was_tolerant = states.get(name, (True, True))
             states[name] = (was_optional and (guarded or tolerant), was_tolerant and tolerant)
@@ -2609,9 +2642,10 @@ def alias_declarations(code: str) -> list[tuple[tuple[int, int], tuple[int, int]
 
     It reads `use .. as ..` for `Query`, `Json`, `Bytes` and serde_json's
     `from_slice`, a module alias of `serde_json`, a plain or glob import of
-    `from_slice`, and `type X<..> = Y<..>;`. A type alias to one of those
-    types with the same parameters is a rename. One with no parameters is
-    replaced by its target. Any other type alias that names an extractor has
+    `from_slice`, and `type X<..> = Y<..>;`. An import or a local item that
+    binds an extractor's name to something else shadows it in its scope. A
+    type alias to one of those types with the same parameters is a rename.
+    One with no parameters is replaced by its target. Any other type alias that names an extractor has
     no replacement (`None`), so the audit reports it.
     """
     found = []
@@ -2638,6 +2672,18 @@ def alias_declarations(code: str) -> list[tuple[tuple[int, int], tuple[int, int]
             elif path in ("serde_json::from_slice", "serde_json::*") and not alias:
                 pattern = r"(?<![\w:.])from_slice%s" % call
                 found.append((scope, span, pattern, ALIAS_TARGETS["from_slice"]))
+    # A local item named like an extractor shadows it in its scope, as an
+    # untrusted import does. A `type` alias that renames the extractor to its
+    # own name is no shadow.
+    item = r"\b(struct|enum|trait|union|type)\s+(Query|Json|Bytes)\b"
+    for local in re.finditer(item, code):
+        if local.group(1) == "type":
+            target = re.match(r"\s*(<[^=;]*?>)?\s*=\s*([^;]+);", code[local.end() :])
+            if target and re.fullmatch(r"%s\s*(<.*>)?" % local.group(2), target.group(2).strip()):
+                continue
+        scope = alias_scope(code, local.start())
+        span = (local.start(), local.end())
+        found.append((scope, span, r"(?<![\w:.])%s\b" % local.group(2), "self::" + local.group(2)))
     for declared in re.finditer(r"\btype\s+([A-Z]\w*)\s*(<[^=;]*?>)?\s*=\s*([^;]+);", code):
         name, parameters, target = declared.group(1), declared.group(2) or "", declared.group(3).strip()
         scope, span = alias_scope(code, declared.start()), declared.span()
@@ -3360,6 +3406,39 @@ struct Cursor {
 """
 
 
+# Local items named like extractors: a module-level struct, and a type alias
+# inside a fn.
+FIXTURE_LOCAL_ITEMS = r"""
+struct Query<T>(T);
+
+fn helper() {
+    type Json<T> = Vec<T>;
+}
+
+pub fn harvest_api_router() -> Router {
+    Router::new()
+        .route("/l/local-query", get(l_local_query))
+        .route("/l/fn-local-json", post(l_fn_local_json))
+}
+
+async fn l_local_query(Query(filter): Query<Cursor>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn l_fn_local_json(Json(body): Json<Gadget>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+struct Cursor {
+    offset: Option<u32>,
+}
+
+struct Gadget {
+    name: String,
+}
+"""
+
+
 # A plain import of an unrelated `Query`, and a glob from an unknown module.
 FIXTURE_IMPORTS = r"""
 use crate::signed::Query;
@@ -3773,6 +3852,9 @@ pub fn harvest_api_router() -> Router {
         .route("/e/raw-std-reader", post(e_raw_std_reader))
         .route("/e/extension-decode", post(e_extension_decode))
         .route("/e/nested-or-inspection", post(e_nested_or_inspection))
+        .route("/e/wrapped-carrier", post(e_wrapped_carrier))
+        .route("/e/nonbyte-param", post(e_nonbyte_param))
+        .route("/e/scalar-read-argument", post(e_scalar_read_argument))
         .route("/e/mut-borrow-parse", post(e_mut_borrow_parse))
         .route("/e/partial-slice-parse", post(e_partial_slice_parse))
         .route("/e/signed-type-alias", get(e_signed_type_alias))
@@ -4976,6 +5058,30 @@ async fn e_signed_type_alias(query: SignedQuery<Cursor>) -> Response {
     StatusCode::OK.into_response()
 }
 
+struct Envelope {
+    bytes: Bytes,
+}
+
+fn decode_envelope(envelope: Envelope) -> Response {
+    StatusCode::OK.into_response()
+}
+
+fn record_size(size: usize) {}
+
+async fn e_wrapped_carrier(body: Bytes) -> Response {
+    decode_envelope(Envelope { bytes: body })
+}
+
+async fn e_nonbyte_param(body: Bytes) -> Response {
+    record_size(body);
+    StatusCode::OK.into_response()
+}
+
+async fn e_scalar_read_argument(body: Bytes) -> Response {
+    record_size(body.len());
+    StatusCode::OK.into_response()
+}
+
 async fn e_nested_or_inspection(body: Result<Json<Gadget>, JsonRejection>) -> Response {
     if body.is_ok() && (feature_on() || fallback_on()) {
         StatusCode::OK.into_response()
@@ -5116,7 +5222,8 @@ async fn e_unknown_helper(body: Bytes) -> Response {
 }
 
 async fn e_uuid_bytes(body: Bytes) -> Response {
-    let id = Uuid::from_slice(&body[..16]);
+    let id_bytes = [0u8; 16];
+    let id = Uuid::from_slice(&id_bytes);
     StatusCode::OK.into_response()
 }
 
@@ -7415,6 +7522,15 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
         {"unresolved": ["POST /n/loose-field: cannot read `Loose` in LooseField"]},
     ),
     (
+        "a local item named like an extractor shadows it in its scope only",
+        FIXTURE_LOCAL_ITEMS,
+        [
+            fixture_route("GET", "/l/local-query", 200, params=[]),
+            fixture_route("POST", "/l/fn-local-json", 200, request_body=body_of(("name", False))),
+        ],
+        {"mandatory": ["POST /l/fn-local-json: `name` is mandatory in Gadget"]},
+    ),
+    (
         "a plain import binds its name, and a glob from an unknown module fails closed",
         FIXTURE_IMPORTS,
         [
@@ -7543,6 +7659,26 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
         FIXTURE_EDGES,
         [fixture_route("GET", "/e/signed-type-alias", 200, params=[])],
         {},
+    ),
+    (
+        "a wrapped carrier or one sent to a non-byte parameter fails closed",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST", path, 200, request_body=body_of(("name", False), required=False)
+            )
+            for path in ("/e/wrapped-carrier", "/e/nonbyte-param", "/e/scalar-read-argument")
+        ],
+        {
+            "body_required": [
+                "POST /e/wrapped-carrier: the body is mandatory",
+                "POST /e/nonbyte-param: the body is mandatory",
+            ],
+            "unresolved": [
+                "POST /e/wrapped-carrier: cannot read a `from_slice` call",
+                "POST /e/nonbyte-param: cannot read a `from_slice` call",
+            ],
+        },
     ),
     (
         "a guard is judged by its top-level && and || only, on every guard path",
