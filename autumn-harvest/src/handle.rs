@@ -2270,7 +2270,7 @@ impl WorkflowHandle {
         // `execute_query_in_process` below, re-resolves its own connection
         // for that execution's own id. That re-resolve already follows ITS
         // forwarding pointer correctly.
-        let (mut execution, _shard) = crate::execution::resolve_live_attempt(
+        let (mut execution, live_shard) = crate::execution::resolve_live_attempt(
             &mut conn,
             &self.client.inner.pools,
             shard,
@@ -2281,16 +2281,23 @@ impl WorkflowHandle {
         // event. Report the outcome its own history records, not a success.
         if execution.state == "CONTINUED_AS_NEW" {
             let replaced_id = ExecutionId::from_uuid(execution.id);
-            let (mut replaced_conn, _) =
-                crate::shard_rebalance::conn_for_execution_forwarded_with_shard(
-                    &self.client.inner.pools,
-                    replaced_id,
-                )
-                .await?;
-            if let Some(state) =
+            // Reuse the held connection when the row lives on its shard. Else
+            // release it before a new checkout, so a pool of size one cannot
+            // deadlock against this call.
+            let outcome = if live_shard == shard {
+                crate::execution::replaced_run_outcome_state(&mut conn, replaced_id).await?
+            } else {
+                drop(conn);
+                let (mut replaced_conn, _) =
+                    crate::shard_rebalance::conn_for_execution_forwarded_with_shard(
+                        &self.client.inner.pools,
+                        replaced_id,
+                    )
+                    .await?;
                 crate::execution::replaced_run_outcome_state(&mut replaced_conn, replaced_id)
                     .await?
-            {
+            };
+            if let Some(state) = outcome {
                 execution.state = state.to_string();
             }
         }

@@ -741,7 +741,10 @@ async fn a_replaced_failed_run_still_reads_as_failed() {
         start_or_load_workflow_execution,
     };
 
-    let (mut conn, _container) = setup_db().await;
+    let (mut conn, container) = setup_db().await;
+    let host = container.get_host().await.expect("host");
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgresql://postgres:postgres@{host}:{port}/postgres");
     let first = ExecutionId::new_for_shard(ShardId::new(0));
     start_or_load_workflow_execution(
         &mut conn,
@@ -798,6 +801,35 @@ async fn a_replaced_failed_run_still_reads_as_failed() {
         .await,
         1,
         "the prior is sealed CONTINUED_AS_NEW to free its business key"
+    );
+
+    // A handle reads the same outcome. The pool has one connection, so a
+    // second checkout while the first is held would hang; the timeout turns
+    // that hang into a failure.
+    let pool: autumn_harvest::worker::DbPool = deadpool::managed::Pool::builder(
+        diesel_async::pooled_connection::AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+            &url,
+        ),
+    )
+    .max_size(1)
+    .build()
+    .expect("size-1 pool");
+    let shard = ShardId::new(0);
+    let client = autumn_harvest::WorkflowHandleClient::new(
+        autumn_harvest::shard::ShardedDbPool::single(pool),
+        autumn_harvest::shard::ShardRouter::new(vec![shard], vec![shard], shard),
+        [(shard, url.clone())],
+    );
+    let snapshot = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        client.handle(first).result_snapshot(),
+    )
+    .await
+    .expect("a size-1 pool must not deadlock the result read")
+    .expect("result snapshot");
+    assert_eq!(
+        snapshot.state,
+        autumn_harvest::handle::WorkflowResultState::Failed
     );
 
     match read_external_await_outcome(&mut conn, first)
