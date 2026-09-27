@@ -450,8 +450,9 @@ BYTE_PARAMETER = re.compile(
     r"(?:(?:[a-z_]+::)*Bytes\b|\[u8\]|Vec<u8>)"
 )
 
-# A `from_slice` call: its turbofish, if any, then its argument list.
-FROM_SLICE = re.compile(r"\bfrom_slice\s*(?:::<|\()")
+# A `serde_json::from_slice` call, or an imported `from_slice`: its turbofish,
+# if any, then its argument list. `Uuid::from_slice` is no body parse.
+FROM_SLICE = re.compile(r"(?:(?<=\bserde_json::)|(?<![\w:]))from_slice\s*(?:::<|\()")
 
 # The `StatusCode` names for a 2xx status.
 SUCCESS_NAMES = "|".join(sorted(name for name, status in NAMED.items() if 200 <= status < 300))
@@ -863,20 +864,23 @@ def walk_chain(after: str) -> tuple[str, str | None, str]:
             "map_or_else",
         ):
             arguments = balanced(rest[call.end() - 1 :])
-            if state == "result" and fallback_rejects(method, arguments):
+            if state in ("result", "option") and fallback_rejects(method, arguments, state):
                 return "reject", inspection, rest
             state = "value"
         opener = call.end() - 1
         rest = rest[opener + len(balanced(rest[opener:])) :]
 
 
-def fallback_rejects(method: str, arguments: str) -> bool:
-    """Whether the fallback of `unwrap_or*` or `map_or*` on a `Result` rejects.
+def fallback_rejects(method: str, arguments: str, state: str = "result") -> bool:
+    """Whether the fallback of `unwrap_or*` or `map_or*` rejects.
 
-    The fallback is the first argument. It rejects when it builds an error or
-    panics. A closure also rejects when its value is a call to a free function,
-    or when it returns or converts its error, or passes that error to a call. A function path given to `unwrap_or_else` or
-    `map_or_else` receives the error, so it rejects too.
+    `state` is `"result"` or `"option"`. The fallback is the first argument. It
+    rejects when it builds an error or panics. A closure also rejects when its
+    value is a helper call that `builds_rejection` accepts. It also rejects
+    when it returns or converts its error, or passes that error to a call. On
+    a `Result`, a function path given to `unwrap_or_else` or `map_or_else`
+    receives the error, so it rejects. On an `Option`, the path's return type
+    decides.
     """
     items = split_top_level(arguments[1:-1])
     fallback = items[0] if items else ""
@@ -884,7 +888,10 @@ def fallback_rejects(method: str, arguments: str) -> bool:
         return True
     closure = re.match(r"(?:move\s+)?\|\s*([a-z_][a-z_0-9]*)?[^|]*\|(.*)", fallback, re.S)
     if closure is None:
-        return method.endswith("_else") and re.fullmatch(r"[A-Za-z_][\w:]*", fallback) is not None
+        if not method.endswith("_else") or re.fullmatch(r"[A-Za-z_][\w:]*", fallback) is None:
+            return False
+        # On an `Option` the path receives no error, so its return type decides.
+        return state == "result" or builds_rejection(fallback + "(")
     bound, body = closure.group(1), closure.group(2)
     # A helper can build a rejection without the error, as `builds_rejection`
     # reads it. A type path such as `Gadget::default()` builds a value.
@@ -1860,6 +1867,9 @@ pub fn harvest_api_router() -> Router {
         .route("/e/is-err-tail-helper", post(e_is_err_tail_helper))
         .route("/e/helper-default", post(e_helper_default))
         .route("/e/unknown-helper", post(e_unknown_helper))
+        .route("/e/uuid-bytes", post(e_uuid_bytes))
+        .route("/e/option-fallback", post(e_option_fallback))
+        .route("/e/option-default", post(e_option_default))
 }
 
 async fn e_wrapped(body: Bytes) -> Response {
@@ -2637,6 +2647,20 @@ async fn e_helper_default(body: Bytes) -> Response {
 
 async fn e_unknown_helper(body: Bytes) -> Response {
     let gadget = serde_json::from_slice::<Gadget>(&body).unwrap_or_else(|_| undefined_helper());
+    StatusCode::OK.into_response()
+}
+
+async fn e_uuid_bytes(body: Bytes) -> Response {
+    let id = Uuid::from_slice(&body);
+    StatusCode::OK.into_response()
+}
+
+async fn e_option_fallback(body: Bytes) -> Response {
+    serde_json::from_slice::<Gadget>(&body).ok().map_or_else(|| invalid_body(), |gadget| accept(gadget))
+}
+
+async fn e_option_default(body: Bytes) -> Response {
+    let gadget = serde_json::from_slice::<Gadget>(&body).ok().unwrap_or_else(Default::default);
     StatusCode::OK.into_response()
 }
 
@@ -4111,6 +4135,31 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             )
         ],
         {},
+    ),
+    (
+        "a from_slice on another type is no body parse",
+        FIXTURE_EDGES,
+        [fixture_route("POST", "/e/uuid-bytes", 200)],
+        {},
+    ),
+    (
+        "a fallback on an Option still rejects through a helper",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/option-fallback",
+                200,
+                request_body=body_of(("name", True), required=False),
+            ),
+            fixture_route(
+                "POST",
+                "/e/option-default",
+                200,
+                request_body=body_of(("name", False), required=False),
+            ),
+        ],
+        {"body_required": ["POST /e/option-fallback: the body is mandatory"]},
     ),
     (
         "a malformed contract entry does not crash the audit",
