@@ -8364,7 +8364,7 @@ fn render_build_routing_action_forms(echo: &BuildRoutingActionEcho) -> Markup {
                     "Does not affect in-flight executions."
                 }
                 @if let Some(error) = &echo.set_policy_error {
-                    p.field-error role="alert" style="margin:0 0 10px" { (error) }
+                    p.field-error role="alert" tabindex="-1" autofocus style="margin:0 0 10px" { (error) }
                 }
                 form method="post" action="build-routing/set-policy"
                       style="display:flex;flex-direction:column;gap:10px" {
@@ -8391,7 +8391,7 @@ fn render_build_routing_action_forms(echo: &BuildRoutingActionEcho) -> Markup {
                     ". Only declare after replay tests confirm safety."
                 }
                 @if let Some(error) = &echo.compat_error {
-                    p.field-error role="alert" style="margin:0 0 10px" { (error) }
+                    p.field-error role="alert" tabindex="-1" autofocus style="margin:0 0 10px" { (error) }
                 }
                 form method="post" action="build-routing/declare-compat"
                       style="display:flex;flex-direction:column;gap:10px" {
@@ -15464,6 +15464,12 @@ mod tests {
         assert!(
             html.contains("prod-v2"),
             "Set Policy form must re-fill the entered deployment name: {html}"
+        );
+        assert!(
+            html.contains(r#"p class="field-error" role="alert" tabindex="-1" autofocus"#),
+            "Set Policy error must grab focus on load — Codex review on #1715: the \
+             action forms sit below the policy/reachability/compat tables, so an \
+             unfocused error can be missed below the fold: {html}"
         );
     }
 
