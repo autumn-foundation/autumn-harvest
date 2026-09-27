@@ -1155,9 +1155,28 @@ impl HarvestRunner {
         };
 
         let worker = if config.worker_enabled {
-            let worker = Worker::new(
+            // Pass the exact generations this call's own install stamped,
+            // when it went through the multi-shard per-shard-channel path
+            // (Codex review, issue #1429 follow-up). A second, overlapping
+            // `start` call can install its own topology in the gap
+            // between the install above and this construction. At least
+            // one `.await` runs in between. `Worker::new` alone re-reads
+            // the global slot at construction time. It cannot tell this
+            // runtime's own channel from a stranger's that landed in that
+            // gap. `new_with_expected_shard_generations` can, via
+            // `dispatch::installed_for_shard_if_current`.
+            //
+            // The single-shard branch has no per-shard generations to
+            // compare. It installs through the independent global slot
+            // instead (`dispatch_install_generation`), which is not this
+            // race's shape, so it passes `None`, same as plain
+            // `Worker::new`.
+            let shard_generations_for_worker: Option<&[(ShardId, u64)]> =
+                (dispatch_shards.len() > 1).then_some(dispatch_shard_generations.as_slice());
+            let worker = Worker::new_with_expected_shard_generations(
                 prepared.worker_runtime_config.clone(),
                 Arc::clone(&registry),
+                shard_generations_for_worker,
             )
             .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
             // Fail the process at startup if any assigned shard is missing from
@@ -1800,8 +1819,15 @@ async fn install_dispatch_channel(
         // (issue #1312). Leaving either there would keep this process
         // publishing and consuming through a channel the operator has
         // turned off.
-        autumn_harvest::dispatch::uninstall();
-        autumn_harvest::dispatch::uninstall_all_shards();
+        //
+        // One atomic clear, not `uninstall()` then `uninstall_all_shards()`
+        // separately (Codex review, issue #1429 follow-up). A racing,
+        // overlapping runner's own `install_shards` call replaces both
+        // slots in one lock acquisition. Two separate clears here could
+        // straddle it, with the second one wiping out the topology that
+        // call just installed. See `dispatch::uninstall_all`'s own doc for
+        // what that runtime would observe.
+        autumn_harvest::dispatch::uninstall_all();
         return Ok(None);
     };
 
@@ -1923,8 +1949,12 @@ async fn install_dispatch_channels_for_shards(
         // Redis is off for this start. Clear both slots, as before: a
         // channel a previous runtime installed (issue #1312) must not
         // outlive this process turning Redis off.
-        autumn_harvest::dispatch::uninstall();
-        autumn_harvest::dispatch::uninstall_all_shards();
+        //
+        // One atomic clear (Codex review, issue #1429 follow-up); see
+        // `install_dispatch_channel`'s matching fix and
+        // `dispatch::uninstall_all`'s own doc for the race two separate
+        // clears leaves open.
+        autumn_harvest::dispatch::uninstall_all();
         return Ok((Vec::new(), None));
     };
 
@@ -2007,8 +2037,7 @@ async fn install_dispatch_channels_for_shards(
     Vec<(ShardId, u64)>,
     Option<autumn_harvest::dispatch::TopologySnapshot>,
 )> {
-    autumn_harvest::dispatch::uninstall();
-    autumn_harvest::dispatch::uninstall_all_shards();
+    autumn_harvest::dispatch::uninstall_all();
     Ok((Vec::new(), None))
 }
 
@@ -2032,8 +2061,7 @@ async fn install_dispatch_channel(
     _config: &HarvestRuntimeConfig,
     _shard: Option<ShardId>,
 ) -> autumn_web::AutumnResult<Option<(u64, autumn_harvest::dispatch::TopologySnapshot)>> {
-    autumn_harvest::dispatch::uninstall();
-    autumn_harvest::dispatch::uninstall_all_shards();
+    autumn_harvest::dispatch::uninstall_all();
     Ok(None)
 }
 

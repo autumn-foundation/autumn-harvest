@@ -448,6 +448,26 @@ pub fn installed_for_shard(shard: crate::types::ShardId) -> Option<InstalledDisp
         .and_then(|slot| slot.as_ref().and_then(|map| map.get(&shard).cloned()))
 }
 
+/// The channel installed for `shard`, but only while it still carries
+/// exactly `generation` (Codex review, issue #1429 follow-up).
+///
+/// `generation` is the value [`install_for_shard`]/[`install_shards`]
+/// stamped on the caller's own install. A caller that installed `shard`'s
+/// channel itself, then later wants to use exactly that install (not
+/// whatever is live now), calls this instead of [`installed_for_shard`].
+/// A later, unrelated install for the same shard mints a new generation
+/// from the shared counter. So a mismatch here can only mean a different
+/// call replaced the slot since. Returns `None` in that case, the same as
+/// if nothing were installed at all, rather than silently handing back
+/// the stranger's channel.
+#[must_use]
+pub fn installed_for_shard_if_current(
+    shard: crate::types::ShardId,
+    generation: u64,
+) -> Option<InstalledDispatch> {
+    installed_for_shard(shard).filter(|installed| installed.generation == generation)
+}
+
 /// Remove every per-shard channel. Tests use this between cases.
 ///
 /// Also stops the background publisher, mirroring [`uninstall`] (Codex
@@ -466,6 +486,43 @@ pub fn uninstall_all_shards() {
     if INSTALLED.read().is_ok_and(|slot| slot.is_none()) {
         ANY_INSTALLED.store(false, Ordering::Relaxed);
     }
+    stop_publisher();
+}
+
+/// Remove both the single-shard slot and every per-shard channel, in one
+/// [`DISPATCH_SLOT_LOCK`] acquisition (Codex review, issue #1429
+/// follow-up).
+///
+/// A caller that instead calls [`uninstall`] and [`uninstall_all_shards`]
+/// separately still leaves a gap between the two clears. [`install_shards`]
+/// replaces both slots in one atomic step specifically so a racing,
+/// overlapping install is never observed half-applied. A two-step clear
+/// can still straddle it.
+///
+/// A concurrent [`install_shards`] call landing between the two separate
+/// clears has its per-shard topology wiped out by the second one. That
+/// happens immediately after the first one found nothing to clear.
+///
+/// That runtime's own `Worker::new` then sees `is_installed()` false,
+/// both slots now empty. It skips per-shard coverage validation entirely.
+/// It starts on the Postgres fallback for every shard — silently. Its
+/// own effective-config snapshot (captured before this race, from its
+/// own successful install) still reports Redis dispatch as installed.
+///
+/// A caller turning Redis dispatch off for this process calls this instead
+/// of `uninstall()` followed by `uninstall_all_shards()`. That is the one
+/// legitimate use here: every other clear needs to undo specifically its
+/// own earlier install (see
+/// [`uninstall_if_current`]/[`uninstall_all_shards_if_current`]).
+pub fn uninstall_all() {
+    let _guard = lock(&DISPATCH_SLOT_LOCK);
+    if let Ok(mut slot) = INSTALLED.write() {
+        *slot = None;
+    }
+    if let Ok(mut slot) = INSTALLED_BY_SHARD.write() {
+        *slot = None;
+    }
+    ANY_INSTALLED.store(false, Ordering::Relaxed);
     stop_publisher();
 }
 
