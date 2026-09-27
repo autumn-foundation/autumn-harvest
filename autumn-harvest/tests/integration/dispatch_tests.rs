@@ -2263,13 +2263,14 @@ async fn a_worker_sweeps_only_the_queues_whose_lease_it_holds() {
     assert!(channel.inner.published_ids().contains(&task_id));
 }
 
-/// A sweep whose publish fails gives its leases back, so a peer sweeps next
-/// time (issue #1429).
+/// A sweep whose publish fails makes no further Redis call, so the fallback
+/// is not delayed. The lease expires. A stopping worker then releases its
+/// leases, so a peer sweeps at once (issue #1429).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_failed_sweep_gives_its_reconcile_leases_back() {
+async fn a_failed_publish_keeps_the_lease_and_a_stop_releases_it() {
     let _serial = DISPATCH_SERIAL.lock().await;
     let (url, _c) = setup_test_database_url_or_env().await;
-    let (_exec_id, _task_id) = start_unpublished(&url).await;
+    let (exec_id, _task_id) = start_unpublished(&url).await;
 
     let channel = Arc::new(LeaseSwitchDispatch::default());
     channel.grant.store(true, Ordering::SeqCst);
@@ -2288,17 +2289,22 @@ async fn a_failed_sweep_gives_its_reconcile_leases_back() {
         empty_shared_state(),
     ));
 
+    let mut check = connect(&url).await;
     with_worker(worker, pool, async {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while AtomicUsize::load(&channel.releases, Ordering::SeqCst) == 0 {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "a failed sweep never gave its leases back"
-            );
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
+        // The sweep publish fails, and the Postgres fallback runs the row.
+        wait_for_state(&mut check, exec_id, &["COMPLETED"], Duration::from_secs(30)).await;
+        assert_eq!(
+            AtomicUsize::load(&channel.releases, Ordering::SeqCst),
+            0,
+            "a failed publish must not call Redis again to release the lease"
+        );
     })
     .await;
+
+    assert!(
+        AtomicUsize::load(&channel.releases, Ordering::SeqCst) >= 1,
+        "a stopping worker must release its leases"
+    );
 }
 
 /// A lease call that fails does not stop the sweep. The durability floor
