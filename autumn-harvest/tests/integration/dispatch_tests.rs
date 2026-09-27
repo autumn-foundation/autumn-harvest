@@ -2077,7 +2077,7 @@ impl TaskDispatch for AckCountingDispatch {
 }
 
 /// The worker disposes of each read with one `ack_many`, never one `ack` per
-/// lease, and starts no task of a read before that read is acked (issue #1429).
+/// lease. It starts no task of a read before that read is acked (issue #1429).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_worker_acks_each_read_in_one_batch() {
     let _serial = DISPATCH_SERIAL.lock().await;
