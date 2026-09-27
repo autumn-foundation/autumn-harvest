@@ -48,20 +48,21 @@ free-form, so checks 2 and 3 skip it. Check 5 still reads it.
 Check 5 treats a bare `Json<T>` as mandatory, since axum rejects a request
 without it. A `Result<Json<T>, _>` is mandatory when the handler rejects its
 error, through `?`, `.map_err(..)?`, or an `Err` arm that builds an error or
-returns the rejection it binds. An `Err` arm that returns a helper rejects,
-unless it hands its error to that helper. Such a helper can recover the request,
-as the start route does (#808). A catch-all `_` arm counts as an `Err` arm, and
-so does an `if let Err(..)` block. An `if` on `.is_err()` or `.is_ok()` counts
-when its failing branch rejects. A raw-byte parse is mandatory unless an `if` on
-`.is_empty()` lets an empty body skip it. The parse must be in the arm that runs
-for a non-empty body, and the empty-body arm must not reject. An earlier
-`if body.is_empty() { .. }` also counts when its block returns `Ok(..)` or a 2xx
-status, and no error. Only a return at the top level of that block counts. A
-return inside a nested `if`, `match` or closure may not run. A parse that turns
-its error into a value is optional too, such as `.ok()`, `.unwrap_or_default()`
-or an `if let Ok(..)` whose `else` does not reject. A `match` on the parse is
-optional when it has an `Err` or catch-all arm and no such arm rejects. A
-fallback that rejects the error or calls a helper, such as
+returns the rejection it binds. An `Err` arm that returns a helper, or whose
+value is a call to a free function, rejects, unless it hands its error to that
+helper. A move of the extractor into another name is followed. Such a helper can
+recover the request, as the start route does (#808). A catch-all `_` arm counts
+as an `Err` arm, and so does an `if let Err(..)` block. An `if` on `.is_err()`
+or `.is_ok()` counts when its failing branch rejects. A raw-byte parse is
+mandatory unless an `if` on `.is_empty()` lets an empty body skip it. The parse
+must be in the arm that runs for a non-empty body, and the empty-body arm must
+not reject. An earlier `if body.is_empty() { .. }` also counts when its block
+returns `Ok(..)` or a 2xx status, and no error. Only a return at the top level
+of that block counts. A return inside a nested `if`, `match` or closure may not
+run. A parse that turns its error into a value is optional too, such as `.ok()`,
+`.unwrap_or_default()` or an `if let Ok(..)` whose `else` does not reject. A
+`match` on the parse is optional when it has an `Err` or catch-all arm and no
+such arm rejects. A fallback that rejects the error or calls a helper, such as
 `.map_or_else(|e| reject(e), ..)`, keeps the parse mandatory. An `.or_else(..)`
 whose fallback yields `Ok(..)` on every path makes a later `?` tolerant. A guard
 or a tolerant call at a helper call site carries into the helper. Check 2
@@ -456,6 +457,10 @@ SUCCESS_NAMES = "|".join(sorted(name for name, status in NAMED.items() if 200 <=
 # or a `StatusCode::` name for a status outside 2xx. A 2xx status is no error.
 ERROR_TOKENS = r"AutumnError::|\bErr\(|StatusCode::(?!(?:%s)\b)[A-Z_]+\b" % SUCCESS_NAMES
 
+# A call to a free function, which can build a rejection. A type path such as
+# `Gadget::default()` starts with a capital, so it does not match.
+FREE_CALL = r"(?:return\s+)?[a-z_][a-z_0-9]*\s*\("
+
 # A `Json` extractor, bare or with a path such as `axum::Json`.
 JSON = r"(?:[a-z_]+::)*Json"
 
@@ -672,12 +677,18 @@ def rejects_result_body(params: str, block: str) -> bool:
     return found is not None and error_rejects(found.group(1), block)
 
 
-def error_rejects(name: str, block: str) -> bool:
+def error_rejects(name: str, block: str, seen: frozenset[str] = frozenset()) -> bool:
     """Whether the handler rejects the error of the `Result` extractor `name`.
 
-    `rejects_result_body` gives the forms it reads.
+    `rejects_result_body` gives the forms it reads. A move into another name,
+    such as `let captured = body;`, is followed.
     """
     variable = re.escape(name)
+    moved = r"\blet\s+(?:mut\s+)?([a-z_][a-z_0-9]*)\s*(?::[^=;]*)?=\s*%s\s*;" % variable
+    for alias in re.finditer(moved, block):
+        if alias.group(1) not in seen | {name}:
+            if error_rejects(alias.group(1), block, seen | {name}):
+                return True
     for use in re.finditer(r"(?<![.\w])%s\b" % variable, block):
         verdict, inspection, rest = walk_chain(block[use.end() :])
         if verdict == "reject":
@@ -728,8 +739,10 @@ def arm_rejects(arm: str, bound: str | None) -> bool:
     """Whether an arm that receives an extractor error rejects the request.
 
     It rejects as `rejecting_arm` reads it. It also rejects when it exits as
-    `rejecting_exit` reads it, unless it hands the error it binds to a helper.
-    Such a helper can recover the request, as the start route does (#808).
+    `rejecting_exit` reads it, or when its value is a call to a free function,
+    unless it hands the error it binds to a helper. Such a helper can recover
+    the request, as the start route does (#808). A type path such as
+    `Gadget::default()` builds a value.
     """
     if rejecting_arm(arm, bound):
         return True
@@ -737,7 +750,7 @@ def arm_rejects(arm: str, bound: str | None) -> bool:
         handed = r"\b[A-Za-z_][\w:]*\s*\([^;]*\b%s\b" % re.escape(bound)
         if re.search(handed, arm):
             return False
-    return rejecting_exit(arm)
+    return rejecting_exit(arm) or re.match(FREE_CALL, closure_value(arm)) is not None
 
 
 def rejecting_arm(arm: str, bound: str | None) -> bool:
@@ -866,7 +879,7 @@ def fallback_rejects(method: str, arguments: str) -> bool:
     # A helper can build a rejection without the error, so its call rejects,
     # as `rejecting_exit` reads a returned call. A type path such as
     # `Gadget::default()` builds a value.
-    if re.match(r"(?:return\s+)?[a-z_][a-z_0-9]*\s*\(", closure_value(body)):
+    if re.match(FREE_CALL, closure_value(body)):
         return True
     if bound is None or bound == "_":
         return False
@@ -970,8 +983,12 @@ def discards_error(before: str, after: str) -> bool:
     if arms and re.search(r"\bmatch\s+(?:serde_json::)?$", before):
         arms = balanced(after[arms.end() - 1 :], "{", "}")
         failures = error_arms(arms)
+        # Unlike `arm_rejects`, a helper handed the parse error rejects here.
+        # The #808 replay exception covers only a `Result` extractor.
         return bool(failures) and not any(
-            rejecting_exit(arm) or rejecting_arm(arm, failure.group(1))
+            rejecting_exit(arm)
+            or rejecting_arm(arm, failure.group(1))
+            or re.match(FREE_CALL, closure_value(arm)) is not None
             for failure in failures
             for arm in [match_arm(arms, failure.start())]
         )
@@ -1813,6 +1830,9 @@ pub fn harvest_api_router() -> Router {
         .route("/e/ignored-error-helper", post(e_ignored_error_helper))
         .route("/e/or-else-branch", post(e_or_else_branch))
         .route("/e/or-else-block", post(e_or_else_block))
+        .route("/e/json-tail-helper", post(e_json_tail_helper))
+        .route("/e/json-tail-value", post(e_json_tail_value))
+        .route("/e/json-alias", post(e_json_alias))
 }
 
 async fn e_wrapped(body: Bytes) -> Response {
@@ -2551,6 +2571,27 @@ async fn e_or_else_block(body: Bytes) -> Result<Response, Response> {
         tracing::debug!(%error, "default");
         Ok(Gadget::default())
     })?;
+    Ok(StatusCode::OK.into_response())
+}
+
+async fn e_json_tail_helper(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    match body {
+        Ok(Json(gadget)) => accept(gadget),
+        Err(_) => invalid_body(),
+    }
+}
+
+async fn e_json_tail_value(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    let gadget = match body {
+        Ok(Json(gadget)) => gadget,
+        Err(_) => Gadget::default(),
+    };
+    StatusCode::OK.into_response()
+}
+
+async fn e_json_alias(body: Result<Json<Gadget>, JsonRejection>) -> Result<Response, JsonRejection> {
+    let captured = body;
+    let Json(gadget) = captured?;
     Ok(StatusCode::OK.into_response())
 }
 
@@ -3952,6 +3993,33 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             fixture_route(
                 "POST",
                 "/e/or-else-block",
+                200,
+                request_body=body_of(("name", False), required=False),
+            )
+        ],
+        {},
+    ),
+    (
+        "a tail helper call in an Err arm and a moved extractor both reject",
+        FIXTURE_EDGES,
+        [
+            fixture_route("POST", path, 200, request_body=body_of(("name", True), required=False))
+            for path in ("/e/json-tail-helper", "/e/json-alias")
+        ],
+        {
+            "body_required": [
+                "POST /e/json-tail-helper: the body is mandatory",
+                "POST /e/json-alias: the body is mandatory",
+            ]
+        },
+    ),
+    (
+        "an Err arm whose value is a type path builds a value",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/json-tail-value",
                 200,
                 request_body=body_of(("name", False), required=False),
             )
