@@ -504,6 +504,33 @@ def byte_parameters(params: str) -> set[str]:
     return set(BYTE_PARAMETER.findall(params))
 
 
+# A comment, a string literal or a char literal. A raw string comes before a
+# plain one, so `r#"..."#` is read whole.
+NOT_CODE = re.compile(
+    r"//[^\n]*|/\*.*?\*/"
+    r'|(?<![\w])b?r(#*)".*?"\1'
+    r'|(?<![\w])b?"(?:\\.|[^"\\])*"'
+    r"|'(?:\\.|[^\\'])'",
+    re.S,
+)
+
+
+def code_only(block: str) -> str:
+    """`block` with comments and literals blanked, at the same length.
+
+    A literal keeps its first and last character. Newlines stay, so offsets
+    and line numbers do not change.
+    """
+
+    def blank(found: re.Match) -> str:
+        text = found.group(0)
+        keep = not text.startswith("/")
+        inner = re.sub(r"[^\n]", " ", text[1:-1] if keep else text)
+        return text[0] + inner + text[-1] if keep else inner
+
+    return NOT_CODE.sub(blank, block)
+
+
 def raw_body_parses(source: str, handler: str) -> list[tuple[str | None, bool, bool]]:
     """`(type, optional, tolerant)` for each raw-body parse in a handler and helpers.
 
@@ -521,15 +548,16 @@ def raw_body_parses(source: str, handler: str) -> list[tuple[str | None, bool, b
     handler_found = handler_parts(source, handler)
     if handler_found is None:
         return []
-    handler_block = handler_found[2]
+    # A call in a comment or a string is no parse, so neither is read.
+    handler_block = code_only(handler_found[2])
     carriers = byte_parameters(handler_found[0])
-    params, returns, block = handler_found
-    parses = block_parses(block, byte_parameters(params), returns)
+    params, returns = handler_found[0], handler_found[1]
+    parses = block_parses(handler_block, byte_parameters(params), returns)
     for helper in called_helpers(source, handler_block):
         parts = function_parts(source, helper)
         if parts is None:
             continue
-        params, returns, block = parts
+        params, returns, block = parts[0], parts[1], code_only(parts[2])
         byte_names = byte_parameters(params)
         states = receiving_parameters(handler_block, helper, params, carriers)
         for name, (optional, tolerant) in states.items():
@@ -1870,6 +1898,7 @@ pub fn harvest_api_router() -> Router {
         .route("/e/uuid-bytes", post(e_uuid_bytes))
         .route("/e/option-fallback", post(e_option_fallback))
         .route("/e/option-default", post(e_option_default))
+        .route("/e/commented-parse", post(e_commented_parse))
 }
 
 async fn e_wrapped(body: Bytes) -> Response {
@@ -2661,6 +2690,15 @@ async fn e_option_fallback(body: Bytes) -> Response {
 
 async fn e_option_default(body: Bytes) -> Response {
     let gadget = serde_json::from_slice::<Gadget>(&body).ok().unwrap_or_else(Default::default);
+    StatusCode::OK.into_response()
+}
+
+async fn e_commented_parse(body: Bytes) -> Response {
+    // serde_json::from_slice::<Gadget>(&body)?
+    /* serde_json::from_slice::<Gadget>(&body)? */
+    let note = "serde_json::from_slice::<Gadget>(&body)? {";
+    let raw = r#"serde_json::from_slice::<Gadget>(&body)"#;
+    let brace = '{';
     StatusCode::OK.into_response()
 }
 
@@ -4160,6 +4198,12 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             ),
         ],
         {"body_required": ["POST /e/option-fallback: the body is mandatory"]},
+    ),
+    (
+        "a from_slice call in a comment or a string is no body parse",
+        FIXTURE_EDGES,
+        [fixture_route("POST", "/e/commented-parse", 200)],
+        {},
     ),
     (
         "a malformed contract entry does not crash the audit",
