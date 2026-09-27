@@ -431,8 +431,18 @@ FILE_PLACES: dict[str, str] = {}
 # the structs of both crates.
 STRUCTS: list[dict[str, list[tuple[str, str]]] | None] = [None]
 
-# The site of each struct block that `struct_index` reads.
-STRUCT_SITES: dict[str, Site] = {}
+
+class StructBlock(str):
+    """A struct's attribute lines and block, with the site of its definition.
+
+    Two structs can have the same block text in different modules, so the
+    site travels with the block, not in a table keyed by its text.
+    """
+
+    def __new__(cls, text: str, site: Site) -> "StructBlock":
+        block = super().__new__(cls, text)
+        block.site = site
+        return block
 
 # Every module place that holds a known item, found once per audit.
 KNOWN_MODULES: list[frozenset[str] | None] = [None]
@@ -730,8 +740,7 @@ def struct_index(
     for found in re.finditer(r"\bstruct ([A-Za-z_][A-Za-z_0-9]*)\s*\{", code):
         inline = [name for start, end, name in sorted(modules) if start < found.start() < end]
         place = location(crate, module, *inline)
-        block = struct_text(source, found)
-        STRUCT_SITES[block] = (code, found.start())
+        block = StructBlock(struct_text(source, found), (code, found.start()))
         index.setdefault(found.group(1), []).append((place, block))
     return index
 
@@ -869,8 +878,8 @@ def struct_layout(
         text = re.sub(r"\s*,\s*([>)])", r"\1", re.sub(r"([<(])\s+", r"\1", text))
         field = re.match(r"(?:pub(?:\([^)]*\))?\s+)?(?:r#)?([a-z_0-9]+)\s*:\s*(.+?),?$", text)
         if field:
-            site = STRUCT_SITES.get(original, (SOURCE[0], None))
-            resolved, unread = resolve_field_type(field.group(2), site)
+            site = getattr(original, "site", (SOURCE[0], None))
+            resolved, unread = resolve_field_type(prelude_bound(field.group(2), site), site)
             fields.append((field.group(1), resolved, serde_items(" ".join(attributes)), unread))
         attributes = []
     return container, fields
@@ -995,7 +1004,7 @@ QUERY_EXTRACTOR = re.compile(r"(?<![\w:])Query<\s*([A-Za-z0-9_:]+)\s*>")
 # A parameter that carries the raw request body.
 BYTE_PARAMETER = re.compile(
     r"\b([a-z_][a-z_0-9]*)\s*:\s*(?:&\s*(?:'[a-z_]+\s+)?(?:mut\s+)?)?"
-    r"(?:(?<![\w:])Bytes\b|\[u8\]|Vec<u8>)"
+    r"(?:(?<![\w:])Bytes\b|\[u8\]|(?<![\w:])Vec<u8>)"
 )
 
 
@@ -1138,6 +1147,16 @@ def resolve_field_type(declared_type: str, site: Site | None = None) -> tuple[st
 
 # A `Json` extractor, bare or with a path such as `axum::Json`.
 JSON = r"(?<![\w:])Json"
+
+# The prelude `Result` and `Option`, unqualified. `canonical_paths` cuts the
+# standard paths first. A qualified name is the shadowing item that
+# `alias_declarations` binds, so it is not read as the prelude type.
+RESULT = r"(?<![\w:])Result"
+OPTION = r"(?<![\w:])Option"
+
+
+# A fn's parameter list, return clause and block, as `parts_at` reads them.
+Parts = tuple[str, str, str]
 
 
 def function_parts(
@@ -1605,15 +1624,45 @@ def outside_calls(argument: str, macros: bool = True) -> str:
 
 
 # Methods on `Bytes`, `[u8]` and `Vec<u8>` that read or copy the bytes and
-# run no deserializer. A raw body as their receiver is no handoff.
+# run no deserializer. A raw body as their receiver is no handoff. No
+# conversion is here, since a local `From` impl can run any code.
 BYTE_ACCESSORS = frozenset(
     {
         "as_ref", "as_slice", "as_bytes", "borrow", "chunks", "clone", "contains",
-        "copy_to_bytes", "deref", "ends_with", "first", "get", "into", "is_empty",
+        "copy_to_bytes", "deref", "ends_with", "first", "get", "is_empty",
         "iter", "last", "len", "slice", "split_at", "split_off", "split_to",
         "starts_with", "to_owned", "to_vec", "windows",
     }
 )
+
+
+# Each conversion method on a raw body, and the constructor it runs.
+CONVERSIONS = {"into": "from", "try_into": "try_from"}
+
+
+def conversion_parts(source: str, block: str, call: re.Match) -> tuple[Parts | None, str | None]:
+    """The `from` or `try_from` fn that a conversion call `call` runs, and its parameter.
+
+    The target type must be written in the same statement, as in `let x: T =
+    body.into();`. `resolve_symbol` then finds `T::from`, or `T::try_from`
+    for `try_into`, from the call site. A `Result<T, _>` annotation names
+    `T`. A target the audit cannot see, or a constructor it cannot find, is
+    `(None, None)`, so the handoff fails closed.
+    """
+    annotated = r"\blet\s+(?:mut\s+)?[a-z_]\w*\s*:\s*([^=;]+?)\s*=\s*$"
+    typed = re.search(annotated, block[: call.start()])
+    if typed is None:
+        return None, None
+    target = typed.group(1).strip()
+    wrapped = re.fullmatch(r"Result<\s*(.+?)\s*,.*>", target, re.S)
+    head = re.match(r"((?:[A-Za-z_]\w*\s*::\s*)*[A-Z]\w*)", wrapped.group(1) if wrapped else target)
+    if head is None:
+        return None, None
+    reference = "%s::%s" % (head.group(1), CONVERSIONS[call.group(1)])
+    starts = resolve_symbol("fn", reference, site_in(block, call.start())) or []
+    parts = parts_at(source, starts[0]) if len(starts) == 1 else None
+    first = re.match(r"\(\s*(?:mut\s+)?([a-z_]\w*)\s*:", parts[0]) if parts else None
+    return (parts, first.group(1)) if first else (None, None)
 
 
 def handoffs(
@@ -1662,14 +1711,17 @@ def handoffs(
             after = block[call.end() - 1 + len(balanced(block[call.end() - 1 :])) :]
             tolerant = discards_error(block[: call.start()], after)
             guarded = guards(block, call.start(), variable)
+            if method in CONVERSIONS:
+                # A conversion hands the body to the constructor it runs.
+                converted, parameter = (
+                    (None, None) if partial else conversion_parts(source, block, call)
+                )
+                found.append((method, converted, parameter, guarded or tolerant, tolerant))
+                continue
             by_self = r"\(\s*&?\s*(?:'[a-z_]+\s+)?(?:mut\s+)?self\b"
             self_param = parts is not None and re.match(by_self, parts[0])
             found.append((method, parts if self_param else None, "self", guarded or tolerant, tolerant))
     return found
-
-
-# A fn's parameter list, return clause and block, as `parts_at` reads them.
-Parts = tuple[str, str, str]
 
 
 def call_sites(
@@ -1927,7 +1979,7 @@ def rejects_result_body(params: str, block: str) -> bool:
     hands the request on, for example to replay a committed key, leaves it
     optional.
     """
-    found = re.search(r"\b([a-z_][a-z_0-9]*)\s*:\s*(?:[a-z_]+::)*Result<\s*%s<" % JSON, params)
+    found = re.search(r"\b([a-z_][a-z_0-9]*)\s*:\s*%s<\s*%s<" % (RESULT, JSON), params)
     return found is not None and error_rejects(found.group(1), block)
 
 
@@ -2957,6 +3009,31 @@ def alias_scope(code: str, position: int) -> tuple[int, int]:
     return enclosing_block(code, position)
 
 
+def prelude_bound(declared_type: str, site: Site) -> str:
+    """A field type with each prelude name that its site shadows replaced.
+
+    `alias_declarations` binds the names, as it does for extractors. A name
+    shadowed by a local item or an import reads as that item's path, so a
+    shadowed `Option<T>` is no `Option`, and the field stays mandatory.
+    """
+    text, at = site
+    if at is None:
+        return declared_type
+    for name in PRELUDE_NAMES:
+        pattern = r"(?<![\w:.])%s\b" % name
+        if not re.search(pattern, declared_type):
+            continue
+        bound = [
+            (start, replacement)
+            for (start, end), _, declared, replacement in alias_declarations(text)
+            if declared == pattern and start <= at < end and replacement
+        ]
+        if bound:
+            declared_type = re.sub(pattern, max(bound)[1], declared_type)
+    return declared_type
+
+
+@functools.lru_cache(maxsize=None)
 def alias_declarations(code: str) -> list[tuple[tuple[int, int], tuple[int, int], str, str | None]]:
     """`(scope, declaration span, pattern, replacement)` for each alias in `code`.
 
@@ -2979,6 +3056,10 @@ def alias_declarations(code: str) -> list[tuple[tuple[int, int], tuple[int, int]
                 # A plain import of another item with an extractor's name binds
                 # that name in scope. It is then that item, not the extractor.
                 found.append((scope, span, r"(?<![\w:.])%s\b" % binding, path))
+            elif binding in PRELUDE_NAMES and path not in PRELUDE_PATHS:
+                # An import of another item with a prelude name hides the
+                # prelude type in scope, as an extractor name does.
+                found.append((scope, span, r"(?<![\w:.])%s\b" % binding, path))
             elif kind and alias:
                 pattern = r"(?<![\w:.])%s\b%s" % (alias, call if kind == "from_slice" else "")
                 found.append((scope, span, pattern, ALIAS_TARGETS[kind]))
@@ -2992,14 +3073,15 @@ def alias_declarations(code: str) -> list[tuple[tuple[int, int], tuple[int, int]
             elif path in ("serde_json::from_slice", "serde_json::*") and not alias:
                 pattern = r"(?<![\w:.])from_slice%s" % call
                 found.append((scope, span, pattern, ALIAS_TARGETS["from_slice"]))
-    # A local item named like an extractor shadows it in its scope, as an
-    # untrusted import does. A `type` alias that renames the extractor to its
-    # own name is no shadow.
-    item = r"\b(struct|enum|trait|union|type)\s+(Query|Json|Bytes)\b"
+    # A local item named like an extractor or a prelude type shadows it in its
+    # scope, as an untrusted import does. A `type` alias that renames the type
+    # to its own name is no shadow.
+    item = r"\b(struct|enum|trait|union|type)\s+(%s)\b" % "|".join(EXTRACTOR_NAMES + PRELUDE_NAMES)
     for local in re.finditer(item, code):
         if local.group(1) == "type":
             target = re.match(r"\s*(<[^=;]*?>)?\s*=\s*([^;]+);", code[local.end() :])
-            if target and re.fullmatch(r"%s\s*(<.*>)?" % local.group(2), target.group(2).strip()):
+            renamed = canonical_paths(target.group(2).strip()) if target else ""
+            if target and re.fullmatch(r"%s\s*(<.*>)?" % local.group(2), renamed):
                 continue
         scope = alias_scope(code, local.start())
         span = (local.start(), local.end())
@@ -3028,6 +3110,18 @@ def alias_declarations(code: str) -> list[tuple[tuple[int, int], tuple[int, int]
 
 # The extractor names an import can bind.
 EXTRACTOR_NAMES = ("Query", "Json", "Bytes")
+
+# The prelude type names that the audit reads by name.
+PRELUDE_NAMES = ("Option", "Result", "Vec", "String")
+
+# The standard paths of the prelude types. Importing one binds the prelude type.
+PRELUDE_PATHS = frozenset(
+    {
+        "std::option::Option", "core::option::Option", "std::result::Result",
+        "core::result::Result", "std::vec::Vec", "alloc::vec::Vec",
+        "std::string::String", "alloc::string::String",
+    }
+)
 
 # Glob imports that bring the supported extractors, or nothing that clashes.
 TRUSTED_GLOBS = frozenset({"axum", "axum::extract", "axum::body", "bytes", "serde_json"})
@@ -3311,9 +3405,9 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
             # none of its fields is mandatory.
             # A `Result<Query<T>, _>` whose error the handler tolerates acts the same.
             prefix = params[: query.start()]
-            wrapped = re.search(r"Option<\s*(?:[a-z_]+::)*$", prefix) is not None
+            wrapped = re.search(r"%s<\s*(?:[a-z_]+::)*$" % OPTION, prefix) is not None
             result = re.search(
-                r"\b([a-z_][a-z_0-9]*)\s*:\s*(?:[a-z_]+::)*Result<\s*(?:[a-z_]+::)*$", prefix
+                r"\b([a-z_][a-z_0-9]*)\s*:\s*%s<\s*(?:[a-z_]+::)*$" % RESULT, prefix
             )
             if result and not error_rejects(result.group(1), block):
                 wrapped = True
@@ -3338,8 +3432,8 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
         bare = re.search(r"%s\s*:\s*%s<\s*([A-Za-z0-9_:]+)\s*>" % (binding, JSON), params)
         extractor = (
             bare
-            or re.search(r"Result<\s*%s<\s*([A-Za-z0-9_:]+)\s*>" % JSON, params)
-            or re.search(r"Option<\s*%s<\s*([A-Za-z0-9_:]+)\s*>\s*>" % JSON, params)
+            or re.search(r"%s<\s*%s<\s*([A-Za-z0-9_:]+)\s*>" % (RESULT, JSON), params)
+            or re.search(r"%s<\s*%s<\s*([A-Za-z0-9_:]+)\s*>\s*>" % (OPTION, JSON), params)
         )
         if len(re.findall(r"(?<![\w:])Json<", params)) > (extractor is not None):
             unresolved.append("  %s %s: cannot read a `Json<..>` extractor" % (method, path))
@@ -3347,7 +3441,7 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
         parses: list[tuple[str, bool, Site]] = []
         body_type = extractor.group(1) if extractor else None
         result_rejects = rejects_result_body(params, block)
-        option_body = bool(extractor) and extractor.re.pattern.startswith("Option<")
+        option_body = bool(extractor) and extractor.re.pattern.startswith(OPTION)
         if body_type is not None and body_type.split("::")[-1] != "Value":
             # A present `Option<Json<T>>` body is still parsed strictly, so its
             # mandatory fields are checked. A tolerant `Result` body is not.
@@ -3871,12 +3965,60 @@ pub fn harvest_api_router() -> Router {
         .route("/s/ambiguous-alias", post(s_ambiguous_alias))
         .route("/s/qualified-target", post(s_qualified_target))
         .route("/s/imported-alias", post(s_imported_alias))
+        .route("/s/local-option", get(s_local_option))
+        .route("/s/imported-option", get(s_imported_option))
+        .route("/s/deep-option", get(s_deep_option))
+        .route("/s/imported-result", post(s_imported_result))
         .route("/s/block-alias", post(s_block_alias))
         .route("/s/dup-params/{id}", get(s_dup_params))
 }
 
 async fn s_imported_alias(Json(body): Json<consumers::ImportedAliasField>) -> Response {
     StatusCode::OK.into_response()
+}
+
+mod local_option {
+    struct Option<T>(T);
+
+    struct LocalOptionPage {
+        limit: Option<u32>,
+    }
+}
+
+mod imported_option {
+    use other_crate::Option;
+
+    struct ImportedOptionPage {
+        limit: Option<u32>,
+    }
+
+    mod deeper {
+        struct Option<T>(T);
+
+        struct DeepOptionPage {
+            limit: Option<u32>,
+        }
+    }
+}
+
+async fn s_deep_option(Query(page): Query<imported_option::deeper::DeepOptionPage>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn s_local_option(Query(page): Query<local_option::LocalOptionPage>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn s_imported_option(Query(page): Query<imported_option::ImportedOptionPage>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+mod imported_result {
+    use other_crate::Result;
+
+    async fn s_imported_result(body: Result<Json<Paging>, JsonRejection>) -> Response {
+        StatusCode::OK.into_response()
+    }
 }
 
 async fn s_qualified_target(Json(body): Json<QualifiedTarget>) -> Response {
@@ -4323,6 +4465,10 @@ pub fn harvest_api_router() -> Router {
         .route("/e/partial-alias", post(e_partial_alias))
         .route("/e/copied-alias", post(e_copied_alias))
         .route("/e/arm-rebinds", post(e_arm_rebinds))
+        .route("/e/into-typed", post(e_into_typed))
+        .route("/e/try-into-typed", post(e_try_into_typed))
+        .route("/e/into-untyped", post(e_into_untyped))
+        .route("/e/from-path", post(e_from_path))
         .route("/e/vector", post(e_vector))
         .route("/e/crate-bytes", post(e_crate_bytes))
         .route("/e/rejects", post(e_rejects))
@@ -4580,6 +4726,43 @@ async fn e_partial_alias(body: Bytes) -> Response {
 async fn e_copied_alias(body: Bytes) -> Response {
     let owned = body.to_vec();
     let gadget = parse_gadget(&owned);
+    StatusCode::OK.into_response()
+}
+
+impl From<Bytes> for Parcel {
+    fn from(raw: Bytes) -> Self {
+        let gadget = serde_json::from_slice::<Gadget>(&raw).unwrap();
+        Parcel { name: gadget.name }
+    }
+}
+
+impl TryFrom<Bytes> for Parcel {
+    type Error = Response;
+
+    fn try_from(raw: Bytes) -> Result<Self, Response> {
+        let gadget = serde_json::from_slice::<Gadget>(&raw).map_err(reject)?;
+        Ok(Parcel { name: gadget.name })
+    }
+}
+
+async fn e_into_typed(body: Bytes) -> Response {
+    let parcel: Parcel = body.into();
+    StatusCode::OK.into_response()
+}
+
+async fn e_try_into_typed(body: Bytes) -> Response {
+    let parcel: Result<Parcel, Response> = body.try_into();
+    parcel?;
+    StatusCode::OK.into_response()
+}
+
+async fn e_into_untyped(body: Bytes) -> Response {
+    consume_parcel(body.into());
+    StatusCode::OK.into_response()
+}
+
+async fn e_from_path(body: Bytes) -> Response {
+    let parcel = Parcel::from(body);
     StatusCode::OK.into_response()
 }
 
@@ -6628,6 +6811,30 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
         },
     ),
     (
+        "a conversion of the body runs its From impl, or fails closed",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST", path, 200, request_body=body_of(("name", False), required=False)
+            )
+            for path in ("/e/into-typed", "/e/try-into-typed", "/e/into-untyped", "/e/from-path")
+        ],
+        {
+            "body_required": [
+                "POST /e/into-typed: the body is mandatory",
+                "POST /e/try-into-typed: the body is mandatory",
+                "POST /e/into-untyped: the body is mandatory",
+                "POST /e/from-path: the body is mandatory",
+            ],
+            "mandatory": [
+                "POST /e/into-typed: `name` is mandatory in Gadget",
+                "POST /e/try-into-typed: `name` is mandatory in Gadget",
+                "POST /e/from-path: `name` is mandatory in Gadget",
+            ],
+            "unresolved": ["POST /e/into-untyped: cannot read a `from_slice` call"],
+        },
+    ),
+    (
         "a Bytes type from another path is a body",
         FIXTURE_EDGES,
         [
@@ -8375,6 +8582,32 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
         FIXTURE_CRATES,
         [fixture_route("POST", "/c/other-crate", 200, request_body=body_of(("tags", False)))],
         {},
+    ),
+    (
+        "a local or imported item named like a prelude type shadows it",
+        FIXTURE_ALIAS_SCOPES,
+        [
+            fixture_route(
+                "GET", path, 200, params=[query_param("limit", "integer", False)]
+            )
+            for path in ("/s/local-option", "/s/imported-option", "/s/deep-option")
+        ]
+        + [
+            fixture_route(
+                "POST", "/s/imported-result", 200, request_body=body_of(("limit", False))
+            )
+        ],
+        {
+            "query_params": [
+                "GET /s/local-option: `limit` has type self::Option<u32>",
+                "GET /s/local-option: `limit` is mandatory in LocalOptionPage",
+                "GET /s/imported-option: `limit` has type other_crate::Option<u32>",
+                "GET /s/imported-option: `limit` is mandatory in ImportedOptionPage",
+                "GET /s/deep-option: `limit` has type self::Option<u32>",
+                "GET /s/deep-option: `limit` is mandatory in DeepOptionPage",
+            ],
+            "unresolved": ["POST /s/imported-result: cannot read a `Json<..>` extractor"],
+        },
     ),
     (
         "a field alias resolves through the import at the struct",
