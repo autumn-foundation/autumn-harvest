@@ -299,7 +299,12 @@ def mask_comments_and_strings(text: str) -> str:
     the wrapper call inside a comment (`// order_due_rows_for_deadlock_free_firing(...)`,
     describing a bypass rather than performing one) would satisfy the same
     regex a real call does. Searching the masked text instead means only
-    code the compiler would actually see can match.
+    code the compiler would actually see can match. A follow-up round
+    found the char-literal gap applied here too: an unmasked `'"'` (a
+    valid char literal holding a quote) was mistaken for the start of a
+    string, and the resulting scan for a closing `"` could blank out an
+    unrelated, much later part of the function — including the real
+    assignment and loop this check exists to find.
     """
     n = len(text)
     out = list(text)
@@ -333,6 +338,12 @@ def mask_comments_and_strings(text: str) -> str:
             blank(i, j)
             i = j
             continue
+        if c == "'":
+            char_end = _try_skip_char_literal(text, i)
+            if char_end is not None:
+                blank(i, char_end)
+                i = char_end
+                continue
         i += 1
     return "".join(out)
 
@@ -365,8 +376,8 @@ def extract_function(text: str, name: str) -> str | None:
 # wrapper entirely, just one step removed. Read-only calls (`.len()`,
 # `.is_empty()`, `.iter()`, ...) are deliberately not in this list.
 _MUTATING_VEC_METHODS = (
-    "sort", "sort_by", "sort_by_key", "sort_unstable", "sort_unstable_by",
-    "sort_unstable_by_key", "reverse", "shuffle", "swap", "retain",
+    "sort", "sort_by", "sort_by_key", "sort_by_cached_key", "sort_unstable",
+    "sort_unstable_by", "sort_unstable_by_key", "reverse", "shuffle", "swap", "retain",
     "retain_mut", "truncate", "extend", "extend_from_slice", "push", "pop",
     "clear", "append", "drain", "insert", "remove", "swap_remove",
     "rotate_left", "rotate_right", "dedup", "dedup_by", "dedup_by_key",
