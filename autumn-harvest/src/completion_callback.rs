@@ -2563,13 +2563,19 @@ async fn apply_delivered_outcomes_batch(
     Ok(())
 }
 
+/// One row's worth of a `Backoff` outcome, staged for
+/// [`apply_backoff_outcomes_batch`]: `(id, attempt, next_attempt_at,
+/// last_status, last_error)`.
+#[cfg(feature = "db")]
+type BackoffOutcomeRow = (Uuid, i32, DateTime<Utc>, Option<u16>, Option<String>);
+
 /// Bulk-record every `Backoff` outcome from one scanner tick in a single
 /// round trip. Same join-on-`(id, attempt)` guard as
 /// [`apply_delivered_outcomes_batch`]; see its doc comment.
 #[cfg(feature = "db")]
 async fn apply_backoff_outcomes_batch(
     conn: &mut diesel_async::AsyncPgConnection,
-    rows: &[(Uuid, i32, DateTime<Utc>, Option<u16>, Option<String>)],
+    rows: &[BackoffOutcomeRow],
     now: DateTime<Utc>,
 ) -> crate::error::HarvestResult<()> {
     use diesel_async::RunQueryDsl;
@@ -2755,6 +2761,7 @@ async fn completion_deliveries_table_exists(
 /// "processed" for scanner-tick accounting, mirroring
 /// `enforce_timeouts_once`'s `count` semantics).
 #[cfg(feature = "db")]
+#[allow(clippy::too_many_lines)] // claim + re-read + dispatch + classify + batched-apply is one tick
 async fn fire_due_on_conn(
     conn: &mut diesel_async::AsyncPgConnection,
     config: &CallbackRuntimeConfig,
@@ -2896,7 +2903,7 @@ async fn fire_due_on_conn(
     // guarantee (`dead_letter_entry_with_current_payload`) this change
     // does not touch.
     let mut delivered_rows: Vec<(Uuid, i32, u16)> = Vec::new();
-    let mut backoff_rows: Vec<(Uuid, i32, DateTime<Utc>, Option<u16>, Option<String>)> = Vec::new();
+    let mut backoff_rows: Vec<BackoffOutcomeRow> = Vec::new();
     let mut dead_letter_rows: Vec<(ClaimedDeliveryRow, OutcomeAction)> = Vec::new();
 
     for ((row, _body, _headers), attempt_outcome) in dispatchable.into_iter().zip(attempt_outcomes)
