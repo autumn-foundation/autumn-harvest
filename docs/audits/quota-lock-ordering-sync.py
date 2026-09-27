@@ -82,6 +82,18 @@ the wrapper's argument list by real paren depth (`find_matching_paren`,
 over the same masked text) and requiring the loop's iterable to be
 exactly `var {` closes both.
 
+Every fix so far still only looked AFTER the assignment. A later round
+found this check finds one correctly ordered assignment/loop pair
+anywhere in the function and calls it satisfied — it never checked
+whether an EARLIER branch could fire rows first. A special-case branch
+that loops over the raw, unordered `due_rows` and returns, before the
+ordering assignment further down is ever reached, still passes: some
+transactions take that branch and claim-order-fire regardless. Rejecting
+any `for _ in var {` loop found before the assignment closes the
+concrete case, though it does not prove the assignment dominates every
+possible control-flow path in full generality — that would need real
+control-flow analysis, not text scanning.
+
 Function extraction matches braces through `find_matching_brace`, not a
 raw character count. Codex review on PR #1696 found the raw count could
 be desynced by a brace inside a line comment, a block comment, or a
@@ -162,8 +174,16 @@ FN_SIGNATURE_RE_TEMPLATE = r"\n(?:async )?fn {name}\s*\("
 # Codex review on PR #1696 found that without it, an identifier merely ending
 # in `r` right before an ordinary string — `bar"\"}"`, a valid adjacent macro
 # token pair — matched at that trailing `r` and misclassified the following
-# normal, escape-aware string as a raw one.
-_RAW_STRING_OPEN_RE = re.compile(r'(?<![A-Za-z0-9_])(?:b|c)?r(#*)"')
+# normal, escape-aware string as a raw one. A follow-up round found the
+# lookbehind's excluded set still missed `'`: `'r"\"}"` tokenizes in Rust as
+# the lifetime `'r` followed by an ordinary string, but this scanner treats
+# the bare `'` as an ordinary character (correctly, per `_try_skip_char_literal`
+# recognizing it as a lifetime, not a char literal) and then matched raw-string
+# open at the very next `r`, since a bare `'` is not itself a word character.
+# Excluding a preceding `'` too closes that; the rare, contrived case of a
+# raw string genuinely and adjacently preceded by a char literal's closing
+# quote (`'a'r"..."`, no space) is not worth the ambiguity it would reopen.
+_RAW_STRING_OPEN_RE = re.compile(r"(?<![A-Za-z0-9_'])(?:b|c)?r(#*)\"")
 
 
 def _skip_line_comment(text: str, i: int) -> int:
@@ -451,7 +471,13 @@ def check_call_site_guard(text: str, file_label: str, enclosing_fn: str, wrapper
     slice projection all pass a check that only confirms the identifier
     matches. Whitelisting the few reads the real code needs, and failing
     on anything else, closes the whole class at once rather than one
-    mutating shape at a time.
+    mutating shape at a time. A further round found the assignment and
+    loop needed anchoring by real structure, not lazy regex spans, to
+    reject a transformation chained onto either the assignment
+    (`.into_iter().rev().collect()`) or the loop's iterable. Rejects any
+    `for _ in var {` loop found BEFORE the assignment too, so a
+    special-case branch cannot fire the raw, unordered batch and return
+    before the ordering step is ever reached.
     """
     body = extract_function(text, enclosing_fn)
     if body is None:
@@ -469,6 +495,17 @@ def check_call_site_guard(text: str, file_label: str, enclosing_fn: str, wrapper
         )
 
     var = call_open_match.group(1)
+
+    early_loop_re = re.compile(r"for\s+\w+\s+in\s+" + re.escape(var) + r"\s*\{")
+    early_loop_match = early_loop_re.search(masked[: call_open_match.start()])
+    if early_loop_match is not None:
+        return (
+            f"{file_label}::{enclosing_fn}: a `for _ in {var} {{` loop fires rows "
+            f"before the `{wrapper_call}` assignment is even reached — an early "
+            "branch (e.g. a special case that fires and returns) can claim-order "
+            "fire without ever going through the ordering wrapper"
+        )
+
     call_close = find_matching_paren(masked, call_open_match.end() - 1)
     tail_match = re.compile(r"\s*(?:\.await)?\s*\??\s*;").match(masked, call_close)
     if tail_match is None:
