@@ -413,6 +413,7 @@ where
 /// Method form of [`buffered_settled`] (issue #1429). Chain it before `.await`.
 ///
 /// Both forms behave the same.
+#[cfg(feature = "db")]
 pub(crate) trait BufferedSettledExt<T, E>: Future<Output = Result<T, E>> + Sized {
     /// Run this transaction future in a buffering scope and settle its hints.
     ///
@@ -422,6 +423,7 @@ pub(crate) trait BufferedSettledExt<T, E>: Future<Output = Result<T, E>> + Sized
     }
 }
 
+#[cfg(feature = "db")]
 impl<T, E, F: Future<Output = Result<T, E>>> BufferedSettledExt<T, E> for F {}
 
 /// Publish `hints` on the installed channel now.
