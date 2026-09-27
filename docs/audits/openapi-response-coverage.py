@@ -666,28 +666,24 @@ def carrier_parses(
     """
     found = block_parses(block, carriers, returns)
     parses = [(kind, o or optional, t or tolerant) for kind, o, t in found]
-    for helper in called_helpers(source, block):
-        parts = function_parts(source, helper)
-        if parts is None:
+    for helper, parts, name, guarded, discarded in handoffs(source, block, carriers):
+        if parts is None or name is None:
             continue
         params, helper_returns, helper_block = parts
-        byte_names = byte_parameters(params)
-        states = receiving_parameters(block, helper, params, carriers)
-        for name, (guarded, discarded) in states.items():
-            if name not in byte_names or (helper, name) in path:
-                continue
-            if len(path) >= HELPER_DEPTH:
-                parses.append((None, optional or guarded, tolerant or discarded))
-                continue
-            parses += carrier_parses(
-                source,
-                helper_block,
-                moved_names(helper_block, {name}),
-                helper_returns,
-                optional or guarded,
-                tolerant or discarded,
-                path | {(helper, name)},
-            )
+        if name not in byte_parameters(params) or (helper, name) in path:
+            continue
+        if len(path) >= HELPER_DEPTH:
+            parses.append((None, optional or guarded, tolerant or discarded))
+            continue
+        parses += carrier_parses(
+            source,
+            helper_block,
+            moved_names(helper_block, {name}),
+            helper_returns,
+            optional or guarded,
+            tolerant or discarded,
+            path | {(helper, name)},
+        )
     return parses
 
 
@@ -731,27 +727,68 @@ def split_top_level(text: str) -> list[str]:
     return items
 
 
+# A word before `(` that is a keyword, not a call.
+NOT_CALLS = frozenset({"if", "match", "while", "for", "return", "in", "loop", "move", "fn"})
+
+
+def outside_calls(argument: str) -> str:
+    """`argument` with the argument list of each call in it blanked.
+
+    A name inside `normalize(body)` is passed to `normalize`, not to the call
+    that receives its result, so only a name outside every inner call is
+    passed on. A receiver such as `body` in `body.as_ref()` stays.
+    """
+    out = argument
+    for call in re.finditer(r"[\w!>]\s*\(", argument):
+        opener = call.end() - 1
+        inner = balanced(argument[opener:])
+        out = out[: opener + 1] + " " * (len(inner) - 2) + out[opener + len(inner) - 1 :]
+    return out
+
+
+def handoffs(
+    source: str, block: str, carriers: dict[str, int]
+) -> list[tuple[str, tuple[str, str, str] | None, str | None, bool, bool]]:
+    """`(helper, parts, parameter, optional, tolerant)` for each carrier handoff.
+
+    A handoff is a free call in `block` that gets a live carrier as an
+    argument, outside any inner call. `parts` is `None` when the audit cannot
+    find the helper, and `parameter` is `None` when the receiving parameter
+    has no plain name. Both the raw-body scan and the `Result` extractor scan
+    read their helpers through this one step.
+    """
+    found = []
+    names = set(re.findall(r"(?<![\w.:])([a-z_][a-z_0-9]*)\s*\(", block))
+    for helper in sorted(names - NOT_CALLS - GENERIC_HELPERS):
+        parts = function_parts(source, helper)
+        states = receiving_parameters(block, helper, parts[0] if parts else "", carriers)
+        found += [(helper, parts, name, o, t) for name, (o, t) in states.items()]
+    return found
+
+
 def receiving_parameters(
     block: str, helper: str, params: str, variables: dict[str, int]
-) -> dict[str, tuple[bool, bool]]:
+) -> dict[str | None, tuple[bool, bool]]:
     """`(optional, tolerant)` for each `helper` parameter that gets a variable.
 
     Each argument maps to the parameter at its position. A `self` receiver is
     skipped, since a call does not pass it in the argument list. A parameter
     is optional when every call that fills it is guarded by `.is_empty()` or
     turns the error into a value. It is tolerant when every such call turns
-    the error into a value.
+    the error into a value. A variable counts only outside every inner call
+    of its argument, as `outside_calls` reads it. An argument with no named
+    parameter maps to `None`.
     """
     # A pattern such as `Extension(state): ..` keeps its slot with no name, so
     # the parameters after it keep their positions.
     names: list[str | None] = []
-    for item in split_top_level(params[1:-1]):
+    for item in split_top_level(params[1:-1] if params else ""):
         if re.fullmatch(r"&?\s*(?:'[a-z_]+\s+)?(?:mut\s+)?self", item):
             continue
         plain = re.match(r"(?:mut\s+)?([a-z_][a-z_0-9]*)\s*:", item)
         names.append(plain.group(1) if plain else None)
     states: dict[str, tuple[bool, bool]] = {}
-    for call in re.finditer(r"\b%s\s*\(" % re.escape(helper), block):
+    for call in re.finditer(r"(?<![\w.:])%s\s*\(" % re.escape(helper), block):
         raw = balanced(block[call.end() - 1 :])
         arguments = split_top_level(raw[1:-1].replace("->", ""))
         tolerant = discards_error(block[: call.start()], block[call.end() - 1 + len(raw) :])
@@ -759,11 +796,11 @@ def receiving_parameters(
             passed = [
                 v
                 for v, bound_at in variables.items()
-                if re.search(r"\b%s\b" % re.escape(v), argument)
+                if re.search(r"(?<![.\w])%s\b" % re.escape(v), outside_calls(argument))
                 and live_binding(block, v, call.start(), bound_at)
             ]
             name = names[index] if index < len(names) else None
-            if not passed or not name:
+            if not passed:
                 continue
             guarded = any(guards(block, call.start(), variable) for variable in passed)
             was_optional, was_tolerant = states.get(name, (True, True))
@@ -883,7 +920,11 @@ def rejects_result_body(params: str, block: str) -> bool:
 
 
 def error_rejects(
-    name: str, block: str, seen: frozenset[str] = frozenset(), bound_at: int = -1
+    name: str,
+    block: str,
+    seen: frozenset[str] = frozenset(),
+    bound_at: int = -1,
+    path: frozenset[tuple[str, str]] = frozenset(),
 ) -> bool:
     """Whether the handler rejects the error of the `Result` extractor `name`.
 
@@ -893,6 +934,11 @@ def error_rejects(
     `block` has its comments and literals masked, so a call in them is no use.
     A later `let` that gives `name` a new value ends the extractor, as
     `live_binding` reads it. `bound_at` is where a move created `name`.
+
+    A helper that gets the extractor, as `handoffs` reads it, is read the same
+    way, with `path` and `HELPER_DEPTH` as in `carrier_parses`. A helper the
+    audit cannot find or read makes the body mandatory, so the audit fails
+    closed.
     """
     variable = re.escape(name)
 
@@ -902,7 +948,7 @@ def error_rejects(
     moved = r"\blet\s+(?:mut\s+)?([a-z_][a-z_0-9]*)\s*(?::[^=;]*)?=\s*%s\s*;" % variable
     for alias in re.finditer(moved, block):
         if alias.group(1) not in seen | {name} and live(alias.start()):
-            if error_rejects(alias.group(1), block, seen | {name}, alias.start()):
+            if error_rejects(alias.group(1), block, seen | {name}, alias.start(), path):
                 return True
     borrow = r"(?:&\s*(?:mut\s+)?)?"
     method = r"(?:\s*\.\s*as_(?:ref|mut)\s*\(\s*\))?"
@@ -953,6 +999,12 @@ def error_rejects(
         if live(tested.start()) and re.match(r"\s*else\s*\{", rest):
             otherwise = balanced(rest[rest.index("{") :], "{", "}")
             if rejecting_exit(otherwise):
+                return True
+    for helper, parts, parameter, _, _ in handoffs(SOURCE[0], block, {name: bound_at}):
+        if parts is None or parameter is None or len(path) >= HELPER_DEPTH:
+            return True
+        if (helper, parameter) not in path:
+            if error_rejects(parameter, parts[2], path=path | {(helper, parameter)}):
                 return True
     return False
 
@@ -1533,7 +1585,13 @@ def wire_type(declared_type: str) -> str | None:
 def query_struct_findings(
     method: str, path: str, route: dict, queries: list[tuple[str, str, bool]]
 ) -> list[str]:
-    """Check 6: the `Query<T>` structs and the route's query parameters agree."""
+    """Check 6: the `Query<T>` structs and the route's query parameters agree.
+
+    Each extractor reads the whole query string, so a key that several structs
+    accept is judged once for the route. It is mandatory when any extractor
+    that is not wrapped requires it. Its OpenAPI type must be the same in every
+    struct, or the key is a finding.
+    """
     documented = {
         entry.get("name"): entry
         for entry in route.get("params") or []
@@ -1542,35 +1600,58 @@ def query_struct_findings(
     where = "  %s %s: `%%s`" % (method, path)
     found: list[str] = []
     accepted: set[str] = set()
+    # (struct, field, declared type, mandatory) for each documented key.
+    readers: dict[str, list[tuple[str, str, str, bool]]] = {}
     for name, struct, wrapped in queries:
         for field, declared_type, mandatory, spellings in struct_fields(struct):
-            mandatory = mandatory and not wrapped
             accepted |= set(spellings)
-            entry = documented.get(documented_as(spellings, documented))
-            if entry is None:
+            key = documented_as(spellings, documented)
+            if documented.get(key) is None:
                 found.append(
                     where % field
                     + " is accepted by %s but the contract does not document it" % name
                 )
                 continue
-            kind = wire_type(declared_type)
-            if kind is None:
+            readers.setdefault(key, []).append(
+                (name, field, declared_type, mandatory and not wrapped)
+            )
+    for key, fields in readers.items():
+        entry = documented[key]
+        kinds = {wire_type(declared_type) for _, _, declared_type, _ in fields}
+        for name, field, declared_type, _ in fields:
+            if wire_type(declared_type) is None:
                 found.append(
                     where % field + " has type %s, which maps to no OpenAPI type" % declared_type
                 )
-            elif entry.get("type") != kind:
-                found.append(
-                    where % field
-                    + " is %s in %s but the contract says %s" % (kind, name, entry.get("type"))
+        kinds.discard(None)
+        if len(kinds) > 1:
+            found.append(
+                where % key
+                + " has conflicting types: "
+                + ", ".join(
+                    "%s in %s" % (wire_type(declared_type), name)
+                    for name, _, declared_type, _ in fields
                 )
-            if mandatory and entry.get("required") is not True:
-                found.append(
-                    where % field + " is mandatory in %s but the contract marks it optional" % name
-                )
-            if not mandatory and entry.get("required") is True:
-                found.append(
-                    where % field + " is optional in %s but the contract marks it required" % name
-                )
+            )
+        elif kinds and entry.get("type") not in kinds:
+            name, field, declared_type, _ = fields[0]
+            found.append(
+                where % field
+                + " is %s in %s but the contract says %s"
+                % (wire_type(declared_type), name, entry.get("type"))
+            )
+        strict = [(name, field) for name, field, _, mandatory in fields if mandatory]
+        if strict and entry.get("required") is not True:
+            name, field = strict[0]
+            found.append(
+                where % field + " is mandatory in %s but the contract marks it optional" % name
+            )
+        if not strict and entry.get("required") is True:
+            field = fields[0][1]
+            owners = " or ".join(sorted({reader for reader, _, _, _ in fields}))
+            found.append(
+                where % field + " is optional in %s but the contract marks it required" % owners
+            )
     owners = " or ".join(name for name, _, _ in queries)
     for key in documented.keys() - accepted:
         found.append(where % key + " is documented but %s does not accept it" % owners)
@@ -2276,6 +2357,12 @@ pub fn harvest_api_router() -> Router {
         .route("/e/raw-shadowed", post(e_raw_shadowed))
         .route("/e/raw-two-level", post(e_raw_two_level))
         .route("/e/raw-recursive", post(e_raw_recursive))
+        .route("/e/json-handoff", post(e_json_handoff))
+        .route("/e/json-handoff-unknown", post(e_json_handoff_unknown))
+        .route("/e/json-handoff-tolerant", post(e_json_handoff_tolerant))
+        .route("/e/raw-nested-argument", post(e_raw_nested_argument))
+        .route("/e/shared-query-key", get(e_shared_query_key))
+        .route("/e/conflicting-query-key", get(e_conflicting_query_key))
         .route("/e/helper-in-comment", get(e_helper_in_comment))
         .route("/e/json-std-err", post(e_json_std_err))
         .route("/e/json-core-err", post(e_json_core_err))
@@ -3148,6 +3235,64 @@ fn decode_pong(raw: &[u8], depth: u32) -> Response {
     }
     let gadget = serde_json::from_slice::<Gadget>(raw).unwrap();
     StatusCode::OK.into_response()
+}
+
+async fn e_json_handoff(body: Result<Json<Gadget>, JsonRejection>) -> Result<Response, JsonRejection> {
+    consume_body(body)
+}
+
+fn consume_body(input: Result<Json<Gadget>, JsonRejection>) -> Result<Response, JsonRejection> {
+    let Json(gadget) = input?;
+    Ok(StatusCode::OK.into_response())
+}
+
+async fn e_json_handoff_unknown(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    elsewhere_defined(body)
+}
+
+async fn e_json_handoff_tolerant(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    peek_body(body)
+}
+
+fn peek_body(input: Result<Json<Gadget>, JsonRejection>) -> Response {
+    let seen = input.is_ok();
+    StatusCode::OK.into_response()
+}
+
+async fn e_raw_nested_argument(body: Bytes) -> Response {
+    decode_normalized(&normalize_empty(&body))
+}
+
+fn normalize_empty(raw: &[u8]) -> Vec<u8> {
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    raw.to_vec()
+}
+
+fn decode_normalized(raw: &[u8]) -> Response {
+    let gadget = serde_json::from_slice::<Gadget>(raw).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_shared_query_key(Query(page): Query<StrictLimit>, Query(hint): Query<LooseLimit>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn e_conflicting_query_key(Query(page): Query<StrictLimit>, Query(named): Query<NamedLimit>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+struct StrictLimit {
+    limit: u32,
+}
+
+struct LooseLimit {
+    limit: Option<u32>,
+}
+
+struct NamedLimit {
+    limit: String,
 }
 
 async fn e_helper_in_comment() -> Response {
@@ -5005,6 +5150,64 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             "body_required": [
                 "POST /e/raw-two-level: the body is mandatory",
                 "POST /e/raw-recursive: the body is mandatory",
+            ]
+        },
+    ),
+    (
+        "a Result extractor handed to a helper is read in the helper",
+        FIXTURE_EDGES,
+        [
+            fixture_route("POST", path, 200, request_body=body_of(("name", True), required=False))
+            for path in ("/e/json-handoff", "/e/json-handoff-unknown")
+        ]
+        + [
+            fixture_route(
+                "POST",
+                "/e/json-handoff-tolerant",
+                200,
+                request_body=body_of(("name", False), required=False),
+            )
+        ],
+        {
+            "body_required": [
+                "POST /e/json-handoff: the body is mandatory",
+                "POST /e/json-handoff-unknown: the body is mandatory",
+            ]
+        },
+    ),
+    (
+        "a raw body inside another call's argument is not passed to the outer call",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/raw-nested-argument",
+                200,
+                request_body=body_of(("name", False), required=False),
+            )
+        ],
+        {},
+    ),
+    (
+        "a query key is required when any strict extractor requires it",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "GET",
+                "/e/shared-query-key",
+                200,
+                params=[query_param("limit", "integer", True)],
+            ),
+            fixture_route(
+                "GET",
+                "/e/conflicting-query-key",
+                200,
+                params=[query_param("limit", "integer", True)],
+            ),
+        ],
+        {
+            "query_params": [
+                "GET /e/conflicting-query-key: `limit` has conflicting types",
             ]
         },
     ),
