@@ -585,6 +585,9 @@ def resolve_symbol(kind: str, reference: str, site: Site | None = None) -> list 
     methods, and `Self::` keeps any method. A plain module path keeps free
     functions.
 
+    `Self::` keeps the methods of the `impl` or `trait` block that holds the
+    site. Outside such a block it keeps any method.
+
     A bare name with no import follows the visibility rule of its kind. A
     fn must be in the site's module or an ancestor, or be public. A struct
     may be anywhere. A type alias must be the only alias of that name, and be
@@ -616,6 +619,8 @@ def resolve_symbol(kind: str, reference: str, site: Site | None = None) -> list 
         typed = qualifier[-1] if qualifier and qualifier[-1][0].isupper() else None
         if typed:
             qualifier = qualifier[:-1]
+        if typed == "Self":
+            typed = enclosing_owner(site) or typed
         found = [item for item in found if (item[2] is None) == (typed is None)]
         found = [item for item in found if typed in (None, "Self", item[2])]
     if not bare:
@@ -633,22 +638,67 @@ def resolve_symbol(kind: str, reference: str, site: Site | None = None) -> list 
     return [item[1] for item in found]
 
 
-def called_helpers(source: str, body: str) -> list[int]:
+def called_helpers(source: str, body: str, params: str = "") -> list[int]:
     """Where each function in this file that `body` calls is defined.
 
     Every call is read: bare, path-qualified and method calls, each from its
-    own site. A call that can reach more than one definition reads all of
-    them, so no status a helper can return is dropped.
+    own site. A method call reaches what `method_targets` finds. A call that
+    can reach more than one definition reads all of them, so no status a
+    helper can return is dropped.
     """
     starts: set[int] = set()
     for call in re.finditer(FREE_CALL_NAME, body):
         if call.group(1) not in GENERIC_HELPERS | NOT_CALLS:
             starts.update(resolve_symbol("fn", call.group(1), site_in(body, call.start())) or [])
     for call in re.finditer(QUALIFIED_CALL, body):
-        if call.group(2) not in GENERIC_HELPERS:
-            reference = call.group(1) + call.group(2)
-            starts.update(resolve_symbol("fn", reference, site_in(body, call.start())) or [])
+        if call.group(2) in GENERIC_HELPERS:
+            continue
+        if call.group(1).strip() == ".":
+            targets = method_targets(body, params, call)
+            # A receiver of unknown type reads every method of that name. This
+            # is deliberate: a status is never dropped for want of a type.
+            if targets is None:
+                targets = resolve_symbol("fn", "." + call.group(2)) or []
+            starts.update(targets)
+            continue
+        reference = call.group(1) + call.group(2)
+        starts.update(resolve_symbol("fn", reference, site_in(body, call.start())) or [])
     return sorted(starts)
+
+
+def method_targets(block: str, params: str, call: re.Match) -> list[int] | None:
+    """The methods that a method call `call` in `block` reaches, or `None`.
+
+    `receiver_type` reads the receiver's written type from `block` or
+    `params`, and the call reaches that type's methods only. A `self`
+    receiver reaches the methods of the enclosing `impl`. `None` means the
+    receiver has no type the audit can know. The status scan and the handoff
+    scan both read method calls through this one step.
+    """
+    receiver = call_receiver(block, call.start())
+    typed = receiver_type(block, params, receiver, call.start()) if receiver else None
+    if typed is None:
+        return None
+    return resolve_symbol("fn", typed + "::" + call.group(2), site_in(block, call.start())) or []
+
+
+def call_receiver(block: str, dot: int) -> str | None:
+    """The plain name just before the `.` of a method call at `dot`, or `None`."""
+    start = max(0, dot - 128)
+    head = block[start:dot].rstrip()
+    name = re.search(r"[A-Za-z_]\w*$", head)
+    if name is None or (name.start() == 0 and start > 0):
+        return None
+    before = head[name.start() - 1] if name.start() else ""
+    return None if before and (before.isalnum() or before in "_.") else name.group(0)
+
+
+def enclosing_owner(site: Site) -> str | None:
+    """The type of the `impl`, or the `trait`, that holds a site in the audited source."""
+    text, at = site
+    if at is None or text != SOURCE[0]:
+        return None
+    return owner_at(block_owners(text, "impl") + block_owners(text, "trait"), at)
 
 
 def handler_parameters(source: str, name: str) -> str | None:
@@ -1571,8 +1621,8 @@ def handoffs(
 ) -> list[tuple[str, tuple[str, str, str] | None, str | None, bool, bool]]:
     """`(helper, parts, parameter, optional, tolerant)` for each carrier handoff.
 
-    A handoff is a free call in `block` that gets a live carrier as an
-    argument, outside any inner call. `parts` is `None` when the audit cannot
+    A handoff is a call in `block` that gets a live carrier as an argument,
+    outside any inner call. `call_sites` resolves each call at its own site. `parts` is `None` when the audit cannot
     find the helper, and `parameter` is `None` when the receiving parameter
     has no plain name. Both the raw-body scan and the `Result` extractor scan
     read their helpers through this one step.
@@ -1586,43 +1636,20 @@ def handoffs(
     type that `receiver_type` finds for `x` in `block` or `params`. The audit
     infers no other type, so a receiver of unknown type has no `parts`.
     """
-    found = []
-    first: dict[str, int] = {}
-    for call in re.finditer(FREE_CALL_NAME, block):
-        first.setdefault(call.group(1), call.start())
-    for helper in sorted(set(first) - NOT_CALLS - GENERIC_HELPERS):
-        site = site_in(block, first[helper])
-        if std_path(helper, site):
-            continue
-        parts = function_parts(source, helper, site)
-        states = receiving_parameters(block, helper, parts[0] if parts else "", carriers)
-        found += [(helper, parts, name, o, t) for name, (o, t) in states.items()]
-    # A path-qualified call or a method call is found by its last segment in
-    # the same file, as an associated fn or an impl method. It gets only a
-    # direct argument, so a receiver such as `body.as_ref()` is no handoff.
-    paths: dict[tuple[str, str], int] = {}
-    for call in qualified_calls(block):
-        if handoff_path(call, block):
-            paths.setdefault((call.group(2), re.sub(r"\s", "", call.group(1))), call.start())
-    for (helper, path), at in sorted(paths.items()):
-        if helper not in GENERIC_HELPERS and path != ".":
-            site = site_in(block, at)
-            parts = function_parts(source, path.rstrip(":") + "::" + helper, site)
-            helper_params = parts[0] if parts else ""
-            states = receiving_parameters(block, helper, helper_params, carriers, qualified=path)
-            found += [(helper, parts, name, o, t) for name, (o, t) in states.items()]
-    for call in re.finditer(QUALIFIED_CALL, block):
-        if call.group(1).strip() != "." or call.group(2) in GENERIC_HELPERS:
-            continue
-        receiver = re.search(r"(?<![\w.])([A-Za-z_]\w*)\s*$", block[: call.start()])
-        typed = receiver_type(block, params, receiver.group(1), call.start()) if receiver else None
-        site = site_in(block, call.start())
-        parts = function_parts(source, typed + "::" + call.group(2), site) if typed else None
+    # Each call resolves at its own site, since block-scoped imports can bind
+    # one name to different helpers. Calls that reach the same definition
+    # and parameter merge: optional and tolerant only when every call is.
+    merged: dict[tuple[object, str | None], tuple[str, Parts | None, bool, bool]] = {}
+    for helper, parts, at, qualified in call_sites(source, block, params):
         helper_params = parts[0] if parts else ""
-        states = receiving_parameters(
-            block, call.group(2), helper_params, carriers, qualified=".", at=call.start()
-        )
-        found += [(call.group(2), parts, name, o, t) for name, (o, t) in states.items()]
+        states = receiving_parameters(block, helper, helper_params, carriers, qualified, at)
+        identity = parts[2].start if parts else (helper, at)
+        for name, (optional, tolerant) in states.items():
+            if (identity, name) in merged:
+                _, _, was_optional, was_tolerant = merged[identity, name]
+                optional, tolerant = optional and was_optional, tolerant and was_tolerant
+            merged[identity, name] = (helper, parts, optional, tolerant)
+    found = [(helper, parts, name, o, t) for (_, name), (helper, parts, o, t) in merged.items()]
     for variable, bound_at in carriers.items() if receivers else []:
         receiver = r"(?<![.\w])%s\s*\.\s*([a-z_][a-z_0-9]*)%s\s*\(" % (re.escape(variable), TURBOFISH)
         for call in re.finditer(receiver, block):
@@ -1638,6 +1665,42 @@ def handoffs(
             by_self = r"\(\s*&?\s*(?:'[a-z_]+\s+)?(?:mut\s+)?self\b"
             self_param = parts is not None and re.match(by_self, parts[0])
             found.append((method, parts if self_param else None, "self", guarded or tolerant, tolerant))
+    return found
+
+
+# A fn's parameter list, return clause and block, as `parts_at` reads them.
+Parts = tuple[str, str, str]
+
+
+def call_sites(
+    source: str, block: str, params: str
+) -> list[tuple[str, tuple[str, str, str] | None, int, str | None]]:
+    """`(helper, parts, start, path)` for each call in `block` that can take a body.
+
+    A bare call, a path-qualified call and a method call each resolve at
+    their own site. `path` is `None` for a bare call, the written path for a
+    qualified one, and `.` for a method call, as `receiving_parameters` reads
+    it. A method call reaches what `method_targets` finds, and one with no
+    known receiver type has no `parts`, so a handoff to it fails closed.
+    """
+    found = []
+    for call in re.finditer(FREE_CALL_NAME, block):
+        helper = call.group(1)
+        site = site_in(block, call.start())
+        if helper in NOT_CALLS | GENERIC_HELPERS or std_path(helper, site):
+            continue
+        found.append((helper, function_parts(source, helper, site), call.start(), None))
+    for call in qualified_calls(block):
+        helper, path = call.group(2), re.sub(r"\s", "", call.group(1))
+        if helper in GENERIC_HELPERS or not handoff_path(call, block):
+            continue
+        if path == ".":
+            starts = method_targets(block, params, call) or []
+            parts = parts_at(source, starts[0]) if len(starts) == 1 else None
+        else:
+            site = site_in(block, call.start())
+            parts = function_parts(source, path.rstrip(":") + "::" + helper, site)
+        found.append((helper, parts, call.start(), path))
     return found
 
 
@@ -3139,7 +3202,7 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
             continue
         declared = declared_statuses(route)
 
-        helpers = called_helpers(code, body)
+        helpers = called_helpers(code, body, handler_parameters(code, handler) or "")
         bodies = [body]
         for helper in helpers:
             reached = parts_at(code, helper)
@@ -3911,6 +3974,11 @@ pub fn harvest_api_router() -> Router {
         .route("/n/external-module-alias", get(n_external_module_alias))
         .route("/n/local-module-alias", get(n_local_module_alias))
         .route("/n/external-module-helper", post(n_external_module_helper))
+        .route("/n/block-imports", post(n_block_imports))
+        .route("/n/block-module-imports", post(n_block_module_imports))
+        .route("/n/typed-reply", get(n_typed_reply))
+        .route("/n/unknown-reply", get(n_unknown_reply))
+        .route("/n/self-method", post(n_self_method))
         .route("/n/local-import", get(n_local_import))
         .route("/n/super-path", get(n_super_path))
         .route("/n/self-path", get(n_self_path))
@@ -4050,6 +4118,83 @@ mod helper_alias {
     async fn n_external_module_helper(body: Bytes) -> Response {
         helpers::decode_raw(&body)
     }
+}
+
+mod lenient_codec {
+    fn unpack(raw: &[u8]) -> Response {
+        StatusCode::OK.into_response()
+    }
+}
+
+mod strict_codec {
+    fn unpack(raw: &[u8]) -> Response {
+        let gadget = serde_json::from_slice::<Gadget>(raw).unwrap();
+        StatusCode::OK.into_response()
+    }
+}
+
+async fn n_block_imports(body: Bytes) -> Response {
+    {
+        use crate::lenient_codec::unpack;
+        unpack(&body);
+    }
+    {
+        use crate::strict_codec::unpack;
+        unpack(&body)
+    }
+}
+
+async fn n_block_module_imports(body: Bytes) -> Response {
+    {
+        use crate::lenient_codec as codec;
+        codec::unpack(&body);
+    }
+    {
+        use crate::strict_codec as codec;
+        codec::unpack(&body)
+    }
+}
+
+impl PlainReply {
+    fn reply(&self) -> Response {
+        StatusCode::OK.into_response()
+    }
+}
+
+impl PickyReply {
+    fn reply(&self) -> Response {
+        StatusCode::CONFLICT.into_response()
+    }
+}
+
+async fn n_typed_reply(replier: PlainReply) -> Response {
+    replier.reply()
+}
+
+async fn n_unknown_reply() -> Response {
+    let replier = make_replier();
+    replier.reply()
+}
+
+impl Relay {
+    fn relay(&self, raw: &[u8]) -> Response {
+        self.finish(raw)
+    }
+
+    fn finish(&self, raw: &[u8]) -> Response {
+        let gadget = serde_json::from_slice::<Gadget>(raw).unwrap();
+        StatusCode::OK.into_response()
+    }
+}
+
+impl Sink {
+    fn finish(&self, raw: &[u8]) -> Response {
+        StatusCode::OK.into_response()
+    }
+}
+
+async fn n_self_method(body: Bytes, relay: Relay) -> Response {
+    relay.relay(&body)
 }
 
 async fn n_helper_parse_type(body: Bytes) -> Response {
@@ -8090,6 +8235,36 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
                 "POST /n/external-module-helper: cannot read a `from_slice` call",
             ],
         },
+    ),
+    (
+        "each call resolves at its own site, so block-scoped imports stay apart",
+        FIXTURE_NAMES,
+        [
+            fixture_route(
+                "POST", path, 200, request_body=body_of(("name", False), required=False)
+            )
+            for path in ("/n/block-imports", "/n/block-module-imports")
+        ],
+        {
+            "body_required": [
+                "POST /n/block-imports: the body is mandatory",
+                "POST /n/block-module-imports: the body is mandatory",
+            ],
+            "mandatory": [
+                "POST /n/block-imports: `name` is mandatory in Gadget",
+                "POST /n/block-module-imports: `name` is mandatory in Gadget",
+            ],
+        },
+    ),
+    (
+        "a method call reaches its receiver type's method, and self its own impl",
+        FIXTURE_NAMES,
+        [
+            fixture_route("GET", "/n/typed-reply", 200),
+            fixture_route("GET", "/n/unknown-reply", 200),
+            fixture_route("POST", "/n/self-method", 200, request_body=GADGET_BODY),
+        ],
+        {"statuses": ["GET /n/unknown-reply returns 409, undeclared"]},
     ),
     (
         "a parse type in a helper resolves from the helper's module",
