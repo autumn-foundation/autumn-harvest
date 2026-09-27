@@ -5531,9 +5531,9 @@ async fn detail_page_reset_action_redirects_with_flash() {
 /// guess an event number the operator never typed.
 ///
 /// A genuine failure now renders the detail page directly instead of
-/// redirecting (issue #1737): the submitted event number and reason
-/// survive in the reopened panel, next to an inline error, rather than
-/// being lost on a round trip through a flash string.
+/// redirecting (issue #1737). The submitted event number and reason
+/// survive in the reopened panel, next to an inline error. They are no
+/// longer lost on a round trip through a flash string.
 #[tokio::test]
 async fn detail_page_reset_action_with_invalid_event_number_reopens_form_with_echoed_values() {
     let (database_url, _container) = setup_test_database_url().await;
@@ -5570,11 +5570,12 @@ async fn detail_page_reset_action_with_invalid_event_number_reopens_form_with_ec
     );
 }
 
-/// Same in-place re-render, for a failure `parse_reset_to_event_id` lets
-/// through (a syntactically valid whole number) that `validate_reset_point`
-/// rejects: displayed "0" has no valid raw form (1-based display, 0-based
-/// storage), so it always maps to a negative raw id and is always rejected,
-/// independent of history state (issue #1737).
+/// Same in-place re-render, for a different kind of failure.
+/// `parse_reset_to_event_id` lets through a syntactically valid whole
+/// number that `validate_reset_point` rejects. Displayed "0" has no valid
+/// raw form (1-based display, 0-based storage). It always maps to a
+/// negative raw id, which is always rejected, independent of history
+/// state (issue #1737).
 #[tokio::test]
 async fn detail_page_reset_action_with_out_of_range_event_number_reopens_form_with_echoed_values() {
     let (database_url, _container) = setup_test_database_url().await;
