@@ -100,7 +100,15 @@ or a tuple destructure all remain undetected, and proving the assignment
 dominates every possible control-flow and data-flow path in full
 generality would need real static analysis, not text scanning. Past
 this point, a finding in this family is a documented limitation of the
-approach, not a fix this script can keep absorbing indefinitely.
+approach, not a fix this script can keep absorbing indefinitely. One
+explicitly considered and declined case: renaming the wrapper's OUTPUT
+binding (`let ordered_rows = wrapper_call(conn, due_rows).await?;`)
+would let an early branch loop over the still-unaliased `due_rows`
+argument and pass, since only the output binding and its own aliases are
+tracked. Tracking the wrapper's input argument as a second,
+independently-aliasable name is the same generalization, one hop over —
+declined for the same reason, and because neither tracked file ever
+renames the result in practice; both always shadow the same name.
 
 `extract_function` itself had a gap at its very first step: it searched
 for a tracked function's signature in unmasked text, so a signature-shaped
