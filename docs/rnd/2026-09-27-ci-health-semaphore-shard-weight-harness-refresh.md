@@ -84,8 +84,19 @@ rather than leave a second stale review cycle on that PR, this change
 re-lands the same harness, corrected, as a fresh PR from this session's own
 branch:
 
-1. Fixed the self-test's expected feature set (`+ "tls"`), verified against
-   the real `Cargo.toml`, not hand-copied a second time.
+1. **Superseded within this same PR (Codex review, round 1 on this PR):**
+   the first push here fixed the self-test by adding `"tls"` to its
+   hard-coded expected feature set. Codex correctly flagged that as the same
+   defect one level down — `main()` runs `self_test()` unconditionally
+   (including on every real, non-`--self-test` invocation), so the *next*
+   legitimate default-feature change on `autumn-harvest` would break this
+   PR's own newly-wired `lint` step the same way `tls` just broke PR #1703's.
+   The actual fix, landed second: `self_test()` now redirects the module's
+   `REPO_ROOT` to a disposable fixture crate tree (a temp `Cargo.toml` with
+   an invented `default = ["alpha", "beta"]`) for the duration of the
+   `crate_default_features`/`enabled_features_for_row` assertions, so the
+   self-test no longer depends on `autumn-harvest`'s real feature list at
+   all — nothing to hand-copy, nothing to go stale.
 2. Replaced the docstring's 09-22 findings table and sweep claim with a
    dated update reflecting today's manifest and shard count, explicitly
    marking the old table as historical (kept for the three rounds of
