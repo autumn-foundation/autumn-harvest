@@ -349,6 +349,12 @@ def function_index(source: str) -> dict[str, list[tuple[int, str | None]]]:
     owners = block_owners(source, "impl") + block_owners(source, "trait")
     index: dict[str, list[tuple[int, str | None]]] = {}
     for found in re.finditer(r"\b(?:async )?fn ([A-Za-z_][A-Za-z_0-9]*)\s*[(<]", source):
+        # A declaration with no body, as in a trait, is no definition.
+        opener = source.find("(", found.start())
+        after = opener + len(balanced(source[opener:]))
+        head = re.match(r"[^;{]*", source[after:])
+        if source[after + head.end() : after + head.end() + 1] != "{":
+            continue
         index.setdefault(found.group(1), []).append((found.start(), owner_at(owners, found.start())))
     return index
 
@@ -419,7 +425,9 @@ def struct_index(source: str, module: str = "") -> dict[str, list[tuple[str, str
     for found in re.finditer(r"\bstruct ([A-Za-z_][A-Za-z_0-9]*)\s*\{", code):
         inline = [name for start, end, name in sorted(modules) if start < found.start() < end]
         path = "::".join(part for part in [module, *inline] if part)
-        index.setdefault(found.group(1), []).append((path, struct_text(source, found)))
+        block = struct_text(source, found)
+        STRUCT_MODULES[block] = path
+        index.setdefault(found.group(1), []).append((path, block))
     return index
 
 
@@ -434,10 +442,7 @@ def defined_structs() -> dict[str, list[tuple[str, str]]]:
     for crate in CRATES:
         root = ROOT / crate / "src"
         for path in sorted(root.rglob("*.rs")):
-            parts = list(path.relative_to(root).with_suffix("").parts)
-            if parts[-1] in ("mod", "lib", "main"):
-                parts = parts[:-1]
-            for name, found in struct_index(path.read_text(), "::".join(parts)).items():
+            for name, found in struct_index(path.read_text(), module_path(root, path)).items():
                 index.setdefault(name, []).extend(found)
     return index
 
@@ -548,6 +553,7 @@ def struct_layout(
     could not read, or `None`. Every serde reader in the audit reads a struct
     through this one parse.
     """
+    original = struct
     struct = canonical_paths(code_only(struct, literals=False))
     opener = struct.index("{")
     container = serde_items(without_comment_lines(struct[:opener]))
@@ -573,7 +579,7 @@ def struct_layout(
         text = re.sub(r"\s*,\s*([>)])", r"\1", re.sub(r"([<(])\s+", r"\1", text))
         field = re.match(r"(?:pub(?:\([^)]*\))?\s+)?(?:r#)?([a-z_0-9]+)\s*:\s*(.+?),?$", text)
         if field:
-            resolved, unread = resolve_field_type(field.group(2))
+            resolved, unread = resolve_field_type(field.group(2), STRUCT_MODULES.get(original, ""))
             fields.append((field.group(1), resolved, serde_items(" ".join(attributes)), unread))
         attributes = []
     return container, fields
@@ -747,51 +753,97 @@ RESPONSE_TYPE = r"\w*(?:Response|Rejection|Error)\b|\b(?:StatusCode|Result)\b|\(
 # The source that `audit` reads, so a helper can be looked up by name.
 SOURCE = [""]
 
-# The type aliases the audited structs can use, by name: `(parameters, target)`.
-# `audit` sets it, from the fixture source or from both crates.
-TYPE_ALIASES: list[dict[str, tuple[list[str], str]]] = [{}]
+# One type alias: `(module path, parameters, target)`.
+TypeAlias = tuple[str, list[str], str]
+
+# The type aliases the audited structs can use, by bare name. `audit` sets it,
+# from the fixture source or from both crates.
+TYPE_ALIASES: list[dict[str, list[TypeAlias]]] = [{}]
+
+# The module path of each struct block that `struct_index` reads.
+STRUCT_MODULES: dict[str, str] = {}
 
 
-def type_aliases_in(source: str) -> dict[str, tuple[list[str], str]]:
-    """Each `type Name<P, ..> = Target;` in `source`: `(parameters, target)`."""
-    found = {}
-    for alias in re.finditer(r"\btype\s+([A-Z]\w*)\s*(?:<([^=;]*)>)?\s*=\s*([^;]+);", code_only(source)):
+def type_aliases_in(source: str, module: str = "") -> dict[str, list[TypeAlias]]:
+    """Each `type Name<P, ..> = Target;` in `source`, by name, with its module.
+
+    `module` is the path of the file itself. An inline `mod name { .. }` adds
+    its name, as `struct_index` does for structs.
+    """
+    code = code_only(source)
+    modules = block_owners(code, "mod")
+    found: dict[str, list[TypeAlias]] = {}
+    for alias in re.finditer(r"\btype\s+([A-Z]\w*)\s*(?:<([^=;]*)>)?\s*=\s*([^;]+);", code):
+        inline = [name for start, end, name in sorted(modules) if start < alias.start() < end]
+        path = "::".join(part for part in [module, *inline] if part)
         parameters = [part.strip() for part in split_expression(alias.group(2) or "", ",", types=True)]
-        found[alias.group(1)] = (parameters, alias.group(3).strip())
+        found.setdefault(alias.group(1), []).append((path, parameters, alias.group(3).strip()))
     return found
 
 
 @functools.lru_cache(maxsize=None)
-def crate_type_aliases() -> dict[str, tuple[list[str], str]]:
-    """The type aliases of both crates, as `type_aliases_in` reads them."""
-    found: dict[str, tuple[list[str], str]] = {}
+def crate_type_aliases() -> dict[str, list[TypeAlias]]:
+    """The type aliases of both crates, with each file's module path."""
+    found: dict[str, list[TypeAlias]] = {}
     for crate in CRATES:
-        for path in sorted((ROOT / crate / "src").rglob("*.rs")):
-            for name, alias in type_aliases_in(path.read_text()).items():
-                # Two different aliases of one name cannot be told apart, so
-                # the name is left unresolvable, and a field that uses it is
-                # unreadable.
-                found[name] = alias if found.get(name, alias) == alias else (["?"], "?")
+        root = ROOT / crate / "src"
+        for path in sorted(root.rglob("*.rs")):
+            for name, aliases in type_aliases_in(path.read_text(), module_path(root, path)).items():
+                found.setdefault(name, []).extend(aliases)
     return found
 
 
-def resolve_field_type(declared_type: str) -> tuple[str, str | None]:
+def module_path(root, path) -> str:
+    """The module path of a file under `src`: `a/b.rs` and `a/b/mod.rs` are `a::b`."""
+    parts = list(path.relative_to(root).with_suffix("").parts)
+    if parts[-1] in ("mod", "lib", "main"):
+        parts = parts[:-1]
+    return "::".join(parts)
+
+
+def pick_alias(qualifier: list[str], name: str, module: str) -> tuple[TypeAlias | None, bool]:
+    """The one alias a field type names, and whether the name is unreadable.
+
+    A qualified name picks the alias in that module, and names a plain type
+    when no alias matches. A bare name resolves only when exactly one alias of
+    that name exists and it is visible from `module`: the same module or the
+    crate root. Any other case is unreadable.
+    """
+    every = TYPE_ALIASES[0].get(name, [])
+    if qualifier:
+        found = [alias for alias in every if alias[0].split("::")[-1] == qualifier[-1]]
+        return (found[0], False) if len(found) == 1 else (None, len(found) > 1)
+    if not every:
+        return None, False
+    if len(every) == 1 and every[0][0] in (module, ""):
+        return every[0], False
+    return None, True
+
+
+def resolve_field_type(declared_type: str, module: str = "") -> tuple[str, str | None]:
     """A field type with its type aliases resolved, and an alias it cannot read.
 
     A no-parameter alias is replaced by its target. An alias whose target is
     the same type applied to the same parameters, such as `type Maybe<T> =
-    Option<T>`, is a rename. The passes repeat up to `ALIAS_PASSES`. Any other
-    alias, or a chain that does not settle, is returned by name, so the field
-    is unreadable. A field spelled through an alias is never read as a
+    Option<T>`, is a rename. `pick_alias` finds the alias, from the struct's
+    `module`. The passes repeat up to `ALIAS_PASSES`. Any other alias, an
+    ambiguous one, or a chain that does not settle, is returned by name, so
+    the field is unreadable. A field spelled through an alias is never read as a
     required non-`Option` by mistake.
     """
-    aliases = TYPE_ALIASES[0]
     for _ in range(ALIAS_PASSES):
-        head = re.fullmatch(r"\s*(?:[A-Za-z_]\w*\s*::\s*)*([A-Z]\w*)\s*(?:<(.*)>)?\s*", declared_type)
-        if head is None or head.group(1) not in aliases:
+        head = re.fullmatch(r"\s*((?:[A-Za-z_]\w*\s*::\s*)*)([A-Z]\w*)\s*(?:<(.*)>)?\s*", declared_type)
+        if head is None:
             return declared_type, None
-        parameters, target = aliases[head.group(1)]
-        arguments = [part.strip() for part in split_expression(head.group(2) or "", ",", types=True)]
+        path = [part.strip() for part in head.group(1).split("::") if part.strip()]
+        qualifier = [part for part in path if part not in CRATE_ROOTS]
+        alias, unreadable = pick_alias(qualifier, head.group(2), module)
+        if unreadable:
+            return declared_type, head.group(2)
+        if alias is None:
+            return declared_type, None
+        _, parameters, target = alias
+        arguments = [part.strip() for part in split_expression(head.group(3) or "", ",", types=True)]
         if not parameters and not arguments:
             declared_type = target
             continue
@@ -800,7 +852,7 @@ def resolve_field_type(declared_type: str) -> tuple[str, str | None]:
         if renamed and [part.strip() for part in inner] == parameters and len(arguments) == len(parameters):
             declared_type = "%s<%s>" % (renamed.group(1), ", ".join(arguments))
             continue
-        return declared_type, head.group(1)
+        return declared_type, head.group(2)
     head = re.match(r"\s*(?:[A-Za-z_]\w*\s*::\s*)*([A-Za-z_]\w*)", declared_type)
     return declared_type, head.group(1) if head else declared_type
 
@@ -971,14 +1023,15 @@ def carrier_parses(
     """
     found = block_parses(block, carriers, returns)
     parses = [(kind, o or optional, t or tolerant) for kind, o, t in found]
-    for helper, parts, name, guarded, discarded in handoffs(source, block, carriers):
+    for helper, parts, name, guarded, discarded in handoffs(source, block, carriers, receivers=True):
         # A helper the audit cannot find or read gets the body all the same, so
         # it is an unresolved parse, as for a `Result` extractor handoff.
         if parts is None or name is None:
             parses.append((None, optional or guarded, tolerant or discarded))
             continue
         params, helper_returns, helper_block = parts
-        if name not in byte_parameters(params) or (helper, name) in path:
+        # A method that gets the body as its receiver reads it as `self`.
+        if name != "self" and name not in byte_parameters(params) or (helper, name) in path:
             continue
         if len(path) >= HELPER_DEPTH:
             parses.append((None, optional or guarded, tolerant or discarded))
@@ -1090,8 +1143,20 @@ def outside_calls(argument: str) -> str:
     return out
 
 
+# Methods on `Bytes`, `[u8]` and `Vec<u8>` that read or copy the bytes and
+# run no deserializer. A raw body as their receiver is no handoff.
+BYTE_ACCESSORS = frozenset(
+    {
+        "as_ref", "as_slice", "as_bytes", "borrow", "chunks", "clone", "contains",
+        "copy_to_bytes", "deref", "ends_with", "first", "get", "into", "is_empty",
+        "iter", "last", "len", "slice", "split_at", "split_off", "split_to",
+        "starts_with", "to_owned", "to_vec", "windows",
+    }
+)
+
+
 def handoffs(
-    source: str, block: str, carriers: dict[str, int]
+    source: str, block: str, carriers: dict[str, int], receivers: bool = False
 ) -> list[tuple[str, tuple[str, str, str] | None, str | None, bool, bool]]:
     """`(helper, parts, parameter, optional, tolerant)` for each carrier handoff.
 
@@ -1100,6 +1165,11 @@ def handoffs(
     find the helper, and `parameter` is `None` when the receiving parameter
     has no plain name. Both the raw-body scan and the `Result` extractor scan
     read their helpers through this one step.
+
+    With `receivers`, a raw body that is the receiver of a method call, as in
+    `body.decode::<T>()`, is handed to that method's `self`, unless the method
+    is one of `BYTE_ACCESSORS`. The method is found through the symbol index.
+    An unknown or ambiguous one has no `parts`, so the caller fails closed.
     """
     found = []
     names = set(re.findall(FREE_CALL_NAME, block))
@@ -1122,6 +1192,19 @@ def handoffs(
             params = parts[0] if parts else ""
             states = receiving_parameters(block, helper, params, carriers, qualified=path)
             found += [(helper, parts, name, o, t) for name, (o, t) in states.items()]
+    for variable, bound_at in carriers.items() if receivers else []:
+        receiver = r"(?<![.\w])%s\s*\.\s*([a-z_][a-z_0-9]*)%s\s*\(" % (re.escape(variable), TURBOFISH)
+        for call in re.finditer(receiver, block):
+            method = call.group(1)
+            if method in BYTE_ACCESSORS or not live_binding(block, variable, call.start(), bound_at):
+                continue
+            parts = function_parts(source, method, ".")
+            after = block[call.end() - 1 + len(balanced(block[call.end() - 1 :])) :]
+            tolerant = discards_error(block[: call.start()], after)
+            guarded = guards(block, call.start(), variable)
+            by_self = r"\(\s*&?\s*(?:'[a-z_]+\s+)?(?:mut\s+)?self\b"
+            self_param = parts is not None and re.match(by_self, parts[0])
+            found.append((method, parts if self_param else None, "self", guarded or tolerant, tolerant))
     return found
 
 
@@ -2418,7 +2501,8 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
     code = masked_source(source)
     unreadable = unreadable_aliases(code) + [(0, len(code), name) for name in unsettled]
     SOURCE[0] = code
-    TYPE_ALIASES[0] = getattr(find_struct, "aliases", None) or crate_type_aliases()
+    aliases = getattr(find_struct, "aliases", None)
+    TYPE_ALIASES[0] = crate_type_aliases() if aliases is None else aliases
     by_route = {(r["method"], r["path"]): r for r in contract["routes"]}
     routes = router_routes(source)
 
@@ -2985,6 +3069,38 @@ struct Cursor {
 """
 
 
+# Two type aliases named `Maybe`, one in a module and one at the root.
+FIXTURE_ALIAS_SCOPES = r"""
+mod domain {
+    type Maybe<T> = Vec<T>;
+}
+
+type Maybe<T> = Option<T>;
+
+pub fn harvest_api_router() -> Router {
+    Router::new()
+        .route("/s/qualified-alias", post(s_qualified_alias))
+        .route("/s/ambiguous-alias", post(s_ambiguous_alias))
+}
+
+async fn s_qualified_alias(Json(body): Json<QualifiedAliasField>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn s_ambiguous_alias(Json(body): Json<AmbiguousAliasField>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+struct QualifiedAliasField {
+    labels: domain::Maybe<String>,
+}
+
+struct AmbiguousAliasField {
+    note: Maybe<String>,
+}
+"""
+
+
 # Names with more than one definition: structs in two modules, and methods
 # of the same name on two types.
 FIXTURE_NAMES = r"""
@@ -3242,6 +3358,9 @@ pub fn harvest_api_router() -> Router {
         .route("/e/raw-method-helper", post(e_raw_method_helper))
         .route("/e/raw-unknown-method", post(e_raw_unknown_method))
         .route("/e/raw-std-reader", post(e_raw_std_reader))
+        .route("/e/extension-decode", post(e_extension_decode))
+        .route("/e/unknown-receiver-method", post(e_unknown_receiver_method))
+        .route("/e/accessor-receiver", post(e_accessor_receiver))
         .route("/e/raw-aliased-std-reader", post(e_raw_aliased_std_reader))
         .route("/e/raw-unknown-associated", post(e_raw_unknown_associated))
         .route("/e/json-handoff-unknown", post(e_json_handoff_unknown))
@@ -4410,6 +4529,32 @@ async fn e_raw_associated_helper(body: Bytes) -> Response {
 
 async fn e_raw_method_helper(body: Bytes, decoder: GadgetDecoder) -> Response {
     decoder.decode_owned(&body)
+}
+
+trait DecodeExt {
+    fn decode_body<T>(&self) -> T;
+}
+
+impl DecodeExt for Bytes {
+    fn decode_body<T>(&self) -> T {
+        serde_json::from_slice::<Gadget>(self).unwrap()
+    }
+}
+
+async fn e_extension_decode(body: Bytes) -> Response {
+    let gadget = body.decode_body::<Gadget>();
+    StatusCode::OK.into_response()
+}
+
+async fn e_unknown_receiver_method(body: Bytes) -> Response {
+    let gadget = body.decode_elsewhere::<Gadget>();
+    StatusCode::OK.into_response()
+}
+
+async fn e_accessor_receiver(body: Bytes) -> Response {
+    let size = body.len();
+    let copy = body.to_vec();
+    StatusCode::OK.into_response()
 }
 
 async fn e_raw_std_reader(body: Bytes) -> Response {
@@ -6741,6 +6886,51 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             ),
         ],
         {"unresolved": ["POST /n/loose-field: cannot read `Loose` in LooseField"]},
+    ),
+    (
+        "a qualified field alias picks its module, and an ambiguous bare alias fails closed",
+        FIXTURE_ALIAS_SCOPES,
+        [
+            fixture_route(
+                "POST", "/s/qualified-alias", 200, request_body=body_of(("labels", False))
+            ),
+            fixture_route("POST", "/s/ambiguous-alias", 200, request_body=body_of(("note", False))),
+        ],
+        {
+            "mandatory": ["POST /s/qualified-alias: `labels` is mandatory in QualifiedAliasField"],
+            "unresolved": ["POST /s/ambiguous-alias: cannot read `Maybe` in AmbiguousAliasField"],
+        },
+    ),
+    (
+        "a raw body as the receiver of a method maps to self, unless the method is an accessor",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/extension-decode",
+                200,
+                request_body=body_of(("name", True), required=False),
+            ),
+            fixture_route(
+                "POST",
+                "/e/unknown-receiver-method",
+                200,
+                request_body=body_of(("name", False), required=False),
+            ),
+            fixture_route(
+                "POST",
+                "/e/accessor-receiver",
+                200,
+                request_body=body_of(("name", False), required=False),
+            ),
+        ],
+        {
+            "body_required": [
+                "POST /e/extension-decode: the body is mandatory",
+                "POST /e/unknown-receiver-method: the body is mandatory",
+            ],
+            "unresolved": ["POST /e/unknown-receiver-method: cannot read a `from_slice` call"],
+        },
     ),
     (
         "a helper named in a comment or a string is not called",
