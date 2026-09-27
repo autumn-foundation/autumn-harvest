@@ -396,34 +396,94 @@ def without_comment_lines(text: str) -> str:
 LAYOUT_KEEPING = frozenset({"default", "deny_unknown_fields", "rename", "crate", "bound", "expecting"})
 
 
+# A string literal in an attribute, with its escapes.
+QUOTED = re.compile(r'"(?:\\.|[^"\\])*"')
+
+# One serde item: `(key, form, value)`. `form` is `=`, `(` or `None`, and
+# `value` is the literal after `=` without its quotes, or `None`.
+SerdeItem = tuple[str, "str | None", "str | None"]
+
+
+def serde_items(attributes: str) -> list[SerdeItem]:
+    """Every item of every `#[serde(..)]` attribute in `attributes`.
+
+    Each attribute is read bracket-balanced, so one that rustfmt splits over
+    several lines is read whole. Its items are split at top-level commas by
+    `split_expression`. Quoted values are set aside first, so a key word
+    inside a value, as in `alias = "skip"`, is never read as a key. Only keys
+    are compared. Values are literals.
+    """
+    items: list[SerdeItem] = []
+    for found in re.finditer(r"#\s*\[\s*serde\s*\(", attributes):
+        inner = balanced(attributes[found.end() - 1 :])[1:-1]
+        values: list[str] = []
+
+        def park(literal: re.Match) -> str:
+            values.append(literal.group(0)[1:-1])
+            return '"%d"' % (len(values) - 1)
+
+        for item in split_expression(QUOTED.sub(park, inner), ","):
+            key = re.match(r'\s*([a-z_]+)\s*(\(|=)?\s*(?:"(\d+)")?', item)
+            if key is None:
+                continue
+            value = values[int(key.group(3))] if key.group(3) is not None else None
+            items.append((key.group(1), key.group(2), value))
+    return items
+
+
+def struct_layout(struct: str) -> tuple[list[SerdeItem], list[tuple[str, str, list[SerdeItem]]]]:
+    """The container serde items, and `(name, type, serde items)` for each field.
+
+    Comments are removed first. An attribute or a type that rustfmt splits
+    over several lines stays open until its brackets balance. Every serde
+    reader in the audit reads a struct through this one parse.
+    """
+    struct = canonical_paths(code_only(struct, literals=False))
+    opener = struct.index("{")
+    container = serde_items(without_comment_lines(struct[:opener]))
+    fields: list[tuple[str, str, list[SerdeItem]]] = []
+    attributes: list[str] = []
+    open_attribute = open_field = ""
+    for line in struct[opener:].split("\n"):
+        text = re.sub(r"/\*.*?\*/", "", line).strip()
+        if open_attribute or text.startswith("#["):
+            open_attribute += " " + text
+            if open_attribute.count("[") <= open_attribute.count("]"):
+                attributes.append(open_attribute.strip())
+                open_attribute = ""
+            continue
+        text = re.sub(r"//.*$", "", text).strip()
+        if open_field:
+            text, open_field = open_field + " " + text, ""
+        if not text or text in ("{", "}"):
+            continue
+        if text.count("<") + text.count("(") > text.count(">") + text.count(")"):
+            open_field = text
+            continue
+        text = re.sub(r"\s*,\s*([>)])", r"\1", re.sub(r"([<(])\s+", r"\1", text))
+        field = re.match(r"(?:pub(?:\([^)]*\))?\s+)?(?:r#)?([a-z_0-9]+)\s*:\s*(.+?),?$", text)
+        if field:
+            fields.append((field.group(1), field.group(2), serde_items(" ".join(attributes))))
+        attributes = []
+    return container, fields
+
+
 def unreadable_serde(struct: str) -> list[str]:
     """Serde attributes in a struct that change its layout in ways not read.
 
     A container attribute passes only when `LAYOUT_KEEPING` names it, and a
     container `rename` passes only in its `rename = ".."` form. Any other,
     such as `transparent`, `untagged`, `tag`, `from` or `rename_all`, is
-    reported, so the audit fails closed. On a field, `flatten` and the
-    `rename(..)` form are reported. A plain `rename = ".."` and `alias = ".."`
-    are read.
+    reported, so the audit fails closed. Field attributes are read by
+    `unreadable_field_serde`.
     """
-    text = without_comment_lines(struct)
-    opener = text.find("{")
+    container, fields = struct_layout(struct)
     found: set[str] = set()
-    for attribute in re.findall(r"#\[serde\(([^\]]*)\)\]", text[: max(opener, 0)]):
-        for item in split_expression(attribute, ","):
-            key = re.match(r"\s*([a-z_]+)\s*(\(|=)?", item)
-            if key is None:
-                continue
-            if key.group(1) not in LAYOUT_KEEPING or key.group(1) == "rename" and key.group(2) != "=":
-                found.add(key.group(1) if key.group(2) != "(" else key.group(1) + "(..)")
-    attributes: list[str] = []
-    for line in text[max(opener, 0) + 1 :].split("\n"):
-        line = line.strip()
-        attributes += re.findall(r"#\[serde\(([^\]]*)\)\]", line)
-        field = re.match(r"(?:pub(?:\([^)]*\))?\s+)?(?:r#)?[a-z_0-9]+\s*:\s*(.+?),?$", line)
-        if field and not line.startswith("#"):
-            found |= unreadable_field_serde(attributes, field.group(1))
-            attributes = []
+    for key, form, _ in container:
+        if key not in LAYOUT_KEEPING or key == "rename" and form != "=":
+            found.add(key + "(..)" if form == "(" else key)
+    for _, declared_type, items in fields:
+        found |= unreadable_field_serde(items, declared_type)
     return sorted(found)
 
 
@@ -444,7 +504,7 @@ KNOWN_DESERIALIZERS = {
 }
 
 
-def unreadable_field_serde(attributes: list[str], declared_type: str) -> set[str]:
+def unreadable_field_serde(items: list[SerdeItem], declared_type: str) -> set[str]:
     """The serde attributes of one field that the audit cannot read.
 
     A key passes when `FIELD_KEEPING` names it, and `rename` only in its
@@ -453,17 +513,12 @@ def unreadable_field_serde(attributes: list[str], declared_type: str) -> set[str
     the audited file defines the function with an `Option<Option<T>>` result.
     """
     found: set[str] = set()
-    for attribute in attributes:
-        for item in split_expression(attribute, ","):
-            key = re.match(r"\s*([a-z_]+)\s*(\(|=)?\s*(?:\"([^\"]*)\")?", item)
-            if key is None:
-                continue
-            name, form, value = key.group(1), key.group(2), key.group(3)
-            if name == "deserialize_with" and modeled_deserializer(value, declared_type):
-                continue
-            if name in FIELD_KEEPING and not (name == "rename" and form != "="):
-                continue
-            found.add(name + "(..)" if form == "(" else name)
+    for name, form, value in items:
+        if name == "deserialize_with" and modeled_deserializer(value, declared_type):
+            continue
+        if name in FIELD_KEEPING and not (name == "rename" and form != "="):
+            continue
+        found.add(name + "(..)" if form == "(" else name)
     return found
 
 
@@ -875,11 +930,36 @@ def handoffs(
         parts = function_parts(source, helper)
         states = receiving_parameters(block, helper, parts[0] if parts else "", carriers)
         found += [(helper, parts, name, o, t) for name, (o, t) in states.items()]
+    # A path-qualified call or a method call is found by its last segment in
+    # the same file, as an associated fn or an impl method. It gets only a
+    # direct argument, so a receiver such as `body.as_ref()` is no handoff.
+    qualified = {call.group(2) for call in re.finditer(QUALIFIED_CALL, block) if handoff_path(call)}
+    for helper in sorted(qualified - GENERIC_HELPERS):
+        parts = function_parts(source, helper)
+        params = parts[0] if parts else ""
+        states = receiving_parameters(block, helper, params, carriers, qualified=True)
+        found += [(helper, parts, name, o, t) for name, (o, t) in states.items()]
     return found
 
 
+# A path-qualified call or a method call. Group 1 is the path or the `.`, and
+# group 2 the last segment, as in `Decoder::decode(` or `decoder.decode(`.
+QUALIFIED_CALL = r"((?:[A-Za-z_]\w*(?:\s*<[^()]*?>)?\s*::\s*)+|\.\s*)([a-z_][a-z_0-9]*)%s\s*\(" % TURBOFISH
+
+
+def handoff_path(call: re.Match) -> bool:
+    """Whether a `QUALIFIED_CALL` match can hand a body to a JSON parse.
+
+    `serde_json::from_slice` is the parse itself, which `block_parses` reads.
+    A path rooted at `std`, `core` or `alloc`, such as `std::str::from_utf8`,
+    cannot run serde_json, so it is no handoff. Any other path or method can.
+    """
+    path = call.group(1).replace(" ", "").lstrip(":")
+    return path != "serde_json::" and not re.match(r"(?:std|core|alloc)::", path)
+
+
 def receiving_parameters(
-    block: str, helper: str, params: str, variables: dict[str, int]
+    block: str, helper: str, params: str, variables: dict[str, int], qualified: bool = False
 ) -> dict[str | None, tuple[bool, bool]]:
     """`(optional, tolerant)` for each `helper` parameter that gets a variable.
 
@@ -889,7 +969,9 @@ def receiving_parameters(
     turns the error into a value. It is tolerant when every such call turns
     the error into a value. A variable counts only outside every inner call
     of its argument, as `outside_calls` reads it. An argument with no named
-    parameter maps to `None`.
+    parameter maps to `None`. With `qualified`, the calls read are the
+    path-qualified and method calls of `helper`, and a variable counts only as
+    a direct argument: `body`, `&body`, `&mut body` or `body.clone()`.
     """
     # A pattern such as `Extension(state): ..` keeps its slot with no name, so
     # the parameters after it keep their positions.
@@ -900,15 +982,28 @@ def receiving_parameters(
         plain = re.match(r"(?:mut\s+)?([a-z_][a-z_0-9]*)\s*:", item)
         names.append(plain.group(1) if plain else None)
     states: dict[str, tuple[bool, bool]] = {}
-    for call in re.finditer(r"(?<![\w.:])%s%s\s*\(" % (re.escape(helper), TURBOFISH), block):
+    if qualified:
+        calls = [
+            call
+            for call in re.finditer(QUALIFIED_CALL, block)
+            if call.group(2) == helper and handoff_path(call)
+        ]
+    else:
+        calls = list(re.finditer(r"(?<![\w.:])%s%s\s*\(" % (re.escape(helper), TURBOFISH), block))
+    for call in calls:
         raw = balanced(block[call.end() - 1 :])
         arguments = split_top_level(raw[1:-1].replace("->", ""))
         tolerant = discards_error(block[: call.start()], block[call.end() - 1 + len(raw) :])
         for index, argument in enumerate(arguments):
+            direct = r"&?\s*(?:mut\s+)?%s(?:\s*\.\s*clone\s*\(\s*\))?"
             passed = [
                 v
                 for v, bound_at in variables.items()
-                if re.search(r"(?<![.\w])%s\b" % re.escape(v), outside_calls(argument))
+                if (
+                    re.fullmatch(direct % re.escape(v), argument.strip())
+                    if qualified
+                    else re.search(r"(?<![.\w])%s\b" % re.escape(v), outside_calls(argument))
+                )
                 and live_binding(block, v, call.start(), bound_at)
             ]
             name = names[index] if index < len(names) else None
@@ -1094,26 +1189,34 @@ def error_rejects(
         for failure in error_arms(arms):
             if arm_rejects(match_arm(arms, failure.start()), failure.group(1)):
                 return True
-    for binding in re.finditer(r"\blet\s+Ok\s*\([^;=]*?\)\s*=\s*%s\s*else\s*\{" % read, block):
+    for binding in re.finditer(r"\blet\s+%sOk\s*\([^;=]*?\)\s*=\s*%s\s*else\s*\{" % (PATTERN_LEAD, read), block):
         otherwise = balanced(block[binding.end() - 1 :], "{", "}")
         if live(binding.start()) and rejecting_exit(otherwise):
             return True
     # After `let Err(e) = body else { .. };`, the rest of the scope runs only on
     # failure, so it is the failure arm.
-    bound_err = r"\blet\s+Err\s*\(\s*%s([a-z_][a-z_0-9]*)?[^=]*=\s*%s\s*else\s*\{" % (BINDING, read)
+    bound_err = r"\blet\s+%sErr\s*\(\s*%s([a-z_][a-z_0-9]*)?[^=]*=\s*%s\s*else\s*\{" % (
+        PATTERN_LEAD,
+        BINDING,
+        read,
+    )
     for binding in re.finditer(bound_err, block):
         otherwise = balanced(block[binding.end() - 1 :], "{", "}")
         rest = block[binding.end() - 1 + len(otherwise) :].lstrip().lstrip(";")
         if live(binding.start()) and arm_rejects(scope_rest(rest), binding.group(1)):
             return True
-    failed = r"\bif\s+let\s+Err\s*\(\s*%s([a-z_][a-z_0-9]*)?[^=]*=\s*%s\s*\{" % (BINDING, read)
+    failed = r"\bif\s+let\s+%sErr\s*\(\s*%s([a-z_][a-z_0-9]*)?[^=]*=\s*%s\s*\{" % (
+        PATTERN_LEAD,
+        BINDING,
+        read,
+    )
     for tested in re.finditer(failed, block):
         taken = balanced(block[tested.end() - 1 :], "{", "}")
         if not live(tested.start()):
             continue
         if rejecting_exit(taken) or rejecting_arm(taken, tested.group(1)):
             return True
-    for tested in re.finditer(r"\bif\s+let\s+Ok\s*\([^;=]*?\)\s*=\s*%s\s*\{" % read, block):
+    for tested in re.finditer(r"\bif\s+let\s+%sOk\s*\([^;=]*?\)\s*=\s*%s\s*\{" % (PATTERN_LEAD, read), block):
         taken = balanced(block[tested.end() - 1 :], "{", "}")
         rest = block[tested.end() - 1 + len(taken) :]
         if live(tested.start()) and re.match(r"\s*else\s*\{", rest):
@@ -1311,7 +1414,7 @@ def error_exits_before(block: str, variable: str, read: str, position: int) -> b
         variable,
         variable,
     )
-    failed = r"\bif\s+let\s+Err\s*\([^=]*=\s*%s\s*\{" % read
+    failed = r"\bif\s+let\s+%sErr\s*\([^=]*=\s*%s\s*\{" % (PATTERN_LEAD, read)
     for test in re.finditer(tested + "|" + failed, block[:position]):
         taken = balanced(block[test.end() - 1 :], "{", "}")
         if test.end() - 1 + len(taken) > position or not same_scope(block, test.start(), position):
@@ -1397,31 +1500,83 @@ def rejecting_arm(arm: str, bound: str | None) -> bool:
     return re.search(returned + "|" + converted, arm) is not None
 
 
+# What a pattern can carry in front of a variant: `&`, `&mut`, `ref`,
+# `ref mut` and grouping parentheses. `pattern_alternatives` strips it, and
+# every `let`, `if let` and `while let` reader allows it before `Ok(` or `Err(`.
+PATTERN_LEAD = r"(?:&\s*(?:mut\s+)?|\(\s*)*"
+
+
+def pattern_alternatives(text: str, start: int, end: int) -> list[int]:
+    """Where each alternative of the pattern `text[start:end]` begins.
+
+    A leading `&`, `&mut`, `ref` or `ref mut` is skipped. Grouping parentheses
+    are opened, and a top-level `|` splits alternatives, at any depth of
+    grouping. A guard such as `if cond` is not part of the pattern.
+    """
+    lead = re.match(r"(?:\s|&|\bmut\b|\bref\b)*", text[start:end])
+    start += lead.end()
+    depth = 0
+    for index in range(start, end):
+        depth += text[index] in "([{"
+        depth -= text[index] in ")]}"
+        if depth == 0 and re.match(r"\bif\b", text[index:end]) and not re.match(r"\w", text[index - 1]):
+            end = index
+            break
+    while end > start and text[end - 1].isspace():
+        end -= 1
+    pieces = [0]
+    depth = 0
+    for index in range(start, end):
+        depth += text[index] in "([{"
+        depth -= text[index] in ")]}"
+        if depth == 0 and text[index] == "|":
+            pieces.append(index + 1 - start)
+    if len(pieces) > 1:
+        bounds = pieces + [end - start + 1]
+        return [
+            at
+            for first, stop in zip(bounds, bounds[1:])
+            for at in pattern_alternatives(text, start + first, start + stop - 1)
+        ]
+    if start < end and text[start] == "(" and len(balanced(text[start:end])) == end - start:
+        return pattern_alternatives(text, start + 1, end - 1)
+    return [start]
+
+
 def error_arms(arms: str) -> list[re.Match]:
     """Each top-level arm pattern of this `match` that can receive an `Err`.
 
     That is an `Err(..)` pattern, a catch-all `_` or binding, or a binding
-    such as `error @ Err(_)`. A guard is not evaluated, so a rejecting arm
-    counts even when a guard limits it to some errors. Group 1 is the
-    name the arm binds, if any. `arms` includes the outer braces, so an arm
-    pattern sits at depth 1 and follows `{`, `,` or `}`. A guarded arm can
+    such as `error @ Err(_)`. `pattern_alternatives` reads each arm, so a
+    borrowed `&Err(ref e)`, a grouped `(Err(e))` and an `Ok(_) | Err(e)`
+    alternative all count. A guard is not evaluated, so a rejecting arm
+    counts even when a guard limits it to some errors. Group 1 is the name the
+    arm binds, if any. `arms` includes the outer braces. A guarded arm can
     fall through to a later arm, so every one is returned.
     """
     catch_all = re.compile(
         BINDING + r"([a-z_][a-z_0-9]*)(?=\s*(?:if\b[^{}]*?)?=>|\s*@\s*(?:Err\b|_))"
     )
+    failure = re.compile(r"Err\s*\(\s*%s([a-z_][a-z_0-9]*)?" % BINDING)
     found: list[re.Match] = []
-    depth = 0
+    depth, arm_start = 0, None
     for index, char in enumerate(arms):
         if char in "([{":
             depth += 1
+            if depth == 1:
+                arm_start = index + 1
         elif char in ")]}":
             depth -= 1
-        elif depth == 1 and (char == "E" or char == "_" or char.islower()):
-            pattern = re.compile(r"Err\s*\(\s*%s([a-z_][a-z_0-9]*)?" % BINDING).match(arms, index)
-            pattern = pattern or catch_all.match(arms, index)
-            if pattern and arms[:index].rstrip()[-1:] in ("{", ",", "}", "|"):
-                found.append(pattern)
+            if depth == 1 and char == "}":
+                arm_start = index + 1
+        elif depth == 1 and char == ",":
+            arm_start = index + 1
+        elif depth == 1 and arms.startswith("=>", index) and arm_start is not None:
+            for at in pattern_alternatives(arms, arm_start, index):
+                pattern = failure.match(arms, at) or catch_all.match(arms, at)
+                if pattern:
+                    found.append(pattern)
+            arm_start = None
     return found
 
 
@@ -1767,53 +1922,22 @@ def struct_fields(struct: str) -> list[tuple[str, str, bool, tuple[str, ...]]]:
     """`(name, type, mandatory, spellings)` for each field serde reads.
 
     `name` is the wire name, after a serde `rename = ".."`. `spellings` holds
-    that name, then each serde `alias`. The text before the first `{` holds the
-    container attributes. A container `#[serde(default)]` makes every field
-    optional.
+    that name, then each serde `alias`. A container `#[serde(default)]` makes
+    every field optional. The serde items come from `struct_layout`, so only
+    keys are compared.
     """
-    # A block comment can nest or span lines, so comments are masked first.
-    struct = canonical_paths(code_only(struct, literals=False))
-    opener = struct.index("{")
-    container = without_comment_lines(struct[:opener])
-    all_default = re.search(r"serde\([^)]*\bdefault\b", container) is not None
+    container, layout = struct_layout(struct)
+    all_default = any(key == "default" for key, _, _ in container)
     fields: list[tuple[str, str, bool, tuple[str, ...]]] = []
-    attributes: list[str] = []
-    # An attribute that rustfmt splits over several lines stays open until its
-    # brackets balance.
-    open_attribute = open_field = ""
-    for line in struct[opener:].split("\n"):
-        text = re.sub(r"/\*.*?\*/", "", line).strip()
-        if open_attribute or text.startswith("#["):
-            open_attribute += " " + text
-            if open_attribute.count("[") <= open_attribute.count("]"):
-                attributes.append(open_attribute.strip())
-                open_attribute = ""
+    for name, declared_type, items in layout:
+        keys = {key for key, _, _ in items}
+        if keys & {"skip", "skip_deserializing"}:
             continue
-        text = re.sub(r"//.*$", "", text).strip()
-        if open_field:
-            text, open_field = open_field + " " + text, ""
-        if not text or text in ("{", "}"):
-            continue
-        # A type that rustfmt wraps over several lines stays open until its
-        # brackets balance.
-        if text.count("<") + text.count("(") > text.count(">") + text.count(")"):
-            open_field = text
-            continue
-        text = re.sub(r"\s*,\s*([>)])", r"\1", re.sub(r"([<(])\s+", r"\1", text))
-        field = re.match(r"(?:pub(?:\([^)]*\))?\s+)?(?:r#)?([a-z_0-9]+)\s*:\s*(.+?),?$", text)
-        if not field:
-            attributes = []
-            continue
-        name, declared_type = field.group(1), field.group(2)
-        joined = " ".join(attributes)
-        if not re.search(r"serde\([^)]*\bskip(?:_deserializing)?\b", joined):
-            defaulted = all_default or re.search(r"serde\([^)]*\bdefault\b", joined)
-            optional = defaulted or declared_type.startswith("Option<")
-            renamed = re.search(r'serde\([^)]*\brename\s*=\s*"([^"]+)"', joined)
-            wire = renamed.group(1) if renamed else name
-            aliases = re.findall(r'\balias\s*=\s*"([^"]+)"', joined)
-            fields.append((wire, declared_type, not optional, (wire, *aliases)))
-        attributes = []
+        optional = all_default or "default" in keys or declared_type.startswith("Option<")
+        renamed = [value for key, form, value in items if key == "rename" and form == "="]
+        wire = renamed[0] if renamed and renamed[0] is not None else name
+        aliases = [value for key, _, value in items if key == "alias" and value is not None]
+        fields.append((wire, declared_type, not optional, (wire, *aliases)))
     return fields
 
 
@@ -2001,6 +2125,11 @@ def alias_declarations(code: str) -> list[tuple[tuple[int, int], tuple[int, int]
                 found.append((scope, span, pattern, ALIAS_TARGETS[kind]))
             elif path == "serde_json" and alias:
                 found.append((scope, span, r"(?<![\w:.])%s(?=\s*::)" % alias, "serde_json"))
+            elif re.fullmatch(r"(?:std|core|alloc)(?:::[a-z_]\w*)+", path):
+                # A standard-library module keeps its root, so `handoff_path`
+                # can see that `s::from_utf8` is `std::str::from_utf8`.
+                name = alias or path.rsplit("::", 1)[-1]
+                found.append((scope, span, r"(?<![\w:.])%s(?=\s*::)" % name, path))
             elif path in ("serde_json::from_slice", "serde_json::*") and not alias:
                 pattern = r"(?<![\w:.])from_slice%s" % call
                 found.append((scope, span, pattern, ALIAS_TARGETS["from_slice"]))
@@ -2678,6 +2807,7 @@ type ChainQuery<T> = ChainQ<T>;
 use serde_json::{self as sj, Value};
 use axum::{extract::{Query as NestedQ, Path}};
 use crate::signed::Query as SignedQ;
+use std::str as text_mod;
 type InnerOdd<T> = Query<Vec<T>>;
 type OuterOdd<T> = InnerOdd<T>;
 type OddQuery<T> = Result<Query<T>, QueryRejection>;
@@ -2824,6 +2954,17 @@ pub fn harvest_api_router() -> Router {
         .route("/e/tristate-plain-option", post(e_tristate_plain_option))
         .route("/e/unknown-deserializer", post(e_unknown_deserializer))
         .route("/e/with-field", post(e_with_field))
+        .route("/e/multiline-field-serde", post(e_multiline_field_serde))
+        .route("/e/serde-keyword-values", post(e_serde_keyword_values))
+        .route("/e/borrowed-err-arm", post(e_borrowed_err_arm))
+        .route("/e/grouped-err-arm", post(e_grouped_err_arm))
+        .route("/e/borrowed-if-let-err", post(e_borrowed_if_let_err))
+        .route("/e/raw-associated-helper", post(e_raw_associated_helper))
+        .route("/e/raw-method-helper", post(e_raw_method_helper))
+        .route("/e/raw-unknown-method", post(e_raw_unknown_method))
+        .route("/e/raw-std-reader", post(e_raw_std_reader))
+        .route("/e/raw-aliased-std-reader", post(e_raw_aliased_std_reader))
+        .route("/e/raw-unknown-associated", post(e_raw_unknown_associated))
         .route("/e/json-handoff-unknown", post(e_json_handoff_unknown))
         .route("/e/json-handoff-tolerant", post(e_json_handoff_tolerant))
         .route("/e/raw-nested-argument", post(e_raw_nested_argument))
@@ -3938,6 +4079,88 @@ struct CustomDeserializer {
 struct WithField {
     #[serde(with = "custom_format")]
     note: String,
+}
+
+async fn e_multiline_field_serde(Json(body): Json<MultilineSerde>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+struct MultilineSerde {
+    name: String,
+    #[serde(
+        flatten
+    )]
+    extra: Extra,
+}
+
+async fn e_serde_keyword_values(Json(body): Json<KeywordValues>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+struct KeywordValues {
+    #[serde(alias = "skip")]
+    name: String,
+    #[serde(alias = "default")]
+    kind: String,
+}
+
+async fn e_borrowed_err_arm(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    match &body {
+        &Err(ref error) => return invalid_body(),
+        &Ok(_) => StatusCode::OK.into_response(),
+    }
+}
+
+async fn e_grouped_err_arm(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    match body {
+        Ok(Json(gadget)) => StatusCode::OK.into_response(),
+        (Err(error)) => invalid_body(),
+    }
+}
+
+async fn e_borrowed_if_let_err(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    if let &Err(ref error) = &body {
+        return invalid_body();
+    }
+    StatusCode::OK.into_response()
+}
+
+async fn e_raw_associated_helper(body: Bytes) -> Response {
+    GadgetDecoder::decode_strict(&body)
+}
+
+async fn e_raw_method_helper(body: Bytes, decoder: GadgetDecoder) -> Response {
+    decoder.decode_owned(&body)
+}
+
+async fn e_raw_std_reader(body: Bytes) -> Response {
+    let text = std::str::from_utf8(&body).unwrap_or("");
+    StatusCode::OK.into_response()
+}
+
+async fn e_raw_aliased_std_reader(body: Bytes) -> Response {
+    let text = text_mod::from_utf8(&body).unwrap_or("");
+    StatusCode::OK.into_response()
+}
+
+async fn e_raw_unknown_associated(body: Bytes) -> Response {
+    Codec::decode_bytes(&body)
+}
+
+async fn e_raw_unknown_method(body: Bytes, codec: Codec) -> Response {
+    codec.decode_elsewhere(&body)
+}
+
+impl GadgetDecoder {
+    fn decode_strict(raw: &[u8]) -> Response {
+        let gadget = serde_json::from_slice::<Gadget>(raw).unwrap();
+        StatusCode::OK.into_response()
+    }
+
+    fn decode_owned(&self, raw: &[u8]) -> Response {
+        let gadget = serde_json::from_slice::<Gadget>(raw).unwrap();
+        StatusCode::OK.into_response()
+    }
 }
 
 async fn e_helper_in_comment() -> Response {
@@ -6091,6 +6314,87 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
                 "POST /e/unknown-deserializer: cannot read `deserialize_with` in CustomDeserializer",
                 "POST /e/with-field: cannot read `with` in WithField",
             ]
+        },
+    ),
+    (
+        "a serde attribute split over several lines is read",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/multiline-field-serde",
+                200,
+                request_body=body_of(("name", True)),
+            )
+        ],
+        {"unresolved": ["POST /e/multiline-field-serde: cannot read `flatten` in MultilineSerde"]},
+    ),
+    (
+        "a serde key word inside a quoted value is no key",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/serde-keyword-values",
+                200,
+                request_body=body_of(("kind", False)),
+            )
+        ],
+        {
+            "mandatory": [
+                "POST /e/serde-keyword-values: `name` is mandatory in KeywordValues",
+                "POST /e/serde-keyword-values: `kind` is mandatory in KeywordValues",
+            ],
+            "undocumented": ["POST /e/serde-keyword-values: `name` is accepted by KeywordValues"],
+        },
+    ),
+    (
+        "a borrowed or grouped Err pattern that rejects is mandatory",
+        FIXTURE_EDGES,
+        [
+            fixture_route("POST", path, 200, request_body=body_of(("name", True), required=False))
+            for path in ("/e/borrowed-err-arm", "/e/grouped-err-arm", "/e/borrowed-if-let-err")
+        ],
+        {
+            "body_required": [
+                "POST /e/borrowed-err-arm: the body is mandatory",
+                "POST /e/grouped-err-arm: the body is mandatory",
+                "POST /e/borrowed-if-let-err: the body is mandatory",
+            ]
+        },
+    ),
+    (
+        "a raw body passed to an associated fn or a method is followed",
+        FIXTURE_EDGES,
+        [
+            fixture_route("POST", path, 200, request_body=body_of(("name", True), required=False))
+            for path in ("/e/raw-associated-helper", "/e/raw-method-helper")
+        ]
+        + [
+            fixture_route(
+                "POST",
+                path,
+                200,
+                request_body=body_of(("name", False), required=False),
+            )
+            for path in (
+                "/e/raw-unknown-method",
+                "/e/raw-unknown-associated",
+                "/e/raw-std-reader",
+                "/e/raw-aliased-std-reader",
+            )
+        ],
+        {
+            "body_required": [
+                "POST /e/raw-associated-helper: the body is mandatory",
+                "POST /e/raw-method-helper: the body is mandatory",
+                "POST /e/raw-unknown-method: the body is mandatory",
+                "POST /e/raw-unknown-associated: the body is mandatory",
+            ],
+            "unresolved": [
+                "POST /e/raw-unknown-method: cannot read a `from_slice` call",
+                "POST /e/raw-unknown-associated: cannot read a `from_slice` call",
+            ],
         },
     ),
     (
