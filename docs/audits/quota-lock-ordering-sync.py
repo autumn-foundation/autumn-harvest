@@ -90,9 +90,17 @@ that loops over the raw, unordered `due_rows` and returns, before the
 ordering assignment further down is ever reached, still passes: some
 transactions take that branch and claim-order-fire regardless. Rejecting
 any `for _ in var {` loop found before the assignment closes the
-concrete case, though it does not prove the assignment dominates every
-possible control-flow path in full generality — that would need real
-control-flow analysis, not text scanning.
+concrete case. A follow-up round found a one-line evasion of that fix:
+rebinding the pre-assignment variable to a new name first (`let
+unordered_rows = due_rows;`) and looping over THAT. Tracking single-hop
+aliases this way closes the demonstrated case too, but this is a
+declared, deliberate stopping point, not a promise of soundness: chained
+aliasing, passing the variable into a helper function, a struct field,
+or a tuple destructure all remain undetected, and proving the assignment
+dominates every possible control-flow and data-flow path in full
+generality would need real static analysis, not text scanning. Past
+this point, a finding in this family is a documented limitation of the
+approach, not a fix this script can keep absorbing indefinitely.
 
 Function extraction matches braces through `find_matching_brace`, not a
 raw character count. Codex review on PR #1696 found the raw count could
@@ -496,14 +504,19 @@ def check_call_site_guard(text: str, file_label: str, enclosing_fn: str, wrapper
 
     var = call_open_match.group(1)
 
-    early_loop_re = re.compile(r"for\s+\w+\s+in\s+" + re.escape(var) + r"\s*\{")
-    early_loop_match = early_loop_re.search(masked[: call_open_match.start()])
+    before_assignment = masked[: call_open_match.start()]
+    watched_names = {var}
+    alias_re = re.compile(r"let\s+(?:mut\s+)?(\w+)\s*=\s*" + re.escape(var) + r"\s*;")
+    watched_names.update(m.group(1) for m in alias_re.finditer(before_assignment))
+    early_loop_re = re.compile(r"for\s+\w+\s+in\s+(?:" + "|".join(re.escape(n) for n in watched_names) + r")\s*\{")
+    early_loop_match = early_loop_re.search(before_assignment)
     if early_loop_match is not None:
         return (
-            f"{file_label}::{enclosing_fn}: a `for _ in {var} {{` loop fires rows "
-            f"before the `{wrapper_call}` assignment is even reached — an early "
-            "branch (e.g. a special case that fires and returns) can claim-order "
-            "fire without ever going through the ordering wrapper"
+            f"{file_label}::{enclosing_fn}: a `for _ in ... {{` loop fires rows, over "
+            f"`{var}` or a direct alias of it ({sorted(watched_names)!r}), before the "
+            f"`{wrapper_call}` assignment is even reached — an early branch (e.g. a "
+            "special case that fires and returns) can claim-order fire without ever "
+            "going through the ordering wrapper"
         )
 
     call_close = find_matching_paren(masked, call_open_match.end() - 1)
