@@ -1,8 +1,14 @@
-# 🚦 Semaphore CI health — refresh the stale shard-weight-drift harness (PR #1703), no new failure signature found
+# 🚦 Semaphore CI health — refresh the stale shard-weight-drift harness (PR #1703): shard 0, not shard 19, is the real bottleneck
 
-**Status:** harness PR (refresh), superseding a 5-day-stale open PR. No new
+**Status:** harness PR (refresh plus a genuine counting-logic fix). No new
 flake or product bug diagnosed this session; `trunk-dev`'s head is green and
 the SOURCE-completion hang series (closed 2026-09-25) has no recurrence.
+What started as a staleness refresh of a 5-day-stale open PR (#1703) turned
+up a real undercounting bug once Codex review checked the harness's row
+selection against `ci.yml` itself: shard 0 runs an extra, unconditional
+workload (the `linuxpart` osclass) the harness never modeled, so every
+prior version — PR #1703's included — under-reported shard 0's total by
+196 test executions and missed that it is this job's actual heaviest shard.
 
 ## 🎯 Verdict path
 
@@ -21,7 +27,7 @@ days old then, branch `mergeable_state: unknown`, and nothing had re-run its
 PR is still open and unmerged five days on, still un-rebased.
 
 Pulling PR #1703's `shard-weight-drift.py` and running it against today's
-checkout surfaces two concrete drift effects, not just staleness in the
+checkout surfaces three concrete defects, not just staleness in the
 abstract:
 
 1. **The self-test itself now fails.** `enabled_features_for_row("autumn-harvest", "-")`
@@ -74,22 +80,74 @@ abstract:
    commit that generated them, and this repository's manifest moves fast
    enough to falsify one within a single review cycle.
 
+3. **A real counting-logic gap, not staleness (Codex review, this PR's
+   third round): shard 0's `linuxpart` workload was never counted.**
+   `ci.yml`'s `test-db-linux` job runs a second, unconditional step on
+   `matrix.shard == 0` only — the whole `linuxpart` osclass (9 rows, the
+   partitioned-`harvest_events`-layout re-run from issue #958 AC2),
+   sequentially, on top of shard 0's normal `linux`-row allocation. The
+   harness never read `linuxpart` rows at all, so every prior run of this
+   script (both today's regenerations above, and every number in PR
+   #1703) under-reported shard 0's real total by that entire second pass —
+   196 test executions as of today's manifest, including a second copy of
+   the 120-test `integration_e2e` filter. Fixed by pinning `linuxpart`'s
+   weight onto shard 0 unconditionally, independent of
+   `SEMAPHORE_SHARD_COUNT` (`linuxpart_rows_in_order()` /
+   `shard_report()`'s new `linuxpart_weights` parameter). This changes the
+   headline finding, not just a number: shard 0's real total is 316, the
+   heaviest shard in the job, not shard 19's previously-reported 269 — and
+   shard 0 has its own two-heavy-suite collision now
+   (`cross_region_dr_tests` from the `linux` allocation, `integration_e2e`
+   from `linuxpart`) that no prior version of this script, including
+   PR #1703's, ever surfaced. The final table, from the tree this PR
+   merges:
+
+   | Shard | Colliding rows (ordinal, weight) |
+   |---|---|
+   | 0  | `cross_region_dr_tests` (84, 31), `integration_e2e` (linuxpart, 120) |
+   | 4  | `shard_rebalance_db_tests` (88, 112), `workflow_rerun_integration` (151, 68) |
+   | 6  | `admission_gate_authoritative` (6, 34), `dispatch_redis` (153, 33) |
+   | 8  | `event_partitioning_tests` (29, 155), `rate_limit_bucket_gc_tests` (50, 30) |
+   | 10 | `interface_schema_integration` (115, 31), `stall_diagnosis_integration` (136, 79) |
+   | 13 | `capability_miss_tests` (13, 46), `pacing_override_integration` (118, 46) |
+   | 19 | `backup_verify_tests` (82, 57), `ui_integration` (145, 149) |
+
+   The sweep floor is unchanged in value (4) but not in which counts reach
+   it — N=18 and N=20 only, once every shard-0 total in the sweep also
+   carries the `linuxpart` addendum.
+
 ## 🔍 Diagnosis
 
 Test-vs-product verdict: **neither** — this is not a flake, it's a
-report-only static-analysis harness whose own fixture (the self-test's
-hand-written expected feature set) drifted out of sync with the crate it
-inspects. Mechanism: `Cargo.toml`'s `default` feature list is live,
-externally-owned state from this harness's point of view; a self-test that
-hard-codes a snapshot of it will break every time that list changes, whether
-or not the harness's own logic has a bug. The harness's actual counting
-logic (weight-per-row, ordinal assignment, sweep) is unaffected and was not
-touched beyond the self-test fixture and the stale docstring numbers.
+report-only static-analysis harness with two distinct defect classes.
 
-Root-cause category for *why nobody caught this in 5 days*: the PR was never
-merged, so it never ran in `ci.yml`'s `lint` job (which would have caught
-the self-test regression the next time any PR touched `autumn-harvest`'s
-default features) — an unmerged report-only harness protects nothing.
+The self-test and stale-table issues (1 and 2 above) are a fixture that
+drifted out of sync with the live state it inspects, not a logic bug:
+`Cargo.toml`'s `default` feature list, and the manifest/shard-count PR
+#1703's table was computed from, are both externally-owned state from this
+harness's point of view. A self-test or a hand-copied table that snapshots
+either will break, or go quietly wrong, the moment that state moves.
+
+The `linuxpart` omission (3 above) is different in kind: a genuine
+undercounting bug in the harness's own counting logic, present since PR
+#1703's first version and carried into every regeneration of this PR until
+Codex's third review round caught it. `ci.yml` runs a real, unconditional
+extra workload on shard 0 that the script simply never modeled — this is
+not state moving under the script, it is the script never having read the
+right input. Both defect classes matter for the same reason: a report-only
+harness's whole value is that its numbers can be trusted without re-running
+it by hand, and both a stale snapshot and an incomplete model produce a
+plausible-looking, wrong number.
+
+Root-cause category for *why nobody caught the first two in 5 days*: the PR
+was never merged, so it never ran in `ci.yml`'s `lint` job (which would have
+caught the self-test regression the next time any PR touched
+`autumn-harvest`'s default features) — an unmerged report-only harness
+protects nothing. The `linuxpart` gap is a different category: nobody who
+reviewed PR #1703's four prior rounds cross-checked its row-selection logic
+(`osclass == "linux"`, one specific string) against every place `ci.yml`
+actually invokes `run-suites.sh` for `test-db-linux` — only against the
+`row_ordinal` arithmetic within that one selection.
 
 ## 🔧 Treatment
 
@@ -113,16 +171,28 @@ branch:
    self-test no longer depends on `autumn-harvest`'s real feature list at
    all — nothing to hand-copy, nothing to go stale.
 2. Replaced the docstring's 09-22 findings table and sweep claim with a
-   dated update reflecting today's manifest and shard count, explicitly
-   marking the old table as historical (kept for the three rounds of
-   Codex-review corrections to the counting logic it documents) rather than
-   a claim about current state — so the next session doesn't have to
-   re-discover that the numbers moved.
-3. Same `ci.yml`/`docs/audits/README.md` wiring PR #1703 proposed: one new
+   dated update reflecting today's manifest and shard count, regenerated a
+   second time after the mid-review `trunk-dev` merge — explicitly marking
+   the older tables as historical (kept for the rounds of Codex-review
+   corrections to the counting logic they document) rather than a claim
+   about current state, so the next session doesn't have to re-discover
+   that the numbers moved.
+3. **Behavior change, not just a data refresh:** added
+   `linuxpart_rows_in_order()` and a `linuxpart_weights` parameter to
+   `shard_report()`/`sweep()` so shard 0's total and heavy-collision check
+   include the `linuxpart` osclass's weight, pinned to shard 0
+   unconditionally rather than assigned by `ordinal % shard_count`. Added
+   a `self_test()` case covering the pinning behavior directly (fixed
+   shard weights plus a fixed `linuxpart` addendum, asserting the total
+   lands on shard 0 regardless of shard count) rather than relying only on
+   the full-manifest run to exercise it.
+4. Same `ci.yml`/`docs/audits/README.md` wiring PR #1703 proposed: one new
    `lint`-job step, report-only (always exits 0), catalogued.
 
-No behavior change to the counting algorithm itself — this is a data
-refresh plus a self-test fix, not a new diagnosis.
+Items 1 and 2 are a data refresh and a self-test fix; item 3 is a genuine
+logic fix to the counting algorithm, found only because Codex's third
+review round checked the harness's row selection against `ci.yml` itself
+rather than trusting the manifest alone.
 
 **Carried forward again, still not fixed:** the migration-bundle-completeness
 gap first named in `docs/rnd/2026-09-24-...-confirmed-fixed.md:254-266` and
@@ -142,15 +212,20 @@ and this session's PR is already the harness refresh above.
 
 Before (PR #1703's branch, as opened 2026-09-22, run against today's
 checkout): `--self-test` fails with an `AssertionError` on
-`enabled_features_for_row`. After (this PR's branch): `--self-test` passes;
-a full run resolves all 156 `linux` rows with no unresolved-file warnings;
-`--sweep` completes N=9..24 and reproduces the "floor is 4, not 0" claim
-above. `audit-catalog-coverage.py` and `comment-hygiene.py --base
-origin/trunk-dev` both pass clean (0 changed `.rs` files, so comment hygiene
-is a no-op; the new script is catalogued). `corpus-link-check.py` exits 0
-(its pre-existing local-Windows-path findings in
-`docs/plans/2026-06-22-canary-swarm-fixes.md` are unrelated and unchanged by
-this diff).
+`enabled_features_for_row`; the full run reports shard 0's total as 120 and
+shard 19 as the heaviest shard at 269, because `linuxpart` rows are never
+read. After (this PR's final commit): `--self-test` passes, including the
+new pinning-behavior case; a full run resolves all 156 `linux` rows plus 9
+`linuxpart` rows with no unresolved-file warnings, and correctly reports
+shard 0's total as 316 (now the actual heaviest shard) with its own
+two-heavy-suite collision; `--sweep` completes N=9..24 with every shard-0
+total in the sweep carrying the `linuxpart` addendum, and reproduces the
+"floor is 4, at N=18/20 only" claim above. `audit-catalog-coverage.py` and
+`comment-hygiene.py --base origin/trunk-dev` both pass clean (0 changed
+`.rs` files, so comment hygiene is a no-op; the new script is catalogued).
+`corpus-link-check.py` exits 0 (its pre-existing local-Windows-path findings
+in `docs/plans/2026-06-22-canary-swarm-fixes.md` are unrelated and unchanged
+by this diff).
 
 Separately, this session checked `trunk-dev`'s own CI health since the
 09-25 closure report: the current head (`8924bfc9`) is green, and the last
@@ -174,7 +249,7 @@ grep -A3 '^\[features\]' autumn-harvest/Cargo.toml
 
 # After checking out this session's fix instead:
 python3 docs/audits/shard-weight-drift.py --self-test   # -> self-test: ok
-python3 docs/audits/shard-weight-drift.py                # -> 156 rows, 6 collisions, N=21
+python3 docs/audits/shard-weight-drift.py                # -> 156+9 rows, shard 0 total 316 (max), 7 collisions, N=21
 python3 docs/audits/shard-weight-drift.py --sweep         # -> floor 4 collisions, N=18/20
 
 # Confirm trunk-dev head is green and no new failure signature:

@@ -74,31 +74,41 @@ script is that accounting, run automatically instead of by hand:
 4. Read `SEMAPHORE_SHARD_COUNT` out of the `test-db-linux` job block in
    `ci.yml` (not hand-copied), and report each shard's total weight plus
    any shard carrying more than one row at or above HEAVY_THRESHOLD.
+5. Add the `linuxpart` osclass's total weight onto shard 0, unconditionally,
+   regardless of `SEMAPHORE_SHARD_COUNT`. **Correction (Codex review, this
+   harness's own third PR round):** an earlier version of this script only
+   read `linux`-osclass rows, missing that `ci.yml`'s `test-db-linux` job
+   also runs the whole `linuxpart` set (the partitioned-`harvest_events`-
+   layout re-run, issue #958 AC2) as an extra step gated on
+   `matrix.shard == 0` — not sharded by ordinal like a `linux` row, always
+   the full set, always on shard 0. That is 9 rows and, as of today, 196
+   more test executions than shard 0's `linux`-row allocation alone
+   reports, including a second pass of the 120-test `integration_e2e`
+   filter. Omitting it did not just under-report shard 0's total: it hid a
+   real two-heavy-suite collision there (`cross_region_dr_tests` from the
+   `linux` allocation plus `integration_e2e` from `linuxpart`), and it
+   silently mis-identified which shard is actually this job's slowest —
+   see the update below. `linuxpart_rows_in_order()` and `shard_report()`'s
+   `linuxpart_weights` parameter are the fix; `main()` wires them in
+   unconditionally rather than behind a flag, since shard 0 always pays
+   this cost in real CI regardless of what this script is asked to report.
 
-**Update (2026-09-27, `SEMAPHORE_SHARD_COUNT` now 21, not 11 — issue #1707
-rebalanced it after this script's first PR round, in between two of the
-prior corrections below).** The specific collisions this docstring named
-above were all found under the old 11-shard layout and the 151-row manifest
-of 2026-09-22; neither number holds today. The manifest has grown to 156
-`linux` rows, and re-running this script against `SEMAPHORE_SHARD_COUNT = 21`
-finds a DIFFERENT set of colliding shards — the rebalance moved the
-collision, exactly as this section already predicted it would, rather than
-removing it.
-
-**Second correction, same day (Codex review, this harness's own second PR,
-second round).** The paragraph above was itself regenerated once already on
-2026-09-27, then went stale again a few hours later, before this PR even
-merged: a `trunk-dev` merge landed mid-review (issue #1429's Redis dispatch
-follow-ups grew `dispatch_redis` from 21 to 33 tests, among other manifest
-changes), which pushed it over `HEAVY_THRESHOLD` and created a sixth
-collision this table did not have an hour earlier. That is not a mistake to
-correct once and move on from — it is this script's own thesis, demonstrated
-on itself: the manifest drifts fast enough that even a same-day hand-copied
-table can go stale before its own PR lands. The table below is regenerated
-one more time, from the tree this PR actually merges:
+**Update (2026-09-27, three rounds of same-day drift on this script's own
+second PR, #1746).** `SEMAPHORE_SHARD_COUNT` is 21 now, not the 11 every
+collision named earlier in this docstring was found under (issue #1707
+rebalanced it after this script's first PR); the manifest has grown from
+151 to 156 `linux` rows since; a `trunk-dev` merge landed mid-review and
+grew `dispatch_redis` past HEAVY_THRESHOLD; and the `linuxpart` omission
+above was found in the same review. None of the collisions this docstring
+named under the old count or the old manifest still hold — not a defect
+in this script's logic, just proof that a hand-copied finding is a
+snapshot, correct only as of the commit that produced it. The table below
+is the tree this PR actually merges; re-run the script rather than
+hand-copying it into a future report:
 
 | Shard | Colliding rows (ordinal, weight) |
 |---|---|
+| 0  | `cross_region_dr_tests` (84, 31), `integration_e2e` (linuxpart, 120) |
 | 4  | `shard_rebalance_db_tests` (88, 112), `workflow_rerun_integration` (151, 68) |
 | 6  | `admission_gate_authoritative` (6, 34), `dispatch_redis` (153, 33) |
 | 8  | `event_partitioning_tests` (29, 155), `rate_limit_bucket_gc_tests` (50, 30) |
@@ -106,25 +116,26 @@ one more time, from the tree this PR actually merges:
 | 13 | `capability_miss_tests` (13, 46), `pacing_override_integration` (118, 46) |
 | 19 | `backup_verify_tests` (82, 57), `ui_integration` (145, 149) |
 
-None of the seven 09-22 pairs (shard 0's `integration_e2e`/
-`quota_enforcement_tests` among them) still collide at N=21 — they now land
-on six different, non-colliding shards each. Both older tables above are
-kept for their own history (three rounds of Codex-review corrections to the
-counting logic itself, which are still the reason this script counts the
-way it does), not as a claim about today's manifest. Re-run the script for
-the current numbers; do not hand-copy any of these three tables into a
-future report.
+Shard 0's own collision is new to this script (the `linuxpart` fix above),
+not a relocation of an earlier one. None of PR #1703's seven 09-22 pairs
+(its own shard-0 `integration_e2e`/`quota_enforcement_tests` pair among
+them, under the old 11-shard count) still collide at today's N=21 — they
+land on six different, non-colliding shards each, plus the new shard-0
+pair. Once `linuxpart` is counted, shard 0's real total is 316, not 120 —
+the true heaviest shard in this job, not shard 19's previously-reported
+269. Older tables earlier in this docstring are kept for their own history
+(rounds of Codex-review corrections to the counting logic itself, which
+are why this script counts the way it does), not as a claim about today's
+manifest.
 
 A sweep of `SEMAPHORE_SHARD_COUNT` from 9 through 24, re-run against the
-tree this PR actually merges, still finds NO value with zero heavy-suite
-collisions (`--sweep`'s own output, 2026-09-27): the best of the sixteen
-counts tried is 4 colliding shards (N=18 and N=20 only — N=19 and N=24, 4
-a few hours earlier, are 5 now for the same `dispatch_redis` reason above),
-not 0, and `SEMAPHORE_SHARD_COUNT`'s actual value of 21 carries 6 collisions
-while still holding the smallest max-shard/min-shard spread (214) of any
-count swept. Bumping `SEMAPHORE_SHARD_COUNT` again would likely just
-relocate the next collision rather than remove the failure mode — this
-script's job is to keep that visible, not to pick the next number.
+tree this PR actually merges and now including the `linuxpart` addendum on
+every shard-0 total, still finds NO value with zero heavy-suite collisions
+(`--sweep`'s own output, 2026-09-27): the floor across the sixteen counts
+tried is 4 colliding shards, at N=18 and N=20 only, not 0. Bumping
+`SEMAPHORE_SHARD_COUNT` again would likely just relocate the next
+collision rather than remove the failure mode — this script's job is to
+keep that visible, not to pick the next number.
 
 Why report-only: gating this now would redden every open PR on a
 pre-existing structural property nobody caused and this script cannot fix
@@ -193,6 +204,19 @@ def parse_manifest_records(text):
 def linux_rows_in_order(records):
     """Mirror do_run's row_ordinal: position among `linux`-osclass rows only."""
     return [r for r in records if r[0] == "linux"]
+
+
+def linuxpart_rows_in_order(records):
+    """`linuxpart` rows (the partitioned-`harvest_events`-layout re-run) in
+    manifest order. Unlike `linux` rows, these are never sharded by ordinal:
+    `ci.yml`'s `test-db-linux` job runs the whole `linuxpart` set as one
+    extra, unconditional step gated on `matrix.shard == 0` (Codex review,
+    this harness's own third PR round). Every shard-0 total this script
+    reports must add this set's weight, and every shard-0 heavy-collision
+    check must consider its members alongside shard 0's own `linux` rows,
+    or shard 0's true per-job workload is undercounted regardless of
+    `SEMAPHORE_SHARD_COUNT`."""
+    return [r for r in records if r[0] == "linuxpart"]
 
 
 def resolve_test_file(crate, target):
@@ -656,13 +680,22 @@ def weigh_rows(linux_rows):
     return weights, unresolved
 
 
-def shard_report(weights, shard_count, heavy_threshold):
+def shard_report(weights, shard_count, heavy_threshold, linuxpart_weights=()):
+    """`linuxpart_weights` (from `weigh_rows(linuxpart_rows_in_order(...))`)
+    always lands on shard 0, unconditionally, regardless of `shard_count` —
+    it is not assigned by `ordinal % shard_count` like a `linux` row, since
+    `ci.yml` runs it as `test-db-linux`'s own extra step gated on
+    `matrix.shard == 0`, not through the sharding scheme this function
+    otherwise models."""
     totals = [0] * shard_count
     members = [[] for _ in range(shard_count)]
     for ordinal, label, weight in weights:
         shard = ordinal % shard_count
         totals[shard] += weight
         members[shard].append((ordinal, label, weight))
+    for _ordinal, label, weight in linuxpart_weights:
+        totals[0] += weight
+        members[0].append(("linuxpart", label, weight))
     heavy_collisions = []
     for shard in range(shard_count):
         heavy = [m for m in members[shard] if m[2] >= heavy_threshold]
@@ -671,10 +704,12 @@ def shard_report(weights, shard_count, heavy_threshold):
     return totals, members, heavy_collisions
 
 
-def sweep(weights, heavy_threshold, lo=9, hi=24):
+def sweep(weights, heavy_threshold, linuxpart_weights=(), lo=9, hi=24):
     print(f"\n--- Shard-count sweep N={lo}..{hi} (heavy >= {heavy_threshold}) ---")
     for n in range(lo, hi + 1):
-        totals, _members, collisions = shard_report(weights, n, heavy_threshold)
+        totals, _members, collisions = shard_report(
+            weights, n, heavy_threshold, linuxpart_weights
+        )
         spread = max(totals) - min(totals)
         print(
             f"N={n:2d} spread={spread:4d} max={max(totals):4d} "
@@ -693,14 +728,30 @@ linux        crate-a  integration  -  mod_a
 linux        crate-a  integration  -  mod_b
 allos        crate-a  integration  -  mod_c
 linux        crate-b  suite_x      -  -
+linuxpart    crate-a  integration  -  mod_a
 """
     records = parse_manifest_records(fixture)
-    assert len(records) == 4, f"expected 4 non-comment records, got {len(records)}"
+    assert len(records) == 5, f"expected 5 non-comment records, got {len(records)}"
     linux_rows = linux_rows_in_order(records)
     assert len(linux_rows) == 3, f"expected 3 linux rows, got {len(linux_rows)}"
     assert linux_rows[0][4] == "mod_a"
     assert linux_rows[1][4] == "mod_b"
     assert linux_rows[2][2] == "suite_x"
+    linuxpart_rows = linuxpart_rows_in_order(records)
+    assert len(linuxpart_rows) == 1, f"expected 1 linuxpart row, got {len(linuxpart_rows)}"
+    assert linuxpart_rows[0][4] == "mod_a"
+
+    # shard_report: a linuxpart weight is pinned to shard 0 regardless of
+    # SEMAPHORE_SHARD_COUNT, not assigned by ordinal % shard_count like a
+    # linux row (Codex review, this harness's own third PR round) — with
+    # shard_count=2 a linux ordinal of 1 would otherwise land on shard 1.
+    fake_weights = [(0, "row-a", 5), (1, "row-b", 7)]
+    fake_linuxpart_weights = [(0, "linuxpart-row", 100)]
+    totals, members, _collisions = shard_report(
+        fake_weights, 2, HEAVY_THRESHOLD_DEFAULT, fake_linuxpart_weights
+    )
+    assert totals == [105, 7], totals
+    assert ("linuxpart", "linuxpart-row", 100) in members[0]
     assert row_label("autumn-harvest", "integration", "quota_enforcement_tests") == (
         "autumn-harvest/integration -- quota_enforcement_tests"
     )
@@ -954,7 +1005,10 @@ def main():
     linux_rows = linux_rows_in_order(records)
     weights, unresolved = weigh_rows(linux_rows)
 
-    for ordinal, label, path in unresolved:
+    linuxpart_rows = linuxpart_rows_in_order(records)
+    linuxpart_weights, linuxpart_unresolved = weigh_rows(linuxpart_rows)
+
+    for ordinal, label, path in unresolved + linuxpart_unresolved:
         print(
             f"::warning::shard-weight-drift.py could not resolve a test "
             f"file for row {ordinal} ({label}) at {path} — weighed as 0",
@@ -962,11 +1016,13 @@ def main():
         )
 
     totals, members, heavy_collisions = shard_report(
-        weights, shard_count, args.threshold
+        weights, shard_count, args.threshold, linuxpart_weights
     )
 
+    linuxpart_total = sum(w for _o, _l, w in linuxpart_weights)
     print(
-        f"test-db-linux: {len(linux_rows)} linux rows, "
+        f"test-db-linux: {len(linux_rows)} linux rows + {len(linuxpart_rows)} "
+        f"linuxpart rows (weight {linuxpart_total}, always on shard 0), "
         f"SEMAPHORE_SHARD_COUNT={shard_count}, heavy threshold={args.threshold}"
     )
     print(f"shard totals: min={min(totals)} max={max(totals)} spread={max(totals) - min(totals)}")
@@ -988,7 +1044,7 @@ def main():
         print(f"\nno shard carries 2+ suites at or above the heavy threshold ({args.threshold})")
 
     if args.sweep:
-        sweep(weights, args.threshold)
+        sweep(weights, args.threshold, linuxpart_weights)
 
     # Report-only — see the module docstring's "Why report-only" section.
     return 0
