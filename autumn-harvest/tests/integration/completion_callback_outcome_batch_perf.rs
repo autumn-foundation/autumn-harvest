@@ -31,7 +31,7 @@
 
 #![allow(clippy::too_many_lines)]
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use autumn_harvest::completion_callback::{
     CallbackRuntimeConfig, CallbackSecret, CompletionCallbackDeliverer, DeliverFuture,
@@ -43,7 +43,6 @@ use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::schema::harvest_completion_deliveries;
 use autumn_harvest::worker::DbPool;
 use chrono::Utc;
-use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
 use serde_json::json;
