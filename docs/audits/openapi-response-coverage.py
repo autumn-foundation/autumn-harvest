@@ -388,14 +388,32 @@ def without_comment_lines(text: str) -> str:
     return "\n".join(line for line in text.split("\n") if not line.strip().startswith("//"))
 
 
-def unreadable_serde(struct: str) -> list[str]:
-    """Serde attributes in a struct that change wire names in ways not read.
+# Serde container attributes that keep a struct's wire layout: an object with
+# one key per field. Any other container attribute is reported.
+LAYOUT_KEEPING = frozenset({"default", "deny_unknown_fields", "rename", "crate", "bound", "expecting"})
 
-    `rename_all`, `flatten` and the `rename(..)` form are reported, not
-    guessed at. A plain `rename = ".."` and `alias = ".."` are read.
+
+def unreadable_serde(struct: str) -> list[str]:
+    """Serde attributes in a struct that change its layout in ways not read.
+
+    A container attribute passes only when `LAYOUT_KEEPING` names it, and a
+    container `rename` passes only in its `rename = ".."` form. Any other,
+    such as `transparent`, `untagged`, `tag`, `from` or `rename_all`, is
+    reported, so the audit fails closed. On a field, `flatten` and the
+    `rename(..)` form are reported. A plain `rename = ".."` and `alias = ".."`
+    are read.
     """
+    text = without_comment_lines(struct)
+    opener = text.find("{")
     found: set[str] = set()
-    for attribute in re.findall(r"#\[serde\(([^\]]*)\)\]", without_comment_lines(struct)):
+    for attribute in re.findall(r"#\[serde\(([^\]]*)\)\]", text[: max(opener, 0)]):
+        for item in split_expression(attribute, ","):
+            key = re.match(r"\s*([a-z_]+)\s*(\(|=)?", item)
+            if key is None:
+                continue
+            if key.group(1) not in LAYOUT_KEEPING or key.group(1) == "rename" and key.group(2) != "=":
+                found.add(key.group(1) if key.group(2) != "(" else key.group(1) + "(..)")
+    for attribute in re.findall(r"#\[serde\(([^\]]*)\)\]", text[max(opener, 0) :]):
         found |= set(re.findall(r"\b(rename_all|flatten)\b", attribute))
         if re.search(r"\brename\s*\(", attribute):
             found.add("rename(..)")
@@ -710,20 +728,47 @@ def moved_names(block: str, names: set[str]) -> dict[str, int]:
         found.update(moved)
 
 
-def split_top_level(text: str) -> list[str]:
-    """The comma-separated items of a list, ignoring commas in nested brackets."""
-    items, depth, current = [], 0, ""
-    for char in text:
-        depth += char in "([{<"
-        depth -= char in ")]}>"
-        if char == "," and depth == 0:
-            items.append(current.strip())
-            current = ""
-        else:
-            current += char
+def split_expression(
+    text: str, *separators: str, types: bool = False, found: list[str] | None = None
+) -> list[str]:
+    """`text` split at each top-level separator, such as `,`, `&&` or `||`.
+
+    A separator inside `( )`, `[ ]` or `{ }` is not at the top level. A `<`
+    opens a generic only in a type (`types`) or right after `::`, as in a
+    turbofish. Anywhere else it is a comparison. Every argument list,
+    parameter list and boolean guard is split here. Each separator met is
+    added to `found`, when it is given.
+    """
+    items, stack, current, index = [], [], "", 0
+    while index < len(text):
+        char = text[index]
+        if char in "([{":
+            stack.append(char)
+        elif char == "<" and (types or text[:index].rstrip().endswith("::")):
+            stack.append(char)
+        elif char == ">" and stack and stack[-1] == "<" and text[index - 1 : index] != "=":
+            stack.pop()
+        elif char in ")]}" and stack:
+            while stack and stack.pop() == "<":
+                pass
+        elif not stack:
+            separator = next((s for s in separators if text.startswith(s, index)), None)
+            if separator is not None:
+                if found is not None:
+                    found.append(separator)
+                items.append(current.strip())
+                current, index = "", index + len(separator)
+                continue
+        current += char
+        index += 1
     if current.strip():
         items.append(current.strip())
     return items
+
+
+def split_top_level(text: str) -> list[str]:
+    """The comma-separated items of an argument list, as `split_expression` reads it."""
+    return split_expression(text, ",")
 
 
 # A word before `(` that is a keyword, not a call.
@@ -790,7 +835,7 @@ def receiving_parameters(
     # A pattern such as `Extension(state): ..` keeps its slot with no name, so
     # the parameters after it keep their positions.
     names: list[str | None] = []
-    for item in split_top_level(params[1:-1] if params else ""):
+    for item in split_expression(params[1:-1] if params else "", ",", types=True):
         if re.fullmatch(r"&?\s*(?:'[a-z_]+\s+)?(?:mut\s+)?self", item):
             continue
         plain = re.match(r"(?:mut\s+)?([a-z_][a-z_0-9]*)\s*:", item)
@@ -884,7 +929,11 @@ def guards(block: str, position: int, variable: str) -> bool:
         # `!body.is_empty()`. Anything else, such as `== false`, can flip it.
         joined = block[test.end() : opener].strip()
         allowed, banned = ("&&", "||") if test.group(1) else ("||", "&&")
-        if joined and (not joined.startswith(allowed) or banned in joined):
+        # Only a top-level operator can let an empty body bypass the test. One
+        # inside parentheses belongs to a term that the outer operator joins.
+        operators: list[str] = []
+        split_expression(joined, "&&", "||", found=operators)
+        if joined and (not joined.startswith(allowed) or banned in operators):
             continue
         taken = balanced(block[opener:], "{", "}")
         taken_end = end = opener + len(taken)
@@ -1241,21 +1290,34 @@ def arm_rejects(arm: str, bound: str | None) -> bool:
     rejects still makes the arm reject. A type path such as
     `Gadget::default()` builds a value.
     """
-    if rejecting_arm(arm, bound):
+    return exits_reject(arm, bound, closure=False)
+
+
+def exits_reject(body: str, bound: str | None, closure: bool) -> bool:
+    """Whether a block that receives an error rejects through one of its exits.
+
+    `body` is an `Err` arm, or a fallback closure when `closure` is true. It
+    rejects as `rejecting_arm` reads it, or when it panics. Its exits are each
+    `return` and its tail value. A `return` in an arm leaves the handler, so
+    it must be a success, as `success_value` reads it. A `return` in a closure
+    gives the closure value, so it is read like a tail. A tail rejects when
+    `builds_rejection` reads it as one. A call that only observes the error,
+    such as `observe(error);`, is no exit, so it decides nothing. In an arm,
+    an exit that hands the error to a helper can recover the request, as the
+    start route does (#808). In a closure, the helper's return type decides.
+    """
+    if rejecting_arm(body, bound) or re.search(r"\b(?:panic|unreachable|todo)!", body):
         return True
-    if bound is not None and bound != "_":
+    handed = None
+    if bound is not None and bound != "_" and not closure:
         handed = r"(?:return\s+)?[A-Za-z_][\w:]*\s*\([^;]*\b%s\b" % re.escape(bound)
-        if re.search(handed, arm):
-            # The handoff excuses only itself. Every other exit of the arm
-            # is still read through `success_value`.
-            if re.search(r"\b(?:panic|unreachable|todo)!", arm):
-                return True
-            for returned in re.findall(r"\breturn\b\s*([^;}]*)", arm):
-                if not re.match(handed, returned.strip()) and not success_value(returned):
-                    return True
-            value = closure_value(arm)
-            return not re.match(handed, value) and builds_rejection(value)
-    return rejecting_exit(arm) or builds_rejection(closure_value(arm))
+    for returned in re.findall(r"\breturn\b\s*([^;}]*)", body):
+        if handed and re.match(handed, returned.strip()):
+            continue
+        if builds_rejection(returned.strip()) if closure else not success_value(returned):
+            return True
+    value = closure_value(body)
+    return not (handed and re.match(handed, value)) and builds_rejection(value)
 
 
 def rejecting_arm(arm: str, bound: str | None) -> bool:
@@ -1377,10 +1439,9 @@ def fallback_rejects(method: str, arguments: str, state: str = "result") -> bool
     """Whether the fallback of `unwrap_or*` or `map_or*` rejects.
 
     `state` is `"result"` or `"option"`. The fallback is the first argument. It
-    rejects when it builds an error or panics. A closure also rejects when its
-    value is a helper call that `builds_rejection` accepts. It also rejects
-    when it returns or converts its error, or passes that error to a call. On
-    a `Result`, a function path given to `unwrap_or_else` or `map_or_else`
+    rejects when it builds an error or panics. A closure is read by its exits,
+    as `exits_reject` reads it, so a call that only observes the error decides
+    nothing. On a `Result`, a function path given to `unwrap_or_else` or `map_or_else`
     receives the error, so it rejects. On an `Option`, the path's return type
     decides.
     """
@@ -1396,17 +1457,8 @@ def fallback_rejects(method: str, arguments: str, state: str = "result") -> bool
             return False
         # On an `Option` the path receives no error, so its return type decides.
         return state == "result" or builds_rejection(fallback + "(")
-    bound, body = closure.group(1), closure.group(2)
-    # A helper can build a rejection without the error, as `builds_rejection`
-    # reads it. A type path such as `Gadget::default()` builds a value. A
-    # `return` in a closure gives the closure value, so it is read the same way.
-    returned = re.findall(r"\breturn\b\s*([^;}]*)", body)
-    if any(builds_rejection(value.strip()) for value in [closure_value(body), *returned]):
-        return True
-    if bound is None or bound == "_":
-        return False
-    passed = r"\b[A-Za-z_][\w:]*\s*\(\s*&?\s*%s\b" % re.escape(bound)
-    return rejecting_arm(body, bound) or re.search(passed, body) is not None
+    # The closure is read by its exits, as `exits_reject` reads an `Err` arm.
+    return exits_reject(closure.group(2), closure.group(1), closure=True)
 
 
 def success_value(value: str) -> bool:
@@ -1867,7 +1919,31 @@ def alias_declarations(code: str) -> list[tuple[tuple[int, int], tuple[int, int]
     return found
 
 
-def resolve_aliases(source: str) -> str:
+# How many passes `resolve_aliases` makes before it gives up on a chain.
+ALIAS_PASSES = 8
+
+
+def resolve_aliases(source: str) -> tuple[str, list[str]]:
+    """`source` with every alias resolved, and the names that did not settle.
+
+    Each pass replaces the aliases that `alias_declarations` reads. A chain
+    such as `use Query as Q; type ApiQuery<T> = Q<T>;` needs one pass per
+    link, so the passes repeat until the text stops changing. A cycle, or a
+    chain longer than `ALIAS_PASSES`, never settles. Its names are returned,
+    so the audit reports each one and fails closed.
+    """
+    for _ in range(ALIAS_PASSES):
+        resolved = resolve_aliases_once(source)
+        if resolved == source:
+            return source, []
+        source = resolved
+    # Every alias name left in the text may be a link that never settled.
+    code = code_only(source)
+    declared = re.findall(r"\btype\s+([A-Za-z_]\w*)|\bas\s+([A-Za-z_]\w*)", code)
+    return source, sorted({name for pair in declared for name in pair if name})
+
+
+def resolve_aliases_once(source: str) -> str:
     """`source` with each alias in `alias_declarations` replaced in its scope.
 
     A module-level alias holds in the whole file. One in a block holds only in
@@ -1903,11 +1979,12 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
     """Every finding, by check. `find_struct` maps a struct name to its block."""
     # A rename keeps every line, so line numbers still point at the source.
     lines = source.split("\n")
-    source = canonical_paths(resolve_aliases(source))
+    source, unsettled = resolve_aliases(source)
+    source = canonical_paths(source)
     # Comments and literals are blanked once, at the same length. Every scan
     # reads `code`. Only the route table and the query keys need literals.
     code = masked_source(source)
-    unreadable = unreadable_aliases(code)
+    unreadable = unreadable_aliases(code) + [(0, len(code), name) for name in unsettled]
     SOURCE[0] = code
     by_route = {(r["method"], r["path"]): r for r in contract["routes"]}
     routes = router_routes(source)
@@ -2443,6 +2520,33 @@ struct Thing {
 """
 
 
+# An alias chain longer than `ALIAS_PASSES`, which never settles.
+FIXTURE_ALIAS_CHAIN = r"""
+use axum::extract::Query as Link1;
+type Link2<T> = Link1<T>;
+type Link3<T> = Link2<T>;
+type Link4<T> = Link3<T>;
+type Link5<T> = Link4<T>;
+type Link6<T> = Link5<T>;
+type Link7<T> = Link6<T>;
+type Link8<T> = Link7<T>;
+type Link9<T> = Link8<T>;
+type Link10<T> = Link9<T>;
+
+pub fn harvest_api_router() -> Router {
+    Router::new().route("/c/long-chain", get(c_long_chain))
+}
+
+async fn c_long_chain(query: Link10<Cursor>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+struct Cursor {
+    offset: Option<u32>,
+}
+"""
+
+
 # Shapes that once slipped past the audit or failed it on correct code.
 FIXTURE_EDGES = r"""
 use serde_json::from_slice as decode;
@@ -2452,6 +2556,8 @@ use axum::{extract::State, Json as AxumJson};
 use bytes::Bytes as RequestBytes;
 
 type ApiQuery<T> = Query<T>;
+use axum::extract::Query as ChainQ;
+type ChainQuery<T> = ChainQ<T>;
 type OddQuery<T> = Result<Query<T>, QueryRejection>;
 
 pub fn harvest_api_router() -> Router {
@@ -2582,6 +2688,11 @@ pub fn harvest_api_router() -> Router {
         .route("/e/renamed-bytes", post(e_renamed_bytes))
         .route("/e/type-alias-query", get(e_type_alias_query))
         .route("/e/odd-alias-query", get(e_odd_alias_query))
+        .route("/e/transparent-body", post(e_transparent_body))
+        .route("/e/comparison-argument", post(e_comparison_argument))
+        .route("/e/nested-or-guard", post(e_nested_or_guard))
+        .route("/e/alias-chain-query", get(e_alias_chain_query))
+        .route("/e/observed-fallback", post(e_observed_fallback))
         .route("/e/json-handoff-unknown", post(e_json_handoff_unknown))
         .route("/e/json-handoff-tolerant", post(e_json_handoff_tolerant))
         .route("/e/raw-nested-argument", post(e_raw_nested_argument))
@@ -3589,6 +3700,43 @@ async fn e_type_alias_query(query: ApiQuery<Cursor>) -> Response {
 }
 
 async fn e_odd_alias_query(query: OddQuery<Cursor>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn e_transparent_body(Json(body): Json<Transparent>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+#[serde(transparent)]
+struct Transparent {
+    inner: String,
+}
+
+async fn e_comparison_argument(body: Bytes) -> Response {
+    decode_limited(limit < maximum, &body)
+}
+
+fn decode_limited(small: bool, raw: &[u8]) -> Response {
+    let gadget = serde_json::from_slice::<Gadget>(raw).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_nested_or_guard(body: Bytes) -> Response {
+    if !body.is_empty() && (feature_on() || fallback_on()) {
+        let gadget = serde_json::from_slice::<Gadget>(&body).unwrap();
+    }
+    StatusCode::OK.into_response()
+}
+
+async fn e_alias_chain_query(query: ChainQuery<Cursor>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn e_observed_fallback(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    let Json(gadget) = body.unwrap_or_else(|error| {
+        observe_rejection(error);
+        Json(Gadget::default())
+    });
     StatusCode::OK.into_response()
 }
 
@@ -5610,6 +5758,70 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             "query_params": ["GET /e/type-alias-query: `offset` is accepted by Cursor"],
             "unresolved": ["GET /e/odd-alias-query: cannot read the `OddQuery` type alias"],
         },
+    ),
+    (
+        "a serde container attribute that changes the layout is unreadable",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/transparent-body",
+                200,
+                request_body=body_of(("inner", True)),
+            )
+        ],
+        {"unresolved": ["POST /e/transparent-body: cannot read `transparent` in Transparent"]},
+    ),
+    (
+        "a comparison in an earlier argument does not swallow the body argument",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/comparison-argument",
+                200,
+                request_body=body_of(("name", True), required=False),
+            )
+        ],
+        {"body_required": ["POST /e/comparison-argument: the body is mandatory"]},
+    ),
+    (
+        "a nested || inside an is_empty guard keeps the guard",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/nested-or-guard",
+                200,
+                request_body=body_of(("name", True), required=False),
+            )
+        ],
+        {},
+    ),
+    (
+        "an alias of an alias of Query is read",
+        FIXTURE_EDGES,
+        [fixture_route("GET", "/e/alias-chain-query", 200, params=[])],
+        {"query_params": ["GET /e/alias-chain-query: `offset` is accepted by Cursor"]},
+    ),
+    (
+        "an alias chain that never settles is reported",
+        FIXTURE_ALIAS_CHAIN,
+        [fixture_route("GET", "/c/long-chain", 200, params=[])],
+        {"unresolved": ["GET /c/long-chain: cannot read the `Link10` type alias"]},
+    ),
+    (
+        "a fallback that observes its error and then recovers is tolerant",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/observed-fallback",
+                200,
+                request_body=body_of(("name", False), required=False),
+            )
+        ],
+        {},
     ),
     (
         "a helper named in a comment or a string is not called",
