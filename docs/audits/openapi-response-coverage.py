@@ -29,9 +29,10 @@ Checks 2 and 3 resolve each `Json<T>` extractor to its struct, with or without
 a path such as `axum::Json`. A field is mandatory when it is neither an
 `Option` nor carries a serde default, since axum rejects a request that omits
 one. A field serde accepts but the contract omits is missing from the
-generated client, so an ordinary request cannot be typed. Check 3 skips only a
-body the contract marks `free_form`. An empty field list on any other body is
-checked.
+generated client, so an ordinary request cannot be typed. Checks 2 and 3 skip
+only a body the contract marks `free_form`. A present `Option<Json<T>>` body is
+parsed strictly, so check 2 reads its mandatory fields. An empty field list on
+any other body is checked.
 
 A handler can also take the raw `Bytes` and call `serde_json::from_slice`
 itself. Checks 2, 3 and 5 read that parse when it reads a parameter of type
@@ -46,7 +47,8 @@ free-form, so checks 2 and 3 skip it. Check 5 still reads it.
 
 Check 5 treats a bare `Json<T>` as mandatory, since axum rejects a request
 without it. A `Result<Json<T>, _>` is mandatory when the handler rejects its
-error, through `?`, `.map_err(..)` or an `Err` arm that builds an error. A
+error, through `?`, `.map_err(..)?`, or an `Err` arm that builds an error or
+returns the rejection it binds. A
 raw-byte parse is mandatory unless an `if` on `.is_empty()` lets an empty body
 skip it. The parse must be in the arm that runs for a non-empty body. An
 earlier `if body.is_empty() { .. }` also counts when its block returns `Ok(..)`
@@ -604,14 +606,32 @@ def rejects_result_body(params: str, block: str) -> bool:
             return True
     for match in re.finditer(r"\bmatch\s+%s\s*\{" % variable, block):
         arms = balanced(block[match.end() - 1 :], "{", "}")
-        failure = re.search(r"\bErr\s*\(", arms)
-        if failure and re.search(ERROR_TOKENS, match_arm(arms, failure.start())):
+        failure = re.search(r"\bErr\s*\(\s*([a-z_][a-z_0-9]*)?", arms)
+        if failure and rejecting_arm(match_arm(arms, failure.start()), failure.group(1)):
             return True
     for binding in re.finditer(r"\blet\s+Ok\s*\(.*?\)\s*=\s*%s\s+else\s*\{" % variable, block):
         otherwise = balanced(block[binding.end() - 1 :], "{", "}")
         if re.search(r"\breturn\b|" + ERROR_TOKENS, otherwise):
             return True
     return False
+
+
+def rejecting_arm(arm: str, bound: str | None) -> bool:
+    """Whether an `Err` arm rejects the request.
+
+    It rejects when it builds an error, or when it returns or converts the
+    rejection it binds, such as `rejection.into_response()`. Passing the
+    rejection to a helper, as the start route does to replay a key, is not
+    rejection.
+    """
+    if re.search(ERROR_TOKENS, arm):
+        return True
+    if bound is None or bound == "_":
+        return False
+    name = re.escape(bound)
+    returned = r"\breturn\s+(?:Err\(\s*)?%s\b(?!\s*[,)])" % name
+    converted = r"\b%s\s*\.\s*(?:into_response|into)\s*\(\s*\)" % name
+    return re.search(returned + "|" + converted, arm) is not None
 
 
 def match_arm(arms: str, start: int) -> str:
@@ -932,8 +952,11 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
         parses: list[tuple[str, bool]] = []
         body_type = extractor.group(1).split("::")[-1] if extractor else None
         result_rejects = rejects_result_body(params, handler_body(source, handler) or "")
+        option_body = bool(extractor) and extractor.re.pattern.startswith("Option<")
         if body_type is not None and body_type != "Value":
-            parses.append((body_type, bool(bare) or result_rejects))
+            # A present `Option<Json<T>>` body is still parsed strictly, so its
+            # mandatory fields are checked. A tolerant `Result` body is not.
+            parses.append((body_type, bool(bare) or result_rejects or option_body))
         mandatory_body = bool(bare) or result_rejects
         if byte_parameters(params):
             for name, optional, tolerant in raw_body_parses(source, handler):
@@ -967,15 +990,16 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
             if unreadable_serde(struct):
                 unresolved += [unread % (method, path, a, name) for a in unreadable_serde(struct)]
                 continue
-            for spellings in mandatory_fields(struct) if mandatory else []:
+            free_form = request_body.get("free_form") is True
+            for spellings in mandatory_fields(struct) if mandatory and not free_form else []:
                 if declared.get(documented_as(spellings, declared)) is not True:
                     body_findings.append(
                         "  %s %s: `%s` is mandatory in %s but the contract does not "
                         "mark it required" % (method, path, spellings[0], name)
                     )
-            # A free-form body is documented by prose, so its fields are not
-            # checked. An empty field list on any other body is checked.
-            if not request_body.get("free_form"):
+            # A free-form body is documented by prose, so checks 2 and 3 skip
+            # its fields. An empty field list on any other body is checked.
+            if not free_form:
                 for spellings in accepted_fields(struct):
                     if documented_as(spellings, declared) is None:
                         undocumented.append(
@@ -1368,6 +1392,7 @@ pub fn harvest_api_router() -> Router {
         .route("/e/call-guard", post(e_call_guard))
         .route("/e/guarded-fields", post(e_guarded_fields))
         .route("/e/map-err-ok", post(e_map_err_ok))
+        .route("/e/return-rejection", post(e_return_rejection))
 }
 
 async fn e_wrapped(body: Bytes) -> Response {
@@ -1689,6 +1714,14 @@ async fn e_guarded_fields(body: Bytes) -> Response {
 
 async fn e_map_err_ok(body: Result<Json<Gadget>, JsonRejection>) -> Response {
     let gadget = body.map_err(log_rejection).ok();
+    StatusCode::OK.into_response()
+}
+
+async fn e_return_rejection(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    let gadget = match body {
+        Ok(Json(gadget)) => gadget,
+        Err(rejection) => return rejection.into_response(),
+    };
     StatusCode::OK.into_response()
 }
 
@@ -2405,7 +2438,10 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
                 request_body={"required": False, "free_form": False, "fields": []},
             )
         ],
-        {"undocumented": ["POST /e/empty-fields: `name` is accepted by Gadget"]},
+        {
+            "undocumented": ["POST /e/empty-fields: `name` is accepted by Gadget"],
+            "mandatory": ["POST /e/empty-fields: `name` is mandatory in Gadget"],
+        },
     ),
     (
         "a free-form body skips the field checks",
@@ -2503,6 +2539,32 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             )
         ],
         {},
+    ),
+    (
+        "an Err arm that returns the rejection itself rejects",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/return-rejection",
+                200,
+                request_body=body_of(("name", True), required=False),
+            )
+        ],
+        {"body_required": ["POST /e/return-rejection: the body is mandatory"]},
+    ),
+    (
+        "a present Option<Json<T>> body needs its mandatory fields",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/empty-fields",
+                200,
+                request_body=body_of(("name", False), required=False),
+            )
+        ],
+        {"mandatory": ["POST /e/empty-fields: `name` is mandatory in Gadget"]},
     ),
     (
         "a malformed contract entry does not crash the audit",
