@@ -38,6 +38,9 @@ const REQUIRED_ALERTS: &[&str] = &[
     "harvest_audit_export_lag_high",
     // Issue #1268 — the availability companion to the lag gauge.
     "harvest_audit_export_unobservable",
+    // Issue #1429 — Redis dispatch channel health (issue #1312).
+    "harvest_dispatch_hints_dropped",
+    "harvest_dispatch_fallback",
 ];
 
 const REQUIRED_DRILLS: &[&str] = &[
@@ -122,6 +125,10 @@ const STABLE_PROMETHEUS_METRICS: &[&str] = &[
     // The adjacent bridge fix issue #1307 made: `record_external_cancel_sent`
     // had no `MetricsRsRecorder` implementation and silently no-opped.
     "harvest_workflow_external_cancel_sent_total",
+    // Issue #1429 — Redis dispatch channel health (issue #1312).
+    "harvest_dispatch_hints_dropped_total",
+    "harvest_dispatch_fallbacks_total",
+    "harvest_dispatch_recovered_total",
 ];
 
 #[test]

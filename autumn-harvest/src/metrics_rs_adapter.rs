@@ -461,6 +461,22 @@ impl MetricsRecorder for MetricsRsRecorder {
         .increment(1);
     }
 
+    fn record_dispatch_hints_dropped(&self, count: u64) {
+        counter!(crate::telemetry::METRIC_DISPATCH_HINTS_DROPPED).increment(count);
+    }
+
+    fn record_dispatch_fallback(&self, reason: &str) {
+        counter!(
+            crate::telemetry::METRIC_DISPATCH_FALLBACKS,
+            METRIC_LABEL_REASON => reason.to_owned(),
+        )
+        .increment(1);
+    }
+
+    fn record_dispatch_recovered(&self, count: u64) {
+        counter!(crate::telemetry::METRIC_DISPATCH_RECOVERED).increment(count);
+    }
+
     fn record_shard_dispatched(&self, shard: u16) {
         counter!(
             crate::telemetry::METRIC_SHARD_DISPATCHED,
@@ -2689,6 +2705,97 @@ mod tests {
             ],
             "the shard-dispatch bridge must register harvest.shard.dispatched \
              with exactly the bounded `shard` label constant",
+        );
+    }
+
+    /// Issue #1429: the three dispatch counters reach metrics-rs under their
+    /// catalogue names, and only the fallback counter carries a label.
+    #[test]
+    #[allow(clippy::too_many_lines)] // inline CapturingRecorder boilerplate
+    fn bridges_dispatch_counters_with_bounded_labels() {
+        type CounterKey = (String, Vec<(String, String)>);
+
+        #[derive(Default)]
+        struct CapturingRecorder {
+            counters: std::sync::Mutex<Vec<CounterKey>>,
+        }
+
+        impl metrics::Recorder for &CapturingRecorder {
+            fn describe_counter(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn describe_gauge(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn describe_histogram(
+                &self,
+                _: metrics::KeyName,
+                _: Option<metrics::Unit>,
+                _: metrics::SharedString,
+            ) {
+            }
+            fn register_counter(
+                &self,
+                key: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Counter {
+                self.counters.lock().unwrap().push((
+                    key.name().to_owned(),
+                    key.labels()
+                        .map(|l| (l.key().to_owned(), l.value().to_owned()))
+                        .collect(),
+                ));
+                metrics::Counter::noop()
+            }
+            fn register_gauge(
+                &self,
+                _: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Gauge {
+                metrics::Gauge::noop()
+            }
+            fn register_histogram(
+                &self,
+                _: &metrics::Key,
+                _: &metrics::Metadata<'_>,
+            ) -> metrics::Histogram {
+                metrics::Histogram::noop()
+            }
+        }
+
+        let capture = CapturingRecorder::default();
+        metrics::with_local_recorder(&&capture, || {
+            let rec = MetricsRsRecorder;
+            rec.record_dispatch_hints_dropped(4);
+            rec.record_dispatch_fallback("read");
+            rec.record_dispatch_recovered(2);
+        });
+
+        let counters = capture.counters.lock().unwrap().clone();
+        assert_eq!(
+            counters.as_slice(),
+            &[
+                (
+                    crate::telemetry::METRIC_DISPATCH_HINTS_DROPPED.to_owned(),
+                    vec![],
+                ),
+                (
+                    crate::telemetry::METRIC_DISPATCH_FALLBACKS.to_owned(),
+                    vec![(METRIC_LABEL_REASON.to_owned(), "read".to_owned())],
+                ),
+                (
+                    crate::telemetry::METRIC_DISPATCH_RECOVERED.to_owned(),
+                    vec![],
+                ),
+            ],
         );
     }
 

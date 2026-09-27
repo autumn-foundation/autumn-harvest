@@ -224,6 +224,10 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     // Issue #1313 — the observable proxy for the by-id fan-out race's
     // precondition.
     "harvest_external_signal_by_id_other_live_observed_total",
+    // Issue #1429 — Redis dispatch channel health (issue #1312).
+    "harvest_dispatch_hints_dropped_total",
+    "harvest_dispatch_fallbacks_total",
+    "harvest_dispatch_recovered_total",
 ];
 
 /// Per-series label ground truth (Prometheus-normalized label names),
@@ -424,6 +428,11 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
         "harvest_external_signal_by_id_other_live_observed",
         &["shard"],
     ),
+    // Issue #1429 — Redis dispatch channel health. `reason` is a closed set:
+    // `maintain`, `read`, `read_timeout` or `publish`.
+    ("harvest_dispatch_hints_dropped", &[]),
+    ("harvest_dispatch_fallbacks", &["reason"]),
+    ("harvest_dispatch_recovered", &[]),
 ];
 
 /// Unbounded / dotted label forms that must never appear in an expression or

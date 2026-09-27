@@ -22,6 +22,7 @@ use diesel_async::pooled_connection::deadpool::Pool;
 use diesel_async::{AsyncConnection, AsyncPgConnection};
 use tokio_util::sync::CancellationToken;
 
+use crate::dispatch::BufferedSettledExt as _;
 use crate::error::{HarvestError, HarvestResult, TimeoutType};
 use crate::event::WorkflowEvent;
 use crate::execution::{
@@ -1162,6 +1163,7 @@ async fn commit_workflow_execution_timeout(
         deferred.extend(triggers);
         Ok((true, deferred, closed_children, pending_cancel_metrics))
     }))
+    .buffered_settled()
     .await
 }
 
@@ -1401,6 +1403,7 @@ async fn enforce_activity_timeout(
         queue::wake_workflow_task(conn, exec_id).await?;
         Ok(true)
     }))
+    .buffered_settled()
     .await?;
 
     // Circuit breaker (issue #369): a start-to-close / heartbeat timeout against
@@ -1767,6 +1770,7 @@ pub async fn force_fail_activity(
             })
         }),
     )
+    .buffered_settled()
     .await
 }
 
@@ -1900,6 +1904,7 @@ async fn enforce_workflow_timeout(
             pending_cancel_metrics,
         )))
     }))
+    .buffered_settled()
     .await?;
 
     // Suppressed by a queue pause: nothing was written, so there is nothing to
@@ -2130,6 +2135,7 @@ pub async fn enforce_external_task_timeouts(conn: &mut AsyncPgConnection) -> Har
             queue::wake_workflow_task(conn, exec_id).await?;
             Ok(true)
         }))
+        .buffered_settled()
         .await;
 
         match result {
@@ -3402,6 +3408,7 @@ pub async fn enforce_external_signals_outbox(
                     Ok(Some((false, Some(row.id))))
                 }
             }))
+            .buffered_settled()
             .await;
 
         match step_res {
@@ -4057,6 +4064,7 @@ pub async fn enforce_external_cancels_outbox(
                     Ok(Some((false, Some(row.id), deferred_starts, cancel_metrics, deferred_checks, caller_shard)))
                 }
             }))
+            .buffered_settled()
             .await;
 
         match step_res {
@@ -4566,6 +4574,7 @@ pub async fn enforce_external_awaits_outbox(
                     Ok(Some((false, Some(row.id))))
                 }
             }))
+            .buffered_settled()
             .await;
 
         match step_res {
@@ -4908,6 +4917,7 @@ pub(crate) async fn enforce_timeouts_once_on_conn_shard(
         .transaction::<usize, HarvestError, _>(async |conn| {
             crate::mutex::reclaim_expired_leases_and_wake(conn).await
         })
+        .buffered_settled()
         .await?;
     Ok(count)
 }
@@ -5330,6 +5340,7 @@ pub async fn enforce_workflow_history_ceiling_with_codecs(
                 deferred.extend(triggers);
                 Ok((true, deferred, closed_children, pending_cancel_metrics))
             }))
+            .buffered_settled()
             .await?;
 
         if !applied {

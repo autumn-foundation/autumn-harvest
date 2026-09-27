@@ -1103,6 +1103,13 @@ impl HarvestRunner {
             _ => None,
         };
         let dispatch_installed = install_dispatch_channel(config, dispatch_shard).await?;
+        if dispatch_installed {
+            // An API-only process drops hints too, and it builds no worker to
+            // set the recorder (issue #1429).
+            autumn_harvest::dispatch::set_metrics_recorder(Arc::clone(
+                &registry.telemetry().metrics,
+            ));
+        }
         let dispatch_guard = DispatchInstallGuard::new(dispatch_installed);
 
         let worker = if config.worker_enabled {
@@ -1209,22 +1216,25 @@ impl HarvestRunner {
                 prepared.worker_runtime_config.poll_interval,
             ))
         };
-        let api_runtime = HarvestApiRuntime::new(
-            registry,
-            dag_catalog,
-            workflow_schedules,
-            worker_id,
-            queues,
-            scheduler_monitor,
-            HarvestRetentionRuntime::new(
-                prepared.retention_config,
-                retention_monitor,
-                retention_trigger,
-            ),
-            shard_router,
-        )
-        .with_registered_dag_names(prepared.registered_dag_names.iter().cloned())
-        .with_effective_config(prepared.effective_config.clone());
+        let api_runtime =
+            HarvestApiRuntime::new(
+                registry,
+                dag_catalog,
+                workflow_schedules,
+                worker_id,
+                queues,
+                scheduler_monitor,
+                HarvestRetentionRuntime::new(
+                    prepared.retention_config,
+                    retention_monitor,
+                    retention_trigger,
+                ),
+                shard_router,
+            )
+            .with_registered_dag_names(prepared.registered_dag_names.iter().cloned())
+            .with_effective_config(prepared.effective_config.clone().with_redis(
+                redis_dispatch_view(&config.redis, dispatch_installed, dispatch_shard),
+            ));
 
         Ok(Self {
             api_runtime,
@@ -1472,7 +1482,6 @@ const DEFAULT_DISPATCH_SHARD: ShardId = ShardId::new(0);
 ///
 /// A central API process that spans several shards still rejects Redis
 /// dispatch at startup. Issue #1429 tracks true multi-shard routing.
-#[cfg_attr(not(feature = "redis"), allow(dead_code))]
 #[must_use]
 fn effective_dispatch_prefix(configured: &str, shard: Option<ShardId>) -> String {
     match shard {
@@ -1480,6 +1489,30 @@ fn effective_dispatch_prefix(configured: &str, shard: Option<ShardId>) -> String
             format!("{configured}:s{}", shard.as_i32())
         }
         _ => configured.to_string(),
+    }
+}
+
+/// The `redis` section of the admin config view (issue #1429).
+///
+/// `installed` is the install result, not the config. A configured URL that
+/// cannot connect stops startup, so a served view never claims a channel that
+/// is not there. The endpoint is the redacted URL, so the view never carries
+/// a password.
+#[must_use]
+fn redis_dispatch_view(
+    redis: &crate::config::HarvestRedisConfig,
+    installed: bool,
+    shard: Option<ShardId>,
+) -> autumn_harvest::effective_config::RedisDispatchView {
+    autumn_harvest::effective_config::RedisDispatchView {
+        installed,
+        endpoint: redis.redacted_url(),
+        key_prefix: effective_dispatch_prefix(&redis.key_prefix, shard),
+        consumer_group: redis.consumer_group.clone(),
+        visibility_timeout_ms: redis.visibility_timeout_ms,
+        poll_interval_ms: redis.poll_interval_ms,
+        reconcile_interval_ms: redis.reconcile_interval_ms,
+        reconcile_batch: redis.reconcile_batch,
     }
 }
 
@@ -1577,14 +1610,7 @@ async fn install_dispatch_channel(
         ))
     })?;
 
-    autumn_harvest::dispatch::install(
-        Arc::new(channel),
-        autumn_harvest::dispatch::DispatchSettings {
-            poll_interval: Duration::from_millis(config.redis.poll_interval_ms),
-            reconcile_interval: Duration::from_millis(config.redis.reconcile_interval_ms),
-            ..autumn_harvest::dispatch::DispatchSettings::default()
-        },
-    );
+    autumn_harvest::dispatch::install(Arc::new(channel), dispatch_settings(&config.redis));
 
     tracing::info!(
         endpoint = %endpoint,
@@ -1592,10 +1618,29 @@ async fn install_dispatch_channel(
         consumer_group = %config.redis.consumer_group,
         poll_interval_ms = config.redis.poll_interval_ms,
         reconcile_interval_ms = config.redis.reconcile_interval_ms,
+        reconcile_batch = config.redis.reconcile_batch,
         "redis dispatch enabled: workers read task references from redis and claim the named \
          row in postgres"
     );
     Ok(true)
+}
+
+/// Worker-side channel tuning from `[harvest.redis]` (issue #1429).
+///
+/// The release backoff cap has no config key, so it keeps its default.
+#[cfg(any(feature = "redis", test))]
+#[must_use]
+fn dispatch_settings(
+    redis: &crate::config::HarvestRedisConfig,
+) -> autumn_harvest::dispatch::DispatchSettings {
+    use std::time::Duration;
+
+    autumn_harvest::dispatch::DispatchSettings {
+        poll_interval: Duration::from_millis(redis.poll_interval_ms),
+        reconcile_interval: Duration::from_millis(redis.reconcile_interval_ms),
+        reconcile_batch: usize::try_from(redis.reconcile_batch).unwrap_or(usize::MAX),
+        ..autumn_harvest::dispatch::DispatchSettings::default()
+    }
 }
 
 /// No dispatch channel exists without the `redis` cargo feature.
@@ -2156,6 +2201,69 @@ mod tests {
             "a caller that already ran the gate must be able to say so",
         );
     }
+    /// Every `[harvest.redis]` tuning key reaches the worker settings
+    /// (issue #1429). Before this, `reconcile_batch` was fixed at its default.
+    #[test]
+    fn dispatch_settings_carry_every_redis_tuning_key() {
+        let redis = crate::config::HarvestRedisConfig {
+            poll_interval_ms: 7,
+            reconcile_interval_ms: 300,
+            reconcile_batch: 250,
+            ..crate::config::HarvestRedisConfig::default()
+        };
+
+        let settings = super::dispatch_settings(&redis);
+
+        assert_eq!(settings.poll_interval, std::time::Duration::from_millis(7));
+        assert_eq!(
+            settings.reconcile_interval,
+            std::time::Duration::from_millis(300)
+        );
+        assert_eq!(settings.reconcile_batch, 250);
+        assert_eq!(
+            settings.release_backoff_cap,
+            autumn_harvest::dispatch::DEFAULT_DISPATCH_RELEASE_BACKOFF_CAP
+        );
+    }
+
+    /// The admin view names the endpoint without its password, and reports
+    /// the effective prefix and the install result (issue #1429).
+    #[test]
+    fn the_redis_view_redacts_the_password_and_reports_the_install() {
+        let redis = crate::config::HarvestRedisConfig {
+            url: Some("redis://ops:hunter2@cache:6379/0".to_owned()),
+            reconcile_batch: 250,
+            ..crate::config::HarvestRedisConfig::default()
+        };
+
+        let view = super::redis_dispatch_view(&redis, true, Some(ShardId::new(2)));
+
+        assert!(view.installed);
+        let endpoint = view.endpoint.expect("a configured url reports an endpoint");
+        assert!(
+            !endpoint.contains("hunter2") && !endpoint.contains("ops"),
+            "the endpoint must drop the userinfo, got {endpoint}"
+        );
+        assert!(endpoint.contains("cache:6379"), "got {endpoint}");
+        assert_eq!(view.key_prefix, "harvest:s2");
+        assert_eq!(view.consumer_group, "harvest_workers");
+        assert_eq!(view.visibility_timeout_ms, 60_000);
+        assert_eq!(view.poll_interval_ms, 20);
+        assert_eq!(view.reconcile_interval_ms, 1_000);
+        assert_eq!(view.reconcile_batch, 250);
+    }
+
+    /// With no URL the view says the channel is off and names no endpoint.
+    #[test]
+    fn the_redis_view_reports_an_off_channel() {
+        let view =
+            super::redis_dispatch_view(&crate::config::HarvestRedisConfig::default(), false, None);
+
+        assert!(!view.installed);
+        assert_eq!(view.endpoint, None);
+        assert_eq!(view.key_prefix, "harvest");
+    }
+
     /// Redis dispatch is single-shard in v1 (issue #1312, contract C7). The
     /// runner rejects the combination before it installs the channel, so a
     /// multi-shard process never reaches a connected channel it cannot use.

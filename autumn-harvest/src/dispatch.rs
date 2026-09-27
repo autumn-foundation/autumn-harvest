@@ -183,12 +183,57 @@ pub trait TaskDispatch: Send + Sync + std::fmt::Debug {
     /// Drop a reference. The row was claimed, or it is no longer claimable.
     async fn ack(&self, lease: &DispatchLease) -> HarvestResult<()>;
 
+    /// Drop several references in one call (issue #1429).
+    ///
+    /// The default acks each lease in turn. It tries every lease and returns
+    /// the first error. A lease left unacked costs one redelivery, which finds
+    /// its row not claimable and acks it.
+    async fn ack_many(&self, leases: &[DispatchLease]) -> HarvestResult<()> {
+        let mut first_error = None;
+        for lease in leases {
+            if let Err(error) = self.ack(lease).await {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
     /// Give a reference back so it is delivered again after `delay`.
     async fn release(&self, lease: &DispatchLease, delay: Duration) -> HarvestResult<()>;
 
     /// Promote due delayed references and recover references held by a
     /// consumer that stopped acking.
     async fn maintain(&self, queues: &[String]) -> HarvestResult<DispatchMaintenance>;
+
+    /// Take or renew the reconcile sweep lease of each queue (issue #1429).
+    ///
+    /// Returns one flag per queue, in order. A `true` flag means `consumer`
+    /// holds that lease for `ttl` and sweeps the queue. One holder per queue
+    /// keeps a fleet from reading the same rows once per worker.
+    ///
+    /// The default grants every lease, so every worker sweeps every queue.
+    async fn hold_reconcile_leases(
+        &self,
+        queues: &[String],
+        consumer: &str,
+        ttl: Duration,
+    ) -> HarvestResult<Vec<bool>> {
+        let _ = (consumer, ttl);
+        Ok(vec![true; queues.len()])
+    }
+
+    /// Give up the reconcile leases `consumer` holds on `queues`.
+    ///
+    /// A worker calls this after a failed sweep, so a peer sweeps next time.
+    /// The default does nothing.
+    async fn release_reconcile_leases(
+        &self,
+        queues: &[String],
+        consumer: &str,
+    ) -> HarvestResult<()> {
+        let _ = (queues, consumer);
+        Ok(())
+    }
 }
 
 /// The installed channel and its settings.
@@ -212,6 +257,8 @@ pub fn install(channel: Arc<dyn TaskDispatch>, settings: DispatchSettings) {
 
 /// Remove the process-global channel. Tests use this between cases.
 ///
+/// The dropped-hint recorder is cleared as well.
+///
 /// The background publisher is stopped as well, so the next install starts
 /// with an empty publisher queue. A hint still in that queue is dropped; the
 /// reconcile sweep republishes its row.
@@ -219,6 +266,9 @@ pub fn uninstall() {
     if let Ok(mut slot) = INSTALLED.write() {
         *slot = None;
         ANY_INSTALLED.store(false, Ordering::Relaxed);
+    }
+    if let Ok(mut slot) = METRICS.write() {
+        *slot = None;
     }
     let publisher = lock(&PUBLISHER).take();
     if let Some(publisher) = publisher {
@@ -355,6 +405,21 @@ where
     outcome
 }
 
+/// Method form of [`buffered_settled`] (issue #1429).
+///
+/// A transaction owner chains `.buffered_settled()` before its `.await`. The
+/// transaction body keeps its indentation, so the change is one line.
+pub trait BufferedSettledExt<T, E>: Future<Output = Result<T, E>> + Sized {
+    /// Run this transaction future in a buffering scope and settle its hints.
+    ///
+    /// See [`buffered_settled`].
+    fn buffered_settled(self) -> impl Future<Output = Result<T, E>> {
+        buffered_settled(self)
+    }
+}
+
+impl<T, E, F: Future<Output = Result<T, E>>> BufferedSettledExt<T, E> for F {}
+
 /// Publish `hints` on the installed channel now.
 ///
 /// Errors are logged and dropped. The reconcile sweep in the worker is the
@@ -460,11 +525,29 @@ fn may_log_dropped(
     }
 }
 
+/// Recorder for the dropped-hint counter (issue #1429).
+static METRICS: RwLock<Option<Arc<dyn crate::telemetry::MetricsRecorder>>> = RwLock::new(None);
+
+/// Set the recorder that counts dropped hints (issue #1429).
+///
+/// The drop site is the background publisher, which no worker owns. An
+/// API-only process drops hints too, so the owner of the install sets the
+/// recorder. [`uninstall`] clears it.
+pub fn set_metrics_recorder(recorder: Arc<dyn crate::telemetry::MetricsRecorder>) {
+    if let Ok(mut slot) = METRICS.write() {
+        *slot = Some(recorder);
+    }
+}
+
 /// Count one dropped hint and warn at most once per interval.
 fn record_dropped_hint() {
     let dropped = DROPPED_HINTS
         .fetch_add(1, Ordering::Relaxed)
         .saturating_add(1);
+    let recorder = METRICS.read().ok().and_then(|slot| slot.clone());
+    if let Some(recorder) = recorder {
+        recorder.record_dispatch_hints_dropped(1);
+    }
     let may_log = {
         let mut last = lock(&DROPPED_HINT_LOGGED);
         may_log_dropped(
@@ -1089,6 +1172,36 @@ mod tests {
         assert_eq!(release_delay(u32::MAX, base, cap), cap);
     }
 
+    /// Counts the dropped-hint counter only.
+    #[derive(Default)]
+    struct DropCounter(std::sync::atomic::AtomicU64);
+
+    impl crate::telemetry::MetricsRecorder for DropCounter {
+        fn record_dispatch_hints_dropped(&self, count: u64) {
+            self.0.fetch_add(count, Ordering::Relaxed);
+        }
+    }
+
+    /// Issue #1429: a hint the publisher drops reaches the recorder. The drop
+    /// site has no worker, so the recorder is process-global.
+    #[tokio::test]
+    async fn a_dropped_hint_reaches_the_metrics_recorder() {
+        let _guard = INSTALL_LOCK.lock().await;
+        let recorder = Arc::new(DropCounter::default());
+        set_metrics_recorder(Arc::clone(&recorder) as Arc<dyn crate::telemetry::MetricsRecorder>);
+
+        record_dropped_hint();
+        assert_eq!(recorder.0.load(Ordering::Relaxed), 1);
+
+        uninstall();
+        record_dropped_hint();
+        assert_eq!(
+            recorder.0.load(Ordering::Relaxed),
+            1,
+            "uninstall clears the recorder"
+        );
+    }
+
     #[tokio::test]
     async fn a_hint_outside_a_scope_reaches_the_channel() {
         let _guard = INSTALL_LOCK.lock().await;
@@ -1304,6 +1417,53 @@ mod tests {
 
         assert_eq!(outer, vec![one]);
         uninstall();
+    }
+
+    /// The default `ack_many` acks each lease, so a channel that does not
+    /// override it still disposes of a whole read (issue #1429).
+    #[tokio::test]
+    async fn ack_many_defaults_to_one_ack_per_lease() {
+        let channel = MemoryDispatch::new();
+        let hints = [hint("q", Utc::now()), hint("q", Utc::now())];
+        channel.publish(&hints).await.expect("publish");
+        let leases = channel
+            .next(&["q".to_string()], "c", 10, Duration::ZERO)
+            .await
+            .expect("next");
+        assert_eq!(leases.len(), 2);
+
+        channel.ack_many(&leases).await.expect("ack_many");
+
+        let mut acked = channel.acked_ids();
+        acked.sort();
+        let mut expected: Vec<Uuid> = hints.iter().map(|hint| hint.task_id).collect();
+        expected.sort();
+        assert_eq!(acked, expected);
+        assert_eq!(channel.outstanding_leases(), 0);
+    }
+
+    /// A channel with no lease store lets every worker sweep every queue
+    /// (issue #1429).
+    #[tokio::test]
+    async fn the_default_reconcile_lease_grants_every_queue() {
+        let channel = MemoryDispatch::new();
+        let queues = vec!["a".to_string(), "b".to_string()];
+
+        let held = channel
+            .hold_reconcile_leases(&queues, "w1", Duration::from_secs(3))
+            .await
+            .expect("hold");
+        let peer = channel
+            .hold_reconcile_leases(&queues, "w2", Duration::from_secs(3))
+            .await
+            .expect("hold");
+
+        assert_eq!(held, vec![true, true]);
+        assert_eq!(peer, vec![true, true]);
+        channel
+            .release_reconcile_leases(&queues, "w1")
+            .await
+            .expect("release");
     }
 
     #[tokio::test]

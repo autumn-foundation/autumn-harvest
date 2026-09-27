@@ -214,6 +214,7 @@ pub const fn requeue_orphan_stmt() -> &'static str {
 
 #[cfg(feature = "db")]
 mod scanner {
+    use crate::dispatch::BufferedSettledExt as _;
     use chrono::Utc;
     use diesel::BoolExpressionMethods;
     use diesel::ExpressionMethods;
@@ -763,6 +764,7 @@ mod scanner {
                     pending_cancel_metrics,
                 ))
             }))
+            .buffered_settled()
             .await?;
 
         if acted {

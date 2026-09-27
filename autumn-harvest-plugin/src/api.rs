@@ -7962,6 +7962,7 @@ pub const fn management_api_response_fields()
                 "shard_topology",
                 "features",
                 "pool",
+                "redis",
             ]),
         ),
         (

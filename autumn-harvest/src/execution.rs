@@ -16,6 +16,7 @@ use uuid::Uuid;
 use crate::build_routing;
 use crate::completion_trigger::DeferredTriggerStart;
 use crate::concurrency::ConcurrencyOnConflict;
+use crate::dispatch::BufferedSettledExt as _;
 use crate::error::{HarvestError, HarvestResult, database_error};
 use crate::event::WorkflowEvent;
 use crate::info::WorkflowInfo;
@@ -1243,6 +1244,10 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
         enqueue.scheduled_at = target_start_time;
     }
 
+    // The start publishes its hints after this transaction commits (issue
+    // #1429). Under a caller's scope the hints stay with the caller. As a
+    // SAVEPOINT with no scope they publish at release, which is never earlier
+    // than the background publisher did before.
     let main_result = Box::pin(conn.transaction::<(
         StartedWorkflowExecution,
         Vec<DeferredTriggerStart>,
@@ -1948,6 +1953,7 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
             }
         }
     }))
+    .buffered_settled()
     .await;
 
     let mut cancel_metrics = pre_check_cancel_metrics;
@@ -2271,6 +2277,7 @@ pub async fn start_or_load_workflow_execution_idempotent_with_codecs(
                 }
             }
         }))
+        .buffered_settled()
         .await?;
 
     for start in deferred_starts {
@@ -3523,6 +3530,7 @@ pub async fn cancel_workflow_execution_collect(
                 closed_children,
             ))
         }))
+        .buffered_settled()
         .await?;
 
     let mut deferred_checks = Vec::new();
@@ -5068,6 +5076,7 @@ pub async fn resume_workflow_execution(
             })
         }),
     )
+    .buffered_settled()
     .await?;
 
     // A no-op resume never actually resumed anything: skip the duration
@@ -5848,6 +5857,7 @@ pub async fn terminate_workflow_execution_collect(
                 closed_children,
             ))
         }))
+        .buffered_settled()
         .await?;
 
     let mut deferred_checks = Vec::new();
@@ -6894,6 +6904,7 @@ pub async fn signal_with_start_workflow_execution_with_metrics_and_codecs(
                 cancel_metrics,
             ))
         }))
+        .buffered_settled()
         .await?;
 
     for start in deferred_starts {
@@ -7608,6 +7619,7 @@ pub async fn rerun_workflow_execution_with_codecs(
                 cancel_metrics,
             ))
         }))
+        .buffered_settled()
         .await?;
 
     // Post-commit side effects (mirrors `signal_with_start_workflow_execution_with_metrics`):
@@ -8359,6 +8371,7 @@ pub async fn update_with_start_workflow_execution_with_metrics_and_codecs(
                 cancel_metrics,
             ))
         }))
+        .buffered_settled()
         .await?;
 
     for start in deferred_starts {

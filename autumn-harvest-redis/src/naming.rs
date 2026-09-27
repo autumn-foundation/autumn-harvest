@@ -63,6 +63,16 @@ pub fn dispatch_payloads_key(prefix: &str, queue_name: &str) -> String {
     format!("{prefix}:dispatch:{queue_name}:delayed:payloads")
 }
 
+/// Per-queue reconcile sweep lease (issue #1429).
+///
+/// The value names the worker that sweeps the queue. The key sits in the
+/// queue's own family. A queue name holds no colon, and a marker ends in a
+/// UUID, so no other dispatch key takes this shape.
+#[must_use]
+pub fn dispatch_reconcile_lease_key(prefix: &str, queue_name: &str) -> String {
+    format!("{prefix}:dispatch:{queue_name}:reconcile")
+}
+
 /// Dedupe marker for one task id.
 ///
 /// The marker makes a publish idempotent per task id. It expires after the
@@ -126,6 +136,10 @@ mod tests {
         assert_eq!(
             dispatch_marker_key("harvest", "abc"),
             "harvest:dispatch:marker:abc"
+        );
+        assert_eq!(
+            dispatch_reconcile_lease_key("harvest", "email"),
+            "harvest:dispatch:email:reconcile"
         );
     }
 

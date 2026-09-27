@@ -449,6 +449,26 @@ pub const METRIC_AUDIT_EXPORTED: &str = "harvest.audit.exported";
 /// neither is self-healing. Labelled `{shard}`.
 pub const METRIC_SHARD_FENCED: &str = "harvest.shard.fenced";
 
+/// Counter: dispatch hints the background publisher dropped (issue #1429).
+///
+/// The publisher queue is bounded. A hint that finds it full is dropped, and
+/// the reconcile sweep republishes its row. A steady rate means the channel
+/// cannot keep up with the enqueue rate. Unlabelled.
+pub const METRIC_DISPATCH_HINTS_DROPPED: &str = "harvest.dispatch.hints_dropped";
+
+/// Counter: a worker fell back to the Postgres claim path (issue #1429).
+///
+/// Incremented once for each channel call that fails and opens a cooldown.
+/// Labelled `{reason}`: `maintain`, `read`, `read_timeout` or `publish`.
+pub const METRIC_DISPATCH_FALLBACKS: &str = "harvest.dispatch.fallbacks";
+
+/// Counter: references recovered from a consumer that stopped acking
+/// (issue #1429).
+///
+/// A non-zero rate means workers crash or stall between a read and its ack.
+/// Unlabelled.
+pub const METRIC_DISPATCH_RECOVERED: &str = "harvest.dispatch.recovered";
+
 /// Gauge: current number of entries in the dead letter queue.
 pub const METRIC_DLQ_ENTRIES: &str = "harvest.dlq.entries";
 
@@ -2967,6 +2987,28 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = shard;
     }
 
+    /// The dispatch publisher dropped `count` hints (issue #1429).
+    ///
+    /// Maps to the counter [`METRIC_DISPATCH_HINTS_DROPPED`].
+    fn record_dispatch_hints_dropped(&self, count: u64) {
+        let _ = count;
+    }
+
+    /// A worker fell back to the Postgres claim path (issue #1429).
+    ///
+    /// `reason` names the channel call that failed. Maps to the counter
+    /// [`METRIC_DISPATCH_FALLBACKS`].
+    fn record_dispatch_fallback(&self, reason: &str) {
+        let _ = reason;
+    }
+
+    /// One maintenance pass recovered `count` references (issue #1429).
+    ///
+    /// Maps to the counter [`METRIC_DISPATCH_RECOVERED`].
+    fn record_dispatch_recovered(&self, count: u64) {
+        let _ = count;
+    }
+
     /// A task was dispatched from the given shard (issue #961).
     ///
     /// Recorded once per dispatched task by the worker's poll loop, which is
@@ -4669,6 +4711,23 @@ mod tests {
         );
         assert_eq!(METRIC_SHARD_GENERATION, "harvest.shard.generation");
         assert_eq!(METRIC_SHARD_FENCED, "harvest.shard.fenced");
+    }
+
+    /// Issue #1429: the dispatch channel exports three counters. Their names
+    /// are part of the dashboard and alert contract.
+    #[test]
+    fn dispatch_metrics_have_stable_names_and_noop_defaults() {
+        assert_eq!(
+            METRIC_DISPATCH_HINTS_DROPPED,
+            "harvest.dispatch.hints_dropped"
+        );
+        assert_eq!(METRIC_DISPATCH_FALLBACKS, "harvest.dispatch.fallbacks");
+        assert_eq!(METRIC_DISPATCH_RECOVERED, "harvest.dispatch.recovered");
+
+        let rec = NoOpMetrics;
+        rec.record_dispatch_hints_dropped(3);
+        rec.record_dispatch_fallback("read");
+        rec.record_dispatch_recovered(2);
     }
 
     #[test]

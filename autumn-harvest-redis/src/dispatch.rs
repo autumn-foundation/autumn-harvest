@@ -81,7 +81,7 @@ use uuid::Uuid;
 use crate::error::{RedisAdapterError, RedisAdapterResult};
 use crate::naming::{
     dispatch_delayed_key, dispatch_marker_key, dispatch_marker_prefix, dispatch_payloads_key,
-    dispatch_stream_key,
+    dispatch_reconcile_lease_key, dispatch_stream_key,
 };
 use crate::redis_queue::is_busygroup;
 
@@ -244,6 +244,8 @@ pub struct RedisDispatch {
     publish_script: Arc<Script>,
     promote_script: Arc<Script>,
     requeue_script: Arc<Script>,
+    hold_lease_script: Arc<Script>,
+    release_lease_script: Arc<Script>,
     /// Queues whose consumer group this process already created.
     ensured: Arc<Mutex<HashSet<String>>>,
     /// Unix milliseconds of the last promotion pass driven by a read.
@@ -286,6 +288,8 @@ impl RedisDispatch {
             publish_script: Arc::new(Script::new(PUBLISH_LUA)),
             promote_script: Arc::new(Script::new(PROMOTE_MARKED_LUA)),
             requeue_script: Arc::new(Script::new(REQUEUE_LUA)),
+            hold_lease_script: Arc::new(Script::new(HOLD_LEASE_LUA)),
+            release_lease_script: Arc::new(Script::new(RELEASE_LEASE_LUA)),
             ensured: Arc::new(Mutex::new(HashSet::new())),
             last_promote_ms: Arc::new(AtomicI64::new(0)),
             last_recover_ms: Arc::new(AtomicI64::new(0)),
@@ -346,6 +350,10 @@ impl RedisDispatch {
 
     fn payloads_key(&self, queue_name: &str) -> String {
         dispatch_payloads_key(&self.config.key_prefix, queue_name)
+    }
+
+    fn reconcile_lease_key(&self, queue_name: &str) -> String {
+        dispatch_reconcile_lease_key(&self.config.key_prefix, queue_name)
     }
 
     fn marker_key(&self, task_id: Uuid) -> String {
@@ -765,20 +773,28 @@ impl RedisDispatch {
         Ok(())
     }
 
-    async fn ack_inner(&self, lease: &DispatchLease) -> RedisAdapterResult<()> {
-        let key = self.stream_key(&lease.queue_name);
-        let entry_id = handle_entry_id(&lease.handle);
+    /// Ack every lease in one atomic round trip (issue #1429).
+    ///
+    /// Each lease costs an `XACK`, an `XDEL` and a `DEL` of its marker. The
+    /// transaction keeps a lease from losing its entry and keeping its marker.
+    async fn ack_inner(&self, leases: &[DispatchLease]) -> RedisAdapterResult<()> {
+        if leases.is_empty() {
+            return Ok(());
+        }
+        let mut pipe = redis::pipe();
+        pipe.atomic();
+        for lease in leases {
+            let key = self.stream_key(&lease.queue_name);
+            let entry_id = handle_entry_id(&lease.handle);
+            pipe.xack(&key, &self.config.consumer_group, &[entry_id])
+                .ignore()
+                .xdel(&key, &[entry_id])
+                .ignore()
+                .del(self.marker_key(lease.task_id))
+                .ignore();
+        }
         let mut conn = self.conn.clone();
-        redis::pipe()
-            .atomic()
-            .xack(&key, &self.config.consumer_group, &[entry_id])
-            .ignore()
-            .xdel(&key, &[entry_id])
-            .ignore()
-            .del(self.marker_key(lease.task_id))
-            .ignore()
-            .query_async::<()>(&mut conn)
-            .await?;
+        pipe.query_async::<()>(&mut conn).await?;
         Ok(())
     }
 
@@ -802,69 +818,126 @@ impl RedisDispatch {
             .await
     }
 
+    /// Take or renew the sweep lease of each queue in one round trip.
+    async fn hold_leases_inner(
+        &self,
+        queues: &[String],
+        consumer: &str,
+        ttl: Duration,
+    ) -> RedisAdapterResult<Vec<bool>> {
+        if queues.is_empty() {
+            return Ok(Vec::new());
+        }
+        // A zero TTL is not a valid `PX`, so the lease lasts one millisecond
+        // at least.
+        let ttl_ms = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX).max(1);
+        let mut invocation = self.hold_lease_script.prepare_invoke();
+        for queue in queues {
+            invocation.key(self.reconcile_lease_key(queue));
+        }
+        invocation.arg(consumer).arg(ttl_ms);
+        let mut conn = self.conn.clone();
+        let held: Vec<i64> = invocation.invoke_async(&mut conn).await?;
+        Ok(held.into_iter().map(|flag| flag == 1).collect())
+    }
+
+    /// Delete each sweep lease that `consumer` still holds.
+    async fn release_leases_inner(
+        &self,
+        queues: &[String],
+        consumer: &str,
+    ) -> RedisAdapterResult<()> {
+        if queues.is_empty() {
+            return Ok(());
+        }
+        let mut invocation = self.release_lease_script.prepare_invoke();
+        for queue in queues {
+            invocation.key(self.reconcile_lease_key(queue));
+        }
+        invocation.arg(consumer);
+        let mut conn = self.conn.clone();
+        let _: i64 = invocation.invoke_async(&mut conn).await?;
+        Ok(())
+    }
+
     /// Re-add every entry that has been idle in the pending entries list
-    /// longer than the visibility timeout.
-    async fn recover_queue(&self, queue_name: &str) -> RedisAdapterResult<usize> {
-        self.ensure_group(queue_name, false).await?;
-        let key = self.stream_key(queue_name);
+    /// longer than the visibility timeout, for every queue.
+    ///
+    /// Each step is one round trip for all queues (issue #1429). One pipeline
+    /// reads every pending entries list. A second claims the idle entries of
+    /// every queue that has one. The discard and the requeue follow as batches.
+    async fn recover_queues(&self, queues: &[String]) -> RedisAdapterResult<usize> {
+        if queues.is_empty() {
+            return Ok(0);
+        }
+        self.ensure_groups(queues, false).await?;
+        let keys: Vec<String> = queues.iter().map(|queue| self.stream_key(queue)).collect();
         let mut conn = self.conn.clone();
 
-        let pending: StreamPendingCountReply = conn
-            .xpending_count(&key, &self.config.consumer_group, "-", "+", RECOVER_BATCH)
-            .await?;
-        if pending.ids.is_empty() {
-            return Ok(0);
+        let mut pending_pipe = redis::pipe();
+        for key in &keys {
+            pending_pipe.xpending_count(key, &self.config.consumer_group, "-", "+", RECOVER_BATCH);
         }
+        let pending: Vec<StreamPendingCountReply> = pending_pipe.query_async(&mut conn).await?;
+
         let visibility_ms = self.visibility_ms();
         let threshold = usize::try_from(visibility_ms).unwrap_or(usize::MAX);
-        let idle: Vec<String> = pending
-            .ids
-            .iter()
-            .filter(|entry| entry.last_delivered_ms >= threshold)
-            .map(|entry| entry.id.clone())
-            .collect();
-        if idle.is_empty() {
-            return Ok(0);
-        }
-
-        // XCLAIM moves the entries to a sentinel consumer so their payloads
-        // can be read. `XREADGROUP >` never returns a pending entry, so the
-        // only way to make the work deliverable again is to re-add it.
-        let claimed: StreamClaimReply = conn
-            .xclaim(
-                &key,
+        let mut claim_pipe = redis::pipe();
+        let mut claimed_queues = Vec::new();
+        for ((queue, key), reply) in queues.iter().zip(&keys).zip(&pending) {
+            let idle: Vec<&str> = reply
+                .ids
+                .iter()
+                .filter(|entry| entry.last_delivered_ms >= threshold)
+                .map(|entry| entry.id.as_str())
+                .collect();
+            if idle.is_empty() {
+                continue;
+            }
+            // XCLAIM moves the entries to a sentinel consumer so their payloads
+            // can be read. `XREADGROUP >` never returns a pending entry, so the
+            // only way to make the work deliverable again is to re-add it.
+            claim_pipe.xclaim(
+                key,
                 &self.config.consumer_group,
                 RECOVERY_CONSUMER,
                 visibility_ms,
                 &idle,
-            )
-            .await?;
+            );
+            claimed_queues.push((queue.as_str(), key.as_str()));
+        }
+        if claimed_queues.is_empty() {
+            return Ok(0);
+        }
+        let claimed: Vec<StreamClaimReply> = claim_pipe.query_async(&mut conn).await?;
 
         let mut recovered = Vec::new();
         let mut malformed = Vec::new();
-        for entry in claimed.ids {
-            let Some(payload) = entry_payload(&entry.map) else {
-                tracing::warn!(
-                    queue = %queue_name,
-                    entry_id = %entry.id,
-                    "discarding recovered entry with no payload field"
-                );
-                malformed.push((key.clone(), entry.id));
-                continue;
-            };
-            let Ok(mut reference) = serde_json::from_str::<DispatchRef>(&payload) else {
-                tracing::warn!(
-                    queue = %queue_name,
-                    entry_id = %entry.id,
-                    "discarding recovered entry with an unreadable payload"
-                );
-                malformed.push((key.clone(), entry.id));
-                continue;
-            };
-            reference.redeliveries = reference.redeliveries.saturating_add(1);
-            // `scheduled_at` keeps the row's due time (C1). The entry is due
-            // now, which the `due` argument below says.
-            recovered.push((entry.id, reference));
+        for ((queue_name, key), reply) in claimed_queues.into_iter().zip(claimed) {
+            for entry in reply.ids {
+                let Some(payload) = entry_payload(&entry.map) else {
+                    tracing::warn!(
+                        queue = %queue_name,
+                        entry_id = %entry.id,
+                        "discarding recovered entry with no payload field"
+                    );
+                    malformed.push((key.to_owned(), entry.id));
+                    continue;
+                };
+                let Ok(mut reference) = serde_json::from_str::<DispatchRef>(&payload) else {
+                    tracing::warn!(
+                        queue = %queue_name,
+                        entry_id = %entry.id,
+                        "discarding recovered entry with an unreadable payload"
+                    );
+                    malformed.push((key.to_owned(), entry.id));
+                    continue;
+                };
+                reference.redeliveries = reference.redeliveries.saturating_add(1);
+                // `scheduled_at` keeps the row's due time (C1). The entry is due
+                // now, which the `due` argument below says.
+                recovered.push((entry.id, reference));
+            }
         }
         // An entry the pass cannot read stays pending unless it is discarded
         // here. See [`RedisDispatch::discard_entries`].
@@ -872,14 +945,6 @@ impl RedisDispatch {
         let count = recovered.len();
         self.requeue_batch(&recovered, Utc::now()).await?;
         Ok(count)
-    }
-
-    async fn recover_queues(&self, queues: &[String]) -> RedisAdapterResult<usize> {
-        let mut total = 0;
-        for queue in queues {
-            total += self.recover_queue(queue).await?;
-        }
-        Ok(total)
     }
 }
 
@@ -906,8 +971,29 @@ impl TaskDispatch for RedisDispatch {
         harvest(self.next_inner(queues, consumer, max, wait).await)
     }
 
+    async fn hold_reconcile_leases(
+        &self,
+        queues: &[String],
+        consumer: &str,
+        ttl: Duration,
+    ) -> HarvestResult<Vec<bool>> {
+        harvest(self.hold_leases_inner(queues, consumer, ttl).await)
+    }
+
+    async fn release_reconcile_leases(
+        &self,
+        queues: &[String],
+        consumer: &str,
+    ) -> HarvestResult<()> {
+        harvest(self.release_leases_inner(queues, consumer).await)
+    }
+
     async fn ack(&self, lease: &DispatchLease) -> HarvestResult<()> {
-        harvest(self.ack_inner(lease).await)
+        harvest(self.ack_inner(std::slice::from_ref(lease)).await)
+    }
+
+    async fn ack_many(&self, leases: &[DispatchLease]) -> HarvestResult<()> {
+        harvest(self.ack_inner(leases).await)
     }
 
     async fn release(&self, lease: &DispatchLease, delay: Duration) -> HarvestResult<()> {
@@ -1164,6 +1250,44 @@ return written
 /// a reference the worker gave back. The marker then names the new location, so
 /// a republish can verify it. See [`PUBLISH_LUA`] for why that matters. Returns
 /// the number of entries handled.
+/// Take or renew one reconcile sweep lease per key (issue #1429).
+///
+/// KEYS are the lease keys. ARGV is the consumer, then the TTL in
+/// milliseconds. A free lease goes to the consumer. A lease the consumer
+/// already holds gets a new TTL. A lease a peer holds stays with the peer.
+/// The reply holds one flag per key: 1 when the consumer holds the lease.
+const HOLD_LEASE_LUA: &str = r"
+local held = {}
+for i, key in ipairs(KEYS) do
+    local owner = redis.call('GET', key)
+    if not owner then
+        redis.call('SET', key, ARGV[1], 'PX', ARGV[2])
+        held[i] = 1
+    elseif owner == ARGV[1] then
+        redis.call('PEXPIRE', key, ARGV[2])
+        held[i] = 1
+    else
+        held[i] = 0
+    end
+end
+return held
+";
+
+/// Delete each reconcile sweep lease that the consumer still holds.
+///
+/// KEYS are the lease keys. ARGV is the consumer. A lease a peer took over
+/// stays with the peer. The reply is the number of leases deleted.
+const RELEASE_LEASE_LUA: &str = r"
+local released = 0
+for _, key in ipairs(KEYS) do
+    if redis.call('GET', key) == ARGV[1] then
+        redis.call('DEL', key)
+        released = released + 1
+    end
+end
+return released
+";
+
 const REQUEUE_LUA: &str = r"
 local stream = KEYS[1]
 local delayed = KEYS[2]

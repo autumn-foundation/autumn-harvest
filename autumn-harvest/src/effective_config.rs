@@ -19,6 +19,9 @@
 //! [`WorkerConfigView::sharded_pool_configured`]). A connection URL (which can
 //! embed a password) can therefore never appear in a serialized response.
 //!
+//! The Redis dispatch section follows the same rule. The plugin stores the
+//! endpoint with its credentials removed (issue #1429).
+//!
 //! [`notification_database_url`]: crate::builder::WorkerConfig::notification_database_url
 //! [`shard_notification_database_urls`]: crate::builder::WorkerConfig::shard_notification_database_urls
 //! [`sharded_pool`]: crate::builder::WorkerConfig
@@ -84,6 +87,34 @@ pub struct EffectiveConfigView {
     pub features: FeatureFlagsView,
     /// Resolved database pool sizing.
     pub pool: PoolConfigView,
+    /// Redis dispatch channel settings (issue #1429). `null` when the runtime
+    /// did not report them.
+    pub redis: Option<RedisDispatchView>,
+}
+
+/// Redis dispatch channel settings, secret-free (issue #1429).
+///
+/// The keys match `[harvest.redis]`. The plugin fills this view, because core
+/// cannot read that section. The endpoint is the URL with its credentials
+/// removed, so a password never reaches the view.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RedisDispatchView {
+    /// True when this process installed the channel.
+    pub installed: bool,
+    /// Redis URL with its credentials removed. `null` when dispatch is off.
+    pub endpoint: Option<String>,
+    /// Effective key prefix, including any shard suffix.
+    pub key_prefix: String,
+    /// Redis Streams consumer group the workers join.
+    pub consumer_group: String,
+    /// Time a delivered reference may stay unacked before recovery, milliseconds.
+    pub visibility_timeout_ms: u64,
+    /// Wait for one blocking read when the channel is idle, milliseconds.
+    pub poll_interval_ms: u64,
+    /// Interval of the reconcile sweep, milliseconds.
+    pub reconcile_interval_ms: u64,
+    /// Row cap for one reconcile sweep per queue.
+    pub reconcile_batch: u32,
 }
 
 /// Secret-free projection of [`WorkerConfig`].
@@ -705,7 +736,15 @@ impl EffectiveConfigView {
             shard_topology: ShardTopologyView::from_router(router),
             features: compiled_feature_flags(),
             pool,
+            redis: None,
         }
+    }
+
+    /// Attach the Redis dispatch section (issue #1429).
+    #[must_use]
+    pub fn with_redis(mut self, redis: RedisDispatchView) -> Self {
+        self.redis = Some(redis);
+        self
     }
 }
 
@@ -1072,6 +1111,7 @@ mod tests {
             "shard_topology",
             "features",
             "pool",
+            "redis",
         ] {
             assert!(
                 json.as_object().unwrap().contains_key(key),
@@ -1080,6 +1120,80 @@ mod tests {
         }
         assert_eq!(json["pool"]["worker_pool_max_connections"], 10);
         assert_eq!(json["pool"]["shard_pool_count"], 1);
+    }
+
+    fn sample_view() -> EffectiveConfigView {
+        EffectiveConfigView::capture(
+            &WorkerConfig::default(),
+            sample_caps(),
+            &crate::shard::ShardRouter::single(),
+            PoolConfigView {
+                worker_pool_max_connections: 10,
+                shard_pool_count: 1,
+            },
+            Duration::from_millis(500),
+            None,
+        )
+    }
+
+    /// Core cannot read `[harvest.redis]`, so a bare capture reports the
+    /// section as an explicit `null`. The key stays present (issue #1429).
+    #[test]
+    fn redis_section_is_null_until_the_runtime_reports_it() {
+        let json = serde_json::to_value(sample_view()).expect("serialize");
+
+        assert!(json.as_object().unwrap().contains_key("redis"));
+        assert!(json["redis"].is_null());
+    }
+
+    /// The runtime reports the channel it installed, key for key with
+    /// `[harvest.redis]` (issue #1429).
+    #[test]
+    fn with_redis_reports_every_redis_dispatch_key() {
+        let view = sample_view().with_redis(RedisDispatchView {
+            installed: true,
+            endpoint: Some("redis://cache:6379".to_owned()),
+            key_prefix: "harvest:s2".to_owned(),
+            consumer_group: "harvest_workers".to_owned(),
+            visibility_timeout_ms: 60_000,
+            poll_interval_ms: 20,
+            reconcile_interval_ms: 1_000,
+            reconcile_batch: 500,
+        });
+
+        let json = serde_json::to_value(&view).expect("serialize");
+        let redis = &json["redis"];
+
+        assert_eq!(redis["installed"], true);
+        assert_eq!(redis["endpoint"], "redis://cache:6379");
+        assert_eq!(redis["key_prefix"], "harvest:s2");
+        assert_eq!(redis["consumer_group"], "harvest_workers");
+        assert_eq!(redis["visibility_timeout_ms"], 60_000);
+        assert_eq!(redis["poll_interval_ms"], 20);
+        assert_eq!(redis["reconcile_interval_ms"], 1_000);
+        assert_eq!(redis["reconcile_batch"], 500);
+    }
+
+    /// With the channel off the endpoint is an explicit `null`, not an
+    /// absent key (issue #1429).
+    #[test]
+    fn an_off_channel_reports_a_null_endpoint() {
+        let view = sample_view().with_redis(RedisDispatchView {
+            installed: false,
+            endpoint: None,
+            key_prefix: "harvest".to_owned(),
+            consumer_group: "harvest_workers".to_owned(),
+            visibility_timeout_ms: 60_000,
+            poll_interval_ms: 20,
+            reconcile_interval_ms: 1_000,
+            reconcile_batch: 1_000,
+        });
+
+        let json = serde_json::to_value(&view).expect("serialize");
+
+        assert_eq!(json["redis"]["installed"], false);
+        assert!(json["redis"].as_object().unwrap().contains_key("endpoint"));
+        assert!(json["redis"]["endpoint"].is_null());
     }
 
     #[test]

@@ -15325,6 +15325,8 @@ impl ActivityContext {
             + Send,
         T: serde::Serialize + Send,
     {
+        use crate::dispatch::BufferedSettledExt as _;
+
         // Two-level error type so the user's original Err(String) propagates
         // unchanged.  Wrapping it in HarvestError::Config would stringify as
         // "invalid configuration: …" which breaks non_retryable_errors matching
@@ -15457,6 +15459,7 @@ impl ActivityContext {
 
             Ok(user_result)
         }))
+        .buffered_settled()
         .await;
 
         match result {

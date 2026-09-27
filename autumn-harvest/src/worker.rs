@@ -25987,6 +25987,12 @@ const DISPATCH_PARKED_ROW_RELEASES: u32 = 3;
 /// path a returned error takes.
 const DISPATCH_CALL_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Reconcile intervals a sweep lease lasts without a renewal (issue #1429).
+///
+/// The holder renews its lease at every sweep. A holder that stops leaves its
+/// queues unswept for at most this many intervals, then a peer takes over.
+const RECONCILE_LEASE_INTERVALS: u32 = 3;
+
 /// Run one channel call under [`DISPATCH_CALL_TIMEOUT`].
 async fn dispatch_call<T>(
     call: impl std::future::Future<Output = HarvestResult<T>>,
@@ -26094,6 +26100,43 @@ impl DispatchDegradation {
     fn is_degraded(&self) -> bool {
         self.started
             .is_some_and(|(at, cooldown)| at.elapsed() < cooldown)
+    }
+}
+
+/// The channel call whose failure sent a worker to the Postgres claim path.
+///
+/// The value labels the fallback counter (issue #1429), so the set is closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DispatchFallback {
+    /// The maintenance pass failed.
+    Maintain,
+    /// The reference read failed.
+    Read,
+    /// The reference read did not answer in time.
+    ReadTimeout,
+    /// The reconcile publish failed.
+    Publish,
+}
+
+impl DispatchFallback {
+    /// The `reason` label value.
+    const fn reason(self) -> &'static str {
+        match self {
+            Self::Maintain => "maintain",
+            Self::Read => "read",
+            Self::ReadTimeout => "read_timeout",
+            Self::Publish => "publish",
+        }
+    }
+
+    /// The log message for this fallback.
+    const fn message(self) -> &'static str {
+        match self {
+            Self::Maintain => "dispatch maintenance failed",
+            Self::Read => "dispatch read failed",
+            Self::ReadTimeout => "dispatch read timed out",
+            Self::Publish => "dispatch reconcile publish failed",
+        }
     }
 }
 
@@ -26371,6 +26414,9 @@ impl Worker {
                     ))
                 })?;
             }
+
+            // The publisher counts dropped hints on this recorder (issue #1429).
+            crate::dispatch::set_metrics_recorder(Arc::clone(&registry.telemetry().metrics));
         }
 
         let mut ineligible_activities = Vec::new();
@@ -28205,15 +28251,25 @@ impl Worker {
         // A maintenance success does not clear the degraded window. Only a
         // successful reference read does. See
         // [`DispatchDegradation::record_read_success`].
-        if DispatchLoopState::due(&mut state.maintained, settings.poll_interval)
-            && let Err(error) = dispatch_call(
+        if DispatchLoopState::due(&mut state.maintained, settings.poll_interval) {
+            match dispatch_call(
                 installed.channel.maintain(&self.config.queues),
                 "maintenance",
             )
             .await
-        {
-            self.enter_degraded(state, &error, "dispatch maintenance failed", settings);
-            return self.drain_postgres(pool, shard).await;
+            {
+                Ok(maintenance) => {
+                    if maintenance.recovered > 0 {
+                        self.registry.telemetry().metrics.record_dispatch_recovered(
+                            u64::try_from(maintenance.recovered).unwrap_or(u64::MAX),
+                        );
+                    }
+                }
+                Err(error) => {
+                    self.enter_degraded(state, &error, DispatchFallback::Maintain, settings);
+                    return self.drain_postgres(pool, shard).await;
+                }
+            }
         }
 
         if DispatchLoopState::due(&mut state.reconciled, settings.reconcile_interval)
@@ -28261,7 +28317,7 @@ impl Worker {
                 leases
             }
             Ok(Err(error)) => {
-                self.enter_degraded(state, &error, "dispatch read failed", settings);
+                self.enter_degraded(state, &error, DispatchFallback::Read, settings);
                 return self.drain_postgres(pool, shard).await;
             }
             Err(_) => {
@@ -28269,12 +28325,16 @@ impl Worker {
                     "dispatch read did not answer within {:?}",
                     settings.poll_interval + DISPATCH_CALL_TIMEOUT
                 ));
-                self.enter_degraded(state, &error, "dispatch read timed out", settings);
+                self.enter_degraded(state, &error, DispatchFallback::ReadTimeout, settings);
                 return self.drain_postgres(pool, shard).await;
             }
         };
 
-        let mut dispatched = false;
+        // The read is disposed of in three steps (issue #1429). Each lease is
+        // claimed first. The leases to drop then go in one `ack_many`. Only
+        // then do the claimed tasks start, so no task runs before its ack.
+        let mut acks = Vec::new();
+        let mut claimed = Vec::new();
         for lease in leases {
             if self.shutdown.is_cancelled() {
                 // Give the reference straight back so a peer serves it now.
@@ -28304,9 +28364,31 @@ impl Worker {
                 }
                 None => None,
             };
-            dispatched |= self
-                .consume_reference(pool, shard, installed, state, lease, reservation)
-                .await;
+            if let Some(task) = self
+                .consume_reference(pool, shard, installed, state, lease, &mut acks)
+                .await
+            {
+                claimed.push((task, reservation));
+            }
+        }
+
+        if !acks.is_empty()
+            && let Err(error) = dispatch_call(installed.channel.ack_many(&acks), "ack").await
+        {
+            // Each claim is durable either way. An unacked reference costs one
+            // redelivery, which finds its row not claimable and acks it.
+            self.log_dispatch_error(state, &error, "dispatch ack failed");
+        }
+
+        let dispatched = !claimed.is_empty();
+        for (task, reservation) in claimed {
+            tracing::debug!(
+                task_id = %task.id,
+                task_type = %task.task_type,
+                queue = %task.queue_name,
+                "claimed task (dispatch)"
+            );
+            self.dispatch_task(task, pool, reservation);
         }
         dispatched
     }
@@ -28352,13 +28434,21 @@ impl Worker {
     }
 
     /// Log a channel error and open the degraded-mode cooldown it earns.
+    ///
+    /// Every call counts one fallback (issue #1429). The log line is
+    /// throttled, and the counter is not.
     fn enter_degraded(
         &self,
         state: &mut DispatchLoopState,
         error: &HarvestError,
-        message: &'static str,
+        fallback: DispatchFallback,
         settings: &crate::dispatch::DispatchSettings,
     ) {
+        self.registry
+            .telemetry()
+            .metrics
+            .record_dispatch_fallback(fallback.reason());
+        let message = fallback.message();
         let cooldown = state.degraded.record_failure(settings.poll_interval);
         if state.may_log_error() {
             tracing::warn!(
@@ -28370,14 +28460,11 @@ impl Worker {
         }
     }
 
-    /// Claim the row one reference names, then ack or release the reference.
+    /// Claim the row one reference names, then queue its ack or release it.
     ///
-    /// Returns `true` when the row was claimed and dispatched.
-    ///
-    /// One reference is disposed of per call. [`crate::dispatch::TaskDispatch`]
-    /// takes one lease per `ack` and per `release`, so a batched disposal for
-    /// the whole read would need a trait change. That is a follow-up, not a
-    /// change this path can make on its own.
+    /// Returns the claimed task. The caller starts it after the whole read is
+    /// acked. A lease to drop goes onto `acks`, so the read costs one
+    /// `ack_many` round trip (issue #1429). A release still goes out at once.
     async fn consume_reference(
         &self,
         pool: &DbPool,
@@ -28385,8 +28472,8 @@ impl Worker {
         installed: &crate::dispatch::InstalledDispatch,
         state: &mut DispatchLoopState,
         lease: crate::dispatch::DispatchLease,
-        reservation: Option<DispatchReservation>,
-    ) -> bool {
+        acks: &mut Vec<crate::dispatch::DispatchLease>,
+    ) -> Option<TaskQueueItem> {
         let mut conn = match acquire_shard_conn(
             pool,
             shard_acquire_bound(false, self.config.poll_interval),
@@ -28399,7 +28486,7 @@ impl Worker {
                 // The pool is unavailable, not the row, so give the reference
                 // straight back and let the next iteration try again.
                 self.retry_reference(installed, &lease).await;
-                return false;
+                return None;
             }
         };
 
@@ -28430,19 +28517,8 @@ impl Worker {
                 // call the database has no part in (issue #1312 review).
                 drop(conn);
                 chaos_point!(DISPATCH_AFTER_CLAIM_BEFORE_ACK);
-                if let Err(error) = dispatch_call(installed.channel.ack(&lease), "ack").await {
-                    // The claim is durable either way. A failed ack costs one
-                    // redelivery, which finds the row `RUNNING` and acks.
-                    self.log_dispatch_error(state, &error, "dispatch ack failed after a claim");
-                }
-                tracing::debug!(
-                    task_id = %task.id,
-                    task_type = %task.task_type,
-                    queue = %task.queue_name,
-                    "claimed task (dispatch)"
-                );
-                self.dispatch_task(task, pool, reservation);
-                true
+                acks.push(lease);
+                Some(task)
             }
             Ok(None) => {
                 let probe = match queue::dispatch_probe(&mut conn, lease.task_id).await {
@@ -28451,7 +28527,7 @@ impl Worker {
                         tracing::warn!(error = %error, task_id = %lease.task_id, "dispatch probe failed");
                         drop(conn);
                         self.retry_reference(installed, &lease).await;
-                        return false;
+                        return None;
                     }
                 };
                 let outcome = reference_outcome(
@@ -28463,24 +28539,27 @@ impl Worker {
                 // Same reason as the claimed arm: the disposal is a channel
                 // round trip, so the connection goes back first.
                 drop(conn);
-                let result = match outcome {
-                    ReferenceOutcome::Ack => {
-                        dispatch_call(installed.channel.ack(&lease), "ack").await
-                    }
+                match outcome {
+                    ReferenceOutcome::Ack => acks.push(lease),
                     ReferenceOutcome::Release(delay) => {
-                        dispatch_call(installed.channel.release(&lease, delay), "release").await
+                        if let Err(error) =
+                            dispatch_call(installed.channel.release(&lease, delay), "release").await
+                        {
+                            self.log_dispatch_error(
+                                state,
+                                &error,
+                                "dispatch reference disposal failed",
+                            );
+                        }
                     }
-                };
-                if let Err(error) = result {
-                    self.log_dispatch_error(state, &error, "dispatch reference disposal failed");
                 }
-                false
+                None
             }
             Err(error) => {
                 tracing::error!(error = %error, task_id = %lease.task_id, "failed to claim a dispatched task");
                 drop(conn);
                 self.retry_reference(installed, &lease).await;
-                false
+                None
             }
         }
     }
@@ -28497,6 +28576,10 @@ impl Worker {
     /// page would hide every claimable row below it for as long as the gate
     /// holds. See [`crate::queue::due_dispatch_hints_after_query`].
     ///
+    /// Each worker reads only the queues whose sweep lease it holds
+    /// (issue #1429). Every worker still emits the throttle metrics below.
+    /// A failed sweep gives its leases up, so a peer sweeps next.
+    ///
     /// Returns `false` when a channel call failed, so the caller can enter
     /// degraded mode. A database failure returns `true`: the database is not
     /// the channel, and the Postgres claim path cannot help with it.
@@ -28506,6 +28589,7 @@ impl Worker {
         installed: &crate::dispatch::InstalledDispatch,
         state: &mut DispatchLoopState,
     ) -> bool {
+        let leased = self.reconcile_lease_queues(installed, state).await;
         let mut conn = match acquire_shard_conn(
             pool,
             shard_acquire_bound(false, self.config.poll_interval),
@@ -28515,6 +28599,7 @@ impl Worker {
             Ok(conn) => conn,
             Err(error) => {
                 tracing::warn!(error = %error, "failed to get connection for the dispatch reconcile sweep");
+                self.release_reconcile_leases(installed, &leased).await;
                 return true;
             }
         };
@@ -28524,7 +28609,7 @@ impl Worker {
         // The cursors are applied after every queue is read, so a read failure
         // part way through leaves the walk where it was.
         let mut walked: Vec<(String, Option<crate::queue::DispatchCursor>)> = Vec::new();
-        for queue in &self.config.queues {
+        for queue in &leased {
             let after = state.reconcile_cursors.get(queue).cloned();
             let page = match queue::due_dispatch_hints_page(&mut conn, queue, batch, after.as_ref())
                 .await
@@ -28532,6 +28617,8 @@ impl Worker {
                 Ok(page) => page,
                 Err(error) => {
                     tracing::warn!(error = %error, queue = %queue, "dispatch reconcile read failed");
+                    drop(conn);
+                    self.release_reconcile_leases(installed, &leased).await;
                     return true;
                 }
             };
@@ -28541,6 +28628,11 @@ impl Worker {
             ));
             hints.extend(page.hints);
         }
+        // A queue a peer sweeps drops its cursor. If the lease comes back, the
+        // walk starts again at the top.
+        state
+            .reconcile_cursors
+            .retain(|queue, _| leased.contains(queue));
         for (queue, cursor) in walked {
             match cursor {
                 Some(cursor) => state.reconcile_cursors.insert(queue, cursor),
@@ -28568,15 +28660,79 @@ impl Worker {
             self.enter_degraded(
                 state,
                 &error,
-                "dispatch reconcile publish failed",
+                DispatchFallback::Publish,
                 &installed.settings,
             );
+            self.release_reconcile_leases(installed, &leased).await;
             return false;
         }
         // A publish success does not clear the degraded window either. The
         // read path owns that window, and the publish runs on the general
         // connection.
         true
+    }
+
+    /// The queues this worker sweeps now (issue #1429).
+    ///
+    /// One worker holds each queue's sweep lease, so a fleet reads each queue
+    /// once per interval, not once per worker. The sweep is the durability
+    /// floor, so the lease fails open: a lease call that fails sweeps every
+    /// queue.
+    async fn reconcile_lease_queues(
+        &self,
+        installed: &crate::dispatch::InstalledDispatch,
+        state: &mut DispatchLoopState,
+    ) -> Vec<String> {
+        let queues = &self.config.queues;
+        let ttl = installed
+            .settings
+            .reconcile_interval
+            .saturating_mul(RECONCILE_LEASE_INTERVALS);
+        let held = dispatch_call(
+            installed
+                .channel
+                .hold_reconcile_leases(queues, &self.config.worker_id, ttl),
+            "reconcile lease",
+        )
+        .await;
+        match held {
+            Ok(held) if held.len() == queues.len() => queues
+                .iter()
+                .zip(held)
+                .filter_map(|(queue, held)| held.then(|| queue.clone()))
+                .collect(),
+            Ok(_) => {
+                let error = HarvestError::Dispatch(
+                    "the reconcile lease reply does not match the queue count".to_string(),
+                );
+                self.log_dispatch_error(state, &error, "dispatch reconcile lease failed");
+                queues.clone()
+            }
+            Err(error) => {
+                self.log_dispatch_error(state, &error, "dispatch reconcile lease failed");
+                queues.clone()
+            }
+        }
+    }
+
+    /// Give up the sweep leases after a failed sweep, so a peer sweeps next.
+    ///
+    /// A failed release is harmless. The lease expires on its own.
+    async fn release_reconcile_leases(
+        &self,
+        installed: &crate::dispatch::InstalledDispatch,
+        leased: &[String],
+    ) {
+        if leased.is_empty() {
+            return;
+        }
+        let _ = dispatch_call(
+            installed
+                .channel
+                .release_reconcile_leases(leased, &self.config.worker_id),
+            "reconcile lease release",
+        )
+        .await;
     }
 
     /// Give a reference back after a local failure, so the next iteration

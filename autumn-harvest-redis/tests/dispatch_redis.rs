@@ -471,6 +471,167 @@ async fn ack_deletes_the_marker_so_a_republish_is_delivered() {
     assert_eq!(again[0].task_id, task_id);
 }
 
+/// One `ack_many` call disposes of a read that spans several queues
+/// (issue #1429). Every entry, pending entry and marker goes.
+#[tokio::test(flavor = "multi_thread")]
+async fn ack_many_clears_every_entry_pending_entry_and_marker() {
+    let Some(fixture) = try_start(Duration::from_secs(60)).await else {
+        return;
+    };
+    let queues = vec!["batch_a".to_string(), "batch_b".to_string()];
+    let ids = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+
+    fixture
+        .dispatch
+        .publish(&[
+            hint("batch_a", ids[0], Utc::now()),
+            hint("batch_a", ids[1], Utc::now()),
+            hint("batch_b", ids[2], Utc::now()),
+        ])
+        .await
+        .expect("publish");
+    let leases = read(&fixture, &queues, 10).await;
+    assert_eq!(leases.len(), 3, "one read returns every reference");
+
+    fixture.dispatch.ack_many(&leases).await.expect("ack_many");
+
+    for task_id in ids {
+        assert!(
+            !fixture.marker_exists(task_id).await,
+            "ack_many must delete the marker of {task_id}"
+        );
+    }
+    for queue in ["batch_a", "batch_b"] {
+        assert_eq!(fixture.stream_len(queue).await, 0, "{queue} keeps an entry");
+        assert_eq!(
+            fixture.pending_count(queue).await,
+            0,
+            "{queue} keeps a pending entry"
+        );
+    }
+}
+
+/// An empty batch is a no-op, not an error.
+#[tokio::test(flavor = "multi_thread")]
+async fn ack_many_of_nothing_is_a_no_op() {
+    let Some(fixture) = try_start(Duration::from_secs(60)).await else {
+        return;
+    };
+
+    fixture.dispatch.ack_many(&[]).await.expect("ack_many");
+}
+
+/// One maintenance pass recovers idle entries from every queue it names
+/// (issue #1429).
+#[tokio::test(flavor = "multi_thread")]
+async fn maintain_recovers_idle_entries_across_queues() {
+    let Some(fixture) = try_start(Duration::from_millis(300)).await else {
+        return;
+    };
+    let queues = vec![
+        "crash_a".to_string(),
+        "crash_b".to_string(),
+        "crash_c".to_string(),
+        "quiet".to_string(),
+    ];
+    let ids = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+
+    fixture
+        .dispatch
+        .publish(&[
+            hint("crash_a", ids[0], Utc::now()),
+            hint("crash_b", ids[1], Utc::now()),
+            hint("crash_c", ids[2], Utc::now()),
+        ])
+        .await
+        .expect("publish");
+    let leases = read(&fixture, &queues, 10).await;
+    assert_eq!(leases.len(), 3);
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let counts = fixture.dispatch.maintain(&queues).await.expect("maintain");
+    assert_eq!(counts.recovered, 3, "every idle entry must be recovered");
+    for queue in ["crash_a", "crash_b", "crash_c"] {
+        assert_eq!(
+            fixture.pending_count(queue).await,
+            0,
+            "{queue} stays pending"
+        );
+    }
+
+    let again = read(&fixture, &queues, 10).await;
+    let mut redelivered: Vec<Uuid> = again.iter().map(|lease| lease.task_id).collect();
+    redelivered.sort();
+    let mut expected = ids.to_vec();
+    expected.sort();
+    assert_eq!(
+        redelivered, expected,
+        "every recovered entry is delivered again"
+    );
+    assert!(again.iter().all(|lease| lease.redeliveries == 1));
+}
+
+/// A malformed entry in one queue does not stop recovery in another.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_malformed_entry_does_not_block_recovery_in_another_queue() {
+    let Some(fixture) = try_start(Duration::from_millis(300)).await else {
+        return;
+    };
+    let queues = vec!["bad_q".to_string(), "good_q".to_string()];
+    let (bad_id, good_id) = (Uuid::new_v4(), Uuid::new_v4());
+
+    // Real publishes create both consumer groups.
+    fixture
+        .dispatch
+        .publish(&[
+            hint("bad_q", bad_id, Utc::now()),
+            hint("good_q", good_id, Utc::now()),
+        ])
+        .await
+        .expect("publish");
+    let leases = read(&fixture, &queues, 10).await;
+    assert_eq!(leases.len(), 2);
+    let bad_lease: Vec<DispatchLease> = leases
+        .iter()
+        .filter(|lease| lease.task_id == bad_id)
+        .cloned()
+        .collect();
+    fixture.dispatch.ack_many(&bad_lease).await.expect("ack");
+
+    // A peer reads an unreadable entry and dies holding it.
+    let key = fixture.stream_key("bad_q");
+    let mut conn = fixture.raw.clone();
+    let _: String = redis::cmd("XADD")
+        .arg(&key)
+        .arg("*")
+        .arg("payload")
+        .arg("{ this is not json")
+        .query_async(&mut conn)
+        .await
+        .expect("xadd an entry with an unreadable payload");
+    let _: redis::streams::StreamReadReply = redis::cmd("XREADGROUP")
+        .arg("GROUP")
+        .arg("harvest_workers")
+        .arg("peer")
+        .arg("COUNT")
+        .arg(10)
+        .arg("STREAMS")
+        .arg(&key)
+        .arg(">")
+        .query_async(&mut conn)
+        .await
+        .expect("peer read");
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let counts = fixture.dispatch.maintain(&queues).await.expect("maintain");
+    assert_eq!(counts.recovered, 1, "the good entry must be recovered");
+    assert_eq!(fixture.pending_count("bad_q").await, 0);
+    assert_eq!(fixture.pending_count("good_q").await, 0);
+    let again = read(&fixture, &queues, 10).await;
+    assert_eq!(again.len(), 1);
+    assert_eq!(again[0].task_id, good_id);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn maintain_recovers_an_unacked_lease_after_the_visibility_timeout() {
     let Some(fixture) = try_start(Duration::from_millis(300)).await else {
@@ -902,4 +1063,100 @@ async fn a_republish_restores_a_parked_reference_that_vanished() {
         "a republish must restore a parked reference the marker can no longer account for"
     );
     assert_eq!(leases[0].task_id, task_id);
+}
+
+/// One consumer holds each queue's reconcile lease. The holder renews it, a
+/// peer waits for it, and a release hands it over (issue #1429).
+#[tokio::test(flavor = "multi_thread")]
+async fn one_consumer_holds_each_reconcile_lease() {
+    let Some(fixture) = try_start(Duration::from_secs(60)).await else {
+        return;
+    };
+    let ttl = Duration::from_secs(30);
+    let both = vec!["lease_a".to_string(), "lease_b".to_string()];
+
+    let first = fixture
+        .dispatch
+        .hold_reconcile_leases(&both, "w1", ttl)
+        .await
+        .expect("hold");
+    assert_eq!(
+        first,
+        vec![true, true],
+        "free leases go to the first caller"
+    );
+
+    let peer = fixture
+        .dispatch
+        .hold_reconcile_leases(&both, "w2", ttl)
+        .await
+        .expect("hold");
+    assert_eq!(
+        peer,
+        vec![false, false],
+        "a held lease stays with its holder"
+    );
+
+    let renewed = fixture
+        .dispatch
+        .hold_reconcile_leases(&both, "w1", ttl)
+        .await
+        .expect("renew");
+    assert_eq!(renewed, vec![true, true], "the holder renews its leases");
+
+    fixture
+        .dispatch
+        .release_reconcile_leases(&both[..1], "w2")
+        .await
+        .expect("release by a non-holder");
+    let still = fixture
+        .dispatch
+        .hold_reconcile_leases(&both, "w2", ttl)
+        .await
+        .expect("hold");
+    assert_eq!(
+        still,
+        vec![false, false],
+        "a non-holder cannot release a lease"
+    );
+
+    fixture
+        .dispatch
+        .release_reconcile_leases(&both[..1], "w1")
+        .await
+        .expect("release");
+    let handed = fixture
+        .dispatch
+        .hold_reconcile_leases(&both, "w2", ttl)
+        .await
+        .expect("hold");
+    assert_eq!(
+        handed,
+        vec![true, false],
+        "a released lease goes to the peer"
+    );
+}
+
+/// A lease the holder stops renewing expires, and a peer takes it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unrenewed_reconcile_lease_expires() {
+    let Some(fixture) = try_start(Duration::from_secs(60)).await else {
+        return;
+    };
+    let queue = vec!["lease_expiry".to_string()];
+
+    let first = fixture
+        .dispatch
+        .hold_reconcile_leases(&queue, "w1", Duration::from_millis(150))
+        .await
+        .expect("hold");
+    assert_eq!(first, vec![true]);
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let peer = fixture
+        .dispatch
+        .hold_reconcile_leases(&queue, "w2", Duration::from_secs(30))
+        .await
+        .expect("hold");
+    assert_eq!(peer, vec![true], "an expired lease goes to the next caller");
 }

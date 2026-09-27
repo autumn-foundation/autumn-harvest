@@ -61,6 +61,13 @@ const REDIS_POLL_INTERVAL_CEILING_MS: u64 = 5_000;
 /// duplicate claim attempt on every reference.
 const REDIS_VISIBILITY_TIMEOUT_FLOOR_MS: u64 = 1_000;
 
+/// Highest accepted `harvest.redis.reconcile_batch` (issue #1429).
+///
+/// A sweep reads up to one batch per queue in one query and holds a pool
+/// connection while it reads. The ceiling keeps one sweep from reading a
+/// whole deep backlog at once.
+const REDIS_RECONCILE_BATCH_CEILING: u32 = 100_000;
+
 /// Redis dispatch channel settings (issue #1312).
 ///
 /// The channel carries references to claimable `harvest_task_queue` rows.
@@ -80,6 +87,8 @@ pub struct HarvestRedisConfig {
     pub poll_interval_ms: u64,
     /// Interval for the reconcile sweep over due `PENDING` rows.
     pub reconcile_interval_ms: u64,
+    /// Row cap for one reconcile sweep per queue (issue #1429).
+    pub reconcile_batch: u32,
 }
 
 /// What to do when workflow-type reachability finds an orphaned type at
@@ -224,6 +233,9 @@ impl HarvestRuntimeConfig {
         if let Some(reconcile_interval_ms) = partial.redis.reconcile_interval_ms {
             self.redis.reconcile_interval_ms = reconcile_interval_ms;
         }
+        if let Some(reconcile_batch) = partial.redis.reconcile_batch {
+            self.redis.reconcile_batch = reconcile_batch;
+        }
     }
 
     fn apply_env_overrides(&mut self, env: &dyn Env) -> Result<(), ConfigError> {
@@ -327,6 +339,10 @@ impl HarvestRuntimeConfig {
                 &reconcile_interval_ms,
             )?;
         }
+        if let Ok(reconcile_batch) = env.var("AUTUMN_HARVEST_REDIS__RECONCILE_BATCH") {
+            self.redis.reconcile_batch =
+                parse_u32("AUTUMN_HARVEST_REDIS__RECONCILE_BATCH", &reconcile_batch)?;
+        }
 
         Ok(())
     }
@@ -402,7 +418,8 @@ impl HarvestRuntimeConfig {
     /// [`REDIS_POLL_INTERVAL_CEILING_MS`] holds one blocking read open for
     /// longer than the shutdown check tolerates. A visibility timeout below
     /// [`REDIS_VISIBILITY_TIMEOUT_FLOOR_MS`] lets a peer recover a reference
-    /// the owning worker is still claiming.
+    /// the owning worker is still claiming. A zero reconcile batch reads no
+    /// rows, so the sweep cursor never moves.
     fn validate_redis(&self) -> Result<(), ConfigError> {
         if self.redis.key_prefix.is_empty() {
             return Err(ConfigError::Validation(
@@ -434,6 +451,16 @@ impl HarvestRuntimeConfig {
             return Err(ConfigError::Validation(
                 "harvest.redis.reconcile_interval_ms must be at least 1".to_owned(),
             ));
+        }
+        if self.redis.reconcile_batch < 1 {
+            return Err(ConfigError::Validation(
+                "harvest.redis.reconcile_batch must be at least 1".to_owned(),
+            ));
+        }
+        if self.redis.reconcile_batch > REDIS_RECONCILE_BATCH_CEILING {
+            return Err(ConfigError::Validation(format!(
+                "harvest.redis.reconcile_batch must be at most {REDIS_RECONCILE_BATCH_CEILING}"
+            )));
         }
 
         if self.redis.url.is_some() && !cfg!(feature = "redis") {
@@ -557,6 +584,7 @@ impl Default for HarvestRedisConfig {
             visibility_timeout_ms: 60_000,
             poll_interval_ms: 20,
             reconcile_interval_ms: 1_000,
+            reconcile_batch: 1_000,
         }
     }
 }
@@ -652,6 +680,7 @@ struct PartialHarvestRedisConfig {
     visibility_timeout_ms: Option<u64>,
     poll_interval_ms: Option<u64>,
     reconcile_interval_ms: Option<u64>,
+    reconcile_batch: Option<u32>,
 }
 
 fn find_config_file_named(filename: &str, env: &dyn Env) -> PathBuf {
@@ -1112,6 +1141,7 @@ orphaned_workflows = "explode"
         assert_eq!(config.redis.visibility_timeout_ms, 60_000);
         assert_eq!(config.redis.poll_interval_ms, 20);
         assert_eq!(config.redis.reconcile_interval_ms, 1_000);
+        assert_eq!(config.redis.reconcile_batch, 1_000);
     }
 
     #[test]
@@ -1126,6 +1156,7 @@ consumer_group = "acme_workers"
 visibility_timeout_ms = 30000
 poll_interval_ms = 5
 reconcile_interval_ms = 250
+reconcile_batch = 500
 "#,
         );
         let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref());
@@ -1138,6 +1169,7 @@ reconcile_interval_ms = 250
         assert_eq!(config.redis.visibility_timeout_ms, 30_000);
         assert_eq!(config.redis.poll_interval_ms, 5);
         assert_eq!(config.redis.reconcile_interval_ms, 250);
+        assert_eq!(config.redis.reconcile_batch, 500);
     }
 
     #[test]
@@ -1156,7 +1188,8 @@ key_prefix = "from_toml"
             .with("AUTUMN_HARVEST_REDIS__CONSUMER_GROUP", "env_workers")
             .with("AUTUMN_HARVEST_REDIS__VISIBILITY_TIMEOUT_MS", "15000")
             .with("AUTUMN_HARVEST_REDIS__POLL_INTERVAL_MS", "40")
-            .with("AUTUMN_HARVEST_REDIS__RECONCILE_INTERVAL_MS", "2000");
+            .with("AUTUMN_HARVEST_REDIS__RECONCILE_INTERVAL_MS", "2000")
+            .with("AUTUMN_HARVEST_REDIS__RECONCILE_BATCH", "250");
 
         let config = HarvestRuntimeConfig::load_with_env(&env).expect("harvest config should load");
 
@@ -1165,6 +1198,7 @@ key_prefix = "from_toml"
         assert_eq!(config.redis.visibility_timeout_ms, 15_000);
         assert_eq!(config.redis.poll_interval_ms, 40);
         assert_eq!(config.redis.reconcile_interval_ms, 2_000);
+        assert_eq!(config.redis.reconcile_batch, 250);
     }
 
     #[test]
@@ -1401,6 +1435,52 @@ key_prefix = "from_toml"
                 .to_string()
                 .contains("harvest.redis.visibility_timeout_ms"),
             "expected a redis visibility_timeout_ms validation error, got {error}"
+        );
+    }
+
+    /// A zero batch reads no rows, so the sweep never republishes a row and
+    /// its cursor never moves (issue #1429).
+    #[test]
+    fn harvest_config_redis_rejects_a_zero_reconcile_batch() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST_REDIS__RECONCILE_BATCH", "0");
+
+        let error = HarvestRuntimeConfig::load_with_env(&env)
+            .expect_err("a zero reconcile batch must fail validation");
+
+        assert!(
+            error.to_string().contains("harvest.redis.reconcile_batch"),
+            "expected a redis reconcile_batch validation error, got {error}"
+        );
+    }
+
+    /// Every worker reads up to one batch per queue per interval. The ceiling
+    /// keeps one sweep from reading a whole backlog in one query (issue #1429).
+    #[test]
+    fn harvest_config_redis_rejects_a_reconcile_batch_above_the_ceiling() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST_REDIS__RECONCILE_BATCH", "100001");
+
+        let error = HarvestRuntimeConfig::load_with_env(&env)
+            .expect_err("a reconcile batch above the ceiling must fail validation");
+
+        assert!(
+            error.to_string().contains("harvest.redis.reconcile_batch"),
+            "expected a redis reconcile_batch validation error, got {error}"
+        );
+    }
+
+    /// A non-numeric override names its variable in the error.
+    #[test]
+    fn harvest_config_redis_rejects_a_non_numeric_reconcile_batch() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST_REDIS__RECONCILE_BATCH", "many");
+
+        let error = HarvestRuntimeConfig::load_with_env(&env)
+            .expect_err("a non-numeric reconcile batch must fail to parse");
+
+        assert!(
+            error
+                .to_string()
+                .contains("AUTUMN_HARVEST_REDIS__RECONCILE_BATCH"),
+            "expected the env var name in the error, got {error}"
         );
     }
 

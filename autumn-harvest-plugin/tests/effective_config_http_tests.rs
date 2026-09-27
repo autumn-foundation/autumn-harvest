@@ -19,7 +19,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use autumn_harvest::builder::WorkerConfig;
-use autumn_harvest::effective_config::{EffectiveConfigView, PayloadCapsView, PoolConfigView};
+use autumn_harvest::effective_config::{
+    EffectiveConfigView, PayloadCapsView, PoolConfigView, RedisDispatchView,
+};
 use autumn_harvest::retention::RetentionConfig;
 use autumn_harvest::scheduler::{DagCatalog, SchedulerMonitor};
 use autumn_harvest::shard::ShardRouter;
@@ -97,6 +99,16 @@ fn sample_view() -> EffectiveConfigView {
         Duration::from_millis(500),
         None,
     )
+    .with_redis(RedisDispatchView {
+        installed: true,
+        endpoint: Some("redis://cache:6379".to_string()),
+        key_prefix: "harvest".to_string(),
+        consumer_group: "harvest_workers".to_string(),
+        visibility_timeout_ms: 60_000,
+        poll_interval_ms: 20,
+        reconcile_interval_ms: 1_000,
+        reconcile_batch: 1_000,
+    })
 }
 
 /// Install a minimal, DB-free runtime carrying `view` — mirroring the standalone
@@ -206,6 +218,7 @@ async fn effective_config_fails_closed_when_runtime_has_no_captured_config() {
             "shard_topology",
             "features",
             "pool",
+            "redis",
         ] {
             assert!(
                 !obj.contains_key(key),
@@ -244,12 +257,16 @@ async fn effective_config_happy_path_returns_secret_free_view() {
         "shard_topology",
         "features",
         "pool",
+        "redis",
     ] {
         assert!(
             json.as_object().unwrap().contains_key(key),
             "missing top-level key: {key}"
         );
     }
+    assert_eq!(json["redis"]["installed"], true);
+    assert_eq!(json["redis"]["endpoint"], "redis://cache:6379");
+    assert_eq!(json["redis"]["reconcile_batch"], 1_000);
     assert!(
         json["worker"]["notification_channel_configured"]
             .as_bool()
