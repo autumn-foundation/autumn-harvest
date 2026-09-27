@@ -56,7 +56,8 @@ block counts. A return inside a nested `if`, `match` or closure may not run. A
 parse that turns its error into a value is optional too, such as `.ok()`,
 `.unwrap_or_default()` or an `if let Ok(..)` whose `else` does not reject. A
 `match` on the parse is optional when no top-level `Err` arm rejects. A
-guard or a tolerant call at a helper call site carries into the helper. Check 2
+fallback that rejects the error, such as `.map_or_else(|e| reject(e), ..)`,
+keeps the parse mandatory. A guard or a tolerant call at a helper call site carries into the helper. Check 2
 applies to every parse that does not tolerate its error, since a body that is
 present must then carry the mandatory fields. A bare `Json<T>` and a rejecting
 `Result<Json<T>, _>` are such parses.
@@ -787,9 +788,34 @@ def walk_chain(after: str) -> tuple[str, str | None, str]:
             "map_or",
             "map_or_else",
         ):
+            arguments = balanced(rest[call.end() - 1 :])
+            if state == "result" and fallback_rejects(method, arguments):
+                return "reject", inspection, rest
             state = "value"
         opener = call.end() - 1
         rest = rest[opener + len(balanced(rest[opener:])) :]
+
+
+def fallback_rejects(method: str, arguments: str) -> bool:
+    """Whether the fallback of `unwrap_or*` or `map_or*` on a `Result` rejects.
+
+    The fallback is the first argument. It rejects when it builds an error or
+    panics. A closure also rejects when it returns or converts its error, or
+    passes that error to a call. A function path given to `unwrap_or_else` or
+    `map_or_else` receives the error, so it rejects too.
+    """
+    items = split_top_level(arguments[1:-1])
+    fallback = items[0] if items else ""
+    if re.search(ERROR_TOKENS + r"|\b(?:panic|unreachable|todo)!", fallback):
+        return True
+    closure = re.match(r"(?:move\s+)?\|\s*([a-z_][a-z_0-9]*)?[^|]*\|(.*)", fallback, re.S)
+    if closure is None:
+        return method.endswith("_else") and re.fullmatch(r"[A-Za-z_][\w:]*", fallback) is not None
+    bound, body = closure.group(1), closure.group(2)
+    if bound is None or bound == "_":
+        return False
+    passed = r"\b[A-Za-z_][\w:]*\s*\(\s*&?\s*%s\b" % re.escape(bound)
+    return rejecting_arm(body, bound) or re.search(passed, body) is not None
 
 
 def inspection_rejects(before: str, inspection: str, rest: str) -> bool:
@@ -1677,6 +1703,10 @@ pub fn harvest_api_router() -> Router {
         .route("/e/raw-match-reject", post(e_raw_match_reject))
         .route("/e/query-result-ok", get(e_query_result_ok))
         .route("/e/query-result-reject", get(e_query_result_reject))
+        .route("/e/map-or-else-reject", post(e_map_or_else_reject))
+        .route("/e/json-map-or-else", post(e_json_map_or_else))
+        .route("/e/fn-ref-fallback", post(e_fn_ref_fallback))
+        .route("/e/closure-default", post(e_closure_default))
 }
 
 async fn e_wrapped(body: Bytes) -> Response {
@@ -2277,6 +2307,24 @@ async fn e_query_result_reject(
 ) -> Result<Response, Response> {
     let Query(query) = query.map_err(|_| reject())?;
     Ok(StatusCode::OK.into_response())
+}
+
+async fn e_map_or_else_reject(body: Bytes) -> Response {
+    serde_json::from_slice::<Gadget>(&body).map_or_else(|error| reject(error), |gadget| accept(gadget))
+}
+
+async fn e_json_map_or_else(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    body.map_or_else(|rejection| rejection.into_response(), |Json(gadget)| accept(gadget))
+}
+
+async fn e_fn_ref_fallback(body: Bytes) -> Response {
+    let gadget = serde_json::from_slice::<Gadget>(&body).unwrap_or_else(rejected_gadget);
+    StatusCode::OK.into_response()
+}
+
+async fn e_closure_default(body: Bytes) -> Response {
+    let gadget = serde_json::from_slice::<Gadget>(&body).unwrap_or_else(|_| Gadget::default());
+    StatusCode::OK.into_response()
 }
 
 async fn e_documented(Query(query): Query<Documented>) -> Response {
@@ -3471,6 +3519,34 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             for path in ("/e/query-result-ok", "/e/query-result-reject")
         ],
         {"query_params": ["GET /e/query-result-reject: `kind` is mandatory in Documented"]},
+    ),
+    (
+        "a fallback that rejects the parse error is mandatory",
+        FIXTURE_EDGES,
+        [
+            fixture_route("POST", path, 200, request_body=body_of(("name", True), required=False))
+            for path in ("/e/map-or-else-reject", "/e/json-map-or-else", "/e/fn-ref-fallback")
+        ],
+        {
+            "body_required": [
+                "POST /e/map-or-else-reject: the body is mandatory",
+                "POST /e/json-map-or-else: the body is mandatory",
+                "POST /e/fn-ref-fallback: the body is mandatory",
+            ]
+        },
+    ),
+    (
+        "a closure fallback that builds a value is tolerant",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/closure-default",
+                200,
+                request_body=body_of(("name", False), required=False),
+            )
+        ],
+        {},
     ),
     (
         "a malformed contract entry does not crash the audit",
