@@ -113,9 +113,12 @@ has a serde default, on the field or on the struct. By default, serde ignores an
 unknown query key, so a documented key that no struct has is a finding.
 
 The audit reads the serde attributes `default`, `skip`, `skip_deserializing`,
-`rename = ".."` and `alias = ".."`. A field is documented when the contract
-names its wire name or any alias. `rename_all`, `flatten` and `rename(..)` are
-check 7 findings, since the audit cannot read the wire names they make.
+`skip_serializing`, `skip_serializing_if`, `rename = ".."` and `alias = ".."`.
+A field is documented when the contract names its wire name or any alias. Any
+other serde attribute, on the struct or on a field, is a check 7 finding,
+since the audit cannot read the wire layout it makes. A field
+`deserialize_with` is read only when `KNOWN_DESERIALIZERS` models it. A new
+custom deserializer must be added to that table, or its field is a finding.
 
 Check 7 stops the audit from skipping what it cannot read. These are findings:
 a `from_slice` call it cannot read, a body type it cannot resolve, a
@@ -413,11 +416,64 @@ def unreadable_serde(struct: str) -> list[str]:
                 continue
             if key.group(1) not in LAYOUT_KEEPING or key.group(1) == "rename" and key.group(2) != "=":
                 found.add(key.group(1) if key.group(2) != "(" else key.group(1) + "(..)")
-    for attribute in re.findall(r"#\[serde\(([^\]]*)\)\]", text[max(opener, 0) :]):
-        found |= set(re.findall(r"\b(rename_all|flatten)\b", attribute))
-        if re.search(r"\brename\s*\(", attribute):
-            found.add("rename(..)")
+    attributes: list[str] = []
+    for line in text[max(opener, 0) + 1 :].split("\n"):
+        line = line.strip()
+        attributes += re.findall(r"#\[serde\(([^\]]*)\)\]", line)
+        field = re.match(r"(?:pub(?:\([^)]*\))?\s+)?(?:r#)?[a-z_0-9]+\s*:\s*(.+?),?$", line)
+        if field and not line.startswith("#"):
+            found |= unreadable_field_serde(attributes, field.group(1))
+            attributes = []
     return sorted(found)
+
+
+# Serde field attributes that keep a field's wire type. `skip` and
+# `skip_deserializing` take the field off the wire, and `struct_fields` reads
+# that.
+FIELD_KEEPING = frozenset(
+    {"rename", "alias", "default", "skip_serializing_if", "skip_serializing", "skip", "skip_deserializing"}
+)
+
+# Field deserializers the audit models, with the declared type each accepts.
+# `deserialize_tristate` reads a `T` or `null` into `Some(..)`, and an absent
+# field falls back to `None` through `default`. So the wire type is the inner
+# `T`, as for an `Option<T>`. A new custom deserializer must be added here, or
+# its field is a check 7 finding.
+KNOWN_DESERIALIZERS = {
+    "deserialize_tristate": r"Option<\s*Option<.+>\s*>",
+}
+
+
+def unreadable_field_serde(attributes: list[str], declared_type: str) -> set[str]:
+    """The serde attributes of one field that the audit cannot read.
+
+    A key passes when `FIELD_KEEPING` names it, and `rename` only in its
+    `rename = ".."` form. `deserialize_with` passes only for a deserializer in
+    `KNOWN_DESERIALIZERS`, when the field has the type that entry accepts and
+    the audited file defines the function with an `Option<Option<T>>` result.
+    """
+    found: set[str] = set()
+    for attribute in attributes:
+        for item in split_expression(attribute, ","):
+            key = re.match(r"\s*([a-z_]+)\s*(\(|=)?\s*(?:\"([^\"]*)\")?", item)
+            if key is None:
+                continue
+            name, form, value = key.group(1), key.group(2), key.group(3)
+            if name == "deserialize_with" and modeled_deserializer(value, declared_type):
+                continue
+            if name in FIELD_KEEPING and not (name == "rename" and form != "="):
+                continue
+            found.add(name + "(..)" if form == "(" else name)
+    return found
+
+
+def modeled_deserializer(function: str | None, declared_type: str) -> bool:
+    """Whether `KNOWN_DESERIALIZERS` models `function` for a field of this type."""
+    shape = KNOWN_DESERIALIZERS.get(function or "")
+    if shape is None or not re.fullmatch(shape, declared_type.strip()):
+        return False
+    defined = r"\bfn\s+%s\s*<[^(]*>\s*\([^)]*\)\s*->\s*Result<\s*Option<\s*Option<" % re.escape(function)
+    return re.search(defined, SOURCE[0]) is not None
 
 
 def key_arms(body: str) -> list[tuple[str, ...]]:
@@ -684,7 +740,10 @@ def carrier_parses(
     found = block_parses(block, carriers, returns)
     parses = [(kind, o or optional, t or tolerant) for kind, o, t in found]
     for helper, parts, name, guarded, discarded in handoffs(source, block, carriers):
+        # A helper the audit cannot find or read gets the body all the same, so
+        # it is an unresolved parse, as for a `Result` extractor handoff.
         if parts is None or name is None:
+            parses.append((None, optional or guarded, tolerant or discarded))
             continue
         params, helper_returns, helper_block = parts
         if name not in byte_parameters(params) or (helper, name) in path:
@@ -1875,6 +1934,43 @@ ALIAS_TARGETS = {
 # A type that an extractor alias can hide.
 EXTRACTOR_LIKE = r"\b(?:Query|Json|Bytes)\b"
 
+# The import paths the audit trusts for each aliased kind. An alias of a
+# same-named item from any other path, such as `crate::signed::Query`, is not
+# rewritten, so it is no extractor.
+SUPPORTED_PATHS = {
+    "axum::extract::Query": "Query",
+    "axum::Json": "Json",
+    "axum::extract::Json": "Json",
+    "bytes::Bytes": "Bytes",
+    "axum::body::Bytes": "Bytes",
+    "serde_json::from_slice": "from_slice",
+}
+
+
+def use_leaves(statement: str) -> list[tuple[str, str | None]]:
+    """`(path, alias)` for each leaf of a `use` tree.
+
+    A group such as `serde_json::{self as json, Value}` or
+    `axum::{extract::{Query as Q}}` is read at any depth. A `self` leaf names
+    its group's path. The prefix `autumn_web::reexports::` is cut, since that
+    crate re-exports axum unchanged.
+    """
+    tree = re.sub(r"^\s*(?:pub(?:\([^)]*\))?\s+)?use\s+", "", statement).rstrip(";").strip()
+
+    def expand(prefix: str, text: str) -> list[tuple[str, str | None]]:
+        text = text.strip()
+        group = re.fullmatch(r"((?:::)?(?:[\w]+\s*::\s*)*)\{(.*)\}", text, re.S)
+        if group:
+            base = prefix + re.sub(r"\s", "", group.group(1))
+            return [leaf for item in split_expression(group.group(2), ",") for leaf in expand(base, item)]
+        named = re.fullmatch(r"(.*?)\s+as\s+([A-Za-z_]\w*)", text, re.S)
+        path, alias = (named.group(1), named.group(2)) if named else (text, None)
+        path = re.sub(r"\s", "", prefix + path)
+        path = re.sub(r"::self$", "", path).lstrip(":")
+        return [(re.sub(r"^autumn_web::reexports::", "", path), alias)]
+
+    return expand("", tree)
+
 
 def alias_scope(code: str, position: int) -> tuple[int, int]:
     """Where a declaration at `position` holds: the file at depth 0, else its block."""
@@ -1896,16 +1992,18 @@ def alias_declarations(code: str) -> list[tuple[tuple[int, int], tuple[int, int]
     """
     found = []
     for use in re.finditer(r"\buse\b[^;]*;", code):
-        scope, span, statement = alias_scope(code, use.start()), use.span(), use.group(0)
-        for kind, alias in re.findall(r"\b(Query|Json|Bytes|from_slice)\s+as\s+([A-Za-z_]\w*)", statement):
-            if kind == "from_slice" and "serde_json" not in statement:
-                continue
-            call = r"(?=\s*(?:::<|\())" if kind == "from_slice" else ""
-            found.append((scope, span, r"(?<![\w:.])%s\b%s" % (alias, call), ALIAS_TARGETS[kind]))
-        for alias in re.findall(r"\bserde_json\s+as\s+([a-z_]\w*)", statement):
-            found.append((scope, span, r"(?<![\w:.])%s(?=\s*::)" % alias, "serde_json"))
-        if re.search(r"\bserde_json::(?:from_slice\s*;|\{[^}]*\bfrom_slice\b(?!\s+as\b)|\*\s*;)", statement):
-            found.append((scope, span, r"(?<![\w:.])from_slice(?=\s*(?:::<|\())", ALIAS_TARGETS["from_slice"]))
+        scope, span = alias_scope(code, use.start()), use.span()
+        for path, alias in use_leaves(use.group(0)):
+            kind = SUPPORTED_PATHS.get(path)
+            call = r"(?=\s*(?:::<|\())"
+            if kind and alias:
+                pattern = r"(?<![\w:.])%s\b%s" % (alias, call if kind == "from_slice" else "")
+                found.append((scope, span, pattern, ALIAS_TARGETS[kind]))
+            elif path == "serde_json" and alias:
+                found.append((scope, span, r"(?<![\w:.])%s(?=\s*::)" % alias, "serde_json"))
+            elif path in ("serde_json::from_slice", "serde_json::*") and not alias:
+                pattern = r"(?<![\w:.])from_slice%s" % call
+                found.append((scope, span, pattern, ALIAS_TARGETS["from_slice"]))
     for declared in re.finditer(r"\btype\s+([A-Z]\w*)\s*(<[^=;]*?>)?\s*=\s*([^;]+);", code):
         name, parameters, target = declared.group(1), declared.group(2) or "", declared.group(3).strip()
         scope, span = alias_scope(code, declared.start()), declared.span()
@@ -1967,12 +2065,31 @@ def resolve_aliases_once(source: str) -> str:
 
 
 def unreadable_aliases(code: str) -> list[tuple[int, int, str]]:
-    """`(scope start, scope end, name)` for each type alias the audit cannot read."""
-    return [
+    """`(scope start, scope end, name)` for each type alias the audit cannot read.
+
+    An alias whose target names an unreadable alias is unreadable too, as in
+    `type Inner<T> = Query<Vec<T>>; type Outer<T> = Inner<T>;`. The set grows
+    until nothing changes.
+    """
+    found = [
         (scope[0], scope[1], pattern)
         for scope, _, pattern, replacement in alias_declarations(code)
         if replacement is None
     ]
+    declared = [
+        (alias_scope(code, hit.start()), hit.group(1), hit.group(2))
+        for hit in re.finditer(r"\btype\s+([A-Za-z_]\w*)[^=;]*=\s*([^;]+);", code)
+    ]
+    while True:
+        names = {name for _, _, name in found}
+        grown = [
+            (scope[0], scope[1], name)
+            for scope, name, target in declared
+            if name not in names and any(re.search(r"\b%s\b" % re.escape(n), target) for n in names)
+        ]
+        if not grown:
+            return found
+        found += grown
 
 
 def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
@@ -2558,6 +2675,11 @@ use bytes::Bytes as RequestBytes;
 type ApiQuery<T> = Query<T>;
 use axum::extract::Query as ChainQ;
 type ChainQuery<T> = ChainQ<T>;
+use serde_json::{self as sj, Value};
+use axum::{extract::{Query as NestedQ, Path}};
+use crate::signed::Query as SignedQ;
+type InnerOdd<T> = Query<Vec<T>>;
+type OuterOdd<T> = InnerOdd<T>;
 type OddQuery<T> = Result<Query<T>, QueryRejection>;
 
 pub fn harvest_api_router() -> Router {
@@ -2693,6 +2815,15 @@ pub fn harvest_api_router() -> Router {
         .route("/e/nested-or-guard", post(e_nested_or_guard))
         .route("/e/alias-chain-query", get(e_alias_chain_query))
         .route("/e/observed-fallback", post(e_observed_fallback))
+        .route("/e/grouped-module-alias", post(e_grouped_module_alias))
+        .route("/e/nested-group-query", get(e_nested_group_query))
+        .route("/e/foreign-query-alias", get(e_foreign_query_alias))
+        .route("/e/unreadable-alias-chain", get(e_unreadable_alias_chain))
+        .route("/e/raw-unknown-helper", post(e_raw_unknown_helper))
+        .route("/e/tristate-field", post(e_tristate_field))
+        .route("/e/tristate-plain-option", post(e_tristate_plain_option))
+        .route("/e/unknown-deserializer", post(e_unknown_deserializer))
+        .route("/e/with-field", post(e_with_field))
         .route("/e/json-handoff-unknown", post(e_json_handoff_unknown))
         .route("/e/json-handoff-tolerant", post(e_json_handoff_tolerant))
         .route("/e/raw-nested-argument", post(e_raw_nested_argument))
@@ -3661,6 +3792,10 @@ async fn e_alias_out_of_scope(body: Bytes) -> Response {
     StatusCode::OK.into_response()
 }
 
+fn parse_scoped(raw: &[u8]) -> usize {
+    raw.len()
+}
+
 async fn e_matches_macro(body: Result<Json<Gadget>, JsonRejection>) -> Response {
     if matches!(body, Err(_)) {
         return StatusCode::BAD_REQUEST.into_response();
@@ -3738,6 +3873,71 @@ async fn e_observed_fallback(body: Result<Json<Gadget>, JsonRejection>) -> Respo
         Json(Gadget::default())
     });
     StatusCode::OK.into_response()
+}
+
+async fn e_grouped_module_alias(body: Bytes) -> Response {
+    let gadget = sj::from_slice::<Gadget>(&body).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_nested_group_query(query: NestedQ<Cursor>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn e_foreign_query_alias(query: SignedQ<Cursor>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn e_unreadable_alias_chain(query: OuterOdd<Cursor>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn e_raw_unknown_helper(body: Bytes) -> Response {
+    imported_decode(&body)
+}
+
+async fn e_tristate_field(Json(body): Json<Tristate>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn e_tristate_plain_option(Json(body): Json<TristatePlain>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn e_unknown_deserializer(Json(body): Json<CustomDeserializer>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn e_with_field(Json(body): Json<WithField>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+fn deserialize_tristate<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: serde::Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Option::<T>::deserialize(deserializer)?))
+}
+
+struct Tristate {
+    #[serde(default, deserialize_with = "deserialize_tristate")]
+    note: Option<Option<String>>,
+}
+
+struct TristatePlain {
+    #[serde(default, deserialize_with = "deserialize_tristate")]
+    note: Option<String>,
+}
+
+struct CustomDeserializer {
+    #[serde(deserialize_with = "parse_loosely")]
+    note: String,
+}
+
+struct WithField {
+    #[serde(with = "custom_format")]
+    note: String,
 }
 
 async fn e_helper_in_comment() -> Response {
@@ -3996,6 +4196,10 @@ async fn e_local_from_slice(body: Bytes) -> Response {
     StatusCode::OK.into_response()
 }
 
+fn from_slice<T>(raw: &[u8]) -> Option<T> {
+    None
+}
+
 async fn e_closure_return_reject(body: Result<Json<Gadget>, JsonRejection>) -> Response {
     body.map_or_else(|_| { return invalid_body(); }, |Json(gadget)| accept(gadget))
 }
@@ -4187,7 +4391,7 @@ struct Shapes {
     pub(in crate::api) page: Option<u32>,
     #[serde(skip_deserializing)]
     cache: Option<String>,
-    #[serde(deserialize_with = "default_kind")]
+    #[serde(alias = "default_kind")]
     kind: String,
 }
 """
@@ -5822,6 +6026,72 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             )
         ],
         {},
+    ),
+    (
+        "a grouped use tree with self as, or a nested group, is read",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/grouped-module-alias",
+                200,
+                request_body=body_of(("name", True), required=False),
+            ),
+            fixture_route("GET", "/e/nested-group-query", 200, params=[]),
+        ],
+        {
+            "body_required": ["POST /e/grouped-module-alias: the body is mandatory"],
+            "query_params": ["GET /e/nested-group-query: `offset` is accepted by Cursor"],
+        },
+    ),
+    (
+        "an alias of a Query from another crate is no extractor",
+        FIXTURE_EDGES,
+        [fixture_route("GET", "/e/foreign-query-alias", 200, params=[])],
+        {},
+    ),
+    (
+        "an alias of an unreadable alias is unreadable",
+        FIXTURE_EDGES,
+        [fixture_route("GET", "/e/unreadable-alias-chain", 200, params=[])],
+        {"unresolved": ["GET /e/unreadable-alias-chain: cannot read the `OuterOdd` type alias"]},
+    ),
+    (
+        "a raw body handed to a helper the audit cannot find fails closed",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/raw-unknown-helper",
+                200,
+                request_body=body_of(("name", False), required=False),
+            )
+        ],
+        {
+            "body_required": ["POST /e/raw-unknown-helper: the body is mandatory"],
+            "unresolved": ["POST /e/raw-unknown-helper: cannot read a `from_slice` call"],
+        },
+    ),
+    (
+        "a modeled tristate field reads clean, other field deserializers do not",
+        FIXTURE_EDGES,
+        [
+            fixture_route("POST", "/e/tristate-field", 200, request_body=body_of(("note", False))),
+            fixture_route(
+                "POST", "/e/tristate-plain-option", 200, request_body=body_of(("note", False))
+            ),
+            fixture_route(
+                "POST", "/e/unknown-deserializer", 200, request_body=body_of(("note", True))
+            ),
+            fixture_route("POST", "/e/with-field", 200, request_body=body_of(("note", True))),
+        ],
+        {
+            "unresolved": [
+                "POST /e/tristate-plain-option: cannot read `deserialize_with` in TristatePlain",
+                "POST /e/unknown-deserializer: cannot read `deserialize_with` in CustomDeserializer",
+                "POST /e/with-field: cannot read `with` in WithField",
+            ]
+        },
     ),
     (
         "a helper named in a comment or a string is not called",
