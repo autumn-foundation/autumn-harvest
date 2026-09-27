@@ -817,7 +817,9 @@ def rejects_result_body(params: str, block: str) -> bool:
     value. It is also mandatory when an `if` on `.is_err()` or `.is_ok()`
     sends the error to a rejection, or when any `Err` or catch-all arm of a
     `match` on it rejects, or when an `if let Err(..) = body` block rejects, or when the `else` of a `let Ok(..) = body else` or an
-    `if let Ok(..) = body` rejects, as `rejecting_exit` reads it. An `Err` arm that
+    `if let Ok(..) = body` rejects, as `rejecting_exit` reads it. It is mandatory
+    too when the handler returns it, or a chain on it that keeps the error, as
+    its value. An `Err` arm that
     hands the request on, for example to replay a committed key, leaves it
     optional.
     """
@@ -847,6 +849,10 @@ def error_rejects(name: str, block: str, seen: frozenset[str] = frozenset()) -> 
     read = borrow + variable + method
     for use in re.finditer(r"(?<![.\w])%s\b" % variable, block):
         verdict, inspection, rest = walk_chain(block[use.end() :])
+        # A chain that still holds the error and is the value of the block
+        # hands that error to the caller, so it rejects like `?` does.
+        if verdict == "open" and yields_block_value(block[: use.start()], rest):
+            verdict = "reject"
         if verdict == "reject" and not error_exits_before(block, variable, read, use.start()):
             return True
         if inspection and inspection_rejects(block[: use.start()], inspection, rest):
@@ -893,6 +899,18 @@ def scope_rest(text: str) -> str:
         if depth < 0:
             return text[:index]
     return text
+
+
+def yields_block_value(before: str, rest: str) -> bool:
+    """Whether an expression is the value of its function block.
+
+    The expression is the tail of the block, or the operand of `return`.
+    `before` is the text before the expression, and `rest` the text after it.
+    A tail inside a nested block, such as an `if` arm, is not read.
+    """
+    tail = rest.strip() == "}"
+    returned = re.search(r"\breturn\s*$", before) is not None and re.match(r"\s*[;}]", rest)
+    return tail or bool(returned)
 
 
 def error_exits_before(block: str, variable: str, read: str, position: int) -> bool:
@@ -2104,6 +2122,8 @@ pub fn harvest_api_router() -> Router {
         .route("/e/json-tail-helper", post(e_json_tail_helper))
         .route("/e/json-tail-value", post(e_json_tail_value))
         .route("/e/json-alias", post(e_json_alias))
+        .route("/e/json-tail-result", post(e_json_tail_result))
+        .route("/e/json-return-map", post(e_json_return_map))
         .route("/e/is-err-tail-helper", post(e_is_err_tail_helper))
         .route("/e/helper-default", post(e_helper_default))
         .route("/e/unknown-helper", post(e_unknown_helper))
@@ -2911,6 +2931,14 @@ async fn e_json_alias(body: Result<Json<Gadget>, JsonRejection>) -> Result<Respo
     let captured = body;
     let Json(gadget) = captured?;
     Ok(StatusCode::OK.into_response())
+}
+
+async fn e_json_tail_result(body: Result<Json<Gadget>, JsonRejection>) -> Result<Json<Gadget>, JsonRejection> {
+    body
+}
+
+async fn e_json_return_map(body: Result<Json<Gadget>, JsonRejection>) -> Result<Response, JsonRejection> {
+    return body.map(|Json(gadget)| StatusCode::OK.into_response());
 }
 
 async fn e_is_err_tail_helper(body: Result<Json<Gadget>, JsonRejection>) -> Response {
@@ -4660,6 +4688,20 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             "body_required": [
                 "POST /e/json-tail-helper: the body is mandatory",
                 "POST /e/json-alias: the body is mandatory",
+            ]
+        },
+    ),
+    (
+        "a Result extractor returned as the handler value rejects",
+        FIXTURE_EDGES,
+        [
+            fixture_route("POST", path, 200, request_body=body_of(("name", True), required=False))
+            for path in ("/e/json-tail-result", "/e/json-return-map")
+        ],
+        {
+            "body_required": [
+                "POST /e/json-tail-result: the body is mandatory",
+                "POST /e/json-return-map: the body is mandatory",
             ]
         },
     ),
