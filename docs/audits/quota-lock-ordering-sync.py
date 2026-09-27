@@ -61,7 +61,13 @@ call and a loop appearing in the right textual order. Codex review on PR
 result was discarded (`wrapper_call(conn, due_rows.clone()).await?;`,
 unused) while the loop kept iterating the untouched original, and when
 the wrapper was merely named inside a comment. Tying the loop's variable
-to the assignment's, over comment/string-masked text, closes both.
+to the assignment's, over comment/string-masked text, closes both. A
+further round found that tying the NAME alone was still not enough:
+shadowing the binding again, or reordering the result back in place with
+a mutating call like `.sort_by(...)`, both pass a check that only
+confirms the same identifier reaches a later loop. `check_call_site_guard`
+also rejects any rebinding or `_MUTATING_VEC_METHODS` call on the
+variable between the assignment and the loop.
 
 Function extraction matches braces through `find_matching_brace`, not a
 raw character count. Codex review on PR #1696 found the raw count could
@@ -75,7 +81,12 @@ A follow-up review round then found the raw-string handling itself
 routed a zero-hash `r"..."` (an ordinary, common raw string) through the
 escape-aware normal-string scan, so a literal like `r"\"` skipped past
 its own closing quote. `_skip_raw_string_literal` never treats `\` as an
-escape, regardless of hash count.
+escape, regardless of hash count. A further round found char literals
+(`'{'`, `'}'`, including a Unicode escape whose own source text contains
+braces, like a char literal spelling `{` as `'\\u{{7B}}'`) were not
+skipped either; `_try_skip_char_literal`
+closes that, while still leaving a lifetime like `'a` as an ordinary
+character since it never closes with a matching quote.
 
 Usage:
     python3 docs/audits/quota-lock-ordering-sync.py
@@ -195,6 +206,41 @@ def _skip_raw_string_literal(text: str, i: int, hashes: int) -> int:
     return n if j == -1 else j + len(closer)
 
 
+def _try_skip_char_literal(text: str, i: int) -> int | None:
+    """`text[i]` is `'`. If it opens a genuine char (or byte-char, `b'x'` —
+    the leading `b` needs no special handling, since it is scanned as a
+    plain character before this ever sees the quote) literal, return the
+    index just past its closing `'`. Otherwise (a lifetime like `'a` or
+    `'static`, which never closes with a matching quote) return `None` so
+    the caller treats `'` as an ordinary character.
+
+    A char literal is exactly one character, or one escape sequence,
+    between two `'`s: a simple escape (`\\n`, `\\t`, `\\\\`, `\\'`, `\\"`,
+    `\\0`), a byte escape (`\\xNN`), or a Unicode escape (`\\u{...}`, itself
+    containing `{`/`}` that must not be counted as block braces either).
+    """
+    n = len(text)
+    j = i + 1
+    if j >= n:
+        return None
+    if text[j] == "\\":
+        k = j + 1
+        if k >= n:
+            return None
+        if text[k] == "u" and k + 1 < n and text[k + 1] == "{":
+            close = text.find("}", k + 2)
+            if close == -1:
+                return None
+            k = close + 1
+        elif text[k] == "x":
+            k += 3
+        else:
+            k += 1
+        return k + 1 if k < n and text[k] == "'" else None
+    k = j + 1
+    return k + 1 if k < n and text[k] == "'" else None
+
+
 def find_matching_brace(text: str, open_index: int) -> int:
     """Return the index just past the `}` matching the `{` at `open_index`.
 
@@ -226,6 +272,13 @@ def find_matching_brace(text: str, open_index: int) -> int:
         if c == '"':
             i = _skip_string_literal(text, i + 1)
             continue
+        if c == "'":
+            char_end = _try_skip_char_literal(text, i)
+            if char_end is not None:
+                i = char_end
+                continue
+            # A lifetime (`'a`, `'static`), not a char literal: fall through
+            # and advance past just the `'` like any ordinary character.
         if c == "{":
             depth += 1
         elif c == "}":
@@ -305,6 +358,22 @@ def extract_function(text: str, name: str) -> str | None:
     return text[start:end]
 
 
+# Vec (and slice) methods that reorder or otherwise mutate a batch in
+# place. An intervening call to one of these on the ordering wrapper's
+# result, between its assignment and the firing loop, could undo the
+# ordering the wrapper just established — the same hazard as skipping the
+# wrapper entirely, just one step removed. Read-only calls (`.len()`,
+# `.is_empty()`, `.iter()`, ...) are deliberately not in this list.
+_MUTATING_VEC_METHODS = (
+    "sort", "sort_by", "sort_by_key", "sort_unstable", "sort_unstable_by",
+    "sort_unstable_by_key", "reverse", "shuffle", "swap", "retain",
+    "retain_mut", "truncate", "extend", "extend_from_slice", "push", "pop",
+    "clear", "append", "drain", "insert", "remove", "swap_remove",
+    "rotate_left", "rotate_right", "dedup", "dedup_by", "dedup_by_key",
+    "fill", "resize",
+)
+
+
 def check_call_site_guard(text: str, file_label: str, enclosing_fn: str, wrapper_call: str) -> str | None:
     """Return a failure message, or `None` if the guard holds.
 
@@ -312,12 +381,20 @@ def check_call_site_guard(text: str, file_label: str, enclosing_fn: str, wrapper
     (so a mention of `wrapper_call` in a comment cannot count), then
     requires a `let <var> = wrapper_call(...)[.await][?];`-shaped
     assignment followed later by a `for _ in <var>` loop over that SAME
-    variable. Matching the wrapper call and a loop independently, without
-    tying them to one variable, is not enough: Codex review on PR #1696
-    found that calling the wrapper on a discarded clone (`wrapper_call(conn,
+    variable, with nothing in between that rebinds or mutates `var`.
+    Matching the wrapper call and a loop independently, without tying them
+    to one variable, is not enough: Codex review on PR #1696 found that
+    calling the wrapper on a discarded clone (`wrapper_call(conn,
     due_rows.clone()).await?;`, result unused) still left a textual call
-    before a textual loop over the untouched original `due_rows`, which is
-    exactly the claim-order-firing bug this guard exists to catch.
+    before a textual loop over the untouched original `due_rows`. A
+    follow-up round found that tying the name alone still was not enough
+    either: shadowing the binding again (`let due_rows = wrapper(...)
+    .await?; let due_rows = original_claim_order; for row in due_rows`)
+    or reordering the result back in place
+    (`due_rows.sort_by(claim_order); for row in due_rows`) both pass a
+    check that only confirms the SAME name reaches a later loop, while
+    reintroducing the exact claim-order-firing bug this guard exists to
+    catch.
     """
     body = extract_function(text, enclosing_fn)
     if body is None:
@@ -345,6 +422,28 @@ def check_call_site_guard(text: str, file_label: str, enclosing_fn: str, wrapper
         return (
             f"{file_label}::{enclosing_fn}: `{wrapper_call}`'s result is bound to `{var}`, "
             f"but no `for _ in {var}` loop consumes it afterward"
+        )
+
+    intervening = masked[assign_match.end() : loop_match.start()]
+    intervening_re = re.compile(
+        r"\blet\s+(?:mut\s+)?"
+        + re.escape(var)
+        + r"\b\s*="
+        + r"|\b"
+        + re.escape(var)
+        + r"\b\s*=(?!=)"
+        + r"|\b"
+        + re.escape(var)
+        + r"\b\s*\.\s*(?:"
+        + "|".join(_MUTATING_VEC_METHODS)
+        + r")\s*\("
+    )
+    mutate_match = intervening_re.search(intervening)
+    if mutate_match is not None:
+        return (
+            f"{file_label}::{enclosing_fn}: `{var}` is rebound or mutated "
+            f"({mutate_match.group(0).strip()!r}) between the ordering assignment "
+            f"and the loop, so the loop is not guaranteed to consume the reordered batch"
         )
     return None
 
