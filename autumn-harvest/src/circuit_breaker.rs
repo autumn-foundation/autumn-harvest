@@ -306,36 +306,6 @@ impl CircuitBreakerRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Looks up `activity_name`'s breaker state, inserting a fresh default
-    /// only the first time this name is ever seen.
-    ///
-    /// `HashMap::entry` takes an owned key unconditionally -- even when the
-    /// entry already exists -- so `states.entry(activity_name.to_string())`
-    /// allocates a `String` on every single call, for the lifetime of the
-    /// process, even though every activity's entry is created once and then
-    /// looked up over and over by every subsequent dispatch/result.
-    /// `contains_key` + `get_mut` costs a second hash-table probe on the hit
-    /// path (the borrow-checker-friendly way to express this on stable Rust
-    /// -- the single-probe `if let Some(st) = states.get_mut(..) { st } else
-    /// { states.entry(..)... }` form does not borrow-check: returning `st`
-    /// from the `Some` arm extends `states`' mutable borrow across the
-    /// whole match, so the `else` arm's own borrow is rejected as a second
-    /// concurrent one. This is a known stable-Rust limitation; see the
-    /// "Polonius" borrow-checker proposal). That second probe is a plain
-    /// `&str` lookup with no allocation, and is measured below to still be
-    /// cheaper than the allocation it replaces.
-    fn state_for<'a>(
-        states: &'a mut HashMap<String, BreakerState>,
-        activity_name: &str,
-    ) -> &'a mut BreakerState {
-        if !states.contains_key(activity_name) {
-            states.insert(activity_name.to_string(), BreakerState::default());
-        }
-        states
-            .get_mut(activity_name)
-            .expect("just inserted above if it was absent")
-    }
-
     /// Decide whether to allow a dispatch of `activity_name` at `now`.
     ///
     /// Activities without a policy always return [`DispatchDecision::Allow`].
@@ -353,7 +323,7 @@ impl CircuitBreakerRegistry {
             };
         };
         let mut states = self.lock();
-        let st = Self::state_for(&mut states, activity_name);
+        let st = states.entry(activity_name.to_string()).or_default();
 
         if st.forced_open {
             // Operator-forced: no probe is admitted on any timer, so advertise
@@ -433,7 +403,7 @@ impl CircuitBreakerRegistry {
     ) -> Option<CircuitTransition> {
         let &policy = self.policies.get(activity_name)?;
         let mut states = self.lock();
-        let st = Self::state_for(&mut states, activity_name);
+        let st = states.entry(activity_name.to_string()).or_default();
 
         if st.forced_open {
             // Operator-pinned: ignore organic results until force-closed.
