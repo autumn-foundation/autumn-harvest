@@ -38,8 +38,9 @@ A handler can also take the raw `Bytes` and call `serde_json::from_slice`
 itself. Checks 2, 3 and 5 read that parse when it reads a parameter of type
 `Bytes`, `&[u8]` or `Vec<u8>`. The parse can be in the handler, or in a helper
 one level down that the handler passes the body to. In a helper, only the
-parameter at the position of the body argument is a body. A copy of the body
-under another name, such as `body.to_vec()`, is not read. The type comes from
+parameter at the position of the body argument is a body. A move into another
+name, such as `let captured = body;`, is followed. A copy through a call, such as
+`body.to_vec()`, is not read. The type comes from
 a turbofish, then from a typed `let` in the same statement, then from a
 `Result<T, _>` return type. The last two apply only when the call ends its
 expression, since a `.map(..)` after it yields another type. A `Value` body is
@@ -52,27 +53,27 @@ returns the rejection it binds. An `Err` arm that returns a helper, or whose
 value is a call to a helper that can build a rejection, rejects, unless it hands
 its error to that helper. A move of the extractor into another name is followed.
 Such a helper can recover the request, as the start route does (#808). A
-catch-all `_` arm counts as an `Err` arm, and so does an `if let Err(..)` block.
-An `if` on `.is_err()` or `.is_ok()` counts when its failing branch rejects. A
-raw-byte parse is mandatory unless an `if` on `.is_empty()` lets an empty body
-skip it. The parse must be in the arm that runs for a non-empty body, and the
-empty-body arm must not reject. An earlier `if body.is_empty() { .. }` also
-counts when its block returns a success, such as `Ok(..)`, a 2xx status or
-`Json(..)`, and no error. Only a return at the top level of that block counts. A
-return inside a nested `if`, `match` or closure may not run. A parse that turns
-its error into a value is optional too, such as `.ok()`, `.unwrap_or_default()`
-or an `if let Ok(..)` whose `else` does not reject. A `match` on the parse is
-optional when it has an `Err` or catch-all arm and no such arm rejects. A
-fallback that rejects the error, such as `.map_or_else(|e| reject(e), ..)`,
-keeps the parse mandatory. So does a fallback that calls a helper that can build
-a rejection. The helper's return type decides: a response, an error or a
-`Result` can be a rejection, and a plain value type such as `Gadget` is not. A
-helper the audit cannot find counts as a rejection. An `.or_else(..)` whose
-fallback yields `Ok(..)` on every path makes a later `?` tolerant. A guard or a
-tolerant call at a helper call site carries into the helper. Check 2 applies to
-every parse that does not tolerate its error, since a body that is present must
-then carry the mandatory fields. A bare `Json<T>` and a rejecting
-`Result<Json<T>, _>` are such parses.
+catch-all `_` arm counts as an `Err` arm, and so does an `if let Err(..)` block
+or the code after `let Err(..) = body else { .. };`. An `if` on `.is_err()` or
+`.is_ok()` counts when its failing branch rejects. A raw-byte parse is mandatory
+unless an `if` on `.is_empty()` lets an empty body skip it. The parse must be in
+the arm that runs for a non-empty body, and the empty-body arm must not reject.
+An earlier `if body.is_empty() { .. }` also counts when its block returns a
+success, such as `Ok(..)`, a 2xx status or `Json(..)`, and no error. Only a
+return at the top level of that block counts. A return inside a nested `if`,
+`match` or closure may not run. A parse that turns its error into a value is
+optional too, such as `.ok()`, `.unwrap_or_default()` or an `if let Ok(..)`
+whose `else` does not reject. A `match` on the parse is optional when it has an
+`Err` or catch-all arm and no such arm rejects. A fallback that rejects the
+error, such as `.map_or_else(|e| reject(e), ..)`, keeps the parse mandatory. So
+does a fallback that calls a helper that can build a rejection. The helper's
+return type decides: a response, an error or a `Result` can be a rejection, and
+a plain value type such as `Gadget` is not. A helper the audit cannot find
+counts as a rejection. An `.or_else(..)` whose fallback yields `Ok(..)` on every
+path makes a later `?` tolerant. A guard or a tolerant call at a helper call
+site carries into the helper. Check 2 applies to every parse that does not
+tolerate its error, since a body that is present must then carry the mandatory
+fields. A bare `Json<T>` and a rejecting `Result<Json<T>, _>` are such parses.
 
 Check 4 reads the routes that take a `RawQuery` and parse the pairs by hand. A
 key those parsers match is a parameter the route accepts, so a key the contract
@@ -471,8 +472,9 @@ ERROR_TOKENS = r"AutumnError::|\bErr\(|StatusCode::(?!(?:%s)\b)[A-Z_]+\b" % SUCC
 # `Gadget::default()` starts with a capital, so it does not match.
 FREE_CALL = r"(?:return\s+)?([a-z_][a-z_0-9]*)\s*\("
 
-# A return type that can carry a rejection rather than a plain value.
-RESPONSE_TYPE = r"Response|Rejection|Error|StatusCode|Result|Json|\("
+# A return type that can carry a rejection rather than a plain value. A bare
+# `Json<T>` is always sent as 200, so it is a success, not a rejection.
+RESPONSE_TYPE = r"Response|Rejection|Error|StatusCode|Result|\("
 
 # The source that `audit` reads, so a helper can be looked up by name.
 SOURCE = [""]
@@ -600,9 +602,9 @@ def raw_body_parses(source: str, handler: str) -> list[tuple[str | None, bool, b
         return []
     # A call in a comment or a string is no parse, so neither is read.
     handler_block = code_only(handler_found[2])
-    carriers = byte_parameters(handler_found[0])
-    params, returns = handler_found[0], handler_found[1]
-    parses = block_parses(handler_block, byte_parameters(params), returns)
+    carriers = moved_names(handler_block, byte_parameters(handler_found[0]))
+    returns = handler_found[1]
+    parses = block_parses(handler_block, carriers, returns)
     for helper in called_helpers(source, handler_block):
         parts = function_parts(source, helper)
         if parts is None:
@@ -613,9 +615,30 @@ def raw_body_parses(source: str, handler: str) -> list[tuple[str | None, bool, b
         for name, (optional, tolerant) in states.items():
             if name not in byte_names:
                 continue
-            found = block_parses(block, {name}, returns)
+            found = block_parses(block, moved_names(block, {name}), returns)
             parses += [(kind, o or optional, t or tolerant) for kind, o, t in found]
     return parses
+
+
+def moved_names(block: str, names: set[str]) -> set[str]:
+    """`names` plus each name that a `let` moves one of them into.
+
+    `let captured = body;` makes `captured` a body too. A copy through a
+    call, such as `body.to_vec()`, is not followed.
+    """
+    found = set(names)
+    while True:
+        moved = {
+            alias.group(1)
+            for name in found
+            for alias in re.finditer(
+                r"\blet\s+(?:mut\s+)?([a-z_][a-z_0-9]*)\s*(?::[^=;]*)?=\s*%s\s*;" % re.escape(name),
+                block,
+            )
+        }
+        if moved <= found:
+            return found
+        found |= moved
 
 
 def split_top_level(text: str) -> list[str]:
@@ -797,6 +820,14 @@ def error_rejects(name: str, block: str, seen: frozenset[str] = frozenset()) -> 
         otherwise = balanced(block[binding.end() - 1 :], "{", "}")
         if rejecting_exit(otherwise):
             return True
+    # After `let Err(e) = body else { .. };`, the rest of the scope runs only on
+    # failure, so it is the failure arm.
+    bound_err = r"\blet\s+Err\s*\(\s*([a-z_][a-z_0-9]*)?[^=]*=\s*%s\s*else\s*\{" % read
+    for binding in re.finditer(bound_err, block):
+        otherwise = balanced(block[binding.end() - 1 :], "{", "}")
+        rest = block[binding.end() - 1 + len(otherwise) :].lstrip().lstrip(";")
+        if arm_rejects(scope_rest(rest), binding.group(1)):
+            return True
     failed = r"\bif\s+let\s+Err\s*\(\s*([a-z_][a-z_0-9]*)?[^=]*=\s*%s\s*\{" % read
     for tested in re.finditer(failed, block):
         taken = balanced(block[tested.end() - 1 :], "{", "}")
@@ -810,6 +841,17 @@ def error_rejects(name: str, block: str, seen: frozenset[str] = frozenset()) -> 
             if rejecting_exit(otherwise):
                 return True
     return False
+
+
+def scope_rest(text: str) -> str:
+    """`text` up to the end of the block it starts in."""
+    depth = 0
+    for index, char in enumerate(text):
+        depth += char in "([{"
+        depth -= char in ")]}"
+        if depth < 0:
+            return text[:index]
+    return text
 
 
 def error_exits_before(block: str, variable: str, read: str, position: int) -> bool:
@@ -2006,6 +2048,9 @@ pub fn harvest_api_router() -> Router {
         .route("/e/exit-then-unwrap", post(e_exit_then_unwrap))
         .route("/e/log-then-unwrap", post(e_log_then_unwrap))
         .route("/e/nested-comment", post(e_nested_comment))
+        .route("/e/raw-alias", post(e_raw_alias))
+        .route("/e/json-helper-default", post(e_json_helper_default))
+        .route("/e/let-err-else", post(e_let_err_else))
 }
 
 async fn e_wrapped(body: Bytes) -> Response {
@@ -2902,6 +2947,30 @@ async fn e_log_then_unwrap(body: Result<Json<Gadget>, JsonRejection>) -> Respons
 async fn e_nested_comment(body: Bytes) -> Response {
     /* outer /* nested */ serde_json::from_slice::<Gadget>(&body)?; */
     StatusCode::OK.into_response()
+}
+
+async fn e_raw_alias(body: Bytes) -> Result<Response, Response> {
+    let captured = body;
+    let gadget = serde_json::from_slice::<Gadget>(&captured).map_err(|_| reject())?;
+    Ok(StatusCode::OK.into_response())
+}
+
+async fn e_json_helper_default(body: Result<Json<Gadget>, JsonRejection>) -> Json<Gadget> {
+    match body {
+        Ok(Json(gadget)) => Json(gadget),
+        Err(_) => default_json(),
+    }
+}
+
+fn default_json() -> Json<Gadget> {
+    Json(Gadget::default())
+}
+
+async fn e_let_err_else(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    let Err(rejection) = body else {
+        return StatusCode::OK.into_response();
+    };
+    rejection.into_response()
 }
 
 fn invalid_body() -> Response {
@@ -4527,6 +4596,33 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
         "a parse inside a nested block comment is no parse",
         FIXTURE_EDGES,
         [fixture_route("POST", "/e/nested-comment", 200)],
+        {},
+    ),
+    (
+        "a moved raw body and a let-Err-else that rejects are mandatory",
+        FIXTURE_EDGES,
+        [
+            fixture_route("POST", path, 200, request_body=body_of(("name", True), required=False))
+            for path in ("/e/raw-alias", "/e/let-err-else")
+        ],
+        {
+            "body_required": [
+                "POST /e/raw-alias: the body is mandatory",
+                "POST /e/let-err-else: the body is mandatory",
+            ]
+        },
+    ),
+    (
+        "a helper that returns Json<T> builds a success",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/json-helper-default",
+                200,
+                request_body=body_of(("name", False), required=False),
+            )
+        ],
         {},
     ),
     (
