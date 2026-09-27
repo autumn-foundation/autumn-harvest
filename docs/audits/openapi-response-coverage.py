@@ -61,12 +61,13 @@ return inside a nested `if`, `match` or closure may not run. A parse that turns
 its error into a value is optional too, such as `.ok()`, `.unwrap_or_default()`
 or an `if let Ok(..)` whose `else` does not reject. A `match` on the parse is
 optional when it has an `Err` or catch-all arm and no such arm rejects. A
-fallback that rejects the error, such as `.map_or_else(|e| reject(e), ..)`,
-keeps the parse mandatory. An `.or_else(..)` whose fallback always returns
-`Ok(..)` makes a later `?` tolerant. A guard or a tolerant call at a helper call
-site carries into the helper. Check 2 applies to every parse that does not
-tolerate its error, since a body that is present must then carry the mandatory
-fields. A bare `Json<T>` and a rejecting `Result<Json<T>, _>` are such parses.
+fallback that rejects the error or calls a helper, such as
+`.map_or_else(|e| reject(e), ..)`, keeps the parse mandatory. An `.or_else(..)`
+whose fallback yields `Ok(..)` on every path makes a later `?` tolerant. A guard
+or a tolerant call at a helper call site carries into the helper. Check 2
+applies to every parse that does not tolerate its error, since a body that is
+present must then carry the mandatory fields. A bare `Json<T>` and a rejecting
+`Result<Json<T>, _>` are such parses.
 
 Check 4 reads the routes that take a `RawQuery` and parse the pairs by hand. A
 key those parsers match is a parameter the route accepts, so a key the contract
@@ -823,10 +824,7 @@ def walk_chain(after: str) -> tuple[str, str | None, str]:
         if method in ("unwrap", "expect") and state not in ("value", "recovered"):
             return "reject", inspection, rest
         if method in ("or", "or_else") and state == "result":
-            fallback = balanced(rest[call.end() - 1 :])
-            if re.search(r"\bOk\s*(?:::<[^()]*>\s*)?\(", fallback) and not re.search(
-                ERROR_TOKENS + r"|\b(?:panic|unreachable|todo)!|\?", fallback
-            ):
+            if always_ok(balanced(rest[call.end() - 1 :])):
                 state = "recovered"
         if method == "ok" and state == "result":
             state = "option"
@@ -853,8 +851,8 @@ def fallback_rejects(method: str, arguments: str) -> bool:
     """Whether the fallback of `unwrap_or*` or `map_or*` on a `Result` rejects.
 
     The fallback is the first argument. It rejects when it builds an error or
-    panics. A closure also rejects when it returns or converts its error, or
-    passes that error to a call. A function path given to `unwrap_or_else` or
+    panics. A closure also rejects when its value is a call to a free function,
+    or when it returns or converts its error, or passes that error to a call. A function path given to `unwrap_or_else` or
     `map_or_else` receives the error, so it rejects too.
     """
     items = split_top_level(arguments[1:-1])
@@ -865,10 +863,47 @@ def fallback_rejects(method: str, arguments: str) -> bool:
     if closure is None:
         return method.endswith("_else") and re.fullmatch(r"[A-Za-z_][\w:]*", fallback) is not None
     bound, body = closure.group(1), closure.group(2)
+    # A helper can build a rejection without the error, so its call rejects,
+    # as `rejecting_exit` reads a returned call. A type path such as
+    # `Gadget::default()` builds a value.
+    if re.match(r"(?:return\s+)?[a-z_][a-z_0-9]*\s*\(", closure_value(body)):
+        return True
     if bound is None or bound == "_":
         return False
     passed = r"\b[A-Za-z_][\w:]*\s*\(\s*&?\s*%s\b" % re.escape(bound)
     return rejecting_arm(body, bound) or re.search(passed, body) is not None
+
+
+def closure_value(body: str) -> str:
+    """The expression a closure body yields: the body, or the tail of its block."""
+    body = body.strip()
+    if not body.startswith("{"):
+        return body
+    inner = balanced(body, "{", "}")[1:-1]
+    depth, tail = 0, 0
+    for index, char in enumerate(inner):
+        depth += char in "([{"
+        depth -= char in ")]}"
+        if char == ";" and depth == 0:
+            tail = index + 1
+    return inner[tail:].strip()
+
+
+def always_ok(arguments: str) -> bool:
+    """Whether the fallback of `or` or `or_else` yields `Ok(..)` on every path.
+
+    The fallback is `Ok(..)` itself, or a closure whose value is `Ok(..)`. A
+    branch, a `return`, a `?`, a panic or an error token in it may fail, so it
+    does not count.
+    """
+    fallback = arguments[1:-1].strip()
+    closure = re.match(r"(?:move\s+)?\|[^|]*\|(.*)", fallback, re.S)
+    value = closure_value(closure.group(1)) if closure else fallback
+    ok = re.match(r"Ok\s*(?:::<[^()]*>\s*)?\(", value)
+    if ok is None or len(balanced(value[ok.end() - 1 :])) != len(value) - ok.end() + 1:
+        return False
+    risky = ERROR_TOKENS + r"|\b(?:if|match|return|panic!|unreachable!|todo!)|\?"
+    return re.search(risky, fallback) is None
 
 
 def inspection_rejects(before: str, inspection: str, rest: str) -> bool:
@@ -1775,6 +1810,9 @@ pub fn harvest_api_router() -> Router {
         .route("/e/json-or-else", post(e_json_or_else))
         .route("/e/raw-or-else", post(e_raw_or_else))
         .route("/e/raw-or-else-err", post(e_raw_or_else_err))
+        .route("/e/ignored-error-helper", post(e_ignored_error_helper))
+        .route("/e/or-else-branch", post(e_or_else_branch))
+        .route("/e/or-else-block", post(e_or_else_block))
 }
 
 async fn e_wrapped(body: Bytes) -> Response {
@@ -2495,6 +2533,24 @@ async fn e_raw_or_else(body: Bytes) -> Result<Response, Response> {
 
 async fn e_raw_or_else_err(body: Bytes) -> Result<Response, Response> {
     let gadget = serde_json::from_slice::<Gadget>(&body).or_else(|e| Err(reject(e)))?;
+    Ok(StatusCode::OK.into_response())
+}
+
+async fn e_ignored_error_helper(body: Bytes) -> Response {
+    serde_json::from_slice::<Gadget>(&body).map_or_else(|_| invalid_body(), |gadget| accept(gadget))
+}
+
+async fn e_or_else_branch(body: Bytes) -> Result<Response, Response> {
+    let gadget = serde_json::from_slice::<Gadget>(&body)
+        .or_else(|e| if !e.is_eof() { Ok(Gadget::default()) } else { propagate(e) })?;
+    Ok(StatusCode::OK.into_response())
+}
+
+async fn e_or_else_block(body: Bytes) -> Result<Response, Response> {
+    let gadget = serde_json::from_slice::<Gadget>(&body).or_else(|error| {
+        tracing::debug!(%error, "default");
+        Ok(Gadget::default())
+    })?;
     Ok(StatusCode::OK.into_response())
 }
 
@@ -3874,6 +3930,33 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             )
         ],
         {"body_required": ["POST /e/raw-or-else-err: the body is mandatory"]},
+    ),
+    (
+        "a fallback that calls a helper or can still fail is mandatory",
+        FIXTURE_EDGES,
+        [
+            fixture_route("POST", path, 200, request_body=body_of(("name", True), required=False))
+            for path in ("/e/ignored-error-helper", "/e/or-else-branch")
+        ],
+        {
+            "body_required": [
+                "POST /e/ignored-error-helper: the body is mandatory",
+                "POST /e/or-else-branch: the body is mandatory",
+            ]
+        },
+    ),
+    (
+        "an or_else block whose value is Ok(..) recovers",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/or-else-block",
+                200,
+                request_body=body_of(("name", False), required=False),
+            )
+        ],
+        {},
     ),
     (
         "a malformed contract entry does not crash the audit",
