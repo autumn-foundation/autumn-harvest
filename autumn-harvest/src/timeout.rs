@@ -1084,87 +1084,104 @@ async fn commit_workflow_execution_timeout(
     Vec<(ExecutionId, String)>,
     Vec<crate::execution::StartCancelledRun>,
 )> {
-    Box::pin(conn.transaction::<(
+    // `wake_parent_for_child_timeout` below raises a dispatch hint (issue
+    // #1429). The scope ties its publish to this transaction's commit, so
+    // a reader never probes a parent row before it is visible.
+    //
+    // `enforce_workflow_execution_timeouts` calls this once per expired
+    // execution in its own sweep loop (Codex review, issue #1429). A
+    // synchronous per-row publish (`buffered_settled`) would pay a Redis
+    // round trip once per row. It would stall the sweep when the channel
+    // is slow, even though Postgres already committed. Hand hints to the
+    // background publisher instead, the same fix already applied to the
+    // outbox sweeps in this file.
+    crate::dispatch::buffered_settled_in_background(Box::pin(conn.transaction::<(
         bool,
         Vec<crate::completion_trigger::DeferredTriggerStart>,
         Vec<(ExecutionId, String)>,
         Vec<crate::execution::StartCancelledRun>,
-    ), HarvestError, _>(async |conn| {
-        let timeout_event = timeout_event.clone();
-        let error_msg = error_msg.to_owned();
-        // Re-check state under lock to guard against concurrent completion.
-        let current_state: Option<String> = harvest_workflow_executions::table
-            .find(exec_id.as_uuid())
-            .for_update()
-            .select(harvest_workflow_executions::state)
-            .first(conn)
+    ), HarvestError, _>(
+        async |conn| {
+            let timeout_event = timeout_event.clone();
+            let error_msg = error_msg.to_owned();
+            // Re-check state under lock to guard against concurrent completion.
+            let current_state: Option<String> = harvest_workflow_executions::table
+                .find(exec_id.as_uuid())
+                .for_update()
+                .select(harvest_workflow_executions::state)
+                .first(conn)
+                .await
+                .optional()
+                .map_err(crate::error::database_error)?;
+
+            match current_state.as_deref() {
+                Some("RUNNING") => {}
+                _ => return Ok((false, Vec::new(), Vec::new(), Vec::new())),
+            }
+
+            store::append_single_event(conn, exec_id, timeout_event).await?;
+            update_workflow_execution_timed_out(conn, exec_id, &error_msg).await?;
+
+            let _rows = diesel::update(
+                harvest_task_queue::table
+                    .filter(harvest_task_queue::workflow_exec_id.eq(exec_id.as_uuid()))
+                    .filter(
+                        harvest_task_queue::state
+                            .eq("PENDING")
+                            .or(harvest_task_queue::state.eq("RUNNING")),
+                    ),
+            )
+            .set((
+                harvest_task_queue::state.eq("FAILED"),
+                harvest_task_queue::error.eq(Some(&error_msg)),
+                harvest_task_queue::completed_at.eq(Some(Utc::now())),
+            ))
+            .execute(conn)
             .await
-            .optional()
             .map_err(crate::error::database_error)?;
 
-        match current_state.as_deref() {
-            Some("RUNNING") => {}
-            _ => return Ok((false, Vec::new(), Vec::new(), Vec::new())),
-        }
-
-        store::append_single_event(conn, exec_id, timeout_event).await?;
-        update_workflow_execution_timed_out(conn, exec_id, &error_msg).await?;
-
-        let _rows = diesel::update(
-            harvest_task_queue::table
-                .filter(harvest_task_queue::workflow_exec_id.eq(exec_id.as_uuid()))
-                .filter(
-                    harvest_task_queue::state
-                        .eq("PENDING")
-                        .or(harvest_task_queue::state.eq("RUNNING")),
-                ),
-        )
-        .set((
-            harvest_task_queue::state.eq("FAILED"),
-            harvest_task_queue::error.eq(Some(&error_msg)),
-            harvest_task_queue::completed_at.eq(Some(Utc::now())),
-        ))
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error)?;
-
-        if let Some(parent_uuid) = parent_uuid {
-            wake_parent_for_child_timeout(
-                conn,
-                execution_id_from_uuid(parent_uuid),
-                exec_id,
-                &error_msg,
-            )
-            .await?;
-        }
-
-        // Issue #1243: neither this cascade nor `timeout_event`
-        // (`WorkflowExecutionTimedOut`) carries a payload-bearing field.
-        // `enforce_workflow_execution_timeouts` also has no configured
-        // registry threaded through its many test call sites. Identity is
-        // exact here, not a shortcut.
-        let (mut deferred, closed_children) =
-            apply_parent_close_cascade(conn, exec_id, &crate::store::DEFAULT_PAYLOAD_CODECS)
+            if let Some(parent_uuid) = parent_uuid {
+                wake_parent_for_child_timeout(
+                    conn,
+                    execution_id_from_uuid(parent_uuid),
+                    exec_id,
+                    &error_msg,
+                )
                 .await?;
-        let mut pending_cancel_metrics = Vec::new();
-        // Issue #1243: same identity-registry rationale as this function's
-        // `apply_parent_close_cascade` call above.
-        let triggers =
-            crate::completion_trigger::evaluate_triggers_for_execution_collecting_with_codecs(
-                conn,
-                exec_id,
-                crate::completion_trigger::TerminalState::TimedOut,
-                metrics,
-                &mut pending_cancel_metrics,
-                &crate::store::DEFAULT_PAYLOAD_CODECS,
-            )
-            .await?;
-        deferred.extend(triggers);
-        Ok((true, deferred, closed_children, pending_cancel_metrics))
-    }))
+            }
+
+            // Issue #1243: neither this cascade nor `timeout_event`
+            // (`WorkflowExecutionTimedOut`) carries a payload-bearing field.
+            // `enforce_workflow_execution_timeouts` also has no configured
+            // registry threaded through its many test call sites. Identity is
+            // exact here, not a shortcut.
+            let (mut deferred, closed_children) =
+                apply_parent_close_cascade(conn, exec_id, &crate::store::DEFAULT_PAYLOAD_CODECS)
+                    .await?;
+            let mut pending_cancel_metrics = Vec::new();
+            // Issue #1243: same identity-registry rationale as this function's
+            // `apply_parent_close_cascade` call above.
+            let triggers =
+                crate::completion_trigger::evaluate_triggers_for_execution_collecting_with_codecs(
+                    conn,
+                    exec_id,
+                    crate::completion_trigger::TerminalState::TimedOut,
+                    metrics,
+                    &mut pending_cancel_metrics,
+                    &crate::store::DEFAULT_PAYLOAD_CODECS,
+                )
+                .await?;
+            deferred.extend(triggers);
+            Ok((true, deferred, closed_children, pending_cancel_metrics))
+        },
+    )))
     .await
 }
 
+// The `dispatch::buffered_settled` wrap (issue #1429) added two lines over
+// the 100-line cap. The transaction below is one atomic unit; splitting it
+// would only move lines around, not shrink the function.
+#[allow(clippy::too_many_lines)]
 async fn enforce_activity_timeout(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
@@ -1172,7 +1189,6 @@ async fn enforce_activity_timeout(
     reason: &TimeoutReason,
     circuit_breakers: Option<&crate::circuit_breaker::CircuitBreakerRegistry>,
     metrics: &(dyn MetricsRecorder + Send + Sync),
-
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
     let Some(activity_name) = task.activity_name.as_deref() else {
@@ -1195,82 +1211,170 @@ async fn enforce_activity_timeout(
     // `default_transaction_isolation = repeatable read` on the database or the
     // role disable the guarantee from outside this code.
     let mut tx = conn.build_transaction().read_committed();
-    let enforced = Box::pin(tx.run::<bool, HarvestError, _>(async |conn| {
-        let error = error.clone();
+    // `wake_workflow_task` below raises a dispatch hint (issue #1429). The
+    // scope ties its publish to this transaction's commit.
+    //
+    // `enforce_timeouts_once_on_conn_shard` calls this once per timed-out
+    // activity task in its own sweep loop (Codex review, issue #1429). A
+    // synchronous per-row publish (`buffered_settled`) would pay a Redis
+    // round trip once per row. It would stall the sweep when the channel
+    // is slow, even though Postgres already committed. Hand hints to the
+    // background publisher instead, the same fix already applied to the
+    // outbox sweeps in this file.
+    let enforced = crate::dispatch::buffered_settled_in_background(Box::pin(
+        tx.run::<bool, HarvestError, _>(async |conn| {
+            let error = error.clone();
 
-        // Authoritative QUEUE-pause re-check (issue #619). The scan predicate
-        // is a non-locking snapshot, so a queue pause committing after the scan
-        // would otherwise let this transaction schedule-to-start-fail the very
-        // task the hold was meant to protect.
-        //
-        // Unlike the execution-pause re-check further down — which is
-        // authoritative because both sides lock the *execution row* —
-        // `pause_queue` shares no row with this transaction, so a bare re-read
-        // would not serialize: a pause could commit in the window between the
-        // read and this transaction's own commit. Both sides therefore take the
-        // same queue-scoped advisory lock, so a pause is either fully visible
-        // here or blocked until this enforcement commits.
-        //
-        // LOCK ORDERING (load-bearing): this runs FIRST, before the execution
-        // and task row locks below, because `resume_queue` takes the very same
-        // advisory lock and *then* row-locks every PENDING task on the queue via
-        // its `scheduled_at` shift. Taking the rows first here and the advisory
-        // lock after would invert that order — enforcement holding a task row
-        // and waiting on the advisory lock while resume holds the advisory lock
-        // and waits on that task row — and Postgres would abort one of them,
-        // failing either the timeout pass or the operator's resume. Both paths
-        // now take advisory-then-rows. (Same convention as the
-        // `harvest_external_tasks` task-row -> execution-row ordering documented
-        // in `enforce_external_task_timeouts`.)
-        //
-        // Scoped by `queue_pause_suppresses_timeout` to `ScheduleToStart` only
-        // — the absolute `schedule_to_close` deadline keeps ticking during a
-        // queue pause, and heartbeat/start-to-close apply to RUNNING rows that a
-        // pause never touches — so the lock is taken only for that reason and
-        // never on the far more common in-flight timeout paths. Bailing here
-        // also skips the row locks and history load entirely for a held task.
-        //
-        // SHARED mode (round-21 review): exclusive would block every claim's
-        // `try_lock_queue_for_claim` for this whole transaction, stalling
-        // dispatch on a queue that is not paused at all. Shared still mutually
-        // excludes the exclusive pause/resume, which is the only ordering this
-        // re-check needs. See `lock_queue_for_timeout_recheck`.
-        if matches!(reason, TimeoutReason::ScheduleToStart) {
-            crate::queue_pause::lock_queue_for_timeout_recheck(conn, &task.queue_name).await?;
-            if crate::queue_pause::queue_pause_suppresses_timeout(
-                reason,
-                crate::queue_pause::is_queue_paused(conn, &task.queue_name).await?,
-            ) {
+            // Authoritative QUEUE-pause re-check (issue #619). The scan predicate
+            // is a non-locking snapshot, so a queue pause committing after the scan
+            // would otherwise let this transaction schedule-to-start-fail the very
+            // task the hold was meant to protect.
+            //
+            // Unlike the execution-pause re-check further down — which is
+            // authoritative because both sides lock the *execution row* —
+            // `pause_queue` shares no row with this transaction, so a bare re-read
+            // would not serialize: a pause could commit in the window between the
+            // read and this transaction's own commit. Both sides therefore take the
+            // same queue-scoped advisory lock, so a pause is either fully visible
+            // here or blocked until this enforcement commits.
+            //
+            // LOCK ORDERING (load-bearing): this runs FIRST, before the execution
+            // and task row locks below, because `resume_queue` takes the very same
+            // advisory lock and *then* row-locks every PENDING task on the queue via
+            // its `scheduled_at` shift. Taking the rows first here and the advisory
+            // lock after would invert that order — enforcement holding a task row
+            // and waiting on the advisory lock while resume holds the advisory lock
+            // and waits on that task row — and Postgres would abort one of them,
+            // failing either the timeout pass or the operator's resume. Both paths
+            // now take advisory-then-rows. (Same convention as the
+            // `harvest_external_tasks` task-row -> execution-row ordering documented
+            // in `enforce_external_task_timeouts`.)
+            //
+            // Scoped by `queue_pause_suppresses_timeout` to `ScheduleToStart` only
+            // — the absolute `schedule_to_close` deadline keeps ticking during a
+            // queue pause, and heartbeat/start-to-close apply to RUNNING rows that a
+            // pause never touches — so the lock is taken only for that reason and
+            // never on the far more common in-flight timeout paths. Bailing here
+            // also skips the row locks and history load entirely for a held task.
+            //
+            // SHARED mode (round-21 review): exclusive would block every claim's
+            // `try_lock_queue_for_claim` for this whole transaction, stalling
+            // dispatch on a queue that is not paused at all. Shared still mutually
+            // excludes the exclusive pause/resume, which is the only ordering this
+            // re-check needs. See `lock_queue_for_timeout_recheck`.
+            if matches!(reason, TimeoutReason::ScheduleToStart) {
+                crate::queue_pause::lock_queue_for_timeout_recheck(conn, &task.queue_name).await?;
+                if crate::queue_pause::queue_pause_suppresses_timeout(
+                    reason,
+                    crate::queue_pause::is_queue_paused(conn, &task.queue_name).await?,
+                ) {
+                    return Ok(false);
+                }
+                // Authoritative ACTIVITY-pause re-check (issue #807), the
+                // per-activity-type sibling of the queue re-check above. Same
+                // staleness problem, same fix: the scan predicate is a non-locking
+                // snapshot, so a pause committing after the scan would otherwise let
+                // this transaction schedule-to-start-fail a task the hold protects.
+                //
+                // No advisory lock (unlike the queue path). This copy is an
+                // ADVISORY FAST PATH: it lets a held task bail before paying for the
+                // execution row lock and history load below. It is NOT the
+                // guarantee -- the very next statement,
+                // `lock_workflow_execution_row_and_load_history`, can block for an
+                // UNBOUNDED period behind any other holder of that row, and
+                // `pause_activity` shares no row with this transaction so it commits
+                // freely during that wait (round-17 review, P1). The authoritative
+                // re-check therefore runs AFTER the row locks; see it below.
+                // Placed after the queue re-check so the two read coarse-to-fine,
+                // and before `schedule_to_start_still_expired_unlocked` so a held
+                // task short-circuits on the cheaper condition.
+                //
+                // Scoped by `task_type = 'activity'` to match the scan predicate
+                // exactly. A *workflow* task can carry a non-NULL `activity_name` —
+                // the engine stamps the `'mixed_signal_suspension'` sentinel there —
+                // so without this an activity paused under that name would suppress
+                // a workflow task's schedule-to-start timeout. That is unreachable
+                // today only because workflow tasks are enqueued with
+                // `schedule_to_start: None` and so never reach this scan; relying on
+                // that would leave the enforcer silently disagreeing with its own
+                // scan predicate the moment a workflow task gains one.
+                if task.task_type == crate::activity_pause::ACTIVITY_TASK_TYPE
+                    && let Some(activity_name) = task.activity_name.as_deref()
+                    && crate::activity_pause::activity_pause_suppresses_timeout(
+                        reason,
+                        crate::activity_pause::is_activity_paused(conn, activity_name).await?,
+                    )
+                {
+                    return Ok(false);
+                }
+                // A *completed* pause/resume cycle leaves nothing for either check
+                // above to suppress on, but resume has already credited the held
+                // time back into `scheduled_at`. Re-read the row-current deadline
+                // before trusting the scan snapshot, or a task is timed out the
+                // instant its deadline was extended. Covers both the queue (#619)
+                // and activity (#807) resume paths, which shift the same column.
+                //
+                // Unlocked here (round-22 review): locking the task row before the
+                // execution row below would invert the documented
+                // execution-row -> task-row order and deadlock against
+                // `resume_workflow_execution`. This is a fast path that skips the
+                // execution lock and history load for the common held-task case;
+                // the authoritative locked re-read runs after the row locks below.
+                if !schedule_to_start_still_expired_unlocked(conn, task.id).await? {
+                    return Ok(false);
+                }
+            }
+
+            let (execution, history) =
+                lock_workflow_execution_row_and_load_history(conn, exec_id, codecs).await?;
+            let Some((state, row_schedule_to_close_at)) =
+                task_state_and_deadline_for_update(conn, task.id).await?
+            else {
+                return Ok(false);
+            };
+            if !expected_task_states_for_timeout(reason).contains(&state.as_str()) {
                 return Ok(false);
             }
-            // Authoritative ACTIVITY-pause re-check (issue #807), the
-            // per-activity-type sibling of the queue re-check above. Same
-            // staleness problem, same fix: the scan predicate is a non-locking
-            // snapshot, so a pause committing after the scan would otherwise let
-            // this transaction schedule-to-start-fail a task the hold protects.
+            // Authoritative `schedule_to_start` deadline re-read (round-18 review),
+            // now placed here — after the execution row lock above and while this
+            // transaction already holds the task row from
+            // `task_state_and_deadline_for_update` — so it preserves the
+            // execution-row -> task-row order (round-22 review). The unlocked
+            // fast-path check near the top of this transaction is advisory; this is
+            // the one that must be trusted, because only a lock held across the
+            // resume's own `scheduled_at` shift can serialize against it.
+            if matches!(reason, TimeoutReason::ScheduleToStart)
+                && !schedule_to_start_still_expired(conn, task.id).await?
+            {
+                return Ok(false);
+            }
+            // Authoritative ACTIVITY-pause re-check, AFTER the blocking row
+            // acquisitions above (issue #807, round-17 review, P1).
             //
-            // No advisory lock (unlike the queue path). This copy is an
-            // ADVISORY FAST PATH: it lets a held task bail before paying for the
-            // execution row lock and history load below. It is NOT the
-            // guarantee -- the very next statement,
-            // `lock_workflow_execution_row_and_load_history`, can block for an
-            // UNBOUNDED period behind any other holder of that row, and
-            // `pause_activity` shares no row with this transaction so it commits
-            // freely during that wait (round-17 review, P1). The authoritative
-            // re-check therefore runs AFTER the row locks; see it below.
-            // Placed after the queue re-check so the two read coarse-to-fine,
-            // and before `schedule_to_start_still_expired_unlocked` so a held
-            // task short-circuits on the cheaper condition.
+            // The copy near the top of this transaction is a fast path only. Between
+            // it and here sits `lock_workflow_execution_row_and_load_history`, a
+            // `FOR UPDATE` that can block for an UNBOUNDED period behind any other
+            // transaction holding the execution row. `pause_activity` touches
+            // neither that row nor this task's, so an operator pause commits
+            // immediately during that wait and returns success -- and without this
+            // re-check the enforcer went on to append `ActivityTimedOut` and
+            // terminally fail the very task the acknowledged hold was placed to
+            // protect, seconds after the operator was told the brake had taken.
             //
-            // Scoped by `task_type = 'activity'` to match the scan predicate
-            // exactly. A *workflow* task can carry a non-NULL `activity_name` —
-            // the engine stamps the `'mixed_signal_suspension'` sentinel there —
-            // so without this an activity paused under that name would suppress
-            // a workflow task's schedule-to-start timeout. That is unreachable
-            // today only because workflow tasks are enqueued with
-            // `schedule_to_start: None` and so never reach this scan; relying on
-            // that would leave the enforcer silently disagreeing with its own
-            // scan predicate the moment a workflow task gains one.
+            // Why this is not the queue path's problem: `lock_queue_for_timeout_recheck`
+            // takes a shared advisory lock at the TOP of this transaction and holds
+            // it through COMMIT, so `pause_queue` cannot interleave at all. The
+            // activity path deliberately takes no advisory lock -- a new keyspace
+            // would impose a fleet-wide queue-before-activity ordering rule and an
+            // ABBA hazard on two paths that today take none -- so the equivalent
+            // guarantee is bought by re-reading after the last blocking acquisition
+            // instead. That is what makes the documented residual genuinely
+            // "bounded by this transaction's own remaining work": every statement
+            // from here to COMMIT touches only rows this transaction already holds.
+            //
+            // Cheap by construction: one indexed `EXISTS` on `harvest_activity_pauses`,
+            // and only on the `ScheduleToStart` path (`activity_pause_suppresses_timeout`
+            // is false for every other reason), which is the rarest of the four.
             if task.task_type == crate::activity_pause::ACTIVITY_TASK_TYPE
                 && let Some(activity_name) = task.activity_name.as_deref()
                 && crate::activity_pause::activity_pause_suppresses_timeout(
@@ -1280,127 +1384,52 @@ async fn enforce_activity_timeout(
             {
                 return Ok(false);
             }
-            // A *completed* pause/resume cycle leaves nothing for either check
-            // above to suppress on, but resume has already credited the held
-            // time back into `scheduled_at`. Re-read the row-current deadline
-            // before trusting the scan snapshot, or a task is timed out the
-            // instant its deadline was extended. Covers both the queue (#619)
-            // and activity (#807) resume paths, which shift the same column.
-            //
-            // Unlocked here (round-22 review): locking the task row before the
-            // execution row below would invert the documented
-            // execution-row -> task-row order and deadlock against
-            // `resume_workflow_execution`. This is a fast path that skips the
-            // execution lock and history load for the common held-task case;
-            // the authoritative locked re-read runs after the row locks below.
-            if !schedule_to_start_still_expired_unlocked(conn, task.id).await? {
-                return Ok(false);
-            }
-        }
-
-        let (execution, history) =
-            lock_workflow_execution_row_and_load_history(conn, exec_id, codecs).await?;
-        let Some((state, row_schedule_to_close_at)) =
-            task_state_and_deadline_for_update(conn, task.id).await?
-        else {
-            return Ok(false);
-        };
-        if !expected_task_states_for_timeout(reason).contains(&state.as_str()) {
-            return Ok(false);
-        }
-        // Authoritative `schedule_to_start` deadline re-read (round-18 review),
-        // now placed here — after the execution row lock above and while this
-        // transaction already holds the task row from
-        // `task_state_and_deadline_for_update` — so it preserves the
-        // execution-row -> task-row order (round-22 review). The unlocked
-        // fast-path check near the top of this transaction is advisory; this is
-        // the one that must be trusted, because only a lock held across the
-        // resume's own `scheduled_at` shift can serialize against it.
-        if matches!(reason, TimeoutReason::ScheduleToStart)
-            && !schedule_to_start_still_expired(conn, task.id).await?
-        {
-            return Ok(false);
-        }
-        // Authoritative ACTIVITY-pause re-check, AFTER the blocking row
-        // acquisitions above (issue #807, round-17 review, P1).
-        //
-        // The copy near the top of this transaction is a fast path only. Between
-        // it and here sits `lock_workflow_execution_row_and_load_history`, a
-        // `FOR UPDATE` that can block for an UNBOUNDED period behind any other
-        // transaction holding the execution row. `pause_activity` touches
-        // neither that row nor this task's, so an operator pause commits
-        // immediately during that wait and returns success -- and without this
-        // re-check the enforcer went on to append `ActivityTimedOut` and
-        // terminally fail the very task the acknowledged hold was placed to
-        // protect, seconds after the operator was told the brake had taken.
-        //
-        // Why this is not the queue path's problem: `lock_queue_for_timeout_recheck`
-        // takes a shared advisory lock at the TOP of this transaction and holds
-        // it through COMMIT, so `pause_queue` cannot interleave at all. The
-        // activity path deliberately takes no advisory lock -- a new keyspace
-        // would impose a fleet-wide queue-before-activity ordering rule and an
-        // ABBA hazard on two paths that today take none -- so the equivalent
-        // guarantee is bought by re-reading after the last blocking acquisition
-        // instead. That is what makes the documented residual genuinely
-        // "bounded by this transaction's own remaining work": every statement
-        // from here to COMMIT touches only rows this transaction already holds.
-        //
-        // Cheap by construction: one indexed `EXISTS` on `harvest_activity_pauses`,
-        // and only on the `ScheduleToStart` path (`activity_pause_suppresses_timeout`
-        // is false for every other reason), which is the rarest of the four.
-        if task.task_type == crate::activity_pause::ACTIVITY_TASK_TYPE
-            && let Some(activity_name) = task.activity_name.as_deref()
-            && crate::activity_pause::activity_pause_suppresses_timeout(
+            // Authoritative PAUSED re-check under the execution row lock
+            // (issue #609 post-review hardening, second bot-review round):
+            // the scan snapshot's PAUSED exclusions are non-locking, so a
+            // pause committing after the scan — or while this transaction
+            // waited on the lock `pause_workflow_execution` itself holds —
+            // must be honoured here or the timeout lands mid-pause. See
+            // `pause_suppresses_timeout_enforcement` for the per-reason
+            // scoping (schedule_to_close always; schedule_to_start only
+            // for a now-frozen row; heartbeat/start-to-close pause-blind).
+            if pause_suppresses_timeout_enforcement(
                 reason,
-                crate::activity_pause::is_activity_paused(conn, activity_name).await?,
-            )
-        {
-            return Ok(false);
-        }
-        // Authoritative PAUSED re-check under the execution row lock
-        // (issue #609 post-review hardening, second bot-review round):
-        // the scan snapshot's PAUSED exclusions are non-locking, so a
-        // pause committing after the scan — or while this transaction
-        // waited on the lock `pause_workflow_execution` itself holds —
-        // must be honoured here or the timeout lands mid-pause. See
-        // `pause_suppresses_timeout_enforcement` for the per-reason
-        // scoping (schedule_to_close always; schedule_to_start only
-        // for a now-frozen row; heartbeat/start-to-close pause-blind).
-        if pause_suppresses_timeout_enforcement(
-            reason,
-            &execution.state,
-            row_schedule_to_close_at,
-            Utc::now(),
-        ) {
-            return Ok(false);
-        }
-        // (The queue-pause re-check runs at the TOP of this transaction, before
-        // the row locks above — see the lock-ordering note there.)
-        let activity_id = match pending_activity_id_for_task(&history.events, task, activity_name) {
-            Ok(Some(activity_id)) => activity_id,
-            Ok(None) => return Ok(false),
-            Err(missing_error) => {
-                let fallback = missing_error.to_string();
-                queue::fail_task(conn, task.id, &fallback).await?;
+                &execution.state,
+                row_schedule_to_close_at,
+                Utc::now(),
+            ) {
                 return Ok(false);
             }
-        };
-        let timeout_event = WorkflowEvent::ActivityTimedOut {
-            activity_id,
-            timeout_type: reason.timeout_type(),
-        };
-        store::append_events_with_codecs(
-            conn,
-            exec_id,
-            &[timeout_event],
-            history.next_event_id,
-            codecs,
-        )
-        .await?;
-        queue::fail_task(conn, task.id, &error).await?;
-        queue::wake_workflow_task(conn, exec_id).await?;
-        Ok(true)
-    }))
+            // (The queue-pause re-check runs at the TOP of this transaction, before
+            // the row locks above — see the lock-ordering note there.)
+            let activity_id =
+                match pending_activity_id_for_task(&history.events, task, activity_name) {
+                    Ok(Some(activity_id)) => activity_id,
+                    Ok(None) => return Ok(false),
+                    Err(missing_error) => {
+                        let fallback = missing_error.to_string();
+                        queue::fail_task(conn, task.id, &fallback).await?;
+                        return Ok(false);
+                    }
+                };
+            let timeout_event = WorkflowEvent::ActivityTimedOut {
+                activity_id,
+                timeout_type: reason.timeout_type(),
+            };
+            store::append_events_with_codecs(
+                conn,
+                exec_id,
+                &[timeout_event],
+                history.next_event_id,
+                codecs,
+            )
+            .await?;
+            queue::fail_task(conn, task.id, &error).await?;
+            queue::wake_workflow_task(conn, exec_id).await?;
+            Ok(true)
+        }),
+    ))
     .await?;
 
     // Circuit breaker (issue #369): a start-to-close / heartbeat timeout against
@@ -1602,7 +1631,9 @@ pub async fn force_fail_activity(
     let exec_id = execution_id_from_uuid(workflow_exec_id);
     let reason = reason.map(str::to_owned);
 
-    Box::pin(
+    // `wake_workflow_task` below raises a dispatch hint (issue #1429). The
+    // scope ties its publish to this transaction's commit.
+    crate::dispatch::buffered_settled(Box::pin(
         conn.transaction::<ForceFailActivityOutcome, HarvestError, _>(async |conn| {
             // Lock ordering (harvest_task_queue convention, see the comment in
             // `enforce_external_task_timeouts`): execution row FIRST, then the
@@ -1766,7 +1797,7 @@ pub async fn force_fail_activity(
                 already_forced: false,
             })
         }),
-    )
+    ))
     .await
 }
 
@@ -1788,118 +1819,127 @@ async fn enforce_workflow_timeout(
     // review). Without it, a `repeatable read` session default lets this
     // enforcer time out the whole execution after a pause was acknowledged.
     let mut tx = conn.build_transaction().read_committed();
-    let enforced = Box::pin(tx.run::<_, HarvestError, _>(async |conn| {
-        // Authoritative QUEUE-pause re-check (issue #619), the exact mirror of
-        // the one in `enforce_activity_timeout` — see that function for the full
-        // rationale on why an advisory lock (not a bare re-read) is required and
-        // why the lock must be taken BEFORE any row is touched.
-        //
-        // This path needs it for the same reason: `find_timed_out_tasks` does
-        // not filter on `task_type`, so a PENDING **workflow** task carrying
-        // `schedule_to_start` reaches here exactly as an activity task does, and
-        // the scan's queue-pause carve-out is only a non-locking snapshot. A
-        // pause committing after that snapshot would otherwise let this
-        // transaction append `WorkflowFailed` and seal the whole execution
-        // `TIMED_OUT` — strictly worse than the activity case, which fails one
-        // task, and precisely the outcome AC3/AC4 forbid.
-        //
-        // Bailing here also skips the execution/history loads below, so the
-        // advisory-lock wait cannot widen the window between reading
-        // `history.next_event_id` and appending at it (those loads used to sit
-        // outside this transaction; they are inside it now for that reason).
-        //
-        // Returning `None` — rather than proceeding with no writes — is
-        // load-bearing beyond the appends: it also skips
-        // `maybe_increment_schedule_failure_counter` below, so a deliberately
-        // held task can never count toward the schedule auto-pause threshold
-        // (issue #360). A hold is not a schedule failure.
-        if matches!(reason, TimeoutReason::ScheduleToStart) {
-            // Shared mode, exactly as in `enforce_activity_timeout` — and it
-            // matters more here, because this transaction holds the lock across
-            // `append_events`, the parent-close cascade and trigger evaluation,
-            // so an exclusive lock would stall dispatch on an unpaused queue for
-            // that entire span. See `lock_queue_for_timeout_recheck`.
-            crate::queue_pause::lock_queue_for_timeout_recheck(conn, &task.queue_name).await?;
-            if crate::queue_pause::queue_pause_suppresses_timeout(
-                reason,
-                crate::queue_pause::is_queue_paused(conn, &task.queue_name).await?,
-            ) {
-                return Ok(None);
-            }
-            // Same stale-scan guard as the activity path, and it matters more
-            // here: this path seals the whole execution `TIMED_OUT` rather than
-            // failing one task, so acting on a deadline a completed resume has
-            // already credited forward destroys the run the hold was protecting.
+    // `wake_parent_for_child_timeout` below raises a dispatch hint (issue
+    // #1429). The scope ties its publish to this transaction's commit.
+    //
+    // `enforce_timeouts_once_on_conn_shard` calls this once per timed-out
+    // workflow task in its own sweep loop, the same reason
+    // `enforce_activity_timeout` above switched (Codex review, issue
+    // #1429).
+    let enforced = crate::dispatch::buffered_settled_in_background(Box::pin(
+        tx.run::<_, HarvestError, _>(async |conn| {
+            // Authoritative QUEUE-pause re-check (issue #619), the exact mirror of
+            // the one in `enforce_activity_timeout` — see that function for the full
+            // rationale on why an advisory lock (not a bare re-read) is required and
+            // why the lock must be taken BEFORE any row is touched.
             //
-            // Unlocked fast path, for the same lock-ordering reason as the
-            // activity path (round-22 review); the authoritative locked re-read
-            // runs below, once the execution row is held.
-            if !schedule_to_start_still_expired_unlocked(conn, task.id).await? {
+            // This path needs it for the same reason: `find_timed_out_tasks` does
+            // not filter on `task_type`, so a PENDING **workflow** task carrying
+            // `schedule_to_start` reaches here exactly as an activity task does, and
+            // the scan's queue-pause carve-out is only a non-locking snapshot. A
+            // pause committing after that snapshot would otherwise let this
+            // transaction append `WorkflowFailed` and seal the whole execution
+            // `TIMED_OUT` — strictly worse than the activity case, which fails one
+            // task, and precisely the outcome AC3/AC4 forbid.
+            //
+            // Bailing here also skips the execution/history loads below, so the
+            // advisory-lock wait cannot widen the window between reading
+            // `history.next_event_id` and appending at it (those loads used to sit
+            // outside this transaction; they are inside it now for that reason).
+            //
+            // Returning `None` — rather than proceeding with no writes — is
+            // load-bearing beyond the appends: it also skips
+            // `maybe_increment_schedule_failure_counter` below, so a deliberately
+            // held task can never count toward the schedule auto-pause threshold
+            // (issue #360). A hold is not a schedule failure.
+            if matches!(reason, TimeoutReason::ScheduleToStart) {
+                // Shared mode, exactly as in `enforce_activity_timeout` — and it
+                // matters more here, because this transaction holds the lock across
+                // `append_events`, the parent-close cascade and trigger evaluation,
+                // so an exclusive lock would stall dispatch on an unpaused queue for
+                // that entire span. See `lock_queue_for_timeout_recheck`.
+                crate::queue_pause::lock_queue_for_timeout_recheck(conn, &task.queue_name).await?;
+                if crate::queue_pause::queue_pause_suppresses_timeout(
+                    reason,
+                    crate::queue_pause::is_queue_paused(conn, &task.queue_name).await?,
+                ) {
+                    return Ok(None);
+                }
+                // Same stale-scan guard as the activity path, and it matters more
+                // here: this path seals the whole execution `TIMED_OUT` rather than
+                // failing one task, so acting on a deadline a completed resume has
+                // already credited forward destroys the run the hold was protecting.
+                //
+                // Unlocked fast path, for the same lock-ordering reason as the
+                // activity path (round-22 review); the authoritative locked re-read
+                // runs below, once the execution row is held.
+                if !schedule_to_start_still_expired_unlocked(conn, task.id).await? {
+                    return Ok(None);
+                }
+            }
+
+            // Lock the execution row BEFORE any task row (round-22 review). This
+            // path used to read the execution unlocked and only take the row lock
+            // implicitly, inside `store::append_events` below — which left the
+            // locked `schedule_to_start` re-read above it, inverting the documented
+            // execution-row -> task-row order. Locking here also loads the history
+            // in the same call, replacing a separate `store::load_history`.
+            let (execution, history) =
+                lock_workflow_execution_row_and_load_history(conn, exec_id, codecs).await?;
+            // Authoritative deadline re-read, now correctly ordered after the
+            // execution lock. See the activity path for why the unlocked check
+            // above cannot be trusted on its own.
+            if matches!(reason, TimeoutReason::ScheduleToStart)
+                && !schedule_to_start_still_expired(conn, task.id).await?
+            {
                 return Ok(None);
             }
-        }
+            let error = timeout_error(&execution.workflow_name, reason);
+            let workflow_event = WorkflowEvent::workflow_failed(error.clone());
 
-        // Lock the execution row BEFORE any task row (round-22 review). This
-        // path used to read the execution unlocked and only take the row lock
-        // implicitly, inside `store::append_events` below — which left the
-        // locked `schedule_to_start` re-read above it, inverting the documented
-        // execution-row -> task-row order. Locking here also loads the history
-        // in the same call, replacing a separate `store::load_history`.
-        let (execution, history) =
-            lock_workflow_execution_row_and_load_history(conn, exec_id, codecs).await?;
-        // Authoritative deadline re-read, now correctly ordered after the
-        // execution lock. See the activity path for why the unlocked check
-        // above cannot be trusted on its own.
-        if matches!(reason, TimeoutReason::ScheduleToStart)
-            && !schedule_to_start_still_expired(conn, task.id).await?
-        {
-            return Ok(None);
-        }
-        let error = timeout_error(&execution.workflow_name, reason);
-        let workflow_event = WorkflowEvent::workflow_failed(error.clone());
-
-        store::append_events_with_codecs(
-            conn,
-            exec_id,
-            &[workflow_event],
-            history.next_event_id,
-            codecs,
-        )
-        .await?;
-        update_workflow_execution_timed_out(conn, exec_id, &error).await?;
-        queue::fail_task(conn, task.id, &error).await?;
-        let (mut deferred, closed_children) =
-            apply_parent_close_cascade(conn, exec_id, codecs).await?;
-        let mut pending_cancel_metrics = Vec::new();
-        let triggers =
-            crate::completion_trigger::evaluate_triggers_for_execution_collecting_with_codecs(
+            store::append_events_with_codecs(
                 conn,
                 exec_id,
-                crate::completion_trigger::TerminalState::TimedOut,
-                Some(metrics),
-                &mut pending_cancel_metrics,
+                &[workflow_event],
+                history.next_event_id,
                 codecs,
             )
             .await?;
-        deferred.extend(triggers);
-        if execution.parent_close_policy.is_none()
-            && let Some(parent_uuid) = execution.parent_id
-        {
-            wake_parent_for_child_timeout(
-                conn,
-                execution_id_from_uuid(parent_uuid),
-                exec_id,
-                &error,
-            )
-            .await?;
-        }
-        Ok(Some((
-            execution,
-            deferred,
-            closed_children,
-            pending_cancel_metrics,
-        )))
-    }))
+            update_workflow_execution_timed_out(conn, exec_id, &error).await?;
+            queue::fail_task(conn, task.id, &error).await?;
+            let (mut deferred, closed_children) =
+                apply_parent_close_cascade(conn, exec_id, codecs).await?;
+            let mut pending_cancel_metrics = Vec::new();
+            let triggers =
+                crate::completion_trigger::evaluate_triggers_for_execution_collecting_with_codecs(
+                    conn,
+                    exec_id,
+                    crate::completion_trigger::TerminalState::TimedOut,
+                    Some(metrics),
+                    &mut pending_cancel_metrics,
+                    codecs,
+                )
+                .await?;
+            deferred.extend(triggers);
+            if execution.parent_close_policy.is_none()
+                && let Some(parent_uuid) = execution.parent_id
+            {
+                wake_parent_for_child_timeout(
+                    conn,
+                    execution_id_from_uuid(parent_uuid),
+                    exec_id,
+                    &error,
+                )
+                .await?;
+            }
+            Ok(Some((
+                execution,
+                deferred,
+                closed_children,
+                pending_cancel_metrics,
+            )))
+        }),
+    ))
     .await?;
 
     // Suppressed by a queue pause: nothing was written, so there is nothing to
@@ -2025,111 +2065,124 @@ pub async fn enforce_external_task_timeouts(conn: &mut AsyncPgConnection) -> Har
             timeout_type: TimeoutType::ScheduleToClose,
         };
 
-        let result = Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
-            // Per-table lock-ordering convention (issue #609
-            // post-review hardening, third bot-review round):
-            //
-            //   harvest_external_tasks: task row → execution row
-            //   harvest_task_queue:     execution row → task row
-            //
-            // The external-task completion paths (`external_task.rs`'s
-            // `complete_externally`/`fail_externally`/`extend_deadline`)
-            // lock the task row first via `lock_task`, then lock the
-            // execution row inside `store::append_single_event` — so
-            // this scanner MUST lock the task row first too. An
-            // earlier revision took the execution row lock first,
-            // which was an ABBA inversion against a concurrent
-            // completion: Postgres deadlock-detects and aborts one of
-            // the two transactions, surfacing spurious errors to
-            // valid external-completion callers. (The task-queue
-            // enforcers — `enforce_activity_timeout`,
-            // `worker::record_schedule_to_close_activity_timeout` —
-            // follow the *opposite*, execution-first convention for
-            // `harvest_task_queue` rows; that is safe because no
-            // task-queue writer locks the task row and then the
-            // execution row, e.g. `queue::requeue_for_retry` touches
-            // only the task row. The one external-task writer that
-            // must run execution-first — resume's pause-span shift,
-            // `execution::shift_external_schedule_to_close_on_resume_query`,
-            // which lives inside the execution-locked resume
-            // transaction — uses `FOR UPDATE SKIP LOCKED` so it never
-            // waits on a task row and cannot join a lock cycle.)
-            //
-            // The locked re-read below replaces trusting the scan
-            // snapshot (the pre-fix code re-verified it via filters
-            // on the claiming UPDATE instead).
-            let locked_row: Option<(String, chrono::DateTime<Utc>)> = harvest_external_tasks::table
-                .find(task_id)
-                .for_update()
-                .select((
-                    harvest_external_tasks::state,
-                    harvest_external_tasks::schedule_to_close_at,
-                ))
-                .first(conn)
-                .await
-                .optional()
-                .map_err(crate::error::database_error)?;
-            let Some((task_state, deadline)) = locked_row else {
-                // Row vanished after the scan (e.g. retention
-                // cascade-deleted the owning execution): skip.
-                return Ok(false);
-            };
-            // Guard against two races the scan snapshot cannot see:
-            // 1. complete/fail landed after our scan → state != PENDING
-            // 2. heartbeat (or a resume's pause-span shift, issue
-            //    #609) extended the deadline after our scan →
-            //    schedule_to_close_at is now in the future
-            // Either way: skip — no flip, no event, not counted.
-            if !external_task_timeout_still_due(&task_state, deadline, Utc::now()) {
-                return Ok(false);
-            }
+        // `wake_workflow_task` below raises a dispatch hint (issue #1429).
+        // This scanner claims one row per loop iteration, the same shape as
+        // the three outbox sweeps `buffered_settled_in_background` already
+        // covers. An inline `buffered_settled` awaits the dispatch
+        // channel's publish call after every commit. That can cost up to
+        // `DISPATCH_CALL_TIMEOUT` per row when the channel is slow (Codex
+        // review, issue #1429). Postgres already committed by then.
+        // Reconciliation is the durability fallback regardless, so
+        // `buffered_settled_in_background` hands the hint to the existing
+        // non-blocking background publisher instead of awaiting it inline.
+        let result = crate::dispatch::buffered_settled_in_background(Box::pin(
+            conn.transaction::<bool, HarvestError, _>(async |conn| {
+                // Per-table lock-ordering convention (issue #609
+                // post-review hardening, third bot-review round):
+                //
+                //   harvest_external_tasks: task row → execution row
+                //   harvest_task_queue:     execution row → task row
+                //
+                // The external-task completion paths (`external_task.rs`'s
+                // `complete_externally`/`fail_externally`/`extend_deadline`)
+                // lock the task row first via `lock_task`, then lock the
+                // execution row inside `store::append_single_event` — so
+                // this scanner MUST lock the task row first too. An
+                // earlier revision took the execution row lock first,
+                // which was an ABBA inversion against a concurrent
+                // completion: Postgres deadlock-detects and aborts one of
+                // the two transactions, surfacing spurious errors to
+                // valid external-completion callers. (The task-queue
+                // enforcers — `enforce_activity_timeout`,
+                // `worker::record_schedule_to_close_activity_timeout` —
+                // follow the *opposite*, execution-first convention for
+                // `harvest_task_queue` rows; that is safe because no
+                // task-queue writer locks the task row and then the
+                // execution row, e.g. `queue::requeue_for_retry` touches
+                // only the task row. The one external-task writer that
+                // must run execution-first — resume's pause-span shift,
+                // `execution::shift_external_schedule_to_close_on_resume_query`,
+                // which lives inside the execution-locked resume
+                // transaction — uses `FOR UPDATE SKIP LOCKED` so it never
+                // waits on a task row and cannot join a lock cycle.)
+                //
+                // The locked re-read below replaces trusting the scan
+                // snapshot (the pre-fix code re-verified it via filters
+                // on the claiming UPDATE instead).
+                let locked_row: Option<(String, chrono::DateTime<Utc>)> =
+                    harvest_external_tasks::table
+                        .find(task_id)
+                        .for_update()
+                        .select((
+                            harvest_external_tasks::state,
+                            harvest_external_tasks::schedule_to_close_at,
+                        ))
+                        .first(conn)
+                        .await
+                        .optional()
+                        .map_err(crate::error::database_error)?;
+                let Some((task_state, deadline)) = locked_row else {
+                    // Row vanished after the scan (e.g. retention
+                    // cascade-deleted the owning execution): skip.
+                    return Ok(false);
+                };
+                // Guard against two races the scan snapshot cannot see:
+                // 1. complete/fail landed after our scan → state != PENDING
+                // 2. heartbeat (or a resume's pause-span shift, issue
+                //    #609) extended the deadline after our scan →
+                //    schedule_to_close_at is now in the future
+                // Either way: skip — no flip, no event, not counted.
+                if !external_task_timeout_still_due(&task_state, deadline, Utc::now()) {
+                    return Ok(false);
+                }
 
-            // THEN the execution row lock — the same lock
-            // `pause_workflow_execution`/`resume_workflow_execution`
-            // hold — so the PAUSED re-check, the external-task state
-            // flip, and the event append below all serialize with the
-            // pause path (issue #609 post-review hardening, second
-            // bot-review round): the pause-suppression guarantee is
-            // unchanged by the task-first reordering. A vanished
-            // execution row (None) proceeds and surfaces as
-            // `append_single_event`'s NotFound, matching the
-            // pre-existing behaviour.
-            let execution_state: Option<String> = harvest_workflow_executions::table
-                .find(exec_uuid)
-                .for_update()
-                .select(harvest_workflow_executions::state)
-                .first(conn)
-                .await
-                .optional()
-                .map_err(crate::error::database_error)?;
-            if execution_state.as_deref().is_some_and(|state| {
-                pause_suppresses_timeout_enforcement(
-                    &TimeoutReason::ScheduleToClose,
-                    state,
-                    None,
-                    Utc::now(),
-                )
-            }) {
-                // Pause won the race: leave the row PENDING and
-                // untouched — the resume-time deadline shift covers it.
-                return Ok(false);
-            }
+                // THEN the execution row lock — the same lock
+                // `pause_workflow_execution`/`resume_workflow_execution`
+                // hold — so the PAUSED re-check, the external-task state
+                // flip, and the event append below all serialize with the
+                // pause path (issue #609 post-review hardening, second
+                // bot-review round): the pause-suppression guarantee is
+                // unchanged by the task-first reordering. A vanished
+                // execution row (None) proceeds and surfaces as
+                // `append_single_event`'s NotFound, matching the
+                // pre-existing behaviour.
+                let execution_state: Option<String> = harvest_workflow_executions::table
+                    .find(exec_uuid)
+                    .for_update()
+                    .select(harvest_workflow_executions::state)
+                    .first(conn)
+                    .await
+                    .optional()
+                    .map_err(crate::error::database_error)?;
+                if execution_state.as_deref().is_some_and(|state| {
+                    pause_suppresses_timeout_enforcement(
+                        &TimeoutReason::ScheduleToClose,
+                        state,
+                        None,
+                        Utc::now(),
+                    )
+                }) {
+                    // Pause won the race: leave the row PENDING and
+                    // untouched — the resume-time deadline shift covers it.
+                    return Ok(false);
+                }
 
-            // The task row is locked and verified above, so a plain
-            // flip suffices — no re-filters needed.
-            diesel::update(harvest_external_tasks::table.find(task_id))
-                .set((
-                    harvest_external_tasks::state.eq("TIMED_OUT"),
-                    harvest_external_tasks::updated_at.eq(Utc::now()),
-                ))
-                .execute(conn)
-                .await
-                .map_err(crate::error::database_error)?;
+                // The task row is locked and verified above, so a plain
+                // flip suffices — no re-filters needed.
+                diesel::update(harvest_external_tasks::table.find(task_id))
+                    .set((
+                        harvest_external_tasks::state.eq("TIMED_OUT"),
+                        harvest_external_tasks::updated_at.eq(Utc::now()),
+                    ))
+                    .execute(conn)
+                    .await
+                    .map_err(crate::error::database_error)?;
 
-            store::append_single_event(conn, exec_id, timeout_event).await?;
-            queue::wake_workflow_task(conn, exec_id).await?;
-            Ok(true)
-        }))
+                store::append_single_event(conn, exec_id, timeout_event).await?;
+                queue::wake_workflow_task(conn, exec_id).await?;
+                Ok(true)
+            }),
+        ))
         .await;
 
         match result {
@@ -3167,7 +3220,14 @@ pub async fn enforce_external_signals_outbox(
         let codecs_clone = codecs.clone();
         let excluded_clone = excluded_event_ids.clone();
 
-        let step_res: Result<Option<(bool, Option<i64>)>, HarvestError> = Box::pin(conn
+        // The terminal-event append below can raise a dispatch hint through
+        // `wake_workflow_task` (issue #1429). The scope ties its publish to
+        // this step transaction's commit. This loop claims one outbox row
+        // per iteration. A synchronous per-row publish (`buffered_settled`)
+        // would pay a Redis round trip once per row. It would stall the
+        // sweep when the channel is slow (Codex review, issue #1429). Hand
+        // hints to the background publisher instead.
+        let step_res: Result<Option<(bool, Option<i64>)>, HarvestError> = crate::dispatch::buffered_settled_in_background(Box::pin(conn
             .transaction::<Option<(bool, Option<i64>)>, HarvestError, _>(async |conn| {
                 let shards = shards_clone;
                 let codecs = codecs_clone;
@@ -3401,7 +3461,7 @@ pub async fn enforce_external_signals_outbox(
                 } else {
                     Ok(Some((false, Some(row.id))))
                 }
-            }))
+            })))
             .await;
 
         match step_res {
@@ -3675,7 +3735,14 @@ pub async fn enforce_external_cancels_outbox(
         let codecs_clone = codecs.clone();
         let excluded_clone = excluded_event_ids.clone();
 
-        let step_res: Result<Option<CancelStepOutcome>, HarvestError> = Box::pin(conn
+        // The terminal-event append below can raise a dispatch hint through
+        // `wake_workflow_task` (issue #1429). The scope ties its publish to
+        // this step transaction's commit. This loop claims one outbox row
+        // per iteration. A synchronous per-row publish (`buffered_settled`)
+        // would pay a Redis round trip once per row. It would stall the
+        // sweep when the channel is slow (Codex review, issue #1429). Hand
+        // hints to the background publisher instead.
+        let step_res: Result<Option<CancelStepOutcome>, HarvestError> = crate::dispatch::buffered_settled_in_background(Box::pin(conn
             .transaction::<Option<CancelStepOutcome>, HarvestError, _>(async |conn| {
                 let shards = shards_clone;
                 let codecs = codecs_clone;
@@ -4056,7 +4123,7 @@ pub async fn enforce_external_cancels_outbox(
                 } else {
                     Ok(Some((false, Some(row.id), deferred_starts, cancel_metrics, deferred_checks, caller_shard)))
                 }
-            }))
+            })))
             .await;
 
         match step_res {
@@ -4336,7 +4403,14 @@ pub async fn enforce_external_awaits_outbox(
         let codecs_clone = codecs.clone();
         let excluded_clone = excluded_event_ids.clone();
 
-        let step_res: Result<Option<(bool, Option<i64>)>, HarvestError> = Box::pin(conn
+        // The terminal-event append below can raise a dispatch hint through
+        // `wake_workflow_task` (issue #1429). The scope ties its publish to
+        // this step transaction's commit. This loop claims one outbox row
+        // per iteration. A synchronous per-row publish (`buffered_settled`)
+        // would pay a Redis round trip once per row. It would stall the
+        // sweep when the channel is slow (Codex review, issue #1429). Hand
+        // hints to the background publisher instead.
+        let step_res: Result<Option<(bool, Option<i64>)>, HarvestError> = crate::dispatch::buffered_settled_in_background(Box::pin(conn
             .transaction::<Option<(bool, Option<i64>)>, HarvestError, _>(async |conn| {
                 let shards = shards_clone;
                 let codecs = codecs_clone;
@@ -4565,7 +4639,7 @@ pub async fn enforce_external_awaits_outbox(
                 } else {
                     Ok(Some((false, Some(row.id))))
                 }
-            }))
+            })))
             .await;
 
         match step_res {
@@ -5247,8 +5321,16 @@ pub async fn enforce_workflow_history_ceiling_with_codecs(
         let workflow_name = row.workflow_name.clone();
         let queue_name = row.queue_name.clone();
 
+        // `wake_parent_for_child_timeout` below raises a dispatch hint
+        // (issue #1429). This scanner claims one row per loop iteration,
+        // the same shape as the outbox sweeps and the external-task
+        // timeout scanner. Those already use `buffered_settled_in_background`
+        // (Codex review, issue #1429). That function hands the hint to the
+        // existing non-blocking background publisher instead of awaiting
+        // it inline. Reconciliation is the durability fallback regardless
+        // of when the hint reaches the channel.
         let (applied, deferred_starts, closed_children, pending_cancel_metrics) =
-            Box::pin(conn.transaction::<(
+            crate::dispatch::buffered_settled_in_background(Box::pin(conn.transaction::<(
                 bool,
                 Vec<crate::completion_trigger::DeferredTriggerStart>,
                 Vec<(ExecutionId, String)>,
@@ -5329,7 +5411,7 @@ pub async fn enforce_workflow_history_ceiling_with_codecs(
                     .await?;
                 deferred.extend(triggers);
                 Ok((true, deferred, closed_children, pending_cancel_metrics))
-            }))
+            })))
             .await?;
 
         if !applied {

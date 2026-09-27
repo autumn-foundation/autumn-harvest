@@ -84,6 +84,43 @@ pub struct EffectiveConfigView {
     pub features: FeatureFlagsView,
     /// Resolved database pool sizing.
     pub pool: PoolConfigView,
+    /// Redis dispatch channel section (issue #1429). `None` when the caller
+    /// does not evaluate Redis dispatch at all, such as a direct embedder
+    /// that skips `autumn-harvest-plugin`.
+    pub dispatch: Option<DispatchConfigView>,
+}
+
+/// Redis dispatch channel section of the effective-config snapshot (issue #1429).
+///
+/// Secret-free by construction: [`endpoint`](Self::endpoint) carries only the
+/// credential-free form a `HarvestRedisConfig::redacted_url` call already
+/// produces, never the raw URL.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DispatchConfigView {
+    /// Whether the Redis dispatch channel is installed and live for this process.
+    pub installed: bool,
+    /// The channel endpoint, credential-free. `None` when dispatch is off.
+    pub endpoint: Option<String>,
+    /// Prefix for every key the channel owns, for a single-shard install.
+    /// `None` on a multi-shard install, which has one prefix per shard; see
+    /// [`key_prefixes`](Self::key_prefixes) instead.
+    pub key_prefix: Option<String>,
+    /// One key-family prefix per shard, for a multi-shard install (issue
+    /// #1429 review). `None` on a single-shard install, which reports its
+    /// one prefix through [`key_prefix`](Self::key_prefix) instead. A
+    /// multi-shard install has no single key family for
+    /// `/admin/config` to report under `key_prefix` alone.
+    pub key_prefixes: Option<Vec<String>>,
+    /// Redis Streams consumer group the workers join.
+    pub consumer_group: Option<String>,
+    /// Time a delivered reference may stay unacked before recovery.
+    pub visibility_timeout_ms: Option<u64>,
+    /// Wait for one blocking read when the channel is idle.
+    pub poll_interval_ms: Option<u64>,
+    /// Interval for the reconcile sweep over due `PENDING` rows.
+    pub reconcile_interval_ms: Option<u64>,
+    /// Row cap for one reconcile sweep per queue.
+    pub reconcile_batch: Option<usize>,
 }
 
 /// Secret-free projection of [`WorkerConfig`].
@@ -685,7 +722,9 @@ impl EffectiveConfigView {
     /// [`BuiltHarvest`](crate::builder::BuiltHarvest) and database pool.
     /// `resolved_sharding` is the resolved-runtime-pool override for the two
     /// [`WorkerConfigView`] sharded-pool fields (`None` = fall back to the
-    /// `WorkerConfig::sharded_pool` knob; the pure no-DB path).
+    /// `WorkerConfig::sharded_pool` knob; the pure no-DB path). `dispatch` is
+    /// the Redis dispatch section (issue #1429); `None` when the caller does
+    /// not evaluate Redis dispatch.
     #[must_use]
     pub fn capture(
         worker: &WorkerConfig,
@@ -694,6 +733,7 @@ impl EffectiveConfigView {
         pool: PoolConfigView,
         poll_interval: Duration,
         resolved_sharding: Option<ShardedInfo>,
+        dispatch: Option<DispatchConfigView>,
     ) -> Self {
         Self {
             worker: WorkerConfigView::from_worker_config_with_resolved_sharding(
@@ -705,6 +745,7 @@ impl EffectiveConfigView {
             shard_topology: ShardTopologyView::from_router(router),
             features: compiled_feature_flags(),
             pool,
+            dispatch,
         }
     }
 }
@@ -1064,6 +1105,7 @@ mod tests {
             },
             Duration::from_millis(500),
             None,
+            None,
         );
         let json = serde_json::to_value(&view).expect("serialize");
         for key in [
@@ -1072,6 +1114,7 @@ mod tests {
             "shard_topology",
             "features",
             "pool",
+            "dispatch",
         ] {
             assert!(
                 json.as_object().unwrap().contains_key(key),
@@ -1080,6 +1123,64 @@ mod tests {
         }
         assert_eq!(json["pool"]["worker_pool_max_connections"], 10);
         assert_eq!(json["pool"]["shard_pool_count"], 1);
+        assert!(json["dispatch"].is_null());
+    }
+
+    #[test]
+    fn dispatch_view_reports_installed_state_and_tuning() {
+        let view = DispatchConfigView {
+            installed: true,
+            endpoint: Some("redis://dbhost:6379".to_string()),
+            key_prefix: Some("harvest".to_string()),
+            key_prefixes: None,
+            consumer_group: Some("harvest_workers".to_string()),
+            visibility_timeout_ms: Some(60_000),
+            poll_interval_ms: Some(20),
+            reconcile_interval_ms: Some(1_000),
+            reconcile_batch: Some(1_000),
+        };
+        let json = serde_json::to_value(&view).expect("serialize");
+        assert_eq!(json["installed"], true);
+        assert_eq!(json["endpoint"], "redis://dbhost:6379");
+        assert_eq!(json["key_prefix"], "harvest");
+        assert_eq!(json["consumer_group"], "harvest_workers");
+        assert_eq!(json["visibility_timeout_ms"], 60_000);
+        assert_eq!(json["poll_interval_ms"], 20);
+        assert_eq!(json["reconcile_interval_ms"], 1_000);
+        assert_eq!(json["reconcile_batch"], 1_000);
+    }
+
+    #[test]
+    fn dispatch_view_never_leaks_a_connection_url() {
+        // The caller must pass the already-redacted endpoint. This test pins
+        // that the view itself has no field that could carry the raw URL.
+        let view = DispatchConfigView {
+            installed: false,
+            endpoint: None,
+            key_prefix: None,
+            key_prefixes: None,
+            consumer_group: None,
+            visibility_timeout_ms: None,
+            poll_interval_ms: None,
+            reconcile_interval_ms: None,
+            reconcile_batch: None,
+        };
+        let json = serde_json::to_string(&view).expect("serialize");
+        assert!(!json.contains("://"), "leaked a URL scheme: {json}");
+        assert_eq!(
+            view,
+            DispatchConfigView {
+                installed: false,
+                endpoint: None,
+                key_prefix: None,
+                key_prefixes: None,
+                consumer_group: None,
+                visibility_timeout_ms: None,
+                poll_interval_ms: None,
+                reconcile_interval_ms: None,
+                reconcile_batch: None,
+            }
+        );
     }
 
     #[test]

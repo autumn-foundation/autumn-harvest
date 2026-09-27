@@ -3576,6 +3576,55 @@
             }
           ],
           "description": "Per-shard task dispatch rate (issue #961). The shard-dimension twin of the per-queue dispatch panel: a multi-shard worker round-robins across its assigned shards, so a shard flatlining at 0 while siblings are busy means it is being starved or has no covering poller. Cross-check with 'Stranded pending tasks by shard'."
+        },
+        {
+          "id": 185254,
+          "type": "timeseries",
+          "title": "Dispatch dropped hints",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 84
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "harvest_dispatch_dropped_hints",
+              "legendFormat": "{{instance}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Alert: harvest_dispatch_dropped_hints. Running total of hints the Redis dispatch background publisher has dropped because its bounded queue was full (issue #1429), per process. A dropped hint costs latency only — the row stays PENDING and the worker's reconcile sweep republishes it — so this is a health signal, not a durability one. A step change means a burst; a steady climb means sustained saturation. Cross-check against 'Queue depth' and the Redis endpoint's own latency."
         }
       ]
     },
