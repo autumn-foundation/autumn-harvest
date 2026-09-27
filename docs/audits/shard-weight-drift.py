@@ -81,34 +81,50 @@ prior corrections below).** The specific collisions this docstring named
 above were all found under the old 11-shard layout and the 151-row manifest
 of 2026-09-22; neither number holds today. The manifest has grown to 156
 `linux` rows, and re-running this script against `SEMAPHORE_SHARD_COUNT = 21`
-finds a DIFFERENT set of five colliding shards — the rebalance moved the
+finds a DIFFERENT set of colliding shards — the rebalance moved the
 collision, exactly as this section already predicted it would, rather than
-removing it:
+removing it.
+
+**Second correction, same day (Codex review, this harness's own second PR,
+second round).** The paragraph above was itself regenerated once already on
+2026-09-27, then went stale again a few hours later, before this PR even
+merged: a `trunk-dev` merge landed mid-review (issue #1429's Redis dispatch
+follow-ups grew `dispatch_redis` from 21 to 33 tests, among other manifest
+changes), which pushed it over `HEAVY_THRESHOLD` and created a sixth
+collision this table did not have an hour earlier. That is not a mistake to
+correct once and move on from — it is this script's own thesis, demonstrated
+on itself: the manifest drifts fast enough that even a same-day hand-copied
+table can go stale before its own PR lands. The table below is regenerated
+one more time, from the tree this PR actually merges:
 
 | Shard | Colliding rows (ordinal, weight) |
 |---|---|
-| 4  | `shard_rebalance_db_tests` (88, 111), `workflow_rerun_integration` (151, 68) |
+| 4  | `shard_rebalance_db_tests` (88, 112), `workflow_rerun_integration` (151, 68) |
+| 6  | `admission_gate_authoritative` (6, 34), `dispatch_redis` (153, 33) |
 | 8  | `event_partitioning_tests` (29, 155), `rate_limit_bucket_gc_tests` (50, 30) |
-| 10 | `interface_schema_integration` (115, 31), `stall_diagnosis_integration` (136, 76) |
+| 10 | `interface_schema_integration` (115, 31), `stall_diagnosis_integration` (136, 79) |
 | 13 | `capability_miss_tests` (13, 46), `pacing_override_integration` (118, 46) |
 | 19 | `backup_verify_tests` (82, 57), `ui_integration` (145, 149) |
 
 None of the seven 09-22 pairs (shard 0's `integration_e2e`/
 `quota_enforcement_tests` among them) still collide at N=21 — they now land
-on five different, non-colliding shards each. The old table above is kept
-for its own history (three rounds of Codex-review corrections to the
-counting logic it caught, which are still the reason this script counts the
+on six different, non-colliding shards each. Both older tables above are
+kept for their own history (three rounds of Codex-review corrections to the
+counting logic itself, which are still the reason this script counts the
 way it does), not as a claim about today's manifest. Re-run the script for
-the current numbers; do not hand-copy either table into a future report.
+the current numbers; do not hand-copy any of these three tables into a
+future report.
 
-A sweep of `SEMAPHORE_SHARD_COUNT` from 9 through 24, re-run against today's
-156-row manifest, still finds NO value with zero heavy-suite collisions
-(`--sweep`'s own output, 2026-09-27): the best of the sixteen counts tried
-is 4 colliding shards (N=18, 19, 20, and 24), not 0, and N=21's own 5 is
-close to that floor while also holding the smallest max-shard/min-shard
-spread (214) of any count swept. Bumping `SEMAPHORE_SHARD_COUNT` again would
-likely just relocate the next collision rather than remove the failure mode
-— this script's job is to keep that visible, not to pick the next number.
+A sweep of `SEMAPHORE_SHARD_COUNT` from 9 through 24, re-run against the
+tree this PR actually merges, still finds NO value with zero heavy-suite
+collisions (`--sweep`'s own output, 2026-09-27): the best of the sixteen
+counts tried is 4 colliding shards (N=18 and N=20 only — N=19 and N=24, 4
+a few hours earlier, are 5 now for the same `dispatch_redis` reason above),
+not 0, and `SEMAPHORE_SHARD_COUNT`'s actual value of 21 carries 6 collisions
+while still holding the smallest max-shard/min-shard spread (214) of any
+count swept. Bumping `SEMAPHORE_SHARD_COUNT` again would likely just
+relocate the next collision rather than remove the failure mode — this
+script's job is to keep that visible, not to pick the next number.
 
 Why report-only: gating this now would redden every open PR on a
 pre-existing structural property nobody caused and this script cannot fix

@@ -38,26 +38,41 @@ abstract:
    report recorded (151 rows, `SEMAPHORE_SHARD_COUNT = 11`). None of the
    seven 09-22 collisions still collide — shard 0's `integration_e2e`/
    `quota_enforcement_tests` pair, the PR's headline example, now land on
-   shards 12 and 2 respectively, un-collided. Today's five collisions are a
+   shards 12 and 2 respectively, un-collided. Today's collisions are a
    different set entirely:
 
    | Shard | Colliding rows (ordinal, weight) |
    |---|---|
-   | 4  | `shard_rebalance_db_tests` (88, 111), `workflow_rerun_integration` (151, 68) |
+   | 4  | `shard_rebalance_db_tests` (88, 112), `workflow_rerun_integration` (151, 68) |
+   | 6  | `admission_gate_authoritative` (6, 34), `dispatch_redis` (153, 33) |
    | 8  | `event_partitioning_tests` (29, 155), `rate_limit_bucket_gc_tests` (50, 30) |
-   | 10 | `interface_schema_integration` (115, 31), `stall_diagnosis_integration` (136, 76) |
+   | 10 | `interface_schema_integration` (115, 31), `stall_diagnosis_integration` (136, 79) |
    | 13 | `capability_miss_tests` (13, 46), `pacing_override_integration` (118, 46) |
    | 19 | `backup_verify_tests` (82, 57), `ui_integration` (145, 149) |
 
    Re-running `--sweep` (N=9..24) against today's manifest confirms the
    PR's core claim still holds under today's data, not just 09-22's: no
-   swept count reaches zero heavy-suite collisions (floor is 4, at N=18,
-   19, 20, 24); `SEMAPHORE_SHARD_COUNT = 21` (today's actual value) carries
-   5 collisions but the smallest max/min shard-weight spread (214) of any
-   count tried. The rebalance (PR #1707) moved the collision, as the
-   script's own docstring already predicted it would, rather than removing
-   it — this is now demonstrated on two different manifests five days apart,
-   not asserted once.
+   swept count reaches zero heavy-suite collisions; the floor is 4, at
+   N=18 and N=20 only. The rebalance (PR #1707) moved the collision, as
+   the script's own docstring already predicted it would, rather than
+   removing it — this is now demonstrated on two different manifests five
+   days apart, not asserted once.
+
+   **This table itself went stale twice in one day (Codex review, this
+   PR's second round).** The numbers above were regenerated once already
+   earlier on 2026-09-27 (6 collisions became 5, `SEMAPHORE_SHARD_COUNT`
+   was still 21 but the specific shards differed from the 09-22 set) —
+   and then, before this PR merged, a `trunk-dev` merge landed mid-review
+   (issue #1429's Redis dispatch follow-ups grew `dispatch_redis` from 21
+   to 33 tests, crossing `HEAVY_THRESHOLD`), adding the shard-6 collision
+   above and dropping the sweep floor's N-values from {18, 19, 20, 24} to
+   {18, 20}. Both prior versions of this table are visible in this PR's
+   own commit history for anyone who wants the demonstration; this report
+   carries only the final numbers, from the tree this PR actually merges.
+   The lesson is the harness's own thesis proving itself on its own PR: a
+   report-only script's findings are a snapshot, correct only as of the
+   commit that generated them, and this repository's manifest moves fast
+   enough to falsify one within a single review cycle.
 
 ## 🔍 Diagnosis
 
@@ -159,8 +174,8 @@ grep -A3 '^\[features\]' autumn-harvest/Cargo.toml
 
 # After checking out this session's fix instead:
 python3 docs/audits/shard-weight-drift.py --self-test   # -> self-test: ok
-python3 docs/audits/shard-weight-drift.py                # -> 156 rows, 5 collisions, N=21
-python3 docs/audits/shard-weight-drift.py --sweep         # -> floor 4 collisions, N=18/19/20/24
+python3 docs/audits/shard-weight-drift.py                # -> 156 rows, 6 collisions, N=21
+python3 docs/audits/shard-weight-drift.py --sweep         # -> floor 4 collisions, N=18/20
 
 # Confirm trunk-dev head is green and no new failure signature:
 # (via actions_list/list_workflow_runs, event=pull_request, status=completed,
