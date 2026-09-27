@@ -768,16 +768,24 @@ def type_aliases_in(source: str, module: str = "") -> dict[str, list[TypeAlias]]
     """Each `type Name<P, ..> = Target;` in `source`, by name, with its module.
 
     `module` is the path of the file itself. An inline `mod name { .. }` adds
-    its name, as `struct_index` does for structs.
+    its name, as `struct_index` does for structs. Only a module-level alias is
+    read: one whose every enclosing block is a `mod`. An alias inside a fn or
+    another block is local to it, and the extractor alias layer reads it in
+    that scope. Each target goes through `canonical_paths`, as every other
+    type text does.
     """
     code = code_only(source)
     modules = block_owners(code, "mod")
     found: dict[str, list[TypeAlias]] = {}
     for alias in re.finditer(r"\btype\s+([A-Z]\w*)\s*(?:<([^=;]*)>)?\s*=\s*([^;]+);", code):
         inline = [name for start, end, name in sorted(modules) if start < alias.start() < end]
+        head = code[: alias.start()]
+        if head.count("{") - head.count("}") != len(inline):
+            continue
         path = "::".join(part for part in [module, *inline] if part)
         parameters = [part.strip() for part in split_expression(alias.group(2) or "", ",", types=True)]
-        found.setdefault(alias.group(1), []).append((path, parameters, alias.group(3).strip()))
+        target = canonical_paths(alias.group(3).strip())
+        found.setdefault(alias.group(1), []).append((path, parameters, target))
     return found
 
 
@@ -2231,6 +2239,23 @@ def wire_type(declared_type: str) -> str | None:
     return WIRE_TYPES.get(inner.group(1) if inner else declared_type)
 
 
+def duplicate_params(method: str, path: str, route: dict) -> list[str]:
+    """Check 6: each parameter's `(name, in)` pair is documented once.
+
+    OpenAPI requires the pair to be unique. A second entry would otherwise
+    collapse into the first before any check reads it, so it is reported.
+    """
+    counts: dict[tuple[str, str], int] = {}
+    for entry in route.get("params") or []:
+        key = (entry.get("name"), entry.get("in"))
+        counts[key] = counts.get(key, 0) + 1
+    return [
+        "  %s %s: `%s` is documented %d times in %s" % (method, path, name, count, where)
+        for (name, where), count in sorted(counts.items(), key=str)
+        if count > 1
+    ]
+
+
 def query_struct_findings(
     method: str, path: str, route: dict, queries: list[tuple[str, str, bool]]
 ) -> list[str]:
@@ -2610,6 +2635,10 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
     required_findings: list[str] = []
     unresolved: list[str] = []
     typed_query: list[str] = []
+    # Every contract route is checked for duplicate parameters, whether or
+    # not the router serves it.
+    for route in contract["routes"]:
+        typed_query += duplicate_params(route["method"], route["path"], route)
     missing = "  %s %s: cannot find struct %s"
     unread = "  %s %s: cannot read `%s` in %s"
     for method, path, handler in routes:
@@ -3091,11 +3120,43 @@ mod domain {
 }
 
 type Maybe<T> = Option<T>;
+type Opt<T> = std::option::Option<T>;
+
+fn with_block_alias() {
+    type Hidden<T> = Option<T>;
+}
 
 pub fn harvest_api_router() -> Router {
     Router::new()
         .route("/s/qualified-alias", post(s_qualified_alias))
         .route("/s/ambiguous-alias", post(s_ambiguous_alias))
+        .route("/s/qualified-target", post(s_qualified_target))
+        .route("/s/block-alias", post(s_block_alias))
+        .route("/s/dup-params/{id}", get(s_dup_params))
+}
+
+async fn s_qualified_target(Json(body): Json<QualifiedTarget>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn s_block_alias(Json(body): Json<BlockAliasField>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn s_dup_params(Path(id): Path<String>, Query(page): Query<Paging>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+struct QualifiedTarget {
+    note: Opt<String>,
+}
+
+struct BlockAliasField {
+    note: Hidden<String>,
+}
+
+struct Paging {
+    limit: Option<u32>,
 }
 
 async fn s_qualified_alias(Json(body): Json<QualifiedAliasField>) -> Response {
@@ -6941,6 +7002,40 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
         {
             "mandatory": ["POST /s/qualified-alias: `labels` is mandatory in QualifiedAliasField"],
             "unresolved": ["POST /s/ambiguous-alias: cannot read `Maybe` in AmbiguousAliasField"],
+        },
+    ),
+    (
+        "an alias target is canonical, and a block-local alias is not a field alias",
+        FIXTURE_ALIAS_SCOPES,
+        [
+            fixture_route(
+                "POST", "/s/qualified-target", 200, request_body=body_of(("note", False))
+            ),
+            fixture_route("POST", "/s/block-alias", 200, request_body=body_of(("note", False))),
+        ],
+        {"mandatory": ["POST /s/block-alias: `note` is mandatory in BlockAliasField"]},
+    ),
+    (
+        "a parameter documented twice with the same name and location is a finding",
+        FIXTURE_ALIAS_SCOPES,
+        [
+            fixture_route(
+                "GET",
+                "/s/dup-params/{id}",
+                200,
+                params=[
+                    query_param("limit", "integer", False),
+                    query_param("limit", "integer", False),
+                    {"name": "id", "in": "path", "type": "string", "required": True},
+                    {"name": "id", "in": "path", "type": "string", "required": True},
+                ],
+            )
+        ],
+        {
+            "query_params": [
+                "GET /s/dup-params/{id}: `limit` is documented 2 times in query",
+                "GET /s/dup-params/{id}: `id` is documented 2 times in path",
+            ]
         },
     ),
     (
