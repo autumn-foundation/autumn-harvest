@@ -312,6 +312,13 @@ diesel::table! {
         /// a mismatch means the evidence belongs to a frontier now behind us.
         /// `NULL` = none recorded yet, which reads as a mismatch.
         capability_miss_handler -> Nullable<Text>,
+        /// The `fires_at` of the durable timer this row is armed for (issue
+        /// #1402). Set only by `queue::reschedule_task`. Survives a later
+        /// `scheduled_at` drift with the same wake reason (a queue-pause
+        /// resume credit, an orphan reclaim, a capability-miss release).
+        /// `NULL` when no timer owns this row, or once a different wake
+        /// reason repends it.
+        timer_fires_at -> Nullable<Timestamptz>,
     }
 }
 
@@ -747,6 +754,16 @@ diesel::table! {
         /// NULL = fired; `condition_unmet` / `condition_invalid` =
         /// resolved-skipped by the output guard (issue #810).
         outcome -> Nullable<Text>,
+        /// The shard the relay resolved for the target, at relay time (issue
+        /// #1401). NULL on a resolved-skip row (no target was ever picked)
+        /// and on every pre-migration row.
+        target_shard -> Nullable<Integer>,
+        /// `harvest_completion_triggers.target_workflow_name` AT RELAY TIME
+        /// (issue #1401). `sync_completion_triggers` can update that column
+        /// in place, so a join against the CURRENT value can name a target
+        /// this specific fire never used. NULL on a resolved-skip row and on
+        /// every pre-migration row.
+        target_workflow_name -> Nullable<Text>,
     }
 }
 

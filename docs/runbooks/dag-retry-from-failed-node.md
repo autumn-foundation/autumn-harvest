@@ -55,13 +55,13 @@ intent, drop `dry_run` (or set it `false`) and re-issue to commit the retry. A
 
 ```bash
 # Preview:
-autumn-harvest dag retry nightly_etl "$RUN_EXEC_ID" \
+harvest dag retry nightly_etl "$RUN_EXEC_ID" \
   --from-node transform_orders \
   --reason "S3 incident 2026-05-17" \
   --dry-run
 
 # Commit (multiple nodes allowed):
-autumn-harvest dag retry nightly_etl "$RUN_EXEC_ID" \
+harvest dag retry nightly_etl "$RUN_EXEC_ID" \
   --from-node transform_orders --from-node load_warehouse \
   --reason "S3 incident 2026-05-17" \
   --operator-id oncall@example.com
