@@ -600,8 +600,8 @@ def rejects_result_body(params: str, block: str) -> bool:
     The body is mandatory when a method chain on it ends in `?`, or reaches
     `.unwrap()` or `.expect(..)`, before any call that turns the error into a
     value. It is also mandatory when any top-level `Err` arm of a `match` on it
-    rejects, or when the `else` of a `let Ok(..) = body else` builds an error
-    or returns. An `Err` arm that
+    rejects, or when the `else` of a `let Ok(..) = body else` rejects, as
+    `rejecting_exit` reads it. An `Err` arm that
     hands the request on, for example to replay a committed key, leaves it
     optional.
     """
@@ -620,7 +620,22 @@ def rejects_result_body(params: str, block: str) -> bool:
                 return True
     for binding in re.finditer(r"\blet\s+Ok\s*\(.*?\)\s*=\s*%s\s+else\s*\{" % variable, block):
         otherwise = balanced(block[binding.end() - 1 :], "{", "}")
-        if re.search(r"\breturn\b|" + ERROR_TOKENS, otherwise):
+        if rejecting_exit(otherwise):
+            return True
+    return False
+
+
+def rejecting_exit(block: str) -> bool:
+    """Whether a fallback block rejects the request.
+
+    It rejects when it builds an error, panics, or returns anything other
+    than `Ok(..)` or a 2xx `StatusCode`. A 4xx or 5xx `StatusCode` is an error
+    token, so it rejects.
+    """
+    if re.search(ERROR_TOKENS + r"|\b(?:panic|unreachable|todo)!", block):
+        return True
+    for returned in re.findall(r"\breturn\b\s*([^;}]*)", block):
+        if not re.match(r"Ok\s*\(|StatusCode::", returned.strip()):
             return True
     return False
 
@@ -746,7 +761,7 @@ def discards_error(before: str, after: str) -> bool:
     if not re.match(r"\s*else\b", rest):
         return True
     otherwise = balanced(rest[rest.index("{") :], "{", "}")
-    return not re.search(r"\breturn\b|" + ERROR_TOKENS, otherwise)
+    return not rejecting_exit(otherwise)
 
 
 def same_scope(block: str, start: int, position: int) -> bool:
@@ -1525,6 +1540,8 @@ pub fn harvest_api_router() -> Router {
         .route("/e/inspected", post(e_inspected))
         .route("/e/mixed-calls", post(e_mixed_calls))
         .route("/e/compared-guard", post(e_compared_guard))
+        .route("/e/let-else-ok", post(e_let_else_ok))
+        .route("/e/if-let-else-ok", post(e_if_let_else_ok))
 }
 
 async fn e_wrapped(body: Bytes) -> Response {
@@ -2017,6 +2034,22 @@ async fn e_compared_guard(body: Bytes) -> Result<Response, Response> {
         return Ok(StatusCode::OK.into_response());
     }
     let gadget = serde_json::from_slice::<Gadget>(&body).map_err(reject)?;
+    Ok(StatusCode::OK.into_response())
+}
+
+async fn e_let_else_ok(body: Result<Json<Gadget>, JsonRejection>) -> Result<Response, Response> {
+    let Ok(Json(gadget)) = body else {
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    };
+    Ok(StatusCode::OK.into_response())
+}
+
+async fn e_if_let_else_ok(body: Bytes) -> Result<Response, Response> {
+    if let Ok(gadget) = serde_json::from_slice::<Gadget>(&body) {
+        tracing::debug!(name = %gadget.name, "parsed");
+    } else {
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    }
     Ok(StatusCode::OK.into_response())
 }
 
@@ -3077,6 +3110,21 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             )
         ],
         {"body_required": ["POST /e/compared-guard: the body is mandatory"]},
+    ),
+    (
+        "an else that returns success does not reject",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                path,
+                200,
+                request_body=body_of(("name", False), required=False),
+                additional_responses=[{"status": 204}],
+            )
+            for path in ("/e/let-else-ok", "/e/if-let-else-ok")
+        ],
+        {},
     ),
     (
         "a malformed contract entry does not crash the audit",
