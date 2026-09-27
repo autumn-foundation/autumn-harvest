@@ -140,6 +140,33 @@ pub async fn send_signal_idempotent(
                 // existing RETRYABLE classification (`HarvestError::is_shard_unavailable`),
                 // so the outbox leaves the row pending and tries again rather than
                 // failing the delivery permanently.
+                //
+                // `MIGRATING` covers two different moments (issue #1317). This
+                // row cannot tell them apart. `commit_cutover` writes only the
+                // SOURCE database, on purpose. That lets it commit even when
+                // the target is briefly unreachable. No distributed two-phase
+                // commit is needed.
+                //
+                // A connection resolved to the target sees the same
+                // `MIGRATING` row in both moments: before cutover, and after
+                // cutover but before activation.
+                //
+                // Accepting the write in the first moment is not safe. If the
+                // migration later aborts, the staged copy is discarded. This
+                // signal would go with it. The caller would see `Ok` for a
+                // signal that silently never existed.
+                //
+                // Refusing in the second moment is suboptimal, not unsafe.
+                // Activation normally follows cutover in the same call.
+                // `resume_incomplete_migrations` finishes the pair after a
+                // crash in between.
+                //
+                // Telling the two moments apart needs a source connection, or
+                // a target-side marker from `commit_cutover`. Callers of this
+                // function are not guaranteed a source connection. A
+                // target-side marker would revive the two-phase dependency
+                // cutover deliberately avoids. So this refuses both,
+                // retryably, rather than risk the unsafe one.
                 state @ ("MIGRATED" | "MIGRATING") => {
                     return Err(HarvestError::ShardUnavailable {
                         shard_id: exec_id.shard().as_i32(),
@@ -239,7 +266,23 @@ pub async fn send_signal_to_live_attempt(
     payload: serde_json::Value,
     idempotency_key: Option<&str>,
 ) -> HarvestResult<RoutedSignalDelivery> {
-    let target = crate::execution::resolve_live_attempt_id(conn, exec_id).await?;
+    // `conn` is supplied by the caller (generated typed-signal code predating
+    // sharding), so its shard is not known here. `resolve_live_attempt_id_best_effort`
+    // (issue #1596 review) recovers it from the row itself rather than
+    // trusting a retry successor's stale `MIGRATED` stub across a rebalance.
+    //
+    // `send_signal_from_resolved` binds to `target`'s own shard itself
+    // (issue #1596 follow-up review, comment 4052389744). Passing `conn`
+    // through unchanged here is correct even when the resolve above hopped
+    // to a different shard than `conn` currently holds.
+    let (target, rebind) =
+        crate::execution::resolve_live_attempt_id_best_effort(conn, exec_id).await?;
+    // Drop this checkout before `send_signal_from_resolved` binds again for
+    // the same shard (fresh review, P1). `rebind` is not reused below: this
+    // call passes `conn` and lets `send_signal_from_resolved` rebind on its
+    // own. Holding both open at once can deadlock a pool-size-one shard
+    // against itself.
+    drop(rebind);
     send_signal_from_resolved(conn, exec_id, target, signal_name, payload, idempotency_key).await
 }
 
@@ -253,6 +296,16 @@ pub async fn send_signal_to_live_attempt(
 /// the resolved row's `workflow_name` — uses this so one request performs one
 /// chain walk instead of two, and so the row it validated against is provably
 /// the row it delivers to.
+///
+/// `resolved` may have been resolved by a caller that holds no
+/// [`crate::shard::ShardedDbPool`] of its own. This function's `conn`-only
+/// signature is unchanged since before sharding. Or it may come from a
+/// caller that does hold one, such as the management API. Either way,
+/// `conn` is not guaranteed to already be bound to `resolved`'s own shard
+/// (issue #1596 follow-up review, comment 4052389744). This function binds
+/// to it itself, rather than trusting the caller to have done so. A hop
+/// that moved shards mid-resolution leaves `conn` on the ORIGINAL shard,
+/// not the resolved one.
 ///
 /// # Errors
 ///
@@ -268,9 +321,20 @@ pub async fn send_signal_from_resolved(
 ) -> HarvestResult<RoutedSignalDelivery> {
     let exec_id = logical_exec_id;
     let mut target = resolved;
+    let mut rebind = crate::execution::bind_to_shard_best_effort(conn, target).await?;
     for _ in 0..crate::execution::RETRY_CHAIN_MAX_REDRIVES {
-        match send_signal_idempotent(conn, target, signal_name, payload.clone(), idempotency_key)
-            .await
+        let active: &mut AsyncPgConnection = match &mut rebind {
+            Some(fresh) => fresh,
+            None => conn,
+        };
+        match send_signal_idempotent(
+            active,
+            target,
+            signal_name,
+            payload.clone(),
+            idempotency_key,
+        )
+        .await
         {
             // A fresh insert is final: it landed on the attempt we resolved.
             Ok(true) => {
@@ -284,9 +348,11 @@ pub async fn send_signal_from_resolved(
             // sealed `FAILED` — swallowing a re-send the live attempt still
             // needs. Nothing was queued, so re-driving cannot double-deliver.
             Ok(false) => {
-                let fresh = crate::execution::resolve_live_attempt_id(conn, exec_id)
-                    .await
-                    .unwrap_or(target);
+                drop(rebind);
+                let (fresh, fresh_rebind) =
+                    crate::execution::resolve_live_attempt_id_best_effort(conn, exec_id)
+                        .await
+                        .unwrap_or((target, None));
                 if !crate::execution::redrive_target(target, fresh) {
                     return Ok(RoutedSignalDelivery {
                         target,
@@ -294,22 +360,30 @@ pub async fn send_signal_from_resolved(
                     });
                 }
                 target = fresh;
+                rebind = fresh_rebind;
             }
             Err(error) => {
                 // The delivery was rolled back, so re-driving is safe: it can
                 // never double-deliver a signal that was actually queued.
-                let fresh = crate::execution::resolve_live_attempt_id(conn, exec_id)
-                    .await
-                    .unwrap_or(target);
+                drop(rebind);
+                let (fresh, fresh_rebind) =
+                    crate::execution::resolve_live_attempt_id_best_effort(conn, exec_id)
+                        .await
+                        .unwrap_or((target, None));
                 if !crate::execution::redrive_target(target, fresh) {
                     return Err(error);
                 }
                 target = fresh;
+                rebind = fresh_rebind;
             }
         }
     }
+    let active: &mut AsyncPgConnection = match &mut rebind {
+        Some(fresh) => fresh,
+        None => conn,
+    };
     let delivered =
-        send_signal_idempotent(conn, target, signal_name, payload, idempotency_key).await?;
+        send_signal_idempotent(active, target, signal_name, payload, idempotency_key).await?;
     Ok(RoutedSignalDelivery { target, delivered })
 }
 

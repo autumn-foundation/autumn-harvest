@@ -28,7 +28,6 @@ use autumn_harvest::types::{ActivityExecId, ExecutionId, ShardId};
 use autumn_harvest::worker::DbPool;
 use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{HarvestApiState, harvest_api_router};
-use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -132,7 +131,7 @@ fn build_app(urls: &[String]) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
     api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(storage);
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 /// Build an app whose **router** knows about more shards than this process has
@@ -174,7 +173,7 @@ fn build_app_with_router_knowing_extra_shard(
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         router,
     ));
-    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+    harvest_api_router(api_state)
 }
 
 async fn get_json(app: &HarvestApiApp, uri: &str) -> (StatusCode, Value) {
@@ -932,7 +931,7 @@ async fn sample_export_requires_admin() {
     // No `set_admin_auth_boundary(true)` and no session: an unauthenticated
     // caller must be rejected.
     api_state.install_storage_pool(storage);
-    let app = harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"));
+    let app = harvest_api_router(api_state);
 
     let (status, _) = get_json(&app, SAMPLE_ROUTE).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);

@@ -24,12 +24,24 @@
 //! `harvest_audit_log` and writes its own bookkeeping
 //! (`harvest_audit_log.export_seq`, `harvest_audit_export_cursor`).
 //!
-//! # Opt-in and zero-cost when unconfigured
+//! # Opt-in, but one cost is not zero
 //!
-//! With no sink registered, [`GLOBAL_AUDIT_EXPORT_CONFIG`] is `None`, the
-//! scanner returns `Ok(0)` before issuing a single query, no cursor row is
-//! ever created, and `export_seq` stays `NULL` on every audit row. Behavior
-//! is byte-identical to before this module existed.
+//! With no sink registered, [`GLOBAL_AUDIT_EXPORT_CONFIG`] is `None`. The
+//! scanner returns `Ok(0)` before it issues a single query. No cursor row is
+//! ever created, and `export_seq` stays `NULL` on every audit row. No new
+//! query runs and no new row exists: read behavior matches the code before
+//! this module existed.
+//!
+//! Write behavior does not. `harvest_audit_log_unexported_idx` is a partial
+//! index on `export_seq IS NULL`. An unconfigured deployment leaves every row
+//! `NULL` forever, so the index matches the whole audit table, and every
+//! audit insert pays its maintenance cost. That cost is bounded only while
+//! retention actually reclaims unexported rows. See `docs/audit-export.md`'s
+//! "Retention interaction" section for the exact conditions: they are more
+//! than one config flag. Tracked as issue #1272. Even then the bound is not
+//! total. Retention can never purge a decommission or reactivation record,
+//! exported or not. That holds no matter how many requests a shard has
+//! seen.
 //!
 //! # Where the monotonic sequence comes from (and why not `BIGSERIAL`)
 //!
@@ -474,7 +486,9 @@ pub const fn resolve_rewind(current_acked: i64, requested: i64) -> RewindOutcome
 /// startup.
 ///
 /// With `sink` and `webhook_url` both `None` — the default — audit export is
-/// never installed and the feature is entirely inert (AC8).
+/// never installed and the scanner is entirely inert (AC8). The partial
+/// index still costs insert-time maintenance; see the module-level caveat
+/// above (issue #1272).
 #[derive(Clone)]
 pub struct AuditExportBuilderConfig {
     /// Allowed sink hosts. Required (non-empty) for a `webhook_url` to
@@ -516,17 +530,27 @@ pub struct AuditExportBuilderConfig {
 ///
 /// Falls back to a marker rather than the input when the URL cannot be parsed:
 /// an unparseable string must not be echoed on the assumption it is harmless.
+///
+/// Reads the origin from a full [`url::Url::parse`], not a hand-rolled
+/// split (issue #1274). A manual split trusts the input's shape. It
+/// missed a backslash standing in for `/`. It also read a malformed
+/// `host:port` authority as valid — `s3cr3t` is not a port, so the real
+/// parser rejects the whole string. Either way, the secret rode along
+/// after it. Delegating to the parser closes the whole class: this
+/// function can only render a host the parser itself accepted.
 pub(crate) fn redact_webhook_url(url: &str) -> String {
-    let Some((scheme, rest)) = url.split_once("://") else {
+    let Ok(parsed) = url::Url::parse(url) else {
         return "<unparseable webhook url redacted>".to_string();
     };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    // Strip any userinfo (`user:pass@host`), itself a credential.
-    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-    if host.is_empty() {
+    let Some(host) = parsed.host_str() else {
         return "<unparseable webhook url redacted>".to_string();
-    }
-    format!("{scheme}://{host}/<redacted>")
+    };
+    // A port is part of the origin, not the credential (issue #1274). Two
+    // targets at the same host on different ports are different
+    // endpoints. `Url::port()` already omits the scheme's default port,
+    // so this adds nothing for a bare `https://host/...` origin.
+    let port = parsed.port().map_or_else(String::new, |p| format!(":{p}"));
+    format!("{}://{host}{port}/<redacted>", parsed.scheme())
 }
 
 impl std::fmt::Debug for AuditExportBuilderConfig {
@@ -684,7 +708,7 @@ impl AuditExportBuilderConfig {
 }
 
 // ---------------------------------------------------------------------
-// M4: process-global runtime config (opt-in; `None` == fully inert)
+// M4: process-global runtime config (opt-in; `None` == scanner fully inert)
 // ---------------------------------------------------------------------
 
 /// Bound on acquiring a shard's connection inside the scanner (issue #953,
@@ -757,10 +781,12 @@ pub const DEFAULT_EXPORT_LEASE: std::time::Duration = std::time::Duration::from_
 
 /// Everything the exporter needs at runtime, installed once at startup.
 ///
-/// `None` (the default, before any builder wiring runs) means the feature is
-/// fully inert: [`fire_due_audit_exports`] returns `Ok(0)` before issuing a
-/// single query, so an embedder who never configures an audit sink sees zero
-/// behavior change and zero scanner work (AC8).
+/// `None` (the default, before any builder wiring runs) means the scanner is
+/// fully inert. [`fire_due_audit_exports`] returns `Ok(0)` before issuing a
+/// query, so an embedder who never configures a sink sees zero query
+/// behavior change and zero scanner work (AC8). The partial index is not
+/// part of that guarantee — see the module-level caveat above (issue
+/// #1272).
 #[derive(Clone)]
 pub struct AuditExportRuntimeConfig {
     /// Embedder-supplied (or plugin-default) transport.
@@ -3785,6 +3811,48 @@ mod tests {
             let rendered = redact_webhook_url(junk);
             assert_eq!(rendered, "<unparseable webhook url redacted>");
         }
+    }
+
+    #[test]
+    fn redact_webhook_url_stops_the_authority_at_a_backslash() {
+        // Issue #1274: `url::Url::parse` treats a backslash as a path
+        // separator for `https`/`http`, the same as a forward slash.
+        // `redact_webhook_url` split only on `/`, `?`, and `#`, so a
+        // backslash-delimited secret rode along as part of the authority.
+        assert_eq!(
+            redact_webhook_url("https://evil.com\\bearer-secret"),
+            "https://evil.com/<redacted>"
+        );
+    }
+
+    #[test]
+    fn redact_webhook_url_withholds_a_malformed_authority() {
+        // Issue #1274: `user:s3cr3t` with no `@` is `host:port`, not
+        // userinfo. `s3cr3t` is not a valid port, so `url::Url::parse`
+        // rejects the whole string. A naive split on `/` still finds an
+        // "authority" here and renders the secret through it.
+        assert_eq!(
+            redact_webhook_url("https://user:s3cr3t/api"),
+            "<unparseable webhook url redacted>"
+        );
+    }
+
+    #[test]
+    fn redact_webhook_url_keeps_a_non_default_port() {
+        // Issue #1274: a port is part of the origin, not the credential.
+        // Two targets on the same host at different ports are different
+        // endpoints. Dropping the port made them indistinguishable in a
+        // startup error or a runtime log line.
+        assert_eq!(
+            redact_webhook_url("https://siem.example.com:8443/token"),
+            "https://siem.example.com:8443/<redacted>"
+        );
+        // The default port for the scheme adds no information; omit it,
+        // matching the pre-existing behavior for a bare origin.
+        assert_eq!(
+            redact_webhook_url("https://siem.example.com:443/token"),
+            "https://siem.example.com/<redacted>"
+        );
     }
 
     /// A delivery whose sink was swapped mid-flight must not advance the

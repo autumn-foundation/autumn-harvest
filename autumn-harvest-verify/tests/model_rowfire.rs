@@ -78,11 +78,12 @@ fn documents() -> Vec<mir::MirDoc> {
         ..BuildRequest::default()
     };
     let mut inputs = driver::emit_mir(&build).expect("emit corpus MIR");
-    inputs.extend(driver::collect_mir_paths(&[Path::new(env!(
-        "CARGO_MANIFEST_DIR"
-    ))
-    .join("tests")
-    .join("fixtures")]));
+    inputs.extend(
+        driver::collect_mir_paths(&[Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")])
+        .expect("fixtures dir is readable"),
+    );
 
     let mut docs = Vec::new();
     for input in inputs {

@@ -697,6 +697,10 @@ checking against this hot path's documented advisory-lock-ordering,
 exactly-once-claim, and `SKIP LOCKED`-concurrency-safety invariants by
 someone with full context on `queue.rs`. It is out of scope for this page and
 is not decided here; it is tracked separately as issue #1340.
+`docs/assays/0005-claim-batched-seek-and-refine.md` prototyped that shape and
+`docs/performance-claim-batched-seek-and-refine.md` measures a real,
+DB-tested implementation (`queue::claim_task_batched`, additive, not wired
+into the default claim path) against the single-row query above.
 
 This also corrects, without fully resolving, the
 [known limitations](#known-limitations) bullet that called `schedule_to_close`
@@ -1766,6 +1770,14 @@ from the benchmark are directly comparable.
   per RUNNING execution on every timeout-scanner tick.
 * Issue #1177 — reproduction and full `EXPLAIN` captures for
   [any residual predicate defeats sort-elision](#any-residual-predicate-defeats-sort-elision-issue-1177).
+* [`docs/performance-claim-batched-seek-and-refine.md`](performance-claim-batched-seek-and-refine.md) —
+  issue #1340's batched seek-and-refine claim (`queue::claim_task_batched`,
+  additive, not wired into the default claim path), measured against the
+  single-row query above.
+* `docs/perf-artifacts/claim-batched-seek-and-refine/` — committed `EXPLAIN`
+  evidence for that measurement.
+* `autumn-harvest/scripts/claim_batched_seek_and_refine_perf_repro.sh` —
+  regenerates that evidence from a clean checkout.
 
 ### Other profiling notes
 
@@ -1781,6 +1793,12 @@ standalone note rather than part of the claim-path attribution table above:
   — lazy JSON-Pointer path construction in schema validation (issue #373).
 * [`docs/performance-det-check.md`](performance-det-check.md) — fusing a
   redundant per-line comment scan in `harvest det-check` (issue #778).
+* [`docs/performance-det-check-line-trim.md`](performance-det-check-line-trim.md)
+  — an ASCII-fast-path `str::trim()` replacement for the same scan's
+  per-line whitespace trim; a real but sub-floor win (best corrected
+  variant: 2.35% instruction reduction against a >=5% floor) — a negative
+  result. An earlier cut of the same variant had a real vertical-tab
+  correctness bug, caught by review before it shipped.
 * [`docs/performance-dag-graph.md`](performance-dag-graph.md) — hoisting a
   per-node rebuild out of `GET /dag-run-graph` (issue #690).
 * [`docs/performance-dlq-aggregate.md`](performance-dlq-aggregate.md) — DLQ
@@ -1815,6 +1833,11 @@ standalone note rather than part of the claim-path attribution table above:
 * [`docs/performance-quota-history-bytes.md`](performance-quota-history-bytes.md)
   — measuring the `history_bytes` admission check's cost claim (issue #946
   AC7); partially inaccurate claim, no fix identified.
+* [`docs/performance-quota-reconcile-candidate-scan.md`](performance-quota-reconcile-candidate-scan.md)
+  — `reconcile_quota_keys_from` candidate-scan cost under mixed-deployment
+  skew (issue #1226 follow-up); confirms the scaling risk is a permanent
+  per-tick cost, not a rollout expense, and diagnoses a planner
+  cardinality misestimate as the cause. No fix ships in this pass.
 * [`docs/performance-codec-rotation-reencrypt.md`](performance-codec-rotation-reencrypt.md)
   — skipping a JSON round-trip in the codec-key-rotation re-encryption sweep
   (issue #948).
@@ -1856,3 +1879,63 @@ standalone note rather than part of the claim-path attribution table above:
   redundant second edge-set traversal in
   `critical_path::CriticalPathAnalyzer::analyze`'s sink detection, folded
   into the existing per-level DP loop (instructions -15.45%, PR #1500).
+* [`docs/performance-poison-pill-orphan-recheck.md`](performance-poison-pill-orphan-recheck.md)
+  — the per-orphan worker-liveness re-check in
+  `poison_pill::reclaim_orphaned_tasks`'s requeue path, folded into the
+  write that follows the row-lock statement, not the row lock itself
+  (3-to-2 statement reduction; total statements -33% at every swept size;
+  worker-liveness calls n → 0, PR #1545).
+* [`docs/performance-queue-coverage.md`](performance-queue-coverage.md) — the
+  O(pending queues x workers x queues-per-worker) nested scan in
+  `queue_coverage::partition_uncovered_and_paused`, the per-shard core of
+  `GET /admin/queue-coverage` (issue #774), indexed into an O(1)-average
+  `HashSet` lookup per pending queue (instructions -83.6%; falls back to
+  the original direct scan for a `?queue_name=`-filtered single-row call).
+* [`docs/performance-build-reachability-fanout.md`](performance-build-reachability-fanout.md)
+  — the per-build N+1 in `build_routing::all_build_reachability`, the
+  Vantage Builds page and `GET /admin/builds`'s counter query (issue #171),
+  batched into three grouped queries (one per source table) instead of one
+  combined query per distinct build id.
+* [`docs/performance-history-export.md`](performance-history-export.md) — a
+  self-referential re-serialization loop in `history_export::export_history`,
+  the archival-export path `retention.rs`'s reclamation sweep calls per
+  retiring execution (issue #524/#698/#772/#798), solved as an O(1) fixed
+  point (instructions -22.08%, alloc bytes -19.89%).
+* [`docs/performance-history-fingerprint.md`](performance-history-fingerprint.md)
+  — a per-event canonicalization buffer in
+  `shard_rebalance::history_fingerprint`, the replay-determinism check a
+  shard migration runs on both sides of a copy (`docs/sharding.md`), fixed
+  by reusing one buffer across events (alloc bytes -16.45%).
+* [`docs/performance-lineage.md`](performance-lineage.md) — the `visited`/
+  `next`/`node.children` vecs in `lineage::LineageWalk`/
+  `LineageTreeReport::finish`, the in-memory half of
+  `GET /workflows/{id}/lineage` (issue #621), pre-sized from what each level
+  actually admits; `nodes` and `by_parent` stay growing from empty after a
+  post-review correction (instructions -2.37%, alloc bytes -27.12%, this
+  fix's final fifth-round-corrected numbers).
+* [`docs/performance-harvest-verify-split-top.md`](performance-harvest-verify-split-top.md)
+  — `autumn-harvest-verify`'s `util::split_top`, the balanced-delimiter
+  splitter every path/type decomposition in the MIR-level determinism
+  analyzer goes through (issue #962), guarded with a first-byte check
+  before its `starts_with` call (instructions -13.54%, PR #1597).
+* [`docs/performance-status-summary-stalled.md`](performance-status-summary-stalled.md)
+  — `status_summary::count_stalled_candidates`'s correlated `NOT EXISTS`
+  anti-join, 86.9% of a `GET /admin/status` request's buffers on a
+  3,000-active-execution fixture (issue #1643), rewritten as a
+  `MATERIALIZED` CTE anti-joined by equality (`Nested Loop Anti Join` →
+  `Hash Anti Join`; -97.8% buffers in the execution-heavy regime, a
+  smaller but real win in the other two measured regimes, PR #1656).
+* [`docs/performance-queue-fairness.md`](performance-queue-fairness.md) —
+  `queue_fairness::weighted_queue_order`, the weighted-random queue-selection
+  step `Worker::poll_once` runs on every poll once an operator configures
+  `WorkerConfig::queue_weights` (issue #515), 53.72% of a 16-queue/20,000-poll
+  harness; a per-queue `String` clone eliminated by returning a borrowed
+  permutation instead (instructions -36.26%, allocations -76.18%).
+* [`docs/performance-payload-codec-owned-transform.md`](performance-payload-codec-owned-transform.md)
+  — `payload_codec::{encode_payload, decode_payload}`'s identity-codec fast
+  path, run once per payload-bearing field of every workflow event ever
+  appended or replayed (`store.rs`'s `encode_event`/`decode_event`), 52.05%
+  of a 454,000-event-round-trip harness's allocation blocks; a redundant
+  `serde_json::Value` clone eliminated by taking the field by value
+  (`std::mem::take`) instead of borrowing it from the event tree the caller
+  already owns (instructions -36.89%, allocation blocks -52.05%).

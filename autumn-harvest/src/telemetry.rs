@@ -452,6 +452,14 @@ pub const METRIC_SHARD_FENCED: &str = "harvest.shard.fenced";
 /// Gauge: current number of entries in the dead letter queue.
 pub const METRIC_DLQ_ENTRIES: &str = "harvest.dlq.entries";
 
+/// Gauge: cumulative hints the dispatch background publisher has dropped
+/// because its bounded queue was full (issue #1429).
+///
+/// A dropped hint costs latency, not correctness: the row stays `PENDING`
+/// and the reconcile sweep republishes it. A sustained non-zero rate means
+/// the publisher queue is undersized for the enqueue rate.
+pub const METRIC_DISPATCH_DROPPED_HINTS: &str = "harvest.dispatch.dropped_hints";
+
 /// Gauge: `1` while a task queue is paused by an operator, `0` once it resumes
 /// (issue #619).
 ///
@@ -558,6 +566,82 @@ pub const METRIC_WORKFLOW_CACHE_MISS: &str = "harvest.workflow.cache_miss";
 /// Per ADR-0001 §7, `harvest.target.execution.id` and `harvest.signal.id` are
 /// **span-only** and must never appear as metric labels.
 pub const METRIC_EXTERNAL_SIGNAL_SENT: &str = "harvest.workflow.external_signal.sent";
+
+/// Counter: incremented once per `cancel_external_workflow` call after the
+/// terminal outcome is recorded in `harvest_events`.
+///
+/// Labels: `outcome` (`"delivered"` or `"failed"`), `reason_code` (only set
+/// when `outcome == "failed"`; values: `"target_terminal"`, `"target_unknown"`).
+/// [`METRIC_EXTERNAL_SIGNAL_SENT`]'s cancel twin.
+pub const METRIC_EXTERNAL_CANCEL_SENT: &str = "harvest.workflow.external_cancel.sent";
+
+/// Counter: a by-id fan-out could not inspect every expected shard. Its
+/// answer is `Indeterminate`, and the outbox row it was resolving stays
+/// pending (issue #1307).
+///
+/// Incremented once per uninspected shard named in the retry outcome. A row
+/// whose fan-out missed two shards increments this twice, once per shard.
+/// Labels: `shard`, `kind`
+/// ([`crate::external_target_location::UninspectedReasonKind::as_label`]).
+///
+/// This is the counter twin of the `"by-id target resolution inconclusive"`
+/// warning both outbox sweeps already log. See
+/// [`METRIC_EXTERNAL_SIGNAL_BY_ID_OLDEST_PENDING_AGE`] for the companion
+/// gauge that answers "how long has this been stuck". A rate on this counter
+/// alone cannot answer that.
+pub const METRIC_EXTERNAL_BY_ID_INDETERMINATE_SHARD: &str =
+    "harvest.external_signal.by_id_indeterminate_shard";
+
+/// Gauge: age in seconds of the oldest pending by-id **signal** outbox row a
+/// sweep left retrying because its target shard fan-out was incomplete
+/// (issue #1307).
+///
+/// `0` when the sweep left no such row pending, matching
+/// [`METRIC_QUEUE_OLDEST_PENDING_AGE`]'s convention so a drained backlog does
+/// not leave a stale reading behind. Distinguishes "retrying, will resolve"
+/// from "stuck since Tuesday" without reasoning about shard topology. Both
+/// `docs/sharding.md` and the backup-restore runbook used to name this gap
+/// as open.
+pub const METRIC_EXTERNAL_SIGNAL_BY_ID_OLDEST_PENDING_AGE: &str =
+    "harvest.external_signal.by_id_oldest_pending_indeterminate_age";
+
+/// Gauge: [`METRIC_EXTERNAL_SIGNAL_BY_ID_OLDEST_PENDING_AGE`]'s **cancel**
+/// outbox twin (issue #1307).
+pub const METRIC_EXTERNAL_CANCEL_BY_ID_OLDEST_PENDING_AGE: &str =
+    "harvest.external_cancel.by_id_oldest_pending_indeterminate_age";
+
+/// Counter: a by-id fan-out delivered over an incomplete shard fan-out — a
+/// silently ambiguous success, never surfaced before this counter (issue
+/// #1307).
+///
+/// Distinct from [`METRIC_EXTERNAL_BY_ID_INDETERMINATE_SHARD`]: that counter
+/// is a stall, where the row stays pending. This one is a delivery that went
+/// ahead on a partial view. Labelled `shard` (the shard the run was found on)
+/// only, per ADR-0001 §7.
+pub const METRIC_EXTERNAL_BY_ID_FOUND_OVER_INCOMPLETE_FANOUT: &str =
+    "harvest.external_signal.by_id_found_over_incomplete_fanout";
+
+/// Counter: a by-id fan-out completed and found more than one live run
+/// of the same business key (issue #1146). Issue #1313 records the
+/// residual bound this counter is evidence for.
+///
+/// `(workflow_name, workflow_id)` uniqueness is shard-local. Two paths
+/// make this fire. A key pinned to one shard while an unpinned start of
+/// it hashes to another is one. Draining a shard, so a later unpinned
+/// start of the same key rehashes elsewhere while the old run stays
+/// live, is the other. Neither pinning is required.
+///
+/// It is the observable proxy for the precondition behind issue
+/// #1313's race. The race itself is a run that starts mid fan-out. No
+/// counter can see that instant. Two live runs surviving a complete
+/// fan-out is different: it is real, and it is countable. Labelled
+/// `shard` (the winning run's shard) only, per ADR-0001 §7.
+///
+/// Distinct from [`METRIC_EXTERNAL_BY_ID_FOUND_OVER_INCOMPLETE_FANOUT`]:
+/// that counter fires over a partial view, a shard that could not be
+/// read. This one fires over a complete view that is still ambiguous.
+pub const METRIC_EXTERNAL_BY_ID_OTHER_LIVE_OBSERVED: &str =
+    "harvest.external_signal.by_id_other_live_observed";
 
 /// OpenTelemetry span attribute: the signal name for `signal_external_workflow` spans.
 ///
@@ -2712,6 +2796,16 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (shard, depth);
     }
 
+    /// Cumulative hints the dispatch background publisher has dropped because
+    /// its bounded queue was full (issue #1429).
+    ///
+    /// Emitted by a periodic in-process sampler, no label. Maps to the gauge
+    /// `harvest_dispatch_dropped_hints`. Not incremental: each call carries
+    /// the running total from [`crate::dispatch::dropped_hints`].
+    fn record_dispatch_dropped_hints(&self, total: u64) {
+        let _ = total;
+    }
+
     /// Whether a task queue is currently held by an operator queue pause
     /// (issue #619): `paused = true` while the hold is in effect, `false` for
     /// one cycle after it is released so the series drops rather than going
@@ -3220,8 +3314,57 @@ pub trait MetricsRecorder: Send + Sync {
     }
 
     /// Record one external cancel dispatch outcome (`outcome`: `"delivered"` / `"failed"`).
+    ///
+    /// Maps to the counter [`METRIC_EXTERNAL_CANCEL_SENT`].
     fn record_external_cancel_sent(&self, outcome: &str, reason_code: Option<&str>) {
         let _ = (outcome, reason_code);
+    }
+
+    /// A by-id fan-out left one shard uninspected, on a row a sweep is
+    /// therefore leaving pending (issue #1307).
+    ///
+    /// Call once per uninspected shard, `kind` from
+    /// [`crate::external_target_location::UninspectedReasonKind::as_label`].
+    ///
+    /// Maps to the counter [`METRIC_EXTERNAL_BY_ID_INDETERMINATE_SHARD`].
+    fn record_external_by_id_indeterminate_shard(&self, shard: u16, kind: &str) {
+        let _ = (shard, kind);
+    }
+
+    /// Age in seconds of the oldest pending by-id **signal** outbox row this
+    /// sweep left retrying; `0` when none did (issue #1307).
+    ///
+    /// Call once per sweep, from [`crate::timeout::enforce_external_signals_outbox`].
+    ///
+    /// Maps to the gauge [`METRIC_EXTERNAL_SIGNAL_BY_ID_OLDEST_PENDING_AGE`].
+    fn record_external_signal_by_id_oldest_pending_indeterminate_age(&self, age_secs: f64) {
+        let _ = age_secs;
+    }
+
+    /// [`Self::record_external_signal_by_id_oldest_pending_indeterminate_age`]'s
+    /// **cancel** outbox twin (issue #1307).
+    ///
+    /// Maps to the gauge [`METRIC_EXTERNAL_CANCEL_BY_ID_OLDEST_PENDING_AGE`].
+    fn record_external_cancel_by_id_oldest_pending_indeterminate_age(&self, age_secs: f64) {
+        let _ = age_secs;
+    }
+
+    /// A by-id fan-out found a live/terminal run and delivered. One or more
+    /// expected shards could not be inspected — a silently ambiguous success
+    /// (issue #1307). `shard` is the shard the run was found on.
+    ///
+    /// Maps to the counter [`METRIC_EXTERNAL_BY_ID_FOUND_OVER_INCOMPLETE_FANOUT`].
+    fn record_external_by_id_found_over_incomplete_fanout(&self, shard: u16) {
+        let _ = shard;
+    }
+
+    /// A by-id fan-out completed and found more than one live run of the
+    /// same business key (issue #1146; issue #1313). `shard` is the
+    /// winning run's shard.
+    ///
+    /// Maps to the counter [`METRIC_EXTERNAL_BY_ID_OTHER_LIVE_OBSERVED`].
+    fn record_external_by_id_other_live_observed(&self, shard: u16) {
+        let _ = shard;
     }
 
     /// A start request was absorbed by a debounce pending record (issue #499).
@@ -4544,6 +4687,45 @@ mod tests {
         );
         assert_eq!(METRIC_SHARD_GENERATION, "harvest.shard.generation");
         assert_eq!(METRIC_SHARD_FENCED, "harvest.shard.fenced");
+    }
+
+    #[test]
+    fn by_id_indeterminate_fanout_observability_has_default_noop_impls_and_stable_names() {
+        // Issue #1307: the outbox sweeps could not previously distinguish
+        // "retrying, will resolve" from "stuck since Tuesday" except by
+        // grepping the `by-id target resolution inconclusive` warning.
+        let rec = NoOpMetrics;
+        rec.record_external_cancel_sent("delivered", None);
+        rec.record_external_cancel_sent("failed", Some("target_unknown"));
+        rec.record_external_by_id_indeterminate_shard(0, "no_pool");
+        rec.record_external_signal_by_id_oldest_pending_indeterminate_age(0.0);
+        rec.record_external_cancel_by_id_oldest_pending_indeterminate_age(30.5);
+        rec.record_external_by_id_found_over_incomplete_fanout(2);
+        rec.record_external_by_id_other_live_observed(1);
+        assert_eq!(
+            METRIC_EXTERNAL_CANCEL_SENT,
+            "harvest.workflow.external_cancel.sent"
+        );
+        assert_eq!(
+            METRIC_EXTERNAL_BY_ID_INDETERMINATE_SHARD,
+            "harvest.external_signal.by_id_indeterminate_shard"
+        );
+        assert_eq!(
+            METRIC_EXTERNAL_SIGNAL_BY_ID_OLDEST_PENDING_AGE,
+            "harvest.external_signal.by_id_oldest_pending_indeterminate_age"
+        );
+        assert_eq!(
+            METRIC_EXTERNAL_CANCEL_BY_ID_OLDEST_PENDING_AGE,
+            "harvest.external_cancel.by_id_oldest_pending_indeterminate_age"
+        );
+        assert_eq!(
+            METRIC_EXTERNAL_BY_ID_FOUND_OVER_INCOMPLETE_FANOUT,
+            "harvest.external_signal.by_id_found_over_incomplete_fanout"
+        );
+        assert_eq!(
+            METRIC_EXTERNAL_BY_ID_OTHER_LIVE_OBSERVED,
+            "harvest.external_signal.by_id_other_live_observed"
+        );
     }
 
     #[test]

@@ -2,7 +2,6 @@ use std::collections::HashMap;
 
 use autumn_harvest_plugin::api::{HarvestApiState, harvest_api_router};
 use autumn_harvest_plugin::ui::harvest_ui_router;
-use autumn_web::AppState;
 use autumn_web::auth::RequireAuth;
 use autumn_web::reexports::axum::body::Body;
 use autumn_web::reexports::http::{Method, Request, StatusCode};
@@ -16,7 +15,7 @@ fn unauthenticated_app() -> impl tower::Service<
     Error = std::convert::Infallible,
     Future = impl std::future::Future,
 > + Clone {
-    harvest_api_router(HarvestApiState::new()).with_state(AppState::for_test())
+    harvest_api_router(HarvestApiState::new())
 }
 
 fn app_with_api_state(
@@ -27,7 +26,7 @@ fn app_with_api_state(
     Error = std::convert::Infallible,
     Future = impl std::future::Future,
 > + Clone {
-    harvest_api_router(api_state).with_state(AppState::for_test())
+    harvest_api_router(api_state)
 }
 
 fn unauthenticated_app_with_ui() -> impl tower::Service<
@@ -37,9 +36,7 @@ fn unauthenticated_app_with_ui() -> impl tower::Service<
     Future = impl std::future::Future,
 > + Clone {
     let api_state = HarvestApiState::new();
-    harvest_api_router(api_state.clone())
-        .nest("/ui", harvest_ui_router(api_state))
-        .with_state(AppState::for_test())
+    harvest_api_router(api_state.clone()).nest("/ui", harvest_ui_router(api_state))
 }
 
 /// Build a test app protected by `RequireAuth`.
@@ -49,9 +46,7 @@ fn authenticated_app() -> impl tower::Service<
     Error = std::convert::Infallible,
     Future = impl std::future::Future,
 > + Clone {
-    harvest_api_router(HarvestApiState::new())
-        .route_layer(RequireAuth::new("user_id"))
-        .with_state(AppState::for_test())
+    harvest_api_router(HarvestApiState::new()).route_layer(RequireAuth::new("user_id"))
 }
 
 fn get(uri: &str) -> Request<Body> {
@@ -1439,9 +1434,7 @@ fn role_auth_nested_app(role: &'static str, with_enforce: bool) -> Router {
             next.run(req).await
         },
     ));
-    Router::new()
-        .nest("/api/harvest", router)
-        .with_state(AppState::for_test())
+    Router::new().nest("/api/harvest", router)
 }
 
 async fn drive_nested(app: &Router, method: Method, uri: &str) -> (StatusCode, String) {
@@ -1666,9 +1659,7 @@ fn token_layer_app() -> impl tower::Service<
     Future = impl std::future::Future,
 > + Clone {
     let api_state = HarvestApiState::new();
-    harvest_api_router(api_state.clone())
-        .layer(from_fn_with_state(api_state, enforce_token_scope))
-        .with_state(AppState::for_test())
+    harvest_api_router(api_state.clone()).layer(from_fn_with_state(api_state, enforce_token_scope))
 }
 
 fn get_bearer(uri: &str, bearer: &str) -> Request<Body> {

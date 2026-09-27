@@ -119,6 +119,136 @@ async fn insert_and_retrieve_audit_record() {
     assert!(rows[0].error_summary.is_none());
 }
 
+// ── issue #1408: `before` cursor and tied `occurred_at` rows ─────────────────
+
+/// Three rows in one `insert_audit_batch` call share one DB-assigned
+/// `occurred_at` (single `INSERT`, single `NOW()`), the same way PR #1407's
+/// bulk-pause/resume UI actions do.
+async fn insert_three_tied_rows(conn: &mut diesel_async::AsyncPgConnection) -> Vec<uuid::Uuid> {
+    let records = [
+        succeeded_record("ops", OP_WORKFLOW_START, TARGET_WORKFLOW, Some("a")),
+        succeeded_record("ops", OP_WORKFLOW_START, TARGET_WORKFLOW, Some("b")),
+        succeeded_record("ops", OP_WORKFLOW_START, TARGET_WORKFLOW, Some("c")),
+    ];
+    audit::insert_audit_batch(conn, &records)
+        .await
+        .expect("batch insert")
+}
+
+#[tokio::test]
+async fn audit_list_before_only_cursor_can_drop_a_tied_row() {
+    let (mut conn, _c) = make_conn().await;
+    let ids = insert_three_tied_rows(&mut conn).await;
+
+    let first_page = audit::list_audit(
+        &mut conn,
+        &AuditFilters {
+            limit: 2,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("first page");
+    assert_eq!(first_page.len(), 2);
+
+    let last = first_page.last().expect("first page has rows");
+    let second_page = audit::list_audit(
+        &mut conn,
+        &AuditFilters {
+            before: Some(last.occurred_at),
+            limit: 10,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("second page");
+
+    // The legacy single-column cursor excludes every row tied with `last`'s
+    // timestamp. All three rows share one timestamp here, so the second page
+    // is empty and the unseen third row is gone for good. This pins the
+    // known gap the `before_id` cursor below closes.
+    assert!(
+        second_page.is_empty(),
+        "before-only cursor is expected to drop every row tied at the page boundary"
+    );
+    let seen: std::collections::HashSet<_> = first_page.iter().map(|r| r.id).collect();
+    assert_eq!(
+        seen.len(),
+        2,
+        "only the first page's two rows were ever seen"
+    );
+    assert_eq!(
+        ids.len(),
+        3,
+        "one of the three inserted rows was never returned"
+    );
+}
+
+#[tokio::test]
+async fn audit_list_before_id_cursor_walks_every_tied_row_once() {
+    let (mut conn, _c) = make_conn().await;
+    let ids = insert_three_tied_rows(&mut conn).await;
+
+    let first_page = audit::list_audit(
+        &mut conn,
+        &AuditFilters {
+            limit: 2,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("first page");
+    assert_eq!(first_page.len(), 2);
+
+    let last = first_page.last().expect("first page has rows");
+    let second_page = audit::list_audit(
+        &mut conn,
+        &AuditFilters {
+            before: Some(last.occurred_at),
+            before_id: Some(last.id),
+            limit: 10,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("second page");
+
+    let mut seen: Vec<uuid::Uuid> = first_page
+        .iter()
+        .chain(second_page.iter())
+        .map(|r| r.id)
+        .collect();
+    seen.sort();
+    let mut expected = ids;
+    expected.sort();
+    assert_eq!(
+        seen, expected,
+        "the before_id cursor must walk every tied row exactly once"
+    );
+}
+
+#[tokio::test]
+async fn audit_list_before_id_alone_is_a_no_op() {
+    let (mut conn, _c) = make_conn().await;
+    let ids = insert_three_tied_rows(&mut conn).await;
+
+    // `before_id` with no `before` applies no cursor filter at all (see the
+    // doc comment on `AuditFilters::before_id`). This pins that choice so it
+    // stays deliberate rather than a silent surprise.
+    let rows = audit::list_audit(
+        &mut conn,
+        &AuditFilters {
+            before_id: Some(ids[0]),
+            limit: 10,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("list with before_id alone");
+
+    assert_eq!(rows.len(), 3, "before_id alone must not filter any row out");
+}
+
 #[tokio::test]
 async fn audit_list_filter_by_actor() {
     let (mut conn, _c) = make_conn().await;

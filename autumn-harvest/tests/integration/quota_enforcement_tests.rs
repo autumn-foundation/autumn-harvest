@@ -79,6 +79,7 @@ use autumn_harvest::info::{ActivityHandlerFn, ActivityInfo, WorkflowHandlerFn};
 use autumn_harvest::models::{
     CompletionTriggerOutboxDb, NewCompletionTriggerOutboxDb, WorkflowExecution,
 };
+use autumn_harvest::queue;
 use autumn_harvest::quota::{MAX_QUOTA_KEY_BYTES, QuotaPolicy, QuotaResource};
 use autumn_harvest::schema::{harvest_completion_trigger_outbox, harvest_workflow_executions};
 use autumn_harvest::shard::{ShardRouter, ShardedDbPool, install_global_router};
@@ -87,15 +88,16 @@ use autumn_harvest::types::{
     ExecutionId, ParentClosePolicy, Priority, ShardId, StartSource, WorkflowIdConflictPolicy,
     WorkflowIdReusePolicy,
 };
-use autumn_harvest::worker::HandlerRegistry;
+use autumn_harvest::worker::{HandlerRegistry, Worker};
 use autumn_harvest::{ActivityContext, WorkflowContext, WorkflowInfo};
 use diesel::prelude::*;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use uuid::Uuid;
 
 use crate::integration_e2e::{
-    build_runtime_worker, build_test_pool, load_history_from_url, setup_test_database_url_or_env,
-    spawn_test_worker, wait_for_execution_state,
+    build_runtime_worker, build_test_pool, load_history_from_url, runtime_config,
+    setup_test_database_url_or_env, spawn_test_worker, wait_for_execution_state,
+    wait_for_execution_state_with_timeout,
 };
 
 // ---------------------------------------------------------------------------
@@ -134,20 +136,34 @@ fn wf_meta(quota: QuotaPolicy) -> WorkflowMetadata {
 /// `--test-threads=1` (see `.github/ci/integration-suites.txt`), so this is
 /// primarily a local-`cargo test`-without-that-flag safeguard, mirroring the
 /// `TEST_SERIAL` convention already used by `completion_callback_tests.rs`.
+///
+/// Every test takes it for its whole body through [`serial`], not only while
+/// a [`MetadataGuard`] is alive. Building a `HandlerRegistry` rebuilds the
+/// global from that registry's own `WorkflowInfo`s. Many tests here build one
+/// with no guard, and several drop their guard before they build a worker. A
+/// lock scoped to the guard left both cases unserialized. Under parallel
+/// `cargo test`, a concurrent test then erased another test's quota policy.
+/// The victim then admitted past its cap or resolved no quota key.
 static TEST_SERIAL: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+/// Take [`TEST_SERIAL`] for the rest of the calling test. Call it first.
+async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
+    TEST_SERIAL.lock().await
+}
 
 /// RAII installer for [`GLOBAL_WORKFLOW_METADATA`]: installs the given map,
 /// and restores whatever was there before on drop — including on a mid-test
 /// panic, unlike a bare manual take/restore pair.
+///
+/// It does not lock [`TEST_SERIAL`] itself. The calling test already holds
+/// that lock through [`serial`], and a `tokio` mutex is not re-entrant.
 struct MetadataGuard {
     previous: Option<HashMap<String, WorkflowMetadata>>,
-    _permit: tokio::sync::MutexGuard<'static, ()>,
 }
 
 impl MetadataGuard {
-    async fn install(map: HashMap<String, WorkflowMetadata>) -> Self {
-        let permit = TEST_SERIAL.lock().await;
+    fn install(map: HashMap<String, WorkflowMetadata>) -> Self {
         let previous = {
             let mut lock = GLOBAL_WORKFLOW_METADATA.write().expect("metadata lock");
             lock.take()
@@ -156,17 +172,14 @@ impl MetadataGuard {
             let mut lock = GLOBAL_WORKFLOW_METADATA.write().expect("metadata lock");
             *lock = Some(map);
         }
-        Self {
-            previous,
-            _permit: permit,
-        }
+        Self { previous }
     }
 
     /// Convenience for the common single-workflow-type case.
-    async fn install_one(workflow_name: &'static str, quota: QuotaPolicy) -> Self {
+    fn install_one(workflow_name: &'static str, quota: QuotaPolicy) -> Self {
         let mut map = HashMap::new();
         map.insert(workflow_name.to_string(), wf_meta(quota));
-        Self::install(map).await
+        Self::install(map)
     }
 }
 
@@ -478,12 +491,13 @@ fn assert_quota_exceeded(
 /// at exactly 100" success metric (the full-scale load test is Task 7).
 #[tokio::test]
 async fn active_executions_cap_admits_exactly_n_then_rejects_the_next() {
+    let _serial = serial().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
 
     let wf = leaked("quota_active_cap");
     let policy = QuotaPolicy::new("tenant_id").with_max_active_executions(5);
-    let _guard = MetadataGuard::install_one(wf, policy).await;
+    let _guard = MetadataGuard::install_one(wf, policy);
 
     for i in 0..5 {
         start_ok(&mut conn, wf, serde_json::json!({"tenant_id": "acme"})).await;
@@ -518,12 +532,13 @@ async fn active_executions_cap_admits_exactly_n_then_rejects_the_next() {
 /// no phantom task-queue row survive a rejected attempt.
 #[tokio::test]
 async fn rejected_start_creates_no_execution_or_task_row() {
+    let _serial = serial().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
 
     let wf = leaked("quota_no_phantom_rows");
     let policy = QuotaPolicy::new("tenant_id").with_max_active_executions(1);
-    let _guard = MetadataGuard::install_one(wf, policy).await;
+    let _guard = MetadataGuard::install_one(wf, policy);
 
     start_ok(&mut conn, wf, serde_json::json!({"tenant_id": "acme"})).await;
 
@@ -542,12 +557,13 @@ async fn rejected_start_creates_no_execution_or_task_row() {
 /// Two distinct resolved keys under one policy are independently capped.
 #[tokio::test]
 async fn active_executions_cap_isolates_per_key() {
+    let _serial = serial().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
 
     let wf = leaked("quota_isolate_per_key");
     let policy = QuotaPolicy::new("tenant_id").with_max_active_executions(1);
-    let _guard = MetadataGuard::install_one(wf, policy).await;
+    let _guard = MetadataGuard::install_one(wf, policy);
 
     start_ok(&mut conn, wf, serde_json::json!({"tenant_id": "acme"})).await;
     // A different key is unaffected by "acme" being at its cap.
@@ -577,6 +593,7 @@ async fn active_executions_cap_isolates_per_key() {
 /// never `quota_key` alone.
 #[tokio::test]
 async fn active_executions_cap_isolates_per_workflow_type() {
+    let _serial = serial().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
 
@@ -586,7 +603,7 @@ async fn active_executions_cap_isolates_per_workflow_type() {
     let mut map = HashMap::new();
     map.insert(wf_a.to_string(), wf_meta(policy));
     map.insert(wf_b.to_string(), wf_meta(policy));
-    let _guard = MetadataGuard::install(map).await;
+    let _guard = MetadataGuard::install(map);
 
     start_ok(&mut conn, wf_a, serde_json::json!({"tenant_id": "acme"})).await;
     // Type B, same resolved key "acme", is a DIFFERENT (workflow_name, key)
@@ -609,6 +626,7 @@ async fn active_executions_cap_isolates_per_workflow_type() {
 
 #[tokio::test]
 async fn no_policy_workflow_is_unaffected() {
+    let _serial = serial().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
 
@@ -628,6 +646,7 @@ async fn no_policy_workflow_is_unaffected() {
 
 #[tokio::test]
 async fn policy_with_no_caps_declared_is_a_noop() {
+    let _serial = serial().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
 
@@ -637,7 +656,7 @@ async fn policy_with_no_caps_declared_is_a_noop() {
     // reached.
     let policy = QuotaPolicy::new("tenant_id");
     assert!(!policy.has_any_cap());
-    let _guard = MetadataGuard::install_one(wf, policy).await;
+    let _guard = MetadataGuard::install_one(wf, policy);
 
     for _ in 0..20 {
         start_ok(&mut conn, wf, serde_json::json!({"tenant_id": "acme"})).await;
@@ -651,12 +670,13 @@ async fn policy_with_no_caps_declared_is_a_noop() {
 
 #[tokio::test]
 async fn unresolvable_key_fails_open() {
+    let _serial = serial().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
 
     let wf = leaked("quota_unresolvable_key");
     let policy = QuotaPolicy::new("tenant_id").with_max_active_executions(1);
-    let _guard = MetadataGuard::install_one(wf, policy).await;
+    let _guard = MetadataGuard::install_one(wf, policy);
 
     // The input has no `tenant_id` field at all -- `resolve_quota_key`
     // returns `None`, so enforcement is skipped for every one of these
@@ -700,12 +720,13 @@ async fn admit_batch(
 
 #[tokio::test]
 async fn batched_start_at_max_size_stamps_quota_key_from_first_admission() {
+    let _serial = serial().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
 
     let wf = leaked("quota_batched_start");
     let policy = QuotaPolicy::new("tenant_id").with_max_active_executions(100);
-    let _guard = MetadataGuard::install_one(wf, policy).await;
+    let _guard = MetadataGuard::install_one(wf, policy);
 
     let batch_key = format!("batch-{}", Uuid::new_v4().simple());
     let workflow_id = format!("wid-{}", Uuid::new_v4().simple());
@@ -760,12 +781,13 @@ async fn batched_start_at_max_size_stamps_quota_key_from_first_admission() {
 
 #[tokio::test]
 async fn batched_start_over_cap_is_rejected_at_fire_time() {
+    let _serial = serial().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
 
     let wf = leaked("quota_batched_start_over_cap");
     let policy = QuotaPolicy::new("tenant_id").with_max_active_executions(1);
-    let _guard = MetadataGuard::install_one(wf, policy).await;
+    let _guard = MetadataGuard::install_one(wf, policy);
 
     // Fill the cap of 1 with a direct (non-batched) start for the same key.
     start_ok(&mut conn, wf, serde_json::json!({"tenant_id": "acme"})).await;
@@ -836,6 +858,7 @@ async fn batched_start_over_cap_is_rejected_at_fire_time() {
 
 #[tokio::test]
 async fn history_bytes_cap_rejects_once_exceeded() {
+    let _serial = serial().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
 
@@ -845,7 +868,7 @@ async fn history_bytes_cap_rejects_once_exceeded() {
     // rejected on `HistoryBytes` alone (active_executions/dead_letters are
     // uncapped for this policy).
     let policy = QuotaPolicy::new("tenant_id").with_max_history_bytes(1);
-    let _guard = MetadataGuard::install_one(wf, policy).await;
+    let _guard = MetadataGuard::install_one(wf, policy);
 
     start_ok(&mut conn, wf, serde_json::json!({"tenant_id": "acme"})).await;
 
@@ -866,12 +889,13 @@ async fn history_bytes_cap_rejects_once_exceeded() {
 
 #[tokio::test]
 async fn dead_letters_cap_rejects_once_reached() {
+    let _serial = serial().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
 
     let wf = leaked("quota_dead_letters");
     let policy = QuotaPolicy::new("tenant_id").with_max_dead_letters(3);
-    let _guard = MetadataGuard::install_one(wf, policy).await;
+    let _guard = MetadataGuard::install_one(wf, policy);
 
     // A seed execution to hang the DLQ rows off of -- `dead_letter()`
     // resolves `workflow_name`/`quota_key` from this exec_id's OWN row, so
@@ -918,12 +942,13 @@ async fn dead_letters_cap_rejects_once_reached() {
 
 #[tokio::test]
 async fn active_executions_cap_frees_up_when_a_run_completes() {
+    let _serial = serial().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
 
     let wf = leaked("quota_frees_on_completion");
     let policy = QuotaPolicy::new("tenant_id").with_max_active_executions(1);
-    let _guard = MetadataGuard::install_one(wf, policy).await;
+    let _guard = MetadataGuard::install_one(wf, policy);
 
     let first = start_ok(&mut conn, wf, serde_json::json!({"tenant_id": "acme"})).await;
 
@@ -1101,6 +1126,7 @@ async fn start_root(
 /// run, not a fresh admission, so it never re-runs `check_quota`.
 #[tokio::test]
 async fn continue_as_new_same_type_propagates_quota_key() {
+    let _serial = serial().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
 
@@ -1152,6 +1178,7 @@ async fn continue_as_new_same_type_propagates_quota_key() {
 /// never populates (it uses the raw `HandlerRegistry::new` constructor).
 #[tokio::test]
 async fn continue_as_new_cross_type_re_resolves_quota_key() {
+    let _serial = serial().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
 
@@ -1198,6 +1225,7 @@ async fn continue_as_new_cross_type_re_resolves_quota_key() {
 /// the key -- "presence decides", not "inherit unless overridden".
 #[tokio::test]
 async fn continue_as_new_cross_type_to_no_quota_workflow_clears_quota_key() {
+    let _serial = serial().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
 
@@ -1280,6 +1308,7 @@ fn detached_quota_child<'a>(
 /// review).
 #[tokio::test]
 async fn detached_child_spawn_honors_target_quota_parks_parent_then_succeeds() {
+    let _serial = serial().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
 
@@ -1299,7 +1328,7 @@ async fn detached_child_spawn_honors_target_quota_parks_parent_then_succeeds() {
     // any `HandlerRegistry` -- so the blocker's `quota_key` is only stamped
     // correctly while this guard is installed (mirrors the pre-existing
     // `concurrent_runaway_tenant_is_capped_...` test's established pattern).
-    let blocker_guard = MetadataGuard::install_one(child_wf_name, child_quota_policy).await;
+    let blocker_guard = MetadataGuard::install_one(child_wf_name, child_quota_policy);
     let blocker = start_root(
         &mut conn,
         child_wf_name,
@@ -1447,6 +1476,7 @@ fn detached_quota_mixed_parent<'a>(
 /// (issue #946, Codex round-3 review).
 #[tokio::test]
 async fn detached_child_spawn_in_mixed_batch_honors_target_quota_parks_parent_then_succeeds() {
+    let _serial = serial().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
 
@@ -1457,7 +1487,7 @@ async fn detached_child_spawn_in_mixed_batch_honors_target_quota_parks_parent_th
     let mut child_info = wf_info(child_wf_name, detached_quota_child);
     child_info.quota = Some(child_quota_policy);
 
-    let blocker_guard = MetadataGuard::install_one(child_wf_name, child_quota_policy).await;
+    let blocker_guard = MetadataGuard::install_one(child_wf_name, child_quota_policy);
     let blocker = start_root(
         &mut conn,
         child_wf_name,
@@ -1553,6 +1583,7 @@ async fn detached_child_spawn_in_mixed_batch_honors_target_quota_parks_parent_th
 /// counting toward the `history_bytes` admission it is itself part of.
 #[tokio::test]
 async fn detached_child_spawn_quota_check_excludes_its_own_just_appended_history_bytes() {
+    let _serial = serial().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
 
@@ -1647,6 +1678,7 @@ fn detached_quota_multi_key_parent<'a>(
 /// This test exercises its dedup and sort over several pairs instead.
 #[tokio::test]
 async fn detached_child_multi_spawn_batch_locks_every_distinct_key_and_admits_all() {
+    let _serial = serial().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
 
@@ -1777,6 +1809,7 @@ fn awaited_quota_child<'a>(
 /// `recover_from_child_quota_exceeded` helper).
 #[tokio::test]
 async fn awaited_child_spawn_honors_target_quota_parks_parent_then_succeeds() {
+    let _serial = serial().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
 
@@ -1791,7 +1824,7 @@ async fn awaited_child_spawn_honors_target_quota_parks_parent_then_succeeds() {
     // blocker of the SAME target type -- see the detached-spawn test above
     // for why the `MetadataGuard` install and the task-row deletion are both
     // required for a correct blocker.
-    let blocker_guard = MetadataGuard::install_one(child_wf_name, child_quota_policy).await;
+    let blocker_guard = MetadataGuard::install_one(child_wf_name, child_quota_policy);
     let blocker = start_root(
         &mut conn,
         child_wf_name,
@@ -1915,6 +1948,7 @@ async fn awaited_child_spawn_honors_target_quota_parks_parent_then_succeeds() {
 /// for the full rationale).
 #[tokio::test]
 async fn awaited_child_spawn_quota_check_excludes_its_own_just_appended_history_bytes() {
+    let _serial = serial().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
 
@@ -1964,6 +1998,188 @@ async fn awaited_child_spawn_quota_check_excludes_its_own_just_appended_history_
 }
 
 // ---------------------------------------------------------------------------
+// Issue #1589: `persist_all_started_child_workflows`'s local-child loop
+// batches children into one multi-row INSERT per table when their OWN
+// `enforce_quota_admission` call is a proven no-op. That no-op case is:
+// no declared policy, no active cap, or no resolved key. A child with an
+// active cap keeps the original sequential insert-then-admit path
+// instead. These tests are the
+// direct proof that the split preserves `enforce_quota_admission`'s
+// graduated admission property, and its all-or-nothing rollback, when a
+// SINGLE decision mixes both groups. That mix is exactly the scenario the
+// split's own safety argument depends on.
+// ---------------------------------------------------------------------------
+
+fn mixed_fan_out_parent<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let uncapped_type = input["uncapped_type"]
+            .as_str()
+            .expect("input.uncapped_type must be present")
+            .to_string();
+        let capped_type = input["capped_type"]
+            .as_str()
+            .expect("input.capped_type must be present")
+            .to_string();
+        let capped_count = input["capped_count"].as_u64().unwrap_or(0);
+
+        // Three uncapped (batchable) children, then N capped (sequential)
+        // children sharing one quota key -- one decision, two groups.
+        let mut children: Vec<(String, serde_json::Value)> = (0..3)
+            .map(|i| (uncapped_type.clone(), serde_json::json!({"i": i})))
+            .collect();
+        for _ in 0..capped_count {
+            children.push((
+                capped_type.clone(),
+                serde_json::json!({"tenant_id": "acme"}),
+            ));
+        }
+
+        let results = ctx
+            .spawn_child_workflow_fan_out_raw(children)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({ "results": results }))
+    })
+}
+
+fn mixed_fan_out_leaf<'a>(
+    _ctx: &'a WorkflowContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move { Ok(serde_json::json!("leaf_done")) })
+}
+
+/// Within the cap: 3 uncapped children (batched) plus exactly 2 capped
+/// children sharing one key against a cap of 2 (sequential, admitted at
+/// the boundary). Both groups must be fully admitted -- the batched
+/// group's existence must not depend on, or interfere with, the
+/// sequential group's admission.
+#[tokio::test]
+async fn mixed_fan_out_admits_the_batched_group_and_exactly_caps_the_sequential_group() {
+    let _serial = serial().await;
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    let parent_wf = leaked("mixed_fanout_parent_ok");
+    let uncapped_wf = leaked("mixed_fanout_uncapped_ok");
+    let capped_wf = leaked("mixed_fanout_capped_ok");
+
+    let mut capped_info = wf_info(capped_wf, mixed_fan_out_leaf);
+    capped_info.quota = Some(QuotaPolicy::new("tenant_id").with_max_active_executions(2));
+
+    let reg = registry(vec![
+        wf_info(parent_wf, mixed_fan_out_parent),
+        wf_info(uncapped_wf, mixed_fan_out_leaf),
+        capped_info,
+    ]);
+
+    let parent = start_root(
+        &mut conn,
+        parent_wf,
+        &format!("parent-{}", Uuid::new_v4().simple()),
+        serde_json::json!({
+            "uncapped_type": uncapped_wf,
+            "capped_type": capped_wf,
+            "capped_count": 2u64,
+        }),
+    )
+    .await;
+
+    let worker = build_runtime_worker("w-1589-mixed-ok", 2, 1, reg);
+    let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&url));
+    wait_for_execution_state(&url, parent, "COMPLETED").await;
+    worker.shutdown();
+    handle.await.expect("worker join");
+
+    let count_sql =
+        "SELECT COUNT(*)::BIGINT AS n FROM harvest_workflow_executions WHERE workflow_name = $1";
+    assert_eq!(
+        count_rows(&mut conn, count_sql, &[uncapped_wf]).await,
+        3,
+        "all 3 batched (uncapped) children must exist regardless of the capped group \
+         sharing the same decision"
+    );
+    assert_eq!(
+        count_rows(&mut conn, count_sql, &[capped_wf]).await,
+        2,
+        "both capped children must be admitted -- exactly at the cap, none over"
+    );
+}
+
+/// Over the cap: 3 uncapped children (batched) plus 3 capped children
+/// sharing one key against a cap of 2. The 3rd capped child's admission
+/// must fail. That failure must roll back the WHOLE decision, including
+/// the already-batched uncapped group, since both groups persist inside
+/// the same outer transaction. The parent parks and retries rather than
+/// completing with a partial fan-out.
+#[tokio::test]
+async fn mixed_fan_out_rolls_back_the_whole_decision_when_the_sequential_group_exceeds_cap() {
+    let _serial = serial().await;
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    let parent_wf = leaked("mixed_fanout_parent_reject");
+    let uncapped_wf = leaked("mixed_fanout_uncapped_reject");
+    let capped_wf = leaked("mixed_fanout_capped_reject");
+
+    let mut capped_info = wf_info(capped_wf, mixed_fan_out_leaf);
+    capped_info.quota = Some(QuotaPolicy::new("tenant_id").with_max_active_executions(2));
+
+    let reg = registry(vec![
+        wf_info(parent_wf, mixed_fan_out_parent),
+        wf_info(uncapped_wf, mixed_fan_out_leaf),
+        capped_info,
+    ]);
+
+    let parent = start_root(
+        &mut conn,
+        parent_wf,
+        &format!("parent-{}", Uuid::new_v4().simple()),
+        serde_json::json!({
+            "uncapped_type": uncapped_wf,
+            "capped_type": capped_wf,
+            "capped_count": 3u64, // exceeds the cap of 2 WITHIN this one decision
+        }),
+    )
+    .await;
+
+    let worker = build_runtime_worker("w-1589-mixed-reject", 2, 1, reg);
+    let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&url));
+
+    // The rejection parks + backoff-retries the parent. It never
+    // completes, since every retry hits the identical over-cap decision.
+    // Give the worker a few cycles, then assert nothing from either group
+    // ever committed.
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+    assert_eq!(
+        load_execution(&mut conn, parent).await.state,
+        "RUNNING",
+        "the parent must stay RUNNING (parked/retrying), never completing on a \
+         decision whose capped group can never be fully admitted"
+    );
+    let count_sql =
+        "SELECT COUNT(*)::BIGINT AS n FROM harvest_workflow_executions WHERE workflow_name = $1";
+    assert_eq!(
+        count_rows(&mut conn, count_sql, &[uncapped_wf]).await,
+        0,
+        "the batched (uncapped) group's inserts must roll back too -- the whole \
+         decision is one transaction"
+    );
+    assert_eq!(
+        count_rows(&mut conn, count_sql, &[capped_wf]).await,
+        0,
+        "none of the over-cap capped group's children may survive a rolled-back decision"
+    );
+
+    worker.shutdown();
+    handle.await.expect("worker join");
+}
+
+// ---------------------------------------------------------------------------
 // Issue #946, Codex round-3 review — the child-timeout-race primitive
 // (`ctx.spawn_child_workflow_timeout`, issue #779) dispatches through
 // `persist_child_timeout_race` -> `insert_awaited_child_execution`, a THIRD
@@ -2009,6 +2225,7 @@ fn child_timeout_race_quota_child<'a>(
 /// a child execution row.
 #[tokio::test]
 async fn child_timeout_race_spawn_honors_target_quota_parks_parent_then_succeeds() {
+    let _serial = serial().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
 
@@ -2019,7 +2236,7 @@ async fn child_timeout_race_spawn_honors_target_quota_parks_parent_then_succeeds
     let mut child_info = wf_info(child_wf_name, child_timeout_race_quota_child);
     child_info.quota = Some(child_quota_policy);
 
-    let blocker_guard = MetadataGuard::install_one(child_wf_name, child_quota_policy).await;
+    let blocker_guard = MetadataGuard::install_one(child_wf_name, child_quota_policy);
     let blocker = start_root(
         &mut conn,
         child_wf_name,
@@ -2141,6 +2358,7 @@ async fn child_timeout_race_spawn_honors_target_quota_parks_parent_then_succeeds
 /// for the full rationale).
 #[tokio::test]
 async fn child_timeout_race_spawn_quota_check_excludes_its_own_just_appended_history_bytes() {
+    let _serial = serial().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
 
@@ -2244,6 +2462,7 @@ fn mixed_batch_quota_child<'a>(
 /// through the shared backoff helper.
 #[tokio::test]
 async fn mixed_batch_child_spawn_honors_target_quota_parks_parent_then_succeeds() {
+    let _serial = serial().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
 
@@ -2257,7 +2476,7 @@ async fn mixed_batch_child_spawn_honors_target_quota_parks_parent_then_succeeds(
     // Occupy the ONE `max_active_executions` slot for key "acme" -- see the
     // detached-spawn test above for why the `MetadataGuard` install and the
     // task-row deletion are both required for a correct blocker.
-    let blocker_guard = MetadataGuard::install_one(child_wf_name, child_quota_policy).await;
+    let blocker_guard = MetadataGuard::install_one(child_wf_name, child_quota_policy);
     let blocker = start_root(
         &mut conn,
         child_wf_name,
@@ -2344,6 +2563,138 @@ async fn mixed_batch_child_spawn_honors_target_quota_parks_parent_then_succeeds(
     );
 }
 
+/// Issue #1391: an old `mixed_signal_suspension` sentinel must not survive
+/// the quota-retry backoff.
+///
+/// `queue::requeue_for_retry` never touched `activity_name`. A sentinel from
+/// an earlier, unrelated cycle then kept matching the wake-forward arm of
+/// `primary_repend_workflow_task_query`. Any unrelated wake during the
+/// backoff window reset `scheduled_at` to now. This defeated the exact
+/// backoff that
+/// [`mixed_batch_child_spawn_honors_target_quota_parks_parent_then_succeeds`]
+/// proves lands in the future.
+#[tokio::test]
+async fn quota_retry_backoff_survives_stale_mixed_signal_suspension_sentinel() {
+    let _serial = serial().await;
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    let parent_wf_name = leaked("quota_sentinel_parent");
+    let child_wf_name = leaked("quota_sentinel_child");
+
+    let child_quota_policy = QuotaPolicy::new("tenant_id").with_max_active_executions(1);
+    let mut child_info = wf_info(child_wf_name, mixed_batch_quota_child);
+    child_info.quota = Some(child_quota_policy);
+
+    // Occupy the ONE `max_active_executions` slot for key "acme". See the
+    // detached-spawn test above for why this needs both the `MetadataGuard`
+    // install and the task-row deletion below.
+    let blocker_guard = MetadataGuard::install_one(child_wf_name, child_quota_policy);
+    let blocker = start_root(
+        &mut conn,
+        child_wf_name,
+        &format!("blocker-{}", Uuid::new_v4().simple()),
+        serde_json::json!({"tenant_id": "acme"}),
+    )
+    .await;
+    drop(blocker_guard);
+    diesel::sql_query("DELETE FROM harvest_task_queue WHERE workflow_exec_id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(blocker.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("delete blocker task row");
+
+    let parent = start_root(
+        &mut conn,
+        parent_wf_name,
+        &format!("parent-{}", Uuid::new_v4().simple()),
+        serde_json::json!({"child_type": child_wf_name}),
+    )
+    .await;
+    let parent_pre_worker_scheduled_at = task_queue_state(&mut conn, parent).await.scheduled_at;
+
+    // Simulate a stale sentinel from an earlier, unrelated timer+signal race
+    // (issue #476/#600). This is the pre-existing-row shape issue #1391
+    // describes, not one this cycle stamps itself.
+    diesel::sql_query(
+        "UPDATE harvest_task_queue SET activity_name = 'mixed_signal_suspension' \
+         WHERE workflow_exec_id = $1 AND task_type = 'workflow'",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(parent.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("stamp stale mixed_signal_suspension sentinel");
+
+    let reg = Arc::new(HandlerRegistry::new(
+        vec![
+            wf_info(parent_wf_name, mixed_batch_quota_parent),
+            child_info,
+        ],
+        vec![act_info(
+            "mixed_batch_quota_noop_activity",
+            mixed_batch_quota_noop_activity,
+        )],
+    ));
+    let worker = build_runtime_worker("w-1391-sentinel-quota", 2, 1, reg);
+    let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&url));
+
+    // While the blocker still holds the quota slot, `persist_mixed_suspension_batch`
+    // rejects with `QuotaExceeded`. The whole transaction rolls back. This
+    // includes any sentinel clear its own success path would have done. So
+    // the pre-stamped sentinel above survives into the backoff requeue.
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+    let (retried_scheduled_at, observed_now) =
+        task_scheduled_at_after_a_retry_cycle(&mut conn, parent, parent_pre_worker_scheduled_at)
+            .await;
+    assert!(
+        retried_scheduled_at > observed_now,
+        "the backoff requeue must land in the future before the wake below \
+         can prove it survives"
+    );
+
+    // The regression check: an unrelated wake during the backoff window must
+    // never pull `scheduled_at` backward. Before the fix, the surviving
+    // sentinel matched `primary_repend_workflow_task_query`'s wake-forward
+    // arm and reset `scheduled_at` to now, defeating the backoff entirely.
+    //
+    // This asserts `>=`, not `==`. The backoff may nearly have elapsed when
+    // the wake fires. Then the worker's own poll can reclaim the row first.
+    // A correct, unrelated retry cycle then moves `scheduled_at` further
+    // into the future. That case must not fail this test. Only a wake
+    // pulling the schedule earlier is the bug (issue #1391).
+    queue::wake_workflow_task(&mut conn, parent)
+        .await
+        .expect("simulated unrelated wake");
+    let after_wake = task_queue_state(&mut conn, parent).await;
+    assert!(
+        after_wake.scheduled_at >= retried_scheduled_at,
+        "an unrelated wake must not pull a quota-backoff's scheduled_at \
+         backward via a stale mixed_signal_suspension sentinel: before \
+         wake {retried_scheduled_at}, after wake {}",
+        after_wake.scheduled_at
+    );
+
+    // Free the quota slot and let the parent finish normally.
+    mark_terminal(&mut conn, blocker, "CANCELLED").await;
+
+    // This test's own sentinel stamp, polling wait, and wake round trip run
+    // before this point. That is on top of the shared setup every sibling
+    // quota test also pays for. That extra time can push the 10s default
+    // past its budget under a resource-constrained runner. So give this
+    // step a wider timeout, the same way
+    // `wait_for_execution_state_with_timeout`'s own doc comment describes.
+    wait_for_execution_state_with_timeout(
+        &url,
+        parent,
+        "COMPLETED",
+        std::time::Duration::from_secs(20),
+    )
+    .await;
+    worker.shutdown();
+    handle.await.expect("worker join");
+}
+
 // ---------------------------------------------------------------------------
 // Success metric — the issue's own runaway-tenant scenario, driven with
 // genuine concurrency (not the sequential admission loop
@@ -2370,6 +2721,7 @@ async fn mixed_batch_child_spawn_honors_target_quota_parks_parent_then_succeeds(
 // make the assertions below harder to read, not clearer.
 #[allow(clippy::similar_names)]
 async fn concurrent_runaway_tenant_is_capped_while_a_second_tenant_is_unaffected() {
+    let _serial = serial().await;
     const CAP: usize = 20;
     const OVERFLOW_ATTEMPTS: usize = 60; // total burst >> cap, guarantees rejections
     const TENANT_B_ATTEMPTS: usize = 15; // a well-behaved sibling tenant, unaffected
@@ -2381,7 +2733,7 @@ async fn concurrent_runaway_tenant_is_capped_while_a_second_tenant_is_unaffected
 
     let policy = QuotaPolicy::new("tenant_id")
         .with_max_active_executions(u32::try_from(CAP).expect("CAP fits in u32"));
-    let _guard = MetadataGuard::install_one(wf, policy).await;
+    let _guard = MetadataGuard::install_one(wf, policy);
 
     // Tenant A: a burst of concurrent starts, all sharing one quota key.
     let mut tasks = Vec::with_capacity(OVERFLOW_ATTEMPTS + TENANT_B_ATTEMPTS);
@@ -2528,6 +2880,7 @@ async fn concurrent_runaway_tenant_is_capped_while_a_second_tenant_is_unaffected
 /// cap" vector review agent 1 identified.
 #[tokio::test]
 async fn replace_execution_allow_duplicate_failed_only_enforces_quota_on_resurrection() {
+    let _serial = serial().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
     let wf = leaked("quota_replace_afo");
@@ -2550,7 +2903,7 @@ async fn replace_execution_allow_duplicate_failed_only_enforces_quota_on_resurre
     //    active admission for key "t1" (including a resurrection of the
     //    just-failed row above) must be rejected.
     let policy = QuotaPolicy::new("tenant_id").with_max_active_executions(1);
-    let _guard = MetadataGuard::install_one(wf, policy).await;
+    let _guard = MetadataGuard::install_one(wf, policy);
     start_ok(&mut conn, wf, serde_json::json!({"tenant_id": "t1"})).await;
     assert_eq!(active_count(&mut conn, wf, "t1").await, 1);
 
@@ -2590,6 +2943,7 @@ async fn replace_execution_allow_duplicate_failed_only_enforces_quota_on_resurre
 /// `replace_execution`.
 #[tokio::test]
 async fn replace_execution_terminate_if_running_enforces_quota_over_a_terminal_prior() {
+    let _serial = serial().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
     let wf = leaked("quota_replace_tir_terminal");
@@ -2606,7 +2960,7 @@ async fn replace_execution_terminate_if_running_enforces_quota_over_a_terminal_p
     mark_terminal(&mut conn, exec_id, "COMPLETED").await;
 
     let policy = QuotaPolicy::new("tenant_id").with_max_active_executions(1);
-    let _guard = MetadataGuard::install_one(wf, policy).await;
+    let _guard = MetadataGuard::install_one(wf, policy);
     start_ok(&mut conn, wf, serde_json::json!({"tenant_id": "t1"})).await;
     assert_eq!(active_count(&mut conn, wf, "t1").await, 1);
 
@@ -2647,12 +3001,13 @@ async fn replace_execution_terminate_if_running_enforces_quota_over_a_terminal_p
 /// `TerminateIfRunning`, with zero quota check anywhere in the path.
 #[tokio::test]
 async fn replace_execution_terminate_if_running_enforces_the_new_requests_resolved_key() {
+    let _serial = serial().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
     let wf = leaked("quota_replace_tir_crosskey");
 
     let policy = QuotaPolicy::new("tenant_id").with_max_active_executions(1);
-    let _guard = MetadataGuard::install_one(wf, policy).await;
+    let _guard = MetadataGuard::install_one(wf, policy);
 
     // Saturate "victim-tenant"'s cap of 1 via an unrelated, distinct
     // `workflow_id`.
@@ -2725,12 +3080,13 @@ async fn replace_execution_terminate_if_running_enforces_the_new_requests_resolv
 /// key is already exactly at its cap, since it is a net-zero swap.
 #[tokio::test]
 async fn replace_execution_paths_still_succeed_when_not_over_cap() {
+    let _serial = serial().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
     let wf = leaked("quota_replace_under_cap");
 
     let policy = QuotaPolicy::new("tenant_id").with_max_active_executions(2);
-    let _guard = MetadataGuard::install_one(wf, policy).await;
+    let _guard = MetadataGuard::install_one(wf, policy);
 
     // AllowDuplicateFailedOnly over a FAILED prior, well under cap.
     let wid1 = format!("wid-{}", Uuid::new_v4().simple());
@@ -2797,6 +3153,7 @@ async fn replace_execution_paths_still_succeed_when_not_over_cap() {
 /// no special-cased exemption logic required for either.
 #[tokio::test]
 async fn replace_execution_terminate_if_running_exempts_the_replaced_runs_own_history_bytes() {
+    let _serial = serial().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
     let wf = leaked("quota_replace_tir_history_bytes");
@@ -2806,7 +3163,7 @@ async fn replace_execution_terminate_if_running_exempts_the_replaced_runs_own_hi
     // pattern), so this key is only ever "under cap" while it has zero
     // RUNNING/PAUSED rows of its own.
     let policy = QuotaPolicy::new("tenant_id").with_max_history_bytes(1);
-    let _guard = MetadataGuard::install_one(wf, policy).await;
+    let _guard = MetadataGuard::install_one(wf, policy);
 
     let workflow_id = format!("wid-{}", Uuid::new_v4().simple());
     let (exec_id, outcome) = try_start(
@@ -2895,12 +3252,13 @@ async fn replace_execution_terminate_if_running_exempts_the_replaced_runs_own_hi
 /// though this one admission was not checked against it.
 #[tokio::test]
 async fn active_executions_cap_does_not_block_a_workflow_level_retry_continuation() {
+    let _serial = serial().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
     let wf = leaked("quota_retry_exemption");
 
     let policy = QuotaPolicy::new("tenant_id").with_max_active_executions(1);
-    let _guard = MetadataGuard::install_one(wf, policy).await;
+    let _guard = MetadataGuard::install_one(wf, policy);
 
     let input = serde_json::json!({"tenant_id": "acme"});
 
@@ -2982,6 +3340,7 @@ async fn active_executions_cap_does_not_block_a_workflow_level_retry_continuatio
 /// resource-cap rejection (AC4).
 #[tokio::test]
 async fn oversized_resolved_quota_key_is_rejected_before_any_db_write() {
+    let _serial = serial().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
     let wf = leaked("quota_key_length_oversized");
@@ -2989,7 +3348,7 @@ async fn oversized_resolved_quota_key_is_rejected_before_any_db_write() {
     // A generous resource cap -- the rejection below must be attributable to
     // the KEY LENGTH bound, not the active-executions count.
     let policy = QuotaPolicy::new("tenant_id").with_max_active_executions(1000);
-    let _guard = MetadataGuard::install_one(wf, policy).await;
+    let _guard = MetadataGuard::install_one(wf, policy);
 
     let oversized_tenant_id = "x".repeat(usize::try_from(MAX_QUOTA_KEY_BYTES).expect("small") + 1);
     let (rejected_id, outcome) = try_start(
@@ -3033,12 +3392,13 @@ async fn oversized_resolved_quota_key_is_rejected_before_any_db_write() {
 /// [`MAX_QUOTA_KEY_BYTES`] is rejected.
 #[tokio::test]
 async fn quota_key_exactly_at_the_length_bound_is_admitted() {
+    let _serial = serial().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
     let wf = leaked("quota_key_length_at_bound");
 
     let policy = QuotaPolicy::new("tenant_id").with_max_active_executions(1000);
-    let _guard = MetadataGuard::install_one(wf, policy).await;
+    let _guard = MetadataGuard::install_one(wf, policy);
 
     let exact_tenant_id = "x".repeat(usize::try_from(MAX_QUOTA_KEY_BYTES).expect("small"));
     assert_eq!(exact_tenant_id.len() as u64, MAX_QUOTA_KEY_BYTES);
@@ -3099,6 +3459,7 @@ fn oversized_key_phase_one<'a>(
 /// `continue_as_new_cross_type_re_resolves_quota_key`'s harness pattern.
 #[tokio::test]
 async fn continue_as_new_cross_type_oversized_quota_key_is_rejected() {
+    let _serial = serial().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
 
@@ -3162,6 +3523,155 @@ async fn continue_as_new_cross_type_oversized_quota_key_is_rejected() {
 }
 
 // ---------------------------------------------------------------------------
+// Issue #1409 — a continue-as-new redirected to a terminal failure by the
+// quota-key cap must still record the cycle's abandoned dispatches. That
+// is the same treatment as any other failing cycle (issue #952's synthetic
+// terminal pair).
+// ---------------------------------------------------------------------------
+
+const ISSUE_1409_ABANDONED_ACTIVITY_NAME: &str = "issue_1409_quota_abandoned_activity";
+
+/// Never actually runs -- the dispatch is abandoned in the same cycle it is
+/// pushed. Still must be a REGISTERED activity: the fleet capability-miss
+/// guard (issue #804) inspects every command in a decision cycle's batch.
+/// It checks abandoned dispatches too, before the cycle is allowed to run
+/// at all.
+fn issue_1409_noop_activity(
+    _ctx: &ActivityContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send>> {
+    Box::pin(async move { Ok(serde_json::json!({"noop": true})) })
+}
+
+/// [`oversized_key_phase_one`] plus an activity dispatched in the SAME
+/// decision cycle as the transition, abandoned when the cycle exits via
+/// continue-as-new.
+fn oversized_key_phase_one_with_abandoned_activity<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let target = input["next_type"]
+            .as_str()
+            .expect("input.next_type must be present")
+            .to_string();
+        let oversized_tenant_id = input["oversized_tenant_id"]
+            .as_str()
+            .expect("input.oversized_tenant_id must be present")
+            .to_string();
+        let target: &'static str = Box::leak(target.into_boxed_str());
+        let dispatch = ctx.execute_activity_raw(
+            ISSUE_1409_ABANDONED_ACTIVITY_NAME,
+            serde_json::json!({}),
+            "default",
+        );
+        let transition = ctx.continue_as_new_as_type(
+            target,
+            serde_json::json!({ "tenant_id": oversized_tenant_id }),
+        );
+        let _ = futures::join!(dispatch, transition);
+        unreachable!("neither branch resolves within a live decision cycle");
+    })
+}
+
+/// A cross-type transition redirected to a terminal failure by the
+/// oversized-quota-key bound must still record the abandoned activity
+/// dispatch from the SAME cycle. Mirrors
+/// `continue_as_new_cross_type_oversized_quota_key_is_rejected` above, plus
+/// the abandoned dispatch.
+#[tokio::test]
+async fn continue_as_new_cross_type_oversized_quota_key_still_records_its_abandoned_dispatch() {
+    let _serial = serial().await;
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    let phase1 = leaked("quota_can_oversized_abandoned_from");
+    let phase2 = leaked("quota_can_oversized_abandoned_to");
+    let workflow_id = format!("sub-{}", Uuid::new_v4().simple());
+
+    let oversized_tenant_id = "x".repeat(usize::try_from(MAX_QUOTA_KEY_BYTES).expect("small") + 1);
+
+    let predecessor = start_root(
+        &mut conn,
+        phase1,
+        &workflow_id,
+        serde_json::json!({
+            "next_type": phase2,
+            "oversized_tenant_id": oversized_tenant_id,
+        }),
+    )
+    .await;
+
+    // A generous resource cap on the TARGET type -- the rejection below must
+    // be attributable to the KEY LENGTH bound, not any active-executions
+    // count.
+    let mut target = wf_info(phase2, phase_two);
+    target.quota = Some(QuotaPolicy::new("tenant_id").with_max_active_executions(1000));
+
+    let reg = Arc::new(HandlerRegistry::new(
+        vec![
+            wf_info(phase1, oversized_key_phase_one_with_abandoned_activity),
+            target,
+        ],
+        vec![act_info(
+            ISSUE_1409_ABANDONED_ACTIVITY_NAME,
+            issue_1409_noop_activity,
+        )],
+    ));
+    let worker = build_runtime_worker("w-1409-quota-abandoned", 2, 1, reg);
+    let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&url));
+    let failed = wait_for_execution_state(&url, predecessor, "FAILED").await;
+    worker.shutdown();
+    handle.await.expect("worker join");
+
+    let error = failed
+        .error
+        .expect("a terminal failure must carry an error");
+    assert!(
+        error.contains(phase2) && error.contains("QuotaKey"),
+        "the failure must name the target type and the QuotaKey payload kind, got {error}"
+    );
+
+    let history = load_history_from_url(&url, predecessor).await;
+    assert!(
+        !history
+            .events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::WorkflowContinuedAsNew { .. })),
+        "a rejected cross-type transition must record no WorkflowContinuedAsNew"
+    );
+    assert!(
+        history.events.iter().any(|e| matches!(
+            e,
+            WorkflowEvent::ActivityScheduled { name, .. } if name == ISSUE_1409_ABANDONED_ACTIVITY_NAME
+        )),
+        "issue #1409: a continue-as-new redirected to a terminal failure by the quota-key cap \
+         must still record the cycle's abandoned activity dispatch; got {:?}",
+        history.events
+    );
+    assert!(
+        history.events.iter().any(|e| matches!(
+            e,
+            WorkflowEvent::ActivityFailed {
+                non_retryable: true,
+                ..
+            }
+        )),
+        "the abandoned dispatch must carry its synthetic terminal half of the pair; got {:?}",
+        history.events
+    );
+    assert!(
+        matches!(
+            history.events.last(),
+            Some(WorkflowEvent::WorkflowFailed { .. })
+        ),
+        "the abandoned-dispatch pair must be appended BEFORE the terminal event, not after \
+         (issue #1409's event-id ordering guarantee); got {:?}",
+        history.events
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Issue #946, Codex round-3 review — a SAME-SHARD completion trigger whose
 // TARGET's per-tenant quota is exhausted at fire time must defer the start
 // to the durable outbox for retry, NOT propagate `Err` out of
@@ -3192,6 +3702,7 @@ fn quota_trigger_target<'a>(
 /// and letting it propagate out of the whole terminal-sealing transaction.
 #[tokio::test]
 async fn completion_trigger_defers_to_outbox_when_target_quota_exceeded() {
+    let _serial = serial().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
 
@@ -3205,7 +3716,7 @@ async fn completion_trigger_defers_to_outbox_when_target_quota_exceeded() {
     // fix under test) is what actually runs, mirroring the convention in
     // `workflow_id_targeted_tests.rs`/`transactional_start_tests.rs`.
     autumn_harvest::shard::install_global_router(autumn_harvest::shard::ShardRouter::single());
-    let _sharded_pool = autumn_harvest::shard::ShardedDbPool::single(build_test_pool(&url));
+    let sharded_pool = autumn_harvest::shard::ShardedDbPool::single(build_test_pool(&url));
 
     let source_wf = leaked("quota_trigger_source");
     let target_wf = leaked("quota_trigger_target");
@@ -3229,7 +3740,7 @@ async fn completion_trigger_defers_to_outbox_when_target_quota_exceeded() {
     // `awaited_child_spawn_honors_target_quota_parks_parent_then_succeeds`
     // test above; `target_info.quota` is what makes the trigger's own
     // admission see the policy once the worker is running.
-    let guard = MetadataGuard::install_one(target_wf, target_quota_policy).await;
+    let guard = MetadataGuard::install_one(target_wf, target_quota_policy);
 
     // Occupy the ONE `max_active_executions` slot for key "acme", then
     // delete its task row so it can never complete/free the slot on its own.
@@ -3272,7 +3783,35 @@ async fn completion_trigger_defers_to_outbox_when_target_quota_exceeded() {
     .await;
 
     let reg = registry(vec![wf_info(source_wf, quota_trigger_source), target_info]);
-    let worker = build_runtime_worker("w-946-trigger-quota", 2, 1, reg);
+    // `build_runtime_worker` leaves `WorkerRuntimeConfig::sharded_pool`
+    // unset (`None`). That is fine for every OTHER test in this file. None
+    // of them depend on the worker's own background outbox scanner
+    // resolving a target shard's pool.
+    //
+    // This test does. Its "money" mechanism is the SAME-SHARD outbox
+    // retry. `enforce_completion_triggers_outbox` needs `sharded_pool`, not
+    // just `shard_assignments`, to look up shard 0's connection pool at
+    // all. With it `None`, every scanner tick hits the early "missing
+    // pool" branch and backs off without ever attempting the retry.
+    //
+    // A one-shot "immediate relay" spawn fires inline when the row is
+    // deferred. It reads the separate `GLOBAL_SHARDED_POOL` static
+    // instead, so it can still succeed. But that depends on WHEN it runs.
+    // It only sees the freed slot if it happens to run AFTER
+    // `mark_terminal` below -- a scheduling order, not a guarantee.
+    //
+    // Wiring the same `sharded_pool` into the worker's own config gives
+    // the scanner the retry path its own doc comment above describes.
+    // That replaces the test's reliance on that race (issue #1685's
+    // Semaphore health-report series).
+    let mut worker_cfg = runtime_config(
+        "w-946-trigger-quota",
+        2,
+        1,
+        std::time::Duration::from_secs(10),
+    );
+    worker_cfg.sharded_pool = Some(sharded_pool);
+    let worker = Arc::new(Worker::new(worker_cfg, reg).expect("worker should build"));
     let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&url));
 
     // The money assertion: the source reaches COMPLETED even though its
@@ -3281,7 +3820,28 @@ async fn completion_trigger_defers_to_outbox_when_target_quota_exceeded() {
     // WHOLE persist transaction -- including the source's own
     // `WorkflowCompleted` append -- leaving it stuck RUNNING forever with no
     // error ever recorded.
-    wait_for_execution_state(&url, source, "COMPLETED").await;
+    //
+    // A wider bound than the usual 10s default (CI flake observed on PR
+    // #1673). This decision cycle resolves the trigger's target quota,
+    // persists the blocked outbox row, and completes the source. All of
+    // that happens before this point. That can push the 10s default past
+    // its budget under a resource-constrained runner, the same way
+    // `wait_for_execution_state_with_timeout`'s own doc comment describes.
+    //
+    // A separate, pre-existing issue, unrelated to this bound: this test
+    // has been seen to fail on one specific CI shard. It times out at
+    // whatever bound is configured, with no variance. That matches a
+    // genuine stall, not a slow-but-progressing run. It reproduces on
+    // trunk-dev at a commit this branch never touched. Widening this
+    // number further does not fix that. It needs its own investigation.
+    // This stays at #1673's own value rather than guessing higher.
+    wait_for_execution_state_with_timeout(
+        &url,
+        source,
+        "COMPLETED",
+        std::time::Duration::from_secs(30),
+    )
+    .await;
 
     #[derive(diesel::QueryableByName)]
     struct OutboxCount {
@@ -3320,7 +3880,14 @@ async fn completion_trigger_defers_to_outbox_when_target_quota_exceeded() {
     // start the target.
     mark_terminal(&mut conn, blocker, "CANCELLED").await;
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    // A wider bound than the usual 10s default (issue #1685's Semaphore
+    // health-report series, tracked as this test's recurring "outbox-retry
+    // timeout" flake). The sweep runs on the worker's background
+    // timeout-checker loop, not on a dedicated fast path, so it shares CPU
+    // with every other in-flight decision cycle. That leaves the 10s
+    // default too tight under a busy CI runner, the same margin problem
+    // `wait_for_execution_state_with_timeout`'s own doc comment describes.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         let n = count_rows(&mut conn, target_row_count_sql, &[target_wf]).await;
         if n == 2 {
@@ -3467,6 +4034,7 @@ async fn set_outbox_created_at(
 /// instead of being starved forever.
 #[tokio::test]
 async fn quota_blocked_outbox_row_gets_backoff_and_does_not_starve_a_sibling_row() {
+    let _serial = serial().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
 
@@ -3477,7 +4045,7 @@ async fn quota_blocked_outbox_row_gets_backoff_and_does_not_starve_a_sibling_row
     let free_wf = leaked("outbox_backoff_free");
 
     let quota_policy = QuotaPolicy::new("tenant_id").with_max_active_executions(1);
-    let guard = MetadataGuard::install_one(blocked_wf, quota_policy).await;
+    let guard = MetadataGuard::install_one(blocked_wf, quota_policy);
 
     // Occupy the one slot for tenant "acme" so any fresh admission of
     // `blocked_wf` under that key is rejected with `QuotaExceeded`.
@@ -3610,6 +4178,189 @@ async fn quota_blocked_outbox_row_gets_backoff_and_does_not_starve_a_sibling_row
     drop(guard);
 }
 
+/// Issue #1392: a `QuotaBlocked` outcome must stamp `next_attempt_at` from
+/// Postgres's own clock, not the scanning replica's host clock.
+///
+/// A host-computed deadline can already be due by the time a peer replica
+/// checks it, when that replica's clock runs ahead. This test compares the
+/// written deadline against the database's own `NOW()`, never this test
+/// process's `chrono::Utc::now()`. It then catches a regression back to the
+/// host clock, regardless of which replica's clock the regression favors.
+#[tokio::test]
+async fn quota_blocked_outbox_backoff_lands_on_the_database_clock() {
+    let _serial = serial().await;
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    install_global_router(ShardRouter::single());
+    let sharded_pool = Some(ShardedDbPool::single(build_test_pool(&url)));
+
+    let blocked_wf = leaked("outbox_backoff_clock");
+    let quota_policy = QuotaPolicy::new("tenant_id").with_max_active_executions(1);
+    let guard = MetadataGuard::install_one(blocked_wf, quota_policy);
+
+    // Occupy the one slot so the outbox relay's admission attempt below
+    // hits `QuotaExceeded`.
+    let blocker = start_root(
+        &mut conn,
+        blocked_wf,
+        &format!("blocker-{}", Uuid::new_v4().simple()),
+        serde_json::json!({"tenant_id": "acme"}),
+    )
+    .await;
+
+    let outbox_id = insert_outbox_row(
+        &mut conn,
+        blocked_wf,
+        serde_json::json!({"tenant_id": "acme"}),
+    )
+    .await;
+
+    // Bracket the write with DB-clock reads taken just before and just
+    // after (Codex review on this PR). The actual `clock_timestamp()`
+    // write happens somewhere inside this call, at a point this test never
+    // observes directly. A single `db_clock_now()` sampled only afterward
+    // would be a fixed race instead. Any scheduling delay between the
+    // write and that later probe reads as a shrunken backoff, and fails
+    // the test even on correct code.
+    let before = queue::db_clock_now(&mut conn)
+        .await
+        .expect("probe database clock before");
+    enforce_completion_triggers_outbox(&mut conn, &NoOpMetrics, &sharded_pool, &[ShardId::new(0)])
+        .await
+        .expect("outbox scan hits the quota-blocked target");
+    let after = queue::db_clock_now(&mut conn)
+        .await
+        .expect("probe database clock after");
+
+    let deadline = outbox_next_attempt_at(&mut conn, outbox_id)
+        .await
+        .expect("a QuotaBlocked outcome must stamp next_attempt_at");
+
+    // Mirrors `QUOTA_REDEFER_BACKOFF` (5 seconds). This tracks that
+    // production constant the same way `CLAIM_BATCH_LIMIT` above does, so
+    // a changed backoff value fails this test loudly.
+    assert_next_attempt_at_matches_backoff_on_db_clock(
+        deadline,
+        before,
+        after,
+        chrono::Duration::seconds(5),
+    );
+
+    mark_terminal(&mut conn, blocker, "CANCELLED").await;
+    drop(guard);
+}
+
+/// Assert `deadline` lands within a tight tolerance of `expected_backoff`
+/// past the database's own clock (issue #1392 review).
+///
+/// `before` and `after` bracket the write. Both are read from the
+/// database's own clock, taken just before and just after the operation
+/// that performs the write. The write's own `clock_timestamp()` reading
+/// falls somewhere between the two. So `deadline` must land in
+/// `[before + expected_backoff, after + expected_backoff]`, widened by a
+/// small tolerance for cross-request rounding. This never depends on how
+/// long the bracketed operation itself takes. It does not race a slow or
+/// loaded test run the way a single post-hoc clock probe would.
+fn assert_next_attempt_at_matches_backoff_on_db_clock(
+    deadline: chrono::DateTime<chrono::Utc>,
+    before: chrono::DateTime<chrono::Utc>,
+    after: chrono::DateTime<chrono::Utc>,
+    expected_backoff: chrono::Duration,
+) {
+    const TOLERANCE_MS: i64 = 750;
+    let tolerance = chrono::Duration::milliseconds(TOLERANCE_MS);
+    let lower = before + expected_backoff - tolerance;
+    let upper = after + expected_backoff + tolerance;
+    assert!(
+        deadline >= lower && deadline <= upper,
+        "expected next_attempt_at ({deadline}) to land within \
+         {TOLERANCE_MS}ms of {expected_backoff} past the database's own \
+         clock, bracketed between before={before} and after={after} \
+         (window [{lower}, {upper}])"
+    );
+}
+
+/// Issue #1392: a scan that cannot even ATTEMPT a relay must also stamp
+/// `next_attempt_at` from Postgres's own clock, via
+/// `stamp_outbox_relay_backoff`. Here, the target shard has no configured
+/// pool.
+///
+/// Distinct from `quota_blocked_outbox_backoff_lands_on_the_database_clock`
+/// above: that test drives `relay_gate_checked_start`'s `QuotaExceeded` arm.
+/// This one drives the separate missing-pool arm in
+/// `enforce_completion_triggers_outbox_with_codecs` itself.
+#[tokio::test]
+async fn outbox_relay_missing_pool_backoff_lands_on_the_database_clock() {
+    let _serial = serial().await;
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+
+    install_global_router(ShardRouter::single());
+
+    // Shard 7 is never registered with a pool. The per-row lookup inside
+    // the scanner then finds no target pool, and takes the missing-pool
+    // backoff path instead of attempting a relay.
+    let unreachable_shard = ShardId::new(7);
+    let mut pools = std::collections::BTreeMap::new();
+    pools.insert(ShardId::new(0), build_test_pool(&url));
+    let sharded_pool = Some(ShardedDbPool::from_map(pools, ShardId::new(0)));
+
+    let outbox_id = diesel::insert_into(harvest_completion_trigger_outbox::table)
+        .values(&NewCompletionTriggerOutboxDb {
+            source_exec_id: Uuid::new_v4(),
+            trigger_id: Uuid::new_v4(),
+            target_shard: unreachable_shard.as_i32(),
+            target_workflow_name: leaked("outbox_missing_pool").to_string(),
+            target_workflow_id: format!("target-{}", Uuid::new_v4().simple()),
+            target_input: serde_json::json!({}),
+            // A named queue skips the default-shard queue-name lookup this
+            // scan would otherwise attempt, keeping the test focused on the
+            // missing-pool backoff path alone.
+            queue_name: Some("outbox-missing-pool-queue".to_string()),
+            concurrency_key: None,
+            concurrency_limit: None,
+            priority: serde_json::to_value(Priority::default()).unwrap(),
+            max_workflow_input_bytes: 1_000_000,
+        })
+        .get_result::<CompletionTriggerOutboxDb>(&mut conn)
+        .await
+        .expect("insert outbox row")
+        .id;
+
+    // Bracket the write with DB-clock reads taken just before and just
+    // after (Codex review on this PR). See
+    // `assert_next_attempt_at_matches_backoff_on_db_clock`'s doc comment
+    // for why a single post-hoc clock probe races a loaded test run.
+    let before = queue::db_clock_now(&mut conn)
+        .await
+        .expect("probe database clock before");
+    enforce_completion_triggers_outbox(
+        &mut conn,
+        &NoOpMetrics,
+        &sharded_pool,
+        &[unreachable_shard],
+    )
+    .await
+    .expect("outbox scan hits the missing-pool target");
+    let after = queue::db_clock_now(&mut conn)
+        .await
+        .expect("probe database clock after");
+
+    let deadline = outbox_next_attempt_at(&mut conn, outbox_id)
+        .await
+        .expect("a missing-pool scan must stamp next_attempt_at");
+
+    // Mirrors `OUTBOX_RELAY_FAILURE_BACKOFF` (5 seconds), the same value as
+    // `QUOTA_REDEFER_BACKOFF` above but a separate production constant.
+    assert_next_attempt_at_matches_backoff_on_db_clock(
+        deadline,
+        before,
+        after,
+        chrono::Duration::seconds(5),
+    );
+}
+
 /// Issue #1227 Finding 4, Codex round-1 P1 (PR #1386): ordering the claim
 /// batch by `created_at` ALONE (the initial fix above) is not enough. Once
 /// `WorkerRuntimeConfig::poll_interval` is at or above `QUOTA_REDEFER_BACKOFF`
@@ -3624,6 +4375,7 @@ async fn quota_blocked_outbox_row_gets_backoff_and_does_not_starve_a_sibling_row
 /// backlog.
 #[tokio::test]
 async fn quota_blocked_outbox_never_attempted_rows_outrank_expired_quota_retries() {
+    let _serial = serial().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
 
@@ -3640,7 +4392,7 @@ async fn quota_blocked_outbox_never_attempted_rows_outrank_expired_quota_retries
     // due for another (a slow poll interval's steady state), not a
     // one-off block that clears on its own.
     let quota_policy = QuotaPolicy::new("tenant_id").with_max_active_executions(1);
-    let _guard = MetadataGuard::install_one(blocked_wf, quota_policy).await;
+    let _guard = MetadataGuard::install_one(blocked_wf, quota_policy);
     start_root(
         &mut conn,
         blocked_wf,
@@ -3732,6 +4484,7 @@ async fn quota_blocked_outbox_never_attempted_rows_outrank_expired_quota_retries
 /// fresh flood claim the whole batch.
 #[tokio::test]
 async fn quota_blocked_outbox_retry_row_is_not_starved_by_a_flood_of_fresh_rows() {
+    let _serial = serial().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
 
@@ -3789,6 +4542,7 @@ async fn quota_blocked_outbox_retry_row_is_not_starved_by_a_flood_of_fresh_rows(
 /// ALL delivered in a single scan, not just the first 40.
 #[tokio::test]
 async fn quota_blocked_outbox_backfills_unused_retry_capacity_with_fresh_rows() {
+    let _serial = serial().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
 
@@ -3840,6 +4594,7 @@ async fn quota_blocked_outbox_backfills_unused_retry_capacity_with_fresh_rows() 
 /// the healthy row would never be reached.
 #[tokio::test]
 async fn quota_blocked_outbox_backs_off_rows_targeting_an_unconfigured_shard() {
+    let _serial = serial().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
 
@@ -3965,6 +4720,7 @@ async fn quota_blocked_outbox_backs_off_rows_targeting_an_unconfigured_shard() {
 /// clobbered by a stale reader waiting behind it.
 #[tokio::test]
 async fn quota_blocked_outbox_relay_backoff_stamp_skips_a_concurrently_claimed_row() {
+    let _serial = serial().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
     let mut locker_conn = connect(&url).await;

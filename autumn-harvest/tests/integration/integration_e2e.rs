@@ -297,7 +297,66 @@ const INIT_SQL: &str = concat!(
     ),
     // issue #1312: the fenced by-id claim reads the DR generation row, so this
     // bundle carries the cross-region DR tables.
-    include_str!("../../migrations/20260726000000_harvest_shard_generation/up.sql")
+    include_str!("../../migrations/20260726000000_harvest_shard_generation/up.sql"),
+    "\n",
+    // issue #1317: migrated_run_terminal_at column on
+    // harvest_workflow_executions. REQUIRED for the same reason as the
+    // #945/#964/#1127/#1227 columns above. `WorkflowExecution::as_select()`
+    // names every column, so every read-back in this suite (and in every
+    // suite that borrows `setup_test_database_url_or_env` from here) fails.
+    // The failure names `column
+    // harvest_workflow_executions.migrated_run_terminal_at does not exist`,
+    // even for a plain root start with nothing to do with shard
+    // rebalancing. This gap goes uncaught locally with
+    // `HARVEST_TEST_DATABASE_URL` set, since that path migrates from the
+    // full `migrations/` directory, not from this partial bundle.
+    include_str!("../../migrations/20260915231809_harvest_migrated_seal_terminal_at/up.sql"),
+    "\n",
+    // issue #1317 review (P1 follow-up): staging_vacated_state column on
+    // harvest_workflow_executions, required for the same reason as the
+    // migrated_run_terminal_at column above -- `WorkflowExecution::as_select()`
+    // names it unconditionally.
+    include_str!("../../migrations/20260916151612_harvest_staging_vacated_state/up.sql"),
+    "\n",
+    // issue #1596 review: staging_vacated_by column on
+    // harvest_workflow_executions, required for the same reason as the
+    // staging_vacated_state column above -- `WorkflowExecution::as_select()`
+    // names it unconditionally.
+    include_str!("../../migrations/20260920014641_harvest_staging_vacated_by/up.sql"),
+    "\n",
+    // Issue #1685 root cause: this migration was never added here when it
+    // landed. Every testcontainers-provisioned test database was missing
+    // `target_shard`/`target_workflow_name` on `harvest_completion_trigger_fires`.
+    // `completion_trigger.rs` inserts into that table unconditionally. That
+    // insert runs inside the same decision-cycle transaction that marks a
+    // source workflow COMPLETED. The missing column failed the insert with a
+    // Postgres "column does not exist" error, on every attempt. The failed
+    // insert rolled back the whole transaction, including the source's own
+    // completion. The task then retried the identical failure forever, so
+    // any test on this path hung until its outer wait timed out.
+    //
+    // A persistent, already-migrated `HARVEST_TEST_DATABASE_URL` database
+    // never showed this bug. It already carried the column, from being
+    // migrated over time. Only a throwaway testcontainers database,
+    // provisioned solely from this constant, was affected. See the
+    // CI-health report series under `docs/rnd/*-ci-health-semaphore-*.md`
+    // for the full investigation this closes.
+    include_str!("../../migrations/20260920215812_harvest_completion_trigger_fires_target/up.sql"),
+    "\n",
+    // issue #1402: timer_fires_at column on harvest_task_queue. REQUIRED, not
+    // optional. `queue::reschedule_task`'s changeset names this column
+    // unconditionally. The repend queries that clear it --
+    // `primary_repend_workflow_task_query`,
+    // `release_suspended_workflow_claim_query`, and the three backoff-retry
+    // requeue queries -- do too. Without it, every one of those writes fails
+    // with `column "timer_fires_at" of relation "harvest_task_queue" does
+    // not exist`. That failure takes the same silent-rollback,
+    // retried-forever, eventual-timeout shape as the #1685/#1596/#1317 gaps
+    // above. It is the same omission class, caught the same way. A local
+    // run with `HARVEST_TEST_DATABASE_URL` set does not catch this gap;
+    // that path migrates from the full `migrations/` directory, not from
+    // this deliberately partial bundle.
+    include_str!("../../migrations/20260921011505_harvest_task_queue_timer_fires_at/up.sql")
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
@@ -423,7 +482,19 @@ const LEGACY_INIT_SQL: &str = concat!(
     // every deployment that never runs a rebalance.
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_to_shard INTEGER NULL;\n",
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_at TIMESTAMPTZ NULL;\n",
-    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_from_shards JSONB NULL;\n"
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_from_shards JSONB NULL;\n",
+    // issue #1317: WorkflowExecution::as_select() also references this
+    // column, for the same reason as the three rebalancing columns above.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_run_terminal_at TIMESTAMPTZ NULL;\n",
+    // fresh review, P1 follow-up: WorkflowExecution::as_select() also
+    // references this column, for the same reason as the column above.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS migrated_run_terminal_state TEXT NULL;\n",
+    // issue #1317 review (P1 follow-up): WorkflowExecution::as_select() also
+    // references this column, for the same reason as the column above.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS staging_vacated_state TEXT NULL;\n",
+    // issue #1596 review: WorkflowExecution::as_select() also references
+    // this column, for the same reason as the column above.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS staging_vacated_by UUID NULL;\n"
 );
 
 /// Start a Postgres container with the harvest schema applied and return
@@ -823,16 +894,39 @@ pub(crate) async fn load_child_executions_from_url(
         .expect("failed to reload child workflow executions")
 }
 
+/// Issue #1298: `insert_workflow_execution()` must be safe to call more than
+/// once against the same database. A fixed `workflow_id` collided with the
+/// partial `UNIQUE(workflow_name, workflow_id)` active index on the second
+/// call. That index also covers a fresh `RUNNING` row, not only a sealed
+/// one. The documented `HARVEST_TEST_DATABASE_URL` fallback runs more than
+/// one test in a process, so it hits this exact path.
+#[tokio::test]
+async fn insert_workflow_execution_helper_is_safe_to_call_more_than_once() {
+    let (mut conn, _container) = setup_test_db().await;
+
+    let first = insert_workflow_execution(&mut conn).await;
+    let second = insert_workflow_execution(&mut conn).await;
+
+    assert_ne!(
+        first, second,
+        "each call should mint a distinct execution, never reusing a row"
+    );
+}
+
 /// Insert a minimal `harvest_workflow_executions` row and return its UUID.
 pub(crate) async fn insert_workflow_execution(conn: &mut AsyncPgConnection) -> ExecutionId {
     let exec_id = ExecutionId::new();
+    // Unique per call so repeated runs against the same (non-throwaway)
+    // database never collide on the partial `UNIQUE(workflow_name, workflow_id)`
+    // active index (issue #1298).
+    let workflow_id = format!("e2e-wf-{}", Uuid::new_v4().simple());
     let row = NewWorkflowExecution {
         quota_key: None,
         continued_from_exec_id: None,
         first_exec_id: None,
         id: exec_id.as_uuid(),
         workflow_name: "e2e_test_workflow",
-        workflow_id: "e2e-wf-001",
+        workflow_id: &workflow_id,
         run_id: Uuid::new_v4(),
         shard_id: 0,
         input: serde_json::json!({"test": true}),
@@ -937,10 +1031,8 @@ pub(crate) async fn insert_workflow_execution_on_shard(
 }
 
 /// Insert a RUNNING execution with a caller-supplied `workflow_id` (all other
-/// fields mirror [`insert_workflow_execution`]). Needed when a single test/setup
-/// inserts more than one live execution: they would otherwise collide on the
-/// partial `UNIQUE(workflow_name, workflow_id)` active index that
-/// [`insert_workflow_execution`]'s hardcoded id trips on a second call.
+/// fields mirror [`insert_workflow_execution`]). Use this when a test needs a
+/// specific, known `workflow_id`; [`insert_workflow_execution`] mints its own.
 pub(crate) async fn insert_workflow_execution_with_id(
     conn: &mut AsyncPgConnection,
     workflow_id: &str,
@@ -1305,7 +1397,7 @@ pub(crate) async fn wait_for_execution_state(
 /// for tests whose expected wall-clock (e.g. many genuinely-concurrent
 /// children each sleeping for real time) can exceed the 10s default under
 /// resource-constrained CI runners.
-async fn wait_for_execution_state_with_timeout(
+pub(crate) async fn wait_for_execution_state_with_timeout(
     database_url: &str,
     exec_id: ExecutionId,
     expected_state: &str,
@@ -1613,8 +1705,20 @@ fn slow_activity<'a>(
     _ctx: &'a ActivityContext,
     input: serde_json::Value,
 ) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    // A fixed sleep raced the 100ms StartToClose timeout below. Under a
+    // loaded CI runner, a delayed scanner tick let the activity finish
+    // first. That changed the event history this test asserts on. It
+    // failed twice in a row on this PR (issue #1272).
+    //
+    // Sleep past the test's own 10-second bound instead. The activity
+    // then cannot complete before the wait loop gives up. The only way
+    // to reach FAILED is the StartToClose timeout.
+    //
+    // `worker.shutdown()`'s 1-second budget does not abort this task. It
+    // only stops waiting for it. The test's own runtime drops it at
+    // teardown.
     Box::pin(async move {
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::time::sleep(Duration::from_secs(30)).await;
         Ok(input)
     })
 }
@@ -3472,7 +3576,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                     name: "slow_activity",
                     module: "integration_e2e",
                     default_retry_policy: None,
-                    default_start_to_close: Some(Duration::from_millis(50)),
+                    default_start_to_close: Some(Duration::from_millis(100)),
                     default_heartbeat_timeout: None,
                     default_schedule_to_start: None,
                     default_schedule_to_close: None,
@@ -3525,9 +3629,13 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
         error.contains("StartToClose") && error.contains("slow_activity")
     }));
 
+    // Issue #1558: `started_at` (the StartToClose deadline anchor) is stamped
+    // at task claim, before the dispatch pipeline appends `ActivityStarted`.
+    // A short `default_start_to_close` can let enforcement win that race and
+    // fail the task first, so `ActivityStarted` never appends. Both shapes
+    // are correct engine behavior; accept either.
     let history = load_history_from_url(&database_url, exec_id).await;
-    assert!(matches!(
-        history.events.as_slice(),
+    match history.events.as_slice() {
         [
             WorkflowEvent::WorkflowStarted { .. },
             WorkflowEvent::ActivityScheduled { .. },
@@ -3538,7 +3646,17 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
             },
             WorkflowEvent::WorkflowFailed { .. },
         ]
-    ));
+        | [
+            WorkflowEvent::WorkflowStarted { .. },
+            WorkflowEvent::ActivityScheduled { .. },
+            WorkflowEvent::ActivityTimedOut {
+                timeout_type: TimeoutType::StartToClose,
+                ..
+            },
+            WorkflowEvent::WorkflowFailed { .. },
+        ] => {}
+        other => panic!("history did not match the expected event shape, got {other:#?}"),
+    }
 
     let tasks = load_tasks_for_execution_from_url(&database_url, exec_id).await;
     assert_eq!(tasks.len(), 2);
@@ -6436,19 +6554,6 @@ async fn worker_continue_as_new_records_own_start_source_referencing_predecessor
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
         .await
         .expect("failed to connect to Postgres container");
-    // Isolate from a shared HARVEST_TEST_DATABASE_URL: other e2e tests reuse the
-    // fixed `e2e_test_workflow` / `e2e-wf-001` identity, so clear those rows
-    // (and the child workflow's) up front. A no-op against a fresh CI container.
-    for stmt in [
-        "DELETE FROM harvest_events WHERE workflow_exec_id IN (SELECT id FROM harvest_workflow_executions WHERE workflow_name IN ('e2e_test_workflow','child_echo_workflow'))",
-        "DELETE FROM harvest_task_queue WHERE workflow_exec_id IN (SELECT id FROM harvest_workflow_executions WHERE workflow_name IN ('e2e_test_workflow','child_echo_workflow'))",
-        "DELETE FROM harvest_workflow_executions WHERE workflow_name IN ('e2e_test_workflow','child_echo_workflow')",
-    ] {
-        diesel::sql_query(stmt)
-            .execute(&mut conn)
-            .await
-            .expect("pre-test scrub");
-    }
 
     let original_exec_id = insert_workflow_execution(&mut conn).await;
     // Give the predecessor a DISTINCT source so "successor never inherits" is
@@ -6537,19 +6642,6 @@ async fn worker_child_workflow_records_child_start_source_referencing_parent() {
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
         .await
         .expect("failed to connect to Postgres container");
-    // Isolate from a shared HARVEST_TEST_DATABASE_URL: other e2e tests reuse the
-    // fixed `e2e_test_workflow` / `e2e-wf-001` identity, so clear those rows
-    // (and the child workflow's) up front. A no-op against a fresh CI container.
-    for stmt in [
-        "DELETE FROM harvest_events WHERE workflow_exec_id IN (SELECT id FROM harvest_workflow_executions WHERE workflow_name IN ('e2e_test_workflow','child_echo_workflow'))",
-        "DELETE FROM harvest_task_queue WHERE workflow_exec_id IN (SELECT id FROM harvest_workflow_executions WHERE workflow_name IN ('e2e_test_workflow','child_echo_workflow'))",
-        "DELETE FROM harvest_workflow_executions WHERE workflow_name IN ('e2e_test_workflow','child_echo_workflow')",
-    ] {
-        diesel::sql_query(stmt)
-            .execute(&mut conn)
-            .await
-            .expect("pre-test scrub");
-    }
 
     let parent_exec_id = insert_workflow_execution(&mut conn).await;
     let workflow_input = serde_json::json!({"value": "from-parent"});
@@ -6587,6 +6679,15 @@ async fn continue_as_new_down_migration_rewrites_historical_runs_for_rollback() 
         .expect("failed to connect to Postgres container");
 
     let original_exec_id = insert_workflow_execution(&mut conn).await;
+    // `insert_workflow_execution()` mints a fresh `workflow_id` per call
+    // (issue #1298), so read back the one this run actually got instead of
+    // assuming a fixed literal.
+    let original_workflow_id: String = harvest_workflow_executions::table
+        .find(original_exec_id.as_uuid())
+        .select(harvest_workflow_executions::workflow_id)
+        .first(&mut conn)
+        .await
+        .expect("failed to read the freshly inserted workflow_id");
     let initial_input = serde_json::json!({"phase": "init"});
     enqueue_started_workflow_task(&mut conn, original_exec_id, initial_input.clone()).await;
 
@@ -6682,7 +6783,7 @@ async fn continue_as_new_down_migration_rewrites_historical_runs_for_rollback() 
     assert!(
         original_row
             .workflow_id
-            .starts_with("e2e-wf-001::continued-as-new:"),
+            .starts_with(&format!("{original_workflow_id}::continued-as-new:")),
         "sealed historical runs should get a synthetic workflow_id during rollback",
     );
 
@@ -6691,13 +6792,13 @@ async fn continue_as_new_down_migration_rewrites_historical_runs_for_rollback() 
         .find(|execution| execution.id == successor_exec_id.as_uuid())
         .expect("successor execution should still exist after rollback rewrite");
     assert_eq!(
-        successor_row.workflow_id, "e2e-wf-001",
+        successor_row.workflow_id, original_workflow_id,
         "the latest run should retain the original logical workflow_id",
     );
 
     let rows_on_original_key = executions
         .iter()
-        .filter(|execution| execution.workflow_id == "e2e-wf-001")
+        .filter(|execution| execution.workflow_id == original_workflow_id)
         .count();
     assert_eq!(
         rows_on_original_key, 1,

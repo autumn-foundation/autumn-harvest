@@ -1,0 +1,17 @@
+-- before: build_reachability() looped once per distinct build id (N=50) --
+[
+    StatRow {
+        query: "SELECT (SELECT COUNT(*) FROM harvest_workflow_executions WHERE assigned_build_id = $1 AND state NOT IN ($3, $4, $5, $6, $7, $8)) AS open_executions, (SELECT COUNT(*) FROM harvest_task_queue WHERE required_build_id = $1 AND state = $9) AS pending_tasks, (SELECT COUNT(*) FROM harvest_workers WHERE build_id = $1 AND status = $10 AND NOW() - last_heartbeat_at <= make_interval(secs => $2::float8)) AS active_workers, (SELECT COUNT(*) FROM harvest_workers WHERE build_id = $1 AND NOW() - last_heartbeat_at > make_interval(secs => $2::float8)) AS stale_workers",
+        calls: 50,
+        shared_blks_hit: 28300,
+        shared_blks_read: 0,
+        total_buffers: 28300,
+    },
+    StatRow {
+        query: "SELECT DISTINCT build_id FROM ( SELECT assigned_build_id AS build_id FROM harvest_workflow_executions WHERE assigned_build_id IS NOT NULL AND assigned_build_id <> $1 UNION SELECT required_build_id AS build_id FROM harvest_task_queue WHERE required_build_id IS NOT NULL AND required_build_id <> $2 UNION SELECT build_id FROM harvest_workers WHERE build_id IS NOT NULL AND build_id <> $3 ) sub ORDER BY build_id",
+        calls: 1,
+        shared_blks_hit: 1949,
+        shared_blks_read: 0,
+        total_buffers: 1949,
+    },
+]

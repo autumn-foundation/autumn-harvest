@@ -1,6 +1,7 @@
 //! Time-based retention janitor for completed workflow history.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 #[cfg(feature = "db")]
@@ -333,6 +334,35 @@ pub struct RetentionConfig {
     /// Audit log retention in days, independent of workflow-history retention.
     /// Defaults to 90 days (3 months). Set to 0 to disable audit purging.
     pub audit_retention_days: i64,
+    /// Protect every unexported audit row, per shard (issue #1266).
+    /// Defaults to `None` (disabled).
+    ///
+    /// `purge_old_audit_records` already refuses to delete an unexported row
+    /// in two cases. The first case: a live cursor exists for the shard. The
+    /// second case: this process has a sink configured.
+    ///
+    /// Both signals can be absent at once. This happens in a split
+    /// web/worker deployment, before the worker's first successful tick on a
+    /// shard. A fresh enablement has no tick yet. A newly added shard may
+    /// also have no tick yet, if the worker cannot reach it. A shard being
+    /// re-enabled after decommission has no tick yet either. In every one of
+    /// these, retention finds no sink and no cursor row it can trust.
+    ///
+    /// `Some(exempt)` protects every shard not in `exempt`. `None` protects
+    /// none. An empty set protects every shard.
+    ///
+    /// The exempt set exists for one reason. A fleet has more than one
+    /// shard. This flag would otherwise apply to all of them at once.
+    /// Decommissioning shard A must resume purging there. Doing that by
+    /// disabling the whole flag would also strip protection from shard B,
+    /// mid-bootstrap on the same sweep. Add A to the exempt set instead,
+    /// and B stays protected.
+    ///
+    /// Like `is_configured`, an unexempted shard's flag overrides a
+    /// retired cursor there too. Decommissioning that shard does not
+    /// resume purging while it stays unexempted. Exempt it as part of
+    /// that step. See `docs/audit-export.md`.
+    pub protect_unexported_audit: Option<BTreeSet<ShardId>>,
     /// Schedule decisions retention in days.
     /// Defaults to 7 days. Set to 0 to disable schedule decision purging.
     pub schedule_decision_retention_days: i64,
@@ -381,6 +411,15 @@ pub struct PartitionMaintenanceConfig {
     /// `ACCESS EXCLUSIVE` lock on the parent, so a bounded budget keeps a
     /// backlog from holding the append path off; successive ticks converge.
     pub max_drops_per_tick: usize,
+    /// Maximum partitions *evaluated* per tick, dropped or not.
+    ///
+    /// `max_drops_per_tick` bounds successful drops, not the cost of finding
+    /// them. A blocked partition can still cost a tier-3 scan up to
+    /// `exact_scan_timeout_secs`. Without its own budget, one long-lived
+    /// execution pinning many old cohorts can make a tick evaluate every
+    /// closed partition. It would drop none, and spend the whole tick
+    /// doing it.
+    pub max_attempts_per_tick: usize,
     /// Seconds to wait for that lock before deferring a partition to the next
     /// tick. Failing fast is what protects the concurrent-p99 budget.
     pub drop_lock_timeout_secs: u64,
@@ -412,6 +451,7 @@ impl Default for PartitionMaintenanceConfig {
             enabled: true,
             lookahead_cohorts: crate::partition::DEFAULT_LOOKAHEAD_COHORTS,
             max_drops_per_tick: crate::partition::SweepOptions::default().max_drops,
+            max_attempts_per_tick: crate::partition::SweepOptions::default().max_attempts,
             drop_lock_timeout_secs: 2,
             exact_scan_timeout_secs: crate::partition::SweepOptions::default()
                 .exact_scan_timeout
@@ -429,6 +469,7 @@ impl PartitionMaintenanceConfig {
     pub fn sweep_options(&self) -> crate::partition::SweepOptions {
         crate::partition::SweepOptions {
             max_drops: self.max_drops_per_tick,
+            max_attempts: self.max_attempts_per_tick,
             lock_timeout: Duration::from_secs(self.drop_lock_timeout_secs.max(1)),
             exact_scan_timeout: Duration::from_secs(self.exact_scan_timeout_secs.max(1)),
             owner_probe_cap: self.owner_probe_cap,
@@ -447,6 +488,7 @@ impl Default for RetentionConfig {
             batch_size: DEFAULT_BATCH_SIZE,
             dry_run: false,
             audit_retention_days: 90,
+            protect_unexported_audit: None,
             schedule_decision_retention_days: 7,
             archival_timeout_secs: DEFAULT_ARCHIVAL_TIMEOUT_SECS,
             summary: None,
@@ -499,6 +541,36 @@ impl RetentionConfig {
     pub const fn with_audit_retention_days(mut self, days: i64) -> Self {
         self.audit_retention_days = days;
         self
+    }
+
+    /// Protect every unexported audit row on this process's sweeps, closing
+    /// the split-deployment bootstrap window (issue #1266). Set `true` on
+    /// every process in a split web/worker deployment.
+    #[must_use]
+    pub fn with_protect_unexported_audit(mut self, protect: bool) -> Self {
+        self.protect_unexported_audit = if protect { Some(BTreeSet::new()) } else { None };
+        self
+    }
+
+    /// Exempt one shard from `protect_unexported_audit` (issue #1266). Call
+    /// this for a shard being decommissioned, so its purge can resume
+    /// without also unprotecting every other shard in the fleet.
+    #[must_use]
+    pub fn excluding_shard_from_protect_unexported_audit(mut self, shard: ShardId) -> Self {
+        if let Some(exempt) = &mut self.protect_unexported_audit {
+            exempt.insert(shard);
+        }
+        self
+    }
+
+    /// Whether `protect_unexported_audit` covers this shard (issue #1266).
+    /// `true` only when protection is enabled and the shard is not
+    /// exempted.
+    #[must_use]
+    pub fn protects_unexported_audit(&self, shard: ShardId) -> bool {
+        self.protect_unexported_audit
+            .as_ref()
+            .is_some_and(|exempt| !exempt.contains(&shard))
     }
 
     /// Override the schedule decision retention window.
@@ -736,6 +808,18 @@ impl RetentionConfig {
                 MAX_MAX_AGE.as_secs()
             ));
         }
+        // `EnableOptions::validate` (issue #958) rejects a zero lookahead at
+        // enable time for exactly this reason: it leaves every append landing
+        // in the DEFAULT partition. `PartitionMaintenanceConfig` must refuse
+        // the same value at runtime, or a deployment could enable with a sane
+        // lookahead and then configure maintenance to pre-create nothing.
+        if self.partitions.enabled && self.partitions.lookahead_cohorts == 0 {
+            return Err(
+                "partitions.lookahead_cohorts must be at least 1; with no lookahead every \
+                 append lands in the DEFAULT partition and reclamation stalls"
+                    .to_string(),
+            );
+        }
         Ok(())
     }
 
@@ -874,10 +958,15 @@ impl RateLimitBucketGcOutcome {
     }
 
     /// A pass that could not run on this shard.
+    ///
+    /// Takes `dry_run` from the config, the way `collected` already does.
+    /// Issue #1316: `..Self::default()` alone leaves `dry_run` at `false`, so
+    /// a failed dry-run preview would report as a failed REAL pass.
     #[must_use]
-    fn failed(error: String) -> Self {
+    fn failed(error: String, dry_run: bool) -> Self {
         Self {
             error: Some(error),
+            dry_run,
             ..Self::default()
         }
     }
@@ -905,6 +994,23 @@ pub struct RetentionStatus {
 #[derive(Debug, Clone)]
 pub struct RetentionMonitor {
     inner: Arc<Mutex<RetentionStatus>>,
+    /// Count of full main-loop iterations completed.
+    ///
+    /// One iteration covers history retention, partition maintenance, and
+    /// the audit, schedule, summary, and rate-limit-bucket GC passes. This
+    /// counter advances once, at the same point as the unconditional
+    /// end-of-iteration liveness tick from issue #797.
+    ///
+    /// This counter is separate from that liveness tick's own counter,
+    /// `crate::scanner_health::record_scanner_tick`. That counter advances
+    /// more than once per iteration under partitioned layout. It advances
+    /// once per shard inside `run_partition_maintenance_pass`, and again
+    /// before the main loop even starts. Crossing a baseline on that
+    /// counter proves only that some scanner tick happened somewhere. It
+    /// does not prove the whole iteration, GC phases included, finished. A
+    /// caller that needs that stronger guarantee must watch this counter
+    /// instead.
+    iterations_completed: Arc<AtomicU64>,
 }
 
 impl RetentionMonitor {
@@ -919,7 +1025,25 @@ impl RetentionMonitor {
             .collect();
         Self {
             inner: Arc::new(Mutex::new(RetentionStatus { config, per_shard })),
+            iterations_completed: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Returns the count of full main-loop iterations completed so far.
+    /// See the `iterations_completed` field above for the exact guarantee.
+    #[must_use]
+    pub fn iterations_completed(&self) -> u64 {
+        // Fully qualified: `diesel_async::RunQueryDsl::load` is in scope
+        // and, resolved by receiver-type autoderef, wins over the inherent
+        // `AtomicU64::load` on plain `.load(...)` syntax.
+        AtomicU64::load(&self.iterations_completed, Ordering::Relaxed)
+    }
+
+    /// Marks one full main-loop iteration as finished. Call this once, at
+    /// the same point as the unconditional end-of-iteration liveness tick.
+    #[cfg(feature = "db")]
+    fn record_iteration_complete(&self) {
+        AtomicU64::fetch_add(&self.iterations_completed, 1, Ordering::Relaxed);
     }
 
     /// # Panics
@@ -948,6 +1072,26 @@ impl RetentionMonitor {
             .find(|x| x.shard == u16::try_from(shard.as_i32()).unwrap_or(0))
         {
             existing.partition_maintenance = Some(outcome);
+        }
+    }
+
+    /// Clear this shard's partition-maintenance outcome (review finding on
+    /// issue #1270 item 6).
+    ///
+    /// `update_partitions` only ever sets the field. A shard that reports a
+    /// real outcome and later reverts to unpartitioned (`harvest partition
+    /// disable`) would then keep showing its last outcome forever. Call
+    /// this when the layout probe finds a shard unpartitioned, so the field
+    /// returns to `None` instead of going stale.
+    #[cfg(feature = "db")]
+    fn clear_partitions(&self, shard: ShardId) {
+        let mut guard = self.inner.lock().expect("retention monitor lock poisoned");
+        if let Some(existing) = guard
+            .per_shard
+            .iter_mut()
+            .find(|x| x.shard == u16::try_from(shard.as_i32()).unwrap_or(0))
+        {
+            existing.partition_maintenance = None;
         }
     }
 
@@ -980,6 +1124,242 @@ impl RetentionMonitor {
             .find(|x| x.shard == u16::try_from(shard.as_i32()).unwrap_or(0))
         {
             *existing = result;
+        }
+    }
+}
+
+/// One shard's persisted sweep-resume state. Carried between ticks the
+/// same way `resume_cursors` itself is: local to the retention task,
+/// never read back from the monitor's reported snapshot.
+///
+/// Review finding: `resume_after` alone lets a backlog skip a blocked
+/// partition forever. That happens whenever the backlog grows at least
+/// as fast as the per-tick budget can attempt one -- see
+/// [`crate::partition::SweepOutcome::catch_up_target`]. `catch_up_target`,
+/// once a catch-up cycle starts, anchors it to the fixed instant that
+/// cycle must reach. It is threaded straight through to
+/// [`crate::partition::maintain_with_progress`] alongside `resume_after`.
+#[cfg(feature = "db")]
+#[derive(Debug, Clone, Copy, Default)]
+struct PartitionSweepCursor {
+    resume_after: Option<DateTime<Utc>>,
+    catch_up_target: Option<DateTime<Utc>>,
+}
+
+/// One pass of engine-automated partition maintenance (issue #958, AC8):
+/// `ensure_partitions`, the reclamation sweep, and the DEFAULT-partition
+/// drain, for every shard.
+///
+/// `maintain` probes the layout first. It is a no-op on the
+/// (overwhelmingly common) unpartitioned shard. A deployment that has not
+/// opted in pays one cheap catalog query per call and nothing else.
+///
+/// Best-effort and per-shard: a shard whose maintenance fails logs and is
+/// retried next call. It must never fail the caller's own work, because
+/// history retention and reclamation are independent.
+///
+/// Called from two places. One call happens directly, the moment
+/// [`RetentionRuntime::spawn`]'s background task starts — see the review
+/// finding at that call site for why. The other runs unconditionally on
+/// every iteration of that task's own tick loop, deliberately after the
+/// candidate loop there. A cohort only becomes droppable once that loop
+/// has archived, summarized and deleted its executions.
+#[cfg(feature = "db")]
+async fn run_partition_maintenance_pass(
+    pools: &ShardedDbPool,
+    config: &RetentionConfig,
+    monitor_task: &RetentionMonitor,
+    resume_cursors: &mut HashMap<ShardId, PartitionSweepCursor>,
+    metrics: &dyn MetricsRecorder,
+    owner: crate::scanner_health::ScannerOwner,
+    shutdown: &CancellationToken,
+) {
+    if !config.partitions.enabled {
+        return;
+    }
+    let mut sweep_opts = config.partitions.sweep_options();
+    // `dry_run` means "do not destroy data". It must NOT stop partition
+    // CREATION: `ensure_partitions` and `drain_default` delete nothing,
+    // and a deployment running retention in dry-run — a common posture
+    // during rollout — would otherwise stop extending the lookahead
+    // window and, after a few days, send every append to the DEFAULT
+    // partition indefinitely. Only the sweep is suppressed, by giving it
+    // a zero drop budget.
+    if config.dry_run {
+        sweep_opts.max_drops = 0;
+        sweep_opts.straggler_grace = None;
+    }
+    for (shard, pool) in pools.iter_shards() {
+        // Checked here, between shards, never inside one. No transaction
+        // is open at this point, so returning here can never abandon one
+        // mid-flight the way racing this whole pass with `select!` used
+        // to. The shard already in progress always finishes.
+        if shutdown.is_cancelled() {
+            return;
+        }
+        // Review finding: a single tick after this whole pass finishes
+        // is not enough. Enough shards hitting the 15-second exact-scan
+        // timeout on a blocked partition can make the whole pass run
+        // longer than the scanner's own staleness threshold. `/admin/
+        // preflight` would then see it as stale or wedged for the
+        // entire pass, not just before it starts.
+        //
+        // Ticking once per shard here is bounded progress. Proof of
+        // life, spaced no farther apart than one shard's worth of work,
+        // however long the whole pass takes.
+        crate::scanner_health::record_scanner_tick(metrics, owner);
+        // Review finding: a saturated pool can leave this `.await`
+        // waiting far longer than the shard-boundary check above
+        // accounts for. Deadpool applies no acquisition timeout here.
+        // No transaction is open yet, so racing it against `shutdown`
+        // is exactly as safe as the shard-boundary check: returning
+        // here can never abandon one mid-flight.
+        let mut conn = tokio::select! {
+            () = shutdown.cancelled() => return,
+            result = pool.get() => match result {
+                Ok(conn) => conn,
+                Err(error) => {
+                    // Never silent: a shard that cannot be reached gets no
+                    // lookahead partitions and no reclamation, and the
+                    // operator has to be able to tell that apart from
+                    // "nothing to do".
+                    tracing::warn!(
+                        shard = %shard,
+                        error = %error,
+                        "harvest event-partition maintenance could not acquire a connection"
+                    );
+                    monitor_task.update_partitions(
+                        shard,
+                        crate::partition::MaintenanceOutcome::failed(error.to_string()),
+                    );
+                    continue;
+                }
+            },
+        };
+        // Review finding: a standalone probe used to run here, before
+        // calling `maintain` below. That told an unpartitioned shard
+        // apart from one that ran and did nothing (issue #1270 item 6).
+        // It worked, but raced `maintain`'s OWN internal probe. A
+        // `disable_partitioning` (or `enable_partitioning`) commit
+        // landing between the two could make them disagree. This loop
+        // then reported whichever one ran here, not the one the
+        // maintenance pass below actually acted on. `outcome.partitioned`
+        // is sourced from `maintain`'s own probe, the one that actually
+        // gates its work, so branching on it below cannot disagree with
+        // what just ran. `maintain` is unconditionally safe to call on
+        // an unpartitioned shard: one cheap catalog query, nothing
+        // else. Removing this separate probe costs nothing.
+        //
+        // Review finding: a fixed oldest-first sweep, restarted from
+        // scratch every tick, cannot converge past a permanently blocked
+        // oldest run of partitions — see
+        // `crate::partition::SweepOutcome::next_resume`. Read back the
+        // cursor this shard's own last pass left. A truncated pass then
+        // picks up where it stopped, instead of re-spending its whole
+        // budget proving the same oldest partitions blocked, tick after
+        // tick.
+        //
+        // Review finding: kept in `resume_cursors`, a map local to this
+        // task, deliberately NOT read back from the monitor's stored
+        // outcome. The history-retention phase's own `monitor_task.update`
+        // (elsewhere in this loop) replaces a shard's whole
+        // `RetentionTickResult`. It does that with a fresh default
+        // whenever a history age is configured -- the common case. That
+        // wipes `partition_maintenance` back to `None` before this pass
+        // ever read it.
+        //
+        // `scan_cursors` above solves the identical problem for history
+        // retention the same way. Local state this task owns outright,
+        // untouched by anything that replaces the monitor's reported
+        // snapshot.
+        let cursor = resume_cursors.get(&shard).copied().unwrap_or_default();
+        // Review finding: a tick recorded once before this whole shard's
+        // maintenance pass is not bounded progress either. A single shard
+        // can spend `max_attempts` partitions at `exact_scan_timeout` each,
+        // long enough on its own to cross the staleness threshold. Ticking
+        // once per partition the sweep attempts closes that gap.
+        let mut tick_partition = || crate::scanner_health::record_scanner_tick(metrics, owner);
+        // Review finding: a single `now` shared across every shard in this
+        // pass goes stale under a slow earlier shard. A shard maintained
+        // late can then compute lookahead partitions against a clock that
+        // is already behind. Its true current cohort then stays uncovered
+        // until the next tick. Read the clock fresh, right before this
+        // shard's own call.
+        let now = Utc::now();
+        match crate::partition::maintain_with_progress(
+            &mut conn,
+            now,
+            config.partitions.lookahead_cohorts,
+            &sweep_opts,
+            cursor.resume_after,
+            cursor.catch_up_target,
+            &mut tick_partition,
+        )
+        .await
+        {
+            Ok(outcome) if outcome.partitioned == Some(false) => {
+                // `outcome.partitioned` comes from `maintain`'s own
+                // probe, the same one that gated its (empty) pass below
+                // -- see the review finding above. A shard that reverted
+                // via `harvest partition disable` (or never converted)
+                // must not keep showing its last outcome from before
+                // that. Its resume cursor goes with it. A later `enable`
+                // starts a fresh partition set at fresh cohort instants,
+                // all later than anything this stale cursor could name.
+                //
+                // `Ok` only ever carries `Some(_)`. `None` is reserved
+                // for `MaintenanceOutcome::failed`, on the `Err` arm
+                // below. So this guard leaves no other case for the
+                // plain `Ok(outcome)` arm to handle but `Some(true)`.
+                monitor_task.clear_partitions(shard);
+                resume_cursors.remove(&shard);
+            }
+            Ok(outcome) => {
+                // `blocked` is in the condition deliberately. The
+                // steady-state failure — nothing created (the window is
+                // already covered), nothing dropped, everything blocked —
+                // is exactly the state an operator needs to see, and
+                // logging only on progress would make it the one state
+                // that produces no output at all.
+                if !outcome.created.is_empty()
+                    || !outcome.sweep.dropped.is_empty()
+                    || !outcome.sweep.blocked.is_empty()
+                    || outcome.drained > 0
+                {
+                    tracing::info!(
+                        shard = %shard,
+                        created = outcome.created.len(),
+                        dropped = outcome.sweep.dropped.len(),
+                        blocked = outcome.sweep.blocked.len(),
+                        drained = outcome.drained,
+                        straggler_rows = outcome.sweep.straggler_rows_deleted,
+                        "harvest event-partition maintenance"
+                    );
+                }
+                resume_cursors.insert(
+                    shard,
+                    PartitionSweepCursor {
+                        resume_after: outcome.sweep.next_resume,
+                        catch_up_target: outcome.sweep.catch_up_target,
+                    },
+                );
+                monitor_task.update_partitions(shard, outcome);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    shard = %shard,
+                    error = %err,
+                    "harvest event-partition maintenance failed"
+                );
+                // Reported, not just logged: without this a
+                // permanently-failing shard is indistinguishable from one
+                // that never opted in, because both show
+                // `partition_maintenance: null`.
+                monitor_task.update_partitions(
+                    shard,
+                    crate::partition::MaintenanceOutcome::failed(err.to_string()),
+                );
+            }
         }
     }
 }
@@ -1049,6 +1429,81 @@ impl RetentionRuntime {
         );
         let handle = tokio::spawn(async move {
             let mut scan_cursors: HashMap<ShardId, Option<RetentionScanCursor>> = HashMap::new();
+            // See `run_partition_maintenance_pass`'s review finding on
+            // `resume_cursors`. Local state this task owns outright, for
+            // the identical reason `scan_cursors` above is local rather
+            // than read back from the monitor.
+            let mut partition_resume_cursors: HashMap<ShardId, PartitionSweepCursor> =
+                HashMap::new();
+            // Issue #1270 item 5: run partition maintenance immediately
+            // rather than waiting a full `tick_interval` (an hour, by
+            // default). A shard that restarts after being offline longer
+            // than its lookahead window has no covering partition until
+            // the first pass runs. Every append meanwhile lands in the
+            // DEFAULT partition, whose later drain is the disruptive path
+            // this module exists to avoid.
+            //
+            // Review finding: this used to be done by pre-loading the
+            // shared trigger channel before the loop started. The very
+            // first tick would then win the race against `sleep`. That
+            // ran the WHOLE janitor tick on every restart. That means
+            // history archival/deletion plus the audit, schedule, summary
+            // and rate-limit purges, across every shard. A fleet whose
+            // processes restart together turns that into a coordinated
+            // scan/delete stampede. It does this even when
+            // `tick_interval` was deliberately set long to avoid exactly
+            // that. Calling the maintenance pass directly here, before
+            // the loop and its channel even exist, gets the same
+            // immediacy without touching that channel at all. So it can
+            // never coalesce with, or crowd out, an operator's own
+            // `run_now()`, which still gets a full tick as documented.
+            //
+            // Review finding: checked cooperatively, not raced with
+            // `select!`. Racing this whole pass against cancellation used
+            // to abort it by dropping its future at an arbitrary await
+            // point. That point can land inside one of its own
+            // transactions, the DEFAULT-partition drain for one. A
+            // dropped future sends no ROLLBACK, so the checked-out
+            // connection could return to the pool with a transaction,
+            // and the locks it holds, still open.
+            // `run_partition_maintenance_pass` checks `shutdown` itself,
+            // between shards, where no transaction is ever open. A
+            // blocked partitioned shard can still spend up to
+            // `max_attempts` ownership probes at `exact_scan_timeout`
+            // each -- minutes, at the defaults. The shard already in
+            // progress always finishes clean. Shutdown takes effect at
+            // the next shard boundary rather than waiting out every
+            // remaining shard.
+            //
+            // Review finding: this early return must still deregister,
+            // same as the graceful-stop path at the loop's own exit
+            // below. Skipping it here would leave this owner in the
+            // process-global liveness registry forever, aging into
+            // `Wedged`. A replacement runtime could then start up
+            // healthy while this registry entry keeps `/admin/preflight`
+            // unhappy anyway.
+            run_partition_maintenance_pass(
+                &pools,
+                &config,
+                &monitor_task,
+                &mut partition_resume_cursors,
+                metrics.as_ref(),
+                owner,
+                &shutdown_task,
+            )
+            .await;
+            if shutdown_task.is_cancelled() {
+                crate::scanner_health::deregister_scanner(owner);
+                return;
+            }
+            // A trailing tick for the degenerate case the per-shard tick
+            // inside the pass does not cover: zero configured shards. The
+            // loop above never ran at all in that case. `register_scanner`
+            // seeds the liveness series at registration time, not at this
+            // instant. A shardless pass has no other chance to prove the
+            // process is alive before the main loop's own first
+            // iteration.
+            crate::scanner_health::record_scanner_tick(metrics.as_ref(), owner);
             loop {
                 tokio::select! {
                     () = shutdown_task.cancelled() => break,
@@ -1163,130 +1618,36 @@ impl RetentionRuntime {
                 }
 
                 // Engine-automated partition maintenance (issue #958, AC8).
+                // See `run_partition_maintenance_pass` — the startup call
+                // above this loop runs the identical pass immediately,
+                // outside the loop's own schedule entirely.
                 //
                 // Deliberately OUTSIDE the history-retention phase gate above:
                 // a partitioned deployment must keep its write window covered
                 // even with no history-retention age configured, or an append
-                // would eventually reach an uncovered cohort. `maintain` probes
-                // the layout first and is a no-op on the (overwhelmingly
-                // common) unpartitioned shard, so a deployment that has not
-                // opted in pays one cheap catalog query per tick and nothing
-                // else.
+                // would eventually reach an uncovered cohort.
                 //
                 // Deliberately AFTER the candidate loop: a cohort only becomes
                 // droppable once the loop has archived (#345), summarized
                 // (#752) and deleted its executions. Running it here reclaims
                 // in the SAME tick that frees the cohort rather than the next
                 // one.
-                //
-                // Best-effort and per-shard: a shard whose maintenance fails
-                // logs and is retried next tick. It must never fail the whole
-                // retention tick, because history retention and reclamation are
-                // independent — the executions are already safely archived and
-                // deleted by this point.
-                if config.partitions.enabled {
-                    let now = Utc::now();
-                    let mut sweep_opts = config.partitions.sweep_options();
-                    // `dry_run` means "do not destroy data". It must NOT stop
-                    // partition CREATION: `ensure_partitions` and
-                    // `drain_default` delete nothing, and a deployment running
-                    // retention in dry-run — a common posture during rollout —
-                    // would otherwise stop extending the lookahead window and,
-                    // after a few days, send every append to the DEFAULT
-                    // partition indefinitely. Only the sweep is suppressed, by
-                    // giving it a zero drop budget.
-                    if config.dry_run {
-                        sweep_opts.max_drops = 0;
-                        sweep_opts.straggler_grace = None;
-                    }
-                    for (shard, pool) in pools.iter_shards() {
-                        let mut conn = match pool.get().await {
-                            Ok(conn) => conn,
-                            Err(error) => {
-                                // Never silent: a shard that cannot be reached
-                                // gets no lookahead partitions and no
-                                // reclamation, and the operator has to be able
-                                // to tell that apart from "nothing to do".
-                                tracing::warn!(
-                                    shard = %shard,
-                                    error = %error,
-                                    "harvest event-partition maintenance could not \
-                                     acquire a connection"
-                                );
-                                monitor_task.update_partitions(
-                                    shard,
-                                    crate::partition::MaintenanceOutcome::failed(error.to_string()),
-                                );
-                                continue;
-                            }
-                        };
-                        match crate::partition::maintain(
-                            &mut conn,
-                            now,
-                            config.partitions.lookahead_cohorts,
-                            &sweep_opts,
-                        )
-                        .await
-                        {
-                            Ok(outcome) => {
-                                // `blocked` is in the condition deliberately.
-                                // The steady-state failure — nothing created
-                                // (the window is already covered), nothing
-                                // dropped, everything blocked — is exactly the
-                                // state an operator needs to see, and logging
-                                // only on progress would make it the one state
-                                // that produces no output at all.
-                                if !outcome.created.is_empty()
-                                    || !outcome.sweep.dropped.is_empty()
-                                    || !outcome.sweep.blocked.is_empty()
-                                    || outcome.drained > 0
-                                {
-                                    tracing::info!(
-                                        shard = %shard,
-                                        created = outcome.created.len(),
-                                        dropped = outcome.sweep.dropped.len(),
-                                        blocked = outcome.sweep.blocked.len(),
-                                        drained = outcome.drained,
-                                        straggler_rows = outcome.sweep.straggler_rows_deleted,
-                                        "harvest event-partition maintenance"
-                                    );
-                                }
-                                monitor_task.update_partitions(shard, outcome);
-                            }
-                            Err(err) => {
-                                tracing::warn!(
-                                    shard = %shard,
-                                    error = %err,
-                                    "harvest event-partition maintenance failed"
-                                );
-                                // Reported, not just logged: without this a
-                                // permanently-failing shard is indistinguishable
-                                // from one that never opted in, because both
-                                // show `partition_maintenance: null`.
-                                monitor_task.update_partitions(
-                                    shard,
-                                    crate::partition::MaintenanceOutcome::failed(err.to_string()),
-                                );
-                            }
-                        }
-                    }
-                }
+                run_partition_maintenance_pass(
+                    &pools,
+                    &config,
+                    &monitor_task,
+                    &mut partition_resume_cursors,
+                    metrics.as_ref(),
+                    owner,
+                    &shutdown_task,
+                )
+                .await;
 
                 // Purge old audit records once per tick, best-effort.
                 // Audit rows may live on any shard (workflow starts use shard-aware
                 // inserts), so iterate every shard to honour the retention window.
                 if config.audit_retention_days > 0 && !config.dry_run {
-                    for (_, pool) in pools.iter_shards() {
-                        if let Ok(mut conn) = pool.get().await
-                            && let Err(err) = crate::audit::purge_old_audit_records(
-                                &mut conn,
-                                config.audit_retention_days,
-                            )
-                            .await
-                        {
-                            tracing::warn!(error = %err, "harvest audit log purge failed");
-                        }
-                    }
+                    purge_audit_records_across_shards(&pools, &config).await;
                 }
 
                 // Purge old schedule decisions once per tick, best-effort.
@@ -1383,7 +1744,10 @@ impl RetentionRuntime {
                                 );
                                 monitor_task.update_rate_limit_buckets(
                                     shard,
-                                    RateLimitBucketGcOutcome::failed(error.to_string()),
+                                    RateLimitBucketGcOutcome::failed(
+                                        error.to_string(),
+                                        config.dry_run,
+                                    ),
                                 );
                                 continue;
                             }
@@ -1428,7 +1792,10 @@ impl RetentionRuntime {
                                 );
                                 monitor_task.update_rate_limit_buckets(
                                     shard,
-                                    RateLimitBucketGcOutcome::failed(err.to_string()),
+                                    RateLimitBucketGcOutcome::failed(
+                                        err.to_string(),
+                                        config.dry_run,
+                                    ),
                                 );
                             }
                         }
@@ -1439,6 +1806,10 @@ impl RetentionRuntime {
                 // tick that deleted nothing still proves the janitor is alive —
                 // which `harvest.retention.deleted` (work-only) cannot.
                 crate::scanner_health::record_scanner_tick(metrics.as_ref(), owner);
+                // See `RetentionMonitor::iterations_completed`'s field doc:
+                // this is the one point in the loop that proves the whole
+                // iteration, GC phases included, actually finished.
+                monitor_task.record_iteration_complete();
             }
             // Issue #797: a graceful stop retires this loop from the expected
             // scanner set. A panic unwinds past here, so a panicked loop stays
@@ -1592,6 +1963,103 @@ impl Drop for RetentionLeaseGuard {
                         .await;
                     }
                 });
+            }
+        }
+    }
+}
+
+/// Compute each pool group's combined `protect_unexported_audit` decision
+/// (issue #1266).
+///
+/// Two logical shards may share one physical pool. See
+/// `ShardedDbPool::pool_groups` for how that is detected.
+///
+/// `purge_old_audit_records` issues one unscoped `DELETE` per call. It
+/// relies on the connection alone to identify which shard it purges.
+/// Calling it once per logical shard would let two aliased shards apply
+/// two different `protect_unexported_audit` decisions to one physical
+/// audit table, within one tick. A less protective decision would commit
+/// before a more protective one ever ran.
+///
+/// Combining each group's decision with `any` avoids that. The combined
+/// decision is `true` when any aliased shard wants protection. Each
+/// physical pool is purged once per tick with that one decision, already
+/// accounting for every shard sharing it.
+///
+/// A list of shard ids travels with the decision for the same reason
+/// (issue #1266). `purge_old_audit_records`'s pending check needs to
+/// know which colocated shards should each have a cursor row, not only
+/// whether the combined protection flag is set. A cursor-row count is
+/// not enough. A decommissioned shard's row is retired, never deleted,
+/// so a count can look complete even when a currently colocated shard
+/// has none of its own. See `purge_old_audit_records`'s doc comment.
+///
+/// The list excludes only shards an operator has explicitly exempted,
+/// not every shard that merely lacks today's `protect_unexported_audit`
+/// flag. Those are different things. The flag can be unset for every
+/// shard (`protect_unexported_audit: None`, the common case). That means
+/// the operator never opted into it at all. Every shard's cursor still
+/// matters exactly as it did before this flag existed.
+/// [`RetentionConfig::protects_unexported_audit`] answers a different
+/// question -- "does the flag protect this shard right now". It returns
+/// `false` for every shard when the flag is off. Using it here would
+/// silently empty this list and disable the check across the board. An
+/// explicitly exempted shard (issue #1266) may never tick, and so may
+/// have no cursor row at all. It is not a shard the guard needs to hear
+/// from: exempting it is exactly how an operator says its progress no
+/// longer matters. Naming it anyway would make the missing-cursor check
+/// permanently true. That blocks purges of rows a still-protected shard
+/// has genuinely already acknowledged, defeating the exemption's purpose.
+///
+/// A fourth element carries the exempted shards back out too (issue
+/// #1266). `purge_old_audit_records`'s pending check still needs to hear
+/// from an exempted shard's cursor while that cursor stays live. The
+/// exemption is meant to take effect once `decommission_cursor` actually
+/// retires the row, not from the moment the config change lands. See its
+/// own doc comment.
+#[cfg(feature = "db")]
+fn group_shards_by_pool<'a>(
+    pools: &'a ShardedDbPool,
+    config: &RetentionConfig,
+) -> Vec<(&'a crate::worker::DbPool, bool, Vec<ShardId>, Vec<ShardId>)> {
+    pools
+        .pool_groups()
+        .into_iter()
+        .map(|(pool, shards)| {
+            let protect = shards
+                .iter()
+                .any(|shard| config.protects_unexported_audit(*shard));
+            let (expects_cursor, exempted): (Vec<ShardId>, Vec<ShardId>) =
+                shards.into_iter().partition(|shard| {
+                    !config
+                        .protect_unexported_audit
+                        .as_ref()
+                        .is_some_and(|exempt| exempt.contains(shard))
+                });
+            (pool, protect, expects_cursor, exempted)
+        })
+        .collect()
+}
+
+#[cfg(feature = "db")]
+async fn purge_audit_records_across_shards(pools: &ShardedDbPool, config: &RetentionConfig) {
+    for (pool, protect_unexported_audit, colocated_shards, exempted_shards) in
+        group_shards_by_pool(pools, config)
+    {
+        if let Ok(mut conn) = pool.get().await {
+            let colocated_shard_ids: Vec<i32> =
+                colocated_shards.iter().map(|s| s.as_i32()).collect();
+            let exempted_shard_ids: Vec<i32> = exempted_shards.iter().map(|s| s.as_i32()).collect();
+            if let Err(err) = crate::audit::purge_old_audit_records(
+                &mut conn,
+                config.audit_retention_days,
+                protect_unexported_audit,
+                &colocated_shard_ids,
+                &exempted_shard_ids,
+            )
+            .await
+            {
+                tracing::warn!(error = %err, "harvest audit log purge failed");
             }
         }
     }
@@ -2186,6 +2654,23 @@ async fn run_shard_tick(
                     .await?;
                     continue;
                 }
+                Ok(CandidateDeleteOutcome::SkippedStaging) => {
+                    // A shard-rebalance staging vacate landed after selection
+                    // (issue #1317 review, P1): the delete-tx FOR UPDATE
+                    // re-check found `staging_vacated_state` set and aborted
+                    // the delete. Treat exactly like a routine skip, for the
+                    // same reason as `SkippedHeld` above.
+                    routine_skip_candidate(
+                        &mut conn,
+                        candidate.id,
+                        candidate_cursor,
+                        has_failed,
+                        &mut outcome,
+                        &guard.active_ids,
+                    )
+                    .await?;
+                    continue;
+                }
                 Ok(CandidateDeleteOutcome::Deleted { summarized }) => {
                     // A summary row was written in the delete tx (issue #752).
                     if summarized {
@@ -2267,6 +2752,11 @@ enum CandidateDeleteOutcome {
     /// execution row, no summary). The caller treats this exactly like a
     /// routine skip.
     SkippedHeld,
+    /// A shard-rebalance staging vacate was found in flight under the
+    /// delete-tx row lock (`staging_vacated_state` set). The delete was
+    /// aborted and NOTHING was touched, for the same reason as
+    /// [`Self::SkippedHeld`] (issue #1317 review, P1).
+    SkippedStaging,
 }
 
 /// The two legal-hold timestamp columns `(legal_hold_set_at, legal_hold_until)`.
@@ -2307,6 +2797,14 @@ async fn delete_candidate_execution(
     let summary = summary.copied();
     Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
         let mut summarized = false;
+        // Set alongside `summarized` when this candidate hits the forced
+        // migration-target tombstone below. It is set even on the `ON
+        // CONFLICT DO NOTHING` path, where `summarized` itself stays
+        // `false` (issue #1317 review, P1 follow-up). The child-lineage
+        // check near the end of this function needs to know a summary row
+        // exists for this row. It is not enough to know THIS call
+        // inserted one.
+        let mut preserve_child_lineage_for_migration_tombstone = false;
         // ── Authoritative legal-hold re-check under a row lock (issue #747
         // BLOCKER 1) ─────────────────────────────────────────────────────
         // The candidate SELECT read the hold columns then committed and
@@ -2331,52 +2829,96 @@ async fn delete_candidate_execution(
         // (e.g. a delete error below) discards the summary too, so no
         // orphan can result. The summary INSERT happens AFTER the hold
         // re-check (a held row is never summarized) and BEFORE the deletes.
-        if let Some(policy) = summary {
-            let row: Option<SummarySourceRow> = harvest_workflow_executions::table
-                .find(candidate_id)
-                .select((
-                    harvest_workflow_executions::legal_hold_set_at,
-                    harvest_workflow_executions::legal_hold_until,
-                    harvest_workflow_executions::workflow_name,
-                    harvest_workflow_executions::workflow_id,
-                    harvest_workflow_executions::state,
-                    harvest_workflow_executions::started_at,
-                    harvest_workflow_executions::completed_at,
-                    harvest_workflow_executions::shard_id,
-                    harvest_workflow_executions::output,
-                    harvest_workflow_executions::error,
-                    harvest_workflow_executions::search_attrs,
-                    harvest_workflow_executions::parent_id,
-                    harvest_workflow_executions::migrated_from_shards,
-                ))
-                .for_update()
-                .first::<SummarySourceRow>(conn)
-                .await
-                .optional()
-                .map_err(database_error)?;
+        // The row read and hold re-check are unconditional (issue #1317
+        // review, P1): whether a summary gets written now has TWO
+        // independent triggers, not one. Summary retention being
+        // configured is the original (#752) trigger.
+        //
+        // The other trigger is new. `migrated_from_shards` non-empty means
+        // this row was itself the TARGET of a shard-rebalance migration at
+        // some point. A source shard elsewhere can still hold a `MIGRATED`
+        // seal whose forwarding chain resolves here, not yet observed
+        // terminal (`reconcile_migrated_seal_terminality` /
+        // `live_copy_is_terminal`).
+        //
+        // Hard-deleting this row with no trace at all breaks reconciliation
+        // for that seal permanently. Every future attempt would fail with
+        // "neither its execution row nor its summary exists" forever. The
+        // seal's business key would stay blocked past any operator's reach.
+        //
+        // So this one case gets a minimal, payload-free summary even when
+        // summary retention is otherwise disabled. That is just enough for
+        // reconciliation to read a terminal state. Every other row's
+        // behavior, and this row's own retention age/eligibility, is
+        // unchanged.
+        let row: Option<SummarySourceRow> = harvest_workflow_executions::table
+            .find(candidate_id)
+            .select((
+                harvest_workflow_executions::legal_hold_set_at,
+                harvest_workflow_executions::legal_hold_until,
+                harvest_workflow_executions::workflow_name,
+                harvest_workflow_executions::workflow_id,
+                harvest_workflow_executions::state,
+                harvest_workflow_executions::started_at,
+                harvest_workflow_executions::completed_at,
+                harvest_workflow_executions::shard_id,
+                harvest_workflow_executions::output,
+                harvest_workflow_executions::error,
+                harvest_workflow_executions::search_attrs,
+                harvest_workflow_executions::parent_id,
+                harvest_workflow_executions::migrated_from_shards,
+                harvest_workflow_executions::staging_vacated_state,
+            ))
+            .for_update()
+            .first::<SummarySourceRow>(conn)
+            .await
+            .optional()
+            .map_err(database_error)?;
 
-            // `None` = row concurrently deleted: nothing to summarize; the
-            // deletes below are harmless no-ops (matches the hold-only
-            // path's missing-row behavior).
-            if let Some((
-                set_at,
-                until,
-                workflow_name,
-                workflow_id,
-                state,
-                started_at,
-                completed_at,
-                shard_id,
-                output,
-                error,
-                search_attrs,
-                parent_id,
-                migrated_from_shards,
-            )) = row
-            {
-                if legal_hold_active(set_at, until, now) {
-                    return Ok(CandidateDeleteOutcome::SkippedHeld);
-                }
+        // `None` = row concurrently deleted: nothing to summarize; the
+        // deletes below are harmless no-ops (matches the pre-#752 missing-
+        // row behavior).
+        if let Some((
+            set_at,
+            until,
+            workflow_name,
+            workflow_id,
+            state,
+            started_at,
+            completed_at,
+            shard_id,
+            output,
+            error,
+            search_attrs,
+            parent_id,
+            migrated_from_shards,
+            staging_vacated_state,
+        )) = row
+        {
+            if legal_hold_active(set_at, until, now) {
+                return Ok(CandidateDeleteOutcome::SkippedHeld);
+            }
+            // A shard-rebalance staging vacate re-check under the SAME row
+            // lock (issue #1317 review, P1). `stage_copy` can seal this row
+            // `CONTINUED_AS_NEW` mid-flight to free its business key for a
+            // copy being staged elsewhere. It records the row's real prior
+            // state in `staging_vacated_state`, so an abort can restore it.
+            // The candidate SELECT that chose this row for deletion ran
+            // before that vacate, released its lock, and never saw it. If
+            // the delete proceeded here, the row would vanish before
+            // `discard_staged_copy_restoring_seal` could restore it on
+            // abort. Any summary would record the transient
+            // `CONTINUED_AS_NEW` instead of the run's real outcome.
+            // Abort exactly like an active legal hold: touch nothing.
+            if staging_vacated_state.is_some() {
+                return Ok(CandidateDeleteOutcome::SkippedStaging);
+            }
+            let was_ever_migrated_here = migrated_from_shards
+                .as_ref()
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|hops| !hops.is_empty());
+            if summary.is_some() || was_ever_migrated_here {
+                preserve_child_lineage_for_migration_tombstone = was_ever_migrated_here;
                 // completed_at is NOT NULL by the candidate query's WHERE
                 // clause; fall back to started_at defensively so the NOT
                 // NULL summary column always has a value.
@@ -2384,15 +2926,17 @@ async fn delete_candidate_execution(
                 // Clamp at 0: a `completed_at` before `started_at` (clock
                 // skew across nodes) must never produce a negative duration.
                 let duration_ms = Some((completed - started_at).num_milliseconds().max(0));
-                // Payload capture is opt-in (AC3): a policy with capture
-                // disabled leaves result/error NULL.
-                let (result, error_out) = if policy.capture_payload {
-                    (
+                // Payload capture is opt-in (AC3), and only ever happens
+                // under an explicit policy that asked for it. The
+                // migration-target tombstone case has no policy, so it
+                // always leaves result/error NULL -- identity and timing
+                // only, exactly like a `capture_payload: false` policy.
+                let (result, error_out) = match summary {
+                    Some(policy) if policy.capture_payload => (
                         cap_result_payload(output, policy.max_payload_bytes),
                         cap_error_text(error.as_deref(), policy.max_payload_bytes),
-                    )
-                } else {
-                    (None, None)
+                    ),
+                    _ => (None, None),
                 };
                 // Codec caveat (issue #752): the summary stores the
                 // `output`/`search_attrs` COLUMNS verbatim — these are
@@ -2401,6 +2945,21 @@ async fn delete_candidate_execution(
                 // encryption-at-rest is preserved: the longer-retained
                 // summary tier can never hold plaintext that the event
                 // history encrypts.
+                //
+                // The forced migration-target tombstone (no `SummaryPolicy`
+                // configured) drops `search_attrs` too, not just the
+                // result/error payload above (issue #1317 review, P1
+                // follow-up). Those attributes can carry plaintext
+                // business/PII data. This row's whole purpose is to be the
+                // minimum an un-reconciled seal needs -- identity, state,
+                // and timing. An explicit policy's own choice to capture
+                // search attrs is unaffected; this only strips the forced
+                // case that never opted into anything.
+                let search_attrs = if summary.is_some() {
+                    search_attrs
+                } else {
+                    None
+                };
                 let new_summary = NewExecutionSummary {
                     execution_id: candidate_id,
                     workflow_name,
@@ -2434,25 +2993,6 @@ async fn delete_candidate_execution(
                     .map_err(database_error)?;
                 summarized = inserted > 0;
             }
-        } else {
-            // Summary retention disabled: byte-for-byte the pre-#752
-            // hold-only re-check.
-            let hold: Option<HoldTimestamps> = harvest_workflow_executions::table
-                .find(candidate_id)
-                .select((
-                    harvest_workflow_executions::legal_hold_set_at,
-                    harvest_workflow_executions::legal_hold_until,
-                ))
-                .for_update()
-                .first::<HoldTimestamps>(conn)
-                .await
-                .optional()
-                .map_err(database_error)?;
-            if let Some((set_at, until)) = hold
-                && legal_hold_active(set_at, until, now)
-            {
-                return Ok(CandidateDeleteOutcome::SkippedHeld);
-            }
         }
 
         // Orphan the deleted parent's terminal children so their `parent_id`
@@ -2468,7 +3008,15 @@ async fn delete_candidate_execution(
         // of whether the parent or child is processed first. The retained
         // `parent_id` on a to-be-deleted terminal child is harmless (no FK;
         // `should_skip_candidate` only reads `parent_id` downward).
-        if summary.is_none() {
+        //
+        // The forced migration-target tombstone above is a THIRD trigger
+        // for a surviving summary row, besides `summary` being configured
+        // (issue #1317 review, P1 follow-up). `summary.is_none()` alone
+        // does not see it, so this null-out ran even when a summary row
+        // for this exact candidate had just been inserted. A later #495
+        // erase of that summary would then find no child to cascade to.
+        // It could report success over a child payload it never reached.
+        if summary.is_none() && !preserve_child_lineage_for_migration_tombstone {
             diesel::update(
                 harvest_workflow_executions::table
                     .filter(harvest_workflow_executions::parent_id.eq(Some(candidate_id)))
@@ -2568,6 +3116,7 @@ type SummarySourceRow = (
     Option<serde_json::Value>, // search_attrs
     Option<uuid::Uuid>,        // parent_id
     Option<serde_json::Value>, // migrated_from_shards
+    Option<String>,            // staging_vacated_state
 );
 
 /// Garbage-collect execution summaries older than the summary horizon (issue
@@ -2593,6 +3142,22 @@ pub(crate) async fn purge_expired_summaries(
         workflow_name: String,
     }
 
+    // Issue #1317 review, P1 follow-up. A summary demoted from a row that
+    // was EVER a shard-rebalance migration target
+    // (`migrated_from_shards` non-empty) is excluded from this horizon's
+    // DELETE entirely.
+    //
+    // It can still be the only surviving evidence a source shard's
+    // un-reconciled `MIGRATED` seal needs to resolve
+    // (`live_copy_is_terminal`). Hard-deleting it past an operator's
+    // configured horizon reopens the exact "seal blocked forever" gap the
+    // retention fix above exists to close. This mirrors the codebase's
+    // existing rule for the row itself: retention already never
+    // hard-deletes a `MIGRATED` seal row outright, for the identical
+    // reason.
+    const NOT_A_MIGRATION_TARGET: &str =
+        "(migrated_from_shards IS NULL OR jsonb_array_length(migrated_from_shards) = 0)";
+
     let mut counts: BTreeMap<String, u64> = BTreeMap::new();
     let Ok(chrono_age) = chrono::Duration::from_std(summary_age) else {
         // Unrepresentable age (unreachable for validated horizons, bounded by
@@ -2604,9 +3169,10 @@ pub(crate) async fn purge_expired_summaries(
     let batch = i64::try_from(batch_size).unwrap_or(i64::MAX).max(1);
 
     if dry_run {
-        let rows = diesel::sql_query(
-            "SELECT workflow_name FROM harvest_execution_summaries WHERE completed_at < $1",
-        )
+        let rows = diesel::sql_query(format!(
+            "SELECT workflow_name FROM harvest_execution_summaries \
+              WHERE completed_at < $1 AND {NOT_A_MIGRATION_TARGET}"
+        ))
         .bind::<Timestamptz, _>(cutoff)
         .load::<NameRow>(conn)
         .await
@@ -2618,16 +3184,16 @@ pub(crate) async fn purge_expired_summaries(
     }
 
     loop {
-        let rows = diesel::sql_query(
+        let rows = diesel::sql_query(format!(
             "DELETE FROM harvest_execution_summaries
              WHERE execution_id IN (
                  SELECT execution_id FROM harvest_execution_summaries
-                 WHERE completed_at < $1
+                 WHERE completed_at < $1 AND {NOT_A_MIGRATION_TARGET}
                  ORDER BY completed_at ASC, execution_id ASC
                  LIMIT $2
              )
-             RETURNING workflow_name",
-        )
+             RETURNING workflow_name"
+        ))
         .bind::<Timestamptz, _>(cutoff)
         .bind::<BigInt, _>(batch)
         .load::<NameRow>(conn)
@@ -2641,6 +3207,44 @@ pub(crate) async fn purge_expired_summaries(
         // EFFECTIVE limit `batch` (clamped `.max(1)`), not the raw `batch_size`:
         // a `batch_size` of 0 makes the LIMIT 1 while `n < 0` is impossible, so
         // an `n == 0` early break is required or the loop would spin forever.
+        if n == 0 || i64::try_from(n).unwrap_or(i64::MAX) < batch {
+            break;
+        }
+    }
+
+    // Issue #1317 review, P1 follow-up to the exemption above. Excluding a
+    // migration-target summary from the DELETE protects the minimal
+    // reconciliation evidence. It also protects that row's OPT-IN payload
+    // fields (`result`/`error`/`search_attrs`) forever whenever a
+    // `SummaryPolicy` captures them. That silently turns a finite,
+    // operator-configured summary horizon into unbounded payload retention
+    // for any execution a shard rebalance ever touched.
+    //
+    // Past the SAME cutoff, strip the payload fields on those rows instead
+    // of leaving them untouched. `state`/`workflow_name`/`workflow_id`/
+    // `migrated_from_shards`/timestamps stay, matching the exact shape
+    // `retention.rs`'s own fallback-summary write already produces when
+    // summary retention is disabled outright. `live_copy_is_terminal` reads
+    // only those columns, never the payload ones, so reconciliation is
+    // unaffected.
+    loop {
+        let n = diesel::sql_query(
+            "UPDATE harvest_execution_summaries
+             SET result = NULL, error = NULL, search_attrs = NULL
+             WHERE execution_id IN (
+                 SELECT execution_id FROM harvest_execution_summaries
+                 WHERE completed_at < $1
+                   AND NOT (migrated_from_shards IS NULL OR jsonb_array_length(migrated_from_shards) = 0)
+                   AND (result IS NOT NULL OR error IS NOT NULL OR search_attrs IS NOT NULL)
+                 ORDER BY completed_at ASC, execution_id ASC
+                 LIMIT $2
+             )",
+        )
+        .bind::<Timestamptz, _>(cutoff)
+        .bind::<BigInt, _>(batch)
+        .execute(conn)
+        .await
+        .map_err(database_error)?;
         if n == 0 || i64::try_from(n).unwrap_or(i64::MAX) < batch {
             break;
         }
@@ -2955,12 +3559,14 @@ mod legal_hold_db {
 
     use super::{LegalHoldOutcome, legal_hold_active};
 
-    /// The four legal-hold columns loaded from a locked execution row.
+    /// The four legal-hold columns, plus the forwarding pointer, loaded from a
+    /// locked execution row.
     type HoldColumns = (
         Option<DateTime<Utc>>,
         Option<DateTime<Utc>>,
         Option<String>,
         Option<String>,
+        Option<i32>,
     );
 
     async fn load_hold_for_update(
@@ -2974,6 +3580,7 @@ mod legal_hold_db {
                 harvest_workflow_executions::legal_hold_until,
                 harvest_workflow_executions::legal_hold_reason,
                 harvest_workflow_executions::legal_hold_actor,
+                harvest_workflow_executions::migrated_to_shard,
             ))
             .for_update()
             .first::<HoldColumns>(conn)
@@ -2981,6 +3588,41 @@ mod legal_hold_db {
             .optional()
             .map_err(database_error)?
             .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))
+    }
+
+    /// Refuse a write onto a sealed row (issue #1405).
+    ///
+    /// A caller resolves its connection to `exec_id`'s shard once, before the
+    /// `FOR UPDATE` lock above is requested. A concurrent cutover can seal the
+    /// row — set `migrated_to_shard` — in the window between that resolution
+    /// and the lock grant. The lock still succeeds; a sealed row is a normal
+    /// row to `SELECT ... FOR UPDATE`. Without this check the hold write lands
+    /// on the forwarding tombstone. The API reports success. The live copy on
+    /// the target shard never sees it.
+    ///
+    /// Matched on the pointer, not on `state = 'MIGRATED'`. Same reasoning as
+    /// [`crate::shard_rebalance::forward_of_held_row`]: the pointer is what
+    /// makes the row a tombstone, regardless of what a later forced state
+    /// write does to `state` itself.
+    ///
+    /// # Errors
+    ///
+    /// [`HarvestError::ShardUnavailable`], naming the shard the row forwards
+    /// to, when `migrated_to_shard` is set. The caller must re-resolve there
+    /// and retry — [`crate::shard_rebalance::set_legal_hold_forwarded`] and
+    /// [`crate::shard_rebalance::release_legal_hold_forwarded`] do exactly
+    /// that.
+    fn refuse_if_sealed(exec_id: ExecutionId, migrated_to_shard: Option<i32>) -> HarvestResult<()> {
+        let Some(shard_id) = migrated_to_shard else {
+            return Ok(());
+        };
+        Err(HarvestError::ShardUnavailable {
+            shard_id,
+            reason: format!(
+                "workflow execution {exec_id} sealed to shard {shard_id} mid shard-rebalance; \
+                 re-resolve it through its forwarding pointer and retry"
+            ),
+        })
     }
 
     /// Place (or refresh) a per-execution legal hold (issue #747). Shard-local:
@@ -2994,6 +3636,10 @@ mod legal_hold_db {
     /// # Errors
     ///
     /// - [`HarvestError::NotFound`] when the execution does not exist (→ 404).
+    /// - [`HarvestError::ShardUnavailable`] when the row was sealed by a
+    ///   shard rebalance under the lock (issue #1405). Nothing is written.
+    ///   Prefer [`crate::shard_rebalance::set_legal_hold_forwarded`], which
+    ///   retries this for you.
     /// - [`HarvestError::Database`] on any persistence failure.
     pub async fn set_legal_hold(
         conn: &mut AsyncPgConnection,
@@ -3015,8 +3661,9 @@ mod legal_hold_db {
         // in autocommit mode.
         Box::pin(
             conn.transaction::<LegalHoldOutcome, HarvestError, _>(async |conn| {
-                let (set_at, until, cur_reason, cur_actor) =
+                let (set_at, until, cur_reason, cur_actor, migrated_to_shard) =
                     load_hold_for_update(conn, exec_id).await?;
+                refuse_if_sealed(exec_id, migrated_to_shard)?;
 
                 if legal_hold_active(set_at, until, now) {
                     // Idempotent: an active hold already exists. Do NOT overwrite
@@ -3076,6 +3723,10 @@ mod legal_hold_db {
     /// # Errors
     ///
     /// - [`HarvestError::NotFound`] when the execution does not exist (→ 404).
+    /// - [`HarvestError::ShardUnavailable`] when the row was sealed by a
+    ///   shard rebalance under the lock (issue #1405). Nothing is cleared.
+    ///   Prefer [`crate::shard_rebalance::release_legal_hold_forwarded`],
+    ///   which retries this for you.
     /// - [`HarvestError::Database`] on any persistence failure.
     pub async fn release_legal_hold(
         conn: &mut AsyncPgConnection,
@@ -3087,7 +3738,9 @@ mod legal_hold_db {
         // concurrent set/release.
         Box::pin(
             conn.transaction::<LegalHoldOutcome, HarvestError, _>(async |conn| {
-                let (set_at, _until, _reason, _actor) = load_hold_for_update(conn, exec_id).await?;
+                let (set_at, _until, _reason, _actor, migrated_to_shard) =
+                    load_hold_for_update(conn, exec_id).await?;
+                refuse_if_sealed(exec_id, migrated_to_shard)?;
 
                 let was_set = set_at.is_some();
                 if was_set {
@@ -3170,6 +3823,282 @@ mod tests {
             ..Default::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_zero_lookahead_cohorts_is_rejected_when_partition_maintenance_is_enabled() {
+        // Issue #1270 item 3: `EnableOptions::validate` already rejects a zero
+        // lookahead at enable time, because it leaves every append landing in
+        // the DEFAULT partition. `PartitionMaintenanceConfig` must refuse the
+        // same value at runtime — the two paths must not disagree about what
+        // is a usable value.
+        let config = RetentionConfig {
+            partitions: PartitionMaintenanceConfig {
+                enabled: true,
+                lookahead_cohorts: 0,
+                ..PartitionMaintenanceConfig::default()
+            },
+            ..Default::default()
+        };
+        assert!(
+            config.validate().is_err(),
+            "a zero lookahead must be rejected while partition maintenance is enabled"
+        );
+
+        // Disabled maintenance never reads the field. A stale zero left
+        // over from a config that later turned maintenance off must not
+        // block startup for reasons unrelated to what is actually running.
+        let config = RetentionConfig {
+            partitions: PartitionMaintenanceConfig {
+                enabled: false,
+                lookahead_cohorts: 0,
+                ..PartitionMaintenanceConfig::default()
+            },
+            ..Default::default()
+        };
+        assert!(
+            config.validate().is_ok(),
+            "lookahead_cohorts is inert while partition maintenance is disabled"
+        );
+
+        let config = RetentionConfig {
+            partitions: PartitionMaintenanceConfig {
+                enabled: true,
+                lookahead_cohorts: 1,
+                ..PartitionMaintenanceConfig::default()
+            },
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    // --- Issue #1266: per-shard protect_unexported_audit exemption ---
+
+    #[test]
+    fn protect_unexported_audit_disabled_by_default() {
+        let config = RetentionConfig::default();
+        assert!(!config.protects_unexported_audit(ShardId::new(0)));
+        assert!(!config.protects_unexported_audit(ShardId::new(1)));
+    }
+
+    #[test]
+    fn protect_unexported_audit_true_covers_every_shard() {
+        let config = RetentionConfig::default().with_protect_unexported_audit(true);
+        assert!(config.protects_unexported_audit(ShardId::new(0)));
+        assert!(config.protects_unexported_audit(ShardId::new(1)));
+    }
+
+    // A fleet decommissioning shard 0 must not lose bootstrap protection
+    // for shard 1, still mid-bootstrap on the same sweep. One process-wide
+    // boolean cannot represent both states at once, which is why the
+    // exemption exists.
+    #[test]
+    fn excluding_a_shard_leaves_every_other_shard_protected() {
+        let config = RetentionConfig::default()
+            .with_protect_unexported_audit(true)
+            .excluding_shard_from_protect_unexported_audit(ShardId::new(0));
+        assert!(
+            !config.protects_unexported_audit(ShardId::new(0)),
+            "the exempted shard must be free to resume purging"
+        );
+        assert!(
+            config.protects_unexported_audit(ShardId::new(1)),
+            "a different shard must stay protected"
+        );
+    }
+
+    #[test]
+    fn excluding_a_shard_while_disabled_changes_nothing() {
+        let config = RetentionConfig::default()
+            .excluding_shard_from_protect_unexported_audit(ShardId::new(0));
+        assert!(!config.protects_unexported_audit(ShardId::new(0)));
+        assert!(!config.protects_unexported_audit(ShardId::new(1)));
+    }
+
+    // Two logical shards may alias one physical pool (a supported pre-split
+    // staging topology). Building a `Pool` never connects, so this needs no
+    // live database.
+    #[cfg(feature = "db")]
+    fn test_pool(url: &str) -> crate::worker::DbPool {
+        let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+            diesel_async::AsyncPgConnection,
+        >::new(url);
+        crate::worker::DbPool::builder(manager)
+            .max_size(1)
+            .build()
+            .expect("pool builds without connecting")
+    }
+
+    // A shard exempted for decommission must not drag its physical-pool
+    // alias down with it. One aliased shard still wants protection, so the
+    // whole shared pool must stay protected (issue #1266).
+    #[cfg(feature = "db")]
+    #[test]
+    fn group_shards_by_pool_combines_aliased_shards_conservatively() {
+        let pool = test_pool("postgres://unused/db");
+        let mut aliased = BTreeMap::new();
+        aliased.insert(ShardId::new(0), pool.clone());
+        aliased.insert(ShardId::new(1), pool);
+        let sharded = ShardedDbPool::from_map(aliased, ShardId::new(0));
+
+        let config = RetentionConfig::default()
+            .with_protect_unexported_audit(true)
+            .excluding_shard_from_protect_unexported_audit(ShardId::new(0));
+
+        let groups = group_shards_by_pool(&sharded, &config);
+        assert_eq!(
+            groups.len(),
+            1,
+            "both shards alias one pool, so they must collapse to one group"
+        );
+        assert!(
+            groups[0].1,
+            "shard 1 still wants protection, so the shared pool stays protected"
+        );
+        assert_eq!(
+            groups[0].2,
+            vec![ShardId::new(1)],
+            "only shard 1 wants protection, so only it belongs in the \
+             expected-cursor list; exempted shard 0 must not appear \
+             there even though it shares the pool"
+        );
+    }
+
+    // Two shards on genuinely separate pools must never be combined. Shard
+    // 0's exemption must stay local to its own pool (issue #1266).
+    #[cfg(feature = "db")]
+    #[test]
+    fn group_shards_by_pool_keeps_distinct_pools_separate() {
+        let pool_a = test_pool("postgres://unused/db-a");
+        let pool_b = test_pool("postgres://unused/db-b");
+        let mut distinct = BTreeMap::new();
+        distinct.insert(ShardId::new(0), pool_a);
+        distinct.insert(ShardId::new(1), pool_b);
+        let sharded = ShardedDbPool::from_map(distinct, ShardId::new(0));
+
+        let config = RetentionConfig::default()
+            .with_protect_unexported_audit(true)
+            .excluding_shard_from_protect_unexported_audit(ShardId::new(0));
+
+        let groups = group_shards_by_pool(&sharded, &config);
+        assert_eq!(
+            groups.len(),
+            2,
+            "two distinct pools must never collapse into one group"
+        );
+        let protections: Vec<bool> = groups.iter().map(|(_, protect, _, _)| *protect).collect();
+        assert!(
+            protections.contains(&false) && protections.contains(&true),
+            "shard 0's exemption must not leak into shard 1's own, separate pool"
+        );
+        for (_, protect, shards, _) in &groups {
+            if *protect {
+                assert_eq!(
+                    *shards,
+                    vec![ShardId::new(1)],
+                    "shard 1's own pool expects a cursor from shard 1"
+                );
+            } else {
+                assert!(
+                    shards.is_empty(),
+                    "exempted shard 0's own pool expects no cursor at all"
+                );
+            }
+        }
+    }
+
+    // An exempted shard that never ticks must not permanently block
+    // purging on a colocated shard that has (issue #1266). Naming an
+    // exempted shard in the expected-cursor list would make the
+    // missing-cursor check true forever, defeating the exemption.
+    #[cfg(feature = "db")]
+    #[test]
+    fn group_shards_by_pool_excludes_an_exempted_shard_from_the_expected_cursor_list() {
+        let pool = test_pool("postgres://unused/db");
+        let mut aliased = BTreeMap::new();
+        aliased.insert(ShardId::new(0), pool.clone());
+        aliased.insert(ShardId::new(1), pool);
+        let sharded = ShardedDbPool::from_map(aliased, ShardId::new(0));
+
+        // Shard 0 is exempted -- an unreachable shard whose export was
+        // abandoned, never ticked, never decommissioned. Shard 1 still
+        // wants protection.
+        let config = RetentionConfig::default()
+            .with_protect_unexported_audit(true)
+            .excluding_shard_from_protect_unexported_audit(ShardId::new(0));
+
+        let groups = group_shards_by_pool(&sharded, &config);
+        assert_eq!(
+            groups[0].2,
+            vec![ShardId::new(1)],
+            "shard 0's exemption must remove it from the expected-cursor \
+             list entirely, not merely from the protection decision, or \
+             its permanent lack of a cursor row would block purging of \
+             rows shard 1 has genuinely acknowledged"
+        );
+    }
+
+    // Leaving `protect_unexported_audit` unset entirely (the common
+    // case, issue #1266) must not empty the expected-cursor list.
+    // `protects_unexported_audit` answers "does the flag protect this
+    // shard today". That is `false` for every shard when the flag is
+    // off. It is a different question from "is this shard exempted",
+    // which is what the expected-cursor list must filter on. Confusing
+    // the two would silently disable the missing-cursor check for every
+    // deployment that never configures this flag at all.
+    #[cfg(feature = "db")]
+    #[test]
+    fn group_shards_by_pool_expects_every_shard_when_the_flag_is_never_configured() {
+        let pool = test_pool("postgres://unused/db");
+        let mut aliased = BTreeMap::new();
+        aliased.insert(ShardId::new(0), pool.clone());
+        aliased.insert(ShardId::new(1), pool);
+        let sharded = ShardedDbPool::from_map(aliased, ShardId::new(0));
+
+        let config = RetentionConfig::default();
+        assert!(
+            !config.protects_unexported_audit(ShardId::new(0)),
+            "the flag protects nobody when it is off, by design"
+        );
+
+        let groups = group_shards_by_pool(&sharded, &config);
+        assert_eq!(
+            groups[0].2,
+            vec![ShardId::new(0), ShardId::new(1)],
+            "an unconfigured flag exempts no one, so both colocated \
+             shards must still be expected to have a cursor row, exactly \
+             as they were before this flag existed"
+        );
+    }
+
+    // A Codex review finding on this fix (issue #1266). The exempted shard
+    // must travel back out as its own list, not merely be dropped from the
+    // expected-cursor one. `purge_old_audit_records` needs it to keep
+    // protecting an exempted shard's own unacknowledged rows while its
+    // cursor stays live. `decommission_cursor`, not this config change, is
+    // what is meant to release them.
+    #[cfg(feature = "db")]
+    #[test]
+    fn group_shards_by_pool_returns_the_exempted_shard_as_its_own_list() {
+        let pool = test_pool("postgres://unused/db");
+        let mut aliased = BTreeMap::new();
+        aliased.insert(ShardId::new(0), pool.clone());
+        aliased.insert(ShardId::new(1), pool);
+        let sharded = ShardedDbPool::from_map(aliased, ShardId::new(0));
+
+        let config = RetentionConfig::default()
+            .with_protect_unexported_audit(true)
+            .excluding_shard_from_protect_unexported_audit(ShardId::new(0));
+
+        let groups = group_shards_by_pool(&sharded, &config);
+        assert_eq!(
+            groups[0].3,
+            vec![ShardId::new(0)],
+            "shard 0 is exempted from the expected-cursor list, but it \
+             must still come back out as an exempted shard so the caller \
+             can keep consulting its cursor while decommission_cursor has \
+             not yet retired it"
+        );
     }
 
     // --- Issue #737: per-workflow-type history retention overrides ---

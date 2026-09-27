@@ -37,6 +37,68 @@ const IMMEDIATE_SCHEDULE_SKEW_SECS: i32 = 5;
 const IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE: Duration =
     Duration::seconds(IMMEDIATE_SCHEDULE_SKEW_SECS as i64);
 
+/// Convert a retry delay to fractional seconds for `make_interval` (issue
+/// #1389).
+///
+/// `requeue_for_retry` and its siblings compute their retry deadline as
+/// `clock_timestamp() + make_interval(secs => ...)`, inside the `UPDATE`
+/// statement itself. This stamps it on Postgres's own clock. `claim_task`
+/// later checks that same deadline against that same clock
+/// (`scheduled_at <= NOW()`).
+///
+/// `clock_timestamp()`, not `NOW()`: some callers run this `UPDATE` inside a
+/// transaction that already did other work (a row lock, a prior write).
+/// `NOW()` is frozen at that transaction's start, so it would understate the
+/// elapsed backoff by however long that prior work took.
+/// `clock_timestamp()` is volatile and reads the real time at execution.
+///
+/// A host-computed deadline (`Utc::now() + delay`) can already be due by the
+/// time `claim_task` checks it, when the host clock trails Postgres's.
+/// Computing the deadline on Postgres's own clock removes that mismatch by
+/// construction, for any `delay`.
+/// Microsecond precision, not millisecond (issue #1389 review). `JitterPolicy::Full`
+/// picks any value between zero and the base interval, so a sub-millisecond
+/// delay is a real, reachable case. Truncating to whole milliseconds would
+/// round such a delay down to zero: an immediate retry instead of a short one.
+#[allow(clippy::cast_precision_loss)] // microsecond delay never approaches 2^53
+fn delay_secs(delay: Duration) -> f64 {
+    delay.num_microseconds().map_or_else(
+        // Out of `i64` microsecond range (roughly 292,000 years): fall back
+        // to millisecond precision, which cannot overflow here either way.
+        || delay.num_milliseconds() as f64 / 1000.0,
+        |us| us as f64 / 1_000_000.0,
+    )
+}
+
+#[derive(diesel::QueryableByName)]
+struct ClockTimestampRow {
+    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+    now: DateTime<Utc>,
+}
+
+/// Probe Postgres's own, live clock (issue #1389).
+///
+/// Uses `clock_timestamp()`, not `NOW()`, so a caller inside an open
+/// transaction still gets the real current time, not that transaction's
+/// frozen start time.
+///
+/// A caller deciding whether a retry still fits inside
+/// `schedule_to_close_at` needs this. [`requeue_for_retry`] and its
+/// siblings already compute their own deadline on this same clock. A
+/// host-clock decision here could otherwise disagree with the deadline
+/// they actually write.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn db_clock_now(conn: &mut AsyncPgConnection) -> HarvestResult<DateTime<Utc>> {
+    diesel::sql_query("SELECT clock_timestamp() AS now")
+        .get_result::<ClockTimestampRow>(conn)
+        .await
+        .map(|row| row.now)
+        .map_err(crate::error::database_error)
+}
+
 /// Compute the **DB-clock** portion of schedule-to-start latency in seconds: the
 /// wait from a task's *true* eligibility to when it was claimed (`claimed_at`),
 /// clamped to `0`.
@@ -1551,6 +1613,39 @@ enum ClaimOutcome {
     Empty,
 }
 
+/// Execute one pre-built release-if-paused statement and report whether a
+/// row was released (🪞 Echo clone-class merge, instances 4→1).
+///
+/// [`crate::queue_pause::release_claim_if_queue_paused`],
+/// [`crate::queue_pause::release_claim`],
+/// [`crate::activity_pause::release_claim_if_activity_paused`], and
+/// [`crate::execution::release_claim_if_workflow_paused`] used to repeat
+/// this exact body. Each bound `task_id`/`worker_id` into its own
+/// statement, executed it, and mapped the row count to a bool.
+///
+/// `sql` is the one thing that legitimately varies between them: which
+/// statement decides a hold is in force. This function never branches on
+/// `sql`'s content. It carries no caller-identity or mode encoding.
+///
+/// Each of the four callers still owns its own statement text. Each still
+/// owns its own barrier strategy. Each still owns its own doc comment on
+/// the residual window that strategy accepts. See
+/// [`apply_post_claim_rechecks`] below for how those strategies differ.
+pub(crate) async fn release_claim_via(
+    conn: &mut AsyncPgConnection,
+    sql: &'static str,
+    task_id: Uuid,
+    worker_id: &str,
+) -> HarvestResult<bool> {
+    let released = diesel::sql_query(sql)
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .bind::<diesel::sql_types::Text, _>(worker_id)
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(released > 0)
+}
+
 /// The post-claim re-checks shared by [`claim_task_on_shard`] and
 /// [`claim_task_by_id_on_shard`].
 ///
@@ -1615,6 +1710,23 @@ async fn apply_post_claim_rechecks(
     // and why it is accepted.
     if task.task_type == crate::activity_pause::ACTIVITY_TASK_TYPE
         && crate::activity_pause::release_claim_if_activity_paused(conn, task.id, worker_id).await?
+    {
+        return Ok(ClaimOutcome::Released(task.id));
+    }
+
+    // Authoritative workflow-pause re-check (issue #1640). The reasoning
+    // matches the two re-checks above. The claim's own anti-join against
+    // `harvest_workflow_executions` is evaluated against that statement's
+    // snapshot. A `pause_workflow_execution` commit while the claim was in
+    // flight stays invisible to it.
+    //
+    // Gated on `task_type` and a non-null `workflow_exec_id`. An activity
+    // claim can never be held by a workflow pause, so it pays no extra round
+    // trip. See `execution::release_claim_if_workflow_paused` for the
+    // residual-window trade-off this re-check accepts.
+    if task.task_type == TaskType::Workflow.as_str()
+        && task.workflow_exec_id.is_some()
+        && crate::execution::release_claim_if_workflow_paused(conn, task.id, worker_id).await?
     {
         return Ok(ClaimOutcome::Released(task.id));
     }
@@ -1983,8 +2095,11 @@ impl PendingHintRow {
             queue_name: self.queue_name,
             scheduled_at: self.scheduled_at,
             priority: self.priority,
-            // v1 rejects Redis dispatch on a sharded runtime at validation, so
-            // a hint never has to name a shard. The field carries the follow-up.
+            // A multi-shard runtime routes by installed CHANNEL, not by this
+            // field (issue #1429). Each shard gets its own per-shard channel
+            // and key family. A reference published into it already carries
+            // an unambiguous shard identity by construction. This
+            // hint-level field stays unset; nothing reads it yet.
             shard: None,
             kind: Some(crate::dispatch::DispatchKind::from(self.task_type.as_str())),
         }
@@ -2792,12 +2907,11 @@ struct PendingRequeueChangeset {
     /// distinct-worker set and the total counter can never disagree about
     /// whether the streak was broken.
     capability_miss_workers: Vec<String>,
-    scheduled_at: chrono::DateTime<Utc>,
     error: Option<String>,
 }
 
 impl PendingRequeueChangeset {
-    const fn new(next_run: chrono::DateTime<Utc>, previous_error: String) -> Self {
+    const fn new(previous_error: String) -> Self {
         Self {
             state: "PENDING",
             worker_id: None,
@@ -2806,7 +2920,6 @@ impl PendingRequeueChangeset {
             crash_strikes: 0,
             capability_misses: 0,
             capability_miss_workers: Vec::new(),
-            scheduled_at: next_run,
             error: Some(previous_error),
         }
     }
@@ -2834,18 +2947,31 @@ pub async fn requeue_for_retry(
     previous_error: &str,
 ) -> HarvestResult<()> {
     use crate::schema::harvest_task_queue::dsl;
+    use diesel::dsl::sql;
+    use diesel::sql_types::{Double, Timestamptz};
 
-    let next_run = Utc::now() + delay;
-    let changeset = PendingRequeueChangeset::new(next_run, previous_error.to_string());
+    let changeset = PendingRequeueChangeset::new(previous_error.to_string());
 
-    let (queue_name, priority, task_type) = diesel::update(
+    let (queue_name, priority, task_type, next_run) = diesel::update(
         dsl::harvest_task_queue
             .find(task_id)
             .filter(dsl::state.eq("RUNNING")),
     )
-    .set(&changeset)
-    .returning((dsl::queue_name, dsl::priority, dsl::task_type))
-    .get_result::<(String, i32, String)>(conn)
+    .set((
+        changeset,
+        dsl::scheduled_at.eq(
+            sql::<Timestamptz>("clock_timestamp() + make_interval(secs => ")
+                .bind::<Double, _>(delay_secs(delay))
+                .sql(")"),
+        ),
+    ))
+    .returning((
+        dsl::queue_name,
+        dsl::priority,
+        dsl::task_type,
+        dsl::scheduled_at,
+    ))
+    .get_result::<(String, i32, String, chrono::DateTime<Utc>)>(conn)
     .await
     .optional()
     .map_err(crate::error::database_error)?
@@ -2877,6 +3003,135 @@ pub async fn requeue_for_retry(
     }
 
     Ok(())
+}
+
+/// Reset a `RUNNING` workflow task to `PENDING` with a future `scheduled_at`.
+///
+/// This is the bounded backoff retry for a quota or shard-admission
+/// rejection (issue #956). It also clears a stale `mixed_signal_suspension`
+/// sentinel, and a mid-cycle wake flag, in the same update.
+///
+/// Mirrors [`requeue_for_retry`], restricted to `task_type = 'workflow'`
+/// rows (every caller holds a workflow task), with two extra clears:
+///
+/// - `activity_name`: without this clear, an old sentinel can survive. An
+///   earlier, unrelated cycle may stamp it during a timer-and-signal race
+///   (issue #476/#600). A surviving sentinel still matches the wake-forward
+///   arm of `primary_repend_workflow_task_query`. Any unrelated wake then
+///   resets `scheduled_at` to now. This defeats the backoff (issue #1391).
+/// - `wake_requested`: a wake captured mid-cycle must not short-circuit the
+///   backoff. The row is durably `PENDING`. It is deferred purely by
+///   `scheduled_at` (`claim_task` enforces `scheduled_at <= NOW()`). So a
+///   wake arriving during the backoff is not lost. The next claim's full
+///   history replay recovers it instead.
+///
+/// `requeue_workflow_task_nd_blocked` clears the same two columns for the
+/// similar ND-block backoff (issue #603).
+///
+/// No `pg_notify`: the task is deliberately not claimable until
+/// `scheduled_at`, so waking pollers early would be pure noise.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::NotFound`] when the task is not a
+/// claimed (`RUNNING`) workflow task, and
+/// [`crate::error::HarvestError::Database`] on update failure.
+pub async fn requeue_workflow_task_for_quota_retry(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    delay: Duration,
+    previous_error: &str,
+) -> HarvestResult<()> {
+    use crate::schema::harvest_task_queue::dsl;
+    use diesel::dsl::sql;
+    use diesel::sql_types::{Double, Timestamptz};
+
+    let changeset = PendingRequeueChangeset::new(previous_error.to_string());
+
+    // `scheduled_at` is computed on Postgres's own `clock_timestamp()`, not
+    // the host's `Utc::now()` (Codex review, issue #1589). A trailing
+    // worker host clock could otherwise bind a `scheduled_at` already at
+    // or before the database's own `NOW()`. `claim_task` compares against
+    // that, so the row would be immediately claimable again. That defeats
+    // this function's whole purpose: a bounded backoff against a durably
+    // exhausted quota. Mirrors `requeue_for_retry`'s and
+    // `requeue_workflow_task_nd_blocked`'s identical DB-clock computation.
+    let updated = diesel::update(
+        dsl::harvest_task_queue
+            .find(task_id)
+            .filter(dsl::state.eq("RUNNING"))
+            .filter(dsl::task_type.eq("workflow")),
+    )
+    .set((
+        changeset,
+        dsl::scheduled_at.eq(
+            sql::<Timestamptz>("clock_timestamp() + make_interval(secs => ")
+                .bind::<Double, _>(delay_secs(delay))
+                .sql(")"),
+        ),
+        dsl::wake_requested.eq(false),
+        dsl::activity_name.eq(None::<String>),
+        // A quota/shard-admission backoff is not a timer wake (issue
+        // #1402). Clear the marker so it cannot survive to name a stale
+        // timer once this row becomes due again.
+        dsl::timer_fires_at.eq(None::<chrono::DateTime<Utc>>),
+    ))
+    .returning((dsl::queue_name, dsl::priority, dsl::scheduled_at))
+    .get_results::<(String, i32, chrono::DateTime<Utc>)>(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+
+    let Some((queue_name, priority, next_run)) = updated.into_iter().next() else {
+        return Err(crate::error::HarvestError::NotFound(format!(
+            "task queue item {task_id} is not a running workflow task"
+        )));
+    };
+
+    // Dispatch hint (issue #1312). No `pg_notify` fires here on purpose --
+    // same rationale as `requeue_workflow_task_nd_blocked`.
+    record_pending_hint(
+        task_id,
+        &queue_name,
+        next_run,
+        priority,
+        crate::dispatch::DispatchKind::Workflow,
+    );
+
+    Ok(())
+}
+
+/// Build the `SET` clause used by [`requeue_workflow_task_for_quota_retry`]
+/// so a no-DB unit test can assert the generated SQL shape (issue #1391).
+/// Mirrors the `requeue_after_panic_query` shape-test precedent.
+#[cfg(test)]
+fn requeue_workflow_task_for_quota_retry_query(
+    changeset: PendingRequeueChangeset,
+    delay: Duration,
+) -> String {
+    use crate::schema::harvest_task_queue::dsl;
+    use diesel::debug_query;
+    use diesel::dsl::sql;
+    use diesel::pg::Pg;
+    use diesel::sql_types::{Double, Timestamptz};
+
+    let query = diesel::update(
+        dsl::harvest_task_queue
+            .find(Uuid::nil())
+            .filter(dsl::state.eq("RUNNING"))
+            .filter(dsl::task_type.eq("workflow")),
+    )
+    .set((
+        changeset,
+        dsl::scheduled_at.eq(
+            sql::<Timestamptz>("clock_timestamp() + make_interval(secs => ")
+                .bind::<Double, _>(delay_secs(delay))
+                .sql(")"),
+        ),
+        dsl::wake_requested.eq(false),
+        dsl::activity_name.eq(None::<String>),
+        dsl::timer_fires_at.eq(None::<chrono::DateTime<Utc>>),
+    ));
+    debug_query::<Pg, _>(&query).to_string()
 }
 
 /// Re-pend an ND-blocked workflow task with a future `scheduled_at` (issue
@@ -2914,9 +3169,10 @@ pub async fn requeue_workflow_task_nd_blocked(
     reason: &str,
 ) -> HarvestResult<()> {
     use crate::schema::harvest_task_queue::dsl;
+    use diesel::dsl::sql;
+    use diesel::sql_types::{Double, Timestamptz};
 
-    let next_run = Utc::now() + delay;
-    let changeset = PendingRequeueChangeset::new(next_run, reason.to_string());
+    let changeset = PendingRequeueChangeset::new(reason.to_string());
 
     let updated = diesel::update(
         dsl::harvest_task_queue
@@ -2926,18 +3182,27 @@ pub async fn requeue_workflow_task_nd_blocked(
     )
     .set((
         changeset,
+        dsl::scheduled_at.eq(
+            sql::<Timestamptz>("clock_timestamp() + make_interval(secs => ")
+                .bind::<Double, _>(delay_secs(delay))
+                .sql(")"),
+        ),
         dsl::sticky_worker_id.eq(None::<String>),
         dsl::sticky_until.eq(None::<chrono::DateTime<Utc>>),
         dsl::sticky_timeout.eq(None::<chrono::Duration>),
         dsl::wake_requested.eq(false),
         dsl::activity_name.eq(None::<String>),
+        // A crash-recovery backoff is not a timer wake (issue #1402).
+        // Clear the marker so it cannot survive to name a stale timer
+        // once this row becomes due again.
+        dsl::timer_fires_at.eq(None::<chrono::DateTime<Utc>>),
     ))
-    .returning((dsl::queue_name, dsl::priority))
-    .get_results::<(String, i32)>(conn)
+    .returning((dsl::queue_name, dsl::priority, dsl::scheduled_at))
+    .get_results::<(String, i32, chrono::DateTime<Utc>)>(conn)
     .await
     .map_err(crate::error::database_error)?;
 
-    let Some((queue_name, priority)) = updated.into_iter().next() else {
+    let Some((queue_name, priority, next_run)) = updated.into_iter().next() else {
         return Err(crate::error::HarvestError::NotFound(format!(
             "task queue item {task_id} is not a running workflow task"
         )));
@@ -2964,10 +3229,12 @@ pub async fn requeue_workflow_task_nd_blocked(
 /// Takes the changeset by value so the returned query owns it (the caller only
 /// needs the SQL text, never to execute it).
 #[cfg(test)]
-fn requeue_after_panic_query(changeset: PendingRequeueChangeset) -> String {
+fn requeue_after_panic_query(changeset: PendingRequeueChangeset, delay: Duration) -> String {
     use crate::schema::harvest_task_queue::dsl;
     use diesel::debug_query;
+    use diesel::dsl::sql;
     use diesel::pg::Pg;
+    use diesel::sql_types::{Double, Timestamptz};
 
     let query = diesel::update(
         dsl::harvest_task_queue
@@ -2977,11 +3244,17 @@ fn requeue_after_panic_query(changeset: PendingRequeueChangeset) -> String {
     )
     .set((
         changeset,
+        dsl::scheduled_at.eq(
+            sql::<Timestamptz>("clock_timestamp() + make_interval(secs => ")
+                .bind::<Double, _>(delay_secs(delay))
+                .sql(")"),
+        ),
         dsl::sticky_worker_id.eq(None::<String>),
         dsl::sticky_until.eq(None::<chrono::DateTime<Utc>>),
         dsl::sticky_timeout.eq(None::<chrono::Duration>),
         dsl::wake_requested.eq(false),
         dsl::activity_name.eq(None::<String>),
+        dsl::timer_fires_at.eq(None::<chrono::DateTime<Utc>>),
     ));
     debug_query::<Pg, _>(&query).to_string()
 }
@@ -3021,9 +3294,10 @@ pub async fn requeue_workflow_task_after_panic(
     reason: &str,
 ) -> HarvestResult<()> {
     use crate::schema::harvest_task_queue::dsl;
+    use diesel::dsl::sql;
+    use diesel::sql_types::{Double, Timestamptz};
 
-    let next_run = Utc::now() + delay;
-    let changeset = PendingRequeueChangeset::new(next_run, reason.to_string());
+    let changeset = PendingRequeueChangeset::new(reason.to_string());
 
     let updated = diesel::update(
         dsl::harvest_task_queue
@@ -3033,18 +3307,27 @@ pub async fn requeue_workflow_task_after_panic(
     )
     .set((
         changeset,
+        dsl::scheduled_at.eq(
+            sql::<Timestamptz>("clock_timestamp() + make_interval(secs => ")
+                .bind::<Double, _>(delay_secs(delay))
+                .sql(")"),
+        ),
         dsl::sticky_worker_id.eq(None::<String>),
         dsl::sticky_until.eq(None::<chrono::DateTime<Utc>>),
         dsl::sticky_timeout.eq(None::<chrono::Duration>),
         dsl::wake_requested.eq(false),
         dsl::activity_name.eq(None::<String>),
+        // A crash-recovery backoff is not a timer wake (issue #1402).
+        // Clear the marker so it cannot survive to name a stale timer
+        // once this row becomes due again.
+        dsl::timer_fires_at.eq(None::<chrono::DateTime<Utc>>),
     ))
-    .returning((dsl::queue_name, dsl::priority))
-    .get_results::<(String, i32)>(conn)
+    .returning((dsl::queue_name, dsl::priority, dsl::scheduled_at))
+    .get_results::<(String, i32, chrono::DateTime<Utc>)>(conn)
     .await
     .map_err(crate::error::database_error)?;
 
-    let Some((queue_name, priority)) = updated.into_iter().next() else {
+    let Some((queue_name, priority, next_run)) = updated.into_iter().next() else {
         return Err(crate::error::HarvestError::NotFound(format!(
             "task queue item {task_id} is not a running workflow task"
         )));
@@ -3288,6 +3571,16 @@ impl CleanContinuationChangeset {
 /// details payload is intentionally preserved so the retry attempt can resume
 /// from the last flushed checkpoint.
 ///
+/// Every caller passes a durable timer's own `fires_at` (issue #1402):
+/// `persist_started_timer` and its mixed-signal/child-race siblings,
+/// always with the exact value just written to `harvest_timers.fires_at`.
+/// This is the ONE path that stamps `timer_fires_at` from `scheduled_at`.
+/// That is what lets
+/// [`crate::stall_diagnosis::is_the_missed_timer_wake`] trust the column
+/// later, even after some other path drifts `scheduled_at` again without
+/// changing the wake reason. See `timer_fires_at`'s column comment in the
+/// schema for the full argument.
+///
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] on update failure.
@@ -3303,7 +3596,10 @@ pub async fn reschedule_task(
             .find(task_id)
             .filter(dsl::state.eq("RUNNING")),
     )
-    .set(CleanContinuationChangeset::new(scheduled_at))
+    .set((
+        CleanContinuationChangeset::new(scheduled_at),
+        dsl::timer_fires_at.eq(Some(scheduled_at)),
+    ))
     .returning((dsl::queue_name, dsl::priority, dsl::task_type))
     .get_result::<(String, i32, String)>(conn)
     .await
@@ -4050,6 +4346,10 @@ pub async fn claim_still_held_for_update(
 /// uses to reset the same column for the same reason. Leaving a stale count
 /// in place would let an unrelated, already-resolved crash history count
 /// against a task that just proved itself dispatchable.
+///
+/// Also clears `timer_fires_at` (issue #1402). This release hands the
+/// row to a fresh dispatch attempt at the current instant, not to
+/// whatever timer last armed it. A stale marker must not outlive it.
 const fn release_suspended_workflow_claim_query() -> &'static str {
     "UPDATE harvest_task_queue \
      SET state = 'PENDING', \
@@ -4063,6 +4363,7 @@ const fn release_suspended_workflow_claim_query() -> &'static str {
          capability_misses = 0, \
          capability_miss_workers = '{}', \
          crash_strikes = 0, \
+         timer_fires_at = NULL, \
          sticky_until = CASE \
              WHEN sticky_worker_id IS NOT NULL AND sticky_timeout IS NOT NULL \
              THEN NOW() + sticky_timeout \
@@ -4705,6 +5006,10 @@ pub async fn wake_workflow_task(
 /// claimed follow-up task (issue #501 review). The wake instant is this cycle's
 /// true eligibility, so an immediately-served wake correctly reports ~0.
 ///
+/// Also clears `timer_fires_at` (issue #1402). A signal, child, or
+/// external handoff woke this row, not whatever timer last armed it.
+/// That marker must not survive to name the wrong cause later.
+///
 /// The statement returns the hint columns rather than `queue_name` alone
 /// (issue #1312). A re-pended row is then published to the dispatch channel
 /// with its own id, due time and priority.
@@ -4732,6 +5037,7 @@ const fn primary_repend_workflow_task_query() -> &'static str {
          scheduled_at = $2, \
          created_at = clock_timestamp(), \
          activity_name = NULL, \
+         timer_fires_at = NULL, \
          sticky_until = CASE \
              WHEN sticky_worker_id IS NOT NULL AND sticky_timeout IS NOT NULL \
              THEN NOW() + sticky_timeout \
@@ -5971,6 +6277,994 @@ pub async fn pending_queue_demand_by_queue_name(
 }
 
 // ---------------------------------------------------------------------------
+// Batched seek-and-refine claim (issue #1340)
+// ---------------------------------------------------------------------------
+
+/// A batched, seek-and-refine alternative to [`claim_task_query`]'s
+/// single-row form, for the per-key concurrency gate specifically.
+///
+/// # Scope
+///
+/// Issue #1177 found that any residual `WHERE` predicate on the claim
+/// candidate scan defeats index sort-elision. Each one forces a
+/// full-backlog scan per claim. Issue #1340 tracks the architectural fix:
+/// fetch a small ordered batch of candidates instead of the single best
+/// row. Apply the expensive gate to the batch, and retry with the next
+/// batch on exhaustion.
+///
+/// This module implements that shape for one gate: the per-key concurrency
+/// check (issue #247). It is the single most expensive residual predicate
+/// measured (`docs/performance.md`: +644% even at low contention). Every
+/// other gate in [`claim_task_query`] stays in the batch scan unchanged --
+/// pause, sticky, session, build routing, workflow pause, capability
+/// labels, rate limiting.
+/// `docs/assays/0005-claim-batched-seek-and-refine.md`
+/// (ledger #5) prototyped and killed one version of this shape. The kill
+/// was a pre-registration fencepost bug, not a mechanism defect: wall-clock
+/// cleared every line by 2.9x-190x. Two real correctness bugs surfaced
+/// there in review. Both are fixed here from the start:
+///
+/// 1. The winning candidate must be picked by the SAME per-candidate
+///    `pg_try_advisory_xact_lock` + fresh `COUNT` recheck the single-row
+///    path already uses. It must never use a batch-wide snapshot taken
+///    before any lock. [`claim_batched_candidate_attempt_query`] is that
+///    recheck, applied to one already-locked row at a time.
+/// 2. The keyset cursor between batches must break ties on `id`, not just
+///    on the sort key. `scheduled_at` and priority commonly collide across
+///    many rows. A 3-column cursor silently drops tied rows past a batch
+///    boundary. The cursor here carries `(sticky_rank, effective_priority,
+///    scheduled_at, id)` and compares with an explicit `OR` chain, since
+///    the columns sort in mixed directions.
+///
+/// A third bug surfaced in this session's own review, not ledger #5's.
+/// A batch walk debited a rate-limit token for every candidate tried,
+/// including one the concurrency gate always rejects. An adversarial
+/// batch sharing both a saturated `concurrency_key` and a `rate_limit_key`
+/// could leak up to `batch_size * max_batches` tokens from one bucket.
+/// That is far more than the single-row path's documented one-token
+/// bound. See [`claim_batched_candidate_concurrency_probe_query`] for the
+/// fix: a cheap, read-only concurrency check runs first. The debit then
+/// only ever runs for a candidate that already cleared the concurrency
+/// gate.
+///
+/// A fourth bug, also caught in this session's review (Codex): the batch
+/// scan's `schedule_to_close_at > NOW()` filter uses `NOW()`, frozen at
+/// transaction start. A deadline that passes in REAL time while an
+/// earlier candidate is still being tried would incorrectly still read
+/// as live against that frozen snapshot. See
+/// [`claim_batched_candidate_attempt_query`]'s own doc for the fix: a
+/// fresh `clock_timestamp()` recheck at claim time, the same
+/// soft-filter-plus-authoritative-recheck shape the concurrency gate uses.
+///
+/// A fifth bug, caught by the same reviewer against the fourth bug's own
+/// fix. The new `clock_timestamp()` recheck only gated `claimed`, the CTE
+/// that performs the update. `rate_limit_debit` is a separate,
+/// data-modifying CTE in the same query. Postgres runs it regardless of
+/// whether `claimed` uses its result. So an expired-but-rate-limited
+/// candidate still spent a token, recreating the third bug's leak on the
+/// deadline path instead of the concurrency path. The fix adds the same
+/// `$9` deadline check to `rate_limit_debit`'s own `WHERE` clause.
+///
+/// A sixth bug, caught by the same reviewer against the fifth bug's own
+/// fix. `clock_timestamp()` is volatile: unlike `NOW()`, Postgres does
+/// not freeze it, so two separate calls in one query can return two
+/// different real times. The fifth fix called it once per CTE. A
+/// deadline that falls between those two reads could let
+/// `rate_limit_debit` commit its token spend while `claimed` rejects the
+/// same row in the same statement. The fix adds a leading `now_ts` CTE
+/// that calls `clock_timestamp()` once. Both `rate_limit_debit` and
+/// `claimed` read that one materialized value, so they always agree on
+/// the deadline decision.
+///
+/// A seventh bug, also caught by the same reviewer. `claimed`'s own
+/// `started_at = NOW()` stamps the claim with the transaction-frozen
+/// start time, not the real time of the claim. A batch walk can spend
+/// real time probing many candidates inside one transaction, so `NOW()`
+/// can be stale by the whole walk's duration. `start_to_close` and
+/// `heartbeat_timeout` are measured from `started_at`. A stale stamp
+/// silently steals part of a task's timeout budget before it starts.
+/// The fix reuses `now_ts`: `started_at` reads the same materialized
+/// `clock_timestamp()` value the deadline checks already use.
+///
+/// A ninth bug, caught by the same reviewer against the seventh bug's
+/// `now_ts` fix. `now_ts` had no `FROM` clause of its own, so Postgres
+/// could resolve it before `rate_limit_debit` even attempted its own row
+/// lock. A concurrent transaction holding that lock would then let
+/// `now_ts` capture a stale, pre-wait value that `rate_limit_debit`,
+/// `claimed`, and `started_at` all reuse. A deadline expiring DURING the
+/// wait would incorrectly still read as live. Confirmed against a real
+/// Postgres instance, not just reasoned about. The same query shape,
+/// run under genuine lock contention, mis-claimed an expired row before
+/// the fix and correctly rejected it after. The fix gives `now_ts` its
+/// own `FOR UPDATE` lock attempt on the exact bucket row
+/// `rate_limit_debit` locks next. So `now_ts` cannot resolve before
+/// that wait ends.
+///
+/// A tenth bug, caught by the same reviewer against the ninth bug's own
+/// fix. The forced lock above gated only on `$6::text IS NOT NULL`,
+/// missing `rate_limit_debit`'s own `NOT ($7 = ANY($8))` circuit-breaker
+/// exclusion. `rate_limit_debit` never touches the bucket row for a
+/// circuit-breaker-bypassed activity, so that claim has no reason to
+/// wait on it. Without the same exclusion, `now_ts` forced it to wait
+/// anyway. That serializes a claim meant to run at full speed behind an
+/// unrelated transaction, risking a missed deadline on a lock the claim
+/// never needed. The fix adds the same `NOT ($7 = ANY($8))` gate to
+/// `now_ts`'s forced lock.
+///
+/// An eleventh bug (P1), caught by the same reviewer: `rate_limit_debit`
+/// wrote `last_refilled_at = NOW()`, the transaction-frozen time, not
+/// the real time of the debit. A long batch walk can let another,
+/// faster transaction refill the SAME bucket in the meantime. This
+/// transaction's own stale `NOW()` can then persist a `last_refilled_at`
+/// from BEFORE that other write. A later claimant reading it re-accrues
+/// tokens for an interval already accounted for, exceeding the
+/// configured rate limit. The fix reuses `now_ts` for every real-time
+/// read the rate-limit formula makes, not just `last_refilled_at`. The
+/// override-active check, both segments of the piecewise accrual
+/// formula, and the final stamp all read the same materialized value.
+///
+/// A twelfth bug (P2), caught by the same reviewer. A candidate's
+/// deadline can expire DURING the batch walk. Not while waiting on its
+/// own bucket lock (the ninth bug above), but while an EARLIER
+/// candidate's bucket lock is being waited on. That candidate still
+/// paid for its own bucket's `now_ts` lock wait before the post-lock
+/// deadline check could reject it. That wastes an entire lock wait on a
+/// candidate that can never claim, regardless of what the lock
+/// protects. [`try_claim_batched_candidate`] now rejects an
+/// already-expired candidate against a fresh `Utc::now()` before
+/// issuing the attempt query at all. It never touches that candidate's
+/// bucket lock.
+///
+/// A thirteenth bug (P2, a real correctness gap, not a performance
+/// one), caught by the same reviewer. The batch scan's own build-routing
+/// gate (`required_build_id`/`harvest_build_compat`) only filters
+/// candidates at SCAN time. The scan and this candidate's own attempt
+/// are separate statements. An operator revoking build compatibility
+/// in between is invisible to `claimed`'s `WHERE`, which checked only
+/// `id = $2` plus the concurrency/rate-limit/deadline gates. A worker
+/// could claim a task requiring a build it is no longer compatible
+/// with, breaking the replay-determinism guarantee build routing
+/// exists to protect. [`claim_task_query`]'s single atomic statement
+/// has no such window; this two-phase design does. Fixed by re-running
+/// the scan's own build-routing gate, verbatim, in `claimed`'s `WHERE`.
+/// A same-review follow-up finding: `rate_limit_debit` is a
+/// data-modifying CTE. It runs whether or not `claimed` uses its
+/// result, the same shape as the original rate-limit-leak fix. Adding
+/// the build-routing gate only to `claimed` left a revoked-build
+/// candidate still spending a token. Fixed by adding the same gate,
+/// via a small `EXISTS` keyed on `$2`, to `rate_limit_debit`'s own
+/// `WHERE`.
+///
+/// A fourteenth bug (P2), caught by the same reviewer.
+/// [`try_claim_batched_candidate`]'s twelfth-bug fix above compared
+/// `schedule_to_close_at` against `Utc::now()`: the worker HOST's
+/// clock, not the database's. If that host clock runs ahead of
+/// Postgres, this fast pre-check can reject a candidate the database's
+/// own `clock_timestamp()` would still consider live. That is the
+/// authoritative source every other deadline check in this module
+/// already uses. The reject then delays dispatch until the skewed
+/// host clock catches up. Fixed by reading the deadline against a
+/// fresh `clock_timestamp()` from the database, not the host. This
+/// keeps the fast-reject property (no bucket lock
+/// touched) while trusting the same clock as everything else here.
+///
+/// # What this is not
+///
+/// This is **not** wired into [`claim_task`] or [`claim_task_on_shard`].
+/// Batching locks up to `batch_size` rows per attempt instead of one.
+/// `tests/integration/claim_batched_tests.rs` measures real
+/// concurrent-claimer correctness under that shape, not merely a stub.
+/// Unlike ledger #5's single-session apparatus, this crate's tests drive
+/// real concurrent Tokio tasks against a real Postgres. They assert no
+/// saturated key is ever over-claimed. What those tests do NOT cover is
+/// fleet-scale throughput under contention, only correctness. That gap is
+/// what issue #1340 flags before this could become the default claim path.
+/// Making this the default claim path needs sign-off from someone with
+/// full context on `queue.rs`'s exactly-once-claim and lock-ordering
+/// invariants, per issue #1340's own scope.
+///
+/// This variant also does not implement the cross-region DR fence (issue
+/// #954). Nor does it implement the by-id claim (issue #1312) that
+/// [`claim_task_query_fenced`] and [`claim_task_by_id_query`] add to the
+/// single-row path. A deployment using either would need those ported here
+/// first.
+///
+/// **Known limitation, safe-side: the advisory lock can be held longer
+/// than the single-row path's.** `pg_try_advisory_xact_lock` is
+/// transaction-scoped and reentrant. So once one candidate in a batch
+/// acquires a saturated key's lock, every later candidate sharing that
+/// key re-acquires it instantly. It then holds the lock until this whole
+/// claim attempt's transaction ends. That span can cover every candidate
+/// in every batch searched. This cannot cause a double-claim. It can only
+/// make other workers' claims on that key wait longer. Unmeasured, and
+/// not the same gap as the fleet-scale-throughput gap named above.
+///
+/// **Known limitation, review finding, not fixed here: a rate-limit
+/// bucket's row lock is retained the same way, but it can deadlock.**
+/// Unlike the advisory lock above, `rate_limit_debit`'s `UPDATE` (and now
+/// `now_ts`'s own lookup) takes a real, BLOCKING Postgres row lock on the
+/// bucket row. This is present since this module's very first draft, not
+/// introduced by the `now_ts` fix. It is held until the whole claim
+/// attempt's transaction ends, for every DISTINCT `rate_limit_key` any
+/// tried candidate carries, not just the winning one.
+///
+/// Two claimers walking batches that touch the same two bucket keys in
+/// opposite orders can each hold one key while waiting on the other.
+/// That is a genuine Postgres deadlock. Postgres detects and resolves
+/// it by aborting one claim attempt outright. That surfaces as a clean,
+/// typed error a caller's own retry loop already handles, not a wedge
+/// or a double-claim. Resolving this needs either a canonical per-transaction
+/// lock order across bucket keys or releasing a failed candidate's lock
+/// before moving on (a `SAVEPOINT` per candidate). Both are real
+/// redesigns, out of scope
+/// here. Named explicitly, alongside the gaps above, as what a reviewer
+/// needs before this becomes the default claim path.
+// The body is one SQL string literal; the line count is the query's, not
+// control flow's -- the same allow `claim_task_query` carries.
+#[allow(clippy::too_many_lines)]
+#[must_use]
+pub fn claim_task_batched_candidates_query() -> &'static str {
+    static QUERY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        let rate_limit_available = effective_available_tokens_expr("b");
+        format!(
+            "WITH worker_info AS ( \
+                 SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{{}}'::jsonb) AS labels \
+             ), \
+             paused_queues AS MATERIALIZED ( \
+                 SELECT COALESCE(array_agg(queue_name), ARRAY[]::text[]) AS names \
+                 FROM harvest_queue_pauses \
+                 WHERE queue_name = ANY($2) \
+             ), \
+             paused_activities AS MATERIALIZED ( \
+                 SELECT COALESCE(array_agg(activity_name), ARRAY[]::text[]) AS names \
+                 FROM harvest_activity_pauses \
+             ) \
+             SELECT \
+                 id, task_type, concurrency_key, concurrency_cap, rate_limit_key, activity_name, \
+                 scheduled_at, schedule_to_close_at, \
+                 CASE WHEN sticky_worker_id = $1 AND sticky_until > NOW() THEN 1 ELSE 0 END AS sticky_rank, \
+                 CASE \
+                     WHEN $4::BIGINT IS NOT NULL AND $4::BIGINT > 0 \
+                     THEN priority + FLOOR(EXTRACT(EPOCH FROM (NOW() - scheduled_at)) / $4::BIGINT)::INT \
+                     ELSE priority \
+                 END AS effective_priority \
+             FROM harvest_task_queue \
+             CROSS JOIN worker_info \
+             CROSS JOIN paused_queues \
+             CROSS JOIN paused_activities \
+             WHERE queue_name = ANY($2) \
+               AND state = 'PENDING' \
+               AND scheduled_at <= NOW() \
+               AND NOT (harvest_task_queue.queue_name = ANY(paused_queues.names)) \
+               AND ( \
+                   schedule_to_close_at IS NULL \
+                   OR schedule_to_close_at > NOW() \
+               ) \
+               AND ( \
+                   sticky_worker_id IS NULL \
+                   OR sticky_worker_id = $1 \
+                   OR sticky_until IS NULL \
+                   OR sticky_until <= NOW() \
+               ) \
+               AND ( \
+                   session_id IS NULL \
+                   OR sticky_worker_id = $1 \
+               ) \
+               AND ( \
+                   required_build_id IS NULL \
+                   OR $3 = '' \
+                   OR required_build_id = $3 \
+                   OR EXISTS ( \
+                       SELECT 1 FROM harvest_build_compat \
+                       WHERE build_id = $3 \
+                         AND compatible_with = harvest_task_queue.required_build_id \
+                   ) \
+               ) \
+               AND ( \
+                   task_type <> 'workflow' \
+                   OR workflow_exec_id IS NULL \
+                   OR NOT EXISTS ( \
+                       SELECT 1 FROM harvest_workflow_executions e \
+                       WHERE e.id = harvest_task_queue.workflow_exec_id \
+                         AND e.state = 'PAUSED' \
+                   ) \
+               ) \
+               AND ( \
+                   task_type != 'activity' \
+                   OR activity_name IS NULL \
+                   OR required_capabilities IS NOT NULL \
+                   OR NOT (activity_name = ANY($6)) \
+               ) \
+               AND ( \
+                   task_type != 'activity' \
+                   OR activity_name IS NULL \
+                   OR NOT (activity_name = ANY(paused_activities.names)) \
+               ) \
+               AND ( \
+                   required_capabilities IS NULL \
+                   OR NOT EXISTS ( \
+                       SELECT 1 \
+                       FROM jsonb_array_elements(required_capabilities) AS r(value) \
+                       WHERE ( \
+                           r.value ? 'Exact' AND ( \
+                               worker_info.labels->>(r.value->'Exact'->>'key') IS NULL \
+                               OR worker_info.labels->>(r.value->'Exact'->>'key') != (r.value->'Exact'->>'value') \
+                           ) \
+                       ) OR ( \
+                           r.value ? 'In' AND ( \
+                               worker_info.labels->>(r.value->'In'->>'key') IS NULL \
+                               OR NOT ( \
+                                   (r.value->'In'->'values') @> jsonb_build_array(worker_info.labels->>(r.value->'In'->>'key')) \
+                               ) \
+                           ) \
+                       ) \
+                   ) \
+               ) \
+               AND ( \
+                   rate_limit_key IS NULL \
+                   OR harvest_task_queue.activity_name = ANY($5) \
+                   OR EXISTS ( \
+                       SELECT 1 FROM harvest_rate_limit_buckets b \
+                       WHERE b.key = harvest_task_queue.rate_limit_key \
+                         AND {rate_limit_available} >= 1.0 \
+                   ) \
+               ) \
+               AND ( \
+                   $7::BOOL = FALSE \
+                   OR (CASE WHEN sticky_worker_id = $1 AND sticky_until > NOW() THEN 1 ELSE 0 END) < $8 \
+                   OR ( \
+                       (CASE WHEN sticky_worker_id = $1 AND sticky_until > NOW() THEN 1 ELSE 0 END) = $8 \
+                       AND (CASE \
+                           WHEN $4::BIGINT IS NOT NULL AND $4::BIGINT > 0 \
+                           THEN priority + FLOOR(EXTRACT(EPOCH FROM (NOW() - scheduled_at)) / $4::BIGINT)::INT \
+                           ELSE priority \
+                       END) < $9 \
+                   ) \
+                   OR ( \
+                       (CASE WHEN sticky_worker_id = $1 AND sticky_until > NOW() THEN 1 ELSE 0 END) = $8 \
+                       AND (CASE \
+                           WHEN $4::BIGINT IS NOT NULL AND $4::BIGINT > 0 \
+                           THEN priority + FLOOR(EXTRACT(EPOCH FROM (NOW() - scheduled_at)) / $4::BIGINT)::INT \
+                           ELSE priority \
+                       END) = $9 \
+                       AND scheduled_at > $10 \
+                   ) \
+                   OR ( \
+                       (CASE WHEN sticky_worker_id = $1 AND sticky_until > NOW() THEN 1 ELSE 0 END) = $8 \
+                       AND (CASE \
+                           WHEN $4::BIGINT IS NOT NULL AND $4::BIGINT > 0 \
+                           THEN priority + FLOOR(EXTRACT(EPOCH FROM (NOW() - scheduled_at)) / $4::BIGINT)::INT \
+                           ELSE priority \
+                       END) = $9 \
+                       AND scheduled_at = $10 AND id > $11 \
+                   ) \
+               ) \
+             ORDER BY sticky_rank DESC, effective_priority DESC, scheduled_at ASC, id ASC \
+             LIMIT $12::BIGINT \
+             FOR UPDATE SKIP LOCKED"
+        )
+    });
+    &QUERY
+}
+
+/// The `required_build_id`/`required_capabilities` eligibility predicate
+/// [`claim_batched_candidate_attempt_query`] applies at three sites: the
+/// claim itself, the rate-limit debit, and the forced bucket lock.
+/// `row_ref` qualifies the row's own columns -- empty for `claimed`'s
+/// direct `UPDATE ... WHERE`, `t.` for a correlated `EXISTS` alias.
+/// `compat_ref` qualifies the one comparison against
+/// `harvest_build_compat.compatible_with`. `claimed` already spelled
+/// that one column with the full table name before this helper existed.
+/// It keeps that spelling here too. `labels_expr` supplies the worker's
+/// current labels. It is the shared `worker_info` CTE where that CTE is
+/// already in scope. Or it is an inline lookup, for a caller that must
+/// run before `worker_info` is defined.
+fn build_and_capability_eligibility_predicate(
+    row_ref: &str,
+    compat_ref: &str,
+    labels_expr: &str,
+) -> String {
+    format!(
+        "( \
+             {row_ref}required_build_id IS NULL \
+             OR $10 = '' \
+             OR {row_ref}required_build_id = $10 \
+             OR EXISTS ( \
+                 SELECT 1 FROM harvest_build_compat \
+                 WHERE build_id = $10 \
+                   AND compatible_with = {compat_ref}required_build_id \
+             ) \
+         ) \
+         AND ( \
+             {row_ref}required_capabilities IS NULL \
+             OR NOT EXISTS ( \
+                 SELECT 1 \
+                 FROM jsonb_array_elements({row_ref}required_capabilities) AS r(value) \
+                 WHERE ( \
+                     r.value ? 'Exact' AND ( \
+                         {labels_expr}->>(r.value->'Exact'->>'key') IS NULL \
+                         OR {labels_expr}->>(r.value->'Exact'->>'key') != (r.value->'Exact'->>'value') \
+                     ) \
+                 ) OR ( \
+                     r.value ? 'In' AND ( \
+                         {labels_expr}->>(r.value->'In'->>'key') IS NULL \
+                         OR NOT ( \
+                             (r.value->'In'->'values') @> jsonb_build_array({labels_expr}->>(r.value->'In'->>'key')) \
+                         ) \
+                     ) \
+                 ) \
+             ) \
+         )"
+    )
+}
+
+/// Wraps [`build_and_capability_eligibility_predicate`] in a correlated
+/// `EXISTS` against this candidate's own row (`$2`). This is for a site
+/// that has no `harvest_task_queue` row directly in scope.
+/// `rate_limit_debit`'s `UPDATE` targets `harvest_rate_limit_buckets`.
+/// The forced bucket lock has no `harvest_task_queue` reference at all
+/// otherwise.
+fn candidate_still_build_and_capability_eligible(labels_expr: &str) -> String {
+    format!(
+        "EXISTS ( \
+             SELECT 1 FROM harvest_task_queue t \
+             WHERE t.id = $2 \
+               AND {predicate} \
+         )",
+        predicate = build_and_capability_eligibility_predicate("t.", "t.", labels_expr)
+    )
+}
+
+/// The authoritative per-candidate claim attempt for [`claim_task_batched`].
+///
+/// Applied to one row [`claim_task_batched_candidates_query`] already
+/// locked via `FOR UPDATE SKIP LOCKED`. Matches 0 rows in four cases.
+/// The concurrency-key advisory lock is lost. The freshly-rechecked cap
+/// is now saturated. The rate-limit bucket has no token. Or the deadline
+/// recheck below fails. In every such case the caller moves on to the
+/// next candidate in the batch. This mirrors [`claim_task_query`]'s
+/// `claimed` CTE, scoped to one known row instead of joined through a
+/// `candidate` CTE.
+///
+/// # Deadline recheck (review finding, not present in the first draft)
+///
+/// The batch scan's own `schedule_to_close_at > NOW()` filter uses
+/// `NOW()`, frozen at transaction start. See [`claim_task_batched`]'s own
+/// doc for why that freeze is load-bearing for the keyset cursor. A batch
+/// search walking many candidates can take real wall-clock time. Up to
+/// `batch_size * max_batches` attempts, with the default config.
+///
+/// A row's deadline can pass in REAL time while an earlier candidate is
+/// still being tried. That row would incorrectly still read as
+/// not-yet-expired against the batch scan's frozen snapshot. This query's
+/// own `$9` check uses `clock_timestamp()` instead, which is never
+/// frozen. So it catches that case even though the batch scan cannot.
+/// This is the same shape the concurrency gate already uses: a soft
+/// filter in the scan, plus an authoritative recheck at claim time.
+///
+/// The SAME `$9` check also gates `rate_limit_debit` (review finding,
+/// not present in the first deadline-recheck draft). A data-modifying
+/// CTE runs whether or not a later CTE uses its result. So without this,
+/// an expired candidate would still debit a token even though `claimed`
+/// always rejects it, recreating the leak
+/// [`claim_batched_candidate_concurrency_probe_query`] exists to close.
+///
+/// Both checks read `now_ts`, a leading CTE that calls
+/// `clock_timestamp()` exactly once (review finding, not present in the
+/// first two-CTE draft). `clock_timestamp()` is volatile, so two direct
+/// calls could return two different real times. That gap could let
+/// `rate_limit_debit` commit a spend for a deadline `claimed` then
+/// rejects, in the same statement. One materialized read removes the
+/// gap: both writers see the identical value.
+///
+/// `now_ts` itself takes a `FOR UPDATE` lock on the same bucket row
+/// `rate_limit_debit` locks next (review finding, not present in the
+/// first `now_ts` draft). A plain, `FROM`-less `now_ts` could resolve
+/// before that row lock, letting a concurrent lock holder's wait make
+/// the captured time stale. The forced lock removes that gap: `now_ts`
+/// cannot finish before the same wait `rate_limit_debit` would face.
+///
+/// That forced lock skips circuit-breaker-tracked activities, via the
+/// same `NOT ($7 = ANY($8))` gate `rate_limit_debit`'s own `WHERE`
+/// already uses (review finding, not present in the first forced-lock
+/// draft). `rate_limit_debit` never touches the bucket row for such an
+/// activity, so a bypassed claim has no reason to wait on it either.
+///
+/// The forced lock also gates on this candidate's own build-routing and
+/// capability eligibility (a sixteenth review finding, the same class as
+/// the circuit-breaker gate). `claimed` is certain to reject a
+/// build-incompatible or capability-mismatched candidate. Without this
+/// gate, the forced lock still waits on an unrelated transaction's
+/// bucket row first. That wait would stall the whole batch walk behind
+/// a lock the claim was never going to use.
+/// [`build_and_capability_eligibility_predicate`] builds the shared
+/// predicate `claimed` and `rate_limit_debit` also apply. This avoids a
+/// third hand-copied literal. The forced lock's own copy reads the
+/// worker's labels with an inline lookup, not the `worker_info` CTE. A
+/// CTE cannot reference one defined after it. `now_ts` must stay the
+/// query's leading CTE.
+///
+/// `rate_limit_available` (a further review finding) is
+/// [`effective_available_tokens_expr`]'s own formula with every `NOW()`
+/// replaced by `(SELECT ts FROM now_ts)`. The shared helper's `NOW()` is
+/// correct for its other, fast-executing call sites; this one alone can
+/// run long after transaction start. `last_refilled_at` reads that same
+/// substituted value, never the raw `NOW()`, so it can never regress to
+/// a time before what a concurrent transaction already committed.
+///
+/// Binds: `$1` worker id, `$2` candidate row id, `$3` concurrency key,
+/// `$4` concurrency cap, `$5` task type. Also `$6` rate limit key, `$7`
+/// activity name, `$8` circuit-breaker-tracked activities, `$9` schedule-
+/// to-close deadline, `$10` worker build id.
+// The body is one SQL string literal; the line count is the query's, not
+// control flow's -- the same allow `claim_task_query` carries.
+#[allow(clippy::too_many_lines)]
+#[must_use]
+pub fn claim_batched_candidate_attempt_query() -> &'static str {
+    static QUERY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        let rate_limit_available =
+            effective_available_tokens_expr("b").replace("NOW()", "(SELECT ts FROM now_ts)");
+        let inline_worker_labels =
+            "COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{}'::jsonb)";
+        let now_ts_eligibility =
+            candidate_still_build_and_capability_eligible(inline_worker_labels);
+        let debit_eligibility =
+            candidate_still_build_and_capability_eligible("(SELECT labels FROM worker_info)");
+        let claimed_eligibility = build_and_capability_eligibility_predicate(
+            "",
+            "harvest_task_queue.",
+            "(SELECT labels FROM worker_info)",
+        );
+        format!(
+            "WITH now_ts AS ( \
+                 SELECT clock_timestamp() AS ts \
+                 FROM (SELECT 1 AS one) base \
+                 LEFT JOIN ( \
+                     SELECT 1 AS x FROM harvest_rate_limit_buckets b \
+                     WHERE $6::text IS NOT NULL AND NOT ($7 = ANY($8)) \
+                       AND {now_ts_eligibility} AND b.key = $6 \
+                     FOR UPDATE \
+                 ) locked ON TRUE \
+             ), \
+             worker_info AS ( \
+                 SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{{}}'::jsonb) AS labels \
+             ), \
+             rate_limit_debit AS ( \
+                 UPDATE harvest_rate_limit_buckets b \
+                 SET tokens = {rate_limit_available} - 1.0, \
+                     last_refilled_at = (SELECT ts FROM now_ts) \
+                 WHERE b.key = $6 \
+                   AND NOT ($7 = ANY($8)) \
+                   AND {rate_limit_available} >= 1.0 \
+                   AND ($9::timestamptz IS NULL OR $9::timestamptz > (SELECT ts FROM now_ts)) \
+                   AND {debit_eligibility} \
+                 RETURNING b.key AS debited_key \
+             ), \
+             claimed AS ( \
+                 UPDATE harvest_task_queue \
+                 SET state = 'RUNNING', worker_id = $1, \
+                     started_at = (SELECT ts FROM now_ts), attempt = attempt + 1, \
+                     wake_requested = FALSE \
+                 WHERE id = $2 \
+                   AND ( \
+                       $3::text IS NULL \
+                       OR ( \
+                           pg_try_advisory_xact_lock(hashtext($3)::bigint) \
+                           AND ( \
+                               $4::int IS NULL \
+                               OR ( \
+                                   SELECT COUNT(*) FROM harvest_task_queue recheck \
+                                   WHERE recheck.concurrency_key = $3 \
+                                     AND recheck.task_type = $5 \
+                                     AND recheck.state = 'RUNNING' \
+                                     AND recheck.worker_id IS NOT NULL \
+                               ) < $4 \
+                           ) \
+                       ) \
+                   ) \
+                   AND ( \
+                       $6::text IS NULL \
+                       OR $7 = ANY($8) \
+                       OR EXISTS (SELECT 1 FROM rate_limit_debit WHERE debited_key = $6) \
+                   ) \
+                   AND ( \
+                       $9::timestamptz IS NULL \
+                       OR $9::timestamptz > (SELECT ts FROM now_ts) \
+                   ) \
+                   AND {claimed_eligibility} \
+                 RETURNING harvest_task_queue.* \
+             ) \
+             SELECT * FROM claimed"
+        )
+    });
+    &QUERY
+}
+
+/// A read-only probe: would this candidate's concurrency gate pass right
+/// now?
+///
+/// [`try_claim_batched_candidate`] runs this BEFORE
+/// [`claim_batched_candidate_attempt_query`], and skips straight to the
+/// next candidate on `false` -- never running the rate-limit debit at all.
+///
+/// # Why this exists (review finding, not present in the first draft)
+///
+/// Without this probe, walking a batch debits a rate-limit token for
+/// EVERY candidate tried, even one the concurrency gate was always going
+/// to reject. An adversarial batch can share both a saturated
+/// `concurrency_key` and a `rate_limit_key` across many rows -- exactly
+/// ledger #4/#5's own poisoned-row shape. Each rejected candidate would
+/// still debit a token before failing. So one `claim_task_batched()` call
+/// could leak up to `batch_size * max_batches` tokens from one bucket. The
+/// single-row path bounds this leak at one token per claim attempt
+/// (documented above [`claim_task_on_shard`]). Batching must not multiply
+/// it. This probe restores that same one-token bound: the rate-limit debit
+/// now only ever runs for a candidate whose concurrency gate already
+/// passed.
+///
+/// Binds: `$1` concurrency key, `$2` concurrency cap, `$3` task type --
+/// the same three columns [`claim_batched_candidate_attempt_query`]'s own
+/// concurrency check reads. Takes the SAME `pg_try_advisory_xact_lock` this
+/// candidate's later claim attempt (if any) will also take. The lock is
+/// transaction-scoped and reentrant. Re-acquiring it here is a no-op, not
+/// a second lock. Holding it from here blocks every other claimer from
+/// starting new `RUNNING` work under this key, until this transaction
+/// ends. So the `COUNT` this probe reads stays valid through the later
+/// claim attempt.
+#[must_use]
+pub const fn claim_batched_candidate_concurrency_probe_query() -> &'static str {
+    "SELECT ( \
+         $1::text IS NULL \
+         OR ( \
+             pg_try_advisory_xact_lock(hashtext($1)::bigint) \
+             AND ( \
+                 $2::int IS NULL \
+                 OR ( \
+                     SELECT COUNT(*) FROM harvest_task_queue recheck \
+                     WHERE recheck.concurrency_key = $1 \
+                       AND recheck.task_type = $3 \
+                       AND recheck.state = 'RUNNING' \
+                       AND recheck.worker_id IS NOT NULL \
+                 ) < $2 \
+             ) \
+         ) \
+     ) AS passes"
+}
+
+/// One row from [`claim_task_batched_candidates_query`]: the columns needed
+/// to walk the batch and attempt a claim. Also carries the sort key used to
+/// resume from a keyset cursor on the next batch.
+#[derive(diesel::QueryableByName, Debug, Clone)]
+struct BatchedClaimCandidate {
+    #[diesel(sql_type = diesel::sql_types::Uuid)]
+    id: Uuid,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    task_type: String,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    concurrency_key: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
+    concurrency_cap: Option<i32>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    rate_limit_key: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    activity_name: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+    scheduled_at: DateTime<Utc>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
+    schedule_to_close_at: Option<DateTime<Utc>>,
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    sticky_rank: i32,
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    effective_priority: i32,
+}
+
+/// Keyset cursor resuming [`claim_task_batched_candidates_query`] just past
+/// the last row of an exhausted batch.
+///
+/// Four columns, not three: `scheduled_at` and `effective_priority` commonly
+/// tie across many rows in the same fixture (shared enqueue timestamp,
+/// shared priority). A cursor without `id` as a final tiebreak silently
+/// drops every row tied with the batch's own last row. That drop is not
+/// just once, but from every later batch too
+/// (`docs/assays/0005-claim-batched-seek-and-refine.md`, post-review item
+/// 1).
+#[derive(Debug, Clone, Copy)]
+struct BatchCursor {
+    sticky_rank: i32,
+    effective_priority: i32,
+    scheduled_at: DateTime<Utc>,
+    id: Uuid,
+}
+
+impl From<&BatchedClaimCandidate> for BatchCursor {
+    fn from(row: &BatchedClaimCandidate) -> Self {
+        Self {
+            sticky_rank: row.sticky_rank,
+            effective_priority: row.effective_priority,
+            scheduled_at: row.scheduled_at,
+            id: row.id,
+        }
+    }
+}
+
+/// Tuning knobs for [`claim_task_batched`] (issue #1340).
+///
+/// Both fields are stubs, not principled bounds. They are picked to match
+/// `docs/assays/0005-claim-batched-seek-and-refine.md`'s own fixed `B=50`,
+/// so a follow-up measurement stays comparable -- not because 50 is proven
+/// optimal. A bigger batch amortizes round trips further, but locks more
+/// rows per attempt. A smaller one locks fewer rows, but needs more
+/// batches against a deep adversarial backlog. `max_batches` bounds how
+/// far one claim attempt searches before giving up. It then leaves the
+/// remaining rows for the next poll cycle. This is the "seek and refine"
+/// trade issue #1340 names. No single claim is guaranteed the best
+/// eligible row across the whole backlog any more, only across
+/// `batch_size * max_batches` of it.
+#[derive(Debug, Clone, Copy)]
+pub struct BatchedClaimConfig {
+    /// Candidate rows fetched per batch.
+    pub batch_size: i64,
+    /// Batches searched before this claim attempt gives up and returns
+    /// `None`, leaving every unvisited row `PENDING` for the next poll.
+    pub max_batches: u32,
+}
+
+impl Default for BatchedClaimConfig {
+    fn default() -> Self {
+        Self {
+            batch_size: 50,
+            max_batches: 20,
+        }
+    }
+}
+
+/// Fetch one ordered batch of claim candidates, optionally resuming past
+/// `cursor`. See [`claim_task_batched_candidates_query`] for the predicate.
+#[allow(clippy::too_many_arguments)]
+async fn fetch_claim_batch(
+    conn: &mut AsyncPgConnection,
+    queues: &[String],
+    worker_id: &str,
+    worker_build_id: &str,
+    aging_secs_i64: Option<i64>,
+    circuit_breaker_activities: &[String],
+    ineligible_activities: &[String],
+    cursor: Option<BatchCursor>,
+    batch_size: i64,
+) -> HarvestResult<Vec<BatchedClaimCandidate>> {
+    diesel::sql_query(claim_task_batched_candidates_query())
+        .bind::<diesel::sql_types::Text, _>(worker_id)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
+        .bind::<diesel::sql_types::Text, _>(worker_build_id)
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::BigInt>, _>(aging_secs_i64)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(circuit_breaker_activities)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(ineligible_activities)
+        .bind::<diesel::sql_types::Bool, _>(cursor.is_some())
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(
+            cursor.map(|c| c.sticky_rank),
+        )
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(
+            cursor.map(|c| c.effective_priority),
+        )
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
+            cursor.map(|c| c.scheduled_at),
+        )
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Uuid>, _>(cursor.map(|c| c.id))
+        .bind::<diesel::sql_types::BigInt, _>(batch_size)
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)
+}
+
+/// The database's own clock (review finding, fourteenth bug in the
+/// module doc above). A fast deadline pre-check that compared against
+/// the worker host's `Utc::now()` instead could reject a candidate.
+/// The database's `clock_timestamp()` is the authoritative source
+/// every other deadline check here trusts. It would still consider
+/// that candidate live, whenever the host clock runs ahead of the
+/// database's. No table access, so this never waits on a lock.
+async fn db_now(conn: &mut AsyncPgConnection) -> HarvestResult<DateTime<Utc>> {
+    #[derive(diesel::QueryableByName)]
+    struct Now {
+        #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+        now: DateTime<Utc>,
+    }
+    let row: Now = diesel::sql_query("SELECT clock_timestamp() AS now")
+        .get_result(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(row.now)
+}
+
+/// Run [`claim_batched_candidate_concurrency_probe_query`] for one
+/// candidate. Only called when `candidate.concurrency_key` is `Some` --
+/// see [`try_claim_batched_candidate`].
+async fn concurrency_probe_passes(
+    conn: &mut AsyncPgConnection,
+    candidate: &BatchedClaimCandidate,
+) -> HarvestResult<bool> {
+    #[derive(diesel::QueryableByName)]
+    struct Passes {
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        passes: bool,
+    }
+    let row: Passes = diesel::sql_query(claim_batched_candidate_concurrency_probe_query())
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
+            candidate.concurrency_key.as_deref(),
+        )
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(
+            candidate.concurrency_cap,
+        )
+        .bind::<diesel::sql_types::Text, _>(&candidate.task_type)
+        .get_result(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(row.passes)
+}
+
+/// Attempt to claim one already-locked candidate.
+///
+/// `Ok(None)` means the authoritative recheck failed: the lock was lost,
+/// the cap is now saturated, or there is no rate token. That is not an
+/// error, just "try the next candidate in the batch".
+///
+/// Rejects an already-expired `schedule_to_close_at` first, against a
+/// fresh [`db_now`] read, before issuing the attempt query
+/// (review finding, twelfth bug in the module doc above). Reading the
+/// database's own clock rather than the host's is the fourteenth
+/// bug's fix. Such a candidate can never claim, regardless of what
+/// its own bucket protects, so it must not pay for that bucket's lock
+/// wait too.
+///
+/// Checks the concurrency gate with
+/// [`claim_batched_candidate_concurrency_probe_query`] next, for any
+/// candidate that carries a concurrency key. A rejected candidate never
+/// reaches the rate-limit debit at all -- see that probe's own doc
+/// comment for the leak this prevents.
+///
+/// Passes `worker_build_id` through so the attempt query's own `WHERE`
+/// can re-check build-routing compatibility (review finding, thirteenth
+/// bug in the module doc above). The batch scan already filtered on it,
+/// but only as of scan time -- this candidate's own attempt is a later,
+/// separate statement.
+async fn try_claim_batched_candidate(
+    conn: &mut AsyncPgConnection,
+    candidate: &BatchedClaimCandidate,
+    worker_id: &str,
+    worker_build_id: &str,
+    circuit_breaker_activities: &[String],
+) -> HarvestResult<Option<TaskQueueItem>> {
+    if let Some(deadline) = candidate.schedule_to_close_at
+        && deadline <= db_now(conn).await?
+    {
+        return Ok(None);
+    }
+
+    if candidate.concurrency_key.is_some() && !concurrency_probe_passes(conn, candidate).await? {
+        return Ok(None);
+    }
+
+    let mut rows: Vec<TaskQueueItem> = diesel::sql_query(claim_batched_candidate_attempt_query())
+        .bind::<diesel::sql_types::Text, _>(worker_id)
+        .bind::<diesel::sql_types::Uuid, _>(candidate.id)
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
+            candidate.concurrency_key.as_deref(),
+        )
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(
+            candidate.concurrency_cap,
+        )
+        .bind::<diesel::sql_types::Text, _>(&candidate.task_type)
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
+            candidate.rate_limit_key.as_deref(),
+        )
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
+            candidate.activity_name.as_deref(),
+        )
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(circuit_breaker_activities)
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(
+            candidate.schedule_to_close_at,
+        )
+        .bind::<diesel::sql_types::Text, _>(worker_build_id)
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(rows.pop())
+}
+
+/// Batched seek-and-refine claim (issue #1340).
+///
+/// See the module doc above [`claim_task_batched_candidates_query`] for
+/// scope, the mechanism, and what remains unmeasured before this could
+/// become the default claim path.
+///
+/// Same transaction shape as [`claim_task_on_shard`]: one `READ COMMITTED`
+/// transaction. A mid-flight re-check failure rolls the claim back, instead
+/// of stranding a `RUNNING` row no worker holds. Every batch fetch and
+/// every candidate attempt runs inside it. So `NOW()` -- and therefore
+/// every candidate's `effective_priority` -- is the same value across every
+/// batch this attempt fetches. Postgres freezes `NOW()` at transaction
+/// start, not per statement. Priority aging therefore cannot drift the
+/// keyset cursor's sort key between batches of the same attempt.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+#[allow(clippy::too_many_arguments)]
+pub async fn claim_task_batched(
+    conn: &mut AsyncPgConnection,
+    queues: &[String],
+    worker_id: &str,
+    worker_build_id: &str,
+    priority_aging_secs: Option<u32>,
+    circuit_breaker_activities: &[String],
+    ineligible_activities: &[String],
+    config: BatchedClaimConfig,
+) -> HarvestResult<Option<TaskQueueItem>> {
+    let aging_secs_i64: Option<i64> = priority_aging_secs.map(i64::from);
+    let batch_size = config.batch_size.max(1);
+    let max_batches = config.max_batches.max(1);
+
+    let mut tx = conn.build_transaction().read_committed();
+    let outcome: ClaimOutcome = tx
+        .run(
+            async |conn: &mut AsyncPgConnection| -> HarvestResult<ClaimOutcome> {
+                let mut cursor: Option<BatchCursor> = None;
+                for _ in 0..max_batches {
+                    let batch = fetch_claim_batch(
+                        conn,
+                        queues,
+                        worker_id,
+                        worker_build_id,
+                        aging_secs_i64,
+                        circuit_breaker_activities,
+                        ineligible_activities,
+                        cursor,
+                        batch_size,
+                    )
+                    .await?;
+                    let fetched = batch.len();
+
+                    for candidate in &batch {
+                        if let Some(task) = try_claim_batched_candidate(
+                            conn,
+                            candidate,
+                            worker_id,
+                            worker_build_id,
+                            circuit_breaker_activities,
+                        )
+                        .await?
+                        {
+                            return apply_post_claim_rechecks(conn, task, worker_id).await;
+                        }
+                    }
+
+                    let Some(last) = batch.last() else {
+                        // Empty batch: no PENDING row anywhere past the cursor.
+                        return Ok(ClaimOutcome::Empty);
+                    };
+                    cursor = Some(BatchCursor::from(last));
+                    if fetched < usize::try_from(batch_size).unwrap_or(usize::MAX) {
+                        // A short batch means the scan reached the end of the
+                        // matching backlog -- no next batch to fetch.
+                        return Ok(ClaimOutcome::Empty);
+                    }
+                }
+                Ok(ClaimOutcome::Empty)
+            },
+        )
+        .await?;
+
+    match outcome {
+        ClaimOutcome::Claimed(task) => Ok(Some(*task)),
+        ClaimOutcome::Released(task_id) => {
+            record_pending_hints(conn, &[task_id]).await;
+            Ok(None)
+        }
+        ClaimOutcome::Empty => Ok(None),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -6533,6 +7827,498 @@ mod tests {
             "concurrency_running_counts: one CTE definition + one reference \
              from the candidate-side COALESCE lookup; got:\n{sql}"
         );
+    }
+
+    // ── Batched seek-and-refine claim (issue #1340) ──────────────────────────
+
+    /// The batch scan must drop the concurrency-key soft filter entirely.
+    /// That is the whole point of moving the gate to a per-candidate
+    /// authoritative recheck, instead of a batch-wide predicate.
+    #[test]
+    fn claim_task_batched_candidates_query_omits_the_concurrency_gate() {
+        let sql = claim_task_batched_candidates_query();
+        assert!(
+            !sql.contains("concurrency_pending_keys"),
+            "the batch scan must not pre-filter or aggregate concurrency \
+             keys -- that work belongs in the per-candidate recheck; got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("concurrency_running_counts"),
+            "the batch scan must not aggregate RUNNING counts; got:\n{sql}"
+        );
+        assert!(
+            // The paren is part of the needle, not decoration. A bare
+            // "advisory_xact_lock" substring confuses
+            // `queue_pause::tests::queue_pause_owns_the_two_argument_advisory_keyspace`'s
+            // source scanner. It then mis-attributes this file's own next
+            // unrelated call as the advisory-lock call.
+            !sql.contains("pg_try_advisory_xact_lock("),
+            "the advisory lock belongs only in the per-candidate attempt \
+             query, never in the batch scan; got:\n{sql}"
+        );
+        assert!(
+            sql.contains("concurrency_key, concurrency_cap"),
+            "the batch scan must still SELECT the concurrency columns, so \
+             the per-candidate recheck has them without a second lookup; \
+             got:\n{sql}"
+        );
+    }
+
+    /// Every OTHER gate in [`claim_task_query`] must still appear, byte for
+    /// byte, in the batch scan. This module is scoped to moving ONE gate
+    /// (concurrency). It does not drop any of the rest.
+    #[test]
+    fn claim_task_batched_candidates_query_preserves_every_other_gate() {
+        let sql = claim_task_batched_candidates_query();
+        for clause in [
+            "paused_queues AS MATERIALIZED",
+            "paused_activities AS MATERIALIZED",
+            "NOT (harvest_task_queue.queue_name = ANY(paused_queues.names))",
+            "schedule_to_close_at IS NULL",
+            "sticky_worker_id IS NULL",
+            "session_id IS NULL",
+            "required_build_id IS NULL",
+            "task_type <> 'workflow'",
+            "NOT (activity_name = ANY($6))",
+            "NOT (activity_name = ANY(paused_activities.names))",
+            "required_capabilities IS NULL",
+            "required_capabilities IS NOT NULL",
+            "rate_limit_key IS NULL",
+        ] {
+            assert!(
+                sql.contains(clause),
+                "batch scan must preserve the unrelated gate clause {clause:?}; \
+                 got:\n{sql}"
+            );
+        }
+    }
+
+    /// The keyset cursor must carry all four sort columns. It must compare
+    /// them with an explicit `OR` chain. A plain row comparison cannot
+    /// express `ORDER BY ... DESC, ... DESC, ... ASC, ... ASC`'s mixed
+    /// directions. A 3-column cursor also silently drops ties past a batch
+    /// boundary (`docs/assays/0005-claim-batched-seek-and-refine.md`,
+    /// post-review item 1).
+    #[test]
+    fn claim_task_batched_candidates_query_cursor_covers_all_four_sort_columns() {
+        let sql = claim_task_batched_candidates_query();
+        assert!(
+            sql.contains("$7::BOOL = FALSE"),
+            "the cursor must be optional -- the first batch of an attempt \
+             has no predecessor row to resume past; got:\n{sql}"
+        );
+        assert!(
+            sql.contains("scheduled_at = $10 AND id > $11"),
+            "the cursor's final tiebreak must compare id, not just \
+             scheduled_at, or tied rows are silently skipped; got:\n{sql}"
+        );
+        assert_eq!(
+            sql.matches("scheduled_at > $10").count() + sql.matches("scheduled_at = $10").count(),
+            2,
+            "the cursor OR-chain must have exactly one 'strictly after' \
+             branch and one 'tied, break on id' branch for scheduled_at; \
+             got:\n{sql}"
+        );
+    }
+
+    /// The per-candidate attempt query must reuse the exact production
+    /// concurrency-gate recheck mechanism -- one advisory lock, one fresh
+    /// `COUNT`, applied to a single known row.
+    #[test]
+    fn claim_batched_candidate_attempt_query_matches_the_authoritative_recheck() {
+        let sql = claim_batched_candidate_attempt_query();
+        assert_eq!(
+            sql.matches("pg_try_advisory_xact_lock").count(),
+            1,
+            "exactly one advisory-lock guard, on the single candidate this \
+             query targets; got:\n{sql}"
+        );
+        assert!(
+            sql.contains(
+                "SELECT COUNT(*) FROM harvest_task_queue recheck \
+                 WHERE recheck.concurrency_key = $3 \
+                   AND recheck.task_type = $5 \
+                   AND recheck.state = 'RUNNING' \
+                   AND recheck.worker_id IS NOT NULL"
+            ),
+            "the recheck must be the same fresh correlated COUNT the \
+             single-row claim path uses, scoped to this candidate's own \
+             key/task_type; got:\n{sql}"
+        );
+        assert!(
+            sql.contains("WHERE id = $2"),
+            "the claim UPDATE must target exactly the one candidate row \
+             already locked by the batch fetch; got:\n{sql}"
+        );
+    }
+
+    /// The deadline recheck must use `clock_timestamp()`, never `NOW()`.
+    /// `NOW()` is frozen at transaction start. So it cannot catch a
+    /// `schedule_to_close_at` deadline that passes in real wall-clock
+    /// time. That can happen while an earlier candidate in a long batch
+    /// search is still being tried. See the query's own doc comment for
+    /// the review finding this closes.
+    #[test]
+    fn claim_batched_candidate_attempt_query_rechecks_the_deadline_against_real_time() {
+        let sql = claim_batched_candidate_attempt_query();
+        assert!(
+            sql.contains("$9::timestamptz IS NULL"),
+            "the deadline recheck must be optional (schedule_to_close_at \
+             defaults to NULL); got:\n{sql}"
+        );
+        assert!(
+            sql.contains("$9::timestamptz > (SELECT ts FROM now_ts)"),
+            "the deadline recheck must compare against a materialized \
+             clock_timestamp() read, not NOW(), or it inherits the same \
+             staleness the batch scan's own soft filter has; got:\n{sql}"
+        );
+        assert_eq!(
+            sql.matches("clock_timestamp()").count(),
+            1,
+            "clock_timestamp() must appear exactly once, in the now_ts \
+             CTE -- both WHERE clauses read that one materialized value, \
+             or two separate volatile reads could straddle the deadline \
+             instant and let the debit and the claim disagree; got:\n{sql}"
+        );
+        assert_eq!(
+            sql.matches("SELECT ts FROM now_ts").count(),
+            10,
+            "every real-time read in this query -- both deadline checks, \
+             started_at, last_refilled_at, and the three NOW() reads \
+             inside the rate-limit formula, rendered twice (SET and \
+             WHERE) -- must read the SAME materialized timestamp; \
+             got:\n{sql}"
+        );
+    }
+
+    /// Regression test for a review finding on this PR. `started_at =
+    /// NOW()` backdates the claim to transaction start, not to when the
+    /// row was actually claimed. A batch walk can spend real wall-clock
+    /// time probing many candidates inside one transaction, so `NOW()`
+    /// can be stale by the whole walk's duration. `start_to_close` and
+    /// `heartbeat_timeout` are measured from `started_at`, so a stale
+    /// stamp silently steals part of a task's timeout budget before it
+    /// even starts.
+    #[test]
+    fn claim_batched_candidate_attempt_query_stamps_started_at_with_real_time() {
+        let sql = claim_batched_candidate_attempt_query();
+        assert!(
+            sql.contains("started_at = (SELECT ts FROM now_ts)"),
+            "started_at must read the same materialized clock_timestamp() \
+             value the deadline checks use, not the transaction-frozen \
+             NOW(); got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("started_at = NOW()"),
+            "started_at must never fall back to the frozen NOW(); \
+             got:\n{sql}"
+        );
+    }
+
+    /// Regression test for a review finding on this PR. `now_ts` has no
+    /// `FROM` clause of its own. Postgres can resolve it before
+    /// `rate_limit_debit` even attempts its row lock. A concurrent
+    /// claimer holding that lock then lets `now_ts` capture a stale,
+    /// pre-wait value that `rate_limit_debit`, `claimed`, and
+    /// `started_at` all reuse. `now_ts` must attempt the SAME lock
+    /// itself, so it cannot resolve before that wait is over.
+    #[test]
+    fn claim_batched_candidate_attempt_query_now_ts_waits_on_the_bucket_lock_first() {
+        let sql = claim_batched_candidate_attempt_query();
+        let now_ts_clause = sql
+            .split("WITH now_ts AS (")
+            .nth(1)
+            .and_then(|rest| rest.split("rate_limit_debit AS (").next())
+            .unwrap_or_default();
+        assert!(
+            now_ts_clause.contains("FOR UPDATE") && !now_ts_clause.contains("SKIP LOCKED"),
+            "now_ts must take a blocking FOR UPDATE lock on the bucket \
+             row rate_limit_debit will lock next, so its clock_timestamp() \
+             read cannot resolve before that lock wait ends; got:\n{sql}"
+        );
+        assert!(
+            now_ts_clause.contains("harvest_rate_limit_buckets b")
+                && now_ts_clause.contains("b.key = $6"),
+            "now_ts's forced lock must target the exact row \
+             rate_limit_debit locks next, keyed by the same $6 bind; \
+             got:\n{sql}"
+        );
+    }
+
+    /// Regression test for a review finding on this PR, against the
+    /// `now_ts` fix above. `rate_limit_debit` never touches the bucket
+    /// row for a circuit-breaker-bypassed activity: its own `WHERE`
+    /// gates on `NOT ($7 = ANY($8))`. `now_ts`'s forced lock must gate
+    /// on the SAME exclusion. A bypassed claim is meant to run at full
+    /// speed, past rate limiting entirely. Without this, it would still
+    /// serialize behind an unrelated transaction holding that bucket
+    /// row. It could even miss its own deadline waiting on a lock its
+    /// own claim never needed.
+    #[test]
+    fn claim_batched_candidate_attempt_query_now_ts_skips_the_lock_for_circuit_breaker_activities()
+    {
+        let sql = claim_batched_candidate_attempt_query();
+        let now_ts_clause = sql
+            .split("WITH now_ts AS (")
+            .nth(1)
+            .and_then(|rest| rest.split("rate_limit_debit AS (").next())
+            .unwrap_or_default();
+        assert!(
+            now_ts_clause.contains("NOT ($7 = ANY($8))"),
+            "now_ts's forced lock must skip circuit-breaker-tracked \
+             activities, matching rate_limit_debit's own exclusion, or a \
+             bypassed claim serializes behind a lock it never needed; \
+             got:\n{sql}"
+        );
+    }
+
+    /// Regression test for a review finding on this PR, the same class
+    /// as the circuit-breaker gate above. `claimed` is certain to reject
+    /// a candidate whose build compatibility was revoked or whose
+    /// required capability the worker no longer has. Without this gate,
+    /// the forced lock still waits on an unrelated transaction's bucket
+    /// row first. That wait stalls the whole batch walk behind a lock
+    /// this claim was never going to use. It also stalls every row the
+    /// walk still holds `FOR UPDATE SKIP LOCKED`.
+    #[test]
+    fn claim_batched_candidate_attempt_query_now_ts_skips_the_lock_for_an_ineligible_candidate() {
+        let sql = claim_batched_candidate_attempt_query();
+        let now_ts_clause = sql
+            .split("WITH now_ts AS (")
+            .nth(1)
+            .and_then(|rest| rest.split("rate_limit_debit AS (").next())
+            .unwrap_or_default();
+        assert!(
+            now_ts_clause.contains("FROM harvest_task_queue t")
+                && now_ts_clause.contains("t.id = $2")
+                && now_ts_clause.contains("FROM harvest_build_compat")
+                && now_ts_clause.contains("jsonb_array_elements(t.required_capabilities)"),
+            "now_ts's forced lock must re-check this candidate's own \
+             build-routing and capability eligibility before waiting on \
+             the bucket row, the same gate claimed and rate_limit_debit \
+             already apply; got:\n{sql}"
+        );
+    }
+
+    /// Regression test for a review finding on this PR. A data-modifying
+    /// CTE runs even when nothing selects its result. So
+    /// `rate_limit_debit` must carry its own deadline recheck, not just
+    /// rely on `claimed`'s, or an expired-but-rate-limited candidate
+    /// still spends a token.
+    #[test]
+    fn claim_batched_candidate_attempt_query_gates_the_rate_limit_debit_on_the_deadline_too() {
+        let sql = claim_batched_candidate_attempt_query();
+        let debit_clause = sql
+            .split("rate_limit_debit AS (")
+            .nth(1)
+            .and_then(|rest| rest.split("RETURNING b.key AS debited_key").next())
+            .unwrap_or_default();
+        assert!(
+            debit_clause.contains("$9::timestamptz IS NULL")
+                && debit_clause.contains("$9::timestamptz > (SELECT ts FROM now_ts)"),
+            "the debit CTE's own WHERE must recheck the deadline, not \
+             rely solely on claimed rejecting the row afterward; \
+             got:\n{sql}"
+        );
+    }
+
+    /// Regression test for a review finding on this PR. `clock_timestamp()`
+    /// is volatile: two separate calls in one query can return different
+    /// values. `rate_limit_debit` and `claimed` must read ONE materialized
+    /// timestamp, from the leading `now_ts` CTE. A deadline that falls
+    /// between two otherwise-independent reads cannot then let the debit
+    /// commit while the claim it was for rejects the row.
+    #[test]
+    fn claim_batched_candidate_attempt_query_shares_one_timestamp_between_debit_and_claim() {
+        let sql = claim_batched_candidate_attempt_query();
+        assert!(
+            sql.trim_start()
+                .starts_with("WITH now_ts AS ( SELECT clock_timestamp() AS ts"),
+            "now_ts must be the query's first CTE, so both later writers \
+             see the same already-materialized value; got:\n{sql}"
+        );
+    }
+
+    /// The rate-limit debit/recheck formula must come from the shared
+    /// helper, not a fourth hand-copied literal. This query is not a
+    /// `const fn`. So it has no excuse to duplicate what
+    /// [`claim_task_query_honors_the_effective_rate_limit_override`] already
+    /// drift-locks for the single-row path.
+    #[test]
+    fn claim_batched_candidate_attempt_query_honors_the_effective_rate_limit_override() {
+        let sql = claim_batched_candidate_attempt_query();
+        let effective =
+            effective_available_tokens_expr("b").replace("NOW()", "(SELECT ts FROM now_ts)");
+        assert_eq!(
+            sql.matches(&effective).count(),
+            2,
+            "the debit SET and its own WHERE re-check must both use the \
+             shared formula, with every NOW() read as the post-lock \
+             now_ts value; got:\n{sql}"
+        );
+    }
+
+    /// Regression test for a review finding on this PR (P1). A long batch
+    /// walk can leave the transaction's own `NOW()` behind real time by
+    /// the time `rate_limit_debit` finally runs. Writing
+    /// `last_refilled_at = NOW()` can then move it BACKWARDS relative to
+    /// a value another, faster transaction already wrote in the
+    /// meantime. A later claimant reading that backward-moved timestamp
+    /// re-accrues tokens for an interval already accounted for,
+    /// exceeding the configured rate limit. `last_refilled_at` must read
+    /// the same post-lock `now_ts` value the available-tokens formula
+    /// now uses, never the frozen `NOW()`.
+    #[test]
+    fn claim_batched_candidate_attempt_query_stamps_last_refilled_at_with_real_time() {
+        let sql = claim_batched_candidate_attempt_query();
+        assert!(
+            sql.contains("last_refilled_at = (SELECT ts FROM now_ts)"),
+            "last_refilled_at must read the materialized now_ts value, \
+             not the transaction-frozen NOW(); got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("last_refilled_at = NOW()"),
+            "last_refilled_at must never fall back to the frozen NOW(); \
+             got:\n{sql}"
+        );
+    }
+
+    /// Regression test for a review finding on this PR. The batch scan's
+    /// own build-routing gate (`required_build_id`/`harvest_build_compat`)
+    /// only filters candidates at SCAN time. This candidate's own attempt
+    /// is a separate, later statement. An operator can revoke build
+    /// compatibility in between. This query would still claim the row
+    /// for a worker no longer allowed to run it, breaking the
+    /// replay-determinism guarantee build routing exists to protect.
+    /// `claimed`'s `WHERE` must re-run the SAME gate the scan
+    /// uses, verbatim, so a revoked candidate is rejected here too.
+    #[test]
+    fn claim_batched_candidate_attempt_query_rechecks_build_routing() {
+        let sql = claim_batched_candidate_attempt_query();
+        let claimed_clause = sql
+            .split("claimed AS (")
+            .nth(1)
+            .and_then(|rest| rest.split("RETURNING harvest_task_queue.*").next())
+            .unwrap_or_default();
+        assert!(
+            claimed_clause.contains("required_build_id IS NULL")
+                && claimed_clause.contains("required_build_id = $10")
+                && claimed_clause.contains("FROM harvest_build_compat")
+                && claimed_clause
+                    .contains("compatible_with = harvest_task_queue.required_build_id"),
+            "claimed's WHERE must re-check required_build_id against \
+             $10 (worker_build_id) and harvest_build_compat, the same \
+             gate the batch scan already applies; got:\n{sql}"
+        );
+    }
+
+    /// Regression test for a review finding on this PR. The batch
+    /// scan's own capability-label gate (`required_capabilities`
+    /// against `harvest_workers.labels`) only filters at SCAN time,
+    /// the same class of gap as the build-routing bug above. A
+    /// worker's labels can change between the scan and this
+    /// candidate's own attempt, a separate, later statement. A
+    /// heartbeat refresh, or the same worker id re-registering, can
+    /// both do it.
+    /// `claimed`'s `WHERE` must re-run the same capability check the
+    /// scan uses. It must read the worker's current labels through a
+    /// fresh `worker_info` CTE, not the scan's own stale snapshot.
+    #[test]
+    fn claim_batched_candidate_attempt_query_rechecks_capability_labels() {
+        let sql = claim_batched_candidate_attempt_query();
+        assert!(
+            sql.contains("worker_info AS ( \\") || sql.contains("worker_info AS ("),
+            "the attempt query must define its own worker_info CTE, \
+             reading harvest_workers.labels fresh rather than reusing \
+             a stale value from the batch scan; got:\n{sql}"
+        );
+        let claimed_clause = sql
+            .split("claimed AS (")
+            .nth(1)
+            .and_then(|rest| rest.split("RETURNING harvest_task_queue.*").next())
+            .unwrap_or_default();
+        assert!(
+            claimed_clause.contains("required_capabilities IS NULL")
+                && claimed_clause.contains("jsonb_array_elements(required_capabilities)")
+                && claimed_clause.contains("FROM worker_info")
+                && claimed_clause.contains("r.value ? 'Exact'")
+                && claimed_clause.contains("r.value ? 'In'"),
+            "claimed's WHERE must re-check required_capabilities against \
+             a freshly-read worker_info.labels, the same gate the batch \
+             scan already applies; got:\n{sql}"
+        );
+    }
+
+    /// Regression test for a review finding on this PR, against the
+    /// thirteenth bug's own fix. `rate_limit_debit` is a data-modifying
+    /// CTE. It runs whether or not `claimed` ends up using its result
+    /// (the same shape as the original rate-limit-leak fix, and the
+    /// deadline-leak fix above). The build-routing gate was added only
+    /// to `claimed`'s `WHERE`, not to `rate_limit_debit`'s. A
+    /// candidate whose build compatibility was revoked still spends a
+    /// token before `claimed` rejects it. An adversarial batch of
+    /// revoked-build candidates sharing one rate-limited key could
+    /// drain far more than the documented one-token bound.
+    /// `rate_limit_debit`'s own `WHERE` must carry the same
+    /// build-routing gate too.
+    #[test]
+    fn claim_batched_candidate_attempt_query_gates_the_rate_limit_debit_on_build_routing_too() {
+        let sql = claim_batched_candidate_attempt_query();
+        let debit_clause = sql
+            .split("rate_limit_debit AS (")
+            .nth(1)
+            .and_then(|rest| rest.split("claimed AS (").next())
+            .unwrap_or_default();
+        assert!(
+            debit_clause.contains("required_build_id IS NULL")
+                && debit_clause.contains("required_build_id = $10")
+                && debit_clause.contains("FROM harvest_build_compat")
+                && debit_clause.contains("compatible_with = "),
+            "rate_limit_debit's WHERE must re-check build routing too, \
+             matching claimed's own gate, or a revoked-build candidate \
+             still spends a token before being rejected; got:\n{sql}"
+        );
+    }
+
+    /// The concurrency probe must contain no rate-limit text at all. It
+    /// exists specifically so a rejected candidate never reaches the
+    /// debit -- see the query's own doc comment for the leak this
+    /// prevents.
+    #[test]
+    fn claim_batched_candidate_concurrency_probe_query_never_touches_rate_limiting() {
+        let sql = claim_batched_candidate_concurrency_probe_query();
+        assert!(
+            !sql.contains("rate_limit"),
+            "the probe must check concurrency only; got:\n{sql}"
+        );
+        assert_eq!(
+            sql.matches("pg_try_advisory_xact_lock").count(),
+            1,
+            "exactly one advisory-lock guard; got:\n{sql}"
+        );
+        assert!(
+            sql.contains(
+                "SELECT COUNT(*) FROM harvest_task_queue recheck \
+                 WHERE recheck.concurrency_key = $1 \
+                   AND recheck.task_type = $3 \
+                   AND recheck.state = 'RUNNING' \
+                   AND recheck.worker_id IS NOT NULL"
+            ),
+            "the probe's recheck must match the attempt query's own \
+             recheck exactly, just against $1/$3 instead of $3/$5; \
+             got:\n{sql}"
+        );
+    }
+
+    /// [`BatchedClaimConfig::default`] matches
+    /// `docs/assays/0005-claim-batched-seek-and-refine.md`'s own fixed
+    /// `B=50`, so a follow-up measurement against that report's numbers
+    /// compares like with like.
+    #[test]
+    fn batched_claim_config_default_matches_the_assay_batch_size() {
+        let config = BatchedClaimConfig::default();
+        assert_eq!(config.batch_size, 50);
+        assert!(config.max_batches >= 1);
     }
 
     // ── TTL'd rate-limit override drift locks (issue #945) ──────────────────
@@ -7496,6 +9282,11 @@ mod tests {
             sql.contains("activity_name = 'mixed_signal_suspension'"),
             "must also target an elapsed mixed-signal PENDING row (issue #383)",
         );
+        assert!(
+            sql.contains("timer_fires_at = NULL"),
+            "a signal/child/handoff wake must clear the stale timer-provenance \
+             marker (issue #1402): {sql}",
+        );
     }
 
     #[test]
@@ -7526,6 +9317,11 @@ mod tests {
         assert!(sql.contains("SET state = 'PENDING'"));
         assert!(sql.contains("worker_id = NULL"));
         assert!(sql.contains("started_at = NULL"));
+        assert!(
+            sql.contains("timer_fires_at = NULL"),
+            "a fresh dispatch attempt must clear the stale timer-provenance \
+             marker (issue #1402): {sql}",
+        );
         assert!(
             sql.contains("wake_requested = FALSE"),
             "a wake that landed in the SKIP LOCKED contention window must be \
@@ -7966,6 +9762,26 @@ mod tests {
         }
     }
 
+    /// Issue #1402: a capability-miss release hands the row to a fresh
+    /// dispatch attempt at the SAME wake reason. A capable peer takes
+    /// over; the wake reason itself does not change. It must NOT clear
+    /// `timer_fires_at`.
+    #[test]
+    fn capability_miss_release_query_preserves_the_timer_marker() {
+        for phase in [
+            CapabilityMissPhase::AfterHandler,
+            CapabilityMissPhase::BeforeHandler,
+            CapabilityMissPhase::DuringHandler,
+        ] {
+            let sql = release_task_for_capability_miss_query(phase);
+            assert!(
+                !sql.contains("timer_fires_at"),
+                "{phase:?}: a capability-miss release must leave \
+                 timer_fires_at untouched: {sql}"
+            );
+        }
+    }
+
     #[test]
     fn capability_miss_release_query_restores_the_attempt_only_before_the_handler() {
         // Issue #804 Codex round-17 P2. `attempt` does double duty on a workflow
@@ -8373,8 +10189,7 @@ mod tests {
         use diesel::debug_query;
         use diesel::pg::Pg;
 
-        let changeset =
-            PendingRequeueChangeset::new(chrono::Utc::now(), "some retryable error".to_string());
+        let changeset = PendingRequeueChangeset::new("some retryable error".to_string());
         let query = diesel::update(dsl::harvest_task_queue.filter(dsl::state.eq("RUNNING")))
             .set(&changeset);
         let debug = debug_query::<Pg, _>(&query).to_string();
@@ -8397,8 +10212,11 @@ mod tests {
         );
         assert!(debug.contains("\"state\" = "));
         assert!(debug.contains("\"crash_strikes\" = "));
-        assert!(debug.contains("\"scheduled_at\" = "));
         assert!(debug.contains("\"error\" = "));
+        // `scheduled_at` is no longer part of this shared changeset (issue
+        // #1389): each caller adds it separately, computed on Postgres's own
+        // clock. See `requeue_after_panic_query_resets_and_unpins_the_task_row`.
+        assert!(!debug.contains("\"scheduled_at\""));
     }
 
     /// Issue #804: reaching the shared pending-requeue path PROVES the claiming
@@ -8417,8 +10235,7 @@ mod tests {
         use diesel::debug_query;
         use diesel::pg::Pg;
 
-        let changeset =
-            PendingRequeueChangeset::new(chrono::Utc::now(), "some retryable error".to_string());
+        let changeset = PendingRequeueChangeset::new("some retryable error".to_string());
 
         // The VALUE is the whole point: a non-zero reset would silently make the
         // counter cumulative and escalate healthy runs on a later deploy. A
@@ -8493,6 +10310,41 @@ mod tests {
         );
     }
 
+    /// Issue #1402: `CleanContinuationChangeset` is shared by two callers.
+    /// `reschedule_task` is a genuine timer arm. `defer_rate_limited_task`
+    /// is a dispatch-time rate-limit deferral, never a timer arm. Only
+    /// `reschedule_task` adds `timer_fires_at`, as an EXTRA tuple element
+    /// alongside the shared changeset. The changeset itself must never
+    /// carry that column. Otherwise `defer_rate_limited_task` would
+    /// silently inherit it and stamp a stale marker on an activity row.
+    ///
+    /// Real end-to-end coverage that `reschedule_task` itself stamps the
+    /// right value lives in a DB integration test against the real
+    /// function:
+    /// `stall_diagnosis_integration::overdue_timer_still_wins_after_a_queue_pause_resume_shift`.
+    /// `debug_query`'s `Display` never renders bound values. So a no-DB
+    /// shape test here could only ever pin the shared changeset's OWN
+    /// columns, not prove `reschedule_task` writes the correct value.
+    #[test]
+    fn clean_continuation_changeset_never_carries_the_timer_marker() {
+        use crate::schema::harvest_task_queue::dsl;
+        use diesel::debug_query;
+        use diesel::pg::Pg;
+
+        let changeset = CleanContinuationChangeset::new(chrono::Utc::now());
+        let query = diesel::update(dsl::harvest_task_queue.filter(dsl::state.eq("RUNNING")))
+            .set(&changeset);
+        let debug = debug_query::<Pg, _>(&query).to_string();
+
+        assert!(
+            !debug.contains("timer_fires_at"),
+            "the shared changeset must not carry timer_fires_at -- only \
+             reschedule_task's own call site may add it, or \
+             defer_rate_limited_task would inherit it for an activity row: \
+             {debug}"
+        );
+    }
+
     /// Issue #782: `requeue_workflow_task_after_panic` must generate a `SET`
     /// clause that (a) resets the shared pending-requeue columns (`state` →
     /// PENDING, `crash_strikes` bound so the poison-pill reclaimer never trips,
@@ -8502,9 +10354,8 @@ mod tests {
     /// purely by `scheduled_at` and re-claimable by any worker.
     #[test]
     fn requeue_after_panic_query_resets_and_unpins_the_task_row() {
-        let changeset =
-            PendingRequeueChangeset::new(chrono::Utc::now(), "handler panic: boom".to_string());
-        let sql = requeue_after_panic_query(changeset);
+        let changeset = PendingRequeueChangeset::new("handler panic: boom".to_string());
+        let sql = requeue_after_panic_query(changeset, Duration::seconds(5));
 
         // Every column is emitted as a bound parameter (`= $N`) by
         // `debug_query`, mirroring the sibling `pending_requeue_changeset`
@@ -8513,7 +10364,6 @@ mod tests {
         for column in [
             "state",
             "crash_strikes",
-            "scheduled_at",
             "worker_id",
             "started_at",
             "last_heartbeat_at",
@@ -8523,18 +10373,27 @@ mod tests {
             "wake_requested",
             "activity_name",
             "error",
+            "timer_fires_at",
         ] {
             assert!(
                 sql.contains(&format!("\"{column}\" = $")),
                 "{column} must appear as a bound column in the SET clause: {sql}"
             );
         }
-        // The null-ing columns (worker_id/started_at/last_heartbeat_at +
-        // sticky_worker_id/sticky_until/sticky_timeout + activity_name) all bind
-        // `None` (SQL NULL), and wake_requested binds `false`.
+        // `scheduled_at` is computed on Postgres's own clock (issue #1389),
+        // not bound as a plain parameter.
         assert!(
-            sql.matches("None").count() >= 7,
-            "the seven null-ing columns must all bind to None (SQL NULL): {sql}"
+            sql.contains("\"scheduled_at\" = clock_timestamp() + make_interval(secs => $"),
+            "scheduled_at must be computed from Postgres's own clock: {sql}"
+        );
+        // The null-ing columns all bind `None` (SQL NULL): worker_id,
+        // started_at, last_heartbeat_at, sticky_worker_id, sticky_until,
+        // sticky_timeout, activity_name, and timer_fires_at. A panic
+        // retry is not a timer wake (issue #1402). wake_requested binds
+        // `false`.
+        assert!(
+            sql.matches("None").count() >= 8,
+            "the eight null-ing columns must all bind to None (SQL NULL): {sql}"
         );
         assert!(
             sql.contains("false"),
@@ -8543,6 +10402,63 @@ mod tests {
         // Restricted to claimed (RUNNING) workflow rows.
         assert!(sql.contains("\"task_type\""), "{sql}");
         assert!(sql.contains("\"state\""), "{sql}");
+    }
+
+    /// Issue #1391: this must generate a `SET` clause that clears both
+    /// `wake_requested` and the stale `activity_name` sentinel. It also
+    /// restricts the update to `RUNNING` workflow rows. This mirrors
+    /// `requeue_workflow_task_after_panic`'s own pin above. A no-DB test
+    /// pins this so a future edit cannot silently drop either clear and
+    /// reopen issue #1391 or its #603 sibling.
+    ///
+    /// Also pins the Codex-review fix (issue #1589): `scheduled_at` must be
+    /// computed via Postgres's own `clock_timestamp()`, not bound as a
+    /// host-computed literal. A trailing worker host clock must not be
+    /// able to bind an already-past deadline.
+    #[test]
+    fn requeue_workflow_task_for_quota_retry_query_clears_sentinel_and_wake() {
+        let changeset = PendingRequeueChangeset::new("quota exceeded".to_string());
+        let sql = requeue_workflow_task_for_quota_retry_query(changeset, Duration::seconds(5));
+
+        for column in ["wake_requested", "activity_name", "timer_fires_at"] {
+            assert!(
+                sql.contains(&format!("\"{column}\" = $")),
+                "{column} must appear as a bound column in the SET clause: {sql}"
+            );
+        }
+        // `scheduled_at` is computed on Postgres's own clock (issue #1389),
+        // not bound as a plain parameter.
+        assert!(
+            sql.contains("\"scheduled_at\" = clock_timestamp() + make_interval(secs => $"),
+            "scheduled_at must be computed from Postgres's own clock: {sql}"
+        );
+        // activity_name and timer_fires_at (issue #1402: a quota retry is
+        // not a timer wake) both bind `None` (SQL NULL); wake_requested
+        // binds `false`.
+        assert!(
+            sql.matches("None").count() >= 2,
+            "activity_name and timer_fires_at must both bind to None \
+             (SQL NULL): {sql}"
+        );
+        assert!(
+            sql.contains("false"),
+            "wake_requested must bind to false: {sql}"
+        );
+        // scheduled_at is computed DB-side from clock_timestamp(), immune to
+        // host/DB clock skew (issue #1389) -- never a Rust-computed timestamp.
+        assert!(
+            sql.contains("clock_timestamp() + make_interval"),
+            "scheduled_at must be DB-computed, not host-computed: {sql}"
+        );
+        // Restricted to claimed (RUNNING) workflow rows.
+        assert!(sql.contains("\"task_type\""), "{sql}");
+        assert!(sql.contains("\"state\""), "{sql}");
+        // `scheduled_at` is computed on Postgres's own clock (issue #1389),
+        // not the host clock, mirroring the panic-retry sibling pin above.
+        assert!(
+            sql.contains("\"scheduled_at\" = clock_timestamp() + make_interval(secs => $"),
+            "scheduled_at must be computed from Postgres's own clock: {sql}"
+        );
     }
 
     #[test]
@@ -8631,6 +10547,25 @@ mod tests {
                 now
             ) < f64::EPSILON
         );
+    }
+
+    /// `delay_secs` feeds `make_interval(secs => ...)` (issue #1389), so it
+    /// must convert exactly, including sub-second and zero delays.
+    #[test]
+    fn delay_secs_converts_exactly() {
+        assert!((delay_secs(Duration::seconds(2)) - 2.0).abs() < f64::EPSILON);
+        assert!((delay_secs(Duration::milliseconds(500)) - 0.5).abs() < f64::EPSILON);
+        assert!((delay_secs(Duration::zero()) - 0.0).abs() < f64::EPSILON);
+        assert!((delay_secs(Duration::seconds(-3)) - (-3.0)).abs() < f64::EPSILON);
+    }
+
+    /// `JitterPolicy::Full` can pick a sub-millisecond delay (issue #1389
+    /// review). Truncating to whole milliseconds would round it down to
+    /// zero, turning a short retry into an immediate one.
+    #[test]
+    fn delay_secs_preserves_sub_millisecond_precision() {
+        assert!((delay_secs(Duration::microseconds(500)) - 0.0005).abs() < f64::EPSILON);
+        assert!((delay_secs(Duration::microseconds(1)) - 0.000_001).abs() < f64::EPSILON);
     }
 
     #[test]

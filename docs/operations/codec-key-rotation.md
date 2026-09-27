@@ -157,7 +157,8 @@ GET /admin/codec/rotation      # admin-gated, read-only
         "last_event_id": 998112,
         "rows_reencrypted": 999588,
         "completed_at": null,
-        "updated_at": "2026-08-29T11:03:22Z"
+        "updated_at": "2026-08-29T11:03:22Z",
+        "next_revalidation_at": null
       }
     }
   ],
@@ -166,6 +167,15 @@ GET /admin/codec/rotation      # admin-gated, read-only
   "unavailable_shards": []
 }
 ```
+
+`updated_at` is cursor liveness: the last time this row was written, moved
+by every batch that advances the cursor, busy or not. `next_revalidation_at`
+is a different thing (issue #1258): the deadline for the next re-census of
+an *already-completed* pass. It is `null` while a pass has not converged;
+once converged, it is armed and then rearmed only when its own interval
+comes due — an ordinary advancing write on a busy shard does not move it.
+Do not read `updated_at` as "how soon will a stray row be found" — that is
+what `next_revalidation_at` answers.
 
 `rows_remaining_total` is only a count when `status` is `"complete"`. Under
 `"partial"` it is a **lower bound** — an unread shard's rows are unknown, never
@@ -297,12 +307,17 @@ still invisible to it and still require the fence.
 
 ### ⚠️ Upgrade every reader before activating a keyed codec
 
-Activating a non-legacy key switches new writes to **envelope version 2** (four
-keys, carrying `kid`). A reader built before issue #948 recognises an envelope
-only as exactly three keys with version 1, and its decoder returns anything
-else *unchanged* rather than rejecting it. A pre-#948 worker therefore hands the
-raw envelope object to workflow code as if it were the payload — silent wrong
-data, not a loud failure.
+Activating a non-legacy key switches new writes to **envelope version 2**
+(four keys, carrying `kid`). A reader built before issue #948 recognises an
+envelope only as exactly three keys with version 1, and its decoder returns
+anything else *unchanged* rather than rejecting it. A pre-#948 worker
+therefore hands the raw envelope object to workflow code as if it were the
+payload — silent wrong data, not a loud failure.
+
+Issue #1253 does not change this. A keyed write still emits this same flat,
+four-key shape — never the nested shape #1253 introduced, which only the
+identity-codec collision-escape path writes. See ADR-0003's "Nesting is
+scoped to the escape case only" addendum for why.
 
 `activate_codec_key` (issue #1244) enforces the deployment order
 structurally: it refuses while any worker that has heartbeated within

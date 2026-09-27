@@ -1820,6 +1820,28 @@ pub async fn fire_due_throttled_starts_with_codecs(
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> crate::error::HarvestResult<usize> {
+    fire_due_throttled_starts_on_conn_shard(
+        conn,
+        None,
+        sharded_pool.as_ref(),
+        shard_assignments,
+        metrics,
+        codecs,
+    )
+    .await
+}
+
+/// [`fire_due_throttled_starts_with_codecs`] for a caller that knows `conn`'s
+/// shard. See [`crate::shard::connect_or_reuse`].
+#[cfg(feature = "db")]
+pub(crate) async fn fire_due_throttled_starts_on_conn_shard(
+    conn: &mut diesel_async::AsyncPgConnection,
+    conn_shard: Option<crate::types::ShardId>,
+    sharded_pool: Option<&crate::shard::ShardedDbPool>,
+    shard_assignments: &[crate::types::ShardId],
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> crate::error::HarvestResult<usize> {
     async fn spawn_fired(
         fired: Vec<FiredThrottle>,
         metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
@@ -1878,17 +1900,17 @@ pub async fn fire_due_throttled_starts_with_codecs(
     match sharded_pool {
         Some(sp) if !shard_assignments.is_empty() => {
             for shard in shard_assignments {
-                let Some(pool) = sp.exact_pool_for(*shard).cloned() else {
+                let Some(mut shard_conn) = crate::shard::connect_or_reuse(
+                    conn,
+                    conn_shard,
+                    sp,
+                    *shard,
+                    "throttle",
+                    crate::shard::ShardConnectError::LogAndSkip,
+                )
+                .await?
+                else {
                     continue;
-                };
-                let mut shard_conn = match pool.get().await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::error!(
-                            "[throttle] failed to get connection to shard {shard:?}: {e:?}"
-                        );
-                        continue;
-                    }
                 };
                 let fired = fire_due_on_conn(&mut shard_conn, metrics, codecs).await?;
                 fired_count += spawn_fired(fired, metrics, &mut shard_conn).await;

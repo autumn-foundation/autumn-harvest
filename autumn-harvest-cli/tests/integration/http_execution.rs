@@ -1,4 +1,4 @@
-use autumn_harvest_cli::{Cli, CliError, execute};
+use autumn_harvest_cli::{Cli, CliError, execute, run_cli};
 use clap::Parser;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -153,6 +153,56 @@ async fn read_only_command_does_not_send_source_header() {
     assert!(
         !raw_request.contains("x-harvest-source"),
         "GET requests must not carry x-harvest-source; got:\n{raw_request}"
+    );
+}
+
+#[tokio::test]
+async fn execute_sends_explicit_json_accept_header() {
+    // Issue #1579: a bare `Accept: */*` (curl's own default) makes the
+    // server's error-page negotiation treat the request as browser
+    // navigation. It then returns an HTML error page, not the
+    // documented JSON body, on a validation error. An explicit
+    // `Accept: application/json` avoids that regardless of what a
+    // client library's own default would have sent.
+    let (base_url, request_task) = spawn_one_response_server("200 OK", r#"{"ok":true}"#).await;
+    let cli = Cli::try_parse_from(["harvest", "--base-url", &base_url, "health"])
+        .expect("CLI args should parse");
+
+    let _ = execute(&cli).await.expect("request should succeed");
+    let raw_request = request_task.await.expect("server task should finish");
+
+    assert!(
+        raw_request.contains("accept: application/json"),
+        "expected an explicit accept: application/json header; got:\n{raw_request}"
+    );
+}
+
+#[tokio::test]
+async fn events_tail_still_sends_event_stream_accept_header() {
+    // Guard against issue #1579's fix widening by accident. `events tail`
+    // is a separate streaming code path with its own `Accept` value. It
+    // must never pick up the JSON `execute()` path's header instead.
+    let (base_url, request_task) = spawn_one_response_server("200 OK", "").await;
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "--base-url",
+        &base_url,
+        "events",
+        "tail",
+        "00000000-0000-0000-0000-000000000001",
+    ])
+    .expect("CLI args should parse");
+
+    let _ = run_cli(cli).await;
+    let raw_request = request_task.await.expect("server task should finish");
+
+    assert!(
+        raw_request.contains("accept: text/event-stream"),
+        "events tail must send accept: text/event-stream; got:\n{raw_request}"
+    );
+    assert!(
+        !raw_request.contains("accept: application/json"),
+        "events tail must not send the JSON execute() Accept header; got:\n{raw_request}"
     );
 }
 

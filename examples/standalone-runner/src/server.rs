@@ -1,11 +1,90 @@
 use std::net::SocketAddr;
 
+use autumn_harvest_plugin::metrics_scrape::HarvestMetricsRecorder;
 use autumn_harvest_plugin::prelude::*;
 use autumn_web::config::DatabaseConfig;
 use autumn_web::reexports::axum::{self, Json, routing::get};
 use serde_json::json;
 
 use crate::runtime::{standalone_builder, standalone_runtime_config};
+
+/// Assemble the raw Axum app the runner listens on: the runner health route,
+/// a Prometheus scrape route fed by `metrics`, plus `harvest_api_router`
+/// nested under `/api/harvest`.
+///
+/// Split out of [`run`] so a test can drive it with `tower::ServiceExt::oneshot`
+/// without binding a socket or starting a `HarvestRunner` (see `tests.rs`).
+///
+/// No `autumn_web::AppState` is required (issue #1607). `harvest_api_router`
+/// returns `Router<()>`, so the standalone mount carries no autumn-web state.
+/// `/metrics` needs none either: `HarvestMetricsRecorder::render_prometheus`
+/// (issue #1611) is the framework-neutral counterpart of the plugin path's
+/// `/actuator/prometheus`, so this route is the entire integration.
+pub fn build_router(api_state: HarvestApiState, metrics: HarvestMetricsRecorder) -> axum::Router {
+    axum::Router::new()
+        .route(
+            "/",
+            get(|| async { Json(json!({ "service": "standalone-runner" })) }),
+        )
+        .route(
+            "/metrics",
+            get(move || {
+                let metrics = metrics.clone();
+                async move {
+                    (
+                        [(
+                            axum::http::header::CONTENT_TYPE,
+                            "text/plain; version=0.0.4",
+                        )],
+                        metrics.render_prometheus(),
+                    )
+                }
+            }),
+        )
+        .nest("/api/harvest", harvest_api_router(api_state))
+}
+
+/// Declare the deployment posture the README's own `Run` command sets
+/// (`AUTUMN_PROFILE=dev`), so the documented `harvest preflight` step is
+/// not gated forever (issue #1609).
+///
+/// A `HarvestPlugin` mount gets this call for free at startup
+/// (`plugin.rs`'s `start_harvest_runtime`). A standalone mount builds its
+/// own `HarvestApiState` and must call it directly, or the admin gate
+/// (`require_admin`) stays fail-closed against every caller.
+///
+/// A `HarvestPlugin` mount also warns at startup when this opens the admin
+/// API to unauthenticated callers (`plugin.rs`'s
+/// `warn_if_dev_admin_api_is_open`). This example never declares an admin
+/// auth boundary, so the same opening happens here. It logs the same
+/// warning, with remediation text for a standalone mount. An operator who
+/// copies this example onto a non-loopback address still learns it from
+/// the log.
+///
+/// Records whatever profile is supplied, not only `"dev"`. A future caller
+/// might add its own auth boundary under a non-dev profile.
+/// `harvest preflight`'s `admin_auth_boundary` check needs the real profile
+/// then, not `"unknown"`. A declared non-dev profile with no boundary is a
+/// hard failure. An undeclared profile is only a warning.
+///
+/// Split out of [`run`] so a test can drive the exact startup posture
+/// without a process-wide `AUTUMN_PROFILE` env var (see `tests.rs`).
+pub fn declare_deployment_profile(api_state: &HarvestApiState, autumn_profile: Option<&str>) {
+    if let Some(profile) = autumn_profile {
+        api_state.set_deployment_profile(profile);
+    }
+    if autumn_profile == Some("dev") {
+        tracing::warn!(
+            "AUTUMN_PROFILE=dev with no admin auth boundary declared: the Harvest management \
+             API (every /admin route and the Vantage dashboard) is reachable UNAUTHENTICATED by \
+             any caller that can open a socket to this process. This is what lets the README's \
+             documented `harvest preflight` step run with no credential. Do not expose this \
+             process beyond localhost. To close it, call \
+             HarvestApiState::set_admin_auth_boundary(true) after installing your own auth \
+             layer, or run a non-dev AUTUMN_PROFILE."
+        );
+    }
+}
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let database_url = std::env::var("DATABASE_URL")
@@ -20,24 +99,19 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     })?
     .ok_or("DATABASE_URL must create a Postgres pool")?;
 
+    let metrics = HarvestMetricsRecorder::new();
     let config = standalone_runtime_config(database_url);
-    let built = standalone_builder().try_build()?;
-    let runner = HarvestRunner::start(built, &config, HarvestRunnerResources::new(pool.clone()))
+    let built = standalone_builder(metrics.clone()).try_build()?;
+    let runner = HarvestRunner::start(built, &config, HarvestRunnerResources::new(pool))
         .await
         .map_err(|error| format!("failed to start Harvest runner: {error}"))?;
 
     let api_state = HarvestApiState::new();
+    declare_deployment_profile(&api_state, std::env::var("AUTUMN_PROFILE").ok().as_deref());
     api_state.install_storage_pool(runner.storage_pool());
     api_state.install(runner.api_runtime());
 
-    let web_state = autumn_web::AppState::for_test().with_pool(pool);
-    let app = axum::Router::new()
-        .route(
-            "/",
-            get(|| async { Json(json!({ "service": "standalone-runner" })) }),
-        )
-        .nest("/api/harvest", harvest_api_router(api_state))
-        .with_state(web_state);
+    let app = build_router(api_state, metrics);
 
     let address = SocketAddr::from(([127, 0, 0, 1], 8082));
     tracing::info!(%address, "standalone Harvest runner listening");

@@ -530,18 +530,6 @@ async fn continue_as_new_carries_chain_deadline_verbatim() {
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
 
-    // Scrub the shared e2e identity so this test is isolated.
-    for stmt in [
-        "DELETE FROM harvest_events WHERE workflow_exec_id IN (SELECT id FROM harvest_workflow_executions WHERE workflow_name = 'e2e_test_workflow')",
-        "DELETE FROM harvest_task_queue WHERE workflow_exec_id IN (SELECT id FROM harvest_workflow_executions WHERE workflow_name = 'e2e_test_workflow')",
-        "DELETE FROM harvest_workflow_executions WHERE workflow_name = 'e2e_test_workflow'",
-    ] {
-        diesel::sql_query(stmt)
-            .execute(&mut conn)
-            .await
-            .expect("scrub");
-    }
-
     let origin = insert_workflow_execution(&mut conn).await;
     // Stamp the origin's chain cap: a FUTURE absolute deadline so the successor
     // is not immediately timed out; we assert the successor copies it exactly.

@@ -126,6 +126,7 @@ panel finds the way back to the rule and its runbook section.
 | `harvest_retention_lag` | Cache, retention & shards | Retention deletions by shard | [runbook](../runbooks/harvest-alerts.md#harvest_retention_lag) |
 | `harvest_shard_unready` | Readiness checks | Readiness: Shard readiness (text) | [runbook](../runbooks/harvest-alerts.md#harvest_shard_unready) |
 | `harvest_shard_undrained` | Cache, retention & shards | Stranded pending tasks by shard (companion: Dispatch rate by shard) | [runbook](../runbooks/harvest-alerts.md#harvest_shard_undrained) |
+| `harvest_dispatch_dropped_hints` | Cache, retention & shards | Dispatch dropped hints | [runbook](../runbooks/harvest-alerts.md#harvest_dispatch_dropped_hints) |
 | `harvest_no_compatible_worker` | Readiness checks | Readiness: Build-routing compatibility (text) | [runbook](../runbooks/harvest-alerts.md#harvest_no_compatible_worker) |
 | `harvest_schedule_ha_domination` | Schedules & triggers | Schedule HA fire attempts | [runbook](../runbooks/harvest-alerts.md#harvest_schedule_ha_domination) |
 | `harvest_workflow_failure_rate` | Overview | Workflow failure ratio | [runbook](../runbooks/harvest-alerts.md#harvest_workflow_failure_rate) |
@@ -206,6 +207,25 @@ mandates `workflow`/`queue`/`shard` as the navigation dimensions) and the
 `uneditable-dashboard` rule (a starter pack is meant to be tuned in
 place). The linter validates the dashboard *model*; a manual import into a
 real Grafana ≥ 10 instance remains the final pre-merge verification step.
+
+## Adding a Panel
+
+Grafana panel `id` values must be unique across the whole file, including
+panels nested inside collapsed rows. Do not hand-pick the next integer:
+five separate PRs (ids 956, 957, 958, 959, 960) each picked the same
+"next" id as a PR merging around the same time. The JSON merges cleanly
+either way, so nothing conflicts until CI runs
+`panel_structure_is_grafana10_clean` (`dashboard_pack_docs.rs`) against
+the merged file — by which point both PRs are already in.
+
+Get a collision-resistant id instead:
+
+```sh
+python3 docs/dashboards/next-panel-id.py
+```
+
+It draws from a wide, mostly-empty range, so two branches picking one at
+the same time are unlikely to collide.
 
 ## Versioning
 

@@ -897,7 +897,17 @@ pub enum HarvestBuilderError {
     /// [`crate::completion_callback::SsrfPolicy`] host allowlist.
     #[error("completion-callback default target '{url}' rejected: {rejection}")]
     CallbackTargetRejected {
-        /// The rejected target URL.
+        /// The rejected target URL, **redacted to its origin**
+        /// (`https://host/<redacted>`) by
+        /// [`crate::completion_callback::CompletionCallbackBuilderConfig::validate_default_targets`]
+        /// (issue #1274).
+        ///
+        /// A startup failure's `Display` goes straight to the logs. A
+        /// completion-callback target often carries a bearer token in the
+        /// path or query, the same way a SIEM ingest URL does (issue #953).
+        /// Every `SsrfRejection` variant discriminates on an origin
+        /// property, so the origin explains the rejection, and the redacted
+        /// remainder is exactly the secret.
         url: String,
         /// The machine-readable SSRF rejection reason.
         rejection: crate::completion_callback::SsrfRejection,
@@ -7360,13 +7370,37 @@ mod tests {
         let result = HarvestBuilder::new()
             .completion_callback_default("https://evil.com/hook", EventFilter::AnyTerminal)
             .try_build();
+        // The URL is carried REDACTED to its origin (issue #1274).
+        // A completion-callback target often carries a bearer token in its
+        // path or query, and this error's `Display` goes to startup logs.
         assert!(
             matches!(
                 result,
                 Err(HarvestBuilderError::CallbackTargetRejected { ref url, .. })
-                    if url == "https://evil.com/hook"
+                    if url == "https://evil.com/<redacted>"
             ),
-            "expected CallbackTargetRejected, got {result:?}"
+            "expected CallbackTargetRejected with a redacted origin, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn builder_redacts_a_credential_bearing_completion_callback_target_in_startup_error() {
+        use crate::completion_callback::EventFilter;
+        // No allowlist configured -> every domain host is rejected.
+        let result = HarvestBuilder::new()
+            .completion_callback_default(
+                "https://evil.com/hook?token=s3cr3t",
+                EventFilter::AnyTerminal,
+            )
+            .try_build();
+        let rendered = result.unwrap_err().to_string();
+        assert!(
+            rendered.contains("evil.com"),
+            "expected the host in the rendered error, got {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("s3cr3t"),
+            "credential-bearing query must not reach the rendered error, got {rendered:?}"
         );
     }
 

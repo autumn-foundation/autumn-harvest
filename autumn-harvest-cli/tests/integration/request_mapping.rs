@@ -1710,6 +1710,8 @@ fn audit_list_all_filters_builds_correct_query_string() {
         "2026-01-01T00:00:00Z",
         "--before",
         "2026-02-01T00:00:00Z",
+        "--before-id",
+        "00000000-0000-0000-0000-000000000002",
         "--limit",
         "25",
     ])
@@ -1731,6 +1733,7 @@ fn audit_list_all_filters_builds_correct_query_string() {
         "status=succeeded",
         "since=2026-01-01T00:00:00Z",
         "before=2026-02-01T00:00:00Z",
+        "before_id=00000000-0000-0000-0000-000000000002",
         "limit=25",
     ] {
         assert!(

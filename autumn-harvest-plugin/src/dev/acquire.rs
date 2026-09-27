@@ -55,7 +55,7 @@ pub async fn acquire_postgres_binaries() -> Result<PostgresBinaries, DevError> {
     if cache_root.exists() && !directory_is_private(&cache_root) {
         return Err(DevError::Acquire {
             detail: format!(
-                "the cache directory {} is not owner-only, and its contents would be executed. \
+                "the cache directory {} is not private, and its contents would be executed. \
                  Point HARVEST_DEV_CACHE_DIR somewhere private, or install PostgreSQL yourself",
                 cache_root.display()
             ),
@@ -114,10 +114,33 @@ pub async fn acquire_postgres_binaries() -> Result<PostgresBinaries, DevError> {
         });
     }
 
-    if std::fs::rename(&staging, &cache_root).is_err() {
+    let this_call_created_cache_root = std::fs::rename(&staging, &cache_root).is_ok();
+    if !this_call_created_cache_root {
         // Either another process got there first (fine) or the rename genuinely
         // failed (the completeness check below is the arbiter either way).
         let _ = std::fs::remove_dir_all(&staging);
+    }
+
+    // The preflight above only ran if `cache_root` already existed. A fresh
+    // acquire into a not-yet-existing versioned subdirectory skips it. An
+    // untrusted `HARVEST_DEV_CACHE_DIR` is caught only here, after the
+    // rename — but only when THIS call is the one that just created
+    // `cache_root`. A lost race means some other process owns it now.
+    // This call must not delete a directory it does not own, whatever
+    // `directory_is_private` says about it.
+    if this_call_created_cache_root && !directory_is_private(&cache_root) {
+        // Remove what was just downloaded, rather than leaving an install
+        // in a shared location. Report the real reason, not the misleading
+        // "archive did not contain the expected binaries" a bare
+        // `cached_install` miss would otherwise produce.
+        let _ = std::fs::remove_dir_all(&cache_root);
+        return Err(DevError::Acquire {
+            detail: format!(
+                "the cache directory {} is not private, and its contents would be executed. \
+                 Point HARVEST_DEV_CACHE_DIR somewhere private, or install PostgreSQL yourself",
+                cache_root.display()
+            ),
+        });
     }
 
     cached_install(&cache_root).ok_or_else(|| DevError::Acquire {
@@ -139,7 +162,7 @@ fn cached_install(cache_root: &std::path::Path) -> Option<PostgresBinaries> {
         tracing::warn!(
             path = %cache_root.display(),
             "dev runtime: ignoring a cached PostgreSQL install in a directory that is not \
-             owner-only — it would be executed"
+             private — it would be executed"
         );
         return None;
     }
@@ -155,26 +178,96 @@ fn cached_install(cache_root: &std::path::Path) -> Option<PostgresBinaries> {
     complete.then(|| PostgresBinaries::at(bin_dir))
 }
 
-/// Whether `dir` exists, is a real directory (not a symlink), is owned by this
-/// user, and is not writable by group or other.
+/// Whether `dir` is safe to execute binaries from.
+///
+/// A leaf-only check is not enough (issue #1292). The check and the run
+/// happen at two separate moments. A local user who can write an ancestor
+/// of `dir` can act in between. That user can rename the validated
+/// directory aside. That user can then put a symlink, or a directory of
+/// their own, in its place. Checking every ancestor removes the directory
+/// such a user would need to replace.
+///
+/// This still checks, then trusts the path for later use. It closes the
+/// race against another local user, but it does not remove the gap
+/// between the check and the run. Only opening a handle and executing
+/// from that handle would remove the gap.
 fn directory_is_private(dir: &std::path::Path) -> bool {
+    leaf_is_private(dir) && dir.parent().is_none_or(ancestors_are_private)
+}
+
+/// Whether `dir` exists, is a real directory (not a symlink), and is ours to
+/// trust — see [`super::reaper::directory_is_ours`]. On Unix it must also not
+/// be writable by group or other.
+fn leaf_is_private(dir: &std::path::Path) -> bool {
     let Ok(metadata) = std::fs::symlink_metadata(dir) else {
         return false;
     };
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return false;
     }
+    if super::reaper::directory_is_ours(dir, &metadata).is_err() {
+        return false;
+    }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt as _;
         use std::os::unix::fs::PermissionsExt as _;
-        if super::reaper::unix_uid().is_some_and(|uid| uid != metadata.uid()) {
-            return false;
-        }
         if metadata.permissions().mode() & 0o022 != 0 {
             return false;
         }
     }
+    true
+}
+
+/// Whether `dir` and every directory above it, up to the filesystem root,
+/// resist a rename-and-replace race.
+///
+/// The ownership rule is looser than in [`leaf_is_private`]. An ancestor
+/// may be owned by the current user or by root. This lets root-owned
+/// system directories, such as `/` and `/home`, pass. An ancestor must
+/// still not be a symlink.
+///
+/// A group- or other-writable ancestor is refused, unless it has the
+/// sticky bit. The kernel applies the same rule to `/tmp`. The sticky bit
+/// blocks the actual attack: another user renaming or deleting an entry
+/// they do not own. A plain shared temp directory does not need refusal
+/// to close that attack.
+///
+/// [`leaf_is_private`] fails open on ownership when the current uid
+/// cannot be determined. That is by design for one directory: a real
+/// permission problem still surfaces as `initdb`'s own error. This walk
+/// checks many directories. The same fail-open choice would widen, not
+/// narrow, what an unidentified process trusts. An ancestor with an
+/// indeterminate uid is refused here, unless the ancestor is root-owned.
+#[cfg(unix)]
+fn ancestors_are_private(dir: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mut current = dir;
+    loop {
+        let Ok(metadata) = std::fs::symlink_metadata(current) else {
+            return false;
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return false;
+        }
+        let untrusted_owner =
+            metadata.uid() != 0 && super::reaper::unix_uid() != Some(metadata.uid());
+        let mode = metadata.permissions().mode();
+        let sticky = mode & 0o1000 != 0;
+        let writable_by_others = mode & 0o022 != 0;
+        if untrusted_owner || (writable_by_others && !sticky) {
+            return false;
+        }
+        current = match current.parent() {
+            Some(parent) => parent,
+            None => return true,
+        };
+    }
+}
+
+#[cfg(not(unix))]
+fn ancestors_are_private(_dir: &std::path::Path) -> bool {
     true
 }
 
@@ -196,8 +289,197 @@ fn cache_root() -> Result<PathBuf, DevError> {
         .ok_or_else(|| DevError::Acquire {
             detail: "no cache directory is available (set HARVEST_DEV_CACHE_DIR)".to_owned(),
         })?;
+    // The ancestor walk in `directory_is_private` needs a real chain of
+    // directories to check. A relative path has no such chain above the
+    // current directory, and would fail that walk with a confusing error.
+    // Reject it here, with a message that names the actual problem.
+    if !base.is_absolute() {
+        return Err(DevError::Acquire {
+            detail: format!(
+                "the cache directory {} is not absolute. Set HARVEST_DEV_CACHE_DIR to an \
+                 absolute path",
+                base.display()
+            ),
+        });
+    }
     Ok(base
         .join("autumn-harvest")
         .join("postgresql")
         .join(MANAGED_CACHE_KEY))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::directory_is_private;
+
+    /// Issue #1287 regression: the Unix answer must not change. A directory
+    /// we own, with default `tempfile` permissions, is still private.
+    ///
+    /// Canonicalised first: the ancestor walk (issue #1292) refuses a
+    /// symlinked ancestor. On macOS `tempfile`'s own base directory
+    /// resolves through one (`/var` -> `/private/var`). That symlink is
+    /// root-owned. No attacker can replace it, so it is not the case
+    /// this test means to pin. Canonicalising resolves it away, leaving
+    /// only real directories in the chain.
+    #[cfg(unix)]
+    #[test]
+    fn an_owner_owned_directory_is_still_private_on_unix() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let real_dir = dir.path().canonicalize().expect("canonicalize temp dir");
+        assert!(directory_is_private(&real_dir));
+    }
+
+    /// Issue #1287 regression: group/other-writable is still rejected on
+    /// Unix, independent of the new `directory_is_ours` delegation above.
+    #[cfg(unix)]
+    #[test]
+    fn a_group_writable_directory_is_still_rejected_on_unix() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o770))
+            .expect("chmod");
+        assert!(!directory_is_private(dir.path()));
+    }
+
+    /// Issue #1287's actual regression, for the cache-directory site: before
+    /// this fix, any non-symlink directory read as "private" on Windows.
+    /// `C:\Windows\Temp` is the machine-wide location the issue names as the
+    /// realistic exposure.
+    #[cfg(windows)]
+    #[test]
+    fn a_directory_outside_any_per_user_root_is_not_private_on_windows() {
+        let dir = std::path::PathBuf::from(r"C:\Windows\Temp");
+        // `directory_is_private` reads `false` both for "correctly rejected"
+        // and for "could not even be stat'd". Stat it here first, so a
+        // broken runner fails loudly instead of passing this test vacuously.
+        std::fs::symlink_metadata(&dir).expect("C:\\Windows\\Temp must be stat-able");
+        assert!(
+            !directory_is_private(&dir),
+            "a shared directory must not be treated as a private cache"
+        );
+    }
+
+    /// The other half: a cache directory under `%LOCALAPPDATA%` is still
+    /// accepted.
+    #[cfg(windows)]
+    #[test]
+    fn a_directory_under_localappdata_is_private_on_windows() {
+        let base = std::env::var_os("LOCALAPPDATA").expect("LOCALAPPDATA must be set on Windows");
+        // A unique temp dir, not a fixed name: a fixed name could already
+        // exist with real contents, which dropping a `TempDir` would delete.
+        let dir = tempfile::tempdir_in(base).expect("temp dir under LOCALAPPDATA");
+        assert!(directory_is_private(dir.path()));
+    }
+
+    /// The ancestor walk (issue #1292) has its own dedicated suite. It
+    /// needs real chmod/chown control over a multi-level directory tree.
+    /// Only Unix gives this file that control.
+    #[cfg(unix)]
+    mod ancestor_walk {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        use super::directory_is_private;
+
+        /// A cache root nested three levels under a fresh, owner-only temp
+        /// directory: the shape a real per-user cache has.
+        ///
+        /// Every level gets an explicit `chmod`. `create_dir_all` alone would
+        /// leave each level's mode to the process umask, and a permissive
+        /// umask would then make this "accepted" fixture fail its own test.
+        ///
+        /// The root is canonicalised before use. On macOS, `tempfile`'s own
+        /// base resolves through a root-owned symlink (`/var` ->
+        /// `/private/var`). No attacker can replace that symlink, but the
+        /// ancestor walk refuses any symlinked ancestor regardless of who
+        /// owns it. Canonicalising leaves only real directories for it to
+        /// walk, so this "accepted" fixture does not fail on that platform.
+        fn private_cache_root() -> (tempfile::TempDir, std::path::PathBuf) {
+            let root = tempfile::tempdir().expect("temp dir");
+            let root_path = root.path().canonicalize().expect("canonicalize temp dir");
+            let a = root_path.join("a");
+            let b = a.join("b");
+            let cache = b.join("cache");
+            fs::create_dir_all(&cache).expect("mkdir cache");
+            for dir in [
+                root_path.as_path(),
+                a.as_path(),
+                b.as_path(),
+                cache.as_path(),
+            ] {
+                fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).expect("chmod");
+            }
+            (root, cache)
+        }
+
+        #[test]
+        fn a_cache_root_under_private_ancestors_is_accepted() {
+            let (_root, cache) = private_cache_root();
+            assert!(directory_is_private(&cache));
+        }
+
+        #[test]
+        fn a_world_writable_ancestor_is_refused() {
+            let (root, cache) = private_cache_root();
+            let ancestor = root.path().join("a");
+            fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o777)).expect("chmod");
+            assert!(!directory_is_private(&cache));
+        }
+
+        #[test]
+        fn a_group_writable_ancestor_is_refused() {
+            let (root, cache) = private_cache_root();
+            let ancestor = root.path().join("a");
+            fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o770)).expect("chmod");
+            assert!(!directory_is_private(&cache));
+        }
+
+        #[test]
+        fn a_symlinked_ancestor_is_refused() {
+            let (root, _cache) = private_cache_root();
+            let real_a = root.path().join("a");
+            let link_a = root.path().join("link-a");
+            std::os::unix::fs::symlink(&real_a, &link_a).expect("symlink");
+            let cache_via_link = link_a.join("b").join("cache");
+            assert!(!directory_is_private(&cache_via_link));
+        }
+
+        #[test]
+        fn the_immediate_parent_writable_by_others_is_refused() {
+            let (_root, cache) = private_cache_root();
+            let parent = cache.parent().expect("parent");
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o777)).expect("chmod");
+            assert!(!directory_is_private(&cache));
+        }
+
+        /// A world-writable ancestor with the sticky bit — `/tmp` itself, in
+        /// shape — must still be accepted. Sticky already blocks the rename
+        /// this check exists to catch, and every temp-backed cache root has one.
+        #[test]
+        fn a_sticky_world_writable_ancestor_is_accepted() {
+            let (root, cache) = private_cache_root();
+            let ancestor = root.path().join("a");
+            fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o1777)).expect("chmod");
+            assert!(directory_is_private(&cache));
+        }
+
+        /// An ancestor owned by neither root nor the current user is refused,
+        /// even with a strict, no-write-bit mode. Mode alone is not the whole
+        /// rule: that owner still controls the directory's contents.
+        ///
+        /// Changing an ancestor's owner needs root, so this test runs only as
+        /// root — the same account this sandbox already runs test suites as.
+        #[test]
+        fn an_ancestor_owned_by_someone_else_is_refused() {
+            if super::super::super::reaper::unix_uid() != Some(0) {
+                eprintln!("SKIP: chowning an ancestor to another user needs root");
+                return;
+            }
+            let (root, cache) = private_cache_root();
+            let ancestor = root.path().join("a");
+            let other_uid = 65534; // "nobody" on most systems; the raw uid is enough.
+            std::os::unix::fs::chown(&ancestor, Some(other_uid), None).expect("chown");
+            assert!(!directory_is_private(&cache));
+        }
+    }
 }

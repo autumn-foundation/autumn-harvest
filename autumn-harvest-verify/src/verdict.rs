@@ -79,11 +79,13 @@ pub enum BoundaryKind {
     MirParse,
     MissingBody,
     DropGlue,
+    FixpointExhausted,
+    UnresolvedCallback,
 }
 
 impl BoundaryKind {
     /// Every boundary kind the analyzer can emit, in stable order (mirrored by the report's boundary table).
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 14] = [
         Self::DynDispatch,
         Self::IndirectCall,
         Self::Ffi,
@@ -96,6 +98,8 @@ impl BoundaryKind {
         Self::MirParse,
         Self::MissingBody,
         Self::DropGlue,
+        Self::FixpointExhausted,
+        Self::UnresolvedCallback,
     ];
 
     /// Kebab-case name as printed in reports (`dyn-dispatch`, `ffi`, ...).
@@ -114,6 +118,8 @@ impl BoundaryKind {
             Self::MirParse => "mir-parse",
             Self::MissingBody => "missing-body",
             Self::DropGlue => "drop-glue",
+            Self::FixpointExhausted => "fixpoint-exhausted",
+            Self::UnresolvedCallback => "unresolved-callback",
         }
     }
 }

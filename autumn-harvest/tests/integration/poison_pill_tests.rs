@@ -113,6 +113,36 @@ async fn insert_running_task(
     id
 }
 
+/// Insert a `RUNNING` task of the given `task_type`, claimed by `worker_id`,
+/// started `age` in the past. No `harvest_workers` row is inserted — callers
+/// add one to simulate a live worker. Used by the issue #1459 stuck-running
+/// backstop tests, where the claiming worker's liveness must not matter.
+async fn insert_running_task_of_type(
+    conn: &mut AsyncPgConnection,
+    workflow_exec_id: Option<Uuid>,
+    worker_id: &str,
+    task_type: &str,
+    age: chrono::Duration,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    let started_at = chrono::Utc::now() - age;
+    diesel::sql_query(
+        "INSERT INTO harvest_task_queue \
+         (id, queue_name, task_type, workflow_exec_id, input, state, worker_id, \
+          attempt, max_attempts, started_at, crash_strikes) \
+         VALUES ($1, 'default', $2, $3, '{}'::jsonb, 'RUNNING', $4, 1, 3, $5, 0)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(id)
+    .bind::<diesel::sql_types::Text, _>(task_type)
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Uuid>, _>(workflow_exec_id)
+    .bind::<diesel::sql_types::Text, _>(worker_id)
+    .bind::<diesel::sql_types::Timestamptz, _>(started_at)
+    .execute(conn)
+    .await
+    .expect("insert running task");
+    id
+}
+
 /// Insert a PENDING sibling activity task for `workflow_exec_id`. Returns its id.
 async fn insert_pending_task(conn: &mut AsyncPgConnection, workflow_exec_id: Uuid) -> Uuid {
     let id = Uuid::new_v4();
@@ -485,6 +515,216 @@ async fn poison_pill_counts_toward_schedule_auto_pause() {
         row.consecutive_failure_count, 1,
         "poison-pill workflow failure must count toward schedule auto-pause"
     );
+}
+
+// --- issue #1459: stuck-running backstop --------------------------------
+//
+// A `workflow` decision-cycle task can stay `RUNNING` on a worker that never
+// died. The in-process wall-clock timeout cancels the cycle. The reset call
+// that should re-pend the row can itself fail to land. The dead-worker
+// orphan scan above never catches this — the claiming worker is alive.
+// `reclaim_orphaned_tasks`'s second pass, gated by `stuck_running_secs`,
+// requeues such a row on wall-clock age alone. These tests pin that pass
+// against a real Postgres, both disabled (the pre-#1459 gap this issue
+// reported) and enabled (the fix).
+
+#[tokio::test]
+async fn stuck_workflow_task_on_live_worker_is_not_reclaimed_without_backstop() {
+    let (mut conn, _container) = setup_db().await;
+    let exec_id = insert_running_workflow(&mut conn, "wf-stuck-disabled").await;
+    let task_id = insert_running_task_of_type(
+        &mut conn,
+        Some(exec_id),
+        "live-worker-stuck",
+        "workflow",
+        chrono::Duration::hours(1),
+    )
+    .await;
+    insert_live_worker(&mut conn, "live-worker-stuck").await;
+    let metrics = RecordingMetrics::default();
+
+    // `None` is the pre-#1459 call shape. It pins the disable contract. A
+    // caller that does not opt in gets the old behavior verbatim. The second
+    // pass's own correctness is not this test's job — the next test covers
+    // that, with the pass enabled.
+    let summary = reclaim_orphaned_tasks(
+        &mut conn,
+        3,
+        10,
+        None,
+        &metrics,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+    )
+    .await
+    .expect("reclaim");
+
+    assert_eq!(summary.total(), 0, "backstop disabled: row stays wedged");
+    let (state, _, worker) = task_state(&mut conn, task_id).await;
+    assert_eq!(state, "RUNNING");
+    assert_eq!(worker.as_deref(), Some("live-worker-stuck"));
+    assert_eq!(workflow_state(&mut conn, exec_id).await, "RUNNING");
+}
+
+#[tokio::test]
+async fn stuck_workflow_task_on_live_worker_is_requeued_by_backstop() {
+    let (mut conn, _container) = setup_db().await;
+    let exec_id = insert_running_workflow(&mut conn, "wf-stuck-enabled").await;
+    let task_id = insert_running_task_of_type(
+        &mut conn,
+        Some(exec_id),
+        "live-worker-stuck-2",
+        "workflow",
+        chrono::Duration::hours(1),
+    )
+    .await;
+    insert_live_worker(&mut conn, "live-worker-stuck-2").await;
+    let metrics = RecordingMetrics::default();
+
+    let summary = reclaim_orphaned_tasks(
+        &mut conn,
+        3,
+        10,
+        Some(60),
+        &metrics,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+    )
+    .await
+    .expect("reclaim");
+
+    assert_eq!(summary.stuck_requeued, 1, "stuck row requeued");
+    assert_eq!(summary.requeued, 0, "not the dead-worker orphan path");
+    assert_eq!(summary.quarantined, 0, "never quarantines");
+
+    let (state, strikes, worker) = task_state(&mut conn, task_id).await;
+    assert_eq!(state, "PENDING", "back in the pool for any worker");
+    assert_eq!(strikes, 0, "crash strikes untouched: not a crash");
+    assert_eq!(worker, None, "stale claim cleared");
+    assert_eq!(
+        workflow_state(&mut conn, exec_id).await,
+        "RUNNING",
+        "a requeue is not terminal"
+    );
+    assert!(metrics.quarantined.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn activity_task_is_excluded_from_the_stuck_running_backstop() {
+    let (mut conn, _container) = setup_db().await;
+    let exec_id = insert_running_workflow(&mut conn, "wf-stuck-activity-sibling").await;
+    let task_id = insert_running_task_of_type(
+        &mut conn,
+        Some(exec_id),
+        "live-worker-activity",
+        "activity",
+        chrono::Duration::hours(1),
+    )
+    .await;
+    insert_live_worker(&mut conn, "live-worker-activity").await;
+    let metrics = RecordingMetrics::default();
+
+    let summary = reclaim_orphaned_tasks(
+        &mut conn,
+        3,
+        10,
+        Some(60),
+        &metrics,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+    )
+    .await
+    .expect("reclaim");
+
+    assert_eq!(
+        summary.total(),
+        0,
+        "an activity's own start_to_close governs it, not this backstop"
+    );
+    let (state, _, worker) = task_state(&mut conn, task_id).await;
+    assert_eq!(state, "RUNNING");
+    assert_eq!(worker.as_deref(), Some("live-worker-activity"));
+}
+
+#[tokio::test]
+async fn workflow_task_under_the_stuck_running_threshold_is_left_alone() {
+    let (mut conn, _container) = setup_db().await;
+    let exec_id = insert_running_workflow(&mut conn, "wf-not-stuck-yet").await;
+    // Started 5s ago, threshold is 60s: a merely slow cycle, not a stuck one.
+    let task_id = insert_running_task_of_type(
+        &mut conn,
+        Some(exec_id),
+        "live-worker-fresh",
+        "workflow",
+        chrono::Duration::seconds(5),
+    )
+    .await;
+    insert_live_worker(&mut conn, "live-worker-fresh").await;
+    let metrics = RecordingMetrics::default();
+
+    let summary = reclaim_orphaned_tasks(
+        &mut conn,
+        3,
+        10,
+        Some(60),
+        &metrics,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+    )
+    .await
+    .expect("reclaim");
+
+    assert_eq!(summary.total(), 0, "still within budget, not stuck");
+    let (state, _, worker) = task_state(&mut conn, task_id).await;
+    assert_eq!(state, "RUNNING");
+    assert_eq!(worker.as_deref(), Some("live-worker-fresh"));
+}
+
+/// A `workflow` task both past the stuck-running threshold AND claimed by a
+/// dead worker matches the scan in both passes
+/// ([`orphaned_running_tasks_query`](autumn_harvest::poison_pill) has no
+/// `task_type` filter). It must go through the dead-worker path only. That
+/// path commits first and clears `state` to `PENDING`. The stuck-running
+/// query then runs second, still filtered to `state = 'RUNNING'`, so it no
+/// longer matches the row. A crash-strike increment is the proof of which
+/// path actually ran. The stuck-running path never touches it.
+#[tokio::test]
+async fn dead_worker_stuck_workflow_task_goes_through_the_crash_strike_path_only() {
+    let (mut conn, _container) = setup_db().await;
+    let exec_id = insert_running_workflow(&mut conn, "wf-dead-and-stuck").await;
+    let task_id = insert_running_task_of_type(
+        &mut conn,
+        Some(exec_id),
+        "dead-worker-stuck",
+        "workflow",
+        chrono::Duration::hours(1),
+    )
+    .await;
+    // No `insert_live_worker` call: this worker is dead, not merely absent
+    // from a heartbeat table it was never in.
+    let metrics = RecordingMetrics::default();
+
+    let summary = reclaim_orphaned_tasks(
+        &mut conn,
+        3,
+        10,
+        Some(60),
+        &metrics,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+    )
+    .await
+    .expect("reclaim");
+
+    assert_eq!(summary.requeued, 1, "dead-worker orphan path claims it");
+    assert_eq!(
+        summary.stuck_requeued, 0,
+        "already PENDING by the time the stuck-running pass runs: not double-counted"
+    );
+    assert_eq!(summary.quarantined, 0);
+
+    let (state, strikes, worker) = task_state(&mut conn, task_id).await;
+    assert_eq!(state, "PENDING");
+    assert_eq!(
+        strikes, 1,
+        "the crash-strike path ran, not the stuck-running one"
+    );
+    assert_eq!(worker, None);
 }
 
 #[derive(QueryableByName)]
