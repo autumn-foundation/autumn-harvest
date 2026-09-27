@@ -68,6 +68,8 @@ mod claim_budget_tests;
 mod codec_rotation_db_tests;
 mod completion_callback_tests;
 #[cfg(feature = "db")]
+mod completion_callback_outcome_batch_perf;
+#[cfg(feature = "db")]
 mod completion_trigger_outbox_queue_perf;
 mod concurrency_key_tests;
 mod concurrency_supersede_tests;
