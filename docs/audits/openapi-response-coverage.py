@@ -75,9 +75,10 @@ removes one `Option`. A field is optional when it is an `Option` or has a serde
 default, on the field or on the struct. By default, serde ignores an unknown
 query key, so a documented key that no struct has is a finding.
 
-The audit reads only the serde attributes `default`, `skip` and
-`skip_deserializing`. It ignores `rename` and `rename_all`, so a renamed field
-shows as a finding, not as a silent pass.
+The audit reads the serde attributes `default`, `skip`, `skip_deserializing`,
+`rename = ".."` and `alias = ".."`. A field is documented when the contract
+names its wire name or any alias. `rename_all`, `flatten` and `rename(..)` are
+check 7 findings, since the audit cannot read the wire names they make.
 
 Check 7 stops the audit from skipping what it cannot read. These are findings:
 a `from_slice` call it cannot read, a body type it cannot resolve, a
@@ -264,14 +265,33 @@ def struct_text(source: str, found: re.Match) -> str:
     return "\n".join(attributes + [block])
 
 
-def accepted_fields(struct: str) -> list[str]:
-    """Field names serde will accept from the wire."""
-    return [name for name, _, _ in struct_fields(struct)]
+def accepted_fields(struct: str) -> list[tuple[str, ...]]:
+    """The spellings of each field serde will accept from the wire."""
+    return [spellings for _, _, _, spellings in struct_fields(struct)]
 
 
-def mandatory_fields(struct: str) -> list[str]:
-    """Field names a caller must send, given serde's rules."""
-    return [name for name, _, mandatory in struct_fields(struct) if mandatory]
+def mandatory_fields(struct: str) -> list[tuple[str, ...]]:
+    """The spellings of each field a caller must send, given serde's rules."""
+    return [spellings for _, _, mandatory, spellings in struct_fields(struct) if mandatory]
+
+
+def documented_as(spellings: tuple[str, ...], documented) -> str | None:
+    """The first spelling of a field that the contract documents, if any."""
+    return next((name for name in spellings if name in documented), None)
+
+
+def unreadable_serde(struct: str) -> list[str]:
+    """Serde attributes in a struct that change wire names in ways not read.
+
+    `rename_all`, `flatten` and the `rename(..)` form are reported, not
+    guessed at. A plain `rename = ".."` and `alias = ".."` are read.
+    """
+    found: set[str] = set()
+    for attribute in re.findall(r"#\[serde\(([^\]]*)\)\]", struct):
+        found |= set(re.findall(r"\b(rename_all|flatten)\b", attribute))
+        if re.search(r"\brename\s*\(", attribute):
+            found.add("rename(..)")
+    return sorted(found)
 
 
 def key_arms(body: str) -> list[tuple[str, ...]]:
@@ -499,15 +519,17 @@ def parse_type(turbofish: str | None, before: str, after: str, returns: str) -> 
     return result.group(1).split("::")[-1] if result else None
 
 
-def struct_fields(struct: str) -> list[tuple[str, str, bool]]:
-    """`(name, type, mandatory)` for each field serde reads from the wire.
+def struct_fields(struct: str) -> list[tuple[str, str, bool, tuple[str, ...]]]:
+    """`(name, type, mandatory, spellings)` for each field serde reads.
 
-    The text before the first `{` holds the container attributes. A container
-    `#[serde(default)]` makes every field optional.
+    `name` is the wire name, after a serde `rename = ".."`. `spellings` holds
+    that name, then each serde `alias`. The text before the first `{` holds the
+    container attributes. A container `#[serde(default)]` makes every field
+    optional.
     """
     opener = struct.index("{")
     all_default = re.search(r"serde\([^)]*\bdefault\b", struct[:opener]) is not None
-    fields: list[tuple[str, str, bool]] = []
+    fields: list[tuple[str, str, bool, tuple[str, ...]]] = []
     attributes: list[str] = []
     for line in struct[opener:].split("\n"):
         text = re.sub(r"/\*.*?\*/", "", line).strip()
@@ -526,7 +548,10 @@ def struct_fields(struct: str) -> list[tuple[str, str, bool]]:
         if not re.search(r"serde\([^)]*\bskip(?:_deserializing)?\b", joined):
             defaulted = all_default or re.search(r"serde\([^)]*\bdefault\b", joined)
             optional = defaulted or declared_type.startswith("Option<")
-            fields.append((name, declared_type, not optional))
+            renamed = re.search(r'serde\([^)]*\brename\s*=\s*"([^"]+)"', joined)
+            wire = renamed.group(1) if renamed else name
+            aliases = re.findall(r'\balias\s*=\s*"([^"]+)"', joined)
+            fields.append((wire, declared_type, not optional, (wire, *aliases)))
         attributes = []
     return fields
 
@@ -544,15 +569,15 @@ def query_struct_findings(
     documented = {
         entry.get("name"): entry
         for entry in route.get("params") or []
-        if entry.get("in") == "query"
+        if entry.get("in") == "query" and entry.get("name")
     }
     where = "  %s %s: `%%s`" % (method, path)
     found: list[str] = []
     accepted: set[str] = set()
     for name, struct in queries:
-        for field, declared_type, mandatory in struct_fields(struct):
-            accepted.add(field)
-            entry = documented.get(field)
+        for field, declared_type, mandatory, spellings in struct_fields(struct):
+            accepted |= set(spellings)
+            entry = documented.get(documented_as(spellings, documented))
             if entry is None:
                 found.append(
                     where % field
@@ -579,8 +604,7 @@ def query_struct_findings(
                 )
     owners = " or ".join(name for name, _ in queries)
     for key in documented.keys() - accepted:
-        if key is not None:
-            found.append(where % key + " is documented but %s does not accept it" % owners)
+        found.append(where % key + " is documented but %s does not accept it" % owners)
     return found
 
 
@@ -683,6 +707,7 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
     unresolved: list[str] = []
     typed_query: list[str] = []
     missing = "  %s %s: cannot find struct %s"
+    unread = "  %s %s: cannot read `%s` in %s"
     for method, path, handler in routes:
         params = handler_parameters(source, handler)
         route = by_route.get((method, path))
@@ -694,6 +719,8 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
             struct = find_struct(name)
             if struct is None:
                 unresolved.append(missing % (method, path, name))
+            elif unreadable_serde(struct):
+                unresolved += [unread % (method, path, a, name) for a in unreadable_serde(struct)]
             else:
                 queries.append((name, struct))
         if len(re.findall(r"\bQuery<", params)) > len(QUERY_EXTRACTOR.findall(params)):
@@ -747,19 +774,22 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
             if struct is None:
                 unresolved.append(missing % (method, path, name))
                 continue
-            for field in (mandatory_fields(struct) if mandatory else []):
-                if declared.get(field) is not True:
+            if unreadable_serde(struct):
+                unresolved += [unread % (method, path, a, name) for a in unreadable_serde(struct)]
+                continue
+            for spellings in mandatory_fields(struct) if mandatory else []:
+                if declared.get(documented_as(spellings, declared)) is not True:
                     body_findings.append(
                         "  %s %s: `%s` is mandatory in %s but the contract does not "
-                        "mark it required" % (method, path, field, name)
+                        "mark it required" % (method, path, spellings[0], name)
                     )
             # An empty field list is a free-form body, documented by prose.
             if declared:
-                for field in accepted_fields(struct):
-                    if field not in declared:
+                for spellings in accepted_fields(struct):
+                    if documented_as(spellings, declared) is None:
                         undocumented.append(
                             "  %s %s: `%s` is accepted by %s but the contract does "
-                            "not document it" % (method, path, field, name)
+                            "not document it" % (method, path, spellings[0], name)
                         )
 
     return {
@@ -1120,6 +1150,11 @@ pub fn harvest_api_router() -> Router {
         .route("/e/mapped", post(e_mapped))
         .route("/e/collide", post(collide))
         .route("/e/braced", post(e_braced))
+        .route("/e/negated-if", post(e_negated_if))
+        .route("/e/renamed", get(e_renamed))
+        .route("/e/aliased", get(e_aliased))
+        .route("/e/renamed-all", get(e_renamed_all))
+        .route("/e/flattened", post(e_flattened))
 }
 
 async fn e_wrapped(body: Bytes) -> Response {
@@ -1242,6 +1277,51 @@ async fn e_braced(
     body: Bytes,
 ) -> Response {
     StatusCode::GONE.into_response()
+}
+
+async fn e_negated_if(body: Bytes) -> Response {
+    if !body.is_empty() {
+        tracing::debug!("a body arrived");
+    }
+    let widget = serde_json::from_slice::<Gadget>(&body).ok();
+    StatusCode::OK.into_response()
+}
+
+async fn e_renamed(Query(query): Query<Renamed>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn e_aliased(Query(query): Query<Aliased>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn e_renamed_all(Query(query): Query<RenamedAll>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn e_flattened(Json(body): Json<Flattened>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+struct Renamed {
+    #[serde(rename = "wire_name")]
+    rust_name: Option<String>,
+}
+
+struct Aliased {
+    #[serde(default, alias = "kind")]
+    task_type: Option<String>,
+}
+
+#[serde(rename_all = "camelCase")]
+struct RenamedAll {
+    page_size: Option<u32>,
+}
+
+struct Flattened {
+    name: String,
+    #[serde(flatten)]
+    extra: Gadget,
 }
 
 struct Gadget {
@@ -1740,6 +1820,53 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
         FIXTURE_EDGES,
         [fixture_route("POST", "/e/braced", 200)],
         {"statuses": ["POST /e/braced returns 410, undeclared"]},
+    ),
+    (
+        "a negated is_empty test that does not wrap the parse is no guard",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST", "/e/negated-if", 200, request_body=body_of(("name", True), required=False)
+            )
+        ],
+        {"body_required": ["POST /e/negated-if: the body is mandatory"]},
+    ),
+    (
+        "a serde rename sets the wire name",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "GET", "/e/renamed", 200, params=[query_param("rust_name", "string", False)]
+            )
+        ],
+        {
+            "query_params": [
+                "GET /e/renamed: `wire_name` is accepted by Renamed",
+                "GET /e/renamed: `rust_name` is documented but Renamed does not accept it",
+            ]
+        },
+    ),
+    (
+        "a serde alias may be the documented name",
+        FIXTURE_EDGES,
+        [fixture_route("GET", "/e/aliased", 200, params=[query_param("kind", "string", False)])],
+        {},
+    ),
+    (
+        "rename_all and flatten are reported, not guessed",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "GET", "/e/renamed-all", 200, params=[query_param("page_size", "integer", False)]
+            ),
+            fixture_route("POST", "/e/flattened", 200, request_body=body_of(("name", True))),
+        ],
+        {
+            "unresolved": [
+                "GET /e/renamed-all: cannot read `rename_all` in RenamedAll",
+                "POST /e/flattened: cannot read `flatten` in Flattened",
+            ]
+        },
     ),
     (
         "a malformed contract entry does not crash the audit",
