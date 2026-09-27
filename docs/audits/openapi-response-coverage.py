@@ -583,7 +583,9 @@ def guards(block: str, position: int, variable: str) -> bool:
             end = branch + len(balanced(block[branch:], "{", "}"))
         if test.group(1) and test.end() < position < taken_end:
             return True
-        if not test.group(1) and taken_end < position < end:
+        # The `else` of `if body.is_empty()` is a guard only when the empty-body
+        # arm itself lets the request through.
+        if not test.group(1) and taken_end < position < end and not rejecting_exit(taken):
             return True
         # An early return counts only for a parse after the whole `if`. A
         # parse inside the empty-body arm runs before that return.
@@ -600,8 +602,8 @@ def rejects_result_body(params: str, block: str) -> bool:
     The body is mandatory when a method chain on it ends in `?`, or reaches
     `.unwrap()` or `.expect(..)`, before any call that turns the error into a
     value. It is also mandatory when any top-level `Err` arm of a `match` on it
-    rejects, or when the `else` of a `let Ok(..) = body else` rejects, as
-    `rejecting_exit` reads it. An `Err` arm that
+    rejects, or when the `else` of a `let Ok(..) = body else` or an
+    `if let Ok(..) = body` rejects, as `rejecting_exit` reads it. An `Err` arm that
     hands the request on, for example to replay a committed key, leaves it
     optional.
     """
@@ -622,6 +624,13 @@ def rejects_result_body(params: str, block: str) -> bool:
         otherwise = balanced(block[binding.end() - 1 :], "{", "}")
         if rejecting_exit(otherwise):
             return True
+    for tested in re.finditer(r"\bif\s+let\s+Ok\s*\(.*?\)\s*=\s*%s\s*\{" % variable, block):
+        taken = balanced(block[tested.end() - 1 :], "{", "}")
+        rest = block[tested.end() - 1 + len(taken) :]
+        if re.match(r"\s*else\s*\{", rest):
+            otherwise = balanced(rest[rest.index("{") :], "{", "}")
+            if rejecting_exit(otherwise):
+                return True
     return False
 
 
@@ -1542,6 +1551,8 @@ pub fn harvest_api_router() -> Router {
         .route("/e/compared-guard", post(e_compared_guard))
         .route("/e/let-else-ok", post(e_let_else_ok))
         .route("/e/if-let-else-ok", post(e_if_let_else_ok))
+        .route("/e/empty-arm-rejects", post(e_empty_arm_rejects))
+        .route("/e/if-let-json", post(e_if_let_json))
 }
 
 async fn e_wrapped(body: Bytes) -> Response {
@@ -2049,6 +2060,24 @@ async fn e_if_let_else_ok(body: Bytes) -> Result<Response, Response> {
         tracing::debug!(name = %gadget.name, "parsed");
     } else {
         return Ok(StatusCode::NO_CONTENT.into_response());
+    }
+    Ok(StatusCode::OK.into_response())
+}
+
+async fn e_empty_arm_rejects(body: Bytes) -> Result<Response, Response> {
+    let gadget = if body.is_empty() {
+        return Err(reject());
+    } else {
+        serde_json::from_slice::<Gadget>(&body).map_err(reject)?
+    };
+    Ok(StatusCode::OK.into_response())
+}
+
+async fn e_if_let_json(body: Result<Json<Gadget>, JsonRejection>) -> Result<Response, Response> {
+    if let Ok(Json(gadget)) = body {
+        tracing::debug!(name = %gadget.name, "parsed");
+    } else {
+        return Err(reject());
     }
     Ok(StatusCode::OK.into_response())
 }
@@ -3125,6 +3154,29 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             for path in ("/e/let-else-ok", "/e/if-let-else-ok")
         ],
         {},
+    ),
+    (
+        "an else arm is no guard when the empty-body arm rejects",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/empty-arm-rejects",
+                200,
+                request_body=body_of(("name", True), required=False),
+            )
+        ],
+        {"body_required": ["POST /e/empty-arm-rejects: the body is mandatory"]},
+    ),
+    (
+        "an if let Ok(Json(..)) whose else rejects makes the body mandatory",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST", "/e/if-let-json", 200, request_body=body_of(("name", True), required=False)
+            )
+        ],
+        {"body_required": ["POST /e/if-let-json: the body is mandatory"]},
     ),
     (
         "a malformed contract entry does not crash the audit",
