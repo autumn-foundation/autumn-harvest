@@ -587,10 +587,11 @@ def guards(block: str, position: int, variable: str) -> bool:
 def rejects_result_body(params: str, block: str) -> bool:
     """Whether a `Result<Json<T>, _>` body is mandatory, since its error rejects.
 
-    The body is mandatory when the handler applies `?`, `.map_err(..)?`,
-    `.unwrap()` or `.expect(..)` to it,
-    when the `Err` arm of a `match` on it builds an error, or when the `else`
-    of a `let Ok(..) = body else` builds an error or returns. An `Err` arm that
+    The body is mandatory when a method chain on it ends in `?`, or reaches
+    `.unwrap()` or `.expect(..)`, before any call that turns the error into a
+    value. It is also mandatory when any top-level `Err` arm of a `match` on it
+    rejects, or when the `else` of a `let Ok(..) = body else` builds an error
+    or returns. An `Err` arm that
     hands the request on, for example to replay a committed key, leaves it
     optional.
     """
@@ -598,18 +599,15 @@ def rejects_result_body(params: str, block: str) -> bool:
     if found is None:
         return False
     variable = re.escape(found.group(1))
-    if re.search(r"\b%s\s*(?:\?|\.\s*(?:unwrap|expect)\s*\()" % variable, block):
-        return True
-    for mapped in re.finditer(r"\b%s\s*\.map_err\s*\(" % variable, block):
-        arguments = balanced(block[mapped.end() - 1 :])
-        if block[mapped.end() - 1 + len(arguments) :].lstrip().startswith("?"):
+    for use in re.finditer(r"(?<![.\w])%s\b" % variable, block):
+        if chain_rejects(block[use.end() :]):
             return True
     scrutinee = r"\bmatch\s+&?\s*%s(?:\s*\.\s*as_ref\s*\(\s*\))?\s*\{" % variable
     for match in re.finditer(scrutinee, block):
         arms = balanced(block[match.end() - 1 :], "{", "}")
-        failure = top_level_err(arms)
-        if failure and rejecting_arm(match_arm(arms, failure.start()), failure.group(1)):
-            return True
+        for failure in top_level_errs(arms):
+            if rejecting_arm(match_arm(arms, failure.start()), failure.group(1)):
+                return True
     for binding in re.finditer(r"\blet\s+Ok\s*\(.*?\)\s*=\s*%s\s+else\s*\{" % variable, block):
         otherwise = balanced(block[binding.end() - 1 :], "{", "}")
         if re.search(r"\breturn\b|" + ERROR_TOKENS, otherwise):
@@ -635,12 +633,14 @@ def rejecting_arm(arm: str, bound: str | None) -> bool:
     return re.search(returned + "|" + converted, arm) is not None
 
 
-def top_level_err(arms: str) -> re.Match | None:
-    """The `Err(..)` pattern that starts an arm of this `match`, not a nested one.
+def top_level_errs(arms: str) -> list[re.Match]:
+    """Each `Err(..)` pattern that starts an arm of this `match`, not a nested one.
 
     `arms` includes the outer braces, so an arm pattern sits at depth 1 and
-    follows `{`, `,` or `}`.
+    follows `{`, `,` or `}`. A guarded `Err(e) if ..` arm can fall through to
+    a later `Err` arm, so every one is returned.
     """
+    found: list[re.Match] = []
     depth = 0
     for index, char in enumerate(arms):
         if char in "([{":
@@ -648,10 +648,37 @@ def top_level_err(arms: str) -> re.Match | None:
         elif char in ")]}":
             depth -= 1
         elif depth == 1 and char == "E":
-            found = re.compile(r"Err\s*\(\s*([a-z_][a-z_0-9]*)?").match(arms, index)
-            if found and arms[:index].rstrip()[-1:] in ("{", ",", "}", "|"):
-                return found
-    return None
+            pattern = re.compile(r"Err\s*\(\s*([a-z_][a-z_0-9]*)?").match(arms, index)
+            if pattern and arms[:index].rstrip()[-1:] in ("{", ",", "}", "|"):
+                found.append(pattern)
+    return found
+
+
+# Methods that turn a `Result` error into a value, so the chain goes on.
+TOLERANT_METHODS = frozenset({"ok", "unwrap_or", "unwrap_or_default", "unwrap_or_else"})
+
+
+def chain_rejects(after: str) -> bool:
+    """Whether a method chain on a `Result` stops the handler on its error.
+
+    It does when it reaches `.unwrap()`, `.expect(..)` or a `?` before any call
+    in `TOLERANT_METHODS`. Other methods, such as `.map(..)`, `.and_then(..)`
+    and `.map_err(..)`, carry the error on.
+    """
+    rest = after
+    while True:
+        rest = rest.lstrip()
+        if rest.startswith("?"):
+            return True
+        call = re.match(r"\.\s*([a-z_][a-z_0-9]*)\s*\(", rest)
+        if call is None:
+            return False
+        if call.group(1) in ("unwrap", "expect"):
+            return True
+        if call.group(1) in TOLERANT_METHODS:
+            return False
+        opener = call.end() - 1
+        rest = rest[opener + len(balanced(rest[opener:])) :]
 
 
 def match_arm(arms: str, start: int) -> str:
@@ -1440,6 +1467,9 @@ pub fn harvest_api_router() -> Router {
         .route("/e/split-calls", post(e_split_calls))
         .route("/e/lifetime", post(e_lifetime))
         .route("/e/conditional-return", post(e_conditional_return))
+        .route("/e/second-err", post(e_second_err))
+        .route("/e/combinator", post(e_combinator))
+        .route("/e/tolerant-chain", post(e_tolerant_chain))
 }
 
 async fn e_wrapped(body: Bytes) -> Response {
@@ -1852,6 +1882,25 @@ async fn e_conditional_return(body: Bytes) -> Result<Response, Response> {
     }
     let gadget = serde_json::from_slice::<Gadget>(&body).map_err(reject)?;
     Ok(StatusCode::OK.into_response())
+}
+
+async fn e_second_err(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    let gadget = match body {
+        Ok(Json(gadget)) => gadget,
+        Err(e) if replayable(&e) => return replay_committed(e).await,
+        Err(e) => return e.into_response(),
+    };
+    StatusCode::OK.into_response()
+}
+
+async fn e_combinator(body: Result<Json<Gadget>, JsonRejection>) -> Result<Response, Response> {
+    let name = body.map(|Json(gadget)| gadget.name).map_err(reject)?;
+    Ok(StatusCode::OK.into_response())
+}
+
+async fn e_tolerant_chain(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    let name = body.map(|Json(gadget)| gadget.name).ok();
+    StatusCode::OK.into_response()
 }
 
 async fn e_documented(Query(query): Query<Documented>) -> Response {
@@ -2806,6 +2855,32 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             )
         ],
         {"body_required": ["POST /e/conditional-return: the body is mandatory"]},
+    ),
+    (
+        "every top-level Err arm is read",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST", "/e/second-err", 200, request_body=body_of(("name", True), required=False)
+            )
+        ],
+        {"body_required": ["POST /e/second-err: the body is mandatory"]},
+    ),
+    (
+        "a combinator chain ending in ? rejects, one ending in ok does not",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST", "/e/combinator", 200, request_body=body_of(("name", True), required=False)
+            ),
+            fixture_route(
+                "POST",
+                "/e/tolerant-chain",
+                200,
+                request_body=body_of(("name", False), required=False),
+            ),
+        ],
+        {"body_required": ["POST /e/combinator: the body is mandatory"]},
     ),
     (
         "a malformed contract entry does not crash the audit",
