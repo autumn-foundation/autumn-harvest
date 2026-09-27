@@ -43,10 +43,12 @@ expression, since a `.map(..)` after it yields another type. A `Value` body is
 free-form, so checks 2 and 3 skip it. Check 5 still reads it.
 
 Check 5 treats a bare `Json<T>` as mandatory, since axum rejects a request
-without it. A raw-byte parse is mandatory unless an `if` on `.is_empty()` lets
-an empty body skip it. The parse must be in the arm that runs for a non-empty
-body. An earlier `if body.is_empty() { .. }` also counts when its block
-returns `Ok(..)` and no error. A parse that turns its error into a value is
+without it. A `Result<Json<T>, _>` is mandatory when the handler rejects its
+error, through `?`, `.map_err(..)` or an `Err` arm that builds an error. A
+raw-byte parse is mandatory unless an `if` on `.is_empty()` lets an empty body
+skip it. The parse must be in the arm that runs for a non-empty body. An
+earlier `if body.is_empty() { .. }` also counts when its block returns `Ok(..)`
+and no error. A parse that turns its error into a value is
 optional too, such as `.ok()`, `.unwrap_or_default()` or an `if let Ok(..)`
 whose `else` does not reject. Check 2 applies only to a mandatory body.
 
@@ -259,10 +261,19 @@ def defined_structs() -> dict[str, str]:
 
 
 def struct_text(source: str, found: re.Match) -> str:
-    """The attribute lines above a struct match, then its block."""
+    """The attribute lines above a struct match, then its block.
+
+    An attribute that rustfmt splits over several lines is read up to its
+    opening `#[`, since its closing `)]` line alone does not start with `#[`.
+    """
     lines = source[: found.start()].split("\n")[:-1]
     attributes: list[str] = []
-    while lines and lines[-1].strip().startswith(("#[", "//")):
+    depth = 0
+    while lines:
+        text = lines[-1].strip()
+        if depth == 0 and not (text.startswith(("#[", "//")) or text.endswith("]")):
+            break
+        depth += text.count("]") - text.count("[")
         attributes.insert(0, lines.pop().strip())
     block = balanced(source[found.end() - 1 :], "{", "}")
     return "\n".join(attributes + [block])
@@ -511,6 +522,28 @@ def guards(block: str, position: int, variable: str) -> bool:
             return True
         early_return = re.search(r"\breturn\s+Ok\(", taken)
         if not test.group(1) and early_return and not re.search(ERROR_TOKENS, taken):
+            return True
+    return False
+
+
+def rejects_result_body(params: str, block: str) -> bool:
+    """Whether a `Result<Json<T>, _>` body is mandatory, since its error rejects.
+
+    The body is mandatory when the handler applies `?` or `.map_err(..)` to it,
+    or when the `Err` arm of a `match` on it builds an error. An `Err` arm that
+    hands the request on, for example to replay a committed key, leaves it
+    optional.
+    """
+    found = re.search(r"\b([a-z_][a-z_0-9]*)\s*:\s*Result<\s*%s<" % JSON, params)
+    if found is None:
+        return False
+    variable = re.escape(found.group(1))
+    if re.search(r"\b%s\s*(?:\?|\.map_err\s*\()" % variable, block):
+        return True
+    for match in re.finditer(r"\bmatch\s+%s\s*\{" % variable, block):
+        arms = balanced(block[match.end() - 1 :], "{", "}")
+        failure = arms.find("Err(")
+        if failure >= 0 and re.search(ERROR_TOKENS, arms[failure + len("Err(") :]):
             return True
     return False
 
@@ -793,9 +826,10 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
         if queries:
             typed_query += query_struct_findings(method, path, route, queries)
 
-        # A bare `Json<T>` means the body is mandatory; `Result<Json<T>, _>` and
-        # `Option<Json<T>>` leave that to the handler. All three still name the
-        # struct whose fields serde accepts, which is what check 3 needs.
+        # A bare `Json<T>` means the body is mandatory. `Result<Json<T>, _>` is
+        # mandatory when its error rejects. `Option<Json<T>>` is optional. All
+        # three still name the struct whose fields serde accepts, which is what
+        # check 3 needs.
         bare = re.search(
             r"%s\(\s*[a-z_0-9]+\s*\)\s*:\s*%s<\s*([A-Za-z0-9_:]+)\s*>" % (JSON, JSON), params
         )
@@ -809,9 +843,10 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
         # (struct name, whether the body is mandatory) for each parse.
         parses: list[tuple[str, bool]] = []
         body_type = extractor.group(1).split("::")[-1] if extractor else None
+        result_rejects = rejects_result_body(params, handler_body(source, handler) or "")
         if body_type is not None and body_type != "Value":
-            parses.append((body_type, bool(bare)))
-        mandatory_body = bool(bare)
+            parses.append((body_type, bool(bare) or result_rejects))
+        mandatory_body = bool(bare) or result_rejects
         if byte_parameters(params):
             for name, guarded in raw_body_parses(source, handler):
                 # An unguarded parse makes the body mandatory, whatever its type.
@@ -1229,6 +1264,10 @@ pub fn harvest_api_router() -> Router {
         .route("/e/two-carriers", post(e_two_carriers))
         .route("/e/if-let-reject", post(e_if_let_reject))
         .route("/e/forwarded", post(e_forwarded))
+        .route("/e/result-reject", post(e_result_reject))
+        .route("/e/result-replay", post(e_result_replay))
+        .route("/e/split-container", get(e_split_container))
+        .route("/e/split-default", get(e_split_default))
 }
 
 async fn e_wrapped(body: Bytes) -> Response {
@@ -1440,6 +1479,49 @@ async fn e_if_let_reject(body: Bytes) -> Response {
         return Err(reject());
     }
     StatusCode::OK.into_response()
+}
+
+async fn e_result_reject(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    let gadget = match body {
+        Ok(Json(gadget)) => gadget,
+        Err(rejection) => {
+            return AutumnError::bad_request_msg(rejection.body_text()).into_response();
+        }
+    };
+    StatusCode::OK.into_response()
+}
+
+async fn e_result_replay(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    let gadget = match body {
+        Ok(Json(gadget)) => gadget,
+        Err(rejection) => return replay_committed(rejection).await,
+    };
+    StatusCode::OK.into_response()
+}
+
+async fn e_split_container(Query(query): Query<SplitContainer>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn e_split_default(Query(query): Query<SplitDefault>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(
+    default,
+    rename_all = "camelCase",
+)]
+struct SplitContainer {
+    page_size: u32,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(
+    default,
+)]
+struct SplitDefault {
+    kind: String,
 }
 
 async fn e_wrapped_attribute(Query(query): Query<WrappedAttribute>) -> Response {
@@ -2088,6 +2170,42 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             )
         ],
         {"body_required": ["POST /e/if-let-reject: the body is mandatory"]},
+    ),
+    (
+        "a Result<Json<T>> body whose Err arm rejects is mandatory",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/result-reject",
+                200,
+                request_body=body_of(("name", False), required=False),
+                error_responses=[{"status": 400}],
+            ),
+            fixture_route(
+                "POST",
+                "/e/result-replay",
+                200,
+                request_body=body_of(("name", False), required=False),
+            ),
+        ],
+        {
+            "body_required": ["POST /e/result-reject: the body is mandatory"],
+            "mandatory": ["POST /e/result-reject: `name` is mandatory in Gadget"],
+        },
+    ),
+    (
+        "a container attribute over several lines is read",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "GET", "/e/split-container", 200, params=[query_param("page_size", "integer", True)]
+            ),
+            fixture_route(
+                "GET", "/e/split-default", 200, params=[query_param("kind", "string", False)]
+            ),
+        ],
+        {"unresolved": ["GET /e/split-container: cannot read `rename_all` in SplitContainer"]},
     ),
     (
         "a malformed contract entry does not crash the audit",
