@@ -48,17 +48,17 @@ free-form, so checks 2 and 3 skip it. Check 5 still reads it.
 Check 5 treats a bare `Json<T>` as mandatory, since axum rejects a request
 without it. A `Result<Json<T>, _>` is mandatory when the handler rejects its
 error, through `?`, `.map_err(..)?`, or an `Err` arm that builds an error or
-returns the rejection it binds. A
-raw-byte parse is mandatory unless an `if` on `.is_empty()` lets an empty body
-skip it. The parse must be in the arm that runs for a non-empty body. An
-earlier `if body.is_empty() { .. }` also counts when its block returns `Ok(..)`
-and no error. A `return` inside a nested closure, fn or async block does not
-count, since it leaves only that scope. A parse that turns its error into a
-value is optional too, such as `.ok()`, `.unwrap_or_default()` or an
-`if let Ok(..)` whose `else` does not reject. A guard or a tolerant call at a helper call site
-carries into the helper. Check 2 applies to every parse that does not tolerate
-its error, since a body that is present must then carry the mandatory fields.
-A bare `Json<T>` and a rejecting `Result<Json<T>, _>` are such parses.
+returns the rejection it binds. A raw-byte parse is mandatory unless an `if` on
+`.is_empty()` lets an empty body skip it. The parse must be in the arm that runs
+for a non-empty body. An earlier `if body.is_empty() { .. }` also counts when
+its block returns `Ok(..)` and no error. A `return` inside a nested closure, fn
+or async block does not count, since it leaves only that scope. A parse that
+turns its error into a value is optional too, such as `.ok()`,
+`.unwrap_or_default()` or an `if let Ok(..)` whose `else` does not reject. A
+guard or a tolerant call at a helper call site carries into the helper. Check 2
+applies to every parse that does not tolerate its error, since a body that is
+present must then carry the mandatory fields. A bare `Json<T>` and a rejecting
+`Result<Json<T>, _>` are such parses.
 
 Check 4 reads the routes that take a `RawQuery` and parse the pairs by hand. A
 key those parsers match is a parameter the route accepts, so a key the contract
@@ -84,10 +84,10 @@ helper it shares.
 
 Check 6 compares every `Query<T>` struct of a route with its `in: query`
 parameters. An `Option<Query<T>>` makes every field optional, since an absent
-query string yields `None`. `WIRE_TYPES` gives the OpenAPI type of a field
-after the audit removes one `Option`. A field is optional when it is an `Option` or has a serde
-default, on the field or on the struct. By default, serde ignores an unknown
-query key, so a documented key that no struct has is a finding.
+query string yields `None`. `WIRE_TYPES` gives the OpenAPI type of a field after
+the audit removes one `Option`. A field is optional when it is an `Option` or
+has a serde default, on the field or on the struct. By default, serde ignores an
+unknown query key, so a documented key that no struct has is a finding.
 
 The audit reads the serde attributes `default`, `skip`, `skip_deserializing`,
 `rename = ".."` and `alias = ".."`. A field is documented when the contract
@@ -581,8 +581,11 @@ def guards(block: str, position: int, variable: str) -> bool:
             return True
         if not test.group(1) and taken_end < position < end:
             return True
+        # An early return counts only for a parse after the whole `if`. A
+        # parse inside the empty-body arm runs before that return.
         early_return = re.search(r"\breturn\s+Ok\(", outer_scope(taken))
-        if not test.group(1) and early_return and not re.search(ERROR_TOKENS, taken):
+        after_if = position >= end
+        if not test.group(1) and after_if and early_return and not re.search(ERROR_TOKENS, taken):
             return True
     return False
 
@@ -607,7 +610,8 @@ def rejects_result_body(params: str, block: str) -> bool:
         arguments = balanced(block[mapped.end() - 1 :])
         if block[mapped.end() - 1 + len(arguments) :].lstrip().startswith("?"):
             return True
-    for match in re.finditer(r"\bmatch\s+%s\s*\{" % variable, block):
+    scrutinee = r"\bmatch\s+&?\s*%s(?:\s*\.\s*as_ref\s*\(\s*\))?\s*\{" % variable
+    for match in re.finditer(scrutinee, block):
         arms = balanced(block[match.end() - 1 :], "{", "}")
         failure = re.search(r"\bErr\s*\(\s*([a-z_][a-z_0-9]*)?", arms)
         if failure and rejecting_arm(match_arm(arms, failure.start()), failure.group(1)):
@@ -1422,6 +1426,8 @@ pub fn harvest_api_router() -> Router {
         .route("/e/closure-return", post(e_closure_return))
         .route("/e/optional-strict-query", get(e_optional_strict_query))
         .route("/e/unwrapped", post(e_unwrapped))
+        .route("/e/borrowed-match", post(e_borrowed_match))
+        .route("/e/parse-then-return", post(e_parse_then_return))
 }
 
 async fn e_wrapped(body: Bytes) -> Response {
@@ -1774,6 +1780,22 @@ struct StrictQuery {
 async fn e_unwrapped(body: Result<Json<Gadget>, JsonRejection>) -> Response {
     let Json(gadget) = body.expect("a valid body");
     StatusCode::OK.into_response()
+}
+
+async fn e_borrowed_match(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    match &body {
+        Ok(_) => {}
+        Err(_) => return AutumnError::bad_request_msg("invalid body").into_response(),
+    }
+    StatusCode::OK.into_response()
+}
+
+async fn e_parse_then_return(body: Bytes) -> Result<Response, Response> {
+    if body.is_empty() {
+        let gadget = serde_json::from_slice::<Gadget>(&body).map_err(reject)?;
+        return Ok(StatusCode::OK.into_response());
+    }
+    Ok(StatusCode::OK.into_response())
 }
 
 async fn e_documented(Query(query): Query<Documented>) -> Response {
@@ -2655,6 +2677,33 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             )
         ],
         {"body_required": ["POST /e/unwrapped: the body is mandatory"]},
+    ),
+    (
+        "a borrowed match on a Result<Json<T>> body is read",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/borrowed-match",
+                200,
+                request_body=body_of(("name", True), required=False),
+                error_responses=[{"status": 400}],
+            )
+        ],
+        {"body_required": ["POST /e/borrowed-match: the body is mandatory"]},
+    ),
+    (
+        "an early return after the parse is no guard",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/parse-then-return",
+                200,
+                request_body=body_of(("name", True), required=False),
+            )
+        ],
+        {"body_required": ["POST /e/parse-then-return: the body is mandatory"]},
     ),
     (
         "a malformed contract entry does not crash the audit",
