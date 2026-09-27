@@ -569,6 +569,96 @@ def use_bindings(code: str) -> dict[str, list[tuple[tuple[int, int], str, int]]]
     return found
 
 
+@functools.lru_cache(maxsize=None)
+def glob_imports(code: str) -> list[tuple[tuple[int, int], str, int]]:
+    """`(scope, module path, position)` for each glob `use` leaf in `code`.
+
+    Both the extractor scan in `glob_unknowns` and `resolve_symbol` read
+    globs through this one step.
+    """
+    found = []
+    for use in re.finditer(r"\buse\b[^;]*;", code):
+        scope = alias_scope(code, use.start())
+        for path, _ in use_leaves(use.group(0)):
+            if path.endswith("::*"):
+                found.append((scope, path[:-3], use.start()))
+    return found
+
+
+def glob_candidates(found: list, site: Site, origin: str) -> list | None:
+    """The candidates for a bare name that the glob imports at `site` leave.
+
+    A definition in the site's own module wins over any glob, as in Rust.
+    A trusted glob, one of `TRUSTED_GLOBS`, brings no request type. A glob
+    of a scanned module, such as `super::*`, brings that module's items. Any
+    other glob may bind the name, so the result is `None` and the caller
+    fails closed. An empty list means no glob decides, so the name follows
+    its bare rule. A name that no scanned item has is left to that rule
+    too, since a glob can then bring only an item the audit cannot read.
+    """
+    text, at = site
+    if at is None or not found:
+        return []
+    covering = [
+        glob_module(text, path, used_at)
+        for (start, end), path, used_at in glob_imports(text)
+        if start <= at < end
+    ]
+    covering = [module for module in covering if module != TRUSTED]
+    if not covering:
+        return []
+    own = [item for item in found if item[0] == origin]
+    if own:
+        return own
+    if None in covering:
+        return None
+    return [item for item in found if item[0] in covering]
+
+
+# What `glob_module` gives for a glob that brings nothing the audit reads.
+TRUSTED = "trusted"
+
+
+def glob_module(text: str, path: str, used_at: int) -> str | None:
+    """What a glob `use path::*` at `used_at` brings: `TRUSTED`, a module place, or `None`.
+
+    A glob of `TRUSTED_GLOBS` is `TRUSTED`. A glob of a module the audit
+    scans, such as `super::*` or `crate::x::*`, is that module's place, so
+    its items resolve through it. Any other glob is `None`: it may bring
+    any name, so a bare name it covers fails closed. This is the one glob
+    rule, for extractor names and for every kind of symbol.
+    """
+    if path in TRUSTED_GLOBS:
+        return TRUSTED
+    origin = site_origin((text, used_at))
+    module = absolute_path(path_segments(path), origin)
+    if module is None:
+        return None
+    place = "::".join([origin.split("::")[0] if module[0] == "crate" else module[0], *module[1:]])
+    return place if place in known_modules() else None
+
+
+def module_binds(code: str, place: str, name: str) -> bool:
+    """Whether the module at `place` defines or imports `name`, as a glob of it brings.
+
+    A struct or a type alias there counts. So does a local item or a `use`
+    of that name inside an inline `mod` block of `code`.
+    """
+    if any(found == place for found, _ in struct_candidates().get(name, [])):
+        return True
+    if any(alias[0] == place for alias in TYPE_ALIASES[0].get(name, [])):
+        return True
+    for start, end, _ in block_owners(code, "mod"):
+        if site_origin((code, start + 1)) != place:
+            continue
+        block = code[start:end]
+        if re.search(r"\b(?:struct|enum|trait|union|type|fn)\s+%s\b" % re.escape(name), block):
+            return True
+        if any(scope[0] == start for scope, _, _ in use_bindings(code).get(name, [])):
+            return True
+    return False
+
+
 def std_path(reference: str, site: Site) -> bool:
     """Whether `reference` names a standard library item, through any import."""
     segments = path_segments(reference)
@@ -597,6 +687,10 @@ def resolve_symbol(kind: str, reference: str, site: Site | None = None) -> list 
 
     `Self::` keeps the methods of the `impl` or `trait` block that holds the
     site. Outside such a block it keeps any method.
+
+    A bare name with no import then goes through the glob imports in scope,
+    as `glob_candidates` reads them. A glob that may bind the name makes it
+    `None`, unless the site's own module defines it.
 
     A bare name with no import follows the visibility rule of its kind. A
     fn must be in the site's module or an ancestor, or be public. A struct
@@ -633,8 +727,13 @@ def resolve_symbol(kind: str, reference: str, site: Site | None = None) -> list 
             typed = enclosing_owner(site) or typed
         found = [item for item in found if (item[2] is None) == (typed is None)]
         found = [item for item in found if typed in (None, "Self", item[2])]
+    globbed = glob_candidates(found, site, origin) if bare else False
+    if globbed is None:
+        return None
     if not bare:
         found = [item for item in found if qualified_match(qualifier, item[0], origin)]
+    elif globbed:
+        found = globbed
     elif kind == "fn":
         found = [
             item
@@ -853,9 +952,9 @@ def struct_layout(
     through this one parse.
     """
     original = struct
-    struct = canonical_paths(code_only(struct, literals=False))
+    struct = code_only(struct, literals=False)
     opener = struct.index("{")
-    container = serde_items(without_comment_lines(struct[:opener]))
+    container = serde_items(canonical_paths(without_comment_lines(struct[:opener])))
     fields: list[tuple[str, str, list[SerdeItem], str | None]] = []
     attributes: list[str] = []
     open_attribute = open_field = ""
@@ -879,8 +978,12 @@ def struct_layout(
         field = re.match(r"(?:pub(?:\([^)]*\))?\s+)?(?:r#)?([a-z_0-9]+)\s*:\s*(.+?),?$", text)
         if field:
             site = getattr(original, "site", (SOURCE[0], None))
-            resolved, unread = resolve_field_type(prelude_bound(field.group(2), site), site)
-            fields.append((field.group(1), resolved, serde_items(" ".join(attributes)), unread))
+            # A shadowed bare name is bound first. A standard path is then cut
+            # to its bare name, since it always names the real type.
+            written = canonical_paths(prelude_bound(field.group(2), site))
+            resolved, unread = resolve_field_type(written, site)
+            items = serde_items(canonical_paths(" ".join(attributes)))
+            fields.append((field.group(1), resolved, items, unread))
         attributes = []
     return container, fields
 
@@ -2903,16 +3006,47 @@ def declared_statuses(route: dict) -> set[int]:
 # A path through `std` or `core` to `Result` or `Option`, and the type before
 # a variant, such as `std::result::Result::Err`. Only spaces and tabs are
 # matched, so a rename keeps every line.
-PRELUDE_PATH = re.compile(r"(?<![\w:])(?:::[ \t]*)?(?:std|core)[ \t]*::[ \t]*(?:result|option)[ \t]*::[ \t]*")
+# Each standard type the audit reads by name: the crate roots and the module
+# that define it. `canonical_paths` cuts every such path to the bare name.
+STD_TYPES: dict[str, tuple[tuple[str, ...], str]] = {
+    "Option": (("std", "core"), "option"),
+    "Result": (("std", "core"), "result"),
+    "Vec": (("std", "alloc"), "vec"),
+    "String": (("std", "alloc"), "string"),
+    "Box": (("std", "alloc"), "boxed"),
+    **{
+        name: (("std", "core"), "primitive")
+        for name in (
+            "i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize f32 f64 bool char".split()
+        )
+    },
+}
+
+# A standard path to one of `STD_TYPES`, up to its bare name.
+PRELUDE_PATH = re.compile(
+    "|".join(
+        r"(?<![\w:])(?:::[ \t]*)?(?:%s)[ \t]*::[ \t]*%s[ \t]*::[ \t]*(?=%s\b)"
+        % ("|".join(roots), module, "|".join(names))
+        for (roots, module), names in sorted(
+            {
+                (roots, module): [n for n, spec in STD_TYPES.items() if spec == (roots, module)]
+                for roots, module in STD_TYPES.values()
+            }.items()
+        )
+    )
+)
 VARIANT_PATH = re.compile(r"\b(?:Result|Option)[ \t]*::[ \t]*(?=(?:Ok|Err|Some|None)\b)")
 
 
 def canonical_paths(text: str) -> str:
-    """`text` with each qualified path to `Result`, `Option` or a variant cut.
+    """`text` with each standard path to a type in `STD_TYPES`, or a variant, cut.
 
-    `std::option::Option<T>` is `Option<T>`, and `std::result::Result::Err(e)`
-    is `Err(e)`. Every check then reads the short name only, so no check needs
-    its own rule for a path.
+    `std::option::Option<T>` is `Option<T>`, `alloc::vec::Vec<u8>` is
+    `Vec<u8>`, `core::primitive::u32` is `u32`, and
+    `std::result::Result::Err(e)` is `Err(e)`. Every check then reads the
+    short name only, so no check needs its own rule for a path. A standard
+    path always names the real type. Only a bare name can be shadowed, and
+    `alias_declarations` binds those before this cut runs.
     """
     return VARIANT_PATH.sub("", PRELUDE_PATH.sub("", text))
 
@@ -3116,11 +3250,9 @@ PRELUDE_NAMES = ("Option", "Result", "Vec", "String")
 
 # The standard paths of the prelude types. Importing one binds the prelude type.
 PRELUDE_PATHS = frozenset(
-    {
-        "std::option::Option", "core::option::Option", "std::result::Result",
-        "core::result::Result", "std::vec::Vec", "alloc::vec::Vec",
-        "std::string::String", "alloc::string::String",
-    }
+    "%s::%s::%s" % (root, module, name)
+    for name, (roots, module) in STD_TYPES.items()
+    for root in roots
 )
 
 # Glob imports that bring the supported extractors, or nothing that clashes.
@@ -3130,27 +3262,30 @@ TRUSTED_GLOBS = frozenset({"axum", "axum::extract", "axum::body", "bytes", "serd
 def glob_unknowns(code: str) -> list[tuple[int, int, str]]:
     """`(scope start, scope end, name)` for each extractor name a glob may hide.
 
-    A glob import from a module the audit does not trust, such as
-    `use crate::models::*;`, may bring its own `Query`, `Json` or `Bytes`. In
-    its scope, a bare use of such a name cannot be told apart, unless a plain
-    import in the same scope binds it, since a plain import wins over a glob.
+    `glob_module` reads each glob. An untrusted one, such as `use
+    crate::models::*;` for a module the audit does not scan, may bring its
+    own `Query`, `Json` or `Bytes`. A glob of a scanned module brings such a
+    name only when that module binds it, as `module_binds` reads it. In the
+    glob's scope, a bare use of such a name cannot be told apart, unless a
+    plain import in the same scope binds it, since a plain import wins over
+    a glob.
     """
     bound: dict[tuple[int, int], set[str]] = {}
-    globs: list[tuple[tuple[int, int], str]] = []
+    globs = [
+        (scope, glob_module(code, base, used_at)) for scope, base, used_at in glob_imports(code)
+    ]
     for use in re.finditer(r"\buse\b[^;]*;", code):
         scope = alias_scope(code, use.start())
         for path, alias in use_leaves(use.group(0)):
-            if path.endswith("::*"):
-                base = re.sub(r"^autumn_web::reexports::", "", path[:-3])
-                if base not in TRUSTED_GLOBS:
-                    globs.append((scope, base))
-            else:
+            if not path.endswith("::*"):
                 bound.setdefault(scope, set()).add(alias or path.rsplit("::", 1)[-1])
     return [
         (scope[0], scope[1], name)
-        for scope, _ in globs
+        for scope, module in globs
+        if module != TRUSTED
         for name in EXTRACTOR_NAMES
         if name not in bound.get(scope, set())
+        and (module is None or module_binds(code, module, name))
     ]
 
 
@@ -3276,7 +3411,6 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
     # reads `code`. Only the route table and the query keys need literals.
     code = masked_source(source)
     unreadable = unreadable_aliases(code) + [(0, len(code), name) for name in unsettled]
-    globbed = glob_unknowns(code)
     SOURCE[0] = code
     aliases = getattr(find_struct, "aliases", None)
     TYPE_ALIASES[0] = crate_type_aliases() if aliases is None else aliases
@@ -3284,6 +3418,7 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
     LOCAL[:] = getattr(find_struct, "local", ("autumn_harvest_plugin", "api"))
     FILE_PLACES[code] = location(LOCAL[0], LOCAL[1])
     KNOWN_MODULES[0] = None
+    globbed = glob_unknowns(code)
     by_route = {(r["method"], r["path"]): r for r in contract["routes"]}
     routes = router_routes(source)
 
@@ -3966,6 +4101,7 @@ pub fn harvest_api_router() -> Router {
         .route("/s/qualified-target", post(s_qualified_target))
         .route("/s/imported-alias", post(s_imported_alias))
         .route("/s/local-option", get(s_local_option))
+        .route("/s/std-paths", get(s_std_paths))
         .route("/s/imported-option", get(s_imported_option))
         .route("/s/deep-option", get(s_deep_option))
         .route("/s/imported-result", post(s_imported_result))
@@ -3979,10 +4115,22 @@ async fn s_imported_alias(Json(body): Json<consumers::ImportedAliasField>) -> Re
 
 mod local_option {
     struct Option<T>(T);
+    struct String;
 
     struct LocalOptionPage {
         limit: Option<u32>,
     }
+
+    struct StdPathsPage {
+        limit: std::option::Option<core::primitive::u32>,
+        name: std::string::String,
+        label: alloc::string::String,
+        exact: ::core::primitive::bool,
+    }
+}
+
+async fn s_std_paths(Query(page): Query<local_option::StdPathsPage>) -> Response {
+    StatusCode::OK.into_response()
 }
 
 mod imported_option {
@@ -4117,6 +4265,12 @@ pub fn harvest_api_router() -> Router {
         .route("/n/local-module-alias", get(n_local_module_alias))
         .route("/n/external-module-helper", post(n_external_module_helper))
         .route("/n/block-imports", post(n_block_imports))
+        .route("/n/glob-struct", get(n_glob_struct))
+        .route("/n/glob-local", get(n_glob_local))
+        .route("/n/glob-own", get(n_glob_own))
+        .route("/n/glob-alias", post(n_glob_alias))
+        .route("/n/glob-helper", post(n_glob_helper))
+        .route("/n/glob-shadow", post(n_glob_shadow))
         .route("/n/block-module-imports", post(n_block_module_imports))
         .route("/n/typed-reply", get(n_typed_reply))
         .route("/n/unknown-reply", get(n_unknown_reply))
@@ -4259,6 +4413,62 @@ mod helper_alias {
 
     async fn n_external_module_helper(body: Bytes) -> Response {
         helpers::decode_raw(&body)
+    }
+}
+
+mod glob_external {
+    use axum::body::Bytes;
+    use axum::extract::Query;
+    use axum::Json;
+    use other_crate::*;
+
+    async fn n_glob_struct(Query(widget): Query<Widget>) -> Response {
+        StatusCode::OK.into_response()
+    }
+
+    struct GlobAliasField {
+        tags: MaybeTags,
+    }
+
+    async fn n_glob_alias(Json(body): Json<GlobAliasField>) -> Response {
+        StatusCode::OK.into_response()
+    }
+
+    async fn n_glob_helper(body: Bytes) -> Response {
+        decode_raw(&body)
+    }
+}
+
+mod glob_local {
+    use crate::module_b::*;
+
+    async fn n_glob_local(Query(filter): Query<Filter>) -> Response {
+        StatusCode::OK.into_response()
+    }
+}
+
+mod shadow_source {
+    struct Json(Vec<u8>);
+}
+
+mod glob_shadow {
+    use crate::shadow_source::*;
+
+    async fn n_glob_shadow(Json(body): Json<Widget>) -> Response {
+        StatusCode::OK.into_response()
+    }
+}
+
+mod glob_own {
+    use axum::extract::Query;
+    use other_crate::*;
+
+    struct Owned {
+        size: u32,
+    }
+
+    async fn n_glob_own(Query(owned): Query<Owned>) -> Response {
+        StatusCode::OK.into_response()
     }
 }
 
@@ -4466,6 +4676,8 @@ pub fn harvest_api_router() -> Router {
         .route("/e/copied-alias", post(e_copied_alias))
         .route("/e/arm-rebinds", post(e_arm_rebinds))
         .route("/e/into-typed", post(e_into_typed))
+        .route("/e/std-vec-body", post(e_std_vec_body))
+        .route("/e/alloc-vec-body", post(e_alloc_vec_body))
         .route("/e/try-into-typed", post(e_try_into_typed))
         .route("/e/into-untyped", post(e_into_untyped))
         .route("/e/from-path", post(e_from_path))
@@ -4743,6 +4955,16 @@ impl TryFrom<Bytes> for Parcel {
         let gadget = serde_json::from_slice::<Gadget>(&raw).map_err(reject)?;
         Ok(Parcel { name: gadget.name })
     }
+}
+
+async fn e_std_vec_body(body: std::vec::Vec<u8>) -> Response {
+    let gadget = serde_json::from_slice::<Gadget>(&body).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_alloc_vec_body(body: alloc::vec::Vec<u8>) -> Response {
+    let gadget = serde_json::from_slice::<Gadget>(&body).unwrap();
+    StatusCode::OK.into_response()
 }
 
 async fn e_into_typed(body: Bytes) -> Response {
@@ -6811,6 +7033,26 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
         },
     ),
     (
+        "a standard path to Vec<u8> is a body carrier",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST", path, 200, request_body=body_of(("name", False), required=False)
+            )
+            for path in ("/e/std-vec-body", "/e/alloc-vec-body")
+        ],
+        {
+            "body_required": [
+                "POST /e/std-vec-body: the body is mandatory",
+                "POST /e/alloc-vec-body: the body is mandatory",
+            ],
+            "mandatory": [
+                "POST /e/std-vec-body: `name` is mandatory in Gadget",
+                "POST /e/alloc-vec-body: `name` is mandatory in Gadget",
+            ],
+        },
+    ),
+    (
         "a conversion of the body runs its From impl, or fails closed",
         FIXTURE_EDGES,
         [
@@ -8444,6 +8686,32 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
         },
     ),
     (
+        "an untrusted glob fails closed for a bare name, and a local glob brings its items",
+        FIXTURE_NAMES,
+        [
+            fixture_route(
+                "GET", "/n/glob-struct", 200, params=[query_param("size", "integer", True)]
+            ),
+            fixture_route(
+                "GET", "/n/glob-local", 200, params=[query_param("wanted", "integer", False)]
+            ),
+            fixture_route("GET", "/n/glob-own", 200, params=[query_param("size", "integer", True)]),
+            fixture_route("POST", "/n/glob-alias", 200, request_body=body_of(("tags", False))),
+            fixture_route(
+                "POST", "/n/glob-helper", 200, request_body=body_of(("name", True))
+            ),
+            fixture_route("POST", "/n/glob-shadow", 200, request_body=body_of(("size", True))),
+        ],
+        {
+            "unresolved": [
+                "POST /n/glob-shadow: cannot tell which `Json` a glob import brings",
+                "GET /n/glob-struct: cannot find struct Widget",
+                "POST /n/glob-alias: cannot read `MaybeTags` in GlobAliasField",
+                "POST /n/glob-helper: cannot read a `from_slice` call",
+            ],
+        },
+    ),
+    (
         "each call resolves at its own site, so block-scoped imports stay apart",
         FIXTURE_NAMES,
         [
@@ -8608,6 +8876,24 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             ],
             "unresolved": ["POST /s/imported-result: cannot read a `Json<..>` extractor"],
         },
+    ),
+    (
+        "a standard path always names the real type, even where the bare name is shadowed",
+        FIXTURE_ALIAS_SCOPES,
+        [
+            fixture_route(
+                "GET",
+                "/s/std-paths",
+                200,
+                params=[
+                    query_param("limit", "integer", False),
+                    query_param("name", "string", True),
+                    query_param("label", "string", True),
+                    query_param("exact", "boolean", True),
+                ],
+            )
+        ],
+        {},
     ),
     (
         "a field alias resolves through the import at the struct",
