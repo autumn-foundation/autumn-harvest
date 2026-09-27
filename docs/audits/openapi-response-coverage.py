@@ -25,7 +25,8 @@ scan already requires. A constructor passed bare, as in
 `.map_err(AutumnError::bad_request_msg)`, names no call and so cannot chain
 `.with_status(..)`: its status is always the constructor's own.
 
-Checks 2 and 3 resolve each `Json<T>` extractor to its struct. A field is
+Checks 2 and 3 resolve each `Json<T>` extractor to its struct, with or without
+a path such as `axum::Json`. A field is
 mandatory when it is neither an `Option` nor carries a serde default, since axum
 rejects a request that omits one. A field serde accepts but the contract omits
 is missing from the generated client, so an ordinary request cannot be typed.
@@ -33,16 +34,18 @@ is missing from the generated client, so an ordinary request cannot be typed.
 A handler can also take the raw `Bytes` and call `serde_json::from_slice`
 itself. Checks 2, 3 and 5 read that parse when it reads a parameter of type
 `Bytes`, `&[u8]` or `Vec<u8>`. The parse can be in the handler, or in a helper
-one level down that the handler passes the body to. The type comes from a
+one level down that the handler passes the body to. A copy of the body under
+another name, such as `body.to_vec()`, is not read. The type comes from a
 turbofish, then from a typed `let` in the same statement, then from a
-`Result<T, _>` return type. A `Value` body is free-form, so checks 2 and 3
-skip it. Check 5 still reads it.
+`Result<T, _>` return type. The last two apply only when the call ends its
+expression, since a `.map(..)` after it yields another type. A `Value` body is
+free-form, so checks 2 and 3 skip it. Check 5 still reads it.
 
 Check 5 treats a bare `Json<T>` as mandatory, since axum rejects a request
-without it. A raw-byte parse is mandatory unless an `.is_empty()` test lets an
-empty body skip it. `!body.is_empty()` is such a test. So is
-`if body.is_empty() { .. }` when its block returns no error. Check 2 applies
-only to a mandatory body.
+without it. A raw-byte parse is mandatory unless an `if` on `.is_empty()` lets
+an empty body skip it. The parse must be inside that `if` or its `else`. An
+earlier `if body.is_empty() { .. }` also counts when its block returns
+`Ok(..)` and no error. Check 2 applies only to a mandatory body.
 
 Check 4 reads the routes that take a `RawQuery` and parse the pairs by hand. A
 key those parsers match is a parameter the route accepts, so a key the contract
@@ -78,8 +81,11 @@ shows as a finding, not as a silent pass.
 
 Check 7 stops the audit from skipping what it cannot read. These are findings:
 a `from_slice` call it cannot read, a body type it cannot resolve, a
-`Query<..>` extractor it cannot read, and a struct it cannot find. A generic
-struct such as `struct Q<'a>` is one it cannot find.
+`Json<..>` or `Query<..>` extractor it cannot read, and a struct it cannot
+find. A generic struct such as `struct Q<'a>` is one it cannot find.
+
+A handler is found from its `async fn` line, so an earlier fn of the same name
+does not hide it. Comments in a parameter list are removed before any read.
 
 Exit code 1 on any finding. Run standalone, or run the fixtures:
 
@@ -187,13 +193,20 @@ def router_routes(source: str) -> list[tuple[str, str, str]]:
     return routes
 
 
+def handler_parts(source: str, name: str) -> tuple[str, str, str] | None:
+    """The parts of `async fn <name>(..)`, or `None` when it is elsewhere.
+
+    The lookup starts at `async fn`, so an earlier fn of the same name, such
+    as a method, does not hide the handler.
+    """
+    at = source.find("async fn %s(" % name)
+    return None if at < 0 else parts_at(source, at)
+
+
 def handler_body(source: str, name: str) -> str | None:
     """The block of `async fn <name>(..)`, or `None` when it is elsewhere."""
-    at = source.find("async fn %s(" % name)
-    if at < 0:
-        return None
-    brace = source.index("{", source.index(")", at))
-    return balanced(source[brace:], "{", "}")
+    parts = handler_parts(source, name)
+    return parts[2] if parts else None
 
 
 def function_body(source: str, name: str) -> str | None:
@@ -219,10 +232,8 @@ def called_helpers(source: str, body: str) -> list[str]:
 
 def handler_parameters(source: str, name: str) -> str | None:
     """The parameter list of `async fn <name>(..)`."""
-    at = source.find("async fn %s(" % name)
-    if at < 0:
-        return None
-    return balanced(source[source.index("(", at) :])
+    parts = handler_parts(source, name)
+    return parts[0] if parts else None
 
 
 def struct_body(name: str) -> str | None:
@@ -322,19 +333,35 @@ BYTE_PARAMETER = re.compile(
 # A `from_slice` call: its turbofish, if any, then its argument list.
 FROM_SLICE = re.compile(r"\bfrom_slice\s*(?:::<|\()")
 
+# A token that marks a block as an error path.
+ERROR_TOKENS = r"AutumnError::|StatusCode::|\bErr\("
+
+# A `Json` extractor, bare or with a path such as `axum::Json`.
+JSON = r"(?:[a-z_]+::)*Json"
+
 
 def function_parts(source: str, name: str) -> tuple[str, str, str] | None:
     """The parameter list, return clause and block of a free function."""
     start = defined_functions(source).get(name)
-    if start is None:
-        return None
+    return None if start is None else parts_at(source, start)
+
+
+def parts_at(source: str, start: int) -> tuple[str, str, str] | None:
+    """The parameter list, return clause and block of the fn at `start`.
+
+    The block starts at the first `{` after the balanced parameter list, so a
+    brace in a parameter comment does not end the search early. The returned
+    parameter list has its comments removed, so a comment that names an
+    extractor is not read as one.
+    """
     opener = source.find("(", start)
     params = balanced(source[opener:])
     brace = source.find("{", opener + len(params))
     if brace < 0:
         return None
     returns = source[opener + len(params) : brace]
-    return params, returns, balanced(source[brace:], "{", "}")
+    code = re.sub(r"//[^\n]*|/\*.*?\*/", "", params, flags=re.S)
+    return code, returns, balanced(source[brace:], "{", "}")
 
 
 def byte_parameters(params: str) -> set[str]:
@@ -350,19 +377,18 @@ def raw_body_parses(source: str, handler: str) -> list[tuple[str | None, bool]]:
     then from a `Result<T, _>` return type. It is `None` when none of those
     names it, or when the call reads the body in a form the audit cannot read.
     """
-    handler_parts = function_parts(source, handler)
-    if handler_parts is None:
+    handler_found = handler_parts(source, handler)
+    if handler_found is None:
         return []
-    handler_block = handler_parts[2]
-    carriers = byte_parameters(handler_parts[0])
-    names = [handler] + [
-        helper
+    handler_block = handler_found[2]
+    carriers = byte_parameters(handler_found[0])
+    found = [handler_found] + [
+        function_parts(source, helper)
         for helper in called_helpers(source, handler_block)
         if passes_variable(handler_block, helper, carriers)
     ]
     parses: list[tuple[str | None, bool]] = []
-    for name in names:
-        parts = function_parts(source, name)
+    for parts in found:
         if parts is None:
             continue
         params, returns, block = parts
@@ -388,12 +414,14 @@ def block_parses(block: str, carriers: set[str], returns: str) -> list[tuple[str
         if block[opener] == "<":
             turbofish = balanced(block[opener:], "<", ">")[1:-1].strip()
             opener = block.find("(", opener + len(turbofish) + 2)
-        argument = balanced(block[opener:])[1:-1].strip().rstrip(",").strip()
+        call = balanced(block[opener:])
+        argument = call[1:-1].strip().rstrip(",").strip()
         root = re.match(r"&?\s*([a-z_][a-z_0-9]*)", argument)
         if root is None or root.group(1) not in carriers:
             continue
         before = block[: hit.start()]
-        guarded = guards(before, root.group(1))
+        after = block[opener + len(call) :]
+        guarded = guards(block, hit.start(), root.group(1))
         # A body read through an index, a method or a generic type is not
         # something the audit can type, so it is reported.
         if re.sub(r"^&\s*", "", argument) != root.group(1):
@@ -401,33 +429,66 @@ def block_parses(block: str, carriers: set[str], returns: str) -> list[tuple[str
         elif turbofish is not None and not re.fullmatch(r"[A-Za-z0-9_:]+", turbofish):
             parses.append((None, guarded))
         else:
-            parses.append((parse_type(turbofish, before, returns), guarded))
+            parses.append((parse_type(turbofish, before, after, returns), guarded))
     return parses
 
 
-def guards(before: str, variable: str) -> bool:
-    """Whether an `.is_empty()` test before the parse lets an empty body through.
+def guards(block: str, position: int, variable: str) -> bool:
+    """Whether an `if` on `<variable>.is_empty()` lets an empty body skip the parse.
 
-    `!body.is_empty()` skips the parse for an empty body. A plain
-    `if body.is_empty() { .. }` counts only when its block returns no error.
-    Any other use, such as a log field, is no guard.
+    The test counts when the parse is inside that `if` or its `else`. A plain
+    `if body.is_empty() { .. }` before the parse also counts when its block
+    returns `Ok(..)` and no error. Any other use, such as a log field, is no
+    guard.
     """
-    for test in re.finditer(r"(!\s*)?\b%s\.is_empty\(\)" % re.escape(variable), before):
-        if test.group(1):
-            return True
-        rest = before[test.end() :]
-        if not rest.lstrip().startswith("{"):
+    pattern = r"\bif\s+(!\s*)?%s\.is_empty\(\)" % re.escape(variable)
+    for test in re.finditer(pattern, block[:position]):
+        opener = block.find("{", test.end())
+        if opener < 0:
             continue
-        block = balanced(rest[rest.index("{") :], "{", "}")
-        if not re.search(r"AutumnError::|StatusCode::|\bErr\(", block):
+        taken = balanced(block[opener:], "{", "}")
+        end = opener + len(taken)
+        while re.match(r"\s*else\b", block[end:]):
+            branch = block.find("{", end)
+            end = branch + len(balanced(block[branch:], "{", "}"))
+        if test.start() < position < end:
+            return True
+        early_return = re.search(r"\breturn\s+Ok\(", taken)
+        if not test.group(1) and early_return and not re.search(ERROR_TOKENS, taken):
             return True
     return False
 
 
-def parse_type(turbofish: str | None, before: str, returns: str) -> str | None:
-    """The struct a `from_slice` call yields, or `None` when it is unnamed."""
+def ends_expression(after: str) -> bool:
+    """Whether the text after a `from_slice(..)` call leaves its type unchanged.
+
+    `?`, `.map_err(..)`, `.unwrap()`, `.unwrap_or_default()` and `.expect(..)`
+    keep the parsed type. The expression must then end, or open a `match` block.
+    """
+    rest = after
+    while True:
+        rest = rest.lstrip()
+        if rest.startswith("?"):
+            rest = rest[1:]
+            continue
+        suffix = re.match(r"\.(?:map_err|expect|unwrap|unwrap_or_default)\s*\(", rest)
+        if suffix is None:
+            break
+        opener = suffix.end() - 1
+        rest = rest[opener + len(balanced(rest[opener:])) :]
+    return rest[:1] in (";", "}", "{")
+
+
+def parse_type(turbofish: str | None, before: str, after: str, returns: str) -> str | None:
+    """The struct a `from_slice` call yields, or `None` when it is unnamed.
+
+    A typed `let` or a `Result<T, _>` return type names the call only when the
+    call ends its expression, since a `.map(..)` after it yields another type.
+    """
     if turbofish:
         return turbofish.split("::")[-1]
+    if not ends_expression(after):
+        return None
     statement = before[before.rfind(";") + 1 :]
     binding = re.search(r"\blet\s+(?:mut\s+)?[a-z_0-9]+\s*:\s*([A-Za-z0-9_:]+)\s*=", statement)
     if binding:
@@ -643,16 +704,21 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
         # A bare `Json<T>` means the body is mandatory; `Result<Json<T>, _>` and
         # `Option<Json<T>>` leave that to the handler. All three still name the
         # struct whose fields serde accepts, which is what check 3 needs.
-        bare = re.search(r"Json\(\s*[a-z_0-9]+\s*\)\s*:\s*Json<([A-Za-z0-9_]+)>", params)
+        bare = re.search(
+            r"%s\(\s*[a-z_0-9]+\s*\)\s*:\s*%s<\s*([A-Za-z0-9_:]+)\s*>" % (JSON, JSON), params
+        )
         extractor = (
             bare
-            or re.search(r"Result<Json<([A-Za-z0-9_]+)>", params)
-            or re.search(r"Option<Json<([A-Za-z0-9_]+)>>", params)
+            or re.search(r"Result<\s*%s<\s*([A-Za-z0-9_:]+)\s*>" % JSON, params)
+            or re.search(r"Option<\s*%s<\s*([A-Za-z0-9_:]+)\s*>\s*>" % JSON, params)
         )
+        if len(re.findall(r"\bJson<", params)) > (extractor is not None):
+            unresolved.append("  %s %s: cannot read a `Json<..>` extractor" % (method, path))
         # (struct name, whether the body is mandatory) for each parse.
         parses: list[tuple[str, bool]] = []
-        if extractor is not None and extractor.group(1) != "Value":
-            parses.append((extractor.group(1), bool(bare)))
+        body_type = extractor.group(1).split("::")[-1] if extractor else None
+        if body_type is not None and body_type != "Value":
+            parses.append((body_type, bool(bare)))
         mandatory_body = bool(bare)
         if byte_parameters(params):
             for name, guarded in raw_body_parses(source, handler):
@@ -1046,6 +1112,14 @@ pub fn harvest_api_router() -> Router {
         .route("/e/commented", get(e_commented))
         .route("/e/defaulted", get(e_defaulted))
         .route("/e/shapes", get(e_shapes))
+        .route("/e/json-path", post(e_json_path))
+        .route("/e/json-list", post(e_json_list))
+        .route("/e/negated-log", post(e_negated_log))
+        .route("/e/sized", post(e_sized))
+        .route("/e/helper-reject", post(e_helper_reject))
+        .route("/e/mapped", post(e_mapped))
+        .route("/e/collide", post(collide))
+        .route("/e/braced", post(e_braced))
 }
 
 async fn e_wrapped(body: Bytes) -> Response {
@@ -1116,6 +1190,58 @@ async fn e_defaulted(Query(query): Query<Defaulted>) -> Response {
 
 async fn e_shapes(Query(query): Query<Shapes>) -> Response {
     StatusCode::OK.into_response()
+}
+
+async fn e_json_path(axum::Json(body): axum::Json<crate::model::Gadget>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn e_json_list(Json(body): Json<Vec<Gadget>>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn e_negated_log(body: Bytes) -> Response {
+    tracing::debug!(has_body = !body.is_empty(), "parsing");
+    let widget = serde_json::from_slice::<Gadget>(&body).ok();
+    StatusCode::OK.into_response()
+}
+
+async fn e_sized(body: Bytes) -> Response {
+    let size = if body.is_empty() { 0 } else { body.len() };
+    let widget = serde_json::from_slice::<Gadget>(&body).ok();
+    StatusCode::OK.into_response()
+}
+
+async fn e_helper_reject(body: Bytes) -> Response {
+    if body.is_empty() {
+        return missing_body();
+    }
+    let widget = serde_json::from_slice::<Gadget>(&body).ok();
+    StatusCode::OK.into_response()
+}
+
+async fn e_mapped(body: Bytes) -> Response {
+    let name: Value = serde_json::from_slice(&body).map(|gadget: Gadget| gadget.name);
+    StatusCode::OK.into_response()
+}
+
+impl Other {
+    fn collide(&self) -> u32 {
+        7
+    }
+}
+
+async fn collide(body: Bytes) -> Response {
+    let widget = serde_json::from_slice::<Gadget>(&body).ok();
+    StatusCode::OK.into_response()
+}
+
+async fn e_braced(
+    Path(id): Path<String>,
+    // A comment with a brace, Json<T> and Query<T>: {"reason": "..."}.
+    body: Bytes,
+) -> Response {
+    StatusCode::GONE.into_response()
 }
 
 struct Gadget {
@@ -1558,6 +1684,62 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             ),
         ],
         {},
+    ),
+    (
+        "a path-qualified Json extractor is read",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST", "/e/json-path", 200, request_body=body_of(("name", False), required=False)
+            )
+        ],
+        {
+            "body_required": ["POST /e/json-path: the body is mandatory"],
+            "mandatory": ["POST /e/json-path: `name` is mandatory in Gadget"],
+        },
+    ),
+    (
+        "a Json extractor the audit cannot read is reported",
+        FIXTURE_EDGES,
+        [fixture_route("POST", "/e/json-list", 200, request_body=body_of())],
+        {"unresolved": ["POST /e/json-list: cannot read a `Json<..>` extractor"]},
+    ),
+    (
+        "an is_empty test that does not skip the parse is no guard",
+        FIXTURE_EDGES,
+        [
+            fixture_route("POST", path, 200, request_body=body_of(("name", True), required=False))
+            for path in ("/e/negated-log", "/e/sized", "/e/helper-reject")
+        ],
+        {
+            "body_required": [
+                "POST /e/negated-log: the body is mandatory",
+                "POST /e/sized: the body is mandatory",
+                "POST /e/helper-reject: the body is mandatory",
+            ]
+        },
+    ),
+    (
+        "a typed let over a transformed parse does not type it",
+        FIXTURE_EDGES,
+        [fixture_route("POST", "/e/mapped", 200, request_body=body_of())],
+        {"unresolved": ["POST /e/mapped: cannot read a `from_slice` call"]},
+    ),
+    (
+        "a handler is found past an earlier fn of the same name",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST", "/e/collide", 200, request_body=body_of(("name", True), required=False)
+            )
+        ],
+        {"body_required": ["POST /e/collide: the body is mandatory"]},
+    ),
+    (
+        "a brace in a parameter comment does not hide the handler body",
+        FIXTURE_EDGES,
+        [fixture_route("POST", "/e/braced", 200)],
+        {"statuses": ["POST /e/braced returns 410, undeclared"]},
     ),
     (
         "a malformed contract entry does not crash the audit",
