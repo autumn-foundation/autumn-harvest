@@ -28332,9 +28332,25 @@ impl Worker {
             }
         };
 
-        // The read is disposed of in three steps (issue #1429). Each lease is
-        // claimed first. The leases to drop then go in one `ack_many`. Only
-        // then do the claimed tasks start, so no task runs before its ack.
+        self.dispose_read(pool, shard, installed, state, leases)
+            .await
+    }
+
+    /// Claim, ack and start one read of references (issue #1429).
+    ///
+    /// Each lease is claimed first. The leases to drop then go in one
+    /// `ack_many`. Only then do the claimed tasks start, so no task runs
+    /// before its ack.
+    ///
+    /// Returns `true` when at least one task was dispatched.
+    async fn dispose_read(
+        &self,
+        pool: &DbPool,
+        shard: Option<crate::types::ShardId>,
+        installed: &crate::dispatch::InstalledDispatch,
+        state: &mut DispatchLoopState,
+        leases: Vec<crate::dispatch::DispatchLease>,
+    ) -> bool {
         let mut acks = Vec::new();
         let mut claimed = Vec::new();
         for lease in leases {
