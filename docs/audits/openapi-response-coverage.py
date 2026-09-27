@@ -123,27 +123,71 @@ API = ROOT / "autumn-harvest-plugin" / "src" / "api.rs"
 CONTRACT = ROOT / "docs" / "api-contract.json"
 CRATES = ("autumn-harvest", "autumn-harvest-plugin")
 
-# The status names the handlers use. An unlisted name is skipped rather than
-# guessed at.
+# Every `StatusCode` constant in the `http` crate, with its status. The table
+# is complete, so an unusual status such as 418 is read, not skipped.
 NAMED = {
+    "CONTINUE": 100,
+    "SWITCHING_PROTOCOLS": 101,
+    "PROCESSING": 102,
+    "EARLY_HINTS": 103,
     "OK": 200,
     "CREATED": 201,
     "ACCEPTED": 202,
+    "NON_AUTHORITATIVE_INFORMATION": 203,
     "NO_CONTENT": 204,
+    "RESET_CONTENT": 205,
+    "PARTIAL_CONTENT": 206,
     "MULTI_STATUS": 207,
+    "ALREADY_REPORTED": 208,
+    "IM_USED": 226,
+    "MULTIPLE_CHOICES": 300,
+    "MOVED_PERMANENTLY": 301,
+    "FOUND": 302,
+    "SEE_OTHER": 303,
+    "NOT_MODIFIED": 304,
+    "USE_PROXY": 305,
+    "TEMPORARY_REDIRECT": 307,
+    "PERMANENT_REDIRECT": 308,
     "BAD_REQUEST": 400,
     "UNAUTHORIZED": 401,
+    "PAYMENT_REQUIRED": 402,
     "FORBIDDEN": 403,
     "NOT_FOUND": 404,
+    "METHOD_NOT_ALLOWED": 405,
+    "NOT_ACCEPTABLE": 406,
+    "PROXY_AUTHENTICATION_REQUIRED": 407,
+    "REQUEST_TIMEOUT": 408,
     "CONFLICT": 409,
     "GONE": 410,
+    "LENGTH_REQUIRED": 411,
+    "PRECONDITION_FAILED": 412,
     "PAYLOAD_TOO_LARGE": 413,
+    "URI_TOO_LONG": 414,
+    "UNSUPPORTED_MEDIA_TYPE": 415,
+    "RANGE_NOT_SATISFIABLE": 416,
+    "EXPECTATION_FAILED": 417,
+    "IM_A_TEAPOT": 418,
+    "MISDIRECTED_REQUEST": 421,
     "UNPROCESSABLE_ENTITY": 422,
+    "LOCKED": 423,
+    "FAILED_DEPENDENCY": 424,
+    "TOO_EARLY": 425,
+    "UPGRADE_REQUIRED": 426,
+    "PRECONDITION_REQUIRED": 428,
     "TOO_MANY_REQUESTS": 429,
+    "REQUEST_HEADER_FIELDS_TOO_LARGE": 431,
+    "UNAVAILABLE_FOR_LEGAL_REASONS": 451,
     "INTERNAL_SERVER_ERROR": 500,
     "NOT_IMPLEMENTED": 501,
+    "BAD_GATEWAY": 502,
     "SERVICE_UNAVAILABLE": 503,
     "GATEWAY_TIMEOUT": 504,
+    "HTTP_VERSION_NOT_SUPPORTED": 505,
+    "VARIANT_ALSO_NEGOTIATES": 506,
+    "INSUFFICIENT_STORAGE": 507,
+    "LOOP_DETECTED": 508,
+    "NOT_EXTENDED": 510,
+    "NETWORK_AUTHENTICATION_REQUIRED": 511,
 }
 
 VERBS = ("get", "post", "put", "patch", "delete")
@@ -160,7 +204,7 @@ GENERIC_HELPERS = frozenset({"map_error"})
 # `AutumnError::<name>(..)` constructors used in this file, and the status each
 # implies absent a `.with_status(..)` override. Sourced from autumn-web's
 # `error.rs`; a constructor with no call site here is omitted rather than
-# guessed at, matching how NAMED above only lists used status names.
+# guessed at.
 AUTUMN_ERROR_STATUS = {
     "internal_server_error": 500,
     "internal_server_error_msg": 500,
@@ -395,11 +439,12 @@ BYTE_PARAMETER = re.compile(
 # A `from_slice` call: its turbofish, if any, then its argument list.
 FROM_SLICE = re.compile(r"\bfrom_slice\s*(?:::<|\()")
 
+# The `StatusCode` names for a 2xx status.
+SUCCESS_NAMES = "|".join(sorted(name for name, status in NAMED.items() if 200 <= status < 300))
+
 # A token that marks a block as an error path: an `AutumnError`, an `Err(..)`,
-# or a `StatusCode::` name for a 4xx or 5xx status. A 2xx status is no error.
-ERROR_TOKENS = r"AutumnError::|\bErr\(|StatusCode::(?:%s)\b" % "|".join(
-    sorted(name for name, status in NAMED.items() if status >= 400)
-)
+# or a `StatusCode::` name for a status outside 2xx. A 2xx status is no error.
+ERROR_TOKENS = r"AutumnError::|\bErr\(|StatusCode::(?!(?:%s)\b)[A-Z_]+\b" % SUCCESS_NAMES
 
 # A `Json` extractor, bare or with a path such as `axum::Json`.
 JSON = r"(?:[a-z_]+::)*Json"
@@ -644,7 +689,7 @@ def rejecting_exit(block: str) -> bool:
     if re.search(ERROR_TOKENS + r"|\b(?:panic|unreachable|todo)!", block):
         return True
     for returned in re.findall(r"\breturn\b\s*([^;}]*)", block):
-        if not re.match(r"Ok\s*\(|StatusCode::", returned.strip()):
+        if not re.match(r"Ok\s*\(|StatusCode::(?:%s)\b" % SUCCESS_NAMES, returned.strip()):
             return True
     return False
 
@@ -1603,6 +1648,8 @@ pub fn harvest_api_router() -> Router {
         .route("/e/map-or", post(e_map_or))
         .route("/e/is-err-reject", post(e_is_err_reject))
         .route("/e/is-ok-reject", post(e_is_ok_reject))
+        .route("/e/teapot-else", post(e_teapot_else))
+        .route("/e/teapot-arm", post(e_teapot_arm))
 }
 
 async fn e_wrapped(body: Bytes) -> Response {
@@ -2158,6 +2205,20 @@ async fn e_is_ok_reject(body: Bytes) -> Result<Response, Response> {
         return Err(reject());
     }
     Ok(StatusCode::OK.into_response())
+}
+
+async fn e_teapot_else(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    let Ok(Json(gadget)) = body else {
+        return StatusCode::IM_A_TEAPOT.into_response();
+    };
+    StatusCode::OK.into_response()
+}
+
+async fn e_teapot_arm(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    match body {
+        Ok(Json(gadget)) => StatusCode::OK.into_response(),
+        Err(_) => StatusCode::METHOD_NOT_ALLOWED.into_response(),
+    }
 }
 
 async fn e_documented(Query(query): Query<Documented>) -> Response {
@@ -3284,6 +3345,38 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
                 "POST /e/is-ok-reject: the body is mandatory",
             ]
         },
+    ),
+    (
+        "a non-2xx status outside the common names rejects and is reported",
+        FIXTURE_EDGES,
+        [
+            fixture_route("POST", path, 200, request_body=body_of(("name", True), required=False))
+            for path in ("/e/teapot-else", "/e/teapot-arm")
+        ],
+        {
+            "statuses": [
+                "POST /e/teapot-else returns 418, undeclared",
+                "POST /e/teapot-arm returns 405, undeclared",
+            ],
+            "body_required": [
+                "POST /e/teapot-else: the body is mandatory",
+                "POST /e/teapot-arm: the body is mandatory",
+            ],
+        },
+    ),
+    (
+        "a declared non-2xx status outside the common names is not reported",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/teapot-else",
+                200,
+                request_body=body_of(("name", True), required=True),
+                error_responses=[{"status": 418}],
+            )
+        ],
+        {},
     ),
     (
         "a malformed contract entry does not crash the audit",
