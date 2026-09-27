@@ -1390,8 +1390,8 @@ const RECONCILE_CURSOR_TTL_SECS: u64 = 3_600;
 /// the consumer. A lease the consumer already holds gets a new TTL. A lease a
 /// peer holds stays with the peer.
 ///
-/// The reply holds one string per queue: `-` when a peer holds the lease,
-/// else the saved cursor, or an empty string when none is saved.
+/// The reply holds one string per queue. It is `-` when a peer holds the
+/// lease. Otherwise it is the saved cursor, or empty when none is saved.
 const HOLD_LEASE_LUA: &str = r"
 local n = #KEYS / 2
 local held = {}
