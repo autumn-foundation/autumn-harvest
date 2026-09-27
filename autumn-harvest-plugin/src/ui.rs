@@ -345,16 +345,18 @@ struct WorkflowTriggerUpdateForm {
     payload: Option<String>,
 }
 
-/// The operator's submitted values and an error, echoed back into the
-/// workflow detail page's Send signal / Reset to event N / Trigger update
-/// panels on a genuine failure, instead of being lost on a redirect (issue
-/// #1737 — the same mechanism issue #1723 used for the DAG retry confirm
-/// form). Every field is `None` on the plain `GET`: nothing has failed, so
-/// each panel stays collapsed and empty. The failing handler fills its own
-/// slot and renders the detail page directly rather than redirecting,
-/// because a redirect can only carry a flash string, with no slot for a
-/// signal payload, an event number, or an update payload the operator
-/// already typed.
+/// `WorkflowFormEcho` carries the operator's submitted values and an
+/// error. It echoes them back into the workflow detail page's Send
+/// signal, Reset to event N, and Trigger update panels after a genuine
+/// failure. This avoids losing them on a redirect (issue #1737). Issue
+/// #1723 used the same mechanism for the DAG retry confirm form.
+///
+/// Every field is `None` on the plain `GET`. Nothing has failed yet, so
+/// each panel stays collapsed and empty. The failing handler fills its
+/// own slot instead. It then renders the detail page directly, rather
+/// than redirecting. A redirect can only carry a flash string. That
+/// string has no slot for a signal payload, an event number, or an
+/// update payload the operator already typed.
 #[derive(Debug, Default)]
 struct WorkflowFormEcho {
     signal: Option<WorkflowSignalEcho>,
@@ -1643,13 +1645,14 @@ async fn workflow_detail_ui(
     .await
 }
 
-/// Loads and renders the workflow detail page. Shared by the plain `GET`
-/// (`workflow_detail_ui`, `form_echo` always empty) and, on a genuine
-/// mutation failure, by `signal_workflow_ui` / `reset_workflow_ui` /
-/// `trigger_update_ui` (issue #1737): rendering this page directly, with
-/// the failed form's submitted values in `form_echo`, replaces a redirect
-/// that could only carry a flash string with no slot for them. Same
-/// mechanism as `render_dag_retry_confirm_page` (issue #1723).
+/// Loads and renders the workflow detail page. The plain `GET`
+/// (`workflow_detail_ui`) shares it, always with an empty `form_echo`. On
+/// a genuine mutation failure, `signal_workflow_ui`, `reset_workflow_ui`,
+/// and `trigger_update_ui` share it too (issue #1737). Rendering this
+/// page directly, with the failed form's submitted values in
+/// `form_echo`, replaces a redirect. A redirect could only carry a flash
+/// string, with no slot for them. Same mechanism as
+/// `render_dag_retry_confirm_page` (issue #1723).
 #[allow(clippy::too_many_lines)]
 async fn render_workflow_detail_page(
     api_state: HarvestApiState,
@@ -2431,11 +2434,10 @@ async fn signal_workflow_ui(
     )
     .await;
 
-    // A genuine failure renders the detail page directly, with the
-    // submitted signal name and payload echoed back into the still-open
-    // panel, instead of redirecting through a flash string that has no
-    // slot for them (issue #1737 -- same mechanism as #1723's DAG retry
-    // fix).
+    // A genuine failure renders the detail page directly. The submitted
+    // signal name and payload echo back into the still-open panel. This
+    // replaces a redirect through a flash string, which has no slot for
+    // them (issue #1737 -- same mechanism as #1723's DAG retry fix).
     if let Some(error) = error_summary {
         let echo = WorkflowFormEcho {
             signal: Some(WorkflowSignalEcho {
@@ -2568,11 +2570,11 @@ async fn reset_workflow_ui(
     )
     .await;
 
-    // A genuine failure renders the detail page directly, with the
-    // submitted event number and reason echoed back into the still-open
-    // panel, instead of redirecting through a flash string that has no
-    // slot for them (issue #1737 -- same mechanism as #1723's DAG retry
-    // fix). This is the page's one destructive-recovery action
+    // A genuine failure renders the detail page directly. The submitted
+    // event number and reason echo back into the still-open panel. This
+    // replaces a redirect through a flash string, which has no slot for
+    // them (issue #1737 -- same mechanism as #1723's DAG retry fix).
+    // This is the page's one destructive-recovery action
     // (`docs/vantage-ui.md` scenarios 3-4), the moment an operator is
     // least willing to retype their input.
     if let Some(error) = error_summary {
@@ -2639,8 +2641,8 @@ async fn trigger_update_ui(
                 )
                 .await;
                 // Same in-place re-render as the two failure branches below
-                // (issue #1737): the operator's update name and payload
-                // survive a bad JSON payload, not just a downstream
+                // (issue #1737). The operator's update name and payload
+                // survive a bad JSON payload too, not only a downstream
                 // rejection.
                 let echo = WorkflowFormEcho {
                     trigger_update: Some(WorkflowTriggerUpdateEcho {
@@ -2727,11 +2729,10 @@ async fn trigger_update_ui(
     )
     .await;
 
-    // A genuine failure renders the detail page directly, with the
-    // submitted update name and payload echoed back into the still-open
-    // panel, instead of redirecting through a flash string that has no
-    // slot for them (issue #1737 -- same mechanism as #1723's DAG retry
-    // fix).
+    // A genuine failure renders the detail page directly. The submitted
+    // update name and payload echo back into the still-open panel. This
+    // replaces a redirect through a flash string, which has no slot for
+    // them (issue #1737 -- same mechanism as #1723's DAG retry fix).
     if let Some(error) = error_summary {
         let echo = WorkflowFormEcho {
             trigger_update: Some(WorkflowTriggerUpdateEcho {
