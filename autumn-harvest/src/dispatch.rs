@@ -1179,12 +1179,16 @@ where
 
 /// True when a hint raised now can reach a channel (issue #1431).
 ///
-/// A channel is installed, or the current task is bound to one. A bound
-/// worker keeps its channel after another runtime clears the slot. Hint
-/// writers check this call, not [`is_installed`], before they build a hint.
+/// An active binding decides first. A task bound to a channel wants hints,
+/// even after another runtime clears the slot. A task bound to no channel
+/// wants none, even while another runtime has a channel installed. With no
+/// binding, the live slot decides. Hint writers check this call, not
+/// [`is_installed`], before they build a hint.
 #[must_use]
 pub fn hints_wanted() -> bool {
-    is_installed() || BOUND_CHANNEL.try_with(Option::is_some).unwrap_or(false)
+    BOUND_CHANNEL
+        .try_with(Option::is_some)
+        .unwrap_or_else(|_| is_installed())
 }
 
 /// Publish `hints` on the bound channel, or else on the installed one, now.
@@ -3300,6 +3304,7 @@ mod tests {
             DispatchSettings::default(),
         );
 
+        let wanted = with_bound_channel(None, async { hints_wanted() }).await;
         with_bound_channel(None, publish_now(vec![hint("q", Utc::now())])).await;
         with_bound_channel(None, async { publish_in_background(hint("q", Utc::now())) }).await;
         // The publisher queue is FIFO. A leaked hint lands before this one.
@@ -3313,6 +3318,10 @@ mod tests {
         }
         uninstall();
 
+        assert!(
+            !wanted,
+            "a scope bound to no channel must not ask writers to build hints"
+        );
         assert_eq!(
             live.published_ids(),
             vec![sentinel.task_id],

@@ -13,8 +13,9 @@ runs its poll loop and each task body in that scope. Its maintenance loops
 (timeouts, poison-pill reclaim, session and quota reconcile, pause
 auto-resume) start through `dispatch::spawn_bound`, so they keep the binding.
 A worker bound to no channel publishes nothing. Hint writers check
-`dispatch::hints_wanted`, so a bound worker still publishes after another
-runtime clears the slot.
+`dispatch::hints_wanted`, where an active binding decides first. A bound
+worker still publishes after another runtime clears the slot. A worker bound
+to no channel builds no hints while another runtime has one installed.
 
 **Late install.** A core caller can call `dispatch::install` after
 `Worker::new`. The constructor saw no channel and checked nothing. The worker
