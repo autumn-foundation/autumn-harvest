@@ -52,9 +52,10 @@ returns the rejection it binds. A
 raw-byte parse is mandatory unless an `if` on `.is_empty()` lets an empty body
 skip it. The parse must be in the arm that runs for a non-empty body. An
 earlier `if body.is_empty() { .. }` also counts when its block returns `Ok(..)`
-and no error. A parse that turns its error into a value is
-optional too, such as `.ok()`, `.unwrap_or_default()` or an `if let Ok(..)`
-whose `else` does not reject. A guard or a tolerant call at a helper call site
+and no error. A `return` inside a nested closure, fn or async block does not
+count, since it leaves only that scope. A parse that turns its error into a
+value is optional too, such as `.ok()`, `.unwrap_or_default()` or an
+`if let Ok(..)` whose `else` does not reject. A guard or a tolerant call at a helper call site
 carries into the helper. Check 2 applies to every parse that does not tolerate
 its error, since a body that is present must then carry the mandatory fields.
 A bare `Json<T>` and a rejecting `Result<Json<T>, _>` are such parses.
@@ -82,8 +83,9 @@ finding text names the source line, since a status can reach a route through a
 helper it shares.
 
 Check 6 compares every `Query<T>` struct of a route with its `in: query`
-parameters. `WIRE_TYPES` gives the OpenAPI type of a field after the audit
-removes one `Option`. A field is optional when it is an `Option` or has a serde
+parameters. An `Option<Query<T>>` makes every field optional, since an absent
+query string yields `None`. `WIRE_TYPES` gives the OpenAPI type of a field
+after the audit removes one `Option`. A field is optional when it is an `Option` or has a serde
 default, on the field or on the struct. By default, serde ignores an unknown
 query key, so a documented key that no struct has is a finding.
 
@@ -579,7 +581,7 @@ def guards(block: str, position: int, variable: str) -> bool:
             return True
         if not test.group(1) and taken_end < position < end:
             return True
-        early_return = re.search(r"\breturn\s+Ok\(", taken)
+        early_return = re.search(r"\breturn\s+Ok\(", outer_scope(taken))
         if not test.group(1) and early_return and not re.search(ERROR_TOKENS, taken):
             return True
     return False
@@ -588,7 +590,8 @@ def guards(block: str, position: int, variable: str) -> bool:
 def rejects_result_body(params: str, block: str) -> bool:
     """Whether a `Result<Json<T>, _>` body is mandatory, since its error rejects.
 
-    The body is mandatory when the handler applies `?` or `.map_err(..)?` to it,
+    The body is mandatory when the handler applies `?`, `.map_err(..)?`,
+    `.unwrap()` or `.expect(..)` to it,
     when the `Err` arm of a `match` on it builds an error, or when the `else`
     of a `let Ok(..) = body else` builds an error or returns. An `Err` arm that
     hands the request on, for example to replay a committed key, leaves it
@@ -598,7 +601,7 @@ def rejects_result_body(params: str, block: str) -> bool:
     if found is None:
         return False
     variable = re.escape(found.group(1))
-    if re.search(r"\b%s\s*\?" % variable, block):
+    if re.search(r"\b%s\s*(?:\?|\.\s*(?:unwrap|expect)\s*\()" % variable, block):
         return True
     for mapped in re.finditer(r"\b%s\s*\.map_err\s*\(" % variable, block):
         arguments = balanced(block[mapped.end() - 1 :])
@@ -676,6 +679,25 @@ def discards_error(before: str, after: str) -> bool:
         return True
     otherwise = balanced(rest[rest.index("{") :], "{", "}")
     return not re.search(r"\breturn\b|" + ERROR_TOKENS, otherwise)
+
+
+# The start of a nested closure, fn or async block. A `return` inside one
+# leaves only that scope, not the handler.
+NESTED_SCOPE = re.compile(
+    r"(?:\|[^|]*\|\s*(?:->\s*[^{]+)?"
+    r"|\bfn\s+[a-z_0-9]+\s*(?:<[^>]*>)?\s*\([^)]*\)\s*(?:->\s*[^{]+)?"
+    r"|\basync\s+(?:move\s+)?)\{"
+)
+
+
+def outer_scope(block: str) -> str:
+    """The block without its nested closures, fns and async blocks."""
+    while True:
+        nested = NESTED_SCOPE.search(block)
+        if nested is None:
+            return block
+        inner = balanced(block[nested.end() - 1 :], "{", "}")
+        block = block[: nested.start()] + block[nested.end() - 1 + len(inner) :]
 
 
 def ends_expression(after: str) -> bool:
@@ -769,7 +791,7 @@ def wire_type(declared_type: str) -> str | None:
 
 
 def query_struct_findings(
-    method: str, path: str, route: dict, queries: list[tuple[str, str]]
+    method: str, path: str, route: dict, queries: list[tuple[str, str, bool]]
 ) -> list[str]:
     """Check 6: the `Query<T>` structs and the route's query parameters agree."""
     documented = {
@@ -780,8 +802,9 @@ def query_struct_findings(
     where = "  %s %s: `%%s`" % (method, path)
     found: list[str] = []
     accepted: set[str] = set()
-    for name, struct in queries:
+    for name, struct, wrapped in queries:
         for field, declared_type, mandatory, spellings in struct_fields(struct):
+            mandatory = mandatory and not wrapped
             accepted |= set(spellings)
             entry = documented.get(documented_as(spellings, documented))
             if entry is None:
@@ -808,7 +831,7 @@ def query_struct_findings(
                 found.append(
                     where % field + " is optional in %s but the contract marks it required" % name
                 )
-    owners = " or ".join(name for name, _ in queries)
+    owners = " or ".join(name for name, _, _ in queries)
     for key in documented.keys() - accepted:
         found.append(where % key + " is documented but %s does not accept it" % owners)
     return found
@@ -919,16 +942,19 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
         route = by_route.get((method, path))
         if params is None or route is None:
             continue
-        queries: list[tuple[str, str]] = []
+        queries: list[tuple[str, str, bool]] = []
         for query in QUERY_EXTRACTOR.finditer(params):
             name = query.group(1).split("::")[-1]
+            # An absent query string turns `Option<Query<T>>` into `None`, so
+            # none of its fields is mandatory.
+            wrapped = re.search(r"Option<\s*(?:[a-z_]+::)*$", params[: query.start()]) is not None
             struct = find_struct(name)
             if struct is None:
                 unresolved.append(missing % (method, path, name))
             elif unreadable_serde(struct):
                 unresolved += [unread % (method, path, a, name) for a in unreadable_serde(struct)]
             else:
-                queries.append((name, struct))
+                queries.append((name, struct, wrapped))
         if len(re.findall(r"\bQuery<", params)) > len(QUERY_EXTRACTOR.findall(params)):
             unresolved.append("  %s %s: cannot read a `Query<..>` extractor" % (method, path))
         if queries:
@@ -1393,6 +1419,9 @@ pub fn harvest_api_router() -> Router {
         .route("/e/guarded-fields", post(e_guarded_fields))
         .route("/e/map-err-ok", post(e_map_err_ok))
         .route("/e/return-rejection", post(e_return_rejection))
+        .route("/e/closure-return", post(e_closure_return))
+        .route("/e/optional-strict-query", get(e_optional_strict_query))
+        .route("/e/unwrapped", post(e_unwrapped))
 }
 
 async fn e_wrapped(body: Bytes) -> Response {
@@ -1722,6 +1751,28 @@ async fn e_return_rejection(body: Result<Json<Gadget>, JsonRejection>) -> Respon
         Ok(Json(gadget)) => gadget,
         Err(rejection) => return rejection.into_response(),
     };
+    StatusCode::OK.into_response()
+}
+
+async fn e_closure_return(body: Bytes) -> Response {
+    if body.is_empty() {
+        let fallback = || -> Result<Gadget, Response> { return Ok(Gadget::default()) };
+    }
+    let gadget = serde_json::from_slice::<Gadget>(&body).map_err(reject)?;
+    StatusCode::OK.into_response()
+}
+
+async fn e_optional_strict_query(query: Option<Query<StrictQuery>>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+struct StrictQuery {
+    term: String,
+    limit: Option<u32>,
+}
+
+async fn e_unwrapped(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    let Json(gadget) = body.expect("a valid body");
     StatusCode::OK.into_response()
 }
 
@@ -2565,6 +2616,45 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             )
         ],
         {"mandatory": ["POST /e/empty-fields: `name` is mandatory in Gadget"]},
+    ),
+    (
+        "a return inside a closure is no early exit",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/closure-return",
+                200,
+                request_body=body_of(("name", True), required=False),
+            )
+        ],
+        {"body_required": ["POST /e/closure-return: the body is mandatory"]},
+    ),
+    (
+        "an Option<Query<T>> makes every field optional",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "GET",
+                "/e/optional-strict-query",
+                200,
+                params=[
+                    query_param("term", "string", False),
+                    query_param("limit", "integer", False),
+                ],
+            )
+        ],
+        {},
+    ),
+    (
+        "unwrap or expect on a Result<Json<T>> body rejects",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST", "/e/unwrapped", 200, request_body=body_of(("name", True), required=False)
+            )
+        ],
+        {"body_required": ["POST /e/unwrapped: the body is mandatory"]},
     ),
     (
         "a malformed contract entry does not crash the audit",
