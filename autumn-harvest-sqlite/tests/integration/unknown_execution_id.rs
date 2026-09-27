@@ -39,11 +39,8 @@ async fn run_until_blocked_on_unknown_id_is_execution_not_found() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
     let bogus = ExecutionId::new();
 
-    assert_not_found(
-        "run_until_blocked",
-        rt.run_until_blocked(bogus).await,
-        bogus,
-    );
+    let result = rt.run_until_blocked(bogus).await;
+    assert_not_found("run_until_blocked", result, bogus);
 }
 
 #[tokio::test]
@@ -55,16 +52,17 @@ async fn run_until_blocked_as_of_on_unknown_id_is_execution_not_found() {
     assert_not_found("run_until_blocked_as_of", result, bogus);
 }
 
-#[tokio::test]
-async fn load_history_on_unknown_id_is_execution_not_found() {
+#[test]
+fn load_history_on_unknown_id_is_execution_not_found() {
     let rt = SqliteRuntime::open_in_memory().unwrap();
     let bogus = ExecutionId::new();
 
-    assert_not_found("load_history", rt.load_history(bogus), bogus);
+    let result = rt.load_history(bogus);
+    assert_not_found("load_history", result, bogus);
 }
 
-#[tokio::test]
-async fn activity_attempts_on_unknown_id_is_execution_not_found() {
+#[test]
+fn activity_attempts_on_unknown_id_is_execution_not_found() {
     let rt = SqliteRuntime::open_in_memory().unwrap();
     let bogus = ExecutionId::new();
 
@@ -79,7 +77,8 @@ async fn outcome_and_send_signal_on_unknown_id_stay_execution_not_found() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
     let bogus = ExecutionId::new();
 
-    assert_not_found("outcome", rt.outcome(bogus), bogus);
+    let result = rt.outcome(bogus);
+    assert_not_found("outcome", result, bogus);
     let result = rt.send_signal(bogus, "go", json!(true));
     assert_not_found("send_signal", result, bogus);
 }

@@ -284,9 +284,9 @@ fail-fast driver, since it already targets a single execution.
 **pure reads** — they never advance a run.
 
 Every call that takes an `exec` id returns `SqliteError::ExecutionNotFound(exec)`
-when no execution has that id. This includes the drivers and the list reads. A
-typo or a stale id gives this one typed error. It never gives an empty list or a
-generic `SQLite` error.
+when no execution has that id. This includes `run_until_blocked` and the list
+reads. A typo or a stale id gives this one typed error. It never gives an empty
+list or a generic `SQLite` error.
 
 Timers use the real wall clock (read once per decision cycle), so a run blocked
 on a `ctx.timer(...)` that is not yet due returns `WaitingTimer`; drive it again
