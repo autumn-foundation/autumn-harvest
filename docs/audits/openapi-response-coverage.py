@@ -532,6 +532,136 @@ def body_of(*fields: tuple[str, bool], required: bool = True) -> dict:
     }
 
 
+# Raw-byte bodies and typed queries. Each handler shows one way the source
+# parses a body or a query.
+FIXTURE_BYTES = r'''
+pub fn harvest_api_router() -> Router {
+    Router::new()
+        .route("/raw/strict", post(raw_strict))
+        .route("/raw/optional", post(raw_optional))
+        .route("/raw/helper", post(raw_helper))
+        .route("/raw/annotated", post(raw_annotated))
+        .route("/raw/returned", post(raw_returned))
+        .route("/raw/untyped", post(raw_untyped))
+        .route("/raw/value", post(raw_value))
+        .route("/raw/other", post(raw_other))
+        .route("/search", get(search))
+        .route("/tagged", get(tagged))
+}
+
+async fn raw_strict(headers: HeaderMap, body: axum::body::Bytes) -> Response {
+    let request = match serde_json::from_slice::<Widget>(&body) {
+        Ok(request) => request,
+        Err(error) => return reject(error),
+    };
+    StatusCode::OK.into_response()
+}
+
+async fn raw_optional(body: Bytes) -> Response {
+    let request: Widget = if body.is_empty() {
+        Widget::default()
+    } else {
+        serde_json::from_slice::<Widget>(&body).unwrap_or_default()
+    };
+    StatusCode::OK.into_response()
+}
+
+fn parse_widget(body: &[u8]) -> Result<Widget, Response> {
+    let widget = serde_json::from_slice::<Widget>(body).map_err(reject)?;
+    Ok(widget)
+}
+
+async fn raw_helper(body: Bytes) -> Response {
+    let widget = match parse_widget(&body) {
+        Ok(widget) => widget,
+        Err(response) => return response,
+    };
+    StatusCode::OK.into_response()
+}
+
+async fn raw_annotated(body_bytes: Bytes) -> Response {
+    let widget: Widget = match serde_json::from_slice(&body_bytes) {
+        Ok(widget) => widget,
+        Err(error) => return reject(error),
+    };
+    StatusCode::OK.into_response()
+}
+
+async fn parse_optional_widget(body: &axum::body::Bytes) -> Result<Widget, Response> {
+    if body.is_empty() {
+        return Ok(Widget::default());
+    }
+    match serde_json::from_slice(body) {
+        Ok(widget) => Ok(widget),
+        Err(error) => Err(reject(error)),
+    }
+}
+
+async fn raw_returned(body: Bytes) -> Response {
+    let widget = match parse_optional_widget(&body).await {
+        Ok(widget) => widget,
+        Err(response) => return response,
+    };
+    StatusCode::OK.into_response()
+}
+
+async fn raw_untyped(body: Bytes) -> Response {
+    let widget = serde_json::from_slice(&body).map(consume);
+    StatusCode::OK.into_response()
+}
+
+async fn raw_value(body: Bytes) -> Response {
+    let value = serde_json::from_slice::<Value>(&body).ok();
+    StatusCode::OK.into_response()
+}
+
+async fn raw_other(_body: Bytes) -> Response {
+    let stored = load_stored();
+    let widget: Widget = serde_json::from_slice(&stored).unwrap_or_default();
+    StatusCode::OK.into_response()
+}
+
+async fn search(Query(query): Query<SearchQuery>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn tagged(Query(query): Query<TaggedQuery>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+struct Widget {
+    name: String,
+    #[serde(default)]
+    size: Option<u32>,
+}
+
+struct SearchQuery {
+    term: String,
+    #[serde(default)]
+    exact: bool,
+    limit: Option<u32>,
+}
+
+struct TaggedQuery {
+    tags: Vec<String>,
+}
+'''
+
+WIDGET_BODY = body_of(("name", True), ("size", False))
+OPTIONAL_WIDGET = body_of(("name", True), ("size", False), required=False)
+
+
+def query_param(name: str, kind: str, required: bool) -> dict:
+    return {"name": name, "in": "query", "type": kind, "required": required}
+
+
+SEARCH_PARAMS = [
+    query_param("term", "string", True),
+    query_param("exact", "boolean", False),
+    query_param("limit", "integer", False),
+]
+
+
 # (name, source, routes, expected findings by check). Each expected string must
 # appear in exactly one finding, and the check must report nothing else.
 SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
@@ -576,6 +706,155 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             fixture_route("GET", "/things/{id}", 200, error_responses=[{"status": 400}]),
         ],
         {"undocumented": ["POST /things: `note` is accepted by CreateThing"]},
+    ),
+    (
+        "a bare Json body is marked required",
+        FIXTURE_SOURCE,
+        [
+            fixture_route(
+                "POST",
+                "/things",
+                201,
+                request_body=body_of(("name", True), ("note", False), required=False),
+            ),
+        ],
+        {"body_required": ["POST /things: the body is mandatory"]},
+    ),
+    (
+        "raw-byte bodies that match the contract are clean",
+        FIXTURE_BYTES,
+        [
+            fixture_route("POST", "/raw/strict", 200, request_body=WIDGET_BODY),
+            fixture_route("POST", "/raw/optional", 200, request_body=OPTIONAL_WIDGET),
+            fixture_route("POST", "/raw/helper", 200, request_body=WIDGET_BODY),
+            fixture_route("POST", "/raw/annotated", 200, request_body=WIDGET_BODY),
+            fixture_route("POST", "/raw/returned", 200, request_body=OPTIONAL_WIDGET),
+            fixture_route("POST", "/raw/value", 200, request_body=body_of(required=False)),
+            fixture_route("POST", "/raw/other", 200),
+        ],
+        {},
+    ),
+    (
+        "an unguarded raw-byte body is marked required",
+        FIXTURE_BYTES,
+        [
+            fixture_route(
+                "POST",
+                "/raw/strict",
+                200,
+                request_body=body_of(("name", False), ("size", False), required=False),
+            ),
+            fixture_route("POST", "/raw/optional", 200, request_body=OPTIONAL_WIDGET),
+        ],
+        {
+            "body_required": ["POST /raw/strict: the body is mandatory"],
+            "mandatory": ["POST /raw/strict: `name` is mandatory in Widget"],
+        },
+    ),
+    (
+        "a raw-byte body parsed in a helper is read",
+        FIXTURE_BYTES,
+        [
+            fixture_route(
+                "POST", "/raw/helper", 200, request_body=body_of(("name", True))
+            ),
+        ],
+        {"undocumented": ["POST /raw/helper: `size` is accepted by Widget"]},
+    ),
+    (
+        "a raw-byte body typed by its binding is read",
+        FIXTURE_BYTES,
+        [
+            fixture_route(
+                "POST",
+                "/raw/annotated",
+                200,
+                request_body=body_of(("name", False), ("size", False)),
+            ),
+        ],
+        {"mandatory": ["POST /raw/annotated: `name` is mandatory in Widget"]},
+    ),
+    (
+        "a raw-byte body typed by its helper's return type is read",
+        FIXTURE_BYTES,
+        [
+            fixture_route(
+                "POST",
+                "/raw/returned",
+                200,
+                request_body=body_of(("name", False), required=False),
+            ),
+        ],
+        {"undocumented": ["POST /raw/returned: `size` is accepted by Widget"]},
+    ),
+    (
+        "a raw-byte body of unknown type is reported",
+        FIXTURE_BYTES,
+        [fixture_route("POST", "/raw/untyped", 200, request_body=OPTIONAL_WIDGET)],
+        {"unresolved": ["POST /raw/untyped: cannot resolve the body type"]},
+    ),
+    (
+        "a typed query that matches the contract is clean",
+        FIXTURE_BYTES,
+        [fixture_route("GET", "/search", 200, params=SEARCH_PARAMS)],
+        {},
+    ),
+    (
+        "a typed query field is documented",
+        FIXTURE_BYTES,
+        [fixture_route("GET", "/search", 200, params=SEARCH_PARAMS[:2])],
+        {"query_params": ["GET /search: `limit` is accepted by SearchQuery"]},
+    ),
+    (
+        "a typed query field carries its wire type",
+        FIXTURE_BYTES,
+        [
+            fixture_route(
+                "GET",
+                "/search",
+                200,
+                params=[SEARCH_PARAMS[0], query_param("exact", "string", False), SEARCH_PARAMS[2]],
+            )
+        ],
+        {"query_params": ["GET /search: `exact` is boolean in SearchQuery but the contract says string"]},
+    ),
+    (
+        "a typed query field carries its required flag",
+        FIXTURE_BYTES,
+        [
+            fixture_route(
+                "GET",
+                "/search",
+                200,
+                params=[
+                    query_param("term", "string", False),
+                    SEARCH_PARAMS[1],
+                    query_param("limit", "integer", True),
+                ],
+            )
+        ],
+        {
+            "query_params": [
+                "GET /search: `term` is mandatory in SearchQuery but the contract marks it optional",
+                "GET /search: `limit` is optional in SearchQuery but the contract marks it required",
+            ]
+        },
+    ),
+    (
+        "a documented query key the struct ignores is reported",
+        FIXTURE_BYTES,
+        [
+            fixture_route(
+                "GET", "/search", 200, params=SEARCH_PARAMS + [query_param("page", "integer", False)]
+            )
+        ],
+        {"query_params": ["GET /search: `page` is documented but SearchQuery does not accept it"]},
+    ),
+    (
+        "a query field with no wire type is reported",
+        FIXTURE_BYTES,
+        [fixture_route("GET", "/tagged", 200, params=[query_param("tags", "string", True)])],
+        {"query_params": ["GET /tagged: `tags` has type Vec<String>, which maps to no OpenAPI type"]},
     ),
 ]
 
