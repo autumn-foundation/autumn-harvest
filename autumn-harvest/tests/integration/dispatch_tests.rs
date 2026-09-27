@@ -1672,8 +1672,8 @@ async fn a_stale_reference_does_not_spend_a_sibling_lease_share() {
 /// A worker built before the channel is installed binds it at the run
 /// boundary, and every claim goes through it (issue #1431).
 ///
-/// `Worker::new` saw no channel here. Before the fix, the worker stayed on
-/// Postgres for its whole life and no task reached the channel.
+/// `Worker::new` saw no channel here. Without the fix, the worker stays on
+/// Postgres for its whole life and no task reaches the channel.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_late_install_is_adopted_at_the_run_boundary() {
     let _serial = DISPATCH_SERIAL.lock().await;
@@ -1739,6 +1739,7 @@ async fn a_replacement_install_does_not_redirect_a_running_workers_hints() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     let before_run = replacement.published_ids();
+    assert_eq!(before_run.len(), 1, "the start must publish one hint");
 
     let pool = build_pool(&url);
     let mut check = connect(&url).await;

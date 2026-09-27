@@ -1201,6 +1201,11 @@ impl HarvestRunner {
                      sharded_pool; refusing to start — check your ShardedDbPool configuration"
                 )));
             }
+            // Fix the dispatch binding while this call still holds the start
+            // lock (issue #1431). With Redis off, the worker saw no channel.
+            // It would otherwise bind at the run boundary, after the lock is
+            // gone, and could adopt another runtime's channel.
+            worker.bind_dispatch();
             Some(Arc::new(worker))
         } else {
             None

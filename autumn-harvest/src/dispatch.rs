@@ -12,9 +12,9 @@
 //! `docs/plans/2026-09-07-redis-dispatch-worker-integration.md`.
 //!
 //! The installed channel is process-global, like the mutex lease TTL and the
-//! DR config. Every enqueue path in the same process publishes through it. A
-//! worker binds the channel it starts with and keeps it (issue #1431). Its
-//! reads and its task hints then ignore a later install.
+//! DR config. Every enqueue path outside a bound worker scope publishes
+//! through it. A worker binds the channel it starts with and keeps it (issue
+//! #1431). Its reads and its hints then ignore a later install.
 
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -261,6 +261,12 @@ impl InstalledDispatch {
 
 static INSTALLED: RwLock<Option<InstalledDispatch>> = RwLock::new(None);
 
+/// Serializes every unit test that writes the dispatch slots or the
+/// publisher (issue #1431). The `dispatch` and `worker` tests share these
+/// globals in one test binary, so one lock must cover both modules.
+#[cfg(all(test, feature = "testing"))]
+pub(crate) static TEST_SLOT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Shared source for every install's generation stamp, across both the
 /// single-shard and per-shard slots (Codex review, issue #1429 follow-up).
 ///
@@ -288,8 +294,8 @@ static DISPATCH_SLOT_LOCK: Mutex<()> = Mutex::new(());
 
 /// Install the process-global channel. A later call replaces the earlier one.
 ///
-/// A running worker keeps the channel it bound at its start (issue #1431). A
-/// replacement reaches only workers that start after it.
+/// A worker keeps the channel it bound (issue #1431). A replacement reaches
+/// only a worker that has not bound a channel yet.
 ///
 /// Returns the generation this install was stamped with. A caller that may
 /// need to undo only *this* install keeps this value, for
@@ -1155,6 +1161,32 @@ fn publish_target() -> PublishTarget {
         .map_or(PublishTarget::Live, PublishTarget::Bound)
 }
 
+/// Spawn `f` with the binding of the current task (issue #1431).
+///
+/// A worker spawns its maintenance loops through this call, so their hints
+/// follow the worker's channel too. With no bound scope, this is a plain
+/// `tokio::spawn`.
+pub(crate) fn spawn_bound<F>(f: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    match BOUND_CHANNEL.try_with(Clone::clone) {
+        Ok(channel) => tokio::spawn(with_bound_channel(channel, f)),
+        Err(_) => tokio::spawn(f),
+    }
+}
+
+/// True when a hint raised now can reach a channel (issue #1431).
+///
+/// A channel is installed, or the current task is bound to one. A bound
+/// worker keeps its channel after another runtime clears the slot. Hint
+/// writers check this call, not [`is_installed`], before they build a hint.
+#[must_use]
+pub fn hints_wanted() -> bool {
+    is_installed() || BOUND_CHANNEL.try_with(Option::is_some).unwrap_or(false)
+}
+
 /// Publish `hints` on the bound channel, or else on the installed one, now.
 ///
 /// Errors are logged and dropped. The reconcile sweep in the worker is the
@@ -1188,10 +1220,10 @@ async fn publish_on(channel: &dyn TaskDispatch, hints: Vec<DispatchHint>) {
 ///
 /// Inside a [`buffered`] scope the hint waits for the flush after commit.
 /// Outside one it goes to a background publisher that batches hints, so the
-/// caller never awaits the channel. The call is a single atomic load when no
-/// channel is installed.
+/// caller never awaits the channel. With no channel, the call costs one atomic
+/// load and one task-local read.
 pub fn record_hint(hint: DispatchHint) {
-    if !is_installed() {
+    if !hints_wanted() {
         return;
     }
     let mut carried = Some(hint);
@@ -1212,7 +1244,7 @@ pub fn record_hint(hint: DispatchHint) {
 pub fn record_hints(hints: Vec<DispatchHint>) {
     // One guard for the whole batch, so a deployment with no channel does not
     // pay one load per hint.
-    if !is_installed() {
+    if !hints_wanted() {
         return;
     }
     for hint in hints {
@@ -1853,7 +1885,7 @@ mod tests {
     use super::*;
 
     /// Serializes the cases that install the process-global channel.
-    static INSTALL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    use super::TEST_SLOT_LOCK as INSTALL_LOCK;
 
     fn hint(queue: &str, at: DateTime<Utc>) -> DispatchHint {
         DispatchHint {
@@ -3270,13 +3302,47 @@ mod tests {
 
         with_bound_channel(None, publish_now(vec![hint("q", Utc::now())])).await;
         with_bound_channel(None, async { publish_in_background(hint("q", Utc::now())) }).await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The publisher queue is FIFO. A leaked hint lands before this one.
+        let sentinel = hint("q", Utc::now());
+        publish_in_background(sentinel.clone());
+        for _ in 0..100 {
+            if !live.published_ids().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         uninstall();
 
-        assert!(
-            live.published_ids().is_empty(),
+        assert_eq!(
+            live.published_ids(),
+            vec![sentinel.task_id],
             "a scope bound to no channel must not publish into the live slot"
         );
+    }
+
+    /// The publisher splits a batch into runs by channel and keeps the order
+    /// inside each channel (issue #1431).
+    #[tokio::test]
+    async fn the_publisher_groups_a_mixed_batch_by_channel() {
+        let first = Arc::new(MemoryDispatch::new());
+        let second = Arc::new(MemoryDispatch::new());
+        let queued = |channel: &Arc<MemoryDispatch>| QueuedHint {
+            hint: hint("q", Utc::now()),
+            channel: Some(Arc::clone(channel) as Arc<dyn TaskDispatch>),
+        };
+        let batch = vec![
+            queued(&first),
+            queued(&second),
+            queued(&first),
+            queued(&first),
+        ];
+        let first_ids = [&batch[0], &batch[2], &batch[3]].map(|q| q.hint.task_id);
+        let second_ids = [batch[1].hint.task_id];
+
+        publish_batch(batch).await;
+
+        assert_eq!(first.published_ids(), first_ids.to_vec());
+        assert_eq!(second.published_ids(), second_ids.to_vec());
     }
 
     /// The background publisher honours the binding of the scope that
@@ -3314,5 +3380,66 @@ mod tests {
             vec![unbound.task_id],
             "a hint queued outside a bound scope still uses the live slot"
         );
+    }
+
+    /// A bound task keeps publishing after another runtime clears the slot
+    /// (issue #1431). The hint gate reads the binding, not only the slot.
+    #[tokio::test]
+    async fn a_bound_task_publishes_with_the_slot_empty() {
+        let _guard = INSTALL_LOCK.lock().await;
+        uninstall_all();
+        let bound = Arc::new(MemoryDispatch::new());
+
+        let one = hint("q", Utc::now());
+        let inner = one.clone();
+        let wanted = with_bound_channel(
+            Some(Arc::clone(&bound) as Arc<dyn TaskDispatch>),
+            async move {
+                let wanted = hints_wanted();
+                record_hint(inner);
+                wanted
+            },
+        )
+        .await;
+        for _ in 0..100 {
+            if !bound.published_ids().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        uninstall_all();
+
+        assert!(wanted, "a bound task must want hints with the slot empty");
+        assert!(!hints_wanted(), "an unbound task with no slot wants none");
+        assert_eq!(bound.published_ids(), vec![one.task_id]);
+    }
+
+    /// A task spawned through `spawn_bound` inherits the binding (issue
+    /// #1431). A plain `tokio::spawn` would lose it.
+    #[tokio::test]
+    async fn spawn_bound_carries_the_binding_into_the_new_task() {
+        let _guard = INSTALL_LOCK.lock().await;
+        let live = Arc::new(MemoryDispatch::new());
+        install(
+            Arc::clone(&live) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+        let bound = Arc::new(MemoryDispatch::new());
+
+        let one = hint("q", Utc::now());
+        let inner = one.clone();
+        with_bound_channel(
+            Some(Arc::clone(&bound) as Arc<dyn TaskDispatch>),
+            async move {
+                spawn_bound(publish_now(vec![inner]))
+                    .await
+                    .expect("the spawned task must finish");
+            },
+        )
+        .await;
+        uninstall();
+
+        assert_eq!(bound.published_ids(), vec![one.task_id]);
+        assert!(live.published_ids().is_empty());
     }
 }
