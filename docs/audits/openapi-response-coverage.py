@@ -35,7 +35,8 @@ itself. Checks 2, 3 and 5 read that parse when it reads a parameter of type
 `Bytes`, `&[u8]` or `Vec<u8>`. The parse can be in the handler, or in a helper
 one level down that the handler passes the body to. The type comes from a
 turbofish, then from a typed `let` in the same statement, then from a
-`Result<T, _>` return type. A `Value` body is free-form, so the audit skips it.
+`Result<T, _>` return type. A `Value` body is free-form, so checks 2 and 3
+skip it. Check 5 still reads it.
 
 Check 5 treats a bare `Json<T>` as mandatory, since axum rejects a request
 without it. A raw-byte parse is mandatory unless an `.is_empty()` test lets an
@@ -655,6 +656,8 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
         mandatory_body = bool(bare)
         if byte_parameters(params):
             for name, guarded in raw_body_parses(source, handler):
+                # An unguarded parse makes the body mandatory, whatever its type.
+                mandatory_body |= not guarded
                 if name is None:
                     unresolved.append(
                         "  %s %s: cannot read a `from_slice` call or resolve its "
@@ -662,7 +665,6 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
                     )
                 elif name != "Value":
                     parses.append((name, not guarded))
-                    mandatory_body |= not guarded
 
         request_body = route.get("request_body") or {}
         if mandatory_body and request_body.get("required") is not True:
@@ -1223,7 +1225,7 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             fixture_route("POST", "/raw/helper", 200, request_body=WIDGET_BODY),
             fixture_route("POST", "/raw/annotated", 200, request_body=WIDGET_BODY),
             fixture_route("POST", "/raw/returned", 200, request_body=OPTIONAL_WIDGET),
-            fixture_route("POST", "/raw/value", 200, request_body=body_of(required=False)),
+            fixture_route("POST", "/raw/value", 200, request_body=body_of()),
             fixture_route("POST", "/raw/other", 200),
         ],
         {},
@@ -1280,9 +1282,15 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
         {"undocumented": ["POST /raw/returned: `size` is accepted by Widget"]},
     ),
     (
+        "an unguarded Value body is marked required",
+        FIXTURE_BYTES,
+        [fixture_route("POST", "/raw/value", 200, request_body=body_of(required=False))],
+        {"body_required": ["POST /raw/value: the body is mandatory"]},
+    ),
+    (
         "a raw-byte body of unknown type is reported",
         FIXTURE_BYTES,
-        [fixture_route("POST", "/raw/untyped", 200, request_body=OPTIONAL_WIDGET)],
+        [fixture_route("POST", "/raw/untyped", 200, request_body=WIDGET_BODY)],
         {"unresolved": ["POST /raw/untyped: cannot read a `from_slice` call"]},
     ),
     (
