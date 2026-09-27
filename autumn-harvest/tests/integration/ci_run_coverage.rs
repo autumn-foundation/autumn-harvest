@@ -254,7 +254,6 @@ const ALLOWLIST: &[(&str, &str)] = &[
         ALLOWLIST_KAFKA_BROKER_REASON,
     ),
     ("plugin:dag_retry_integration", ALLOWLIST_DEBT_REASON),
-    ("plugin:dlq_redrive_integration", ALLOWLIST_DEBT_REASON),
     ("plugin:erase_payloads_integration", ALLOWLIST_DEBT_REASON),
     ("plugin:event_batch_integration", ALLOWLIST_DEBT_REASON),
     (
@@ -276,7 +275,6 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ),
     ("plugin:stalled_workflow_tests", ALLOWLIST_DEBT_REASON),
     ("plugin:telemetry_propagation_tests", ALLOWLIST_DEBT_REASON),
-    ("plugin:terminate_integration", ALLOWLIST_DEBT_REASON),
     ("plugin:usage_integration", ALLOWLIST_DEBT_REASON),
     ("plugin:version_usage_integration", ALLOWLIST_DEBT_REASON),
     (
@@ -293,7 +291,6 @@ const ALLOWLIST: &[(&str, &str)] = &[
         "plugin:workflow_history_pagination_integration",
         ALLOWLIST_DEBT_REASON,
     ),
-    ("plugin:workflow_reset_integration", ALLOWLIST_DEBT_REASON),
     ("plugin:workflow_result_integration", ALLOWLIST_DEBT_REASON),
 ];
 
@@ -1068,12 +1065,10 @@ fn core_module_executes(rows: &[SuiteRow], module: &str, required: &BTreeSet<Str
 ///
 /// Each entry must still be gated and still be unexecuted, so this list only
 /// shrinks. The DB guard above covers the `db` feature separately.
-const FEATURE_GATE_EXEMPT: &[(&str, &str)] = &[
-    (
-        "chaos_tests",
-        "chaos-feature-gated: runs in the dedicated nightly chaos.yml job",
-    ),
-];
+const FEATURE_GATE_EXEMPT: &[(&str, &str)] = &[(
+    "chaos_tests",
+    "chaos-feature-gated: runs in the dedicated nightly chaos.yml job",
+)];
 
 /// A suite behind a feature gate can compile in every CI job and still run in
 /// none. The unified-DAG suites were such a gap: no row enabled both

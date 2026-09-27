@@ -3064,6 +3064,24 @@ pub fn replaced_run_outcome(events: &[WorkflowEvent]) -> Option<&'static str> {
     })?
 }
 
+/// The state a result reader reports for a row in `state`.
+///
+/// A `CONTINUED_AS_NEW` row reports its [`replaced_run_outcome`] when it has
+/// one. Every other state reports itself. A value the schema does not allow
+/// reports `UNKNOWN`, which the caller treats as not yet terminal.
+async fn reported_outcome_state(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    state: &str,
+) -> HarvestResult<&'static str> {
+    if state == "CONTINUED_AS_NEW"
+        && let Some(outcome) = replaced_run_outcome_state(conn, exec_id).await?
+    {
+        return Ok(outcome);
+    }
+    Ok(crate::lifecycle::WorkflowState::from_db(state).map_or("UNKNOWN", |s| s.as_str()))
+}
+
 /// Load `exec_id`'s history and apply [`replaced_run_outcome`] to it.
 ///
 /// # Errors
@@ -9480,12 +9498,8 @@ pub async fn read_external_await_outcome(
 
         // A replaced run reports the outcome it had before the seal. Only a
         // real continue-as-new reaches the successor-chain arm below.
-        let replaced = if execution.state == "CONTINUED_AS_NEW" {
-            replaced_run_outcome_state(conn, current).await?
-        } else {
-            None
-        };
-        let outcome = match replaced.unwrap_or(execution.state.as_str()) {
+        let state = reported_outcome_state(conn, current, &execution.state).await?;
+        let outcome = match state {
             "COMPLETED" => {
                 // The target's `output` row column is read RAW. Core
                 // `append_events`/`load_history` use the identity codec (payload

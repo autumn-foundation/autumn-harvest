@@ -614,7 +614,7 @@ mod append_only_guard {
     fn only_the_two_sanctioned_files_write_stored_event_data() {
         let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut offenders = Vec::new();
-        let mut stack = vec![src.clone()];
+        let mut stack = vec![src];
         while let Some(dir) = stack.pop() {
             for entry in std::fs::read_dir(&dir)
                 .expect("read src/")

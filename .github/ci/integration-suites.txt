@@ -186,6 +186,7 @@ linux        autumn-harvest-plugin  dev_runtime_lifecycle            dev-runtime
 linux        autumn-harvest-plugin  dlq_aggregate_integration        -                          -
 linux        autumn-harvest-plugin  dlq_bulk_discard_perf            -                          -
 linux        autumn-harvest-plugin  dlq_bulk_integration             -                          -
+linux        autumn-harvest-plugin  dlq_redrive_integration          -                          -
 linux        autumn-harvest-plugin  eligibility_tests                -                          -
 linux        autumn-harvest-plugin  fail_now_integration             -                          -
 linux        autumn-harvest-plugin  fanout_degradation_integration   -                          -
@@ -217,6 +218,7 @@ linux        autumn-harvest-plugin  start_source_integration         -          
 linux        autumn-harvest-plugin  start_throttle_integration       -                          -
 linux        autumn-harvest-plugin  status_summary_integration       -                          -
 linux        autumn-harvest-plugin  status_summary_stalled_perf      -                          -
+linux        autumn-harvest-plugin  terminate_integration            -                          -
 linux        autumn-harvest-plugin  timeline_integration             -                          -
 linux        autumn-harvest-plugin  token_auth_integration           -                          -
 linux        autumn-harvest-plugin  triage_integration               -                          -
@@ -227,6 +229,7 @@ linux        autumn-harvest-plugin  workflow_children_traversal_perf -          
 linux        autumn-harvest-plugin  workflow_logs_integration        -                          -
 linux        autumn-harvest-plugin  workflow_reachability_integration  -                          -
 linux        autumn-harvest-plugin  workflow_rerun_integration       -                          -
+linux        autumn-harvest-plugin  workflow_reset_integration       -                          -
 linux        autumn-harvest-plugin  workflow_summaries_integration   -                          -
 linux        autumn-harvest-redis   dispatch_redis                   -                          -
 linux        autumn-harvest-redis   integration_redis                -                          -

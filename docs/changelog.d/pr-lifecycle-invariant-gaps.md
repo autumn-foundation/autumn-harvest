@@ -96,11 +96,15 @@ directly by design.
   walker's semantics never ran in CI.
 - `ci_run_coverage::every_feature_gated_core_suite_executes_in_some_row`
   catches that class of gap for any feature-gated suite, DB or not.
-- `cancellation_tests`, `redrive_tests`, `workflow_task_timeout_tests` and
-  `pause_tests` leave the `ci_run_coverage` debt allowlist and get `linux`
-  rows. They covered cancel, redrive, pause and the workflow task timeout
-  paths, and no CI step ran them. `pause_tests` also holds the two new
-  workflow task timeout regression tests.
+- Seven suites leave the `ci_run_coverage` debt allowlist and get `linux`
+  rows: `cancellation_tests`, `redrive_tests`, `workflow_task_timeout_tests`
+  and `pause_tests`, plus the plugin suites `terminate_integration`,
+  `workflow_reset_integration` and `dlq_redrive_integration`. They cover
+  cancel, redrive, pause, terminate, reset and the workflow task timeout, and
+  no CI step ran them. All pass. `pause_tests` also holds the two new workflow
+  task timeout regression tests. `dag_retry_integration` stays allowlisted:
+  `reset_without_the_flag_still_forks_an_erased_source` fails in reset-point
+  validation, code this change does not touch.
 - `specs/scheduler_claim_invariant.rs` is deleted. It was a Verus proof about
   the `harvest_dag_runs` claim, a table dropped in `20260514000000`. It was
   not built anywhere.
