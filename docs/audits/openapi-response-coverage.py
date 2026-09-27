@@ -52,7 +52,10 @@ skip it. The parse must be in the arm that runs for a non-empty body. An
 earlier `if body.is_empty() { .. }` also counts when its block returns `Ok(..)`
 and no error. A parse that turns its error into a value is
 optional too, such as `.ok()`, `.unwrap_or_default()` or an `if let Ok(..)`
-whose `else` does not reject. Check 2 applies only to a mandatory body.
+whose `else` does not reject. A guard or a tolerant call at a helper call site
+carries into the helper. Check 2 applies to every parse that does not tolerate
+its error, since a body that is present must then carry the mandatory fields.
+A bare `Json<T>` and a rejecting `Result<Json<T>, _>` are such parses.
 
 Check 4 reads the routes that take a `RawQuery` and parse the pairs by hand. A
 key those parsers match is a parameter the route accepts, so a key the contract
@@ -426,8 +429,13 @@ def byte_parameters(params: str) -> set[str]:
     return set(BYTE_PARAMETER.findall(params))
 
 
-def raw_body_parses(source: str, handler: str) -> list[tuple[str | None, bool]]:
-    """`(type, guarded)` for each raw-body parse in a handler and its helpers.
+def raw_body_parses(source: str, handler: str) -> list[tuple[str | None, bool, bool]]:
+    """`(type, optional, tolerant)` for each raw-body parse in a handler and helpers.
+
+    `optional` means an empty body can skip the parse, so the body is optional.
+    `tolerant` means the parse turns its error into a value, so a present body
+    need not carry the mandatory fields either. A guard or a tolerant call at
+    the helper call site carries into the helper.
 
     A helper counts only when the handler passes it a body variable, and only
     the helper parameters that receive the body are read as bodies. The type
@@ -448,8 +456,30 @@ def raw_body_parses(source: str, handler: str) -> list[tuple[str | None, bool]]:
             continue
         params, returns, block = parts
         receivers = receiving_parameters(handler_block, helper, params, carriers)
-        parses += block_parses(block, receivers & byte_parameters(params), returns)
+        found = block_parses(block, receivers & byte_parameters(params), returns)
+        if not found:
+            continue
+        guarded, tolerant = call_site_state(handler_block, helper, carriers)
+        parses += [(kind, o or guarded or tolerant, t or tolerant) for kind, o, t in found]
     return parses
+
+
+def call_site_state(block: str, helper: str, variables: set[str]) -> tuple[bool, bool]:
+    """Whether every call to `helper` that passes a body is guarded, or tolerant.
+
+    A call is guarded when an `.is_empty()` guard lets an empty body skip it. A
+    call is tolerant when it turns the helper's error into a value.
+    """
+    guarded = tolerant = True
+    for call in re.finditer(r"\b%s\s*\(" % re.escape(helper), block):
+        arguments = balanced(block[call.end() - 1 :])
+        passed = [v for v in variables if re.search(r"\b%s\b" % re.escape(v), arguments)]
+        if not passed:
+            continue
+        after = block[call.end() - 1 + len(arguments) :]
+        guarded &= any(guards(block, call.start(), variable) for variable in passed)
+        tolerant &= discards_error(block[: call.start()], after)
+    return guarded, tolerant
 
 
 def split_top_level(text: str) -> list[str]:
@@ -492,9 +522,11 @@ def receiving_parameters(block: str, helper: str, params: str, variables: set[st
     return receivers
 
 
-def block_parses(block: str, carriers: set[str], returns: str) -> list[tuple[str | None, bool]]:
-    """`(type, guarded)` for each `from_slice` call that reads a carrier."""
-    parses: list[tuple[str | None, bool]] = []
+def block_parses(
+    block: str, carriers: set[str], returns: str
+) -> list[tuple[str | None, bool, bool]]:
+    """`(type, optional, tolerant)` for each `from_slice` call that reads a carrier."""
+    parses: list[tuple[str | None, bool, bool]] = []
     for hit in FROM_SLICE.finditer(block):
         turbofish = None
         opener = hit.end() - 1
@@ -508,15 +540,17 @@ def block_parses(block: str, carriers: set[str], returns: str) -> list[tuple[str
             continue
         before = block[: hit.start()]
         after = block[opener + len(call) :]
-        guarded = guards(block, hit.start(), root.group(1)) or discards_error(before, after)
+        tolerant = discards_error(before, after)
+        optional = tolerant or guards(block, hit.start(), root.group(1))
         # A body read through an index, a method or a generic type is not
         # something the audit can type, so it is reported.
         if re.sub(r"^&\s*", "", argument) != root.group(1):
-            parses.append((None, guarded))
+            kind = None
         elif turbofish is not None and not re.fullmatch(r"[A-Za-z0-9_:]+", turbofish):
-            parses.append((None, guarded))
+            kind = None
         else:
-            parses.append((parse_type(turbofish, before, after, returns), guarded))
+            kind = parse_type(turbofish, before, after, returns)
+        parses.append((kind, optional, tolerant))
     return parses
 
 
@@ -552,7 +586,7 @@ def guards(block: str, position: int, variable: str) -> bool:
 def rejects_result_body(params: str, block: str) -> bool:
     """Whether a `Result<Json<T>, _>` body is mandatory, since its error rejects.
 
-    The body is mandatory when the handler applies `?` or `.map_err(..)` to it,
+    The body is mandatory when the handler applies `?` or `.map_err(..)?` to it,
     when the `Err` arm of a `match` on it builds an error, or when the `else`
     of a `let Ok(..) = body else` builds an error or returns. An `Err` arm that
     hands the request on, for example to replay a committed key, leaves it
@@ -562,8 +596,12 @@ def rejects_result_body(params: str, block: str) -> bool:
     if found is None:
         return False
     variable = re.escape(found.group(1))
-    if re.search(r"\b%s\s*(?:\?|\.map_err\s*\()" % variable, block):
+    if re.search(r"\b%s\s*\?" % variable, block):
         return True
+    for mapped in re.finditer(r"\b%s\s*\.map_err\s*\(" % variable, block):
+        arguments = balanced(block[mapped.end() - 1 :])
+        if block[mapped.end() - 1 + len(arguments) :].lstrip().startswith("?"):
+            return True
     for match in re.finditer(r"\bmatch\s+%s\s*\{" % variable, block):
         arms = balanced(block[match.end() - 1 :], "{", "}")
         failure = re.search(r"\bErr\s*\(", arms)
@@ -898,16 +936,18 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
             parses.append((body_type, bool(bare) or result_rejects))
         mandatory_body = bool(bare) or result_rejects
         if byte_parameters(params):
-            for name, guarded in raw_body_parses(source, handler):
-                # An unguarded parse makes the body mandatory, whatever its type.
-                mandatory_body |= not guarded
+            for name, optional, tolerant in raw_body_parses(source, handler):
+                # A parse an empty body cannot skip makes the body mandatory,
+                # whatever its type. A parse that does not tolerate its error
+                # needs the mandatory fields of any body that is present.
+                mandatory_body |= not optional
                 if name is None:
                     unresolved.append(
                         "  %s %s: cannot read a `from_slice` call or resolve its "
                         "body type" % (method, path)
                     )
                 elif name != "Value":
-                    parses.append((name, not guarded))
+                    parses.append((name, not tolerant))
 
         request_body = route.get("request_body") or {}
         if mandatory_body and request_body.get("required") is not True:
@@ -1325,6 +1365,9 @@ pub fn harvest_api_router() -> Router {
         .route("/e/let-else", post(e_let_else))
         .route("/e/err-succeeds", post(e_err_succeeds))
         .route("/e/documented", get(e_documented))
+        .route("/e/call-guard", post(e_call_guard))
+        .route("/e/guarded-fields", post(e_guarded_fields))
+        .route("/e/map-err-ok", post(e_map_err_ok))
 }
 
 async fn e_wrapped(body: Bytes) -> Response {
@@ -1628,6 +1671,27 @@ async fn e_err_succeeds(body: Result<Json<Gadget>, JsonRejection>) -> Response {
     StatusCode::OK.into_response()
 }
 
+async fn e_call_guard(body: Bytes) -> Response {
+    if !body.is_empty() {
+        let gadget = parse_gadget(&body)?;
+    }
+    StatusCode::OK.into_response()
+}
+
+async fn e_guarded_fields(body: Bytes) -> Response {
+    let gadget: Gadget = if body.is_empty() {
+        Gadget::default()
+    } else {
+        serde_json::from_slice(&body).map_err(reject)?
+    };
+    StatusCode::OK.into_response()
+}
+
+async fn e_map_err_ok(body: Result<Json<Gadget>, JsonRejection>) -> Response {
+    let gadget = body.map_err(log_rejection).ok();
+    StatusCode::OK.into_response()
+}
+
 async fn e_documented(Query(query): Query<Documented>) -> Response {
     StatusCode::OK.into_response()
 }
@@ -1828,7 +1892,7 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
                 "POST",
                 "/raw/returned",
                 200,
-                request_body=body_of(("name", False), required=False),
+                request_body=body_of(("name", True), required=False),
             ),
         ],
         {"undocumented": ["POST /raw/returned: `size` is accepted by Widget"]},
@@ -2406,6 +2470,39 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
         FIXTURE_EDGES,
         [fixture_route("GET", "/e/documented", 200, params=[query_param("kind", "string", False)])],
         {"query_params": ["GET /e/documented: `kind` is mandatory in Documented"]},
+    ),
+    (
+        "a guard around a helper call keeps the helper parse optional",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST", "/e/call-guard", 200, request_body=body_of(("name", True), required=False)
+            )
+        ],
+        {},
+    ),
+    (
+        "a guarded body still needs its mandatory fields",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST",
+                "/e/guarded-fields",
+                200,
+                request_body=body_of(("name", False), required=False),
+            )
+        ],
+        {"mandatory": ["POST /e/guarded-fields: `name` is mandatory in Gadget"]},
+    ),
+    (
+        "map_err without a ? does not reject",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST", "/e/map-err-ok", 200, request_body=body_of(("name", False), required=False)
+            )
+        ],
+        {},
     ),
     (
         "a malformed contract entry does not crash the audit",
