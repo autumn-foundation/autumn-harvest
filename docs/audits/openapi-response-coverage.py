@@ -867,6 +867,74 @@ SEARCH_PARAMS = [
 ]
 
 
+# Status literals, overrides, generic helpers, hand-parsed queries, and two
+# body shapes the audit must not misread.
+FIXTURE_STATUS = r"""
+pub fn harvest_api_router() -> Router {
+    Router::new()
+        .route("/s/literal", delete(s_literal))
+        .route("/s/override", post(s_override))
+        .route("/s/bare", get(s_bare))
+        .route("/s/generic", get(s_generic))
+        .route("/s/list", get(s_list))
+        .route("/s/scoped", post(s_scoped))
+        .route("/s/lenient", patch(s_lenient))
+}
+
+async fn s_literal(Path(id): Path<String>) -> Response {
+    if state == StatusCode::GONE {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn s_override() -> Response {
+    AutumnError::bad_request_msg("busy").with_status(StatusCode::CONFLICT).into_response()
+}
+
+async fn s_bare(Path(id): Path<String>) -> Result<Response, AutumnError> {
+    let thing = load(&id).map_err(AutumnError::not_found_msg)?;
+    Ok(StatusCode::OK.into_response())
+}
+
+fn map_error(error: HarvestError) -> Response {
+    StatusCode::SERVICE_UNAVAILABLE.into_response()
+}
+
+async fn s_generic() -> Response {
+    map_error(run())
+}
+
+async fn s_list(RawQuery(raw): RawQuery) -> Response {
+    for (key, value) in pairs {
+        match key.as_str() {
+            "limit" | "page_size" => {}
+            "order" => match value.as_str() {
+                "asc" => {}
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    StatusCode::OK.into_response()
+}
+
+async fn s_scoped(body: Bytes) -> Response {
+    let limit: u32 = 10;
+    let widget = serde_json::from_slice(&body).map(consume);
+    StatusCode::OK.into_response()
+}
+
+async fn s_lenient(body: Result<Json<Thing>, JsonRejection>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+struct Thing {
+    name: String,
+}
+"""
+
+
 # (name, source, routes, expected findings by check). Each expected string must
 # appear in exactly one finding, and the check must report nothing else.
 SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
@@ -890,7 +958,7 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             ),
             fixture_route("GET", "/things/{id}", 200),
         ],
-        {"statuses": ["GET /things/{id} returns 400 via AutumnError::bad_request_msg"]},
+        {"statuses": ["GET /things/{id} returns 400 via AutumnError::bad_request_msg, undeclared"]},
     ),
     (
         "a mandatory Json field is marked required",
@@ -1081,6 +1149,56 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             ]
         },
     ),
+    (
+        "an undeclared StatusCode literal is reported, a comparison is not",
+        FIXTURE_STATUS,
+        [fixture_route("DELETE", "/s/literal", 204)],
+        {"statuses": ["DELETE /s/literal returns 404, undeclared"]},
+    ),
+    (
+        "a with_status override carries its own status",
+        FIXTURE_STATUS,
+        [fixture_route("POST", "/s/override", 200)],
+        {"statuses": ["POST /s/override returns 409, undeclared"]},
+    ),
+    (
+        "a bare AutumnError fn ref is reported",
+        FIXTURE_STATUS,
+        [fixture_route("GET", "/s/bare", 200)],
+        {
+            "statuses": [
+                "GET /s/bare returns 404 via AutumnError::not_found_msg (bare fn ref), undeclared"
+            ]
+        },
+    ),
+    (
+        "a generic helper contributes no status",
+        FIXTURE_STATUS,
+        [fixture_route("GET", "/s/generic", 200)],
+        {},
+    ),
+    (
+        "an undocumented RawQuery key is reported, an alias is not",
+        FIXTURE_STATUS,
+        [fixture_route("GET", "/s/list", 200, params=[{"name": "page_size", "in": "query"}])],
+        {"query_keys": ["GET /s/list: `order` is accepted by the query parser"]},
+    ),
+    (
+        "a typed let in an earlier statement does not type a parse",
+        FIXTURE_STATUS,
+        [fixture_route("POST", "/s/scoped", 200, request_body=body_of(required=True))],
+        {"unresolved": ["POST /s/scoped: cannot resolve the body type"]},
+    ),
+    (
+        "a Result<Json<T>> body is not mandatory",
+        FIXTURE_STATUS,
+        [
+            fixture_route(
+                "PATCH", "/s/lenient", 200, request_body=body_of(("name", False), required=False)
+            )
+        ],
+        {},
+    ),
 ]
 
 
@@ -1090,6 +1208,14 @@ def self_test() -> int:
     for name, source, routes, expected in SELF_TESTS:
         found = audit(source, {"routes": routes}, fixture_struct(source))
         problems: list[str] = []
+        # A route the fixture router lacks is skipped, so its test would pass
+        # without a check.
+        known = {(method, path) for method, path, _ in router_routes(source)}
+        for route in routes:
+            if (route["method"], route["path"]) not in known:
+                problems.append(
+                    "%s %s: not in the fixture router" % (route["method"], route["path"])
+                )
         for check, reported in found.items():
             wanted = expected.get(check, [])
             for needle in wanted:
