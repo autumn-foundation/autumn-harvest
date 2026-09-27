@@ -57,6 +57,15 @@ ABBA deadlock risk) while every tracked function stayed identical.
 asserts the wrapper call appears, and appears before the per-row firing
 loop starts.
 
+Function extraction matches braces through `find_matching_brace`, not a
+raw character count. Codex review on PR #1696 found the raw count could
+be desynced by a brace inside a line comment, a block comment, or a
+string literal (including a raw string): a stray `}` truncates a tracked
+function early, silently hiding a real divergence after it; a stray `{`
+never finds its match and runs the scan past the end of the file.
+`find_matching_brace` walks the same comment/string lexical structure
+Rust itself does, so only a brace the grammar would count changes depth.
+
 Usage:
     python3 docs/audits/quota-lock-ordering-sync.py
 
@@ -110,15 +119,105 @@ CALL_SITE_GUARDS = [
 
 FN_SIGNATURE_RE_TEMPLATE = r"\n(?:async )?fn {name}\s*\("
 
+# Matches a raw string's opening delimiter: r, r#"..., r##"..., etc. Requires
+# the quote immediately after the hashes, so a raw identifier like `r#type`
+# (no quote) is never mistaken for one.
+_RAW_STRING_OPEN_RE = re.compile(r'r(#*)"')
+
+
+def _skip_line_comment(text: str, i: int) -> int:
+    j = text.find("\n", i)
+    return len(text) if j == -1 else j + 1
+
+
+def _skip_block_comment(text: str, i: int) -> int:
+    """`text[i:i+2]` is `/*`. Return the index just past the matching `*/`,
+    honoring Rust's nested block comments."""
+    n = len(text)
+    depth = 1
+    i += 2
+    while i < n and depth > 0:
+        two = text[i : i + 2]
+        if two == "/*":
+            depth += 1
+            i += 2
+        elif two == "*/":
+            depth -= 1
+            i += 2
+        else:
+            i += 1
+    return i
+
+
+def _skip_string_literal(text: str, i: int, raw_hashes: int = 0) -> int:
+    """`i` is just past the opening quote. Return the index just past the
+    closing quote (plus its hashes, for a raw string)."""
+    n = len(text)
+    if raw_hashes:
+        closer = '"' + "#" * raw_hashes
+        j = text.find(closer, i)
+        return n if j == -1 else j + len(closer)
+    while i < n:
+        if text[i] == "\\":
+            i += 2
+            continue
+        if text[i] == '"':
+            return i + 1
+        i += 1
+    return n
+
+
+def find_matching_brace(text: str, open_index: int) -> int:
+    """Return the index just past the `}` matching the `{` at `open_index`.
+
+    A naive character scan miscounts a brace that appears inside a line
+    comment, a block comment, or a string literal — Codex review on PR
+    #1696 found this could either truncate a tracked function early (a
+    stray `}` in a string silently drops the rest of the function from
+    comparison, so a real divergence after it passes as identical) or run
+    past the end of the file (a stray `{` in a string never finds its
+    match, and the caller's index into `text` goes out of range). This
+    walks the same lexical structure rustfmt would, so a brace only counts
+    when Rust's own grammar would count it.
+    """
+    n = len(text)
+    depth = 0
+    i = open_index
+    while i < n:
+        c = text[i]
+        if c == "/" and i + 1 < n and text[i + 1] == "/":
+            i = _skip_line_comment(text, i)
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "*":
+            i = _skip_block_comment(text, i)
+            continue
+        if c == '"':
+            i = _skip_string_literal(text, i + 1)
+            continue
+        raw_match = _RAW_STRING_OPEN_RE.match(text, i)
+        if raw_match:
+            i = _skip_string_literal(text, raw_match.end(), raw_hashes=len(raw_match.group(1)))
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    raise ValueError(f"unterminated brace starting at index {open_index}")
+
 
 def extract_function(text: str, name: str) -> str | None:
     """Return `name`'s full source (signature through closing brace).
 
     Finds the signature line, then the first `{`, then matches braces to
-    that function's own closing `}`. Doc comments and attributes above the
-    signature are not included — deliberately, so the two copies' shared
-    line-number-dependent `#[cfg(...)]` placement never causes a false
-    divergence unrelated to the algorithm itself.
+    that function's own closing `}` via `find_matching_brace`, so a brace
+    inside a comment or string literal in the function body cannot end the
+    extraction early or run it off the end of the file. Doc comments and
+    attributes above the signature are not included — deliberately, so the
+    two copies' shared line-number-dependent `#[cfg(...)]` placement never
+    causes a false divergence unrelated to the algorithm itself.
     """
     sig_re = re.compile(FN_SIGNATURE_RE_TEMPLATE.format(name=re.escape(name)))
     m = sig_re.search(text)
@@ -126,15 +225,8 @@ def extract_function(text: str, name: str) -> str | None:
         return None
     start = m.start() + 1  # skip the leading newline
     open_brace = text.index("{", m.end())
-    depth = 1
-    i = open_brace + 1
-    while depth > 0:
-        if text[i] == "{":
-            depth += 1
-        elif text[i] == "}":
-            depth -= 1
-        i += 1
-    return text[start:i]
+    end = find_matching_brace(text, open_brace)
+    return text[start:end]
 
 
 def check_call_site_guard(
