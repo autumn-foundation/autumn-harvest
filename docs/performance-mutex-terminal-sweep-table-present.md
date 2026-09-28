@@ -30,8 +30,18 @@ activity has none of):
   that succeeds does it set `retry_committed = true` and gate the evaluator
   call behind `if !retry_committed`. So a `FAILED` predecessor whose retry
   was successfully scheduled reaches a terminal *state* without reaching
-  this sweep at all — the lock release waits for whichever attempt finally
-  stops retrying.
+  this sweep at all. This page originally guessed that a later attempt's own
+  sweep would eventually release the lock; it doesn't. The retry runs under
+  a **new** `ExecutionId` (`rid`), `harvest_mutex_locks.holder_exec_id`
+  matches against the exact id passed to the sweep, and nothing transfers
+  `holder_exec_id` from the predecessor to `rid` (no write site does). The
+  predecessor's lock, if it held one, sits until `reclaim_expired_leases_
+  and_wake`'s lease-expiry sweep reclaims it — not until any later attempt's
+  own terminal sweep. That is a real mutex-semantics question (a lock a
+  failed-and-retried workflow held is not released until its lease expires,
+  not at the retry decision), out of scope to fix from a Ledger performance
+  pass — noted here only because this page's own table_present() accounting
+  must not misstate what the surrounding function actually does.
 * continue-as-new sealing (`worker.rs:18719`)
 * workflow reset (`reset.rs:1335`)
 
