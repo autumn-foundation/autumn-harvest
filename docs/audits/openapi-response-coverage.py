@@ -1246,7 +1246,7 @@ BYTE_PARAMETER = re.compile(
 # `resolve_aliases` rewrites every import of it and every alias to this path
 # first, so this one pattern reads them all. `Uuid::from_slice` and a local
 # `from_slice` are no body parse.
-FROM_SLICE_CALL = re.compile(r"\bserde_json::from_slice\s*(?:::<|\()")
+FROM_SLICE_CALL = re.compile(r"\bserde_json::from_(?:slice|str)\s*(?:::<|\()")
 
 
 @functools.lru_cache(maxsize=None)
@@ -1728,6 +1728,47 @@ class Carriers(dict):
     possible: frozenset[str] = frozenset()
     # Each name a destructuring pattern binds anew to a carrier, with where.
     rebound: dict[str, int] = {}
+    # Each name bound to a standard conversion of a carrier, with where.
+    derived: dict[str, int] = {}
+
+
+def std_conversion_source(
+    block: str, carriers: dict[str, int], expression: str, position: int
+) -> str | None:
+    """The carrier that a standard conversion in `expression` reads whole, or `None`.
+
+    A standard conversion is a call of a `std`, `core` or `alloc` path, or
+    of a standard type such as `String::from_utf8`, with one argument that
+    reads a live, whole carrier. A trailing success projection or
+    `.map_err(..)` keeps it, so `std::str::from_utf8(&body)?` reads `body`.
+    """
+    text = expression.strip().rstrip(",").strip()
+    while True:
+        lead = re.match(r"(?:&\s*(?:mut\b)?|\*)\s*", text)
+        if lead and lead.end():
+            text = text[lead.end() :].strip()
+            continue
+        if text.startswith("(") and len(balanced(text)) == len(text):
+            text = text[1:-1].strip()
+            continue
+        mapped = r"\.\s*map_err\s*\((?:[^()]|\([^()]*\))*\)"
+        step = re.search(r"\s*(?:%s|%s)$" % (SUCCESS_STEP, mapped), text)
+        if step and step.start():
+            text = text[: step.start()].strip()
+            continue
+        break
+    call = re.match(r"((?:[A-Za-z_]\w*\s*::\s*)+[a-z_]\w*)\s*\(", text)
+    if call is None or len(balanced(text[call.end() - 1 :])) != len(text) - call.end() + 1:
+        return None
+    path = call.group(1)
+    standard = std_path(path, site_in(block, position)) or path_segments(path)[0] in STD_TYPES
+    arguments = split_top_level(text[call.end() : -1])
+    if not standard or len(arguments) != 1:
+        return None
+    root, whole = argument_root(arguments[0])
+    if not whole or root not in carriers or not carrier_live(block, carriers, root, position):
+        return None
+    return None if carrier_partial(carriers, root, position) else root
 
 
 def carrier_live(block: str, carriers: dict[str, int], name: str, position: int) -> bool:
@@ -1776,6 +1817,7 @@ def moved_names(block: str, names: set[str] | dict[str, int]) -> Carriers:
     """
     found = Carriers(names if isinstance(names, dict) else {name: -1 for name in names})
     found.rebound = {}
+    found.derived = {}
     partial: set[str] = set()
     lets = [
         (let.group(1), let.start(), let.end(), block[let.end() : statement_end(block, let.end())])
@@ -1820,6 +1862,22 @@ def moved_names(block: str, names: set[str] | dict[str, int]) -> Carriers:
                         moved.setdefault(bound, (found[bound], bound in partial))
                 elif bound not in moved:
                     moved[bound] = (at, True)
+        # A `let` or an assignment whose value is a standard conversion of a
+        # carrier, or another derived name, binds a derived name. Only a
+        # serde_json parse reads it, as `block_parses` does.
+        derivations = [(b, st, op, v) for b, st, op, v in lets] + list(assigned)
+        derived_before = len(found.derived)
+        for bound, start, opener, value in derivations:
+            if bound in found or bound in found.derived:
+                continue
+            source = std_conversion_source(block, found, value, start)
+            aliased = any(
+                live_passes(block, value, opener, name, at) == "direct"
+                and live_binding(block, name, start, at)
+                for name, at in list(found.derived.items())
+            )
+            if source is not None or aliased:
+                found.derived[bound] = start
         # A plain assignment `name = value;` moves a carrier as a `let` does.
         # One that gives a carrier name another value leaves it partial from
         # there, which fails closed, since a branch may skip it.
@@ -1836,7 +1894,7 @@ def moved_names(block: str, names: set[str] | dict[str, int]) -> Carriers:
                 continue
             if way and target not in moved:
                 moved[target] = (start, way == "wrapped")
-        if not moved:
+        if not moved and len(found.derived) == derived_before:
             found.partial = frozenset(partial)
             return found
         for bound, (start, is_partial) in moved.items():
@@ -2523,12 +2581,21 @@ def block_parses(block: str, carriers: dict[str, int], returns: str) -> list[Par
         call = balanced(block[opener:])
         argument = call[1:-1].strip().rstrip(",").strip()
         root, whole = argument_root(argument)
+        # A standard conversion of a carrier, inline or bound to a derived
+        # name, is read like the carrier itself.
+        converted = std_conversion_source(block, carriers, argument, hit.start())
+        derived = getattr(carriers, "derived", {})
+        if converted is not None:
+            root, whole = converted, True
+        elif root in derived and root not in carriers:
+            if not live_binding(block, root, hit.start(), derived[root]):
+                continue
         possible = root in possible_names(carriers) and root not in carriers
-        if root is None or root not in carriers and not possible:
+        if root is None or root not in carriers and not possible and root not in derived:
             continue
         if root in carriers and not carrier_live(block, carriers, root, hit.start()):
             continue
-        if root not in carriers and not live_binding(block, root, hit.start()):
+        if root in possible_names(carriers) and not live_binding(block, root, hit.start()):
             continue
         before = block[: hit.start()]
         after = block[opener + len(call) :]
@@ -4423,10 +4490,18 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
             reference = query.group(1)
             name = reference.split("::")[-1]
             # An absent query string turns `Option<Query<T>>` into `None`, so
-            # none of its fields is mandatory.
+            # none of its fields is mandatory, unless the handler rejects it.
             # A `Result<Query<T>, _>` whose error the handler tolerates acts the same.
             prefix = params[: query.start()]
             wrapped = re.search(r"%s<\s*(?:[a-z_]+::)*$" % OPTION, prefix) is not None
+            # An `Option<Query<T>>` whose `None` the handler rejects, as
+            # `error_rejects` reads it for bodies too, keeps every field's
+            # own required flag.
+            absent = re.search(
+                r"\b([a-z_][a-z_0-9]*)\s*:\s*%s<\s*(?:[a-z_]+::)*$" % OPTION, prefix
+            )
+            if absent and error_rejects(absent.group(1), block, kind="option"):
+                wrapped = False
             result = re.search(
                 r"\b([a-z_][a-z_0-9]*)\s*:\s*%s<\s*(?:[a-z_]+::)*$" % RESULT, prefix
             )
@@ -5047,6 +5122,9 @@ pub fn harvest_api_router() -> Router {
         .route("/s/std-paths", get(s_std_paths))
         .route("/s/spoofed-query", get(s_spoofed_query))
         .route("/s/std-alias-field", get(s_std_alias_field))
+        .route("/s/option-query-rejected", get(s_option_query_rejected))
+        .route("/s/option-query-unwrapped", get(s_option_query_unwrapped))
+        .route("/s/option-query-tolerated", get(s_option_query_tolerated))
         .route("/s/no-query/{id}", get(s_no_query))
         .route("/s/raw-and-query", get(s_raw_and_query))
         .route("/s/trusted-id", get(s_trusted_id))
@@ -5215,6 +5293,25 @@ async fn s_raw_query(axum::extract::RawQuery(raw): axum::extract::RawQuery) -> R
 }
 
 async fn s_unread_query(Query(page): Query<MissingPage>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+struct StrictPage {
+    limit: u32,
+}
+
+async fn s_option_query_rejected(query: Option<Query<StrictPage>>) -> Response {
+    let Query(page) = query.ok_or_else(reject)?;
+    StatusCode::OK.into_response()
+}
+
+async fn s_option_query_unwrapped(query: Option<Query<StrictPage>>) -> Response {
+    let Query(page) = query.unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn s_option_query_tolerated(query: Option<Query<StrictPage>>) -> Response {
+    let page = query.map(|Query(page)| page);
     StatusCode::OK.into_response()
 }
 
@@ -6010,6 +6107,12 @@ pub fn harvest_api_router() -> Router {
         .route("/e/extension-decode", post(e_extension_decode))
         .route("/e/grouped-receiver", post(e_grouped_receiver))
         .route("/e/macro-carrier", post(e_macro_carrier))
+        .route("/e/utf8-derived", post(e_utf8_derived))
+        .route("/e/utf8-inline", post(e_utf8_inline))
+        .route("/e/utf8-assigned", post(e_utf8_assigned))
+        .route("/e/utf8-form", post(e_utf8_form))
+        .route("/e/utf8-inspected", post(e_utf8_inspected))
+        .route("/e/helper-text", post(e_helper_text))
         .route("/e/option-inline", post(e_option_inline))
         .route("/e/result-inline", post(e_result_inline))
         .route("/e/option-deref", post(e_option_deref))
@@ -7757,6 +7860,49 @@ async fn e_match_rejects_tolerant(body: Bytes) -> Response {
         false => {}
     }
     let gadget: Gadget = serde_json::from_slice(&body).unwrap_or_default();
+    StatusCode::OK.into_response()
+}
+
+async fn e_utf8_derived(body: Bytes) -> Response {
+    let text = std::str::from_utf8(&body)?;
+    let gadget = serde_json::from_str::<Gadget>(text).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_utf8_inline(body: Bytes) -> Response {
+    let gadget = serde_json::from_str::<Gadget>(std::str::from_utf8(&body).unwrap()).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_utf8_assigned(body: Bytes) -> Response {
+    let text;
+    text = std::str::from_utf8(&body).map_err(reject)?;
+    let gadget = serde_json::from_str::<Gadget>(text).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_utf8_form(body: Bytes) -> Response {
+    let raw = std::str::from_utf8(&body).map_err(reject)?;
+    for pair in raw.split('&') {
+        record_pair(pair);
+    }
+    StatusCode::OK.into_response()
+}
+
+fn summary_text(raw: &[u8]) -> String {
+    format!("{} bytes", raw.len())
+}
+
+async fn e_helper_text(body: Bytes) -> Response {
+    let text = crate::summary_text(&body);
+    let gadget = serde_json::from_str::<Gadget>(&text).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_utf8_inspected(body: Bytes) -> Response {
+    if std::str::from_utf8(&body).is_ok() {
+        tracing::debug!("utf-8");
+    }
     StatusCode::OK.into_response()
 }
 
@@ -10688,6 +10834,24 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
         },
     ),
     (
+        "an Option<Query<T>> whose None rejects keeps each field's required flag",
+        FIXTURE_ALIAS_SCOPES,
+        [
+            fixture_route("GET", path, 200, params=[query_param("limit", "integer", False)])
+            for path in (
+                "/s/option-query-rejected",
+                "/s/option-query-unwrapped",
+                "/s/option-query-tolerated",
+            )
+        ],
+        {
+            "query_params": [
+                "GET /s/option-query-rejected: `limit` is mandatory in StrictPage",
+                "GET /s/option-query-unwrapped: `limit` is mandatory in StrictPage",
+            ]
+        },
+    ),
+    (
         "an aliased import of a standard type is that type, in a field and in a parameter",
         FIXTURE_ALIAS_SCOPES,
         [
@@ -11062,6 +11226,35 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
                 "POST /e/match-guard: `name` is mandatory in Gadget",
                 "POST /e/match-not-guard: `name` is mandatory in Gadget",
                 "POST /e/match-wildcard: `name` is mandatory in Gadget",
+            ],
+        },
+    ),
+    (
+        "a standard conversion of the body is a derived carrier that a serde_json parse reads",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST", "/e/" + path, 200, request_body=body_of(("name", False), required=False)
+            )
+            for path in (
+                "utf8-derived",
+                "utf8-inline",
+                "utf8-assigned",
+                "utf8-form",
+                "utf8-inspected",
+                "helper-text",
+            )
+        ],
+        {
+            "body_required": [
+                "POST /e/utf8-derived: the body is mandatory",
+                "POST /e/utf8-inline: the body is mandatory",
+                "POST /e/utf8-assigned: the body is mandatory",
+            ],
+            "mandatory": [
+                "POST /e/utf8-derived: `name` is mandatory in Gadget",
+                "POST /e/utf8-inline: `name` is mandatory in Gadget",
+                "POST /e/utf8-assigned: `name` is mandatory in Gadget",
             ],
         },
     ),
