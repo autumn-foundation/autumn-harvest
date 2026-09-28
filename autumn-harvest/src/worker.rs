@@ -26165,7 +26165,7 @@ async fn dispatch_call_with_timeout<T>(
 /// implementation. `ack_many_inner` does two round trips per queue: an
 /// `XACK`/`XDEL` pipeline, then a separate marker-cleanup script.
 /// `release_many_inner` / `requeue_batch` are one round trip per queue.
-/// The dispatch read is six; see [`dispatch_read_timeout`].
+/// The dispatch read asks its channel; see [`dispatch_read_timeout`].
 ///
 /// `lease_count` covers a different implementation entirely (Codex review,
 /// issue #1429 follow-up). `TaskDispatch::ack_many`/`release_many`'s own
@@ -26189,29 +26189,19 @@ fn dispatch_batch_timeout(
         .saturating_mul(u32::try_from(queue_rounds.max(lease_count)).unwrap_or(u32::MAX))
 }
 
-/// Round trips a single dispatch-read visit can need (Codex review, issue
-/// #1756 follow-up). The common case is one `XREADGROUP`. A missing
-/// consumer group costs three instead: `read_with_heal` issues the failed
-/// `XREADGROUP`, then `ensure_groups`, then a healed retry `XREADGROUP`.
-const DISPATCH_READ_VISIT_ROUND_TRIPS: usize = 3;
-
-/// Sequential round trips per queue that a dispatch read can make outside
-/// its blocking wait. `read_across_queues` makes one non-blocking pass over
-/// every queue first. A deadline that passes mid-lap also finishes that lap
-/// with non-blocking reads, so each remaining queue gets one more visit
-/// after the wait ends (#1756). Both visits are budgeted at
-/// [`DISPATCH_READ_VISIT_ROUND_TRIPS`], not one, since either one can be the
-/// visit that heals a missing consumer group.
-const DISPATCH_READ_ROUND_TRIPS_PER_QUEUE: usize = DISPATCH_READ_VISIT_ROUND_TRIPS * 2;
-
 /// The outer deadline for a dispatch-channel read. It is the blocking wait
-/// plus [`DISPATCH_READ_ROUND_TRIPS_PER_QUEUE`] call timeouts per queue.
-/// The read must not expire while a round trip is in flight. Expiry drops
-/// the future, and an entry that `XREADGROUP` already claimed then stays
-/// pending until visibility recovery. A healed visit is three such round
-/// trips, not one, so the budget must cover that worst case too.
-fn dispatch_read_timeout(block_for: Duration, queue_count: usize) -> Duration {
-    block_for + dispatch_batch_timeout(queue_count, DISPATCH_READ_ROUND_TRIPS_PER_QUEUE, 0)
+/// plus one call timeout per round trip the channel reports for each queue
+/// ([`crate::dispatch::TaskDispatch::next_round_trips_per_queue`]). The read must not expire
+/// while a round trip is in flight. Expiry drops the future, and an entry
+/// that the read already claimed then stays pending until visibility
+/// recovery. The count comes from the channel, so only a channel that
+/// needs a larger budget gets one (#1756).
+fn dispatch_read_timeout(
+    block_for: Duration,
+    queue_count: usize,
+    round_trips_per_queue: usize,
+) -> Duration {
+    block_for + dispatch_batch_timeout(queue_count, round_trips_per_queue, 0)
 }
 
 /// Per-shard block duration for a dispatch-channel read during multi-shard
@@ -28795,15 +28785,20 @@ impl Worker {
         // per queue before its own blocking phase even starts. See
         // `read_across_queues`'s doc comment. A flat call timeout sized
         // for one round trip can then fire before that pass alone
-        // finishes. A deadline that passes mid-lap adds up to one more
-        // round trip per queue after the wait, so the cap budgets two per
-        // queue. See [`dispatch_read_timeout`]. `tokio::time::timeout`
+        // finishes. The Redis channel can also finish a lap after its
+        // deadline and heal a missing group. The channel reports its own
+        // round trips per queue, so the cap covers them. See
+        // [`dispatch_read_timeout`]. `tokio::time::timeout`
         // drops the whole future on expiry. An entry the read had already
         // claimed from an earlier queue then never reaches the channel's
         // own requeue-on-drop path. It sits pending until visibility
         // recovery, not just delayed. The shutdown arm gives a stopping
         // worker its exit without waiting out the read.
-        let read_timeout = dispatch_read_timeout(block_for, self.config.queues.len());
+        let read_timeout = dispatch_read_timeout(
+            block_for,
+            self.config.queues.len(),
+            installed.channel.next_round_trips_per_queue(),
+        );
         let read = tokio::select! {
             () = self.shutdown.cancelled() => return 0,
             result = tokio::time::timeout(
@@ -42716,26 +42711,27 @@ mod tests {
         );
     }
 
-    /// The read deadline covers the initial non-blocking pass and a lap
-    /// that finishes after the wait ends. Either visit can be the one that
-    /// heals a missing consumer group, so each is budgeted at
-    /// `DISPATCH_READ_VISIT_ROUND_TRIPS` (three), not one (#1756 follow-up).
+    /// The read deadline scales with the round trips per queue that the
+    /// channel reports. A channel with the default count of one keeps the
+    /// old deadline, so a stalled custom dispatcher still times out
+    /// quickly (#1756).
     #[test]
-    fn dispatch_read_timeout_budgets_the_initial_pass_and_a_forced_lap() {
+    fn dispatch_read_timeout_scales_with_the_channel_round_trip_count() {
         let block_for = Duration::from_secs(2);
         assert_eq!(
-            dispatch_read_timeout(block_for, 3),
+            dispatch_read_timeout(block_for, 3, 1),
+            block_for + DISPATCH_CALL_TIMEOUT * 3,
+            "a default channel keeps one call timeout per queue"
+        );
+        assert_eq!(
+            dispatch_read_timeout(block_for, 3, 6),
             block_for + DISPATCH_CALL_TIMEOUT * 18,
-            "three queues need three healed pass round trips and three healed forced-lap round trips"
+            "a channel that reports six round trips per queue gets six call timeouts per queue"
         );
         assert_eq!(
-            dispatch_read_timeout(block_for, 1),
-            block_for + DISPATCH_CALL_TIMEOUT * 6,
-        );
-        assert_eq!(
-            dispatch_read_timeout(Duration::ZERO, 0),
-            DISPATCH_CALL_TIMEOUT * 6,
-            "an empty queue list still gets one queue's worth of budget"
+            dispatch_read_timeout(Duration::ZERO, 0, 0),
+            DISPATCH_CALL_TIMEOUT,
+            "an empty queue list and a zero count still get one call timeout"
         );
     }
 
