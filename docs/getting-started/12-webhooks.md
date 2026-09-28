@@ -18,9 +18,10 @@ dispatches it idempotently.
 
 ## Enable the feature
 
-`#[webhook]`-annotated functions compile with no extra setup, but the plugin
-wiring in [step 3](#3-wire-the-plugin) below does not: `HarvestPlugin::webhooks(...)`
-and `WebhookCtx` live behind the `webhooks` Cargo feature on
+`#[webhook]`-annotated functions compile with no extra setup — `WebhookCtx`
+and the macro itself live in `autumn-harvest`'s unconditional core. The
+plugin wiring in [step 3](#3-wire-the-plugin) below is different:
+`HarvestPlugin::webhooks(...)` lives behind the `webhooks` Cargo feature on
 `autumn-harvest-plugin` — off by default, the same shape as
 [chapter 13](13-broker-connectors.md)'s `connectors` feature:
 

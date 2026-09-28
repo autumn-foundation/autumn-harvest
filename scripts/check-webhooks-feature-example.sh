@@ -2,9 +2,10 @@
 # Fails if chapter 12's webhook example regresses, in either of two ways:
 #
 # 1. Doc drift: the "Enable the feature" note (added by an Onramp
-#    clean-room pass) that tells the reader `HarvestPlugin::webhooks(...)`
-#    and `WebhookCtx` need `autumn-harvest-plugin`'s `webhooks` Cargo
-#    feature disappears from the chapter, or is moved past step 3.
+#    clean-room pass) -- which tells the reader that
+#    `HarvestPlugin::webhooks(...)` needs `autumn-harvest-plugin`'s
+#    `webhooks` Cargo feature -- disappears from the chapter, or moves
+#    past step 3.
 # 2. Code drift: step 2's `#[webhook]` mapping function and step 3's
 #    `HarvestPlugin` wiring stop compiling against the real crate.
 #
