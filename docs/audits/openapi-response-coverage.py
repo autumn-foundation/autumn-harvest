@@ -50,7 +50,9 @@ that the handler passes the body to, at any depth up to `HELPER_DEPTH`. A
 recursive helper is read once per chain of calls. In a helper, only the
 parameter at the position of the body argument is a body. A move into another
 name, such as `let captured = body;`, is followed. A copy through a call, such
-as `body.to_vec()`, is read only inside a standard conversion. The type comes from a turbofish, then from a
+as `body.to_vec()`, is read only inside a standard conversion. A byte accessor
+such as `body.as_ref()` is no handoff, unless a local method of that name may
+run on the body's type, as `local_methods` reads it. The type comes from a turbofish, then from a
 typed `let` in the same statement, then from a `Result<T, _>` return type. The
 last two apply only when the call ends its expression, since a `.map(..)` after
 it yields another type. A `Value` body is free-form, so checks 2 and 3 skip it.
@@ -84,7 +86,9 @@ decides: a response, an error or a `Result` can be a rejection, and a plain
 value type such as `Gadget` is not. A helper the audit cannot find counts as a
 rejection. An `.or_else(..)` whose fallback yields `Ok(..)` on every path makes
 a later `?` tolerant. A guard or a tolerant call at a helper call site carries
-into the helper. Check 2 applies to every parse that does not tolerate its
+into the helper. A parse in a closure that a `let` binds and that runs only
+where it is called reads the guard at each call, and the strictest call
+decides. Check 2 applies to every parse that does not tolerate its
 error, since a body that is present must then carry the mandatory fields. A bare
 `Json<T>` and a rejecting `Result<Json<T>, _>` are such parses.
 
@@ -831,6 +835,65 @@ def method_targets(
     if typed is None:
         return None
     return resolve_symbol("fn", typed + "::" + method, site_in(block, at)) or []
+
+
+# The types a carrier can have when its written type is unknown.
+BYTE_RECEIVER_TYPES = frozenset({"Bytes", "Vec", BYTE_SLICE, "Option", "Result"})
+
+
+def local_methods(
+    block: str, params: str, receiver: str, method: str, at: int
+) -> list[int]:
+    """The local methods named `method` that a carrier `receiver` at `at` may run.
+
+    A method of an `impl` for the carrier's type counts, as `receiver_type`
+    reads that type. A carrier of unknown type may have any byte type in
+    `BYTE_RECEIVER_TYPES`. A default method of a local trait counts, and so
+    does a method of a blanket `impl` for a type parameter. Each may run on
+    the carrier. A method of an `impl` for any other type does not.
+    """
+    typed = receiver_type(block, params, receiver, at)
+    types = {path_segments(typed)[-1]} if typed and path_segments(typed) else BYTE_RECEIVER_TYPES
+    found = []
+    for start, owner, _, _ in function_index(SOURCE[0]).get(method, []):
+        if owner is None:
+            continue
+        keyword, generics = owner_block(SOURCE[0], start)
+        if keyword == "trait" or owner in generics or owner in types:
+            found.append(start)
+    return found
+
+
+def owner_block(source: str, position: int) -> tuple[str | None, frozenset[str]]:
+    """The keyword and type parameters of the innermost `impl` or `trait` at `position`."""
+    holding = [block for block in owner_blocks(source) if block[0] < position < block[1]]
+    if not holding:
+        return None, frozenset()
+    _, _, keyword, generics = max(holding)
+    return keyword, generics
+
+
+@functools.lru_cache(maxsize=None)
+def owner_blocks(source: str) -> list[tuple[int, int, str, frozenset[str]]]:
+    """`(start, end, keyword, type parameters)` for each `impl` or `trait` block."""
+    found = []
+    for head in re.finditer(r"\b(impl|trait)\b", source):
+        brace = source.find("{", head.end())
+        stop = source.find(";", head.end())
+        if brace < 0 or 0 <= stop < brace:
+            continue
+        header = source[head.end() : brace].lstrip()
+        if head.group(1) == "trait":
+            header = re.sub(r"^[A-Za-z_]\w*\s*", "", header)
+        names: set[str] = set()
+        if header.startswith("<"):
+            for item in split_top_level(balanced(header, "<", ">")[1:-1]):
+                name = re.match(r"\s*(?:const\s+)?([A-Za-z_]\w*)", item)
+                if name:
+                    names.add(name.group(1))
+        end = brace + len(balanced(source[brace:], "{", "}"))
+        found.append((brace, end, head.group(1), frozenset(names)))
+    return found
 
 
 def call_receiver(block: str, dot: int) -> str | None:
@@ -2392,7 +2455,7 @@ def handoffs(
     # grouped or borrowed receiver such as `(&body)` is read like `body`, and
     # one that holds the carrier in any other way fails closed.
     for call in qualified_calls(block) if receivers else []:
-        if call.group(1).strip() != "." or call.group(2) in RECEIVER_READS:
+        if call.group(1).strip() != ".":
             continue
         method, expression = call.group(2), receiver_expression(block, call.start())
         for variable in carriers:
@@ -2401,6 +2464,13 @@ def handoffs(
                 continue
             if in_dead_closure(block, call.start()):
                 continue
+            # A method of `RECEIVER_READS` is no handoff, unless a local
+            # definition of that name may run on the carrier's type.
+            local = None
+            if method in RECEIVER_READS:
+                local = local_methods(block, params, variable, method, call.start())
+                if not local:
+                    continue
             after = block[call.end() - 1 + len(balanced(block[call.end() - 1 :])) :]
             tolerant = discards_error(block[: call.start()], after)
             allowed = empty_allowed(block, call.start(), variable, tolerant)
@@ -2410,9 +2480,14 @@ def handoffs(
             # A partial carrier reaches no method the audit can follow. A whole
             # one reaches only a method of an `impl` for its own type.
             partial = carrier_partial(carriers, variable, call.start())
-            starts = (
-                None if partial else method_targets(block, params, variable, method, call.start())
-            )
+            if local is not None:
+                starts = None if partial else local
+            else:
+                starts = (
+                    None
+                    if partial
+                    else method_targets(block, params, variable, method, call.start())
+                )
             parts = parts_at(source, starts[0]) if starts and len(starts) == 1 else None
             if method in CONVERSIONS:
                 # A conversion hands the body to the constructor it runs.
@@ -2645,6 +2720,34 @@ def closure_body_end(text: str, after: int) -> tuple[int, int]:
     return opener, opener + (cut[0] if cut else len(rest))
 
 
+def closure_calls(block: str, position: int) -> list[int]:
+    """Where the closure that holds `position` in `block` is called, or nothing.
+
+    The innermost closure that holds `position` counts only when a `let`
+    binds it by name and each later use of that name, as `live_binding` reads
+    it, is a direct call such as `parse()`. Its body then runs at those
+    calls, so a guard or an early exit there applies. Any other closure,
+    such as one passed to a helper or a combinator, runs where the audit
+    cannot see, so this is empty and the caller reads `position` itself.
+    """
+    holding = [item for item in closures(block) if item[1] <= position < item[2]]
+    if not holding:
+        return []
+    start, _, stop = max(holding)
+    bound = re.search(r"\blet\s+(?:mut\s+)?([a-z_][a-z_0-9]*)\s*(?::[^=;]*)?=\s*$", block[:start])
+    if bound is None or bound.group(1) == "_":
+        return []
+    calls = []
+    for use in re.finditer(r"(?<![.\w])%s\b" % re.escape(bound.group(1)), block[stop:]):
+        at = stop + use.start()
+        if not live_binding(block, bound.group(1), at, bound.start()):
+            continue
+        if not re.match(r"\s*\(", block[stop + use.end() :]):
+            return []
+        calls.append(at)
+    return calls
+
+
 def in_dead_closure(block: str, position: int) -> bool:
     """Whether `position` is inside a closure in `block` that never runs.
 
@@ -2841,9 +2944,16 @@ def empty_allowed(block: str, position: int, variable: str, tolerant: bool) -> b
     lets an empty body skip the parse. A tolerant parse lets it through
     too, unless an earlier empty-body test rejects it, as `rejects_empty`
     reads it.
+
+    A position in a closure that runs only where it is called, as
+    `closure_calls` finds, is also read at each call when no guard in the
+    closure applies. The strictest call decides.
     """
     if guards(block, position, variable):
         return True
+    calls = closure_calls(block, position)
+    if calls:
+        return all(empty_allowed(block, call, variable, tolerant) for call in calls)
     return tolerant and not rejects_empty(block, position, variable)
 
 
@@ -6253,6 +6363,19 @@ pub fn harvest_api_router() -> Router {
         .route("/e/utf8-sliced-inline", post(e_utf8_sliced_inline))
         .route("/e/utf8-partial", post(e_utf8_partial))
         .route("/e/std-two-arguments", post(e_std_two_arguments))
+        .route("/e/local-as-bytes", post(e_local_as_bytes))
+        .route("/e/trait-default-slice", post(e_trait_default_slice))
+        .route("/e/blanket-first", post(e_blanket_first))
+        .route("/e/ambiguous-windows", post(e_ambiguous_windows))
+        .route("/e/other-type-len", post(e_other_type_len))
+        .route("/e/vec-windows", post(e_vec_windows))
+        .route("/e/closure-guarded-call", post(e_closure_guarded_call))
+        .route("/e/closure-early-return", post(e_closure_early_return))
+        .route("/e/closure-mixed-calls", post(e_closure_mixed_calls))
+        .route("/e/closure-passed-away", post(e_closure_passed_away))
+        .route("/e/closure-nested-called", post(e_closure_nested_called))
+        .route("/e/closure-nested-passed", post(e_closure_nested_passed))
+        .route("/e/closure-inner-guard", post(e_closure_inner_guard))
         .route("/e/dlq-like-form", post(e_dlq_like_form))
         .route("/e/serde-quiet", post(e_serde_quiet))
         .route("/e/option-inline", post(e_option_inline))
@@ -8156,6 +8279,151 @@ async fn e_std_two_arguments(body: Bytes) -> Response {
     let mut held = Bytes::new();
     let previous = std::mem::replace(&mut held, body);
     let gadget = serde_json::from_slice::<Gadget>(&held).unwrap();
+    StatusCode::OK.into_response()
+}
+
+trait GadgetBytes {
+    fn as_bytes(&self) -> Gadget;
+}
+
+impl GadgetBytes for Bytes {
+    fn as_bytes(&self) -> Gadget {
+        serde_json::from_slice::<Gadget>(self).unwrap()
+    }
+}
+
+async fn e_local_as_bytes(body: Bytes) -> Response {
+    let gadget = body.as_bytes();
+    StatusCode::OK.into_response()
+}
+
+trait SliceGadget: AsRef<[u8]> {
+    fn as_slice(&self) -> Gadget {
+        serde_json::from_slice::<Gadget>(self.as_ref()).unwrap()
+    }
+}
+
+impl SliceGadget for Bytes {}
+
+async fn e_trait_default_slice(body: Bytes) -> Response {
+    let gadget = body.as_slice();
+    StatusCode::OK.into_response()
+}
+
+trait FirstGadget {
+    fn first(&self) -> Gadget;
+}
+
+impl<T: AsRef<[u8]>> FirstGadget for T {
+    fn first(&self) -> Gadget {
+        serde_json::from_slice::<Gadget>(self.as_ref()).unwrap()
+    }
+}
+
+async fn e_blanket_first(body: Bytes) -> Response {
+    let gadget = body.first();
+    StatusCode::OK.into_response()
+}
+
+trait WindowsLeft {
+    fn windows(&self) -> Gadget;
+}
+
+trait WindowsRight {
+    fn windows(&self) -> Gadget;
+}
+
+impl WindowsLeft for Bytes {
+    fn windows(&self) -> Gadget {
+        serde_json::from_slice::<Gadget>(self).unwrap()
+    }
+}
+
+impl WindowsRight for Bytes {
+    fn windows(&self) -> Gadget {
+        serde_json::from_slice::<Gadget>(self).unwrap_or_default()
+    }
+}
+
+async fn e_ambiguous_windows(body: Bytes) -> Response {
+    let gadget = body.windows();
+    StatusCode::OK.into_response()
+}
+
+struct Tally;
+
+impl Tally {
+    fn len(&self) -> usize {
+        serde_json::from_slice::<Gadget>(b"{}").map_or(0, |_| 1)
+    }
+}
+
+async fn e_other_type_len(body: Bytes) -> Response {
+    if body.len() > 4 {
+        record_size(body.len());
+    }
+    StatusCode::OK.into_response()
+}
+
+async fn e_closure_nested_called(body: Bytes) -> Response {
+    let outer = || {
+        let parse = || serde_json::from_slice::<Gadget>(&body);
+        parse().unwrap()
+    };
+    let gadget = if body.is_empty() { Gadget::default() } else { outer() };
+    StatusCode::OK.into_response()
+}
+
+async fn e_closure_nested_passed(body: Bytes) -> Response {
+    let outer = || run_parse(|| serde_json::from_slice::<Gadget>(&body));
+    let gadget = if body.is_empty() { Gadget::default() } else { outer() };
+    StatusCode::OK.into_response()
+}
+
+async fn e_closure_inner_guard(body: Bytes) -> Response {
+    let parse = || {
+        if body.is_empty() {
+            Gadget::default()
+        } else {
+            serde_json::from_slice::<Gadget>(&body).unwrap()
+        }
+    };
+    let gadget = parse();
+    StatusCode::OK.into_response()
+}
+
+async fn e_vec_windows(body: Vec<u8>) -> Response {
+    for pair in body.windows(2) {
+        record_size(pair.len());
+    }
+    StatusCode::OK.into_response()
+}
+
+async fn e_closure_guarded_call(body: Bytes) -> Response {
+    let parse = || serde_json::from_slice::<Gadget>(&body);
+    let gadget = if body.is_empty() { Gadget::default() } else { parse().unwrap() };
+    StatusCode::OK.into_response()
+}
+
+async fn e_closure_early_return(body: Bytes) -> Response {
+    let parse = move || serde_json::from_slice::<Gadget>(&body).unwrap();
+    if body.is_empty() {
+        return StatusCode::OK.into_response();
+    }
+    let gadget = parse();
+    StatusCode::OK.into_response()
+}
+
+async fn e_closure_mixed_calls(body: Bytes) -> Response {
+    let parse = || serde_json::from_slice::<Gadget>(&body);
+    let first = if body.is_empty() { Gadget::default() } else { parse().unwrap() };
+    let second = parse().unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_closure_passed_away(body: Bytes) -> Response {
+    let parse = || serde_json::from_slice::<Gadget>(&body);
+    let gadget = if body.is_empty() { Gadget::default() } else { run_parse(parse) };
     StatusCode::OK.into_response()
 }
 
@@ -11608,6 +11876,56 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
                 "POST /e/utf8-sliced-inline: cannot read a `from_slice` call",
                 "POST /e/utf8-partial: cannot read a `from_slice` call",
                 "POST /e/std-two-arguments: cannot read a `from_slice` call",
+            ],
+        },
+    ),
+    (
+        "a local accessor-named method is a handoff, and a closure parse reads its calls",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST", "/e/" + path, 200, request_body=body_of(("name", False), required=False)
+            )
+            for path in (
+                "local-as-bytes",
+                "trait-default-slice",
+                "blanket-first",
+                "ambiguous-windows",
+                "other-type-len",
+                "vec-windows",
+                "closure-guarded-call",
+                "closure-early-return",
+                "closure-mixed-calls",
+                "closure-passed-away",
+                "closure-nested-called",
+                "closure-nested-passed",
+                "closure-inner-guard",
+            )
+        ],
+        {
+            "body_required": [
+                "POST /e/local-as-bytes: the body is mandatory",
+                "POST /e/trait-default-slice: the body is mandatory",
+                "POST /e/blanket-first: the body is mandatory",
+                "POST /e/ambiguous-windows: the body is mandatory",
+                "POST /e/closure-mixed-calls: the body is mandatory",
+                "POST /e/closure-passed-away: the body is mandatory",
+                "POST /e/closure-nested-passed: the body is mandatory",
+            ],
+            "mandatory": [
+                "POST /e/local-as-bytes: `name` is mandatory in Gadget",
+                "POST /e/trait-default-slice: `name` is mandatory in Gadget",
+                "POST /e/blanket-first: `name` is mandatory in Gadget",
+                "POST /e/closure-guarded-call: `name` is mandatory in Gadget",
+                "POST /e/closure-early-return: `name` is mandatory in Gadget",
+                "POST /e/closure-mixed-calls: `name` is mandatory in Gadget",
+                "POST /e/closure-passed-away: `name` is mandatory in Gadget",
+                "POST /e/closure-nested-called: `name` is mandatory in Gadget",
+                "POST /e/closure-nested-passed: `name` is mandatory in Gadget",
+                "POST /e/closure-inner-guard: `name` is mandatory in Gadget",
+            ],
+            "unresolved": [
+                "POST /e/ambiguous-windows: cannot read a `from_slice` call",
             ],
         },
     ),
