@@ -992,6 +992,180 @@ async fn redrive_recoverable_count_falls_short_when_a_purge_already_removed_part
     );
 }
 
+// ── issue #1508: a `before` redrive must flag a prefix retention already cut ─
+
+/// Export `count` records, so the cursor acknowledges all of them.
+async fn export_all(conn: &mut diesel_async::AsyncPgConnection, count: usize) {
+    let _sink = install(Arc::new(RecordingSink::new(200)), 100);
+    insert_audit_rows(conn, count).await;
+    fire_due_audit_exports(conn, &None, &[], &NoOpMetrics)
+        .await
+        .expect("tick");
+    uninstall();
+}
+
+/// Move the `occurred_at` of records with `lo < export_seq <= hi` to `days` ago.
+async fn age_rows(conn: &mut diesel_async::AsyncPgConnection, lo: i64, hi: i64, days: i64) {
+    diesel::update(
+        harvest_audit_log::table
+            .filter(harvest_audit_log::export_seq.gt(lo))
+            .filter(harvest_audit_log::export_seq.le(hi)),
+    )
+    .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(days)))
+    .execute(conn)
+    .await
+    .expect("age rows");
+}
+
+async fn window_truncated(
+    conn: &mut diesel_async::AsyncPgConnection,
+    request: RewindRequest,
+    outcome: RewindOutcome,
+) -> bool {
+    autumn_harvest::audit_export::redrive_window_truncated(conn, request, outcome)
+        .await
+        .expect("truncation check")
+}
+
+#[tokio::test]
+async fn before_redrive_flags_a_prefix_retention_already_purged() {
+    let _guard = TEST_SERIAL.lock().await;
+    let (mut conn, _c) = make_conn().await;
+    export_all(&mut conn, 5).await;
+    age_rows(&mut conn, 0, 3, 365).await;
+    let deleted = purge_old_audit_records(&mut conn, 90, false, &[0], &[])
+        .await
+        .expect("purge");
+    assert_eq!(deleted, 3, "records 1-3 are aged and acknowledged");
+
+    // The instant names all five records. Three are gone.
+    let request = RewindRequest::Before(chrono::Utc::now() - chrono::Duration::days(400));
+    let outcome = rewind_cursor(&mut conn, 0, request, chrono::Utc::now())
+        .await
+        .expect("rewind");
+    assert_eq!(outcome, RewindOutcome::Rewound { from: 5, to: 3 });
+    assert!(
+        window_truncated(&mut conn, request, outcome).await,
+        "retention purged records at or after the instant"
+    );
+}
+
+#[tokio::test]
+async fn before_redrive_flags_a_refusal_when_every_matching_record_was_purged() {
+    let _guard = TEST_SERIAL.lock().await;
+    let (mut conn, _c) = make_conn().await;
+    export_all(&mut conn, 3).await;
+    age_rows(&mut conn, 0, 3, 365).await;
+    purge_old_audit_records(&mut conn, 90, false, &[0], &[])
+        .await
+        .expect("purge");
+
+    let request = RewindRequest::Before(chrono::Utc::now() - chrono::Duration::days(400));
+    let outcome = rewind_cursor(&mut conn, 0, request, chrono::Utc::now())
+        .await
+        .expect("rewind");
+    assert!(matches!(outcome, RewindOutcome::NoOp { .. }));
+    assert!(
+        window_truncated(&mut conn, request, outcome).await,
+        "a refusal must still name the loss"
+    );
+}
+
+#[tokio::test]
+async fn before_redrive_is_not_flagged_when_nothing_was_purged() {
+    let _guard = TEST_SERIAL.lock().await;
+    let (mut conn, _c) = make_conn().await;
+    export_all(&mut conn, 5).await;
+
+    let request = RewindRequest::Before(chrono::Utc::now() - chrono::Duration::days(400));
+    let outcome = rewind_cursor(&mut conn, 0, request, chrono::Utc::now())
+        .await
+        .expect("rewind");
+    assert_eq!(outcome, RewindOutcome::Rewound { from: 5, to: 0 });
+    assert!(!window_truncated(&mut conn, request, outcome).await);
+}
+
+#[tokio::test]
+async fn before_redrive_is_not_flagged_when_the_instant_is_after_every_purged_record() {
+    let _guard = TEST_SERIAL.lock().await;
+    let (mut conn, _c) = make_conn().await;
+    export_all(&mut conn, 5).await;
+    age_rows(&mut conn, 0, 3, 365).await;
+    purge_old_audit_records(&mut conn, 90, false, &[0], &[])
+        .await
+        .expect("purge");
+
+    // Records 4-5 are recent. The purged records predate this instant.
+    let request = RewindRequest::Before(chrono::Utc::now() - chrono::Duration::days(30));
+    let outcome = rewind_cursor(&mut conn, 0, request, chrono::Utc::now())
+        .await
+        .expect("rewind");
+    assert_eq!(outcome, RewindOutcome::Rewound { from: 5, to: 3 });
+    assert!(!window_truncated(&mut conn, request, outcome).await);
+}
+
+#[tokio::test]
+async fn seq_redrive_is_never_flagged() {
+    let _guard = TEST_SERIAL.lock().await;
+    let (mut conn, _c) = make_conn().await;
+    export_all(&mut conn, 5).await;
+    age_rows(&mut conn, 0, 3, 365).await;
+    purge_old_audit_records(&mut conn, 90, false, &[0], &[])
+        .await
+        .expect("purge");
+
+    let request = RewindRequest::Seq(0);
+    let outcome = rewind_cursor(&mut conn, 0, request, chrono::Utc::now())
+        .await
+        .expect("rewind");
+    assert!(
+        !window_truncated(&mut conn, request, outcome).await,
+        "`already_purged_records` is exact for a sequence request"
+    );
+}
+
+#[tokio::test]
+async fn the_purge_watermark_never_moves_backwards() {
+    let _guard = TEST_SERIAL.lock().await;
+    let (mut conn, _c) = make_conn().await;
+    export_all(&mut conn, 4).await;
+    age_rows(&mut conn, 0, 2, 100).await;
+    purge_old_audit_records(&mut conn, 90, false, &[0], &[])
+        .await
+        .expect("first purge");
+    // A later sweep removes OLDER records. The watermark must keep the newer.
+    age_rows(&mut conn, 2, 3, 200).await;
+    purge_old_audit_records(&mut conn, 90, false, &[0], &[])
+        .await
+        .expect("second purge");
+
+    let request = RewindRequest::Before(chrono::Utc::now() - chrono::Duration::days(150));
+    let outcome = RewindOutcome::Rewound { from: 4, to: 3 };
+    assert!(window_truncated(&mut conn, request, outcome).await);
+}
+
+#[tokio::test]
+async fn purging_unsequenced_records_leaves_no_watermark() {
+    let _guard = TEST_SERIAL.lock().await;
+    uninstall();
+    let (mut conn, _c) = make_conn().await;
+    insert_audit_rows(&mut conn, 3).await;
+    diesel::update(harvest_audit_log::table)
+        .set(harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(365)))
+        .execute(&mut conn)
+        .await
+        .expect("age rows");
+    let deleted = purge_old_audit_records(&mut conn, 90, false, &[], &[])
+        .await
+        .expect("purge");
+    assert_eq!(deleted, 3, "export never ran, so nothing protects the rows");
+
+    // A `before` request never sees an unsequenced record, so none can be lost.
+    let request = RewindRequest::Before(chrono::Utc::now() - chrono::Duration::days(400));
+    let outcome = RewindOutcome::Rewound { from: 1, to: 0 };
+    assert!(!window_truncated(&mut conn, request, outcome).await);
+}
+
 // ── AC5/AC7: metrics and status ──────────────────────────────────────────────
 
 #[tokio::test]

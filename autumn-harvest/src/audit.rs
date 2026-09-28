@@ -1764,6 +1764,9 @@ pub async fn list_audit(
 /// admin-triggered operations, to make that narrower guarantee
 /// unconditionally true.
 ///
+/// The delete also advances `harvest_audit_purge_watermark` in the same
+/// statement (issue #1508). See [`crate::audit_export::redrive_window_truncated`].
+///
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] if the delete fails.
@@ -1864,8 +1867,14 @@ pub async fn purge_old_audit_records(
     //
     // Also never one of the two audit-export lifecycle records exempted
     // above (issue #1273).
+    //
+    // The same statement records a watermark (issue #1508). A `before`
+    // redrive reads it to detect a purged prefix. The delete and the
+    // upsert commit together, so a purge cannot leave records gone without
+    // a trace. Unsequenced rows are skipped: no redrive ever selects one.
     diesel::sql_query(
-        "DELETE FROM harvest_audit_log a \
+        "WITH deleted AS ( \
+         DELETE FROM harvest_audit_log a \
          WHERE a.occurred_at < $1 \
            AND a.operation NOT IN ($5, $6) \
            AND NOT ( \
@@ -1907,7 +1916,24 @@ pub async fn purge_old_audit_records(
                               ) \
                    ) \
                  ) \
-           )",
+           ) \
+         RETURNING a.occurred_at, a.export_seq \
+         ), \
+         stamped AS ( \
+           SELECT MAX(occurred_at) AS max_at, COUNT(*) AS n \
+           FROM deleted WHERE export_seq IS NOT NULL \
+         ), \
+         mark AS ( \
+           INSERT INTO harvest_audit_purge_watermark AS w \
+                  (singleton, max_purged_occurred_at, purged_records) \
+           SELECT TRUE, max_at, n FROM stamped WHERE n > 0 \
+           ON CONFLICT (singleton) DO UPDATE SET \
+                  max_purged_occurred_at = \
+                      GREATEST(w.max_purged_occurred_at, EXCLUDED.max_purged_occurred_at), \
+                  purged_records = w.purged_records + EXCLUDED.purged_records, \
+                  updated_at = NOW() \
+         ) \
+         SELECT COUNT(*) AS deleted FROM deleted",
     )
     .bind::<diesel::sql_types::Timestamptz, _>(cutoff)
     .bind::<diesel::sql_types::Bool, _>(protect_unexported_audit)
@@ -1916,9 +1942,17 @@ pub async fn purge_old_audit_records(
     .bind::<diesel::sql_types::Text, _>(OP_AUDIT_EXPORT_DECOMMISSION)
     .bind::<diesel::sql_types::Text, _>(OP_AUDIT_EXPORT_REACTIVATE)
     .bind::<diesel::sql_types::Bool, _>(crate::audit_export::is_configured())
-    .execute(conn)
+    .get_result::<PurgeCount>(conn)
     .await
     .map_err(database_error)
+    .map(|row| usize::try_from(row.deleted).unwrap_or(0))
+}
+
+/// Row count returned by the purge statement.
+#[derive(diesel::QueryableByName)]
+struct PurgeCount {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    deleted: i64,
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
