@@ -1539,7 +1539,12 @@ def raw_body_parses(source: str, handler: str) -> list[Parse]:
         return []
     # `source` is masked, so a call in a comment or a string is no parse.
     handler_block = handler_found[2]
-    carriers = moved_names(handler_block, byte_parameters(handler_found[0]))
+    # A byte carrier inside a `Result` or an `Option` is seeded where its
+    # success binds it, as `wrapped_successes` reads it.
+    seeds = {name: -1 for name in byte_parameters(handler_found[0])}
+    for name, kind in wrapped_carriers(handler_found[0]).items():
+        seeds.update(wrapped_successes(handler_block, name, kind))
+    carriers = moved_names(handler_block, seeds)
     carriers.possible = possible_carriers(handler_found[0])
     if not dict(carriers):
         # No byte carrier, so only a parse of a possible one can be found.
@@ -1629,19 +1634,20 @@ def partial_names(carriers: dict[str, int]) -> frozenset[str]:
     return getattr(carriers, "partial", frozenset())
 
 
-def moved_names(block: str, names: set[str]) -> Carriers:
+def moved_names(block: str, names: set[str] | dict[str, int]) -> Carriers:
     """`names` plus each name that a `let` binds to one of them, with where.
 
     Each `let` value goes through `argument_passes`. A value that is a whole
     carrier, such as `body`, `&body` or `body.as_ref()`, makes a carrier
     alias, bound at that `let`. A value that holds a carrier in any other
     way, such as `&body[4..]`, `body.to_vec()` or a struct literal, makes a
-    partial carrier. An alias of a partial carrier is partial too. A
-    parameter is bound at -1. A `let` counts only while its source still
+    partial carrier. An alias of a partial carrier is partial too. `names`
+    is a set of parameters, each bound at -1, or a map of each name to where
+    it is bound. A `let` counts only while its source still
     holds the body, as `live_binding` reads it. A read through a call, such
     as `from_utf8(&body)`, is the call's own handoff, so it binds no carrier.
     """
-    found = Carriers({name: -1 for name in names})
+    found = Carriers(names if isinstance(names, dict) else {name: -1 for name in names})
     partial: set[str] = set()
     lets = [
         (let.group(1), let.start(), let.end(), block[let.end() : statement_end(block, let.end())])
@@ -2346,17 +2352,79 @@ def rejects_result_body(params: str, block: str) -> bool:
     return found is not None and error_rejects(found.group(1), block)
 
 
-def rejects_option_body(params: str, block: str) -> bool:
-    """Whether an `Option<Json<T>>` or `Option<Bytes>` body is mandatory, since its `None` rejects.
+# A raw byte carrier type, as the inner type of a wrapper.
+BYTE_TYPE = r"(?:(?<![\w:])Bytes\b|(?<![\w:])Vec<u8>|&?\s*\[u8\])"
 
-    `error_rejects` reads it with `None` in the role of `Err`, so the same
-    forms decide: `ok_or(..)?`, `ok_or_else(..)?`, `.unwrap()`, `.expect(..)`,
-    a `None` or catch-all arm that rejects, `if let None`, a let-else on
-    `Some`, and an `if` on `.is_none()` or `.is_some()`.
+
+def wrapped_carriers(params: str) -> dict[str, str]:
+    """Each `Result<Bytes, _>` or `Option<Bytes>` parameter, with its kind.
+
+    The kind is `"result"` or `"option"`, as `FAILURE_VARIANTS` reads it.
+    `Vec<u8>` and `[u8]` count as `Bytes` does.
     """
-    body = r"(?:%s<|(?<![\w:])Bytes\b|(?<![\w:])Vec<u8>|&?\s*\[u8\])" % JSON
-    found = re.finditer(r"\b([a-z_][a-z_0-9]*)\s*:\s*%s<\s*%s" % (OPTION, body), params)
-    return any(error_rejects(option.group(1), block, kind="option") for option in found)
+    found = {}
+    for kind, wrapper in (("result", RESULT), ("option", OPTION)):
+        typed = r"\b([a-z_][a-z_0-9]*)\s*:\s*%s<\s*%s" % (wrapper, BYTE_TYPE)
+        found.update({hit.group(1): kind for hit in re.finditer(typed, params)})
+    return found
+
+
+def rejects_wrapped_body(params: str, block: str) -> bool:
+    """Whether a wrapped body is mandatory, since its failure rejects.
+
+    It reads `Option<Json<T>>`, `Option<Bytes>` and `Result<Bytes, _>`.
+    `error_rejects` reads each with its failure, `None` or `Err`, so the
+    same forms decide: `ok_or(..)?`, `?`, `.unwrap()`, `.expect(..)`, a
+    failure or catch-all arm that rejects, `if let` on the failure, a
+    let-else on the success, and an `if` on an inspection such as
+    `.is_none()`. `rejects_result_body` reads `Result<Json<T>, _>`.
+    """
+    found = re.finditer(r"\b([a-z_][a-z_0-9]*)\s*:\s*%s<\s*%s<" % (OPTION, JSON), params)
+    wrapped = {option.group(1): "option" for option in found}
+    wrapped.update(wrapped_carriers(params))
+    return any(error_rejects(name, block, kind=kind) for name, kind in wrapped.items())
+
+
+# One step of a chain that turns a wrapper into its value, or leaves it one.
+UNWRAP_STEP = (
+    r"(?:\?|\.\s*await\b|\.\s*(?:unwrap|expect|ok_or|ok_or_else|unwrap_or|unwrap_or_default"
+    r"|unwrap_or_else)\s*\((?:[^()]|\([^()]*\))*\))"
+)
+
+
+def wrapped_successes(block: str, name: str, kind: str) -> dict[str, int]:
+    """Each name that holds the byte carrier inside the wrapper `name`, with where.
+
+    The success variant, `Ok` or `Some`, binds it in a `let`, `if let`,
+    `while let`, let-else or `match` arm. A `let` whose value is `name`
+    through `?`, `.unwrap()`, `.expect(..)`, `.ok_or*(..)` or `.unwrap_or*(..)`
+    binds it whole too. Each name is bound where its pattern is, so
+    `live_binding` reads it in that scope. A use of `name` that a later
+    binding shadows is left out.
+    """
+    success = FAILURE_VARIANTS[kind][0]
+    variable = re.escape(name)
+    inner = r"%s%s\s*\(\s*%s([a-z_][a-z_0-9]*)\s*\)" % (PATTERN_LEAD, success, BINDING)
+    found: dict[str, int] = {}
+    held = r"\b(?:if\s+|while\s+)?let\s+%s\s*=\s*(?:&\s*(?:mut\s+)?)?%s\b" % (inner, variable)
+    for hit in re.finditer(held, block):
+        if live_binding(block, name, hit.end()):
+            found.setdefault(hit.group(1), hit.start(1))
+    for scrutinee in re.finditer(r"\bmatch\s+(?:&\s*(?:mut\s+)?)?%s\s*\{" % variable, block):
+        if not live_binding(block, name, scrutinee.start()):
+            continue
+        arms = balanced(block[scrutinee.end() - 1 :], "{", "}")
+        offset = scrutinee.end() - 1
+        for arm in re.finditer(inner + r"\s*(?:if\b[^{}]*?)?=>", arms):
+            found.setdefault(arm.group(1), offset + arm.start(1))
+    whole = r"\blet\s+(?:mut\s+)?([a-z_][a-z_0-9]*)\s*(?::[^=;]*)?=\s*%s(?:\s*%s)+\s*;" % (
+        variable,
+        UNWRAP_STEP,
+    )
+    for hit in re.finditer(whole, block):
+        if live_binding(block, name, hit.start()):
+            found.setdefault(hit.group(1), hit.start())
+    return found
 
 
 # For each extractor kind: the success variant, and a pattern for the failure
@@ -3231,7 +3299,8 @@ def raw_reader(written: str, site: Site) -> bool:
     The head of the type goes through `written_path`, so an import decides.
     It counts when it expands to one of `RAW_READER_PATHS`, after the
     `autumn_web::reexports::` prefix is cut. A bare name with no import
-    counts, as a bare extractor name does, unless a local item shadows it.
+    counts, as a bare extractor name does, unless a local item shadows it or
+    an untrusted glob may bring it, as `glob_unknowns` reads it.
     A reader nested in a generic argument, as in `State<Request>`, or one
     from an untrusted path, does not count.
     """
@@ -3242,7 +3311,12 @@ def raw_reader(written: str, site: Site) -> bool:
     segments, used_at = written_path(head.group(0), site)
     path = re.sub(r"^autumn_web::reexports::", "", "::".join(segments))
     if len(segments) == 1:
-        return path in RAW_READER_NAMES
+        # An untrusted glob that may bring this name makes it unknown.
+        text, at = site
+        hidden = any(
+            start <= at < end and name == path for start, end, name in glob_unknowns(text)
+        )
+        return path in RAW_READER_NAMES and not hidden
     return path in RAW_READER_PATHS
 
 
@@ -3691,17 +3765,29 @@ PRELUDE_PATHS = frozenset(
 # Glob imports that bring the supported extractors, or nothing that clashes.
 TRUSTED_GLOBS = frozenset({"axum", "axum::extract", "axum::body", "bytes", "serde_json"})
 
+# Every name the audit trusts by its bare spelling: the extractors, the raw
+# query readers and the standard types it reads by name. An untrusted glob
+# may bring its own item of any of them, so `glob_unknowns` reads them all.
+BARE_TRUSTED_NAMES = tuple(
+    sorted(
+        set(EXTRACTOR_NAMES)
+        | RAW_READER_NAMES
+        | {name for name in STD_TYPES if name[:1].isupper()}
+    )
+)
 
+
+@functools.lru_cache(maxsize=None)
 def glob_unknowns(code: str) -> list[tuple[int, int, str]]:
-    """`(scope start, scope end, name)` for each extractor name a glob may hide.
+    """`(scope start, scope end, name)` for each bare-trusted name a glob may hide.
 
-    `glob_module` reads each glob. An untrusted one, such as `use
-    crate::models::*;` for a module the audit does not scan, may bring its
-    own `Query`, `Json` or `Bytes`. A glob of a scanned module brings such a
-    name only when that module binds it, as `module_binds` reads it. In the
-    glob's scope, a bare use of such a name cannot be told apart, unless a
-    plain import in the same scope binds it, since a plain import wins over
-    a glob.
+    The names are `BARE_TRUSTED_NAMES`. `glob_module` reads each glob. An
+    untrusted one, such as `use crate::models::*;` for a module the audit
+    does not scan, may bring its own `Query`, `Request` or `Option`. A glob
+    of a scanned module brings such a name only when that module binds it,
+    as `module_binds` reads it. In the glob's scope, a bare use of such a
+    name cannot be told apart, unless a plain import in the same scope binds
+    it, since a plain import wins over a glob.
     """
     bound: dict[tuple[int, int], set[str]] = {}
     globs = [
@@ -3716,7 +3802,7 @@ def glob_unknowns(code: str) -> list[tuple[int, int, str]]:
         (scope[0], scope[1], name)
         for scope, module in globs
         if module != TRUSTED
-        for name in EXTRACTOR_NAMES
+        for name in BARE_TRUSTED_NAMES
         if name not in bound.get(scope, set())
         and (module is None or module_binds(code, module, name))
     ]
@@ -4022,8 +4108,8 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
             # mandatory fields are checked. A tolerant `Result` body is not.
             parses.append((body_type, bool(bare) or result_rejects or option_body, (code, at)))
         # An `Option` body whose `None` the handler rejects is mandatory too.
-        mandatory_body = bool(bare) or result_rejects or rejects_option_body(params, block)
-        if byte_parameters(params) or possible_carriers(params):
+        mandatory_body = bool(bare) or result_rejects or rejects_wrapped_body(params, block)
+        if byte_parameters(params) or possible_carriers(params) or wrapped_carriers(params):
             for name, optional, tolerant, site in raw_body_parses(code, handler):
                 # A parse an empty body cannot skip makes the body mandatory,
                 # whatever its type. A parse that does not tolerate its error
@@ -4593,6 +4679,7 @@ pub fn harvest_api_router() -> Router {
         .route("/s/reexport-raw", get(s_reexport_raw))
         .route("/s/full-reexport-raw", get(s_full_reexport_raw))
         .route("/s/local-request", get(s_local_request))
+        .route("/s/glob-request", get(s_glob_request))
         .route("/s/raw-query", get(s_raw_query))
         .route("/s/unread-query", get(s_unread_query))
         .route("/s/std-option-param", post(s_std_option_param))
@@ -4705,6 +4792,14 @@ mod local_request {
     }
 
     async fn s_local_request(request: Request) -> Response {
+        StatusCode::OK.into_response()
+    }
+}
+
+mod glob_reader {
+    use other_crate::*;
+
+    async fn s_glob_request(request: Request) -> Response {
         StatusCode::OK.into_response()
     }
 }
@@ -5486,6 +5581,11 @@ pub fn harvest_api_router() -> Router {
         .route("/e/unrelated-receiver", post(e_unrelated_receiver))
         .route("/e/alias-body", post(e_alias_body))
         .route("/e/dead-closure", post(e_dead_closure))
+        .route("/e/result-bytes", post(e_result_bytes))
+        .route("/e/option-bytes-match", post(e_option_bytes_match))
+        .route("/e/result-bytes-if-let", post(e_result_bytes_if_let))
+        .route("/e/result-bytes-tolerant", post(e_result_bytes_tolerant))
+        .route("/e/option-bytes-unwrapped", post(e_option_bytes_unwrapped))
         .route("/e/empty-rejected-tolerant", post(e_empty_rejected_tolerant))
         .route("/e/empty-rejected-helper", post(e_empty_rejected_helper))
         .route("/e/empty-else-rejected", post(e_empty_else_rejected))
@@ -6939,6 +7039,41 @@ async fn e_option_unread_use(body: Option<Json<Gadget>>) -> Response {
 
 async fn e_option_body_default(body: Option<Json<Gadget>>) -> Response {
     let gadget = body.map(|Json(gadget)| gadget).unwrap_or_default();
+    StatusCode::OK.into_response()
+}
+
+async fn e_result_bytes(body: Result<Bytes, BytesRejection>) -> Response {
+    let raw = body?;
+    let gadget = serde_json::from_slice::<Gadget>(&raw).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_option_bytes_match(body: Option<Bytes>) -> Response {
+    match body {
+        Some(raw) => {
+            let gadget = serde_json::from_slice::<Gadget>(&raw).unwrap();
+        }
+        None => {}
+    }
+    StatusCode::OK.into_response()
+}
+
+async fn e_result_bytes_if_let(body: Result<Bytes, BytesRejection>) -> Response {
+    if let Ok(raw) = body {
+        let gadget: Gadget = serde_json::from_slice(&raw).unwrap_or_default();
+    }
+    StatusCode::OK.into_response()
+}
+
+async fn e_result_bytes_tolerant(body: Result<Bytes, BytesRejection>) -> Response {
+    let raw = body?;
+    let gadget: Gadget = serde_json::from_slice(&raw).unwrap_or_default();
+    StatusCode::OK.into_response()
+}
+
+async fn e_option_bytes_unwrapped(body: Option<Bytes>) -> Response {
+    let raw = body.unwrap_or_default();
+    let gadget = serde_json::from_slice::<Gadget>(&raw).unwrap();
     StatusCode::OK.into_response()
 }
 
@@ -9812,6 +9947,7 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
                 "/s/state-request",
                 "/s/fake-raw",
                 "/s/local-request",
+                "/s/glob-request",
                 "/s/trusted-request",
                 "/s/reexport-raw",
                 "/s/full-reexport-raw",
@@ -9822,7 +9958,9 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
                 "GET /s/state-request: `limit` is documented but no extractor of the route",
                 "GET /s/fake-raw: `limit` is documented but no extractor of the route",
                 "GET /s/local-request: `limit` is documented but no extractor of the route",
-            ]
+                "GET /s/glob-request: `limit` is documented but no extractor of the route",
+            ],
+            "unresolved": ["GET /s/glob-request: cannot tell which `Request` a glob import brings"],
         },
     ),
     (
@@ -10016,6 +10154,35 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
                 "POST /e/option-bytes: the body is mandatory",
                 "POST /e/option-unread-use: the body is mandatory",
             ]
+        },
+    ),
+    (
+        "a byte carrier inside a Result or an Option is followed from its success",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST", path, 200, request_body=body_of(("name", False), required=False)
+            )
+            for path in (
+                "/e/result-bytes",
+                "/e/option-bytes-match",
+                "/e/result-bytes-if-let",
+                "/e/result-bytes-tolerant",
+                "/e/option-bytes-unwrapped",
+            )
+        ],
+        {
+            "body_required": [
+                "POST /e/result-bytes: the body is mandatory",
+                "POST /e/option-bytes-match: the body is mandatory",
+                "POST /e/option-bytes-unwrapped: the body is mandatory",
+                "POST /e/result-bytes-tolerant: the body is mandatory",
+            ],
+            "mandatory": [
+                "POST /e/result-bytes: `name` is mandatory in Gadget",
+                "POST /e/option-bytes-match: `name` is mandatory in Gadget",
+                "POST /e/option-bytes-unwrapped: `name` is mandatory in Gadget",
+            ],
         },
     ),
     (
