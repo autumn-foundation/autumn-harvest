@@ -144,20 +144,27 @@ impl Settings {
             .filter_map(Arm::parse)
             .collect::<Vec<_>>();
         Self {
+            // Defaults point at assay13, not the inherited assay10 name, and
+            // at this assay's own pre-registered shape (depth 1000, n=6) —
+            // not 0010's. Found by Codex review on PR #1761. With only
+            // `ASSAY10_DATABASE_URL` overridden, the old defaults reset one
+            // database (`assay10`) while querying another. Running with no
+            // depth/rep overrides at all silently graded a different
+            // workload against assay #13's own decision lines.
             database_url: env_string(
                 "ASSAY10_DATABASE_URL",
-                "postgres://postgres@127.0.0.1:5432/assay10",
+                "postgres://postgres@127.0.0.1:5432/assay13",
             ),
             admin_url: env_string(
                 "ASSAY10_ADMIN_URL",
                 "postgres://postgres@127.0.0.1:5432/postgres",
             ),
-            database_name: env_string("ASSAY10_DB_NAME", "assay10"),
+            database_name: env_string("ASSAY10_DB_NAME", "assay13"),
             redis_url: env_string("ASSAY10_REDIS_URL", "redis://127.0.0.1:6379"),
-            sqlite_dir: env_string("ASSAY10_SQLITE_DIR", "/tmp/assay10-sqlite"),
+            sqlite_dir: env_string("ASSAY10_SQLITE_DIR", "/tmp/assay13-sqlite"),
             input_json: env_string("ASSAY10_INPUT_JSON", INPUT_JSON),
-            workflows: env_usize("ASSAY10_WORKFLOWS", 2_000),
-            reps: env_usize("ASSAY10_REPS", 3),
+            workflows: env_usize("ASSAY10_WORKFLOWS", 1_000),
+            reps: env_usize("ASSAY10_REPS", 6),
             seeders: env_usize("ASSAY10_SEEDERS", 16),
             cap_secs: env_usize("ASSAY10_CAP_SECS", 900) as u64,
             arms,
@@ -1097,13 +1104,41 @@ async fn main() {
 
     println!("\n## pre-registered line (assay #13)\n");
 
-    let Some((_, rates, _)) = summary.iter().find(|(arm, _, _)| *arm == Arm::Postgres) else {
+    // Refuse to grade a different shape against this assay's own decision
+    // lines. Assay #13 pre-registered depth 1000, n=6; those lines say
+    // nothing about any other depth or repetition count. Found by Codex
+    // review on PR #1761.
+    if settings.workflows != 1000 || settings.reps != 6 {
+        println!(
+            "* **Not graded.** Backlog {} workflows, {} reps is not assay #13's pre-registered \
+             shape (depth 1000, n=6). The CV lines below apply only to that shape.",
+            settings.workflows, settings.reps
+        );
+        return;
+    }
+
+    let Some((_, rates, all_correct)) = summary.iter().find(|(arm, _, _)| *arm == Arm::Postgres)
+    else {
         println!(
             "* the postgres arm produced no valid repetition, so the CV line is \
              **INDETERMINATE**."
         );
         return;
     };
+    // A repetition that failed correctness or was excluded from `rates`
+    // means fewer than the pre-registered six measurements went into the CV
+    // below. Grading on the survivors alone, silently, would print a
+    // precise-looking verdict from an incomplete registered run. Found by
+    // Codex review on PR #1761.
+    if !all_correct {
+        println!(
+            "* **Not graded.** {} of {} repetitions passed correctness; assay #13 pre-registered \
+             all six. **INDETERMINATE** — rerun rather than grading on the survivors.",
+            rates.len(),
+            settings.reps
+        );
+        return;
+    }
     if rates.len() < 2 {
         println!(
             "* fewer than two valid repetitions ({}); a coefficient of variation needs at \

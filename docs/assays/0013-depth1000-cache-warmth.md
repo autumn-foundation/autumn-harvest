@@ -1,13 +1,19 @@
-# ⛏️ Prospect: does per-rep database recreation drive the depth-1000 postgres variance? (pursue: 4.3% warm CV vs 5% line)
+# ⛏️ Prospect: does per-rep database recreation drive the depth-1000 postgres variance? (pursue: 2.8% warm CV vs 5% line)
 
-> Status: **measured, corrected.** The pre-registration lives in
+> Status: **measured, corrected twice.** The pre-registration lives in
 > [`docs/rnd/2026-09-28-depth1000-cache-warmth-preregistration.md`](../rnd/2026-09-28-depth1000-cache-warmth-preregistration.md)
 > and was committed (`8766957`) before any warm-condition measurement was
 > taken. Nothing in it has been edited since. **This report's own first
 > published version reported a KILL, on a flawed apparatus** — see
 > [erratum](#erratum-the-first-warm-run-did-not-test-the-hypothesis) below.
-> The corrected Apparatus, Assay, Verdict, Cost and Reproduce sections
-> reflect the fixed apparatus and its numbers.
+> A second round of Codex review then found three reproducibility gaps in
+> the fixed apparatus (wrong default database name, no guard against
+> grading the wrong workload shape, no guard against grading an incomplete
+> run) — see [hardening](#hardening-three-reproducibility-gaps-from-a-second-review-round).
+> None changed the mechanism, but the assay was rerun once more against
+> the hardened binary for a clean, final pair of numbers. The Apparatus,
+> Assay, Verdict, Cost and Reproduce sections below reflect that final
+> state.
 
 ## 🎯 Question
 
@@ -105,42 +111,82 @@ withdrawn rather than reported as a valid data point.
 
 The apparatus was corrected to `DELETE` + `VACUUM` (same relfilenode,
 mechanism above), rebuilt, and rerun in full (all six warm repetitions,
-fresh database). The cold condition needed no change — it never called
-the broken function — so its six repetitions stand as originally measured
-and are reused as this assay's control.
+fresh database). The cold condition needed no change at that point — it
+never called the broken function — so its six repetitions stood as
+originally measured. Both conditions were rerun once more after the
+[hardening](#hardening-three-reproducibility-gaps-from-a-second-review-round)
+below, against the final binary; the numbers in this report are from that
+last, fully-hardened pair of runs.
+
+## 🔧 Hardening: three reproducibility gaps from a second review round
+
+Codex reviewed the fix above (commit `7a22fe7`) and found three more
+issues, all in reproducibility guards rather than the measured mechanism:
+
+1. **Wrong default database.** `Settings::from_env` still inherited
+   0010's `assay10` default for `database_url`/`database_name`/
+   `sqlite_dir`. Every run in this report always set
+   `ASSAY10_DATABASE_URL`/`ASSAY10_DB_NAME` explicitly, so this never
+   affected a reported number — but with only one of those two variables
+   overridden, the apparatus would reset one database while measuring
+   another. Fixed: the defaults now name `assay13`.
+2. **No guard against grading the wrong shape.** The defaults inherited
+   from 0010 (`ASSAY10_WORKFLOWS=2000`, `ASSAY10_REPS=3`) don't match
+   assay #13's own pre-registered shape (depth 1000, n=6). A run with
+   neither variable set would still print a CV verdict graded against
+   this assay's lines — a formally invalid comparison. Fixed: the
+   defaults now match the pre-registered shape, and the grading section
+   refuses to print a verdict (prints `Not graded` instead) when the
+   actual run doesn't match depth 1000 / n=6.
+3. **No guard against grading an incomplete run.** A repetition that
+   fails correctness is silently dropped from the rate list; the CV was
+   computed on however many repetitions remained, with no check that all
+   six pre-registered ones had actually passed. All twelve repetitions in
+   every run of this assay in fact passed correctness, so this never
+   changed a reported number either — but the gap was real. Fixed: the
+   grading section now checks the per-arm `all_correct` flag and prints
+   `Not graded` if any registered repetition failed.
+
+None of the three changed the mechanism under test (`DELETE`+`VACUUM` vs.
+drop/recreate). Both conditions were rerun once more against the hardened
+binary, with no environment overrides needed beyond `ASSAY10_ARMS` and
+`ASSAY10_RECREATE_DB` — the corrected defaults now match the
+pre-registration on their own.
 
 ## 📐 Assay
 
 Raw output:
-[`warm-depth1000.md`](apparatus/0013-depth1000-cache-warmth/results/warm-depth1000.md)
-(corrected `DELETE`+`VACUUM` mechanism),
+[`warm-depth1000.md`](apparatus/0013-depth1000-cache-warmth/results/warm-depth1000.md),
 [`cold-depth1000.md`](apparatus/0013-depth1000-cache-warmth/results/cold-depth1000.md)
-(unaffected by the fix).
+— both from the final, hardened binary.
 
 | condition | rep 0 | rep 1 | rep 2 | rep 3 | rep 4 | rep 5 | mean | stdev | **CV** |
 |:--|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| WARM (`DELETE`+`VACUUM`) | 21.16 | 20.42 | 19.79 | 19.21 | 19.10 | 19.04 | 19.79 | 0.86 | **4.3%** |
-| COLD (recreate/rep) | 19.44 | 13.44 | 20.09 | 10.44 | 12.32 | 11.14 | 14.48 | 4.23 | **29.2%** |
+| WARM (`DELETE`+`VACUUM`) | 19.19 | 19.43 | 18.74 | 18.61 | 18.33 | 19.73 | 19.01 | 0.53 | **2.8%** |
+| COLD (recreate/rep) | 20.42 | 13.09 | 21.08 | 7.96 | 12.51 | 13.60 | 14.78 | 5.05 | **34.2%** |
 
 All twelve reported repetitions passed correctness: every seeded workflow
 `COMPLETED`, activity-run counts exact (3000 of 3000) in every rep.
 
-**Cold reproduces ledger #12's spread on this host** (29.2% CV) — the
-same-host control behaves as the pre-registration expected.
+**Cold reproduces ledger #12's spread on this host, more sharply this
+time** (34.2% CV) — the same-host control behaves as the pre-registration
+expected, and the wider spread (one rep as low as 7.96, another as high as
+21.08) only strengthens the contrast with warm.
 
-**Warm clears the success line decisively.** 4.3% sits under the 5% line,
-and the six warm reps form a smooth, monotonically-settling sequence
-(21.16 → 20.42 → 19.79 → 19.21 → 19.10 → 19.04) rather than cold's jumpy,
-bimodal-looking spread (19.44, 13.44, 20.09, 10.44, 12.32, 11.14, no
-positional pattern). The warm mean (19.79) is also **36.7% higher** than
-the cold mean (14.48) at the identical depth, same host, same tree, same
-durability settings — cold isn't just noisier, it is measuring a slower
-steady state on average, not only a wider one.
+**Warm clears the success line decisively.** 2.8% sits well under the 5%
+line — tighter, in this final run, than depth 500's own 1.3% CV from
+ledger #12. The six warm reps (19.19, 19.43, 18.74, 18.61, 18.33, 19.73)
+show no discernible pattern and stay within a ±3% band of their own mean,
+in sharp contrast to cold's swings from 7.96 to 21.08. The warm mean
+(19.01) is also **28.7% higher** than the cold mean (14.78) at the
+identical depth, same host, same tree, same durability settings — cold
+isn't just noisier, it is measuring a slower average, not only a wider
+one.
 
 ## 🏁 Verdict
 
-**PURSUE, on the pre-registered line.** Warm CV (4.3%) clears the ≤5%
-success line; cold CV (29.2%) clears the ≥15% same-host-control line. The
+**PURSUE, on the pre-registered line.** Warm CV (2.8%) clears the ≤5%
+success line; cold CV (34.2%) clears the ≥15% same-host-control line. The
 cold-cache-from-database-recreation hypothesis ledger #12 named is
 **confirmed**: dropping and recreating the database before every
 repetition is what drives the depth-1000 `postgres`-arm variance, and it
@@ -148,8 +194,8 @@ also depresses the mean relative to a warmed steady state.
 
 This has a real implication beyond this one depth: ledger #2, #8, #9,
 #10, #11 and #12 all measured the `postgres` arm using the same
-drop/recreate-per-repetition pattern this assay just showed costs ~37% of
-throughput and inflates variance ~7x at depth 1000. **This assay does not
+drop/recreate-per-repetition pattern this assay just showed costs ~29% of
+throughput and inflates variance ~12x at depth 1000. **This assay does not
 re-grade any of those reports** — each used a different depth, workload,
 or shape, and re-litigating a closed verdict on an untested inference
 would be exactly the goalpost-moving this repo's own assay discipline
@@ -158,7 +204,7 @@ at depth ≥1000 should be read as cold-start figures, not steady-state
 ones, until someone re-runs the specific comparison each of those reports
 made under the warm pattern.
 
-**Open, un-chartered pits named here:** (1) whether the ~37%
+**Open, un-chartered pits named here:** (1) whether the ~29%
 mean-throughput gap and the CV gap hold at other depths (500, 2000, and
 beyond) and other workload shapes — this assay tested depth 1000 only;
 (2) whether the same warm pattern, applied to `redis_pg`'s own depth-1000
