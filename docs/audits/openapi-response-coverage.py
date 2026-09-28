@@ -93,8 +93,9 @@ rejection. An `.or_else(..)` whose fallback yields `Ok(..)` on every path makes
 a later `?` tolerant. A guard or a tolerant call at a helper call site carries
 into the helper. A parse in a closure or an `async` block that a `let` binds,
 and that runs only where it is called or awaited, reads the guard at each
-call or `.await`. The strictest one decides. One whose name is never used
-never runs, so its parse does not count. Check 2 applies to every parse
+call or `.await`. A plain move to another name, such as `let run = parse;`,
+is followed to that name's calls. The strictest one decides. One whose name is
+never used never runs, so its parse does not count. Check 2 applies to every parse
 that does not tolerate its error, since a body that is present must then carry
 the mandatory fields. A bare `Json<T>` and a rejecting `Result<Json<T>, _>` are
 such parses.
@@ -1913,6 +1914,15 @@ def partial_names(carriers: dict[str, int]) -> frozenset[str]:
     return getattr(carriers, "partial", frozenset())
 
 
+@functools.lru_cache(maxsize=None)
+def plain_lets(block: str) -> list[tuple[str, int, int, str]]:
+    """`(name, start, value start, value)` for each `let` of one plain name in `block`."""
+    return [
+        (let.group(1), let.start(), let.end(), block[let.end() : statement_end(block, let.end())])
+        for let in re.finditer(r"\blet\s+(?:mut\s+)?([a-z_][a-z_0-9]*)\s*(?::[^=;]*)?=(?!=)", block)
+    ]
+
+
 def moved_names(block: str, names: set[str] | dict[str, int]) -> Carriers:
     """`names` plus each name that a `let` binds to one of them, with where.
 
@@ -1930,10 +1940,7 @@ def moved_names(block: str, names: set[str] | dict[str, int]) -> Carriers:
     found.rebound = {}
     found.derived = {}
     partial: set[str] = set()
-    lets = [
-        (let.group(1), let.start(), let.end(), block[let.end() : statement_end(block, let.end())])
-        for let in re.finditer(r"\blet\s+(?:mut\s+)?([a-z_][a-z_0-9]*)\s*(?::[^=;]*)?=(?!=)", block)
-    ]
+    lets = plain_lets(block)
     patterns = destructuring_lets(block)
     assigned = [item for item in assignments(block) if re.fullmatch(r"[a-z_][a-z_0-9]*", item[0])]
     while True:
@@ -1998,7 +2005,10 @@ def moved_names(block: str, names: set[str] | dict[str, int]) -> Carriers:
                 found.derived[bound] = start
         # A plain assignment `name = value;` moves a carrier as a `let` does.
         # One that gives a carrier name another value leaves it partial from
-        # there, which fails closed, since a branch may skip it.
+        # there, which fails closed, since a branch may skip it. That is
+        # decided only once no name moves, since a later pass can find a
+        # carrier in the value, as in a cycle of plain moves.
+        rebinds = []
         for target, start, opener, value in assigned:
             flows = [
                 live_passes(block, value, opener, name, bound_at)
@@ -2011,11 +2021,15 @@ def moved_names(block: str, names: set[str] | dict[str, int]) -> Carriers:
                 way = {"whole": "direct", "partial": "wrapped"}.get(result or "")
             if target in found:
                 if way != "direct" and found.rebound.get(target, len(block)) > start:
-                    found.rebound[target] = start
+                    rebinds.append((target, start))
                 continue
             if way and target not in moved:
                 moved[target] = (start, way == "wrapped")
         if not moved and len(found.derived) == derived_before:
+            if rebinds:
+                for target, start in rebinds:
+                    found.rebound[target] = min(start, found.rebound.get(target, start))
+                continue
             found.partial = frozenset(partial)
             return found
         for bound, (start, is_partial) in moved.items():
@@ -2888,12 +2902,16 @@ def closure_calls(block: str, position: int) -> list[int]:
 
     A deferred body is a closure, or an `async` or `async move` block, as
     `async_blocks` finds it. The innermost one that holds `position` counts
-    only when a `let` binds it by name. Each later use of that name, as
-    `live_binding` reads it, must run it: a direct call such as `parse()`
-    for a closure, or `fut.await` for an async block. Its body then runs at
-    those uses, so a guard or an early exit there applies. Any other body,
-    such as one passed to a helper, a combinator or a spawn, runs where the
-    audit cannot see, so this is empty and the caller reads `position` itself.
+    only when a `let` binds it by name. `moved_names` then follows that name
+    through each plain move, such as `let run = parse;` or `run = parse;`,
+    to every alias, so there is no second alias walker. Each later use of
+    the name or an alias, as `live_binding` reads it, must run the body or
+    move it to an alias: a direct call such as `run()` for a closure, or
+    `fut.await` for an async block. The body then runs at those uses, so a
+    guard or an early exit there applies. Any other use, such as a handoff
+    to a helper, a combinator or a spawn, or an alias that is wrapped or
+    given another value, may run where the audit cannot see. This is then
+    empty, and the caller reads `position` itself.
     """
     # Each body, with the pattern that a use of its name must start with.
     kinds = [(closures(block), r"\s*\("), (async_blocks(block), r"\s*\.\s*await\b")]
@@ -2909,15 +2927,45 @@ def closure_calls(block: str, position: int) -> list[int]:
     bound = re.search(r"\blet\s+(?:mut\s+)?([a-z_][a-z_0-9]*)\s*(?::[^=;]*)?=\s*$", block[:start])
     if bound is None or bound.group(1) == "_":
         return []
+    moved = moved_names(block, {bound.group(1): bound.start()})
+    if moved.rebound:
+        return []
+    # An alias is a name that a plain move, such as `let run = parse;` or
+    # `run = &parse;`, binds from the name or another alias. A name that
+    # holds the body in another value, such as `(parse, 1)`, is none, and
+    # neither is the result of a run, such as `fut.await`. The fixed point
+    # ends, since each pass adds a name or stops.
+    aliases = {bound.group(1): bound.start()}
+    moves: set[int] = set()
+    statements = plain_lets(block) + assignments(block)
+    while True:
+        added = False
+        for target, _, opener, value in statements:
+            plain = re.fullmatch(r"\s*(?:&\s*(?:mut\s+)?)?([a-z_][a-z_0-9]*)\s*", value)
+            if plain is None or plain.group(1) not in aliases or target not in moved:
+                continue
+            if target in partial_names(moved) or opener + plain.start(1) in moves:
+                continue
+            moves.add(opener + plain.start(1))
+            if target not in aliases:
+                aliases[target] = moved[target]
+            added = True
+        if not added:
+            break
     calls = []
-    for use in re.finditer(r"(?<![.\w])%s\b" % re.escape(bound.group(1)), block[stop:]):
-        at = stop + use.start()
-        if not live_binding(block, bound.group(1), at, bound.start()):
-            continue
-        if not re.match(runs, block[stop + use.end() :]):
-            return []
-        calls.append(at)
-    return calls
+    for alias, bound_at in aliases.items():
+        for use in re.finditer(r"(?<![.\w])%s\b" % re.escape(alias), block):
+            at = use.start()
+            if at < stop or not live_binding(block, alias, at, bound_at):
+                continue
+            if at in moves or re.search(r"\blet\s+(?:mut\s+)?$", block[:at]):
+                continue
+            if re.match(r"\s*=(?![=>])", block[use.end() :]):
+                continue
+            if not re.match(runs, block[use.end() :]):
+                return []
+            calls.append(at)
+    return sorted(calls)
 
 
 @functools.lru_cache(maxsize=None)
@@ -6553,6 +6601,14 @@ pub fn harvest_api_router() -> Router {
         .route("/e/ambiguous-windows", post(e_ambiguous_windows))
         .route("/e/other-type-len", post(e_other_type_len))
         .route("/e/vec-windows", post(e_vec_windows))
+        .route("/e/closure-alias-call", post(e_closure_alias_call))
+        .route("/e/closure-alias-chain", post(e_closure_alias_chain))
+        .route("/e/closure-alias-assigned", post(e_closure_alias_assigned))
+        .route("/e/closure-alias-cycle", post(e_closure_alias_cycle))
+        .route("/e/async-alias-await", post(e_async_alias_await))
+        .route("/e/closure-alias-passed", post(e_closure_alias_passed))
+        .route("/e/closure-alias-mixed", post(e_closure_alias_mixed))
+        .route("/e/closure-alias-reassigned", post(e_closure_alias_reassigned))
         .route("/e/async-unpolled", post(e_async_unpolled))
         .route("/e/async-underscore", post(e_async_underscore))
         .route("/e/async-dropped", post(e_async_dropped))
@@ -8793,6 +8849,72 @@ async fn e_branch_method_helper(body: Bytes) -> Response {
 async fn e_branch_count(body: Bytes) -> Response {
     let size = if body.len() > 2 { counted(&body) } else { 0 };
     record_size(size);
+    StatusCode::OK.into_response()
+}
+
+async fn e_closure_alias_call(body: Bytes) -> Response {
+    let parse = || serde_json::from_slice::<Gadget>(&body);
+    let run = parse;
+    let gadget = if body.is_empty() { Gadget::default() } else { run().unwrap() };
+    StatusCode::OK.into_response()
+}
+
+async fn e_closure_alias_chain(body: Bytes) -> Response {
+    let parse = || serde_json::from_slice::<Gadget>(&body).unwrap();
+    let first = parse;
+    let second = &first;
+    if body.is_empty() {
+        return StatusCode::OK.into_response();
+    }
+    let gadget = second();
+    StatusCode::OK.into_response()
+}
+
+async fn e_closure_alias_assigned(body: Bytes) -> Response {
+    let parse = || serde_json::from_slice::<Gadget>(&body);
+    let run;
+    run = parse;
+    let gadget = if body.is_empty() { Gadget::default() } else { run().unwrap() };
+    StatusCode::OK.into_response()
+}
+
+async fn e_closure_alias_cycle(body: Bytes) -> Response {
+    let parse = || serde_json::from_slice::<Gadget>(&body);
+    let mut left = parse;
+    let mut right = left;
+    left = right;
+    right = left;
+    let gadget = if body.is_empty() { Gadget::default() } else { right().unwrap() };
+    StatusCode::OK.into_response()
+}
+
+async fn e_async_alias_await(body: Bytes) -> Response {
+    let pending = async { serde_json::from_slice::<Gadget>(&body).unwrap() };
+    let later = pending;
+    let gadget = if body.is_empty() { Gadget::default() } else { later.await };
+    StatusCode::OK.into_response()
+}
+
+async fn e_closure_alias_passed(body: Bytes) -> Response {
+    let parse = || serde_json::from_slice::<Gadget>(&body);
+    let run = parse;
+    let gadget = if body.is_empty() { Gadget::default() } else { run_parse(run) };
+    StatusCode::OK.into_response()
+}
+
+async fn e_closure_alias_mixed(body: Bytes) -> Response {
+    let parse = || serde_json::from_slice::<Gadget>(&body);
+    let run = parse;
+    let first = if body.is_empty() { Gadget::default() } else { run().unwrap() };
+    let second = parse().unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_closure_alias_reassigned(body: Bytes) -> Response {
+    let parse = || serde_json::from_slice::<Gadget>(&body);
+    let mut run = parse;
+    run = || Ok(Gadget::default());
+    let gadget = if body.is_empty() { Gadget::default() } else { run().unwrap() };
     StatusCode::OK.into_response()
 }
 
@@ -12425,6 +12547,42 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
                 "POST /e/nested-call-helper: cannot read a `from_slice` call",
                 "POST /e/branch-raw: cannot read a `from_slice` call",
                 "POST /e/branch-method-helper: cannot read a `from_slice` call",
+            ],
+        },
+    ),
+    (
+        "a deferred body runs at the calls or awaits of each plain alias",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST", "/e/" + path, 200, request_body=body_of(("name", False), required=False)
+            )
+            for path in (
+                "closure-alias-call",
+                "closure-alias-chain",
+                "closure-alias-assigned",
+                "closure-alias-cycle",
+                "async-alias-await",
+                "closure-alias-passed",
+                "closure-alias-mixed",
+                "closure-alias-reassigned",
+            )
+        ],
+        {
+            "body_required": [
+                "POST /e/closure-alias-passed: the body is mandatory",
+                "POST /e/closure-alias-mixed: the body is mandatory",
+                "POST /e/closure-alias-reassigned: the body is mandatory",
+            ],
+            "mandatory": [
+                "POST /e/closure-alias-call: `name` is mandatory in Gadget",
+                "POST /e/closure-alias-chain: `name` is mandatory in Gadget",
+                "POST /e/closure-alias-assigned: `name` is mandatory in Gadget",
+                "POST /e/closure-alias-cycle: `name` is mandatory in Gadget",
+                "POST /e/async-alias-await: `name` is mandatory in Gadget",
+                "POST /e/closure-alias-passed: `name` is mandatory in Gadget",
+                "POST /e/closure-alias-mixed: `name` is mandatory in Gadget",
+                "POST /e/closure-alias-reassigned: `name` is mandatory in Gadget",
             ],
         },
     ),
