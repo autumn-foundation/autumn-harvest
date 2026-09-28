@@ -2976,6 +2976,125 @@ async fn run_latest_wins_supersede(
     Ok((cancel_metrics, outcome.deferred_starts))
 }
 
+/// Seal a finished prior `CONTINUED_AS_NEW` so a start can replace it.
+///
+/// The caller holds the row lock. The state is read again here because an
+/// active prior is cancelled in the same transaction, after the caller read
+/// it. Only a finished run can be sealed, and the write is a compare-and-set
+/// on the state that was read.
+///
+/// The seal appends no event. The run's own terminal event stays last in its
+/// history, so [`replaced_run_outcome`] can still name its real outcome.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Config`] when the row is not in a finished state,
+/// or when the compare-and-set updates no row.
+async fn seal_replaced_execution(
+    conn: &mut AsyncPgConnection,
+    existing_id: uuid::Uuid,
+) -> HarvestResult<()> {
+    let current: String = harvest_workflow_executions::table
+        .find(existing_id)
+        .select(harvest_workflow_executions::state)
+        .for_update()
+        .first(conn)
+        .await
+        .map_err(database_error)?;
+    if !REPLACEABLE_PRIOR_STATES.contains(&current.as_str()) {
+        return Err(HarvestError::Config(format!(
+            "workflow execution {} is {current}; a start can only replace a \
+             COMPLETED, FAILED, CANCELLED or TIMED_OUT run",
+            ExecutionId::from_uuid(existing_id)
+        )));
+    }
+    let updated = diesel::update(
+        harvest_workflow_executions::table
+            .find(existing_id)
+            .filter(harvest_workflow_executions::state.eq(&current)),
+    )
+    .set((
+        harvest_workflow_executions::state.eq("CONTINUED_AS_NEW"),
+        harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+    ))
+    .execute(conn)
+    .await
+    .map_err(database_error)?;
+    if updated == 0 {
+        return Err(HarvestError::Config(format!(
+            "workflow execution {} changed state while a start replaced it",
+            ExecutionId::from_uuid(existing_id)
+        )));
+    }
+    Ok(())
+}
+
+/// The finished states a start-replace may seal over.
+pub(crate) const REPLACEABLE_PRIOR_STATES: &[&str] =
+    &["COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT"];
+
+/// The outcome a `CONTINUED_AS_NEW` row's own history records.
+///
+/// A real continue-as-new ends its history with `WorkflowContinuedAsNew`.
+/// A start-replace or a shard-staging vacate seals a finished run
+/// `CONTINUED_AS_NEW` with no event. Its last lifecycle event is then the
+/// outcome it really had. Returns `None` for a real continue-as-new, or when
+/// the history names no outcome.
+///
+/// A workflow task timeout records `WorkflowFailed` for a `TIMED_OUT` run.
+/// Its [`crate::failure::ERROR_TYPE_WORKFLOW_TASK_TIMED_OUT`] type makes such
+/// a run read back as `TIMED_OUT`. A history written before that type existed
+/// reads back as `FAILED`.
+#[must_use]
+pub fn replaced_run_outcome(events: &[WorkflowEvent]) -> Option<&'static str> {
+    events.iter().rev().find_map(|event| match event {
+        WorkflowEvent::WorkflowContinuedAsNew { .. }
+        | WorkflowEvent::WorkflowResetTerminated { .. } => Some(None),
+        WorkflowEvent::WorkflowCompleted { .. } => Some(Some("COMPLETED")),
+        WorkflowEvent::WorkflowFailed { error_type, .. }
+            if error_type.as_deref()
+                == Some(crate::failure::ERROR_TYPE_WORKFLOW_TASK_TIMED_OUT) =>
+        {
+            Some(Some("TIMED_OUT"))
+        }
+        WorkflowEvent::WorkflowFailed { .. } => Some(Some("FAILED")),
+        WorkflowEvent::WorkflowCancelled { .. } => Some(Some("CANCELLED")),
+        WorkflowEvent::WorkflowExecutionTimedOut { .. } => Some(Some("TIMED_OUT")),
+        _ => None,
+    })?
+}
+
+/// The state a result reader reports for a row in `state`.
+///
+/// A `CONTINUED_AS_NEW` row reports its [`replaced_run_outcome`] when it has
+/// one. Every other state reports itself. A value the schema does not allow
+/// reports `UNKNOWN`, which the caller treats as not yet terminal.
+async fn reported_outcome_state(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    state: &str,
+) -> HarvestResult<&'static str> {
+    if state == "CONTINUED_AS_NEW"
+        && let Some(outcome) = replaced_run_outcome_state(conn, exec_id).await?
+    {
+        return Ok(outcome);
+    }
+    Ok(crate::lifecycle::WorkflowState::from_db(state).map_or("UNKNOWN", |s| s.as_str()))
+}
+
+/// Load `exec_id`'s history and apply [`replaced_run_outcome`] to it.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] when the history cannot be read.
+pub async fn replaced_run_outcome_state(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<Option<&'static str>> {
+    let history = store::load_history_undecoded(conn, exec_id).await?;
+    Ok(replaced_run_outcome(&history.events))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn replace_execution(
     conn: &mut AsyncPgConnection,
@@ -3015,15 +3134,11 @@ async fn replace_execution(
     // partial index already excludes an observed-terminal seal via
     // `migrated_run_terminal_at IS NULL`. So this row is already outside
     // the uniqueness scope without touching its state at all.
+    //
+    // Nothing continued this run, so readers must still report its real
+    // outcome. See `replaced_run_outcome`.
     if existing.state != "MIGRATED" {
-        diesel::update(harvest_workflow_executions::table.find(existing.id))
-            .set((
-                harvest_workflow_executions::state.eq("CONTINUED_AS_NEW"),
-                harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
-            ))
-            .execute(conn)
-            .await
-            .map_err(database_error)?;
+        seal_replaced_execution(conn, existing.id).await?;
     }
 
     let new_execution = diesel::insert_into(harvest_workflow_executions::table)
@@ -3146,7 +3261,7 @@ async fn inline_cancel(
         codecs,
     )
     .await?;
-    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+    let updated = diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
         .set((
             harvest_workflow_executions::state.eq("CANCELLED"),
@@ -3160,6 +3275,13 @@ async fn inline_cancel(
         .execute(conn)
         .await
         .map_err(database_error)?;
+    // The event above is already appended. A run that is not open must not
+    // keep a cancel event that its state does not match, so roll back.
+    if updated == 0 {
+        return Err(HarvestError::Config(format!(
+            "workflow execution {exec_id} is no longer running"
+        )));
+    }
     queue::fail_open_tasks_for_execution(conn, exec_id, &format!("workflow cancelled: {reason}"))
         .await?;
     let (mut deferred, closed_children) =
@@ -5299,6 +5421,16 @@ pub async fn reactivate_failed_execution(
         )));
     }
 
+    // A redrive replays history and runs the failed step again, live. Erasure
+    // is allowed on a FAILED run and replaces its payloads with tombstones. A
+    // redrive would then run user code on those tombstones, so refuse it. The
+    // check is under the row lock, so it cannot race an erasure.
+    if crate::erase::execution_input_is_erased(&execution.input) {
+        return Err(HarvestError::Config(format!(
+            "cannot redrive: workflow execution {exec_id} has erased payloads"
+        )));
+    }
+
     // Re-anchor the hard deadline and soft SLA deadline from now so the timeout
     // and SLA scanners see a fresh window rather than the stale past deadlines
     // that were set when the execution first started. Without this, a FAILED
@@ -5714,6 +5846,22 @@ pub async fn terminate_workflow_execution_collect(
                 .optional()
                 .map_err(database_error)?
                 .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))?;
+
+            // A rebalanced seal is not a terminal prior (issue #964). The run
+            // is alive on another shard. An idempotent success here would tell
+            // the operator, or a parent-close cascade, that the run stopped
+            // when it did not. Refuse retryably, as cancel does. A seal whose
+            // live copy is already observed terminal stays an idempotent no-op.
+            if execution.state == "MIGRATED" && execution.migrated_run_terminal_at.is_none() {
+                return Err(HarvestError::ShardUnavailable {
+                    shard_id: execution.migrated_to_shard.unwrap_or(execution.shard_id),
+                    reason: format!(
+                        "workflow execution {exec_id} was rebalanced onto another shard \
+                         (state MIGRATED); this row is a forwarding seal, not the live \
+                         run, so it cannot be terminated here"
+                    ),
+                });
+            }
 
             // Idempotent no-op against any already-terminal state
             // (issue #504, AC #7): never append a duplicate terminal
@@ -9338,7 +9486,10 @@ pub async fn read_external_await_outcome(
             Err(e) => return Err(e),
         };
 
-        let outcome = match execution.state.as_str() {
+        // A replaced run reports the outcome it had before the seal. Only a
+        // real continue-as-new reaches the successor-chain arm below.
+        let state = reported_outcome_state(conn, current, &execution.state).await?;
+        let outcome = match state {
             "COMPLETED" => {
                 // The target's `output` row column is read RAW. Core
                 // `append_events`/`load_history` use the identity codec (payload
@@ -9987,5 +10138,87 @@ mod retry_chain_routing_tests {
                 "the bound must sit far above any realistic max_attempts"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod replaced_run_outcome_tests {
+    use super::replaced_run_outcome;
+    use crate::event::WorkflowEvent;
+
+    fn continued_as_new() -> WorkflowEvent {
+        serde_json::from_value(serde_json::json!({
+            "type": "WorkflowContinuedAsNew",
+            "data": {
+                "new_exec_id": "00000000-0000-0000-0000-000000000001",
+                "input": null
+            }
+        }))
+        .expect("a WorkflowContinuedAsNew event")
+    }
+
+    fn completed() -> WorkflowEvent {
+        WorkflowEvent::WorkflowCompleted {
+            output: serde_json::json!(7),
+        }
+    }
+
+    #[test]
+    fn a_real_continue_as_new_has_no_replaced_outcome() {
+        assert_eq!(
+            replaced_run_outcome(&[completed(), continued_as_new()]),
+            None
+        );
+    }
+
+    #[test]
+    fn a_replaced_run_reports_its_last_lifecycle_event() {
+        assert_eq!(replaced_run_outcome(&[completed()]), Some("COMPLETED"));
+        assert_eq!(
+            replaced_run_outcome(&[WorkflowEvent::workflow_failed("boom")]),
+            Some("FAILED")
+        );
+        assert_eq!(
+            replaced_run_outcome(&[WorkflowEvent::WorkflowCancelled {
+                reason: "stop".into()
+            }]),
+            Some("CANCELLED")
+        );
+    }
+
+    #[test]
+    fn a_workflow_task_timeout_reads_back_as_timed_out() {
+        let timed_out = WorkflowEvent::WorkflowFailed {
+            error: "timeout: StartToClose for wf".into(),
+            error_type: Some(crate::failure::ERROR_TYPE_WORKFLOW_TASK_TIMED_OUT.into()),
+            details: None,
+            non_retryable: None,
+        };
+        assert_eq!(replaced_run_outcome(&[timed_out]), Some("TIMED_OUT"));
+    }
+
+    #[test]
+    fn a_workflow_that_fails_with_timeout_text_still_reads_as_failed() {
+        // An activity timeout that the workflow returns writes the same text.
+        assert_eq!(
+            replaced_run_outcome(&[WorkflowEvent::workflow_failed(
+                "timeout: StartToClose for send_email"
+            )]),
+            Some("FAILED")
+        );
+    }
+
+    #[test]
+    fn the_last_lifecycle_event_wins() {
+        // A redriven run failed once, then completed.
+        assert_eq!(
+            replaced_run_outcome(&[WorkflowEvent::workflow_failed("boom"), completed()]),
+            Some("COMPLETED")
+        );
+    }
+
+    #[test]
+    fn a_history_without_an_outcome_names_none() {
+        assert_eq!(replaced_run_outcome(&[]), None);
     }
 }

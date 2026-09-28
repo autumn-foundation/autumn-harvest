@@ -18436,7 +18436,7 @@ async fn persist_workflow_continue_as_new_with_verdict(
     new_workflow_type: Option<String>,
     verdict: ContinueAsNewVerdict,
 ) -> HarvestResult<bool> {
-    use crate::schema::{harvest_events, harvest_signals, harvest_workflow_executions};
+    use crate::schema::{harvest_signals, harvest_workflow_executions};
 
     let offloader = registry.payload_offloader();
 
@@ -18732,47 +18732,37 @@ async fn persist_workflow_continue_as_new_with_verdict(
             .await
             .map_err(crate::error::database_error)?;
 
-        store::append_events_offloaded_with_codecs(
+        // Issue #1243 review (P1): a carried offload reference must reach the
+        // successor's `WorkflowStarted` byte-identical to the predecessor's
+        // copy. It is a blob pointer, not ciphertext, so it never goes through
+        // `encode_payload`. The patch places it in the encoded row before the
+        // INSERT. No UPDATE of `harvest_events` follows, so this path adds no
+        // in-place writer to the append-only log.
+        let carried_raw = carried_lcr_ref.as_ref().map(|_| {
+            raw_carryover.clone().expect(
+                "carried_lcr_ref is Some only when raw_carryover parsed as an offload envelope",
+            )
+        });
+        store::append_events_offloaded_with_codecs_and_patch(
             conn,
             new_exec_id,
             &[started_event],
             0,
             offloader,
             registry.payload_codecs(),
+            |rows| {
+                if let (Some(raw_value), Some(row)) = (carried_raw, rows.first_mut())
+                    && let Some(data) = row.event_data.get_mut("data")
+                {
+                    data["last_completion_result"] = raw_value;
+                }
+            },
         )
         .await?;
         // Record the carried-forward blob reference for the successor so the
         // blob survives until the successor is also retained (issue #524).
         if let Some(ref carried) = carried_lcr_ref {
             store::insert_payload_refs(conn, new_exec_id, std::slice::from_ref(carried)).await?;
-            // Issue #1243 review (P1): patch the offload reference into the
-            // row the write above just inserted with a `None` placeholder.
-            // This never goes through `encode_payload` -- the reference is
-            // a blob pointer, not ciphertext, and it must reach storage
-            // byte-identical to the predecessor's copy. Mirrors the raw
-            // `event_data` patch `erase.rs` uses for the same reason.
-            let raw_value = raw_carryover.clone().expect(
-                "carried_lcr_ref is Some only when raw_carryover parsed as an offload envelope",
-            );
-            let mut event_data: serde_json::Value = harvest_events::table
-                .filter(harvest_events::workflow_exec_id.eq(new_exec_id.as_uuid()))
-                .filter(harvest_events::event_id.eq(0))
-                .select(harvest_events::event_data)
-                .first(conn)
-                .await
-                .map_err(crate::error::database_error)?;
-            if let Some(data) = event_data.get_mut("data") {
-                data["last_completion_result"] = raw_value;
-            }
-            diesel::update(
-                harvest_events::table
-                    .filter(harvest_events::workflow_exec_id.eq(new_exec_id.as_uuid()))
-                    .filter(harvest_events::event_id.eq(0)),
-            )
-            .set(harvest_events::event_data.eq(event_data))
-            .execute(conn)
-            .await
-            .map_err(crate::error::database_error)?;
         }
 
         // Reassign unconsumed signals to the new execution so signals

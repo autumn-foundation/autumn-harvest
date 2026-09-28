@@ -18,9 +18,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{HarvestError, HarvestResult};
-use crate::execution::{
-    StartWorkflowParams, StartedWorkflowExecution, start_or_load_workflow_execution_with_codecs,
-};
+use crate::execution::{StartWorkflowParams, StartedWorkflowExecution};
 use crate::info::DagInfo;
 use crate::models::{HarvestSchedule, NewHarvestSchedule};
 use crate::policy::{OverlapPolicy, Schedule, WorkflowSchedule, compute_jitter_offset};
@@ -1418,6 +1416,8 @@ pub async fn trigger_unified_dag(
     start_source: crate::types::StartSource,
     started_by: Option<&str>,
 ) -> HarvestResult<StartedWorkflowExecution> {
+    use diesel_async::AsyncConnection;
+
     let mut db = pool
         .get()
         .await
@@ -1431,6 +1431,12 @@ pub async fn trigger_unified_dag(
     // Resolve the DAG schedule row by its DAG marker first. Some upgrade paths
     // can still have workflow-only rows, so use those as a fallback until
     // registration merges them.
+    //
+    // The pause and `max_active_runs` checks and the start run in one
+    // transaction, under a lock on the schedule rows. Two concurrent manual
+    // triggers once read the same count, and both started, so the DAG ran
+    // over its limit. The lock makes the second trigger count the first run.
+    let (collected, hints) = Box::pin(crate::dispatch::buffered(Box::pin(db.transaction::<_, HarvestError, _>(async |conn| {
     let schedule = {
         use crate::schema::harvest_schedules::dsl;
         let rows = dsl::harvest_schedules
@@ -1439,8 +1445,10 @@ pub async fn trigger_unified_dag(
                     .eq(dag_name)
                     .or(dsl::workflow_name.eq(dag_name)),
             )
+            .order(dsl::id)
             .select(HarvestSchedule::as_select())
-            .load::<HarvestSchedule>(&mut db)
+            .for_update()
+            .load::<HarvestSchedule>(conn)
             .await
             .map_err(crate::error::database_error)?;
         rows.iter()
@@ -1462,7 +1470,7 @@ pub async fn trigger_unified_dag(
         // successor of this schedule too, not just same-named runs -- a manual
         // trigger must not double-dispatch a schedule whose active run has
         // already changed type mid-chain.
-        let running: i64 = schedule_running_basis(&mut db, dag_name, schedule.id).await?;
+        let running: i64 = schedule_running_basis(conn, dag_name, schedule.id).await?;
         if running >= i64::from(schedule.max_active_runs) {
             return Err(HarvestError::UpdateRejected {
                 reason: format!(
@@ -1494,8 +1502,8 @@ pub async fn trigger_unified_dag(
         max_execution_timeout_ceiling,
     } = registry.resolve_dispatch_deadline(dag_name);
 
-    start_or_load_workflow_execution_with_codecs(
-        &mut db,
+    crate::execution::start_or_load_workflow_execution_collect_with_codecs(
+        conn,
         StartWorkflowParams {
             workflow_name: dag_name,
             workflow_id: &workflow_id,
@@ -1545,10 +1553,30 @@ pub async fn trigger_unified_dag(
             start_source_ref: schedule_ref.as_deref(),
             started_by,
         },
+        /* in_outer_transaction = */ true,
+        /* reject_fresh_if_debounced = */ false,
+        None,
         None,
         registry.payload_codecs(),
     )
     .await
+    })))).await;
+    let (started, deferred_starts, deferred_checks, _cancel_metrics) = collected?;
+    // Side effects run only after the commit, so a rollback starts nothing.
+    crate::dispatch::publish_now(hints).await;
+    for start in deferred_starts {
+        start.spawn();
+    }
+    for (check_id, check_name) in deferred_checks {
+        let _ = crate::execution::check_and_report_unfinished_handlers(
+            &mut db,
+            check_id,
+            &check_name,
+            None,
+        )
+        .await;
+    }
+    Ok(started)
 }
 
 /// Upsert the durable schedule row for one registered DAG.

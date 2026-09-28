@@ -80,6 +80,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          build_reachability_fanout_perf
 linux        autumn-harvest         integration                      -                          business_day_timer_tests
 linux        autumn-harvest         integration                      -                          canary_tests
+linux        autumn-harvest         integration                      -                          cancellation_tests
 linux        autumn-harvest         integration                      -                          capability_miss_tests
 linux        autumn-harvest         integration                      -                          chain_timeout_tests
 linux        autumn-harvest         integration                      -                          child_fanout_batch_perf
@@ -109,6 +110,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          mutex_tests
 linux        autumn-harvest         integration                      -                          panic_containment_tests
 linux        autumn-harvest         integration                      -                          parent_close_cascade_unfinished_handlers_perf
+linux        autumn-harvest         integration                      -                          pause_tests
 linux        autumn-harvest         integration                      -                          poison_pill_reclaim_perf
 linux        autumn-harvest         integration                      -                          queue_pause_success_metric_tests
 linux        autumn-harvest         integration                      -                          queue_pause_tests
@@ -120,6 +122,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          quota_supersede_ordering_tests
 linux        autumn-harvest         integration                      -                          rate_limit_bucket_gc_tests
 linux        autumn-harvest         integration                      -                          rate_limit_key
+linux        autumn-harvest         integration                      -                          redrive_tests
 linux        autumn-harvest         integration                      -                          retention_overrides_tests
 linux        autumn-harvest         integration                      -                          retention_summary_tests
 linux        autumn-harvest         integration                      -                          retry_after_tests
@@ -147,6 +150,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          workflow_pause_claim_recheck_tests
 linux        autumn-harvest         integration                      -                          workflow_reachability_samples_tests
 linux        autumn-harvest         integration                      -                          workflow_retry_tests
+linux        autumn-harvest         integration                      -                          workflow_task_timeout_tests
 linux        autumn-harvest         integration                      hot-code-swap,testing      hot_code_swap_tests
 linux        autumn-harvest         integration                      testing                    backup_verify_refs_batch_perf
 linux        autumn-harvest         integration                      testing                    backup_verify_retention_batch_perf
@@ -154,6 +158,10 @@ linux        autumn-harvest         integration                      testing    
 linux        autumn-harvest         integration                      testing                    codec_rotation_db_tests
 linux        autumn-harvest         integration                      testing                    cross_region_dr_tests
 linux        autumn-harvest         integration                      testing                    dag_compensation
+linux        autumn-harvest         integration                      testing                    dag_input_binding_tests
+linux        autumn-harvest         integration                      testing                    dag_mapping_tests
+linux        autumn-harvest         integration                      testing                    dag_signal_gate_tests
+linux        autumn-harvest         integration                      testing                    dag_unified_tests
 linux        autumn-harvest         integration                      testing                    dispatch_tests
 linux        autumn-harvest         integration                      testing                    nd_block
 linux        autumn-harvest         integration                      testing                    shard_rebalance_db_tests
@@ -179,6 +187,7 @@ linux        autumn-harvest-plugin  dev_runtime_lifecycle            dev-runtime
 linux        autumn-harvest-plugin  dlq_aggregate_integration        -                          -
 linux        autumn-harvest-plugin  dlq_bulk_discard_perf            -                          -
 linux        autumn-harvest-plugin  dlq_bulk_integration             -                          -
+linux        autumn-harvest-plugin  dlq_redrive_integration          -                          -
 linux        autumn-harvest-plugin  eligibility_tests                -                          -
 linux        autumn-harvest-plugin  fail_now_integration             -                          -
 linux        autumn-harvest-plugin  fanout_degradation_integration   -                          -
@@ -210,6 +219,7 @@ linux        autumn-harvest-plugin  start_source_integration         -          
 linux        autumn-harvest-plugin  start_throttle_integration       -                          -
 linux        autumn-harvest-plugin  status_summary_integration       -                          -
 linux        autumn-harvest-plugin  status_summary_stalled_perf      -                          -
+linux        autumn-harvest-plugin  terminate_integration            -                          -
 linux        autumn-harvest-plugin  timeline_integration             -                          -
 linux        autumn-harvest-plugin  token_auth_integration           -                          -
 linux        autumn-harvest-plugin  triage_integration               -                          -
@@ -220,6 +230,7 @@ linux        autumn-harvest-plugin  workflow_children_traversal_perf -          
 linux        autumn-harvest-plugin  workflow_logs_integration        -                          -
 linux        autumn-harvest-plugin  workflow_reachability_integration  -                          -
 linux        autumn-harvest-plugin  workflow_rerun_integration       -                          -
+linux        autumn-harvest-plugin  workflow_reset_integration       -                          -
 linux        autumn-harvest-plugin  workflow_summaries_integration   -                          -
 linux        autumn-harvest-redis   dispatch_redis                   -                          -
 linux        autumn-harvest-redis   integration_redis                -                          -
