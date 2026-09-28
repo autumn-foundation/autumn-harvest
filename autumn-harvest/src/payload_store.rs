@@ -457,6 +457,59 @@ mod tests {
         assert_eq!(store.gets.load(Ordering::SeqCst), 1);
     }
 
+    /// Quarantined regression test for issue #1758.
+    ///
+    /// Business data that was never offloaded, but happens to be shaped like
+    /// an offload reference envelope, is misread as one on the very next
+    /// inflate. Replay then fails instead of returning the stored value
+    /// byte-for-byte, breaking the guarantee documented on
+    /// `inflate_event_value`.
+    ///
+    /// `is_offload_envelope` and `parse_offload_envelope` are
+    /// discriminator-only. They match `_harvest_offload_envelope: 1` plus
+    /// sibling field names and types, with no structural guard against a
+    /// coincidental business payload of that shape. Issue #1253 found and
+    /// fixed the same defect class in the codec envelope by nesting it under
+    /// one reserved top-level key. The offload envelope was never migrated
+    /// to that shape. Ignored until #1758 lands a fix; remove `#[ignore]`
+    /// then.
+    #[ignore = "issue #1758: offload envelope has no collision escape, unlike the codec envelope fixed by #1253"]
+    #[tokio::test]
+    async fn business_data_shaped_like_offload_envelope_is_corrupted_on_inflate() {
+        let store = MemStore::new(); // store_id() == "mem"
+        let off = offloader(store.clone(), 1_000_000); // threshold never hit
+        let original = serde_json::json!({
+            OFFLOAD_ENVELOPE_KEY: 1,
+            "store_id": "s3-prod",
+            "key": "customer-42/invoice.pdf",
+            "len": 1234,
+            "checksum": "abc123",
+        });
+        let mut event = event_with_output(original.clone());
+
+        let refs = off.offload_event_value(&mut event).await.unwrap();
+        assert!(refs.is_empty(), "payload is tiny: nothing should be offloaded");
+        assert_eq!(
+            event["data"]["output"], original,
+            "written event still holds the caller's exact business value"
+        );
+        assert_eq!(store.puts.load(Ordering::SeqCst), 0);
+
+        // The very next read/replay of this event inflates it. Instead of
+        // returning the byte-identical value that was stored, it is
+        // misclassified as a dangling offload reference and errors out.
+        let result = off.inflate_event_value(&mut event).await;
+        assert_eq!(
+            event["data"]["output"], original,
+            "byte fidelity broken: inflate must not touch a field it cannot really own"
+        );
+        assert!(
+            result.is_ok(),
+            "replay/read of a workflow whose own business data merely LOOKS like an \
+             offload envelope must not fail: got {result:?}"
+        );
+    }
+
     #[tokio::test]
     async fn small_field_stays_inline() {
         let store = MemStore::new();
