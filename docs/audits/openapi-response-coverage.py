@@ -93,7 +93,8 @@ rejection. An `.or_else(..)` whose fallback yields `Ok(..)` on every path makes
 a later `?` tolerant. A guard or a tolerant call at a helper call site carries
 into the helper. A parse in a closure or an `async` block that a `let` binds,
 and that runs only where it is called or awaited, reads the guard at each
-call or `.await`. A plain move to another name, such as `let run = parse;`,
+call or `.await`, grouped or borrowed as in `(parse)()` or `(&fut).await`. A
+plain move to another name, such as `let run = parse;` or `let run = (parse);`,
 is followed to that name's calls. The strictest one decides. One whose name is
 never used never runs, so its parse does not count. Check 2 applies to every parse
 that does not tolerate its error, since a body that is present must then carry
@@ -2406,14 +2407,17 @@ SUCCESS_STEP = r"(?:\?|\.\s*await\b|\.\s*(?:%s)\s*\((?:[^()]|\([^()]*\))*\))" % 
 )
 
 
-def argument_root(argument: str, copies: bool = False) -> tuple[str | None, bool]:
+def argument_root(
+    argument: str, copies: bool = False, projections: bool = True
+) -> tuple[str | None, bool]:
     """The variable an argument reads, and whether it reads all of it.
 
     `&`, `&mut`, `*` and grouping parentheses are stripped, and so are whole
     views in `WHOLE_VIEW` and success projections in `SUCCESS_STEP`, so
     `body.as_ref().unwrap()` reads a wrapped carrier `body` whole. With
     `copies`, each step of `BYTE_PRESERVING_STEP` is stripped too, so
-    `body.to_vec()` reads `body` whole. What is
+    `body.to_vec()` reads `body` whole. With `projections` false, only
+    borrows, dereferences and grouping are stripped. What is
     left must be a plain name, which is then the root, read whole. A name
     followed by anything else, such as `body[4..]` or `body.to_vec()`, is
     the root, read in a form the audit cannot type. Any other argument has
@@ -2431,7 +2435,7 @@ def argument_root(argument: str, copies: bool = False) -> tuple[str | None, bool
             continue
         views = BYTE_PRESERVING_STEP if copies else WHOLE_VIEW
         view = re.search(r"\s*(?:%s|%s)$" % (views, SUCCESS_STEP), text)
-        if view and view.start():
+        if projections and view and view.start():
             text = text[: view.start()].strip()
             continue
         break
@@ -2930,23 +2934,25 @@ def closure_calls(block: str, position: int) -> list[int]:
     moved = moved_names(block, {bound.group(1): bound.start()})
     if moved.rebound:
         return []
-    # An alias is a name that a plain move, such as `let run = parse;` or
-    # `run = &parse;`, binds from the name or another alias. A name that
-    # holds the body in another value, such as `(parse, 1)`, is none, and
-    # neither is the result of a run, such as `fut.await`. The fixed point
-    # ends, since each pass adds a name or stops.
+    # An alias is a name that a plain move, such as `let run = parse;`,
+    # `let run = (parse);` or `run = &parse;`, binds from the name or another
+    # alias. `argument_root` reads the move with borrows and grouping only.
+    # A name that holds the body in another value, such as `(parse, 1)`, is
+    # none, and neither is the result of a run, such as `fut.await`. The
+    # fixed point ends, since each pass adds a name or stops.
     aliases = {bound.group(1): bound.start()}
     moves: set[int] = set()
     statements = plain_lets(block) + assignments(block)
     while True:
         added = False
         for target, _, opener, value in statements:
-            plain = re.fullmatch(r"\s*(?:&\s*(?:mut\s+)?)?([a-z_][a-z_0-9]*)\s*", value)
-            if plain is None or plain.group(1) not in aliases or target not in moved:
+            root, whole = argument_root(value, projections=False)
+            if not whole or root not in aliases or target not in moved:
                 continue
-            if target in partial_names(moved) or opener + plain.start(1) in moves:
+            use = opener + re.search(r"(?<![.\w])%s\b" % re.escape(root), value).start()
+            if target in partial_names(moved) or use in moves:
                 continue
-            moves.add(opener + plain.start(1))
+            moves.add(use)
             if target not in aliases:
                 aliases[target] = moved[target]
             added = True
@@ -2962,7 +2968,18 @@ def closure_calls(block: str, position: int) -> list[int]:
                 continue
             if re.match(r"\s*=(?![=>])", block[use.end() :]):
                 continue
-            if not re.match(runs, block[use.end() :]):
+            # A grouped or borrowed use, such as `(parse)()` or `(&fut).await`,
+            # runs when the whole group is the receiver of the call or await,
+            # as `receiver_start` bounds it and `argument_root` reads it.
+            end = use.end()
+            while closing := re.match(r"\s*\)", block[end:]):
+                end += closing.end()
+            if not re.match(runs, block[end:]):
+                return []
+            run = end + len(block[end:]) - len(block[end:].lstrip())
+            receiver = receiver_start(block, run)
+            read = argument_root(block[receiver:run], projections=False)
+            if receiver > at or read != (alias, True):
                 return []
             calls.append(at)
     return sorted(calls)
@@ -6601,6 +6618,14 @@ pub fn harvest_api_router() -> Router {
         .route("/e/ambiguous-windows", post(e_ambiguous_windows))
         .route("/e/other-type-len", post(e_other_type_len))
         .route("/e/vec-windows", post(e_vec_windows))
+        .route("/e/closure-grouped-call", post(e_closure_grouped_call))
+        .route("/e/closure-borrowed-call", post(e_closure_borrowed_call))
+        .route("/e/closure-double-grouped", post(e_closure_double_grouped))
+        .route("/e/async-grouped-await", post(e_async_grouped_await))
+        .route("/e/closure-grouped-alias", post(e_closure_grouped_alias))
+        .route("/e/closure-grouped-passed", post(e_closure_grouped_passed))
+        .route("/e/closure-helper-call", post(e_closure_helper_call))
+        .route("/e/async-branch-returned", post(e_async_branch_returned))
         .route("/e/closure-alias-call", post(e_closure_alias_call))
         .route("/e/closure-alias-chain", post(e_closure_alias_chain))
         .route("/e/closure-alias-assigned", post(e_closure_alias_assigned))
@@ -8915,6 +8940,60 @@ async fn e_closure_alias_reassigned(body: Bytes) -> Response {
     let mut run = parse;
     run = || Ok(Gadget::default());
     let gadget = if body.is_empty() { Gadget::default() } else { run().unwrap() };
+    StatusCode::OK.into_response()
+}
+
+async fn e_closure_grouped_call(body: Bytes) -> Response {
+    let parse = || serde_json::from_slice::<Gadget>(&body);
+    let gadget = if body.is_empty() { Gadget::default() } else { (parse)().unwrap() };
+    StatusCode::OK.into_response()
+}
+
+async fn e_closure_borrowed_call(body: Bytes) -> Response {
+    let parse = || serde_json::from_slice::<Gadget>(&body);
+    let gadget = if body.is_empty() { Gadget::default() } else { (&parse)().unwrap() };
+    StatusCode::OK.into_response()
+}
+
+async fn e_closure_double_grouped(body: Bytes) -> Response {
+    let parse = || serde_json::from_slice::<Gadget>(&body).unwrap();
+    if body.is_empty() {
+        return StatusCode::OK.into_response();
+    }
+    let gadget = ((parse))();
+    StatusCode::OK.into_response()
+}
+
+async fn e_async_grouped_await(body: Bytes) -> Response {
+    let pending = async { serde_json::from_slice::<Gadget>(&body).unwrap() };
+    let gadget = if body.is_empty() { Gadget::default() } else { (pending).await };
+    StatusCode::OK.into_response()
+}
+
+async fn e_closure_grouped_alias(body: Bytes) -> Response {
+    let parse = || serde_json::from_slice::<Gadget>(&body);
+    let run = (parse);
+    let gadget = if body.is_empty() { Gadget::default() } else { run().unwrap() };
+    StatusCode::OK.into_response()
+}
+
+async fn e_closure_grouped_passed(body: Bytes) -> Response {
+    let parse = || serde_json::from_slice::<Gadget>(&body);
+    let gadget = if body.is_empty() { Gadget::default() } else { run_parse((parse)) };
+    StatusCode::OK.into_response()
+}
+
+async fn e_closure_helper_call(body: Bytes) -> Response {
+    let parse = || serde_json::from_slice::<Gadget>(&body);
+    let gadget = if body.is_empty() { Gadget::default() } else { wrap_parse(parse)().unwrap() };
+    StatusCode::OK.into_response()
+}
+
+async fn e_async_branch_returned(body: Bytes) -> Response {
+    let pending = async { serde_json::from_slice::<Gadget>(&body).unwrap() };
+    let fallback = async { Gadget::default() };
+    let later = if body.is_empty() { fallback } else { pending };
+    let gadget = later.await;
     StatusCode::OK.into_response()
 }
 
@@ -12583,6 +12662,42 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
                 "POST /e/closure-alias-passed: `name` is mandatory in Gadget",
                 "POST /e/closure-alias-mixed: `name` is mandatory in Gadget",
                 "POST /e/closure-alias-reassigned: `name` is mandatory in Gadget",
+            ],
+        },
+    ),
+    (
+        "a grouped or borrowed call or await of a deferred body is a run site",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST", "/e/" + path, 200, request_body=body_of(("name", False), required=False)
+            )
+            for path in (
+                "closure-grouped-call",
+                "closure-borrowed-call",
+                "closure-double-grouped",
+                "async-grouped-await",
+                "closure-grouped-alias",
+                "closure-grouped-passed",
+                "closure-helper-call",
+                "async-branch-returned",
+            )
+        ],
+        {
+            "body_required": [
+                "POST /e/closure-grouped-passed: the body is mandatory",
+                "POST /e/closure-helper-call: the body is mandatory",
+                "POST /e/async-branch-returned: the body is mandatory",
+            ],
+            "mandatory": [
+                "POST /e/closure-grouped-call: `name` is mandatory in Gadget",
+                "POST /e/closure-borrowed-call: `name` is mandatory in Gadget",
+                "POST /e/closure-double-grouped: `name` is mandatory in Gadget",
+                "POST /e/async-grouped-await: `name` is mandatory in Gadget",
+                "POST /e/closure-grouped-alias: `name` is mandatory in Gadget",
+                "POST /e/closure-grouped-passed: `name` is mandatory in Gadget",
+                "POST /e/closure-helper-call: `name` is mandatory in Gadget",
+                "POST /e/async-branch-returned: `name` is mandatory in Gadget",
             ],
         },
     ),
