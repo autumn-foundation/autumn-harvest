@@ -26190,18 +26190,16 @@ fn dispatch_batch_timeout(
 }
 
 /// The outer deadline for a dispatch-channel read. It is the blocking wait
-/// plus one call timeout per round trip the channel reports for each queue
-/// ([`crate::dispatch::TaskDispatch::next_round_trips_per_queue`]). The read must not expire
-/// while a round trip is in flight. Expiry drops the future, and an entry
-/// that the read already claimed then stays pending until visibility
-/// recovery. The count comes from the channel, so only a channel that
-/// needs a larger budget gets one (#1756).
-fn dispatch_read_timeout(
-    block_for: Duration,
-    queue_count: usize,
-    round_trips_per_queue: usize,
-) -> Duration {
-    block_for + dispatch_batch_timeout(queue_count, round_trips_per_queue, 0)
+/// plus one call timeout per round trip that the channel reports for the
+/// read ([`crate::dispatch::TaskDispatch::next_round_trips`]). The read must
+/// not expire while a round trip is in flight. Expiry drops the future, and
+/// an entry that the read already claimed then stays pending until
+/// visibility recovery. The count comes from the channel, so only a channel
+/// that needs a larger budget gets one (#1756).
+fn dispatch_read_timeout(block_for: Duration, round_trips: usize) -> Duration {
+    block_for
+        + DISPATCH_CALL_TIMEOUT
+            .saturating_mul(u32::try_from(round_trips.max(1)).unwrap_or(u32::MAX))
 }
 
 /// Per-shard block duration for a dispatch-channel read during multi-shard
@@ -28786,8 +28784,8 @@ impl Worker {
         // `read_across_queues`'s doc comment. A flat call timeout sized
         // for one round trip can then fire before that pass alone
         // finishes. The Redis channel can also finish a lap after its
-        // deadline and heal a missing group. The channel reports its own
-        // round trips per queue, so the cap covers them. See
+        // deadline, heal a missing group and requeue a surplus. The channel
+        // reports its own worst-case round trips, so the cap covers them. See
         // [`dispatch_read_timeout`]. `tokio::time::timeout`
         // drops the whole future on expiry. An entry the read had already
         // claimed from an earlier queue then never reaches the channel's
@@ -28796,8 +28794,7 @@ impl Worker {
         // worker its exit without waiting out the read.
         let read_timeout = dispatch_read_timeout(
             block_for,
-            self.config.queues.len(),
-            installed.channel.next_round_trips_per_queue(),
+            installed.channel.next_round_trips(self.config.queues.len()),
         );
         let read = tokio::select! {
             () = self.shutdown.cancelled() => return 0,
@@ -42711,27 +42708,26 @@ mod tests {
         );
     }
 
-    /// The read deadline scales with the round trips per queue that the
-    /// channel reports. A channel with the default count of one keeps the
-    /// old deadline, so a stalled custom dispatcher still times out
-    /// quickly (#1756).
+    /// The read deadline is the wait plus one call timeout per round trip
+    /// that the channel reports. A channel with the default count of one
+    /// per queue keeps the old deadline, so a stalled custom dispatcher
+    /// still times out quickly (#1756).
     #[test]
     fn dispatch_read_timeout_scales_with_the_channel_round_trip_count() {
         let block_for = Duration::from_secs(2);
         assert_eq!(
-            dispatch_read_timeout(block_for, 3, 1),
+            dispatch_read_timeout(block_for, 3),
             block_for + DISPATCH_CALL_TIMEOUT * 3,
-            "a default channel keeps one call timeout per queue"
+            "a default channel over three queues gets three call timeouts"
         );
         assert_eq!(
-            dispatch_read_timeout(block_for, 3, 6),
-            block_for + DISPATCH_CALL_TIMEOUT * 18,
-            "a channel that reports six round trips per queue gets six call timeouts per queue"
+            dispatch_read_timeout(block_for, 36),
+            block_for + DISPATCH_CALL_TIMEOUT * 36,
         );
         assert_eq!(
-            dispatch_read_timeout(Duration::ZERO, 0, 0),
+            dispatch_read_timeout(Duration::ZERO, 0),
             DISPATCH_CALL_TIMEOUT,
-            "an empty queue list and a zero count still get one call timeout"
+            "a zero count still gets one call timeout"
         );
     }
 
