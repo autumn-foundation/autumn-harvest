@@ -143,8 +143,15 @@ matters.
 Collapsing 3 calls to 1 on an already-warm connection: **6 → 6, Δ = 0
 buffers.** On a cold connection's very first sweep (or the first sweep after
 any DDL invalidates the syscache entry): 6 → 6 either way (a single call
-still has to resolve it once). There is no buffer regime in which the fix
-saves anything.
+still has to resolve it once). The one regime probes 3-4 do not cover and
+this page does not claim to rule out: DDL against `harvest_mutex_locks`
+landing and committing from a concurrent session at the exact moment
+*between* this sweep's own three calls, invalidating the syscache entry the
+outer call just warmed before the two nested calls run. That would make
+calls 2-3 pay the 6-buffer cost again, and collapsing to one call would
+avoid it — but this is schema DDL racing a single in-flight transaction on
+a table nothing but the initial migration touches, not a load-bearing
+scenario this page measures or a reason to reconsider the verdict below.
 
 Neither floor item available to a catalog lookup is cleared, and now for an
 even more direct reason than "the statement is under 5% of the workload":
