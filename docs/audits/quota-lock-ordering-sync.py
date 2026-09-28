@@ -575,11 +575,20 @@ def check_call_site_guard(text: str, file_label: str, enclosing_fn: str, wrapper
     watched_names = {var}
     alias_re = re.compile(r"let\s+(?:mut\s+)?(\w+)\s*(?::[^=;]+)?=\s*" + re.escape(var) + r"\s*;")
     watched_names.update(m.group(1) for m in alias_re.finditer(before_assignment))
-    early_loop_re = re.compile(r"for\s+\w+\s+in\s+(?:" + "|".join(re.escape(n) for n in watched_names) + r")\s*\{")
+    # No `\s*\{` anchor here, unlike the guarded loop's own pattern below
+    # (Codex review, issue #1696 follow-up): a firing loop rooted at a
+    # watched name is unsafe before the ordering assignment whether or not
+    # an adaptor is chained onto its iterable (`due_rows.into_iter()`, say).
+    # The guarded loop's pattern is deliberately strict so a chained
+    # adaptor there is NOT recognized as the safe loop; this one is
+    # deliberately loose so a chained adaptor here IS still caught as a
+    # bypass. A trailing `\b` still stops `due_rows` from matching inside a
+    # longer identifier such as `due_rows_extra`.
+    early_loop_re = re.compile(r"for\s+\w+\s+in\s+(?:" + "|".join(re.escape(n) for n in watched_names) + r")\b")
     early_loop_match = early_loop_re.search(before_assignment)
     if early_loop_match is not None:
         return (
-            f"{file_label}::{enclosing_fn}: a `for _ in ... {{` loop fires rows, over "
+            f"{file_label}::{enclosing_fn}: a `for _ in ...` loop fires rows, over "
             f"`{var}` or a direct alias of it ({sorted(watched_names)!r}), before the "
             f"`{wrapper_call}` assignment is even reached — an early branch (e.g. a "
             "special case that fires and returns) can claim-order fire without ever "
