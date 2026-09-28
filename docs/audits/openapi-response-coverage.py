@@ -1117,10 +1117,10 @@ def overridden_by_with_status(body: str, call_open_paren: int) -> bool:
 
 
 # The OpenAPI type of each Rust scalar a query struct uses. The audit reports an
-# unlisted type. It does not guess one.
+# unlisted type. It does not guess one. A type from outside the standard
+# library is listed only by its trusted path, as `TRUSTED_TYPE_PATHS` holds.
 WIRE_TYPES = {
     "String": "string",
-    "Uuid": "string",
     "uuid::Uuid": "string",
     "bool": "boolean",
     "f32": "number",
@@ -1331,13 +1331,18 @@ class Params(str):
 
     `possible` holds each plainly named parameter whose type the audit can
     neither read as a byte carrier nor rule out as one. `written` is the list
-    as the source spells it, for a finding that names an alias.
+    as the source spells it, for a finding that names an alias. `raw_reader`
+    tells whether a top-level parameter is a trusted raw query reader, as
+    `raw_reader` reads it.
     """
 
-    def __new__(cls, text: str, possible: frozenset[str], written: str) -> "Params":
+    def __new__(
+        cls, text: str, possible: frozenset[str], written: str, raw_reader: bool = False
+    ) -> "Params":
         params = super().__new__(cls, text)
         params.possible = possible
         params.written = written
+        params.raw_reader = raw_reader
         return params
 
 
@@ -1350,14 +1355,16 @@ def canonical_params(params: str, opener: int) -> Params:
     an alias the audit cannot read, or a head the audit does not know, as
     `known_non_bytes` reads it.
     """
-    out, possible = params, set()
+    out, possible, readers = params, set(), False
     for start, end in reversed(parameter_spans(params)):
         item = params[start:end]
         colon = re.search(r"(?<!:):(?!:)", item)
         if colon is None:
             continue
         written = item[colon.end() :]
-        canonical, unread = canonical_type(written, (SOURCE[0], opener + start + colon.end()))
+        site = (SOURCE[0], opener + start + colon.end())
+        readers = readers or raw_reader(written, site)
+        canonical, unread = canonical_type(written, site)
         pattern = item[: colon.start()].strip()
         named = re.fullmatch(r"(?:mut\s+)?([a-z_][a-z_0-9]*)", pattern)
         typed = "%s: %s" % (pattern, canonical)
@@ -1365,7 +1372,7 @@ def canonical_params(params: str, opener: int) -> Params:
             if unread is not None or not known_non_bytes(canonical, opener + start):
                 possible.add(named.group(1))
         out = out[: start] + " " + typed + out[end:]
-    return Params(out, frozenset(possible), params)
+    return Params(out, frozenset(possible), params, readers)
 
 
 def parameter_spans(params: str) -> list[tuple[int, int]]:
@@ -3053,9 +3060,38 @@ def duplicate_params(method: str, path: str, route: dict) -> list[str]:
     ]
 
 
-# An extractor that reads the raw query string or the whole request, so the
-# keys it accepts are not typed. `Query<T>` is not one.
-RAW_QUERY_READER = re.compile(r"\b(?:RawQuery|Uri|OriginalUri|Request|Parts)\b")
+# The trusted paths of the extractors that read the raw query string or the
+# whole request, so the keys they accept are not typed. `Query<T>` is not one.
+RAW_READER_PATHS = frozenset(
+    {
+        "axum::extract::RawQuery", "axum::http::Uri", "axum::extract::OriginalUri",
+        "axum::extract::Request", "axum::http::Request", "axum::http::request::Parts",
+    }
+)
+
+# The bare names of those extractors, which a local item can shadow.
+RAW_READER_NAMES = frozenset(path.rsplit("::", 1)[-1] for path in RAW_READER_PATHS)
+
+
+def raw_reader(written: str, site: Site) -> bool:
+    """Whether a parameter type is a trusted raw query reader at its top level.
+
+    The head of the type goes through `written_path`, so an import decides.
+    It counts when it expands to one of `RAW_READER_PATHS`, after the
+    `autumn_web::reexports::` prefix is cut. A bare name with no import
+    counts, as a bare extractor name does, unless a local item shadows it.
+    A reader nested in a generic argument, as in `State<Request>`, or one
+    from an untrusted path, does not count.
+    """
+    text = re.sub(r"^(?:&\s*(?:'[a-z_]+\s+)?(?:mut\s+)?)*", "", written.strip())
+    head = re.match(r"(?:::\s*)?[A-Za-z_]\w*(?:\s*::\s*[A-Za-z_]\w*)*", text)
+    if head is None:
+        return False
+    segments, used_at = written_path(head.group(0), site)
+    path = re.sub(r"^autumn_web::reexports::", "", "::".join(segments))
+    if len(segments) == 1:
+        return path in RAW_READER_NAMES
+    return path in RAW_READER_PATHS
 
 
 def query_struct_findings(
@@ -3329,13 +3365,23 @@ def canonical_type_at(declared_type: str, text: str, at: int | None) -> tuple[st
     return canonical_paths(lead + resolved), unread
 
 
+# Paths of types from outside the standard library that the audit reads by
+# path. A type counts as one only when its spelling resolves to the path.
+TRUSTED_TYPE_PATHS = frozenset({"uuid::Uuid"})
+
+
 def std_imports(declared_type: str, site: Site) -> str:
-    """A type with each name that a `use` binds to a standard item spelled out.
+    """A type with each name that a `use` binds to a standard or trusted item spelled out.
 
     `use std::option::Option as Maybe;` makes `Maybe<T>` read as
     `std::option::Option<T>`, which the `STD_TYPES` cut then shortens.
-    `written_path` reads each import. A name bound to any other item is
-    left as written, since `resolve_symbol` reads its import itself.
+    `use uuid::Uuid;` makes `Uuid` read as `uuid::Uuid`, one of
+    `TRUSTED_TYPE_PATHS`. A written trusted path whose first name an import
+    rebinds, as under `use crate::fake as uuid;`, is spelled out too, so it
+    no longer reads as trusted. `written_path` reads each import. A name
+    bound to any other item is left as written, since `resolve_symbol`
+    reads its import itself. A bare `Uuid` with no import stays bare and is
+    no wire type, so the audit fails closed on it.
     """
     text, at = site
     if at is None:
@@ -3346,7 +3392,10 @@ def std_imports(declared_type: str, site: Site) -> str:
         # The audited source has its standard paths cut already, `use`
         # statements too, so a bare standard name there is one as well.
         cut = len(segments) == 1 and segments[0] in STD_TYPES
-        if used_at is not None and segments and (segments[0] in STD_ROOTS or cut):
+        trusted = "::".join(segments) in TRUSTED_TYPE_PATHS
+        rebound = re.sub(r"\s", "", found.group(0)) in TRUSTED_TYPE_PATHS
+        standard = bool(segments) and segments[0] in STD_ROOTS
+        if used_at is not None and (standard or cut or trusted or rebound):
             spelled = "::".join(segments)
             declared_type = declared_type[: found.start()] + spelled + declared_type[found.end() :]
     return declared_type
@@ -3420,7 +3469,8 @@ def alias_declarations(code: str) -> list[tuple[tuple[int, int], tuple[int, int]
     # A local item named like an extractor or a prelude type shadows it in its
     # scope, as an untrusted import does. A `type` alias that renames the type
     # to its own name is no shadow.
-    item = r"\b(struct|enum|trait|union|type)\s+(%s)\b" % "|".join(EXTRACTOR_NAMES + PRELUDE_NAMES)
+    shadowable = EXTRACTOR_NAMES + PRELUDE_NAMES + tuple(sorted(RAW_READER_NAMES))
+    item = r"\b(struct|enum|trait|union|type)\s+(%s)\b" % "|".join(shadowable)
     for local in re.finditer(item, code):
         if local.group(1) == "type":
             target = re.match(r"\s*(<[^=;]*?>)?\s*=\s*([^;]+);", code[local.end() :])
@@ -3772,7 +3822,7 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
         # query the audit cannot read whole is left to its own finding: an
         # unresolved `Query<T>`, or a raw reader that check 4 or no check reads.
         unread_queries = len(unresolved) > unread_queries
-        if not unread_queries and not RAW_QUERY_READER.search(params):
+        if not unread_queries and not getattr(params, "raw_reader", False):
             typed_query += query_struct_findings(method, path, route, queries)
 
         # A bare `Json<T>` means the body is mandatory. `Result<Json<T>, _>` is
@@ -4322,6 +4372,16 @@ pub fn harvest_api_router() -> Router {
         .route("/s/spoofed-query", get(s_spoofed_query))
         .route("/s/std-alias-field", get(s_std_alias_field))
         .route("/s/no-query/{id}", get(s_no_query))
+        .route("/s/trusted-id", get(s_trusted_id))
+        .route("/s/local-id", get(s_local_id))
+        .route("/s/rebound-id", get(s_rebound_id))
+        .route("/s/bare-id", get(s_bare_id))
+        .route("/s/state-request", get(s_state_request))
+        .route("/s/fake-raw", get(s_fake_raw))
+        .route("/s/trusted-request", get(s_trusted_request))
+        .route("/s/reexport-raw", get(s_reexport_raw))
+        .route("/s/full-reexport-raw", get(s_full_reexport_raw))
+        .route("/s/local-request", get(s_local_request))
         .route("/s/raw-query", get(s_raw_query))
         .route("/s/unread-query", get(s_unread_query))
         .route("/s/std-option-param", post(s_std_option_param))
@@ -4360,6 +4420,96 @@ mod local_option {
 }
 
 async fn s_std_paths(Query(page): Query<local_option::StdPathsPage>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+mod ids_trusted {
+    use uuid::Uuid;
+
+    struct TrustedIdPage {
+        id: Uuid,
+        other: uuid::Uuid,
+    }
+}
+
+mod ids_local {
+    struct Uuid(u128);
+
+    struct LocalIdPage {
+        id: Uuid,
+    }
+}
+
+mod ids_rebound {
+    use crate::fake as uuid;
+
+    struct ReboundIdPage {
+        id: uuid::Uuid,
+    }
+}
+
+struct BareIdPage {
+    id: Uuid,
+}
+
+async fn s_trusted_id(Query(page): Query<ids_trusted::TrustedIdPage>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn s_local_id(Query(page): Query<ids_local::LocalIdPage>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn s_rebound_id(Query(page): Query<ids_rebound::ReboundIdPage>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn s_bare_id(Query(page): Query<BareIdPage>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn s_state_request(State(state): State<Request>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+mod fake_reader {
+    use crate::fake::RawQuery;
+
+    async fn s_fake_raw(RawQuery(raw): RawQuery) -> Response {
+        StatusCode::OK.into_response()
+    }
+}
+
+mod trusted_reader {
+    use axum::extract::Request;
+
+    async fn s_trusted_request(request: Request) -> Response {
+        StatusCode::OK.into_response()
+    }
+}
+
+mod local_request {
+    struct Request {
+        id: u32,
+    }
+
+    async fn s_local_request(request: Request) -> Response {
+        StatusCode::OK.into_response()
+    }
+}
+
+mod reexport_reader {
+    use autumn_web::reexports::axum;
+
+    async fn s_reexport_raw(axum::extract::RawQuery(raw): axum::extract::RawQuery) -> Response {
+        StatusCode::OK.into_response()
+    }
+}
+
+async fn s_full_reexport_raw(
+    autumn_web::reexports::axum::extract::RawQuery(raw):
+        autumn_web::reexports::axum::extract::RawQuery,
+) -> Response {
     StatusCode::OK.into_response()
 }
 
@@ -9281,6 +9431,51 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             )
         ],
         {},
+    ),
+    (
+        "Uuid is a string only when it resolves to uuid::Uuid",
+        FIXTURE_ALIAS_SCOPES,
+        [
+            fixture_route(
+                "GET",
+                "/s/trusted-id",
+                200,
+                params=[query_param("id", "string", True), query_param("other", "string", True)],
+            )
+        ]
+        + [
+            fixture_route("GET", path, 200, params=[query_param("id", "string", True)])
+            for path in ("/s/local-id", "/s/rebound-id", "/s/bare-id")
+        ],
+        {
+            "query_params": [
+                "GET /s/local-id: `id` has type Uuid, which maps to no OpenAPI type",
+                "GET /s/rebound-id: `id` has type crate::fake::Uuid, which maps to no OpenAPI type",
+                "GET /s/bare-id: `id` has type Uuid, which maps to no OpenAPI type",
+            ]
+        },
+    ),
+    (
+        "only a trusted top-level raw reader exempts a route from the documented key check",
+        FIXTURE_ALIAS_SCOPES,
+        [
+            fixture_route("GET", path, 200, params=[query_param("limit", "integer", False)])
+            for path in (
+                "/s/state-request",
+                "/s/fake-raw",
+                "/s/local-request",
+                "/s/trusted-request",
+                "/s/reexport-raw",
+                "/s/full-reexport-raw",
+            )
+        ],
+        {
+            "query_params": [
+                "GET /s/state-request: `limit` is documented but no extractor of the route",
+                "GET /s/fake-raw: `limit` is documented but no extractor of the route",
+                "GET /s/local-request: `limit` is documented but no extractor of the route",
+            ]
+        },
     ),
     (
         "a documented query key needs an extractor that reads it, on every served route",
