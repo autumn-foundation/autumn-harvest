@@ -303,6 +303,26 @@ jobs:
         # guards above. See
         # scripts/check-preflight-declared-deps-example.sh.
         run: ./scripts/check-preflight-declared-deps-example.sh
+      - name: Check webhooks chapter documents the webhooks feature
+        # Guards a real, reproduced-live defect an Onramp clean-room pass
+        # found in chapter 12: it showed the `#[webhook]` mapping function
+        # and `.webhooks(webhooks![...])` plugin wiring with no mention
+        # that `autumn-harvest-plugin` needs `features = ["webhooks"]` --
+        # unlike the sibling chapter 13 (broker connectors), which states
+        # its `connectors` feature requirement up front in its own
+        # "Features:" table. A newcomer who scaffolds per chapter 1 (no
+        # extra features) and pastes chapter 12's code verbatim hits, at
+        # the .webhooks(...) call:
+        #   error[E0599]: no method named `webhooks` found for struct
+        #   `HarvestPlugin`
+        # which names neither "webhooks" nor this chapter. This compiles
+        # the doc's own snippets with `cargo check` twice -- once with
+        # default features (must fail, proving the feature really is
+        # required) and once with `--features webhooks` (must pass) --
+        # and greps for the fix's own "Enable the feature" note landing
+        # before step 3, so neither the code nor the note can regress
+        # silently. See scripts/check-webhooks-feature-example.sh.
+        run: ./scripts/check-webhooks-feature-example.sh
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Clippy autumn-harvest
