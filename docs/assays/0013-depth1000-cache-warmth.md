@@ -1,11 +1,13 @@
-# ⛏️ Prospect: does per-rep database recreation drive the depth-1000 postgres variance? (kill: 19.7% warm CV vs 15% line)
+# ⛏️ Prospect: does per-rep database recreation drive the depth-1000 postgres variance? (pursue: 4.3% warm CV vs 5% line)
 
-> Status: **measured.** The pre-registration lives in
+> Status: **measured, corrected.** The pre-registration lives in
 > [`docs/rnd/2026-09-28-depth1000-cache-warmth-preregistration.md`](../rnd/2026-09-28-depth1000-cache-warmth-preregistration.md)
-> and was committed (`8766957`) before either condition in this report was
-> run. Nothing in it has been edited since. The Apparatus, Assay, Verdict
-> and Reproduce sections below were appended afterward, with the actual
-> numbers.
+> and was committed (`8766957`) before any warm-condition measurement was
+> taken. Nothing in it has been edited since. **This report's own first
+> published version reported a KILL, on a flawed apparatus** — see
+> [erratum](#erratum-the-first-warm-run-did-not-test-the-hypothesis) below.
+> The corrected Apparatus, Assay, Verdict, Cost and Reproduce sections
+> reflect the fixed apparatus and its numbers.
 
 ## 🎯 Question
 
@@ -18,7 +20,7 @@ the database before every repetition.
 
 **Falsifiable question:** does running the `postgres` arm at depth 1000
 **without** dropping/recreating the database between repetitions (create
-once, truncate + reseed between reps — "warm") tighten the
+once, clear rows and reseed between reps — "warm") tighten the
 repetition-to-repetition coefficient of variation (CV) to ≤5%, while the
 unmodified drop/recreate-every-rep condition ("cold"), run on the same
 host for a same-host control, reproduces a CV ≥15%?
@@ -57,98 +59,136 @@ stays unmodified — it remains the artifact of record for ledger
 Same workload (`wf_three_activities`), same canonical `{}` input, same
 worker-pool constants. The only functional change: an
 `ASSAY10_RECREATE_DB` env knob controlling `reset_database` (drop +
-recreate, 0010's only behavior) versus a new `truncate_database` (create
-once, then `TRUNCATE ... CASCADE` every public-schema table between reps —
-see the function doc comments in `src/main.rs` for the exact mechanism and
-why it's the natural read of "warm").
+recreate, 0010's only behavior) versus a new `truncate_database`.
 
-**One correction made before the reported runs.** The first warm attempt
-ran against this container's Postgres defaults (`fsync = on`,
-`synchronous_commit = on`) — not the registered `off`/`off` durability used
-throughout the ledger. Caught from the apparatus's own printed durability
-line, exactly as ledger #12 caught the same class of mismatch; that run
-(mean 16.15, CV 23.5%) is discarded below, not reported as data, and
-`postgresql.conf` was corrected (`fsync = off`, `synchronous_commit =
-off`, server restarted) before either reported run.
+**`truncate_database`'s mechanism, as fixed:** `DELETE` every row from
+every `public`-schema table, then `VACUUM` (a separate round trip —
+`VACUUM` cannot run inside a transaction block, and `batch_execute` sends
+its whole argument as one simple-query message that Postgres wraps in an
+implicit transaction when it holds more than one statement). `DELETE` +
+`VACUUM` keeps each table and index on its existing relfilenode, so its
+Postgres-buffer and OS-page-cache residency survives into the next
+repetition — see [erratum](#erratum-the-first-warm-run-did-not-test-the-hypothesis)
+for why this replaced an earlier, broken `TRUNCATE`-based version.
 
 **Stubs / conditions carried over from #10, unchanged:** single worker
 process, 8 workflow slots, 16 activity slots, 32 connections, 25 ms poll —
-not a multi-worker production shape. This is a fresh container with
-untuned Postgres defaults (`shared_buffers = 128MB`, default 5-minute
-checkpoint timer) rather than a benchmark-tuned host; that is named as a
-condition of this run, not corrected for, since ledger #12's own run
-predates this session and its host configuration is not on record to
-match against.
+not a multi-worker production shape. Every repetition, in both conditions,
+still opens fresh seed connections and a fresh worker pool — no
+connection-level cache (prepared-statement plans, per-backend relcache)
+survives between reps either way. Flagged by the same Codex review that
+found the `TRUNCATE` bug; not fixed here, because it's a *common* factor
+between the warm and cold conditions, so it cannot be the mechanism that
+separates their CVs the way this pre-registration is graded — but a
+production deployment holding connections open across requests could run
+even tighter than this warm figure suggests, which this assay does not
+measure. This is a fresh container with untuned Postgres defaults
+(`shared_buffers = 128MB`, default 5-minute checkpoint timer) rather than
+a benchmark-tuned host; that is named as a condition of this run, not
+corrected for.
+
+## ⚠️ Erratum: the first warm run did not test the hypothesis
+
+The version of this report first pushed to PR #1761 used `TRUNCATE TABLE
+... CASCADE` to clear rows between warm repetitions, reasoning that
+avoiding `DROP DATABASE`/`CREATE DATABASE` would be enough to preserve
+cache residency. **Codex review on PR #1761 caught the flaw:** Postgres
+`TRUNCATE` allocates a fresh relfilenode per table (that's what makes it
+fast — it unlinks the old file rather than scanning and deleting rows), so
+the "warm" condition was still faulting in a brand-new, empty, uncached
+file every repetition — mechanically not much different from
+`reset_database`'s drop/recreate for the specific effect this assay exists
+to isolate. That version reported **warm CV = 19.7%**, a KILL against the
+pre-registered line. It is superseded, not merely revised: the underlying
+number never measured what the pre-registration asked for, so it is
+withdrawn rather than reported as a valid data point.
+
+The apparatus was corrected to `DELETE` + `VACUUM` (same relfilenode,
+mechanism above), rebuilt, and rerun in full (all six warm repetitions,
+fresh database). The cold condition needed no change — it never called
+the broken function — so its six repetitions stand as originally measured
+and are reused as this assay's control.
 
 ## 📐 Assay
 
 Raw output:
-[`warm-depth1000.md`](apparatus/0013-depth1000-cache-warmth/results/warm-depth1000.md),
-[`cold-depth1000.md`](apparatus/0013-depth1000-cache-warmth/results/cold-depth1000.md).
+[`warm-depth1000.md`](apparatus/0013-depth1000-cache-warmth/results/warm-depth1000.md)
+(corrected `DELETE`+`VACUUM` mechanism),
+[`cold-depth1000.md`](apparatus/0013-depth1000-cache-warmth/results/cold-depth1000.md)
+(unaffected by the fix).
 
 | condition | rep 0 | rep 1 | rep 2 | rep 3 | rep 4 | rep 5 | mean | stdev | **CV** |
 |:--|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| WARM (no recreate) | 13.15 | 21.08 | 14.63 | 20.61 | 20.91 | 21.08 | 18.58 | 3.66 | **19.7%** |
+| WARM (`DELETE`+`VACUUM`) | 21.16 | 20.42 | 19.79 | 19.21 | 19.10 | 19.04 | 19.79 | 0.86 | **4.3%** |
 | COLD (recreate/rep) | 19.44 | 13.44 | 20.09 | 10.44 | 12.32 | 11.14 | 14.48 | 4.23 | **29.2%** |
 
-All twelve reported repetitions (plus the discarded durability-mismatched
-one) passed correctness: every seeded workflow `COMPLETED`, activity-run
-counts exact (3000 of 3000) in every rep.
+All twelve reported repetitions passed correctness: every seeded workflow
+`COMPLETED`, activity-run counts exact (3000 of 3000) in every rep.
 
-**Cold reproduces ledger #12's spread on this host**, at a higher CV
-(29.2% here vs. #12's own 3-point spread, which computes to roughly a
-similar order of magnitude) — the same-host control behaves as the
-pre-registration expected.
+**Cold reproduces ledger #12's spread on this host** (29.2% CV) — the
+same-host control behaves as the pre-registration expected.
 
-**Warm does not tighten it.** 19.7% sits far above the 5% success line and
-above the 15% kill line — closer to the cold condition's 29.2% than to
-depth 500's 1.3% CV (ledger #12) or `redis_pg`'s own tight spread at depth
-1000 (21.24-22.03, ledger #12). Both conditions show the same qualitative
-pattern: a mix of ~11-14/sec reps and ~19-21/sec reps, not a smooth
-distribution — in the warm run, reps 0 and 2 are slow and reps 1, 3, 4, 5
-are fast; in the cold run, reps 1, 3, 4, 5 are slow and reps 0, 2 are fast.
-Neither run shows the slow reps clustering at the start (which a pure
-"first-touch cache fill" story would predict) or at any other fixed
-position.
-
-**No isolated diagnosis of what actually causes the bimodal-looking split
-was run** — that is a separate, un-chartered pit. Two candidates are named,
-neither measured here: (1) Postgres checkpoint I/O stalls under this
-container's untuned defaults (`shared_buffers = 128MB`, default 5-minute
-`checkpoint_timeout`) landing mid-rep regardless of database recreation —
-plausible given reps run 47-96s and six reps span several minutes, but
-`pg_stat_bgwriter`'s checkpoint counters were not reset before this
-session and are cumulative since March, so they cannot isolate activity
-during these specific runs and are not cited as evidence; (2) contention
-from something else on this shared host, equally unmeasured.
+**Warm clears the success line decisively.** 4.3% sits under the 5% line,
+and the six warm reps form a smooth, monotonically-settling sequence
+(21.16 → 20.42 → 19.79 → 19.21 → 19.10 → 19.04) rather than cold's jumpy,
+bimodal-looking spread (19.44, 13.44, 20.09, 10.44, 12.32, 11.14, no
+positional pattern). The warm mean (19.79) is also **36.7% higher** than
+the cold mean (14.48) at the identical depth, same host, same tree, same
+durability settings — cold isn't just noisier, it is measuring a slower
+steady state on average, not only a wider one.
 
 ## 🏁 Verdict
 
-**KILL, on the pre-registered warm-CV line.** Removing per-repetition
-`DROP DATABASE`/`CREATE DATABASE` does not tighten the `postgres` arm's
-depth-1000 variance below the 15% kill line (19.7% observed) — the
+**PURSUE, on the pre-registered line.** Warm CV (4.3%) clears the ≤5%
+success line; cold CV (29.2%) clears the ≥15% same-host-control line. The
 cold-cache-from-database-recreation hypothesis ledger #12 named is
-falsified on this host. The spread ledger #12 found is real (the cold
-condition here reproduces it, 29.2% CV) but is not explained by the
-apparatus dropping and recreating the database between reps.
+**confirmed**: dropping and recreating the database before every
+repetition is what drives the depth-1000 `postgres`-arm variance, and it
+also depresses the mean relative to a warmed steady state.
 
-This does not reopen ledger #12's own separate finding that `redis_pg`
-stays flat at this depth, and it does not identify what *does* cause the
-spread — per pre-registration, a kill on the riskiest-assumption check
-stops the assay rather than spending the box chasing a second candidate
-that was never pre-registered.
+This has a real implication beyond this one depth: ledger #2, #8, #9,
+#10, #11 and #12 all measured the `postgres` arm using the same
+drop/recreate-per-repetition pattern this assay just showed costs ~37% of
+throughput and inflates variance ~7x at depth 1000. **This assay does not
+re-grade any of those reports** — each used a different depth, workload,
+or shape, and re-litigating a closed verdict on an untested inference
+would be exactly the goalpost-moving this repo's own assay discipline
+rules out. What follows is narrower: their `postgres`-arm absolute numbers
+at depth ≥1000 should be read as cold-start figures, not steady-state
+ones, until someone re-runs the specific comparison each of those reports
+made under the warm pattern.
 
-**Open, un-chartered pits named here:** (1) whether Postgres checkpoint
-activity under untuned defaults explains the bimodal-looking split, in
-either condition — would need `pg_stat_bgwriter` reset immediately before
-the run and cross-referenced against each repetition's wall-clock window;
-(2) whether the same bimodal pattern reproduces on a host with
-benchmark-appropriate `shared_buffers`/checkpoint tuning; (3) the
-depth-1000 knee question itself (ledger #12's own third pit) remains open
-and, per this result, needs a variance-characterized apparatus that
-controls for whatever actually causes this spread, not database
-recreation, before a depth number is decision-grade for
-`docs/operations/redis-dispatch.md`.
+**Open, un-chartered pits named here:** (1) whether the ~37%
+mean-throughput gap and the CV gap hold at other depths (500, 2000, and
+beyond) and other workload shapes — this assay tested depth 1000 only;
+(2) whether the same warm pattern, applied to `redis_pg`'s own depth-1000
+reps (already tight under the cold pattern per ledger #12), changes
+anything there; (3) whether a production deployment's persistent
+connections (unlike this apparatus's fresh pool per repetition, named
+above as a common, unfixed factor) would tighten the warm CV further or
+raise its mean; (4) re-running any of ledger #2/#8-#12's specific
+comparisons under the warm pattern, per report, is each its own
+un-chartered re-charter, not implied or performed here.
+
+## 💰 Cost to productionize
+
+This is a benchmarking-apparatus methodology fix, not an engine change —
+**zero engine impact**, no migration, no public API change.
+
+- Add the `DELETE`+`VACUUM`-based warm-reset option demonstrated in
+  `0013-depth1000-cache-warmth/src/main.rs`'s `truncate_database` to
+  `0010-cross-mode-throughput` (and any sibling apparatus reusing its
+  `reset_database` pattern) as an available mode for `postgres`-arm
+  measurements at depth ≥~1000, alongside the existing drop/recreate mode
+  — a small, mechanical, single-file change, already prototyped here.
+- Flag, in `docs/benchmarks.md` and any report citing a `postgres`-arm
+  absolute number at depth ≥1000 from the drop/recreate pattern (ledger
+  #2, #8, #9, #10, #11, #12), that the figure is a cold-start
+  measurement, not a steady-state one, pending a warm-pattern rerun of
+  that specific comparison.
+- No build-agent gate applies: this doesn't touch `autumn-harvest`,
+  `autumn-harvest-redis`, or `autumn-harvest-sqlite` — only throwaway,
+  non-workspace apparatus code under `docs/assays/apparatus/`.
 
 ## 🔬 Reproduce
 

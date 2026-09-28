@@ -3,11 +3,11 @@
 // `autumn-harvest-sqlite` only. It modifies no workspace crate.
 //
 // Forked from `../0010-cross-mode-throughput/src/main.rs` (0010 stays
-// unmodified) to answer assay ledger #13: does per-repetition
+// unmodified). It answers assay ledger #13. Does per-repetition
 // `DROP DATABASE`/`CREATE DATABASE` drive the ~60% variance ledger #12 found
 // in the `postgres` arm's depth-1000 reps? The only functional change from
 // 0010 is `ASSAY10_RECREATE_DB` (see `reset_database`/`truncate_database`
-// below); everything else — workload, constants, pool construction, grading
+// below). Everything else — workload, constants, pool construction, grading
 // — is untouched.
 //
 // The lines, the shape and the repetition plan come from
@@ -131,8 +131,9 @@ struct Settings {
     arms: Vec<Arm>,
     /// `1` (default): drop/recreate the database every repetition — 0010's
     /// only behavior, byte-for-byte. `0`: create the database once, then
-    /// truncate and reseed between repetitions — the assay #13 "warm"
-    /// condition. See `reset_database`/`truncate_database`.
+    /// clear rows (`DELETE` + `VACUUM`, same relfilenode) and reseed between
+    /// repetitions — the assay #13 "warm" condition. See
+    /// `reset_database`/`truncate_database`.
     recreate_db: bool,
 }
 
@@ -396,14 +397,25 @@ async fn reset_database(settings: &Settings) {
         .expect("the harvest schema should apply");
 }
 
-/// Clear every table in the assay database without dropping it.
+/// Clear every table in the assay database without dropping it or its
+/// relation storage.
 ///
-/// Assay #13's "warm" condition: the database, its catalog entries and
-/// connection-level caches survive across repetitions; only row content is
-/// cleared. Contrast with `reset_database`, which drops the whole database
-/// (and so its buffer-cache residency, catalog cache entries and
-/// `CREATE DATABASE`'s template-copy cost) before every repetition — the
+/// Assay #13's "warm" condition. The database, its catalog entries, and each
+/// table/index's relfilenode survive across repetitions. So does their
+/// Postgres-buffer and OS-page-cache residency. Only row content is
+/// cleared. Contrast with `reset_database`. It drops the whole database,
+/// and every relation in it, before every repetition. That drop is the
 /// candidate cause ledger #12 named for the depth-1000 `postgres` variance.
+///
+/// This uses `DELETE`, not `TRUNCATE`. `TRUNCATE` allocates a fresh
+/// relfilenode per table. That discards exactly the buffer/page-cache
+/// residency this condition exists to preserve. A `TRUNCATE`-based warm run
+/// would still fault in a brand-new, empty file every repetition. That is
+/// no better, for the mechanism this assay tests, than `reset_database`'s
+/// drop/recreate. Found by Codex review on PR #1761. `VACUUM` afterward
+/// reclaims the deleted rows' space in place, on that same relfilenode. The
+/// next repetition's reseed then reuses already-resident pages, instead of
+/// extending the file.
 async fn truncate_database(settings: &Settings) {
     let mut conn = connect(&settings.database_url).await;
     conn.batch_execute(
@@ -411,12 +423,20 @@ async fn truncate_database(settings: &Settings) {
         DECLARE r RECORD;
         BEGIN
           FOR r IN SELECT tablename FROM pg_tables WHERE schemaname = 'public' LOOP
-            EXECUTE 'TRUNCATE TABLE public.' || quote_ident(r.tablename) || ' CASCADE';
+            EXECUTE 'DELETE FROM public.' || quote_ident(r.tablename);
           END LOOP;
         END $$;",
     )
     .await
-    .expect("the assay database should truncate");
+    .expect("the assay database should clear its rows");
+    // A separate round trip. `batch_execute` sends its whole argument as one
+    // simple-query message. Postgres wraps a multi-statement message in an
+    // implicit transaction block unless it contains explicit BEGIN/COMMIT.
+    // `VACUUM` cannot run inside a transaction block. Combined with the
+    // `DELETE` above in one call, every repetition after the first panicked.
+    conn.batch_execute("VACUUM;")
+        .await
+        .expect("the assay database should vacuum");
 }
 
 async fn scalar(conn: &mut AsyncPgConnection, sql: &str) -> i64 {
@@ -995,7 +1015,7 @@ async fn main() {
         if settings.recreate_db {
             "COLD (drop/recreate database every rep)"
         } else {
-            "WARM (create once, truncate+reseed between reps)"
+            "WARM (create once, DELETE+VACUUM+reseed between reps)"
         }
     );
     println!(
