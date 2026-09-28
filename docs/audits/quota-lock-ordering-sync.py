@@ -222,7 +222,17 @@ FN_SIGNATURE_RE_TEMPLATE = r"\n(?:async )?fn {name}\s*\("
 # `#` was not excluded. `#` is otherwise only valid immediately AFTER a
 # raw string's `r`, as its hash-delimiter count, never immediately before
 # a prefix, so excluding it here is unambiguous.
-_RAW_STRING_OPEN_RE = re.compile(r"(?<![A-Za-z0-9_'#])(?:b|c)?r(#*)\"")
+#
+# The excluded set was still ASCII-only (Codex review, issue #1696
+# follow-up): Rust identifiers, raw or not, may contain any Unicode
+# XID_Continue character, so `r#αbr"\"}"` (a Unicode letter inside the raw
+# identifier) hit the same bug the ASCII-only class had just closed.
+# Switched the hand-enumerated `[A-Za-z0-9_]` to `\w`, which this pattern
+# (an ordinary `str`, not a `bytes`, regex — Python only special-cases
+# `\w` to ASCII under `re.ASCII` or on a `bytes` pattern) already matches
+# against the same Unicode identifier characters Rust does, rather than
+# special-casing each further script this class of finding turns up.
+_RAW_STRING_OPEN_RE = re.compile(r"(?<![\w'#])(?:b|c)?r(#*)\"")
 
 
 def _skip_line_comment(text: str, i: int) -> int:
