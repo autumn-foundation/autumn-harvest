@@ -250,28 +250,38 @@ here rather than force a pursue/kill call the data doesn't support.
 
 **This is not a null result — it is a more interesting and more important
 finding than either the withdrawn KILL or the withdrawn PURSUE, and it
-points somewhere this assay was never chartered to look.** The variance
-ledger #12 found, and that this report's own first two (withdrawn)
-versions reproduced, collapsed by roughly 4-5x in *both* conditions the
-moment `ANALYZE` was added symmetrically after seeding — a change that has
-nothing to do with dropping or recreating the database. That strongly
-suggests the real driver of the original variance was stale or absent
-planner statistics immediately after a fresh seed, not database
-recreation. Every ledger entry that measures a `postgres` arm by seeding a
-backlog and immediately timing claims against it — #2, #8, #9, #10, #11,
-#12, and this assay's own two earlier (withdrawn) versions — shares that
-same gap. **This assay does not re-grade any of those reports, and does
-not claim to have confirmed the `ANALYZE` hypothesis** — it was never
-pre-registered here, this run cannot separate it from ordinary
-run-to-run noise at n=6, and treating a discovery made mid-assay as
-already-confirmed is exactly the goalpost-moving this repo's own
+points somewhere this assay was never chartered to look — but the
+evidence for it is narrower than an earlier version of this section
+claimed.** ⚠️ **Correction (found by a sixth Codex review round):** this
+section previously said the variance "collapsed by roughly 4-5x in *both*
+conditions" when `ANALYZE` was added. That is only true for **cold**:
+34.2% → 7.4%, a clean, isolated comparison, since `ANALYZE` was the only
+thing that changed in the cold path between those two runs. It is not true
+for **warm** — warm's CV went from 2.8% to **8.0%, an increase**, not a
+collapse — and that comparison is not isolated either: the same commit
+that added `ANALYZE` also fixed `truncate_database` from plain `VACUUM` to
+`VACUUM (TRUNCATE FALSE)` (see erratum 2), so two variables moved at once
+for warm, not one. The correct, narrower claim: **cold's** variance
+collapse, on its own, is clean evidence that stale or absent planner
+statistics — not database recreation — was doing most of the work in
+ledger #12's original finding. Whatever changed warm's variance (`ANALYZE`,
+the `VACUUM` fix, or their interaction) is not separable from this run and
+is not claimed here. Every ledger entry that measures a `postgres` arm by
+seeding a backlog and immediately timing claims against it — #2, #8, #9,
+#10, #11, #12, and this assay's own two earlier (withdrawn) versions —
+shares the same missing-`ANALYZE` gap the clean cold evidence points at.
+**This assay does not re-grade any of those reports, and does not claim to
+have confirmed the `ANALYZE` hypothesis** — it was never pre-registered
+here, this run cannot separate it from ordinary run-to-run noise at n=6,
+and treating a discovery made mid-assay as already-confirmed is exactly
+the goalpost-moving this repo's own
 discipline rules out.
 
-**A fourth review round, per
+**A fifth review round, per
 [erratum 3](#erratum-3-the-fix-for-erratum-2-cannot-cleanly-test-the-original-hypothesis-either),
 found something more fundamental than a threshold miss: this apparatus,
 at this depth, was never capable of testing genuine backlog-row cache
-coldness at all**, in any of its four versions. Seeding necessarily warms
+coldness at all**, in any version. Seeding necessarily warms
 the exact rows a claim query reads, through Postgres's ordinary buffer
 manager, independent of `DROP DATABASE`/`CREATE DATABASE` versus
 `DELETE`+`VACUUM`. `ANALYZE`'s own full-table scan (unavoidable once the
@@ -295,8 +305,10 @@ exceeds the buffer pool regardless of eviction. This is now the
 highest-priority pit, and a materially different, larger undertaking than
 this assay. (2) **The `ANALYZE`-after-seed hypothesis** — does adding it
 alone to the existing (unmodified) drop/recreate apparatus, with no
-warm/cold change, collapse ledger #12's original variance the same way it
-did here? Cheaper than (1): a one-line change to
+warm/cold change, collapse ledger #12's original variance the way it
+collapsed this assay's own cold-arm variance (34.2% → 7.4%, the one clean,
+single-variable comparison this run actually produced)? Cheaper than (1):
+a one-line change to
 `0010-cross-mode-throughput`, no new apparatus, and it would settle
 whether *surrounding* database-level state (catalog, template-copy cost —
 see erratum 3) rather than backlog-row caching is what ledger #12 actually

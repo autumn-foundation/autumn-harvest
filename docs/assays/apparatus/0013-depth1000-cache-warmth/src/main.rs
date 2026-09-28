@@ -144,7 +144,7 @@ impl Settings {
         // arm only, and this assay's containment plan does not start Redis.
         // A default invocation would panic on the `redis_pg` arm's
         // connection attempt before printing a summary or a CV. Found by a
-        // third round of Codex review on PR #1761.
+        // fourth round of Codex review on PR #1761.
         let arms = env_string("ASSAY10_ARMS", "postgres")
             .split(',')
             .filter_map(Arm::parse)
@@ -437,7 +437,7 @@ async fn reset_database(settings: &Settings) {
 /// the same "brand-new, empty file" outcome the paragraph above rules out
 /// `TRUNCATE` for, just reached by a different route. Confirmed directly
 /// against this apparatus's own database: a table at 159 pages went to 0
-/// pages after `DELETE` + plain `VACUUM`. Found by a second round of Codex
+/// pages after `DELETE` + plain `VACUUM`. Found by a third round of Codex
 /// review on PR #1761.
 async fn truncate_database(settings: &Settings) {
     let mut conn = connect(&settings.database_url).await;
@@ -871,7 +871,7 @@ async fn run_postgres_arm(settings: &Settings, arm: Arm, rep: usize) -> RepOutco
     // thousand. Without this step, the two conditions hand the claim
     // query's planner different statistics for the same logical backlog.
     // That confound is not what this assay's own grading is about. Found
-    // by a second round of Codex review on PR #1761.
+    // by a third round of Codex review on PR #1761.
     connect(&settings.database_url)
         .await
         .batch_execute("ANALYZE;")
@@ -1060,10 +1060,19 @@ async fn main() {
          slots, {POOL_SIZE} connections, {WORKER_POLL_MS} ms poll.\n"
     );
 
+    // Reset the database, unconditionally, before probing it. On a clean
+    // host `database_url`'s target does not exist yet, so connecting to it
+    // would panic before any repetition ever calls `reset_database` itself.
+    // Resetting here first also means the probe below reads the freshly
+    // recreated database's own effective settings. It cannot read a stale
+    // per-database override an earlier, now-dropped copy might have
+    // carried. Found by a sixth round of Codex review on PR #1761.
+    reset_database(&settings).await;
+
     // Read from `database_url`, the workload connection, not `admin_url`.
     // `synchronous_commit` can be set per database, so the admin connection
     // (to the `postgres` database) need not match what the timed workload
-    // actually runs under. Found by a fourth round of Codex review on
+    // actually runs under. Found by a fifth round of Codex review on
     // PR #1761.
     let (fsync, synchronous_commit) = {
         let mut conn = connect(&settings.database_url).await;
@@ -1156,13 +1165,13 @@ async fn main() {
     // throughput and variance. This section would otherwise still print
     // assay #13's verdict against it. Compared on the parsed value,
     // not the raw text, since `{ }` and `{}` are the same workload. Found
-    // by a third round of Codex review on PR #1761.
+    // by a fourth round of Codex review on PR #1761.
     // Refuse to grade an unregistered durability setting the same way.
     // Every prior number in this report ran under `fsync=off`,
     // `synchronous_commit=off`. A server left at ordinary defaults changes
     // both throughput and variance. This section would otherwise still
     // print a verdict against lines measured under the other setting.
-    // Found by a fourth round of Codex review on PR #1761.
+    // Found by a fifth round of Codex review on PR #1761.
     if fsync != "off" || synchronous_commit != "off" {
         println!(
             "* **Not graded.** `fsync = {fsync}`, `synchronous_commit = {synchronous_commit}` \
