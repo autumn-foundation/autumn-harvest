@@ -1,30 +1,45 @@
 # The terminal-sweep `table_present` triple-check — real calls, ~zero buffers
 
-> **Corrected after review.** The first version of this page mismeasured the
-> buffer cost (three separate `psql` processes, each a cold connection, when
-> production issues all three calls on one already-warm pooled connection)
-> and mis-scoped the workload (claimed "every finished workflow/activity
-> execution"; activities never reach this code). Both are fixed below. The
-> corrected numbers make the no-fix verdict *stronger*, not weaker: the real
-> buffer cost of the redundancy this page found is zero in the deployment
-> shape that matters, not merely under 5%.
+> **Corrected after review, twice.** The first version of this page
+> mismeasured the buffer cost (three separate `psql` processes, each a cold
+> connection, when production issues all three calls on one already-warm
+> pooled connection) and mis-scoped the workload (claimed "every finished
+> workflow/activity execution"; activities never reach this code). A second
+> review round caught a narrower scope gap in that same fix: a workflow
+> that **fails and is successfully retried** also skips this sweep on the
+> failing attempt. All three are fixed below. The corrected numbers make the
+> no-fix verdict *stronger*, not weaker: the real buffer cost of the
+> redundancy this page found is zero in the deployment shape that matters,
+> not merely under 5%.
 
 🎯 **Workload.** `WorkflowContext::mutex` (issue #691, `autumn-harvest/src/mutex.rs`)
 is guarded end to end by `table_present()` — an uncached
 `SELECT to_regclass('harvest_mutex_locks') IS NOT NULL` — so that a shard that
 has not yet applied the mutex migration during a staggered rollout no-ops
-instead of erroring. `sweep_terminal_holder_and_wake` runs inside the
-terminal-seal transaction of every **workflow** terminal transition — not
-every execution, and not activities, which never call it. Its three call
-sites are all workflow-scoped: `evaluate_triggers_for_execution_collecting_with_codecs`
-(`completion_trigger.rs:1539`, the terminal-trigger evaluator that fires on
-complete/fail/cancel/terminate/timeout/poison-pill — it loads the row from
-`harvest_workflow_executions`, so an activity, which has no row in that
-table, cannot reach it), continue-as-new sealing (`worker.rs:18719`), and
-workflow reset (`reset.rs:1335`). Still a very high-frequency chokepoint —
-every workflow that ever finishes, regardless of whether it touched a
-mutex — just not the even-higher-frequency "every execution" this page
-originally claimed.
+instead of erroring. `sweep_terminal_holder_and_wake` runs on workflow
+terminal transitions that reach one of three call sites, all workflow-scoped
+— not every execution, and not activities, which never call it (the trigger
+evaluator below loads its row from `harvest_workflow_executions`, which an
+activity has none of):
+
+* `evaluate_triggers_for_execution_collecting_with_codecs`
+  (`completion_trigger.rs:1539`) — fires on complete/cancel/terminate/
+  timeout/poison-pill, and on fail **only when no workflow-level retry is
+  committed**. `persist_workflow_failure` (`worker.rs:8294-8440`) marks the
+  failing execution `FAILED` first, then starts the retry attempt; only once
+  that succeeds does it set `retry_committed = true` and gate the evaluator
+  call behind `if !retry_committed`. So a `FAILED` predecessor whose retry
+  was successfully scheduled reaches a terminal *state* without reaching
+  this sweep at all — the lock release waits for whichever attempt finally
+  stops retrying.
+* continue-as-new sealing (`worker.rs:18719`)
+* workflow reset (`reset.rs:1335`)
+
+Still a high-frequency chokepoint — most workflow terminal transitions,
+including every plain success/cancel/terminate/timeout/poison-pill and every
+non-retried failure — just narrower than "every workflow terminal
+transition" (the first correction's wording) or the original "every
+finished workflow/activity execution."
 
 That single function calls `table_present()` three times in the same
 transaction, all evaluating to the same answer:
