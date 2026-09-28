@@ -898,6 +898,30 @@ def receiver_start(block: str, dot: int) -> int:
     return index
 
 
+# A macro invocation: its path, then `!` and the opening of its token tree.
+MACRO_CALL = re.compile(r"(?<![\w:])((?:[A-Za-z_]\w*\s*::\s*)*([a-z_][a-z_0-9]*))!\s*([(\[{])")
+
+
+@functools.lru_cache(maxsize=None)
+def macro_invocations(block: str) -> list[tuple[str, int, str, int]]:
+    """`(path, start, token tree, end)` for each macro invocation in `block`.
+
+    It reads `name!(..)`, `name![..]` and `name!{..}`, with or without a
+    path. The token tree is the text inside the brackets. No macro is
+    modeled, so a carrier in any macro is no parse the audit can type. A
+    scalar read such as `body.len()` is no handoff, as `argument_passes`
+    reads it outside a macro too.
+    """
+    closers = {"(": ")", "[": "]", "{": "}"}
+    found = []
+    for invocation in MACRO_CALL.finditer(block):
+        opener = invocation.end() - 1
+        tree = balanced(block[opener:], invocation.group(3), closers[invocation.group(3)])
+        path = re.sub(r"\s", "", invocation.group(1))
+        found.append((path, invocation.start(), tree[1:-1], opener + len(tree)))
+    return found
+
+
 def matching_opener(text: str, closer: int) -> int | None:
     """Where the `(` or `[` that the closer at `closer` matches starts, or `None`."""
     pairs = {")": "(", "]": "["}
@@ -2123,6 +2147,20 @@ def handoffs(
                 optional, tolerant = optional and was_optional, tolerant and was_tolerant
             merged[identity, name] = (helper, parts, optional, tolerant)
     found = [(helper, parts, name, o, t) for (_, name), (helper, parts, o, t) in merged.items()]
+    # A macro whose token tree holds a live carrier hands it on in a form the
+    # audit cannot follow, so the handoff is unresolved and fails closed.
+    for invocation in macro_invocations(block) if receivers else []:
+        name, start, tree, end = invocation
+        if in_dead_closure(block, start):
+            continue
+        for variable in carriers:
+            if not argument_passes(tree, variable):
+                continue
+            if not carrier_live(block, carriers, variable, start):
+                continue
+            tolerant = discards_error(block[:start], block[end:])
+            allowed = empty_allowed(block, start, variable, tolerant)
+            found.append((name + "!", None, None, allowed, tolerant))
     # A method call whose receiver holds a carrier hands it to `self`. The
     # receiver goes through `argument_passes`, as an argument does, so a
     # grouped or borrowed receiver such as `(&body)` is read like `body`, and
@@ -5839,6 +5877,11 @@ pub fn harvest_api_router() -> Router {
         .route("/e/raw-std-reader", post(e_raw_std_reader))
         .route("/e/extension-decode", post(e_extension_decode))
         .route("/e/grouped-receiver", post(e_grouped_receiver))
+        .route("/e/macro-carrier", post(e_macro_carrier))
+        .route("/e/macro-bracket", post(e_macro_bracket))
+        .route("/e/macro-path", post(e_macro_path))
+        .route("/e/macro-scalar", post(e_macro_scalar))
+        .route("/e/macro-shadowed", post(e_macro_shadowed))
         .route("/e/borrowed-receiver", post(e_borrowed_receiver))
         .route("/e/nested-receiver", post(e_nested_receiver))
         .route("/e/sliced-receiver", post(e_sliced_receiver))
@@ -7477,6 +7520,38 @@ mod spoofed_parse {
         let gadget = serde_json::from_slice::<Gadget>(&body).unwrap();
         StatusCode::OK.into_response()
     }
+}
+
+macro_rules! decode_body {
+    ($raw:expr) => {
+        serde_json::from_slice::<Gadget>($raw).unwrap()
+    };
+}
+
+async fn e_macro_carrier(body: Bytes) -> Response {
+    let gadget = decode_body!(&body);
+    StatusCode::OK.into_response()
+}
+
+async fn e_macro_bracket(body: Bytes) -> Response {
+    let gadget = decode_body![body.as_ref()];
+    StatusCode::OK.into_response()
+}
+
+async fn e_macro_path(body: Bytes) -> Response {
+    let gadget = codec::decode_body! { &body };
+    StatusCode::OK.into_response()
+}
+
+async fn e_macro_shadowed(body: Bytes) -> Response {
+    let body = other_value();
+    let gadget = decode_body!(&body);
+    StatusCode::OK.into_response()
+}
+
+async fn e_macro_scalar(body: Bytes) -> Response {
+    tracing::debug!(size = body.len(), empty = body.is_empty(), "received");
+    StatusCode::OK.into_response()
 }
 
 async fn e_grouped_receiver(body: Bytes) -> Response {
@@ -10662,6 +10737,34 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
         FIXTURE_EDGES,
         [fixture_route("POST", "/e/spoofed-parse", 200, request_body=GADGET_BODY)],
         {"unresolved": ["POST /e/spoofed-parse: cannot read a `from_slice` call"]},
+    ),
+    (
+        "a macro that gets a raw body is an unresolved handoff, and a scalar read is not",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST", path, 200, request_body=body_of(("name", False), required=False)
+            )
+            for path in (
+                "/e/macro-carrier",
+                "/e/macro-bracket",
+                "/e/macro-path",
+                "/e/macro-scalar",
+                "/e/macro-shadowed",
+            )
+        ],
+        {
+            "body_required": [
+                "POST /e/macro-carrier: the body is mandatory",
+                "POST /e/macro-bracket: the body is mandatory",
+                "POST /e/macro-path: the body is mandatory",
+            ],
+            "unresolved": [
+                "POST /e/macro-carrier: cannot read a `from_slice` call",
+                "POST /e/macro-bracket: cannot read a `from_slice` call",
+                "POST /e/macro-path: cannot read a `from_slice` call",
+            ],
+        },
     ),
     (
         "a grouped or borrowed receiver is read like an argument, or fails closed",
