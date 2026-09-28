@@ -139,7 +139,13 @@ struct Settings {
 
 impl Settings {
     fn from_env() -> Self {
-        let arms = env_string("ASSAY10_ARMS", "sqlite,postgres,redis_pg")
+        // Default to `postgres` alone, not 0010's inherited
+        // `sqlite,postgres,redis_pg`. Assay #13 pre-registers the `postgres`
+        // arm only, and this assay's containment plan does not start Redis.
+        // A default invocation would panic on the `redis_pg` arm's
+        // connection attempt before printing a summary or a CV. Found by a
+        // third round of Codex review on PR #1761.
+        let arms = env_string("ASSAY10_ARMS", "postgres")
             .split(',')
             .filter_map(Arm::parse)
             .collect::<Vec<_>>();
@@ -1137,6 +1143,23 @@ async fn main() {
             "* **Not graded.** Backlog {} workflows, {} reps is not assay #13's pre-registered \
              shape (depth 1000, n=6). The CV lines below apply only to that shape.",
             settings.workflows, settings.reps
+        );
+        return;
+    }
+    // Refuse to grade a noncanonical input the same way. The pre-registered
+    // workload seeds the canonical `{}`. That value is persisted and
+    // replayed on every workflow task, so a different one changes both
+    // throughput and variance. This section would otherwise still print
+    // assay #13's verdict against it. Compared on the parsed value,
+    // not the raw text, since `{ }` and `{}` are the same workload. Found
+    // by a third round of Codex review on PR #1761.
+    let canonical_input: serde_json::Value =
+        serde_json::from_str(INPUT_JSON).expect("the canonical input should parse");
+    if workflow_input(&settings) != canonical_input {
+        println!(
+            "* **Not graded.** `ASSAY10_INPUT_JSON` is `{}`, not the canonical `{INPUT_JSON}`. \
+             Assay #13's lines apply only to the canonical workload.",
+            settings.input_json
         );
         return;
     }

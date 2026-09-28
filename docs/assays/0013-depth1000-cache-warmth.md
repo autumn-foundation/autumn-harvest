@@ -15,6 +15,11 @@
 > report's current sections without the errata would miss the most
 > important thing it has to say: **the apparatus's own history is evidence
 > that this kind of assay is easy to get wrong in a way that looks clean.**
+> A fourth review round found two further reproducibility gaps (a default
+> arm set that would panic on an unstarted Redis, a missing guard against
+> grading a noncanonical seeded input) — both fixed, neither changing a
+> reported number, since every run in this report always set the relevant
+> environment variables explicitly.
 
 ## 🎯 Question
 
