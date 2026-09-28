@@ -6067,9 +6067,8 @@ pub(crate) const fn single_pool_entrypoint_rejects(
 /// miss. Dispatch therefore needs a span of exactly one shard.
 ///
 /// `Worker::new` applies the same rule. A core caller can still install the
-/// channel after construction, and the poll loop reads the process-global slot
-/// on every iteration. The loop decides once at run start and holds that
-/// decision, so a late install cannot widen the span. `shard` on
+/// channel after construction. The run boundary then applies the rule to that
+/// late install before the worker binds it (issue #1431). `shard` on
 /// [`crate::dispatch::DispatchHint`] carries the follow-up that lifts the
 /// limit.
 #[must_use]
@@ -6078,6 +6077,36 @@ pub(crate) const fn dispatch_allowed_for_span(
     pool_shards: usize,
 ) -> bool {
     shard_assignments <= 1 && pool_shards <= 1
+}
+
+/// The global channel a worker adopts from a late install (issue #1431).
+///
+/// A core caller can call `dispatch::install` after `Worker::new`. The
+/// constructor saw no channel, so it checked neither the span nor the queue
+/// names. The run boundary applies both checks here, to `live`.
+///
+/// # Errors
+///
+/// Returns the operator-facing reason when the worker cannot use `live`.
+fn late_install_binding(
+    live: Option<crate::dispatch::InstalledDispatch>,
+    span_allowed: bool,
+    queues: &[String],
+) -> Result<Option<crate::dispatch::InstalledDispatch>, String> {
+    let Some(live) = live else {
+        return Ok(None);
+    };
+    if !span_allowed {
+        return Err(
+            "this worker spans more than one shard, and a single-shard channel \
+             cannot route a reference to the right pool (issue #1312)"
+                .to_string(),
+        );
+    }
+    for queue in queues {
+        crate::dispatch::validate_queue_name(queue)?;
+    }
+    Ok(Some(live))
 }
 
 /// Captures each of `assignments`' own per-shard dispatch channel, for
@@ -25443,12 +25472,15 @@ pub struct Worker {
     /// `run` time.
     shard_dispatch:
         std::collections::HashMap<crate::types::ShardId, crate::dispatch::InstalledDispatch>,
-    /// The single-shard global dispatch channel, captured once at
-    /// construction (Codex review, issue #1429 follow-up). See the capture
+    /// The single-shard global dispatch channel, bound once (Codex review,
+    /// issue #1429 follow-up). See the capture
     /// site in [`Worker::new_with_expected_shard_generations`] and the
     /// read site in [`Worker::run_poll_loop`] for why this is captured
     /// rather than read live, mirroring `shard_dispatch` above.
-    global_dispatch: Option<crate::dispatch::InstalledDispatch>,
+    ///
+    /// Empty until the run boundary if `Worker::new` saw no channel (issue
+    /// #1431). Read it through [`Worker::global_dispatch_binding`].
+    global_dispatch: std::sync::OnceLock<Option<crate::dispatch::InstalledDispatch>>,
 }
 
 struct WorkerMonitoringHandles {
@@ -25530,7 +25562,8 @@ fn spawn_pause_auto_resumer(
         interval,
         shard,
     );
-    tokio::spawn(async move {
+    // Keep the worker dispatch binding for hints (issue #1431).
+    crate::dispatch::spawn_bound(async move {
         loop {
             tokio::select! {
                 () = cancel.cancelled() => break,
@@ -26778,7 +26811,11 @@ impl Worker {
         // This worker's own database pool was never validated against
         // that channel. `shard_dispatch` above is captured rather than
         // read live for exactly the same reason.
-        let mut global_dispatch = None;
+        //
+        // With no channel installed, the binding stays empty here. The run
+        // boundary then resolves it once (issue #1431). See
+        // `global_dispatch_binding`.
+        let global_dispatch = std::sync::OnceLock::new();
 
         if crate::dispatch::is_installed() {
             let shard_count = config.shard_assignments.len();
@@ -26797,8 +26834,8 @@ impl Worker {
             // poll loop only ever reads the per-shard pair regardless. A
             // wide span is covered whenever either condition holds on its
             // own, not only when the global slot's span is one.
-            global_dispatch = crate::dispatch::installed();
-            let single_shard_channel = global_dispatch.is_some();
+            let captured = crate::dispatch::installed();
+            let single_shard_channel = captured.is_some();
             let covered = (single_shard_channel
                 && dispatch_allowed_for_span(shard_count, pool_shards))
                 || shard_dispatch_covered;
@@ -26824,6 +26861,8 @@ impl Worker {
                     ))
                 })?;
             }
+            // No other reader exists yet, so this `set` cannot fail.
+            let _ = global_dispatch.set(captured);
         }
 
         let mut ineligible_activities = Vec::new();
@@ -26877,6 +26916,76 @@ impl Worker {
         })
     }
 
+    /// The global channel this worker is bound to (issue #1431).
+    ///
+    /// `Worker::new` sets the binding when any channel is installed. Otherwise
+    /// the first call resolves a late install through [`late_install_binding`].
+    /// `run`, `run_with_listener` or `bind_dispatch` makes that first call.
+    /// The binding never changes after that.
+    fn global_dispatch_binding(&self) -> Option<&crate::dispatch::InstalledDispatch> {
+        self.global_dispatch
+            .get_or_init(|| {
+                match late_install_binding(
+                    crate::dispatch::installed(),
+                    self.dispatch_span_allowed(),
+                    &self.config.queues,
+                ) {
+                    Ok(bound) => {
+                        if bound.is_some() {
+                            tracing::info!(
+                                worker_id = %self.config.worker_id,
+                                "this worker uses a dispatch channel it did not see at \
+                                 construction (issue #1431)"
+                            );
+                        }
+                        bound
+                    }
+                    Err(reason) => {
+                        tracing::error!(
+                            worker_id = %self.config.worker_id,
+                            reason = %reason,
+                            "a dispatch channel is installed that this worker did not see \
+                             at construction, and this worker cannot use it. It claims \
+                             through Postgres (issue #1431)"
+                        );
+                        None
+                    }
+                }
+            })
+            .as_ref()
+    }
+
+    /// Fix this worker's dispatch binding now (issue #1431).
+    ///
+    /// Without this call, a worker that saw no channel at construction binds
+    /// at the run boundary. It then adopts a channel installed in between,
+    /// after the span and queue-name checks. A runner that starts without
+    /// dispatch calls this while it still holds its start lock. Another
+    /// runtime's later install then never reaches this worker. A second call
+    /// does nothing.
+    pub fn bind_dispatch(&self) {
+        self.global_dispatch_binding();
+    }
+
+    /// The channel of this worker's binding, for a bound scope.
+    fn bound_channel(&self) -> Option<Arc<dyn crate::dispatch::TaskDispatch>> {
+        self.global_dispatch_binding()
+            .map(|installed| Arc::clone(&installed.channel))
+    }
+
+    /// Whether this worker's span allows the single-shard channel.
+    fn dispatch_span_allowed(&self) -> bool {
+        #[cfg(feature = "db")]
+        let pool_shards = self
+            .config
+            .sharded_pool
+            .as_ref()
+            .map_or(0, crate::shard::ShardedDbPool::len);
+        #[cfg(not(feature = "db"))]
+        let pool_shards = 0;
+        dispatch_allowed_for_span(self.config.shard_assignments.len(), pool_shards)
+    }
+
     /// Return the assigned shards that have no exact pool entry in the
     /// configured `sharded_pool`.
     ///
@@ -26914,8 +27023,17 @@ impl Worker {
     /// it drains all assigned shards via `run_poll_loop_multi` (issue #522).
     /// Otherwise it falls through to the existing single-shard path
     /// (`run_with_listener`) byte-for-byte unchanged.
-    #[allow(clippy::too_many_lines)]
     pub async fn run(&self, pool: &DbPool) {
+        // Bind the global dispatch channel at the run boundary (issue #1431).
+        // Every hint the run raises, in the poll loop or in a maintenance
+        // loop, then goes to that channel.
+        let bound = self.bound_channel();
+        crate::dispatch::with_bound_channel(bound, Box::pin(self.run_bound(pool))).await;
+    }
+
+    /// The body of [`Worker::run`], inside the dispatch binding.
+    #[allow(clippy::too_many_lines)]
+    async fn run_bound(&self, pool: &DbPool) {
         // Defense-in-depth: refuse to start if ANY assigned shard is missing an
         // exact pool entry (issue #522 review). The authoritative check runs at
         // process startup (`HarvestRunner::start`) and fails the process before
@@ -27167,7 +27285,7 @@ impl Worker {
                 }
                 None => None,
             };
-            self.run_with_listener(claim_pool, listener).await;
+            self.run_with_listener_bound(claim_pool, listener).await;
         }
     }
 
@@ -27716,6 +27834,22 @@ impl Worker {
         pool: &DbPool,
         listener: Option<crate::notify::QueueListener>,
     ) {
+        // A direct caller of this entry point skips `run`, so bind here too
+        // (issue #1431).
+        let bound = self.bound_channel();
+        crate::dispatch::with_bound_channel(
+            bound,
+            Box::pin(self.run_with_listener_bound(pool, listener)),
+        )
+        .await;
+    }
+
+    /// The body of [`Worker::run_with_listener`], inside the dispatch binding.
+    async fn run_with_listener_bound(
+        &self,
+        pool: &DbPool,
+        listener: Option<crate::notify::QueueListener>,
+    ) {
         tracing::info!(
             worker_id = %self.config.worker_id,
             queues = ?self.config.queues,
@@ -27806,20 +27940,10 @@ impl Worker {
         };
 
         // Decide the dispatch span once, here, and hold it for the whole loop
-        // (issue #1312). `Worker::new` applies the same rule, but a core caller
-        // can install the channel after construction, and the loop reads the
-        // process-global slot on every iteration. Deciding per iteration would
-        // let such an install put a multi-shard worker on the dispatch path.
-        #[cfg(feature = "db")]
-        let pool_shards = self
-            .config
-            .sharded_pool
-            .as_ref()
-            .map_or(0, crate::shard::ShardedDbPool::len);
-        #[cfg(not(feature = "db"))]
-        let pool_shards = 0;
-        let dispatch_allowed =
-            dispatch_allowed_for_span(self.config.shard_assignments.len(), pool_shards);
+        // (issue #1312). It stops a wide-span worker from using a global
+        // channel. `Worker::new` can capture one next to full per-shard
+        // coverage.
+        let dispatch_allowed = self.dispatch_span_allowed();
 
         self.run_poll_loop(
             pool,
@@ -29364,12 +29488,12 @@ impl Worker {
     /// endpoint this worker's own database pool was never validated
     /// against.
     ///
-    /// The single global slot fallback (`self.global_dispatch`, a few
-    /// lines below) is captured at construction too, for the same reason
-    /// (Codex review, issue #1429 follow-up). A live `dispatch::installed()`
-    /// read here could pick up a replacement runner's own global-slot
-    /// install. This worker's own database pool was never validated
-    /// against that channel's key space. It could then start reading
+    /// `global_dispatch_binding`, a few lines below, binds the global
+    /// fallback once too (issue #1429). A late install binds at the run
+    /// boundary (issue #1431). A live `dispatch::installed()` read here
+    /// could pick up a replacement runner's own global-slot install. This
+    /// worker's own database pool was never validated against that
+    /// channel's key space. It could then start reading
     /// references meant for a different runner, while its reconcile sweep
     /// keeps publishing this pool's own rows into the replacement's
     /// namespace.
@@ -29428,7 +29552,9 @@ impl Worker {
             let per_shard_installed =
                 shard.and_then(|shard| self.shard_dispatch.get(&shard).cloned());
             let dispatch_allowed = per_shard_installed.is_some() || dispatch_allowed;
-            if let Some(installed) = per_shard_installed.or_else(|| self.global_dispatch.clone()) {
+            if let Some(installed) =
+                per_shard_installed.or_else(|| self.global_dispatch_binding().cloned())
+            {
                 if dispatch_allowed {
                     let dispatched = self
                         .run_dispatch_iteration(pool, shard, &installed, &mut dispatch_state, 1)
@@ -30552,6 +30678,10 @@ impl Worker {
                 }
             }
         };
+        // Every publish from this task body uses this worker's bound channel,
+        // not the live slot (issue #1431). Another runtime can replace the
+        // slot after this worker starts.
+        let bound_channel = self.bound_channel();
         tokio::spawn(async move {
             // Every hint this task raises waits in the scope until the
             // transaction that raised it commits and a flush point publishes
@@ -30564,9 +30694,12 @@ impl Worker {
             // A deployment with no channel runs the body directly. The scope
             // would allocate a buffer and one boxed future per task for hints
             // that no hook ever raises, so the Postgres-only path skips it.
-            if crate::dispatch::is_installed() {
-                let ((), hints) = Box::pin(crate::dispatch::buffered(task_body)).await;
-                crate::dispatch::publish_now(hints).await;
+            if bound_channel.is_some() || crate::dispatch::is_installed() {
+                Box::pin(crate::dispatch::with_bound_channel(bound_channel, async {
+                    let ((), hints) = Box::pin(crate::dispatch::buffered(task_body)).await;
+                    crate::dispatch::publish_now(hints).await;
+                }))
+                .await;
             } else {
                 task_body.await;
             }
@@ -31422,7 +31555,11 @@ mod tests {
     /// installing per-shard channels while `the_sharded_runtime_rejection_reads_as_one_sentence`
     /// checks a global-only install, for example, turns an expected
     /// rejection into a spurious acceptance.
-    static DISPATCH_INSTALL_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    ///
+    /// The `dispatch` tests share the same globals, so this is their lock too
+    /// (issue #1431).
+    #[cfg(feature = "testing")]
+    use crate::dispatch::TEST_SLOT_LOCK as DISPATCH_INSTALL_TEST_SERIAL;
 
     /// Pins [`NEW_WORKFLOW_EXECUTION_COLUMNS`], and therefore
     /// [`ROWS_PER_EXECUTION_INSERT_CHUNK`], to `NewWorkflowExecution`'s real
@@ -42900,9 +43037,7 @@ mod tests {
     #[cfg(feature = "testing")]
     #[test]
     fn per_shard_dispatch_requires_full_coverage() {
-        let _serial = DISPATCH_INSTALL_TEST_SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _serial = DISPATCH_INSTALL_TEST_SERIAL.blocking_lock();
         crate::dispatch::uninstall_all_shards();
 
         let shard_a = crate::types::ShardId::new(1);
@@ -43071,9 +43206,7 @@ mod tests {
     #[cfg(feature = "testing")]
     #[test]
     fn the_sharded_runtime_rejection_reads_as_one_sentence() {
-        let _serial = DISPATCH_INSTALL_TEST_SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _serial = DISPATCH_INSTALL_TEST_SERIAL.blocking_lock();
         let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
         let channel = Arc::new(crate::dispatch::MemoryDispatch::new());
         crate::dispatch::install(
@@ -43104,9 +43237,7 @@ mod tests {
     #[cfg(feature = "testing")]
     #[test]
     fn a_fully_covered_multi_shard_runtime_is_accepted() {
-        let _serial = DISPATCH_INSTALL_TEST_SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _serial = DISPATCH_INSTALL_TEST_SERIAL.blocking_lock();
         crate::dispatch::uninstall_all_shards();
         let shard_0 = crate::types::ShardId::new(0);
         let shard_1 = crate::types::ShardId::new(1);
@@ -43145,9 +43276,7 @@ mod tests {
     #[cfg(feature = "testing")]
     #[test]
     fn a_fully_covered_multi_shard_runtime_is_accepted_alongside_a_global_channel() {
-        let _serial = DISPATCH_INSTALL_TEST_SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _serial = DISPATCH_INSTALL_TEST_SERIAL.blocking_lock();
         crate::dispatch::uninstall_all_shards();
         let shard_0 = crate::types::ShardId::new(0);
         let shard_1 = crate::types::ShardId::new(1);
@@ -43195,9 +43324,7 @@ mod tests {
     #[cfg(feature = "testing")]
     #[test]
     fn worker_new_captures_shard_channels_immune_to_a_later_install() {
-        let _serial = DISPATCH_INSTALL_TEST_SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _serial = DISPATCH_INSTALL_TEST_SERIAL.blocking_lock();
         crate::dispatch::uninstall_all_shards();
         let shard_0 = crate::types::ShardId::new(0);
         let shard_1 = crate::types::ShardId::new(1);
@@ -43254,9 +43381,7 @@ mod tests {
     #[cfg(feature = "testing")]
     #[test]
     fn worker_new_captures_the_global_channel_immune_to_a_later_install() {
-        let _serial = DISPATCH_INSTALL_TEST_SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _serial = DISPATCH_INSTALL_TEST_SERIAL.blocking_lock();
         crate::dispatch::uninstall();
         let original_channel = Arc::new(crate::dispatch::MemoryDispatch::new())
             as Arc<dyn crate::dispatch::TaskDispatch>;
@@ -43277,8 +43402,7 @@ mod tests {
         );
 
         let captured = worker
-            .global_dispatch
-            .as_ref()
+            .global_dispatch_binding()
             .expect("the global channel must have been captured at construction");
         assert!(
             Arc::ptr_eq(&captured.channel, &original_channel),
@@ -43298,9 +43422,7 @@ mod tests {
     #[cfg(feature = "testing")]
     #[test]
     fn worker_new_refuses_a_shard_generation_a_racing_install_already_replaced() {
-        let _serial = DISPATCH_INSTALL_TEST_SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _serial = DISPATCH_INSTALL_TEST_SERIAL.blocking_lock();
         crate::dispatch::uninstall_all_shards();
         let shard_0 = crate::types::ShardId::new(0);
         let shard_1 = crate::types::ShardId::new(1);
@@ -43351,9 +43473,7 @@ mod tests {
     #[cfg(feature = "testing")]
     #[test]
     fn worker_new_accepts_matching_expected_shard_generations() {
-        let _serial = DISPATCH_INSTALL_TEST_SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _serial = DISPATCH_INSTALL_TEST_SERIAL.blocking_lock();
         crate::dispatch::uninstall_all_shards();
         let shard_0 = crate::types::ShardId::new(0);
         let shard_1 = crate::types::ShardId::new(1);
@@ -43393,5 +43513,191 @@ mod tests {
         );
 
         crate::dispatch::uninstall_all_shards();
+    }
+
+    /// An install record around a new in-memory channel. No slot holds it.
+    #[cfg(feature = "testing")]
+    fn late_channel() -> crate::dispatch::InstalledDispatch {
+        crate::dispatch::InstalledDispatch::unslotted(Arc::new(
+            crate::dispatch::MemoryDispatch::new(),
+        ))
+    }
+
+    /// A channel installed after `Worker::new` is adopted at the run
+    /// boundary when the span and every queue name allow it (issue #1431).
+    #[cfg(feature = "testing")]
+    #[test]
+    fn a_late_install_is_adopted_when_the_span_and_queue_names_allow_it() {
+        let live = late_channel();
+        let queues = vec!["default".to_string(), "tenant-priority".to_string()];
+
+        let bound = late_install_binding(Some(live.clone()), true, &queues)
+            .expect("a valid late install must be adopted")
+            .expect("the late channel must be bound");
+
+        assert!(Arc::ptr_eq(&bound.channel, &live.channel));
+    }
+
+    /// No late install leaves the worker on Postgres, with no error.
+    #[test]
+    fn no_late_install_binds_no_channel() {
+        let bound = late_install_binding(None, true, &["default".to_string()]);
+        assert!(matches!(bound, Ok(None)), "got {bound:?}");
+    }
+
+    /// A late install is refused when one queue name cannot travel through
+    /// the channel (issue #1431). `Worker::new` never saw that channel, so
+    /// the run boundary is the first place to check the name.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn a_late_install_with_an_unaddressable_queue_name_is_refused() {
+        let queues = vec!["default".to_string(), "tenant:priority".to_string()];
+
+        let refusal = late_install_binding(Some(late_channel()), true, &queues)
+            .expect_err("a queue name with a colon must refuse the late install");
+
+        assert!(
+            refusal.contains("tenant:priority"),
+            "the refusal must name the queue: {refusal}"
+        );
+    }
+
+    /// A late install is refused on a span wider than one shard, the same
+    /// rule `Worker::new` applies (issue #1431).
+    #[cfg(feature = "testing")]
+    #[test]
+    fn a_late_install_on_a_wide_span_is_refused() {
+        let refusal = late_install_binding(Some(late_channel()), false, &["default".to_string()])
+            .expect_err("a wide span must refuse the late install");
+
+        assert!(refusal.contains("issue #1312"), "got {refusal}");
+    }
+
+    /// A worker built before the install binds the late channel at the run
+    /// boundary, then keeps it (issue #1431).
+    ///
+    /// A second install after that point is a replacement runner. The worker
+    /// never validated its own pool against it, so it must not follow it.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn a_worker_built_before_install_binds_the_late_channel_once() {
+        let _serial = DISPATCH_INSTALL_TEST_SERIAL.blocking_lock();
+        crate::dispatch::uninstall_all();
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker =
+            Worker::new(default_runtime_config(), registry).expect("no channel is installed yet");
+
+        let late = Arc::new(crate::dispatch::MemoryDispatch::new())
+            as Arc<dyn crate::dispatch::TaskDispatch>;
+        crate::dispatch::install(
+            Arc::clone(&late),
+            crate::dispatch::DispatchSettings::default(),
+        );
+        let first = worker
+            .global_dispatch_binding()
+            .map(|installed| Arc::clone(&installed.channel));
+        crate::dispatch::install(
+            Arc::new(crate::dispatch::MemoryDispatch::new()),
+            crate::dispatch::DispatchSettings::default(),
+        );
+        let second = worker
+            .global_dispatch_binding()
+            .map(|installed| Arc::clone(&installed.channel));
+        crate::dispatch::uninstall_all();
+
+        let first = first.expect("the run boundary must adopt the late channel");
+        assert!(Arc::ptr_eq(&first, &late));
+        let second = second.expect("the binding must hold");
+        assert!(
+            Arc::ptr_eq(&second, &late),
+            "a replacement install must not move the binding"
+        );
+    }
+
+    /// A worker built before the install refuses a late channel it cannot
+    /// use, and stays on Postgres (issue #1431).
+    #[cfg(feature = "testing")]
+    #[test]
+    fn a_worker_built_before_install_refuses_a_late_channel_for_a_bad_queue_name() {
+        let _serial = DISPATCH_INSTALL_TEST_SERIAL.blocking_lock();
+        crate::dispatch::uninstall_all();
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let config = WorkerRuntimeConfig {
+            queues: vec!["tenant:priority".to_string()],
+            ..default_runtime_config()
+        };
+        let worker = Worker::new(config, registry).expect("no channel is installed yet");
+
+        crate::dispatch::install(
+            Arc::new(crate::dispatch::MemoryDispatch::new()),
+            crate::dispatch::DispatchSettings::default(),
+        );
+        let bound = worker.global_dispatch_binding().is_some();
+        crate::dispatch::uninstall_all();
+
+        assert!(
+            !bound,
+            "an unaddressable queue name must refuse the late channel"
+        );
+    }
+
+    /// A worker that saw a dispatch topology at construction keeps exactly
+    /// what it captured (issue #1431). A later global install is a stranger's,
+    /// not a late install of this worker's own runtime.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn a_worker_built_on_per_shard_channels_never_adopts_a_later_global_install() {
+        let _serial = DISPATCH_INSTALL_TEST_SERIAL.blocking_lock();
+        crate::dispatch::uninstall_all();
+        let shard_0 = crate::types::ShardId::new(0);
+        let shard_1 = crate::types::ShardId::new(1);
+        for shard in [shard_0, shard_1] {
+            crate::dispatch::install_for_shard(
+                shard,
+                Arc::new(crate::dispatch::MemoryDispatch::new()),
+                crate::dispatch::DispatchSettings::default(),
+            );
+        }
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let config = WorkerRuntimeConfig {
+            shard_assignments: vec![shard_0],
+            ..default_runtime_config()
+        };
+        let worker = Worker::new(config, registry).expect("shard 0 is covered");
+
+        crate::dispatch::install(
+            Arc::new(crate::dispatch::MemoryDispatch::new()),
+            crate::dispatch::DispatchSettings::default(),
+        );
+        let bound = worker.global_dispatch_binding().is_some();
+        crate::dispatch::uninstall_all();
+
+        assert!(
+            !bound,
+            "a stranger's global install must not bind this worker"
+        );
+    }
+
+    /// `bind_dispatch` fixes the binding before the run boundary (issue
+    /// #1431). A runner with Redis off calls it under its start lock, so a
+    /// later install by another runtime never reaches this worker.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn bind_dispatch_pins_no_channel_before_a_later_install() {
+        let _serial = DISPATCH_INSTALL_TEST_SERIAL.blocking_lock();
+        crate::dispatch::uninstall_all();
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker =
+            Worker::new(default_runtime_config(), registry).expect("no channel is installed yet");
+        worker.bind_dispatch();
+
+        crate::dispatch::install(
+            Arc::new(crate::dispatch::MemoryDispatch::new()),
+            crate::dispatch::DispatchSettings::default(),
+        );
+        let bound = worker.global_dispatch_binding().is_some();
+        crate::dispatch::uninstall_all();
+
+        assert!(!bound, "a pinned worker must not adopt a later install");
     }
 }

@@ -5120,7 +5120,8 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
         )
     })
     .collect();
-    tokio::spawn(async move {
+    // Keep the worker dispatch binding for hints (issue #1431).
+    crate::dispatch::spawn_bound(async move {
         loop {
             tokio::select! {
                 () = cancel.cancelled() => {

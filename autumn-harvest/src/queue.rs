@@ -2117,8 +2117,9 @@ pub const fn pending_hint_rows_query() -> &'static str {
 
 /// Record a dispatch hint for one row a write left `PENDING`.
 ///
-/// The values are already in the caller's hand. The call costs one atomic
-/// load with no channel installed, and one buffer push with one.
+/// The values are already in the caller's hand. With no channel, the call
+/// costs one atomic load and one task-local read. With one, it costs one
+/// buffer push.
 pub(crate) fn record_pending_hint(
     task_id: Uuid,
     queue_name: &str,
@@ -2126,7 +2127,7 @@ pub(crate) fn record_pending_hint(
     priority: i32,
     kind: crate::dispatch::DispatchKind,
 ) {
-    if !crate::dispatch::is_installed() {
+    if !crate::dispatch::hints_wanted() {
         return;
     }
     crate::dispatch::record_hint(crate::dispatch::DispatchHint {
@@ -2152,7 +2153,7 @@ pub(crate) fn record_pending_hint(
 /// can thaw a backlog of any size, and one statement carrying every id would
 /// build an array bound only by that backlog.
 pub(crate) async fn record_pending_hints(conn: &mut AsyncPgConnection, ids: &[Uuid]) {
-    if ids.is_empty() || !crate::dispatch::is_installed() {
+    if ids.is_empty() || !crate::dispatch::hints_wanted() {
         return;
     }
     for chunk in ids.chunks(PENDING_HINT_READ_CHUNK) {
@@ -4970,7 +4971,7 @@ pub async fn wake_workflow_task(
     //
     // The vector is built only when a channel is installed. A deployment
     // without one pays one atomic load rather than one allocation per wake.
-    if crate::dispatch::is_installed() {
+    if crate::dispatch::hints_wanted() {
         crate::dispatch::record_hints(
             repended
                 .iter()

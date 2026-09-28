@@ -375,7 +375,8 @@ pub fn spawn_session_slot_reconciler(
     cancel: tokio_util::sync::CancellationToken,
     interval: std::time::Duration,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    // Keep the worker dispatch binding for hints (issue #1431).
+    crate::dispatch::spawn_bound(async move {
         loop {
             tokio::select! {
                 () = cancel.cancelled() => break,
