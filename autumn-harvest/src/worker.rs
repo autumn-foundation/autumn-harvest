@@ -26179,8 +26179,8 @@ async fn dispatch_call_with_timeout<T>(
 /// `round_trips_per_queue` must match the channel call's *pipelined*
 /// implementation. `ack_many_inner` does two round trips per queue: an
 /// `XACK`/`XDEL` pipeline, then a separate marker-cleanup script.
-/// `release_many_inner` / `requeue_batch` and the dispatch read's own
-/// non-blocking pass are one round trip per queue.
+/// `release_many_inner` / `requeue_batch` are one round trip per queue.
+/// The dispatch read is two; see [`dispatch_read_timeout`].
 ///
 /// `lease_count` covers a different implementation entirely (Codex review,
 /// issue #1429 follow-up). `TaskDispatch::ack_many`/`release_many`'s own
@@ -26202,6 +26202,22 @@ fn dispatch_batch_timeout(
         .saturating_mul(round_trips_per_queue.max(1));
     DISPATCH_CALL_TIMEOUT
         .saturating_mul(u32::try_from(queue_rounds.max(lease_count)).unwrap_or(u32::MAX))
+}
+
+/// Sequential round trips per queue that a dispatch read can make outside
+/// its blocking wait. `read_across_queues` makes one non-blocking pass over
+/// every queue first. A deadline that passes mid-lap also finishes that lap
+/// with non-blocking reads, so each remaining queue can cost one more round
+/// trip after the wait ends (#1756).
+const DISPATCH_READ_ROUND_TRIPS_PER_QUEUE: usize = 2;
+
+/// The outer deadline for a dispatch-channel read. It is the blocking wait
+/// plus [`DISPATCH_READ_ROUND_TRIPS_PER_QUEUE`] call timeouts per queue.
+/// The read must not expire while a round trip is in flight. Expiry drops
+/// the future, and an entry that `XREADGROUP` already claimed then stays
+/// pending until visibility recovery.
+fn dispatch_read_timeout(block_for: Duration, queue_count: usize) -> Duration {
+    block_for + dispatch_batch_timeout(queue_count, DISPATCH_READ_ROUND_TRIPS_PER_QUEUE, 0)
 }
 
 /// Per-shard block duration for a dispatch-channel read during multi-shard
@@ -28785,13 +28801,15 @@ impl Worker {
         // per queue before its own blocking phase even starts. See
         // `read_across_queues`'s doc comment. A flat call timeout sized
         // for one round trip can then fire before that pass alone
-        // finishes. `tokio::time::timeout` drops the whole future on
-        // expiry. An entry the read had already claimed from an earlier
-        // queue then never reaches the channel's own requeue-on-drop
-        // path. It sits pending until visibility recovery, not just
-        // delayed. The shutdown arm gives a stopping worker its exit
-        // without waiting out the read.
-        let read_timeout = block_for + dispatch_batch_timeout(self.config.queues.len(), 1, 0);
+        // finishes. A deadline that passes mid-lap adds up to one more
+        // round trip per queue after the wait, so the cap budgets two per
+        // queue. See [`dispatch_read_timeout`]. `tokio::time::timeout`
+        // drops the whole future on expiry. An entry the read had already
+        // claimed from an earlier queue then never reaches the channel's
+        // own requeue-on-drop path. It sits pending until visibility
+        // recovery, not just delayed. The shutdown arm gives a stopping
+        // worker its exit without waiting out the read.
+        let read_timeout = dispatch_read_timeout(block_for, self.config.queues.len());
         let read = tokio::select! {
             () = self.shutdown.cancelled() => return 0,
             result = tokio::time::timeout(
@@ -42698,6 +42716,28 @@ mod tests {
         assert!(
             dispatch_kind_within_share(None, 999, 0, 999, 0),
             "an untyped reference has no kind-specific pool to exhaust"
+        );
+    }
+
+    /// The read deadline covers the initial non-blocking pass and a lap
+    /// that finishes after the wait ends. Both cost one round trip per
+    /// queue (#1756).
+    #[test]
+    fn dispatch_read_timeout_budgets_the_initial_pass_and_a_forced_lap() {
+        let block_for = Duration::from_secs(2);
+        assert_eq!(
+            dispatch_read_timeout(block_for, 3),
+            block_for + DISPATCH_CALL_TIMEOUT * 6,
+            "three queues need three pass round trips and three forced-lap round trips"
+        );
+        assert_eq!(
+            dispatch_read_timeout(block_for, 1),
+            block_for + DISPATCH_CALL_TIMEOUT * 2,
+        );
+        assert_eq!(
+            dispatch_read_timeout(Duration::ZERO, 0),
+            DISPATCH_CALL_TIMEOUT * 2,
+            "an empty queue list still gets one queue's worth of budget"
         );
     }
 
