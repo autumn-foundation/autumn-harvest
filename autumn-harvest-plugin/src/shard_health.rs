@@ -384,16 +384,16 @@ fn check_no_live_worker_gate(
         .copied()
         .filter(|q| !queue_covered(q))
         .collect();
+    uncovered.sort_unstable();
+    // Issue #1463: an assigned worker that polls the queue but is stale or not
+    // active needs restoring, not new coverage. Report the two cases apart so
+    // the operator gets the right remediation.
+    let (unhealthy, unpolled): (Vec<&str>, Vec<&str>) = uncovered.iter().partition(|q| {
+        ws.iter()
+            .any(|w| worker_assigned_to_shard(w, shard_id) && worker_polls_queue(w, q))
+    });
     if !uncovered.is_empty() {
-        uncovered.sort_unstable();
         push_reason_code(reason_codes, REASON_NO_LIVE_WORKER);
-        // Issue #1463: an assigned worker that polls the queue but is stale or
-        // not active needs restoring, not new coverage. Report the two cases
-        // apart so the operator gets the right remediation.
-        let (unhealthy, unpolled): (Vec<&str>, Vec<&str>) = uncovered.iter().partition(|q| {
-            ws.iter()
-                .any(|w| worker_assigned_to_shard(w, shard_id) && worker_polls_queue(w, q))
-        });
         if !unpolled.is_empty() {
             blocking_reasons.push(format!(
                 "{} claimable task(s) queued but no worker assigned to this shard polls \
@@ -423,14 +423,16 @@ fn check_no_live_worker_gate(
     // though `default` looks covered by the per-queue check above. All
     // constraints are checked against the *same* worker so a task needing
     // several is not falsely covered by different workers each satisfying only
-    // one. Skip queues already flagged with no covering worker at all to avoid a
-    // duplicate reason for the same demand.
-    let already_uncovered: std::collections::HashSet<&str> = uncovered.iter().copied().collect();
+    // one. Skip queues no assigned worker polls, which already have a reason.
+    // A queue with only a stale or draining poller is different. That worker
+    // counts if it would satisfy the demand once restored. Otherwise restoring it
+    // cannot help, and the constraint blocker stays.
     let mut uncovered_constraints: Vec<String> = Vec::new();
     for demand in &queue_depth.constraint_demands {
-        if already_uncovered.contains(demand.queue_name.as_str()) {
+        if unpolled.contains(&demand.queue_name.as_str()) {
             continue;
         }
+        let restorable = unhealthy.contains(&demand.queue_name.as_str());
         // Parse the capability requirements once. `None` ⇒ no label constraint.
         // An unparseable value is treated as "no label constraint" so the gate
         // never fabricates a coverage failure from a value it cannot read.
@@ -440,8 +442,9 @@ fn check_no_live_worker_gate(
             .and_then(|caps| serde_json::from_value(caps.clone()).ok());
         let satisfied = ws.iter().any(|w| {
             worker_assigned_to_shard(w, shard_id)
-                && w.health == WorkerHealth::Healthy
-                && w.worker.status == WorkerStatus::Active.as_str()
+                && (restorable
+                    || (w.health == WorkerHealth::Healthy
+                        && w.worker.status == WorkerStatus::Active.as_str()))
                 && worker_polls_queue(w, &demand.queue_name)
                 && demand
                     .sticky_owner
@@ -1559,6 +1562,40 @@ mod tests {
             &mut blocking_reasons,
         );
         assert_eq!(blocking_reasons.len(), 1, "{blocking_reasons:?}");
+    }
+
+    #[test]
+    fn no_live_worker_gate_keeps_constraint_blocker_when_stale_poller_is_ineligible() {
+        // Restoring the stale worker cannot help: the sticky lease binds the row
+        // to another worker (issue #1463 review).
+        let mut stale = worker_row_with_shard_assignments(&[0], &["default"]);
+        stale.health = WorkerHealth::Stale;
+        let mut queue_depth = pending_queue_depth(5);
+        queue_depth.constraint_demands.push(ConstraintDemand {
+            queue_name: "default".to_string(),
+            required_capabilities: None,
+            required_build_id: None,
+            sticky_owner: Some("some-other-worker".to_string()),
+            count: 1,
+        });
+        let mut reason_codes = Vec::new();
+        let mut blocking_reasons = Vec::new();
+        check_no_live_worker_gate(
+            0,
+            &[ShardRole::Writable],
+            false,
+            &queue_depth,
+            &Ok(vec![stale]),
+            &empty_compat(),
+            &mut reason_codes,
+            &mut blocking_reasons,
+        );
+        assert_eq!(blocking_reasons.len(), 2, "{blocking_reasons:?}");
+        assert!(
+            blocking_reasons
+                .iter()
+                .any(|r| r.contains("requirements queued on queue(s) [default]"))
+        );
     }
 
     #[test]
