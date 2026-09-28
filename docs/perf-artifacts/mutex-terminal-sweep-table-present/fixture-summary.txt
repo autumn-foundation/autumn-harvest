@@ -1,0 +1,25 @@
+Fixture: harvest_ledger_probe
+Built by: applying all 112 migrations under autumn-harvest/migrations/*/up.sql,
+in directory-sort (== timestamp) order, via psql, against a fresh database on
+the local Postgres 16.13 instance (pg_stat_statements loaded via
+shared_preload_libraries, extension created in-database).
+
+No table_present()-relevant fixture data is needed: the statement under test
+(`SELECT to_regclass('harvest_mutex_locks') IS NOT NULL AS present`) is a
+catalog lookup independent of `harvest_mutex_locks` row count. What matters is
+only that the table exists (post-migration schema), which this fixture
+provides:
+
+  public | harvest_mutex_locks   | table | postgres
+  public | harvest_mutex_waiters | table | postgres
+
+Reproduce:
+  PGPASSWORD=postgres psql -h localhost -U postgres -c \
+    "CREATE DATABASE harvest_ledger_probe;"
+  cd autumn-harvest/migrations
+  for d in $(ls -d */ | sort); do
+    [ -f "${d}up.sql" ] && PGPASSWORD=postgres psql -h localhost -U postgres \
+      -d harvest_ledger_probe -v ON_ERROR_STOP=1 -f "${d}up.sql"
+  done
+  PGPASSWORD=postgres psql -h localhost -U postgres -d harvest_ledger_probe \
+    -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements;"

@@ -1866,6 +1866,13 @@ standalone note rather than part of the claim-path attribution table above:
   one statement per key (`calls` -66.7% at every swept size; buffers flat
   by design, so the fix is measured in DB-socket syscalls instead: `sendto`
   -44.5%, `recvfrom` -40.9%).
+* [`docs/performance-mutex-terminal-sweep-table-present.md`](performance-mutex-terminal-sweep-table-present.md)
+  — `mutex::sweep_terminal_holder_and_wake`, the per-terminal-transition
+  chokepoint every finished execution passes through, issuing its
+  `table_present()` migration guard three redundant times in one transaction
+  (issue #691 follow-up); real (18 → 6 buffers, calls 3 → 1) but the
+  statement is nowhere near 5% of the transaction's total buffers, so it does
+  not clear this page's own floor — findings only, no fix ships.
 * [`docs/performance-metrics-sampler-guard.md`](performance-metrics-sampler-guard.md)
   — four worker samplers issuing SQL with no `metrics.is_enabled()` guard
   (issue #1428), eliminated entirely rather than reduced (pool-touch count
