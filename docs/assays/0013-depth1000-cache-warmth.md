@@ -98,7 +98,7 @@ Postgres defaults (`shared_buffers = 128MB`, default 5-minute checkpoint
 timer) rather than a benchmark-tuned host — named as a condition of this
 run, not corrected for.
 
-## ⚠️ Erratum 1: the first warm run did not test the hypothesis
+## Erratum 1: the first warm run did not test the hypothesis
 
 The version of this report first pushed to PR #1761 used `TRUNCATE TABLE
 ... CASCADE` to clear rows between warm repetitions, reasoning that
@@ -118,7 +118,7 @@ default database name and two missing validity guards, none of which
 altered the measured mechanism). Both numbers were reported as a clean
 **PURSUE**. Both are also withdrawn — see the next erratum.
 
-## ⚠️ Erratum 2: plain `VACUUM` also failed to preserve what it claimed to
+## Erratum 2: plain `VACUUM` also failed to preserve what it claimed to
 
 A second round of Codex review, on the same commit, raised two more
 findings — both confirmed directly against this apparatus's own database
@@ -163,7 +163,7 @@ spread at all**. The cold mean (20.29) is now *higher* than the warm mean
 [erratum 3](#erratum-3-the-fix-for-erratum-2-cannot-cleanly-test-the-original-hypothesis-either)
 and [verdict](#-verdict) for what this means and what it doesn't.
 
-## ⚠️ Erratum 3: the fix for erratum 2 cannot cleanly test the original hypothesis either
+## Erratum 3: the fix for erratum 2 cannot cleanly test the original hypothesis either
 
 A fourth round of Codex review, on the commit containing both fixes above,
 raised a deeper problem with the fix itself, not a new bug in its code.
