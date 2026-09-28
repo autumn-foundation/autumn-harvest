@@ -1957,11 +1957,13 @@ def handoffs(
                 converted, parameter = (
                     (None, None) if partial else conversion_parts(source, block, call)
                 )
-                found.append((method, converted, parameter, guarded or tolerant, tolerant))
+                allowed = guarded or tolerant and not rejects_empty(block, call.start(), variable)
+                found.append((method, converted, parameter, allowed, tolerant))
                 continue
             by_self = r"\(\s*&?\s*(?:'[a-z_]+\s+)?(?:mut\s+)?self\b"
             self_param = parts is not None and re.match(by_self, parts[0])
-            found.append((method, parts if self_param else None, "self", guarded or tolerant, tolerant))
+            allowed = guarded or tolerant and not rejects_empty(block, call.start(), variable)
+            found.append((method, parts if self_param else None, "self", allowed, tolerant))
     return found
 
 
@@ -2119,9 +2121,11 @@ def receiving_parameters(
             # A wrapped carrier reaches no parameter the audit can follow.
             if any(way == "wrapped" for way in ways.values()):
                 name = None
-            guarded = any(guards(block, call.start(), variable) for variable in passed)
+            allowed = any(
+                empty_allowed(block, call.start(), variable, tolerant) for variable in passed
+            )
             was_optional, was_tolerant = states.get(name, (True, True))
-            states[name] = (was_optional and (guarded or tolerant), was_tolerant and tolerant)
+            states[name] = (was_optional and allowed, was_tolerant and tolerant)
     return states
 
 
@@ -2220,7 +2224,7 @@ def block_parses(block: str, carriers: dict[str, int], returns: str) -> list[Par
             used = re.search(r"(?<![.\w])%s\b" % name, after)
             passed = re.search(r"[(,]\s*&?\s*(?:mut\s+)?%s\b" % name, after)
             tolerant = bool(used) and not passed and not error_rejects(stored.group(1), after)
-        optional = tolerant or guards(block, hit.start(), root)
+        optional = empty_allowed(block, hit.start(), root, tolerant)
         # A body read through an index, a method or a generic type is not
         # something the audit can type, so it is reported.
         if not whole or possible or root in partial_names(carriers):
@@ -2276,6 +2280,54 @@ def guards(block: str, position: int, variable: str) -> bool:
     return False
 
 
+def empty_allowed(block: str, position: int, variable: str, tolerant: bool) -> bool:
+    """Whether an empty body can reach a success past the parse at `position`.
+
+    This verdict is kept apart from `tolerant`, which says only that a parse
+    error turns into a value. An `.is_empty()` guard, as `guards` reads it,
+    lets an empty body skip the parse. A tolerant parse lets it through
+    too, unless an earlier empty-body test rejects it, as `rejects_empty`
+    reads it.
+    """
+    if guards(block, position, variable):
+        return True
+    return tolerant and not rejects_empty(block, position, variable)
+
+
+def rejects_empty(block: str, position: int, variable: str) -> bool:
+    """Whether an `if` on `<variable>.is_empty()` rejects every empty body before `position`.
+
+    The arm that runs for an empty body is the block of `if body.is_empty()`,
+    or the `else` of `if !body.is_empty()`, when `condition_keeps` holds for
+    the whole condition. It counts when that arm rejects, as
+    `rejecting_exit` reads it, and the parse is in the other arm or after the
+    whole `if` in the same scope.
+    """
+    pattern = r"\bif\s+(!\s*)?%s\.is_empty\(\)" % re.escape(variable)
+    for test in re.finditer(pattern, block[:position]):
+        opener = block.find("{", test.end())
+        if opener < 0 or not condition_keeps(block[test.end() : opener], not test.group(1)):
+            continue
+        taken = balanced(block[opener:], "{", "}")
+        taken_end = end = opener + len(taken)
+        otherwise = None
+        if re.match(r"\s*else\s*\{", block[end:]):
+            branch = block.find("{", end)
+            otherwise = balanced(block[branch:], "{", "}")
+            end = branch + len(otherwise)
+        if test.group(1):
+            empty_arm, other_arm = otherwise, (opener, taken_end)
+        else:
+            empty_arm, other_arm = taken, (taken_end, end)
+        if empty_arm is None or not rejecting_exit(empty_arm):
+            continue
+        in_other = other_arm[0] < position < other_arm[1]
+        after_if = position >= end and same_scope(block, test.start(), position)
+        if in_other or after_if:
+            return True
+    return False
+
+
 def rejects_result_body(params: str, block: str) -> bool:
     """Whether a `Result<Json<T>, _>` body is mandatory, since its error rejects.
 
@@ -2294,14 +2346,40 @@ def rejects_result_body(params: str, block: str) -> bool:
     return found is not None and error_rejects(found.group(1), block)
 
 
+def rejects_option_body(params: str, block: str) -> bool:
+    """Whether an `Option<Json<T>>` or `Option<Bytes>` body is mandatory, since its `None` rejects.
+
+    `error_rejects` reads it with `None` in the role of `Err`, so the same
+    forms decide: `ok_or(..)?`, `ok_or_else(..)?`, `.unwrap()`, `.expect(..)`,
+    a `None` or catch-all arm that rejects, `if let None`, a let-else on
+    `Some`, and an `if` on `.is_none()` or `.is_some()`.
+    """
+    body = r"(?:%s<|(?<![\w:])Bytes\b|(?<![\w:])Vec<u8>|&?\s*\[u8\])" % JSON
+    found = re.finditer(r"\b([a-z_][a-z_0-9]*)\s*:\s*%s<\s*%s" % (OPTION, body), params)
+    return any(error_rejects(option.group(1), block, kind="option") for option in found)
+
+
+# For each extractor kind: the success variant, and a pattern for the failure
+# variant whose group 1 is the name the pattern binds, if any.
+FAILURE_VARIANTS = {
+    "result": ("Ok", "Err", r"Err\s*\(\s*%s([a-z_][a-z_0-9]*)?" % BINDING),
+    "option": ("Some", "None", r"None()\b"),
+}
+
+
 def error_rejects(
     name: str,
     block: str,
     seen: frozenset[str] = frozenset(),
     bound_at: int = -1,
     path: frozenset[tuple[str, str]] = frozenset(),
+    kind: str = "result",
 ) -> bool:
-    """Whether the handler rejects the error of the `Result` extractor `name`.
+    """Whether the handler rejects the failure of the extractor `name`.
+
+    `kind` is `"result"` for a `Result` extractor, whose failure is `Err`, or
+    `"option"` for an `Option` one, whose failure is `None`. Every form below
+    reads the failure variant of that kind, as `FAILURE_VARIANTS` names it.
 
     `rejects_result_body` gives the forms it reads. A move into another name,
     such as `let captured = body;`, is followed. A pattern can read the
@@ -2316,6 +2394,7 @@ def error_rejects(
     closed.
     """
     variable = re.escape(name)
+    success, failure_name, failure = FAILURE_VARIANTS[kind]
 
     def live(position: int) -> bool:
         return live_binding(block, name, position, bound_at)
@@ -2323,7 +2402,7 @@ def error_rejects(
     moved = r"\blet\s+(?:mut\s+)?([a-z_][a-z_0-9]*)\s*(?::[^=;]*)?=\s*%s\s*;" % variable
     for alias in re.finditer(moved, block):
         if alias.group(1) not in seen | {name} and live(alias.start()):
-            if error_rejects(alias.group(1), block, seen | {name}, alias.start(), path):
+            if error_rejects(alias.group(1), block, seen | {name}, alias.start(), path, kind):
                 return True
     borrow = r"(?:&\s*(?:mut\s+)?)?"
     method = r"(?:\s*\.\s*as_(?:ref|mut)\s*\(\s*\))?"
@@ -2332,7 +2411,7 @@ def error_rejects(
     for use in re.finditer(r"(?<![.\w])%s\b" % variable, block):
         if not live(use.start()) or binds_name(block, use.start(), use.end()):
             continue
-        verdict, inspection, rest = walk_chain(block[use.end() :])
+        verdict, inspection, rest = walk_chain(block[use.end() :], kind)
         # A chain that still holds the error and is the value of the block
         # hands that error to the caller, so it rejects like `?` does.
         if verdict == "open" and yields_block_value(block[: use.start()], rest):
@@ -2350,37 +2429,31 @@ def error_rejects(
         if not live(match.start()):
             continue
         arms = balanced(block[match.end() - 1 :], "{", "}")
-        for failure in error_arms(arms):
-            if arm_rejects(match_arm(arms, failure.start()), failure.group(1)):
+        for arm in error_arms(arms, kind):
+            if arm_rejects(match_arm(arms, arm.start()), arm.group(1)):
                 return True
-    for binding in re.finditer(r"\blet\s+%sOk\s*\([^;=]*?\)\s*=\s*%s\s*else\s*\{" % (PATTERN_LEAD, read), block):
+    held = r"\blet\s+%s%s\s*\([^;=]*?\)\s*=\s*%s\s*else\s*\{" % (PATTERN_LEAD, success, read)
+    for binding in re.finditer(held, block):
         otherwise = balanced(block[binding.end() - 1 :], "{", "}")
         if live(binding.start()) and rejecting_exit(otherwise):
             return True
     # After `let Err(e) = body else { .. };`, the rest of the scope runs only on
     # failure, so it is the failure arm.
-    bound_err = r"\blet\s+%sErr\s*\(\s*%s([a-z_][a-z_0-9]*)?[^=]*=\s*%s\s*else\s*\{" % (
-        PATTERN_LEAD,
-        BINDING,
-        read,
-    )
+    bound_err = r"\blet\s+%s%s[^=]*=\s*%s\s*else\s*\{" % (PATTERN_LEAD, failure, read)
     for binding in re.finditer(bound_err, block):
         otherwise = balanced(block[binding.end() - 1 :], "{", "}")
         rest = block[binding.end() - 1 + len(otherwise) :].lstrip().lstrip(";")
         if live(binding.start()) and arm_rejects(scope_rest(rest), binding.group(1)):
             return True
-    failed = r"\bif\s+let\s+%sErr\s*\(\s*%s([a-z_][a-z_0-9]*)?[^=]*=\s*%s\s*\{" % (
-        PATTERN_LEAD,
-        BINDING,
-        read,
-    )
+    failed = r"\bif\s+let\s+%s%s[^=]*=\s*%s\s*\{" % (PATTERN_LEAD, failure, read)
     for tested in re.finditer(failed, block):
         taken = balanced(block[tested.end() - 1 :], "{", "}")
         if not live(tested.start()):
             continue
         if rejecting_exit(taken) or rejecting_arm(taken, tested.group(1)):
             return True
-    for tested in re.finditer(r"\bif\s+let\s+%sOk\s*\([^;=]*?\)\s*=\s*%s\s*\{" % (PATTERN_LEAD, read), block):
+    kept = r"\bif\s+let\s+%s%s\s*\([^;=]*?\)\s*=\s*%s\s*\{" % (PATTERN_LEAD, success, read)
+    for tested in re.finditer(kept, block):
         taken = balanced(block[tested.end() - 1 :], "{", "}")
         rest = block[tested.end() - 1 + len(taken) :]
         if live(tested.start()) and re.match(r"\s*else\s*\{", rest):
@@ -2391,7 +2464,7 @@ def error_rejects(
         if parts is None or parameter is None or len(path) >= HELPER_DEPTH:
             return True
         if (helper, parameter) not in path:
-            if error_rejects(parameter, parts[2], path=path | {(helper, parameter)}):
+            if error_rejects(parameter, parts[2], path=path | {(helper, parameter)}, kind=kind):
                 return True
     return False
 
@@ -2710,8 +2783,11 @@ def pattern_alternatives(text: str, start: int, end: int) -> list[int]:
     return [start]
 
 
-def error_arms(arms: str) -> list[re.Match]:
-    """Each top-level arm pattern of this `match` that can receive an `Err`.
+def error_arms(arms: str, kind: str = "result") -> list[re.Match]:
+    """Each top-level arm pattern of this `match` that can receive the failure.
+
+    The failure is `Err` for a `Result` and `None` for an `Option`, as
+    `FAILURE_VARIANTS` gives it for `kind`.
 
     That is an `Err(..)` pattern, a catch-all `_` or binding, or a binding
     such as `error @ Err(_)`. `pattern_alternatives` reads each arm, so a
@@ -2721,10 +2797,12 @@ def error_arms(arms: str) -> list[re.Match]:
     arm binds, if any. `arms` includes the outer braces. A guarded arm can
     fall through to a later arm, so every one is returned.
     """
+    _, failure_name, failure_pattern = FAILURE_VARIANTS[kind]
     catch_all = re.compile(
-        BINDING + r"([a-z_][a-z_0-9]*)(?=\s*(?:if\b[^{}]*?)?=>|\s*@\s*(?:Err\b|_))"
+        BINDING
+        + r"([a-z_][a-z_0-9]*)(?=\s*(?:if\b[^{}]*?)?=>|\s*@\s*(?:%s\b|_))" % failure_name
     )
-    failure = re.compile(r"Err\s*\(\s*%s([a-z_][a-z_0-9]*)?" % BINDING)
+    failure = re.compile(failure_pattern)
     found: list[re.Match] = []
     depth, arm_start = 0, None
     for index, char in enumerate(arms):
@@ -2768,9 +2846,15 @@ def chain_state(after: str) -> str:
 INSPECTIONS = frozenset({"is_ok", "is_err", "is_ok_and", "is_err_and", "is_some", "is_none"})
 
 
-def walk_chain(after: str) -> tuple[str, str | None, str]:
-    """`(verdict, last inspection, text after the chain)` for `chain_state`."""
-    state, inspection = "result", None
+def walk_chain(after: str, start: str = "result") -> tuple[str, str | None, str]:
+    """`(verdict, last inspection, text after the chain)` for `chain_state`.
+
+    `start` is `"result"` for a `Result` extractor or `"option"` for an
+    `Option` one. For an `Option`, the chain holds the failure while it is
+    the `Option`, or a `Result` that `ok_or(..)` made from it.
+    """
+    state, inspection = start, None
+    holding = {"result"} if start == "result" else {"option", "result"}
     rest = after
     while True:
         rest = rest.lstrip()
@@ -2788,7 +2872,7 @@ def walk_chain(after: str) -> tuple[str, str | None, str]:
             return "reject", inspection, rest
         call = re.match(r"\.\s*([a-z_][a-z_0-9]*)\s*\(", rest)
         if call is None:
-            return ("open" if state == "result" else "tolerate"), inspection, rest
+            return ("open" if state in holding else "tolerate"), inspection, rest
         method = call.group(1)
         if method in ("unwrap", "expect") and state not in ("value", "recovered"):
             return "reject", inspection, rest
@@ -3167,9 +3251,10 @@ def query_struct_findings(
 ) -> list[str]:
     """Check 6: the `Query<T>` structs and the route's query parameters agree.
 
-    It runs for every served route, so a route with no `Query<T>` accepts no
-    documented query key. Each extractor reads the whole query string, so a
-    key that several structs accept is judged once for the route. It is mandatory when any extractor
+    This is the forward check. It reads each field of each extractor.
+    `documented_query_findings` is the inverse check, gated on its own. Each
+    extractor reads the whole query string, so a key that several structs
+    accept is judged once for the route. It is mandatory when any extractor
     that is not wrapped requires it. Its OpenAPI type must be the same in every
     struct, or the key is a finding.
     """
@@ -3180,12 +3265,10 @@ def query_struct_findings(
     }
     where = "  %s %s: `%%s`" % (method, path)
     found: list[str] = []
-    accepted: set[str] = set()
     # (struct, field, declared type, mandatory) for each documented key.
     readers: dict[str, list[tuple[str, str, str, bool]]] = {}
     for name, struct, wrapped in queries:
         for field, declared_type, mandatory, spellings in struct_fields(struct):
-            accepted |= set(spellings)
             key = documented_as(spellings, documented)
             if documented.get(key) is None:
                 found.append(
@@ -3233,11 +3316,33 @@ def query_struct_findings(
             found.append(
                 where % field + " is optional in %s but the contract marks it required" % owners
             )
+    return found
+
+
+def documented_query_findings(
+    method: str, path: str, route: dict, queries: list[tuple[str, str, bool]]
+) -> list[str]:
+    """Check 6, inverse: each documented query key is one an extractor accepts.
+
+    It runs for every served route, so a route with no `Query<T>` accepts no
+    documented query key. A route whose query the audit cannot read whole
+    skips it, as `audit` gates it.
+    """
+    documented = {
+        entry.get("name")
+        for entry in route.get("params") or []
+        if entry.get("in") == "query" and entry.get("name")
+    }
+    accepted = {
+        spelling
+        for _, struct, _ in queries
+        for _, _, _, spellings in struct_fields(struct)
+        for spelling in spellings
+    }
     owners = " or ".join(name for name, _, _ in queries)
     readers = "%s does not accept it" % owners if owners else "no extractor of the route accepts it"
-    for key in documented.keys() - accepted:
-        found.append(where % key + " is documented but " + readers)
-    return found
+    where = "  %s %s: `%%s`" % (method, path)
+    return [where % key + " is documented but " + readers for key in documented - accepted]
 
 
 def declared_statuses(route: dict) -> set[int]:
@@ -3881,16 +3986,20 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
                 queries.append((name, struct, wrapped))
         if len(re.findall(r"(?<![\w:])Query<", params)) > len(QUERY_EXTRACTOR.findall(params)):
             unresolved.append("  %s %s: cannot read a `Query<..>` extractor" % (method, path))
-        # Every served route is checked, with or without a `Query<T>`, so a
-        # documented key that no extractor reads is a finding. A route whose
-        # query the audit cannot read whole is left to its own finding: an
-        # unresolved `Query<T>`, or a raw reader that check 4 or no check reads.
+        # The forward check reads every `Query<T>` the audit can read. The
+        # inverse check runs for every served route, with or without a
+        # `Query<T>`, so a documented key that no extractor reads is a finding.
+        # A route whose query the audit cannot read whole is left out of the
+        # inverse check only: an unresolved `Query<T>`, or a raw reader that
+        # check 4 reads.
         unread_queries = len(unresolved) > unread_queries
+        typed_query += query_struct_findings(method, path, route, queries)
         if not unread_queries and not getattr(params, "raw_reader", False):
-            typed_query += query_struct_findings(method, path, route, queries)
+            typed_query += documented_query_findings(method, path, route, queries)
 
         # A bare `Json<T>` means the body is mandatory. `Result<Json<T>, _>` is
-        # mandatory when its error rejects. `Option<Json<T>>` is optional. All
+        # mandatory when its error rejects. `Option<Json<T>>` is mandatory when
+        # its `None` rejects, and optional otherwise. All
         # three still name the struct whose fields serde accepts, which is what
         # check 3 needs.
         # The binding is `Json(body)` or a plain name such as `mut body`.
@@ -3912,7 +4021,8 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
             # A present `Option<Json<T>>` body is still parsed strictly, so its
             # mandatory fields are checked. A tolerant `Result` body is not.
             parses.append((body_type, bool(bare) or result_rejects or option_body, (code, at)))
-        mandatory_body = bool(bare) or result_rejects
+        # An `Option` body whose `None` the handler rejects is mandatory too.
+        mandatory_body = bool(bare) or result_rejects or rejects_option_body(params, block)
         if byte_parameters(params) or possible_carriers(params):
             for name, optional, tolerant, site in raw_body_parses(code, handler):
                 # A parse an empty body cannot skip makes the body mandatory,
@@ -4472,6 +4582,7 @@ pub fn harvest_api_router() -> Router {
         .route("/s/spoofed-query", get(s_spoofed_query))
         .route("/s/std-alias-field", get(s_std_alias_field))
         .route("/s/no-query/{id}", get(s_no_query))
+        .route("/s/raw-and-query", get(s_raw_and_query))
         .route("/s/trusted-id", get(s_trusted_id))
         .route("/s/local-id", get(s_local_id))
         .route("/s/rebound-id", get(s_rebound_id))
@@ -4609,6 +4720,13 @@ mod reexport_reader {
 async fn s_full_reexport_raw(
     autumn_web::reexports::axum::extract::RawQuery(raw):
         autumn_web::reexports::axum::extract::RawQuery,
+) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn s_raw_and_query(
+    axum::extract::RawQuery(raw): axum::extract::RawQuery,
+    Query(page): Query<Paging>,
 ) -> Response {
     StatusCode::OK.into_response()
 }
@@ -5368,6 +5486,17 @@ pub fn harvest_api_router() -> Router {
         .route("/e/unrelated-receiver", post(e_unrelated_receiver))
         .route("/e/alias-body", post(e_alias_body))
         .route("/e/dead-closure", post(e_dead_closure))
+        .route("/e/empty-rejected-tolerant", post(e_empty_rejected_tolerant))
+        .route("/e/empty-rejected-helper", post(e_empty_rejected_helper))
+        .route("/e/empty-else-rejected", post(e_empty_else_rejected))
+        .route("/e/option-ok-or", post(e_option_ok_or))
+        .route("/e/option-expect", post(e_option_expect))
+        .route("/e/option-match", post(e_option_match))
+        .route("/e/option-let-else", post(e_option_let_else))
+        .route("/e/option-if-none", post(e_option_if_none))
+        .route("/e/option-bytes", post(e_option_bytes))
+        .route("/e/option-body-default", post(e_option_body_default))
+        .route("/e/option-unread-use", post(e_option_unread_use))
         .route("/e/dropped-closure", post(e_dropped_closure))
         .route("/e/dead-helper-closure", post(e_dead_helper_closure))
         .route("/e/called-closure", post(e_called_closure))
@@ -6740,6 +6869,78 @@ async fn e_extension_decode(body: Bytes) -> Response {
 type RawBody = Vec<u8>;
 type RawSlice = [u8];
 type Opaque<T> = Wrapper<T>;
+
+async fn e_empty_rejected_tolerant(body: Bytes) -> Response {
+    if body.is_empty() {
+        return Err(reject());
+    }
+    let gadget: Gadget = serde_json::from_slice(&body).unwrap_or_default();
+    StatusCode::OK.into_response()
+}
+
+async fn e_empty_rejected_helper(body: Bytes) -> Response {
+    if body.is_empty() {
+        return Err(reject());
+    }
+    let gadget = parse_gadget(&body).unwrap_or_default();
+    StatusCode::OK.into_response()
+}
+
+async fn e_empty_else_rejected(body: Bytes) -> Response {
+    if !body.is_empty() {
+        let gadget: Gadget = serde_json::from_slice(&body).unwrap_or_default();
+    } else {
+        return Err(reject());
+    }
+    StatusCode::OK.into_response()
+}
+
+async fn e_option_ok_or(body: Option<Json<Gadget>>) -> Response {
+    let Json(gadget) = body.ok_or(reject())?;
+    StatusCode::OK.into_response()
+}
+
+async fn e_option_expect(body: Option<Json<Gadget>>) -> Response {
+    let Json(gadget) = body.expect("a body");
+    StatusCode::OK.into_response()
+}
+
+async fn e_option_match(body: Option<Json<Gadget>>) -> Response {
+    match body {
+        Some(Json(gadget)) => {}
+        None => return Err(reject()),
+    }
+    StatusCode::OK.into_response()
+}
+
+async fn e_option_let_else(body: Option<Json<Gadget>>) -> Response {
+    let Some(Json(gadget)) = body else {
+        return Err(reject());
+    };
+    StatusCode::OK.into_response()
+}
+
+async fn e_option_if_none(body: Option<Json<Gadget>>) -> Response {
+    if body.is_none() {
+        return Err(reject());
+    }
+    StatusCode::OK.into_response()
+}
+
+async fn e_option_bytes(body: Option<Bytes>) -> Response {
+    let raw = body.ok_or_else(reject)?;
+    StatusCode::OK.into_response()
+}
+
+async fn e_option_unread_use(body: Option<Json<Gadget>>) -> Response {
+    tracing::debug!(present = ?body);
+    StatusCode::OK.into_response()
+}
+
+async fn e_option_body_default(body: Option<Json<Gadget>>) -> Response {
+    let gadget = body.map(|Json(gadget)| gadget).unwrap_or_default();
+    StatusCode::OK.into_response()
+}
 
 async fn e_dead_closure(body: Bytes) -> Response {
     let parse = || serde_json::from_slice::<Gadget>(&body).unwrap();
@@ -9625,6 +9826,26 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
         },
     ),
     (
+        "a raw reader skips only the inverse check, and every Query<T> is still read",
+        FIXTURE_ALIAS_SCOPES,
+        [
+            fixture_route(
+                "GET",
+                "/s/raw-and-query",
+                200,
+                params=[
+                    query_param("limit", "string", False),
+                    query_param("extra", "string", False),
+                ],
+            )
+        ],
+        {
+            "query_params": [
+                "GET /s/raw-and-query: `limit` is integer in Paging but the contract says string"
+            ]
+        },
+    ),
+    (
         "a documented query key needs an extractor that reads it, on every served route",
         FIXTURE_ALIAS_SCOPES,
         [
@@ -9743,6 +9964,57 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             "query_params": [
                 "GET /s/dup-params/{id}: `limit` is documented 2 times in query",
                 "GET /s/dup-params/{id}: `id` is documented 2 times in path",
+            ]
+        },
+    ),
+    (
+        "a tolerant parse leaves the body optional only when an empty body can succeed",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST", path, 200, request_body=body_of(("name", False), required=False)
+            )
+            for path in (
+                "/e/empty-rejected-tolerant",
+                "/e/empty-rejected-helper",
+                "/e/empty-else-rejected",
+            )
+        ],
+        {
+            "body_required": [
+                "POST /e/empty-rejected-tolerant: the body is mandatory",
+                "POST /e/empty-rejected-helper: the body is mandatory",
+                "POST /e/empty-else-rejected: the body is mandatory",
+            ]
+        },
+    ),
+    (
+        "an Option body whose None rejects is mandatory",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST", path, 200, request_body=body_of(("name", True), required=False)
+            )
+            for path in (
+                "/e/option-ok-or",
+                "/e/option-expect",
+                "/e/option-match",
+                "/e/option-let-else",
+                "/e/option-if-none",
+                "/e/option-bytes",
+                "/e/option-body-default",
+                "/e/option-unread-use",
+            )
+        ],
+        {
+            "body_required": [
+                "POST /e/option-ok-or: the body is mandatory",
+                "POST /e/option-expect: the body is mandatory",
+                "POST /e/option-match: the body is mandatory",
+                "POST /e/option-let-else: the body is mandatory",
+                "POST /e/option-if-none: the body is mandatory",
+                "POST /e/option-bytes: the body is mandatory",
+                "POST /e/option-unread-use: the body is mandatory",
             ]
         },
     ),
