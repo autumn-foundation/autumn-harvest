@@ -1940,6 +1940,8 @@ def handoffs(
             method = call.group(1)
             if method in BYTE_ACCESSORS or not live_binding(block, variable, call.start(), bound_at):
                 continue
+            if in_dead_closure(block, call.start()):
+                continue
             # A partial carrier reaches no method the audit can follow. A whole
             # one reaches only a method of an `impl` for its own type.
             partial = variable in partial_names(carriers)
@@ -1969,10 +1971,11 @@ def call_sites(
     """`(helper, parts, start, path)` for each call in `block` that can take a body.
 
     A bare call, a path-qualified call and a method call each resolve at
-    their own site. `path` is `None` for a bare call, the written path for a
-    qualified one, and `.` for a method call, as `receiving_parameters` reads
-    it. A method call reaches what `method_targets` finds, and one with no
-    known receiver type has no `parts`, so a handoff to it fails closed.
+    their own site. A call in a closure that never runs is skipped. `path`
+    is `None` for a bare call, the written path for a qualified one, and `.`
+    for a method call, as `receiving_parameters` reads it. A method call
+    reaches what `method_targets` finds, and one with no known receiver type
+    has no `parts`, so a handoff to it fails closed.
     """
     found = []
     for call in re.finditer(FREE_CALL_NAME, block):
@@ -1980,10 +1983,14 @@ def call_sites(
         site = site_in(block, call.start())
         if helper in NOT_CALLS | GENERIC_HELPERS or std_path(helper, site):
             continue
+        if in_dead_closure(block, call.start()):
+            continue
         found.append((helper, function_parts(source, helper, site), call.start(), None))
     for call in qualified_calls(block):
         helper, path = call.group(2), re.sub(r"\s", "", call.group(1))
         if helper in GENERIC_HELPERS or not handoff_path(call, block):
+            continue
+        if in_dead_closure(block, call.start()):
             continue
         if path == ".":
             receiver = call_receiver(block, call.start())
@@ -2118,6 +2125,63 @@ def receiving_parameters(
     return states
 
 
+@functools.lru_cache(maxsize=None)
+def closures(block: str) -> list[tuple[int, int, int]]:
+    """`(start, body start, body end)` for each closure expression in `block`.
+
+    The body is a block, or an expression up to the first top-level `,` or
+    `;`, as `closure_body_end` reads it. An operator such as `a || b` can
+    read as one too. `in_dead_closure` acts only on a closure that a `let`
+    binds directly, which an operator never is.
+    """
+    found = []
+    for head in re.finditer(r"(?<![|\w])(?:move\s+)?\|([^|]*)\|", block):
+        opener, stop = closure_body_end(block, head.end())
+        found.append((head.start(), opener, stop))
+    return found
+
+
+def closure_body_end(text: str, after: int) -> tuple[int, int]:
+    """Where the body of a closure whose parameters end at `after` starts and ends."""
+    body = text[after:].lstrip()
+    opener = after + len(text[after:]) - len(body)
+    if body.startswith("{"):
+        return opener, opener + len(balanced(body, "{", "}"))
+    rest = scope_rest(body)
+    cut = [index for index, char in enumerate(rest) if char in ",;"]
+    return opener, opener + (cut[0] if cut else len(rest))
+
+
+def in_dead_closure(block: str, position: int) -> bool:
+    """Whether `position` is inside a closure in `block` that never runs.
+
+    Each enclosing closure is its own site. One that is called in place,
+    passed to a helper or a combinator such as `map`, returned or stored
+    runs, or may run, so its body counts as today, which fails closed. Only
+    a closure bound by `let` whose name is never read after it, as
+    `live_binding` reads the name, never runs. So does one bound to `_`.
+    """
+    for start, opener, stop in closures(block):
+        if not opener <= position < stop:
+            continue
+        bound = re.search(
+            r"\blet\s+(?:mut\s+)?([a-z_][a-z_0-9]*)\s*(?::[^=;]*)?=\s*$", block[:start]
+        )
+        if bound is None:
+            continue
+        name = bound.group(1)
+        if name == "_":
+            return True
+        uses = [
+            use.start()
+            for use in re.finditer(r"(?<![.\w])%s\b" % re.escape(name), block[stop:])
+            if live_binding(block, name, stop + use.start(), bound.start())
+        ]
+        if not uses:
+            return True
+    return False
+
+
 def block_parses(block: str, carriers: dict[str, int], returns: str) -> list[Parse]:
     """`(type, optional, tolerant, site)` for each `from_slice` call that reads a carrier.
 
@@ -2125,9 +2189,13 @@ def block_parses(block: str, carriers: dict[str, int], returns: str) -> list[Par
     `let` gave a new value is no carrier after that `let`. A partial carrier,
     as `moved_names` marks it, has no type the audit can read. The site is
     where the call is, so its type resolves from that module and its imports.
+    A call in a closure that never runs, as `in_dead_closure` reads it, is
+    no parse.
     """
     parses: list[Parse] = []
     for hit in FROM_SLICE_CALL.finditer(block):
+        if in_dead_closure(block, hit.start()):
+            continue
         turbofish = None
         opener = hit.end() - 1
         if block[opener] == "<":
@@ -3585,14 +3653,7 @@ def value_shadowed(code: str, name: str, position: int, bound_at: int) -> bool:
     variable = re.escape(name)
     for closure in re.finditer(r"(?<![|\w])\|([^|]*)\|", code[:position]):
         if re.search(r"(?<![\w.])%s\b" % variable, closure.group(1)):
-            body = code[closure.end() :].lstrip()
-            opener = closure.end() + len(code[closure.end() :]) - len(body)
-            if body.startswith("{"):
-                stop = opener + len(balanced(body, "{", "}"))
-            else:
-                rest = scope_rest(body)
-                cut = [index for index, char in enumerate(rest) if char in ",;"]
-                stop = opener + (cut[0] if cut else len(rest))
+            _, stop = closure_body_end(code, closure.end())
             if closure.start() < position < stop:
                 return True
     for fn in re.finditer(r"\bfn\s+\w+\s*(?:<[^>]*>)?\s*\(", code[:position]):
@@ -3699,7 +3760,10 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
                 bodies.append(reached[2])
 
         params = handler_parameters(code, handler)
-        if params is not None and "RawQuery" in params:
+        # Every trusted raw reader, as `raw_reader` reads it, parses the
+        # query by hand, so its key arms are read. The same gate exempts the
+        # route from the documented-key check below.
+        if params is not None and getattr(params, "raw_reader", False):
             documented = {entry["name"] for entry in route.get("params", [])}
             # A query key is a string literal, so these blocks keep literals.
             keyed = [handler_body(source, handler)]
@@ -4191,6 +4255,9 @@ pub fn harvest_api_router() -> Router {
         .route("/s/bare", get(s_bare))
         .route("/s/generic", get(s_generic))
         .route("/s/list", get(s_list))
+        .route("/s/uri-list", get(s_uri_list))
+        .route("/s/request-list", get(s_request_list))
+        .route("/s/parts-list", get(s_parts_list))
         .route("/s/scoped", post(s_scoped))
         .route("/s/lenient", patch(s_lenient))
 }
@@ -4227,6 +4294,39 @@ async fn s_list(RawQuery(raw): RawQuery) -> Response {
                 "asc" => {}
                 _ => {}
             },
+            _ => {}
+        }
+    }
+    StatusCode::OK.into_response()
+}
+
+async fn s_uri_list(uri: Uri) -> Response {
+    for (key, value) in query_pairs(uri.query()) {
+        match key.as_str() {
+            "limit" => {}
+            "sort" => {}
+            _ => {}
+        }
+    }
+    StatusCode::OK.into_response()
+}
+
+async fn s_request_list(request: Request) -> Response {
+    for (key, value) in query_pairs(request.uri().query()) {
+        match key.as_str() {
+            "limit" => {}
+            "sort" => {}
+            _ => {}
+        }
+    }
+    StatusCode::OK.into_response()
+}
+
+async fn s_parts_list(parts: Parts) -> Response {
+    for (key, value) in query_pairs(parts.uri.query()) {
+        match key.as_str() {
+            "limit" => {}
+            "sort" => {}
             _ => {}
         }
     }
@@ -5267,6 +5367,11 @@ pub fn harvest_api_router() -> Router {
         .route("/e/extension-decode", post(e_extension_decode))
         .route("/e/unrelated-receiver", post(e_unrelated_receiver))
         .route("/e/alias-body", post(e_alias_body))
+        .route("/e/dead-closure", post(e_dead_closure))
+        .route("/e/dropped-closure", post(e_dropped_closure))
+        .route("/e/dead-helper-closure", post(e_dead_helper_closure))
+        .route("/e/called-closure", post(e_called_closure))
+        .route("/e/stored-closure", post(e_stored_closure))
         .route("/e/alias-helper", post(e_alias_helper))
         .route("/e/opaque-body", post(e_opaque_body))
         .route("/e/unknown-type-body", post(e_unknown_type_body))
@@ -6636,6 +6741,33 @@ type RawBody = Vec<u8>;
 type RawSlice = [u8];
 type Opaque<T> = Wrapper<T>;
 
+async fn e_dead_closure(body: Bytes) -> Response {
+    let parse = || serde_json::from_slice::<Gadget>(&body).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_dropped_closure(body: Bytes) -> Response {
+    let _ = || serde_json::from_slice::<Gadget>(&body).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_dead_helper_closure(body: Bytes) -> Response {
+    let later = || parse_gadget(&body);
+    StatusCode::OK.into_response()
+}
+
+async fn e_called_closure(body: Bytes) -> Response {
+    let parse = || serde_json::from_slice::<Gadget>(&body).unwrap();
+    let gadget = parse();
+    StatusCode::OK.into_response()
+}
+
+async fn e_stored_closure(body: Bytes) -> Response {
+    let parse = || serde_json::from_slice::<Gadget>(&body).unwrap();
+    register(parse);
+    StatusCode::OK.into_response()
+}
+
 async fn e_alias_body(body: RawBody) -> Response {
     let gadget = serde_json::from_slice::<Gadget>(&body).unwrap();
     StatusCode::OK.into_response()
@@ -7481,6 +7613,21 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
         FIXTURE_STATUS,
         [fixture_route("GET", "/s/list", 200, params=[{"name": "page_size", "in": "query"}])],
         {"query_keys": ["GET /s/list: `order` is accepted by the query parser"]},
+    ),
+    (
+        "every trusted raw reader has its hand-parsed query keys read",
+        FIXTURE_STATUS,
+        [
+            fixture_route("GET", path, 200, params=[query_param("limit", "integer", False)])
+            for path in ("/s/uri-list", "/s/request-list", "/s/parts-list")
+        ],
+        {
+            "query_keys": [
+                "GET /s/uri-list: `sort` is accepted by the query parser",
+                "GET /s/request-list: `sort` is accepted by the query parser",
+                "GET /s/parts-list: `sort` is accepted by the query parser",
+            ]
+        },
     ),
     (
         "a typed let in an earlier statement does not type a parse",
@@ -9597,6 +9744,32 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
                 "GET /s/dup-params/{id}: `limit` is documented 2 times in query",
                 "GET /s/dup-params/{id}: `id` is documented 2 times in path",
             ]
+        },
+    ),
+    (
+        "a parse in a closure counts only when the closure may run",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST", path, 200, request_body=body_of(("name", False), required=False)
+            )
+            for path in (
+                "/e/dead-closure",
+                "/e/dropped-closure",
+                "/e/dead-helper-closure",
+                "/e/called-closure",
+                "/e/stored-closure",
+            )
+        ],
+        {
+            "body_required": [
+                "POST /e/called-closure: the body is mandatory",
+                "POST /e/stored-closure: the body is mandatory",
+            ],
+            "mandatory": [
+                "POST /e/called-closure: `name` is mandatory in Gadget",
+                "POST /e/stored-closure: `name` is mandatory in Gadget",
+            ],
         },
     ),
     (
