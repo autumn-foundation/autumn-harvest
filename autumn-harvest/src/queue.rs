@@ -10477,10 +10477,19 @@ mod tests {
     }
 
     /// A matched row resolves to `Ok(())`. `record_pending_hint` is a no-op
-    /// here since no channel is installed. This test pins only the return
-    /// value. Hint content belongs to `crate::dispatch`.
+    /// only while no channel is installed. `crate::dispatch`'s install state
+    /// is process-global (issue #1431). A channel a concurrent test installs
+    /// could otherwise receive this synthetic hint. That would contaminate
+    /// the other test's assertions. This locks against the same mutex those
+    /// install/uninstall tests use. It clears the slots first, so the no-op
+    /// is guaranteed, not incidental. This test pins only the return value.
+    /// Hint content belongs to `crate::dispatch`.
+    #[cfg(feature = "testing")]
     #[test]
     fn finish_workflow_backoff_requeue_succeeds_on_a_matched_row() {
+        let _serial = crate::dispatch::TEST_SLOT_LOCK.blocking_lock();
+        crate::dispatch::uninstall_all();
+
         let task_id = Uuid::new_v4();
         let updated = vec![("default".to_string(), 5, Utc::now())];
 
