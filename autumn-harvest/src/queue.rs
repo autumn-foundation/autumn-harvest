@@ -3006,6 +3006,48 @@ pub async fn requeue_for_retry(
     Ok(())
 }
 
+/// Finish a backoff-style workflow-task re-pend: record a dispatch hint for
+/// the re-pended row, or report `NotFound` when the update touched none.
+///
+/// Shared by the three backoff re-pend paths that deliberately skip
+/// `pg_notify` (issue #1312): [`requeue_workflow_task_for_quota_retry`],
+/// [`requeue_workflow_task_nd_blocked`], and
+/// [`requeue_workflow_task_after_panic`]. Each of those `UPDATE`s restricts
+/// itself to a claimed (`RUNNING`) workflow row. Each returns at most one
+/// `(queue_name, priority, scheduled_at)` tuple, so this only ever consumes
+/// the first element.
+///
+/// The task stays un-claimable until `scheduled_at`
+/// (`claim_task` enforces `scheduled_at <= NOW()`), so waking a poller
+/// early would be pure noise. The channel instead parks a reference until
+/// `next_run`, at no cost to a poller and no backlog scan once the backoff
+/// elapses.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::NotFound`] when `updated` is empty:
+/// the task was not a claimed (`RUNNING`) workflow task.
+fn finish_workflow_backoff_requeue(
+    task_id: Uuid,
+    updated: Vec<(String, i32, chrono::DateTime<Utc>)>,
+) -> HarvestResult<()> {
+    let Some((queue_name, priority, next_run)) = updated.into_iter().next() else {
+        return Err(crate::error::HarvestError::NotFound(format!(
+            "task queue item {task_id} is not a running workflow task"
+        )));
+    };
+
+    record_pending_hint(
+        task_id,
+        &queue_name,
+        next_run,
+        priority,
+        crate::dispatch::DispatchKind::Workflow,
+    );
+
+    Ok(())
+}
+
 /// Reset a `RUNNING` workflow task to `PENDING` with a future `scheduled_at`.
 ///
 /// This is the bounded backoff retry for a quota or shard-admission
@@ -3082,23 +3124,7 @@ pub async fn requeue_workflow_task_for_quota_retry(
     .await
     .map_err(crate::error::database_error)?;
 
-    let Some((queue_name, priority, next_run)) = updated.into_iter().next() else {
-        return Err(crate::error::HarvestError::NotFound(format!(
-            "task queue item {task_id} is not a running workflow task"
-        )));
-    };
-
-    // Dispatch hint (issue #1312). No `pg_notify` fires here on purpose --
-    // same rationale as `requeue_workflow_task_nd_blocked`.
-    record_pending_hint(
-        task_id,
-        &queue_name,
-        next_run,
-        priority,
-        crate::dispatch::DispatchKind::Workflow,
-    );
-
-    Ok(())
+    finish_workflow_backoff_requeue(task_id, updated)
 }
 
 /// Build the `SET` clause used by [`requeue_workflow_task_for_quota_retry`]
@@ -3203,24 +3229,7 @@ pub async fn requeue_workflow_task_nd_blocked(
     .await
     .map_err(crate::error::database_error)?;
 
-    let Some((queue_name, priority, next_run)) = updated.into_iter().next() else {
-        return Err(crate::error::HarvestError::NotFound(format!(
-            "task queue item {task_id} is not a running workflow task"
-        )));
-    };
-
-    // Dispatch hint (issue #1312). No `pg_notify` fires here on purpose. The
-    // channel parks a reference until `next_run` instead. That costs a poller
-    // nothing and removes the backlog scan when the backoff elapses.
-    record_pending_hint(
-        task_id,
-        &queue_name,
-        next_run,
-        priority,
-        crate::dispatch::DispatchKind::Workflow,
-    );
-
-    Ok(())
+    finish_workflow_backoff_requeue(task_id, updated)
 }
 
 /// Build the `SET` clause used by [`requeue_workflow_task_after_panic`] so a
@@ -3328,24 +3337,7 @@ pub async fn requeue_workflow_task_after_panic(
     .await
     .map_err(crate::error::database_error)?;
 
-    let Some((queue_name, priority, next_run)) = updated.into_iter().next() else {
-        return Err(crate::error::HarvestError::NotFound(format!(
-            "task queue item {task_id} is not a running workflow task"
-        )));
-    };
-
-    // Dispatch hint (issue #1312). No `pg_notify` fires here on purpose. The
-    // channel parks a reference until `next_run` instead. That costs a poller
-    // nothing and removes the backlog scan when the backoff elapses.
-    record_pending_hint(
-        task_id,
-        &queue_name,
-        next_run,
-        priority,
-        crate::dispatch::DispatchKind::Workflow,
-    );
-
-    Ok(())
+    finish_workflow_backoff_requeue(task_id, updated)
 }
 
 // ---------------------------------------------------------------------------
@@ -10459,6 +10451,53 @@ mod tests {
         assert!(
             sql.contains("\"scheduled_at\" = clock_timestamp() + make_interval(secs => $"),
             "scheduled_at must be computed from Postgres's own clock: {sql}"
+        );
+    }
+
+    // ── finish_workflow_backoff_requeue: shared tail of the three backoff
+    // re-pend paths (quota retry, ND-block, panic retry) ────────────────────
+
+    /// An empty `updated` batch means the `UPDATE` matched no row: the task
+    /// was not a claimed (`RUNNING`) workflow task. Every caller relies on
+    /// this exact `NotFound` message.
+    #[test]
+    fn finish_workflow_backoff_requeue_reports_not_found_on_an_empty_batch() {
+        let task_id = Uuid::new_v4();
+
+        let result = finish_workflow_backoff_requeue(task_id, Vec::new());
+
+        assert!(
+            matches!(
+                result,
+                Err(crate::error::HarvestError::NotFound(ref message))
+                    if message == &format!("task queue item {task_id} is not a running workflow task")
+            ),
+            "expected a NotFound error naming the task id: {result:?}"
+        );
+    }
+
+    /// A matched row resolves to `Ok(())`. `record_pending_hint` is a no-op
+    /// only while no channel is installed. `crate::dispatch`'s install state
+    /// is process-global (issue #1431). A channel a concurrent test installs
+    /// could otherwise receive this synthetic hint. That would contaminate
+    /// the other test's assertions. This locks against the same mutex those
+    /// install/uninstall tests use. It clears the slots first, so the no-op
+    /// is guaranteed, not incidental. This test pins only the return value.
+    /// Hint content belongs to `crate::dispatch`.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn finish_workflow_backoff_requeue_succeeds_on_a_matched_row() {
+        let _serial = crate::dispatch::TEST_SLOT_LOCK.blocking_lock();
+        crate::dispatch::uninstall_all();
+
+        let task_id = Uuid::new_v4();
+        let updated = vec![("default".to_string(), 5, Utc::now())];
+
+        let result = finish_workflow_backoff_requeue(task_id, updated);
+
+        assert!(
+            result.is_ok(),
+            "expected Ok(()) for a matched row: {result:?}"
         );
     }
 
