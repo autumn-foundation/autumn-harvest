@@ -146,12 +146,21 @@ const QUEUE_BLOCK_SLICE: Duration = Duration::from_millis(200);
 /// retry read.
 const VISIT_ROUND_TRIPS: usize = 3;
 
-/// Sequential round trips per queue that one `next` call can make outside
-/// its wait. `read_across_queues` visits every queue once in its initial
-/// non-blocking pass. A deadline that passes mid-lap also finishes that lap
-/// with non-blocking reads, so each queue can get a second visit after the
-/// wait ends (#1756). Either visit can be the one that heals a group.
-const NEXT_ROUND_TRIPS_PER_QUEUE: usize = 2 * VISIT_ROUND_TRIPS;
+/// Worst-case round trips per queue in one `next` call, outside its wait.
+///
+/// - `promote_queues` can create one consumer group per queue.
+/// - `read_across_queues` visits every queue in its initial pass. A deadline
+///   that passes mid-lap gives each queue a second visit (#1756). Either
+///   visit can heal a group, so each costs [`VISIT_ROUND_TRIPS`].
+/// - `requeue_batch` runs one script per queue for a surplus. A script the
+///   server forgot costs three: `EVALSHA`, `SCRIPT LOAD`, then `EVALSHA`.
+/// - `discard_entries` runs one pipeline per stream with malformed entries.
+const NEXT_ROUND_TRIPS_PER_QUEUE: usize = 1 + 2 * VISIT_ROUND_TRIPS + 3 + 1;
+
+/// Worst-case round trips in one `next` call that do not scale with the
+/// queue count. `promote_queues` runs one pipeline for every queue. A script
+/// the server forgot adds a `SCRIPT LOAD` and a second pipeline.
+const NEXT_ROUND_TRIPS_FIXED: usize = 3;
 
 /// Separator between the entry id and the payload inside a lease handle.
 ///
@@ -1418,8 +1427,10 @@ impl TaskDispatch for RedisDispatch {
         harvest(self.publish_inner(hints).await)
     }
 
-    fn next_round_trips_per_queue(&self) -> usize {
-        NEXT_ROUND_TRIPS_PER_QUEUE
+    fn next_round_trips(&self, queue_count: usize) -> usize {
+        queue_count
+            .saturating_mul(NEXT_ROUND_TRIPS_PER_QUEUE)
+            .saturating_add(NEXT_ROUND_TRIPS_FIXED)
     }
 
     async fn next(
@@ -1852,14 +1863,14 @@ return n
 mod tests {
     use super::*;
 
-    /// A read can visit each queue twice: the initial pass and a lap that
-    /// finishes after the deadline. Either visit can heal a missing group,
-    /// which costs three round trips. The worker's read timeout must cover
-    /// all six (#1756).
+    /// One `next` call can promote, visit each queue twice, requeue a
+    /// surplus and discard malformed entries. The worker's read timeout must
+    /// cover the worst case of all of them (#1756).
     #[test]
-    fn a_read_reports_two_healed_visits_per_queue() {
+    fn a_next_call_reports_its_worst_case_round_trips() {
         assert_eq!(VISIT_ROUND_TRIPS, 3);
-        assert_eq!(NEXT_ROUND_TRIPS_PER_QUEUE, 6);
+        assert_eq!(NEXT_ROUND_TRIPS_PER_QUEUE, 11);
+        assert_eq!(NEXT_ROUND_TRIPS_FIXED, 3);
     }
 
     fn lease(redeliveries: u32) -> DispatchLease {
