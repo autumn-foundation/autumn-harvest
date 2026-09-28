@@ -488,7 +488,10 @@ mod tests {
         let mut event = event_with_output(original.clone());
 
         let refs = off.offload_event_value(&mut event).await.unwrap();
-        assert!(refs.is_empty(), "payload is tiny: nothing should be offloaded");
+        assert!(
+            refs.is_empty(),
+            "payload is tiny: nothing should be offloaded"
+        );
         assert_eq!(
             event["data"]["output"], original,
             "written event still holds the caller's exact business value"
