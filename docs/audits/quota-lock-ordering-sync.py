@@ -232,6 +232,24 @@ FN_SIGNATURE_RE_TEMPLATE = r"\n(?:async )?fn {name}\s*\("
 # `\w` to ASCII under `re.ASCII` or on a `bytes` pattern) already matches
 # against the same Unicode identifier characters Rust does, rather than
 # special-casing each further script this class of finding turns up.
+#
+# Declined (Codex review, issue #1696 follow-up): `\w` does not match a
+# combining mark (e.g. U+0301, category `Mn`), which Rust's `XID_Continue`
+# does include, so a composed-with-combining-mark identifier like
+# `r#ábr"\"}"` still slips past this lookbehind. Closing this exactly
+# needs Rust's actual `XID_Start`/`XID_Continue` grammar — Unicode
+# category classification (`Mn`/`Mc`/`Nd`/`Pc` plus the letter categories,
+# with the standard Derived Core Properties inclusions/exclusions), a
+# different scope of work than swapping a character class, and it would
+# not be the last such gap either. This is the same declared stopping
+# point as the alias-tracking and input-independent-tracking limits
+# documented above: a plain gap in a fix already committed to (ASCII,
+# then `#`, then Unicode letters via `\w`) gets fixed, but a fully
+# spec-correct Unicode identifier matcher is a new frontier, not a
+# continuation of it. The scenario also needs a raw identifier
+# immediately, character-for-character, abutting an unrelated string
+# literal with no separator; neither tracked file contains a macro
+# invocation or a raw identifier at all.
 _RAW_STRING_OPEN_RE = re.compile(r"(?<![\w'#])(?:b|c)?r(#*)\"")
 
 
