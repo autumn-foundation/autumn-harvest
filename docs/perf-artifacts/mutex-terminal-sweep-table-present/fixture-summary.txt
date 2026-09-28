@@ -1,0 +1,40 @@
+Fixture: harvest_ledger_probe
+Built by: applying all 112 migrations under autumn-harvest/migrations/*/up.sql,
+in directory-sort (== timestamp) order, via psql, against a fresh database on
+the local Postgres 16.13 instance (pg_stat_statements loaded via
+shared_preload_libraries, extension created in-database).
+
+No table_present()-relevant fixture data is needed: the statement under test
+(`SELECT to_regclass('harvest_mutex_locks') IS NOT NULL AS present`) is a
+catalog lookup independent of `harvest_mutex_locks` row count. What matters is
+only that the table exists (post-migration schema):
+
+  public | harvest_mutex_locks   | table | postgres
+  public | harvest_mutex_waiters | table | postgres
+
+Four probes were run against this fixture (see docs/performance-mutex-terminal-sweep-table-present.md
+for the full writeup and the review correction that produced probes 3-4):
+
+  1. cold-connection-first-call.explain.txt       -- one fresh connection, one call
+  2. pg_stat_statements.INVALID-separate-connections.txt
+                                                    -- three separate `psql` processes
+                                                       (three cold connections); kept as
+                                                       a labeled negative example, not
+                                                       evidence for this page's conclusion
+  3. same-connection-same-transaction.explain.txt  -- one connection, 3 calls, 1 transaction
+                                                       (matches production: sweep_terminal_
+                                                       holder_and_wake's 3 calls run on one
+                                                       already-open AsyncPgConnection)
+  4. same-connection-new-transactions.explain.txt  -- one connection, 3 calls, 3 transactions
+  pg_stat_statements.same-connection.txt           -- aggregate calls/buffers for probe 3
+
+Reproduce:
+  PGPASSWORD=postgres psql -h localhost -U postgres -c \
+    "CREATE DATABASE harvest_ledger_probe;"
+  cd autumn-harvest/migrations
+  for d in $(ls -d */ | sort); do
+    [ -f "${d}up.sql" ] && PGPASSWORD=postgres psql -h localhost -U postgres \
+      -d harvest_ledger_probe -v ON_ERROR_STOP=1 -f "${d}up.sql"
+  done
+  PGPASSWORD=postgres psql -h localhost -U postgres -d harvest_ledger_probe \
+    -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements;"
