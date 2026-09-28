@@ -231,6 +231,21 @@ pub trait TaskDispatch: Send + Sync + std::fmt::Debug {
     /// Promote due delayed references and recover references held by a
     /// consumer that stopped acking.
     async fn maintain(&self, queues: &[String]) -> HarvestResult<DispatchMaintenance>;
+
+    /// The most sequential round trips that one [`Self::next`] call over
+    /// `queue_count` queues can make outside its `wait`. The default is one
+    /// per queue.
+    ///
+    /// The worker times out a read after `wait` plus one call timeout per
+    /// such round trip. A timeout drops the read future, so an entry the
+    /// read already claimed stays pending until recovery. An implementation
+    /// that makes more round trips must return its real worst case, including
+    /// any work before or after the read itself. The count applies to this
+    /// implementation only, so a stalled channel with the default still
+    /// reaches the worker's timeout quickly (#1756).
+    fn next_round_trips(&self, queue_count: usize) -> usize {
+        queue_count
+    }
 }
 
 /// The installed channel and its settings.
@@ -1917,6 +1932,15 @@ mod tests {
             .expect("read")
             .into_iter()
             .next()
+    }
+
+    /// A channel with no override reports one round trip per queue. The
+    /// worker's read timeout then keeps its old bound (#1756).
+    #[test]
+    fn a_channel_reports_one_read_round_trip_per_queue_by_default() {
+        let channel = MemoryDispatch::new();
+        assert_eq!(channel.next_round_trips(1), 1);
+        assert_eq!(channel.next_round_trips(4), 4);
     }
 
     /// The kind is the `task_type`

@@ -140,6 +140,28 @@ const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// `wait`, regardless of how many queues are configured.
 const QUEUE_BLOCK_SLICE: Duration = Duration::from_millis(200);
 
+/// Round trips one queue visit in `read_across_queues` can need. The common
+/// case is one `XREADGROUP`. A missing consumer group costs three:
+/// `read_with_heal` issues the failed read, then `ensure_groups`, then a
+/// retry read.
+const VISIT_ROUND_TRIPS: usize = 3;
+
+/// Worst-case round trips per queue in one `next` call, outside its wait.
+///
+/// - `promote_queues` can create one consumer group per queue.
+/// - `read_across_queues` visits every queue in its initial pass. A deadline
+///   that passes mid-lap gives each queue a second visit (#1756). Either
+///   visit can heal a group, so each costs [`VISIT_ROUND_TRIPS`].
+/// - `requeue_batch` runs one script per queue for a surplus. A script the
+///   server forgot costs three: `EVALSHA`, `SCRIPT LOAD`, then `EVALSHA`.
+/// - `discard_entries` runs one pipeline per stream with malformed entries.
+const NEXT_ROUND_TRIPS_PER_QUEUE: usize = 1 + 2 * VISIT_ROUND_TRIPS + 3 + 1;
+
+/// Worst-case round trips in one `next` call that do not scale with the
+/// queue count. `promote_queues` runs one pipeline for every queue. A script
+/// the server forgot adds a `SCRIPT LOAD` and a second pipeline.
+const NEXT_ROUND_TRIPS_FIXED: usize = 3;
+
 /// Separator between the entry id and the payload inside a lease handle.
 ///
 /// A stream entry id is `{milliseconds}-{sequence}`, so it never holds this
@@ -826,8 +848,16 @@ impl RedisDispatch {
             // through the rest of the wait budget on the same failure.
             let mut consecutive_errors = 0usize;
             while !any_ready && remaining > 0 {
-                let Some(budget) = deadline.checked_duration_since(Instant::now()) else {
-                    break;
+                // No slice includes the round-trip time. On a slow link, those
+                // round trips can use up the budget before the lap reaches
+                // the tail. A deadline that passes mid-lap therefore finishes
+                // the lap with non-blocking reads. So every queue gets one
+                // look after the initial pass. The wait grows by at most one
+                // round trip per queue left in the lap.
+                let budget = match deadline.checked_duration_since(Instant::now()) {
+                    Some(budget) => budget,
+                    None if !rotation.is_multiple_of(ordered.len()) => Duration::ZERO,
+                    None => break,
                 };
                 // A lone queue leaves `wait` undivided: there is no sibling
                 // to starve, so this stays the original single-call block
@@ -1397,6 +1427,12 @@ impl TaskDispatch for RedisDispatch {
         harvest(self.publish_inner(hints).await)
     }
 
+    fn next_round_trips(&self, queue_count: usize) -> usize {
+        queue_count
+            .saturating_mul(NEXT_ROUND_TRIPS_PER_QUEUE)
+            .saturating_add(NEXT_ROUND_TRIPS_FIXED)
+    }
+
     async fn next(
         &self,
         queues: &[String],
@@ -1826,6 +1862,16 @@ return n
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One `next` call can promote, visit each queue twice, requeue a
+    /// surplus and discard malformed entries. The worker's read timeout must
+    /// cover the worst case of all of them (#1756).
+    #[test]
+    fn a_next_call_reports_its_worst_case_round_trips() {
+        assert_eq!(VISIT_ROUND_TRIPS, 3);
+        assert_eq!(NEXT_ROUND_TRIPS_PER_QUEUE, 11);
+        assert_eq!(NEXT_ROUND_TRIPS_FIXED, 3);
+    }
 
     fn lease(redeliveries: u32) -> DispatchLease {
         DispatchLease {
