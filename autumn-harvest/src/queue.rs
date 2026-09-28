@@ -10495,7 +10495,10 @@ mod tests {
 
         let result = finish_workflow_backoff_requeue(task_id, updated);
 
-        assert!(result.is_ok(), "expected Ok(()) for a matched row: {result:?}");
+        assert!(
+            result.is_ok(),
+            "expected Ok(()) for a matched row: {result:?}"
+        );
     }
 
     #[test]
