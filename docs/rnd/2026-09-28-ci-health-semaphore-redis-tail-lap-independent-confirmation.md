@@ -30,9 +30,18 @@ on 2026-09-27. Clustering by signature:
 | 36340435284 | 18:22 | Lint | `sqlite_feasibility_docs::every_inventoried_module_records_the_mechanisms_grep_finds` + `mechanism_counts_quoted_in_the_report_are_current` — same doc-drift class |
 | 36342698704 | 18:59 | (none — `get_job_logs` reports 0 failed jobs for a run whose top-level conclusion is `failure`) | not investigated further this session |
 
-Two signatures, three defect classes. The `sqlite_feasibility_docs` failures
-are the same "hand-copied number races a concurrent merge" class already
-chronicled for `shard-weight-drift.py`'s self-test
+Three identified signatures across three defect classes — the
+`dispatch_redis` flake this report targets, the `cross_region_dr_tests` FK
+violation (already fixed by #1753, listed here only because it pre-dates
+that fix's 21:35 merge), and the `sqlite_feasibility_docs` doc-drift family
+(two different assertions in the two Lint rows, same underlying class) —
+plus one run (36342698704) left uninvestigated this session:
+`get_job_logs` reports 0 failed jobs for it despite a top-level `failure`
+conclusion, and this report does not chase that discrepancy down.
+
+The `sqlite_feasibility_docs` failures are the same "hand-copied number
+races a concurrent merge" class already chronicled for
+`shard-weight-drift.py`'s self-test
 (`docs/rnd/2026-09-27-...-harness-refresh.md`) — a report-only doc-audit
 test correctly catching that its snapshot went stale between the PR's base
 and `trunk-dev`'s moving head, not a flake in the CI-health sense (rerunning
@@ -47,9 +56,15 @@ Checking this session's own sample against that: run 36347109249 is
 this report's independent scan corroborates PR #1756's own two occurrences
 rather than adding a third, distinct PR. That is weaker than "three
 unrelated PRs" would have been, but the two occurrences PR #1756 already
-cites are themselves enough to place the trigger in CI-runner load rather
-than in PR #1715's UI-only diff: the same non-Redis-touching PR cannot be
-the cause of a Redis-dispatch race repeating across separate CI attempts.
+cites are themselves enough to rule out PR #1715's UI-only diff as the
+cause: the same non-Redis-touching PR cannot be why a Redis-dispatch race
+repeats across separate CI attempts of it. That only isolates the trigger
+to something outside the diff — nondeterministic round-trip timing, per
+the Diagnosis below — not specifically to CI-runner load. This report's
+own local reproduction (Measurement, below) found the same failure on a
+bare, non-deliberately-loaded Redis, which cuts against "load" as the
+precise mechanism even though it doesn't change the test-vs-product
+verdict.
 
 ## 🔍 Diagnosis
 
