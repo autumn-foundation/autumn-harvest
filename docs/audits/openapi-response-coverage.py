@@ -3053,13 +3053,19 @@ def duplicate_params(method: str, path: str, route: dict) -> list[str]:
     ]
 
 
+# An extractor that reads the raw query string or the whole request, so the
+# keys it accepts are not typed. `Query<T>` is not one.
+RAW_QUERY_READER = re.compile(r"\b(?:RawQuery|Uri|OriginalUri|Request|Parts)\b")
+
+
 def query_struct_findings(
     method: str, path: str, route: dict, queries: list[tuple[str, str, bool]]
 ) -> list[str]:
     """Check 6: the `Query<T>` structs and the route's query parameters agree.
 
-    Each extractor reads the whole query string, so a key that several structs
-    accept is judged once for the route. It is mandatory when any extractor
+    It runs for every served route, so a route with no `Query<T>` accepts no
+    documented query key. Each extractor reads the whole query string, so a
+    key that several structs accept is judged once for the route. It is mandatory when any extractor
     that is not wrapped requires it. Its OpenAPI type must be the same in every
     struct, or the key is a finding.
     """
@@ -3124,8 +3130,9 @@ def query_struct_findings(
                 where % field + " is optional in %s but the contract marks it required" % owners
             )
     owners = " or ".join(name for name, _, _ in queries)
+    readers = "%s does not accept it" % owners if owners else "no extractor of the route accepts it"
     for key in documented.keys() - accepted:
-        found.append(where % key + " is documented but %s does not accept it" % owners)
+        found.append(where % key + " is documented but " + readers)
     return found
 
 
@@ -3737,6 +3744,7 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
                     "  %s %s: cannot tell which `%s` a glob import brings" % (method, path, name)
                 )
         queries: list[tuple[str, str, bool]] = []
+        unread_queries = len(unresolved)
         for query in QUERY_EXTRACTOR.finditer(params):
             reference = query.group(1)
             name = reference.split("::")[-1]
@@ -3759,7 +3767,12 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
                 queries.append((name, struct, wrapped))
         if len(re.findall(r"(?<![\w:])Query<", params)) > len(QUERY_EXTRACTOR.findall(params)):
             unresolved.append("  %s %s: cannot read a `Query<..>` extractor" % (method, path))
-        if queries:
+        # Every served route is checked, with or without a `Query<T>`, so a
+        # documented key that no extractor reads is a finding. A route whose
+        # query the audit cannot read whole is left to its own finding: an
+        # unresolved `Query<T>`, or a raw reader that check 4 or no check reads.
+        unread_queries = len(unresolved) > unread_queries
+        if not unread_queries and not RAW_QUERY_READER.search(params):
             typed_query += query_struct_findings(method, path, route, queries)
 
         # A bare `Json<T>` means the body is mandatory. `Result<Json<T>, _>` is
@@ -4308,6 +4321,9 @@ pub fn harvest_api_router() -> Router {
         .route("/s/std-paths", get(s_std_paths))
         .route("/s/spoofed-query", get(s_spoofed_query))
         .route("/s/std-alias-field", get(s_std_alias_field))
+        .route("/s/no-query/{id}", get(s_no_query))
+        .route("/s/raw-query", get(s_raw_query))
+        .route("/s/unread-query", get(s_unread_query))
         .route("/s/std-option-param", post(s_std_option_param))
         .route("/s/std-alias-param", post(s_std_alias_param))
         .route("/s/spoofed-json", post(s_spoofed_json))
@@ -4344,6 +4360,18 @@ mod local_option {
 }
 
 async fn s_std_paths(Query(page): Query<local_option::StdPathsPage>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn s_no_query(Path(id): Path<String>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn s_raw_query(axum::extract::RawQuery(raw): axum::extract::RawQuery) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn s_unread_query(Query(page): Query<MissingPage>) -> Response {
     StatusCode::OK.into_response()
 }
 
@@ -9253,6 +9281,33 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             )
         ],
         {},
+    ),
+    (
+        "a documented query key needs an extractor that reads it, on every served route",
+        FIXTURE_ALIAS_SCOPES,
+        [
+            fixture_route(
+                "GET",
+                "/s/no-query/{id}",
+                200,
+                params=[
+                    {"name": "id", "in": "path", "type": "string", "required": True},
+                    query_param("limit", "integer", False),
+                ],
+            ),
+            fixture_route(
+                "GET", "/s/raw-query", 200, params=[query_param("limit", "integer", False)]
+            ),
+            fixture_route(
+                "GET", "/s/unread-query", 200, params=[query_param("limit", "integer", False)]
+            ),
+        ],
+        {
+            "query_params": [
+                "GET /s/no-query/{id}: `limit` is documented but no extractor of the route"
+            ],
+            "unresolved": ["GET /s/unread-query: cannot find struct MissingPage"],
+        },
     ),
     (
         "an aliased import of a standard type is that type, in a field and in a parameter",
