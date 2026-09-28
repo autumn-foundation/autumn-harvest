@@ -159,6 +159,9 @@ undersells how little it takes.
 redis-server --daemonize yes --port 6399 --save "" --appendonly no
 export HARVEST_REDIS_TEST_URL=redis://127.0.0.1:6399
 
+# Save the starting ref so the detached-HEAD checkouts below can be undone.
+starting_ref=$(git symbolic-ref --short -q HEAD || git rev-parse HEAD)
+
 # Before (trunk-dev tip, PR #1756 absent):
 git checkout 7906f22ea00cf0a5fd8f40340362473e6130a479
 cargo build -p autumn-harvest-redis --test dispatch_redis
@@ -180,6 +183,9 @@ for i in $(seq 1 50); do
     -- --exact --test-threads=1
 done   # -> 50/50 pass
 git checkout -- autumn-harvest-redis/src/dispatch.rs
+
+# Return to the ref this recipe started from (it left HEAD detached twice above).
+git checkout "$starting_ref"
 ```
 
 ```python
