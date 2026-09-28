@@ -607,7 +607,8 @@ pub fn spawn_quota_key_reconciler_for_shard(
     batch_size: i64,
     shard: Option<crate::types::ShardId>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    // Keep the worker dispatch binding for hints (issue #1431).
+    crate::dispatch::spawn_bound(async move {
         if batch_size <= 0 {
             return;
         }

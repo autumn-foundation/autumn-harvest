@@ -1470,7 +1470,7 @@ pub async fn resume_queue(
         // Only a deployment with a channel needs the thawed ids. Without one
         // the collector stays empty, so a resume of a large backlog does not
         // hold a second copy of every id it shifted.
-        if crate::dispatch::is_installed() {
+        if crate::dispatch::hints_wanted() {
             collector
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
