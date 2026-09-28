@@ -1060,14 +1060,25 @@ async fn main() {
          slots, {POOL_SIZE} connections, {WORKER_POLL_MS} ms poll.\n"
     );
 
-    // Reset the database, unconditionally, before probing it. On a clean
-    // host `database_url`'s target does not exist yet, so connecting to it
-    // would panic before any repetition ever calls `reset_database` itself.
-    // Resetting here first also means the probe below reads the freshly
-    // recreated database's own effective settings. It cannot read a stale
-    // per-database override an earlier, now-dropped copy might have
-    // carried. Found by a sixth round of Codex review on PR #1761.
-    reset_database(&settings).await;
+    // Create the database only if it does not already exist yet, before
+    // probing it — not unconditionally. On a clean host `database_url`'s
+    // target does not exist. Connecting to it would then panic before any
+    // repetition ever calls `reset_database` itself, so that case still
+    // needs a reset here. On every real measurement run in this report,
+    // though, the database already exists, untouched since the previous
+    // invocation. An unconditional reset here would drop and recreate it a
+    // second, untimed time, immediately before rep 0's own reset. That is
+    // exactly the recreation cost this assay measures, run once extra and
+    // unmeasured. It could warm template or catalog filesystem state the
+    // timed recreation would otherwise have hit cold. Found by a seventh
+    // round of Codex review on PR #1761, catching a defect introduced by
+    // the sixth round's own fix.
+    if <AsyncPgConnection as AsyncConnection>::establish(&settings.database_url)
+        .await
+        .is_err()
+    {
+        reset_database(&settings).await;
+    }
 
     // Read from `database_url`, the workload connection, not `admin_url`.
     // `synchronous_commit` can be set per database, so the admin connection
