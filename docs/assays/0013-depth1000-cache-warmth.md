@@ -1,25 +1,26 @@
-# ⛏️ Prospect: does per-rep database recreation drive the depth-1000 postgres variance? (undetermined: 8.0% warm CV, cold no longer reproduces ledger #12 at 7.4%)
+# ⛏️ Prospect: does per-rep database recreation drive the depth-1000 postgres variance? (undetermined — the apparatus cannot test it at this depth)
 
-> Status: **measured, corrected three times — final verdict undetermined.**
-> The pre-registration lives in
+> Status: **measured, corrected across five review rounds — final verdict
+> undetermined, and not fixable by a sixth.** The pre-registration lives in
 > [`docs/rnd/2026-09-28-depth1000-cache-warmth-preregistration.md`](../rnd/2026-09-28-depth1000-cache-warmth-preregistration.md)
 > and was committed (`8766957`) before any warm-condition measurement was
-> taken. Nothing in it has been edited since. This report went through
-> three rounds of Codex review, each catching a real defect in the
-> apparatus, and each one **changed the actual verdict**: KILL →
-> [erratum 1](#erratum-1-the-first-warm-run-did-not-test-the-hypothesis) →
-> PURSUE →
-> [erratum 2](#erratum-2-plain-vacuum-also-failed-to-preserve-what-it-claimed-to)
-> → **UNDETERMINED**. The numbers, Apparatus, Assay, and Verdict sections
-> below reflect that final, fully-corrected state. Reading only this
-> report's current sections without the errata would miss the most
-> important thing it has to say: **the apparatus's own history is evidence
-> that this kind of assay is easy to get wrong in a way that looks clean.**
-> A fourth review round found two further reproducibility gaps (a default
-> arm set that would panic on an unstarted Redis, a missing guard against
-> grading a noncanonical seeded input) — both fixed, neither changing a
-> reported number, since every run in this report always set the relevant
-> environment variables explicitly.
+> taken. Nothing in it has been edited since. Every round below is Codex
+> review on PR #1761. Two rounds caught defects that changed the verdict:
+> round 1 found the original "warm" condition never tested the hypothesis
+> ([erratum 1](#erratum-1-the-first-warm-run-did-not-test-the-hypothesis),
+> withdrew a KILL); round 3 found the replacement fix was also broken
+> ([erratum 2](#erratum-2-plain-vacuum-also-failed-to-preserve-what-it-claimed-to),
+> withdrew a PURSUE). Rounds 2 and 4 caught reproducibility gaps (wrong
+> defaults, missing validity guards) that never changed a reported number,
+> because every run in this report always set the relevant environment
+> variables explicitly. **Round 5 found something no further patch can
+> fix**: this apparatus's warm/cold toggle, at this backlog depth, was
+> never capable of testing genuine cache coldness at all — see
+> [erratum 3](#erratum-3-the-fix-for-erratum-2-cannot-cleanly-test-the-original-hypothesis-either).
+> Reading only this report's current sections without the errata would
+> miss the most important thing it has to say: **the apparatus's own
+> history is evidence that this kind of assay is easy to get wrong in a
+> way that looks clean, all the way down to its own foundations.**
 
 ## 🎯 Question
 
@@ -159,7 +160,58 @@ moved from the withdrawn 34.2% to **7.4%** — an order-of-magnitude drop,
 and it means the same-host control **no longer reproduces ledger #12's
 spread at all**. The cold mean (20.29) is now *higher* than the warm mean
 (18.81), the opposite of every previous version of this report. See
-[verdict](#-verdict) for what this means and what it doesn't.
+[erratum 3](#erratum-3-the-fix-for-erratum-2-cannot-cleanly-test-the-original-hypothesis-either)
+and [verdict](#-verdict) for what this means and what it doesn't.
+
+## ⚠️ Erratum 3: the fix for erratum 2 cannot cleanly test the original hypothesis either
+
+A fourth round of Codex review, on the commit containing both fixes above,
+raised a deeper problem with the fix itself, not a new bug in its code.
+
+`ANALYZE`'s block-sampling algorithm targets `300 * default_statistics_target`
+sample rows — 30,000 at this server's default. The seeded backlog holds
+1,000 rows. Since the target sample size is far larger than the table,
+`ANALYZE` does not sample: it reads every page. At this depth, that means
+the `ANALYZE` erratum 2 added — right after seeding, immediately before
+the timed portion of each repetition — necessarily pulls the entire
+just-seeded table into Postgres's shared buffers, **in both conditions**,
+a few milliseconds before the clock starts.
+
+That is a real problem for this assay's own question, but on reflection it
+is not a new one introduced by `ANALYZE` — it was already true. Seeding
+writes the 1,000 rows through the buffer manager regardless of whether
+`ANALYZE` runs afterward: a freshly inserted row's page is resident in
+shared buffers the moment the `INSERT` commits, in *every* version of this
+apparatus, including ledger #12's own original one and this report's two
+earlier (withdrawn) versions. **The claim query's own working set — the
+backlog rows a claim actually reads — was never capable of being "cold" at
+the moment timing starts, in any version of this assay, because seeding it
+is what makes it warm.** `ANALYZE`'s full scan only makes the same
+already-true fact more obviously true, and only for the exact rows the
+seed step just wrote.
+
+This reframes, rather than reopens, ledger #12's own hypothesis. "Cold
+buffer-cache/page-cache effect ... specific to whichever repetition runs
+first against a freshly recreated database" cannot mean the backlog rows
+themselves, in an apparatus shaped like this one, at a depth this small —
+those are warmed by construction. What a fresh `CREATE DATABASE` can
+still make genuinely cold, and what `DELETE`+`VACUUM (TRUNCATE FALSE)`
+still avoids, is the *surrounding* state: `CREATE DATABASE`'s template-copy
+I/O, and catalog pages and cache entries for OIDs no prior repetition has
+ever touched. Erratum 2's own finding — that fixing planner statistics
+alone collapsed most of the variance — says that surrounding-state cost
+was never the dominant term at this depth either, at least not on this
+host. Building an apparatus that can isolate genuine backlog-row cache
+coldness would need to either evict Postgres's shared buffers for those
+specific pages between seeding and timing (no such primitive is available
+from a normal client connection; the closest is a full server restart,
+which is not attempted here) or run at a depth deep enough that the
+backlog's own working set exceeds `shared_buffers` (128 MB here, roughly
+16,000 8 KB pages — comfortably larger than this assay's ~150-page tables,
+so depth 1000 cannot exceed it; a depth on the order of 100,000+ rows
+might). Neither is a small change to this apparatus, and neither is
+attempted here — per this repo's own re-charter discipline, that is a
+separately-chartered next assay, not another patch to this one.
 
 ## 📐 Assay
 
@@ -215,19 +267,46 @@ run-to-run noise at n=6, and treating a discovery made mid-assay as
 already-confirmed is exactly the goalpost-moving this repo's own
 discipline rules out.
 
-**Open, un-chartered pits named here**, in priority order: (1) **the
-`ANALYZE`-after-seed hypothesis itself** — does adding it to the existing
-drop/recreate apparatus, alone, with no warm/cold change at all, collapse
-ledger #12's original variance the same way it did here? This is now the
-highest-value, cheapest next pit: it needs only a one-line change to
-`0010-cross-mode-throughput` and no new apparatus. (2) Whether the
-cold-now-faster-than-warm reversal here is real or an n=6 artifact — a
-higher-repetition rerun of both conditions, together, would settle it.
-(3) Whatever now produces each condition's one-outlier-of-six pattern is
-unexplained by anything measured in this report. (4) The original
-depth-1000 knee question (ledger #12's own third pit) remains open, and
-now looks like it needs an `ANALYZE`-corrected apparatus before any of
-this assay's numbers, or #12's, can be trusted for it.
+**A fourth review round, per
+[erratum 3](#erratum-3-the-fix-for-erratum-2-cannot-cleanly-test-the-original-hypothesis-either),
+found something more fundamental than a threshold miss: this apparatus,
+at this depth, was never capable of testing genuine backlog-row cache
+coldness at all**, in any of its four versions. Seeding necessarily warms
+the exact rows a claim query reads, through Postgres's ordinary buffer
+manager, independent of `DROP DATABASE`/`CREATE DATABASE` versus
+`DELETE`+`VACUUM`. `ANALYZE`'s own full-table scan (unavoidable once the
+table is smaller than the sampling target) only makes that pre-existing
+fact impossible to miss. So this assay's undetermined verdict is not "not
+enough evidence yet" in the usual sense — it is "this specific
+manipulation cannot move the variable ledger #12's hypothesis names,
+because the seed step moves it first, the same way, regardless of which
+condition runs." A same-host rerun with a larger n, or a rerun at a
+different depth using this same drop/recreate-vs-reuse toggle, would not
+fix that; the toggle itself is not wired to backlog-row cache state at
+this table size.
+
+**Open, un-chartered pits named here**, in priority order: (1) **whether
+genuine backlog-row cache coldness affects claim throughput at all** —
+untestable by this apparatus's toggle; would need either a buffer-eviction
+primitive between seeding and timing, or a depth large enough (roughly
+100,000+ rows, estimated from `shared_buffers = 128 MB` against this
+table's own per-1,000-row page count) that the backlog's working set
+exceeds the buffer pool regardless of eviction. This is now the
+highest-priority pit, and a materially different, larger undertaking than
+this assay. (2) **The `ANALYZE`-after-seed hypothesis** — does adding it
+alone to the existing (unmodified) drop/recreate apparatus, with no
+warm/cold change, collapse ledger #12's original variance the same way it
+did here? Cheaper than (1): a one-line change to
+`0010-cross-mode-throughput`, no new apparatus, and it would settle
+whether *surrounding* database-level state (catalog, template-copy cost —
+see erratum 3) rather than backlog-row caching is what ledger #12 actually
+measured. (3) Whether the cold-now-faster-than-warm reversal in this run
+is real or an n=6 artifact. (4) Whatever produces each condition's
+one-outlier-of-six pattern is unexplained by anything measured here. (5)
+The original depth-1000 knee question (ledger #12's own third pit)
+remains open, and now looks like it needs pit (1) resolved, not just an
+`ANALYZE`-corrected apparatus, before any number here or in #12 can be
+trusted for it.
 
 ## 🔬 Reproduce
 

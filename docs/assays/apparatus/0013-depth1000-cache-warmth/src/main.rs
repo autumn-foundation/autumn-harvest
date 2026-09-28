@@ -1060,18 +1060,22 @@ async fn main() {
          slots, {POOL_SIZE} connections, {WORKER_POLL_MS} ms poll.\n"
     );
 
-    {
-        let mut conn = connect(&settings.admin_url).await;
-        println!(
-            "Postgres durability this run: `fsync = {}`, `synchronous_commit = {}`.",
-            pg_setting(&mut conn, "fsync").await,
-            pg_setting(&mut conn, "synchronous_commit").await
-        );
+    // Read from `database_url`, the workload connection, not `admin_url`.
+    // `synchronous_commit` can be set per database, so the admin connection
+    // (to the `postgres` database) need not match what the timed workload
+    // actually runs under. Found by a fourth round of Codex review on
+    // PR #1761.
+    let (fsync, synchronous_commit) = {
+        let mut conn = connect(&settings.database_url).await;
+        let fsync = pg_setting(&mut conn, "fsync").await;
+        let synchronous_commit = pg_setting(&mut conn, "synchronous_commit").await;
+        println!("Postgres durability this run: `fsync = {fsync}`, `synchronous_commit = {synchronous_commit}`.");
         println!(
             "Embedded durability is fixed at `journal_mode = WAL`, `synchronous = FULL`, \
              which fsyncs on every commit and cannot be turned off by a caller.\n"
         );
-    }
+        (fsync, synchronous_commit)
+    };
 
     let mut summary: Vec<(Arm, Vec<f64>, bool)> = Vec::new();
 
@@ -1153,6 +1157,20 @@ async fn main() {
     // assay #13's verdict against it. Compared on the parsed value,
     // not the raw text, since `{ }` and `{}` are the same workload. Found
     // by a third round of Codex review on PR #1761.
+    // Refuse to grade an unregistered durability setting the same way.
+    // Every prior number in this report ran under `fsync=off`,
+    // `synchronous_commit=off`. A server left at ordinary defaults changes
+    // both throughput and variance. This section would otherwise still
+    // print a verdict against lines measured under the other setting.
+    // Found by a fourth round of Codex review on PR #1761.
+    if fsync != "off" || synchronous_commit != "off" {
+        println!(
+            "* **Not graded.** `fsync = {fsync}`, `synchronous_commit = {synchronous_commit}` \
+             on the workload connection, not the pre-registered `off`/`off`. Assay #13's lines \
+             apply only to that durability setting."
+        );
+        return;
+    }
     let canonical_input: serde_json::Value =
         serde_json::from_str(INPUT_JSON).expect("the canonical input should parse");
     if workflow_input(&settings) != canonical_input {
