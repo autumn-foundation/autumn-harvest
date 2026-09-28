@@ -788,9 +788,11 @@ Three properties worth knowing:
   the earliest records at or after the instant. The response then sets
   `window_truncated` to `true` (issue #1508). Retention records the latest
   `occurred_at` it purges in `harvest_audit_purge_watermark`, and the redrive
-  compares that value with the instant. The flag proves a loss. It does not
-  count the lost records. When every matching record is gone, the `400`
-  refusal names the loss too. `to_seq` does not need the flag: it names an
+  compares that value with the instant. The flag shows that a record at or
+  after the instant is gone. It does not count the lost records. Shards that
+  share a database share one watermark, so the flag can be `true` for a shard
+  that lost nothing. Purges before the upgrade left no trace. A refused
+  `before` request (`400`) names the loss too when the flag is set. `to_seq` does not need the flag: it names an
   exact position, so `already_purged_records` is exact for it.
 - **The redrive is itself audited** (`audit_export.redrive`), so re-exporting is
   as auditable as the operations being exported. The rewind and its audit

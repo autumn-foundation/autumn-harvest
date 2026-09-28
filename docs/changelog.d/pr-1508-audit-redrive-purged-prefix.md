@@ -20,10 +20,13 @@ Fix: a persisted purge watermark.
   for a `before` request when the watermark is at or after the instant. It is
   `false` for `to_seq` (already exact) and for `NotConfigured`.
 - The redrive response gains `window_truncated`. The `audit_export.redrive`
-  audit detail and the `400` refusal name the loss.
+  audit detail and the `400` refusal name the loss when the flag is set.
 
-The flag proves a loss. It does not count the lost records: no surviving
-row holds that number. The redrive still runs when the flag is set, since the
+The flag shows that a record at or after the instant is gone. It does not
+count them: no surviving row holds that number. The table is database-wide,
+like the `before` resolver, so shards that share a database share it and the
+flag can be `true` for a shard that lost nothing. A purge that commits after
+the check is not seen. Purges before the upgrade left no trace. The redrive still runs when the flag is set, since the
 surviving records are real and `to_seq` remains available.
 
 The watermark is a new table, not a cursor column. Retention takes no

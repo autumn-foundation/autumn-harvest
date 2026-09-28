@@ -2082,12 +2082,17 @@ pub async fn redrive_recovery_counts(
 /// `occurred_at` it purged in `harvest_audit_purge_watermark`. The window is
 /// truncated when that value is at or after the requested instant.
 ///
+/// The watermark is database-wide, like the `Before` resolver. Shards that
+/// share a database share it, so the flag can be `true` for a shard that
+/// lost nothing. A purge that commits after this check is not seen. A purge
+/// from before the migration left no trace.
+///
 /// Always `false` for [`RewindRequest::Seq`]: `to` there is the operator's own
 /// number, so `already_purged_records` is exact. Always `false` for
 /// [`RewindOutcome::NotConfigured`], which has no window.
 ///
-/// The count of lost records is unknown. The watermark proves a loss and
-/// does not measure it.
+/// The watermark shows that a record at or after the instant is gone. It does
+/// not show where that record sat in the window, and it does not count them.
 ///
 /// # Errors
 /// Returns `HarvestError` on a database failure.

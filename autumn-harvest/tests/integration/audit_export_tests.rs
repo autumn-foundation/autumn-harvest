@@ -1166,6 +1166,128 @@ async fn purging_unsequenced_records_leaves_no_watermark() {
     assert!(!window_truncated(&mut conn, request, outcome).await);
 }
 
+async fn watermark_row(
+    conn: &mut diesel_async::AsyncPgConnection,
+) -> Vec<(chrono::DateTime<chrono::Utc>, i64)> {
+    use autumn_harvest::schema::harvest_audit_purge_watermark::dsl as mark;
+    mark::harvest_audit_purge_watermark
+        .select((mark::max_purged_occurred_at, mark::purged_records))
+        .load(conn)
+        .await
+        .expect("watermark rows")
+}
+
+#[tokio::test]
+async fn one_purge_records_the_latest_occurred_at_it_removed() {
+    let _guard = TEST_SERIAL.lock().await;
+    let (mut conn, _c) = make_conn().await;
+    export_all(&mut conn, 3).await;
+    age_rows(&mut conn, 0, 1, 400).await;
+    age_rows(&mut conn, 1, 2, 100).await;
+    purge_old_audit_records(&mut conn, 90, false, &[0], &[])
+        .await
+        .expect("purge");
+
+    let rows = watermark_row(&mut conn).await;
+    assert_eq!(rows.len(), 1, "the table holds one row");
+    let expected = chrono::Utc::now() - chrono::Duration::days(100);
+    assert!(
+        (rows[0].0 - expected).num_seconds().abs() < 60,
+        "the watermark is the LATEST purged instant, not the earliest"
+    );
+    assert_eq!(rows[0].1, 2);
+}
+
+#[tokio::test]
+async fn purged_records_accumulate_in_the_single_watermark_row() {
+    let _guard = TEST_SERIAL.lock().await;
+    let (mut conn, _c) = make_conn().await;
+    export_all(&mut conn, 4).await;
+    age_rows(&mut conn, 0, 2, 100).await;
+    purge_old_audit_records(&mut conn, 90, false, &[0], &[])
+        .await
+        .expect("first purge");
+    age_rows(&mut conn, 2, 3, 200).await;
+    purge_old_audit_records(&mut conn, 90, false, &[0], &[])
+        .await
+        .expect("second purge");
+    assert_eq!(watermark_row(&mut conn).await[..].len(), 1);
+    assert_eq!(watermark_row(&mut conn).await[0].1, 3);
+}
+
+#[tokio::test]
+async fn a_purge_with_nothing_eligible_returns_zero_and_writes_no_watermark() {
+    let _guard = TEST_SERIAL.lock().await;
+    let (mut conn, _c) = make_conn().await;
+    export_all(&mut conn, 2).await;
+    let deleted = purge_old_audit_records(&mut conn, 90, false, &[0], &[])
+        .await
+        .expect("purge");
+    assert_eq!(deleted, 0);
+    assert!(watermark_row(&mut conn).await.is_empty());
+}
+
+#[tokio::test]
+async fn the_flag_includes_the_exact_watermark_instant() {
+    let _guard = TEST_SERIAL.lock().await;
+    let (mut conn, _c) = make_conn().await;
+    export_all(&mut conn, 2).await;
+    let t = chrono::Utc::now() - chrono::Duration::days(365);
+    let t = chrono::DateTime::from_timestamp_micros(t.timestamp_micros()).expect("instant");
+    diesel::update(harvest_audit_log::table.filter(harvest_audit_log::export_seq.eq(1)))
+        .set(harvest_audit_log::occurred_at.eq(t))
+        .execute(&mut conn)
+        .await
+        .expect("age row");
+    purge_old_audit_records(&mut conn, 90, false, &[0], &[])
+        .await
+        .expect("purge");
+
+    let outcome = RewindOutcome::Rewound { from: 2, to: 1 };
+    assert!(window_truncated(&mut conn, RewindRequest::Before(t), outcome).await);
+    let later = t + chrono::Duration::microseconds(1);
+    assert!(!window_truncated(&mut conn, RewindRequest::Before(later), outcome).await);
+}
+
+#[tokio::test]
+async fn a_record_the_purge_spares_never_moves_the_watermark() {
+    let _guard = TEST_SERIAL.lock().await;
+    let (mut conn, _c) = make_conn().await;
+    export_all(&mut conn, 2).await;
+    // Record 1 is a lifecycle record, which retention never purges.
+    diesel::update(harvest_audit_log::table.filter(harvest_audit_log::export_seq.eq(1)))
+        .set((
+            harvest_audit_log::operation.eq(audit::OP_AUDIT_EXPORT_DECOMMISSION),
+            harvest_audit_log::occurred_at.eq(chrono::Utc::now() - chrono::Duration::days(300)),
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("mark lifecycle row");
+    age_rows(&mut conn, 1, 2, 365).await;
+    let deleted = purge_old_audit_records(&mut conn, 90, false, &[0], &[])
+        .await
+        .expect("purge");
+    assert_eq!(deleted, 1, "only record 2 goes");
+
+    // Record 1 sits at 300 days. The purged record 2 sits at 365 days.
+    let request = RewindRequest::Before(chrono::Utc::now() - chrono::Duration::days(330));
+    let outcome = RewindOutcome::Rewound { from: 2, to: 0 };
+    assert!(!window_truncated(&mut conn, request, outcome).await);
+}
+
+#[tokio::test]
+async fn an_unconfigured_shard_is_never_flagged() {
+    let _guard = TEST_SERIAL.lock().await;
+    let (mut conn, _c) = make_conn().await;
+    export_all(&mut conn, 2).await;
+    age_rows(&mut conn, 0, 2, 365).await;
+    purge_old_audit_records(&mut conn, 90, false, &[0], &[])
+        .await
+        .expect("purge");
+    let request = RewindRequest::Before(chrono::Utc::now() - chrono::Duration::days(400));
+    assert!(!window_truncated(&mut conn, request, RewindOutcome::NotConfigured).await);
+}
+
 // ── AC5/AC7: metrics and status ──────────────────────────────────────────────
 
 #[tokio::test]
