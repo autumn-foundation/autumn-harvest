@@ -1060,43 +1060,6 @@ async fn main() {
          slots, {POOL_SIZE} connections, {WORKER_POLL_MS} ms poll.\n"
     );
 
-    // Create the database only if it does not already exist yet, before
-    // probing it — not unconditionally. On a clean host `database_url`'s
-    // target does not exist. Connecting to it would then panic before any
-    // repetition ever calls `reset_database` itself, so that case still
-    // needs a reset here. On every real measurement run in this report,
-    // though, the database already exists, untouched since the previous
-    // invocation. An unconditional reset here would drop and recreate it a
-    // second, untimed time, immediately before rep 0's own reset. That is
-    // exactly the recreation cost this assay measures, run once extra and
-    // unmeasured. It could warm template or catalog filesystem state the
-    // timed recreation would otherwise have hit cold. Found by a seventh
-    // round of Codex review on PR #1761, catching a defect introduced by
-    // the sixth round's own fix.
-    if <AsyncPgConnection as AsyncConnection>::establish(&settings.database_url)
-        .await
-        .is_err()
-    {
-        reset_database(&settings).await;
-    }
-
-    // Read from `database_url`, the workload connection, not `admin_url`.
-    // `synchronous_commit` can be set per database, so the admin connection
-    // (to the `postgres` database) need not match what the timed workload
-    // actually runs under. Found by a fifth round of Codex review on
-    // PR #1761.
-    let (fsync, synchronous_commit) = {
-        let mut conn = connect(&settings.database_url).await;
-        let fsync = pg_setting(&mut conn, "fsync").await;
-        let synchronous_commit = pg_setting(&mut conn, "synchronous_commit").await;
-        println!("Postgres durability this run: `fsync = {fsync}`, `synchronous_commit = {synchronous_commit}`.");
-        println!(
-            "Embedded durability is fixed at `journal_mode = WAL`, `synchronous = FULL`, \
-             which fsyncs on every commit and cannot be turned off by a caller.\n"
-        );
-        (fsync, synchronous_commit)
-    };
-
     let mut summary: Vec<(Arm, Vec<f64>, bool)> = Vec::new();
 
     for arm in settings.arms.clone() {
@@ -1142,6 +1105,32 @@ async fn main() {
         );
         summary.push((arm, rates, all_correct));
     }
+
+    // Probe durability now, after every repetition of every arm has run.
+    // Do not probe before any of them. The `postgres` arm always resets
+    // the database at least once: every cold repetition, and warm's rep
+    // 0. So whatever `database_url` reflects at this point is the
+    // database's final state, after its last reset. That is exactly what
+    // the *last* timed repetition actually ran under. `fsync` and
+    // `synchronous_commit` are process-lifetime cluster settings here.
+    // Only `postgresql.conf` backs them. Nothing in this apparatus issues
+    // a per-database `ALTER DATABASE ... SET`. So the last repetition's
+    // setting is every repetition's setting. A probe taken *before* the
+    // loop cannot make that guarantee, reset first or not: a cold
+    // repetition drops and recreates the very database being probed.
+    // Found by an eighth round of Codex review on PR #1761. Two earlier
+    // attempts at a pre-loop probe each left a version of this same gap.
+    let (fsync, synchronous_commit) = {
+        let mut conn = connect(&settings.database_url).await;
+        let fsync = pg_setting(&mut conn, "fsync").await;
+        let synchronous_commit = pg_setting(&mut conn, "synchronous_commit").await;
+        println!("Postgres durability this run: `fsync = {fsync}`, `synchronous_commit = {synchronous_commit}`.");
+        println!(
+            "Embedded durability is fixed at `journal_mode = WAL`, `synchronous = FULL`, \
+             which fsyncs on every commit and cannot be turned off by a caller.\n"
+        );
+        (fsync, synchronous_commit)
+    };
 
     println!("## summary\n");
     println!("| arm | mean workflows/sec | valid reps | correctness |");
