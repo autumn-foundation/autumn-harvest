@@ -34,17 +34,23 @@ only a body the contract marks `free_form`. A present `Option<Json<T>>` body is
 parsed strictly, so check 2 reads its mandatory fields. An empty field list on
 any other body is checked.
 
-A handler can also take the raw `Bytes` and call `serde_json::from_slice`
-itself. An import alias, such as `use serde_json::from_slice as decode;`, is
-read too. Every scan reads the source after `resolve_aliases`. It reads each
-`use .. as ..` and `type` alias of `Query`, `Json`, `Bytes` or `from_slice`
-in its scope, and reports a type alias it cannot read. Checks 2, 3 and 5 read that parse when it reads a parameter of type
+A handler can also take the raw `Bytes` and parse it itself with one of
+`SERDE_PARSERS`, `serde_json::from_slice` or `serde_json::from_str`. An
+import alias, such as `use serde_json::from_slice as decode;`, is read too.
+Every scan reads the source after `resolve_aliases`. It reads each `use .. as
+..` and `type` alias of `Query`, `Json`, `Bytes` or a parser in its scope,
+and reports a type alias it cannot read. Any other serde_json call that gets
+the body, such as `from_reader`, fails closed. A standard conversion of the
+whole body, such as `std::str::from_utf8(&body)` or
+`String::from_utf8(body.to_vec())`, is a derived carrier that a parser reads.
+A standard conversion of any other part of the body fails closed. Checks 2, 3
+and 5 read that parse when it reads a parameter of type
 `Bytes`, `&[u8]` or `Vec<u8>`. The parse can be in the handler, or in a helper
 that the handler passes the body to, at any depth up to `HELPER_DEPTH`. A
 recursive helper is read once per chain of calls. In a helper, only the
 parameter at the position of the body argument is a body. A move into another
 name, such as `let captured = body;`, is followed. A copy through a call, such
-as `body.to_vec()`, is not read. The type comes from a turbofish, then from a
+as `body.to_vec()`, is read only inside a standard conversion. The type comes from a turbofish, then from a
 typed `let` in the same statement, then from a `Result<T, _>` return type. The
 last two apply only when the call ends its expression, since a `.map(..)` after
 it yields another type. A `Value` body is free-form, so checks 2 and 3 skip it.
@@ -1246,7 +1252,12 @@ BYTE_PARAMETER = re.compile(
 # `resolve_aliases` rewrites every import of it and every alias to this path
 # first, so this one pattern reads them all. `Uuid::from_slice` and a local
 # `from_slice` are no body parse.
-FROM_SLICE_CALL = re.compile(r"\bserde_json::from_(?:slice|str)\s*(?:::<|\()")
+# The serde_json entry points the audit models as a typed parse. Every other
+# serde_json call that gets a carrier is an unresolved handoff, and the alias
+# layer trusts exactly these names. This is the one list.
+SERDE_PARSERS = ("from_slice", "from_str")
+
+FROM_SLICE_CALL = re.compile(r"\bserde_json::(?:%s)\s*(?:::<|\()" % "|".join(SERDE_PARSERS))
 
 
 @functools.lru_cache(maxsize=None)
@@ -1741,6 +1752,9 @@ def std_conversion_source(
     of a standard type such as `String::from_utf8`, with one argument that
     reads a live, whole carrier. A trailing success projection or
     `.map_err(..)` keeps it, so `std::str::from_utf8(&body)?` reads `body`.
+    The argument may copy the carrier through `BYTE_PRESERVING`, so
+    `String::from_utf8(body.to_vec())` reads `body` too. `handoffs` fails
+    closed on a standard conversion of any other part of a carrier.
     """
     text = expression.strip().rstrip(",").strip()
     while True:
@@ -1760,15 +1774,42 @@ def std_conversion_source(
     call = re.match(r"((?:[A-Za-z_]\w*\s*::\s*)+[a-z_]\w*)\s*\(", text)
     if call is None or len(balanced(text[call.end() - 1 :])) != len(text) - call.end() + 1:
         return None
-    path = call.group(1)
-    standard = std_path(path, site_in(block, position)) or path_segments(path)[0] in STD_TYPES
     arguments = split_top_level(text[call.end() : -1])
-    if not standard or len(arguments) != 1:
+    if not std_conversion(call.group(1), site_in(block, position)) or len(arguments) != 1:
         return None
-    root, whole = argument_root(arguments[0])
+    root, whole = argument_root(arguments[0], copies=True)
     if not whole or root not in carriers or not carrier_live(block, carriers, root, position):
         return None
     return None if carrier_partial(carriers, root, position) else root
+
+
+def std_conversion(path: str, site: Site) -> bool:
+    """Whether the call path `path` names a standard conversion.
+
+    That is a path through `std`, `core` or `alloc`, as `std_path` reads it,
+    or a path that starts at one of `STD_TYPES`, such as `String::from_utf8`.
+    """
+    return std_path(path, site) or path_segments(path)[0] in STD_TYPES
+
+
+def serde_path(reference: str, site: Site) -> bool:
+    """Whether the call path `reference` names a serde_json item.
+
+    An import decides first, as `written_path` reads it, so `use
+    serde_json::from_value as decode;` makes `decode` a serde_json path. A
+    bare name under a glob of `serde_json` counts when no local fn has it.
+    """
+    segments, _ = written_path(reference, site)
+    if not segments:
+        return False
+    if segments[0] == "serde_json":
+        return True
+    text, at = site
+    if len(segments) != 1 or at is None:
+        return False
+    globs = [scope for scope, path, _ in glob_imports(text) if path == "serde_json"]
+    covered = any(start <= at < end for start, end in globs)
+    return covered and not resolve_symbol("fn", segments[0], site)
 
 
 def carrier_live(block: str, carriers: dict[str, int], name: str, position: int) -> bool:
@@ -1826,6 +1867,8 @@ def moved_names(block: str, names: set[str] | dict[str, int]) -> Carriers:
     patterns = destructuring_lets(block)
     assigned = [item for item in assignments(block) if re.fullmatch(r"[a-z_][a-z_0-9]*", item[0])]
     while True:
+        # The partial names so far, so `std_conversion_source` sees them.
+        found.partial = frozenset(partial)
         moved: dict[str, tuple[int, bool]] = {}
         for bound, start, opener, value in lets:
             if bound in found or bound in moved:
@@ -2093,9 +2136,19 @@ FREE_CALL_HEAD = r"(?<![\w.:])([a-z_][a-z_0-9]*)%s" % TURBOFISH
 FREE_CALL_NAME = FREE_CALL_HEAD + r"\s*\("
 
 
-# Views that read a whole carrier: `.as_ref()`, `.as_slice()`, `.deref()`,
-# `.clone()` or a full `[..]` slice.
-WHOLE_VIEW = r"(?:\.\s*(?:as_ref|as_slice|as_bytes|deref|clone)\s*\(\s*\)|\[\s*\.\.\s*\])"
+# The byte-preserving methods: each gives all the bytes of its receiver and
+# runs no deserializer. A view borrows them and a copy clones them. This is
+# the one list. `BYTE_ACCESSORS` holds it, and `WHOLE_VIEW` reads the views.
+BYTE_VIEWS = ("as_ref", "as_slice", "as_bytes", "deref", "clone")
+BYTE_COPIES = ("to_vec", "to_owned")
+BYTE_PRESERVING = frozenset(BYTE_VIEWS + BYTE_COPIES)
+
+# Views that read a whole carrier: one of `BYTE_VIEWS`, such as `.as_ref()`,
+# or a full `[..]` slice.
+WHOLE_VIEW = r"(?:\.\s*(?:%s)\s*\(\s*\)|\[\s*\.\.\s*\])" % "|".join(BYTE_VIEWS)
+
+# A whole view or a byte copy, such as `.to_vec()`. Each keeps every byte.
+BYTE_PRESERVING_STEP = r"(?:%s|\.\s*(?:%s)\s*\(\s*\))" % (WHOLE_VIEW, "|".join(BYTE_COPIES))
 
 # The methods of a success projection: each turns a `Result` or an `Option`
 # that wraps a carrier into the carrier, or keeps it wrapped.
@@ -2113,12 +2166,14 @@ SUCCESS_STEP = r"(?:\?|\.\s*await\b|\.\s*(?:%s)\s*\((?:[^()]|\([^()]*\))*\))" % 
 )
 
 
-def argument_root(argument: str) -> tuple[str | None, bool]:
+def argument_root(argument: str, copies: bool = False) -> tuple[str | None, bool]:
     """The variable an argument reads, and whether it reads all of it.
 
     `&`, `&mut`, `*` and grouping parentheses are stripped, and so are whole
     views in `WHOLE_VIEW` and success projections in `SUCCESS_STEP`, so
-    `body.as_ref().unwrap()` reads a wrapped carrier `body` whole. What is
+    `body.as_ref().unwrap()` reads a wrapped carrier `body` whole. With
+    `copies`, each step of `BYTE_PRESERVING_STEP` is stripped too, so
+    `body.to_vec()` reads `body` whole. What is
     left must be a plain name, which is then the root, read whole. A name
     followed by anything else, such as `body[4..]` or `body.to_vec()`, is
     the root, read in a form the audit cannot type. Any other argument has
@@ -2134,7 +2189,8 @@ def argument_root(argument: str) -> tuple[str | None, bool]:
         if text.startswith("(") and len(balanced(text)) == len(text):
             text = text[1:-1].strip()
             continue
-        view = re.search(r"\s*(?:%s|%s)$" % (WHOLE_VIEW, SUCCESS_STEP), text)
+        views = BYTE_PRESERVING_STEP if copies else WHOLE_VIEW
+        view = re.search(r"\s*(?:%s|%s)$" % (views, SUCCESS_STEP), text)
         if view and view.start():
             text = text[: view.start()].strip()
             continue
@@ -2194,12 +2250,11 @@ def outside_calls(argument: str, macros: bool = True) -> str:
 # Methods on `Bytes`, `[u8]` and `Vec<u8>` that read or copy the bytes and
 # run no deserializer. A raw body as their receiver is no handoff. No
 # conversion is here, since a local `From` impl can run any code.
-BYTE_ACCESSORS = frozenset(
+BYTE_ACCESSORS = BYTE_PRESERVING | frozenset(
     {
-        "as_ref", "as_slice", "as_bytes", "borrow", "chunks", "clone", "contains",
-        "copy_to_bytes", "deref", "ends_with", "first", "get", "is_empty",
-        "iter", "last", "len", "slice", "split_at", "split_off", "split_to",
-        "starts_with", "to_owned", "to_vec", "windows",
+        "borrow", "chunks", "contains", "copy_to_bytes", "ends_with", "first", "get",
+        "is_empty", "iter", "last", "len", "slice", "split_at", "split_off", "split_to",
+        "starts_with", "windows",
     }
 )
 
@@ -2299,6 +2354,39 @@ def handoffs(
             tolerant = discards_error(block[:start], block[end:])
             allowed = empty_allowed(block, start, variable, tolerant)
             found.append((name + "!", None, None, allowed, tolerant))
+    for helper, start, arguments, end in std_and_serde_calls(block) if receivers else []:
+        if in_dead_closure(block, start):
+            continue
+        tolerant = discards_error(block[:start], block[end:])
+        site = site_in(block, start)
+        # A standard conversion reads a carrier whole only as its one argument,
+        # as `std_conversion_source` does. Any other read fails closed. A
+        # partial carrier or a part of one, such as `&body[1..]`, has no type.
+        for argument in arguments if std_conversion(helper, site) else []:
+            for variable in carriers:
+                if not argument_passes(argument, variable):
+                    continue
+                if not carrier_live(block, carriers, variable, start):
+                    continue
+                whole = argument_root(argument, copies=True) == (variable, True)
+                if whole and len(arguments) == 1:
+                    if not carrier_partial(carriers, variable, start):
+                        continue
+                allowed = empty_allowed(block, start, variable, tolerant)
+                found.append((helper, None, None, allowed, tolerant))
+        # A derived name reaches no serde_json call but one of `SERDE_PARSERS`,
+        # which `block_parses` reads. Any other, such as `from_value` or
+        # `Deserializer::from_str`, is a handoff the audit cannot follow.
+        if not serde_path(helper, site) or re.sub(r"\s", "", helper) in SERDE_PATHS:
+            continue
+        derived = getattr(carriers, "derived", {})
+        for variable, bound_at in derived.items():
+            if not any(argument_passes(argument, variable) for argument in arguments):
+                continue
+            if not live_binding(block, variable, start, bound_at):
+                continue
+            allowed = empty_allowed(block, start, variable, tolerant)
+            found.append((helper, None, None, allowed, tolerant))
     # A method call whose receiver holds a carrier hands it to `self`. The
     # receiver goes through `argument_passes`, as an argument does, so a
     # grouped or borrowed receiver such as `(&body)` is read like `body`, and
@@ -2389,16 +2477,44 @@ QUALIFIED_CALL = (
 def handoff_path(call: re.Match, block: str) -> bool:
     """Whether a `QUALIFIED_CALL` match in `block` can hand a body to a JSON parse.
 
-    `serde_json::from_slice` is the parse itself, which `block_parses` reads.
-    A path rooted at `std`, `core` or `alloc`, such as `std::str::from_utf8`,
-    cannot run serde_json, so it is no handoff. `std_path` reads the root
-    through an import, as `use std::str as text;` binds it. Any other path or
-    method can hand the body on.
+    A call of one of `SERDE_PARSERS`, such as `serde_json::from_slice`, is
+    the parse itself, which `block_parses` reads. Any other serde_json call,
+    such as `from_reader` or `Deserializer::from_slice`, is a handoff the
+    audit cannot follow, so it fails closed. A standard conversion, as
+    `std_conversion` reads it, such as `std::str::from_utf8` or
+    `String::from_utf8`, cannot run serde_json, so it is no handoff.
+    `std_path` reads the root through an import, as `use std::str as text;`
+    binds it. Any other path or method can hand the body on.
     """
     path = call.group(1).replace(" ", "").lstrip(":")
-    if path == "serde_json::" or path == ".":
-        return path == "."
-    return not std_path(path + call.group(2), site_in(block, call.start()))
+    if path == ".":
+        return True
+    if path + call.group(2) in SERDE_PATHS:
+        return False
+    return not std_conversion(path + call.group(2), site_in(block, call.start()))
+
+
+def std_and_serde_calls(block: str) -> list[tuple[str, int, list[str], int]]:
+    """`(path, start, arguments, end)` for each bare or path call in `block`.
+
+    `path` is the call as written, spaces removed, as in `std::str::from_utf8`
+    or `from_value`. A method call is not here. `handoffs` reads the standard
+    conversions and the serde_json calls from this one list.
+    """
+    found = []
+    heads = [(call, "") for call in re.finditer(FREE_CALL_NAME, block)]
+    heads += [(call, call.group(1)) for call in qualified_calls(block)]
+    for call, path in heads:
+        path = re.sub(r"\s", "", path).lstrip(":")
+        if path == ".":
+            continue
+        name = call.group(2) if path else call.group(1)
+        if not path and name in NOT_CALLS:
+            continue
+        raw = balanced(block[call.end() - 1 :])
+        arguments = split_top_level(raw[1:-1])
+        found.append((path + name, call.start(), arguments, call.end() - 1 + len(raw)))
+    return found
 
 
 @functools.lru_cache(maxsize=None)
@@ -3915,7 +4031,7 @@ ALIAS_TARGETS = {
     "Query": "Query",
     "Json": "Json",
     "Bytes": "Bytes",
-    "from_slice": "serde_json::from_slice",
+    **{parser: "serde_json::" + parser for parser in SERDE_PARSERS},
 }
 
 
@@ -3928,8 +4044,12 @@ SUPPORTED_PATHS = {
     "axum::extract::Json": "Json",
     "bytes::Bytes": "Bytes",
     "axum::body::Bytes": "Bytes",
-    "serde_json::from_slice": "from_slice",
+    **{"serde_json::" + parser: parser for parser in SERDE_PARSERS},
 }
+
+
+# The trusted path of each modeled serde_json entry point.
+SERDE_PATHS = frozenset("serde_json::" + parser for parser in SERDE_PARSERS)
 
 
 def extractor_kind(path: str) -> str | None:
@@ -3954,9 +4074,9 @@ def canonical_extractor_paths(source: str) -> str:
     as `written_path` reads them. The expanded path is then trusted or not,
     as `extractor_kind` reads it. This is the one path-trust decision.
     `axum::Json<T>` becomes `Json<T>`, and so does
-    `autumn_web::reexports::axum::Json`. A trusted `from_slice` path becomes
-    `serde_json::from_slice`. A path it does not trust, such as
-    `crate::signed::Query<T>`, is left whole. If an import rebinds its
+    `autumn_web::reexports::axum::Json`. A trusted path to one of
+    `SERDE_PARSERS` becomes its `serde_json::` path. A path it does not
+    trust, such as `crate::signed::Query<T>`, is left whole. If an import rebinds its
     first name, the path is spelled out in full, so `axum::Json` under `use
     crate::signed as axum;` reads as `crate::signed::Json`. Every extractor
     reader matches only a bare name, so that type is no extractor. A `use` statement
@@ -3965,7 +4085,8 @@ def canonical_extractor_paths(source: str) -> str:
     """
     code = code_only(source)
     uses = [found.span() for found in re.finditer(r"\buse\b[^;]*;", code)]
-    qualified = r"(?<![\w:])(?:::\s*)?(?:[A-Za-z_]\w*\s*::\s*)+(Query|Json|Bytes|from_slice)\b"
+    names = "|".join(("Query", "Json", "Bytes") + SERDE_PARSERS)
+    qualified = r"(?<![\w:])(?:::\s*)?(?:[A-Za-z_]\w*\s*::\s*)+(%s)\b" % names
     for found in reversed(list(re.finditer(qualified, code))):
         if any(start <= found.start() < end for start, end in uses):
             continue
@@ -4113,13 +4234,14 @@ def shadow_bound(declared_type: str, site: Site) -> str:
 def alias_declarations(code: str) -> list[tuple[tuple[int, int], tuple[int, int], str, str | None]]:
     """`(scope, declaration span, pattern, replacement)` for each alias in `code`.
 
-    It reads `use .. as ..` for `Query`, `Json`, `Bytes` and serde_json's
-    `from_slice`, a module alias of `serde_json`, a plain or glob import of
-    `from_slice`, and `type X<..> = Y<..>;`. An import or a local item that
-    binds an extractor's name to something else shadows it in its scope. A
-    type alias to one of those types with the same parameters is a rename.
-    One with no parameters is replaced by its target. Any other type alias that names an extractor has
-    no replacement (`None`), so the audit reports it.
+    It reads `use .. as ..` for `Query`, `Json`, `Bytes` and each of
+    serde_json's `SERDE_PARSERS`, a module alias of `serde_json`, a plain or
+    glob import of those parsers, and `type X<..> = Y<..>;`. An import or a
+    local item that binds an extractor's name to something else shadows it
+    in its scope. A type alias to one of those types with the same
+    parameters is a rename. One with no parameters is replaced by its
+    target. Any other type alias that names an extractor has no replacement
+    (`None`), so the audit reports it.
     """
     found = []
     for use in re.finditer(r"\buse\b[^;]*;", code):
@@ -4137,7 +4259,7 @@ def alias_declarations(code: str) -> list[tuple[tuple[int, int], tuple[int, int]
                 # prelude type in scope, as an extractor name does.
                 found.append((scope, span, r"(?<![\w:.])%s\b" % binding, path))
             elif kind and alias:
-                pattern = r"(?<![\w:.])%s\b%s" % (alias, call if kind == "from_slice" else "")
+                pattern = r"(?<![\w:.])%s\b%s" % (alias, call if kind in SERDE_PARSERS else "")
                 found.append((scope, span, pattern, ALIAS_TARGETS[kind]))
             elif path == "serde_json" and alias:
                 found.append((scope, span, r"(?<![\w:.])%s(?=\s*::)" % alias, "serde_json"))
@@ -4146,9 +4268,11 @@ def alias_declarations(code: str) -> list[tuple[tuple[int, int], tuple[int, int]
                 # can see that `s::from_utf8` is `std::str::from_utf8`.
                 name = alias or path.rsplit("::", 1)[-1]
                 found.append((scope, span, r"(?<![\w:.])%s(?=\s*::)" % name, path))
-            elif path in ("serde_json::from_slice", "serde_json::*") and not alias:
-                pattern = r"(?<![\w:.])from_slice%s" % call
-                found.append((scope, span, pattern, ALIAS_TARGETS["from_slice"]))
+            elif not alias and (path == "serde_json::*" or path in SERDE_PATHS):
+                # A plain or glob import binds each modeled parser by name.
+                for parser in SERDE_PARSERS if path.endswith("*") else (path.rsplit("::", 1)[-1],):
+                    pattern = r"(?<![\w:.])%s%s" % (parser, call)
+                    found.append((scope, span, pattern, ALIAS_TARGETS[parser]))
     # A local item named like an extractor or a prelude type shadows it in its
     # scope, as an untrusted import does. A `type` alias that renames the type
     # to its own name is no shadow.
@@ -4308,7 +4432,7 @@ def resolve_aliases_once(source: str) -> str:
             continue
         # A fn alias names a value, so a local binding of the same name, a
         # `let`, a pattern or a closure or fn parameter, stops it in its scope.
-        value = replacement == ALIAS_TARGETS["from_slice"]
+        value = replacement in SERDE_PATHS
         for hit in re.finditer(pattern, code[:end]):
             if not start <= hit.start() or skip_start <= hit.start() < skip_end:
                 continue
@@ -6113,6 +6237,24 @@ pub fn harvest_api_router() -> Router {
         .route("/e/utf8-form", post(e_utf8_form))
         .route("/e/utf8-inspected", post(e_utf8_inspected))
         .route("/e/helper-text", post(e_helper_text))
+        .route("/e/serde-reader", post(e_serde_reader))
+        .route("/e/serde-deserializer", post(e_serde_deserializer))
+        .route("/e/serde-derived-reader", post(e_serde_derived_reader))
+        .route("/e/serde-derived-stream", post(e_serde_derived_stream))
+        .route("/e/serde-glob-reader", post(e_serde_glob_reader))
+        .route("/e/serde-imported-reader", post(e_serde_imported_reader))
+        .route("/e/serde-alias-str", post(e_serde_alias_str))
+        .route("/e/serde-plain-str", post(e_serde_plain_str))
+        .route("/e/serde-glob-str", post(e_serde_glob_str))
+        .route("/e/serde-rebound-str", post(e_serde_rebound_str))
+        .route("/e/utf8-copied", post(e_utf8_copied))
+        .route("/e/utf8-owned-slice", post(e_utf8_owned_slice))
+        .route("/e/utf8-sliced", post(e_utf8_sliced))
+        .route("/e/utf8-sliced-inline", post(e_utf8_sliced_inline))
+        .route("/e/utf8-partial", post(e_utf8_partial))
+        .route("/e/std-two-arguments", post(e_std_two_arguments))
+        .route("/e/dlq-like-form", post(e_dlq_like_form))
+        .route("/e/serde-quiet", post(e_serde_quiet))
         .route("/e/option-inline", post(e_option_inline))
         .route("/e/result-inline", post(e_result_inline))
         .route("/e/option-deref", post(e_option_deref))
@@ -7904,6 +8046,150 @@ async fn e_utf8_inspected(body: Bytes) -> Response {
         tracing::debug!("utf-8");
     }
     StatusCode::OK.into_response()
+}
+
+async fn e_serde_reader(body: Bytes) -> Response {
+    let gadget: Gadget = serde_json::from_reader(&body[..]).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_serde_deserializer(body: Bytes) -> Response {
+    let mut stream = serde_json::Deserializer::from_slice(&body);
+    let gadget = Gadget::deserialize(&mut stream).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_serde_derived_reader(body: Bytes) -> Response {
+    let text = std::str::from_utf8(&body).unwrap();
+    let gadget: Gadget = serde_json::from_reader(text.as_bytes()).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_serde_derived_stream(body: Bytes) -> Response {
+    use serde_json::Deserializer as Stream;
+    let text = std::str::from_utf8(&body).unwrap();
+    for gadget in Stream::from_str(&text).into_iter::<Gadget>() {
+        record_gadget(gadget.unwrap());
+    }
+    StatusCode::OK.into_response()
+}
+
+async fn e_serde_glob_reader(body: Bytes) -> Response {
+    use serde_json::*;
+    let text = std::str::from_utf8(&body).unwrap();
+    let gadget: Gadget = from_reader(text.as_bytes()).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_serde_imported_reader(body: Bytes) -> Response {
+    use serde_json::from_reader as read_json;
+    let text = std::str::from_utf8(&body).unwrap();
+    let gadget: Gadget = read_json(text.as_bytes()).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_serde_alias_str(body: Bytes) -> Response {
+    use serde_json::from_str as parse_text;
+    let text = std::str::from_utf8(&body).unwrap();
+    let gadget: Gadget = parse_text(text).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_serde_plain_str(body: Bytes) -> Response {
+    use serde_json::from_str;
+    let text = std::str::from_utf8(&body).unwrap();
+    let gadget = from_str::<Gadget>(text).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_serde_glob_str(body: Bytes) -> Response {
+    use serde_json::*;
+    let text = std::str::from_utf8(&body).unwrap();
+    let gadget = from_str::<Gadget>(text).unwrap();
+    StatusCode::OK.into_response()
+}
+
+mod lenient_json {
+    pub fn from_str<T: Default>(text: &str) -> Result<T, ()> {
+        Ok(T::default())
+    }
+}
+
+async fn e_serde_rebound_str(body: Bytes) -> Response {
+    use crate::lenient_json as serde_json;
+    let text = std::str::from_utf8(&body).unwrap();
+    let gadget: Gadget = serde_json::from_str(text).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_utf8_copied(body: Bytes) -> Response {
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    let gadget = serde_json::from_str::<Gadget>(&text).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_utf8_owned_slice(body: Bytes) -> Response {
+    let text = String::from_utf8((&body[..]).to_owned()).unwrap();
+    let gadget = serde_json::from_str::<Gadget>(&text).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_utf8_sliced(body: Bytes) -> Response {
+    let text = std::str::from_utf8(&body[1..]).unwrap();
+    let gadget = serde_json::from_str::<Gadget>(text).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_utf8_sliced_inline(body: Bytes) -> Response {
+    let gadget = serde_json::from_str::<Gadget>(std::str::from_utf8(&body[1..]).unwrap()).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_utf8_partial(body: Bytes) -> Response {
+    let tail = &body[1..];
+    let text = std::str::from_utf8(tail).unwrap();
+    let gadget = serde_json::from_str::<Gadget>(text).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_std_two_arguments(body: Bytes) -> Response {
+    let mut held = Bytes::new();
+    let previous = std::mem::replace(&mut held, body);
+    let gadget = serde_json::from_slice::<Gadget>(&held).unwrap();
+    StatusCode::OK.into_response()
+}
+
+fn dlq_like_form(body: &[u8]) -> Result<Vec<serde_json::Value>, Rejection> {
+    let raw = std::str::from_utf8(body).map_err(reject)?;
+    let mut values = Vec::new();
+    for (key, value) in split_pairs(raw)? {
+        values.push(serde_json::Value::String(value.to_string()));
+    }
+    Ok(values)
+}
+
+fn record_text(text: &str) {}
+
+async fn e_serde_quiet(body: Bytes) -> Response {
+    use serde_json::*;
+    let unused = || std::str::from_utf8(&body[1..]);
+    let text = std::str::from_utf8(&body).unwrap();
+    match (text, 1) {
+        _ => record_text(text),
+    }
+    let text = "{}";
+    let value: Value = from_reader(text.as_bytes()).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_dlq_like_form(body: Bytes) -> Response {
+    if body.is_empty() {
+        return StatusCode::OK.into_response();
+    }
+    match dlq_like_form(&body) {
+        Ok(values) => StatusCode::OK.into_response(),
+        Err(rejection) => rejection.into_response(),
+    }
 }
 
 macro_rules! decode_body {
@@ -11255,6 +11541,73 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
                 "POST /e/utf8-derived: `name` is mandatory in Gadget",
                 "POST /e/utf8-inline: `name` is mandatory in Gadget",
                 "POST /e/utf8-assigned: `name` is mandatory in Gadget",
+            ],
+        },
+    ),
+    (
+        "an unmodeled serde_json call or a partial std conversion fails closed",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST", "/e/" + path, 200, request_body=body_of(("name", False), required=False)
+            )
+            for path in (
+                "serde-reader",
+                "serde-deserializer",
+                "serde-derived-reader",
+                "serde-derived-stream",
+                "serde-glob-reader",
+                "serde-imported-reader",
+                "serde-alias-str",
+                "serde-plain-str",
+                "serde-glob-str",
+                "serde-rebound-str",
+                "utf8-copied",
+                "utf8-owned-slice",
+                "utf8-sliced",
+                "utf8-sliced-inline",
+                "utf8-partial",
+                "std-two-arguments",
+                "dlq-like-form",
+                "serde-quiet",
+            )
+        ],
+        {
+            "body_required": [
+                "POST /e/serde-reader: the body is mandatory",
+                "POST /e/serde-deserializer: the body is mandatory",
+                "POST /e/serde-derived-reader: the body is mandatory",
+                "POST /e/serde-derived-stream: the body is mandatory",
+                "POST /e/serde-glob-reader: the body is mandatory",
+                "POST /e/serde-imported-reader: the body is mandatory",
+                "POST /e/serde-alias-str: the body is mandatory",
+                "POST /e/serde-plain-str: the body is mandatory",
+                "POST /e/serde-glob-str: the body is mandatory",
+                "POST /e/utf8-copied: the body is mandatory",
+                "POST /e/utf8-owned-slice: the body is mandatory",
+                "POST /e/utf8-sliced: the body is mandatory",
+                "POST /e/utf8-sliced-inline: the body is mandatory",
+                "POST /e/utf8-partial: the body is mandatory",
+                "POST /e/std-two-arguments: the body is mandatory",
+            ],
+            "mandatory": [
+                "POST /e/serde-alias-str: `name` is mandatory in Gadget",
+                "POST /e/serde-plain-str: `name` is mandatory in Gadget",
+                "POST /e/serde-glob-str: `name` is mandatory in Gadget",
+                "POST /e/utf8-copied: `name` is mandatory in Gadget",
+                "POST /e/utf8-owned-slice: `name` is mandatory in Gadget",
+            ],
+            "unresolved": [
+                "POST /e/serde-reader: cannot read a `from_slice` call",
+                "POST /e/serde-deserializer: cannot read a `from_slice` call",
+                "POST /e/serde-derived-reader: cannot read a `from_slice` call",
+                "POST /e/serde-derived-stream: cannot read a `from_slice` call",
+                "POST /e/serde-glob-reader: cannot read a `from_slice` call",
+                "POST /e/serde-imported-reader: cannot read a `from_slice` call",
+                "POST /e/utf8-sliced: cannot read a `from_slice` call",
+                "POST /e/utf8-sliced-inline: cannot read a `from_slice` call",
+                "POST /e/utf8-partial: cannot read a `from_slice` call",
+                "POST /e/std-two-arguments: cannot read a `from_slice` call",
             ],
         },
     ),
