@@ -1867,11 +1867,13 @@ standalone note rather than part of the claim-path attribution table above:
   by design, so the fix is measured in DB-socket syscalls instead: `sendto`
   -44.5%, `recvfrom` -40.9%).
 * [`docs/performance-mutex-terminal-sweep-table-present.md`](performance-mutex-terminal-sweep-table-present.md)
-  — `mutex::sweep_terminal_holder_and_wake`, the per-workflow-terminal-
-  transition chokepoint, issuing its `table_present()` migration guard three
-  redundant times in one transaction (issue #691 follow-up); `calls` is
-  really 3 → 1, but measured on a single reused connection (matching
-  production) the buffer delta is 0 — Postgres's own backend-local relcache
+  — `mutex::sweep_terminal_holder_and_wake`, reached from the workflow
+  completion-trigger evaluator (skipped on a successfully-retried failure),
+  continue-as-new sealing, and reset, issuing its `table_present()`
+  migration guard three redundant times in one transaction (issue #691
+  follow-up); `calls` is really 3 → 1, but measured on a single reused
+  connection (matching production) the buffer delta is 0 — Postgres's own
+  backend-local syscache
   already makes calls 2 and 3 free. No fix ships.
 * [`docs/performance-metrics-sampler-guard.md`](performance-metrics-sampler-guard.md)
   — four worker samplers issuing SQL with no `metrics.is_enabled()` guard

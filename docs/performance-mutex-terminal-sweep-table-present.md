@@ -61,16 +61,16 @@ second caller.
 `docs/perf-artifacts/mutex-terminal-sweep-table-present/fixture-summary.txt`).
 
 **Probe 1 — cold connection, single call**
-(`cold-connection-first-call.explain.txt`): `shared hit=6`. This is the
-Postgres relation-cache (`relcache`) resolving `harvest_mutex_locks` for the
-first time on that backend — a `pg_class` lookup, not a heap/index access on
-the table itself.
+(`cold-connection-first-call.explain.txt`): `shared hit=6`. This is
+Postgres's catalog/syscache resolving `harvest_mutex_locks` by name for the
+first time on that backend (`RELNAMENSP` syscache lookup) — a `pg_class`
+lookup, not a heap/index access on the table itself.
 
 **Probe 2 — the methodology the first version of this page used, and why it
 was wrong** (`pg_stat_statements.INVALID-separate-connections.txt`): three
 separate `psql` invocations, each opening its own connection/backend,
 report `calls=3, shared_blks_hit=18` — i.e. `6` **every** time, because each
-process starts with a cold relcache. Codex's review correctly flagged this
+process starts with a cold syscache. Codex's review correctly flagged this
 as not representative: `sweep_terminal_holder_and_wake`'s three calls run on
 one already-open `AsyncPgConnection`, not three fresh ones. Kept in the
 artifact directory as a labeled negative example, not as evidence for
@@ -79,20 +79,28 @@ anything in this page's conclusion.
 **Probe 3 — one connection, three calls in the same transaction**
 (`same-connection-same-transaction.explain.txt`, matching production
 exactly): `Buffers: shared hit=6` on call 1, **no `Buffers:` line at all**
-(zero shared-buffer touches) on calls 2 and 3 — the backend's relcache
+(zero shared-buffer touches) on calls 2 and 3 — the backend's syscache
 already has the answer, so Postgres never consults the shared buffer pool
 again. `pg_stat_statements.same-connection.txt` confirms it in aggregate:
 `calls=3, shared_blks_hit=6` for the whole three-call sweep, not 18.
 
 **Probe 4 — one connection, three separate transactions**
 (`same-connection-new-transactions.explain.txt`): same result, `6, 0, 0` —
-the relcache entry is backend-scoped, not transaction-scoped, so it survives
-across `COMMIT`. In a pooled-connection deployment, this means only the
-*very first* terminal-transition sweep a given pooled connection ever
-handles pays the 6-buffer cost, once, for the lifetime of that connection —
-regardless of whether `table_present()` is called once or three times per
-sweep, and regardless of how many thousands of terminal transitions that
-connection goes on to seal afterward.
+the cache entry backing this lookup is a backend-local syscache entry, not
+transaction-scoped, so it survives across `COMMIT`. It is **not** the same
+thing as a guarantee for "the connection's lifetime": `to_regclass`
+resolves through Postgres's catalog/syscache, and a syscache entry is
+invalidated by relevant DDL against that relation (or a broader
+invalidation event), not merely by time or transaction boundaries. This
+probe only demonstrates reuse across three adjacent transactions with no
+intervening DDL — it does not show, and this page does not claim, that
+*only* the very first sweep a pooled connection ever handles pays the cost
+for that connection's entire remaining life. The narrower, supported
+reading: within any span with no DDL against `harvest_mutex_locks` (which
+in practice is effectively the whole life of a connection that predates and
+outlives a migration, since nothing else touches that table's schema),
+`table_present()` after the first call in that span costs 0 buffers,
+regardless of whether it's called once or three times per sweep.
 
 🧭 **Plan.** No plan-shape question — `to_regclass` is a catalog function
 with no scan node, cold or warm.
@@ -123,9 +131,10 @@ matters.
 | **total shared_blks_hit** | **18** | **6** | **6** |
 
 Collapsing 3 calls to 1 on an already-warm connection: **6 → 6, Δ = 0
-buffers.** On a cold connection's very first sweep: 6 → 6 either way (a
-single call still has to resolve the relcache once). There is no buffer
-regime in which the fix saves anything.
+buffers.** On a cold connection's very first sweep (or the first sweep after
+any DDL invalidates the syscache entry): 6 → 6 either way (a single call
+still has to resolve it once). There is no buffer regime in which the fix
+saves anything.
 
 Neither floor item available to a catalog lookup is cleared, and now for an
 even more direct reason than "the statement is under 5% of the workload":
@@ -143,7 +152,7 @@ even more direct reason than "the statement is under 5% of the workload":
 **Verdict: do not fix.** The three calls are real and `pg_stat_statements`
 will keep reporting `calls=3` at this chokepoint until someone changes it,
 but the buffer cost of removing two of them is not "small" — it is
-measured zero, because Postgres's own backend-local relcache already
+measured zero, because Postgres's own backend-local syscache already
 eliminates the repeat work `table_present()`'s redundancy appears to cause.
 The only remaining argument is round-trip latency (three sequential
 synchronous awaits on the hottest transaction boundary in the engine
