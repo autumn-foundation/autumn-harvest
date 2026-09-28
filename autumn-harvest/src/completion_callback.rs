@@ -2519,10 +2519,115 @@ async fn dead_letter_entry_with_current_payload(
     })
 }
 
+/// Bulk-record every `Delivered` outcome from one scanner tick in a single
+/// round trip: `UPDATE ... FROM unnest($ids, $attempts, $statuses)`. The
+/// join is on `(id, attempt)`, exactly like the per-row path's
+/// `.find(row.id).filter(attempt.eq(row.attempt))` guard. A row whose
+/// `attempt` no longer matches is silently skipped by the join instead
+/// of updated -- the same no-op the per-row guard produced. That can
+/// happen when a later reclaim supersedes the row; see `apply_outcome`'s
+/// doc comment.
+///
+/// A no-op on an empty batch: the caller only invokes this when at least
+/// one row resolved `Delivered`.
+#[cfg(feature = "db")]
+async fn apply_delivered_outcomes_batch(
+    conn: &mut diesel_async::AsyncPgConnection,
+    rows: &[(Uuid, i32, u16)],
+    now: DateTime<Utc>,
+) -> crate::error::HarvestResult<()> {
+    use diesel_async::RunQueryDsl;
+
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let ids: Vec<Uuid> = rows.iter().map(|r| r.0).collect();
+    let attempts: Vec<i32> = rows.iter().map(|r| r.1).collect();
+    let statuses: Vec<i32> = rows.iter().map(|r| i32::from(r.2)).collect();
+
+    diesel::sql_query(
+        "UPDATE harvest_completion_deliveries d \
+         SET state = 'DELIVERED', last_status = v.last_status, last_error = NULL, \
+             delivered_at = $1, updated_at = $1 \
+         FROM unnest($2::uuid[], $3::int4[], $4::int4[]) AS v(id, attempt, last_status) \
+         WHERE d.id = v.id AND d.attempt = v.attempt",
+    )
+    .bind::<diesel::sql_types::Timestamptz, _>(now)
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(ids)
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(attempts)
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(statuses)
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+
+    Ok(())
+}
+
+/// One row's worth of a `Backoff` outcome, staged for
+/// [`apply_backoff_outcomes_batch`]: `(id, attempt, next_attempt_at,
+/// last_status, last_error)`.
+#[cfg(feature = "db")]
+type BackoffOutcomeRow = (Uuid, i32, DateTime<Utc>, Option<u16>, Option<String>);
+
+/// Bulk-record every `Backoff` outcome from one scanner tick in a single
+/// round trip. Same join-on-`(id, attempt)` guard as
+/// [`apply_delivered_outcomes_batch`]; see its doc comment.
+#[cfg(feature = "db")]
+async fn apply_backoff_outcomes_batch(
+    conn: &mut diesel_async::AsyncPgConnection,
+    rows: &[BackoffOutcomeRow],
+    now: DateTime<Utc>,
+) -> crate::error::HarvestResult<()> {
+    use diesel_async::RunQueryDsl;
+
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let ids: Vec<Uuid> = rows.iter().map(|r| r.0).collect();
+    let attempts: Vec<i32> = rows.iter().map(|r| r.1).collect();
+    let next_attempt_ats: Vec<DateTime<Utc>> = rows.iter().map(|r| r.2).collect();
+    let last_statuses: Vec<Option<i32>> = rows.iter().map(|r| r.3.map(i32::from)).collect();
+    let last_errors: Vec<Option<String>> = rows.iter().map(|r| r.4.clone()).collect();
+
+    diesel::sql_query(
+        "UPDATE harvest_completion_deliveries d \
+         SET state = 'PENDING', next_attempt_at = v.next_attempt_at, \
+             last_status = v.last_status, last_error = v.last_error, updated_at = $1 \
+         FROM unnest($2::uuid[], $3::int4[], $4::timestamptz[], $5::int4[], $6::text[]) \
+              AS v(id, attempt, next_attempt_at, last_status, last_error) \
+         WHERE d.id = v.id AND d.attempt = v.attempt",
+    )
+    .bind::<diesel::sql_types::Timestamptz, _>(now)
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(ids)
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(attempts)
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Timestamptz>, _>(next_attempt_ats)
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Nullable<diesel::sql_types::Integer>>, _>(
+        last_statuses,
+    )
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Nullable<diesel::sql_types::Text>>, _>(
+        last_errors,
+    )
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+
+    Ok(())
+}
+
 /// Record the outcome of one delivery attempt: `DELIVERED` (single
 /// `UPDATE`), rescheduled with backoff (single `UPDATE`), or dead-lettered
 /// (`UPDATE` + `harvest_dead_letters` insert, in one transaction so the two
 /// writes are atomic).
+///
+/// Only the `DeadLetter` branch is still reachable from the main per-tick
+/// scanner loop. `Delivered` and `Backoff` outcomes there are recorded via
+/// [`apply_delivered_outcomes_batch`] / [`apply_backoff_outcomes_batch`]
+/// instead: one round trip per outcome kind per tick, not one per row.
+/// The pre-dispatch exceptional paths (SSRF re-check failure, payload
+/// serialization failure) still call this directly with `DeadLetter`.
+/// They run per-row, before the batch's outcomes are even classified.
 #[cfg(feature = "db")]
 async fn apply_outcome(
     conn: &mut diesel_async::AsyncPgConnection,
@@ -2656,6 +2761,7 @@ async fn completion_deliveries_table_exists(
 /// "processed" for scanner-tick accounting, mirroring
 /// `enforce_timeouts_once`'s `count` semantics).
 #[cfg(feature = "db")]
+#[allow(clippy::too_many_lines)] // claim + re-read + dispatch + classify + batched-apply is one tick
 async fn fire_due_on_conn(
     conn: &mut diesel_async::AsyncPgConnection,
     config: &CallbackRuntimeConfig,
@@ -2786,6 +2892,20 @@ async fn fire_due_on_conn(
     // finished" for the whole batch.
     let backoff_now = Utc::now();
 
+    // Classify every attempt's outcome first, sorting rows into three
+    // buckets by action kind. Then write each bucket in one round trip,
+    // instead of one `apply_outcome` call per row. The classify/apply
+    // split itself is unchanged; only how the resulting actions get
+    // written is new. `Delivered` and `Backoff` are the common paths and
+    // are batched below. `DeadLetter` keeps the per-row transaction
+    // `apply_outcome` already used. Its fence-check + `FOR UPDATE`
+    // re-read + DLQ insert are a documented atomicity guarantee, named
+    // on `dead_letter_entry_with_current_payload`. This change does not
+    // touch that guarantee.
+    let mut delivered_rows: Vec<(Uuid, i32, u16)> = Vec::new();
+    let mut backoff_rows: Vec<BackoffOutcomeRow> = Vec::new();
+    let mut dead_letter_rows: Vec<(ClaimedDeliveryRow, OutcomeAction)> = Vec::new();
+
     for ((row, _body, _headers), attempt_outcome) in dispatchable.into_iter().zip(attempt_outcomes)
     {
         let retry_policy: crate::policy::RetryPolicy = match serde_json::from_value(
@@ -2814,8 +2934,34 @@ async fn fire_due_on_conn(
             backoff_now,
         );
 
-        apply_outcome(conn, &row, action).await?;
+        match action {
+            OutcomeAction::Delivered { status } => {
+                delivered_rows.push((row.id, row.attempt, status));
+            }
+            OutcomeAction::Backoff {
+                next_attempt_at,
+                last_status,
+                last_error,
+            } => {
+                backoff_rows.push((
+                    row.id,
+                    row.attempt,
+                    next_attempt_at,
+                    last_status,
+                    last_error,
+                ));
+            }
+            OutcomeAction::DeadLetter { .. } => {
+                dead_letter_rows.push((row, action));
+            }
+        }
         processed += 1;
+    }
+
+    apply_delivered_outcomes_batch(conn, &delivered_rows, backoff_now).await?;
+    apply_backoff_outcomes_batch(conn, &backoff_rows, backoff_now).await?;
+    for (row, action) in dead_letter_rows {
+        apply_outcome(conn, &row, action).await?;
     }
 
     Ok(processed)

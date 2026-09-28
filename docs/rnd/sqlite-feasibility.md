@@ -59,7 +59,7 @@ module counts at the audited revision, recomputed by CI:
 | `row-lock` blocking row lock (Diesel `.for_update()`) | 17 modules | Subsumed by the single write lock. |
 | `interval-sql` (`INTERVAL '…'`, `make_interval()`) | 14 modules | Yes — integer epoch milliseconds. |
 | `raw-sql` — reaches for Diesel's raw-SQL escape hatch (`sql::<…>`, `sql_query`) | 40 modules | Case by case — the SQL must be read, not inferred from the ORM. |
-| `raw-pg-sql` — *identified* Postgres-only syntax within that SQL (JSONB `#>>`/`@>`, `::TYPE` casts in either case, `EXTRACT(EPOCH …)`, `JOIN LATERAL`, `~` regex) | 28 modules | Mostly — but each is a hand rewrite, and `~` has no SQLite equivalent at all. |
+| `raw-pg-sql` — *identified* Postgres-only syntax within that SQL (JSONB `#>>`/`@>`, `::TYPE` casts in either case, `EXTRACT(EPOCH …)`, `JOIN LATERAL`, `~` regex) | 29 modules | Mostly — but each is a hand rewrite, and `~` has no SQLite equivalent at all. |
 | `advisory-lock` (`pg_advisory_*` / `pg_try_advisory_*`) | 13 modules | Subsumed by the single write lock. |
 | `to_regclass` table-existence probes | 9 modules | Yes — `sqlite_master` lookup. |
 | `listen/notify` push wakeups | 4 modules | No — polling is a degradation, not a translation. |
@@ -167,7 +167,7 @@ Classification rule:
 | `build_routing` | diesel, interval-sql, raw-sql | (b) | Integer epoch ms for the interval arithmetic. |
 | `calendar` | diesel | (a) | Plain CRUD. |
 | `codec_rotation` | diesel, interval-sql, raw-pg-sql, raw-sql, to_regclass | (b) | Lazy re-encryption sweep (issue #948). Every Postgres-ism is a rewrite, not a capability: `::jsonb`/`::TEXT` casts, a `JOIN LATERAL` over the payload-field allowlist, a `~` regex validating the stored key id, and a `to_regclass` probe for the cursor table. The `~` check is the only awkward one — validate the key id in Rust, as the decoder already does. No claim, no lock: the sweep is a batched scan whose writes are compare-and-swaps. |
-| `completion_callback` | diesel, skip-locked, row-lock, to_regclass, raw-sql | (c) | Two-transaction claim scanner; multi-worker delivery dropped. |
+| `completion_callback` | diesel, skip-locked, row-lock, to_regclass, raw-pg-sql, raw-sql | (c) | Two-transaction claim scanner; multi-worker delivery dropped. The batched `Delivered`/`Backoff` outcome writes bind their `unnest(...)` arrays with explicit `::uuid[]`/`::int4[]`/`::timestamptz[]`/`::text[]` casts — a dialect rewrite (`CAST(x AS t)`), not a capability gap. |
 | `completion_trigger` | diesel, interval-sql, skip-locked, advisory-lock, raw-sql | (c) | Terminal-commit fan-out; claim semantics dropped. The outbox relay's backoff deadlines are computed as `clock_timestamp() + make_interval(secs => …)` (issue #1392) — integer epoch ms for the interval arithmetic, as `build_routing` does. |
 | `concurrency` | diesel, skip-locked, advisory-lock, raw-pg-sql, raw-sql | (c) | Was a pure consumer of the claim invariant; the latest-wins supersede path (#811) added a `pg_advisory_xact_lock(hashtext(key)::bigint)` critical section and a raw candidate scan of its own. Per-key fleet limits are meaningless single-writer, and the advisory lock is subsumed by the single write lock. |
 | `context` | diesel, listen/notify | (c) | Wakeup path; no push primitive exists. |
