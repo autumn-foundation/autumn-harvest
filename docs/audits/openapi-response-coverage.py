@@ -335,10 +335,13 @@ def qualified_match(qualifier: list[str], place: str, origin: str | None = None)
     qualifier that starts with `crate` names a module path from the root of
     the crate of `origin`. One that starts with a scanned crate's name names
     a path from that crate's root. `self` names `origin`, and each `super`
-    one module up from it. Those forms must match `place` whole. Any other
-    qualifier must equal the trailing modules of `place`, so `a::b` reaches
-    `x::a::b` but not `x::b`. An external crate matches nothing, so its item
-    is unresolved. `resolve_symbol` reads every qualifier through this step.
+    one module up from it. Any other first name is relative, as in the 2018
+    edition, so `a::b` reaches `origin::a::b` only. Every form must match
+    `place` whole. A first name that is no module inside `origin` names an
+    external crate, as `models::Filter` does with no import, so it matches
+    nothing and its item is unresolved. An imported first name has already
+    been expanded by `expanded_path`. `resolve_symbol` reads every qualifier
+    through this step.
     """
     whole = place.split("::")
     base = (origin or location(LOCAL[0], LOCAL[1])).split("::")
@@ -355,8 +358,10 @@ def qualified_match(qualifier: list[str], place: str, origin: str | None = None)
                 return False
             base, wanted = base[:-1], wanted[1:]
         return whole == base + wanted
-    modules = whole[1:]
-    return len(wanted) <= len(modules) and modules[len(modules) - len(wanted) :] == wanted
+    # Any other first name is relative, as in the 2018 edition: it must be a
+    # module inside `origin`. Otherwise it names an external crate, which
+    # matches nothing.
+    return whole == base + wanted
 
 
 @functools.lru_cache(maxsize=None)
@@ -4994,6 +4999,10 @@ pub fn harvest_api_router() -> Router {
         .route("/n/strict-decoder", post(n_strict_decoder))
         .route("/n/ambiguous-method", post(n_ambiguous_method))
         .route("/n/wrong-prefix-struct", get(n_wrong_prefix_struct))
+        .route("/n/extern-root-struct", get(n_extern_root_struct))
+        .route("/n/extern-root-helper", post(n_extern_root_helper))
+        .route("/n/child-path-struct", get(n_child_path_struct))
+        .route("/n/aliased-root-struct", get(n_aliased_root_struct))
         .route("/n/crate-path-struct", get(n_crate_path_struct))
         .route("/n/module-helper", post(n_module_helper))
         .route("/n/turbofish-type-helper", post(n_turbofish_type_helper))
@@ -5041,6 +5050,46 @@ mod module_b {
 
 async fn n_qualified_struct(Query(filter): Query<module_b::Filter>) -> Response {
     StatusCode::OK.into_response()
+}
+
+mod unrelated {
+    mod models {
+        struct RemoteFilter {
+            wanted: u32,
+        }
+
+        fn decode_models(raw: &[u8]) -> Response {
+            StatusCode::OK.into_response()
+        }
+    }
+}
+
+async fn n_extern_root_struct(Query(filter): Query<models::RemoteFilter>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+async fn n_extern_root_helper(body: Bytes) -> Response {
+    models::decode_models(&body)
+}
+
+mod outer_scope {
+    mod inner {
+        struct InnerPage {
+            wanted: Option<u32>,
+        }
+    }
+
+    async fn n_child_path_struct(Query(page): Query<inner::InnerPage>) -> Response {
+        StatusCode::OK.into_response()
+    }
+}
+
+mod aliased_root {
+    use crate::unrelated::models as models;
+
+    async fn n_aliased_root_struct(Query(filter): Query<models::RemoteFilter>) -> Response {
+        StatusCode::OK.into_response()
+    }
 }
 
 async fn n_wrong_prefix_struct(Query(filter): Query<other::module_b::Filter>) -> Response {
@@ -9590,6 +9639,37 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             ),
         ],
         {"unresolved": ["GET /n/ambiguous-struct: cannot find struct Filter"]},
+    ),
+    (
+        "a relative first name must be a module inside the site, or it is an external crate",
+        FIXTURE_NAMES,
+        [
+            fixture_route(
+                "GET", path, 200, params=[query_param("wanted", "integer", True)]
+            )
+            for path in ("/n/extern-root-struct", "/n/aliased-root-struct")
+        ]
+        + [
+            fixture_route(
+                "POST",
+                "/n/extern-root-helper",
+                200,
+                request_body=body_of(("name", False), required=False),
+            ),
+            fixture_route(
+                "GET",
+                "/n/child-path-struct",
+                200,
+                params=[query_param("wanted", "integer", False)],
+            ),
+        ],
+        {
+            "body_required": ["POST /n/extern-root-helper: the body is mandatory"],
+            "unresolved": [
+                "GET /n/extern-root-struct: cannot find struct RemoteFilter",
+                "POST /n/extern-root-helper: cannot read a `from_slice` call",
+            ],
+        },
     ),
     (
         "a qualified path matches its whole module suffix",
