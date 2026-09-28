@@ -64,6 +64,7 @@ allos        autumn-harvest-plugin  security                         -          
 allos        autumn-harvest-plugin  sse_stream_tests                 -                          -
 allos        autumn-harvest-plugin  standalone_admin_auth            -                          -
 allos        autumn-harvest-plugin  standalone_mount                 -                          -
+allos        autumn-harvest-plugin  standalone_webhook_mount         webhooks                   -
 compileonly  autumn-harvest-plugin  dev_runtime_managed              dev-runtime-managed        -
 compileonly  autumn-harvest-plugin  mcp_tools_integration            mcp,unified-dag-execution  -
 compileonly  autumn-harvest-plugin  status_summary_localpg           -                          -
