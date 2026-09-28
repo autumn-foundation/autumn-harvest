@@ -828,14 +828,88 @@ def method_targets(
 
 
 def call_receiver(block: str, dot: int) -> str | None:
-    """The plain name just before the `.` of a method call at `dot`, or `None`."""
-    start = max(0, dot - 128)
-    head = block[start:dot].rstrip()
-    name = re.search(r"[A-Za-z_]\w*$", head)
-    if name is None or (name.start() == 0 and start > 0):
-        return None
-    before = head[name.start() - 1] if name.start() else ""
-    return None if before and (before.isalnum() or before in "_.") else name.group(0)
+    """The variable a method call at `dot` reads whole as its receiver, or `None`.
+
+    The receiver expression, as `receiver_expression` finds it, goes through
+    `argument_root`, the normalizer that argument handoffs use. So `body`,
+    `(body)`, `(&body)` and `(*body).as_ref()` all name `body`.
+    """
+    root, whole = argument_root(receiver_expression(block, dot))
+    return root if whole else None
+
+
+def receiver_expression(block: str, dot: int) -> str:
+    """The receiver expression of a method call at `dot`, as `receiver_start` bounds it."""
+    return block[receiver_start(block, dot) : dot].strip()
+
+
+def receiver_start(block: str, dot: int) -> int:
+    """Where the postfix expression that ends at the `.` of a method call at `dot` starts.
+
+    It reads back over names, grouped `( .. )` and indexed `[ .. ]` parts, a
+    call's own name with its turbofish, `?`, and the `.` or `::` that join
+    them. So the expression is `(&body)` in `(&body).decode()`, and
+    `body.as_ref()` in `body.as_ref().decode()`. A prefix operator outside
+    the group, as in `&body.decode()`, applies to the call, so it is not
+    read.
+    """
+
+    def skip(index: int) -> int:
+        while index > 0 and block[index - 1].isspace():
+            index -= 1
+        return index
+
+    index = skip(dot)
+    while index > 0:
+        char = block[index - 1]
+        if char in ")]":
+            opener = matching_opener(block, index - 1)
+            if opener is None:
+                break
+            index = opener
+            # A call's own name, with its turbofish, belongs to the call.
+            if char == ")" and block[index - 1 : index] == ">":
+                depth = 0
+                for back in range(index - 1, -1, -1):
+                    depth += block[back] == ">"
+                    depth -= block[back] == "<"
+                    if depth == 0:
+                        index = back - 2 if block[back - 2 : back] == "::" else back
+                        break
+            name = re.search(r"[A-Za-z_]\w*!?$", block[max(0, index - 64) : index])
+            if name:
+                index -= len(name.group(0))
+        elif char.isalnum() or char == "_":
+            while index > 0 and (block[index - 1].isalnum() or block[index - 1] == "_"):
+                index -= 1
+        elif char == "?":
+            index -= 1
+            continue
+        else:
+            break
+        joint = skip(index)
+        if joint > 1 and block[joint - 2 : joint] == "::":
+            index = skip(joint - 2)
+            continue
+        if joint > 0 and block[joint - 1] == "." and block[joint - 2 : joint] != "..":
+            index = skip(joint - 1)
+            continue
+        break
+    return index
+
+
+def matching_opener(text: str, closer: int) -> int | None:
+    """Where the `(` or `[` that the closer at `closer` matches starts, or `None`."""
+    pairs = {")": "(", "]": "["}
+    opener, close, depth = pairs[text[closer]], text[closer], 0
+    for index in range(closer, -1, -1):
+        if text[index] == close:
+            depth += 1
+        elif text[index] == opener:
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
 
 
 def enclosing_owner(site: Site) -> str | None:
@@ -1986,8 +2060,12 @@ BYTE_ACCESSORS = frozenset(
 CONVERSIONS = {"into": "from", "try_into": "try_from"}
 
 
-def conversion_parts(source: str, block: str, call: re.Match) -> tuple[Parts | None, str | None]:
-    """The `from` or `try_from` fn that a conversion call `call` runs, and its parameter.
+def conversion_parts(
+    source: str, block: str, method: str, start: int
+) -> tuple[Parts | None, str | None]:
+    """The `from` or `try_from` fn that a conversion `method` runs, and its parameter.
+
+    `start` is where the receiver of the conversion call starts in `block`.
 
     The target type must be written in the same statement, as in `let x: T =
     body.into();`. `resolve_symbol` then finds `T::from`, or `T::try_from`
@@ -1996,7 +2074,7 @@ def conversion_parts(source: str, block: str, call: re.Match) -> tuple[Parts | N
     `(None, None)`, so the handoff fails closed.
     """
     annotated = r"\blet\s+(?:mut\s+)?[a-z_]\w*\s*:\s*([^=;]+?)\s*=\s*$"
-    typed = re.search(annotated, block[: call.start()])
+    typed = re.search(annotated, block[:start])
     if typed is None:
         return None, None
     target, _ = canonical_type(typed.group(1), site_in(block, typed.start(1)))
@@ -2004,8 +2082,8 @@ def conversion_parts(source: str, block: str, call: re.Match) -> tuple[Parts | N
     head = re.match(r"((?:[A-Za-z_]\w*\s*::\s*)*[A-Z]\w*)", wrapped.group(1) if wrapped else target)
     if head is None:
         return None, None
-    reference = "%s::%s" % (head.group(1), CONVERSIONS[call.group(1)])
-    starts = resolve_symbol("fn", reference, site_in(block, call.start())) or []
+    reference = "%s::%s" % (head.group(1), CONVERSIONS[method])
+    starts = resolve_symbol("fn", reference, site_in(block, start)) or []
     parts = parts_at(source, starts[0]) if len(starts) == 1 else None
     first = re.match(r"\(\s*(?:mut\s+)?([a-z_]\w*)\s*:", parts[0]) if parts else None
     return (parts, first.group(1)) if first else (None, None)
@@ -2045,15 +2123,25 @@ def handoffs(
                 optional, tolerant = optional and was_optional, tolerant and was_tolerant
             merged[identity, name] = (helper, parts, optional, tolerant)
     found = [(helper, parts, name, o, t) for (_, name), (helper, parts, o, t) in merged.items()]
-    for variable, bound_at in carriers.items() if receivers else []:
-        receiver = r"(?<![.\w])%s\s*\.\s*([a-z_][a-z_0-9]*)%s\s*\(" % (re.escape(variable), TURBOFISH)
-        for call in re.finditer(receiver, block):
-            method = call.group(1)
-            if method in BYTE_ACCESSORS:
-                continue
-            if not carrier_live(block, carriers, variable, call.start()):
+    # A method call whose receiver holds a carrier hands it to `self`. The
+    # receiver goes through `argument_passes`, as an argument does, so a
+    # grouped or borrowed receiver such as `(&body)` is read like `body`, and
+    # one that holds the carrier in any other way fails closed.
+    for call in qualified_calls(block) if receivers else []:
+        if call.group(1).strip() != "." or call.group(2) in BYTE_ACCESSORS:
+            continue
+        method, expression = call.group(2), receiver_expression(block, call.start())
+        for variable in carriers:
+            way = argument_passes(expression, variable)
+            if way is None or not carrier_live(block, carriers, variable, call.start()):
                 continue
             if in_dead_closure(block, call.start()):
+                continue
+            after = block[call.end() - 1 + len(balanced(block[call.end() - 1 :])) :]
+            tolerant = discards_error(block[: call.start()], after)
+            allowed = empty_allowed(block, call.start(), variable, tolerant)
+            if way == "wrapped":
+                found.append((method, None, "self", allowed, tolerant))
                 continue
             # A partial carrier reaches no method the audit can follow. A whole
             # one reaches only a method of an `impl` for its own type.
@@ -2062,20 +2150,16 @@ def handoffs(
                 None if partial else method_targets(block, params, variable, method, call.start())
             )
             parts = parts_at(source, starts[0]) if starts and len(starts) == 1 else None
-            after = block[call.end() - 1 + len(balanced(block[call.end() - 1 :])) :]
-            tolerant = discards_error(block[: call.start()], after)
-            guarded = guards(block, call.start(), variable)
             if method in CONVERSIONS:
                 # A conversion hands the body to the constructor it runs.
+                start = receiver_start(block, call.start())
                 converted, parameter = (
-                    (None, None) if partial else conversion_parts(source, block, call)
+                    (None, None) if partial else conversion_parts(source, block, method, start)
                 )
-                allowed = guarded or tolerant and not rejects_empty(block, call.start(), variable)
                 found.append((method, converted, parameter, allowed, tolerant))
                 continue
             by_self = r"\(\s*&?\s*(?:'[a-z_]+\s+)?(?:mut\s+)?self\b"
             self_param = parts is not None and re.match(by_self, parts[0])
-            allowed = guarded or tolerant and not rejects_empty(block, call.start(), variable)
             found.append((method, parts if self_param else None, "self", allowed, tolerant))
     return found
 
@@ -5152,6 +5236,7 @@ pub fn harvest_api_router() -> Router {
         .route("/n/typed-receiver", post(n_typed_receiver))
         .route("/n/let-receiver", post(n_let_receiver))
         .route("/n/alias-receiver", post(n_alias_receiver))
+        .route("/n/grouped-let-receiver", post(n_grouped_let_receiver))
         .route("/n/untyped-receiver", post(n_untyped_receiver))
         .route("/n/maybe-fields", post(n_maybe_fields))
         .route("/n/loose-field", post(n_loose_field))
@@ -5254,6 +5339,11 @@ type ReaderAlias = StrictReader;
 async fn n_alias_receiver(body: Bytes) -> Response {
     let reader: ReaderAlias = make_reader();
     reader.read(&body)
+}
+
+async fn n_grouped_let_receiver(body: Bytes) -> Response {
+    let reader = StrictReader::new();
+    (&reader).read(&body)
 }
 
 async fn n_let_receiver(body: Bytes) -> Response {
@@ -5748,6 +5838,11 @@ pub fn harvest_api_router() -> Router {
         .route("/e/raw-unknown-method", post(e_raw_unknown_method))
         .route("/e/raw-std-reader", post(e_raw_std_reader))
         .route("/e/extension-decode", post(e_extension_decode))
+        .route("/e/grouped-receiver", post(e_grouped_receiver))
+        .route("/e/borrowed-receiver", post(e_borrowed_receiver))
+        .route("/e/nested-receiver", post(e_nested_receiver))
+        .route("/e/sliced-receiver", post(e_sliced_receiver))
+        .route("/e/grouped-argument", post(e_grouped_argument))
         .route("/e/unrelated-receiver", post(e_unrelated_receiver))
         .route("/e/alias-body", post(e_alias_body))
         .route("/e/dead-closure", post(e_dead_closure))
@@ -7382,6 +7477,31 @@ mod spoofed_parse {
         let gadget = serde_json::from_slice::<Gadget>(&body).unwrap();
         StatusCode::OK.into_response()
     }
+}
+
+async fn e_grouped_receiver(body: Bytes) -> Response {
+    let gadget = (body).decode_body::<Gadget>();
+    StatusCode::OK.into_response()
+}
+
+async fn e_borrowed_receiver(body: Bytes) -> Response {
+    let gadget = (&body).decode_body::<Gadget>();
+    StatusCode::OK.into_response()
+}
+
+async fn e_nested_receiver(body: Bytes) -> Response {
+    let gadget = (&(body)).decode_body::<Gadget>();
+    StatusCode::OK.into_response()
+}
+
+async fn e_sliced_receiver(body: Bytes) -> Response {
+    let gadget = (&body[1..]).decode_body::<Gadget>();
+    StatusCode::OK.into_response()
+}
+
+async fn e_grouped_argument(body: Bytes) -> Response {
+    let gadget = parse_gadget((&body))?;
+    StatusCode::OK.into_response()
 }
 
 async fn e_unknown_receiver_method(body: Bytes) -> Response {
@@ -9873,12 +9993,14 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
                 "/n/let-receiver",
                 "/n/untyped-receiver",
                 "/n/alias-receiver",
+                "/n/grouped-let-receiver",
             )
         ],
         {
             "body_required": [
                 "POST /n/let-receiver: the body is mandatory",
                 "POST /n/alias-receiver: the body is mandatory",
+                "POST /n/grouped-let-receiver: the body is mandatory",
                 "POST /n/untyped-receiver: the body is mandatory",
             ],
             "unresolved": ["POST /n/untyped-receiver: cannot read a `from_slice` call"],
@@ -10540,6 +10662,38 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
         FIXTURE_EDGES,
         [fixture_route("POST", "/e/spoofed-parse", 200, request_body=GADGET_BODY)],
         {"unresolved": ["POST /e/spoofed-parse: cannot read a `from_slice` call"]},
+    ),
+    (
+        "a grouped or borrowed receiver is read like an argument, or fails closed",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST", path, 200, request_body=body_of(("name", False), required=False)
+            )
+            for path in (
+                "/e/grouped-receiver",
+                "/e/borrowed-receiver",
+                "/e/nested-receiver",
+                "/e/sliced-receiver",
+                "/e/grouped-argument",
+            )
+        ],
+        {
+            "body_required": [
+                "POST /e/grouped-receiver: the body is mandatory",
+                "POST /e/borrowed-receiver: the body is mandatory",
+                "POST /e/nested-receiver: the body is mandatory",
+                "POST /e/sliced-receiver: the body is mandatory",
+                "POST /e/grouped-argument: the body is mandatory",
+            ],
+            "mandatory": [
+                "POST /e/grouped-receiver: `name` is mandatory in Gadget",
+                "POST /e/borrowed-receiver: `name` is mandatory in Gadget",
+                "POST /e/nested-receiver: `name` is mandatory in Gadget",
+                "POST /e/grouped-argument: `name` is mandatory in Gadget",
+            ],
+            "unresolved": ["POST /e/sliced-receiver: cannot read a `from_slice` call"],
+        },
     ),
     (
         "a raw body as the receiver of a method maps to self, unless the method is an accessor",
