@@ -4198,6 +4198,21 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "reason": {
+                    "description": "Accepted for symmetry with pause, then ignored. Resume clears pause_reason."
+                  }
+                },
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
         "responses": {
           "200": {
             "content": {
@@ -5985,15 +6000,6 @@
             "required": true,
             "schema": {
               "type": "string"
-            }
-          },
-          {
-            "description": "Maximum number of runs to return.",
-            "in": "query",
-            "name": "limit",
-            "required": false,
-            "schema": {
-              "type": "integer"
             }
           }
         ],

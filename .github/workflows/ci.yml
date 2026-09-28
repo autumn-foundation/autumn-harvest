@@ -609,8 +609,12 @@ jobs:
       # The contract is what the OpenAPI document is generated from, so a
       # status or a mandatory field missing there is missing from every
       # generated client. Reads api.rs and the contract, builds nothing.
+      # The self-test runs first. It runs each fixture through the checks.
+      # A change to the parser that breaks a check fails CI.
       - name: OpenAPI contract coverage (docs/audits/openapi-response-coverage.py)
-        run: python3 docs/audits/openapi-response-coverage.py
+        run: |
+          python3 docs/audits/openapi-response-coverage.py --self-test
+          python3 docs/audits/openapi-response-coverage.py
 
       - name: Comment hygiene (docs/audits/comment-hygiene.py)
         run: |

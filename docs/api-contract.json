@@ -3311,13 +3311,6 @@
           "type": "string",
           "required": true,
           "description": "Registered DAG name."
-        },
-        {
-          "name": "limit",
-          "in": "query",
-          "type": "integer",
-          "required": false,
-          "description": "Maximum number of runs to return."
         }
       ],
       "request_body": null,
@@ -7405,7 +7398,13 @@
       "request_body": {
         "required": false,
         "free_form": false,
-        "fields": []
+        "fields": [
+          {
+            "name": "reason",
+            "required": false,
+            "description": "Accepted for symmetry with pause, then ignored. Resume clears pause_reason."
+          }
+        ]
       },
       "success_response": {
         "status": 200,
