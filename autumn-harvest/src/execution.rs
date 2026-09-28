@@ -3041,14 +3041,22 @@ pub(crate) const REPLACEABLE_PRIOR_STATES: &[&str] =
 /// outcome it really had. Returns `None` for a real continue-as-new, or when
 /// the history names no outcome.
 ///
-/// A workflow task timeout records `WorkflowFailed` for a `TIMED_OUT` run, so
-/// such a run reads back as `FAILED` once replaced.
+/// A workflow task timeout records `WorkflowFailed` for a `TIMED_OUT` run.
+/// Its [`crate::failure::ERROR_TYPE_WORKFLOW_TASK_TIMED_OUT`] type makes such
+/// a run read back as `TIMED_OUT`. A history written before that type existed
+/// reads back as `FAILED`.
 #[must_use]
 pub fn replaced_run_outcome(events: &[WorkflowEvent]) -> Option<&'static str> {
     events.iter().rev().find_map(|event| match event {
         WorkflowEvent::WorkflowContinuedAsNew { .. }
         | WorkflowEvent::WorkflowResetTerminated { .. } => Some(None),
         WorkflowEvent::WorkflowCompleted { .. } => Some(Some("COMPLETED")),
+        WorkflowEvent::WorkflowFailed { error_type, .. }
+            if error_type.as_deref()
+                == Some(crate::failure::ERROR_TYPE_WORKFLOW_TASK_TIMED_OUT) =>
+        {
+            Some(Some("TIMED_OUT"))
+        }
         WorkflowEvent::WorkflowFailed { .. } => Some(Some("FAILED")),
         WorkflowEvent::WorkflowCancelled { .. } => Some(Some("CANCELLED")),
         WorkflowEvent::WorkflowExecutionTimedOut { .. } => Some(Some("TIMED_OUT")),
@@ -10175,6 +10183,28 @@ mod replaced_run_outcome_tests {
                 reason: "stop".into()
             }]),
             Some("CANCELLED")
+        );
+    }
+
+    #[test]
+    fn a_workflow_task_timeout_reads_back_as_timed_out() {
+        let timed_out = WorkflowEvent::WorkflowFailed {
+            error: "timeout: StartToClose for wf".into(),
+            error_type: Some(crate::failure::ERROR_TYPE_WORKFLOW_TASK_TIMED_OUT.into()),
+            details: None,
+            non_retryable: None,
+        };
+        assert_eq!(replaced_run_outcome(&[timed_out]), Some("TIMED_OUT"));
+    }
+
+    #[test]
+    fn a_workflow_that_fails_with_timeout_text_still_reads_as_failed() {
+        // An activity timeout that the workflow returns writes the same text.
+        assert_eq!(
+            replaced_run_outcome(&[WorkflowEvent::workflow_failed(
+                "timeout: StartToClose for send_email"
+            )]),
+            Some("FAILED")
         );
     }
 

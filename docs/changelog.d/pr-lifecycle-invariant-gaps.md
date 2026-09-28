@@ -28,8 +28,12 @@ change.
   `execution::replaced_run_outcome` reads it, and both
   `WorkflowHandle::load_effective_execution` and
   `read_external_await_outcome` now report it. A real continue-as-new is
-  unaffected. A run whose workflow task timed out records `WorkflowFailed`, so
-  once replaced it reads back as `FAILED`, not `TIMED_OUT`.
+  unaffected. A workflow task timeout records `WorkflowFailed`, which now
+  carries the engine-reserved `error_type` `WorkflowTaskTimedOut`
+  (`failure::ERROR_TYPE_WORKFLOW_TASK_TIMED_OUT`). A replaced run with that
+  event reads back as `TIMED_OUT`. The error text alone cannot decide it,
+  because a workflow that returns an activity timeout writes the same text.
+  A history written before this change reads back as `FAILED`.
 - `inline_cancel` appended `WorkflowCancelled` and then ignored a zero-row
   UPDATE. It now rolls back.
 - `terminate_workflow_execution_collect` returned an idempotent success for

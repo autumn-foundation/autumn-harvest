@@ -2227,6 +2227,28 @@ async fn a_workflow_task_timeout_on_a_paused_run_clears_the_pause_record() {
 }
 
 #[tokio::test]
+async fn a_workflow_task_timeout_stays_a_timeout_once_replaced() {
+    // A start-replace seals the row `CONTINUED_AS_NEW` and writes no event.
+    // Readers then infer the outcome from history, so the timeout's own event
+    // must still say `TIMED_OUT`.
+    let (url, _c) = setup().await;
+    let mut conn = connect(&url).await;
+    let exec_id = start(&mut conn, "wf", "wft-timeout-replaced").await;
+    make_workflow_task_overdue(&mut conn, exec_id).await;
+
+    scan_timeouts_once(&mut conn).await;
+
+    assert_eq!(get_state(&mut conn, exec_id).await, "TIMED_OUT");
+    assert_eq!(
+        autumn_harvest::execution::replaced_run_outcome_state(&mut conn, exec_id)
+            .await
+            .expect("history"),
+        Some("TIMED_OUT"),
+        "the history must keep the timeout, not read back as a plain failure"
+    );
+}
+
+#[tokio::test]
 async fn a_workflow_task_timeout_never_rewrites_a_sealed_run() {
     // The timeout scan filters on task state only. A run that another path
     // already sealed can still own an open workflow task. The timeout must

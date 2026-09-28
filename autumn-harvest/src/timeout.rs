@@ -1944,7 +1944,14 @@ async fn enforce_workflow_timeout(
                 }
                 WorkflowTaskTimeoutDisposition::Skip => return Ok(None),
             }
-            let workflow_event = WorkflowEvent::workflow_failed(error.clone());
+            // The engine-reserved type keeps the timeout readable after a
+            // start-replace seals this row `CONTINUED_AS_NEW`.
+            let workflow_event = WorkflowEvent::WorkflowFailed {
+                error: error.clone(),
+                error_type: Some(crate::failure::ERROR_TYPE_WORKFLOW_TASK_TIMED_OUT.to_string()),
+                details: None,
+                non_retryable: None,
+            };
 
             store::append_events_with_codecs(
                 conn,
