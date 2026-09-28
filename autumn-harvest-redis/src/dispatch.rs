@@ -140,6 +140,19 @@ const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// `wait`, regardless of how many queues are configured.
 const QUEUE_BLOCK_SLICE: Duration = Duration::from_millis(200);
 
+/// Round trips one queue visit in `read_across_queues` can need. The common
+/// case is one `XREADGROUP`. A missing consumer group costs three:
+/// `read_with_heal` issues the failed read, then `ensure_groups`, then a
+/// retry read.
+const VISIT_ROUND_TRIPS: usize = 3;
+
+/// Sequential round trips per queue that one `next` call can make outside
+/// its wait. `read_across_queues` visits every queue once in its initial
+/// non-blocking pass. A deadline that passes mid-lap also finishes that lap
+/// with non-blocking reads, so each queue can get a second visit after the
+/// wait ends (#1756). Either visit can be the one that heals a group.
+const NEXT_ROUND_TRIPS_PER_QUEUE: usize = 2 * VISIT_ROUND_TRIPS;
+
 /// Separator between the entry id and the payload inside a lease handle.
 ///
 /// A stream entry id is `{milliseconds}-{sequence}`, so it never holds this
@@ -1405,6 +1418,10 @@ impl TaskDispatch for RedisDispatch {
         harvest(self.publish_inner(hints).await)
     }
 
+    fn next_round_trips_per_queue(&self) -> usize {
+        NEXT_ROUND_TRIPS_PER_QUEUE
+    }
+
     async fn next(
         &self,
         queues: &[String],
@@ -1834,6 +1851,16 @@ return n
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A read can visit each queue twice: the initial pass and a lap that
+    /// finishes after the deadline. Either visit can heal a missing group,
+    /// which costs three round trips. The worker's read timeout must cover
+    /// all six (#1756).
+    #[test]
+    fn a_read_reports_two_healed_visits_per_queue() {
+        assert_eq!(VISIT_ROUND_TRIPS, 3);
+        assert_eq!(NEXT_ROUND_TRIPS_PER_QUEUE, 6);
+    }
 
     fn lease(redeliveries: u32) -> DispatchLease {
         DispatchLease {
