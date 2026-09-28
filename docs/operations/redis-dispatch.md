@@ -251,6 +251,8 @@ wrapper, so the two cases do not share one failure mode.
 | `rediss://` URL | Startup fails at connect | An error stating that this release carries no TLS transport (issue #1429) |
 | `key_prefix` or `consumer_group` empty | Startup fails at config validation | An error naming the empty key |
 | A worker queue name is empty or holds a `:` | Startup fails before the channel is installed; `Worker::new` repeats the check | An error naming the queue and the rule |
+| A core caller installs the channel after `Worker::new` | The worker checks the span and every queue name when it starts to run. It uses the channel only when both checks pass. Otherwise it claims through Postgres. An install after the run starts does not reach the worker | One error naming the reason and issue #1431 |
+| A second runtime in the same process replaces the channel | A running worker keeps the channel it started with. Its reads, its task hints and the hints of its maintenance loops use that channel | No error |
 
 The fallback is the important one, and its scope is exact. It covers the
 **running** state: a started process that loses Redis keeps working on the

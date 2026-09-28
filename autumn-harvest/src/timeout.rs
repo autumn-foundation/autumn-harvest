@@ -976,6 +976,35 @@ fn external_task_timeout_still_due(
     state == "PENDING" && schedule_to_close_at < now
 }
 
+/// What a workflow task timeout may do to its owning execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkflowTaskTimeoutDisposition {
+    /// The run is open. Seal it `TIMED_OUT`.
+    Seal,
+    /// The run is already sealed. Fail the orphan task and nothing else.
+    FailTaskOnly,
+    /// The row is a staged shard copy. Do not touch it.
+    Skip,
+}
+
+/// Classify the locked execution state for a workflow task timeout.
+///
+/// `PAUSED` seals, as the quarantine and poison-pill paths do (issue #383).
+/// A terminal state never changes, so a late timeout cannot rewrite the
+/// recorded outcome of a run.
+fn workflow_task_timeout_disposition(state: &str) -> WorkflowTaskTimeoutDisposition {
+    match state {
+        "RUNNING" | "PAUSED" => WorkflowTaskTimeoutDisposition::Seal,
+        s if crate::erase::is_terminal_state(s) => WorkflowTaskTimeoutDisposition::FailTaskOnly,
+        _ => WorkflowTaskTimeoutDisposition::Skip,
+    }
+}
+
+/// Seal an open execution `TIMED_OUT`.
+///
+/// The write carries its own state predicate. Only a `RUNNING` or `PAUSED` row
+/// changes, and any other state returns an error. A paused run also loses its
+/// pause record, so it cannot appear both terminal and paused (issue #383).
 async fn update_workflow_execution_timed_out(
     conn: &mut AsyncPgConnection,
     exec_id: crate::types::ExecutionId,
@@ -996,28 +1025,35 @@ async fn update_workflow_execution_timed_out(
         .map_err(crate::error::database_error)?
         .unwrap_or(false);
 
-    let updated = diesel::update(dsl::harvest_workflow_executions.find(exec_id.as_uuid()))
-        .set((
-            dsl::state.eq("TIMED_OUT"),
-            dsl::output.eq(None::<serde_json::Value>),
-            dsl::error.eq(Some(error.to_string())),
-            dsl::completed_at.eq(Some(Utc::now())),
-            // Belt-and-braces ND-block reset (code-review fix, issue #603):
-            // a TIMED_OUT execution closes out permanently — a stale block
-            // marker must not survive on a terminal row, matching the
-            // precedent already applied to the two worker.rs terminal
-            // writers.
-            dsl::nd_blocked_at.eq(None::<chrono::DateTime<Utc>>),
-            dsl::nd_block_reason.eq(None::<String>),
-            dsl::nd_block_count.eq(0),
-        ))
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error)?;
+    let updated = diesel::update(
+        dsl::harvest_workflow_executions
+            .find(exec_id.as_uuid())
+            .filter(dsl::state.eq_any(["RUNNING", "PAUSED"])),
+    )
+    .set((
+        dsl::state.eq("TIMED_OUT"),
+        dsl::output.eq(None::<serde_json::Value>),
+        dsl::error.eq(Some(error.to_string())),
+        dsl::completed_at.eq(Some(Utc::now())),
+        dsl::paused_at.eq(None::<chrono::DateTime<Utc>>),
+        dsl::pause_reason.eq(None::<String>),
+        dsl::pause_actor.eq(None::<String>),
+        // Belt-and-braces ND-block reset (code-review fix, issue #603):
+        // a TIMED_OUT execution closes out permanently — a stale block
+        // marker must not survive on a terminal row, matching the
+        // precedent already applied to the two worker.rs terminal
+        // writers.
+        dsl::nd_blocked_at.eq(None::<chrono::DateTime<Utc>>),
+        dsl::nd_block_reason.eq(None::<String>),
+        dsl::nd_block_count.eq(0),
+    ))
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
 
     if updated == 0 {
         return Err(HarvestError::NotFound(format!(
-            "workflow execution {exec_id}"
+            "workflow execution {exec_id} is not RUNNING or PAUSED"
         )));
     }
 
@@ -1895,7 +1931,27 @@ async fn enforce_workflow_timeout(
                 return Ok(None);
             }
             let error = timeout_error(&execution.workflow_name, reason);
-            let workflow_event = WorkflowEvent::workflow_failed(error.clone());
+            // The task scan filters on task state only. So the owning execution
+            // can already be sealed, or can be a staged shard copy. A workflow
+            // task timeout seals only an open run: `RUNNING` or `PAUSED`.
+            match workflow_task_timeout_disposition(&execution.state) {
+                WorkflowTaskTimeoutDisposition::Seal => {}
+                WorkflowTaskTimeoutDisposition::FailTaskOnly => {
+                    // The run is already sealed. Close the orphan task so the
+                    // scan stops finding it, and keep the recorded outcome.
+                    queue::fail_task(conn, task.id, &error).await?;
+                    return Ok(None);
+                }
+                WorkflowTaskTimeoutDisposition::Skip => return Ok(None),
+            }
+            // The engine-reserved type keeps the timeout readable after a
+            // start-replace seals this row `CONTINUED_AS_NEW`.
+            let workflow_event = WorkflowEvent::WorkflowFailed {
+                error: error.clone(),
+                error_type: Some(crate::failure::ERROR_TYPE_WORKFLOW_TASK_TIMED_OUT.to_string()),
+                details: None,
+                non_retryable: None,
+            };
 
             store::append_events_with_codecs(
                 conn,
@@ -5120,7 +5176,8 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
         )
     })
     .collect();
-    tokio::spawn(async move {
+    // Keep the worker dispatch binding for hints (issue #1431).
+    crate::dispatch::spawn_bound(async move {
         loop {
             tokio::select! {
                 () = cancel.cancelled() => {
@@ -5484,6 +5541,38 @@ pub async fn enforce_workflow_history_ceiling_with_codecs(
 
 #[cfg(test)]
 mod tests {
+    // ── workflow task timeout against the locked execution state ─────────
+
+    #[test]
+    fn a_workflow_task_timeout_seals_only_an_open_run() {
+        for state in ["RUNNING", "PAUSED"] {
+            assert_eq!(
+                workflow_task_timeout_disposition(state),
+                WorkflowTaskTimeoutDisposition::Seal,
+                "{state}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_workflow_task_timeout_never_rewrites_a_sealed_run() {
+        for state in crate::erase::TERMINAL_STATES {
+            assert_eq!(
+                workflow_task_timeout_disposition(state),
+                WorkflowTaskTimeoutDisposition::FailTaskOnly,
+                "{state}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_workflow_task_timeout_leaves_a_staged_copy_alone() {
+        assert_eq!(
+            workflow_task_timeout_disposition("MIGRATING"),
+            WorkflowTaskTimeoutDisposition::Skip
+        );
+    }
+
     // ── by-id shard-local vs. cross-shard disagreement (issue #1146) ──────
 
     #[test]

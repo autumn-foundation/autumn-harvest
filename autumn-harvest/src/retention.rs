@@ -2121,6 +2121,10 @@ async fn run_shard_tick(
         .and_then(|age| chrono::Duration::from_std(age).ok())
         .map(|delta| now - delta);
 
+    // The candidate SQL excludes rows whose `sticky_worker_id` starts with
+    // this prefix. The worker also writes that column, with its own id, when
+    // it seals a run. Those rows stay candidates. Only a live lease excludes
+    // a row.
     let lease_id = format!("retention-lease-{}", uuid::Uuid::new_v4());
     let guard = RetentionLeaseGuard {
         pool: pool.clone(),
@@ -2191,7 +2195,7 @@ async fn run_shard_tick(
                  FROM harvest_workflow_executions
                  WHERE state IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW','TERMINATED')
                    AND completed_at IS NOT NULL
-                   AND sticky_worker_id IS NULL
+                   AND (sticky_worker_id IS NULL OR sticky_worker_id NOT LIKE 'retention-lease-%')
                    AND completed_at < COALESCE(
                        (SELECT ov.cut
                           FROM unnest($1::text[], $2::timestamptz[]) AS ov(nm, cut)
@@ -2210,7 +2214,7 @@ async fn run_shard_tick(
                  FROM harvest_workflow_executions
                  WHERE state IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW','TERMINATED')
                    AND completed_at IS NOT NULL
-                   AND sticky_worker_id IS NULL
+                   AND (sticky_worker_id IS NULL OR sticky_worker_id NOT LIKE 'retention-lease-%')
                    AND completed_at < COALESCE(
                        (SELECT ov.cut
                           FROM unnest($1::text[], $2::timestamptz[]) AS ov(nm, cut)
@@ -2654,12 +2658,16 @@ async fn run_shard_tick(
                     .await?;
                     continue;
                 }
-                Ok(CandidateDeleteOutcome::SkippedStaging) => {
+                Ok(
+                    CandidateDeleteOutcome::SkippedStaging
+                    | CandidateDeleteOutcome::SkippedNotTerminal,
+                ) => {
                     // A shard-rebalance staging vacate landed after selection
                     // (issue #1317 review, P1): the delete-tx FOR UPDATE
                     // re-check found `staging_vacated_state` set and aborted
-                    // the delete. Treat exactly like a routine skip, for the
-                    // same reason as `SkippedHeld` above.
+                    // the delete. A redrive that reopened the run after the
+                    // scan is handled the same way. Treat exactly like a
+                    // routine skip, for the same reason as `SkippedHeld` above.
                     routine_skip_candidate(
                         &mut conn,
                         candidate.id,
@@ -2757,7 +2765,26 @@ enum CandidateDeleteOutcome {
     /// aborted and NOTHING was touched, for the same reason as
     /// [`Self::SkippedHeld`] (issue #1317 review, P1).
     SkippedStaging,
+    /// The row is no longer in a retention candidate state under the
+    /// delete-tx row lock. A DLQ redrive reopened it after the candidate
+    /// scan. The delete was aborted and NOTHING was touched, for the same
+    /// reason as [`Self::SkippedHeld`].
+    SkippedNotTerminal,
 }
+
+/// The execution states the retention candidate scan selects.
+///
+/// The candidate SQL lists the same states. `MIGRATED` is absent on purpose:
+/// a sealed source row carries the forwarding pointer.
+#[cfg(feature = "db")]
+const RETENTION_CANDIDATE_STATES: &[&str] = &[
+    "COMPLETED",
+    "FAILED",
+    "CANCELLED",
+    "TIMED_OUT",
+    "CONTINUED_AS_NEW",
+    "TERMINATED",
+];
 
 /// The two legal-hold timestamp columns `(legal_hold_set_at, legal_hold_until)`.
 #[cfg(feature = "db")]
@@ -2912,6 +2939,13 @@ async fn delete_candidate_execution(
             // Abort exactly like an active legal hold: touch nothing.
             if staging_vacated_state.is_some() {
                 return Ok(CandidateDeleteOutcome::SkippedStaging);
+            }
+            // The candidate scan read the state before this lock. A DLQ redrive
+            // can move a FAILED run back to RUNNING in that window. Deleting it
+            // would destroy a live run and its history, so check the state again
+            // under the lock.
+            if !RETENTION_CANDIDATE_STATES.contains(&state.as_str()) {
+                return Ok(CandidateDeleteOutcome::SkippedNotTerminal);
             }
             let was_ever_migrated_here = migrated_from_shards
                 .as_ref()
