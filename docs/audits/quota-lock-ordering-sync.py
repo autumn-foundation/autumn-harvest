@@ -93,8 +93,11 @@ any `for _ in var {` loop found before the assignment closes the
 concrete case. A follow-up round found a one-line evasion of that fix:
 rebinding the pre-assignment variable to a new name first (`let
 unordered_rows = due_rows;`) and looping over THAT. Tracking single-hop
-aliases this way closes the demonstrated case too, but this is a
-declared, deliberate stopping point, not a promise of soundness: chained
+aliases this way closes the demonstrated case too — including a type
+annotation on the alias (`let unordered_rows: Vec<FireDueRow> =
+due_rows;`), which the alias regex initially missed entirely, matching
+only the bare, unannotated form — but this is a declared, deliberate
+stopping point, not a promise of soundness: chained
 aliasing, passing the variable into a helper function, a struct field,
 or a tuple destructure all remain undetected, and proving the assignment
 dominates every possible control-flow and data-flow path in full
@@ -570,7 +573,7 @@ def check_call_site_guard(text: str, file_label: str, enclosing_fn: str, wrapper
 
     before_assignment = masked[: call_open_match.start()]
     watched_names = {var}
-    alias_re = re.compile(r"let\s+(?:mut\s+)?(\w+)\s*=\s*" + re.escape(var) + r"\s*;")
+    alias_re = re.compile(r"let\s+(?:mut\s+)?(\w+)\s*(?::[^=;]+)?=\s*" + re.escape(var) + r"\s*;")
     watched_names.update(m.group(1) for m in alias_re.finditer(before_assignment))
     early_loop_re = re.compile(r"for\s+\w+\s+in\s+(?:" + "|".join(re.escape(n) for n in watched_names) + r")\s*\{")
     early_loop_match = early_loop_re.search(before_assignment)
