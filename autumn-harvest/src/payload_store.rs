@@ -555,7 +555,8 @@ mod tests {
     async fn already_offloaded_field_is_not_reuploaded() {
         let store = MemStore::new();
         let off = offloader(store.clone(), 16);
-        let mut event = event_with_output(serde_json::json!({ "blob": "y".repeat(5_000) }));
+        let original = serde_json::json!({ "blob": "y".repeat(5_000) });
+        let mut event = event_with_output(original.clone());
         off.offload_event_value(&mut event).await.unwrap();
         assert_eq!(store.puts.load(Ordering::SeqCst), 1);
         // Re-running offload on an already-enveloped value must not re-upload
@@ -563,6 +564,12 @@ mod tests {
         let refs = off.offload_event_value(&mut event).await.unwrap();
         assert!(refs.is_empty());
         assert_eq!(store.puts.load(Ordering::SeqCst), 1, "no second put");
+        // The re-persisted envelope must still inflate back to the real
+        // blob. This guards against an issue #1758 fix that closes the
+        // collision by escaping every envelope-shaped field
+        // unconditionally, which would also break a genuine re-persist.
+        off.inflate_event_value(&mut event).await.unwrap();
+        assert_eq!(event["data"]["output"], original);
     }
 
     #[tokio::test]
