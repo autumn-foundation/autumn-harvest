@@ -24,7 +24,7 @@ on 2026-09-27. Clustering by signature:
 
 | Run | Time (UTC) | Job | Signature |
 |---|---|---|---|
-| 36347109249 | 23:59 | Test DB (linux, shard 6) | `dispatch_redis::a_queue_near_the_tail_of_a_long_rotation_still_gets_a_blocking_look` — `left == right` failed, left 0, right 1, `tests/dispatch_redis.rs:1256` |
+| 36347109249 (PR #1715, attempt 2) | 23:59 | Test DB (linux, shard 6) | `dispatch_redis::a_queue_near_the_tail_of_a_long_rotation_still_gets_a_blocking_look` — `left == right` failed, left 0, right 1, `tests/dispatch_redis.rs:1256` |
 | 36342582816 | 20:21 | Test DB (linux, shard 0) | `cross_region_dr_tests` FK violation (pre-dates the 21:35 fix in #1753; unrelated to this report) |
 | 36343266170 | 19:08 | Lint | `sqlite_feasibility_docs::derived_totals_agree_with_the_table_and_the_tree` — stale headline count (doc-drift class, not a flake; see note below) |
 | 36340435284 | 18:22 | Lint | `sqlite_feasibility_docs::every_inventoried_module_records_the_mechanisms_grep_finds` + `mechanism_counts_quoted_in_the_report_are_current` — same doc-drift class |
@@ -41,10 +41,15 @@ future session if it keeps recurring; not this report's target.
 
 The `dispatch_redis` signature is the target. `PR #1756`, opened
 02:42 UTC today by a separate session, already diagnoses and fixes it,
-citing two prior occurrences on PR #1715 (a UI-only PR, unrelated to Redis)
-before this report's third sample. Three independent occurrences across
-three unrelated PRs is enough on its own to rule out "specific to this
-diff" — the trigger is CI-runner load, not the code under test.
+citing two prior occurrences on PR #1715 (a UI-only PR, unrelated to Redis).
+Checking this session's own sample against that: run 36347109249 is
+`pull_requests: [1715]`, attempt 2 — the *same* PR, not a third one. So
+this report's independent scan corroborates PR #1756's own two occurrences
+rather than adding a third, distinct PR. That is weaker than "three
+unrelated PRs" would have been, but the two occurrences PR #1756 already
+cites are themselves enough to place the trigger in CI-runner load rather
+than in PR #1715's UI-only diff: the same non-Redis-touching PR cannot be
+the cause of a Redis-dispatch race repeating across separate CI attempts.
 
 ## 🔍 Diagnosis
 
@@ -104,13 +109,19 @@ no commit made to this session's own branch from the patched state.
 "The failure needs a slow round trip, so it does not reproduce on an idle
 local Redis." That does not hold in this sandbox — a bare local
 `redis-server`, not under any deliberate load, reproduced the failure at
-15% (3/20). The mechanism still fits: this sandbox is a 4-core container
-already running `cargo test`'s own thread pool plus the test binary's
-`multi_thread` Tokio runtime for 20 concurrent-ish queue visits, which is
-enough scheduling contention to push round trips over the roughly-40ms
-threshold PR #1756's own arithmetic names, without any external load
-generator. This is additional evidence for the same diagnosis, not a
-different one: "idle" undersells how little contention this bug needs.
+15% (3/20). The mechanism still fits, but not for the reason a first guess
+suggests: the 20 queue visits inside `read_across_queues` are not
+concurrent with each other — the loop `.await`s each `read_with_heal` call
+before advancing the rotation — and `--test-threads=1` keeps no other test
+running alongside this one. What this 4-core sandbox does add is ordinary
+scheduling and I/O latency on each sequential round trip: cargo's own
+build/test-harness overhead, the container's shared CPU, and the loopback
+hop to `redis-server`, none of it a deliberate load generator. PR #1756's
+own arithmetic only needs round trips to average above roughly 40ms for
+the tail queue to starve; this sandbox's ordinary per-call latency is
+apparently enough, without any concurrent contention to blame it on. This
+is additional evidence for the same diagnosis, not a different one: "idle"
+undersells how little it takes.
 
 ## 🔬 Reproduce
 
@@ -129,6 +140,7 @@ for i in $(seq 1 20); do
 done   # -> 3/20 fail, "left: 0, right: 1" at dispatch_redis.rs:1256
 
 # After (PR #1756's core mechanism commit applied):
+git fetch origin claude/beautiful-noether-r28wu2
 git show e24a735 -- autumn-harvest-redis/src/dispatch.rs | git apply -
 cargo build -p autumn-harvest-redis --test dispatch_redis
 for i in $(seq 1 20); do
