@@ -1646,6 +1646,7 @@ def raw_body_parses(source: str, handler: str) -> list[Parse]:
     # success binds it, as `wrapped_successes` reads it.
     seeds = {name: -1 for name in byte_parameters(handler_found[0])}
     for name, kind in wrapped_carriers(handler_found[0]).items():
+        seeds[name] = -1
         seeds.update(wrapped_successes(handler_block, name, kind))
     carriers = moved_names(handler_block, seeds)
     carriers.possible = possible_carriers(handler_found[0])
@@ -1781,6 +1782,7 @@ def moved_names(block: str, names: set[str] | dict[str, int]) -> Carriers:
         for let in re.finditer(r"\blet\s+(?:mut\s+)?([a-z_][a-z_0-9]*)\s*(?::[^=;]*)?=(?!=)", block)
     ]
     patterns = destructuring_lets(block)
+    assigned = [item for item in assignments(block) if re.fullmatch(r"[a-z_][a-z_0-9]*", item[0])]
     while True:
         moved: dict[str, tuple[int, bool]] = {}
         for bound, start, opener, value in lets:
@@ -1794,8 +1796,15 @@ def moved_names(block: str, names: set[str] | dict[str, int]) -> Carriers:
         # A carrier that flows into a destructuring pattern makes each name
         # the pattern binds a partial carrier, so a parse of it fails closed.
         for binds, start, opener, value in patterns:
+            # A pattern whose names are all seeded here, as the success binding
+            # of a wrapped carrier is, or already rebound here, is settled.
             if all(bound in found or bound in moved for bound, _ in binds):
-                if all(found.rebound.get(bound) == at for bound, at in binds if bound in found):
+                settled = [
+                    found.rebound.get(bound) == at or found[bound] == at
+                    for bound, at in binds
+                    if bound in found
+                ]
+                if all(settled):
                     continue
             flows = any(
                 live_passes(block, value, opener, name, bound_at)
@@ -1811,6 +1820,22 @@ def moved_names(block: str, names: set[str] | dict[str, int]) -> Carriers:
                         moved.setdefault(bound, (found[bound], bound in partial))
                 elif bound not in moved:
                     moved[bound] = (at, True)
+        # A plain assignment `name = value;` moves a carrier as a `let` does.
+        # One that gives a carrier name another value leaves it partial from
+        # there, which fails closed, since a branch may skip it.
+        for target, start, opener, value in assigned:
+            flows = [
+                live_passes(block, value, opener, name, bound_at)
+                for name, bound_at in list(found.items())
+                if carrier_live(block, found, name, start)
+            ]
+            way = "wrapped" if "wrapped" in flows else "direct" if "direct" in flows else None
+            if target in found:
+                if way != "direct" and found.rebound.get(target, len(block)) > start:
+                    found.rebound[target] = start
+                continue
+            if way and target not in moved:
+                moved[target] = (start, way == "wrapped")
         if not moved:
             found.partial = frozenset(partial)
             return found
@@ -1834,6 +1859,30 @@ def live_passes(block: str, value: str, opener: int, name: str, bound_at: int) -
         if not live_binding(block, name, opener + use.start(), bound_at):
             value = value[: use.start()] + " " * len(name) + value[use.end() :]
     return argument_passes(value, name)
+
+
+@functools.lru_cache(maxsize=None)
+def assignments(block: str) -> list[tuple[str, int, int, str]]:
+    """`(target, start, value start, value)` for each assignment statement in `block`.
+
+    An assignment is a top-level `=` in a statement that no keyword starts,
+    so a `let`, a comparison, a `=>` and a named macro argument are none. The
+    target is the text before the `=`, such as `bytes`, `self.x` or `*p`.
+    """
+    found = []
+    for equals in re.finditer(r"(?<![=!<>+\-*/%&|^:])=(?![=>])", block):
+        start = max(block.rfind(";", 0, equals.start()), block.rfind("{", 0, equals.start()))
+        start = max(start, block.rfind("}", 0, equals.start())) + 1
+        target = block[start : equals.start()]
+        depth = sum(target.count(o) for o in "([") - sum(target.count(c) for c in ")]")
+        stripped = target.strip()
+        keyword = r"(?:let|if|while|for|match|return|else|const|static|type|use|pub)\b|[#|]"
+        if depth or not stripped or re.match(keyword, stripped):
+            continue
+        opener = equals.end()
+        at = start + len(target) - len(target.lstrip())
+        found.append((stripped, at, opener, block[opener : statement_end(block, opener)]))
+    return found
 
 
 @functools.lru_cache(maxsize=None)
@@ -1990,16 +2039,33 @@ FREE_CALL_NAME = FREE_CALL_HEAD + r"\s*\("
 # `.clone()` or a full `[..]` slice.
 WHOLE_VIEW = r"(?:\.\s*(?:as_ref|as_slice|as_bytes|deref|clone)\s*\(\s*\)|\[\s*\.\.\s*\])"
 
+# The methods of a success projection: each turns a `Result` or an `Option`
+# that wraps a carrier into the carrier, or keeps it wrapped.
+SUCCESS_METHODS = frozenset(
+    {
+        "unwrap", "expect", "ok_or", "ok_or_else", "unwrap_or", "unwrap_or_default",
+        "unwrap_or_else", "as_ref", "as_deref", "as_mut", "as_deref_mut",
+    }
+)
+
+# One step of a success projection: `?`, `.await`, or a call of one of
+# `SUCCESS_METHODS`. This is the one success-chain definition.
+SUCCESS_STEP = r"(?:\?|\.\s*await\b|\.\s*(?:%s)\s*\((?:[^()]|\([^()]*\))*\))" % "|".join(
+    sorted(SUCCESS_METHODS)
+)
+
 
 def argument_root(argument: str) -> tuple[str | None, bool]:
     """The variable an argument reads, and whether it reads all of it.
 
     `&`, `&mut`, `*` and grouping parentheses are stripped, and so are whole
-    views in `WHOLE_VIEW`. What is left must be a plain name, which is then
-    the root, read whole. A name followed by anything else, such as
-    `body[4..]` or `body.to_vec()`, is the root, read in a form the audit
-    cannot type. Any other argument has no root. Every carrier and argument
-    reader in the audit strips borrows through this one step.
+    views in `WHOLE_VIEW` and success projections in `SUCCESS_STEP`, so
+    `body.as_ref().unwrap()` reads a wrapped carrier `body` whole. What is
+    left must be a plain name, which is then the root, read whole. A name
+    followed by anything else, such as `body[4..]` or `body.to_vec()`, is
+    the root, read in a form the audit cannot type. Any other argument has
+    no root. Every carrier and argument reader in the audit strips borrows
+    through this one step.
     """
     text = argument.strip().rstrip(",").strip()
     while True:
@@ -2010,7 +2076,7 @@ def argument_root(argument: str) -> tuple[str | None, bool]:
         if text.startswith("(") and len(balanced(text)) == len(text):
             text = text[1:-1].strip()
             continue
-        view = re.search(r"\s*%s$" % WHOLE_VIEW, text)
+        view = re.search(r"\s*(?:%s|%s)$" % (WHOLE_VIEW, SUCCESS_STEP), text)
         if view and view.start():
             text = text[: view.start()].strip()
             continue
@@ -2147,6 +2213,20 @@ def handoffs(
                 optional, tolerant = optional and was_optional, tolerant and was_tolerant
             merged[identity, name] = (helper, parts, optional, tolerant)
     found = [(helper, parts, name, o, t) for (_, name), (helper, parts, o, t) in merged.items()]
+    # An assignment to a target the audit cannot read, such as `self.x` or
+    # `*p`, moves a live carrier out of its view, so it fails closed.
+    for target, start, opener, value in assignments(block) if receivers else []:
+        if re.fullmatch(r"[a-z_][a-z_0-9]*", target) or in_dead_closure(block, start):
+            continue
+        for variable in carriers:
+            if not argument_passes(value, variable):
+                continue
+            if not carrier_live(block, carriers, variable, start):
+                continue
+            end = opener + len(value)
+            tolerant = discards_error(block[:start], block[end:])
+            allowed = empty_allowed(block, start, variable, tolerant)
+            found.append(("=", None, None, allowed, tolerant))
     # A macro whose token tree holds a live carrier hands it on in a form the
     # audit cannot follow, so the handoff is unresolved and fails closed.
     for invocation in macro_invocations(block) if receivers else []:
@@ -2166,7 +2246,7 @@ def handoffs(
     # grouped or borrowed receiver such as `(&body)` is read like `body`, and
     # one that holds the carrier in any other way fails closed.
     for call in qualified_calls(block) if receivers else []:
-        if call.group(1).strip() != "." or call.group(2) in BYTE_ACCESSORS:
+        if call.group(1).strip() != "." or call.group(2) in RECEIVER_READS:
             continue
         method, expression = call.group(2), receiver_expression(block, call.start())
         for variable in carriers:
@@ -2515,7 +2595,59 @@ def guards(block: str, position: int, variable: str) -> bool:
         after_if = position >= end and same_scope(block, test.start(), position)
         if not test.group(1) and after_if and early_return and not re.search(ERROR_TOKENS, taken):
             return True
+    # A `match` on the same test reads like the `if`: its empty-body arm must
+    # let the request through, and the parse must be in the other arm, or
+    # after a `match` whose empty-body arm returns a success.
+    for start, empty_arm, other_arm, end in empty_matches(block, variable):
+        if start >= position or rejecting_exit(empty_arm[2]):
+            continue
+        if other_arm[0] < position < other_arm[1]:
+            return True
+        after = position >= end and same_scope(block, start, position)
+        early = returns_success(unconditional(empty_arm[2]))
+        if after and early and not re.search(ERROR_TOKENS, empty_arm[2]):
+            return True
     return False
+
+
+def empty_matches(
+    block: str, variable: str
+) -> list[tuple[int, tuple[int, int, str], tuple[int, int], int]]:
+    """`(start, empty arm, other arm, end)` for each `match` on `<variable>.is_empty()`.
+
+    The empty arm is `(start, end, text)` of the arm that runs for an empty
+    body: `true` for `match body.is_empty()`, `false` for `match
+    !body.is_empty()`. The other arm is its span. Only a match with exactly
+    one `true` arm and one `false` arm, and no guard or catch-all, is read.
+    Any other form is no guard, so the body stays mandatory, which is the
+    fail-closed direction.
+    """
+    found = []
+    pattern = r"\bmatch\s+(!\s*)?%s\.is_empty\(\)\s*\{" % re.escape(variable)
+    for test in re.finditer(pattern, block):
+        opener = test.end() - 1
+        arms_text = balanced(block[opener:], "{", "}")
+        arms = {}
+        readable = True
+        for arm in re.finditer(r"(?:^|[,{}])\s*([^,{}=]*?)\s*=>", arms_text):
+            label = arm.group(1).strip()
+            if label not in ("true", "false") or label in arms:
+                readable = False
+                break
+            body_start = opener + arm.end()
+            rest = block[body_start:]
+            lead = len(rest) - len(rest.lstrip())
+            if rest[lead : lead + 1] == "{":
+                body_end = body_start + lead + len(balanced(rest[lead:], "{", "}"))
+            else:
+                body_end = body_start + len(scope_rest(rest.replace(",", ";")).split(";")[0])
+            arms[label] = (body_start, body_end, block[body_start:body_end])
+        if not readable or set(arms) != {"true", "false"}:
+            continue
+        empty = "false" if test.group(1) else "true"
+        other = arms["true" if empty == "false" else "false"]
+        found.append((test.start(), arms[empty], other[:2], opener + len(arms_text)))
+    return found
 
 
 def empty_allowed(block: str, position: int, variable: str, tolerant: bool) -> bool:
@@ -2562,6 +2694,12 @@ def rejects_empty(block: str, position: int, variable: str) -> bool:
         in_other = other_arm[0] < position < other_arm[1]
         after_if = position >= end and same_scope(block, test.start(), position)
         if in_other or after_if:
+            return True
+    for start, empty_arm, other_arm, end in empty_matches(block, variable):
+        if start >= position or not rejecting_exit(empty_arm[2]):
+            continue
+        in_other = other_arm[0] < position < other_arm[1]
+        if in_other or position >= end and same_scope(block, start, position):
             return True
     return False
 
@@ -2618,19 +2756,16 @@ def rejects_wrapped_body(params: str, block: str) -> bool:
 
 
 # One step of a chain that turns a wrapper into its value, or leaves it one.
-UNWRAP_STEP = (
-    r"(?:\?|\.\s*await\b|\.\s*(?:unwrap|expect|ok_or|ok_or_else|unwrap_or|unwrap_or_default"
-    r"|unwrap_or_else)\s*\((?:[^()]|\([^()]*\))*\))"
-)
 
 
 def wrapped_successes(block: str, name: str, kind: str) -> dict[str, int]:
     """Each name that holds the byte carrier inside the wrapper `name`, with where.
 
     The success variant, `Ok` or `Some`, binds it in a `let`, `if let`,
-    `while let`, let-else or `match` arm. A `let` whose value is `name`
-    through `?`, `.unwrap()`, `.expect(..)`, `.ok_or*(..)` or `.unwrap_or*(..)`
-    binds it whole too. Each name is bound where its pattern is, so
+    `while let`, let-else or `match` arm. The wrapper itself is a carrier
+    too, so a success projection such as `body.as_ref().unwrap()` or
+    `body?` reads the inner carrier wherever it is written, as
+    `argument_root` reads it. Each name is bound where its pattern is, so
     `live_binding` reads it in that scope. A use of `name` that a later
     binding shadows is left out.
     """
@@ -2649,13 +2784,6 @@ def wrapped_successes(block: str, name: str, kind: str) -> dict[str, int]:
         offset = scrutinee.end() - 1
         for arm in re.finditer(inner + r"\s*(?:if\b[^{}]*?)?=>", arms):
             found.setdefault(arm.group(1), offset + arm.start(1))
-    whole = r"\blet\s+(?:mut\s+)?([a-z_][a-z_0-9]*)\s*(?::[^=;]*)?=\s*%s(?:\s*%s)+\s*;" % (
-        variable,
-        UNWRAP_STEP,
-    )
-    for hit in re.finditer(whole, block):
-        if live_binding(block, name, hit.start()):
-            found.setdefault(hit.group(1), hit.start())
     return found
 
 
@@ -3144,6 +3272,10 @@ def chain_state(after: str) -> str:
 
 # Inspections that turn a `Result` or an `Option` into a boolean.
 INSPECTIONS = frozenset({"is_ok", "is_err", "is_ok_and", "is_err_and", "is_some", "is_none"})
+
+# Methods on a carrier, or on its wrapper, that hand no body on by themselves.
+# A success projection passes the carrier on to what reads its value.
+RECEIVER_READS = BYTE_ACCESSORS | INSPECTIONS | SUCCESS_METHODS
 
 
 def walk_chain(after: str, start: str = "result") -> tuple[str, str | None, str]:
@@ -5878,6 +6010,19 @@ pub fn harvest_api_router() -> Router {
         .route("/e/extension-decode", post(e_extension_decode))
         .route("/e/grouped-receiver", post(e_grouped_receiver))
         .route("/e/macro-carrier", post(e_macro_carrier))
+        .route("/e/option-inline", post(e_option_inline))
+        .route("/e/result-inline", post(e_result_inline))
+        .route("/e/option-deref", post(e_option_deref))
+        .route("/e/option-mapped", post(e_option_mapped))
+        .route("/e/assigned-carrier", post(e_assigned_carrier))
+        .route("/e/reassigned-carrier", post(e_reassigned_carrier))
+        .route("/e/field-assigned", post(e_field_assigned))
+        .route("/e/tuple-assigned", post(e_tuple_assigned))
+        .route("/e/carrier-cleared", post(e_carrier_cleared))
+        .route("/e/match-guard", post(e_match_guard))
+        .route("/e/match-not-guard", post(e_match_not_guard))
+        .route("/e/match-wildcard", post(e_match_wildcard))
+        .route("/e/match-rejects-tolerant", post(e_match_rejects_tolerant))
         .route("/e/macro-bracket", post(e_macro_bracket))
         .route("/e/macro-path", post(e_macro_path))
         .route("/e/macro-scalar", post(e_macro_scalar))
@@ -7520,6 +7665,99 @@ mod spoofed_parse {
         let gadget = serde_json::from_slice::<Gadget>(&body).unwrap();
         StatusCode::OK.into_response()
     }
+}
+
+async fn e_option_inline(body: Option<Bytes>) -> Response {
+    let gadget = serde_json::from_slice::<Gadget>(body.as_ref().unwrap()).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_result_inline(body: Result<Bytes, BytesRejection>) -> Response {
+    let gadget = serde_json::from_slice::<Gadget>(&body?).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_option_deref(body: Option<Vec<u8>>) -> Response {
+    let gadget = serde_json::from_slice::<Gadget>(body.as_deref().unwrap()).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_option_mapped(body: Option<Bytes>) -> Response {
+    let gadget = body.map(|raw| serde_json::from_slice::<Gadget>(&raw).unwrap());
+    StatusCode::OK.into_response()
+}
+
+async fn e_assigned_carrier(body: Bytes) -> Response {
+    let bytes;
+    bytes = body;
+    let gadget = serde_json::from_slice::<Gadget>(&bytes).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_reassigned_carrier(body: Bytes) -> Response {
+    let mut bytes = Bytes::new();
+    bytes = body;
+    let gadget = serde_json::from_slice::<Gadget>(&bytes).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_field_assigned(body: Bytes) -> Response {
+    let mut holder = Holder::default();
+    holder.raw = body;
+    StatusCode::OK.into_response()
+}
+
+async fn e_tuple_assigned(body: Bytes) -> Response {
+    let mut bytes = Bytes::new();
+    (bytes, _) = (body, 1);
+    let gadget = serde_json::from_slice::<Gadget>(&bytes).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_carrier_cleared(body: Bytes) -> Response {
+    let mut body = body;
+    body = Bytes::new();
+    let gadget = serde_json::from_slice::<Gadget>(&body).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_match_guard(body: Bytes) -> Response {
+    match body.is_empty() {
+        true => StatusCode::OK.into_response(),
+        false => {
+            let gadget = serde_json::from_slice::<Gadget>(&body).unwrap();
+            StatusCode::OK.into_response()
+        }
+    }
+}
+
+async fn e_match_not_guard(body: Bytes) -> Response {
+    match !body.is_empty() {
+        true => {
+            let gadget = serde_json::from_slice::<Gadget>(&body).unwrap();
+        }
+        false => {}
+    }
+    StatusCode::OK.into_response()
+}
+
+async fn e_match_wildcard(body: Bytes) -> Response {
+    match body.is_empty() {
+        true if ready() => StatusCode::OK.into_response(),
+        _ => {
+            let gadget = serde_json::from_slice::<Gadget>(&body).unwrap();
+            StatusCode::OK.into_response()
+        }
+    }
+}
+
+async fn e_match_rejects_tolerant(body: Bytes) -> Response {
+    match body.is_empty() {
+        true => return Err(reject()),
+        false => {}
+    }
+    let gadget: Gadget = serde_json::from_slice(&body).unwrap_or_default();
+    StatusCode::OK.into_response()
 }
 
 macro_rules! decode_body {
@@ -10737,6 +10975,95 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
         FIXTURE_EDGES,
         [fixture_route("POST", "/e/spoofed-parse", 200, request_body=GADGET_BODY)],
         {"unresolved": ["POST /e/spoofed-parse: cannot read a `from_slice` call"]},
+    ),
+    (
+        "an inline success projection of a wrapped body is read like the inner body",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST", path, 200, request_body=body_of(("name", False), required=False)
+            )
+            for path in (
+                "/e/option-inline",
+                "/e/result-inline",
+                "/e/option-deref",
+                "/e/option-mapped",
+            )
+        ],
+        {
+            "body_required": [
+                "POST /e/option-inline: the body is mandatory",
+                "POST /e/result-inline: the body is mandatory",
+                "POST /e/option-deref: the body is mandatory",
+                "POST /e/option-mapped: the body is mandatory",
+            ],
+            "mandatory": [
+                "POST /e/option-inline: `name` is mandatory in Gadget",
+                "POST /e/result-inline: `name` is mandatory in Gadget",
+                "POST /e/option-deref: `name` is mandatory in Gadget",
+            ],
+            "unresolved": ["POST /e/option-mapped: cannot read a `from_slice` call"],
+        },
+    ),
+    (
+        "an assignment moves a carrier, and one the audit cannot read fails closed",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST", path, 200, request_body=body_of(("name", False), required=False)
+            )
+            for path in (
+                "/e/assigned-carrier",
+                "/e/reassigned-carrier",
+                "/e/field-assigned",
+                "/e/tuple-assigned",
+                "/e/carrier-cleared",
+            )
+        ],
+        {
+            "body_required": [
+                "POST /e/assigned-carrier: the body is mandatory",
+                "POST /e/reassigned-carrier: the body is mandatory",
+                "POST /e/field-assigned: the body is mandatory",
+                "POST /e/tuple-assigned: the body is mandatory",
+                "POST /e/carrier-cleared: the body is mandatory",
+            ],
+            "mandatory": [
+                "POST /e/assigned-carrier: `name` is mandatory in Gadget",
+                "POST /e/reassigned-carrier: `name` is mandatory in Gadget",
+            ],
+            "unresolved": [
+                "POST /e/field-assigned: cannot read a `from_slice` call",
+                "POST /e/tuple-assigned: cannot read a `from_slice` call",
+                "POST /e/carrier-cleared: cannot read a `from_slice` call",
+            ],
+        },
+    ),
+    (
+        "a match on the empty test reads like the if form, and an unreadable one stays strict",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST", path, 200, request_body=body_of(("name", False), required=False)
+            )
+            for path in (
+                "/e/match-guard",
+                "/e/match-not-guard",
+                "/e/match-wildcard",
+                "/e/match-rejects-tolerant",
+            )
+        ],
+        {
+            "body_required": [
+                "POST /e/match-wildcard: the body is mandatory",
+                "POST /e/match-rejects-tolerant: the body is mandatory",
+            ],
+            "mandatory": [
+                "POST /e/match-guard: `name` is mandatory in Gadget",
+                "POST /e/match-not-guard: `name` is mandatory in Gadget",
+                "POST /e/match-wildcard: `name` is mandatory in Gadget",
+            ],
+        },
     ),
     (
         "a macro that gets a raw body is an unresolved handoff, and a scalar read is not",
