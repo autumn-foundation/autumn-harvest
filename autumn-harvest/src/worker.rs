@@ -18479,8 +18479,8 @@ async fn persist_workflow_continue_as_new_with_verdict(
 
     // Carry the predecessor's `last_completion_result` forward by its *stored*
     // representation (issue #524 / #488). If it was offloaded, copy the
-    // reference envelope verbatim and record a new ref for the successor so the
-    // blob is NOT re-uploaded; the offloader skips already-enveloped fields.
+    // reference envelope verbatim. Record a new ref for the successor. The blob
+    // is NOT re-uploaded, because the raw reference bypasses the offloader.
     let raw_carryover = store::load_raw_started_carryover(conn, persistence.exec_id).await?;
     let carried_lcr_ref = raw_carryover
         .as_ref()
