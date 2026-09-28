@@ -864,9 +864,7 @@ pub fn install_global_audit_export_config_for_direct_worker(config: &AuditExport
                  default reqwest signed-webhook sink."
             );
         }
-        if let Ok(mut lock) = GLOBAL_AUDIT_EXPORT_CONFIG.write() {
-            *lock = None;
-        }
+        set_global_audit_export_config(None);
         return;
     };
     let secret = config.secret.clone().unwrap_or_else(|| {
@@ -878,14 +876,72 @@ pub fn install_global_audit_export_config_for_direct_worker(config: &AuditExport
         );
         CallbackSecret::new(Vec::new())
     });
-    if let Ok(mut lock) = GLOBAL_AUDIT_EXPORT_CONFIG.write() {
-        *lock = Some(std::sync::Arc::new(AuditExportRuntimeConfig {
-            sink,
-            secret,
-            batch_size: config.effective_batch_size(),
-            backoff: config.backoff.clone(),
-            lease: config.effective_lease(),
-        }));
+    set_global_audit_export_config(Some(std::sync::Arc::new(AuditExportRuntimeConfig {
+        sink,
+        secret,
+        batch_size: config.effective_batch_size(),
+        backoff: config.backoff.clone(),
+        lease: config.effective_lease(),
+    })));
+}
+
+/// `true` after a live export config was removed and none replaced it.
+///
+/// Only [`set_global_audit_export_config`] writes it. A process that never
+/// installed a sink never sets it, so it emits no new series (AC8).
+static EXPORT_DISABLED_AFTER_ENABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Publish or clear [`GLOBAL_AUDIT_EXPORT_CONFIG`], and track the edge.
+///
+/// Replacing a `Some` with `None` marks export as disabled (issue #1506).
+/// The exporter then reports each shard as unobserved. Without this, the
+/// gauges keep their last value and the process looks healthy. Publishing a
+/// `Some` clears the mark. The mark changes under the write lock, so a tick
+/// never sees a config and a mark that disagree.
+pub fn set_global_audit_export_config(config: Option<std::sync::Arc<AuditExportRuntimeConfig>>) {
+    use std::sync::atomic::Ordering;
+
+    let Ok(mut lock) = GLOBAL_AUDIT_EXPORT_CONFIG.write() else {
+        return;
+    };
+    let was_configured = lock.is_some();
+    *lock = config;
+    if lock.is_some() {
+        EXPORT_DISABLED_AFTER_ENABLE.store(false, Ordering::SeqCst);
+    } else if was_configured {
+        EXPORT_DISABLED_AFTER_ENABLE.store(true, Ordering::SeqCst);
+    }
+}
+
+fn export_disabled_after_enable() -> bool {
+    EXPORT_DISABLED_AFTER_ENABLE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Shards an unconfigured tick reports on.
+///
+/// Mirrors the shard choice of [`fire_due_audit_exports`]: the assignments
+/// when a sharded pool has any, else the pool default (or `0` when unsharded).
+fn disabled_tick_shards(
+    pool_default: Option<i32>,
+    assignments: &[crate::types::ShardId],
+) -> Vec<i32> {
+    if pool_default.is_some() && !assignments.is_empty() {
+        assignments.iter().map(|s| s.as_i32()).collect()
+    } else {
+        vec![pool_default.unwrap_or(0)]
+    }
+}
+
+/// Mark one shard unobserved when export was disabled (issue #1506).
+///
+/// Does nothing for a process that never had export configured.
+fn report_export_disabled(
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
+    shard: u16,
+) {
+    if export_disabled_after_enable() {
+        metrics.record_audit_export_observed(shard, false);
     }
 }
 
@@ -2401,6 +2457,13 @@ pub async fn fire_due_audit_exports(
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> crate::error::HarvestResult<usize> {
     let Some(config) = read_global_audit_export_config() else {
+        // Issue #1506: report a disabled export instead of freezing the gauges.
+        if export_disabled_after_enable() {
+            let pool_default = sharded_pool.as_ref().map(|sp| sp.default_shard().as_i32());
+            for shard in disabled_tick_shards(pool_default, shard_assignments) {
+                report_export_disabled(metrics, u16::try_from(shard).unwrap_or(u16::MAX));
+            }
+        }
         return Ok(0);
     };
 
@@ -2650,11 +2713,13 @@ async fn export_once_via_pool(
     cancel: &tokio_util::sync::CancellationToken,
     config_arc: Option<std::sync::Arc<AuditExportRuntimeConfig>>,
 ) -> crate::error::HarvestResult<usize> {
+    let shard_u16 = u16::try_from(shard_id).unwrap_or(u16::MAX);
     let Some(config_arc) = config_arc else {
+        // Issue #1506: report a disabled export instead of freezing the gauges.
+        report_export_disabled(metrics, shard_u16);
         return Ok(0);
     };
     let config = config_arc.as_ref();
-    let shard_u16 = u16::try_from(shard_id).unwrap_or(u16::MAX);
 
     let Some(mut conn) =
         acquire_shard_conn_for_export(pool, shard_id, shard_u16, metrics, SHARD_ACQUIRE_BOUND)
@@ -3947,5 +4012,118 @@ mod tests {
         assert_bounds::<NoopSink>();
         let boxed: Box<dyn AuditSink> = Box::new(NoopSink);
         let _arc: std::sync::Arc<dyn AuditSink> = std::sync::Arc::from(boxed);
+    }
+
+    // ── Disabled-after-enabled signal (issue #1506) ─────────────────────────
+
+    /// Serializes tests that touch the process-wide disable flag.
+    static DISABLE_FLAG_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[derive(Default)]
+    struct ObservedLog(std::sync::Mutex<Vec<(u16, bool)>>);
+
+    impl crate::telemetry::MetricsRecorder for ObservedLog {
+        fn record_audit_export_observed(&self, shard: u16, observed: bool) {
+            self.0.lock().expect("log lock").push((shard, observed));
+        }
+    }
+
+    fn live_config() -> std::sync::Arc<AuditExportRuntimeConfig> {
+        std::sync::Arc::new(AuditExportRuntimeConfig {
+            sink: std::sync::Arc::new(NoopSink),
+            secret: CallbackSecret::new(b"k".to_vec()),
+            batch_size: 10,
+            backoff: ExportBackoff::default(),
+            lease: Duration::from_secs(30),
+        })
+    }
+
+    /// Resets the flag and the config on entry and on drop.
+    struct FlagGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+    impl FlagGuard {
+        fn new() -> Self {
+            let guard = DISABLE_FLAG_SERIAL
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Self::reset();
+            Self(guard)
+        }
+
+        fn reset() {
+            set_global_audit_export_config(Some(live_config()));
+            set_global_audit_export_config(None);
+            EXPORT_DISABLED_AFTER_ENABLE.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl Drop for FlagGuard {
+        fn drop(&mut self) {
+            Self::reset();
+        }
+    }
+
+    fn observed_after_report() -> Vec<(u16, bool)> {
+        let log = ObservedLog::default();
+        report_export_disabled(&log, 3);
+        log.0.lock().expect("log lock").clone()
+    }
+
+    #[test]
+    fn disabling_a_live_export_marks_the_shard_unobserved() {
+        let _g = FlagGuard::new();
+        set_global_audit_export_config(Some(live_config()));
+        set_global_audit_export_config(None);
+        assert_eq!(observed_after_report(), vec![(3, false)]);
+    }
+
+    #[test]
+    fn a_never_configured_process_reports_nothing() {
+        let _g = FlagGuard::new();
+        set_global_audit_export_config(None);
+        assert!(observed_after_report().is_empty());
+    }
+
+    #[test]
+    fn reenabling_export_clears_the_signal() {
+        let _g = FlagGuard::new();
+        set_global_audit_export_config(Some(live_config()));
+        set_global_audit_export_config(None);
+        set_global_audit_export_config(Some(live_config()));
+        set_global_audit_export_config(None);
+        set_global_audit_export_config(Some(live_config()));
+        assert!(observed_after_report().is_empty());
+    }
+
+    #[test]
+    fn clearing_twice_keeps_the_signal() {
+        let _g = FlagGuard::new();
+        set_global_audit_export_config(Some(live_config()));
+        set_global_audit_export_config(None);
+        set_global_audit_export_config(None);
+        assert_eq!(observed_after_report(), vec![(3, false)]);
+    }
+
+    #[test]
+    fn the_signal_repeats_on_every_tick() {
+        let _g = FlagGuard::new();
+        set_global_audit_export_config(Some(live_config()));
+        set_global_audit_export_config(None);
+        let log = ObservedLog::default();
+        report_export_disabled(&log, 1);
+        report_export_disabled(&log, 2);
+        assert_eq!(
+            *log.0.lock().expect("log lock"),
+            vec![(1, false), (2, false)]
+        );
+    }
+
+    #[test]
+    fn disabled_ticks_report_assigned_shards_or_the_default() {
+        use crate::types::ShardId;
+        let assigned = [ShardId::new(4), ShardId::new(7)];
+        assert_eq!(disabled_tick_shards(Some(0), &assigned), vec![4, 7]);
+        assert_eq!(disabled_tick_shards(Some(2), &[]), vec![2]);
+        assert_eq!(disabled_tick_shards(None, &assigned), vec![0]);
     }
 }

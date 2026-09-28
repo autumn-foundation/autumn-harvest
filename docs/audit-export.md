@@ -693,6 +693,13 @@ and tenant-identifying (ADR-0001 §7).
 > `GET /admin/audit-export` runs the unbounded, exact query instead — use
 > it to confirm a reading this gauge cannot fully resolve.
 
+> **Disabled export (issue #1506).** A process can stop exporting when a
+> runtime is rebuilt with no sink. The exporter then sets `export_observed` to
+> `0` on every tick, for every shard it serves, until a sink is configured
+> again. `export_lag` keeps its last value. A process that never configured
+> export emits neither gauge. A deliberate disable therefore fires
+> `harvest_audit_export_unobservable`. Silence the alert for that process.
+
 The gauge is emitted on **every** exporter tick, including ticks that deliver
 nothing — the signal must not go stale precisely when delivery has stopped.
 

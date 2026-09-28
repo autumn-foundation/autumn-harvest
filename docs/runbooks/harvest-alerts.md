@@ -3126,6 +3126,11 @@ This is a ticket rather than a page: the sink may be working fine, and
 records already sequenced are not lost — the cursor is simply not advancing
 because the exporter cannot currently reach this shard to advance it.
 
+This alert also fires when export was disabled in a live process (issue
+#1506). A runtime rebuilt with no sink sets `export_observed` to `0` for each
+shard. In that case `GET /admin/audit-export` shows `sink_configured: false`.
+Configure a sink again, or silence the alert if you disabled export on purpose.
+
 ### Triage steps
 
 1. `curl -s "$HARVEST/admin/audit-export" | jq '.shards[] | select(.shard == <id>)'`.

@@ -358,6 +358,50 @@ async fn unconfigured_export_never_touches_anything() {
     );
 }
 
+/// Issue #1506: disabling a live export must not leave `export_observed` at 1.
+#[tokio::test]
+async fn disabling_a_live_export_marks_the_default_shard_unobserved() {
+    let _guard = TEST_SERIAL.lock().await;
+    let (mut conn, _c) = make_conn().await;
+    let metrics = RecordingMetrics::default();
+
+    autumn_harvest::audit_export::set_global_audit_export_config(Some(Arc::new(
+        AuditExportRuntimeConfig {
+            sink: Arc::new(RecordingSink::new(200)),
+            secret: CallbackSecret::new(b"test-secret".to_vec()),
+            batch_size: 10,
+            backoff: ExportBackoff::default(),
+            lease: std::time::Duration::from_secs(60),
+        },
+    )));
+    autumn_harvest::audit_export::set_global_audit_export_config(None);
+    fire_due_audit_exports(&mut conn, &None, &[], &metrics)
+        .await
+        .expect("scanner runs");
+
+    // Clear the flag before asserting so a failure cannot leak it.
+    autumn_harvest::audit_export::set_global_audit_export_config(Some(Arc::new(
+        AuditExportRuntimeConfig {
+            sink: Arc::new(RecordingSink::new(200)),
+            secret: CallbackSecret::new(b"test-secret".to_vec()),
+            batch_size: 10,
+            backoff: ExportBackoff::default(),
+            lease: std::time::Duration::from_secs(60),
+        },
+    )));
+    uninstall();
+
+    assert_eq!(
+        *metrics.observed.lock().expect("observed"),
+        vec![(0, false)],
+        "a disabled export must report the shard unobserved"
+    );
+    assert!(
+        metrics.lag.lock().expect("lag").is_empty(),
+        "the lag gauge stays untouched"
+    );
+}
+
 // ── AC4: dense, strictly monotonic per-shard sequences ───────────────────────
 
 #[tokio::test]
