@@ -26165,7 +26165,7 @@ async fn dispatch_call_with_timeout<T>(
 /// implementation. `ack_many_inner` does two round trips per queue: an
 /// `XACK`/`XDEL` pipeline, then a separate marker-cleanup script.
 /// `release_many_inner` / `requeue_batch` are one round trip per queue.
-/// The dispatch read is two; see [`dispatch_read_timeout`].
+/// The dispatch read is six; see [`dispatch_read_timeout`].
 ///
 /// `lease_count` covers a different implementation entirely (Codex review,
 /// issue #1429 follow-up). `TaskDispatch::ack_many`/`release_many`'s own
@@ -26189,18 +26189,27 @@ fn dispatch_batch_timeout(
         .saturating_mul(u32::try_from(queue_rounds.max(lease_count)).unwrap_or(u32::MAX))
 }
 
+/// Round trips a single dispatch-read visit can need (Codex review, issue
+/// #1756 follow-up). The common case is one `XREADGROUP`. A missing
+/// consumer group costs three instead: `read_with_heal` issues the failed
+/// `XREADGROUP`, then `ensure_groups`, then a healed retry `XREADGROUP`.
+const DISPATCH_READ_VISIT_ROUND_TRIPS: usize = 3;
+
 /// Sequential round trips per queue that a dispatch read can make outside
 /// its blocking wait. `read_across_queues` makes one non-blocking pass over
 /// every queue first. A deadline that passes mid-lap also finishes that lap
-/// with non-blocking reads. Each remaining queue can then cost one more
-/// round trip after the wait ends (#1756).
-const DISPATCH_READ_ROUND_TRIPS_PER_QUEUE: usize = 2;
+/// with non-blocking reads, so each remaining queue gets one more visit
+/// after the wait ends (#1756). Both visits are budgeted at
+/// [`DISPATCH_READ_VISIT_ROUND_TRIPS`], not one, since either one can be the
+/// visit that heals a missing consumer group.
+const DISPATCH_READ_ROUND_TRIPS_PER_QUEUE: usize = DISPATCH_READ_VISIT_ROUND_TRIPS * 2;
 
 /// The outer deadline for a dispatch-channel read. It is the blocking wait
 /// plus [`DISPATCH_READ_ROUND_TRIPS_PER_QUEUE`] call timeouts per queue.
 /// The read must not expire while a round trip is in flight. Expiry drops
 /// the future, and an entry that `XREADGROUP` already claimed then stays
-/// pending until visibility recovery.
+/// pending until visibility recovery. A healed visit is three such round
+/// trips, not one, so the budget must cover that worst case too.
 fn dispatch_read_timeout(block_for: Duration, queue_count: usize) -> Duration {
     block_for + dispatch_batch_timeout(queue_count, DISPATCH_READ_ROUND_TRIPS_PER_QUEUE, 0)
 }
@@ -42708,23 +42717,24 @@ mod tests {
     }
 
     /// The read deadline covers the initial non-blocking pass and a lap
-    /// that finishes after the wait ends. Both cost one round trip per
-    /// queue (#1756).
+    /// that finishes after the wait ends. Either visit can be the one that
+    /// heals a missing consumer group, so each is budgeted at
+    /// `DISPATCH_READ_VISIT_ROUND_TRIPS` (three), not one (#1756 follow-up).
     #[test]
     fn dispatch_read_timeout_budgets_the_initial_pass_and_a_forced_lap() {
         let block_for = Duration::from_secs(2);
         assert_eq!(
             dispatch_read_timeout(block_for, 3),
-            block_for + DISPATCH_CALL_TIMEOUT * 6,
-            "three queues need three pass round trips and three forced-lap round trips"
+            block_for + DISPATCH_CALL_TIMEOUT * 18,
+            "three queues need three healed pass round trips and three healed forced-lap round trips"
         );
         assert_eq!(
             dispatch_read_timeout(block_for, 1),
-            block_for + DISPATCH_CALL_TIMEOUT * 2,
+            block_for + DISPATCH_CALL_TIMEOUT * 6,
         );
         assert_eq!(
             dispatch_read_timeout(Duration::ZERO, 0),
-            DISPATCH_CALL_TIMEOUT * 2,
+            DISPATCH_CALL_TIMEOUT * 6,
             "an empty queue list still gets one queue's worth of budget"
         );
     }
