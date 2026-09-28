@@ -1009,10 +1009,7 @@ def struct_layout(
         field = re.match(r"(?:pub(?:\([^)]*\))?\s+)?(?:r#)?([a-z_0-9]+)\s*:\s*(.+?),?$", text)
         if field:
             site = getattr(original, "site", (SOURCE[0], None))
-            # A shadowed bare name is bound first. A standard path is then cut
-            # to its bare name, since it always names the real type.
-            written = canonical_paths(prelude_bound(field.group(2), site))
-            resolved, unread = resolve_field_type(written, site)
+            resolved, unread = canonical_type(field.group(2), site)
             items = serde_items(canonical_paths(" ".join(attributes)))
             fields.append((field.group(1), resolved, items, unread))
         attributes = []
@@ -1205,8 +1202,8 @@ def type_aliases_in(
     its name, as `struct_index` does for structs. Only a module-level alias is
     read: one whose every enclosing block is a `mod`. An alias inside a fn or
     another block is local to it, and the extractor alias layer reads it in
-    that scope. Each target goes through `canonical_paths`, as every other
-    type text does.
+    that scope. A target is kept as written. `canonical_type` cuts its
+    standard paths after the alias pass, as for every other type text.
     """
     code = code_only(source)
     modules = block_owners(code, "mod")
@@ -1218,7 +1215,7 @@ def type_aliases_in(
             continue
         place = location(crate, module, *inline)
         parameters = [part.strip() for part in split_expression(alias.group(2) or "", ",", types=True)]
-        target = canonical_paths(alias.group(3).strip())
+        target = alias.group(3).strip()
         found.setdefault(alias.group(1), []).append((place, parameters, target))
     return found
 
@@ -1324,9 +1321,87 @@ def parts_at(source: str, start: int) -> tuple[str, str, str] | None:
         return None
     returns = source[opener + len(params) : brace]
     # The masked copy blanks nested comments too.
-    code = masked[opener : opener + len(params)]
+    code = canonical_params(masked[opener : opener + len(params)], opener)
     block = source[brace : brace + len(balanced(masked[brace:], "{", "}"))]
     return code, returns, Block(block, brace)
+
+
+class Params(str):
+    """A canonical parameter list, with the names that may carry a raw body.
+
+    `possible` holds each plainly named parameter whose type the audit can
+    neither read as a byte carrier nor rule out as one. `written` is the list
+    as the source spells it, for a finding that names an alias.
+    """
+
+    def __new__(cls, text: str, possible: frozenset[str], written: str) -> "Params":
+        params = super().__new__(cls, text)
+        params.possible = possible
+        params.written = written
+        return params
+
+
+@functools.lru_cache(maxsize=None)
+def canonical_params(params: str, opener: int) -> Params:
+    """A parameter list with each parameter type in its `canonical_type` form.
+
+    Each type is read at its own site in the audited source. A plainly named
+    parameter whose type is no byte carrier is `possible` when its type has
+    an alias the audit cannot read, or a head the audit does not know, as
+    `known_non_bytes` reads it.
+    """
+    out, possible = params, set()
+    for start, end in reversed(parameter_spans(params)):
+        item = params[start:end]
+        colon = re.search(r"(?<!:):(?!:)", item)
+        if colon is None:
+            continue
+        written = item[colon.end() :]
+        canonical, unread = canonical_type(written, (SOURCE[0], opener + start + colon.end()))
+        pattern = item[: colon.start()].strip()
+        named = re.fullmatch(r"(?:mut\s+)?([a-z_][a-z_0-9]*)", pattern)
+        typed = "%s: %s" % (pattern, canonical)
+        if named and not BYTE_PARAMETER.search(typed):
+            if unread is not None or not known_non_bytes(canonical, opener + start):
+                possible.add(named.group(1))
+        out = out[: start] + " " + typed + out[end:]
+    return Params(out, frozenset(possible), params)
+
+
+def parameter_spans(params: str) -> list[tuple[int, int]]:
+    """The span of each top-level parameter in a parenthesized parameter list."""
+    spans, depth, start = [], 0, 1
+    for index in range(1, len(params) - 1):
+        char = params[index]
+        if char in "([{<":
+            depth += 1
+        elif char in ")]}" or char == ">" and params[index - 1] != "-":
+            depth -= 1
+        elif char == "," and depth == 0:
+            spans.append((start, index))
+            start = index + 1
+    if params[start : len(params) - 1].strip():
+        spans.append((start, len(params) - 1))
+    return spans
+
+
+def known_non_bytes(canonical: str, at: int) -> bool:
+    """Whether a canonical parameter type is one the audit knows holds no raw body.
+
+    A standard type, a wire scalar, a bare extractor, a tuple and a struct
+    the audit scans are known. Any other head, such as an unknown path or a
+    fixed-size array, may hold bytes.
+    """
+    text = re.sub(r"^(?:&\s*(?:'[a-z_]+\s+)?(?:mut\s+)?|impl\s+|dyn\s+)*", "", canonical.strip())
+    if text.startswith("("):
+        return True
+    head = re.match(r"((?:[A-Za-z_]\w*\s*::\s*)*[A-Za-z_]\w*)", text)
+    if head is None:
+        return False
+    name = re.sub(r"\s", "", head.group(1))
+    if name in STD_TYPES or name in WIRE_TYPES or name in EXTRACTOR_NAMES:
+        return True
+    return bool(resolve_symbol("struct", name, (SOURCE[0], at)))
 
 
 class Block(str):
@@ -1349,8 +1424,17 @@ def masked_source(source: str) -> str:
 
 
 def byte_parameters(params: str) -> set[str]:
-    """Names of the parameters that carry the raw request body."""
+    """Names of the parameters that carry the raw request body.
+
+    `params` is canonical, as `parts_at` returns it, so an alias such as
+    `type RawBody = Vec<u8>;` is already its target here.
+    """
     return set(BYTE_PARAMETER.findall(params))
+
+
+def possible_carriers(params: str) -> frozenset[str]:
+    """The parameters that may carry a raw body, as `canonical_params` reads them."""
+    return getattr(params, "possible", frozenset())
 
 
 # A comment, a string literal or a char literal. A raw string comes before a
@@ -1449,6 +1533,10 @@ def raw_body_parses(source: str, handler: str) -> list[Parse]:
     # `source` is masked, so a call in a comment or a string is no parse.
     handler_block = handler_found[2]
     carriers = moved_names(handler_block, byte_parameters(handler_found[0]))
+    carriers.possible = possible_carriers(handler_found[0])
+    if not dict(carriers):
+        # No byte carrier, so only a parse of a possible one can be found.
+        return block_parses(handler_block, carriers, handler_found[1])
     return carrier_parses(
         source, handler_block, carriers, handler_found[1], params=handler_found[0]
     )
@@ -1521,6 +1609,12 @@ class Carriers(dict):
     """
 
     partial: frozenset[str] = frozenset()
+    possible: frozenset[str] = frozenset()
+
+
+def possible_names(carriers: dict[str, int]) -> frozenset[str]:
+    """The parameters that may carry a raw body, which a parse reads unresolved."""
+    return getattr(carriers, "possible", frozenset())
 
 
 def partial_names(carriers: dict[str, int]) -> frozenset[str]:
@@ -1787,7 +1881,7 @@ def conversion_parts(source: str, block: str, call: re.Match) -> tuple[Parts | N
     typed = re.search(annotated, block[: call.start()])
     if typed is None:
         return None, None
-    target = typed.group(1).strip()
+    target, _ = canonical_type(typed.group(1), site_in(block, typed.start(1)))
     wrapped = re.fullmatch(r"Result<\s*(.+?)\s*,.*>", target, re.S)
     head = re.match(r"((?:[A-Za-z_]\w*\s*::\s*)*[A-Z]\w*)", wrapped.group(1) if wrapped else target)
     if head is None:
@@ -1941,7 +2035,9 @@ def receiver_type(block: str, params: str, receiver: str, position: int) -> str 
     if bindings:
         annotated, value = bindings[-1].group(1), bindings[-1].group(2)
         if annotated:
-            typed = re.match(head, annotated.strip())
+            at = bindings[-1].start(1)
+            canonical, _ = canonical_type(annotated, site_in(block, at))
+            typed = re.match(head, canonical)
             return re.sub(r"\s", "", typed.group(1)) if typed else None
         generic = r"(?:\s*::\s*<[^()]*?>)?"
         built = re.match(head + generic + r"\s*(?:::\s*[a-z_]\w*\s*%s\s*\(|\{)" % generic, value.strip())
@@ -2033,9 +2129,10 @@ def block_parses(block: str, carriers: dict[str, int], returns: str) -> list[Par
         call = balanced(block[opener:])
         argument = call[1:-1].strip().rstrip(",").strip()
         root, whole = argument_root(argument)
-        if root is None or root not in carriers:
+        possible = root in possible_names(carriers) and root not in carriers
+        if root is None or root not in carriers and not possible:
             continue
-        if not live_binding(block, root, hit.start(), carriers[root]):
+        if not live_binding(block, root, hit.start(), carriers.get(root, -1)):
             continue
         before = block[: hit.start()]
         after = block[opener + len(call) :]
@@ -2051,7 +2148,7 @@ def block_parses(block: str, carriers: dict[str, int], returns: str) -> list[Par
         optional = tolerant or guards(block, hit.start(), root)
         # A body read through an index, a method or a generic type is not
         # something the audit can type, so it is reported.
-        if not whole or root in partial_names(carriers):
+        if not whole or possible or root in partial_names(carriers):
             kind = None
         elif turbofish is not None and not re.fullmatch(r"[A-Za-z0-9_:]+", turbofish):
             kind = None
@@ -3195,17 +3292,71 @@ def alias_scope(code: str, position: int) -> tuple[int, int]:
     return enclosing_block(code, position)
 
 
-def prelude_bound(declared_type: str, site: Site) -> str:
-    """A field type with each prelude name that its site shadows replaced.
+def canonical_type(declared_type: str, site: Site | None = None) -> tuple[str, str | None]:
+    """A type spelling in its canonical form, and the alias it cannot read, if any.
 
-    `alias_declarations` binds the names, as it does for extractors. A name
-    shadowed by a local item or an import reads as that item's path, so a
-    shadowed `Option<T>` is no `Option`, and the field stays mandatory.
+    Every type the audit reads goes through this one pipeline: handler and
+    helper parameters, receiver and `let` types, and struct fields. At the
+    type's `site` it applies, in order:
+
+    1. prelude and extractor shadowing, as `shadow_bound` reads it;
+    2. scoped `use` expansion of standard items, as `std_imports` reads it;
+    3. type aliases, to a fixed point, as `resolve_field_type` reads them;
+    4. the `STD_TYPES` cut of `canonical_paths`.
+
+    Every reader then matches only the canonical text.
+    """
+    text, at = site or (SOURCE[0], None)
+    return canonical_type_at(declared_type.strip(), text, at)
+
+
+@functools.lru_cache(maxsize=None)
+def canonical_type_at(declared_type: str, text: str, at: int | None) -> tuple[str, str | None]:
+    """`canonical_type` for a site given as its text and position, found once."""
+    site = (text, at)
+    declared_type = std_imports(shadow_bound(declared_type, site), site)
+    # A reference or a lifetime before the type stays, and the alias pass
+    # reads the type after it.
+    lead = re.match(r"(?:&\s*(?:'[a-z_]+\s+)?(?:mut\s+)?)?", declared_type).group(0)
+    resolved, unread = resolve_field_type(declared_type[len(lead) :], site)
+    return canonical_paths(lead + resolved), unread
+
+
+def std_imports(declared_type: str, site: Site) -> str:
+    """A type with each name that a `use` binds to a standard item spelled out.
+
+    `use std::option::Option as Maybe;` makes `Maybe<T>` read as
+    `std::option::Option<T>`, which the `STD_TYPES` cut then shortens.
+    `written_path` reads each import. A name bound to any other item is
+    left as written, since `resolve_symbol` reads its import itself.
     """
     text, at = site
     if at is None:
         return declared_type
-    for name in PRELUDE_NAMES:
+    names = r"(?<![\w:])(?:::\s*)?[A-Za-z_]\w*(?:\s*::\s*[A-Za-z_]\w*)*"
+    for found in reversed(list(re.finditer(names, declared_type))):
+        segments, used_at = written_path(found.group(0), site)
+        # The audited source has its standard paths cut already, `use`
+        # statements too, so a bare standard name there is one as well.
+        cut = len(segments) == 1 and segments[0] in STD_TYPES
+        if used_at is not None and segments and (segments[0] in STD_ROOTS or cut):
+            spelled = "::".join(segments)
+            declared_type = declared_type[: found.start()] + spelled + declared_type[found.end() :]
+    return declared_type
+
+
+def shadow_bound(declared_type: str, site: Site) -> str:
+    """A type with each prelude or extractor name that its site shadows replaced.
+
+    `alias_declarations` binds the names. A name shadowed by a local item or
+    an import reads as that item's path, so a shadowed `Option<T>` is no
+    `Option`, and the field stays mandatory. The audited source needs no
+    pass here, since `resolve_aliases` has already rewritten it whole.
+    """
+    text, at = site
+    if at is None or text == SOURCE[0]:
+        return declared_type
+    for name in PRELUDE_NAMES + EXTRACTOR_NAMES:
         pattern = r"(?<![\w:.])%s\b" % name
         if not re.search(pattern, declared_type):
             continue
@@ -3576,11 +3727,12 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
         if params is None or route is None:
             continue
         at = code.find("async fn %s(" % handler)
+        written = getattr(params, "written", params)
         for start, end, alias in unreadable:
-            if start <= at < end and re.search(r"(?<![\w:])%s\b" % alias, params):
+            if start <= at < end and re.search(r"(?<![\w:])%s\b" % alias, written):
                 unresolved.append("  %s %s: cannot read the `%s` type alias" % (method, path, alias))
         for start, end, name in globbed:
-            if start <= at < end and re.search(r"(?<![\w:])%s\b" % name, params):
+            if start <= at < end and re.search(r"(?<![\w:])%s\b" % name, written):
                 unresolved.append(
                     "  %s %s: cannot tell which `%s` a glob import brings" % (method, path, name)
                 )
@@ -3634,7 +3786,7 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
             # mandatory fields are checked. A tolerant `Result` body is not.
             parses.append((body_type, bool(bare) or result_rejects or option_body, (code, at)))
         mandatory_body = bool(bare) or result_rejects
-        if byte_parameters(params):
+        if byte_parameters(params) or possible_carriers(params):
             for name, optional, tolerant, site in raw_body_parses(code, handler):
                 # A parse an empty body cannot skip makes the body mandatory,
                 # whatever its type. A parse that does not tolerate its error
@@ -4155,6 +4307,9 @@ pub fn harvest_api_router() -> Router {
         .route("/s/local-option", get(s_local_option))
         .route("/s/std-paths", get(s_std_paths))
         .route("/s/spoofed-query", get(s_spoofed_query))
+        .route("/s/std-alias-field", get(s_std_alias_field))
+        .route("/s/std-option-param", post(s_std_option_param))
+        .route("/s/std-alias-param", post(s_std_alias_param))
         .route("/s/spoofed-json", post(s_spoofed_json))
         .route("/s/reexported-query", get(s_reexported_query))
         .route("/s/imported-option", get(s_imported_option))
@@ -4176,6 +4331,10 @@ mod local_option {
         limit: Option<u32>,
     }
 
+    async fn s_std_option_param(body: std::option::Option<Json<Paging>>) -> Response {
+        StatusCode::OK.into_response()
+    }
+
     struct StdPathsPage {
         limit: std::option::Option<core::primitive::u32>,
         name: std::string::String,
@@ -4185,6 +4344,22 @@ mod local_option {
 }
 
 async fn s_std_paths(Query(page): Query<local_option::StdPathsPage>) -> Response {
+    StatusCode::OK.into_response()
+}
+
+mod std_alias {
+    use std::option::Option as Maybe;
+
+    struct StdAliasPage {
+        limit: Maybe<u32>,
+    }
+
+    async fn s_std_alias_param(body: Maybe<Json<Paging>>) -> Response {
+        StatusCode::OK.into_response()
+    }
+}
+
+async fn s_std_alias_field(Query(page): Query<std_alias::StdAliasPage>) -> Response {
     StatusCode::OK.into_response()
 }
 
@@ -4355,6 +4530,7 @@ pub fn harvest_api_router() -> Router {
         .route("/n/self-path", get(n_self_path))
         .route("/n/typed-receiver", post(n_typed_receiver))
         .route("/n/let-receiver", post(n_let_receiver))
+        .route("/n/alias-receiver", post(n_alias_receiver))
         .route("/n/untyped-receiver", post(n_untyped_receiver))
         .route("/n/maybe-fields", post(n_maybe_fields))
         .route("/n/loose-field", post(n_loose_field))
@@ -4409,6 +4585,13 @@ impl LenientReader {
 }
 
 async fn n_typed_receiver(body: Bytes, reader: LenientReader) -> Response {
+    reader.read(&body)
+}
+
+type ReaderAlias = StrictReader;
+
+async fn n_alias_receiver(body: Bytes) -> Response {
+    let reader: ReaderAlias = make_reader();
     reader.read(&body)
 }
 
@@ -4905,6 +5088,12 @@ pub fn harvest_api_router() -> Router {
         .route("/e/raw-std-reader", post(e_raw_std_reader))
         .route("/e/extension-decode", post(e_extension_decode))
         .route("/e/unrelated-receiver", post(e_unrelated_receiver))
+        .route("/e/alias-body", post(e_alias_body))
+        .route("/e/alias-helper", post(e_alias_helper))
+        .route("/e/opaque-body", post(e_opaque_body))
+        .route("/e/unknown-type-body", post(e_unknown_type_body))
+        .route("/e/alias-conversion", post(e_alias_conversion))
+        .route("/e/struct-named-alias", post(e_struct_named_alias))
         .route("/e/slice-receiver", post(e_slice_receiver))
         .route("/e/spoofed-parse", post(e_spoofed_parse))
         .route("/e/nested-or-inspection", post(e_nested_or_inspection))
@@ -6262,6 +6451,54 @@ impl DecodeExt for Bytes {
 
 async fn e_extension_decode(body: Bytes) -> Response {
     let gadget = body.decode_body::<Gadget>();
+    StatusCode::OK.into_response()
+}
+
+type RawBody = Vec<u8>;
+type RawSlice = [u8];
+type Opaque<T> = Wrapper<T>;
+
+async fn e_alias_body(body: RawBody) -> Response {
+    let gadget = serde_json::from_slice::<Gadget>(&body).unwrap();
+    StatusCode::OK.into_response()
+}
+
+fn parse_raw_slice(raw: &RawSlice) -> Response {
+    let gadget = serde_json::from_slice::<Gadget>(raw).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_alias_helper(body: Bytes) -> Response {
+    parse_raw_slice(&body)
+}
+
+async fn e_opaque_body(body: Opaque<u8>) -> Response {
+    let gadget = serde_json::from_slice::<Gadget>(&body).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_unknown_type_body(body: other_crate::Blob) -> Response {
+    let gadget = serde_json::from_slice::<Gadget>(&body).unwrap();
+    StatusCode::OK.into_response()
+}
+
+type ParcelAlias = Parcel;
+
+async fn e_alias_conversion(body: Bytes) -> Response {
+    let parcel: ParcelAlias = body.into();
+    StatusCode::OK.into_response()
+}
+
+mod shapes {
+    struct Blob {
+        size: u32,
+    }
+}
+
+type Blob<T> = Wrapper<T, u8>;
+
+async fn e_struct_named_alias(body: Blob<u8>) -> Response {
+    let gadget = serde_json::from_slice::<Gadget>(&body).unwrap();
     StatusCode::OK.into_response()
 }
 
@@ -8728,11 +8965,17 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
                 200,
                 request_body=body_of(("name", True), required=False),
             )
-            for path in ("/n/typed-receiver", "/n/let-receiver", "/n/untyped-receiver")
+            for path in (
+                "/n/typed-receiver",
+                "/n/let-receiver",
+                "/n/untyped-receiver",
+                "/n/alias-receiver",
+            )
         ],
         {
             "body_required": [
                 "POST /n/let-receiver: the body is mandatory",
+                "POST /n/alias-receiver: the body is mandatory",
                 "POST /n/untyped-receiver: the body is mandatory",
             ],
             "unresolved": ["POST /n/untyped-receiver: cannot read a `from_slice` call"],
@@ -9012,6 +9255,31 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
         {},
     ),
     (
+        "an aliased import of a standard type is that type, in a field and in a parameter",
+        FIXTURE_ALIAS_SCOPES,
+        [
+            fixture_route(
+                "GET",
+                "/s/std-alias-field",
+                200,
+                params=[query_param("limit", "integer", False)],
+            ),
+            fixture_route(
+                "POST",
+                "/s/std-alias-param",
+                200,
+                request_body=body_of(("limit", False), required=False),
+            ),
+            fixture_route(
+                "POST",
+                "/s/std-option-param",
+                200,
+                request_body=body_of(("limit", False), required=False),
+            ),
+        ],
+        {},
+    ),
+    (
         "an extractor path is trusted only after its first name goes through the imports",
         FIXTURE_ALIAS_SCOPES,
         [
@@ -9079,6 +9347,43 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
                 "GET /s/dup-params/{id}: `limit` is documented 2 times in query",
                 "GET /s/dup-params/{id}: `id` is documented 2 times in path",
             ]
+        },
+    ),
+    (
+        "a parameter type is read through its aliases, and one the audit cannot read fails closed",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST", path, 200, request_body=body_of(("name", False), required=False)
+            )
+            for path in (
+                "/e/alias-body",
+                "/e/alias-helper",
+                "/e/opaque-body",
+                "/e/unknown-type-body",
+                "/e/alias-conversion",
+                "/e/struct-named-alias",
+            )
+        ],
+        {
+            "body_required": [
+                "POST /e/alias-body: the body is mandatory",
+                "POST /e/alias-helper: the body is mandatory",
+                "POST /e/opaque-body: the body is mandatory",
+                "POST /e/unknown-type-body: the body is mandatory",
+                "POST /e/alias-conversion: the body is mandatory",
+                "POST /e/struct-named-alias: the body is mandatory",
+            ],
+            "mandatory": [
+                "POST /e/alias-body: `name` is mandatory in Gadget",
+                "POST /e/alias-helper: `name` is mandatory in Gadget",
+                "POST /e/alias-conversion: `name` is mandatory in Gadget",
+            ],
+            "unresolved": [
+                "POST /e/opaque-body: cannot read a `from_slice` call",
+                "POST /e/unknown-type-body: cannot read a `from_slice` call",
+                "POST /e/struct-named-alias: cannot read a `from_slice` call",
+            ],
         },
     ),
     (
