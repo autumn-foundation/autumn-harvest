@@ -128,7 +128,7 @@ The `harvest_events` table is the exception: its `id` column is `BIGSERIAL i64` 
 
 **2. `db` feature gates all Diesel code**
 
-`schema.rs` and `models.rs` are compiled only when `features = ["db"]`. `default = ["db"]`, so it compiles in by default. Tests on Windows run `--no-default-features` to avoid OpenSSL dependency. CI tests the `db` feature on Linux.
+`schema.rs` and `models.rs` are compiled only when `features = ["db"]`. `default = ["db", "unified-dag-execution", "tls"]`, so it compiles in by default. `tls` adds rustls for LISTEN/NOTIFY connections with `sslmode=require` (issue #1717). Tests on Windows run `--no-default-features` to avoid OpenSSL dependency. CI tests the `db` feature on Linux.
 
 **3. Adjacently-tagged event JSON**
 
@@ -138,7 +138,12 @@ The `harvest_events` table is the exception: its `id` column is `BIGSERIAL i64` 
 
 Never remove or reorder `WorkflowEvent` variants. Stored JSON in `harvest_events.event_data` must always deserialize into the same variant names after deployment. Add new variants at the end.
 
-**Sanctioned in-place mutation exception — payload erasure (`erase.rs`, issue #495):** `erase_workflow_payloads` is the **only** operation (alongside heartbeat checkpoints in `queue::record_heartbeat`) permitted to mutate existing `harvest_events.event_data` rows in-place. It replaces payload-bearing field values within the `data` object with a tombstone `{"_harvest_erased": true}` — the event `type`, variant structure, event IDs, timestamps, and sequence number are never touched. This exception is **terminal-only** (execution must be COMPLETED/FAILED/CANCELLED/TIMED_OUT/CONTINUED_AS_NEW/TERMINATED) to protect replay determinism of any resumable run, and is **irreversible**. No new `WorkflowEvent` variant is introduced.
+**Sanctioned in-place mutation exceptions.** Exactly two operations write existing `harvest_events.event_data` rows. `CLAUDE.md` ("`harvest_events` is append-only") is the authority on this list, with each scope guarantee and its proof.
+
+- **Payload erasure** (`erase.rs`, issue #495). `erase_workflow_payloads` replaces payload-bearing field values within the `data` object with a tombstone `{"_harvest_erased": true}`. The event `type`, variant structure, event IDs, timestamps, and sequence number are never touched. This exception is **terminal-only** (execution must be COMPLETED/FAILED/CANCELLED/TIMED_OUT/CONTINUED_AS_NEW/TERMINATED) to protect replay determinism of any resumable run, and is **irreversible**. No new `WorkflowEvent` variant is introduced.
+- **Codec key re-encryption** (`codec_rotation.rs`, issue #948). The rotation sweep decodes a payload field's ciphertext under a retired key and re-encodes it under the active key. The decoded plaintext is byte-identical before and after. The write is a compare-and-swap on the row's previous bytes, so it always loses a race against an erasure.
+
+Heartbeat checkpoints (`queue::record_heartbeat`) are not an exception. They write the `harvest_task_queue` row, not the event log. Continue-as-new carries a stored `last_completion_result` into the successor's first event by patching the row before its INSERT, not after, so it is not an exception either.
 
 **5. `WorkflowContext` replay modes**
 
@@ -204,7 +209,7 @@ Current implementation scope: `ExecutionId`/`ShardId` encoding, `ShardRouter`, `
 | `replay.rs` | 2 | Deterministic replay engine: `HistoryMatcher` walks event history, detects non-determinism |
 | `executor.rs` | 2 | Workflow executor: `run_workflow` drives replay + live execution, handles suspension |
 | `queue.rs` | 2 | Postgres task queue: `enqueue`, `claim` (FOR UPDATE SKIP LOCKED), `complete`, `fail` |
-| `notify.rs` | 2 | LISTEN/NOTIFY wrapper: `Listener` (async stream), `Notifier` (pg_notify), channel naming |
+| `notify.rs` | 2 | LISTEN/NOTIFY wrapper: `Listener` (async stream), `Notifier` (pg_notify), channel naming. `sslmode=require` selects verified TLS (issue #1717). |
 | `dispatch.rs` | 3.x | Task dispatch channel seam (issue #1312): `TaskDispatch` trait (`publish`/`next`/`ack`/`release`/`maintain`), `DispatchHint` (task id, queue, `scheduled_at`, priority, shard), `DispatchLease`, `DispatchMaintenance`, `DispatchSettings` (`poll_interval`, `reconcile_interval`, `reconcile_batch`, `release_backoff_cap`) and the process-global `install`/`installed`/`uninstall`. The channel carries references to claimable `harvest_task_queue` rows; Postgres stays the source of truth, and a worker still claims the named row with the full claim predicate. It is a latency and throughput optimization, never a durability store: the worker's reconcile sweep republishes every due `PENDING` row the channel does not hold. No new event variant, no migration. The Redis Streams implementation lives in `autumn-harvest-redis`; see [`docs/operations/redis-dispatch.md`](operations/redis-dispatch.md). |
 | `worker.rs` | 2 | Worker runtime: poll loop, semaphore-bounded concurrent dispatch, graceful shutdown |
 | `workers.rs` | 4 | Worker fleet registry: `register_worker`, `heartbeat_worker`, `transition_status`, `list_workers`, `get_worker`, `fleet_health`, `spawn_worker_heartbeat` |

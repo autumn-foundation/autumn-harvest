@@ -122,6 +122,8 @@ const STABLE_PROMETHEUS_METRICS: &[&str] = &[
     // The adjacent bridge fix issue #1307 made: `record_external_cancel_sent`
     // had no `MetricsRsRecorder` implementation and silently no-opped.
     "harvest_workflow_external_cancel_sent_total",
+    // Issue #1429 — the dispatch background publisher's dropped-hint count.
+    "harvest_dispatch_dropped_hints",
 ];
 
 #[test]
@@ -382,6 +384,56 @@ fn the_replication_down_alert_keys_on_standby_count_not_on_lag() {
         description.contains("unknown") || description.contains("absent"),
         "the description must explain that the lag series goes ABSENT, not to zero: \
          {description}"
+    );
+}
+
+/// The dropped-hints alert must require sustained growth, not a single
+/// burst (Codex review, issue #1429 follow-up).
+///
+/// `harvest.dispatch.dropped_hints` is a running total. A bare
+/// `increase(m[15m]) > 0` clause goes true the moment any one hint drops
+/// anywhere in that window. It then stays true for the rest of the
+/// window, even if the burst cleared immediately. The alert's own runbook
+/// and `default_threshold` name that exact shape as a false positive: "a
+/// brief spike... that clears within one or two reconcile intervals".
+/// The expression must also require growth in a shorter, more recent
+/// window, so a burst that already stopped climbing does not alone
+/// satisfy it.
+///
+/// The `and` clause alone is still not enough (Codex review, issue #1429
+/// follow-up). A single dropped hint holds both clauses true for up to 5
+/// minutes. An importer with no minimum-duration gate still opens a
+/// ticket for that one-off burst. A `for` clause closes that gap. The AND
+/// expression decays to false once the burst's own 5-minute clause ages
+/// out, well short of 15 minutes. Only drops still recurring every
+/// 5-minute slice across the whole window keep the condition true long
+/// enough to satisfy `for: 15m`.
+#[test]
+fn the_dropped_hints_alert_requires_sustained_growth_not_one_burst() {
+    let pack = read_pack();
+    let rules = pack["rules"].as_array().expect("rules must be an array");
+    let rule = rules
+        .iter()
+        .find(|rule| rule["id"].as_str() == Some("harvest_dispatch_dropped_hints"))
+        .expect("dropped-hints alert must exist");
+    let expression = &rule["prometheus"]["expressions"][0];
+    let expr = expression["expr"]
+        .as_str()
+        .expect("must carry a PromQL expression");
+    assert!(
+        expr.contains("increase(harvest_dispatch_dropped_hints[15m]) > 0"),
+        "the alert must still require growth over the full window: {expr}"
+    );
+    assert!(
+        expr.contains("and increase(harvest_dispatch_dropped_hints[5m]) > 0"),
+        "the alert must also require growth in a shorter, more recent window, so a burst \
+         that already stopped climbing does not alone fire it: {expr}"
+    );
+    assert_eq!(
+        expression["for"].as_str(),
+        Some("15m"),
+        "a `for` clause must gate the fire, or a single burst's brief AND window still \
+         opens a ticket with no minimum-duration check"
     );
 }
 

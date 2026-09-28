@@ -585,6 +585,18 @@ pub enum HarvestBuilderError {
         name: String,
     },
 
+    /// A registered DAG definition does not compile: it has a cycle, a bad
+    /// input binding or a bad compensator. Without this check the other DAG
+    /// validators skip such a DAG. The error then appears only when the
+    /// plugin compiles its DAG catalog, or at run time as a FAILED run.
+    #[error("DAG '{dag}' does not compile: {error}")]
+    InvalidDagDefinition {
+        /// DAG whose definition failed to compile.
+        dag: String,
+        /// The build error, as its display text.
+        error: String,
+    },
+
     /// A DAG references an activity registered as local-only. Local activities
     /// run inline on the workflow worker and cannot be scheduled through the
     /// DAG activity queue lowering.
@@ -2426,6 +2438,7 @@ impl HarvestBuilder {
             &self.activities,
             self.worker_config.max_local_activity_start_to_close,
         )?;
+        validate_dag_definitions_compile(&self.dags)?;
         validate_dags_do_not_use_local_activities(&self.dags, &self.activities)?;
         validate_classic_dags_have_no_signal_gates(&self.dags)?;
         validate_classic_dags_have_no_compensators(&self.dags)?;
@@ -2526,6 +2539,22 @@ impl HarvestBuilder {
             wasm_module_registrations: self.wasm_module_registrations,
         })
     }
+}
+
+/// Reject a registered DAG whose definition does not compile.
+///
+/// The DAG validators below skip a definition that fails to build. This check
+/// runs first, so no invalid definition passes `try_build` unreported.
+fn validate_dag_definitions_compile(dags: &[DagInfo]) -> Result<(), HarvestBuilderError> {
+    for dag in dags {
+        if let Err(error) = dag.build_definition() {
+            return Err(HarvestBuilderError::InvalidDagDefinition {
+                dag: dag.name.to_string(),
+                error: error.to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn validate_dags_do_not_use_local_activities(
@@ -4888,6 +4917,50 @@ mod tests {
     fn harvest_builder_collects_dags() {
         let builder = HarvestBuilder::new().dags(vec![fake_dag_info()]);
         assert_eq!(builder.dag_count(), 1);
+    }
+
+    /// A DAG whose definition does not compile fails `try_build`. The other
+    /// DAG validators skip such a definition, so without this check a cycle
+    /// passed the build and surfaced only at run time.
+    #[test]
+    fn a_cyclic_dag_is_rejected_by_the_builder() {
+        fn forward() {}
+
+        let cyclic_dag = DagInfo {
+            name: "cyclic_dag",
+            module: "test",
+            schedule: None,
+            catchup: false,
+            max_active_runs: 1,
+            default_queue: None,
+            builder: |dag: &mut DagBuilder| {
+                let node = dag.activity(forward);
+                let same = node.clone();
+                let _ = node.upstream(&same);
+            },
+            workflow_handler: Some(|_ctx, input| Box::pin(async move { Ok(input) })),
+            jitter: ::std::time::Duration::ZERO,
+            overlap_policy: crate::policy::OverlapPolicy::Skip,
+            buffer_all_max: 100,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            mcp: false,
+            execution_timeout: None,
+            sla: None,
+        };
+
+        let err = HarvestBuilder::new()
+            .dags(vec![cyclic_dag])
+            .try_build()
+            .expect_err("a cyclic DAG must be rejected");
+        assert!(
+            matches!(
+                err,
+                HarvestBuilderError::InvalidDagDefinition { ref dag, .. } if dag == "cyclic_dag"
+            ),
+            "the rejection must name the DAG, got: {err:?}"
+        );
     }
 
     // ── Issue #780 — declarative DAG node compensation validations ──────────

@@ -1983,10 +1983,8 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
                 for start in pre_check_deferred {
                     start.spawn();
                 }
-                for check in deferred_checks {
-                    let _ = check_and_report_unfinished_handlers(conn, check.0, &check.1, metrics)
-                        .await;
-                }
+                let _ = check_and_report_unfinished_handlers_batch(conn, &deferred_checks, metrics)
+                    .await;
                 if let Some(m) = metrics {
                     emit_start_cancel_metrics(m, &cancel_metrics);
                 }
@@ -2070,9 +2068,7 @@ pub async fn start_or_load_workflow_execution_with_codecs(
     for start in deferred_starts {
         start.spawn();
     }
-    for check in deferred_checks {
-        let _ = check_and_report_unfinished_handlers(conn, check.0, &check.1, None).await;
-    }
+    let _ = check_and_report_unfinished_handlers_batch(conn, &deferred_checks, None).await;
     Ok(result)
 }
 
@@ -2119,9 +2115,7 @@ pub async fn start_or_load_workflow_execution_with_metrics_and_codecs(
     for start in deferred_starts {
         start.spawn();
     }
-    for check in deferred_checks {
-        let _ = check_and_report_unfinished_handlers(conn, check.0, &check.1, metrics).await;
-    }
+    let _ = check_and_report_unfinished_handlers_batch(conn, &deferred_checks, metrics).await;
     if let Some(m) = metrics {
         emit_start_cancel_metrics(m, &cancel_metrics);
     }
@@ -2276,9 +2270,7 @@ pub async fn start_or_load_workflow_execution_idempotent_with_codecs(
     for start in deferred_starts {
         start.spawn();
     }
-    for check in deferred_checks {
-        let _ = check_and_report_unfinished_handlers(conn, check.0, &check.1, metrics).await;
-    }
+    let _ = check_and_report_unfinished_handlers_batch(conn, &deferred_checks, metrics).await;
     if let Some(m) = metrics {
         emit_start_cancel_metrics(m, &cancel_metrics);
     }
@@ -2984,6 +2976,125 @@ async fn run_latest_wins_supersede(
     Ok((cancel_metrics, outcome.deferred_starts))
 }
 
+/// Seal a finished prior `CONTINUED_AS_NEW` so a start can replace it.
+///
+/// The caller holds the row lock. The state is read again here because an
+/// active prior is cancelled in the same transaction, after the caller read
+/// it. Only a finished run can be sealed, and the write is a compare-and-set
+/// on the state that was read.
+///
+/// The seal appends no event. The run's own terminal event stays last in its
+/// history, so [`replaced_run_outcome`] can still name its real outcome.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Config`] when the row is not in a finished state,
+/// or when the compare-and-set updates no row.
+async fn seal_replaced_execution(
+    conn: &mut AsyncPgConnection,
+    existing_id: uuid::Uuid,
+) -> HarvestResult<()> {
+    let current: String = harvest_workflow_executions::table
+        .find(existing_id)
+        .select(harvest_workflow_executions::state)
+        .for_update()
+        .first(conn)
+        .await
+        .map_err(database_error)?;
+    if !REPLACEABLE_PRIOR_STATES.contains(&current.as_str()) {
+        return Err(HarvestError::Config(format!(
+            "workflow execution {} is {current}; a start can only replace a \
+             COMPLETED, FAILED, CANCELLED or TIMED_OUT run",
+            ExecutionId::from_uuid(existing_id)
+        )));
+    }
+    let updated = diesel::update(
+        harvest_workflow_executions::table
+            .find(existing_id)
+            .filter(harvest_workflow_executions::state.eq(&current)),
+    )
+    .set((
+        harvest_workflow_executions::state.eq("CONTINUED_AS_NEW"),
+        harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+    ))
+    .execute(conn)
+    .await
+    .map_err(database_error)?;
+    if updated == 0 {
+        return Err(HarvestError::Config(format!(
+            "workflow execution {} changed state while a start replaced it",
+            ExecutionId::from_uuid(existing_id)
+        )));
+    }
+    Ok(())
+}
+
+/// The finished states a start-replace may seal over.
+pub(crate) const REPLACEABLE_PRIOR_STATES: &[&str] =
+    &["COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT"];
+
+/// The outcome a `CONTINUED_AS_NEW` row's own history records.
+///
+/// A real continue-as-new ends its history with `WorkflowContinuedAsNew`.
+/// A start-replace or a shard-staging vacate seals a finished run
+/// `CONTINUED_AS_NEW` with no event. Its last lifecycle event is then the
+/// outcome it really had. Returns `None` for a real continue-as-new, or when
+/// the history names no outcome.
+///
+/// A workflow task timeout records `WorkflowFailed` for a `TIMED_OUT` run.
+/// Its [`crate::failure::ERROR_TYPE_WORKFLOW_TASK_TIMED_OUT`] type makes such
+/// a run read back as `TIMED_OUT`. A history written before that type existed
+/// reads back as `FAILED`.
+#[must_use]
+pub fn replaced_run_outcome(events: &[WorkflowEvent]) -> Option<&'static str> {
+    events.iter().rev().find_map(|event| match event {
+        WorkflowEvent::WorkflowContinuedAsNew { .. }
+        | WorkflowEvent::WorkflowResetTerminated { .. } => Some(None),
+        WorkflowEvent::WorkflowCompleted { .. } => Some(Some("COMPLETED")),
+        WorkflowEvent::WorkflowFailed { error_type, .. }
+            if error_type.as_deref()
+                == Some(crate::failure::ERROR_TYPE_WORKFLOW_TASK_TIMED_OUT) =>
+        {
+            Some(Some("TIMED_OUT"))
+        }
+        WorkflowEvent::WorkflowFailed { .. } => Some(Some("FAILED")),
+        WorkflowEvent::WorkflowCancelled { .. } => Some(Some("CANCELLED")),
+        WorkflowEvent::WorkflowExecutionTimedOut { .. } => Some(Some("TIMED_OUT")),
+        _ => None,
+    })?
+}
+
+/// The state a result reader reports for a row in `state`.
+///
+/// A `CONTINUED_AS_NEW` row reports its [`replaced_run_outcome`] when it has
+/// one. Every other state reports itself. A value the schema does not allow
+/// reports `UNKNOWN`, which the caller treats as not yet terminal.
+async fn reported_outcome_state(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    state: &str,
+) -> HarvestResult<&'static str> {
+    if state == "CONTINUED_AS_NEW"
+        && let Some(outcome) = replaced_run_outcome_state(conn, exec_id).await?
+    {
+        return Ok(outcome);
+    }
+    Ok(crate::lifecycle::WorkflowState::from_db(state).map_or("UNKNOWN", |s| s.as_str()))
+}
+
+/// Load `exec_id`'s history and apply [`replaced_run_outcome`] to it.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] when the history cannot be read.
+pub async fn replaced_run_outcome_state(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<Option<&'static str>> {
+    let history = store::load_history_undecoded(conn, exec_id).await?;
+    Ok(replaced_run_outcome(&history.events))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn replace_execution(
     conn: &mut AsyncPgConnection,
@@ -3023,15 +3134,11 @@ async fn replace_execution(
     // partial index already excludes an observed-terminal seal via
     // `migrated_run_terminal_at IS NULL`. So this row is already outside
     // the uniqueness scope without touching its state at all.
+    //
+    // Nothing continued this run, so readers must still report its real
+    // outcome. See `replaced_run_outcome`.
     if existing.state != "MIGRATED" {
-        diesel::update(harvest_workflow_executions::table.find(existing.id))
-            .set((
-                harvest_workflow_executions::state.eq("CONTINUED_AS_NEW"),
-                harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
-            ))
-            .execute(conn)
-            .await
-            .map_err(database_error)?;
+        seal_replaced_execution(conn, existing.id).await?;
     }
 
     let new_execution = diesel::insert_into(harvest_workflow_executions::table)
@@ -3154,7 +3261,7 @@ async fn inline_cancel(
         codecs,
     )
     .await?;
-    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+    let updated = diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
         .set((
             harvest_workflow_executions::state.eq("CANCELLED"),
@@ -3168,6 +3275,13 @@ async fn inline_cancel(
         .execute(conn)
         .await
         .map_err(database_error)?;
+    // The event above is already appended. A run that is not open must not
+    // keep a cancel event that its state does not match, so roll back.
+    if updated == 0 {
+        return Err(HarvestError::Config(format!(
+            "workflow execution {exec_id} is no longer running"
+        )));
+    }
     queue::fail_open_tasks_for_execution(conn, exec_id, &format!("workflow cancelled: {reason}"))
         .await?;
     let (mut deferred, closed_children) =
@@ -3570,9 +3684,7 @@ pub async fn cancel_workflow_execution(
     let (cancel_result, deferred_starts, deferred_checks, deferred_terminal) =
         cancel_workflow_execution_collect(conn, exec_id, reason, Some(metrics)).await?;
 
-    for check in deferred_checks {
-        let _ = check_and_report_unfinished_handlers(conn, check.0, &check.1, Some(metrics)).await;
-    }
+    let _ = check_and_report_unfinished_handlers_batch(conn, &deferred_checks, Some(metrics)).await;
     if let Some((workflow_name, queue_name)) = deferred_terminal {
         crate::telemetry::emit_workflow_terminal(
             metrics,
@@ -4687,13 +4799,13 @@ pub async fn release_claim_if_workflow_paused(
     task_id: Uuid,
     worker_id: &str,
 ) -> HarvestResult<bool> {
-    let released = diesel::sql_query(release_claim_if_workflow_paused_query())
-        .bind::<diesel::sql_types::Uuid, _>(task_id)
-        .bind::<diesel::sql_types::Text, _>(worker_id)
-        .execute(conn)
-        .await
-        .map_err(database_error)?;
-    Ok(released > 0)
+    queue::release_claim_via(
+        conn,
+        release_claim_if_workflow_paused_query(),
+        task_id,
+        worker_id,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -5309,6 +5421,16 @@ pub async fn reactivate_failed_execution(
         )));
     }
 
+    // A redrive replays history and runs the failed step again, live. Erasure
+    // is allowed on a FAILED run and replaces its payloads with tombstones. A
+    // redrive would then run user code on those tombstones, so refuse it. The
+    // check is under the row lock, so it cannot race an erasure.
+    if crate::erase::execution_input_is_erased(&execution.input) {
+        return Err(HarvestError::Config(format!(
+            "cannot redrive: workflow execution {exec_id} has erased payloads"
+        )));
+    }
+
     // Re-anchor the hard deadline and soft SLA deadline from now so the timeout
     // and SLA scanners see a fresh window rather than the stale past deadlines
     // that were set when the execution first started. Without this, a FAILED
@@ -5725,6 +5847,22 @@ pub async fn terminate_workflow_execution_collect(
                 .map_err(database_error)?
                 .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))?;
 
+            // A rebalanced seal is not a terminal prior (issue #964). The run
+            // is alive on another shard. An idempotent success here would tell
+            // the operator, or a parent-close cascade, that the run stopped
+            // when it did not. Refuse retryably, as cancel does. A seal whose
+            // live copy is already observed terminal stays an idempotent no-op.
+            if execution.state == "MIGRATED" && execution.migrated_run_terminal_at.is_none() {
+                return Err(HarvestError::ShardUnavailable {
+                    shard_id: execution.migrated_to_shard.unwrap_or(execution.shard_id),
+                    reason: format!(
+                        "workflow execution {exec_id} was rebalanced onto another shard \
+                         (state MIGRATED); this row is a forwarding seal, not the live \
+                         run, so it cannot be terminated here"
+                    ),
+                });
+            }
+
             // Idempotent no-op against any already-terminal state
             // (issue #504, AC #7): never append a duplicate terminal
             // transition. `idempotent` returns the existing state with
@@ -5907,9 +6045,7 @@ pub async fn terminate_workflow_execution(
     let (cancel_result, deferred_starts, deferred_checks, deferred_terminal) =
         terminate_workflow_execution_collect(conn, exec_id, reason).await?;
 
-    for check in deferred_checks {
-        let _ = check_and_report_unfinished_handlers(conn, check.0, &check.1, Some(metrics)).await;
-    }
+    let _ = check_and_report_unfinished_handlers_batch(conn, &deferred_checks, Some(metrics)).await;
     if let Some((workflow_name, queue_name)) = deferred_terminal {
         crate::telemetry::emit_workflow_terminal(
             metrics,
@@ -6899,9 +7035,7 @@ pub async fn signal_with_start_workflow_execution_with_metrics_and_codecs(
     for start in deferred_starts {
         start.spawn();
     }
-    for check in deferred_checks {
-        let _ = check_and_report_unfinished_handlers(conn, check.0, &check.1, metrics).await;
-    }
+    let _ = check_and_report_unfinished_handlers_batch(conn, &deferred_checks, metrics).await;
     if let Some(m) = metrics {
         emit_start_cancel_metrics(m, &cancel_metrics);
     }
@@ -7615,9 +7749,7 @@ pub async fn rerun_workflow_execution_with_codecs(
     for start in deferred_starts {
         start.spawn();
     }
-    for check in deferred_checks {
-        let _ = check_and_report_unfinished_handlers(conn, check.0, &check.1, metrics).await;
-    }
+    let _ = check_and_report_unfinished_handlers_batch(conn, &deferred_checks, metrics).await;
     if let Some(m) = metrics {
         emit_start_cancel_metrics(m, &cancel_metrics);
     }
@@ -8364,9 +8496,7 @@ pub async fn update_with_start_workflow_execution_with_metrics_and_codecs(
     for start in deferred_starts {
         start.spawn();
     }
-    for check in deferred_checks {
-        let _ = check_and_report_unfinished_handlers(conn, check.0, &check.1, metrics).await;
-    }
+    let _ = check_and_report_unfinished_handlers_batch(conn, &deferred_checks, metrics).await;
     if let Some(m) = metrics {
         emit_start_cancel_metrics(m, &cancel_metrics);
         // Post-outer-commit: emit update.admitted (issue #684) only when an
@@ -9356,7 +9486,10 @@ pub async fn read_external_await_outcome(
             Err(e) => return Err(e),
         };
 
-        let outcome = match execution.state.as_str() {
+        // A replaced run reports the outcome it had before the seal. Only a
+        // real continue-as-new reaches the successor-chain arm below.
+        let state = reported_outcome_state(conn, current, &execution.state).await?;
+        let outcome = match state {
             "COMPLETED" => {
                 // The target's `output` row column is read RAW. Core
                 // `append_events`/`load_history` use the identity codec (payload
@@ -9485,6 +9618,104 @@ pub async fn check_and_report_unfinished_handlers(
         if let Some(recorder) = metrics {
             recorder.record_workflow_unfinished_handlers(workflow_name, "update", count as u64);
         }
+    }
+    Ok(())
+}
+
+/// Executions checked per [`check_and_report_unfinished_handlers_batch`]
+/// round trip.
+///
+/// Review findings on PR #1739 (Codex, P2, two rounds).
+///
+/// Round one flagged an unchunked [`store::load_histories_undecoded_batch`]
+/// call. It materializes every requested history into one map before this
+/// function reads any of them. A parent-close cascade is bounded only by
+/// its own fan-out width. An unbounded `checks` list therefore makes peak
+/// memory proportional to the sum of every history in the cascade.
+///
+/// Chunking the *loader's own* `exec_ids` fixed that call's shape. Round
+/// two found the regression survived one layer up. This function's own
+/// accumulator still held every chunk's decoded histories for the life of
+/// the whole call, so peak memory was unchanged.
+///
+/// The fix lives here, not in the loader. This function chunks `checks`
+/// itself, calls the loader once per chunk, and finishes reporting that
+/// chunk before moving to the next. The loader's own returned map, and
+/// every history inside it, is dropped at the end of each loop iteration.
+/// Peak memory is therefore bounded by one chunk's histories at a time,
+/// not by the whole batch.
+const UNFINISHED_HANDLER_CHECK_CHUNK: usize = 100;
+
+/// Batched form of [`check_and_report_unfinished_handlers`] for many
+/// executions closed in the same operation.
+///
+/// Covers a parent-close cascade, a superseded-run cancellation, or any
+/// other post-commit cleanup that collects more than one `(exec_id,
+/// workflow_name)` pair before reporting.
+///
+/// Every call site this replaces looped over its own collected pairs. Each
+/// issued one `check_and_report_unfinished_handlers` call, one
+/// `harvest_events` query per pair, and discarded each call's error
+/// independently (`let _ = ...`). This does the same job with one
+/// `harvest_events` query per [`UNFINISHED_HANDLER_CHECK_CHUNK`]-sized
+/// chunk of `checks` ([`store::load_histories_undecoded_batch`]). It
+/// reports each chunk from its own in-memory result before moving on.
+///
+/// # Error-isolation trade-off
+///
+/// The old per-pair loop kept one pair's failure from affecting any other:
+/// each ran its own independent query. Chunked, a single query failure is
+/// reported for its own chunk and every later chunk too. The error
+/// propagates out of this function entirely, so no later chunk is ever
+/// attempted. That failure is a connection error, or one row's
+/// `event_data` failing to deserialize. Every caller already discards this
+/// error (`let _ = ...`) exactly as it did before chunking.
+///
+/// A connection failure would already have failed every pair's own query
+/// too, in the old loop. Only an undecodable `event_data` value is a real
+/// behavior change. Previously it dropped just that one pair's report; now
+/// it drops its whole chunk's and every later chunk's. This function
+/// reports on already-committed workflow history, which never disagreed
+/// with this shape before commit. The fixture and integration suite that
+/// exercise this path would already fail if it ever did.
+pub async fn check_and_report_unfinished_handlers_batch(
+    conn: &mut AsyncPgConnection,
+    checks: &[(ExecutionId, String)],
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+) -> HarvestResult<()> {
+    for chunk in checks.chunks(UNFINISHED_HANDLER_CHECK_CHUNK) {
+        let exec_ids: Vec<ExecutionId> = chunk.iter().map(|(id, _)| *id).collect();
+        let mut histories = store::load_histories_undecoded_batch(conn, &exec_ids).await?;
+
+        for (exec_id, workflow_name) in chunk {
+            // `remove`, not `get` + `.clone()` -- review finding on PR #1739
+            // (Codex, P2). Each `exec_id` is looked up at most once per
+            // chunk. Taking ownership here avoids a full deep copy of the
+            // decoded event vector, and its JSON payloads, per execution.
+            // `HistoryMatcher::new` only needs that vector by value.
+            let Some(history) = histories.remove(exec_id) else {
+                continue;
+            };
+            let matcher = crate::replay::HistoryMatcher::new(history.events);
+            let count = matcher.unfinished_update_handler_count_at_end();
+            if count > 0 {
+                tracing::warn!(
+                    workflow_name = workflow_name.as_str(),
+                    execution_id = %exec_id,
+                    unfinished_update_handler_count = count,
+                    "Workflow completed with unfinished update handlers"
+                );
+                if let Some(recorder) = metrics {
+                    recorder.record_workflow_unfinished_handlers(
+                        workflow_name,
+                        "update",
+                        count as u64,
+                    );
+                }
+            }
+        }
+        // `histories`, and every decoded `EventHistory` inside it, drops
+        // here -- before the next chunk's query loads the next batch.
     }
     Ok(())
 }
@@ -9907,5 +10138,87 @@ mod retry_chain_routing_tests {
                 "the bound must sit far above any realistic max_attempts"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod replaced_run_outcome_tests {
+    use super::replaced_run_outcome;
+    use crate::event::WorkflowEvent;
+
+    fn continued_as_new() -> WorkflowEvent {
+        serde_json::from_value(serde_json::json!({
+            "type": "WorkflowContinuedAsNew",
+            "data": {
+                "new_exec_id": "00000000-0000-0000-0000-000000000001",
+                "input": null
+            }
+        }))
+        .expect("a WorkflowContinuedAsNew event")
+    }
+
+    fn completed() -> WorkflowEvent {
+        WorkflowEvent::WorkflowCompleted {
+            output: serde_json::json!(7),
+        }
+    }
+
+    #[test]
+    fn a_real_continue_as_new_has_no_replaced_outcome() {
+        assert_eq!(
+            replaced_run_outcome(&[completed(), continued_as_new()]),
+            None
+        );
+    }
+
+    #[test]
+    fn a_replaced_run_reports_its_last_lifecycle_event() {
+        assert_eq!(replaced_run_outcome(&[completed()]), Some("COMPLETED"));
+        assert_eq!(
+            replaced_run_outcome(&[WorkflowEvent::workflow_failed("boom")]),
+            Some("FAILED")
+        );
+        assert_eq!(
+            replaced_run_outcome(&[WorkflowEvent::WorkflowCancelled {
+                reason: "stop".into()
+            }]),
+            Some("CANCELLED")
+        );
+    }
+
+    #[test]
+    fn a_workflow_task_timeout_reads_back_as_timed_out() {
+        let timed_out = WorkflowEvent::WorkflowFailed {
+            error: "timeout: StartToClose for wf".into(),
+            error_type: Some(crate::failure::ERROR_TYPE_WORKFLOW_TASK_TIMED_OUT.into()),
+            details: None,
+            non_retryable: None,
+        };
+        assert_eq!(replaced_run_outcome(&[timed_out]), Some("TIMED_OUT"));
+    }
+
+    #[test]
+    fn a_workflow_that_fails_with_timeout_text_still_reads_as_failed() {
+        // An activity timeout that the workflow returns writes the same text.
+        assert_eq!(
+            replaced_run_outcome(&[WorkflowEvent::workflow_failed(
+                "timeout: StartToClose for send_email"
+            )]),
+            Some("FAILED")
+        );
+    }
+
+    #[test]
+    fn the_last_lifecycle_event_wins() {
+        // A redriven run failed once, then completed.
+        assert_eq!(
+            replaced_run_outcome(&[WorkflowEvent::workflow_failed("boom"), completed()]),
+            Some("COMPLETED")
+        );
+    }
+
+    #[test]
+    fn a_history_without_an_outcome_names_none() {
+        assert_eq!(replaced_run_outcome(&[]), None);
     }
 }

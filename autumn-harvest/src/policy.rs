@@ -387,7 +387,10 @@ pub enum TaskStatus {
 
 /// When a DAG task with multiple upstreams should execute.
 ///
-/// All rules vacuously fire when `upstream_statuses` is empty (no dependencies).
+/// With no upstreams (a root node), `AllSuccess` and `AllDone` fire.
+/// `OneSuccess`, `OneFailed`, `AllFailed` and `Manual` do not fire, so a root
+/// node with one of those rules is always skipped. The skip writes no
+/// history marker.
 ///
 /// ## Examples
 ///
@@ -410,7 +413,8 @@ pub enum TriggerRule {
     OneFailed,
     /// Run when all upstream tasks failed.
     AllFailed,
-    /// Never auto-trigger; must be triggered manually.
+    /// Never fires. No API triggers a single DAG node, so a `Manual` node is
+    /// always skipped, and so is every node that needs it to succeed.
     Manual,
 }
 
@@ -1875,10 +1879,15 @@ mod tests {
     }
 
     #[test]
-    fn trigger_rule_vacuous_empty_slice() {
-        // All rules fire vacuously when there are no upstreams
+    fn trigger_rule_empty_slice_matches_the_documented_root_behavior() {
+        // A root node has no upstreams. Only these two rules fire for it.
         assert!(TriggerRule::AllSuccess.should_run(&[]));
         assert!(TriggerRule::AllDone.should_run(&[]));
+        // The other four rules skip a root node.
+        assert!(!TriggerRule::OneSuccess.should_run(&[]));
+        assert!(!TriggerRule::OneFailed.should_run(&[]));
+        assert!(!TriggerRule::AllFailed.should_run(&[]));
+        assert!(!TriggerRule::Manual.should_run(&[]));
     }
 
     // ── Bounded schedules (issue #543 / #478) ───────────────────────────────────

@@ -1058,6 +1058,9 @@ The embedded Vantage UI (`harvest_ui_router`, typically mounted at `/api/harvest
 - The `db` feature is enabled by default and pulls Diesel + diesel-async; build
   with `--no-default-features` for pure compile-checks on systems without
   libpq.
+- The `tls` feature is enabled by default. It lets LISTEN/NOTIFY connections
+  use `sslmode=require`, and it compiles `ring`. A build with
+  `default-features = false` must list `tls` to keep it.
 
 ## Status
 
