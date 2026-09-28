@@ -26192,8 +26192,8 @@ fn dispatch_batch_timeout(
 /// Sequential round trips per queue that a dispatch read can make outside
 /// its blocking wait. `read_across_queues` makes one non-blocking pass over
 /// every queue first. A deadline that passes mid-lap also finishes that lap
-/// with non-blocking reads, so each remaining queue can cost one more round
-/// trip after the wait ends (#1756).
+/// with non-blocking reads. Each remaining queue can then cost one more
+/// round trip after the wait ends (#1756).
 const DISPATCH_READ_ROUND_TRIPS_PER_QUEUE: usize = 2;
 
 /// The outer deadline for a dispatch-channel read. It is the blocking wait
