@@ -11,7 +11,7 @@ worker" and to restore, restart, or reactivate it. The reason code is
 unchanged. The `harvest_shard_undrained` runbook lists both branches.
 
 The two messages use different cues on purpose: `polls queue(s)` and
-`are stale, unhealthy, or draining`. The runbook branches on those cues.
+`are stale, unhealthy, draining, or stopped`. The runbook branches on those cues.
 
 No migration, no route change, and no `harvest_events` change.
 

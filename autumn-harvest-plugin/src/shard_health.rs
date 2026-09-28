@@ -392,22 +392,28 @@ fn check_no_live_worker_gate(
         ws.iter()
             .any(|w| worker_assigned_to_shard(w, shard_id) && worker_polls_queue(w, q))
     });
+    let pending_in = |queues: &[&str]| -> i64 {
+        queues
+            .iter()
+            .filter_map(|q| queue_depth.by_queue.get(*q))
+            .sum()
+    };
     if !uncovered.is_empty() {
         push_reason_code(reason_codes, REASON_NO_LIVE_WORKER);
         if !unpolled.is_empty() {
             blocking_reasons.push(format!(
                 "{} claimable task(s) queued but no worker assigned to this shard polls \
                  queue(s) [{}]; start a worker or widen shard and queue coverage",
-                queue_depth.total_pending,
+                pending_in(&unpolled),
                 unpolled.join(", ")
             ));
         }
         if !unhealthy.is_empty() {
             blocking_reasons.push(format!(
                 "{} claimable task(s) queued, but the workers assigned to this shard for \
-                 queue(s) [{}] are stale, unhealthy, or draining; restore, restart, or \
+                 queue(s) [{}] are stale, unhealthy, draining, or stopped; restore, restart, or \
                  reactivate them",
-                queue_depth.total_pending,
+                pending_in(&unhealthy),
                 unhealthy.join(", ")
             ));
         }
@@ -1491,7 +1497,7 @@ mod tests {
         stale.health = WorkerHealth::Stale;
         let reason = gate_reason_for(vec![stale]);
         assert!(
-            reason.contains("are stale, unhealthy, or draining"),
+            reason.contains("are stale, unhealthy, draining, or stopped"),
             "{reason}"
         );
         assert!(
@@ -1533,7 +1539,7 @@ mod tests {
             &mut blocking_reasons,
         );
         assert_eq!(blocking_reasons.len(), 1, "{blocking_reasons:?}");
-        assert!(blocking_reasons[0].starts_with("5 claimable"));
+        assert!(blocking_reasons[0].starts_with("6 claimable"));
         assert!(blocking_reasons[0].contains("[billing, default]"));
     }
 
@@ -1624,9 +1630,50 @@ mod tests {
                 .any(|r| r.contains("polls queue(s) [email]"))
         );
         assert!(
+            blocking_reasons.iter().any(
+                |r| r.contains("queue(s) [default] are stale, unhealthy, draining, or stopped")
+            )
+        );
+    }
+
+    #[test]
+    fn no_live_worker_reason_names_liveness_for_stopped_assigned_poller() {
+        let mut stopped = worker_row_with_shard_assignments(&[0], &["default"]);
+        stopped.worker.status = WorkerStatus::Stopped.as_str().to_string();
+        let reason = gate_reason_for(vec![stopped]);
+        assert!(reason.contains("draining, or stopped"), "{reason}");
+    }
+
+    #[test]
+    fn no_live_worker_reason_counts_only_the_tasks_in_each_group() {
+        let mut stale = worker_row_with_shard_assignments(&[0], &["default"]);
+        stale.health = WorkerHealth::Stale;
+        let covered = worker_row_with_shard_assignments(&[0], &["covered"]);
+        let mut queue_depth = pending_queue_depth(10);
+        queue_depth.by_queue.insert("default".to_string(), 3);
+        queue_depth.by_queue.insert("email".to_string(), 2);
+        queue_depth.by_queue.insert("covered".to_string(), 5);
+        let mut reason_codes = Vec::new();
+        let mut blocking_reasons = Vec::new();
+        check_no_live_worker_gate(
+            0,
+            &[ShardRole::Writable],
+            false,
+            &queue_depth,
+            &Ok(vec![stale, covered]),
+            &empty_compat(),
+            &mut reason_codes,
+            &mut blocking_reasons,
+        );
+        assert!(
             blocking_reasons
                 .iter()
-                .any(|r| r.contains("queue(s) [default] are stale, unhealthy, or draining"))
+                .any(|r| r.starts_with("2 claimable") && r.contains("[email]"))
+        );
+        assert!(
+            blocking_reasons
+                .iter()
+                .any(|r| r.starts_with("3 claimable") && r.contains("[default]"))
         );
     }
 
@@ -1636,7 +1683,7 @@ mod tests {
         draining.worker.status = WorkerStatus::Draining.as_str().to_string();
         let reason = gate_reason_for(vec![draining]);
         assert!(
-            reason.contains("are stale, unhealthy, or draining"),
+            reason.contains("are stale, unhealthy, draining, or stopped"),
             "{reason}"
         );
         assert!(
