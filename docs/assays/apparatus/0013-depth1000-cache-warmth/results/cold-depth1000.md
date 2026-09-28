@@ -10,21 +10,21 @@ Embedded durability is fixed at `journal_mode = WAL`, `synchronous = FULL`, whic
 
 ## arm `postgres`
 
-rep 0: 20.42 workflows/sec (1000 completed in 48.97 s, 3000 activity runs, correctness PASS)
-rep 1: 13.09 workflows/sec (1000 completed in 76.37 s, 3000 activity runs, correctness PASS)
-rep 2: 21.08 workflows/sec (1000 completed in 47.45 s, 3000 activity runs, correctness PASS)
-rep 3: 7.96 workflows/sec (1000 completed in 125.63 s, 3000 activity runs, correctness PASS)
-rep 4: 12.51 workflows/sec (1000 completed in 79.95 s, 3000 activity runs, correctness PASS)
-rep 5: 13.60 workflows/sec (1000 completed in 73.53 s, 3000 activity runs, correctness PASS)
+rep 0: 20.91 workflows/sec (1000 completed in 47.83 s, 3000 activity runs, correctness PASS)
+rep 1: 19.92 workflows/sec (1000 completed in 50.21 s, 3000 activity runs, correctness PASS)
+rep 2: 21.19 workflows/sec (1000 completed in 47.20 s, 3000 activity runs, correctness PASS)
+rep 3: 20.39 workflows/sec (1000 completed in 49.04 s, 3000 activity runs, correctness PASS)
+rep 4: 21.83 workflows/sec (1000 completed in 45.82 s, 3000 activity runs, correctness PASS)
+rep 5: 17.53 workflows/sec (1000 completed in 57.05 s, 3000 activity runs, correctness PASS)
 
-**mean 14.78 workflows/sec** over 6 valid rep(s); per-dispatch rate 103.44/sec.
+**mean 20.29 workflows/sec** over 6 valid rep(s); per-dispatch rate 142.05/sec.
 
 ## summary
 
 | arm | mean workflows/sec | valid reps | correctness |
 |:--|--:|--:|:--|
-| `postgres` | 14.78 | 6 | PASS |
+| `postgres` | 20.29 | 6 | PASS |
 
 ## pre-registered line (assay #13)
 
-* **COLD** condition, n=6: mean 14.78, sample stdev 5.05, **CV = 34.2%** (pre-registered line: expect >= 15%, replicating ledger #12)
+* **COLD** condition, n=6: mean 20.29, sample stdev 1.50, **CV = 7.4%** (pre-registered line: expect >= 15%, replicating ledger #12)

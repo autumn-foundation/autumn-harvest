@@ -419,10 +419,20 @@ async fn reset_database(settings: &Settings) {
 /// residency this condition exists to preserve. A `TRUNCATE`-based warm run
 /// would still fault in a brand-new, empty file every repetition. That is
 /// no better, for the mechanism this assay tests, than `reset_database`'s
-/// drop/recreate. Found by Codex review on PR #1761. `VACUUM` afterward
-/// reclaims the deleted rows' space in place, on that same relfilenode. The
-/// next repetition's reseed then reuses already-resident pages, instead of
-/// extending the file.
+/// drop/recreate. Found by Codex review on PR #1761. `VACUUM (TRUNCATE
+/// FALSE)` afterward reclaims the deleted rows' space in place, on that
+/// same relfilenode, without shrinking the file. The next repetition's
+/// reseed then reuses already-resident pages, instead of extending the
+/// file.
+///
+/// Plain `VACUUM` (no `TRUNCATE FALSE`) is not a safe substitute here. A
+/// full-table `DELETE` leaves every page empty. Postgres's default
+/// vacuum-truncate behavior then shrinks the file to zero pages. That is
+/// the same "brand-new, empty file" outcome the paragraph above rules out
+/// `TRUNCATE` for, just reached by a different route. Confirmed directly
+/// against this apparatus's own database: a table at 159 pages went to 0
+/// pages after `DELETE` + plain `VACUUM`. Found by a second round of Codex
+/// review on PR #1761.
 async fn truncate_database(settings: &Settings) {
     let mut conn = connect(&settings.database_url).await;
     conn.batch_execute(
@@ -441,7 +451,7 @@ async fn truncate_database(settings: &Settings) {
     // implicit transaction block unless it contains explicit BEGIN/COMMIT.
     // `VACUUM` cannot run inside a transaction block. Combined with the
     // `DELETE` above in one call, every repetition after the first panicked.
-    conn.batch_execute("VACUUM;")
+    conn.batch_execute("VACUUM (TRUNCATE FALSE);")
         .await
         .expect("the assay database should vacuum");
 }
@@ -847,6 +857,20 @@ async fn run_postgres_arm(settings: &Settings, arm: Arm, rep: usize) -> RepOutco
     )
     .await;
     assert_eq!(seeded, settings.workflows, "every start should be accepted");
+
+    // `ANALYZE` after seeding, in both conditions, before timing starts. A
+    // cold repetition's table is freshly created (`pg_class` shows no
+    // stats at all). A warm repetition's table was just `VACUUM`ed. That
+    // recorded zero live rows, a moment before this seed inserted a
+    // thousand. Without this step, the two conditions hand the claim
+    // query's planner different statistics for the same logical backlog.
+    // That confound is not what this assay's own grading is about. Found
+    // by a second round of Codex review on PR #1761.
+    connect(&settings.database_url)
+        .await
+        .batch_execute("ANALYZE;")
+        .await
+        .expect("the assay database should analyze after seeding");
 
     let pool = build_pool(&settings.database_url, POOL_SIZE);
     let mut conn = connect(&settings.database_url).await;
