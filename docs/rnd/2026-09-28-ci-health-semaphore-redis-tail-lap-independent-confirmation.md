@@ -89,27 +89,42 @@ skip via its `testcontainers` fallback. It also honors
 `HARVEST_REDIS_TEST_URL` directly (`tests/dispatch_redis.rs`'s
 `try_start`), and this image ships a real `redis-server` binary. Started one
 locally (`redis-server --daemonize yes --port 6399 --save "" --appendonly
-no`), pointed the harness at it, and ran the target test in isolation
-20 times per condition, `--test-threads=1`, flushing Redis between runs.
+no`), pointed the harness at it, and ran the target test in isolation,
+`--test-threads=1`, flushing Redis between runs.
 
-**Before** (`HEAD` = `trunk-dev` tip `7906f22`, PR #1756's fix absent):
-**17/20 passed, 3/20 failed (15%)**, all three with the exact CI signature
-— `left: 0, right: 1` at `dispatch_redis.rs:1256`.
+**Before** (`HEAD` = `trunk-dev` tip `7906f22`/`ad9deec`, PR #1756's fix
+absent): **34/40 passed, 6/40 failed (15%)**, all six with the exact CI
+signature — `left: 0, right: 1` at `dispatch_redis.rs:1256`.
 
 **After** (PR #1756's core mechanism commit, `e24a735`, applied to the same
-tree via `git apply`, nothing else changed): **20/20 passed**.
+tree via `git apply`, nothing else changed): **50/50 passed**.
 
-Revert check: satisfied by construction — the "before" run above *is* the
-pre-fix tree, sampled after the "after" run confirmed the fix's presence
-mattered, not merely that the suite happened to be green that day. Working
-tree restored to `HEAD` (`git checkout -- dispatch.rs`) after measurement;
-no commit made to this session's own branch from the patched state.
+The first pass through this measurement used 20 trials per condition
+(3/20 before, 0/20 after) and a Codex review round on this PR correctly
+flagged that 20-vs-20 does not establish the fix mattered: a one-sided
+Fisher exact test on 3/20 vs 0/20 gives p ≈ 0.115, not significant at any
+conventional threshold, because a 15%-true-rate process can land on 0/20
+by chance often enough (0.85²⁰ ≈ 3.9%) that two independent small samples
+can't distinguish "the rate changed" from "this batch got lucky." Widened
+to 40 before / 50 after in response (same harness, same protocol, fresh
+runs, not a continuation of the original 20/20): the failure rate held at
+15% under the larger before-sample, and 50/50 passed after. A one-sided
+Fisher exact test on 6/40 vs 0/50 gives **p ≈ 0.0062** — the fix's presence
+changing the outcome is now supported at a conventional significance
+threshold, not merely consistent with it.
+
+Revert check: satisfied by construction — the "before" runs above *are*
+the pre-fix tree, sampled both before and after the "after" runs, at two
+different sample sizes, with a consistent ~15% rate throughout. Working
+tree restored to `HEAD` (`git checkout -- dispatch.rs`) after each
+measurement pass; no commit made to this session's own branch from the
+patched state.
 
 **Correction to PR #1756's own evidence section:** its description states
 "The failure needs a slow round trip, so it does not reproduce on an idle
 local Redis." That does not hold in this sandbox — a bare local
 `redis-server`, not under any deliberate load, reproduced the failure at
-15% (3/20). The mechanism still fits, but not for the reason a first guess
+15% (6/40). The mechanism still fits, but not for the reason a first guess
 suggests: the 20 queue visits inside `read_across_queues` are not
 concurrent with each other — the loop `.await`s each `read_with_heal` call
 before advancing the rotation — and `--test-threads=1` keeps no other test
@@ -132,22 +147,35 @@ export HARVEST_REDIS_TEST_URL=redis://127.0.0.1:6399
 # Before (trunk-dev tip, PR #1756 absent):
 git checkout 7906f22ea00cf0a5fd8f40340362473e6130a479
 cargo build -p autumn-harvest-redis --test dispatch_redis
-for i in $(seq 1 20); do
+for i in $(seq 1 40); do
   redis-cli -p 6399 flushall >/dev/null
   cargo test -p autumn-harvest-redis --test dispatch_redis \
     a_queue_near_the_tail_of_a_long_rotation_still_gets_a_blocking_look \
     -- --exact --test-threads=1
-done   # -> 3/20 fail, "left: 0, right: 1" at dispatch_redis.rs:1256
+done   # -> 6/40 fail (15%), "left: 0, right: 1" at dispatch_redis.rs:1256
 
 # After (PR #1756's core mechanism commit applied):
 git fetch origin claude/beautiful-noether-r28wu2
 git show e24a735 -- autumn-harvest-redis/src/dispatch.rs | git apply -
 cargo build -p autumn-harvest-redis --test dispatch_redis
-for i in $(seq 1 20); do
+for i in $(seq 1 50); do
   redis-cli -p 6399 flushall >/dev/null
   cargo test -p autumn-harvest-redis --test dispatch_redis \
     a_queue_near_the_tail_of_a_long_rotation_still_gets_a_blocking_look \
     -- --exact --test-threads=1
-done   # -> 20/20 pass
+done   # -> 50/50 pass
 git checkout -- autumn-harvest-redis/src/dispatch.rs
+```
+
+```python
+# One-sided Fisher exact test, 6/40 (before) vs 0/50 (after):
+import math
+def fisher_exact_greater(a, b, c, d):
+    n, row1, row2, col1 = a+b+c+d, a+b, c+d, a+c
+    def hyper(x):
+        if x < 0 or x > row1 or (col1-x) < 0 or (col1-x) > row2:
+            return 0.0
+        return math.comb(row1, x) * math.comb(row2, col1-x) / math.comb(n, col1)
+    return sum(hyper(x) for x in range(a, min(row1, col1)+1))
+fisher_exact_greater(6, 34, 0, 50)  # -> 0.0062
 ```
