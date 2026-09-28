@@ -826,8 +826,16 @@ impl RedisDispatch {
             // through the rest of the wait budget on the same failure.
             let mut consecutive_errors = 0usize;
             while !any_ready && remaining > 0 {
-                let Some(budget) = deadline.checked_duration_since(Instant::now()) else {
-                    break;
+                // No slice includes the round-trip time. On a slow link, those
+                // round trips can use up the budget before the lap reaches
+                // the tail. A deadline that passes mid-lap therefore finishes
+                // the lap with non-blocking reads. So every queue gets one
+                // look after the initial pass. The wait grows by at most one
+                // round trip per queue left in the lap.
+                let budget = match deadline.checked_duration_since(Instant::now()) {
+                    Some(budget) => budget,
+                    None if !rotation.is_multiple_of(ordered.len()) => Duration::ZERO,
+                    None => break,
                 };
                 // A lone queue leaves `wait` undivided: there is no sibling
                 // to starve, so this stays the original single-call block
