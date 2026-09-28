@@ -478,38 +478,38 @@ mod tests {
     async fn business_data_shaped_like_offload_envelope_is_corrupted_on_inflate() {
         let store = MemStore::new(); // store_id() == "mem"
         let off = offloader(store.clone(), 1_000_000); // threshold never hit
+        // Uses the offloader's own configured store id and a
+        // syntactically valid-length checksum. A shallow hardening
+        // (reject a foreign store id, validate checksum syntax) cannot
+        // make this test pass without closing the real, production-shaped
+        // collision. `key` points at a blob that does not exist in
+        // `store`.
         let original = serde_json::json!({
             OFFLOAD_ENVELOPE_KEY: 1,
-            "store_id": "s3-prod",
+            "store_id": store.store_id(),
             "key": "customer-42/invoice.pdf",
             "len": 1234,
-            "checksum": "abc123",
+            "checksum": "a".repeat(64),
         });
         let mut event = event_with_output(original.clone());
 
-        let refs = off.offload_event_value(&mut event).await.unwrap();
-        assert!(
-            refs.is_empty(),
-            "payload is tiny: nothing should be offloaded"
-        );
-        assert_eq!(
-            event["data"]["output"], original,
-            "written event still holds the caller's exact business value"
-        );
-        assert_eq!(store.puts.load(Ordering::SeqCst), 0);
+        // The write path may legitimately change the stored representation
+        // to escape the collision, the way issue #1253's fix nested the
+        // codec envelope. Only the round-trip result is the actual
+        // contract, so the assertions below never pin the intermediate
+        // wire shape.
+        off.offload_event_value(&mut event).await.unwrap();
 
-        // The very next read/replay of this event inflates it. Instead of
-        // returning the byte-identical value that was stored, it is
-        // misclassified as a dangling offload reference and errors out.
         let result = off.inflate_event_value(&mut event).await;
-        assert_eq!(
-            event["data"]["output"], original,
-            "byte fidelity broken: inflate must not touch a field it cannot really own"
-        );
         assert!(
             result.is_ok(),
             "replay/read of a workflow whose own business data merely LOOKS like an \
              offload envelope must not fail: got {result:?}"
+        );
+        assert_eq!(
+            event["data"]["output"], original,
+            "byte fidelity broken: a value that merely looks like an offload \
+             envelope must round-trip through write-then-read unchanged"
         );
     }
 
