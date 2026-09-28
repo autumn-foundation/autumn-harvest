@@ -10,5 +10,11 @@ the queue but is not healthy and active, the reason says "no healthy active
 worker" and to restore, restart, or reactivate it. The reason code is
 unchanged. The `harvest_shard_undrained` runbook lists both branches.
 
-Tests: four unit tests in `shard_health.rs` and the runbook guard in
+The two messages use different cues on purpose: `polls queue(s)` and
+`are stale, unhealthy, or draining`. The runbook branches on those cues.
+
+No migration, no route change, and no `harvest_events` change.
+
+Tests: unit tests in `shard_health.rs` cover both cases, a mixed queue set,
+legacy empty assignments, and constraint-demand dedup. The runbook guard is in
 `alert_pack_docs.rs`.
