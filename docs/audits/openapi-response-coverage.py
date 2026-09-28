@@ -1627,6 +1627,29 @@ class Carriers(dict):
 
     partial: frozenset[str] = frozenset()
     possible: frozenset[str] = frozenset()
+    # Each name a destructuring pattern binds anew to a carrier, with where.
+    rebound: dict[str, int] = {}
+
+
+def carrier_live(block: str, carriers: dict[str, int], name: str, position: int) -> bool:
+    """Whether the carrier `name` holds the body at `position`.
+
+    The first binding decides, as `live_binding` reads it. A destructuring
+    pattern that binds the same name anew to a carrier, as `moved_names`
+    records it, holds the body from its own binding on.
+    """
+    if live_binding(block, name, position, carriers[name]):
+        return True
+    rebind = getattr(carriers, "rebound", {}).get(name)
+    return rebind is not None and position >= rebind and live_binding(block, name, position, rebind)
+
+
+def carrier_partial(carriers: dict[str, int], name: str, position: int) -> bool:
+    """Whether the carrier `name` holds only part of the body at `position`."""
+    if name in partial_names(carriers):
+        return True
+    rebind = getattr(carriers, "rebound", {}).get(name)
+    return rebind is not None and position >= rebind
 
 
 def possible_names(carriers: dict[str, int]) -> frozenset[str]:
@@ -1653,11 +1676,13 @@ def moved_names(block: str, names: set[str] | dict[str, int]) -> Carriers:
     as `from_utf8(&body)`, is the call's own handoff, so it binds no carrier.
     """
     found = Carriers(names if isinstance(names, dict) else {name: -1 for name in names})
+    found.rebound = {}
     partial: set[str] = set()
     lets = [
         (let.group(1), let.start(), let.end(), block[let.end() : statement_end(block, let.end())])
         for let in re.finditer(r"\blet\s+(?:mut\s+)?([a-z_][a-z_0-9]*)\s*(?::[^=;]*)?=(?!=)", block)
     ]
+    patterns = destructuring_lets(block)
     while True:
         moved: dict[str, tuple[int, bool]] = {}
         for bound, start, opener, value in lets:
@@ -1668,6 +1693,26 @@ def moved_names(block: str, names: set[str] | dict[str, int]) -> Carriers:
                 if way and live_binding(block, name, start, bound_at):
                     moved[bound] = (start, way == "wrapped" or name in partial)
                     break
+        # A carrier that flows into a destructuring pattern makes each name
+        # the pattern binds a partial carrier, so a parse of it fails closed.
+        for binds, start, opener, value in patterns:
+            if all(bound in found or bound in moved for bound, _ in binds):
+                if all(found.rebound.get(bound) == at for bound, at in binds if bound in found):
+                    continue
+            flows = any(
+                live_passes(block, value, opener, name, bound_at)
+                and carrier_live(block, found, name, start)
+                for name, bound_at in list(found.items())
+            )
+            if not flows:
+                continue
+            for bound, at in binds:
+                if bound in found:
+                    if found.rebound.get(bound) != at:
+                        found.rebound[bound] = at
+                        moved.setdefault(bound, (found[bound], bound in partial))
+                elif bound not in moved:
+                    moved[bound] = (at, True)
         if not moved:
             found.partial = frozenset(partial)
             return found
@@ -1691,6 +1736,61 @@ def live_passes(block: str, value: str, opener: int, name: str, bound_at: int) -
         if not live_binding(block, name, opener + use.start(), bound_at):
             value = value[: use.start()] + " " * len(name) + value[use.end() :]
     return argument_passes(value, name)
+
+
+@functools.lru_cache(maxsize=None)
+def destructuring_lets(block: str) -> list[tuple[list[tuple[str, int]], int, int, str]]:
+    """`(bound names, start, value start, value)` for each `let` whose pattern is not one name.
+
+    It reads a plain `let`, an `if let` and a `while let` with a tuple,
+    struct, slice, reference or variant pattern. Each bound name comes with
+    where the pattern binds it. A name followed by `(`, `{`, `::` or a
+    single `:` is a path or a field, not a binding.
+    """
+    found = []
+    for let in re.finditer(r"\blet\s+", block):
+        rest = block[let.end() :]
+        if re.match(r"(?:mut\s+)?[a-z_][a-z_0-9]*\s*(?::(?!:)|=(?![=>]))", rest):
+            continue
+        depth, equals, colon = 0, None, None
+        for index, char in enumerate(rest):
+            if char in "([{":
+                depth += 1
+            elif char in ")]}":
+                depth -= 1
+                if depth < 0:
+                    break
+            elif depth == 0 and char == ";":
+                break
+            elif depth == 0 and char == ":" and rest[index - 1 : index + 2].count(":") == 1:
+                colon = index if colon is None else colon
+            elif depth == 0 and char == "=" and rest[index + 1 : index + 2] not in ("=", ">"):
+                if rest[index - 1 : index] not in ("=", "!", "<", ">"):
+                    equals = index
+                    break
+        if equals is None:
+            continue
+        pattern = rest[: colon if colon is not None else equals]
+        opener = let.end() + equals + 1
+        head = block[max(0, let.start() - 12) : let.start()]
+        if re.search(r"\b(?:if|while)\s*$", head):
+            value_end = opener
+            depth = 0
+            while value_end < len(block) and not (depth == 0 and block[value_end] == "{"):
+                depth += block[value_end] in "(["
+                depth -= block[value_end] in ")]"
+                value_end += 1
+        else:
+            value_end = statement_end(block, opener)
+        binds = [
+            (name.group(0), let.end() + name.start())
+            for name in re.finditer(r"(?<![\w:.])[a-z_][a-z_0-9]*\b", pattern)
+            if name.group(0) not in ("ref", "mut", "box", "_")
+            and not re.match(r"\s*(?:\(|\{|::|:(?!:))", pattern[name.end() :])
+        ]
+        if binds:
+            found.append((binds, let.start(), opener, block[opener:value_end]))
+    return found
 
 
 def statement_end(text: str, start: int) -> int:
@@ -1776,7 +1876,7 @@ def split_top_level(text: str) -> list[str]:
 
 
 # A word before `(` that is a keyword, not a call.
-NOT_CALLS = frozenset({"if", "match", "while", "for", "return", "in", "loop", "move", "fn"})
+NOT_CALLS = frozenset({"if", "match", "while", "for", "return", "in", "loop", "move", "fn", "let"})
 
 # An optional turbofish between a helper name and its `(`, as in `decode::<T>(`.
 TURBOFISH = r"(?:\s*::\s*<[^()]*?>)?"
@@ -1949,13 +2049,15 @@ def handoffs(
         receiver = r"(?<![.\w])%s\s*\.\s*([a-z_][a-z_0-9]*)%s\s*\(" % (re.escape(variable), TURBOFISH)
         for call in re.finditer(receiver, block):
             method = call.group(1)
-            if method in BYTE_ACCESSORS or not live_binding(block, variable, call.start(), bound_at):
+            if method in BYTE_ACCESSORS:
+                continue
+            if not carrier_live(block, carriers, variable, call.start()):
                 continue
             if in_dead_closure(block, call.start()):
                 continue
             # A partial carrier reaches no method the audit can follow. A whole
             # one reaches only a method of an `impl` for its own type.
-            partial = variable in partial_names(carriers)
+            partial = carrier_partial(carriers, variable, call.start())
             starts = (
                 None if partial else method_targets(block, params, variable, method, call.start())
             )
@@ -2119,12 +2221,12 @@ def receiving_parameters(
         arguments = split_top_level(raw[1:-1].replace("->", ""))
         tolerant = discards_error(block[: call.start()], block[call.end() - 1 + len(raw) :])
         for index, argument in enumerate(arguments):
-            live = [
-                v for v, bound in variables.items() if live_binding(block, v, call.start(), bound)
-            ]
+            live = [v for v in variables if carrier_live(block, variables, v, call.start())]
             ways = {v: argument_passes(argument, v) for v in live}
-            partial = partial_names(variables)
-            ways = {v: "wrapped" if way and v in partial else way for v, way in ways.items()}
+            ways = {
+                v: "wrapped" if way and carrier_partial(variables, v, call.start()) else way
+                for v, way in ways.items()
+            }
             passed = [v for v, way in ways.items() if way]
             name = names[index] if index < len(names) else None
             if not passed:
@@ -2222,7 +2324,9 @@ def block_parses(block: str, carriers: dict[str, int], returns: str) -> list[Par
         possible = root in possible_names(carriers) and root not in carriers
         if root is None or root not in carriers and not possible:
             continue
-        if not live_binding(block, root, hit.start(), carriers.get(root, -1)):
+        if root in carriers and not carrier_live(block, carriers, root, hit.start()):
+            continue
+        if root not in carriers and not live_binding(block, root, hit.start()):
             continue
         before = block[: hit.start()]
         after = block[opener + len(call) :]
@@ -2238,7 +2342,8 @@ def block_parses(block: str, carriers: dict[str, int], returns: str) -> list[Par
         optional = empty_allowed(block, hit.start(), root, tolerant)
         # A body read through an index, a method or a generic type is not
         # something the audit can type, so it is reported.
-        if not whole or possible or root in partial_names(carriers):
+        partial = root in carriers and carrier_partial(carriers, root, hit.start())
+        if not whole or possible or partial:
             kind = None
         elif turbofish is not None and not re.fullmatch(r"[A-Za-z0-9_:]+", turbofish):
             kind = None
@@ -3325,6 +3430,19 @@ def raw_reader(written: str, site: Site) -> bool:
     return path in RAW_READER_PATHS
 
 
+def query_params(route: dict) -> dict[str, dict]:
+    """The route's documented `in: query` parameters, by name.
+
+    Checks 4 and 6 read query keys only through this, so a path or header
+    parameter of the same name never documents a query key.
+    """
+    return {
+        entry.get("name"): entry
+        for entry in route.get("params") or []
+        if entry.get("in") == "query" and entry.get("name")
+    }
+
+
 def query_struct_findings(
     method: str, path: str, route: dict, queries: list[tuple[str, str, bool]]
 ) -> list[str]:
@@ -3337,11 +3455,7 @@ def query_struct_findings(
     that is not wrapped requires it. Its OpenAPI type must be the same in every
     struct, or the key is a finding.
     """
-    documented = {
-        entry.get("name"): entry
-        for entry in route.get("params") or []
-        if entry.get("in") == "query" and entry.get("name")
-    }
+    documented = query_params(route)
     where = "  %s %s: `%%s`" % (method, path)
     found: list[str] = []
     # (struct, field, declared type, mandatory) for each documented key.
@@ -3407,11 +3521,7 @@ def documented_query_findings(
     documented query key. A route whose query the audit cannot read whole
     skips it, as `audit` gates it.
     """
-    documented = {
-        entry.get("name")
-        for entry in route.get("params") or []
-        if entry.get("in") == "query" and entry.get("name")
-    }
+    documented = set(query_params(route))
     accepted = {
         spelling
         for _, struct, _ in queries
@@ -3960,7 +4070,7 @@ def audit(source: str, contract: dict, find_struct) -> dict[str, list[str]]:
         # query by hand, so its key arms are read. The same gate exempts the
         # route from the documented-key check below.
         if params is not None and getattr(params, "raw_reader", False):
-            documented = {entry["name"] for entry in route.get("params", [])}
+            documented = set(query_params(route))
             # A query key is a string literal, so these blocks keep literals.
             keyed = [handler_body(source, handler)]
             keyed += [parts[2] for parts in map(lambda at: parts_at(source, at), helpers) if parts]
@@ -4457,6 +4567,7 @@ pub fn harvest_api_router() -> Router {
         .route("/s/generic", get(s_generic))
         .route("/s/list", get(s_list))
         .route("/s/uri-list", get(s_uri_list))
+        .route("/s/uri-path-key/{id}", get(s_uri_path_key))
         .route("/s/request-list", get(s_request_list))
         .route("/s/parts-list", get(s_parts_list))
         .route("/s/scoped", post(s_scoped))
@@ -4506,6 +4617,16 @@ async fn s_uri_list(uri: Uri) -> Response {
         match key.as_str() {
             "limit" => {}
             "sort" => {}
+            _ => {}
+        }
+    }
+    StatusCode::OK.into_response()
+}
+
+async fn s_uri_path_key(Path(id): Path<String>, uri: Uri) -> Response {
+    for (key, value) in query_pairs(uri.query()) {
+        match key.as_str() {
+            "id" => {}
             _ => {}
         }
     }
@@ -5630,6 +5751,10 @@ pub fn harvest_api_router() -> Router {
         .route("/e/unrelated-receiver", post(e_unrelated_receiver))
         .route("/e/alias-body", post(e_alias_body))
         .route("/e/dead-closure", post(e_dead_closure))
+        .route("/e/tuple-carrier", post(e_tuple_carrier))
+        .route("/e/struct-carrier", post(e_struct_carrier))
+        .route("/e/rebound-carrier", post(e_rebound_carrier))
+        .route("/e/rebound-other", post(e_rebound_other))
         .route("/e/result-bytes", post(e_result_bytes))
         .route("/e/option-bytes-match", post(e_option_bytes_match))
         .route("/e/result-bytes-if-let", post(e_result_bytes_if_let))
@@ -7126,6 +7251,30 @@ async fn e_option_bytes_unwrapped(body: Option<Bytes>) -> Response {
     StatusCode::OK.into_response()
 }
 
+async fn e_tuple_carrier(body: Bytes) -> Response {
+    let (bytes,) = (body,);
+    let gadget = serde_json::from_slice::<Gadget>(&bytes).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_struct_carrier(body: Bytes) -> Response {
+    let Holder { raw } = Holder { raw: body };
+    let gadget = serde_json::from_slice::<Gadget>(&raw).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_rebound_carrier(body: Bytes) -> Response {
+    let (body, extra) = (body, 1);
+    let gadget = serde_json::from_slice::<Gadget>(&body).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_rebound_other(body: Bytes) -> Response {
+    let (body, extra) = (other_value(), 1);
+    let gadget = serde_json::from_slice::<Gadget>(&body).unwrap();
+    StatusCode::OK.into_response()
+}
+
 async fn e_dead_closure(body: Bytes) -> Response {
     let parse = || serde_json::from_slice::<Gadget>(&body).unwrap();
     StatusCode::OK.into_response()
@@ -7998,6 +8147,19 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
         FIXTURE_STATUS,
         [fixture_route("GET", "/s/list", 200, params=[{"name": "page_size", "in": "query"}])],
         {"query_keys": ["GET /s/list: `order` is accepted by the query parser"]},
+    ),
+    (
+        "a hand-parsed query key is documented only by an in: query parameter",
+        FIXTURE_STATUS,
+        [
+            fixture_route(
+                "GET",
+                "/s/uri-path-key/{id}",
+                200,
+                params=[{"name": "id", "in": "path", "type": "string", "required": True}],
+            )
+        ],
+        {"query_keys": ["GET /s/uri-path-key/{id}: `id` is accepted by the query parser"]},
     ),
     (
         "every trusted raw reader has its hand-parsed query keys read",
@@ -10262,6 +10424,33 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
                 "POST /e/result-bytes: `name` is mandatory in Gadget",
                 "POST /e/option-bytes-match: `name` is mandatory in Gadget",
                 "POST /e/option-bytes-unwrapped: `name` is mandatory in Gadget",
+            ],
+        },
+    ),
+    (
+        "a carrier that flows into a destructuring pattern fails closed",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST", path, 200, request_body=body_of(("name", False), required=False)
+            )
+            for path in (
+                "/e/tuple-carrier",
+                "/e/struct-carrier",
+                "/e/rebound-carrier",
+                "/e/rebound-other",
+            )
+        ],
+        {
+            "body_required": [
+                "POST /e/tuple-carrier: the body is mandatory",
+                "POST /e/struct-carrier: the body is mandatory",
+                "POST /e/rebound-carrier: the body is mandatory",
+            ],
+            "unresolved": [
+                "POST /e/tuple-carrier: cannot read a `from_slice` call",
+                "POST /e/struct-carrier: cannot read a `from_slice` call",
+                "POST /e/rebound-carrier: cannot read a `from_slice` call",
             ],
         },
     ),
