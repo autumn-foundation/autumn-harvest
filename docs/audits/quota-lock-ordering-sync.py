@@ -472,12 +472,28 @@ def extract_function(text: str, name: str) -> str | None:
     signature; a brace surviving in a return type or `where` clause after
     the parameter list closes remains unhandled, the same declared,
     bounded stopping point as the alias-tracking limit above.
+
+    Raises if a tracked name has more than one definition in `text` (e.g.
+    mutually exclusive `#[cfg(...)]` variants, valid Rust when their
+    configurations do not overlap). Codex review on PR #1696 found this
+    would otherwise silently compare only the first variant in each file:
+    if the compiled (active) variant is a later one and it has diverged,
+    the check would still report success. Refusing to guess which variant
+    is real is safer than picking one.
     """
     masked = mask_comments_and_strings(text)
     sig_re = re.compile(FN_SIGNATURE_RE_TEMPLATE.format(name=re.escape(name)))
     m = sig_re.search(masked)
     if not m:
         return None
+    if sig_re.search(masked, m.end()):
+        raise ValueError(
+            f"multiple definitions of `{name}` found — likely mutually exclusive "
+            "#[cfg(...)] variants, which this script cannot pick between; comparing "
+            "only the first one found could silently miss a divergence in whichever "
+            "variant actually compiles. Resolve the ambiguity (e.g. name the variants "
+            "differently) or extend this script to compare every corresponding variant."
+        )
     start = m.start() + 1  # skip the leading newline
     params_close = find_matching_paren(masked, m.end() - 1)
     open_brace = masked.index("{", params_close)
