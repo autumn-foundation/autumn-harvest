@@ -320,6 +320,15 @@ fn queue_depth_unreadable_degrades(roles: &[ShardRole], candidate: bool) -> bool
     roles.contains(&ShardRole::Writable) || candidate
 }
 
+/// Whether the worker lists `queue` among its polled queues.
+fn worker_polls_queue(worker: &WorkerRow, queue: &str) -> bool {
+    worker
+        .worker
+        .queues
+        .as_array()
+        .is_some_and(|qs| qs.iter().any(|v| v.as_str() == Some(queue)))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn check_no_live_worker_gate(
     shard_id: i32,
@@ -381,12 +390,30 @@ fn check_no_live_worker_gate(
     if !uncovered.is_empty() {
         uncovered.sort_unstable();
         push_reason_code(reason_codes, REASON_NO_LIVE_WORKER);
-        blocking_reasons.push(format!(
-            "{} claimable task(s) queued but no live worker assigned to this shard \
-             polls queue(s) [{}]",
-            queue_depth.total_pending,
-            uncovered.join(", ")
-        ));
+        // Issue #1463: an assigned worker that polls the queue but is stale or
+        // not active needs restoring, not new coverage. Report the two cases
+        // apart so the operator gets the right remediation.
+        let (unhealthy, unpolled): (Vec<&str>, Vec<&str>) = uncovered.iter().partition(|q| {
+            ws.iter()
+                .any(|w| worker_assigned_to_shard(w, shard_id) && worker_polls_queue(w, q))
+        });
+        if !unpolled.is_empty() {
+            blocking_reasons.push(format!(
+                "{} claimable task(s) queued but no worker assigned to this shard polls \
+                 queue(s) [{}]; start a worker or widen shard and queue coverage",
+                queue_depth.total_pending,
+                unpolled.join(", ")
+            ));
+        }
+        if !unhealthy.is_empty() {
+            blocking_reasons.push(format!(
+                "{} claimable task(s) queued but no healthy active worker assigned to this \
+                 shard polls queue(s) [{}]; restore, restart, or reactivate the stale, \
+                 unhealthy, or draining worker",
+                queue_depth.total_pending,
+                unhealthy.join(", ")
+            ));
+        }
     }
 
     // Constraint-aware coverage (issue #522 review): a worker that polls the
@@ -1432,6 +1459,65 @@ mod tests {
             "should emit no_live_worker when no worker covers the shard"
         );
         assert!(!blocking_reasons.is_empty());
+    }
+
+    /// Run the gate for shard 0 and return its single blocking reason.
+    fn gate_reason_for(workers: Vec<WorkerRow>) -> String {
+        let mut reason_codes = Vec::new();
+        let mut blocking_reasons = Vec::new();
+        check_no_live_worker_gate(
+            0,
+            &[ShardRole::Writable],
+            false,
+            &pending_queue_depth(5),
+            &Ok(workers),
+            &empty_compat(),
+            &mut reason_codes,
+            &mut blocking_reasons,
+        );
+        assert_eq!(reason_codes, vec![REASON_NO_LIVE_WORKER.to_string()]);
+        assert_eq!(blocking_reasons.len(), 1, "{blocking_reasons:?}");
+        blocking_reasons.remove(0)
+    }
+
+    #[test]
+    fn no_live_worker_reason_says_no_poller_when_no_assigned_worker_polls_queue() {
+        let other_queue = worker_row_with_shard_assignments(&[0], &["email"]);
+        let reason = gate_reason_for(vec![other_queue]);
+        assert!(reason.contains("no worker assigned to this shard polls queue(s) [default]"));
+        assert!(reason.contains("start a worker or widen"), "{reason}");
+    }
+
+    #[test]
+    fn no_live_worker_reason_names_liveness_for_stale_assigned_poller() {
+        let mut stale = worker_row_with_shard_assignments(&[0], &["default"]);
+        stale.health = WorkerHealth::Stale;
+        let reason = gate_reason_for(vec![stale]);
+        assert!(reason.contains("no healthy active worker"), "{reason}");
+        assert!(
+            reason.contains("restore, restart, or reactivate"),
+            "{reason}"
+        );
+        assert!(!reason.contains("start a worker"), "{reason}");
+    }
+
+    #[test]
+    fn no_live_worker_reason_names_liveness_for_draining_assigned_poller() {
+        let mut draining = worker_row_with_shard_assignments(&[0], &["default"]);
+        draining.worker.status = WorkerStatus::Draining.as_str().to_string();
+        let reason = gate_reason_for(vec![draining]);
+        assert!(
+            reason.contains("restore, restart, or reactivate"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn no_live_worker_reason_ignores_unhealthy_poller_assigned_to_other_shard() {
+        let mut stale = worker_row_with_shard_assignments(&[3], &["default"]);
+        stale.health = WorkerHealth::Stale;
+        let reason = gate_reason_for(vec![stale]);
+        assert!(reason.contains("start a worker or widen"), "{reason}");
     }
 
     #[test]

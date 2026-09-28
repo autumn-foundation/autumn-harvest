@@ -347,6 +347,7 @@ fn shard_undrained_alert_does_not_infer_poller_absence_from_dispatches() {
         .expect("shard-undrained runbook section must exist");
     assert!(
         section.contains("`polls queue(s)` means no shard-assigned worker polls")
+            && section.contains("`no healthy active worker` means an assigned poller exists")
             && section.contains("`capability/build/sticky requirements` means a covering poller"),
         "the runbook must branch on shard-health blocking reasons"
     );

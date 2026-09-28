@@ -853,6 +853,8 @@ or queue coverage or fix worker eligibility.
 3. Branch on `blocking_reasons`:
    - `polls queue(s)` means no shard-assigned worker polls the pending queue.
      Start or widen a worker's shard and queue coverage.
+   - `no healthy active worker` means an assigned poller exists but is stale,
+     unhealthy, or draining. Restore, restart, or reactivate that worker.
    - `capability/build/sticky requirements` means a covering poller is present
      but ineligible. Fix build compatibility, capabilities, or sticky ownership.
 4. Use this optional expression to find stranded shards with no recent dispatch
@@ -903,7 +905,8 @@ while it finishes — cross-check `harvest shard health` for its writable flag.
 ### Safe actions
 
 For a `polls queue(s)` block, remove explicit `with_shard_assignments`
-narrowing, add the shard, or add the queue. For a
+narrowing, add the shard, or add the queue. For a `no healthy active worker`
+block, restore, restart, or reactivate the named worker. For a
 `capability/build/sticky requirements` block, fix the named eligibility
 constraint. Configuration changes take effect on worker restart. Do **not**
 move executions across shards. Execution ids encode the original shard.
