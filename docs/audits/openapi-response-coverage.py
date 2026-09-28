@@ -49,7 +49,10 @@ and 5 read that parse when it reads a parameter of type
 that the handler passes the body to, at any depth up to `HELPER_DEPTH`. A
 recursive helper is read once per chain of calls. In a helper, only the
 parameter at the position of the body argument is a body. A move into another
-name, such as `let captured = body;`, is followed. A copy through a call, such
+name, such as `let captured = body;`, is followed. So is the result of a
+helper that gets the body and returns a byte type, when `returns_carrier`
+proves that it returns the body. Any other such result is a partial carrier,
+so a parse of it fails closed. A copy through a call, such
 as `body.to_vec()`, is read only inside a standard conversion. A byte accessor
 such as `body.as_ref()` is no handoff, unless a local method of that name may
 run on the body's type, as `local_methods` reads it. The type comes from a turbofish, then from a
@@ -86,11 +89,12 @@ decides: a response, an error or a `Result` can be a rejection, and a plain
 value type such as `Gadget` is not. A helper the audit cannot find counts as a
 rejection. An `.or_else(..)` whose fallback yields `Ok(..)` on every path makes
 a later `?` tolerant. A guard or a tolerant call at a helper call site carries
-into the helper. A parse in a closure that a `let` binds and that runs only
-where it is called reads the guard at each call, and the strictest call
-decides. Check 2 applies to every parse that does not tolerate its
-error, since a body that is present must then carry the mandatory fields. A bare
-`Json<T>` and a rejecting `Result<Json<T>, _>` are such parses.
+into the helper. A parse in a closure or an `async` block that a `let` binds,
+and that runs only where it is called or awaited, reads the guard at each
+call or `.await`. The strictest one decides. Check 2 applies to every parse
+that does not tolerate its error, since a body that is present must then carry
+the mandatory fields. A bare `Json<T>` and a rejecting `Result<Json<T>, _>` are
+such parses.
 
 Check 4 reads the routes that take a `RawQuery` and parse the pairs by hand. A
 key those parsers match is a parameter the route accepts, so a key the contract
@@ -1941,6 +1945,11 @@ def moved_names(block: str, names: set[str] | dict[str, int]) -> Carriers:
                 if way and live_binding(block, name, start, bound_at):
                     moved[bound] = (start, way == "wrapped" or name in partial)
                     break
+            else:
+                # A helper that returns a byte type hands its result back.
+                result = helper_result(block, found, value, opener)
+                if result is not None:
+                    moved[bound] = (start, result == "partial")
         # A carrier that flows into a destructuring pattern makes each name
         # the pattern binds a partial carrier, so a parse of it fails closed.
         for binds, start, opener, value in patterns:
@@ -1994,6 +2003,9 @@ def moved_names(block: str, names: set[str] | dict[str, int]) -> Carriers:
                 if carrier_live(block, found, name, start)
             ]
             way = "wrapped" if "wrapped" in flows else "direct" if "direct" in flows else None
+            if way is None:
+                result = helper_result(block, found, value, opener)
+                way = {"whole": "direct", "partial": "wrapped"}.get(result or "")
             if target in found:
                 if way != "direct" and found.rebound.get(target, len(block)) > start:
                     found.rebound[target] = start
@@ -2007,6 +2019,126 @@ def moved_names(block: str, names: set[str] | dict[str, int]) -> Carriers:
             found[bound] = start
             if is_partial:
                 partial.add(bound)
+
+
+# A return type that is a byte type or wraps one, such as `Result<Bytes, E>`.
+BYTE_RETURN = re.compile(r"(?<![\w:])Bytes\b|\[\s*u8\s*\]|(?<![\w:])Vec\s*<\s*u8\s*>")
+
+# The helper blocks whose returns `returns_carrier` is reading now.
+RETURN_STACK: set[int] = set()
+
+
+def helper_result(block: str, carriers: dict[str, int], value: str, opener: int) -> str | None:
+    """How a `let` value at `opener` that calls a helper with a carrier holds it.
+
+    The value must be one call, with any trailing success projection. A
+    free or path-qualified call resolves at the call site, as `call_sites`
+    resolves it. A method call reaches what `method_targets` finds. The
+    helper must get a live carrier as an argument, as `receiving_parameters`
+    maps it. A receiver that holds a carrier is a move, as `moved_names`
+    reads it, so it never reaches here. The return type must be a byte type
+    or wrap one, as `BYTE_RETURN` reads it. The result is then `"whole"` when
+    `returns_carrier` proves that the helper returns the carrier, and
+    `"partial"` otherwise, so a later parse of it fails closed. Any other
+    value is `None`: it holds no carrier the audit models. A helper the audit
+    cannot resolve is already an unresolved handoff.
+    """
+    live = {
+        name: carriers[name]
+        for name in carriers
+        if carrier_live(block, carriers, name, opener)
+    }
+    if not any(re.search(r"(?<![.\w])%s\b" % re.escape(name), value) for name in live):
+        return None
+    text = value.strip().rstrip(";").strip()
+    while True:
+        step = re.search(r"\s*%s$" % SUCCESS_STEP, text)
+        if step is None or not step.start():
+            break
+        text = text[: step.start()].rstrip()
+    at = opener + len(value) - len(value.lstrip())
+    end = at + len(text)
+    head = r"((?:[A-Za-z_]\w*(?:\s*::\s*<[^()]*?>)?\s*::\s*)*)([a-z_]\w*)%s\s*\(" % TURBOFISH
+    call = re.match(head, text)
+    if call and len(balanced(text[call.end() - 1 :])) == len(text) - call.end() + 1:
+        path, helper = re.sub(r"\s", "", call.group(1)), call.group(2)
+        site = site_in(block, at)
+        if helper in NOT_CALLS | GENERIC_HELPERS or std_conversion(path + helper, site):
+            return None
+        if serde_path(path + helper, site):
+            return None
+        reference = path.rstrip(":") + "::" + helper if path else helper
+        parts = function_parts(SOURCE[0], reference, site)
+        qualified, start = path or None, at
+    else:
+        # A method call whose argument list ends the value.
+        methods = [
+            found
+            for found in qualified_calls(block)
+            if found.group(1).strip() == "."
+            and at <= found.start() < end
+            and found.end() - 1 + len(balanced(block[found.end() - 1 :])) == end
+        ]
+        if len(methods) != 1:
+            return None
+        helper, start, qualified = methods[0].group(2), methods[0].start(), "."
+        if helper in GENERIC_HELPERS:
+            return None
+        targets = method_targets(block, "", call_receiver(block, start), helper, start)
+        parts = parts_at(SOURCE[0], targets[0]) if targets and len(targets) == 1 else None
+    if parts is None or not BYTE_RETURN.search(parts[1]):
+        return None
+    names = set(receiving_parameters(block, helper, parts[0], live, qualified, start))
+    if not names:
+        return None
+    if None in names:
+        return "partial"
+    return "whole" if returns_carrier(parts, names) else "partial"
+
+
+def returns_carrier(parts: tuple[str, str, str], names: set[str]) -> bool:
+    """Whether every value the fn of `parts` returns is a whole carrier from `names`.
+
+    The exits are the tail of the block and each `return`. An `Ok(..)` or a
+    `Some(..)` exit is read inside, and an `Err(..)` or a `None` exit
+    returns no body. Each value must be a live, whole carrier of the block,
+    as `moved_names` reads it from `names`. A helper already being read
+    returns nothing the audit can prove.
+    """
+    helper_block = parts[2]
+    key = getattr(helper_block, "start", id(helper_block))
+    if key in RETURN_STACK:
+        return False
+    RETURN_STACK.add(key)
+    try:
+        carriers = moved_names(helper_block, names)
+        tail = closure_value(helper_block)
+        exits = [(tail, helper_block.rfind(tail))] if tail else []
+        exits += [
+            (found.group(1), found.start())
+            for found in re.finditer(r"\breturn\b([^;]*);", helper_block)
+        ]
+        if not exits:
+            return False
+        for expression, position in exits:
+            expression = expression.strip()
+            wrapped = re.fullmatch(r"(?:Ok|Some)\s*\((.*)\)", expression, re.S)
+            if wrapped and len(balanced(expression[expression.find("(") :])) == len(
+                expression
+            ) - expression.find("("):
+                expression = wrapped.group(1)
+            elif re.fullmatch(r"Err\s*\(.*\)|None", expression, re.S):
+                continue
+            root, whole = argument_root(expression)
+            if not whole or root not in carriers:
+                return False
+            if carrier_partial(carriers, root, position):
+                return False
+            if not carrier_live(helper_block, carriers, root, position):
+                return False
+        return True
+    finally:
+        RETURN_STACK.discard(key)
 
 
 def live_passes(block: str, value: str, opener: int, name: str, bound_at: int) -> str | None:
@@ -2721,19 +2853,28 @@ def closure_body_end(text: str, after: int) -> tuple[int, int]:
 
 
 def closure_calls(block: str, position: int) -> list[int]:
-    """Where the closure that holds `position` in `block` is called, or nothing.
+    """Where the deferred body that holds `position` in `block` runs, or nothing.
 
-    The innermost closure that holds `position` counts only when a `let`
-    binds it by name and each later use of that name, as `live_binding` reads
-    it, is a direct call such as `parse()`. Its body then runs at those
-    calls, so a guard or an early exit there applies. Any other closure,
-    such as one passed to a helper or a combinator, runs where the audit
-    cannot see, so this is empty and the caller reads `position` itself.
+    A deferred body is a closure, or an `async` or `async move` block, as
+    `async_blocks` finds it. The innermost one that holds `position` counts
+    only when a `let` binds it by name. Each later use of that name, as
+    `live_binding` reads it, must run it: a direct call such as `parse()`
+    for a closure, or `fut.await` for an async block. Its body then runs at
+    those uses, so a guard or an early exit there applies. Any other body,
+    such as one passed to a helper, a combinator or a spawn, runs where the
+    audit cannot see, so this is empty and the caller reads `position` itself.
     """
-    holding = [item for item in closures(block) if item[1] <= position < item[2]]
-    if not holding:
+    # Each body, with the pattern that a use of its name must start with.
+    kinds = [(closures(block), r"\s*\("), (async_blocks(block), r"\s*\.\s*await\b")]
+    bodies = [
+        (start, stop, runs)
+        for found, runs in kinds
+        for start, opener, stop in found
+        if opener <= position < stop
+    ]
+    if not bodies:
         return []
-    start, _, stop = max(holding)
+    start, stop, runs = max(bodies)
     bound = re.search(r"\blet\s+(?:mut\s+)?([a-z_][a-z_0-9]*)\s*(?::[^=;]*)?=\s*$", block[:start])
     if bound is None or bound.group(1) == "_":
         return []
@@ -2742,10 +2883,20 @@ def closure_calls(block: str, position: int) -> list[int]:
         at = stop + use.start()
         if not live_binding(block, bound.group(1), at, bound.start()):
             continue
-        if not re.match(r"\s*\(", block[stop + use.end() :]):
+        if not re.match(runs, block[stop + use.end() :]):
             return []
         calls.append(at)
     return calls
+
+
+@functools.lru_cache(maxsize=None)
+def async_blocks(block: str) -> list[tuple[int, int, int]]:
+    """`(start, body start, body end)` for each `async` or `async move` block in `block`."""
+    found = []
+    for head in re.finditer(r"\basync\s+(?:move\s+)?(?=\{)", block):
+        body = balanced(block[head.end() :], "{", "}")
+        found.append((head.start(), head.end(), head.end() + len(body)))
+    return found
 
 
 def in_dead_closure(block: str, position: int) -> bool:
@@ -6369,6 +6520,19 @@ pub fn harvest_api_router() -> Router {
         .route("/e/ambiguous-windows", post(e_ambiguous_windows))
         .route("/e/other-type-len", post(e_other_type_len))
         .route("/e/vec-windows", post(e_vec_windows))
+        .route("/e/identity-helper", post(e_identity_helper))
+        .route("/e/checked-helper", post(e_checked_helper))
+        .route("/e/assigned-helper", post(e_assigned_helper))
+        .route("/e/trimmed-helper", post(e_trimmed_helper))
+        .route("/e/branching-helper", post(e_branching_helper))
+        .route("/e/counting-helper", post(e_counting_helper))
+        .route("/e/fresh-helper", post(e_fresh_helper))
+        .route("/e/method-helper", post(e_method_helper))
+        .route("/e/early-fresh-helper", post(e_early_fresh_helper))
+        .route("/e/shadowing-helper", post(e_shadowing_helper))
+        .route("/e/async-guarded", post(e_async_guarded))
+        .route("/e/async-move-early", post(e_async_move_early))
+        .route("/e/async-spawned", post(e_async_spawned))
         .route("/e/closure-guarded-call", post(e_closure_guarded_call))
         .route("/e/closure-early-return", post(e_closure_early_return))
         .route("/e/closure-mixed-calls", post(e_closure_mixed_calls))
@@ -8389,6 +8553,141 @@ async fn e_closure_inner_guard(body: Bytes) -> Response {
         }
     };
     let gadget = parse();
+    StatusCode::OK.into_response()
+}
+
+fn identity(body: Bytes) -> Bytes {
+    body
+}
+
+async fn e_identity_helper(body: Bytes) -> Response {
+    let bytes = identity(body);
+    let gadget = serde_json::from_slice::<Gadget>(&bytes).unwrap();
+    StatusCode::OK.into_response()
+}
+
+fn checked(body: Bytes) -> Result<Bytes, Rejection> {
+    if body.len() > 64 {
+        return Err(Rejection::TooLarge);
+    }
+    let kept = body;
+    Ok(kept)
+}
+
+async fn e_checked_helper(body: Bytes) -> Response {
+    let bytes = checked(body)?;
+    let gadget = serde_json::from_slice::<Gadget>(&bytes).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_assigned_helper(body: Bytes) -> Response {
+    let bytes;
+    bytes = identity(body);
+    let gadget = serde_json::from_slice::<Gadget>(&bytes).unwrap();
+    StatusCode::OK.into_response()
+}
+
+fn trimmed(body: &[u8]) -> &[u8] {
+    &body[1..]
+}
+
+async fn e_trimmed_helper(body: Bytes) -> Response {
+    let bytes = trimmed(&body);
+    let gadget = serde_json::from_slice::<Gadget>(bytes).unwrap();
+    StatusCode::OK.into_response()
+}
+
+fn branching(body: Bytes) -> Bytes {
+    if body.len() > 2 { body } else { Bytes::new() }
+}
+
+async fn e_branching_helper(body: Bytes) -> Response {
+    let bytes = branching(body);
+    let gadget = serde_json::from_slice::<Gadget>(&bytes).unwrap();
+    StatusCode::OK.into_response()
+}
+
+fn counted(body: &Bytes) -> usize {
+    body.len()
+}
+
+async fn e_counting_helper(body: Bytes) -> Response {
+    let size = counted(&body);
+    record_size(size);
+    StatusCode::OK.into_response()
+}
+
+fn fresh_bytes() -> Bytes {
+    Bytes::new()
+}
+
+async fn e_fresh_helper(body: Bytes) -> Response {
+    let bytes = fresh_bytes();
+    let gadget = serde_json::from_slice::<Gadget>(&bytes).unwrap_or_default();
+    record_size(body.len());
+    StatusCode::OK.into_response()
+}
+
+struct Passer;
+
+impl Passer {
+    fn pass(&self, body: Bytes) -> Bytes {
+        body
+    }
+}
+
+async fn e_method_helper(body: Bytes) -> Response {
+    let passer: Passer = Passer;
+    let bytes = passer.pass(body);
+    let gadget = serde_json::from_slice::<Gadget>(&bytes).unwrap();
+    StatusCode::OK.into_response()
+}
+
+fn early_fresh(body: Bytes) -> Bytes {
+    if body.len() > 64 {
+        return Bytes::new();
+    }
+    let kept = body;
+    kept
+}
+
+async fn e_early_fresh_helper(body: Bytes) -> Response {
+    let bytes = early_fresh(body);
+    let gadget = serde_json::from_slice::<Gadget>(&bytes).unwrap();
+    StatusCode::OK.into_response()
+}
+
+fn shadowing(body: Bytes) -> Bytes {
+    let body = Bytes::new();
+    body
+}
+
+async fn e_shadowing_helper(body: Bytes) -> Response {
+    let bytes = shadowing(body);
+    let gadget = serde_json::from_slice::<Gadget>(&bytes).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_async_guarded(body: Bytes) -> Response {
+    let pending = async { serde_json::from_slice::<Gadget>(&body).unwrap() };
+    let gadget = if body.is_empty() { Gadget::default() } else { pending.await };
+    StatusCode::OK.into_response()
+}
+
+async fn e_async_move_early(body: Bytes) -> Response {
+    let pending = async move { serde_json::from_slice::<Gadget>(&body).unwrap() };
+    if body.is_empty() {
+        return StatusCode::OK.into_response();
+    }
+    let gadget = pending.await;
+    StatusCode::OK.into_response()
+}
+
+async fn e_async_spawned(body: Bytes) -> Response {
+    let pending = async { serde_json::from_slice::<Gadget>(&body).unwrap() };
+    if !body.is_empty() {
+        tokio::spawn(pending);
+    }
     StatusCode::OK.into_response()
 }
 
@@ -11926,6 +12225,58 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
             ],
             "unresolved": [
                 "POST /e/ambiguous-windows: cannot read a `from_slice` call",
+            ],
+        },
+    ),
+    (
+        "a helper that returns the body hands back a carrier, and an async parse reads its awaits",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST", "/e/" + path, 200, request_body=body_of(("name", False), required=False)
+            )
+            for path in (
+                "identity-helper",
+                "checked-helper",
+                "assigned-helper",
+                "trimmed-helper",
+                "branching-helper",
+                "counting-helper",
+                "fresh-helper",
+                "method-helper",
+                "early-fresh-helper",
+                "shadowing-helper",
+                "async-guarded",
+                "async-move-early",
+                "async-spawned",
+            )
+        ],
+        {
+            "body_required": [
+                "POST /e/identity-helper: the body is mandatory",
+                "POST /e/checked-helper: the body is mandatory",
+                "POST /e/assigned-helper: the body is mandatory",
+                "POST /e/method-helper: the body is mandatory",
+                "POST /e/trimmed-helper: the body is mandatory",
+                "POST /e/branching-helper: the body is mandatory",
+                "POST /e/early-fresh-helper: the body is mandatory",
+                "POST /e/shadowing-helper: the body is mandatory",
+                "POST /e/async-spawned: the body is mandatory",
+            ],
+            "mandatory": [
+                "POST /e/identity-helper: `name` is mandatory in Gadget",
+                "POST /e/checked-helper: `name` is mandatory in Gadget",
+                "POST /e/assigned-helper: `name` is mandatory in Gadget",
+                "POST /e/method-helper: `name` is mandatory in Gadget",
+                "POST /e/async-guarded: `name` is mandatory in Gadget",
+                "POST /e/async-move-early: `name` is mandatory in Gadget",
+                "POST /e/async-spawned: `name` is mandatory in Gadget",
+            ],
+            "unresolved": [
+                "POST /e/trimmed-helper: cannot read a `from_slice` call",
+                "POST /e/branching-helper: cannot read a `from_slice` call",
+                "POST /e/early-fresh-helper: cannot read a `from_slice` call",
+                "POST /e/shadowing-helper: cannot read a `from_slice` call",
             ],
         },
     ),
