@@ -52,7 +52,9 @@ parameter at the position of the body argument is a body. A move into another
 name, such as `let captured = body;`, is followed. So is the result of a
 helper that gets the body and returns a byte type, when `returns_carrier`
 proves that it returns the body. Any other such result is a partial carrier,
-so a parse of it fails closed. A copy through a call, such
+so a parse of it fails closed. So is a value that holds such a call inside a
+branch, a block, a match arm or a group, since the audit does not model which
+branch runs. A copy through a call, such
 as `body.to_vec()`, is read only inside a standard conversion. A byte accessor
 such as `body.as_ref()` is no handoff, unless a local method of that name may
 run on the body's type, as `local_methods` reads it. The type comes from a turbofish, then from a
@@ -91,7 +93,8 @@ rejection. An `.or_else(..)` whose fallback yields `Ok(..)` on every path makes
 a later `?` tolerant. A guard or a tolerant call at a helper call site carries
 into the helper. A parse in a closure or an `async` block that a `let` binds,
 and that runs only where it is called or awaited, reads the guard at each
-call or `.await`. The strictest one decides. Check 2 applies to every parse
+call or `.await`. The strictest one decides. One whose name is never used
+never runs, so its parse does not count. Check 2 applies to every parse
 that does not tolerate its error, since a body that is present must then carry
 the mandatory fields. A bare `Json<T>` and a rejecting `Result<Json<T>, _>` are
 such parses.
@@ -2029,19 +2032,18 @@ RETURN_STACK: set[int] = set()
 
 
 def helper_result(block: str, carriers: dict[str, int], value: str, opener: int) -> str | None:
-    """How a `let` value at `opener` that calls a helper with a carrier holds it.
+    """How a `let` value at `opener` holds a carrier that a helper returns.
 
-    The value must be one call, with any trailing success projection. A
-    free or path-qualified call resolves at the call site, as `call_sites`
-    resolves it. A method call reaches what `method_targets` finds. The
-    helper must get a live carrier as an argument, as `receiving_parameters`
-    maps it. A receiver that holds a carrier is a move, as `moved_names`
-    reads it, so it never reaches here. The return type must be a byte type
-    or wrap one, as `BYTE_RETURN` reads it. The result is then `"whole"` when
-    `returns_carrier` proves that the helper returns the carrier, and
-    `"partial"` otherwise, so a later parse of it fails closed. Any other
-    value is `None`: it holds no carrier the audit models. A helper the audit
-    cannot resolve is already an unresolved handoff.
+    When the whole value is one call, with any trailing success projection,
+    that `byte_call` reads, the result is `"whole"` when `returns_carrier`
+    proves that the helper returns the carrier, and `"partial"` otherwise.
+    When such a call is anywhere else in the value, as in a branch, a block,
+    a match arm or a group, the result is `"partial"`: the audit does not
+    model which branch runs, so a later parse fails closed. A value that
+    holds a carrier outside every call is read by `argument_passes`, the
+    same partial rule. Any other value is `None`: it holds no carrier the
+    audit models. A helper the audit cannot resolve is already an unresolved
+    handoff.
     """
     live = {
         name: carriers[name]
@@ -2057,43 +2059,72 @@ def helper_result(block: str, carriers: dict[str, int], value: str, opener: int)
             break
         text = text[: step.start()].rstrip()
     at = opener + len(value) - len(value.lstrip())
-    end = at + len(text)
+    whole = byte_call(block, live, at, at + len(text))
+    if whole is not None:
+        parts, names = whole
+        if None in names:
+            return "partial"
+        return "whole" if returns_carrier(parts, names) else "partial"
+    # A byte-returning call that gets a carrier inside a larger expression.
+    stop = opener + len(value)
+    # A method call is read from its `.`, as `byte_call` finds it by range.
+    calls = list(re.finditer(FREE_CALL_NAME, block)) + qualified_calls(block)
+    spans = [(found.start(), found.end()) for found in calls]
+    for start, head_end in spans:
+        if not opener <= start < stop:
+            continue
+        end = head_end - 1 + len(balanced(block[head_end - 1 :]))
+        if end <= stop and byte_call(block, live, start, end) is not None:
+            return "partial"
+    return None
+
+
+def byte_call(
+    block: str, live: dict[str, int], start: int, end: int
+) -> tuple[tuple[str, str, str], set[str | None]] | None:
+    """`(parts, names)` when `block[start:end]` is one call of a byte-returning helper.
+
+    A free or path-qualified call resolves at the call site, as `call_sites`
+    resolves it. A method call reaches what `method_targets` finds. The
+    helper must get a carrier of `live` as an argument, and `names` holds
+    each parameter that gets one, as `receiving_parameters` maps it. A
+    receiver that holds a carrier is a move, as `moved_names` reads it. The
+    return type must be a byte type or wrap one, as `BYTE_RETURN` reads it.
+    Any other text is `None`.
+    """
+    text = block[start:end]
     head = r"((?:[A-Za-z_]\w*(?:\s*::\s*<[^()]*?>)?\s*::\s*)*)([a-z_]\w*)%s\s*\(" % TURBOFISH
     call = re.match(head, text)
     if call and len(balanced(text[call.end() - 1 :])) == len(text) - call.end() + 1:
         path, helper = re.sub(r"\s", "", call.group(1)), call.group(2)
-        site = site_in(block, at)
+        site = site_in(block, start)
         if helper in NOT_CALLS | GENERIC_HELPERS or std_conversion(path + helper, site):
             return None
         if serde_path(path + helper, site):
             return None
         reference = path.rstrip(":") + "::" + helper if path else helper
         parts = function_parts(SOURCE[0], reference, site)
-        qualified, start = path or None, at
+        qualified, at = path or None, start
     else:
-        # A method call whose argument list ends the value.
+        # A method call whose argument list ends the text.
         methods = [
             found
             for found in qualified_calls(block)
             if found.group(1).strip() == "."
-            and at <= found.start() < end
+            and start <= found.start() < end
             and found.end() - 1 + len(balanced(block[found.end() - 1 :])) == end
         ]
         if len(methods) != 1:
             return None
-        helper, start, qualified = methods[0].group(2), methods[0].start(), "."
+        helper, at, qualified = methods[0].group(2), methods[0].start(), "."
         if helper in GENERIC_HELPERS:
             return None
-        targets = method_targets(block, "", call_receiver(block, start), helper, start)
+        targets = method_targets(block, "", call_receiver(block, at), helper, at)
         parts = parts_at(SOURCE[0], targets[0]) if targets and len(targets) == 1 else None
     if parts is None or not BYTE_RETURN.search(parts[1]):
         return None
-    names = set(receiving_parameters(block, helper, parts[0], live, qualified, start))
-    if not names:
-        return None
-    if None in names:
-        return "partial"
-    return "whole" if returns_carrier(parts, names) else "partial"
+    names = set(receiving_parameters(block, helper, parts[0], live, qualified, at))
+    return (parts, names) if names else None
 
 
 def returns_carrier(parts: tuple[str, str, str], names: set[str]) -> bool:
@@ -2900,15 +2931,17 @@ def async_blocks(block: str) -> list[tuple[int, int, int]]:
 
 
 def in_dead_closure(block: str, position: int) -> bool:
-    """Whether `position` is inside a closure in `block` that never runs.
+    """Whether `position` is inside a deferred body in `block` that never runs.
 
-    Each enclosing closure is its own site. One that is called in place,
-    passed to a helper or a combinator such as `map`, returned or stored
-    runs, or may run, so its body counts as today, which fails closed. Only
-    a closure bound by `let` whose name is never read after it, as
-    `live_binding` reads the name, never runs. So does one bound to `_`.
+    A deferred body is a closure, or an `async` or `async move` block, as
+    `async_blocks` finds it. Each enclosing one is its own site. One that is
+    called or awaited in place, passed to a helper, a combinator or a spawn,
+    returned or stored runs, or may run, so its body counts as today, which
+    fails closed. Only a body bound by `let` whose name is never read after
+    it, as `live_binding` reads the name, never runs. So does one bound to
+    `_`.
     """
-    for start, opener, stop in closures(block):
+    for start, opener, stop in closures(block) + async_blocks(block):
         if not opener <= position < stop:
             continue
         bound = re.search(
@@ -6520,6 +6553,16 @@ pub fn harvest_api_router() -> Router {
         .route("/e/ambiguous-windows", post(e_ambiguous_windows))
         .route("/e/other-type-len", post(e_other_type_len))
         .route("/e/vec-windows", post(e_vec_windows))
+        .route("/e/async-unpolled", post(e_async_unpolled))
+        .route("/e/async-underscore", post(e_async_underscore))
+        .route("/e/async-dropped", post(e_async_dropped))
+        .route("/e/branch-helper", post(e_branch_helper))
+        .route("/e/match-helper", post(e_match_helper))
+        .route("/e/block-helper", post(e_block_helper))
+        .route("/e/nested-call-helper", post(e_nested_call_helper))
+        .route("/e/branch-raw", post(e_branch_raw))
+        .route("/e/branch-count", post(e_branch_count))
+        .route("/e/branch-method-helper", post(e_branch_method_helper))
         .route("/e/identity-helper", post(e_identity_helper))
         .route("/e/checked-helper", post(e_checked_helper))
         .route("/e/assigned-helper", post(e_assigned_helper))
@@ -8688,6 +8731,68 @@ async fn e_async_spawned(body: Bytes) -> Response {
     if !body.is_empty() {
         tokio::spawn(pending);
     }
+    StatusCode::OK.into_response()
+}
+
+async fn e_async_unpolled(body: Bytes) -> Response {
+    let pending = async { serde_json::from_slice::<Gadget>(&body).unwrap() };
+    StatusCode::OK.into_response()
+}
+
+async fn e_async_underscore(body: Bytes) -> Response {
+    let _ = async move { serde_json::from_slice::<Gadget>(&body).unwrap() };
+    StatusCode::OK.into_response()
+}
+
+async fn e_async_dropped(body: Bytes) -> Response {
+    let pending = async { serde_json::from_slice::<Gadget>(&body).unwrap() };
+    drop(pending);
+    StatusCode::OK.into_response()
+}
+
+async fn e_branch_helper(body: Bytes) -> Response {
+    let bytes = if body.len() > 2 { identity(body) } else { fresh_bytes() };
+    let gadget = serde_json::from_slice::<Gadget>(&bytes).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_match_helper(body: Bytes) -> Response {
+    let bytes = match body.len() {
+        0 => fresh_bytes(),
+        _ => identity(body),
+    };
+    let gadget = serde_json::from_slice::<Gadget>(&bytes).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_block_helper(body: Bytes) -> Response {
+    let bytes = (identity(body));
+    let gadget = serde_json::from_slice::<Gadget>(&bytes).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_nested_call_helper(body: Bytes) -> Response {
+    let bytes = identity(identity(body));
+    let gadget = serde_json::from_slice::<Gadget>(&bytes).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_branch_raw(body: Bytes) -> Response {
+    let bytes = if body.len() > 2 { body } else { Bytes::new() };
+    let gadget = serde_json::from_slice::<Gadget>(&bytes).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_branch_method_helper(body: Bytes) -> Response {
+    let passer: Passer = Passer;
+    let bytes = if body.len() > 2 { passer.pass(body) } else { fresh_bytes() };
+    let gadget = serde_json::from_slice::<Gadget>(&bytes).unwrap();
+    StatusCode::OK.into_response()
+}
+
+async fn e_branch_count(body: Bytes) -> Response {
+    let size = if body.len() > 2 { counted(&body) } else { 0 };
+    record_size(size);
     StatusCode::OK.into_response()
 }
 
@@ -12277,6 +12382,49 @@ SELF_TESTS: list[tuple[str, str, list[dict], dict[str, list[str]]]] = [
                 "POST /e/branching-helper: cannot read a `from_slice` call",
                 "POST /e/early-fresh-helper: cannot read a `from_slice` call",
                 "POST /e/shadowing-helper: cannot read a `from_slice` call",
+            ],
+        },
+    ),
+    (
+        "an unpolled async block is dead, and a nested helper result is a partial carrier",
+        FIXTURE_EDGES,
+        [
+            fixture_route(
+                "POST", "/e/" + path, 200, request_body=body_of(("name", False), required=False)
+            )
+            for path in (
+                "async-unpolled",
+                "async-underscore",
+                "async-dropped",
+                "branch-helper",
+                "match-helper",
+                "block-helper",
+                "nested-call-helper",
+                "branch-raw",
+                "branch-count",
+                "branch-method-helper",
+            )
+        ],
+        {
+            "body_required": [
+                "POST /e/async-dropped: the body is mandatory",
+                "POST /e/branch-helper: the body is mandatory",
+                "POST /e/match-helper: the body is mandatory",
+                "POST /e/block-helper: the body is mandatory",
+                "POST /e/nested-call-helper: the body is mandatory",
+                "POST /e/branch-raw: the body is mandatory",
+                "POST /e/branch-method-helper: the body is mandatory",
+            ],
+            "mandatory": [
+                "POST /e/async-dropped: `name` is mandatory in Gadget",
+            ],
+            "unresolved": [
+                "POST /e/branch-helper: cannot read a `from_slice` call",
+                "POST /e/match-helper: cannot read a `from_slice` call",
+                "POST /e/block-helper: cannot read a `from_slice` call",
+                "POST /e/nested-call-helper: cannot read a `from_slice` call",
+                "POST /e/branch-raw: cannot read a `from_slice` call",
+                "POST /e/branch-method-helper: cannot read a `from_slice` call",
             ],
         },
     ),
