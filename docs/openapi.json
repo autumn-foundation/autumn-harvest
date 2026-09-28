@@ -6001,15 +6001,6 @@
             "schema": {
               "type": "string"
             }
-          },
-          {
-            "description": "Maximum number of runs to return.",
-            "in": "query",
-            "name": "limit",
-            "required": false,
-            "schema": {
-              "type": "integer"
-            }
           }
         ],
         "responses": {

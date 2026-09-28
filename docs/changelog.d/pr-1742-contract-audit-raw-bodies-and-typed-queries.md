@@ -15,8 +15,10 @@ unless an `.is_empty()` test lets an empty body skip it. This separates the
 three DLQ routes from the three optional-body routes in #1411.
 
 **Check 6.** Each `Query<T>` field has one query parameter with the same
-name, OpenAPI type and required flag. A documented key that no struct
-accepts is a finding.
+name, OpenAPI type and required flag. A documented key that no extractor
+accepts is a finding. The check runs for every served route, so a route
+with no `Query<T>` accepts no documented query key. A route that reads the
+raw query string, such as through `RawQuery`, is left to check 4.
 
 **Check 7.** The audit does not skip what it cannot read. An unreadable
 `from_slice` call or `Query<..>` extractor is a finding. So is an unresolved
@@ -31,6 +33,11 @@ not about 2 min 30 s. The speed change alone does not change any finding.
 `POST /admin/schedules/{id}/resume` accepts `reason` through
 `PauseResumeRequest`, but the contract listed no fields. The contract now
 documents it as accepted and ignored, since resume clears `pause_reason`.
+
+The wider check 6 found one more. `GET /dags/{dag_name}/runs` documented a
+`limit` query parameter since #274, but `list_dag_runs` has no query
+extractor and never read it. The contract no longer lists it, and both
+OpenAPI copies are regenerated. A real `limit` is left to a follow-up.
 
 No engine or schema change. The real contract passes every check. Each of
 six defects seeded into a copy of the contract fails the audit.

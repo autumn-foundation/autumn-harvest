@@ -3311,13 +3311,6 @@
           "type": "string",
           "required": true,
           "description": "Registered DAG name."
-        },
-        {
-          "name": "limit",
-          "in": "query",
-          "type": "integer",
-          "required": false,
-          "description": "Maximum number of runs to return."
         }
       ],
       "request_body": null,
