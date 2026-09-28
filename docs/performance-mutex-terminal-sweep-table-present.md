@@ -172,6 +172,13 @@ investigation now shows does not exist.
 
 🔬 **Reproduce.**
 
+Prerequisite (once, requires a Postgres restart — `pg_stat_statements` must
+be preloaded, not just `CREATE EXTENSION`ed, for `shared_blks_hit` counters
+to accumulate): add `shared_preload_libraries = 'pg_stat_statements'` to
+`postgresql.conf` and restart the cluster, e.g.
+`pg_ctlcluster 16 main restart` on Debian/Ubuntu packaging. Verify with
+`SHOW shared_preload_libraries;` before continuing.
+
 ```sh
 PGPASSWORD=postgres psql -h localhost -U postgres -c \
   "CREATE DATABASE harvest_ledger_probe;"
@@ -198,4 +205,19 @@ BEGIN; EXPLAIN (ANALYZE, BUFFERS) SELECT to_regclass('harvest_mutex_locks') IS N
 BEGIN; EXPLAIN (ANALYZE, BUFFERS) SELECT to_regclass('harvest_mutex_locks') IS NOT NULL AS present; COMMIT;
 BEGIN; EXPLAIN (ANALYZE, BUFFERS) SELECT to_regclass('harvest_mutex_locks') IS NOT NULL AS present; COMMIT;
 SQL
+
+# pg_stat_statements.same-connection.txt: reset, issue the same three calls
+# as Probe 3 as plain (non-EXPLAIN) statements so they accumulate normal
+# statement stats, then read the aggregate back.
+PGPASSWORD=postgres psql -h localhost -U postgres -d harvest_ledger_probe \
+  -c "SELECT pg_stat_statements_reset();"
+cat <<'SQL' | PGPASSWORD=postgres psql -h localhost -U postgres -d harvest_ledger_probe
+BEGIN;
+SELECT to_regclass('harvest_mutex_locks') IS NOT NULL AS present;
+SELECT to_regclass('harvest_mutex_locks') IS NOT NULL AS present;
+SELECT to_regclass('harvest_mutex_locks') IS NOT NULL AS present;
+COMMIT;
+SQL
+PGPASSWORD=postgres psql -h localhost -U postgres -d harvest_ledger_probe -c \
+  "SELECT query, calls, shared_blks_hit, shared_blks_read FROM pg_stat_statements WHERE query ILIKE '%to_regclass%';"
 ```
