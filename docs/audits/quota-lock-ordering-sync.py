@@ -621,6 +621,23 @@ def check_call_site_guard(text: str, file_label: str, enclosing_fn: str, wrapper
             f"does not recognize as read-only ({', '.join(_ALLOWED_READ_ONLY_METHODS)} "
             "only), so the loop is not guaranteed to consume the reordered batch"
         )
+
+    # A second `for _ in var {` loop anywhere later in the function is a
+    # fallback firing path this check has not verified (Codex review, issue
+    # #1696 follow-up). The real code shadows the wrapper's input with its
+    # output under the same name, so a conditional branch that runs the
+    # guarded loop and returns, followed by an outer-scope fallback loop over
+    # the pre-shadowing (unordered) binding of that same name, textually
+    # looks identical to the one guarded loop this check already found.
+    further_loop_match = loop_re.search(masked, loop_match.end())
+    if further_loop_match is not None:
+        return (
+            f"{file_label}::{enclosing_fn}: another `for _ in {var} {{` loop exists "
+            f"after the one this check already matched — a conditional branch that "
+            "runs the guarded loop and returns, followed by a fallback loop over an "
+            "outer-scope, pre-ordering binding of the same name, would pass this "
+            "check by matching only the first loop it finds"
+        )
     return None
 
 
