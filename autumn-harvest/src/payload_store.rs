@@ -31,12 +31,13 @@
 //!
 //! A reference is recognised by its discriminator. Business data can carry the
 //! same key. To keep the two apart, the write path offloads any fresh field that
-//! carries the discriminator, even when the field is small. A stored field with
-//! the discriminator is therefore always a real reference. The stored shape does
-//! not change, so an older binary still reads every new row.
+//! carries the discriminator, even when the field is small. A field written
+//! through the offloader therefore never stores a bare look-alike. The stored
+//! shape does not change, so an older binary still reads every new row.
 //!
-//! Rows written before this fix are not repaired. A look-alike that reached the
-//! log earlier still fails on read.
+//! Some writers do not use the offloader, for example the workflow start input.
+//! A rolling deploy and a node without a store also skip it. A look-alike written
+//! that way, or before this fix, still fails on read.
 
 use std::sync::Arc;
 
@@ -199,9 +200,9 @@ impl PayloadOffloader {
     /// composes after [`PayloadCodec::encode`](crate::payload_codec::PayloadCodec::encode).
     /// Input is always a fresh value, never a stored row. A field that carries
     /// [`OFFLOAD_ENVELOPE_KEY`] is business data that looks like a reference
-    /// (issue #1758). It is offloaded whatever its size, so a stored field with
-    /// the discriminator is always a real reference. Returns the set of blobs
-    /// created so the caller can record per-execution references.
+    /// (issue #1758). It is offloaded whatever its size, so this path never
+    /// stores a bare look-alike. Returns the set of blobs created so the caller
+    /// can record per-execution references.
     ///
     /// # Errors
     ///
@@ -573,18 +574,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_integer_discriminator_stays_inline() {
+    async fn non_one_discriminator_stays_inline() {
+        for marker in [
+            serde_json::json!("yes"),
+            serde_json::json!("1"),
+            serde_json::json!(2),
+            serde_json::json!(1.0),
+        ] {
+            let store = MemStore::new();
+            let off = offloader(store.clone(), 1_000_000);
+            let original = serde_json::json!({ "_harvest_offload_envelope": marker });
+            let mut event = event_with_output(original.clone());
+            assert!(
+                off.offload_event_value(&mut event)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(event["data"]["output"], original);
+        }
+    }
+
+    #[tokio::test]
+    async fn look_alike_in_every_payload_field_round_trips() {
         let store = MemStore::new();
         let off = offloader(store.clone(), 1_000_000);
-        let original = serde_json::json!({ "_harvest_offload_envelope": "yes" });
-        let mut event = event_with_output(original.clone());
-        assert!(
-            off.offload_event_value(&mut event)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(event["data"]["output"], original);
+        let look_alike = serde_json::json!({ "_harvest_offload_envelope": 1 });
+        let mut data = serde_json::Map::new();
+        for key in PAYLOAD_FIELD_KEYS {
+            data.insert(key.to_string(), look_alike.clone());
+        }
+        let mut event = serde_json::json!({ "type": "T", "data": data });
+        let refs = off.offload_event_value(&mut event).await.unwrap();
+        assert_eq!(refs.len(), PAYLOAD_FIELD_KEYS.len());
+        off.inflate_event_value(&mut event).await.unwrap();
+        for key in PAYLOAD_FIELD_KEYS {
+            assert_eq!(event["data"][key], look_alike, "field {key}");
+        }
     }
 
     #[tokio::test]

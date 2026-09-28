@@ -4436,8 +4436,8 @@ fn offloaded_fixture_reason(json: &str, snapshot: &HistorySnapshot) -> Option<St
         .map(|reference| reference.blob_key)
         .collect();
     if offloaded.is_empty() {
-        // The key appeared in payload *data* rather than as a real envelope
-        // (e.g. a workflow whose own JSON mentions it). Nothing to inflate.
+        // The key appeared in payload *data* rather than as a real envelope.
+        // A partial look-alike, for example. Nothing to inflate.
         return None;
     }
 

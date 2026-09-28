@@ -219,7 +219,8 @@ pub fn reencrypt_event_payload_fields_under(
         // Discriminator-only, NOT the strict `extract_offload_ref` parser: a
         // field bearing the offload marker is passed through whether or not its
         // reference parses, because there is no ciphertext here to rotate and
-        // rewriting it would orphan the blob either way.
+        // rewriting it would orphan the blob either way. A reference that does
+        // not parse can only be a row written before issue #1758.
         if is_offload_envelope(field) {
             outcome.fields_skipped_offloaded += 1;
             continue;
