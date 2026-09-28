@@ -18,6 +18,7 @@ to wire into CI as a gate.
 | `cli-flag-coverage.py` | The inverse of `config-cli-drift.py`: real `harvest` CLI `--flags`, extracted the same way, that no page in the corpus mentions at all — a coverage-matrix report for manual triage, not a gate (see the script's own docstring for why) | No — report-only; run manually as Folio triage input |
 | `comment-hygiene.py` | Comment defects across every `*.rs`: commented-out code, unreferenced TODOs, narrative asides, blank block edges (all gated at zero), plus review-round archaeology, contractions and over-long sentences (ratcheted against the merge base, so a change may not add one to a file it touches) | Yes — `.github/workflows/ci.yml`, `lint` job |
 | `audit-catalog-coverage.py` | Every `*.py` script in `docs/audits/` has a row in this table | Yes — `.github/workflows/ci.yml`, `lint` job |
+| `shard-weight-drift.py` | `test-db-linux` per-shard test-count weight, computed the way `run-suites.sh`'s own `row_ordinal % SEMAPHORE_SHARD_COUNT` actually assigns rows to shards; flags any shard carrying 2+ heavy suites | Yes — `.github/workflows/ci.yml`, `lint` job, **report-only** (always exits 0; see the script's own docstring for why it does not yet gate) |
 
 ## Comment hygiene: the two tiers
 
