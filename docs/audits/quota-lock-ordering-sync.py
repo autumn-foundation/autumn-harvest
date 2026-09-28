@@ -213,7 +213,16 @@ FN_SIGNATURE_RE_TEMPLATE = r"\n(?:async )?fn {name}\s*\("
 # Excluding a preceding `'` too closes that; the rare, contrived case of a
 # raw string genuinely and adjacently preceded by a char literal's closing
 # quote (`'a'r"..."`, no space) is not worth the ambiguity it would reopen.
-_RAW_STRING_OPEN_RE = re.compile(r"(?<![A-Za-z0-9_'])(?:b|c)?r(#*)\"")
+#
+# A further round found the excluded set still missed `#` (Codex review,
+# issue #1696 follow-up): `r#br"\"}"` tokenizes in Rust as the raw
+# identifier `r#br` (the `r#` escape consumes the whole identifier `br`)
+# followed by an ordinary, escape-aware string, but this scanner is not
+# blocked from starting a raw-string match at the `b`, since a preceding
+# `#` was not excluded. `#` is otherwise only valid immediately AFTER a
+# raw string's `r`, as its hash-delimiter count, never immediately before
+# a prefix, so excluding it here is unambiguous.
+_RAW_STRING_OPEN_RE = re.compile(r"(?<![A-Za-z0-9_'#])(?:b|c)?r(#*)\"")
 
 
 def _skip_line_comment(text: str, i: int) -> int:
