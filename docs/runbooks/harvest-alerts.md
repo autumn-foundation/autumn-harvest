@@ -3051,6 +3051,7 @@ invisible to detection is growing, and the audit table is growing with it.
   | Process down | `up == 0` |
   | Exporter never ran for a shard | `absent(harvest_audit_export_lag{shard="N"})` |
   | Sink failing or slow, exporter observing normally | the lag threshold — the cursor is held, so the oldest unacknowledged record ages and the gauge climbs |
+  | Export **disabled** in a live process (issue #1506) | `harvest_audit_export_unobservable` — the exporter reports `observed = 0` |
   | Exporter alive but **cannot observe the shard** | `harvest_audit_export_unobservable` — see the runbook section below |
   | **One shard** never scanned while others report | **nothing in the shipped rules.** `absent()` is false as soon as any shard reports. Template one absence rule per configured shard from your own inventory: `absent(harvest_audit_export_lag{shard="N"})` |
 
@@ -3130,6 +3131,7 @@ This alert also fires when export was disabled in a live process (issue
 #1506). A runtime rebuilt with no sink sets `export_observed` to `0` for each
 shard. In that case `GET /admin/audit-export` shows `sink_configured: false`.
 Configure a sink again, or silence the alert if you disabled export on purpose.
+Check `sink_configured` first.
 
 ### Triage steps
 

@@ -1,4 +1,4 @@
-## Phase 8.1506 — Audit export disable marks shards unobserved (issue #1506)
+## Phase — Audit export disable marks shards unobserved (issue #1506)
 
 A live process could clear its audit-export config. Both audit-export gauges
 then kept their last value, and no alert fired. `set_global_audit_export_config`

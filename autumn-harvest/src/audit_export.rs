@@ -32,6 +32,10 @@
 //! query runs and no new row exists: read behavior matches the code before
 //! this module existed.
 //!
+//! One exception exists (issue #1506). If a live config is removed, each tick
+//! still returns before any query. It then reports `export_observed = 0` for
+//! each shard it serves, because the gauges would otherwise keep a healthy value.
+//!
 //! Write behavior does not. `harvest_audit_log_unexported_idx` is a partial
 //! index on `export_seq IS NULL`. An unconfigured deployment leaves every row
 //! `NULL` forever, so the index matches the whole audit table, and every
@@ -802,6 +806,10 @@ pub struct AuditExportRuntimeConfig {
     pub lease: std::time::Duration,
 }
 
+// Write this static through [`set_global_audit_export_config`]. A direct write
+// skips the disable tracking of issue #1506, and the gauges then keep their
+// last value.
+//
 // `Arc`-wrapped for the same reason as `GLOBAL_CALLBACK_CONFIG` (issue #605
 // review): every read clones the value out of the lock, and the struct carries
 // owned fields that would otherwise be deep-copied on every scanner tick for a
@@ -853,6 +861,9 @@ fn read_global_audit_export_config() -> Option<std::sync::Arc<AuditExportRuntime
 /// same reason as the callback installer: the config is a single process-wide
 /// static, so a second runtime built without a sink must not keep shipping
 /// audit records to the first runtime's destination.
+///
+/// That clear marks export as disabled (issue #1506). Each export tick then
+/// reports its shards as unobserved until a sink is configured again.
 pub fn install_global_audit_export_config_for_direct_worker(config: &AuditExportBuilderConfig) {
     let Some(sink) = config.sink.clone() else {
         if config.webhook_url.is_some() {
@@ -897,25 +908,37 @@ static EXPORT_DISABLED_AFTER_ENABLE: std::sync::atomic::AtomicBool =
 /// Replacing a `Some` with `None` marks export as disabled (issue #1506).
 /// The exporter then reports each shard as unobserved. Without this, the
 /// gauges keep their last value and the process looks healthy. Publishing a
-/// `Some` clears the mark. The mark changes under the write lock, so a tick
-/// never sees a config and a mark that disagree.
+/// `Some` clears the mark. The mark changes under the write lock. A tick reads
+/// the mark without the lock, so it can lag one tick behind. The next tick
+/// corrects it.
 pub fn set_global_audit_export_config(config: Option<std::sync::Arc<AuditExportRuntimeConfig>>) {
+    let mut lock = GLOBAL_AUDIT_EXPORT_CONFIG
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    apply_config_edge(&mut lock, &EXPORT_DISABLED_AFTER_ENABLE, config);
+}
+
+/// Store `config` in `slot` and update `disabled` for the edge.
+///
+/// Takes the flag as an argument so tests can use a private one.
+fn apply_config_edge(
+    slot: &mut Option<std::sync::Arc<AuditExportRuntimeConfig>>,
+    disabled: &std::sync::atomic::AtomicBool,
+    config: Option<std::sync::Arc<AuditExportRuntimeConfig>>,
+) {
     use std::sync::atomic::Ordering;
 
-    let Ok(mut lock) = GLOBAL_AUDIT_EXPORT_CONFIG.write() else {
-        return;
-    };
-    let was_configured = lock.is_some();
-    *lock = config;
-    if lock.is_some() {
-        EXPORT_DISABLED_AFTER_ENABLE.store(false, Ordering::SeqCst);
+    let was_configured = slot.is_some();
+    *slot = config;
+    if slot.is_some() {
+        disabled.store(false, Ordering::Relaxed);
     } else if was_configured {
-        EXPORT_DISABLED_AFTER_ENABLE.store(true, Ordering::SeqCst);
+        disabled.store(true, Ordering::Relaxed);
     }
 }
 
 fn export_disabled_after_enable() -> bool {
-    EXPORT_DISABLED_AFTER_ENABLE.load(std::sync::atomic::Ordering::SeqCst)
+    EXPORT_DISABLED_AFTER_ENABLE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Shards an unconfigured tick reports on.
@@ -940,7 +963,15 @@ fn report_export_disabled(
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
     shard: u16,
 ) {
-    if export_disabled_after_enable() {
+    report_if_disabled(export_disabled_after_enable(), metrics, shard);
+}
+
+fn report_if_disabled(
+    disabled: bool,
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
+    shard: u16,
+) {
+    if disabled {
         metrics.record_audit_export_observed(shard, false);
     }
 }
@@ -2428,8 +2459,9 @@ async fn emit_lag_and_observed(
 /// fan-out, because audit rows live on the shard whose database recorded
 /// them, and a single-connection scan would never see the others.
 ///
-/// A no-op (returns `Ok(0)` **before any query**) when no audit sink has been
-/// configured (AC8).
+/// Returns `Ok(0)` **before any query** when no audit sink is configured (AC8).
+/// It emits no metric, unless a sink was removed after it was enabled. Then it
+/// reports each shard unobserved (issue #1506).
 ///
 /// # Connection handling
 ///
@@ -2698,7 +2730,9 @@ async fn acquire_shard_conn_for_export(
 /// during the reacquire wait between the two, after an earlier fence check
 /// but before a stale `Advance` outcome commits.
 ///
-/// Returns `Ok(0)` before any query when no sink is configured (AC8).
+/// Returns `Ok(0)` before any query when no sink is configured (AC8). It
+/// reports the shard unobserved if a sink was removed after it was enabled
+/// (issue #1506).
 ///
 /// # Errors
 /// Returns `HarvestError` on a genuine database failure inside a claimed
@@ -4015,9 +4049,9 @@ mod tests {
     }
 
     // ── Disabled-after-enabled signal (issue #1506) ─────────────────────────
-
-    /// Serializes tests that touch the process-wide disable flag.
-    static DISABLE_FLAG_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    //
+    // These tests use a private slot and flag. Builder tests in this binary
+    // write the process-wide statics at the same time.
 
     #[derive(Default)]
     struct ObservedLog(std::sync::Mutex<Vec<(u16, bool)>>);
@@ -4038,80 +4072,74 @@ mod tests {
         })
     }
 
-    /// Resets the flag and the config on entry and on drop.
-    struct FlagGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
-
-    impl FlagGuard {
-        fn new() -> Self {
-            let guard = DISABLE_FLAG_SERIAL
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            Self::reset();
-            Self(guard)
-        }
-
-        fn reset() {
-            set_global_audit_export_config(Some(live_config()));
-            set_global_audit_export_config(None);
-            EXPORT_DISABLED_AFTER_ENABLE.store(false, std::sync::atomic::Ordering::SeqCst);
-        }
+    /// A private config slot and flag.
+    #[derive(Default)]
+    struct Edge {
+        slot: Option<std::sync::Arc<AuditExportRuntimeConfig>>,
+        disabled: std::sync::atomic::AtomicBool,
     }
 
-    impl Drop for FlagGuard {
-        fn drop(&mut self) {
-            Self::reset();
+    impl Edge {
+        fn set(&mut self, live: bool) {
+            apply_config_edge(&mut self.slot, &self.disabled, live.then(live_config));
         }
-    }
 
-    fn observed_after_report() -> Vec<(u16, bool)> {
-        let log = ObservedLog::default();
-        report_export_disabled(&log, 3);
-        log.0.lock().expect("log lock").clone()
+        fn report(&self, shard: u16, log: &ObservedLog) {
+            report_if_disabled(
+                self.disabled.load(std::sync::atomic::Ordering::Relaxed),
+                log,
+                shard,
+            );
+        }
+
+        fn observed(&self) -> Vec<(u16, bool)> {
+            let log = ObservedLog::default();
+            self.report(3, &log);
+            log.0.lock().expect("log lock").clone()
+        }
     }
 
     #[test]
     fn disabling_a_live_export_marks_the_shard_unobserved() {
-        let _g = FlagGuard::new();
-        set_global_audit_export_config(Some(live_config()));
-        set_global_audit_export_config(None);
-        assert_eq!(observed_after_report(), vec![(3, false)]);
+        let mut edge = Edge::default();
+        edge.set(true);
+        edge.set(false);
+        assert_eq!(edge.observed(), vec![(3, false)]);
     }
 
     #[test]
     fn a_never_configured_process_reports_nothing() {
-        let _g = FlagGuard::new();
-        set_global_audit_export_config(None);
-        assert!(observed_after_report().is_empty());
+        let mut edge = Edge::default();
+        edge.set(false);
+        assert!(edge.observed().is_empty());
     }
 
     #[test]
     fn reenabling_export_clears_the_signal() {
-        let _g = FlagGuard::new();
-        set_global_audit_export_config(Some(live_config()));
-        set_global_audit_export_config(None);
-        set_global_audit_export_config(Some(live_config()));
-        set_global_audit_export_config(None);
-        set_global_audit_export_config(Some(live_config()));
-        assert!(observed_after_report().is_empty());
+        let mut edge = Edge::default();
+        for live in [true, false, true] {
+            edge.set(live);
+        }
+        assert!(edge.observed().is_empty());
     }
 
     #[test]
     fn clearing_twice_keeps_the_signal() {
-        let _g = FlagGuard::new();
-        set_global_audit_export_config(Some(live_config()));
-        set_global_audit_export_config(None);
-        set_global_audit_export_config(None);
-        assert_eq!(observed_after_report(), vec![(3, false)]);
+        let mut edge = Edge::default();
+        for live in [true, false, false] {
+            edge.set(live);
+        }
+        assert_eq!(edge.observed(), vec![(3, false)]);
     }
 
     #[test]
     fn the_signal_repeats_on_every_tick() {
-        let _g = FlagGuard::new();
-        set_global_audit_export_config(Some(live_config()));
-        set_global_audit_export_config(None);
+        let mut edge = Edge::default();
+        edge.set(true);
+        edge.set(false);
         let log = ObservedLog::default();
-        report_export_disabled(&log, 1);
-        report_export_disabled(&log, 2);
+        edge.report(1, &log);
+        edge.report(2, &log);
         assert_eq!(
             *log.0.lock().expect("log lock"),
             vec![(1, false), (2, false)]

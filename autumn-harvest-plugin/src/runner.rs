@@ -666,6 +666,8 @@ fn prepare_audit_export_config(
 ///
 /// Deliberately the **last** thing `PreparedHarvestRuntime::build` does, after
 /// every fallible step has succeeded — see [`prepare_audit_export_config`].
+///
+/// Committing `None` over a live config marks export as disabled (issue #1506).
 fn commit_audit_export_config(
     config: Option<Arc<autumn_harvest::audit_export::AuditExportRuntimeConfig>>,
 ) {
