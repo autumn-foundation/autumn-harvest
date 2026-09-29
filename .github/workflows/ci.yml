@@ -339,6 +339,14 @@ jobs:
         # before step 3, so neither the code nor the note can regress
         # silently. See scripts/check-webhooks-feature-example.sh.
         run: ./scripts/check-webhooks-feature-example.sh
+      - name: Check chapter 5 and 6 flagship examples compile
+        # Guards two hard compile failures a clean-room pass found on the
+        # getting-started path: chapter 5 passed a workflow id to
+        # `spawn_child_workflow_raw` (E0061; the method takes name + input),
+        # and chapter 6's `charge_card` used `.map_err(|e| e.to_string())?`
+        # in a `HarvestResult` function (E0277; no `From<String>`).
+        # See scripts/check-child-idempotency-examples.sh.
+        run: ./scripts/check-child-idempotency-examples.sh
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Clippy autumn-harvest
