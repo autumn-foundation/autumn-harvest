@@ -555,13 +555,6 @@ jobs:
       - name: Folio audit-catalog coverage (docs/audits/audit-catalog-coverage.py)
         run: python3 docs/audits/audit-catalog-coverage.py
 
-      # Workflow YAML parse check (see docs/audits/workflow-yaml-parse.py).
-      # GitHub runs an unparsable workflow file as a zero-job failed run on
-      # every push and never fires its triggers. chaos.yml sat in that state
-      # from its first commit, so its nightly suite never ran.
-      - name: Workflow YAML parses (docs/audits/workflow-yaml-parse.py)
-        run: python3 docs/audits/workflow-yaml-parse.py
-
       # Quota-lock-ordering clone-class sync check (see
       # docs/audits/quota-lock-ordering-sync.py). An Echo duplication survey
       # (issue #1695) found debounce.rs's and throttle.rs's batch
@@ -640,6 +633,17 @@ jobs:
             "openapi-spec-validator==0.9.0"
           python3 -m openapi_spec_validator docs/openapi.json
           python3 -m openapi_spec_validator autumn-harvest-plugin/openapi.json
+
+      # Workflow YAML parse check (see docs/audits/workflow-yaml-parse.py).
+      # GitHub runs an unparsable workflow file as a zero-job failed run on
+      # every push and never fires its triggers. chaos.yml sat in that state
+      # from its first commit, so its nightly suite never ran. Runs after
+      # `setup-python` above, which is where PyYAML can be installed. The pin
+      # keeps a PyYAML release from reddening lint.
+      - name: Workflow YAML parses (docs/audits/workflow-yaml-parse.py)
+        run: |
+          python3 -m pip install --quiet --disable-pip-version-check "PyYAML==6.0.2"
+          python3 docs/audits/workflow-yaml-parse.py
 
       # The contract is what the OpenAPI document is generated from, so a
       # status or a mandatory field missing there is missing from every

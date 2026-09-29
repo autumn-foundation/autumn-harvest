@@ -29,8 +29,9 @@ for path in files:
         print(f"{path.relative_to(ROOT)}: {err}")
         bad += 1
         continue
-    if not isinstance(doc, dict) or "jobs" not in doc:
-        print(f"{path.relative_to(ROOT)}: no top-level `jobs` mapping")
+    jobs = doc.get("jobs") if isinstance(doc, dict) else None
+    if not isinstance(jobs, dict) or not jobs:
+        print(f"{path.relative_to(ROOT)}: `jobs` is not a non-empty mapping")
         bad += 1
 print(f"workflow-yaml-parse: {len(files)} files, {bad} unparsable")
 sys.exit(1 if bad else 0)
