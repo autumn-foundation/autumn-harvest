@@ -31,7 +31,12 @@ class UniqueKeyLoader(yaml.SafeLoader):
     def construct_mapping(self, node, deep=False):
         seen = set()
         for key_node, _ in node.value:
-            key = self.construct_object(key_node, deep=True)
+            # Compare the spelling, not the resolved value: YAML 1.1 turns
+            # both `on` and `true` into True, but GitHub keeps them distinct.
+            if isinstance(key_node, yaml.ScalarNode):
+                key = key_node.value
+            else:
+                key = repr(self.construct_object(key_node, deep=True))
             if key in seen:
                 raise yaml.constructor.ConstructorError(
                     None,
