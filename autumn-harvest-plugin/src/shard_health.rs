@@ -329,6 +329,30 @@ fn worker_polls_queue(worker: &WorkerRow, queue: &str) -> bool {
         .is_some_and(|qs| qs.iter().any(|v| v.as_str() == Some(queue)))
 }
 
+/// Whether the worker is healthy and active, so it can claim work now.
+fn worker_is_live(worker: &WorkerRow) -> bool {
+    worker.health == WorkerHealth::Healthy && worker.worker.status == WorkerStatus::Active.as_str()
+}
+
+/// Blocking reason for queues that no assigned worker polls.
+fn no_poller_reason(pending: i64, queues: &[&str]) -> String {
+    format!(
+        "{pending} claimable task(s) queued but no worker assigned to this shard polls \
+         queue(s) [{}]; start a worker or widen shard and queue coverage",
+        queues.join(", ")
+    )
+}
+
+/// Blocking reason for queues whose assigned pollers need restoring (issue #1463).
+fn restore_reason(pending: i64, queues: &[&str]) -> String {
+    format!(
+        "{pending} claimable task(s) queued, but the workers assigned to this shard for \
+         queue(s) [{}] are stale, unhealthy, draining, or stopped; restore, restart, or \
+         reactivate them",
+        queues.join(", ")
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn check_no_live_worker_gate(
     shard_id: i32,
@@ -374,8 +398,7 @@ fn check_no_live_worker_gate(
     let queue_covered = |queue: &str| {
         ws.iter().any(|w| {
             worker_assigned_to_shard(w, shard_id)
-                && w.health == WorkerHealth::Healthy
-                && w.worker.status == WorkerStatus::Active.as_str()
+                && worker_is_live(w)
                 && worker_polls_queue(w, queue)
         })
     };
@@ -398,25 +421,9 @@ fn check_no_live_worker_gate(
             .filter_map(|q| queue_depth.by_queue.get(*q))
             .sum()
     };
-    if !uncovered.is_empty() {
+    if !unpolled.is_empty() {
         push_reason_code(reason_codes, REASON_NO_LIVE_WORKER);
-        if !unpolled.is_empty() {
-            blocking_reasons.push(format!(
-                "{} claimable task(s) queued but no worker assigned to this shard polls \
-                 queue(s) [{}]; start a worker or widen shard and queue coverage",
-                pending_in(&unpolled),
-                unpolled.join(", ")
-            ));
-        }
-        if !unhealthy.is_empty() {
-            blocking_reasons.push(format!(
-                "{} claimable task(s) queued, but the workers assigned to this shard for \
-                 queue(s) [{}] are stale, unhealthy, draining, or stopped; restore, restart, or \
-                 reactivate them",
-                pending_in(&unhealthy),
-                unhealthy.join(", ")
-            ));
-        }
+        blocking_reasons.push(no_poller_reason(pending_in(&unpolled), &unpolled));
     }
 
     // Constraint-aware coverage (issue #522 review): a worker that polls the
@@ -430,15 +437,16 @@ fn check_no_live_worker_gate(
     // constraints are checked against the *same* worker so a task needing
     // several is not falsely covered by different workers each satisfying only
     // one. Skip queues no assigned worker polls, which already have a reason.
-    // A queue with only a stale or draining poller is different. That worker
-    // counts if it would satisfy the demand once restored. Otherwise restoring it
-    // cannot help, and the constraint blocker stays.
+    // When no live worker can claim a demand, look at the inactive assigned
+    // workers. If one would satisfy the demand once restored, report a liveness
+    // problem. Otherwise restoring cannot help, and the constraint blocker stays.
     let mut uncovered_constraints: Vec<String> = Vec::new();
+    let mut unhealthy_queues: Vec<&str> = unhealthy.clone();
+    let mut extra_restore_tasks: i64 = 0;
     for demand in &queue_depth.constraint_demands {
         if unpolled.contains(&demand.queue_name.as_str()) {
             continue;
         }
-        let restorable = unhealthy.contains(&demand.queue_name.as_str());
         // Parse the capability requirements once. `None` ⇒ no label constraint.
         // An unparseable value is treated as "no label constraint" so the gate
         // never fabricates a coverage failure from a value it cannot read.
@@ -446,11 +454,8 @@ fn check_no_live_worker_gate(
             .required_capabilities
             .as_ref()
             .and_then(|caps| serde_json::from_value(caps.clone()).ok());
-        let satisfied = ws.iter().any(|w| {
+        let can_claim = |w: &WorkerRow| {
             worker_assigned_to_shard(w, shard_id)
-                && (restorable
-                    || (w.health == WorkerHealth::Healthy
-                        && w.worker.status == WorkerStatus::Active.as_str()))
                 && worker_polls_queue(w, &demand.queue_name)
                 && demand
                     .sticky_owner
@@ -462,10 +467,28 @@ fn check_no_live_worker_gate(
                         autumn_harvest::payload_codec::string_valued_labels(&w.worker.labels);
                     autumn_harvest::eligibility::matches_requirements(reqs, &labels)
                 })
-        });
-        if !satisfied {
+        };
+        if ws.iter().any(|w| worker_is_live(w) && can_claim(w)) {
+            continue;
+        }
+        if ws.iter().any(can_claim) {
+            if !unhealthy.contains(&demand.queue_name.as_str()) {
+                if !unhealthy_queues.contains(&demand.queue_name.as_str()) {
+                    unhealthy_queues.push(demand.queue_name.as_str());
+                }
+                extra_restore_tasks += demand.count;
+            }
+        } else {
             uncovered_constraints.push(demand.queue_name.clone());
         }
+    }
+    if !unhealthy_queues.is_empty() {
+        unhealthy_queues.sort_unstable();
+        push_reason_code(reason_codes, REASON_NO_LIVE_WORKER);
+        blocking_reasons.push(restore_reason(
+            pending_in(&unhealthy) + extra_restore_tasks,
+            &unhealthy_queues,
+        ));
     }
     if !uncovered_constraints.is_empty() {
         uncovered_constraints.sort_unstable();
@@ -1602,6 +1625,40 @@ mod tests {
                 .iter()
                 .any(|r| r.contains("requirements queued on queue(s) [default]"))
         );
+    }
+
+    #[test]
+    fn no_live_worker_gate_advises_restore_when_only_a_stale_worker_is_eligible() {
+        // A live worker polls `default` but the sticky lease binds the row to the
+        // stale worker, so restoring that worker resolves the demand.
+        let mut live = worker_row_with_shard_assignments(&[0], &["default"]);
+        live.worker.worker_id = "live".to_string();
+        let mut stale = worker_row_with_shard_assignments(&[0], &["default"]);
+        stale.worker.worker_id = "stale".to_string();
+        stale.health = WorkerHealth::Stale;
+        let mut queue_depth = pending_queue_depth(4);
+        queue_depth.constraint_demands.push(ConstraintDemand {
+            queue_name: "default".to_string(),
+            required_capabilities: None,
+            required_build_id: None,
+            sticky_owner: Some("stale".to_string()),
+            count: 4,
+        });
+        let mut reason_codes = Vec::new();
+        let mut blocking_reasons = Vec::new();
+        check_no_live_worker_gate(
+            0,
+            &[ShardRole::Writable],
+            false,
+            &queue_depth,
+            &Ok(vec![live, stale]),
+            &empty_compat(),
+            &mut reason_codes,
+            &mut blocking_reasons,
+        );
+        assert_eq!(blocking_reasons.len(), 1, "{blocking_reasons:?}");
+        assert!(blocking_reasons[0].starts_with("4 claimable"));
+        assert!(blocking_reasons[0].contains("restore, restart, or reactivate"));
     }
 
     #[test]
