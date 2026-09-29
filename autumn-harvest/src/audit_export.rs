@@ -937,6 +937,7 @@ fn apply_config_edge(
     }
 }
 
+#[cfg(feature = "db")]
 fn export_disabled_after_enable() -> bool {
     EXPORT_DISABLED_AFTER_ENABLE.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -945,6 +946,7 @@ fn export_disabled_after_enable() -> bool {
 ///
 /// Mirrors the shard choice of [`fire_due_audit_exports`]: the assignments
 /// when a sharded pool has any, else the pool default (or `0` when unsharded).
+#[cfg(feature = "db")]
 fn disabled_tick_shards(
     pool_default: Option<i32>,
     assignments: &[crate::types::ShardId],
@@ -959,6 +961,7 @@ fn disabled_tick_shards(
 /// Mark one shard unobserved when export was disabled (issue #1506).
 ///
 /// Does nothing for a process that never had export configured.
+#[cfg(feature = "db")]
 fn report_export_disabled(
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
     shard: u16,
@@ -966,6 +969,7 @@ fn report_export_disabled(
     report_if_disabled(export_disabled_after_enable(), metrics, shard);
 }
 
+#[cfg(feature = "db")]
 fn report_if_disabled(
     disabled: bool,
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
@@ -4053,15 +4057,18 @@ mod tests {
     // These tests use a private slot and flag. Builder tests in this binary
     // write the process-wide statics at the same time.
 
+    #[cfg(feature = "db")]
     #[derive(Default)]
     struct ObservedLog(std::sync::Mutex<Vec<(u16, bool)>>);
 
+    #[cfg(feature = "db")]
     impl crate::telemetry::MetricsRecorder for ObservedLog {
         fn record_audit_export_observed(&self, shard: u16, observed: bool) {
             self.0.lock().expect("log lock").push((shard, observed));
         }
     }
 
+    #[cfg(feature = "db")]
     fn live_config() -> std::sync::Arc<AuditExportRuntimeConfig> {
         std::sync::Arc::new(AuditExportRuntimeConfig {
             sink: std::sync::Arc::new(NoopSink),
@@ -4073,12 +4080,14 @@ mod tests {
     }
 
     /// A private config slot and flag.
+    #[cfg(feature = "db")]
     #[derive(Default)]
     struct Edge {
         slot: Option<std::sync::Arc<AuditExportRuntimeConfig>>,
         disabled: std::sync::atomic::AtomicBool,
     }
 
+    #[cfg(feature = "db")]
     impl Edge {
         fn set(&mut self, live: bool) {
             apply_config_edge(&mut self.slot, &self.disabled, live.then(live_config));
@@ -4099,6 +4108,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "db")]
     #[test]
     fn disabling_a_live_export_marks_the_shard_unobserved() {
         let mut edge = Edge::default();
@@ -4107,6 +4117,7 @@ mod tests {
         assert_eq!(edge.observed(), vec![(3, false)]);
     }
 
+    #[cfg(feature = "db")]
     #[test]
     fn a_never_configured_process_reports_nothing() {
         let mut edge = Edge::default();
@@ -4114,6 +4125,7 @@ mod tests {
         assert!(edge.observed().is_empty());
     }
 
+    #[cfg(feature = "db")]
     #[test]
     fn reenabling_export_clears_the_signal() {
         let mut edge = Edge::default();
@@ -4123,6 +4135,7 @@ mod tests {
         assert!(edge.observed().is_empty());
     }
 
+    #[cfg(feature = "db")]
     #[test]
     fn clearing_twice_keeps_the_signal() {
         let mut edge = Edge::default();
@@ -4132,6 +4145,7 @@ mod tests {
         assert_eq!(edge.observed(), vec![(3, false)]);
     }
 
+    #[cfg(feature = "db")]
     #[test]
     fn the_signal_repeats_on_every_tick() {
         let mut edge = Edge::default();
@@ -4146,6 +4160,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "db")]
     #[test]
     fn disabled_ticks_report_assigned_shards_or_the_default() {
         use crate::types::ShardId;
