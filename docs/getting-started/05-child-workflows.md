@@ -37,7 +37,6 @@ async fn checkout(ctx: &WorkflowContext, order_id: String) -> HarvestResult<Stri
     let invoice_url = ctx
         .spawn_child_workflow_raw(
             "issue_invoice",
-            &format!("invoice-{order_id}"),
             serde_json::json!(order_id),
         )
         .await?;
