@@ -20,11 +20,34 @@ except ImportError:
     sys.exit(2)
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+
+
+class UniqueKeyLoader(yaml.SafeLoader):
+    """SafeLoader that rejects a repeated mapping key.
+
+    PyYAML keeps the last value silently. GitHub rejects the workflow.
+    """
+
+    def construct_mapping(self, node, deep=False):
+        seen = set()
+        for key_node, _ in node.value:
+            key = self.construct_object(key_node, deep=True)
+            if key in seen:
+                raise yaml.constructor.ConstructorError(
+                    None,
+                    None,
+                    f"duplicate mapping key {key!r}",
+                    key_node.start_mark,
+                )
+            seen.add(key)
+        return super().construct_mapping(node, deep)
+
+
 bad = 0
 files = sorted((ROOT / ".github" / "workflows").glob("*.y*ml"))
 for path in files:
     try:
-        doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+        doc = yaml.load(path.read_text(encoding="utf-8"), Loader=UniqueKeyLoader)
     except yaml.YAMLError as err:
         print(f"{path.relative_to(ROOT)}: {err}")
         bad += 1
