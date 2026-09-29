@@ -20,6 +20,7 @@ to wire into CI as a gate.
 | `audit-catalog-coverage.py` | Every `*.py` script in `docs/audits/` has a row in this table | Yes — `.github/workflows/ci.yml`, `lint` job |
 | `shard-weight-drift.py` | `test-db-linux` per-shard test-count weight, computed the way `run-suites.sh`'s own `row_ordinal % SEMAPHORE_SHARD_COUNT` actually assigns rows to shards; flags any shard carrying 2+ heavy suites | Yes — `.github/workflows/ci.yml`, `lint` job, **report-only** (always exits 0; see the script's own docstring for why it does not yet gate) |
 | `quota-lock-ordering-sync.py` | Five functions (`resolve_quota_lock_ids`, `order_rows_by_quota_lock_id`, `snapshot_quota_policies`, `order_due_rows_for_deadlock_free_firing`, `resolve_row_quota_lock_key`) stay byte-identical between `autumn-harvest/src/debounce.rs` and `autumn-harvest/src/throttle.rs`, modulo one normalized field name, and each scanner's `fire_due_on_conn` still calls the ordering wrapper before its firing loop — a clone class (issue #1230 Finding 2) an Echo duplication survey (issue #1695) found below the project's merge bar (2 instances, no missed-fix defect on record), linked instead of merged | Yes — `.github/workflows/ci.yml`, `lint` job |
+| `workflow-yaml-parse.py` | Every `.github/workflows/*.yml` parses as YAML and has a `jobs` mapping. GitHub runs an unparsable workflow as a zero-job failed run and never fires its triggers | Yes — `.github/workflows/ci.yml`, `lint` job |
 
 ## Comment hygiene: the two tiers
 
