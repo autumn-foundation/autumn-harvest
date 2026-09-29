@@ -1306,12 +1306,14 @@ jobs:
       # `postgres:16-alpine` (one outlier suite's override), and `redis:5.0`
       # (Redis's default, un-overridden anywhere; needed by the issue #1312
       # dispatch suites this job also forces via HARVEST_TEST_REQUIRE_REDIS
-      # below).
+      # below), and `softwaremill/elasticmq:1.5.2` (the `connector_sqs_broker`
+      # suite's ElasticMQ default, which "bytes remaining on stream" failed on
+      # PR #1773 because it was the one image not pre-pulled).
       - name: Pre-pull Docker test images (retry transient pull failures)
         if: needs.changes.outputs.code == 'true'
         shell: bash
         run: |
-          for image in postgres:11-alpine postgres:16 postgres:16-alpine redis:5.0; do
+          for image in postgres:11-alpine postgres:16 postgres:16-alpine redis:5.0 softwaremill/elasticmq:1.5.2; do
             for attempt in 1 2 3 4 5; do
               if docker pull "$image"; then
                 continue 2
