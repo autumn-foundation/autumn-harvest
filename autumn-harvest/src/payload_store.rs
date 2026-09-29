@@ -26,6 +26,18 @@
 //! the inverse on read (fetch-then-decode). The offload envelope is keyed on a
 //! distinct `_harvest_offload_envelope` discriminator so it never collides with
 //! the codec's `_harvest_codec_envelope`.
+//!
+//! ## Business data that looks like a reference (issue #1758)
+//!
+//! A reference is recognised by its discriminator. Business data can carry the
+//! same key. To keep the two apart, the write path offloads any fresh field that
+//! carries the discriminator, even when the field is small. A field written
+//! through the offloader therefore never stores a bare look-alike. The stored
+//! shape does not change, so an older binary still reads every new row.
+//!
+//! Some writers do not use the offloader, for example the workflow start input.
+//! A rolling deploy and a node without a store also skip it. A look-alike written
+//! that way, or before this fix, still fails on read.
 
 use std::sync::Arc;
 
@@ -186,9 +198,11 @@ impl PayloadOffloader {
     ///
     /// Operates on the **already codec-encoded** event value, so offload
     /// composes after [`PayloadCodec::encode`](crate::payload_codec::PayloadCodec::encode).
-    /// Fields that are already offload envelopes (carry-forward / idempotent
-    /// re-persist) are left untouched. Returns the set of blobs created so the
-    /// caller can record per-execution references.
+    /// Input is always a fresh value, never a stored row. A field that carries
+    /// [`OFFLOAD_ENVELOPE_KEY`] is business data that looks like a reference
+    /// (issue #1758). It is offloaded whatever its size, so this path never
+    /// stores a bare look-alike. Returns the set of blobs created so the caller
+    /// can record per-execution references.
     ///
     /// # Errors
     ///
@@ -203,11 +217,13 @@ impl PayloadOffloader {
             let Some(field) = data.get_mut(key) else {
                 continue;
             };
-            if field.is_null() || is_offload_envelope(field) {
+            if field.is_null() {
                 continue;
             }
             let bytes = serde_json::to_vec(field)?;
-            if bytes.len() as u64 <= self.threshold {
+            // A fresh value that carries the discriminator is business data.
+            // Store it as a blob so no bare look-alike reaches the log.
+            if !is_offload_envelope(field) && bytes.len() as u64 <= self.threshold {
                 continue;
             }
             let byte_len = bytes.len() as u64;
@@ -495,18 +511,121 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn already_offloaded_field_is_not_reuploaded() {
+    /// Business data that carries the discriminator is stored as a real blob.
+    /// Issue #1758.
+    async fn assert_look_alike_round_trips(threshold: u64, original: Value) {
         let store = MemStore::new();
-        let off = offloader(store.clone(), 16);
-        let mut event = event_with_output(serde_json::json!({ "blob": "y".repeat(5_000) }));
-        off.offload_event_value(&mut event).await.unwrap();
-        assert_eq!(store.puts.load(Ordering::SeqCst), 1);
-        // Re-running offload on an already-enveloped value must not re-upload
-        // (carry-forward / idempotent re-persist).
+        let off = offloader(store.clone(), threshold);
+        let mut event = event_with_output(original.clone());
+
         let refs = off.offload_event_value(&mut event).await.unwrap();
-        assert!(refs.is_empty());
-        assert_eq!(store.puts.load(Ordering::SeqCst), 1, "no second put");
+        assert_eq!(refs.len(), 1, "look-alike is escaped into a blob");
+        assert_eq!(refs[0].store_id, "mem");
+        assert_ne!(
+            event["data"]["output"], original,
+            "no bare look-alike stored"
+        );
+        assert_eq!(
+            extract_offload_ref(&event["data"]["output"]).unwrap(),
+            refs[0]
+        );
+
+        off.inflate_event_value(&mut event).await.unwrap();
+        assert_eq!(event["data"]["output"], original, "100% byte fidelity");
+    }
+
+    #[tokio::test]
+    async fn business_data_shaped_like_offload_envelope_round_trips() {
+        // The exact value from issue #1758, far below the threshold.
+        assert_look_alike_round_trips(
+            1_000_000,
+            serde_json::json!({
+                "_harvest_offload_envelope": 1,
+                "store_id": "s3-prod",
+                "key": "customer-42/invoice.pdf",
+                "len": 1234,
+                "checksum": "abc123",
+            }),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn discriminator_only_business_data_round_trips() {
+        assert_look_alike_round_trips(
+            1_000_000,
+            serde_json::json!({ "_harvest_offload_envelope": 1 }),
+        )
+        .await;
+        assert_look_alike_round_trips(
+            1_000_000,
+            serde_json::json!({ "_harvest_offload_envelope": 1, "note": "malformed" }),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn oversized_look_alike_is_still_offloaded() {
+        assert_look_alike_round_trips(
+            16,
+            serde_json::json!({ "_harvest_offload_envelope": 1, "pad": "x".repeat(5_000) }),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn non_one_discriminator_stays_inline() {
+        for marker in [
+            serde_json::json!("yes"),
+            serde_json::json!("1"),
+            serde_json::json!(2),
+            serde_json::json!(1.0),
+        ] {
+            let store = MemStore::new();
+            let off = offloader(store.clone(), 1_000_000);
+            let original = serde_json::json!({ "_harvest_offload_envelope": marker });
+            let mut event = event_with_output(original.clone());
+            assert!(
+                off.offload_event_value(&mut event)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(event["data"]["output"], original);
+        }
+    }
+
+    #[tokio::test]
+    async fn look_alike_in_every_payload_field_round_trips() {
+        let store = MemStore::new();
+        let off = offloader(store.clone(), 1_000_000);
+        let look_alike = serde_json::json!({ "_harvest_offload_envelope": 1 });
+        let mut data = serde_json::Map::new();
+        for key in PAYLOAD_FIELD_KEYS {
+            data.insert(key.to_string(), look_alike.clone());
+        }
+        let mut event = serde_json::json!({ "type": "T", "data": data });
+        let refs = off.offload_event_value(&mut event).await.unwrap();
+        assert_eq!(refs.len(), PAYLOAD_FIELD_KEYS.len());
+        off.inflate_event_value(&mut event).await.unwrap();
+        for key in PAYLOAD_FIELD_KEYS {
+            assert_eq!(event["data"][key], look_alike, "field {key}");
+        }
+    }
+
+    #[tokio::test]
+    async fn escaped_look_alike_is_not_reescaped_after_inflate() {
+        let store = MemStore::new();
+        let off = offloader(store.clone(), 1_000_000);
+        let mut event = event_with_output(serde_json::json!({ "_harvest_offload_envelope": 1 }));
+        off.offload_event_value(&mut event).await.unwrap();
+        off.inflate_event_value(&mut event).await.unwrap();
+        // Inflate must stop after one level, not chase the restored look-alike.
+        assert_eq!(
+            event["data"]["output"],
+            serde_json::json!({ "_harvest_offload_envelope": 1 })
+        );
+        assert_eq!(store.gets.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
