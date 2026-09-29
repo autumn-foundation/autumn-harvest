@@ -1886,8 +1886,9 @@ standalone note rather than part of the claim-path attribution table above:
   `resolve_target_queues_batch` (`lookup_calls` n → 1 at every swept size).
 * [`docs/performance-completion-callback-outcome-batch.md`](performance-completion-callback-outcome-batch.md)
   — the completion-callback scanner's per-row `apply_outcome` UPDATE in
-  `completion_callback::fire_due_on_conn`, batched so a tick resolving N
-  rows issues one outcome write, not N (statement calls 100 → 2, PR #1748).
+  `completion_callback::fire_due_on_conn`, batched into one write per outcome
+  class (`Delivered`, `Backoff`), not one per row (statement calls 100 → 2 on
+  the measured mixed tick, PR #1748).
 * [`docs/performance-critical-path.md`](performance-critical-path.md) — a
   redundant second edge-set traversal in
   `critical_path::CriticalPathAnalyzer::analyze`'s sink detection, folded
