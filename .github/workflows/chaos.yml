@@ -54,14 +54,10 @@ jobs:
         # scripted-cap validation, and seeded determinism — are no-DB lib tests.
         # Run them here (fast, no container) so a regression in the harness
         # *itself* is caught, not merely compiled by the always-on lint job.
-        run: >-
-          cargo test -p autumn-harvest --features chaos --lib
-          "chaos::" -- --test-threads=1
+        run: 'cargo test -p autumn-harvest --features chaos --lib chaos:: -- --test-threads=1'
       - name: Run chaos reproducers + seeded convergence sweep
         # `--test-threads=1`: the harness serialises armed plans on a process-wide
         # mutex anyway, and each test spins its own Postgres container — running
         # serially keeps container resource use bounded. The suite is scoped to the
         # `chaos_tests` module so only the fault-injection tests run under `chaos`.
-        run: >-
-          cargo test -p autumn-harvest --features chaos --test integration
-          "chaos_tests::" -- --nocapture --test-threads=1
+        run: 'cargo test -p autumn-harvest --features chaos --test integration chaos_tests:: -- --nocapture --test-threads=1'
