@@ -134,14 +134,14 @@ impl HarvestStartupConfig {
     pub fn with_operator_overrides(mut self, env: &dyn Env) -> Result<Self, ConfigError> {
         for path in operator_config_paths(env) {
             if let Some(startup) = load_startup_section(&path)? {
-                self.apply_partial(&startup);
+                self.apply_partial(startup);
             }
         }
         self.apply_env_overrides(env)?;
         Ok(self)
     }
 
-    const fn apply_partial(&mut self, partial: &PartialHarvestStartupConfig) {
+    const fn apply_partial(&mut self, partial: PartialHarvestStartupConfig) {
         if let Some(orphaned_workflows) = partial.orphaned_workflows {
             self.orphaned_workflows = orphaned_workflows;
         }
@@ -241,7 +241,7 @@ impl HarvestRuntimeConfig {
         if let Some(require_shard_readiness) = partial.readiness.require_shard_readiness {
             self.readiness.require_shard_readiness = require_shard_readiness;
         }
-        self.startup.apply_partial(&partial.startup);
+        self.startup.apply_partial(partial.startup);
         if let Some(url) = partial.redis.url {
             self.redis.url = Some(url);
         }

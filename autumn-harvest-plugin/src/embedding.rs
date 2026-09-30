@@ -180,11 +180,17 @@ impl HarvestEmbedding {
     /// value of the failed start. An API state from [`Self::with_api_state`]
     /// can keep the posture settings of a failed start. It holds no runtime,
     /// so its routes answer 503.
-    pub async fn start(self) -> autumn_web::AutumnResult<HarvestEmbeddingRuntime> {
-        // Read the environment before the first await. `&dyn Env` is not
-        // `Sync`, so holding it would make this future not `Send`.
-        let operator = OperatorInputs::read(self.config.startup, &OsEnv)?;
-        self.start_with(operator).await
+    pub fn start(
+        self,
+    ) -> impl Future<Output = autumn_web::AutumnResult<HarvestEmbeddingRuntime>> + Send {
+        // The startup future is large, so it lives on the heap. A caller's own
+        // future then stays small (`clippy::large_futures`).
+        Box::pin(async move {
+            // Read the environment before the first await. `&dyn Env` is not
+            // `Sync`, so holding it would make this future not `Send`.
+            let operator = OperatorInputs::read(self.config.startup, &OsEnv)?;
+            self.start_with(operator).await
+        })
     }
 
     async fn start_with(
