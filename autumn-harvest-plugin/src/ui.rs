@@ -8965,6 +8965,26 @@ const fn schedule_is_resumable(row: &HarvestSchedule) -> bool {
     row.is_paused || row.auto_paused_at.is_some()
 }
 
+/// Whether the scheduler hashes jitter against the row's own `next_run_at`.
+///
+/// Two cases break this (issue #1568). A calendar can rebase the slot to a
+/// business day first. The `MostRecent` and `Window` catchup policies can pick
+/// a later slot first. The row alone cannot show either result.
+/// `SkipAll` and `Unbounded` both fire `next_run_at` first.
+fn scheduler_slot_is_raw(row: &HarvestSchedule) -> bool {
+    use autumn_harvest::policy::CatchupPolicy;
+
+    row.calendar_name.is_none()
+        && matches!(
+            CatchupPolicy::from_db(
+                row.catchup_policy.as_deref(),
+                row.catchup_window_secs,
+                row.catchup,
+            ),
+            CatchupPolicy::SkipAll | CatchupPolicy::Unbounded
+        )
+}
+
 /// Whether a schedule has run out of budget or passed its cutoff, whether or
 /// not a scheduler tick has got round to stamping `exhausted_at`.
 ///
@@ -8990,6 +9010,10 @@ const fn schedule_is_resumable(row: &HarvestSchedule) -> bool {
 /// is at or past `end_at`. It rejects the fire even when the raw slot is
 /// still before `end_at`. Reading the raw slot here would call such a row
 /// healthy until a tick happens to stamp `exhausted_at`.
+///
+/// When [`scheduler_slot_is_raw`] is false, this check judges the raw slot
+/// instead (issue #1568). A raw slot before `end_at` is then never reported
+/// as exhausted, even if the scheduler later stops it.
 fn schedule_is_bounded_out(row: &HarvestSchedule, now: DateTime<Utc>) -> bool {
     if row.exhausted_at.is_some() {
         return true;
@@ -9011,8 +9035,11 @@ fn schedule_is_bounded_out(row: &HarvestSchedule, now: DateTime<Utc>) -> bool {
     // there is no pending slot to judge.
     //
     // `effective_fire_time` returns `None` for `jitter_secs <= 0`, so an
-    // unjittered schedule falls back to the raw slot below.
-    let pending = crate::api::effective_fire_time(row.id, row.next_run_at, row.jitter_secs)
+    // unjittered schedule falls back to the raw slot below. It also falls back
+    // to the raw slot when the scheduler may hash a different slot (#1568).
+    let pending = scheduler_slot_is_raw(row)
+        .then(|| crate::api::effective_fire_time(row.id, row.next_run_at, row.jitter_secs))
+        .flatten()
         .or(row.next_run_at);
     row.end_at
         .is_some_and(|end_at| pending.map_or(now >= end_at, |t| t >= end_at))
@@ -19760,6 +19787,95 @@ mod tests {
             ..make_schedule(Some("plain_wf"), None, false)
         };
         assert!(!schedule_is_bounded_out(&unjittered, now));
+    }
+
+    // -- issue #1568 regression --
+
+    /// Build a jittered row whose raw slot is before `end_at` but whose
+    /// jitter-adjusted fire time is not. Only the raw slot is legal for a
+    /// caller that cannot see the scheduler's real candidate slot.
+    fn jitter_past_cutoff_row() -> HarvestSchedule {
+        let id = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000001568")
+            .expect("valid fixture uuid");
+        let next_run_at = chrono::DateTime::parse_from_rfc3339("2026-09-01T12:00:00Z")
+            .expect("valid fixture timestamp")
+            .with_timezone(&chrono::Utc);
+        let jitter_secs = 300i64;
+        let effective = crate::api::effective_fire_time(id, Some(next_run_at), jitter_secs)
+            .expect("jittered schedule has an effective fire time");
+        assert!(effective > next_run_at, "fixture needs a non-zero offset");
+        HarvestSchedule {
+            id,
+            next_run_at: Some(next_run_at),
+            jitter_secs,
+            end_at: Some(effective),
+            ..make_schedule(Some("jitter_cutoff_wf"), None, false)
+        }
+    }
+
+    /// A calendar can rebase the slot before jitter. The row cannot show the
+    /// rebased slot, so the check must judge the raw slot only.
+    #[test]
+    fn end_at_exhaustion_ignores_jitter_when_calendar_is_set() {
+        let now = chrono::Utc::now();
+        let row = HarvestSchedule {
+            calendar_name: Some("us_holidays".to_string()),
+            ..jitter_past_cutoff_row()
+        };
+        assert!(
+            !schedule_is_bounded_out(&row, now),
+            "an unknown rebased slot must not be reported as exhausted"
+        );
+
+        let raw_past_cutoff = HarvestSchedule {
+            end_at: row.next_run_at,
+            ..row
+        };
+        assert!(
+            schedule_is_bounded_out(&raw_past_cutoff, now),
+            "a raw slot at or past end_at is still exhausted"
+        );
+    }
+
+    /// `MostRecent` and `Window` can pick a later slot than `next_run_at`.
+    #[test]
+    fn end_at_exhaustion_ignores_jitter_for_slot_selecting_catchup() {
+        let now = chrono::Utc::now();
+        for (policy, window_secs) in [("most_recent", None), ("window", Some(3600))] {
+            let row = HarvestSchedule {
+                catchup: true,
+                catchup_policy: Some(policy.to_string()),
+                catchup_window_secs: window_secs,
+                ..jitter_past_cutoff_row()
+            };
+            assert!(
+                !schedule_is_bounded_out(&row, now),
+                "{policy}: the selected slot is unknown, so judge the raw slot"
+            );
+        }
+    }
+
+    /// `SkipAll`, `Unbounded` and no policy all fire `next_run_at` first. They
+    /// keep the jitter-adjusted judgement from issue #1293.
+    #[test]
+    fn end_at_exhaustion_keeps_jitter_for_first_slot_catchup() {
+        let now = chrono::Utc::now();
+        for (policy, catchup) in [
+            (Some("skip_all"), false),
+            (Some("unbounded"), true),
+            (None, false),
+            (None, true),
+        ] {
+            let row = HarvestSchedule {
+                catchup,
+                catchup_policy: policy.map(str::to_string),
+                ..jitter_past_cutoff_row()
+            };
+            assert!(
+                schedule_is_bounded_out(&row, now),
+                "{policy:?}/{catchup}: the first slot is exact, so jitter applies"
+            );
+        }
     }
 
     /// A jittered schedule with no pending slot still falls back to the wall
