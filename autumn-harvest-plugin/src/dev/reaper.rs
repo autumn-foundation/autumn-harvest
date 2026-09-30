@@ -116,7 +116,7 @@ fn harden_root(root: &Path) -> Result<(), DevError> {
 /// It is not sound where the ACL is separate from the mode. Those are the
 /// macOS and BSD native ACLs and `NFSv4` ACLs. `stat` does not show them. The
 /// docs of `directory_is_private` in `acquire.rs` record this limit.
-#[cfg(unix)]
+#[cfg(all(unix, any(test, feature = "dev-runtime-managed")))]
 pub(super) const fn others_can_write(mode: u32) -> bool {
     mode & 0o022 != 0
 }
