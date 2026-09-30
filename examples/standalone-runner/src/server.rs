@@ -9,9 +9,10 @@ use serde_json::json;
 
 use crate::runtime::{standalone_builder, standalone_runtime_config};
 
-/// Assemble the raw Axum app the runner listens on: the runner health route,
-/// a Prometheus scrape route fed by `metrics`, and the `harvest` router
-/// nested under `/api/harvest`.
+/// Assemble the raw Axum app the runner listens on.
+///
+/// It holds the runner health route and a Prometheus scrape route fed by
+/// `metrics`. It nests the `harvest` router under `/api/harvest`.
 ///
 /// Split out of [`run`] so a test can drive it with `tower::ServiceExt::oneshot`
 /// without a database (see `tests.rs`).

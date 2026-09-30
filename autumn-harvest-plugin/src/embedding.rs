@@ -135,9 +135,14 @@ impl HarvestEmbedding {
     ///
     /// # Errors
     ///
-    /// Returns an error when the operator startup config is invalid, when a
-    /// shard has no notification URL, when the orphan gate refuses boot, or
-    /// when [`HarvestRunner::start`] fails. Nothing is left running then.
+    /// Returns an error in these cases:
+    ///
+    /// - The operator startup config is invalid.
+    /// - A shard has no notification URL.
+    /// - The orphan gate refuses boot.
+    /// - [`HarvestRunner::start`] fails.
+    ///
+    /// The admission globals are then restored to their previous values.
     pub async fn start(self) -> autumn_web::AutumnResult<HarvestEmbeddingRuntime> {
         self.start_with_env(&OsEnv).await
     }
