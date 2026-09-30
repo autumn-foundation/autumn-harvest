@@ -30,15 +30,18 @@ use std::sync::Arc;
 
 use autumn_harvest::BuiltHarvest;
 use autumn_harvest::types::ShardId;
-use autumn_web::config::{Env, OsEnv};
+use autumn_web::config::{Env, OsEnv, normalize_profile_name};
 use autumn_web::error::AutumnError;
 use autumn_web::reexports::axum::Router;
 
 use crate::api::{HarvestApiState, StandaloneAdminAuth, harvest_api_router};
 use crate::boot::{self, AdmissionGlobalsGuard, GateRefreshRuntime};
-use crate::config::HarvestRuntimeConfig;
+use crate::config::{HarvestRuntimeConfig, HarvestStartupConfig, OrphanStartupAction};
 use crate::runner::{HarvestRunner, HarvestRunnerResources, run_startup_orphan_gate};
 use crate::ui::harvest_ui_router;
+
+/// The profile a new `HarvestApiState` reports until one is declared.
+const UNDECLARED_PROFILE: &str = "unknown";
 
 /// The inputs of a standalone Harvest runtime, before it starts.
 ///
@@ -52,6 +55,7 @@ pub struct HarvestEmbedding {
     admin_auth: StandaloneAdminAuth,
     api_state: HarvestApiState,
     mount_ui: bool,
+    ambient_profile: bool,
     notification_urls: BTreeMap<ShardId, String>,
 }
 
@@ -61,6 +65,11 @@ impl HarvestEmbedding {
     /// `config.startup` is the code default. The operator config file and
     /// the `AUTUMN_HARVEST_STARTUP__*` variables override it at start. See
     /// [`crate::config::HarvestStartupConfig::with_operator_overrides`].
+    ///
+    /// Some steps belong to the plugin only, because they need an autumn-web
+    /// `AppState`. This entry point does not run the outbox relay, the broker
+    /// connectors, the webhook delivery workflow or the MCP tool routes.
+    /// [`Self::start`] logs a warning when `config.outbox.enabled` is set.
     #[must_use]
     pub fn new(
         built: BuiltHarvest,
@@ -74,15 +83,16 @@ impl HarvestEmbedding {
             admin_auth: StandaloneAdminAuth::new(),
             api_state: HarvestApiState::new(),
             mount_ui: true,
+            ambient_profile: false,
             notification_urls: BTreeMap::new(),
         }
     }
 
     /// Declare the admin credential and the deployment posture.
     ///
-    /// When `auth` declares no deployment profile, [`Self::start`] reads it
-    /// from `AUTUMN_PROFILE` or `--profile`, as the config loader does. With
-    /// neither, the profile stays `unknown` and the admin API fails closed.
+    /// With no declared profile, the profile stays `unknown` and the admin
+    /// API fails closed. See [`Self::with_ambient_profile`] to read it from
+    /// the environment instead.
     #[must_use]
     pub fn with_admin_auth(mut self, auth: StandaloneAdminAuth) -> Self {
         self.admin_auth = auth;
@@ -94,9 +104,28 @@ impl HarvestEmbedding {
     /// Use this to apply a setting that has no builder input, for example
     /// [`HarvestApiState::set_actor_extractor`]. Do not install a runtime or
     /// a storage pool on it. [`Self::start`] installs both.
+    ///
+    /// Declare the auth boundary through [`Self::with_admin_auth`], not on the
+    /// state. [`Self::start`] sets the boundary from that declaration. A
+    /// profile already set on the state is kept.
     #[must_use]
     pub fn with_api_state(mut self, api_state: HarvestApiState) -> Self {
         self.api_state = api_state;
+        self
+    }
+
+    /// Read the deployment profile from the environment.
+    ///
+    /// [`Self::start`] reads `AUTUMN_ENV`, then `AUTUMN_PROFILE`, as autumn-web
+    /// does. It does not read the command line. A profile that
+    /// [`Self::with_admin_auth`] declares, or that the API state already
+    /// holds, always wins.
+    ///
+    /// This is an opt-in because the `dev` profile opens the admin API to a
+    /// caller with no credential. A stray variable must not do that silently.
+    #[must_use]
+    pub const fn with_ambient_profile(mut self) -> Self {
+        self.ambient_profile = true;
         self
     }
 
@@ -111,8 +140,11 @@ impl HarvestEmbedding {
     /// shard.
     ///
     /// A single-shard embedding can omit this. It then uses
-    /// `config.database.url` for the default shard. A multi-shard embedding
-    /// must name every shard in its pool, or [`Self::start`] refuses.
+    /// `config.database.url` for the default shard. Explicit URLs replace
+    /// `config.database.url` for every shard, the default shard too. A
+    /// multi-shard embedding must name every shard in its pool, or
+    /// [`Self::start`] refuses. The `embedded` mode does not read the
+    /// autumn-web `[database] url`, so set `config.database.url` or call this.
     #[must_use]
     pub fn with_notification_database_urls<I, S>(mut self, urls: I) -> Self
     where
@@ -142,14 +174,22 @@ impl HarvestEmbedding {
     /// - The orphan gate refuses boot.
     /// - [`HarvestRunner::start`] fails.
     ///
-    /// The admission globals are then restored to their previous values.
+    /// The first three cases publish no admission global and change no other
+    /// process global. In the last case, the admission globals are restored
+    /// to their previous values. The start-idempotency purge window keeps the
+    /// value of the failed start. An API state from [`Self::with_api_state`]
+    /// can keep the posture settings of a failed start. It holds no runtime,
+    /// so its routes answer 503.
     pub async fn start(self) -> autumn_web::AutumnResult<HarvestEmbeddingRuntime> {
-        self.start_with_env(&OsEnv).await
+        // Read the environment before the first await. `&dyn Env` is not
+        // `Sync`, so holding it would make this future not `Send`.
+        let operator = OperatorInputs::read(self.config.startup, &OsEnv)?;
+        self.start_with(operator).await
     }
 
-    async fn start_with_env(
+    async fn start_with(
         self,
-        env: &dyn Env,
+        operator: OperatorInputs,
     ) -> autumn_web::AutumnResult<HarvestEmbeddingRuntime> {
         let Self {
             mut built,
@@ -158,13 +198,19 @@ impl HarvestEmbedding {
             admin_auth,
             api_state,
             mount_ui,
+            ambient_profile,
             notification_urls,
         } = self;
 
-        config.startup = config
-            .startup
-            .with_operator_overrides(env)
-            .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
+        warn_if_operator_weakens_the_orphan_gate(config.startup, operator.startup);
+        config.startup = operator.startup;
+        if config.outbox.enabled {
+            tracing::warn!(
+                "HarvestEmbedding does not run the workflow-start outbox relay. The relay needs \
+                 an autumn-web AppState, so only HarvestPlugin runs it. Set \
+                 config.outbox.enabled = false to silence this warning."
+            );
+        }
 
         // Check the URL coverage first, so that a refusal spawns nothing.
         let (default_shard, default_pool) = resources.default_shard_pool(&built);
@@ -181,17 +227,21 @@ impl HarvestEmbedding {
         }
 
         let router = mount_router(&api_state, &admin_auth, mount_ui);
-        apply_ambient_profile(&api_state, &admin_auth, env);
+        if ambient_profile {
+            apply_ambient_profile(&api_state, &admin_auth, operator.profile.as_deref());
+        }
         warn_if_dev_admin_api_is_open(&api_state);
         // Reject a start that arrives before the boot gate load completes.
         api_state.arm_gate_cache_fail_closed();
         api_state.set_health_requires_shard_readiness(config.readiness.require_shard_readiness);
         api_state.set_workflow_result_notification_database_urls(urls);
         api_state.set_payload_codecs(built.payload_codecs().clone());
-        boot::mirror_built_config(&api_state, &mut built);
 
         boot::load_boot_admission_gates(&api_state, &default_pool).await;
         run_startup_orphan_gate(config.startup.orphaned_workflows, &built, &resources).await?;
+        // The mirror sets a process global, so it runs after the last refusal
+        // that needs no rollback.
+        boot::mirror_built_config(&api_state, &mut built);
 
         let mut admission_guard = AdmissionGlobalsGuard::publish_gate_cache(api_state.gate_cache());
         admission_guard.publish_metrics(Arc::clone(&built.telemetry().metrics));
@@ -217,10 +267,19 @@ impl HarvestEmbedding {
     }
 }
 
+/// How many times any Harvest runtime in this process has published its
+/// admission gate cache. For tests only.
+#[doc(hidden)]
+#[must_use]
+pub fn __admission_gate_cache_publish_count() -> u64 {
+    boot::gate_cache_publish_count()
+}
+
 /// A running standalone Harvest runtime.
 ///
 /// Call [`Self::stop`] when the server stops. A dropped runtime keeps its
 /// background tasks and its process globals.
+#[must_use = "call `stop()` on shutdown, or the background tasks and process globals remain"]
 pub struct HarvestEmbeddingRuntime {
     runner: HarvestRunner,
     api_state: HarvestApiState,
@@ -234,7 +293,11 @@ impl HarvestEmbeddingRuntime {
     /// Nest it under a path of your choice. Apply your own auth middleware
     /// outside it, so that the layer order is: your auth, the token layer,
     /// the read-only-role layer, the admin guard.
-    #[must_use]
+    ///
+    /// The router holds the Vantage dashboard unless
+    /// [`HarvestEmbedding::without_ui`] was called. The admin guard covers
+    /// only the admin routes. The other routes, for example a workflow start
+    /// or a cancel, need your own auth layer, as on the plugin path.
     pub fn router(&self) -> Router<()> {
         self.router.clone()
     }
@@ -282,16 +345,54 @@ fn mount_router(
     admin_auth.mount(router, api_state)
 }
 
-/// Set the profile from `AUTUMN_PROFILE` or `--profile` when `admin_auth`
-/// declares none. A declared profile always wins.
+/// The operator inputs [`HarvestEmbedding::start`] reads from the
+/// environment and the config files.
+struct OperatorInputs {
+    /// The code startup config with the operator overrides applied.
+    startup: HarvestStartupConfig,
+    /// The profile from the environment, if any.
+    profile: Option<String>,
+}
+
+impl OperatorInputs {
+    fn read(code_startup: HarvestStartupConfig, env: &dyn Env) -> autumn_web::AutumnResult<Self> {
+        let startup = code_startup
+            .with_operator_overrides(env)
+            .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
+        Ok(Self {
+            startup,
+            profile: ambient_profile(env),
+        })
+    }
+}
+
+/// The profile from `AUTUMN_ENV`, else `AUTUMN_PROFILE`, as autumn-web
+/// resolves it.
+///
+/// The command line is not read, because the host program can own a
+/// `--profile` flag of its own.
+fn ambient_profile(env: &dyn Env) -> Option<String> {
+    ["AUTUMN_ENV", "AUTUMN_PROFILE"]
+        .into_iter()
+        .filter_map(|key| env.var(key).ok())
+        .find_map(|value| normalize_profile_name(&value))
+}
+
+/// Set `profile` on `api_state` unless a profile is already declared.
+///
+/// A profile that `admin_auth` declares wins. A profile already set on
+/// `api_state` also wins.
 fn apply_ambient_profile(
     api_state: &HarvestApiState,
     admin_auth: &StandaloneAdminAuth,
-    env: &dyn Env,
+    profile: Option<&str>,
 ) {
-    if admin_auth.declared_deployment_profile().is_none()
-        && let Some(profile) = crate::config::resolve_profile(env)
+    if admin_auth.declared_deployment_profile().is_some()
+        || api_state.deployment_profile() != UNDECLARED_PROFILE
     {
+        return;
+    }
+    if let Some(profile) = profile {
         api_state.set_deployment_profile(profile);
     }
 }
@@ -303,13 +404,39 @@ fn warn_if_dev_admin_api_is_open(api_state: &HarvestApiState) {
         api_state.admin_auth_boundary(),
     ) {
         tracing::warn!(
-            "AUTUMN_PROFILE=dev with no admin auth boundary declared: the Harvest management \
-             API (every /admin route and the Vantage dashboard) is reachable UNAUTHENTICATED \
-             by any caller that can open a socket to this process. Do not expose this process \
-             beyond localhost. To close it, declare \
+            "The dev deployment profile is active with no admin auth boundary declared: the \
+             Harvest management API (every /admin route and the Vantage dashboard) is reachable \
+             UNAUTHENTICATED by any caller that can open a socket to this process. Do not \
+             expose this process beyond localhost. To close it, declare \
              StandaloneAdminAuth::with_admin_auth_boundary() behind your own auth layer, or \
-             run a non-dev AUTUMN_PROFILE."
+             declare a non-dev profile."
         );
+    }
+}
+
+/// Log an operator override that weakens a code-set orphan action.
+///
+/// The override is valid, so it applies. The log line makes the change
+/// visible, because `fail` protects in-flight runs.
+fn warn_if_operator_weakens_the_orphan_gate(
+    code: HarvestStartupConfig,
+    resolved: HarvestStartupConfig,
+) {
+    if orphan_action_rank(resolved.orphaned_workflows) < orphan_action_rank(code.orphaned_workflows)
+    {
+        tracing::warn!(
+            code = ?code.orphaned_workflows,
+            operator = ?resolved.orphaned_workflows,
+            "operator config weakens the orphaned-workflow startup action set in code"
+        );
+    }
+}
+
+const fn orphan_action_rank(action: OrphanStartupAction) -> u8 {
+    match action {
+        OrphanStartupAction::Off => 0,
+        OrphanStartupAction::Warn => 1,
+        OrphanStartupAction::Fail => 2,
     }
 }
 
@@ -404,30 +531,64 @@ mod tests {
         let api_state = HarvestApiState::new();
         let auth = StandaloneAdminAuth::new().with_deployment_profile("prod");
         let _router = mount_router(&api_state, &auth, false);
-        apply_ambient_profile(
-            &api_state,
-            &auth,
-            &MockEnv::new().with("AUTUMN_PROFILE", "dev"),
-        );
+        let env = MockEnv::new().with("AUTUMN_PROFILE", "dev");
+        apply_ambient_profile(&api_state, &auth, ambient_profile(&env).as_deref());
         assert_eq!(api_state.deployment_profile(), "prod");
+    }
+
+    #[test]
+    fn a_profile_already_on_the_state_is_not_replaced_by_the_environment() {
+        let api_state = HarvestApiState::new();
+        api_state.set_deployment_profile("prod");
+        apply_ambient_profile(&api_state, &StandaloneAdminAuth::new(), Some("dev"));
+        assert_eq!(api_state.deployment_profile(), "prod");
+    }
+
+    #[test]
+    fn autumn_env_wins_over_autumn_profile() {
+        let env = MockEnv::new()
+            .with("AUTUMN_ENV", "prod")
+            .with("AUTUMN_PROFILE", "dev");
+        assert_eq!(ambient_profile(&env).as_deref(), Some("prod"));
     }
 
     #[test]
     fn an_undeclared_profile_comes_from_the_environment() {
         let api_state = HarvestApiState::new();
         let auth = StandaloneAdminAuth::new();
-        apply_ambient_profile(
-            &api_state,
-            &auth,
-            &MockEnv::new().with("AUTUMN_PROFILE", "dev"),
-        );
+        let env = MockEnv::new().with("AUTUMN_PROFILE", "dev");
+        apply_ambient_profile(&api_state, &auth, ambient_profile(&env).as_deref());
         assert_eq!(api_state.deployment_profile(), "dev");
     }
 
     #[test]
     fn an_undeclared_profile_with_no_environment_stays_unknown() {
         let api_state = HarvestApiState::new();
-        apply_ambient_profile(&api_state, &StandaloneAdminAuth::new(), &MockEnv::new());
-        assert_eq!(api_state.deployment_profile(), "unknown");
+        apply_ambient_profile(
+            &api_state,
+            &StandaloneAdminAuth::new(),
+            ambient_profile(&MockEnv::new()).as_deref(),
+        );
+        assert_eq!(api_state.deployment_profile(), UNDECLARED_PROFILE);
+    }
+
+    #[test]
+    fn the_undeclared_profile_matches_a_new_api_state() {
+        assert_eq!(
+            HarvestApiState::new().deployment_profile(),
+            UNDECLARED_PROFILE
+        );
+    }
+
+    #[test]
+    fn orphan_action_rank_orders_off_warn_fail() {
+        assert!(
+            orphan_action_rank(OrphanStartupAction::Off)
+                < orphan_action_rank(OrphanStartupAction::Warn)
+        );
+        assert!(
+            orphan_action_rank(OrphanStartupAction::Warn)
+                < orphan_action_rank(OrphanStartupAction::Fail)
+        );
     }
 }

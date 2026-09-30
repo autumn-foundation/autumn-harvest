@@ -25,12 +25,12 @@ use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
 use autumn_harvest::store;
 use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::DbPool;
-use autumn_harvest_plugin::api::StandaloneAdminAuth;
+use autumn_harvest_plugin::api::{HarvestApiState, StandaloneAdminAuth};
 use autumn_harvest_plugin::config::{
     HarvestDatabaseConfig, HarvestMode, HarvestRuntimeConfig, HarvestStartupConfig,
     OrphanStartupAction,
 };
-use autumn_harvest_plugin::embedding::HarvestEmbedding;
+use autumn_harvest_plugin::embedding::{__admission_gate_cache_publish_count, HarvestEmbedding};
 use autumn_harvest_plugin::runner::HarvestRunnerResources;
 use autumn_web::reexports::axum;
 use axum::body::Body;
@@ -280,7 +280,7 @@ async fn boot_loads_gates_a_previous_process_persisted() {
     let published = global_admission_gate_cache().expect("gate cache must be published");
     assert!(Arc::ptr_eq(&published, &runtime.api_state().gate_cache()));
 
-    let (status, _) = send(
+    let (status, body) = send(
         &runtime.router(),
         "POST",
         "/workflows/embed_echo/start",
@@ -289,6 +289,9 @@ async fn boot_loads_gates_a_previous_process_persisted() {
     )
     .await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    // The fail-closed cache also answers 503. Only the loaded gate names its
+    // reason.
+    assert!(body.to_string().contains("incident-42"), "{body}");
 
     runtime.stop().await;
 }
@@ -306,6 +309,7 @@ async fn code_set_fail_refuses_boot_and_publishes_nothing() {
     let (url, _db) = database().await;
     seed_orphan(&url, "embed_removed_type").await;
     let before = global_admission_gate_cache();
+    let publishes = __admission_gate_cache_publish_count();
 
     let mut config = config(&url);
     config.startup = HarvestStartupConfig {
@@ -323,6 +327,9 @@ async fn code_set_fail_refuses_boot_and_publishes_nothing() {
         panic!("an orphan under `fail` must refuse boot");
     };
     assert!(error.to_string().contains("embed_removed_type"), "{error}");
+    // A refused boot restores the globals, so only the count shows that no
+    // publish happened before the orphan gate.
+    assert_eq!(__admission_gate_cache_publish_count(), publishes);
     let after = global_admission_gate_cache();
     assert_eq!(
         before.map(|cache| Arc::as_ptr(&cache)),
@@ -375,6 +382,32 @@ async fn non_dev_profile_rejects_an_anonymous_admin_call() {
 
     let (status, _) = send(&runtime.router(), "GET", "/admin/preflight", None, None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    runtime.stop().await;
+}
+
+/// A declared auth boundary admits admin calls under a non-dev profile. The
+/// embedder's own auth layer wraps the router in production.
+#[tokio::test]
+async fn a_declared_boundary_admits_an_admin_call() {
+    let _serial = SERIAL.lock().await;
+    let (url, _db) = database().await;
+    let runtime = HarvestEmbedding::new(
+        builder().build(),
+        config(&url),
+        HarvestRunnerResources::new(pool(&url)),
+    )
+    .with_admin_auth(
+        StandaloneAdminAuth::new()
+            .with_admin_auth_boundary()
+            .with_deployment_profile("prod"),
+    )
+    .start()
+    .await
+    .expect("embedding should start");
+
+    let (status, _) = send(&runtime.router(), "GET", "/admin/preflight", None, None).await;
+    assert_eq!(status, StatusCode::OK);
 
     runtime.stop().await;
 }
@@ -590,6 +623,7 @@ async fn multi_shard_needs_a_notification_url_per_shard() {
     let (shard0, _db) = database().await;
     let shard1 = fresh_database(&shard0).await;
     let before = global_admission_gate_cache();
+    let publishes = __admission_gate_cache_publish_count();
 
     let result = HarvestEmbedding::new(
         builder().build(),
@@ -603,6 +637,7 @@ async fn multi_shard_needs_a_notification_url_per_shard() {
         panic!("a shard with no notification URL must refuse boot");
     };
     assert!(error.to_string().contains("shard 1"), "{error}");
+    assert_eq!(__admission_gate_cache_publish_count(), publishes);
     assert_eq!(
         before.map(|cache| Arc::as_ptr(&cache)),
         global_admission_gate_cache().map(|cache| Arc::as_ptr(&cache)),
@@ -642,22 +677,22 @@ async fn multi_shard_starts_with_a_notification_url_per_shard() {
 // ---------------------------------------------------------------------------
 
 /// Sets environment variables and removes them on drop, also on panic.
-struct EnvGuard(&'static [&'static str]);
+struct EnvGuard(&'static [(&'static str, &'static str)]);
 
 impl EnvGuard {
-    fn set(vars: &'static [(&'static str, &'static str)], names: &'static [&'static str]) -> Self {
+    fn set(vars: &'static [(&'static str, &'static str)]) -> Self {
         for (name, value) in vars {
             // SAFETY: `SERIAL` is held, so no other test in this binary reads
             // the environment while this one changes it.
             unsafe { std::env::set_var(name, value) };
         }
-        Self(names)
+        Self(vars)
     }
 }
 
 impl Drop for EnvGuard {
     fn drop(&mut self) {
-        for name in self.0 {
+        for (name, _) in self.0 {
             // SAFETY: see `EnvGuard::set`.
             unsafe { std::env::remove_var(name) };
         }
@@ -665,24 +700,19 @@ impl Drop for EnvGuard {
 }
 
 /// The operator's `AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS=fail` overrides
-/// the code default of `warn`. `AUTUMN_PROFILE=dev` declares the profile when
-/// the embedder declares none. The example used to thread both by hand.
+/// the code default of `warn`. `AUTUMN_PROFILE=dev` declares the profile only
+/// with the `with_ambient_profile` opt-in. The example used to thread both by
+/// hand.
 #[tokio::test]
 async fn operator_environment_sets_the_startup_action_and_the_profile() {
     let _serial = SERIAL.lock().await;
     let (orphaned, _db) = database().await;
     let clean = fresh_database(&orphaned).await;
     seed_orphan(&orphaned, "embed_env_removed_type").await;
-    let _env = EnvGuard::set(
-        &[
-            ("AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS", "fail"),
-            ("AUTUMN_PROFILE", "dev"),
-        ],
-        &[
-            "AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS",
-            "AUTUMN_PROFILE",
-        ],
-    );
+    let _env = EnvGuard::set(&[
+        ("AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS", "fail"),
+        ("AUTUMN_PROFILE", "dev"),
+    ]);
 
     let refused = HarvestEmbedding::new(
         builder().build(),
@@ -699,7 +729,7 @@ async fn operator_environment_sets_the_startup_action_and_the_profile() {
         "{error}"
     );
 
-    let runtime = HarvestEmbedding::new(
+    let closed = HarvestEmbedding::new(
         builder().build(),
         config(&clean),
         HarvestRunnerResources::new(pool(&clean)),
@@ -707,7 +737,74 @@ async fn operator_environment_sets_the_startup_action_and_the_profile() {
     .start()
     .await
     .expect("a clean database should boot");
+    let (status, _) = send(&closed.router(), "GET", "/admin/preflight", None, None).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "without the opt-in, a stray AUTUMN_PROFILE must not open the admin API"
+    );
+    closed.stop().await;
+
+    let open = HarvestEmbedding::new(
+        builder().build(),
+        config(&clean),
+        HarvestRunnerResources::new(pool(&clean)),
+    )
+    .with_ambient_profile()
+    .start()
+    .await
+    .expect("a clean database should boot");
+    let (status, _) = send(&open.router(), "GET", "/admin/preflight", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    open.stop().await;
+}
+
+/// An invalid operator value refuses boot. A typo must not become `warn`.
+#[tokio::test]
+async fn an_invalid_operator_startup_value_refuses_boot() {
+    let _serial = SERIAL.lock().await;
+    let (url, _db) = database().await;
+    let _env = EnvGuard::set(&[("AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS", "fial")]);
+
+    let result = HarvestEmbedding::new(
+        builder().build(),
+        config(&url),
+        HarvestRunnerResources::new(pool(&url)),
+    )
+    .start()
+    .await;
+
+    let Err(error) = result else {
+        panic!("an invalid startup action must refuse boot");
+    };
+    assert!(error.to_string().contains("fial"), "{error}");
+}
+
+/// A profile the embedder set on its own API state survives the ambient
+/// read, and that state is the one the runtime installs.
+#[tokio::test]
+async fn a_profile_set_on_the_api_state_wins_over_the_environment() {
+    let _serial = SERIAL.lock().await;
+    let (url, _db) = database().await;
+    let _env = EnvGuard::set(&[("AUTUMN_PROFILE", "dev")]);
+    let api_state = HarvestApiState::new();
+    api_state.set_deployment_profile("prod");
+
+    let runtime = HarvestEmbedding::new(
+        builder().build(),
+        config(&url),
+        HarvestRunnerResources::new(pool(&url)),
+    )
+    .with_api_state(api_state.clone())
+    .with_ambient_profile()
+    .start()
+    .await
+    .expect("embedding should start");
+
     let (status, _) = send(&runtime.router(), "GET", "/admin/preflight", None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(api_state.batch_start_max_items() > 0);
+    let (status, _) = send(&runtime.router(), "GET", "/workflows", None, None).await;
     assert_eq!(status, StatusCode::OK);
 
     runtime.stop().await;

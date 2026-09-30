@@ -46,8 +46,9 @@ pub fn build_router(harvest: axum::Router, metrics: HarvestMetricsRecorder) -> a
 /// Build a pool, start Harvest through `HarvestEmbedding`, and serve.
 ///
 /// `HarvestEmbedding` runs the whole startup sequence (issue #1613). It
-/// applies the operator's startup config and reads `AUTUMN_PROFILE`. It loads
-/// the persisted admission gates and installs the pool and the runtime.
+/// applies the operator's startup config. `with_ambient_profile` makes it read
+/// `AUTUMN_PROFILE`, as the README's `Run` command needs. It loads the
+/// persisted admission gates and installs the pool and the runtime.
 pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://runner:runner@localhost:5434/runner".to_owned());
@@ -67,6 +68,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         standalone_runtime_config(database_url),
         HarvestRunnerResources::new(pool),
     )
+    .with_ambient_profile()
     .start()
     .await
     .map_err(|error| format!("failed to start Harvest: {error}"))?;

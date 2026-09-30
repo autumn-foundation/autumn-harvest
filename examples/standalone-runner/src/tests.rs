@@ -1,6 +1,7 @@
 use autumn_harvest::telemetry::MetricsRecorder;
 use autumn_harvest::{WorkflowEvent, WorkflowSimulator};
 use autumn_harvest_plugin::api::{HarvestApiState, StandaloneAdminAuth, harvest_api_router};
+use autumn_harvest_plugin::harvest_ui_router;
 use autumn_harvest_plugin::metrics_scrape::HarvestMetricsRecorder;
 use autumn_harvest_plugin::prelude::HarvestMode;
 use autumn_web::reexports::axum;
@@ -106,9 +107,13 @@ fn router_under_test() -> axum::Router {
     )
 }
 
+/// The composition `HarvestEmbedding` mounts: the API with Vantage nested,
+/// under the declared auth layers. It covers the composition only.
 fn harvest_mount(auth: &StandaloneAdminAuth) -> axum::Router {
     let api_state = HarvestApiState::new();
-    auth.mount(harvest_api_router(api_state.clone()), &api_state)
+    let router =
+        harvest_api_router(api_state.clone()).nest("/ui", harvest_ui_router(api_state.clone()));
+    auth.mount(router, &api_state)
 }
 
 async fn get_status(app: axum::Router, uri: &str) -> StatusCode {

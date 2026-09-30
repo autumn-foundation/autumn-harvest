@@ -6,10 +6,11 @@ This example shows the out-of-the-box non-`HarvestPlugin` runner path. It does n
 
 `HarvestEmbedding` (issue #1613) runs the startup sequence the plugin runs:
 
-- It applies `[harvest.startup] orphaned_workflows` from `autumn.toml` or
-  `AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS`.
-- It reads the deployment profile from `AUTUMN_PROFILE`. Declare a credential with
-  `with_admin_auth(StandaloneAdminAuth::new().with_api_tokens())`.
+- It applies `[harvest.startup] orphaned_workflows` from `autumn.toml`,
+  `autumn-{profile}.toml` or `AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS`.
+- `with_ambient_profile()` makes it read the deployment profile from `AUTUMN_ENV` or
+  `AUTUMN_PROFILE`. Without it, the profile is `unknown` and the admin API fails closed.
+  Declare a credential with `with_admin_auth(StandaloneAdminAuth::new().with_api_tokens())`.
 - It loads the persisted admission gates before the worker starts.
 - It installs the storage pool and the API runtime, in that order.
 

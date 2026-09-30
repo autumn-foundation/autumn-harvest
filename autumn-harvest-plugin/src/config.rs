@@ -121,16 +121,21 @@ impl HarvestStartupConfig {
     /// [`HarvestRuntimeConfig::load`]. A setting that no source names keeps
     /// the code value. A plain `load()` would reset a code `fail` to `warn`.
     ///
-    /// Only the startup settings are read. An invalid value in another
-    /// `AUTUMN_HARVEST_*` variable does not block this overlay.
+    /// Only `[harvest.startup]` and its variable are read. An invalid value in
+    /// another setting does not block this overlay. A file that is not valid
+    /// TOML does block it.
     ///
     /// # Errors
     ///
     /// Returns [`ConfigError`] when a config file cannot be read or parsed,
     /// or when a startup value is invalid. A typo must not become `warn`.
+    /// A parse error names the file only. It does not quote the file, which
+    /// can hold a database password.
     pub fn with_operator_overrides(mut self, env: &dyn Env) -> Result<Self, ConfigError> {
-        for root in load_operator_roots(env)? {
-            self.apply_partial(&root.harvest.startup);
+        for path in operator_config_paths(env) {
+            if let Some(startup) = load_startup_section(&path)? {
+                self.apply_partial(&startup);
+            }
         }
         self.apply_env_overrides(env)?;
         Ok(self)
@@ -678,7 +683,7 @@ struct PartialHarvestReadinessConfig {
     require_shard_readiness: Option<bool>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, Deserialize)]
 struct PartialHarvestStartupConfig {
     orphaned_workflows: Option<OrphanStartupAction>,
 }
@@ -715,15 +720,8 @@ fn load_partial_root(path: &Path) -> Result<Option<PartialRoot>, ConfigError> {
 /// The operator config files, in precedence order: `autumn.toml`, then
 /// `autumn-{profile}.toml`. A file that does not exist is skipped.
 fn load_operator_roots(env: &dyn Env) -> Result<Vec<PartialRoot>, ConfigError> {
-    let mut paths = vec![find_config_file_named("autumn.toml", env)];
-    if let Some(profile) = resolve_profile(env) {
-        paths.push(find_config_file_named(
-            &format!("autumn-{profile}.toml"),
-            env,
-        ));
-    }
     let mut roots = Vec::new();
-    for path in paths {
+    for path in operator_config_paths(env) {
         if let Some(root) = load_partial_root(&path)? {
             roots.push(root);
         }
@@ -731,8 +729,56 @@ fn load_operator_roots(env: &dyn Env) -> Result<Vec<PartialRoot>, ConfigError> {
     Ok(roots)
 }
 
-/// The deployment profile: `AUTUMN_PROFILE`, else a `--profile` argument.
-pub(crate) fn resolve_profile(env: &dyn Env) -> Option<String> {
+/// The operator config file paths, in precedence order.
+fn operator_config_paths(env: &dyn Env) -> Vec<PathBuf> {
+    let mut paths = vec![find_config_file_named("autumn.toml", env)];
+    if let Some(profile) = resolve_profile(env) {
+        paths.push(find_config_file_named(
+            &format!("autumn-{profile}.toml"),
+            env,
+        ));
+    }
+    paths
+}
+
+/// Only the `[harvest.startup]` table of a config file.
+#[derive(Debug, Default, Deserialize)]
+struct StartupOnlyRoot {
+    #[serde(default)]
+    harvest: StartupOnlyHarvest,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct StartupOnlyHarvest {
+    #[serde(default)]
+    startup: PartialHarvestStartupConfig,
+}
+
+/// Read `[harvest.startup]` from `path`. A missing file gives `None`.
+///
+/// The parse error names the file and the byte offset only. The TOML error
+/// text quotes the failing line, which can hold a password.
+fn load_startup_section(path: &Path) -> Result<Option<PartialHarvestStartupConfig>, ConfigError> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(ConfigError::Io(error)),
+    };
+    toml::from_str::<StartupOnlyRoot>(&contents)
+        .map(|root| Some(root.harvest.startup))
+        .map_err(|error| {
+            let offset = error
+                .span()
+                .map_or_else(String::new, |span| format!(" at byte {}", span.start));
+            ConfigError::Validation(format!(
+                "could not parse {}{offset}: the file is not valid TOML, or \
+                 [harvest.startup] holds an invalid value",
+                path.display()
+            ))
+        })
+}
+
+fn resolve_profile(env: &dyn Env) -> Option<String> {
     if let Ok(profile) = env.var("AUTUMN_PROFILE")
         && !profile.is_empty()
     {
@@ -1657,6 +1703,42 @@ orphaned_workflows = "off"
             .with_operator_overrides(&env)
             .expect("an unrelated setting must not block the startup overlay");
         assert_eq!(resolved.orphaned_workflows, OrphanStartupAction::Warn);
+    }
+
+    #[test]
+    fn startup_overlay_ignores_an_invalid_setting_outside_the_startup_table() {
+        let dir = unique_temp_dir("harvest-startup-narrow");
+        write_file(
+            &dir.join("autumn.toml"),
+            r#"
+[harvest]
+worker_enabled = "maybe"
+
+[harvest.startup]
+orphaned_workflows = "fail"
+"#,
+        );
+        let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref());
+        let resolved = HarvestStartupConfig::default()
+            .with_operator_overrides(&env)
+            .expect("an invalid setting outside [harvest.startup] must not block the overlay");
+        assert_eq!(resolved.orphaned_workflows, OrphanStartupAction::Fail);
+    }
+
+    #[test]
+    fn startup_overlay_parse_error_does_not_quote_the_file() {
+        let dir = unique_temp_dir("harvest-startup-secret");
+        write_file(
+            &dir.join("autumn.toml"),
+            "[database]\nurl = postgres://user:hunter2@db/app\n",
+        );
+        let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref());
+        let error = HarvestStartupConfig::default()
+            .with_operator_overrides(&env)
+            .expect_err("a file that is not valid TOML must refuse");
+        let message = error.to_string();
+        assert!(message.contains("autumn.toml"), "{message}");
+        assert!(!message.contains("hunter2"), "{message}");
     }
 
     #[test]
