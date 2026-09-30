@@ -8967,10 +8967,12 @@ const fn schedule_is_resumable(row: &HarvestSchedule) -> bool {
 
 /// Whether the scheduler hashes jitter against the row's own `next_run_at`.
 ///
-/// Two cases break this (issue #1568). A calendar can rebase the slot to a
-/// business day first. The `MostRecent` and `Window` catchup policies can pick
-/// a later slot first. The row alone cannot show either result.
-/// `SkipAll` and `Unbounded` both fire `next_run_at` first.
+/// Two cases break this (issue #1568). A calendar can rebase an excluded slot
+/// to a business day first. The `MostRecent` and `Window` catchup policies can
+/// pick a later slot first. The row holds neither the calendar exclusions nor
+/// the catchup slot selection, so it cannot show either result.
+/// `SkipAll` and `Unbounded` both fire `next_run_at` first. An unknown policy
+/// string uses the legacy `catchup` bool, so it is one of those two.
 fn scheduler_slot_is_raw(row: &HarvestSchedule) -> bool {
     use autumn_harvest::policy::CatchupPolicy;
 
@@ -19876,6 +19878,60 @@ mod tests {
                 "{policy:?}/{catchup}: the first slot is exact, so jitter applies"
             );
         }
+    }
+
+    /// A calendar alone forces the raw slot, whatever the catchup policy is.
+    #[test]
+    fn end_at_exhaustion_calendar_overrides_first_slot_catchup() {
+        let now = chrono::Utc::now();
+        for policy in ["skip_all", "unbounded"] {
+            let row = HarvestSchedule {
+                calendar_name: Some("us_holidays".to_string()),
+                catchup_policy: Some(policy.to_string()),
+                ..jitter_past_cutoff_row()
+            };
+            assert!(
+                !schedule_is_bounded_out(&row, now),
+                "{policy}: a calendar can rebase the slot, so judge the raw slot"
+            );
+        }
+    }
+
+    /// An unknown policy string uses the legacy `catchup` bool, as the
+    /// scheduler does. `Window` with no seconds still selects a slot.
+    #[test]
+    fn end_at_exhaustion_catchup_fallbacks_match_the_scheduler() {
+        let now = chrono::Utc::now();
+        for catchup in [false, true] {
+            let unknown = HarvestSchedule {
+                catchup,
+                catchup_policy: Some("future_mode".to_string()),
+                ..jitter_past_cutoff_row()
+            };
+            assert!(
+                schedule_is_bounded_out(&unknown, now),
+                "unknown/{catchup}: the bool fallback fires the first slot"
+            );
+        }
+        let window_no_secs = HarvestSchedule {
+            catchup_policy: Some("window".to_string()),
+            catchup_window_secs: None,
+            ..jitter_past_cutoff_row()
+        };
+        assert!(!schedule_is_bounded_out(&window_no_secs, now));
+    }
+
+    /// A calendar with no pending slot still falls back to the wall clock.
+    #[test]
+    fn end_at_exhaustion_calendar_with_no_slot_uses_wall_clock() {
+        let now = chrono::Utc::now();
+        let row = HarvestSchedule {
+            next_run_at: None,
+            calendar_name: Some("us_holidays".to_string()),
+            end_at: Some(now - chrono::Duration::hours(1)),
+            ..jitter_past_cutoff_row()
+        };
+        assert!(schedule_is_bounded_out(&row, now));
     }
 
     /// A jittered schedule with no pending slot still falls back to the wall

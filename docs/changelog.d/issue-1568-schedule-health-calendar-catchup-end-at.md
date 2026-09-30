@@ -1,4 +1,4 @@
-## Phase X.Y — Schedule health end_at check skips jitter when slot is unknown (issue #1568)
+## Fix — schedule health end_at check skips jitter when slot is unknown (issue #1568)
 
 The Vantage schedule health check judged `end_at` against the jitter-adjusted
 `next_run_at`. The scheduler hashes jitter against a different slot in two
@@ -11,11 +11,10 @@ schedules as exhausted.
 catchup policy resolves through `CatchupPolicy::from_db`, as in the scheduler.
 
 Trade-off: a raw slot before `end_at` is not reported as exhausted, even if the
-scheduler later stops it. Full accuracy needs calendar exclusions loaded per
-page render. That work stays open.
+scheduler later stops it. Exact results need calendar exclusions loaded per
+page render. That follow-up work is described in #1568.
 
 No migration. No `WorkflowEvent` change. `harvest_events` is not touched.
 
-Tests: `end_at_exhaustion_ignores_jitter_when_calendar_is_set`,
-`end_at_exhaustion_ignores_jitter_for_slot_selecting_catchup`,
-`end_at_exhaustion_keeps_jitter_for_first_slot_catchup`.
+Tests: the `end_at_exhaustion_*` cases in `ui.rs` cover calendar rows,
+`MostRecent` and `Window` rows, first-slot policies, and the bool fallbacks.

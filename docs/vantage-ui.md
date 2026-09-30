@@ -109,7 +109,7 @@ condition:
 |---|---|
 | `Paused` | `is_paused` |
 | `Auto-paused` | `auto_paused_at` set (#360) — supersedes `Paused` |
-| `Exhausted: <reason>` | `exhausted_at` set (#478), **or** the row is terminal on its live bounds before a tick has stamped the column: `runs_started >= max_runs` (for `max_runs > 0`), or the **pending slot** is at/past the cutoff (`next_run_at >= end_at`; falling back to `now >= end_at` only when there is no pending slot). An unstamped exhaustion names its bound (`run budget spent` / `past end_at`). |
+| `Exhausted: <reason>` | `exhausted_at` set (#478), **or** the row is terminal on its live bounds before a tick has stamped the column: `runs_started >= max_runs` (for `max_runs > 0`), or the **pending slot** is at/past the cutoff (`next_run_at >= end_at`; falling back to `now >= end_at` only when there is no pending slot). An unstamped exhaustion names its bound (`run budget spent` / `past end_at`). The pending slot includes jitter (#1293). Rows with a calendar, or with `MostRecent` or `Window` catchup, use the raw `next_run_at` (#1568). The scheduler may stop such a row before the badge shows. |
 | `Catchup dropped ×N` | `last_catchup_dropped > 0` (#484) |
 
 Unhealthy schedules **sort above** healthy ones; healthy rows keep their existing
