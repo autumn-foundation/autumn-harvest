@@ -2065,16 +2065,10 @@ pub async fn rewind_cursor_locked(
                     // record at or after the instant means there is nothing to
                     // re-export from there, so the cursor stays put.
                     //
-                    // Known gap (issue #1508): this MIN only sees SURVIVING
-                    // rows. If retention already purged the earliest records
-                    // at or after `instant`, the query lands on the lowest
-                    // row still present instead. The resolved `to` then reads
-                    // as the operator's full request. `from - to` silently
-                    // excludes the purged prefix. `already_purged_records`
-                    // (computed only over the resolved window) then reports
-                    // `0`, even though records the operator's timestamp named
-                    // are gone. Closing this needs a persisted purge
-                    // watermark. No row survives to compute it from here.
+                    // This MIN sees only SURVIVING rows. Retention may have
+                    // purged the earliest records at or after `instant`.
+                    // `redrive_window_truncated` reports that case from the
+                    // purge watermark (issue #1508).
                     let lowest: Option<Option<i64>> = log::harvest_audit_log
                         .filter(log::occurred_at.ge(instant))
                         .filter(log::export_seq.is_not_null())
@@ -2154,10 +2148,9 @@ pub async fn count_redrive_recoverable(
 /// [`RewindOutcome::Rewound`], see [`count_redrive_recoverable`].
 ///
 /// Exact for a [`RewindRequest::Seq`] rewind: `to` is the operator's own
-/// number, independent of what still exists. Understates a purged prefix for
-/// a [`RewindRequest::Before`] rewind (issue #1508). `to` there is derived
-/// from surviving rows. An already-purged prefix is invisible to this count
-/// too, not only to the resolver that picked `to`.
+/// number, independent of what still exists. For a [`RewindRequest::Before`]
+/// rewind, `to` comes from surviving rows, so this count misses a purged
+/// prefix. [`redrive_window_truncated`] covers that case (issue #1508).
 ///
 /// # Errors
 /// Returns `HarvestError` on a database failure.
@@ -2171,6 +2164,53 @@ pub async fn redrive_recovery_counts(
     };
     let recoverable = count_redrive_recoverable(conn, from, to).await?;
     Ok((recoverable, (from - to - recoverable).max(0)))
+}
+
+/// Whether retention already purged records the redrive named (issue #1508).
+///
+/// A [`RewindRequest::Before`] window comes from surviving rows only. A purged
+/// row leaves nothing to count. Retention therefore records the latest
+/// `occurred_at` it purged in `harvest_audit_purge_watermark`. The window is
+/// truncated when that value is at or after the requested instant.
+///
+/// The watermark is database-wide, like the `Before` resolver. Shards that
+/// share a database share it, so the flag can be `true` for a shard that
+/// lost nothing. A purge that commits after this check is not seen. A purge
+/// from before the migration left no trace.
+///
+/// Always `false` for [`RewindRequest::Seq`]: `to` there is the operator's own
+/// number, so `already_purged_records` is exact. Always `false` for
+/// [`RewindOutcome::NotConfigured`], which has no window.
+///
+/// The watermark shows that a record at or after the instant is gone. It does
+/// not show where that record sat in the window, and it does not count them.
+///
+/// # Errors
+/// Returns `HarvestError` on a database failure.
+#[cfg(feature = "db")]
+pub async fn redrive_window_truncated(
+    conn: &mut diesel_async::AsyncPgConnection,
+    request: RewindRequest,
+    outcome: RewindOutcome,
+) -> crate::error::HarvestResult<bool> {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    use crate::schema::harvest_audit_purge_watermark::dsl as mark;
+
+    let RewindRequest::Before(instant) = request else {
+        return Ok(false);
+    };
+    if matches!(outcome, RewindOutcome::NotConfigured) {
+        return Ok(false);
+    }
+    mark::harvest_audit_purge_watermark
+        .filter(mark::max_purged_occurred_at.ge(instant))
+        .count()
+        .get_result::<i64>(conn)
+        .await
+        .map(|n| n > 0)
+        .map_err(crate::error::database_error)
 }
 
 // ---------------------------------------------------------------------

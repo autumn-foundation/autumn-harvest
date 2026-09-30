@@ -417,6 +417,12 @@ const HARVEST_WRITE_PRIVILEGE_REQUIREMENTS: &[(&str, &[&str])] = &[
     ("harvest_workers", &["SELECT", "INSERT", "UPDATE"]),
     ("harvest_batch_jobs", &["SELECT", "INSERT", "UPDATE"]),
     ("harvest_audit_log", &["SELECT", "INSERT", "DELETE"]),
+    // The retention purge writes this table in the same statement as its
+    // delete (issue #1508). A missing grant fails the whole purge.
+    (
+        "harvest_audit_purge_watermark",
+        &["SELECT", "INSERT", "UPDATE"],
+    ),
     // Claim-path gate tables. The claim CTE reads all four unconditionally on
     // every poll, so a storage role missing `SELECT` on any one of them makes
     // `claim_task` error and the worker claim *nothing* -- a missing grant

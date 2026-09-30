@@ -8077,6 +8077,7 @@ pub const fn management_api_response_fields()
                 "to",
                 "recoverable_records",
                 "already_purged_records",
+                "window_truncated",
             ]),
         ),
         (
@@ -37868,6 +37869,10 @@ struct AuditExportRedriveRequest {
     before: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// Appended to the redrive audit detail and refusal when retention cut the window.
+const TRUNCATED_NOTE: &str = "; retention already purged records at or after the requested \
+                              instant, so the window is incomplete";
+
 /// What `rewind_cursor_locked` decided, plus how much of it the database can
 /// actually deliver (issue #1267).
 ///
@@ -37880,6 +37885,8 @@ struct RedriveApplied {
     outcome: ::autumn_harvest::audit_export::RewindOutcome,
     recoverable_records: i64,
     already_purged_records: i64,
+    /// Retention purged records a `before` request named (issue #1508).
+    window_truncated: bool,
 }
 
 /// `POST /admin/audit-export/redrive` — rewind one shard's export cursor so
@@ -38012,12 +38019,19 @@ async fn audit_export_redrive_handler(
                         ::autumn_harvest::audit_export::redrive_recovery_counts(conn, outcome)
                             .await?;
 
+                    // A `before` window comes from surviving rows, so the
+                    // counts above cannot see a purged prefix (issue #1508).
+                    let window_truncated = ::autumn_harvest::audit_export::redrive_window_truncated(
+                        conn, target, outcome,
+                    )
+                    .await?;
+
                     // Only a rewind that actually moved the cursor is a
                     // SUCCEEDED privileged action; a refused request changed
                     // nothing and must not read as one in the trail.
                     let (status, detail) = match &outcome {
                         ::autumn_harvest::audit_export::RewindOutcome::Rewound { from, to } => {
-                            let detail = if already_purged_records > 0 {
+                            let mut detail = if already_purged_records > 0 {
                                 format!(
                                     "cursor rewound from {from} to {to}; {already_purged_records} \
                                      of {} records in that window were already purged by \
@@ -38027,6 +38041,9 @@ async fn audit_export_redrive_handler(
                             } else {
                                 format!("cursor rewound from {from} to {to}")
                             };
+                            if window_truncated {
+                                detail.push_str(TRUNCATED_NOTE);
+                            }
                             (STATUS_SUCCEEDED, Some(detail))
                         }
                         ::autumn_harvest::audit_export::RewindOutcome::NoOp {
@@ -38036,7 +38053,8 @@ async fn audit_export_redrive_handler(
                             STATUS_FAILED,
                             Some(format!(
                                 "refused: cursor is at {cursor}, requested {requested}; a \
-                                 cursor may only be rewound"
+                                 cursor may only be rewound{}",
+                                if window_truncated { TRUNCATED_NOTE } else { "" }
                             )),
                         ),
                         ::autumn_harvest::audit_export::RewindOutcome::NotConfigured => (
@@ -38063,6 +38081,7 @@ async fn audit_export_redrive_handler(
                         outcome,
                         recoverable_records,
                         already_purged_records,
+                        window_truncated,
                     })
                 }))
                 .await
@@ -38116,6 +38135,7 @@ async fn audit_export_redrive_handler(
                 "to": to,
                 "recoverable_records": applied.recoverable_records,
                 "already_purged_records": applied.already_purged_records,
+                "window_truncated": applied.window_truncated,
             })),
         )
             .into_response(),
@@ -38123,8 +38143,13 @@ async fn audit_export_redrive_handler(
             AutumnError::bad_request_msg(format!(
                 "refusing to move shard {}'s audit-export cursor to {requested} (it is at \
                  {cursor}); a cursor may only be rewound, since advancing it would mark \
-                 records delivered that never were",
-                request.shard
+                 records delivered that never were{}",
+                request.shard,
+                if applied.window_truncated {
+                    TRUNCATED_NOTE
+                } else {
+                    ""
+                }
             ))
             .into_response()
         }
