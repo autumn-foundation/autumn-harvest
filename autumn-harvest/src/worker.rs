@@ -34418,13 +34418,16 @@ mod tests {
     ///
     /// Only the heartbeat tasks hold that `Arc` besides the worker, so the
     /// count is `1 + heartbeats` while they run and `1` after they stop.
+    /// Each wait lasts up to 30 seconds. A refused connection to a closed
+    /// port is slow on Windows, and startup visits each shard pool in turn.
+    /// The wait only runs out when the code is broken.
     async fn heartbeats_stop_after_run_is_cancelled(
         worker: &Worker,
         run: impl std::future::Future<Output = ()>,
         heartbeats: usize,
     ) {
         let spawned = async {
-            for _ in 0..300 {
+            for _ in 0..3000 {
                 if Arc::strong_count(&worker.drain_deadline_max) == 1 + heartbeats {
                     return true;
                 }
@@ -34433,12 +34436,12 @@ mod tests {
             false
         };
         let seen = tokio::select! {
-            () = run => false,
+            () = run => panic!("the run returned before its heartbeat started"),
             seen = spawned => seen,
         };
         assert!(seen, "the run must spawn its heartbeat before the cancel");
 
-        for _ in 0..500 {
+        for _ in 0..3000 {
             if Arc::strong_count(&worker.drain_deadline_max) == 1 {
                 return;
             }
