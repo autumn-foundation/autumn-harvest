@@ -110,9 +110,8 @@ fn apply_skip_policy_with(
 /// appear in `excluded_dates`. When `false`, a weekend `date` that is not in
 /// `excluded_dates` is returned unchanged.
 ///
-/// Scans up to 365 days in either direction; returns `None` if no non-excluded
-/// day can be found within that window (degenerate calendar with 365 consecutive
-/// exclusions).
+/// Scans up to 365 calendar days in either direction. Returns `None` if no
+/// non-excluded weekday exists within that window.
 ///
 /// Checks `excluded_dates` with an O(n) linear scan per date. A caller that
 /// invokes this once per date in a loop over the *same* `excluded_dates`
@@ -1754,6 +1753,23 @@ mod tests {
             )
             .unwrap();
             assert_eq!(next, date("2026-07-07"));
+        }
+    }
+
+    #[test]
+    fn apply_skip_policy_prev_steps_over_weekend_and_second_holiday() {
+        // Mon 2026-01-19 and Fri 2026-01-16 are holidays.
+        let exc = excluded(&["2026-01-19", "2026-01-16"]);
+        for exclude_weekends in [false, true] {
+            assert_eq!(
+                apply_skip_policy(
+                    date("2026-01-19"),
+                    SkipPolicy::RunPrevBusinessDay,
+                    &exc,
+                    exclude_weekends
+                ),
+                Some(date("2026-01-15"))
+            );
         }
     }
 

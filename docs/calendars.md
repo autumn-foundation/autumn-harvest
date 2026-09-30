@@ -10,7 +10,7 @@ Three calendars are seeded by the `20260519000000_harvest_calendar_awareness` mi
 
 | Name | Description |
 |------|-------------|
-| `weekends-off` | Saturday and Sunday (rolling; no fixed exclusion rows — handled by day-of-week logic built into `apply_skip_policy`) |
+| `weekends-off` | Saturday and Sunday (rolling; no fixed exclusion rows — the `exclude_weekends` flag of `apply_skip_policy` covers it) |
 | `us-federal-holidays` | US federal public holidays for 2025–2026 |
 | `nyse` | NYSE market holidays for 2025–2026 |
 
@@ -157,10 +157,10 @@ let excluded = vec![
 let fire_date = NaiveDate::from_ymd_opt(2026, 1, 19).unwrap();
 
 // Returns None → skip
-assert!(apply_skip_policy(fire_date, SkipPolicy::Skip, &excluded).is_none());
+assert!(apply_skip_policy(fire_date, SkipPolicy::Skip, &excluded, false).is_none());
 
 // Returns Some(2026-01-20) → Tuesday after the holiday
-let next = apply_skip_policy(fire_date, SkipPolicy::RunNextBusinessDay, &excluded);
+let next = apply_skip_policy(fire_date, SkipPolicy::RunNextBusinessDay, &excluded, false);
 assert_eq!(next, NaiveDate::from_ymd_opt(2026, 1, 20));
 ```
 
@@ -181,6 +181,6 @@ This is separate from `reason="overlap"` skips (overlap policy) so dashboards ca
 ## Notes
 
 - Calendar filtering happens **after** jitter is applied and **before** overlap policy evaluation. The effective fire time shown in the preview already includes jitter.
-- `weekends-off` is enforced by `apply_skip_policy` checking `weekday()` on the candidate date directly; Saturday and Sunday are never "business days" regardless of what exclusion rows say.
+- `weekends-off` sets `exclude_weekends = true` in `apply_skip_policy`. Saturday and Sunday are then excluded whatever the exclusion rows say.
 - A shift target is a weekday for every calendar, not only `weekends-off`. A weekend slot that is not excluded keeps its date, because only the shift scan applies the weekday rule.
 - If a calendar is deleted while schedules still reference it, those schedules degrade gracefully to no filtering (the calendar lookup returns an empty exclusion set).

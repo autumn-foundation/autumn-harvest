@@ -4,4 +4,6 @@
 
 `apply_skip_policy_with` now requires a shift target to be a weekday and not excluded. The check on the original slot date is unchanged, so a weekend slot that is not excluded keeps its date. No migration. No `harvest_events` change.
 
-Tests: four new `apply_skip_policy_*` unit tests in `calendar.rs` cover both directions, an unshifted weekend slot, and both `exclude_weekends` values. Two existing tests pinned the weekend result and now expect Monday.
+Operator effect: schedule preview, backfill, and overdue rebasing now give a Monday where they gave a Saturday or Sunday. A shifted slot can wait up to two days longer.
+
+Tests: five new `apply_skip_policy_*` unit tests in `calendar.rs` cover both directions, an unshifted weekend slot, and both `exclude_weekends` values. Three existing tests pinned the weekend result and now expect Monday. One of them is the `db`-gated `preview_firings_deferred_next`.
