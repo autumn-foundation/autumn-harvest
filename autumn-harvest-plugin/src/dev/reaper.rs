@@ -107,7 +107,8 @@ fn harden_root(root: &Path) -> Result<(), DevError> {
 ///
 /// # ACLs
 ///
-/// A Linux POSIX ACL cannot hide a write grant here. The group bits of the
+/// A POSIX ACL cannot hide a write grant here. Local Linux filesystems such as
+/// ext4, xfs, btrfs, and tmpfs use POSIX ACLs. The group bits of the
 /// mode show the ACL mask, so a named grant raises them. A later `chmod`
 /// lowers the mask and so lowers the grant with it. This predicate is
 /// therefore sound on Linux.
@@ -753,12 +754,22 @@ pub(super) mod acl_fixture {
     ///
     /// Returns `false` when `setfacl` is missing or the filesystem has no ACL
     /// support. The caller then skips, because nothing can be tested there.
+    ///
+    /// # Panics
+    ///
+    /// Panics under CI (the `CI` variable is set), so a runner without ACL
+    /// support fails instead of passing without a test.
     pub(in crate::dev) fn grant_write(dir: &std::path::Path) -> bool {
-        std::process::Command::new("setfacl")
+        let granted = std::process::Command::new("setfacl")
             .args(["-m", "u:65534:rwx"])
             .arg(dir)
             .status()
-            .is_ok_and(|status| status.success())
+            .is_ok_and(|status| status.success());
+        assert!(
+            granted || std::env::var_os("CI").is_none(),
+            "setfacl must work on CI runners"
+        );
+        granted
     }
 }
 
