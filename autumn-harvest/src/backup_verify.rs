@@ -1073,8 +1073,12 @@ fn route_trigger_fires(
 /// same horizon (issue #1676). A fire never outlives its target's summary,
 /// so this scan does not see it.
 ///
-/// The gap remains when no summary horizon is set. Summaries then do not
-/// exist, and no fire row is deleted.
+/// The gap remains when summaries are disabled. No summary then proves a
+/// delivered fire, and no fire row is deleted. With unbounded summaries,
+/// the summary check always wins, but fire rows also stay.
+///
+/// A fire also stays while its source execution row exists. That row can
+/// outlive the summary when `summary_age` is not above the history horizon.
 #[cfg(all(feature = "db", feature = "testing"))]
 #[must_use]
 fn absence_is_decisive_loss(
@@ -3066,8 +3070,9 @@ mod probes {
     }
 
     /// Cap on fires [`adjudicate_trigger_fires`] adjudicates per round trip
-    /// (issue #1401, Codex follow-up x2). Without a summary horizon,
-    /// `harvest_completion_trigger_fires` has no cleanup. The preceding scan admits up to
+    /// (issue #1401, Codex follow-up x2). With summaries disabled or
+    /// unbounded, `harvest_completion_trigger_fires` has no cleanup.
+    /// The preceding scan admits up to
     /// [`MAX_TRIGGER_FIRE_SCAN_PAGES`] pages. A shard whose fires are ALL
     /// confirmed-delivered can put every one of them in a single batch.
     /// Unbounded, a 255-byte-name fleet at that scale turns one `UNNEST`
@@ -3671,8 +3676,9 @@ mod probes {
     ///
     /// Chunked at [`WORKFLOW_KEY_LOOKUP_CHUNK`] fires per round trip, not
     /// per-fire and not as one whole-shard batch (issue #1401, Codex
-    /// follow-up x2). Without a summary horizon,
-    /// `harvest_completion_trigger_fires` has no cleanup. A busy fleet's confirmed-delivered fire count can reach
+    /// follow-up x2). With summaries disabled or unbounded,
+    /// `harvest_completion_trigger_fires` has no cleanup.
+    /// A busy fleet's confirmed-delivered fire count can reach
     /// into the hundreds of thousands. One query per fire, plus a second
     /// for every absent target, would make a routine restore drill issue
     /// up to two round trips per row. A single whole-shard batch, at the

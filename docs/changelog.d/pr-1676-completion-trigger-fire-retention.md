@@ -1,4 +1,4 @@
-## Phase 3.51.1 — Completion-trigger fire retention (issue #1676)
+## Phase 3.51 — Completion-trigger fire retention (issue #1676)
 
 `backup verify` proves a delivered completion-trigger fire from the target's
 `harvest_execution_summaries` row. That row expires at `--summary-age`. The
@@ -13,8 +13,10 @@ than the target's summary. `backup verify` no longer sees it.
 
 A fire stays in two cases. Its outbox row still exists, so the relay is not
 done. Its source execution row still exists, so the fire row still stops a
-second fire for that run. With no summary horizon, no fire row is deleted.
-That case keeps the timestamp guess described in the runbook §4.2(d).
+second fire for that run. With no finite summary horizon, no fire row is
+deleted. Unbounded summaries close the gap, because the summary check
+always wins. Disabled summaries keep the timestamp guess described in the
+runbook §4.2(d).
 
 Migration `20260930020953_harvest_completion_trigger_fires_fired_at_index`
 adds one index on `fired_at`. No `WorkflowEvent` variant, no replay impact,

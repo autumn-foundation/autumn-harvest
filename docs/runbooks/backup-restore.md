@@ -342,11 +342,13 @@ ack, it refuses; with the ack, it still only reads.
   `harvest_execution_summaries` closes this, since it is checked first and
   wins regardless of the timestamp — but only within the summary's own
   retention horizon (`--summary-age`). With a finite horizon, retention
-  deletes a fire row at the same horizon (issue #1676), so a fire never
-  outlives its target's summary. A fire is kept while its outbox row or its
-  source execution row still exists. The residual gap remains when no
-  summary horizon is set: summaries then do not exist, and fire rows are
-  never deleted.
+  deletes a fire row at the same horizon (issue #1676), so a fire does not
+  normally outlive its target's summary. A fire stays while its outbox row
+  or its source execution row exists. The source row can outlive the summary
+  when `--summary-age` is not above the history horizon. The residual gap
+  remains when summaries are disabled: no summary exists to prove the fire,
+  and retention never deletes a fire row. With unbounded summaries the gap
+  does not occur, but fire rows also stay.
 
   **Pre-migration fires** (rows written before `20260920215812` shipped)
   carry no recorded `target_shard`/`target_workflow_name` and fall back to

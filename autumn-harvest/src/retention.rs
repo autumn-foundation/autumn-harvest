@@ -3308,14 +3308,15 @@ pub(crate) async fn purge_expired_summaries(
 /// #1676). Returns the number of rows deleted.
 ///
 /// `backup verify` proves a delivered fire by finding its target in
-/// `harvest_execution_summaries`. That row expires at `summary_age`, and the
-/// fire row had no cleanup path. An old fire then fell back to a timestamp
-/// guess that can report a false loss. Deleting the fire at the same horizon
-/// removes it from the verify scan.
+/// `harvest_execution_summaries`. That row expires at `summary_age`. An old
+/// fire row with no summary makes verify use a timestamp guess. The guess can
+/// report a false loss. Deleting the fire row at the same horizon removes it
+/// from the verify scan.
 ///
-/// A fire fires before its target completes, so `fired_at` is never later
-/// than the target's `completed_at`. The fire therefore expires no later than
-/// the target's summary.
+/// The engine writes the fire row before its target completes. So `fired_at`
+/// is normally not later than the target's `completed_at`, and the fire
+/// expires no later than the target's summary. Clock skew between shards can
+/// keep a fire a little longer. That error keeps data and never loses it.
 ///
 /// A fire stays in two cases. First, its outbox row still exists: the relay
 /// has not delivered it. Second, its source execution row still exists: the
