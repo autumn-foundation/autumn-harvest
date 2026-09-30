@@ -1392,7 +1392,7 @@
     {
       "id": "harvest_audit_export_unobservable",
       "status": "enforceable",
-      "signal_source": "harvest.audit.export_observed{shard}, emitted every export scanner tick that reaches a shard (issue #1268).",
+      "signal_source": "harvest.audit.export_observed{shard}, emitted every export scanner tick that reaches a shard (issue #1268), and every tick after a live sink is removed (issue #1506).",
       "default_threshold": "Ticket when harvest_audit_export_observed is 0 for a shard for 10 minutes.",
       "severity": "ticket",
       "owner_persona": "security/compliance engineer",

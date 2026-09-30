@@ -32,6 +32,10 @@
 //! query runs and no new row exists: read behavior matches the code before
 //! this module existed.
 //!
+//! One exception exists (issue #1506). If a live config is removed, each tick
+//! still returns before any query. It then reports `export_observed = 0` for
+//! each shard it serves, because the gauges would otherwise keep a healthy value.
+//!
 //! Write behavior does not. `harvest_audit_log_unexported_idx` is a partial
 //! index on `export_seq IS NULL`. An unconfigured deployment leaves every row
 //! `NULL` forever, so the index matches the whole audit table, and every
@@ -802,6 +806,10 @@ pub struct AuditExportRuntimeConfig {
     pub lease: std::time::Duration,
 }
 
+// Write this static through [`set_global_audit_export_config`]. A direct write
+// skips the disable tracking of issue #1506, and the gauges then keep their
+// last value.
+//
 // `Arc`-wrapped for the same reason as `GLOBAL_CALLBACK_CONFIG` (issue #605
 // review): every read clones the value out of the lock, and the struct carries
 // owned fields that would otherwise be deep-copied on every scanner tick for a
@@ -853,6 +861,9 @@ fn read_global_audit_export_config() -> Option<std::sync::Arc<AuditExportRuntime
 /// same reason as the callback installer: the config is a single process-wide
 /// static, so a second runtime built without a sink must not keep shipping
 /// audit records to the first runtime's destination.
+///
+/// That clear marks export as disabled (issue #1506). Each export tick then
+/// reports its shards as unobserved until a sink is configured again.
 pub fn install_global_audit_export_config_for_direct_worker(config: &AuditExportBuilderConfig) {
     let Some(sink) = config.sink.clone() else {
         if config.webhook_url.is_some() {
@@ -864,9 +875,7 @@ pub fn install_global_audit_export_config_for_direct_worker(config: &AuditExport
                  default reqwest signed-webhook sink."
             );
         }
-        if let Ok(mut lock) = GLOBAL_AUDIT_EXPORT_CONFIG.write() {
-            *lock = None;
-        }
+        set_global_audit_export_config(None);
         return;
     };
     let secret = config.secret.clone().unwrap_or_else(|| {
@@ -878,14 +887,96 @@ pub fn install_global_audit_export_config_for_direct_worker(config: &AuditExport
         );
         CallbackSecret::new(Vec::new())
     });
-    if let Ok(mut lock) = GLOBAL_AUDIT_EXPORT_CONFIG.write() {
-        *lock = Some(std::sync::Arc::new(AuditExportRuntimeConfig {
-            sink,
-            secret,
-            batch_size: config.effective_batch_size(),
-            backoff: config.backoff.clone(),
-            lease: config.effective_lease(),
-        }));
+    set_global_audit_export_config(Some(std::sync::Arc::new(AuditExportRuntimeConfig {
+        sink,
+        secret,
+        batch_size: config.effective_batch_size(),
+        backoff: config.backoff.clone(),
+        lease: config.effective_lease(),
+    })));
+}
+
+/// `true` after a live export config was removed and none replaced it.
+///
+/// Only [`set_global_audit_export_config`] writes it. A process that never
+/// installed a sink never sets it, so it emits no new series (AC8).
+static EXPORT_DISABLED_AFTER_ENABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Publish or clear [`GLOBAL_AUDIT_EXPORT_CONFIG`], and track the edge.
+///
+/// Replacing a `Some` with `None` marks export as disabled (issue #1506).
+/// The exporter then reports each shard as unobserved. Without this, the
+/// gauges keep their last value and the process looks healthy. Publishing a
+/// `Some` clears the mark. The mark changes under the write lock. A tick reads
+/// the mark without the lock, so it can lag one tick behind. The next tick
+/// corrects it.
+pub fn set_global_audit_export_config(config: Option<std::sync::Arc<AuditExportRuntimeConfig>>) {
+    let mut lock = GLOBAL_AUDIT_EXPORT_CONFIG
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    apply_config_edge(&mut lock, &EXPORT_DISABLED_AFTER_ENABLE, config);
+}
+
+/// Store `config` in `slot` and update `disabled` for the edge.
+///
+/// Takes the flag as an argument so tests can use a private one.
+fn apply_config_edge(
+    slot: &mut Option<std::sync::Arc<AuditExportRuntimeConfig>>,
+    disabled: &std::sync::atomic::AtomicBool,
+    config: Option<std::sync::Arc<AuditExportRuntimeConfig>>,
+) {
+    use std::sync::atomic::Ordering;
+
+    let was_configured = slot.is_some();
+    *slot = config;
+    if slot.is_some() {
+        disabled.store(false, Ordering::Relaxed);
+    } else if was_configured {
+        disabled.store(true, Ordering::Relaxed);
+    }
+}
+
+#[cfg(feature = "db")]
+fn export_disabled_after_enable() -> bool {
+    EXPORT_DISABLED_AFTER_ENABLE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Shards an unconfigured tick reports on.
+///
+/// Mirrors the shard choice of [`fire_due_audit_exports`]: the assignments
+/// when a sharded pool has any, else the pool default (or `0` when unsharded).
+#[cfg(feature = "db")]
+fn disabled_tick_shards(
+    pool_default: Option<i32>,
+    assignments: &[crate::types::ShardId],
+) -> Vec<i32> {
+    if pool_default.is_some() && !assignments.is_empty() {
+        assignments.iter().map(|s| s.as_i32()).collect()
+    } else {
+        vec![pool_default.unwrap_or(0)]
+    }
+}
+
+/// Mark one shard unobserved when export was disabled (issue #1506).
+///
+/// Does nothing for a process that never had export configured.
+#[cfg(feature = "db")]
+fn report_export_disabled(
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
+    shard: u16,
+) {
+    report_if_disabled(export_disabled_after_enable(), metrics, shard);
+}
+
+#[cfg(feature = "db")]
+fn report_if_disabled(
+    disabled: bool,
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
+    shard: u16,
+) {
+    if disabled {
+        metrics.record_audit_export_observed(shard, false);
     }
 }
 
@@ -2372,8 +2463,9 @@ async fn emit_lag_and_observed(
 /// fan-out, because audit rows live on the shard whose database recorded
 /// them, and a single-connection scan would never see the others.
 ///
-/// A no-op (returns `Ok(0)` **before any query**) when no audit sink has been
-/// configured (AC8).
+/// Returns `Ok(0)` **before any query** when no audit sink is configured (AC8).
+/// It emits no metric, unless a sink was removed after it was enabled. Then it
+/// reports each shard unobserved (issue #1506).
 ///
 /// # Connection handling
 ///
@@ -2401,6 +2493,13 @@ pub async fn fire_due_audit_exports(
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> crate::error::HarvestResult<usize> {
     let Some(config) = read_global_audit_export_config() else {
+        // Issue #1506: report a disabled export instead of freezing the gauges.
+        if export_disabled_after_enable() {
+            let pool_default = sharded_pool.as_ref().map(|sp| sp.default_shard().as_i32());
+            for shard in disabled_tick_shards(pool_default, shard_assignments) {
+                report_export_disabled(metrics, u16::try_from(shard).unwrap_or(u16::MAX));
+            }
+        }
         return Ok(0);
     };
 
@@ -2635,7 +2734,9 @@ async fn acquire_shard_conn_for_export(
 /// during the reacquire wait between the two, after an earlier fence check
 /// but before a stale `Advance` outcome commits.
 ///
-/// Returns `Ok(0)` before any query when no sink is configured (AC8).
+/// Returns `Ok(0)` before any query when no sink is configured (AC8). It
+/// reports the shard unobserved if a sink was removed after it was enabled
+/// (issue #1506).
 ///
 /// # Errors
 /// Returns `HarvestError` on a genuine database failure inside a claimed
@@ -2650,11 +2751,13 @@ async fn export_once_via_pool(
     cancel: &tokio_util::sync::CancellationToken,
     config_arc: Option<std::sync::Arc<AuditExportRuntimeConfig>>,
 ) -> crate::error::HarvestResult<usize> {
+    let shard_u16 = u16::try_from(shard_id).unwrap_or(u16::MAX);
     let Some(config_arc) = config_arc else {
+        // Issue #1506: report a disabled export instead of freezing the gauges.
+        report_export_disabled(metrics, shard_u16);
         return Ok(0);
     };
     let config = config_arc.as_ref();
-    let shard_u16 = u16::try_from(shard_id).unwrap_or(u16::MAX);
 
     let Some(mut conn) =
         acquire_shard_conn_for_export(pool, shard_id, shard_u16, metrics, SHARD_ACQUIRE_BOUND)
@@ -3947,5 +4050,123 @@ mod tests {
         assert_bounds::<NoopSink>();
         let boxed: Box<dyn AuditSink> = Box::new(NoopSink);
         let _arc: std::sync::Arc<dyn AuditSink> = std::sync::Arc::from(boxed);
+    }
+
+    // ── Disabled-after-enabled signal (issue #1506) ─────────────────────────
+    //
+    // These tests use a private slot and flag. Builder tests in this binary
+    // write the process-wide statics at the same time.
+
+    #[cfg(feature = "db")]
+    #[derive(Default)]
+    struct ObservedLog(std::sync::Mutex<Vec<(u16, bool)>>);
+
+    #[cfg(feature = "db")]
+    impl crate::telemetry::MetricsRecorder for ObservedLog {
+        fn record_audit_export_observed(&self, shard: u16, observed: bool) {
+            self.0.lock().expect("log lock").push((shard, observed));
+        }
+    }
+
+    #[cfg(feature = "db")]
+    fn live_config() -> std::sync::Arc<AuditExportRuntimeConfig> {
+        std::sync::Arc::new(AuditExportRuntimeConfig {
+            sink: std::sync::Arc::new(NoopSink),
+            secret: CallbackSecret::new(b"k".to_vec()),
+            batch_size: 10,
+            backoff: ExportBackoff::default(),
+            lease: Duration::from_secs(30),
+        })
+    }
+
+    /// A private config slot and flag.
+    #[cfg(feature = "db")]
+    #[derive(Default)]
+    struct Edge {
+        slot: Option<std::sync::Arc<AuditExportRuntimeConfig>>,
+        disabled: std::sync::atomic::AtomicBool,
+    }
+
+    #[cfg(feature = "db")]
+    impl Edge {
+        fn set(&mut self, live: bool) {
+            apply_config_edge(&mut self.slot, &self.disabled, live.then(live_config));
+        }
+
+        fn report(&self, shard: u16, log: &ObservedLog) {
+            report_if_disabled(
+                self.disabled.load(std::sync::atomic::Ordering::Relaxed),
+                log,
+                shard,
+            );
+        }
+
+        fn observed(&self) -> Vec<(u16, bool)> {
+            let log = ObservedLog::default();
+            self.report(3, &log);
+            log.0.lock().expect("log lock").clone()
+        }
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn disabling_a_live_export_marks_the_shard_unobserved() {
+        let mut edge = Edge::default();
+        edge.set(true);
+        edge.set(false);
+        assert_eq!(edge.observed(), vec![(3, false)]);
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn a_never_configured_process_reports_nothing() {
+        let mut edge = Edge::default();
+        edge.set(false);
+        assert!(edge.observed().is_empty());
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn reenabling_export_clears_the_signal() {
+        let mut edge = Edge::default();
+        for live in [true, false, true] {
+            edge.set(live);
+        }
+        assert!(edge.observed().is_empty());
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn clearing_twice_keeps_the_signal() {
+        let mut edge = Edge::default();
+        for live in [true, false, false] {
+            edge.set(live);
+        }
+        assert_eq!(edge.observed(), vec![(3, false)]);
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn the_signal_repeats_on_every_tick() {
+        let mut edge = Edge::default();
+        edge.set(true);
+        edge.set(false);
+        let log = ObservedLog::default();
+        edge.report(1, &log);
+        edge.report(2, &log);
+        assert_eq!(
+            *log.0.lock().expect("log lock"),
+            vec![(1, false), (2, false)]
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn disabled_ticks_report_assigned_shards_or_the_default() {
+        use crate::types::ShardId;
+        let assigned = [ShardId::new(4), ShardId::new(7)];
+        assert_eq!(disabled_tick_shards(Some(0), &assigned), vec![4, 7]);
+        assert_eq!(disabled_tick_shards(Some(2), &[]), vec![2]);
+        assert_eq!(disabled_tick_shards(None, &assigned), vec![0]);
     }
 }

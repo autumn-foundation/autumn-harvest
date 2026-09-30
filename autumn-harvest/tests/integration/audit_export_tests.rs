@@ -358,6 +358,57 @@ async fn unconfigured_export_never_touches_anything() {
     );
 }
 
+/// Clears the disabled mark and the config on drop, even after a panic.
+struct DisableMarkGuard;
+
+impl Drop for DisableMarkGuard {
+    fn drop(&mut self) {
+        autumn_harvest::audit_export::set_global_audit_export_config(Some(Arc::new(
+            AuditExportRuntimeConfig {
+                sink: Arc::new(RecordingSink::new(200)),
+                secret: CallbackSecret::new(b"test-secret".to_vec()),
+                batch_size: 10,
+                backoff: ExportBackoff::default(),
+                lease: std::time::Duration::from_secs(60),
+            },
+        )));
+        uninstall();
+    }
+}
+
+/// Issue #1506: disabling a live export must not leave `export_observed` at 1.
+#[tokio::test]
+async fn disabling_a_live_export_marks_the_default_shard_unobserved() {
+    let _guard = TEST_SERIAL.lock().await;
+    let _mark = DisableMarkGuard;
+    let (mut conn, _c) = make_conn().await;
+    let metrics = RecordingMetrics::default();
+
+    autumn_harvest::audit_export::set_global_audit_export_config(Some(Arc::new(
+        AuditExportRuntimeConfig {
+            sink: Arc::new(RecordingSink::new(200)),
+            secret: CallbackSecret::new(b"test-secret".to_vec()),
+            batch_size: 10,
+            backoff: ExportBackoff::default(),
+            lease: std::time::Duration::from_secs(60),
+        },
+    )));
+    autumn_harvest::audit_export::set_global_audit_export_config(None);
+    fire_due_audit_exports(&mut conn, &None, &[], &metrics)
+        .await
+        .expect("scanner runs");
+
+    assert_eq!(
+        *metrics.observed.lock().expect("observed"),
+        vec![(0, false)],
+        "a disabled export must report the shard unobserved"
+    );
+    assert!(
+        metrics.lag.lock().expect("lag").is_empty(),
+        "the lag gauge stays untouched"
+    );
+}
+
 // ── AC4: dense, strictly monotonic per-shard sequences ───────────────────────
 
 #[tokio::test]

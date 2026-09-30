@@ -696,6 +696,14 @@ and tenant-identifying (ADR-0001 §7).
 The gauge is emitted on **every** exporter tick, including ticks that deliver
 nothing — the signal must not go stale precisely when delivery has stopped.
 
+> **Disabled export (issue #1506).** A runtime rebuilt with no sink stops
+> exporting. Each export tick then sets `export_observed` to `0` for each shard
+> it serves, until a sink is configured again. `export_lag` keeps its last
+> value. A process that never configured export emits no new series. Set the
+> config only through `set_global_audit_export_config`. A deliberate disable
+> fires `harvest_audit_export_unobservable`, so silence that alert for the
+> process.
+
 A suggested alert: `harvest_audit_export_lag > 300` for 10 minutes. Sustained
 lag means privileged-action logs are not reaching the SIEM. Nothing is lost —
 the cursor is held rather than advanced — but the window during which a
