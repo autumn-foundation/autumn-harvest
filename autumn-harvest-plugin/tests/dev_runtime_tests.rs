@@ -2471,6 +2471,18 @@ fn reap_skips_an_old_session_when_a_process_names_its_data_dir() {
     );
 }
 
+/// Kills and reaps a child, so a failed assertion leaks no process.
+#[cfg(unix)]
+struct KillOnDrop(std::process::Child);
+
+#[cfg(unix)]
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn an_old_session_with_a_live_process_on_its_data_dir_survives_the_full_reap_pipeline() {
@@ -2492,14 +2504,15 @@ fn an_old_session_with_a_live_process_on_its_data_dir_survives_the_full_reap_pip
     )
     .expect("write record");
 
-    let mut child = std::process::Command::new("sh")
-        .args(["-c", "sleep 30", "--pgdata"])
+    // The trailing `:` stops `sh` from exec-ing `sleep`, which would drop the
+    // data directory from the command line.
+    let child = std::process::Command::new("sh")
+        .args(["-c", "sleep 30; :", "--pgdata"])
         .arg(&data_dir)
         .spawn()
         .expect("spawn stand-in postmaster");
+    let _guard = KillOnDrop(child);
     let reclaimed = autumn_harvest_plugin::dev::reap_stale_sessions(&root).expect("reap");
-    let _ = child.kill();
-    let _ = child.wait();
 
     assert_eq!(
         reclaimed, 0,

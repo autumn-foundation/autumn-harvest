@@ -27,7 +27,9 @@
 //! 3. **A pid is not an identity.** The recorded postmaster start time must
 //!    still match, so a reused pid is never mistaken for the process we
 //!    started. A record with no start time is *unknown*, not a match — a
-//!    live pid there is left alone rather than reaped (issue #1295).
+//!    live pid there is left alone rather than reaped (issue #1295). With no
+//!    pid at all, a live process on the data directory also blocks reaping
+//!    (issue #1585).
 //! 4. **No blind kill.** A cluster we could not stop through `pg_ctl` is left
 //!    running *and* its directory is left in place, because deleting the data
 //!    directory out from under a live postmaster is worse than leaking it.
@@ -528,13 +530,29 @@ fn command_names_data_dir(command: &str, data_dir: &str) -> bool {
                 .chars()
                 .next_back()
                 .is_none_or(char::is_whitespace);
-            let path_ends_a_word = command[start + needle.len()..]
-                .chars()
-                .next()
-                .is_none_or(char::is_whitespace);
+            // One trailing slash still names the same directory.
+            let rest = &command[start + needle.len()..];
+            let rest = rest.strip_prefix('/').unwrap_or(rest);
+            let path_ends_a_word = rest.chars().next().is_none_or(char::is_whitespace);
             flag_starts_a_word && path_ends_a_word
         })
     })
+}
+
+/// Whether one `ps -o pid=,state=,command=` line is a live process, other than
+/// `self_pid`, that names `data_dir`.
+#[cfg(any(all(unix, not(target_os = "linux")), test))]
+fn ps_line_names_data_dir(line: &str, self_pid: u32, data_dir: &str) -> bool {
+    let mut rest = line.trim_start();
+    let mut next_field = || {
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let (field, tail) = rest.split_at(end);
+        rest = tail.trim_start();
+        field
+    };
+    let pid = next_field().parse::<u32>().ok();
+    let state = next_field();
+    pid != Some(self_pid) && !state.starts_with('Z') && command_names_data_dir(rest, data_dir)
 }
 
 /// Whether a live process other than this one names `data_dir`.
@@ -543,10 +561,12 @@ fn command_names_data_dir(command: &str, data_dir: &str) -> bool {
 /// #1585). Linux reads `/proc/<pid>/cmdline`. Other Unix systems use `ps`.
 /// Windows has no scan, and neither does a process table that cannot be read.
 /// Those cases return `false`, so the startup grace period is the only guard.
+/// Hand-started servers (`-c data_directory=` or `PGDATA`) are not matched.
+/// An unrelated long-lived process that names the directory blocks reaping.
+/// That leaks a directory, which is the safe direction.
 fn live_process_names_data_dir(data_dir: &Path) -> bool {
-    let Some(data_dir) = data_dir.to_str() else {
-        return false;
-    };
+    let data_dir = data_dir.to_string_lossy();
+    let data_dir = data_dir.as_ref();
     let self_pid = std::process::id();
     #[cfg(target_os = "linux")]
     {
@@ -578,15 +598,9 @@ fn live_process_names_data_dir(data_dir: &Path) -> bool {
             .ok()
             .filter(|output| output.status.success())
             .is_some_and(|output| {
-                String::from_utf8_lossy(&output.stdout).lines().any(|line| {
-                    let mut parts = line.trim_start().splitn(3, char::is_whitespace);
-                    let pid = parts.next().and_then(|pid| pid.parse::<u32>().ok());
-                    let state = parts.next().unwrap_or_default();
-                    let command = parts.next().unwrap_or_default();
-                    pid != Some(self_pid)
-                        && !state.starts_with('Z')
-                        && command_names_data_dir(command, data_dir)
-                })
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .any(|line| ps_line_names_data_dir(line, self_pid, data_dir))
             })
     }
     #[cfg(not(unix))]
@@ -821,7 +835,7 @@ pub fn rewrite_owner_pid_for_test(session_dir: &Path, owner_pid: u32) {
 mod tests {
     use super::{
         PostmasterIdentity, SessionRecord, command_names_data_dir, directory_is_ours,
-        postmaster_identity,
+        postmaster_identity, ps_line_names_data_dir,
     };
 
     const DIR: &str = "/tmp/harvest-dev-0/session-1-aa/data";
@@ -854,6 +868,22 @@ mod tests {
             &format!("postgres -D {DIR}/sub"),
             DIR
         ));
+    }
+
+    /// Issue #1585. One trailing slash names the same directory.
+    #[test]
+    fn a_trailing_slash_still_names_the_data_dir() {
+        assert!(command_names_data_dir(&format!("postgres -D {DIR}/"), DIR));
+    }
+
+    /// Issue #1585. A `ps` line is a match only for a live process that is not us.
+    #[test]
+    fn a_ps_line_matches_only_a_live_other_process() {
+        let line = |pid: u32, state: &str| format!("  {pid} {state}  postgres -D {DIR}");
+        assert!(ps_line_names_data_dir(&line(10, "Ss"), 99, DIR));
+        assert!(!ps_line_names_data_dir(&line(99, "Ss"), 99, DIR));
+        assert!(!ps_line_names_data_dir(&line(10, "Z"), 99, DIR));
+        assert!(!ps_line_names_data_dir("10 Ss postgres -D /other", 99, DIR));
     }
 
     /// Issue #1585. The path alone, without a data-dir flag, is not a match.

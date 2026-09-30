@@ -145,7 +145,8 @@ pub enum SkipReason {
     /// Issue #1299: `pg_ctl` may have already launched Postgres before the
     /// owner was killed, and `postmaster.pid` appears only once the
     /// postmaster itself writes it. Absence is evidence only once the
-    /// startup grace period has passed.
+    /// startup grace period has passed and no live process names the data
+    /// directory (issue #1585).
     PossiblyStillStarting,
     /// No postmaster pid is known, but a live process names the data directory.
     PostmasterProcessFound,
@@ -194,8 +195,8 @@ pub fn record_is_self_consistent(record: &SessionRecord, session_dir: &Path) -> 
 /// postmaster writes its pid file within a small fraction of it.
 ///
 /// This is the fallback. The reaper first looks for a live process on the
-/// data directory (issue #1585), because a suspend ages a wall-clock deadline
-/// without letting the postmaster run.
+/// data directory (issue #1585). A suspend ages a wall-clock deadline without
+/// letting the postmaster run.
 ///
 /// Wall-clock, like `created_at` itself: a clock set backward after a
 /// record is written could delay reaping it, never bring one forward. This
@@ -208,7 +209,7 @@ const POSTMASTER_STARTUP_GRACE: chrono::Duration = chrono::Duration::seconds(15)
 /// Pure: liveness, identity and the current time are all supplied by the
 /// caller. The whole table can be tested without processes or a real clock.
 ///
-/// `postmaster` decides between three outcomes, not two. `Confirmed` reaps
+/// `postmaster` selects the outcome. `Confirmed` reaps
 /// through `StopThenRemove`. `NotRunning` removes the directory with no
 /// signal — nothing is there to signal. The exception is a record still
 /// within its startup grace period (issue #1299): there, absence is not yet
