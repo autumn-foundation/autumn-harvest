@@ -23,8 +23,8 @@ Built-in calendars (`built_in = true`) cannot be deleted via `DELETE /calendars/
 | Value | Behaviour when fire date is excluded |
 |-------|--------------------------------------|
 | `skip` (default) | Drop the firing; record `harvest.schedule.skipped` metric with `reason = "calendar"`. The schedule advances to the next computed fire time. |
-| `run_next_business_day` | Advance to the nearest non-excluded weekday **after** the excluded date (scans forward up to 365 days). |
-| `run_prev_business_day` | Retreat to the nearest non-excluded weekday **before** the excluded date (scans backward up to 365 days). |
+| `run_next_business_day` | Advance to the nearest non-excluded weekday **after** the excluded date. The target is never a Saturday or Sunday. The scan covers up to 365 days. |
+| `run_prev_business_day` | Retreat to the nearest non-excluded weekday **before** the excluded date. The target is never a Saturday or Sunday. The scan covers up to 365 days. |
 
 ---
 
@@ -182,4 +182,5 @@ This is separate from `reason="overlap"` skips (overlap policy) so dashboards ca
 
 - Calendar filtering happens **after** jitter is applied and **before** overlap policy evaluation. The effective fire time shown in the preview already includes jitter.
 - `weekends-off` is enforced by `apply_skip_policy` checking `weekday()` on the candidate date directly; Saturday and Sunday are never "business days" regardless of what exclusion rows say.
+- A shift target is a weekday for every calendar, not only `weekends-off`. A weekend slot that is not excluded keeps its date, because only the shift scan applies the weekday rule.
 - If a calendar is deleted while schedules still reference it, those schedules degrade gracefully to no filtering (the calendar lookup returns an empty exclusion set).

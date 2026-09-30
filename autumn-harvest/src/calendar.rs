@@ -43,8 +43,12 @@ pub fn is_excluded_date(date: NaiveDate, excluded_dates: &[NaiveDate]) -> bool {
 /// Internal helper: returns `true` if `date` should be treated as excluded,
 /// checking both the explicit exclusion list and the weekend flag.
 fn is_excluded_impl(date: NaiveDate, excluded_dates: &[NaiveDate], exclude_weekends: bool) -> bool {
-    (exclude_weekends && matches!(date.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun))
-        || excluded_dates.contains(&date)
+    (exclude_weekends && is_weekend(date)) || excluded_dates.contains(&date)
+}
+
+/// Returns `true` when `date` is a Saturday or Sunday.
+fn is_weekend(date: NaiveDate) -> bool {
+    matches!(date.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun)
 }
 
 /// Shared skip-search: advances `date` per `skip_policy` using `is_excluded`
@@ -53,6 +57,10 @@ fn is_excluded_impl(date: NaiveDate, excluded_dates: &[NaiveDate], exclude_weeke
 /// two copies that could drift. Those representations are `&[NaiveDate]`
 /// for a single lookup, and `&BTreeSet<NaiveDate>` for a caller repeating
 /// this check across many dates.
+///
+/// A shift target must be a weekday and not excluded (issue #1772). The
+/// weekday rule applies to the scan only. The check on `date` itself uses
+/// `is_excluded`, so a weekend slot that is not excluded keeps its date.
 fn apply_skip_policy_with(
     date: NaiveDate,
     skip_policy: SkipPolicy,
@@ -61,12 +69,13 @@ fn apply_skip_policy_with(
     if !is_excluded(date) {
         return Some(date);
     }
+    let is_target = |d: NaiveDate| !is_weekend(d) && !is_excluded(d);
     match skip_policy {
         SkipPolicy::Skip => None,
         SkipPolicy::RunNextBusinessDay => {
             let mut candidate = date + chrono::Duration::days(1);
             for _ in 0..365 {
-                if !is_excluded(candidate) {
+                if is_target(candidate) {
                     return Some(candidate);
                 }
                 candidate += chrono::Duration::days(1);
@@ -76,7 +85,7 @@ fn apply_skip_policy_with(
         SkipPolicy::RunPrevBusinessDay => {
             let mut candidate = date - chrono::Duration::days(1);
             for _ in 0..365 {
-                if !is_excluded(candidate) {
+                if is_target(candidate) {
                     return Some(candidate);
                 }
                 candidate -= chrono::Duration::days(1);
@@ -93,10 +102,13 @@ fn apply_skip_policy_with(
 /// - `SkipPolicy::RunNextBusinessDay` → first subsequent non-excluded weekday.
 /// - `SkipPolicy::RunPrevBusinessDay` → most recent preceding non-excluded weekday.
 ///
+/// A shift target is never a Saturday or Sunday, whatever `exclude_weekends` is.
+///
 /// Set `exclude_weekends = true` when the attached calendar is `"weekends-off"`
 /// (or any calendar that implies Saturday/Sunday are always excluded). When
 /// `true`, Saturday and Sunday are treated as excluded regardless of whether they
-/// appear in `excluded_dates`.
+/// appear in `excluded_dates`. When `false`, a weekend `date` that is not in
+/// `excluded_dates` is returned unchanged.
 ///
 /// Scans up to 365 days in either direction; returns `None` if no non-excluded
 /// day can be found within that window (degenerate calendar with 365 consecutive
@@ -145,8 +157,7 @@ fn apply_skip_policy_indexed(
     exclude_weekends: bool,
 ) -> Option<NaiveDate> {
     apply_skip_policy_with(date, skip_policy, |d| {
-        (exclude_weekends && matches!(d.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun))
-            || excluded.contains(&d)
+        (exclude_weekends && is_weekend(d)) || excluded.contains(&d)
     })
 }
 
@@ -189,8 +200,7 @@ pub const MAX_BUSINESS_DAYS: u32 = 3650;
 /// [`is_excluded_date`] performs.
 #[must_use]
 pub fn is_business_day(date: NaiveDate, holidays: &std::collections::BTreeSet<NaiveDate>) -> bool {
-    !matches!(date.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun)
-        && !holidays.contains(&date)
+    !is_weekend(date) && !holidays.contains(&date)
 }
 
 /// A resolved business-day deadline plus the non-business dates stepped over.
@@ -1613,7 +1623,7 @@ mod tests {
                 &exc,
                 false
             ),
-            Some(date("2026-07-05"))
+            Some(date("2026-07-06"))
         );
     }
 
@@ -1641,7 +1651,7 @@ mod tests {
                 &exc,
                 false
             ),
-            Some(date("2026-08-09"))
+            Some(date("2026-08-10"))
         );
     }
 
@@ -1687,6 +1697,64 @@ mod tests {
             apply_skip_policy(start_date, SkipPolicy::RunPrevBusinessDay, &exc, false),
             None
         );
+    }
+
+    // ── shift target is always a weekday (issue #1772) ────────────────────────
+
+    #[test]
+    fn apply_skip_policy_next_skips_weekend_without_weekend_flag() {
+        // Fri 2026-07-03 is a holiday. Sat and Sun are not in the list.
+        let exc = excluded(&["2026-07-03"]);
+        assert_eq!(
+            apply_skip_policy(
+                date("2026-07-03"),
+                SkipPolicy::RunNextBusinessDay,
+                &exc,
+                false
+            ),
+            Some(date("2026-07-06"))
+        );
+    }
+
+    #[test]
+    fn apply_skip_policy_prev_skips_weekend_without_weekend_flag() {
+        // Mon 2026-01-19 is a holiday. Sat and Sun are not in the list.
+        let exc = excluded(&["2026-01-19"]);
+        assert_eq!(
+            apply_skip_policy(
+                date("2026-01-19"),
+                SkipPolicy::RunPrevBusinessDay,
+                &exc,
+                false
+            ),
+            Some(date("2026-01-16"))
+        );
+    }
+
+    #[test]
+    fn apply_skip_policy_weekend_slot_is_not_shifted_without_weekend_flag() {
+        // A weekend slot that is not excluded keeps its date.
+        let d = date("2026-07-04");
+        assert_eq!(
+            apply_skip_policy(d, SkipPolicy::RunNextBusinessDay, &[], false),
+            Some(d)
+        );
+        assert_eq!(apply_skip_policy(d, SkipPolicy::Skip, &[], false), Some(d));
+    }
+
+    #[test]
+    fn apply_skip_policy_shift_target_is_never_a_weekend() {
+        let exc = excluded(&["2026-07-03", "2026-07-06"]);
+        for exclude_weekends in [false, true] {
+            let next = apply_skip_policy(
+                date("2026-07-03"),
+                SkipPolicy::RunNextBusinessDay,
+                &exc,
+                exclude_weekends,
+            )
+            .unwrap();
+            assert_eq!(next, date("2026-07-07"));
+        }
     }
 
     // ── preview_schedule_firings ──────────────────────────────────────────────
@@ -1763,7 +1831,7 @@ mod tests {
             assert!(deferred.effective_at.is_some());
             assert_eq!(
                 deferred.effective_at.unwrap().date_naive(),
-                date("2026-07-05")
+                date("2026-07-06")
             );
             assert!(
                 deferred.reason.starts_with("DeferredFrom:"),
