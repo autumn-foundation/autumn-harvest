@@ -3824,10 +3824,11 @@ async fn completion_trigger_defers_to_outbox_when_target_quota_exceeded() {
     // One decision cycle resolves the target quota, writes the outbox row and
     // completes the source. The 30 s bound absorbs a loaded CI runner.
     //
-    // Issue #1693: an earlier stall here was not a slow claim. The shared
+    // Issue #1693: an earlier stall here was not a slow claim. The hand-kept
     // test schema lacked a migration. The completion transaction failed on
-    // every retry and rolled back the source. The schema guard in
-    // `integration_e2e.rs` prevents a repeat.
+    // every retry and rolled back the source. The shared schema now comes from
+    // `autumn_harvest::test_init_sql()`. A guard test in `integration_e2e.rs`
+    // compares it with the migrations.
     wait_for_execution_state_with_timeout(
         &url,
         source,

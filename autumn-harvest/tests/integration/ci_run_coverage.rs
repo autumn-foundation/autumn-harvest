@@ -9,7 +9,7 @@
 //! bugs.
 //!
 //! This is a *run-coverage* guard, deliberately distinct from *migration
-//! drift* (a hand-rolled `INIT_SQL` bundle missing a migration, which would
+//! drift* (a hand-rolled migration bundle missing a migration, which would
 //! fail `column/relation ... does not exist` at runtime). Drift is guarded
 //! separately in `migration_hygiene.rs`; this guard only answers "is every
 //! DB-gated test actually RUN by some CI step?" — never whether its schema

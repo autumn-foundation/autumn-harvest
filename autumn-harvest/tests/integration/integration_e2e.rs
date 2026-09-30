@@ -1130,20 +1130,21 @@ pub(crate) async fn wait_for_execution_state_with_timeout(
         }
     })
     .await;
-    match waited {
-        Ok(execution) => execution,
-        Err(elapsed) => panic!(
-            "workflow should reach expected state within timeout: {elapsed:?}\n{}",
-            describe_stuck_execution(database_url, exec_id).await
-        ),
+    if let Ok(execution) = waited {
+        return execution;
     }
+    panic!(
+        "workflow should reach expected state within timeout: wanted {expected_state} \
+         within {timeout:?}\n{}",
+        describe_stuck_execution(database_url, exec_id).await
+    );
 }
 
-/// Describe an execution and its queued tasks for a timeout message (issue
-/// #1693).
+/// Describe an execution and its queued tasks for a timeout message.
 ///
 /// A decision cycle that fails on every retry leaves a queued task with a
-/// recorded error. The state alone hides that error.
+/// recorded error. The state alone hides that error (issue #1693). A failed
+/// lookup returns its own error text, so it never hides the timeout.
 async fn describe_stuck_execution(database_url: &str, exec_id: ExecutionId) -> String {
     #[derive(diesel::QueryableByName)]
     struct TaskRow {
@@ -1157,29 +1158,39 @@ async fn describe_stuck_execution(database_url: &str, exec_id: ExecutionId) -> S
         error: Option<String>,
     }
 
-    let execution = load_execution_from_url(database_url, exec_id).await;
-    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(database_url)
-        .await
-        .expect("failed to connect fresh Postgres client for task query");
-    let tasks = diesel::sql_query(
-        "SELECT state, attempt, scheduled_at::text AS scheduled_at, error \
-         FROM harvest_task_queue WHERE workflow_exec_id = $1 ORDER BY created_at",
-    )
-    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
-    .load::<TaskRow>(&mut conn)
-    .await
-    .expect("failed to read the execution's tasks");
-    let mut lines = vec![format!("execution state: {}", execution.state)];
-    lines.extend(tasks.iter().map(|t| {
-        format!(
-            "harvest_task_queue: state {}, attempt {}, scheduled_at {}, task error: {}",
-            t.state,
-            t.attempt,
-            t.scheduled_at,
-            t.error.as_deref().unwrap_or("none")
+    let described = async {
+        let mut conn =
+            <AsyncPgConnection as diesel_async::AsyncConnection>::establish(database_url)
+                .await
+                .map_err(|e| e.to_string())?;
+        let execution_state = harvest_workflow_executions::table
+            .find(exec_id.as_uuid())
+            .select(harvest_workflow_executions::state)
+            .first::<String>(&mut conn)
+            .await
+            .map_err(|e| e.to_string())?;
+        let tasks = diesel::sql_query(
+            "SELECT state, attempt, scheduled_at::text AS scheduled_at, error \
+             FROM harvest_task_queue WHERE workflow_exec_id = $1 ORDER BY created_at",
         )
-    }));
-    lines.join("\n")
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .load::<TaskRow>(&mut conn)
+        .await
+        .map_err(|e| e.to_string())?;
+        let mut lines = vec![format!("execution state: {execution_state}")];
+        lines.extend(tasks.iter().map(|t| {
+            format!(
+                "harvest_task_queue: state {}, attempt {}, scheduled_at {}, task error: {}",
+                t.state,
+                t.attempt,
+                t.scheduled_at,
+                t.error.as_deref().unwrap_or("none")
+            )
+        }));
+        Ok::<String, String>(lines.join("\n"))
+    }
+    .await;
+    described.unwrap_or_else(|e| format!("could not describe the stuck execution: {e}"))
 }
 
 /// A timed-out wait names the stuck task and its last error (issue #1693).
@@ -1189,7 +1200,7 @@ async fn describe_stuck_execution(database_url: &str, exec_id: ExecutionId) -> S
 #[tokio::test]
 #[should_panic(expected = "task error: simulated persist failure")]
 async fn wait_timeout_reports_the_stuck_task_error() {
-    let (database_url, _container) = setup_test_database_url_or_env().await;
+    let (database_url, _container) = setup_test_database_url().await;
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
         .await
         .expect("connect to the test database");
@@ -12118,14 +12129,15 @@ async fn windowed_fan_out_peak_task_rows_bounded_by_window() {
     assert_eq!(markers, 1, "exactly one fan_out marker recorded");
 }
 
-/// Guard (issue #1693): the shared test database must match the full
-/// migration bundle.
+/// Guard (issue #1693): the shared test database must match the migrations.
 ///
-/// A hand-kept migration list in the shared fixture lacked one migration.
-/// The source's completion transaction then failed on every retry, and
-/// `quota_enforcement_tests` timed out with no error. This test builds the
-/// full schema in a second database on the same server. It then compares
-/// the column sets of both databases.
+/// A hand-kept migration list in the shared fixture lacked a migration. The
+/// completion transaction of the source then failed on every retry.
+/// `quota_enforcement_tests` timed out with no error.
+///
+/// This test builds a reference database by applying each `migrations/*/up.sql`
+/// file in order. That path does not use the generated bundle. The test
+/// compares the columns, types and nullability of both databases.
 #[tokio::test]
 async fn shared_test_database_schema_matches_full_migrations() {
     #[derive(diesel::QueryableByName, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -12161,10 +12173,28 @@ async fn shared_test_database_schema_matches_full_migrations() {
     ))
     .await
     .expect("connect to the reference database");
+    let migrations_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    let mut migration_names: Vec<String> = std::fs::read_dir(&migrations_dir)
+        .expect("read the migrations directory")
+        .map(|entry| entry.expect("read a migration entry"))
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    migration_names.sort();
+    for name in &migration_names {
+        let up_sql = std::fs::read_to_string(migrations_dir.join(name).join("up.sql"))
+            .unwrap_or_else(|e| panic!("read {name}/up.sql: {e}"));
+        reference
+            .batch_execute(&up_sql)
+            .await
+            .unwrap_or_else(|e| panic!("apply {name}: {e}"));
+    }
+    // The partitioned layout adds a suffix on top of the migrations.
+    let init_sql = autumn_harvest::test_init_sql();
     reference
-        .batch_execute(&autumn_harvest::test_init_sql())
+        .batch_execute(&init_sql[autumn_harvest::full_migrations_sql().len()..])
         .await
-        .expect("apply the full migration bundle");
+        .expect("apply the layout suffix");
 
     let shared_columns: std::collections::BTreeSet<ColumnRow> = diesel::sql_query(COLUMNS_SQL)
         .load(&mut shared)
