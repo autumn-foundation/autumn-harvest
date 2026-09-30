@@ -851,6 +851,8 @@ or queue coverage or fix worker eligibility.
 2. Inspect `no_live_worker` and its `blocking_reasons`. The reason code means no
    live worker can claim at least one demand. It does not prove poller absence.
 3. Branch on `blocking_reasons`:
+   - `are stale, unhealthy, draining, or stopped` means an assigned poller exists but is not
+     live. Restore, restart, or reactivate that worker.
    - `polls queue(s)` means no shard-assigned worker polls the pending queue.
      Start or widen a worker's shard and queue coverage.
    - `capability/build/sticky requirements` means a covering poller is present
@@ -903,7 +905,8 @@ while it finishes — cross-check `harvest shard health` for its writable flag.
 ### Safe actions
 
 For a `polls queue(s)` block, remove explicit `with_shard_assignments`
-narrowing, add the shard, or add the queue. For a
+narrowing, add the shard, or add the queue. For a `are stale, unhealthy, draining, or stopped`
+block, restore, restart, or reactivate the assigned worker. For a
 `capability/build/sticky requirements` block, fix the named eligibility
 constraint. Configuration changes take effect on worker restart. Do **not**
 move executions across shards. Execution ids encode the original shard.
