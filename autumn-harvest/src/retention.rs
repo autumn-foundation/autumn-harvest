@@ -1701,6 +1701,24 @@ impl RetentionRuntime {
                                     tracing::warn!(shard = %shard, error = %err, "harvest execution-summary GC failed");
                                 }
                             }
+                            // Fires expire with their target's summary
+                            // (issue #1676).
+                            match purge_expired_trigger_fires(
+                                &mut conn,
+                                summary_age,
+                                config.batch_size,
+                                now,
+                            )
+                            .await
+                            {
+                                Ok(0) => {}
+                                Ok(n) => {
+                                    tracing::debug!(shard = %shard, deleted = n, "harvest completion-trigger fire GC");
+                                }
+                                Err(err) => {
+                                    tracing::warn!(shard = %shard, error = %err, "harvest completion-trigger fire GC failed");
+                                }
+                            }
                         }
                     }
                 }
@@ -3284,6 +3302,72 @@ pub(crate) async fn purge_expired_summaries(
         }
     }
     Ok(counts)
+}
+
+/// Delete completion-trigger fire rows older than the summary horizon (issue
+/// #1676). Returns the number of rows deleted.
+///
+/// `backup verify` proves a delivered fire by finding its target in
+/// `harvest_execution_summaries`. That row expires at `summary_age`, and the
+/// fire row had no cleanup path. An old fire then fell back to a timestamp
+/// guess that can report a false loss. Deleting the fire at the same horizon
+/// removes it from the verify scan.
+///
+/// A fire fires before its target completes, so `fired_at` is never later
+/// than the target's `completed_at`. The fire therefore expires no later than
+/// the target's summary.
+///
+/// A fire stays in two cases. First, its outbox row still exists: the relay
+/// has not delivered it. Second, its source execution row still exists: the
+/// fire row prevents a second fire for that run.
+///
+/// Shard-local: fires live on the source execution's shard.
+#[cfg(feature = "db")]
+pub(crate) async fn purge_expired_trigger_fires(
+    conn: &mut diesel_async::AsyncPgConnection,
+    summary_age: Duration,
+    batch_size: usize,
+    now: DateTime<Utc>,
+) -> HarvestResult<u64> {
+    // An unrepresentable age deletes nothing, like `purge_expired_summaries`.
+    let Ok(chrono_age) = chrono::Duration::from_std(summary_age) else {
+        return Ok(0);
+    };
+    let cutoff = now - chrono_age;
+    let batch = i64::try_from(batch_size).unwrap_or(i64::MAX).max(1);
+
+    let mut total: u64 = 0;
+    loop {
+        let n = diesel::sql_query(
+            "DELETE FROM harvest_completion_trigger_fires
+             WHERE (source_exec_id, trigger_id) IN (
+                 SELECT f.source_exec_id, f.trigger_id
+                 FROM harvest_completion_trigger_fires f
+                 WHERE f.fired_at < $1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM harvest_completion_trigger_outbox o
+                       WHERE o.source_exec_id = f.source_exec_id
+                         AND o.trigger_id = f.trigger_id)
+                   AND NOT EXISTS (
+                       SELECT 1 FROM harvest_workflow_executions e
+                       WHERE e.id = f.source_exec_id)
+                 ORDER BY f.fired_at ASC, f.source_exec_id ASC, f.trigger_id ASC
+                 LIMIT $2
+             )",
+        )
+        .bind::<Timestamptz, _>(cutoff)
+        .bind::<BigInt, _>(batch)
+        .execute(conn)
+        .await
+        .map_err(database_error)?;
+        total += n as u64;
+        // A short or empty batch ends the loop. An empty batch must end it
+        // even when `batch` is 1, or the loop never stops.
+        if n == 0 || i64::try_from(n).unwrap_or(i64::MAX) < batch {
+            break;
+        }
+    }
+    Ok(total)
 }
 
 /// Filter set for the read-only execution-summary list query (issue #752).

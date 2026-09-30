@@ -65,6 +65,8 @@ CREATE TABLE harvest_completion_trigger_fires (
 );
 ```
 
+Retention deletes a fire row once it is older than the summary horizon (issue #1676). The row stays while its outbox row exists or its source execution row exists. Without a finite summary horizon, no fire row is deleted.
+
 ### `harvest_completion_trigger_outbox`
 Holds cross-shard pending target starts. A row is written on the source shard inside the terminal-commit transaction when the target routes to a different shard, and deleted once the target start succeeds (either by the immediate async spawn or by the `enforce_completion_triggers_outbox` sweeper). It is the durable backstop that makes cross-shard delivery at-least-once:
 ```sql
