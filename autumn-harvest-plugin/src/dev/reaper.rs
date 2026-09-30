@@ -757,8 +757,9 @@ pub(super) mod acl_fixture {
     ///
     /// # Panics
     ///
-    /// Panics under CI (the `CI` variable is set), so a runner without ACL
-    /// support fails instead of passing without a test.
+    /// Panics on Linux under CI (the `CI` variable is set), so a runner
+    /// without ACL support fails instead of passing without a test. macOS has
+    /// no `setfacl`, so it always skips.
     pub(in crate::dev) fn grant_write(dir: &std::path::Path) -> bool {
         let granted = std::process::Command::new("setfacl")
             .args(["-m", "u:65534:rwx"])
@@ -766,7 +767,7 @@ pub(super) mod acl_fixture {
             .status()
             .is_ok_and(|status| status.success());
         assert!(
-            granted || std::env::var_os("CI").is_none(),
+            granted || !cfg!(target_os = "linux") || std::env::var_os("CI").is_none(),
             "setfacl must work on CI runners"
         );
         granted
@@ -793,6 +794,8 @@ mod tests {
         #[test]
         fn group_and_other_write_bits_are_flagged() {
             assert!(others_can_write(0o775));
+            assert!(others_can_write(0o020));
+            assert!(others_can_write(0o002));
             assert!(others_can_write(0o757));
             assert!(!others_can_write(0o755));
             assert!(!others_can_write(0o700));
@@ -821,6 +824,7 @@ mod tests {
                 eprintln!("SKIP: setfacl is unavailable");
                 return;
             }
+            assert!(others_can_write(mode_of(dir.path())), "grant applied");
             harden_root(dir.path()).expect("harden");
             assert!(!others_can_write(mode_of(dir.path())));
             assert_eq!(mode_of(dir.path()) & 0o777, 0o700);
