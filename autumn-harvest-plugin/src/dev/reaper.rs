@@ -102,8 +102,8 @@ fn harden_root(root: &Path) -> Result<(), DevError> {
 
 /// Whether a Unix `mode` lets group or other write to a directory.
 ///
-/// The one place that reads the write bits, for `harden_root`'s result and both
-/// checks in `acquire.rs` (issue #1548).
+/// Both checks in `acquire.rs` call this function. The write-bit rule lives in
+/// one place (issue #1548).
 ///
 /// # ACLs
 ///
@@ -114,7 +114,7 @@ fn harden_root(root: &Path) -> Result<(), DevError> {
 ///
 /// It is not sound where the ACL is separate from the mode. Those are the
 /// macOS and BSD native ACLs and `NFSv4` ACLs. `stat` does not show them. The
-/// module docs of `acquire.rs` record this limit (issue #1548).
+/// docs of `directory_is_private` in `acquire.rs` record this limit.
 #[cfg(unix)]
 pub(super) const fn others_can_write(mode: u32) -> bool {
     mode & 0o022 != 0

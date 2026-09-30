@@ -22,3 +22,5 @@ No migration, no route change, and no `harvest_events` change.
 Tests: unit tests in `reaper.rs` and `acquire.rs` use `setfacl` and skip when
 it is missing. They cover a granted leaf, a granted ancestor, a masked grant,
 `harden_root`, and a plain `0755` directory.
+
+Evidence: 48 `dev::` unit tests pass on Linux with `setfacl` present.
