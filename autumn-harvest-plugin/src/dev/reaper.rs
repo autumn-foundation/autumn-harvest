@@ -380,11 +380,7 @@ fn reap_one_session(
     }
     record.postmaster_pid = effective_postmaster_pid(&record, pid_file.contents());
 
-    let postmaster = record
-        .postmaster_pid
-        .map_or(PostmasterIdentity::NotRunning, |pid| {
-            postmaster_identity(&record, pid)
-        });
+    let postmaster = session_postmaster_identity(&record);
     let decision = decide_reap(
         &record,
         owner_is_the_recorded_one(&record),
@@ -400,10 +396,12 @@ fn reap_one_session(
             );
             return false;
         }
-        ReapDecision::Skip(SkipReason::PossiblyStillStarting) => {
+        ReapDecision::Skip(
+            SkipReason::PossiblyStillStarting | SkipReason::PostmasterProcessFound,
+        ) => {
             tracing::debug!(
                 path = %dir.display(),
-                "dev runtime: leaving a recent session whose postmaster may still be starting"
+                "dev runtime: leaving a session whose postmaster may still be starting"
             );
             return false;
         }
@@ -455,6 +453,18 @@ fn reap_one_session(
     }
 }
 
+/// Identity of the postmaster a session record points at.
+///
+/// With no pid anywhere, only a live process on the data directory proves a
+/// postmaster exists (issue #1585). Absence of one is `NotRunning`.
+fn session_postmaster_identity(record: &SessionRecord) -> PostmasterIdentity {
+    match record.postmaster_pid {
+        Some(pid) => postmaster_identity(record, pid),
+        None if live_process_names_data_dir(&record.data_dir) => PostmasterIdentity::ProcessFound,
+        None => PostmasterIdentity::NotRunning,
+    }
+}
+
 /// Whether the process at the recorded owner pid is still the run that created
 /// this session.
 ///
@@ -501,6 +511,88 @@ fn postmaster_identity(record: &SessionRecord, pid: u32) -> PostmasterIdentity {
         (Some(recorded), Some(current)) if recorded == &current => PostmasterIdentity::Confirmed,
         (Some(_), Some(_)) => PostmasterIdentity::NotRunning,
         _ => PostmasterIdentity::Unknown,
+    }
+}
+
+/// Whether `command` starts a server or tool on `data_dir`.
+///
+/// The postmaster runs as `postgres -D <dir>`. `pg_ctl` uses `--pgdata <dir>`
+/// or `--pgdata=<dir>`. The path must end at the string end or at whitespace,
+/// so `<dir>2` does not match. A path with spaces can match a longer command.
+/// That only causes a skip, which is the safe direction.
+fn command_names_data_dir(command: &str, data_dir: &str) -> bool {
+    ["-D ", "-D", "--pgdata ", "--pgdata="].iter().any(|flag| {
+        let needle = format!("{flag}{data_dir}");
+        command.match_indices(&needle).any(|(start, _)| {
+            let flag_starts_a_word = command[..start]
+                .chars()
+                .next_back()
+                .is_none_or(char::is_whitespace);
+            let path_ends_a_word = command[start + needle.len()..]
+                .chars()
+                .next()
+                .is_none_or(char::is_whitespace);
+            flag_starts_a_word && path_ends_a_word
+        })
+    })
+}
+
+/// Whether a live process other than this one names `data_dir`.
+///
+/// Positive evidence that a postmaster may exist, pid file or not (issue
+/// #1585). Linux reads `/proc/<pid>/cmdline`. Other Unix systems use `ps`.
+/// Windows has no scan, and neither does a process table that cannot be read.
+/// Those cases return `false`, so the startup grace period is the only guard.
+fn live_process_names_data_dir(data_dir: &Path) -> bool {
+    let Some(data_dir) = data_dir.to_str() else {
+        return false;
+    };
+    let self_pid = std::process::id();
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return false;
+        };
+        entries.flatten().any(|entry| {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
+                return false;
+            };
+            if pid == self_pid || !process_is_alive(pid) {
+                return false;
+            }
+            std::fs::read(entry.path().join("cmdline")).is_ok_and(|raw| {
+                let command = String::from_utf8_lossy(&raw).replace('\0', " ");
+                command_names_data_dir(&command, data_dir)
+            })
+        })
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        std::process::Command::new("/bin/ps")
+            .args(["-axww", "-o", "pid=,state=,command="])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .is_some_and(|output| {
+                String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+                    let mut parts = line.trim_start().splitn(3, char::is_whitespace);
+                    let pid = parts.next().and_then(|pid| pid.parse::<u32>().ok());
+                    let state = parts.next().unwrap_or_default();
+                    let command = parts.next().unwrap_or_default();
+                    pid != Some(self_pid)
+                        && !state.starts_with('Z')
+                        && command_names_data_dir(command, data_dir)
+                })
+            })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (data_dir, self_pid);
+        false
     }
 }
 
@@ -727,7 +819,49 @@ pub fn rewrite_owner_pid_for_test(session_dir: &Path, owner_pid: u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::{PostmasterIdentity, SessionRecord, directory_is_ours, postmaster_identity};
+    use super::{
+        PostmasterIdentity, SessionRecord, command_names_data_dir, directory_is_ours,
+        postmaster_identity,
+    };
+
+    const DIR: &str = "/tmp/harvest-dev-0/session-1-aa/data";
+
+    /// Issue #1585. `postgres -D <dir>` is how `pg_ctl` starts the postmaster.
+    #[test]
+    fn a_postmaster_command_line_names_its_data_dir() {
+        assert!(command_names_data_dir(&format!("postgres -D {DIR}"), DIR));
+        assert!(command_names_data_dir(&format!("postgres -D{DIR}"), DIR));
+    }
+
+    /// Issue #1585. `pg_ctl` itself uses the long flag, with a space or `=`.
+    #[test]
+    fn a_pg_ctl_command_line_names_its_data_dir() {
+        assert!(command_names_data_dir(
+            &format!("pg_ctl --pgdata {DIR} start"),
+            DIR
+        ));
+        assert!(command_names_data_dir(
+            &format!("pg_ctl --pgdata={DIR}"),
+            DIR
+        ));
+    }
+
+    /// Issue #1585. A sibling directory that shares a prefix is not a match.
+    #[test]
+    fn a_data_dir_prefix_is_not_a_match() {
+        assert!(!command_names_data_dir(&format!("postgres -D {DIR}2"), DIR));
+        assert!(!command_names_data_dir(
+            &format!("postgres -D {DIR}/sub"),
+            DIR
+        ));
+    }
+
+    /// Issue #1585. The path alone, without a data-dir flag, is not a match.
+    #[test]
+    fn a_bare_path_without_a_flag_is_not_a_match() {
+        assert!(!command_names_data_dir(&format!("tail -f {DIR}"), DIR));
+        assert!(!command_names_data_dir("postgres -D /elsewhere", DIR));
+    }
 
     /// A pid guaranteed dead: past the 32-bit ceiling, above every `pid_max`
     /// this crate supports.

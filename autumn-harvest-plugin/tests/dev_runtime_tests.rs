@@ -2451,6 +2451,64 @@ fn a_freshly_created_session_with_no_pid_file_survives_the_full_reap_pipeline() 
 }
 
 #[test]
+fn reap_skips_an_old_session_when_a_process_names_its_data_dir() {
+    // Issue #1585. Wall-clock age is no proof of absence: a suspend can age a
+    // record past the grace period while the postmaster gets no CPU. A live
+    // process that names the data directory is positive evidence.
+    let mut aged = record(4242, None);
+    aged.created_at = chrono::Utc::now() - chrono::Duration::minutes(5);
+    let decision = decide_reap(
+        &aged,
+        false,
+        PostmasterIdentity::ProcessFound,
+        99,
+        chrono::Utc::now(),
+    );
+    assert_eq!(
+        decision,
+        ReapDecision::Skip(SkipReason::PostmasterProcessFound),
+        "{decision:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_old_session_with_a_live_process_on_its_data_dir_survives_the_full_reap_pipeline() {
+    // Issue #1585, end to end. The record is far older than the grace period
+    // and has no pid file. A live process names the data directory, so the
+    // reaper must leave the session alone.
+    let base = tempfile::tempdir().expect("temp dir");
+    let root = autumn_harvest_plugin::dev::session_root(base.path()).expect("session root");
+    let session_dir = root.join("session-4242-0000000d");
+    let data_dir = session_dir.join("data");
+    std::fs::create_dir_all(&data_dir).expect("data dir");
+    let mut aged = record(u32::MAX - 1, None);
+    aged.owner_start_token = None;
+    aged.data_dir = data_dir.clone();
+    aged.created_at = chrono::Utc::now() - chrono::Duration::minutes(5);
+    std::fs::write(
+        session_dir.join("session.json"),
+        aged.to_json().expect("json"),
+    )
+    .expect("write record");
+
+    let mut child = std::process::Command::new("sh")
+        .args(["-c", "sleep 30", "--pgdata"])
+        .arg(&data_dir)
+        .spawn()
+        .expect("spawn stand-in postmaster");
+    let reclaimed = autumn_harvest_plugin::dev::reap_stale_sessions(&root).expect("reap");
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert_eq!(
+        reclaimed, 0,
+        "a live process on the data dir must block reaping"
+    );
+    assert!(session_dir.exists(), "{}", session_dir.display());
+}
+
+#[test]
 fn a_tokenless_but_live_postmaster_survives_the_full_reap_pipeline() {
     // Issue #1295, end to end. Unit tests elsewhere pin `decide_reap` and
     // `postmaster_identity` directly; this drives the same scenario through
