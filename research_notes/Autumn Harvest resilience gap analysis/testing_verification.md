@@ -389,7 +389,7 @@ There is one Critical gap: the chaos and convergence suite is not executed at al
      - In each case, assert the sweep's convergence oracle (`chaos_tests.rs:1571-1613`).
 6. **MEDIUM — activity completion lacks worker/attempt fencing, and no zombie-completion test exists.**
    - Evidence: `queue.rs:2476-2505`, `worker.rs:13043-13083`.
-   - Remedy: a DB test in which worker A's lease expires, worker B re-claims and completes, then worker A completes late. Assert a single `ActivityCompleted` event and a defined winner. Consider an attempt or claim-token predicate.
+   - Remedy: a DB test in which worker A's liveness heartbeat goes stale while A is still running, the orphan reclaimer requeues the row, worker B re-claims and completes, then worker A completes late. Assert a single `ActivityCompleted` event and a defined winner. Consider an attempt or claim-token predicate.
 7. **MEDIUM — the append-only invariant is enforced only by a source grep.**
    - Evidence: `lifecycle.rs:597-614`; the unlisted `partition.rs:3783` cohort writer; no DB trigger.
    - Remedy: a Postgres `BEFORE UPDATE` trigger on `harvest_events` that rejects changes to `event_data`, `type`, `event_id` or `created_at` unless a transaction-local GUC is set by the two sanctioned paths. Add a DB test proving an ordinary UPDATE fails.
