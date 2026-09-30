@@ -100,6 +100,26 @@ fn harden_root(root: &Path) -> Result<(), DevError> {
     Ok(())
 }
 
+/// Whether a Unix `mode` lets group or other write to a directory.
+///
+/// The one place that reads the write bits, for `harden_root`'s result and both
+/// checks in `acquire.rs` (issue #1548).
+///
+/// # ACLs
+///
+/// A Linux POSIX ACL cannot hide a write grant here. The group bits of the
+/// mode show the ACL mask, so a named grant raises them. A later `chmod`
+/// lowers the mask and so lowers the grant with it. This predicate is
+/// therefore sound on Linux.
+///
+/// It is not sound where the ACL is separate from the mode. Those are the
+/// macOS and BSD native ACLs and `NFSv4` ACLs. `stat` does not show them. The
+/// module docs of `acquire.rs` record this limit (issue #1548).
+#[cfg(unix)]
+pub(super) const fn others_can_write(mode: u32) -> bool {
+    mode & 0o022 != 0
+}
+
 /// Whether a non-symlink directory is ours alone to trust.
 ///
 /// The ownership question `harden_root` above and `directory_is_private`
@@ -725,9 +745,76 @@ pub fn rewrite_owner_pid_for_test(session_dir: &Path, owner_pid: u32) {
     std::fs::write(&path, record.to_json().expect("serialize")).expect("rewrite session record");
 }
 
+/// Fixtures that set a filesystem ACL through `setfacl`, for the tests in
+/// this file and in `acquire.rs` (issue #1548).
+#[cfg(all(test, unix))]
+pub(super) mod acl_fixture {
+    /// Grant an unrelated account (uid 65534) full access to `dir`.
+    ///
+    /// Returns `false` when `setfacl` is missing or the filesystem has no ACL
+    /// support. The caller then skips, because nothing can be tested there.
+    pub(in crate::dev) fn grant_write(dir: &std::path::Path) -> bool {
+        std::process::Command::new("setfacl")
+            .args(["-m", "u:65534:rwx"])
+            .arg(dir)
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{PostmasterIdentity, SessionRecord, directory_is_ours, postmaster_identity};
+
+    #[cfg(unix)]
+    mod acl {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        use super::super::{acl_fixture, harden_root, others_can_write};
+
+        fn mode_of(dir: &std::path::Path) -> u32 {
+            std::fs::metadata(dir)
+                .expect("metadata")
+                .permissions()
+                .mode()
+        }
+
+        #[test]
+        fn group_and_other_write_bits_are_flagged() {
+            assert!(others_can_write(0o775));
+            assert!(others_can_write(0o757));
+            assert!(!others_can_write(0o755));
+            assert!(!others_can_write(0o700));
+        }
+
+        /// Issue #1548. On Linux, a POSIX ACL grant raises the mask, and the
+        /// mask shows as the group bits. The grant is visible to a mode check.
+        #[test]
+        fn a_posix_acl_grant_shows_in_the_mode_bits() {
+            let dir = tempfile::tempdir().expect("temp dir");
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+            if !acl_fixture::grant_write(dir.path()) {
+                eprintln!("SKIP: setfacl is unavailable");
+                return;
+            }
+            assert!(others_can_write(mode_of(dir.path())));
+        }
+
+        /// Issue #1548. `harden_root` sets `0700`, which zeroes the mask. The
+        /// named grant then has no effective access.
+        #[test]
+        fn harden_root_neutralises_an_acl_grant() {
+            let dir = tempfile::tempdir().expect("temp dir");
+            if !acl_fixture::grant_write(dir.path()) {
+                eprintln!("SKIP: setfacl is unavailable");
+                return;
+            }
+            harden_root(dir.path()).expect("harden");
+            assert!(!others_can_write(mode_of(dir.path())));
+            assert_eq!(mode_of(dir.path()) & 0o777, 0o700);
+        }
+    }
 
     /// A pid guaranteed dead: past the 32-bit ceiling, above every `pid_max`
     /// this crate supports.
