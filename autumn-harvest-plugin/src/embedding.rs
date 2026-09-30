@@ -189,7 +189,7 @@ impl HarvestEmbedding {
             // Read the environment before the first await. `&dyn Env` is not
             // `Sync`, so holding it would make this future not `Send`.
             let operator = OperatorInputs::read(self.config.startup, &OsEnv)?;
-            self.start_with(operator).await
+            Box::pin(self.start_with(operator)).await
         })
     }
 
