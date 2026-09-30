@@ -5575,6 +5575,11 @@ impl StandaloneAdminAuth {
         self
     }
 
+    /// The declared deployment profile, if any.
+    pub(crate) fn declared_deployment_profile(&self) -> Option<&str> {
+        self.deployment_profile.as_deref()
+    }
+
     /// Apply the declaration to `api_state` and wrap `router` in the declared
     /// layers.
     ///

@@ -113,6 +113,46 @@ pub struct HarvestStartupConfig {
     pub orphaned_workflows: OrphanStartupAction,
 }
 
+impl HarvestStartupConfig {
+    /// Apply the operator settings over this code value (issue #1613).
+    ///
+    /// The sources are `autumn.toml`, then `autumn-{profile}.toml`, then
+    /// `AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS`. This is the precedence of
+    /// [`HarvestRuntimeConfig::load`]. A setting that no source names keeps
+    /// the code value. A plain `load()` would reset a code `fail` to `warn`.
+    ///
+    /// Only the startup settings are read. An invalid value in another
+    /// `AUTUMN_HARVEST_*` variable does not block this overlay.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError`] when a config file cannot be read or parsed,
+    /// or when a startup value is invalid. A typo must not become `warn`.
+    pub fn with_operator_overrides(mut self, env: &dyn Env) -> Result<Self, ConfigError> {
+        for root in load_operator_roots(env)? {
+            self.apply_partial(&root.harvest.startup);
+        }
+        self.apply_env_overrides(env)?;
+        Ok(self)
+    }
+
+    const fn apply_partial(&mut self, partial: &PartialHarvestStartupConfig) {
+        if let Some(orphaned_workflows) = partial.orphaned_workflows {
+            self.orphaned_workflows = orphaned_workflows;
+        }
+    }
+
+    fn apply_env_overrides(&mut self, env: &dyn Env) -> Result<(), ConfigError> {
+        if let Ok(orphaned_workflows) = env.var("AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS") {
+            self.orphaned_workflows = parse_orphan_startup_action(
+                "AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS",
+                &orphaned_workflows,
+            )?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HarvestRuntimeConfig {
     pub mode: HarvestMode,
@@ -144,20 +184,10 @@ impl HarvestRuntimeConfig {
     /// Returns [`ConfigError`] when config files cannot be read or parsed, environment overrides
     /// are invalid, or the resulting topology configuration is not valid.
     pub fn load_with_env(env: &dyn Env) -> Result<Self, ConfigError> {
-        let profile = resolve_profile(env);
         let mut config = Self::default();
-
-        if let Some(root) = load_partial_root(&find_config_file_named("autumn.toml", env))? {
+        for root in load_operator_roots(env)? {
             config.apply_partial(root.harvest);
         }
-
-        if let Some(profile) = profile {
-            let path = find_config_file_named(&format!("autumn-{profile}.toml"), env);
-            if let Some(root) = load_partial_root(&path)? {
-                config.apply_partial(root.harvest);
-            }
-        }
-
         config.apply_env_overrides(env)?;
         config.validate()?;
         Ok(config)
@@ -206,9 +236,7 @@ impl HarvestRuntimeConfig {
         if let Some(require_shard_readiness) = partial.readiness.require_shard_readiness {
             self.readiness.require_shard_readiness = require_shard_readiness;
         }
-        if let Some(orphaned_workflows) = partial.startup.orphaned_workflows {
-            self.startup.orphaned_workflows = orphaned_workflows;
-        }
+        self.startup.apply_partial(&partial.startup);
         if let Some(url) = partial.redis.url {
             self.redis.url = Some(url);
         }
@@ -299,12 +327,7 @@ impl HarvestRuntimeConfig {
                 &require_shard_readiness,
             )?;
         }
-        if let Ok(orphaned_workflows) = env.var("AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS") {
-            self.startup.orphaned_workflows = parse_orphan_startup_action(
-                "AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS",
-                &orphaned_workflows,
-            )?;
-        }
+        self.startup.apply_env_overrides(env)?;
 
         // Issue #1312. An empty `AUTUMN_HARVEST_REDIS__URL` means "off", the
         // same convention `AUTUMN_HARVEST_DATABASE__URL` uses above.
@@ -689,7 +712,27 @@ fn load_partial_root(path: &Path) -> Result<Option<PartialRoot>, ConfigError> {
     }
 }
 
-fn resolve_profile(env: &dyn Env) -> Option<String> {
+/// The operator config files, in precedence order: `autumn.toml`, then
+/// `autumn-{profile}.toml`. A file that does not exist is skipped.
+fn load_operator_roots(env: &dyn Env) -> Result<Vec<PartialRoot>, ConfigError> {
+    let mut paths = vec![find_config_file_named("autumn.toml", env)];
+    if let Some(profile) = resolve_profile(env) {
+        paths.push(find_config_file_named(
+            &format!("autumn-{profile}.toml"),
+            env,
+        ));
+    }
+    let mut roots = Vec::new();
+    for path in paths {
+        if let Some(root) = load_partial_root(&path)? {
+            roots.push(root);
+        }
+    }
+    Ok(roots)
+}
+
+/// The deployment profile: `AUTUMN_PROFILE`, else a `--profile` argument.
+pub(crate) fn resolve_profile(env: &dyn Env) -> Option<String> {
     if let Ok(profile) = env.var("AUTUMN_PROFILE")
         && !profile.is_empty()
     {

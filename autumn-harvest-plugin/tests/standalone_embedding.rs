@@ -266,11 +266,15 @@ async fn boot_loads_gates_a_previous_process_persisted() {
     .await
     .expect("create gate");
 
-    let runtime = HarvestEmbedding::new(builder().build(), config(&url), HarvestRunnerResources::new(pool(&url)))
-        .with_admin_auth(StandaloneAdminAuth::new().with_deployment_profile("dev"))
-        .start()
-        .await
-        .expect("embedding should start");
+    let runtime = HarvestEmbedding::new(
+        builder().build(),
+        config(&url),
+        HarvestRunnerResources::new(pool(&url)),
+    )
+    .with_admin_auth(StandaloneAdminAuth::new().with_deployment_profile("dev"))
+    .start()
+    .await
+    .expect("embedding should start");
 
     assert_eq!(runtime.api_state().gate_cache().active_count(), 1);
     let published = global_admission_gate_cache().expect("gate cache must be published");
@@ -307,9 +311,13 @@ async fn code_set_fail_refuses_boot_and_publishes_nothing() {
     config.startup = HarvestStartupConfig {
         orphaned_workflows: OrphanStartupAction::Fail,
     };
-    let result = HarvestEmbedding::new(builder().build(), config, HarvestRunnerResources::new(pool(&url)))
-        .start()
-        .await;
+    let result = HarvestEmbedding::new(
+        builder().build(),
+        config,
+        HarvestRunnerResources::new(pool(&url)),
+    )
+    .start()
+    .await;
 
     let Err(error) = result else {
         panic!("an orphan under `fail` must refuse boot");
@@ -332,15 +340,19 @@ async fn code_set_fail_refuses_boot_and_publishes_nothing() {
 async fn dev_profile_opens_preflight_and_mounts_vantage() {
     let _serial = SERIAL.lock().await;
     let (url, _db) = database().await;
-    let runtime = HarvestEmbedding::new(builder().build(), config(&url), HarvestRunnerResources::new(pool(&url)))
-        .with_admin_auth(StandaloneAdminAuth::new().with_deployment_profile("dev"))
-        .start()
-        .await
-        .expect("embedding should start");
+    let runtime = HarvestEmbedding::new(
+        builder().build(),
+        config(&url),
+        HarvestRunnerResources::new(pool(&url)),
+    )
+    .with_admin_auth(StandaloneAdminAuth::new().with_deployment_profile("dev"))
+    .start()
+    .await
+    .expect("embedding should start");
 
     let (status, _) = send(&runtime.router(), "GET", "/admin/preflight", None, None).await;
     assert_eq!(status, StatusCode::OK);
-    let (status, _) = send(&runtime.router(), "GET", "/ui/", None, None).await;
+    let (status, _) = send(&runtime.router(), "GET", "/ui/workflows", None, None).await;
     assert_eq!(status, StatusCode::OK);
 
     runtime.stop().await;
@@ -351,11 +363,15 @@ async fn dev_profile_opens_preflight_and_mounts_vantage() {
 async fn non_dev_profile_rejects_an_anonymous_admin_call() {
     let _serial = SERIAL.lock().await;
     let (url, _db) = database().await;
-    let runtime = HarvestEmbedding::new(builder().build(), config(&url), HarvestRunnerResources::new(pool(&url)))
-        .with_admin_auth(StandaloneAdminAuth::new().with_deployment_profile("prod"))
-        .start()
-        .await
-        .expect("embedding should start");
+    let runtime = HarvestEmbedding::new(
+        builder().build(),
+        config(&url),
+        HarvestRunnerResources::new(pool(&url)),
+    )
+    .with_admin_auth(StandaloneAdminAuth::new().with_deployment_profile("prod"))
+    .start()
+    .await
+    .expect("embedding should start");
 
     let (status, _) = send(&runtime.router(), "GET", "/admin/preflight", None, None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -382,15 +398,19 @@ async fn a_stored_api_token_reaches_an_admin_route() {
     .await
     .expect("seed token");
 
-    let runtime = HarvestEmbedding::new(builder().build(), config(&url), HarvestRunnerResources::new(pool(&url)))
-        .with_admin_auth(
-            StandaloneAdminAuth::new()
-                .with_api_tokens()
-                .with_deployment_profile("prod"),
-        )
-        .start()
-        .await
-        .expect("embedding should start");
+    let runtime = HarvestEmbedding::new(
+        builder().build(),
+        config(&url),
+        HarvestRunnerResources::new(pool(&url)),
+    )
+    .with_admin_auth(
+        StandaloneAdminAuth::new()
+            .with_api_tokens()
+            .with_deployment_profile("prod"),
+    )
+    .start()
+    .await
+    .expect("embedding should start");
 
     let (status, _) = send(
         &runtime.router(),
@@ -410,14 +430,18 @@ async fn a_stored_api_token_reaches_an_admin_route() {
 async fn without_ui_leaves_vantage_unmounted() {
     let _serial = SERIAL.lock().await;
     let (url, _db) = database().await;
-    let runtime = HarvestEmbedding::new(builder().build(), config(&url), HarvestRunnerResources::new(pool(&url)))
-        .with_admin_auth(StandaloneAdminAuth::new().with_deployment_profile("dev"))
-        .without_ui()
-        .start()
-        .await
-        .expect("embedding should start");
+    let runtime = HarvestEmbedding::new(
+        builder().build(),
+        config(&url),
+        HarvestRunnerResources::new(pool(&url)),
+    )
+    .with_admin_auth(StandaloneAdminAuth::new().with_deployment_profile("dev"))
+    .without_ui()
+    .start()
+    .await
+    .expect("embedding should start");
 
-    let (status, _) = send(&runtime.router(), "GET", "/ui/", None, None).await;
+    let (status, _) = send(&runtime.router(), "GET", "/ui/workflows", None, None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
     runtime.stop().await;
@@ -434,11 +458,15 @@ async fn without_ui_leaves_vantage_unmounted() {
 async fn the_router_starts_a_workflow_the_worker_completes() {
     let _serial = SERIAL.lock().await;
     let (url, _db) = database().await;
-    let runtime = HarvestEmbedding::new(builder().build(), config(&url), HarvestRunnerResources::new(pool(&url)))
-        .with_admin_auth(StandaloneAdminAuth::new().with_deployment_profile("dev"))
-        .start()
-        .await
-        .expect("embedding should start");
+    let runtime = HarvestEmbedding::new(
+        builder().build(),
+        config(&url),
+        HarvestRunnerResources::new(pool(&url)),
+    )
+    .with_admin_auth(StandaloneAdminAuth::new().with_deployment_profile("dev"))
+    .start()
+    .await
+    .expect("embedding should start");
 
     let (status, started) = send(
         &runtime.router(),
@@ -480,15 +508,14 @@ async fn builder_limits_reach_the_api_state() {
         .worker(WorkerConfig::default())
         .build();
 
-    let runtime = HarvestEmbedding::new(built, config(&url), HarvestRunnerResources::new(pool(&url)))
-        .start()
-        .await
-        .expect("embedding should start");
+    let runtime =
+        HarvestEmbedding::new(built, config(&url), HarvestRunnerResources::new(pool(&url)))
+            .start()
+            .await
+            .expect("embedding should start");
 
     assert_eq!(runtime.api_state().batch_start_max_items(), 7);
-    assert!(
-        (autumn_harvest::start_idempotency::purge_window_secs() - 4321.0).abs() < f64::EPSILON
-    );
+    assert!((autumn_harvest::start_idempotency::purge_window_secs() - 4321.0).abs() < f64::EPSILON);
 
     runtime.stop().await;
 }
@@ -503,11 +530,15 @@ async fn builder_limits_reach_the_api_state() {
 async fn stop_tears_down_globals_and_the_api_state() {
     let _serial = SERIAL.lock().await;
     let (url, _db) = database().await;
-    let runtime = HarvestEmbedding::new(builder().build(), config(&url), HarvestRunnerResources::new(pool(&url)))
-        .with_admin_auth(StandaloneAdminAuth::new().with_deployment_profile("dev"))
-        .start()
-        .await
-        .expect("embedding should start");
+    let runtime = HarvestEmbedding::new(
+        builder().build(),
+        config(&url),
+        HarvestRunnerResources::new(pool(&url)),
+    )
+    .with_admin_auth(StandaloneAdminAuth::new().with_deployment_profile("dev"))
+    .start()
+    .await
+    .expect("embedding should start");
     let router = runtime.router();
     assert!(global_admission_gate_cache().is_some());
     assert!(global_admission_metrics().is_some());
@@ -647,7 +678,10 @@ async fn operator_environment_sets_the_startup_action_and_the_profile() {
             ("AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS", "fail"),
             ("AUTUMN_PROFILE", "dev"),
         ],
-        &["AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS", "AUTUMN_PROFILE"],
+        &[
+            "AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS",
+            "AUTUMN_PROFILE",
+        ],
     );
 
     let refused = HarvestEmbedding::new(
@@ -660,7 +694,10 @@ async fn operator_environment_sets_the_startup_action_and_the_profile() {
     let Err(error) = refused else {
         panic!("the operator's `fail` must refuse boot over an orphan");
     };
-    assert!(error.to_string().contains("embed_env_removed_type"), "{error}");
+    assert!(
+        error.to_string().contains("embed_env_removed_type"),
+        "{error}"
+    );
 
     let runtime = HarvestEmbedding::new(
         builder().build(),
@@ -675,4 +712,3 @@ async fn operator_environment_sets_the_startup_action_and_the_profile() {
 
     runtime.stop().await;
 }
-
