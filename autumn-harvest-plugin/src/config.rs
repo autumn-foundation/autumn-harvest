@@ -1560,6 +1560,71 @@ url = "postgres://harvest:harvest@localhost:5432/harvest"
         assert!(error.to_string().contains("sideways"), "{error}");
     }
 
+    // Issue #1613: the operator overlay for a code-built startup config.
+
+    #[test]
+    fn startup_overlay_keeps_the_code_value_when_the_operator_sets_nothing() {
+        let code = HarvestStartupConfig {
+            orphaned_workflows: OrphanStartupAction::Fail,
+        };
+        let resolved = code
+            .with_operator_overrides(&MockEnv::new())
+            .expect("an empty environment should resolve");
+        assert_eq!(resolved.orphaned_workflows, OrphanStartupAction::Fail);
+    }
+
+    #[test]
+    fn startup_overlay_applies_the_environment_override() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS", "fail");
+        let resolved = HarvestStartupConfig::default()
+            .with_operator_overrides(&env)
+            .expect("a valid override should resolve");
+        assert_eq!(resolved.orphaned_workflows, OrphanStartupAction::Fail);
+    }
+
+    #[test]
+    fn startup_overlay_applies_the_config_file_then_the_environment() {
+        let dir = unique_temp_dir("harvest-startup-overlay");
+        write_file(
+            &dir.join("autumn.toml"),
+            r#"
+[harvest.startup]
+orphaned_workflows = "off"
+"#,
+        );
+        let file_only = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref());
+        let resolved = HarvestStartupConfig::default()
+            .with_operator_overrides(&file_only)
+            .expect("the file should resolve");
+        assert_eq!(resolved.orphaned_workflows, OrphanStartupAction::Off);
+
+        let file_and_env = MockEnv::new()
+            .with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref())
+            .with("AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS", "fail");
+        let resolved = HarvestStartupConfig::default()
+            .with_operator_overrides(&file_and_env)
+            .expect("the file and the override should resolve");
+        assert_eq!(resolved.orphaned_workflows, OrphanStartupAction::Fail);
+    }
+
+    #[test]
+    fn startup_overlay_ignores_unrelated_invalid_settings() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST__WORKER_ENABLED", "maybe");
+        let resolved = HarvestStartupConfig::default()
+            .with_operator_overrides(&env)
+            .expect("an unrelated setting must not block the startup overlay");
+        assert_eq!(resolved.orphaned_workflows, OrphanStartupAction::Warn);
+    }
+
+    #[test]
+    fn startup_overlay_rejects_an_invalid_startup_action() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS", "fial");
+        let error = HarvestStartupConfig::default()
+            .with_operator_overrides(&env)
+            .expect_err("a typo in the action must not silently become `warn`");
+        assert!(error.to_string().contains("fial"), "{error}");
+    }
+
     fn unique_temp_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "autumn-harvest-plugin-{label}-{}",
