@@ -165,6 +165,8 @@ mod payload_offload_db_tests;
 mod payload_offload_replay_tests;
 mod performance_docs;
 #[cfg(feature = "db")]
+mod pg_timeouts_tests;
+#[cfg(feature = "db")]
 mod poison_pill_reclaim_perf;
 mod poison_pill_tests;
 mod priority_tests;

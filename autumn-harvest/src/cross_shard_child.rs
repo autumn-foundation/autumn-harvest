@@ -509,10 +509,10 @@ pub async fn enforce_cross_shard_children(
     codecs: &crate::payload_codec::PayloadCodecs,
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> HarvestResult<usize> {
-    // Every cross-shard checkout in this sweep is bounded. Harvest configures no
-    // deadpool `Timeouts`, so a bare `pool.get().await` is an *unbounded* wait,
-    // and the relay holds a connection on the parent's shard for the whole sweep
-    // while reaching across to others — see `acquire_bounded` for the two-pool
+    // Every cross-shard checkout in this sweep is bounded. A pool may have no
+    // deadpool `Timeouts`. Then a bare `pool.get().await` is an *unbounded* wait.
+    // The relay holds a connection on the parent's shard for the whole sweep
+    // while it reaches across to others. See `acquire_bounded` for the two-pool
     // wait-for cycle that creates. The relay only ever runs with a
     // `ShardedDbPool` present, so the multi-shard bound always applies; the
     // floor (rather than a poll interval) is used because a bounded pool busy
@@ -1844,7 +1844,7 @@ async fn target_conn(
 
 /// `pool.get()` under an optional deadline.
 ///
-/// Harvest configures no deadpool `Timeouts`, so a bare `pool.get().await` is an
+/// A pool may have no deadpool `Timeouts`, so a bare `pool.get().await` is an
 /// **unbounded** wait. That matters more here than almost anywhere else: the
 /// relay holds a checked-out connection on the *parent's* shard for the whole
 /// sweep while reaching across to other shards, and `Distributed` placement is

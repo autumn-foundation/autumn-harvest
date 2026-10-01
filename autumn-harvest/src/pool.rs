@@ -117,6 +117,270 @@ pub fn compute_pool_sizes(
 }
 
 // ---------------------------------------------------------------------------
+// Engine connection timeouts (issue #1788)
+// ---------------------------------------------------------------------------
+
+/// The fallback acquire bound for a pool with no deadpool `wait` timeout.
+pub const DEFAULT_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The work an engine pool serves. It selects the session timeouts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DbRole {
+    /// Claim and persist.
+    Hot,
+    /// Background scanners.
+    Scanner,
+    /// Maintenance and operator tooling.
+    Maintenance,
+}
+
+/// Postgres session timeouts set on each new engine connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionTimeouts {
+    /// `statement_timeout`.
+    pub statement: std::time::Duration,
+    /// `lock_timeout`.
+    pub lock: std::time::Duration,
+    /// `idle_in_transaction_session_timeout`.
+    pub idle_in_transaction: std::time::Duration,
+    /// `transaction_timeout`. Needs PostgreSQL 17 or later.
+    pub transaction: std::time::Duration,
+}
+
+impl SessionTimeouts {
+    /// The default timeouts for `role`.
+    ///
+    /// `transaction` is zero for every role, because PostgreSQL 16 and
+    /// earlier reject `transaction_timeout`.
+    #[must_use]
+    pub const fn for_role(role: DbRole) -> Self {
+        let (statement, lock, idle_in_transaction) = match role {
+            DbRole::Hot => (30, 5, 300),
+            DbRole::Scanner => (300, 30, 300),
+            DbRole::Maintenance => (1_800, 60, 600),
+        };
+        Self {
+            statement: std::time::Duration::from_secs(statement),
+            lock: std::time::Duration::from_secs(lock),
+            idle_in_transaction: std::time::Duration::from_secs(idle_in_transaction),
+            transaction: std::time::Duration::ZERO,
+        }
+    }
+
+    /// The `SET` statements that apply these timeouts, joined by `; `.
+    ///
+    /// A zero timeout sends no `SET`, so the server or role default stays.
+    #[must_use]
+    pub fn setup_sql(&self) -> String {
+        [
+            ("statement_timeout", self.statement),
+            ("lock_timeout", self.lock),
+            (
+                "idle_in_transaction_session_timeout",
+                self.idle_in_transaction,
+            ),
+            ("transaction_timeout", self.transaction),
+        ]
+        .into_iter()
+        .filter(|(_, value)| !value.is_zero())
+        .map(|(name, value)| format!("SET {name} = '{}ms'", value.as_millis()))
+        .collect::<Vec<_>>()
+        .join("; ")
+    }
+}
+
+/// deadpool timeouts for an engine pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolTimeouts {
+    /// Wait for a free slot.
+    pub wait: std::time::Duration,
+    /// Open a new connection.
+    pub create: std::time::Duration,
+    /// Check an idle connection before reuse.
+    pub recycle: std::time::Duration,
+}
+
+impl Default for PoolTimeouts {
+    fn default() -> Self {
+        Self {
+            wait: DEFAULT_ACQUIRE_TIMEOUT,
+            create: std::time::Duration::from_secs(10),
+            recycle: std::time::Duration::from_secs(5),
+        }
+    }
+}
+
+/// Pool and session timeouts for every engine role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngineDbTimeouts {
+    /// deadpool timeouts.
+    pub pool: PoolTimeouts,
+    /// Session timeouts for [`DbRole::Hot`].
+    pub hot: SessionTimeouts,
+    /// Session timeouts for [`DbRole::Scanner`].
+    pub scanner: SessionTimeouts,
+    /// Session timeouts for [`DbRole::Maintenance`].
+    pub maintenance: SessionTimeouts,
+}
+
+impl Default for EngineDbTimeouts {
+    fn default() -> Self {
+        Self {
+            pool: PoolTimeouts::default(),
+            hot: SessionTimeouts::for_role(DbRole::Hot),
+            scanner: SessionTimeouts::for_role(DbRole::Scanner),
+            maintenance: SessionTimeouts::for_role(DbRole::Maintenance),
+        }
+    }
+}
+
+impl EngineDbTimeouts {
+    /// The session timeouts for `role`.
+    #[must_use]
+    pub const fn session(&self, role: DbRole) -> SessionTimeouts {
+        match role {
+            DbRole::Hot => self.hot,
+            DbRole::Scanner => self.scanner,
+            DbRole::Maintenance => self.maintenance,
+        }
+    }
+
+    /// Reject a zero pool timeout.
+    ///
+    /// # Errors
+    ///
+    /// [`HarvestError::Config`] when `wait`, `create` or `recycle` is zero.
+    pub fn validate(&self) -> HarvestResult<()> {
+        for (name, value) in [
+            ("wait", self.pool.wait),
+            ("create", self.pool.create),
+            ("recycle", self.pool.recycle),
+        ] {
+            if value.is_zero() {
+                return Err(HarvestError::Config(format!(
+                    "pool {name} timeout must be greater than zero"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A pooled engine connection.
+#[cfg(feature = "db")]
+pub type PooledConn = deadpool::managed::Object<
+    diesel_async::pooled_connection::AsyncDieselConnectionManager<diesel_async::AsyncPgConnection>,
+>;
+
+/// A builder for an engine pool.
+#[cfg(feature = "db")]
+pub type DbPoolBuilder = deadpool::managed::PoolBuilder<
+    diesel_async::pooled_connection::AsyncDieselConnectionManager<diesel_async::AsyncPgConnection>,
+>;
+
+/// Add the engine timeouts for `role` to `builder`.
+///
+/// Sets the deadpool timeouts and the Tokio runtime that they need. Adds a
+/// `post_create` hook that runs [`SessionTimeouts::setup_sql`] once on each new
+/// connection. Call [`EngineDbTimeouts::validate`] first: deadpool treats a
+/// zero `wait` as "do not wait".
+#[cfg(feature = "db")]
+#[must_use]
+pub fn with_engine_timeouts(
+    builder: DbPoolBuilder,
+    role: DbRole,
+    timeouts: &EngineDbTimeouts,
+) -> DbPoolBuilder {
+    let builder = builder
+        .runtime(deadpool::Runtime::Tokio1)
+        .wait_timeout(Some(timeouts.pool.wait))
+        .create_timeout(Some(timeouts.pool.create))
+        .recycle_timeout(Some(timeouts.pool.recycle));
+    let sql = timeouts.session(role).setup_sql();
+    if sql.is_empty() {
+        return builder;
+    }
+    let sql: std::sync::Arc<str> = sql.into();
+    builder.post_create(deadpool::managed::Hook::async_fn(
+        move |conn: &mut diesel_async::AsyncPgConnection, _: &deadpool::managed::Metrics| {
+            let sql = std::sync::Arc::clone(&sql);
+            Box::pin(async move {
+                diesel_async::SimpleAsyncConnection::batch_execute(conn, &sql)
+                    .await
+                    .map_err(|e| {
+                        deadpool::managed::HookError::Message(
+                            format!("could not set session timeouts: {e}").into(),
+                        )
+                    })
+            })
+        },
+    ))
+}
+
+/// Build an engine pool for `role`.
+///
+/// # Errors
+///
+/// [`HarvestError::Config`] when `timeouts` is not valid or the pool does not
+/// build.
+#[cfg(feature = "db")]
+pub fn engine_pool(
+    dsn: impl Into<String>,
+    max_size: usize,
+    role: DbRole,
+    timeouts: &EngineDbTimeouts,
+) -> HarvestResult<crate::worker::DbPool> {
+    timeouts.validate()?;
+    let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+        diesel_async::AsyncPgConnection,
+    >::new(dsn);
+    with_engine_timeouts(
+        deadpool::managed::Pool::builder(manager).max_size(max_size.max(1)),
+        role,
+        timeouts,
+    )
+    .build()
+    .map_err(|e| HarvestError::Config(format!("could not build a connection pool: {e}")))
+}
+
+/// The acquire bound for `pool`.
+#[cfg(feature = "db")]
+#[must_use]
+pub fn acquire_bound(pool: &crate::worker::DbPool) -> std::time::Duration {
+    pool.timeouts()
+        .wait
+        .filter(|wait| !wait.is_zero())
+        .unwrap_or(DEFAULT_ACQUIRE_TIMEOUT)
+}
+
+/// Get a connection from `pool` within `bound`.
+///
+/// The bound applies to every pool, also to a pool with no deadpool timeouts.
+/// A deadpool timeout returns the same typed error.
+///
+/// # Errors
+///
+/// [`HarvestError::PoolAcquireTimeout`] when the bound elapses.
+/// [`HarvestError::Database`] for any other pool error.
+#[cfg(feature = "db")]
+pub async fn acquire(
+    pool: &crate::worker::DbPool,
+    bound: std::time::Duration,
+) -> HarvestResult<PooledConn> {
+    let started = std::time::Instant::now();
+    match tokio::time::timeout(bound, pool.get()).await {
+        Ok(Ok(conn)) => Ok(conn),
+        Ok(Err(deadpool::managed::PoolError::Timeout(_))) => {
+            Err(HarvestError::PoolAcquireTimeout {
+                waited: started.elapsed(),
+            })
+        }
+        Ok(Err(e)) => Err(crate::error::database_error(e)),
+        Err(_elapsed) => Err(HarvestError::PoolAcquireTimeout { waited: bound }),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -212,5 +476,208 @@ mod tests {
         let (web, worker) = compute_pool_sizes(0, 0, 2);
         assert!(web >= 1);
         assert!(worker >= 1);
+    }
+
+    // -- Issue #1788: engine connection timeouts --------------------------
+
+    use std::time::{Duration, Instant};
+
+    fn session(statement_ms: u64, lock_ms: u64, idle_ms: u64, tx_ms: u64) -> SessionTimeouts {
+        SessionTimeouts {
+            statement: Duration::from_millis(statement_ms),
+            lock: Duration::from_millis(lock_ms),
+            idle_in_transaction: Duration::from_millis(idle_ms),
+            transaction: Duration::from_millis(tx_ms),
+        }
+    }
+
+    #[test]
+    fn setup_sql_sets_each_timeout_in_milliseconds() {
+        let sql = session(1_500, 250, 60_000, 0).setup_sql();
+        assert!(sql.contains("SET statement_timeout = '1500ms'"), "{sql}");
+        assert!(sql.contains("SET lock_timeout = '250ms'"), "{sql}");
+        assert!(
+            sql.contains("SET idle_in_transaction_session_timeout = '60000ms'"),
+            "{sql}"
+        );
+    }
+
+    /// Zero keeps the server or role default. An explicit `0` would switch off
+    /// a limit an operator set with `ALTER ROLE`.
+    #[test]
+    fn setup_sql_skips_a_zero_timeout() {
+        let sql = session(0, 250, 0, 0).setup_sql();
+        assert!(!sql.contains("statement_timeout"), "{sql}");
+        assert!(
+            !sql.contains("idle_in_transaction_session_timeout"),
+            "{sql}"
+        );
+        assert!(!sql.contains("transaction_timeout ="), "{sql}");
+        assert!(sql.contains("SET lock_timeout = '250ms'"), "{sql}");
+    }
+
+    #[test]
+    fn setup_sql_sets_transaction_timeout_only_when_asked() {
+        let sql = session(0, 0, 0, 90_000).setup_sql();
+        assert_eq!(sql, "SET transaction_timeout = '90000ms'");
+    }
+
+    #[test]
+    fn role_defaults_grow_from_hot_to_maintenance() {
+        let hot = SessionTimeouts::for_role(DbRole::Hot);
+        let scanner = SessionTimeouts::for_role(DbRole::Scanner);
+        let maintenance = SessionTimeouts::for_role(DbRole::Maintenance);
+
+        assert!(Duration::ZERO < hot.statement);
+        assert!(hot.statement < scanner.statement);
+        assert!(scanner.statement < maintenance.statement);
+        assert!(Duration::ZERO < hot.lock);
+        assert!(hot.lock < scanner.lock);
+        assert!(scanner.lock < maintenance.lock);
+        for role in [hot, scanner, maintenance] {
+            assert!(role.idle_in_transaction > Duration::ZERO);
+            // PostgreSQL 16 does not know `transaction_timeout`.
+            assert_eq!(role.transaction, Duration::ZERO);
+        }
+    }
+
+    #[test]
+    fn validate_rejects_a_zero_pool_timeout() {
+        assert!(EngineDbTimeouts::default().validate().is_ok());
+        for zeroed in [
+            PoolTimeouts {
+                wait: Duration::ZERO,
+                ..PoolTimeouts::default()
+            },
+            PoolTimeouts {
+                create: Duration::ZERO,
+                ..PoolTimeouts::default()
+            },
+            PoolTimeouts {
+                recycle: Duration::ZERO,
+                ..PoolTimeouts::default()
+            },
+        ] {
+            let cfg = EngineDbTimeouts {
+                pool: zeroed,
+                ..EngineDbTimeouts::default()
+            };
+            let err = cfg
+                .validate()
+                .expect_err("a zero pool timeout is not valid");
+            assert!(matches!(err, HarvestError::Config(_)), "{err}");
+        }
+    }
+
+    /// A loopback listener that accepts TCP and never answers. A connect to it
+    /// hangs in the Postgres handshake, so a pool slot never frees.
+    #[cfg(feature = "db")]
+    async fn silent_listener() -> (tokio::net::TcpListener, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral loopback port");
+        let addr = listener.local_addr().expect("listener has a local address");
+        (listener, format!("postgres://silent@{addr}/silent"))
+    }
+
+    #[cfg(feature = "db")]
+    fn timeouts_with_pool(wait_ms: u64) -> EngineDbTimeouts {
+        let bound = Duration::from_millis(wait_ms);
+        EngineDbTimeouts {
+            pool: PoolTimeouts {
+                wait: bound,
+                create: bound,
+                recycle: bound,
+            },
+            ..EngineDbTimeouts::default()
+        }
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn acquire_bound_reads_the_pool_wait_timeout() {
+        let (_listener, dsn) = silent_listener().await;
+        let pool = engine_pool(dsn.clone(), 1, DbRole::Hot, &timeouts_with_pool(750))
+            .expect("pool builds without connecting");
+        assert_eq!(acquire_bound(&pool), Duration::from_millis(750));
+
+        let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+            diesel_async::AsyncPgConnection,
+        >::new(dsn);
+        let plain = deadpool::managed::Pool::builder(manager)
+            .max_size(1)
+            .build()
+            .expect("pool builds without connecting");
+        assert_eq!(acquire_bound(&plain), DEFAULT_ACQUIRE_TIMEOUT);
+    }
+
+    /// A pool with no deadpool timeouts still returns within the bound.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn acquire_returns_a_typed_timeout_within_the_bound() {
+        let (_listener, dsn) = silent_listener().await;
+        let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+            diesel_async::AsyncPgConnection,
+        >::new(dsn);
+        let pool = deadpool::managed::Pool::builder(manager)
+            .max_size(1)
+            .build()
+            .expect("pool builds without connecting");
+
+        let bound = Duration::from_millis(200);
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), acquire(&pool, bound))
+            .await
+            .expect("acquire must not hang past its bound");
+        let err = outcome
+            .err()
+            .expect("a silent database yields no connection");
+        assert!(err.is_pool_acquire_timeout(), "{err}");
+        assert!(matches!(err, HarvestError::PoolAcquireTimeout { waited } if waited == bound));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A deadpool timeout maps to the same typed error.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn acquire_maps_a_deadpool_timeout_to_the_typed_error() {
+        let (_listener, dsn) = silent_listener().await;
+        let pool = engine_pool(dsn, 1, DbRole::Hot, &timeouts_with_pool(150))
+            .expect("pool builds without connecting");
+
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            acquire(&pool, Duration::from_secs(60)),
+        )
+        .await
+        .expect("the pool's own timeout must fire first");
+        let err = outcome
+            .err()
+            .expect("a silent database yields no connection");
+        assert!(err.is_pool_acquire_timeout(), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn engine_pool_rejects_invalid_timeouts() {
+        let err = engine_pool(
+            "postgres://unused@127.0.0.1:1/none",
+            1,
+            DbRole::Hot,
+            &timeouts_with_pool(0),
+        )
+        .err()
+        .expect("a zero wait is not valid");
+        assert!(matches!(err, HarvestError::Config(_)), "{err}");
     }
 }

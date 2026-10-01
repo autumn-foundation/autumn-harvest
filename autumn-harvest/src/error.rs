@@ -764,6 +764,17 @@ pub enum HarvestError {
         reason: String,
     },
 
+    /// A pool did not hand out a connection within the bound (issue #1788).
+    ///
+    /// The pool is full, or the database does not answer. Nothing was
+    /// written, so the caller can retry. Classify it with
+    /// [`HarvestError::is_pool_acquire_timeout`].
+    #[error("database pool acquire timed out after {waited:?}")]
+    PoolAcquireTimeout {
+        /// The bound that elapsed.
+        waited: std::time::Duration,
+    },
+
     /// Delivery of a `signal_external_workflow`/`signal_external_workflow_by_id`
     /// call failed permanently.
     ///
@@ -1360,6 +1371,12 @@ impl HarvestError {
     #[must_use]
     pub const fn is_shard_unavailable(&self) -> bool {
         matches!(self, Self::ShardUnavailable { .. })
+    }
+
+    /// Is this a [`HarvestError::PoolAcquireTimeout`]?
+    #[must_use]
+    pub const fn is_pool_acquire_timeout(&self) -> bool {
+        matches!(self, Self::PoolAcquireTimeout { .. })
     }
 
     /// Returns `true` if this is a

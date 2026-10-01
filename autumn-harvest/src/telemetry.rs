@@ -1394,6 +1394,20 @@ pub const METRIC_SESSION_ACQUISITION: &str = "harvest.session.acquisition";
 /// `GET /admin/preflight` for deployments without a metrics pipeline.
 pub const METRIC_SCANNER_TICK: &str = "harvest.scanner.tick";
 
+/// Counter: a pool acquire hit its bound (issue #1788).
+///
+/// Labelled `{site}`: `claim` or `heartbeat_flush`. A steady rate means the
+/// pool is too small or a connection is stuck. See
+/// `docs/operations/postgres-timeouts.md`.
+pub const METRIC_DB_POOL_ACQUIRE_TIMEOUT: &str = "harvest.db.pool_acquire_timeout";
+
+/// Counter: an activity heartbeat flush failed (issue #1788).
+///
+/// Labelled `{reason}`: `acquire_timeout`, `acquire_error` or `write_error`.
+/// The flusher keeps the payload and tries again on the next tick. A run of
+/// failures can let `heartbeat_timeout` fire on a healthy activity.
+pub const METRIC_HEARTBEAT_FLUSH_FAILED: &str = "harvest.heartbeat.flush_failed";
+
 /// Counter: a `SignalReceived` event was durably delivered into a workflow's
 /// history and promoted to a live workflow-task wake (issue #684).
 ///
@@ -1834,6 +1848,11 @@ pub const METRIC_LABEL_ACTION: &str = "action";
 /// Bounded by construction to the [`Scanner`](crate::scanner_health::Scanner)
 /// variants — a call site passes the enum's `as_str()`, never a free string.
 pub const METRIC_LABEL_SCANNER: &str = "scanner";
+
+/// Metric label: the code path that hit a pool acquire bound (issue #1788).
+///
+/// Bounded: `claim` or `heartbeat_flush`.
+pub const METRIC_LABEL_SITE: &str = "site";
 /// `shard` label value for a control loop that is **not** per-shard (issue #797).
 ///
 /// The `retention` and `schedule` loops run once per process rather than once
@@ -2651,6 +2670,21 @@ pub trait MetricsRecorder: Send + Sync {
     /// existing implementor breaks.
     fn record_scanner_registered(&self, scanner: &str, shard: &str) {
         let _ = (scanner, shard);
+    }
+
+    /// A pool acquire hit its bound (issue #1788).
+    ///
+    /// `site` is `claim` or `heartbeat_flush`. Additive with a no-op default.
+    fn record_db_pool_acquire_timeout(&self, site: &str) {
+        let _ = site;
+    }
+
+    /// An activity heartbeat flush failed (issue #1788).
+    ///
+    /// `reason` is `acquire_timeout`, `acquire_error` or `write_error`.
+    /// Additive with a no-op default.
+    fn record_heartbeat_flush_failed(&self, reason: &str) {
+        let _ = reason;
     }
 
     /// Results of one retention-janitor tick on a shard.

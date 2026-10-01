@@ -5917,7 +5917,7 @@ pub(crate) const MIN_SHARD_ACQUIRE_BOUND: Duration = Duration::from_secs(5);
 /// The per-shard pool-acquisition bound (issue #961 review, Codex P1; extended
 /// to shutdown by issue #1209).
 ///
-/// Harvest configures no deadpool `Timeouts`, so every `pool.get().await` is an
+/// A pool with no deadpool `Timeouts` makes every `pool.get().await` an
 /// **unbounded** wait. The multi-shard path visits its shards *sequentially* in
 /// three places. In each, a single exhausted or unreachable pool parks the
 /// one future and strands every peer shard:
@@ -5953,10 +5953,9 @@ pub(crate) const MIN_SHARD_ACQUIRE_BOUND: Duration = Duration::from_secs(5);
 /// follow-up; it needs `poll_once` to distinguish "acquisition timed out" from
 /// "no work", which it deliberately does not today.
 ///
-/// `false` - the single-shard path - returns `None`, which keeps the original
-/// unbounded `pool.get().await` byte-for-byte (AC7): with one shard there are
-/// no peers to starve, and blocking until a connection frees is the desired
-/// behaviour.
+/// `false` - the single-shard path - returns `None`. With one shard there are
+/// no peers to starve, so `None` uses the pool's own bound. Issue #1788 bounds
+/// that path too: an unbounded wait let one stuck connection stop all claims.
 #[must_use]
 pub(crate) const fn shard_acquire_bound(
     multi_shard: bool,
@@ -5978,38 +5977,28 @@ pub(crate) const fn shard_acquire_bound(
     }
 }
 
-/// A pooled connection, optionally acquired under a bound.
+/// A pooled connection, acquired under a bound.
 ///
 /// The single source of truth for [`shard_acquire_bound`]'s two behaviours, so
 /// the multi-shard startup path and the poll loop cannot drift on whether the
-/// wait is capped. `None` is a plain `pool.get().await` — byte-for-byte the
-/// pre-#961 single-shard code path.
+/// wait is capped. `None` uses the pool's own bound,
+/// [`crate::pool::acquire_bound`] (issue #1788).
 ///
-/// Both outcomes collapse to `Err(String)` so each caller's existing
-/// pool-failure branch handles a timeout identically to a pool error: the
-/// shard is skipped, its graceful recovery (pending-flag retry, or the next
-/// poll iteration) takes over, and no peer shard is affected.
+/// Each caller's existing pool-failure branch handles a timeout the same way
+/// as a pool error. The shard is skipped, and its graceful recovery takes
+/// over: the pending-flag retry, or the next poll iteration. No peer shard is
+/// affected. A timeout is [`HarvestError::PoolAcquireTimeout`], so a caller
+/// can count it.
 async fn acquire_shard_conn(
     pool: &DbPool,
     acquire_bound: Option<Duration>,
-) -> Result<
-    deadpool::managed::Object<
-        diesel_async::pooled_connection::AsyncDieselConnectionManager<
-            diesel_async::AsyncPgConnection,
-        >,
-    >,
-    String,
-> {
-    match acquire_bound {
-        Some(bound) => match tokio::time::timeout(bound, pool.get()).await {
-            Ok(result) => result.map_err(|e| e.to_string()),
-            Err(_elapsed) => Err(format!(
-                "pool acquisition exceeded {bound:?}; skipping this shard for one iteration"
-            )),
-        },
-        None => pool.get().await.map_err(|e| e.to_string()),
-    }
+) -> HarvestResult<crate::pool::PooledConn> {
+    let bound = acquire_bound.unwrap_or_else(|| crate::pool::acquire_bound(pool));
+    crate::pool::acquire(pool, bound).await
 }
+
+/// The `site` label for a claim acquire timeout.
+const SITE_CLAIM: &str = "claim";
 
 /// Whether the single-pool `run_with_listener` entrypoint must refuse to start
 /// (issue #961 review, Codex P1).
@@ -15072,8 +15061,15 @@ async fn process_activity_task(
     }
 
     let cancel = CancellationToken::new();
-    let heartbeat_tx =
-        crate::heartbeat::spawn_heartbeat_flusher(task.id, pool.clone(), cancel.clone());
+    let heartbeat_tx = crate::heartbeat::spawn_heartbeat_flusher_with(
+        task.id,
+        pool.clone(),
+        cancel.clone(),
+        crate::heartbeat::HeartbeatFlushOptions {
+            acquire_timeout: crate::pool::acquire_bound(pool),
+            metrics: Arc::clone(&registry.telemetry().metrics),
+        },
+    );
     let trace_carrier = task
         .trace_context
         .as_ref()
@@ -27138,8 +27134,8 @@ impl Worker {
         // can park it forever. No shard then reaches registration or
         // polling. A bounded acquisition still fails closed on that shard.
         // It matches the existing intent. It bounds the wait instead of
-        // hanging. Single-shard keeps the original unbounded
-        // `pool.get().await`. That path has no peer shard to strand.
+        // hanging. Single-shard passes `None`, which uses the pool's own
+        // bound (issue #1788). That path has no peer shard to strand.
         #[cfg(feature = "wasm-activities")]
         {
             let registrations = self.registry.wasm_module_registrations();
@@ -27960,8 +27956,8 @@ impl Worker {
         tracing::info!(worker_id = %self.config.worker_id, "shutdown signal received");
 
         // Transition to Draining before waiting for in-flight tasks. `None`:
-        // the single-shard path has no peer to strand, so this stays the
-        // original unbounded wait (AC3, issue #1209).
+        // the single-shard path has no peer to strand, so it uses the pool's
+        // own bound (issue #1788).
         self.transition_fleet_status(pool, crate::workers::WorkerStatus::Draining, None)
             .await;
 
@@ -30029,7 +30025,7 @@ impl Worker {
     /// Transition this worker's status in the fleet table.
     ///
     /// `acquire_bound` follows `shard_acquire_bound`. `None` on the
-    /// single-shard path keeps the wait unbounded, byte-for-byte. `Some(_)`
+    /// single-shard path uses the pool's own bound (issue #1788). `Some(_)`
     /// applies during multi-shard shutdown. That sequence visits shards
     /// sequentially, so one exhausted shard pool must not park the others'
     /// Draining/Stopped writes (issue #1209).
@@ -30088,11 +30084,12 @@ impl Worker {
     /// Gets a connection from the pool, tries to claim a task, dispatches it
     /// if found, or sleeps for `poll_interval` if the queue was empty.
     ///
-    /// `acquire_bound` optionally caps the pool acquisition. It is `None` on
-    /// the single-shard path (byte-for-byte the original unbounded
-    /// `pool.get().await`) and `Some(poll_interval)` when one loop drains
-    /// several shards in sequence, so an exhausted pool on one shard cannot
-    /// park the loop and strand its peers -- see `shard_acquire_bound`.
+    /// `acquire_bound` caps the pool acquisition. `None` on the single-shard
+    /// path uses the pool's own bound (issue #1788). `Some(poll_interval)`
+    /// applies when one loop drains several shards in sequence, so an
+    /// exhausted pool on one shard cannot park the loop and strand its peers.
+    /// See `shard_acquire_bound`. A timeout increments
+    /// `harvest.db.pool_acquire_timeout{site="claim"}`.
     #[allow(clippy::too_many_lines)]
     async fn poll_once(
         &self,
@@ -30103,6 +30100,12 @@ impl Worker {
         let mut conn = match acquire_shard_conn(pool, acquire_bound).await {
             Ok(conn) => conn,
             Err(e) => {
+                if e.is_pool_acquire_timeout() {
+                    self.registry
+                        .telemetry()
+                        .metrics
+                        .record_db_pool_acquire_timeout(SITE_CLAIM);
+                }
                 tracing::error!(error = %e, "failed to get connection from pool");
                 return false;
             }
@@ -34244,10 +34247,11 @@ mod tests {
         assert!(monitor_shard_scope(None, &[]).is_empty());
     }
 
-    /// The multi-shard loop bounds its pool acquisition; the single-shard path
-    /// stays unbounded, byte-for-byte (issue #961 review, Codex P1 / AC7).
+    /// The multi-shard loop floors its bound at `MIN_SHARD_ACQUIRE_BOUND`.
+    /// The single-shard path passes `None`, which uses the pool's own bound
+    /// (issue #1788).
     #[test]
-    fn shard_acquire_bound_is_multi_shard_only() {
+    fn shard_acquire_bound_floors_only_the_multi_shard_path() {
         // Below the floor -> floored. A poll interval is tuned for idle polling
         // cadence, not for how long a healthy acquisition takes on a busy pool;
         // using it directly starved a shard that merely had a deep backlog.
@@ -34269,19 +34273,79 @@ mod tests {
             "a slow loop should not be bounded tighter than its own cadence",
         );
 
-        // AC7: the single-shard path keeps the original unbounded acquisition
-        // at every cadence.
+        // The single-shard path defers to the pool bound at every cadence.
         for interval in [
             Duration::from_millis(50),
             Duration::from_millis(500),
             Duration::from_secs(60),
         ] {
-            assert_eq!(
-                shard_acquire_bound(false, interval),
-                None,
-                "the single-shard path must keep the original unbounded pool.get().await",
-            );
+            assert_eq!(shard_acquire_bound(false, interval), None);
         }
+    }
+
+    #[derive(Default)]
+    struct AcquireTimeoutSink(std::sync::Mutex<Vec<String>>);
+
+    impl crate::telemetry::MetricsRecorder for AcquireTimeoutSink {
+        fn record_db_pool_acquire_timeout(&self, site: &str) {
+            self.0.lock().expect("lock").push(site.to_owned());
+        }
+    }
+
+    /// A single-shard claim on a pool that never yields a connection returns
+    /// within the pool bound and counts the timeout (issue #1788).
+    #[tokio::test]
+    async fn a_single_shard_claim_is_bounded_and_counted() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral loopback port");
+        let addr = listener.local_addr().expect("listener has a local address");
+        let bound = Duration::from_millis(200);
+        let pool = crate::pool::engine_pool(
+            format!("postgres://silent@{addr}/silent"),
+            1,
+            crate::pool::DbRole::Hot,
+            &crate::pool::EngineDbTimeouts {
+                pool: crate::pool::PoolTimeouts {
+                    wait: bound,
+                    create: bound,
+                    recycle: bound,
+                },
+                ..crate::pool::EngineDbTimeouts::default()
+            },
+        )
+        .expect("pool builds without connecting");
+
+        let sink = Arc::new(AcquireTimeoutSink::default());
+        let telemetry = Arc::new(
+            crate::telemetry::TelemetryConfig::builder()
+                .metrics(Arc::clone(&sink) as Arc<dyn crate::telemetry::MetricsRecorder>)
+                .build(),
+        );
+        let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
+            vec![],
+            vec![],
+            crate::context::empty_shared_state(),
+            telemetry,
+        ));
+        let worker = Worker::new(default_runtime_config(), registry).expect("worker builds");
+
+        assert_eq!(crate::pool::acquire_bound(&pool), bound);
+        let claim_bound = shard_acquire_bound(false, worker.config.poll_interval);
+        let started = std::time::Instant::now();
+        let claimed = tokio::time::timeout(
+            Duration::from_secs(5),
+            worker.poll_once(&pool, claim_bound, None),
+        )
+        .await
+        .expect("a claim must not hang past the pool bound");
+        assert!(!claimed);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(*sink.0.lock().expect("lock"), vec!["claim".to_owned()]);
     }
 
     /// The single-pool entrypoint refuses a multi-shard config, and only when

@@ -1756,14 +1756,19 @@ impl ShardedDbPool {
             let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
                 diesel_async::AsyncPgConnection,
             >::new(dsn);
-            let pool = deadpool::managed::Pool::builder(manager)
-                .max_size(max_size.max(1))
-                .build()
-                .map_err(|e| {
-                    crate::error::HarvestError::Config(format!(
-                        "shard {shard}: could not build a connection pool: {e}"
-                    ))
-                })?;
+            // Operator tooling, so the `Maintenance` session timeouts apply
+            // (issue #1788).
+            let pool = crate::pool::with_engine_timeouts(
+                deadpool::managed::Pool::builder(manager).max_size(max_size.max(1)),
+                crate::pool::DbRole::Maintenance,
+                &crate::pool::EngineDbTimeouts::default(),
+            )
+            .build()
+            .map_err(|e| {
+                crate::error::HarvestError::Config(format!(
+                    "shard {shard}: could not build a connection pool: {e}"
+                ))
+            })?;
             pools.insert(shard, pool);
         }
         let mut this = Self::from_map(pools, default_shard);
@@ -1962,8 +1967,8 @@ impl std::ops::DerefMut for ShardConnRef<'_> {
 ///
 /// The per-shard timeout checker is the caller this exists for. It holds
 /// `conn` for the whole pass, and its scanners visit that same shard. A
-/// second `pool.get()` on that pool is then a hold-and-wait. Harvest
-/// configures no deadpool acquisition timeout. Once the pool is exhausted,
+/// second `pool.get()` on that pool is then a hold-and-wait. A pool
+/// may have no deadpool acquisition timeout. Once the pool is exhausted,
 /// the wait never ends, and it wedges the whole pass (issue #1426
 /// follow-up).
 ///
