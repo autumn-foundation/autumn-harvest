@@ -574,3 +574,58 @@ async fn a_lock_timeout_leaves_the_connection_ready_for_a_retry() {
         .await
         .expect("the same connection runs the write again");
 }
+
+/// The claim release that runs after a pool acquire timeout works on an
+/// activity row. It also refuses a newer claim of the same row.
+#[tokio::test]
+async fn a_stranded_activity_claim_is_released() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let queue_name = format!("q-release-{}", Uuid::new_v4());
+    let task_id = autumn_harvest::queue::enqueue(
+        &mut conn,
+        &autumn_harvest::queue::EnqueueParams::new(
+            &queue_name,
+            autumn_harvest::queue::TaskType::Activity,
+            serde_json::json!({}),
+        ),
+    )
+    .await
+    .expect("enqueue");
+    diesel::sql_query(
+        "UPDATE harvest_task_queue SET state = 'RUNNING', worker_id = 'w-1', attempt = 1 \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .execute(&mut conn)
+    .await
+    .expect("model the claim");
+    let pool = engine_pool(
+        url,
+        1,
+        DbRole::Hot,
+        &timeouts(5_000, SessionTimeouts::for_role(DbRole::Hot)),
+    )
+    .expect("engine pool");
+
+    // A stale claim (attempt 0) must not release the current one.
+    autumn_harvest::worker::reset_timed_out_workflow_task(&pool, task_id, "w-1", 0, 0).await;
+    assert_eq!(task_state(&mut conn, task_id).await, "RUNNING");
+
+    autumn_harvest::worker::reset_timed_out_workflow_task(&pool, task_id, "w-1", 0, 1).await;
+    assert_eq!(task_state(&mut conn, task_id).await, "PENDING");
+}
+
+async fn task_state(conn: &mut AsyncPgConnection, task_id: Uuid) -> String {
+    #[derive(diesel::QueryableByName)]
+    struct State {
+        #[diesel(sql_type = Text)]
+        state: String,
+    }
+    diesel::sql_query("SELECT state FROM harvest_task_queue WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .get_result::<State>(conn)
+        .await
+        .expect("read state")
+        .state
+}

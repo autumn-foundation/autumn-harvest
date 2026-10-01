@@ -36,6 +36,12 @@ or outage does not drop the result. A result write that a session
 Each write re-checks that the task is `RUNNING` under a row lock, so a repeat
 is safe.
 
+An activity task that still fails with a pool acquire timeout goes back to the
+queue. An activity can have no heartbeat, `start_to_close` or
+`schedule_to_close` deadline, and then no scanner would find it. The release
+checks the claim's `attempt` and `worker_id`. The activity can run again, as it
+can after a worker crash.
+
 `harvest.db.pool_acquire_timeout{site}` counts the timeouts that matter most.
 `site` is `claim` or `heartbeat_flush`. Other sites log the error only.
 

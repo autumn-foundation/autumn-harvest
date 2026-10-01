@@ -30709,13 +30709,15 @@ impl Worker {
                     // task on that path met the same abandoned claim, so the
                     // recovery cannot live only in the timed arm.
                     //
-                    // An activity task needs nothing here. Its `heartbeat_timeout`
-                    // and `start_to_close` columns give the server-side scan in
-                    // `timeout::find_timed_out_tasks` a deadline to find it by. A
-                    // workflow task has no such column, which is why only its
-                    // claim strands.
+                    // An activity task usually needs nothing here. Its
+                    // `heartbeat_timeout` and `start_to_close` columns give the
+                    // server-side scan in `timeout::find_timed_out_tasks` a
+                    // deadline to find it by. A workflow task has no such
+                    // column, which is why its claim strands. An activity with
+                    // all deadlines unset strands too after a pool acquire
+                    // timeout (issue #1788). See `releases_claim_after_error`.
                     #[cfg(feature = "db")]
-                    if task_type == "workflow" {
+                    if releases_claim_after_error(&task_type, &error) {
                         drop(permit);
                         reset_timed_out_workflow_task(
                             &pool,
@@ -31221,6 +31223,18 @@ pub async fn quarantine_workflow_task_timeout(
     }
 }
 
+/// Whether the dispatch error path releases the claim after `error`.
+///
+/// A workflow task has no deadline column, so its claim is always released.
+/// An activity can have every deadline unset. After a pool acquire timeout
+/// (issue #1788) no scanner would then find it, and the orphan reclaimer
+/// skips a live worker. Release it too. The handler may already have run, so
+/// the activity can run again. That is the at-least-once contract a crash
+/// gives as well.
+fn releases_claim_after_error(task_type: &str, error: &HarvestError) -> bool {
+    task_type == "workflow" || (task_type == "activity" && error.is_pool_acquire_timeout())
+}
+
 /// Backoff schedule for [`reset_timed_out_workflow_task`]'s pool-connection
 /// retries (issue #1459).
 ///
@@ -31242,6 +31256,9 @@ const RESET_POOL_RETRY_BACKOFF_MS: &[u64] =
 /// Reset a timed-out RUNNING workflow task back to PENDING so any worker can
 /// re-claim it on the next poll cycle without waiting for the orphan-reclaim
 /// staleness window (issue #494).
+///
+/// The reset applies to any task row. It also releases an activity claim
+/// after a pool acquire timeout (issue #1788).
 ///
 /// Uses an optimistic `WHERE state = 'RUNNING' AND worker_id = …` guard so a
 /// concurrent reclaim or a different worker that somehow picked it up does not
@@ -34320,6 +34337,21 @@ mod tests {
         ] {
             assert_eq!(shard_acquire_bound(false, interval), None);
         }
+    }
+
+    /// An activity whose claim hit a pool acquire timeout goes back to the
+    /// queue. Its deadlines may all be unset, so no scanner would ever find it
+    /// (issue #1788). A workflow task is always released, as before.
+    #[test]
+    fn a_pool_acquire_timeout_releases_an_activity_claim() {
+        let timeout = crate::error::HarvestError::PoolAcquireTimeout {
+            waited: Duration::from_secs(30),
+        };
+        let other = crate::error::HarvestError::Database("boom".into());
+        assert!(releases_claim_after_error("activity", &timeout));
+        assert!(!releases_claim_after_error("activity", &other));
+        assert!(releases_claim_after_error("workflow", &timeout));
+        assert!(releases_claim_after_error("workflow", &other));
     }
 
     #[derive(Default)]
