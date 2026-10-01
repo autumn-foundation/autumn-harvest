@@ -13,10 +13,11 @@ An unconfigured deployment no longer pays for the audit export index.
   It rebuilds an invalid index. It turns `statement_timeout` off for the build and restores the old value.
   A session advisory lock stops two exporters from dropping each other's build.
 - A pool of four or more connections runs the build in a detached task. The
-  build never delays a claim. A smaller pool builds inline on the tick
-  connection, so no other session loses a connection. A failure logs a warning and waits five
-  minutes. Export continues without the index. The caller drops the connection
-  if the unlock fails.
+  build never delays a claim. A smaller pool never builds, because the build
+  would starve other sessions. A role that does not own the table also cannot
+  build. In both cases the exporter logs `UNEXPORTED_INDEX_DDL` for an operator
+  to run once as the table owner. Export is correct without the index. The
+  caller drops the connection if the unlock fails.
 - No `WorkflowEvent` change. No `harvest_events` write. No replay impact.
 - Tests: `audit_export_tests` cover the migration with and without a cursor row,
   the first-tick build, no build when unconfigured, idempotence, invalid-index

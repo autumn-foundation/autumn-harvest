@@ -1101,6 +1101,14 @@ pub async fn ensure_cursor_row(
     Ok(())
 }
 
+/// The statement that builds the claim-scan index.
+///
+/// The exporter runs it on a large enough pool. An operator can run it as the
+/// table owner when the runtime role cannot, or the pool is too small.
+pub const UNEXPORTED_INDEX_DDL: &str = "CREATE INDEX CONCURRENTLY IF NOT EXISTS \
+     harvest_audit_log_unexported_idx ON harvest_audit_log (occurred_at, id) \
+     WHERE export_seq IS NULL";
+
 /// Advisory-lock key that serializes builds of the claim-scan index.
 pub const UNEXPORTED_INDEX_LOCK_KEY: i64 = 0x6175_6469_745f_6978;
 
@@ -1220,13 +1228,10 @@ async fn build_unexported_index(
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
-    let built = diesel::sql_query(
-        "CREATE INDEX CONCURRENTLY IF NOT EXISTS harvest_audit_log_unexported_idx \
-         ON harvest_audit_log (occurred_at, id) WHERE export_seq IS NULL",
-    )
-    .execute(conn)
-    .await
-    .map_err(crate::error::database_error);
+    let built = diesel::sql_query(UNEXPORTED_INDEX_DDL)
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error);
     let reset = diesel::sql_query("SELECT set_config('statement_timeout', $1, false)")
         .bind::<diesel::sql_types::Text, _>(previous)
         .execute(conn)
@@ -1237,11 +1242,48 @@ async fn build_unexported_index(
     Ok(())
 }
 
+/// A shard in one pool. The pool identity separates databases that share a
+/// shard number.
+#[cfg(feature = "db")]
+type BuildKey = (i32, usize);
+
+#[cfg(feature = "db")]
+fn build_key(pool: &crate::worker::DbPool, shard_id: i32) -> BuildKey {
+    (shard_id, std::ptr::from_ref(pool.manager()) as usize)
+}
+
 /// Earliest time each shard may try another background index build.
 #[cfg(feature = "db")]
 static INDEX_BUILD_GATE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<BuildKey, std::time::Instant>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Wait between repeats of the "pool too small" notice.
+#[cfg(feature = "db")]
+const INDEX_BUILD_NOTICE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// When each shard last logged the "pool too small" notice.
+#[cfg(feature = "db")]
+static POOL_NOTICE_GATE: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<i32, std::time::Instant>>,
 > = std::sync::LazyLock::new(Default::default);
+
+/// Whether this shard may log the "pool too small" notice now.
+#[cfg(feature = "db")]
+fn pool_notice_due(shard_id: i32) -> bool {
+    let mut gate = POOL_NOTICE_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let now = std::time::Instant::now();
+    if gate
+        .get(&shard_id)
+        .is_some_and(|last| now.duration_since(*last) < INDEX_BUILD_NOTICE_INTERVAL)
+    {
+        return false;
+    }
+    gate.insert(shard_id, now);
+    true
+}
 
 /// Wait after a failed background build before the next attempt.
 #[cfg(feature = "db")]
@@ -1249,37 +1291,34 @@ const INDEX_BUILD_RETRY: std::time::Duration = std::time::Duration::from_secs(30
 
 /// Claim the right to start a build for this shard. Marks it in flight.
 #[cfg(feature = "db")]
-fn index_build_due(shard_id: i32) -> bool {
+fn index_build_due(key: BuildKey) -> bool {
     let mut gate = INDEX_BUILD_GATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let now = std::time::Instant::now();
-    if gate
-        .get(&shard_id)
-        .is_some_and(|not_before| now < *not_before)
-    {
+    if gate.get(&key).is_some_and(|not_before| now < *not_before) {
         return false;
     }
     // A build can outlive the retry wait. The advisory lock then skips the
     // duplicate.
-    gate.insert(shard_id, now + INDEX_BUILD_RETRY);
+    gate.insert(key, now + INDEX_BUILD_RETRY);
     true
 }
 
 #[cfg(feature = "db")]
-fn index_build_finished(shard_id: i32, succeeded: bool) {
+fn index_build_finished(key: BuildKey, succeeded: bool) {
     let mut gate = INDEX_BUILD_GATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if succeeded {
-        gate.remove(&shard_id);
+        gate.remove(&key);
     }
 }
 
 /// Smallest pool that can lend a connection to a long build.
 ///
 /// A smaller pool would starve the export or other workers for the whole
-/// build. Such a pool builds inline on the tick connection instead.
+/// build.
 #[cfg(feature = "db")]
 const MIN_POOL_FOR_BACKGROUND_BUILD: usize = 4;
 
@@ -1290,57 +1329,61 @@ const MIN_POOL_FOR_BACKGROUND_BUILD: usize = 4;
 /// failure drops that connection and waits [`INDEX_BUILD_RETRY`]. Export is
 /// correct without the index, only slower.
 ///
-/// A pool under [`MIN_POOL_FOR_BACKGROUND_BUILD`] connections builds inline on
-/// the tick connection. The tick then pauses for the build, but no other
-/// session loses a connection.
+/// A pool under [`MIN_POOL_FOR_BACKGROUND_BUILD`] connections never builds. The
+/// build would starve every other session of a connection. The exporter logs
+/// [`UNEXPORTED_INDEX_DDL`] for an operator instead.
 #[cfg(feature = "db")]
 async fn spawn_unexported_index_build_if_due(
     pool: &crate::worker::DbPool,
     conn: &mut diesel_async::AsyncPgConnection,
     shard_id: i32,
 ) {
-    if !index_build_due(shard_id) {
-        return;
-    }
-    match unexported_index_valid(conn).await {
-        Ok(Some(true)) => {
-            index_build_finished(shard_id, true);
-            return;
-        }
-        Ok(_) => {}
-        Err(error) => {
-            index_build_finished(shard_id, false);
-            tracing::warn!(shard = shard_id, %error, "[audit_export] could not inspect the claim-scan index");
-            return;
-        }
-    }
     if pool.status().max_size < MIN_POOL_FOR_BACKGROUND_BUILD {
-        let built = ensure_unexported_index(conn).await;
-        index_build_finished(shard_id, built.is_ok());
-        if let Err(error) = built {
+        if pool_notice_due(shard_id)
+            && !matches!(unexported_index_valid(conn).await, Ok(Some(true)))
+        {
             tracing::warn!(
                 shard = shard_id,
-                %error,
-                "[audit_export] could not build the claim-scan index; export continues without it"
+                statement = UNEXPORTED_INDEX_DDL,
+                "[audit_export] the pool is too small to build the claim-scan index; \
+                 export continues without it. Run the statement as the table owner"
             );
         }
         return;
     }
+    let key = build_key(pool, shard_id);
+    if !index_build_due(key) {
+        return;
+    }
+    match unexported_index_valid(conn).await {
+        Ok(Some(true)) => {
+            index_build_finished(key, true);
+            return;
+        }
+        Ok(_) => {}
+        Err(error) => {
+            index_build_finished(key, false);
+            tracing::warn!(shard = shard_id, %error, "[audit_export] could not inspect the claim-scan index");
+            return;
+        }
+    }
     let pool = pool.clone();
     tokio::spawn(async move {
         let Ok(mut build_conn) = pool.get().await else {
-            index_build_finished(shard_id, false);
+            index_build_finished(key, false);
             return;
         };
         match ensure_unexported_index(&mut build_conn).await {
-            Ok(()) => index_build_finished(shard_id, true),
+            Ok(()) => index_build_finished(key, true),
             Err(error) => {
                 tracing::warn!(
                     shard = shard_id,
                     %error,
-                    "[audit_export] could not build the claim-scan index; export continues without it"
+                    statement = UNEXPORTED_INDEX_DDL,
+                    "[audit_export] could not build the claim-scan index; export continues \
+                     without it. The role may lack ownership: run the statement as the table owner"
                 );
-                index_build_finished(shard_id, false);
+                index_build_finished(key, false);
                 drop(deadpool::managed::Object::take(build_conn));
             }
         }
@@ -1359,7 +1402,9 @@ async fn ensure_unexported_index_best_effort(
         tracing::warn!(
             shard = shard_id,
             %error,
-            "[audit_export] could not build the claim-scan index; export continues without it"
+            statement = UNEXPORTED_INDEX_DDL,
+            "[audit_export] could not build the claim-scan index; export continues \
+             without it. The role may lack ownership: run the statement as the table owner"
         );
     }
 }

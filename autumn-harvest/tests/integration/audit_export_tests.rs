@@ -5294,7 +5294,9 @@ async fn a_short_session_statement_timeout_does_not_break_the_build() {
         .await
         .expect("second session");
     old_txn
-        .batch_execute("BEGIN; SELECT txid_current();")
+        .batch_execute(
+            "BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM harvest_audit_log;",
+        )
         .await
         .expect("open transaction");
     conn.batch_execute("SET statement_timeout = '100ms'")
@@ -5444,7 +5446,9 @@ async fn export_delivers_while_the_background_build_waits() {
         .await
         .expect("second session");
     old_txn
-        .batch_execute("BEGIN; SELECT txid_current();")
+        .batch_execute(
+            "BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM harvest_audit_log;",
+        )
         .await
         .expect("open transaction");
     let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
@@ -5473,7 +5477,49 @@ async fn export_delivers_while_the_background_build_waits() {
     }
     assert_eq!(unexported_idx_state(&mut conn).await, Some(false));
     old_txn.batch_execute("COMMIT").await.expect("commit");
+    // Let the build finish, so it clears its process-wide retry gate.
+    while unexported_idx_state(&mut conn).await != Some(true) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the build must finish"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
     cancel.cancel();
     let _ = handle.await;
     uninstall();
+}
+
+/// A one-connection pool must never run the long build. Export still works.
+#[tokio::test]
+async fn a_one_connection_pool_exports_without_building_the_index() {
+    let _guard = TEST_SERIAL.lock().await;
+    let sink = install(Arc::new(RecordingSink::new(200)), 100);
+    let (mut conn, url, _c) = make_conn_any().await;
+    insert_audit_rows(&mut conn, 3).await;
+    let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+        diesel_async::AsyncPgConnection,
+    >::new(url);
+    let pool = autumn_harvest::worker::DbPool::builder(manager)
+        .max_size(1)
+        .build()
+        .expect("pool");
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let handle = autumn_harvest::audit_export::spawn_audit_export_checker_for_shard(
+        pool,
+        cancel.clone(),
+        std::time::Duration::from_millis(20),
+        Arc::new(autumn_harvest::telemetry::TelemetryConfig::default()),
+        Some(ShardId::new(0)),
+        None,
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while sink.all_seqs().len() < 3 {
+        assert!(std::time::Instant::now() < deadline, "records must export");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    cancel.cancel();
+    let _ = handle.await;
+    uninstall();
+    assert_eq!(unexported_idx_state(&mut conn).await, None);
 }

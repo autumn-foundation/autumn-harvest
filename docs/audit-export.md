@@ -25,7 +25,10 @@ per-shard cursor that advances only on acknowledgement.
   exporter now builds the index on its first tick, with `CREATE INDEX
   CONCURRENTLY`, so audit inserts continue during the build. A migration drops
   the index from databases that never ran export. Databases with a cursor row
-  keep it. Once export runs, the index size is bounded only while retention
+  keep it. A pool under four connections, or a role that does not own the
+  table, cannot build it. The exporter then logs the statement. Run it once as
+  the table owner. Export is correct without the index, only slower. Once
+  export runs, the index size is bounded only while retention
   reclaims unexported rows. See "Retention interaction" below. Retention can never purge a decommission or reactivation
   record, exported or not.
 - **It never touches workflow history.** No new `WorkflowEvent` variant, no
