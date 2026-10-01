@@ -1,6 +1,6 @@
 # Fork — The first workflow on plain Axum
 
-[← Index](README.md) · [Chapter 2](02-first-workflow.md) · [Reference: `embedding.md`](../embedding.md)
+[← Your first workflow](02-first-workflow.md) · [Index](README.md) · [Next: Durable timers →](03-durable-timers.md)
 
 ---
 
@@ -9,26 +9,31 @@ service runs on plain Axum, not on autumn-web. It runs the Chapter 2 workflow
 with no `HarvestPlugin` and no `AppBuilder`.
 
 Workflows, activities, timers, signals and child workflows are the same on
-both paths. Only two things change: how the process starts the engine, and
-how it serves the management API.
+both paths. Three things change: how the process starts the engine, how it
+serves the management API, and how the migrations run.
 
 [`embedding.md`](../embedding.md) is the reference for this path. This chapter
 is the short version.
 
 > **Prerequisites**
+> - Read [Chapter 2](02-first-workflow.md) first. It explains the workflow and
+>   the activity. Skip its `HarvestPlugin` registration.
 > - A clone of this repository. The code in this chapter is the crate
 >   [`examples/standalone-quickstart`](../../examples/standalone-quickstart/),
 >   and CI runs each command below as written.
 > - Docker, for Postgres.
 > - `jq`.
 >
-> `HarvestEmbedding` is not in the 0.6.0 release. Run this chapter from the
-> checkout until the next release ships.
+> Run each command from the repository root. `HarvestEmbedding` is not in the
+> 0.6.0 release, so run this chapter from the checkout until the next release
+> ships.
 
 ## 1. The crate
 
 <!-- sync: examples/standalone-quickstart/Cargo.toml -->
 ```toml
+# This crate inherits no workspace settings, so you can copy it out of the
+# repository as it is.
 [package]
 name = "standalone-quickstart"
 version = "0.1.0"
@@ -49,21 +54,21 @@ autumn-harvest = { version = "0.6.0", path = "../../autumn-harvest", features = 
 ```
 
 The crate does not call autumn-web's `AppBuilder`. It still depends on
-`autumn-web`, because `autumn-harvest-plugin` does and `main.rs` uses its Axum
-re-export. Issue #1615 removes that dependency.
+`autumn-web`. `autumn-harvest-plugin` needs it, and `main.rs` uses its Axum
+re-export. Issue #1615 tracks the removal of that dependency.
 
-Outside this repository, remove each `path` key. Use the first release that
-contains `HarvestEmbedding`.
+Outside this repository, remove each `path` key. Set each `version` to the
+first release that contains `HarvestEmbedding`.
 
 ## 2. The workflow
 
 `src/workflows.rs` holds the Chapter 2 code with no change. Below it,
-`harvest_builder` registers the workflow and the activity. On the plugin
-path, `HarvestPlugin::workflows` and `HarvestPlugin::activities` do this.
+`harvest_builder` registers the workflow and the activity.
 
 <!-- sync: examples/standalone-quickstart/src/workflows.rs -->
 ```rust
 use std::time::Duration;
+
 use autumn_harvest::prelude::*;
 
 #[workflow]
@@ -102,8 +107,8 @@ pub fn harvest_builder() -> HarvestBuilder {
 mod tests;
 ```
 
-The `tests` module runs `onboarding` under `WorkflowSimulator`.
-[Chapter 11](11-testing.md) explains that tool.
+The `tests` module runs `onboarding` under `WorkflowSimulator`, with the
+activity mocked. [Chapter 11](11-testing.md) covers workflow tests.
 
 ## 3. The server
 
@@ -127,9 +132,10 @@ async fn main() -> Result<(), BoxError> {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .init();
+
     let database_url = std::env::var("DATABASE_URL").map_err(|_| "set DATABASE_URL")?;
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&database_url);
-    let pool = Pool::builder(manager).build()?;
+    let pool = Pool::builder(manager).max_size(10).build()?;
 
     // The default config runs the worker and the scheduler in this process.
     // The outbox relay needs autumn-web, so `HarvestEmbedding` does not run it.
@@ -144,6 +150,9 @@ async fn main() -> Result<(), BoxError> {
         ..HarvestRuntimeConfig::default()
     };
 
+    // Bind first. A busy port then stops the process before a worker starts.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
+
     // Run the startup sequence of `HarvestPlugin` without autumn-web's `AppBuilder`.
     let harvest = HarvestEmbedding::new(
         workflows::harvest_builder().try_build()?,
@@ -156,25 +165,28 @@ async fn main() -> Result<(), BoxError> {
     .map_err(|error| format!("Harvest did not start: {error}"))?;
 
     let app = axum::Router::new().nest("/api/harvest", harvest.router());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
     tracing::info!("listening on http://127.0.0.1:3000");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await?;
+    let served = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await;
 
-    // Drain the worker and remove the process globals.
+    // Drain the worker and remove the process globals, also after a serve error.
     harvest.stop().await;
+    tracing::info!("Harvest stopped");
+    served?;
     Ok(())
+}
+
+/// Wait for Ctrl-C.
+async fn shutdown_signal() {
+    if let Err(error) = tokio::signal::ctrl_c().await {
+        tracing::warn!(%error, "cannot listen for Ctrl-C");
+    }
 }
 ```
 
-`HarvestEmbedding::start` runs the startup sequence of `HarvestPlugin`:
-
-- It applies the operator's `[harvest.startup]` settings.
-- It loads the persisted admission gates before the worker starts.
-- It installs the storage pool and then the API runtime.
+`HarvestEmbedding::start` runs the same startup steps as `HarvestPlugin`.
+[Start the runtime](../embedding.md#start-the-runtime) lists them.
 
 `harvest.router()` is a plain `axum::Router`. Nest it under any path.
 `harvest.stop()` drains the worker after the server stops.
@@ -193,11 +205,17 @@ services:
       POSTGRES_PASSWORD: harvest
       POSTGRES_DB: harvest
     ports:
-      - "5435:5432"
+      - "127.0.0.1:5435:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U harvest"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
 ```
 
+<!-- chapter-run: skip CI starts the same Postgres as a service container. -->
 ```bash
-docker compose -f examples/standalone-quickstart/compose.yaml up -d
+docker compose -f examples/standalone-quickstart/compose.yaml up -d --wait
 ```
 
 Apply the Harvest migrations. On the plugin path, the `dev` profile applies
@@ -218,15 +236,19 @@ AUTUMN_PROFILE=dev \
 cargo run -p standalone-quickstart
 ```
 
-`with_ambient_profile()` reads `AUTUMN_PROFILE`. The `dev` profile opens the
-management API to any caller with no credential. The server logs a warning
-about this. Do not use `dev` outside your workstation.
+`with_ambient_profile()` reads `AUTUMN_ENV`, then `AUTUMN_PROFILE`. The `dev`
+profile opens the admin routes to any caller with no credential. The server
+logs a warning about this.
+
+Other profiles do not close everything. With no auth layer of your own, a
+workflow start or a signal is open in every profile. So keep this server on
+`127.0.0.1`.
 
 ## 5. Start the workflow
 
 In a second terminal, send the Chapter 2 request:
 
-<!-- chapter-run: expect execution_id -->
+<!-- chapter-run: expect "execution_id": " -->
 ```bash
 curl -s -X POST http://localhost:3000/api/harvest/workflows/onboarding/start \
   -H 'Content-Type: application/json' \
@@ -252,17 +274,20 @@ cargo run -p autumn-harvest-cli -- preflight
 ```
 
 The CLI's default base URL is `http://localhost:3000/api/harvest`. Preflight
-exits `0` on a pass and `2` on a warning. Under `dev`, the
-`admin_auth_boundary` row says that the admin API is reachable
-unauthenticated.
+exits `0` on a pass and `2` on a warning. Expect `0` or `2` here. The
+`admin_auth_boundary` row passes, and it says that any caller can reach the
+admin API.
+
+Press Ctrl-C in the server terminal. The server stops, drains the worker, and
+logs `Harvest stopped`.
 
 ## Before production
 
 The `dev` profile is for this chapter only. Read these sections of the
 reference before you deploy:
 
-- [Authenticate](../embedding.md#authenticate): declare a profile and a
-  credential. Tokens alone do not pass preflight.
+- [Authenticate](../embedding.md#authenticate): declare a profile, a
+  credential and your own auth layer. Tokens alone do not pass preflight.
 - [What you own](../embedding.md#what-you-own): the work that
   `HarvestPlugin` does and this path does not.
 - [Scrape metrics](../embedding.md#scrape-metrics) and
@@ -272,15 +297,16 @@ reference before you deploy:
 
 ## Back to the main path
 
-Chapters 3 to 11 apply to this path. Add each workflow and activity to
-`src/workflows.rs`, and register it in `harvest_builder`. Where a chapter
+Continue at [Chapter 3](03-durable-timers.md). Add each workflow and activity
+to `src/workflows.rs`, and register it in `harvest_builder`. Where a chapter
 registers code with a `HarvestPlugin` method, such as `.signals(..)` or
-`.dags(..)`, call the `HarvestBuilder` method with the same name. For the auth
-methods in [Chapter 10](10-operations.md), see
-[Authenticate](../embedding.md#authenticate).
+`.dags(..)`, call the `HarvestBuilder` method with the same name.
 
-Two chapters differ:
+These chapters differ on this path:
 
+- [Chapter 10](10-operations.md): use `harvest migrate run`, not
+  `autumn migrate`. Where it says that a call needs admin auth, see
+  [Authenticate](../embedding.md#authenticate).
 - [Chapter 12](12-webhooks.md): mount receivers with `build_webhook_router`.
   See [Receive webhooks](../embedding.md#receive-webhooks).
 - [Chapter 13](13-broker-connectors.md): broker connectors are available on
@@ -288,4 +314,4 @@ Two chapters differ:
 
 ---
 
-[← Index](README.md) · [Chapter 2](02-first-workflow.md) · [Reference: `embedding.md`](../embedding.md)
+[← Your first workflow](02-first-workflow.md) · [Index](README.md) · [Next: Durable timers →](03-durable-timers.md)

@@ -6,4 +6,9 @@ services:
       POSTGRES_PASSWORD: harvest
       POSTGRES_DB: harvest
     ports:
-      - "5435:5432"
+      - "127.0.0.1:5435:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U harvest"]
+      interval: 2s
+      timeout: 5s
+      retries: 15

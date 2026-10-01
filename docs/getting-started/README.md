@@ -42,7 +42,8 @@ Stop at any chapter — each one ends in a runnable state.
 > **Not on autumn-web?** Every chapter above mounts `HarvestPlugin` on an
 > autumn-web app. If your service runs on plain Axum, take the fork:
 > [The first workflow on plain Axum](standalone-axum.md) runs the Chapter 2
-> workflow with `HarvestEmbedding`. Then come back for Chapters 3 to 11.
+> workflow with `HarvestEmbedding`. Then continue at Chapter 3. The fork lists
+> the chapters that differ.
 
 Start with [Chapter 1 →](01-project-skeleton.md)
 

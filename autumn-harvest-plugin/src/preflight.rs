@@ -1531,7 +1531,8 @@ fn check_admin_auth_boundary(api_state: &HarvestApiState) -> PreflightCheckResul
                 "Wrap the Harvest API in your own auth layer and declare it: \
                  HarvestPlugin::api_with_auth on autumn-web, or \
                  StandaloneAdminAuth::with_admin_auth_boundary on a standalone mount. \
-                 API tokens alone are not a boundary, because they guard only the /admin routes.",
+                 API tokens alone are not a boundary, because a request with no token \
+                 still reaches each route that has no admin guard.",
             ),
         },
         Vec::new(),
@@ -1798,6 +1799,10 @@ mod tests {
                 "remediation must name {needle:?}, got: {remediation}"
             );
         }
+        assert!(
+            !remediation.contains("  "),
+            "each line continuation must leave one space, got: {remediation}"
+        );
     }
 
     /// Build a `WorkerRow` with the given registered `shard_assignments`.

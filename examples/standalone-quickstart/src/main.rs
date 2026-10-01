@@ -16,9 +16,10 @@ async fn main() -> Result<(), BoxError> {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .init();
+
     let database_url = std::env::var("DATABASE_URL").map_err(|_| "set DATABASE_URL")?;
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&database_url);
-    let pool = Pool::builder(manager).build()?;
+    let pool = Pool::builder(manager).max_size(10).build()?;
 
     // The default config runs the worker and the scheduler in this process.
     // The outbox relay needs autumn-web, so `HarvestEmbedding` does not run it.
@@ -33,6 +34,9 @@ async fn main() -> Result<(), BoxError> {
         ..HarvestRuntimeConfig::default()
     };
 
+    // Bind first. A busy port then stops the process before a worker starts.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
+
     // Run the startup sequence of `HarvestPlugin` without autumn-web's `AppBuilder`.
     let harvest = HarvestEmbedding::new(
         workflows::harvest_builder().try_build()?,
@@ -45,15 +49,21 @@ async fn main() -> Result<(), BoxError> {
     .map_err(|error| format!("Harvest did not start: {error}"))?;
 
     let app = axum::Router::new().nest("/api/harvest", harvest.router());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
     tracing::info!("listening on http://127.0.0.1:3000");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await?;
+    let served = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await;
 
-    // Drain the worker and remove the process globals.
+    // Drain the worker and remove the process globals, also after a serve error.
     harvest.stop().await;
+    tracing::info!("Harvest stopped");
+    served?;
     Ok(())
+}
+
+/// Wait for Ctrl-C.
+async fn shutdown_signal() {
+    if let Err(error) = tokio::signal::ctrl_c().await {
+        tracing::warn!(%error, "cannot listen for Ctrl-C");
+    }
 }

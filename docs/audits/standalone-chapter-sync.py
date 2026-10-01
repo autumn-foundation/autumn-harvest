@@ -4,22 +4,28 @@
 Deterministic. No network, no build.
 
 The standalone getting-started chapter shows a real crate,
-`examples/standalone-quickstart`. CI compiles that crate and runs it. This
-audit makes sure that the chapter shows the same bytes that CI runs.
+`examples/standalone-quickstart`. CI compiles that crate and runs the
+chapter's shell blocks with `scripts/run-standalone-chapter.sh`. This audit
+makes sure that the chapter shows the same bytes that CI runs, and that no
+shell block escapes the run.
 
 It checks these items:
 
-1. Each `<!-- sync: PATH -->` marker has a fenced block after it. The block
-   body is identical to the file at PATH.
-2. Each file in `REQUIRED_SYNC` has a marker. A deleted marker cannot hide
-   a stale block.
-3. The chapter has the `<!-- chapter-run: KIND -->` markers that
-   `scripts/run-standalone-chapter.sh` needs.
+1. The chapter has no CR byte. The runner reads lines with awk, so a CR
+   would hide a marker from it.
+2. Each `<!-- sync: PATH -->` marker has a fenced block after it. The block
+   body is identical to the file at PATH. Each file in `REQUIRED_SYNC` has
+   a marker, so a deleted marker cannot hide a stale block.
+3. Each shell fence has a `<!-- chapter-run: KIND -->` marker before it.
+   Each marker parses, and the chapter has each kind that the runner needs.
 4. The first Rust block of Chapter 2 appears verbatim in the crate. The
    fork then really runs "the same first workflow".
 5. `docs/embedding.md` has no Rust fence that rustdoc skips. The
    `EmbeddingDocSnippets` doctest then compiles every Rust block in it.
-6. The doctest harness and the CI steps that run these guards exist.
+6. The doctest harness and the CI steps that run these guards exist, and
+   are not commented out.
+7. The CI Postgres service matches `compose.yaml`, so CI tests the database
+   that the chapter starts.
 
 Usage:
     python3 docs/audits/standalone-chapter-sync.py
@@ -36,32 +42,50 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 CHAPTER = "docs/getting-started/standalone-axum.md"
 EMBEDDING = "docs/embedding.md"
 CRATE = "examples/standalone-quickstart"
+CHAPTER_2 = "docs/getting-started/02-first-workflow.md"
+CHAPTER_2_FILE = f"{CRATE}/src/workflows.rs"
+COMPOSE = f"{CRATE}/compose.yaml"
+CI = ".github/workflows/ci.yml"
+CI_JOB = "standalone-chapter"
 
 REQUIRED_SYNC = [
     f"{CRATE}/Cargo.toml",
-    f"{CRATE}/compose.yaml",
+    COMPOSE,
     f"{CRATE}/src/workflows.rs",
     f"{CRATE}/src/main.rs",
 ]
-CHAPTER_2 = "docs/getting-started/02-first-workflow.md"
-CHAPTER_2_FILE = f"{CRATE}/src/workflows.rs"
 REQUIRED_RUN_KINDS = ["serve", "expect", "preflight"]
 
-# Each pair is (file, text). The text must appear in the file.
+# Each pair is (file, line). The line must appear in the file, uncommented.
 REQUIRED_WIRING = [
+    (
+        "autumn-harvest-plugin/src/lib.rs",
+        '#[cfg(all(doctest, feature = "metrics", feature = "webhooks"))]',
+    ),
     (
         "autumn-harvest-plugin/src/lib.rs",
         '#[doc = include_str!("../../docs/embedding.md")]',
     ),
-    (".github/workflows/ci.yml", "python3 docs/audits/standalone-chapter-sync.py"),
-    (".github/workflows/ci.yml", "--doc EmbeddingDocSnippets"),
-    (".github/workflows/ci.yml", "./scripts/run-standalone-chapter.sh"),
+    (CI, "python3 docs/audits/standalone-chapter-sync.py"),
+    (
+        CI,
+        "cargo test -p autumn-harvest-plugin --features metrics,webhooks "
+        "--doc EmbeddingDocSnippets 2>&1 | tee embedding-doctests.log",
+    ),
+    (CI, "run: ./scripts/run-standalone-chapter.sh"),
 ]
 
 SYNC_RE = re.compile(r"^<!-- sync: (\S+) -->$")
-RUN_RE = re.compile(r"^<!-- chapter-run: (\w+)(?: .*)? -->$")
-FENCE_OPEN_RE = re.compile(r"^```(\S*)$")
-RUST_SKIP_ATTRS = {"ignore", "text", "compile_fail"}
+RUN_RE = re.compile(r"^<!-- chapter-run: (serve|preflight|expect \S.*|skip \S.*) -->$")
+FENCE_OPEN_RE = re.compile(r"^ {0,3}```(.*)$")
+SHELL_LANGS = {"bash", "sh", "shell", "console", "zsh"}
+RUST_SKIP_ATTRS = {"text", "compile_fail"}
+
+
+def fence_info(line: str) -> str | None:
+    """Return the info string of an opening fence, or None."""
+    opener = FENCE_OPEN_RE.match(line)
+    return opener.group(1).strip() if opener else None
 
 
 def next_block(lines: list[str], start: int) -> tuple[str, str] | None:
@@ -74,22 +98,29 @@ def next_block(lines: list[str], start: int) -> tuple[str, str] | None:
         index += 1
     if index >= len(lines):
         return None
-    opener = FENCE_OPEN_RE.match(lines[index])
-    if not opener:
+    info = fence_info(lines[index])
+    if info is None:
         return None
     body: list[str] = []
     for line in lines[index + 1 :]:
-        if line == "```":
-            return opener.group(1), "".join(f"{entry}\n" for entry in body)
+        if line.strip() == "```":
+            return info, "".join(f"{entry}\n" for entry in body)
         body.append(line)
     return None
+
+
+def check_line_endings(text: str) -> list[str]:
+    """The chapter has no CR byte."""
+    if "\r" in text:
+        return [f"{CHAPTER}: contains a CR byte. Save it with LF line endings."]
+    return []
 
 
 def check_sync(chapter_text: str, read_file) -> tuple[list[str], set[str]]:
     """Compare each synced block with its file. Return errors and paths."""
     errors: list[str] = []
     seen: set[str] = set()
-    lines = chapter_text.splitlines()
+    lines = chapter_text.split("\n")
     for number, line in enumerate(lines, start=1):
         marker = SYNC_RE.match(line)
         if not marker:
@@ -112,19 +143,49 @@ def check_sync(chapter_text: str, read_file) -> tuple[list[str], set[str]]:
     return errors, seen
 
 
+def is_shell_fence(info: str) -> bool:
+    words = re.split(r"[,\s]+", info)
+    return bool(words) and words[0] in SHELL_LANGS
+
+
 def check_run_markers(chapter_text: str) -> list[str]:
-    """Each run marker has a bash block. Each required kind is present."""
+    """Each marker parses and has a bash block. Each shell fence has a marker."""
     errors: list[str] = []
     kinds: set[str] = set()
-    lines = chapter_text.splitlines()
+    marked_fences: set[int] = set()
+    lines = chapter_text.split("\n")
     for number, line in enumerate(lines, start=1):
+        if "chapter-run" not in line:
+            continue
         marker = RUN_RE.match(line)
         if not marker:
+            errors.append(f"{CHAPTER}:{number}: a chapter-run marker does not parse: {line!r}")
             continue
-        kinds.add(marker.group(1))
+        kinds.add(marker.group(1).split(" ", 1)[0])
+        index = number
+        while index < len(lines) and not lines[index].strip():
+            index += 1
+        marked_fences.add(index)
         block = next_block(lines, number)
         if block is None or block[0] != "bash":
             errors.append(f"{CHAPTER}:{number}: a chapter-run marker needs a bash block after it")
+
+    in_fence = False
+    for index, line in enumerate(lines):
+        if in_fence:
+            if line.strip() == "```":
+                in_fence = False
+            continue
+        info = fence_info(line)
+        if info is None:
+            continue
+        in_fence = True
+        if is_shell_fence(info) and index not in marked_fences:
+            errors.append(
+                f"{CHAPTER}:{index + 1}: a shell block has no chapter-run marker. "
+                "Mark it, or mark it `skip REASON`."
+            )
+
     for kind in REQUIRED_RUN_KINDS:
         if kind not in kinds:
             errors.append(f"{CHAPTER}: no <!-- chapter-run: {kind} --> marker")
@@ -134,15 +195,21 @@ def check_run_markers(chapter_text: str) -> list[str]:
 def check_embedding_fences(text: str) -> list[str]:
     """Every Rust fence in embedding.md is one that rustdoc compiles."""
     errors: list[str] = []
-    for number, line in enumerate(text.splitlines(), start=1):
-        opener = FENCE_OPEN_RE.match(line)
-        if not opener or not opener.group(1).startswith("rust"):
+    for number, line in enumerate(text.split("\n"), start=1):
+        info = fence_info(line)
+        if not info:
             continue
-        attrs = set(opener.group(1).split(",")[1:])
-        skipped = attrs & RUST_SKIP_ATTRS
+        words = [word for word in re.split(r"[,\s]+", info) if word]
+        if not words or words[0] != "rust":
+            continue
+        skipped = [
+            word
+            for word in words[1:]
+            if word.startswith("ignore") or word in RUST_SKIP_ATTRS
+        ]
         if skipped:
             errors.append(
-                f"{EMBEDDING}:{number}: a rust fence marked {sorted(skipped)} is not compiled. "
+                f"{EMBEDDING}:{number}: a rust fence marked {skipped} is not compiled. "
                 "Make the block compile."
             )
     return errors
@@ -150,7 +217,7 @@ def check_embedding_fences(text: str) -> list[str]:
 
 def first_rust_block(text: str) -> str | None:
     """Return the body of the first `rust` fence in `text`."""
-    lines = text.splitlines()
+    lines = text.split("\n")
     for index, line in enumerate(lines):
         if line == "```rust":
             block = next_block(lines, index)
@@ -170,9 +237,55 @@ def check_same_workflow(chapter_2: str | None, crate_file: str | None) -> list[s
     return []
 
 
+def compose_value(compose: str, key: str) -> str | None:
+    match = re.search(rf"^\s*{key}:\s*(\S+)\s*$", compose, re.M)
+    return match.group(1) if match else None
+
+
+def check_service_matches_compose(compose: str, ci_job: str) -> list[str]:
+    """The CI service uses the image, the credentials and the port of compose.yaml."""
+    errors: list[str] = []
+    needles = []
+    for key in ["image", "POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB"]:
+        value = compose_value(compose, key)
+        if value is None:
+            errors.append(f"{COMPOSE}: no {key}")
+            continue
+        needles.append(f"{key}: {value}")
+    port = re.search(r"(\d+):5432", compose)
+    if port is None:
+        errors.append(f"{COMPOSE}: no published Postgres port")
+    else:
+        needles.append(f"{port.group(1)}:5432")
+    for needle in needles:
+        if needle not in ci_job:
+            errors.append(f"{CI}: job {CI_JOB} does not have {needle!r} from {COMPOSE}")
+    return errors
+
+
+def ci_job_text(ci: str, job: str) -> str:
+    """Return the lines of one top-level job in ci.yml."""
+    match = re.search(rf"^  {re.escape(job)}:\n(.*?)(?=^  [\w-]+:\n|\Z)", ci, re.M | re.S)
+    return match.group(1) if match else ""
+
+
+def wiring_present(text: str, needle: str) -> bool:
+    """`needle` is on a line that is not a YAML or Rust comment."""
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith(("#", "//")) and not stripped.startswith("#["):
+            continue
+        if needle in line:
+            return True
+    return False
+
+
 def read_repo_file(path: str) -> str | None:
+    """Read a file with its line endings unchanged."""
     target = REPO_ROOT / path
-    return target.read_text(encoding="utf-8") if target.is_file() else None
+    if not target.is_file():
+        return None
+    return target.read_bytes().decode("utf-8")
 
 
 def run() -> int:
@@ -181,6 +294,7 @@ def run() -> int:
     if chapter is None:
         errors.append(f"{CHAPTER}: not found")
     else:
+        errors.extend(check_line_endings(chapter))
         sync_errors, seen = check_sync(chapter, read_repo_file)
         errors.extend(sync_errors)
         for path in REQUIRED_SYNC:
@@ -199,9 +313,14 @@ def run() -> int:
         errors.extend(check_embedding_fences(embedding))
 
     for path, needle in REQUIRED_WIRING:
-        text = read_repo_file(path) or ""
-        if needle not in text:
+        if not wiring_present(read_repo_file(path) or "", needle):
             errors.append(f"{path}: missing {needle!r}")
+
+    errors.extend(
+        check_service_matches_compose(
+            read_repo_file(COMPOSE) or "", ci_job_text(read_repo_file(CI) or "", CI_JOB)
+        )
+    )
 
     for error in errors:
         print(error, file=sys.stderr)
@@ -251,6 +370,33 @@ def self_test() -> int:
     assert check_embedding_fences("```rust\nfn a() {}\n```\n") == []
     assert check_embedding_fences("```rust,no_run\nfn a() {}\n```\n") == []
     assert len(check_embedding_fences("```rust,ignore\nfn a() {}\n```\n")) == 1
+    # A CR anywhere in the chapter is a finding, because awk sees it.
+    assert len(check_line_endings("a\r\nb\n")) == 1
+    # A line that mentions chapter-run but does not parse is a finding.
+    assert len(check_run_markers("<!--  chapter-run: serve -->\n```bash\nx\n```\n")) >= 1
+    assert len(check_run_markers("<!-- chapter-run: expect  -->\n```bash\nx\n```\n")) >= 1
+    assert len(check_run_markers("<!-- chapter-run: serving -->\n```bash\nx\n```\n")) >= 1
+    # Every shell fence needs a marker. `skip` with a reason is a marker.
+    unmarked = runs + "```bash\ndocker compose up\n```\n"
+    assert len(check_run_markers(unmarked)) == 1
+    assert len(check_run_markers(runs + "   ```sh\nls\n   ```\n")) == 1
+    skipped = runs + "<!-- chapter-run: skip CI uses a service. -->\n```bash\nup\n```\n"
+    assert check_run_markers(skipped) == []
+    # rustdoc also skips these forms.
+    assert len(check_embedding_fences("```rust, ignore\nfn a() {}\n```\n")) == 1
+    assert len(check_embedding_fences("```rust ignore\nfn a() {}\n```\n")) == 1
+    assert len(check_embedding_fences("  ```rust,ignore-wasm32\nfn a() {}\n  ```\n")) == 1
+    # The CI service matches compose.yaml.
+    compose = (
+        "    image: postgres:16\n      POSTGRES_USER: u\n"
+        "      POSTGRES_PASSWORD: p\n      POSTGRES_DB: d\n      - \"127.0.0.1:5435:5432\"\n"
+    )
+    job = "image: postgres:16\nPOSTGRES_USER: u\nPOSTGRES_PASSWORD: p\nPOSTGRES_DB: d\n- 5435:5432\n"
+    assert check_service_matches_compose(compose, job) == []
+    assert len(check_service_matches_compose(compose, job.replace("16", "17"))) == 1
+    # A commented-out CI line does not count as wiring.
+    assert not wiring_present("# run: cargo test x\n", "run: cargo test x")
+    assert wiring_present("  run: cargo test x\n", "run: cargo test x")
     print("standalone-chapter-sync self-test: OK")
     return 0
 

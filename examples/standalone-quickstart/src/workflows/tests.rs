@@ -16,12 +16,16 @@ fn the_builder_registers_the_chapter_2_workflow_and_activity() {
 #[tokio::test]
 async fn onboarding_returns_the_status_of_the_welcome_email() {
     let result = WorkflowSimulator::new(__autumn_workflow_info_onboarding().handler)
-        .mock_activity("send_welcome_email", |_| Ok(json!({ "status": "sent" })))
+        .mock_activity("send_welcome_email", |input| {
+            assert_eq!(input["user_id"], json!(42));
+            Ok(json!({ "status": "queued" }))
+        })
         .run(json!(42))
         .await;
 
+    // The workflow falls back to "sent", so the mock returns a different status.
     assert_eq!(
         result.final_output.expect("onboarding completes"),
-        json!("sent")
+        json!("queued")
     );
 }

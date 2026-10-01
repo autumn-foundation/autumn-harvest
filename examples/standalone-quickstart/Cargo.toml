@@ -1,3 +1,5 @@
+# This crate inherits no workspace settings, so you can copy it out of the
+# repository as it is.
 [package]
 name = "standalone-quickstart"
 version = "0.1.0"

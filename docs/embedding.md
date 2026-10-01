@@ -67,14 +67,21 @@ types. Your code does not call `AppBuilder`. Issue #1615 tracks an embedding
 with no `autumn-web` in its `Cargo.toml`.
 
 **A database pool.** `HarvestRunnerResources::new` takes an
-`autumn_harvest::worker::DbPool`. The core crate re-exports `diesel_async`, so
-you can build the pool without autumn-web. See the
-[`main.rs` of the fork chapter](getting-started/standalone-axum.md#3-the-server).
+`autumn_harvest::worker::DbPool`. The fork chapter builds one through the
+`diesel_async` re-export of the core crate, with a size cap of 10. See its
+[`main.rs`](getting-started/standalone-axum.md#3-the-server). A production pool
+also needs timeouts and TLS. `autumn_web::db::create_pool` sets both, and
+[`examples/standalone-runner`](../examples/standalone-runner/) uses it.
+
+**A runtime config in code.** `HarvestPlugin` loads all of `[harvest]` from
+`autumn.toml` and the environment. `HarvestEmbedding` reads only
+`[harvest.startup]` from them. Build the rest of `HarvestRuntimeConfig` in
+code, or call `HarvestRuntimeConfig::load()`.
 
 ## Start the runtime
 
-`HarvestEmbedding::start` runs the startup sequence that `HarvestPlugin` runs,
-in the same order. Both paths call the same steps in `boot.rs`.
+`HarvestEmbedding::start` runs the startup steps of `HarvestPlugin` through
+the same shared code. `start` returns a `HarvestEmbeddingRuntime`.
 
 ```rust
 use autumn_harvest_plugin::api::StandaloneAdminAuth;
@@ -99,6 +106,11 @@ async fn serve(
         },
         ..HarvestRuntimeConfig::default()
     };
+
+    // Bind first. A busy port then stops the process before a worker starts.
+    // Bind a public address only behind your own auth layer.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:8080").await?;
+
     let harvest = HarvestEmbedding::new(
         builder.try_build()?,
         config,
@@ -110,18 +122,41 @@ async fn serve(
     .map_err(|error| format!("Harvest did not start: {error}"))?;
 
     let app = axum::Router::new().nest("/api/harvest", harvest.router());
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await?;
+    let served = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await;
+
+    // Stop also after a serve error, so the worker drains.
     harvest.stop().await;
+    served?;
     Ok(())
+}
+
+/// Wait for Ctrl-C, or for the SIGTERM that a container runtime sends.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                sigterm.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        () = ctrl_c => {}
+        () = terminate => {}
+    }
 }
 ```
 
-`start` does these steps:
+`start` does these steps, in this order:
 
 1. It applies the operator's `[harvest.startup]` settings over `config.startup`.
    It reads `autumn.toml`, `autumn-{profile}.toml` and
@@ -129,26 +164,34 @@ async fn serve(
    boot.
 2. It applies the declared admin posture to the API state and wraps the
    router in the declared auth layers.
-3. It copies the builder limits into the API state.
-4. It loads the persisted admission gates before a worker starts.
-5. It runs the orphaned-workflow gate. See
+3. It loads the persisted admission gates before a worker starts.
+4. It runs the orphaned-workflow gate. See
    [`safe-deploy.md`](runbooks/safe-deploy.md).
-6. It starts the runner. It then installs the storage pool and the API
-   runtime, in that order, and starts the gate refresh loop.
+5. It copies the builder limits into the API state.
+6. It publishes the admission globals and starts the runner.
+7. It installs the storage pool, starts the gate refresh loop, and then
+   installs the API runtime.
+
+The plugin copies the builder limits first. `HarvestEmbedding` copies them
+after the orphan gate, because the copy sets a process global. A refused boot
+then changes no process global.
 
 These builder methods set the inputs:
 
 | Method | Effect |
 |---|---|
 | `with_admin_auth(StandaloneAdminAuth)` | Declares the credential and the deployment profile. See [Authenticate](#authenticate). |
-| `with_ambient_profile()` | Reads the profile from `AUTUMN_ENV`, then `AUTUMN_PROFILE`. A declared profile wins. |
+| `with_ambient_profile()` | Reads the profile from `AUTUMN_ENV`, then `AUTUMN_PROFILE`. A declared profile overrides the environment. |
 | `without_ui()` | Leaves the Vantage dashboard out of the router. |
 | `with_notification_database_urls(..)` | Sets one result-notification URL per shard. See [Run more than one shard](#run-more-than-one-shard). |
 | `with_api_state(HarvestApiState)` | Uses your API state, for example to call `set_actor_extractor`. Do not install a runtime or a pool on it. |
 
-`start` returns an error when the startup config is invalid, a shard has no
-notification URL, the orphan gate refuses the boot, or the runner does not
-start.
+`start` returns an error in these cases:
+
+- The operator startup config is invalid.
+- A shard has no notification URL.
+- The orphan gate refuses the boot.
+- The runner does not start.
 
 ## What the router gives you
 
@@ -157,20 +200,23 @@ under any path. It holds these routes:
 
 - The management API. [`management-api.md`](management-api.md) lists every
   route.
-- The Vantage dashboard under `/ui`, unless you call `without_ui()`.
-- `GET /openapi.json`. It needs no credential, by design.
+- The Vantage dashboard under `/ui`, unless you call `without_ui()`. Its
+  start page is `/ui/workflows`.
+- `GET /openapi.json` and `GET /health`. They need no credential, by design.
 
-The admin guard covers only the `/admin` routes. Other routes, for example a
-workflow start, a signal or a cancel, have no built-in guard. Put your own
-auth layer around the router, as on the plugin path.
+The admin guard is on selected high-impact routes only, for example
+`/workflows/{id}/cancel` and most `/admin` routes. Many routes have no
+built-in guard, for example a workflow start, a signal and some `/admin`
+schedule routes. Put your own auth layer around the router, as on the plugin
+path.
 
-The layer order is load-bearing. A request passes through these layers, from
-the outside in:
+The layer order sets which layer sees a request first. A request passes
+through these layers, from the outside in:
 
 1. Your auth layer.
-2. The scoped-token layer, if you declare `with_api_tokens()`.
-3. The read-only-role layer, if you declare `with_read_only_role()`.
-4. The admin guard on each `/admin` route.
+2. The scoped-token layer, if you call `StandaloneAdminAuth::with_api_tokens()`.
+3. The read-only-role layer, if you call `StandaloneAdminAuth::with_read_only_role()`.
+4. The admin guard on each guarded route.
 
 `router()` applies layers 2 to 4. Apply layer 1 to the router that it returns.
 
@@ -182,47 +228,59 @@ shows who does each item on each path.
 | Responsibility | `HarvestPlugin` | `HarvestEmbedding` | You |
 |---|---|---|---|
 | Apply `[harvest.startup]` operator settings | Yes | Yes | — |
+| Load the rest of `[harvest]` config | From `autumn.toml` and the environment | No | Build `HarvestRuntimeConfig` in code, or call `HarvestRuntimeConfig::load()` |
 | Load the admission gates at boot, then refresh them | Yes | Yes | — |
 | Install the storage pool, then the API runtime | Yes | Yes | — |
 | Copy the builder limits into the API state | Yes | Yes | — |
 | Set the deployment profile | From autumn-web | From `StandaloneAdminAuth` or `with_ambient_profile()` | Declare it |
 | Install the token and read-only-role layers | `enable_api_tokens()`, `api_with_role_auth(..)` | From `StandaloneAdminAuth` | Declare them |
-| Authenticate non-admin routes | `api_with_auth(..)` | No | Your auth layer |
+| Authenticate the routes with no admin guard | `api_with_auth(..)` | No | Your auth layer |
 | Apply migrations | Under the `dev` profile | No | `harvest migrate run` |
 | Create the database pool | From `[database]` | No | Build a `DbPool` |
 | Serve HTTP | autumn-web | No | Your Axum server |
-| Serve metrics | `/actuator/prometheus` | No | A route that calls `render_prometheus()` |
+| Serve the catalogue metrics | `with_metrics_scrape()` adds them to `/actuator/prometheus` | No | A route that calls `render_prometheus()` |
 | Mount webhook receivers | `HarvestPlugin::webhooks(..)` | No | `build_webhook_router(..)` |
 | Stop on shutdown | Shutdown hook | `stop()` | Call `stop()` after the server stops |
+
+The queue-scaling gauges at `GET /admin/metrics` are part of the management
+API, so both paths serve them.
 
 ## Authenticate
 
 A new `StandaloneAdminAuth` declares nothing. The profile is then `unknown`,
-and every `/admin` route answers `401`. Declare a profile and a credential.
+and each admin-guarded route answers `401`. Declare a profile and a
+credential. For production, declare all three of these: a profile, API
+tokens, and your own layer with the boundary.
+[Your own auth layer](#your-own-auth-layer) shows that posture.
 
 ### The deployment profile
 
 Declare it with `with_deployment_profile("prod")`, or call
 `HarvestEmbedding::with_ambient_profile()` to read it from the environment.
-The `dev` profile with no boundary admits any caller with no credential. The
-server logs a warning when this is the case. Use `dev` on a workstation only.
+Under the `dev` profile with no declared boundary, the admin guard admits
+every caller, also a caller with no credential. The server logs a warning
+when this is the case. Use `dev` on a workstation only.
 
 ### Scoped API tokens
 
-`with_api_tokens()` installs the token layer (issue #942). A request with an
-`Authorization: Bearer hvst_…` header reaches the admin routes that its scope
-allows. A `read` token gets `403` on a mutating route.
+`with_api_tokens()` installs the token layer (issue #942). The layer checks
+each `Authorization: Bearer hvst_…` header on every route. A verified token
+reaches the admin routes that its scope allows. A `read` token gets `403` on a
+mutating route. An unknown, revoked or expired token gets `401`.
 
 `POST /admin/tokens` mints a token, but only an admin can call it. Seed the
 first token offline instead:
 
 ```bash
-cargo run -p autumn-harvest-cli -- token bootstrap --name ops-seed --scope mutate
+cargo run -p autumn-harvest-cli -- token bootstrap \
+  --name ops-seed --scope mutate --expires-at 2026-12-31T00:00:00Z
 ```
 
 The command opens no connection. It prints the secret once and an `INSERT`
-statement. Run the statement against the Harvest database. Then pass the
-secret to the CLI with `--token` or `HARVEST_TOKEN`.
+statement. Run the statement against the Harvest database. Give the secret to
+the CLI in the `HARVEST_TOKEN` variable, not with `--token`, so that it stays
+out of the shell history. Then mint a scoped token for each operator with
+`POST /admin/tokens`, and revoke the seed.
 [`security-posture.md`](security-posture.md#first-token-bootstrap-standalone-mode)
 explains the design.
 
@@ -230,7 +288,7 @@ explains the design.
 
 `with_admin_auth_boundary()` declares that your layer authenticates every
 request. The admin guard then admits each request that reaches it. Declare it
-only when a layer really wraps the router.
+only when a layer wraps the router.
 
 ```rust
 use autumn_harvest::api_token::looks_like_harvest_token;
@@ -257,8 +315,14 @@ fn is_operator(_bearer: &str) -> bool {
     false
 }
 
-/// Your auth layer. The Harvest token layer inside it verifies `hvst_` tokens.
-async fn require_operator(request: Request, next: Next) -> Response {
+/// Your auth layer.
+///
+/// It lets an `hvst_` bearer through to the Harvest token layer, which
+/// verifies it. Keep that arm only while `admin_auth` calls `with_api_tokens()`.
+/// Without the token layer, nothing checks the token.
+async fn require_operator(mut request: Request, next: Next) -> Response {
+    // The default actor extractor trusts this header, so do not let a caller set it.
+    request.headers_mut().remove("x-harvest-actor");
     let bearer = request
         .headers()
         .get(AUTHORIZATION)
@@ -278,15 +342,22 @@ fn app(harvest: &HarvestEmbeddingRuntime) -> axum::Router {
 }
 ```
 
+This layer also gates `/health` and `/openapi.json`. Exempt them if a probe or
+a client needs them. The layer accepts only the exact `Bearer ` prefix, so it
+rejects other spellings. To record the operator as the audit actor, set an
+actor extractor through `with_api_state`.
+
 A browser does not send a bearer header. To use Vantage, accept a browser
-credential in your layer too, for example a session cookie.
+credential too, for example a session cookie. Accept it only for paths under
+`/ui`, or set `SameSite=Strict` on it. Some API `POST` routes have no body and
+no cross-site check.
 
 ### The read-only operator role
 
-`with_read_only_role()` installs the class-aware read-only layer (issue #776).
-It reads an autumn-web `Session` that your layer sets. Without that session,
-the layer has no effect. [`operator-role.md`](operator-role.md) describes the
-role.
+`with_read_only_role()` installs the read-only-role layer (issue #776). The
+layer sorts each route into a read class or a mutating class. It reads an
+autumn-web `Session` that your layer sets. Without that session, the layer
+has no effect. [`operator-role.md`](operator-role.md) describes the role.
 
 ### What preflight reports
 
@@ -296,19 +367,20 @@ check reads only the profile and the boundary declaration.
 | Profile | `with_admin_auth_boundary()` | `admin_auth_boundary` check |
 |---|---|---|
 | `dev` | No | Pass, with `unauthenticated_access: true` |
-| `dev` | Yes | Pass |
 | `unknown` | No | Warn |
-| Any other | Yes | Pass |
 | Any other | No | **Fail**, also when tokens are on |
+| Any profile | Yes | Pass |
 
-Tokens alone do not pass this check. The token layer guards the `/admin`
-routes only, so a workflow start is still open. Wrap the router in your own
-layer and declare the boundary.
+Tokens alone do not pass this check. The token layer admits a request with no
+token, so each route with no admin guard stays open. Wrap the router in your
+own layer and declare the boundary.
 
 ## Scrape metrics
 
-`HarvestMetricsRecorder` collects the catalogue metrics in process. It needs
-the `metrics` feature. Give the same recorder to the builder and to a route.
+`HarvestMetricsRecorder` collects the
+[catalogue metrics](telemetry.md#metric-catalogue-adr-0001-7) in process. It
+needs the `metrics` feature. Give the same recorder to the builder and to a
+route.
 
 ```rust
 use std::sync::Arc;
@@ -365,6 +437,7 @@ fn webhooks(
     harvest: &HarvestEmbeddingRuntime,
     triggers: &[WebhookTriggerInfo],
     workflows: &[WorkflowInfo],
+    dags: &[DagInfo],
     secret: &str,
 ) -> Result<axum::Router, WebhookConfigError> {
     let endpoint = WebhookEndpointConfig::generic("orders", "/hooks/orders", secret)
@@ -373,20 +446,21 @@ fn webhooks(
         endpoints: vec![endpoint],
         ..WebhookConfig::default()
     };
-    build_webhook_router(triggers, workflows, &[], harvest.api_state(), &config)
+    build_webhook_router(triggers, workflows, dags, harvest.api_state(), &config)
 }
 ```
 
-Pass the workflows that you register on the builder. Merge the result into
-your app at the root, not under the management API path.
+Pass the workflows and the DAGs that you register on the builder. The DAG
+check needs the DAG list. Merge the result into your app at the root, not
+under the management API path.
 
 These limits apply off the plugin path:
 
 - An endpoint with replay protection is an error. The cleanup layer that
   releases a replay key after a `5xx` exists only in autumn-web. Harvest
-  deduplicates by `WorkflowId`, so you do not need it.
-- The function panics at build time when a trigger has no endpoint, targets
-  a DAG, or targets an unregistered workflow.
+  deduplicates starts by `WorkflowId`, so you do not need replay protection.
+- `build_webhook_router` panics when a trigger has no endpoint, targets a DAG,
+  or targets an unregistered workflow.
 - The routes do not get the plugin's request timeout, idempotency metadata or
   OpenAPI entry.
 
@@ -395,15 +469,19 @@ verification.
 
 ## Shut down
 
-Stop the HTTP server first. Then call `HarvestEmbeddingRuntime::stop`:
+Stop the HTTP server first, so that no request reaches a cleared API state.
+Then call `HarvestEmbeddingRuntime::stop`. It does these steps, in order:
 
-1. The gate refresh loop stops.
-2. The runner drains its worker, up to `WorkerConfig::shutdown_timeout`.
-3. The admission globals are removed.
-4. The API state is cleared, so the router answers `503`.
+1. It stops the gate refresh loop.
+2. It stops the runner, which drains the worker up to
+   `WorkerConfig::shutdown_timeout`.
+3. It removes the admission globals.
+4. It clears the API state. The routes then fail with "harvest runtime is not
+   started".
 
 A dropped runtime keeps its background tasks and its process globals. Always
-call `stop()`.
+call `stop()`, also after a server error. A container runtime sends SIGTERM,
+so listen for it as well as for Ctrl-C.
 
 ## Run more than one shard
 
@@ -421,7 +499,8 @@ terminally. See
 
 These features need autumn-web. `HarvestEmbedding` does not provide them:
 
-- **MCP tools.** The tool routes use autumn-web's `mount_mcp` envelope.
+- **MCP tools.** The tool routes need autumn-web's `mount_mcp`. This path has
+  no MCP surface today.
 - **The workflow-start outbox relay.** `start` logs a warning when
   `config.outbox.enabled` is set.
 - **Broker connectors** (Kafka, SQS). See

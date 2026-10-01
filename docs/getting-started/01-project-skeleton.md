@@ -5,7 +5,8 @@
 ---
 
 > This guide uses autumn-web and `HarvestPlugin`. For a plain Axum service,
-> take the fork: [The first workflow on plain Axum](standalone-axum.md).
+> read [Chapter 2](02-first-workflow.md), then take the fork:
+> [The first workflow on plain Axum](standalone-axum.md).
 
 ## The fastest path: `cargo dev`
 
