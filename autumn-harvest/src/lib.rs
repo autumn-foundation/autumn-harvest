@@ -373,6 +373,8 @@ pub mod queue_pause;
 /// `db` feature; [`quota::load_quota_usage`]/[`quota::list_quota_usage`] are
 /// DB-gated.
 pub mod quota;
+#[cfg(feature = "db")]
+pub(crate) mod quota_lock_order;
 /// Registry-aware `quota_key` backfill for pre-upgrade executions (issue #1226).
 ///
 /// Pure logic ([`quota_reconcile::resolve_backfill`],
