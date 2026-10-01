@@ -10222,3 +10222,129 @@ mod replaced_run_outcome_tests {
         assert_eq!(replaced_run_outcome(&[]), None);
     }
 }
+
+#[cfg(test)]
+mod with_start_shared_unit_tests {
+    use super::{
+        SWS_LIVE_STATES, StartEffects, StartWorkflowParams, UWS_LIVE_STATES, UpdateWithStartParams,
+        is_live_state, should_escalate_terminal_prior,
+    };
+    use crate::types::{ExecutionId, StartSource, UpdateId, WorkflowIdReusePolicy as R};
+
+    #[test]
+    fn live_states_differ_only_by_suspended() {
+        for state in ["RUNNING", "PAUSED"] {
+            assert!(is_live_state(state, SWS_LIVE_STATES));
+            assert!(is_live_state(state, UWS_LIVE_STATES));
+        }
+        assert!(!is_live_state("SUSPENDED", SWS_LIVE_STATES));
+        assert!(is_live_state("SUSPENDED", UWS_LIVE_STATES));
+        for state in ["COMPLETED", "FAILED", "CANCELLED", "TERMINATED"] {
+            assert!(!is_live_state(state, SWS_LIVE_STATES));
+            assert!(!is_live_state(state, UWS_LIVE_STATES));
+        }
+    }
+
+    #[test]
+    fn escalation_needs_a_terminal_prior_and_an_allow_policy_and_no_debounce() {
+        let go = |state, debounced, policy| {
+            should_escalate_terminal_prior(state, SWS_LIVE_STATES, debounced, policy)
+        };
+        assert!(go("COMPLETED", false, R::AllowDuplicate));
+        assert!(go("FAILED", false, R::AllowDuplicateFailedOnly));
+        assert!(!go("RUNNING", false, R::AllowDuplicate));
+        assert!(!go("PAUSED", false, R::AllowDuplicate));
+        assert!(!go("COMPLETED", true, R::AllowDuplicate));
+        assert!(!go("COMPLETED", false, R::RejectDuplicate));
+        assert!(!go("COMPLETED", false, R::TerminateIfRunning));
+    }
+
+    fn update_request() -> UpdateWithStartParams<'static> {
+        UpdateWithStartParams {
+            workflow_name: "wf",
+            workflow_id: "id-1",
+            exec_id: ExecutionId::new(),
+            input: serde_json::json!({"in": 1}),
+            parent_id: Some(uuid::Uuid::nil()),
+            queue_name: "q",
+            execution_timeout: Some(chrono::Duration::seconds(10)),
+            memo: Some(serde_json::json!({"m": 1})),
+            search_attrs: Some(serde_json::json!({"s": 1})),
+            reuse_policy: R::AllowDuplicate,
+            trace_context: None,
+            max_execution_timeout_ceiling: Some(chrono::Duration::seconds(20)),
+            chain_execution_timeout: Some(chrono::Duration::seconds(30)),
+            max_workflow_chain_timeout_ceiling: Some(chrono::Duration::seconds(40)),
+            concurrency_key: Some("ck".to_string()),
+            concurrency_limit: Some(3),
+            concurrency_on_conflict: crate::concurrency::ConcurrencyOnConflict::Defer,
+            update_id: UpdateId::new(),
+            update_name: "u".to_string(),
+            update_args: serde_json::json!({}),
+            idempotency_key: None,
+            max_workflow_input_bytes: 99,
+            owner: Some("o"),
+            runbook_url: Some("r"),
+            severity: Some("s"),
+            context_headers: None,
+            sla: Some(chrono::Duration::seconds(5)),
+            workflow_retry_policy: None,
+            max_workflow_attempts_ceiling: Some(4),
+            reject_fresh_if_debounced: false,
+        }
+    }
+
+    #[test]
+    fn builder_forwards_common_fields_and_takes_provenance_as_data() {
+        let request = update_request();
+        let exec_id = ExecutionId::new();
+        let p: StartWorkflowParams<'_> = with_start_params!(
+            request,
+            exec_id,
+            R::TerminateIfRunning,
+            StartSource::Webhook,
+            Some("ref-x")
+        );
+        assert_eq!(p.exec_id, exec_id);
+        assert_eq!(p.reuse_policy, R::TerminateIfRunning);
+        assert_eq!(p.start_source, StartSource::Webhook);
+        assert_eq!(p.start_source_ref, Some("ref-x"));
+        assert_eq!(p.workflow_id, "id-1");
+        assert_eq!(p.queue_name, "q");
+        assert_eq!(p.input, request.input);
+        assert_eq!(p.parent_id, request.parent_id);
+        assert_eq!(p.memo, request.memo);
+        assert_eq!(p.search_attrs, request.search_attrs);
+        assert_eq!(p.execution_timeout, request.execution_timeout);
+        assert_eq!(p.chain_execution_timeout, request.chain_execution_timeout);
+        assert_eq!(
+            p.max_workflow_chain_timeout_ceiling,
+            request.max_workflow_chain_timeout_ceiling
+        );
+        assert_eq!(p.inherited_chain_deadline_at, None);
+        assert_eq!(p.concurrency_key.as_deref(), Some("ck"));
+        assert_eq!(p.concurrency_limit, Some(3));
+        assert_eq!(p.owner, Some("o"));
+        assert_eq!(p.sla, request.sla);
+        assert_eq!(p.max_workflow_attempts_ceiling, Some(4));
+        assert_eq!(p.workflow_attempt, 1);
+        // The start step enforces the input cap; the builder never sets it.
+        assert_eq!(p.max_workflow_input_bytes, 0);
+    }
+
+    #[test]
+    fn absorb_appends_every_deferred_list() {
+        let mut effects = StartEffects::default();
+        effects.absorb((
+            Vec::new(),
+            vec![(ExecutionId::new(), "wf".to_string())],
+            Vec::new(),
+        ));
+        effects.absorb((
+            Vec::new(),
+            vec![(ExecutionId::new(), "wf".to_string())],
+            Vec::new(),
+        ));
+        assert_eq!(effects.checks.len(), 2);
+    }
+}
