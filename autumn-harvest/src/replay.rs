@@ -4247,10 +4247,10 @@ impl HistoryMatcher {
                 // What separates them is not the event, it is whether anything in
                 // this decision claims it — which this scan cannot know, because it
                 // runs BEFORE the sibling branches are polled. So it crosses
-                // everything NON-CONSUMINGLY (each event stays claimable exactly
-                // once by `match_timer_cancel` / `match_timer_arm` / etc.) and
-                // leaves the verdict to the end-of-cycle drift guard in
-                // `executor.rs`. Strict and canary replay use
+                // everything NON-CONSUMINGLY. Each event stays claimable exactly
+                // once by `match_timer_cancel` / `match_timer_arm` / etc. The
+                // end-of-cycle drift guard in `executor.rs` gives the verdict.
+                // Strict and canary replay use
                 // `history_has_unconsumed_events()`. The worker path uses
                 // `first_unconsumed_command_event()` (issue #1791).
                 //
@@ -4369,8 +4369,8 @@ impl HistoryMatcher {
         //   * a sibling branch of this decision claims it later in the same
         //     cycle (the #950 mixed batch) → the frontier is clean when the body
         //     suspends and the park is correct;
-        //   * nothing claims it (a stray left by code that no longer runs, issue
-        //     #768 round 13) → it is still unconsumed at suspend. The
+        //   * nothing claims it (a stray left by code that no longer runs,
+        //     issue #768) → it is still unconsumed at suspend. The
         //     end-of-cycle drift guard in `executor.rs` then fails the cycle.
         //     The run does not park forever on a signal that never arrives.
         //     Strict and canary replay use `history_has_unconsumed_events()`.
@@ -9154,7 +9154,7 @@ mod tests {
         //
         // So this asserts the two halves the cycle guard needs, not a verdict:
         // park, and the stray event still unclaimed. Two integration tests pin
-        // the round-13 OUTCOME end to end:
+        // the issue #768 outcome end to end:
         //
         // - `interleaved_sibling_signal_stray_timer_started_still_diverges`
         //   pins strict replay (`history_has_unconsumed_events()`).
