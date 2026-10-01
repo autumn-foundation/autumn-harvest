@@ -636,6 +636,8 @@ mod signature_validation_characterization_tests {
     }
 }
 
+// Pins the output of `attr_util::build_handler_dispatch` as used by `#[update]`
+// (issue #1632).
 #[cfg(test)]
 mod dispatch_characterization_tests {
     use super::update_macro;

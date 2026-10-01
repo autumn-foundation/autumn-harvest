@@ -591,14 +591,10 @@ pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
 // ── Dispatch-block characterization tests (issue #1632) ─────────────────────
 //
-// `activity_macro`'s arity-keyed dispatch block (0/1/N non-`ctx` params, plus
-// the `encode_err` branch for a plain vs. `ActivityFailure` return type) is
-// byte-identical to `workflow.rs`'s `workflow_macro` dispatch block. Issue
-// #1632 documents this as one decision, hand-mirrored across both macros.
-// It defers a merge until characterization tests exist here (this file had
-// no macro-expansion tests before this commit). Pinned here first so a
-// follow-up move to a shared `build_handler_dispatch` cannot silently change
-// what a handler's dispatch closure does.
+// `activity_macro` builds its dispatch block with
+// `attr_util::build_handler_dispatch`. These tests pin the generated block for
+// 0, 1, and many non-`ctx` params. They cover a plain return type and an
+// `ActivityFailure` return type.
 #[cfg(test)]
 mod dispatch_characterization_tests {
     use super::activity_macro;

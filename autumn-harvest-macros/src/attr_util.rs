@@ -180,9 +180,9 @@ pub fn param_idents<'a>(params: &'a [&syn::FnArg]) -> Vec<&'a syn::Ident> {
 /// value. Many parameters decode a JSON array by position. The array binds to
 /// `__args`, so a handler parameter named `args` cannot shadow it.
 ///
-/// The caller supplies the call shape: `ctx_expr` is the context argument,
-/// `await_tokens` is empty or `.await`, and `encode_err` is the closure that
-/// maps the handler error to a `String`.
+/// The caller supplies the call shape. `ctx_expr` is the context argument.
+/// `await_tokens` is empty or `.await`. `encode_err` is the closure that maps
+/// the handler error to a `String`.
 pub fn build_handler_dispatch(
     fn_name: &syn::Ident,
     param_names: &[&syn::Ident],

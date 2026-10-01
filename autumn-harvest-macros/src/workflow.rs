@@ -1471,15 +1471,10 @@ mod rate_validation_tests {
 
 // ── Dispatch-block characterization tests (issue #1632) ─────────────────────
 //
-// `workflow_macro`'s arity-keyed dispatch block (0/1/N non-`ctx` params, plus
-// the `encode_err` branch for a plain vs. `WorkflowFailure` return type) is
-// byte-identical to `activity.rs`'s `activity_macro` dispatch block, and
-// shares its 0/1/N structure with `query.rs`/`update.rs`. Issue #1632
-// documents this as one decision, hand-mirrored across all four macros. It
-// defers a merge until characterization tests exist for `workflow.rs` and
-// `activity.rs` (neither had macro-expansion tests before this commit).
-// Pinned here first so a follow-up move to a shared `build_handler_dispatch`
-// cannot silently change what a handler's dispatch closure does.
+// `workflow_macro` builds its dispatch block with
+// `attr_util::build_handler_dispatch`. These tests pin the generated block for
+// 0, 1, and many non-`ctx` params. They cover a plain return type and a
+// `WorkflowFailure` return type.
 #[cfg(test)]
 mod dispatch_characterization_tests {
     use super::workflow_macro;
