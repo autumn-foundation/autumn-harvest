@@ -63,7 +63,7 @@ async fn setup() -> (AsyncPgConnection, Option<ContainerAsync<Postgres>>) {
     (conn, container)
 }
 
-fn sws<'a>(id: &'a str, policy: WorkflowIdReusePolicy) -> SignalWithStartParams<'a> {
+fn sws(id: &str, policy: WorkflowIdReusePolicy) -> SignalWithStartParams<'_> {
     SignalWithStartParams {
         workflow_name: "ws_wf",
         workflow_id: id,
@@ -101,7 +101,7 @@ fn sws<'a>(id: &'a str, policy: WorkflowIdReusePolicy) -> SignalWithStartParams<
     }
 }
 
-fn uws<'a>(id: &'a str, policy: WorkflowIdReusePolicy) -> UpdateWithStartParams<'a> {
+fn uws(id: &str, policy: WorkflowIdReusePolicy) -> UpdateWithStartParams<'_> {
     UpdateWithStartParams {
         workflow_name: "ws_wf",
         workflow_id: id,
