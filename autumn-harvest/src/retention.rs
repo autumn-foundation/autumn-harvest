@@ -3865,11 +3865,13 @@ mod tests {
     use crate::types::ShardId;
     use std::time::Duration;
 
+    #[cfg(feature = "db")]
     fn count_of(sql: &str, needle: &str) -> usize {
         sql.matches(needle).count()
     }
 
     #[test]
+    #[cfg(feature = "db")]
     fn candidate_scan_sql_lists_exactly_the_candidate_states() {
         for global in [true, false] {
             let sql = candidate_scan_sql(global);
@@ -3883,6 +3885,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "db")]
     fn active_child_count_sql_keeps_the_candidate_states() {
         let sql = active_child_count_sql();
         assert!(sql.contains("NOT IN"));
@@ -3893,6 +3896,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "db")]
     fn chain_link_count_sql_lists_every_terminal_state() {
         let sql = chain_link_count_sql();
         for state in crate::erase::TERMINAL_STATES {
@@ -3901,6 +3905,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "db")]
     fn templates_hold_no_hand_copied_state() {
         for template in [
             CANDIDATE_SCAN_GLOBAL_TEMPLATE,
