@@ -14,6 +14,7 @@
 //!
 //! `audit_export_tests.rs`'s own module doc repeats the same deferral:
 //! "The insert-path index cost is separate (issue #1272)."
+//!
 //! Issue #1667 shipped option (1): the migration drops the index and the exporter
 //! builds it lazily. This harness now builds it for the with-index arm.
 //!
