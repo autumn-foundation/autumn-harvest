@@ -37,6 +37,11 @@ Each write re-checks that the task is `RUNNING` under a row lock, so a repeat
 is safe. With a payload offloader there is no repeat: each try would upload a
 blob that no row then references.
 
+Harvest detects a session timeout from the English Postgres message, because
+Diesel keeps no SQLSTATE in its errors. Keep `lc_messages` set to an English
+locale, such as `C` or `en_US.UTF-8`, on the server or the database. With
+another language, a cancelled result write is not repeated or released.
+
 An activity task that still fails to get a connection, or still hits a session
 timeout, goes back to the queue. `HarvestError::PoolAcquireFailed` marks a
 connection that failed at once, for example a refused connect. An activity can have no heartbeat, `start_to_close` or

@@ -299,6 +299,10 @@ impl EngineDbTimeouts {
 ///
 /// Postgres rolls back the failed transaction and keeps the session, so the
 /// same connection can run the write again.
+///
+/// The check reads the English message text. Diesel keeps no SQLSTATE in its
+/// error, so a server with a non-English `lc_messages` is not detected. The
+/// `partition` timeout checks have the same limit.
 #[must_use]
 pub fn is_session_timeout(error: &HarvestError) -> bool {
     match error {
