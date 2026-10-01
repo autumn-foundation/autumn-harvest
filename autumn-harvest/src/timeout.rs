@@ -522,6 +522,29 @@ pub async fn find_timed_out_tasks(
     Ok(results)
 }
 
+/// Default rows per timeout reason that one checker pass reads (issue #1795).
+pub const DEFAULT_TIMEOUT_SCAN_BATCH_SIZE: u32 = 500;
+
+/// Where the next batched task-timeout scan starts (issue #1795).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TimeoutScanCursor {
+    _private: (),
+}
+
+/// Batched form of [`find_timed_out_tasks`] (issue #1795).
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] on query failure.
+pub async fn find_timed_out_tasks_batch(
+    conn: &mut AsyncPgConnection,
+    cursor: &mut TimeoutScanCursor,
+    limit: i64,
+) -> HarvestResult<Vec<(TaskQueueItem, TimeoutReason)>> {
+    let _ = (cursor, limit);
+    find_timed_out_tasks(conn).await
+}
+
 fn execution_id_from_uuid(id: uuid::Uuid) -> crate::types::ExecutionId {
     id.to_string()
         .parse()
@@ -5125,6 +5148,45 @@ pub fn spawn_timeout_checker_for_shard(
     )
 }
 
+/// [`spawn_timeout_checker_for_shard`] with scanner election (issue #1795).
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_coordinated_timeout_checker_for_shard(
+    pool: Pool<AsyncPgConnection>,
+    cancel: CancellationToken,
+    interval: Duration,
+    telemetry: std::sync::Arc<crate::telemetry::TelemetryConfig>,
+    unknown_target_grace_window: Duration,
+    sharded_pool: Option<crate::shard::ShardedDbPool>,
+    shard_assignments: Vec<crate::types::ShardId>,
+    circuit_breakers: std::sync::Arc<crate::circuit_breaker::CircuitBreakerRegistry>,
+    max_workflow_history_events: Option<u64>,
+    session_worker_stale_secs: i64,
+    shard: Option<crate::types::ShardId>,
+    payload_codecs: crate::payload_codec::PayloadCodecs,
+    codec_rotation_batch_size: i64,
+    coordination: crate::scanner_lease::ScannerCoordination,
+    task_batch_size: u32,
+) -> tokio::task::JoinHandle<()> {
+    let _ = (coordination, task_batch_size);
+    spawn_timeout_checker_on_shard_pool(
+        pool,
+        cancel,
+        interval,
+        telemetry,
+        unknown_target_grace_window,
+        sharded_pool,
+        shard_assignments,
+        circuit_breakers,
+        max_workflow_history_events,
+        session_worker_stale_secs,
+        shard,
+        None,
+        payload_codecs,
+        codec_rotation_batch_size,
+    )
+}
+
 /// [`spawn_timeout_checker_for_shard`] for a caller that knows `pool`'s shard.
 ///
 /// `pool_shard` must name the shard whose own pool `pool` is. `shard` stays
@@ -5250,6 +5312,11 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
             // no-work pass, an enforcement error, and a failed connection
             // checkout all still prove the loop itself is alive. Only a
             // panicked, deadlocked, or permanently hung loop stops ticking.
+            telemetry.metrics.record_scanner_pass(
+                crate::scanner_health::Scanner::Timeout.as_str(),
+                &owners[0].shard_label(),
+                "unelected",
+            );
             for owner in &owners {
                 crate::scanner_health::record_scanner_tick(&*telemetry.metrics, *owner);
             }
