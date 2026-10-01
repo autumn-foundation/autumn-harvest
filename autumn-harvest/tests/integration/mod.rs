@@ -271,6 +271,8 @@ mod usage_report_activity_lookback_tests;
 #[cfg(feature = "wasm-activities")]
 mod wasm_activities_tests;
 mod webhook_trigger_tests;
+#[cfg(feature = "db")]
+mod with_start_shared_tests;
 mod worker_session_tests;
 #[cfg(feature = "db")]
 mod workflow_handle_tests;

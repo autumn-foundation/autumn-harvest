@@ -6610,6 +6610,278 @@ pub async fn resolve_and_cancel_by_workflow_id(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Shared with-start step (issue #1440)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Signal-with-start and update-with-start run the same admission steps. They
+// differ in the second action, the live states, and the start provenance. The
+// items below hold the shared steps. Each route passes its differences as data.
+
+/// States in which signal-with-start attaches to a prior run.
+const SWS_LIVE_STATES: &[&str] = &["RUNNING", "PAUSED"];
+
+/// States in which update-with-start attaches to a prior run.
+///
+/// The engine does not store `SUSPENDED` today. Update-with-start accepts it
+/// as a defensive measure.
+const UWS_LIVE_STATES: &[&str] = &["RUNNING", "SUSPENDED", "PAUSED"];
+
+fn is_live_state(state: &str, live_states: &[&str]) -> bool {
+    live_states.contains(&state)
+}
+
+/// Whether a start that loaded a terminal prior must start a fresh run.
+///
+/// The second action cannot land on a terminal run. A debounced call never
+/// escalates, because a fresh start must go through debounce admission.
+fn should_escalate_terminal_prior(
+    state: &str,
+    live_states: &[&str],
+    reject_fresh_if_debounced: bool,
+    reuse_policy: WorkflowIdReusePolicy,
+) -> bool {
+    !is_live_state(state, live_states)
+        && !reject_fresh_if_debounced
+        && matches!(
+            reuse_policy,
+            WorkflowIdReusePolicy::AllowDuplicate | WorkflowIdReusePolicy::AllowDuplicateFailedOnly
+        )
+}
+
+/// Build a [`StartWorkflowParams`] from a with-start request.
+///
+/// `$request` must expose the shared fields of [`SignalWithStartParams`] and
+/// [`UpdateWithStartParams`]. The caller passes the start provenance as data,
+/// so the macro never derives it.
+///
+/// A with-start call always begins a fresh chain origin, so the macro sets no
+/// inherited chain deadline (issue #617). The start step enforces the input
+/// cap, so the macro sets none. The macro leaves priority and `started_by` at
+/// their defaults.
+macro_rules! with_start_params {
+    ($request:ident, $exec_id:expr, $policy:expr, $source:expr, $source_ref:expr) => {
+        crate::execution::StartWorkflowParams {
+            workflow_name: $request.workflow_name,
+            workflow_id: $request.workflow_id,
+            exec_id: $exec_id,
+            input: $request.input.clone(),
+            parent_id: $request.parent_id,
+            queue_name: $request.queue_name,
+            execution_timeout: $request.execution_timeout,
+            memo: $request.memo.clone(),
+            search_attrs: $request.search_attrs.clone(),
+            reuse_policy: $policy,
+            conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
+            trace_context: $request.trace_context.clone(),
+            max_execution_timeout_ceiling: $request.max_execution_timeout_ceiling,
+            chain_execution_timeout: $request.chain_execution_timeout,
+            max_workflow_chain_timeout_ceiling: $request.max_workflow_chain_timeout_ceiling,
+            inherited_chain_deadline_at: None,
+            concurrency_key: $request.concurrency_key.clone(),
+            concurrency_limit: $request.concurrency_limit,
+            concurrency_on_conflict: $request.concurrency_on_conflict,
+            priority: crate::types::Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
+            owner: $request.owner,
+            runbook_url: $request.runbook_url,
+            severity: $request.severity,
+            context_headers: $request.context_headers.clone(),
+            sla: $request.sla,
+            schedule_id: None,
+            scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: $request
+                .workflow_retry_policy
+                .clone()
+                .and_then(|v| serde_json::from_value(v).ok()),
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: $request.max_workflow_attempts_ceiling,
+            origin: None,
+            completion_callbacks: None,
+            start_source: $source,
+            start_source_ref: $source_ref,
+            started_by: None,
+        }
+    };
+}
+
+/// Deferred starts, unfinished-handler checks, and cancel metrics of one start.
+type DeferredStartWork = (
+    Vec<DeferredTriggerStart>,
+    Vec<(ExecutionId, String)>,
+    Vec<StartCancelledRun>,
+);
+
+/// Work that start calls defer until the outer transaction commits.
+#[derive(Default)]
+struct StartEffects {
+    starts: Vec<DeferredTriggerStart>,
+    checks: Vec<(ExecutionId, String)>,
+    cancels: Vec<StartCancelledRun>,
+}
+
+impl StartEffects {
+    fn absorb(&mut self, (mut starts, mut checks, mut cancels): DeferredStartWork) {
+        self.starts.append(&mut starts);
+        self.checks.append(&mut checks);
+        self.cancels.append(&mut cancels);
+    }
+
+    /// Run the deferred work after the outer transaction commits.
+    async fn run_after_commit(
+        self,
+        conn: &mut AsyncPgConnection,
+        metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    ) {
+        for start in self.starts {
+            start.spawn();
+        }
+        let _ = check_and_report_unfinished_handlers_batch(conn, &self.checks, metrics).await;
+        if let Some(m) = metrics {
+            emit_start_cancel_metrics(m, &self.cancels);
+        }
+    }
+}
+
+/// Inputs of the shared start step. Each route fills it from its request.
+struct WithStartStep<'a> {
+    workflow_name: &'a str,
+    workflow_id: &'a str,
+    exec_id: ExecutionId,
+    reuse_policy: WorkflowIdReusePolicy,
+    debounced: bool,
+    input: &'a serde_json::Value,
+    max_workflow_input_bytes: u64,
+    /// Schema source for the fresh-start input check. `None` skips the check.
+    workflow_info: Option<&'a WorkflowInfo>,
+    live_states: &'static [&'static str],
+    metrics: Option<&'a (dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    gate: Option<crate::admission_gate::GateMode>,
+    codecs: &'a crate::payload_codec::PayloadCodecs,
+}
+
+impl WithStartStep<'_> {
+    /// Start or load one run and collect its deferred work.
+    ///
+    /// A debounced call runs without the admission gate. Debounce owns its own
+    /// admission (issue #618).
+    async fn start_collecting(
+        &self,
+        conn: &mut AsyncPgConnection,
+        params: StartWorkflowParams<'_>,
+        reject_fresh: bool,
+        effects: &mut StartEffects,
+    ) -> HarvestResult<StartedWorkflowExecution> {
+        let gate = if reject_fresh { None } else { self.gate };
+        let (started, starts, checks, cancels) =
+            start_or_load_workflow_execution_collect_with_codecs(
+                conn,
+                params,
+                true,
+                reject_fresh,
+                self.metrics,
+                gate,
+                self.codecs,
+            )
+            .await?;
+        effects.absorb((starts, checks, cancels));
+        Ok(started)
+    }
+
+    /// Enforce the input cap and schema. Only a fresh start writes the input.
+    fn check_fresh_input(&self) -> HarvestResult<()> {
+        check_sws_payload_cap(
+            self.input,
+            crate::error::PayloadKind::WorkflowInput,
+            self.max_workflow_input_bytes,
+            self.workflow_name,
+        )?;
+        check_sws_input_schema(self.input, self.workflow_info)
+    }
+}
+
+/// Resolve the reuse policy, then start a fresh run or attach to a live one.
+///
+/// Steps, in order:
+/// 1. Resolve the effective reuse policy under the row lock. The resolver
+///    upgrades `AllowDuplicate` to `TerminateIfRunning` when the prior run is
+///    terminal. The second action then lands on a live run (issue #244).
+/// 2. Start or load the run.
+/// 3. Check the input cap and schema when the start created a run. An attach
+///    writes no input, so it skips the check (issue #918).
+/// 4. Escalate a terminal prior to a fresh start (TOCTOU guard).
+/// 5. Reject a debounced call that did not attach to a live run.
+///
+/// Step 4 covers a concurrent completion between the policy lock and the
+/// start. The second action must land on a live run, not drop silently. A
+/// PAUSED run is live (issue #383). The second action attaches to it and does
+/// not cancel it.
+///
+/// A debounced call may only attach to a live run. A fresh start returns
+/// `DebounceFreshStart` and rolls back. The rollback cancels no prior run and
+/// spawns no follow-up work (issue #499). The caller holds the transaction
+/// lock, so the decision is atomic.
+async fn start_or_attach<'p>(
+    conn: &mut AsyncPgConnection,
+    step: &WithStartStep<'_>,
+    build: impl Fn(ExecutionId, WorkflowIdReusePolicy) -> StartWorkflowParams<'p>,
+    effects: &mut StartEffects,
+) -> HarvestResult<StartedWorkflowExecution> {
+    let debounced = step.debounced;
+    let effective_policy = if debounced {
+        step.reuse_policy
+    } else {
+        resolve_effective_signal_with_start_policy(
+            conn,
+            step.workflow_name,
+            step.workflow_id,
+            step.reuse_policy,
+        )
+        .await?
+    };
+
+    let started = step
+        .start_collecting(
+            conn,
+            build(step.exec_id, effective_policy),
+            debounced,
+            effects,
+        )
+        .await?;
+    if started.created {
+        step.check_fresh_input()?;
+    }
+
+    let started = if should_escalate_terminal_prior(
+        &started.state,
+        step.live_states,
+        debounced,
+        step.reuse_policy,
+    ) {
+        let fresh_exec_id = ExecutionId::new_for_shard(started.exec_id.shard());
+        let params = build(fresh_exec_id, WorkflowIdReusePolicy::TerminateIfRunning);
+        let fresh = step.start_collecting(conn, params, false, effects).await?;
+        if fresh.created {
+            step.check_fresh_input()?;
+        }
+        fresh
+    } else {
+        started
+    };
+
+    if debounced && (started.created || !is_live_state(&started.state, step.live_states)) {
+        return Err(HarvestError::DebounceFreshStart {
+            workflow_name: step.workflow_name.to_string(),
+            workflow_id: step.workflow_id.to_string(),
+        });
+    }
+    Ok(started)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // SignalWithStart (issue #244)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -6890,17 +7162,10 @@ pub async fn signal_with_start_workflow_execution_with_metrics_and_codecs(
 ) -> HarvestResult<SignalWithStartOutcome> {
     // Single outer transaction: pre-cancel + start (or attach) + signal insert commit
     // atomically. Inner conn.transaction calls become savepoints under this wrapper.
-    let (outcome, deferred_starts, deferred_checks, cancel_metrics) =
-        Box::pin(conn.transaction::<(
-            SignalWithStartOutcome,
-            Vec<DeferredTriggerStart>,
-            Vec<(ExecutionId, String)>,
-            Vec<StartCancelledRun>,
-        ), HarvestError, _>(async |conn| {
+    let (outcome, effects) = Box::pin(
+        conn.transaction::<(SignalWithStartOutcome, StartEffects), HarvestError, _>(async |conn| {
             let request = request;
-            let mut deferred_starts = Vec::new();
-            let mut deferred_checks = Vec::new();
-            let mut cancel_metrics = Vec::new();
+            let mut effects = StartEffects::default();
 
             // Acquire the business-key admission lock FIRST, before any row
             // lock this transaction takes (issue #1596 review, comment_id
@@ -6935,9 +7200,7 @@ pub async fn signal_with_start_workflow_execution_with_metrics_and_codecs(
                         started_fresh: false,
                         signal_delivered: false,
                     },
-                    deferred_starts,
-                    deferred_checks,
-                    cancel_metrics,
+                    effects,
                 ));
             }
 
@@ -6949,7 +7212,6 @@ pub async fn signal_with_start_workflow_execution_with_metrics_and_codecs(
             // matching the pre-check pattern in start_or_load_workflow_execution.
             // Runs in a savepoint: if the signal or start cap checks fail below,
             // the cancellation is rolled back.
-            let mut pre_check_deferred = Vec::new();
             if request.reuse_policy == WorkflowIdReusePolicy::TerminateIfRunning
                 && !request.reject_fresh_if_debounced
                 && let Some(prior) =
@@ -6966,217 +7228,56 @@ pub async fn signal_with_start_workflow_execution_with_metrics_and_codecs(
                 .await
                 {
                     Ok((_cancelled, mut deferred, mut checks, metrics_opt)) => {
-                        pre_check_deferred.append(&mut deferred);
-                        deferred_checks.append(&mut checks);
+                        effects.starts.append(&mut deferred);
+                        effects.checks.append(&mut checks);
                         if let Some((wf_name, q_name)) = metrics_opt {
-                            cancel_metrics.push(StartCancelledRun::terminated(wf_name, q_name));
+                            effects
+                                .cancels
+                                .push(StartCancelledRun::terminated(wf_name, q_name));
                         }
                     }
                     Err(HarvestError::NotFound(_)) => {}
                     Err(e) => return Err(e),
                 }
             }
-            deferred_starts.append(&mut pre_check_deferred);
-
-            // Upgrade AllowDuplicate / AllowDuplicateFailedOnly to TerminateIfRunning
-            // when the prior run is terminal so the signal always lands on a live
-            // execution ("no signal silently dropped" invariant from issue #244).
-            // For a debounced workflow, skip the upgrade: a terminal prior must not
-            // be escalated to a fresh start here — the reject check below routes it
-            // to debounce admission instead.
-            let effective_policy = if request.reject_fresh_if_debounced {
-                request.reuse_policy
-            } else {
-                resolve_effective_signal_with_start_policy(
-                    conn,
-                    request.workflow_name,
-                    request.workflow_id,
-                    request.reuse_policy,
-                )
-                .await?
+            let step = WithStartStep {
+                workflow_name: request.workflow_name,
+                workflow_id: request.workflow_id,
+                exec_id: request.exec_id,
+                reuse_policy: request.reuse_policy,
+                debounced: request.reject_fresh_if_debounced,
+                input: &request.input,
+                max_workflow_input_bytes: request.max_workflow_input_bytes,
+                workflow_info: request.workflow_info,
+                live_states: SWS_LIVE_STATES,
+                metrics,
+                gate,
+                codecs,
             };
-
-            let build_start_request =
-                |exec_id: ExecutionId, policy: WorkflowIdReusePolicy| StartWorkflowParams {
-                    workflow_name: request.workflow_name,
-                    workflow_id: request.workflow_id,
-                    exec_id,
-                    input: request.input.clone(),
-                    parent_id: request.parent_id,
-                    queue_name: request.queue_name,
-                    execution_timeout: request.execution_timeout,
-                    memo: request.memo.clone(),
-                    search_attrs: request.search_attrs.clone(),
-                    reuse_policy: policy,
-                    conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
-                    trace_context: request.trace_context.clone(),
-                    max_execution_timeout_ceiling: request.max_execution_timeout_ceiling,
-                    // Chain-scoped lifetime cap (issue #617): forward the
-                    // request's fresh-origin chain cap + fleet-wide ceiling.
-                    // A signal-/update-with-start never inherits a chain
-                    // deadline — it always begins a fresh chain origin.
-                    chain_execution_timeout: request.chain_execution_timeout,
-                    max_workflow_chain_timeout_ceiling: request.max_workflow_chain_timeout_ceiling,
-                    inherited_chain_deadline_at: None,
-                    concurrency_key: request.concurrency_key.clone(),
-                    concurrency_limit: request.concurrency_limit,
-                    concurrency_on_conflict: request.concurrency_on_conflict,
-                    priority: Priority::default(),
-                    max_workflow_input_bytes: 0,
-                    start_at: None,
-                    delay: None,
-                    max_workflow_start_delay: None,
-                    owner: request.owner,
-                    runbook_url: request.runbook_url,
-                    severity: request.severity,
-                    context_headers: request.context_headers.clone(),
-                    sla: request.sla,
-                    schedule_id: None,
-                    scheduled_for: None,
-                    workflow_attempt: 1,
-                    workflow_retry_policy: request
-                        .workflow_retry_policy
-                        .clone()
-                        .and_then(|v| serde_json::from_value(v).ok()),
-                    retry_of_exec_id: None,
-                    max_workflow_attempts_ceiling: request.max_workflow_attempts_ceiling,
-                    origin: None,
-                    completion_callbacks: None,
-                    start_source: request
-                        .start_source_override
-                        .unwrap_or(crate::types::StartSource::SignalWithStart),
-                    start_source_ref: request
-                        .start_source_ref_override
-                        .as_deref()
-                        .or(request.idempotency_key.as_deref())
-                        .or(Some(request.workflow_id)),
-                    started_by: None,
-                };
-
-            // For a debounced workflow, route the start through the no-spawn collect
-            // path with reject_fresh: a fresh start (including a TerminateIfRunning
-            // cancel+replace) returns DebounceFreshStart and rolls back WITHOUT
-            // cancelling a prior or spawning completion-trigger/parent-close
-            // follow-ups (issue #499). An attach returns the existing live run;
-            // its deferred list is empty and spawned defensively.
-            let started = if request.reject_fresh_if_debounced {
-                let (s, mut deferred, mut checks, mut metrics_list) =
-                    start_or_load_workflow_execution_collect_with_codecs(
-                        conn,
-                        build_start_request(request.exec_id, effective_policy),
-                        true,
-                        true,
-                        metrics,
-                        None,
-                        codecs,
-                    )
-                    .await?;
-                deferred_starts.append(&mut deferred);
-                deferred_checks.append(&mut checks);
-                cancel_metrics.append(&mut metrics_list);
-                s
-            } else {
-                let (s, mut deferred, mut checks, mut metrics_list) =
-                    start_or_load_workflow_execution_collect_with_codecs(
-                        conn,
-                        build_start_request(request.exec_id, effective_policy),
-                        true,
-                        false,
-                        metrics,
-                        gate,
-                        codecs,
-                    )
-                    .await?;
-                deferred_starts.append(&mut deferred);
-                deferred_checks.append(&mut checks);
-                cancel_metrics.append(&mut metrics_list);
-                s
-            };
-
-            // On fresh start only: enforce workflow input cap and schema (tx
-            // rollback on error). An attach never writes start_input, so neither
-            // check runs for it (issue #918 review — schema validation used to
-            // run unconditionally, pre-lock, in the HTTP handler, rejecting
-            // legitimate signal deliveries to an already-running execution
-            // whenever the signal payload didn't match the start-input schema).
-            if started.created {
-                check_sws_payload_cap(
-                    &request.input,
-                    crate::error::PayloadKind::WorkflowInput,
-                    request.max_workflow_input_bytes,
-                    request.workflow_name,
-                )?;
-                check_sws_input_schema(&request.input, request.workflow_info)?;
-            }
-
-            // TOCTOU guard: if a concurrent transaction completed the run between
-            // the policy resolver's lock and our start, the start helper returns
-            // a terminal row. Escalate to TerminateIfRunning so the signal always
-            // lands on a live execution rather than being silently dropped.
-            // PAUSED is a non-terminal active state (issue #383): treat it like
-            // RUNNING here so a signal-with-start attaches to (and buffers the
-            // signal for) the paused run instead of cancelling and replacing it.
-            let started = if !matches!(started.state.as_str(), "RUNNING" | "PAUSED")
-                // For a debounced workflow, never escalate a terminal prior to a
-                // fresh start here — that fresh start must go through debounce
-                // admission. The reject check below catches the non-live outcome.
-                && !request.reject_fresh_if_debounced
-                && matches!(
-                    request.reuse_policy,
-                    WorkflowIdReusePolicy::AllowDuplicate
-                        | WorkflowIdReusePolicy::AllowDuplicateFailedOnly
-                ) {
-                let fresh_exec_id = ExecutionId::new_for_shard(started.exec_id.shard());
-                let (fresh, mut deferred, mut checks, mut metrics_list) =
-                    start_or_load_workflow_execution_collect_with_codecs(
-                        conn,
-                        build_start_request(
-                            fresh_exec_id,
-                            WorkflowIdReusePolicy::TerminateIfRunning,
-                        ),
-                        true,
-                        false,
-                        metrics,
-                        gate,
-                        codecs,
-                    )
-                    .await?;
-                deferred_starts.append(&mut deferred);
-                deferred_checks.append(&mut checks);
-                cancel_metrics.append(&mut metrics_list);
-                if fresh.created {
-                    check_sws_payload_cap(
-                        &request.input,
-                        crate::error::PayloadKind::WorkflowInput,
-                        request.max_workflow_input_bytes,
-                        request.workflow_name,
-                    )?;
-                    check_sws_input_schema(&request.input, request.workflow_info)?;
-                }
-                fresh
-            } else {
-                started
-            };
-
-            // Atomic debounce gate (issue #499): under this transaction's lock, a
-            // debounced workflow may only *attach* to a live (RUNNING/PAUSED) prior.
-            // Any other outcome — a fresh insert (`created`) or a non-live prior the
-            // signal can't land on — would be a fresh start, so reject it and let the
-            // caller route to debounce admission. Rolls back any fresh insert above.
-            if request.reject_fresh_if_debounced
-                && (started.created || !matches!(started.state.as_str(), "RUNNING" | "PAUSED"))
-            {
-                return Err(HarvestError::DebounceFreshStart {
-                    workflow_name: request.workflow_name.to_string(),
-                    workflow_id: request.workflow_id.to_string(),
-                });
-            }
+            // Provenance is data: a webhook or broker delegation overrides it.
+            let start_source = request
+                .start_source_override
+                .unwrap_or(crate::types::StartSource::SignalWithStart);
+            let start_source_ref = request
+                .start_source_ref_override
+                .as_deref()
+                .or(request.idempotency_key.as_deref())
+                .or(Some(request.workflow_id));
+            let started = start_or_attach(
+                conn,
+                &step,
+                |exec_id, policy| {
+                    with_start_params!(request, exec_id, policy, start_source, start_source_ref)
+                },
+                &mut effects,
+            )
+            .await?;
 
             // Check signal payload cap here — after start/attach/AlreadyExists
             // resolution — so RejectDuplicate conflicts surface as 409 AlreadyExists
             // rather than 413 PayloadTooLarge when the payload happens to be oversized.
             // PAUSED counts as live: the signal will be staged and delivered on resume.
-            if matches!(started.state.as_str(), "RUNNING" | "PAUSED") {
+            if is_live_state(&started.state, SWS_LIVE_STATES) {
                 check_sws_payload_cap(
                     &request.signal_payload,
                     crate::error::PayloadKind::SignalPayload,
@@ -7185,7 +7286,7 @@ pub async fn signal_with_start_workflow_execution_with_metrics_and_codecs(
                 )?;
             }
 
-            let signal_delivered = if matches!(started.state.as_str(), "RUNNING" | "PAUSED") {
+            let signal_delivered = if is_live_state(&started.state, SWS_LIVE_STATES) {
                 stage_signal_with_idempotency(
                     conn,
                     started.exec_id,
@@ -7207,20 +7308,13 @@ pub async fn signal_with_start_workflow_execution_with_metrics_and_codecs(
                     started_fresh: started.created,
                     signal_delivered,
                 },
-                deferred_starts,
-                deferred_checks,
-                cancel_metrics,
+                effects,
             ))
-        }))
-        .await?;
+        }),
+    )
+    .await?;
 
-    for start in deferred_starts {
-        start.spawn();
-    }
-    let _ = check_and_report_unfinished_handlers_batch(conn, &deferred_checks, metrics).await;
-    if let Some(m) = metrics {
-        emit_start_cancel_metrics(m, &cancel_metrics);
-    }
+    effects.run_after_commit(conn, metrics).await;
 
     Ok(outcome)
 }
@@ -8372,17 +8466,10 @@ pub async fn update_with_start_workflow_execution_with_metrics_and_codecs(
     // name (Codex P2; see `admit_update_event`), so the counter is labeled by
     // `workflow` + `queue` only.
     let queue_for_metric = request.queue_name.to_owned();
-    let (outcome, deferred_starts, deferred_checks, cancel_metrics) =
-        Box::pin(conn.transaction::<(
-            UpdateWithStartOutcome,
-            Vec<DeferredTriggerStart>,
-            Vec<(ExecutionId, String)>,
-            Vec<StartCancelledRun>,
-        ), HarvestError, _>(async |conn| {
+    let (outcome, effects) = Box::pin(
+        conn.transaction::<(UpdateWithStartOutcome, StartEffects), HarvestError, _>(async |conn| {
             let request = request;
-            let mut deferred_starts = Vec::new();
-            let mut deferred_checks = Vec::new();
-            let mut cancel_metrics = Vec::new();
+            let mut effects = StartEffects::default();
 
             // Acquire the business-key admission lock FIRST, before any row
             // lock this transaction takes (issue #1596 review, comment_id
@@ -8413,190 +8500,45 @@ pub async fn update_with_start_workflow_execution_with_metrics_and_codecs(
                         update_id: request.update_id,
                         update_admitted: false,
                     },
-                    deferred_starts,
-                    deferred_checks,
-                    cancel_metrics,
+                    effects,
                 ));
             }
 
-            // Upgrade AllowDuplicate / AllowDuplicateFailedOnly to TerminateIfRunning
-            // when the prior run is terminal so the update always lands on a live
-            // execution (mirrors the signal-with-start "no signal dropped" invariant).
-            // For a debounced workflow, skip the upgrade: we must not escalate a
-            // terminal prior to a fresh start here — the reject check below routes it
-            // to debounce admission instead.
-            let effective_policy = if request.reject_fresh_if_debounced {
-                request.reuse_policy
-            } else {
-                resolve_effective_signal_with_start_policy(
-                    conn,
-                    request.workflow_name,
-                    request.workflow_id,
-                    request.reuse_policy,
-                )
-                .await?
+            let step = WithStartStep {
+                workflow_name: request.workflow_name,
+                workflow_id: request.workflow_id,
+                exec_id: request.exec_id,
+                reuse_policy: request.reuse_policy,
+                debounced: request.reject_fresh_if_debounced,
+                input: &request.input,
+                max_workflow_input_bytes: request.max_workflow_input_bytes,
+                workflow_info: None,
+                live_states: UWS_LIVE_STATES,
+                metrics,
+                gate,
+                codecs,
             };
-
-            let build_start_request =
-                |exec_id: ExecutionId, policy: WorkflowIdReusePolicy| StartWorkflowParams {
-                    workflow_name: request.workflow_name,
-                    workflow_id: request.workflow_id,
-                    exec_id,
-                    input: request.input.clone(),
-                    parent_id: request.parent_id,
-                    queue_name: request.queue_name,
-                    execution_timeout: request.execution_timeout,
-                    memo: request.memo.clone(),
-                    search_attrs: request.search_attrs.clone(),
-                    reuse_policy: policy,
-                    conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
-                    trace_context: request.trace_context.clone(),
-                    max_execution_timeout_ceiling: request.max_execution_timeout_ceiling,
-                    // Chain-scoped lifetime cap (issue #617): forward the
-                    // request's fresh-origin chain cap + fleet-wide ceiling.
-                    // A signal-/update-with-start never inherits a chain
-                    // deadline — it always begins a fresh chain origin.
-                    chain_execution_timeout: request.chain_execution_timeout,
-                    max_workflow_chain_timeout_ceiling: request.max_workflow_chain_timeout_ceiling,
-                    inherited_chain_deadline_at: None,
-                    concurrency_key: request.concurrency_key.clone(),
-                    concurrency_limit: request.concurrency_limit,
-                    concurrency_on_conflict: request.concurrency_on_conflict,
-                    priority: Priority::default(),
-                    max_workflow_input_bytes: 0,
-                    start_at: None,
-                    delay: None,
-                    max_workflow_start_delay: None,
-                    owner: request.owner,
-                    runbook_url: request.runbook_url,
-                    severity: request.severity,
-                    context_headers: request.context_headers.clone(),
-                    sla: request.sla,
-                    schedule_id: None,
-                    scheduled_for: None,
-                    workflow_attempt: 1,
-                    workflow_retry_policy: request
-                        .workflow_retry_policy
-                        .clone()
-                        .and_then(|v| serde_json::from_value(v).ok()),
-                    retry_of_exec_id: None,
-                    max_workflow_attempts_ceiling: request.max_workflow_attempts_ceiling,
-                    origin: None,
-                    completion_callbacks: None,
-                    start_source: crate::types::StartSource::UpdateWithStart,
-                    start_source_ref: request
-                        .idempotency_key
-                        .as_deref()
-                        .or(Some(request.workflow_id)),
-                    started_by: None,
-                };
-
-            // Debounced workflow: route through the no-spawn collect path with
-            // reject_fresh so a fresh start (incl. TerminateIfRunning cancel+replace)
-            // rolls back via DebounceFreshStart without cancelling/spawning before
-            // the rejection (issue #499). Attach returns the existing live run.
-            let started = if request.reject_fresh_if_debounced {
-                let (s, mut deferred, mut checks, mut metrics_list) =
-                    start_or_load_workflow_execution_collect_with_codecs(
-                        conn,
-                        build_start_request(request.exec_id, effective_policy),
-                        true,
-                        true,
-                        metrics,
-                        None,
-                        codecs,
+            let start_source_ref = request
+                .idempotency_key
+                .as_deref()
+                .or(Some(request.workflow_id));
+            // The admit step below rejects a PAUSED run (`WorkflowPaused`) and
+            // rolls the whole transaction back.
+            let started = start_or_attach(
+                conn,
+                &step,
+                |exec_id, policy| {
+                    with_start_params!(
+                        request,
+                        exec_id,
+                        policy,
+                        crate::types::StartSource::UpdateWithStart,
+                        start_source_ref
                     )
-                    .await?;
-                deferred_starts.append(&mut deferred);
-                deferred_checks.append(&mut checks);
-                cancel_metrics.append(&mut metrics_list);
-                s
-            } else {
-                let (s, mut deferred, mut checks, mut metrics_list) =
-                    start_or_load_workflow_execution_collect_with_codecs(
-                        conn,
-                        build_start_request(request.exec_id, effective_policy),
-                        true,
-                        false,
-                        metrics,
-                        gate,
-                        codecs,
-                    )
-                    .await?;
-                deferred_starts.append(&mut deferred);
-                deferred_checks.append(&mut checks);
-                cancel_metrics.append(&mut metrics_list);
-                s
-            };
-
-            // Enforce workflow input cap on fresh start.
-            if started.created {
-                check_sws_payload_cap(
-                    &request.input,
-                    crate::error::PayloadKind::WorkflowInput,
-                    request.max_workflow_input_bytes,
-                    request.workflow_name,
-                )?;
-            }
-
-            // TOCTOU guard: if a concurrent transaction completed the run between
-            // the policy resolver's lock and our start, escalate so the update lands.
-            // SUSPENDED is treated as RUNNING here (not a real DB state today, but
-            // defensive). PAUSED is a non-terminal active state; the update will be
-            // rejected by admit_update_event below (WorkflowPaused), rolling back.
-            let started = if !matches!(started.state.as_str(), "RUNNING" | "SUSPENDED" | "PAUSED")
-                // Debounced workflow: never escalate a terminal prior to a fresh
-                // start here — route it to debounce admission via the check below.
-                && !request.reject_fresh_if_debounced
-                && matches!(
-                    request.reuse_policy,
-                    WorkflowIdReusePolicy::AllowDuplicate
-                        | WorkflowIdReusePolicy::AllowDuplicateFailedOnly
-                ) {
-                let fresh_exec_id = ExecutionId::new_for_shard(started.exec_id.shard());
-                let (fresh, mut deferred, mut checks, mut metrics_list) =
-                    start_or_load_workflow_execution_collect_with_codecs(
-                        conn,
-                        build_start_request(
-                            fresh_exec_id,
-                            WorkflowIdReusePolicy::TerminateIfRunning,
-                        ),
-                        true,
-                        false,
-                        metrics,
-                        gate,
-                        codecs,
-                    )
-                    .await?;
-                deferred_starts.append(&mut deferred);
-                deferred_checks.append(&mut checks);
-                cancel_metrics.append(&mut metrics_list);
-                if fresh.created {
-                    check_sws_payload_cap(
-                        &request.input,
-                        crate::error::PayloadKind::WorkflowInput,
-                        request.max_workflow_input_bytes,
-                        request.workflow_name,
-                    )?;
-                }
-                fresh
-            } else {
-                started
-            };
-
-            // Atomic debounce gate (issue #499): a debounced workflow may only
-            // *attach* to a live (RUNNING/SUSPENDED/PAUSED) prior. A fresh insert
-            // (`created`) or a non-live prior would be a fresh start — reject and let
-            // the caller route to debounce admission. Rolls back any fresh insert.
-            if request.reject_fresh_if_debounced
-                && (started.created
-                    || !matches!(started.state.as_str(), "RUNNING" | "SUSPENDED" | "PAUSED"))
-            {
-                return Err(HarvestError::DebounceFreshStart {
-                    workflow_name: request.workflow_name.to_string(),
-                    workflow_id: request.workflow_id.to_string(),
-                });
-            }
+                },
+                &mut effects,
+            )
+            .await?;
 
             // Post-lock idempotency re-check: two concurrent calls with the same
             // idempotency_key may both pass the early dedupe query (which runs before
@@ -8622,9 +8564,7 @@ pub async fn update_with_start_workflow_execution_with_metrics_and_codecs(
                         update_id: request.update_id,
                         update_admitted: false,
                     },
-                    deferred_starts,
-                    deferred_checks,
-                    cancel_metrics,
+                    effects,
                 ));
             }
 
@@ -8668,19 +8608,14 @@ pub async fn update_with_start_workflow_execution_with_metrics_and_codecs(
                     update_id: request.update_id,
                     update_admitted: true,
                 },
-                deferred_starts,
-                deferred_checks,
-                cancel_metrics,
+                effects,
             ))
-        }))
-        .await?;
+        }),
+    )
+    .await?;
 
-    for start in deferred_starts {
-        start.spawn();
-    }
-    let _ = check_and_report_unfinished_handlers_batch(conn, &deferred_checks, metrics).await;
+    effects.run_after_commit(conn, metrics).await;
     if let Some(m) = metrics {
-        emit_start_cancel_metrics(m, &cancel_metrics);
         // Post-outer-commit: emit update.admitted (issue #684) only when an
         // update was actually admitted (an idempotency dedup short-circuit
         // reports update_admitted == false and admits nothing).
@@ -10402,5 +10337,147 @@ mod replaced_run_outcome_tests {
     #[test]
     fn a_history_without_an_outcome_names_none() {
         assert_eq!(replaced_run_outcome(&[]), None);
+    }
+}
+
+#[cfg(test)]
+mod with_start_shared_unit_tests {
+    use super::{
+        SWS_LIVE_STATES, StartCancelledRun, StartEffects, StartWorkflowParams, UWS_LIVE_STATES,
+        UpdateWithStartParams, is_live_state, should_escalate_terminal_prior,
+    };
+    use crate::types::{ExecutionId, StartSource, UpdateId, WorkflowIdReusePolicy as R};
+
+    #[test]
+    fn live_states_differ_only_by_suspended() {
+        for state in ["RUNNING", "PAUSED"] {
+            assert!(is_live_state(state, SWS_LIVE_STATES));
+            assert!(is_live_state(state, UWS_LIVE_STATES));
+        }
+        assert!(!is_live_state("SUSPENDED", SWS_LIVE_STATES));
+        assert!(is_live_state("SUSPENDED", UWS_LIVE_STATES));
+        for state in ["COMPLETED", "FAILED", "CANCELLED", "TERMINATED"] {
+            assert!(!is_live_state(state, SWS_LIVE_STATES));
+            assert!(!is_live_state(state, UWS_LIVE_STATES));
+        }
+    }
+
+    #[test]
+    fn escalation_needs_a_terminal_prior_and_an_allow_policy_and_no_debounce() {
+        let go = |state, debounced, policy| {
+            should_escalate_terminal_prior(state, SWS_LIVE_STATES, debounced, policy)
+        };
+        assert!(go("COMPLETED", false, R::AllowDuplicate));
+        assert!(go("FAILED", false, R::AllowDuplicateFailedOnly));
+        assert!(!go("RUNNING", false, R::AllowDuplicate));
+        assert!(!go("PAUSED", false, R::AllowDuplicate));
+        assert!(!go("COMPLETED", true, R::AllowDuplicate));
+        assert!(!go("COMPLETED", false, R::RejectDuplicate));
+        assert!(!go("COMPLETED", false, R::TerminateIfRunning));
+        // SUSPENDED is live only for update-with-start.
+        let suspended =
+            |live| should_escalate_terminal_prior("SUSPENDED", live, false, R::AllowDuplicate);
+        assert!(suspended(SWS_LIVE_STATES));
+        assert!(!suspended(UWS_LIVE_STATES));
+    }
+
+    fn update_request() -> UpdateWithStartParams<'static> {
+        UpdateWithStartParams {
+            workflow_name: "wf",
+            workflow_id: "id-1",
+            exec_id: ExecutionId::new(),
+            input: serde_json::json!({"in": 1}),
+            parent_id: Some(uuid::Uuid::nil()),
+            queue_name: "q",
+            execution_timeout: Some(chrono::Duration::seconds(10)),
+            memo: Some(serde_json::json!({"m": 1})),
+            search_attrs: Some(serde_json::json!({"s": 1})),
+            reuse_policy: R::AllowDuplicate,
+            trace_context: None,
+            max_execution_timeout_ceiling: Some(chrono::Duration::seconds(20)),
+            chain_execution_timeout: Some(chrono::Duration::seconds(30)),
+            max_workflow_chain_timeout_ceiling: Some(chrono::Duration::seconds(40)),
+            concurrency_key: Some("ck".to_string()),
+            concurrency_limit: Some(3),
+            concurrency_on_conflict: crate::concurrency::ConcurrencyOnConflict::CancelRunning,
+            update_id: UpdateId::new(),
+            update_name: "u".to_string(),
+            update_args: serde_json::json!({}),
+            idempotency_key: None,
+            max_workflow_input_bytes: 99,
+            owner: Some("o"),
+            runbook_url: Some("r"),
+            severity: Some("s"),
+            context_headers: Some([("h".to_string(), "v".to_string())].into()),
+            sla: Some(chrono::Duration::seconds(5)),
+            workflow_retry_policy: Some(serde_json::json!({"max_attempts": 3})),
+            max_workflow_attempts_ceiling: Some(4),
+            reject_fresh_if_debounced: false,
+        }
+    }
+
+    #[test]
+    fn builder_forwards_common_fields_and_takes_provenance_as_data() {
+        let request = update_request();
+        let exec_id = ExecutionId::new();
+        let p: StartWorkflowParams<'_> = with_start_params!(
+            request,
+            exec_id,
+            R::TerminateIfRunning,
+            StartSource::Webhook,
+            Some("ref-x")
+        );
+        assert_eq!(p.exec_id, exec_id);
+        assert_eq!(p.reuse_policy, R::TerminateIfRunning);
+        assert_eq!(p.start_source, StartSource::Webhook);
+        assert_eq!(p.start_source_ref, Some("ref-x"));
+        assert_eq!(p.workflow_id, "id-1");
+        assert_eq!(p.queue_name, "q");
+        assert_eq!(p.input, request.input);
+        assert_eq!(p.parent_id, request.parent_id);
+        assert_eq!(p.memo, request.memo);
+        assert_eq!(p.search_attrs, request.search_attrs);
+        assert_eq!(p.execution_timeout, request.execution_timeout);
+        assert_eq!(p.chain_execution_timeout, request.chain_execution_timeout);
+        assert_eq!(
+            p.max_workflow_chain_timeout_ceiling,
+            request.max_workflow_chain_timeout_ceiling
+        );
+        assert_eq!(p.inherited_chain_deadline_at, None);
+        assert_eq!(p.concurrency_key.as_deref(), Some("ck"));
+        assert_eq!(p.concurrency_limit, Some(3));
+        assert_eq!(
+            p.concurrency_on_conflict,
+            crate::concurrency::ConcurrencyOnConflict::CancelRunning
+        );
+        assert_eq!(
+            p.max_execution_timeout_ceiling,
+            request.max_execution_timeout_ceiling
+        );
+        assert_eq!(p.context_headers, request.context_headers);
+        assert_eq!(p.owner, Some("o"));
+        assert_eq!(p.runbook_url, Some("r"));
+        assert_eq!(p.severity, Some("s"));
+        assert_eq!(p.sla, request.sla);
+        assert_eq!(p.max_workflow_attempts_ceiling, Some(4));
+        assert_eq!(p.workflow_attempt, 1);
+        // The start step enforces the input cap; the builder never sets it.
+        assert_eq!(p.max_workflow_input_bytes, 0);
+    }
+
+    #[test]
+    fn absorb_appends_every_deferred_list() {
+        let check = || (ExecutionId::new(), "wf".to_string());
+        let cancel = || StartCancelledRun::terminated("wf".to_string(), "q".to_string());
+        let mut effects = StartEffects::default();
+        effects.absorb((Vec::new(), vec![check()], vec![cancel(), cancel()]));
+        effects.absorb((
+            Vec::new(),
+            vec![check()],
+            vec![cancel(), cancel(), cancel()],
+        ));
+        assert_eq!(effects.starts.len(), 0);
+        assert_eq!(effects.checks.len(), 2);
+        assert_eq!(effects.cancels.len(), 5);
     }
 }

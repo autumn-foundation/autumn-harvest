@@ -337,6 +337,17 @@ duplicate. The reset operator explicitly opted the prior row out of the
 uniqueness scope, matching the broader `start_or_load_workflow_execution`
 semantics.
 
+**Shared start step (#1440).** Signal-with-start and update-with-start share
+one start path in `execution.rs`. `with_start_params!` builds the
+`StartWorkflowParams`. `start_or_attach` resolves the policy, starts or loads
+the run, checks the input, escalates a terminal prior, and applies the debounce
+gate. `StartEffects` holds the work that runs after commit. Each route passes
+its differences as data: the start provenance, the live states, and the input
+schema. Update-with-start accepts `SUSPENDED` as live. Signal-with-start does
+not. The input check runs only when the start creates a run. An attach
+writes no input (issue #918). Signal-with-start also cancels a `TerminateIfRunning` prior before the
+start step. Update-with-start cancels it inside the start step.
+
 **Idempotency dedupe is scoped to the logical workflow**, not the
 `workflow_exec_id`. A webhook retry carrying the same `idempotency_key` that
 arrives after the original execution has reached a terminal state will be
