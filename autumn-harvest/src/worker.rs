@@ -30684,7 +30684,7 @@ impl Worker {
                                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                                         .remove(&exec_id);
                                 }
-                                quarantine_workflow_task_timeout(
+                                let quarantined = quarantine_workflow_task_timeout(
                                     &pool,
                                     task_id,
                                     exec_id_for_timeout,
@@ -30700,6 +30700,14 @@ impl Worker {
                                     telemetry.payload_codecs(),
                                 )
                                 .await;
+                                // No connection: put the strikes back so the
+                                // next timeout quarantines at once (issue #1788).
+                                if !quarantined && let Some(exec_id) = exec_id_for_timeout {
+                                    timeout_strikes
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .insert(exec_id, new_strikes);
+                                }
                             }
                             crate::poison_pill::ReclaimAction::Requeue => {
                                 // Reset the task to PENDING so any worker can
@@ -30935,6 +30943,9 @@ async fn workflow_task_timeout_metric_names(
 ///
 /// Called when the consecutive in-memory timeout counter reaches
 /// `poison_pill_threshold` (issue #494). Errors are logged and swallowed.
+///
+/// Returns `false` only when no pool connection was available. The caller then
+/// keeps the strike count, so the next timeout tries the quarantine again.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn quarantine_workflow_task_timeout(
     pool: &DbPool,
@@ -30949,12 +30960,15 @@ pub async fn quarantine_workflow_task_timeout(
     // Issue #1243: the configured payload-codec registry, so this write
     // encodes under the same codecs replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
-) {
+) -> bool {
     use crate::schema::harvest_task_queue::dsl as task_dsl;
     use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
     use diesel::BoolExpressionMethods;
 
-    let mut conn = match crate::pool::acquire_within_pool_bound(pool).await {
+    // Retry the acquire (issue #1788). The caller already cleared the strike
+    // count. A lost quarantine would let the poison workflow run up the whole
+    // threshold again, so the caller restores the count when this is false.
+    let mut conn = match crate::pool::acquire_with_retries(pool, FINALIZE_ACQUIRE_ATTEMPTS).await {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(
@@ -30962,7 +30976,7 @@ pub async fn quarantine_workflow_task_timeout(
                 error = %e,
                 "workflow task timeout quarantine: pool exhausted"
             );
-            return;
+            return false;
         }
     };
 
@@ -31273,6 +31287,7 @@ pub async fn quarantine_workflow_task_timeout(
             );
         }
     }
+    true
 }
 
 /// Whether the dispatch error path releases the claim after `error`.
@@ -34474,6 +34489,53 @@ mod tests {
 
         let next = allow(probe_time + Duration::from_secs(61));
         assert!(next.is_probe(), "a released probe lets a fresh probe in");
+    }
+
+    /// A quarantine that cannot reach the pool reports it, so the caller can
+    /// keep the strike count (issue #1788).
+    #[tokio::test]
+    async fn a_quarantine_without_a_connection_reports_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral loopback port");
+        let addr = listener.local_addr().expect("listener has a local address");
+        let bound = Duration::from_millis(50);
+        let pool = crate::pool::engine_pool(
+            format!("postgres://silent@{addr}/silent"),
+            1,
+            crate::pool::DbRole::Hot,
+            &crate::pool::EngineDbTimeouts {
+                pool: crate::pool::PoolTimeouts {
+                    wait: bound,
+                    create: bound,
+                    recycle: bound,
+                },
+                ..crate::pool::EngineDbTimeouts::default()
+            },
+        )
+        .expect("pool builds without connecting");
+
+        let reached = tokio::time::timeout(
+            Duration::from_secs(10),
+            quarantine_workflow_task_timeout(
+                &pool,
+                uuid::Uuid::new_v4(),
+                None,
+                "w-1",
+                3,
+                10,
+                "wf",
+                "default",
+                &crate::telemetry::NoOpMetrics,
+                &crate::payload_codec::PayloadCodecs::default(),
+            ),
+        )
+        .await
+        .expect("the quarantine must give up within its retries");
+        assert!(
+            !reached,
+            "a quarantine with no connection must report failure"
+        );
     }
 
     /// An offloaded result uploads a blob on each try. A repeat would leave
