@@ -6006,6 +6006,42 @@ async fn acquire_shard_conn(
 /// or `start_to_close` timeout, as before.
 const FINALIZE_ACQUIRE_ATTEMPTS: u32 = 10;
 
+/// Emit `harvest.activity.panic` once if `result` is a contained handler panic
+/// (issue #782).
+///
+/// A contained panic carries the typed `HandlerPanic` error type in its
+/// envelope. Call it once per attempt, before any result write, because that
+/// write can repeat (issue #1788).
+fn record_activity_panic_once(
+    metrics: &dyn crate::telemetry::MetricsRecorder,
+    activity_name: &str,
+    queue_name: &str,
+    result: &Result<serde_json::Value, String>,
+) {
+    if let Err(error) = result
+        && crate::failure::parse_error_payload_full(error).error_type
+            == crate::failure::ERROR_TYPE_HANDLER_PANIC
+    {
+        metrics.record_activity_panic(activity_name, queue_name);
+    }
+}
+
+/// Refund the rate-limit token this dispatch debited, if any (issue #1788).
+///
+/// Use it when setup fails after the debit and before the handler runs. A
+/// refund that fails is logged; the bucket refills on its own.
+async fn refund_debited_token(conn: &mut AsyncPgConnection, debited_key: Option<&str>) {
+    if let Some(key) = debited_key
+        && let Err(error) = queue::refund_rate_limit_token(conn, key).await
+    {
+        tracing::warn!(
+            rate_limit_key = %key,
+            error = %error,
+            "failed to refund rate-limit token after a failed activity start"
+        );
+    }
+}
+
 /// Release the dispatch `token`, then return `error` unchanged.
 ///
 /// Use it on each setup error after `on_dispatch` admitted the attempt and
@@ -14414,15 +14450,9 @@ async fn handle_activity_result(
             .await
         }
         Err(error) => {
-            // Issue #782: emit the panic counter once per panicking attempt
-            // (before the retry/terminal split). A contained activity panic is
-            // classified by the typed HandlerPanic error type in the envelope;
-            // it otherwise flows through the ordinary retryable-failure path.
-            if crate::failure::parse_error_payload_full(&error).error_type
-                == crate::failure::ERROR_TYPE_HANDLER_PANIC
-            {
-                metrics.record_activity_panic(activity_name_for_cap, &task.queue_name);
-            }
+            // The panic counter (issue #782) is not emitted here. The caller
+            // emits it once through `record_activity_panic_once`, because the
+            // result write can run more than once (issue #1788).
             let delay_result = next_retry_delay(task, &error, retry_policy, retry_after_ceiling);
             let delay =
                 fail_execution_on_error(conn, task, worker_id, delay_result, codecs).await?;
@@ -14933,57 +14963,59 @@ async fn process_activity_task(
     // The connection that took the token also appends ActivityStarted below
     // (issue #1788). A second acquire there could time out after the debit and
     // leave the token spent on a call that never ran.
-    let mut reserved_conn: Option<crate::pool::PooledConn> = None;
-    if circuit_token.is_some()
-        && activity.circuit_breaker.is_some()
-        && let Some(key) = task.rate_limit_key.as_deref()
-    {
-        let mut conn = crate::pool::acquire_within_pool_bound(pool)
-            .await
-            .map_err(|e| {
-                release_probe_on_error(&circuit_breakers, activity_name, circuit_token, e)
-            })?;
-        if !queue::try_consume_rate_limit_token(&mut conn, key)
-            .await
-            .map_err(|e| {
-                release_probe_on_error(&circuit_breakers, activity_name, circuit_token, e)
-            })?
+    let (mut reserved_conn, debited_key): (Option<crate::pool::PooledConn>, Option<&str>) =
+        if circuit_token.is_some()
+            && activity.circuit_breaker.is_some()
+            && let Some(key) = task.rate_limit_key.as_deref()
         {
-            // No token available (bucket empty, or fail-closed when the bucket
-            // row is missing): defer this real call instead of running it.
-            //
-            // Releasing any half-open probe slot this dispatch just admitted is
-            // essential — `on_dispatch` set `probe_in_flight = true`, and if we
-            // returned without resolving it the breaker would stay HalfOpen
-            // forever and short-circuit every later attempt. A rate-limit defer
-            // is not a downstream health signal, so `on_cancelled` re-arms the
-            // cooldown (rather than tripping or closing) and a fresh probe is
-            // admitted once the cooldown re-elapses.
-            if let Some(token) = circuit_token {
-                circuit_breakers.on_cancelled(activity_name, token, std::time::Instant::now());
+            let mut conn = crate::pool::acquire_within_pool_bound(pool)
+                .await
+                .map_err(|e| {
+                    release_probe_on_error(&circuit_breakers, activity_name, circuit_token, e)
+                })?;
+            if !queue::try_consume_rate_limit_token(&mut conn, key)
+                .await
+                .map_err(|e| {
+                    release_probe_on_error(&circuit_breakers, activity_name, circuit_token, e)
+                })?
+            {
+                // No token available (bucket empty, or fail-closed when the bucket
+                // row is missing): defer this real call instead of running it.
+                //
+                // Releasing any half-open probe slot this dispatch just admitted is
+                // essential — `on_dispatch` set `probe_in_flight = true`, and if we
+                // returned without resolving it the breaker would stay HalfOpen
+                // forever and short-circuit every later attempt. A rate-limit defer
+                // is not a downstream health signal, so `on_cancelled` re-arms the
+                // cooldown (rather than tripping or closing) and a fresh probe is
+                // admitted once the cooldown re-elapses.
+                if let Some(token) = circuit_token {
+                    circuit_breakers.on_cancelled(activity_name, token, std::time::Instant::now());
+                }
+                let refill_delay = activity
+                    .rate_limit_rps
+                    .filter(|rps| *rps > 0.0)
+                    .map_or(RATE_LIMIT_DEFER_FALLBACK, |rps| {
+                        Duration::from_secs_f64(1.0 / rps)
+                    })
+                    .clamp(RATE_LIMIT_DEFER_MIN, RATE_LIMIT_DEFER_MAX);
+                // Label the throttle metric by the bounded activity name, never the
+                // rate-limit bucket key (which for a dynamic per-key limit,
+                // issue #699, embeds unbounded tenant input — ADR-0001 §7).
+                registry
+                    .telemetry()
+                    .metrics
+                    .record_rate_limit_throttled(activity_name);
+                let scheduled_at = chrono::Utc::now()
+                    + chrono::Duration::from_std(refill_delay)
+                        .unwrap_or_else(|_| chrono::Duration::seconds(5));
+                queue::defer_rate_limited_task(&mut conn, task.id, scheduled_at).await?;
+                return Ok(());
             }
-            let refill_delay = activity
-                .rate_limit_rps
-                .filter(|rps| *rps > 0.0)
-                .map_or(RATE_LIMIT_DEFER_FALLBACK, |rps| {
-                    Duration::from_secs_f64(1.0 / rps)
-                })
-                .clamp(RATE_LIMIT_DEFER_MIN, RATE_LIMIT_DEFER_MAX);
-            // Label the throttle metric by the bounded activity name, never the
-            // rate-limit bucket key (which for a dynamic per-key limit,
-            // issue #699, embeds unbounded tenant input — ADR-0001 §7).
-            registry
-                .telemetry()
-                .metrics
-                .record_rate_limit_throttled(activity_name);
-            let scheduled_at = chrono::Utc::now()
-                + chrono::Duration::from_std(refill_delay)
-                    .unwrap_or_else(|_| chrono::Duration::seconds(5));
-            queue::defer_rate_limited_task(&mut conn, task.id, scheduled_at).await?;
-            return Ok(());
-        }
-        reserved_conn = Some(conn);
-    }
+            (Some(conn), Some(key))
+        } else {
+            (None, None)
+        };
 
     // Setup phase: append ActivityStarted, then drop the connection so the pool
     // slot is free before the handler runs (prevents a deadlock when
@@ -15009,16 +15041,37 @@ async fn process_activity_task(
             registry.payload_codecs(),
         )
         .await;
-        let Some(started) = fail_execution_on_error(
-            &mut conn,
-            task,
-            worker_id,
-            started_result,
-            registry.payload_codecs(),
-        )
-        .await
-        .map_err(|e| release_probe_on_error(&circuit_breakers, activity_name, circuit_token, e))?
-        else {
+        // A transient failure (issue #1788) has not run the handler and wrote
+        // nothing. It must not fail the workflow through
+        // `fail_execution_on_error`. Return it instead: the dispatch error path
+        // releases the claim, so the task runs again.
+        let started_result = match started_result {
+            Err(error) if crate::pool::is_transient_db_error(&error) => Err(error),
+            other => {
+                fail_execution_on_error(
+                    &mut conn,
+                    task,
+                    worker_id,
+                    other,
+                    registry.payload_codecs(),
+                )
+                .await
+            }
+        };
+        let started_opt = match started_result {
+            Ok(started_opt) => started_opt,
+            Err(error) => {
+                // Undo the dispatch reservation: the token and the probe.
+                refund_debited_token(&mut conn, debited_key).await;
+                return Err(release_probe_on_error(
+                    &circuit_breakers,
+                    activity_name,
+                    circuit_token,
+                    error,
+                ));
+            }
+        };
+        let Some(started) = started_opt else {
             // The activity will not run: it already has a terminal event, or the
             // task row stopped being RUNNING (cancelled / timed out concurrently).
             // Undo the side effects of the dispatch decision for this no-op so the
@@ -15639,6 +15692,12 @@ async fn process_activity_task(
     // (issue #1788). The handler already ran, so try again. Each finalization
     // re-checks `RUNNING` under a row lock, so a repeat is safe. An offloader
     // turns the repeats off; see `result_write_attempts`.
+    record_activity_panic_once(
+        telemetry.metrics.as_ref(),
+        activity_name,
+        &task.queue_name,
+        &activity_result,
+    );
     let mut conn = crate::pool::acquire_with_retries(pool, FINALIZE_ACQUIRE_ATTEMPTS).await?;
     let attempts = result_write_attempts(registry.payload_offloader().is_some());
     let mut attempt = 1;
@@ -31312,8 +31371,7 @@ pub async fn quarantine_workflow_task_timeout(
 /// not released: it may repeat, and a release would skip the retry policy.
 fn releases_claim_after_error(task_type: &str, error: &HarvestError) -> bool {
     task_type == "workflow"
-        || (task_type == "activity"
-            && (error.is_pool_acquire_failure() || crate::pool::is_session_timeout(error)))
+        || (task_type == "activity" && crate::pool::is_transient_db_error(error))
 }
 
 /// Backoff schedule for [`reset_timed_out_workflow_task`]'s pool-connection
@@ -34536,6 +34594,32 @@ mod tests {
             !reached,
             "a quarantine with no connection must report failure"
         );
+    }
+
+    #[derive(Default)]
+    struct PanicSink(std::sync::Mutex<u32>);
+
+    impl crate::telemetry::MetricsRecorder for PanicSink {
+        fn record_activity_panic(&self, _activity: &str, _queue: &str) {
+            *self.0.lock().expect("lock") += 1;
+        }
+    }
+
+    /// The panic counter fires once per panicking result, outside the result
+    /// write retries (issue #1788).
+    #[test]
+    fn the_panic_metric_counts_only_a_handler_panic() {
+        use crate::failure::IntoActivityErrorString as _;
+        let sink = PanicSink::default();
+        let panic = crate::failure::ActivityFailure::retryable(
+            crate::failure::ERROR_TYPE_HANDLER_PANIC,
+            "boom",
+        )
+        .into_error_payload();
+        record_activity_panic_once(&sink, "act", "default", &Err(panic));
+        record_activity_panic_once(&sink, "act", "default", &Err("plain error".to_owned()));
+        record_activity_panic_once(&sink, "act", "default", &Ok(serde_json::json!({})));
+        assert_eq!(*sink.0.lock().expect("lock"), 1);
     }
 
     /// An offloaded result uploads a blob on each try. A repeat would leave

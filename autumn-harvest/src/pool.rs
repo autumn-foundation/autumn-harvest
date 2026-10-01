@@ -316,6 +316,14 @@ pub fn is_session_timeout(error: &HarvestError) -> bool {
     }
 }
 
+/// Whether `error` is a transient database failure: the pool handed out no
+/// connection, or a session timeout cancelled the statement. Nothing was
+/// written, so the work can run again.
+#[must_use]
+pub fn is_transient_db_error(error: &HarvestError) -> bool {
+    error.is_pool_acquire_failure() || is_session_timeout(error)
+}
+
 /// A pooled engine connection.
 #[cfg(feature = "db")]
 pub type PooledConn = deadpool::managed::Object<
@@ -674,6 +682,33 @@ mod tests {
         assert!(!is_session_timeout(&HarvestError::NotFound(
             "lock timeout".into()
         )));
+    }
+
+    #[test]
+    fn is_transient_db_error_covers_pool_failures_and_session_timeouts() {
+        let cases = [
+            (
+                HarvestError::PoolAcquireTimeout {
+                    waited: Duration::from_secs(1),
+                },
+                true,
+            ),
+            (
+                HarvestError::PoolAcquireFailed {
+                    reason: "refused".into(),
+                },
+                true,
+            ),
+            (
+                HarvestError::Database("canceling statement due to lock timeout".into()),
+                true,
+            ),
+            (HarvestError::Database("duplicate key value".into()), false),
+            (HarvestError::NotFound("task".into()), false),
+        ];
+        for (error, transient) in cases {
+            assert_eq!(is_transient_db_error(&error), transient, "{error}");
+        }
     }
 
     #[test]
