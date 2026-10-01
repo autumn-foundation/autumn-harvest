@@ -1337,6 +1337,15 @@ pub fn validate_schedule(schedule: &Schedule) -> Result<(), String> {
     }
 }
 
+/// Default fire jitter for a cron schedule with no seconds field.
+pub const DEFAULT_CRON_JITTER: Duration = Duration::ZERO;
+
+/// Return the default fire jitter for `schedule`.
+#[must_use]
+pub const fn default_schedule_jitter(_schedule: &Schedule) -> Duration {
+    Duration::ZERO
+}
+
 /// Maximum jitter allowed for a [`Schedule::Cron`] schedule (1 hour).
 pub const MAX_CRON_JITTER: Duration = Duration::from_secs(3600);
 
@@ -1644,6 +1653,48 @@ mod tests {
     }
 
     #[test]
+    fn workflow_schedule_cron_defaults_to_small_jitter() {
+        let cron = WorkflowSchedule::new("wf", Schedule::Cron("0 * * * *".to_string()));
+        assert_eq!(cron.jitter, DEFAULT_CRON_JITTER);
+        let alias = WorkflowSchedule::new("wf", Schedule::Cron("@hourly".to_string()));
+        assert_eq!(alias.jitter, DEFAULT_CRON_JITTER);
+        let zoned = WorkflowSchedule::new(
+            "wf",
+            Schedule::CronInTimezone {
+                expr: "0 9 * * *".to_string(),
+                tz: "Europe/Paris".to_string(),
+            },
+        );
+        assert_eq!(zoned.jitter, DEFAULT_CRON_JITTER);
+        assert!(validate_jitter(&cron.schedule, cron.jitter).is_ok());
+    }
+
+    #[test]
+    fn workflow_schedule_default_jitter_is_zero_when_it_could_collide() {
+        // A seconds field can fire more often than the default window.
+        let seconds = Schedule::Cron("*/5 * * * * *".to_string());
+        assert_eq!(default_schedule_jitter(&seconds), Duration::ZERO);
+        let interval = Schedule::Interval(Duration::from_secs(5));
+        assert_eq!(default_schedule_jitter(&interval), Duration::ZERO);
+        assert_eq!(default_schedule_jitter(&Schedule::Manual), Duration::ZERO);
+    }
+
+    #[test]
+    fn default_cron_jitter_is_whole_seconds_below_one_minute() {
+        // `jitter_secs` stores whole seconds, so a fraction would be lost.
+        assert_eq!(DEFAULT_CRON_JITTER.subsec_nanos(), 0);
+        assert!(DEFAULT_CRON_JITTER > Duration::ZERO);
+        assert!(DEFAULT_CRON_JITTER < Duration::from_secs(60));
+    }
+
+    #[test]
+    fn workflow_schedule_cron_jitter_opt_out_is_zero() {
+        let sched = WorkflowSchedule::new("wf", Schedule::Cron("0 * * * *".to_string()))
+            .with_jitter(Duration::ZERO);
+        assert_eq!(sched.jitter, Duration::ZERO);
+    }
+
+    #[test]
     fn workflow_schedule_with_jitter_sets_duration() {
         let sched =
             WorkflowSchedule::new("my_wf", Schedule::Manual).with_jitter(Duration::from_secs(300));
@@ -1757,8 +1808,55 @@ mod tests {
     }
 
     #[test]
+    fn retry_policy_constructors_default_to_full_jitter() {
+        assert_eq!(JitterPolicy::default(), JitterPolicy::Full);
+        assert_eq!(RetryPolicy::default().jitter, JitterPolicy::Full);
+        let exp = RetryPolicy::exponential(3, Duration::from_secs(1));
+        assert_eq!(exp.jitter, JitterPolicy::Full);
+        let fixed = RetryPolicy::fixed(3, Duration::from_secs(1));
+        assert_eq!(fixed.jitter, JitterPolicy::Full);
+    }
+
+    #[test]
+    fn retry_policy_without_jitter_key_deserializes_to_full() {
+        let json = serde_json::json!({
+            "max_attempts": 3,
+            "initial_interval": {"secs": 1, "nanos": 0},
+            "backoff_coefficient": 2.0,
+            "max_interval": {"secs": 300, "nanos": 0},
+            "non_retryable_errors": [],
+        });
+        let policy: RetryPolicy = serde_json::from_value(json).expect("valid policy");
+        assert_eq!(policy.jitter, JitterPolicy::Full);
+    }
+
+    #[test]
+    fn retry_policy_explicit_none_jitter_round_trips() {
+        let policy = RetryPolicy::default().with_jitter(JitterPolicy::None);
+        let json = serde_json::to_value(&policy).expect("serializes");
+        let back: RetryPolicy = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(back.jitter, JitterPolicy::None);
+    }
+
+    /// Tasks that fail together must not retry together (issue #1792).
+    #[test]
+    fn default_retry_policy_jitters_delays_across_tasks() {
+        let policy = RetryPolicy::default();
+        for attempt in 1..policy.max_attempts {
+            let delays: std::collections::HashSet<Duration> = (0..100_u64)
+                .map(|task| policy.next_delay_with_seed(attempt, mix64(task)).unwrap())
+                .collect();
+            assert!(
+                delays.len() > 1,
+                "attempt {attempt}: 100 tasks got one delay {delays:?}"
+            );
+        }
+    }
+
+    #[test]
     fn exponential_backoff_doubles() {
-        let policy = RetryPolicy::exponential(5, Duration::from_secs(1));
+        let policy =
+            RetryPolicy::exponential(5, Duration::from_secs(1)).with_jitter(JitterPolicy::None);
         assert_eq!(policy.next_delay(1), Some(Duration::from_secs(1)));
         assert_eq!(policy.next_delay(2), Some(Duration::from_secs(2)));
         assert_eq!(policy.next_delay(3), Some(Duration::from_secs(4)));
@@ -1766,7 +1864,7 @@ mod tests {
 
     #[test]
     fn fixed_backoff_stays_constant() {
-        let policy = RetryPolicy::fixed(3, Duration::from_secs(5));
+        let policy = RetryPolicy::fixed(3, Duration::from_secs(5)).with_jitter(JitterPolicy::None);
         assert_eq!(policy.next_delay(1), Some(Duration::from_secs(5)));
         assert_eq!(policy.next_delay(2), Some(Duration::from_secs(5)));
     }
@@ -1778,8 +1876,9 @@ mod tests {
     }
 
     #[test]
-    fn retry_jitter_none_is_bit_identical_default() {
-        let policy = RetryPolicy::exponential(5, Duration::from_secs(1));
+    fn retry_jitter_none_ignores_the_seed() {
+        let policy =
+            RetryPolicy::exponential(5, Duration::from_secs(1)).with_jitter(JitterPolicy::None);
         for attempt in 1..5 {
             assert_eq!(
                 policy.next_delay(attempt),
@@ -1790,7 +1889,8 @@ mod tests {
 
     #[test]
     fn retry_jitter_bounds_over_10k_seeds() {
-        let base = RetryPolicy::exponential(8, Duration::from_millis(200));
+        let base = RetryPolicy::exponential(8, Duration::from_millis(200))
+            .with_jitter(JitterPolicy::None);
         for attempt in 1..6 {
             let base_delay = base.next_delay(attempt).unwrap();
             for seed in 0..10_000_u64 {

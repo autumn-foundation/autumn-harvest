@@ -5039,6 +5039,14 @@ fn retry_stream_seed(task: &TaskQueueItem) -> u64 {
     seed
 }
 
+/// Retry jitter seed for a local activity.
+const fn local_retry_stream_seed(
+    _exec_id: ExecutionId,
+    _activity_id: crate::types::ActivityExecId,
+) -> u64 {
+    0
+}
+
 /// Read the current time from the database clock (`NOW()`).
 ///
 /// Timer due-ness checks and the signal `received_at` column default both use
@@ -5693,6 +5701,11 @@ fn nd_block_backoff(block_count: i32) -> Duration {
         Duration::from_secs(ND_BLOCK_BACKOFF_CAP_SECS),
         attempt,
     )
+}
+
+/// Jittered [`nd_block_backoff`] for one execution.
+fn nd_block_backoff_jittered(block_count: i32, _stream_seed: u64) -> Duration {
+    nd_block_backoff(block_count)
 }
 
 // ---------------------------------------------------------------------------
@@ -7547,6 +7560,11 @@ fn panic_retry_backoff(strikes: u32) -> Duration {
         Duration::from_secs(PANIC_RETRY_BACKOFF_CAP_SECS),
         strikes.max(1),
     )
+}
+
+/// Jittered [`panic_retry_backoff`] for one execution.
+fn panic_retry_backoff_jittered(strikes: u32, _stream_seed: u64) -> Duration {
+    panic_retry_backoff(strikes)
 }
 
 /// Whether a contained workflow panic should be re-dispatched or failed
@@ -31979,6 +31997,7 @@ pub(crate) fn under_provisioned_shard_pools(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::JitterPolicy;
 
     /// Serializes every test below that installs or uninstalls a dispatch
     /// channel, global or per-shard (Codex review, issue #1429).
@@ -37187,6 +37206,38 @@ mod tests {
         assert_eq!(nd_block_backoff(i32::MAX), Duration::from_secs(300));
     }
 
+    /// Executions blocked together must not re-dispatch together (issue #1792).
+    #[test]
+    fn nd_block_backoff_jittered_spreads_a_blocked_cohort() {
+        for count in [0, 3, 6, 20] {
+            let delays: std::collections::HashSet<Duration> = (0..100_u64)
+                .map(|exec| nd_block_backoff_jittered(count, test_seed(exec)))
+                .collect();
+            assert!(delays.len() > 1, "count {count}: one delay {delays:?}");
+        }
+    }
+
+    #[test]
+    fn nd_block_backoff_jittered_keeps_half_the_backoff_as_a_floor() {
+        for count in [-1, 0, 1, 5, 6, i32::MAX] {
+            let ceiling = nd_block_backoff(count);
+            for exec in 0..200_u64 {
+                let delay = nd_block_backoff_jittered(count, test_seed(exec));
+                assert!(delay <= ceiling, "count {count}: {delay:?} > {ceiling:?}");
+                assert!(delay >= ceiling / 2, "count {count}: {delay:?} < half");
+                assert_eq!(delay, nd_block_backoff_jittered(count, test_seed(exec)));
+            }
+        }
+    }
+
+    /// Spread `n` into a 64-bit seed, like a real execution-id seed.
+    fn test_seed(n: u64) -> u64 {
+        retry_stream_seed(&TaskQueueItem {
+            workflow_exec_id: Some(uuid::Uuid::from_u128(u128::from(n))),
+            ..retry_after_test_task(1, 3)
+        })
+    }
+
     // -----------------------------------------------------------------------
     // Capability-miss release / escalate (issue #804)
     // -----------------------------------------------------------------------
@@ -39803,6 +39854,23 @@ mod tests {
         assert_eq!(panic_retry_backoff(4), Duration::from_secs(8));
     }
 
+    /// Panicking executions must not re-dispatch together (issue #1792).
+    #[test]
+    fn panic_retry_backoff_jittered_spreads_and_keeps_a_floor() {
+        for strikes in [0, 1, 3, 6, u32::MAX] {
+            let ceiling = panic_retry_backoff(strikes);
+            let mut delays = std::collections::HashSet::new();
+            for exec in 0..100_u64 {
+                let delay = panic_retry_backoff_jittered(strikes, test_seed(exec));
+                assert!(delay <= ceiling, "strikes {strikes}: {delay:?} > {ceiling:?}");
+                assert!(delay >= ceiling / 2, "strikes {strikes}: {delay:?} < half");
+                assert_eq!(delay, panic_retry_backoff_jittered(strikes, test_seed(exec)));
+                delays.insert(delay);
+            }
+            assert!(delays.len() > 1, "strikes {strikes}: one delay {delays:?}");
+        }
+    }
+
     #[test]
     fn panic_retry_backoff_caps_and_clamps() {
         // 1 * 2^5 = 32 > 30 — first strike that hits the cap.
@@ -40910,7 +40978,7 @@ mod tests {
         // AC3: a non-positive (here, exactly zero) hint falls through to the
         // policy delay -- it must NOT resolve to an immediate retry.
         let task = retry_after_test_task(1, 3);
-        let policy = RetryPolicy::fixed(3, Duration::from_secs(2));
+        let policy = RetryPolicy::fixed(3, Duration::from_secs(2)).with_jitter(JitterPolicy::None);
         let error = ActivityFailure::retryable("Http429", "rate limited")
             .with_retry_after(Duration::ZERO)
             .into_error_payload();
@@ -40929,7 +40997,7 @@ mod tests {
         // A plain legacy `Err(String)` recovers no typed `ActivityFailure`, so
         // `retry_after` is `None` and the policy delay is used verbatim.
         let task = retry_after_test_task(1, 3);
-        let policy = RetryPolicy::fixed(3, Duration::from_secs(5));
+        let policy = RetryPolicy::fixed(3, Duration::from_secs(5)).with_jitter(JitterPolicy::None);
         let delay = next_retry_delay(&task, "boom", Some(&policy), Duration::from_secs(900))
             .unwrap()
             .expect("an attempt is still available");
@@ -40956,16 +41024,32 @@ mod tests {
         assert_eq!(delay, chrono::Duration::seconds(0));
     }
 
+    /// The no-policy fallback jitters within one second (issue #1792).
     #[test]
-    fn next_retry_delay_no_policy_no_retry_after_uses_one_second_fallback() {
-        // The `retry_policy: None` branch's own `Duration::from_secs(1)`
-        // fallback (when an attempt remains) is untouched when no hint is
-        // present.
-        let task = retry_after_test_task(1, 3);
-        let delay = next_retry_delay(&task, "boom", None, Duration::from_secs(900))
-            .unwrap()
-            .expect("an attempt is still available");
-        assert_eq!(delay, chrono::Duration::seconds(1));
+    fn next_retry_delay_no_policy_no_retry_after_jitters_the_one_second_fallback() {
+        let mut delays = std::collections::HashSet::new();
+        for n in 0..100_u128 {
+            let task = TaskQueueItem {
+                activity_id: Some(uuid::Uuid::from_u128(n)),
+                ..retry_after_test_task(1, 3)
+            };
+            let delay = next_retry_delay(&task, "boom", None, Duration::from_secs(900))
+                .unwrap()
+                .expect("an attempt is still available");
+            assert!(delay >= chrono::Duration::zero());
+            assert!(delay <= chrono::Duration::seconds(1), "{delay:?} > 1s");
+            delays.insert(delay);
+        }
+        assert!(delays.len() > 1, "100 tasks got one delay {delays:?}");
+    }
+
+    #[test]
+    fn local_retry_stream_seed_differs_per_activity_and_repeats() {
+        let exec = ExecutionId::from_uuid(uuid::Uuid::from_u128(7));
+        let a = crate::types::ActivityExecId::from_uuid(uuid::Uuid::from_u128(1));
+        let b = crate::types::ActivityExecId::from_uuid(uuid::Uuid::from_u128(2));
+        assert_eq!(local_retry_stream_seed(exec, a), local_retry_stream_seed(exec, a));
+        assert_ne!(local_retry_stream_seed(exec, a), local_retry_stream_seed(exec, b));
     }
 
     #[test]
