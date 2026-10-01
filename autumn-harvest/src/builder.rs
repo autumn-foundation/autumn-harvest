@@ -3832,6 +3832,12 @@ pub struct WorkerConfig {
     /// keyed codec is registered, so this costs nothing on a deployment that has
     /// not adopted key rotation. Set via `with_codec_rotation_batch_size`.
     pub codec_rotation_batch_size: i64,
+    /// Per-shard scanner election, cadence, and batch size (issue #1795).
+    ///
+    /// By default one replica per shard runs the timeout checker. The others
+    /// stand by and take over within the lease TTL. Set via
+    /// `with_scanner_config`.
+    pub scanner: crate::scanner_lease::ScannerConfig,
 }
 
 /// Drop duplicate shard ids, preserving first-occurrence order (issue #797).
@@ -3979,6 +3985,7 @@ impl Default for WorkerConfig {
             sharded_pool: None,
             max_concurrent_sessions: 0,
             codec_rotation_batch_size: crate::codec_rotation::CODEC_ROTATION_DEFAULT_BATCH,
+            scanner: crate::scanner_lease::ScannerConfig::default(),
         }
     }
 }
@@ -4501,6 +4508,14 @@ impl WorkerConfig {
     #[must_use]
     pub const fn with_codec_rotation_batch_size(mut self, rows: i64) -> Self {
         self.codec_rotation_batch_size = rows;
+        self
+    }
+
+    /// Set the per-shard scanner election, cadence, and batch size (issue
+    /// #1795). See [`WorkerConfig::scanner`].
+    #[must_use]
+    pub fn with_scanner_config(mut self, scanner: crate::scanner_lease::ScannerConfig) -> Self {
+        self.scanner = scanner;
         self
     }
 

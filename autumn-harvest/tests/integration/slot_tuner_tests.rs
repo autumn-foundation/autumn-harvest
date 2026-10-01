@@ -169,6 +169,7 @@ fn build_registry(telemetry: Arc<TelemetryConfig>) -> Arc<HandlerRegistry> {
 fn runtime_config(worker_id: &str, slot_tuner: Option<SlotTunerConfig>) -> WorkerRuntimeConfig {
     WorkerRuntimeConfig {
         codec_rotation_batch_size: 0,
+        scanner: Default::default(),
         dr: autumn_harvest::replication::DrConfig::default(),
         worker_id: worker_id.to_string(),
         queues: vec!["default".to_string()],

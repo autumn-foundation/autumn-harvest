@@ -243,6 +243,16 @@ pub struct WorkerConfigView {
     /// *identifiers* and per-key rows-remaining are served by
     /// `GET /admin/codec/rotation`.
     pub codec_rotation_batch_size: i64,
+    /// Whether one replica per shard runs the timeout checker (issue #1795).
+    pub scanner_election: bool,
+    /// Scanner lease TTL before the floor of three ticks, in milliseconds.
+    pub scanner_lease_ttl_ms: u64,
+    /// Random spread of each scanner sleep, as a fraction of the interval.
+    pub scanner_jitter: f64,
+    /// Mean time between timeout-checker ticks, in milliseconds.
+    pub timeout_scan_interval_ms: u64,
+    /// Rows per timeout reason that one timeout pass reads.
+    pub timeout_scan_batch_size: u32,
     /// Max panic strikes before a panicking workflow task fails terminally
     /// (0 = terminal on first panic).
     pub workflow_panic_max_attempts: u32,
@@ -401,6 +411,7 @@ impl WorkerConfigView {
             max_concurrent_sessions,
             workflow_panic_max_attempts,
             codec_rotation_batch_size,
+            scanner,
             // REDACTED — the registry holds live codec handles that may close
             // over key material. Only the operator-chosen key IDENTIFIERS are
             // safe to report, and those are served by
@@ -463,6 +474,11 @@ impl WorkerConfigView {
             slot_tuner_enabled: slot_tuner.is_some(),
             max_concurrent_sessions: *max_concurrent_sessions,
             codec_rotation_batch_size: *codec_rotation_batch_size,
+            scanner_election: scanner.elect,
+            scanner_lease_ttl_ms: dur_ms(scanner.lease_ttl),
+            scanner_jitter: scanner.jitter,
+            timeout_scan_interval_ms: dur_ms(scanner.timeout_interval),
+            timeout_scan_batch_size: scanner.timeout_batch_size,
             workflow_panic_max_attempts: *workflow_panic_max_attempts,
             notification_channel_configured: notification_database_url.is_some(),
             shard_notification_channels_configured: shard_notification_database_urls.len(),
