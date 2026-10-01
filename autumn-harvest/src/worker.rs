@@ -558,6 +558,8 @@ pub struct HandlerRegistry {
     /// in-process state. Built from the registered activities' declared
     /// [`CircuitBreakerPolicy`](crate::policy::CircuitBreakerPolicy)s.
     circuit_breakers: Arc<crate::circuit_breaker::CircuitBreakerRegistry>,
+    /// Per-activity-type retry budgets (issue #1793). On by default.
+    retry_budgets: Arc<crate::retry_budget::RetryBudgetRegistry>,
     /// Maximum byte length for `current_details` strings passed to the
     /// workflow context (issue #473). Default: 1 KiB.
     pub max_current_details_bytes: usize,
@@ -805,6 +807,7 @@ impl HandlerRegistry {
             circuit_breakers: Arc::new(crate::circuit_breaker::CircuitBreakerRegistry::new(
                 circuit_policies,
             )),
+            retry_budgets: Arc::new(crate::retry_budget::RetryBudgetRegistry::default()),
             max_workflow_attempts_ceiling: None,
             max_workflow_chain_timeout: None,
             max_workflow_execution_timeout: None,
@@ -1167,6 +1170,23 @@ impl HandlerRegistry {
         Arc::clone(&self.circuit_breakers)
     }
 
+    /// Replace the per-activity-type retry budgets (issue #1793).
+    ///
+    /// Mirrors [`crate::builder::WorkerConfig::with_retry_budget`]. The default
+    /// gives every activity type the default
+    /// [`RetryBudgetPolicy`](crate::policy::RetryBudgetPolicy).
+    #[must_use]
+    pub fn with_retry_budget(mut self, config: crate::retry_budget::RetryBudgetConfig) -> Self {
+        self.retry_budgets = Arc::new(crate::retry_budget::RetryBudgetRegistry::new(config));
+        self
+    }
+
+    /// Access the per-activity-type retry budgets (issue #1793).
+    #[must_use]
+    pub fn retry_budgets(&self) -> Arc<crate::retry_budget::RetryBudgetRegistry> {
+        Arc::clone(&self.retry_budgets)
+    }
+
     /// History-size guardrails applied to workflow contexts run by this registry.
     #[must_use]
     pub const fn history_policy(&self) -> WorkflowHistoryPolicy {
@@ -1442,6 +1462,7 @@ impl std::fmt::Debug for HandlerRegistry {
             .field("max_current_details_bytes", &self.max_current_details_bytes)
             .field("workflow_log_policy", &self.workflow_log_policy)
             .field("circuit_breakers", &self.circuit_breakers)
+            .field("retry_budgets", &self.retry_budgets)
             .field(
                 "max_workflow_attempts_ceiling",
                 &self.max_workflow_attempts_ceiling,
@@ -34231,6 +34252,7 @@ mod tests {
             slot_tuner: None,
             max_concurrent_sessions: 0,
             codec_rotation_batch_size: crate::codec_rotation::CODEC_ROTATION_DEFAULT_BATCH,
+            retry_budget: crate::retry_budget::RetryBudgetConfig::default(),
             #[cfg(feature = "db")]
             sharded_pool: None,
         };

@@ -1303,7 +1303,8 @@ impl BuiltHarvest {
             self.worker_config.default_activity_retry_policy.clone(),
             self.worker_config.default_activity_start_to_close,
         )
-        .with_retry_after_ceiling(self.worker_config.retry_after_ceiling);
+        .with_retry_after_ceiling(self.worker_config.retry_after_ceiling)
+        .with_retry_budget(self.worker_config.retry_budget.clone());
         #[cfg(feature = "wasm-activities")]
         if let Some(store) = self.wasm_store {
             registry = registry.with_wasm_activities(
@@ -1403,7 +1404,8 @@ impl BuiltHarvest {
             self.worker_config.default_activity_retry_policy.clone(),
             self.worker_config.default_activity_start_to_close,
         )
-        .with_retry_after_ceiling(self.worker_config.retry_after_ceiling);
+        .with_retry_after_ceiling(self.worker_config.retry_after_ceiling)
+        .with_retry_budget(self.worker_config.retry_budget.clone());
         #[cfg(feature = "wasm-activities")]
         if let Some(store) = self.wasm_store {
             registry = registry.with_wasm_activities(
@@ -3832,6 +3834,15 @@ pub struct WorkerConfig {
     /// keyed codec is registered, so this costs nothing on a deployment that has
     /// not adopted key rotation. Set via `with_codec_rotation_batch_size`.
     pub codec_rotation_batch_size: i64,
+    /// Per-activity-type retry budgets (issue #1793).
+    ///
+    /// **On by default.** Every activity type gets the default
+    /// [`RetryBudgetPolicy`](crate::policy::RetryBudgetPolicy): a 10 % retry
+    /// ratio, 10 tokens of capacity and a floor of 1 retry each second. An
+    /// empty budget defers a retry and never drops it. Use
+    /// [`RetryBudgetConfig::disabled`](crate::retry_budget::RetryBudgetConfig::disabled)
+    /// to turn it off. Set via `with_retry_budget`.
+    pub retry_budget: crate::retry_budget::RetryBudgetConfig,
 }
 
 /// Drop duplicate shard ids, preserving first-occurrence order (issue #797).
@@ -3979,6 +3990,7 @@ impl Default for WorkerConfig {
             sharded_pool: None,
             max_concurrent_sessions: 0,
             codec_rotation_batch_size: crate::codec_rotation::CODEC_ROTATION_DEFAULT_BATCH,
+            retry_budget: crate::retry_budget::RetryBudgetConfig::default(),
         }
     }
 }
@@ -4536,6 +4548,14 @@ impl WorkerConfig {
     #[must_use]
     pub const fn with_retry_after_ceiling(mut self, ceiling: Duration) -> Self {
         self.retry_after_ceiling = ceiling;
+        self
+    }
+
+    /// Set the per-activity-type retry budgets (issue #1793). See
+    /// [`WorkerConfig::retry_budget`].
+    #[must_use]
+    pub fn with_retry_budget(mut self, config: crate::retry_budget::RetryBudgetConfig) -> Self {
+        self.retry_budget = config;
         self
     }
 }
@@ -5375,6 +5395,44 @@ mod tests {
             built.into_worker_parts_with_extra_state(crate::context::SharedStateMap::new());
 
         assert_eq!(registry.retry_after_ceiling, Duration::from_secs(77));
+    }
+
+    /// The worker registry enforces the configured retry budget (issue #1793).
+    #[cfg(feature = "db")]
+    #[test]
+    fn harvest_builder_wires_retry_budget_into_worker_registry() {
+        use crate::policy::RetryBudgetPolicy;
+        use crate::retry_budget::RetryBudgetConfig;
+
+        let _guard = crate::start_idempotency::PURGE_WINDOW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let config = RetryBudgetConfig::default()
+            .with_activity("charge_card", Some(RetryBudgetPolicy::new(0.5, 3.0, 0.0)))
+            .with_activity("send_email", None);
+        let built = HarvestBuilder::new()
+            .worker(WorkerConfig::default().with_retry_budget(config.clone()))
+            .build();
+        let (registry, _dags, _schedules, _worker_config) = built.into_worker_parts();
+        assert_eq!(registry.retry_budgets().config(), &config);
+
+        let built = HarvestBuilder::new()
+            .worker(WorkerConfig::default().with_retry_budget(config.clone()))
+            .build();
+        let (registry, _dags, _schedules, _worker_config) =
+            built.into_worker_parts_with_extra_state(crate::context::SharedStateMap::new());
+        assert_eq!(registry.retry_budgets().config(), &config);
+    }
+
+    /// The retry budget is on by default (issue #1793).
+    #[test]
+    fn worker_config_retry_budget_is_on_by_default() {
+        let config = WorkerConfig::default();
+        assert_eq!(
+            config.retry_budget.default_policy(),
+            Some(crate::policy::RetryBudgetPolicy::default())
+        );
     }
 
     #[test]

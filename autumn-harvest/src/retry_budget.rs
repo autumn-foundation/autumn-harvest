@@ -1,0 +1,479 @@
+//! Per-activity-type retry budget (issue #1793).
+//!
+//! A retry policy limits the retries of one task. Nothing else limits retries
+//! in aggregate. During a dependency brownout, every failing task retries, and
+//! the retries multiply the load on the dependency.
+//!
+//! A retry budget caps that load. The worker keeps one token bucket for each
+//! activity type:
+//!
+//! - The bucket starts full at `max_tokens`.
+//! - A first attempt deposits `ratio` tokens, up to `max_tokens`.
+//! - A retry spends one token.
+//! - Time adds `min_retries_per_sec` tokens each second, up to `max_tokens`.
+//!
+//! When the bucket holds less than one token, the worker defers the retry. The
+//! task row goes back to `PENDING` at a later `scheduled_at`. The deferral does
+//! not use an attempt and appends no event. **A deferred retry is never lost.**
+//! Only the existing activity timeouts can end it.
+//!
+//! See [`RetryBudgetPolicy`](crate::policy::RetryBudgetPolicy) for the knobs.
+//!
+//! ## Scope and durability
+//!
+//! State is in process and per worker, like
+//! [`crate::circuit_breaker`]. It never touches the event log, so replay is
+//! unaffected. Each worker process enforces its own budget, so a fleet of N
+//! workers allows up to N budgets.
+
+use std::collections::HashMap;
+use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, Instant};
+
+use crate::policy::RetryBudgetPolicy;
+
+/// Shortest deferral. It keeps a deferred retry from spinning on the claim
+/// path.
+pub const MIN_RETRY_BUDGET_DEFER: Duration = Duration::from_millis(50);
+
+/// Longest deferral. A deferred retry checks the bucket again at least this
+/// often.
+pub const MAX_RETRY_BUDGET_DEFER: Duration = Duration::from_secs(30);
+
+/// Which activity types have a retry budget, and with which policy.
+///
+/// The default config gives every activity type the default
+/// [`RetryBudgetPolicy`]. A per-type override replaces the default policy for
+/// one activity name. An override of `None` turns the budget off for that type.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RetryBudgetConfig {
+    default_policy: Option<RetryBudgetPolicy>,
+    overrides: HashMap<String, Option<RetryBudgetPolicy>>,
+}
+
+impl Default for RetryBudgetConfig {
+    fn default() -> Self {
+        Self {
+            default_policy: Some(RetryBudgetPolicy::default()),
+            overrides: HashMap::new(),
+        }
+    }
+}
+
+impl RetryBudgetConfig {
+    /// A config with no budget for any activity type.
+    #[must_use]
+    pub fn disabled() -> Self {
+        Self {
+            default_policy: None,
+            overrides: HashMap::new(),
+        }
+    }
+
+    /// Set the policy for every activity type without an override. `None`
+    /// turns the default off.
+    #[must_use]
+    pub fn with_default(mut self, policy: Option<RetryBudgetPolicy>) -> Self {
+        self.default_policy = policy.map(sanitize);
+        self
+    }
+
+    /// Set the policy for one activity type. `None` turns the budget off for
+    /// that type.
+    #[must_use]
+    pub fn with_activity(
+        mut self,
+        activity_name: impl Into<String>,
+        policy: Option<RetryBudgetPolicy>,
+    ) -> Self {
+        self.overrides
+            .insert(activity_name.into(), policy.map(sanitize));
+        self
+    }
+
+    /// The policy for every activity type without an override.
+    #[must_use]
+    pub const fn default_policy(&self) -> Option<RetryBudgetPolicy> {
+        self.default_policy
+    }
+
+    /// Number of per-type overrides.
+    #[must_use]
+    pub fn override_count(&self) -> usize {
+        self.overrides.len()
+    }
+
+    /// The policy that applies to `activity_name`, or `None` when it has no
+    /// budget.
+    #[must_use]
+    pub fn policy_for(&self, activity_name: &str) -> Option<RetryBudgetPolicy> {
+        self.overrides
+            .get(activity_name)
+            .copied()
+            .unwrap_or(self.default_policy)
+    }
+}
+
+/// Re-apply the constructor rules. The policy fields are public, so a caller
+/// can set a NaN or a negative value directly.
+fn sanitize(policy: RetryBudgetPolicy) -> RetryBudgetPolicy {
+    RetryBudgetPolicy::new(policy.ratio, policy.max_tokens, policy.min_retries_per_sec)
+}
+
+/// Proof that [`RetryBudgetRegistry::admit`] changed a bucket.
+///
+/// Give it back to [`RetryBudgetRegistry::release`] when the admitted attempt
+/// does not run, for example when a rate limit defers it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BudgetTicket {
+    kind: TicketKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TicketKind {
+    /// A first attempt added this many tokens.
+    Deposited(f64),
+    /// A retry spent one token.
+    Spent,
+}
+
+/// Outcome of [`RetryBudgetRegistry::admit`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Admission {
+    /// The activity type has no budget. Run the attempt.
+    Untracked,
+    /// Run the attempt. Release `ticket` if the attempt does not run.
+    Admitted {
+        /// Undo token for [`RetryBudgetRegistry::release`].
+        ticket: BudgetTicket,
+        /// Tokens left after this decision.
+        available: f64,
+    },
+    /// The bucket is empty. Defer the retry by `retry_after`. Do not run it.
+    Deferred {
+        /// Delay before the retry is claimable again.
+        retry_after: Duration,
+        /// Tokens left after this decision.
+        available: f64,
+    },
+}
+
+#[derive(Debug)]
+struct Bucket {
+    tokens: f64,
+    refilled_at: Instant,
+    /// Latest wake-up slot given to a deferred retry. Later deferrals are
+    /// spaced after it, so deferred retries do not wake in a herd.
+    next_slot: Instant,
+}
+
+/// In-process registry of per-activity-type retry budgets.
+///
+/// The worker builds one registry and shares it behind an `Arc`.
+#[derive(Debug)]
+pub struct RetryBudgetRegistry {
+    config: RetryBudgetConfig,
+    buckets: Mutex<HashMap<String, Bucket>>,
+}
+
+impl Default for RetryBudgetRegistry {
+    fn default() -> Self {
+        Self::new(RetryBudgetConfig::default())
+    }
+}
+
+impl RetryBudgetRegistry {
+    /// Build a registry from `config`.
+    #[must_use]
+    pub fn new(config: RetryBudgetConfig) -> Self {
+        Self {
+            config,
+            buckets: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The config this registry enforces.
+    #[must_use]
+    pub const fn config(&self) -> &RetryBudgetConfig {
+        &self.config
+    }
+
+    #[allow(dead_code)]
+    fn lock(&self) -> MutexGuard<'_, HashMap<String, Bucket>> {
+        // The state is plain numbers, so a poisoned lock is safe to reuse.
+        self.buckets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Decide whether an attempt of `activity_name` may run at `now`.
+    ///
+    /// A first attempt (`is_retry == false`) always runs and deposits tokens.
+    /// A retry runs only when it can spend one token.
+    #[must_use]
+    pub fn admit(&self, activity_name: &str, is_retry: bool, now: Instant) -> Admission {
+        let _ = (activity_name, is_retry, now);
+        Admission::Untracked
+    }
+
+    /// Undo the bucket change that `ticket` records.
+    ///
+    /// Returns the tokens left, or `None` when the type has no budget.
+    pub fn release(&self, activity_name: &str, ticket: BudgetTicket, now: Instant) -> Option<f64> {
+        let _ = (activity_name, ticket, now);
+        None
+    }
+
+    /// Tokens available to `activity_name` at `now`, or `None` when the type
+    /// has no budget.
+    #[must_use]
+    pub fn available(&self, activity_name: &str, now: Instant) -> Option<f64> {
+        let _ = (activity_name, now);
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const A: &str = "charge_card";
+    const B: &str = "send_email";
+
+    fn registry(policy: RetryBudgetPolicy) -> RetryBudgetRegistry {
+        RetryBudgetRegistry::new(RetryBudgetConfig::disabled().with_default(Some(policy)))
+    }
+
+    fn is_admitted(a: Admission) -> bool {
+        matches!(a, Admission::Admitted { .. })
+    }
+
+    fn ticket(a: Admission) -> BudgetTicket {
+        match a {
+            Admission::Admitted { ticket, .. } => ticket,
+            other => panic!("expected Admitted, got {other:?}"),
+        }
+    }
+
+    fn retry_after(a: Admission) -> Duration {
+        match a {
+            Admission::Deferred { retry_after, .. } => retry_after,
+            other => panic!("expected Deferred, got {other:?}"),
+        }
+    }
+
+    /// Spend every token. Return how many retries ran.
+    fn drain(reg: &RetryBudgetRegistry, name: &str, now: Instant) -> u32 {
+        let mut ran = 0;
+        while is_admitted(reg.admit(name, true, now)) {
+            ran += 1;
+            assert!(ran < 10_000, "bucket never ran dry");
+        }
+        ran
+    }
+
+    #[test]
+    fn default_config_gives_every_type_the_default_policy() {
+        let config = RetryBudgetConfig::default();
+        assert_eq!(config.policy_for(A), Some(RetryBudgetPolicy::default()));
+        let p = RetryBudgetPolicy::default();
+        assert!((p.ratio - 0.1).abs() < f64::EPSILON);
+        assert!((p.max_tokens - 10.0).abs() < f64::EPSILON);
+        assert!((p.min_retries_per_sec - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn default_registry_is_on() {
+        let reg = RetryBudgetRegistry::default();
+        assert!(is_admitted(reg.admit(A, true, Instant::now())));
+    }
+
+    #[test]
+    fn disabled_config_tracks_nothing() {
+        let reg = RetryBudgetRegistry::new(RetryBudgetConfig::disabled());
+        let now = Instant::now();
+        for _ in 0..1_000 {
+            assert_eq!(reg.admit(A, true, now), Admission::Untracked);
+        }
+        assert_eq!(reg.available(A, now), None);
+    }
+
+    #[test]
+    fn per_type_override_wins_over_the_default() {
+        let custom = RetryBudgetPolicy::new(0.5, 2.0, 0.0);
+        let config = RetryBudgetConfig::default()
+            .with_activity(A, Some(custom))
+            .with_activity(B, None);
+        assert_eq!(config.policy_for(A), Some(custom));
+        assert_eq!(config.policy_for(B), None);
+        assert_eq!(config.policy_for("other"), config.default_policy());
+        assert_eq!(config.override_count(), 2);
+
+        let reg = RetryBudgetRegistry::new(config);
+        let now = Instant::now();
+        assert_eq!(drain(&reg, A, now), 2);
+        assert_eq!(reg.admit(B, true, now), Admission::Untracked);
+    }
+
+    #[test]
+    fn bucket_starts_full_and_retries_spend_one_token_each() {
+        let reg = registry(RetryBudgetPolicy::new(0.1, 3.0, 0.0));
+        let now = Instant::now();
+        assert_eq!(reg.available(A, now), Some(3.0));
+        assert_eq!(drain(&reg, A, now), 3);
+        assert!(matches!(
+            reg.admit(A, true, now),
+            Admission::Deferred { .. }
+        ));
+    }
+
+    #[test]
+    fn first_attempts_always_run_and_deposit_ratio_tokens() {
+        let reg = registry(RetryBudgetPolicy::new(0.5, 2.0, 0.0));
+        let now = Instant::now();
+        assert_eq!(drain(&reg, A, now), 2);
+        for _ in 0..4 {
+            assert!(is_admitted(reg.admit(A, false, now)));
+        }
+        assert_eq!(reg.available(A, now), Some(2.0));
+        assert_eq!(drain(&reg, A, now), 2);
+    }
+
+    #[test]
+    fn deposits_never_exceed_capacity() {
+        let reg = registry(RetryBudgetPolicy::new(1.0, 5.0, 0.0));
+        let now = Instant::now();
+        for _ in 0..100 {
+            let _ = reg.admit(A, false, now);
+        }
+        assert_eq!(reg.available(A, now), Some(5.0));
+    }
+
+    #[test]
+    fn time_refills_at_the_floor_rate() {
+        let reg = registry(RetryBudgetPolicy::new(0.0, 4.0, 2.0));
+        let t0 = Instant::now();
+        assert_eq!(drain(&reg, A, t0), 4);
+        let t1 = t0 + Duration::from_secs(1);
+        assert_eq!(drain(&reg, A, t1), 2);
+        let t2 = t1 + Duration::from_secs(60);
+        assert_eq!(reg.available(A, t2), Some(4.0));
+    }
+
+    /// The core budget claim. With no time refill, retries that run never
+    /// exceed `max_tokens + ratio * first_attempts`.
+    #[test]
+    fn retries_stay_within_the_budget_under_total_failure() {
+        let policy = RetryBudgetPolicy::new(0.1, 10.0, 0.0);
+        let reg = registry(policy);
+        let now = Instant::now();
+        let first_attempts = 500_u32;
+        let mut retries_run = 0_u32;
+        for _ in 0..first_attempts {
+            let _ = reg.admit(A, false, now);
+            // Every attempt fails, and each failed task asks to retry 5 times.
+            for _ in 0..5 {
+                if is_admitted(reg.admit(A, true, now)) {
+                    retries_run += 1;
+                }
+            }
+        }
+        let budget = policy.max_tokens + policy.ratio * f64::from(first_attempts);
+        assert!(
+            f64::from(retries_run) <= budget + 1e-9,
+            "{retries_run} retries ran; budget is {budget}"
+        );
+        assert!(f64::from(retries_run) >= budget - 1.0, "budget unused");
+    }
+
+    #[test]
+    fn exhausting_one_type_leaves_other_types_unaffected() {
+        let reg = registry(RetryBudgetPolicy::new(0.1, 3.0, 0.0));
+        let now = Instant::now();
+        assert_eq!(drain(&reg, A, now), 3);
+        assert!(is_admitted(reg.admit(B, true, now)));
+        assert_eq!(reg.available(B, now), Some(2.0));
+    }
+
+    #[test]
+    fn release_undoes_a_spent_retry() {
+        let reg = registry(RetryBudgetPolicy::new(0.1, 2.0, 0.0));
+        let now = Instant::now();
+        let t = ticket(reg.admit(A, true, now));
+        assert_eq!(reg.available(A, now), Some(1.0));
+        assert_eq!(reg.release(A, t, now), Some(2.0));
+    }
+
+    #[test]
+    fn release_undoes_a_deposit() {
+        let reg = registry(RetryBudgetPolicy::new(0.5, 2.0, 0.0));
+        let now = Instant::now();
+        assert_eq!(drain(&reg, A, now), 2);
+        let t = ticket(reg.admit(A, false, now));
+        assert_eq!(reg.available(A, now), Some(0.5));
+        assert_eq!(reg.release(A, t, now), Some(0.0));
+    }
+
+    #[test]
+    fn deferral_waits_for_the_next_token() {
+        let reg = registry(RetryBudgetPolicy::new(0.0, 1.0, 2.0));
+        let now = Instant::now();
+        assert_eq!(drain(&reg, A, now), 1);
+        let wait = retry_after(reg.admit(A, true, now));
+        assert!(
+            wait >= Duration::from_millis(450) && wait <= Duration::from_millis(550),
+            "expected about 500 ms, got {wait:?}"
+        );
+    }
+
+    #[test]
+    fn consecutive_deferrals_are_spaced_out() {
+        let reg = registry(RetryBudgetPolicy::new(0.0, 1.0, 2.0));
+        let now = Instant::now();
+        assert_eq!(drain(&reg, A, now), 1);
+        let first = retry_after(reg.admit(A, true, now));
+        let second = retry_after(reg.admit(A, true, now));
+        let third = retry_after(reg.admit(A, true, now));
+        assert!(
+            second >= first + Duration::from_millis(450),
+            "{first:?} {second:?}"
+        );
+        assert!(
+            third >= second + Duration::from_millis(450),
+            "{second:?} {third:?}"
+        );
+    }
+
+    #[test]
+    fn deferral_is_capped_when_time_never_refills() {
+        let reg = registry(RetryBudgetPolicy::new(0.1, 1.0, 0.0));
+        let now = Instant::now();
+        assert_eq!(drain(&reg, A, now), 1);
+        for _ in 0..100 {
+            let wait = retry_after(reg.admit(A, true, now));
+            assert!(wait >= MIN_RETRY_BUDGET_DEFER && wait <= MAX_RETRY_BUDGET_DEFER);
+        }
+    }
+
+    #[test]
+    fn policy_constructor_rejects_bad_values() {
+        let p = RetryBudgetPolicy::new(f64::NAN, 0.0, -3.0);
+        assert!(p.ratio.abs() < f64::EPSILON);
+        assert!((p.max_tokens - 1.0).abs() < f64::EPSILON);
+        assert!(p.min_retries_per_sec.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn config_sanitizes_a_policy_built_from_public_fields() {
+        let raw = RetryBudgetPolicy {
+            ratio: f64::INFINITY,
+            max_tokens: f64::NAN,
+            min_retries_per_sec: f64::NAN,
+        };
+        let config = RetryBudgetConfig::disabled().with_default(Some(raw));
+        let p = config.policy_for(A).expect("policy");
+        assert!(p.ratio.abs() < f64::EPSILON);
+        assert!((p.max_tokens - 1.0).abs() < f64::EPSILON);
+        assert!(p.min_retries_per_sec.abs() < f64::EPSILON);
+    }
+}

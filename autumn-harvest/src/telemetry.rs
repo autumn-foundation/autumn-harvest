@@ -1218,6 +1218,17 @@ pub const METRIC_RATE_LIMIT_REFILL_RATE: &str = "harvest.rate_limit.refill_rate"
 /// Counter: incremented when a task claim is throttled/skipped due to rate limiting.
 pub const METRIC_RATE_LIMIT_THROTTLED: &str = "harvest.rate_limit.throttled";
 
+/// Gauge: tokens left in the retry budget of one activity type (issue #1793).
+///
+/// Labeled by `activity`. The worker sets it after each budget decision.
+pub const METRIC_RETRY_BUDGET_AVAILABLE: &str = "harvest.retry.budget.available";
+
+/// Counter: retries that the retry budget deferred (issue #1793).
+///
+/// Labeled by `activity`. Prometheus exports it as
+/// `harvest_retry_budget_exhausted_total`.
+pub const METRIC_RETRY_BUDGET_EXHAUSTED: &str = "harvest.retry.budget.exhausted";
+
 /// Counter: incremented on each scheduler tick-loop fire attempt for a due schedule slot.
 ///
 /// Labels:
@@ -2782,6 +2793,23 @@ pub trait MetricsRecorder: Send + Sync {
     /// key (`dyn-rate:{expr}:{tenant}`, issue #699) embeds unbounded tenant
     /// input and would explode label cardinality.
     fn record_rate_limit_throttled(&self, activity: &str) {
+        let _ = activity;
+    }
+
+    /// Record the tokens left in the retry budget of one activity type
+    /// (issue #1793).
+    ///
+    /// Maps to the gauge `harvest.retry.budget.available{activity}`. The
+    /// `activity` argument is the registered activity name.
+    fn record_retry_budget_available(&self, activity: &str, tokens: f64) {
+        let _ = (activity, tokens);
+    }
+
+    /// Record one retry that the retry budget deferred (issue #1793).
+    ///
+    /// Maps to the counter `harvest.retry.budget.exhausted{activity}`. The
+    /// `activity` argument is the registered activity name.
+    fn record_retry_budget_exhausted(&self, activity: &str) {
         let _ = activity;
     }
 

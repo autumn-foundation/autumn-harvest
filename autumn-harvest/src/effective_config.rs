@@ -243,6 +243,11 @@ pub struct WorkerConfigView {
     /// *identifiers* and per-key rows-remaining are served by
     /// `GET /admin/codec/rotation`.
     pub codec_rotation_batch_size: i64,
+    /// Retry budget policy for activity types without an override
+    /// (issue #1793). `null` = no default budget.
+    pub retry_budget_default: Option<crate::policy::RetryBudgetPolicy>,
+    /// Number of per-activity-type retry budget overrides (issue #1793).
+    pub retry_budget_overrides: usize,
     /// Max panic strikes before a panicking workflow task fails terminally
     /// (0 = terminal on first panic).
     pub workflow_panic_max_attempts: u32,
@@ -401,6 +406,7 @@ impl WorkerConfigView {
             max_concurrent_sessions,
             workflow_panic_max_attempts,
             codec_rotation_batch_size,
+            retry_budget,
             // REDACTED — the registry holds live codec handles that may close
             // over key material. Only the operator-chosen key IDENTIFIERS are
             // safe to report, and those are served by
@@ -463,6 +469,8 @@ impl WorkerConfigView {
             slot_tuner_enabled: slot_tuner.is_some(),
             max_concurrent_sessions: *max_concurrent_sessions,
             codec_rotation_batch_size: *codec_rotation_batch_size,
+            retry_budget_default: retry_budget.default_policy(),
+            retry_budget_overrides: retry_budget.override_count(),
             workflow_panic_max_attempts: *workflow_panic_max_attempts,
             notification_channel_configured: notification_database_url.is_some(),
             shard_notification_channels_configured: shard_notification_database_urls.len(),

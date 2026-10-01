@@ -250,3 +250,31 @@ fn record_payload_rejected_bridges_counter() {
         "harvest.payload.rejected must carry the workflow.type label, got {labels:?}"
     );
 }
+
+#[test]
+fn record_retry_budget_available_bridges_gauge_with_activity_label() {
+    let keys = captured_keys(|| {
+        MetricsRsRecorder.record_retry_budget_available("charge_card", 4.5);
+    });
+    let key = find_key(
+        &keys,
+        "harvest.retry.budget.available",
+        InstrumentKind::Gauge,
+    );
+    let labels = labels_of(key);
+    assert_eq!(labels, vec![("activity", "charge_card")], "issue #1793");
+}
+
+#[test]
+fn record_retry_budget_exhausted_bridges_counter_with_activity_label() {
+    let keys = captured_keys(|| {
+        MetricsRsRecorder.record_retry_budget_exhausted("charge_card");
+    });
+    let key = find_key(
+        &keys,
+        "harvest.retry.budget.exhausted",
+        InstrumentKind::Counter,
+    );
+    let labels = labels_of(key);
+    assert_eq!(labels, vec![("activity", "charge_card")], "issue #1793");
+}
