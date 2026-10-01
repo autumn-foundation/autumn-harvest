@@ -279,6 +279,7 @@ mod webhook_trigger_tests;
 #[cfg(feature = "db")]
 mod with_start_shared_tests;
 mod worker_session_tests;
+mod workflow_backoff_requeue_tests;
 #[cfg(feature = "db")]
 mod workflow_handle_tests;
 #[cfg(feature = "db")]
