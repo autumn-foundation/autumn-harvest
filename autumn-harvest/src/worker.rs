@@ -13219,6 +13219,30 @@ async fn requeue_parent_on_transient_ingest_conflict(
     Ok(())
 }
 
+/// Re-drive a workflow task after an event-id conflict in an append made
+/// after the handler lookup (issue #1787).
+///
+/// The lookup succeeded, so this worker can run the task. The park clears the
+/// capability-miss evidence, as every other post-lookup park does (issue
+/// #804). Stale evidence could otherwise end the redelivery budget early.
+#[doc(hidden)] // exposed for its integration test; not a stable API
+pub async fn requeue_workflow_task_after_event_id_conflict(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    worker_id: &str,
+    sticky_timeout: Duration,
+    exec_id: ExecutionId,
+) -> HarvestResult<()> {
+    let sticky = if sticky_timeout.is_zero() {
+        None
+    } else {
+        Some(queue::StickyHint::new(worker_id, sticky_timeout))
+    };
+    let _ = queue::park_workflow_task(conn, task.id, sticky).await?;
+    queue::wake_workflow_task(conn, exec_id).await?;
+    Ok(())
+}
+
 /// Run the wake-event ingest ([`ingest_due_timers_and_signals`]), converting a
 /// transient `(workflow_exec_id, event_id)` UNIQUE conflict into a re-drive of
 /// the parent workflow task rather than a terminal failure (issue #779).
@@ -21860,7 +21884,7 @@ async fn process_workflow_task(
                         // transaction rolled back, so re-drive, as the
                         // wake-event ingest does (issue #779). A fresh load
                         // reads past the other event.
-                        requeue_parent_on_transient_ingest_conflict(
+                        requeue_workflow_task_after_event_id_conflict(
                             conn,
                             task,
                             worker_id,

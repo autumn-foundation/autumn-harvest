@@ -28,7 +28,9 @@ because it needs PostgreSQL 17. A part of a millisecond rounds up, and `validate
 `i32::MAX` ms. `ShardedDbPool::from_dsns` builds `Maintenance` pools. The
 partition drain sets `SET LOCAL statement_timeout = 0` for its census and its
 move. A large DEFAULT census can need longer than a role limit, and a timeout
-in the move discards a finished pass.
+in the move discards a finished pass. Inside a caller's transaction the drain
+runs as a savepoint, and `RELEASE SAVEPOINT` keeps a `SET LOCAL`. So the drain
+restores the prior statement, lock and transaction limits before it returns.
 
 **Heartbeat flush.** Each flush has its own bounded acquire. The activity
 stamps each heartbeat when it sends it. A failed flush keeps its payload and
@@ -60,8 +62,9 @@ acquire of that session on the same worker defers until the read ends.
 **Local activity append conflict.** A local activity append that loses its
 `event_id` to a concurrent append now re-drives the workflow task. Before, it
 failed the run. Since #1787, a race loser that a freed permit admits appends
-`ActivityStarted` while the winner's workflow task runs. The re-drive is the
-one that the wake-event ingest uses (issue #779). This fixes
+`ActivityStarted` while the winner's workflow task runs. The re-drive parks the
+task as the wake-event ingest does (issue #779). It also clears the
+capability-miss evidence, because the handler lookup already succeeded. This fixes
 `race_resolved_by_activity_with_an_open_activity_loser_then_local_activity`,
 which failed on every run on `trunk-dev`.
 

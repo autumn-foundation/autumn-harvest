@@ -2114,6 +2114,114 @@ async fn a_session_acquire_defers_while_its_slot_is_rechecked() {
     drop(held);
 }
 
+/// A drain inside the caller's transaction gives the session limits back.
+/// Diesel runs a nested transaction as a savepoint. Releasing a savepoint
+/// keeps a `SET LOCAL`, so the drain must restore the limits itself.
+#[tokio::test]
+async fn a_nested_drain_restores_the_session_limits() {
+    #[derive(diesel::QueryableByName)]
+    struct Limits {
+        #[diesel(sql_type = Text)]
+        statement_ms: String,
+        #[diesel(sql_type = Text)]
+        lock_ms: String,
+    }
+
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let limits = Box::pin(
+        conn.transaction::<Limits, autumn_harvest::error::HarvestError, _>(async |conn| {
+            diesel::sql_query("SET LOCAL statement_timeout = '7s'")
+                .execute(conn)
+                .await?;
+            diesel::sql_query("SET LOCAL lock_timeout = '3s'")
+                .execute(conn)
+                .await?;
+            autumn_harvest::partition::drain_default(conn).await?;
+            Ok(diesel::sql_query(
+                "SELECT current_setting('statement_timeout') AS statement_ms, \
+                 current_setting('lock_timeout') AS lock_ms",
+            )
+            .get_result::<Limits>(conn)
+            .await?)
+        }),
+    )
+    .await
+    .expect("drain inside a transaction");
+    assert_eq!(limits.statement_ms, "7s");
+    assert_eq!(limits.lock_ms, "3s");
+}
+
+/// A re-drive after the handler lookup clears the capability-miss evidence.
+/// The lookup proved this worker capable. Stale evidence could end the
+/// redelivery budget early.
+#[tokio::test]
+async fn a_post_lookup_redrive_clears_capability_misses() {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = Text)]
+        state: String,
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        capability_misses: i32,
+    }
+
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let queue_name = format!("q-cm-{}", &Uuid::new_v4().simple().to_string()[..12]);
+    let exec_id = seed_execution(&mut conn, &queue_name).await;
+    let task_id = autumn_harvest::queue::enqueue(
+        &mut conn,
+        &autumn_harvest::queue::EnqueueParams::new(
+            &queue_name,
+            autumn_harvest::queue::TaskType::Workflow,
+            serde_json::json!({}),
+        ),
+    )
+    .await
+    .expect("enqueue");
+    register_live_worker(&mut conn, "w-1").await;
+    diesel::sql_query(
+        "UPDATE harvest_task_queue SET state = 'RUNNING', worker_id = 'w-1', attempt = 1, \
+         workflow_exec_id = $2, capability_misses = 2, \
+         capability_miss_workers = ARRAY['w-x', 'w-y'] WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("model the claim");
+    let task = {
+        use autumn_harvest::models::TaskQueueItem;
+        use autumn_harvest::schema::harvest_task_queue;
+        use diesel::{QueryDsl, SelectableHelper};
+        harvest_task_queue::table
+            .find(task_id)
+            .select(TaskQueueItem::as_select())
+            .first::<TaskQueueItem>(&mut conn)
+            .await
+            .expect("load the claim")
+    };
+
+    autumn_harvest::worker::requeue_workflow_task_after_event_id_conflict(
+        &mut conn,
+        &task,
+        "w-1",
+        Duration::ZERO,
+        exec_id,
+    )
+    .await
+    .expect("re-drive");
+
+    let row =
+        diesel::sql_query("SELECT state, capability_misses FROM harvest_task_queue WHERE id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(task_id)
+            .get_result::<Row>(&mut conn)
+            .await
+            .expect("read the row");
+    assert_eq!(row.state, "PENDING");
+    assert_eq!(row.capability_misses, 0);
+}
+
 /// Mark `worker_id` as a live worker. A test row `RUNNING` under an unknown
 /// worker is an orphan, and a reclaimer of a parallel suite would requeue it.
 /// The row has no queues and a shard that does not exist, so no other code
