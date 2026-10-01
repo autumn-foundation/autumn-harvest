@@ -1454,9 +1454,24 @@ async fn a_stale_result_write_does_not_reach_a_newer_claim() {
     for (case, result) in [
         ("completion", Ok(serde_json::json!({"done": true}))),
         ("retry", Err("transient failure".to_owned())),
+        ("deadline", Err("transient failure".to_owned())),
     ] {
-        let (exec_id, activity_id, stale) = seed_claimed_activity(&mut conn, "q-sr").await;
+        let (exec_id, activity_id, mut stale) = seed_claimed_activity(&mut conn, "q-sr").await;
         let task_id = stale.id;
+        if case == "deadline" {
+            // The 1 s retry delay crosses this deadline, so the write takes
+            // the schedule-to-close timeout branch.
+            let deadline = Utc::now() + chrono::Duration::milliseconds(500);
+            stale.schedule_to_close_at = Some(deadline);
+            diesel::sql_query(
+                "UPDATE harvest_task_queue SET schedule_to_close_at = $2 WHERE id = $1",
+            )
+            .bind::<diesel::sql_types::Uuid, _>(task_id)
+            .bind::<diesel::sql_types::Timestamptz, _>(deadline)
+            .execute(&mut conn)
+            .await
+            .expect("set the deadline");
+        }
 
         // Another worker reclaims the task.
         diesel::sql_query(

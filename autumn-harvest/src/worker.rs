@@ -14533,23 +14533,46 @@ fn schedule_to_close_recheck_outcome(
     None
 }
 
+/// A task row's state, `schedule_to_close_at`, `worker_id` and `attempt`.
+type ClaimDeadlineRow = (
+    String,
+    Option<chrono::DateTime<chrono::Utc>>,
+    Option<String>,
+    i32,
+);
+
 /// Locked (`FOR UPDATE`) read of a task row's current state and
 /// `schedule_to_close_at`, so the retry path's deadline decision is made
 /// against the row-current value rather than the claim-time snapshot.
+///
+/// Returns `None` when another claim owns the row: a different `worker_id` or
+/// `attempt` (issue #1788). A late write, for example a retried one, then
+/// cannot time out a newer attempt. A task with no claim worker checks the
+/// row only.
 async fn task_state_and_deadline_for_update(
     conn: &mut AsyncPgConnection,
-    task_id: uuid::Uuid,
+    task: &TaskQueueItem,
 ) -> HarvestResult<Option<(String, Option<chrono::DateTime<chrono::Utc>>)>> {
     use crate::schema::harvest_task_queue::dsl;
 
-    dsl::harvest_task_queue
-        .find(task_id)
+    let row: Option<ClaimDeadlineRow> = dsl::harvest_task_queue
+        .find(task.id)
         .for_update()
-        .select((dsl::state, dsl::schedule_to_close_at))
+        .select((
+            dsl::state,
+            dsl::schedule_to_close_at,
+            dsl::worker_id,
+            dsl::attempt,
+        ))
         .first(conn)
         .await
         .optional()
-        .map_err(crate::error::database_error)
+        .map_err(crate::error::database_error)?;
+    Ok(row.and_then(|(state, deadline, worker_id, attempt)| {
+        let ours =
+            task.worker_id.is_none() || (worker_id == task.worker_id && attempt == task.attempt);
+        ours.then_some((state, deadline))
+    }))
 }
 
 /// Append `ActivityTimedOut { ScheduleToClose }` and fail the task row.
@@ -14606,7 +14629,7 @@ async fn record_schedule_to_close_activity_timeout(
             let error = error.clone();
             let (execution, history) =
                 lock_workflow_execution_row_and_load_history(conn, exec_id, codecs).await?;
-            let task_row = task_state_and_deadline_for_update(conn, task.id).await?;
+            let task_row = task_state_and_deadline_for_update(conn, task).await?;
             // Authoritative re-check under the execution row lock: bail
             // without mutation when the task was concurrently resolved, the
             // owning execution was paused after the caller's non-locking
