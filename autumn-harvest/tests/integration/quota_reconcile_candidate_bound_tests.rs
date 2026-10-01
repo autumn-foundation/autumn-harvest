@@ -292,3 +292,25 @@ async fn merged_batches_keep_global_id_order_across_registered_types() {
     assert_eq!(quota_key_of(&mut conn, 25).await, None, "unregistered row");
     assert_eq!(quota_key_of(&mut conn, 85).await, None, "unregistered row");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn nil_uuid_row_is_a_candidate_on_the_first_page() {
+    let Some(bench) = bench_db_or_skip().await else {
+        return;
+    };
+    let _guard = MetadataGuard::install(&["bound_nil"]).await;
+    let mut conn = db::connect(&bench.url).await;
+    diesel::sql_query("TRUNCATE harvest_workflow_executions CASCADE")
+        .execute(&mut conn)
+        .await
+        .expect("truncate");
+    let input = serde_json::json!({"tenant_id": "t"});
+    insert_row(&mut conn, 0, "bound_nil", "RUNNING", &input).await;
+    insert_row(&mut conn, 1, "bound_nil", "RUNNING", &input).await;
+
+    let (summary, _) = reconcile_quota_keys_from(&mut conn, 5, None, Some(ShardId::new(0)))
+        .await
+        .expect("tick");
+    assert_eq!(summary.backfilled, 2, "the nil-id row is not skipped");
+    assert_eq!(quota_key_of(&mut conn, 0).await.as_deref(), Some("t"));
+}

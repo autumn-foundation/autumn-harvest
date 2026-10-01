@@ -303,12 +303,13 @@ struct CandidateRow {
 /// therefore takes effect on the next tick. See this module's doc comment
 /// for when a given row becomes visible.
 ///
-/// `AND id > COALESCE($2, <nil uuid>) ORDER BY id LIMIT $3` is a keyset
-/// cursor, not a bare `LIMIT`. The `COALESCE` form keeps the cursor an
-/// index condition in a generic plan. An `IS NULL OR` form would become a
-/// filter, and each tick would re-walk the rows below the cursor. A row
-/// whose id is the nil UUID is never a candidate. Generated ids never
-/// take that value. A row this sweep can never resolve --
+/// `AND id >= COALESCE($2, <nil uuid>) AND ($2 IS NULL OR id > $2) ORDER BY
+/// id LIMIT $3` is a keyset cursor, not a bare `LIMIT`. The `>=` bound keeps
+/// the cursor an index condition in a generic plan. An `IS NULL OR` form
+/// alone would become a filter, and each tick would re-walk the rows below
+/// the cursor. The second clause makes the cursor strict. It also keeps a
+/// row with the nil UUID id in the first page. A row this sweep can never
+/// resolve --
 /// [`ReconcileOutcome::Unresolvable`] or [`ReconcileOutcome::OverCap`] --
 /// never leaves the index. A bare `LIMIT` with no stable order could
 /// therefore return the SAME stuck rows every tick, starving every
@@ -328,7 +329,8 @@ const CANDIDATE_SQL: &str = "\
         FROM harvest_workflow_executions e \
         WHERE e.workflow_name = n.name \
           AND e.quota_key IS NULL AND e.state IN ('RUNNING', 'PAUSED') \
-          AND e.id > COALESCE($2::uuid, '00000000-0000-0000-0000-000000000000') \
+          AND e.id >= COALESCE($2::uuid, '00000000-0000-0000-0000-000000000000') \
+          AND ($2::uuid IS NULL OR e.id > $2) \
         ORDER BY e.id \
         LIMIT $3 \
     ) c \
