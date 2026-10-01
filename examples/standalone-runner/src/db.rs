@@ -61,10 +61,7 @@ async fn connect(database_url: &str) -> Result<AsyncPgConnection, ConnectionErro
     }
     // `tokio-postgres` parses only `require`. The `verify-*` modes get the
     // same verified connector, so the rewrite drops no check.
-    let dsn = database_url
-        .replace("sslmode=verify-full", "sslmode=require")
-        .replace("sslmode=verify-ca", "sslmode=require");
-    let config: tokio_postgres::Config = dsn.parse().map_err(|error: tokio_postgres::Error| {
+    let config: tokio_postgres::Config = tls_dsn(database_url).parse().map_err(|error: tokio_postgres::Error| {
         ConnectionError::BadConnection(error.to_string())
     })?;
     let tls = tokio_postgres_rustls::MakeRustlsConnect::new(tls_config()?);
@@ -77,12 +74,133 @@ async fn connect(database_url: &str) -> Result<AsyncPgConnection, ConnectionErro
 
 /// True when `database_url` asks for TLS.
 ///
-/// It reads the `sslmode` option of a URL or of a keyword/value string.
+/// It reads `sslmode` with the libpq grammar, in a URL or in a keyword/value
+/// string. Names and values are case-insensitive, and URL parts may be
+/// percent-encoded.
 pub fn wants_tls(database_url: &str) -> bool {
-    database_url
-        .split(['?', '&', ' '])
-        .filter_map(|option| option.trim().strip_prefix("sslmode="))
-        .any(|mode| TLS_MODES.contains(&mode))
+    Dsn::parse(database_url)
+        .and_then(|dsn| dsn.sslmode())
+        .is_some_and(|mode| TLS_MODES.contains(&mode.as_str()))
+}
+
+/// `database_url` with `sslmode=require`, the one TLS mode
+/// `tokio-postgres` parses.
+fn tls_dsn(database_url: &str) -> String {
+    Dsn::parse(database_url).map_or_else(|| database_url.to_owned(), |dsn| dsn.with_require())
+}
+
+/// The options of a connection string.
+enum Dsn<'a> {
+    /// `postgres://…?query`. Each pair keeps its raw text.
+    Url {
+        base: &'a str,
+        pairs: Vec<(&'a str, String, String)>,
+    },
+    /// `key=value key='value' …`, decoded.
+    Keywords(Vec<(String, String)>),
+}
+
+impl<'a> Dsn<'a> {
+    fn parse(dsn: &'a str) -> Option<Self> {
+        let lower = dsn.trim_start().to_ascii_lowercase();
+        if !(lower.starts_with("postgres://") || lower.starts_with("postgresql://")) {
+            return parse_keywords(dsn).map(Self::Keywords);
+        }
+        let (base, query) = dsn.split_once('?').unwrap_or((dsn, ""));
+        let decode = |text: &str| percent_encoding::percent_decode_str(text).decode_utf8_lossy().into_owned();
+        let pairs = query
+            .split('&')
+            .filter(|raw| !raw.is_empty())
+            .map(|raw| {
+                let (key, value) = raw.split_once('=').unwrap_or((raw, ""));
+                (raw, decode(key), decode(value))
+            })
+            .collect();
+        Some(Self::Url { base, pairs })
+    }
+
+    /// The last `sslmode` value, in lowercase.
+    fn sslmode(&self) -> Option<String> {
+        let mut options: Box<dyn DoubleEndedIterator<Item = (&str, &str)>> = match self {
+            Self::Url { pairs, .. } => Box::new(pairs.iter().map(|(_, k, v)| (k.as_str(), v.as_str()))),
+            Self::Keywords(pairs) => Box::new(pairs.iter().map(|(k, v)| (k.as_str(), v.as_str()))),
+        };
+        options
+            .rfind(|(key, _)| key.eq_ignore_ascii_case("sslmode"))
+            .map(|(_, value)| value.trim().to_ascii_lowercase())
+    }
+
+    /// The DSN again, with every `sslmode` set to `require`.
+    fn with_require(&self) -> String {
+        match self {
+            Self::Url { base, pairs } => {
+                let query: Vec<&str> = pairs
+                    .iter()
+                    .map(|(raw, key, _)| {
+                        if key.eq_ignore_ascii_case("sslmode") {
+                            "sslmode=require"
+                        } else {
+                            raw
+                        }
+                    })
+                    .collect();
+                format!("{base}?{}", query.join("&"))
+            }
+            Self::Keywords(pairs) => pairs
+                .iter()
+                .map(|(key, value)| {
+                    if key.eq_ignore_ascii_case("sslmode") {
+                        "sslmode='require'".to_owned()
+                    } else {
+                        let quoted = value.replace('\\', "\\\\").replace('\'', "\\'");
+                        format!("{key}='{quoted}'")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+        }
+    }
+}
+
+/// Parse a libpq keyword/value string. `None` when it is malformed.
+///
+/// A value is a bare word or a single-quoted string. A backslash escapes the
+/// next character in both forms. Space may surround the `=`.
+fn parse_keywords(dsn: &str) -> Option<Vec<(String, String)>> {
+    let mut chars = dsn.chars().peekable();
+    let mut pairs = Vec::new();
+    loop {
+        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+        if chars.peek().is_none() {
+            return Some(pairs);
+        }
+        let mut key = String::new();
+        while let Some(c) = chars.next_if(|c| !c.is_whitespace() && *c != '=') {
+            key.push(c);
+        }
+        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+        chars.next_if_eq(&'=')?;
+        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+        let mut value = String::new();
+        if chars.next_if_eq(&'\'').is_some() {
+            loop {
+                match chars.next()? {
+                    '\\' => value.push(chars.next()?),
+                    '\'' => break,
+                    c => value.push(c),
+                }
+            }
+        } else {
+            while let Some(c) = chars.next_if(|c| !c.is_whitespace()) {
+                if c == '\\' {
+                    value.push(chars.next()?);
+                } else {
+                    value.push(c);
+                }
+            }
+        }
+        pairs.push((key, value));
+    }
 }
 
 /// The rustls client config, built once. It trusts the platform store.
@@ -110,7 +228,38 @@ fn tls_config() -> Result<rustls::ClientConfig, ConnectionError> {
 
 #[cfg(test)]
 mod tests {
-    use super::wants_tls;
+    use super::{tls_dsn, wants_tls};
+
+    #[test]
+    fn sslmode_is_read_with_the_dsn_grammar() {
+        for url in [
+            "host=db sslmode = require",
+            "host=db sslmode='verify-full' user=u",
+            "postgres://u@h/db?SSLMODE=Require",
+            "postgres://u@h/db?ssl%6Dode=require",
+            "postgresql://u@h/db?sslmode=verify%2Dfull",
+        ] {
+            assert!(wants_tls(url), "{url}");
+        }
+        for url in [
+            "host=db application_name='sslmode=require'",
+            "postgres://u@h/db?application_name=sslmode%3Drequire",
+        ] {
+            assert!(!wants_tls(url), "{url}");
+        }
+    }
+
+    #[test]
+    fn tls_dsn_sets_require_and_keeps_the_other_options() {
+        assert_eq!(
+            tls_dsn("postgres://u@h/db?a=1&SSLMODE=verify-full&b=x%20y"),
+            "postgres://u@h/db?a=1&sslmode=require&b=x%20y"
+        );
+        assert_eq!(
+            tls_dsn(r"host=h sslmode = verify-ca password='it\'s a \\ b'"),
+            r"host='h' sslmode='require' password='it\'s a \\ b'"
+        );
+    }
 
     #[test]
     fn tls_follows_sslmode_in_both_dsn_forms() {

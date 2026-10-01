@@ -14,6 +14,7 @@ deadpool = { workspace = true, features = ["rt_tokio_1"] }
 diesel = { workspace = true }
 diesel-async = { workspace = true }
 futures = { workspace = true }
+percent-encoding = "2"
 # TLS for `sslmode=require` and `verify-*` (see `src/db.rs`). All are in the
 # lockfile already, through the CLI and the core `tls` feature.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
