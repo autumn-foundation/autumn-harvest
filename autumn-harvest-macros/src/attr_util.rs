@@ -348,6 +348,43 @@ mod build_handler_dispatch_tests {
     fn many_params_survive_a_parameter_named_args() {
         let out = dispatch(&["args", "b"], &quote! { ctx }, &quote! {});
         assert!(out.contains("(__args [1] . clone ())"), "{out}");
+        assert_eq!(out.matches("input").count(), 1, "{out}");
+    }
+
+    /// The index must advance for every parameter, not repeat or skip.
+    #[test]
+    fn three_params_use_indices_zero_to_two() {
+        let out = dispatch(&["a", "b", "c"], &quote! { ctx }, &quote! {});
+        for i in 0..3 {
+            assert!(out.contains(&format!("(__args [{i}] . clone ())")), "{out}");
+        }
+        assert!(out.contains("handler (ctx , a , b , c)"), "{out}");
+    }
+
+    #[test]
+    fn a_single_param_named_like_the_input_binding_decodes_first() {
+        let out = dispatch(&["input"], &quote! { ctx }, &quote! {});
+        assert!(
+            out.starts_with("let input = :: autumn_harvest :: serde_json :: from_value (input)"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn no_await_tokens_emit_no_await() {
+        let out = dispatch(&["a", "b"], &quote! { ctx }, &quote! {});
+        assert!(!out.contains("await"), "{out}");
+    }
+
+    #[test]
+    fn every_arity_ends_with_the_json_encoding_tail() {
+        for names in [&[][..], &["a"][..], &["a", "b"][..]] {
+            let out = dispatch(names, &quote! { ctx }, &quote! {});
+            assert!(
+                out.ends_with("and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })"),
+                "{out}"
+            );
+        }
     }
 
     #[test]
