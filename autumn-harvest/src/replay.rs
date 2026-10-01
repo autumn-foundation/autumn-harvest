@@ -2007,10 +2007,11 @@ impl HistoryMatcher {
     /// Returns `true` for the command events that the end-of-cycle drift
     /// check counts (issue #1791).
     ///
-    /// Only a workflow command writes these events. A deterministic replay
-    /// re-issues every recorded command, so it consumes each of them.
-    /// Signals, results and lifecycle events come from outside the workflow
-    /// code and are not in this set.
+    /// Each event anchors a workflow call that replay re-issues at the same
+    /// position. Most are written from a workflow command. `MutexGranted` is
+    /// written when a parked `acquire()` gets its lock. A deterministic replay
+    /// consumes each of them. Signals, results and lifecycle events come from
+    /// outside the workflow code and are not in this set.
     const fn is_command_event(event: &WorkflowEvent) -> bool {
         matches!(
             event,
@@ -2025,6 +2026,8 @@ impl HistoryMatcher {
                 | WorkflowEvent::ExternalSignalRequested { .. }
                 | WorkflowEvent::ExternalCancelRequested { .. }
                 | WorkflowEvent::ExternalAwaitRequested { .. }
+                | WorkflowEvent::ActivityAwaitingExternal { .. }
+                | WorkflowEvent::MutexGranted { .. }
         )
     }
 
@@ -2074,6 +2077,10 @@ impl HistoryMatcher {
             WorkflowEvent::ChildWorkflowSpawnedDetached { workflow_name, .. } => {
                 format!("ChildWorkflowSpawnedDetached({workflow_name})")
             }
+            WorkflowEvent::ActivityAwaitingExternal { name, .. } => {
+                format!("ActivityAwaitingExternal({name})")
+            }
+            WorkflowEvent::MutexGranted { key, .. } => format!("MutexGranted({key})"),
             other => Self::actual_event_name(other),
         }
     }
@@ -13829,6 +13836,40 @@ mod tests {
             m.first_unconsumed_command_event(),
             Some((0, "TimerStarted(t)".to_string()))
         );
+    }
+
+    #[test]
+    fn first_unconsumed_command_event_reports_an_external_activity_and_a_mutex_grant() {
+        // Both events anchor a replayed call: `execute_activity_external()`
+        // and `mutex(key).acquire()`. A dropped call leaves them unconsumed.
+        let external = WorkflowEvent::ActivityAwaitingExternal {
+            activity_id: ActivityExecId::new(),
+            token: crate::types::ExternalActivityToken::new(),
+            name: "approve".into(),
+            input: Value::Null,
+            queue: "default".into(),
+            schedule_to_close_secs: 60,
+        };
+        let grant = WorkflowEvent::MutexGranted {
+            key: "account-1".into(),
+            lock_seq: 1,
+            acquired_at: Utc::now(),
+        };
+        let m = HistoryMatcher::new(vec![external]);
+        assert_eq!(
+            m.first_unconsumed_command_event(),
+            Some((0, "ActivityAwaitingExternal(approve)".to_string()))
+        );
+        let mut m = HistoryMatcher::new(vec![grant]);
+        assert_eq!(
+            m.first_unconsumed_command_event(),
+            Some((0, "MutexGranted(account-1)".to_string()))
+        );
+        assert!(matches!(
+            m.match_mutex_granted("account-1"),
+            MutexGrantMatch::Granted { .. }
+        ));
+        assert_eq!(m.first_unconsumed_command_event(), None);
     }
 
     #[test]

@@ -15,15 +15,15 @@ A deploy that removed a recorded command was not caught:
 `non_deterministic_details`, so the #603 gate ND-blocks the run. The run stays
 `RUNNING`, appends no event from the cycle, and resumes after a rollback.
 
-The check counts only events that a workflow command writes:
+The check counts only events that anchor a replayed workflow call:
 `ActivityScheduled`, `LocalActivityScheduled`, `TimerStarted`,
 `TimerCancelled`, `ChildWorkflowStarted`, `ChildWorkflowSpawnedDetached`,
-`MarkerRecorded`, `SideEffectRecorded` and the three `External*Requested`
-events. A live history can hold a signal or a result, such as
-`ActivityCompleted`, that the code has not awaited yet. Those events are not
-drift, so the check ignores them. The strict check
-(`history_has_unconsumed_events`) counts them, so the worker path does not
-reuse it.
+`MarkerRecorded`, `SideEffectRecorded`, the three `External*Requested`
+events, `ActivityAwaitingExternal` and `MutexGranted`. A live history can hold
+a signal or a result, such as `ActivityCompleted`, that the code has not
+awaited yet. Those events are not drift, so the check ignores them. The
+strict check (`history_has_unconsumed_events`) counts them, so the worker
+path does not reuse it.
 
 Strict replay and the deploy canary already report every case that the new
 check flags. The author `Err` arm is not checked, as on the strict path. A
