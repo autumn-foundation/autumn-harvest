@@ -52,313 +52,6 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use uuid::Uuid;
 
-/// The migration SQL embedded at compile time.
-///
-/// Combines the initial schema with every forward-compatible schema-addition
-/// migration that ships in `migrations/`. The
-/// `20260410010000_harvest_workflow_start_uniqueness` migration is
-/// deliberately excluded because one test (see
-/// `legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts`)
-/// applies it on a legacy schema to verify the upgrade path.
-const INIT_SQL: &str = concat!(
-    include_str!("../../migrations/20260409000000_harvest_initial/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260619000000_harvest_task_queue_created_at/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260424000001_harvest_trace_context/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260505000000_harvest_heartbeat_details/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260427000000_harvest_continue_as_new/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260429000000_harvest_concurrency_key/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260430000000_harvest_workflow_schedules/up.sql"),
-    "\n",
-    // Unified DAG schedule rows carry both dag_name and workflow_name, so the
-    // strict XOR kind_check from the migration above must be relaxed to an OR.
-    include_str!("../../migrations/20260514010000_unified_dag_schedule_kind/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260430000001_harvest_external_tasks/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260508000000_harvest_external_task_updated_at/up.sql"),
-    "\n",
-    // Reset (#148/#538) refines the active-uniqueness index to exclude
-    // TERMINATED rows; placed after continue_as_new (creates the index) and
-    // after external_tasks (whose state_check it recreates), and before the
-    // pause migration so the later PAUSED-inclusive state_check wins.
-    include_str!("../../migrations/20260503000000_harvest_workflow_reset/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260506000000_harvest_audit_log/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260501000000_harvest_workers/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260508010000_harvest_workers_drain_deadline/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260509000000_harvest_build_routing/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260513000000_harvest_schedule_pause_metadata/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260514020000_harvest_task_activity_id/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260518000000_harvest_signal_idempotency/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260517000000_harvest_schedule_jitter/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260517000001_harvest_schedule_overlap_policy/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260613000000_harvest_workflow_sla/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260519000000_harvest_calendar_awareness/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260522000000_harvest_schedule_decisions/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260522000001_harvest_rate_limiting/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260526000001_harvest_parent_close_policy/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260530000000_harvest_schedule_ha_claim/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260601000000_harvest_schedule_auto_pause/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260601000001_harvest_poison_pill_strikes/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260601000002_harvest_ownership_metadata/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260603000000_harvest_completion_triggers/up.sql"),
-    include_str!("../../migrations/20260708000001_harvest_completion_trigger_condition/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260605000000_harvest_admission_gates/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260606000001_harvest_activity_schedule_to_close/up.sql"),
-    include_str!("../../migrations/20260607000000_harvest_worker_capability_labels/up.sql"),
-    include_str!("../../migrations/20260607000001_harvest_task_required_capabilities/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260607000002_harvest_workflow_pause/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260609000001_harvest_workflow_current_details/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260610000001_harvest_schedule_bounded_runs/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260613000001_harvest_schedule_catchup_window/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260616000001_harvest_workflow_schedule_id/up.sql"),
-    "\n",
-    include_str!("../../migrations/20260615000001_harvest_context_headers/up.sql"),
-    "\n",
-    // issue #499: enforce_timeouts_once now scans harvest_debounce.
-    include_str!("../../migrations/20260618000001_harvest_debounce/up.sql"),
-    "\n",
-    // issue #518: event-batched starts persist pending admissions here.
-    include_str!("../../migrations/20260624000000_harvest_event_batches/up.sql"),
-    "\n",
-    // issue #523: workflow-level retry policy columns.
-    include_str!("../../migrations/20260626000001_harvest_workflow_retry/up.sql"),
-    "\n",
-    // issue #534: origin column + per-schedule run-history index.
-    include_str!("../../migrations/20260628000001_harvest_execution_origin/up.sql"),
-    include_str!("../../migrations/20260703000000_harvest_task_queue_wake_requested/up.sql"),
-    "\n",
-    // issue #604: target_build_id/ramp_percent columns on harvest_build_policies.
-    include_str!("../../migrations/20260704000001_harvest_build_policy_ramp/up.sql"),
-    include_str!("../../migrations/20260704000000_harvest_workflow_nd_block/up.sql"),
-    "\n",
-    // issue #605: harvest_completion_deliveries table + completion_callbacks
-    // column on harvest_workflow_executions.
-    include_str!("../../migrations/20260705000000_harvest_completion_deliveries/up.sql"),
-    "\n",
-    // issue #606: harvest_sessions table + session_id column on
-    // harvest_task_queue + max_concurrent_sessions/in_use_sessions on
-    // harvest_workers.
-    include_str!("../../migrations/20260706000000_harvest_worker_sessions/up.sql"),
-    include_str!("../../migrations/20260710000002_harvest_workflow_continue_chain/up.sql"),
-    "\n",
-    // issue #747: per-execution legal hold columns on harvest_workflow_executions.
-    include_str!("../../migrations/20260709000001_harvest_legal_hold/up.sql"),
-    "\n",
-    // issue #740: start_source/start_source_ref/started_by provenance columns on
-    // harvest_workflow_executions.
-    include_str!("../../migrations/20260712000000_harvest_execution_start_source/up.sql"),
-    "\n",
-    // issue #617: chain_execution_timeout/chain_deadline_at columns on
-    // harvest_workflow_executions.
-    include_str!("../../migrations/20260714000000_harvest_workflow_chain_timeout/up.sql"),
-    "\n",
-    // issue #619: harvest_queue_pauses. REQUIRED, not optional — `claim_task`'s
-    // pause anti-join references this table on every claim, so without it every
-    // claim in this suite (and in every suite that borrows
-    // `setup_test_database_url_or_env` from here) fails with
-    // `relation "harvest_queue_pauses" does not exist`.
-    include_str!("../../migrations/20260715000000_harvest_queue_pause/up.sql"),
-    "\n",
-    // issue #704: history_bloat_warned_at column on harvest_workflow_executions.
-    // REQUIRED, not optional — `WorkflowExecution::as_select()`/`as_returning()`
-    // reference this column on every full-row read/insert-returning, so without
-    // it every such call in this suite (and in every suite that borrows
-    // `setup_test_database_url_or_env` from here) fails with
-    // `column harvest_workflow_executions.history_bloat_warned_at does not exist`.
-    include_str!("../../migrations/20260716000000_harvest_workflow_history_bloat_warn/up.sql"),
-    "\n",
-    // issue #759: triage_note column on harvest_workflow_executions. REQUIRED,
-    // not optional — `WorkflowExecution::as_select()`/`as_returning()` reference
-    // this column on every full-row read/insert-returning, so without it every
-    // such call in this suite (and in every suite that borrows
-    // `setup_test_database_url_or_env` from here) fails with
-    // `column harvest_workflow_executions.triage_note does not exist`.
-    include_str!("../../migrations/20260717000000_harvest_workflow_triage_note/up.sql"),
-    "\n",
-    // issue #804: capability_misses column on harvest_task_queue. REQUIRED, not
-    // optional -- `TaskQueueItem` (which `claim_task`'s `RETURNING
-    // harvest_task_queue.*` deserializes into) references this column on every
-    // claim, so without it every claim in this suite (and in every suite that
-    // borrows `setup_test_database_url_or_env` from here) fails with
-    // `column "capability_misses" does not exist`.
-    include_str!("../../migrations/20260720000000_harvest_task_capability_misses/up.sql"),
-    "\n",
-    // issue #807: harvest_activity_pauses. REQUIRED, not optional -- the
-    // `paused_activities` MATERIALIZED CTE in `claim_task_query()` selects from
-    // this table on every claim, so without it every claim in this suite (and in
-    // every suite that borrows `setup_test_database_url_or_env` from here) fails
-    // with `relation "harvest_activity_pauses" does not exist`. The same
-    // migration also adds the partial `idx_harvest_tq_activity_pause` index on
-    // `harvest_task_queue`; that index is a performance aid rather than a
-    // correctness requirement, but it ships in the same file.
-    include_str!("../../migrations/20260722000000_harvest_activity_pause/up.sql"),
-    "\n",
-    // issue #843: idx_harvest_wfx_retry_of. Performance-only (CREATE INDEX,
-    // no column added, no correctness dependency), included for schema
-    // fidelity with the latest migration set.
-    include_str!("../../migrations/20260723000000_harvest_retry_chain_index/up.sql"),
-    "\n",
-    // issue #945: override_refill_rate/override_burst/override_expires_at
-    // columns on harvest_rate_limit_buckets. REQUIRED, not optional --
-    // `claim_task_query()`'s rate-limit token-availability expression
-    // references `b.override_expires_at`/`b.override_refill_rate`/
-    // `b.override_burst` unconditionally (Postgres resolves every column
-    // reference in a query at parse time, regardless of whether that branch
-    // is reached for a given row), so without these columns EVERY claim in
-    // this suite (and in every suite that borrows
-    // `setup_test_database_url_or_env` from here) fails with
-    // `column b.override_expires_at does not exist` -- even for tasks with
-    // no rate limit configured at all.
-    include_str!("../../migrations/20260724000000_harvest_pacing_overrides/up.sql"),
-    "\n",
-    // issue #946: quota_key column on harvest_workflow_executions, referenced
-    // by every WorkflowExecution::as_select() read-back in this suite (and in
-    // every suite that borrows `setup_test_database_url_or_env` from here).
-    include_str!("../../migrations/20260725000000_harvest_workflow_quotas/up.sql"),
-    "\n",
-    // Dependency of the shard-rebalancing migration below, which adds a column
-    // to `harvest_execution_summaries`. INIT_SQL is deliberately partial, so
-    // this table was never part of it before; without this line the rebalancing
-    // migration aborts mid-bundle with `relation "harvest_execution_summaries"
-    // does not exist`, leaving the execution columns added but
-    // `harvest_shard_migrations` never created.
-    include_str!("../../migrations/20260710000001_harvest_execution_summaries/up.sql"),
-    "\n",
-    // issue #964: migrated_to_shard/migrated_at/migrated_from_shards columns on
-    // harvest_workflow_executions, plus migrated_from_shards on
-    // harvest_execution_summaries. REQUIRED for the same reason as the quota
-    // migration above -- `WorkflowExecution::as_select()` names every column, so
-    // every read-back in this suite (and in every suite that borrows
-    // `setup_test_database_url_or_env` from here) fails with
-    // `column harvest_workflow_executions.migrated_to_shard does not exist`,
-    // including plain root starts that have nothing to do with rebalancing.
-    //
-    // This suite runs against a testcontainer built from INIT_SQL, NOT against
-    // a migrated database, so a local run with HARVEST_TEST_DATABASE_URL set
-    // cannot catch the omission -- that path skips INIT_SQL entirely.
-    include_str!("../../migrations/20260902131705_harvest_shard_rebalancing/up.sql"),
-    "\n",
-    // issue #1127: last_registered_at/baseline_set_at columns on
-    // harvest_rate_limit_buckets. REQUIRED for the same reason as the #945
-    // columns above -- `queue::ensure_rate_limit_bucket` references
-    // `last_registered_at` unconditionally, and it runs inside the SAME
-    // transaction as every dynamic-per-key activity enqueue, so without these
-    // columns that decision transaction rolls back and the workflow never
-    // progresses (a silent timeout, not an obvious error).
-    include_str!("../../migrations/20260902133132_harvest_rate_limit_bucket_gc/up.sql"),
-    "\n",
-    // issue #1227: next_attempt_at column on harvest_completion_trigger_outbox.
-    // REQUIRED for the same reason as the #945/#964/#1127 columns above --
-    // `enforce_completion_triggers_outbox`'s claim queries and
-    // `stamp_outbox_relay_backoff` reference `next_attempt_at` unconditionally,
-    // so without this column every outbox-relay test in this suite (and in
-    // every suite that borrows `setup_test_database_url_or_env` from here)
-    // fails with `column harvest_completion_trigger_outbox.next_attempt_at
-    // does not exist`, even for a row with no quota block or relay failure at
-    // all. A local run with `HARVEST_TEST_DATABASE_URL` set does not catch
-    // this gap -- that path migrates from the full `migrations/` directory,
-    // not from this deliberately partial bundle.
-    include_str!(
-        "../../migrations/20260906014820_harvest_completion_trigger_outbox_backoff/up.sql"
-    ),
-    // issue #1312: the fenced by-id claim reads the DR generation row, so this
-    // bundle carries the cross-region DR tables.
-    include_str!("../../migrations/20260726000000_harvest_shard_generation/up.sql"),
-    "\n",
-    // issue #1317: migrated_run_terminal_at column on
-    // harvest_workflow_executions. REQUIRED for the same reason as the
-    // #945/#964/#1127/#1227 columns above. `WorkflowExecution::as_select()`
-    // names every column, so every read-back in this suite (and in every
-    // suite that borrows `setup_test_database_url_or_env` from here) fails.
-    // The failure names `column
-    // harvest_workflow_executions.migrated_run_terminal_at does not exist`,
-    // even for a plain root start with nothing to do with shard
-    // rebalancing. This gap goes uncaught locally with
-    // `HARVEST_TEST_DATABASE_URL` set, since that path migrates from the
-    // full `migrations/` directory, not from this partial bundle.
-    include_str!("../../migrations/20260915231809_harvest_migrated_seal_terminal_at/up.sql"),
-    "\n",
-    // issue #1317 review (P1 follow-up): staging_vacated_state column on
-    // harvest_workflow_executions, required for the same reason as the
-    // migrated_run_terminal_at column above -- `WorkflowExecution::as_select()`
-    // names it unconditionally.
-    include_str!("../../migrations/20260916151612_harvest_staging_vacated_state/up.sql"),
-    "\n",
-    // issue #1596 review: staging_vacated_by column on
-    // harvest_workflow_executions, required for the same reason as the
-    // staging_vacated_state column above -- `WorkflowExecution::as_select()`
-    // names it unconditionally.
-    include_str!("../../migrations/20260920014641_harvest_staging_vacated_by/up.sql"),
-    "\n",
-    // Issue #1685 root cause: this migration was never added here when it
-    // landed. Every testcontainers-provisioned test database was missing
-    // `target_shard`/`target_workflow_name` on `harvest_completion_trigger_fires`.
-    // `completion_trigger.rs` inserts into that table unconditionally. That
-    // insert runs inside the same decision-cycle transaction that marks a
-    // source workflow COMPLETED. The missing column failed the insert with a
-    // Postgres "column does not exist" error, on every attempt. The failed
-    // insert rolled back the whole transaction, including the source's own
-    // completion. The task then retried the identical failure forever, so
-    // any test on this path hung until its outer wait timed out.
-    //
-    // A persistent, already-migrated `HARVEST_TEST_DATABASE_URL` database
-    // never showed this bug. It already carried the column, from being
-    // migrated over time. Only a throwaway testcontainers database,
-    // provisioned solely from this constant, was affected. See the
-    // CI-health report series under `docs/rnd/*-ci-health-semaphore-*.md`
-    // for the full investigation this closes.
-    include_str!("../../migrations/20260920215812_harvest_completion_trigger_fires_target/up.sql"),
-    "\n",
-    // issue #1402: timer_fires_at column on harvest_task_queue. REQUIRED, not
-    // optional. `queue::reschedule_task`'s changeset names this column
-    // unconditionally. The repend queries that clear it --
-    // `primary_repend_workflow_task_query`,
-    // `release_suspended_workflow_claim_query`, and the three backoff-retry
-    // requeue queries -- do too. Without it, every one of those writes fails
-    // with `column "timer_fires_at" of relation "harvest_task_queue" does
-    // not exist`. That failure takes the same silent-rollback,
-    // retried-forever, eventual-timeout shape as the #1685/#1596/#1317 gaps
-    // above. It is the same omission class, caught the same way. A local
-    // run with `HARVEST_TEST_DATABASE_URL` set does not catch this gap;
-    // that path migrates from the full `migrations/` directory, not from
-    // this deliberately partial bundle.
-    include_str!("../../migrations/20260921011505_harvest_task_queue_timer_fires_at/up.sql")
-);
-
 /// The minimal "legacy" migration set used by the upgrade-path regression
 /// test. Excludes both the workflow-start uniqueness upgrade *and* the
 /// continue-as-new migration so the test can drive the database through the
@@ -518,7 +211,7 @@ async fn setup_test_db() -> (AsyncPgConnection, Option<ContainerAsync<Postgres>>
     }
 
     let container = Postgres::default()
-        .with_init_sql(INIT_SQL.to_string().into_bytes())
+        .with_init_sql(autumn_harvest::test_init_sql().into_bytes())
         .with_tag("16")
         .start()
         .await
@@ -545,7 +238,7 @@ async fn setup_test_db() -> (AsyncPgConnection, Option<ContainerAsync<Postgres>>
 /// the database URL plus the live container handle.
 pub(crate) async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
     let container = Postgres::default()
-        .with_init_sql(INIT_SQL.to_string().into_bytes())
+        .with_init_sql(autumn_harvest::test_init_sql().into_bytes())
         .with_tag("16")
         .start()
         .await
@@ -597,9 +290,32 @@ async fn setup_blank_test_database_url() -> (String, ContainerAsync<Postgres>) {
     (database_url, container)
 }
 
+/// The shared database plus the `harvest_dag_runs` table.
+///
+/// The full migration bundle drops that table. The drop-migration tests seed
+/// legacy rows first, so they need the table back. Its definition comes from
+/// the initial migration, so it cannot drift.
+async fn setup_test_db_with_legacy_dag_runs()
+-> (AsyncPgConnection, Option<ContainerAsync<Postgres>>) {
+    let (mut conn, container) = setup_test_db().await;
+    let initial = include_str!("../../migrations/20260409000000_harvest_initial/up.sql");
+    let start = initial
+        .find("CREATE TABLE harvest_dag_runs (")
+        .expect("initial migration creates harvest_dag_runs");
+    let end = start
+        + initial[start..]
+            .find(");")
+            .expect("harvest_dag_runs definition ends with `);`")
+        + ");".len();
+    conn.batch_execute(&initial[start..end])
+        .await
+        .expect("recreate the legacy harvest_dag_runs table");
+    (conn, container)
+}
+
 #[tokio::test]
 async fn drop_dag_runs_migration_copies_legacy_rows_to_workflow_executions() {
-    let (mut conn, _container) = setup_test_db().await;
+    let (mut conn, _container) = setup_test_db_with_legacy_dag_runs().await;
     let legacy_run_id = Uuid::new_v4();
     let dag_name = "legacy_migrated_dag";
     let logical_date = chrono::DateTime::parse_from_rfc3339("2026-05-14T02:00:00Z")
@@ -653,7 +369,7 @@ async fn drop_dag_runs_migration_copies_legacy_rows_to_workflow_executions() {
 
 #[tokio::test]
 async fn drop_dag_runs_migration_does_not_turn_queued_runs_into_running_workflows() {
-    let (mut conn, _container) = setup_test_db().await;
+    let (mut conn, _container) = setup_test_db_with_legacy_dag_runs().await;
     let legacy_run_id = Uuid::new_v4();
     let dag_name = "legacy_queued_dag";
     let logical_date = chrono::DateTime::parse_from_rfc3339("2026-05-14T02:00:00Z")
@@ -709,7 +425,7 @@ async fn drop_dag_runs_migration_does_not_turn_queued_runs_into_running_workflow
 
 #[tokio::test]
 async fn drop_dag_runs_migration_preserves_subsecond_legacy_run_identities() {
-    let (mut conn, _container) = setup_test_db().await;
+    let (mut conn, _container) = setup_test_db_with_legacy_dag_runs().await;
     let dag_name = "legacy_subsecond_dag";
     let first_run_id = Uuid::new_v4();
     let second_run_id = Uuid::new_v4();
@@ -1403,7 +1119,7 @@ pub(crate) async fn wait_for_execution_state_with_timeout(
     expected_state: &str,
     timeout: Duration,
 ) -> WorkflowExecution {
-    tokio::time::timeout(timeout, async {
+    let waited = tokio::time::timeout(timeout, async {
         loop {
             let execution = load_execution_from_url(database_url, exec_id).await;
             if execution.state == expected_state {
@@ -1413,8 +1129,99 @@ pub(crate) async fn wait_for_execution_state_with_timeout(
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
+    .await;
+    if let Ok(execution) = waited {
+        return execution;
+    }
+    panic!(
+        "workflow should reach expected state within timeout: wanted {expected_state} \
+         within {timeout:?}\n{}",
+        describe_stuck_execution(database_url, exec_id).await
+    );
+}
+
+/// Describe an execution and its queued tasks for a timeout message.
+///
+/// A decision cycle that fails on every retry leaves a queued task with a
+/// recorded error. The state alone hides that error (issue #1693). A failed
+/// lookup returns its own error text, so it never hides the timeout.
+async fn describe_stuck_execution(database_url: &str, exec_id: ExecutionId) -> String {
+    #[derive(diesel::QueryableByName)]
+    struct TaskRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        state: String,
+        #[diesel(sql_type = diesel::sql_types::Int4)]
+        attempt: i32,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        scheduled_at: String,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        error: Option<String>,
+    }
+
+    let described = async {
+        let mut conn =
+            <AsyncPgConnection as diesel_async::AsyncConnection>::establish(database_url)
+                .await
+                .map_err(|e| e.to_string())?;
+        let execution_state = harvest_workflow_executions::table
+            .find(exec_id.as_uuid())
+            .select(harvest_workflow_executions::state)
+            .first::<String>(&mut conn)
+            .await
+            .map_err(|e| e.to_string())?;
+        let tasks = diesel::sql_query(
+            "SELECT state, attempt, scheduled_at::text AS scheduled_at, error \
+             FROM harvest_task_queue WHERE workflow_exec_id = $1 ORDER BY created_at",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .load::<TaskRow>(&mut conn)
+        .await
+        .map_err(|e| e.to_string())?;
+        let mut lines = vec![format!("execution state: {execution_state}")];
+        lines.extend(tasks.iter().map(|t| {
+            format!(
+                "harvest_task_queue: state {}, attempt {}, scheduled_at {}, task error: {}",
+                t.state,
+                t.attempt,
+                t.scheduled_at,
+                t.error.as_deref().unwrap_or("none")
+            )
+        }));
+        Ok::<String, String>(lines.join("\n"))
+    }
+    .await;
+    described.unwrap_or_else(|e| format!("could not describe the stuck execution: {e}"))
+}
+
+/// A timed-out wait names the stuck task and its last error (issue #1693).
+///
+/// A decision cycle that fails on every retry leaves the execution `RUNNING`
+/// with one queued task. The bare timeout hid the recorded error.
+#[tokio::test]
+#[should_panic(expected = "task error: simulated persist failure")]
+async fn wait_timeout_reports_the_stuck_task_error() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("connect to the test database");
+    let exec_id = insert_workflow_execution(&mut conn).await;
+    enqueue_started_workflow_task(&mut conn, exec_id, serde_json::json!({})).await;
+    diesel::sql_query(
+        "UPDATE harvest_task_queue SET error = 'simulated persist failure' \
+         WHERE workflow_exec_id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut conn)
     .await
-    .expect("workflow should reach expected state within timeout")
+    .expect("record a task error");
+
+    wait_for_execution_state_with_timeout(
+        &database_url,
+        exec_id,
+        "COMPLETED",
+        Duration::from_millis(300),
+    )
+    .await;
 }
 
 fn child_round_trip_registry() -> Arc<HandlerRegistry> {
@@ -12322,78 +12129,104 @@ async fn windowed_fan_out_peak_task_rows_bounded_by_window() {
     assert_eq!(markers, 1, "exactly one fan_out marker recorded");
 }
 
-/// Guard: `INIT_SQL` must create every `harvest_*` table the claim path
-/// references.
+/// Guard (issue #1693): the shared test database must match the migrations.
 ///
-/// [`INIT_SQL`] is a deliberately-partial, hand-maintained bundle (it omits the
-/// workflow-start-uniqueness migration on purpose), so it is one of the few
-/// fixtures allowed to skip [`autumn_harvest::full_migrations_sql`]. That makes
-/// it a standing drift hazard. `queue::claim_task` runs on essentially every
-/// test in this suite. It also runs in every suite that borrows
-/// `setup_test_database_url_or_env` from here (`chain_timeout_tests`,
-/// `child_timeout_tests`, `cross_type_continue_as_new_tests`, `ctx_info_tests`,
-/// `dag_execution_timeout_tests`, `rate_limit_key_tests`,
-/// `quota_enforcement_tests`, `workflow_retry_tests`). A migration that adds a
-/// table to the claim query, then forgets this bundle, breaks nine suites at
-/// once with `relation "..." does not exist`.
+/// A hand-kept migration list in the shared fixture lacked a migration. The
+/// completion transaction of the source then failed on every retry.
+/// `quota_enforcement_tests` timed out with no error.
 ///
-/// That is exactly what issue #619's `harvest_queue_pauses` anti-join did. It
-/// cost a full Docker-backed CI cycle (~13 min) to surface, yet it is decidable
-/// as a pure string comparison, so this pins it as a fast no-DB check instead.
-///
-/// The rule is mechanical: every `harvest_*` identifier named in the real
-/// `claim_task_query()` SQL must appear in `INIT_SQL`. Deriving the table set
-/// from the live query rather than a hardcoded list means a future claim-path
-/// table is caught automatically, with no second list to maintain.
-#[test]
-fn init_sql_creates_every_table_the_claim_path_references() {
-    // Both claim statements, not only the unfenced one. The fenced variant
-    // splices in `harvest_shard_generation`. No other query names that table.
-    // Scanning only the base query left that gap to a Docker-backed CI cycle
-    // (issue #1312).
-    let claim_sql = format!(
-        "{} {}",
-        autumn_harvest::queue::claim_task_query(),
-        autumn_harvest::queue::claim_task_query_fenced()
-    );
-    let claim_sql = claim_sql.as_str();
-
-    let mut tables: Vec<String> = Vec::new();
-    let bytes = claim_sql.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' {
-            let start = i;
-            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-                i += 1;
-            }
-            let word = &claim_sql[start..i];
-            if word.starts_with("harvest_") && !tables.contains(&word.to_string()) {
-                tables.push(word.to_string());
-            }
-        } else {
-            i += 1;
-        }
+/// This test builds a reference database by applying each `migrations/*/up.sql`
+/// file in order. That path does not use the generated bundle. The test
+/// compares the columns, types and nullability of both databases.
+#[tokio::test]
+async fn shared_test_database_schema_matches_full_migrations() {
+    #[derive(diesel::QueryableByName, Debug, PartialEq, Eq, PartialOrd, Ord)]
+    struct ColumnRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        table_name: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        column_name: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        data_type: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        is_nullable: String,
     }
 
-    assert!(
-        !tables.is_empty(),
-        "expected to find harvest_* identifiers in the claim queries; the token scan is broken"
-    );
+    const COLUMNS_SQL: &str = "SELECT table_name::text AS table_name, \
+         column_name::text AS column_name, data_type::text AS data_type, \
+         is_nullable::text AS is_nullable \
+         FROM information_schema.columns WHERE table_schema = 'public'";
 
-    let missing: Vec<&String> = tables
-        .iter()
-        .filter(|table| !INIT_SQL.contains(table.as_str()))
+    let (shared_url, _container) = setup_test_database_url().await;
+    let mut shared = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&shared_url)
+        .await
+        .expect("connect to the shared test database");
+    diesel::sql_query("CREATE DATABASE harvest_full_reference")
+        .execute(&mut shared)
+        .await
+        .expect("create the reference database");
+    let (server_url, _) = shared_url
+        .rsplit_once('/')
+        .expect("database url has a database name");
+    let mut reference = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&format!(
+        "{server_url}/harvest_full_reference"
+    ))
+    .await
+    .expect("connect to the reference database");
+    let migrations_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    let mut migration_names: Vec<String> = std::fs::read_dir(&migrations_dir)
+        .expect("read the migrations directory")
+        .map(|entry| entry.expect("read a migration entry"))
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    migration_names.sort();
+    for name in &migration_names {
+        let up_sql = std::fs::read_to_string(migrations_dir.join(name).join("up.sql"))
+            .unwrap_or_else(|e| panic!("read {name}/up.sql: {e}"));
+        reference
+            .batch_execute(&up_sql)
+            .await
+            .unwrap_or_else(|e| panic!("apply {name}: {e}"));
+    }
+    // The partitioned layout adds a suffix on top of the migrations.
+    let init_sql = autumn_harvest::test_init_sql();
+    reference
+        .batch_execute(&init_sql[autumn_harvest::full_migrations_sql().len()..])
+        .await
+        .expect("apply the layout suffix");
+
+    let shared_columns: std::collections::BTreeSet<ColumnRow> = diesel::sql_query(COLUMNS_SQL)
+        .load(&mut shared)
+        .await
+        .expect("read shared columns")
+        .into_iter()
+        .collect();
+    let full_columns: std::collections::BTreeSet<ColumnRow> = diesel::sql_query(COLUMNS_SQL)
+        .load(&mut reference)
+        .await
+        .expect("read reference columns")
+        .into_iter()
         .collect();
 
+    let describe = |rows: Vec<&ColumnRow>| -> Vec<String> {
+        rows.into_iter()
+            .take(20)
+            .map(|r| {
+                format!(
+                    "{}.{} ({}, nullable {})",
+                    r.table_name, r.column_name, r.data_type, r.is_nullable
+                )
+            })
+            .collect()
+    };
+    let missing = describe(full_columns.difference(&shared_columns).collect());
+    let extra = describe(shared_columns.difference(&full_columns).collect());
     assert!(
-        missing.is_empty(),
-        "INIT_SQL is missing table(s) the claim path references: {missing:?}\n\
-         Add the migration that creates them to the INIT_SQL concat! in this file. \
-         Without it every claim in this suite -- and in chain_timeout_tests, \
-         child_timeout_tests, cross_type_continue_as_new_tests, ctx_info_tests, \
-         dag_execution_timeout_tests, rate_limit_key_tests and \
-         workflow_retry_tests, which reuse setup_test_database_url_or_env from \
-         here -- fails with `relation \"...\" does not exist` (issues #619, #807)."
+        missing.is_empty() && extra.is_empty(),
+        "the shared test database differs from the full migration bundle.\n\
+         missing from the shared database (first 20): {missing:#?}\n\
+         only in the shared database (first 20): {extra:#?}\n\
+         Build the shared database from `autumn_harvest::test_init_sql()` (issue #1693)."
     );
 }
