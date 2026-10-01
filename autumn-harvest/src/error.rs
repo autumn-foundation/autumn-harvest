@@ -672,13 +672,14 @@ pub enum HarvestError {
         reason: String,
     },
 
-    /// A new workflow start was shed because its queue has an old backlog
-    /// (issue #1794).
+    /// Load shedding refused a new workflow start because its queue has an
+    /// old backlog (issue #1794).
     ///
     /// Only a fresh admission under
     /// [`GateMode::Check`](crate::admission_gate::GateMode::Check) can get it.
-    /// No execution, event or task row is written. The management API returns
-    /// `429 Too Many Requests` with a `Retry-After` header.
+    /// The refused start writes no execution, event or task row. The
+    /// management API returns `429 Too Many Requests` with a `Retry-After`
+    /// header.
     #[error(
         "load shed on queue '{queue}': oldest pending task is {oldest_pending_age_secs}s old; \
          retry after {retry_after_secs}s"

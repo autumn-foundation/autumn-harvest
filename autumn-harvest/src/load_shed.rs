@@ -18,7 +18,7 @@ pub const DEFAULT_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
 /// The shortest accepted time between two samples.
 pub const MIN_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 
-/// A state older than this many sample intervals is ignored.
+/// The gate ignores a state older than this many sample intervals.
 ///
 /// The gate then admits starts. It fails open, so a dead sampler cannot keep a
 /// queue shed.
@@ -175,8 +175,8 @@ impl LoadShedConfig {
 
     /// Set the sample interval.
     ///
-    /// A value below [`MIN_SAMPLE_INTERVAL`] is raised to it. Each sample runs
-    /// one query per shard pool.
+    /// The setter raises a value below [`MIN_SAMPLE_INTERVAL`] to that minimum.
+    /// Each sample runs one query per shard pool.
     #[must_use]
     pub fn with_sample_interval(mut self, interval: Duration) -> Self {
         self.sample_interval = interval.max(MIN_SAMPLE_INTERVAL);
@@ -202,10 +202,12 @@ impl LoadShedConfig {
         self.sample_interval
     }
 
-    /// The age after which a state is ignored.
+    /// The age after which the gate ignores a state.
     #[must_use]
     pub fn stale_after(&self) -> Duration {
-        self.sample_interval * STALE_AFTER_SAMPLES
+        self.sample_interval
+            .checked_mul(STALE_AFTER_SAMPLES)
+            .unwrap_or(Duration::MAX)
     }
 
     /// The policy for `queue`, if any.
@@ -259,7 +261,8 @@ struct Inner {
 /// The per-queue shed state of one process.
 ///
 /// The process-global [`crate::admission_gate::AdmissionGateCache`] owns one.
-/// Each replica samples the same database, so replicas reach the same state.
+/// Each replica samples the same database. A replica that starts during an
+/// incident admits starts until its own samples reach `trip_age`.
 #[derive(Debug, Default)]
 pub struct LoadShedder {
     inner: RwLock<Inner>,
@@ -291,24 +294,37 @@ impl LoadShedder {
 
     /// Record one sample for `queue` taken at `now`.
     ///
-    /// Returns the transition the sample caused, if any. A queue with no
-    /// policy is ignored.
+    /// Returns the transition the sample caused, if any. The shedder ignores a
+    /// queue with no policy.
+    ///
+    /// A stale shedding state counts as admitting, because the gate failed open.
+    /// The next sample must reach `trip_age` to shed again, and that is a new
+    /// trip. A sample below `trip_age` reports the clear that closes the trip.
     pub fn observe(&self, queue: &str, age_secs: f64, now: Instant) -> Option<ShedTransition> {
-        let mut inner = self.inner.write().unwrap_or_else(PoisonError::into_inner);
-        let policy = *inner.config.policy(queue)?;
-        let was_shedding = inner.states.get(queue).is_some_and(|s| s.shedding);
-        let shedding = policy.next_shedding(was_shedding, age_secs);
-        inner.states.insert(
-            queue.to_owned(),
-            QueueState {
-                shedding,
-                age_secs,
-                observed_at: now,
-            },
-        );
-        match (was_shedding, shedding) {
-            (false, true) => Some(ShedTransition::Tripped),
-            (true, false) => Some(ShedTransition::Cleared),
+        let (recorded, effective, shedding) = {
+            let mut inner = self.inner.write().unwrap_or_else(PoisonError::into_inner);
+            let policy = *inner.config.policy(queue)?;
+            let stale_after = inner.config.stale_after();
+            let prior = inner.states.get(queue).copied();
+            let recorded = prior.is_some_and(|p| p.shedding);
+            let effective = prior.is_some_and(|p| {
+                p.shedding && now.saturating_duration_since(p.observed_at) <= stale_after
+            });
+            let shedding = policy.next_shedding(effective, age_secs);
+            inner.states.insert(
+                queue.to_owned(),
+                QueueState {
+                    shedding,
+                    age_secs,
+                    observed_at: now,
+                },
+            );
+            drop(inner);
+            (recorded, effective, shedding)
+        };
+        match (recorded, effective, shedding) {
+            (_, false, true) => Some(ShedTransition::Tripped),
+            (true, _, false) => Some(ShedTransition::Cleared),
             _ => None,
         }
     }
@@ -319,10 +335,15 @@ impl LoadShedder {
     /// state older than [`LoadShedConfig::stale_after`].
     #[must_use]
     pub fn check(&self, queue: &str, now: Instant) -> Option<ShedDecision> {
-        let inner = self.inner.read().unwrap_or_else(PoisonError::into_inner);
-        let policy = inner.config.policy(queue)?;
-        let state = inner.states.get(queue)?;
-        let fresh = now.saturating_duration_since(state.observed_at) <= inner.config.stale_after();
+        let (policy, state, stale_after) = {
+            let inner = self.inner.read().unwrap_or_else(PoisonError::into_inner);
+            let policy = *inner.config.policy(queue)?;
+            let state = *inner.states.get(queue)?;
+            let stale_after = inner.config.stale_after();
+            drop(inner);
+            (policy, state, stale_after)
+        };
+        let fresh = now.saturating_duration_since(state.observed_at) <= stale_after;
         (state.shedding && fresh).then(|| ShedDecision {
             queue: queue.to_owned(),
             oldest_pending_age_secs: whole_secs(state.age_secs),
@@ -340,7 +361,8 @@ impl LoadShedder {
 /// has age 0. Each trip or clear writes one audit row to `audit_pool`.
 ///
 /// Returns `false` when a pool read fails. No state changes then, so a partial
-/// read cannot clear a shedding queue.
+/// read cannot clear a shedding queue. The active gauge is still written, so
+/// it shows 0 once a stale state fails open.
 #[cfg(feature = "db")]
 pub async fn sample_once(
     shedder: &LoadShedder,
@@ -354,43 +376,81 @@ pub async fn sample_once(
         return true;
     }
     let queues = config.queues();
-    let mut ages: HashMap<String, f64> = HashMap::new();
-    for pool in pools {
-        let mut conn = match pool.get().await {
-            Ok(conn) => conn,
-            Err(error) => {
-                tracing::warn!(error = %error, "load shed sample could not get a connection");
-                return false;
-            }
-        };
-        match crate::queue::oldest_pending_ages(&mut conn, &queues, circuit_breaker_activities)
-            .await
-        {
-            Ok(rows) => {
-                for (queue, age_secs) in rows {
-                    let slot = ages.entry(queue).or_insert(0.0);
-                    *slot = slot.max(age_secs);
-                }
-            }
-            Err(error) => {
-                tracing::warn!(error = %error, "load shed sample query failed");
-                return false;
-            }
-        }
-    }
+    let Some(ages) = read_ages(pools, &queues, circuit_breaker_activities).await else {
+        record_active(shedder, &queues, metrics, Instant::now());
+        return false;
+    };
 
     let now = Instant::now();
     for queue in &queues {
         let age_secs = ages.get(queue).copied().unwrap_or(0.0);
-        let transition = shedder.observe(queue, age_secs, now);
-        if let Some(m) = metrics {
-            m.record_load_shed_active(queue, shedder.check(queue, now).is_some());
-        }
-        if let Some(transition) = transition {
+        if let Some(transition) = shedder.observe(queue, age_secs, now) {
             record_transition(audit_pool, queue, transition, age_secs).await;
         }
     }
+    record_active(shedder, &queues, metrics, now);
     true
+}
+
+/// Read the maximum oldest-pending age per queue across `pools`.
+///
+/// The pools are read concurrently, so one slow shard sets the sample time.
+/// Returns `None` when any pool read fails.
+#[cfg(feature = "db")]
+async fn read_ages(
+    pools: &[crate::worker::DbPool],
+    queues: &[String],
+    circuit_breaker_activities: &[String],
+) -> Option<HashMap<String, f64>> {
+    let reads = pools
+        .iter()
+        .map(|pool| read_pool_ages(pool, queues, circuit_breaker_activities));
+    let mut ages: HashMap<String, f64> = HashMap::new();
+    for rows in futures::future::join_all(reads).await {
+        for (queue, age_secs) in rows? {
+            let slot = ages.entry(queue).or_insert(0.0);
+            *slot = slot.max(age_secs);
+        }
+    }
+    Some(ages)
+}
+
+/// Read the oldest-pending age per queue on one pool.
+#[cfg(feature = "db")]
+async fn read_pool_ages(
+    pool: &crate::worker::DbPool,
+    queues: &[String],
+    circuit_breaker_activities: &[String],
+) -> Option<Vec<(String, f64)>> {
+    let mut conn = match pool.get().await {
+        Ok(conn) => conn,
+        Err(error) => {
+            tracing::warn!(error = %error, "load shed sample could not get a connection");
+            return None;
+        }
+    };
+    match crate::queue::oldest_pending_ages(&mut conn, queues, circuit_breaker_activities).await {
+        Ok(rows) => Some(rows),
+        Err(error) => {
+            tracing::warn!(error = %error, "load shed sample query failed");
+            None
+        }
+    }
+}
+
+/// Write the active gauge for every configured queue.
+#[cfg(feature = "db")]
+fn record_active(
+    shedder: &LoadShedder,
+    queues: &[String],
+    metrics: Option<&dyn crate::telemetry::MetricsRecorder>,
+    now: Instant,
+) {
+    if let Some(m) = metrics {
+        for queue in queues {
+            m.record_load_shed_active(queue, shedder.check(queue, now).is_some());
+        }
+    }
 }
 
 /// Log one transition and write its audit row.
@@ -452,7 +512,7 @@ const AUDIT_ROUTE: &str = "background.load_shed_sampler";
 
 /// `age_secs` as whole seconds, rounded down. Negative and NaN become 0.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn whole_secs(age_secs: f64) -> u64 {
+const fn whole_secs(age_secs: f64) -> u64 {
     // The `as` cast saturates, and NaN becomes 0.
     age_secs.max(0.0) as u64
 }
@@ -577,6 +637,43 @@ mod tests {
             None,
             "past the bound it admits"
         );
+    }
+
+    #[test]
+    fn stale_shedding_state_needs_a_new_trip() {
+        let s = shedder();
+        let t0 = Instant::now();
+        s.observe("q", 61.0, t0);
+        let late = t0 + s.config().stale_after() + Duration::from_secs(1);
+        // Inside the band after a stale gap: the gate stays open and closes the trip.
+        assert_eq!(s.observe("q", 30.0, late), Some(ShedTransition::Cleared));
+        assert_eq!(s.check("q", late), None);
+        // A later trip is a new trip.
+        assert_eq!(s.observe("q", 61.0, late), Some(ShedTransition::Tripped));
+    }
+
+    #[test]
+    fn stale_shedding_state_over_trip_age_trips_again() {
+        let s = shedder();
+        let t0 = Instant::now();
+        s.observe("q", 61.0, t0);
+        let late = t0 + s.config().stale_after() + Duration::from_secs(1);
+        assert_eq!(s.observe("q", 90.0, late), Some(ShedTransition::Tripped));
+        assert!(s.check("q", late).is_some());
+    }
+
+    #[test]
+    fn stale_after_saturates() {
+        let c = LoadShedConfig::new().with_sample_interval(Duration::MAX);
+        assert_eq!(c.stale_after(), Duration::MAX);
+    }
+
+    #[test]
+    fn nan_age_never_trips() {
+        let s = shedder();
+        assert_eq!(s.observe("q", f64::NAN, Instant::now()), None);
+        assert_eq!(whole_secs(f64::NAN), 0);
+        assert_eq!(whole_secs(-3.0), 0);
     }
 
     #[test]

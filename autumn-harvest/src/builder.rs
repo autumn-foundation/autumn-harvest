@@ -137,7 +137,8 @@ pub struct HarvestBuilder {
     unknown_target_grace_window: Option<Duration>,
     /// Hard caps for `POST /workflows/batch_start` (issue #357).
     batch_start_config: BatchStartConfig,
-    /// Automatic per-queue load shedding (issue #1794). Empty = off.
+    /// Automatic per-queue load shedding (issue #1794). An empty config turns
+    /// it off.
     load_shed: crate::load_shed::LoadShedConfig,
     /// Declarative completion triggers (issue #517).
     completion_triggers: Vec<crate::completion_trigger::CompletionTrigger>,
@@ -338,7 +339,8 @@ pub struct BuiltHarvest {
     pub unknown_target_grace_window: Duration,
     /// Hard caps for `POST /workflows/batch_start` (issue #357).
     pub batch_start_config: BatchStartConfig,
-    /// Automatic per-queue load shedding (issue #1794). Empty = off.
+    /// Automatic per-queue load shedding (issue #1794). An empty config turns
+    /// it off.
     pub load_shed: crate::load_shed::LoadShedConfig,
     /// Declarative completion triggers (issue #517).
     completion_triggers: Vec<crate::completion_trigger::CompletionTrigger>,

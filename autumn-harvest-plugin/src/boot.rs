@@ -203,6 +203,10 @@ pub fn spawn_gate_refresh(
 ///
 /// Returns `None` when no queue has a policy, so a default deployment runs no
 /// sampler SQL. The sampler reads each physical pool once per tick.
+///
+/// A sample that runs longer than two intervals is dropped as a failed tick.
+/// Ticks keep a fixed period, so a slow sample does not push the next one out.
+/// The shed state then stays inside its three-interval staleness bound.
 fn spawn_load_shed_sampler(
     api_state: &HarvestApiState,
     pools: &HarvestDbPool,
@@ -223,10 +227,12 @@ fn spawn_load_shed_sampler(
     let audit_pool = pools.clone_inner();
     let api_state = api_state.clone();
     Some(tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(interval);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 () = cancel.cancelled() => return,
-                () = tokio::time::sleep(interval) => {}
+                _ = ticks.tick() => {}
             }
             // The runtime is installed after boot, so resolve it per tick.
             let runtime = api_state.runtime().ok();
@@ -242,16 +248,23 @@ fn spawn_load_shed_sampler(
                         .to_vec()
                 })
                 .unwrap_or_default();
-            let sample = autumn_harvest::load_shed::sample_once(
-                &shedder,
-                &shard_pools,
-                &audit_pool,
-                metrics.as_deref(),
-                &breakers,
+            let sample = tokio::time::timeout(
+                interval.saturating_mul(2),
+                autumn_harvest::load_shed::sample_once(
+                    &shedder,
+                    &shard_pools,
+                    &audit_pool,
+                    metrics.as_deref(),
+                    &breakers,
+                ),
             );
             tokio::select! {
                 () = cancel.cancelled() => return,
-                _ = sample => {}
+                result = sample => {
+                    if result.is_err() {
+                        tracing::warn!("load shed sample timed out; shed state unchanged");
+                    }
+                }
             }
         }
     }))

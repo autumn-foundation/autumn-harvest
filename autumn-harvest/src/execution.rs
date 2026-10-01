@@ -741,7 +741,8 @@ fn admit_fresh_start(
 /// Ask the published load shedder whether to shed a start on `queue_name`.
 ///
 /// Only [`GateMode::Check`](crate::admission_gate::GateMode::Check) sheds. A
-/// `CheckCached` caller is continuation work that cannot act on `Retry-After`.
+/// `CheckCached` caller is an internal producer or a continuation. It cannot
+/// act on `Retry-After`.
 fn evaluate_load_shed(
     mode: crate::admission_gate::GateMode,
     queue_name: &str,

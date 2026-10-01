@@ -11593,7 +11593,8 @@ fn workflow_result_response(result: WorkflowResult) -> axum::response::Response 
 /// The `429` response for a start that load shedding refused (issue #1794).
 ///
 /// `Retry-After` carries the policy delay in whole seconds. The body names the
-/// queue, so a caller can tell overload (429) from a manual gate (503).
+/// shed queue. The `429` status tells a caller that overload refused the
+/// start, not a manual gate.
 fn load_shed_response(
     queue: &str,
     oldest_pending_age_secs: u64,
@@ -18641,7 +18642,9 @@ pub(crate) async fn start_workflow(
         // workflow resolves a throttle policy (the enclosing `if let`), so the
         // batch route's extra `workflow_resolving_throttle(...).is_some()` guard
         // is redundant here.
-        if let Some((gate_id, gate_reason, scope_kind)) = {
+        // Load shedding (issue #1794) follows the same rule. A deferred start
+        // never reaches the primitive's shed check, and its later fire is exempt.
+        let gate_hit = {
             let wf_owner = runtime
                 .registry
                 .workflows
@@ -18650,7 +18653,12 @@ pub(crate) async fn start_workflow(
             api_state
                 .gate_cache()
                 .check(&workflow_name, &queue_name, shard.as_i32(), wf_owner)
-        } {
+        };
+        let shed_hit = api_state
+            .gate_cache()
+            .load_shedder()
+            .check(&queue_name, std::time::Instant::now());
+        if gate_hit.is_some() || shed_hit.is_some() {
             // Idempotent-retry bypass (mirrors the batch route's bypasses). Only
             // meaningful for an explicit `workflow_id`: an auto-generated id varies
             // per retry and can never resolve to a prior run/row. The checks reuse
@@ -18703,7 +18711,7 @@ pub(crate) async fn start_workflow(
                     .await
                     .unwrap_or(false)
             };
-            if !is_idempotent_retry {
+            if !is_idempotent_retry && let Some((gate_id, gate_reason, scope_kind)) = gate_hit {
                 let reason_label = match gate_reason.char_indices().nth(64) {
                     Some((idx, _)) => &gate_reason[..idx],
                     None => &gate_reason,
@@ -18738,6 +18746,32 @@ pub(crate) async fn start_workflow(
                     })),
                 )
                     .into_response();
+            }
+            if !is_idempotent_retry && let Some(decision) = shed_hit {
+                runtime
+                    .registry
+                    .telemetry()
+                    .metrics
+                    .record_load_shed_rejected(&decision.queue);
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(workflow_name.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("load shed"),
+                    shard_id: Some(shard.as_i32()),
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+                return load_shed_response(
+                    &decision.queue,
+                    decision.oldest_pending_age_secs,
+                    decision.retry_after_secs,
+                );
             }
             // Idempotent retry: fall through to `reserve_or_defer`, which resolves
             // it to the existing execution / same pending row (no fresh admission).
@@ -19655,6 +19689,13 @@ async fn batch_start_workflows(
     let mut shard_groups: std::collections::BTreeMap<ShardId, Vec<(usize, String)>> =
         std::collections::BTreeMap::new();
     let mut gate_rejected: Vec<BatchStartItemResult> = Vec::new();
+    // Load shedding (issue #1794). Every item uses `item_queue`, so one check
+    // covers the batch. A throttle defer in Phase 2 skips the primitive's check.
+    let shed_hit = api_state
+        .gate_cache()
+        .load_shedder()
+        .check(item_queue, std::time::Instant::now());
+    let mut shed_rejected = 0_usize;
     for (idx, item) in request.items.iter().enumerate() {
         if pre_rejected_idxs.contains(&idx) {
             continue;
@@ -19673,12 +19714,13 @@ async fn batch_start_workflows(
             .workflows
             .get(&item.workflow_name)
             .and_then(|i| i.owner);
-        if let Some((gate_id, gate_reason, scope_kind)) = api_state.gate_cache().check(
+        let gate_hit = api_state.gate_cache().check(
             &item.workflow_name,
             item_queue,
             shard.as_i32(),
             item_owner,
-        ) {
+        );
+        if gate_hit.is_some() || shed_hit.is_some() {
             // Idempotent retry bypass: if the caller supplied an explicit
             // workflow_id, check whether an active (RUNNING/SUSPENDED) execution
             // already exists on this shard.  AllowDuplicate would return the
@@ -19770,25 +19812,50 @@ async fn batch_start_workflows(
                     .push((idx, workflow_id));
                 continue;
             }
-            let reason_label = match gate_reason.char_indices().nth(64) {
-                Some((idx2, _)) => &gate_reason[..idx2],
-                None => &gate_reason,
-            };
-            runtime
-                .registry
-                .telemetry()
-                .metrics
-                .record_admission_blocked(scope_kind, reason_label);
-            gate_rejected.push(BatchStartItemResult {
-                index: idx,
-                workflow_id: Some(workflow_id.clone()),
-                status: BatchStartItemStatus::Rejected,
-                execution_id: None,
-                error: Some(format!(
-                    "admission blocked by gate {gate_id}: {gate_reason}"
-                )),
-            });
-            continue;
+            if let Some((gate_id, gate_reason, scope_kind)) = gate_hit {
+                let reason_label = match gate_reason.char_indices().nth(64) {
+                    Some((idx2, _)) => &gate_reason[..idx2],
+                    None => &gate_reason,
+                };
+                runtime
+                    .registry
+                    .telemetry()
+                    .metrics
+                    .record_admission_blocked(scope_kind, reason_label);
+                gate_rejected.push(BatchStartItemResult {
+                    index: idx,
+                    workflow_id: Some(workflow_id.clone()),
+                    status: BatchStartItemStatus::Rejected,
+                    execution_id: None,
+                    error: Some(format!(
+                        "admission blocked by gate {gate_id}: {gate_reason}"
+                    )),
+                });
+                continue;
+            }
+            if let Some(decision) = &shed_hit {
+                runtime
+                    .registry
+                    .telemetry()
+                    .metrics
+                    .record_load_shed_rejected(&decision.queue);
+                shed_rejected += 1;
+                gate_rejected.push(BatchStartItemResult {
+                    index: idx,
+                    workflow_id: Some(workflow_id.clone()),
+                    status: BatchStartItemStatus::Rejected,
+                    execution_id: None,
+                    error: Some(
+                        HarvestError::LoadShed {
+                            queue: decision.queue.clone(),
+                            oldest_pending_age_secs: decision.oldest_pending_age_secs,
+                            retry_after_secs: decision.retry_after_secs,
+                        }
+                        .to_string(),
+                    ),
+                });
+                continue;
+            }
         }
 
         shard_groups
@@ -19799,6 +19866,7 @@ async fn batch_start_workflows(
 
     // Atomic mode: if any item was gate-rejected, fail the whole batch.
     if request.atomic && !gate_rejected.is_empty() {
+        let only_shed = shed_rejected == gate_rejected.len();
         if let Ok(pool) = api_state.storage_pool()
             && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
         {
@@ -19811,11 +19879,37 @@ async fn batch_start_workflows(
                 request_id: request_id.as_deref(),
                 idempotency_key: None,
                 status: STATUS_FAILED,
-                error_summary: Some("atomic batch rejected: one or more items blocked by gate"),
+                error_summary: Some(if only_shed {
+                    "atomic batch rejected: one or more items shed"
+                } else {
+                    "atomic batch rejected: one or more items blocked by gate"
+                }),
                 shard_id: None,
                 source: &source,
             };
             let _ = audit::insert_audit(&mut conn, &ar).await;
+        }
+        // Only sheds: answer 429 with `Retry-After`, so the caller retries.
+        // A manual-gate block keeps the 409.
+        if let Some(decision) = shed_hit.as_ref().filter(|_| only_shed) {
+            let mut response = (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(BatchStartRejectedResponse {
+                    message: format!(
+                        "{} of {} items shed on queue '{}'; no executions inserted (atomic=true)",
+                        gate_rejected.len(),
+                        request.items.len(),
+                        decision.queue
+                    ),
+                    rejected: gate_rejected,
+                }),
+            )
+                .into_response();
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from(decision.retry_after_secs),
+            );
+            return response;
         }
         return (
             StatusCode::CONFLICT,
