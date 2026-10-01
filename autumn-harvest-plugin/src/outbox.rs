@@ -623,6 +623,7 @@ pub(crate) async fn dispatch_workflow_start_request(
             max_workflow_attempts_ceiling,
             // Started by the cross-shard outbox dispatcher (issue #740).
             start_source: autumn_harvest::StartSource::Outbox,
+            // `origin` stays `None`. Outbox delivery is not a schedule fire (issue #534).
             ..StartWorkflowParams::new(
                 &request.workflow_name,
                 &request.workflow_id,

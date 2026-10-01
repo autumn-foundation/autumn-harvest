@@ -156,7 +156,7 @@ pub struct StartWorkflowParams<'a> {
     /// `None` for manual starts and any non-scheduled call site.
     pub scheduled_for: Option<chrono::DateTime<chrono::Utc>>,
     /// Attempt number for this execution in the retry chain (issue #523). 1 = first attempt.
-    /// Callers starting a fresh workflow pass `1`. The retry hook passes `workflow_attempt + 1`.
+    /// [`Self::new`] sets `1`. The retry hook passes `workflow_attempt + 1`.
     pub workflow_attempt: u32,
     /// Effective retry policy frozen at start time (issue #523).
     ///
@@ -558,8 +558,8 @@ mod start_params_new_tests {
         assert!(execution_timeout.is_none());
         assert!(memo.is_none());
         assert!(search_attrs.is_none());
-        assert_eq!(reuse_policy, WorkflowIdReusePolicy::default());
-        assert_eq!(conflict_policy, WorkflowIdConflictPolicy::default());
+        assert_eq!(reuse_policy, WorkflowIdReusePolicy::AllowDuplicate);
+        assert_eq!(conflict_policy, WorkflowIdConflictPolicy::Unspecified);
         assert!(trace_context.is_none());
         assert!(max_execution_timeout_ceiling.is_none());
         assert!(chain_execution_timeout.is_none());
@@ -567,8 +567,8 @@ mod start_params_new_tests {
         assert!(inherited_chain_deadline_at.is_none());
         assert!(concurrency_key.is_none());
         assert!(concurrency_limit.is_none());
-        assert_eq!(concurrency_on_conflict, ConcurrencyOnConflict::default());
-        assert_eq!(priority, Priority::default());
+        assert_eq!(concurrency_on_conflict, ConcurrencyOnConflict::Defer);
+        assert_eq!(priority, Priority::Normal);
         assert_eq!(max_workflow_input_bytes, 0);
         assert!(start_at.is_none());
         assert!(delay.is_none());
@@ -601,7 +601,11 @@ mod start_params_new_tests {
         };
         assert_eq!(params.owner, Some("team"));
         assert_eq!(params.priority, Priority::High);
+        assert_eq!(params.workflow_name, "wf");
+        assert_eq!(params.workflow_id, "id");
+        assert_eq!(params.queue_name, "q");
         assert_eq!(params.workflow_attempt, 1);
+        assert_eq!(params.start_source, StartSource::Unknown);
     }
 }
 

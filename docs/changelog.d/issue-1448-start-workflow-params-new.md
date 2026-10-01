@@ -9,10 +9,10 @@ execution id, input and queue. All other fields get a neutral default.
 override only what they vary, with `..StartWorkflowParams::new(..)`.
 
 The production sites in `autumn-harvest` and `autumn-harvest-plugin` use the
-constructor. A site that accepts a new field's default needs no edit.
+constructor. So do the `#[workflow]` macro expansion and the quickstart example. A site that accepts a new field's default needs no edit.
 
 Trade-off: `Default` is not implemented. Five fields have no sound default.
-Tests and the macro expansion keep their literals. They can move later.
+Tests and assays keep their literals. They can move later.
 
 No behavior change. No migration. No `WorkflowEvent` change.
 `harvest_events` is not touched.

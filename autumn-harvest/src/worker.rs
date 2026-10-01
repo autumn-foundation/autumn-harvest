@@ -8310,49 +8310,57 @@ pub async fn persist_workflow_failure(
             {
                 let retry_workflow_id = rid.to_string();
                 let retry_params = crate::execution::StartWorkflowParams {
-execution_timeout: exec_ref.execution_timeout,
-memo: exec_ref.memo.clone(),
-search_attrs: exec_ref.search_attrs.clone(),
-// Workflow-level retry (issue #523) is the same logical run
-// continuing, so the chain-scoped lifetime cap (issue #617)
-// is inherited verbatim: carry the origin's absolute
-// `chain_deadline_at` forward rather than re-anchoring it.
-chain_execution_timeout: exec_ref.chain_execution_timeout,
-inherited_chain_deadline_at: exec_ref.chain_deadline_at,
-concurrency_key: concurrency_key.clone(),
-concurrency_limit,
-priority,
-delay: start_delay,
-owner: exec_ref.owner.as_deref(),
-runbook_url: exec_ref.runbook_url.as_deref(),
-severity: exec_ref.severity.as_deref(),
-context_headers: exec_ref
+                    execution_timeout: exec_ref.execution_timeout,
+                    memo: exec_ref.memo.clone(),
+                    search_attrs: exec_ref.search_attrs.clone(),
+                    // Workflow-level retry (issue #523) is the same logical run
+                    // continuing, so the chain-scoped lifetime cap (issue #617)
+                    // is inherited verbatim: carry the origin's absolute
+                    // `chain_deadline_at` forward rather than re-anchoring it.
+                    chain_execution_timeout: exec_ref.chain_execution_timeout,
+                    inherited_chain_deadline_at: exec_ref.chain_deadline_at,
+                    concurrency_key: concurrency_key.clone(),
+                    concurrency_limit,
+                    // A retry never supersedes (issue #811). It is the same
+                    // logical run, not a fresh admission. `CancelRunning` here
+                    // could cancel a run admitted after the failure and invert
+                    // latest-wins.
+                    concurrency_on_conflict: crate::concurrency::ConcurrencyOnConflict::Defer,
+                    priority,
+                    delay: start_delay,
+                    owner: exec_ref.owner.as_deref(),
+                    runbook_url: exec_ref.runbook_url.as_deref(),
+                    severity: exec_ref.severity.as_deref(),
+                    context_headers: exec_ref
                         .context_headers
                         .clone()
                         .and_then(|v| serde_json::from_value(v).ok()),
-sla: exec_ref.sla,
-schedule_id: exec_ref.schedule_id,
-scheduled_for: exec_ref.scheduled_for,
-workflow_attempt: attempt + 1,
-workflow_retry_policy: Some(policy),
-retry_of_exec_id: Some(exec_id.as_uuid()),
-origin: exec_ref.origin.as_deref(),
-// Workflow-level retry (issue #523) is the same
-// logical run trying again — inherit the
-// predecessor's completion-callback targets (#605)
-// rather than silently dropping them.
-completion_callbacks: exec_ref.completion_callbacks.clone(),
-// Workflow-level retry (issue #523/#740) is the same
-// logical run trying again — inherit the predecessor's
-// start provenance rather than re-attributing it as a
-// fresh `api` start.
-start_source: crate::types::StartSource::from_str(
+                    sla: exec_ref.sla,
+                    schedule_id: exec_ref.schedule_id,
+                    scheduled_for: exec_ref.scheduled_for,
+                    workflow_attempt: attempt + 1,
+                    workflow_retry_policy: Some(policy),
+                    retry_of_exec_id: Some(exec_id.as_uuid()),
+                    origin: exec_ref.origin.as_deref(),
+                    // A retry is the same logical run trying again (issue #523).
+                    // It inherits the predecessor's completion-callback targets
+                    // (issue #605) instead of dropping them.
+                    completion_callbacks: exec_ref.completion_callbacks.clone(),
+                    // A retry also inherits the predecessor's start provenance
+                    // (issue #740). It is not a fresh `api` start.
+                    start_source: crate::types::StartSource::from_str(
                         exec_ref.start_source.as_deref().unwrap_or("unknown"),
                     ),
-start_source_ref: exec_ref.start_source_ref.as_deref(),
-started_by: exec_ref.started_by.as_deref(),
-..crate::execution::StartWorkflowParams::new(&exec_ref.workflow_name, &retry_workflow_id, rid, exec_ref.input.clone(), &exec_ref.queue_name)
-};
+                    start_source_ref: exec_ref.start_source_ref.as_deref(),
+                    started_by: exec_ref.started_by.as_deref(),
+                    ..crate::execution::StartWorkflowParams::new(
+                        &exec_ref.workflow_name,
+                        &retry_workflow_id,
+                        rid,
+                        exec_ref.input.clone(),
+                        &exec_ref.queue_name,
+                    )
+                };
 
                 match crate::execution::start_or_load_workflow_execution_collect_with_codecs(
                     conn,

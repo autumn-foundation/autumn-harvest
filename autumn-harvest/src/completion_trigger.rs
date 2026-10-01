@@ -1317,6 +1317,9 @@ impl DeferredTriggerStart {
                 max_workflow_attempts_ceiling: self.max_workflow_attempts_ceiling,
                 start_source: crate::types::StartSource::CompletionTrigger,
                 start_source_ref: Some(source_exec_id_str.as_str()),
+                // `origin` and `completion_callbacks` keep their `None` default.
+                // A completion-trigger start is not a schedule fire (issue #534).
+                // Only builder-wide callback targets apply (issue #605).
                 ..crate::execution::StartWorkflowParams::new(
                     &self.target_workflow_name,
                     &self.target_workflow_id,
@@ -1928,6 +1931,9 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
                         // `target_input` is cloned, not moved. The `QuotaExceeded`
                         // outbox-fallback arm below needs the original values to
                         // build a `DeferredTriggerStart` for retry (issue #946).
+                        // `origin` and `completion_callbacks` keep their `None` default.
+                        // A completion-trigger start is not a schedule fire (issue #534).
+                        // Only builder-wide callback targets apply (issue #605).
                         ..StartWorkflowParams::new(
                             &trigger_db.target_workflow_name,
                             &target_workflow_id,
@@ -2536,6 +2542,9 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
             max_workflow_attempts_ceiling,
             start_source: crate::types::StartSource::CompletionTrigger,
             start_source_ref: Some(source_exec_id_str.as_str()),
+            // `origin` and `completion_callbacks` keep their `None` default.
+            // A completion-trigger start is not a schedule fire (issue #534).
+            // Only builder-wide callback targets apply (issue #605).
             ..crate::execution::StartWorkflowParams::new(
                 &task.target_workflow_name,
                 &task.target_workflow_id,

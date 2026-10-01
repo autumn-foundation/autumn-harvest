@@ -1505,25 +1505,25 @@ pub async fn trigger_unified_dag(
     crate::execution::start_or_load_workflow_execution_collect_with_codecs(
         conn,
         StartWorkflowParams {
-execution_timeout,
-max_execution_timeout_ceiling,
-owner,
-runbook_url,
-severity,
-sla,
-// Attribute the manual API trigger to the schedule so it appears in
-// GET /admin/schedules/{id}/runs with origin='manual_trigger'.
-// scheduled_for stays None so resolve_carryover (issue #488) still
-// short-circuits — NULL slot comparisons are false.
-schedule_id: schedule.as_ref().map(|s| s.id),
-origin: schedule
+            execution_timeout,
+            max_execution_timeout_ceiling,
+            owner,
+            runbook_url,
+            severity,
+            sla,
+            // Attribute the manual API trigger to the schedule so it appears in
+            // GET /admin/schedules/{id}/runs with origin='manual_trigger'.
+            // scheduled_for stays None so resolve_carryover (issue #488) still
+            // short-circuits — NULL slot comparisons are false.
+            schedule_id: schedule.as_ref().map(|s| s.id),
+            origin: schedule
                 .as_ref()
                 .map(|_| crate::execution::ORIGIN_MANUAL_TRIGGER),
-start_source,
-start_source_ref: schedule_ref.as_deref(),
-started_by,
-..StartWorkflowParams::new(dag_name, &workflow_id, exec_id, input, &queue_name)
-},
+            start_source,
+            start_source_ref: schedule_ref.as_deref(),
+            started_by,
+            ..StartWorkflowParams::new(dag_name, &workflow_id, exec_id, input, &queue_name)
+        },
         /* in_outer_transaction = */ true,
         /* reject_fresh_if_debounced = */ false,
         None,
