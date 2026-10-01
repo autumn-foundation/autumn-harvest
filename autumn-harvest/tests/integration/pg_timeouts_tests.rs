@@ -1135,7 +1135,7 @@ async fn a_start_error_on_a_lost_connection_still_refunds_the_token() {
 
     autumn_harvest::worker::refund_after_start_error(
         &pool,
-        conn,
+        Some(conn),
         Some(&key),
         &autumn_harvest::error::HarvestError::Database("connection closed".into()),
     )
@@ -1745,6 +1745,68 @@ async fn a_heartbeat_sent_during_a_blocked_flush_keeps_its_time() {
         lag < chrono::Duration::milliseconds(1_000),
         "the heartbeat time moved past its arrival: {lag}"
     );
+}
+
+/// A start that lost its connection on a one-slot pool must still find its
+/// committed `ActivityStarted`. The dead connection holds the only slot. The
+/// reconcile read needs that slot, so the dead connection must go back first.
+#[tokio::test]
+async fn a_lost_start_on_a_one_slot_pool_is_still_found() {
+    #[derive(diesel::QueryableByName)]
+    struct Pid {
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        pid: i32,
+    }
+
+    let (url, _container) = setup_db().await;
+    let mut admin = connect(&url).await;
+    // `seed_claimed_activity` writes this claim's start after the claim, as
+    // a start that committed before the connection dropped.
+    let (exec_id, _activity_id, task) = seed_claimed_activity(&mut admin, "q-l1").await;
+    diesel::sql_query(
+        "UPDATE harvest_task_queue SET started_at = NOW() - INTERVAL '1 minute' WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task.id)
+    .execute(&mut admin)
+    .await
+    .expect("move the claim time before the start");
+    let task = {
+        use autumn_harvest::models::TaskQueueItem;
+        use autumn_harvest::schema::harvest_task_queue;
+        use diesel::{QueryDsl, SelectableHelper};
+        harvest_task_queue::table
+            .find(task.id)
+            .select(TaskQueueItem::as_select())
+            .first::<TaskQueueItem>(&mut admin)
+            .await
+            .expect("reload the claim")
+    };
+
+    let pool = engine_pool(
+        url,
+        1,
+        DbRole::Hot,
+        &timeouts(200, SessionTimeouts::for_role(DbRole::Hot)),
+    )
+    .expect("engine pool");
+    let mut conn = pool.get().await.expect("the only connection");
+    let pid = diesel::sql_query("SELECT pg_backend_pid() AS pid")
+        .get_result::<Pid>(&mut conn)
+        .await
+        .expect("read the backend pid")
+        .pid;
+    diesel::sql_query("SELECT pg_terminate_backend($1)")
+        .bind::<diesel::sql_types::Integer, _>(pid)
+        .execute(&mut admin)
+        .await
+        .expect("end the pooled session");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let found =
+        autumn_harvest::worker::append_start_for_test(&pool, conn, &task, exec_id, "act", "w-1")
+            .await
+            .expect("the reconcile reads the committed start");
+    assert!(found, "this claim's committed start must be found");
 }
 
 /// Mark `worker_id` as a live worker. A test row `RUNNING` under an unknown

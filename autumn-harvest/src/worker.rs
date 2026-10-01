@@ -5556,6 +5556,85 @@ async fn read_lost_start(
     }))
 }
 
+/// Append `ActivityStarted`, and find a start that a lost connection hid
+/// (issue #1788).
+///
+/// A lost connection hides whether the start committed. If it did, the
+/// handler must run. A release would add a second start. Returns the
+/// connection when it is still usable.
+async fn append_start_or_reconcile(
+    pool: &DbPool,
+    mut conn: crate::pool::PooledConn,
+    task: &TaskQueueItem,
+    exec_id: ExecutionId,
+    activity_name: &str,
+    worker_id: &str,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> (
+    HarvestResult<Option<StartedActivity>>,
+    Option<crate::pool::PooledConn>,
+) {
+    let started = append_activity_started_if_pending(
+        &mut conn,
+        task,
+        exec_id,
+        activity_name,
+        worker_id,
+        codecs,
+    )
+    .await;
+    match started {
+        Err(error) if crate::pool::is_connection_lost(&error) => {
+            // Return the dead connection first. It holds a pool slot, and the
+            // reconcile read needs one.
+            drop(conn);
+            let found = reconcile_lost_start(pool, task, exec_id, activity_name, worker_id).await;
+            let outcome = match found {
+                Ok(Some(started)) => Ok(Some(started)),
+                Ok(None) => Err(error),
+                Err(reconcile_error) => {
+                    tracing::warn!(
+                        task_id = %task.id,
+                        error = %reconcile_error,
+                        "could not check whether a lost activity start committed"
+                    );
+                    Err(error)
+                }
+            };
+            (outcome, None)
+        }
+        other => (other, Some(conn)),
+    }
+}
+
+/// Whether [`append_start_or_reconcile`] reports this claim's start on `conn`.
+/// Tests use it (issue #1788).
+///
+/// # Errors
+///
+/// The start or reconcile error.
+#[doc(hidden)]
+pub async fn append_start_for_test(
+    pool: &DbPool,
+    conn: crate::pool::PooledConn,
+    task: &TaskQueueItem,
+    exec_id: ExecutionId,
+    activity_name: &str,
+    worker_id: &str,
+) -> HarvestResult<bool> {
+    let (started, _) = append_start_or_reconcile(
+        pool,
+        conn,
+        task,
+        exec_id,
+        activity_name,
+        worker_id,
+        &crate::payload_codec::PayloadCodecs::default(),
+    )
+    .await;
+    started.map(|started| started.is_some())
+}
+
 async fn append_activity_started_if_pending(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
@@ -6197,17 +6276,19 @@ async fn refund_debited_token(conn: &mut AsyncPgConnection, debited_key: Option<
 #[doc(hidden)]
 pub async fn refund_after_start_error(
     pool: &DbPool,
-    mut conn: crate::pool::PooledConn,
+    conn: Option<crate::pool::PooledConn>,
     debited_key: Option<&str>,
     error: &HarvestError,
 ) {
     if debited_key.is_none() {
         return;
     }
-    if crate::pool::is_connection_lost(error) {
-        // Return the dead connection first. It holds a pool slot.
-        drop(conn);
-        conn = match crate::pool::acquire_within_pool_bound(pool).await {
+    // `filter` drops a dead connection here, so its pool slot is free before
+    // the new acquire.
+    let usable = conn.filter(|_| !crate::pool::is_connection_lost(error));
+    let mut conn = match usable {
+        Some(conn) => conn,
+        None => match crate::pool::acquire_within_pool_bound(pool).await {
             Ok(conn) => conn,
             Err(acquire_error) => {
                 tracing::warn!(
@@ -6217,8 +6298,8 @@ pub async fn refund_after_start_error(
                 );
                 return;
             }
-        };
-    }
+        },
+    };
     refund_debited_token(&mut conn, debited_key).await;
 }
 
@@ -15345,7 +15426,7 @@ async fn process_activity_task(
     // a deferred task never records a start it did not run; serves both the
     // short-circuit path (start + CircuitOpen failure) and the real-call path.
     let started = {
-        let mut conn = match reserved_conn.take() {
+        let conn = match reserved_conn.take() {
             Some(conn) => conn,
             None => crate::pool::acquire_within_pool_bound(pool)
                 .await
@@ -15353,8 +15434,9 @@ async fn process_activity_task(
                     release_probe_on_error(&circuit_breakers, activity_name, circuit_token, e)
                 })?,
         };
-        let started_result = append_activity_started_if_pending(
-            &mut conn,
+        let (started_result, mut conn) = append_start_or_reconcile(
+            pool,
+            conn,
             task,
             exec_id,
             activity_name,
@@ -15362,41 +15444,22 @@ async fn process_activity_task(
             registry.payload_codecs(),
         )
         .await;
-        // A lost connection hides whether the start committed (issue #1788).
-        // If it did, run the handler. A release would add a second start.
-        let started_result = match started_result {
-            Err(error) if crate::pool::is_connection_lost(&error) => {
-                match reconcile_lost_start(pool, task, exec_id, activity_name, worker_id).await {
-                    Ok(Some(started)) => Ok(Some(started)),
-                    Ok(None) => Err(error),
-                    Err(reconcile_error) => {
-                        tracing::warn!(
-                            task_id = %task.id,
-                            error = %reconcile_error,
-                            "could not check whether a lost activity start committed"
-                        );
-                        Err(error)
-                    }
-                }
-            }
-            other => other,
-        };
         // A transient failure (issue #1788) has not run the handler and wrote
         // nothing. It must not fail the workflow through
         // `fail_execution_on_error`. Return it instead: the dispatch error path
         // releases the claim, so the task runs again.
-        let started_result = match started_result {
-            Err(error) if crate::pool::is_transient_db_error(&error) => Err(error),
-            other => {
+        let started_result = match (started_result, conn.as_mut()) {
+            (Err(error), Some(conn)) if !crate::pool::is_transient_db_error(&error) => {
                 fail_execution_on_error(
-                    &mut conn,
+                    conn,
                     task,
                     worker_id,
-                    other,
+                    Err(error),
                     registry.payload_codecs(),
                 )
                 .await
             }
+            (other, _) => other,
         };
         let started_opt = match started_result {
             Ok(started_opt) => started_opt,
@@ -15427,7 +15490,8 @@ async fn process_activity_task(
             if circuit_token.is_some()
                 && activity.circuit_breaker.is_some()
                 && let Some(key) = task.rate_limit_key.as_deref()
-                && let Err(error) = queue::refund_rate_limit_token(&mut conn, key).await
+                && let Some(conn) = conn.as_mut()
+                && let Err(error) = queue::refund_rate_limit_token(conn, key).await
             {
                 tracing::warn!(
                     rate_limit_key = %key,
