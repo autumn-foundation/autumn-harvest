@@ -96,13 +96,16 @@ pub async fn flush_heartbeat(
 ) -> HarvestResult<()> {
     flush(pool, task_id, payload, acquire_timeout)
         .await
-        .map_err(|failure| failure.error)
+        .map_err(|failure| *failure.error)
 }
 
 /// A failed flush and its `harvest.heartbeat.flush_failed` reason label.
+///
+/// The error is boxed, because `HarvestError` is large
+/// (`clippy::result_large_err`).
 struct FlushFailure {
     reason: &'static str,
-    error: HarvestError,
+    error: Box<HarvestError>,
 }
 
 async fn flush(
@@ -119,13 +122,13 @@ async fn flush(
             } else {
                 "acquire_error"
             },
-            error,
+            error: Box::new(error),
         })?;
     crate::queue::record_heartbeat(&mut conn, task_id, payload)
         .await
         .map_err(|error| FlushFailure {
             reason: "write_error",
-            error,
+            error: Box::new(error),
         })
 }
 
@@ -163,7 +166,7 @@ async fn heartbeat_loop(
             && let Err(failure) =
                 flush(&pool, task_id, payload.clone(), options.acquire_timeout).await
         {
-            if matches!(failure.error, HarvestError::NotFound(_)) {
+            if matches!(*failure.error, HarvestError::NotFound(_)) {
                 // The task finished or went back to the queue. A retry cannot
                 // succeed, and it could overwrite a newer attempt.
                 tracing::debug!(
