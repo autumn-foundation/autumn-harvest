@@ -1020,7 +1020,7 @@ async fn test_eligibility_optimizations_and_resilience() {
     .await;
     assert_eq!(status_mixed, StatusCode::OK);
     assert_eq!(body_mixed["summary"]["diagnosis"], "healthy");
-    assert_eq!(!body_mixed["eligible_workers"].as_array().unwrap().len(), 0);
+    assert_ne!(body_mixed["eligible_workers"].as_array().unwrap().len(), 0);
 
     // Now test service unavailable: if we only query a broken queue, or if all shards fail
     let all_broken_pool = build_two_shard_pool(
