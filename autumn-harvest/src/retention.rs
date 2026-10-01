@@ -2739,14 +2739,7 @@ enum CandidateDeleteOutcome {
 /// The candidate SQL renders this list. `MIGRATED` is absent on purpose:
 /// a sealed source row carries the forwarding pointer.
 #[cfg(feature = "db")]
-const RETENTION_CANDIDATE_STATES: &[&str] = &[
-    "COMPLETED",
-    "FAILED",
-    "CANCELLED",
-    "TIMED_OUT",
-    "CONTINUED_AS_NEW",
-    "TERMINATED",
-];
+const RETENTION_CANDIDATE_STATES: &[&str] = crate::erase::TERMINAL_STATES_WITHOUT_MIGRATED;
 
 /// Candidate-scan template when a global age fallback is bound as `$3`.
 #[cfg(feature = "db")]
@@ -2790,20 +2783,31 @@ const CANDIDATE_SCAN_NO_GLOBAL_TEMPLATE: &str = r"SELECT id, workflow_name, work
                  LIMIT $5
                  FOR UPDATE SKIP LOCKED";
 
-/// Builds the candidate-scan query from [`RETENTION_CANDIDATE_STATES`].
 #[cfg(feature = "db")]
-fn candidate_scan_sql(has_global_age: bool) -> String {
-    let template = if has_global_age {
-        CANDIDATE_SCAN_GLOBAL_TEMPLATE
+static CANDIDATE_SCAN_GLOBAL_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    crate::erase::render_states(CANDIDATE_SCAN_GLOBAL_TEMPLATE, RETENTION_CANDIDATE_STATES)
+});
+
+#[cfg(feature = "db")]
+static CANDIDATE_SCAN_NO_GLOBAL_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    crate::erase::render_states(
+        CANDIDATE_SCAN_NO_GLOBAL_TEMPLATE,
+        RETENTION_CANDIDATE_STATES,
+    )
+});
+
+/// Returns the candidate-scan query, rendered once from [`RETENTION_CANDIDATE_STATES`].
+#[cfg(feature = "db")]
+fn candidate_scan_sql(has_global_age: bool) -> &'static str {
+    if has_global_age {
+        &CANDIDATE_SCAN_GLOBAL_SQL
     } else {
-        CANDIDATE_SCAN_NO_GLOBAL_TEMPLATE
-    };
-    crate::erase::render_states(template, RETENTION_CANDIDATE_STATES)
+        &CANDIDATE_SCAN_NO_GLOBAL_SQL
+    }
 }
 
-/// Builds the live-child count query. `MIGRATED` stays outside the list, so a seal blocks the parent.
 #[cfg(feature = "db")]
-fn active_child_count_sql() -> String {
+static ACTIVE_CHILD_COUNT_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     crate::erase::render_states(
         "SELECT COUNT(*) AS count
          FROM harvest_workflow_executions
@@ -2811,11 +2815,16 @@ fn active_child_count_sql() -> String {
            AND state NOT IN ({states})",
         RETENTION_CANDIDATE_STATES,
     )
+});
+
+/// Returns the live-child count query. `MIGRATED` stays outside the list, so a seal blocks the parent.
+#[cfg(feature = "db")]
+fn active_child_count_sql() -> &'static str {
+    &ACTIVE_CHILD_COUNT_SQL
 }
 
-/// Builds the chain-link count query. It treats every terminal state, `MIGRATED` included, as settled.
 #[cfg(feature = "db")]
-fn chain_link_count_sql() -> String {
+static CHAIN_LINK_COUNT_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     crate::erase::render_states(
         "SELECT COUNT(*) AS count
          FROM harvest_workflow_executions
@@ -2829,6 +2838,12 @@ fn chain_link_count_sql() -> String {
            )",
         crate::erase::TERMINAL_STATES,
     )
+});
+
+/// Returns the chain-link count query. It treats every terminal state, `MIGRATED` included, as settled.
+#[cfg(feature = "db")]
+fn chain_link_count_sql() -> &'static str {
+    &CHAIN_LINK_COUNT_SQL
 }
 
 /// The two legal-hold timestamp columns `(legal_hold_set_at, legal_hold_until)`.
@@ -3857,8 +3872,9 @@ mod tests {
         for global in [true, false] {
             let sql = candidate_scan_sql(global);
             assert!(!sql.contains("{states}"), "unrendered placeholder");
+            assert!(sql.contains("state IN ("), "template lost its IN clause");
             for state in RETENTION_CANDIDATE_STATES {
-                assert_eq!(count_of(&sql, &format!("'{state}'")), 1, "{state}");
+                assert_eq!(count_of(sql, &format!("'{state}'")), 1, "{state}");
             }
             assert!(!sql.contains("'MIGRATED'"), "seal must stay unpurgeable");
         }
@@ -3878,15 +3894,21 @@ mod tests {
     fn chain_link_count_sql_lists_every_terminal_state() {
         let sql = chain_link_count_sql();
         for state in crate::erase::TERMINAL_STATES {
-            assert_eq!(count_of(&sql, &format!("'{state}'")), 1, "{state}");
+            assert_eq!(count_of(sql, &format!("'{state}'")), 1, "{state}");
         }
     }
 
     #[test]
-    fn terminal_states_are_candidates_plus_migrated() {
-        let mut expected: Vec<&str> = RETENTION_CANDIDATE_STATES.to_vec();
-        expected.push("MIGRATED");
-        assert_eq!(expected, crate::erase::TERMINAL_STATES);
+    fn templates_hold_no_hand_copied_state() {
+        for template in [
+            CANDIDATE_SCAN_GLOBAL_TEMPLATE,
+            CANDIDATE_SCAN_NO_GLOBAL_TEMPLATE,
+        ] {
+            assert!(
+                !template.contains("'COMPLETED'"),
+                "state literal in template"
+            );
+        }
     }
 
     #[test]

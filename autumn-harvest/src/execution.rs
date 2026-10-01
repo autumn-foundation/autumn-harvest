@@ -9014,12 +9014,18 @@ GROUP BY workflow_name
 ORDER BY workflow_name
 ";
 
-/// Builds the reachability query with the terminal list from `erase::TERMINAL_STATES`.
-fn non_terminal_counts_sql() -> String {
+static NON_TERMINAL_COUNTS_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     crate::erase::render_states(
         NON_TERMINAL_COUNTS_SQL_TEMPLATE,
-        crate::erase::TERMINAL_STATES,
+        crate::erase::TERMINAL_STATES_WITHOUT_MIGRATED,
     )
+});
+
+/// Returns the reachability query, rendered once.
+///
+/// `MIGRATED` stays outside the list, so a seal counts as active here.
+fn non_terminal_counts_sql() -> &'static str {
+    &NON_TERMINAL_COUNTS_SQL
 }
 
 /// Count non-terminal workflow executions grouped by `workflow_name` on one shard.
@@ -9723,8 +9729,10 @@ pub async fn check_and_report_unfinished_handlers_batch(
 
 #[cfg(test)]
 mod non_terminal_sql_tests {
-    use super::{REACHABILITY_SAMPLE_CAP, non_terminal_counts_sql};
-    use crate::erase::{TERMINAL_STATES, is_terminal_state};
+    use super::{
+        NON_TERMINAL_COUNTS_SQL_TEMPLATE, REACHABILITY_SAMPLE_CAP, non_terminal_counts_sql,
+    };
+    use crate::erase::{TERMINAL_STATES_WITHOUT_MIGRATED, is_terminal_state};
 
     /// Diesel `sql_query` cannot interpolate a Rust const into the SQL string,
     /// so the per-shard sample slice is a hardcoded `[1:5]` literal. This guard
@@ -9740,25 +9748,28 @@ mod non_terminal_sql_tests {
         );
     }
 
-    /// The `NOT IN (...)` state list in `non_terminal_counts_sql` must be the
-    /// exact complement of `erase::is_terminal_state`. If a new terminal state is
-    /// added to `is_terminal_state`, this test fails until the SQL is updated,
-    /// preventing the reachability query from counting terminal runs as non-terminal
-    /// and blocking safe handler removal forever.
+    /// The `NOT IN (...)` list in `non_terminal_counts_sql` renders the terminal states
+    /// except the `MIGRATED` seal, which counts as active here.
+    ///
+    /// This test guards the rendering. A new terminal state fails
+    /// `erase::tests::states_without_migrated_equal_terminal_states_minus_migrated`.
     #[test]
     fn non_terminal_sql_excludes_exactly_terminal_states() {
-        for state in TERMINAL_STATES {
+        assert!(!NON_TERMINAL_COUNTS_SQL_TEMPLATE.contains("'COMPLETED'"));
+        for state in TERMINAL_STATES_WITHOUT_MIGRATED {
             assert!(
                 is_terminal_state(state),
-                "State '{state}' is listed in non_terminal_counts_sql's NOT IN clause \
-                 but is_terminal_state returns false — update one of them to match"
+                "'{state}' is listed but is_terminal_state returns false"
             );
             assert!(
-                non_terminal_counts_sql().contains(state),
-                "is_terminal_state returns true for '{state}' but it is missing from \
-                 non_terminal_counts_sql's NOT IN clause — add it to keep the lists in sync"
+                non_terminal_counts_sql().contains(&format!("'{state}'")),
+                "is_terminal_state returns true for '{state}' but the query omits it"
             );
         }
+        assert!(
+            !non_terminal_counts_sql().contains("'MIGRATED'"),
+            "a seal counts as active in the reachability query"
+        );
         let candidate_non_terminal = ["RUNNING", "SUSPENDED", "PAUSED"];
         for state in &candidate_non_terminal {
             assert!(

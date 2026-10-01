@@ -141,9 +141,18 @@ GROUP BY workflow_name, change_id, recorded_version, shard_id
 ORDER BY workflow_name, change_id, recorded_version, shard_id
 ";
 
-/// Builds the usage query with the terminal list from `erase::TERMINAL_STATES`.
-fn version_usage_sql() -> String {
-    crate::erase::render_states(VERSION_USAGE_SQL_TEMPLATE, crate::erase::TERMINAL_STATES)
+static VERSION_USAGE_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    crate::erase::render_states(
+        VERSION_USAGE_SQL_TEMPLATE,
+        crate::erase::TERMINAL_STATES_WITHOUT_MIGRATED,
+    )
+});
+
+/// Returns the usage query, rendered once.
+///
+/// `MIGRATED` stays outside the list, so a seal counts as active here.
+fn version_usage_sql() -> &'static str {
+    &VERSION_USAGE_SQL
 }
 
 /// Load grouped version-marker usage from a single shard without mutating state.
@@ -192,17 +201,22 @@ pub async fn load_version_usage(
 mod tests {
     use super::*;
 
-    /// Every rendered terminal list must equal `erase::TERMINAL_STATES`.
-    fn assert_terminal_lists_only(sql: &str) {
+    /// The rendered SQL must hold no placeholder and list every state of the set.
+    fn assert_lists_every_state(sql: &str) {
         assert!(!sql.contains("{states}"), "unrendered placeholder");
-        for state in crate::erase::TERMINAL_STATES {
+        for state in crate::erase::TERMINAL_STATES_WITHOUT_MIGRATED {
             assert!(sql.contains(&format!("'{state}'")), "{state} missing");
         }
+        assert!(!sql.contains("'MIGRATED'"), "a seal counts as active here");
     }
 
     #[test]
     fn usage_sql_derives_terminal_list_from_terminal_states() {
-        assert_terminal_lists_only(&version_usage_sql());
+        assert_lists_every_state(version_usage_sql());
+        assert!(
+            !VERSION_USAGE_SQL_TEMPLATE.contains("'COMPLETED'"),
+            "state literal in template"
+        );
     }
 
     #[test]

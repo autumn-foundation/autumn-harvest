@@ -145,7 +145,7 @@ pub fn tombstone_payload_fields(event_value: &mut Value) -> usize {
 /// consumers that need the literal list for a SQL filter (e.g.
 /// `execution::resolve_execution_id_by_workflow_id`, issue #805) reference this
 /// constant directly rather than re-declaring the states, so the two can never
-/// drift.
+/// drift. Raw SQL templates render a list from it with `render_states`.
 pub const TERMINAL_STATES: &[&str] = &[
     "COMPLETED",
     "FAILED",
@@ -178,14 +178,32 @@ pub fn is_terminal_state(state: &str) -> bool {
     TERMINAL_STATES.contains(&state)
 }
 
+/// The terminal states except the `MIGRATED` seal (issue #964).
+///
+/// Retention purge lists and the reporting queries use this set. A `MIGRATED` seal
+/// is not purgeable, and the reporting queries still count it as active.
+/// A unit test keeps this list equal to [`TERMINAL_STATES`] minus `MIGRATED`.
+#[cfg(any(feature = "db", test))]
+pub(crate) const TERMINAL_STATES_WITHOUT_MIGRATED: &[&str] = &[
+    "COMPLETED",
+    "FAILED",
+    "CANCELLED",
+    "TIMED_OUT",
+    "CONTINUED_AS_NEW",
+    "TERMINATED",
+];
+
 /// Placeholder that [`render_states`] replaces in a SQL template.
-pub const STATES_PLACEHOLDER: &str = "{states}";
+#[cfg(any(feature = "db", test))]
+pub(crate) const STATES_PLACEHOLDER: &str = "{states}";
 
 /// Renders `states` as a SQL literal list, for example `'A', 'B'`.
 ///
 /// State names are code constants, never user input, so no escaping is needed.
+#[cfg(any(feature = "db", test))]
 #[must_use]
-pub fn sql_literal_list(states: &[&str]) -> String {
+pub(crate) fn sql_literal_list(states: &[&str]) -> String {
+    debug_assert!(states.iter().all(|state| !state.contains('\'')));
     states
         .iter()
         .map(|state| format!("'{state}'"))
@@ -196,8 +214,13 @@ pub fn sql_literal_list(states: &[&str]) -> String {
 /// Replaces every [`STATES_PLACEHOLDER`] in `template` with the literal list of `states`.
 ///
 /// Raw SQL derives its state lists here, so the lists cannot drift from the constants.
+#[cfg(any(feature = "db", test))]
 #[must_use]
-pub fn render_states(template: &str, states: &[&str]) -> String {
+pub(crate) fn render_states(template: &str, states: &[&str]) -> String {
+    debug_assert!(
+        template.contains(STATES_PLACEHOLDER),
+        "template has no placeholder"
+    );
     template.replace(STATES_PLACEHOLDER, &sql_literal_list(states))
 }
 
@@ -1404,11 +1427,16 @@ mod tests {
     }
 
     #[test]
-    fn render_states_of_terminal_states_lists_every_state() {
-        let sql = render_states("{states}", TERMINAL_STATES);
-        for state in TERMINAL_STATES {
-            assert!(sql.contains(&format!("'{state}'")), "{state} missing");
-        }
+    fn states_without_migrated_equal_terminal_states_minus_migrated() {
+        let expected: Vec<&str> = TERMINAL_STATES
+            .iter()
+            .copied()
+            .filter(|state| *state != "MIGRATED")
+            .collect();
+        assert_eq!(
+            TERMINAL_STATES_WITHOUT_MIGRATED, expected,
+            "a new terminal state needs a decision: add it to both lists or document why not"
+        );
     }
 
     // ── tombstone_payload_fields ──────────────────────────────────────────────
