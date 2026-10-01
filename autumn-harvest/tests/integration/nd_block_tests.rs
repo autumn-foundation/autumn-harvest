@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use autumn_harvest::context::empty_shared_state;
 use autumn_harvest::event::WorkflowEvent;
-use autumn_harvest::info::WorkflowInfo;
+use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
 use autumn_harvest::schema::{harvest_task_queue, harvest_timers, harvest_workflow_executions};
 use autumn_harvest::store;
 use autumn_harvest::telemetry::{MetricsRecorder, TelemetryConfig};
@@ -269,10 +269,19 @@ fn make_worker(
     metrics: Arc<dyn MetricsRecorder + Send + Sync>,
     build_id: &str,
 ) -> Worker {
+    make_worker_with_activities(workflows, vec![], metrics, build_id)
+}
+
+fn make_worker_with_activities(
+    workflows: Vec<WorkflowInfo>,
+    activities: Vec<ActivityInfo>,
+    metrics: Arc<dyn MetricsRecorder + Send + Sync>,
+    build_id: &str,
+) -> Worker {
     let telemetry = Arc::new(TelemetryConfig::builder().metrics(metrics).build());
     let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
         workflows,
-        vec![],
+        activities,
         empty_shared_state(),
         telemetry,
     ));
@@ -1317,4 +1326,387 @@ async fn nd_blocked_cycle_does_not_emit_signal_unhandled() {
         "co-location proof: the terminal-failed counter (same match arm) is also \
          suppressed on ND-block, so signal.unhandled — emitted from that arm — is too"
     );
+}
+
+// ── Issue #1791: unconsumed-history drift on the worker path ───────────────
+//
+// The strict and canary executors ND-block a run that ends a cycle with
+// recorded history unconsumed. These tests pin the same guard on the
+// production worker path.
+
+/// Queue that no worker polls, so its activities stay scheduled.
+const NOWHERE_QUEUE: &str = "nd-nowhere";
+
+/// Activity handler that never finishes.
+fn never_finishing_activity(
+    _ctx: &autumn_harvest::ActivityContext,
+    _input: Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + '_>> {
+    Box::pin(std::future::pending())
+}
+
+/// Register `name` on [`NOWHERE_QUEUE`] with a handler that never finishes.
+///
+/// The worker schedules only activities that it has a handler for.
+const fn nowhere_activity(name: &'static str) -> ActivityInfo {
+    ActivityInfo {
+        name,
+        module: "nd_block_tests",
+        default_retry_policy: None,
+        default_start_to_close: None,
+        default_heartbeat_timeout: None,
+        default_schedule_to_start: None,
+        default_schedule_to_close: None,
+        default_queue: Some(NOWHERE_QUEUE),
+        max_concurrent: None,
+        concurrency_key: None,
+        rate_limit_rps: None,
+        rate_limit_burst: None,
+        rate_limit_key: None,
+        rate_limit_key_expr: None,
+        circuit_breaker: None,
+        is_local: false,
+        max_input_bytes: None,
+        max_result_bytes: None,
+        requires: None,
+        handler: never_finishing_activity,
+    }
+}
+
+/// v1: arm the timer and schedule two activities in one batch.
+///
+/// The activities go to a queue that no worker polls. The history then
+/// holds two `ActivityScheduled` events after the `TimerStarted`.
+fn trailing_activities_v1_handler(
+    ctx: &WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + '_>> {
+    Box::pin(async move {
+        let (timer, a, b) = futures::join!(
+            ctx.timer("nd-gate", 300),
+            ctx.execute_activity_raw("nd_trailing_a", Value::Null, NOWHERE_QUEUE),
+            ctx.execute_activity_raw("nd_trailing_b", Value::Null, NOWHERE_QUEUE),
+        );
+        timer.map_err(|e| e.to_string())?;
+        a.map_err(|e| e.to_string())?;
+        b.map_err(|e| e.to_string())?;
+        Ok(serde_json::json!("v1-completed"))
+    })
+}
+
+/// v2: the deploy deletes both activity calls and keeps the timer.
+fn trailing_activities_v2_handler(
+    ctx: &WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + '_>> {
+    Box::pin(async move {
+        ctx.timer("nd-gate", 300).await.map_err(|e| e.to_string())?;
+        Ok(serde_json::json!("v2-completed"))
+    })
+}
+
+/// v2: the deploy deletes the timer and waits for a signal instead.
+fn signal_wait_v2_handler(
+    ctx: &WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + '_>> {
+    Box::pin(async move {
+        ctx.wait_for_signal("nd-go")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!("v2-completed"))
+    })
+}
+
+/// Healthy control: wait for the timer, then for a signal.
+fn timer_then_signal_handler(
+    ctx: &WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + '_>> {
+    Box::pin(async move {
+        ctx.timer("nd-gate", 300).await.map_err(|e| e.to_string())?;
+        ctx.wait_for_signal("nd-go")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!("signal-completed"))
+    })
+}
+
+/// A workflow id that is unique per run, so tests can share one database.
+fn unique_workflow_id(prefix: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("{prefix}-{nanos}")
+}
+
+/// Run one build until `ready` holds for the history, then stop it.
+async fn run_build_until(
+    url: &str,
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    worker: Worker,
+    ready: impl Fn(&[WorkflowEvent]) -> bool,
+) {
+    let (worker, handle) = spawn_worker(worker, build_pool(url));
+    for _ in 0..400 {
+        if ready(&get_history(conn, exec_id).await) {
+            worker.shutdown();
+            let _ = handle.await;
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let history = get_history(conn, exec_id).await;
+    panic!("execution {exec_id} never reached the expected history: {history:?}");
+}
+
+/// Append a `SignalReceived` event directly to the history.
+async fn inject_signal(conn: &mut AsyncPgConnection, exec_id: ExecutionId, name: &str) {
+    let next_id = i32::try_from(get_history(conn, exec_id).await.len()).unwrap();
+    store::append_events(
+        conn,
+        exec_id,
+        &[WorkflowEvent::SignalReceived {
+            signal_name: name.into(),
+            payload: Value::Null,
+        }],
+        next_id,
+    )
+    .await
+    .expect("inject SignalReceived");
+}
+
+/// Assert that the run is ND-blocked and was never completed or failed.
+///
+/// `expected_event` is the recorded event that the new build skipped.
+async fn assert_drift_blocked(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    metrics: &RecordingMetrics,
+    expected_event: &str,
+) {
+    let (blocked, reason, count, attrs) = wait_for_nd_block(conn, exec_id, 1).await;
+    assert!(blocked, "nd_blocked_at must be set");
+    assert_eq!(count, 1);
+    assert_eq!(get_state(conn, exec_id).await, "RUNNING");
+    let history = get_history(conn, exec_id).await;
+    assert!(
+        !history.iter().any(|e| matches!(
+            e,
+            WorkflowEvent::WorkflowCompleted { .. } | WorkflowEvent::WorkflowFailed { .. }
+        )),
+        "a drifted run must have no terminal event: {history:?}"
+    );
+    assert!(
+        reason
+            .as_deref()
+            .is_some_and(|r| r.contains("non-deterministic replay")),
+        "nd_block_reason must carry the divergence error: {reason:?}"
+    );
+    let attrs = attrs.expect("search_attrs must be stamped");
+    assert_eq!(attrs["failure_cause"], "non_determinism");
+    assert!(
+        attrs["expected"]
+            .as_str()
+            .is_some_and(|e| e.contains(expected_event)),
+        "expected must name the skipped event {expected_event}: {attrs}"
+    );
+    assert!(attrs["event_index"].is_number());
+    assert_eq!(attrs["build_id"], "v2");
+    assert_eq!(metrics.nd_block_count(), 1);
+    assert_eq!(metrics.terminal_failed_count(), 0);
+}
+
+/// Issue #1791, scenario 1: a deploy deletes the last two activity calls.
+///
+/// v2 returns `Ok` with both `ActivityScheduled` events unconsumed. The
+/// worker must ND-block the run. It must not persist `WorkflowCompleted`.
+#[tokio::test]
+async fn trailing_activity_drift_blocks_instead_of_completing() {
+    let (url, _c) = setup_env_or_container().await;
+    let mut conn = connect(&url).await;
+    let metrics = Arc::new(RecordingMetrics::default());
+    let exec_id = start_workflow(
+        &mut conn,
+        "nd_trailing_wf",
+        &unique_workflow_id("nd-trailing"),
+    )
+    .await;
+
+    // Phase 1: v1 records the timer and both activities, then parks.
+    run_build_until(
+        &url,
+        &mut conn,
+        exec_id,
+        make_worker_with_activities(
+            vec![wf_info("nd_trailing_wf", trailing_activities_v1_handler)],
+            vec![
+                nowhere_activity("nd_trailing_a"),
+                nowhere_activity("nd_trailing_b"),
+            ],
+            metrics.clone(),
+            "v1",
+        ),
+        |history| {
+            history
+                .iter()
+                .filter(|e| matches!(e, WorkflowEvent::ActivityScheduled { .. }))
+                .count()
+                == 2
+        },
+    )
+    .await;
+
+    // Phase 2: the timer fires under v2, which no longer calls the activities.
+    fire_timer_now(&mut conn, exec_id).await;
+    make_task_claimable_now(&mut conn, exec_id).await;
+    let (worker2, handle2) = spawn_worker(
+        make_worker(
+            vec![wf_info("nd_trailing_wf", trailing_activities_v2_handler)],
+            metrics.clone(),
+            "v2",
+        ),
+        build_pool(&url),
+    );
+    assert_drift_blocked(&mut conn, exec_id, &metrics, "ActivityScheduled").await;
+    worker2.shutdown();
+    let _ = handle2.await;
+}
+
+/// Issue #1791, scenario 2: a stray `TimerStarted` ahead of a signal wait.
+///
+/// v2 replaced the timer with a signal wait. The timer fires, so v2 parks
+/// on a signal that never arrives. The worker must ND-block the run. It
+/// must not park the run forever.
+#[tokio::test]
+async fn stray_timer_before_signal_wait_blocks_instead_of_parking() {
+    let (url, _c) = setup_env_or_container().await;
+    let mut conn = connect(&url).await;
+    let metrics = Arc::new(RecordingMetrics::default());
+    let exec_id = start_workflow(&mut conn, "nd_stray_wf", &unique_workflow_id("nd-stray")).await;
+
+    run_build_until(
+        &url,
+        &mut conn,
+        exec_id,
+        make_worker(
+            vec![wf_info("nd_stray_wf", timer_v1_handler)],
+            metrics.clone(),
+            "v1",
+        ),
+        |history| {
+            history
+                .iter()
+                .any(|e| matches!(e, WorkflowEvent::TimerStarted { .. }))
+        },
+    )
+    .await;
+
+    fire_timer_now(&mut conn, exec_id).await;
+    make_task_claimable_now(&mut conn, exec_id).await;
+    let (worker2, handle2) = spawn_worker(
+        make_worker(
+            vec![wf_info("nd_stray_wf", signal_wait_v2_handler)],
+            metrics.clone(),
+            "v2",
+        ),
+        build_pool(&url),
+    );
+    assert_drift_blocked(&mut conn, exec_id, &metrics, "TimerStarted").await;
+    worker2.shutdown();
+    let _ = handle2.await;
+}
+
+/// Issue #1791, scenario 2 with the signal delivered.
+///
+/// The signal wait now resolves, so v2 returns `Ok` with the stray
+/// `TimerStarted` unconsumed. The worker must ND-block the run.
+#[tokio::test]
+async fn stray_timer_before_delivered_signal_blocks_instead_of_completing() {
+    let (url, _c) = setup_env_or_container().await;
+    let mut conn = connect(&url).await;
+    let metrics = Arc::new(RecordingMetrics::default());
+    let exec_id = start_workflow(
+        &mut conn,
+        "nd_stray_sig_wf",
+        &unique_workflow_id("nd-stray-sig"),
+    )
+    .await;
+
+    run_build_until(
+        &url,
+        &mut conn,
+        exec_id,
+        make_worker(
+            vec![wf_info("nd_stray_sig_wf", timer_v1_handler)],
+            metrics.clone(),
+            "v1",
+        ),
+        |history| {
+            history
+                .iter()
+                .any(|e| matches!(e, WorkflowEvent::TimerStarted { .. }))
+        },
+    )
+    .await;
+
+    inject_signal(&mut conn, exec_id, "nd-go").await;
+    make_task_claimable_now(&mut conn, exec_id).await;
+    let (worker2, handle2) = spawn_worker(
+        make_worker(
+            vec![wf_info("nd_stray_sig_wf", signal_wait_v2_handler)],
+            metrics.clone(),
+            "v2",
+        ),
+        build_pool(&url),
+    );
+    assert_drift_blocked(&mut conn, exec_id, &metrics, "TimerStarted").await;
+    worker2.shutdown();
+    let _ = handle2.await;
+}
+
+/// Issue #1791 control: a healthy run must not ND-block.
+///
+/// A signal arrives while the run waits on its timer. The cycle parks with
+/// the signal not yet consumed, which is normal on the live path. The run
+/// must then complete with no ND-block.
+#[tokio::test]
+async fn early_signal_while_parked_does_not_block() {
+    let (url, _c) = setup_env_or_container().await;
+    let mut conn = connect(&url).await;
+    let metrics = Arc::new(RecordingMetrics::default());
+    let exec_id = start_workflow(
+        &mut conn,
+        "nd_early_sig_wf",
+        &unique_workflow_id("nd-early-sig"),
+    )
+    .await;
+    let (worker, handle) = spawn_worker(
+        make_worker(
+            vec![wf_info("nd_early_sig_wf", timer_then_signal_handler)],
+            metrics.clone(),
+            "v1",
+        ),
+        build_pool(&url),
+    );
+    wait_for_timer_started(&mut conn, exec_id).await;
+
+    // The signal wakes the run before the timer fires. The cycle must park.
+    inject_signal(&mut conn, exec_id, "nd-go").await;
+    make_task_claimable_now(&mut conn, exec_id).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let (blocked, reason, _, _) = get_nd_block_row(&mut conn, exec_id).await;
+    assert!(!blocked, "a pending signal is not drift: {reason:?}");
+    assert_eq!(get_state(&mut conn, exec_id).await, "RUNNING");
+
+    // The timer fires. The run consumes the signal and completes.
+    fire_timer_now(&mut conn, exec_id).await;
+    make_task_claimable_now(&mut conn, exec_id).await;
+    wait_for_state(&mut conn, exec_id, &["COMPLETED"]).await;
+    worker.shutdown();
+    let _ = handle.await;
+    assert_eq!(metrics.nd_block_count(), 0);
+    assert_eq!(metrics.nd_detection_count(), 0);
 }
