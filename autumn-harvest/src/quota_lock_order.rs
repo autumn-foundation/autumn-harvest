@@ -1,11 +1,25 @@
-//! Deadlock-free ordering of a claimed scanner batch (issue #1230, #1752).
+//! Deadlock-free ordering of a claimed scanner batch (issues #1230, #1752).
+//!
+//! The debounce and throttle scanners each claim a batch of due rows. They
+//! fire the rows one at a time in one transaction. Each fire takes a quota
+//! advisory lock through [`crate::quota::lock_quota_key`].
+//!
+//! Two scanner transactions can claim disjoint batches that need the same
+//! two quota locks in opposite order. That is an ABBA wait-for cycle.
+//! Postgres aborts one transaction with a raw `deadlock_detected` error.
+//! No arm in a scanner fire path catches that error. It aborts every other
+//! duty in the same tick.
+//!
+//! [`order_due_rows_for_deadlock_free_firing`] closes the cycle. It sorts
+//! the batch by the advisory-lock id each row will take. Every transaction
+//! then visits shared locks in the same order.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use crate::quota::QuotaPolicy;
 
 /// A claimed scanner row that can need a quota advisory lock.
-pub(crate) trait QuotaLockRow {
+pub trait QuotaLockRow: Send + Sync {
     /// Workflow the row starts.
     fn workflow_name(&self) -> &str;
     /// Input the quota key expression reads.
@@ -13,43 +27,161 @@ pub(crate) trait QuotaLockRow {
 }
 
 /// Quota policies by workflow name.
-pub(crate) type QuotaPolicies = HashMap<String, QuotaPolicy>;
+pub type QuotaPolicies = HashMap<String, QuotaPolicy>;
 
 /// Resolved advisory-lock ids by `(workflow_name, quota_key)`.
-pub(crate) type LockIds = HashMap<(String, String), i32>;
+pub type LockIds = HashMap<(String, String), i32>;
 
-pub(crate) fn resolve_row_quota_lock_key<R: QuotaLockRow>(
-    _row: &R,
-    _quota_by_workflow: &QuotaPolicies,
+/// Resolve the `(workflow_name, quota_key)` a fresh start of this row locks.
+///
+/// Return `None` when no cap applies. The function takes the policies as a
+/// plain map. It never reads the global workflow metadata. A unit test can
+/// therefore use a local map, with no database and no global state.
+pub fn resolve_row_quota_lock_key<R: QuotaLockRow>(
+    row: &R,
+    quota_by_workflow: &QuotaPolicies,
 ) -> Option<(String, String)> {
-    todo!("issue #1752")
+    let policy = *quota_by_workflow.get(row.workflow_name())?;
+    if !policy.has_any_cap() {
+        return None;
+    }
+    let key = crate::quota::resolve_quota_key(policy.key_expr, row.quota_input())?;
+    Some((row.workflow_name().to_owned(), key))
 }
 
-pub(crate) fn snapshot_quota_policies() -> QuotaPolicies {
-    todo!("issue #1752")
+/// Snapshot every declared quota policy in one read.
+///
+/// The read comes from [`crate::completion_trigger::GLOBAL_WORKFLOW_METADATA`].
+/// One read serves the whole batch.
+pub fn snapshot_quota_policies() -> QuotaPolicies {
+    crate::completion_trigger::GLOBAL_WORKFLOW_METADATA
+        .read()
+        .ok()
+        .and_then(|lock| {
+            lock.as_ref().map(|map| {
+                map.iter()
+                    .filter_map(|(name, meta)| meta.quota.map(|q| (name.clone(), q)))
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
 }
 
-pub(crate) async fn resolve_quota_lock_ids<R: QuotaLockRow>(
-    _conn: &mut diesel_async::AsyncPgConnection,
-    _due_rows: &[R],
-    _quota_by_workflow: &QuotaPolicies,
+/// Resolve the real advisory-lock id of every row, in one round trip.
+///
+/// The id is the `hashtext` value [`crate::quota::lock_quota_key`] locks on.
+/// Rust cannot compute it. Postgres documents `hashtext` as an
+/// implementation detail. Only Postgres can give the matching value.
+pub async fn resolve_quota_lock_ids<R: QuotaLockRow>(
+    conn: &mut diesel_async::AsyncPgConnection,
+    due_rows: &[R],
+    quota_by_workflow: &QuotaPolicies,
 ) -> crate::error::HarvestResult<LockIds> {
-    todo!("issue #1752")
+    // Defined before any statements to satisfy clippy::items_after_statements.
+    #[derive(diesel::QueryableByName)]
+    struct HashRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        namespace: String,
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        lock_id: i32,
+    }
+
+    use diesel_async::RunQueryDsl;
+
+    let distinct_keys: BTreeSet<(String, String)> = due_rows
+        .iter()
+        .filter_map(|row| resolve_row_quota_lock_key(row, quota_by_workflow))
+        .collect();
+    if distinct_keys.is_empty() {
+        return Ok(LockIds::new());
+    }
+
+    let namespaces: Vec<String> = distinct_keys
+        .iter()
+        .map(|(workflow_name, quota_key)| {
+            crate::quota::quota_lock_namespace(workflow_name, quota_key)
+        })
+        .collect();
+
+    let hash_of_namespace: HashMap<String, i32> = diesel::sql_query(
+        "SELECT n AS namespace, hashtext(n) AS lock_id FROM unnest($1::text[]) AS n",
+    )
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(&namespaces)
+    .load::<HashRow>(conn)
+    .await
+    .map_err(crate::error::database_error)?
+    .into_iter()
+    .map(|r| (r.namespace, r.lock_id))
+    .collect();
+
+    Ok(distinct_keys
+        .into_iter()
+        .filter_map(|(workflow_name, quota_key)| {
+            let namespace = crate::quota::quota_lock_namespace(&workflow_name, &quota_key);
+            let lock_id = *hash_of_namespace.get(&namespace)?;
+            Some(((workflow_name, quota_key), lock_id))
+        })
+        .collect())
 }
 
-pub(crate) fn order_rows_by_quota_lock_id<R: QuotaLockRow>(
-    _due_rows: Vec<R>,
-    _quota_by_workflow: &QuotaPolicies,
-    _lock_id_of: &LockIds,
+/// Sort rows by their already-resolved advisory-lock id.
+///
+/// The sort uses the id, not the `(workflow_name, quota_key)` strings.
+/// `hashtext` is 32 bits wide, so two distinct keys can share one id.
+/// Sorting the strings would not keep the lock order across such a pair.
+/// That would reopen the ABBA cycle. Rows with equal ids compare equal.
+///
+/// The sort is stable and compares only the id. Rows with the same id, or
+/// with no id, keep the claim order. Each scanner claim query sets that
+/// order. Tie-breaking on `workflow_id` once scrambled it.
+///
+/// The function only reorders. It takes no lock. Each row still locks its
+/// execution row first, then its quota key. A direct start uses the same
+/// order. Locking every quota key up front would invert it and recreate
+/// the ABBA hazard against a direct start.
+pub fn order_rows_by_quota_lock_id<R: QuotaLockRow>(
+    due_rows: Vec<R>,
+    quota_by_workflow: &QuotaPolicies,
+    lock_id_of: &LockIds,
 ) -> Vec<R> {
-    todo!("issue #1752")
+    let mut decorated: Vec<(Option<i32>, R)> = due_rows
+        .into_iter()
+        .map(|row| {
+            let id = resolve_row_quota_lock_key(&row, quota_by_workflow)
+                .and_then(|key| lock_id_of.get(&key).copied());
+            (id, row)
+        })
+        .collect();
+    decorated.sort_by_key(|(id, _)| *id);
+    decorated.into_iter().map(|(_, row)| row).collect()
 }
 
-pub(crate) async fn order_due_rows_for_deadlock_free_firing<R: QuotaLockRow + Send>(
-    _conn: &mut diesel_async::AsyncPgConnection,
-    _due_rows: Vec<R>,
+/// Order a claimed batch so concurrent scanner transactions cannot deadlock.
+///
+/// Snapshot the policies once. Resolve the lock ids in one round trip. Sort
+/// with [`order_rows_by_quota_lock_id`].
+///
+/// One hazard remains. A transaction that holds one row key exposes every
+/// later row. A direct start under `TerminateIfRunning` resolves its quota
+/// key from its own, newer input. That key can match a key this transaction
+/// already holds. No row order closes this. Only one execution lock at a
+/// time would close it. That conflicts with one cap across one batch.
+/// The hazard predates this ordering.
+///
+/// The policy snapshot is an explicit argument of the pure functions. A
+/// test that read the global metadata would race with `worker.rs` tests.
+/// Those tests write the same global on every registry build.
+pub async fn order_due_rows_for_deadlock_free_firing<R: QuotaLockRow>(
+    conn: &mut diesel_async::AsyncPgConnection,
+    due_rows: Vec<R>,
 ) -> crate::error::HarvestResult<Vec<R>> {
-    todo!("issue #1752")
+    let quota_by_workflow = snapshot_quota_policies();
+    let lock_id_of = resolve_quota_lock_ids(conn, &due_rows, &quota_by_workflow).await?;
+    Ok(order_rows_by_quota_lock_id(
+        due_rows,
+        &quota_by_workflow,
+        &lock_id_of,
+    ))
 }
 
 #[cfg(test)]
@@ -131,7 +263,11 @@ mod tests {
     #[test]
     fn keeps_every_row_when_rows_share_one_key() {
         let lock_id_of = LockIds::from([lock_id("t1", 1)]);
-        let rows = vec![row("wf_a", "t1", 0), row("wf_a", "t1", 1), row("wf_a", "t1", 2)];
+        let rows = vec![
+            row("wf_a", "t1", 0),
+            row("wf_a", "t1", 1),
+            row("wf_a", "t1", 2),
+        ];
         assert_eq!(
             order_rows_by_quota_lock_id(rows, &capped(), &lock_id_of).len(),
             3
@@ -141,7 +277,11 @@ mod tests {
     #[test]
     fn keeps_claim_order_for_rows_sharing_one_key() {
         let lock_id_of = LockIds::from([lock_id("t1", 1)]);
-        let rows = vec![row("wf_a", "t1", 2), row("wf_a", "t1", 0), row("wf_a", "t1", 1)];
+        let rows = vec![
+            row("wf_a", "t1", 2),
+            row("wf_a", "t1", 0),
+            row("wf_a", "t1", 1),
+        ];
         let fired = order_rows_by_quota_lock_id(rows, &capped(), &lock_id_of);
         assert_eq!(ids(&fired), vec![2, 0, 1]);
     }
@@ -174,7 +314,10 @@ mod tests {
     #[test]
     fn a_policy_without_caps_has_no_lock_key() {
         let quota = HashMap::from([("wf_a".to_string(), QuotaPolicy::new("tenant_id"))]);
-        assert_eq!(resolve_row_quota_lock_key(&row("wf_a", "t1", 0), &quota), None);
+        assert_eq!(
+            resolve_row_quota_lock_key(&row("wf_a", "t1", 0), &quota),
+            None
+        );
     }
 
     #[test]
@@ -183,7 +326,10 @@ mod tests {
             "wf_a".to_string(),
             QuotaPolicy::new("no_such_field").with_max_active_executions(100),
         )]);
-        assert_eq!(resolve_row_quota_lock_key(&row("wf_a", "t1", 0), &quota), None);
+        assert_eq!(
+            resolve_row_quota_lock_key(&row("wf_a", "t1", 0), &quota),
+            None
+        );
     }
 
     #[test]
@@ -212,7 +358,10 @@ mod tests {
                 "fn resolve_row_quota_lock_key",
                 "fn snapshot_quota_policies",
             ] {
-                assert!(!production.contains(local), "{name} must not define `{local}`");
+                assert!(
+                    !production.contains(local),
+                    "{name} must not define `{local}`"
+                );
             }
         }
     }

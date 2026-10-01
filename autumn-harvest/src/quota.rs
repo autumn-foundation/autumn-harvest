@@ -752,7 +752,7 @@ pub async fn list_quota_usage(conn: &mut AsyncPgConnection) -> HarvestResult<Vec
 
 /// The exact advisory-lock namespace string [`lock_quota_key`] hashes. A
 /// single source of truth. A scanner's pre-fire lock-ordering pass
-/// (`debounce`/`throttle`'s `order_due_rows_for_deadlock_free_firing`) can
+/// ([`crate::quota_lock_order`]) can
 /// then resolve the SAME string this function locks on. It never uses an
 /// independently-formatted copy that could silently drift from it.
 #[cfg(feature = "db")]
