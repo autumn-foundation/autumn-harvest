@@ -31,12 +31,14 @@ jobs:
   watchdog:
     name: Chaos nightly watchdog
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # Each step has its own timeout, and they sum to less than this. A step
+    # timeout is a step failure, so the report step still runs. A job timeout
+    # is a cancel, and then the report step does not run.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        timeout-minutes: 2
       - name: Alert when no scheduled chaos run succeeded in 48 h
-        # A step timeout is a step failure, so the report step below runs.
-        # A job timeout is a cancel, and then it does not run.
         timeout-minutes: 3
         env:
           GH_TOKEN: ${{ github.token }}
@@ -45,6 +47,7 @@ jobs:
       # run. This step puts a red watchdog run on its own issue instead.
       - name: Report a failed watchdog run on an issue
         if: failure()
+        timeout-minutes: 2
         env:
           GH_TOKEN: ${{ github.token }}
         # If checkout failed, the script is not on disk. Then comment on the
