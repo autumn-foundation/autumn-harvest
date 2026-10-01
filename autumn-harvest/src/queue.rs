@@ -1292,7 +1292,7 @@ pub async fn claim_task(
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] on query failure.
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub async fn claim_task_on_shard(
     conn: &mut AsyncPgConnection,
     queues: &[String],
@@ -1302,6 +1302,41 @@ pub async fn claim_task_on_shard(
     circuit_breaker_activities: &[String],
     ineligible_activities: &[String],
     shard: Option<crate::types::ShardId>,
+) -> HarvestResult<Option<TaskQueueItem>> {
+    claim_task_of_kind_on_shard(
+        conn,
+        queues,
+        worker_id,
+        worker_build_id,
+        priority_aging_secs,
+        circuit_breaker_activities,
+        ineligible_activities,
+        shard,
+        None,
+    )
+    .await
+}
+
+/// [`claim_task_on_shard`], limited to one task kind when `kind` is set
+/// (issue #1787).
+///
+/// `None` issues the unchanged statement. `Some` adds one literal predicate.
+/// See [`claim_task_query_for_kind`].
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+pub async fn claim_task_of_kind_on_shard(
+    conn: &mut AsyncPgConnection,
+    queues: &[String],
+    worker_id: &str,
+    worker_build_id: &str,
+    priority_aging_secs: Option<u32>,
+    circuit_breaker_activities: &[String],
+    ineligible_activities: &[String],
+    shard: Option<crate::types::ShardId>,
+    kind: Option<TaskType>,
 ) -> HarvestResult<Option<TaskQueueItem>> {
     // Two-phase claim using a CTE to avoid holding advisory locks during
     // broad WHERE filtering.
@@ -1443,7 +1478,10 @@ pub async fn claim_task_on_shard(
                 // engine's hottest statement.
                 let result: Vec<TaskQueueItem> = match fence_binding(shard) {
                     None => {
-                        diesel::sql_query(claim_task_query())
+                        let query = kind.map_or_else(claim_task_query, |kind| {
+                            claim_task_query_for_kind(kind, false)
+                        });
+                        diesel::sql_query(query)
                             .bind::<diesel::sql_types::Text, _>(worker_id)
                             .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
                             .bind::<diesel::sql_types::Text, _>(worker_build_id)
@@ -1460,7 +1498,10 @@ pub async fn claim_task_on_shard(
                             .await
                     }
                     Some((fence_shard, generation)) => {
-                        diesel::sql_query(claim_task_query_fenced())
+                        let query = kind.map_or_else(claim_task_query_fenced, |kind| {
+                            claim_task_query_for_kind(kind, true)
+                        });
+                        diesel::sql_query(query)
                             .bind::<diesel::sql_types::Text, _>(worker_id)
                             .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
                             .bind::<diesel::sql_types::Text, _>(worker_build_id)
@@ -1593,6 +1634,49 @@ pub fn claim_task_by_id_query_fenced() -> &'static str {
     static BY_ID_FENCED: std::sync::LazyLock<String> =
         std::sync::LazyLock::new(|| splice_by_id_predicate(claim_task_query_fenced(), "$9"));
     &BY_ID_FENCED
+}
+
+/// Splice a literal task-kind predicate into the `candidate` CTE of `base`.
+///
+/// The by-id anchor appears exactly once in the base query. The assertion
+/// makes an edit that breaks it panic at first use.
+fn splice_kind_predicate(base: &str, kind: TaskType) -> String {
+    assert_eq!(
+        base.matches(BY_ID_ANCHOR).count(),
+        1,
+        "claim query kind anchor must appear exactly once"
+    );
+    base.replace(
+        BY_ID_ANCHOR,
+        &format!(
+            "{BY_ID_ANCHOR}AND harvest_task_queue.task_type = '{}' ",
+            kind.as_str()
+        ),
+    )
+}
+
+/// [`claim_task_query`] limited to one task kind (issue #1787).
+///
+/// A worker with a free permit for one kind only claims through this form.
+/// The predicate is a literal, so the binds do not change. With `fenced`, the
+/// base is [`claim_task_query_fenced`], which binds `$7` and `$8`.
+#[must_use]
+pub fn claim_task_query_for_kind(kind: TaskType, fenced: bool) -> &'static str {
+    use std::sync::LazyLock;
+    static WORKFLOW: LazyLock<String> =
+        LazyLock::new(|| splice_kind_predicate(claim_task_query(), TaskType::Workflow));
+    static ACTIVITY: LazyLock<String> =
+        LazyLock::new(|| splice_kind_predicate(claim_task_query(), TaskType::Activity));
+    static WORKFLOW_FENCED: LazyLock<String> =
+        LazyLock::new(|| splice_kind_predicate(claim_task_query_fenced(), TaskType::Workflow));
+    static ACTIVITY_FENCED: LazyLock<String> =
+        LazyLock::new(|| splice_kind_predicate(claim_task_query_fenced(), TaskType::Activity));
+    match (kind, fenced) {
+        (TaskType::Workflow, false) => &WORKFLOW,
+        (TaskType::Activity, false) => &ACTIVITY,
+        (TaskType::Workflow, true) => &WORKFLOW_FENCED,
+        (TaskType::Activity, true) => &ACTIVITY_FENCED,
+    }
 }
 
 /// What one claim transaction concluded.
@@ -11029,6 +11113,50 @@ mod tests {
         assert!(
             keys < predicate && predicate < counts,
             "the by-id key predicate must sit inside concurrency_pending_keys"
+        );
+    }
+
+    /// The kind form differs from its base by one literal predicate (issue
+    /// #1787). Every gate the base query proves therefore holds for it too.
+    #[test]
+    fn kind_claim_query_is_the_base_query_plus_one_predicate() {
+        for (kind, literal) in [
+            (TaskType::Workflow, "'workflow'"),
+            (TaskType::Activity, "'activity'"),
+        ] {
+            let predicate = format!("AND harvest_task_queue.task_type = {literal} ");
+            for (fenced, base) in [
+                (false, claim_task_query()),
+                (true, claim_task_query_fenced()),
+            ] {
+                let query = claim_task_query_for_kind(kind, fenced);
+                assert_eq!(query.matches(&predicate).count(), 1, "{kind} {fenced}");
+                assert_eq!(query.replacen(&predicate, "", 1), base, "{kind} {fenced}");
+            }
+        }
+    }
+
+    /// The kind form adds no bind. The fence keeps `$7` and `$8`.
+    #[test]
+    fn kind_claim_query_adds_no_bind() {
+        for kind in [TaskType::Workflow, TaskType::Activity] {
+            assert!(!claim_task_query_for_kind(kind, false).contains("$7"));
+            assert!(claim_task_query_for_kind(kind, true).contains("$8"));
+            assert!(!claim_task_query_for_kind(kind, true).contains("$9"));
+        }
+    }
+
+    #[test]
+    fn the_kind_predicate_lands_inside_the_candidate_cte() {
+        let query = claim_task_query_for_kind(TaskType::Activity, false);
+        let predicate = query
+            .find("AND harvest_task_queue.task_type = 'activity'")
+            .expect("predicate");
+        let candidate = query.find("candidate AS (").expect("candidate CTE");
+        let claimed = query.find("claimed AS (").expect("claimed CTE");
+        assert!(
+            candidate < predicate && predicate < claimed,
+            "the kind predicate must sit inside the candidate CTE"
         );
     }
 

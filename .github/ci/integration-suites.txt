@@ -114,6 +114,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          parent_close_cascade_unfinished_handlers_perf
 linux        autumn-harvest         integration                      -                          pause_tests
 linux        autumn-harvest         integration                      -                          poison_pill_reclaim_perf
+linux        autumn-harvest         integration                      -                          poll_capacity_gate_tests
 linux        autumn-harvest         integration                      -                          queue_pause_success_metric_tests
 linux        autumn-harvest         integration                      -                          queue_pause_tests
 linux        autumn-harvest         integration                      -                          quota_enforcement_tests
@@ -138,6 +139,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          shard_database_sweep_tests
 linux        autumn-harvest         integration                      -                          shard_placement_by_id_tests
 linux        autumn-harvest         integration                      -                          sharded_runtime_tests
+linux        autumn-harvest         integration                      -                          slot_tuner_tests
 linux        autumn-harvest         integration                      -                          start_idempotency_tests
 linux        autumn-harvest         integration                      -                          start_source_tests
 linux        autumn-harvest         integration                      -                          terminal_write_ownership_tests

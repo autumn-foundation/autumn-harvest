@@ -76,8 +76,10 @@ signals harvest already owns in-process** — no new external dependency, no
    `status()`) — is the pool at capacity, or does it have callers waiting for
    a connection?
 3. **Claim-to-dispatch permit-wait latency** — the longest time, since the
-   tuner's last tick, that a claimed task spent waiting for a local dispatch
-   permit before starting.
+   tuner's last tick, that a task waited before it held a local dispatch
+   permit. The wait runs from task eligibility, so it includes the queue wait.
+   A worker claims only against a free permit (issue #1787), so a backlog
+   waits in the queue, not at the permit.
 
 Decision order (first match wins), evaluated once per control-loop tick:
 
@@ -127,10 +129,9 @@ When a tuner is configured, a dispatch semaphore is created with
   revokes a permit already held by an in-flight task.
 
 **Fair-queue fallback for a busy worker.** `dispatch_task` spawns every
-claimed task as a queueing `semaphore.acquire()`, and claiming is not
-throttled against the live target — under a real backlog (claims outrunning
-dispatch capacity), the semaphore's wait queue can be continuously
-non-empty. `tokio::sync::Semaphore` always assigns a released permit
+claimed task as a queueing `semaphore.acquire()`. Claiming reads free permits,
+so withheld permits throttle it (issue #1787). A task in the short window
+between its claim and its permit can still queue on the semaphore. `tokio::sync::Semaphore` always assigns a released permit
 directly to the oldest queued waiter before it is ever visible to a
 concurrent `try_acquire()`, so a shrink that only ever tried `try_acquire`
 could lose that race indefinitely for as long as the backlog persisted —
@@ -165,7 +166,9 @@ worker is trying to wind down and exactly when the tuner may have shrunk
 pressure. In practice the window is narrow (bounded by how many tasks were
 claimed beyond the current live target at the moment of shutdown) and every
 started task still completes normally — this does not corrupt state, only
-temporarily exceeds the tuned band during shutdown. A future fix would have
+temporarily exceeds the tuned band during shutdown. Since issue #1787 a
+worker claims only against a free permit, so few tasks wait in this window.
+A future fix would have
 `drain_in_flight` wait for the tuner's live target directly instead of the
 full `max_slots`, removing the need to force-release withheld permits at
 all; tracked as follow-up work under issue #548.

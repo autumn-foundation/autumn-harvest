@@ -25344,8 +25344,9 @@ pub struct Worker {
     /// Total permits behind `activity_semaphore` (issue #548). See
     /// `workflow_permit_total`.
     activity_permit_total: usize,
-    /// Longest claim-to-dispatch permit-wait observed since the slot tuner's
-    /// last tick, in microseconds (issue #548). `None` when no tuner is
+    /// Longest wait from eligibility to a held permit observed since the slot
+    /// tuner's last tick, in microseconds (issue #548). It is the queue wait
+    /// plus the permit wait (issue #1787). `None` when no tuner is
     /// configured, so the hot dispatch path performs no extra work in the
     /// default (untuned) case. Reset to 0 by the tuner loop each tick
     /// (`AtomicU64::swap`).
@@ -25368,6 +25369,9 @@ pub struct Worker {
     /// Activity references claimed through the channel that do not hold their
     /// permit yet (issue #1312). See [`DispatchReservation`].
     dispatch_reserved_activity: Arc<AtomicUsize>,
+    /// Wakes a saturated poll loop when a task releases its permit (issue
+    /// #1787). See [`CapacityPermit`].
+    capacity_freed: Arc<tokio::sync::Notify>,
     /// Set the first time `spawn_monitoring_tasks` runs to completion (issue
     /// #548 review). Guards against a hypothetical second invocation (e.g. a
     /// future caller wrapping `run`/`run_with_listener` in a retry loop)
@@ -26529,6 +26533,8 @@ impl DispatchLoopState {
 ///
 /// The guard is created before the claim. It moves into the spawned task, which
 /// drops it as soon as it holds the permit. A claim that fails drops it at once.
+/// The Postgres poll path uses the same guard (issue #1787). See
+/// [`PollReservations`].
 #[derive(Debug)]
 struct DispatchReservation(Arc<AtomicUsize>);
 
@@ -26564,6 +26570,101 @@ const fn dispatch_kind_admitted(
         Some(crate::dispatch::DispatchKind::Workflow) => free_workflow > 0,
         Some(crate::dispatch::DispatchKind::Activity) => free_activity > 0,
         None => true,
+    }
+}
+
+/// What one Postgres poll may claim (issue #1787).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PollAdmission {
+    /// No pool has a free permit. The poll claims nothing.
+    Saturated,
+    /// Both pools have a free permit. The poll claims any kind.
+    Any,
+    /// Only the pool of this kind has a free permit.
+    Only(crate::queue::TaskType),
+}
+
+/// Which kinds one Postgres poll may claim (issue #1787).
+///
+/// A claim stamps `started_at`. Start-to-close and heartbeat deadlines run
+/// from `started_at`. A row claimed with no free permit waits on the local
+/// semaphore and uses its timeout budget. A peer with capacity cannot claim it.
+/// [`dispatch_kind_admitted`] is the same gate on the dispatch-channel path.
+const fn poll_admission(free_workflow: usize, free_activity: usize) -> PollAdmission {
+    use crate::queue::TaskType;
+    match (free_workflow > 0, free_activity > 0) {
+        (false, false) => PollAdmission::Saturated,
+        (true, true) => PollAdmission::Any,
+        (true, false) => PollAdmission::Only(TaskType::Workflow),
+        (false, true) => PollAdmission::Only(TaskType::Activity),
+    }
+}
+
+/// The reservations one Postgres poll holds across its claim (issue #1787).
+///
+/// The poll reserves each kind it may claim. The claimed row's reservation
+/// moves into the spawned task. The other reservation drops with this value.
+#[derive(Debug)]
+struct PollReservations {
+    workflow: Option<DispatchReservation>,
+    activity: Option<DispatchReservation>,
+}
+
+impl PollReservations {
+    /// Reserve `kind`, or both kinds when `kind` is `None`.
+    fn new(
+        kind: Option<crate::queue::TaskType>,
+        workflow: &Arc<AtomicUsize>,
+        activity: &Arc<AtomicUsize>,
+    ) -> Self {
+        use crate::queue::TaskType;
+        let reserve = |want: TaskType, counter: &Arc<AtomicUsize>| {
+            kind.is_none_or(|kind| kind == want)
+                .then(|| DispatchReservation::new(counter))
+        };
+        Self {
+            workflow: reserve(TaskType::Workflow, workflow),
+            activity: reserve(TaskType::Activity, activity),
+        }
+    }
+
+    /// Take the reservation for the `task_type` of a claimed row.
+    fn take(&mut self, task_type: &str) -> Option<DispatchReservation> {
+        use crate::queue::TaskType;
+        if task_type == TaskType::Workflow.as_str() {
+            self.workflow.take()
+        } else if task_type == TaskType::Activity.as_str() {
+            self.activity.take()
+        } else {
+            None
+        }
+    }
+}
+
+/// A held pool permit that wakes a saturated poll loop on release (issue
+/// #1787).
+///
+/// `Drop` returns the permit first and then notifies. A loop woken before the
+/// return would read the pool as full and wait again. `notify_one` stores one
+/// wake-up when no loop waits, so a release during a claim is not lost.
+struct CapacityPermit<'a> {
+    permit: Option<tokio::sync::SemaphorePermit<'a>>,
+    freed: Arc<tokio::sync::Notify>,
+}
+
+impl<'a> CapacityPermit<'a> {
+    fn new(permit: tokio::sync::SemaphorePermit<'a>, freed: &Arc<tokio::sync::Notify>) -> Self {
+        Self {
+            permit: Some(permit),
+            freed: Arc::clone(freed),
+        }
+    }
+}
+
+impl Drop for CapacityPermit<'_> {
+    fn drop(&mut self) {
+        drop(self.permit.take());
+        self.freed.notify_one();
     }
 }
 
@@ -26902,6 +27003,7 @@ impl Worker {
             activity_permit_wait_micros: activity_parts.permit_wait_micros,
             dispatch_reserved_workflow: Arc::new(AtomicUsize::new(0)),
             dispatch_reserved_activity: Arc::new(AtomicUsize::new(0)),
+            capacity_freed: Arc::new(tokio::sync::Notify::new()),
             monitoring_started: std::sync::atomic::AtomicBool::new(false),
             shutdown: CancellationToken::new(),
             remote_drain_deadline: Arc::new(Mutex::new(None)),
@@ -27676,6 +27778,10 @@ impl Worker {
             // All idle — rotate start so the next iteration begins at the next
             // shard in round-robin order regardless of which fired a NOTIFY.
             start_idx = (start_idx + 1) % n;
+
+            if self.wait_while_saturated().await {
+                continue;
+            }
 
             // All shards idle — poll all per-shard listeners in round-robin
             // with a short per-listener timeout (fix #6). Notifications are
@@ -29622,6 +29728,10 @@ impl Worker {
                 continue;
             }
 
+            if self.wait_while_saturated().await {
+                continue;
+            }
+
             if let Some(listener) = listener.as_mut() {
                 match listener
                     .wait_for_notification(self.config.poll_interval)
@@ -30083,6 +30193,36 @@ impl Worker {
         }
     }
 
+    /// What a Postgres poll may claim now. See [`poll_admission`].
+    fn poll_admission_now(&self) -> PollAdmission {
+        poll_admission(
+            Self::free_permits(&self.workflow_semaphore, &self.dispatch_reserved_workflow),
+            Self::free_permits(&self.activity_semaphore, &self.dispatch_reserved_activity),
+        )
+    }
+
+    /// Wait while no pool has a free permit (issue #1787).
+    ///
+    /// Returns `false` at once when a permit is free. Otherwise waits for a
+    /// released permit, for `poll_interval`, or for shutdown, and returns
+    /// `true`. A saturated loop waits here, not on its NOTIFY listener. A new
+    /// task cannot run until a permit is free.
+    ///
+    /// The `poll_interval` bound keeps the wait no longer than the idle wait
+    /// it replaces. A tuner that adds permits does not notify, so the bound
+    /// also catches that case.
+    async fn wait_while_saturated(&self) -> bool {
+        if self.poll_admission_now() != PollAdmission::Saturated {
+            return false;
+        }
+        tokio::select! {
+            () = self.shutdown.cancelled() => {}
+            () = self.capacity_freed.notified() => {}
+            () = tokio::time::sleep(self.config.poll_interval) => {}
+        }
+        true
+    }
+
     /// Execute a single poll iteration.
     ///
     /// Gets a connection from the pool, tries to claim a task, dispatches it
@@ -30100,6 +30240,21 @@ impl Worker {
         acquire_bound: Option<Duration>,
         shard: Option<crate::types::ShardId>,
     ) -> bool {
+        // Claim only against a free local permit (issue #1787). See
+        // [`poll_admission`]. A saturated poll takes no connection.
+        let kind = match self.poll_admission_now() {
+            PollAdmission::Saturated => return false,
+            PollAdmission::Any => None,
+            PollAdmission::Only(kind) => Some(kind),
+        };
+        // Reserved before the claim, as on the dispatch-channel path. See
+        // [`DispatchReservation`].
+        let mut reservations = PollReservations::new(
+            kind,
+            &self.dispatch_reserved_workflow,
+            &self.dispatch_reserved_activity,
+        );
+
         let mut conn = match acquire_shard_conn(pool, acquire_bound).await {
             Ok(conn) => conn,
             Err(e) => {
@@ -30146,7 +30301,7 @@ impl Worker {
                 // permutation. A claim that succeeds on the first
                 // (typically highest-weight) queue never pays for the rest.
                 let single_queue = [(*queue_name).to_owned()];
-                match queue::claim_task_on_shard(
+                match queue::claim_task_of_kind_on_shard(
                     &mut conn,
                     &single_queue,
                     &self.config.worker_id,
@@ -30155,6 +30310,7 @@ impl Worker {
                     circuit_breaker_activities,
                     &self.ineligible_activities,
                     shard,
+                    kind,
                 )
                 .await
                 {
@@ -30165,7 +30321,8 @@ impl Worker {
                             queue = %task.queue_name,
                             "claimed task (weighted)"
                         );
-                        self.dispatch_task(task, pool, None);
+                        let reservation = reservations.take(&task.task_type);
+                        self.dispatch_task(task, pool, reservation);
                         return true;
                     }
                     Ok(None) => {
@@ -30188,7 +30345,7 @@ impl Worker {
         }
 
         // --- Default (unweighted) path: original single ANY($2) query ---
-        match queue::claim_task_on_shard(
+        match queue::claim_task_of_kind_on_shard(
             &mut conn,
             &self.config.queues,
             &self.config.worker_id,
@@ -30197,6 +30354,7 @@ impl Worker {
             circuit_breaker_activities,
             &self.ineligible_activities,
             shard,
+            kind,
         )
         .await
         {
@@ -30207,17 +30365,13 @@ impl Worker {
                     queue = %task.queue_name,
                     "claimed task"
                 );
-                // schedule-to-start latency is recorded once the handler
-                // genuinely begins (in `process_workflow_task` /
-                // `process_activity_task`, past the dispatch-time defer/no-op
-                // gates), not here at claim time: the worker can over-claim past
-                // `max_concurrent_*` (the semaphore gates execution, not
-                // claiming), so measuring at claim would hide the time a task
-                // spends waiting behind a local permit on a saturated worker —
-                // exactly the capacity bottleneck the SLI is meant to page on.
-                // `schedule_to_start_secs` measures from task eligibility, so that
-                // permit wait is still captured in the recorded sample.
-                self.dispatch_task(task, pool, None);
+                // Schedule-to-start is recorded when the handler begins, in
+                // `process_workflow_task` / `process_activity_task`. It is not
+                // recorded here. The sample runs from task eligibility, so it
+                // includes the `PENDING` wait behind a saturated worker (issue
+                // #1787) and the short permit wait after the claim.
+                let reservation = reservations.take(&task.task_type);
+                self.dispatch_task(task, pool, reservation);
                 true
             }
             Ok(None) => {
@@ -30282,6 +30436,19 @@ impl Worker {
         };
         let session_slots_in_use = Arc::clone(&self.session_slots_in_use);
         let max_concurrent_sessions = self.config.max_concurrent_sessions;
+        let capacity_freed = Arc::clone(&self.capacity_freed);
+        // The time the row waited in `PENDING`, eligibility to claim, from
+        // database clocks. The poll gate holds a backlog in `PENDING`, not at
+        // the permit (issue #1787). The tuner signal below adds this wait so
+        // it still sees the backlog. Read only when a tuner is configured.
+        let queue_wait = permit_wait_micros.as_ref().map(|_| {
+            Duration::try_from_secs_f64(queue::schedule_to_start_secs(
+                task.scheduled_at,
+                task.created_at,
+                task.started_at.unwrap_or(task.scheduled_at),
+            ))
+            .unwrap_or_default()
+        });
 
         // Per-queue dispatch counter for live split observability (issue #515).
         self.registry
@@ -30362,6 +30529,8 @@ impl Worker {
                 tracing::error!(task_id = %task_id, "semaphore closed");
                 return;
             };
+            // The release wakes a saturated poll loop (issue #1787).
+            let permit = CapacityPermit::new(permit, &capacity_freed);
             // The permit is held, so the reference no longer needs a
             // reservation against it (issue #1312). The early return above
             // drops it too, so a closed semaphore cannot leak one.
@@ -30370,10 +30539,11 @@ impl Worker {
             // Feed the adaptive slot tuner's permit-wait signal (issue #548).
             // A lock-free fetch_max so concurrent dispatches never contend;
             // the tuner loop consumes (and resets) this via `swap(0, ..)`
-            // once per tick, off this hot path entirely.
+            // once per tick, off this hot path entirely. The signal is the
+            // queue wait plus the permit wait (issue #1787).
             if let Some(acc) = &permit_wait_micros {
-                let wait_micros =
-                    u64::try_from(dispatched_at.elapsed().as_micros()).unwrap_or(u64::MAX);
+                let wait = dispatched_at.elapsed() + queue_wait.unwrap_or_default();
+                let wait_micros = u64::try_from(wait.as_micros()).unwrap_or(u64::MAX);
                 acc.fetch_max(wait_micros, Ordering::Relaxed);
             }
 
@@ -42813,6 +42983,73 @@ mod tests {
             dispatch_kind_admitted(None, 0, 0),
             "an untyped reference keeps the behaviour it had before the kind existed"
         );
+    }
+
+    /// The Postgres poll path claims only a kind with a free permit (issue
+    /// #1787). A claimed row that waits on the local semaphore uses its
+    /// start-to-close budget, and a peer cannot take it.
+    #[test]
+    fn a_poll_claims_only_a_kind_with_a_free_permit() {
+        use crate::queue::TaskType;
+        assert_eq!(poll_admission(0, 0), PollAdmission::Saturated);
+        assert_eq!(
+            poll_admission(1, 0),
+            PollAdmission::Only(TaskType::Workflow),
+            "a free workflow permit cannot start an activity row"
+        );
+        assert_eq!(
+            poll_admission(0, 1),
+            PollAdmission::Only(TaskType::Activity),
+            "a free activity permit cannot start a workflow row"
+        );
+        assert_eq!(poll_admission(3, 5), PollAdmission::Any);
+    }
+
+    /// A poll reserves each kind it may claim. The claimed kind keeps its
+    /// reservation. The other kind releases its reservation at once.
+    #[test]
+    fn a_poll_keeps_only_the_reservation_of_the_kind_it_claimed() {
+        use crate::queue::TaskType;
+        let workflow = Arc::new(AtomicUsize::new(0));
+        let activity = Arc::new(AtomicUsize::new(0));
+        let mut reservations = PollReservations::new(None, &workflow, &activity);
+        assert_eq!(AtomicUsize::load(&workflow, Ordering::Relaxed), 1);
+        assert_eq!(AtomicUsize::load(&activity, Ordering::Relaxed), 1);
+        let kept = reservations.take(TaskType::Activity.as_str());
+        drop(reservations);
+        assert_eq!(AtomicUsize::load(&workflow, Ordering::Relaxed), 0);
+        assert_eq!(AtomicUsize::load(&activity, Ordering::Relaxed), 1);
+        drop(kept);
+        assert_eq!(AtomicUsize::load(&activity, Ordering::Relaxed), 0);
+
+        let only = PollReservations::new(Some(TaskType::Workflow), &workflow, &activity);
+        assert_eq!(AtomicUsize::load(&workflow, Ordering::Relaxed), 1);
+        assert_eq!(
+            AtomicUsize::load(&activity, Ordering::Relaxed),
+            0,
+            "a kind the poll cannot claim is not reserved"
+        );
+        drop(only);
+        assert_eq!(AtomicUsize::load(&workflow, Ordering::Relaxed), 0);
+    }
+
+    /// A released permit wakes a saturated poll loop (issue #1787).
+    #[tokio::test]
+    async fn a_released_permit_wakes_the_poll_loop() {
+        let semaphore = tokio::sync::Semaphore::new(1);
+        let freed = Arc::new(tokio::sync::Notify::new());
+        let permit = CapacityPermit::new(semaphore.acquire().await.expect("permit"), &freed);
+        assert_eq!(semaphore.available_permits(), 0);
+        let waiter = {
+            let freed = Arc::clone(&freed);
+            tokio::spawn(async move { freed.notified().await })
+        };
+        drop(permit);
+        assert_eq!(semaphore.available_permits(), 1);
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("the poll loop must wake")
+            .expect("waiter task");
     }
 
     /// A shard's batch must not spend a sibling's share of one kind's pool.

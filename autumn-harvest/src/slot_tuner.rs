@@ -110,6 +110,10 @@ pub struct SlotObservations {
     pub pool: Option<PoolPressure>,
     /// The longest claim-to-dispatch permit-wait observed since the previous
     /// tick, when any task was dispatched.
+    ///
+    /// The wait runs from task eligibility, so it includes the queue wait
+    /// (issue #1787). A worker claims only against a free permit. A backlog
+    /// therefore waits in the queue, not at the permit.
     pub max_permit_wait: Option<Duration>,
 }
 
