@@ -47,13 +47,21 @@ jobs:
         if: failure()
         env:
           GH_TOKEN: ${{ github.token }}
-        # If checkout failed, the script is not on disk. Then open the issue
-        # directly. The title must match `failed_title` in the script.
+        # If checkout failed, the script is not on disk. Then comment on the
+        # open issue, or open one, directly. The title must match
+        # `failed_title` in the script.
         run: |
           if [ -f .github/ci/chaos-watchdog.sh ]; then
             bash .github/ci/chaos-watchdog.sh self-failed
+            exit 0
+          fi
+          title="Chaos watchdog: a watchdog run failed"
+          body="The chaos watchdog run failed before checkout: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          issue="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search "\"$title\" in:title" --json number,title \
+            | jq -r --arg title "$title" 'map(select(.title == $title)) | .[0].number // empty')"
+          if [ -n "$issue" ]; then
+            gh issue comment "$issue" --repo "$GITHUB_REPOSITORY" --body "$body"
           else
-            gh issue create --repo "$GITHUB_REPOSITORY" \
-              --title "Chaos watchdog: a watchdog run failed" \
-              --body "The chaos watchdog run failed before checkout: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
           fi

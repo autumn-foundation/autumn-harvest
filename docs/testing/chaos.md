@@ -268,8 +268,8 @@ one. GitHub tells only the last editor of a cron about a failed scheduled run, s
 without this step the failure is silent. The next clean watchdog run closes that
 issue. The check step has its own 3-minute timeout. A step timeout is a failure,
 so the report step still runs. When checkout fails, the report step opens the
-issue without the script. A concurrency group runs one watchdog job at a time,
-so two runs cannot both open an issue.
+issue without the script, or comments on the open one. A concurrency group runs
+one watchdog job at a time, so two runs cannot both open an issue.
 
 ## Out of scope
 

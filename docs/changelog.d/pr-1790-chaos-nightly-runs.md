@@ -19,7 +19,7 @@ seeded convergence sweep never ran. The `core:chaos_tests` allowlist reason in
   the open one. After a success, it closes that issue. An API error fails the
   run. An `if: failure()` step then opens a separate issue for the failed
   watchdog run, also when checkout failed. The next clean run closes it. A
-  concurrency group runs one watchdog job at a time. Thirteen `chaos_watchdog`
+  concurrency group runs one watchdog job at a time. Fourteen `chaos_watchdog`
   tests run the script or the report step against a stub `gh` and the real `jq`
   on Linux. Four more check the watchdog workflow.
 - The chaos suite passes locally against Docker Postgres: 9 integration tests
