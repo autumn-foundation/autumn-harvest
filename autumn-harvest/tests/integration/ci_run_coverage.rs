@@ -1353,8 +1353,9 @@ fn all_workflows() -> BTreeSet<String> {
 /// `cargo test` flags that run no test, or less than the whole module.
 const NO_FULL_RUN_FLAGS: &[&str] = &["--no-run", "--exact", "--skip", "--ignored", "--list"];
 
-/// Shell text that makes a failed `cargo test` exit 0.
-const FAILURE_MASKS: &[&str] = &["||", "set +e", "exit 0"];
+/// Shell text that joins a second command to the step, or runs the command
+/// inside another one. Either can hide a failed `cargo test` or replace it.
+const SHELL_OPERATORS: &[&str] = &[";", "&", "|", "\n", "`", "$("];
 
 /// True when a job or step has no `if` and no `continue-on-error: true`.
 ///
@@ -1368,7 +1369,10 @@ fn ungated(node: &serde_yaml::Value) -> bool {
 }
 
 /// True when an ungated step in an ungated job runs the whole `chaos_tests`
-/// module with the `chaos` feature, and no shell text hides its failure.
+/// module with the `chaos` feature.
+///
+/// The step must be one plain `cargo test` command. Text that only contains
+/// the right arguments, such as an `echo`, runs no test.
 fn runs_the_chaos_suite_unconditionally(doc: &serde_yaml::Value) -> bool {
     let Some(jobs) = doc.get("jobs").and_then(serde_yaml::Value::as_mapping) else {
         return false;
@@ -1385,7 +1389,8 @@ fn runs_the_chaos_suite_unconditionally(doc: &serde_yaml::Value) -> bool {
                 && !run
                     .split_whitespace()
                     .any(|word| NO_FULL_RUN_FLAGS.iter().any(|f| word.starts_with(f)))
-                && !FAILURE_MASKS.iter().any(|mask| run.contains(mask))
+                && run.trim().starts_with("cargo test ")
+                && !SHELL_OPERATORS.iter().any(|op| run.trim().contains(op))
         })
 }
 

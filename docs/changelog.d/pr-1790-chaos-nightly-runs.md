@@ -12,7 +12,8 @@ seeded convergence sweep never ran. The `core:chaos_tests` allowlist reason in
   repeated key fails). It checks that `chaos.yml` has a cron and runs
   `chaos_tests::` with the `chaos` feature. An `if` or a
   `continue-on-error: true` on that step or job fails the check. So does a flag
-  such as `--no-run`, or `|| true`, in the step's `run:` text. On the old file,
+  such as `--no-run` in the step's `run:` text. The step must be one plain
+  `cargo test` command, so `|| true` or an `echo` also fails. On the old file,
   both tests failed at the parse step (RED: `line 57 column 72`).
 - New `chaos-watchdog.yml` runs `.github/ci/chaos-watchdog.sh` daily. With no
   successful scheduled chaos run in 48 h, it opens one issue, or comments on
