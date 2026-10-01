@@ -231,7 +231,68 @@ const SEAL_RACE_MAX_LOAD_RETRIES: u32 = 64;
 /// lock holder to block on.
 const SEAL_RACE_LOAD_BACKOFF_MS: u64 = 1;
 
-impl StartWorkflowParams<'_> {
+impl<'a> StartWorkflowParams<'a> {
+    /// Build params from the five required fields. Every other field gets a
+    /// neutral default (issue #1448).
+    ///
+    /// Use struct-update syntax to override only the fields a call site
+    /// varies: `StartWorkflowParams { owner, ..StartWorkflowParams::new(..) }`.
+    /// A field added later needs no edit at call sites that accept its default.
+    ///
+    /// `workflow_attempt` is `1`, the first attempt. Zero would grant one
+    /// extra retry beyond `max_attempts`.
+    #[must_use]
+    pub fn new(
+        workflow_name: &'a str,
+        workflow_id: &'a str,
+        exec_id: ExecutionId,
+        input: serde_json::Value,
+        queue_name: &'a str,
+    ) -> Self {
+        Self {
+            workflow_name,
+            workflow_id,
+            exec_id,
+            input,
+            parent_id: None,
+            queue_name,
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: WorkflowIdReusePolicy::default(),
+            conflict_policy: WorkflowIdConflictPolicy::default(),
+            trace_context: None,
+            max_execution_timeout_ceiling: None,
+            chain_execution_timeout: None,
+            max_workflow_chain_timeout_ceiling: None,
+            inherited_chain_deadline_at: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            concurrency_on_conflict: ConcurrencyOnConflict::default(),
+            priority: Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            context_headers: None,
+            sla: None,
+            schedule_id: None,
+            scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
+            origin: None,
+            completion_callbacks: None,
+            start_source: StartSource::default(),
+            start_source_ref: None,
+            started_by: None,
+        }
+    }
+
     /// Shard derived from the encoded `exec_id`, used to populate the row's
     /// `shard_id` column. Returns `0` when the caller passed an unencoded id
     /// (tests / legacy call sites), matching the pre-sharding default.
@@ -424,6 +485,123 @@ impl CancelledWorkflowExecution {
             queue_name,
             prior_state,
         }
+    }
+}
+
+#[cfg(test)]
+mod start_params_new_tests {
+    use super::StartWorkflowParams;
+    use crate::concurrency::ConcurrencyOnConflict;
+    use crate::types::{
+        ExecutionId, Priority, StartSource, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
+    };
+
+    /// `new` sets the five required fields and gives every other field its
+    /// neutral default (issue #1448).
+    ///
+    /// The destructure has no `..`. A new field breaks this test until its
+    /// default is pinned here.
+    #[test]
+    fn new_sets_required_fields_and_neutral_defaults() {
+        let exec_id = ExecutionId::new();
+        let input = serde_json::json!({"k": 1});
+        let StartWorkflowParams {
+            workflow_name,
+            workflow_id,
+            exec_id: got_exec_id,
+            input: got_input,
+            parent_id,
+            queue_name,
+            execution_timeout,
+            memo,
+            search_attrs,
+            reuse_policy,
+            conflict_policy,
+            trace_context,
+            max_execution_timeout_ceiling,
+            chain_execution_timeout,
+            max_workflow_chain_timeout_ceiling,
+            inherited_chain_deadline_at,
+            concurrency_key,
+            concurrency_limit,
+            concurrency_on_conflict,
+            priority,
+            max_workflow_input_bytes,
+            start_at,
+            delay,
+            max_workflow_start_delay,
+            owner,
+            runbook_url,
+            severity,
+            context_headers,
+            sla,
+            schedule_id,
+            scheduled_for,
+            workflow_attempt,
+            workflow_retry_policy,
+            retry_of_exec_id,
+            max_workflow_attempts_ceiling,
+            origin,
+            completion_callbacks,
+            start_source,
+            start_source_ref,
+            started_by,
+        } = StartWorkflowParams::new("wf", "wf-1", exec_id, input.clone(), "default");
+
+        assert_eq!(workflow_name, "wf");
+        assert_eq!(workflow_id, "wf-1");
+        assert_eq!(got_exec_id, exec_id);
+        assert_eq!(got_input, input);
+        assert_eq!(queue_name, "default");
+
+        assert!(parent_id.is_none());
+        assert!(execution_timeout.is_none());
+        assert!(memo.is_none());
+        assert!(search_attrs.is_none());
+        assert_eq!(reuse_policy, WorkflowIdReusePolicy::default());
+        assert_eq!(conflict_policy, WorkflowIdConflictPolicy::default());
+        assert!(trace_context.is_none());
+        assert!(max_execution_timeout_ceiling.is_none());
+        assert!(chain_execution_timeout.is_none());
+        assert!(max_workflow_chain_timeout_ceiling.is_none());
+        assert!(inherited_chain_deadline_at.is_none());
+        assert!(concurrency_key.is_none());
+        assert!(concurrency_limit.is_none());
+        assert_eq!(concurrency_on_conflict, ConcurrencyOnConflict::default());
+        assert_eq!(priority, Priority::default());
+        assert_eq!(max_workflow_input_bytes, 0);
+        assert!(start_at.is_none());
+        assert!(delay.is_none());
+        assert!(max_workflow_start_delay.is_none());
+        assert!(owner.is_none());
+        assert!(runbook_url.is_none());
+        assert!(severity.is_none());
+        assert!(context_headers.is_none());
+        assert!(sla.is_none());
+        assert!(schedule_id.is_none());
+        assert!(scheduled_for.is_none());
+        assert_eq!(workflow_attempt, 1, "zero would grant an extra retry");
+        assert!(workflow_retry_policy.is_none());
+        assert!(retry_of_exec_id.is_none());
+        assert!(max_workflow_attempts_ceiling.is_none());
+        assert!(origin.is_none());
+        assert!(completion_callbacks.is_none());
+        assert_eq!(start_source, StartSource::Unknown);
+        assert!(start_source_ref.is_none());
+        assert!(started_by.is_none());
+    }
+
+    /// Struct-update syntax overrides only the named fields.
+    #[test]
+    fn struct_update_overrides_only_named_fields() {
+        let params = StartWorkflowParams {
+            owner: Some("team"),
+            priority: Priority::High,
+            ..StartWorkflowParams::new("wf", "id", ExecutionId::new(), serde_json::json!(null), "q")
+        };
+        assert_eq!(params.owner, Some("team"));
+        assert_eq!(params.priority, Priority::High);
+        assert_eq!(params.workflow_attempt, 1);
     }
 }
 

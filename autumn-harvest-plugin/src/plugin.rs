@@ -1980,52 +1980,29 @@ async fn start_harvest_runtime(
                     // sealed/absent run's fresh create is gated (matching gate → block+count;
                     // fail-closed sentinel → block a fresh start, per round 5).
                     let start_params = autumn_harvest::execution::StartWorkflowParams {
-                        workflow_name: "webhook_delivery",
-                        workflow_id: &workflow_id,
-                        exec_id,
-                        input: serde_json::json!({
-                            "subscription_id": sub.id,
-                            "topic": log.topic,
-                            "payload": log.payload,
-                        }),
-                        parent_id: None,
-                        queue_name: "webhooks",
-                        execution_timeout: None,
-                        memo: None,
-                        search_attrs: None,
                         reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
-                        conflict_policy:
-                            autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
-                        trace_context: None,
-                        max_execution_timeout_ceiling: None,
-                        chain_execution_timeout: None,
-                        max_workflow_chain_timeout_ceiling: None,
-                        inherited_chain_deadline_at: None,
-                        concurrency_key: None,
-                        concurrency_limit: None,
                         concurrency_on_conflict:
                             autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
                         priority: autumn_harvest::prelude::Priority::default(),
                         max_workflow_input_bytes,
-                        start_at: None,
-                        delay: None,
-                        max_workflow_start_delay: None,
                         owner,
                         runbook_url,
                         severity,
-                        context_headers: None,
                         sla,
-                        schedule_id: None,
-                        scheduled_for: None,
-                        workflow_attempt: 1,
                         workflow_retry_policy: webhook_retry_policy,
-                        retry_of_exec_id: None,
                         max_workflow_attempts_ceiling: client.max_workflow_attempts(),
-                        origin: None,
-                        completion_callbacks: None,
                         start_source: autumn_harvest::StartSource::Api,
-                        start_source_ref: None,
-                        started_by: None,
+                        ..autumn_harvest::execution::StartWorkflowParams::new(
+                            "webhook_delivery",
+                            &workflow_id,
+                            exec_id,
+                            serde_json::json!({
+                                "subscription_id": sub.id,
+                                "topic": log.topic,
+                                "payload": log.payload,
+                            }),
+                            "webhooks",
+                        )
                     };
 
                     // The metrics recorder (`Arc<dyn MetricsRecorder>`) coerced to the

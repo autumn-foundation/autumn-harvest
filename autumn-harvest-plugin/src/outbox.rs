@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use autumn_harvest::error::{HarvestError, HarvestResult, database_error};
 use autumn_harvest::shard::ShardRouter;
-use autumn_harvest::types::{ExecutionId, Priority};
+use autumn_harvest::types::ExecutionId;
 use autumn_harvest::{
     StartWorkflowParams, start_or_load_workflow_execution_with_metrics_and_codecs,
 };
@@ -611,48 +611,25 @@ pub(crate) async fn dispatch_workflow_start_request(
     let start = start_or_load_workflow_execution_with_metrics_and_codecs(
         &mut conn,
         StartWorkflowParams {
-            workflow_name: &request.workflow_name,
-            workflow_id: &request.workflow_id,
-            exec_id,
-            input: request.input.clone(),
-            parent_id: None,
-            queue_name: &request.queue_name,
-            execution_timeout: None,
             memo: request.memo.clone(),
             search_attrs: request.search_attrs.clone(),
             reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
-            conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
-            trace_context: None,
-            max_execution_timeout_ceiling: None,
-            chain_execution_timeout: None,
-            max_workflow_chain_timeout_ceiling: None,
-            inherited_chain_deadline_at: None,
-            concurrency_key: None,
-            concurrency_limit: None,
             concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
-            priority: Priority::default(),
-            max_workflow_input_bytes: 0,
-            start_at: None,
-            delay: None,
-            max_workflow_start_delay: None,
             owner,
             runbook_url,
             severity,
-            context_headers: None,
             sla,
-            schedule_id: None,
-            scheduled_for: None,
-            workflow_attempt: 1,
             workflow_retry_policy: info_retry_policy,
-            retry_of_exec_id: None,
             max_workflow_attempts_ceiling,
-            // Outbox delivery is not a schedule fire (issue #534).
-            origin: None,
-            completion_callbacks: None,
             // Started by the cross-shard outbox dispatcher (issue #740).
             start_source: autumn_harvest::StartSource::Outbox,
-            start_source_ref: None,
-            started_by: None,
+            ..StartWorkflowParams::new(
+                &request.workflow_name,
+                &request.workflow_id,
+                exec_id,
+                request.input.clone(),
+                &request.queue_name,
+            )
         },
         registry_ext.as_ref().map(|r| {
             r.telemetry().metrics.as_ref()
