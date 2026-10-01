@@ -344,7 +344,8 @@ the run, checks the input, escalates a terminal prior, and applies the debounce
 gate. `StartEffects` holds the work that runs after commit. Each route passes
 its differences as data: the start provenance, the live states, and the input
 schema. Update-with-start accepts `SUSPENDED` as live. Signal-with-start does
-not. Signal-with-start also cancels a `TerminateIfRunning` prior before the
+not. The input check runs only when the start creates a run. An attach
+writes no input (issue #918). Signal-with-start also cancels a `TerminateIfRunning` prior before the
 start step. Update-with-start cancels it inside the start step.
 
 **Idempotency dedupe is scoped to the logical workflow**, not the

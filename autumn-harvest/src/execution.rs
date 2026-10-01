@@ -6468,10 +6468,14 @@ fn should_escalate_terminal_prior(
 
 /// Build a [`StartWorkflowParams`] from a with-start request.
 ///
-/// Both request types share these field names. The caller passes the start
-/// provenance as data, so the macro never derives it. A with-start call always
-/// begins a fresh chain origin, so it sets no inherited chain deadline (issue
-/// #617). The start step enforces the input cap, so the macro sets none.
+/// `$request` must expose the shared fields of [`SignalWithStartParams`] and
+/// [`UpdateWithStartParams`]. The caller passes the start provenance as data,
+/// so the macro never derives it.
+///
+/// A with-start call always begins a fresh chain origin, so the macro sets no
+/// inherited chain deadline (issue #617). The start step enforces the input
+/// cap, so the macro sets none. The macro leaves priority and `started_by` at
+/// their defaults.
 macro_rules! with_start_params {
     ($request:ident, $exec_id:expr, $policy:expr, $source:expr, $source_ref:expr) => {
         crate::execution::StartWorkflowParams {
@@ -6522,6 +6526,13 @@ macro_rules! with_start_params {
     };
 }
 
+/// Deferred starts, unfinished-handler checks, and cancel metrics of one start.
+type DeferredStartWork = (
+    Vec<DeferredTriggerStart>,
+    Vec<(ExecutionId, String)>,
+    Vec<StartCancelledRun>,
+);
+
 /// Work that start calls defer until the outer transaction commits.
 #[derive(Default)]
 struct StartEffects {
@@ -6531,14 +6542,7 @@ struct StartEffects {
 }
 
 impl StartEffects {
-    fn absorb(
-        &mut self,
-        (mut starts, mut checks, mut cancels): (
-            Vec<DeferredTriggerStart>,
-            Vec<(ExecutionId, String)>,
-            Vec<StartCancelledRun>,
-        ),
-    ) {
+    fn absorb(&mut self, (mut starts, mut checks, mut cancels): DeferredStartWork) {
         self.starts.append(&mut starts);
         self.checks.append(&mut checks);
         self.cancels.append(&mut cancels);
@@ -6566,7 +6570,7 @@ struct WithStartStep<'a> {
     workflow_id: &'a str,
     exec_id: ExecutionId,
     reuse_policy: WorkflowIdReusePolicy,
-    reject_fresh_if_debounced: bool,
+    debounced: bool,
     input: &'a serde_json::Value,
     max_workflow_input_bytes: u64,
     /// Schema source for the fresh-start input check. `None` skips the check.
@@ -6620,21 +6624,31 @@ impl WithStartStep<'_> {
 /// Resolve the reuse policy, then start a fresh run or attach to a live one.
 ///
 /// Steps, in order:
-/// 1. Resolve the effective reuse policy under the row lock.
-/// 2. Start or load the run. A debounced call rejects a fresh insert.
-/// 3. Check the input cap and schema when the start created a run.
+/// 1. Resolve the effective reuse policy under the row lock. The resolver
+///    upgrades `AllowDuplicate` to `TerminateIfRunning` when the prior run is
+///    terminal. The second action then lands on a live run (issue #244).
+/// 2. Start or load the run.
+/// 3. Check the input cap and schema when the start created a run. An attach
+///    writes no input, so it skips the check (issue #918).
 /// 4. Escalate a terminal prior to a fresh start (TOCTOU guard).
 /// 5. Reject a debounced call that did not attach to a live run.
 ///
 /// Step 4 covers a concurrent completion between the policy lock and the
-/// start. The second action must land on a live run, not drop silently.
+/// start. The second action must land on a live run, not drop silently. A
+/// PAUSED run is live (issue #383). The second action attaches to it and does
+/// not cancel it.
+///
+/// A debounced call may only attach to a live run. A fresh start returns
+/// `DebounceFreshStart` and rolls back. The rollback cancels no prior run and
+/// spawns no follow-up work (issue #499). The caller holds the transaction
+/// lock, so the decision is atomic.
 async fn start_or_attach<'p>(
     conn: &mut AsyncPgConnection,
     step: &WithStartStep<'_>,
     build: impl Fn(ExecutionId, WorkflowIdReusePolicy) -> StartWorkflowParams<'p>,
     effects: &mut StartEffects,
 ) -> HarvestResult<StartedWorkflowExecution> {
-    let debounced = step.reject_fresh_if_debounced;
+    let debounced = step.debounced;
     let effective_policy = if debounced {
         step.reuse_policy
     } else {
@@ -7049,7 +7063,7 @@ pub async fn signal_with_start_workflow_execution_with_metrics_and_codecs(
                 workflow_id: request.workflow_id,
                 exec_id: request.exec_id,
                 reuse_policy: request.reuse_policy,
-                reject_fresh_if_debounced: request.reject_fresh_if_debounced,
+                debounced: request.reject_fresh_if_debounced,
                 input: &request.input,
                 max_workflow_input_bytes: request.max_workflow_input_bytes,
                 workflow_info: request.workflow_info,
@@ -8313,7 +8327,7 @@ pub async fn update_with_start_workflow_execution_with_metrics_and_codecs(
                 workflow_id: request.workflow_id,
                 exec_id: request.exec_id,
                 reuse_policy: request.reuse_policy,
-                reject_fresh_if_debounced: request.reject_fresh_if_debounced,
+                debounced: request.reject_fresh_if_debounced,
                 input: &request.input,
                 max_workflow_input_bytes: request.max_workflow_input_bytes,
                 workflow_info: None,
@@ -10147,8 +10161,8 @@ mod replaced_run_outcome_tests {
 #[cfg(test)]
 mod with_start_shared_unit_tests {
     use super::{
-        SWS_LIVE_STATES, StartEffects, StartWorkflowParams, UWS_LIVE_STATES, UpdateWithStartParams,
-        is_live_state, should_escalate_terminal_prior,
+        SWS_LIVE_STATES, StartCancelledRun, StartEffects, StartWorkflowParams, UWS_LIVE_STATES,
+        UpdateWithStartParams, is_live_state, should_escalate_terminal_prior,
     };
     use crate::types::{ExecutionId, StartSource, UpdateId, WorkflowIdReusePolicy as R};
 
@@ -10178,6 +10192,11 @@ mod with_start_shared_unit_tests {
         assert!(!go("COMPLETED", true, R::AllowDuplicate));
         assert!(!go("COMPLETED", false, R::RejectDuplicate));
         assert!(!go("COMPLETED", false, R::TerminateIfRunning));
+        // SUSPENDED is live only for update-with-start.
+        let suspended =
+            |live| should_escalate_terminal_prior("SUSPENDED", live, false, R::AllowDuplicate);
+        assert!(suspended(SWS_LIVE_STATES));
+        assert!(!suspended(UWS_LIVE_STATES));
     }
 
     fn update_request() -> UpdateWithStartParams<'static> {
@@ -10198,7 +10217,7 @@ mod with_start_shared_unit_tests {
             max_workflow_chain_timeout_ceiling: Some(chrono::Duration::seconds(40)),
             concurrency_key: Some("ck".to_string()),
             concurrency_limit: Some(3),
-            concurrency_on_conflict: crate::concurrency::ConcurrencyOnConflict::Defer,
+            concurrency_on_conflict: crate::concurrency::ConcurrencyOnConflict::CancelRunning,
             update_id: UpdateId::new(),
             update_name: "u".to_string(),
             update_args: serde_json::json!({}),
@@ -10207,9 +10226,9 @@ mod with_start_shared_unit_tests {
             owner: Some("o"),
             runbook_url: Some("r"),
             severity: Some("s"),
-            context_headers: None,
+            context_headers: Some([("h".to_string(), "v".to_string())].into()),
             sla: Some(chrono::Duration::seconds(5)),
-            workflow_retry_policy: None,
+            workflow_retry_policy: Some(serde_json::json!({"max_attempts": 3})),
             max_workflow_attempts_ceiling: Some(4),
             reject_fresh_if_debounced: false,
         }
@@ -10245,7 +10264,18 @@ mod with_start_shared_unit_tests {
         assert_eq!(p.inherited_chain_deadline_at, None);
         assert_eq!(p.concurrency_key.as_deref(), Some("ck"));
         assert_eq!(p.concurrency_limit, Some(3));
+        assert_eq!(
+            p.concurrency_on_conflict,
+            crate::concurrency::ConcurrencyOnConflict::CancelRunning
+        );
+        assert_eq!(
+            p.max_execution_timeout_ceiling,
+            request.max_execution_timeout_ceiling
+        );
+        assert_eq!(p.context_headers, request.context_headers);
         assert_eq!(p.owner, Some("o"));
+        assert_eq!(p.runbook_url, Some("r"));
+        assert_eq!(p.severity, Some("s"));
         assert_eq!(p.sla, request.sla);
         assert_eq!(p.max_workflow_attempts_ceiling, Some(4));
         assert_eq!(p.workflow_attempt, 1);
@@ -10255,17 +10285,17 @@ mod with_start_shared_unit_tests {
 
     #[test]
     fn absorb_appends_every_deferred_list() {
+        let check = || (ExecutionId::new(), "wf".to_string());
+        let cancel = || StartCancelledRun::terminated("wf".to_string(), "q".to_string());
         let mut effects = StartEffects::default();
+        effects.absorb((Vec::new(), vec![check()], vec![cancel(), cancel()]));
         effects.absorb((
             Vec::new(),
-            vec![(ExecutionId::new(), "wf".to_string())],
-            Vec::new(),
+            vec![check()],
+            vec![cancel(), cancel(), cancel()],
         ));
-        effects.absorb((
-            Vec::new(),
-            vec![(ExecutionId::new(), "wf".to_string())],
-            Vec::new(),
-        ));
+        assert_eq!(effects.starts.len(), 0);
         assert_eq!(effects.checks.len(), 2);
+        assert_eq!(effects.cancels.len(), 5);
     }
 }

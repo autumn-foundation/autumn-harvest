@@ -243,25 +243,29 @@ async fn debounced_call_never_escalates_a_terminal_prior_on_both_routes() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (mut conn, _c) = setup().await;
 
-    for id in ["deb-term-sws", "deb-term-uws"] {
-        let prior = seed(&mut conn, id).await;
-        set_state(&mut conn, prior, "COMPLETED").await;
-        let err = if id.ends_with("sws") {
-            let mut p = sws(id, ALLOW);
-            p.reject_fresh_if_debounced = true;
-            run_sws(&mut conn, p).await.unwrap_err()
-        } else {
-            let mut p = uws(id, ALLOW);
-            p.reject_fresh_if_debounced = true;
-            run_uws(&mut conn, p).await.unwrap_err()
-        };
-        assert!(
-            matches!(err, HarvestError::DebounceFreshStart { .. }),
-            "{err:?}"
-        );
-        assert_eq!(count_rows(&mut conn, id).await, 1, "no fresh run for {id}");
-        assert_eq!(row(&mut conn, prior).await.state, "COMPLETED");
-    }
+    let prior = seed(&mut conn, "deb-term-sws").await;
+    set_state(&mut conn, prior, "COMPLETED").await;
+    let mut p = sws("deb-term-sws", ALLOW);
+    p.reject_fresh_if_debounced = true;
+    let err = run_sws(&mut conn, p).await.unwrap_err();
+    assert!(
+        matches!(err, HarvestError::DebounceFreshStart { .. }),
+        "{err:?}"
+    );
+    assert_eq!(count_rows(&mut conn, "deb-term-sws").await, 1);
+    assert_eq!(row(&mut conn, prior).await.state, "COMPLETED");
+
+    let prior = seed(&mut conn, "deb-term-uws").await;
+    set_state(&mut conn, prior, "COMPLETED").await;
+    let mut p = uws("deb-term-uws", ALLOW);
+    p.reject_fresh_if_debounced = true;
+    let err = run_uws(&mut conn, p).await.unwrap_err();
+    assert!(
+        matches!(err, HarvestError::DebounceFreshStart { .. }),
+        "{err:?}"
+    );
+    assert_eq!(count_rows(&mut conn, "deb-term-uws").await, 1);
+    assert_eq!(row(&mut conn, prior).await.state, "COMPLETED");
 }
 
 // ── Input cap ───────────────────────────────────────────────────────────────
@@ -399,6 +403,11 @@ async fn terminal_prior_escalates_to_a_fresh_run_on_both_routes() {
         .expect("sws");
     assert!(out.started_fresh && out.signal_delivered);
     assert_ne!(out.exec_id, prior);
+    assert_eq!(row(&mut conn, prior).await.state, "CONTINUED_AS_NEW");
+    assert_eq!(
+        row(&mut conn, out.exec_id).await.start_source.as_deref(),
+        Some("signal_with_start")
+    );
 
     let prior = seed(&mut conn, "esc-uws").await;
     set_state(&mut conn, prior, "FAILED").await;
@@ -449,6 +458,10 @@ async fn paused_prior_buffers_a_signal_but_rejects_an_update() {
         .expect("sws");
     assert_eq!(out.exec_id, prior);
     assert!(!out.started_fresh && out.signal_delivered);
+    let pending = autumn_harvest::signal::load_pending_signals(&mut conn, prior)
+        .await
+        .expect("pending signals");
+    assert_eq!(pending.len(), 2, "seed signal plus the buffered signal");
 
     let prior = seed(&mut conn, "pause-uws").await;
     set_state(&mut conn, prior, "PAUSED").await;
@@ -501,7 +514,9 @@ async fn common_start_fields_reach_the_row_identically_on_both_routes() {
     assert_eq!(a.memo, Some(json!({"m": 1})));
     assert_eq!(a.search_attrs, Some(json!({"s": 2})));
     assert_eq!(a.owner.as_deref(), Some("team-a"));
+    assert_eq!(a.runbook_url.as_deref(), Some("https://example.test/rb"));
     assert_eq!(a.severity.as_deref(), Some("high"));
+    assert_eq!(a.context_headers, Some(json!({"h": "v"})));
     assert_eq!(a.sla, Some(hour / 2));
     assert_eq!(a.workflow_attempt, 1);
     assert_eq!(a.schedule_id, None);
@@ -577,4 +592,138 @@ async fn sws_row(conn: &mut AsyncPgConnection, p: SignalWithStartParams<'_>) -> 
 async fn uws_row(conn: &mut AsyncPgConnection, p: UpdateWithStartParams<'_>) -> WorkflowExecution {
     let id = run_uws(conn, p).await.expect("uws").exec_id;
     row(conn, id).await
+}
+
+// ── Policy, dedupe, schema ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn reuse_policy_decides_a_terminal_prior_on_both_routes() {
+    let _g = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (mut conn, _c) = setup().await;
+    let failed_only = WorkflowIdReusePolicy::AllowDuplicateFailedOnly;
+    let reject = WorkflowIdReusePolicy::RejectDuplicate;
+
+    let prior = seed(&mut conn, "pol-sws-a").await;
+    set_state(&mut conn, prior, "COMPLETED").await;
+    let out = run_sws(&mut conn, sws("pol-sws-a", failed_only))
+        .await
+        .expect("sws");
+    assert!(out.started_fresh);
+
+    let prior = seed(&mut conn, "pol-uws-a").await;
+    set_state(&mut conn, prior, "COMPLETED").await;
+    let out = run_uws(&mut conn, uws("pol-uws-a", failed_only))
+        .await
+        .expect("uws");
+    assert!(out.started_fresh);
+
+    let prior = seed(&mut conn, "pol-sws-b").await;
+    set_state(&mut conn, prior, "COMPLETED").await;
+    let err = run_sws(&mut conn, sws("pol-sws-b", reject))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, HarvestError::AlreadyExists { .. }), "{err:?}");
+
+    let prior = seed(&mut conn, "pol-uws-b").await;
+    set_state(&mut conn, prior, "COMPLETED").await;
+    let err = run_uws(&mut conn, uws("pol-uws-b", reject))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, HarvestError::AlreadyExists { .. }), "{err:?}");
+}
+
+#[tokio::test]
+async fn a_repeated_idempotency_key_returns_the_first_outcome_on_both_routes() {
+    let _g = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (mut conn, _c) = setup().await;
+
+    let mut p = sws("idem-sws", ALLOW);
+    p.idempotency_key = Some("k".to_string());
+    let first = run_sws(&mut conn, p).await.expect("first");
+    let mut p = sws("idem-sws", ALLOW);
+    p.idempotency_key = Some("k".to_string());
+    let again = run_sws(&mut conn, p).await.expect("again");
+    assert!(first.started_fresh && first.signal_delivered);
+    assert_eq!(again.exec_id, first.exec_id);
+    assert!(!again.started_fresh && !again.signal_delivered);
+    assert_eq!(count_rows(&mut conn, "idem-sws").await, 1);
+
+    let update_id = UpdateId::new();
+    let mut p = uws("idem-uws", ALLOW);
+    p.idempotency_key = Some("k".to_string());
+    p.update_id = update_id;
+    let first = run_uws(&mut conn, p).await.expect("first");
+    let mut p = uws("idem-uws", ALLOW);
+    p.idempotency_key = Some("k".to_string());
+    p.update_id = update_id;
+    let again = run_uws(&mut conn, p).await.expect("again");
+    assert!(first.started_fresh && first.update_admitted);
+    assert_eq!(again.exec_id, first.exec_id);
+    assert!(!again.started_fresh && !again.update_admitted);
+    assert_eq!(count_rows(&mut conn, "idem-uws").await, 1);
+}
+
+fn input_schema() -> serde_json::Value {
+    json!({"type": "object", "required": ["tier"], "properties": {"tier": {"type": "string"}}})
+}
+
+fn dummy_handler(
+    _ctx: &autumn_harvest::context::WorkflowContext,
+    _input: serde_json::Value,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + '_>,
+> {
+    Box::pin(async { Ok(serde_json::Value::Null) })
+}
+
+fn schema_info() -> autumn_harvest::info::WorkflowInfo {
+    autumn_harvest::info::WorkflowInfo {
+        quota: None,
+        declared_activities: None,
+        declared_children: None,
+        name: "ws_wf",
+        module: "with_start_shared_tests",
+        handler: dummy_handler,
+        execution_timeout: None,
+        chain_execution_timeout: None,
+        sla: None,
+        concurrency: None,
+        debounce: None,
+        batch: None,
+        throttle: None,
+        max_input_bytes: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        description: None,
+        input_schema: Some(input_schema),
+        output_schema: None,
+        error_schema: None,
+        retry_policy: None,
+        mcp: false,
+    }
+}
+
+#[tokio::test]
+async fn input_schema_applies_to_the_escalated_fresh_start() {
+    let _g = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (mut conn, _c) = setup().await;
+    let info = schema_info();
+
+    let prior = seed(&mut conn, "schema-esc").await;
+    set_state(&mut conn, prior, "COMPLETED").await;
+    let mut p = sws("schema-esc", ALLOW);
+    p.workflow_info = Some(&info);
+    let err = run_sws(&mut conn, p).await.unwrap_err();
+    assert!(
+        matches!(err, HarvestError::InputValidationFailed { .. }),
+        "{err:?}"
+    );
+    assert_eq!(count_rows(&mut conn, "schema-esc").await, 1);
 }
