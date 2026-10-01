@@ -56,6 +56,14 @@ fails on a transient error keeps its slot until a read of the session row
 settles it. When no read succeeds, a background task reads again. A new
 acquire of that session on the same worker defers until the read ends.
 
+**Local activity append conflict.** A local activity append that loses its
+`event_id` to a concurrent append now re-drives the workflow task. Before, it
+failed the run. Since #1787, a race loser that a freed permit admits appends
+`ActivityStarted` while the winner's workflow task runs. The re-drive is the
+one that the wake-event ingest uses (issue #779). This fixes
+`race_resolved_by_activity_with_an_open_activity_loser_then_local_activity`,
+which failed on every run on `trunk-dev`.
+
 **Metrics.** `harvest.db.pool_acquire_timeout{site}` and
 `harvest.heartbeat.flush_failed{reason}`, with starter dashboard panels.
 

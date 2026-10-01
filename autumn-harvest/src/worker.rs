@@ -21853,6 +21853,29 @@ async fn process_workflow_task(
                 .await
                 {
                     Ok(outcome) => outcome,
+                    Err(e) if e.is_event_id_unique_violation() => {
+                        // A concurrent append took this cycle's `event_id`.
+                        // An example is the `ActivityStarted` of a race loser
+                        // that a freed permit admits (issue #1787). The
+                        // transaction rolled back, so re-drive, as the
+                        // wake-event ingest does (issue #779). A fresh load
+                        // reads past the other event.
+                        requeue_parent_on_transient_ingest_conflict(
+                            conn,
+                            task,
+                            worker_id,
+                            sticky_timeout,
+                            prepared.exec_id,
+                        )
+                        .await?;
+                        tracing::warn!(
+                            task_id = %task.id,
+                            workflow_exec_id = %prepared.exec_id,
+                            "harvest: event-id conflict in a local activity append; \
+                             re-driving the workflow task"
+                        );
+                        return Ok(());
+                    }
                     Err(e) => {
                         // Issue #946, Codex round-3/round-4 review:
                         // `run_local_activity_inline` calls
