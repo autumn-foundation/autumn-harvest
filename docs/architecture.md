@@ -157,7 +157,13 @@ Both types are `fn` (not `Box<dyn Fn>`). The macro generates a closure body cast
 
 Single-param workflows/activities: input is passed as a single JSON value and deserialized directly. Multi-param: input is expected to be a JSON array `[arg1, arg2, ...]`, indexed by position.
 
-**8. Activity claim epoch (issue #1789)**
+**8. Two boot paths, one set of startup steps**
+
+`HarvestPlugin` boots Harvest inside an autumn-web app. `HarvestEmbedding` (`embedding.rs`, issue #1613) boots it on any Axum server. Both call the shared steps in `autumn-harvest-plugin/src/boot.rs`: the limit mirror, the boot gate load, the admission globals, the gate refresh and the teardown. Add a new startup step there, not to one path only.
+
+The order is load-bearing. The gate cache loads before any worker spawns. The orphan gate runs before any admission global is published. The storage pool is installed before the API runtime. On stop, the admission globals are cleared only after the runner stops.
+
+**9. Activity claim epoch (issue #1789)**
 
 An activity attempt owns its task row only through its claim. The claim is the pair `(worker_id, attempt)`, held in `queue::TaskClaim`.
 

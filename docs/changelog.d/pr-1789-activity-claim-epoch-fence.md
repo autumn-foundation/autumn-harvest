@@ -34,9 +34,16 @@ actions. The protocol and its invariant are in `docs/architecture.md`,
 
 No new `WorkflowEvent` variant, no migration, no schema change.
 
+- `fail_task_and_execution_with_history` locks an activity row with the
+  claim epoch (`FOR UPDATE SKIP LOCKED`) before its `crash_strikes` guard. A
+  later claim of the same worker can pass that guard after a release resets
+  `crash_strikes` to 0. That case is now a no-op.
+
 **Tests, red then green.** `tests/integration/activity_claim_epoch_tests.rs`
-has 12 DB tests. Each one runs the real orphan-requeue statement between two
-claims. Before the fix, 8 tests failed. A stale completion, failure, retry,
-deferral, start and heartbeat all changed the later attempt, and lease loss
-did not cancel the token. The "B completes, then A completes late" test
-passed before the fix too. The history check already blocked that order.
+has 16 DB tests. Each one runs the real orphan-requeue statement after A's
+liveness row goes stale. Before the fix, 8 of the first 12 tests failed. A
+stale completion, failure, retry, deferral, start and heartbeat all changed
+the later attempt, and lease loss did not cancel the token. The "B completes,
+then A completes late" test passed before the fix too, because the history
+check already blocked that order. The reused-strike-count test was proven red
+by disabling its guard. One test drives a real `Worker` end to end.
