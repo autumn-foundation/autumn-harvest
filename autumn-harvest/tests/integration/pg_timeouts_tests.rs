@@ -1873,6 +1873,64 @@ async fn a_session_release_timeout_does_not_fail_the_workflow() {
     );
 }
 
+/// A session acquire that fails on a transient error may still have
+/// committed its row. The local slot must stay when this worker is the
+/// recorded host. Otherwise the worker would run the session without
+/// counting it. With no row, or another host, the slot goes back.
+#[tokio::test]
+async fn a_transient_session_acquire_keeps_the_slot_only_for_its_own_session() {
+    use autumn_harvest::sessions::{
+        new_session_slot_registry, record_session_acquired, session_slot_count,
+        try_acquire_session_slot,
+    };
+    use autumn_harvest::types::SessionId;
+
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let queue_name = format!("q-ss-{}", &Uuid::new_v4().simple().to_string()[..12]);
+    let exec_id = seed_execution(&mut conn, &queue_name).await;
+    let pool = engine_pool(
+        url,
+        1,
+        DbRole::Hot,
+        &timeouts(5_000, SessionTimeouts::for_role(DbRole::Hot)),
+    )
+    .expect("engine pool");
+    let expires_at = Utc::now() + chrono::Duration::minutes(5);
+
+    for (case, recorded_host, kept) in [
+        ("hosted here", Some("w-1"), true),
+        ("no row", None, false),
+        ("hosted elsewhere", Some("w-2"), false),
+    ] {
+        let session_id = SessionId::new();
+        if let Some(host) = recorded_host {
+            record_session_acquired(
+                &mut conn,
+                session_id,
+                exec_id,
+                host,
+                &queue_name,
+                expires_at,
+            )
+            .await
+            .expect("record the session");
+        }
+        let registry = new_session_slot_registry();
+        assert!(try_acquire_session_slot(&registry, 4, session_id));
+
+        autumn_harvest::worker::settle_session_slot_after_transient_error(
+            &pool, &registry, session_id, "w-1",
+        )
+        .await;
+        assert_eq!(
+            session_slot_count(&registry) == 1,
+            kept,
+            "{case}: wrong slot decision"
+        );
+    }
+}
+
 /// Mark `worker_id` as a live worker. A test row `RUNNING` under an unknown
 /// worker is an orphan, and a reclaimer of a parallel suite would requeue it.
 /// The row has no queues and a shard that does not exist, so no other code

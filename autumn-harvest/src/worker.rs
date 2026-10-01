@@ -15193,13 +15193,22 @@ async fn handle_session_acquire(
             // wedging. The periodic reconciler (`reconcile_local_sessions`) is
             // a backstop for this same release should it ever be missed (e.g.
             // a crash between the DB error and this line).
-            crate::sessions::release_session_slot(session_slots_in_use, session_id);
-            // A transient failure (issue #1788) wrote nothing. Return it, and
-            // the dispatch error path releases the claim for a retry. The
-            // acquire write is idempotent, so a retry is safe.
+            // A transient failure (issue #1788) returns as is, and the dispatch
+            // error path releases the claim for a retry. The acquire write is
+            // idempotent, so a retry is safe. The insert may have committed,
+            // so settle the slot from the recorded row.
             if crate::pool::is_transient_db_error(&error) {
+                drop(conn);
+                settle_session_slot_after_transient_error(
+                    pool,
+                    session_slots_in_use,
+                    session_id,
+                    worker_id,
+                )
+                .await;
                 return Err(error);
             }
+            crate::sessions::release_session_slot(session_slots_in_use, session_id);
             let msg = error.to_string();
             fail_task_and_execution(&mut conn, task, worker_id, &msg, codecs).await?;
             return Err(error);
@@ -15281,6 +15290,67 @@ async fn handle_session_release(
 
     let output = serde_json::Value::Null;
     finalize_activity_completion(&mut conn, task, exec_id, activity_id, output, None, codecs).await
+}
+
+/// Settle the local slot of a session acquire that failed on a transient
+/// error (issue #1788).
+///
+/// The insert of the session row can commit before the error. A retry then
+/// finds the row and keeps this worker as host, so this worker must still
+/// count the slot. Read the row again on a new connection:
+///
+/// - This worker hosts the `ACTIVE` session: keep the slot.
+/// - No row, or another host: release the slot.
+/// - The read fails on every try: keep the slot. A slot too many lowers
+///   capacity. A slot too few lets the worker exceed `max_concurrent_sessions`.
+#[doc(hidden)]
+pub async fn settle_session_slot_after_transient_error(
+    pool: &DbPool,
+    registry: &crate::sessions::SessionSlotRegistry,
+    session_id: crate::types::SessionId,
+    worker_id: &str,
+) {
+    use crate::schema::harvest_sessions::dsl;
+
+    let spacing = crate::pool::retry_spacing(pool);
+    for attempt in 1..=FINALIZE_ACQUIRE_ATTEMPTS {
+        let started = tokio::time::Instant::now();
+        let read = match crate::pool::acquire_within_pool_bound(pool).await {
+            Ok(mut conn) => dsl::harvest_sessions
+                .find(session_id.as_uuid())
+                .select((dsl::host_worker_id, dsl::state))
+                .first::<(String, String)>(&mut conn)
+                .await
+                .optional()
+                .map_err(crate::error::database_error),
+            Err(error) => Err(error),
+        };
+        match read {
+            Ok(row) => {
+                let ours = row.is_some_and(|(host, state)| host == worker_id && state == "ACTIVE");
+                if !ours {
+                    crate::sessions::release_session_slot(registry, session_id);
+                }
+                return;
+            }
+            Err(error) if attempt < FINALIZE_ACQUIRE_ATTEMPTS => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    attempt,
+                    error = %error,
+                    "could not read a session after a failed acquire; trying again"
+                );
+                tokio::time::sleep_until(started + spacing).await;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    error = %error,
+                    "could not read a session after a failed acquire; keeping its slot"
+                );
+            }
+        }
+    }
 }
 
 /// Run the internal session-release activity for `task`. Tests use it
