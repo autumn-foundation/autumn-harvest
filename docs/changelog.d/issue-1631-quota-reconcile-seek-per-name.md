@@ -20,9 +20,13 @@ test fixture at 40,000 unrelated rows dropped from 40,019 buffers to 171.
 
 Migration `20261001192155_harvest_quota_reconcile_name_id_index` adds
 `idx_harvest_we_quota_reconcile_name_id` on `(workflow_name, id)` with the
-old partial predicate. It drops `idx_harvest_we_quota_reconcile_candidates`.
-Nothing else read that index. The write cost per row stays the same: one
-partial index.
+old partial predicate. A prebuilt index is accepted only if its definition
+matches and it is valid.
+
+The migration keeps `idx_harvest_we_quota_reconcile_candidates`. Old workers
+still run the old query during a rolling upgrade, and that query needs it.
+The new query does not use it. A later migration drops it, once no old binary
+can run. Until then, each row write updates two partial indexes.
 
 No `WorkflowEvent` variant, no data change, no replay impact.
 

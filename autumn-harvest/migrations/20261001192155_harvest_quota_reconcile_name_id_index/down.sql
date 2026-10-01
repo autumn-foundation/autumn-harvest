@@ -1,6 +1,3 @@
--- Revert: restore the id-only candidate index (issue #1631).
-CREATE INDEX IF NOT EXISTS idx_harvest_we_quota_reconcile_candidates
-    ON harvest_workflow_executions (id)
-    WHERE quota_key IS NULL AND state IN ('RUNNING', 'PAUSED');
-
+-- Revert: drop the name-leading candidate index (issue #1631).
+-- The old `(id)` index was never dropped, so nothing else to restore.
 DROP INDEX IF EXISTS idx_harvest_we_quota_reconcile_name_id;
