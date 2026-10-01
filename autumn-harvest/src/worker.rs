@@ -26545,6 +26545,36 @@ impl Drop for DispatchReservation {
     }
 }
 
+/// Owns a task handle and aborts the task when dropped (issue #1552).
+///
+/// A bare `JoinHandle` detaches its task on drop. Cancelling the future that
+/// owns the handle then leaves the task running with nothing to stop it. This
+/// guard requests an abort instead. `Drop` cannot await, so the task may need
+/// one more poll to stop. The graceful path calls [`AbortOnDrop::join`].
+#[derive(Debug)]
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl AbortOnDrop {
+    const fn new(handle: tokio::task::JoinHandle<()>) -> Self {
+        Self(handle)
+    }
+
+    /// Wait for the task to end on its own.
+    ///
+    /// The handle stays in the guard while `join` waits. If the caller is
+    /// cancelled during the wait, the guard still aborts the task. Aborting a
+    /// finished task does nothing, so a completed `join` needs no disarming.
+    async fn join(mut self) -> Result<(), tokio::task::JoinError> {
+        (&mut self.0).await
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Whether a reference of this kind may be claimed now (issue #1312).
 ///
 /// The read is sized on the sum of both pools, and that is right. A read that
@@ -27509,13 +27539,13 @@ impl Worker {
             .iter()
             .zip(&registration_pending_per_shard)
             .map(|((_, shard_pool), pending)| {
-                self.spawn_heartbeat_task(
+                AbortOnDrop::new(self.spawn_heartbeat_task(
                     shard_pool,
                     Arc::clone(&monitors.workflow_slot_target),
                     Arc::clone(&monitors.activity_slot_target),
                     heartbeat_cancel.clone(),
                     Arc::clone(pending),
-                )
+                ))
             })
             .collect();
 
@@ -27575,7 +27605,7 @@ impl Worker {
         heartbeat_cancel.cancel();
 
         for handle in heartbeat_handles {
-            if let Err(error) = handle.await {
+            if let Err(error) = handle.join().await {
                 tracing::warn!(
                     worker_id = %self.config.worker_id,
                     error = %error,
@@ -27916,13 +27946,13 @@ impl Worker {
 
         let monitors = self.spawn_monitoring_tasks(pool, std::slice::from_ref(pool));
         let heartbeat_cancel = CancellationToken::new();
-        let heartbeat_handle = self.spawn_heartbeat_task(
+        let heartbeat_handle = AbortOnDrop::new(self.spawn_heartbeat_task(
             pool,
             Arc::clone(&monitors.workflow_slot_target),
             Arc::clone(&monitors.activity_slot_target),
             heartbeat_cancel.clone(),
             Arc::clone(&registration_pending),
-        );
+        ));
 
         // The single-shard path resolves at most one shard target, and that
         // target is always `shard_assignments[0]` (see the shard-target
@@ -29655,10 +29685,10 @@ impl Worker {
     #[allow(clippy::too_many_lines)]
     async fn shutdown_and_cleanup(
         &self,
-        heartbeat_handle: tokio::task::JoinHandle<()>,
+        heartbeat_handle: AbortOnDrop,
         monitors: WorkerMonitoringHandles,
     ) {
-        if let Err(error) = heartbeat_handle.await {
+        if let Err(error) = heartbeat_handle.join().await {
             tracing::warn!(
                 worker_id = %self.config.worker_id,
                 error = %error,
@@ -34381,6 +34411,81 @@ mod tests {
              refuse to start: one pool covers every assignment",
         );
         worker.shutdown();
+    }
+
+    /// Cancels `run` once its heartbeat task exists. Then waits for the
+    /// heartbeat to release its `drain_deadline_max` handle.
+    ///
+    /// Only the heartbeat tasks hold that `Arc` besides the worker, so the
+    /// count is `1 + heartbeats` while they run and `1` after they stop.
+    /// Each wait lasts up to 30 seconds. A refused connection to a closed
+    /// port is slow on Windows, and startup visits each shard pool in turn.
+    /// The wait only runs out when the code is broken.
+    async fn heartbeats_stop_after_run_is_cancelled(
+        worker: &Worker,
+        run: impl std::future::Future<Output = ()>,
+        heartbeats: usize,
+    ) {
+        let spawned = async {
+            for _ in 0..3000 {
+                if Arc::strong_count(&worker.drain_deadline_max) == 1 + heartbeats {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            false
+        };
+        let seen = tokio::select! {
+            () = run => panic!("the run returned before its heartbeat started"),
+            seen = spawned => seen,
+        };
+        assert!(seen, "the run must spawn its heartbeat before the cancel");
+
+        for _ in 0..3000 {
+            if Arc::strong_count(&worker.drain_deadline_max) == 1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("a cancelled run must not leave a detached heartbeat task");
+    }
+
+    /// Cancelling `run_with_listener` from outside stops its heartbeat
+    /// (issue #1552). A bare `JoinHandle` would detach the task instead.
+    #[tokio::test]
+    async fn cancelling_run_with_listener_aborts_its_heartbeat() {
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(default_runtime_config(), registry).expect("valid config");
+        let pool = unreachable_pool("postgres://127.0.0.1:1/s0");
+
+        heartbeats_stop_after_run_is_cancelled(&worker, worker.run_with_listener(&pool, None), 1)
+            .await;
+    }
+
+    /// Cancelling the multi-shard runner from outside stops every shard
+    /// heartbeat (issue #1552).
+    #[tokio::test]
+    async fn cancelling_run_multi_shard_aborts_every_heartbeat() {
+        let mut pools = std::collections::BTreeMap::new();
+        pools.insert(
+            crate::types::ShardId::new(0),
+            unreachable_pool("postgres://127.0.0.1:1/s0"),
+        );
+        pools.insert(
+            crate::types::ShardId::new(1),
+            unreachable_pool("postgres://127.0.0.1:1/s1"),
+        );
+        let mut cfg = default_runtime_config();
+        cfg.shard_assignments = vec![crate::types::ShardId::new(0), crate::types::ShardId::new(1)];
+        cfg.sharded_pool = Some(crate::shard::ShardedDbPool::from_map(
+            pools,
+            crate::types::ShardId::new(0),
+        ));
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(cfg, registry).expect("valid config");
+        let pool = unreachable_pool("postgres://127.0.0.1:1/s0");
+
+        heartbeats_stop_after_run_is_cancelled(&worker, worker.run(&pool), 2).await;
     }
 
     /// The pending flag is per pool, not per worker (issue #804, Codex
@@ -43731,5 +43836,108 @@ mod tests {
         crate::dispatch::uninstall_all();
 
         assert!(!bound, "a pinned worker must not adopt a later install");
+    }
+
+    /// Signals through a channel when the task that owns it is dropped.
+    struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    fn parked_task() -> (
+        tokio::task::JoinHandle<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let _signal = DropSignal(Some(tx));
+            std::future::pending::<()>().await;
+        });
+        (handle, rx)
+    }
+
+    /// A bare `JoinHandle` detaches its task on drop (issue #1552).
+    #[tokio::test]
+    async fn dropping_the_guard_aborts_its_task() {
+        let (handle, dropped) = parked_task();
+        tokio::task::yield_now().await;
+
+        drop(AbortOnDrop::new(handle));
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), dropped)
+            .await
+            .expect("the task must stop after the guard drops")
+            .expect("the task future must drop its signal");
+    }
+
+    /// External cancellation of the owning future drops its locals.
+    #[tokio::test]
+    async fn aborting_the_owner_future_aborts_the_guarded_task() {
+        let (handle, dropped) = parked_task();
+        let owner = tokio::spawn(async move {
+            let _guard = AbortOnDrop::new(handle);
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+
+        owner.abort();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), dropped)
+            .await
+            .expect("the guarded task must stop with its owner")
+            .expect("the task future must drop its signal");
+    }
+
+    /// Cancelling a caller that waits in `join` must not detach the task.
+    #[tokio::test]
+    async fn aborting_a_caller_inside_join_aborts_the_guarded_task() {
+        let (handle, dropped) = parked_task();
+        let guard = AbortOnDrop::new(handle);
+        let caller = tokio::spawn(async move {
+            let _ = guard.join().await;
+        });
+        tokio::task::yield_now().await;
+
+        caller.abort();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), dropped)
+            .await
+            .expect("the guarded task must stop with a cancelled join")
+            .expect("the task future must drop its signal");
+    }
+
+    /// The graceful path must keep the task's own exit, not force one.
+    #[tokio::test]
+    async fn join_waits_for_a_clean_exit_and_does_not_abort() {
+        let cancel = CancellationToken::new();
+        let token = cancel.clone();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            token.cancelled().await;
+            tokio::task::yield_now().await;
+            let _ = done_tx.send(());
+        });
+        let guard = AbortOnDrop::new(handle);
+
+        cancel.cancel();
+        let joined = guard.join().await;
+
+        assert!(joined.is_ok(), "a clean exit must not read as cancelled");
+        assert!(done_rx.await.is_ok(), "the task must run to its own end");
+    }
+
+    /// A panic in the task must reach the caller, as with a bare handle.
+    #[tokio::test]
+    async fn join_reports_a_task_panic() {
+        let handle = tokio::spawn(async { panic!("heartbeat boom") });
+
+        let joined = AbortOnDrop::new(handle).join().await;
+
+        assert!(joined.is_err_and(|error| error.is_panic()));
     }
 }
