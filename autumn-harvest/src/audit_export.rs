@@ -1374,7 +1374,15 @@ async fn spawn_unexported_index_build_if_due(
             return;
         };
         match ensure_unexported_index(&mut build_conn).await {
-            Ok(()) => index_build_finished(key, true),
+            // A skipped build also returns `Ok`: another session holds the lock.
+            // Only a valid index clears the retry gate.
+            Ok(()) => {
+                let valid = matches!(
+                    unexported_index_valid(&mut build_conn).await,
+                    Ok(Some(true))
+                );
+                index_build_finished(key, valid);
+            }
             Err(error) => {
                 tracing::warn!(
                     shard = shard_id,
@@ -1390,14 +1398,22 @@ async fn spawn_unexported_index_build_if_due(
     });
 }
 
-/// Run [`ensure_unexported_index`] without failing the tick.
+/// Run [`ensure_unexported_index`] without failing the tick on a build error.
 ///
 /// A failed build leaves export correct but slower. The next tick retries.
+/// After an error the session state is unknown: a cleanup statement may have
+/// failed. A probe query checks the connection. If the probe fails, this
+/// function returns the error so the caller discards the connection.
+///
+/// # Errors
+/// Returns `HarvestError` when the connection no longer works.
 #[cfg(feature = "db")]
 async fn ensure_unexported_index_best_effort(
     conn: &mut diesel_async::AsyncPgConnection,
     shard_id: i32,
-) {
+) -> crate::error::HarvestResult<()> {
+    use diesel_async::RunQueryDsl;
+
     if let Err(error) = ensure_unexported_index(conn).await {
         tracing::warn!(
             shard = shard_id,
@@ -1406,7 +1422,12 @@ async fn ensure_unexported_index_best_effort(
             "[audit_export] could not build the claim-scan index; export continues \
              without it. The role may lack ownership: run the statement as the table owner"
         );
+        diesel::sql_query("SELECT 1")
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
     }
+    Ok(())
 }
 
 /// Result of resolving a decommission or reactivate request against the live
@@ -2613,7 +2634,7 @@ async fn export_once_on_conn(
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> crate::error::HarvestResult<usize> {
     let config = config_arc.as_ref();
-    ensure_unexported_index_best_effort(conn, shard_id).await;
+    ensure_unexported_index_best_effort(conn, shard_id).await?;
     ensure_cursor_row(conn, shard_id).await?;
 
     let now = Utc::now();
