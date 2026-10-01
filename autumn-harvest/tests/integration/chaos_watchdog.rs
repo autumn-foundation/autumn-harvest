@@ -160,6 +160,17 @@ impl Outcome {
 /// Runs the watchdog script with a stub `gh` first on `PATH`.
 #[cfg(target_os = "linux")]
 fn run_watchdog(stub: &Stub) -> Outcome {
+    let mut cmd = std::process::Command::new("bash");
+    cmd.arg(repo_root().join(WATCHDOG_SCRIPT));
+    if let Some(arg) = stub.arg {
+        cmd.arg(arg);
+    }
+    run_stubbed(stub, cmd)
+}
+
+/// Runs `cmd` with a stub `gh` first on `PATH` and the runner variables set.
+#[cfg(target_os = "linux")]
+fn run_stubbed(stub: &Stub, mut cmd: std::process::Command) -> Outcome {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -187,11 +198,6 @@ esac
         dir.path().display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let mut cmd = std::process::Command::new("bash");
-    cmd.arg(repo_root().join(WATCHDOG_SCRIPT));
-    if let Some(arg) = stub.arg {
-        cmd.arg(arg);
-    }
     let output = cmd
         .env("PATH", path)
         .env("GITHUB_REPOSITORY", "owner/repo")
@@ -408,4 +414,67 @@ fn watchdog_closes_its_failure_issue_after_a_clean_run() {
     });
     assert!(out.success, "calls: {:?}", out.calls);
     assert!(out.called("issue close 88"), "calls: {:?}", out.calls);
+}
+
+/// Two runs that overlap can both find no open issue and both open one. A
+/// concurrency group runs one watchdog job at a time. It must queue, not
+/// cancel, because a cancelled run skips the `if: failure()` step.
+#[test]
+fn watchdog_workflow_runs_one_job_at_a_time() {
+    let doc = parse_workflow(WATCHDOG_WORKFLOW);
+    let concurrency = doc.get("concurrency");
+    assert!(
+        concurrency.and_then(|c| c.get("group")).is_some(),
+        "{WATCHDOG_WORKFLOW} must set a top-level `concurrency.group`"
+    );
+    let cancels = concurrency
+        .and_then(|c| c.get("cancel-in-progress"))
+        .and_then(serde_yaml::Value::as_bool)
+        .unwrap_or(false);
+    assert!(!cancels, "`cancel-in-progress` must be false");
+}
+
+/// When `actions/checkout` fails, the script is not on disk. The report step
+/// must still open the watchdog-failure issue.
+#[cfg(target_os = "linux")]
+#[test]
+fn watchdog_report_step_works_without_checkout() {
+    let doc = parse_workflow(WATCHDOG_WORKFLOW);
+    let report = doc
+        .get("jobs")
+        .and_then(serde_yaml::Value::as_mapping)
+        .into_iter()
+        .flat_map(|jobs| jobs.values())
+        .filter_map(|job| job.get("steps").and_then(serde_yaml::Value::as_sequence))
+        .flatten()
+        .filter(|step| {
+            step.get("if")
+                .and_then(serde_yaml::Value::as_str)
+                .is_some_and(|cond| cond.contains("failure()"))
+        })
+        .find_map(|step| step.get("run").and_then(serde_yaml::Value::as_str))
+        .expect("an `if: failure()` step with a `run:`")
+        .to_string();
+
+    let empty = tempfile::tempdir().expect("tempdir");
+    let mut cmd = std::process::Command::new("bash");
+    cmd.arg("-c").arg(&report).current_dir(empty.path());
+    let out = run_stubbed(
+        &Stub {
+            runs: None,
+            issues: Some(Stub::no_issue()),
+            arg: None,
+        },
+        cmd,
+    );
+    assert!(out.success, "calls: {:?}", out.calls);
+    let create = out
+        .calls
+        .iter()
+        .find(|c| c.starts_with("issue create"))
+        .unwrap_or_else(|| panic!("no issue opened; calls: {:?}", out.calls));
+    assert!(
+        create.contains(WATCHDOG_FAILED_TITLE) && create.contains("actions/runs/4242"),
+        "the issue must use the watchdog-failure title and link the run: {create}"
+    );
 }
