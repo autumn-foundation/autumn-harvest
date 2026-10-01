@@ -146,7 +146,7 @@ Response:
 Pure functions are available without the `db` feature:
 
 ```rust
-use autumn_harvest::calendar::{is_excluded_date, apply_skip_policy};
+use autumn_harvest::calendar::{apply_skip_policy, calendar_excludes_weekends};
 use autumn_harvest::policy::SkipPolicy;
 use chrono::NaiveDate;
 
@@ -154,15 +154,27 @@ let excluded = vec![
     NaiveDate::from_ymd_opt(2026, 1, 19).unwrap(), // MLK Day
 ];
 
+// The scheduler derives this flag from the calendar name.
+let exclude_weekends = calendar_excludes_weekends("us-federal-holidays");
+assert!(!exclude_weekends);
+
 let fire_date = NaiveDate::from_ymd_opt(2026, 1, 19).unwrap();
 
 // Returns None → skip
-assert!(apply_skip_policy(fire_date, SkipPolicy::Skip, &excluded).is_none());
+assert!(apply_skip_policy(fire_date, SkipPolicy::Skip, &excluded, exclude_weekends).is_none());
 
 // Returns Some(2026-01-20) → Tuesday after the holiday
-let next = apply_skip_policy(fire_date, SkipPolicy::RunNextBusinessDay, &excluded);
+let next = apply_skip_policy(
+    fire_date,
+    SkipPolicy::RunNextBusinessDay,
+    &excluded,
+    exclude_weekends,
+);
 assert_eq!(next, NaiveDate::from_ymd_opt(2026, 1, 20));
 ```
+
+The fourth argument, `exclude_weekends`, treats Saturday and Sunday as excluded. Pass
+`calendar_excludes_weekends(name)` to match the scheduler. That function returns `true` only for `weekends-off`.
 
 ---
 
@@ -170,7 +182,7 @@ assert_eq!(next, NaiveDate::from_ymd_opt(2026, 1, 20));
 
 When a firing is suppressed by the calendar, the scheduler emits:
 
-```
+```text
 harvest.schedule.skipped{workflow="generate_payroll", queue="default", reason="calendar"}
 ```
 
@@ -181,5 +193,5 @@ This is separate from `reason="overlap"` skips (overlap policy) so dashboards ca
 ## Notes
 
 - Calendar filtering happens **after** jitter is applied and **before** overlap policy evaluation. The effective fire time shown in the preview already includes jitter.
-- `weekends-off` is enforced by `apply_skip_policy` checking `weekday()` on the candidate date directly; Saturday and Sunday are never "business days" regardless of what exclusion rows say.
+- `weekends-off` sets the `exclude_weekends` flag of `apply_skip_policy`. When the flag is `true`, Saturday and Sunday are never business days, whatever the exclusion rows say. When it is `false`, only listed dates are excluded.
 - If a calendar is deleted while schedules still reference it, those schedules degrade gracefully to no filtering (the calendar lookup returns an empty exclusion set).
