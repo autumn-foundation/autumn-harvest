@@ -2719,6 +2719,10 @@ enum ScheduleCommand {
         /// Create the schedule in a paused state.
         #[arg(long)]
         paused: bool,
+        /// Jitter window in seconds. 0 disables jitter. If you omit it, a cron
+        /// with no seconds field gets 10 seconds (issue #1792).
+        #[arg(long)]
+        jitter_secs: Option<u64>,
     },
     /// Edit an existing schedule in place — partial update, `schedule_id` preserved (issue #771).
     Update {
@@ -11256,6 +11260,7 @@ fn schedule_request(command: &ScheduleCommand) -> Result<ApiRequest, CliError> {
             max_active_runs,
             catchup,
             paused,
+            jitter_secs,
         } => {
             let mut body = Map::new();
             body.insert("workflow_name".to_string(), Value::String(name.clone()));
@@ -11263,6 +11268,9 @@ fn schedule_request(command: &ScheduleCommand) -> Result<ApiRequest, CliError> {
             body.insert("max_active_runs".to_string(), json!(max_active_runs));
             body.insert("catchup".to_string(), json!(catchup));
             body.insert("paused".to_string(), json!(paused));
+            if let Some(secs) = jitter_secs {
+                body.insert("jitter_secs".to_string(), json!(secs));
+            }
             if let Some(input) =
                 parse_json_source(input_json.as_deref(), input_file.as_deref(), "input")?
             {

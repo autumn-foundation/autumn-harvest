@@ -3340,7 +3340,7 @@
                     "type": "string"
                   },
                   "jitter_secs": {
-                    "description": "Jitter window in seconds. 0 disables jitter. When omitted, a cron schedule with no seconds field gets 10, as on create. Validated via validate_jitter.",
+                    "description": "Jitter window in seconds. 0 disables jitter. If omitted, a cron schedule with no seconds field gets 10 seconds, as on create. Validated via validate_jitter.",
                     "type": "integer"
                   },
                   "max_active_runs": {
@@ -3463,7 +3463,7 @@
                     "description": "Workflow input payload (any JSON value)."
                   },
                   "jitter_secs": {
-                    "description": "Jitter window in seconds. Spreads fires to avoid a thundering herd. 0 disables jitter. When omitted, a cron schedule with no seconds field gets 10, and other schedules get 0.",
+                    "description": "Jitter window in seconds. It spreads fires to avoid a thundering herd. 0 disables jitter. If omitted, a cron schedule with no seconds field gets 10 seconds. Other schedules get 0.",
                     "type": "integer"
                   },
                   "max_active_runs": {

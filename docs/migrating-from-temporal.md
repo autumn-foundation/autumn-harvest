@@ -265,8 +265,9 @@ below is a concrete task, not a vague warning.
    with `schedule_to_close` (checklist item 4, below) as the real bound.
 
    Harvest supports four jitter shapes: `JitterPolicy::None`, `Full`,
-   `Equal`, and `Decorrelated`. The default is `Full`. Set
-   `JitterPolicy::None` if you need exact backoff timing.
+   `Equal`, and `Decorrelated`. The default is `Full`, so a ported policy
+   retries anywhere in `[0, base]`. Set `JitterPolicy::None` to keep exact
+   backoff timing.
 4. **Translate each timeout name.** This is the single most common porting
    mistake. The two engines invert the meaning of two timeout names:
 

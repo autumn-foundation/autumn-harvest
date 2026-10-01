@@ -178,6 +178,7 @@ you.
 | `default_queue` | `"default"` | Queue assigned to tasks that don't override it via `#[activity(queue = ...)]` or `.queue(...)`. |
 | `execution_timeout` | none | Hard wall-clock deadline for the whole DAG run — see below. |
 | `sla` | none | Soft SLA for the whole DAG run — see below. |
+| `jitter` | 10 s for a cron with no seconds field, else 0 | Fire-time spread window — `"30s"`, `"5m"`. `"0s"` opts out of the default (issue #1792). |
 
 ### Deadlines for scheduled DAG runs (`execution_timeout` / `sla`)
 

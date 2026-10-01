@@ -1594,8 +1594,10 @@ mod classify_outcome_tests {
     use crate::policy::RetryPolicy;
     use std::time::Duration as StdDuration;
 
+    /// Exact backoff, so the delay tests do not depend on the seed (issue #1792).
     fn test_policy() -> RetryPolicy {
         RetryPolicy::exponential(5, StdDuration::from_secs(1))
+            .with_jitter(crate::policy::JitterPolicy::None)
     }
 
     fn now() -> DateTime<Utc> {

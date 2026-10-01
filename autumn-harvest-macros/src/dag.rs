@@ -52,6 +52,13 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<DagAttrs> {
             Ok(())
         } else if meta.path.is_ident("jitter") {
             let value: LitStr = meta.value()?.parse()?;
+            // Zero is valid here: `jitter = "0s"` opts out (issue #1792).
+            if crate::attr_util::task_duration_secs(&value.value()).is_none() {
+                return Err(syn::Error::new_spanned(
+                    &value,
+                    "invalid jitter duration; expected e.g. \"0s\", \"30s\", \"5m\"",
+                ));
+            }
             result.jitter = Some(value.value());
             Ok(())
         } else if meta.path.is_ident("owner") {
@@ -147,7 +154,9 @@ pub fn dag_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // A scheduled DAG with no `jitter` gets the cron default (issue #1792).
     // An explicit zero, such as `"0s"`, opts out.
     let jitter_expr = match (attrs.jitter.as_deref(), attrs.schedule.as_deref()) {
-        (Some(s), _) if is_zero_duration(s) => quote! { ::std::time::Duration::ZERO },
+        (Some(s), _) if crate::attr_util::is_zero_task_duration(s) => {
+            quote! { ::std::time::Duration::ZERO }
+        }
         (Some(s), _) => quote! {
             ::autumn_harvest::task_duration(#s)
                 .expect(concat!("invalid jitter duration string: ", #s))
@@ -397,13 +406,4 @@ fn emit_workflow_companion(
             }
         }
     }
-}
-
-/// Return `true` for a zero duration string, such as `"0s"` or `"0m 0s"`.
-///
-/// `task_duration` rejects a zero total, so the macro handles the opt-out.
-fn is_zero_duration(s: &str) -> bool {
-    s.contains('0')
-        && s.chars()
-            .all(|c| c == '0' || c == ' ' || matches!(c, 's' | 'm' | 'h' | 'd'))
 }

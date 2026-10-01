@@ -16,10 +16,10 @@ non-terminally:
   `worker.rs`). Retries are otherwise **unbounded** — the block is
   rate-limited, not attempt-capped, so a rollback at *any* later time still
   resumes the execution. A permanently diverging history costs one dispatch
-  per 150s to 300s, never a hot loop.
+  every 150s to 300s, never a hot loop.
 - **Jittered re-dispatch.** Each delay is in `[base/2, base]` (issue #1792).
-  The seed comes from the execution, so executions blocked by one deploy do
-  not re-dispatch together.
+  The seed comes from the execution id. When one deploy blocks many
+  executions, they do not re-dispatch together.
 - **Diagnostic stamped.** The execution row records `nd_blocked_at` (most
   recent observation), `nd_block_reason` (the divergence error), and
   `nd_block_count` (consecutive blocks — drives the backoff); `search_attrs`

@@ -70,19 +70,17 @@ const fn uniform_inclusive(seed: u64, lo: u64, hi: u64) -> u64 {
 ///
 /// `stream_seed` and `attempt` select the value, so a replay gets the same delay.
 #[must_use]
-pub fn full_jitter(base: Duration, stream_seed: u64, attempt: u32) -> Duration {
+pub(crate) fn full_jitter(base: Duration, stream_seed: u64, attempt: u32) -> Duration {
     let hi = u64::try_from(base.as_nanos()).unwrap_or(u64::MAX);
-    if hi == 0 {
-        return Duration::ZERO;
-    }
     Duration::from_nanos(uniform_inclusive(stream_seed ^ u64::from(attempt), 0, hi))
 }
 
 /// Equal jitter: a deterministic delay in `[base/2, base]`.
 ///
-/// Half of `base` is a floor, so a loop with no attempt cap cannot hot-loop.
+/// The delay is at least half of `base`. Thus a loop with no attempt cap cannot
+/// become a hot loop.
 #[must_use]
-pub fn equal_jitter(base: Duration, stream_seed: u64, attempt: u32) -> Duration {
+pub(crate) fn equal_jitter(base: Duration, stream_seed: u64, attempt: u32) -> Duration {
     let hi = u64::try_from(base.as_nanos()).unwrap_or(u64::MAX);
     if hi <= 1 {
         return base;
@@ -153,7 +151,8 @@ pub struct RetryPolicy {
     pub max_interval: Duration,
     /// Error type names that must not be retried.
     pub non_retryable_errors: Vec<String>,
-    /// Jitter strategy. Defaults to [`JitterPolicy::Full`], also when the key is absent.
+    /// Jitter strategy. Defaults to [`JitterPolicy::Full`]. A serialized policy
+    /// with no `jitter` key also gets `Full`.
     #[serde(default)]
     pub jitter: JitterPolicy,
 }
@@ -900,8 +899,10 @@ pub struct WorkflowSchedule {
     ///
     /// The actual fire time is shifted forward by a deterministic offset in
     /// `[0, jitter)` derived from `(schedule_id, scheduled_fire_time)`.
-    /// [`WorkflowSchedule::new`] sets [`default_schedule_jitter`]: 10 s for a cron
-    /// with no seconds field, else zero. Set `Duration::ZERO` to opt out.
+    /// [`WorkflowSchedule::new`] sets [`default_schedule_jitter`]:
+    /// [`DEFAULT_CRON_JITTER`] for a cron with no seconds field, else zero. Set
+    /// `Duration::ZERO` to opt out. A deserialized schedule with no `jitter` key
+    /// gets zero.
     ///
     /// ## Example
     ///
@@ -1371,9 +1372,10 @@ pub const DEFAULT_CRON_JITTER: Duration = Duration::from_secs(10);
 
 /// Return the default fire jitter for `schedule`.
 ///
-/// A cron with five fields fires at most once a minute, so 10 s cannot reach
-/// the next fire. A sixth field is seconds, so that cron gets zero. Interval
-/// and manual schedules also get zero.
+/// A cron with fewer than six fields, such as `"0 9 * * *"` or `"@hourly"`,
+/// fires at most once a minute. A 10 s offset thus cannot move a fire past the
+/// next slot. A six-field cron has a seconds field. It can fire more often than
+/// every 10 s, so it gets zero. Interval and manual schedules also get zero.
 #[must_use]
 pub fn default_schedule_jitter(schedule: &Schedule) -> Duration {
     match schedule {
@@ -1687,7 +1689,7 @@ mod tests {
     // ── Schedule jitter ───────────────────────────────────────────────────────
 
     #[test]
-    fn workflow_schedule_jitter_defaults_to_zero() {
+    fn workflow_schedule_manual_jitter_defaults_to_zero() {
         let sched = WorkflowSchedule::new("my_workflow", Schedule::Manual);
         assert_eq!(sched.jitter, Duration::ZERO);
     }
@@ -1696,6 +1698,7 @@ mod tests {
     fn workflow_schedule_cron_defaults_to_small_jitter() {
         let cron = WorkflowSchedule::new("wf", Schedule::Cron("0 * * * *".to_string()));
         assert_eq!(cron.jitter, DEFAULT_CRON_JITTER);
+        assert_eq!(DEFAULT_CRON_JITTER, Duration::from_secs(10));
         let alias = WorkflowSchedule::new("wf", Schedule::Cron("@hourly".to_string()));
         assert_eq!(alias.jitter, DEFAULT_CRON_JITTER);
         let zoned = WorkflowSchedule::new(
@@ -1711,9 +1714,14 @@ mod tests {
 
     #[test]
     fn workflow_schedule_default_jitter_is_zero_when_it_could_collide() {
-        // A seconds field can fire more often than the default window.
+        // A cron with a seconds field can fire more often than the default window.
         let seconds = Schedule::Cron("*/5 * * * * *".to_string());
         assert_eq!(default_schedule_jitter(&seconds), Duration::ZERO);
+        let zoned_seconds = Schedule::CronInTimezone {
+            expr: "0 */5 * * * *".to_string(),
+            tz: "UTC".to_string(),
+        };
+        assert_eq!(default_schedule_jitter(&zoned_seconds), Duration::ZERO);
         let interval = Schedule::Interval(Duration::from_secs(5));
         assert_eq!(default_schedule_jitter(&interval), Duration::ZERO);
         assert_eq!(default_schedule_jitter(&Schedule::Manual), Duration::ZERO);
@@ -1721,7 +1729,8 @@ mod tests {
 
     #[test]
     fn default_cron_jitter_is_whole_seconds_below_one_minute() {
-        // `jitter_secs` stores whole seconds, so a fraction would be lost.
+        // `harvest_schedules.jitter_secs` stores whole seconds. A fractional
+        // default would lose its fraction.
         assert_eq!(DEFAULT_CRON_JITTER.subsec_nanos(), 0);
         assert!(DEFAULT_CRON_JITTER > Duration::ZERO);
         assert!(DEFAULT_CRON_JITTER < Duration::from_secs(60));

@@ -10,8 +10,8 @@ These come up in roughly the order you'll need them.
 for a flat retry, or build a `RetryPolicy` directly when you need a custom
 shape (max interval, backoff coefficient, non-retryable error filters). For
 retry-storm avoidance across many concurrent executions, see
-[`docs/retry-jitter.md`](../retry-jitter.md) — deterministic jitter, on by
-default via `RetryPolicy::jitter`, that replays identically.
+[`docs/retry-jitter.md`](../retry-jitter.md). Retry jitter is deterministic
+and on by default. Set it with `RetryPolicy::jitter`.
 
 **A fleet-wide reliability floor (builder-default retry / `start_to_close`).**
 Instead of repeating the same `retry = …` / `start_to_close = …` on every

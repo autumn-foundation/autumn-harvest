@@ -15,7 +15,21 @@
 /// `execution_timeout`/`sla`, ...) so the validation rule lives in exactly
 /// one place.
 pub fn is_valid_task_duration(s: &str) -> bool {
+    task_duration_secs(s).is_some_and(|secs| secs != 0)
+}
+
+/// Return `true` for a valid duration string with a zero total, such as `"0s"`.
+///
+/// The runtime `task_duration()` rejects a zero total. `#[dag(jitter = "0s")]`
+/// uses this check to opt out of the default cron jitter (issue #1792).
+pub fn is_zero_task_duration(s: &str) -> bool {
+    task_duration_secs(s) == Some(0)
+}
+
+/// Parse a `task_duration()` string to whole seconds. A zero total is valid here.
+pub fn task_duration_secs(s: &str) -> Option<u64> {
     let mut total_secs = 0u64;
+    let mut saw_unit = false;
     let mut current_num = String::new();
     for ch in s.chars() {
         if ch.is_ascii_digit() {
@@ -23,33 +37,28 @@ pub fn is_valid_task_duration(s: &str) -> bool {
                 current_num.clear();
             }
             if current_num.len() > 20 {
-                return false;
+                return None;
             }
             current_num.push(ch);
         } else if ch.is_ascii_alphabetic() {
-            let Ok(num) = current_num.parse::<u64>() else {
-                return false;
-            };
+            let num = current_num.parse::<u64>().ok()?;
             current_num.clear();
+            saw_unit = true;
             let mult = match ch {
                 's' => 1,
                 'm' => 60,
                 'h' => 3600,
                 'd' => 86400,
-                _ => return false,
+                _ => return None,
             };
-            match num
+            total_secs = num
                 .checked_mul(mult)
-                .and_then(|v| total_secs.checked_add(v))
-            {
-                Some(v) => total_secs = v,
-                None => return false,
-            }
+                .and_then(|v| total_secs.checked_add(v))?;
         } else if ch != ' ' {
-            return false;
+            return None;
         }
     }
-    current_num.is_empty() && total_secs != 0
+    (saw_unit && current_num.is_empty()).then_some(total_secs)
 }
 
 /// Parse a bare-flag-or-explicit-bool attribute value: `name` (bare, implies
@@ -249,5 +258,38 @@ mod arg_type_hint_tests {
         let owned = params_from("a: u32, b: bool");
         let refs: Vec<_> = owned.iter().collect();
         assert_eq!(arg_type_hint(&refs), "(u32, bool)");
+    }
+}
+
+#[cfg(test)]
+mod task_duration_tests {
+    use super::{is_valid_task_duration, is_zero_task_duration, task_duration_secs};
+
+    #[test]
+    fn zero_duration_strings_are_zero() {
+        for s in ["0s", "0m", "00s", "0h 0s", "0d"] {
+            assert!(is_zero_task_duration(s), "should be zero: '{s}'");
+            assert!(
+                !is_valid_task_duration(s),
+                "zero is not a valid timeout: '{s}'"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_or_non_zero_strings_are_not_zero() {
+        for s in [
+            "", "0", "s0", "0d0", "sss0", "m0h", "0s 0", "0x", "10s", "1m",
+        ] {
+            assert!(!is_zero_task_duration(s), "should not be zero: '{s}'");
+        }
+    }
+
+    #[test]
+    fn task_duration_secs_sums_units() {
+        assert_eq!(task_duration_secs("1h30m"), Some(5400));
+        assert_eq!(task_duration_secs("0s"), Some(0));
+        assert_eq!(task_duration_secs("5x"), None);
+        assert_eq!(task_duration_secs(""), None);
     }
 }

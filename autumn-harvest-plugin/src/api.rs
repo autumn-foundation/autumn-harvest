@@ -3038,6 +3038,14 @@ struct PauseResumeRequest {
     reason: Option<String>,
 }
 
+/// Resolve a request `jitter_secs`. An omitted value gets `default_schedule_jitter`.
+fn requested_jitter(jitter_secs: Option<u64>, schedule: &Schedule) -> std::time::Duration {
+    jitter_secs.map_or_else(
+        || default_schedule_jitter(schedule),
+        std::time::Duration::from_secs,
+    )
+}
+
 /// Request body for `POST /admin/schedules/workflow`.
 #[derive(Debug, Deserialize)]
 struct CreateWorkflowScheduleRequest {
@@ -3060,8 +3068,8 @@ struct CreateWorkflowScheduleRequest {
     paused: bool,
     #[serde(default = "default_queue_name")]
     queue_name: String,
-    /// Jitter window in seconds. `0` disables jitter. When omitted, a cron
-    /// schedule gets `default_schedule_jitter` (issue #1792).
+    /// Jitter window in seconds. `0` disables jitter. If the request omits this
+    /// field, the schedule gets `default_schedule_jitter` (issue #1792).
     #[serde(default)]
     jitter_secs: Option<u64>,
     /// Overlap policy string (e.g. `"skip"`, `"buffer_one"`, `"buffer_all"`,
@@ -27329,10 +27337,7 @@ async fn create_workflow_schedule(
         }
     }
 
-    let jitter = request.jitter_secs.map_or_else(
-        || default_schedule_jitter(&schedule),
-        std::time::Duration::from_secs,
-    );
+    let jitter = requested_jitter(request.jitter_secs, &schedule);
     let ws = WorkflowSchedule {
         workflow_name: request.workflow_name.clone(),
         dag_name: None,
@@ -44722,7 +44727,8 @@ struct CandidateSchedulePreviewRequest {
     max_active_runs: u32,
     #[serde(default)]
     paused: bool,
-    /// When omitted, a cron schedule gets `default_schedule_jitter`, as on create.
+    /// If the request omits this field, the preview uses `default_schedule_jitter`,
+    /// as create does.
     #[serde(default)]
     jitter_secs: Option<u64>,
     #[serde(default = "default_overlap_policy")]
@@ -45196,12 +45202,9 @@ async fn preview_candidate_schedule_handler(
         ));
     }
 
-    // Validate jitter before i64 conversion; body.jitter_secs is u64 so an
-    // overly large value would overflow chrono::Duration::seconds and panic.
-    let jitter_duration = body.jitter_secs.map_or_else(
-        || default_schedule_jitter(&schedule),
-        std::time::Duration::from_secs,
-    );
+    // Validate jitter before the i64 conversion. A u64 second count can
+    // overflow chrono::Duration::seconds and panic.
+    let jitter_duration = requested_jitter(body.jitter_secs, &schedule);
     if let Err(e) = validate_jitter(&schedule, jitter_duration) {
         return Ok((
             StatusCode::BAD_REQUEST,
@@ -45287,10 +45290,9 @@ async fn preview_candidate_schedule_handler(
         raw_entries.iter().map(|e| e.effective_at).collect();
 
     if jitter_secs > 0 {
-        let jitter_window = jitter_duration;
         for entry in &mut raw_entries {
             if let Some(t) = entry.effective_at {
-                let offset = compute_jitter_offset(schedule_id, t, jitter_window);
+                let offset = compute_jitter_offset(schedule_id, t, jitter_duration);
                 if let Ok(d) = chrono::Duration::from_std(offset) {
                     entry.effective_at = Some(t + d);
                 }
@@ -54236,6 +54238,24 @@ mod tests {
         assert_eq!(req.overlap_policy, "skip");
         assert_eq!(req.count, 10);
         assert!(req.from.is_none());
+    }
+
+    /// An omitted `jitter_secs` gets the cron default; an explicit 0 opts out
+    /// (issue #1792).
+    #[test]
+    fn requested_jitter_defaults_only_when_omitted() {
+        let cron = Schedule::Cron("0 9 * * *".to_string());
+        assert_eq!(
+            requested_jitter(None, &cron),
+            autumn_harvest::policy::DEFAULT_CRON_JITTER
+        );
+        assert_eq!(requested_jitter(Some(0), &cron), std::time::Duration::ZERO);
+        assert_eq!(
+            requested_jitter(Some(300), &cron),
+            std::time::Duration::from_secs(300)
+        );
+        let seconds = Schedule::Cron("*/5 * * * * *".to_string());
+        assert_eq!(requested_jitter(None, &seconds), std::time::Duration::ZERO);
     }
 
     #[test]

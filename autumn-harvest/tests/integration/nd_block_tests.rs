@@ -432,6 +432,34 @@ async fn get_nd_block_row(
     (blocked_at.is_some(), reason, count, attrs)
 }
 
+/// The requeue delay of the latest block: `scheduled_at - nd_blocked_at`.
+///
+/// One block writes both columns, so poll lag does not enter the value.
+async fn nd_requeue_delay(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> chrono::Duration {
+    let blocked_at: Option<chrono::DateTime<chrono::Utc>> = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::id.eq(exec_id.as_uuid()))
+        .select(harvest_workflow_executions::nd_blocked_at)
+        .first(conn)
+        .await
+        .expect("execution must exist");
+    let (_, scheduled_at, _, _) = get_workflow_task(conn, exec_id).await;
+    scheduled_at - blocked_at.expect("nd_blocked_at must be set")
+}
+
+/// Assert that `delay` is in the Equal-jitter band `[base/2, base]` (issue #1792).
+///
+/// The worker clock writes `nd_blocked_at` and the database clock writes
+/// `scheduled_at`, so the band has a small slop.
+fn assert_in_equal_jitter_band(delay: chrono::Duration, base_secs: i64) {
+    let slop = chrono::Duration::milliseconds(250);
+    let base = chrono::Duration::seconds(base_secs);
+    assert!(
+        delay >= base / 2 - slop && delay <= base + slop,
+        "delay {delay} is outside [{}, {base}]",
+        base / 2
+    );
+}
+
 async fn get_history(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> Vec<WorkflowEvent> {
     store::load_history(conn, exec_id)
         .await
@@ -631,11 +659,11 @@ async fn divergent_replay_blocks_instead_of_failing() {
     let (task_state, scheduled_at, sticky, task_error) =
         get_workflow_task(&mut conn, exec_id).await;
     assert_eq!(task_state, "PENDING");
-    // Equal jitter defers the first re-dispatch by 2.5s to 5s (issue #1792).
     assert!(
-        scheduled_at > chrono::Utc::now() + chrono::Duration::seconds(1),
-        "first block must defer the re-dispatch by 2.5s to 5s; got {scheduled_at}"
+        scheduled_at > chrono::Utc::now(),
+        "re-dispatch must be deferred"
     );
+    assert_in_equal_jitter_band(nd_requeue_delay(&mut conn, exec_id).await, 5);
     assert!(sticky.is_none(), "sticky affinity must be cleared");
     assert!(
         task_error
@@ -896,9 +924,9 @@ async fn blocked_child_does_not_notify_parent() {
     assert_eq!(output, Some(serde_json::json!("v1-completed")));
 }
 
-/// AC4: a still-diverging re-dispatch re-blocks — `nd_block_count` increments
-/// and the backoff grows (5s, then 10s), so a permanently diverging history is
-/// rate-limited, never a hot loop.
+/// AC4: a still-diverging re-dispatch re-blocks. `nd_block_count` increments
+/// and the backoff ceiling grows from 5s to 10s. A permanently diverging
+/// history is thus rate-limited, never a hot loop.
 #[tokio::test]
 async fn reblock_increments_count_and_grows_backoff() {
     let (url, _c) = setup().await;
@@ -930,28 +958,20 @@ async fn reblock_increments_count_and_grows_backoff() {
         build_pool(&url),
     );
     wait_for_nd_block(&mut conn, exec_id, 1).await;
-    let (_, first_scheduled_at, _, _) = get_workflow_task(&mut conn, exec_id).await;
-    let first_delay = first_scheduled_at - chrono::Utc::now();
+    let first_delay = nd_requeue_delay(&mut conn, exec_id).await;
 
     // Skip the first backoff; the still-divergent v2 worker re-blocks.
     make_task_claimable_now(&mut conn, exec_id).await;
     wait_for_nd_block(&mut conn, exec_id, 2).await;
-    let (_, second_scheduled_at, _, _) = get_workflow_task(&mut conn, exec_id).await;
-    let second_delay = second_scheduled_at - chrono::Utc::now();
+    let second_delay = nd_requeue_delay(&mut conn, exec_id).await;
     worker2.shutdown();
     let _ = handle2.await;
 
     assert_eq!(get_state(&mut conn, exec_id).await, "RUNNING");
     // Equal jitter: the first block defers 2.5s to 5s, the second 5s to 10s
-    // (issue #1792). Generous slop for CI clocks.
-    assert!(
-        second_delay > first_delay,
-        "backoff must grow: first={first_delay}, second={second_delay}"
-    );
-    assert!(
-        second_delay > chrono::Duration::seconds(3),
-        "second block must defer by 5s to 10s; got {second_delay}"
-    );
+    // (issue #1792). The bands touch at 5s, so the test checks each band.
+    assert_in_equal_jitter_band(first_delay, 5);
+    assert_in_equal_jitter_band(second_delay, 10);
     assert_eq!(metrics.nd_block_count(), 2);
     assert_eq!(
         metrics.terminal_failed_count(),
