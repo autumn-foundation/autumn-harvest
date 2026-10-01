@@ -1,5 +1,13 @@
 # Ledger: `quota_reconcile` candidate-scan cost under mixed-deployment skew
 
+> **Resolved by issue #1631.** The scan now seeks once per registered
+> workflow name through `idx_harvest_we_quota_reconcile_name_id`
+> (migration `20261001192155_harvest_quota_reconcile_name_id_index`).
+> One tick reads at most `batch_size` rows per registered name. The text
+> below is the original diagnosis. It describes the query and index that
+> existed before that fix.
+> `quota_reconcile_candidate_bound_tests.rs` now guards the bound.
+
 Findings, not a fix. Issue #1226 follow-up, closing the open question
 migration `20260910192721_harvest_quota_reconcile_candidate_index`'s own
 comment raises, with a root cause more specific than the migration

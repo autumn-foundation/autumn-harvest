@@ -267,88 +267,38 @@ struct CandidateRow {
 
 /// SQL for [`reconcile_quota_keys_from`]'s candidate scan.
 ///
-/// Backed by `idx_harvest_we_quota_reconcile_candidates` (migration
-/// `20260910192721_harvest_quota_reconcile_candidate_index`), a partial
-/// index on `(id) WHERE quota_key IS NULL AND state IN ('RUNNING',
-/// 'PAUSED')`. `idx_harvest_we_state` (migration
-/// `20260409000000_harvest_initial`) covers only `state = 'RUNNING'`, not
-/// `PAUSED`, so it cannot serve this query's `IN`. Without the dedicated
-/// index the scan falls back to a full sequential scan of
-/// `harvest_workflow_executions` on every tick, unbounded by the current
-/// non-terminal row count.
+/// The query seeks once per registered workflow name. `$1` holds the
+/// names. A `LATERAL` subquery reads the first `$3` candidate rows of one
+/// name in `id` order. The outer query merges those rows and keeps the
+/// first `$3`. The result equals one global `id`-ordered scan over all
+/// registered names, so the keyset cursor below is unchanged.
 ///
-/// The index's predicate already includes `quota_key IS NULL`, so a row
-/// leaves the index the moment its `quota_key` is backfilled. The index
-/// therefore always covers exactly today's candidate set, never the
-/// table's full history.
+/// `idx_harvest_we_quota_reconcile_name_id` backs each seek (migration
+/// `20261001192155_harvest_quota_reconcile_name_id_index`). It is a
+/// partial index on `(workflow_name, id) WHERE quota_key IS NULL AND
+/// state IN ('RUNNING', 'PAUSED')`. Each seek is an equality on
+/// `workflow_name`, so the index returns rows in `id` order with no sort.
+/// A tick reads at most `$3` rows per registered name. It never reads the
+/// rows of unregistered types, or the resolved history of a registered
+/// type (issue #1631).
 ///
-/// `workflow_name = ANY($1)` restricts the scan to workflow types with a
-/// currently-registered `QuotaPolicy` (see
-/// [`registered_quota_workflow_names`]). A `NoPolicy` row never sets
-/// `quota_key`, so it never leaves the index on its own. Without this
-/// filter, a mixed deployment (some workflow types quota'd, others not)
-/// would re-fetch every no-policy row's JSON input on every tick,
-/// forever. `$1` is re-read from the live registry on every call. A
-/// policy declared mid-uptime, or removed, therefore takes effect
-/// starting with the very next tick, not just at the next restart.
-/// See this module's doc comment for exactly when a given ROW becomes
-/// visible. It is immediate if sorted ahead of the cursor, or waits for
-/// the next pass wrap if sorted behind it.
+/// A row leaves the index when its `quota_key` is backfilled or its
+/// execution turns terminal. The index therefore covers only the current
+/// candidate set.
 ///
-/// KNOWN SCALING TRADE-OFF: this filter is a residual predicate, not an
-/// index seek. `idx_harvest_we_quota_reconcile_candidates` orders by
-/// `id` alone, so Postgres evaluates `workflow_name = ANY($1)` against
-/// each id-ordered candidate row, not by jumping straight to matches. In
-/// a mixed deployment with a huge non-quota'd population and few
-/// matching rows, one tick can touch many discarded rows before filling
-/// `batch_size`.
+/// The old form was one scan with `workflow_name = ANY($1) ORDER BY id
+/// LIMIT $3` over an `(id)` index. Postgres tested the name on every
+/// row, so cost grew with the unrelated `NULL` backlog. The plan also
+/// changed as a registered type matured. See
+/// `docs/performance-quota-reconcile-candidate-scan.md`.
 ///
-/// A `(workflow_name, id)` index was considered and rejected. It would
-/// enable that seek, but could no longer serve `ORDER BY id LIMIT $3`
-/// without sorting every matching row first. That trades today's
-/// bounded cost against a large EXCLUDED population for a bounded cost
-/// against a large REGISTERED one instead, not a strict win. See the
-/// migration's own comment for the full trade-off.
-///
-/// Measured against production-shaped fixtures (issue #1226 follow-up,
-/// see `docs/performance-quota-reconcile-candidate-scan.md`). The
-/// residual filter cost is real. It grows with the non-quota'd
-/// population: about 3,900 buffers at 20,000 such rows. It reaches about
-/// 95,000 buffers, and a ~150ms single-batch execution time, at 500,000.
-/// That is once the quota'd workflow type also carries its own realistic
-/// terminal history. `idx_harvest_wfx_workflow_identity` does not rescue
-/// this in practice. It is a full index, so it pays for that terminal
-/// history too.
-///
-/// This is not a one-time rollout cost, for a sustained workload. A
-/// non-quota'd row leaves the candidate index too, once its execution
-/// goes terminal -- the predicate is `state IN ('RUNNING', 'PAUSED')`,
-/// not `quota_key IS NULL` alone. This fixture never advances that
-/// population. It measures a live production system's steady state
-/// instead: new non-quota'd starts continuously replace completions,
-/// holding the active non-quota'd population roughly constant. Under
-/// that condition, not literally "the same rows forever", the candidate
-/// scan cost recurs every tick, since nothing shrinks the population it
-/// walks. Measured directly: 504,201 buffers, immediately after the
-/// target backlog is fully backfilled -- worse than any single tick
-/// measured during the backfill itself.
-///
-/// The rejected `(workflow_name, id)` index was built and tested
-/// directly. The unforced planner does not pick it either. The reason is
-/// a cost misestimate, not a hard limitation. Forcing the planner onto
-/// it (`enable_indexscan = off`) drops the cost from about 95,000
-/// buffers to 46. A literal `workflow_name = $1` rewrite drops it to
-/// 189, with no forcing needed. The index would help enormously; the
-/// default planner just never reaches for it under `= ANY($1)` against
-/// this correlated data.
-///
-/// Two fix directions exist, both evidenced, neither shipped. One
-/// rewrites `CANDIDATE_SQL` as one bounded, ordered scan per registered
-/// quota'd workflow name, merged by `id`. That touches the keyset
-/// cursor's anti-starvation guarantee below, so it needs a human
-/// decision. The other fixes the underlying statistics -- attempted
-/// once, unsuccessfully, and not pursued further. No fix ships in this
-/// pass.
+/// Only types with a registered `QuotaPolicy` are candidates (see
+/// [`registered_quota_workflow_names`]). A `NoPolicy` row never gets a
+/// `quota_key`. Without the name filter, a mixed deployment would
+/// re-fetch every no-policy row on every tick. `$1` is re-read from the
+/// live registry on every call. A policy declared mid-uptime, or removed,
+/// therefore takes effect on the next tick. See this module's doc comment
+/// for when a given row becomes visible.
 ///
 /// `AND ($2::uuid IS NULL OR id > $2) ORDER BY id LIMIT $3` is a keyset
 /// cursor, not a bare `LIMIT`. A row this sweep can never resolve --

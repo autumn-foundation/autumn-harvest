@@ -2,6 +2,10 @@
 //! Ledger perf pass: `quota_reconcile::CANDIDATE_SQL`'s residual
 //! `workflow_name = ANY($1)` filter (issue #1226).
 //!
+//! Historical evidence. Issue #1631 replaced the query and the index this
+//! file measures. `quota_reconcile_candidate_bound_tests.rs` guards the
+//! fix.
+//!
 //! # Workload
 //!
 //! [`reconcile_quota_keys_from`] runs on `worker_heartbeat_interval`

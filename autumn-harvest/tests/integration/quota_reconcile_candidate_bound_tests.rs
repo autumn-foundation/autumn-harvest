@@ -201,7 +201,11 @@ async fn merged_batches_keep_global_id_order_across_registered_types() {
         .expect("truncate");
     // Twelve rows. Odd ids belong to one type, even ids to the other.
     for n in 1..=12_u32 {
-        let name = if n % 2 == 0 { "bound_even" } else { "bound_odd" };
+        let name = if n % 2 == 0 {
+            "bound_even"
+        } else {
+            "bound_odd"
+        };
         diesel::sql_query(
             "INSERT INTO harvest_workflow_executions \
                (id, workflow_name, workflow_id, shard_id, state, input, quota_key) \
