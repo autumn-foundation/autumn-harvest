@@ -243,6 +243,23 @@ and on a nightly `cron`. The cron leaves `CHAOS_SEEDS` empty so the sweep uses
 its computed default (≥ 5 seeds per run, AC5); a manual dispatch can supply
 explicit seeds to replay a printed failure.
 
+### Nightly watchdog (issue #1790)
+
+Until issue #1790, `chaos.yml` did not parse, so the nightly never ran. Two
+checks now stop a repeat:
+
+- `ci_run_coverage` parses `chaos.yml` and each other workflow that it cites.
+  It also checks that `chaos.yml` has a cron and runs `chaos_tests::` with the
+  `chaos` feature.
+- `.github/workflows/chaos-watchdog.yml` runs daily at 10:41 UTC. It runs
+  `.github/ci/chaos-watchdog.sh`. When no scheduled `chaos.yml` run succeeded in
+  the last 48 hours, the script opens an issue. Its title is `Chaos nightly: no
+  successful scheduled run in 48 h`. While the gap continues, the script adds a
+  comment to that issue. After the next success, it closes the issue.
+
+The watchdog is a separate file, so a defect in `chaos.yml` cannot also stop the
+alert. An API error makes the watchdog run fail. It does not open a false alert.
+
 ## Out of scope
 
 Production/runtime chaos (#796), network-partition / Jepsen / Antithesis-style

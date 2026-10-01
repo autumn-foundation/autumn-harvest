@@ -1193,7 +1193,7 @@ fn linux_clone(row: &SuiteRow) -> SuiteRow {
 // ── Every workflow this guard cites must parse (issue #1790) ────────────────
 
 /// The repository root.
-fn repo_root() -> PathBuf {
+pub(super) fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..")
 }
 
@@ -1228,7 +1228,7 @@ fn parse_workflow_text(text: &str) -> Result<serde_yaml::Value, String> {
 }
 
 /// Reads and parses one workflow. Panics with the path and the parse error.
-fn parse_workflow(rel: &str) -> serde_yaml::Value {
+pub(super) fn parse_workflow(rel: &str) -> serde_yaml::Value {
     let text = read_source(&repo_root().join(rel));
     parse_workflow_text(&text).unwrap_or_else(|e| {
         panic!(
@@ -1240,7 +1240,7 @@ fn parse_workflow(rel: &str) -> serde_yaml::Value {
 }
 
 /// The `run:` text of every step in every job of a parsed workflow.
-fn workflow_run_commands(doc: &serde_yaml::Value) -> Vec<String> {
+pub(super) fn workflow_run_commands(doc: &serde_yaml::Value) -> Vec<String> {
     let Some(jobs) = doc.get("jobs").and_then(serde_yaml::Value::as_mapping) else {
         return Vec::new();
     };
@@ -1253,7 +1253,7 @@ fn workflow_run_commands(doc: &serde_yaml::Value) -> Vec<String> {
 }
 
 /// The `cron` strings under a parsed workflow's `on.schedule`.
-fn workflow_crons(doc: &serde_yaml::Value) -> Vec<String> {
+pub(super) fn workflow_crons(doc: &serde_yaml::Value) -> Vec<String> {
     doc.get("on")
         .and_then(|on| on.get("schedule"))
         .and_then(serde_yaml::Value::as_sequence)

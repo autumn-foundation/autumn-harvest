@@ -9,60 +9,34 @@
 //! Linux only, because the script uses GNU `date`, as the `ubuntu-latest`
 //! runner does.
 
-use std::path::PathBuf;
-
-/// The repository root.
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..")
-}
+use super::ci_run_coverage::{parse_workflow, repo_root, workflow_crons, workflow_run_commands};
 
 const WATCHDOG_WORKFLOW: &str = ".github/workflows/chaos-watchdog.yml";
 const WATCHDOG_SCRIPT: &str = ".github/ci/chaos-watchdog.sh";
-
-fn parse_watchdog_workflow() -> serde_yaml::Value {
-    let path = repo_root().join(WATCHDOG_WORKFLOW);
-    let text = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    serde_yaml::from_str(&text).unwrap_or_else(|e| panic!("{WATCHDOG_WORKFLOW}: {e}"))
-}
 
 /// The watchdog must fire on its own cron and run the script with the
 /// permissions that the script needs.
 #[test]
 fn watchdog_workflow_runs_the_script_daily() {
-    let doc = parse_watchdog_workflow();
-    let crons: Vec<&str> = doc
-        .get("on")
-        .and_then(|on| on.get("schedule"))
-        .and_then(serde_yaml::Value::as_sequence)
-        .into_iter()
-        .flatten()
-        .filter_map(|e| e.get("cron").and_then(serde_yaml::Value::as_str))
-        .collect();
+    let doc = parse_workflow(WATCHDOG_WORKFLOW);
     assert!(
-        !crons.is_empty(),
+        !workflow_crons(&doc).is_empty(),
         "{WATCHDOG_WORKFLOW} must have an `on.schedule` cron"
     );
 
-    let perms = doc.get("permissions");
     let perm = |key: &str| {
-        perms
+        doc.get("permissions")
             .and_then(|p| p.get(key))
             .and_then(serde_yaml::Value::as_str)
     };
     assert_eq!(perm("actions"), Some("read"), "the script lists runs");
     assert_eq!(perm("issues"), Some("write"), "the script opens issues");
 
-    let runs_script = doc
-        .get("jobs")
-        .and_then(serde_yaml::Value::as_mapping)
-        .into_iter()
-        .flat_map(|jobs| jobs.values())
-        .filter_map(|job| job.get("steps").and_then(serde_yaml::Value::as_sequence))
-        .flatten()
-        .filter_map(|step| step.get("run").and_then(serde_yaml::Value::as_str))
-        .any(|run| run.contains(WATCHDOG_SCRIPT));
-    assert!(runs_script, "{WATCHDOG_WORKFLOW} must run {WATCHDOG_SCRIPT}");
+    let runs = workflow_run_commands(&doc);
+    assert!(
+        runs.iter().any(|run| run.contains(WATCHDOG_SCRIPT)),
+        "{WATCHDOG_WORKFLOW} must run {WATCHDOG_SCRIPT}; found {runs:?}"
+    );
 }
 
 /// The answers that the stub `gh` gives.
