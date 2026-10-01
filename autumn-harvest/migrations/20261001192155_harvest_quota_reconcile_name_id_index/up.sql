@@ -39,10 +39,8 @@ BEGIN
         CREATE INDEX idx_harvest_we_quota_reconcile_name_id
             ON harvest_workflow_executions (workflow_name, id)
             WHERE quota_key IS NULL AND state IN ('RUNNING', 'PAUSED');
-    ELSIF existing_def NOT LIKE '%USING btree (workflow_name, id) WHERE %'
-          OR existing_def NOT LIKE '%quota_key IS NULL%'
-          OR existing_def NOT LIKE '%RUNNING%'
-          OR existing_def NOT LIKE '%PAUSED%'
+    ELSIF regexp_replace(existing_def, '^CREATE INDEX \S+ ON (ONLY )?\S+ ', '') <>
+          'USING btree (workflow_name, id) WHERE ((quota_key IS NULL) AND (state = ANY (ARRAY[''RUNNING''::text, ''PAUSED''::text])))'
     THEN
         RAISE EXCEPTION
             'idx_harvest_we_quota_reconcile_name_id already exists with an unexpected definition -- rename or drop it before retrying this migration: %',
