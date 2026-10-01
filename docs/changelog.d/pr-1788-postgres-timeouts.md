@@ -8,21 +8,28 @@ The workspace enables deadpool's `rt_tokio_1` feature, which these timeouts
 need. `pool::acquire` bounds any pool, also a pool with no deadpool timeouts. A
 timeout is the new typed error `HarvestError::PoolAcquireTimeout`.
 
-**Bounded claim.** The single-shard claim, fleet registration and fleet status
-writes now use the pool's `wait` bound, or 30 s when the pool has none. Before,
-they waited without limit. This reverses the "single shard stays unbounded"
-rule from issue #961 AC7. A claim that times out reports no work, and the poll
-loop tries again.
+**Bounded worker acquires.** Every worker acquire now uses the pool's `wait`
+bound, or 30 s when the pool has none: the single-shard claim, fleet
+registration and status writes, activity and workflow task persistence, the
+cancellation observer and the DR generation pin. Before, a pool with no deadpool
+`wait` timeout made them wait without limit. This reverses the "single shard
+stays unbounded" rule from issue #961 AC7. A claim that times out reports no
+work, and the poll loop tries again.
 
-**Session timeouts per role.** A `post_create` hook runs `SET` once on each
-new connection. `DbRole::Hot` (claim and persist), `Scanner` and `Maintenance`
-get growing `statement_timeout`, `lock_timeout` and
-`idle_in_transaction_session_timeout` values. A zero value sends no `SET`.
-`transaction_timeout` is off by default, because it needs PostgreSQL 17.
-`ShardedDbPool::from_dsns` builds `Maintenance` pools.
+**Session timeouts per role (opt-in).** A pool built with `engine_pool` or
+`with_engine_timeouts` runs `SET` once on each new connection. The plugin's
+`autumn-web` pools do not, so the operator guide gives the `ALTER ROLE` steps.
+`DbRole::Hot` (claim and persist), `Scanner` and `Maintenance` get growing
+`statement_timeout`, `lock_timeout` and `idle_in_transaction_session_timeout`
+values. A zero value sends no `SET`. `transaction_timeout` is off by default,
+because it needs PostgreSQL 17. A part of a millisecond rounds up, and `validate` rejects a value above
+`i32::MAX` ms. `ShardedDbPool::from_dsns` builds `Maintenance` pools. The
+partition drain sets `SET LOCAL statement_timeout = 0`, because a timeout there
+discards a finished pass.
 
 **Heartbeat flush.** Each flush has its own bounded acquire. A failed flush
-keeps its payload for the next tick.
+keeps its payload for the next tick. A task that is no longer `RUNNING` drops
+the payload.
 
 **Metrics.** `harvest.db.pool_acquire_timeout{site}` and
 `harvest.heartbeat.flush_failed{reason}`, with starter dashboard panels.
@@ -35,7 +42,8 @@ No new `WorkflowEvent` variant. No migration. No `harvest_events` write.
 
 **Tests.** Unit: `pool::tests` (setup SQL, role defaults, validation, bounded
 `acquire` against a silent listener), `heartbeat::tests` (typed timeout, counted
-retry), `worker::tests::a_single_shard_claim_is_bounded_and_counted`.
+retry), `worker::tests::a_single_shard_claim_is_bounded_and_counted` and
+`a_claim_on_a_pool_without_timeouts_uses_the_default_bound` (paused clock).
 Integration (`pg_timeouts_tests`, real Postgres): a full pool fails a claim and
 a heartbeat flush within the bound; `statement_timeout` cancels a `pg_sleep`
 trigger in `store::append_events`; each role's connection reports its

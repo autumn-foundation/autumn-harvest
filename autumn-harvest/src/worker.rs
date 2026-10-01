@@ -5954,8 +5954,9 @@ pub(crate) const MIN_SHARD_ACQUIRE_BOUND: Duration = Duration::from_secs(5);
 /// "no work", which it deliberately does not today.
 ///
 /// `false` - the single-shard path - returns `None`. With one shard there are
-/// no peers to starve, so `None` uses the pool's own bound. Issue #1788 bounds
-/// that path too: an unbounded wait let one stuck connection stop all claims.
+/// no peers to starve, so this floor does not apply. `None` uses the pool's
+/// own bound instead (issue #1788). An unbounded wait let one stuck connection
+/// stop all claims.
 #[must_use]
 pub(crate) const fn shard_acquire_bound(
     multi_shard: bool,
@@ -14053,7 +14054,7 @@ async fn observe_task_cancellation(pool: &DbPool, task_id: uuid::Uuid) {
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
 
-        let Ok(mut conn) = pool.get().await else {
+        let Ok(mut conn) = crate::pool::acquire_within_pool_bound(pool).await else {
             continue;
         };
 
@@ -14584,7 +14585,7 @@ async fn handle_session_acquire(
     // same registry replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
-    let mut conn = pool.get().await.map_err(crate::error::database_error)?;
+    let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
 
     let Some(activity_uuid) = task.activity_id else {
         return fail_task_only(
@@ -14762,7 +14763,7 @@ async fn handle_session_release(
     // same registry replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
-    let mut conn = pool.get().await.map_err(crate::error::database_error)?;
+    let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
 
     let Some(activity_uuid) = task.activity_id else {
         return fail_task_only(
@@ -14811,11 +14812,11 @@ async fn process_activity_task(
     session_slots_in_use: &crate::sessions::SessionSlotRegistry,
 ) -> HarvestResult<()> {
     let Some(exec_uuid) = task.workflow_exec_id else {
-        let mut conn = pool.get().await.map_err(crate::error::database_error)?;
+        let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
         return fail_task_only(&mut conn, task.id, "activity task missing workflow_exec_id").await;
     };
     let Some(activity_name) = task.activity_name.as_deref() else {
-        let mut conn = pool.get().await.map_err(crate::error::database_error)?;
+        let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
         return fail_task_only(&mut conn, task.id, "activity task missing activity_name").await;
     };
     let exec_id = execution_id_from_uuid(exec_uuid);
@@ -14892,7 +14893,7 @@ async fn process_activity_task(
         && activity.circuit_breaker.is_some()
         && let Some(key) = task.rate_limit_key.as_deref()
     {
-        let mut conn = pool.get().await.map_err(crate::error::database_error)?;
+        let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
         if !queue::try_consume_rate_limit_token(&mut conn, key).await? {
             // No token available (bucket empty, or fail-closed when the bucket
             // row is missing): defer this real call instead of running it.
@@ -14936,7 +14937,7 @@ async fn process_activity_task(
     // a deferred task never records a start it did not run; serves both the
     // short-circuit path (start + CircuitOpen failure) and the real-call path.
     let started = {
-        let mut conn = pool.get().await.map_err(crate::error::database_error)?;
+        let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
         let started_result = append_activity_started_if_pending(
             &mut conn,
             task,
@@ -15032,7 +15033,7 @@ async fn process_activity_task(
             &task.queue_name,
             ActivityStatus::Failed,
         );
-        let mut conn = pool.get().await.map_err(crate::error::database_error)?;
+        let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
         let retry_policy_result = configured_retry_policy(task);
         let retry_policy = fail_execution_on_error(
             &mut conn,
@@ -15221,55 +15222,57 @@ async fn process_activity_task(
     #[cfg(feature = "wasm-activities")]
     let wasm_dispatch: Option<crate::wasm_store::WasmDispatch> =
         match (registry.wasm_binding(activity_name), registry.wasm_store()) {
-            (Some(binding), Some(store)) => Some(match pool.get().await {
-                Ok(mut conn) => {
-                    crate::wasm_store::resolve_wasm_dispatch(
-                        &mut conn,
-                        store,
-                        binding,
-                        activity_name,
-                        wasm_effective_deadline(
-                            task.start_to_close,
-                            activity.default_start_to_close,
-                        ),
-                        // Thread the task cancellation token so a cancelled guest
-                        // is cooperatively interrupted (issue #965 review) within
-                        // ~1 epoch tick, instead of holding a blocking-pool thread
-                        // until its wall-clock ceiling.
-                        Some(cancel.clone()),
-                        // Thread the start-to-close anchor so `invoke` charges the
-                        // whole pre-guest interval — resolution (this checkout +
-                        // active-hash lookup + cold-cache byte fetch) plus compile
-                        // — against the guest deadline, not just compile (issue
-                        // #965 review round 7). `attempt_clock_start` was captured
-                        // above, just before this dispatch resolution began, so it
-                        // APPROXIMATES the start-to-close anchor (issue #965
-                        // review round 10 — it does not equal it). The
-                        // authoritative anchor is `task.started_at`, set at claim,
-                        // and `ActivityStarted` is appended earlier still, so the
-                        // setup between them is not charged to the guest. Under
-                        // pool contention the guest's budget therefore starts
-                        // slightly later than the timeout scanner's. That is
-                        // safe-direction — the scanner fires first, the guest's own
-                        // epoch ceiling still bounds it, and a late result lands on
-                        // an already-terminal task — and it matches native
-                        // activities, which are equally unaware of `started_at`.
-                        attempt_clock_start,
-                    )
-                    .await
-                    // `conn` is dropped at the end of this arm, before the guest runs.
-                }
-                Err(e) => {
-                    use crate::failure::IntoActivityErrorString as _;
-                    crate::wasm_store::WasmDispatch::Fail(
+            (Some(binding), Some(store)) => {
+                Some(match crate::pool::acquire_within_pool_bound(pool).await {
+                    Ok(mut conn) => {
+                        crate::wasm_store::resolve_wasm_dispatch(
+                            &mut conn,
+                            store,
+                            binding,
+                            activity_name,
+                            wasm_effective_deadline(
+                                task.start_to_close,
+                                activity.default_start_to_close,
+                            ),
+                            // Thread the task cancellation token so a cancelled guest
+                            // is cooperatively interrupted (issue #965 review) within
+                            // ~1 epoch tick, instead of holding a blocking-pool thread
+                            // until its wall-clock ceiling.
+                            Some(cancel.clone()),
+                            // Thread the start-to-close anchor so `invoke` charges the
+                            // whole pre-guest interval — resolution (this checkout +
+                            // active-hash lookup + cold-cache byte fetch) plus compile
+                            // — against the guest deadline, not just compile (issue
+                            // #965 review round 7). `attempt_clock_start` was captured
+                            // above, just before this dispatch resolution began, so it
+                            // APPROXIMATES the start-to-close anchor (issue #965
+                            // review round 10 — it does not equal it). The
+                            // authoritative anchor is `task.started_at`, set at claim,
+                            // and `ActivityStarted` is appended earlier still, so the
+                            // setup between them is not charged to the guest. Under
+                            // pool contention the guest's budget therefore starts
+                            // slightly later than the timeout scanner's. That is
+                            // safe-direction — the scanner fires first, the guest's own
+                            // epoch ceiling still bounds it, and a late result lands on
+                            // an already-terminal task — and it matches native
+                            // activities, which are equally unaware of `started_at`.
+                            attempt_clock_start,
+                        )
+                        .await
+                        // `conn` is dropped at the end of this arm, before the guest runs.
+                    }
+                    Err(e) => {
+                        use crate::failure::IntoActivityErrorString as _;
+                        crate::wasm_store::WasmDispatch::Fail(
                         crate::failure::ActivityFailure::wasm_module_lookup_failed(format!(
                             "failed to acquire a database connection to resolve the wasm module \
                              for activity '{activity_name}': {e}"
                         ))
                         .into_error_payload(),
                     )
-                }
-            }),
+                    }
+                })
+            }
             _ => None,
         };
 
@@ -15466,7 +15469,7 @@ async fn process_activity_task(
     drop(activity_future);
 
     // Finalization phase: re-acquire a connection now that the handler is done.
-    let mut conn = pool.get().await.map_err(crate::error::database_error)?;
+    let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
     let retry_policy_result = configured_retry_policy(task);
     let retry_policy = fail_execution_on_error(
         &mut conn,
@@ -22762,7 +22765,7 @@ async fn process_task(
             // Boxed so `process_task`'s own future does not grow by the whole
             // decision cycle's state (clippy::large_futures).
             let cycle = Box::pin(async {
-                let mut conn = pool.get().await.map_err(crate::error::database_error)?;
+                let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
                 // Boxed for the same reason the enclosing `cycle` is
                 // (clippy::large_futures): `process_workflow_task`'s state is
                 // large enough on its own that inlining it here grows every
@@ -22824,7 +22827,7 @@ async fn process_task(
             if result.as_ref().err().is_some_and(|e| {
                 e.handler_not_registered().is_some() || e.terminal_write_claim_ambiguous().is_some()
             }) {
-                let conn = pool.get().await.map_err(crate::error::database_error)?;
+                let conn = crate::pool::acquire_within_pool_bound(pool).await?;
                 (conn, result)
             } else {
                 return result.map(|()| TaskDispatchOutcome::Completed);
@@ -28038,7 +28041,7 @@ impl Worker {
         let mut pinned: Vec<(crate::types::ShardId, crate::replication::ShardGeneration)> =
             Vec::with_capacity(targets.len());
         for (shard_id, pool) in &targets {
-            let mut conn = match pool.get().await {
+            let mut conn = match crate::pool::acquire_within_pool_bound(pool).await {
                 Ok(conn) => conn,
                 Err(error) => {
                     tracing::error!(
@@ -30824,7 +30827,7 @@ async fn workflow_task_timeout_metric_names(
     let Some(exec_uuid) = exec_id else {
         return ("unknown".to_string(), "default".to_string());
     };
-    let Ok(mut conn) = pool.get().await else {
+    let Ok(mut conn) = crate::pool::acquire_within_pool_bound(pool).await else {
         return ("unknown".to_string(), "default".to_string());
     };
     dsl::harvest_workflow_executions
@@ -30861,7 +30864,7 @@ pub async fn quarantine_workflow_task_timeout(
     use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
     use diesel::BoolExpressionMethods;
 
-    let mut conn = match pool.get().await {
+    let mut conn = match crate::pool::acquire_within_pool_bound(pool).await {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(
@@ -31227,7 +31230,7 @@ pub async fn reset_timed_out_workflow_task(
             if delay_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             }
-            match pool.get().await {
+            match crate::pool::acquire_within_pool_bound(pool).await {
                 Ok(c) => {
                     result = Some(c);
                     break;
@@ -34345,6 +34348,53 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
+        assert_eq!(*sink.0.lock().expect("lock"), vec!["claim".to_owned()]);
+    }
+
+    /// A pool with no deadpool timeouts still bounds the claim. The bound is
+    /// `DEFAULT_ACQUIRE_TIMEOUT`. A paused clock skips the 30 s wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_claim_on_a_pool_without_timeouts_uses_the_default_bound() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral loopback port");
+        let addr = listener.local_addr().expect("listener has a local address");
+        let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+            diesel_async::AsyncPgConnection,
+        >::new(format!("postgres://silent@{addr}/silent"));
+        let pool = deadpool::managed::Pool::builder(manager)
+            .max_size(1)
+            .build()
+            .expect("pool builds without connecting");
+        assert_eq!(pool.timeouts().wait, None);
+
+        let sink = Arc::new(AcquireTimeoutSink::default());
+        let telemetry = Arc::new(
+            crate::telemetry::TelemetryConfig::builder()
+                .metrics(Arc::clone(&sink) as Arc<dyn crate::telemetry::MetricsRecorder>)
+                .build(),
+        );
+        let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
+            vec![],
+            vec![],
+            crate::context::empty_shared_state(),
+            telemetry,
+        ));
+        let worker = Worker::new(default_runtime_config(), registry).expect("worker builds");
+
+        let started = tokio::time::Instant::now();
+        let claimed = tokio::time::timeout(
+            Duration::from_secs(120),
+            worker.poll_once(
+                &pool,
+                shard_acquire_bound(false, worker.config.poll_interval),
+                None,
+            ),
+        )
+        .await
+        .expect("a claim must not wait without limit");
+        assert!(!claimed);
+        assert!(started.elapsed() >= crate::pool::DEFAULT_ACQUIRE_TIMEOUT);
         assert_eq!(*sink.0.lock().expect("lock"), vec!["claim".to_owned()]);
     }
 

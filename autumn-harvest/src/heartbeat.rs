@@ -37,8 +37,8 @@ use crate::telemetry::MetricsRecorder;
 /// heartbeats faster than that without the flusher draining, sends will
 /// await (backpressure).
 ///
-/// The pool acquire is bounded by [`crate::pool::acquire_bound`]. Failures go
-/// to no metrics sink. Use [`spawn_heartbeat_flusher_with`] to count them.
+/// [`crate::pool::acquire_bound`] limits each pool acquire. This variant
+/// records no metrics. Use [`spawn_heartbeat_flusher_with`] to count failures.
 #[must_use]
 pub fn spawn_heartbeat_flusher(
     task_id: Uuid,
@@ -66,7 +66,8 @@ pub struct HeartbeatFlushOptions {
 /// sink (issue #1788).
 ///
 /// A failed flush keeps its payload. The next tick sends it again, unless a
-/// newer payload replaces it.
+/// newer payload replaces it. A task that is no longer `RUNNING` drops the
+/// payload, because no later flush can succeed.
 #[must_use]
 pub fn spawn_heartbeat_flusher_with(
     task_id: Uuid,
@@ -81,7 +82,7 @@ pub fn spawn_heartbeat_flusher_with(
     tx
 }
 
-/// Write one heartbeat. The pool acquire is bounded by `acquire_timeout`.
+/// Write one heartbeat. `acquire_timeout` limits the pool acquire.
 ///
 /// # Errors
 ///
@@ -158,10 +159,18 @@ async fn heartbeat_loop(
         }
 
         // If we got at least one heartbeat, flush to DB.
-        if let Some(payload) = pending.take() {
-            if let Err(failure) =
+        if let Some(payload) = pending.take()
+            && let Err(failure) =
                 flush(&pool, task_id, payload.clone(), options.acquire_timeout).await
-            {
+        {
+            if matches!(failure.error, HarvestError::NotFound(_)) {
+                // The task finished or went back to the queue. A retry cannot
+                // succeed, and it could overwrite a newer attempt.
+                tracing::debug!(
+                    task_id = %task_id,
+                    "task is no longer running; dropping the heartbeat"
+                );
+            } else {
                 options
                     .metrics
                     .record_heartbeat_flush_failed(failure.reason);
@@ -255,6 +264,10 @@ mod tests {
         fn record_heartbeat_flush_failed(&self, reason: &str) {
             self.0.lock().expect("lock").push(reason.to_owned());
         }
+
+        fn record_db_pool_acquire_timeout(&self, site: &str) {
+            self.0.lock().expect("lock").push(format!("site:{site}"));
+        }
     }
 
     /// A pool aimed at a listener that never answers. Its only slot never
@@ -315,8 +328,10 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(6);
         loop {
             let seen = failures.0.lock().expect("lock").clone();
-            if seen.len() >= 2 {
-                assert!(seen.iter().all(|r| r == "acquire_timeout"), "{seen:?}");
+            let reasons: Vec<&String> = seen.iter().filter(|r| !r.starts_with("site:")).collect();
+            if reasons.len() >= 2 {
+                assert!(reasons.iter().all(|r| *r == "acquire_timeout"), "{seen:?}");
+                assert!(seen.iter().any(|r| r == "site:heartbeat_flush"), "{seen:?}");
                 break;
             }
             assert!(Instant::now() < deadline, "flush failures seen: {seen:?}");

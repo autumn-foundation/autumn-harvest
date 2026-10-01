@@ -5,7 +5,8 @@ Issue #1788. Applies to every Harvest deployment on Postgres.
 ## Why
 
 PostgreSQL sets no statement, lock or idle-transaction limit by default. A pool
-with no `wait` timeout makes every connection request wait without limit.
+with no deadpool `wait` timeout makes every connection request wait without
+limit.
 
 Together these let one stuck connection stop work:
 
@@ -15,10 +16,29 @@ Together these let one stuck connection stop work:
 - A transaction left open holds `xmin`. Vacuum cannot remove dead rows, and the
   `SKIP LOCKED` queue scan slows down.
 
-## Pool timeouts
+## Acquire bound
 
-Harvest builds an engine pool with deadpool `wait`, `create` and `recycle`
-timeouts.
+The worker never waits without limit for a connection. Each acquire uses the
+pool's deadpool `wait` timeout as its bound. A pool with no `wait` timeout gets
+30 s.
+
+- An `autumn-web` pool sets `wait` from `database.connect_timeout_secs`, 5 s by
+  default. The plugin's worker then uses 5 s.
+- A multi-shard worker uses a shorter bound when it visits shards in turn:
+  the poll interval, with a 5 s floor.
+
+A timeout returns `HarvestError::PoolAcquireTimeout`. A claim that times out
+reports no work, and the poll loop tries again. A failed fleet registration
+arms the heartbeat retry.
+
+`harvest.db.pool_acquire_timeout{site}` counts the timeouts that matter most.
+`site` is `claim` or `heartbeat_flush`. Other sites log the error only.
+
+## Pools that Harvest configures
+
+`pool::engine_pool` and `pool::with_engine_timeouts` add two things to a pool.
+
+First, deadpool timeouts:
 
 | Timeout | Default | Bounds |
 |---|---|---|
@@ -26,18 +46,8 @@ timeouts.
 | `create` | 10 s | Opening a new connection. |
 | `recycle` | 5 s | The check of an idle connection before reuse. |
 
-The claim, the heartbeat flush, fleet registration and fleet status writes use
-the pool's `wait` value as their bound. A pool with no `wait` timeout gets
-30 s. A timeout returns `HarvestError::PoolAcquireTimeout`. The claim then reports
-no work, and the poll loop tries again.
-
-`harvest.db.pool_acquire_timeout{site}` counts each timeout. `site` is `claim` or
-`heartbeat_flush`.
-
-## Session timeouts per role
-
-Each new engine connection runs `SET` for the timeouts of its role. Pick the
-role with `autumn_harvest::pool::DbRole`.
+Second, session timeouts. Each new connection runs `SET` for the timeouts of
+its role, `autumn_harvest::pool::DbRole`:
 
 | Role | Work | `statement_timeout` | `lock_timeout` | `idle_in_transaction_session_timeout` |
 |---|---|---|---|---|
@@ -46,10 +56,10 @@ role with `autumn_harvest::pool::DbRole`.
 | `Maintenance` | Maintenance and operator tools | 30 min | 60 s | 10 min |
 
 A pool serves every role when you give Harvest one pool. Use `Scanner` for that
-pool, because its scanners need the longer limits. Partition and replication
-maintenance set tighter `SET LOCAL` limits where they need them.
+pool, because its scanners need the longer limits.
 
-A zero value sends no `SET`. The server or role default then applies.
+A zero value sends no `SET`. The server or role default then applies. A part of
+a millisecond rounds up to 1 ms.
 
 `transaction_timeout` needs PostgreSQL 17 or later. It is off by default. Do not
 set it on PostgreSQL 16 or earlier, because each new connection then fails.
@@ -57,7 +67,8 @@ set it on PostgreSQL 16 or earlier, because each new connection then fails.
 `ShardedDbPool::from_dsns`, which `harvest shard rebalance` uses, builds
 `Maintenance` pools.
 
-### Pools that you build
+The examples below run in a function that returns
+`Result<_, Box<dyn std::error::Error>>`.
 
 Use `engine_pool` for a new pool:
 
@@ -72,19 +83,21 @@ for TLS:
 
 ```rust
 use autumn_harvest::pool::{DbRole, EngineDbTimeouts, with_engine_timeouts};
+use diesel_async::pooled_connection::deadpool::Pool;
 
-let builder = deadpool::managed::Pool::builder(manager).max_size(16);
-let pool = with_engine_timeouts(builder, DbRole::Scanner, &EngineDbTimeouts::default())
+let builder = Pool::builder(manager).max_size(16);
+let pool = with_engine_timeouts(builder, DbRole::Scanner, &EngineDbTimeouts::default())?
     .build()?;
 ```
 
 `with_engine_timeouts` sets the Tokio runtime on the builder. deadpool needs
 that runtime for its timeouts.
 
-### Pools that Harvest does not build
+## Pools that Harvest does not configure
 
-The `autumn-web` pool does not run the engine setup. Set the limits on the
-database role. They then apply to every connection that the role opens:
+The plugin takes its pools from `autumn-web` in every mode. Those pools get the
+acquire bound, but no session timeouts. Set the limits on the database role.
+They then apply to every connection that the role opens:
 
 ```sql
 ALTER ROLE harvest SET statement_timeout = '5min';
@@ -95,7 +108,17 @@ ALTER ROLE harvest SET idle_in_transaction_session_timeout = '5min';
 New connections get the values. Existing connections keep their old values
 until they reconnect.
 
-The claim and the heartbeat flush still get the 30 s acquire bound.
+Run migrations as a different role, or clear the limits in the migration
+session. A long migration step can need more than 5 minutes. A migration
+runner can wait more than 30 s for the ledger lock while another runner works.
+
+```sql
+SET statement_timeout = 0;
+SET lock_timeout = 0;
+```
+
+The partition drain (`partition::drain_default`) switches `statement_timeout`
+off in its own transaction. A timeout there would discard a finished pass.
 
 ## Heartbeat flushes
 
@@ -104,7 +127,8 @@ without limit on a full pool.
 
 A failed flush keeps its payload and tries again on the next one-second tick.
 `harvest.heartbeat.flush_failed{reason}` counts each failure. `reason` is
-`acquire_timeout`, `acquire_error` or `write_error`.
+`acquire_timeout`, `acquire_error` or `write_error`. A task that is no longer
+`RUNNING` drops the payload and is not counted.
 
 Alert when the rate stays above zero:
 
@@ -132,8 +156,9 @@ ORDER BY age(backend_xmin) DESC
 LIMIT 10;
 ```
 
-Alert when the oldest value stays high. With `postgres_exporter`, a rule can
-use its `pg_stat_activity` metrics:
+Alert when the oldest value stays high. `postgres_exporter` exports
+`pg_stat_activity_max_tx_duration`, the age in seconds of the oldest open
+transaction. A rule can use it:
 
 ```promql
 max(pg_stat_activity_max_tx_duration{datname="harvest"}) > 600

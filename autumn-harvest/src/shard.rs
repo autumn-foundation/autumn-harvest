@@ -1762,7 +1762,7 @@ impl ShardedDbPool {
                 deadpool::managed::Pool::builder(manager).max_size(max_size.max(1)),
                 crate::pool::DbRole::Maintenance,
                 &crate::pool::EngineDbTimeouts::default(),
-            )
+            )?
             .build()
             .map_err(|e| {
                 crate::error::HarvestError::Config(format!(

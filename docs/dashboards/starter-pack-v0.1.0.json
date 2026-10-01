@@ -6631,7 +6631,7 @@
       "description": "A complete by-id fan-out found more than one live run of one business key (issue #1313). Evidence of a key pinned to one shard while an unpinned start of it hashed to another, or of a shard drained during a topology change while an unpinned start of the same key stayed live elsewhere -- neither requires the other. Not the race issue #1313 names, which is invisible to any single fan-out by construction; this is the observable proxy for its precondition."
     },
     {
-      "id": 970,
+      "id": 177984,
       "type": "row",
       "title": "Database pool & Postgres timeouts (issue #1788)",
       "collapsed": false,
@@ -6644,7 +6644,7 @@
       "panels": []
     },
     {
-      "id": 971,
+      "id": 428323,
       "type": "timeseries",
       "title": "Pool acquire timeouts",
       "datasource": {
@@ -6693,7 +6693,7 @@
       "description": "Rate of pool acquires that hit their bound, per site (claim or heartbeat_flush). The bound is the pool's deadpool wait timeout, or 30 s when the pool has none. A steady rate means the pool is too small or a connection is stuck. See docs/operations/postgres-timeouts.md."
     },
     {
-      "id": 972,
+      "id": 422004,
       "type": "timeseries",
       "title": "Heartbeat flush failures",
       "datasource": {

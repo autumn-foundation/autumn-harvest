@@ -2,7 +2,8 @@
 //! Engine connection timeouts against a real Postgres (issue #1788).
 //!
 //! * AC1: with every pool connection held, a claim and a heartbeat flush fail
-//!   within the pool bound. Before the fix both waited without limit.
+//!   within the pool bound. Before the fix, a pool with no deadpool timeouts
+//!   made both wait without limit. `worker::tests` covers that pool shape.
 //! * AC2: `statement_timeout` cancels a slow statement in the persist path.
 //! * AC3: an engine connection reports the configured session timeouts.
 //!
@@ -53,7 +54,7 @@ async fn connect(url: &str) -> AsyncPgConnection {
         .expect("failed to connect to Postgres")
 }
 
-fn timeouts(pool_ms: u64, session: SessionTimeouts) -> EngineDbTimeouts {
+const fn timeouts(pool_ms: u64, session: SessionTimeouts) -> EngineDbTimeouts {
     let bound = Duration::from_millis(pool_ms);
     EngineDbTimeouts {
         pool: PoolTimeouts {
@@ -171,7 +172,16 @@ async fn statement_timeout_cancels_a_slow_persist() {
     let function = format!("harvest_test_1788_sleep_{suffix}");
     let trigger = format!("harvest_test_1788_sleep_{suffix}");
 
-    // A BEFORE INSERT trigger sleeps for this execution only.
+    let session = SessionTimeouts {
+        statement: Duration::from_millis(500),
+        ..SessionTimeouts::for_role(DbRole::Hot)
+    };
+    let pool = engine_pool(url.clone(), 1, DbRole::Hot, &timeouts(5_000, session))
+        .expect("engine pool builds");
+    let mut conn = pool.get().await.expect("engine connection");
+
+    // A BEFORE INSERT trigger sleeps for this execution only. Nothing between
+    // its creation and its drop can panic, so it cannot leak.
     let mut admin = connect(&url).await;
     diesel::sql_query(format!(
         "CREATE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS $$ \
@@ -191,14 +201,6 @@ async fn statement_timeout_cancels_a_slow_persist() {
     .execute(&mut admin)
     .await
     .expect("create sleep trigger");
-
-    let session = SessionTimeouts {
-        statement: Duration::from_millis(500),
-        ..SessionTimeouts::for_role(DbRole::Hot)
-    };
-    let pool = engine_pool(url.clone(), 1, DbRole::Hot, &timeouts(5_000, session))
-        .expect("engine pool builds");
-    let mut conn = pool.get().await.expect("engine connection");
 
     let started = Instant::now();
     let outcome = tokio::time::timeout(
@@ -396,6 +398,8 @@ async fn a_full_pool_fails_a_claim_within_the_bound() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let held = hold_every_connection(&pool).await;
+    // A timeout from the race to fill the pool does not count.
+    metrics.0.lock().expect("lock").clear();
     let saturated_at = Instant::now();
 
     // A claim waits at most 300 ms for a slot, then the loop sleeps one poll

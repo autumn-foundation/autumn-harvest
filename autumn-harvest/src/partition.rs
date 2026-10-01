@@ -4816,7 +4816,10 @@ async fn drain_default_bounded_inner(
     Box::pin(conn.transaction::<usize, HarvestError, _>(async |conn| {
         exec(conn, "SET LOCAL lock_timeout = '5s'").await?;
         // No `statement_timeout` here — see the note above the budgets. It
-        // would discard a completed pass rather than bound one.
+        // would discard a completed pass rather than bound one. An engine
+        // pool or `ALTER ROLE` can set a session default (issue #1788), so
+        // switch it off for this transaction only.
+        exec(conn, "SET LOCAL statement_timeout = 0").await?;
         exec(
             conn,
             &format!("ALTER TABLE harvest_events DETACH PARTITION {DEFAULT_PARTITION}"),

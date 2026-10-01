@@ -123,6 +123,10 @@ pub fn compute_pool_sizes(
 /// The fallback acquire bound for a pool with no deadpool `wait` timeout.
 pub const DEFAULT_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// The largest session timeout Postgres accepts: `i32::MAX` milliseconds.
+pub const MAX_SESSION_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(i32::MAX as u64);
+
 /// The work an engine pool serves. It selects the session timeouts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DbRole {
@@ -143,15 +147,15 @@ pub struct SessionTimeouts {
     pub lock: std::time::Duration,
     /// `idle_in_transaction_session_timeout`.
     pub idle_in_transaction: std::time::Duration,
-    /// `transaction_timeout`. Needs PostgreSQL 17 or later.
+    /// `transaction_timeout`. Needs Postgres 17 or later.
     pub transaction: std::time::Duration,
 }
 
 impl SessionTimeouts {
     /// The default timeouts for `role`.
     ///
-    /// `transaction` is zero for every role, because PostgreSQL 16 and
-    /// earlier reject `transaction_timeout`.
+    /// `transaction` is zero for every role, because Postgres 16 and earlier
+    /// reject `transaction_timeout`.
     #[must_use]
     pub const fn for_role(role: DbRole) -> Self {
         let (statement, lock, idle_in_transaction) = match role {
@@ -170,6 +174,8 @@ impl SessionTimeouts {
     /// The `SET` statements that apply these timeouts, joined by `; `.
     ///
     /// A zero timeout sends no `SET`, so the server or role default stays.
+    /// A part of a millisecond rounds up. A `'0ms'` value would switch the
+    /// limit off.
     #[must_use]
     pub fn setup_sql(&self) -> String {
         [
@@ -183,7 +189,10 @@ impl SessionTimeouts {
         ]
         .into_iter()
         .filter(|(_, value)| !value.is_zero())
-        .map(|(name, value)| format!("SET {name} = '{}ms'", value.as_millis()))
+        .map(|(name, value)| {
+            let ms = value.as_millis() + u128::from(value.subsec_nanos() % 1_000_000 != 0);
+            format!("SET {name} = '{ms}ms'")
+        })
         .collect::<Vec<_>>()
         .join("; ")
     }
@@ -245,11 +254,13 @@ impl EngineDbTimeouts {
         }
     }
 
-    /// Reject a zero pool timeout.
+    /// Reject a zero pool timeout and a session timeout above
+    /// [`MAX_SESSION_TIMEOUT`].
     ///
     /// # Errors
     ///
-    /// [`HarvestError::Config`] when `wait`, `create` or `recycle` is zero.
+    /// [`HarvestError::Config`] when `wait`, `create` or `recycle` is zero, or
+    /// when a session timeout is too large for Postgres.
     pub fn validate(&self) -> HarvestResult<()> {
         for (name, value) in [
             ("wait", self.pool.wait),
@@ -260,6 +271,24 @@ impl EngineDbTimeouts {
                 return Err(HarvestError::Config(format!(
                     "pool {name} timeout must be greater than zero"
                 )));
+            }
+        }
+        for (role, session) in [
+            (DbRole::Hot, self.hot),
+            (DbRole::Scanner, self.scanner),
+            (DbRole::Maintenance, self.maintenance),
+        ] {
+            for (name, value) in [
+                ("statement", session.statement),
+                ("lock", session.lock),
+                ("idle_in_transaction", session.idle_in_transaction),
+                ("transaction", session.transaction),
+            ] {
+                if value > MAX_SESSION_TIMEOUT {
+                    return Err(HarvestError::Config(format!(
+                        "{role:?} {name} timeout must be at most {MAX_SESSION_TIMEOUT:?}"
+                    )));
+                }
             }
         }
         Ok(())
@@ -282,15 +311,19 @@ pub type DbPoolBuilder = deadpool::managed::PoolBuilder<
 ///
 /// Sets the deadpool timeouts and the Tokio runtime that they need. Adds a
 /// `post_create` hook that runs [`SessionTimeouts::setup_sql`] once on each new
-/// connection. Call [`EngineDbTimeouts::validate`] first: deadpool treats a
-/// zero `wait` as "do not wait".
+/// connection.
+///
+/// # Errors
+///
+/// [`HarvestError::Config`] when [`EngineDbTimeouts::validate`] rejects
+/// `timeouts`. deadpool treats a zero `wait` as "do not wait".
 #[cfg(feature = "db")]
-#[must_use]
 pub fn with_engine_timeouts(
     builder: DbPoolBuilder,
     role: DbRole,
     timeouts: &EngineDbTimeouts,
-) -> DbPoolBuilder {
+) -> HarvestResult<DbPoolBuilder> {
+    timeouts.validate()?;
     let builder = builder
         .runtime(deadpool::Runtime::Tokio1)
         .wait_timeout(Some(timeouts.pool.wait))
@@ -298,10 +331,10 @@ pub fn with_engine_timeouts(
         .recycle_timeout(Some(timeouts.pool.recycle));
     let sql = timeouts.session(role).setup_sql();
     if sql.is_empty() {
-        return builder;
+        return Ok(builder);
     }
     let sql: std::sync::Arc<str> = sql.into();
-    builder.post_create(deadpool::managed::Hook::async_fn(
+    Ok(builder.post_create(deadpool::managed::Hook::async_fn(
         move |conn: &mut diesel_async::AsyncPgConnection, _: &deadpool::managed::Metrics| {
             let sql = std::sync::Arc::clone(&sql);
             Box::pin(async move {
@@ -314,7 +347,7 @@ pub fn with_engine_timeouts(
                     })
             })
         },
-    ))
+    )))
 }
 
 /// Build an engine pool for `role`.
@@ -330,7 +363,6 @@ pub fn engine_pool(
     role: DbRole,
     timeouts: &EngineDbTimeouts,
 ) -> HarvestResult<crate::worker::DbPool> {
-    timeouts.validate()?;
     let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
         diesel_async::AsyncPgConnection,
     >::new(dsn);
@@ -338,7 +370,7 @@ pub fn engine_pool(
         deadpool::managed::Pool::builder(manager).max_size(max_size.max(1)),
         role,
         timeouts,
-    )
+    )?
     .build()
     .map_err(|e| HarvestError::Config(format!("could not build a connection pool: {e}")))
 }
@@ -351,6 +383,16 @@ pub fn acquire_bound(pool: &crate::worker::DbPool) -> std::time::Duration {
         .wait
         .filter(|wait| !wait.is_zero())
         .unwrap_or(DEFAULT_ACQUIRE_TIMEOUT)
+}
+
+/// Get a connection from `pool` within [`acquire_bound`].
+///
+/// # Errors
+///
+/// See [`acquire`].
+#[cfg(feature = "db")]
+pub async fn acquire_within_pool_bound(pool: &crate::worker::DbPool) -> HarvestResult<PooledConn> {
+    acquire(pool, acquire_bound(pool)).await
 }
 
 /// Get a connection from `pool` within `bound`.
@@ -480,7 +522,9 @@ mod tests {
 
     // -- Issue #1788: engine connection timeouts --------------------------
 
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
+    #[cfg(feature = "db")]
+    use std::time::Instant;
 
     fn session(statement_ms: u64, lock_ms: u64, idle_ms: u64, tx_ms: u64) -> SessionTimeouts {
         SessionTimeouts {
@@ -520,6 +564,45 @@ mod tests {
     fn setup_sql_sets_transaction_timeout_only_when_asked() {
         let sql = session(0, 0, 0, 90_000).setup_sql();
         assert_eq!(sql, "SET transaction_timeout = '90000ms'");
+    }
+
+    /// `'0ms'` would switch the limit off, so a part of a millisecond rounds
+    /// up.
+    #[test]
+    fn setup_sql_rounds_a_part_of_a_millisecond_up() {
+        let tiny = SessionTimeouts {
+            statement: Duration::from_micros(500),
+            lock: Duration::from_micros(1_500),
+            ..session(0, 0, 0, 0)
+        };
+        let sql = tiny.setup_sql();
+        assert!(sql.contains("SET statement_timeout = '1ms'"), "{sql}");
+        assert!(sql.contains("SET lock_timeout = '2ms'"), "{sql}");
+    }
+
+    #[test]
+    fn validate_rejects_a_session_timeout_postgres_cannot_hold() {
+        let too_long = MAX_SESSION_TIMEOUT + Duration::from_millis(1);
+        let cfg = EngineDbTimeouts {
+            scanner: SessionTimeouts {
+                idle_in_transaction: too_long,
+                ..SessionTimeouts::for_role(DbRole::Scanner)
+            },
+            ..EngineDbTimeouts::default()
+        };
+        let err = cfg
+            .validate()
+            .expect_err("Postgres rejects a value this large");
+        assert!(matches!(err, HarvestError::Config(_)), "{err}");
+
+        let at_limit = EngineDbTimeouts {
+            hot: SessionTimeouts {
+                statement: MAX_SESSION_TIMEOUT,
+                ..SessionTimeouts::for_role(DbRole::Hot)
+            },
+            ..EngineDbTimeouts::default()
+        };
+        assert!(at_limit.validate().is_ok());
     }
 
     #[test]
@@ -665,6 +748,20 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn with_engine_timeouts_rejects_invalid_timeouts() {
+        let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+            diesel_async::AsyncPgConnection,
+        >::new("postgres://unused@127.0.0.1:1/none");
+        let outcome = with_engine_timeouts(
+            deadpool::managed::Pool::builder(manager),
+            DbRole::Hot,
+            &timeouts_with_pool(0),
+        );
+        assert!(matches!(outcome, Err(HarvestError::Config(_))));
     }
 
     #[cfg(feature = "db")]

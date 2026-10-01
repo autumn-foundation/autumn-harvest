@@ -771,7 +771,7 @@ pub enum HarvestError {
     /// [`HarvestError::is_pool_acquire_timeout`].
     #[error("database pool acquire timed out after {waited:?}")]
     PoolAcquireTimeout {
-        /// The bound that elapsed.
+        /// How long the acquire waited before it failed.
         waited: std::time::Duration,
     },
 
