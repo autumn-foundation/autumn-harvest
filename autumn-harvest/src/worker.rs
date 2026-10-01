@@ -14584,6 +14584,103 @@ async fn handle_activity_result(
     }
 }
 
+/// Outcome of the retry budget gate in `process_activity_task` (issue #1793).
+enum RetryBudgetGate {
+    /// Run the attempt. Release the ticket if the attempt does not run.
+    Run(Option<crate::retry_budget::BudgetTicket>),
+    /// Do not run the retry. Defer it by this delay.
+    Defer(Duration),
+}
+
+/// Consult the retry budget for one claimed attempt and emit its metrics.
+///
+/// A claim with `attempt > 1` is a retry. An orphan reclaim also raises
+/// `attempt`, so a re-run after a crash counts as a retry too. It loads the
+/// dependency like a retry does.
+fn admit_retry_budget(
+    registry: &HandlerRegistry,
+    activity_name: &str,
+    task: &TaskQueueItem,
+) -> RetryBudgetGate {
+    use crate::retry_budget::Admission;
+
+    let is_retry = task_attempt(task) > 1;
+    let metrics = &registry.telemetry().metrics;
+    match registry
+        .retry_budgets()
+        .admit(activity_name, is_retry, std::time::Instant::now())
+    {
+        Admission::Untracked => RetryBudgetGate::Run(None),
+        Admission::Admitted { ticket, available } => {
+            metrics.record_retry_budget_available(activity_name, available);
+            RetryBudgetGate::Run(Some(ticket))
+        }
+        Admission::Deferred {
+            retry_after,
+            available,
+        } => {
+            metrics.record_retry_budget_available(activity_name, available);
+            metrics.record_retry_budget_exhausted(activity_name);
+            RetryBudgetGate::Defer(retry_after)
+        }
+    }
+}
+
+/// Undo a retry budget decision for an attempt that did not run, and update
+/// the gauge.
+fn release_retry_budget(
+    registry: &HandlerRegistry,
+    activity_name: &str,
+    ticket: crate::retry_budget::BudgetTicket,
+) {
+    let released =
+        registry
+            .retry_budgets()
+            .release(activity_name, ticket, std::time::Instant::now());
+    if let Some(available) = released {
+        registry
+            .telemetry()
+            .metrics
+            .record_retry_budget_available(activity_name, available);
+    }
+}
+
+/// Defer a retry that the retry budget did not admit (issue #1793).
+///
+/// The row goes back to `PENDING` at `now + retry_after`. The deferral lowers
+/// `attempt` again and leaves `error` as it is, so the retry keeps its attempt
+/// number and its previous failure. No event is appended.
+///
+/// The claim debited a rate-limit token for an activity without a circuit
+/// breaker. The retry does not run, so the token goes back. A refund failure
+/// is logged and not propagated, like a capability-miss refund.
+async fn defer_retry_for_budget(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    activity: &ActivityInfo,
+    retry_after: Duration,
+) -> HarvestResult<()> {
+    if activity.circuit_breaker.is_none()
+        && let Some(key) = task.rate_limit_key.as_deref()
+        && let Err(error) = queue::refund_rate_limit_token(conn, key).await
+    {
+        tracing::warn!(
+            task_id = %task.id,
+            rate_limit_key = %key,
+            %error,
+            "failed to refund the rate-limit token for a retry-budget deferral"
+        );
+    }
+    let scheduled_at = chrono::Utc::now()
+        + chrono::Duration::from_std(retry_after).unwrap_or_else(|_| chrono::Duration::seconds(1));
+    if queue::defer_claimed_rate_limited_task(conn, &claim_of_task(task)?, scheduled_at).await?
+        == queue::ClaimWrite::LeaseLost
+    {
+        log_lease_lost(task, "retry-budget deferral");
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_activity_future_with_cancellation(
     activity_name: &str,
@@ -15028,6 +15125,30 @@ async fn process_activity_task(
         crate::circuit_breaker::DispatchDecision::ShortCircuit { .. } => None,
     };
 
+    // Retry budget (issue #1793). Only a real call is gated: a short-circuit
+    // never reaches the dependency. The gate runs before ActivityStarted, so
+    // a deferred retry leaves no event behind.
+    let budget_ticket = if circuit_token.is_some() {
+        match admit_retry_budget(registry, activity_name, task) {
+            RetryBudgetGate::Run(ticket) => ticket,
+            RetryBudgetGate::Defer(retry_after) => {
+                if let Some(token) = circuit_token {
+                    circuit_breakers.on_cancelled(activity_name, token, std::time::Instant::now());
+                }
+                let mut conn = pool.get().await.map_err(crate::error::database_error)?;
+                return defer_retry_for_budget(&mut conn, task, activity, retry_after).await;
+            }
+        }
+    } else {
+        None
+    };
+    // Undo the budget decision for an attempt that does not run.
+    let release_budget = || {
+        if let Some(ticket) = budget_ticket {
+            release_retry_budget(registry, activity_name, ticket);
+        }
+    };
+
     // Dispatch-time rate limiting (issue #369): a circuit-breaker activity skips
     // the claim-time rate-limit gate/debit, so a genuine call (Allow) must reserve
     // a token here, gated on the authoritative `on_dispatch` decision. This runs
@@ -15057,6 +15178,7 @@ async fn process_activity_task(
             if let Some(token) = circuit_token {
                 circuit_breakers.on_cancelled(activity_name, token, std::time::Instant::now());
             }
+            release_budget();
             let refill_delay = activity
                 .rate_limit_rps
                 .filter(|rps| *rps > 0.0)
@@ -15127,6 +15249,7 @@ async fn process_activity_task(
             if let Some(token) = circuit_token {
                 circuit_breakers.on_cancelled(activity_name, token, std::time::Instant::now());
             }
+            release_budget();
             if circuit_token.is_some()
                 && activity.circuit_breaker.is_some()
                 && let Some(key) = task.rate_limit_key.as_deref()
@@ -23292,6 +23415,10 @@ async fn read_live_fleet_or_degrade(
 /// only site that returns a claim-time debit, and it runs once per dispatch. No
 /// other path — retry requeue, orphan reclaim, timeout, cancel — refunds, so a
 /// second credit for one debit cannot arise.
+///
+/// A retry-budget deferral (issue #1793) also refunds a claim-time debit. It
+/// runs only after the handler lookup succeeds, so it never shares a dispatch
+/// with a capability miss.
 ///
 /// Pinned by `stale_dispatcher_refund_leaves_one_debit_for_the_live_claim` in
 /// `capability_miss_tests`, which drives the exact interleaving above and

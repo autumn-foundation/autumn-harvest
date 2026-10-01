@@ -72,9 +72,10 @@ proptest! {
         }
 
         let elapsed = now.duration_since(start).as_secs_f64();
-        let budget = policy.max_tokens
-            + policy.ratio * f64::from(first_attempts)
-            + policy.min_retries_per_sec * elapsed;
+        let budget = policy.min_retries_per_sec.mul_add(
+            elapsed,
+            policy.ratio.mul_add(f64::from(first_attempts), policy.max_tokens),
+        );
         prop_assert!(
             f64::from(retries_run) <= budget + 1e-6,
             "{} retries ran; budget is {}", retries_run, budget

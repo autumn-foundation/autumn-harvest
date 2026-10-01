@@ -98,19 +98,23 @@ static ATTEMPTS: LazyLock<Mutex<HashMap<String, Attempts>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn record_attempt(ctx: &autumn_harvest::ActivityContext) {
-    let mut map = ATTEMPTS.lock().unwrap_or_else(|e| e.into_inner());
+    let is_retry = ctx.attempt() > 1;
+    let mut map = ATTEMPTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let entry = map.entry(ctx.activity_type().to_owned()).or_default();
-    if ctx.attempt() > 1 {
+    if is_retry {
         entry.retries += 1;
     } else {
         entry.first += 1;
     }
+    drop(map);
 }
 
 fn attempts(activity: &str) -> Attempts {
     ATTEMPTS
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(activity)
         .copied()
         .unwrap_or_default()
@@ -126,7 +130,7 @@ impl BudgetMetrics {
     fn exhausted(&self, activity: &str) -> u64 {
         self.exhausted
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(activity)
             .copied()
             .unwrap_or(0)
@@ -138,7 +142,7 @@ impl MetricsRecorder for BudgetMetrics {
         *self
             .exhausted
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .entry(activity.to_owned())
             .or_default() += 1;
     }
@@ -456,9 +460,10 @@ async fn retry_rate_stays_within_the_default_budget_when_one_type_always_fails()
     handle.await.expect("worker joins");
 
     assert_eq!(seen.first, WORKFLOWS, "every first attempt runs: {seen:?}");
-    let budget = DEFAULT_MAX_TOKENS
-        + DEFAULT_RATIO * f64::from(seen.first)
-        + DEFAULT_MIN_RETRIES_PER_SEC * elapsed;
+    let budget = DEFAULT_MIN_RETRIES_PER_SEC.mul_add(
+        elapsed,
+        DEFAULT_RATIO.mul_add(f64::from(seen.first), DEFAULT_MAX_TOKENS),
+    );
     assert!(
         f64::from(seen.retries) <= budget + 1.0,
         "{} retries ran in {elapsed:.2}s; the budget allows {budget:.1}",

@@ -198,12 +198,30 @@ impl RetryBudgetRegistry {
         &self.config
     }
 
-    #[allow(dead_code)]
     fn lock(&self) -> MutexGuard<'_, HashMap<String, Bucket>> {
         // The state is plain numbers, so a poisoned lock is safe to reuse.
         self.buckets
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Run `f` on the refilled bucket of `activity_name`. Returns `None` when
+    /// the type has no budget.
+    fn with_bucket<T>(
+        &self,
+        activity_name: &str,
+        now: Instant,
+        f: impl FnOnce(&mut Bucket, &RetryBudgetPolicy) -> T,
+    ) -> Option<T> {
+        let policy = self.config.policy_for(activity_name)?;
+        let mut buckets = self.lock();
+        let bucket = buckets
+            .entry(activity_name.to_owned())
+            .or_insert_with(|| Bucket::full(&policy, now));
+        bucket.refill(&policy, now);
+        let out = f(bucket, &policy);
+        drop(buckets);
+        Some(out)
     }
 
     /// Decide whether an attempt of `activity_name` may run at `now`.
@@ -212,25 +230,105 @@ impl RetryBudgetRegistry {
     /// A retry runs only when it can spend one token.
     #[must_use]
     pub fn admit(&self, activity_name: &str, is_retry: bool, now: Instant) -> Admission {
-        let _ = (activity_name, is_retry, now);
-        Admission::Untracked
+        self.with_bucket(activity_name, now, |bucket, policy| {
+            if !is_retry {
+                let deposit = policy.ratio.min(policy.max_tokens - bucket.tokens).max(0.0);
+                bucket.tokens += deposit;
+                return Admission::Admitted {
+                    ticket: BudgetTicket {
+                        kind: TicketKind::Deposited(deposit),
+                    },
+                    available: bucket.tokens,
+                };
+            }
+            if bucket.tokens >= 1.0 {
+                bucket.tokens -= 1.0;
+                return Admission::Admitted {
+                    ticket: BudgetTicket {
+                        kind: TicketKind::Spent,
+                    },
+                    available: bucket.tokens,
+                };
+            }
+            Admission::Deferred {
+                retry_after: bucket.reserve_slot(policy, now),
+                available: bucket.tokens,
+            }
+        })
+        .unwrap_or(Admission::Untracked)
     }
 
     /// Undo the bucket change that `ticket` records.
     ///
     /// Returns the tokens left, or `None` when the type has no budget.
     pub fn release(&self, activity_name: &str, ticket: BudgetTicket, now: Instant) -> Option<f64> {
-        let _ = (activity_name, ticket, now);
-        None
+        self.with_bucket(activity_name, now, |bucket, policy| {
+            bucket.tokens = match ticket.kind {
+                TicketKind::Deposited(amount) => (bucket.tokens - amount).max(0.0),
+                TicketKind::Spent => (bucket.tokens + 1.0).min(policy.max_tokens),
+            };
+            bucket.tokens
+        })
     }
 
     /// Tokens available to `activity_name` at `now`, or `None` when the type
     /// has no budget.
     #[must_use]
     pub fn available(&self, activity_name: &str, now: Instant) -> Option<f64> {
-        let _ = (activity_name, now);
-        None
+        self.with_bucket(activity_name, now, |bucket, _| bucket.tokens)
     }
+}
+
+impl Bucket {
+    const fn full(policy: &RetryBudgetPolicy, now: Instant) -> Self {
+        Self {
+            tokens: policy.max_tokens,
+            refilled_at: now,
+            next_slot: now,
+        }
+    }
+
+    /// Add the time refill since the last call. Callers read `now` before
+    /// they take the lock, so `now` can be earlier than `refilled_at`.
+    fn refill(&mut self, policy: &RetryBudgetPolicy, now: Instant) {
+        let elapsed = now
+            .saturating_duration_since(self.refilled_at)
+            .as_secs_f64();
+        self.tokens = elapsed
+            .mul_add(policy.min_retries_per_sec, self.tokens)
+            .min(policy.max_tokens);
+        self.refilled_at = self.refilled_at.max(now);
+    }
+
+    /// Give a deferred retry a wake-up slot and return the delay to it.
+    ///
+    /// The first slot is the time at which the time refill gives one token.
+    /// Each later slot is one refill interval after the previous slot. Thus
+    /// deferred retries wake one at a time, at the refill rate. No slot is
+    /// later than [`MAX_RETRY_BUDGET_DEFER`].
+    fn reserve_slot(&mut self, policy: &RetryBudgetPolicy, now: Instant) -> Duration {
+        let rate = policy.min_retries_per_sec;
+        let (until_token, interval) = if rate > 0.0 {
+            let deficit = (1.0 - self.tokens).max(0.0);
+            (secs(deficit / rate), secs(1.0 / rate))
+        } else {
+            (MAX_RETRY_BUDGET_DEFER, MAX_RETRY_BUDGET_DEFER)
+        };
+        let latest = now + MAX_RETRY_BUDGET_DEFER;
+        let slot = (now + until_token)
+            .max(self.next_slot + interval)
+            .min(latest);
+        self.next_slot = slot;
+        slot.saturating_duration_since(now)
+            .clamp(MIN_RETRY_BUDGET_DEFER, MAX_RETRY_BUDGET_DEFER)
+    }
+}
+
+/// Convert seconds to a `Duration`, capped at [`MAX_RETRY_BUDGET_DEFER`].
+fn secs(value: f64) -> Duration {
+    Duration::try_from_secs_f64(value)
+        .unwrap_or(MAX_RETRY_BUDGET_DEFER)
+        .min(MAX_RETRY_BUDGET_DEFER)
 }
 
 #[cfg(test)]
@@ -262,10 +360,12 @@ mod tests {
         }
     }
 
-    /// Spend every token. Return how many retries ran.
+    /// Spend every whole token. Return how many retries ran. No retry is
+    /// deferred, so no wake-up slot is used.
     fn drain(reg: &RetryBudgetRegistry, name: &str, now: Instant) -> u32 {
         let mut ran = 0;
-        while is_admitted(reg.admit(name, true, now)) {
+        while reg.available(name, now).is_some_and(|t| t >= 1.0) {
+            assert!(is_admitted(reg.admit(name, true, now)));
             ran += 1;
             assert!(ran < 10_000, "bucket never ran dry");
         }
@@ -378,7 +478,9 @@ mod tests {
                 }
             }
         }
-        let budget = policy.max_tokens + policy.ratio * f64::from(first_attempts);
+        let budget = policy
+            .ratio
+            .mul_add(f64::from(first_attempts), policy.max_tokens);
         assert!(
             f64::from(retries_run) <= budget + 1e-9,
             "{retries_run} retries ran; budget is {budget}"
