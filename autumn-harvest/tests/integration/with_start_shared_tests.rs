@@ -407,7 +407,7 @@ async fn terminal_prior_escalates_to_a_fresh_run_on_both_routes() {
         .expect("uws");
     assert!(out.started_fresh && out.update_admitted);
     assert_ne!(out.exec_id, prior);
-    assert_eq!(row(&mut conn, prior).await.state, "FAILED");
+    assert_eq!(row(&mut conn, prior).await.state, "CONTINUED_AS_NEW");
 }
 
 #[tokio::test]
@@ -423,7 +423,7 @@ async fn terminate_if_running_cancels_the_prior_on_both_routes() {
         .await
         .expect("sws");
     assert!(out.started_fresh);
-    assert_eq!(row(&mut conn, prior).await.state, "CANCELLED");
+    assert_eq!(row(&mut conn, prior).await.state, "CONTINUED_AS_NEW");
     assert_eq!(row(&mut conn, out.exec_id).await.state, "RUNNING");
 
     let prior = seed(&mut conn, "term-uws").await;
@@ -431,7 +431,7 @@ async fn terminate_if_running_cancels_the_prior_on_both_routes() {
         .await
         .expect("uws");
     assert!(out.started_fresh);
-    assert_eq!(row(&mut conn, prior).await.state, "CANCELLED");
+    assert_eq!(row(&mut conn, prior).await.state, "CONTINUED_AS_NEW");
     assert_eq!(row(&mut conn, out.exec_id).await.state, "RUNNING");
 }
 
