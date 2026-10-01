@@ -240,6 +240,8 @@ is made alongside it).
 
 ## 🔧 Why no fix ships in this PR
 
+Issue #1631 later shipped direction 1. See the note at the top.
+
 Two directions exist, both evidenced above, neither attempted here:
 
 1. **Rewrite the query per registered name.** Instead of one query

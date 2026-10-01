@@ -13,7 +13,7 @@
 -- Like its predecessor, this index self-shrinks. A row leaves it when its
 -- `quota_key` is set or its execution turns terminal.
 --
--- On a live deployment prefer the concurrent form, which cannot run inside
+-- On a live deployment, use the concurrent form. It cannot run inside
 -- Diesel's migration transaction. Build the new index first:
 --   CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_harvest_we_quota_reconcile_name_id
 --       ON harvest_workflow_executions (workflow_name, id)

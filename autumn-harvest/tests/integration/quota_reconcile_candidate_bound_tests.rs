@@ -188,6 +188,43 @@ fn ordered_id(n: u32) -> Uuid {
     Uuid::parse_str(&format!("00000000-0000-0000-0000-{n:012}")).expect("valid uuid")
 }
 
+async fn insert_row(
+    conn: &mut AsyncPgConnection,
+    n: u32,
+    name: &str,
+    state: &str,
+    input: &serde_json::Value,
+) {
+    diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions \
+           (id, workflow_name, workflow_id, shard_id, state, input, quota_key) \
+         VALUES ($1, $2, $3, 0, $4, $5, NULL)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(ordered_id(n))
+    .bind::<Text, _>(name)
+    .bind::<Text, _>(format!("wf-{n}"))
+    .bind::<Text, _>(state)
+    .bind::<diesel::sql_types::Jsonb, _>(input.clone())
+    .execute(conn)
+    .await
+    .expect("insert row");
+}
+
+async fn quota_key_of(conn: &mut AsyncPgConnection, n: u32) -> Option<String> {
+    #[derive(QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = Nullable<Text>)]
+        quota_key: Option<String>,
+    }
+    let row: Row =
+        diesel::sql_query("SELECT quota_key FROM harvest_workflow_executions WHERE id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(ordered_id(n))
+            .get_result(conn)
+            .await
+            .expect("read quota_key");
+    row.quota_key
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn merged_batches_keep_global_id_order_across_registered_types() {
     let Some(bench) = bench_db_or_skip().await else {
@@ -199,24 +236,27 @@ async fn merged_batches_keep_global_id_order_across_registered_types() {
         .execute(&mut conn)
         .await
         .expect("truncate");
-    // Twelve rows. Odd ids belong to one type, even ids to the other.
+    let resolvable = serde_json::json!({"tenant_id": "t"});
+    // Twelve registered rows at ids 10, 20, ... 120. Odd positions belong to
+    // one type, even positions to the other. Row 3 is PAUSED. Row 6 has no
+    // tenant, so it never resolves.
     for n in 1..=12_u32 {
         let name = if n % 2 == 0 {
             "bound_even"
         } else {
             "bound_odd"
         };
-        diesel::sql_query(
-            "INSERT INTO harvest_workflow_executions \
-               (id, workflow_name, workflow_id, shard_id, state, input, quota_key) \
-             VALUES ($1, $2, $3, 0, 'RUNNING', '{\"tenant_id\":\"t\"}'::jsonb, NULL)",
-        )
-        .bind::<diesel::sql_types::Uuid, _>(ordered_id(n))
-        .bind::<Text, _>(name)
-        .bind::<Text, _>(format!("wf-{n}"))
-        .execute(&mut conn)
-        .await
-        .expect("insert row");
+        let state = if n == 3 { "PAUSED" } else { "RUNNING" };
+        let input = if n == 6 {
+            serde_json::json!({})
+        } else {
+            resolvable.clone()
+        };
+        insert_row(&mut conn, n * 10, name, state, &input).await;
+    }
+    // Unregistered rows sit between registered ids and must stay untouched.
+    for n in [25_u32, 85] {
+        insert_row(&mut conn, n, "bound_unregistered", "RUNNING", &resolvable).await;
     }
 
     let shard = Some(ShardId::new(0));
@@ -224,17 +264,31 @@ async fn merged_batches_keep_global_id_order_across_registered_types() {
         .await
         .expect("first tick");
     assert_eq!(first.backfilled, 5);
-    assert_eq!(cursor, Some(ordered_id(5)), "cursor is the 5th id overall");
+    assert_eq!(
+        cursor,
+        Some(ordered_id(50)),
+        "cursor is the 5th registered id"
+    );
 
     let (second, cursor) = reconcile_quota_keys_from(&mut conn, 5, cursor, shard)
         .await
         .expect("second tick");
-    assert_eq!(second.backfilled, 5);
-    assert_eq!(cursor, Some(ordered_id(10)));
+    assert_eq!(second.backfilled, 4);
+    assert_eq!(second.unresolvable, 1, "the cursor still moves past row 6");
+    assert_eq!(cursor, Some(ordered_id(100)));
 
     let (third, cursor) = reconcile_quota_keys_from(&mut conn, 5, cursor, shard)
         .await
         .expect("third tick");
     assert_eq!(third.backfilled, 2);
     assert_eq!(cursor, None, "a short batch wraps the cursor");
+
+    assert_eq!(
+        quota_key_of(&mut conn, 30).await.as_deref(),
+        Some("t"),
+        "PAUSED row"
+    );
+    assert_eq!(quota_key_of(&mut conn, 60).await, None, "unresolvable row");
+    assert_eq!(quota_key_of(&mut conn, 25).await, None, "unregistered row");
+    assert_eq!(quota_key_of(&mut conn, 85).await, None, "unregistered row");
 }

@@ -72,8 +72,9 @@
 //! backlog. `spawn_quota_key_reconciler_for_shard`'s per-tick work is
 //! bounded by `batch_size` regardless of how many eligible rows exist.
 //! The SCAN that finds them is bounded too, thanks to
-//! `idx_harvest_we_quota_reconcile_candidates` (see
-//! `quota_reconcile_candidate_query`'s doc comment). The existing
+//! `idx_harvest_we_quota_reconcile_name_id` (see
+//! `quota_reconcile_candidate_query`'s doc comment). The scan reads at most
+//! `batch_size` rows per registered workflow name. The existing
 //! `idx_harvest_we_state` index covers only `RUNNING`, not `PAUSED`, so it
 //! cannot serve this query on its own; the dedicated index closes that gap.
 //!
@@ -280,7 +281,9 @@ struct CandidateRow {
 /// `workflow_name`, so the index returns rows in `id` order with no sort.
 /// A tick reads at most `$3` rows per registered name. It never reads the
 /// rows of unregistered types, or the resolved history of a registered
-/// type (issue #1631).
+/// type (issue #1631). The bound is names times `$3`, not `$3`. A
+/// deployment with hundreds of quota types and full backlogs reads more
+/// rows per tick than the old scan did.
 ///
 /// A row leaves the index when its `quota_key` is backfilled or its
 /// execution turns terminal. The index therefore covers only the current
@@ -300,8 +303,12 @@ struct CandidateRow {
 /// therefore takes effect on the next tick. See this module's doc comment
 /// for when a given row becomes visible.
 ///
-/// `AND ($2::uuid IS NULL OR id > $2) ORDER BY id LIMIT $3` is a keyset
-/// cursor, not a bare `LIMIT`. A row this sweep can never resolve --
+/// `AND id > COALESCE($2, <nil uuid>) ORDER BY id LIMIT $3` is a keyset
+/// cursor, not a bare `LIMIT`. The `COALESCE` form keeps the cursor an
+/// index condition in a generic plan. An `IS NULL OR` form would become a
+/// filter, and each tick would re-walk the rows below the cursor. A row
+/// whose id is the nil UUID is never a candidate. Generated ids never
+/// take that value. A row this sweep can never resolve --
 /// [`ReconcileOutcome::Unresolvable`] or [`ReconcileOutcome::OverCap`] --
 /// never leaves the index. A bare `LIMIT` with no stable order could
 /// therefore return the SAME stuck rows every tick, starving every
@@ -321,7 +328,7 @@ const CANDIDATE_SQL: &str = "\
         FROM harvest_workflow_executions e \
         WHERE e.workflow_name = n.name \
           AND e.quota_key IS NULL AND e.state IN ('RUNNING', 'PAUSED') \
-          AND ($2::uuid IS NULL OR e.id > $2) \
+          AND e.id > COALESCE($2::uuid, '00000000-0000-0000-0000-000000000000') \
         ORDER BY e.id \
         LIMIT $3 \
     ) c \
@@ -355,18 +362,17 @@ fn registered_quota_policy(workflow_name: &str) -> Option<QuotaPolicy> {
 /// [`QuotaPolicy`], anywhere in the process.
 ///
 /// [`reconcile_quota_keys_from`] binds this as `CANDIDATE_SQL`'s
-/// `workflow_name = ANY($1)` filter, so a workflow type with no declared
+/// `$1` name list, so a workflow type with no declared
 /// policy is never a candidate at all. `NoPolicy` never sets
-/// `quota_key`, so nothing ever shrinks the index for those rows.
+/// `quota_key`, so a no-policy row never leaves the candidate index.
 /// Without this filter, a mixed deployment (some workflow types
 /// quota'd, others not) would re-fetch every no-policy row forever.
 ///
-/// An empty result means the scan itself should be skipped entirely
-/// (`workflow_name = ANY('{}')` matches nothing, but issuing that query
-/// is still a real round trip). [`reconcile_quota_keys_from`] special-
-/// cases this to avoid the round trip, matching issue #946 AC9's
-/// zero-overhead promise for a deployment that has not adopted quotas at
-/// all.
+/// An empty result means the scan skips the query entirely. `unnest('{}')`
+/// yields no names, so the query would return nothing. Issuing it is still
+/// a real round trip. [`reconcile_quota_keys_from`] special-cases this to
+/// avoid the round trip. That matches issue #946 AC9's zero-overhead
+/// promise for a deployment that has not adopted quotas at all.
 #[cfg(feature = "db")]
 fn registered_quota_workflow_names() -> Vec<String> {
     crate::completion_trigger::GLOBAL_WORKFLOW_METADATA
@@ -723,7 +729,8 @@ mod tests {
     #[cfg(feature = "db")]
     #[test]
     fn candidate_sql_restricts_to_quota_governed_workflow_names() {
-        assert!(CANDIDATE_SQL.contains("workflow_name = ANY($1)"));
+        assert!(CANDIDATE_SQL.contains("unnest($1::text[])"));
+        assert!(CANDIDATE_SQL.contains("e.workflow_name = n.name"));
     }
 
     #[cfg(feature = "db")]
