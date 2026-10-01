@@ -3,6 +3,7 @@
 
 use proc_macro2::TokenStream;
 use quote::quote;
+use syn::ext::IdentExt as _;
 
 /// Compile-time validator for the runtime `task_duration()` string format
 /// (`"30s"`, `"5m"`, `"1h"`, `"1h30m"`, ...): digits followed by one of
@@ -212,7 +213,7 @@ pub fn build_handler_dispatch(
         names => {
             let indices = (0..names.len()).map(syn::Index::from);
             let mut binding = String::from("__args");
-            while names.iter().any(|n| *n == &binding) {
+            while names.iter().any(|n| n.unraw() == binding) {
                 binding.insert(0, '_');
             }
             let binding = syn::Ident::new(&binding, proc_macro2::Span::call_site());
@@ -364,6 +365,25 @@ mod build_handler_dispatch_tests {
         let out = dispatch(&["__args", "b"], &quote! { ctx }, &quote! {});
         assert!(out.starts_with("let ___args :"), "{out}");
         assert!(out.contains("(___args [1] . clone ())"), "{out}");
+    }
+
+    /// A raw identifier `r#__args` names the same variable as `__args`.
+    #[test]
+    fn many_params_survive_a_raw_identifier_named_dunder_args() {
+        let fn_name = format_ident!("handler");
+        let args = format_ident!("input");
+        let raw = format_ident!("r#__args");
+        let b = format_ident!("b");
+        let out = build_handler_dispatch(
+            &fn_name,
+            &[&raw, &b],
+            &args,
+            &quote! { ctx },
+            &quote! {},
+            &quote! { |e| e.to_string() },
+        )
+        .to_string();
+        assert!(out.starts_with("let ___args :"), "{out}");
     }
 
     #[test]
