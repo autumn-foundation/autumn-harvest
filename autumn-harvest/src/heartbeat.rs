@@ -9,7 +9,7 @@
 //! only the last one. This avoids hammering Postgres with per-heartbeat writes
 //! while still providing timely liveness detection.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -90,10 +90,41 @@ pub fn spawn_heartbeat_flusher_with(
     options: HeartbeatFlushOptions,
 ) -> mpsc::Sender<Value> {
     let (tx, rx) = mpsc::channel(64);
+    let latest = Arc::new(Mutex::new(None));
 
-    tokio::spawn(heartbeat_loop(task_id, pool, rx, cancel, options));
+    tokio::spawn(stamp_heartbeats(rx, Arc::clone(&latest), cancel.clone()));
+    tokio::spawn(heartbeat_loop(task_id, pool, latest, cancel, options));
 
     tx
+}
+
+/// The newest heartbeat not yet taken by the flush loop.
+type LatestHeartbeat = Arc<Mutex<Option<Pending>>>;
+
+/// Stamp each heartbeat with its arrival time, and keep only the newest
+/// (issue #1788).
+///
+/// This task never waits on the database. A flush can block for its acquire or
+/// statement timeout. A heartbeat that arrives in that time still gets its
+/// real arrival time. A stalled handler then cannot look alive later.
+async fn stamp_heartbeats(
+    mut rx: mpsc::Receiver<Value>,
+    latest: LatestHeartbeat,
+    cancel: CancellationToken,
+) {
+    loop {
+        let payload = tokio::select! {
+            () = cancel.cancelled() => break,
+            received = rx.recv() => match received {
+                Some(payload) => payload,
+                None => break,
+            },
+        };
+        *latest.lock().unwrap_or_else(PoisonError::into_inner) = Some(Pending {
+            payload,
+            received_at: chrono::Utc::now(),
+        });
+    }
 }
 
 /// Write one heartbeat. `acquire_timeout` limits the pool acquire.
@@ -183,7 +214,7 @@ async fn flush(
 async fn heartbeat_loop(
     task_id: Uuid,
     pool: Pool<AsyncPgConnection>,
-    mut rx: mpsc::Receiver<Value>,
+    latest: LatestHeartbeat,
     cancel: CancellationToken,
     options: HeartbeatFlushOptions,
 ) {
@@ -204,12 +235,10 @@ async fn heartbeat_loop(
             }
         }
 
-        // Drain all pending heartbeats, keeping only the most recent.
-        while let Ok(payload) = rx.try_recv() {
-            pending = Some(Pending {
-                payload,
-                received_at: chrono::Utc::now(),
-            });
+        // Take the newest heartbeat. It replaces an unwritten older one.
+        let newest = latest.lock().unwrap_or_else(PoisonError::into_inner).take();
+        if newest.is_some() {
+            pending = newest;
         }
 
         // If we got at least one heartbeat, flush to DB.

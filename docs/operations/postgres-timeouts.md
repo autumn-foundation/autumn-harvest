@@ -159,7 +159,8 @@ without limit on a full pool.
 
 A failed flush keeps its payload and tries again on the next one-second tick.
 The retry writes the time that the worker got the heartbeat, not the retry
-time. A stalled handler then cannot look alive after an outage.
+time. The worker stamps each heartbeat when it arrives, also while a flush is
+blocked. A stalled handler then cannot look alive after an outage.
 `harvest.heartbeat.flush_failed{reason}` counts each failure. `reason` is
 `acquire_timeout`, `acquire_error` or `write_error`.
 

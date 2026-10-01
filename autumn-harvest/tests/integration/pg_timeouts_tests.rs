@@ -1576,6 +1576,162 @@ async fn seed_claimed_activity(
     (exec_id, activity_id, task)
 }
 
+/// A quarantine lookup that a session timeout cancels must not read as a
+/// missing execution. That would dead-letter the task but leave the workflow
+/// `RUNNING`, and report success. Another session locks the executions table
+/// for 400 ms, and the pool gives up on a lock after 250 ms. The lookup fails,
+/// but the quarantine transaction itself could still commit.
+#[tokio::test]
+async fn a_failed_quarantine_lookup_reports_failure() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let queue_name = format!("q-ql-{}", &Uuid::new_v4().simple().to_string()[..12]);
+    let exec_id = seed_execution(&mut conn, &queue_name).await;
+    let task_id = autumn_harvest::queue::enqueue(
+        &mut conn,
+        &autumn_harvest::queue::EnqueueParams::new(
+            &queue_name,
+            autumn_harvest::queue::TaskType::Workflow,
+            serde_json::json!({}),
+        ),
+    )
+    .await
+    .expect("enqueue");
+    register_live_worker(&mut conn, "w-1").await;
+    diesel::sql_query(
+        "UPDATE harvest_task_queue SET state = 'RUNNING', worker_id = 'w-1', attempt = 1, \
+         workflow_exec_id = $2 WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("model the claim");
+
+    let lock_url = url.clone();
+    let holder = tokio::spawn(async move {
+        let mut conn = connect(&lock_url).await;
+        diesel::sql_query(
+            "DO $$ BEGIN LOCK TABLE harvest_workflow_executions IN ACCESS EXCLUSIVE MODE; \
+             PERFORM pg_sleep(0.4); END $$",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("hold the table lock");
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let session = SessionTimeouts {
+        lock: Duration::from_millis(250),
+        ..SessionTimeouts::for_role(DbRole::Hot)
+    };
+    let pool = engine_pool(url, 1, DbRole::Hot, &timeouts(5_000, session)).expect("engine pool");
+    let reached = autumn_harvest::worker::quarantine_workflow_task_timeout(
+        &pool,
+        task_id,
+        Some(exec_id.as_uuid()),
+        "w-1",
+        3,
+        10,
+        "wf",
+        &queue_name,
+        &autumn_harvest::telemetry::NoOpMetrics,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+    )
+    .await;
+    holder.await.expect("holder joins");
+
+    assert!(!reached, "a failed lookup must not report a quarantine");
+    assert_eq!(task_state(&mut conn, task_id).await, "RUNNING");
+}
+
+/// A heartbeat that arrives while a flush is blocked keeps its arrival time.
+/// The first flush waits 3 s for a held pool. The second heartbeat arrives
+/// during that wait. The flusher reads it only after the wait, but its write
+/// must carry the arrival time.
+#[tokio::test]
+async fn a_heartbeat_sent_during_a_blocked_flush_keeps_its_time() {
+    #[derive(diesel::QueryableByName)]
+    struct Beat {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
+        last_heartbeat_at: Option<chrono::DateTime<Utc>>,
+    }
+
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let suffix = Uuid::new_v4().simple().to_string()[..12].to_owned();
+    let worker_id = format!("w-hb-{suffix}");
+    register_live_worker(&mut conn, &worker_id).await;
+    let task_id = autumn_harvest::queue::enqueue(
+        &mut conn,
+        &autumn_harvest::queue::EnqueueParams::new(
+            format!("q-hb-{suffix}"),
+            autumn_harvest::queue::TaskType::Activity,
+            serde_json::json!({}),
+        ),
+    )
+    .await
+    .expect("enqueue");
+    diesel::sql_query(
+        "UPDATE harvest_task_queue SET state = 'RUNNING', worker_id = $2, attempt = 1 \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .bind::<Text, _>(&worker_id)
+    .execute(&mut conn)
+    .await
+    .expect("model the claim");
+
+    let pool = engine_pool(
+        url,
+        1,
+        DbRole::Hot,
+        &timeouts(3_000, SessionTimeouts::for_role(DbRole::Hot)),
+    )
+    .expect("engine pool");
+    let held = hold_every_connection(&pool).await;
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let tx = autumn_harvest::heartbeat::spawn_heartbeat_flusher_with(
+        task_id,
+        pool.clone(),
+        cancel.clone(),
+        autumn_harvest::heartbeat::HeartbeatFlushOptions {
+            acquire_timeout: Duration::from_secs(3),
+            metrics: Arc::new(autumn_harvest::telemetry::NoOpMetrics),
+            claim: Some(autumn_harvest::heartbeat::HeartbeatClaim {
+                attempt: 1,
+                worker_id: worker_id.clone(),
+            }),
+        },
+    );
+    tx.send(serde_json::json!({"progress": 1}))
+        .await
+        .expect("send the first heartbeat");
+    // The first flush starts at about 1 s and waits until about 4 s.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let sent_at = Utc::now();
+    tx.send(serde_json::json!({"progress": 2}))
+        .await
+        .expect("send the second heartbeat");
+    tokio::time::sleep(Duration::from_millis(3_000)).await;
+    drop(held);
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    cancel.cancel();
+
+    let beat = diesel::sql_query("SELECT last_heartbeat_at FROM harvest_task_queue WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .get_result::<Beat>(&mut conn)
+        .await
+        .expect("read the heartbeat")
+        .last_heartbeat_at
+        .expect("a flush wrote the heartbeat");
+    let lag = beat - sent_at;
+    assert!(
+        lag < chrono::Duration::milliseconds(1_000),
+        "the heartbeat time moved past its arrival: {lag}"
+    );
+}
+
 /// Mark `worker_id` as a live worker. A test row `RUNNING` under an unknown
 /// worker is an orphan, and a reclaimer of a parallel suite would requeue it.
 /// The row has no queues and a shard that does not exist, so no other code

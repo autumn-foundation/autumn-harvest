@@ -31400,16 +31400,32 @@ pub async fn quarantine_workflow_task_timeout(
     };
     let error_msg = reason.to_string();
 
+    // A failed lookup is not a missing row (issue #1788). A session timeout
+    // can cancel it. Treated as missing, the execution lookup would skip the
+    // workflow's terminal transition. So report failure, and the caller keeps
+    // the strike count.
+    let lookup_failed = |error: &diesel::result::Error| {
+        tracing::error!(
+            task_id = %task_id,
+            error = %error,
+            "workflow task timeout quarantine: lookup failed"
+        );
+    };
+
     // Fetch the task row's input + attempt for the DLQ entry.
-    let (input, attempts) = task_dsl::harvest_task_queue
+    let task_row = task_dsl::harvest_task_queue
         .find(task_id)
         .select((task_dsl::input, task_dsl::attempt))
         .first::<(serde_json::Value, i32)>(&mut conn)
         .await
-        .optional()
-        .ok()
-        .flatten()
-        .unwrap_or((serde_json::Value::Null, 1));
+        .optional();
+    let (input, attempts) = match task_row {
+        Ok(row) => row.unwrap_or((serde_json::Value::Null, 1)),
+        Err(error) => {
+            lookup_failed(&error);
+            return false;
+        }
+    };
 
     // Fetch owner/severity/parent_id from the execution row for the DLQ
     // entry and parent notification.  Also record whether the execution row
@@ -31445,9 +31461,14 @@ pub async fn quarantine_workflow_task_timeout(
                     Option<String>,
                 )>(&mut conn)
                 .await
-                .optional()
-                .ok()
-                .flatten();
+                .optional();
+            let res = match res {
+                Ok(row) => row,
+                Err(error) => {
+                    lookup_failed(&error);
+                    return false;
+                }
+            };
             match res {
                 Some((o, s, p, pcp, wid, sched_id, orig)) => {
                     exec_exists = true;
