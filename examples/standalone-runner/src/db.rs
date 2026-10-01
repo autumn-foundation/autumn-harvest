@@ -6,10 +6,15 @@
 //! `diesel-async` connects without TLS. A URL whose `sslmode` is `require`,
 //! `verify-ca` or `verify-full` therefore connects through rustls here. The
 //! server certificate must chain to the platform trust store in all three
-//! modes. That is stricter than libpq for `require`. Other modes connect in
-//! plaintext, as the `autumn-web` pool did.
+//! modes. `verify-full` and `require` also check the host name. That is
+//! stricter than libpq for `require`. Other modes connect in plaintext, as
+//! the `autumn-web` pool did.
 
 use std::sync::{Arc, OnceLock};
+
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{DigitallySignedStruct, SignatureScheme};
 use std::time::Duration;
 
 use autumn_harvest::migrate::{self, MigrationReport};
@@ -29,9 +34,6 @@ const POOL_SIZE: usize = 16;
 /// How long a checkout waits for a free or a new connection. Without a
 /// limit, an unreachable database hangs startup and every request.
 const CHECKOUT_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// The `sslmode` values that need TLS.
-const TLS_MODES: [&str; 3] = ["require", "verify-ca", "verify-full"];
 
 /// Build the Harvest storage pool. It opens no connection until first use.
 pub fn create_pool(database_url: &str) -> Result<DbPool, BuildError> {
@@ -56,18 +58,18 @@ pub async fn run_pending_migrations(database_url: &str) -> Result<MigrationRepor
 
 /// Open one connection, with TLS when `sslmode` asks for it.
 async fn connect(database_url: &str) -> Result<AsyncPgConnection, ConnectionError> {
-    if !wants_tls(database_url) {
+    let Some(verify) = tls_verify(database_url) else {
         return AsyncPgConnection::establish(database_url).await;
-    }
-    // `tokio-postgres` parses only `require`. The `verify-*` modes get the
-    // same verified connector, so the rewrite drops no check.
+    };
+    // `tokio-postgres` parses only `require`. The connector does the check
+    // that the original mode asks for, so the rewrite drops none.
     let config: tokio_postgres::Config =
         tls_dsn(database_url)
             .parse()
             .map_err(|error: tokio_postgres::Error| {
                 ConnectionError::BadConnection(error.to_string())
             })?;
-    let tls = tokio_postgres_rustls::MakeRustlsConnect::new(tls_config()?);
+    let tls = tokio_postgres_rustls::MakeRustlsConnect::new(tls_config(verify)?);
     let (client, connection) = config
         .connect(tls)
         .await
@@ -75,15 +77,26 @@ async fn connect(database_url: &str) -> Result<AsyncPgConnection, ConnectionErro
     AsyncPgConnection::try_from_client_and_connection(client, connection).await
 }
 
-/// True when `database_url` asks for TLS.
+/// How a TLS connection checks the server certificate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Verify {
+    /// The chain must reach a trusted root. `verify-ca` asks for this.
+    Chain,
+    /// The chain and the host name. `verify-full` and `require` use it.
+    ChainAndName,
+}
+
+/// The certificate check `database_url` asks for, or `None` for plaintext.
 ///
 /// It reads `sslmode` with the libpq grammar, in a URL or in a keyword/value
 /// string. Names and values are case-insensitive, and URL parts may be
 /// percent-encoded.
-pub fn wants_tls(database_url: &str) -> bool {
-    Dsn::parse(database_url)
-        .and_then(|dsn| dsn.sslmode())
-        .is_some_and(|mode| TLS_MODES.contains(&mode.as_str()))
+fn tls_verify(database_url: &str) -> Option<Verify> {
+    match Dsn::parse(database_url)?.sslmode()?.as_str() {
+        "verify-ca" => Some(Verify::Chain),
+        "require" | "verify-full" => Some(Verify::ChainAndName),
+        _ => None,
+    }
 }
 
 /// `database_url` with `sslmode=require`, the one TLS mode
@@ -212,32 +225,131 @@ fn parse_keywords(dsn: &str) -> Option<Vec<(String, String)>> {
     }
 }
 
-/// The rustls client config, built once. It trusts the platform store.
-fn tls_config() -> Result<rustls::ClientConfig, ConnectionError> {
-    static CONFIG: OnceLock<Result<rustls::ClientConfig, String>> = OnceLock::new();
-    CONFIG
-        .get_or_init(|| {
-            let mut roots = rustls::RootCertStore::empty();
-            for cert in rustls_native_certs::load_native_certs().certs {
-                // The other certificates still anchor a chain.
-                let _ = roots.add(cert);
-            }
-            if roots.is_empty() {
-                return Err("the platform trust store has no usable certificate".to_owned());
-            }
-            let provider = Arc::new(rustls::crypto::ring::default_provider());
-            rustls::ClientConfig::builder_with_provider(provider)
-                .with_safe_default_protocol_versions()
-                .map(|builder| builder.with_root_certificates(roots).with_no_client_auth())
-                .map_err(|error| error.to_string())
-        })
-        .clone()
-        .map_err(ConnectionError::BadConnection)
+/// The rustls client config for `verify`, built once. It trusts the
+/// platform store.
+fn tls_config(verify: Verify) -> Result<rustls::ClientConfig, ConnectionError> {
+    type Configs = Result<(rustls::ClientConfig, rustls::ClientConfig), String>;
+    static CONFIGS: OnceLock<Configs> = OnceLock::new();
+    let (chain, chain_and_name) = CONFIGS
+        .get_or_init(build_tls_configs)
+        .as_ref()
+        .map_err(|error| ConnectionError::BadConnection(error.clone()))?;
+    Ok(match verify {
+        Verify::Chain => chain.clone(),
+        Verify::ChainAndName => chain_and_name.clone(),
+    })
+}
+
+/// Build the `verify-ca` config and the `verify-full` config.
+fn build_tls_configs() -> Result<(rustls::ClientConfig, rustls::ClientConfig), String> {
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in rustls_native_certs::load_native_certs().certs {
+        // The other certificates still anchor a chain.
+        let _ = roots.add(cert);
+    }
+    if roots.is_empty() {
+        return Err("the platform trust store has no usable certificate".to_owned());
+    }
+    let roots = Arc::new(roots);
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let builder = || {
+        rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+            .with_safe_default_protocol_versions()
+            .map_err(|error| error.to_string())
+    };
+    let chain_and_name = builder()?
+        .with_root_certificates(Arc::clone(&roots))
+        .with_no_client_auth();
+    let chain = builder()?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(ChainOnly {
+            roots,
+            provider: Arc::clone(&provider),
+        }))
+        .with_no_client_auth();
+    Ok((chain, chain_and_name))
+}
+
+/// The `verify-ca` check: the chain must reach a trusted root. The host name
+/// is not compared, as in libpq.
+#[derive(Debug)]
+struct ChainOnly {
+    roots: Arc<rustls::RootCertStore>,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl ServerCertVerifier for ChainOnly {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let cert = rustls::server::ParsedCertificate::try_from(end_entity)?;
+        rustls::client::verify_server_cert_signed_by_trust_anchor(
+            &cert,
+            &self.roots,
+            intermediates,
+            now,
+            self.provider.signature_verification_algorithms.all,
+        )?;
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{tls_dsn, wants_tls};
+    use super::{Verify, tls_dsn, tls_verify};
+
+    fn wants_tls(url: &str) -> bool {
+        tls_verify(url).is_some()
+    }
+
+    #[test]
+    fn verify_ca_checks_the_chain_and_verify_full_also_the_name() {
+        let url = |mode: &str| format!("postgres://u@h/db?sslmode={mode}");
+        assert_eq!(tls_verify(&url("verify-ca")), Some(Verify::Chain));
+        assert_eq!(tls_verify(&url("verify-full")), Some(Verify::ChainAndName));
+        assert_eq!(tls_verify(&url("require")), Some(Verify::ChainAndName));
+        assert_eq!(tls_verify(&url("prefer")), None);
+        assert_eq!(tls_verify("postgres://u@h/db"), None);
+    }
 
     #[test]
     fn sslmode_is_read_with_the_dsn_grammar() {

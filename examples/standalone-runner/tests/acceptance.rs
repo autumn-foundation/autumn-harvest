@@ -519,6 +519,47 @@ async fn prod_profile_refuses_a_weak_webhook_secret() {
     );
 }
 
+/// An open SSE stream must not hold shutdown forever. Axum's graceful
+/// shutdown waits for every response, and a stream never ends on its own.
+#[tokio::test]
+async fn sigterm_stops_cleanly_with_an_open_stream() {
+    let _serial = SERIAL.lock().await;
+    let (url, _db) = empty_database().await;
+    let runner = Launch::new(&url, "dev").start().await;
+
+    // No worker polls this queue, so the run stays open and so does its stream.
+    let started: Value = HTTP
+        .post(runner.url("/api/harvest/workflows/standalone_order/start"))
+        .json(&json!({
+            "workflow_id": "parked-1",
+            "queue": "nobody-polls-this",
+            "input": { "order_id": "parked-1", "sku": "sku-book", "quantity": 1 },
+        }))
+        .send()
+        .await
+        .expect("start should reach the runner")
+        .json()
+        .await
+        .expect("start returns JSON");
+    let exec_id = started["execution_id"].as_str().expect("an execution id");
+    let stream = reqwest::Client::new()
+        .get(runner.url(&format!("/api/harvest/workflows/{exec_id}/stream")))
+        .send()
+        .await
+        .expect("the stream should open");
+    assert!(stream.status().is_success(), "stream: {}", stream.status());
+
+    let began = Instant::now();
+    let status = runner.stop_with("TERM");
+    assert!(status.success(), "SIGTERM should stop cleanly: {status}");
+    assert!(
+        began.elapsed() < Duration::from_secs(30),
+        "shutdown took {:?}",
+        began.elapsed()
+    );
+    drop(stream);
+}
+
 /// SIGTERM, as Docker, systemd and Kubernetes send it, also drains the
 /// worker and exits cleanly.
 #[tokio::test]

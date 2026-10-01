@@ -1,4 +1,7 @@
+use std::future::IntoFuture as _;
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
 
 use autumn_harvest_plugin::HarvestEmbedding;
 use autumn_harvest_plugin::api::{HarvestApiState, StandaloneAdminAuth};
@@ -19,6 +22,10 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 const DEFAULT_DATABASE_URL: &str = "postgres://runner:runner@localhost:5434/runner";
 const DEFAULT_ADDR: &str = "127.0.0.1:8082";
+
+/// How long open responses may run after a stop signal. A stream never ends
+/// on its own, so the server stops waiting after this.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
 /// Assemble the raw Axum app the runner listens on.
 ///
@@ -132,9 +139,24 @@ pub async fn run() -> Result<(), BoxError> {
 
     let app = build_router(harvest.router(), metrics, webhooks);
     tracing::info!(%address, "standalone Harvest runner listening");
-    let served = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await;
+    let signalled = Arc::new(tokio::sync::Notify::new());
+    let notify = Arc::clone(&signalled);
+    let serve = axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            notify.notify_one();
+        })
+        .into_future();
+    let served = tokio::select! {
+        served = serve => served,
+        () = async {
+            signalled.notified().await;
+            tokio::time::sleep(SHUTDOWN_GRACE).await;
+        } => {
+            tracing::warn!(grace = ?SHUTDOWN_GRACE, "closing responses still open at shutdown");
+            Ok(())
+        }
+    };
     harvest.stop().await;
     Ok(served?)
 }

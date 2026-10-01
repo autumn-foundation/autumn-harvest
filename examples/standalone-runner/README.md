@@ -45,7 +45,9 @@ cargo run -p standalone-runner
 
 In the `dev` profile the runner applies the Harvest migrations itself. The
 `dev` admin API needs no credential. Do not expose a `dev` process beyond
-localhost. Ctrl-C or SIGTERM drains the worker and stops the process.
+localhost. Ctrl-C or SIGTERM drains the worker and stops the process. Open
+responses, such as an SSE stream, get 10 seconds before the server closes
+them.
 
 | Variable | Default | Use |
 |---|---|---|
@@ -114,8 +116,10 @@ results are correct. The acceptance suite pins the `fail`.
 ## TLS
 
 `sslmode=require`, `verify-ca` and `verify-full` connect through rustls. The
-server certificate must chain to the platform trust store in all three modes,
-so `require` is stricter here than in libpq. `sslrootcert` is not read. Put a
+server certificate must chain to the platform trust store in all three modes.
+`verify-full` and `require` also check the host name, so `require` is
+stricter here than in libpq. `verify-ca` checks the chain only. The runner
+reads `sslmode` with the libpq grammar. `sslrootcert` is not read. Put a
 private CA in the platform store, or point `SSL_CERT_FILE` at a bundle that
 holds it. A URL with no `sslmode`, `disable` or `prefer` connects in
 plaintext.

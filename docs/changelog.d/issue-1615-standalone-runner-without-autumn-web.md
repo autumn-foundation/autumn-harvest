@@ -12,7 +12,9 @@ the tree keeps one standalone reference, not two.
   A checkout waits at most 5 s, as the `autumn-web` pool did.
 - `diesel-async` connects without TLS. For `sslmode=require`, `verify-ca` and
   `verify-full`, the pool and the migration connection use rustls with the
-  platform trust store. Other modes stay plaintext, as with `autumn-web`.
+  platform trust store. `verify-ca` checks the chain only. The other two also
+  check the host name. Other modes stay plaintext, as with `autumn-web`.
+  `sslmode` is read with the libpq grammar, in both DSN forms.
 - In `dev`, migrations go through `autumn_harvest::migrate`, the code behind
   `harvest migrate run`, not `autumn_web::migrate::run_pending`.
 - `HarvestEmbedding` mounts the API and Vantage on a plain `axum::Router`.
@@ -25,7 +27,9 @@ the tree keeps one standalone reference, not two.
   boot. `build_webhook_router` itself checks only that the secret is not empty.
 - `STANDALONE_RUNNER_ADDR` sets the listen address. The default is still
   `127.0.0.1:8082`. The log names the bound address, so port `0` works.
-- Ctrl-C and SIGTERM both drain the worker and stop the runtime.
+- Ctrl-C and SIGTERM both drain the worker and stop the runtime. Open
+  responses, such as an SSE stream, get 10 s. The server then closes them, so
+  shutdown always reaches the worker drain.
 - Each fallible step runs before `start`. After `start`, the runtime always
   stops, also when the server fails.
 
@@ -47,8 +51,9 @@ the tree keeps one standalone reference, not two.
   crate, so a re-export path fails too.
 - `tests/acceptance.rs` runs the built binary against Postgres. It covers
   `dev` migration, Vantage, a completed order, `/metrics`, a clean exit on
-  Ctrl-C and on SIGTERM, a bootstrap token under `prod`, signed and forged
-  webhooks, and a weak secret that refuses boot.
+  Ctrl-C and on SIGTERM, also with an SSE stream open, a bootstrap token
+  under `prod`, signed and forged webhooks, and a weak secret that refuses
+  boot.
 - CI runs the unit tests with `cargo test -p standalone-runner --bins`. The
   manifest row `linux standalone-runner acceptance` runs the live suite on
   `test-db-linux`. `ci_run_coverage.rs` accepts the new crate name and fails
