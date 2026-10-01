@@ -5456,6 +5456,27 @@ async fn append_activity_started_if_pending(
     .await
 }
 
+/// Test seam for the activity start fence (issue #1789).
+///
+/// Returns the started activity id, or `None` when the start is a no-op.
+///
+/// # Errors
+///
+/// Returns the error of the start transaction.
+#[doc(hidden)]
+pub async fn append_activity_started_for_test(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    exec_id: ExecutionId,
+    activity_name: &str,
+    worker_id: &str,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<Option<ActivityExecId>> {
+    append_activity_started_if_pending(conn, task, exec_id, activity_name, worker_id, codecs)
+        .await
+        .map(|started| started.map(|s| s.activity_id))
+}
+
 async fn load_workflow_execution(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -13040,7 +13061,8 @@ pub async fn fail_task_and_execution_with_history(
     .await
 }
 
-async fn finalize_activity_completion(
+#[doc(hidden)]
+pub async fn finalize_activity_completion(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
     exec_id: ExecutionId,
@@ -13108,7 +13130,8 @@ async fn finalize_activity_completion(
     crate::dispatch::settle_scope(result).await
 }
 
-async fn finalize_activity_failure(
+#[doc(hidden)]
+pub async fn finalize_activity_failure(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
     exec_id: ExecutionId,
@@ -14056,8 +14079,10 @@ async fn create_detached_child_executions(
 ///
 /// Transient DB errors are retried silently; only a state transition (or
 /// row deletion) resolves the future.
-async fn observe_task_cancellation(pool: &DbPool, task_id: uuid::Uuid) {
+#[doc(hidden)]
+pub async fn observe_task_cancellation(pool: &DbPool, claim: &queue::TaskClaim) {
     use crate::schema::harvest_task_queue::dsl;
+    let task_id = claim.task_id;
 
     const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -15072,8 +15097,9 @@ async fn process_activity_task(
     }
 
     let cancel = CancellationToken::new();
+    let activity_claim = queue::TaskClaim::new(task.id, worker_id, task.attempt);
     let heartbeat_tx =
-        crate::heartbeat::spawn_heartbeat_flusher(task.id, pool.clone(), cancel.clone());
+        crate::heartbeat::spawn_heartbeat_flusher(activity_claim.clone(), pool.clone(), cancel.clone());
     let trace_carrier = task
         .trace_context
         .as_ref()
@@ -15361,7 +15387,7 @@ async fn process_activity_task(
             }
         }
     };
-    let cancellation_observer = observe_task_cancellation(pool, task.id);
+    let cancellation_observer = observe_task_cancellation(pool, &activity_claim);
     tokio::pin!(cancellation_observer);
 
     let activity_result = execute_activity_future_with_cancellation(

@@ -2445,6 +2445,147 @@ const CONCURRENCY_ATTRIBUTION_SQL: &str = "SELECT \
            AND (t.state = 'PENDING' OR (t.state = 'RUNNING' AND t.worker_id IS NOT NULL)) \
          GROUP BY t.concurrency_key, t.task_type, e.workflow_name";
 
+/// The claim epoch of one activity attempt (issue #1789).
+///
+/// `claim_task` sets `worker_id` and increments `attempt` on every claim. The
+/// pair therefore identifies one claim of a row, like a fencing token. See
+/// `docs/architecture.md`, section "Activity claim epoch", for the protocol.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskClaim {
+    /// The claimed task queue row.
+    pub task_id: Uuid,
+    /// The worker that holds the claim.
+    pub worker_id: String,
+    /// The row's `attempt` value that this claim wrote.
+    pub attempt: i32,
+}
+
+impl TaskClaim {
+    /// Build a claim from its parts.
+    #[must_use]
+    pub fn new(task_id: Uuid, worker_id: impl Into<String>, attempt: i32) -> Self {
+        Self {
+            task_id,
+            worker_id: worker_id.into(),
+            attempt,
+        }
+    }
+
+    /// The claim that a claimed task snapshot carries.
+    ///
+    /// Returns `None` when the snapshot has no `worker_id`. Such a row is not
+    /// claimed, so no write can be fenced to it.
+    #[must_use]
+    pub fn of(task: &TaskQueueItem) -> Option<Self> {
+        task.worker_id
+            .as_deref()
+            .map(|worker_id| Self::new(task.id, worker_id, task.attempt))
+    }
+}
+
+/// The result of a write fenced by a [`TaskClaim`].
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimWrite {
+    /// The claim was current, and the write took effect.
+    Applied,
+    /// The claim was not current, and the write changed nothing.
+    LeaseLost,
+}
+
+/// The result of [`lock_claim_for_update`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimLock {
+    /// The claim is current. The row stays locked until the transaction ends.
+    Held,
+    /// The claim is not current. `state` is the row's state, or `None` when
+    /// the row does not exist.
+    Lost {
+        /// The row's current state.
+        state: Option<String>,
+    },
+}
+
+/// Lock the claimed row `FOR UPDATE` and report whether `claim` is current.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn lock_claim_for_update(
+    conn: &mut AsyncPgConnection,
+    claim: &TaskClaim,
+) -> HarvestResult<ClaimLock> {
+    // RED stub (issue #1789): checks the state only.
+    let state = task_state_for_update(conn, claim.task_id).await?;
+    Ok(match state {
+        Some(state) if state == "RUNNING" => ClaimLock::Held,
+        state => ClaimLock::Lost { state },
+    })
+}
+
+fn lease_lost_on_not_found(result: HarvestResult<()>) -> HarvestResult<ClaimWrite> {
+    match result {
+        Ok(()) => Ok(ClaimWrite::Applied),
+        Err(crate::error::HarvestError::NotFound(_)) => Ok(ClaimWrite::LeaseLost),
+        Err(e) => Err(e),
+    }
+}
+
+/// Complete the task that `claim` holds. A stale claim changes nothing.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on update failure.
+pub async fn complete_claimed_task(
+    conn: &mut AsyncPgConnection,
+    claim: &TaskClaim,
+    output: serde_json::Value,
+) -> HarvestResult<ClaimWrite> {
+    lease_lost_on_not_found(complete_task(conn, claim.task_id, output).await)
+}
+
+/// Fail the task that `claim` holds. A stale claim changes nothing.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on update failure.
+pub async fn fail_claimed_task(
+    conn: &mut AsyncPgConnection,
+    claim: &TaskClaim,
+    error: &str,
+) -> HarvestResult<ClaimWrite> {
+    lease_lost_on_not_found(fail_task(conn, claim.task_id, error).await)
+}
+
+/// Requeue the task that `claim` holds for retry. A stale claim changes
+/// nothing.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on update failure.
+pub async fn requeue_claimed_task_for_retry(
+    conn: &mut AsyncPgConnection,
+    claim: &TaskClaim,
+    delay: Duration,
+    previous_error: &str,
+) -> HarvestResult<ClaimWrite> {
+    lease_lost_on_not_found(requeue_for_retry(conn, claim.task_id, delay, previous_error).await)
+}
+
+/// Defer the rate-limited task that `claim` holds. A stale claim changes
+/// nothing.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on update failure.
+pub async fn defer_claimed_rate_limited_task(
+    conn: &mut AsyncPgConnection,
+    claim: &TaskClaim,
+    scheduled_at: chrono::DateTime<Utc>,
+) -> HarvestResult<ClaimWrite> {
+    lease_lost_on_not_found(defer_rate_limited_task(conn, claim.task_id, scheduled_at).await)
+}
+
 /// Mark a task as completed with the given output.
 ///
 /// Terminal completion clears any heartbeat checkpoint payload so it cannot be
@@ -2852,10 +2993,11 @@ pub async fn oldest_pending_ages(
 /// Returns [`crate::error::HarvestError::Database`] on update failure.
 pub async fn record_heartbeat(
     conn: &mut AsyncPgConnection,
-    task_id: Uuid,
+    claim: &TaskClaim,
     details: serde_json::Value,
-) -> HarvestResult<()> {
+) -> HarvestResult<ClaimWrite> {
     use crate::schema::harvest_task_queue::dsl;
+    let task_id = claim.task_id;
 
     let updated = diesel::update(
         dsl::harvest_task_queue
@@ -2871,12 +3013,10 @@ pub async fn record_heartbeat(
     .map_err(crate::error::database_error)?;
 
     if updated == 0 {
-        return Err(crate::error::HarvestError::NotFound(format!(
-            "task queue item {task_id} is not running"
-        )));
+        return Ok(ClaimWrite::LeaseLost);
     }
 
-    Ok(())
+    Ok(ClaimWrite::Applied)
 }
 
 /// Shared "reset a claimed task back to `PENDING` with a future

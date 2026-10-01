@@ -12,8 +12,8 @@
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
+use crate::queue::TaskClaim;
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::deadpool::Pool;
 
@@ -32,25 +32,26 @@ use diesel_async::pooled_connection::deadpool::Pool;
 /// await (backpressure).
 #[must_use]
 pub fn spawn_heartbeat_flusher(
-    task_id: Uuid,
+    claim: TaskClaim,
     pool: Pool<AsyncPgConnection>,
     cancel: CancellationToken,
 ) -> mpsc::Sender<Value> {
     let (tx, rx) = mpsc::channel(64);
 
-    tokio::spawn(heartbeat_loop(task_id, pool, rx, cancel));
+    tokio::spawn(heartbeat_loop(claim, pool, rx, cancel));
 
     tx
 }
 
 /// The main heartbeat flushing loop.
 async fn heartbeat_loop(
-    task_id: Uuid,
+    claim: TaskClaim,
     pool: Pool<AsyncPgConnection>,
     mut rx: mpsc::Receiver<Value>,
     cancel: CancellationToken,
 ) {
     let flush_interval = std::time::Duration::from_secs(1);
+    let task_id = claim.task_id;
 
     loop {
         // Wait for either: a heartbeat arrives, the interval expires, or cancellation.
@@ -75,7 +76,7 @@ async fn heartbeat_loop(
             match pool.get().await {
                 Ok(mut conn) => {
                     if let Err(e) =
-                        crate::queue::record_heartbeat(&mut conn, task_id, payload).await
+                        crate::queue::record_heartbeat(&mut conn, &claim, payload).await
                     {
                         tracing::warn!(
                             task_id = %task_id,
