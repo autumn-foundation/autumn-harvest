@@ -772,15 +772,11 @@ fn event_from_wire(value: Value) -> Result<crate::event::WorkflowEvent, serde_js
     if !tagged {
         return serde_json::from_value(Value::Object(map));
     }
-    let mut pairs = Vec::with_capacity(2);
-    if let Some(tag) = map.remove("type") {
-        pairs.push(("type", tag));
-    }
-    if let Some(data) = map.remove("data") {
-        pairs.push(("data", data));
-    }
+    let tag = map.remove("type").unwrap_or_default();
+    let data = map.remove("data");
+    let pairs = std::iter::once(("type", tag)).chain(data.map(|data| ("data", data)));
     let de: MapDeserializer<'_, _, serde_json::Error> =
-        MapDeserializer::new(pairs.into_iter().map(|(k, v)| (k.into_deserializer(), v)));
+        MapDeserializer::new(pairs.map(|(key, value)| (key.into_deserializer(), value)));
     serde::Deserialize::deserialize(de)
 }
 
