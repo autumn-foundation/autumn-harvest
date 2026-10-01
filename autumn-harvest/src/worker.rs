@@ -6060,6 +6060,57 @@ fn release_probe_on_error(
     error
 }
 
+/// Parse the task's retry policy. A policy that does not parse fails the task.
+///
+/// The handler can already have run, so the failure write must not be lost
+/// (issue #1788). A session timeout rolls the write back, so the write runs
+/// again, up to `FINALIZE_ACQUIRE_ATTEMPTS` times. The write re-checks the
+/// claim under a row lock, so a repeat is safe.
+///
+/// # Errors
+///
+/// Returns the parse error after the task fails, or the write error when the
+/// write does not commit.
+#[doc(hidden)]
+pub async fn retry_policy_or_fail_task(
+    pool: &DbPool,
+    task: &TaskQueueItem,
+    worker_id: &str,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<Option<RetryPolicy>> {
+    if let Ok(policy) = configured_retry_policy(task) {
+        return Ok(policy);
+    }
+    let mut conn = crate::pool::acquire_with_retries(pool, FINALIZE_ACQUIRE_ATTEMPTS).await?;
+    let mut attempt = 1;
+    loop {
+        // Parse again on each try. The parse error is not `Clone`.
+        let outcome = fail_execution_on_error(
+            &mut conn,
+            task,
+            worker_id,
+            configured_retry_policy(task),
+            codecs,
+        )
+        .await;
+        match outcome {
+            Err(error)
+                if attempt < FINALIZE_ACQUIRE_ATTEMPTS
+                    && crate::pool::is_session_timeout(&error) =>
+            {
+                tracing::warn!(
+                    task_id = %task.id,
+                    attempt,
+                    error = %error,
+                    "session timeout while failing a task with an invalid retry policy; trying again"
+                );
+                attempt += 1;
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
 /// How many times to run an activity result write that a session timeout
 /// cancels (issue #1788).
 ///
@@ -15149,30 +15200,21 @@ async fn process_activity_task(
             &task.queue_name,
             ActivityStatus::Failed,
         );
-        let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
-        let retry_policy_result = configured_retry_policy(task);
-        let retry_policy = fail_execution_on_error(
-            &mut conn,
-            task,
-            worker_id,
-            retry_policy_result,
-            registry.payload_codecs(),
-        )
-        .await?;
-        return handle_activity_result(
-            &mut conn,
+        // `ActivityStarted` is already committed, and a start is not
+        // idempotent. So this write uses the same retries as a handler result
+        // (issue #1788). A released claim would append a second start.
+        let retry_policy =
+            retry_policy_or_fail_task(pool, task, worker_id, registry.payload_codecs()).await?;
+        return write_activity_result(
+            pool,
+            registry,
             task,
             exec_id,
             activity_id,
             worker_id,
             retry_policy.as_ref(),
-            Err(payload),
-            0,
+            &Err(payload),
             activity_name,
-            registry.payload_offloader(),
-            telemetry.metrics.as_ref(),
-            registry.retry_after_ceiling,
-            registry.payload_codecs(),
         )
         .await;
     }
@@ -15592,21 +15634,8 @@ async fn process_activity_task(
     // must not drop its result: each acquire is bounded and retried (issue
     // #1788). Acquire only when a write is needed. An activity that committed
     // through `run_transactional` needs none, so it must not wait on the pool.
-    let retry_policy = match configured_retry_policy(task) {
-        Ok(policy) => policy,
-        Err(error) => {
-            let mut conn =
-                crate::pool::acquire_with_retries(pool, FINALIZE_ACQUIRE_ATTEMPTS).await?;
-            fail_execution_on_error(
-                &mut conn,
-                task,
-                worker_id,
-                Err(error),
-                registry.payload_codecs(),
-            )
-            .await?
-        }
-    };
+    let retry_policy =
+        retry_policy_or_fail_task(pool, task, worker_id, registry.payload_codecs()).await?;
 
     // Circuit breaker (issue #369): record this attempt's outcome. A close →
     // open trip (or half-open re-open) and a recovery to closed are surfaced as
@@ -15685,19 +15714,49 @@ async fn process_activity_task(
         return Ok(());
     }
 
-    // activity_result is already cap-normalized (oversized Ok → non-retryable Err);
-    // pass 0 so handle_activity_result skips the redundant cap check.
-    //
-    // A session `statement_timeout` or `lock_timeout` rolls the write back
-    // (issue #1788). The handler already ran, so try again. Each finalization
-    // re-checks `RUNNING` under a row lock, so a repeat is safe. An offloader
-    // turns the repeats off; see `result_write_attempts`.
     record_activity_panic_once(
         telemetry.metrics.as_ref(),
         activity_name,
         &task.queue_name,
         &activity_result,
     );
+    write_activity_result(
+        pool,
+        registry,
+        task,
+        exec_id,
+        activity_id,
+        worker_id,
+        retry_policy.as_ref(),
+        &activity_result,
+        activity_name,
+    )
+    .await
+}
+
+/// Write the result of an activity attempt that has started (issue #1788).
+///
+/// Each acquire is bounded and retried, so a short pool incident does not
+/// drop the result. A session `statement_timeout` or `lock_timeout` rolls the
+/// write back, so the write runs again. Each finalization re-checks `RUNNING`
+/// under a row lock, so a repeat is safe. An offloader turns the repeats off;
+/// see `result_write_attempts`.
+///
+/// `activity_result` is already cap-normalized: an oversized `Ok` is a
+/// non-retryable `Err`. So the cap passed to `handle_activity_result` is 0,
+/// which skips a second check.
+#[allow(clippy::too_many_arguments)]
+async fn write_activity_result(
+    pool: &DbPool,
+    registry: &HandlerRegistry,
+    task: &TaskQueueItem,
+    exec_id: ExecutionId,
+    activity_id: ActivityExecId,
+    worker_id: &str,
+    retry_policy: Option<&RetryPolicy>,
+    activity_result: &Result<serde_json::Value, String>,
+    activity_name: &str,
+) -> HarvestResult<()> {
     let mut conn = crate::pool::acquire_with_retries(pool, FINALIZE_ACQUIRE_ATTEMPTS).await?;
     let attempts = result_write_attempts(registry.payload_offloader().is_some());
     let mut attempt = 1;
@@ -15708,12 +15767,12 @@ async fn process_activity_task(
             exec_id,
             activity_id,
             worker_id,
-            retry_policy.as_ref(),
+            retry_policy,
             activity_result.clone(),
             0,
             activity_name,
             registry.payload_offloader(),
-            telemetry.metrics.as_ref(),
+            registry.telemetry().metrics.as_ref(),
             registry.retry_after_ceiling,
             registry.payload_codecs(),
         )

@@ -405,6 +405,10 @@ pub fn engine_pool(
 }
 
 /// The acquire bound for `pool`.
+///
+/// A zero `wait` keeps its deadpool meaning. `pool.get()` then fails at once
+/// when no slot is free. The default bound only guards the connect and the
+/// recycle check, which have no limit when their own timeouts are absent.
 #[cfg(feature = "db")]
 #[must_use]
 pub fn acquire_bound(pool: &crate::worker::DbPool) -> std::time::Duration {
@@ -780,6 +784,40 @@ mod tests {
             },
             ..EngineDbTimeouts::default()
         }
+    }
+
+    /// A pool with a zero `wait` fails at once when its only slot is busy.
+    /// The default bound must not turn that fail-fast pool into a 30 s wait.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn a_zero_wait_pool_still_fails_at_once() {
+        let (_listener, dsn) = silent_listener().await;
+        let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+            diesel_async::AsyncPgConnection,
+        >::new(dsn);
+        let pool = deadpool::managed::Pool::builder(manager)
+            .max_size(1)
+            .runtime(deadpool::Runtime::Tokio1)
+            .wait_timeout(Some(Duration::ZERO))
+            .build()
+            .expect("pool builds without connecting");
+
+        let busy = pool.clone();
+        let holder = tokio::spawn(async move { acquire_within_pool_bound(&busy).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let started = Instant::now();
+        let err = acquire_within_pool_bound(&pool)
+            .await
+            .err()
+            .expect("the only slot is busy");
+        holder.abort();
+        assert!(err.is_pool_acquire_timeout(), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[cfg(feature = "db")]

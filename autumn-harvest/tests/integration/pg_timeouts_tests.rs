@@ -806,6 +806,145 @@ async fn a_claim_release_retries_after_a_non_timeout_error() {
     assert_eq!(state, "PENDING");
 }
 
+/// Insert a running workflow execution with a `WorkflowStarted` event.
+async fn seed_execution(conn: &mut AsyncPgConnection, queue: &str) -> ExecutionId {
+    use autumn_harvest::models::NewWorkflowExecution;
+    use autumn_harvest::schema::harvest_workflow_executions;
+
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let row = NewWorkflowExecution {
+        quota_key: None,
+        id: exec_id.as_uuid(),
+        workflow_name: "wf",
+        workflow_id: &format!("wf-{}", exec_id.as_uuid()),
+        run_id: Uuid::new_v4(),
+        shard_id: 0,
+        input: serde_json::json!({}),
+        parent_id: None,
+        queue_name: queue,
+        execution_timeout: None,
+        deadline_at: None,
+        chain_execution_timeout: None,
+        chain_deadline_at: None,
+        memo: None,
+        search_attrs: None,
+        assigned_build_id: None,
+        parent_close_policy: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        context_headers: None,
+        sla: None,
+        sla_deadline_at: None,
+        schedule_id: None,
+        scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
+        origin: None,
+        completion_callbacks: None,
+        continued_from_exec_id: None,
+        first_exec_id: None,
+        start_source: None,
+        start_source_ref: None,
+        started_by: None,
+    };
+    diesel::insert_into(harvest_workflow_executions::table)
+        .values(&row)
+        .execute(conn)
+        .await
+        .expect("insert workflow execution");
+    store::append_events(
+        conn,
+        exec_id,
+        &[WorkflowEvent::WorkflowStarted {
+            input: serde_json::json!({}),
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        }],
+        0,
+    )
+    .await
+    .expect("append WorkflowStarted");
+    exec_id
+}
+
+/// A retry policy that does not parse fails the task after its handler ran.
+/// That write must ride out a `lock_timeout`. Otherwise the claim is released,
+/// and the handler runs again. Another session holds the execution row lock
+/// for 700 ms, and the pool gives up on a lock after 150 ms.
+#[tokio::test]
+async fn an_invalid_retry_policy_failure_retries_after_a_lock_timeout() {
+    use autumn_harvest::models::TaskQueueItem;
+    use autumn_harvest::schema::harvest_task_queue;
+    use diesel::{QueryDsl, SelectableHelper};
+
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let queue_name = format!("q-ip-{}", &Uuid::new_v4().simple().to_string()[..12]);
+    let exec_id = seed_execution(&mut conn, &queue_name).await;
+    let task_id = autumn_harvest::queue::enqueue(
+        &mut conn,
+        &autumn_harvest::queue::EnqueueParams::new(
+            &queue_name,
+            autumn_harvest::queue::TaskType::Activity,
+            serde_json::json!({}),
+        ),
+    )
+    .await
+    .expect("enqueue");
+    diesel::sql_query(
+        "UPDATE harvest_task_queue SET state = 'RUNNING', worker_id = 'w-1', attempt = 1, \
+         workflow_exec_id = $2, retry_policy = '{\"max_attempts\": \"many\"}'::jsonb \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("model the claim");
+    let task: TaskQueueItem = harvest_task_queue::table
+        .find(task_id)
+        .select(TaskQueueItem::as_select())
+        .first(&mut conn)
+        .await
+        .expect("load the task");
+
+    let lock_url = url.clone();
+    let holder = tokio::spawn(async move {
+        let mut conn = connect(&lock_url).await;
+        diesel::sql_query(format!(
+            "DO $$ BEGIN PERFORM 1 FROM harvest_workflow_executions \
+             WHERE id = '{}' FOR UPDATE; PERFORM pg_sleep(0.7); END $$",
+            exec_id.as_uuid()
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("hold the row lock");
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let session = SessionTimeouts {
+        lock: Duration::from_millis(150),
+        ..SessionTimeouts::for_role(DbRole::Hot)
+    };
+    let pool = engine_pool(url, 1, DbRole::Hot, &timeouts(5_000, session)).expect("engine pool");
+    let outcome = autumn_harvest::worker::retry_policy_or_fail_task(
+        &pool,
+        &task,
+        "w-1",
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+    )
+    .await;
+    holder.await.expect("holder joins");
+
+    let err = outcome.expect_err("the policy does not parse");
+    assert!(!autumn_harvest::pool::is_session_timeout(&err), "{err}");
+    assert_eq!(task_state(&mut conn, task_id).await, "FAILED");
+}
+
 async fn task_state(conn: &mut AsyncPgConnection, task_id: Uuid) -> String {
     #[derive(diesel::QueryableByName)]
     struct State {

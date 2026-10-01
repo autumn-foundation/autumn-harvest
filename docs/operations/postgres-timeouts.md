@@ -20,7 +20,8 @@ Together these let one stuck connection stop work:
 
 The worker never waits without limit for a connection. Each acquire uses the
 pool's deadpool `wait` timeout as its bound. A pool with no `wait` timeout gets
-30 s.
+30 s. A zero `wait` keeps its deadpool meaning: the acquire fails at once when
+no slot is free.
 
 - An `autumn-web` pool sets `wait` from `database.connect_timeout_secs`, 5 s by
   default. The plugin's worker then uses 5 s.
@@ -35,7 +36,9 @@ or outage does not drop the result. A result write that a session
 `statement_timeout` or `lock_timeout` cancels also runs again, up to 10 times.
 Each write re-checks that the task is `RUNNING` under a row lock, so a repeat
 is safe. With a payload offloader there is no repeat: each try would upload a
-blob that no row then references.
+blob that no row then references. The same tries apply to two more writes after
+`ActivityStarted`: the failure of a task whose retry policy does not parse, and
+the `CircuitOpen` failure.
 
 Harvest detects a session timeout from the English Postgres message, because
 Diesel keeps no SQLSTATE in its errors. Keep `lc_messages` set to an English
