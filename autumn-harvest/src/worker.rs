@@ -30944,8 +30944,9 @@ async fn workflow_task_timeout_metric_names(
 /// Called when the consecutive in-memory timeout counter reaches
 /// `poison_pill_threshold` (issue #494). Errors are logged and swallowed.
 ///
-/// Returns `false` only when no pool connection was available. The caller then
-/// keeps the strike count, so the next timeout tries the quarantine again.
+/// Returns `false` when the quarantine did not commit: no pool connection, or
+/// the transaction rolled back. The caller then keeps the strike count, so the
+/// next timeout tries the quarantine again.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn quarantine_workflow_task_timeout(
     pool: &DbPool,
@@ -31285,6 +31286,7 @@ pub async fn quarantine_workflow_task_timeout(
                 error = %e,
                 "workflow task timeout quarantine: transaction failed"
             );
+            return false;
         }
     }
     true

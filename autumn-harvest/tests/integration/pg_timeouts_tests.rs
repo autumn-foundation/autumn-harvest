@@ -667,6 +667,69 @@ async fn a_claim_release_retries_after_a_lock_timeout() {
     assert_eq!(task_state(&mut conn, task_id).await, "PENDING");
 }
 
+/// A quarantine whose transaction a `lock_timeout` rolls back reports failure,
+/// so the caller keeps the strike count.
+#[tokio::test]
+async fn a_rolled_back_quarantine_reports_failure() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let queue_name = format!("q-qr-{}", &Uuid::new_v4().simple().to_string()[..12]);
+    let task_id = autumn_harvest::queue::enqueue(
+        &mut conn,
+        &autumn_harvest::queue::EnqueueParams::new(
+            &queue_name,
+            autumn_harvest::queue::TaskType::Workflow,
+            serde_json::json!({}),
+        ),
+    )
+    .await
+    .expect("enqueue");
+    diesel::sql_query(
+        "UPDATE harvest_task_queue SET state = 'RUNNING', worker_id = 'w-1', attempt = 1 \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .execute(&mut conn)
+    .await
+    .expect("model the claim");
+
+    let lock_url = url.clone();
+    let holder = tokio::spawn(async move {
+        let mut conn = connect(&lock_url).await;
+        diesel::sql_query(format!(
+            "DO $$ BEGIN PERFORM 1 FROM harvest_task_queue WHERE id = '{task_id}' FOR UPDATE; \
+             PERFORM pg_sleep(1.5); END $$"
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("hold the row lock");
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let session = SessionTimeouts {
+        lock: Duration::from_millis(100),
+        ..SessionTimeouts::for_role(DbRole::Hot)
+    };
+    let pool = engine_pool(url, 1, DbRole::Hot, &timeouts(5_000, session)).expect("engine pool");
+    let reached = autumn_harvest::worker::quarantine_workflow_task_timeout(
+        &pool,
+        task_id,
+        None,
+        "w-1",
+        3,
+        10,
+        "wf",
+        &queue_name,
+        &autumn_harvest::telemetry::NoOpMetrics,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+    )
+    .await;
+    holder.await.expect("holder joins");
+
+    assert!(!reached, "a rolled-back quarantine must not report success");
+    assert_eq!(task_state(&mut conn, task_id).await, "RUNNING");
+}
+
 async fn task_state(conn: &mut AsyncPgConnection, task_id: Uuid) -> String {
     #[derive(diesel::QueryableByName)]
     struct State {
