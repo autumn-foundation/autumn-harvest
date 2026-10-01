@@ -752,8 +752,8 @@ impl std::fmt::Debug for PayloadCodecs {
 
 /// Deserialize a wire event without serde's `Content` buffering.
 ///
-/// `WorkflowEvent` is adjacently tagged. `serde_json::Map` iterates keys in
-/// sorted order, so `data` comes before `type`. Serde then buffers the whole
+/// `WorkflowEvent` is adjacently tagged. Without the `preserve_order` feature,
+/// `serde_json::Map` iterates keys in sorted order, so `data` comes before `type`. Serde then buffers the whole
 /// event in `Content` before it can pick a variant. This function feeds
 /// `type` first, so serde reads `data` straight into the chosen variant.
 ///
