@@ -364,11 +364,18 @@ struct CandidateRow {
 /// cursor wraps.
 #[cfg(feature = "db")]
 const CANDIDATE_SQL: &str = "\
-    SELECT id, workflow_name, input FROM harvest_workflow_executions \
-    WHERE quota_key IS NULL AND state IN ('RUNNING', 'PAUSED') \
-      AND workflow_name = ANY($1) \
-      AND ($2::uuid IS NULL OR id > $2) \
-    ORDER BY id \
+    SELECT c.id, c.workflow_name, c.input \
+    FROM unnest($1::text[]) AS n(name) \
+    CROSS JOIN LATERAL ( \
+        SELECT e.id, e.workflow_name, e.input \
+        FROM harvest_workflow_executions e \
+        WHERE e.workflow_name = n.name \
+          AND e.quota_key IS NULL AND e.state IN ('RUNNING', 'PAUSED') \
+          AND ($2::uuid IS NULL OR e.id > $2) \
+        ORDER BY e.id \
+        LIMIT $3 \
+    ) c \
+    ORDER BY c.id \
     LIMIT $3";
 
 /// The exact SQL text [`reconcile_quota_keys`] executes for its candidate
