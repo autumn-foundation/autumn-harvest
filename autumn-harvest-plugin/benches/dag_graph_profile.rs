@@ -997,10 +997,7 @@ fn push_gate_resolution(
         // gate_0, gate_2 (plain `signal_gate`) and gate_3
         // (`signal_gate_with_timeout`, resolved by its signal arriving
         // before the deadline): all resolved by a matching signal.
-        0 | 2 | 3 => {
-            push(t, events, signal_received(&gate.signal_name));
-            true
-        }
+        0 | 2 | 3 => push(t, events, signal_received(&gate.signal_name)),
         // gate_1 (`signal_gate_with_timeout`): resolved by the race timer
         // firing before any signal arrives.
         _ => {
@@ -1011,9 +1008,9 @@ fn push_gate_resolution(
             // between events (issue #690 review, Codex).
             *t += 300;
             push(t, events, gate_timer_fired(1, &gate.signal_name));
-            true
         }
     }
+    true
 }
 
 fn env_usize(key: &str, default: usize) -> usize {

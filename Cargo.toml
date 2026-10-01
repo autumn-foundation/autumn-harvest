@@ -84,6 +84,15 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
+# Clippy 1.99 fires `redundant_field_names` inside the expansion of
+# `#[derive(diesel::QueryableByName)]`, on code this tree does not write.
+# `assert_is_empty` is new in 1.99 and flags the `assert!(x.is_empty())`
+# idiom that the test suites use throughout.
+# `double_must_use` fires on each `#[async_trait]` default method. The macro
+# adds `#[must_use]` to a boxed future that is already `#[must_use]`.
+redundant_field_names = "allow"
+assert_is_empty = "allow"
+double_must_use = "allow"
 
 [profile.dev.package.bollard-stubs]
 opt-level = 0
