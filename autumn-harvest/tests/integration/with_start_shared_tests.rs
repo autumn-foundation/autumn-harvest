@@ -28,7 +28,7 @@ use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
-/// Each test scrubs the shared database, so the tests run one at a time.
+/// Each test scrubs its own rows, so the tests run one at a time.
 static TEST_SERIAL: Mutex<()> = Mutex::new(());
 
 async fn setup() -> (AsyncPgConnection, Option<ContainerAsync<Postgres>>) {
@@ -49,23 +49,29 @@ async fn setup() -> (AsyncPgConnection, Option<ContainerAsync<Postgres>>) {
         )
     };
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
-    for stmt in [
-        "DELETE FROM harvest_signals",
-        "DELETE FROM harvest_task_queue",
-        "DELETE FROM harvest_events",
-        "DELETE FROM harvest_workflow_executions",
-    ] {
-        diesel::sql_query(stmt)
-            .execute(&mut conn)
-            .await
-            .expect("scrub");
+    // Delete only this suite's rows, so a shared database stays safe for the
+    // other integration modules.
+    for table in ["harvest_signals", "harvest_task_queue", "harvest_events"] {
+        diesel::sql_query(format!(
+            "DELETE FROM {table} WHERE workflow_exec_id IN \
+             (SELECT id FROM harvest_workflow_executions WHERE workflow_name = '{WORKFLOW}')"
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("scrub");
     }
+    diesel::sql_query(format!(
+        "DELETE FROM harvest_workflow_executions WHERE workflow_name = '{WORKFLOW}'"
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("scrub");
     (conn, container)
 }
 
 fn sws(id: &str, policy: WorkflowIdReusePolicy) -> SignalWithStartParams<'_> {
     SignalWithStartParams {
-        workflow_name: "ws_wf",
+        workflow_name: WORKFLOW,
         workflow_id: id,
         exec_id: ExecutionId::new(),
         input: json!({"hello": "world"}),
@@ -103,7 +109,7 @@ fn sws(id: &str, policy: WorkflowIdReusePolicy) -> SignalWithStartParams<'_> {
 
 fn uws(id: &str, policy: WorkflowIdReusePolicy) -> UpdateWithStartParams<'_> {
     UpdateWithStartParams {
-        workflow_name: "ws_wf",
+        workflow_name: WORKFLOW,
         workflow_id: id,
         exec_id: ExecutionId::new(),
         input: json!({"hello": "world"}),
@@ -136,6 +142,8 @@ fn uws(id: &str, policy: WorkflowIdReusePolicy) -> UpdateWithStartParams<'_> {
     }
 }
 
+/// The workflow type every test in this suite uses.
+const WORKFLOW: &str = "ws_wf";
 const ALLOW: WorkflowIdReusePolicy = WorkflowIdReusePolicy::AllowDuplicate;
 
 async fn run_sws(
@@ -685,7 +693,7 @@ fn schema_info() -> autumn_harvest::info::WorkflowInfo {
         quota: None,
         declared_activities: None,
         declared_children: None,
-        name: "ws_wf",
+        name: WORKFLOW,
         module: "with_start_shared_tests",
         handler: dummy_handler,
         execution_timeout: None,
