@@ -14658,11 +14658,11 @@ impl<'a> BudgetReleaseGuard<'a> {
         }
     }
 
-    fn hold(&mut self, ticket: Option<crate::retry_budget::BudgetTicket>) {
+    const fn hold(&mut self, ticket: Option<crate::retry_budget::BudgetTicket>) {
         self.ticket = ticket;
     }
 
-    fn commit(&mut self) {
+    const fn commit(&mut self) {
         self.ticket = None;
     }
 }

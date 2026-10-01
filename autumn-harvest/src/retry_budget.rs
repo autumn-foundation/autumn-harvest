@@ -281,6 +281,8 @@ impl RetryBudgetRegistry {
     /// exact, because the next deposits must pay it back first.
     ///
     /// Returns the tokens left, or `None` when the type has no budget.
+    // The ticket is taken by value so that one ticket is released only once.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn release(&self, activity_name: &str, ticket: BudgetTicket, now: Instant) -> Option<f64> {
         self.with_bucket(activity_name, now, |bucket, policy| {
             bucket.tokens = match ticket.kind {
@@ -371,7 +373,7 @@ mod tests {
         RetryBudgetRegistry::new(RetryBudgetConfig::disabled().with_default(Some(policy)))
     }
 
-    fn is_admitted(a: Admission) -> bool {
+    const fn is_admitted(a: &Admission) -> bool {
         matches!(a, Admission::Admitted { .. })
     }
 
@@ -394,7 +396,7 @@ mod tests {
     fn drain(reg: &RetryBudgetRegistry, name: &str, now: Instant) -> u32 {
         let mut ran = 0;
         while reg.available(name, now).is_some_and(|t| t >= 1.0) {
-            assert!(is_admitted(reg.admit(name, true, now)));
+            assert!(is_admitted(&reg.admit(name, true, now)));
             ran += 1;
             assert!(ran < 10_000, "bucket never ran dry");
         }
@@ -414,7 +416,7 @@ mod tests {
     #[test]
     fn default_registry_is_on() {
         let reg = RetryBudgetRegistry::default();
-        assert!(is_admitted(reg.admit(A, true, Instant::now())));
+        assert!(is_admitted(&reg.admit(A, true, Instant::now())));
     }
 
     #[test]
@@ -462,7 +464,7 @@ mod tests {
         let now = Instant::now();
         assert_eq!(drain(&reg, A, now), 2);
         for _ in 0..4 {
-            assert!(is_admitted(reg.admit(A, false, now)));
+            assert!(is_admitted(&reg.admit(A, false, now)));
         }
         assert_eq!(reg.available(A, now), Some(2.0));
         assert_eq!(drain(&reg, A, now), 2);
@@ -502,7 +504,7 @@ mod tests {
             let _ = reg.admit(A, false, now);
             // Every attempt fails, and each failed task asks to retry 5 times.
             for _ in 0..5 {
-                if is_admitted(reg.admit(A, true, now)) {
+                if is_admitted(&reg.admit(A, true, now)) {
                     retries_run += 1;
                 }
             }
@@ -522,7 +524,7 @@ mod tests {
         let reg = registry(RetryBudgetPolicy::new(0.1, 3.0, 0.0));
         let now = Instant::now();
         assert_eq!(drain(&reg, A, now), 3);
-        assert!(is_admitted(reg.admit(B, true, now)));
+        assert!(is_admitted(&reg.admit(B, true, now)));
         assert_eq!(reg.available(B, now), Some(2.0));
     }
 
@@ -595,7 +597,7 @@ mod tests {
         assert_eq!(drain(&reg, A, now), 1);
         let first_a = ticket(reg.admit(A, false, now));
         let first_b = ticket(reg.admit(A, false, now));
-        assert!(is_admitted(reg.admit(A, true, now)));
+        assert!(is_admitted(&reg.admit(A, true, now)));
         reg.release(A, first_a, now);
         reg.release(A, first_b, now);
         assert_eq!(reg.available(A, now), Some(-1.0));
@@ -617,7 +619,7 @@ mod tests {
         for _ in 0..10 {
             let _ = reg.admit(A, false, now);
         }
-        assert!(is_admitted(reg.admit(A, true, now)));
+        assert!(is_admitted(&reg.admit(A, true, now)));
     }
 
     /// Deferrals past the cap are spread over the upper half of the cap. They

@@ -782,7 +782,7 @@ async fn budget_deferral_keeps_crash_strikes_attempt_and_error() {
 
     let claimed = queue::claim_task(
         &mut conn,
-        &[queue.clone()],
+        std::slice::from_ref(&queue),
         "rb-strikes-worker",
         "",
         None,

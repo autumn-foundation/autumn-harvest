@@ -3844,7 +3844,7 @@ pub struct WorkerConfig {
     /// to turn it off. Set via `with_retry_budget`.
     ///
     /// The Postgres worker enforces the budget. Local activities and the
-    /// SQLite backend do not use it.
+    /// `autumn-harvest-sqlite` backend do not use it.
     pub retry_budget: crate::retry_budget::RetryBudgetConfig,
 }
 
