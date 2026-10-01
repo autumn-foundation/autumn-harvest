@@ -27811,57 +27811,70 @@ impl Worker {
                     () = tokio::time::sleep(poll_interval) => {}
                 }
             } else {
-                // Poll each listener with a short cap; overall timeout = poll_interval.
-                let per_check = Duration::from_millis(10).min(poll_interval);
-                let deadline = tokio::time::Instant::now() + poll_interval;
-                let mut notified = false;
+                self.wait_on_shard_listeners(&mut shard_listeners, capacity_bound)
+                    .await;
+            }
+        }
+    }
 
-                'notify_wait: while tokio::time::Instant::now() < deadline
-                    && !shutdown.is_cancelled()
-                {
-                    // One check per round of listener slices. A released
-                    // permit waits at most one round.
-                    if capacity_bound
-                        && futures::FutureExt::now_or_never(self.capacity_freed.notified())
-                            .is_some()
-                    {
-                        break 'notify_wait;
-                    }
-                    let mut broken_idx: Option<usize> = None;
-                    for (i, slot) in shard_listeners.iter_mut().enumerate() {
-                        if let Some(listener) = slot.as_mut() {
-                            match listener.wait_for_notification(per_check).await {
-                                Ok(Some(_)) => {
-                                    notified = true;
-                                    break 'notify_wait;
-                                }
-                                Ok(None) => {}
-                                Err(error) => {
-                                    tracing::warn!(
-                                        worker_id = %self.config.worker_id,
-                                        shard_idx = i,
-                                        error = %error,
-                                        "LISTEN/NOTIFY wait failed for shard; removing listener"
-                                    );
-                                    broken_idx = Some(i);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    if let Some(i) = broken_idx {
-                        shard_listeners[i] = None;
-                        // All listeners gone: nothing left to await in this loop,
-                        // so bail out instead of busy-spinning until the deadline.
-                        if shard_listeners.iter().all(Option::is_none) {
+    /// Wait on every per-shard listener in round-robin, for up to one
+    /// `poll_interval` (extracted from [`Self::run_poll_loop_multi`]).
+    ///
+    /// With `capacity_bound`, a released permit also ends the wait (issue
+    /// #1787).
+    async fn wait_on_shard_listeners(
+        &self,
+        shard_listeners: &mut [Option<crate::notify::QueueListener>],
+        capacity_bound: bool,
+    ) {
+        let poll_interval = self.config.poll_interval;
+        let shutdown = &self.shutdown;
+        // Poll each listener with a short cap; overall timeout = poll_interval.
+        let per_check = Duration::from_millis(10).min(poll_interval);
+        let deadline = tokio::time::Instant::now() + poll_interval;
+        let mut notified = false;
+
+        'notify_wait: while tokio::time::Instant::now() < deadline && !shutdown.is_cancelled() {
+            // One check per round of listener slices. A released
+            // permit waits at most one round.
+            if capacity_bound
+                && futures::FutureExt::now_or_never(self.capacity_freed.notified()).is_some()
+            {
+                break 'notify_wait;
+            }
+            let mut broken_idx: Option<usize> = None;
+            for (i, slot) in shard_listeners.iter_mut().enumerate() {
+                if let Some(listener) = slot.as_mut() {
+                    match listener.wait_for_notification(per_check).await {
+                        Ok(Some(_)) => {
+                            notified = true;
                             break 'notify_wait;
                         }
+                        Ok(None) => {}
+                        Err(error) => {
+                            tracing::warn!(
+                                worker_id = %self.config.worker_id,
+                                shard_idx = i,
+                                error = %error,
+                                "LISTEN/NOTIFY wait failed for shard; removing listener"
+                            );
+                            broken_idx = Some(i);
+                            break;
+                        }
                     }
                 }
-                if notified {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            if let Some(i) = broken_idx {
+                shard_listeners[i] = None;
+                // All listeners gone: nothing left to await in this loop,
+                // so bail out instead of busy-spinning until the deadline.
+                if shard_listeners.iter().all(Option::is_none) {
+                    break 'notify_wait;
                 }
             }
+        }
+        if notified {
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 
