@@ -52,6 +52,10 @@ connection that failed at once, for example a refused connect. An activity can h
 checks the claim's `attempt` and `worker_id`. The activity can run again, as it
 can after a worker crash.
 
+A start that loses its connection can still commit. Before a release, the
+worker reads the history again on a new connection. If this claim's
+`ActivityStarted` is there, the handler runs and the claim stays.
+
 `harvest.db.pool_acquire_timeout{site}` counts the timeouts that matter most.
 `site` is `claim` or `heartbeat_flush`. Other sites log the error only.
 
@@ -152,6 +156,8 @@ Each activity heartbeat flush has its own bounded acquire. It does not wait
 without limit on a full pool.
 
 A failed flush keeps its payload and tries again on the next one-second tick.
+The retry writes the time that the worker got the heartbeat, not the retry
+time. A stalled handler then cannot look alive after an outage.
 `harvest.heartbeat.flush_failed{reason}` counts each failure. `reason` is
 `acquire_timeout`, `acquire_error` or `write_error`.
 

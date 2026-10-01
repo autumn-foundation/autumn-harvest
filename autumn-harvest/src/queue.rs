@@ -2855,6 +2855,24 @@ pub async fn record_heartbeat(
     task_id: Uuid,
     details: serde_json::Value,
 ) -> HarvestResult<()> {
+    record_heartbeat_received_at(conn, task_id, details, Utc::now()).await
+}
+
+/// [`record_heartbeat`] with the time the worker got the heartbeat
+/// (issue #1788).
+///
+/// A retry after a failed flush keeps the original time. A stalled handler
+/// then cannot look alive.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on update failure.
+pub async fn record_heartbeat_received_at(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    details: serde_json::Value,
+    received_at: DateTime<Utc>,
+) -> HarvestResult<()> {
     use crate::schema::harvest_task_queue::dsl;
 
     let updated = diesel::update(
@@ -2863,7 +2881,7 @@ pub async fn record_heartbeat(
             .filter(dsl::state.eq("RUNNING")),
     )
     .set((
-        dsl::last_heartbeat_at.eq(Some(Utc::now())),
+        dsl::last_heartbeat_at.eq(Some(received_at)),
         dsl::heartbeat_details.eq(Some(details)),
     ))
     .execute(conn)
@@ -2885,6 +2903,9 @@ pub async fn record_heartbeat(
 /// and `worker_id`. A requeue or a new claim changes them. A late heartbeat
 /// from the old claim then cannot touch the new attempt's row.
 ///
+/// `received_at` is the time the worker got the heartbeat, not the write time.
+/// A retry after a failed flush then cannot make a stalled handler look alive.
+///
 /// # Errors
 ///
 /// [`crate::error::HarvestError::NotFound`] when the claim no longer holds the
@@ -2895,6 +2916,7 @@ pub async fn record_heartbeat_for_claim(
     attempt: i32,
     worker_id: &str,
     details: serde_json::Value,
+    received_at: DateTime<Utc>,
 ) -> HarvestResult<()> {
     use crate::schema::harvest_task_queue::dsl;
 
@@ -2906,7 +2928,7 @@ pub async fn record_heartbeat_for_claim(
             .filter(dsl::worker_id.eq(worker_id)),
     )
     .set((
-        dsl::last_heartbeat_at.eq(Some(Utc::now())),
+        dsl::last_heartbeat_at.eq(Some(received_at)),
         dsl::heartbeat_details.eq(Some(details)),
     ))
     .execute(conn)

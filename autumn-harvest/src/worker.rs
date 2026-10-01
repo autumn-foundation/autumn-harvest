@@ -5408,6 +5408,69 @@ struct StartedActivity {
     workflow_name: String,
 }
 
+/// Whether this claim's `ActivityStarted` committed (issue #1788).
+///
+/// # Errors
+///
+/// A database error from the reads.
+#[doc(hidden)]
+pub async fn lost_start_committed(
+    pool: &DbPool,
+    task: &TaskQueueItem,
+    exec_id: ExecutionId,
+    activity_name: &str,
+    worker_id: &str,
+) -> HarvestResult<bool> {
+    reconcile_lost_start(pool, task, exec_id, activity_name, worker_id)
+        .await
+        .map(|started| started.is_some())
+}
+
+/// Find the start that a lost connection hid (issue #1788).
+///
+/// The server can commit `ActivityStarted` after the client loses the
+/// connection. A release would then let the next claim append a second start.
+/// So read the history again on a new connection.
+///
+/// This claim wrote the start only if an `ActivityStarted` from this worker
+/// has a time at or after the claim's `started_at`. An earlier attempt of the
+/// same worker wrote its start before this claim. The database clock sets both
+/// times: the event row's `DEFAULT NOW()` and the claim's `started_at = NOW()`.
+async fn reconcile_lost_start(
+    pool: &DbPool,
+    task: &TaskQueueItem,
+    exec_id: ExecutionId,
+    activity_name: &str,
+    worker_id: &str,
+) -> HarvestResult<Option<StartedActivity>> {
+    let Some(claimed_at) = task.started_at else {
+        return Ok(None);
+    };
+    let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
+    let history = store::load_history_with_timestamps(&mut conn, exec_id).await?;
+    let events: Vec<WorkflowEvent> = history.iter().map(|(_, event)| event.clone()).collect();
+    let Some(activity_id) = pending_activity_id_for_task(&events, task, activity_name)? else {
+        return Ok(None);
+    };
+    let ours = history.iter().any(|(at, event)| {
+        *at >= claimed_at
+            && matches!(
+                event,
+                WorkflowEvent::ActivityStarted { activity_id: id, worker_id: by }
+                    if *id == activity_id && by.as_str() == worker_id
+            )
+    });
+    if !ours {
+        return Ok(None);
+    }
+    let execution = load_workflow_execution(&mut conn, exec_id).await?;
+    Ok(Some(StartedActivity {
+        activity_id,
+        workflow_id: execution.workflow_id,
+        workflow_name: execution.workflow_name,
+    }))
+}
+
 async fn append_activity_started_if_pending(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
@@ -15142,6 +15205,25 @@ async fn process_activity_task(
             registry.payload_codecs(),
         )
         .await;
+        // A lost connection hides whether the start committed (issue #1788).
+        // If it did, run the handler. A release would add a second start.
+        let started_result = match started_result {
+            Err(error) if crate::pool::is_connection_lost(&error) => {
+                match reconcile_lost_start(pool, task, exec_id, activity_name, worker_id).await {
+                    Ok(Some(started)) => Ok(Some(started)),
+                    Ok(None) => Err(error),
+                    Err(reconcile_error) => {
+                        tracing::warn!(
+                            task_id = %task.id,
+                            error = %reconcile_error,
+                            "could not check whether a lost activity start committed"
+                        );
+                        Err(error)
+                    }
+                }
+            }
+            other => other,
+        };
         // A transient failure (issue #1788) has not run the handler and wrote
         // nothing. It must not fail the workflow through
         // `fail_execution_on_error`. Return it instead: the dispatch error path

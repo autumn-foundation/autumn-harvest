@@ -31,7 +31,8 @@ move. A large DEFAULT census can need longer than a role limit, and a timeout
 in the move discards a finished pass.
 
 **Heartbeat flush.** Each flush has its own bounded acquire. A failed flush
-keeps its payload for the next tick. The new `queue::record_heartbeat_for_claim`
+keeps its payload and its receipt time for the next tick, so a retry cannot
+make a stalled handler look alive. The new `queue::record_heartbeat_for_claim`
 writes only under the claim's `attempt` and `worker_id`, so a late heartbeat
 cannot reach a newer attempt. A payload with no matching claim is dropped. The
 executed activity's result write uses `pool::acquire_with_retries` (10 bounded
@@ -44,7 +45,8 @@ not parse use the same tries. A write that loses its connection, for example to
 `transaction_timeout`, runs again on a new connection (`pool::is_connection_lost`). An activity task that still fails to get a
 connection or hits a session timeout has its claim released, fenced on `attempt`
 and `worker_id`, because an activity with no deadline would otherwise stay
-`RUNNING`.
+`RUNNING`. A start that loses its connection is checked again first: if this
+claim's `ActivityStarted` committed, the handler runs instead.
 
 **Metrics.** `harvest.db.pool_acquire_timeout{site}` and
 `harvest.heartbeat.flush_failed{reason}`, with starter dashboard panels.

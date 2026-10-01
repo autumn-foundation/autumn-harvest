@@ -110,7 +110,11 @@ pub async fn flush_heartbeat(
     payload: Value,
     acquire_timeout: Duration,
 ) -> HarvestResult<()> {
-    flush(pool, task_id, None, payload, acquire_timeout)
+    let pending = Pending {
+        payload,
+        received_at: chrono::Utc::now(),
+    };
+    flush(pool, task_id, None, &pending, acquire_timeout)
         .await
         .map_err(|failure| *failure.error)
 }
@@ -124,11 +128,17 @@ struct FlushFailure {
     error: Box<HarvestError>,
 }
 
+/// A heartbeat not yet written, with the time the worker got it.
+struct Pending {
+    payload: Value,
+    received_at: chrono::DateTime<chrono::Utc>,
+}
+
 async fn flush(
     pool: &Pool<AsyncPgConnection>,
     task_id: Uuid,
     claim: Option<&HeartbeatClaim>,
-    payload: Value,
+    pending: &Pending,
     acquire_timeout: Duration,
 ) -> Result<(), FlushFailure> {
     let mut conn = crate::pool::acquire(pool, acquire_timeout)
@@ -148,11 +158,20 @@ async fn flush(
                 task_id,
                 claim.attempt,
                 &claim.worker_id,
-                payload,
+                pending.payload.clone(),
+                pending.received_at,
             )
             .await
         }
-        None => crate::queue::record_heartbeat(&mut conn, task_id, payload).await,
+        None => {
+            crate::queue::record_heartbeat_received_at(
+                &mut conn,
+                task_id,
+                pending.payload.clone(),
+                pending.received_at,
+            )
+            .await
+        }
     };
     written.map_err(|error| FlushFailure {
         reason: "write_error",
@@ -169,8 +188,9 @@ async fn heartbeat_loop(
     options: HeartbeatFlushOptions,
 ) {
     let flush_interval = Duration::from_secs(1);
-    // The newest payload not yet written. A failed flush puts it back here.
-    let mut pending: Option<Value> = None;
+    // The newest payload not yet written, with the time it arrived. A failed
+    // flush puts it back here. A retry writes that time, not the retry time.
+    let mut pending: Option<Pending> = None;
 
     loop {
         // Wait for either: a heartbeat arrives, the interval expires, or cancellation.
@@ -186,16 +206,19 @@ async fn heartbeat_loop(
 
         // Drain all pending heartbeats, keeping only the most recent.
         while let Ok(payload) = rx.try_recv() {
-            pending = Some(payload);
+            pending = Some(Pending {
+                payload,
+                received_at: chrono::Utc::now(),
+            });
         }
 
         // If we got at least one heartbeat, flush to DB.
-        if let Some(payload) = pending.take()
+        if let Some(beat) = pending.take()
             && let Err(failure) = flush(
                 &pool,
                 task_id,
                 options.claim.as_ref(),
-                payload.clone(),
+                &beat,
                 options.acquire_timeout,
             )
             .await
@@ -222,7 +245,7 @@ async fn heartbeat_loop(
                     error = %failure.error,
                     "failed to flush heartbeat to database; retrying on the next tick"
                 );
-                pending = Some(payload);
+                pending = Some(beat);
             }
         }
 

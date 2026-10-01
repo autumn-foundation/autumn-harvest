@@ -492,6 +492,7 @@ async fn a_heartbeat_from_an_old_claim_is_rejected() {
         1,
         "old-worker",
         serde_json::json!({"from": "old"}),
+        Utc::now(),
     )
     .await
     .expect_err("an old claim must not write");
@@ -506,6 +507,7 @@ async fn a_heartbeat_from_an_old_claim_is_rejected() {
         2,
         "new-worker",
         serde_json::json!({"from": "new"}),
+        Utc::now(),
     )
     .await
     .expect("the current claim writes");
@@ -592,6 +594,7 @@ async fn a_stranded_activity_claim_is_released() {
     )
     .await
     .expect("enqueue");
+    register_live_worker(&mut conn, "w-1").await;
     diesel::sql_query(
         "UPDATE harvest_task_queue SET state = 'RUNNING', worker_id = 'w-1', attempt = 1 \
          WHERE id = $1",
@@ -634,6 +637,7 @@ async fn a_claim_release_retries_after_a_lock_timeout() {
     )
     .await
     .expect("enqueue");
+    register_live_worker(&mut conn, "w-1").await;
     diesel::sql_query(
         "UPDATE harvest_task_queue SET state = 'RUNNING', worker_id = 'w-1', attempt = 1 \
          WHERE id = $1",
@@ -684,6 +688,7 @@ async fn a_rolled_back_quarantine_reports_failure() {
     )
     .await
     .expect("enqueue");
+    register_live_worker(&mut conn, "w-1").await;
     diesel::sql_query(
         "UPDATE harvest_task_queue SET state = 'RUNNING', worker_id = 'w-1', attempt = 1 \
          WHERE id = $1",
@@ -749,6 +754,7 @@ async fn a_claim_release_retries_after_a_non_timeout_error() {
     )
     .await
     .expect("enqueue");
+    register_live_worker(&mut conn, "w-1").await;
     diesel::sql_query(
         "UPDATE harvest_task_queue SET state = 'RUNNING', worker_id = 'w-1', attempt = 1 \
          WHERE id = $1",
@@ -928,6 +934,7 @@ async fn an_invalid_retry_policy_failure_retries_after_a_lock_timeout() {
     )
     .await
     .expect("enqueue");
+    register_live_worker(&mut conn, "w-1").await;
     diesel::sql_query(
         "UPDATE harvest_task_queue SET state = 'RUNNING', worker_id = 'w-1', attempt = 1, \
          workflow_exec_id = $2, retry_policy = '{\"max_attempts\": \"many\"}'::jsonb \
@@ -1002,6 +1009,7 @@ async fn an_invalid_retry_policy_failure_retries_after_a_lost_connection() {
     )
     .await
     .expect("enqueue");
+    register_live_worker(&mut conn, "w-1").await;
     diesel::sql_query(
         "UPDATE harvest_task_queue SET state = 'RUNNING', worker_id = 'w-1', attempt = 1, \
          workflow_exec_id = $2, retry_policy = '{\"max_attempts\": \"many\"}'::jsonb \
@@ -1145,6 +1153,208 @@ async fn a_start_error_on_a_lost_connection_still_refunds_the_token() {
         .await
         .expect("drop the bucket");
     assert!((tokens - 1.0).abs() < 1e-9, "tokens = {tokens}");
+}
+
+/// A heartbeat that waits out a full pool keeps its own time. A retry that
+/// stamps the write time instead would make a stalled handler look alive.
+#[tokio::test]
+async fn a_retried_heartbeat_keeps_its_receipt_time() {
+    #[derive(diesel::QueryableByName)]
+    struct Beat {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
+        last_heartbeat_at: Option<chrono::DateTime<Utc>>,
+    }
+
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let suffix = Uuid::new_v4().simple().to_string()[..12].to_owned();
+    let queue_name = format!("q-hr-{suffix}");
+    let worker_id = format!("w-hr-{suffix}");
+    register_live_worker(&mut conn, &worker_id).await;
+    let task_id = autumn_harvest::queue::enqueue(
+        &mut conn,
+        &autumn_harvest::queue::EnqueueParams::new(
+            &queue_name,
+            autumn_harvest::queue::TaskType::Activity,
+            serde_json::json!({}),
+        ),
+    )
+    .await
+    .expect("enqueue");
+    diesel::sql_query(
+        "UPDATE harvest_task_queue SET state = 'RUNNING', worker_id = $2, attempt = 1 \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .bind::<Text, _>(&worker_id)
+    .execute(&mut conn)
+    .await
+    .expect("model the claim");
+
+    let pool = engine_pool(
+        url,
+        1,
+        DbRole::Hot,
+        &timeouts(200, SessionTimeouts::for_role(DbRole::Hot)),
+    )
+    .expect("engine pool");
+    let held = hold_every_connection(&pool).await;
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let tx = autumn_harvest::heartbeat::spawn_heartbeat_flusher_with(
+        task_id,
+        pool.clone(),
+        cancel.clone(),
+        autumn_harvest::heartbeat::HeartbeatFlushOptions {
+            acquire_timeout: Duration::from_millis(200),
+            metrics: Arc::new(autumn_harvest::telemetry::NoOpMetrics),
+            claim: Some(autumn_harvest::heartbeat::HeartbeatClaim {
+                attempt: 1,
+                worker_id: worker_id.clone(),
+            }),
+        },
+    );
+    let sent_at = Utc::now();
+    tx.send(serde_json::json!({"progress": 1}))
+        .await
+        .expect("send the heartbeat");
+
+    // Several flushes fail while the pool is full. Then the slot frees.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    drop(held);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    cancel.cancel();
+
+    let beat = diesel::sql_query("SELECT last_heartbeat_at FROM harvest_task_queue WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .get_result::<Beat>(&mut conn)
+        .await
+        .expect("read the heartbeat")
+        .last_heartbeat_at
+        .expect("the retry wrote the heartbeat");
+    let lag = beat - sent_at;
+    assert!(
+        lag < chrono::Duration::milliseconds(1_500),
+        "the heartbeat time moved to the retry: {lag}"
+    );
+}
+
+/// A start whose connection dropped may still have committed. Only an
+/// `ActivityStarted` from this worker after this claim's `started_at` proves
+/// that. Both times come from the database clock.
+#[tokio::test]
+async fn a_lost_start_is_found_only_when_this_claim_wrote_it() {
+    use autumn_harvest::models::TaskQueueItem;
+    use autumn_harvest::schema::harvest_task_queue;
+    use autumn_harvest::types::{ActivityExecId, WorkerId};
+    use diesel::{QueryDsl, SelectableHelper};
+
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let queue_name = format!("q-ls-{}", &Uuid::new_v4().simple().to_string()[..12]);
+    let exec_id = seed_execution(&mut conn, &queue_name).await;
+    let activity_id = ActivityExecId::from_uuid(Uuid::new_v4());
+    let started = |worker: &str| WorkflowEvent::ActivityStarted {
+        activity_id,
+        worker_id: WorkerId::new(worker),
+    };
+    store::append_events(
+        &mut conn,
+        exec_id,
+        &[
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "act".to_owned(),
+                input: serde_json::json!({}),
+                queue: queue_name.clone(),
+            },
+            // An earlier attempt by the same worker.
+            started("w-1"),
+        ],
+        1,
+    )
+    .await
+    .expect("schedule the activity");
+
+    let task_id = autumn_harvest::queue::enqueue(
+        &mut conn,
+        &autumn_harvest::queue::EnqueueParams::new(
+            &queue_name,
+            autumn_harvest::queue::TaskType::Activity,
+            serde_json::json!({}),
+        ),
+    )
+    .await
+    .expect("enqueue");
+    register_live_worker(&mut conn, "w-1").await;
+    diesel::sql_query(
+        "UPDATE harvest_task_queue SET state = 'RUNNING', worker_id = 'w-1', attempt = 2, \
+         started_at = NOW(), workflow_exec_id = $2, activity_id = $3, activity_name = 'act' \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Uuid, _>(activity_id.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("model the claim");
+    let load = async |conn: &mut AsyncPgConnection| -> TaskQueueItem {
+        harvest_task_queue::table
+            .find(task_id)
+            .select(TaskQueueItem::as_select())
+            .first(conn)
+            .await
+            .expect("load the task")
+    };
+    let task = load(&mut conn).await;
+    let pool = engine_pool(
+        url,
+        1,
+        DbRole::Hot,
+        &timeouts(5_000, SessionTimeouts::for_role(DbRole::Hot)),
+    )
+    .expect("engine pool");
+    let committed = async |task: &TaskQueueItem| {
+        autumn_harvest::worker::lost_start_committed(&pool, task, exec_id, "act", "w-1")
+            .await
+            .expect("reconcile reads")
+    };
+
+    assert!(
+        !committed(&task).await,
+        "an earlier attempt's start is not this claim's"
+    );
+
+    store::append_events(&mut conn, exec_id, &[started("w-2")], 3)
+        .await
+        .expect("another worker's start");
+    assert!(
+        !committed(&task).await,
+        "another worker's start is not this claim's"
+    );
+
+    store::append_events(&mut conn, exec_id, &[started("w-1")], 4)
+        .await
+        .expect("this claim's start");
+    assert!(committed(&task).await, "this claim's start committed");
+}
+
+/// Mark `worker_id` as a live worker. A test row `RUNNING` under an unknown
+/// worker is an orphan, and a reclaimer of a parallel suite would requeue it.
+/// The row has no queues and a shard that does not exist, so no other code
+/// gives it work.
+async fn register_live_worker(conn: &mut AsyncPgConnection, worker_id: &str) {
+    diesel::sql_query(
+        "INSERT INTO harvest_workers \
+         (worker_id, queues, shard_assignments, max_concurrency, in_flight_count, \
+          status, last_heartbeat_at, started_at, host) \
+         VALUES ($1, '[]'::jsonb, '[9999]'::jsonb, 1, 0, 'Active', \
+                 NOW() + INTERVAL '1 hour', NOW(), 'pg-timeouts-test') \
+         ON CONFLICT (worker_id) DO UPDATE SET last_heartbeat_at = EXCLUDED.last_heartbeat_at",
+    )
+    .bind::<Text, _>(worker_id)
+    .execute(conn)
+    .await
+    .expect("register the test worker");
 }
 
 async fn task_state(conn: &mut AsyncPgConnection, task_id: Uuid) -> String {
