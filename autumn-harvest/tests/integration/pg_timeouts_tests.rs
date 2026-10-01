@@ -1809,6 +1809,70 @@ async fn a_lost_start_on_a_one_slot_pool_is_still_found() {
     assert!(found, "this claim's committed start must be found");
 }
 
+/// A session-release write that a session timeout cancels must not fail the
+/// workflow. The handler wrote nothing, so the claim goes back for a retry.
+/// Another session locks `harvest_sessions` for 600 ms, and the pool gives up
+/// on a lock after 150 ms.
+#[tokio::test]
+async fn a_session_release_timeout_does_not_fail_the_workflow() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let (exec_id, _activity_id, task) = seed_claimed_activity(&mut conn, "q-sx").await;
+    diesel::sql_query("UPDATE harvest_task_queue SET input = to_jsonb($2::text) WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(task.id)
+        .bind::<Text, _>(Uuid::new_v4().to_string())
+        .execute(&mut conn)
+        .await
+        .expect("make the input a session id");
+    let task = {
+        use autumn_harvest::models::TaskQueueItem;
+        use autumn_harvest::schema::harvest_task_queue;
+        use diesel::{QueryDsl, SelectableHelper};
+        harvest_task_queue::table
+            .find(task.id)
+            .select(TaskQueueItem::as_select())
+            .first::<TaskQueueItem>(&mut conn)
+            .await
+            .expect("reload the claim")
+    };
+
+    let lock_url = url.clone();
+    let holder = tokio::spawn(async move {
+        let mut conn = connect(&lock_url).await;
+        diesel::sql_query(
+            "DO $$ BEGIN LOCK TABLE harvest_sessions IN ACCESS EXCLUSIVE MODE; \
+             PERFORM pg_sleep(0.6); END $$",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("hold the table lock");
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let session = SessionTimeouts {
+        lock: Duration::from_millis(150),
+        ..SessionTimeouts::for_role(DbRole::Hot)
+    };
+    let pool = engine_pool(url, 1, DbRole::Hot, &timeouts(5_000, session)).expect("engine pool");
+    let outcome =
+        autumn_harvest::worker::handle_session_release_for_test(&pool, &task, "w-1", exec_id).await;
+    holder.await.expect("holder joins");
+
+    let err = outcome.expect_err("the release write timed out");
+    assert!(autumn_harvest::pool::is_transient_db_error(&err), "{err}");
+    assert_eq!(task_state(&mut conn, task.id).await, "RUNNING");
+    let history = store::load_history(&mut conn, exec_id)
+        .await
+        .expect("load history");
+    assert!(
+        !history
+            .events
+            .iter()
+            .any(|event| matches!(event, WorkflowEvent::WorkflowFailed { .. })),
+        "a transient session write must not fail the workflow"
+    );
+}
+
 /// Mark `worker_id` as a live worker. A test row `RUNNING` under an unknown
 /// worker is an orphan, and a reclaimer of a parallel suite would requeue it.
 /// The row has no queues and a shard that does not exist, so no other code

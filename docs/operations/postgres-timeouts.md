@@ -149,7 +149,8 @@ SET lock_timeout = 0;
 ```
 
 The partition drain (`partition::drain_default`) switches `statement_timeout`
-off for its census and for its move transaction. The census scans the whole
+off for its census and for its move transaction. On PostgreSQL 17 it also
+switches `transaction_timeout` off there. The census scans the whole
 DEFAULT partition, and a timeout in the move would discard a finished pass.
 
 ## Heartbeat flushes

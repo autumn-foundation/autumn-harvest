@@ -15194,6 +15194,12 @@ async fn handle_session_acquire(
             // a backstop for this same release should it ever be missed (e.g.
             // a crash between the DB error and this line).
             crate::sessions::release_session_slot(session_slots_in_use, session_id);
+            // A transient failure (issue #1788) wrote nothing. Return it, and
+            // the dispatch error path releases the claim for a retry. The
+            // acquire write is idempotent, so a retry is safe.
+            if crate::pool::is_transient_db_error(&error) {
+                return Err(error);
+            }
             let msg = error.to_string();
             fail_task_and_execution(&mut conn, task, worker_id, &msg, codecs).await?;
             return Err(error);
@@ -15258,6 +15264,11 @@ async fn handle_session_release(
     };
 
     if let Err(error) = crate::sessions::record_session_completed(&mut conn, session_id).await {
+        // A transient failure (issue #1788) wrote nothing. Return it, and the
+        // dispatch error path releases the claim for a retry.
+        if crate::pool::is_transient_db_error(&error) {
+            return Err(error);
+        }
         let msg = error.to_string();
         fail_task_and_execution(&mut conn, task, worker_id, &msg, codecs).await?;
         return Err(error);
@@ -15270,6 +15281,30 @@ async fn handle_session_release(
 
     let output = serde_json::Value::Null;
     finalize_activity_completion(&mut conn, task, exec_id, activity_id, output, None, codecs).await
+}
+
+/// Run the internal session-release activity for `task`. Tests use it
+/// (issue #1788).
+///
+/// # Errors
+///
+/// See `handle_session_release`.
+#[doc(hidden)]
+pub async fn handle_session_release_for_test(
+    pool: &DbPool,
+    task: &TaskQueueItem,
+    worker_id: &str,
+    exec_id: ExecutionId,
+) -> HarvestResult<()> {
+    handle_session_release(
+        pool,
+        task,
+        worker_id,
+        exec_id,
+        &crate::sessions::new_session_slot_registry(),
+        &crate::payload_codec::PayloadCodecs::default(),
+    )
+    .await
 }
 
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]

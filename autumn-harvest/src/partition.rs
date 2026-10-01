@@ -3373,6 +3373,25 @@ async fn exec(conn: &mut AsyncPgConnection, sql: &str) -> HarvestResult<()> {
     Ok(())
 }
 
+/// Switch off the session statement and transaction limits for the current
+/// transaction only (issue #1788).
+///
+/// A drain pass can run longer than a role limit. A limit there would stop
+/// every pass, so the backlog would never shrink. `transaction_timeout`
+/// exists only on PostgreSQL 17 or later. The guard skips it on an earlier
+/// server, where `set_config` would fail on the unknown name.
+#[cfg(feature = "db")]
+async fn switch_off_session_limits(conn: &mut AsyncPgConnection) -> HarvestResult<()> {
+    exec(conn, "SET LOCAL statement_timeout = 0").await?;
+    exec(
+        conn,
+        "SELECT set_config('transaction_timeout', '0', true) \
+         FROM (SELECT current_setting('transaction_timeout', true) AS v) AS s \
+         WHERE s.v IS NOT NULL",
+    )
+    .await
+}
+
 #[cfg(feature = "db")]
 async fn scalar_bool(conn: &mut AsyncPgConnection, sql: &str) -> HarvestResult<bool> {
     Ok(diesel::sql_query(sql)
@@ -4751,11 +4770,12 @@ async fn drain_default_bounded_inner(
     mut progress: Option<&mut (dyn FnMut() + Send)>,
 ) -> HarvestResult<usize> {
     // The reads before the lock run in their own transaction, so `SET LOCAL`
-    // can switch off a session `statement_timeout` (issue #1788). The census
+    // can switch off the session statement and transaction limits (issue
+    // #1788). The census
     // scans the whole DEFAULT partition. On a large backlog it can need longer
     // than a role default, and a timeout would then stop every pass.
     let census = Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
-        exec(conn, "SET LOCAL statement_timeout = 0").await?;
+        switch_off_session_limits(conn).await?;
         let width = match detect_layout(conn).await? {
             EventLayout::Unpartitioned => return Ok(None),
             EventLayout::Partitioned { cohort_width_secs } => cohort_width_secs,
@@ -4830,8 +4850,8 @@ async fn drain_default_bounded_inner(
         // No `statement_timeout` here — see the note above the budgets. It
         // would discard a completed pass rather than bound one. An engine
         // pool or `ALTER ROLE` can set a session default (issue #1788), so
-        // switch it off for this transaction only.
-        exec(conn, "SET LOCAL statement_timeout = 0").await?;
+        // switch it and `transaction_timeout` off for this transaction only.
+        switch_off_session_limits(conn).await?;
         exec(
             conn,
             &format!("ALTER TABLE harvest_events DETACH PARTITION {DEFAULT_PARTITION}"),
