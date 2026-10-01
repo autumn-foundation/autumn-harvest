@@ -10066,3 +10066,65 @@ async fn converting_refuses_to_drop_the_row_security_it_cannot_carry() {
         .await
         .expect("conversion must proceed once the row security is gone");
 }
+
+/// A session `statement_timeout` must not stop the drain census (issue #1788).
+///
+/// The census scans the whole DEFAULT partition, so a large backlog can need
+/// longer than a role default. A timeout there would stop every pass before it
+/// moves a row. Here a 1 ms session limit stands in for the role default.
+#[tokio::test]
+async fn a_session_statement_timeout_does_not_stop_the_drain_census() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    reset_to_unpartitioned(&mut conn).await;
+    partition::enable_partitioning(&mut conn, &EnableOptions::default())
+        .await
+        .expect("enable");
+
+    let _exec = seed_expired(&mut conn, "drain_wf", "drain-st-1", day(2026, 3, 1)).await;
+    for sql in [
+        "INSERT INTO harvest_events
+             (workflow_exec_id, event_id, event_type, event_data, timestamp, cohort)
+         SELECT e.workflow_exec_id, 1000 + (g.i * 10) + e.event_id, e.event_type,
+                e.event_data, e.timestamp, '2026-03-02'::timestamptz
+           FROM harvest_events e
+           CROSS JOIN generate_series(1, 15000) AS g(i)"
+            .to_owned(),
+        format!(
+            "WITH parked AS (
+                 DELETE FROM harvest_events WHERE cohort > '2026-03-01'::timestamptz RETURNING *
+             )
+             INSERT INTO {} SELECT * FROM parked",
+            partition::DEFAULT_PARTITION
+        ),
+    ] {
+        diesel::sql_query(sql)
+            .execute(&mut conn)
+            .await
+            .expect("park a large one-cohort backlog");
+    }
+
+    diesel::sql_query("SET statement_timeout = '1ms'")
+        .execute(&mut conn)
+        .await
+        .expect("set the session limit");
+    let outcome = partition::drain_default(&mut conn).await;
+    diesel::sql_query("RESET statement_timeout")
+        .execute(&mut conn)
+        .await
+        .expect("reset the session limit");
+
+    let moved = outcome.expect("the drain must not hit the session statement_timeout");
+    assert!(moved > 0, "the pass must move the backlog");
+    assert_eq!(
+        scalar_i64(
+            &mut conn,
+            &format!(
+                "SELECT COUNT(*)::bigint AS n FROM {}",
+                partition::DEFAULT_PARTITION
+            ),
+        )
+        .await,
+        0
+    );
+}

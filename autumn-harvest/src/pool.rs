@@ -316,12 +316,35 @@ pub fn is_session_timeout(error: &HarvestError) -> bool {
     }
 }
 
+/// Whether `error` shows that the server ended the session.
+///
+/// `transaction_timeout` (SQLSTATE 25P04) and
+/// `idle_in_transaction_session_timeout` (25P03) end the session. The client
+/// gets the FATAL message only when a statement is running. Otherwise the next
+/// statement fails with `connection closed`, so this matches that text too.
+///
+/// A repeat needs a new connection. A lost connection can hide a commit, so
+/// repeat only a write that re-checks its claim.
+#[must_use]
+pub fn is_connection_lost(error: &HarvestError) -> bool {
+    match error {
+        HarvestError::Database(msg) => {
+            msg.contains("connection closed")
+                || msg.contains("terminating connection")
+                || msg.contains("transaction timeout")
+                || msg.contains("25P03")
+                || msg.contains("25P04")
+        }
+        _ => false,
+    }
+}
+
 /// Whether `error` is a transient database failure: the pool handed out no
-/// connection, or a session timeout cancelled the statement. Nothing was
-/// written, so the work can run again.
+/// connection, a session timeout cancelled the statement, or the server ended
+/// the session. The work can run again.
 #[must_use]
 pub fn is_transient_db_error(error: &HarvestError) -> bool {
-    error.is_pool_acquire_failure() || is_session_timeout(error)
+    error.is_pool_acquire_failure() || is_session_timeout(error) || is_connection_lost(error)
 }
 
 /// A pooled engine connection.
@@ -707,12 +730,39 @@ mod tests {
                 HarvestError::Database("canceling statement due to lock timeout".into()),
                 true,
             ),
+            (HarvestError::Database("connection closed".into()), true),
             (HarvestError::Database("duplicate key value".into()), false),
             (HarvestError::NotFound("task".into()), false),
         ];
         for (error, transient) in cases {
             assert_eq!(is_transient_db_error(&error), transient, "{error}");
         }
+    }
+
+    /// PostgreSQL 17 sends this FATAL message when `transaction_timeout` ends
+    /// a running statement. The integration suite runs PostgreSQL 16, so this
+    /// case is checked here.
+    #[test]
+    fn is_connection_lost_matches_session_ending_errors_only() {
+        let cases = [
+            ("terminating connection due to transaction timeout", true),
+            (
+                "terminating connection due to idle-in-transaction timeout",
+                true,
+            ),
+            ("connection closed", true),
+            ("canceling statement due to statement timeout", false),
+            ("canceling statement due to lock timeout", false),
+            ("duplicate key value", false),
+        ];
+        for (message, lost) in cases {
+            let error = HarvestError::Database(message.into());
+            assert_eq!(is_connection_lost(&error), lost, "{message}");
+            assert!(!lost || !is_session_timeout(&error), "{message}");
+        }
+        assert!(!is_connection_lost(&HarvestError::NotFound(
+            "connection closed".into()
+        )));
     }
 
     #[test]

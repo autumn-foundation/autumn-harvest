@@ -6064,8 +6064,9 @@ fn release_probe_on_error(
 ///
 /// The handler can already have run, so the failure write must not be lost
 /// (issue #1788). A session timeout rolls the write back, so the write runs
-/// again, up to `FINALIZE_ACQUIRE_ATTEMPTS` times. The write re-checks the
-/// claim under a row lock, so a repeat is safe.
+/// again, up to `FINALIZE_ACQUIRE_ATTEMPTS` times. A lost connection gets a new
+/// one first. The write re-checks the claim under a row lock, so a repeat is
+/// safe.
 ///
 /// # Errors
 ///
@@ -6104,6 +6105,23 @@ pub async fn retry_policy_or_fail_task(
                     error = %error,
                     "session timeout while failing a task with an invalid retry policy; trying again"
                 );
+                attempt += 1;
+            }
+            Err(error)
+                if attempt < FINALIZE_ACQUIRE_ATTEMPTS
+                    && crate::pool::is_connection_lost(&error) =>
+            {
+                tracing::warn!(
+                    task_id = %task.id,
+                    attempt,
+                    error = %error,
+                    "lost the connection while failing a task with an invalid retry policy; \
+                     trying again on a new connection"
+                );
+                // Return the dead connection first. It holds a pool slot, and on a
+                // full pool the new acquire would wait for that slot.
+                drop(conn);
+                conn = crate::pool::acquire_with_retries(pool, FINALIZE_ACQUIRE_ATTEMPTS).await?;
                 attempt += 1;
             }
             outcome => return outcome,
@@ -15738,9 +15756,10 @@ async fn process_activity_task(
 ///
 /// Each acquire is bounded and retried, so a short pool incident does not
 /// drop the result. A session `statement_timeout` or `lock_timeout` rolls the
-/// write back, so the write runs again. Each finalization re-checks `RUNNING`
-/// under a row lock, so a repeat is safe. An offloader turns the repeats off;
-/// see `result_write_attempts`.
+/// write back, so the write runs again. A lost connection, for example after a
+/// `transaction_timeout`, gets a new connection first. Each finalization
+/// re-checks `RUNNING` under a row lock, so a repeat is safe. An offloader
+/// turns the repeats off; see `result_write_attempts`.
 ///
 /// `activity_result` is already cap-normalized: an oversized `Ok` is a
 /// non-retryable `Err`. So the cap passed to `handle_activity_result` is 0,
@@ -15785,6 +15804,20 @@ async fn write_activity_result(
                     error = %error,
                     "session timeout while writing the activity result; trying again"
                 );
+                attempt += 1;
+            }
+            Err(error) if attempt < attempts && crate::pool::is_connection_lost(&error) => {
+                tracing::warn!(
+                    task_id = %task.id,
+                    attempt,
+                    error = %error,
+                    "lost the connection while writing the activity result; \
+                     trying again on a new connection"
+                );
+                // Return the dead connection first. It holds a pool slot, and on a
+                // full pool the new acquire would wait for that slot.
+                drop(conn);
+                conn = crate::pool::acquire_with_retries(pool, FINALIZE_ACQUIRE_ATTEMPTS).await?;
                 attempt += 1;
             }
             outcome => return outcome,

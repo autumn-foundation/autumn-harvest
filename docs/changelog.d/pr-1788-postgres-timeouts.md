@@ -26,8 +26,9 @@ tries again.
 values. A zero value sends no `SET`. `transaction_timeout` is off by default,
 because it needs PostgreSQL 17. A part of a millisecond rounds up, and `validate` rejects a value above
 `i32::MAX` ms. `ShardedDbPool::from_dsns` builds `Maintenance` pools. The
-partition drain sets `SET LOCAL statement_timeout = 0`, because a timeout there
-discards a finished pass.
+partition drain sets `SET LOCAL statement_timeout = 0` for its census and its
+move. A large DEFAULT census can need longer than a role limit, and a timeout
+in the move discards a finished pass.
 
 **Heartbeat flush.** Each flush has its own bounded acquire. A failed flush
 keeps its payload for the next tick. The new `queue::record_heartbeat_for_claim`
@@ -39,7 +40,8 @@ short outage. A result write cancelled by a session `statement_timeout` or
 `lock_timeout` runs again, up to 10 times (`pool::is_session_timeout`). With a
 payload offloader there is one try, so no unreferenced blobs pile up. The
 `CircuitOpen` failure write and the failure write for a retry policy that does
-not parse use the same tries. An activity task that still fails to get a
+not parse use the same tries. A write that loses its connection, for example to
+`transaction_timeout`, runs again on a new connection (`pool::is_connection_lost`). An activity task that still fails to get a
 connection or hits a session timeout has its claim released, fenced on `attempt`
 and `worker_id`, because an activity with no deadline would otherwise stay
 `RUNNING`.

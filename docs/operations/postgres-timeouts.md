@@ -85,6 +85,10 @@ a millisecond rounds up to 1 ms.
 `transaction_timeout` needs PostgreSQL 17 or later. It is off by default. Do not
 set it on PostgreSQL 16 or earlier, because each new connection then fails.
 
+`transaction_timeout` and `idle_in_transaction_session_timeout` end the
+session, not only the statement. A result write that loses its connection
+runs again on a new connection. A task that still fails goes back to the queue.
+
 `ShardedDbPool::from_dsns`, which `harvest shard rebalance` uses, builds
 `Maintenance` pools.
 
@@ -139,7 +143,8 @@ SET lock_timeout = 0;
 ```
 
 The partition drain (`partition::drain_default`) switches `statement_timeout`
-off in its own transaction. A timeout there would discard a finished pass.
+off for its census and for its move transaction. The census scans the whole
+DEFAULT partition, and a timeout in the move would discard a finished pass.
 
 ## Heartbeat flushes
 

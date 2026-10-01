@@ -806,6 +806,39 @@ async fn a_claim_release_retries_after_a_non_timeout_error() {
     assert_eq!(state, "PENDING");
 }
 
+/// A timeout that ends the session is a transient error, and it needs a new
+/// connection. PostgreSQL 16 has no `transaction_timeout`, so this test uses
+/// `idle_in_transaction_session_timeout`, which ends the session the same way.
+#[tokio::test]
+async fn an_idle_transaction_timeout_is_a_lost_connection() {
+    let (url, _container) = setup_db().await;
+    let session = SessionTimeouts {
+        idle_in_transaction: Duration::from_millis(100),
+        ..SessionTimeouts::for_role(DbRole::Hot)
+    };
+    let pool = engine_pool(url, 1, DbRole::Hot, &timeouts(5_000, session)).expect("engine pool");
+    let mut conn = pool.get().await.expect("engine connection");
+
+    let outcome = conn
+        .transaction::<(), autumn_harvest::error::HarvestError, _>(async |conn| {
+            diesel::sql_query("SELECT 1")
+                .execute(conn)
+                .await
+                .map_err(autumn_harvest::error::database_error)?;
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            diesel::sql_query("SELECT 1")
+                .execute(conn)
+                .await
+                .map_err(autumn_harvest::error::database_error)?;
+            Ok(())
+        })
+        .await;
+    let err = outcome.expect_err("the server ends the idle transaction");
+    assert!(autumn_harvest::pool::is_connection_lost(&err), "{err:?}");
+    assert!(autumn_harvest::pool::is_transient_db_error(&err), "{err:?}");
+    assert!(!autumn_harvest::pool::is_session_timeout(&err), "{err:?}");
+}
+
 /// Insert a running workflow execution with a `WorkflowStarted` event.
 async fn seed_execution(conn: &mut AsyncPgConnection, queue: &str) -> ExecutionId {
     use autumn_harvest::models::NewWorkflowExecution;
@@ -943,6 +976,104 @@ async fn an_invalid_retry_policy_failure_retries_after_a_lock_timeout() {
     let err = outcome.expect_err("the policy does not parse");
     assert!(!autumn_harvest::pool::is_session_timeout(&err), "{err}");
     assert_eq!(task_state(&mut conn, task_id).await, "FAILED");
+}
+
+/// A write that loses its connection runs again on a new one. A trigger ends
+/// its own backend on the first update of this task row. A sequence counts the
+/// tries, because a sequence does not roll back.
+#[tokio::test]
+async fn an_invalid_retry_policy_failure_retries_after_a_lost_connection() {
+    use autumn_harvest::models::TaskQueueItem;
+    use autumn_harvest::schema::harvest_task_queue;
+    use diesel::{QueryDsl, SelectableHelper};
+
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let suffix = Uuid::new_v4().simple().to_string()[..12].to_owned();
+    let queue_name = format!("q-lc-{suffix}");
+    let exec_id = seed_execution(&mut conn, &queue_name).await;
+    let task_id = autumn_harvest::queue::enqueue(
+        &mut conn,
+        &autumn_harvest::queue::EnqueueParams::new(
+            &queue_name,
+            autumn_harvest::queue::TaskType::Activity,
+            serde_json::json!({}),
+        ),
+    )
+    .await
+    .expect("enqueue");
+    diesel::sql_query(
+        "UPDATE harvest_task_queue SET state = 'RUNNING', worker_id = 'w-1', attempt = 1, \
+         workflow_exec_id = $2, retry_policy = '{\"max_attempts\": \"many\"}'::jsonb \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("model the claim");
+    let task: TaskQueueItem = harvest_task_queue::table
+        .find(task_id)
+        .select(TaskQueueItem::as_select())
+        .first(&mut conn)
+        .await
+        .expect("load the task");
+
+    let seq = format!("harvest_test_1788_lc_seq_{suffix}");
+    let function = format!("harvest_test_1788_lc_{suffix}");
+    let trigger = format!("harvest_test_1788_lc_{suffix}");
+    for sql in [
+        format!("CREATE SEQUENCE {seq}"),
+        format!(
+            "CREATE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN \
+               IF NEW.id = '{task_id}'::uuid AND nextval('{seq}') = 1 THEN \
+                 PERFORM pg_terminate_backend(pg_backend_pid()); \
+                 PERFORM pg_sleep(5); \
+               END IF; \
+               RETURN NEW; \
+             END $$"
+        ),
+        format!(
+            "CREATE TRIGGER {trigger} BEFORE UPDATE ON harvest_task_queue \
+             FOR EACH ROW EXECUTE FUNCTION {function}()"
+        ),
+    ] {
+        diesel::sql_query(sql)
+            .execute(&mut conn)
+            .await
+            .expect("set up the trigger");
+    }
+
+    let pool = engine_pool(
+        url,
+        1,
+        DbRole::Hot,
+        &timeouts(5_000, SessionTimeouts::for_role(DbRole::Hot)),
+    )
+    .expect("engine pool");
+    let outcome = autumn_harvest::worker::retry_policy_or_fail_task(
+        &pool,
+        &task,
+        "w-1",
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+    )
+    .await;
+    let state = task_state(&mut conn, task_id).await;
+
+    for sql in [
+        format!("DROP TRIGGER {trigger} ON harvest_task_queue"),
+        format!("DROP FUNCTION {function}()"),
+        format!("DROP SEQUENCE {seq}"),
+    ] {
+        diesel::sql_query(sql)
+            .execute(&mut conn)
+            .await
+            .expect("drop the trigger");
+    }
+    let err = outcome.expect_err("the policy does not parse");
+    assert!(!autumn_harvest::pool::is_connection_lost(&err), "{err:?}");
+    assert_eq!(state, "FAILED");
 }
 
 async fn task_state(conn: &mut AsyncPgConnection, task_id: Uuid) -> String {

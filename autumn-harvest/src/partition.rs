@@ -4750,43 +4750,55 @@ async fn drain_default_bounded_inner(
     max_rows: usize,
     mut progress: Option<&mut (dyn FnMut() + Send)>,
 ) -> HarvestResult<usize> {
-    let width = match detect_layout(conn).await? {
-        EventLayout::Unpartitioned => return Ok(0),
-        EventLayout::Partitioned { cohort_width_secs } => cohort_width_secs,
-    };
-    let has_rows = scalar_bool(
-        conn,
-        &format!("SELECT EXISTS (SELECT 1 FROM {DEFAULT_PARTITION}) AS v"),
-    )
-    .await?;
-    if !has_rows {
-        return Ok(0);
-    }
+    // The reads before the lock run in their own transaction, so `SET LOCAL`
+    // can switch off a session `statement_timeout` (issue #1788). The census
+    // scans the whole DEFAULT partition. On a large backlog it can need longer
+    // than a role default, and a timeout would then stop every pass.
+    let census = Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
+        exec(conn, "SET LOCAL statement_timeout = 0").await?;
+        let width = match detect_layout(conn).await? {
+            EventLayout::Unpartitioned => return Ok(None),
+            EventLayout::Partitioned { cohort_width_secs } => cohort_width_secs,
+        };
+        let has_rows = scalar_bool(
+            conn,
+            &format!("SELECT EXISTS (SELECT 1 FROM {DEFAULT_PARTITION}) AS v"),
+        )
+        .await?;
+        if !has_rows {
+            return Ok(None);
+        }
 
-    // Review finding: the census below is unbounded by any statement
-    // timeout. It is a full scan of the DEFAULT partition, exactly the
-    // expensive case this whole function exists for. Nothing can tick
-    // between its rows, so a single tick before it starts is not enough
-    // on its own for a large backlog. Race it against a repeating timer,
-    // the same way the oversized-cohort move below does.
-    //
-    // Census BEFORE the lock. This `GROUP BY` scans every row in the DEFAULT
-    // partition, and `cohort` carries no index — on the large backlog a
-    // maintenance gap leaves, exactly the case this budget exists for, it is
-    // the most expensive thing the pass does. Run after the `DETACH` it was
-    // unbounded work under the parent's ACCESS EXCLUSIVE, so the row budget
-    // bounded only what was MOVED while the shard stayed stopped for the whole
-    // scan. Here it takes ACCESS SHARE and costs bystanders nothing.
-    let census = {
-        let query = diesel::sql_query(format!(
-            "SELECT cohort AS v, count(*)::bigint AS n
-               FROM {DEFAULT_PARTITION} GROUP BY 1 ORDER BY 1"
-        ))
-        .load::<CohortCountRow>(&mut *conn);
-        tokio::pin!(query);
-        await_with_heartbeat(query, &mut progress)
-            .await
-            .map_err(database_error)?
+        // Review finding: the census below is unbounded by any statement
+        // timeout. It is a full scan of the DEFAULT partition, exactly the
+        // expensive case this whole function exists for. Nothing can tick
+        // between its rows, so a single tick before it starts is not enough
+        // on its own for a large backlog. Race it against a repeating timer,
+        // the same way the oversized-cohort move below does.
+        //
+        // Census BEFORE the lock. This `GROUP BY` scans every row in the DEFAULT
+        // partition, and `cohort` carries no index — on the large backlog a
+        // maintenance gap leaves, exactly the case this budget exists for, it is
+        // the most expensive thing the pass does. Run after the `DETACH` it was
+        // unbounded work under the parent's ACCESS EXCLUSIVE, so the row budget
+        // bounded only what was MOVED while the shard stayed stopped for the whole
+        // scan. Here it takes ACCESS SHARE and costs bystanders nothing.
+        let census = {
+            let query = diesel::sql_query(format!(
+                "SELECT cohort AS v, count(*)::bigint AS n
+                   FROM {DEFAULT_PARTITION} GROUP BY 1 ORDER BY 1"
+            ))
+            .load::<CohortCountRow>(&mut *conn);
+            tokio::pin!(query);
+            await_with_heartbeat(query, &mut progress)
+                .await
+                .map_err(database_error)?
+        };
+        Ok(Some((width, census)))
+    }))
+    .await?;
+    let Some((width, census)) = census else {
+        return Ok(0);
     };
 
     // Take whole cohorts, oldest first, up to BOTH budgets — and always at
