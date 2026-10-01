@@ -4430,6 +4430,17 @@ async fn tick_one_workflow_schedule(
         {
             break;
         }
+        // Clone-class note: the concurrency-key resolution and the
+        // owner/runbook/severity merge below repeat verbatim in
+        // `drain_buffered_schedule_runs`. Apply any change to either
+        // block to both functions.
+        //
+        // Two instances only. Commit 6b3fb18c (issue #372, PR #550)
+        // introduced both copies together. Commit f138c3b0 (issue #811,
+        // PR #1196) later updated both copies together again. No
+        // missed-fix has occurred on either copy since. The merge bar
+        // (rule of three, or a missed-fix) is not met yet, so the
+        // duplication stays.
         let workflow_id = scheduled_workflow_id(schedule.id, wf_name, *original_slot);
         let exec_id = scheduled_fire_exec_id(wf_name, schedule.dag_name.is_some(), current_shard);
         let input = schedule
@@ -6278,6 +6289,12 @@ async fn drain_buffered_schedule_runs(
             }
 
             buffered.remove(0);
+            // Clone-class note: the concurrency-key resolution and the
+            // owner/runbook/severity merge below repeat verbatim in
+            // `tick_one_workflow_schedule`. Apply any change to either
+            // block to both functions. Two instances only, so the merge
+            // bar is not met yet. See the note in
+            // `tick_one_workflow_schedule`.
             let workflow_id = scheduled_workflow_id(schedule.id, wf_name, scheduled_for);
             let exec_id =
                 scheduled_fire_exec_id(wf_name, schedule.dag_name.is_some(), current_shard);
