@@ -1405,6 +1405,7 @@ pub const METRIC_SCANNER_TICK: &str = "harvest.scanner.tick";
 /// - `fail_open`: the lease query failed. This replica ran the pass anyway.
 ///
 /// The sum of the three running roles across the fleet is the scan load.
+/// The `role` label is [`METRIC_LABEL_ROLE`].
 pub const METRIC_SCANNER_PASS: &str = "harvest.scanner.pass";
 
 /// Counter: a `SignalReceived` event was durably delivered into a workflow's
@@ -1847,6 +1848,11 @@ pub const METRIC_LABEL_ACTION: &str = "action";
 /// Bounded by construction to the [`Scanner`](crate::scanner_health::Scanner)
 /// variants — a call site passes the enum's `as_str()`, never a free string.
 pub const METRIC_LABEL_SCANNER: &str = "scanner";
+/// Metric label: what a scanner tick did under election (issue #1795).
+///
+/// Bounded by construction to the
+/// [`ScannerRole`](crate::scanner_lease::ScannerRole) variants.
+pub const METRIC_LABEL_ROLE: &str = "role";
 /// `shard` label value for a control loop that is **not** per-shard (issue #797).
 ///
 /// The `retention` and `schedule` loops run once per process rather than once

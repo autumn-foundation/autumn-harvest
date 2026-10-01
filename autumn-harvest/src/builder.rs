@@ -4514,7 +4514,10 @@ impl WorkerConfig {
     /// Set the per-shard scanner election, cadence, and batch size (issue
     /// #1795). See [`WorkerConfig::scanner`].
     #[must_use]
-    pub fn with_scanner_config(mut self, scanner: crate::scanner_lease::ScannerConfig) -> Self {
+    pub const fn with_scanner_config(
+        mut self,
+        scanner: crate::scanner_lease::ScannerConfig,
+    ) -> Self {
         self.scanner = scanner;
         self
     }

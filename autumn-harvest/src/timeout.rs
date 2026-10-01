@@ -461,8 +461,11 @@ pub fn classify_workflow_timeout(
 
 /// Find all tasks that have exceeded their timeout limits.
 ///
-/// Runs all three timeout queries and returns the matched tasks along with
+/// Runs all four timeout queries and returns the matched tasks along with
 /// their timeout reason.
+///
+/// This scan has no bound. The spawned checker uses
+/// [`find_timed_out_tasks_batch`] instead (issue #1795).
 ///
 /// # Errors
 ///
@@ -494,7 +497,7 @@ pub use crate::scanner_lease::DEFAULT_TIMEOUT_SCAN_BATCH_SIZE;
 ///
 /// [`find_timed_out_tasks`] and [`find_timed_out_tasks_batch`] both read this
 /// list, so the two cannot disagree on a predicate.
-fn task_timeout_scans() -> [(TimeoutReason, &'static str); 4] {
+const fn task_timeout_scans() -> [(TimeoutReason, &'static str); 4] {
     [
         (TimeoutReason::Heartbeat, heartbeat_timeout_query()),
         (TimeoutReason::StartToClose, start_to_close_timeout_query()),
@@ -5173,6 +5176,10 @@ pub fn spawn_timeout_checker(
 /// shard label, so this is the only surface that can localize it.
 ///
 /// Pass `None` for a process-wide loop or a single-shard deployment.
+///
+/// This loop does not take part in election and does not jitter. Every
+/// caller runs every pass on a fixed cadence. For election, use
+/// [`spawn_coordinated_timeout_checker_for_shard`] (issue #1795).
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_timeout_checker_for_shard(
@@ -5211,6 +5218,14 @@ pub fn spawn_timeout_checker_for_shard(
 }
 
 /// [`spawn_timeout_checker_for_shard`] with scanner election (issue #1795).
+///
+/// With a holder in `coordination`, replicas that share a database elect
+/// one checker for `shard`. Only that checker runs the pass. The others
+/// stand by and take over within the lease TTL. `task_batch_size` bounds the
+/// task-timeout rows that one pass reads per reason. See
+/// [`crate::scanner_lease`].
+///
+/// The lease key is `shard`, or shard 0 when `shard` is `None`.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_coordinated_timeout_checker_for_shard(

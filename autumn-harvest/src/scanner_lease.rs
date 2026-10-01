@@ -369,7 +369,7 @@ mod db {
 mod tests {
     use super::*;
 
-    const BASE: Duration = Duration::from_millis(1000);
+    const BASE: Duration = Duration::from_secs(1);
 
     #[test]
     fn jitter_spans_the_band_and_keeps_its_mean() {
@@ -393,9 +393,9 @@ mod tests {
 
     #[test]
     fn bad_inputs_are_clamped_never_a_zero_or_wild_sleep() {
-        assert_eq!(clamp_jitter(f64::NAN), 0.0);
-        assert_eq!(clamp_jitter(-1.0), 0.0);
-        assert_eq!(clamp_jitter(5.0), MAX_SCANNER_JITTER);
+        assert!(clamp_jitter(f64::NAN).abs() < f64::EPSILON);
+        assert!(clamp_jitter(-1.0).abs() < f64::EPSILON);
+        assert!((clamp_jitter(5.0) - MAX_SCANNER_JITTER).abs() < f64::EPSILON);
         assert!(jittered_interval(BASE, 5.0, 0.0) >= Duration::from_millis(99));
         assert_eq!(
             jittered_interval(BASE, 0.2, 7.0),
