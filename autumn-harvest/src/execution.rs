@@ -9116,7 +9116,7 @@ struct WorkflowTypeNonTerminalSqlRow {
 /// (well under the < 2 s / 100k-execution budget). If a very large group's
 /// full-array materialisation ever becomes a concern, the drop-in fallback is a
 /// `LATERAL (SELECT ... ORDER BY started_at LIMIT n)` per group.
-const NON_TERMINAL_COUNTS_SQL: &str = r"
+const NON_TERMINAL_COUNTS_SQL_TEMPLATE: &str = r"
 SELECT
     workflow_name::TEXT AS workflow_name,
     COUNT(*)::BIGINT AS non_terminal_count,
@@ -9124,19 +9124,26 @@ SELECT
     -- [1:5] MUST stay in sync with REACHABILITY_SAMPLE_CAP (guarded by a unit test)
     (ARRAY_AGG(id ORDER BY started_at ASC, id ASC))[1:5] AS sample_execution_ids
 FROM harvest_workflow_executions
-WHERE state NOT IN (
-        'COMPLETED',
-        'FAILED',
-        'CANCELLED',
-        'TIMED_OUT',
-        'CONTINUED_AS_NEW',
-        'TERMINATED'
-      )
+WHERE state NOT IN ({states})
   AND ($1::TEXT IS NULL OR workflow_name = $1::TEXT)
   AND ($2::INT4 IS NULL OR shard_id = $2::INT4)
 GROUP BY workflow_name
 ORDER BY workflow_name
 ";
+
+static NON_TERMINAL_COUNTS_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    crate::erase::render_states(
+        NON_TERMINAL_COUNTS_SQL_TEMPLATE,
+        crate::erase::TERMINAL_STATES_WITHOUT_MIGRATED,
+    )
+});
+
+/// Returns the reachability query, rendered once.
+///
+/// `MIGRATED` stays outside the list, so a seal counts as active here.
+fn non_terminal_counts_sql() -> &'static str {
+    &NON_TERMINAL_COUNTS_SQL
+}
 
 /// Count non-terminal workflow executions grouped by `workflow_name` on one shard.
 ///
@@ -9166,7 +9173,7 @@ pub async fn non_terminal_counts_by_workflow_name(
     shard_id: Option<i32>,
     workflow_type: Option<&str>,
 ) -> HarvestResult<Vec<WorkflowTypeNonTerminalCount>> {
-    let rows = diesel::sql_query(NON_TERMINAL_COUNTS_SQL)
+    let rows = diesel::sql_query(non_terminal_counts_sql())
         .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(workflow_type)
         .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(shard_id)
         .load::<WorkflowTypeNonTerminalSqlRow>(conn)
@@ -9839,8 +9846,10 @@ pub async fn check_and_report_unfinished_handlers_batch(
 
 #[cfg(test)]
 mod non_terminal_sql_tests {
-    use super::{NON_TERMINAL_COUNTS_SQL, REACHABILITY_SAMPLE_CAP};
-    use crate::erase::is_terminal_state;
+    use super::{
+        NON_TERMINAL_COUNTS_SQL_TEMPLATE, REACHABILITY_SAMPLE_CAP, non_terminal_counts_sql,
+    };
+    use crate::erase::{TERMINAL_STATES_WITHOUT_MIGRATED, is_terminal_state};
 
     /// Diesel `sql_query` cannot interpolate a Rust const into the SQL string,
     /// so the per-shard sample slice is a hardcoded `[1:5]` literal. This guard
@@ -9849,40 +9858,35 @@ mod non_terminal_sql_tests {
     #[test]
     fn sql_sample_slice_matches_reachability_sample_cap() {
         assert!(
-            NON_TERMINAL_COUNTS_SQL.contains(&format!("[1:{REACHABILITY_SAMPLE_CAP}]")),
+            non_terminal_counts_sql().contains(&format!("[1:{REACHABILITY_SAMPLE_CAP}]")),
             "SQL sample-slice cap drifted from REACHABILITY_SAMPLE_CAP \
              ({REACHABILITY_SAMPLE_CAP}); the hardcoded [1:N] literal in \
-             NON_TERMINAL_COUNTS_SQL must equal it"
+             non_terminal_counts_sql must equal it"
         );
     }
 
-    /// The `NOT IN (...)` state list in `NON_TERMINAL_COUNTS_SQL` must be the
-    /// exact complement of `erase::is_terminal_state`. If a new terminal state is
-    /// added to `is_terminal_state`, this test fails until the SQL is updated,
-    /// preventing the reachability query from counting terminal runs as non-terminal
-    /// and blocking safe handler removal forever.
+    /// The `NOT IN (...)` list in `non_terminal_counts_sql` renders the terminal states
+    /// except the `MIGRATED` seal, which counts as active here.
+    ///
+    /// This test guards the rendering. A new terminal state fails
+    /// `erase::tests::states_without_migrated_equal_terminal_states_minus_migrated`.
     #[test]
     fn non_terminal_sql_excludes_exactly_terminal_states() {
-        let terminal_states = [
-            "COMPLETED",
-            "FAILED",
-            "CANCELLED",
-            "TIMED_OUT",
-            "CONTINUED_AS_NEW",
-            "TERMINATED",
-        ];
-        for state in &terminal_states {
+        assert!(!NON_TERMINAL_COUNTS_SQL_TEMPLATE.contains("'COMPLETED'"));
+        for state in TERMINAL_STATES_WITHOUT_MIGRATED {
             assert!(
                 is_terminal_state(state),
-                "State '{state}' is listed in NON_TERMINAL_COUNTS_SQL's NOT IN clause \
-                 but is_terminal_state returns false — update one of them to match"
+                "'{state}' is listed but is_terminal_state returns false"
             );
             assert!(
-                NON_TERMINAL_COUNTS_SQL.contains(state),
-                "is_terminal_state returns true for '{state}' but it is missing from \
-                 NON_TERMINAL_COUNTS_SQL's NOT IN clause — add it to keep the lists in sync"
+                non_terminal_counts_sql().contains(&format!("'{state}'")),
+                "is_terminal_state returns true for '{state}' but the query omits it"
             );
         }
+        assert!(
+            !non_terminal_counts_sql().contains("'MIGRATED'"),
+            "a seal counts as active in the reachability query"
+        );
         let candidate_non_terminal = ["RUNNING", "SUSPENDED", "PAUSED"];
         for state in &candidate_non_terminal {
             assert!(
@@ -9891,8 +9895,8 @@ mod non_terminal_sql_tests {
                  but is_terminal_state returned true — remove it from this test"
             );
             assert!(
-                !NON_TERMINAL_COUNTS_SQL.contains(&format!("'{state}'")),
-                "State '{state}' appears in the NOT IN clause of NON_TERMINAL_COUNTS_SQL \
+                !non_terminal_counts_sql().contains(&format!("'{state}'")),
+                "State '{state}' appears in the NOT IN clause of non_terminal_counts_sql \
                  but should be non-terminal — remove it from the exclusion list"
             );
         }

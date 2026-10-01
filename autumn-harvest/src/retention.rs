@@ -1701,6 +1701,24 @@ impl RetentionRuntime {
                                     tracing::warn!(shard = %shard, error = %err, "harvest execution-summary GC failed");
                                 }
                             }
+                            // Fires expire with their target's summary
+                            // (issue #1676).
+                            match purge_expired_trigger_fires(
+                                &mut conn,
+                                summary_age,
+                                config.batch_size,
+                                now,
+                            )
+                            .await
+                            {
+                                Ok(0) => {}
+                                Ok(n) => {
+                                    tracing::debug!(shard = %shard, deleted = n, "harvest completion-trigger fire GC");
+                                }
+                                Err(err) => {
+                                    tracing::warn!(shard = %shard, error = %err, "harvest completion-trigger fire GC failed");
+                                }
+                            }
                         }
                     }
                 }
@@ -2175,98 +2193,62 @@ async fn run_shard_tick(
         let lease_id_inner = lease_id.clone();
         let names_inner = override_cut_names.clone();
         let cuts_inner = override_cuts.clone();
-        let candidates = Box::pin(conn.transaction::<Vec<CandidateExecution>, HarvestError, _>(async |conn| {
-            // Push each row's exact per-type effective cutoff into the
-            // predicate (issue #737, PR #990 review): the correlated
-            // `unnest` subquery resolves the override cutoff for this row's
-            // workflow_name, falling through COALESCE to the global cutoff
-            // ($3) or, when there is no global age, to `'-infinity'` — so a
-            // non-overridden never-delete type is never selected. Only
-            // genuinely-eligible rows are returned, so a long-retained
-            // type's not-yet-eligible backlog can neither consume the batch
-            // budget nor starve newer expired rows of a shorter policy.
-            //
-            // Two query-string variants keep the bind numbering unambiguous:
-            // with a global age the fallback is bound as $3; without one it
-            // is the `'-infinity'` literal and the cursor/limit binds shift
-            // down by one.
-            let sql = if global_fallback.is_some() {
-                "SELECT id, workflow_name, workflow_id, state, completed_at, context_headers, legal_hold_set_at, legal_hold_until, execution_timeout, deadline_at, parent_id, queue_name
-                 FROM harvest_workflow_executions
-                 WHERE state IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW','TERMINATED')
-                   AND completed_at IS NOT NULL
-                   AND (sticky_worker_id IS NULL OR sticky_worker_id NOT LIKE 'retention-lease-%')
-                   AND completed_at < COALESCE(
-                       (SELECT ov.cut
-                          FROM unnest($1::text[], $2::timestamptz[]) AS ov(nm, cut)
-                         WHERE ov.nm = harvest_workflow_executions.workflow_name),
-                       $3)
-                   AND (
-                       $4 IS NULL
-                       OR completed_at > $4
-                       OR (completed_at = $4 AND id > $5)
-                   )
-                 ORDER BY completed_at ASC, id ASC
-                 LIMIT $6
-                 FOR UPDATE SKIP LOCKED"
-            } else {
-                "SELECT id, workflow_name, workflow_id, state, completed_at, context_headers, legal_hold_set_at, legal_hold_until, execution_timeout, deadline_at, parent_id, queue_name
-                 FROM harvest_workflow_executions
-                 WHERE state IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW','TERMINATED')
-                   AND completed_at IS NOT NULL
-                   AND (sticky_worker_id IS NULL OR sticky_worker_id NOT LIKE 'retention-lease-%')
-                   AND completed_at < COALESCE(
-                       (SELECT ov.cut
-                          FROM unnest($1::text[], $2::timestamptz[]) AS ov(nm, cut)
-                         WHERE ov.nm = harvest_workflow_executions.workflow_name),
-                       '-infinity'::timestamptz)
-                   AND (
-                       $3 IS NULL
-                       OR completed_at > $3
-                       OR (completed_at = $3 AND id > $4)
-                   )
-                 ORDER BY completed_at ASC, id ASC
-                 LIMIT $5
-                 FOR UPDATE SKIP LOCKED"
-            };
-            // Bind order maps to $1..$N regardless of textual position. The
-            // override arrays ($1/$2) are always bound; $3 is the global
-            // fallback only in the global-age variant.
-            let query = diesel::sql_query(sql)
-                .bind::<Array<Text>, _>(names_inner)
-                .bind::<Array<Timestamptz>, _>(cuts_inner);
-            let rows = if let Some(fallback) = global_fallback {
-                query
-                    .bind::<Timestamptz, _>(fallback)
-                    .bind::<Nullable<Timestamptz>, _>(cursor.map(|it| it.completed_at))
-                    .bind::<Nullable<SqlUuid>, _>(cursor.map(|it| it.id))
-                    .bind::<BigInt, _>(i64::try_from(remaining).unwrap_or(i64::MAX))
-                    .load::<CandidateExecution>(conn)
-                    .await
-            } else {
-                query
-                    .bind::<Nullable<Timestamptz>, _>(cursor.map(|it| it.completed_at))
-                    .bind::<Nullable<SqlUuid>, _>(cursor.map(|it| it.id))
-                    .bind::<BigInt, _>(i64::try_from(remaining).unwrap_or(i64::MAX))
-                    .load::<CandidateExecution>(conn)
-                    .await
-            }
-            .map_err(database_error)?;
-
-            if !rows.is_empty() {
-                let ids: Vec<uuid::Uuid> = rows.iter().map(|r| r.id).collect();
-                diesel::update(
-                    harvest_workflow_executions::table
-                        .filter(harvest_workflow_executions::id.eq_any(ids)),
-                )
-                .set(harvest_workflow_executions::sticky_worker_id.eq(Some(lease_id_inner)))
-                .execute(conn)
-                .await
+        let candidates = Box::pin(
+            conn.transaction::<Vec<CandidateExecution>, HarvestError, _>(async |conn| {
+                // Push each row's exact per-type effective cutoff into the
+                // predicate (issue #737, PR #990 review): the correlated
+                // `unnest` subquery resolves the override cutoff for this row's
+                // workflow_name, falling through COALESCE to the global cutoff
+                // ($3) or, when there is no global age, to `'-infinity'` — so a
+                // non-overridden never-delete type is never selected. Only
+                // genuinely-eligible rows are returned, so a long-retained
+                // type's not-yet-eligible backlog can neither consume the batch
+                // budget nor starve newer expired rows of a shorter policy.
+                //
+                // Two query-string variants keep the bind numbering unambiguous:
+                // with a global age the fallback is bound as $3; without one it
+                // is the `'-infinity'` literal and the cursor/limit binds shift
+                // down by one.
+                let sql = candidate_scan_sql(global_fallback.is_some());
+                // Bind order maps to $1..$N regardless of textual position. The
+                // override arrays ($1/$2) are always bound; $3 is the global
+                // fallback only in the global-age variant.
+                let query = diesel::sql_query(sql)
+                    .bind::<Array<Text>, _>(names_inner)
+                    .bind::<Array<Timestamptz>, _>(cuts_inner);
+                let rows = if let Some(fallback) = global_fallback {
+                    query
+                        .bind::<Timestamptz, _>(fallback)
+                        .bind::<Nullable<Timestamptz>, _>(cursor.map(|it| it.completed_at))
+                        .bind::<Nullable<SqlUuid>, _>(cursor.map(|it| it.id))
+                        .bind::<BigInt, _>(i64::try_from(remaining).unwrap_or(i64::MAX))
+                        .load::<CandidateExecution>(conn)
+                        .await
+                } else {
+                    query
+                        .bind::<Nullable<Timestamptz>, _>(cursor.map(|it| it.completed_at))
+                        .bind::<Nullable<SqlUuid>, _>(cursor.map(|it| it.id))
+                        .bind::<BigInt, _>(i64::try_from(remaining).unwrap_or(i64::MAX))
+                        .load::<CandidateExecution>(conn)
+                        .await
+                }
                 .map_err(database_error)?;
-            }
 
-            Ok(rows)
-        }))
+                if !rows.is_empty() {
+                    let ids: Vec<uuid::Uuid> = rows.iter().map(|r| r.id).collect();
+                    diesel::update(
+                        harvest_workflow_executions::table
+                            .filter(harvest_workflow_executions::id.eq_any(ids)),
+                    )
+                    .set(harvest_workflow_executions::sticky_worker_id.eq(Some(lease_id_inner)))
+                    .execute(conn)
+                    .await
+                    .map_err(database_error)?;
+                }
+
+                Ok(rows)
+            }),
+        )
         .await?;
 
         // Release the checked-out connection immediately back to the pool
@@ -2774,17 +2756,115 @@ enum CandidateDeleteOutcome {
 
 /// The execution states the retention candidate scan selects.
 ///
-/// The candidate SQL lists the same states. `MIGRATED` is absent on purpose:
+/// The candidate SQL renders this list. `MIGRATED` is absent on purpose:
 /// a sealed source row carries the forwarding pointer.
 #[cfg(feature = "db")]
-const RETENTION_CANDIDATE_STATES: &[&str] = &[
-    "COMPLETED",
-    "FAILED",
-    "CANCELLED",
-    "TIMED_OUT",
-    "CONTINUED_AS_NEW",
-    "TERMINATED",
-];
+const RETENTION_CANDIDATE_STATES: &[&str] = crate::erase::TERMINAL_STATES_WITHOUT_MIGRATED;
+
+/// Candidate-scan template when a global age fallback is bound as `$3`.
+#[cfg(feature = "db")]
+const CANDIDATE_SCAN_GLOBAL_TEMPLATE: &str = r"SELECT id, workflow_name, workflow_id, state, completed_at, context_headers, legal_hold_set_at, legal_hold_until, execution_timeout, deadline_at, parent_id, queue_name
+                 FROM harvest_workflow_executions
+                 WHERE state IN ({states})
+                   AND completed_at IS NOT NULL
+                   AND (sticky_worker_id IS NULL OR sticky_worker_id NOT LIKE 'retention-lease-%')
+                   AND completed_at < COALESCE(
+                       (SELECT ov.cut
+                          FROM unnest($1::text[], $2::timestamptz[]) AS ov(nm, cut)
+                         WHERE ov.nm = harvest_workflow_executions.workflow_name),
+                       $3)
+                   AND (
+                       $4 IS NULL
+                       OR completed_at > $4
+                       OR (completed_at = $4 AND id > $5)
+                   )
+                 ORDER BY completed_at ASC, id ASC
+                 LIMIT $6
+                 FOR UPDATE SKIP LOCKED";
+
+/// Candidate-scan template when no global age is set; the fallback is `-infinity`.
+#[cfg(feature = "db")]
+const CANDIDATE_SCAN_NO_GLOBAL_TEMPLATE: &str = r"SELECT id, workflow_name, workflow_id, state, completed_at, context_headers, legal_hold_set_at, legal_hold_until, execution_timeout, deadline_at, parent_id, queue_name
+                 FROM harvest_workflow_executions
+                 WHERE state IN ({states})
+                   AND completed_at IS NOT NULL
+                   AND (sticky_worker_id IS NULL OR sticky_worker_id NOT LIKE 'retention-lease-%')
+                   AND completed_at < COALESCE(
+                       (SELECT ov.cut
+                          FROM unnest($1::text[], $2::timestamptz[]) AS ov(nm, cut)
+                         WHERE ov.nm = harvest_workflow_executions.workflow_name),
+                       '-infinity'::timestamptz)
+                   AND (
+                       $3 IS NULL
+                       OR completed_at > $3
+                       OR (completed_at = $3 AND id > $4)
+                   )
+                 ORDER BY completed_at ASC, id ASC
+                 LIMIT $5
+                 FOR UPDATE SKIP LOCKED";
+
+#[cfg(feature = "db")]
+static CANDIDATE_SCAN_GLOBAL_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    crate::erase::render_states(CANDIDATE_SCAN_GLOBAL_TEMPLATE, RETENTION_CANDIDATE_STATES)
+});
+
+#[cfg(feature = "db")]
+static CANDIDATE_SCAN_NO_GLOBAL_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    crate::erase::render_states(
+        CANDIDATE_SCAN_NO_GLOBAL_TEMPLATE,
+        RETENTION_CANDIDATE_STATES,
+    )
+});
+
+/// Returns the candidate-scan query, rendered once from [`RETENTION_CANDIDATE_STATES`].
+#[cfg(feature = "db")]
+fn candidate_scan_sql(has_global_age: bool) -> &'static str {
+    if has_global_age {
+        &CANDIDATE_SCAN_GLOBAL_SQL
+    } else {
+        &CANDIDATE_SCAN_NO_GLOBAL_SQL
+    }
+}
+
+#[cfg(feature = "db")]
+static ACTIVE_CHILD_COUNT_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    crate::erase::render_states(
+        "SELECT COUNT(*) AS count
+         FROM harvest_workflow_executions
+         WHERE parent_id = $1
+           AND state NOT IN ({states})",
+        RETENTION_CANDIDATE_STATES,
+    )
+});
+
+/// Returns the live-child count query. `MIGRATED` stays outside the list, so a seal blocks the parent.
+#[cfg(feature = "db")]
+fn active_child_count_sql() -> &'static str {
+    &ACTIVE_CHILD_COUNT_SQL
+}
+
+#[cfg(feature = "db")]
+static CHAIN_LINK_COUNT_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    crate::erase::render_states(
+        "SELECT COUNT(*) AS count
+         FROM harvest_workflow_executions
+         WHERE workflow_name = $1
+           AND workflow_id = $2
+           AND id <> $3
+           AND (
+                state NOT IN ({states})
+               OR completed_at IS NULL
+               OR completed_at >= $4
+           )",
+        crate::erase::TERMINAL_STATES,
+    )
+});
+
+/// Returns the chain-link count query. It treats every terminal state, `MIGRATED` included, as settled.
+#[cfg(feature = "db")]
+fn chain_link_count_sql() -> &'static str {
+    &CHAIN_LINK_COUNT_SQL
+}
 
 /// The two legal-hold timestamp columns `(legal_hold_set_at, legal_hold_until)`.
 #[cfg(feature = "db")]
@@ -3286,6 +3366,73 @@ pub(crate) async fn purge_expired_summaries(
     Ok(counts)
 }
 
+/// Delete completion-trigger fire rows older than the summary horizon (issue
+/// #1676). Returns the number of rows deleted.
+///
+/// `backup verify` proves a delivered fire by finding its target in
+/// `harvest_execution_summaries`. That row expires at `summary_age`. An old
+/// fire row with no summary makes verify use a timestamp guess. The guess can
+/// report a false loss. Deleting the fire row at the same horizon removes it
+/// from the verify scan.
+///
+/// The engine writes the fire row before its target completes. So `fired_at`
+/// is normally not later than the target's `completed_at`, and the fire
+/// expires no later than the target's summary. Clock skew between shards can
+/// keep a fire a little longer. That error keeps data and never loses it.
+///
+/// A fire stays in two cases. First, its outbox row still exists: the relay
+/// has not delivered it. Second, its source execution row still exists: the
+/// fire row prevents a second fire for that run.
+///
+/// Shard-local: fires live on the source execution's shard.
+#[cfg(feature = "db")]
+pub(crate) async fn purge_expired_trigger_fires(
+    conn: &mut diesel_async::AsyncPgConnection,
+    summary_age: Duration,
+    batch_size: usize,
+    now: DateTime<Utc>,
+) -> HarvestResult<u64> {
+    // An unrepresentable age deletes nothing, like `purge_expired_summaries`.
+    let Ok(chrono_age) = chrono::Duration::from_std(summary_age) else {
+        return Ok(0);
+    };
+    let cutoff = now - chrono_age;
+    let batch = i64::try_from(batch_size).unwrap_or(i64::MAX).max(1);
+
+    let mut total: u64 = 0;
+    loop {
+        let n = diesel::sql_query(
+            "DELETE FROM harvest_completion_trigger_fires
+             WHERE (source_exec_id, trigger_id) IN (
+                 SELECT f.source_exec_id, f.trigger_id
+                 FROM harvest_completion_trigger_fires f
+                 WHERE f.fired_at < $1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM harvest_completion_trigger_outbox o
+                       WHERE o.source_exec_id = f.source_exec_id
+                         AND o.trigger_id = f.trigger_id)
+                   AND NOT EXISTS (
+                       SELECT 1 FROM harvest_workflow_executions e
+                       WHERE e.id = f.source_exec_id)
+                 ORDER BY f.fired_at ASC, f.source_exec_id ASC, f.trigger_id ASC
+                 LIMIT $2
+             )",
+        )
+        .bind::<Timestamptz, _>(cutoff)
+        .bind::<BigInt, _>(batch)
+        .execute(conn)
+        .await
+        .map_err(database_error)?;
+        total += n as u64;
+        // A short or empty batch ends the loop. An empty batch must end it
+        // even when `batch` is 1, or the loop never stops.
+        if n == 0 || i64::try_from(n).unwrap_or(i64::MAX) < batch {
+            break;
+        }
+    }
+    Ok(total)
+}
+
 /// Filter set for the read-only execution-summary list query (issue #752).
 ///
 /// Mirrors the `GET /workflows` filter vocabulary against the summary tier:
@@ -3446,17 +3593,12 @@ async fn should_skip_candidate(
     candidate: &CandidateExecution,
     cutoff: DateTime<Utc>,
 ) -> HarvestResult<bool> {
-    let active_parent_ref_count = diesel::sql_query(
-        "SELECT COUNT(*) AS count
-         FROM harvest_workflow_executions
-         WHERE parent_id = $1
-           AND state NOT IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW','TERMINATED')",
-    )
-    .bind::<SqlUuid, _>(candidate.id)
-    .get_result::<CountRow>(conn)
-    .await
-    .map_err(database_error)?
-    .count;
+    let active_parent_ref_count = diesel::sql_query(active_child_count_sql())
+        .bind::<SqlUuid, _>(candidate.id)
+        .get_result::<CountRow>(conn)
+        .await
+        .map_err(database_error)?
+        .count;
 
     if active_parent_ref_count > 0 {
         return Ok(true);
@@ -3495,26 +3637,15 @@ async fn should_skip_candidate(
         return Ok(true);
     }
 
-    let chain_link_count = diesel::sql_query(
-        "SELECT COUNT(*) AS count
-         FROM harvest_workflow_executions
-         WHERE workflow_name = $1
-           AND workflow_id = $2
-           AND id <> $3
-           AND (
-                state NOT IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW','TERMINATED','MIGRATED')
-               OR completed_at IS NULL
-               OR completed_at >= $4
-           )",
-    )
-    .bind::<Text, _>(&candidate.workflow_name)
-    .bind::<Text, _>(&candidate.workflow_id)
-    .bind::<SqlUuid, _>(candidate.id)
-    .bind::<Timestamptz, _>(cutoff)
-    .get_result::<CountRow>(conn)
-    .await
-    .map_err(database_error)?
-    .count;
+    let chain_link_count = diesel::sql_query(chain_link_count_sql())
+        .bind::<Text, _>(&candidate.workflow_name)
+        .bind::<Text, _>(&candidate.workflow_id)
+        .bind::<SqlUuid, _>(candidate.id)
+        .bind::<Timestamptz, _>(cutoff)
+        .get_result::<CountRow>(conn)
+        .await
+        .map_err(database_error)?
+        .count;
 
     Ok(chain_link_count > 0)
 }
@@ -3818,6 +3949,59 @@ mod tests {
     use super::*;
     use crate::types::ShardId;
     use std::time::Duration;
+
+    #[cfg(feature = "db")]
+    fn count_of(sql: &str, needle: &str) -> usize {
+        sql.matches(needle).count()
+    }
+
+    #[test]
+    #[cfg(feature = "db")]
+    fn candidate_scan_sql_lists_exactly_the_candidate_states() {
+        for global in [true, false] {
+            let sql = candidate_scan_sql(global);
+            assert!(!sql.contains("{states}"), "unrendered placeholder");
+            assert!(sql.contains("state IN ("), "template lost its IN clause");
+            for state in RETENTION_CANDIDATE_STATES {
+                assert_eq!(count_of(sql, &format!("'{state}'")), 1, "{state}");
+            }
+            assert!(!sql.contains("'MIGRATED'"), "seal must stay unpurgeable");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "db")]
+    fn active_child_count_sql_keeps_the_candidate_states() {
+        let sql = active_child_count_sql();
+        assert!(sql.contains("NOT IN"));
+        for state in RETENTION_CANDIDATE_STATES {
+            assert!(sql.contains(&format!("'{state}'")), "{state}");
+        }
+        assert!(!sql.contains("'MIGRATED'"));
+    }
+
+    #[test]
+    #[cfg(feature = "db")]
+    fn chain_link_count_sql_lists_every_terminal_state() {
+        let sql = chain_link_count_sql();
+        for state in crate::erase::TERMINAL_STATES {
+            assert_eq!(count_of(sql, &format!("'{state}'")), 1, "{state}");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "db")]
+    fn templates_hold_no_hand_copied_state() {
+        for template in [
+            CANDIDATE_SCAN_GLOBAL_TEMPLATE,
+            CANDIDATE_SCAN_NO_GLOBAL_TEMPLATE,
+        ] {
+            assert!(
+                !template.contains("'COMPLETED'"),
+                "state literal in template"
+            );
+        }
+    }
 
     #[test]
     fn test_retention_config_validation() {

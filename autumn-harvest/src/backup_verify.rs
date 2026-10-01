@@ -1066,14 +1066,19 @@ fn route_trigger_fires(
 /// loss.
 ///
 /// `harvest_execution_summaries` (checked by the caller first) closes
-/// this -- but only within its OWN retention horizon.
-/// `retention::gc_execution_summaries` hard-deletes a non-migration-target
-/// summary once it ages past `summary_age`, while
-/// `harvest_completion_trigger_fires` has no cleanup path at all. So this
-/// gap is not just "summaries disabled": it recurs for every fire once it
-/// outlives its target's summary, even with summaries enabled. Closing it
-/// unconditionally needs a real durable restore-point marker, the exact
-/// durable-marker work issue #1401 explicitly chose not to require.
+/// this, but only within its own retention horizon.
+/// `retention::purge_expired_summaries` deletes a non-migration-target
+/// summary once it ages past `summary_age`.
+/// `retention::purge_expired_trigger_fires` deletes the fire row at the
+/// same horizon (issue #1676). A fire never outlives its target's summary,
+/// so this scan does not see it.
+///
+/// The gap remains when summaries are disabled. No summary then proves a
+/// delivered fire, and no fire row is deleted. With unbounded summaries,
+/// the summary check always wins, but fire rows also stay.
+///
+/// A fire also stays while its source execution row exists. That row can
+/// outlive the summary when `summary_age` is not above the history horizon.
 #[cfg(all(feature = "db", feature = "testing"))]
 #[must_use]
 fn absence_is_decisive_loss(
@@ -3065,8 +3070,9 @@ mod probes {
     }
 
     /// Cap on fires [`adjudicate_trigger_fires`] adjudicates per round trip
-    /// (issue #1401, Codex follow-up x2). `harvest_completion_trigger_fires`
-    /// has no cleanup path, and the preceding scan admits up to
+    /// (issue #1401, Codex follow-up x2). With summaries disabled or
+    /// unbounded, `harvest_completion_trigger_fires` has no cleanup.
+    /// The preceding scan admits up to
     /// [`MAX_TRIGGER_FIRE_SCAN_PAGES`] pages. A shard whose fires are ALL
     /// confirmed-delivered can put every one of them in a single batch.
     /// Unbounded, a 255-byte-name fleet at that scale turns one `UNNEST`
@@ -3670,8 +3676,9 @@ mod probes {
     ///
     /// Chunked at [`WORKFLOW_KEY_LOOKUP_CHUNK`] fires per round trip, not
     /// per-fire and not as one whole-shard batch (issue #1401, Codex
-    /// follow-up x2). `harvest_completion_trigger_fires` has no cleanup
-    /// path, and a busy fleet's confirmed-delivered fire count can reach
+    /// follow-up x2). With summaries disabled or unbounded,
+    /// `harvest_completion_trigger_fires` has no cleanup.
+    /// A busy fleet's confirmed-delivered fire count can reach
     /// into the hundreds of thousands. One query per fire, plus a second
     /// for every absent target, would make a routine restore drill issue
     /// up to two round trips per row. A single whole-shard batch, at the
