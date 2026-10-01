@@ -451,8 +451,12 @@ fn prose_says_the_index_is_built_lazily() {
             "{rel}: the index description must cite issue #1667"
         );
         assert!(
-            contains_collapsed(&text, "CONCURRENTLY") || contains_collapsed(&text, "built lazily"),
+            contains_collapsed(&text, "CONCURRENTLY"),
             "{rel}: the index description must say it is built lazily"
+        );
+        assert!(
+            !contains_collapsed(&text, "every audit insert pays its maintenance cost"),
+            "{rel}: the retracted always-on cost claim must not return"
         );
     }
 }

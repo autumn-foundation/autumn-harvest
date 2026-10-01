@@ -1117,7 +1117,8 @@ pub const UNEXPORTED_INDEX_LOCK_KEY: i64 = 0x6175_6469_745f_6978;
 /// dropping each other's build. A caller that loses the race returns at once.
 /// The claim scan is correct without the index, only slower.
 ///
-/// The connection must not be inside a transaction.
+/// The connection must not be inside a transaction. On `Err` the caller must
+/// drop the connection: the advisory lock may still be held.
 ///
 /// # Errors
 /// Returns `HarvestError` on a database failure.
@@ -1146,13 +1147,13 @@ pub async fn ensure_unexported_index(
     }
     let built = build_unexported_index(conn).await;
     // The lock belongs to the session, and the pool reuses the session.
-    if let Err(error) = diesel::sql_query("SELECT pg_advisory_unlock($1)")
+    // A failed unlock leaves the lock on a live session. The caller must drop
+    // the connection, so this error takes precedence over the build result.
+    diesel::sql_query("SELECT pg_advisory_unlock($1)")
         .bind::<diesel::sql_types::BigInt, _>(UNEXPORTED_INDEX_LOCK_KEY)
         .execute(conn)
         .await
-    {
-        tracing::warn!(%error, "[audit_export] could not release the index build lock");
-    }
+        .map_err(crate::error::database_error)?;
     built
 }
 
@@ -1197,14 +1198,113 @@ async fn build_unexported_index(
         }
         None => {}
     }
-    diesel::sql_query(
+    tracing::info!("[audit_export] building harvest_audit_log_unexported_idx (issue #1667)");
+    // A pool or role timeout shorter than the build would fail it on every try.
+    diesel::sql_query("SET statement_timeout = 0")
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    let built = diesel::sql_query(
         "CREATE INDEX CONCURRENTLY IF NOT EXISTS harvest_audit_log_unexported_idx \
          ON harvest_audit_log (occurred_at, id) WHERE export_seq IS NULL",
     )
     .execute(conn)
     .await
-    .map_err(crate::error::database_error)?;
+    .map_err(crate::error::database_error);
+    let reset = diesel::sql_query("RESET statement_timeout")
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error);
+    built?;
+    reset?;
     Ok(())
+}
+
+/// Earliest time each shard may try another background index build.
+#[cfg(feature = "db")]
+static INDEX_BUILD_GATE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<i32, std::time::Instant>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Wait after a failed background build before the next attempt.
+#[cfg(feature = "db")]
+const INDEX_BUILD_RETRY: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Claim the right to start a build for this shard. Marks it in flight.
+#[cfg(feature = "db")]
+fn index_build_due(shard_id: i32) -> bool {
+    let mut gate = INDEX_BUILD_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let now = std::time::Instant::now();
+    if gate
+        .get(&shard_id)
+        .is_some_and(|not_before| now < *not_before)
+    {
+        return false;
+    }
+    // A build can outlive the retry wait. The advisory lock then skips the
+    // duplicate.
+    gate.insert(shard_id, now + INDEX_BUILD_RETRY);
+    true
+}
+
+#[cfg(feature = "db")]
+fn index_build_finished(shard_id: i32, succeeded: bool) {
+    let mut gate = INDEX_BUILD_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if succeeded {
+        gate.remove(&shard_id);
+    }
+}
+
+/// Start the index build in a detached task, off the export tick (issue #1667).
+///
+/// The build can take minutes on a large table. It must not delay a claim,
+/// the lag gauge or the lease. The task uses its own pooled connection. A
+/// failure drops that connection and waits [`INDEX_BUILD_RETRY`]. Export is
+/// correct without the index, only slower.
+#[cfg(feature = "db")]
+async fn spawn_unexported_index_build_if_due(
+    pool: &crate::worker::DbPool,
+    conn: &mut diesel_async::AsyncPgConnection,
+    shard_id: i32,
+) {
+    if !index_build_due(shard_id) {
+        return;
+    }
+    match unexported_index_valid(conn).await {
+        Ok(Some(true)) => {
+            index_build_finished(shard_id, true);
+            return;
+        }
+        Ok(_) => {}
+        Err(error) => {
+            index_build_finished(shard_id, false);
+            tracing::warn!(shard = shard_id, %error, "[audit_export] could not inspect the claim-scan index");
+            return;
+        }
+    }
+    let pool = pool.clone();
+    tokio::spawn(async move {
+        let Ok(mut build_conn) = pool.get().await else {
+            index_build_finished(shard_id, false);
+            return;
+        };
+        match ensure_unexported_index(&mut build_conn).await {
+            Ok(()) => index_build_finished(shard_id, true),
+            Err(error) => {
+                tracing::warn!(
+                    shard = shard_id,
+                    %error,
+                    "[audit_export] could not build the claim-scan index; export continues without it"
+                );
+                index_build_finished(shard_id, false);
+                drop(deadpool::managed::Object::take(build_conn));
+            }
+        }
+    });
 }
 
 /// Run [`ensure_unexported_index`] without failing the tick.
@@ -2928,6 +3028,7 @@ async fn export_once_via_pool(
     else {
         return Ok(0);
     };
+    spawn_unexported_index_build_if_due(pool, &mut conn, shard_id).await;
     // Raced against `cancel` (Codex review on PR #1520, follow-up P2, fifth
     // round). `claim_shard`'s locked read can wait indefinitely behind
     // another session holding the cursor row. A bare await here would then
@@ -2938,7 +3039,6 @@ async fn export_once_via_pool(
     // the same locked row from scratch.
     let claim = tokio::select! {
         result = async {
-            ensure_unexported_index_best_effort(&mut conn, shard_id).await;
             ensure_cursor_row(&mut conn, shard_id).await?;
             let now = Utc::now();
             claim_shard(&mut conn, shard_id, config.batch_size, config.lease, now).await
