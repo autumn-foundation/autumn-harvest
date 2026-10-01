@@ -10,10 +10,9 @@
 //! This module is the opt-in *act* half of issue #531 (slot-utilization
 //! gauges, the *observe* half): a [`SlotTuner`] resizes a worker's live
 //! dispatch semaphore within an operator-configured `[min_slots, max_slots]`
-//! band, driven only by in-process signals the worker already owns — slot
-//! utilization, worker DB-pool acquisition pressure, and recent
-//! claim-to-dispatch permit-wait latency. No new external dependency, no
-//! `execution.id` sampling.
+//! band. Only in-process signals the worker already owns drive it: slot
+//! utilization, worker DB-pool acquisition pressure, and recent dispatch-wait
+//! latency. No new external dependency, no `execution.id` sampling.
 //!
 //! This module is pure / no-DB except for [`TunedSlotRuntime`] and
 //! [`spawn_slot_tuner_loop`], which operate on an in-memory `Semaphore` and a
@@ -108,12 +107,13 @@ pub struct SlotObservations {
     pub in_use: usize,
     /// Worker DB-pool saturation, when available.
     pub pool: Option<PoolPressure>,
-    /// The longest claim-to-dispatch permit-wait observed since the previous
-    /// tick, when any task was dispatched.
+    /// The longest dispatch wait observed since the previous tick, when any
+    /// task was dispatched.
     ///
-    /// The wait runs from task eligibility, so it includes the queue wait
-    /// (issue #1787). A worker claims only against a free permit. A backlog
-    /// therefore waits in the queue, not at the permit.
+    /// A dispatch wait is the wait for a local permit. A worker claims only
+    /// against a free permit (issue #1787), so a backlog waits in the queue.
+    /// When the claim gate held a kind back, its next dispatch wait therefore
+    /// also includes the queue wait, from task eligibility to the claim.
     pub max_permit_wait: Option<Duration>,
 }
 

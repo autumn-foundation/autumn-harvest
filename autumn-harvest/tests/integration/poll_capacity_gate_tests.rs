@@ -3,11 +3,14 @@
 //!
 //! The default Postgres poll path claims a task only when the worker has a
 //! free local permit for that task kind. A claim stamps `started_at`, and the
-//! start-to-close clock runs from `started_at`. An over-claimed task therefore
-//! spends its timeout budget in the local permit queue. A peer cannot take it.
+//! start-to-close clock runs from `started_at`. Without the gate, an
+//! over-claimed task spends its timeout budget in the local permit queue, and
+//! a peer cannot take it. These tests pin that the gate prevents this.
 //!
 //! * `queued_activity_never_times_out_before_its_handler_starts` (AC1).
-//! * `idle_peer_takes_tasks_a_saturated_worker_left_unclaimed` (AC2).
+//! * `idle_peer_takes_tasks_a_saturated_worker_left_unclaimed` (AC2, AC3).
+//! * `kind_filtered_claim_takes_only_that_kind`: the kind-filtered statement.
+//! * `a_freed_permit_starts_the_next_task_without_a_poll_interval_wait`.
 //!
 //! Set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run against it.
 //! Otherwise a testcontainers Postgres 16 starts. Each test uses its own queue.
@@ -15,7 +18,7 @@
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
@@ -29,6 +32,7 @@ use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfi
 use autumn_harvest::{RetryPolicy, WorkflowContext, store};
 
 use chrono::Utc;
+use diesel::QueryDsl;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use testcontainers::ContainerAsync;
@@ -86,6 +90,10 @@ static BLOCKING_STARTED: LazyLock<Mutex<HashSet<String>>> =
 static QUICK_STARTED: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
+/// Start instants of the short activity handler, by execution id.
+static SHORT_STARTED: LazyLock<Mutex<HashMap<String, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 fn record(set: &Mutex<HashSet<String>>, input: &serde_json::Value) {
     let key = input.as_str().expect("activity input is an id").to_owned();
     set.lock().expect("started set").insert(key);
@@ -117,6 +125,19 @@ fn blocking_activity(
     Box::pin(async move {
         record(&BLOCKING_STARTED, &input);
         tokio::time::sleep(Duration::from_secs(60)).await;
+        Ok(input)
+    })
+}
+
+/// Activity that holds its permit for 300 ms.
+fn short_activity(_ctx: &autumn_harvest::ActivityContext, input: serde_json::Value) -> BoxFut<'_> {
+    Box::pin(async move {
+        let key = input.as_str().expect("activity input is an id").to_owned();
+        SHORT_STARTED
+            .lock()
+            .expect("started map")
+            .insert(key, Instant::now());
+        tokio::time::sleep(Duration::from_millis(300)).await;
         Ok(input)
     })
 }
@@ -191,11 +212,14 @@ fn activity_info(
 }
 
 fn build_registry(activity: ActivityInfo) -> Arc<HandlerRegistry> {
-    let telemetry = Arc::new(
-        TelemetryConfig::builder()
-            .metrics(Arc::new(NoOpMetrics) as Arc<dyn MetricsRecorder>)
-            .build(),
-    );
+    build_registry_with_metrics(activity, Arc::new(NoOpMetrics))
+}
+
+fn build_registry_with_metrics(
+    activity: ActivityInfo,
+    metrics: Arc<dyn MetricsRecorder>,
+) -> Arc<HandlerRegistry> {
+    let telemetry = Arc::new(TelemetryConfig::builder().metrics(metrics).build());
     Arc::new(HandlerRegistry::with_state_and_telemetry(
         vec![workflow_info()],
         vec![activity],
@@ -206,6 +230,15 @@ fn build_registry(activity: ActivityInfo) -> Arc<HandlerRegistry> {
 
 /// A worker with one activity permit and spare workflow permits.
 fn build_worker(worker_id: &str, queue: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> {
+    build_worker_polling(worker_id, queue, registry, Duration::from_millis(25))
+}
+
+fn build_worker_polling(
+    worker_id: &str,
+    queue: &str,
+    registry: Arc<HandlerRegistry>,
+    poll_interval: Duration,
+) -> Arc<Worker> {
     Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
@@ -216,7 +249,7 @@ fn build_worker(worker_id: &str, queue: &str, registry: Arc<HandlerRegistry>) ->
                 notification_database_url: None,
                 max_concurrent_workflows: 8,
                 max_concurrent_activities: 1,
-                poll_interval: Duration::from_millis(25),
+                poll_interval,
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
                 sticky_timeout: Duration::from_secs(5),
@@ -380,6 +413,27 @@ fn spawn_timeout_scanner(
     })
 }
 
+/// Records every schedule-to-start sample.
+#[derive(Default)]
+struct ScheduleToStartSamples(Mutex<Vec<f64>>);
+
+impl MetricsRecorder for ScheduleToStartSamples {
+    fn record_schedule_to_start(&self, _queue_name: &str, wait_secs: f64) {
+        self.0.lock().expect("samples").push(wait_secs);
+    }
+}
+
+/// Whether the history of `exec_id` holds an `ActivityScheduled` event.
+async fn activity_scheduled(url: &str, exec_id: ExecutionId) -> bool {
+    let mut conn = connect(url).await;
+    store::load_history(&mut conn, exec_id)
+        .await
+        .expect("load_history")
+        .events
+        .iter()
+        .any(|e| matches!(e, WorkflowEvent::ActivityScheduled { .. }))
+}
+
 // ---------------------------------------------------------------------------
 // AC1: no queued task times out before its handler starts.
 // ---------------------------------------------------------------------------
@@ -390,7 +444,7 @@ async fn queued_activity_never_times_out_before_its_handler_starts() {
     let queue = format!("gate-ac1-{}", Uuid::new_v4());
     let ids = seed_workflows(&url, &queue, 4).await;
 
-    let stc = Duration::from_secs(1);
+    let stc = Duration::from_secs(2);
     let registry = build_registry(activity_info(blocking_activity, stc));
     let worker = build_worker("gate-ac1-worker", &queue, registry);
     let pool = build_pool(&url);
@@ -420,6 +474,11 @@ async fn queued_activity_never_times_out_before_its_handler_starts() {
     let started: HashSet<String> = BLOCKING_STARTED.lock().expect("started set").clone();
     let mut timed_out = Vec::new();
     for id in &ids {
+        // Not vacuous: every workflow scheduled the activity under test.
+        assert!(
+            activity_scheduled(&url, *id).await,
+            "workflow {id:?} must schedule its activity"
+        );
         if activity_timed_out(&url, *id).await {
             timed_out.push(id.as_uuid().to_string());
         }
@@ -473,10 +532,14 @@ async fn idle_peer_takes_tasks_a_saturated_worker_left_unclaimed() {
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Worker B: idle, with a free permit and a handler that returns at once.
+    let samples = Arc::new(ScheduleToStartSamples::default());
     let idle = build_worker(
         "gate-ac2-idle",
         &queue,
-        build_registry(activity_info(quick_activity, stc)),
+        build_registry_with_metrics(
+            activity_info(quick_activity, stc),
+            Arc::clone(&samples) as Arc<dyn MetricsRecorder>,
+        ),
     );
     let idle_runner = Arc::clone(&idle);
     let idle_pool = pool.clone();
@@ -504,5 +567,135 @@ async fn idle_peer_takes_tasks_a_saturated_worker_left_unclaimed() {
         started_count(&BLOCKING_STARTED, &ids),
         1,
         "worker A must start exactly one activity while its permit is held"
+    );
+    // AC3: schedule-to-start still runs from eligibility. The activities B
+    // ran waited at least 1 s in `PENDING`, and the samples show that wait.
+    let waited = samples
+        .0
+        .lock()
+        .expect("samples")
+        .iter()
+        .filter(|secs| **secs >= 0.9)
+        .count();
+    assert!(
+        waited >= rest,
+        "schedule-to-start must include the PENDING wait; {waited} of {rest} samples did"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The kind-filtered claim statement against a real database.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kind_filtered_claim_takes_only_that_kind() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let queue = format!("gate-kind-{}", Uuid::new_v4());
+    let queues = [queue.clone()];
+
+    // The workflow row is older, so an unfiltered claim takes it first.
+    let mut workflow = EnqueueParams::new(&queue, TaskType::Workflow, serde_json::json!(null));
+    workflow.scheduled_at = Utc::now() - chrono::Duration::seconds(10);
+    let workflow_id = queue::enqueue(&mut conn, &workflow)
+        .await
+        .expect("enqueue workflow row");
+    let mut activity = EnqueueParams::new(&queue, TaskType::Activity, serde_json::json!(null));
+    activity.activity_name = Some("gate_activity".to_owned());
+    activity.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    let activity_id = queue::enqueue(&mut conn, &activity)
+        .await
+        .expect("enqueue activity row");
+
+    let claim = |kind| {
+        let queues = queues.clone();
+        let url = url.clone();
+        async move {
+            let mut conn = connect(&url).await;
+            queue::claim_task_of_kind_on_shard(
+                &mut conn,
+                &queues,
+                "gate-kind-worker",
+                "",
+                None,
+                &[],
+                &[],
+                None,
+                Some(kind),
+            )
+            .await
+            .expect("claim")
+        }
+    };
+
+    let claimed = claim(TaskType::Activity).await.expect("an activity row");
+    assert_eq!(
+        claimed.id, activity_id,
+        "the activity claim skips the older workflow row"
+    );
+    assert!(
+        claim(TaskType::Activity).await.is_none(),
+        "no activity row is left to claim"
+    );
+    let claimed = claim(TaskType::Workflow).await.expect("a workflow row");
+    assert_eq!(claimed.id, workflow_id);
+
+    let state: String = autumn_harvest::schema::harvest_task_queue::table
+        .find(activity_id)
+        .select(autumn_harvest::schema::harvest_task_queue::state)
+        .first(&mut conn)
+        .await
+        .expect("activity row");
+    assert_eq!(state, "RUNNING");
+}
+
+// ---------------------------------------------------------------------------
+// A released permit starts the next task at once (issue #1787 review).
+// ---------------------------------------------------------------------------
+
+/// With the activity pool full and the workflow pool free, the poll claims
+/// workflows only. The release of the activity permit must wake the loop. A
+/// 3 s `poll_interval` with no listener makes a missed wake-up visible.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_freed_permit_starts_the_next_task_without_a_poll_interval_wait() {
+    let (url, _container) = setup_db().await;
+    let queue = format!("gate-wake-{}", Uuid::new_v4());
+    let ids = seed_workflows(&url, &queue, 4).await;
+    let pool = build_pool(&url);
+
+    let worker = build_worker_polling(
+        "gate-wake-worker",
+        &queue,
+        build_registry(activity_info(short_activity, Duration::from_secs(60))),
+        Duration::from_secs(3),
+    );
+    let runner = Arc::clone(&worker);
+    let run_pool = pool.clone();
+    let run_handle = tokio::spawn(async move { runner.run(&run_pool).await });
+
+    let keys: Vec<String> = ids.iter().map(|id| id.as_uuid().to_string()).collect();
+    let all_started = wait_until(Duration::from_secs(30), || {
+        let map = SHORT_STARTED.lock().expect("started map");
+        keys.iter().all(|k| map.contains_key(k))
+    })
+    .await;
+
+    worker.shutdown();
+    let _ = run_handle.await;
+    assert!(all_started, "every short activity must start");
+
+    let mut starts: Vec<Instant> = {
+        let map = SHORT_STARTED.lock().expect("started map");
+        keys.iter().map(|k| map[k]).collect()
+    };
+    starts.sort();
+    let max_gap = starts
+        .windows(2)
+        .map(|w| w[1].duration_since(w[0]))
+        .max()
+        .expect("four starts");
+    assert!(
+        max_gap < Duration::from_millis(1500),
+        "each 300 ms activity must start the next one at once; the largest gap was {max_gap:?}"
     );
 }
