@@ -60,9 +60,12 @@ jobs:
           fi
           title="Chaos watchdog: a watchdog run failed"
           body="The chaos watchdog run failed before checkout: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-          issue="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
-            --search "\"$title\" in:title" --json number,title \
-            | jq -r --arg title "$title" 'map(select(.title == $title)) | .[0].number // empty')"
+          # Same lookup as `open_issue_titled` in the script: the paginated
+          # REST listing, not the search index, which can lag.
+          issue="$(gh api --paginate -X GET "repos/$GITHUB_REPOSITORY/issues" \
+            -f state=open -f per_page=100 \
+            | jq -rs --arg title "$title" \
+              '(add // []) | map(select(.pull_request == null and .title == $title)) | .[0].number // empty')"
           if [ -n "$issue" ]; then
             gh issue comment "$issue" --repo "$GITHUB_REPOSITORY" --body "$body"
           else

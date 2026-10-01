@@ -27,13 +27,15 @@ title="Chaos nightly: no successful scheduled run in ${window_hours} h"
 failed_title="Chaos watchdog: a watchdog run failed"
 footer="Opened by \`.github/workflows/chaos-watchdog.yml\` (issue #1790)."
 
-# Prints the number of the open issue with title $1, or nothing. The search
-# is fuzzy, so jq keeps only an exact title match.
+# Prints the number of the open issue with title $1, or nothing. It reads
+# every page of the REST listing, because the search index can lag a
+# just-opened issue. The listing also holds pull requests, so jq drops them
+# and keeps only an exact title match.
 open_issue_titled() {
-  gh issue list --repo "$repo" --state open \
-    --search "\"$1\" in:title" --json number,title \
-    | jq -r --arg title "$1" \
-      'map(select(.title == $title)) | .[0].number // empty'
+  gh api --paginate -X GET "repos/${repo}/issues" -f state=open -f per_page=100 \
+    | jq -rs --arg title "$1" \
+      '(add // []) | map(select(.pull_request == null and .title == $title))
+       | .[0].number // empty'
 }
 
 # Comments on the open issue with title $1, or opens one with body $2.
