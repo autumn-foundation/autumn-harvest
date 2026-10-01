@@ -43,7 +43,7 @@ schema = ["dep:schemars"]
 # Sandboxed WebAssembly activities (issue #965). Pulls wasmtime + wat only when
 # explicitly enabled; requires the `db` feature (activity events are persisted).
 #
-# EFFECTIVE MSRV: this feature requires Rust >= 1.94 (wasmtime 46's own minimum).
+# EFFECTIVE MSRV: this feature requires Rust >= 1.95 (wasmtime 48's own minimum).
 # The crate's core/default MSRV is 1.88 and is UNAFFECTED: this optional R&D-spike
 # feature is out of the default build and the MSRV CI check (`cargo check
 # --workspace`, default features, never compiles wasmtime). See
@@ -62,7 +62,7 @@ wasm-activities = ["dep:wasmtime", "dep:wat", "db"]
 # capability model and resource limits rather than adding a second sandbox, so
 # this feature adds **no new dependency to the workspace**.
 #
-# EFFECTIVE MSRV: inherited from `wasm-activities` (Rust >= 1.94, wasmtime 46's
+# EFFECTIVE MSRV: inherited from `wasm-activities` (Rust >= 1.95, wasmtime 48's
 # own minimum). The crate's core/default MSRV is 1.88 and is UNAFFECTED.
 # See docs/rnd/hot-code-swap.md.
 hot-code-swap = ["wasm-activities"]
@@ -118,14 +118,14 @@ tokio-postgres-rustls = { version = "0.13", optional = true }
 # freshly resolve the yanked 0.24.5).
 metrics = { version = "0.24.6", optional = true }
 schemars = { version = "0.8", optional = true }
-# wasmtime 46's own minimum Rust is 1.94, so the `wasm-activities` feature that
-# enables these has an effective MSRV of 1.94 (the crate's core MSRV stays 1.88).
-# 46.0.3 is the first release with all four RUSTSEC-2026-0222/0223/0268/0269
-# fixes; pin the floor so a downstream consumer enabling `wasm-activities`
-# can't silently resolve back to a vulnerable 46.0.x (same reasoning as
-# tokio-postgres above — a workspace's own Cargo.lock never propagates to
-# downstream consumers, only the manifest constraint does).
-wasmtime = { version = "46.0.3", optional = true }
+# wasmtime 48's own minimum Rust is 1.95, so the `wasm-activities` feature that
+# enables these has an effective MSRV of 1.95 (the crate's core MSRV stays 1.88).
+# 48.0.3 is the first 48.x release with the RUSTSEC-2026-0316 fix (46.x has no
+# patched release); pin the floor so a downstream consumer enabling
+# `wasm-activities` can't silently resolve back to a vulnerable 48.0.x (same
+# reasoning as tokio-postgres above -- a workspace's own Cargo.lock never
+# propagates to downstream consumers, only the manifest constraint does).
+wasmtime = { version = "48.0.3", optional = true }
 wat = { version = "1", optional = true }
 
 [[test]]
