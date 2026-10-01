@@ -2857,9 +2857,14 @@ pub async fn defer_claimed_rate_limited_task(
 /// Defer the retry that `claim` holds because the retry budget is empty
 /// (issue #1793). A stale claim changes nothing.
 ///
-/// The write is the rate-limit deferral with one difference: it keeps
-/// `crash_strikes`. An empty bucket says nothing about crashes. A reset
-/// would let a task that crashes workers escape poison-pill quarantine.
+/// The write is the rate-limit deferral with two differences:
+///
+/// - It keeps `crash_strikes`. An empty bucket says nothing about crashes. A
+///   reset would let a task that crashes workers escape poison-pill
+///   quarantine.
+/// - It computes `scheduled_at` as `clock_timestamp() + delay` in the
+///   statement (issue #1389). The claim checks `scheduled_at` on the same
+///   clock, so a host clock behind Postgres cannot make the row due at once.
 ///
 /// # Errors
 ///
@@ -2867,9 +2872,11 @@ pub async fn defer_claimed_rate_limited_task(
 pub async fn defer_claimed_retry_for_budget(
     conn: &mut AsyncPgConnection,
     claim: &TaskClaim,
-    scheduled_at: chrono::DateTime<Utc>,
+    delay: Duration,
 ) -> HarvestResult<ClaimWrite> {
     use crate::schema::harvest_task_queue::dsl;
+    use diesel::dsl::sql;
+    use diesel::sql_types::{Double, Timestamptz};
 
     let update = diesel::update(
         dsl::harvest_task_queue
@@ -2877,7 +2884,12 @@ pub async fn defer_claimed_retry_for_budget(
             .filter(dsl::state.eq("RUNNING")),
     )
     .set((
-        BudgetDeferralChangeset::new(scheduled_at),
+        BudgetDeferralChangeset::new(),
+        dsl::scheduled_at.eq(
+            sql::<Timestamptz>("clock_timestamp() + make_interval(secs => ")
+                .bind::<Double, _>(delay_secs(delay))
+                .sql(")"),
+        ),
         // Undo the claim-time attempt increment. A deferral is not an
         // execution, so it must not use an attempt.
         dsl::attempt.eq(diesel::dsl::sql::<diesel::sql_types::Integer>(
@@ -2885,9 +2897,14 @@ pub async fn defer_claimed_retry_for_budget(
         )),
     ))
     .into_boxed();
-    let Some((queue_name, priority, task_type)) = fence(update, Some(claim))
-        .returning((dsl::queue_name, dsl::priority, dsl::task_type))
-        .get_result::<(String, i32, String)>(conn)
+    let Some((queue_name, priority, task_type, scheduled_at)) = fence(update, Some(claim))
+        .returning((
+            dsl::queue_name,
+            dsl::priority,
+            dsl::task_type,
+            dsl::scheduled_at,
+        ))
+        .get_result::<(String, i32, String, chrono::DateTime<Utc>)>(conn)
         .await
         .optional()
         .map_err(crate::error::database_error)?
@@ -4026,8 +4043,9 @@ struct CleanContinuationChangeset {
     scheduled_at: chrono::DateTime<Utc>,
 }
 
-/// [`CleanContinuationChangeset`] without `crash_strikes`, for a retry-budget
-/// deferral (issue #1793).
+/// [`CleanContinuationChangeset`] without `crash_strikes` and `scheduled_at`,
+/// for a retry-budget deferral (issue #1793). The caller sets `scheduled_at`
+/// on the database clock.
 #[derive(AsChangeset)]
 #[diesel(table_name = crate::schema::harvest_task_queue, treat_none_as_null = true)]
 struct BudgetDeferralChangeset {
@@ -4037,11 +4055,10 @@ struct BudgetDeferralChangeset {
     last_heartbeat_at: Option<chrono::DateTime<Utc>>,
     capability_misses: i32,
     capability_miss_workers: Vec<String>,
-    scheduled_at: chrono::DateTime<Utc>,
 }
 
 impl BudgetDeferralChangeset {
-    const fn new(scheduled_at: chrono::DateTime<Utc>) -> Self {
+    const fn new() -> Self {
         Self {
             state: "PENDING",
             worker_id: None,
@@ -4049,7 +4066,6 @@ impl BudgetDeferralChangeset {
             last_heartbeat_at: None,
             capability_misses: 0,
             capability_miss_workers: Vec::new(),
-            scheduled_at,
         }
     }
 }

@@ -800,10 +800,10 @@ async fn budget_deferral_keeps_crash_strikes_attempt_and_error() {
         worker_id: "rb-strikes-worker".to_string(),
         attempt: claimed.attempt,
     };
-    let later = Utc::now() + chrono::Duration::seconds(30);
-    let write = queue::defer_claimed_retry_for_budget(&mut conn, &claim, later)
-        .await
-        .expect("defer");
+    let write =
+        queue::defer_claimed_retry_for_budget(&mut conn, &claim, chrono::Duration::seconds(30))
+            .await
+            .expect("defer");
     assert_eq!(write, queue::ClaimWrite::Applied);
 
     let row: TaskQueueItem = harvest_task_queue::table

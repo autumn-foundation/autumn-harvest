@@ -217,7 +217,7 @@ A retry policy limits the retries of one task. A retry budget limits the retries
 
 So the retries that run in a window of `T` seconds are at most `max_tokens + ratio × first_attempts + min_retries_per_sec × T`.
 
-*Deferral.* An empty bucket defers the retry. The worker calls `queue::defer_claimed_retry_for_budget`. That fenced write puts the row back to `PENDING` at a later `scheduled_at`. It lowers `attempt` again and keeps `error` and `crash_strikes`. A deferral says nothing about crashes, so poison-pill quarantine still counts them. The write appends no event. A deferral of a rate-limited activity without a circuit breaker also refunds the claim-time rate-limit token.
+*Deferral.* An empty bucket defers the retry. The worker calls `queue::defer_claimed_retry_for_budget`. That fenced write puts the row back to `PENDING`. It computes the new `scheduled_at` on the database clock, as the retry requeue does (issue #1389). It lowers `attempt` again and keeps `error` and `crash_strikes`. A deferral says nothing about crashes, so poison-pill quarantine still counts them. The write appends no event. A deferral of a rate-limited activity without a circuit breaker also refunds the claim-time rate-limit token.
 
 The first delay is the time to the next refill token. Each later deferral gets the next slot, one refill interval later. A slot more than 60 s away is not reserved. That retry gets a random delay from 30 s to 60 s instead, so a large backlog does not wake at one instant. No delay is shorter than 50 ms. Deferred retries are not served in order. The next retry that finds a token runs.
 

@@ -14688,10 +14688,10 @@ impl Drop for BudgetReleaseGuard<'_> {
 
 /// Defer a retry that the retry budget did not admit (issue #1793).
 ///
-/// The row goes back to `PENDING` at `now + retry_after`. The write lowers
-/// `attempt` again and keeps `error` and `crash_strikes`. Thus the retry keeps
-/// its attempt number, its previous failure and its poison-pill count. The
-/// write appends no event.
+/// The row goes back to `PENDING` `retry_after` past the database clock. The
+/// write lowers `attempt` again and keeps `error` and `crash_strikes`. Thus the
+/// retry keeps its attempt number, its previous failure and its poison-pill
+/// count. The write appends no event.
 ///
 /// The claim debited a rate-limit token for an activity without a circuit
 /// breaker. The retry does not run, so the token goes back. The function logs
@@ -14713,9 +14713,10 @@ async fn defer_retry_for_budget(
             "failed to refund the rate-limit token for a retry-budget deferral"
         );
     }
-    let scheduled_at = chrono::Utc::now()
-        + chrono::Duration::from_std(retry_after).unwrap_or_else(|_| chrono::Duration::seconds(1));
-    if queue::defer_claimed_retry_for_budget(conn, &claim_of_task(task)?, scheduled_at).await?
+    // The delay runs on the database clock. See `defer_claimed_retry_for_budget`.
+    let delay =
+        chrono::Duration::from_std(retry_after).unwrap_or_else(|_| chrono::Duration::seconds(1));
+    if queue::defer_claimed_retry_for_budget(conn, &claim_of_task(task)?, delay).await?
         == queue::ClaimWrite::LeaseLost
     {
         log_lease_lost(task, "retry-budget deferral");
