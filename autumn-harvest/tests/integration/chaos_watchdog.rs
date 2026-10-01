@@ -135,12 +135,13 @@ impl Stub {
         }
     }
 
-    /// An issue query that finds one open issue with this number and title.
+    /// One page of the open-issue listing, with one issue of this number and
+    /// title.
     fn issue(number: u32, title: &str) -> String {
         format!(r#"[{{"number":{number},"title":"{title}"}}]"#)
     }
 
-    /// An issue query that finds no open issue.
+    /// An open-issue listing with no issue.
     fn no_issue() -> String {
         "[]".to_string()
     }
@@ -191,14 +192,18 @@ fn run_stubbed(stub: &Stub, mut cmd: std::process::Command) -> Outcome {
         &gh,
         r#"#!/usr/bin/env bash
 printf '%s\n' "$*" >> "$STUB_LOG"
-case "$1 $2" in
-  "api "*)
-    if [ "$STUB_RUNS_FAIL" = 1 ]; then echo "HTTP 502" >&2; exit 1; fi
-    printf '%s\n' "$STUB_RUNS" ;;
-  "issue list")
-    if [ "$STUB_ISSUES_FAIL" = 1 ]; then echo "HTTP 502" >&2; exit 1; fi
-    printf '%s\n' "$STUB_ISSUES" ;;
-esac
+if [ "$1" = api ]; then
+  case "$*" in
+    *"/actions/workflows/"*)
+      if [ "$STUB_RUNS_FAIL" = 1 ]; then echo "HTTP 502" >&2; exit 1; fi
+      printf '%s\n' "$STUB_RUNS" ;;
+    *"/issues"*)
+      if [ "$STUB_ISSUES_FAIL" = 1 ]; then echo "HTTP 502" >&2; exit 1; fi
+      printf '%s\n' "$STUB_ISSUES" ;;
+  esac
+fi
+# The search index is not read-after-write, so it must not find the issue.
+if [ "$1 $2" = "issue list" ]; then echo "[]"; fi
 "#,
     )
     .expect("write stub gh");
@@ -252,7 +257,7 @@ fn watchdog_queries_successful_scheduled_chaos_runs_in_48_hours() {
     let api = out
         .calls
         .iter()
-        .find(|c| c.starts_with("api "))
+        .find(|c| c.starts_with("api ") && c.contains("/actions/workflows/"))
         .unwrap_or_else(|| panic!("no run query; calls: {:?}", out.calls));
     for needle in [
         "repos/owner/repo/actions/workflows/chaos.yml/runs",
@@ -384,7 +389,11 @@ fn watchdog_self_failed_mode_opens_its_own_issue() {
         arg: Some("self-failed"),
     });
     assert!(out.success, "calls: {:?}", out.calls);
-    assert!(!out.called("api "), "calls: {:?}", out.calls);
+    assert!(
+        !out.calls.iter().any(|c| c.contains("/actions/workflows/")),
+        "calls: {:?}",
+        out.calls
+    );
     assert!(!out.called("issue comment 77"), "calls: {:?}", out.calls);
     let create = out
         .calls
@@ -510,4 +519,40 @@ fn watchdog_report_step_without_checkout_comments_on_the_open_issue() {
     assert!(out.success, "calls: {:?}", out.calls);
     assert!(out.called("issue comment 88"), "calls: {:?}", out.calls);
     assert!(!out.called("issue create"), "calls: {:?}", out.calls);
+}
+
+/// The issue lookup reads every page of the open-issue listing, not the
+/// search index, which can lag a just-opened issue.
+#[cfg(target_os = "linux")]
+#[test]
+fn watchdog_finds_the_open_issue_on_a_later_page() {
+    let pages = format!(
+        "{}\n{}",
+        Stub::issue(5, "Some other issue"),
+        Stub::issue(78, ALERT_TITLE)
+    );
+    let out = run_watchdog(&Stub {
+        runs: Some(Stub::runs(0)),
+        issues: Some(pages),
+        arg: None,
+    });
+    assert!(out.success, "calls: {:?}", out.calls);
+    assert!(out.called("issue comment 78"), "calls: {:?}", out.calls);
+    assert!(!out.called("issue create"), "calls: {:?}", out.calls);
+}
+
+/// The issues endpoint also lists pull requests. A pull request with the alert
+/// title is not the alert issue.
+#[cfg(target_os = "linux")]
+#[test]
+fn watchdog_ignores_a_pull_request_with_the_alert_title() {
+    let pr = format!(r#"[{{"number":9,"title":"{ALERT_TITLE}","pull_request":{{}}}}]"#);
+    let out = run_watchdog(&Stub {
+        runs: Some(Stub::runs(0)),
+        issues: Some(pr),
+        arg: None,
+    });
+    assert!(out.success, "calls: {:?}", out.calls);
+    assert!(out.called("issue create"), "calls: {:?}", out.calls);
+    assert!(!out.called("issue comment 9"), "calls: {:?}", out.calls);
 }
