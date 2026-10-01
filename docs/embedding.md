@@ -163,8 +163,13 @@ async fn shutdown_signal() {
 1. It applies the operator's `[harvest.startup]` settings over `config.startup`.
    It reads `autumn.toml`, `autumn-{profile}.toml` and
    `AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS`. The profile comes from
-   `AUTUMN_ENV`, `AUTUMN_PROFILE` or `--profile`, in that order, as in
-   autumn-web. An invalid value stops the boot.
+   `AUTUMN_ENV`, `AUTUMN_PROFILE`, `--profile` or `AUTUMN_IS_DEBUG`, in that
+   order, as in autumn-web. `AUTUMN_IS_DEBUG=1` selects `dev`, and `0`
+   selects `prod`. An invalid value stops the boot.
+
+   `with_ambient_profile()` reads only `AUTUMN_ENV` and `AUTUMN_PROFILE`. So
+   with only `AUTUMN_IS_DEBUG` set, the startup config uses a profile file,
+   but the admin posture stays `unknown`.
 2. It applies the declared admin posture to the API state and wraps the
    router in the declared auth layers.
 3. It loads the persisted admission gates before a worker starts.
