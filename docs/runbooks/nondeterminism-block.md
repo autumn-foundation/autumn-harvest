@@ -60,6 +60,12 @@ For any blocked row, read `search_attrs`:
 `nd_block_reason` / `nd_block_count` / `nd_blocked_at` on the embedded
 execution object.
 
+**Skipped recorded command (issue #1791).** The deployed code can also stop
+before a command that the recorded run issued. For example, a deploy deletes
+an activity call or a timer. Then `expected` is `<workflow returned early>` or
+`<workflow suspended early>`. `actual` names the skipped event, for example
+`ActivityScheduled(send_email)`. `event_index` is its history position.
+
 ## Diagnose the divergence (issue #614)
 
 To confirm — on demand, for one specific execution — exactly how the
