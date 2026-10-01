@@ -32,9 +32,10 @@ in the move discards a finished pass.
 
 **Heartbeat flush.** Each flush has its own bounded acquire. A failed flush
 keeps its payload and its receipt time for the next tick, so a retry cannot
-make a stalled handler look alive. The new `queue::record_heartbeat_for_claim`
-writes only under the claim's `attempt` and `worker_id`, so a late heartbeat
-cannot reach a newer attempt. A payload with no matching claim is dropped. The
+make a stalled handler look alive. The flush writes through
+`queue::record_heartbeat` with the `TaskClaim` fence from issue #1789, so a late
+heartbeat cannot reach a newer attempt. A payload with no matching claim is
+dropped. The
 executed activity's result write uses `pool::acquire_with_retries` (10 bounded
 tries). A try that fails early waits out its bound, so the tries also ride out a
 short outage. A result write cancelled by a session `statement_timeout` or
@@ -47,6 +48,13 @@ connection or hits a session timeout has its claim released, fenced on `attempt`
 and `worker_id`, because an activity with no deadline would otherwise stay
 `RUNNING`. A start that loses its connection is checked again first: if this
 claim's `ActivityStarted` committed, the handler runs instead.
+
+**Quarantine and session slots.** The workflow task timeout quarantine also
+retries its acquire. Its write is fenced on the claim, so a late quarantine
+cannot fail a run that a peer claimed in the meantime. A session acquire that
+fails on a transient error keeps its slot until a read of the session row
+settles it. When no read succeeds, a background task reads again. A new
+acquire of that session on the same worker defers until the read ends.
 
 **Metrics.** `harvest.db.pool_acquire_timeout{site}` and
 `harvest.heartbeat.flush_failed{reason}`, with starter dashboard panels.

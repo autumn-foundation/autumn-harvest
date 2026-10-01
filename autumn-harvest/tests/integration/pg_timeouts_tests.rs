@@ -713,6 +713,7 @@ async fn a_rolled_back_quarantine_reports_failure() {
         task_id,
         None,
         "w-1",
+        1,
         3,
         10,
         "wf",
@@ -1634,6 +1635,7 @@ async fn a_failed_quarantine_lookup_reports_failure() {
         task_id,
         Some(exec_id.as_uuid()),
         "w-1",
+        1,
         3,
         10,
         "wf",
@@ -1958,6 +1960,81 @@ async fn a_kept_session_slot_is_released_once_the_row_proves_absent() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// An acquire waits while a background re-check of its slot runs. Otherwise
+/// the re-check can read no row just before the acquire inserts one. It then
+/// releases the slot of a session that this worker hosts, and the worker can
+/// exceed `max_concurrent_sessions`.
+#[tokio::test]
+async fn a_session_acquire_defers_while_its_slot_is_rechecked() {
+    use autumn_harvest::sessions::{new_session_slot_registry, try_acquire_session_slot};
+    use autumn_harvest::types::SessionId;
+
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let (exec_id, _activity_id, task) = seed_claimed_activity(&mut conn, "q-sr").await;
+    let session_id = SessionId::new();
+    diesel::sql_query("UPDATE harvest_task_queue SET input = to_jsonb($2::text) WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(task.id)
+        .bind::<Text, _>(session_id.to_string())
+        .execute(&mut conn)
+        .await
+        .expect("make the input a session id");
+    let task = {
+        use autumn_harvest::models::TaskQueueItem;
+        use autumn_harvest::schema::harvest_task_queue;
+        use diesel::{QueryDsl, SelectableHelper};
+        harvest_task_queue::table
+            .find(task.id)
+            .select(TaskQueueItem::as_select())
+            .first::<TaskQueueItem>(&mut conn)
+            .await
+            .expect("reload the claim")
+    };
+
+    // The re-check gets no answer, so it keeps running in the background.
+    let starved = engine_pool(
+        url.clone(),
+        1,
+        DbRole::Hot,
+        &timeouts(100, SessionTimeouts::for_role(DbRole::Hot)),
+    )
+    .expect("starved pool");
+    let held = hold_every_connection(&starved).await;
+    let registry = new_session_slot_registry();
+    assert!(try_acquire_session_slot(&registry, 4, session_id));
+    autumn_harvest::worker::settle_session_slot_after_transient_error(
+        &starved, &registry, session_id, "w-1",
+    )
+    .await;
+
+    let pool = engine_pool(
+        url,
+        2,
+        DbRole::Hot,
+        &timeouts(5_000, SessionTimeouts::for_role(DbRole::Hot)),
+    )
+    .expect("engine pool");
+    autumn_harvest::worker::handle_session_acquire_for_test(
+        &pool, &task, "w-1", exec_id, 4, &registry,
+    )
+    .await
+    .expect("the acquire defers");
+
+    assert_eq!(task_state(&mut conn, task.id).await, "PENDING");
+    let rows: i64 = {
+        use autumn_harvest::schema::harvest_sessions::dsl;
+        use diesel::{ExpressionMethods, QueryDsl};
+        dsl::harvest_sessions
+            .filter(dsl::id.eq(session_id.as_uuid()))
+            .count()
+            .get_result(&mut conn)
+            .await
+            .expect("count session rows")
+    };
+    assert_eq!(rows, 0, "the acquire must not record the session yet");
+    drop(held);
 }
 
 /// Mark `worker_id` as a live worker. A test row `RUNNING` under an unknown

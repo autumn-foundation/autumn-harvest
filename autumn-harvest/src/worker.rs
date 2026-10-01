@@ -15150,11 +15150,15 @@ async fn handle_session_acquire(
         .await;
     }
 
-    if !crate::sessions::try_acquire_session_slot(
-        session_slots_in_use,
-        max_concurrent_sessions,
-        session_id,
-    ) {
+    // A background re-check of an earlier failed acquire can still release
+    // this slot (issue #1788). Defer until it ends, as at full capacity.
+    if session_slot_rechecked(session_slots_in_use, session_id)
+        || !crate::sessions::try_acquire_session_slot(
+            session_slots_in_use,
+            max_concurrent_sessions,
+            session_id,
+        )
+    {
         // Lost the race: this worker is at its advertised session
         // capacity (or sessions are disabled: max_concurrent_sessions <= 0,
         // so every acquire loses). Reschedule with a randomized backoff so
@@ -15364,12 +15368,69 @@ pub async fn settle_session_slot_after_transient_error(
         session_id = %session_id,
         "could not read a session after a failed acquire; keeping its slot until a read succeeds"
     );
+    let recheck = RecheckedSessionSlot::mark(registry, session_id);
     let pool = pool.clone();
     let registry = std::sync::Arc::clone(registry);
     let worker_id = worker_id.to_owned();
     tokio::spawn(async move {
         while !settle_session_slot_once(&pool, &registry, session_id, &worker_id).await {}
+        drop(recheck);
     });
+}
+
+/// Session slots that a background re-check can still release (issue #1788).
+///
+/// An acquire of such a session defers until the re-check ends. Otherwise the
+/// re-check can read no row just before the acquire inserts one. It then
+/// releases the slot of a session that this worker hosts. Each key holds the
+/// registry address, so two workers in one process keep separate entries.
+static RECHECKED_SESSION_SLOTS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<(usize, crate::types::SessionId)>>,
+> = std::sync::LazyLock::new(Default::default);
+
+fn rechecked_slot_key(
+    registry: &crate::sessions::SessionSlotRegistry,
+    session_id: crate::types::SessionId,
+) -> (usize, crate::types::SessionId) {
+    (std::sync::Arc::as_ptr(registry).addr(), session_id)
+}
+
+/// Whether a background re-check of this slot is still in progress.
+fn session_slot_rechecked(
+    registry: &crate::sessions::SessionSlotRegistry,
+    session_id: crate::types::SessionId,
+) -> bool {
+    RECHECKED_SESSION_SLOTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&rechecked_slot_key(registry, session_id))
+}
+
+/// Marks a slot as in re-check. The mark goes when this value drops, also
+/// when the runtime cancels the re-check task.
+struct RecheckedSessionSlot((usize, crate::types::SessionId));
+
+impl RecheckedSessionSlot {
+    fn mark(
+        registry: &crate::sessions::SessionSlotRegistry,
+        session_id: crate::types::SessionId,
+    ) -> Self {
+        let key = rechecked_slot_key(registry, session_id);
+        RECHECKED_SESSION_SLOTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key);
+        Self(key)
+    }
+}
+
+impl Drop for RecheckedSessionSlot {
+    fn drop(&mut self) {
+        RECHECKED_SESSION_SLOTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.0);
+    }
 }
 
 /// One round of [`settle_session_slot_after_transient_error`]: up to
@@ -15437,6 +15498,34 @@ pub async fn handle_session_release_for_test(
         worker_id,
         exec_id,
         &crate::sessions::new_session_slot_registry(),
+        &crate::payload_codec::PayloadCodecs::default(),
+    )
+    .await
+}
+
+/// Run the internal session-acquire activity for `task` against `registry`.
+/// Tests use it (issue #1788).
+///
+/// # Errors
+///
+/// See `handle_session_acquire`.
+#[doc(hidden)]
+pub async fn handle_session_acquire_for_test(
+    pool: &DbPool,
+    task: &TaskQueueItem,
+    worker_id: &str,
+    exec_id: ExecutionId,
+    max_concurrent_sessions: i32,
+    registry: &crate::sessions::SessionSlotRegistry,
+) -> HarvestResult<()> {
+    handle_session_acquire(
+        pool,
+        task,
+        worker_id,
+        exec_id,
+        max_concurrent_sessions,
+        registry,
+        &crate::telemetry::NoOpMetrics,
         &crate::payload_codec::PayloadCodecs::default(),
     )
     .await
@@ -31659,6 +31748,7 @@ impl Worker {
                                     task_id,
                                     exec_id_for_timeout,
                                     &worker_id,
+                                    claim_attempt,
                                     new_strikes,
                                     timeout_secs,
                                     &workflow_name_str,
@@ -31917,12 +32007,17 @@ async fn workflow_task_timeout_metric_names(
 /// Returns `false` when the quarantine did not commit: no pool connection, or
 /// the transaction rolled back. The caller then keeps the strike count, so the
 /// next timeout tries the quarantine again.
+///
+/// The write is fenced on the claim `(worker_id, attempt)`. The acquire can
+/// retry for longer than the stuck-running backstop. A peer can then hold a
+/// new claim, and its run must not fail. A lost claim also returns `false`.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn quarantine_workflow_task_timeout(
     pool: &DbPool,
     task_id: uuid::Uuid,
     exec_id_opt: Option<uuid::Uuid>,
     worker_id: &str,
+    attempt: i32,
     new_strikes: i32,
     timeout_secs: u64,
     workflow_name: &str,
@@ -32055,15 +32150,21 @@ pub async fn quarantine_workflow_task_timeout(
         severity,
     };
 
-    let result = Box::pin(conn.transaction::<(
+    let claim = queue::TaskClaim::new(task_id, worker_id, attempt);
+    let result = Box::pin(conn.transaction::<Option<(
         Vec<crate::completion_trigger::DeferredTriggerStart>,
         Option<String>,
         Vec<(ExecutionId, String)>,
         Vec<crate::execution::StartCancelledRun>,
-    ), HarvestError, _>(async |conn| {
+    )>, HarvestError, _>(async |conn| {
         let error_msg = error_msg.clone();
         let entry = entry.clone();
         let worker_id = worker_id.to_string();
+        // `fail_task` below has no fence. The row lock keeps the claim current
+        // until this transaction ends.
+        if let queue::ClaimLock::Lost { .. } = queue::lock_claim_for_update(conn, &claim).await? {
+            return Ok(None);
+        }
         dlq::dead_letter(conn, &entry).await?;
         queue::fail_task(conn, task_id, &error_msg).await?;
 
@@ -32211,17 +32312,26 @@ pub async fn quarantine_workflow_task_timeout(
                 (Vec::new(), None, Vec::new(), Vec::new())
             };
 
-        Ok((
+        Ok(Some((
             deferred,
             queue_used,
             closed_children,
             pending_cancel_metrics,
-        ))
+        )))
     }))
     .await;
 
     match result {
-        Ok((deferred_starts, queue_used, closed_children, pending_cancel_metrics)) => {
+        Ok(None) => {
+            tracing::warn!(
+                task_id = %task_id,
+                worker_id = %worker_id,
+                attempt,
+                "workflow task timeout quarantine: claim lost; a peer owns the task"
+            );
+            return false;
+        }
+        Ok(Some((deferred_starts, queue_used, closed_children, pending_cancel_metrics))) => {
             // issue #1197, item 1: emitted only now that this transaction has
             // actually committed.
             crate::execution::emit_start_cancel_metrics(metrics, &pending_cancel_metrics);
@@ -35503,6 +35613,7 @@ mod tests {
                 uuid::Uuid::new_v4(),
                 None,
                 "w-1",
+                1,
                 3,
                 10,
                 "wf",
