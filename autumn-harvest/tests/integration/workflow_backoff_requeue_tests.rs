@@ -1,3 +1,4 @@
+#![cfg(feature = "db")]
 //! Shared contract of the three workflow-task backoff requeues (issue #1751).
 //!
 //! `requeue_workflow_task_nd_blocked`, `requeue_workflow_task_after_panic`, and
@@ -116,6 +117,8 @@ async fn claimed_task_with_stale_markers(conn: &mut AsyncPgConnection) -> Uuid {
     task
 }
 
+// One bool per column the requeue may clear.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(diesel::QueryableByName, Debug)]
 struct RowState {
     #[diesel(sql_type = diesel::sql_types::Text)]
@@ -245,6 +248,57 @@ async fn every_backoff_requeue_reports_not_found_for_an_unclaimed_task() {
                 Err(autumn_harvest::error::HarvestError::NotFound(_))
             ),
             "{path:?}: {result:?}"
+        );
+    }
+}
+
+/// A `PENDING` task is not claimed, so every path reports `NotFound` and
+/// leaves the row untouched.
+#[tokio::test]
+async fn every_backoff_requeue_rejects_a_pending_task() {
+    let (mut conn, _c) = setup_db().await;
+    for path in ALL_PATHS {
+        let queue_name = format!("backoff-{}", Uuid::new_v4().simple());
+        let exec_id = insert_execution(&mut conn).await;
+        let mut params = EnqueueParams::new(&queue_name, TaskType::Workflow, serde_json::json!({}));
+        params.workflow_exec_id = Some(exec_id);
+        let task = queue::enqueue(&mut conn, &params).await.expect("enqueue");
+
+        let result = match path {
+            Path::NdBlocked => {
+                queue::requeue_workflow_task_nd_blocked(&mut conn, task, Duration::seconds(60), "x")
+                    .await
+            }
+            Path::AfterPanic => {
+                queue::requeue_workflow_task_after_panic(
+                    &mut conn,
+                    task,
+                    Duration::seconds(60),
+                    "x",
+                )
+                .await
+            }
+            Path::QuotaRetry => {
+                queue::requeue_workflow_task_for_quota_retry(
+                    &mut conn,
+                    task,
+                    Duration::seconds(60),
+                    "x",
+                )
+                .await
+            }
+        };
+
+        assert!(
+            matches!(
+                result,
+                Err(autumn_harvest::error::HarvestError::NotFound(_))
+            ),
+            "{path:?}: {result:?}"
+        );
+        assert!(
+            !read_row(&mut conn, task).await.backoff_in_future,
+            "{path:?} must not defer a task it rejected"
         );
     }
 }

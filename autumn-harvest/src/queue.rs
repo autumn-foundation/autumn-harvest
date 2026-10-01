@@ -3294,11 +3294,10 @@ pub async fn record_heartbeat(
     Ok(claim_write(updated > 0))
 }
 
-/// Shared "reset a claimed task back to `PENDING` with a future
-/// `scheduled_at`" changeset (code-review cleanup, issue #603): the 7 fields
-/// common to both [`requeue_for_retry`] (activity retry) and
-/// [`requeue_workflow_task_nd_blocked`] (ND-block backoff), previously
-/// duplicated verbatim in both functions.
+/// Shared changeset that resets a claimed task back to `PENDING` (issue #603).
+/// It holds the fields common to [`requeue_for_retry`] (activity retry) and
+/// [`requeue_workflow_task_with_backoff`] (every workflow-task backoff).
+/// Each caller adds its own `scheduled_at`.
 ///
 /// `treat_none_as_null = true` is required: Diesel's default `AsChangeset`
 /// behavior treats a `None` field as "omit this column from `SET`" rather
@@ -3515,8 +3514,8 @@ impl StickyRelease {
 ///   #1389). The row would then be claimable at once.
 /// - `wake_requested` is cleared. A wake captured mid-cycle must not cut the
 ///   backoff short. The next claim replays the full history and finds it.
-/// - `activity_name` is cleared. A stale `mixed_signal_suspension` sentinel
-///   would match the wake-forward arm of `primary_repend_workflow_task_query`.
+/// - `activity_name` is cleared. A timer-and-signal race can leave a stale
+///   `mixed_signal_suspension` sentinel (issues #476, #600). It would match the wake-forward arm of `primary_repend_workflow_task_query`.
 ///   An unrelated wake would then reset `scheduled_at` to now (issues #603,
 ///   #1391).
 /// - `timer_fires_at` is cleared. A backoff is not a timer wake, so the marker
@@ -3614,10 +3613,13 @@ fn workflow_backoff_sql(
 /// #956, #1391).
 ///
 /// This is a bounded backoff against a quota that is exhausted for now. It
-/// keeps sticky affinity. A quota rejection is not a worker failure. The
-/// pinned worker is healthy, and its warm replay cache helps the retry. The
-/// other two backoff requeues release affinity because their pinned worker is
-/// the suspect (issue #1751).
+/// keeps sticky affinity. A quota rejection does not show that the pinned
+/// worker is faulty. The other two backoff requeues release affinity because
+/// their pinned worker is the suspect (issue #1751).
+///
+/// Affinity is a soft preference. It ends at `sticky_until`, and nothing here
+/// extends it. Any worker can claim the row after that time, so a kept pin
+/// cannot starve the retry. This holds for a shard-admission rejection too.
 ///
 /// All other columns follow [`workflow_backoff_set`].
 ///
@@ -3663,8 +3665,10 @@ pub async fn requeue_workflow_task_nd_blocked(
 /// It is a separate named entry point so the panic path stays easy to find.
 /// It appends no event and does not touch the execution row. The task row is
 /// deferred only by `scheduled_at`. A signal or timer that arrives during the
-/// backoff is handled on the next dispatch. All other columns follow
-/// [`workflow_backoff_set`].
+/// backoff is handled on the next dispatch. The shared changeset resets
+/// `crash_strikes`, so the poison-pill reclaimer never trips on a panic loop.
+/// No `FOR UPDATE` guard is needed. The claim-layer `PAUSED` gate defers a
+/// re-pended task. All other columns follow [`workflow_backoff_set`].
 ///
 /// # Errors
 ///
