@@ -1021,7 +1021,7 @@ async fn workflow_list_exec_id_prefix_filter_applied() {
     // Non-matching prefix → 0 results.
     let (status, json) = get_json(&app, "/workflows?exec_id_prefix=00000000").await;
     assert_eq!(status, StatusCode::OK);
-    assert!(json.as_array().unwrap().is_empty());
+    assert_eq!(json.as_array().unwrap().len(), 0);
 }
 
 #[tokio::test]

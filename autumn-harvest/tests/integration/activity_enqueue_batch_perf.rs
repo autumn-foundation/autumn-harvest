@@ -452,7 +452,7 @@ async fn enqueue_batch_on_empty_slice_is_a_no_op() {
     let ids = queue::enqueue_batch(&mut conn, &[])
         .await
         .expect("enqueue_batch on empty slice");
-    assert!(ids.is_empty());
+    assert_eq!(ids.len(), 0);
 }
 
 /// Order must round-trip exactly: `persist_scheduled_activities` zips the

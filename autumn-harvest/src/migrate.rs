@@ -1187,7 +1187,7 @@ mod tests {
             plan.pending.iter().map(|s| &s.name).collect::<Vec<_>>(),
             vec!["20260102000000_b"]
         );
-        assert!(plan.unrecognized.is_empty());
+        assert_eq!(plan.unrecognized.len(), 0);
         assert!(plan.has_pending());
     }
 

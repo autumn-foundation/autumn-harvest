@@ -1108,7 +1108,7 @@ mod tests {
     #[test]
     fn validate_band_is_clean_for_sane_config() {
         let warnings = validate_band(2, 40, 20);
-        assert!(warnings.is_empty());
+        assert_eq!(warnings.len(), 0);
     }
 
     // -----------------------------------------------------------------------

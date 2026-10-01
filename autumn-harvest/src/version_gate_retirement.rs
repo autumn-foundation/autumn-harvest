@@ -310,7 +310,7 @@ mod tests {
     #[test]
     fn parse_sample_ids_handles_empty_array() {
         let ids = parse_sample_ids("[]").expect("empty array is valid");
-        assert!(ids.is_empty());
+        assert_eq!(ids.len(), 0);
     }
 
     #[test]

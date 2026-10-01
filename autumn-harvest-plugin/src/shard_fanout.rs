@@ -410,7 +410,7 @@ mod tests {
             panic!("no pool must be an error observation");
         };
         assert_eq!(observation.shard_id, 7);
-        assert!(observation.rows.is_empty());
+        assert_eq!(observation.rows.len(), 0);
         assert_eq!(
             observation.error.as_deref(),
             Some("shard 7 has no configured storage pool")
@@ -435,7 +435,7 @@ mod tests {
             panic!("unreachable pool must be an error observation");
         };
         assert_eq!(observation.shard_id, 3);
-        assert!(observation.rows.is_empty());
+        assert_eq!(observation.rows.len(), 0);
         assert_eq!(
             observation.error.as_deref(),
             Some("database connection for shard 3 could not be acquired")
@@ -525,7 +525,7 @@ mod tests {
         ]);
         assert_eq!(merged.status, FanoutStatus::Unavailable);
         assert!(!merged.is_complete());
-        assert!(merged.rows.is_empty());
+        assert_eq!(merged.rows.len(), 0);
         // Unavailable shards are sorted by shard_id.
         let ids: Vec<i32> = merged
             .unavailable_shards
@@ -539,7 +539,7 @@ mod tests {
     fn collect_fanout_rows_empty_observations_is_unavailable() {
         let merged: FanoutRows<i64> = collect_fanout_rows(Vec::new());
         assert_eq!(merged.status, FanoutStatus::Unavailable);
-        assert!(merged.rows.is_empty());
+        assert_eq!(merged.rows.len(), 0);
         assert!(merged.unavailable_shards.is_empty());
     }
 }

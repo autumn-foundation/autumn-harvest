@@ -4424,7 +4424,7 @@ mod tests {
 
         let routing = route_trigger_fires(fires, &router);
 
-        assert!(routing.pending.is_empty());
+        assert_eq!(routing.pending.len(), 0);
         assert_eq!(
             routing.uncertain.len(),
             MAX_FINDING_SAMPLES,

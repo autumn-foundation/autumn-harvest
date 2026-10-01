@@ -233,7 +233,7 @@ async fn an_earlier_due_time_moves_a_delayed_entry_forward() {
         )])
         .await
         .expect("park");
-    assert!(read(&fixture, &queues, 10).await.is_empty());
+    assert_eq!(read(&fixture, &queues, 10).await.len(), 0);
 
     // A signal arrives for the parked row. The second hint is due now, so the
     // entry moves out of the delayed set and onto the stream.
@@ -353,7 +353,7 @@ async fn a_wake_moves_a_backed_off_entry_forward() {
         .release(&leases[0], Duration::from_secs(3600))
         .await
         .expect("release");
-    assert!(read(&fixture, &queues, 10).await.is_empty());
+    assert_eq!(read(&fixture, &queues, 10).await.len(), 0);
 
     // A signal moves the row's `scheduled_at`, so the reference moves too.
     fixture
@@ -836,7 +836,7 @@ async fn a_blocking_read_returns_early_when_an_entry_arrives() {
     let task_id = Uuid::new_v4();
 
     // Ensure the group exists before the blocking read starts.
-    assert!(read(&fixture, &queues, 10).await.is_empty());
+    assert_eq!(read(&fixture, &queues, 10).await.len(), 0);
 
     let publisher = fixture.dispatch.clone();
     let handle = tokio::spawn(async move {
@@ -877,7 +877,7 @@ async fn a_multi_queue_blocking_read_still_delivers_an_arrival_on_either_queue()
     };
     let queues = vec!["multi-a".to_string(), "multi-b".to_string()];
     // Prime both consumer groups so neither read hits NOGROUP mid-test.
-    assert!(read(&fixture, &queues, 10).await.is_empty());
+    assert_eq!(read(&fixture, &queues, 10).await.len(), 0);
 
     let task_id = Uuid::new_v4();
     let publisher = fixture.dispatch.clone();

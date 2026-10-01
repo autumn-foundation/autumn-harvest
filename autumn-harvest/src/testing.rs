@@ -7263,7 +7263,7 @@ mod tests {
     fn parse_nd_message_unknown_format() {
         let (kind, expected, _) = parse_nd_message("signal history contains unexpected failure");
         assert_eq!(kind, NonDeterminismKind::Unknown);
-        assert!(!expected.is_empty());
+        assert_ne!(expected.len(), 0);
     }
 
     #[test]

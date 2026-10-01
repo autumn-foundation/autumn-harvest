@@ -7774,7 +7774,7 @@ mod tests {
         let timestamps = plan_backfill_timestamps(Some(&schedule), from, to, 100)
             .expect("inverted window should return empty without error");
 
-        assert!(timestamps.is_empty());
+        assert_eq!(timestamps.len(), 0);
     }
 
     #[test]
@@ -7785,12 +7785,12 @@ mod tests {
         let timestamps = plan_backfill_timestamps(None, from, to, 100)
             .expect("unset schedule backfill should succeed with empty plan");
 
-        assert!(timestamps.is_empty());
+        assert_eq!(timestamps.len(), 0);
 
         let timestamps = plan_backfill_timestamps(Some(&Schedule::Manual), from, to, 100)
             .expect("manual schedule backfill should succeed with empty plan");
 
-        assert!(timestamps.is_empty());
+        assert_eq!(timestamps.len(), 0);
     }
 
     #[test]
@@ -7957,9 +7957,12 @@ mod tests {
 
     #[test]
     fn parse_buffered_runs_returns_empty_for_null_or_invalid() {
-        assert!(parse_buffered_runs(&serde_json::Value::Null).is_empty());
-        assert!(parse_buffered_runs(&serde_json::json!([])).is_empty());
-        assert!(parse_buffered_runs(&serde_json::json!("not-an-array")).is_empty());
+        assert_eq!(parse_buffered_runs(&serde_json::Value::Null).len(), 0);
+        assert_eq!(parse_buffered_runs(&serde_json::json!([])).len(), 0);
+        assert_eq!(
+            parse_buffered_runs(&serde_json::json!("not-an-array")).len(),
+            0
+        );
     }
 
     #[test]

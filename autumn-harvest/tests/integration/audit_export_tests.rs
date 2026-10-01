@@ -1275,7 +1275,7 @@ async fn a_purge_with_nothing_eligible_returns_zero_and_writes_no_watermark() {
         .await
         .expect("purge");
     assert_eq!(deleted, 0);
-    assert!(watermark_row(&mut conn).await.is_empty());
+    assert_eq!(watermark_row(&mut conn).await.len(), 0);
 }
 
 #[tokio::test]

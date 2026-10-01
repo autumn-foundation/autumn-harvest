@@ -146,7 +146,7 @@ fn from_history_opens_and_closes_an_activity_awaitable() {
     let trace = ReplayTrace::from_history("two_step", ExecutionId::new(), &events);
 
     // After WorkflowStarted: nothing open.
-    assert!(trace.steps[0].open_awaitables.is_empty());
+    assert_eq!(trace.steps[0].open_awaitables.len(), 0);
 
     // After ActivityScheduled: exactly one open activity, opened at index 1.
     let open = &trace.steps[1].open_awaitables;
@@ -160,7 +160,7 @@ fn from_history_opens_and_closes_an_activity_awaitable() {
     );
 
     // After ActivityCompleted: closed again.
-    assert!(trace.steps[2].open_awaitables.is_empty());
+    assert_eq!(trace.steps[2].open_awaitables.len(), 0);
 }
 
 #[test]
@@ -402,7 +402,7 @@ fn from_history_passes_offload_envelope_through_verbatim() {
 #[test]
 fn from_history_on_empty_history_is_an_empty_trace() {
     let trace = ReplayTrace::from_history("two_step", ExecutionId::new(), &[]);
-    assert!(trace.steps.is_empty());
+    assert_eq!(trace.steps.len(), 0);
     assert_eq!(trace.total_events, 0);
     assert!(!trace.truncated);
 }

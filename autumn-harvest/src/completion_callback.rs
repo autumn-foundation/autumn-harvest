@@ -1390,7 +1390,7 @@ mod config_resolution_tests {
             TerminalState::TimedOut,
             TerminalState::Terminated,
         ] {
-            assert!(resolve_effective_targets(&all, state).is_empty());
+            assert_eq!(resolve_effective_targets(&all, state).len(), 0);
         }
     }
 
@@ -1872,7 +1872,7 @@ mod builder_config_tests {
     fn default_config_has_empty_allowlist_and_no_default_targets() {
         let config = CompletionCallbackBuilderConfig::default();
         assert!(config.allowlist.is_empty());
-        assert!(config.default_targets.is_empty());
+        assert_eq!(config.default_targets.len(), 0);
         assert!(!config.allow_http);
         assert!(!config.allow_ip_literals);
         assert!(config.secret.is_none());

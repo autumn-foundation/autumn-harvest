@@ -329,7 +329,7 @@ async fn a_leaf_root_returns_an_empty_children_array_not_an_error() {
 
     let (status, body) = get_json(&app, &format!("/workflows/{root}/tree")).await;
     assert_eq!(status, StatusCode::OK, "AC: a leaf is not an error");
-    assert!(children_of(&body["root"]).is_empty());
+    assert_eq!(children_of(&body["root"]).len(), 0);
     assert_eq!(body["node_count"], 1);
     assert_eq!(body["truncated"], false);
 }
@@ -670,11 +670,12 @@ async fn a_tree_that_ends_exactly_at_the_depth_cap_is_not_reported_truncated() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["truncated"], false);
     assert_eq!(body["truncation_reason"], Value::Null);
-    assert!(
+    assert_eq!(
         body["truncated_parent_ids"]
             .as_array()
             .expect("array")
-            .is_empty()
+            .len(),
+        0
     );
 }
 

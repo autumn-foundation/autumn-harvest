@@ -975,13 +975,13 @@ async fn idle_fleet_yields_an_empty_but_complete_manifest() {
 
     let (status, body) = get_json(&app, SAMPLE_ROUTE).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert!(body["exports"].as_array().expect("array").is_empty());
+    assert_eq!(body["exports"].as_array().expect("array").len(), 0);
     let manifest = manifest_of(&body);
     assert!(manifest.is_complete());
     assert!(!manifest.is_truncated());
     assert_eq!(manifest.sampled_total, 0);
     assert_eq!(manifest.in_flight_total, 0);
-    assert!(manifest.per_workflow.is_empty());
+    assert_eq!(manifest.per_workflow.len(), 0);
 }
 
 // ---------------------------------------------------------------------------

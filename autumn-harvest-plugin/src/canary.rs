@@ -1366,7 +1366,7 @@ mod tests {
         let report = CanaryReport::empty(at(0));
         let value = serde_json::to_value(&report).unwrap();
         assert_eq!(value["status"], serde_json::json!("complete"));
-        assert!(value["probes"].as_array().unwrap().is_empty());
+        assert_eq!(value["probes"].as_array().unwrap().len(), 0);
         assert_eq!(value["staleness_window_secs"], serde_json::json!(0));
     }
 }

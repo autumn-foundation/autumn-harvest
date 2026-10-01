@@ -574,7 +574,7 @@ mod tests {
         let params = WorkflowCountParams::from_query_pairs(&[], STATES).unwrap();
         assert_eq!(params.group_by, vec![WorkflowCountDimension::State]);
         assert_eq!(params.limit_groups, DEFAULT_LIMIT_GROUPS);
-        assert!(params.states.is_empty());
+        assert_eq!(params.states.len(), 0);
         assert!(params.workflow_name.is_none());
     }
 

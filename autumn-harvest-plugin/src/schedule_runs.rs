@@ -652,7 +652,7 @@ mod tests {
     fn params_default_limit_when_omitted() {
         let p = ScheduleRunsParams::from_query_pairs(&[], at(0)).unwrap();
         assert_eq!(p.limit, DEFAULT_LIMIT);
-        assert!(p.states.is_empty());
+        assert_eq!(p.states.len(), 0);
         assert!(p.cursor.is_none());
     }
 

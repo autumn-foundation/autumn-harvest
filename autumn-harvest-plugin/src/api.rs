@@ -49967,7 +49967,7 @@ mod tests {
 
     #[test]
     fn merge_paused_queues_is_empty_when_nothing_is_held() {
-        assert!(merge_paused_queue_rows(Vec::new(), &[0]).is_empty());
+        assert_eq!(merge_paused_queue_rows(Vec::new(), &[0]).len(), 0);
     }
 
     /// Issue #619 review: `effective_scope` must be derived from the shards that
@@ -50564,7 +50564,7 @@ mod tests {
 
         let mut empty: Vec<String> = Vec::new();
         sort_reason_codes(&mut empty);
-        assert!(empty.is_empty());
+        assert_eq!(empty.len(), 0);
 
         // Issue #807: the activity-level hold leads too, and a task held by
         // BOTH reports them in a deterministic order rather than whichever the
@@ -50945,8 +50945,8 @@ mod tests {
             obs.error.is_some(),
             "a poolless expected shard must be an unavailable observation, not skipped"
         );
-        assert!(obs.runs.is_empty());
-        assert!(obs.summary.is_empty());
+        assert_eq!(obs.runs.len(), 0);
+        assert_eq!(obs.summary.len(), 0);
 
         // The unavailable observation, combined with a healthy inspected shard,
         // must drive the report status to `partial` — never `complete`.
@@ -51594,9 +51594,9 @@ mod tests {
     fn parse_workflow_filters_defaults_to_empty_filters_with_default_limit() {
         let filters = parse_workflow_filters(&[]).expect("no params should parse");
         assert_eq!(filters.limit, DEFAULT_WORKFLOW_LIMIT);
-        assert!(filters.states.is_empty());
+        assert_eq!(filters.states.len(), 0);
         assert!(filters.workflow_name.is_none());
-        assert!(filters.search_attrs.is_empty());
+        assert_eq!(filters.search_attrs.len(), 0);
     }
 
     #[test]
@@ -51939,7 +51939,7 @@ mod tests {
     fn parse_workflow_filters_ignores_unknown_query_keys() {
         let filters = parse_workflow_filters(&pairs(&[("ignored", "value")]))
             .expect("unknown keys should be skipped");
-        assert!(filters.states.is_empty());
+        assert_eq!(filters.states.len(), 0);
         assert!(filters.workflow_name.is_none());
     }
 
@@ -53498,7 +53498,7 @@ mod tests {
 
     #[test]
     fn shard_population_of_no_rows_is_empty() {
-        assert!(shard_population(&[]).is_empty());
+        assert_eq!(shard_population(&[]).len(), 0);
     }
 
     /// Two logical shards may share one physical database — a supported
@@ -57947,7 +57947,10 @@ mod tests {
             rate_limit_bucket_missing: false,
             concurrency_saturated: false,
         };
-        assert!(contributing_reasons_for(&[facts], chrono::Utc::now()).is_empty());
+        assert_eq!(
+            contributing_reasons_for(&[facts], chrono::Utc::now()).len(),
+            0
+        );
     }
 
     #[test]
@@ -58375,8 +58378,11 @@ mod tests {
         // A co-located worker that has not registered a row yet, and an
         // API-only replica, both leave the local build unidentified -- which
         // `registry_fallback_binds` reads as "no build identity configured".
-        assert!(local_build_id_from_workers(&workers, Some("w-missing")).is_empty());
-        assert!(local_build_id_from_workers(&workers, None).is_empty());
+        assert_eq!(
+            local_build_id_from_workers(&workers, Some("w-missing")).len(),
+            0
+        );
+        assert_eq!(local_build_id_from_workers(&workers, None).len(), 0);
     }
 
     #[test]

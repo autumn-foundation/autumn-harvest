@@ -18062,7 +18062,7 @@ mod migrate_cli_tests {
         else {
             panic!("expected migrate status");
         };
-        assert!(include_dir.is_empty());
+        assert_eq!(include_dir.len(), 0);
         assert_eq!(format, MigrateFormat::Text);
         assert!(!check, "the deploy gate must be opt-in");
     }

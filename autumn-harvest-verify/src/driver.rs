@@ -1551,7 +1551,7 @@ mod tests {
             &mut warnings,
         );
         assert_eq!(selections, vec![TargetSel::Lib]);
-        assert!(warnings.is_empty());
+        assert_eq!(warnings.len(), 0);
     }
 
     #[test]

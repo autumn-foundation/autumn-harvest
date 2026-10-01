@@ -16114,7 +16114,7 @@ mod tests {
             ]
         );
         // A second drain sees nothing (no double delivery).
-        assert!(ctx.drain_signals_raw("event").unwrap().is_empty());
+        assert_eq!(ctx.drain_signals_raw("event").unwrap().len(), 0);
     }
 
     #[test]
@@ -16262,7 +16262,7 @@ mod tests {
 
         // Same for drain_signals over an empty buffer.
         let drained = ctx.drain_signals_raw("event").unwrap();
-        assert!(drained.is_empty());
+        assert_eq!(drained.len(), 0);
         assert!(
             ctx.drain_commands().is_empty(),
             "drain_signals must not emit any command"
@@ -21959,8 +21959,8 @@ mod tests {
         else {
             panic!("expected CancelRaceLosers, got {:?}", commands[0]);
         };
-        assert!(activities.is_empty());
-        assert!(children.is_empty());
+        assert_eq!(activities.len(), 0);
+        assert_eq!(children.len(), 0);
         assert_eq!(
             timers,
             &vec![TimerId::new("__signal_timeout:1:approval")],
@@ -22020,8 +22020,8 @@ mod tests {
         else {
             panic!("expected CancelRaceLosers, got {:?}", commands[0]);
         };
-        assert!(activities.is_empty());
-        assert!(children.is_empty());
+        assert_eq!(activities.len(), 0);
+        assert_eq!(children.len(), 0);
         assert_eq!(
             timers,
             &vec![timer_id],
@@ -22886,8 +22886,8 @@ mod tests {
         else {
             panic!("expected CancelRaceLosers, got {:?}", commands[0]);
         };
-        assert!(activities.is_empty());
-        assert!(children.is_empty());
+        assert_eq!(activities.len(), 0);
+        assert_eq!(children.len(), 0);
         assert_eq!(
             timers,
             &vec![timer_id],
@@ -22943,8 +22943,8 @@ mod tests {
         else {
             panic!("expected CancelRaceLosers, got {:?}", commands[0]);
         };
-        assert!(activities.is_empty());
-        assert!(timers.is_empty());
+        assert_eq!(activities.len(), 0);
+        assert_eq!(timers.len(), 0);
         assert_eq!(
             children,
             &vec![child_id],
@@ -23175,8 +23175,8 @@ mod tests {
         else {
             panic!("expected CancelRaceLosers, got {:?}", commands[0]);
         };
-        assert!(activities.is_empty());
-        assert!(children.is_empty());
+        assert_eq!(activities.len(), 0);
+        assert_eq!(children.len(), 0);
         assert_eq!(timers, &vec![timer_id]);
     }
 

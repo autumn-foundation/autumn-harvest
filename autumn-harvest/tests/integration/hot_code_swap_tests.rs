@@ -1589,11 +1589,12 @@ async fn retiring_a_build_hides_its_modules_from_every_read_path() {
             .is_none(),
         "a retired module must not be loadable"
     );
-    assert!(
+    assert_eq!(
         list_workflow_modules_for_build(&mut conn, "wf-v1")
             .await
             .expect("list")
-            .is_empty()
+            .len(),
+        0
     );
 }
 

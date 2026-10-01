@@ -278,7 +278,7 @@ async fn empty_fleet_returns_complete_zero_groups() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "complete");
     assert_eq!(body["groups"].as_array().unwrap().len(), 0);
-    assert!(body["unavailable_shards"].as_array().unwrap().is_empty());
+    assert_eq!(body["unavailable_shards"].as_array().unwrap().len(), 0);
 }
 
 #[tokio::test]
@@ -826,7 +826,7 @@ async fn one_shard_down_is_partial_not_500() {
     let unavailable = body["unavailable_shards"].as_array().unwrap();
     assert_eq!(unavailable.len(), 1);
     assert_eq!(unavailable[0]["shard_id"], 1);
-    assert!(!unavailable[0]["reason"].as_str().unwrap().is_empty());
+    assert_ne!(unavailable[0]["reason"].as_str().unwrap().len(), 0);
 }
 
 #[tokio::test]

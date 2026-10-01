@@ -2351,7 +2351,7 @@ mod tests {
         let ids = json["active_task_ids"]
             .as_array()
             .expect("active_task_ids should be array");
-        assert!(ids.is_empty());
+        assert_eq!(ids.len(), 0);
     }
 
     #[test]
@@ -2576,8 +2576,8 @@ mod tests {
     fn preview_item_from_row_handles_empty_queues_and_shards() {
         let row = make_worker_row_full("w-2", "Draining", 0, &[], &[]);
         let item = preview_item_from_row(&row);
-        assert!(item.queues.is_empty());
-        assert!(item.shard_ids.is_empty());
+        assert_eq!(item.queues.len(), 0);
+        assert_eq!(item.shard_ids.len(), 0);
     }
 
     #[test]

@@ -4162,7 +4162,7 @@ mod tests {
     fn a_never_configured_process_reports_nothing() {
         let mut edge = Edge::default();
         edge.set(false);
-        assert!(edge.observed().is_empty());
+        assert_eq!(edge.observed().len(), 0);
     }
 
     #[cfg(feature = "db")]
@@ -4172,7 +4172,7 @@ mod tests {
         for live in [true, false, true] {
             edge.set(live);
         }
-        assert!(edge.observed().is_empty());
+        assert_eq!(edge.observed().len(), 0);
     }
 
     #[cfg(feature = "db")]

@@ -1167,7 +1167,7 @@ mod tests {
         walk.record_probe_result(&[]);
         assert!(!walk.truncated(), "no false-positive truncation");
         assert_eq!(walk.truncation_reason(), None);
-        assert!(walk.dropped_parent_ids().is_empty());
+        assert_eq!(walk.dropped_parent_ids().len(), 0);
     }
 
     #[test]
@@ -1357,7 +1357,7 @@ mod tests {
         let summary = walk.finish(root_node(root)).into_summary();
         assert!(summary.truncated);
         assert_eq!(summary.truncation_reason, Some(TruncationReason::MaxNodes));
-        assert!(!summary.truncated_parent_ids.is_empty());
+        assert_ne!(summary.truncated_parent_ids.len(), 0);
     }
 
     // ── Root node projection ─────────────────────────────────────────────

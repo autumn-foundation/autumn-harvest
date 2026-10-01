@@ -49,7 +49,7 @@ fn webhook_ctx_exposes_verified_metadata() {
     assert_eq!(ctx.provider, "generic");
     assert_eq!(ctx.delivery_id.as_deref(), Some("dlv_123"));
     assert_eq!(ctx.event_type.as_deref(), Some("order.created"));
-    assert!(!ctx.raw_body.is_empty());
+    assert_ne!(ctx.raw_body.len(), 0);
 }
 
 #[test]

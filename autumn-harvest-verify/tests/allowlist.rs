@@ -54,7 +54,7 @@ justification = "pre-#384 workflow, frozen history; rewrite lands in #970"
 fn an_empty_file_is_an_empty_allowlist() {
     let f = write_temp("");
     let allow = Allowlist::load(f.path()).expect("an empty allowlist is legal");
-    assert!(allow.allow.is_empty());
+    assert_eq!(allow.allow.len(), 0);
     assert!(allow.validate().is_ok());
 }
 
@@ -167,19 +167,19 @@ fn unused_reports_entries_that_matched_nothing() {
     assert_eq!(unused.len(), 1);
     assert_eq!(unused[0].workflow, "seeded::wf_gone");
 
-    assert!(
+    assert_eq!(
         list.unused(&used(&["seeded::wf_a", "seeded::wf_b", "seeded::wf_gone"]))
-            .is_empty()
+            .len(),
+        0
     );
     assert_eq!(
         list.unused(&BTreeSet::new()).len(),
         3,
         "nothing analyzed => everything unused"
     );
-    assert!(
-        Allowlist::default()
-            .unused(&used(&["seeded::wf_a"]))
-            .is_empty()
+    assert_eq!(
+        Allowlist::default().unused(&used(&["seeded::wf_a"])).len(),
+        0
     );
 }
 

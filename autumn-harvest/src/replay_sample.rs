@@ -586,8 +586,8 @@ mod tests {
 
     #[test]
     fn merge_of_nothing_is_empty() {
-        assert!(merge_coverage(&[]).is_empty());
-        assert!(merge_coverage(&[vec![]]).is_empty());
+        assert_eq!(merge_coverage(&[]).len(), 0);
+        assert_eq!(merge_coverage(&[vec![]]).len(), 0);
     }
 
     #[test]

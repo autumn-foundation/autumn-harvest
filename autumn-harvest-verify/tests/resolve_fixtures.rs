@@ -76,7 +76,7 @@ fn build_over_the_real_example_dump_succeeds() {
     let docs = vec![parse_fixture("example_deterministic_primitives.mir")];
     let program = Program::build(docs, &workspace_roots()).expect("build over the real example");
     assert_eq!(program.docs.len(), 1);
-    assert!(program.docs[0].parse_failures.is_empty());
+    assert_eq!(program.docs[0].parse_failures.len(), 0);
 }
 
 #[test]

@@ -32587,7 +32587,7 @@ mod tests {
         // genuinely-overdue schedule living on the failed shard).
         let previous = key_set(&[("workflow", "a"), ("workflow", "b")]);
         let current = key_set(&[("workflow", "a")]);
-        assert!(labels_to_clear(&previous, &current, false).is_empty());
+        assert_eq!(labels_to_clear(&previous, &current, false).len(), 0);
     }
 
     #[test]
@@ -32595,7 +32595,7 @@ mod tests {
         // previous ⊆ current → [] (nothing disappeared).
         let previous = key_set(&[("workflow", "a")]);
         let current = key_set(&[("workflow", "a"), ("dag", "b")]);
-        assert!(labels_to_clear(&previous, &current, true).is_empty());
+        assert_eq!(labels_to_clear(&previous, &current, true).len(), 0);
     }
 
     #[test]
@@ -32603,7 +32603,7 @@ mod tests {
         // Empty previous (first pass) → [] regardless of current.
         let previous = std::collections::HashSet::new();
         let current = key_set(&[("workflow", "a")]);
-        assert!(labels_to_clear(&previous, &current, true).is_empty());
+        assert_eq!(labels_to_clear(&previous, &current, true).len(), 0);
     }
 
     /// A pool that builds without connecting, aimed at a closed port.
@@ -33295,7 +33295,7 @@ mod tests {
             value: "x".to_string(),
             explicit_clear: false,
         }];
-        assert!(collect_log_lines(&cmds).is_empty());
+        assert_eq!(collect_log_lines(&cmds).len(), 0);
     }
 
     #[test]
@@ -34306,7 +34306,7 @@ mod tests {
     fn monitor_shard_scope_passes_the_full_list_through_on_the_single_pool_fallback() {
         let all = vec![crate::types::ShardId::new(0), crate::types::ShardId::new(1)];
         assert_eq!(monitor_shard_scope(None, &all), all);
-        assert!(monitor_shard_scope(None, &[]).is_empty());
+        assert_eq!(monitor_shard_scope(None, &[]).len(), 0);
     }
 
     /// The multi-shard loop bounds its pool acquisition; the single-shard path
@@ -34784,7 +34784,7 @@ mod tests {
         let resolved = resolved_external_ids(&new_events);
         assert!(!resolved.is_empty());
         assert_eq!(resolved.signal_ids, vec![sid]);
-        assert!(resolved.cancel_ids.is_empty());
+        assert_eq!(resolved.cancel_ids.len(), 0);
     }
 
     #[test]
@@ -34797,7 +34797,7 @@ mod tests {
         let resolved = resolved_external_ids(&new_events);
         assert!(!resolved.is_empty());
         assert_eq!(resolved.cancel_ids, vec![cid]);
-        assert!(resolved.signal_ids.is_empty());
+        assert_eq!(resolved.signal_ids.len(), 0);
     }
 
     #[test]
@@ -34849,7 +34849,7 @@ mod tests {
         ];
         let resolved = resolved_external_ids(&new_events);
         assert_eq!(resolved.signal_ids, vec![sid_a]);
-        assert!(resolved.cancel_ids.is_empty());
+        assert_eq!(resolved.cancel_ids.len(), 0);
     }
 
     #[test]
@@ -34873,8 +34873,8 @@ mod tests {
         ];
         let resolved = resolved_external_ids(&new_events);
         assert_eq!(resolved.await_ids, vec![aid]);
-        assert!(resolved.signal_ids.is_empty());
-        assert!(resolved.cancel_ids.is_empty());
+        assert_eq!(resolved.signal_ids.len(), 0);
+        assert_eq!(resolved.cancel_ids.len(), 0);
     }
 
     // ── inline-vs-outbox await terminal de-duplication (issue #757 review, P1) ──
@@ -36023,7 +36023,7 @@ mod tests {
             batch.children.is_empty(),
             "a detached spawn is NOT an awaited child"
         );
-        assert!(batch.activity_waits.is_empty());
+        assert_eq!(batch.activity_waits.len(), 0);
         assert!(!batch.waits_on_signal);
     }
 
@@ -36774,7 +36774,7 @@ mod tests {
             ..default_runtime_config()
         };
         let worker = Worker::new(cfg, registry.clone()).unwrap();
-        assert!(worker.ineligible_activities.is_empty());
+        assert_eq!(worker.ineligible_activities.len(), 0);
 
         // Worker with cpu only, region = us-east-1 (act_gpu is ineligible)
         let mut labels = std::collections::HashMap::new();
@@ -40083,7 +40083,7 @@ mod tests {
             name: "m".into(),
             details: Value::Null,
         }];
-        assert!(collect_update_result_metrics(&history, &cmds).is_empty());
+        assert_eq!(collect_update_result_metrics(&history, &cmds).len(), 0);
     }
 
     #[test]

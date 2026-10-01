@@ -197,7 +197,7 @@ mod tests {
             "fn __autumn_workflow_info_w::{closure#0}() -> u8 {\n    let mut _0: u8;\n\
              \n    bb0: {\n        return;\n    }\n}\n",
         );
-        assert!(discover(&[d]).is_empty());
+        assert_eq!(discover(&[d]).len(), 0);
     }
     #[test]
     fn a_marker_header_that_failed_to_parse_still_yields_the_entry() {
@@ -259,7 +259,7 @@ mod tests {
             reason: "malformed fn header".to_string(),
             line: 1,
         });
-        assert!(discover(&[d]).is_empty());
+        assert_eq!(discover(&[d]).len(), 0);
     }
 
     #[test]
@@ -270,7 +270,7 @@ mod tests {
             reason: "malformed fn header".to_string(),
             line: 1,
         });
-        assert!(discover(&[d]).is_empty());
+        assert_eq!(discover(&[d]).len(), 0);
     }
 
     #[test]

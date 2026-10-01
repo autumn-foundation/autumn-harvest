@@ -77,6 +77,7 @@ pub enum DeadLetterOutcome {
 }
 
 /// Where a binding's poison messages are written.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait DeadLetterSink: Send + Sync {
     /// Durably record a poison message.
