@@ -50,27 +50,38 @@ fn watchdog_workflow_runs_the_script_daily() {
 
 /// A job timeout cancels the job, and `if: failure()` steps do not run after
 /// a cancel. A step timeout is a step failure, so the report step still runs.
+/// So each step needs its own timeout, and together they must fit inside the
+/// job timeout. A hung checkout then fails its step and is reported.
 #[test]
-fn watchdog_check_step_has_its_own_timeout() {
+fn watchdog_steps_time_out_before_the_job() {
     let doc = parse_workflow(WATCHDOG_WORKFLOW);
-    let timed = doc
+    let jobs = doc
         .get("jobs")
         .and_then(serde_yaml::Value::as_mapping)
-        .into_iter()
-        .flat_map(|jobs| jobs.values())
-        .filter_map(|job| job.get("steps").and_then(serde_yaml::Value::as_sequence))
-        .flatten()
-        .filter(|step| step.get("if").is_none())
-        .filter(|step| {
-            step.get("run")
-                .and_then(serde_yaml::Value::as_str)
-                .is_some_and(|run| run.contains(WATCHDOG_SCRIPT))
-        })
-        .all(|step| step.get("timeout-minutes").is_some());
-    assert!(
-        timed,
-        "the step that runs {WATCHDOG_SCRIPT} must set `timeout-minutes`"
-    );
+        .expect("jobs");
+    for (name, job) in jobs {
+        let job_limit = job
+            .get("timeout-minutes")
+            .and_then(serde_yaml::Value::as_u64)
+            .unwrap_or_else(|| panic!("job {name:?} must set `timeout-minutes`"));
+        let steps = job
+            .get("steps")
+            .and_then(serde_yaml::Value::as_sequence)
+            .expect("steps");
+        let mut total = 0;
+        for step in steps {
+            let limit = step
+                .get("timeout-minutes")
+                .and_then(serde_yaml::Value::as_u64)
+                .unwrap_or_else(|| panic!("step {step:?} must set `timeout-minutes`"));
+            total += limit;
+        }
+        assert!(
+            total < job_limit,
+            "job {name:?}: the step timeouts sum to {total} min, which must be under \
+             the {job_limit}-min job timeout"
+        );
+    }
 }
 
 /// GitHub tells only the last editor of a cron when a scheduled run fails.
