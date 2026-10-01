@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::deadpool::Pool;
 
+use crate::context::StampedHeartbeat;
 use crate::error::{HarvestError, HarvestResult};
 use crate::queue::{ClaimWrite, TaskClaim};
 use crate::telemetry::MetricsRecorder;
@@ -42,6 +43,10 @@ use crate::telemetry::MetricsRecorder;
 ///
 /// [`crate::pool::acquire_bound`] limits each pool acquire. This variant
 /// records no metrics. Use [`spawn_heartbeat_flusher_with`] to count failures.
+///
+/// A payload gets its time when a forwarding task takes it from the channel.
+/// A busy runtime can run that task late. [`spawn_heartbeat_flusher_with`]
+/// takes payloads that the sender stamps, and the worker uses it.
 #[must_use]
 pub fn spawn_heartbeat_flusher(
     claim: TaskClaim,
@@ -52,7 +57,23 @@ pub fn spawn_heartbeat_flusher(
         acquire_timeout: crate::pool::acquire_bound(&pool),
         metrics: Arc::new(crate::telemetry::NoOpMetrics),
     };
-    spawn_heartbeat_flusher_with(claim, pool, cancel, options)
+    let stamped = spawn_heartbeat_flusher_with(claim, pool, cancel.clone(), options);
+    let (tx, mut rx) = mpsc::channel::<Value>(64);
+    tokio::spawn(async move {
+        loop {
+            let details = tokio::select! {
+                () = cancel.cancelled() => break,
+                received = rx.recv() => match received {
+                    Some(details) => details,
+                    None => break,
+                },
+            };
+            if stamped.send(StampedHeartbeat::now(details)).await.is_err() {
+                break;
+            }
+        }
+    });
+    tx
 }
 
 /// Options for [`spawn_heartbeat_flusher_with`] (issue #1788).
@@ -71,17 +92,24 @@ pub struct HeartbeatFlushOptions {
 /// A failed flush keeps its payload. The next tick sends it again, unless a
 /// newer payload replaces it. A lost claim stops the flusher, as in
 /// [`spawn_heartbeat_flusher`].
+///
+/// Each payload carries the time its sender stamped. The flush writes that
+/// time, so a payload that waits in the channel keeps its real age.
 #[must_use]
 pub fn spawn_heartbeat_flusher_with(
     claim: TaskClaim,
     pool: Pool<AsyncPgConnection>,
     cancel: CancellationToken,
     options: HeartbeatFlushOptions,
-) -> mpsc::Sender<Value> {
+) -> mpsc::Sender<StampedHeartbeat> {
     let (tx, rx) = mpsc::channel(64);
     let latest = Arc::new(Mutex::new(None));
 
-    tokio::spawn(stamp_heartbeats(rx, Arc::clone(&latest), cancel.clone()));
+    tokio::spawn(keep_newest_heartbeat(
+        rx,
+        Arc::clone(&latest),
+        cancel.clone(),
+    ));
     tokio::spawn(heartbeat_loop(claim, pool, latest, cancel, options));
 
     tx
@@ -90,28 +118,27 @@ pub fn spawn_heartbeat_flusher_with(
 /// The newest heartbeat not yet taken by the flush loop.
 type LatestHeartbeat = Arc<Mutex<Option<Pending>>>;
 
-/// Stamp each heartbeat with its arrival time, and keep only the newest
-/// (issue #1788).
+/// Keep only the newest heartbeat for the flush loop (issue #1788).
 ///
 /// This task never waits on the database. A flush can block for its acquire or
-/// statement timeout. A heartbeat that arrives in that time still gets its
-/// real arrival time. A stalled handler then cannot look alive later.
-async fn stamp_heartbeats(
-    mut rx: mpsc::Receiver<Value>,
+/// statement timeout. A heartbeat sent in that time keeps its send time, so a
+/// stalled handler cannot look alive later.
+async fn keep_newest_heartbeat(
+    mut rx: mpsc::Receiver<StampedHeartbeat>,
     latest: LatestHeartbeat,
     cancel: CancellationToken,
 ) {
     loop {
-        let payload = tokio::select! {
+        let beat = tokio::select! {
             () = cancel.cancelled() => break,
             received = rx.recv() => match received {
-                Some(payload) => payload,
+                Some(beat) => beat,
                 None => break,
             },
         };
         *latest.lock().unwrap_or_else(PoisonError::into_inner) = Some(Pending {
-            payload,
-            received_at: chrono::Utc::now(),
+            payload: beat.details,
+            sent_at: beat.sent_at,
         });
     }
 }
@@ -133,7 +160,7 @@ pub async fn flush_heartbeat(
 ) -> HarvestResult<ClaimWrite> {
     let pending = Pending {
         payload,
-        received_at: chrono::Utc::now(),
+        sent_at: chrono::Utc::now(),
     };
     flush(pool, claim, &pending, acquire_timeout)
         .await
@@ -149,10 +176,10 @@ struct FlushFailure {
     error: Box<HarvestError>,
 }
 
-/// A heartbeat not yet written, with the time the worker got it.
+/// A heartbeat not yet written, with the time the activity sent it.
 struct Pending {
     payload: Value,
-    received_at: chrono::DateTime<chrono::Utc>,
+    sent_at: chrono::DateTime<chrono::Utc>,
 }
 
 async fn flush(
@@ -175,7 +202,7 @@ async fn flush(
         &mut conn,
         claim,
         pending.payload.clone(),
-        pending.received_at,
+        pending.sent_at,
     )
     .await
     .map_err(|error| FlushFailure {
@@ -194,8 +221,8 @@ async fn heartbeat_loop(
 ) {
     let flush_interval = Duration::from_secs(1);
     let task_id = claim.task_id;
-    // The newest payload not yet written, with the time it arrived. A failed
-    // flush puts it back here. A retry writes that time, not the retry time.
+    // The newest payload not yet written, with its send time. A failed flush
+    // puts it back here. A retry writes that time, not the retry time.
     let mut pending: Option<Pending> = None;
 
     loop {
@@ -391,7 +418,9 @@ mod tests {
                 metrics: Arc::clone(&failures) as Arc<dyn crate::telemetry::MetricsRecorder>,
             },
         );
-        tx.send(serde_json::json!({"p": 1})).await.expect("send");
+        tx.send(serde_json::json!({"p": 1}).into())
+            .await
+            .expect("send");
 
         let deadline = Instant::now() + Duration::from_secs(6);
         loop {

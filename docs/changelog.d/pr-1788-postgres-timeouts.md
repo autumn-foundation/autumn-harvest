@@ -30,9 +30,10 @@ partition drain sets `SET LOCAL statement_timeout = 0` for its census and its
 move. A large DEFAULT census can need longer than a role limit, and a timeout
 in the move discards a finished pass.
 
-**Heartbeat flush.** Each flush has its own bounded acquire. A failed flush
-keeps its payload and its receipt time for the next tick, so a retry cannot
-make a stalled handler look alive. The flush writes through
+**Heartbeat flush.** Each flush has its own bounded acquire. The activity
+stamps each heartbeat when it sends it. A failed flush keeps its payload and
+that time for the next tick. Neither a retry nor a busy runtime can then make a
+stalled handler look alive. The flush writes through
 `queue::record_heartbeat` with the `TaskClaim` fence from issue #1789, so a late
 heartbeat cannot reach a newer attempt. A payload with no matching claim is
 dropped. The

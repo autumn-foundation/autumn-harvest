@@ -13896,6 +13896,67 @@ impl ActivityExecutionInfo {
     }
 }
 
+/// A heartbeat payload and the time the activity sent it (issue #1788).
+///
+/// The sender takes the time. A busy runtime can run the receiving task late.
+/// A time taken there would make a stale heartbeat look new.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StampedHeartbeat {
+    /// The heartbeat payload.
+    pub details: serde_json::Value,
+    /// When the activity sent the heartbeat.
+    pub sent_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl StampedHeartbeat {
+    /// Stamp `details` with the current time.
+    #[must_use]
+    pub fn now(details: serde_json::Value) -> Self {
+        Self {
+            details,
+            sent_at: chrono::Utc::now(),
+        }
+    }
+}
+
+impl From<serde_json::Value> for StampedHeartbeat {
+    fn from(details: serde_json::Value) -> Self {
+        Self::now(details)
+    }
+}
+
+/// Where [`ActivityContext::heartbeat`] sends a payload.
+#[derive(Debug, Clone)]
+pub(crate) enum HeartbeatSink {
+    /// A channel of bare payloads, for tests.
+    Plain(tokio::sync::mpsc::Sender<serde_json::Value>),
+    /// The worker's flusher. Each payload carries its send time.
+    Stamped(tokio::sync::mpsc::Sender<StampedHeartbeat>),
+}
+
+impl HeartbeatSink {
+    /// Send `details`. Returns `false` when the receiver is gone.
+    async fn send(&self, details: serde_json::Value) -> bool {
+        match self {
+            Self::Plain(tx) => tx.send(details).await.is_ok(),
+            Self::Stamped(tx) => tx.send(StampedHeartbeat::now(details)).await.is_ok(),
+        }
+    }
+}
+
+impl From<tokio::sync::mpsc::Sender<serde_json::Value>> for HeartbeatSink {
+    fn from(tx: tokio::sync::mpsc::Sender<serde_json::Value>) -> Self {
+        Self::Plain(tx)
+    }
+}
+
+impl From<tokio::sync::mpsc::Sender<StampedHeartbeat>> for HeartbeatSink {
+    fn from(tx: tokio::sync::mpsc::Sender<StampedHeartbeat>) -> Self {
+        Self::Stamped(tx)
+    }
+}
+
 /// Context passed to every activity function.
 ///
 /// Activities may perform I/O, call external services, and interact with the
@@ -13905,7 +13966,7 @@ pub struct ActivityContext {
     /// Shared state map.
     state: SharedState,
     /// Heartbeat channel -- `None` in test contexts.
-    heartbeat_tx: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,
+    heartbeat_tx: Option<HeartbeatSink>,
     /// Latest heartbeat payload durably persisted by the previous attempt.
     heartbeat_details: Option<serde_json::Value>,
     /// Why heartbeat APIs are unavailable for this activity context.
@@ -14085,7 +14146,7 @@ impl ActivityContext {
     #[allow(dead_code)]
     pub(crate) fn new(
         state: SharedState,
-        heartbeat_tx: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,
+        heartbeat_tx: Option<HeartbeatSink>,
         cancel: tokio_util::sync::CancellationToken,
         identity: ActivityIdentity,
     ) -> Self {
@@ -14128,7 +14189,7 @@ impl ActivityContext {
     #[cfg(feature = "db")]
     pub(crate) fn new_with_cancellation_check(
         state: SharedState,
-        heartbeat_tx: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,
+        heartbeat_tx: Option<HeartbeatSink>,
         heartbeat_details: Option<serde_json::Value>,
         cancel: tokio_util::sync::CancellationToken,
         claim: crate::queue::TaskClaim,
@@ -14970,9 +15031,11 @@ impl ActivityContext {
         let Some(ref tx) = self.heartbeat_tx else {
             return Ok(());
         };
-        tx.send(payload).await.map_err(|_| {
-            HarvestError::ActivityCancelled("activity cancelled: heartbeat channel closed".into())
-        })?;
+        if !tx.send(payload).await {
+            return Err(HarvestError::ActivityCancelled(
+                "activity cancelled: heartbeat channel closed".into(),
+            ));
+        }
 
         Ok(())
     }
@@ -15093,7 +15156,7 @@ impl ActivityContext {
                         };
                         // Channel closed => the flusher is gone; stop silently
                         // (never panic).
-                        if tx.send(payload).await.is_err() {
+                        if !tx.send(payload).await {
                             break;
                         }
                     }
@@ -15605,7 +15668,7 @@ impl ActivityContext {
         };
         Self::new(
             empty_shared_state(),
-            Some(heartbeat_tx),
+            Some(heartbeat_tx.into()),
             tokio_util::sync::CancellationToken::new(),
             identity,
         )
@@ -17793,7 +17856,7 @@ mod tests {
         let cancel = tokio_util::sync::CancellationToken::new();
         let ctx = ActivityContext::new(
             Arc::new(HashMap::new()),
-            Some(tx),
+            Some(HeartbeatSink::Plain(tx)),
             cancel,
             ActivityIdentity::for_test(),
         );
@@ -17820,7 +17883,7 @@ mod tests {
         let cancel = tokio_util::sync::CancellationToken::new();
         let ctx = ActivityContext::new(
             Arc::new(HashMap::new()),
-            Some(tx),
+            Some(HeartbeatSink::Plain(tx)),
             cancel.clone(),
             ActivityIdentity::for_test(),
         );
@@ -17847,7 +17910,7 @@ mod tests {
         let cancel = tokio_util::sync::CancellationToken::new();
         let ctx = ActivityContext::new(
             Arc::new(HashMap::new()),
-            Some(tx),
+            Some(HeartbeatSink::Plain(tx)),
             cancel,
             ActivityIdentity::for_test(),
         );
@@ -17860,7 +17923,7 @@ mod tests {
         let cancel = tokio_util::sync::CancellationToken::new();
         let ctx = ActivityContext::new(
             Arc::new(HashMap::new()),
-            Some(tx),
+            Some(HeartbeatSink::Plain(tx)),
             cancel.clone(),
             ActivityIdentity::for_test(),
         );
@@ -17887,7 +17950,7 @@ mod tests {
         let cancel = tokio_util::sync::CancellationToken::new();
         let ctx = ActivityContext::new(
             empty_shared_state(),
-            Some(tx),
+            Some(HeartbeatSink::Plain(tx)),
             cancel.clone(),
             ActivityIdentity::for_test(),
         )
@@ -18119,7 +18182,7 @@ mod tests {
 
         let ctx = ActivityContext::new_with_cancellation_check(
             empty_shared_state(),
-            Some(tx),
+            Some(HeartbeatSink::Plain(tx)),
             Some(serde_json::json!({"checkpoint": 42})),
             cancel,
             crate::queue::TaskClaim::new(uuid::Uuid::new_v4(), "test-worker", 1),
@@ -18154,7 +18217,7 @@ mod tests {
         let cancel = tokio_util::sync::CancellationToken::new();
         let ctx = ActivityContext::new(
             empty_shared_state(),
-            Some(tx),
+            Some(HeartbeatSink::Plain(tx)),
             cancel,
             ActivityIdentity::for_test(),
         );
@@ -18261,7 +18324,7 @@ mod tests {
         let cancel = tokio_util::sync::CancellationToken::new();
         let ctx = ActivityContext::new(
             Arc::new(HashMap::new()),
-            Some(tx),
+            Some(HeartbeatSink::Plain(tx)),
             cancel,
             ActivityIdentity::for_test(),
         );

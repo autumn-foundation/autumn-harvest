@@ -15883,7 +15883,7 @@ async fn process_activity_task(
     );
     let ctx = ActivityContext::new_with_cancellation_check(
         registry.shared_state(),
-        Some(heartbeat_tx),
+        Some(heartbeat_tx.into()),
         task.heartbeat_details.clone(),
         cancel.clone(),
         activity_claim.clone(),
