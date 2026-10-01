@@ -10,6 +10,9 @@ the tree keeps one standalone reference, not two.
   depends on it, so it stays in the build graph. The embedder never names it.
 - The pool is a `diesel-async` `deadpool` pool, not `autumn_web::db::create_pool`.
   A checkout waits at most 5 s, as the `autumn-web` pool did.
+- `diesel-async` connects without TLS. For `sslmode=require`, `verify-ca` and
+  `verify-full`, the pool and the migration connection use rustls with the
+  platform trust store. Other modes stay plaintext, as with `autumn-web`.
 - In `dev`, migrations go through `autumn_harvest::migrate`, the code behind
   `harvest migrate run`, not `autumn_web::migrate::run_pending`.
 - `HarvestEmbedding` mounts the API and Vantage on a plain `axum::Router`.

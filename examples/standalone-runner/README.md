@@ -49,7 +49,7 @@ localhost. Ctrl-C or SIGTERM drains the worker and stops the process.
 
 | Variable | Default | Use |
 |---|---|---|
-| `DATABASE_URL` | `postgres://runner:runner@localhost:5434/runner` | The Harvest database |
+| `DATABASE_URL` | `postgres://runner:runner@localhost:5434/runner` | The Harvest database. See [TLS](#tls). |
 | `AUTUMN_ENV` or `AUTUMN_PROFILE` | none (`unknown`) | Deployment profile. `AUTUMN_ENV` wins. `dev` or `development` also applies migrations. |
 | `STANDALONE_RUNNER_ADDR` | `127.0.0.1:8082` | Listen address. Port `0` picks a free port. Some routes have no auth, so keep it on localhost or behind your own auth layer. |
 | `STANDALONE_RUNNER_WEBHOOK_SECRET` | none | HMAC secret. The webhook route exists only when this is set. Outside `dev`, a secret under 32 bytes refuses boot. |
@@ -110,6 +110,15 @@ have no auth here. For production, put your own auth layer in front of
 Until you do, `preflight` reports `admin_auth_boundary` as `fail` under a
 named non-`dev` profile. It reports `warn` when the profile is unknown. Both
 results are correct. The acceptance suite pins the `fail`.
+
+## TLS
+
+`sslmode=require`, `verify-ca` and `verify-full` connect through rustls. The
+server certificate must chain to the platform trust store in all three modes,
+so `require` is stricter here than in libpq. `sslrootcert` is not read. Put a
+private CA in the platform store, or point `SSL_CERT_FILE` at a bundle that
+holds it. A URL with no `sslmode`, `disable` or `prefer` connects in
+plaintext.
 
 ## Webhooks
 
