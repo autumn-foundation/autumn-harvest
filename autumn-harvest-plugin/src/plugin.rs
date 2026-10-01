@@ -408,6 +408,16 @@ impl HarvestPlugin {
         self
     }
 
+    /// Turn on automatic load shedding for the queues in `config` (issue #1794).
+    ///
+    /// A queue with an old backlog then refuses new starts with `429` and
+    /// `Retry-After`. See `docs/operations/load-shedding.md`.
+    #[must_use]
+    pub fn load_shed(mut self, config: autumn_harvest::load_shed::LoadShedConfig) -> Self {
+        self.builder = self.builder.load_shed(config);
+        self
+    }
+
     /// How long a keyed workflow start's idempotency claim is retained
     /// (issue #808; default 24 h).
     ///
@@ -3409,6 +3419,26 @@ mod tests {
             .expect("valid retention config should build");
         assert_eq!(built.retention().max_age_secs, Some(42));
         assert_eq!(built.retention().tick_interval_secs, 7);
+    }
+
+    #[test]
+    fn harvest_plugin_forwards_load_shed_to_builder() {
+        // Issue #1794: the plugin owns its builder, so without this forwarder
+        // a plugin deployment cannot turn on load shedding.
+        let policy = autumn_harvest::load_shed::LoadShedPolicy::new(
+            std::time::Duration::from_secs(300),
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(5),
+        )
+        .expect("valid policy");
+        let config = autumn_harvest::load_shed::LoadShedConfig::new().queue("default", policy);
+        let plugin = HarvestPlugin::new().load_shed(config.clone());
+        let built = plugin
+            .builder
+            .try_build()
+            .expect("valid load-shed config should build");
+        assert_eq!(built.load_shed, config);
+        assert!(built.load_shed.is_enabled());
     }
 
     // ── Connector build-time validation (issue #944) ──────────────────────

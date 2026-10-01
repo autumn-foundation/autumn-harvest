@@ -136,6 +136,8 @@ fn build() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+`HarvestPlugin` has the same method: `HarvestPlugin::new().load_shed(config)`.
+
 The default `sample_interval` is 5 seconds. The minimum is 1 second.
 
 ## Observability
