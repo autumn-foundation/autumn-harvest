@@ -14,7 +14,7 @@ the builder/worker seam, and the tests enumerated at the end.
 
 ## 1. Runtime choice — wasmtime vs wasmer
 
-**Recommendation: wasmtime (adopted).** The spike embeds **wasmtime 46**.
+**Recommendation: wasmtime (adopted).** The spike embeds **wasmtime 48**.
 
 Why wasmtime:
 
@@ -553,20 +553,22 @@ real SDK (the issue scopes SDK ergonomics beyond one demo language as follow-up)
   suite needs a live migrated database. Locally it runs against any migrated
   Postgres via `HARVEST_TEST_DATABASE_URL`.
 - **Guest randomness is non-cryptographic** (xorshift64), by design.
-- **The `wasm-activities` feature has an effective MSRV of 1.94**, distinct from
-  the crate's core MSRV of **1.88**. wasmtime 46.0.1's own minimum supported Rust
-  is 1.94 (its policy is the latest 3 stable releases; see the Sources note on the
+- **The `wasm-activities` feature has an effective MSRV of 1.95**, distinct from
+  the crate's core MSRV of **1.88**. wasmtime 48.0.3's own minimum supported Rust
+  is 1.95 (its policy is the latest 3 stable releases; see the Sources note on the
   wasmtime MSRV policy), so a consumer enabling `--features wasm-activities` must
-  build on Rust ≥ 1.94. This is an accepted constraint of the spike, not a
+  build on Rust ≥ 1.95. This is an accepted constraint of the spike, not a
   regression to the workspace MSRV: the feature is optional and out of the default
   build, so the default build and the CI MSRV job (`cargo check --workspace`,
   default features) **never compile wasmtime and are unaffected** — the crate
   continues to advertise and honour `rust-version = 1.88.0` for every non-`wasm`
   consumer. Pinning an older wasmtime compatible with 1.88 would mean a materially
   older runtime and API (the whole sandbox in `src/wasm_activities.rs` is written
-  against wasmtime 46's epoch-interruption / `StoreLimits` / component-model
+  against wasmtime 48's epoch-interruption / `StoreLimits` / component-model
   surface); it is a follow-up only if 1.88 support for this feature is ever
-  required.
+  required. (46.0.3, the version originally embedded here, moved to 48.0.3 to
+  clear RUSTSEC-2026-0316 — see `autumn-harvest/Cargo.toml`'s `wasmtime`
+  dependency comment.)
 
 ---
 
