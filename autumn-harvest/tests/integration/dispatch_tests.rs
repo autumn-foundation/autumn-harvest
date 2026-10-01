@@ -798,7 +798,10 @@ async fn retry_backoff_is_honoured_by_the_channel() {
         vec![act_info(
             "flaky",
             fail_once_activity,
-            Some(RetryPolicy::fixed(3, Duration::from_millis(500))),
+            Some(
+                RetryPolicy::fixed(3, Duration::from_millis(500))
+                    .with_jitter(autumn_harvest::policy::JitterPolicy::None),
+            ),
         )],
         shared,
     ));

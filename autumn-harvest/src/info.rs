@@ -1570,7 +1570,8 @@ pub struct DagInfo {
     /// without needing to look up the companion by name.
     pub workflow_handler: Option<WorkflowHandlerFn>,
     /// Maximum spread window for staggering schedule fires. `Duration::ZERO`
-    /// disables jitter (default — today's behaviour).
+    /// disables jitter. `#[dag(schedule = ...)]` defaults to
+    /// [`default_schedule_jitter`](crate::policy::default_schedule_jitter).
     pub jitter: Duration,
     /// What to do when a new firing collides with a still-running execution.
     /// Defaults to [`OverlapPolicy::Skip`].

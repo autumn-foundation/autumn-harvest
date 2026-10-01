@@ -1161,7 +1161,10 @@ async fn backing_off_activity_task_error_column_carries_the_panic_message() {
             "panic_activity",
             panic_activity,
             false,
-            Some(RetryPolicy::fixed(3, Duration::from_secs(3))),
+            Some(
+                RetryPolicy::fixed(3, Duration::from_secs(3))
+                    .with_jitter(autumn_harvest::policy::JitterPolicy::None),
+            ),
         )],
         Arc::clone(&metrics),
     );

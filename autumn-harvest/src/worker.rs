@@ -4956,10 +4956,11 @@ async fn run_local_activity_inline(
                 // clamped to the configured ceiling -- previously this only
                 // ever consulted the registered RetryPolicy's own backoff,
                 // silently ignoring a downstream-supplied delay hint.
+                let seed = local_retry_stream_seed(exec_id, run.activity_id);
                 let policy_delay = run
                     .retry_policy
                     .as_ref()
-                    .and_then(|p| p.next_delay(attempt));
+                    .and_then(|p| p.next_delay_with_seed(attempt, seed));
                 if let Some(delay) =
                     local_retry_delay(policy_delay, typed.as_ref(), registry.retry_after_ceiling)
                 {
@@ -5019,17 +5020,28 @@ pub(crate) fn task_attempt(task: &TaskQueueItem) -> u32 {
     u32::try_from(task.attempt.max(1)).unwrap_or(1)
 }
 
-#[allow(clippy::missing_const_for_fn)]
 fn retry_stream_seed(task: &TaskQueueItem) -> u64 {
+    retry_stream_seed_from_ids(task.workflow_exec_id, task.activity_id)
+}
+
+/// Retry jitter seed for a local activity (issue #1792).
+///
+/// Seed `0` gave every local activity the same jitter, so they stayed in step.
+fn local_retry_stream_seed(exec_id: ExecutionId, activity_id: crate::types::ActivityExecId) -> u64 {
+    retry_stream_seed_from_ids(Some(exec_id.as_uuid()), Some(activity_id.as_uuid()))
+}
+
+#[allow(clippy::missing_const_for_fn)]
+fn retry_stream_seed_from_ids(exec_id: Option<uuid::Uuid>, activity_id: Option<uuid::Uuid>) -> u64 {
     let mut seed = 0xcbf2_9ce4_8422_2325_u64;
-    if let Some(exec) = task.workflow_exec_id {
+    if let Some(exec) = exec_id {
         let raw = exec.as_u128().to_le_bytes();
         seed ^= u64::from_le_bytes(raw[..8].try_into().unwrap_or([0_u8; 8]));
         seed = seed.wrapping_mul(0x1000_0000_01b3);
         seed ^= u64::from_le_bytes(raw[8..].try_into().unwrap_or([0_u8; 8]));
         seed = seed.wrapping_mul(0x1000_0000_01b3);
     }
-    if let Some(activity) = task.activity_id {
+    if let Some(activity) = activity_id {
         let raw = activity.as_u128().to_le_bytes();
         seed ^= u64::from_le_bytes(raw[..8].try_into().unwrap_or([0_u8; 8]));
         seed = seed.wrapping_mul(0x1000_0000_01b3);
@@ -5037,14 +5049,6 @@ fn retry_stream_seed(task: &TaskQueueItem) -> u64 {
         seed = seed.wrapping_mul(0x1000_0000_01b3);
     }
     seed
-}
-
-/// Retry jitter seed for a local activity.
-const fn local_retry_stream_seed(
-    _exec_id: ExecutionId,
-    _activity_id: crate::types::ActivityExecId,
-) -> u64 {
-    0
 }
 
 /// Read the current time from the database clock (`NOW()`).
@@ -5096,15 +5100,15 @@ fn next_retry_delay(
         return Ok(None);
     }
 
+    let seed = retry_stream_seed(task);
     let policy_delay: Option<Duration> = retry_policy.map_or_else(
         || {
-            if task.attempt < task.max_attempts {
-                Some(Duration::from_secs(1))
-            } else {
-                None
-            }
+            // Full jitter over the 1s fallback (issue #1792).
+            (task.attempt < task.max_attempts).then(|| {
+                crate::policy::full_jitter(Duration::from_secs(1), seed, task_attempt(task))
+            })
         },
-        |policy| policy.next_delay_with_seed(task_attempt(task), retry_stream_seed(task)),
+        |policy| policy.next_delay_with_seed(task_attempt(task), seed),
     );
 
     // The attempt-cap gate is authoritative and must never be bypassed by a
@@ -5703,9 +5707,15 @@ fn nd_block_backoff(block_count: i32) -> Duration {
     )
 }
 
-/// Jittered [`nd_block_backoff`] for one execution.
-fn nd_block_backoff_jittered(block_count: i32, _stream_seed: u64) -> Duration {
-    nd_block_backoff(block_count)
+/// [`nd_block_backoff`] with Equal jitter, in `[base/2, base]` (issue #1792).
+///
+/// Executions blocked by one bad deploy must not re-dispatch together. Equal
+/// jitter keeps half the backoff as a floor, so the unbounded loop cannot hot-loop.
+fn nd_block_backoff_jittered(block_count: i32, stream_seed: u64) -> Duration {
+    let attempt = u32::try_from(block_count.max(0))
+        .unwrap_or(u32::MAX)
+        .saturating_add(1);
+    crate::policy::equal_jitter(nd_block_backoff(block_count), stream_seed, attempt)
 }
 
 // ---------------------------------------------------------------------------
@@ -7562,9 +7572,11 @@ fn panic_retry_backoff(strikes: u32) -> Duration {
     )
 }
 
-/// Jittered [`panic_retry_backoff`] for one execution.
-fn panic_retry_backoff_jittered(strikes: u32, _stream_seed: u64) -> Duration {
-    panic_retry_backoff(strikes)
+/// [`panic_retry_backoff`] with Equal jitter, in `[base/2, base]` (issue #1792).
+///
+/// The floor stops a fast, deterministic panic from a hot loop.
+fn panic_retry_backoff_jittered(strikes: u32, stream_seed: u64) -> Duration {
+    crate::policy::equal_jitter(panic_retry_backoff(strikes), stream_seed, strikes.max(1))
 }
 
 /// Whether a contained workflow panic should be re-dispatched or failed
@@ -7947,7 +7959,7 @@ async fn block_workflow_for_non_determinism(
     error: &str,
     details: &crate::error::NonDeterministicDetails,
 ) -> HarvestResult<()> {
-    let backoff = nd_block_backoff(execution.nd_block_count);
+    let backoff = nd_block_backoff_jittered(execution.nd_block_count, retry_stream_seed(task));
     let backoff_chrono = chrono::Duration::from_std(backoff).unwrap_or_default();
     let error_owned = error.to_string();
     let patch = nd_search_attrs_patch(details);
@@ -21859,7 +21871,8 @@ async fn process_workflow_task(
                 // `panic_retry_backoff` is bounded by PANIC_RETRY_BACKOFF_CAP_SECS
                 // (30s), always representable as a chrono::Duration; the fallback
                 // is defensive and still non-zero so it can never hot-loop.
-                let backoff = chrono::Duration::from_std(panic_retry_backoff(strikes))
+                let backoff = panic_retry_backoff_jittered(strikes, retry_stream_seed(task));
+                let backoff = chrono::Duration::from_std(backoff)
                     .unwrap_or_else(|_| chrono::Duration::seconds(30));
                 tracing::warn!(
                     execution_id = %prepared.exec_id,
@@ -39862,9 +39875,15 @@ mod tests {
             let mut delays = std::collections::HashSet::new();
             for exec in 0..100_u64 {
                 let delay = panic_retry_backoff_jittered(strikes, test_seed(exec));
-                assert!(delay <= ceiling, "strikes {strikes}: {delay:?} > {ceiling:?}");
+                assert!(
+                    delay <= ceiling,
+                    "strikes {strikes}: {delay:?} > {ceiling:?}"
+                );
                 assert!(delay >= ceiling / 2, "strikes {strikes}: {delay:?} < half");
-                assert_eq!(delay, panic_retry_backoff_jittered(strikes, test_seed(exec)));
+                assert_eq!(
+                    delay,
+                    panic_retry_backoff_jittered(strikes, test_seed(exec))
+                );
                 delays.insert(delay);
             }
             assert!(delays.len() > 1, "strikes {strikes}: one delay {delays:?}");
@@ -41048,8 +41067,14 @@ mod tests {
         let exec = ExecutionId::from_uuid(uuid::Uuid::from_u128(7));
         let a = crate::types::ActivityExecId::from_uuid(uuid::Uuid::from_u128(1));
         let b = crate::types::ActivityExecId::from_uuid(uuid::Uuid::from_u128(2));
-        assert_eq!(local_retry_stream_seed(exec, a), local_retry_stream_seed(exec, a));
-        assert_ne!(local_retry_stream_seed(exec, a), local_retry_stream_seed(exec, b));
+        assert_eq!(
+            local_retry_stream_seed(exec, a),
+            local_retry_stream_seed(exec, a)
+        );
+        assert_ne!(
+            local_retry_stream_seed(exec, a),
+            local_retry_stream_seed(exec, b)
+        );
     }
 
     #[test]

@@ -264,9 +264,9 @@ below is a concrete task, not a vague warning.
    not until it runs out of attempts, set a high `max_attempts`. Pair it
    with `schedule_to_close` (checklist item 4, below) as the real bound.
 
-   Harvest also supports the same jitter shapes: `JitterPolicy::None`,
-   `Full`, `Equal`, and `Decorrelated`. Use these if your Temporal retry
-   policy used jittered backoff.
+   Harvest supports four jitter shapes: `JitterPolicy::None`, `Full`,
+   `Equal`, and `Decorrelated`. The default is `Full`. Set
+   `JitterPolicy::None` if you need exact backoff timing.
 4. **Translate each timeout name.** This is the single most common porting
    mistake. The two engines invert the meaning of two timeout names:
 

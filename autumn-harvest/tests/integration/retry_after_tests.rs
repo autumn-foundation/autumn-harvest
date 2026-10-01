@@ -819,7 +819,10 @@ mod db_tests {
             vec![act_info(
                 "echo",
                 fail_retry_after_zero,
-                Some(RetryPolicy::fixed(2, Duration::from_secs(2))),
+                Some(
+                    RetryPolicy::fixed(2, Duration::from_secs(2))
+                        .with_jitter(autumn_harvest::policy::JitterPolicy::None),
+                ),
                 None,
             )],
             None,

@@ -721,7 +721,8 @@ async fn scanner_schedules_backoff_from_attempt_completion_not_claim_time() {
     });
     install_config(
         deliverer.clone(),
-        RetryPolicy::exponential(5, Duration::from_millis(50)),
+        RetryPolicy::exponential(5, Duration::from_millis(50))
+            .with_jitter(autumn_harvest::policy::JitterPolicy::None),
     );
 
     let exec_id = ExecutionId::new();

@@ -144,15 +144,21 @@ pub fn dag_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .as_deref()
         .map_or_else(|| quote! { None }, |queue| quote! { Some(#queue) });
 
-    let jitter_expr = attrs.jitter.as_deref().map_or_else(
-        || quote! { ::std::time::Duration::ZERO },
-        |s| {
-            quote! {
-                ::autumn_harvest::task_duration(#s)
-                    .expect(concat!("invalid jitter duration string: ", #s))
-            }
+    // A scheduled DAG with no `jitter` gets the cron default (issue #1792).
+    // An explicit zero, such as `"0s"`, opts out.
+    let jitter_expr = match (attrs.jitter.as_deref(), attrs.schedule.as_deref()) {
+        (Some(s), _) if is_zero_duration(s) => quote! { ::std::time::Duration::ZERO },
+        (Some(s), _) => quote! {
+            ::autumn_harvest::task_duration(#s)
+                .expect(concat!("invalid jitter duration string: ", #s))
         },
-    );
+        (None, Some(expr)) => quote! {
+            ::autumn_harvest::policy::default_schedule_jitter(
+                &::autumn_harvest::Schedule::Cron(#expr.to_string()),
+            )
+        },
+        (None, None) => quote! { ::std::time::Duration::ZERO },
+    };
 
     // Emit execution_timeout/sla as Option<Duration> (issue #743). Already
     // validated for parseability in `parse_attrs`, so `task_duration` here
@@ -391,4 +397,13 @@ fn emit_workflow_companion(
             }
         }
     }
+}
+
+/// Return `true` for a zero duration string, such as `"0s"` or `"0m 0s"`.
+///
+/// `task_duration` rejects a zero total, so the macro handles the opt-out.
+fn is_zero_duration(s: &str) -> bool {
+    s.contains('0')
+        && s.chars()
+            .all(|c| c == '0' || c == ' ' || matches!(c, 's' | 'm' | 'h' | 'd'))
 }

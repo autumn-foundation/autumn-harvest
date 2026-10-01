@@ -32,12 +32,19 @@ pub fn compute_retry_delay(
 }
 
 /// Retry jitter strategy.
+///
+/// The default is [`Full`](Self::Full), so tasks that fail together do not
+/// retry together (issue #1792). Use [`None`](Self::None) for exact timing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum JitterPolicy {
-    #[default]
+    /// Exact backoff, with no jitter.
     None,
+    /// Uniform in `[0, base]`.
+    #[default]
     Full,
+    /// Uniform in `[base/2, base]`.
     Equal,
+    /// Uniform in `[initial, min(prev * 3, max)]`.
     Decorrelated,
 }
 
@@ -59,6 +66,31 @@ const fn uniform_inclusive(seed: u64, lo: u64, hi: u64) -> u64 {
     lo.wrapping_add(offset)
 }
 
+/// Full jitter: a deterministic delay in `[0, base]`.
+///
+/// `stream_seed` and `attempt` select the value, so a replay gets the same delay.
+#[must_use]
+pub fn full_jitter(base: Duration, stream_seed: u64, attempt: u32) -> Duration {
+    let hi = u64::try_from(base.as_nanos()).unwrap_or(u64::MAX);
+    if hi == 0 {
+        return Duration::ZERO;
+    }
+    Duration::from_nanos(uniform_inclusive(stream_seed ^ u64::from(attempt), 0, hi))
+}
+
+/// Equal jitter: a deterministic delay in `[base/2, base]`.
+///
+/// Half of `base` is a floor, so a loop with no attempt cap cannot hot-loop.
+#[must_use]
+pub fn equal_jitter(base: Duration, stream_seed: u64, attempt: u32) -> Duration {
+    let hi = u64::try_from(base.as_nanos()).unwrap_or(u64::MAX);
+    if hi <= 1 {
+        return base;
+    }
+    let lo = hi / 2;
+    Duration::from_nanos(uniform_inclusive(stream_seed ^ u64::from(attempt), lo, hi))
+}
+
 /// Compute deterministic retry delay with jitter.
 #[must_use]
 pub fn compute_retry_delay_with_seed(
@@ -74,21 +106,8 @@ pub fn compute_retry_delay_with_seed(
     );
     match policy.jitter {
         JitterPolicy::None => base,
-        JitterPolicy::Full => {
-            let hi = u64::try_from(base.as_nanos()).unwrap_or(u64::MAX);
-            if hi == 0 {
-                return Duration::ZERO;
-            }
-            Duration::from_nanos(uniform_inclusive(stream_seed ^ u64::from(attempt), 0, hi))
-        }
-        JitterPolicy::Equal => {
-            let hi = u64::try_from(base.as_nanos()).unwrap_or(u64::MAX);
-            if hi <= 1 {
-                return base;
-            }
-            let lo = hi / 2;
-            Duration::from_nanos(uniform_inclusive(stream_seed ^ u64::from(attempt), lo, hi))
-        }
+        JitterPolicy::Full => full_jitter(base, stream_seed, attempt),
+        JitterPolicy::Equal => equal_jitter(base, stream_seed, attempt),
         JitterPolicy::Decorrelated => {
             let prev = if attempt <= 1 {
                 policy.initial_interval
@@ -134,12 +153,13 @@ pub struct RetryPolicy {
     pub max_interval: Duration,
     /// Error type names that must not be retried.
     pub non_retryable_errors: Vec<String>,
+    /// Jitter strategy. Defaults to [`JitterPolicy::Full`], also when the key is absent.
     #[serde(default)]
     pub jitter: JitterPolicy,
 }
 
 impl RetryPolicy {
-    /// Exponential backoff: doubles each retry, capped at 5 minutes.
+    /// Exponential backoff: doubles each retry, capped at 5 minutes, with Full jitter.
     ///
     /// ## Examples
     ///
@@ -159,11 +179,11 @@ impl RetryPolicy {
             backoff_coefficient: 2.0,
             max_interval: Duration::from_secs(300),
             non_retryable_errors: vec![],
-            jitter: JitterPolicy::None,
+            jitter: JitterPolicy::Full,
         }
     }
 
-    /// Fixed delay: same interval every retry.
+    /// Fixed delay: same interval every retry, with Full jitter.
     ///
     /// ## Examples
     ///
@@ -183,7 +203,7 @@ impl RetryPolicy {
             backoff_coefficient: 1.0,
             max_interval: interval,
             non_retryable_errors: vec![],
-            jitter: JitterPolicy::None,
+            jitter: JitterPolicy::Full,
         }
     }
 
@@ -191,13 +211,17 @@ impl RetryPolicy {
     ///
     /// `attempt` is 1-based: 1 = first retry (after the initial failure).
     ///
+    /// This uses seed `0`, so every caller gets the same jitter. Use
+    /// [`next_delay_with_seed`](Self::next_delay_with_seed) to spread tasks.
+    ///
     /// ## Examples
     ///
     /// ```rust
     /// use std::time::Duration;
-    /// use autumn_harvest::policy::RetryPolicy;
+    /// use autumn_harvest::policy::{JitterPolicy, RetryPolicy};
     ///
-    /// let policy = RetryPolicy::exponential(3, Duration::from_secs(1));
+    /// let policy = RetryPolicy::exponential(3, Duration::from_secs(1))
+    ///     .with_jitter(JitterPolicy::None);
     /// assert_eq!(policy.next_delay(1), Some(Duration::from_secs(1)));
     /// assert_eq!(policy.next_delay(3), None); // attempt >= max_attempts
     /// ```
@@ -876,7 +900,8 @@ pub struct WorkflowSchedule {
     ///
     /// The actual fire time is shifted forward by a deterministic offset in
     /// `[0, jitter)` derived from `(schedule_id, scheduled_fire_time)`.
-    /// Defaults to `Duration::ZERO` (no jitter — today's behaviour).
+    /// [`WorkflowSchedule::new`] sets [`default_schedule_jitter`]: 10 s for a cron
+    /// with no seconds field, else zero. Set `Duration::ZERO` to opt out.
     ///
     /// ## Example
     ///
@@ -1022,9 +1047,11 @@ impl WorkflowSchedule {
     /// Defaults: `input = null`, `catchup = false`, `max_active_runs = 1`,
     /// `paused = false`, `queue_name = "default"`, `overlap_policy = Skip`,
     /// `buffer_all_max = 100`, `calendar = None`, `skip_policy = Skip`,
-    /// `catchup_policy = None` (falls back to the `catchup` bool).
+    /// `catchup_policy = None` (falls back to the `catchup` bool),
+    /// `jitter = default_schedule_jitter(&schedule)`.
     #[must_use]
     pub fn new(workflow_name: impl Into<String>, schedule: Schedule) -> Self {
+        let jitter = default_schedule_jitter(&schedule);
         Self {
             workflow_name: workflow_name.into(),
             dag_name: None,
@@ -1034,7 +1061,7 @@ impl WorkflowSchedule {
             max_active_runs: 1,
             paused: false,
             queue_name: "default".to_string(),
-            jitter: Duration::ZERO,
+            jitter,
             overlap_policy: OverlapPolicy::Skip,
             buffer_all_max: 100,
             execution_timeout: None,
@@ -1156,6 +1183,8 @@ impl WorkflowSchedule {
     /// Validation at build time rejects values that would cause consecutive fires
     /// to collide (`jitter >= period` for `Interval` schedules) or exceed the
     /// 1-hour sane upper bound for `Cron` schedules.
+    ///
+    /// `Duration::ZERO` turns off the default cron jitter.
     #[must_use]
     pub const fn with_jitter(mut self, jitter: Duration) -> Self {
         self.jitter = jitter;
@@ -1337,13 +1366,24 @@ pub fn validate_schedule(schedule: &Schedule) -> Result<(), String> {
     }
 }
 
-/// Default fire jitter for a cron schedule with no seconds field.
-pub const DEFAULT_CRON_JITTER: Duration = Duration::ZERO;
+/// Default fire jitter for a cron schedule with no seconds field (issue #1792).
+pub const DEFAULT_CRON_JITTER: Duration = Duration::from_secs(10);
 
 /// Return the default fire jitter for `schedule`.
+///
+/// A cron with five fields fires at most once a minute, so 10 s cannot reach
+/// the next fire. A sixth field is seconds, so that cron gets zero. Interval
+/// and manual schedules also get zero.
 #[must_use]
-pub const fn default_schedule_jitter(_schedule: &Schedule) -> Duration {
-    Duration::ZERO
+pub fn default_schedule_jitter(schedule: &Schedule) -> Duration {
+    match schedule {
+        Schedule::Cron(expr) | Schedule::CronInTimezone { expr, .. }
+            if expr.split_whitespace().count() < 6 =>
+        {
+            DEFAULT_CRON_JITTER
+        }
+        _ => Duration::ZERO,
+    }
 }
 
 /// Maximum jitter allowed for a [`Schedule::Cron`] schedule (1 hour).
@@ -1889,8 +1929,8 @@ mod tests {
 
     #[test]
     fn retry_jitter_bounds_over_10k_seeds() {
-        let base = RetryPolicy::exponential(8, Duration::from_millis(200))
-            .with_jitter(JitterPolicy::None);
+        let base =
+            RetryPolicy::exponential(8, Duration::from_millis(200)).with_jitter(JitterPolicy::None);
         for attempt in 1..6 {
             let base_delay = base.next_delay(attempt).unwrap();
             for seed in 0..10_000_u64 {

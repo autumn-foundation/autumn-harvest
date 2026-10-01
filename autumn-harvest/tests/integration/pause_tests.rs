@@ -1294,8 +1294,11 @@ async fn retry_path_requeues_when_a_concurrent_resume_shifted_the_deadline() {
     params.max_attempts = 5;
     params.schedule_to_close_at = Some(chrono::Utc::now() + chrono::Duration::seconds(30));
     params.retry_policy = Some(
-        serde_json::to_value(RetryPolicy::fixed(5, Duration::from_secs(300)))
-            .expect("retry policy serializes"),
+        serde_json::to_value(
+            RetryPolicy::fixed(5, Duration::from_secs(300))
+                .with_jitter(autumn_harvest::policy::JitterPolicy::None),
+        )
+        .expect("retry policy serializes"),
     );
     let task_id = queue::enqueue(&mut conn, &params)
         .await
@@ -1550,8 +1553,11 @@ async fn retry_path_requeues_when_a_concurrent_pause_committed_after_the_gate() 
     params.max_attempts = 5;
     params.schedule_to_close_at = Some(chrono::Utc::now() + chrono::Duration::seconds(30));
     params.retry_policy = Some(
-        serde_json::to_value(RetryPolicy::fixed(5, Duration::from_secs(300)))
-            .expect("retry policy serializes"),
+        serde_json::to_value(
+            RetryPolicy::fixed(5, Duration::from_secs(300))
+                .with_jitter(autumn_harvest::policy::JitterPolicy::None),
+        )
+        .expect("retry policy serializes"),
     );
     let task_id = queue::enqueue(&mut conn, &params)
         .await

@@ -631,9 +631,10 @@ async fn divergent_replay_blocks_instead_of_failing() {
     let (task_state, scheduled_at, sticky, task_error) =
         get_workflow_task(&mut conn, exec_id).await;
     assert_eq!(task_state, "PENDING");
+    // Equal jitter defers the first re-dispatch by 2.5s to 5s (issue #1792).
     assert!(
-        scheduled_at > chrono::Utc::now() + chrono::Duration::seconds(2),
-        "first block must defer the re-dispatch by ~5s; got {scheduled_at}"
+        scheduled_at > chrono::Utc::now() + chrono::Duration::seconds(1),
+        "first block must defer the re-dispatch by 2.5s to 5s; got {scheduled_at}"
     );
     assert!(sticky.is_none(), "sticky affinity must be cleared");
     assert!(
@@ -941,14 +942,15 @@ async fn reblock_increments_count_and_grows_backoff() {
     let _ = handle2.await;
 
     assert_eq!(get_state(&mut conn, exec_id).await, "RUNNING");
-    // First block defers ~5s, second ~10s. Generous slop for CI clocks.
+    // Equal jitter: the first block defers 2.5s to 5s, the second 5s to 10s
+    // (issue #1792). Generous slop for CI clocks.
     assert!(
         second_delay > first_delay,
         "backoff must grow: first={first_delay}, second={second_delay}"
     );
     assert!(
-        second_delay > chrono::Duration::seconds(6),
-        "second block must defer by ~10s; got {second_delay}"
+        second_delay > chrono::Duration::seconds(3),
+        "second block must defer by 5s to 10s; got {second_delay}"
     );
     assert_eq!(metrics.nd_block_count(), 2);
     assert_eq!(

@@ -90,7 +90,8 @@ use autumn_harvest::models::{
 };
 use autumn_harvest::payload_codec::{LossyDecodeOutcome, PayloadCodecs};
 use autumn_harvest::policy::{
-    Schedule, SkipPolicy, WorkflowSchedule, compute_jitter_offset, validate_jitter,
+    Schedule, SkipPolicy, WorkflowSchedule, compute_jitter_offset, default_schedule_jitter,
+    validate_jitter,
 };
 use autumn_harvest::queue::{self, ConcurrencyKeyStats};
 use autumn_harvest::reset::{
@@ -3059,9 +3060,10 @@ struct CreateWorkflowScheduleRequest {
     paused: bool,
     #[serde(default = "default_queue_name")]
     queue_name: String,
-    /// Jitter window in seconds. `0` disables jitter (default).
+    /// Jitter window in seconds. `0` disables jitter. When omitted, a cron
+    /// schedule gets `default_schedule_jitter` (issue #1792).
     #[serde(default)]
-    jitter_secs: u64,
+    jitter_secs: Option<u64>,
     /// Overlap policy string (e.g. `"skip"`, `"buffer_one"`, `"buffer_all"`,
     /// `"cancel_other"`, `"terminate_other"`). Defaults to `"skip"`.
     #[serde(default = "default_overlap_policy")]
@@ -27327,6 +27329,10 @@ async fn create_workflow_schedule(
         }
     }
 
+    let jitter = request.jitter_secs.map_or_else(
+        || default_schedule_jitter(&schedule),
+        std::time::Duration::from_secs,
+    );
     let ws = WorkflowSchedule {
         workflow_name: request.workflow_name.clone(),
         dag_name: None,
@@ -27336,7 +27342,7 @@ async fn create_workflow_schedule(
         max_active_runs: request.max_active_runs,
         paused: request.paused,
         queue_name: request.queue_name.clone(),
-        jitter: std::time::Duration::from_secs(request.jitter_secs),
+        jitter,
         overlap_policy,
         buffer_all_max: request.buffer_all_max,
         execution_timeout: None,
@@ -44716,8 +44722,9 @@ struct CandidateSchedulePreviewRequest {
     max_active_runs: u32,
     #[serde(default)]
     paused: bool,
+    /// When omitted, a cron schedule gets `default_schedule_jitter`, as on create.
     #[serde(default)]
-    jitter_secs: u64,
+    jitter_secs: Option<u64>,
     #[serde(default = "default_overlap_policy")]
     overlap_policy: String,
     #[serde(default = "default_buffer_all_max")]
@@ -45191,7 +45198,10 @@ async fn preview_candidate_schedule_handler(
 
     // Validate jitter before i64 conversion; body.jitter_secs is u64 so an
     // overly large value would overflow chrono::Duration::seconds and panic.
-    let jitter_duration = std::time::Duration::from_secs(body.jitter_secs);
+    let jitter_duration = body.jitter_secs.map_or_else(
+        || default_schedule_jitter(&schedule),
+        std::time::Duration::from_secs,
+    );
     if let Err(e) = validate_jitter(&schedule, jitter_duration) {
         return Ok((
             StatusCode::BAD_REQUEST,
@@ -45200,7 +45210,7 @@ async fn preview_candidate_schedule_handler(
     }
     // Safe after validate_jitter: valid jitter is at most 3600 s for cron,
     // or less than the interval period, both well within i64 range.
-    let jitter_secs = i64::try_from(body.jitter_secs).unwrap_or(i64::MAX);
+    let jitter_secs = i64::try_from(jitter_duration.as_secs()).unwrap_or(i64::MAX);
 
     // Verify the calendar exists before returning any result so that a typo
     // here gets a 400 even when the schedule is paused.  Exclusion dates are
@@ -45277,7 +45287,7 @@ async fn preview_candidate_schedule_handler(
         raw_entries.iter().map(|e| e.effective_at).collect();
 
     if jitter_secs > 0 {
-        let jitter_window = std::time::Duration::from_secs(body.jitter_secs);
+        let jitter_window = jitter_duration;
         for entry in &mut raw_entries {
             if let Some(t) = entry.effective_at {
                 let offset = compute_jitter_offset(schedule_id, t, jitter_window);
@@ -54222,7 +54232,7 @@ mod tests {
             serde_json::from_str(json).expect("should deserialize minimal body");
         assert_eq!(req.schedule_expr, "0 9 * * 1-5");
         assert_eq!(req.timezone, "UTC");
-        assert_eq!(req.jitter_secs, 0);
+        assert_eq!(req.jitter_secs, None);
         assert_eq!(req.overlap_policy, "skip");
         assert_eq!(req.count, 10);
         assert!(req.from.is_none());
@@ -54242,7 +54252,7 @@ mod tests {
         let req: CandidateSchedulePreviewRequest =
             serde_json::from_str(json).expect("should deserialize full body");
         assert_eq!(req.timezone, "America/Los_Angeles");
-        assert_eq!(req.jitter_secs, 300);
+        assert_eq!(req.jitter_secs, Some(300));
         assert_eq!(req.overlap_policy, "cancel_other");
         assert_eq!(req.count, 20);
         assert_eq!(req.from.as_deref(), Some("2026-06-01T09:00:00Z"));
@@ -54883,7 +54893,7 @@ mod tests {
         );
         let req: CandidateSchedulePreviewRequest =
             serde_json::from_str(&json).expect("u64::MAX must parse into the struct");
-        assert_eq!(req.jitter_secs, u64::MAX);
+        assert_eq!(req.jitter_secs, Some(u64::MAX));
     }
 
     #[test]

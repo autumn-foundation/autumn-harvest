@@ -7096,7 +7096,7 @@
   "name": "jitter_secs",
   "type": "integer",
   "required": false,
-  "description": "Random delay added to each fire, in seconds, to spread a thundering herd."
+  "description": "Jitter window in seconds. Spreads fires to avoid a thundering herd. 0 disables jitter. When omitted, a cron schedule with no seconds field gets 10, and other schedules get 0."
           },
           {
   "name": "overlap_policy",
@@ -7831,7 +7831,7 @@
           {
             "name": "jitter_secs",
             "type": "integer",
-            "description": "Jitter window in seconds. 0 disables jitter. Validated via validate_jitter."
+            "description": "Jitter window in seconds. 0 disables jitter. When omitted, a cron schedule with no seconds field gets 10, as on create. Validated via validate_jitter."
           },
           {
             "name": "overlap_policy",
