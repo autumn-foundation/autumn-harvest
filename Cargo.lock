@@ -6139,6 +6139,7 @@ dependencies = [
  "autumn-harvest-cli",
  "autumn-harvest-plugin",
  "axum",
+ "deadpool",
  "diesel",
  "diesel-async",
  "hex",

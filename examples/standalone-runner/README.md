@@ -5,10 +5,15 @@ This example embeds Harvest in a plain Axum server. Its `Cargo.toml` has no
 not install `HarvestPlugin`.
 
 `autumn-harvest-plugin` still depends on `autumn-web`, so the crate is in the
-build graph. The point is that the embedder never names it. A change that puts
-an `autumn_web::` type back into the standalone surface fails to compile here.
+build graph. The point is that the embedder never names it. A plugin API that
+needs an `autumn_web::` type with no plugin re-export fails to compile here.
 Two tests in `src/tests.rs` also fail when the manifest or the source names
 `autumn-web`.
+
+Some types still come from `autumn-web`. The webhook config types are
+`autumn-web` types that `autumn_harvest_plugin::webhook_receiver` re-exports.
+`HarvestEmbedding::start` returns an `autumn-web` error, which the example
+only formats.
 
 | Need | How the example does it, with no `autumn-web` |
 |---|---|
@@ -40,14 +45,14 @@ cargo run -p standalone-runner
 
 In the `dev` profile the runner applies the Harvest migrations itself. The
 `dev` admin API needs no credential. Do not expose a `dev` process beyond
-localhost.
+localhost. Ctrl-C or SIGTERM drains the worker and stops the process.
 
 | Variable | Default | Use |
 |---|---|---|
 | `DATABASE_URL` | `postgres://runner:runner@localhost:5434/runner` | The Harvest database |
-| `AUTUMN_PROFILE` | none (`unknown`) | Deployment profile. `dev` also applies migrations. |
-| `STANDALONE_RUNNER_ADDR` | `127.0.0.1:8082` | Listen address |
-| `STANDALONE_RUNNER_WEBHOOK_SECRET` | none | HMAC secret. The webhook route exists only when this is set. |
+| `AUTUMN_ENV` or `AUTUMN_PROFILE` | none (`unknown`) | Deployment profile. `AUTUMN_ENV` wins. `dev` or `development` also applies migrations. |
+| `STANDALONE_RUNNER_ADDR` | `127.0.0.1:8082` | Listen address. Port `0` picks a free port. Some routes have no auth, so keep it on localhost or behind your own auth layer. |
+| `STANDALONE_RUNNER_WEBHOOK_SECRET` | none | HMAC secret. The webhook route exists only when this is set. Outside `dev`, a secret under 32 bytes refuses boot. |
 
 Routes:
 
@@ -77,7 +82,7 @@ cargo run -p autumn-harvest-cli -- --base-url http://localhost:8082/api/harvest 
 
 ## Run outside `dev`
 
-Outside `dev`, the runner does not migrate, and every admin route needs a
+Outside `dev`, the runner does not migrate. Every admin route needs a
 credential. Apply the migrations and seed the first API token first:
 
 ```bash
@@ -88,24 +93,28 @@ cargo run -p autumn-harvest-cli -- token bootstrap
 
 `token bootstrap` prints a secret and an `INSERT` statement. Run the statement
 against the database, and keep the secret. Then start the runner and send the
-secret as a bearer token:
+secret as a bearer token. `read -rs` keeps the secret out of the shell history:
 
 ```bash
 AUTUMN_PROFILE=prod cargo run -p standalone-runner
 
-HARVEST_TOKEN=<secret> cargo run -p autumn-harvest-cli -- \
-  --base-url http://localhost:8082/api/harvest preflight
+read -rs HARVEST_TOKEN && export HARVEST_TOKEN
+cargo run -p autumn-harvest-cli -- --base-url http://localhost:8082/api/harvest preflight
 ```
 
-The token gates the admin routes only. The other routes, for example a
-workflow start, have no auth here. Put your own auth layer in front of
-`harvest.router()` in production. Until then, `preflight` reports
-`admin_auth_boundary` as `fail` outside `dev`. That result is correct.
+The token gates the admin routes only. A workflow start and the workflow reads
+have no auth here. For production, put your own auth layer in front of
+`harvest.router()`. Then declare it with
+`StandaloneAdminAuth::with_admin_auth_boundary()`.
+
+Until you do, `preflight` reports `admin_auth_boundary` as `fail` under a
+named non-`dev` profile. It reports `warn` when the profile is unknown. Both
+results are correct. The acceptance suite pins the `fail`.
 
 ## Webhooks
 
 ```bash
-STANDALONE_RUNNER_WEBHOOK_SECRET=<at least 16 bytes> \
+STANDALONE_RUNNER_WEBHOOK_SECRET=<random secret, 32 bytes or more> \
 AUTUMN_PROFILE=dev cargo run -p standalone-runner
 ```
 

@@ -62,9 +62,13 @@ pub fn build_router(
 /// The signed order webhook, verified with `secret`.
 ///
 /// Replay protection is off. The mapped workflow id dedupes a redelivery.
+///
+/// `build_webhook_router` checks only that the secret is not empty. With
+/// `is_production`, this also refuses a short or demo secret.
 pub fn order_webhook_router(
     api_state: &HarvestApiState,
     secret: &str,
+    is_production: bool,
 ) -> Result<axum::Router, BoxError> {
     let config = WebhookConfig {
         endpoints: vec![
@@ -73,6 +77,7 @@ pub fn order_webhook_router(
         ],
         ..WebhookConfig::default()
     };
+    config.validate(is_production)?;
     let router = build_webhook_router(
         &webhooks::webhooks(),
         &workflows::workflows(),
@@ -83,7 +88,7 @@ pub fn order_webhook_router(
     Ok(router)
 }
 
-/// Migrate in `dev`, start Harvest, and serve until Ctrl-C.
+/// Migrate in `dev`, start Harvest, and serve until Ctrl-C or SIGTERM.
 ///
 /// Each step that can fail runs before `start`. After `start`, the runtime
 /// always stops, also when the server fails.
@@ -95,7 +100,8 @@ pub async fn run() -> Result<(), BoxError> {
         .parse()?;
 
     // `with_ambient_profile` below reads the same profile.
-    if ambient_deployment_profile().as_deref() == Some("dev") {
+    let is_dev = ambient_deployment_profile().as_deref() == Some("dev");
+    if is_dev {
         let report = db::run_pending_migrations(&database_url).await?;
         tracing::info!(applied = report.applied.len(), "applied Harvest migrations");
     }
@@ -105,9 +111,11 @@ pub async fn run() -> Result<(), BoxError> {
     let api_state = HarvestApiState::new();
     let webhooks = std::env::var("STANDALONE_RUNNER_WEBHOOK_SECRET")
         .ok()
-        .map(|secret| order_webhook_router(&api_state, &secret))
+        .map(|secret| order_webhook_router(&api_state, &secret, !is_dev))
         .transpose()?;
     let listener = tokio::net::TcpListener::bind(address).await?;
+    // Port 0 picks a free port, so log the address the socket really has.
+    let address = listener.local_addr()?;
 
     let metrics = HarvestMetricsRecorder::new();
     let harvest = HarvestEmbedding::new(
@@ -131,8 +139,31 @@ pub async fn run() -> Result<(), BoxError> {
     Ok(served?)
 }
 
+/// Resolve on Ctrl-C, or on SIGTERM from a process manager.
 async fn shutdown_signal() {
-    if let Err(error) = tokio::signal::ctrl_c().await {
-        tracing::warn!(%error, "failed to listen for shutdown signal");
+    let ctrl_c = async {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::warn!(%error, "failed to listen for Ctrl-C");
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut stream) => {
+                stream.recv().await;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "failed to listen for SIGTERM");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        () = ctrl_c => {}
+        () = terminate => {}
     }
 }

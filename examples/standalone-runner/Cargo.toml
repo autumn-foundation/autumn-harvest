@@ -8,8 +8,9 @@ publish = false
 [dependencies]
 autumn-harvest = { version = "0.6.0", path = "../../autumn-harvest", features = ["db", "testing"] }
 autumn-harvest-plugin = { version = "0.6.0", path = "../../autumn-harvest-plugin", features = ["metrics", "webhooks"] }
-# Issue #1615: no `autumn-web` entry. `src/tests.rs` fails the build if one returns.
+# Issue #1615: no `autumn-web` entry. A unit test in `src/tests.rs` fails if one returns.
 axum = "0.8"
+deadpool = { workspace = true, features = ["rt_tokio_1"] }
 diesel-async = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

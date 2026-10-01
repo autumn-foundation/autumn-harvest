@@ -807,6 +807,32 @@ fn claim_budget_gate_has_a_covering_manifest_row() {
     );
 }
 
+/// Issue #1615. Each test target of the `standalone-runner` example runs
+/// from a manifest row. The guard above scans only the core and plugin
+/// test directories, so a deleted row would go unseen.
+#[test]
+fn standalone_runner_test_targets_have_a_running_row() {
+    let rows = parse_manifest();
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../examples/standalone-runner/tests");
+    let targets: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            (path.extension()? == "rs").then(|| path.file_stem()?.to_str().map(str::to_owned))?
+        })
+        .collect();
+    assert!(!targets.is_empty(), "the example has an acceptance suite");
+    for target in targets {
+        assert!(
+            rows.iter().any(|r| r.krate == "standalone-runner"
+                && r.target == target
+                && r.osclass == "linux"
+                && r.filter == "-"),
+            "examples/standalone-runner/tests/{target}.rs needs a `linux standalone-runner {target}` row"
+        );
+    }
+}
+
 #[test]
 fn strip_line_comments_drops_prose_container_tokens() {
     let src = "//! see the testcontainers suite\nlet x = 1; // TestDb reference in prose\ncode();";

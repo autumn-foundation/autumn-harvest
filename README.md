@@ -328,9 +328,9 @@ context — a worker or CLI process with no HTTP surface at all — use the bare
 no framework dependency of its own. To expose the management API (and, for
 the Vantage UI, `harvest_ui_router`) from a Rust service on plain Axum
 instead of autumn-web, mount `autumn-harvest-plugin`'s `harvest_api_router`
-yourself — [`examples/standalone-runner`](examples/standalone-runner/)
-demonstrates the management-API mount with no `autumn-web` entry in its
-`Cargo.toml`. Both routers return
+yourself. [`examples/standalone-runner`](examples/standalone-runner/)
+mounts both routers through `HarvestEmbedding`. Its `Cargo.toml` has no
+`autumn-web` entry. Both routers return
 `axum::Router<()>`, so this path is for Axum services, not an arbitrary
 framework.
 

@@ -271,23 +271,40 @@ fn guard_detects_every_way_to_name_autumn_web() {
 }
 
 /// Issue #1615. No code line may name the `autumn_web` crate. A re-export
-/// through another crate would compile, so the guard reads the source.
+/// through another crate would compile, so the guard reads the source. It
+/// reads every `.rs` file of the crate, so a new `build.rs` is covered too.
 #[test]
 fn source_names_no_autumn_web_path() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut offenders = Vec::new();
-    for dir in ["src", "tests"] {
-        for path in rust_files(&root.join(dir)) {
-            let text = std::fs::read_to_string(&path).expect("source should read");
-            for (number, line) in text.lines().enumerate() {
-                let code = line.split("//").next().unwrap_or_default();
-                if names_crate(code, CRATE) {
-                    offenders.push(format!("{}:{}", path.display(), number + 1));
-                }
+    for path in rust_files(root) {
+        let text = std::fs::read_to_string(&path).expect("source should read");
+        for (number, line) in text.lines().enumerate() {
+            if names_crate(code_part(line), CRATE) {
+                offenders.push(format!("{}:{}", path.display(), number + 1));
             }
         }
     }
     assert!(offenders.is_empty(), "autumn-web paths: {offenders:?}");
+}
+
+/// `line` up to its `//` comment. A `//` inside a string is code.
+fn code_part(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut in_string = false;
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' if in_string => index += 1,
+            b'"' => in_string = !in_string,
+            // A quote in a char literal does not open a string.
+            b'\'' if !in_string && bytes.get(index + 2) == Some(&b'\'') => index += 2,
+            b'/' if !in_string && bytes.get(index + 1) == Some(&b'/') => return &line[..index],
+            _ => {}
+        }
+        index += 1;
+    }
+    line
 }
 
 /// The crate name the source guard looks for, split so this file passes.
@@ -301,6 +318,15 @@ fn names_crate(code: &str, name: &str) -> bool {
         let after = code[start + name.len()..].chars().next();
         !before.is_some_and(is_ident) && !after.is_some_and(is_ident)
     })
+}
+
+#[test]
+fn source_guard_reads_code_after_a_url_in_a_string() {
+    let line = format!("let u = \"http://x\"; {CRATE}::f(); // {CRATE}");
+    let code = code_part(&line);
+    assert!(names_crate(code, CRATE), "{code}");
+    assert!(!code.ends_with(CRATE), "the comment is cut: {code}");
+    assert_eq!(code_part("let c = '\"'; // x"), "let c = '\"'; ");
 }
 
 #[test]
@@ -320,6 +346,13 @@ fn rust_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut files = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
+        let skipped = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "target" || name.starts_with('.'));
+        if skipped {
+            continue;
+        }
         if path.is_dir() {
             files.extend(rust_files(&path));
         } else if path.extension().is_some_and(|ext| ext == "rs") {

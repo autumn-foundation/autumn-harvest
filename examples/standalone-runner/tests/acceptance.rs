@@ -5,15 +5,15 @@
 //! `autumn-web`, so this is the epic's definition of done, run end to end.
 //!
 //! Dual-mode database. `HARVEST_TEST_DATABASE_URL` gives each test a fresh
-//! database on that server. Otherwise each test starts a Postgres 16
-//! container.
+//! database on that server, dropped after the test. Otherwise each test
+//! starts a Postgres 16 container. The tests run one at a time.
 
 #![cfg(unix)]
 
 use std::fs::File;
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
@@ -28,12 +28,53 @@ const WEBHOOK_SECRET: &str = "acceptance-webhook-secret-0123456789";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const RESULT_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// One runner and one database at a time.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Every request times out, so a hung runner fails the test.
+static HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("the HTTP client should build")
+});
+
 // ---------------------------------------------------------------------------
 // Database
 // ---------------------------------------------------------------------------
 
-/// Keeps a container alive for the test. `None` on the shared-server path.
-type DbGuard = Option<ContainerAsync<Postgres>>;
+/// Keeps the test database alive. Drop removes it.
+enum DbGuard {
+    /// A database on the `HARVEST_TEST_DATABASE_URL` server.
+    Shared { base_url: String, name: String },
+    /// A Postgres container.
+    Container(#[allow(dead_code)] Box<ContainerAsync<Postgres>>),
+}
+
+impl Drop for DbGuard {
+    fn drop(&mut self) {
+        let Self::Shared { base_url, name } = self else {
+            return;
+        };
+        let sql = format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)");
+        let base_url = base_url.clone();
+        // Drop runs inside the test runtime, so a fresh thread owns the work.
+        let dropped = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a cleanup runtime should build");
+            runtime.block_on(async move {
+                let mut admin = AsyncPgConnection::establish(&base_url).await.ok()?;
+                diesel::sql_query(sql).execute(&mut admin).await.ok()
+            })
+        })
+        .join();
+        if !matches!(dropped, Ok(Some(_))) {
+            eprintln!("could not drop the test database {name}");
+        }
+    }
+}
 
 /// A fresh, empty database. No migration is applied.
 async fn empty_database() -> (String, DbGuard) {
@@ -46,8 +87,8 @@ async fn empty_database() -> (String, DbGuard) {
             .execute(&mut admin)
             .await
             .expect("create a database");
-        let (prefix, _) = base_url.rsplit_once('/').expect("url names a database");
-        return (format!("{prefix}/{name}"), None);
+        let url = with_database(&base_url, &name);
+        return (url, DbGuard::Shared { base_url, name });
     }
     let container = Postgres::default()
         .with_tag("16")
@@ -60,7 +101,35 @@ async fn empty_database() -> (String, DbGuard) {
         .await
         .expect("container port");
     let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
-    (url, Some(container))
+    (url, DbGuard::Container(Box::new(container)))
+}
+
+/// `url` with its database name replaced by `name`. The query is kept.
+fn with_database(url: &str, name: &str) -> String {
+    let (location, query) = url
+        .split_once('?')
+        .map_or((url, None), |(l, q)| (l, Some(q)));
+    let (authority, _) = location
+        .rsplit_once('/')
+        .filter(|(authority, _)| authority.contains("//") && !authority.ends_with('/'))
+        .unwrap_or((location, ""));
+    query.map_or_else(
+        || format!("{authority}/{name}"),
+        |query| format!("{authority}/{name}?{query}"),
+    )
+}
+
+#[test]
+fn with_database_keeps_the_query_and_the_authority() {
+    assert_eq!(
+        with_database("postgres://u:p@h:5432/base?sslmode=disable", "x"),
+        "postgres://u:p@h:5432/x?sslmode=disable"
+    );
+    assert_eq!(
+        with_database("postgres://u@h/base", "x"),
+        "postgres://u@h/x"
+    );
+    assert_eq!(with_database("postgres://u@h", "x"), "postgres://u@h/x");
 }
 
 fn uuid_suffix() -> String {
@@ -103,42 +172,88 @@ struct Runner {
     log: PathBuf,
 }
 
-impl Runner {
-    /// Start the binary and wait until `GET /` answers.
-    async fn start(database_url: &str, profile: &str, webhook_secret: Option<&str>) -> Self {
-        let port = free_port();
-        let log = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("runner-{port}.log"));
+/// The settings of one runner process.
+struct Launch<'a> {
+    database_url: &'a str,
+    profile: &'a str,
+    webhook_secret: Option<&'a str>,
+}
+
+impl<'a> Launch<'a> {
+    const fn new(database_url: &'a str, profile: &'a str) -> Self {
+        Self {
+            database_url,
+            profile,
+            webhook_secret: None,
+        }
+    }
+
+    const fn webhook_secret(mut self, secret: &'a str) -> Self {
+        self.webhook_secret = Some(secret);
+        self
+    }
+
+    /// Spawn the binary on port 0. Its log names the bound address.
+    fn spawn(&self) -> (Child, PathBuf) {
+        let log =
+            Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("runner-{}.log", uuid_suffix()));
         let file = File::create(&log).expect("create the runner log");
         let mut command = Command::new(env!("CARGO_BIN_EXE_standalone-runner"));
         command
-            .env("DATABASE_URL", database_url)
-            .env("AUTUMN_PROFILE", profile)
-            .env("STANDALONE_RUNNER_ADDR", format!("127.0.0.1:{port}"))
+            .env("DATABASE_URL", self.database_url)
+            .env("AUTUMN_PROFILE", self.profile)
+            .env("STANDALONE_RUNNER_ADDR", "127.0.0.1:0")
             .env_remove("AUTUMN_ENV")
             .env_remove("STANDALONE_RUNNER_WEBHOOK_SECRET")
             .stdin(Stdio::null())
             .stdout(file.try_clone().expect("share the log file"))
             .stderr(file);
-        if let Some(secret) = webhook_secret {
+        if let Some(secret) = self.webhook_secret {
             command.env("STANDALONE_RUNNER_WEBHOOK_SECRET", secret);
         }
         let child = command.spawn().expect("the runner binary should spawn");
-        let mut runner = Self {
+        (child, log)
+    }
+
+    /// Start the binary and wait until `GET /` answers.
+    async fn start(&self) -> Runner {
+        let (child, log) = self.spawn();
+        let mut runner = Runner {
             child,
-            base: format!("http://127.0.0.1:{port}"),
+            base: String::new(),
             log,
         };
         runner.wait_until_ready().await;
         runner
     }
 
+    /// Start the binary and expect it to exit before it serves.
+    fn refused(&self) -> (ExitStatus, String) {
+        let (child, log) = self.spawn();
+        let mut runner = Runner {
+            child,
+            base: String::new(),
+            log,
+        };
+        let status = runner.wait_for_exit();
+        (status, runner.log())
+    }
+}
+
+impl Runner {
     async fn wait_until_ready(&mut self) {
         let deadline = Instant::now() + STARTUP_TIMEOUT;
         loop {
             if let Some(status) = self.child.try_wait().expect("poll the child") {
                 panic!("the runner exited during startup: {status}\n{}", self.log());
             }
-            if let Ok(response) = reqwest::get(&self.base).await
+            if self.base.is_empty()
+                && let Some(address) = listening_address(&self.log())
+            {
+                self.base = format!("http://{address}");
+            }
+            if !self.base.is_empty()
+                && let Ok(response) = HTTP.get(&self.base).send().await
                 && response.status().is_success()
             {
                 return;
@@ -161,14 +276,18 @@ impl Runner {
         format!("{}{path}", self.base)
     }
 
-    /// Send SIGINT, as Ctrl-C does, and wait for the exit.
-    fn interrupt(mut self) -> ExitStatus {
+    /// Send `signal`, for example `INT` for Ctrl-C, and wait for the exit.
+    fn stop_with(mut self, signal: &str) -> ExitStatus {
         let pid = self.child.id().to_string();
         let sent = Command::new("kill")
-            .args(["-INT", &pid])
+            .args([&format!("-{signal}"), &pid])
             .status()
             .expect("kill should run");
-        assert!(sent.success(), "SIGINT should reach the runner");
+        assert!(sent.success(), "SIG{signal} should reach the runner");
+        self.wait_for_exit()
+    }
+
+    fn wait_for_exit(&mut self) -> ExitStatus {
         let deadline = Instant::now() + STARTUP_TIMEOUT;
         loop {
             if let Some(status) = self.child.try_wait().expect("poll the child") {
@@ -191,12 +310,11 @@ impl Drop for Runner {
     }
 }
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind an ephemeral port")
-        .local_addr()
-        .expect("read the bound address")
-        .port()
+/// The address from the runner's `listening` log line.
+fn listening_address(log: &str) -> Option<&str> {
+    let line = log.lines().find(|line| line.contains("runner listening"))?;
+    let address = line.split("address=").nth(1)?;
+    address.split_whitespace().next()
 }
 
 // ---------------------------------------------------------------------------
@@ -204,7 +322,7 @@ fn free_port() -> u16 {
 // ---------------------------------------------------------------------------
 
 async fn get(url: &str, bearer: Option<&str>) -> reqwest::Response {
-    let mut request = reqwest::Client::new().get(url);
+    let mut request = HTTP.get(url);
     if let Some(token) = bearer {
         request = request.bearer_auth(token);
     }
@@ -212,7 +330,7 @@ async fn get(url: &str, bearer: Option<&str>) -> reqwest::Response {
 }
 
 async fn start_order(runner: &Runner, workflow_id: &str) {
-    let response = reqwest::Client::new()
+    let response = HTTP
         .post(runner.url("/api/harvest/workflows/standalone_order/start"))
         .json(&json!({
             "workflow_id": workflow_id,
@@ -259,8 +377,7 @@ fn sign(body: &[u8]) -> String {
 }
 
 async fn post_webhook(runner: &Runner, body: &[u8], signature: &str) -> reqwest::StatusCode {
-    reqwest::Client::new()
-        .post(runner.url("/hooks/orders"))
+    HTTP.post(runner.url("/hooks/orders"))
         .header("Content-Type", "application/json")
         .header("X-Webhook-Signature", signature)
         .header("X-Webhook-Delivery", "delivery-1")
@@ -281,8 +398,9 @@ async fn post_webhook(runner: &Runner, body: &[u8], signature: &str) -> reqwest:
 /// process cleanly.
 #[tokio::test]
 async fn dev_profile_migrates_runs_an_order_and_reports_metrics() {
+    let _serial = SERIAL.lock().await;
     let (url, _db) = empty_database().await;
-    let runner = Runner::start(&url, "dev", None).await;
+    let runner = Launch::new(&url, "dev").start().await;
 
     let vantage = get(&runner.url("/api/harvest/ui"), None).await;
     assert_eq!(
@@ -304,7 +422,7 @@ async fn dev_profile_migrates_runs_an_order_and_reports_metrics() {
         "missing the started sample:\n{text}"
     );
 
-    let status = runner.interrupt();
+    let status = runner.stop_with("INT");
     assert!(status.success(), "Ctrl-C should stop cleanly: {status}");
 }
 
@@ -313,10 +431,11 @@ async fn dev_profile_migrates_runs_an_order_and_reports_metrics() {
 /// does not.
 #[tokio::test]
 async fn prod_profile_admits_a_bootstrap_token_and_nothing_else() {
+    let _serial = SERIAL.lock().await;
     let (url, _db) = empty_database().await;
     migrate(&url).await;
     let token = bootstrap_token(&url).await;
-    let runner = Runner::start(&url, "prod", None).await;
+    let runner = Launch::new(&url, "prod").start().await;
     let preflight = runner.url("/api/harvest/admin/preflight");
 
     let anonymous = get(&preflight, None).await;
@@ -330,10 +449,10 @@ async fn prod_profile_admits_a_bootstrap_token_and_nothing_else() {
     let body = admitted.text().await.unwrap_or_default();
     assert_eq!(status, reqwest::StatusCode::OK, "{body}");
     let report: Value = serde_json::from_str(&body).expect("preflight is JSON");
-    assert!(
-        check_named(&report, "admin_auth_boundary").is_some(),
-        "{report}"
-    );
+    // The README says this check fails outside `dev`: the token gates only
+    // the admin routes. A `pass` here would mislead an operator.
+    let boundary = check_named(&report, "admin_auth_boundary").expect("the check is present");
+    assert_eq!(boundary["status"], json!("fail"), "{report}");
 }
 
 fn check_named<'a>(report: &'a Value, name: &str) -> Option<&'a Value> {
@@ -350,8 +469,12 @@ fn check_named<'a>(report: &'a Value, name: &str) -> Option<&'a Value> {
 /// still migrate, so it reads the profile as the embedding does.
 #[tokio::test]
 async fn signed_webhook_starts_an_order() {
+    let _serial = SERIAL.lock().await;
     let (url, _db) = empty_database().await;
-    let runner = Runner::start(&url, "development", Some(WEBHOOK_SECRET)).await;
+    let runner = Launch::new(&url, "development")
+        .webhook_secret(WEBHOOK_SECRET)
+        .start()
+        .await;
     let body = serde_json::to_vec(&json!({
         "order_id": "hook-7",
         "sku": "sku-pen",
@@ -371,10 +494,43 @@ async fn signed_webhook_starts_an_order() {
 /// No secret, no receiver. The example never serves an unsigned route.
 #[tokio::test]
 async fn webhook_route_is_absent_without_a_secret() {
+    let _serial = SERIAL.lock().await;
     let (url, _db) = empty_database().await;
-    let runner = Runner::start(&url, "dev", None).await;
+    let runner = Launch::new(&url, "dev").start().await;
     let body = b"{}";
 
     let status = post_webhook(&runner, body, &sign(body)).await;
     assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+}
+
+/// Outside `dev`, a short webhook secret refuses boot. A short HMAC key
+/// can be brute-forced from one captured delivery.
+#[tokio::test]
+async fn prod_profile_refuses_a_weak_webhook_secret() {
+    let _serial = SERIAL.lock().await;
+    let (url, _db) = empty_database().await;
+    migrate(&url).await;
+
+    let (status, log) = Launch::new(&url, "prod").webhook_secret("short").refused();
+    assert!(!status.success(), "a weak secret must refuse boot\n{log}");
+    assert!(
+        log.to_lowercase().contains("secret"),
+        "the error names the secret\n{log}"
+    );
+}
+
+/// SIGTERM, as Docker, systemd and Kubernetes send it, also drains the
+/// worker and exits cleanly.
+#[tokio::test]
+async fn sigterm_stops_cleanly() {
+    let _serial = SERIAL.lock().await;
+    let (url, _db) = empty_database().await;
+    let runner = Launch::new(&url, "dev").start().await;
+
+    let log_before = runner.log();
+    let status = runner.stop_with("TERM");
+    assert!(
+        status.success(),
+        "SIGTERM should stop cleanly: {status}\n{log_before}"
+    );
 }

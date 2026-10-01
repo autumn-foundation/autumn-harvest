@@ -960,7 +960,7 @@ jobs:
       # signal/child-workflow saga (docs/getting-started/04-signals.md tells a
       # reader to run `cargo test -p saga-choreography` directly),
       # billing-autumn-web's checkout saga (README.md's first pointer past
-      # hello-world), and standalone-runner's external-runner mode -- but
+      # hello-world), and standalone-runner's plain-Axum embedding -- but
       # nothing before this step exercised any of them beyond `cargo build`.
       # The only existing coverage was narrow grep guards for specific past
       # docs defects (check-search-attr-query-syntax.sh,
