@@ -15,6 +15,16 @@ The `admin_auth_boundary` preflight remediation now names
 alone are not a boundary. The `HarvestEmbedding` rustdoc now gives the real
 startup order and the real answer of a stopped runtime.
 
+**Fix: the `[harvest]` config files now follow the autumn-web profile order.**
+Harvest picked `autumn-{profile}.toml` from `AUTUMN_PROFILE`, `--profile` or
+`AUTUMN_IS_DEBUG`, and ignored `AUTUMN_ENV`. autumn-web, and
+`HarvestEmbedding::with_ambient_profile`, read `AUTUMN_ENV` first. So under
+`AUTUMN_ENV=prod`, Harvest skipped `autumn-prod.toml`, and a
+`[harvest.startup] orphaned_workflows = "fail"` there was lost. The order is now
+`AUTUMN_ENV`, `AUTUMN_PROFILE`, `--profile`, `AUTUMN_IS_DEBUG`, with the
+autumn-web name normalisation (`production` becomes `prod`). This applies on
+both paths.
+
 Guards:
 
 - `docs/audits/standalone-chapter-sync.py` runs in the `lint` job. It checks

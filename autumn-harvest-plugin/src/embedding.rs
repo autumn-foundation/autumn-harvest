@@ -180,7 +180,7 @@ impl HarvestEmbedding {
     /// to their previous values. The start-idempotency purge window keeps the
     /// value of the failed start. An API state from [`Self::with_api_state`]
     /// can keep the posture settings of a failed start. It holds no runtime,
-    /// so its routes fail with "harvest runtime is not started".
+    /// so its routes that need the runtime or the database fail.
     pub fn start(
         self,
     ) -> impl Future<Output = autumn_web::AutumnResult<HarvestEmbeddingRuntime>> + Send {
@@ -326,8 +326,8 @@ impl HarvestEmbeddingRuntime {
     /// The order is the `HarvestPlugin` order. The gate refresh stops first.
     /// The runner then drains its worker, up to `WorkerConfig::shutdown_timeout`.
     /// The admission globals are cleared only after the runner stops. The API
-    /// state is emptied last, so the routes fail with "harvest runtime is not
-    /// started".
+    /// state is emptied last, so the routes that need the runtime or the
+    /// database fail.
     pub async fn stop(self) {
         let metrics = Arc::clone(&self.runner.api_runtime().registry().telemetry().metrics);
         self.gate_refresh.stop().await;

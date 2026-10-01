@@ -160,8 +160,9 @@ async fn shutdown_signal() {
 
 1. It applies the operator's `[harvest.startup]` settings over `config.startup`.
    It reads `autumn.toml`, `autumn-{profile}.toml` and
-   `AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS`. An invalid value stops the
-   boot.
+   `AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS`. The profile comes from
+   `AUTUMN_ENV`, `AUTUMN_PROFILE` or `--profile`, in that order, as in
+   autumn-web. An invalid value stops the boot.
 2. It applies the declared admin posture to the API state and wraps the
    router in the declared auth layers.
 3. It loads the persisted admission gates before a worker starts.
@@ -258,7 +259,7 @@ tokens, and your own layer with the boundary.
 Declare it with `with_deployment_profile("prod")`, or call
 `HarvestEmbedding::with_ambient_profile()` to read it from the environment.
 Under the `dev` profile with no declared boundary, the admin guard admits
-every caller, also a caller with no credential. The server logs a warning
+every caller that presents no session. So a caller needs no credential. The server logs a warning
 when this is the case. Use `dev` on a workstation only.
 
 ### Scoped API tokens
@@ -476,8 +477,8 @@ Then call `HarvestEmbeddingRuntime::stop`. It does these steps, in order:
 2. It stops the runner, which drains the worker up to
    `WorkerConfig::shutdown_timeout`.
 3. It removes the admission globals.
-4. It clears the API state. The routes then fail with "harvest runtime is not
-   started".
+4. It clears the API state. The routes that need the runtime or the database
+   then fail. `GET /health` reports `runtime_ready: false`.
 
 A dropped runtime keeps its background tasks and its process globals. Always
 call `stop()`, also after a server error. A container runtime sends SIGTERM,
