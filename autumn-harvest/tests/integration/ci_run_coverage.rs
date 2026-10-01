@@ -1188,3 +1188,146 @@ fn linux_clone(row: &SuiteRow) -> SuiteRow {
         filter: row.filter.clone(),
     }
 }
+
+// ── Every workflow this guard cites must parse (issue #1790) ────────────────
+
+/// The repository root.
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..")
+}
+
+/// Workflow files that this guard cites as proof that a suite runs.
+///
+/// The set is `ci.yml` plus each `.github/workflows/` path that an `ALLOWLIST`
+/// or `FEATURE_GATE_EXEMPT` reason names. A new citation is checked with no
+/// edit here.
+fn cited_workflows() -> BTreeSet<String> {
+    let mut out = BTreeSet::from([".github/workflows/ci.yml".to_string()]);
+    let reasons = ALLOWLIST.iter().chain(FEATURE_GATE_EXEMPT).map(|&(_, r)| r);
+    for reason in reasons {
+        let mut rest = reason;
+        while let Some(idx) = rest.find(".github/workflows/") {
+            let tail = &rest[idx..];
+            let end = tail
+                .find(|c: char| !(c.is_ascii_alphanumeric() || "./-_".contains(c)))
+                .unwrap_or(tail.len());
+            out.insert(tail[..end].trim_end_matches('.').to_string());
+            rest = &tail[end..];
+        }
+    }
+    out
+}
+
+/// Parses workflow text as YAML 1.2, which keeps `on` as a string key.
+///
+/// `serde_yaml` also rejects a repeated mapping key. GitHub rejects that file
+/// too, but PyYAML keeps the last value and hides the defect.
+fn parse_workflow_text(text: &str) -> Result<serde_yaml::Value, String> {
+    serde_yaml::from_str(text).map_err(|e| e.to_string())
+}
+
+/// Reads and parses one workflow. Panics with the path and the parse error.
+fn parse_workflow(rel: &str) -> serde_yaml::Value {
+    let text = read_source(&repo_root().join(rel));
+    parse_workflow_text(&text).unwrap_or_else(|e| {
+        panic!(
+            "{rel} does not parse as YAML: {e}\nGitHub runs an unparsable workflow as a \
+             zero-job failure and never fires its triggers. Quote a `run:` value that holds \
+             `: ` (for example `chaos:: --`)."
+        )
+    })
+}
+
+/// The `run:` text of every step in every job of a parsed workflow.
+fn workflow_run_commands(doc: &serde_yaml::Value) -> Vec<String> {
+    let Some(jobs) = doc.get("jobs").and_then(serde_yaml::Value::as_mapping) else {
+        return Vec::new();
+    };
+    jobs.values()
+        .filter_map(|job| job.get("steps").and_then(serde_yaml::Value::as_sequence))
+        .flatten()
+        .filter_map(|step| step.get("run").and_then(serde_yaml::Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The `cron` strings under a parsed workflow's `on.schedule`.
+fn workflow_crons(doc: &serde_yaml::Value) -> Vec<String> {
+    doc.get("on")
+        .and_then(|on| on.get("schedule"))
+        .and_then(serde_yaml::Value::as_sequence)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("cron").and_then(serde_yaml::Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Self-test: the parser rejects the defect classes that it must catch.
+#[test]
+fn workflow_parser_rejects_the_chaos_yml_defect_classes() {
+    let unquoted = "jobs:\n  a:\n    steps:\n      - run: cargo test chaos:: -- --nocapture\n";
+    assert!(
+        parse_workflow_text(unquoted).is_err(),
+        "an unquoted `run:` value that holds `:: ` must not parse"
+    );
+    let quoted = "jobs:\n  a:\n    steps:\n      - run: 'cargo test chaos:: -- --nocapture'\n";
+    let doc = parse_workflow_text(quoted).expect("the quoted form must parse");
+    assert_eq!(
+        workflow_run_commands(&doc),
+        ["cargo test chaos:: -- --nocapture"]
+    );
+
+    let repeated = "jobs:\n  a:\n    runs-on: x\n  a:\n    runs-on: y\n";
+    assert!(
+        parse_workflow_text(repeated).is_err(),
+        "a repeated mapping key must not parse"
+    );
+
+    let scheduled = "on:\n  schedule:\n    - cron: \"17 4 * * *\"\njobs: {}\n";
+    let doc = parse_workflow_text(scheduled).expect("a schedule must parse");
+    assert_eq!(
+        workflow_crons(&doc),
+        ["17 4 * * *"],
+        "`on` must stay a string key (YAML 1.2), not the boolean `true` (YAML 1.1)"
+    );
+}
+
+/// An `ALLOWLIST` reason that cites a workflow claims that the workflow runs
+/// the suite. That claim is false when the workflow does not parse. The
+/// chaos suite stayed in that state from its first commit (issue #1790).
+#[test]
+fn every_cited_workflow_parses_and_has_jobs() {
+    let cited = cited_workflows();
+    assert!(
+        cited.contains(".github/workflows/chaos.yml"),
+        "the `core:chaos_tests` reason must cite .github/workflows/chaos.yml; found {cited:?}"
+    );
+    for rel in &cited {
+        let doc = parse_workflow(rel);
+        let jobs = doc.get("jobs").and_then(serde_yaml::Value::as_mapping);
+        assert!(
+            jobs.is_some_and(|j| !j.is_empty()),
+            "{rel} must have a non-empty `jobs` mapping"
+        );
+    }
+}
+
+/// The `core:chaos_tests` exemption is true only when `chaos.yml` runs the
+/// whole `chaos_tests` module, with the `chaos` feature, on a cron.
+#[test]
+fn chaos_workflow_runs_the_chaos_suite_nightly() {
+    let doc = parse_workflow(".github/workflows/chaos.yml");
+    assert!(
+        !workflow_crons(&doc).is_empty(),
+        "chaos.yml must have an `on.schedule` cron; without one no nightly run exists"
+    );
+    let runs = workflow_run_commands(&doc);
+    assert!(
+        runs.iter().any(|r| {
+            r.contains("--features chaos") && r.contains("--test integration chaos_tests:: ")
+        }),
+        "chaos.yml must have a step that runs \
+         `--features chaos --test integration chaos_tests:: `; found {runs:?}"
+    );
+}

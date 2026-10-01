@@ -277,6 +277,10 @@ wat = "1"
 # on it) at the workspace version, so `{ workspace = true }` unifies rather than
 # widening the graph — same rationale as the `tokio-util` dev-dep above.
 proc-macro2 = { workspace = true }
+# Parse `.github/workflows/*.yml` in the `ci_run_coverage` guard (issue #1790).
+# A workflow that does not parse never runs. Already in the lockfile through
+# `autumn-web` at this version, so this unifies and adds no new crate.
+serde_yaml = "0.9"
 
 # testcontainers pulls bollard -> hyper-util, which uses `tokio::net`. Under a
 # global `RUSTFLAGS="--cfg loom"` build tokio's `net` module is compiled out
