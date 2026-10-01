@@ -5432,11 +5432,53 @@ pub async fn lost_start_committed(
 /// connection. A release would then let the next claim append a second start.
 /// So read the history again on a new connection.
 ///
+/// A read that fails on a transient error runs again, up to
+/// `FINALIZE_ACQUIRE_ATTEMPTS` times. The tries start one pool bound apart, so
+/// they ride out a short outage. After the last try the claim is released. An
+/// outage that long would otherwise leave an activity with no deadline
+/// `RUNNING` for good.
+async fn reconcile_lost_start(
+    pool: &DbPool,
+    task: &TaskQueueItem,
+    exec_id: ExecutionId,
+    activity_name: &str,
+    worker_id: &str,
+) -> HarvestResult<Option<StartedActivity>> {
+    let spacing = crate::pool::retry_spacing(pool);
+    let mut attempt = 1;
+    loop {
+        let started = tokio::time::Instant::now();
+        match read_lost_start(pool, task, exec_id, activity_name, worker_id).await {
+            Err(error)
+                if attempt < FINALIZE_ACQUIRE_ATTEMPTS
+                    && crate::pool::is_transient_db_error(&error) =>
+            {
+                tracing::warn!(
+                    task_id = %task.id,
+                    attempt,
+                    error = %error,
+                    "could not read a lost activity start; trying again"
+                );
+                tokio::time::sleep_until(started + spacing).await;
+                attempt += 1;
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
+/// One read for [`reconcile_lost_start`].
+///
 /// This claim wrote the start only if an `ActivityStarted` from this worker
 /// has a time at or after the claim's `started_at`. An earlier attempt of the
 /// same worker wrote its start before this claim. The database clock sets both
 /// times: the event row's `DEFAULT NOW()` and the claim's `started_at = NOW()`.
-async fn reconcile_lost_start(
+///
+/// A later claim by the same worker also matches that test. So the task row
+/// must still be `RUNNING` under this claim's `attempt` and `worker_id`. The
+/// row is read after the history. A newer start in that history needs a newer
+/// claim first, and a newer claim has a larger `attempt`.
+async fn read_lost_start(
     pool: &DbPool,
     task: &TaskQueueItem,
     exec_id: ExecutionId,
@@ -5461,6 +5503,21 @@ async fn reconcile_lost_start(
             )
     });
     if !ours {
+        return Ok(None);
+    }
+    let held: i64 = {
+        use crate::schema::harvest_task_queue::dsl;
+        dsl::harvest_task_queue
+            .filter(dsl::id.eq(task.id))
+            .filter(dsl::state.eq("RUNNING"))
+            .filter(dsl::worker_id.eq(worker_id))
+            .filter(dsl::attempt.eq(task.attempt))
+            .count()
+            .get_result(&mut conn)
+            .await
+            .map_err(crate::error::database_error)?
+    };
+    if held == 0 {
         return Ok(None);
     }
     let execution = load_workflow_execution(&mut conn, exec_id).await?;

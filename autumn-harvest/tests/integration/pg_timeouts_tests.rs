@@ -1336,6 +1336,104 @@ async fn a_lost_start_is_found_only_when_this_claim_wrote_it() {
         .await
         .expect("this claim's start");
     assert!(committed(&task).await, "this claim's start committed");
+
+    // A newer claim by the same worker owns that start, not this claim.
+    diesel::sql_query("UPDATE harvest_task_queue SET attempt = 3 WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .execute(&mut conn)
+        .await
+        .expect("model a newer claim");
+    assert!(
+        !committed(&task).await,
+        "a start under a newer claim is not this claim's"
+    );
+}
+
+/// The reconcile read retries while the pool is busy. A single failed read
+/// would release the claim, and the next claim would append a second start.
+#[tokio::test]
+async fn a_lost_start_check_waits_for_a_busy_pool() {
+    use autumn_harvest::models::TaskQueueItem;
+    use autumn_harvest::schema::harvest_task_queue;
+    use autumn_harvest::types::{ActivityExecId, WorkerId};
+    use diesel::{QueryDsl, SelectableHelper};
+
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let queue_name = format!("q-lw-{}", &Uuid::new_v4().simple().to_string()[..12]);
+    let exec_id = seed_execution(&mut conn, &queue_name).await;
+    let activity_id = ActivityExecId::from_uuid(Uuid::new_v4());
+    store::append_events(
+        &mut conn,
+        exec_id,
+        &[WorkflowEvent::ActivityScheduled {
+            activity_id,
+            name: "act".to_owned(),
+            input: serde_json::json!({}),
+            queue: queue_name.clone(),
+        }],
+        1,
+    )
+    .await
+    .expect("schedule the activity");
+    let task_id = autumn_harvest::queue::enqueue(
+        &mut conn,
+        &autumn_harvest::queue::EnqueueParams::new(
+            &queue_name,
+            autumn_harvest::queue::TaskType::Activity,
+            serde_json::json!({}),
+        ),
+    )
+    .await
+    .expect("enqueue");
+    register_live_worker(&mut conn, "w-1").await;
+    diesel::sql_query(
+        "UPDATE harvest_task_queue SET state = 'RUNNING', worker_id = 'w-1', attempt = 1, \
+         started_at = NOW(), workflow_exec_id = $2, activity_id = $3, activity_name = 'act' \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Uuid, _>(activity_id.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("model the claim");
+    store::append_events(
+        &mut conn,
+        exec_id,
+        &[WorkflowEvent::ActivityStarted {
+            activity_id,
+            worker_id: WorkerId::new("w-1"),
+        }],
+        2,
+    )
+    .await
+    .expect("this claim's start");
+    let task: TaskQueueItem = harvest_task_queue::table
+        .find(task_id)
+        .select(TaskQueueItem::as_select())
+        .first(&mut conn)
+        .await
+        .expect("load the task");
+
+    let pool = engine_pool(
+        url,
+        1,
+        DbRole::Hot,
+        &timeouts(200, SessionTimeouts::for_role(DbRole::Hot)),
+    )
+    .expect("engine pool");
+    let held = hold_every_connection(&pool).await;
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        drop(held);
+    });
+    let committed =
+        autumn_harvest::worker::lost_start_committed(&pool, &task, exec_id, "act", "w-1")
+            .await
+            .expect("the check waits for the pool");
+    release.await.expect("release joins");
+    assert!(committed, "this claim's start committed");
 }
 
 /// Mark `worker_id` as a live worker. A test row `RUNNING` under an unknown

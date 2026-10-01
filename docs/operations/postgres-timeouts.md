@@ -54,7 +54,9 @@ can after a worker crash.
 
 A start that loses its connection can still commit. Before a release, the
 worker reads the history again on a new connection. If this claim's
-`ActivityStarted` is there, the handler runs and the claim stays.
+`ActivityStarted` is there and the task row is still under this claim, the
+handler runs and the claim stays. A failed read runs again, up to 10 times. If
+the outage lasts longer, the claim is released.
 
 `harvest.db.pool_acquire_timeout{site}` counts the timeouts that matter most.
 `site` is `claim` or `heartbeat_flush`. Other sites log the error only.

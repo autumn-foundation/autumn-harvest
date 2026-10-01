@@ -459,7 +459,7 @@ pub const ZERO_WAIT_RETRY_SPACING: std::time::Duration = std::time::Duration::fr
 
 /// The time from the start of one try to the start of the next one.
 #[cfg(feature = "db")]
-fn retry_spacing(pool: &crate::worker::DbPool) -> std::time::Duration {
+pub(crate) fn retry_spacing(pool: &crate::worker::DbPool) -> std::time::Duration {
     if pool.timeouts().wait.is_some_and(|wait| wait.is_zero()) {
         ZERO_WAIT_RETRY_SPACING
     } else {
