@@ -448,6 +448,11 @@ jobs:
       - name: Run docs/performance.md guards (also on docs-only PRs)
         run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration performance_docs::"
 
+      # Issue #1783: the `docs/calendars.md` Rust fences compile as doctests.
+      # A docs-only PR skips the `test` matrix, so the doctests run here, ungated.
+      - name: Run docs/calendars.md doctests (also on docs-only PRs)
+        run: "cargo test -p autumn-harvest --no-default-features --doc calendar::CalendarsDocSnippets"
+
       # Issue #966: same reasoning as the step above, for the R&D report's
       # coupling-inventory guards. `docs/rnd/sqlite-feasibility.md` matches BOTH
       # clauses of the docs-only filter (`^(docs/|.*\.md$)`), so a PR that edits

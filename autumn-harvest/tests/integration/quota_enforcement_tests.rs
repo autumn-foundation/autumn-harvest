@@ -3821,20 +3821,14 @@ async fn completion_trigger_defers_to_outbox_when_target_quota_exceeded() {
     // `WorkflowCompleted` append -- leaving it stuck RUNNING forever with no
     // error ever recorded.
     //
-    // A wider bound than the usual 10s default (CI flake observed on PR
-    // #1673). This decision cycle resolves the trigger's target quota,
-    // persists the blocked outbox row, and completes the source. All of
-    // that happens before this point. That can push the 10s default past
-    // its budget under a resource-constrained runner, the same way
-    // `wait_for_execution_state_with_timeout`'s own doc comment describes.
+    // One decision cycle resolves the target quota, writes the outbox row and
+    // completes the source. The 30 s bound absorbs a loaded CI runner.
     //
-    // A separate, pre-existing issue, unrelated to this bound: this test
-    // has been seen to fail on one specific CI shard. It times out at
-    // whatever bound is configured, with no variance. That matches a
-    // genuine stall, not a slow-but-progressing run. It reproduces on
-    // trunk-dev at a commit this branch never touched. Widening this
-    // number further does not fix that. It needs its own investigation.
-    // This stays at #1673's own value rather than guessing higher.
+    // Issue #1693: an earlier stall here was not a slow claim. The hand-kept
+    // test schema lacked a migration. The completion transaction failed on
+    // every retry and rolled back the source. The shared schema now comes from
+    // `autumn_harvest::test_init_sql()`. A guard test in `integration_e2e.rs`
+    // compares it with the migrations.
     wait_for_execution_state_with_timeout(
         &url,
         source,

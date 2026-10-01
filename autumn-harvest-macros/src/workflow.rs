@@ -1278,22 +1278,15 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     };
 
                     let params = ::autumn_harvest::execution::StartWorkflowParams {
-                        workflow_name: info.name,
-                        workflow_id: &workflow_id,
-                        exec_id,
-                        input,
                         parent_id: opts.parent_id,
-                        queue_name: opts.queue_name.as_deref().unwrap_or("default"),
                         execution_timeout,
                         memo: opts.memo,
                         search_attrs: opts.search_attrs,
                         reuse_policy: opts.reuse_policy.unwrap_or(::autumn_harvest::types::WorkflowIdReusePolicy::AllowDuplicate),
-                        conflict_policy: ::autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
                         trace_context: opts.trace_context,
                         max_execution_timeout_ceiling,
                         chain_execution_timeout,
                         max_workflow_chain_timeout_ceiling,
-                        inherited_chain_deadline_at: ::std::option::Option::None,
                         concurrency_key,
                         concurrency_limit,
                         concurrency_on_conflict,
@@ -1309,17 +1302,16 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         sla: opts.sla.or(info.sla).and_then(|d|
                             ::autumn_harvest::chrono::Duration::from_std(d).ok()
                         ),
-                        schedule_id: ::std::option::Option::None,
-                        scheduled_for: ::std::option::Option::None,
-                        workflow_attempt: 1,
                         workflow_retry_policy: info.retry_policy.clone(),
-                        retry_of_exec_id: ::std::option::Option::None,
                         max_workflow_attempts_ceiling: client.max_workflow_attempts(),
-                        origin: None,
-                        completion_callbacks: ::std::option::Option::None,
                         start_source: ::autumn_harvest::types::StartSource::Api,
-                        start_source_ref: ::std::option::Option::None,
-                        started_by: ::std::option::Option::None,
+                        ..::autumn_harvest::execution::StartWorkflowParams::new(
+                            info.name,
+                            &workflow_id,
+                            exec_id,
+                            input,
+                            opts.queue_name.as_deref().unwrap_or("default"),
+                        )
                     };
 
                     let started = client.start_or_load(conn, params).await?;

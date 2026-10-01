@@ -4785,8 +4785,9 @@ async fn heartbeat_checkpoints_are_unaffected_by_partitioning() {
     let exec = insert_execution(&mut conn, "hb_wf", "hb-1", past, None).await;
     let task: uuid::Uuid = diesel::sql_query(
         "INSERT INTO harvest_task_queue
-            (queue_name, task_type, workflow_exec_id, input, state, started_at)
-         VALUES ('default', 'activity', $1, '{}'::jsonb, 'RUNNING', NOW())
+            (queue_name, task_type, workflow_exec_id, input, state, started_at,
+             worker_id, attempt)
+         VALUES ('default', 'activity', $1, '{}'::jsonb, 'RUNNING', NOW(), 'hb-worker', 1)
          RETURNING id",
     )
     .bind::<diesel::sql_types::Uuid, _>(exec)
@@ -4795,9 +4796,15 @@ async fn heartbeat_checkpoints_are_unaffected_by_partitioning() {
     .expect("insert task")
     .id;
 
-    autumn_harvest::queue::record_heartbeat(&mut conn, task, serde_json::json!({"progress": 0.5}))
-        .await
-        .expect("AC6: heartbeat checkpoints must work on a partitioned deployment");
+    let claim = autumn_harvest::queue::TaskClaim::new(task, "hb-worker", 1);
+    let write = autumn_harvest::queue::record_heartbeat(
+        &mut conn,
+        &claim,
+        serde_json::json!({"progress": 0.5}),
+    )
+    .await
+    .expect("AC6: heartbeat checkpoints must work on a partitioned deployment");
+    assert_eq!(write, autumn_harvest::queue::ClaimWrite::Applied);
 
     assert_eq!(
         scalar_i64(

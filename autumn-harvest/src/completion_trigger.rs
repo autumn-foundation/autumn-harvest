@@ -1304,46 +1304,29 @@ impl DeferredTriggerStart {
             // Provenance ref is the triggering (source) execution id (#740).
             let source_exec_id_str = self.source_exec_id.to_string();
             let params = crate::execution::StartWorkflowParams {
-                workflow_name: &self.target_workflow_name,
-                workflow_id: &self.target_workflow_id,
-                exec_id: crate::types::ExecutionId::new_for_shard(self.target_shard),
-                input: self.target_input,
-                parent_id: None,
-                queue_name: &queue_name,
-                execution_timeout: None,
-                memo: None,
-                search_attrs: None,
-                reuse_policy: crate::types::WorkflowIdReusePolicy::AllowDuplicate,
-                conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
-                trace_context: None,
-                max_execution_timeout_ceiling: None,
-                chain_execution_timeout: None,
-                max_workflow_chain_timeout_ceiling: None,
-                inherited_chain_deadline_at: None,
                 concurrency_key: self.concurrency_key,
                 concurrency_limit: self.concurrency_limit,
                 concurrency_on_conflict: self.concurrency_on_conflict,
                 priority: self.priority,
                 max_workflow_input_bytes: self.max_workflow_input_bytes,
-                start_at: None,
-                delay: None,
-                max_workflow_start_delay: None,
                 owner: self.owner.as_deref(),
                 runbook_url: self.runbook_url.as_deref(),
                 severity: self.severity.as_deref(),
-                context_headers: None,
                 sla: self.sla.and_then(|d| chrono::Duration::from_std(d).ok()),
-                schedule_id: None,
-                scheduled_for: None,
-                workflow_attempt: 1,
                 workflow_retry_policy: self.retry_policy.clone(),
-                retry_of_exec_id: None,
                 max_workflow_attempts_ceiling: self.max_workflow_attempts_ceiling,
-                origin: None,
-                completion_callbacks: None,
                 start_source: crate::types::StartSource::CompletionTrigger,
                 start_source_ref: Some(source_exec_id_str.as_str()),
-                started_by: None,
+                // `origin` and `completion_callbacks` keep their `None` default.
+                // A completion-trigger start is not a schedule fire (issue #534).
+                // Only builder-wide callback targets apply (issue #605).
+                ..crate::execution::StartWorkflowParams::new(
+                    &self.target_workflow_name,
+                    &self.target_workflow_id,
+                    crate::types::ExecutionId::new_for_shard(self.target_shard),
+                    self.target_input,
+                    &queue_name,
+                )
             };
 
             if let Err(e) = relay_gate_checked_start(
@@ -1501,7 +1484,6 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
         use crate::schema::harvest_workflow_executions::dsl as execs_dsl;
         use crate::models::{CompletionTriggerDb, NewCompletionTriggerFireDb, WorkflowExecution, NewCompletionTriggerOutboxDb};
         use crate::execution::{StartWorkflowParams, start_or_load_workflow_execution_collect_with_codecs, check_and_report_unfinished_handlers_batch};
-        use crate::types::WorkflowIdReusePolicy;
         use crate::types::Priority;
 
         let mut deferred_starts = Vec::new();
@@ -1934,52 +1916,31 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
                     match start_or_load_workflow_execution_collect_with_codecs(
                     conn,
                     StartWorkflowParams {
-                        workflow_name: &trigger_db.target_workflow_name,
-                        workflow_id: &target_workflow_id,
-                        exec_id: target_exec_id,
-                        // Cloned (not moved) — `target_input` and `concurrency_key`
-                        // must stay available after this call for the new
-                        // `QuotaExceeded` outbox-fallback arm below (issue #946,
-                        // Codex round-3 review), which needs the original values
-                        // to construct a `DeferredTriggerStart` for retry.
-                        input: target_input.clone(),
-                        parent_id: None,
-                        queue_name: &queue_name,
-                        execution_timeout: None,
-                        memo: None,
-                        search_attrs: None,
-                        reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
-                        conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
-                        trace_context: None,
-                        max_execution_timeout_ceiling: None,
-                        chain_execution_timeout: None,
-                        max_workflow_chain_timeout_ceiling: None,
-                        inherited_chain_deadline_at: None,
                         concurrency_key: concurrency_key.clone(),
                         concurrency_limit,
                         concurrency_on_conflict,
-                        priority: Priority::default(),
                         max_workflow_input_bytes,
-                        start_at: None,
-                        delay: None,
-                        max_workflow_start_delay: None,
                         owner: target_owner.as_deref(),
                         runbook_url: target_runbook_url.as_deref(),
                         severity: target_severity.as_deref(),
-                        context_headers: None,
                         sla: target_sla.and_then(|d| chrono::Duration::from_std(d).ok()),
-                        schedule_id: None,
-                        scheduled_for: None,
-                        workflow_attempt: 1,
                         workflow_retry_policy: target_retry_policy.clone(),
-                        retry_of_exec_id: None,
                         max_workflow_attempts_ceiling,
-                        // Completion-trigger start is not a schedule fire (issue #534).
-                        origin: None,
-                        completion_callbacks: None,
                         start_source: crate::types::StartSource::CompletionTrigger,
                         start_source_ref: Some(source_exec_id_str.as_str()),
-                        started_by: None,
+                        // `target_input` is cloned, not moved. The `QuotaExceeded`
+                        // outbox-fallback arm below needs the original values to
+                        // build a `DeferredTriggerStart` for retry (issue #946).
+                        // `origin` and `completion_callbacks` keep their `None` default.
+                        // A completion-trigger start is not a schedule fire (issue #534).
+                        // Only builder-wide callback targets apply (issue #605).
+                        ..StartWorkflowParams::new(
+                            &trigger_db.target_workflow_name,
+                            &target_workflow_id,
+                            target_exec_id,
+                            target_input.clone(),
+                            &queue_name,
+                        )
                     },
                     // Not nested inside a caller-managed outer transaction from
                     // this call's own point of view, and no debounce-reject
@@ -2566,22 +2527,6 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
         // Provenance ref is the triggering (source) execution id (#740).
         let source_exec_id_str = task.source_exec_id.to_string();
         let params = crate::execution::StartWorkflowParams {
-            workflow_name: &task.target_workflow_name,
-            workflow_id: &task.target_workflow_id,
-            exec_id: crate::types::ExecutionId::new_for_shard(target_shard),
-            input: task.target_input,
-            parent_id: None,
-            queue_name: &queue_name,
-            execution_timeout: None,
-            memo: None,
-            search_attrs: None,
-            reuse_policy: crate::types::WorkflowIdReusePolicy::AllowDuplicate,
-            conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
-            trace_context: None,
-            max_execution_timeout_ceiling: None,
-            chain_execution_timeout: None,
-            max_workflow_chain_timeout_ceiling: None,
-            inherited_chain_deadline_at: None,
             concurrency_key: task.concurrency_key,
             concurrency_limit: task
                 .concurrency_limit
@@ -2589,29 +2534,24 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
             concurrency_on_conflict: relay_concurrency_on_conflict,
             priority,
             max_workflow_input_bytes: u64::try_from(task.max_workflow_input_bytes).unwrap_or(0),
-            start_at: None,
-            delay: None,
-            max_workflow_start_delay: None,
             owner: target_owner.as_deref(),
             runbook_url: target_runbook_url.as_deref(),
             severity: target_severity.as_deref(),
-            context_headers: None,
             sla: target_sla.and_then(|d| chrono::Duration::from_std(d).ok()),
-            schedule_id: None,
-            scheduled_for: None,
-            workflow_attempt: 1,
             workflow_retry_policy: target_retry_policy,
-            retry_of_exec_id: None,
             max_workflow_attempts_ceiling,
-            // Completion-trigger start is not a schedule fire (issue #534).
-            origin: None,
-            // Internal start: only builder-wide default callback targets apply
-            // (issue #605); a completion-trigger target has no per-execution
-            // callback option of its own.
-            completion_callbacks: None,
             start_source: crate::types::StartSource::CompletionTrigger,
             start_source_ref: Some(source_exec_id_str.as_str()),
-            started_by: None,
+            // `origin` and `completion_callbacks` keep their `None` default.
+            // A completion-trigger start is not a schedule fire (issue #534).
+            // Only builder-wide callback targets apply (issue #605).
+            ..crate::execution::StartWorkflowParams::new(
+                &task.target_workflow_name,
+                &task.target_workflow_id,
+                crate::types::ExecutionId::new_for_shard(target_shard),
+                task.target_input,
+                &queue_name,
+            )
         };
 
         // Existence-aware relay-time start/block via `gate_checked_start_or_load`

@@ -1097,30 +1097,19 @@ async fn fire_claimed_throttle_row(
     let is_scheduled_fire = opts.origin.as_deref() == Some(crate::execution::ORIGIN_SCHEDULED);
 
     let params = crate::execution::StartWorkflowParams {
-        workflow_name: &workflow_name,
-        workflow_id: &workflow_id,
-        exec_id,
-        input: row.input,
-        parent_id: None,
-        queue_name: &queue_name,
         execution_timeout,
         memo: opts.memo,
         search_attrs: opts.search_attrs,
         reuse_policy,
-        conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
         trace_context: opts.trace_context,
         max_execution_timeout_ceiling,
         chain_execution_timeout,
         max_workflow_chain_timeout_ceiling,
-        inherited_chain_deadline_at: None,
         concurrency_key: opts.concurrency_key,
         concurrency_limit: opts.concurrency_limit,
         concurrency_on_conflict: opts.concurrency_on_conflict.unwrap_or_default(),
         priority,
         max_workflow_input_bytes: opts.max_workflow_input_bytes.unwrap_or(u64::MAX),
-        start_at: None,
-        delay: None,
-        max_workflow_start_delay: None,
         owner: owner.as_deref(),
         runbook_url: runbook_url.as_deref(),
         severity: severity.as_deref(),
@@ -1132,17 +1121,22 @@ async fn fire_claimed_throttle_row(
         // the schedule exactly as an immediate fire would be.
         schedule_id: opts.schedule_id,
         scheduled_for: opts.scheduled_for,
-        workflow_attempt: 1,
         workflow_retry_policy: opts
             .workflow_retry_policy
             .and_then(|v| serde_json::from_value(v).ok()),
-        retry_of_exec_id: None,
         max_workflow_attempts_ceiling: opts.max_workflow_attempts_ceiling,
         origin: opts.origin.as_deref(),
         completion_callbacks: opts.completion_callbacks,
         start_source,
         start_source_ref: start_source_ref.as_deref(),
         started_by: started_by.as_deref(),
+        ..crate::execution::StartWorkflowParams::new(
+            &workflow_name,
+            &workflow_id,
+            exec_id,
+            row.input,
+            &queue_name,
+        )
     };
 
     // `in_outer_transaction = true`: runs inside the scanner's fire transaction,

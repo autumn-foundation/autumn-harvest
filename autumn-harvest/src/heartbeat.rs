@@ -15,15 +15,15 @@ use std::time::Duration;
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::deadpool::Pool;
 
 use crate::error::{HarvestError, HarvestResult};
+use crate::queue::{ClaimWrite, TaskClaim};
 use crate::telemetry::MetricsRecorder;
 
-/// Spawn a background heartbeat flusher for the given task.
+/// Spawn a background heartbeat flusher for the task that `claim` holds.
 ///
 /// Returns an `mpsc::Sender<Value>` that the activity should use to send
 /// heartbeat payloads. The flusher task will:
@@ -31,7 +31,10 @@ use crate::telemetry::MetricsRecorder;
 /// 1. Wait up to 1 second for heartbeats to arrive.
 /// 2. Drain all pending heartbeats, keeping only the most recent.
 /// 3. Call `queue::record_heartbeat()` to update the DB timestamp and payload.
-/// 4. Repeat until the cancellation token is triggered.
+/// 4. Repeat until `cancel` fires or the claim is lost.
+///
+/// `claim` fences the write (issue #1789). When the claim is no longer
+/// current, the flusher cancels `cancel` and stops.
 ///
 /// The returned sender has a buffer of 64 messages -- if the activity sends
 /// heartbeats faster than that without the flusher draining, sends will
@@ -41,16 +44,15 @@ use crate::telemetry::MetricsRecorder;
 /// records no metrics. Use [`spawn_heartbeat_flusher_with`] to count failures.
 #[must_use]
 pub fn spawn_heartbeat_flusher(
-    task_id: Uuid,
+    claim: TaskClaim,
     pool: Pool<AsyncPgConnection>,
     cancel: CancellationToken,
 ) -> mpsc::Sender<Value> {
     let options = HeartbeatFlushOptions {
         acquire_timeout: crate::pool::acquire_bound(&pool),
         metrics: Arc::new(crate::telemetry::NoOpMetrics),
-        claim: None,
     };
-    spawn_heartbeat_flusher_with(task_id, pool, cancel, options)
+    spawn_heartbeat_flusher_with(claim, pool, cancel, options)
 }
 
 /// Options for [`spawn_heartbeat_flusher_with`] (issue #1788).
@@ -61,30 +63,17 @@ pub struct HeartbeatFlushOptions {
     /// Receives `harvest.heartbeat.flush_failed` and
     /// `harvest.db.pool_acquire_timeout{site="heartbeat_flush"}`.
     pub metrics: Arc<dyn MetricsRecorder>,
-    /// The claim that owns the task. `Some` makes each write check it, so a
-    /// late heartbeat cannot reach a newer attempt. `None` checks only that
-    /// the task is `RUNNING`.
-    pub claim: Option<HeartbeatClaim>,
-}
-
-/// The claim a heartbeat belongs to: the task row's `attempt` and `worker_id`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HeartbeatClaim {
-    /// `harvest_task_queue.attempt` at claim time.
-    pub attempt: i32,
-    /// The claiming worker.
-    pub worker_id: String,
 }
 
 /// [`spawn_heartbeat_flusher`] with an explicit acquire bound and metrics
 /// sink (issue #1788).
 ///
 /// A failed flush keeps its payload. The next tick sends it again, unless a
-/// newer payload replaces it. A task that is no longer `RUNNING` drops the
-/// payload, because no later flush can succeed.
+/// newer payload replaces it. A lost claim stops the flusher, as in
+/// [`spawn_heartbeat_flusher`].
 #[must_use]
 pub fn spawn_heartbeat_flusher_with(
-    task_id: Uuid,
+    claim: TaskClaim,
     pool: Pool<AsyncPgConnection>,
     cancel: CancellationToken,
     options: HeartbeatFlushOptions,
@@ -93,7 +82,7 @@ pub fn spawn_heartbeat_flusher_with(
     let latest = Arc::new(Mutex::new(None));
 
     tokio::spawn(stamp_heartbeats(rx, Arc::clone(&latest), cancel.clone()));
-    tokio::spawn(heartbeat_loop(task_id, pool, latest, cancel, options));
+    tokio::spawn(heartbeat_loop(claim, pool, latest, cancel, options));
 
     tx
 }
@@ -127,7 +116,8 @@ async fn stamp_heartbeats(
     }
 }
 
-/// Write one heartbeat. `acquire_timeout` limits the pool acquire.
+/// Write one heartbeat for `claim`. `acquire_timeout` limits the pool
+/// acquire.
 ///
 /// # Errors
 ///
@@ -137,15 +127,15 @@ async fn stamp_heartbeats(
 /// write fails.
 pub async fn flush_heartbeat(
     pool: &Pool<AsyncPgConnection>,
-    task_id: Uuid,
+    claim: &TaskClaim,
     payload: Value,
     acquire_timeout: Duration,
-) -> HarvestResult<()> {
+) -> HarvestResult<ClaimWrite> {
     let pending = Pending {
         payload,
         received_at: chrono::Utc::now(),
     };
-    flush(pool, task_id, None, &pending, acquire_timeout)
+    flush(pool, claim, &pending, acquire_timeout)
         .await
         .map_err(|failure| *failure.error)
 }
@@ -167,11 +157,10 @@ struct Pending {
 
 async fn flush(
     pool: &Pool<AsyncPgConnection>,
-    task_id: Uuid,
-    claim: Option<&HeartbeatClaim>,
+    claim: &TaskClaim,
     pending: &Pending,
     acquire_timeout: Duration,
-) -> Result<(), FlushFailure> {
+) -> Result<ClaimWrite, FlushFailure> {
     let mut conn = crate::pool::acquire(pool, acquire_timeout)
         .await
         .map_err(|error| FlushFailure {
@@ -182,29 +171,14 @@ async fn flush(
             },
             error: Box::new(error),
         })?;
-    let written = match claim {
-        Some(claim) => {
-            crate::queue::record_heartbeat_for_claim(
-                &mut conn,
-                task_id,
-                claim.attempt,
-                &claim.worker_id,
-                pending.payload.clone(),
-                pending.received_at,
-            )
-            .await
-        }
-        None => {
-            crate::queue::record_heartbeat_received_at(
-                &mut conn,
-                task_id,
-                pending.payload.clone(),
-                pending.received_at,
-            )
-            .await
-        }
-    };
-    written.map_err(|error| FlushFailure {
+    crate::queue::record_heartbeat_received_at(
+        &mut conn,
+        claim,
+        pending.payload.clone(),
+        pending.received_at,
+    )
+    .await
+    .map_err(|error| FlushFailure {
         reason: "write_error",
         error: Box::new(error),
     })
@@ -212,13 +186,14 @@ async fn flush(
 
 /// The main heartbeat flushing loop.
 async fn heartbeat_loop(
-    task_id: Uuid,
+    claim: TaskClaim,
     pool: Pool<AsyncPgConnection>,
     latest: LatestHeartbeat,
     cancel: CancellationToken,
     options: HeartbeatFlushOptions,
 ) {
     let flush_interval = Duration::from_secs(1);
+    let task_id = claim.task_id;
     // The newest payload not yet written, with the time it arrived. A failed
     // flush puts it back here. A retry writes that time, not the retry time.
     let mut pending: Option<Pending> = None;
@@ -242,39 +217,38 @@ async fn heartbeat_loop(
         }
 
         // If we got at least one heartbeat, flush to DB.
-        if let Some(beat) = pending.take()
-            && let Err(failure) = flush(
-                &pool,
-                task_id,
-                options.claim.as_ref(),
-                &beat,
-                options.acquire_timeout,
-            )
-            .await
-        {
-            if matches!(*failure.error, HarvestError::NotFound(_)) {
-                // The task finished, went back to the queue, or has a newer
-                // claim. A retry cannot succeed.
-                tracing::debug!(
-                    task_id = %task_id,
-                    "task is no longer running; dropping the heartbeat"
-                );
-            } else {
-                options
-                    .metrics
-                    .record_heartbeat_flush_failed(failure.reason);
-                if failure.error.is_pool_acquire_timeout() {
+        if let Some(beat) = pending.take() {
+            match flush(&pool, &claim, &beat, options.acquire_timeout).await {
+                Ok(ClaimWrite::Applied) => {}
+                // The claim is no longer current (issue #1789). Stop the
+                // activity, so this stale attempt does no more work.
+                Ok(ClaimWrite::LeaseLost) => {
+                    tracing::warn!(
+                        task_id = %task_id,
+                        worker_id = %claim.worker_id,
+                        attempt = claim.attempt,
+                        "activity lease lost on heartbeat; cancelling the activity"
+                    );
+                    cancel.cancel();
+                    break;
+                }
+                Err(failure) => {
                     options
                         .metrics
-                        .record_db_pool_acquire_timeout(SITE_HEARTBEAT_FLUSH);
+                        .record_heartbeat_flush_failed(failure.reason);
+                    if failure.error.is_pool_acquire_timeout() {
+                        options
+                            .metrics
+                            .record_db_pool_acquire_timeout(SITE_HEARTBEAT_FLUSH);
+                    }
+                    tracing::warn!(
+                        task_id = %task_id,
+                        reason = failure.reason,
+                        error = %failure.error,
+                        "failed to flush heartbeat to database; retrying on the next tick"
+                    );
+                    pending = Some(beat);
                 }
-                tracing::warn!(
-                    task_id = %task_id,
-                    reason = failure.reason,
-                    error = %failure.error,
-                    "failed to flush heartbeat to database; retrying on the next tick"
-                );
-                pending = Some(beat);
             }
         }
 
@@ -383,7 +357,12 @@ mod tests {
         let started = Instant::now();
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
-            flush_heartbeat(&pool, Uuid::new_v4(), serde_json::json!({"p": 1}), bound),
+            flush_heartbeat(
+                &pool,
+                &TaskClaim::new(uuid::Uuid::new_v4(), "w-1", 1),
+                serde_json::json!({"p": 1}),
+                bound,
+            ),
         )
         .await
         .expect("a heartbeat flush must not hang past its bound");
@@ -404,13 +383,12 @@ mod tests {
         let failures = Arc::new(FlushFailures::default());
         let cancel = CancellationToken::new();
         let tx = spawn_heartbeat_flusher_with(
-            Uuid::new_v4(),
+            TaskClaim::new(uuid::Uuid::new_v4(), "w-1", 1),
             pool,
             cancel.clone(),
             HeartbeatFlushOptions {
                 acquire_timeout: Duration::from_millis(100),
                 metrics: Arc::clone(&failures) as Arc<dyn crate::telemetry::MetricsRecorder>,
-                claim: None,
             },
         );
         tx.send(serde_json::json!({"p": 1})).await.expect("send");

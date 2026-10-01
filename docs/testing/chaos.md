@@ -243,6 +243,36 @@ and on a nightly `cron`. The cron leaves `CHAOS_SEEDS` empty so the sweep uses
 its computed default (≥ 5 seeds per run, AC5); a manual dispatch can supply
 explicit seeds to replay a printed failure.
 
+### Nightly watchdog (issue #1790)
+
+Before the fix for issue #1790, `chaos.yml` did not parse, so the nightly never
+ran. Two checks now catch a repeat:
+
+- `ci_run_coverage` parses every workflow file. It also checks that `chaos.yml`
+  has a cron and runs `chaos_tests::` with the `chaos` feature. An `if` or a
+  `continue-on-error: true` on that step or its job fails the check. In the
+  step's `run:` text, a flag such as `--no-run` or `--skip` fails it too. The
+  step must be one plain `cargo test` command, so `|| true`, `; true` or an
+  `echo` of the arguments also fails it.
+- `.github/workflows/chaos-watchdog.yml` runs daily at 10:41 UTC. It runs
+  `.github/ci/chaos-watchdog.sh`. When no scheduled `chaos.yml` run succeeds in
+  a 48-hour window, the script opens an issue with this title:
+  `Chaos nightly: no successful scheduled run in 48 h`.
+  While the gap continues, the script adds a comment to that issue. After the
+  next success, it closes the issue.
+
+The watchdog is a separate file, so a defect in `chaos.yml` cannot also stop the
+alert. An API error makes the watchdog run fail. It does not open a false alert.
+A final `if: failure()` step then runs `chaos-watchdog.sh self-failed`. It opens
+an issue titled `Chaos watchdog: a watchdog run failed`, or comments on the open
+one. GitHub tells only the last editor of a cron about a failed scheduled run, so
+without this step the failure is silent. The next clean watchdog run closes that
+issue. Each step has its own timeout, and the step timeouts sum to less than the
+job timeout. A step timeout is a failure, so the report step still runs, also
+after a hung checkout. When checkout fails, the report step opens the
+issue without the script, or comments on the open one. A concurrency group runs
+one watchdog job at a time, so two runs cannot both open an issue.
+
 ## Out of scope
 
 Production/runtime chaos (#796), network-partition / Jepsen / Antithesis-style

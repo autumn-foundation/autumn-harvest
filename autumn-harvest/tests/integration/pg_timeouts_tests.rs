@@ -356,7 +356,7 @@ async fn a_full_pool_fails_a_heartbeat_flush_within_the_bound() {
         Duration::from_secs(10),
         autumn_harvest::heartbeat::flush_heartbeat(
             &pool,
-            Uuid::new_v4(),
+            &autumn_harvest::queue::TaskClaim::new(Uuid::new_v4(), "w-1", 1),
             serde_json::json!({"progress": 1}),
             bound,
         ),
@@ -486,31 +486,23 @@ async fn a_heartbeat_from_an_old_claim_is_rejected() {
     .await
     .expect("model a newer claim");
 
-    let stale = autumn_harvest::queue::record_heartbeat_for_claim(
+    let stale = autumn_harvest::queue::record_heartbeat(
         &mut conn,
-        task_id,
-        1,
-        "old-worker",
+        &autumn_harvest::queue::TaskClaim::new(task_id, "old-worker", 1),
         serde_json::json!({"from": "old"}),
-        Utc::now(),
     )
     .await
-    .expect_err("an old claim must not write");
-    assert!(
-        matches!(stale, autumn_harvest::error::HarvestError::NotFound(_)),
-        "{stale}"
-    );
+    .expect("the write runs");
+    assert_eq!(stale, autumn_harvest::queue::ClaimWrite::LeaseLost);
 
-    autumn_harvest::queue::record_heartbeat_for_claim(
+    let current = autumn_harvest::queue::record_heartbeat(
         &mut conn,
-        task_id,
-        2,
-        "new-worker",
+        &autumn_harvest::queue::TaskClaim::new(task_id, "new-worker", 2),
         serde_json::json!({"from": "new"}),
-        Utc::now(),
     )
     .await
-    .expect("the current claim writes");
+    .expect("the write runs");
+    assert_eq!(current, autumn_harvest::queue::ClaimWrite::Applied);
 
     let row = diesel::sql_query("SELECT heartbeat_details FROM harvest_task_queue WHERE id = $1")
         .bind::<diesel::sql_types::Uuid, _>(task_id)
@@ -1201,16 +1193,12 @@ async fn a_retried_heartbeat_keeps_its_receipt_time() {
     let held = hold_every_connection(&pool).await;
     let cancel = tokio_util::sync::CancellationToken::new();
     let tx = autumn_harvest::heartbeat::spawn_heartbeat_flusher_with(
-        task_id,
+        autumn_harvest::queue::TaskClaim::new(task_id, worker_id.clone(), 1),
         pool.clone(),
         cancel.clone(),
         autumn_harvest::heartbeat::HeartbeatFlushOptions {
             acquire_timeout: Duration::from_millis(200),
             metrics: Arc::new(autumn_harvest::telemetry::NoOpMetrics),
-            claim: Some(autumn_harvest::heartbeat::HeartbeatClaim {
-                attempt: 1,
-                worker_id: worker_id.clone(),
-            }),
         },
     );
     let sent_at = Utc::now();
@@ -1707,16 +1695,12 @@ async fn a_heartbeat_sent_during_a_blocked_flush_keeps_its_time() {
     let held = hold_every_connection(&pool).await;
     let cancel = tokio_util::sync::CancellationToken::new();
     let tx = autumn_harvest::heartbeat::spawn_heartbeat_flusher_with(
-        task_id,
+        autumn_harvest::queue::TaskClaim::new(task_id, worker_id.clone(), 1),
         pool.clone(),
         cancel.clone(),
         autumn_harvest::heartbeat::HeartbeatFlushOptions {
             acquire_timeout: Duration::from_secs(3),
             metrics: Arc::new(autumn_harvest::telemetry::NoOpMetrics),
-            claim: Some(autumn_harvest::heartbeat::HeartbeatClaim {
-                attempt: 1,
-                worker_id: worker_id.clone(),
-            }),
         },
     );
     tx.send(serde_json::json!({"progress": 1}))

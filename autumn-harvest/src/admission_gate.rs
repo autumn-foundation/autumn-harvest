@@ -44,20 +44,22 @@
 //! The core completion-trigger path reaches the shared [`AdmissionGateCache`]
 //! through the process-global [`GLOBAL_ADMISSION_GATE_CACHE`] static (mirroring
 //! `GLOBAL_WORKFLOW_METADATA` / `GLOBAL_CALLBACK_CONFIG`), populated by the
-//! plugin at boot with the same `Arc` the management API uses. When the static
-//! is unset (standalone integrations, or the plugin's brief boot window) the
-//! core gate check is skipped — byte-identical to pre-#618 behaviour.
+//! plugin at boot with the same `Arc` the management API uses. `HarvestEmbedding`
+//! publishes it the same way. When the static is unset (a hand-built
+//! standalone mount, or the brief boot window) the core gate check is skipped
+//! — byte-identical to pre-#618 behaviour.
 //!
 //! ## Standalone router note
 //!
 //! [`AdmissionGateCache::new`] initialises the cache as **open** (no gates).
-//! Standalone integrations that mount `harvest_api_router` without the plugin
-//! boot loader (i.e. without calling `HarvestPlugin::on_startup`) must
-//! explicitly call `load_active_gates` from the DB and pass the result to
-//! [`AdmissionGateCache::refresh`] on startup to pick up any gates that were
-//! persisted before the process restarted. Without this step, gates created in
-//! a previous process lifetime are invisible until a local create/lift happens
-//! on the same replica.
+//! A standalone integration starts through `HarvestEmbedding` (issue #1613).
+//! It loads the persisted gates before any worker spawns and publishes the
+//! cache. It also starts the refresh loop.
+//!
+//! An integration that mounts `harvest_api_router` without `HarvestEmbedding`
+//! must do this step itself. It calls `load_active_gates` at startup and
+//! passes the result to [`AdmissionGateCache::refresh`]. Without this step, a
+//! gate from a previous process lifetime is invisible on this replica.
 //!
 //! Such an integration declares its admin credential with
 //! `StandaloneAdminAuth` (issue #1608), which installs the scoped-API-token

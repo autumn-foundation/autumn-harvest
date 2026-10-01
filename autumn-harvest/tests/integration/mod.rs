@@ -2,6 +2,8 @@
 
 #[cfg(feature = "db")]
 mod active_workflow_gauge_tests;
+#[cfg(feature = "db")]
+mod activity_claim_epoch_tests;
 mod activity_default_floor_tests;
 #[cfg(feature = "db")]
 mod activity_enqueue_batch_perf;
@@ -42,6 +44,7 @@ mod business_day_replay_tests;
 #[cfg(feature = "db")]
 mod business_day_timer_tests;
 mod cache_delta_load_tests;
+mod calendars_docs;
 #[cfg(feature = "db")]
 mod canary_tests;
 mod cancellation_tests;
@@ -53,6 +56,7 @@ mod chaos_catalogue_drift;
 mod chaos_docs;
 #[cfg(feature = "chaos")]
 mod chaos_tests;
+mod chaos_watchdog;
 #[cfg(feature = "db")]
 mod child_fanout_batch_perf;
 mod child_fanout_tests;
@@ -169,6 +173,8 @@ mod pg_timeouts_tests;
 #[cfg(feature = "db")]
 mod poison_pill_reclaim_perf;
 mod poison_pill_tests;
+#[cfg(feature = "db")]
+mod poll_capacity_gate_tests;
 mod priority_tests;
 #[cfg(feature = "testing")]
 mod publish_progress_tests;
@@ -272,6 +278,8 @@ mod usage_report_activity_lookback_tests;
 #[cfg(feature = "wasm-activities")]
 mod wasm_activities_tests;
 mod webhook_trigger_tests;
+#[cfg(feature = "db")]
+mod with_start_shared_tests;
 mod worker_session_tests;
 #[cfg(feature = "db")]
 mod workflow_handle_tests;
