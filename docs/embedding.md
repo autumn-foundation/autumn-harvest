@@ -51,13 +51,15 @@ cargo run -p autumn-harvest-cli -- migrate run \
 as a deploy gate. For a multi-shard pool, give `--database-url` once per shard.
 
 **These crates.** The Axum types come from the `autumn_web::reexports::axum`
-re-export, so the version always matches the router.
+re-export, so the version always matches the router. The `path` keys point
+into a checkout of this repository, next to your crate. Remove them when a
+release after 0.6.0 ships `HarvestEmbedding`.
 
 ```toml
 [dependencies]
-autumn-harvest = "0.6"
+autumn-harvest = { version = "0.6.0", path = "../autumn-harvest/autumn-harvest" }
 # `metrics` adds the Prometheus recorder. `webhooks` adds webhook receivers.
-autumn-harvest-plugin = { version = "0.6", features = ["metrics", "webhooks"] }
+autumn-harvest-plugin = { version = "0.6.0", path = "../autumn-harvest/autumn-harvest-plugin", features = ["metrics", "webhooks"] }
 autumn-web = "0.7"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 ```
@@ -234,6 +236,7 @@ shows who does each item on each path.
 | Install the storage pool, then the API runtime | Yes | Yes | — |
 | Copy the builder limits into the API state | Yes | Yes | — |
 | Set the deployment profile | From autumn-web | From `StandaloneAdminAuth` or `with_ambient_profile()` | Declare it |
+| Declare the auth boundary and the auth session key | From `api_with_auth(..)` and autumn-web | From `StandaloneAdminAuth` | Declare them |
 | Install the token and read-only-role layers | `enable_api_tokens()`, `api_with_role_auth(..)` | From `StandaloneAdminAuth` | Declare them |
 | Authenticate the routes with no admin guard | `api_with_auth(..)` | No | Your auth layer |
 | Apply migrations | Under the `dev` profile | No | `harvest migrate run` |
@@ -274,7 +277,7 @@ first token offline instead:
 
 ```bash
 cargo run -p autumn-harvest-cli -- token bootstrap \
-  --name ops-seed --scope mutate --expires-at 2026-12-31T00:00:00Z
+  --name ops-seed --scope mutate --expires-at 2027-06-30T00:00:00Z
 ```
 
 The command opens no connection. It prints the secret once and an `INSERT`
