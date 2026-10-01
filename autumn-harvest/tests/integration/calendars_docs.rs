@@ -56,14 +56,14 @@ fn doctest_step_runs_on_docs_only_changes() {
         "the doctest invocation must be a step `run:` line"
     );
 
-    let lint_start = workflow
+    let lint_job_at = workflow
         .find("\n  lint:")
         .expect("ci.yml must define a `lint` job");
-    let test_start = workflow
+    let test_job_at = workflow
         .find("\n  test:")
         .expect("ci.yml must define a `test` job");
     assert!(
-        step_at > lint_start && step_at < test_start,
+        step_at > lint_job_at && step_at < test_job_at,
         "the doctest step must live in the ungated `lint` job"
     );
 
