@@ -451,6 +451,22 @@ pub async fn acquire_within_pool_bound(pool: &crate::worker::DbPool) -> HarvestR
     acquire(pool, acquire_bound(pool)).await
 }
 
+/// The spacing between tries on a pool with a zero deadpool `wait`.
+///
+/// Such a pool is set to fail fast, so its tries do not wait out the default
+/// bound. A short spacing still lets a busy slot free up between tries.
+pub const ZERO_WAIT_RETRY_SPACING: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// The time from the start of one try to the start of the next one.
+#[cfg(feature = "db")]
+fn retry_spacing(pool: &crate::worker::DbPool) -> std::time::Duration {
+    if pool.timeouts().wait.is_some_and(|wait| wait.is_zero()) {
+        ZERO_WAIT_RETRY_SPACING
+    } else {
+        acquire_bound(pool)
+    }
+}
+
 /// Get a connection for a write that must not be lost, such as an executed
 /// activity result.
 ///
@@ -459,6 +475,9 @@ pub async fn acquire_within_pool_bound(pool: &crate::worker::DbPool) -> HarvestR
 /// bound before the next try. The tries then always span about `attempts`
 /// times the bound. A short pool incident or outage delays the write but does
 /// not drop it.
+///
+/// A pool with a zero `wait` is set to fail fast. Its tries start
+/// [`ZERO_WAIT_RETRY_SPACING`] apart instead.
 ///
 /// # Errors
 ///
@@ -470,6 +489,7 @@ pub async fn acquire_with_retries(
 ) -> HarvestResult<PooledConn> {
     let attempts = attempts.max(1);
     let bound = acquire_bound(pool);
+    let spacing = retry_spacing(pool);
     let mut attempt = 1;
     loop {
         let started = tokio::time::Instant::now();
@@ -477,7 +497,7 @@ pub async fn acquire_with_retries(
             Ok(conn) => return Ok(conn),
             Err(error) if attempt < attempts => {
                 tracing::warn!(attempt, attempts, error = %error, "pool acquire failed; trying again");
-                tokio::time::sleep_until(started + bound).await;
+                tokio::time::sleep_until(started + spacing).await;
                 attempt += 1;
             }
             Err(error) => return Err(error),
@@ -865,6 +885,40 @@ mod tests {
         assert!(err.is_pool_acquire_timeout(), "{err}");
         assert!(
             started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Retries on a zero-wait pool keep the fail-fast intent. A try that
+    /// fails at once must not wait out the 30 s default before the next try.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn retries_on_a_zero_wait_pool_stay_short() {
+        let (_listener, dsn) = silent_listener().await;
+        let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+            diesel_async::AsyncPgConnection,
+        >::new(dsn);
+        let pool = deadpool::managed::Pool::builder(manager)
+            .max_size(1)
+            .runtime(deadpool::Runtime::Tokio1)
+            .wait_timeout(Some(Duration::ZERO))
+            .build()
+            .expect("pool builds without connecting");
+
+        let busy = pool.clone();
+        let holder = tokio::spawn(async move { acquire_within_pool_bound(&busy).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), acquire_with_retries(&pool, 3))
+            .await
+            .expect("retries on a zero-wait pool must not wait out the default bound");
+        holder.abort();
+        let err = outcome.err().expect("the only slot stays busy");
+        assert!(err.is_pool_acquire_timeout(), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
             "{:?}",
             started.elapsed()
         );

@@ -21,7 +21,7 @@ Together these let one stuck connection stop work:
 The worker never waits without limit for a connection. Each acquire uses the
 pool's deadpool `wait` timeout as its bound. A pool with no `wait` timeout gets
 30 s. A zero `wait` keeps its deadpool meaning: the acquire fails at once when
-no slot is free.
+no slot is free. Retries on such a pool start 100 ms apart, not one bound apart.
 
 - An `autumn-web` pool sets `wait` from `database.connect_timeout_secs`, 5 s by
   default. The plugin's worker then uses 5 s.

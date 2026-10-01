@@ -13,10 +13,10 @@ pool failure, such as a refused connect, is `HarvestError::PoolAcquireFailed`.
 bound, or 30 s when the pool has none: the single-shard claim, fleet
 registration and status writes, activity and workflow task persistence, the
 cancellation observer and the DR generation pin. A zero `wait` still fails at
-once when no slot is free. Before, a pool with no deadpool `wait` timeout made
-them wait without limit. This reverses the "single shard stays unbounded" rule
-from issue #961 AC7. A claim that times out reports no work, and the poll loop
-tries again.
+once when no slot is free, and its retries start 100 ms apart. Before, a pool
+with no deadpool `wait` timeout made them wait without limit. This reverses the
+"single shard stays unbounded" rule from issue #961 AC7. A claim that times out
+reports no work, and the poll loop tries again.
 
 **Session timeouts per role (opt-in).** A pool built with `engine_pool` or
 `with_engine_timeouts` runs `SET` once on each new connection. The plugin's
