@@ -2175,60 +2175,62 @@ async fn run_shard_tick(
         let lease_id_inner = lease_id.clone();
         let names_inner = override_cut_names.clone();
         let cuts_inner = override_cuts.clone();
-        let candidates = Box::pin(conn.transaction::<Vec<CandidateExecution>, HarvestError, _>(async |conn| {
-            // Push each row's exact per-type effective cutoff into the
-            // predicate (issue #737, PR #990 review): the correlated
-            // `unnest` subquery resolves the override cutoff for this row's
-            // workflow_name, falling through COALESCE to the global cutoff
-            // ($3) or, when there is no global age, to `'-infinity'` — so a
-            // non-overridden never-delete type is never selected. Only
-            // genuinely-eligible rows are returned, so a long-retained
-            // type's not-yet-eligible backlog can neither consume the batch
-            // budget nor starve newer expired rows of a shorter policy.
-            //
-            // Two query-string variants keep the bind numbering unambiguous:
-            // with a global age the fallback is bound as $3; without one it
-            // is the `'-infinity'` literal and the cursor/limit binds shift
-            // down by one.
-            let sql = candidate_scan_sql(global_fallback.is_some());
-            // Bind order maps to $1..$N regardless of textual position. The
-            // override arrays ($1/$2) are always bound; $3 is the global
-            // fallback only in the global-age variant.
-            let query = diesel::sql_query(sql)
-                .bind::<Array<Text>, _>(names_inner)
-                .bind::<Array<Timestamptz>, _>(cuts_inner);
-            let rows = if let Some(fallback) = global_fallback {
-                query
-                    .bind::<Timestamptz, _>(fallback)
-                    .bind::<Nullable<Timestamptz>, _>(cursor.map(|it| it.completed_at))
-                    .bind::<Nullable<SqlUuid>, _>(cursor.map(|it| it.id))
-                    .bind::<BigInt, _>(i64::try_from(remaining).unwrap_or(i64::MAX))
-                    .load::<CandidateExecution>(conn)
-                    .await
-            } else {
-                query
-                    .bind::<Nullable<Timestamptz>, _>(cursor.map(|it| it.completed_at))
-                    .bind::<Nullable<SqlUuid>, _>(cursor.map(|it| it.id))
-                    .bind::<BigInt, _>(i64::try_from(remaining).unwrap_or(i64::MAX))
-                    .load::<CandidateExecution>(conn)
-                    .await
-            }
-            .map_err(database_error)?;
-
-            if !rows.is_empty() {
-                let ids: Vec<uuid::Uuid> = rows.iter().map(|r| r.id).collect();
-                diesel::update(
-                    harvest_workflow_executions::table
-                        .filter(harvest_workflow_executions::id.eq_any(ids)),
-                )
-                .set(harvest_workflow_executions::sticky_worker_id.eq(Some(lease_id_inner)))
-                .execute(conn)
-                .await
+        let candidates = Box::pin(
+            conn.transaction::<Vec<CandidateExecution>, HarvestError, _>(async |conn| {
+                // Push each row's exact per-type effective cutoff into the
+                // predicate (issue #737, PR #990 review): the correlated
+                // `unnest` subquery resolves the override cutoff for this row's
+                // workflow_name, falling through COALESCE to the global cutoff
+                // ($3) or, when there is no global age, to `'-infinity'` — so a
+                // non-overridden never-delete type is never selected. Only
+                // genuinely-eligible rows are returned, so a long-retained
+                // type's not-yet-eligible backlog can neither consume the batch
+                // budget nor starve newer expired rows of a shorter policy.
+                //
+                // Two query-string variants keep the bind numbering unambiguous:
+                // with a global age the fallback is bound as $3; without one it
+                // is the `'-infinity'` literal and the cursor/limit binds shift
+                // down by one.
+                let sql = candidate_scan_sql(global_fallback.is_some());
+                // Bind order maps to $1..$N regardless of textual position. The
+                // override arrays ($1/$2) are always bound; $3 is the global
+                // fallback only in the global-age variant.
+                let query = diesel::sql_query(sql)
+                    .bind::<Array<Text>, _>(names_inner)
+                    .bind::<Array<Timestamptz>, _>(cuts_inner);
+                let rows = if let Some(fallback) = global_fallback {
+                    query
+                        .bind::<Timestamptz, _>(fallback)
+                        .bind::<Nullable<Timestamptz>, _>(cursor.map(|it| it.completed_at))
+                        .bind::<Nullable<SqlUuid>, _>(cursor.map(|it| it.id))
+                        .bind::<BigInt, _>(i64::try_from(remaining).unwrap_or(i64::MAX))
+                        .load::<CandidateExecution>(conn)
+                        .await
+                } else {
+                    query
+                        .bind::<Nullable<Timestamptz>, _>(cursor.map(|it| it.completed_at))
+                        .bind::<Nullable<SqlUuid>, _>(cursor.map(|it| it.id))
+                        .bind::<BigInt, _>(i64::try_from(remaining).unwrap_or(i64::MAX))
+                        .load::<CandidateExecution>(conn)
+                        .await
+                }
                 .map_err(database_error)?;
-            }
 
-            Ok(rows)
-        }))
+                if !rows.is_empty() {
+                    let ids: Vec<uuid::Uuid> = rows.iter().map(|r| r.id).collect();
+                    diesel::update(
+                        harvest_workflow_executions::table
+                            .filter(harvest_workflow_executions::id.eq_any(ids)),
+                    )
+                    .set(harvest_workflow_executions::sticky_worker_id.eq(Some(lease_id_inner)))
+                    .execute(conn)
+                    .await
+                    .map_err(database_error)?;
+                }
+
+                Ok(rows)
+            }),
+        )
         .await?;
 
         // Release the checked-out connection immediately back to the pool
