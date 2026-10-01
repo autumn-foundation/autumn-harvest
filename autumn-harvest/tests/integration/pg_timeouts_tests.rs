@@ -616,6 +616,57 @@ async fn a_stranded_activity_claim_is_released() {
     assert_eq!(task_state(&mut conn, task_id).await, "PENDING");
 }
 
+/// The claim release must ride out the same `lock_timeout` that stopped the
+/// result write. Another session holds the row lock for 700 ms, and the pool
+/// gives up on a lock after 150 ms.
+#[tokio::test]
+async fn a_claim_release_retries_after_a_lock_timeout() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let queue_name = format!("q-rl-{}", &Uuid::new_v4().simple().to_string()[..12]);
+    let task_id = autumn_harvest::queue::enqueue(
+        &mut conn,
+        &autumn_harvest::queue::EnqueueParams::new(
+            &queue_name,
+            autumn_harvest::queue::TaskType::Activity,
+            serde_json::json!({}),
+        ),
+    )
+    .await
+    .expect("enqueue");
+    diesel::sql_query(
+        "UPDATE harvest_task_queue SET state = 'RUNNING', worker_id = 'w-1', attempt = 1 \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .execute(&mut conn)
+    .await
+    .expect("model the claim");
+
+    let lock_url = url.clone();
+    let holder = tokio::spawn(async move {
+        let mut conn = connect(&lock_url).await;
+        diesel::sql_query(format!(
+            "DO $$ BEGIN PERFORM 1 FROM harvest_task_queue WHERE id = '{task_id}' FOR UPDATE; \
+             PERFORM pg_sleep(0.7); END $$"
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("hold the row lock");
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let session = SessionTimeouts {
+        lock: Duration::from_millis(150),
+        ..SessionTimeouts::for_role(DbRole::Hot)
+    };
+    let pool = engine_pool(url, 1, DbRole::Hot, &timeouts(5_000, session)).expect("engine pool");
+    autumn_harvest::worker::reset_timed_out_workflow_task(&pool, task_id, "w-1", 0, 1).await;
+    holder.await.expect("holder joins");
+
+    assert_eq!(task_state(&mut conn, task_id).await, "PENDING");
+}
+
 async fn task_state(conn: &mut AsyncPgConnection, task_id: Uuid) -> String {
     #[derive(diesel::QueryableByName)]
     struct State {

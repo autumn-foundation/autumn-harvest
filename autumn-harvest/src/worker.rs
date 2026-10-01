@@ -31327,111 +31327,128 @@ pub async fn reset_timed_out_workflow_task(
 ) {
     use crate::schema::harvest_task_queue::dsl;
 
-    // Retry acquiring a pool connection: a transient pool saturation during
-    // timeout handling would otherwise leave the task stuck in RUNNING on a
-    // live worker (the orphan reclaimer skips tasks owned by live workers).
-    let mut conn = {
-        let mut last_err = None;
-        let backoff_ms: &[u64] = RESET_POOL_RETRY_BACKOFF_MS;
-        let mut result = None;
-        for &delay_ms in backoff_ms {
-            if delay_ms > 0 {
-                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-            }
-            match crate::pool::acquire_within_pool_bound(pool).await {
-                Ok(c) => {
-                    result = Some(c);
-                    break;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        task_id = %task_id,
-                        worker_id = %worker_id,
-                        error = %e,
-                        "workflow task timeout reset: pool unavailable, retrying"
-                    );
-                    last_err = Some(e);
-                }
-            }
+    // Retry both the pool acquire and the release write. Without the retry, a
+    // short pool saturation leaves the task stuck in RUNNING on a live worker.
+    // The orphan reclaimer skips tasks owned by live workers. The write can
+    // also hit a session `lock_timeout` or
+    // `statement_timeout` (issue #1788): often the same lock that stopped the
+    // activity's own result write. The claim fence makes a repeat safe.
+    let mut last_err = None;
+    for &delay_ms in RESET_POOL_RETRY_BACKOFF_MS {
+        if delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         }
-        if let Some(c) = result {
-            c
-        } else {
-            tracing::error!(
-                task_id = %task_id,
-                worker_id = %worker_id,
-                error = ?last_err,
-                "workflow task timeout reset: pool exhausted after retries; \
-                 task may be stuck RUNNING until worker stops"
-            );
-            return;
-        }
-    };
-    match diesel::update(
-        dsl::harvest_task_queue
-            .find(task_id)
-            .filter(dsl::state.eq("RUNNING"))
-            .filter(dsl::worker_id.eq(worker_id))
-            // Claim-epoch guard (issue #1459). It is the same race
-            // `queue::release_task_for_capability_miss` already guards.
-            // `poison_pill::requeue_orphan` hands an orphan back as `PENDING`
-            // with `crash_strikes + 1`, and the same worker can win it again.
-            // A `(state, worker_id)` guard alone then matches that new claim.
-            // This reset would re-`PENDING` a row whose replacement handler
-            // already runs, and invite a second concurrent dispatch.
+        let mut conn = match crate::pool::acquire_within_pool_bound(pool).await {
+            Ok(conn) => conn,
+            Err(e) => {
+                tracing::warn!(
+                    task_id = %task_id,
+                    worker_id = %worker_id,
+                    error = %e,
+                    "workflow task timeout reset: pool unavailable, retrying"
+                );
+                last_err = Some(e);
+                continue;
+            }
+        };
+        let written = diesel::update(
+            dsl::harvest_task_queue
+                .find(task_id)
+                .filter(dsl::state.eq("RUNNING"))
+                .filter(dsl::worker_id.eq(worker_id))
+                // Claim-epoch guard (issue #1459). It is the same race
+                // `queue::release_task_for_capability_miss` already guards.
+                // `poison_pill::requeue_orphan` hands an orphan back as `PENDING`
+                // with `crash_strikes + 1`, and the same worker can win it again.
+                // A `(state, worker_id)` guard alone then matches that new claim.
+                // This reset would re-`PENDING` a row whose replacement handler
+                // already runs, and invite a second concurrent dispatch.
+                //
+                // Two discriminators, not one. `crash_strikes` alone is not
+                // enough. `poison_pill::requeue_stuck_task` (issue #1459's
+                // stuck-running backstop) also hands a row back to `PENDING` for
+                // re-claim. It deliberately leaves `crash_strikes` untouched --
+                // being stuck is not a crash. Its re-claim would then still match
+                // on `crash_strikes` alone. This reset must also check `attempt`,
+                // which `claim_task` bumps on every claim without exception.
+                .filter(dsl::crash_strikes.eq(claim_crash_strikes))
+                .filter(dsl::attempt.eq(claim_attempt)),
+        )
+        .set((
+            dsl::state.eq("PENDING"),
+            dsl::worker_id.eq(None::<String>),
+            dsl::started_at.eq(None::<chrono::DateTime<chrono::Utc>>),
+            dsl::last_heartbeat_at.eq(None::<chrono::DateTime<chrono::Utc>>),
+            // Clear sticky affinity so any worker can reclaim the task immediately
+            // rather than waiting for the expired lease of the hung worker.
+            dsl::sticky_worker_id.eq(None::<String>),
+            dsl::sticky_until.eq(None::<chrono::DateTime<chrono::Utc>>),
+            // `capability_misses` is deliberately NOT reset here (issue #804).
             //
-            // Two discriminators, not one. `crash_strikes` alone is not
-            // enough. `poison_pill::requeue_stuck_task` (issue #1459's
-            // stuck-running backstop) also hands a row back to `PENDING` for
-            // re-claim. It deliberately leaves `crash_strikes` untouched --
-            // being stuck is not a crash. Its re-claim would then still match
-            // on `crash_strikes` alone. This reset must also check `attempt`,
-            // which `claim_task` bumps on every claim without exception.
-            .filter(dsl::crash_strikes.eq(claim_crash_strikes))
-            .filter(dsl::attempt.eq(claim_attempt)),
-    )
-    .set((
-        dsl::state.eq("PENDING"),
-        dsl::worker_id.eq(None::<String>),
-        dsl::started_at.eq(None::<chrono::DateTime<chrono::Utc>>),
-        dsl::last_heartbeat_at.eq(None::<chrono::DateTime<chrono::Utc>>),
-        // Clear sticky affinity so any worker can reclaim the task immediately
-        // rather than waiting for the expired lease of the hung worker.
-        dsl::sticky_worker_id.eq(None::<String>),
-        dsl::sticky_until.eq(None::<chrono::DateTime<chrono::Utc>>),
-        // `capability_misses` is deliberately NOT reset here (issue #804).
-        //
-        // It is tempting to: a workflow-task timeout usually means the handler
-        // was found and ran long, which would be proof of capability. But that
-        // premise does not hold on this path. The timeout is armed around the
-        // whole of `process_task`, and `pool.get()` plus the full history load
-        // both sit inside it — strictly *before* the registry lookup that
-        // defines a capability miss. Under pool starvation or a slow shard the
-        // budget expires with the lookup never having run, so reaching here
-        // proves nothing about the claiming worker.
-        //
-        // Resetting on that false premise is the worse error of the two: a
-        // genuinely unregistered type under load would have its consecutive-miss
-        // streak zeroed indefinitely and never escalate, so the run never
-        // reaches the `no_capable_worker:` terminal AC3 promises and the
-        // operator sees only the ticket-severity sustained-release rule instead
-        // of the page. It also erases an in-flight miss when the release UPDATE
-        // itself is what timed out.
-        //
-        // Accepted cost: a capable-but-slow worker's timeout leaves a stale
-        // streak, so a later genuine miss can escalate before spending the full
-        // budget. That direction is fail-safe — it produces a loud, actionable
-        // terminal failure rather than a silently un-escalating task — and the
-        // two `park_workflow_task` queries already cover the dominant
-        // proof-of-capability path (the handler ran and suspended).
-    ))
-    .execute(&mut conn)
-    .await
-    {
+            // It is tempting to: a workflow-task timeout usually means the handler
+            // was found and ran long, which would be proof of capability. But that
+            // premise does not hold on this path. The timeout is armed around the
+            // whole of `process_task`, and `pool.get()` plus the full history load
+            // both sit inside it — strictly *before* the registry lookup that
+            // defines a capability miss. Under pool starvation or a slow shard the
+            // budget expires with the lookup never having run, so reaching here
+            // proves nothing about the claiming worker.
+            //
+            // Resetting on that false premise is the worse error of the two: a
+            // genuinely unregistered type under load would have its consecutive-miss
+            // streak zeroed indefinitely and never escalate, so the run never
+            // reaches the `no_capable_worker:` terminal AC3 promises and the
+            // operator sees only the ticket-severity sustained-release rule instead
+            // of the page. It also erases an in-flight miss when the release UPDATE
+            // itself is what timed out.
+            //
+            // Accepted cost: a capable-but-slow worker's timeout leaves a stale
+            // streak, so a later genuine miss can escalate before spending the full
+            // budget. That direction is fail-safe — it produces a loud, actionable
+            // terminal failure rather than a silently un-escalating task — and the
+            // two `park_workflow_task` queries already cover the dominant
+            // proof-of-capability path (the handler ran and suspended).
+        ))
+        .execute(&mut conn)
+        .await
+        .map_err(crate::error::database_error);
+        match written {
+            Err(e) if crate::pool::is_session_timeout(&e) => {
+                tracing::warn!(
+                    task_id = %task_id,
+                    worker_id = %worker_id,
+                    error = %e,
+                    "workflow task timeout reset: session timeout, retrying"
+                );
+                last_err = Some(e);
+            }
+            outcome => {
+                log_claim_reset_outcome(&mut conn, task_id, worker_id, outcome).await;
+                return;
+            }
+        }
+    }
+    tracing::error!(
+        task_id = %task_id,
+        worker_id = %worker_id,
+        error = ?last_err,
+        "workflow task timeout reset: retries exhausted; \
+         task may be stuck RUNNING until worker stops"
+    );
+}
+
+/// Log the result of the claim reset in [`reset_timed_out_workflow_task`].
+async fn log_claim_reset_outcome(
+    conn: &mut AsyncPgConnection,
+    task_id: uuid::Uuid,
+    worker_id: &str,
+    outcome: HarvestResult<usize>,
+) {
+    match outcome {
         Ok(n) if n > 0 => {
             // Dispatch hint (issue #1312). The row is `PENDING` again with no
             // owner, so the channel gets a reference to it.
-            crate::queue::record_pending_hints(&mut conn, &[task_id]).await;
+            crate::queue::record_pending_hints(conn, &[task_id]).await;
             tracing::debug!(
                 task_id = %task_id,
                 worker_id = %worker_id,
