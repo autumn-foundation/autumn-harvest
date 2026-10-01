@@ -1404,6 +1404,23 @@ fn chaos_suite_check_rejects_gated_and_empty_runs() {
         );
     }
 
+    let kept = "        continue-on-error: false\n";
+    assert!(
+        runs_the_chaos_suite_unconditionally(&workflow("", kept, run)),
+        "`continue-on-error: false` is the default, so it must count"
+    );
+
+    for masked in [
+        format!("{run} || true"),
+        format!("{run}; exit 0"),
+        format!("set +e; {run}"),
+    ] {
+        assert!(
+            !runs_the_chaos_suite_unconditionally(&workflow("", "", &masked)),
+            "`{masked}` hides a failed suite, so it must not count"
+        );
+    }
+
     for flag in [
         "--no-run",
         "--exact",

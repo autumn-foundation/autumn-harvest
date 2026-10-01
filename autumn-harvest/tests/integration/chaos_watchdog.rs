@@ -19,6 +19,10 @@ const WATCHDOG_SCRIPT: &str = ".github/ci/chaos-watchdog.sh";
 #[cfg(target_os = "linux")]
 const ALERT_TITLE: &str = "Chaos nightly: no successful scheduled run in 48 h";
 
+/// The title of the issue for a failed watchdog run.
+#[cfg(target_os = "linux")]
+const WATCHDOG_FAILED_TITLE: &str = "Chaos watchdog: a watchdog run failed";
+
 /// The watchdog must fire on its own cron and run the script with the
 /// permissions that the script needs.
 #[test]
@@ -44,6 +48,31 @@ fn watchdog_workflow_runs_the_script_daily() {
     );
 }
 
+/// A job timeout cancels the job, and `if: failure()` steps do not run after
+/// a cancel. A step timeout is a step failure, so the report step still runs.
+#[test]
+fn watchdog_check_step_has_its_own_timeout() {
+    let doc = parse_workflow(WATCHDOG_WORKFLOW);
+    let timed = doc
+        .get("jobs")
+        .and_then(serde_yaml::Value::as_mapping)
+        .into_iter()
+        .flat_map(|jobs| jobs.values())
+        .filter_map(|job| job.get("steps").and_then(serde_yaml::Value::as_sequence))
+        .flatten()
+        .filter(|step| step.get("if").is_none())
+        .filter(|step| {
+            step.get("run")
+                .and_then(serde_yaml::Value::as_str)
+                .is_some_and(|run| run.contains(WATCHDOG_SCRIPT))
+        })
+        .all(|step| step.get("timeout-minutes").is_some());
+    assert!(
+        timed,
+        "the step that runs {WATCHDOG_SCRIPT} must set `timeout-minutes`"
+    );
+}
+
 /// GitHub tells only the last editor of a cron when a scheduled run fails.
 /// So a red watchdog run is silent, as the dead nightly was. A final step must
 /// put that failure on the alert issue.
@@ -61,7 +90,7 @@ fn watchdog_workflow_reports_its_own_failure() {
             let on_failure = step
                 .get("if")
                 .and_then(serde_yaml::Value::as_str)
-                .is_some_and(|cond| cond.contains("failure()"));
+                .is_some_and(|cond| cond.contains("failure()") && !cond.contains('!'));
             let run = step.get("run").and_then(serde_yaml::Value::as_str);
             on_failure
                 && run.is_some_and(|r| r.contains(WATCHDOG_SCRIPT) && r.contains("self-failed"))
@@ -325,11 +354,13 @@ fn watchdog_fails_closed_when_the_issue_query_fails() {
     assert!(!out.wrote_an_issue(), "calls: {:?}", out.calls);
 }
 
-/// In `self-failed` mode the script reports the red watchdog run. It does
-/// not query runs, because that query can be the part that failed.
+/// In `self-failed` mode the script reports the red watchdog run on its own
+/// issue. It does not query runs, because that query can be the part that
+/// failed. It must not use the nightly alert title, because the nightly can
+/// be green.
 #[cfg(target_os = "linux")]
 #[test]
-fn watchdog_self_failed_mode_reports_on_the_alert_issue() {
+fn watchdog_self_failed_mode_opens_its_own_issue() {
     let out = run_watchdog(&Stub {
         runs: None,
         issues: Some(Stub::issue(77, ALERT_TITLE)),
@@ -337,13 +368,44 @@ fn watchdog_self_failed_mode_reports_on_the_alert_issue() {
     });
     assert!(out.success, "calls: {:?}", out.calls);
     assert!(!out.called("api "), "calls: {:?}", out.calls);
-    let comment = out
+    assert!(!out.called("issue comment 77"), "calls: {:?}", out.calls);
+    let create = out
         .calls
         .iter()
-        .find(|c| c.starts_with("issue comment 77"))
-        .unwrap_or_else(|| panic!("no comment on #77; calls: {:?}", out.calls));
+        .find(|c| c.starts_with("issue create"))
+        .unwrap_or_else(|| panic!("no issue opened; calls: {:?}", out.calls));
     assert!(
-        comment.contains("actions/runs/4242"),
-        "the comment must link the failed run: {comment}"
+        create.contains(WATCHDOG_FAILED_TITLE) && !create.contains(ALERT_TITLE),
+        "the issue must use the watchdog-failure title: {create}"
     );
+    assert!(
+        create.contains("actions/runs/4242"),
+        "the issue must link the failed run: {create}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn watchdog_self_failed_mode_comments_on_its_open_issue() {
+    let out = run_watchdog(&Stub {
+        runs: None,
+        issues: Some(Stub::issue(88, WATCHDOG_FAILED_TITLE)),
+        arg: Some("self-failed"),
+    });
+    assert!(out.success, "calls: {:?}", out.calls);
+    assert!(out.called("issue comment 88"), "calls: {:?}", out.calls);
+    assert!(!out.called("issue create"), "calls: {:?}", out.calls);
+}
+
+/// A watchdog run that completes its query shows the watchdog works again.
+#[cfg(target_os = "linux")]
+#[test]
+fn watchdog_closes_its_failure_issue_after_a_clean_run() {
+    let out = run_watchdog(&Stub {
+        runs: Some(Stub::runs(1)),
+        issues: Some(Stub::issue(88, WATCHDOG_FAILED_TITLE)),
+        arg: None,
+    });
+    assert!(out.success, "calls: {:?}", out.calls);
+    assert!(out.called("issue close 88"), "calls: {:?}", out.calls);
 }
