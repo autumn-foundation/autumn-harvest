@@ -180,6 +180,16 @@ fn cached_install(cache_root: &std::path::Path) -> Option<PostgresBinaries> {
 
 /// Whether `dir` is safe to execute binaries from.
 ///
+/// # ACL limit (issue #1548)
+///
+/// The write test reads POSIX mode bits. On Linux this covers POSIX ACLs,
+/// because the group bits show the ACL mask. It does not cover ACLs that
+/// `stat` cannot show: macOS and BSD native ACLs, and `NFSv4` ACLs. A grant of
+/// that kind on `dir` or an ancestor lets its holder do the rename-and-replace
+/// attack below. This limit is accepted and documented, as with the sshd
+/// `StrictModes` check. A fix needs a per-platform ACL API. Keep the cache
+/// under a path that no such ACL covers.
+///
 /// A leaf-only check is not enough (issue #1292). The check and the run
 /// happen at two separate moments. A local user who can write an ancestor
 /// of `dir` can act in between. That user can rename the validated
@@ -211,7 +221,7 @@ fn leaf_is_private(dir: &std::path::Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        if metadata.permissions().mode() & 0o022 != 0 {
+        if super::reaper::others_can_write(metadata.permissions().mode()) {
             return false;
         }
     }
@@ -255,7 +265,7 @@ fn ancestors_are_private(dir: &std::path::Path) -> bool {
             metadata.uid() != 0 && super::reaper::unix_uid() != Some(metadata.uid());
         let mode = metadata.permissions().mode();
         let sticky = mode & 0o1000 != 0;
-        let writable_by_others = mode & 0o022 != 0;
+        let writable_by_others = super::reaper::others_can_write(mode);
         if untrusted_owner || (writable_by_others && !sticky) {
             return false;
         }
@@ -380,6 +390,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
 
         use super::directory_is_private;
+        use crate::dev::reaper::acl_fixture;
 
         /// A cache root nested three levels under a fresh, owner-only temp
         /// directory: the shape a real per-user cache has.
@@ -460,6 +471,49 @@ mod tests {
             let (root, cache) = private_cache_root();
             let ancestor = root.path().join("a");
             fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o1777)).expect("chmod");
+            assert!(directory_is_private(&cache));
+        }
+
+        /// Issue #1548. An ACL write grant on an ancestor is refused.
+        #[test]
+        fn an_ancestor_with_an_acl_write_grant_is_refused() {
+            let (root, cache) = private_cache_root();
+            if !acl_fixture::grant_write(&root.path().join("a")) {
+                eprintln!("SKIP: setfacl is unavailable");
+                return;
+            }
+            assert!(!directory_is_private(&cache));
+        }
+
+        /// Issue #1548. An ACL write grant on the leaf is refused.
+        #[test]
+        fn a_leaf_with_an_acl_write_grant_is_refused() {
+            let (_root, cache) = private_cache_root();
+            if !acl_fixture::grant_write(&cache) {
+                eprintln!("SKIP: setfacl is unavailable");
+                return;
+            }
+            assert!(!directory_is_private(&cache));
+        }
+
+        /// Issue #1548. A `chmod 755` lowers the ACL mask, so the grant has
+        /// no effective write access. The directory is accepted.
+        #[test]
+        fn a_masked_acl_grant_is_accepted() {
+            let (_root, cache) = private_cache_root();
+            if !acl_fixture::grant_write(&cache) {
+                eprintln!("SKIP: setfacl is unavailable");
+                return;
+            }
+            fs::set_permissions(&cache, fs::Permissions::from_mode(0o755)).expect("chmod");
+            assert!(directory_is_private(&cache));
+        }
+
+        /// Issue #1548. A `0755` directory with no ACL stays accepted.
+        #[test]
+        fn a_0755_directory_without_an_acl_is_accepted() {
+            let (_root, cache) = private_cache_root();
+            fs::set_permissions(&cache, fs::Permissions::from_mode(0o755)).expect("chmod");
             assert!(directory_is_private(&cache));
         }
 
