@@ -829,6 +829,15 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Collect parameter names after the first (ctx is first, rest are inputs).
     let params: Vec<_> = input_fn.sig.inputs.iter().skip(1).collect();
     let param_names: Vec<_> = crate::attr_util::param_idents(&params);
+    if let Some(pt) = crate::attr_util::first_non_ident_param(&params) {
+        return syn::Error::new_spanned(
+            &pt.pat,
+            "#[workflow] input parameters must be plain identifiers, so `_` and \
+             destructuring patterns are not supported; name the parameter, for \
+             example `_input: ()` (the leading underscore silences the unused warning)",
+        )
+        .to_compile_error();
+    }
 
     // If the workflow returns `Result<_, WorkflowFailure>`, route the error
     // through `WorkflowFailure`'s `IntoWorkflowErrorString` impl so the engine
