@@ -28,6 +28,7 @@
 
 #![allow(clippy::too_many_lines)]
 
+use std::fmt::Write as _;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
@@ -93,10 +94,11 @@ async fn create_fresh_db(admin_url: &str, name: &str) -> String {
     url
 }
 
-/// Seeds a production-shaped `harvest_timers` table: finished executions
-/// whose timers fired long ago (95%), a thin tail of still-pending timers
-/// (5%), and a skewed timer count per execution. Deterministic: no random
-/// calls, every value derives from the series index.
+/// Seeds a production-shaped `harvest_timers` table.
+/// Finished executions own timers that fired long ago (95%).
+/// A thin tail of still-pending timers makes up the rest (5%).
+/// The timer count per execution is skewed.
+/// The seed is deterministic: every value derives from the series index.
 async fn seed_timer_history(conn: &mut AsyncPgConnection) {
     conn.batch_execute(&format!(
         "INSERT INTO harvest_workflow_executions \
@@ -120,7 +122,10 @@ async fn seed_timer_history(conn: &mut AsyncPgConnection) {
     .expect("seed production-shaped timer history");
 }
 
-fn wf_info(name: &'static str, handler: fn(&WorkflowContext, Value) -> WfFuture<'_>) -> WorkflowInfo {
+fn wf_info(
+    name: &'static str,
+    handler: fn(&WorkflowContext, Value) -> WfFuture<'_>,
+) -> WorkflowInfo {
     WorkflowInfo {
         quota: None,
         declared_activities: None,
@@ -274,7 +279,11 @@ async fn measure_one(admin: &str, label: &str, n: u64) -> (Point, Vec<StatRow>, 
     // Wait until the park has persisted every timer row.
     let mut parked = false;
     for _ in 0..200 {
-        if load_timers_for_execution_from_url(&url, exec_id).await.len() as u64 == n {
+        if load_timers_for_execution_from_url(&url, exec_id)
+            .await
+            .len() as u64
+            == n
+        {
             parked = true;
             break;
         }
@@ -338,7 +347,10 @@ fn is_poll_noise(q: &str) -> bool {
 
 /// `EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS)` for the lookup and the
 /// insert, run inside a rolled-back transaction.
-async fn explain_statements(conn: &mut AsyncPgConnection, exec_id: autumn_harvest::types::ExecutionId) -> String {
+async fn explain_statements(
+    conn: &mut AsyncPgConnection,
+    exec_id: autumn_harvest::types::ExecutionId,
+) -> String {
     #[derive(diesel::QueryableByName)]
     struct Line {
         #[diesel(sql_type = diesel::sql_types::Text)]
@@ -364,11 +376,8 @@ async fn explain_statements(conn: &mut AsyncPgConnection, exec_id: autumn_harves
             ),
         ),
     ] {
-        let lines: Vec<Line> = diesel::sql_query(sql)
-            .load(conn)
-            .await
-            .expect("explain");
-        out.push_str(&format!("-- {title}\n"));
+        let lines: Vec<Line> = diesel::sql_query(sql).load(conn).await.expect("explain");
+        writeln!(out, "-- {title}").unwrap();
         for l in lines {
             out.push_str(&l.plan);
             out.push('\n');
@@ -398,41 +407,63 @@ async fn zz_capture_mixed_suspension_timer_batch_evidence() {
         eprintln!(
             "label={label} n={} lookup_calls={} lookup_buffers={} clock_calls={} insert_calls={} \
              insert_buffers={} target_calls={} target_buffers={} park_calls={} park_buffers={}",
-            p.n, p.lookup_calls, p.lookup_buffers, p.clock_calls, p.insert_calls,
-            p.insert_buffers, p.target_calls, p.target_buffers, p.park_calls, p.park_buffers
+            p.n,
+            p.lookup_calls,
+            p.lookup_buffers,
+            p.clock_calls,
+            p.insert_calls,
+            p.insert_buffers,
+            p.target_calls,
+            p.target_buffers,
+            p.park_calls,
+            p.park_buffers
         );
         lines.push(format!(
             "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            p.n, p.lookup_calls, p.lookup_buffers, p.clock_calls, p.insert_calls,
-            p.insert_buffers, p.target_calls, p.target_buffers, p.park_calls, p.park_buffers
+            p.n,
+            p.lookup_calls,
+            p.lookup_buffers,
+            p.clock_calls,
+            p.insert_calls,
+            p.insert_buffers,
+            p.target_calls,
+            p.target_buffers,
+            p.park_calls,
+            p.park_buffers
         ));
         if n == 10 {
             let mut snap = format!("-- {label}: pg_stat_statements, n={n}, ranked by buffers\n");
             snap.push_str("calls\tshared_hit\tshared_read\ttotal_buffers\twal_bytes\tquery\n");
             for r in &rows {
-                snap.push_str(&format!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\n",
+                writeln!(
+                    snap,
+                    "{}\t{}\t{}\t{}\t{}\t{}",
                     r.calls,
                     r.shared_blks_hit,
                     r.shared_blks_read,
                     r.total_buffers,
                     r.wal_bytes,
                     r.query.replace('\n', " ")
-                ));
+                )
+                .unwrap();
             }
             snap.push_str("\n-- ranked by calls (top 10)\n");
             let mut by_calls: Vec<&StatRow> = rows.iter().collect();
             by_calls.sort_by(|a, b| b.calls.cmp(&a.calls).then(a.query.cmp(&b.query)));
             for r in by_calls.iter().take(10) {
-                snap.push_str(&format!("{}\t{}\n", r.calls, r.query.replace('\n', " ")));
+                writeln!(snap, "{}\t{}", r.calls, r.query.replace('\n', " ")).unwrap();
             }
             std::fs::write(dir.join(format!("{label}-pg_stat_statements.txt")), snap)
                 .expect("write snapshot");
-            std::fs::write(dir.join(format!("{label}-explain.txt")), explain).expect("write explain");
+            std::fs::write(dir.join(format!("{label}-explain.txt")), explain)
+                .expect("write explain");
         }
     }
-    std::fs::write(dir.join(format!("{label}-sweep.txt")), lines.join("\n") + "\n")
-        .expect("write sweep");
+    std::fs::write(
+        dir.join(format!("{label}-sweep.txt")),
+        lines.join("\n") + "\n",
+    )
+    .expect("write sweep");
 }
 
 /// A park with duplicate-free timers persists one row and one `TimerStarted`
@@ -453,7 +484,11 @@ async fn park_persists_the_same_timer_rows_and_events() {
     let worker = build_runtime_worker("timer-batch-equiv", 4, 2, registry);
     let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&url));
     for _ in 0..200 {
-        if load_timers_for_execution_from_url(&url, exec_id).await.len() == 5 {
+        if load_timers_for_execution_from_url(&url, exec_id)
+            .await
+            .len()
+            == 5
+        {
             break;
         }
         tokio::time::sleep(StdDuration::from_millis(50)).await;

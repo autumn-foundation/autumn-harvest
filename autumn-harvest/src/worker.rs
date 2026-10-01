@@ -5040,6 +5040,38 @@ fn retry_stream_seed(task: &TaskQueueItem) -> u64 {
     seed
 }
 
+/// Loads the un-fired `harvest_timers` rows for `timer_ids` on one execution,
+/// keyed by `timer_id`, in one statement.
+///
+/// The mixed-batch paths used to issue one `LIMIT 1` lookup per `StartTimer`.
+/// `harvest_timers` has no `(workflow_exec_id, timer_id)` index, so each of
+/// those lookups scanned the pending-timer index. One `eq_any` lookup scans it
+/// once. The table has no unique index either, so a duplicate un-fired row for
+/// one `timer_id` is possible in principle. The earliest `fires_at` wins, with
+/// `id` as the tiebreaker, which makes the choice deterministic.
+async fn load_unfired_timers_by_id(
+    conn: &mut AsyncPgConnection,
+    exec_id: uuid::Uuid,
+    timer_ids: &[&str],
+) -> HarvestResult<HashMap<String, HarvestTimer>> {
+    let mut by_id = HashMap::with_capacity(timer_ids.len());
+    if timer_ids.is_empty() {
+        return Ok(by_id);
+    }
+    let rows: Vec<HarvestTimer> = harvest_timers::table
+        .filter(harvest_timers::workflow_exec_id.eq(exec_id))
+        .filter(harvest_timers::timer_id.eq_any(timer_ids))
+        .filter(harvest_timers::fired.eq(false))
+        .order((harvest_timers::fires_at.asc(), harvest_timers::id.asc()))
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    for row in rows {
+        by_id.entry(row.timer_id.clone()).or_insert(row);
+    }
+    Ok(by_id)
+}
+
 /// Read the current time from the database clock (`NOW()`).
 ///
 /// Timer due-ness checks and the signal `received_at` column default both use
@@ -12232,21 +12264,26 @@ async fn persist_mixed_suspension_batch(
         let mut new_timer_rows: Vec<(TimerId, chrono::DateTime<chrono::Utc>)> = Vec::new();
         let mut timer_started_events: std::collections::VecDeque<Option<WorkflowEvent>> =
             std::collections::VecDeque::with_capacity(batch.timers.len());
+        let timer_ids: Vec<&str> = batch.timers.iter().map(|t| t.timer_id.as_str()).collect();
+        let existing_timers =
+            load_unfired_timers_by_id(conn, exec_id.as_uuid(), &timer_ids).await?;
+        // `NOW()` is the transaction start time, so one read serves every new
+        // timer in this batch.
+        let mut db_now: Option<chrono::DateTime<chrono::Utc>> = None;
         for timer in &batch.timers {
-            let existing: Option<HarvestTimer> = harvest_timers::table
-                .filter(harvest_timers::workflow_exec_id.eq(exec_id.as_uuid()))
-                .filter(harvest_timers::timer_id.eq(timer.timer_id.as_str()))
-                .filter(harvest_timers::fired.eq(false))
-                .first::<HarvestTimer>(conn)
-                .await
-                .optional()
-                .map_err(crate::error::database_error)?;
-            let fires_at = if let Some(ref ext) = existing {
+            let existing = existing_timers.get(timer.timer_id.as_str());
+            let fires_at = if let Some(ext) = existing {
                 ext.fires_at
             } else {
                 let fire_delay = chrono_duration_from_secs(timer.duration_secs, "timer duration")?;
-                let db_now = db_clock_now(conn).await?;
-                let fires_at = db_now + fire_delay;
+                let now = if let Some(now) = db_now {
+                    now
+                } else {
+                    let now = db_clock_now(conn).await?;
+                    db_now = Some(now);
+                    now
+                };
+                let fires_at = now + fire_delay;
                 new_timer_rows.push((timer.timer_id.clone(), fires_at));
                 fires_at
             };
@@ -12412,14 +12449,17 @@ async fn persist_mixed_suspension_batch(
         let activity_task_ids = queue::enqueue_batch(conn, &enqueued).await?;
 
         // Insert the durable rows for genuinely new timers.
-        for (timer_id, fires_at) in &new_timer_rows {
-            let new_timer = NewHarvestTimer {
-                workflow_exec_id: exec_id.as_uuid(),
-                timer_id: timer_id.as_str(),
-                fires_at: *fires_at,
-            };
+        if !new_timer_rows.is_empty() {
+            let new_timers: Vec<NewHarvestTimer<'_>> = new_timer_rows
+                .iter()
+                .map(|(timer_id, fires_at)| NewHarvestTimer {
+                    workflow_exec_id: exec_id.as_uuid(),
+                    timer_id: timer_id.as_str(),
+                    fires_at: *fires_at,
+                })
+                .collect();
             diesel::insert_into(harvest_timers::table)
-                .values(&new_timer)
+                .values(&new_timers)
                 .execute(conn)
                 .await
                 .map_err(crate::error::database_error)?;
@@ -19850,16 +19890,11 @@ async fn suspended_command_event_count(
         branch_events = branch_events
             .saturating_add(new_child_workflow_event_count(conn, &mixed.children).await?);
         if let Some(exec_uuid) = workflow_exec_id {
+            let timer_ids: Vec<&str> = mixed.timers.iter().map(|t| t.timer_id.as_str()).collect();
+            let existing_timers = load_unfired_timers_by_id(conn, exec_uuid, &timer_ids).await?;
             for timer in &mixed.timers {
-                let existing: Option<HarvestTimer> = harvest_timers::table
-                    .filter(harvest_timers::workflow_exec_id.eq(exec_uuid))
-                    .filter(harvest_timers::timer_id.eq(timer.timer_id.as_str()))
-                    .filter(harvest_timers::fired.eq(false))
-                    .first::<HarvestTimer>(conn)
-                    .await
-                    .optional()
-                    .map_err(crate::error::database_error)?;
-                branch_events = branch_events.saturating_add(u64::from(existing.is_none()));
+                let is_new = !existing_timers.contains_key(timer.timer_id.as_str());
+                branch_events = branch_events.saturating_add(u64::from(is_new));
             }
         } else {
             // No execution id to resolve against (the pure-preflight caller):
