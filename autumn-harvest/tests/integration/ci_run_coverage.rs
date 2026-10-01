@@ -1422,10 +1422,14 @@ fn chaos_suite_check_rejects_gated_and_empty_runs() {
         format!("{run} || true"),
         format!("{run}; exit 0"),
         format!("set +e; {run}"),
+        format!("{run}; true"),
+        format!("{run} & wait"),
+        format!("echo {}", run.trim_start_matches("cargo test ")),
+        format!("echo $({run})"),
     ] {
         assert!(
             !runs_the_chaos_suite_unconditionally(&workflow("", "", &masked)),
-            "`{masked}` hides a failed suite, so it must not count"
+            "`{masked}` hides a failed suite or runs no test, so it must not count"
         );
     }
 
