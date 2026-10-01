@@ -479,7 +479,7 @@ async fn common_start_fields_reach_the_row_identically_on_both_routes() {
     a.severity = Some("high");
     a.context_headers = Some([("h".to_string(), "v".to_string())].into());
     a.sla = Some(hour / 2);
-    let a = row(&mut conn, run_sws(&mut conn, a).await.expect("sws").exec_id).await;
+    let a = sws_row(&mut conn, a).await;
 
     let mut b = uws("fields-uws", ALLOW);
     b.queue_name = "q-fields";
@@ -492,7 +492,7 @@ async fn common_start_fields_reach_the_row_identically_on_both_routes() {
     b.severity = Some("high");
     b.context_headers = Some([("h".to_string(), "v".to_string())].into());
     b.sla = Some(hour / 2);
-    let b = row(&mut conn, run_uws(&mut conn, b).await.expect("uws").exec_id).await;
+    let b = uws_row(&mut conn, b).await;
 
     assert_eq!(a.queue_name, "q-fields");
     assert_eq!(a.execution_timeout, Some(hour));
@@ -539,17 +539,10 @@ async fn start_provenance_is_data_the_routes_set_independently() {
     // Signal-with-start: ref falls back to the idempotency key, then the id.
     let mut p = sws("prov-sws-key", ALLOW);
     p.idempotency_key = Some("idem-1".to_string());
-    let r = row(&mut conn, run_sws(&mut conn, p).await.unwrap().exec_id).await;
+    let r = sws_row(&mut conn, p).await;
     assert_eq!(src(&r), ("signal_with_start".into(), Some("idem-1".into())));
 
-    let r = row(
-        &mut conn,
-        run_sws(&mut conn, sws("prov-sws-id", ALLOW))
-            .await
-            .unwrap()
-            .exec_id,
-    )
-    .await;
+    let r = sws_row(&mut conn, sws("prov-sws-id", ALLOW)).await;
     assert_eq!(
         src(&r),
         ("signal_with_start".into(), Some("prov-sws-id".into()))
@@ -560,25 +553,28 @@ async fn start_provenance_is_data_the_routes_set_independently() {
     p.idempotency_key = Some("idem-2".to_string());
     p.start_source_override = Some(StartSource::Webhook);
     p.start_source_ref_override = Some("hook-ref".to_string());
-    let r = row(&mut conn, run_sws(&mut conn, p).await.unwrap().exec_id).await;
+    let r = sws_row(&mut conn, p).await;
     assert_eq!(src(&r), ("webhook".into(), Some("hook-ref".into())));
 
     // Update-with-start: no override exists.
     let mut p = uws("prov-uws-key", ALLOW);
     p.idempotency_key = Some("idem-3".to_string());
-    let r = row(&mut conn, run_uws(&mut conn, p).await.unwrap().exec_id).await;
+    let r = uws_row(&mut conn, p).await;
     assert_eq!(src(&r), ("update_with_start".into(), Some("idem-3".into())));
 
-    let r = row(
-        &mut conn,
-        run_uws(&mut conn, uws("prov-uws-id", ALLOW))
-            .await
-            .unwrap()
-            .exec_id,
-    )
-    .await;
+    let r = uws_row(&mut conn, uws("prov-uws-id", ALLOW)).await;
     assert_eq!(
         src(&r),
         ("update_with_start".into(), Some("prov-uws-id".into()))
     );
+}
+
+async fn sws_row(conn: &mut AsyncPgConnection, p: SignalWithStartParams<'_>) -> WorkflowExecution {
+    let id = run_sws(conn, p).await.expect("sws").exec_id;
+    row(conn, id).await
+}
+
+async fn uws_row(conn: &mut AsyncPgConnection, p: UpdateWithStartParams<'_>) -> WorkflowExecution {
+    let id = run_uws(conn, p).await.expect("uws").exec_id;
+    row(conn, id).await
 }
