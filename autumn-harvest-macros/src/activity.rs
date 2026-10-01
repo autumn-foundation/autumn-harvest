@@ -487,44 +487,14 @@ pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             |e| e.to_string()
         }
     };
-    let dispatch = if param_names.is_empty() {
-        quote! {
-            let result = #fn_name(ctx).await;
-            result.map_err(#encode_err)
-                .and_then(|v| {
-                    ::autumn_harvest::serde_json::to_value(v)
-                        .map_err(|e| e.to_string())
-                })
-        }
-    } else if param_names.len() == 1 {
-        let name = &param_names[0];
-        quote! {
-            let #name = ::autumn_harvest::serde_json::from_value(input)
-                .map_err(|e| e.to_string())?;
-            let result = #fn_name(ctx, #name).await;
-            result.map_err(#encode_err)
-                .and_then(|v| {
-                    ::autumn_harvest::serde_json::to_value(v)
-                        .map_err(|e| e.to_string())
-                })
-        }
-    } else {
-        let indices = (0..param_names.len()).map(syn::Index::from);
-        let names = param_names.clone();
-        quote! {
-            let args: ::autumn_harvest::serde_json::Value = input;
-            #(
-                let #names = ::autumn_harvest::serde_json::from_value(args[#indices].clone())
-                    .map_err(|e| e.to_string())?;
-            )*
-            let result = #fn_name(ctx, #(#names),*).await;
-            result.map_err(#encode_err)
-                .and_then(|v| {
-                    ::autumn_harvest::serde_json::to_value(v)
-                        .map_err(|e| e.to_string())
-                })
-        }
-    };
+    let dispatch = crate::attr_util::build_handler_dispatch(
+        fn_name,
+        &param_names,
+        &format_ident!("input"),
+        &quote! { ctx },
+        &quote! { .await },
+        &encode_err,
+    );
 
     let is_local = attrs.local;
 
@@ -665,8 +635,8 @@ mod dispatch_characterization_tests {
     const ACTIVITY_DISPATCH_0_TYPED: &str = "let result = my_activity (ctx) . await ; result . map_err (| e | :: autumn_harvest :: failure :: IntoActivityErrorString :: into_error_payload (e)) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
     const ACTIVITY_DISPATCH_1_LEGACY: &str = "let n = :: autumn_harvest :: serde_json :: from_value (input) . map_err (| e | e . to_string ()) ? ; let result = my_activity (ctx , n) . await ; result . map_err (| e | e . to_string ()) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
     const ACTIVITY_DISPATCH_1_TYPED: &str = "let n = :: autumn_harvest :: serde_json :: from_value (input) . map_err (| e | e . to_string ()) ? ; let result = my_activity (ctx , n) . await ; result . map_err (| e | :: autumn_harvest :: failure :: IntoActivityErrorString :: into_error_payload (e)) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
-    const ACTIVITY_DISPATCH_N_LEGACY: &str = "let args : :: autumn_harvest :: serde_json :: Value = input ; let a = :: autumn_harvest :: serde_json :: from_value (args [0] . clone ()) . map_err (| e | e . to_string ()) ? ; let b = :: autumn_harvest :: serde_json :: from_value (args [1] . clone ()) . map_err (| e | e . to_string ()) ? ; let result = my_activity (ctx , a , b) . await ; result . map_err (| e | e . to_string ()) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
-    const ACTIVITY_DISPATCH_N_TYPED: &str = "let args : :: autumn_harvest :: serde_json :: Value = input ; let a = :: autumn_harvest :: serde_json :: from_value (args [0] . clone ()) . map_err (| e | e . to_string ()) ? ; let b = :: autumn_harvest :: serde_json :: from_value (args [1] . clone ()) . map_err (| e | e . to_string ()) ? ; let result = my_activity (ctx , a , b) . await ; result . map_err (| e | :: autumn_harvest :: failure :: IntoActivityErrorString :: into_error_payload (e)) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
+    const ACTIVITY_DISPATCH_N_LEGACY: &str = "let __args : :: autumn_harvest :: serde_json :: Value = input ; let a = :: autumn_harvest :: serde_json :: from_value (__args [0] . clone ()) . map_err (| e | e . to_string ()) ? ; let b = :: autumn_harvest :: serde_json :: from_value (__args [1] . clone ()) . map_err (| e | e . to_string ()) ? ; let result = my_activity (ctx , a , b) . await ; result . map_err (| e | e . to_string ()) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
+    const ACTIVITY_DISPATCH_N_TYPED: &str = "let __args : :: autumn_harvest :: serde_json :: Value = input ; let a = :: autumn_harvest :: serde_json :: from_value (__args [0] . clone ()) . map_err (| e | e . to_string ()) ? ; let b = :: autumn_harvest :: serde_json :: from_value (__args [1] . clone ()) . map_err (| e | e . to_string ()) ? ; let result = my_activity (ctx , a , b) . await ; result . map_err (| e | :: autumn_harvest :: failure :: IntoActivityErrorString :: into_error_payload (e)) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
 
     #[test]
     fn zero_params_legacy_error_dispatch_is_pinned() {

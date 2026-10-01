@@ -1,6 +1,9 @@
 //! Small parsing helpers shared across the `#[workflow(...)]`, `#[update(...)]`,
 //! and sibling attribute-macro argument parsers.
 
+use proc_macro2::TokenStream;
+use quote::quote;
+
 /// Compile-time validator for the runtime `task_duration()` string format
 /// (`"30s"`, `"5m"`, `"1h"`, `"1h30m"`, ...): digits followed by one of
 /// `s`/`m`/`h`/`d`, optionally space-separated, with no overflow and no
@@ -170,6 +173,56 @@ pub fn param_idents<'a>(params: &'a [&syn::FnArg]) -> Vec<&'a syn::Ident> {
         .collect()
 }
 
+/// Builds the body that decodes a handler's non-`ctx` arguments, calls it, and
+/// encodes the result as JSON.
+///
+/// Zero parameters take no input. One parameter decodes the whole `args_ident`
+/// value. Many parameters decode a JSON array by position. The array binds to
+/// `__args`, so a handler parameter named `args` cannot shadow it.
+///
+/// The caller supplies the call shape: `ctx_expr` is the context argument,
+/// `await_tokens` is empty or `.await`, and `encode_err` is the closure that
+/// maps the handler error to a `String`.
+pub fn build_handler_dispatch(
+    fn_name: &syn::Ident,
+    param_names: &[&syn::Ident],
+    args_ident: &syn::Ident,
+    ctx_expr: &TokenStream,
+    await_tokens: &TokenStream,
+    encode_err: &TokenStream,
+) -> TokenStream {
+    let tail = quote! {
+        result.map_err(#encode_err)
+            .and_then(|v| {
+                ::autumn_harvest::serde_json::to_value(v).map_err(|e| e.to_string())
+            })
+    };
+    match param_names {
+        [] => quote! {
+            let result = #fn_name(#ctx_expr) #await_tokens;
+            #tail
+        },
+        [name] => quote! {
+            let #name = ::autumn_harvest::serde_json::from_value(#args_ident)
+                .map_err(|e| e.to_string())?;
+            let result = #fn_name(#ctx_expr, #name) #await_tokens;
+            #tail
+        },
+        names => {
+            let indices = (0..names.len()).map(syn::Index::from);
+            quote! {
+                let __args: ::autumn_harvest::serde_json::Value = #args_ident;
+                #(
+                    let #names = ::autumn_harvest::serde_json::from_value(__args[#indices].clone())
+                        .map_err(|e| e.to_string())?;
+                )*
+                let result = #fn_name(#ctx_expr, #(#names),*) #await_tokens;
+                #tail
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod param_idents_tests {
     use super::param_idents;
@@ -249,5 +302,77 @@ mod arg_type_hint_tests {
         let owned = params_from("a: u32, b: bool");
         let refs: Vec<_> = owned.iter().collect();
         assert_eq!(arg_type_hint(&refs), "(u32, bool)");
+    }
+}
+
+#[cfg(test)]
+mod build_handler_dispatch_tests {
+    use super::build_handler_dispatch;
+    use proc_macro2::TokenStream;
+    use quote::{format_ident, quote};
+
+    fn dispatch(names: &[&str], ctx: &TokenStream, aw: &TokenStream) -> String {
+        let fn_name = format_ident!("handler");
+        let args = format_ident!("input");
+        let idents: Vec<_> = names.iter().map(|n| format_ident!("{}", n)).collect();
+        let refs: Vec<_> = idents.iter().collect();
+        let encode_err = quote! { |e| e.to_string() };
+        build_handler_dispatch(&fn_name, &refs, &args, ctx, aw, &encode_err).to_string()
+    }
+
+    #[test]
+    fn zero_params_call_the_handler_with_ctx_only() {
+        let out = dispatch(&[], &quote! { ctx }, &quote! {});
+        assert!(out.starts_with("let result = handler (ctx) ;"), "{out}");
+        assert!(!out.contains("from_value"), "{out}");
+    }
+
+    #[test]
+    fn one_param_decodes_the_whole_input() {
+        let out = dispatch(&["n"], &quote! { ctx }, &quote! {});
+        assert!(out.contains("from_value (input)"), "{out}");
+        assert!(out.contains("handler (ctx , n)"), "{out}");
+    }
+
+    #[test]
+    fn many_params_decode_by_position_from_a_hygienic_binding() {
+        let out = dispatch(&["a", "b"], &quote! { ctx }, &quote! {});
+        assert!(out.contains("let __args"), "{out}");
+        assert!(out.contains("(__args [0] . clone ())"), "{out}");
+        assert!(out.contains("(__args [1] . clone ())"), "{out}");
+        assert!(out.contains("handler (ctx , a , b)"), "{out}");
+    }
+
+    /// A parameter named `args` must not shadow the decode binding.
+    #[test]
+    fn many_params_survive_a_parameter_named_args() {
+        let out = dispatch(&["args", "b"], &quote! { ctx }, &quote! {});
+        assert!(out.contains("(__args [1] . clone ())"), "{out}");
+    }
+
+    #[test]
+    fn ctx_expression_and_await_are_interpolated() {
+        let out = dispatch(&["n"], &quote! { ctx . as_ref () }, &quote! { . await });
+        assert!(
+            out.contains("handler (ctx . as_ref () , n) . await ;"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn encode_err_is_passed_to_map_err() {
+        let fn_name = format_ident!("handler");
+        let args = format_ident!("input");
+        let encode_err = quote! { |e| custom (e) };
+        let out = build_handler_dispatch(
+            &fn_name,
+            &[],
+            &args,
+            &quote! { ctx },
+            &quote! {},
+            &encode_err,
+        )
+        .to_string();
+        assert!(out.contains("map_err (| e | custom (e))"), "{out}");
     }
 }
