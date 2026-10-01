@@ -63,6 +63,18 @@ pub const MAX_SCANNER_JITTER: f64 = 0.9;
 /// late wakeup.
 pub const MIN_LEASE_TICKS: u32 = 3;
 
+/// Shortest scanner interval a loop accepts.
+///
+/// A zero interval busy-spins. It also bounds the connection checkout to
+/// zero, so every tick times out and skips the pass, yet still looks alive.
+pub const MIN_SCANNER_INTERVAL: Duration = Duration::from_millis(10);
+
+/// `interval`, raised to at least [`MIN_SCANNER_INTERVAL`].
+#[must_use]
+pub fn scanner_interval(interval: Duration) -> Duration {
+    interval.max(MIN_SCANNER_INTERVAL)
+}
+
 /// Longest time a graceful stop spends on releasing its lease.
 ///
 /// The release is best effort. A stop that runs out of time leaves the lease
@@ -139,7 +151,8 @@ pub struct ScannerConfig {
     /// to [`DEFAULT_SCANNER_JITTER`]. Clamped to `[0, MAX_SCANNER_JITTER]`.
     pub jitter: f64,
     /// Mean time between timeout-checker ticks. `None`, the default, uses the
-    /// worker poll interval (500 ms by default).
+    /// worker poll interval (500 ms by default). Raised to at least
+    /// [`MIN_SCANNER_INTERVAL`].
     pub timeout_interval: Option<Duration>,
     /// Most rows per timeout reason that one timeout pass enforces. Defaults
     /// to [`DEFAULT_TIMEOUT_SCAN_BATCH_SIZE`]. Raised to at least 1.
@@ -500,6 +513,12 @@ mod tests {
         }
         .coordination("w1");
         assert_eq!(off.holder, None);
+    }
+
+    #[test]
+    fn a_zero_interval_is_raised_to_the_floor() {
+        assert_eq!(scanner_interval(Duration::ZERO), MIN_SCANNER_INTERVAL);
+        assert_eq!(scanner_interval(BASE), BASE);
     }
 
     #[test]

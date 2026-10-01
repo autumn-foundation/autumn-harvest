@@ -22,7 +22,9 @@ size, so adding workers to clear a backlog added database load in proportion.
 - **Bounded scans.** The checker enforces at most one batch per timeout
   reason per pass (default 500). A keyset cursor walks the backlog in `id`
   order and wraps at the end, so a row that stays expired cannot starve the
-  rest. `OFFSET 0` keeps each predicate on its own partial index. A row that
+  rest. `OFFSET 0` keeps each predicate on its own partial index. The keyset
+  bound sits inside that subquery, so a page sorts only the rows past the
+  cursor. A row that
   matches two reasons gets the first one, as in the full scan. The four
   predicate consts are unchanged, so the backup drill's `UNION` still works.
   The public `enforce_timeouts_once` keeps its full scan.
@@ -33,7 +35,8 @@ size, so adding workers to clear a backlog added database load in proportion.
 - **Settings.** `WorkerConfig::with_scanner_config(ScannerConfig { elect,
   lease_ttl, jitter, timeout_interval, timeout_batch_size })`, reported by
   `GET /admin/config`. `timeout_interval: None` keeps the poll-interval
-  cadence. The worker uses its `worker_id` as the holder id.
+  cadence. A zero interval is raised to 10 ms. The worker uses its
+  `worker_id` as the holder id.
 - **Metric.** `harvest.scanner.pass{scanner, shard, role}` with `role` one of
   `leader`, `standby`, `unelected`, `fail_open`. The metrics-rs bridge emits
   it, `docs/telemetry.md` lists it, and the starter dashboard has a "Scanner

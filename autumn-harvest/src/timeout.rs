@@ -520,8 +520,13 @@ const fn task_timeout_scans() -> [(TimeoutReason, &'static str); 4] {
 /// `OFFSET 0` stops Postgres from pulling the subquery up. Pulled up, the
 /// planner guesses many expired rows and walks the primary key for the
 /// `ORDER BY id LIMIT`. That reads the whole table. Kept apart, the
-/// predicate uses its own partial index, and only the expired rows are
-/// sorted.
+/// predicate uses its own partial index.
+///
+/// The keyset bound `id > $1` goes inside the subquery, ahead of
+/// `OFFSET 0`. Outside, it cannot reach the scan, and each page would sort
+/// the whole expired backlog again. Inside, each page sorts only the rows
+/// past the cursor. Every predicate has one table at its top level, so the
+/// bare `id` is not ambiguous.
 ///
 /// `higher` holds the predicates of the reasons that come first. A row that
 /// also matches one of them is left to that reason's page. So a row always
@@ -532,14 +537,12 @@ const fn task_timeout_scans() -> [(TimeoutReason, &'static str); 4] {
 fn batched_timeout_query(predicate: &str, higher: &[&str], after: bool) -> String {
     use std::fmt::Write as _;
 
-    let mut sql = format!("SELECT q.* FROM ({predicate} OFFSET 0) q WHERE TRUE");
-    if after {
-        sql.push_str(" AND q.id > $1");
-    }
+    let bound = if after { " AND id > $1" } else { "" };
+    let mut sql = format!("SELECT q.* FROM ({predicate}{bound} OFFSET 0) q WHERE TRUE");
     for earlier in higher {
         let _ = write!(
             sql,
-            " AND NOT EXISTS (SELECT 1 FROM ({earlier}) h WHERE h.id = q.id)"
+            " AND NOT EXISTS (SELECT 1 FROM ({earlier}{bound}) h WHERE h.id = q.id)"
         );
     }
     sql.push_str(if after {
@@ -5329,6 +5332,8 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
 ) -> tokio::task::JoinHandle<()> {
     use crate::scanner_lease::{ScannerLease, ScannerRole};
 
+    // A zero interval would busy-spin and time out every checkout.
+    let interval = crate::scanner_lease::scanner_interval(interval);
     let jitter = coordination.jitter;
     // Liveness judges the loop against its longest sleep, not its mean.
     let longest_sleep = crate::scanner_lease::max_jittered_interval(interval, jitter);
@@ -6165,9 +6170,21 @@ mod tests {
         assert!(first.starts_with(&format!("SELECT q.* FROM ({predicate} OFFSET 0) q")));
         assert!(first.ends_with("ORDER BY q.id LIMIT $1"));
         assert!(!first.contains("$2"));
+        // The keyset bound sits inside the subquery, where it reaches the scan.
         let next = batched_timeout_query(predicate, &[], true);
-        assert!(next.contains(" AND q.id > $1 "));
+        assert!(next.starts_with(&format!(
+            "SELECT q.* FROM ({predicate} AND id > $1 OFFSET 0) q"
+        )));
         assert!(next.ends_with("ORDER BY q.id LIMIT $2"));
+    }
+
+    #[test]
+    fn batched_timeout_query_bounds_the_higher_reasons_too() {
+        let higher = heartbeat_timeout_query();
+        let sql = batched_timeout_query(start_to_close_timeout_query(), &[higher], true);
+        assert!(sql.contains(&format!(
+            "AND NOT EXISTS (SELECT 1 FROM ({higher} AND id > $1) h WHERE h.id = q.id)"
+        )));
     }
 
     #[test]
