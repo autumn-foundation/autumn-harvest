@@ -61,9 +61,12 @@ async fn connect(database_url: &str) -> Result<AsyncPgConnection, ConnectionErro
     }
     // `tokio-postgres` parses only `require`. The `verify-*` modes get the
     // same verified connector, so the rewrite drops no check.
-    let config: tokio_postgres::Config = tls_dsn(database_url).parse().map_err(|error: tokio_postgres::Error| {
-        ConnectionError::BadConnection(error.to_string())
-    })?;
+    let config: tokio_postgres::Config =
+        tls_dsn(database_url)
+            .parse()
+            .map_err(|error: tokio_postgres::Error| {
+                ConnectionError::BadConnection(error.to_string())
+            })?;
     let tls = tokio_postgres_rustls::MakeRustlsConnect::new(tls_config()?);
     let (client, connection) = config
         .connect(tls)
@@ -107,7 +110,11 @@ impl<'a> Dsn<'a> {
             return parse_keywords(dsn).map(Self::Keywords);
         }
         let (base, query) = dsn.split_once('?').unwrap_or((dsn, ""));
-        let decode = |text: &str| percent_encoding::percent_decode_str(text).decode_utf8_lossy().into_owned();
+        let decode = |text: &str| {
+            percent_encoding::percent_decode_str(text)
+                .decode_utf8_lossy()
+                .into_owned()
+        };
         let pairs = query
             .split('&')
             .filter(|raw| !raw.is_empty())
@@ -122,7 +129,9 @@ impl<'a> Dsn<'a> {
     /// The last `sslmode` value, in lowercase.
     fn sslmode(&self) -> Option<String> {
         let mut options: Box<dyn DoubleEndedIterator<Item = (&str, &str)>> = match self {
-            Self::Url { pairs, .. } => Box::new(pairs.iter().map(|(_, k, v)| (k.as_str(), v.as_str()))),
+            Self::Url { pairs, .. } => {
+                Box::new(pairs.iter().map(|(_, k, v)| (k.as_str(), v.as_str())))
+            }
             Self::Keywords(pairs) => Box::new(pairs.iter().map(|(k, v)| (k.as_str(), v.as_str()))),
         };
         options
