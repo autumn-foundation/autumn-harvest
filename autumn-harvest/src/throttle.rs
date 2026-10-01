@@ -1317,7 +1317,7 @@ async fn fire_claimed_throttle_row(
 /// advisory lock. Two independent scanner transactions can therefore
 /// deadlock on BUCKET locks alone (review). It is the same ABBA shape as
 /// the original quota-lock hazard, but on a dimension
-/// [`order_rows_by_quota_lock_id`] never looks at. Batch A fires (bucket X,
+/// [`crate::quota_lock_order::order_rows_by_quota_lock_id`] never looks at. Batch A fires (bucket X,
 /// quota 1) then (bucket Y, quota 2). Batch B fires (bucket Y, quota 1)
 /// then (bucket X, quota 2).
 ///
@@ -1334,7 +1334,7 @@ async fn fire_claimed_throttle_row(
 ///
 /// This is safe where the equivalent pre-lock for QUOTA keys was NOT
 /// (issue #1230 Finding 2 follow-up, P1 -- see
-/// [`order_due_rows_for_deadlock_free_firing`]'s doc comment). That
+/// [`crate::quota_lock_order`]'s module docs). That
 /// pre-lock inverted lock order against a concurrent DIRECT start, which
 /// also touches quota locks. Nothing outside this scanner ever touches a
 /// rate-limit bucket row. `reserve_or_defer` only ever INSERTs the
@@ -1967,6 +1967,26 @@ pub async fn pending_throttle_counts_for_workflows(
 mod tests {
     use super::*;
     use chrono::TimeZone as _;
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn fire_due_row_gives_the_quota_lock_inputs() {
+        use crate::quota_lock_order::QuotaLockRow;
+        let row = FireDueRow {
+            id: uuid::Uuid::new_v4(),
+            workflow_name: "wf_a".to_string(),
+            throttle_key: "k".to_string(),
+            bucket_key: "b".to_string(),
+            workflow_id: "w".to_string(),
+            queue_name: "default".to_string(),
+            input: serde_json::json!({ "tenant_id": "t1" }),
+            start_options: serde_json::json!({ "tenant_id": "wrong" }),
+            expires_at: None,
+            shard_id: 0,
+        };
+        assert_eq!(row.workflow_name(), "wf_a");
+        assert_eq!(row.quota_input()["tenant_id"], "t1");
+    }
 
     fn ts(h: u32, m: u32, s: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 7, 6, h, m, s).unwrap()

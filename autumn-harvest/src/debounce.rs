@@ -1176,6 +1176,25 @@ mod tests {
     use super::*;
     use chrono::TimeZone as _;
 
+    #[cfg(feature = "db")]
+    #[test]
+    fn fire_due_row_gives_the_quota_lock_inputs() {
+        use crate::quota_lock_order::QuotaLockRow;
+        let row = FireDueRow {
+            id: uuid::Uuid::new_v4(),
+            workflow_name: "wf_a".to_string(),
+            debounce_key: "k".to_string(),
+            workflow_id: "w".to_string(),
+            queue_name: "default".to_string(),
+            last_input: serde_json::json!({ "tenant_id": "t1" }),
+            start_options: serde_json::json!({ "tenant_id": "wrong" }),
+            shard_id: 0,
+            max_fire_at: Utc::now(),
+        };
+        assert_eq!(row.workflow_name(), "wf_a");
+        assert_eq!(row.quota_input()["tenant_id"], "t1");
+    }
+
     fn ts(year: i32, month: u32, day: u32, h: u32, m: u32, s: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(year, month, day, h, m, s).unwrap()
     }

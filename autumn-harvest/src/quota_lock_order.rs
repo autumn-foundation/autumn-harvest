@@ -132,13 +132,16 @@ pub async fn resolve_quota_lock_ids<R: QuotaLockRow>(
 /// That would reopen the ABBA cycle. Rows with equal ids compare equal.
 ///
 /// The sort is stable and compares only the id. Rows with the same id, or
-/// with no id, keep the claim order. Each scanner claim query sets that
-/// order. Tie-breaking on `workflow_id` once scrambled it.
+/// with no id, keep the claim order. The claim query sets that order.
+/// Debounce claims oldest `effective_fire_at` first. Throttle claims
+/// oldest `deferred_at` first within each bucket (issue #607).
+/// Tie-breaking on `workflow_id` once scrambled it.
 ///
 /// The function only reorders. It takes no lock. Each row still locks its
 /// execution row first, then its quota key. A direct start uses the same
-/// order. Locking every quota key up front would invert it and recreate
-/// the ABBA hazard against a direct start.
+/// order. Locking every quota key up front would invert it. The scanner
+/// would then wait on the uncommitted execution row of a direct start.
+/// That direct start waits on the quota key. That is an ABBA cycle.
 pub fn order_rows_by_quota_lock_id<R: QuotaLockRow>(
     due_rows: Vec<R>,
     quota_by_workflow: &QuotaPolicies,
@@ -261,17 +264,38 @@ mod tests {
     }
 
     #[test]
-    fn keeps_every_row_when_rows_share_one_key() {
-        let lock_id_of = LockIds::from([lock_id("t1", 1)]);
+    fn three_keys_in_reverse_claim_order_sort_ascending() {
+        let lock_id_of = LockIds::from([lock_id("a", 1), lock_id("b", 2), lock_id("c", 3)]);
         let rows = vec![
-            row("wf_a", "t1", 0),
-            row("wf_a", "t1", 1),
-            row("wf_a", "t1", 2),
+            row("wf_a", "c", 0),
+            row("wf_a", "b", 1),
+            row("wf_a", "a", 2),
         ];
-        assert_eq!(
-            order_rows_by_quota_lock_id(rows, &capped(), &lock_id_of).len(),
-            3
-        );
+        let fired = order_rows_by_quota_lock_id(rows, &capped(), &lock_id_of);
+        assert_eq!(ids(&fired), vec![2, 1, 0]);
+    }
+
+    #[test]
+    fn interleaved_ties_keep_claim_order_within_each_id() {
+        let lock_id_of = LockIds::from([lock_id("a", 5), lock_id("b", 3)]);
+        let rows = vec![
+            row("wf_a", "a", 0),
+            row("wf_a", "b", 1),
+            row("wf_a", "a", 2),
+            row("wf_none", "a", 3),
+            row("wf_a", "b", 4),
+            row("wf_none", "a", 5),
+        ];
+        let fired = order_rows_by_quota_lock_id(rows, &capped(), &lock_id_of);
+        assert_eq!(ids(&fired), vec![3, 5, 1, 4, 0, 2]);
+    }
+
+    #[test]
+    fn a_key_missing_from_the_lock_ids_sorts_as_keyless() {
+        let lock_id_of = LockIds::from([lock_id("t1", 1)]);
+        let rows = vec![row("wf_a", "t1", 0), row("wf_a", "unknown", 1)];
+        let fired = order_rows_by_quota_lock_id(rows, &capped(), &lock_id_of);
+        assert_eq!(ids(&fired), vec![1, 0]);
     }
 
     #[test]
