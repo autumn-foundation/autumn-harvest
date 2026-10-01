@@ -750,6 +750,40 @@ impl std::fmt::Debug for PayloadCodecs {
     }
 }
 
+/// Deserialize a wire event without serde's `Content` buffering.
+///
+/// `WorkflowEvent` is adjacently tagged. `serde_json::Map` iterates keys in
+/// sorted order, so `data` comes before `type`. Serde then buffers the whole
+/// event in `Content` before it can pick a variant. This function feeds
+/// `type` first, so serde reads `data` straight into the chosen variant.
+///
+/// Any other shape takes the plain `from_value` path, so every error message
+/// stays the same. That covers a non-object root, a missing `type`, and extra
+/// keys.
+fn event_from_wire(value: Value) -> Result<crate::event::WorkflowEvent, serde_json::Error> {
+    use serde::de::IntoDeserializer;
+    use serde::de::value::MapDeserializer;
+
+    let Value::Object(mut map) = value else {
+        return serde_json::from_value(value);
+    };
+    let tagged = map.get("type").is_some_and(Value::is_string)
+        && map.keys().all(|key| key == "type" || key == "data");
+    if !tagged {
+        return serde_json::from_value(Value::Object(map));
+    }
+    let mut pairs = Vec::with_capacity(2);
+    if let Some(tag) = map.remove("type") {
+        pairs.push(("type", tag));
+    }
+    if let Some(data) = map.remove("data") {
+        pairs.push(("data", data));
+    }
+    let de: MapDeserializer<'_, _, serde_json::Error> =
+        MapDeserializer::new(pairs.into_iter().map(|(k, v)| (k.into_deserializer(), v)));
+    serde::Deserialize::deserialize(de)
+}
+
 /// Validate an operator-supplied codec key id (issue #948).
 ///
 /// Key ids are persisted inside stored envelopes and echoed in the rotation
@@ -1168,7 +1202,7 @@ impl PayloadCodecs {
     /// Returns [`HarvestError`] if codec decoding or event deserialization fails.
     pub fn decode_event(&self, mut value: Value) -> HarvestResult<crate::event::WorkflowEvent> {
         self.transform_event_data(&mut value, false)?;
-        Ok(serde_json::from_value(value)?)
+        Ok(event_from_wire(value)?)
     }
 
     fn transform_event_data(&self, root: &mut Value, encode: bool) -> HarvestResult<()> {
