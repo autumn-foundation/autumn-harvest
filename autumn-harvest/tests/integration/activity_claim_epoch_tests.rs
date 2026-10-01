@@ -87,7 +87,7 @@ async fn insert_execution(conn: &mut AsyncPgConnection, queue: &str) -> Executio
             workflow_id: &format!("wf-claim-epoch-{}", Uuid::new_v4()),
             run_id: Uuid::new_v4(),
             shard_id: 0,
-            input: serde_json::json!({}),
+            input: serde_json::json!({}).into(),
             memo: None,
             search_attrs: None,
             queue_name: queue,

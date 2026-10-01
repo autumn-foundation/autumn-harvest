@@ -221,7 +221,7 @@ async fn seed_execution(
         workflow_id,
         run_id: Uuid::new_v4(),
         shard_id: shard.as_i32(),
-        input: json!({ "secret": "plaintext-payload" }),
+        input: json!({ "secret": "plaintext-payload" }).into(),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,

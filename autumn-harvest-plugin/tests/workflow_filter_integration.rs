@@ -181,7 +181,7 @@ async fn seed_workflow(
             workflow_name,
             workflow_id,
             exec_id,
-            input: json!({ "workflow_id": workflow_id }),
+            input: json!({ "workflow_id": workflow_id }).into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,

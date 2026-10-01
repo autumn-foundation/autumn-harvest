@@ -23,6 +23,7 @@ use crate::models::{NewHarvestSignal, NewWorkflowExecution, WorkflowExecution};
 use crate::queue::{self, EnqueueParams, TaskType};
 use crate::schema::{harvest_execution_summaries, harvest_signals, harvest_workflow_executions};
 use crate::shard::ShardedDbPool;
+use crate::shared_json::SharedJson;
 use crate::store;
 use crate::telemetry::TraceContextCarrier;
 use crate::types::{
@@ -44,7 +45,9 @@ pub struct StartWorkflowParams<'a> {
     pub workflow_name: &'a str,
     pub workflow_id: &'a str,
     pub exec_id: ExecutionId,
-    pub input: serde_json::Value,
+    /// Shared so the start path hands the payload to each owner without a
+    /// deep copy (issue #1733).
+    pub input: SharedJson,
     pub parent_id: Option<Uuid>,
     pub queue_name: &'a str,
     pub execution_timeout: Option<chrono::Duration>,
@@ -246,14 +249,14 @@ impl<'a> StartWorkflowParams<'a> {
         workflow_name: &'a str,
         workflow_id: &'a str,
         exec_id: ExecutionId,
-        input: serde_json::Value,
+        input: impl Into<SharedJson>,
         queue_name: &'a str,
     ) -> Self {
         Self {
             workflow_name,
             workflow_id,
             exec_id,
-            input,
+            input: input.into(),
             parent_id: None,
             queue_name,
             execution_timeout: None,
@@ -495,6 +498,32 @@ mod start_params_new_tests {
     use crate::types::{
         ExecutionId, Priority, StartSource, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
     };
+
+    /// The input is stored as a shared payload (issue #1733). A clone of the
+    /// params must not copy the JSON.
+    #[test]
+    fn new_shares_the_input_with_the_caller() {
+        let input = crate::shared_json::SharedJson::from(serde_json::json!({"k": 1}));
+        let p = StartWorkflowParams::new("wf", "id", ExecutionId::new(), input.clone(), "q");
+        assert!(crate::shared_json::SharedJson::ptr_eq(&p.input, &input));
+        assert!(crate::shared_json::SharedJson::ptr_eq(
+            &p.clone().input,
+            &input
+        ));
+    }
+
+    /// A plain `Value` still works at the constructor (issue #1733).
+    #[test]
+    fn new_accepts_a_plain_value() {
+        let p = StartWorkflowParams::new(
+            "wf",
+            "id",
+            ExecutionId::new(),
+            serde_json::json!({"k": 1}),
+            "q",
+        );
+        assert_eq!(p.input, serde_json::json!({"k": 1}));
+    }
 
     /// `new` sets the five required fields and gives every other field its
     /// neutral default (issue #1448).
@@ -1432,8 +1461,7 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
         Vec<StartCancelledRun>,
     ), HarvestError, _>(async |conn| {
         let row = row;
-        let enqueue = enqueue.clone();
-        let request = request.clone();
+        let enqueue = enqueue;
         let quota_key = quota_key.clone();
         // `gate`, `metrics`, `shard_id_value`, `quota_policy`, and
         // `quota_enforcement_policy` (issue #946) are all `Copy`, so the
@@ -1751,7 +1779,7 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
                 (None, None)
             };
             let started_event = WorkflowEvent::WorkflowStarted {
-                input: request.input.clone(),
+                input: request.input.to_value(),
                 timestamp: target_start_time,
                 last_completion_result: carryover_result,
                 last_error: carryover_error,
@@ -3401,7 +3429,7 @@ async fn replace_execution(
         (None, None)
     };
     let started_event = WorkflowEvent::WorkflowStarted {
-        input: request.input.clone(),
+        input: request.input.to_value(),
         timestamp: start_timestamp,
         last_completion_result: carryover_result,
         last_error: carryover_error,
@@ -6664,7 +6692,7 @@ macro_rules! with_start_params {
             workflow_name: $request.workflow_name,
             workflow_id: $request.workflow_id,
             exec_id: $exec_id,
-            input: $request.input.clone(),
+            input: $request.input.clone().into(),
             parent_id: $request.parent_id,
             queue_name: $request.queue_name,
             execution_timeout: $request.execution_timeout,
@@ -7911,7 +7939,8 @@ pub async fn rerun_workflow_execution_with_codecs(
                 input: request
                     .input_override
                     .clone()
-                    .unwrap_or_else(|| source.input.clone()),
+                    .unwrap_or_else(|| source.input.clone())
+                    .into(),
                 parent_id: None,
                 queue_name: &source.queue_name,
                 // The row value IS the effective (already ceiling-clamped) timeout.

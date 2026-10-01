@@ -201,7 +201,7 @@ fn start_params(exec_id: ExecutionId) -> StartWorkflowParams<'static> {
         workflow_name: "correlate_wf",
         workflow_id: "activity-info-correlation",
         exec_id,
-        input: json!({"ok": true}),
+        input: json!({"ok": true}).into(),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
