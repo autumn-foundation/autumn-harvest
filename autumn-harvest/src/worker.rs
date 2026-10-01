@@ -5375,16 +5375,40 @@ async fn lock_activity_claim(
     queue::lock_claim_for_update(conn, &claim).await
 }
 
-/// Whether a later claim holds the activity row and still passes a
-/// `crash_strikes` guard for the `task` snapshot (issue #1789).
-async fn later_activity_claim_passes_guard(
+/// Check the claim epoch of an activity row under its lock (issue #1789).
+///
+/// The guards in [`fail_task_and_execution_with_history`] key on
+/// `(worker_id, crash_strikes)`. A clean release resets `crash_strikes` to 0,
+/// so a later claim by the same worker can pass them. This check locks the
+/// row with the epoch in the same statement. The later guards then read a row
+/// that this transaction holds, so the epoch cannot move under them.
+///
+/// `SKIP LOCKED`, as in [`queue::claim_still_held_for_update`], keeps this
+/// transaction out of a lock cycle.
+async fn activity_epoch_check(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
-) -> HarvestResult<bool> {
+) -> HarvestResult<ActivityEpoch> {
     let Some(claim) = queue::TaskClaim::of(task) else {
-        return Ok(false);
+        return Ok(ActivityEpoch::Unconfirmed);
     };
-    queue::later_claim_shares_strikes(conn, &claim, task.crash_strikes).await
+    if queue::claim_held_for_update_skip_locked(conn, &claim).await? {
+        return Ok(ActivityEpoch::Held);
+    }
+    if queue::later_claim_shares_strikes(conn, &claim, task.crash_strikes).await? {
+        return Ok(ActivityEpoch::Reused);
+    }
+    Ok(ActivityEpoch::Unconfirmed)
+}
+
+/// The result of [`activity_epoch_check`].
+enum ActivityEpoch {
+    /// The claim is current, and this transaction holds the row lock.
+    Held,
+    /// A later claim of the same worker passes the `crash_strikes` guards.
+    Reused,
+    /// The claim is lost, or another transaction holds the row lock.
+    Unconfirmed,
 }
 
 /// Log a write that a lost claim turned into a no-op (issue #1789).
@@ -13043,14 +13067,20 @@ pub async fn fail_task_and_execution_with_history(
             lock_workflow_execution_row_only(conn, exec_id).await?;
         }
 
-        // Activity rows also carry a claim epoch (issue #1789). The guards
-        // below key on `crash_strikes`, and a clean release can reset it to
-        // 0. A later claim by the same worker can then pass them. That one
-        // case is a lost lease, so this failure is a no-op. Every other case
-        // keeps the guards' own outcome.
-        if task.task_type == "activity" && later_activity_claim_passes_guard(conn, task).await? {
-            log_lease_lost(task, "activity execution failure");
-            return Ok(());
+        // Activity rows also carry a claim epoch (issue #1789). A reused
+        // claim is a lost lease, so this failure is a no-op. An unconfirmed
+        // claim takes the same blameless path as the guards below.
+        if task.task_type == "activity" {
+            match activity_epoch_check(conn, task).await? {
+                ActivityEpoch::Held => {}
+                ActivityEpoch::Reused => {
+                    log_lease_lost(task, "activity execution failure");
+                    return Ok(());
+                }
+                ActivityEpoch::Unconfirmed => {
+                    return Err(HarvestError::TerminalWriteClaimAmbiguous { task_id });
+                }
+            }
         }
 
         let (exec_id, next_event_id) = match preloaded {

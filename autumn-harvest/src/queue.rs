@@ -2644,6 +2644,34 @@ pub(crate) async fn claim_is_current(
     Ok(status.is_some_and(|(_, _, held)| held))
 }
 
+/// Lock the row `FOR UPDATE SKIP LOCKED` when `claim` is current.
+///
+/// Returns `false` when the claim is lost, or when another transaction holds
+/// the row lock. The caller treats both the same way, as in
+/// [`claim_still_held_for_update`].
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub(crate) async fn claim_held_for_update_skip_locked(
+    conn: &mut AsyncPgConnection,
+    claim: &TaskClaim,
+) -> HarvestResult<bool> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    dsl::harvest_task_queue
+        .find(claim.task_id)
+        .filter(claim_held(&claim.worker_id, claim.attempt))
+        .select(dsl::id)
+        .for_update()
+        .skip_locked()
+        .first::<Uuid>(conn)
+        .await
+        .optional()
+        .map(|row| row.is_some())
+        .map_err(crate::error::database_error)
+}
+
 /// Whether a later claim of the same worker holds the row with the same
 /// `crash_strikes` (issue #1789).
 ///

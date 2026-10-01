@@ -1097,3 +1097,35 @@ async fn worker_stops_an_attempt_whose_claim_moved_and_drops_its_result() {
         "the stale attempt must leave the new claim untouched"
     );
 }
+
+#[tokio::test]
+async fn stale_execution_failure_after_another_worker_claims_is_ambiguous() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let fx = seed_activity(&mut conn).await;
+    let codecs = PayloadCodecs::default();
+    let (a, _b) = a_then_b(&mut conn, &fx).await;
+    let before = row(&mut conn, fx.task_id).await;
+
+    let preloaded = preload_failure_history(&mut conn, &a).await;
+    let err = fail_task_and_execution_with_history(
+        &mut conn,
+        &a,
+        &fx.worker_a,
+        "stale",
+        preloaded,
+        &codecs,
+    )
+    .await
+    .expect_err("a lost claim is the blameless ambiguous outcome");
+
+    assert_eq!(err.terminal_write_claim_ambiguous(), Some(fx.task_id));
+    assert!(
+        !events(&mut conn, fx.exec_id)
+            .await
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::WorkflowFailed { .. })),
+        "a stale attempt must not fail the workflow"
+    );
+    assert_eq!(row(&mut conn, fx.task_id).await, before);
+}
