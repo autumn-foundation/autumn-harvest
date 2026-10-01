@@ -1206,6 +1206,17 @@ impl BuiltHarvest {
     }
 
     /// Convert the built harvest registration into worker-ready parts.
+    ///
+    /// Clone-class note: the three `install_global_*_for_direct_worker` and
+    /// `set_purge_window_secs` calls, and the registry-builder chain below,
+    /// repeat verbatim in [`Self::into_worker_parts_with_extra_state`].
+    /// Apply any change to either block to both functions.
+    ///
+    /// Two instances only. Three separate features (issue #605, issue
+    /// #808, issue #953) each added one new install call here. Each
+    /// landed in both copies in the same change. No copy has ever shipped
+    /// the call alone. The merge bar (rule of three, or a missed-fix) is
+    /// not met yet, so the duplication stays.
     #[cfg(feature = "db")]
     #[must_use]
     pub fn into_worker_parts(
@@ -1311,6 +1322,12 @@ impl BuiltHarvest {
 
     /// Convert the built harvest registration into worker-ready parts while
     /// injecting additional typed runtime state.
+    ///
+    /// Clone-class note: the three `install_global_*_for_direct_worker` and
+    /// `set_purge_window_secs` calls, and the registry-builder chain below,
+    /// repeat verbatim in [`Self::into_worker_parts`]. Apply any change to
+    /// either block to both functions. Two instances only, so the merge
+    /// bar is not met yet. See the note on `into_worker_parts`.
     #[cfg(feature = "db")]
     #[must_use]
     pub fn into_worker_parts_with_extra_state(
