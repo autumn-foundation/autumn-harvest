@@ -64,7 +64,20 @@ execution object.
 before a command that the recorded run issued. For example, a deploy deletes
 an activity call or a timer. Then `expected` is `<workflow returned early>` or
 `<workflow suspended early>`. `actual` names the skipped event, for example
-`ActivityScheduled(send_email)`. `event_index` is its history position.
+`ActivityScheduled(send_email)`. `event_index` is its history position. The
+replay-diagnosis endpoint below reports the same drift with strict-replay
+labels. There, `<workflow returned early>` or `<workflow suspended early>`
+appears in `actual`, and `event_index` can differ. Use the block's
+`event_index` to choose a reset point.
+
+The engine upgrade alone can surface this case. A run that skipped a
+recorded command under an earlier deploy blocks on its next wake. The
+`build_id` is then the current build, so a rollback does not help. Reset the
+run to before `event_index`, or terminate it.
+
+A block with `expected: <workflow suspended early>` and a `clean` diagnosis
+has a different cause. The workflow body awaits non-durable work for more
+than 100 ms during replay. Move that work into an activity.
 
 ## Diagnose the divergence (issue #614)
 
@@ -81,7 +94,8 @@ This is read-only (it appends no events and performs no writes) and admin-gated.
 The response verdict is one of `clean` / `diverged` / `workflow_failed` /
 `not_registered` / `not_replayable_dag` (all `200`; the diagnosis, not the HTTP
 status, carries the answer). For a blocked run the verdict is `diverged`, with a
-`divergence` object using the **same vocabulary as the block diagnostic** above:
+`divergence` object using the **same vocabulary as the block diagnostic** above.
+A skipped recorded command (issue #1791) is the exception, as noted above:
 
 ```json
 {

@@ -62,9 +62,14 @@ struct RecordingMetrics {
     nd_detections: Mutex<usize>,
     terminal_failed: Mutex<usize>,
     signal_unhandled: Mutex<Vec<(String, String)>>,
+    dispatched: Mutex<usize>,
 }
 
 impl RecordingMetrics {
+    fn dispatch_count(&self) -> usize {
+        *self.dispatched.lock().unwrap()
+    }
+
     fn nd_block_count(&self) -> usize {
         self.block_labels.lock().unwrap().len()
     }
@@ -83,6 +88,10 @@ impl RecordingMetrics {
 }
 
 impl MetricsRecorder for RecordingMetrics {
+    fn record_task_dispatched(&self, _queue_name: &str) {
+        *self.dispatched.lock().unwrap() += 1;
+    }
+
     fn record_workflow_nondeterministic_block(&self, workflow_name: &str, queue: &str) {
         self.block_labels
             .lock()
@@ -1330,8 +1339,8 @@ async fn nd_blocked_cycle_does_not_emit_signal_unhandled() {
 
 // ── Issue #1791: unconsumed-history drift on the worker path ───────────────
 //
-// The strict and canary executors ND-block a run that ends a cycle with
-// recorded history unconsumed. These tests pin the same guard on the
+// The strict and canary executors report a run that ends a cycle with
+// recorded history unconsumed. These tests pin the matching guard on the
 // production worker path.
 
 /// Queue that no worker polls, so its activities stay scheduled.
@@ -1447,7 +1456,7 @@ async fn run_build_until(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     worker: Worker,
-    ready: impl Fn(&[WorkflowEvent]) -> bool,
+    ready: fn(&[WorkflowEvent]) -> bool,
 ) {
     let (worker, handle) = spawn_worker(worker, build_pool(url));
     for _ in 0..400 {
@@ -1460,6 +1469,27 @@ async fn run_build_until(
     }
     let history = get_history(conn, exec_id).await;
     panic!("execution {exec_id} never reached the expected history: {history:?}");
+}
+
+/// The history holds a `TimerStarted` followed by two `ActivityScheduled`.
+fn timer_then_two_activities(history: &[WorkflowEvent]) -> bool {
+    let timer = history
+        .iter()
+        .position(|e| matches!(e, WorkflowEvent::TimerStarted { .. }));
+    let activities: Vec<usize> = history
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| matches!(e, WorkflowEvent::ActivityScheduled { .. }))
+        .map(|(index, _)| index)
+        .collect();
+    activities.len() == 2 && timer.is_some_and(|t| t < activities[0])
+}
+
+/// The history holds a `TimerStarted`.
+fn has_timer_started(history: &[WorkflowEvent]) -> bool {
+    history
+        .iter()
+        .any(|e| matches!(e, WorkflowEvent::TimerStarted { .. }))
 }
 
 /// Append a `SignalReceived` event directly to the history.
@@ -1478,17 +1508,34 @@ async fn inject_signal(conn: &mut AsyncPgConnection, exec_id: ExecutionId, name:
     .expect("inject SignalReceived");
 }
 
+/// The ND diagnostic that a drifted run must carry.
+struct Drift {
+    /// How the cycle ended. The diagnostic reports it as `expected`.
+    ended: &'static str,
+    /// The recorded event that v2 skipped. The diagnostic reports it as
+    /// `actual`, the recorded side.
+    skipped: &'static str,
+    /// The history position of the skipped event.
+    event_index: i64,
+    workflow_type: &'static str,
+}
+
 /// Assert that the run is ND-blocked and was never completed or failed.
 ///
-/// `skipped_event` is the recorded event that the new build skipped. The
-/// diagnostic reports it as `actual`, the recorded side.
+/// The worker records the block metric after its commit. So the test stops
+/// the v2 worker before it reads the metrics.
 async fn assert_drift_blocked(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
+    v2: (Arc<Worker>, tokio::task::JoinHandle<()>),
     metrics: &RecordingMetrics,
-    skipped_event: &str,
+    drift: &Drift,
 ) {
     let (blocked, reason, count, attrs) = wait_for_nd_block(conn, exec_id, 1).await;
+    let (worker2, handle2) = v2;
+    worker2.shutdown();
+    let _ = handle2.await;
+
     assert!(blocked, "nd_blocked_at must be set");
     assert_eq!(count, 1);
     assert_eq!(get_state(conn, exec_id).await, "RUNNING");
@@ -1501,23 +1548,20 @@ async fn assert_drift_blocked(
         "a drifted run must have no terminal event: {history:?}"
     );
     assert!(
-        reason
-            .as_deref()
-            .is_some_and(|r| r.contains("non-deterministic replay")),
-        "nd_block_reason must carry the divergence error: {reason:?}"
+        reason.as_deref().is_some_and(|r| {
+            r.contains("non-deterministic replay") && r.contains(drift.skipped)
+        }),
+        "nd_block_reason must name the skipped event: {reason:?}"
     );
     let attrs = attrs.expect("search_attrs must be stamped");
     assert_eq!(attrs["failure_cause"], "non_determinism");
-    assert_eq!(attrs["actual"], skipped_event, "{attrs}");
-    assert!(
-        attrs["expected"]
-            .as_str()
-            .is_some_and(|e| e.starts_with("<workflow ")),
-        "expected must say how the cycle ended: {attrs}"
-    );
-    assert!(attrs["event_index"].is_number());
+    assert_eq!(attrs["expected"], drift.ended, "{attrs}");
+    assert_eq!(attrs["actual"], drift.skipped, "{attrs}");
+    assert_eq!(attrs["event_index"], drift.event_index, "{attrs}");
+    assert_eq!(attrs["workflow_type"], drift.workflow_type);
     assert_eq!(attrs["build_id"], "v2");
     assert_eq!(metrics.nd_block_count(), 1);
+    assert_eq!(metrics.nd_detection_count(), 1);
     assert_eq!(metrics.terminal_failed_count(), 0);
 }
 
@@ -1551,20 +1595,14 @@ async fn trailing_activity_drift_blocks_instead_of_completing() {
             metrics.clone(),
             "v1",
         ),
-        |history| {
-            history
-                .iter()
-                .filter(|e| matches!(e, WorkflowEvent::ActivityScheduled { .. }))
-                .count()
-                == 2
-        },
+        timer_then_two_activities,
     )
     .await;
 
     // Phase 2: the timer fires under v2, which no longer calls the activities.
     fire_timer_now(&mut conn, exec_id).await;
     make_task_claimable_now(&mut conn, exec_id).await;
-    let (worker2, handle2) = spawn_worker(
+    let v2 = spawn_worker(
         make_worker(
             vec![wf_info("nd_trailing_wf", trailing_activities_v2_handler)],
             metrics.clone(),
@@ -1572,20 +1610,18 @@ async fn trailing_activity_drift_blocks_instead_of_completing() {
         ),
         build_pool(&url),
     );
-    assert_drift_blocked(
-        &mut conn,
-        exec_id,
-        &metrics,
-        "ActivityScheduled(nd_trailing_a)",
-    )
-    .await;
-    worker2.shutdown();
-    let _ = handle2.await;
+    let drift = Drift {
+        ended: "<workflow returned early>",
+        skipped: "ActivityScheduled(nd_trailing_a)",
+        event_index: 2,
+        workflow_type: "nd_trailing_wf",
+    };
+    assert_drift_blocked(&mut conn, exec_id, v2, &metrics, &drift).await;
 }
 
 /// Issue #1791, scenario 2: a stray `TimerStarted` ahead of a signal wait.
 ///
-/// v2 replaced the timer with a signal wait. The timer fires, so v2 parks
+/// v2 replaces the timer with a signal wait. The timer fires, so v2 parks
 /// on a signal that never arrives. The worker must ND-block the run. It
 /// must not park the run forever.
 #[tokio::test]
@@ -1604,17 +1640,13 @@ async fn stray_timer_before_signal_wait_blocks_instead_of_parking() {
             metrics.clone(),
             "v1",
         ),
-        |history| {
-            history
-                .iter()
-                .any(|e| matches!(e, WorkflowEvent::TimerStarted { .. }))
-        },
+        has_timer_started,
     )
     .await;
 
     fire_timer_now(&mut conn, exec_id).await;
     make_task_claimable_now(&mut conn, exec_id).await;
-    let (worker2, handle2) = spawn_worker(
+    let v2 = spawn_worker(
         make_worker(
             vec![wf_info("nd_stray_wf", signal_wait_v2_handler)],
             metrics.clone(),
@@ -1622,9 +1654,13 @@ async fn stray_timer_before_signal_wait_blocks_instead_of_parking() {
         ),
         build_pool(&url),
     );
-    assert_drift_blocked(&mut conn, exec_id, &metrics, "TimerStarted(nd-gate)").await;
-    worker2.shutdown();
-    let _ = handle2.await;
+    let drift = Drift {
+        ended: "<workflow suspended early>",
+        skipped: "TimerStarted(nd-gate)",
+        event_index: 1,
+        workflow_type: "nd_stray_wf",
+    };
+    assert_drift_blocked(&mut conn, exec_id, v2, &metrics, &drift).await;
 }
 
 /// Issue #1791, scenario 2 with the signal delivered.
@@ -1652,17 +1688,13 @@ async fn stray_timer_before_delivered_signal_blocks_instead_of_completing() {
             metrics.clone(),
             "v1",
         ),
-        |history| {
-            history
-                .iter()
-                .any(|e| matches!(e, WorkflowEvent::TimerStarted { .. }))
-        },
+        has_timer_started,
     )
     .await;
 
     inject_signal(&mut conn, exec_id, "nd-go").await;
     make_task_claimable_now(&mut conn, exec_id).await;
-    let (worker2, handle2) = spawn_worker(
+    let v2 = spawn_worker(
         make_worker(
             vec![wf_info("nd_stray_sig_wf", signal_wait_v2_handler)],
             metrics.clone(),
@@ -1670,9 +1702,43 @@ async fn stray_timer_before_delivered_signal_blocks_instead_of_completing() {
         ),
         build_pool(&url),
     );
-    assert_drift_blocked(&mut conn, exec_id, &metrics, "TimerStarted(nd-gate)").await;
-    worker2.shutdown();
-    let _ = handle2.await;
+    let drift = Drift {
+        ended: "<workflow returned early>",
+        skipped: "TimerStarted(nd-gate)",
+        event_index: 1,
+        workflow_type: "nd_stray_sig_wf",
+    };
+    assert_drift_blocked(&mut conn, exec_id, v2, &metrics, &drift).await;
+}
+
+/// Wait until the worker has claimed the task `dispatches` times and the
+/// task is parked again on a far-future `scheduled_at`.
+///
+/// An ND-block re-pends the task about 5s ahead, so it fails this wait.
+async fn wait_for_reparked_after(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    metrics: &RecordingMetrics,
+    dispatches: usize,
+) {
+    for _ in 0..400 {
+        let (state, scheduled_at, _, _) = get_workflow_task(conn, exec_id).await;
+        if metrics.dispatch_count() >= dispatches
+            && state == "PENDING"
+            && scheduled_at > chrono::Utc::now() + chrono::Duration::seconds(60)
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let row = get_nd_block_row(conn, exec_id).await;
+    panic!(
+        "execution {exec_id} never re-parked after {dispatches} dispatches; \
+         dispatches={} blocked={} reason={:?}",
+        metrics.dispatch_count(),
+        row.0,
+        row.1
+    );
 }
 
 /// Issue #1791 control: a healthy run must not ND-block.
@@ -1699,12 +1765,13 @@ async fn early_signal_while_parked_does_not_block() {
         ),
         build_pool(&url),
     );
-    wait_for_timer_started(&mut conn, exec_id).await;
+    wait_for_reparked_after(&mut conn, exec_id, &metrics, 1).await;
 
-    // The signal wakes the run before the timer fires. The cycle must park.
+    // The signal wakes the run before the timer fires. The second cycle
+    // must park again on the timer.
     inject_signal(&mut conn, exec_id, "nd-go").await;
     make_task_claimable_now(&mut conn, exec_id).await;
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    wait_for_reparked_after(&mut conn, exec_id, &metrics, 2).await;
     let (blocked, reason, _, _) = get_nd_block_row(&mut conn, exec_id).await;
     assert!(!blocked, "a pending signal is not drift: {reason:?}");
     assert_eq!(get_state(&mut conn, exec_id).await, "RUNNING");

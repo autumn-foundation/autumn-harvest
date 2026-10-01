@@ -1,7 +1,8 @@
 ## Fix — the worker path ND-blocks a cycle that skips recorded commands (issue #1791)
 
-Only the strict and canary executors checked for unconsumed recorded history
-at the end of a cycle. The production worker path, `drive_workflow`, did not.
+Only the replay paths (strict, canary, query and debugger) checked for
+unconsumed recorded history at the end of a cycle. `drive_workflow`, the
+production worker path, did not.
 A deploy that removed a recorded command was not caught:
 
 - If the new code returned early, the worker persisted `WorkflowCompleted`
@@ -12,24 +13,43 @@ A deploy that removed a recorded command was not caught:
 `drive_workflow` now checks its completed and suspended outcomes with
 `HistoryMatcher::first_unconsumed_command_event`. A hit returns `Failed` with
 `non_deterministic_details`, so the #603 gate ND-blocks the run. The run stays
-`RUNNING`, persists nothing from the cycle, and resumes after a rollback.
+`RUNNING`, appends no event from the cycle, and resumes after a rollback.
 
 The check counts only events that a workflow command writes:
 `ActivityScheduled`, `LocalActivityScheduled`, `TimerStarted`,
 `TimerCancelled`, `ChildWorkflowStarted`, `ChildWorkflowSpawnedDetached`,
 `MarkerRecorded`, `SideEffectRecorded` and the three `External*Requested`
-events. A live history can hold a signal, a result or an update that the code
-has not awaited yet. Those are not drift, so the check ignores them. The strict
-check (`history_has_unconsumed_events`) counts them, so it is not reused.
+events. A live history can hold a signal or a result, such as
+`ActivityCompleted`, that the code has not awaited yet. Those events are not
+drift, so the check ignores them. The strict check
+(`history_has_unconsumed_events`) counts them, so the worker path does not
+reuse it.
 
-Every case the new check flags, strict replay and the deploy canary already
-report. The author `Err` arm is not checked, as on the strict path. A
+Strict replay and the deploy canary already report every case that the new
+check flags. The author `Err` arm is not checked, as on the strict path. A
 fail-fast join can return `Err` without polling every branch.
+
+`WorkflowTestEnv`, `WorkflowSimulator` and the SQLite runtime share
+`drive_workflow`, so they also report this drift.
 
 The ND diagnostic follows the #603 runbook: `expected` is what the code did
 and `actual` is the recorded event, for example
 `expected: <workflow returned early>` and
 `actual: ActivityScheduled(send_email)`.
+
+Upgrade impact. The engine upgrade alone can surface drift from an earlier
+deploy. A run that skipped a recorded command used to complete or park. It
+now blocks on its next wake. The diagnostic `build_id` is the current build,
+so a rollback does not clear the block. Before the upgrade, run the deploy
+canary or `replay-diagnosis` over in-flight runs. After it, reset a blocked
+run to before the reported `event_index`, or terminate it. A stale
+`patch:`/`version:` marker left by an early removal of `deprecate_patch` also
+blocks now. The next `docs/upgrading/` guide must carry this note.
+
+A workflow body that awaits non-durable work for more than 100 ms during
+replay could fail terminally with zero commands. It now blocks with
+`expected: <workflow suspended early>`, and stays recoverable. The ND-block
+runbook and the alert runbook describe both cases.
 
 No migration, no new `WorkflowEvent` variant, and no `harvest_events` write.
 The strict and canary executors are unchanged.

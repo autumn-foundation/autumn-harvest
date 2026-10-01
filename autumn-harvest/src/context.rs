@@ -3455,11 +3455,12 @@ impl WorkflowContext {
     /// `WorkflowCancelled`).
     ///
     /// Used by `run_workflow_strict` to detect early-completion non-determinism.
-    /// The worker path uses the narrower `first_unconsumed_command_event`
-    /// (issue #1791).
     /// Terminal lifecycle events are excluded because they are appended by the
     /// executor after the workflow returns and are never consumed by workflow
     /// commands.
+    ///
+    /// The worker path uses the narrower `first_unconsumed_command_event`
+    /// (issue #1791).
     pub fn history_has_unconsumed_events(&self) -> bool {
         self.match_history(|m| m.has_non_lifecycle_unconsumed())
     }
@@ -3469,7 +3470,8 @@ impl WorkflowContext {
     ///
     /// See [`crate::replay::HistoryMatcher::first_unconsumed_command_event`].
     /// The read locks the matcher directly, so it runs no signal-handler
-    /// pump. It reads the cursor and does not move it.
+    /// pump. A pump here could dispatch a signal handler after the cycle
+    /// ends. The read does not move the cursor.
     pub(crate) fn first_unconsumed_command_event(&self) -> Option<(usize, String)> {
         self.matcher
             .lock()

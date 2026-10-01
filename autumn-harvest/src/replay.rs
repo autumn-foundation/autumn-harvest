@@ -2004,11 +2004,13 @@ impl HistoryMatcher {
         !self.pending_external_awaits.is_empty()
     }
 
-    /// Returns `true` for events that only a workflow command writes.
+    /// Returns `true` for the command events that the end-of-cycle drift
+    /// check counts (issue #1791).
     ///
-    /// A deterministic replay re-issues every recorded command, so it
-    /// consumes each of these events. Signals, results and lifecycle events
-    /// come from outside the workflow code and are not in this set.
+    /// Only a workflow command writes these events. A deterministic replay
+    /// re-issues every recorded command, so it consumes each of them.
+    /// Signals, results and lifecycle events come from outside the workflow
+    /// code and are not in this set.
     const fn is_command_event(event: &WorkflowEvent) -> bool {
         matches!(
             event,
@@ -2034,8 +2036,9 @@ impl HistoryMatcher {
     ///
     /// This check is narrower than
     /// [`has_non_lifecycle_unconsumed`](Self::has_non_lifecycle_unconsumed).
-    /// A live history can hold a signal, a result or a cancel request that
-    /// the code has not awaited yet. Those are not drift on the live path.
+    /// A live history can hold a signal or a result, such as `TimerFired`,
+    /// that the code has not awaited yet. Those events are not drift on the
+    /// live path.
     #[must_use]
     pub fn first_unconsumed_command_event(&self) -> Option<(usize, String)> {
         let at_or_after_cursor = (self.cursor..self.events.len())
@@ -4374,8 +4377,8 @@ impl HistoryMatcher {
         //     end-of-cycle drift guard in `executor.rs` then fails the cycle.
         //     The run does not park forever on a signal that never arrives.
         //     Strict and canary replay use `history_has_unconsumed_events()`.
-        //     The worker path uses `first_unconsumed_command_event()`, and
-        //     the #603 gate ND-blocks the run (issue #1791).
+        //     The worker path uses `first_unconsumed_command_event()` (issue
+        //     #1791). The #603 gate then ND-blocks the run.
         //
         // Deciding that here instead would mean guessing, since this scan runs
         // before the sibling branches of the same decision are polled — which is
@@ -9170,8 +9173,8 @@ mod tests {
         );
         assert!(
             !m.is_consumed(0),
-            "the stray timer must be left UNCONSUMED — that is the whole signal \
-             `history_has_unconsumed_events()` keys on to nd-block the run"
+            "the stray timer must be left UNCONSUMED. Both end-of-cycle drift \
+             guards key on it"
         );
         assert_eq!(
             m.first_unconsumed_command_event(),
@@ -13784,7 +13787,10 @@ mod tests {
     #[test]
     fn first_unconsumed_command_event_reports_a_trailing_activity() {
         let mut m = HistoryMatcher::new(vec![scheduled("a"), scheduled("b")]);
-        let _ = m.match_activity("a");
+        assert!(
+            !matches!(m.match_activity("a"), HistoryMatch::Diverged { .. }),
+            "the setup must match activity a"
+        );
         assert_eq!(
             m.first_unconsumed_command_event(),
             Some((1, "ActivityScheduled(b)".to_string())),
