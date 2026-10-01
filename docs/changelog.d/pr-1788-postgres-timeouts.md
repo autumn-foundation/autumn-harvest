@@ -28,8 +28,11 @@ partition drain sets `SET LOCAL statement_timeout = 0`, because a timeout there
 discards a finished pass.
 
 **Heartbeat flush.** Each flush has its own bounded acquire. A failed flush
-keeps its payload for the next tick. A task that is no longer `RUNNING` drops
-the payload.
+keeps its payload for the next tick. The new `queue::record_heartbeat_for_claim`
+writes only under the claim's `attempt` and `worker_id`, so a late heartbeat
+cannot reach a newer attempt. A payload with no matching claim is dropped. The
+executed activity's result write uses `pool::acquire_with_retries` (10 bounded
+tries).
 
 **Metrics.** `harvest.db.pool_acquire_timeout{site}` and
 `harvest.heartbeat.flush_failed{reason}`, with starter dashboard panels.

@@ -5998,6 +5998,13 @@ async fn acquire_shard_conn(
     crate::pool::acquire(pool, bound).await
 }
 
+/// Pool acquire tries for an executed activity's result write.
+///
+/// Each try waits up to the pool bound. Ten tries ride out a short pool
+/// incident. A pool that stays full longer leaves the task to its heartbeat
+/// or `start_to_close` timeout, as before.
+const FINALIZE_ACQUIRE_ATTEMPTS: u32 = 10;
+
 /// The `site` label for a claim acquire timeout.
 const SITE_CLAIM: &str = "claim";
 
@@ -15069,6 +15076,10 @@ async fn process_activity_task(
         crate::heartbeat::HeartbeatFlushOptions {
             acquire_timeout: crate::pool::acquire_bound(pool),
             metrics: Arc::clone(&registry.telemetry().metrics),
+            claim: Some(crate::heartbeat::HeartbeatClaim {
+                attempt: task.attempt,
+                worker_id: worker_id.to_owned(),
+            }),
         },
     );
     let trace_carrier = task
@@ -15469,7 +15480,9 @@ async fn process_activity_task(
     drop(activity_future);
 
     // Finalization phase: re-acquire a connection now that the handler is done.
-    let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
+    // The handler already ran, so a short pool incident must not drop its
+    // result. Each try is bounded (issue #1788).
+    let mut conn = crate::pool::acquire_with_retries(pool, FINALIZE_ACQUIRE_ATTEMPTS).await?;
     let retry_policy_result = configured_retry_policy(task);
     let retry_policy = fail_execution_on_error(
         &mut conn,

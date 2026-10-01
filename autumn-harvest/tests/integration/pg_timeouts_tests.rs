@@ -423,3 +423,97 @@ async fn a_full_pool_fails_a_claim_within_the_bound() {
         .expect("worker stops")
         .expect("worker task joins");
 }
+
+// ---------------------------------------------------------------------------
+// Review follow-ups: finalization retries, claim-fenced heartbeats.
+// ---------------------------------------------------------------------------
+
+/// A finalization write waits through several bounded attempts. A slot that
+/// frees during them is taken, so an executed result is not dropped.
+#[tokio::test]
+async fn a_retrying_acquire_gets_a_slot_that_frees_later() {
+    let (url, _container) = setup_db().await;
+    let pool = engine_pool(
+        url,
+        1,
+        DbRole::Hot,
+        &timeouts(200, SessionTimeouts::for_role(DbRole::Hot)),
+    )
+    .expect("engine pool builds");
+    let held = hold_every_connection(&pool).await;
+    let releaser = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        drop(held);
+    });
+
+    let conn = tokio::time::timeout(
+        Duration::from_secs(10),
+        autumn_harvest::pool::acquire_with_retries(&pool, 10),
+    )
+    .await
+    .expect("the retries end")
+    .expect("the freed slot is taken");
+    drop(conn);
+    releaser.await.expect("releaser joins");
+}
+
+#[derive(diesel::QueryableByName)]
+struct Details {
+    #[diesel(sql_type = diesel::sql_types::Jsonb)]
+    heartbeat_details: serde_json::Value,
+}
+
+/// A heartbeat from an old claim must not touch the row after a new claim.
+#[tokio::test]
+async fn a_heartbeat_from_an_old_claim_is_rejected() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let queue_name = format!("q-hb-{}", Uuid::new_v4());
+    let params = autumn_harvest::queue::EnqueueParams::new(
+        &queue_name,
+        autumn_harvest::queue::TaskType::Activity,
+        serde_json::json!({}),
+    );
+    let task_id = autumn_harvest::queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue");
+    diesel::sql_query(
+        "UPDATE harvest_task_queue SET state = 'RUNNING', worker_id = 'new-worker', \
+         attempt = 2 WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .execute(&mut conn)
+    .await
+    .expect("model a newer claim");
+
+    let stale = autumn_harvest::queue::record_heartbeat_for_claim(
+        &mut conn,
+        task_id,
+        1,
+        "old-worker",
+        serde_json::json!({"from": "old"}),
+    )
+    .await
+    .expect_err("an old claim must not write");
+    assert!(
+        matches!(stale, autumn_harvest::error::HarvestError::NotFound(_)),
+        "{stale}"
+    );
+
+    autumn_harvest::queue::record_heartbeat_for_claim(
+        &mut conn,
+        task_id,
+        2,
+        "new-worker",
+        serde_json::json!({"from": "new"}),
+    )
+    .await
+    .expect("the current claim writes");
+
+    let row = diesel::sql_query("SELECT heartbeat_details FROM harvest_task_queue WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .get_result::<Details>(&mut conn)
+        .await
+        .expect("read details");
+    assert_eq!(row.heartbeat_details, serde_json::json!({"from": "new"}));
+}

@@ -395,6 +395,35 @@ pub async fn acquire_within_pool_bound(pool: &crate::worker::DbPool) -> HarvestR
     acquire(pool, acquire_bound(pool)).await
 }
 
+/// Get a connection for a write that must not be lost, such as an executed
+/// activity result.
+///
+/// Makes up to `attempts` tries, each within [`acquire_bound`]. A short pool
+/// incident then delays the write but does not drop it. The worst-case wait is
+/// `attempts` times the bound.
+///
+/// # Errors
+///
+/// The error of the last attempt, see [`acquire`].
+#[cfg(feature = "db")]
+pub async fn acquire_with_retries(
+    pool: &crate::worker::DbPool,
+    attempts: u32,
+) -> HarvestResult<PooledConn> {
+    let attempts = attempts.max(1);
+    let mut attempt = 1;
+    loop {
+        match acquire_within_pool_bound(pool).await {
+            Ok(conn) => return Ok(conn),
+            Err(error) if attempt < attempts => {
+                tracing::warn!(attempt, attempts, error = %error, "pool acquire failed; trying again");
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// Get a connection from `pool` within `bound`.
 ///
 /// The bound applies to every pool, also to a pool with no deadpool timeouts.
@@ -745,6 +774,29 @@ mod tests {
         assert!(err.is_pool_acquire_timeout(), "{err}");
         assert!(
             started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Each attempt is bounded, and the last error is the typed timeout.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn acquire_with_retries_makes_each_attempt_then_gives_up() {
+        let (_listener, dsn) = silent_listener().await;
+        let pool = engine_pool(dsn, 1, DbRole::Hot, &timeouts_with_pool(100))
+            .expect("pool builds without connecting");
+
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(Duration::from_secs(10), acquire_with_retries(&pool, 3))
+            .await
+            .expect("three bounded attempts must end");
+        let err = outcome
+            .err()
+            .expect("a silent database yields no connection");
+        assert!(err.is_pool_acquire_timeout(), "{err}");
+        assert!(
+            started.elapsed() >= Duration::from_millis(300),
             "{:?}",
             started.elapsed()
         );

@@ -48,6 +48,7 @@ pub fn spawn_heartbeat_flusher(
     let options = HeartbeatFlushOptions {
         acquire_timeout: crate::pool::acquire_bound(&pool),
         metrics: Arc::new(crate::telemetry::NoOpMetrics),
+        claim: None,
     };
     spawn_heartbeat_flusher_with(task_id, pool, cancel, options)
 }
@@ -60,6 +61,19 @@ pub struct HeartbeatFlushOptions {
     /// Receives `harvest.heartbeat.flush_failed` and
     /// `harvest.db.pool_acquire_timeout{site="heartbeat_flush"}`.
     pub metrics: Arc<dyn MetricsRecorder>,
+    /// The claim that owns the task. `Some` makes each write check it, so a
+    /// late heartbeat cannot reach a newer attempt. `None` checks only that
+    /// the task is `RUNNING`.
+    pub claim: Option<HeartbeatClaim>,
+}
+
+/// The claim a heartbeat belongs to: the task row's `attempt` and `worker_id`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeartbeatClaim {
+    /// `harvest_task_queue.attempt` at claim time.
+    pub attempt: i32,
+    /// The claiming worker.
+    pub worker_id: String,
 }
 
 /// [`spawn_heartbeat_flusher`] with an explicit acquire bound and metrics
@@ -94,7 +108,7 @@ pub async fn flush_heartbeat(
     payload: Value,
     acquire_timeout: Duration,
 ) -> HarvestResult<()> {
-    flush(pool, task_id, payload, acquire_timeout)
+    flush(pool, task_id, None, payload, acquire_timeout)
         .await
         .map_err(|failure| *failure.error)
 }
@@ -111,6 +125,7 @@ struct FlushFailure {
 async fn flush(
     pool: &Pool<AsyncPgConnection>,
     task_id: Uuid,
+    claim: Option<&HeartbeatClaim>,
     payload: Value,
     acquire_timeout: Duration,
 ) -> Result<(), FlushFailure> {
@@ -124,12 +139,23 @@ async fn flush(
             },
             error: Box::new(error),
         })?;
-    crate::queue::record_heartbeat(&mut conn, task_id, payload)
-        .await
-        .map_err(|error| FlushFailure {
-            reason: "write_error",
-            error: Box::new(error),
-        })
+    let written = match claim {
+        Some(claim) => {
+            crate::queue::record_heartbeat_for_claim(
+                &mut conn,
+                task_id,
+                claim.attempt,
+                &claim.worker_id,
+                payload,
+            )
+            .await
+        }
+        None => crate::queue::record_heartbeat(&mut conn, task_id, payload).await,
+    };
+    written.map_err(|error| FlushFailure {
+        reason: "write_error",
+        error: Box::new(error),
+    })
 }
 
 /// The main heartbeat flushing loop.
@@ -163,12 +189,18 @@ async fn heartbeat_loop(
 
         // If we got at least one heartbeat, flush to DB.
         if let Some(payload) = pending.take()
-            && let Err(failure) =
-                flush(&pool, task_id, payload.clone(), options.acquire_timeout).await
+            && let Err(failure) = flush(
+                &pool,
+                task_id,
+                options.claim.as_ref(),
+                payload.clone(),
+                options.acquire_timeout,
+            )
+            .await
         {
             if matches!(*failure.error, HarvestError::NotFound(_)) {
-                // The task finished or went back to the queue. A retry cannot
-                // succeed, and it could overwrite a newer attempt.
+                // The task finished, went back to the queue, or has a newer
+                // claim. A retry cannot succeed.
                 tracing::debug!(
                     task_id = %task_id,
                     "task is no longer running; dropping the heartbeat"
@@ -324,6 +356,7 @@ mod tests {
             HeartbeatFlushOptions {
                 acquire_timeout: Duration::from_millis(100),
                 metrics: Arc::clone(&failures) as Arc<dyn crate::telemetry::MetricsRecorder>,
+                claim: None,
             },
         );
         tx.send(serde_json::json!({"p": 1})).await.expect("send");

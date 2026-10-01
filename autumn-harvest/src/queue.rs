@@ -2879,6 +2879,49 @@ pub async fn record_heartbeat(
     Ok(())
 }
 
+/// [`record_heartbeat`] for one claim of the task (issue #1788).
+///
+/// The write applies only while the row is `RUNNING` under this `attempt`
+/// and `worker_id`. A requeue or a new claim changes them. A late heartbeat
+/// from the old claim then cannot touch the new attempt's row.
+///
+/// # Errors
+///
+/// [`crate::error::HarvestError::NotFound`] when the claim no longer holds the
+/// row. [`crate::error::HarvestError::Database`] when the write fails.
+pub async fn record_heartbeat_for_claim(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    attempt: i32,
+    worker_id: &str,
+    details: serde_json::Value,
+) -> HarvestResult<()> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    let updated = diesel::update(
+        dsl::harvest_task_queue
+            .find(task_id)
+            .filter(dsl::state.eq("RUNNING"))
+            .filter(dsl::attempt.eq(attempt))
+            .filter(dsl::worker_id.eq(worker_id)),
+    )
+    .set((
+        dsl::last_heartbeat_at.eq(Some(Utc::now())),
+        dsl::heartbeat_details.eq(Some(details)),
+    ))
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+
+    if updated == 0 {
+        return Err(crate::error::HarvestError::NotFound(format!(
+            "task queue item {task_id} is not running under attempt {attempt} of worker {worker_id}"
+        )));
+    }
+
+    Ok(())
+}
+
 /// Shared "reset a claimed task back to `PENDING` with a future
 /// `scheduled_at`" changeset (code-review cleanup, issue #603): the 7 fields
 /// common to both [`requeue_for_retry`] (activity retry) and
