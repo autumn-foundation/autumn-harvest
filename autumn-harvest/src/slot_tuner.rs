@@ -7,8 +7,8 @@
 //! under a burst; too low leaves capacity idle while schedule-to-start latency
 //! climbs.
 //!
-//! This module is the opt-in *act* half of issue #531 (slot-utilization
-//! gauges, the *observe* half): a [`SlotTuner`] resizes a worker's live
+//! This module is the opt-in *act* half of issue #531. The slot-utilization
+//! gauges are the *observe* half. A [`SlotTuner`] resizes a worker's live
 //! dispatch semaphore within an operator-configured `[min_slots, max_slots]`
 //! band. Only in-process signals the worker already owns drive it: slot
 //! utilization, worker DB-pool acquisition pressure, and recent dispatch-wait

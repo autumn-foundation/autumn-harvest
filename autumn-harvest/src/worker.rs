@@ -356,9 +356,8 @@ impl WorkerRuntimeConfig {
                 ));
             }
             // `min_slots == 0` is a liveness hazard, not just a degenerate
-            // band: the default controller's grow signal depends on
-            // observing a dispatch wait, which requires a
-            // task to actually be dispatched. If pool pressure ever shrinks
+            // band. The grow signal of the default controller needs a
+            // dispatch wait. A dispatch wait needs a dispatched task. If pool pressure ever shrinks
             // the target to 0, no task can dispatch, so no permit wait is
             // ever recorded and the worker is permanently stuck at zero
             // capacity — the same silent-outage shape as `max_slots == 0`.
