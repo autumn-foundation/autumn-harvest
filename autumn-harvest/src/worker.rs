@@ -5040,6 +5040,26 @@ fn retry_stream_seed(task: &TaskQueueItem) -> u64 {
     seed
 }
 
+/// PostgreSQL's bind-parameter ceiling for one statement.
+const TIMER_POSTGRES_MAX_BIND_PARAMS: usize = 65_535;
+
+/// Columns `NewHarvestTimer` binds per row.
+const NEW_HARVEST_TIMER_COLUMNS: usize = 3;
+
+/// Rows per multi-row `INSERT INTO harvest_timers`.
+///
+/// A mixed batch has no cap on its timer count. At three binds per row,
+/// `TIMER_ROWS_PER_INSERT_CHUNK * NEW_HARVEST_TIMER_COLUMNS` never reaches
+/// [`TIMER_POSTGRES_MAX_BIND_PARAMS`].
+const TIMER_ROWS_PER_INSERT_CHUNK: usize =
+    TIMER_POSTGRES_MAX_BIND_PARAMS / NEW_HARVEST_TIMER_COLUMNS;
+
+/// Timer ids per batched lookup.
+///
+/// The lookup binds one parameter per id, plus the execution id and the
+/// `fired` flag. Two spare slots keep it under the ceiling.
+const TIMER_LOOKUP_ID_CHUNK: usize = TIMER_POSTGRES_MAX_BIND_PARAMS - 2;
+
 /// Loads the un-fired `harvest_timers` rows for `timer_ids` on one execution,
 /// keyed by `timer_id`, in one statement.
 ///
@@ -5058,16 +5078,18 @@ async fn load_unfired_timers_by_id(
     if timer_ids.is_empty() {
         return Ok(by_id);
     }
-    let rows: Vec<HarvestTimer> = harvest_timers::table
-        .filter(harvest_timers::workflow_exec_id.eq(exec_id))
-        .filter(harvest_timers::timer_id.eq_any(timer_ids))
-        .filter(harvest_timers::fired.eq(false))
-        .order((harvest_timers::fires_at.asc(), harvest_timers::id.asc()))
-        .load(conn)
-        .await
-        .map_err(crate::error::database_error)?;
-    for row in rows {
-        by_id.entry(row.timer_id.clone()).or_insert(row);
+    for chunk in timer_ids.chunks(TIMER_LOOKUP_ID_CHUNK) {
+        let rows: Vec<HarvestTimer> = harvest_timers::table
+            .filter(harvest_timers::workflow_exec_id.eq(exec_id))
+            .filter(harvest_timers::timer_id.eq_any(chunk))
+            .filter(harvest_timers::fired.eq(false))
+            .order((harvest_timers::fires_at.asc(), harvest_timers::id.asc()))
+            .load(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+        for row in rows {
+            by_id.entry(row.timer_id.clone()).or_insert(row);
+        }
     }
     Ok(by_id)
 }
@@ -12458,11 +12480,13 @@ async fn persist_mixed_suspension_batch(
                     fires_at: *fires_at,
                 })
                 .collect();
-            diesel::insert_into(harvest_timers::table)
-                .values(&new_timers)
-                .execute(conn)
-                .await
-                .map_err(crate::error::database_error)?;
+            for chunk in new_timers.chunks(TIMER_ROWS_PER_INSERT_CHUNK) {
+                diesel::insert_into(harvest_timers::table)
+                    .values(chunk)
+                    .execute(conn)
+                    .await
+                    .map_err(crate::error::database_error)?;
+            }
         }
 
         // Issue #1484 review: already locked above. That combined pre-lock
@@ -31618,6 +31642,21 @@ pub(crate) fn under_provisioned_shard_pools(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn timer_batch_chunks_stay_under_the_bind_parameter_ceiling() {
+        const {
+            assert!(
+                TIMER_ROWS_PER_INSERT_CHUNK * NEW_HARVEST_TIMER_COLUMNS
+                    <= TIMER_POSTGRES_MAX_BIND_PARAMS
+            );
+            assert!(TIMER_LOOKUP_ID_CHUNK + 2 <= TIMER_POSTGRES_MAX_BIND_PARAMS);
+        }
+        // 21,845 rows fill one insert chunk. The next row starts a second chunk.
+        assert_eq!(21_845usize.div_ceil(TIMER_ROWS_PER_INSERT_CHUNK), 1);
+        assert_eq!(21_846usize.div_ceil(TIMER_ROWS_PER_INSERT_CHUNK), 2);
+        assert_eq!(65_536usize.div_ceil(TIMER_ROWS_PER_INSERT_CHUNK), 4);
+    }
+
     use super::*;
 
     /// Serializes every test below that installs or uninstalls a dispatch

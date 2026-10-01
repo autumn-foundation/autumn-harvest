@@ -66,7 +66,7 @@ instead of one. `eq_any` turns `n` scans into one.
 `load_unfired_timers_by_id` loads every un-fired row for the batch's timer ids
 in one statement. Both loops use it. The persist loop reads `NOW()` at most
 once, because `NOW()` is the transaction start time and returns the same value
-on every call. The new timer rows go in one multi-row `INSERT`. A timer id is
+on every call. The new timer rows go in one multi-row `INSERT`. Both the lookup and the insert split into chunks under PostgreSQL's 65,535 bind-parameter limit (21,845 rows per insert chunk, 65,533 ids per lookup chunk), so a very wide batch still parks. A timer id is
 unique within a batch (`duplicate_start_timer_id` rejects repeats), so the
 batched insert writes the same rows. No migration, no lock.
 
