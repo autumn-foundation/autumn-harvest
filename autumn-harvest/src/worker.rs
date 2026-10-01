@@ -14929,6 +14929,11 @@ async fn process_activity_task(
     // A short-circuit reserves nothing; only a real call consumes a token. The
     // `circuit_token.is_some()` guard means "decision is Allow"; the breaker guard
     // restricts this to activities whose claim-time rate limiting was skipped.
+    //
+    // The connection that took the token also appends ActivityStarted below
+    // (issue #1788). A second acquire there could time out after the debit and
+    // leave the token spent on a call that never ran.
+    let mut reserved_conn: Option<crate::pool::PooledConn> = None;
     if circuit_token.is_some()
         && activity.circuit_breaker.is_some()
         && let Some(key) = task.rate_limit_key.as_deref()
@@ -14977,6 +14982,7 @@ async fn process_activity_task(
             queue::defer_rate_limited_task(&mut conn, task.id, scheduled_at).await?;
             return Ok(());
         }
+        reserved_conn = Some(conn);
     }
 
     // Setup phase: append ActivityStarted, then drop the connection so the pool
@@ -14986,11 +14992,14 @@ async fn process_activity_task(
     // a deferred task never records a start it did not run; serves both the
     // short-circuit path (start + CircuitOpen failure) and the real-call path.
     let started = {
-        let mut conn = crate::pool::acquire_within_pool_bound(pool)
-            .await
-            .map_err(|e| {
-                release_probe_on_error(&circuit_breakers, activity_name, circuit_token, e)
-            })?;
+        let mut conn = match reserved_conn.take() {
+            Some(conn) => conn,
+            None => crate::pool::acquire_within_pool_bound(pool)
+                .await
+                .map_err(|e| {
+                    release_probe_on_error(&circuit_breakers, activity_name, circuit_token, e)
+                })?,
+        };
         let started_result = append_activity_started_if_pending(
             &mut conn,
             task,
@@ -31346,10 +31355,10 @@ pub async fn reset_timed_out_workflow_task(
 
     // Retry both the pool acquire and the release write. Without the retry, a
     // short pool saturation leaves the task stuck in RUNNING on a live worker.
-    // The orphan reclaimer skips tasks owned by live workers. The write can
-    // also hit a session `lock_timeout` or
-    // `statement_timeout` (issue #1788): often the same lock that stopped the
-    // activity's own result write. The claim fence makes a repeat safe.
+    // The orphan reclaimer skips tasks owned by live workers. Any write error
+    // retries (issue #1788): a session `lock_timeout`, often the same lock that
+    // stopped the activity's own result write, or a dropped connection. The
+    // write is one claim-fenced statement, so a repeat is safe.
     let mut last_err = None;
     for &delay_ms in RESET_POOL_RETRY_BACKOFF_MS {
         if delay_ms > 0 {
@@ -31430,17 +31439,17 @@ pub async fn reset_timed_out_workflow_task(
         .await
         .map_err(crate::error::database_error);
         match written {
-            Err(e) if crate::pool::is_session_timeout(&e) => {
+            Err(e) => {
                 tracing::warn!(
                     task_id = %task_id,
                     worker_id = %worker_id,
                     error = %e,
-                    "workflow task timeout reset: session timeout, retrying"
+                    "workflow task timeout reset: write failed, retrying"
                 );
                 last_err = Some(e);
             }
-            outcome => {
-                log_claim_reset_outcome(&mut conn, task_id, worker_id, outcome).await;
+            Ok(updated) => {
+                log_claim_reset_outcome(&mut conn, task_id, worker_id, updated).await;
                 return;
             }
         }
@@ -31459,34 +31468,23 @@ async fn log_claim_reset_outcome(
     conn: &mut AsyncPgConnection,
     task_id: uuid::Uuid,
     worker_id: &str,
-    outcome: HarvestResult<usize>,
+    updated: usize,
 ) {
-    match outcome {
-        Ok(n) if n > 0 => {
-            // Dispatch hint (issue #1312). The row is `PENDING` again with no
-            // owner, so the channel gets a reference to it.
-            crate::queue::record_pending_hints(conn, &[task_id]).await;
-            tracing::debug!(
-                task_id = %task_id,
-                worker_id = %worker_id,
-                "reset timed-out workflow task to PENDING"
-            );
-        }
-        Ok(_) => {
-            tracing::debug!(
-                task_id = %task_id,
-                worker_id = %worker_id,
-                "timed-out workflow task already reclaimed or transitioned"
-            );
-        }
-        Err(e) => {
-            tracing::error!(
-                task_id = %task_id,
-                worker_id = %worker_id,
-                error = %e,
-                "failed to reset timed-out workflow task to PENDING"
-            );
-        }
+    if updated > 0 {
+        // Dispatch hint (issue #1312). The row is `PENDING` again with no
+        // owner, so the channel gets a reference to it.
+        crate::queue::record_pending_hints(conn, &[task_id]).await;
+        tracing::debug!(
+            task_id = %task_id,
+            worker_id = %worker_id,
+            "reset timed-out workflow task to PENDING"
+        );
+    } else {
+        tracing::debug!(
+            task_id = %task_id,
+            worker_id = %worker_id,
+            "timed-out workflow task already reclaimed or transitioned"
+        );
     }
 }
 

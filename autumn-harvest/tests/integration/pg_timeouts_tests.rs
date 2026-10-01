@@ -730,6 +730,82 @@ async fn a_rolled_back_quarantine_reports_failure() {
     assert_eq!(task_state(&mut conn, task_id).await, "RUNNING");
 }
 
+/// A claim release that fails with a non-timeout error, such as a dropped
+/// connection, also retries. A trigger fails the first update for this row
+/// once. A sequence counts the tries, because it does not roll back.
+#[tokio::test]
+async fn a_claim_release_retries_after_a_non_timeout_error() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let suffix = Uuid::new_v4().simple().to_string()[..12].to_owned();
+    let queue_name = format!("q-ne-{suffix}");
+    let task_id = autumn_harvest::queue::enqueue(
+        &mut conn,
+        &autumn_harvest::queue::EnqueueParams::new(
+            &queue_name,
+            autumn_harvest::queue::TaskType::Activity,
+            serde_json::json!({}),
+        ),
+    )
+    .await
+    .expect("enqueue");
+    diesel::sql_query(
+        "UPDATE harvest_task_queue SET state = 'RUNNING', worker_id = 'w-1', attempt = 1 \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .execute(&mut conn)
+    .await
+    .expect("model the claim");
+
+    let seq = format!("harvest_test_1788_seq_{suffix}");
+    let function = format!("harvest_test_1788_fail_once_{suffix}");
+    let trigger = format!("harvest_test_1788_fail_once_{suffix}");
+    for sql in [
+        format!("CREATE SEQUENCE {seq}"),
+        format!(
+            "CREATE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN \
+               IF NEW.id = '{task_id}'::uuid AND nextval('{seq}') = 1 THEN \
+                 RAISE EXCEPTION 'transient failure for the test'; \
+               END IF; \
+               RETURN NEW; \
+             END $$"
+        ),
+        format!(
+            "CREATE TRIGGER {trigger} BEFORE UPDATE ON harvest_task_queue \
+             FOR EACH ROW EXECUTE FUNCTION {function}()"
+        ),
+    ] {
+        diesel::sql_query(sql)
+            .execute(&mut conn)
+            .await
+            .expect("set up the trigger");
+    }
+
+    let pool = engine_pool(
+        url,
+        1,
+        DbRole::Hot,
+        &timeouts(5_000, SessionTimeouts::for_role(DbRole::Hot)),
+    )
+    .expect("engine pool");
+    autumn_harvest::worker::reset_timed_out_workflow_task(&pool, task_id, "w-1", 0, 1).await;
+    let state = task_state(&mut conn, task_id).await;
+
+    for sql in [
+        format!("DROP TRIGGER {trigger} ON harvest_task_queue"),
+        format!("DROP FUNCTION {function}()"),
+        format!("DROP SEQUENCE {seq}"),
+    ] {
+        diesel::sql_query(sql)
+            .execute(&mut conn)
+            .await
+            .expect("drop the trigger");
+    }
+    assert_eq!(state, "PENDING");
+}
+
 async fn task_state(conn: &mut AsyncPgConnection, task_id: Uuid) -> String {
     #[derive(diesel::QueryableByName)]
     struct State {
