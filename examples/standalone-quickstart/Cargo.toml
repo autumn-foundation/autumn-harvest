@@ -11,6 +11,7 @@ autumn-web = "0.7"
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 tracing = "0.1"
+tracing-subscriber = "0.3"
 
 [dev-dependencies]
 autumn-harvest = { version = "0.6.0", path = "../../autumn-harvest", features = ["testing"] }

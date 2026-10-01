@@ -12,6 +12,10 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
+    // Print the engine's log lines, for example the dev-profile warning.
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .init();
     let database_url = std::env::var("DATABASE_URL").map_err(|_| "set DATABASE_URL")?;
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&database_url);
     let pool = Pool::builder(manager).build()?;

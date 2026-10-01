@@ -42,6 +42,7 @@ autumn-web = "0.7"
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 tracing = "0.1"
+tracing-subscriber = "0.3"
 
 [dev-dependencies]
 autumn-harvest = { version = "0.6.0", path = "../../autumn-harvest", features = ["testing"] }
@@ -122,6 +123,10 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
+    // Print the engine's log lines, for example the dev-profile warning.
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .init();
     let database_url = std::env::var("DATABASE_URL").map_err(|_| "set DATABASE_URL")?;
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&database_url);
     let pool = Pool::builder(manager).build()?;
@@ -198,7 +203,7 @@ docker compose -f examples/standalone-quickstart/compose.yaml up -d
 Apply the Harvest migrations. On the plugin path, the `dev` profile applies
 them at boot. Here, the `harvest` CLI applies them:
 
-<!-- chapter-run: expect MIGRATE_EXPECT -->
+<!-- chapter-run: expect migration(s) applied -->
 ```bash
 cargo run -p autumn-harvest-cli -- migrate run \
   --database-url postgres://harvest:harvest@localhost:5435/harvest
@@ -231,13 +236,13 @@ curl -s -X POST http://localhost:3000/api/harvest/workflows/onboarding/start \
 Wait for the result. The request returns when the run completes, or after 30
 seconds:
 
-<!-- chapter-run: expect RESULT_EXPECT -->
+<!-- chapter-run: expect "output": "sent" -->
 ```bash
 curl -s 'http://localhost:3000/api/harvest/workflows/by-id/onboarding/user-42/result?wait=30s' | jq .
 ```
 
-Open `http://localhost:3000/api/harvest/ui` to see the run in the Vantage
-dashboard.
+Open `http://localhost:3000/api/harvest/ui/workflows` to see the run in the
+Vantage dashboard.
 
 ## 6. Run preflight
 
@@ -247,8 +252,9 @@ cargo run -p autumn-harvest-cli -- preflight
 ```
 
 The CLI's default base URL is `http://localhost:3000/api/harvest`. Preflight
-exits `0` on a pass and `2` on a warning. Under `dev`, its
-`admin_auth_boundary` check reports `unauthenticated_access: true`.
+exits `0` on a pass and `2` on a warning. Under `dev`, the
+`admin_auth_boundary` row says that the admin API is reachable
+unauthenticated.
 
 ## Before production
 

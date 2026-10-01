@@ -1554,8 +1554,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # One package per command. The chapter runs each with `cargo run -p`,
+      # and a joint build resolves other features, so it would not be reused.
       - name: Build the chapter's crate and the CLI
-        run: cargo build -p standalone-quickstart -p autumn-harvest-cli
+        run: |
+          cargo build -p autumn-harvest-cli
+          cargo build -p standalone-quickstart
       - name: Run the bash blocks of docs/getting-started/standalone-axum.md
         run: ./scripts/run-standalone-chapter.sh
 
