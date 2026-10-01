@@ -66,11 +66,11 @@ pub enum WorkflowOutcome {
         handler_panic: bool,
         /// Unconsumed delivered signals at this terminal outcome (issue #684).
         /// See [`WorkflowOutcome::Completed::unhandled_signals`]. Populated on
-        /// the executor's `Ok(Err)` / deferred-nd-reroute / skipped-command
-        /// (issue #1791) terminal arms; a
+        /// the executor's `Ok(Err)` / deferred-nd-reroute terminal arms; a
         /// `Failed { non_deterministic_details: Some(_) }` ND-block outcome
         /// carries it too but is diverted by the worker's #603 gate before the
-        /// emission site, so it is never counted.
+        /// emission site, so it is never counted. The skipped-command arm
+        /// (issue #1791) also populates it.
         unhandled_signals: std::collections::BTreeMap<String, u64>,
     },
     /// The workflow suspended awaiting activity results or timer firings.
