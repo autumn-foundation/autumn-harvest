@@ -19689,13 +19689,11 @@ async fn batch_start_workflows(
     let mut shard_groups: std::collections::BTreeMap<ShardId, Vec<(usize, String)>> =
         std::collections::BTreeMap::new();
     let mut gate_rejected: Vec<BatchStartItemResult> = Vec::new();
-    // Load shedding (issue #1794). Every item uses `item_queue`, so one check
-    // covers the batch. A throttle defer in Phase 2 skips the primitive's check.
-    let shed_hit = api_state
-        .gate_cache()
-        .load_shedder()
-        .check(item_queue, std::time::Instant::now());
+    // Load shedding (issue #1794). A throttle defer in Phase 2 skips the
+    // primitive's check, so each item is checked here. The check repeats per
+    // item, because the idempotency lookups below can outlast a sample.
     let mut shed_rejected = 0_usize;
+    let mut last_shed: Option<autumn_harvest::load_shed::ShedDecision> = None;
     for (idx, item) in request.items.iter().enumerate() {
         if pre_rejected_idxs.contains(&idx) {
             continue;
@@ -19720,6 +19718,10 @@ async fn batch_start_workflows(
             shard.as_i32(),
             item_owner,
         );
+        let shed_hit = api_state
+            .gate_cache()
+            .load_shedder()
+            .check(item_queue, std::time::Instant::now());
         if gate_hit.is_some() || shed_hit.is_some() {
             // Idempotent retry bypass: if the caller supplied an explicit
             // workflow_id, check whether an active (RUNNING/SUSPENDED) execution
@@ -19833,7 +19835,7 @@ async fn batch_start_workflows(
                 });
                 continue;
             }
-            if let Some(decision) = &shed_hit {
+            if let Some(decision) = shed_hit {
                 runtime
                     .registry
                     .telemetry()
@@ -19854,6 +19856,7 @@ async fn batch_start_workflows(
                         .to_string(),
                     ),
                 });
+                last_shed = Some(decision);
                 continue;
             }
         }
@@ -19891,7 +19894,7 @@ async fn batch_start_workflows(
         }
         // Only sheds: answer 429 with `Retry-After`, so the caller retries.
         // A manual-gate block keeps the 409.
-        if let Some(decision) = shed_hit.as_ref().filter(|_| only_shed) {
+        if let Some(decision) = last_shed.as_ref().filter(|_| only_shed) {
             let mut response = (
                 StatusCode::TOO_MANY_REQUESTS,
                 Json(BatchStartRejectedResponse {
