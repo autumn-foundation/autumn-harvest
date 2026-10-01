@@ -28729,11 +28729,13 @@ impl Worker {
                         runtime: workflow_runtime,
                         permit_wait_micros: workflow_permit_wait,
                         slot_type: SlotType::Workflow,
+                        capacity_freed: Some(Arc::clone(&self.capacity_freed)),
                     },
                     crate::slot_tuner::TunedSlot {
                         runtime: activity_runtime,
                         permit_wait_micros: activity_permit_wait,
                         slot_type: SlotType::Activity,
+                        capacity_freed: Some(Arc::clone(&self.capacity_freed)),
                     },
                     Arc::clone(&tuner_cfg.tuner),
                     move || {

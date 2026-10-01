@@ -22,7 +22,8 @@ not take it. The timeout then failed the task and fed the circuit breaker.
 - **Capacity wake-up.** While a pool is full, the idle wait of each poll loop
   also wakes on a released permit. This applies to the single-shard loop, the
   multi-shard loop and the Redis-degraded `drain_postgres` fallback. A NOTIFY
-  alone cannot do it, because the backlog sent its NOTIFY long ago.
+  alone cannot do it, because the backlog sent its NOTIFY long ago. A slot
+  tuner tick that grows a pool sends the same wake-up (`TunedSlot::capacity_freed`).
 - **Slot tuner signal.** The tuner grows a full pool when a task waited at
   least 50 ms for its permit. The gate moves a backlog from the permit to
   `PENDING`. When the gate refused a kind, the next dispatch of that kind now

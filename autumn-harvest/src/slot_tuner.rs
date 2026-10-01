@@ -661,6 +661,10 @@ pub struct TunedSlot {
     pub permit_wait_micros: Arc<AtomicU64>,
     /// The bounded label this slot's telemetry is emitted under.
     pub slot_type: SlotType,
+    /// Notified when a tick grows the live target (issue #1787). A worker
+    /// poll loop that waits on a full pool then claims at once. `None`
+    /// sends no wake-up.
+    pub capacity_freed: Option<Arc<tokio::sync::Notify>>,
 }
 
 /// Apply one control-loop tick to a single [`TunedSlot`], given the tick's
@@ -713,6 +717,11 @@ async fn tick_one(
     let (new_target, decision) =
         apply_action(base, action, slot.runtime.min_slots, slot.runtime.max_slots);
     slot.runtime.resize_toward(new_target).await;
+    if slot.runtime.live_target() > current_target
+        && let Some(freed) = &slot.capacity_freed
+    {
+        freed.notify_one();
+    }
     decision
 }
 
@@ -799,6 +808,7 @@ impl TunedSlot {
             runtime,
             permit_wait_micros: Arc::new(AtomicU64::new(0)),
             slot_type,
+            capacity_freed: None,
         }
     }
 }
@@ -1446,6 +1456,37 @@ mod tests {
         // acquire_many(max_slots) must be able to complete for both semaphores.
         let _wf = workflow_semaphore.acquire_many(100).await.unwrap();
         let _act = activity_semaphore.acquire_many(50).await.unwrap();
+    }
+
+    /// A tick that grows the live target wakes the poll loop (issue #1787
+    /// review). Growth adds free permits without a task release, so nothing
+    /// else wakes a loop that waits on a full pool. A hold tick stays quiet.
+    #[tokio::test]
+    async fn a_grow_tick_wakes_the_poll_loop() {
+        struct Scripted(SlotTunerAction);
+        impl SlotTuner for Scripted {
+            fn decide(&self, _observations: &SlotObservations) -> SlotTunerAction {
+                self.0
+            }
+        }
+        let semaphore = Arc::new(Semaphore::new(10));
+        let runtime = TunedSlotRuntime::new(Arc::clone(&semaphore), 4, 2, 10);
+        let freed = Arc::new(tokio::sync::Notify::new());
+        let mut slot = TunedSlot::new_for_test(runtime, SlotType::Activity);
+        slot.capacity_freed = Some(Arc::clone(&freed));
+
+        tick_one(&mut slot, &Scripted(SlotTunerAction::Hold), None).await;
+        assert!(
+            futures::FutureExt::now_or_never(freed.notified()).is_none(),
+            "a hold tick adds no capacity"
+        );
+
+        tick_one(&mut slot, &Scripted(SlotTunerAction::Grow(2)), None).await;
+        assert_eq!(slot.runtime.live_target(), 6);
+        assert!(
+            futures::FutureExt::now_or_never(freed.notified()).is_some(),
+            "a grow tick must wake the poll loop"
+        );
     }
 
     // Same rationale as the sibling test below: the tick count must not
