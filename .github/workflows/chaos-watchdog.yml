@@ -1,0 +1,34 @@
+# Chaos nightly watchdog (issue #1790).
+#
+# chaos.yml did not parse from its first commit, so its nightly cron never
+# fired. No alert told anyone. This workflow opens an issue when no scheduled
+# chaos.yml run succeeds in 48 hours. It is a separate file, so a defect in
+# chaos.yml cannot also stop the alert.
+#
+# The logic is in .github/ci/chaos-watchdog.sh. The chaos_watchdog tests in
+# autumn-harvest/tests/integration run it against a stub `gh`.
+name: Chaos watchdog
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Daily at 10:41 UTC. The chaos.yml nightly starts at 04:17 UTC and has a
+    # 45-minute timeout, so it is complete before this starts.
+    - cron: "41 10 * * *"
+
+permissions:
+  actions: read
+  contents: read
+  issues: write
+
+jobs:
+  watchdog:
+    name: Chaos nightly watchdog
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Alert when no scheduled chaos run succeeded in 48 h
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/ci/chaos-watchdog.sh

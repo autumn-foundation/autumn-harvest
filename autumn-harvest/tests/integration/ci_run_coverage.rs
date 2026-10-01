@@ -196,10 +196,11 @@ const ALLOWLIST_KAFKA_BROKER_REASON: &str = "kafka-feature-gated: DOES run in CI
      vendored librdkafka on macOS/Windows). Not a coverage gap — see the `Run plugin Kafka broker connector tests` step.";
 const ALLOWLIST_WEBHOOKS_IGNORED_REASON: &str = "webhooks-feature-gated — not run in CI (no manifest row) — AND all tests are #[ignore]d \
      (TestDb/run_pending paved-path DB harness); tracked";
-const ALLOWLIST_CHAOS_REASON: &str = "chaos-feature-gated (issue #940): DOES run in CI, via a dedicated \
-     workflow_dispatch + nightly job (.github/workflows/chaos.yml) that runs the suite with >=5 distinct \
-     seeds — NOT the manifest's `test` job (chaos is `#[cfg(feature = \"chaos\")]`, off by default and \
-     seed-driven/slower, so it is deliberately not part of every PR run). Not a coverage gap.";
+const ALLOWLIST_CHAOS_REASON: &str = "chaos-feature-gated (issue #940): not in the manifest's `test` job. \
+     It runs only in the nightly and manual job in .github/workflows/chaos.yml. \
+     `chaos_workflow_runs_the_chaos_suite_nightly` checks that claim. \
+     .github/workflows/chaos-watchdog.yml opens an issue when no nightly run succeeds in 48 h. \
+     Until issue #1790, chaos.yml did not parse, and this suite never ran.";
 const ALLOWLIST_PERF_EVIDENCE_REASON: &str = "manual pg_stat_statements perf-evidence generator (issue #1620): its \
      one test is #[ignore]d by design, run by hand per docs/performance-outbox-start-relay.md's `Reproduce` \
      section against a real local Postgres — no CI run should execute it automatically. Not a coverage gap.";
@@ -309,9 +310,9 @@ const ALLOWLIST: &[(&str, &str)] = &[
 /// a whole-module row), `core:completion_callback_tests`, and
 /// `core:event_batch_tests`. 73 = minus `plugin:workflow_reachability_integration`,
 /// now wired to a covering `linux` manifest row (issue #700).
-/// 75 = plus `core:chaos_tests` (issue #940): a chaos-feature-gated suite that
-/// runs via a dedicated `.github/workflows/chaos.yml` seed-driven job, not the
-/// manifest `test` job — deliberate, not a coverage gap (see the reason above).
+/// 75 = plus `core:chaos_tests` (issue #940). It runs in the nightly
+/// `.github/workflows/chaos.yml` job, not in the manifest `test` job.
+/// `chaos_workflow_runs_the_chaos_suite_nightly` checks that claim.
 const ALLOWLIST_MAX_LEN: usize = 75;
 
 fn allowlisted(key: &str) -> bool {
@@ -1074,7 +1075,7 @@ fn core_module_executes(rows: &[SuiteRow], module: &str, required: &BTreeSet<Str
 /// shrinks. The DB guard above covers the `db` feature separately.
 const FEATURE_GATE_EXEMPT: &[(&str, &str)] = &[(
     "chaos_tests",
-    "chaos-feature-gated: runs in the dedicated nightly chaos.yml job",
+    "chaos-feature-gated: runs only in the nightly job in .github/workflows/chaos.yml",
 )];
 
 /// A suite behind a feature gate can compile in every CI job and still run in
