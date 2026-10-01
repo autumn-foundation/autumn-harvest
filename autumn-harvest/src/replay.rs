@@ -2597,9 +2597,14 @@ impl HistoryMatcher {
                 // awaiting external completion: the worker re-runs
                 // persist_scheduled_external_activity, but record_external_task
                 // is idempotent (ON CONFLICT DO NOTHING).  Skip the duplicate.
+                //
+                // Consume the duplicate too. No other call claims it, and the
+                // end-of-cycle drift guard would otherwise report it as a
+                // skipped call while the activity is still pending (#1791).
                 WorkflowEvent::ActivityAwaitingExternal {
                     activity_id: id, ..
                 } if *id == activity_id => {
+                    self.consumed_out_of_order_events.insert(scan_cursor);
                     scan_cursor += 1;
                 }
                 WorkflowEvent::ChildWorkflowSpawnedDetached { .. } => {
@@ -13868,6 +13873,26 @@ mod tests {
         assert!(matches!(
             m.match_mutex_granted("account-1"),
             MutexGrantMatch::Granted { .. }
+        ));
+        assert_eq!(m.first_unconsumed_command_event(), None);
+    }
+
+    #[test]
+    fn first_unconsumed_command_event_ignores_a_duplicate_external_anchor() {
+        // A signal wake while an external activity is pending writes a
+        // duplicate anchor for the same activity. The scan consumes it.
+        let awaiting = WorkflowEvent::ActivityAwaitingExternal {
+            activity_id: ActivityExecId::new(),
+            token: crate::types::ExternalActivityToken::new(),
+            name: "approve".into(),
+            input: Value::Null,
+            queue: "default".into(),
+            schedule_to_close_secs: 60,
+        };
+        let mut m = HistoryMatcher::new(vec![awaiting.clone(), signal("nudge"), awaiting]);
+        assert!(matches!(
+            m.match_external_activity("approve"),
+            HistoryMatch::AwaitingExternalCompletion { .. }
         ));
         assert_eq!(m.first_unconsumed_command_event(), None);
     }

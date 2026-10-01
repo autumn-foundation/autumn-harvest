@@ -2725,6 +2725,55 @@ mod tests {
         assert_eq!(details.event_index, Some(1));
     }
 
+    /// Awaits one external activity, then completes.
+    fn external_activity_workflow<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            ctx.execute_activity_external("approve", Value::Null, "default", 60)
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    #[tokio::test]
+    async fn signal_wake_while_awaiting_an_external_activity_still_suspends() {
+        // A signal wakes the run while the external activity is pending. The
+        // worker then writes a duplicate `ActivityAwaitingExternal`. The
+        // duplicate is not drift, so the cycle must park.
+        let activity_id = ActivityExecId::new();
+        let token = crate::types::ExternalActivityToken::new();
+        let awaiting = WorkflowEvent::ActivityAwaitingExternal {
+            activity_id,
+            token,
+            name: "approve".to_string(),
+            input: Value::Null,
+            queue: "default".to_string(),
+            schedule_to_close_secs: 60,
+        };
+        let history = vec![
+            started(),
+            awaiting.clone(),
+            WorkflowEvent::SignalReceived {
+                signal_name: "nudge".to_string(),
+                payload: Value::Null,
+            },
+            awaiting,
+        ];
+        let outcome = run_workflow(
+            ExecutionId::new(),
+            history,
+            external_activity_workflow,
+            Value::Null,
+        )
+        .await;
+        assert!(
+            matches!(outcome, WorkflowOutcome::Suspended { .. }),
+            "{outcome:?}"
+        );
+    }
+
     #[tokio::test]
     async fn completion_that_skips_a_stashed_external_signal_is_an_nd_failure() {
         // The drive drains the request into the external stash. The guard
