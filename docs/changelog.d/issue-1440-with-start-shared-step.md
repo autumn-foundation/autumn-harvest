@@ -1,4 +1,4 @@
-## Phase 6.1 — Share the with-start admission step (issue #1440)
+## Engine — Shared with-start admission step (issue #1440)
 
 Signal-with-start and update-with-start no longer duplicate their start path.
 
