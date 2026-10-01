@@ -194,6 +194,38 @@ The capability-miss release still keys on `(worker_id, crash_strikes)`. It runs 
 
 A formal model of this protocol is tracked in issue #1819.
 
+**10. Retry budget per activity type (issue #1793)**
+
+A retry policy limits the retries of one task. A retry budget limits the retries of one activity type in aggregate. It stops retries from multiplying the load on a dependency during a brownout. `retry_budget.rs` holds the bucket. `process_activity_task` in `worker.rs` holds the gate.
+
+*Bucket.* Each worker process keeps one token bucket for each activity type. `RetryBudgetPolicy` sets three values:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `ratio` | `0.1` | Tokens that each first attempt deposits. |
+| `max_tokens` | `10.0` | Capacity. The bucket starts full. |
+| `min_retries_per_sec` | `1.0` | Tokens that time adds each second. |
+
+*Rules.*
+
+1. A claim with `attempt == 1` is a first attempt. It always runs and deposits `ratio` tokens.
+2. A claim with `attempt > 1` is a retry. An orphan re-claim is a retry too. A retry runs only if it can spend one token.
+3. The bucket never holds more than `max_tokens`.
+4. Only a real call is gated. A `CircuitOpen` short-circuit spends nothing.
+5. An attempt that does not run gives its tokens back. This applies to a rate-limit deferral and a no-op start.
+
+So the retries that run in a window of `T` seconds are at most `max_tokens + ratio × first_attempts + min_retries_per_sec × T`.
+
+*Deferral.* An empty bucket defers the retry. The worker calls `defer_claimed_rate_limited_task`, the same fenced write as a rate-limit deferral. The row goes back to `PENDING` at a later `scheduled_at`. The write lowers `attempt` again and keeps `error`. No event is appended. The delay is the time to the next refill token. Each later deferral waits one more refill interval, so deferred retries do not wake in a herd. No delay is shorter than 50 ms or longer than 30 s. A deferral of a rate-limited activity without a circuit breaker refunds the claim-time rate-limit token.
+
+*A deferred retry is never lost.* The row stays in the queue until a worker runs it. The deferral does not use an attempt and does not move the task to the DLQ. Only the existing activity timeouts can end a deferred retry. For example, a `schedule_to_close` deadline that passes during a deferral times the activity out. The timeout is recorded as an ordinary `ActivityTimedOut` event.
+
+*Configuration.* The budget is on by default. `WorkerConfig::with_retry_budget` takes a `RetryBudgetConfig`. `with_default` sets the policy for all types. `with_activity(name, policy)` overrides one type, and `None` turns the budget off for that type. `RetryBudgetConfig::disabled()` turns it off everywhere. `GET /admin/config` reports the default policy and the number of overrides.
+
+*Scope.* The state is in process, like the circuit breaker. N workers allow up to N budgets. The event log is not touched, so replay is unaffected. Local activities retry inline, outside the queue, so the budget does not gate them. The SQLite backend does not use this path.
+
+*Metrics.* The gauge `harvest.retry.budget.available{activity}` shows the tokens left. The counter `harvest.retry.budget.exhausted{activity}` counts deferrals. Prometheus exports the counter as `harvest_retry_budget_exhausted_total`. See [`telemetry.md`](telemetry.md#metric-catalogue-adr-0001-7).
+
 ### Sharding
 
 Harvest can spread workflow state across N independent Postgres databases. A single workflow's event log, task queue rows, timers, signals, and DLQ entries all live on the same shard, so per-workflow ACID guarantees are preserved without cross-shard transactions. Cross-shard rebalancing of existing workflows is out of scope.
@@ -273,6 +305,7 @@ Current implementation scope: `ExecutionId`/`ShardId` encoding, `ShardRouter`, `
 | `metrics_rs_adapter.rs` | 4 | `metrics-rs` feature flag adapter: `MetricsRsRecorder` bridges `MetricsRecorder` → `metrics` crate global registry. See `docs/telemetry.md` for recipe. |
 | `poison_pill.rs` | 3.17 | Poison-pill task quarantine (issue #367): pure `quarantine_decision`/`ReclaimAction` (no DB dep), `orphaned_running_tasks_query` (worker-liveness reclaim, independent of per-task timeouts), `reclaim_orphaned_tasks` (increment `crash_strikes`, requeue-or-quarantine), `spawn_poison_pill_reclaimer`. Quarantine → `harvest_dead_letters` with `DeadLetterReason::PoisonPill` + terminal `WorkflowFailed` (no new event variant). `WorkerConfig::poison_pill_threshold` (default 3, 0 disables). Shard-local. |
 | `circuit_breaker.rs` | 3.18 | Per-activity circuit breaker (issue #369): `CircuitBreakerRegistry` (closed/open/half-open, rolling-window failure count, single half-open probe, `on_dispatch`/`on_result`, `force_open`/`force_close`, `snapshot`/`list`), `CircuitPhase`, `DispatchDecision`, `CircuitTransition`, `CircuitSnapshot`. Pure/in-process, per-shard; consulted by the worker before dispatch and shared with the management API via `HandlerRegistry::circuit_breakers()`. No new event variant, no migration. |
+| `retry_budget.rs` | 3.18 | Per-activity-type retry budget (issue #1793): `RetryBudgetConfig`, `RetryBudgetRegistry` (`admit`/`release`/`available`), `Admission`, `BudgetTicket`. In process, per worker. The worker consults it before dispatch and defers a retry when the bucket is empty. See design decision 10. No new event variant, no migration. |
 | `slot_tuner.rs` | 3.42 | Adaptive worker dispatch-slot tuner (issue #548): `SlotTuner` trait, `DefaultSlotTuner` (pool-pressure shrink / saturated-and-waiting grow / hold), `SlotTunerConfig { min_slots, max_slots, tuner }` (`::new`/`::with_tuner`), pure helpers `initial_target`/`apply_action`/`validate_band`/`tuned_available`, `TunedSlotRuntime` (owns withheld `OwnedSemaphorePermit`s; `resize_toward`/`release_all_withheld`), `spawn_slot_tuner_loop`. Opt-in via `WorkerConfig::with_slot_tuner`; `None` (default) is byte-identical to the pre-#548 fixed-concurrency semaphore. No new event variant, no migration, no replay surface — purely an in-process semaphore control constructed inside `worker.rs::spawn_monitoring_tasks` (never stored on `Worker` itself, to avoid clippy's significant-drop propagation into every `Worker`-holding test). See [`docs/operations/adaptive-slot-tuner.md`](operations/adaptive-slot-tuner.md). |
 | `migrations/` | 1 | SQL -- run with `diesel migration run` |
 
