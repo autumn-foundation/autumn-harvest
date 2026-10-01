@@ -74,6 +74,9 @@ point. At that point it decides to **create** a new execution. Only
   result whose `error` starts with `load shed on queue`. An atomic batch whose
   only rejections are sheds answers `429` with `Retry-After` and inserts
   nothing. An atomic batch with a manual-gate block keeps its `409`.
+- The queue can trip while an atomic batch starts its items. The batch then
+  stops at the shed item and answers `429` with `Retry-After`. Items started
+  before it stay started, as for any other atomic start failure.
 - `POST /workflows/{id}/rerun`.
 
 A start that both gates match gets the manual gate's `503`.

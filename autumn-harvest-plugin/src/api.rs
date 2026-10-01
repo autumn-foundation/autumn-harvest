@@ -20479,6 +20479,14 @@ async fn batch_start_workflows(
                     }
                     rejected_count += 1;
                     let err_str = e.to_string();
+                    // The queue can trip between Phase 1 and this start (issue
+                    // #1794). A shed keeps its 429 and `Retry-After` here too.
+                    let shed_retry_after = match &e {
+                        HarvestError::LoadShed {
+                            retry_after_secs, ..
+                        } => Some(*retry_after_secs),
+                        _ => None,
+                    };
                     results.push(BatchStartItemResult {
                         index: *idx,
                         workflow_id: Some(workflow_id.clone()),
@@ -20495,12 +20503,21 @@ async fn batch_start_workflows(
                             &source,
                             request_id.as_deref(),
                             route,
-                            "atomic batch rejected: start failure",
+                            if shed_retry_after.is_some() {
+                                "atomic batch rejected: item shed"
+                            } else {
+                                "atomic batch rejected: start failure"
+                            },
                         )
                         .await;
                         results.sort_by_key(|r| r.index);
-                        return (
-                            StatusCode::CONFLICT,
+                        let status = if shed_retry_after.is_some() {
+                            StatusCode::TOO_MANY_REQUESTS
+                        } else {
+                            StatusCode::CONFLICT
+                        };
+                        let mut response = (
+                            status,
                             Json(BatchStartRejectedResponse {
                                 message: format!(
                                     "atomic batch aborted: item {idx} failed: {err_str}"
@@ -20509,6 +20526,13 @@ async fn batch_start_workflows(
                             }),
                         )
                             .into_response();
+                        if let Some(secs) = shed_retry_after {
+                            response.headers_mut().insert(
+                                axum::http::header::RETRY_AFTER,
+                                axum::http::HeaderValue::from(secs),
+                            );
+                        }
+                        return response;
                     }
                 }
             }

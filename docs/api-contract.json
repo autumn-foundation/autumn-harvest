@@ -4972,7 +4972,7 @@
         },
         {
           "status": 429,
-          "description": "atomic=true and every rejected item was refused by automatic load shedding (issue #1794). No execution is inserted. Body is {\"message\", \"rejected\"} like the 409. With atomic=false, a shed item is instead a per-item rejected result in the 200 body whose error starts with 'load shed on queue'.",
+          "description": "atomic=true and every rejected item was refused by automatic load shedding (issue #1794). No execution is inserted. Body is {\"message\", \"rejected\"} like the 409. With atomic=false, a shed item is instead a per-item rejected result in the 200 body whose error starts with 'load shed on queue'. If the queue trips while an atomic batch starts its items, the batch stops at the shed item and also answers 429 with Retry-After; items started before it stay started and are listed in the body.",
           "headers": [
             {
               "name": "Retry-After",
