@@ -1187,6 +1187,12 @@ async fn build_unexported_index(
 ) -> crate::error::HarvestResult<()> {
     use diesel_async::RunQueryDsl;
 
+    #[derive(diesel::QueryableByName)]
+    struct Setting {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        value: String,
+    }
+
     // Re-check under the lock: another exporter may have finished the build.
     match unexported_index_valid(conn).await? {
         Some(true) => return Ok(()),
@@ -1200,6 +1206,16 @@ async fn build_unexported_index(
     }
     tracing::info!("[audit_export] building harvest_audit_log_unexported_idx (issue #1667)");
     // A pool or role timeout shorter than the build would fail it on every try.
+    // Restore the exact value afterwards: the pool reuses this session.
+    let previous: Vec<Setting> =
+        diesel::sql_query("SELECT current_setting('statement_timeout') AS value")
+            .load(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+    let previous = previous
+        .into_iter()
+        .next()
+        .map_or_else(|| "0".to_owned(), |row| row.value);
     diesel::sql_query("SET statement_timeout = 0")
         .execute(conn)
         .await
@@ -1211,7 +1227,8 @@ async fn build_unexported_index(
     .execute(conn)
     .await
     .map_err(crate::error::database_error);
-    let reset = diesel::sql_query("RESET statement_timeout")
+    let reset = diesel::sql_query("SELECT set_config('statement_timeout', $1, false)")
+        .bind::<diesel::sql_types::Text, _>(previous)
         .execute(conn)
         .await
         .map_err(crate::error::database_error);
@@ -1259,12 +1276,23 @@ fn index_build_finished(shard_id: i32, succeeded: bool) {
     }
 }
 
+/// Smallest pool that can lend a connection to a long build.
+///
+/// A smaller pool would starve the export or other workers for the whole
+/// build. Such a pool builds inline on the tick connection instead.
+#[cfg(feature = "db")]
+const MIN_POOL_FOR_BACKGROUND_BUILD: usize = 4;
+
 /// Start the index build in a detached task, off the export tick (issue #1667).
 ///
 /// The build can take minutes on a large table. It must not delay a claim,
 /// the lag gauge or the lease. The task uses its own pooled connection. A
 /// failure drops that connection and waits [`INDEX_BUILD_RETRY`]. Export is
 /// correct without the index, only slower.
+///
+/// A pool under [`MIN_POOL_FOR_BACKGROUND_BUILD`] connections builds inline on
+/// the tick connection. The tick then pauses for the build, but no other
+/// session loses a connection.
 #[cfg(feature = "db")]
 async fn spawn_unexported_index_build_if_due(
     pool: &crate::worker::DbPool,
@@ -1285,6 +1313,18 @@ async fn spawn_unexported_index_build_if_due(
             tracing::warn!(shard = shard_id, %error, "[audit_export] could not inspect the claim-scan index");
             return;
         }
+    }
+    if pool.status().max_size < MIN_POOL_FOR_BACKGROUND_BUILD {
+        let built = ensure_unexported_index(conn).await;
+        index_build_finished(shard_id, built.is_ok());
+        if let Err(error) = built {
+            tracing::warn!(
+                shard = shard_id,
+                %error,
+                "[audit_export] could not build the claim-scan index; export continues without it"
+            );
+        }
+        return;
     }
     let pool = pool.clone();
     tokio::spawn(async move {

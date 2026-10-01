@@ -5384,3 +5384,96 @@ async fn ensure_releases_the_build_lock() {
         .expect("lock");
     assert!(got.into_iter().next().is_some_and(|row| row.got));
 }
+
+#[derive(diesel::QueryableByName)]
+struct Setting {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    value: String,
+}
+
+async fn setting(conn: &mut diesel_async::AsyncPgConnection, name: &str) -> String {
+    let rows: Vec<Setting> =
+        diesel::sql_query(format!("SELECT current_setting('{name}') AS value"))
+            .load(conn)
+            .await
+            .expect("setting");
+    rows.into_iter().next().expect("one row").value
+}
+
+#[tokio::test]
+async fn the_build_restores_the_sessions_statement_timeout() {
+    let (mut conn, _url, _c) = make_conn_any().await;
+    conn.batch_execute("SET statement_timeout = '7s'")
+        .await
+        .expect("set timeout");
+    autumn_harvest::audit_export::ensure_unexported_index(&mut conn)
+        .await
+        .expect("ensure");
+    assert_eq!(setting(&mut conn, "statement_timeout").await, "7s");
+}
+
+/// A held table lock must fail the migration fast, not queue traffic behind it.
+#[tokio::test]
+async fn the_lazy_migration_gives_up_on_a_held_table_lock() {
+    let (mut conn, url, _c) = make_conn_any().await;
+    create_unexported_idx(&mut conn).await;
+    let mut holder = diesel_async::AsyncPgConnection::establish(&url)
+        .await
+        .expect("second session");
+    holder
+        .batch_execute("BEGIN; LOCK TABLE harvest_audit_log IN ACCESS SHARE MODE;")
+        .await
+        .expect("hold lock");
+    let started = std::time::Instant::now();
+    let result = conn.batch_execute(LAZY_IDX_MIGRATION).await;
+    assert!(result.is_err(), "the migration must fail on lock timeout");
+    assert!(started.elapsed() < std::time::Duration::from_secs(15));
+    holder.batch_execute("ROLLBACK").await.expect("rollback");
+    assert_eq!(unexported_idx_state(&mut conn).await, Some(true));
+}
+
+/// With a pool of four, a slow build must not hold up delivery.
+#[tokio::test]
+async fn export_delivers_while_the_background_build_waits() {
+    let _guard = TEST_SERIAL.lock().await;
+    let sink = install(Arc::new(RecordingSink::new(200)), 100);
+    let (mut conn, url, _c) = make_conn_any().await;
+    insert_audit_rows(&mut conn, 3).await;
+    // An older open transaction makes the build wait for its snapshot.
+    let mut old_txn = diesel_async::AsyncPgConnection::establish(&url)
+        .await
+        .expect("second session");
+    old_txn
+        .batch_execute("BEGIN; SELECT txid_current();")
+        .await
+        .expect("open transaction");
+    let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+        diesel_async::AsyncPgConnection,
+    >::new(url);
+    let pool = autumn_harvest::worker::DbPool::builder(manager)
+        .max_size(4)
+        .build()
+        .expect("pool");
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let handle = autumn_harvest::audit_export::spawn_audit_export_checker_for_shard(
+        pool,
+        cancel.clone(),
+        std::time::Duration::from_millis(20),
+        Arc::new(autumn_harvest::telemetry::TelemetryConfig::default()),
+        Some(ShardId::new(0)),
+        None,
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while sink.all_seqs().len() < 3 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "delivery must not wait for the index build"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(unexported_idx_state(&mut conn).await, Some(false));
+    old_txn.batch_execute("COMMIT").await.expect("commit");
+    cancel.cancel();
+    let _ = handle.await;
+    uninstall();
+}
