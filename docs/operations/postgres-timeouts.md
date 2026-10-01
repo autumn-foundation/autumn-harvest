@@ -30,7 +30,8 @@ pool's deadpool `wait` timeout as its bound. A pool with no `wait` timeout gets
 A timeout returns `HarvestError::PoolAcquireTimeout`. A claim that times out
 reports no work, and the poll loop tries again. A failed fleet registration
 arms the heartbeat retry. The write of an executed activity's result makes up
-to 10 bounded tries, so a short pool incident does not drop the result.
+to 10 tries. Each try spans at least the pool bound, so a short pool incident
+or outage does not drop the result.
 
 `harvest.db.pool_acquire_timeout{site}` counts the timeouts that matter most.
 `site` is `claim` or `heartbeat_flush`. Other sites log the error only.

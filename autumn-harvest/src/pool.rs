@@ -398,9 +398,11 @@ pub async fn acquire_within_pool_bound(pool: &crate::worker::DbPool) -> HarvestR
 /// Get a connection for a write that must not be lost, such as an executed
 /// activity result.
 ///
-/// Makes up to `attempts` tries, each within [`acquire_bound`]. A short pool
-/// incident then delays the write but does not drop it. The worst-case wait is
-/// `attempts` times the bound.
+/// Makes up to `attempts` tries, each within [`acquire_bound`]. A try that
+/// fails early, for example on a refused connect, waits out the rest of its
+/// bound before the next try. The tries then always span about `attempts`
+/// times the bound. A short pool incident or outage delays the write but does
+/// not drop it.
 ///
 /// # Errors
 ///
@@ -411,12 +413,15 @@ pub async fn acquire_with_retries(
     attempts: u32,
 ) -> HarvestResult<PooledConn> {
     let attempts = attempts.max(1);
+    let bound = acquire_bound(pool);
     let mut attempt = 1;
     loop {
-        match acquire_within_pool_bound(pool).await {
+        let started = tokio::time::Instant::now();
+        match acquire(pool, bound).await {
             Ok(conn) => return Ok(conn),
             Err(error) if attempt < attempts => {
                 tracing::warn!(attempt, attempts, error = %error, "pool acquire failed; trying again");
+                tokio::time::sleep_until(started + bound).await;
                 attempt += 1;
             }
             Err(error) => return Err(error),
@@ -797,6 +802,31 @@ mod tests {
         assert!(err.is_pool_acquire_timeout(), "{err}");
         assert!(
             started.elapsed() >= Duration::from_millis(300),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A refused connect fails at once. The retries still spread over the
+    /// bound, so they can ride out a short outage.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn acquire_with_retries_waits_out_an_immediate_failure() {
+        let pool = engine_pool(
+            "postgres://refused@127.0.0.1:1/refused",
+            1,
+            DbRole::Hot,
+            &timeouts_with_pool(100),
+        )
+        .expect("pool builds without connecting");
+
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(Duration::from_secs(10), acquire_with_retries(&pool, 3))
+            .await
+            .expect("three bounded attempts must end");
+        assert!(outcome.is_err(), "nothing listens on port 1");
+        assert!(
+            started.elapsed() >= Duration::from_millis(200),
             "{:?}",
             started.elapsed()
         );
