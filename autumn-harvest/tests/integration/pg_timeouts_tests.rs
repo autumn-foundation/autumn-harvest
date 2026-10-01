@@ -1076,6 +1076,77 @@ async fn an_invalid_retry_policy_failure_retries_after_a_lost_connection() {
     assert_eq!(state, "FAILED");
 }
 
+/// A start that fails on a lost connection still refunds its rate-limit
+/// token. The dead connection cannot run the refund, so the refund needs a new
+/// connection.
+#[tokio::test]
+async fn a_start_error_on_a_lost_connection_still_refunds_the_token() {
+    #[derive(diesel::QueryableByName)]
+    struct Tokens {
+        #[diesel(sql_type = diesel::sql_types::Double)]
+        tokens: f64,
+    }
+    #[derive(diesel::QueryableByName)]
+    struct Pid {
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        pid: i32,
+    }
+
+    let (url, _container) = setup_db().await;
+    let mut admin = connect(&url).await;
+    let key = format!("rl-lost-{}", Uuid::new_v4().simple());
+    autumn_harvest::queue::ensure_rate_limit_bucket(&mut admin, &key, 0.0, 1.0)
+        .await
+        .expect("create the bucket");
+    assert!(
+        autumn_harvest::queue::try_consume_rate_limit_token(&mut admin, &key)
+            .await
+            .expect("debit the token"),
+        "the bucket starts with one token"
+    );
+
+    let pool = engine_pool(
+        url,
+        1,
+        DbRole::Hot,
+        &timeouts(5_000, SessionTimeouts::for_role(DbRole::Hot)),
+    )
+    .expect("engine pool");
+    let mut conn = pool.get().await.expect("engine connection");
+    let pid = diesel::sql_query("SELECT pg_backend_pid() AS pid")
+        .get_result::<Pid>(&mut conn)
+        .await
+        .expect("read the backend pid")
+        .pid;
+    diesel::sql_query("SELECT pg_terminate_backend($1)")
+        .bind::<diesel::sql_types::Integer, _>(pid)
+        .execute(&mut admin)
+        .await
+        .expect("end the pooled session");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    autumn_harvest::worker::refund_after_start_error(
+        &pool,
+        conn,
+        Some(&key),
+        &autumn_harvest::error::HarvestError::Database("connection closed".into()),
+    )
+    .await;
+
+    let tokens = diesel::sql_query("SELECT tokens FROM harvest_rate_limit_buckets WHERE key = $1")
+        .bind::<Text, _>(&key)
+        .get_result::<Tokens>(&mut admin)
+        .await
+        .expect("read the bucket")
+        .tokens;
+    diesel::sql_query("DELETE FROM harvest_rate_limit_buckets WHERE key = $1")
+        .bind::<Text, _>(&key)
+        .execute(&mut admin)
+        .await
+        .expect("drop the bucket");
+    assert!((tokens - 1.0).abs() < 1e-9, "tokens = {tokens}");
+}
+
 async fn task_state(conn: &mut AsyncPgConnection, task_id: Uuid) -> String {
     #[derive(diesel::QueryableByName)]
     struct State {

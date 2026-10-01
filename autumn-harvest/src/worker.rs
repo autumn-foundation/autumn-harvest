@@ -6042,6 +6042,38 @@ async fn refund_debited_token(conn: &mut AsyncPgConnection, debited_key: Option<
     }
 }
 
+/// Refund the token that a failed activity start debited.
+///
+/// The handler did not run, so the token goes back. A lost connection cannot
+/// run the refund (issue #1788). The refund then uses a new connection.
+#[doc(hidden)]
+pub async fn refund_after_start_error(
+    pool: &DbPool,
+    mut conn: crate::pool::PooledConn,
+    debited_key: Option<&str>,
+    error: &HarvestError,
+) {
+    if debited_key.is_none() {
+        return;
+    }
+    if crate::pool::is_connection_lost(error) {
+        // Return the dead connection first. It holds a pool slot.
+        drop(conn);
+        conn = match crate::pool::acquire_within_pool_bound(pool).await {
+            Ok(conn) => conn,
+            Err(acquire_error) => {
+                tracing::warn!(
+                    rate_limit_key = debited_key.unwrap_or_default(),
+                    error = %acquire_error,
+                    "no connection to refund the rate-limit token after a failed activity start"
+                );
+                return;
+            }
+        };
+    }
+    refund_debited_token(&mut conn, debited_key).await;
+}
+
 /// Release the dispatch `token`, then return `error` unchanged.
 ///
 /// Use it on each setup error after `on_dispatch` admitted the attempt and
@@ -15131,7 +15163,7 @@ async fn process_activity_task(
             Ok(started_opt) => started_opt,
             Err(error) => {
                 // Undo the dispatch reservation: the token and the probe.
-                refund_debited_token(&mut conn, debited_key).await;
+                refund_after_start_error(pool, conn, debited_key, &error).await;
                 return Err(release_probe_on_error(
                     &circuit_breakers,
                     activity_name,
@@ -15652,8 +15684,13 @@ async fn process_activity_task(
     // must not drop its result: each acquire is bounded and retried (issue
     // #1788). Acquire only when a write is needed. An activity that committed
     // through `run_transactional` needs none, so it must not wait on the pool.
-    let retry_policy =
-        retry_policy_or_fail_task(pool, task, worker_id, registry.payload_codecs()).await?;
+    // Its outcome is sealed, so it needs no retry policy, and an invalid
+    // policy must not fail it.
+    let retry_policy = if committed_transactionally {
+        None
+    } else {
+        retry_policy_or_fail_task(pool, task, worker_id, registry.payload_codecs()).await?
+    };
 
     // Circuit breaker (issue #369): record this attempt's outcome. A close →
     // open trip (or half-open re-open) and a recovery to closed are surfaced as
