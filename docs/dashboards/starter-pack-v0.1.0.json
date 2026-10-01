@@ -5865,7 +5865,7 @@
               }
             }
           ],
-          "description": "Timeout-checker ticks by election role (issue #1795). One replica per shard should show `leader`. The others show `standby`. The non-standby rate summed over a shard is that shard's scan load: about one tick rate with election, N tick rates without it. A non-zero `fail_open` rate means the lease query fails on that replica, so election is off there. Check the harvest_scanner_leases migration and its grants. Bounded labels: scanner, shard, role (4 values). See docs/runbooks/ha-deployment.md."
+          "description": "Timeout-checker ticks by election role (issue #1795). One replica per shard should show `leader`. The others show `standby`. The non-standby rate summed over a shard is that shard's scan load: about one tick rate with election, N tick rates without it. A non-zero `fail_open` rate means the lease query fails on that replica, so it runs the pass unelected. This differs from `unelected`, where an operator turned election off. Check the harvest_scanner_leases migration, its grants, and lease row locks. Bounded labels: scanner, shard, role (4 values). See docs/runbooks/ha-deployment.md."
         }
       ]
     },

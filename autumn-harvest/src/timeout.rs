@@ -512,9 +512,28 @@ const fn task_timeout_scans() -> [(TimeoutReason, &'static str); 4] {
     ]
 }
 
-/// One keyset page of a task-timeout scan (issue #1795).
+/// The ` AND NOT EXISTS` clauses that leave a row to an earlier reason.
 ///
-/// The page wraps the unchanged predicate as a subquery. The predicate
+/// `higher` holds the predicates of the reasons that come first. A row that
+/// also matches one of them is left to that reason. So a row always gets the
+/// first reason it matches, as in [`find_timed_out_tasks`]. `bound` narrows
+/// each one the same way as the main predicate.
+fn higher_reason_exclusions(higher: &[&str], bound: &str) -> String {
+    use std::fmt::Write as _;
+
+    let mut sql = String::new();
+    for earlier in higher {
+        let _ = write!(
+            sql,
+            " AND NOT EXISTS (SELECT 1 FROM ({earlier}{bound}) h WHERE h.id = q.id)"
+        );
+    }
+    sql
+}
+
+/// The ids of one refill of a task-timeout queue (issue #1795).
+///
+/// The query wraps the unchanged predicate as a subquery. The predicate
 /// consts stay plain, because the backup drill `UNION`s them.
 ///
 /// `OFFSET 0` stops Postgres from pulling the subquery up. Pulled up, the
@@ -522,56 +541,81 @@ const fn task_timeout_scans() -> [(TimeoutReason, &'static str); 4] {
 /// `ORDER BY id LIMIT`. That reads the whole table. Kept apart, the
 /// predicate uses its own partial index.
 ///
-/// The keyset bound `id > $1` goes inside the subquery, ahead of
-/// `OFFSET 0`. Outside, it cannot reach the scan, and each page would sort
-/// the whole expired backlog again. Inside, each page sorts only the rows
-/// past the cursor. Every predicate has one table at its top level, so the
-/// bare `id` is not ambiguous.
+/// The keyset bound `id > $1` goes inside the subquery, where it reaches the
+/// scan. Every predicate has one table at its top level, so the bare `id` is
+/// not ambiguous. The query returns ids only, so the sort stays small.
 ///
-/// `higher` holds the predicates of the reasons that come first. A row that
-/// also matches one of them is left to that reason's page. So a row always
-/// gets the first reason it matches, as in [`find_timed_out_tasks`].
-///
-/// With `after`, `$1` is the last id of the previous page and `$2` is the
+/// With `after`, `$1` is the last id of the previous refill and `$2` is the
 /// limit. Without it, `$1` is the limit.
-fn batched_timeout_query(predicate: &str, higher: &[&str], after: bool) -> String {
-    use std::fmt::Write as _;
-
+fn timeout_refill_query(predicate: &str, higher: &[&str], after: bool) -> String {
     let bound = if after { " AND id > $1" } else { "" };
-    let mut sql = format!("SELECT q.* FROM ({predicate}{bound} OFFSET 0) q WHERE TRUE");
-    for earlier in higher {
-        let _ = write!(
-            sql,
-            " AND NOT EXISTS (SELECT 1 FROM ({earlier}{bound}) h WHERE h.id = q.id)"
-        );
-    }
-    sql.push_str(if after {
-        " ORDER BY q.id LIMIT $2"
-    } else {
-        " ORDER BY q.id LIMIT $1"
-    });
-    sql
+    let limit = if after { "$2" } else { "$1" };
+    let exclusions = higher_reason_exclusions(higher, bound);
+    format!(
+        "SELECT q.id FROM ({predicate}{bound} OFFSET 0) q WHERE TRUE{exclusions} \
+         ORDER BY q.id LIMIT {limit}"
+    )
+}
+
+/// The rows of one batch of queued ids (issue #1795).
+///
+/// `$1` is the batch of ids. A primary-key lookup finds them, so the work is
+/// bounded by the batch. The predicate and the earlier-reason exclusions are
+/// checked again, because a queued row can stop matching before its turn.
+fn timeout_batch_query(predicate: &str, higher: &[&str]) -> String {
+    let bound = " AND id = ANY($1)";
+    let exclusions = higher_reason_exclusions(higher, bound);
+    format!("SELECT q.* FROM ({predicate}{bound} OFFSET 0) q WHERE TRUE{exclusions} ORDER BY q.id")
+}
+
+/// Batches of ids one refill queues, per timeout reason.
+///
+/// A refill scans every row the reason's index range holds. Queuing many
+/// batches per refill spreads that cost over many passes. So draining a
+/// backlog does not repeat the scan on every pass.
+const REFILL_BATCHES: i64 = 64;
+
+/// Most ids one timeout reason queues, whatever the batch size.
+const MAX_QUEUED_IDS: i64 = 100_000;
+
+/// One timeout reason's place in its sweep.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TimeoutScanLane {
+    /// The last id of the last full refill. `None` starts at the lowest id.
+    after: Option<uuid::Uuid>,
+    /// Expired ids from the last refill, in id order, not yet handed out.
+    queued: std::collections::VecDeque<uuid::Uuid>,
 }
 
 /// Where the next batched task-timeout scan starts (issue #1795).
 ///
-/// One keyset position per timeout reason. A full page moves the position to
-/// its last id. A short page resets it, so the next sweep starts again at the
-/// lowest id. A sweep reaches every row that stays expired within
-/// `ceil(rows / limit) + 1` passes. A row that expires behind the position
-/// waits for the next sweep.
+/// One lane per timeout reason. When a lane runs empty, one scan queues up
+/// to [`REFILL_BATCHES`] batches of expired ids, in id order, past the
+/// lane's keyset position. Each pass then takes one batch from the queue and
+/// loads it by primary key. A full refill moves the position to its last id.
+/// A short refill resets it, so the next sweep starts again at the lowest id.
 ///
-/// A failed pass still moves the position. So one bad row cannot block the
-/// rows behind it. Rows that the failed pass did not reach wait for the next
+/// A sweep reaches every row that stays expired. A row that expires behind
+/// the position waits for the next sweep. A queued row that stops matching
+/// is dropped when its batch loads.
+///
+/// A failed pass still moves the lane. So one bad row cannot block the rows
+/// behind it. Rows that the failed pass did not reach wait for the next
 /// sweep.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TimeoutScanCursor {
-    after: [Option<uuid::Uuid>; 4],
+    lanes: [TimeoutScanLane; 4],
+}
+
+#[derive(diesel::QueryableByName)]
+struct QueuedId {
+    #[diesel(sql_type = diesel::sql_types::Uuid)]
+    id: uuid::Uuid,
 }
 
 /// Bounded form of [`find_timed_out_tasks`] (issue #1795).
 ///
-/// Reads at most `limit` rows per timeout reason, from `cursor` onward, and
+/// Returns at most `limit` rows per timeout reason, from `cursor` onward, and
 /// moves `cursor`. A `limit` below 1 counts as 1.
 ///
 /// # Errors
@@ -583,36 +627,51 @@ pub async fn find_timed_out_tasks_batch(
     limit: i64,
 ) -> HarvestResult<Vec<(TaskQueueItem, TimeoutReason)>> {
     let limit = limit.max(1);
+    let refill = limit
+        .saturating_mul(REFILL_BATCHES)
+        .min(MAX_QUEUED_IDS)
+        .max(limit);
     let mut results = Vec::new();
     let mut seen = HashSet::new();
 
     let scans = task_timeout_scans();
     let predicates = scans.clone().map(|(_, predicate)| predicate);
-    for (index, (after, (reason, predicate))) in cursor.after.iter_mut().zip(scans).enumerate() {
+    for (index, (lane, (reason, predicate))) in cursor.lanes.iter_mut().zip(scans).enumerate() {
         let higher = &predicates[..index];
-        let page: Vec<TaskQueueItem> = match *after {
-            Some(id) => {
-                diesel::sql_query(batched_timeout_query(predicate, higher, true))
-                    .bind::<diesel::sql_types::Uuid, _>(id)
-                    .bind::<diesel::sql_types::BigInt, _>(limit)
-                    .load(conn)
-                    .await
+        if lane.queued.is_empty() {
+            let ids: Vec<QueuedId> = match lane.after {
+                Some(id) => {
+                    diesel::sql_query(timeout_refill_query(predicate, higher, true))
+                        .bind::<diesel::sql_types::Uuid, _>(id)
+                        .bind::<diesel::sql_types::BigInt, _>(refill)
+                        .load(conn)
+                        .await
+                }
+                None => {
+                    diesel::sql_query(timeout_refill_query(predicate, higher, false))
+                        .bind::<diesel::sql_types::BigInt, _>(refill)
+                        .load(conn)
+                        .await
+                }
             }
-            None => {
-                diesel::sql_query(batched_timeout_query(predicate, higher, false))
-                    .bind::<diesel::sql_types::BigInt, _>(limit)
-                    .load(conn)
-                    .await
-            }
+            .map_err(crate::error::database_error)?;
+            let full = i64::try_from(ids.len()).is_ok_and(|n| n >= refill);
+            lane.after = if full { ids.last().map(|r| r.id) } else { None };
+            lane.queued.extend(ids.into_iter().map(|r| r.id));
         }
-        .map_err(crate::error::database_error)?;
 
-        let full = i64::try_from(page.len()).is_ok_and(|n| n >= limit);
-        *after = if full {
-            page.last().map(|t| t.id)
-        } else {
-            None
-        };
+        let take = usize::try_from(limit)
+            .unwrap_or(usize::MAX)
+            .min(lane.queued.len());
+        if take == 0 {
+            continue;
+        }
+        let batch: Vec<uuid::Uuid> = lane.queued.drain(..take).collect();
+        let page: Vec<TaskQueueItem> = diesel::sql_query(timeout_batch_query(predicate, higher))
+            .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&batch)
+            .load(conn)
+            .await
+            .map_err(crate::error::database_error)?;
         for task in page {
             if seen.insert(task.id) {
                 results.push((task, reason.clone()));
@@ -6163,37 +6222,42 @@ mod tests {
     }
 
     #[test]
-    fn batched_timeout_query_wraps_the_predicate_in_a_keyset_page() {
+    fn refill_query_wraps_the_predicate_in_a_keyset_page_of_ids() {
         let predicate = start_to_close_timeout_query();
-        let first = batched_timeout_query(predicate, &[], false);
+        let first = timeout_refill_query(predicate, &[], false);
         // `OFFSET 0` keeps the predicate on its own index plan.
-        assert!(first.starts_with(&format!("SELECT q.* FROM ({predicate} OFFSET 0) q")));
+        assert!(first.starts_with(&format!("SELECT q.id FROM ({predicate} OFFSET 0) q")));
         assert!(first.ends_with("ORDER BY q.id LIMIT $1"));
         assert!(!first.contains("$2"));
         // The keyset bound sits inside the subquery, where it reaches the scan.
-        let next = batched_timeout_query(predicate, &[], true);
+        let next = timeout_refill_query(predicate, &[], true);
         assert!(next.starts_with(&format!(
-            "SELECT q.* FROM ({predicate} AND id > $1 OFFSET 0) q"
+            "SELECT q.id FROM ({predicate} AND id > $1 OFFSET 0) q"
         )));
         assert!(next.ends_with("ORDER BY q.id LIMIT $2"));
     }
 
     #[test]
-    fn batched_timeout_query_bounds_the_higher_reasons_too() {
+    fn refill_query_leaves_a_row_to_the_first_reason_it_matches() {
         let higher = heartbeat_timeout_query();
-        let sql = batched_timeout_query(start_to_close_timeout_query(), &[higher], true);
+        let sql = timeout_refill_query(start_to_close_timeout_query(), &[higher], true);
         assert!(sql.contains(&format!(
             "AND NOT EXISTS (SELECT 1 FROM ({higher} AND id > $1) h WHERE h.id = q.id)"
         )));
     }
 
     #[test]
-    fn batched_timeout_query_leaves_a_row_to_the_first_reason_it_matches() {
+    fn batch_query_loads_by_id_and_checks_the_predicate_again() {
+        let predicate = start_to_close_timeout_query();
         let higher = heartbeat_timeout_query();
-        let sql = batched_timeout_query(start_to_close_timeout_query(), &[higher], false);
-        assert!(sql.contains(&format!(
-            "AND NOT EXISTS (SELECT 1 FROM ({higher}) h WHERE h.id = q.id)"
+        let sql = timeout_batch_query(predicate, &[higher]);
+        assert!(sql.starts_with(&format!(
+            "SELECT q.* FROM ({predicate} AND id = ANY($1) OFFSET 0) q"
         )));
+        assert!(sql.contains(&format!(
+            "AND NOT EXISTS (SELECT 1 FROM ({higher} AND id = ANY($1)) h WHERE h.id = q.id)"
+        )));
+        assert!(!sql.contains("LIMIT"));
     }
 
     #[test]

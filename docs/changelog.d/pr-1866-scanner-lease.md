@@ -20,11 +20,12 @@ size, so adding workers to clear a backlog added database load in proportion.
 - **Not a fence.** Two holders for a short time are safe, because every
   sub-pass is already safe with concurrent runners.
 - **Bounded scans.** The checker enforces at most one batch per timeout
-  reason per pass (default 500). A keyset cursor walks the backlog in `id`
-  order and wraps at the end, so a row that stays expired cannot starve the
-  rest. `OFFSET 0` keeps each predicate on its own partial index. The keyset
-  bound sits inside that subquery, so a page sorts only the rows past the
-  cursor. A row that
+  reason per pass (default 500). One scan queues up to 64 batches of expired
+  ids, and each pass loads one batch by primary key and checks it again. So
+  draining a backlog does not repeat the full scan on every pass. A keyset
+  cursor walks the backlog in `id` order and wraps at the end, so a row that
+  stays expired cannot starve the rest. `OFFSET 0` keeps each predicate on
+  its own partial index, with the keyset bound inside the subquery. A row that
   matches two reasons gets the first one, as in the full scan. The four
   predicate consts are unchanged, so the backup drill's `UNION` still works.
   The public `enforce_timeouts_once` keeps its full scan.

@@ -209,10 +209,11 @@ tick.
 
 The four task-timeout scans (heartbeat, start-to-close, schedule-to-start,
 schedule-to-close) return at most one batch per reason per pass (default 500
-rows). A keyset cursor moves through the backlog in `id` order and wraps at
-the end. A sweep reaches every row that stays expired within
-`ceil(rows / batch) + 1` passes. A row that expires behind the cursor waits
-for the next sweep.
+rows). One scan queues up to 64 batches of expired ids, in `id` order. Each
+pass then loads one batch by primary key and checks it again. So draining a
+backlog does not repeat the full scan on every pass. A keyset cursor moves
+through the backlog and wraps at the end. A row that expires behind the
+cursor waits for the next sweep.
 
 A row that matches two reasons gets the first one, in the order above. So
 the recorded timeout type does not depend on where each cursor is.
@@ -262,7 +263,9 @@ sum by (instance, shard) (rate(harvest_scanner_pass_total{scanner="timeout",role
 A standby loop is alive and ready to lead, so the liveness alerts do not
 change.
 
-A non-zero `fail_open` rate means election is off on that replica. Check
+A non-zero `fail_open` rate means the lease query fails on that replica. It
+is not the same as `unelected`, which means an operator turned election off.
+While the query fails, every replica that sees the fault runs the pass. Check
 that the `20261001191830_harvest_scanner_leases` migration ran and that the
 storage role can `SELECT`, `INSERT` and `UPDATE` `harvest_scanner_leases`.
 Check also for a transaction that holds a lease row lock.
