@@ -367,7 +367,9 @@ impl LoadShedder {
 ///
 /// A complete read updates every queue at once, with no await in between.
 /// The audit writes run after that, so a slow audit write cannot leave a
-/// partial sample behind. Each audit write is bounded by one sample interval.
+/// partial sample behind. They run concurrently under one timeout of one
+/// sample interval. A sample therefore ends within three intervals, inside
+/// the staleness bound, whatever the number of transitions.
 #[cfg(feature = "db")]
 pub async fn sample_once(
     shedder: &LoadShedder,
@@ -406,14 +408,16 @@ pub async fn sample_once(
         })
         .collect();
     record_active(shedder, &queues, metrics, now);
-    for (queue, transition, age_secs) in transitions {
-        let write = record_transition(audit_pool, queue, transition, age_secs);
-        if tokio::time::timeout(config.sample_interval(), write)
-            .await
-            .is_err()
-        {
-            tracing::warn!(queue = %queue, "load shed audit write timed out");
-        }
+    let writes = transitions
+        .into_iter()
+        .map(|(queue, transition, age_secs)| {
+            record_transition(audit_pool, queue, transition, age_secs)
+        });
+    if tokio::time::timeout(config.sample_interval(), futures::future::join_all(writes))
+        .await
+        .is_err()
+    {
+        tracing::warn!("load shed audit writes timed out");
     }
     true
 }

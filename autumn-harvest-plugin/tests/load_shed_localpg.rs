@@ -648,7 +648,7 @@ async fn failed_sample_keeps_state() {
 }
 
 /// A hung audit write cannot undo or split a sample. The state change lands
-/// before the audit write, and the write is bounded by one sample interval.
+/// before the audit writes, and the writes share one sample-interval bound.
 #[tokio::test]
 async fn hung_audit_write_keeps_the_committed_state() {
     let Some(url) = db_url() else {
@@ -662,19 +662,47 @@ async fn hung_audit_write_keeps_the_committed_state() {
     let mut conn = pool.get().await.unwrap();
     let metrics = Arc::new(CapturingMetrics::default());
     let (api_state, _app, _cache, _) = seed(&pool, &mut conn, &metrics).await;
-    let fast = LoadShedConfig::new()
-        .with_sample_interval(Duration::from_secs(1))
-        .queue(
-            QUEUE,
-            LoadShedPolicy::new(
-                Duration::from_secs(60),
-                Duration::from_secs(10),
-                Duration::from_secs(7),
-            )
-            .unwrap(),
-        );
-    api_state.gate_cache().load_shedder().configure(fast);
     set_backlog_age(&mut conn, 120).await;
+
+    // Four queues trip in one sample: clone the old task into three more queues.
+    let queues = [QUEUE, "ls_q2", "ls_q3", "ls_q4"];
+    for other in &queues[1..] {
+        for stmt in [
+            "CREATE TEMP TABLE ls_clone AS \
+             SELECT * FROM harvest_task_queue WHERE queue_name = 'default'",
+            "UPDATE ls_clone SET id = gen_random_uuid()",
+        ] {
+            diesel::sql_query(stmt)
+                .execute(&mut conn)
+                .await
+                .expect(stmt);
+        }
+        diesel::sql_query("UPDATE ls_clone SET queue_name = $1")
+            .bind::<Text, _>(*other)
+            .execute(&mut conn)
+            .await
+            .expect("rename clone");
+        for stmt in [
+            "INSERT INTO harvest_task_queue SELECT * FROM ls_clone",
+            "DROP TABLE ls_clone",
+        ] {
+            diesel::sql_query(stmt)
+                .execute(&mut conn)
+                .await
+                .expect(stmt);
+        }
+    }
+    let policy = LoadShedPolicy::new(
+        Duration::from_secs(60),
+        Duration::from_secs(10),
+        Duration::from_secs(7),
+    )
+    .unwrap();
+    let fast = queues.iter().fold(
+        LoadShedConfig::new().with_sample_interval(Duration::from_secs(1)),
+        |config, queue| config.queue(*queue, policy),
+    );
+    api_state.gate_cache().load_shedder().configure(fast);
 
     // An audit pool of one connection, held here, so the audit write waits.
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.as_str());
@@ -694,19 +722,23 @@ async fn hung_audit_write_keeps_the_committed_state() {
     )
     .await;
     assert!(ok, "the read succeeded, so the sample succeeded");
+    // Four writes that each waited a full interval would take 4 s.
+    let elapsed = started.elapsed();
     assert!(
-        started.elapsed() < Duration::from_secs(10),
-        "the audit write must be bounded"
+        elapsed < Duration::from_millis(2_500),
+        "the audit writes must share one bound: {elapsed:?}"
     );
     let cache = api_state.gate_cache();
-    assert!(
-        cache
-            .load_shedder()
-            .check(QUEUE, std::time::Instant::now())
-            .is_some(),
-        "the trip must be committed although its audit write hung"
-    );
-    assert_eq!(metrics.active(), [true]);
+    for queue in queues {
+        assert!(
+            cache
+                .load_shedder()
+                .check(queue, std::time::Instant::now())
+                .is_some(),
+            "{queue}: the trip must be committed although its audit write hung"
+        );
+    }
+    assert_eq!(metrics.active(), [true, true, true, true]);
 }
 
 /// With no policy the shedder never sheds, whatever the backlog.
