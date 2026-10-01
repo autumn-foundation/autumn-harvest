@@ -36,6 +36,10 @@
 //! keeps the `merge=union` manifest sorted + unique (a union-merge artifact is a
 //! benign, one-command-fix CI failure, never a conflict).
 //!
+//! A third assertion (issue #1790) parses `ci.yml` and each workflow that an
+//! `ALLOWLIST` or `FEATURE_GATE_EXEMPT` reason cites. A workflow that does not
+//! parse never runs, so a reason that cites it is false.
+//!
 //! On failure the panic message lists every uncovered test and the exact
 //! manifest line to add.
 
@@ -197,10 +201,11 @@ const ALLOWLIST_KAFKA_BROKER_REASON: &str = "kafka-feature-gated: DOES run in CI
 const ALLOWLIST_WEBHOOKS_IGNORED_REASON: &str = "webhooks-feature-gated — not run in CI (no manifest row) — AND all tests are #[ignore]d \
      (TestDb/run_pending paved-path DB harness); tracked";
 const ALLOWLIST_CHAOS_REASON: &str = "chaos-feature-gated (issue #940): not in the manifest's `test` job. \
-     It runs only in the nightly and manual job in .github/workflows/chaos.yml. \
+     The `chaos` feature is off by default, and the seeded sweep is slow, so each PR does not run it. \
+     It runs only in the nightly and manual job in .github/workflows/chaos.yml, with at least 5 seeds. \
      `chaos_workflow_runs_the_chaos_suite_nightly` checks that claim. \
-     .github/workflows/chaos-watchdog.yml opens an issue when no nightly run succeeds in 48 h. \
-     Until issue #1790, chaos.yml did not parse, and this suite never ran.";
+     .github/workflows/chaos-watchdog.yml opens an issue when no scheduled run succeeds in 48 h. \
+     Before the fix for issue #1790, chaos.yml did not parse, and this suite never ran. Not a coverage gap.";
 const ALLOWLIST_PERF_EVIDENCE_REASON: &str = "manual pg_stat_statements perf-evidence generator (issue #1620): its \
      one test is #[ignore]d by design, run by hand per docs/performance-outbox-start-relay.md's `Reproduce` \
      section against a real local Postgres — no CI run should execute it automatically. Not a coverage gap.";
@@ -1075,7 +1080,7 @@ fn core_module_executes(rows: &[SuiteRow], module: &str, required: &BTreeSet<Str
 /// shrinks. The DB guard above covers the `db` feature separately.
 const FEATURE_GATE_EXEMPT: &[(&str, &str)] = &[(
     "chaos_tests",
-    "chaos-feature-gated: runs only in the nightly job in .github/workflows/chaos.yml",
+    "chaos-feature-gated: runs only in the nightly and manual job in .github/workflows/chaos.yml",
 )];
 
 /// A suite behind a feature gate can compile in every CI job and still run in
@@ -1193,7 +1198,7 @@ fn linux_clone(row: &SuiteRow) -> SuiteRow {
 // ── Every workflow this guard cites must parse (issue #1790) ────────────────
 
 /// The repository root.
-pub(super) fn repo_root() -> PathBuf {
+pub fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..")
 }
 
@@ -1222,13 +1227,13 @@ fn cited_workflows() -> BTreeSet<String> {
 /// Parses workflow text as YAML 1.2, which keeps `on` as a string key.
 ///
 /// `serde_yaml` also rejects a repeated mapping key. GitHub rejects that file
-/// too, but PyYAML keeps the last value and hides the defect.
+/// too, but `PyYAML` keeps the last value and hides the defect.
 fn parse_workflow_text(text: &str) -> Result<serde_yaml::Value, String> {
     serde_yaml::from_str(text).map_err(|e| e.to_string())
 }
 
 /// Reads and parses one workflow. Panics with the path and the parse error.
-pub(super) fn parse_workflow(rel: &str) -> serde_yaml::Value {
+pub fn parse_workflow(rel: &str) -> serde_yaml::Value {
     let text = read_source(&repo_root().join(rel));
     parse_workflow_text(&text).unwrap_or_else(|e| {
         panic!(
@@ -1240,7 +1245,7 @@ pub(super) fn parse_workflow(rel: &str) -> serde_yaml::Value {
 }
 
 /// The `run:` text of every step in every job of a parsed workflow.
-pub(super) fn workflow_run_commands(doc: &serde_yaml::Value) -> Vec<String> {
+pub fn workflow_run_commands(doc: &serde_yaml::Value) -> Vec<String> {
     let Some(jobs) = doc.get("jobs").and_then(serde_yaml::Value::as_mapping) else {
         return Vec::new();
     };
@@ -1253,7 +1258,7 @@ pub(super) fn workflow_run_commands(doc: &serde_yaml::Value) -> Vec<String> {
 }
 
 /// The `cron` strings under a parsed workflow's `on.schedule`.
-pub(super) fn workflow_crons(doc: &serde_yaml::Value) -> Vec<String> {
+pub fn workflow_crons(doc: &serde_yaml::Value) -> Vec<String> {
     doc.get("on")
         .and_then(|on| on.get("schedule"))
         .and_then(serde_yaml::Value::as_sequence)
@@ -1304,12 +1309,61 @@ fn every_cited_workflow_parses_and_has_jobs() {
         cited.contains(".github/workflows/chaos.yml"),
         "the `core:chaos_tests` reason must cite .github/workflows/chaos.yml; found {cited:?}"
     );
+    let all = all_workflows();
     for rel in &cited {
+        assert!(all.contains(rel), "{rel} is cited but is not a workflow file");
+    }
+    for rel in &all {
         let doc = parse_workflow(rel);
         let jobs = doc.get("jobs").and_then(serde_yaml::Value::as_mapping);
         assert!(
             jobs.is_some_and(|j| !j.is_empty()),
             "{rel} must have a non-empty `jobs` mapping"
+        );
+    }
+}
+
+/// Every `.yml` or `.yaml` file in `.github/workflows/`, as a repository path.
+fn all_workflows() -> BTreeSet<String> {
+    BTreeSet::new()
+}
+
+/// True when some step runs the whole `chaos_tests` module with the `chaos`
+/// feature.
+fn runs_the_chaos_suite_unconditionally(doc: &serde_yaml::Value) -> bool {
+    workflow_run_commands(doc)
+        .iter()
+        .any(|r| r.contains("--features chaos") && r.contains("--test integration chaos_tests:: "))
+}
+
+/// Self-test: a gate or a flag that runs nothing must not count as a run.
+#[test]
+fn chaos_suite_check_rejects_gated_and_empty_runs() {
+    let run = "cargo test -p autumn-harvest --features chaos --test integration chaos_tests:: -- --test-threads=1";
+    let workflow = |job_extra: &str, step_extra: &str, run: &str| {
+        let text = format!(
+            "jobs:\n  chaos:\n    runs-on: x\n{job_extra}    steps:\n      - run: '{run}'\n{step_extra}"
+        );
+        parse_workflow_text(&text).expect("synthetic workflow must parse")
+    };
+    assert!(runs_the_chaos_suite_unconditionally(&workflow("", "", run)));
+
+    let job_if = "    if: github.event_name == 'workflow_dispatch'\n";
+    let job_soft = "    continue-on-error: true\n";
+    let step_if = "        if: false\n";
+    let step_soft = "        continue-on-error: true\n";
+    for (job_extra, step_extra) in [(job_if, ""), (job_soft, ""), ("", step_if), ("", step_soft)] {
+        assert!(
+            !runs_the_chaos_suite_unconditionally(&workflow(job_extra, step_extra, run)),
+            "a gate must not count: job {job_extra:?}, step {step_extra:?}"
+        );
+    }
+
+    for flag in ["--no-run", "--exact", "--skip chaos_tests", "--ignored", "--list"] {
+        let flagged = format!("{run} {flag}");
+        assert!(
+            !runs_the_chaos_suite_unconditionally(&workflow("", "", &flagged)),
+            "`{flag}` runs no test or not the whole module, so it must not count"
         );
     }
 }
@@ -1323,12 +1377,11 @@ fn chaos_workflow_runs_the_chaos_suite_nightly() {
         !workflow_crons(&doc).is_empty(),
         "chaos.yml must have an `on.schedule` cron; without one no nightly run exists"
     );
-    let runs = workflow_run_commands(&doc);
     assert!(
-        runs.iter().any(|r| {
-            r.contains("--features chaos") && r.contains("--test integration chaos_tests:: ")
-        }),
+        runs_the_chaos_suite_unconditionally(&doc),
         "chaos.yml must have a step that runs \
-         `--features chaos --test integration chaos_tests:: `; found {runs:?}"
+         `--features chaos --test integration chaos_tests:: ` with no `if`, no \
+         `continue-on-error` and no flag that skips tests; found {:?}",
+        workflow_run_commands(&doc)
     );
 }

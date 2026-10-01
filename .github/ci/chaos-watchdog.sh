@@ -8,8 +8,9 @@
 # A failed `gh` call stops the script with a non-zero exit. The watchdog run
 # then fails, so an API error never reads as "no runs" or as "green".
 #
-# Needs GH_TOKEN with `actions: read` and `issues: write`, GITHUB_REPOSITORY
-# and GITHUB_SERVER_URL. GitHub Actions sets the last two.
+# Needs GH_TOKEN with `actions: read` and `issues: write`, and
+# GITHUB_REPOSITORY. GITHUB_SERVER_URL defaults to https://github.com.
+# GitHub Actions sets both.
 set -euo pipefail
 
 repo="${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is not set}"

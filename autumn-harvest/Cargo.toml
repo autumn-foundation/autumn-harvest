@@ -278,8 +278,9 @@ wat = "1"
 # widening the graph — same rationale as the `tokio-util` dev-dep above.
 proc-macro2 = { workspace = true }
 # Parse `.github/workflows/*.yml` in the `ci_run_coverage` guard (issue #1790).
-# A workflow that does not parse never runs. Already in the lockfile through
-# `autumn-web` at this version, so this unifies and adds no new crate.
+# A workflow that does not parse never runs. `autumn-web` already pulls this
+# version into the lockfile, so this dev-dependency adds no new crate. The crate
+# is deprecated upstream. It is dev-only, so it never ships.
 serde_yaml = "0.9"
 
 # testcontainers pulls bollard -> hyper-util, which uses `tokio::net`. Under a
