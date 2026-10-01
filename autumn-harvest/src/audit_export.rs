@@ -43,8 +43,8 @@
 //! builds it on the first export tick, and a migration drops it from databases
 //! that never ran export. An unconfigured deployment pays no index maintenance
 //! cost. Once export runs, the index size is bounded only while retention
-//! reclaims unexported rows. See `docs/audit-export.md`'s "Retention
-//! interaction" section. Retention can never
+//! reclaims unexported rows. See "Retention interaction" in
+//! `docs/audit-export.md`. Retention can never
 //! purge a decommission or reactivation record, exported or not.
 //!
 //! # Where the monotonic sequence comes from (and why not `BIGSERIAL`)
@@ -1141,7 +1141,7 @@ pub async fn ensure_unexported_index(
         .load(conn)
         .await
         .map_err(crate::error::database_error)?;
-    if !locked.iter().next().is_some_and(|row| row.flag) {
+    if !locked.into_iter().next().is_some_and(|row| row.flag) {
         return Ok(());
     }
     let built = build_unexported_index(conn).await;
@@ -1176,7 +1176,7 @@ async fn unexported_index_valid(
     .load(conn)
     .await
     .map_err(crate::error::database_error)?;
-    Ok(rows.iter().next().map(|row| row.valid))
+    Ok(rows.into_iter().next().map(|row| row.valid))
 }
 
 /// Build the index. The caller holds [`UNEXPORTED_INDEX_LOCK_KEY`].
