@@ -1077,7 +1077,8 @@ per-execution operator action**. Full playbook:
    - `build_id` (the build ID of the worker that observed the divergence)
 3. Diagnose one specific execution on demand against the **currently-deployed**
    code with `POST /api/harvest/workflows/{id}/replay-diagnosis` (issue #614) —
-   it returns the same `{kind, event_index, expected, actual}` vocabulary and,
+   it returns the same `{kind, event_index, expected, actual}` vocabulary (one
+   exception: a skipped recorded command, see the playbook) and,
    after a candidate rollback/fix is deployed, a `clean` verdict confirms the
    run will resume. See the **"Diagnose the divergence"** section of
    [`docs/runbooks/nondeterminism-block.md`](nondeterminism-block.md#diagnose-the-divergence-issue-614)
@@ -1090,10 +1091,13 @@ per-execution operator action**. Full playbook:
 - Code deployment that modifies workflow logic (adding, removing, or reordering activities, signals, timers, or child workflows) without updating the version gate.
 - Side effects that are not wrapped in `WorkflowContext::side_effect()`, such as direct system calls, time queries (`Instant::now()`), or random number generation.
 - Iteration order on non-deterministic collections (like `HashMap` or `HashSet`) in the workflow function.
+- Drift from an earlier deploy that the engine upgrade surfaces (issue #1791). The worker now blocks a cycle that skips a recorded command. The `build_id` is then the current build, and a rollback does not clear the block.
 
 ### False positives
 
-None. A non-determinism mismatch means the workflow code generated a different sequence of commands/actions than what was recorded in history, making replay safety impossible. Author `Err(...)` returns are never classified as divergence — they still fail terminally.
+None for a mismatch. A non-determinism mismatch means the workflow code generated a different sequence of commands/actions than what was recorded in history, making replay safety impossible. Author `Err(...)` returns are never classified as divergence — they still fail terminally.
+
+One misdiagnosis is possible (issue #1791). A workflow body that awaits non-durable work for more than 100 ms during replay can block with `expected: <workflow suspended early>`. Replay-diagnosis then reports `clean`. Move that work into an activity.
 
 ### Safe actions
 
