@@ -1117,6 +1117,15 @@ pub const NYSE_HOLIDAYS_2025_2026: &[&str] = &[
     "2026-12-25", // Christmas
 ];
 
+/// Compiles every Rust fence in `docs/calendars.md` as a doctest (issue #1783).
+///
+/// A fence that drifts from the public API fails `cargo test --doc`.
+/// Mark a fence that cannot compile as `text`, `ignore`, or `no_run`.
+/// A failure names a line in this file, not in the markdown.
+#[cfg(doctest)]
+#[doc = include_str!("../../docs/calendars.md")]
+struct CalendarsDocSnippets;
+
 #[cfg(test)]
 mod tests {
     use super::*;
