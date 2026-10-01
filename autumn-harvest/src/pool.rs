@@ -454,7 +454,7 @@ pub async fn acquire_with_retries(
 /// # Errors
 ///
 /// [`HarvestError::PoolAcquireTimeout`] when the bound elapses.
-/// [`HarvestError::Database`] for any other pool error.
+/// [`HarvestError::PoolAcquireFailed`] for any other pool error.
 #[cfg(feature = "db")]
 pub async fn acquire(
     pool: &crate::worker::DbPool,
@@ -468,7 +468,9 @@ pub async fn acquire(
                 waited: started.elapsed(),
             })
         }
-        Ok(Err(e)) => Err(crate::error::database_error(e)),
+        Ok(Err(e)) => Err(HarvestError::PoolAcquireFailed {
+            reason: e.to_string(),
+        }),
         Err(_elapsed) => Err(HarvestError::PoolAcquireTimeout { waited: bound }),
     }
 }
@@ -786,6 +788,35 @@ mod tests {
             started.elapsed() < Duration::from_secs(2),
             "{:?}",
             started.elapsed()
+        );
+    }
+
+    /// A connect that fails at once is a typed acquire failure, not a plain
+    /// database error. The worker then releases the activity claim.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn acquire_types_an_immediate_connect_failure() {
+        let pool = engine_pool(
+            "postgres://refused@127.0.0.1:1/refused",
+            1,
+            DbRole::Hot,
+            &timeouts_with_pool(1_000),
+        )
+        .expect("pool builds without connecting");
+        let err = acquire(&pool, Duration::from_secs(1))
+            .await
+            .err()
+            .expect("nothing listens on port 1");
+        assert!(
+            matches!(err, HarvestError::PoolAcquireFailed { .. }),
+            "{err}"
+        );
+        assert!(err.is_pool_acquire_failure(), "{err}");
+        assert!(
+            HarvestError::PoolAcquireTimeout {
+                waited: Duration::from_secs(1)
+            }
+            .is_pool_acquire_failure()
         );
     }
 

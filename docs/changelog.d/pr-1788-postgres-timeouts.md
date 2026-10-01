@@ -6,7 +6,8 @@ A full pool or a stuck connection no longer stops claims and heartbeats.
 pool with deadpool `wait` (30 s), `create` (10 s) and `recycle` (5 s) timeouts.
 The workspace enables deadpool's `rt_tokio_1` feature, which these timeouts
 need. `pool::acquire` bounds any pool, also a pool with no deadpool timeouts. A
-timeout is the new typed error `HarvestError::PoolAcquireTimeout`.
+timeout is the new typed error `HarvestError::PoolAcquireTimeout`. Any other
+pool failure, such as a refused connect, is `HarvestError::PoolAcquireFailed`.
 
 **Bounded worker acquires.** Every worker acquire now uses the pool's `wait`
 bound, or 30 s when the pool has none: the single-shard claim, fleet
@@ -36,7 +37,7 @@ tries). A try that fails early waits out its bound, so the tries also ride out
 a short outage. A result write cancelled by a session `statement_timeout`
 or `lock_timeout` runs again, up to 10 times (`pool::is_session_timeout`).
 With a payload offloader there is one try, so no unreferenced blobs pile up. An
-activity task that still fails with a pool acquire timeout or a session timeout
+activity task that still fails to get a connection or hits a session timeout
 has its claim
 released, fenced on `attempt` and `worker_id`, because an activity with no
 deadline would otherwise stay `RUNNING`.

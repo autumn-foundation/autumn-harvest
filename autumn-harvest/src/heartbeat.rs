@@ -101,7 +101,9 @@ pub fn spawn_heartbeat_flusher_with(
 /// # Errors
 ///
 /// [`crate::error::HarvestError::PoolAcquireTimeout`] when the acquire bound
-/// elapses. [`crate::error::HarvestError::Database`] when the write fails.
+/// elapses. [`crate::error::HarvestError::PoolAcquireFailed`] when the pool
+/// fails in another way. [`crate::error::HarvestError::Database`] when the
+/// write fails.
 pub async fn flush_heartbeat(
     pool: &Pool<AsyncPgConnection>,
     task_id: Uuid,

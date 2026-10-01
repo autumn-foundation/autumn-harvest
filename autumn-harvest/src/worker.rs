@@ -31239,15 +31239,16 @@ pub async fn quarantine_workflow_task_timeout(
 /// Whether the dispatch error path releases the claim after `error`.
 ///
 /// A workflow task has no deadline column, so its claim is always released.
-/// An activity can have every deadline unset. After a pool acquire timeout or
+/// An activity can have every deadline unset. After a pool acquire failure or
 /// a session timeout (issue #1788) no scanner would then find it, and the
 /// orphan reclaimer skips a live worker. Release it too. The handler may
 /// already have run, so the activity can run again. That is the
-/// at-least-once contract a crash gives as well.
+/// at-least-once contract a crash gives as well. Another database error is
+/// not released: it may repeat, and a release would skip the retry policy.
 fn releases_claim_after_error(task_type: &str, error: &HarvestError) -> bool {
     task_type == "workflow"
         || (task_type == "activity"
-            && (error.is_pool_acquire_timeout() || crate::pool::is_session_timeout(error)))
+            && (error.is_pool_acquire_failure() || crate::pool::is_session_timeout(error)))
 }
 
 /// Backoff schedule for [`reset_timed_out_workflow_task`]'s pool-connection
@@ -34370,6 +34371,10 @@ mod tests {
             releases_claim_after_error("activity", &session_timeout),
             "a result write that used up its session-timeout retries must not strand"
         );
+        let refused = crate::error::HarvestError::PoolAcquireFailed {
+            reason: "connection refused".into(),
+        };
+        assert!(releases_claim_after_error("activity", &refused));
         assert!(!releases_claim_after_error("activity", &other));
         assert!(releases_claim_after_error("workflow", &timeout));
         assert!(releases_claim_after_error("workflow", &other));
