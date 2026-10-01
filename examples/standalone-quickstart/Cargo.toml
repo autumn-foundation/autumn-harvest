@@ -1,0 +1,16 @@
+[package]
+name = "standalone-quickstart"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+autumn-harvest = { version = "0.6.0", path = "../../autumn-harvest" }
+autumn-harvest-plugin = { version = "0.6.0", path = "../../autumn-harvest-plugin" }
+autumn-web = "0.7"
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+tracing = "0.1"
+
+[dev-dependencies]
+autumn-harvest = { version = "0.6.0", path = "../../autumn-harvest", features = ["testing"] }

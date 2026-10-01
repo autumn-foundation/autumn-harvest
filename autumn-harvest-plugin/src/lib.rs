@@ -90,6 +90,14 @@ pub mod openapi;
 #[cfg(feature = "metrics")]
 pub mod metrics_scrape;
 
+/// Compiles each Rust block in `docs/embedding.md` as a doctest (issue #1614).
+///
+/// Run it with `cargo test -p autumn-harvest-plugin --features metrics,webhooks
+/// --doc EmbeddingDocSnippets`. The `lint` job in CI runs that command.
+#[cfg(all(doctest, feature = "metrics", feature = "webhooks"))]
+#[doc = include_str!("../../docs/embedding.md")]
+pub struct EmbeddingDocSnippets;
+
 pub use api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, StandaloneAdminAuth,
     harvest_api_router, management_api_request_fields, management_api_response_fields,

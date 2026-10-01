@@ -400,6 +400,8 @@ jobs:
         run: cargo clippy -p billing-autumn-web --all-targets -- -D warnings
       - name: Clippy standalone-runner example
         run: cargo clippy -p standalone-runner --all-targets -- -D warnings
+      - name: Clippy standalone-quickstart example (issue #1614)
+        run: cargo clippy -p standalone-quickstart --all-targets -- -D warnings
       # Same issue #962 rule as the verify and redis crates below: a new
       # workspace member gets NO clippy coverage without its own step here.
       # `--no-deps` scopes the deny to the example, because it depends on
@@ -452,6 +454,11 @@ jobs:
       # A docs-only PR skips the `test` matrix, so the doctests run here, ungated.
       - name: Run docs/calendars.md doctests (also on docs-only PRs)
         run: "cargo test -p autumn-harvest --no-default-features --doc calendar::CalendarsDocSnippets"
+
+      # Issue #1614: the `docs/embedding.md` Rust fences compile as doctests.
+      # A docs-only PR skips the `test` matrix, so they run here, ungated.
+      - name: Run docs/embedding.md doctests (also on docs-only PRs)
+        run: cargo test -p autumn-harvest-plugin --features metrics,webhooks --doc EmbeddingDocSnippets
 
       # Issue #966: same reasoning as the step above, for the R&D report's
       # coupling-inventory guards. `docs/rnd/sqlite-feasibility.md` matches BOTH
@@ -579,6 +586,14 @@ jobs:
       # hand. Pure Python stdlib, no deps, no network.
       - name: Quota-lock-ordering clone-class sync (docs/audits/quota-lock-ordering-sync.py)
         run: python3 docs/audits/quota-lock-ordering-sync.py
+
+      # Issue #1614: the standalone getting-started chapter shows the files of
+      # examples/standalone-quickstart byte for byte, and keeps the markers
+      # that the `standalone-chapter` job runs.
+      - name: Standalone chapter sync (docs/audits/standalone-chapter-sync.py)
+        run: |
+          python3 docs/audits/standalone-chapter-sync.py --self-test
+          python3 docs/audits/standalone-chapter-sync.py
 
       # Folio corpus harness: Rust syntax check for every ```rust fence in
       # docs/getting-started/*.md and README.md (see
@@ -976,6 +991,9 @@ jobs:
       - name: Run standalone-runner example tests
         if: needs.changes.outputs.code == 'true' && matrix.shard == 2
         run: cargo test -p standalone-runner
+      - name: Run standalone-quickstart example tests (issue #1614)
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 1
+        run: cargo test -p standalone-quickstart
       - name: Run business_metrics example tests (issue #758)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 0
         run: cargo test -p autumn-harvest --no-default-features --features testing --example business_metrics
@@ -1508,6 +1526,38 @@ jobs:
             sleep 1
           done
           echo "::error::workflow did not reach COMPLETED within the timeout"; exit 1
+
+  standalone-chapter:
+    name: Standalone chapter runs as written (issue #1614)
+    needs: changes
+    # Draft-skip (see lint). A docs-only change still runs this job, because
+    # the chapter's commands are the thing under test.
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    # Matches examples/standalone-quickstart/compose.yaml, so the chapter's
+    # DATABASE_URL connects as written.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: harvest
+          POSTGRES_PASSWORD: harvest
+          POSTGRES_DB: harvest
+        ports:
+          - 5435:5432
+        options: >-
+          --health-cmd "pg_isready -U harvest"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the chapter's crate and the CLI
+        run: cargo build -p standalone-quickstart -p autumn-harvest-cli
+      - name: Run the bash blocks of docs/getting-started/standalone-axum.md
+        run: ./scripts/run-standalone-chapter.sh
 
   openapi-client-smoke:
     name: Generated TypeScript client drives a running plugin

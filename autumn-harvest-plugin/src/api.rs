@@ -1137,6 +1137,9 @@ impl HarvestApiState {
     /// `dev` allows an unauthenticated local management API; every other
     /// profile is treated as non-dev and must have an auth boundary.
     ///
+    /// A standalone embedder declares the profile with
+    /// [`StandaloneAdminAuth::with_deployment_profile`]. See `docs/embedding.md`.
+    ///
     /// # Panics
     ///
     /// Panics if the internal mutex is poisoned.
@@ -1150,7 +1153,8 @@ impl HarvestApiState {
     /// Mark whether the Harvest management API is mounted behind auth.
     ///
     /// This reports the boundary provided via [`crate::plugin::HarvestPlugin::api_with_auth`]
-    /// or an equivalent standalone integration. It does not implement RBAC.
+    /// or [`StandaloneAdminAuth::with_admin_auth_boundary`]. It does not implement RBAC.
+    /// See `docs/embedding.md` for the standalone path.
     ///
     /// # Panics
     ///
@@ -1167,6 +1171,7 @@ impl HarvestApiState {
     /// This mirrors `AppState::auth_session_key()` during plugin startup. Standalone
     /// integrations that mount `harvest_api_router` directly can call this to keep
     /// Harvest's built-in high-impact route guard aligned with their app auth config.
+    /// [`StandaloneAdminAuth::with_admin_auth_session_key`] declares it for them.
     ///
     /// # Panics
     ///

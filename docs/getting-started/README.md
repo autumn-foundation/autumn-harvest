@@ -39,6 +39,11 @@ Stop at any chapter — each one ends in a runnable state.
 12. [Inbound webhooks](12-webhooks.md) — `#[webhook]`, `[security.webhooks]` verification, idempotent dispatch.
 13. [Broker connectors](13-broker-connectors.md) — Kafka and SQS topics/queues as workflow triggers: idempotent redelivery, ack ordering, poison isolation, backpressure.
 
+> **Not on autumn-web?** Every chapter above mounts `HarvestPlugin` on an
+> autumn-web app. If your service runs on plain Axum, take the fork:
+> [The first workflow on plain Axum](standalone-axum.md) runs the Chapter 2
+> workflow with `HarvestEmbedding`. Then come back for Chapters 3 to 11.
+
 Start with [Chapter 1 →](01-project-skeleton.md)
 
 ## Where to go next
@@ -61,9 +66,10 @@ Start with [Chapter 1 →](01-project-skeleton.md)
   is a full subscription-checkout integration: outbox → workflow start, saga
   compensation, child workflow, version gate, signal handoff, and a scheduled
   reconciliation DAG.
-- **Standalone runner.** [`examples/standalone-runner/`](../../examples/standalone-runner/)
-  shows the engine without `HarvestPlugin` — useful when embedding in a
-  non-Autumn service.
+- **Embedding on plain Axum.** [`embedding.md`](../embedding.md) is the
+  reference for the path without `HarvestPlugin`: auth, metrics, webhooks,
+  shutdown, and multi-shard. [`examples/standalone-runner/`](../../examples/standalone-runner/)
+  is a larger example of that path.
 - **Embedded SQLite backend.** [`sqlite-backend.md`](../sqlite-backend.md) is a
   task-oriented guide to `autumn-harvest-sqlite`, a single-writer, no-server
   persistence backend for edge / local-first / single-server deployments (its
