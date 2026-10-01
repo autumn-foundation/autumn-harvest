@@ -18747,7 +18747,14 @@ pub(crate) async fn start_workflow(
                 )
                     .into_response();
             }
-            if !is_idempotent_retry && let Some(decision) = shed_hit {
+            // The lookups above can outlast a sample, so re-check the shedder
+            // here rather than trust the decision taken before them.
+            if !is_idempotent_retry
+                && let Some(decision) = api_state
+                    .gate_cache()
+                    .load_shedder()
+                    .check(&queue_name, std::time::Instant::now())
+            {
                 runtime
                     .registry
                     .telemetry()
@@ -20216,6 +20223,38 @@ async fn batch_start_workflows(
                         continue;
                     }
                 };
+                // The queue can trip after Phase 1 (issue #1794). A fresh row
+                // would defer past the primitive's check, so check here too.
+                // `skip_cap_check` marks an attach or a bypass, which is no
+                // fresh admission.
+                if !skip_cap_check
+                    && let Some(decision) = api_state
+                        .gate_cache()
+                        .load_shedder()
+                        .check(&queue_name, std::time::Instant::now())
+                {
+                    runtime
+                        .registry
+                        .telemetry()
+                        .metrics
+                        .record_load_shed_rejected(&decision.queue);
+                    rejected_count += 1;
+                    results.push(BatchStartItemResult {
+                        index: *idx,
+                        workflow_id: Some(workflow_id.clone()),
+                        status: BatchStartItemStatus::Rejected,
+                        execution_id: None,
+                        error: Some(
+                            HarvestError::LoadShed {
+                                queue: decision.queue,
+                                oldest_pending_age_secs: decision.oldest_pending_age_secs,
+                                retry_after_secs: decision.retry_after_secs,
+                            }
+                            .to_string(),
+                        ),
+                    });
+                    continue;
+                }
                 if !skip_cap_check && effective_wf_cap > 0 {
                     let observed = serde_json::to_string(&input).map_or(0u64, |s| s.len() as u64);
                     if observed > effective_wf_cap {
