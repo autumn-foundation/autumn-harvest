@@ -1931,6 +1931,51 @@ async fn a_transient_session_acquire_keeps_the_slot_only_for_its_own_session() {
     }
 }
 
+/// A kept slot is checked again once the database answers. Every first read
+/// fails on a full pool, so the slot stays at first. After the pool frees, a
+/// background read finds no session row and releases the slot. Otherwise the
+/// slot would stay until the worker restarts.
+#[tokio::test]
+async fn a_kept_session_slot_is_released_once_the_row_proves_absent() {
+    use autumn_harvest::sessions::{
+        new_session_slot_registry, session_slot_count, try_acquire_session_slot,
+    };
+    use autumn_harvest::types::SessionId;
+
+    let (url, _container) = setup_db().await;
+    let pool = engine_pool(
+        url,
+        1,
+        DbRole::Hot,
+        &timeouts(100, SessionTimeouts::for_role(DbRole::Hot)),
+    )
+    .expect("engine pool");
+    let held = hold_every_connection(&pool).await;
+
+    let session_id = SessionId::new();
+    let registry = new_session_slot_registry();
+    assert!(try_acquire_session_slot(&registry, 4, session_id));
+    autumn_harvest::worker::settle_session_slot_after_transient_error(
+        &pool, &registry, session_id, "w-1",
+    )
+    .await;
+    assert_eq!(
+        session_slot_count(&registry),
+        1,
+        "with no answer, the slot stays"
+    );
+
+    drop(held);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while session_slot_count(&registry) == 1 {
+        assert!(
+            Instant::now() < deadline,
+            "the slot of a session with no row must be released once the database answers"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// Mark `worker_id` as a live worker. A test row `RUNNING` under an unknown
 /// worker is an orphan, and a reclaimer of a parallel suite would requeue it.
 /// The row has no queues and a shard that does not exist, so no other code

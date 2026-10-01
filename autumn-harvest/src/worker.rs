@@ -15301,8 +15301,10 @@ async fn handle_session_release(
 ///
 /// - This worker hosts the `ACTIVE` session: keep the slot.
 /// - No row, or another host: release the slot.
-/// - The read fails on every try: keep the slot. A slot too many lowers
-///   capacity. A slot too few lets the worker exceed `max_concurrent_sessions`.
+/// - No read succeeds: keep the slot for now. A slot too few lets the worker
+///   exceed `max_concurrent_sessions`. A background task reads again until
+///   the database answers, then settles the slot. The reconciler only
+///   handles rows that exist, so it cannot release a slot with no row.
 #[doc(hidden)]
 pub async fn settle_session_slot_after_transient_error(
     pool: &DbPool,
@@ -15310,6 +15312,30 @@ pub async fn settle_session_slot_after_transient_error(
     session_id: crate::types::SessionId,
     worker_id: &str,
 ) {
+    if settle_session_slot_once(pool, registry, session_id, worker_id).await {
+        return;
+    }
+    tracing::warn!(
+        session_id = %session_id,
+        "could not read a session after a failed acquire; keeping its slot until a read succeeds"
+    );
+    let pool = pool.clone();
+    let registry = std::sync::Arc::clone(registry);
+    let worker_id = worker_id.to_owned();
+    tokio::spawn(async move {
+        while !settle_session_slot_once(&pool, &registry, session_id, &worker_id).await {}
+    });
+}
+
+/// One round of [`settle_session_slot_after_transient_error`]: up to
+/// `FINALIZE_ACQUIRE_ATTEMPTS` reads, one pool bound apart. Returns whether a
+/// read succeeded and the slot is settled.
+async fn settle_session_slot_once(
+    pool: &DbPool,
+    registry: &crate::sessions::SessionSlotRegistry,
+    session_id: crate::types::SessionId,
+    worker_id: &str,
+) -> bool {
     use crate::schema::harvest_sessions::dsl;
 
     let spacing = crate::pool::retry_spacing(pool);
@@ -15331,9 +15357,9 @@ pub async fn settle_session_slot_after_transient_error(
                 if !ours {
                     crate::sessions::release_session_slot(registry, session_id);
                 }
-                return;
+                return true;
             }
-            Err(error) if attempt < FINALIZE_ACQUIRE_ATTEMPTS => {
+            Err(error) => {
                 tracing::warn!(
                     session_id = %session_id,
                     attempt,
@@ -15342,15 +15368,9 @@ pub async fn settle_session_slot_after_transient_error(
                 );
                 tokio::time::sleep_until(started + spacing).await;
             }
-            Err(error) => {
-                tracing::warn!(
-                    session_id = %session_id,
-                    error = %error,
-                    "could not read a session after a failed acquire; keeping its slot"
-                );
-            }
         }
     }
+    false
 }
 
 /// Run the internal session-release activity for `task`. Tests use it
