@@ -157,8 +157,9 @@ Workers with explicit shard assignments only poll their assigned shards. The sch
 ## Background Scanners Under HA (issue #1795)
 
 Each worker runs a set of per-shard background scanners. The heaviest is the
-timeout checker. It enforces task timeouts, SLA breaches, the external
-outboxes, broken sessions, codec rotation and mutex lease reclaim.
+timeout checker. It runs task and workflow timeouts, SLA checks, the outbox
+and delivery scanners, session cleanup, codec rotation and mutex lease
+reclaim.
 
 Before #1795, every replica ran every pass on every tick. Scan load grew with
 fleet size. Adding workers to clear a backlog added database load in
@@ -189,32 +190,38 @@ cannot give two replicas a live lease.
 
 The lease is a load control, not a safety fence. Two replicas can both run a
 pass for a short time, for example when a slow pass outlives its lease. That
-is safe: every resident of the pass already tolerates concurrent runners.
+is safe: every sub-pass is already safe with concurrent runners.
 
 ### Failover
 
 | Event | Takeover |
 |-------|----------|
 | Graceful stop (deploy, scale-in) | The holder expires its lease on exit. A standby leads on its next tick. |
-| Crash, kill, or network partition | A standby leads within the lease TTL (default 10 s). |
-| Lease query fails (table missing, grant missing) | Each replica runs the pass, as before #1795. The worker logs a warning once. |
+| Crash, kill, or network partition | A standby leads within the lease TTL plus one tick (default about 10.6 s). |
+| The holder's pass fails three times in a row | The holder gives up the lease and stands by for one TTL. Another replica takes over. |
+| Lease query fails (table missing, grant missing, lock wait over 1 s) | Each replica runs the pass, as before #1795. The worker logs one warning each time the lease query starts to fail. |
 
-During the takeover window, no replica enforces timeouts on that shard. A
-timeout that falls in the window fires late by at most the TTL.
+During the takeover window, no replica runs the pass on that shard. Work
+that falls due in the window runs late by up to the effective TTL plus one
+tick.
 
 ### Bounded scans
 
 The four task-timeout scans (heartbeat, start-to-close, schedule-to-start,
-schedule-to-close) read at most one batch per reason per pass (default 500
+schedule-to-close) return at most one batch per reason per pass (default 500
 rows). A keyset cursor moves through the backlog in `id` order and wraps at
-the end. Every expired row is read within `ceil(rows / batch)` passes, even
-when some rows stay expired across passes.
+the end. A sweep reaches every row that stays expired within
+`ceil(rows / batch) + 1` passes. A row that expires behind the cursor waits
+for the next sweep.
+
+A row that matches two reasons gets the first one, in the order above. So
+the recorded timeout type does not depend on where each cursor is.
 
 ### Jitter
 
-Each sleep is the interval times a random factor in `[0.8, 1.2]` by default.
-The mean stays at the interval (500 ms), so the default enforcement latency
-does not change. Replica ticks stop lining up.
+By default, each sleep is the interval times a random factor in
+`[0.8, 1.2]`. The mean stays at the interval (500 ms), so the default
+enforcement latency does not change. Replica ticks stop lining up.
 
 ### Settings
 
@@ -223,17 +230,18 @@ Set with `WorkerConfig::with_scanner_config(ScannerConfig { .. })`:
 | Field | Default | Meaning |
 |-------|---------|---------|
 | `elect` | `true` | `false` makes every replica run every pass, as before #1795. |
-| `lease_ttl` | 10 s | Failover bound after a crash. Raised to at least three of the longest sleeps. |
+| `lease_ttl` | 10 s | Failover bound after a crash. Capped at 300 s, then raised to at least three times the longest sleep. |
 | `jitter` | 0.2 | Random spread of each sleep, as a fraction of the interval. Clamped to `[0, 0.9]`. |
-| `timeout_interval` | 500 ms | Mean time between timeout-checker ticks. |
-| `timeout_batch_size` | 500 | Rows per timeout reason that one pass reads. |
+| `timeout_interval` | `None` | Mean time between timeout-checker ticks. `None` uses the worker poll interval (500 ms). |
+| `timeout_batch_size` | 500 | Most rows per timeout reason that one pass enforces. Raised to at least 1. |
 
-`GET /admin/config` reports these under `worker.scanner_*` and
-`worker.timeout_scan_*`.
+`GET /admin/config` reports the configured values under `worker.scanner_*`
+and `worker.timeout_scan_*`.
 
 ### Observability
 
-`harvest.scanner.pass` counts each tick by `scanner`, `shard` and `role`:
+`harvest.scanner.pass` counts each tick that gets a database connection, by
+`scanner`, `shard` and `role`:
 
 | `role` | Meaning |
 |--------|---------|
@@ -254,9 +262,10 @@ sum by (instance, shard) (rate(harvest_scanner_pass_total{scanner="timeout",role
 A standby loop is alive and ready to lead, so the liveness alerts do not
 change.
 
-Any `fail_open` rate means election is off on that replica. Check that the
-`20261001191830_harvest_scanner_leases` migration ran and that the storage
-role can `SELECT`, `INSERT` and `UPDATE` `harvest_scanner_leases`.
+A non-zero `fail_open` rate means election is off on that replica. Check
+that the `20261001191830_harvest_scanner_leases` migration ran and that the
+storage role can `SELECT`, `INSERT` and `UPDATE` `harvest_scanner_leases`.
+Check also for a transaction that holds a lease row lock.
 
 To see the current holders:
 
@@ -268,9 +277,12 @@ ORDER BY shard_id, scanner;
 
 ### Known limits
 
-- Only the timeout checker uses the lease today. The poison-pill reclaimer,
-  pause auto-resume, quota reconcile, audit export and the metric samplers
-  still run on every replica.
+- Only the timeout checker uses the lease. The poison-pill reclaimer,
+  session-slot reconciler, pause auto-resume, quota reconcile, audit export
+  and the metric samplers still run on every replica.
+- Only the holder's settings and registries apply to the pass. Give every
+  replica that shares a database the same codecs, history ceiling and
+  scanner settings. A holder whose pass keeps failing gives up the lease.
 - Activity circuit breakers are per process. Only the holder sees
   out-of-band timeouts, so only its breakers count them. Before #1795, each
   replica saw a random share.
@@ -279,6 +291,6 @@ ORDER BY shard_id, scanner;
 
 ## Out of Scope for This Runbook
 
-- **Worker poll loop HA**: workers already coordinate via `FOR UPDATE SKIP LOCKED` in `queue.rs`. This runbook covers the scheduler tick path only.
+- **Worker poll loop HA**: workers already coordinate via `FOR UPDATE SKIP LOCKED` in `queue.rs`. This runbook covers the scheduler tick and the background scanners.
 - **`drain_buffered_schedule_runs`**: the buffered-run drain path (for `BufferOne`/`BufferAll` overlap policies) has a lower-severity double-dispatch risk. In practice, `WorkflowIdReusePolicy::RejectDuplicate` on scheduled IDs prevents double execution. A dedicated claim guard for drain is tracked separately.
 - **Cross-region active-active**: single-region multi-replica is the target topology. Cross-region deployments with separate Postgres instances should pin the scheduler to a single region.

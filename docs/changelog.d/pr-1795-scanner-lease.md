@@ -7,25 +7,33 @@ size, so adding workers to clear a backlog added database load in proportion.
 - **Lease.** New table `harvest_scanner_leases`, one row per
   `(shard_id, scanner)` (migration `20261001191830_harvest_scanner_leases`).
   Each tick takes or renews the `timeout` lease with one atomic upsert on the
-  database clock. Only the holder runs the pass. A standby still refreshes
-  its active codec key, because codec key retirement counts on every process
-  to do that once per tick. A graceful stop expires the lease at once. After
-  a crash, a standby takes over within the TTL (default 10 s, raised to at
-  least three of the longest sleeps). A lease query error fails open: the
-  replica runs the pass, as before.
+  database clock, under a 1 s `lock_timeout`. Only the holder runs the pass.
+  A standby still refreshes its active codec key, because codec key
+  retirement counts on every process to do that once per tick. A graceful
+  stop expires the lease at once. After a crash, a standby takes over within
+  the TTL plus one tick. The TTL defaults to 10 s, is capped at 300 s, and is
+  raised to at least three times the longest sleep. A lease query error fails
+  open: the replica runs the pass, as before.
+- **Abdication.** A holder whose pass fails three times in a row gives up the
+  lease and stands by for one TTL. A pass can fail on one replica alone, for
+  example on a codec only that replica lacks.
 - **Not a fence.** Two holders for a short time are safe, because every
-  resident of the pass already tolerates concurrent runners.
-- **Bounded scans.** The checker reads at most one batch per timeout reason
-  per pass (default 500). A keyset cursor walks the backlog in `id` order and
-  wraps at the end, so a row that stays expired cannot starve the rest. The
-  four predicate consts are unchanged, so the backup drill's `UNION` still
-  works. The public `enforce_timeouts_once` keeps its full scan.
-- **Jitter.** Each sleep is the interval times a factor in `[0.8, 1.2]`. The
-  mean is unchanged, so default enforcement latency does not change.
-  Liveness registers the longest sleep.
+  sub-pass is already safe with concurrent runners.
+- **Bounded scans.** The checker enforces at most one batch per timeout
+  reason per pass (default 500). A keyset cursor walks the backlog in `id`
+  order and wraps at the end, so a row that stays expired cannot starve the
+  rest. `OFFSET 0` keeps each predicate on its own partial index. A row that
+  matches two reasons gets the first one, as in the full scan. The four
+  predicate consts are unchanged, so the backup drill's `UNION` still works.
+  The public `enforce_timeouts_once` keeps its full scan.
+- **Jitter.** By default, each sleep is the interval times a factor in
+  `[0.8, 1.2]`. The mean is unchanged, so default enforcement latency does
+  not change. The liveness check judges the loop against its longest sleep,
+  not its mean.
 - **Settings.** `WorkerConfig::with_scanner_config(ScannerConfig { elect,
   lease_ttl, jitter, timeout_interval, timeout_batch_size })`, reported by
-  `GET /admin/config`. The worker uses its `worker_id` as the holder id.
+  `GET /admin/config`. `timeout_interval: None` keeps the poll-interval
+  cadence. The worker uses its `worker_id` as the holder id.
 - **Metric.** `harvest.scanner.pass{scanner, shard, role}` with `role` one of
   `leader`, `standby`, `unelected`, `fail_open`. The metrics-rs bridge emits
   it, `docs/telemetry.md` lists it, and the starter dashboard has a "Scanner
@@ -37,14 +45,24 @@ size, so adding workers to clear a backlog added database load in proportion.
 - **Preflight.** `harvest_scanner_leases` joins the write-privilege probe.
 - **Scope.** Only the timeout checker uses the lease. The other per-shard
   loops still run on every replica. `docs/runbooks/ha-deployment.md` lists
-  them.
+  them, and `docs/upgrading/0.5.0.md` §3.9 lists the behavior changes.
 
 No new `WorkflowEvent` variant. No `harvest_events` mutation. No replay impact.
 
-Tests (`scanner_lease_tests`, against Postgres 16): three checkers on one
-shard run about one checker's worth of passes (RED: 60 passes over 20 ticks);
-a 7-row backlog with a batch of 3 is read 3 rows per pass, every row once per
-cycle, and drains in 3 passes (RED: 7 rows in one pass); aborting the holder
-hands the lease to a standby within the TTL with a higher epoch, and a
-graceful stop hands it over at once (RED: no lease taken). Unit tests cover
-jitter bounds and clamping, the TTL floor, the role table, and the SQL shape.
+Tests run in `scanner_lease_tests` against Postgres 16:
+
+- Three checkers on one shard run about one checker's worth of passes, and
+  the leader never loses the lease (RED: 60 passes over 20 ticks).
+- A batch of 3 reads a 7-row backlog 3 rows per pass. One sweep reads every
+  row once, in id order, and a short page wraps the cursor. Failing each
+  batch drains the backlog in 3 passes (RED: 7 rows in one pass).
+- A spawned checker with a batch of 3 enforces exactly 3 of 7 rows in one
+  pass.
+- An aborted holder keeps its lease until the TTL, then a standby takes over
+  with a higher epoch. A renewal keeps the epoch. A graceful stop expires the
+  lease, and a standby leads on its next tick (RED: no lease taken).
+- A failed lease query fails open, and a standby picks up a new active codec
+  key.
+
+Unit tests cover jitter bounds and clamping, the TTL floor and caps, the role
+table, the lease SQL shape, and the batched query shape.

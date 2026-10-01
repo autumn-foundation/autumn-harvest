@@ -16,30 +16,37 @@
 //!   `[1 - jitter, 1 + jitter]`. The mean stays at the interval, so the
 //!   default enforcement latency does not change. Replica ticks stop lining
 //!   up.
-//! - **A role metric.** `harvest.scanner.pass` counts each tick by role, so
-//!   an operator can see which replica leads.
+//! - **A role metric.** `harvest.scanner.pass` counts each tick that reaches
+//!   the database, by role. An operator can see which replica leads.
 //!
 //! # The lease is a load control, not a fence
 //!
 //! Two replicas can both run a pass for a short time. For example, a slow
 //! pass outlives its lease and a standby takes over. That is safe, because
 //! every scanner that uses this lease must already stay correct with many
-//! concurrent runners. Before this change every replica ran every pass, and
+//! concurrent runners. Before issue #1795, every replica ran every pass, and
 //! that was correct. The lease only removes the duplicate work.
 //!
 //! # Fail open
 //!
 //! When the lease query fails, the replica runs the pass anyway. A missing
 //! table or a lost grant must not stop timeout enforcement fleet-wide. The
-//! cost is duplicate scan load until the fault clears, which is the
-//! behaviour before this change.
+//! cost is duplicate scan load until the fault clears. This matches the
+//! behavior before issue #1795.
 
 use std::time::Duration;
 
 /// How long a scanner lease lasts without renewal by default.
 ///
-/// This is the failover bound when a holder dies without a graceful stop.
+/// With [`MIN_LEASE_TICKS`], this sets the failover bound when a holder dies
+/// without a graceful stop.
 pub const DEFAULT_SCANNER_LEASE_TTL: Duration = Duration::from_secs(10);
+
+/// Longest lease TTL a scanner accepts.
+///
+/// A dead holder blocks its scanner until the lease ends. A large TTL then
+/// stops enforcement on that shard for that long.
+pub const MAX_SCANNER_LEASE_TTL: Duration = Duration::from_secs(300);
 
 /// Default random spread of each scanner sleep, as a fraction of the interval.
 pub const DEFAULT_SCANNER_JITTER: f64 = 0.2;
@@ -56,6 +63,19 @@ pub const MAX_SCANNER_JITTER: f64 = 0.9;
 /// late wakeup.
 pub const MIN_LEASE_TICKS: u32 = 3;
 
+/// Failed passes in a row after which a leader gives up its lease.
+///
+/// A pass can fail on one replica alone, for example on a codec only that
+/// replica lacks. The leader then stands by for one TTL, and another
+/// replica can take over.
+pub const ABDICATE_AFTER_FAILED_PASSES: u32 = 3;
+
+/// Upper bound on any lease TTL, the floor included.
+///
+/// The TTL goes into a Postgres `make_interval`. An unbounded value can
+/// overflow the timestamp, and every tick then fails open.
+const LEASE_TTL_HARD_CAP: Duration = Duration::from_secs(86_400);
+
 /// How replicas share one per-shard background scanner.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScannerCoordination {
@@ -69,7 +89,7 @@ pub struct ScannerCoordination {
 
 impl ScannerCoordination {
     /// No election and no jitter. Every replica runs every pass on a fixed
-    /// cadence. This is the behaviour before issue #1795.
+    /// cadence. This is the behavior before issue #1795.
     #[must_use]
     pub const fn unelected() -> Self {
         Self {
@@ -106,28 +126,22 @@ pub struct ScannerConfig {
     /// Set `false` to make every replica run every pass, as before #1795.
     pub elect: bool,
     /// How long a lease lasts without renewal. Defaults to
-    /// [`DEFAULT_SCANNER_LEASE_TTL`]. Raised to at least
-    /// [`MIN_LEASE_TICKS`] of the longest sleep.
+    /// [`DEFAULT_SCANNER_LEASE_TTL`]. Capped at [`MAX_SCANNER_LEASE_TTL`],
+    /// then raised to at least [`MIN_LEASE_TICKS`] times the longest sleep.
     pub lease_ttl: Duration,
     /// Random spread of each sleep, as a fraction of the interval. Defaults
     /// to [`DEFAULT_SCANNER_JITTER`]. Clamped to `[0, MAX_SCANNER_JITTER]`.
     pub jitter: f64,
-    /// Mean time between timeout-checker ticks. Defaults to 500 ms, the
-    /// worker poll interval.
-    pub timeout_interval: Duration,
-    /// Rows per timeout reason that one timeout pass reads. Defaults to
-    /// [`DEFAULT_TIMEOUT_SCAN_BATCH_SIZE`]. Raised to at least 1.
+    /// Mean time between timeout-checker ticks. `None`, the default, uses the
+    /// worker poll interval (500 ms by default).
+    pub timeout_interval: Option<Duration>,
+    /// Most rows per timeout reason that one timeout pass enforces. Defaults
+    /// to [`DEFAULT_TIMEOUT_SCAN_BATCH_SIZE`]. Raised to at least 1.
     pub timeout_batch_size: u32,
 }
 
-/// Default rows per timeout reason that one checker pass reads.
+/// Default cap on the rows per timeout reason that one checker pass enforces.
 pub const DEFAULT_TIMEOUT_SCAN_BATCH_SIZE: u32 = 500;
-
-/// Default mean time between timeout-checker ticks.
-///
-/// Equal to the worker poll interval, so the default enforcement latency
-/// does not change.
-pub const DEFAULT_TIMEOUT_SCAN_INTERVAL: Duration = Duration::from_millis(500);
 
 impl Default for ScannerConfig {
     fn default() -> Self {
@@ -135,7 +149,7 @@ impl Default for ScannerConfig {
             elect: true,
             lease_ttl: DEFAULT_SCANNER_LEASE_TTL,
             jitter: DEFAULT_SCANNER_JITTER,
-            timeout_interval: DEFAULT_TIMEOUT_SCAN_INTERVAL,
+            timeout_interval: None,
             timeout_batch_size: DEFAULT_TIMEOUT_SCAN_BATCH_SIZE,
         }
     }
@@ -185,8 +199,8 @@ impl ScannerRole {
     }
 }
 
-/// `jitter` made safe: not finite or negative gives 0, and the top is
-/// [`MAX_SCANNER_JITTER`].
+/// Clamps `jitter` to `[0, MAX_SCANNER_JITTER]`. A NaN, infinite or
+/// negative value gives 0.
 #[must_use]
 pub fn clamp_jitter(jitter: f64) -> f64 {
     if jitter.is_finite() && jitter > 0.0 {
@@ -196,10 +210,15 @@ pub fn clamp_jitter(jitter: f64) -> f64 {
     }
 }
 
+/// `duration` times `factor`, saturating at [`Duration::MAX`].
+fn scale(duration: Duration, factor: f64) -> Duration {
+    Duration::try_from_secs_f64(duration.as_secs_f64() * factor).unwrap_or(Duration::MAX)
+}
+
 /// The longest sleep [`jittered_interval`] can return.
 #[must_use]
 pub fn max_jittered_interval(interval: Duration, jitter: f64) -> Duration {
-    interval.mul_f64(1.0 + clamp_jitter(jitter))
+    scale(interval, 1.0 + clamp_jitter(jitter))
 }
 
 /// One scanner sleep: `interval` times a factor in `[1 - j, 1 + j]`.
@@ -214,14 +233,23 @@ pub fn jittered_interval(interval: Duration, jitter: f64, unit: f64) -> Duration
     } else {
         0.5
     };
-    interval.mul_f64(2.0f64.mul_add(jitter * unit, 1.0 - jitter))
+    scale(interval, 2.0f64.mul_add(jitter * unit, 1.0 - jitter))
 }
 
-/// The TTL a lease actually uses: `ttl`, raised to at least
-/// [`MIN_LEASE_TICKS`] of the longest sleep.
+/// The TTL a lease actually uses.
+///
+/// `ttl` is capped at [`MAX_SCANNER_LEASE_TTL`]. It is then raised to at
+/// least [`MIN_LEASE_TICKS`] times the longest sleep, so a live holder
+/// renews before its lease ends. The floor wins over the cap.
 #[must_use]
 pub fn effective_lease_ttl(ttl: Duration, interval: Duration, jitter: f64) -> Duration {
-    ttl.max(max_jittered_interval(interval, jitter) * MIN_LEASE_TICKS)
+    let floor = scale(
+        max_jittered_interval(interval, jitter),
+        f64::from(MIN_LEASE_TICKS),
+    );
+    ttl.min(MAX_SCANNER_LEASE_TTL)
+        .max(floor)
+        .min(LEASE_TTL_HARD_CAP)
 }
 
 #[cfg(feature = "db")]
@@ -233,9 +261,9 @@ mod db {
 
     use diesel::QueryableByName;
     use diesel::sql_types::{BigInt, Double, Integer, Text};
-    use diesel_async::{AsyncPgConnection, RunQueryDsl};
+    use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 
-    use crate::error::{HarvestResult, database_error};
+    use crate::error::{HarvestError, HarvestResult, database_error};
     use crate::scanner_health::Scanner;
     use crate::types::ShardId;
 
@@ -259,6 +287,14 @@ mod db {
                                 THEN l.acquired_at ELSE NOW() END \
          WHERE l.holder = EXCLUDED.holder OR l.lease_until <= NOW() \
          RETURNING l.epoch";
+
+    /// Bound on the wait for the lease row lock.
+    ///
+    /// A stuck transaction can hold that row lock. Without a bound, every
+    /// replica then blocks on the upsert, and no replica runs the pass or
+    /// refreshes its codec key. A timeout is an error, so the replica fails
+    /// open and runs the pass.
+    const LOCK_TIMEOUT_SQL: &str = "SET LOCAL lock_timeout = '1s'";
 
     /// Expire the lease now, if this holder has it.
     ///
@@ -306,22 +342,32 @@ mod db {
 
         /// Take or renew the lease. `Some(epoch)` when this holder has it.
         ///
+        /// Runs in its own short transaction, so the lock wait is bounded.
+        ///
         /// # Errors
         ///
-        /// Returns [`crate::error::HarvestError::Database`] on query failure.
+        /// Returns [`crate::error::HarvestError::Database`] on query failure
+        /// or when the row lock is not free within one second.
         pub async fn try_acquire(
             &self,
             conn: &mut AsyncPgConnection,
         ) -> HarvestResult<Option<i64>> {
-            let rows: Vec<EpochRow> = diesel::sql_query(ACQUIRE_SQL)
-                .bind::<Integer, _>(self.shard.as_i32())
-                .bind::<Text, _>(self.scanner.as_str())
-                .bind::<Text, _>(&self.holder)
-                .bind::<Double, _>(self.ttl.as_secs_f64())
-                .load(conn)
-                .await
-                .map_err(database_error)?;
-            Ok(rows.into_iter().next().map(|r| r.epoch))
+            conn.transaction::<Option<i64>, HarvestError, _>(async |conn| {
+                diesel::sql_query(LOCK_TIMEOUT_SQL)
+                    .execute(conn)
+                    .await
+                    .map_err(database_error)?;
+                let rows: Vec<EpochRow> = diesel::sql_query(ACQUIRE_SQL)
+                    .bind::<Integer, _>(self.shard.as_i32())
+                    .bind::<Text, _>(self.scanner.as_str())
+                    .bind::<Text, _>(&self.holder)
+                    .bind::<Double, _>(self.ttl.as_secs_f64())
+                    .load(conn)
+                    .await
+                    .map_err(database_error)?;
+                Ok(rows.into_iter().next().map(|r| r.epoch))
+            })
+            .await
         }
 
         /// Expire the lease now, so a standby takes over on its next tick.
@@ -354,6 +400,11 @@ mod db {
                 ACQUIRE_SQL.contains("WHERE l.holder = EXCLUDED.holder OR l.lease_until <= NOW()")
             );
             assert!(ACQUIRE_SQL.contains("RETURNING l.epoch"));
+        }
+
+        #[test]
+        fn acquire_bounds_its_lock_wait() {
+            assert_eq!(LOCK_TIMEOUT_SQL, "SET LOCAL lock_timeout = '1s'");
         }
 
         #[test]
@@ -413,6 +464,19 @@ mod tests {
     }
 
     #[test]
+    fn lease_ttl_is_capped_and_never_overflows() {
+        let huge = effective_lease_ttl(Duration::MAX, BASE, 0.2);
+        assert_eq!(huge, MAX_SCANNER_LEASE_TTL);
+        // The floor wins over the cap, up to the hard cap.
+        let slow = effective_lease_ttl(Duration::from_secs(1), Duration::from_secs(200), 0.0);
+        assert_eq!(slow, Duration::from_secs(600));
+        let absurd = effective_lease_ttl(Duration::from_secs(1), Duration::MAX, 0.2);
+        assert_eq!(absurd, LEASE_TTL_HARD_CAP);
+        assert_eq!(max_jittered_interval(Duration::MAX, 0.5), Duration::MAX);
+        assert_eq!(jittered_interval(Duration::MAX, 0.5, 1.0), Duration::MAX);
+    }
+
+    #[test]
     fn only_standby_skips_the_pass() {
         assert!(ScannerRole::Leader.runs_pass());
         assert!(ScannerRole::Unelected.runs_pass());
@@ -430,5 +494,10 @@ mod tests {
         }
         .coordination("w1");
         assert_eq!(off.holder, None);
+    }
+
+    #[test]
+    fn default_timeout_interval_follows_the_worker_poll_interval() {
+        assert_eq!(ScannerConfig::default().timeout_interval, None);
     }
 }

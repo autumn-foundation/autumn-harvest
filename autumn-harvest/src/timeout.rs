@@ -514,26 +514,53 @@ const fn task_timeout_scans() -> [(TimeoutReason, &'static str); 4] {
 
 /// One keyset page of a task-timeout scan (issue #1795).
 ///
-/// The page wraps the unchanged predicate as a subquery. Postgres flattens
-/// it, so the plan is the predicate plus an ordered `LIMIT`. The predicate
+/// The page wraps the unchanged predicate as a subquery. The predicate
 /// consts stay plain, because the backup drill `UNION`s them.
+///
+/// `OFFSET 0` stops Postgres from pulling the subquery up. Pulled up, the
+/// planner guesses many expired rows and walks the primary key for the
+/// `ORDER BY id LIMIT`. That reads the whole table. Kept apart, the
+/// predicate uses its own partial index, and only the expired rows are
+/// sorted.
+///
+/// `higher` holds the predicates of the reasons that come first. A row that
+/// also matches one of them is left to that reason's page. So a row always
+/// gets the first reason it matches, as in [`find_timed_out_tasks`].
 ///
 /// With `after`, `$1` is the last id of the previous page and `$2` is the
 /// limit. Without it, `$1` is the limit.
-fn batched_timeout_query(predicate: &str, after: bool) -> String {
+fn batched_timeout_query(predicate: &str, higher: &[&str], after: bool) -> String {
+    use std::fmt::Write as _;
+
+    let mut sql = format!("SELECT q.* FROM ({predicate} OFFSET 0) q WHERE TRUE");
     if after {
-        format!("SELECT q.* FROM ({predicate}) q WHERE q.id > $1 ORDER BY q.id LIMIT $2")
-    } else {
-        format!("SELECT q.* FROM ({predicate}) q ORDER BY q.id LIMIT $1")
+        sql.push_str(" AND q.id > $1");
     }
+    for earlier in higher {
+        let _ = write!(
+            sql,
+            " AND NOT EXISTS (SELECT 1 FROM ({earlier}) h WHERE h.id = q.id)"
+        );
+    }
+    sql.push_str(if after {
+        " ORDER BY q.id LIMIT $2"
+    } else {
+        " ORDER BY q.id LIMIT $1"
+    });
+    sql
 }
 
 /// Where the next batched task-timeout scan starts (issue #1795).
 ///
 /// One keyset position per timeout reason. A full page moves the position to
-/// its last id. A short page resets it, so the next pass starts again at the
-/// lowest id. Every expired row is read within `ceil(rows / limit)` passes,
-/// even when some rows stay expired across passes.
+/// its last id. A short page resets it, so the next sweep starts again at the
+/// lowest id. A sweep reaches every row that stays expired within
+/// `ceil(rows / limit) + 1` passes. A row that expires behind the position
+/// waits for the next sweep.
+///
+/// A failed pass still moves the position. So one bad row cannot block the
+/// rows behind it. Rows that the failed pass did not reach wait for the next
+/// sweep.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TimeoutScanCursor {
     after: [Option<uuid::Uuid>; 4],
@@ -556,17 +583,20 @@ pub async fn find_timed_out_tasks_batch(
     let mut results = Vec::new();
     let mut seen = HashSet::new();
 
-    for (after, (reason, predicate)) in cursor.after.iter_mut().zip(task_timeout_scans()) {
+    let scans = task_timeout_scans();
+    let predicates = scans.clone().map(|(_, predicate)| predicate);
+    for (index, (after, (reason, predicate))) in cursor.after.iter_mut().zip(scans).enumerate() {
+        let higher = &predicates[..index];
         let page: Vec<TaskQueueItem> = match *after {
             Some(id) => {
-                diesel::sql_query(batched_timeout_query(predicate, true))
+                diesel::sql_query(batched_timeout_query(predicate, higher, true))
                     .bind::<diesel::sql_types::Uuid, _>(id)
                     .bind::<diesel::sql_types::BigInt, _>(limit)
                     .load(conn)
                     .await
             }
             None => {
-                diesel::sql_query(batched_timeout_query(predicate, false))
+                diesel::sql_query(batched_timeout_query(predicate, higher, false))
                     .bind::<diesel::sql_types::BigInt, _>(limit)
                     .load(conn)
                     .await
@@ -5308,12 +5338,14 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
     let lease_shard = pool_shard
         .or(shard)
         .unwrap_or(crate::types::ShardId::new(0));
+    let lease_ttl =
+        crate::scanner_lease::effective_lease_ttl(coordination.lease_ttl, interval, jitter);
     let lease = coordination.holder.map(|holder| {
         ScannerLease::new(
             lease_shard,
             crate::scanner_health::Scanner::Timeout,
             holder,
-            crate::scanner_lease::effective_lease_ttl(coordination.lease_ttl, interval, jitter),
+            lease_ttl,
         )
     });
     let task_batch_size = i64::from(task_batch_size.max(1));
@@ -5352,6 +5384,8 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
     crate::dispatch::spawn_bound(async move {
         let mut cursor = TimeoutScanCursor::default();
         let mut last_role: Option<ScannerRole> = None;
+        let mut failed_leader_passes: u32 = 0;
+        let mut abdicated_until: Option<tokio::time::Instant> = None;
         loop {
             // Issue #1795: a random sleep in `[1 - jitter, 1 + jitter]` of
             // the interval. The mean is the interval, so enforcement latency
@@ -5389,8 +5423,13 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
             };
             match get_result {
                 Ok(Ok(mut conn)) => {
+                    let abdicated =
+                        abdicated_until.is_some_and(|until| tokio::time::Instant::now() < until);
                     let role = match &lease {
                         None => ScannerRole::Unelected,
+                        // After giving up the lease, stand by for one TTL, so
+                        // another replica can take it.
+                        Some(_) if abdicated => ScannerRole::Standby,
                         Some(lease) => match lease.try_acquire(&mut conn).await {
                             Ok(Some(_epoch)) => ScannerRole::Leader,
                             Ok(None) => ScannerRole::Standby,
@@ -5435,12 +5474,35 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
                         )
                         .await
                         {
-                            Ok(enforced_count) if enforced_count > 0 => {
-                                tracing::warn!(enforced_count, "enforced timed-out tasks");
+                            Ok(enforced_count) => {
+                                if enforced_count > 0 {
+                                    tracing::warn!(enforced_count, "enforced timed-out tasks");
+                                }
+                                failed_leader_passes = 0;
                             }
-                            Ok(_) => {}
                             Err(e) => {
                                 tracing::error!(error = %e, "failed to enforce timed-out tasks");
+                                if role == ScannerRole::Leader {
+                                    failed_leader_passes += 1;
+                                }
+                            }
+                        }
+                        // A pass can fail on one replica alone, for example on
+                        // a codec only that replica lacks. Before #1795,
+                        // another replica's pass did the work. So a leader
+                        // that keeps failing gives up the lease.
+                        if failed_leader_passes
+                            >= crate::scanner_lease::ABDICATE_AFTER_FAILED_PASSES
+                            && let Some(lease) = &lease
+                        {
+                            failed_leader_passes = 0;
+                            abdicated_until = Some(tokio::time::Instant::now() + lease_ttl);
+                            tracing::warn!(
+                                shard = %shard_label,
+                                "timeout scanner gave up its lease after failed passes"
+                            );
+                            if let Err(e) = lease.release(&mut conn).await {
+                                tracing::warn!(error = %e, "timeout scanner lease release failed");
                             }
                         }
                     } else if let Err(e) =
@@ -6093,22 +6155,25 @@ mod tests {
     }
 
     #[test]
-    fn default_timeout_scan_interval_is_the_worker_poll_interval() {
-        // Issue #1795: the default must keep today's enforcement latency.
-        assert_eq!(
-            crate::scanner_lease::DEFAULT_TIMEOUT_SCAN_INTERVAL,
-            crate::worker::DEFAULT_WORKER_POLL_INTERVAL
-        );
+    fn batched_timeout_query_wraps_the_predicate_in_a_keyset_page() {
+        let predicate = start_to_close_timeout_query();
+        let first = batched_timeout_query(predicate, &[], false);
+        // `OFFSET 0` keeps the predicate on its own index plan.
+        assert!(first.starts_with(&format!("SELECT q.* FROM ({predicate} OFFSET 0) q")));
+        assert!(first.ends_with("ORDER BY q.id LIMIT $1"));
+        assert!(!first.contains("$2"));
+        let next = batched_timeout_query(predicate, &[], true);
+        assert!(next.contains(" AND q.id > $1 "));
+        assert!(next.ends_with("ORDER BY q.id LIMIT $2"));
     }
 
     #[test]
-    fn batched_timeout_query_wraps_the_predicate_in_a_keyset_page() {
-        let predicate = start_to_close_timeout_query();
-        let first = batched_timeout_query(predicate, false);
-        assert!(first.starts_with(&format!("SELECT q.* FROM ({predicate}) q")));
-        assert!(first.ends_with("ORDER BY q.id LIMIT $1"));
-        let next = batched_timeout_query(predicate, true);
-        assert!(next.ends_with("WHERE q.id > $1 ORDER BY q.id LIMIT $2"));
+    fn batched_timeout_query_leaves_a_row_to_the_first_reason_it_matches() {
+        let higher = heartbeat_timeout_query();
+        let sql = batched_timeout_query(start_to_close_timeout_query(), &[higher], false);
+        assert!(sql.contains(&format!(
+            "AND NOT EXISTS (SELECT 1 FROM ({higher}) h WHERE h.id = q.id)"
+        )));
     }
 
     #[test]

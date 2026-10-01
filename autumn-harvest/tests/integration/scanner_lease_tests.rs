@@ -1,21 +1,27 @@
 //! One timeout scanner per shard, bounded scans, and failover (issue #1795).
 //!
-//! Before this change, every replica ran the timeout pass on every tick. Scan
-//! load grew with fleet size. These tests prove three properties against a
-//! real database:
+//! Before issue #1795, every replica ran the timeout pass on every tick. Scan
+//! load grew with fleet size. These tests prove the fix against a real
+//! database:
 //!
 //! 1. Three checkers on one shard run about one checker's worth of passes.
 //! 2. A task-timeout scan returns at most one batch per reason per pass. It
-//!    still reaches every expired row and drains a backlog.
+//!    still reaches every expired row and drains a backlog. The spawned
+//!    checker enforces one batch per pass.
 //! 3. When the lease holder dies, a standby takes over within the lease TTL.
 //!    A graceful stop hands over at once.
+//! 4. A failed lease query fails open, and a standby still refreshes its
+//!    codec key.
 #![cfg(feature = "db")]
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use autumn_harvest::scanner_lease::ScannerCoordination;
+use autumn_harvest::payload_codec::{CodecError, PayloadCodec, PayloadCodecs};
+use autumn_harvest::scanner_lease::{
+    ScannerCoordination, effective_lease_ttl, max_jittered_interval,
+};
 use autumn_harvest::telemetry::MetricsRecorder;
 use autumn_harvest::timeout::{self, TimeoutReason, TimeoutScanCursor};
 use autumn_harvest::types::ShardId;
@@ -29,6 +35,9 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tokio_util::sync::CancellationToken;
 
+/// The jitter every checker in this file uses.
+const JITTER: f64 = 0.2;
+
 /// Prefer an operator-supplied database and fall back to testcontainers.
 async fn setup_test_db_url() -> (String, Option<ContainerAsync<Postgres>>) {
     if let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") {
@@ -36,11 +45,14 @@ async fn setup_test_db_url() -> (String, Option<ContainerAsync<Postgres>>) {
         let mut conn = AsyncPgConnection::establish(&url)
             .await
             .expect("HARVEST_TEST_DATABASE_URL must be reachable");
-        let already_migrated = conn
-            .batch_execute("SELECT 1 FROM harvest_scanner_leases LIMIT 0")
+        // Several suites share one operator-supplied database, so apply the
+        // bundle only once. A failed probe poisons the connection, so the
+        // apply runs on a fresh one.
+        let migrated = conn
+            .batch_execute("SELECT 1 FROM harvest_workflow_executions LIMIT 0")
             .await
             .is_ok();
-        if !already_migrated {
+        if !migrated {
             let mut fresh = AsyncPgConnection::establish(&url)
                 .await
                 .expect("HARVEST_TEST_DATABASE_URL must be reachable");
@@ -139,13 +151,30 @@ struct Checker {
     handle: tokio::task::JoinHandle<()>,
 }
 
-fn spawn_checker(
-    pool: &DbPool,
+/// How to spawn one test checker.
+struct Spec<'a> {
     shard: ShardId,
-    holder: &str,
+    holder: &'a str,
     interval: Duration,
     lease_ttl: Duration,
-) -> Checker {
+    batch: u32,
+    codecs: PayloadCodecs,
+}
+
+impl<'a> Spec<'a> {
+    fn new(shard: ShardId, holder: &'a str, interval: Duration, lease_ttl: Duration) -> Self {
+        Self {
+            shard,
+            holder,
+            interval,
+            lease_ttl,
+            batch: timeout::DEFAULT_TIMEOUT_SCAN_BATCH_SIZE,
+            codecs: PayloadCodecs::default(),
+        }
+    }
+}
+
+fn spawn_checker(pool: &DbPool, spec: Spec<'_>) -> Checker {
     let metrics = Arc::new(PassRecorder::default());
     let telemetry = Arc::new(autumn_harvest::telemetry::TelemetryConfig {
         metrics: metrics.clone(),
@@ -155,29 +184,38 @@ fn spawn_checker(
     let handle = timeout::spawn_coordinated_timeout_checker_for_shard(
         pool.clone(),
         cancel.clone(),
-        interval,
+        spec.interval,
         telemetry,
         Duration::from_secs(5),
         None,
-        vec![shard],
+        vec![spec.shard],
         Arc::new(autumn_harvest::circuit_breaker::CircuitBreakerRegistry::default()),
         None,
         60,
-        Some(shard),
-        autumn_harvest::payload_codec::PayloadCodecs::default(),
+        Some(spec.shard),
+        spec.codecs,
         0,
         ScannerCoordination {
-            holder: Some(holder.to_owned()),
-            lease_ttl,
-            jitter: 0.2,
+            holder: Some(spec.holder.to_owned()),
+            lease_ttl: spec.lease_ttl,
+            jitter: JITTER,
         },
-        timeout::DEFAULT_TIMEOUT_SCAN_BATCH_SIZE,
+        spec.batch,
     );
     Checker {
-        holder: holder.to_owned(),
+        holder: spec.holder.to_owned(),
         metrics,
         cancel,
         handle,
+    }
+}
+
+async fn stop_all(checkers: Vec<Checker>) {
+    for c in &checkers {
+        c.cancel.cancel();
+    }
+    for c in checkers {
+        let _ = c.handle.await;
     }
 }
 
@@ -187,20 +225,30 @@ struct LeaseRow {
     holder: String,
     #[diesel(sql_type = diesel::sql_types::BigInt)]
     epoch: i64,
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    live: bool,
 }
 
-/// The live holder of the `timeout` lease on `shard`, if any.
-async fn live_holder(pool: &DbPool, shard: ShardId) -> Option<(String, i64)> {
+/// The `timeout` lease row on `shard`, live or not.
+async fn lease_row(pool: &DbPool, shard: ShardId) -> Option<LeaseRow> {
     let mut conn = pool.get().await.expect("connection");
     let rows: Vec<LeaseRow> = diesel::sql_query(
-        "SELECT holder, epoch FROM harvest_scanner_leases \
-         WHERE shard_id = $1 AND scanner = 'timeout' AND lease_until > NOW()",
+        "SELECT holder, epoch, lease_until > NOW() AS live FROM harvest_scanner_leases \
+         WHERE shard_id = $1 AND scanner = 'timeout'",
     )
     .bind::<diesel::sql_types::Integer, _>(shard.as_i32())
     .load(&mut conn)
     .await
     .expect("lease query");
-    rows.into_iter().next().map(|r| (r.holder, r.epoch))
+    rows.into_iter().next()
+}
+
+/// The live holder of the `timeout` lease on `shard`, if any.
+async fn live_holder(pool: &DbPool, shard: ShardId) -> Option<(String, i64)> {
+    lease_row(pool, shard)
+        .await
+        .filter(|r| r.live)
+        .map(|r| (r.holder, r.epoch))
 }
 
 async fn wait_for<F: Fn() -> bool>(what: &str, limit: Duration, done: F) {
@@ -221,7 +269,7 @@ async fn three_checkers_on_one_shard_run_about_one_pass_per_tick() {
 
     let checkers: Vec<Checker> = ["w1", "w2", "w3"]
         .into_iter()
-        .map(|h| spawn_checker(&pool, shard, h, interval, Duration::from_secs(5)))
+        .map(|h| spawn_checker(&pool, Spec::new(shard, h, interval, Duration::from_secs(5))))
         .collect();
 
     wait_for("20 ticks on every checker", Duration::from_secs(30), || {
@@ -232,13 +280,12 @@ async fn three_checkers_on_one_shard_run_about_one_pass_per_tick() {
     let ran: usize = checkers.iter().map(|c| c.metrics.ran()).sum();
     let standby: usize = checkers.iter().map(|c| c.metrics.role("standby")).sum();
     let most_ticks = checkers.iter().map(|c| c.metrics.ticks()).max().unwrap();
-
-    for c in &checkers {
-        c.cancel.cancel();
-    }
-    for c in checkers {
-        let _ = c.handle.await;
-    }
+    let leader = checkers
+        .iter()
+        .max_by_key(|c| c.metrics.role("leader"))
+        .unwrap();
+    let leader_standby = leader.metrics.role("standby");
+    stop_all(checkers).await;
 
     // Unelected, the three checkers run about 3 × `most_ticks` passes.
     // Elected, one checker runs them. The bound leaves room for the
@@ -248,12 +295,24 @@ async fn three_checkers_on_one_shard_run_about_one_pass_per_tick() {
         "expected about one checker's worth of passes, got {ran} passes over \
          {most_ticks} ticks"
     );
-    assert!(ran > 0, "the leader must still run passes");
     assert!(standby > 0, "the other checkers must stand by");
+    // The first winner keeps the lease for the whole window, which is
+    // shorter than the TTL. A tick with no connection records no role.
+    assert_eq!(leader_standby, 0, "the leader must never lose the lease");
 }
 
-/// Inserts `n` RUNNING activity rows whose start-to-close budget has run out.
-async fn insert_expired_running_tasks(conn: &mut AsyncPgConnection, n: usize) -> Vec<uuid::Uuid> {
+/// Inserts `n` RUNNING activity rows on `queue` whose start-to-close budget
+/// has run out. Removes earlier rows on `queue` first.
+async fn insert_expired_running_tasks(
+    conn: &mut AsyncPgConnection,
+    queue: &str,
+    n: usize,
+) -> Vec<uuid::Uuid> {
+    diesel::sql_query("DELETE FROM harvest_task_queue WHERE queue_name = $1")
+        .bind::<diesel::sql_types::Text, _>(queue)
+        .execute(conn)
+        .await
+        .expect("clear queue");
     let mut ids = Vec::with_capacity(n);
     for _ in 0..n {
         let id = uuid::Uuid::new_v4();
@@ -261,86 +320,166 @@ async fn insert_expired_running_tasks(conn: &mut AsyncPgConnection, n: usize) ->
             "INSERT INTO harvest_task_queue \
              (id, queue_name, task_type, input, state, attempt, max_attempts, \
               started_at, start_to_close) \
-             VALUES ($1, 'scanner-lease-batch', 'activity', '{}'::jsonb, 'RUNNING', \
+             VALUES ($1, $2, 'activity', '{}'::jsonb, 'RUNNING', \
                      1, 1, NOW() - INTERVAL '1 minute', INTERVAL '1 second')",
         )
         .bind::<diesel::sql_types::Uuid, _>(id)
+        .bind::<diesel::sql_types::Text, _>(queue)
         .execute(conn)
         .await
         .expect("insert expired task");
         ids.push(id);
     }
+    ids.sort();
     ids
 }
 
+#[derive(QueryableByName)]
+struct Count {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    n: i64,
+}
+
+/// Expired start-to-close rows outside `queue`. The bound tests need none.
+async fn foreign_expired_rows(conn: &mut AsyncPgConnection, queue: &str) -> i64 {
+    let rows: Vec<Count> = diesel::sql_query(format!(
+        "SELECT COUNT(*) AS n FROM ({}) q WHERE q.queue_name <> $1",
+        timeout::start_to_close_timeout_query()
+    ))
+    .bind::<diesel::sql_types::Text, _>(queue)
+    .load(conn)
+    .await
+    .expect("count");
+    rows[0].n
+}
+
+/// Rows among `ids` still RUNNING.
+async fn still_running(conn: &mut AsyncPgConnection, ids: &[uuid::Uuid]) -> i64 {
+    let rows: Vec<Count> = diesel::sql_query(
+        "SELECT COUNT(*) AS n FROM harvest_task_queue WHERE id = ANY($1) AND state = 'RUNNING'",
+    )
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(ids)
+    .load(conn)
+    .await
+    .expect("count");
+    rows[0].n
+}
+
+fn start_to_close_ids(
+    page: &[(autumn_harvest::models::TaskQueueItem, TimeoutReason)],
+) -> Vec<uuid::Uuid> {
+    page.iter()
+        .filter(|(_, r)| *r == TimeoutReason::StartToClose)
+        .map(|(t, _)| t.id)
+        .collect()
+}
+
 /// AC2: a backlog larger than the batch is read one bounded batch per pass.
-/// The keyset cursor reaches every row once per cycle, and failing each
-/// batch drains the backlog.
+/// The keyset cursor reaches every row once per sweep, wraps after a short
+/// page, and failing each batch drains the backlog.
 #[tokio::test]
 async fn timeout_scan_is_bounded_per_pass_and_converges() {
     let (url, _container) = setup_test_db_url().await;
     let pool = build_pool(&url);
     let mut conn = pool.get().await.expect("connection");
-    let ours: HashSet<uuid::Uuid> = insert_expired_running_tasks(&mut conn, 7)
-        .await
-        .into_iter()
-        .collect();
+    let queue = "scanner-lease-batch";
+    let ours = insert_expired_running_tasks(&mut conn, queue, 7).await;
+    assert_eq!(
+        foreign_expired_rows(&mut conn, queue).await,
+        0,
+        "precondition: no other expired rows in this database"
+    );
     let limit = 3;
 
-    // Rows that stay expired: three passes must visit each row exactly once.
+    // Rows that stay expired: three passes visit each row once. The third
+    // page is short, so the fourth pass wraps to the lowest ids.
     let mut cursor = TimeoutScanCursor::default();
-    let mut seen = Vec::new();
+    let mut pages = Vec::new();
+    for _ in 0..4 {
+        let page = timeout::find_timed_out_tasks_batch(&mut conn, &mut cursor, limit)
+            .await
+            .expect("batch scan");
+        let ids = start_to_close_ids(&page);
+        assert!(
+            ids.len() <= 3,
+            "a pass must read at most one batch per reason, got {}",
+            ids.len()
+        );
+        pages.push(ids);
+    }
+    let first_sweep: Vec<_> = pages[..3].concat();
+    assert_eq!(
+        first_sweep, ours,
+        "one sweep reads every row once, in id order"
+    );
+    assert_eq!(pages[3], ours[..3], "a short page wraps the cursor");
+
+    // A limit below 1 counts as 1.
+    let page = timeout::find_timed_out_tasks_batch(&mut conn, &mut TimeoutScanCursor::default(), 0)
+        .await
+        .expect("batch scan");
+    assert_eq!(start_to_close_ids(&page), ours[..1]);
+
+    // Rows that leave the predicate: the backlog drains in ceil(7 / 3) passes.
+    let mut cursor = TimeoutScanCursor::default();
     for _ in 0..3 {
         let page = timeout::find_timed_out_tasks_batch(&mut conn, &mut cursor, limit)
             .await
             .expect("batch scan");
-        let start_to_close: Vec<_> = page
-            .iter()
-            .filter(|(_, r)| *r == TimeoutReason::StartToClose)
-            .collect();
-        assert!(
-            start_to_close.len() <= usize::try_from(limit).unwrap(),
-            "a pass must read at most one batch per reason, got {}",
-            start_to_close.len()
-        );
-        seen.extend(
-            start_to_close
-                .iter()
-                .map(|(t, _)| t.id)
-                .filter(|id| ours.contains(id)),
-        );
-    }
-    let distinct: HashSet<_> = seen.iter().copied().collect();
-    assert_eq!(
-        seen.len(),
-        distinct.len(),
-        "no row is read twice in a cycle"
-    );
-    assert_eq!(distinct, ours, "one cycle must reach every expired row");
-
-    // Rows that leave the predicate: the backlog drains in a bounded number
-    // of passes.
-    let mut cursor = TimeoutScanCursor::default();
-    let mut passes = 0;
-    loop {
-        let page = timeout::find_timed_out_tasks_batch(&mut conn, &mut cursor, limit)
-            .await
-            .expect("batch scan");
-        let mine: Vec<_> = page.iter().filter(|(t, _)| ours.contains(&t.id)).collect();
-        if mine.is_empty() && passes > 0 {
-            break;
-        }
-        for (task, _) in mine {
-            autumn_harvest::queue::fail_task(&mut conn, task.id, "timed out")
+        for id in start_to_close_ids(&page) {
+            autumn_harvest::queue::fail_task(&mut conn, id, "timed out")
                 .await
                 .expect("fail task");
         }
-        passes += 1;
-        assert!(
-            passes <= 4,
-            "the backlog must drain within ceil(7 / 3) + 1 passes"
-        );
     }
+    assert_eq!(
+        still_running(&mut conn, &ours).await,
+        0,
+        "the backlog must drain"
+    );
+}
+
+/// AC2, end to end: the spawned checker enforces one batch per pass.
+#[tokio::test]
+async fn spawned_checker_enforces_one_batch_per_pass() {
+    let (url, _container) = setup_test_db_url().await;
+    let pool = build_pool(&url);
+    let queue = "scanner-lease-spawned";
+    let ours = {
+        let mut conn = pool.get().await.expect("connection");
+        let ours = insert_expired_running_tasks(&mut conn, queue, 7).await;
+        assert_eq!(
+            foreign_expired_rows(&mut conn, queue).await,
+            0,
+            "precondition: no other expired rows in this database"
+        );
+        ours
+    };
+
+    // A long interval, so the test can stop the loop after its first pass.
+    let mut spec = Spec::new(
+        ShardId::new(17_952),
+        "batch-leader",
+        Duration::from_secs(2),
+        Duration::from_secs(10),
+    );
+    spec.batch = 3;
+    let checker = spawn_checker(&pool, spec);
+    wait_for("the first pass", Duration::from_secs(20), || {
+        checker.metrics.role("leader") >= 1
+    })
+    .await;
+    stop_all(vec![checker]).await;
+
+    let mut conn = pool.get().await.expect("connection");
+    let left = still_running(&mut conn, &ours).await;
+    // Leave no expired rows for the next test in a shared database.
+    diesel::sql_query("DELETE FROM harvest_task_queue WHERE queue_name = $1")
+        .bind::<diesel::sql_types::Text, _>(queue)
+        .execute(&mut conn)
+        .await
+        .expect("clear queue");
+    assert_eq!(left, 4, "one pass must enforce exactly one batch of 3");
 }
 
 /// AC3: kill the lease holder. A standby takes over within the lease TTL.
@@ -352,10 +491,11 @@ async fn standby_takes_over_within_lease_ttl() {
     let shard = ShardId::new(17_953);
     let interval = Duration::from_millis(100);
     let ttl = Duration::from_secs(2);
+    let longest_sleep = max_jittered_interval(interval, JITTER);
 
     let mut checkers: Vec<Checker> = ["k1", "k2", "k3"]
         .into_iter()
-        .map(|h| spawn_checker(&pool, shard, h, interval, ttl))
+        .map(|h| spawn_checker(&pool, Spec::new(shard, h, interval, ttl)))
         .collect();
 
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -367,6 +507,14 @@ async fn standby_takes_over_within_lease_ttl() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
 
+    // Renewal by the same holder keeps the epoch.
+    tokio::time::sleep(longest_sleep * 3).await;
+    assert_eq!(
+        live_holder(&pool, shard).await,
+        Some((first.clone(), first_epoch)),
+        "a renewal must keep the holder and the epoch"
+    );
+
     // Kill, not stop: an abort skips the graceful release.
     let idx = checkers.iter().position(|c| c.holder == first).unwrap();
     let killed = checkers.remove(idx);
@@ -374,6 +522,9 @@ async fn standby_takes_over_within_lease_ttl() {
     let _ = killed.handle.await;
     let killed_at = Instant::now();
 
+    // A standby leads on its first tick after the lease ends.
+    let bound =
+        effective_lease_ttl(ttl, interval, JITTER) + longest_sleep + Duration::from_millis(500);
     let (second, second_epoch) = loop {
         if let Some((holder, epoch)) = live_holder(&pool, shard).await
             && holder != first
@@ -381,11 +532,15 @@ async fn standby_takes_over_within_lease_ttl() {
             break (holder, epoch);
         }
         assert!(
-            killed_at.elapsed() < ttl + Duration::from_secs(2),
+            killed_at.elapsed() < bound,
             "no standby took over within the lease TTL"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
+    assert!(
+        killed_at.elapsed() >= ttl / 2,
+        "a killed holder must keep its lease until the TTL runs out"
+    );
     assert!(second_epoch > first_epoch, "a takeover must bump the epoch");
 
     let leader = checkers.iter().find(|c| c.holder == second).unwrap();
@@ -395,13 +550,19 @@ async fn standby_takes_over_within_lease_ttl() {
     })
     .await;
 
-    // Graceful stop: the holder releases the lease, so the last standby leads
-    // well inside the TTL.
+    // Graceful stop: the holder expires its lease on exit.
     let idx = checkers.iter().position(|c| c.holder == second).unwrap();
     let stopped = checkers.remove(idx);
     stopped.cancel.cancel();
     let _ = stopped.handle.await;
     let stopped_at = Instant::now();
+    let row = lease_row(&pool, shard).await;
+    assert!(
+        row.is_some_and(|r| r.holder != second || !r.live),
+        "a graceful stop must expire the lease"
+    );
+
+    // The last standby leads on its next tick, well inside the TTL.
     let last = &checkers[0];
     loop {
         if let Some((holder, _)) = live_holder(&pool, shard).await
@@ -410,14 +571,113 @@ async fn standby_takes_over_within_lease_ttl() {
             break;
         }
         assert!(
-            stopped_at.elapsed() < ttl,
-            "a graceful stop must hand over before the TTL runs out"
+            stopped_at.elapsed() < longest_sleep * 3 + Duration::from_millis(500),
+            "a graceful stop must hand over on the next standby tick"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    for c in checkers {
-        c.cancel.cancel();
-        let _ = c.handle.await;
+    stop_all(checkers).await;
+}
+
+/// A failed lease query does not stop enforcement: the checker runs the
+/// pass anyway. A holder id with a NUL byte makes Postgres reject the query
+/// without touching the schema.
+#[tokio::test]
+async fn a_failed_lease_query_fails_open() {
+    let (url, _container) = setup_test_db_url().await;
+    let pool = build_pool(&url);
+    let checker = spawn_checker(
+        &pool,
+        Spec::new(
+            ShardId::new(17_954),
+            "bad\0holder",
+            Duration::from_millis(100),
+            Duration::from_secs(2),
+        ),
+    );
+    wait_for("fail-open passes", Duration::from_secs(20), || {
+        checker.metrics.role("fail_open") >= 3
+    })
+    .await;
+    let (leader, standby) = (
+        checker.metrics.role("leader"),
+        checker.metrics.role("standby"),
+    );
+    stop_all(vec![checker]).await;
+    assert_eq!(
+        (leader, standby),
+        (0, 0),
+        "no tick may claim a lease it cannot take"
+    );
+}
+
+#[derive(Debug)]
+struct XorCodec(u8);
+
+impl PayloadCodec for XorCodec {
+    fn codec_id(&self) -> &'static str {
+        "xor"
     }
+    fn encode(&self, raw: &[u8]) -> Result<Vec<u8>, CodecError> {
+        Ok(raw.iter().map(|b| b ^ self.0).collect())
+    }
+    fn decode(&self, encoded: &[u8]) -> Result<Vec<u8>, CodecError> {
+        Ok(encoded.iter().map(|b| b ^ self.0).collect())
+    }
+}
+
+fn two_key_registry() -> PayloadCodecs {
+    let codecs = PayloadCodecs::default();
+    codecs
+        .register_key("k1", Arc::new(XorCodec(0x11)))
+        .expect("register k1");
+    codecs
+        .register_key("k2", Arc::new(XorCodec(0x22)))
+        .expect("register k2");
+    codecs.set_active_key("k1").expect("activate k1");
+    codecs
+}
+
+/// A standby skips the pass but still refreshes its active codec key.
+/// Codec key retirement counts on every live process to do that each tick.
+#[tokio::test]
+async fn a_standby_still_refreshes_its_codec_key() {
+    let (url, _container) = setup_test_db_url().await;
+    let pool = build_pool(&url);
+    let shard = ShardId::new(17_955);
+    let interval = Duration::from_millis(100);
+
+    let views: Vec<PayloadCodecs> = (0..2).map(|_| two_key_registry()).collect();
+    let checkers: Vec<Checker> = ["c1", "c2"]
+        .into_iter()
+        .zip(&views)
+        .map(|(h, codecs)| {
+            let mut spec = Spec::new(shard, h, interval, Duration::from_secs(5));
+            spec.codecs = codecs.clone();
+            spawn_checker(&pool, spec)
+        })
+        .collect();
+    wait_for("a standby tick", Duration::from_secs(20), || {
+        checkers.iter().any(|c| c.metrics.role("standby") > 0)
+    })
+    .await;
+
+    let operator = two_key_registry();
+    let sharded = autumn_harvest::ShardedDbPool::single(pool.clone());
+    autumn_harvest::codec_rotation::activate_codec_key(
+        &sharded,
+        &[ShardId::new(0)],
+        &operator,
+        "k2",
+        60,
+    )
+    .await
+    .expect("activate k2");
+
+    wait_for("both checkers on k2", Duration::from_secs(20), || {
+        views.iter().all(|c| c.active_key_id() == "k2")
+    })
+    .await;
+    stop_all(checkers).await;
 }

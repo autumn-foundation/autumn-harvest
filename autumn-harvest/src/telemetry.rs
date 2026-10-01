@@ -1394,7 +1394,8 @@ pub const METRIC_SESSION_ACQUISITION: &str = "harvest.session.acquisition";
 /// `GET /admin/preflight` for deployments without a metrics pipeline.
 pub const METRIC_SCANNER_TICK: &str = "harvest.scanner.tick";
 
-/// Counter: one tick of a per-shard background scanner, by role (issue #1795).
+/// Counter: one per-shard scanner tick that reached the database, by role
+/// (issue #1795).
 ///
 /// Labels: `scanner`, `shard`, and `role`. A `role` is one of:
 ///

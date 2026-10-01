@@ -28629,7 +28629,11 @@ impl Worker {
                 crate::timeout::spawn_timeout_checker_on_shard_pool(
                     shard_pool.clone(),
                     self.shutdown.clone(),
-                    self.config.scanner.timeout_interval,
+                    // Issue #1795: `None` keeps the poll-interval cadence.
+                    self.config
+                        .scanner
+                        .timeout_interval
+                        .unwrap_or(self.config.poll_interval),
                     self.registry.telemetry().clone(),
                     self.config.unknown_target_grace_window,
                     self.config.sharded_pool.clone(),
