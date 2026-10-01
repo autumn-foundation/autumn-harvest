@@ -6006,6 +6006,20 @@ async fn acquire_shard_conn(
 /// or `start_to_close` timeout, as before.
 const FINALIZE_ACQUIRE_ATTEMPTS: u32 = 10;
 
+/// How many times to run an activity result write that a session timeout
+/// cancels (issue #1788).
+///
+/// An offloaded result uploads its blob on each try, before the transaction.
+/// The rollback then drops the reference row but not the blob. So with an
+/// offloader there is one try, and a session timeout releases the claim.
+const fn result_write_attempts(offloading: bool) -> u32 {
+    if offloading {
+        1
+    } else {
+        FINALIZE_ACQUIRE_ATTEMPTS
+    }
+}
+
 /// The `site` label for a claim acquire timeout.
 const SITE_CLAIM: &str = "claim";
 
@@ -15576,7 +15590,9 @@ async fn process_activity_task(
     //
     // A session `statement_timeout` or `lock_timeout` rolls the write back
     // (issue #1788). The handler already ran, so try again. Each finalization
-    // re-checks `RUNNING` under a row lock, so a repeat is safe.
+    // re-checks `RUNNING` under a row lock, so a repeat is safe. An offloader
+    // turns the repeats off; see `result_write_attempts`.
+    let attempts = result_write_attempts(registry.payload_offloader().is_some());
     let mut attempt = 1;
     loop {
         let outcome = handle_activity_result(
@@ -15596,10 +15612,7 @@ async fn process_activity_task(
         )
         .await;
         match outcome {
-            Err(error)
-                if attempt < FINALIZE_ACQUIRE_ATTEMPTS
-                    && crate::pool::is_session_timeout(&error) =>
-            {
+            Err(error) if attempt < attempts && crate::pool::is_session_timeout(&error) => {
                 tracing::warn!(
                     task_id = %task.id,
                     attempt,
@@ -31226,13 +31239,15 @@ pub async fn quarantine_workflow_task_timeout(
 /// Whether the dispatch error path releases the claim after `error`.
 ///
 /// A workflow task has no deadline column, so its claim is always released.
-/// An activity can have every deadline unset. After a pool acquire timeout
-/// (issue #1788) no scanner would then find it, and the orphan reclaimer
-/// skips a live worker. Release it too. The handler may already have run, so
-/// the activity can run again. That is the at-least-once contract a crash
-/// gives as well.
+/// An activity can have every deadline unset. After a pool acquire timeout or
+/// a session timeout (issue #1788) no scanner would then find it, and the
+/// orphan reclaimer skips a live worker. Release it too. The handler may
+/// already have run, so the activity can run again. That is the
+/// at-least-once contract a crash gives as well.
 fn releases_claim_after_error(task_type: &str, error: &HarvestError) -> bool {
-    task_type == "workflow" || (task_type == "activity" && error.is_pool_acquire_timeout())
+    task_type == "workflow"
+        || (task_type == "activity"
+            && (error.is_pool_acquire_timeout() || crate::pool::is_session_timeout(error)))
 }
 
 /// Backoff schedule for [`reset_timed_out_workflow_task`]'s pool-connection
@@ -34348,10 +34363,24 @@ mod tests {
             waited: Duration::from_secs(30),
         };
         let other = crate::error::HarvestError::Database("boom".into());
+        let session_timeout =
+            crate::error::HarvestError::Database("canceling statement due to lock timeout".into());
         assert!(releases_claim_after_error("activity", &timeout));
+        assert!(
+            releases_claim_after_error("activity", &session_timeout),
+            "a result write that used up its session-timeout retries must not strand"
+        );
         assert!(!releases_claim_after_error("activity", &other));
         assert!(releases_claim_after_error("workflow", &timeout));
         assert!(releases_claim_after_error("workflow", &other));
+    }
+
+    /// An offloaded result uploads a blob on each try. A repeat would leave
+    /// blobs that no row references, so offloading turns the repeats off.
+    #[test]
+    fn offloading_turns_off_result_write_repeats() {
+        assert_eq!(result_write_attempts(false), FINALIZE_ACQUIRE_ATTEMPTS);
+        assert_eq!(result_write_attempts(true), 1);
     }
 
     #[derive(Default)]

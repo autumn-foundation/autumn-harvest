@@ -34,10 +34,11 @@ to 10 tries. Each try spans at least the pool bound, so a short pool incident
 or outage does not drop the result. A result write that a session
 `statement_timeout` or `lock_timeout` cancels also runs again, up to 10 times.
 Each write re-checks that the task is `RUNNING` under a row lock, so a repeat
-is safe.
+is safe. With a payload offloader there is no repeat: each try would upload a
+blob that no row then references.
 
-An activity task that still fails with a pool acquire timeout goes back to the
-queue. An activity can have no heartbeat, `start_to_close` or
+An activity task that still fails with a pool acquire timeout or a session
+timeout goes back to the queue. An activity can have no heartbeat, `start_to_close` or
 `schedule_to_close` deadline, and then no scanner would find it. The release
 checks the claim's `attempt` and `worker_id`. The activity can run again, as it
 can after a worker crash.
