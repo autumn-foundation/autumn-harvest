@@ -356,9 +356,8 @@ impl WorkerRuntimeConfig {
                 ));
             }
             // `min_slots == 0` is a liveness hazard, not just a degenerate
-            // band: the default controller's grow signal depends on
-            // observing a claim-to-dispatch permit wait, which requires a
-            // task to actually be dispatched. If pool pressure ever shrinks
+            // band. The grow signal of the default controller needs a
+            // dispatch wait. A dispatch wait needs a dispatched task. If pool pressure ever shrinks
             // the target to 0, no task can dispatch, so no permit wait is
             // ever recorded and the worker is permanently stuck at zero
             // capacity — the same silent-outage shape as `max_slots == 0`.
@@ -25333,8 +25332,9 @@ pub struct Worker {
     /// Total permits behind `activity_semaphore` (issue #548). See
     /// `workflow_permit_total`.
     activity_permit_total: usize,
-    /// Longest claim-to-dispatch permit-wait observed since the slot tuner's
-    /// last tick, in microseconds (issue #548). `None` when no tuner is
+    /// Longest dispatch wait observed since the slot tuner's last tick, in
+    /// microseconds (issue #548). See `SlotObservations::max_permit_wait`
+    /// for what a dispatch wait includes (issue #1787). `None` when no tuner is
     /// configured, so the hot dispatch path performs no extra work in the
     /// default (untuned) case. Reset to 0 by the tuner loop each tick
     /// (`AtomicU64::swap`).
@@ -25348,15 +25348,23 @@ pub struct Worker {
     /// tuner-loop task in the same call, before any task can be dispatched —
     /// see the comment there.
     workflow_permit_wait_micros: Option<Arc<AtomicU64>>,
-    /// Longest claim-to-dispatch permit-wait for the activity semaphore
-    /// (issue #548). See `workflow_permit_wait_micros`.
+    /// Longest dispatch wait for the activity semaphore (issue #548). See
+    /// `workflow_permit_wait_micros`.
     activity_permit_wait_micros: Option<Arc<AtomicU64>>,
-    /// Workflow references claimed through the channel that do not hold their
-    /// permit yet (issue #1312). See [`DispatchReservation`].
+    /// Workflow tasks claimed through the dispatch channel that do not hold
+    /// their permit yet (issue #1312). See [`DispatchReservation`].
     dispatch_reserved_workflow: Arc<AtomicUsize>,
-    /// Activity references claimed through the channel that do not hold their
-    /// permit yet (issue #1312). See [`DispatchReservation`].
+    /// Activity tasks claimed through the dispatch channel that do not hold
+    /// their permit yet (issue #1312). See [`DispatchReservation`].
     dispatch_reserved_activity: Arc<AtomicUsize>,
+    /// Wakes a saturated poll loop when a task releases its permit (issue
+    /// #1787). See [`CapacityPermit`].
+    capacity_freed: Arc<tokio::sync::Notify>,
+    /// Kinds the poll gate refused since the last claim of that kind (issue
+    /// #1787). The slot tuner counts a claimed task's queue wait only when
+    /// the gate held its kind back. Otherwise a NOTIFY delay reads as a
+    /// backlog.
+    gate_refused: Arc<GateRefused>,
     /// Set the first time `spawn_monitoring_tasks` runs to completion (issue
     /// #548 review). Guards against a hypothetical second invocation (e.g. a
     /// future caller wrapping `run`/`run_with_listener` in a retry loop)
@@ -26508,7 +26516,7 @@ impl DispatchLoopState {
     }
 }
 
-/// One reference claimed through the channel that does not hold its permit yet.
+/// One claimed task that does not hold its permit yet.
 ///
 /// A worker dispatches a claimed task by spawning it. The spawned task is what
 /// acquires the pool permit, so `available_permits` still counts that permit as
@@ -26518,6 +26526,8 @@ impl DispatchLoopState {
 ///
 /// The guard is created before the claim. It moves into the spawned task, which
 /// drops it as soon as it holds the permit. A claim that fails drops it at once.
+/// The Postgres poll path holds a real permit instead (issue #1787). See
+/// [`PollPermits`].
 #[derive(Debug)]
 struct DispatchReservation(Arc<AtomicUsize>);
 
@@ -26584,6 +26594,127 @@ const fn dispatch_kind_admitted(
         Some(crate::dispatch::DispatchKind::Activity) => free_activity > 0,
         None => true,
     }
+}
+
+/// What one Postgres poll may claim (issue #1787).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PollAdmission {
+    /// No pool has a free permit. The poll claims nothing.
+    Saturated,
+    /// Both pools have a free permit. The poll claims any kind.
+    Any,
+    /// Only the pool of this kind has a free permit.
+    Only(crate::queue::TaskType),
+}
+
+/// Which kinds one Postgres poll may claim (issue #1787).
+///
+/// A claim stamps `started_at`. Start-to-close and heartbeat deadlines run
+/// from `started_at`. A row claimed with no free permit waits on the local
+/// semaphore and uses its timeout budget. A peer with capacity cannot claim it.
+/// [`dispatch_kind_admitted`] is the same gate on the dispatch-channel path.
+const fn poll_admission(free_workflow: usize, free_activity: usize) -> PollAdmission {
+    use crate::queue::TaskType;
+    match (free_workflow > 0, free_activity > 0) {
+        (false, false) => PollAdmission::Saturated,
+        (true, true) => PollAdmission::Any,
+        (true, false) => PollAdmission::Only(TaskType::Workflow),
+        (false, true) => PollAdmission::Only(TaskType::Activity),
+    }
+}
+
+/// The permits one Postgres poll holds across its claim (issue #1787).
+///
+/// The poll takes one real permit of each kind it may claim, before the
+/// claim. Nothing else can take a held permit. A slot tuner shrink therefore
+/// cannot leave a claimed row without a permit while its timeout runs. The
+/// claimed row's permit moves into the spawned task. The other permit goes
+/// back when this value drops.
+#[derive(Debug)]
+struct PollPermits {
+    workflow: Option<tokio::sync::OwnedSemaphorePermit>,
+    activity: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl PollPermits {
+    /// Take one free permit of each kind that `admission` allows.
+    fn acquire(
+        admission: PollAdmission,
+        workflow: &Arc<Semaphore>,
+        activity: &Arc<Semaphore>,
+    ) -> Self {
+        use crate::queue::TaskType;
+        let take = |kind: TaskType, semaphore: &Arc<Semaphore>| {
+            let admitted = match admission {
+                PollAdmission::Saturated => false,
+                PollAdmission::Any => true,
+                PollAdmission::Only(only) => only == kind,
+            };
+            if admitted {
+                Arc::clone(semaphore).try_acquire_owned().ok()
+            } else {
+                None
+            }
+        };
+        Self {
+            workflow: take(TaskType::Workflow, workflow),
+            activity: take(TaskType::Activity, activity),
+        }
+    }
+
+    /// What the held permits allow this poll to claim.
+    fn admission(&self) -> PollAdmission {
+        poll_admission(
+            usize::from(self.workflow.is_some()),
+            usize::from(self.activity.is_some()),
+        )
+    }
+
+    /// Take the permit for the `task_type` of a claimed row.
+    fn take(&mut self, task_type: &str) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        use crate::queue::TaskType;
+        if task_type == TaskType::Workflow.as_str() {
+            self.workflow.take()
+        } else if task_type == TaskType::Activity.as_str() {
+            self.activity.take()
+        } else {
+            None
+        }
+    }
+}
+
+/// A held pool permit that wakes a saturated poll loop on release (issue
+/// #1787).
+///
+/// `Drop` returns the permit first and then notifies. A loop woken before the
+/// return would read the pool as full and wait again. `notify_one` stores one
+/// wake-up when no loop waits, so a release during a claim is not lost.
+struct CapacityPermit {
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    freed: Arc<tokio::sync::Notify>,
+}
+
+impl CapacityPermit {
+    fn new(permit: tokio::sync::OwnedSemaphorePermit, freed: &Arc<tokio::sync::Notify>) -> Self {
+        Self {
+            permit: Some(permit),
+            freed: Arc::clone(freed),
+        }
+    }
+}
+
+impl Drop for CapacityPermit {
+    fn drop(&mut self) {
+        drop(self.permit.take());
+        self.freed.notify_one();
+    }
+}
+
+/// One flag per task kind: the poll gate refused this kind (issue #1787).
+#[derive(Debug, Default)]
+struct GateRefused {
+    workflow: AtomicBool,
+    activity: AtomicBool,
 }
 
 /// Whether one more lease of `kind` fits this shard's own fair share of its
@@ -26921,6 +27052,8 @@ impl Worker {
             activity_permit_wait_micros: activity_parts.permit_wait_micros,
             dispatch_reserved_workflow: Arc::new(AtomicUsize::new(0)),
             dispatch_reserved_activity: Arc::new(AtomicUsize::new(0)),
+            capacity_freed: Arc::new(tokio::sync::Notify::new()),
+            gate_refused: Arc::new(GateRefused::default()),
             monitoring_started: std::sync::atomic::AtomicBool::new(false),
             shutdown: CancellationToken::new(),
             remote_drain_deadline: Arc::new(Mutex::new(None)),
@@ -27704,56 +27837,80 @@ impl Worker {
             // wake the loop.
             let poll_interval = self.config.poll_interval;
             let shutdown = &self.shutdown;
+            // A full pool also wakes on a released permit (issue #1787).
+            let capacity_bound = self.capacity_bound();
 
             if shard_listeners.iter().all(Option::is_none) {
                 tokio::select! {
                     () = shutdown.cancelled() => break,
+                    () = self.capacity_freed.notified(), if capacity_bound => {}
                     () = tokio::time::sleep(poll_interval) => {}
                 }
             } else {
-                // Poll each listener with a short cap; overall timeout = poll_interval.
-                let per_check = Duration::from_millis(10).min(poll_interval);
-                let deadline = tokio::time::Instant::now() + poll_interval;
-                let mut notified = false;
+                self.wait_on_shard_listeners(&mut shard_listeners, capacity_bound)
+                    .await;
+            }
+        }
+    }
 
-                'notify_wait: while tokio::time::Instant::now() < deadline
-                    && !shutdown.is_cancelled()
-                {
-                    let mut broken_idx: Option<usize> = None;
-                    for (i, slot) in shard_listeners.iter_mut().enumerate() {
-                        if let Some(listener) = slot.as_mut() {
-                            match listener.wait_for_notification(per_check).await {
-                                Ok(Some(_)) => {
-                                    notified = true;
-                                    break 'notify_wait;
-                                }
-                                Ok(None) => {}
-                                Err(error) => {
-                                    tracing::warn!(
-                                        worker_id = %self.config.worker_id,
-                                        shard_idx = i,
-                                        error = %error,
-                                        "LISTEN/NOTIFY wait failed for shard; removing listener"
-                                    );
-                                    broken_idx = Some(i);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    if let Some(i) = broken_idx {
-                        shard_listeners[i] = None;
-                        // All listeners gone: nothing left to await in this loop,
-                        // so bail out instead of busy-spinning until the deadline.
-                        if shard_listeners.iter().all(Option::is_none) {
+    /// Wait on every per-shard listener in round-robin, for up to one
+    /// `poll_interval` (extracted from [`Self::run_poll_loop_multi`]).
+    ///
+    /// With `capacity_bound`, a released permit also ends the wait (issue
+    /// #1787).
+    async fn wait_on_shard_listeners(
+        &self,
+        shard_listeners: &mut [Option<crate::notify::QueueListener>],
+        capacity_bound: bool,
+    ) {
+        let poll_interval = self.config.poll_interval;
+        let shutdown = &self.shutdown;
+        // Poll each listener with a short cap; overall timeout = poll_interval.
+        let per_check = Duration::from_millis(10).min(poll_interval);
+        let deadline = tokio::time::Instant::now() + poll_interval;
+        let mut notified = false;
+
+        'notify_wait: while tokio::time::Instant::now() < deadline && !shutdown.is_cancelled() {
+            // One check per round of listener slices. A released
+            // permit waits at most one round.
+            if capacity_bound
+                && futures::FutureExt::now_or_never(self.capacity_freed.notified()).is_some()
+            {
+                break 'notify_wait;
+            }
+            let mut broken_idx: Option<usize> = None;
+            for (i, slot) in shard_listeners.iter_mut().enumerate() {
+                if let Some(listener) = slot.as_mut() {
+                    match listener.wait_for_notification(per_check).await {
+                        Ok(Some(_)) => {
+                            notified = true;
                             break 'notify_wait;
                         }
+                        Ok(None) => {}
+                        Err(error) => {
+                            tracing::warn!(
+                                worker_id = %self.config.worker_id,
+                                shard_idx = i,
+                                error = %error,
+                                "LISTEN/NOTIFY wait failed for shard; removing listener"
+                            );
+                            broken_idx = Some(i);
+                            break;
+                        }
                     }
                 }
-                if notified {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            if let Some(i) = broken_idx {
+                shard_listeners[i] = None;
+                // All listeners gone: nothing left to await in this loop,
+                // so bail out instead of busy-spinning until the deadline.
+                if shard_listeners.iter().all(Option::is_none) {
+                    break 'notify_wait;
                 }
             }
+        }
+        if notified {
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 
@@ -28591,11 +28748,13 @@ impl Worker {
                         runtime: workflow_runtime,
                         permit_wait_micros: workflow_permit_wait,
                         slot_type: SlotType::Workflow,
+                        capacity_freed: Some(Arc::clone(&self.capacity_freed)),
                     },
                     crate::slot_tuner::TunedSlot {
                         runtime: activity_runtime,
                         permit_wait_micros: activity_permit_wait,
                         slot_type: SlotType::Activity,
+                        capacity_freed: Some(Arc::clone(&self.capacity_freed)),
                     },
                     Arc::clone(&tuner_cfg.tuner),
                     move || {
@@ -29128,7 +29287,7 @@ impl Worker {
         dispatched
     }
 
-    /// Permits of one pool that no claimed reference has spoken for yet.
+    /// Permits of one pool that no claimed task has reserved yet.
     fn free_permits(semaphore: &tokio::sync::Semaphore, reserved: &Arc<AtomicUsize>) -> usize {
         // Fully qualified: diesel's blanket `RunQueryDsl::load` is in scope here
         // and shadows the inherent `AtomicUsize::load` through the `Arc` deref.
@@ -29139,8 +29298,9 @@ impl Worker {
 
     /// Drain the backlog through the Postgres claim path (issue #1312).
     ///
-    /// This is the ordinary poll loop, one iteration of it: claim until the
-    /// backlog is empty, then wait one poll interval. A degraded worker
+    /// This is the ordinary poll loop, one iteration of it. It claims until
+    /// the backlog is empty or no permit is free, then waits one poll
+    /// interval. A released permit ends that wait early (issue #1787). A degraded worker
     /// therefore claims at the Postgres rate, not at one row per failed channel
     /// call. A channel call that fails can cost the poll interval plus the call
     /// timeout. One claim per call is a throughput collapse, not a fallback.
@@ -29203,8 +29363,11 @@ impl Worker {
         // idle, so it always waits, unchanged.
         if idle {
             let wait = dispatch_read_block(shard_count, self.config.poll_interval);
+            // A full pool also wakes on a released permit (issue #1787).
+            let capacity_bound = self.capacity_bound();
             tokio::select! {
                 () = self.shutdown.cancelled() => {}
+                () = self.capacity_freed.notified(), if capacity_bound => {}
                 () = tokio::time::sleep(wait) => {}
             }
         }
@@ -29317,7 +29480,7 @@ impl Worker {
                     queue = %task.queue_name,
                     "claimed task (dispatch)"
                 );
-                self.dispatch_task(task, pool, reservation);
+                self.dispatch_task(task, pool, reservation, None);
                 ReferenceDisposition::Dispatched(lease)
             }
             Ok(None) => {
@@ -29641,28 +29804,36 @@ impl Worker {
                 continue;
             }
 
-            if let Some(listener) = listener.as_mut() {
-                match listener
-                    .wait_for_notification(self.config.poll_interval)
-                    .await
-                {
-                    Ok(Some(_)) => {
-                        // Host-side timestamps can be slightly ahead of Postgres NOW(),
-                        // so give newly notified tasks a brief moment to become claimable.
-                        tokio::time::sleep(Duration::from_millis(50)).await;
+            let idle_wait = async {
+                if let Some(listener) = listener.as_mut() {
+                    match listener
+                        .wait_for_notification(self.config.poll_interval)
+                        .await
+                    {
+                        Ok(Some(_)) => {
+                            // Host-side timestamps can be slightly ahead of Postgres NOW(),
+                            // so give newly notified tasks a brief moment to become claimable.
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            tracing::warn!(
+                                worker_id = %self.config.worker_id,
+                                error = %error,
+                                "LISTEN/NOTIFY wait failed; sleeping before retry"
+                            );
+                            tokio::time::sleep(self.config.poll_interval).await;
+                        }
                     }
-                    Ok(None) => {}
-                    Err(error) => {
-                        tracing::warn!(
-                            worker_id = %self.config.worker_id,
-                            error = %error,
-                            "LISTEN/NOTIFY wait failed; sleeping before retry"
-                        );
-                        tokio::time::sleep(self.config.poll_interval).await;
-                    }
+                } else {
+                    tokio::time::sleep(self.config.poll_interval).await;
                 }
-            } else {
-                tokio::time::sleep(self.config.poll_interval).await;
+            };
+            // A full pool also wakes on a released permit (issue #1787).
+            let capacity_bound = self.capacity_bound();
+            tokio::select! {
+                () = self.capacity_freed.notified(), if capacity_bound => {}
+                () = idle_wait => {}
             }
         }
     }
@@ -30102,23 +30273,79 @@ impl Worker {
         }
     }
 
+    /// What a Postgres poll may claim now. See [`poll_admission`].
+    fn poll_admission_now(&self) -> PollAdmission {
+        poll_admission(
+            Self::free_permits(&self.workflow_semaphore, &self.dispatch_reserved_workflow),
+            Self::free_permits(&self.activity_semaphore, &self.dispatch_reserved_activity),
+        )
+    }
+
+    /// Whether a released permit can unblock a claim this worker refuses
+    /// (issue #1787).
+    ///
+    /// True when at least one pool has no free permit. The idle wait then
+    /// also wakes on `capacity_freed`. A NOTIFY alone does not do it: the
+    /// backlog that waits for the permit sent its NOTIFY long ago.
+    fn capacity_bound(&self) -> bool {
+        self.poll_admission_now() != PollAdmission::Any
+    }
+
+    /// Mark each kind the gate refuses (issue #1787). See `gate_refused`.
+    fn record_gate_refusal(&self, admission: PollAdmission) {
+        use crate::queue::TaskType;
+        let (workflow, activity) = match admission {
+            PollAdmission::Saturated => (true, true),
+            PollAdmission::Any => (false, false),
+            PollAdmission::Only(TaskType::Workflow) => (false, true),
+            PollAdmission::Only(TaskType::Activity) => (true, false),
+        };
+        if workflow {
+            AtomicBool::store(&self.gate_refused.workflow, true, Ordering::Relaxed);
+        }
+        if activity {
+            AtomicBool::store(&self.gate_refused.activity, true, Ordering::Relaxed);
+        }
+    }
+
     /// Execute a single poll iteration.
     ///
-    /// Gets a connection from the pool, tries to claim a task, dispatches it
-    /// if found, or sleeps for `poll_interval` if the queue was empty.
+    /// Claims one task of a kind with a free permit and dispatches it. Returns
+    /// `false` when no permit is free, no task is claimable, or the claim
+    /// fails. The caller then waits (issue #1787).
     ///
     /// `acquire_bound` optionally caps the pool acquisition. It is `None` on
     /// the single-shard path (byte-for-byte the original unbounded
     /// `pool.get().await`) and `Some(poll_interval)` when one loop drains
     /// several shards in sequence, so an exhausted pool on one shard cannot
     /// park the loop and strand its peers -- see `shard_acquire_bound`.
-    #[allow(clippy::too_many_lines)]
+    // significant_drop_tightening: `permits` holds `OwnedSemaphorePermit`s
+    // across the claim on purpose (issue #1787). An earlier drop would let a
+    // slot tuner shrink take the permit of a row this poll then claims.
+    #[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
     async fn poll_once(
         &self,
         pool: &DbPool,
         acquire_bound: Option<Duration>,
         shard: Option<crate::types::ShardId>,
     ) -> bool {
+        // Claim only against a free local permit (issue #1787). See
+        // [`poll_admission`]. The read honors dispatch-channel reservations.
+        // The poll then holds a real permit of each admitted kind across the
+        // claim. See [`PollPermits`]. A saturated poll takes no connection.
+        let mut permits = PollPermits::acquire(
+            self.poll_admission_now(),
+            &self.workflow_semaphore,
+            &self.activity_semaphore,
+        );
+        let admission = permits.admission();
+        self.record_gate_refusal(admission);
+        let kind = match admission {
+            PollAdmission::Saturated => return false,
+            PollAdmission::Any => None,
+            PollAdmission::Only(kind) => Some(kind),
+        };
+
         let mut conn = match acquire_shard_conn(pool, acquire_bound).await {
             Ok(conn) => conn,
             Err(e) => {
@@ -30165,7 +30392,7 @@ impl Worker {
                 // permutation. A claim that succeeds on the first
                 // (typically highest-weight) queue never pays for the rest.
                 let single_queue = [(*queue_name).to_owned()];
-                match queue::claim_task_on_shard(
+                match queue::claim_task_of_kind_on_shard(
                     &mut conn,
                     &single_queue,
                     &self.config.worker_id,
@@ -30174,6 +30401,7 @@ impl Worker {
                     circuit_breaker_activities,
                     &self.ineligible_activities,
                     shard,
+                    kind,
                 )
                 .await
                 {
@@ -30184,7 +30412,8 @@ impl Worker {
                             queue = %task.queue_name,
                             "claimed task (weighted)"
                         );
-                        self.dispatch_task(task, pool, None);
+                        let permit = permits.take(&task.task_type);
+                        self.dispatch_task(task, pool, None, permit);
                         return true;
                     }
                     Ok(None) => {
@@ -30207,7 +30436,7 @@ impl Worker {
         }
 
         // --- Default (unweighted) path: original single ANY($2) query ---
-        match queue::claim_task_on_shard(
+        match queue::claim_task_of_kind_on_shard(
             &mut conn,
             &self.config.queues,
             &self.config.worker_id,
@@ -30216,6 +30445,7 @@ impl Worker {
             circuit_breaker_activities,
             &self.ineligible_activities,
             shard,
+            kind,
         )
         .await
         {
@@ -30226,17 +30456,13 @@ impl Worker {
                     queue = %task.queue_name,
                     "claimed task"
                 );
-                // schedule-to-start latency is recorded once the handler
-                // genuinely begins (in `process_workflow_task` /
-                // `process_activity_task`, past the dispatch-time defer/no-op
-                // gates), not here at claim time: the worker can over-claim past
-                // `max_concurrent_*` (the semaphore gates execution, not
-                // claiming), so measuring at claim would hide the time a task
-                // spends waiting behind a local permit on a saturated worker —
-                // exactly the capacity bottleneck the SLI is meant to page on.
-                // `schedule_to_start_secs` measures from task eligibility, so that
-                // permit wait is still captured in the recorded sample.
-                self.dispatch_task(task, pool, None);
+                // Schedule-to-start is recorded when the handler begins, in
+                // `process_workflow_task` / `process_activity_task`. It is not
+                // recorded here. The sample runs from task eligibility. It
+                // includes the `PENDING` wait behind a saturated worker (issue
+                // #1787) and the short permit wait after the claim.
+                let permit = permits.take(&task.task_type);
+                self.dispatch_task(task, pool, None, permit);
                 true
             }
             Ok(None) => {
@@ -30251,12 +30477,16 @@ impl Worker {
     }
 
     /// Spawn a bounded Tokio task for the claimed work item.
+    ///
+    /// `held_permit` is the pool permit the poll gate took before the claim
+    /// (issue #1787). Without it, the task acquires a permit on spawn.
     #[allow(clippy::too_many_lines)]
     fn dispatch_task(
         &self,
         task: TaskQueueItem,
         pool: &DbPool,
         reservation: Option<DispatchReservation>,
+        held_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     ) {
         // Debug-only tripwire (issue #548 review): dispatch must never race
         // ahead of `spawn_monitoring_tasks`, which withholds a tuned
@@ -30301,6 +30531,27 @@ impl Worker {
         };
         let session_slots_in_use = Arc::clone(&self.session_slots_in_use);
         let max_concurrent_sessions = self.config.max_concurrent_sessions;
+        let capacity_freed = Arc::clone(&self.capacity_freed);
+        // The row waited in `PENDING` from eligibility to claim. Database
+        // clocks measure this wait. The poll gate holds a backlog in
+        // `PENDING`, not at the permit (issue #1787). The tuner signal below
+        // adds this wait only when the gate refused this kind since its last
+        // claim. Read only when a tuner is configured.
+        let gate_refused = match kind {
+            ClaimedTaskKind::Workflow => &self.gate_refused.workflow,
+            ClaimedTaskKind::Activity => &self.gate_refused.activity,
+        };
+        let queue_wait = permit_wait_micros
+            .as_ref()
+            .filter(|_| AtomicBool::swap(gate_refused, false, Ordering::Relaxed))
+            .map(|_| {
+                Duration::try_from_secs_f64(queue::schedule_to_start_secs(
+                    task.scheduled_at,
+                    task.created_at,
+                    task.started_at.unwrap_or(task.scheduled_at),
+                ))
+                .unwrap_or_default()
+            });
 
         // Per-queue dispatch counter for live split observability (issue #515).
         self.registry
@@ -30376,11 +30627,21 @@ impl Worker {
         // body at the same nesting, so this change adds no reindentation to
         // the hottest file in the repo.
         let task_body = async move {
-            // Acquire semaphore permit — blocks if at concurrency limit.
-            let Ok(permit) = semaphore.acquire().await else {
-                tracing::error!(task_id = %task_id, "semaphore closed");
-                return;
-            };
+            // Acquire semaphore permit — blocks if at concurrency limit. A
+            // poll-path claim already holds one (issue #1787).
+            // The release wakes a saturated poll loop (issue #1787).
+            let permit = CapacityPermit::new(
+                if let Some(permit) = held_permit {
+                    permit
+                } else {
+                    let Ok(permit) = Arc::clone(&semaphore).acquire_owned().await else {
+                        tracing::error!(task_id = %task_id, "semaphore closed");
+                        return;
+                    };
+                    permit
+                },
+                &capacity_freed,
+            );
             // The permit is held, so the reference no longer needs a
             // reservation against it (issue #1312). The early return above
             // drops it too, so a closed semaphore cannot leak one.
@@ -30389,10 +30650,11 @@ impl Worker {
             // Feed the adaptive slot tuner's permit-wait signal (issue #548).
             // A lock-free fetch_max so concurrent dispatches never contend;
             // the tuner loop consumes (and resets) this via `swap(0, ..)`
-            // once per tick, off this hot path entirely.
+            // once per tick, off this hot path entirely. The signal is the
+            // queue wait plus the permit wait (issue #1787).
             if let Some(acc) = &permit_wait_micros {
-                let wait_micros =
-                    u64::try_from(dispatched_at.elapsed().as_micros()).unwrap_or(u64::MAX);
+                let wait = dispatched_at.elapsed() + queue_wait.unwrap_or_default();
+                let wait_micros = u64::try_from(wait.as_micros()).unwrap_or(u64::MAX);
                 acc.fetch_max(wait_micros, Ordering::Relaxed);
             }
 
@@ -42907,6 +43169,124 @@ mod tests {
             dispatch_kind_admitted(None, 0, 0),
             "an untyped reference keeps the behaviour it had before the kind existed"
         );
+    }
+
+    /// The Postgres poll path claims only a kind with a free permit (issue
+    /// #1787). A claimed row that waits on the local semaphore uses its
+    /// start-to-close budget, and a peer cannot take it.
+    #[test]
+    fn a_poll_claims_only_a_kind_with_a_free_permit() {
+        use crate::queue::TaskType;
+        assert_eq!(poll_admission(0, 0), PollAdmission::Saturated);
+        assert_eq!(
+            poll_admission(1, 0),
+            PollAdmission::Only(TaskType::Workflow),
+            "a free workflow permit cannot start an activity row"
+        );
+        assert_eq!(
+            poll_admission(0, 1),
+            PollAdmission::Only(TaskType::Activity),
+            "a free activity permit cannot start a workflow row"
+        );
+        assert_eq!(poll_admission(3, 5), PollAdmission::Any);
+    }
+
+    /// A poll holds one real permit of each kind it may claim. The claimed
+    /// kind keeps its permit. The other permit goes back at once.
+    #[allow(clippy::significant_drop_tightening)]
+    #[test]
+    fn a_poll_keeps_only_the_permit_of_the_kind_it_claimed() {
+        use crate::queue::TaskType;
+        let workflow = Arc::new(Semaphore::new(1));
+        let activity = Arc::new(Semaphore::new(1));
+        let mut permits = PollPermits::acquire(PollAdmission::Any, &workflow, &activity);
+        assert_eq!(permits.admission(), PollAdmission::Any);
+        assert_eq!(workflow.available_permits(), 0);
+        assert_eq!(activity.available_permits(), 0);
+        let kept = permits.take(TaskType::Activity.as_str());
+        drop(permits);
+        assert_eq!(workflow.available_permits(), 1);
+        assert_eq!(activity.available_permits(), 0);
+        drop(kept);
+        assert_eq!(activity.available_permits(), 1);
+
+        let only = PollPermits::acquire(
+            PollAdmission::Only(TaskType::Workflow),
+            &workflow,
+            &activity,
+        );
+        assert_eq!(only.admission(), PollAdmission::Only(TaskType::Workflow));
+        assert_eq!(
+            activity.available_permits(),
+            1,
+            "a kind the poll cannot claim keeps its permit free"
+        );
+    }
+
+    /// A permit taken between the read and the poll lowers the admission.
+    #[allow(clippy::significant_drop_tightening)]
+    #[test]
+    fn a_poll_admits_only_the_permits_it_holds() {
+        use crate::queue::TaskType;
+        let workflow = Arc::new(Semaphore::new(1));
+        let activity = Arc::new(Semaphore::new(0));
+        let permits = PollPermits::acquire(PollAdmission::Any, &workflow, &activity);
+        assert_eq!(permits.admission(), PollAdmission::Only(TaskType::Workflow));
+        let none = PollPermits::acquire(PollAdmission::Any, &workflow, &activity);
+        assert_eq!(none.admission(), PollAdmission::Saturated);
+    }
+
+    /// A slot tuner shrink cannot take the permit a poll holds for its claim
+    /// (issue #1787 review). The claim stamps `started_at`. A stolen permit
+    /// would start the timeout clock of a task that cannot run.
+    #[allow(clippy::significant_drop_tightening)]
+    #[tokio::test]
+    async fn a_tuner_shrink_cannot_take_the_permit_a_poll_holds() {
+        use crate::queue::TaskType;
+        use crate::slot_tuner::TunedSlotRuntime;
+        let workflow = Arc::new(Semaphore::new(2));
+        let activity = Arc::new(Semaphore::new(2));
+        let mut tuner = TunedSlotRuntime::new(Arc::clone(&activity), 2, 1, 2);
+        let _running = Arc::clone(&activity)
+            .acquire_owned()
+            .await
+            .expect("in-flight task");
+        let mut permits = PollPermits::acquire(PollAdmission::Any, &workflow, &activity);
+        assert_eq!(permits.admission(), PollAdmission::Any);
+
+        // A pool-pressure tick shrinks the activity target to 1.
+        tuner.resize_toward(1).await;
+
+        assert!(
+            permits.take(TaskType::Activity.as_str()).is_some(),
+            "the claimed activity keeps the permit it was admitted on"
+        );
+    }
+
+    /// A released permit wakes a saturated poll loop (issue #1787).
+    #[allow(clippy::significant_drop_tightening)]
+    #[tokio::test]
+    async fn a_released_permit_wakes_the_poll_loop() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let freed = Arc::new(tokio::sync::Notify::new());
+        let permit = CapacityPermit::new(
+            Arc::clone(&semaphore)
+                .acquire_owned()
+                .await
+                .expect("permit"),
+            &freed,
+        );
+        assert_eq!(semaphore.available_permits(), 0);
+        let waiter = {
+            let freed = Arc::clone(&freed);
+            tokio::spawn(async move { freed.notified().await })
+        };
+        drop(permit);
+        assert_eq!(semaphore.available_permits(), 1);
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("the poll loop must wake")
+            .expect("waiter task");
     }
 
     /// A shard's batch must not spend a sibling's share of one kind's pool.

@@ -168,6 +168,8 @@ mod performance_docs;
 #[cfg(feature = "db")]
 mod poison_pill_reclaim_perf;
 mod poison_pill_tests;
+#[cfg(feature = "db")]
+mod poll_capacity_gate_tests;
 mod priority_tests;
 #[cfg(feature = "testing")]
 mod publish_progress_tests;

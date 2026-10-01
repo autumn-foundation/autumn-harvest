@@ -241,7 +241,6 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ("core:signal_tests", ALLOWLIST_DEBT_REASON),
     ("core:signal_with_start_tests", ALLOWLIST_DEBT_REASON),
     ("core:sla_breach_tests", ALLOWLIST_DEBT_REASON),
-    ("core:slot_tuner_tests", ALLOWLIST_DEBT_REASON),
     ("core:sticky_routing_tests", ALLOWLIST_DEBT_REASON),
     ("core:telemetry_span_tests", ALLOWLIST_DEBT_REASON),
     ("core:throttle_tests", ALLOWLIST_DEBT_REASON),

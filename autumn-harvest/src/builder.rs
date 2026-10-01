@@ -3799,7 +3799,7 @@ pub struct WorkerConfig {
     /// `max_concurrent_activities`) are auto-resized within
     /// `[SlotTunerConfig::min_slots, SlotTunerConfig::max_slots]`, driven by
     /// in-process slot utilization, worker DB-pool pressure, and recent
-    /// claim-to-dispatch permit-wait latency. The controller never resizes
+    /// dispatch-wait latency. The controller never resizes
     /// below `min_slots` (liveness floor) or above `max_slots` (hard safety
     /// cap); a shrink decision only withholds *new* permits and never cancels
     /// or reclaims an already-dispatched task, so graceful shutdown and
@@ -4464,8 +4464,8 @@ impl WorkerConfig {
     /// behaviour is byte-for-byte identical to today.
     ///
     /// See [`crate::slot_tuner`] for the default controller's signals
-    /// (slot utilization, worker DB-pool pressure, claim-to-dispatch permit
-    /// wait) and `docs/operations/adaptive-slot-tuner.md` for the operator
+    /// (slot utilization, worker DB-pool pressure, dispatch wait) and
+    /// `docs/operations/adaptive-slot-tuner.md` for the operator
     /// guide.
     #[must_use]
     pub fn with_slot_tuner(mut self, cfg: crate::slot_tuner::SlotTunerConfig) -> Self {
