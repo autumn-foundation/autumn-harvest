@@ -146,7 +146,7 @@ Response:
 Pure functions are available without the `db` feature:
 
 ```rust
-use autumn_harvest::calendar::{is_excluded_date, apply_skip_policy};
+use autumn_harvest::calendar::{apply_skip_policy, calendar_excludes_weekends};
 use autumn_harvest::policy::SkipPolicy;
 use chrono::NaiveDate;
 
@@ -154,15 +154,27 @@ let excluded = vec![
     NaiveDate::from_ymd_opt(2026, 1, 19).unwrap(), // MLK Day
 ];
 
+// The scheduler derives this flag from the calendar name.
+let exclude_weekends = calendar_excludes_weekends("us-federal-holidays");
+assert!(!exclude_weekends);
+
 let fire_date = NaiveDate::from_ymd_opt(2026, 1, 19).unwrap();
 
 // Returns None → skip
-assert!(apply_skip_policy(fire_date, SkipPolicy::Skip, &excluded, false).is_none());
+assert!(apply_skip_policy(fire_date, SkipPolicy::Skip, &excluded, exclude_weekends).is_none());
 
 // Returns Some(2026-01-20) → Tuesday after the holiday
-let next = apply_skip_policy(fire_date, SkipPolicy::RunNextBusinessDay, &excluded, false);
+let next = apply_skip_policy(
+    fire_date,
+    SkipPolicy::RunNextBusinessDay,
+    &excluded,
+    exclude_weekends,
+);
 assert_eq!(next, NaiveDate::from_ymd_opt(2026, 1, 20));
 ```
+
+Pass `calendar_excludes_weekends(name)` as the fourth argument to match the scheduler.
+That function returns `true` only for `weekends-off`.
 
 ---
 
@@ -170,7 +182,7 @@ assert_eq!(next, NaiveDate::from_ymd_opt(2026, 1, 20));
 
 When a firing is suppressed by the calendar, the scheduler emits:
 
-```
+```text
 harvest.schedule.skipped{workflow="generate_payroll", queue="default", reason="calendar"}
 ```
 

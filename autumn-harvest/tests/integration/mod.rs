@@ -42,6 +42,7 @@ mod business_day_replay_tests;
 #[cfg(feature = "db")]
 mod business_day_timer_tests;
 mod cache_delta_load_tests;
+mod calendars_docs;
 #[cfg(feature = "db")]
 mod canary_tests;
 mod cancellation_tests;
