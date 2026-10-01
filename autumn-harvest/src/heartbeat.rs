@@ -13,7 +13,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::queue::TaskClaim;
+use crate::queue::{ClaimWrite, TaskClaim};
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::deadpool::Pool;
 
@@ -26,6 +26,9 @@ use diesel_async::pooled_connection::deadpool::Pool;
 /// 2. Drain all pending heartbeats, keeping only the most recent.
 /// 3. Call `queue::record_heartbeat()` to update the DB timestamp and payload.
 /// 4. Repeat until the cancellation token is triggered.
+///
+/// The write is fenced by `claim` (issue #1789). When a later claim holds the
+/// row, the flusher cancels `cancel` and stops.
 ///
 /// The returned sender has a buffer of 64 messages -- if the activity sends
 /// heartbeats faster than that without the flusher draining, sends will
@@ -74,17 +77,30 @@ async fn heartbeat_loop(
         // If we got at least one heartbeat, flush to DB.
         if let Some(payload) = latest {
             match pool.get().await {
-                Ok(mut conn) => {
-                    if let Err(e) =
-                        crate::queue::record_heartbeat(&mut conn, &claim, payload).await
-                    {
+                Ok(mut conn) => match crate::queue::record_heartbeat(&mut conn, &claim, payload)
+                    .await
+                {
+                    Ok(ClaimWrite::Applied) => {}
+                    // A later claim holds the row (issue #1789). Stop the
+                    // activity, so this stale attempt does no more work.
+                    Ok(ClaimWrite::LeaseLost) => {
+                        tracing::warn!(
+                            task_id = %task_id,
+                            worker_id = %claim.worker_id,
+                            attempt = claim.attempt,
+                            "activity lease lost on heartbeat; cancelling the activity"
+                        );
+                        cancel.cancel();
+                        break;
+                    }
+                    Err(e) => {
                         tracing::warn!(
                             task_id = %task_id,
                             error = %e,
                             "failed to flush heartbeat to database"
                         );
                     }
-                }
+                },
                 Err(e) => {
                     tracing::warn!(
                         task_id = %task_id,

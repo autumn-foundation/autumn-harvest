@@ -300,8 +300,9 @@ pub struct TransactionalState {
     pub(crate) exec_id: crate::types::ExecutionId,
     /// Unique ID of this activity invocation attempt.
     pub(crate) activity_id: crate::types::ActivityExecId,
-    /// Task queue row ID — used to lock and complete the task atomically.
-    pub(crate) task_id: uuid::Uuid,
+    /// The claim this attempt holds. It fences the lock and the completion
+    /// (issue #1789).
+    pub(crate) claim: crate::queue::TaskClaim,
     /// Maximum serialized result size in bytes (0 = unlimited).  Checked
     /// inside the transaction so an oversized result is caught before
     /// `ActivityCompleted` is committed.
@@ -15365,7 +15366,8 @@ impl ActivityContext {
 
         let exec_id = txn.exec_id;
         let activity_id = txn.activity_id;
-        let task_id = txn.task_id;
+        let claim = txn.claim.clone();
+        let task_id = claim.task_id;
         // Issue #1243: bound out here so the transaction closure owns a clone.
         // The registry's rotation state is shared across clones, so this still
         // observes a `set_active_key` that lands mid-activity.
@@ -15421,21 +15423,34 @@ impl ActivityContext {
                 // Undecoded: this reads `next_event_id` only (see the helper's docs).
                 let history = crate::store::lock_and_load_history_undecoded(conn, exec_id).await?;
 
-                // Idempotency guard: verify the task is still RUNNING before
-                // we commit.  If it's already COMPLETED (e.g. this is a
-                // crash-recovery attempt where the first transaction succeeded)
-                // we roll back the user writes so the caller sees a clean
-                // slate, matching the "exactly-once" contract.
-                match crate::queue::task_state_for_update(conn, task_id).await? {
-                    Some(ref s) if s == "RUNNING" => {}
-                    Some(other) => {
+                // Idempotency guard: verify that this attempt still holds the
+                // claim before we commit.  If the task is already COMPLETED
+                // (e.g. this is a crash-recovery attempt where the first
+                // transaction succeeded) we roll back the user writes so the
+                // caller sees a clean slate, matching the "exactly-once"
+                // contract.  A later claim of the same row also rolls back.
+                // Its own attempt owns the outcome (issue #1789).
+                match crate::queue::lock_claim_for_update(conn, &claim).await? {
+                    crate::queue::ClaimLock::Held => {}
+                    crate::queue::ClaimLock::Lost {
+                        state: Some(other),
+                    } if other == "RUNNING" => {
+                        return Err(TxError::Harvest(HarvestError::Config(format!(
+                            "transactional activity task {task_id} is held by a later \
+                         claim; rolling back user writes (the lease of this attempt \
+                         was lost)"
+                        ))));
+                    }
+                    crate::queue::ClaimLock::Lost {
+                        state: Some(other),
+                    } => {
                         return Err(TxError::Harvest(HarvestError::Config(format!(
                             "transactional activity task {task_id} is in state '{other}', \
                          not RUNNING; rolling back user writes (the ActivityCompleted \
                          event was already committed by a prior attempt)"
                         ))));
                     }
-                    None => {
+                    crate::queue::ClaimLock::Lost { state: None } => {
                         return Err(TxError::Harvest(HarvestError::Config(format!(
                             "transactional activity task {task_id} no longer exists; \
                          rolling back user writes"
@@ -15457,8 +15472,16 @@ impl ActivityContext {
                 )
                 .await?;
 
-                // Mark the task COMPLETED.
-                crate::queue::complete_task(conn, task_id, output).await?;
+                // Mark the task COMPLETED.  The row lock above keeps the claim
+                // current, so a lost lease here is a bug.  Roll back.
+                if crate::queue::complete_claimed_task(conn, &claim, output).await?
+                    == crate::queue::ClaimWrite::LeaseLost
+                {
+                    return Err(TxError::Harvest(HarvestError::Config(format!(
+                        "transactional activity task {task_id} lost its claim under \
+                         the row lock; rolling back user writes"
+                    ))));
+                }
 
                 // Wake the workflow so it can pick up the ActivityCompleted
                 // result on its next execution cycle.

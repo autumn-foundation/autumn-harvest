@@ -8,6 +8,7 @@ use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, Utc};
 use diesel::AsChangeset;
+use diesel::BoolExpressionMethods;
 use diesel::ExpressionMethods;
 use diesel::OptionalExtension;
 use diesel::QueryDsl;
@@ -2493,6 +2494,27 @@ pub enum ClaimWrite {
     LeaseLost,
 }
 
+impl ClaimWrite {
+    /// Turn a lost lease into an error.
+    ///
+    /// Use it only after [`lock_claim_for_update`] returned
+    /// [`ClaimLock::Held`] in the same transaction. The lock keeps the claim
+    /// current, so a lost lease there is a bug, and the error rolls back.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::HarvestError::NotFound`] for
+    /// [`ClaimWrite::LeaseLost`].
+    pub fn require_applied(self, task_id: Uuid) -> HarvestResult<()> {
+        match self {
+            Self::Applied => Ok(()),
+            Self::LeaseLost => Err(crate::error::HarvestError::NotFound(format!(
+                "task queue item {task_id} lost its claim under the row lock"
+            ))),
+        }
+    }
+}
+
 /// The result of [`lock_claim_for_update`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClaimLock {
@@ -2506,7 +2528,55 @@ pub enum ClaimLock {
     },
 }
 
+/// The claim-epoch predicate (issue #1789).
+///
+/// Every write fenced by a [`TaskClaim`] adds this predicate to its own
+/// statement. Only the holder of the current claim can then match the row.
+#[diesel::dsl::auto_type(no_type_alias)]
+fn claim_held<'a>(worker_id: &'a str, attempt: i32) -> _ {
+    let running: &'static str = "RUNNING";
+    crate::schema::harvest_task_queue::state
+        .eq(running)
+        .and(crate::schema::harvest_task_queue::worker_id.eq(worker_id))
+        .and(crate::schema::harvest_task_queue::attempt.eq(attempt))
+}
+
+/// An `UPDATE harvest_task_queue` with a boxed `WHERE` clause.
+type TaskUpdate<'a, V, Ret> = diesel::query_builder::BoxedUpdateStatement<
+    'a,
+    diesel::pg::Pg,
+    crate::schema::harvest_task_queue::table,
+    V,
+    Ret,
+>;
+
+/// Add the claim-epoch predicate to `update` when `claim` is set.
+///
+/// This is the one place that fences a task row write. `None` keeps the
+/// unfenced behavior for writers that are not the claim owner, for example
+/// timeouts and operator actions.
+fn fence<'a, V, Ret>(
+    update: TaskUpdate<'a, V, Ret>,
+    claim: Option<&'a TaskClaim>,
+) -> TaskUpdate<'a, V, Ret> {
+    match claim {
+        Some(claim) => update.filter(claim_held(&claim.worker_id, claim.attempt)),
+        None => update,
+    }
+}
+
+const fn claim_write(updated: bool) -> ClaimWrite {
+    if updated {
+        ClaimWrite::Applied
+    } else {
+        ClaimWrite::LeaseLost
+    }
+}
+
 /// Lock the claimed row `FOR UPDATE` and report whether `claim` is current.
+///
+/// Call it after the execution row lock, as every activity write path does.
+/// While the transaction lives, no other writer can move the claim.
 ///
 /// # Errors
 ///
@@ -2515,20 +2585,43 @@ pub async fn lock_claim_for_update(
     conn: &mut AsyncPgConnection,
     claim: &TaskClaim,
 ) -> HarvestResult<ClaimLock> {
-    // RED stub (issue #1789): checks the state only.
-    let state = task_state_for_update(conn, claim.task_id).await?;
-    Ok(match state {
-        Some(state) if state == "RUNNING" => ClaimLock::Held,
-        state => ClaimLock::Lost { state },
+    use crate::schema::harvest_task_queue::dsl;
+
+    let row = dsl::harvest_task_queue
+        .find(claim.task_id)
+        .for_update()
+        .select((dsl::state, claim_held(&claim.worker_id, claim.attempt)))
+        .first::<(String, Option<bool>)>(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+    Ok(match row {
+        Some((_, Some(true))) => ClaimLock::Held,
+        Some((state, _)) => ClaimLock::Lost { state: Some(state) },
+        None => ClaimLock::Lost { state: None },
     })
 }
 
-fn lease_lost_on_not_found(result: HarvestResult<()>) -> HarvestResult<ClaimWrite> {
-    match result {
-        Ok(()) => Ok(ClaimWrite::Applied),
-        Err(crate::error::HarvestError::NotFound(_)) => Ok(ClaimWrite::LeaseLost),
-        Err(e) => Err(e),
-    }
+/// Whether `claim` is current, read without a lock.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn claim_is_current(
+    conn: &mut AsyncPgConnection,
+    claim: &TaskClaim,
+) -> HarvestResult<bool> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    dsl::harvest_task_queue
+        .find(claim.task_id)
+        .filter(claim_held(&claim.worker_id, claim.attempt))
+        .select(dsl::id)
+        .first::<Uuid>(conn)
+        .await
+        .optional()
+        .map(|row| row.is_some())
+        .map_err(crate::error::database_error)
 }
 
 /// Complete the task that `claim` holds. A stale claim changes nothing.
@@ -2541,7 +2634,9 @@ pub async fn complete_claimed_task(
     claim: &TaskClaim,
     output: serde_json::Value,
 ) -> HarvestResult<ClaimWrite> {
-    lease_lost_on_not_found(complete_task(conn, claim.task_id, output).await)
+    complete_task_inner(conn, claim.task_id, Some(claim), output)
+        .await
+        .map(claim_write)
 }
 
 /// Fail the task that `claim` holds. A stale claim changes nothing.
@@ -2554,7 +2649,9 @@ pub async fn fail_claimed_task(
     claim: &TaskClaim,
     error: &str,
 ) -> HarvestResult<ClaimWrite> {
-    lease_lost_on_not_found(fail_task(conn, claim.task_id, error).await)
+    fail_task_inner(conn, claim.task_id, Some(claim), error)
+        .await
+        .map(claim_write)
 }
 
 /// Requeue the task that `claim` holds for retry. A stale claim changes
@@ -2569,11 +2666,17 @@ pub async fn requeue_claimed_task_for_retry(
     delay: Duration,
     previous_error: &str,
 ) -> HarvestResult<ClaimWrite> {
-    lease_lost_on_not_found(requeue_for_retry(conn, claim.task_id, delay, previous_error).await)
+    requeue_for_retry_inner(conn, claim.task_id, Some(claim), delay, previous_error)
+        .await
+        .map(claim_write)
 }
 
 /// Defer the rate-limited task that `claim` holds. A stale claim changes
 /// nothing.
+///
+/// The deferral lowers `attempt` by one. A stale owner must not do that. It
+/// would let a later claim reuse an old `attempt` value and match a stale
+/// claim again.
 ///
 /// # Errors
 ///
@@ -2583,7 +2686,9 @@ pub async fn defer_claimed_rate_limited_task(
     claim: &TaskClaim,
     scheduled_at: chrono::DateTime<Utc>,
 ) -> HarvestResult<ClaimWrite> {
-    lease_lost_on_not_found(defer_rate_limited_task(conn, claim.task_id, scheduled_at).await)
+    defer_rate_limited_task_inner(conn, claim.task_id, Some(claim), scheduled_at)
+        .await
+        .map(claim_write)
 }
 
 /// Mark a task as completed with the given output.
@@ -2591,37 +2696,36 @@ pub async fn defer_claimed_rate_limited_task(
 /// Terminal completion clears any heartbeat checkpoint payload so it cannot be
 /// observed after the activity has successfully finished.
 ///
-/// # Errors
-/// Lock the task queue row `FOR UPDATE` and return its current `state`.
+/// This write is not fenced. The activity owner uses
+/// [`complete_claimed_task`] instead.
 ///
-/// Used by [`crate::context::ActivityContext::run_transactional`] to verify
-/// the task is still `RUNNING` before committing the transactional activity
-/// result.  Returns `None` when the row no longer exists.
-pub(crate) async fn task_state_for_update(
-    conn: &mut AsyncPgConnection,
-    task_id: Uuid,
-) -> HarvestResult<Option<String>> {
-    use crate::schema::harvest_task_queue::dsl;
-
-    dsl::harvest_task_queue
-        .find(task_id)
-        .for_update()
-        .select(dsl::state)
-        .first::<String>(conn)
-        .await
-        .optional()
-        .map_err(crate::error::database_error)
-}
-
-/// Returns [`crate::error::HarvestError::Database`] on update failure.
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::NotFound`] when the task is not
+/// running, and [`crate::error::HarvestError::Database`] on update failure.
 pub async fn complete_task(
     conn: &mut AsyncPgConnection,
     task_id: Uuid,
     output: serde_json::Value,
 ) -> HarvestResult<()> {
+    if !complete_task_inner(conn, task_id, None, output).await? {
+        return Err(crate::error::HarvestError::NotFound(format!(
+            "task queue item {task_id} is not running"
+        )));
+    }
+
+    Ok(())
+}
+
+async fn complete_task_inner(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    claim: Option<&TaskClaim>,
+    output: serde_json::Value,
+) -> HarvestResult<bool> {
     use crate::schema::harvest_task_queue::dsl;
 
-    let updated = diesel::update(
+    let update = diesel::update(
         dsl::harvest_task_queue
             .find(task_id)
             .filter(dsl::state.eq("RUNNING")),
@@ -2633,17 +2737,12 @@ pub async fn complete_task(
         dsl::error.eq(None::<String>),
         dsl::completed_at.eq(Some(Utc::now())),
     ))
-    .execute(conn)
-    .await
-    .map_err(crate::error::database_error)?;
-
-    if updated == 0 {
-        return Err(crate::error::HarvestError::NotFound(format!(
-            "task queue item {task_id} is not running"
-        )));
-    }
-
-    Ok(())
+    .into_boxed();
+    let updated = fence(update, claim)
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(updated > 0)
 }
 
 /// Mark a task as failed with the given error message.
@@ -2652,17 +2751,37 @@ pub async fn complete_task(
 /// Retry rescheduling uses [`requeue_for_retry`] instead and preserves the
 /// payload for the next attempt.
 ///
+/// This write is not fenced. Timeouts, cancellation and operator actions use
+/// it. The activity owner uses [`fail_claimed_task`] instead.
+///
 /// # Errors
 ///
-/// Returns [`crate::error::HarvestError::Database`] on update failure.
+/// Returns [`crate::error::HarvestError::NotFound`] when the task is not
+/// pending or running, and [`crate::error::HarvestError::Database`] on update
+/// failure.
 pub async fn fail_task(
     conn: &mut AsyncPgConnection,
     task_id: Uuid,
     error: &str,
 ) -> HarvestResult<()> {
+    if !fail_task_inner(conn, task_id, None, error).await? {
+        return Err(crate::error::HarvestError::NotFound(format!(
+            "task queue item {task_id} is not pending or running"
+        )));
+    }
+
+    Ok(())
+}
+
+async fn fail_task_inner(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    claim: Option<&TaskClaim>,
+    error: &str,
+) -> HarvestResult<bool> {
     use crate::schema::harvest_task_queue::dsl;
 
-    let updated = diesel::update(
+    let update = diesel::update(
         dsl::harvest_task_queue
             .find(task_id)
             .filter(dsl::state.eq_any(["PENDING", "RUNNING"])),
@@ -2673,17 +2792,12 @@ pub async fn fail_task(
         dsl::heartbeat_details.eq(None::<serde_json::Value>),
         dsl::completed_at.eq(Some(Utc::now())),
     ))
-    .execute(conn)
-    .await
-    .map_err(crate::error::database_error)?;
-
-    if updated == 0 {
-        return Err(crate::error::HarvestError::NotFound(format!(
-            "task queue item {task_id} is not pending or running"
-        )));
-    }
-
-    Ok(())
+    .into_boxed();
+    let updated = fence(update, claim)
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(updated > 0)
 }
 
 /// Mark all pending or running tasks for a workflow execution as failed.
@@ -2986,7 +3100,12 @@ pub async fn oldest_pending_ages(
         .collect())
 }
 
-/// Update the `last_heartbeat_at` timestamp and checkpoint payload for a running task.
+/// Update the `last_heartbeat_at` timestamp and checkpoint payload of the
+/// task that `claim` holds.
+///
+/// The write is fenced by `claim` (issue #1789). A stale owner cannot refresh
+/// or overwrite the checkpoint of a later attempt. It gets
+/// [`ClaimWrite::LeaseLost`] and must stop the activity.
 ///
 /// # Errors
 ///
@@ -2997,26 +3116,18 @@ pub async fn record_heartbeat(
     details: serde_json::Value,
 ) -> HarvestResult<ClaimWrite> {
     use crate::schema::harvest_task_queue::dsl;
-    let task_id = claim.task_id;
 
-    let updated = diesel::update(
-        dsl::harvest_task_queue
-            .find(task_id)
-            .filter(dsl::state.eq("RUNNING")),
-    )
-    .set((
-        dsl::last_heartbeat_at.eq(Some(Utc::now())),
-        dsl::heartbeat_details.eq(Some(details)),
-    ))
-    .execute(conn)
-    .await
-    .map_err(crate::error::database_error)?;
-
-    if updated == 0 {
-        return Ok(ClaimWrite::LeaseLost);
-    }
-
-    Ok(ClaimWrite::Applied)
+    let update = diesel::update(dsl::harvest_task_queue.find(claim.task_id))
+        .set((
+            dsl::last_heartbeat_at.eq(Some(Utc::now())),
+            dsl::heartbeat_details.eq(Some(details)),
+        ))
+        .into_boxed();
+    let updated = fence(update, Some(claim))
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(claim_write(updated > 0))
 }
 
 /// Shared "reset a claimed task back to `PENDING` with a future
@@ -3066,11 +3177,6 @@ impl PendingRequeueChangeset {
     }
 }
 
-/// Reset a task to `PENDING` with a future `scheduled_at` for retry.
-///
-/// # Errors
-///
-/// Returns [`crate::error::HarvestError::Database`] on update failure.
 /// Reschedule a `RUNNING` task back to `PENDING` after a retryable failure.
 ///
 /// Stores `previous_error` in the task row's `error` column so the next
@@ -3078,22 +3184,41 @@ impl PendingRequeueChangeset {
 /// The heartbeat details payload is preserved so the retry attempt can resume
 /// from the last flushed checkpoint.
 ///
+/// This write is not fenced. The activity owner uses
+/// [`requeue_claimed_task_for_retry`] instead.
+///
 /// # Errors
 ///
-/// Returns [`crate::error::HarvestError::Database`] on update failure.
+/// Returns [`crate::error::HarvestError::NotFound`] when the task is not
+/// running, and [`crate::error::HarvestError::Database`] on update failure.
 pub async fn requeue_for_retry(
     conn: &mut AsyncPgConnection,
     task_id: Uuid,
     delay: Duration,
     previous_error: &str,
 ) -> HarvestResult<()> {
+    if !requeue_for_retry_inner(conn, task_id, None, delay, previous_error).await? {
+        return Err(crate::error::HarvestError::NotFound(format!(
+            "task queue item {task_id} is not running"
+        )));
+    }
+    Ok(())
+}
+
+async fn requeue_for_retry_inner(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    claim: Option<&TaskClaim>,
+    delay: Duration,
+    previous_error: &str,
+) -> HarvestResult<bool> {
     use crate::schema::harvest_task_queue::dsl;
     use diesel::dsl::sql;
     use diesel::sql_types::{Double, Timestamptz};
 
     let changeset = PendingRequeueChangeset::new(previous_error.to_string());
 
-    let (queue_name, priority, task_type, next_run) = diesel::update(
+    let update = diesel::update(
         dsl::harvest_task_queue
             .find(task_id)
             .filter(dsl::state.eq("RUNNING")),
@@ -3106,19 +3231,21 @@ pub async fn requeue_for_retry(
                 .sql(")"),
         ),
     ))
-    .returning((
-        dsl::queue_name,
-        dsl::priority,
-        dsl::task_type,
-        dsl::scheduled_at,
-    ))
-    .get_result::<(String, i32, String, chrono::DateTime<Utc>)>(conn)
-    .await
-    .optional()
-    .map_err(crate::error::database_error)?
-    .ok_or_else(|| {
-        crate::error::HarvestError::NotFound(format!("task queue item {task_id} is not running"))
-    })?;
+    .into_boxed();
+    let Some((queue_name, priority, task_type, next_run)) = fence(update, claim)
+        .returning((
+            dsl::queue_name,
+            dsl::priority,
+            dsl::task_type,
+            dsl::scheduled_at,
+        ))
+        .get_result::<(String, i32, String, chrono::DateTime<Utc>)>(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?
+    else {
+        return Ok(false);
+    };
 
     // Dispatch hint (issue #1312). The retry is due at `next_run`, so the
     // channel parks the reference until then.
@@ -3143,7 +3270,7 @@ pub async fn requeue_for_retry(
         );
     }
 
-    Ok(())
+    Ok(true)
 }
 
 /// Finish a backoff-style workflow-task re-pend: record a dispatch hint for
@@ -3765,17 +3892,35 @@ pub async fn reschedule_task(
 /// Otherwise mirrors [`reschedule_task`] (clean continuation: resets the
 /// poison-pill crash streak and re-notifies the queue).
 ///
+/// This write is not fenced. The activity owner uses
+/// [`defer_claimed_rate_limited_task`] instead.
+///
 /// # Errors
 ///
-/// Returns [`crate::error::HarvestError::Database`] on update failure.
+/// Returns [`crate::error::HarvestError::NotFound`] when the task is not
+/// running, and [`crate::error::HarvestError::Database`] on update failure.
 pub async fn defer_rate_limited_task(
     conn: &mut AsyncPgConnection,
     task_id: Uuid,
     scheduled_at: chrono::DateTime<Utc>,
 ) -> HarvestResult<()> {
+    if !defer_rate_limited_task_inner(conn, task_id, None, scheduled_at).await? {
+        return Err(crate::error::HarvestError::NotFound(format!(
+            "task queue item {task_id} is not running"
+        )));
+    }
+    Ok(())
+}
+
+async fn defer_rate_limited_task_inner(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    claim: Option<&TaskClaim>,
+    scheduled_at: chrono::DateTime<Utc>,
+) -> HarvestResult<bool> {
     use crate::schema::harvest_task_queue::dsl;
 
-    let (queue_name, priority, task_type) = diesel::update(
+    let update = diesel::update(
         dsl::harvest_task_queue
             .find(task_id)
             .filter(dsl::state.eq("RUNNING")),
@@ -3788,14 +3933,16 @@ pub async fn defer_rate_limited_task(
             "GREATEST(attempt - 1, 0)",
         )),
     ))
-    .returning((dsl::queue_name, dsl::priority, dsl::task_type))
-    .get_result::<(String, i32, String)>(conn)
-    .await
-    .optional()
-    .map_err(crate::error::database_error)?
-    .ok_or_else(|| {
-        crate::error::HarvestError::NotFound(format!("task queue item {task_id} is not running"))
-    })?;
+    .into_boxed();
+    let Some((queue_name, priority, task_type)) = fence(update, claim)
+        .returning((dsl::queue_name, dsl::priority, dsl::task_type))
+        .get_result::<(String, i32, String)>(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?
+    else {
+        return Ok(false);
+    };
 
     crate::notify::notify_task_enqueued(conn, &queue_name, task_id).await?;
     // Dispatch hint (issue #1312).
@@ -3807,7 +3954,7 @@ pub async fn defer_rate_limited_task(
         crate::dispatch::DispatchKind::from(task_type.as_str()),
     );
 
-    Ok(())
+    Ok(true)
 }
 
 /// SQL for [`release_task_for_capability_miss`], exposed for no-DB shape tests

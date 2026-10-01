@@ -157,6 +157,34 @@ Both types are `fn` (not `Box<dyn Fn>`). The macro generates a closure body cast
 
 Single-param workflows/activities: input is passed as a single JSON value and deserialized directly. Multi-param: input is expected to be a JSON array `[arg1, arg2, ...]`, indexed by position.
 
+**8. Activity claim epoch (issue #1789)**
+
+An activity attempt owns its task row only through its claim. The claim is the pair `(worker_id, attempt)`, held in `queue::TaskClaim`.
+
+*Protocol.*
+
+1. **Claim.** `claim_task` sets `state = 'RUNNING'` and `worker_id`, and adds 1 to `attempt`.
+2. **Heartbeat.** The flusher writes `last_heartbeat_at` and `heartbeat_details` under the claim.
+3. **Orphan reclaim.** The worker's liveness row goes stale. `requeue_orphan` sets the row to `PENDING` and clears `worker_id`. It does not change `attempt`.
+4. **Re-claim.** A worker claims the row again. The new claim has a higher `attempt`.
+5. **Complete.** The owner appends the terminal event and writes the terminal row state, under its claim.
+
+*Invariant.* At most one attempt's terminal write takes effect, and only the current claim's.
+
+*Why the pair is a fencing token.* Every claim adds 1 to `attempt`. Only these writes subtract 1: the pause releases, the capability-miss release and the rate-limit deferral. Each one undoes the increment of the claim that releases itself. So after a foreign requeue, every later claim has a higher `attempt` than the stale one. The rate-limit deferral is fenced, so a stale owner cannot lower `attempt`. `worker_id` alone is not enough, because the same worker can win the row back.
+
+*Enforcement.* `claim_held` in `queue.rs` is the one predicate: `state = 'RUNNING' AND worker_id = $w AND attempt = $a`. Every owner write adds it to its own statement:
+
+- `complete_claimed_task`, `fail_claimed_task`, `requeue_claimed_task_for_retry`, `defer_claimed_rate_limited_task` and `record_heartbeat`.
+- `lock_claim_for_update`. The start fence, both finalize paths, the schedule-to-close timeout, the session-acquire timeout and `run_transactional` take it after the execution row lock.
+- `claim_is_current`. The cancellation observer polls it.
+
+*Lease lost.* A write that matches 0 rows returns `ClaimWrite::LeaseLost`. The owner appends no event and returns `Ok`. It must not return an error, because `fail_execution_on_error` would then fail the workflow. The heartbeat flusher and the cancellation observer cancel the activity's token.
+
+*Not fenced.* `complete_task`, `fail_task`, `requeue_for_retry` and `defer_rate_limited_task` stay unfenced. Timeouts, cancellation and operator actions use them on purpose: they act on a row whatever its claim. Workflow-task writes use `claim_still_held_for_update` (issue #1184).
+
+A formal model of this protocol is tracked in issue #1819.
+
 ### Sharding
 
 Harvest can spread workflow state across N independent Postgres databases. A single workflow's event log, task queue rows, timers, signals, and DLQ entries all live on the same shard, so per-workflow ACID guarantees are preserved without cross-shard transactions. Cross-shard rebalancing of existing workflows is out of scope.
