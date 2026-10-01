@@ -450,7 +450,6 @@ jobs:
 
       # Issue #1783: the `docs/calendars.md` Rust fences compile as doctests.
       # A docs-only PR skips the `test` matrix, so the doctests run here, ungated.
-      # The filter is quoted because it contains `::`.
       - name: Run docs/calendars.md doctests (also on docs-only PRs)
         run: "cargo test -p autumn-harvest --no-default-features --doc calendar::CalendarsDocSnippets"
 

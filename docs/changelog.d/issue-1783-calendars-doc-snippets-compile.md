@@ -8,4 +8,4 @@ The example now derives `exclude_weekends` with `calendar_excludes_weekends`. It
 
 No migration. No `WorkflowEvent` variant. Nothing writes to `harvest_events`.
 
-Tests: red, the doctest failed on the three-argument call. Green, it passes on the fixed example.
+Tests: the doctest failed on the three-argument call. It passes on the fixed example. A guard test fails if the harness or the CI step is removed.
