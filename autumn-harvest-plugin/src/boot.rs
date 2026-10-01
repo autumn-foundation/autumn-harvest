@@ -18,6 +18,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::api::{HarvestApiState, acquire_conn};
+use crate::state::HarvestDbPool;
 
 /// Copy the limits of `built` into `api_state`.
 ///
@@ -61,6 +62,11 @@ pub fn mirror_built_config(api_state: &HarvestApiState, built: &mut BuiltHarvest
     api_state.set_usage_max_groups(built.usage_max_groups);
     // Batch start caps (issue #357).
     api_state.set_batch_start_config(&built.batch_start_config);
+    // Automatic load shedding (issue #1794). An empty config turns it off.
+    api_state
+        .gate_cache()
+        .load_shedder()
+        .configure(built.load_shed.clone());
     // Completion-callback SSRF policy (issue #605). The HTTP start route
     // validates a per-execution target against the allowlist that the scanner
     // uses at delivery time. `PreparedHarvestRuntime::build`, inside
@@ -109,17 +115,23 @@ pub async fn load_boot_admission_gates(api_state: &HarvestApiState, pool: &DbPoo
     }
 }
 
-/// The background loop that keeps the gate cache current (issue #377).
+/// The background loops that keep the gate cache current (issue #377).
+///
+/// The load-shed sampler (issue #1794) shares the shutdown token.
 pub struct GateRefreshRuntime {
     shutdown: CancellationToken,
     handle: JoinHandle<()>,
+    load_shed: Option<JoinHandle<()>>,
 }
 
 impl GateRefreshRuntime {
-    /// Cancel the loop and wait for it to end.
+    /// Cancel the loops and wait for them to end.
     pub async fn stop(self) {
         self.shutdown.cancel();
         let _ = self.handle.await;
+        if let Some(load_shed) = self.load_shed {
+            let _ = load_shed.await;
+        }
     }
 }
 
@@ -128,11 +140,18 @@ impl GateRefreshRuntime {
 /// The loop fails closed. When the gate table is unreadable, the cache
 /// becomes uninitialized, so `check()` blocks new starts. A stale open
 /// snapshot would admit them.
-pub fn spawn_gate_refresh(api_state: &HarvestApiState, pool: DbPool) -> GateRefreshRuntime {
-    let cache = api_state.gate_cache();
-    let api_state = api_state.clone();
+///
+/// It also spawns the load-shed sampler when a queue has a policy.
+pub fn spawn_gate_refresh(
+    api_state: &HarvestApiState,
+    pools: &HarvestDbPool,
+) -> GateRefreshRuntime {
     let shutdown = CancellationToken::new();
     let cancel = shutdown.child_token();
+    let load_shed = spawn_load_shed_sampler(api_state, pools, shutdown.child_token());
+    let pool = pools.clone_inner();
+    let cache = api_state.gate_cache();
+    let api_state = api_state.clone();
     let handle = tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -173,7 +192,69 @@ pub fn spawn_gate_refresh(api_state: &HarvestApiState, pool: DbPool) -> GateRefr
             }
         }
     });
-    GateRefreshRuntime { shutdown, handle }
+    GateRefreshRuntime {
+        shutdown,
+        handle,
+        load_shed,
+    }
+}
+
+/// Spawn the load-shed sampler of `api_state` (issue #1794).
+///
+/// Returns `None` when no queue has a policy, so a default deployment runs no
+/// sampler SQL. The sampler reads each physical pool once per tick.
+fn spawn_load_shed_sampler(
+    api_state: &HarvestApiState,
+    pools: &HarvestDbPool,
+    cancel: CancellationToken,
+) -> Option<JoinHandle<()>> {
+    let shedder = Arc::clone(api_state.gate_cache().load_shedder());
+    let config = shedder.config();
+    if !config.is_enabled() {
+        return None;
+    }
+    let interval = config.sample_interval();
+    let shard_pools: Vec<DbPool> = pools
+        .sharded_pool()
+        .pool_groups()
+        .into_iter()
+        .map(|(pool, _)| pool.clone())
+        .collect();
+    let audit_pool = pools.clone_inner();
+    let api_state = api_state.clone();
+    Some(tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => return,
+                () = tokio::time::sleep(interval) => {}
+            }
+            // The runtime is installed after boot, so resolve it per tick.
+            let runtime = api_state.runtime().ok();
+            let metrics = runtime
+                .as_ref()
+                .map(|r| Arc::clone(&r.registry().telemetry().metrics));
+            let breakers = runtime
+                .as_ref()
+                .map(|r| {
+                    r.registry()
+                        .circuit_breakers()
+                        .tracked_activity_names()
+                        .to_vec()
+                })
+                .unwrap_or_default();
+            let sample = autumn_harvest::load_shed::sample_once(
+                &shedder,
+                &shard_pools,
+                &audit_pool,
+                metrics.as_deref(),
+                &breakers,
+            );
+            tokio::select! {
+                () = cancel.cancelled() => return,
+                _ = sample => {}
+            }
+        }
+    }))
 }
 
 /// Clear the admission globals that this runtime published.

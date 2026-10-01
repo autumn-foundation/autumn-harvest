@@ -672,6 +672,26 @@ pub enum HarvestError {
         reason: String,
     },
 
+    /// A new workflow start was shed because its queue has an old backlog
+    /// (issue #1794).
+    ///
+    /// Only a fresh admission under
+    /// [`GateMode::Check`](crate::admission_gate::GateMode::Check) can get it.
+    /// No execution, event or task row is written. The management API returns
+    /// `429 Too Many Requests` with a `Retry-After` header.
+    #[error(
+        "load shed on queue '{queue}': oldest pending task is {oldest_pending_age_secs}s old; \
+         retry after {retry_after_secs}s"
+    )]
+    LoadShed {
+        /// The shed queue.
+        queue: String,
+        /// The last sampled age of the oldest claimable task, in seconds.
+        oldest_pending_age_secs: u64,
+        /// The delay the caller waits before a retry, in seconds.
+        retry_after_secs: u64,
+    },
+
     /// A workflow start was rejected because a declared
     /// [`QuotaPolicy`](crate::quota::QuotaPolicy) cap for the resolved
     /// tenant key has already been reached (issue #946).

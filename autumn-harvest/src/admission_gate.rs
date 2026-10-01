@@ -78,6 +78,14 @@
 //! Multiple active gates are evaluated as OR: any match → blocked.
 //! Expired gates are never matched, regardless of scope.
 //!
+//! ## Automatic load shedding (issue #1794)
+//!
+//! The cache also owns a [`crate::load_shed::LoadShedder`]. It is a per-queue
+//! gate that trips on backlog age, not on an operator action. The start
+//! primitive consults it after the manual gates, for `GateMode::Check` only. A
+//! shed start gets `HarvestError::LoadShed`, which the API maps to `429` with
+//! `Retry-After`. See `docs/operations/load-shedding.md`.
+//!
 //! ## Upper bound on simultaneous gates
 //!
 //! [`MAX_ACTIVE_GATES`] documents the supported maximum. Exceeding it returns
@@ -320,6 +328,8 @@ pub struct AdmissionGateCache {
     gates: std::sync::RwLock<Vec<AdmissionGate>>,
     /// Set to `true` after the first successful `refresh()`.
     initialized: std::sync::atomic::AtomicBool,
+    /// The automatic per-queue gate (issue #1794). It has no policy by default.
+    load_shedder: Arc<crate::load_shed::LoadShedder>,
 }
 
 impl Default for AdmissionGateCache {
@@ -327,6 +337,7 @@ impl Default for AdmissionGateCache {
         Self {
             gates: std::sync::RwLock::new(Vec::new()),
             initialized: std::sync::atomic::AtomicBool::new(false),
+            load_shedder: Arc::new(crate::load_shed::LoadShedder::new()),
         }
     }
 }
@@ -487,6 +498,14 @@ impl AdmissionGateCache {
     #[must_use]
     pub fn active_count(&self) -> usize {
         self.gates.read().map_or(0, |g| g.len())
+    }
+
+    /// The automatic load-shed gate (issue #1794).
+    ///
+    /// The fail-closed flag does not apply to it. It fails open on stale data.
+    #[must_use]
+    pub const fn load_shedder(&self) -> &Arc<crate::load_shed::LoadShedder> {
+        &self.load_shedder
     }
 }
 

@@ -11027,6 +11027,9 @@
           "422": {
             "description": "A completion callback target CLONED VERBATIM from the source (issue #605) is no longer admissible under the live SSRF policy — e.g. it was valid when the source started but has since been dropped from the host allowlist. Body: {error: \"completion callback target rejected\", url, rejection}, where `rejection` is a machine-readable SsrfRejection object (tag: `code`, e.g. HostNotAllowlisted/SchemeNotAllowed/IpLiteralNotAllowed). Only fires when the source has `completion_callbacks` recorded; a source with none is unaffected. Nothing is started and the source is never sealed."
           },
+          "429": {
+            "description": "Automatic load shedding (issue #1794) refused the re-run's fresh start because the queue's oldest claimable task is older than its LoadShedPolicy trip_age. Body is {\"error\": \"load shed\", \"queue\", \"oldest_pending_age_secs\", \"retry_after_secs\"}; the response carries a Retry-After header in whole seconds."
+          },
           "500": {
             "description": "Database error."
           },
@@ -12226,7 +12229,7 @@
             "description": "The serialized workflow input exceeds max_workflow_input_bytes, or the signal payload exceeds max_signal_payload_bytes."
           },
           "429": {
-            "description": "The workflow's declared per-tenant resource quota (issue #946, QuotaPolicy) is exhausted for the resolved key on a FRESH admission only (attaching to an existing run and delivering the signal to it never re-checks the quota). Body is {\"error\": \"quota exceeded\", \"workflow_name\", \"key\", \"resource\", \"limit\", \"current\"}, mirroring the plain start route's arm exactly. Never returned for a workflow with no declared QuotaPolicy."
+            "description": "The workflow's declared per-tenant resource quota (issue #946, QuotaPolicy) is exhausted for the resolved key on a FRESH admission only (attaching to an existing run and delivering the signal to it never re-checks the quota). Body is {\"error\": \"quota exceeded\", \"workflow_name\", \"key\", \"resource\", \"limit\", \"current\"}, mirroring the plain start route's arm exactly. Never returned for a workflow with no declared QuotaPolicy. Also returned when automatic load shedding (issue #1794) refuses a FRESH admission because the queue's oldest claimable task is older than its LoadShedPolicy trip_age. That body is {\"error\": \"load shed\", \"queue\", \"oldest_pending_age_secs\", \"retry_after_secs\"} and the response carries a Retry-After header in whole seconds. An attach to an existing run is never shed."
           },
           "500": {
             "description": "Database or scheduling error."
@@ -12531,7 +12534,7 @@
             "description": "A completion callback target rejected the start, as the JSON body below. No execution was created. The same status is returned as plain text when the request body is syntactically valid JSON that does not deserialize into the start request. The handler forwards that extractor rejection unchanged, so the body is the extractor message rather than this object."
           },
           "429": {
-            "description": "The workflow's declared per-tenant resource quota (issue #946, QuotaPolicy) is exhausted for the resolved key on a FRESH admission only (an attach to an existing run never re-checks the quota). Body is {\"error\": \"quota exceeded\", \"workflow_name\", \"key\", \"resource\", \"limit\", \"current\"} naming which of max_active_executions / max_history_bytes / max_dead_letters was hit and the usage observed immediately before this admission (current excludes the would-be admission itself). No execution row, event, or task queue row is created for a rejected start. Never returned for a workflow with no declared QuotaPolicy."
+            "description": "The workflow's declared per-tenant resource quota (issue #946, QuotaPolicy) is exhausted for the resolved key on a FRESH admission only (an attach to an existing run never re-checks the quota). Body is {\"error\": \"quota exceeded\", \"workflow_name\", \"key\", \"resource\", \"limit\", \"current\"} naming which of max_active_executions / max_history_bytes / max_dead_letters was hit and the usage observed immediately before this admission (current excludes the would-be admission itself). No execution row, event, or task queue row is created for a rejected start. Never returned for a workflow with no declared QuotaPolicy. Also returned when automatic load shedding (issue #1794) refuses a FRESH admission because the queue's oldest claimable task is older than its LoadShedPolicy trip_age. That body is {\"error\": \"load shed\", \"queue\", \"oldest_pending_age_secs\", \"retry_after_secs\"} and the response carries a Retry-After header in whole seconds. An attach to an existing run is never shed."
           },
           "500": {
             "description": "Database or scheduling error."
@@ -12674,7 +12677,7 @@
             "description": "Update validator rejected the update_args."
           },
           "429": {
-            "description": "The workflow's declared per-tenant resource quota (issue #946, QuotaPolicy) is exhausted for the resolved key on a FRESH admission only (attaching to an existing run and admitting the update against it never re-checks the quota). Body is {\"error\": \"quota exceeded\", \"workflow_name\", \"key\", \"resource\", \"limit\", \"current\"}, mirroring the plain start route's arm exactly. Never returned for a workflow with no declared QuotaPolicy."
+            "description": "The workflow's declared per-tenant resource quota (issue #946, QuotaPolicy) is exhausted for the resolved key on a FRESH admission only (attaching to an existing run and admitting the update against it never re-checks the quota). Body is {\"error\": \"quota exceeded\", \"workflow_name\", \"key\", \"resource\", \"limit\", \"current\"}, mirroring the plain start route's arm exactly. Never returned for a workflow with no declared QuotaPolicy. Also returned when automatic load shedding (issue #1794) refuses a FRESH admission because the queue's oldest claimable task is older than its LoadShedPolicy trip_age. That body is {\"error\": \"load shed\", \"queue\", \"oldest_pending_age_secs\", \"retry_after_secs\"} and the response carries a Retry-After header in whole seconds. An attach to an existing run is never shed."
           },
           "500": {
             "description": "Database or scheduling error."

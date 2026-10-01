@@ -2069,10 +2069,7 @@ async fn start_harvest_runtime(
     // than an empty snapshot.
 
     // issue #377: spawn background gate-cache refresh (≤2 s p95 cross-replica propagation).
-    let gate_refresh = Some(crate::boot::spawn_gate_refresh(
-        api_state,
-        harvest_db_pool.clone_inner(),
-    ));
+    let gate_refresh = Some(crate::boot::spawn_gate_refresh(api_state, &harvest_db_pool));
 
     let outbox = app_pool.as_ref().and_then(|_| {
         if harvest_config.outbox.enabled {

@@ -11590,6 +11590,47 @@ fn workflow_result_response(result: WorkflowResult) -> axum::response::Response 
     }
 }
 
+/// The `429` response for a start that load shedding refused (issue #1794).
+///
+/// `Retry-After` carries the policy delay in whole seconds. The body names the
+/// queue, so a caller can tell overload (429) from a manual gate (503).
+fn load_shed_response(
+    queue: &str,
+    oldest_pending_age_secs: u64,
+    retry_after_secs: u64,
+) -> axum::response::Response {
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(serde_json::json!({
+            "error": "load shed",
+            "queue": queue,
+            "oldest_pending_age_secs": oldest_pending_age_secs,
+            "retry_after_secs": retry_after_secs,
+        })),
+    )
+        .into_response();
+    response.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from(retry_after_secs),
+    );
+    response
+}
+
+/// Map a failed start to a response.
+///
+/// A shed start gets [`load_shed_response`]. `map_error` cannot set a header,
+/// so it would drop `Retry-After`. Every other error goes to `map_error`.
+fn start_error_response(error: HarvestError) -> axum::response::Response {
+    match error {
+        HarvestError::LoadShed {
+            queue,
+            oldest_pending_age_secs,
+            retry_after_secs,
+        } => load_shed_response(&queue, oldest_pending_age_secs, retry_after_secs),
+        other => map_error(other).into_response(),
+    }
+}
+
 fn workflow_result_pending_response() -> axum::response::Response {
     let mut response = StatusCode::NO_CONTENT.into_response();
     response.headers_mut().insert(
@@ -19087,7 +19128,7 @@ pub(crate) async fn start_workflow(
                     source: &source,
                 };
                 let _ = audit::insert_audit(&mut conn, &ar).await;
-                map_error(e).into_response()
+                start_error_response(e)
             }
         };
     }
@@ -19289,7 +19330,7 @@ pub(crate) async fn start_workflow(
                 source: &source,
             };
             let _ = audit::insert_audit(&mut conn, &ar).await;
-            map_error(e).into_response()
+            start_error_response(e)
         }
         Ok(start) => {
             // AC-a: a start that attached to an existing run (rather than
@@ -21587,7 +21628,7 @@ pub(crate) async fn signal_with_start_workflow(
                 source: &source,
             };
             let _ = audit::insert_audit(&mut conn, &ar).await;
-            map_error(e).into_response()
+            start_error_response(e)
         }
         Ok(outcome) => {
             let exec_id_str = outcome.exec_id.to_string();
@@ -22419,7 +22460,7 @@ async fn update_with_start_workflow(
                 source: &source,
             };
             let _ = audit::insert_audit(&mut conn, &ar).await;
-            map_error(e).into_response()
+            start_error_response(e)
         }
         Ok(outcome) => {
             let exec_id_str = outcome.exec_id.to_string();
@@ -23352,7 +23393,7 @@ async fn rerun_workflow(
         Err(e) => {
             let msg = e.to_string();
             audit_rerun_failure_on(&mut conn, &audit_ctx, Some(&exec_id_str), &msg).await;
-            map_error(e).into_response()
+            start_error_response(e)
         }
     }
 }
@@ -44386,6 +44427,10 @@ pub(crate) fn map_error(error: HarvestError) -> AutumnError {
             details.insert("current".to_string(), vec![current.to_string()]);
             AutumnError::validation(details).with_status(axum::http::StatusCode::TOO_MANY_REQUESTS)
         }
+        // A route with no `start_error_response` arm still answers 429 for a
+        // shed start (issue #1794). It has no `Retry-After` header.
+        error @ HarvestError::LoadShed { .. } => AutumnError::bad_request_msg(error.to_string())
+            .with_status(axum::http::StatusCode::TOO_MANY_REQUESTS),
         HarvestError::Database(message) => AutumnError::service_unavailable_msg(message),
         other => AutumnError::service_unavailable_msg(other.to_string()),
     }

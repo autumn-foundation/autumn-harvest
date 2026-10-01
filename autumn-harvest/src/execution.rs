@@ -708,6 +708,67 @@ fn evaluate_start_gate(
     }
 }
 
+/// Admit or refuse a start that will create a new execution.
+///
+/// The manual gate runs first and returns [`HarvestError::AdmissionBlocked`].
+/// Load shedding (issue #1794) runs second and returns
+/// [`HarvestError::LoadShed`]. Each refusal records its metric once.
+fn admit_fresh_start(
+    mode: crate::admission_gate::GateMode,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    workflow_name: &str,
+    queue_name: &str,
+    shard_id: i32,
+    owner: Option<&str>,
+) -> HarvestResult<()> {
+    if let Some((gate_id, reason, scope_kind)) =
+        evaluate_start_gate(mode, workflow_name, queue_name, shard_id, owner)
+    {
+        record_start_gate_block(metrics, scope_kind, &reason);
+        return Err(HarvestError::AdmissionBlocked { gate_id, reason });
+    }
+    if let Some(decision) = evaluate_load_shed(mode, queue_name) {
+        record_load_shed_rejected(metrics, &decision.queue);
+        return Err(HarvestError::LoadShed {
+            queue: decision.queue,
+            oldest_pending_age_secs: decision.oldest_pending_age_secs,
+            retry_after_secs: decision.retry_after_secs,
+        });
+    }
+    Ok(())
+}
+
+/// Ask the published load shedder whether to shed a start on `queue_name`.
+///
+/// Only [`GateMode::Check`](crate::admission_gate::GateMode::Check) sheds. A
+/// `CheckCached` caller is continuation work that cannot act on `Retry-After`.
+fn evaluate_load_shed(
+    mode: crate::admission_gate::GateMode,
+    queue_name: &str,
+) -> Option<crate::load_shed::ShedDecision> {
+    if mode != crate::admission_gate::GateMode::Check {
+        return None;
+    }
+    let cache = crate::admission_gate::global_admission_gate_cache()?;
+    cache
+        .load_shedder()
+        .check(queue_name, std::time::Instant::now())
+}
+
+/// Record a `harvest.load_shed.rejected` count (issue #1794).
+///
+/// The recorder choice is the same as in [`record_start_gate_block`].
+fn record_load_shed_rejected(
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    queue: &str,
+) {
+    if let Some(m) = metrics {
+        m.record_load_shed_rejected(queue);
+    } else if let Some(g) = crate::admission_gate::global_admission_metrics() {
+        g.record_load_shed_rejected(queue);
+    }
+}
+
 /// Record a `harvest.admission.blocked` count for a gated start (issue #618, PR
 /// #1014). Uses the caller-supplied recorder when present, else the process-global
 /// recorder the plugin publishes at boot — so a block on a metrics-less internal
@@ -955,6 +1016,8 @@ pub(crate) async fn enforce_quota_admission(
 ///   `reject_fresh_if_debounced`.
 /// - [`HarvestError::AdmissionBlocked`] when `gate` matches an active gate on a
 ///   fresh admission.
+/// - [`HarvestError::LoadShed`] when `gate` is `Check` and the queue sheds a
+///   fresh admission (issue #1794).
 /// - [`HarvestError::Database`] for insert/query failures.
 /// - Propagates queue/event-store failures from the start transaction.
 #[allow(clippy::too_many_lines)]
@@ -1250,16 +1313,15 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
     if let Some(mode) = gate
         && terminate_via_pre_check
         && !reject_fresh_if_debounced
-        && let Some((gate_id, reason, scope_kind)) = evaluate_start_gate(
+    {
+        admit_fresh_start(
             mode,
+            metrics,
             request.workflow_name,
             request.queue_name,
             shard_id_value,
             request.owner,
-        )
-    {
-        record_start_gate_block(metrics, scope_kind, &reason);
-        return Err(HarvestError::AdmissionBlocked { gate_id, reason });
+        )?;
     }
 
     // Route a quota-governed key through the fully atomic `inline_cancel` +
@@ -1621,15 +1683,15 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
                 prior.as_ref().map(|e| e.state.as_str()),
                 request.reuse_policy,
                 request.conflict_policy,
-            ) && let Some((gate_id, reason, scope_kind)) = evaluate_start_gate(
-                mode,
-                request.workflow_name,
-                request.queue_name,
-                shard_id_value,
-                request.owner,
             ) {
-                record_start_gate_block(metrics, scope_kind, &reason);
-                return Err(HarvestError::AdmissionBlocked { gate_id, reason });
+                admit_fresh_start(
+                    mode,
+                    metrics,
+                    request.workflow_name,
+                    request.queue_name,
+                    shard_id_value,
+                    request.owner,
+                )?;
             }
         }
 

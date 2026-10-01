@@ -1209,6 +1209,20 @@ pub const METRIC_CODEC_REENCRYPTED: &str = "harvest.codec.reencrypted";
 /// `execution.id` is never a metric label.
 pub const METRIC_ADMISSION_BYPASSED: &str = "harvest.admission.bypassed";
 
+/// Gauge: 1 while a queue sheds new starts, 0 otherwise (issue #1794).
+///
+/// Label:
+///   - `"queue"` (= [`METRIC_LABEL_QUEUE`]) — a queue with a load-shed policy.
+///
+/// The sampler sets it for every configured queue on every successful sample.
+pub const METRIC_LOAD_SHED_ACTIVE: &str = "harvest.load_shed.active";
+
+/// Counter: one per new start that load shedding refused (issue #1794).
+///
+/// Label:
+///   - `"queue"` (= [`METRIC_LABEL_QUEUE`]) — the shed queue.
+pub const METRIC_LOAD_SHED_REJECTED: &str = "harvest.load_shed.rejected";
+
 /// Gauge: current available tokens in a rate limit bucket.
 pub const METRIC_RATE_LIMIT_TOKENS_AVAILABLE: &str = "harvest.rate_limit.tokens_available";
 
@@ -2326,6 +2340,19 @@ pub trait MetricsRecorder: Send + Sync {
     /// nothing is silently slipping an active gate.
     fn record_admission_bypassed(&self, producer: &str) {
         let _ = producer;
+    }
+
+    /// The load-shed state of `queue` after one sample (issue #1794).
+    ///
+    /// `active` is `true` while the queue sheds new starts. The sampler calls
+    /// this for every configured queue on every successful sample.
+    fn record_load_shed_active(&self, queue: &str, active: bool) {
+        let _ = (queue, active);
+    }
+
+    /// Load shedding rejected one new start on `queue` (issue #1794).
+    fn record_load_shed_rejected(&self, queue: &str) {
+        let _ = queue;
     }
 
     /// A fresh workflow start was rejected because its resolved per-tenant

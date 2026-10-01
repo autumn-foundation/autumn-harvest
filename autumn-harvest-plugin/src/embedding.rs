@@ -260,7 +260,7 @@ impl HarvestEmbedding {
 
         let storage_pool = runner.storage_pool();
         api_state.install_storage_pool(storage_pool.clone());
-        let gate_refresh = boot::spawn_gate_refresh(&api_state, storage_pool.clone_inner());
+        let gate_refresh = boot::spawn_gate_refresh(&api_state, &storage_pool);
         api_state.install(runner.api_runtime());
         admission_guard.commit();
 

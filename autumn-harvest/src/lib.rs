@@ -455,6 +455,8 @@ pub mod dlq;
 #[cfg(feature = "db")]
 #[doc(hidden)]
 pub mod heartbeat;
+/// Automatic load shedding driven by backlog age (issue #1794).
+pub mod load_shed;
 #[cfg(feature = "db")]
 #[doc(hidden)]
 pub mod models;
