@@ -30367,7 +30367,7 @@ impl Worker {
                 );
                 // Schedule-to-start is recorded when the handler begins, in
                 // `process_workflow_task` / `process_activity_task`. It is not
-                // recorded here. The sample runs from task eligibility, so it
+                // recorded here. The sample runs from task eligibility. It
                 // includes the `PENDING` wait behind a saturated worker (issue
                 // #1787) and the short permit wait after the claim.
                 let reservation = reservations.take(&task.task_type);
