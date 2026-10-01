@@ -36,16 +36,16 @@
 //! still returns before any query. It then reports `export_observed = 0` for
 //! each shard it serves, because the gauges would otherwise keep a healthy value.
 //!
-//! Write behavior does not. `harvest_audit_log_unexported_idx` is a partial
-//! index on `export_seq IS NULL`. An unconfigured deployment leaves every row
-//! `NULL` forever, so the index matches the whole audit table, and every
-//! audit insert pays its maintenance cost. That cost is bounded only while
-//! retention actually reclaims unexported rows. See `docs/audit-export.md`'s
-//! "Retention interaction" section for the exact conditions: they are more
-//! than one config flag. Tracked as issue #1272. Even then the bound is not
-//! total. Retention can never purge a decommission or reactivation record,
-//! exported or not. That holds no matter how many requests a shard has
-//! seen.
+//! Write behavior matched that before issue #1667. The partial index
+//! `harvest_audit_log_unexported_idx` matches every row while `export_seq` stays
+//! `NULL`. It then added maintenance cost to each audit insert and served no
+//! read (issue #1272). The index is now built lazily. [`ensure_unexported_index`]
+//! builds it on the first export tick, and a migration drops it from databases
+//! that never ran export. An unconfigured deployment pays no index maintenance
+//! cost. Once export runs, the index size is bounded only while retention
+//! reclaims unexported rows. See `docs/audit-export.md`'s "Retention
+//! interaction" section. Retention can never
+//! purge a decommission or reactivation record, exported or not.
 //!
 //! # Where the monotonic sequence comes from (and why not `BIGSERIAL`)
 //!
@@ -491,8 +491,8 @@ pub const fn resolve_rewind(current_acked: i64, requested: i64) -> RewindOutcome
 ///
 /// With `sink` and `webhook_url` both `None` — the default — audit export is
 /// never installed and the scanner is entirely inert (AC8). The partial
-/// index still costs insert-time maintenance; see the module-level caveat
-/// above (issue #1272).
+/// index does not exist until export first runs; see the module-level note
+/// above (issues #1272 and #1667).
 #[derive(Clone)]
 pub struct AuditExportBuilderConfig {
     /// Allowed sink hosts. Required (non-empty) for a `webhook_url` to
@@ -788,9 +788,8 @@ pub const DEFAULT_EXPORT_LEASE: std::time::Duration = std::time::Duration::from_
 /// `None` (the default, before any builder wiring runs) means the scanner is
 /// fully inert. [`fire_due_audit_exports`] returns `Ok(0)` before issuing a
 /// query, so an embedder who never configures a sink sees zero query
-/// behavior change and zero scanner work (AC8). The partial index is not
-/// part of that guarantee — see the module-level caveat above (issue
-/// #1272).
+/// behavior change and zero scanner work (AC8). The partial index is built
+/// lazily on the first tick; see the module-level note above (issue #1667).
 #[derive(Clone)]
 pub struct AuditExportRuntimeConfig {
     /// Embedder-supplied (or plugin-default) transport.
@@ -1100,6 +1099,129 @@ pub async fn ensure_cursor_row(
     .await
     .map_err(crate::error::database_error)?;
     Ok(())
+}
+
+/// Advisory-lock key that serializes builds of the claim-scan index.
+pub const UNEXPORTED_INDEX_LOCK_KEY: i64 = 0x6175_6469_745f_6978;
+
+/// Build the claim-scan index if it is missing or invalid (issue #1667).
+///
+/// The index `harvest_audit_log_unexported_idx` matches every audit row while
+/// no sink is configured. It would add cost to each insert and serve no read.
+/// So no migration creates it. The exporter builds it here, before its first
+/// claim.
+///
+/// The build uses `CREATE INDEX CONCURRENTLY`, so audit inserts continue. A
+/// failed concurrent build leaves an invalid index. This function drops and
+/// rebuilds such an index. A session advisory lock keeps two exporters from
+/// dropping each other's build. A caller that loses the race returns at once.
+/// The claim scan is correct without the index, only slower.
+///
+/// The connection must not be inside a transaction.
+///
+/// # Errors
+/// Returns `HarvestError` on a database failure.
+#[cfg(feature = "db")]
+pub async fn ensure_unexported_index(
+    conn: &mut diesel_async::AsyncPgConnection,
+) -> crate::error::HarvestResult<()> {
+    use diesel_async::RunQueryDsl;
+
+    #[derive(diesel::QueryableByName)]
+    struct Flag {
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        flag: bool,
+    }
+
+    if unexported_index_valid(conn).await? == Some(true) {
+        return Ok(());
+    }
+    let locked: Vec<Flag> = diesel::sql_query("SELECT pg_try_advisory_lock($1) AS flag")
+        .bind::<diesel::sql_types::BigInt, _>(UNEXPORTED_INDEX_LOCK_KEY)
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    if !locked.iter().next().is_some_and(|row| row.flag) {
+        return Ok(());
+    }
+    let built = build_unexported_index(conn).await;
+    // The lock belongs to the session, and the pool reuses the session.
+    if let Err(error) = diesel::sql_query("SELECT pg_advisory_unlock($1)")
+        .bind::<diesel::sql_types::BigInt, _>(UNEXPORTED_INDEX_LOCK_KEY)
+        .execute(conn)
+        .await
+    {
+        tracing::warn!(%error, "[audit_export] could not release the index build lock");
+    }
+    built
+}
+
+/// `None` when the index is missing, else whether it is valid.
+#[cfg(feature = "db")]
+async fn unexported_index_valid(
+    conn: &mut diesel_async::AsyncPgConnection,
+) -> crate::error::HarvestResult<Option<bool>> {
+    use diesel_async::RunQueryDsl;
+
+    #[derive(diesel::QueryableByName)]
+    struct State {
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        valid: bool,
+    }
+
+    let rows: Vec<State> = diesel::sql_query(
+        "SELECT indisvalid AS valid FROM pg_index \
+         WHERE indexrelid = to_regclass('harvest_audit_log_unexported_idx')",
+    )
+    .load(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+    Ok(rows.iter().next().map(|row| row.valid))
+}
+
+/// Build the index. The caller holds [`UNEXPORTED_INDEX_LOCK_KEY`].
+#[cfg(feature = "db")]
+async fn build_unexported_index(
+    conn: &mut diesel_async::AsyncPgConnection,
+) -> crate::error::HarvestResult<()> {
+    use diesel_async::RunQueryDsl;
+
+    // Re-check under the lock: another exporter may have finished the build.
+    match unexported_index_valid(conn).await? {
+        Some(true) => return Ok(()),
+        Some(false) => {
+            diesel::sql_query("DROP INDEX CONCURRENTLY IF EXISTS harvest_audit_log_unexported_idx")
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+        }
+        None => {}
+    }
+    diesel::sql_query(
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS harvest_audit_log_unexported_idx \
+         ON harvest_audit_log (occurred_at, id) WHERE export_seq IS NULL",
+    )
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+    Ok(())
+}
+
+/// Run [`ensure_unexported_index`] without failing the tick.
+///
+/// A failed build leaves export correct but slower. The next tick retries.
+#[cfg(feature = "db")]
+async fn ensure_unexported_index_best_effort(
+    conn: &mut diesel_async::AsyncPgConnection,
+    shard_id: i32,
+) {
+    if let Err(error) = ensure_unexported_index(conn).await {
+        tracing::warn!(
+            shard = shard_id,
+            %error,
+            "[audit_export] could not build the claim-scan index; export continues without it"
+        );
+    }
 }
 
 /// Result of resolving a decommission or reactivate request against the live
@@ -1760,7 +1882,7 @@ struct OldestInWindow {
 /// scale with the backlog.
 ///
 /// - Not-yet-sequenced rows: `MIN(occurred_at) WHERE export_seq IS NULL`.
-///   An index-min on `harvest_audit_log_unexported_idx` serves this.
+///   An index-min on `harvest_audit_log_unexported_idx` serves this once export runs.
 /// - Sequenced-but-unacknowledged rows: `MIN(occurred_at)` over the lowest
 ///   [`EXPORT_LAG_LOOKBACK_ROWS`] pending sequences (issue #1271). The
 ///   covering index `harvest_audit_log_export_seq_idx` on
@@ -2306,6 +2428,7 @@ async fn export_once_on_conn(
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> crate::error::HarvestResult<usize> {
     let config = config_arc.as_ref();
+    ensure_unexported_index_best_effort(conn, shard_id).await;
     ensure_cursor_row(conn, shard_id).await?;
 
     let now = Utc::now();
@@ -2815,6 +2938,7 @@ async fn export_once_via_pool(
     // the same locked row from scratch.
     let claim = tokio::select! {
         result = async {
+            ensure_unexported_index_best_effort(&mut conn, shard_id).await;
             ensure_cursor_row(&mut conn, shard_id).await?;
             let now = Utc::now();
             claim_shard(&mut conn, shard_id, config.batch_size, config.lease, now).await

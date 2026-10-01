@@ -5100,3 +5100,171 @@ async fn a_short_lease_still_keeps_a_positive_delivery_window() {
     let _ = handle.await;
     uninstall();
 }
+
+// ── Lazy claim-scan index (issue #1667) ──────────────────────────────────────
+
+const UNEXPORTED_IDX: &str = "harvest_audit_log_unexported_idx";
+const LAZY_IDX_MIGRATION: &str =
+    include_str!("../../migrations/20261001190405_harvest_audit_unexported_idx_lazy/up.sql");
+
+/// A fresh migrated database. Uses `HARVEST_TEST_DATABASE_URL` when set.
+async fn make_conn_any() -> (
+    diesel_async::AsyncPgConnection,
+    String,
+    Option<testcontainers::ContainerAsync<Postgres>>,
+) {
+    let Ok(admin_url) = std::env::var("HARVEST_TEST_DATABASE_URL") else {
+        let (conn, container) = make_conn().await;
+        let port = container.get_host_port_ipv4(5432).await.expect("port");
+        let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+        return (conn, url, Some(container));
+    };
+    let mut admin = diesel_async::AsyncPgConnection::establish(&admin_url)
+        .await
+        .expect("admin connect");
+    let name = format!("lazy_idx_{}", uuid::Uuid::new_v4().simple());
+    admin
+        .batch_execute(&format!("CREATE DATABASE {name}"))
+        .await
+        .expect("create database");
+    let (base, _) = admin_url.rsplit_once('/').expect("url has a database");
+    let url = format!("{base}/{name}");
+    let mut conn = diesel_async::AsyncPgConnection::establish(&url)
+        .await
+        .expect("connect");
+    conn.batch_execute(autumn_harvest::full_migrations_sql())
+        .await
+        .expect("migration");
+    (conn, url, None)
+}
+
+#[derive(diesel::QueryableByName)]
+struct IndexState {
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    valid: bool,
+}
+
+/// `None` when the index does not exist, else whether it is valid.
+async fn unexported_idx_state(conn: &mut diesel_async::AsyncPgConnection) -> Option<bool> {
+    let rows: Vec<IndexState> = diesel::sql_query(format!(
+        "SELECT indisvalid AS valid FROM pg_index WHERE indexrelid = to_regclass('{UNEXPORTED_IDX}')"
+    ))
+    .load(conn)
+    .await
+    .expect("index state");
+    rows.iter().next().map(|r| r.valid)
+}
+
+async fn create_unexported_idx(conn: &mut diesel_async::AsyncPgConnection) {
+    conn.batch_execute(&format!(
+        "CREATE INDEX {UNEXPORTED_IDX} ON harvest_audit_log (occurred_at, id) \
+         WHERE export_seq IS NULL"
+    ))
+    .await
+    .expect("create index");
+}
+
+#[tokio::test]
+async fn a_fresh_database_has_no_claim_scan_index() {
+    let (mut conn, _url, _c) = make_conn_any().await;
+    assert_eq!(unexported_idx_state(&mut conn).await, None);
+}
+
+#[tokio::test]
+async fn the_lazy_migration_drops_the_index_when_export_never_ran() {
+    let (mut conn, _url, _c) = make_conn_any().await;
+    create_unexported_idx(&mut conn).await;
+    conn.batch_execute(LAZY_IDX_MIGRATION)
+        .await
+        .expect("migration");
+    assert_eq!(unexported_idx_state(&mut conn).await, None);
+}
+
+#[tokio::test]
+async fn the_lazy_migration_keeps_the_index_when_a_cursor_row_exists() {
+    let (mut conn, _url, _c) = make_conn_any().await;
+    create_unexported_idx(&mut conn).await;
+    ensure_cursor_row(&mut conn, 0).await.expect("cursor row");
+    conn.batch_execute(LAZY_IDX_MIGRATION)
+        .await
+        .expect("migration");
+    assert_eq!(unexported_idx_state(&mut conn).await, Some(true));
+}
+
+#[tokio::test]
+async fn the_first_export_tick_builds_the_index() {
+    let _guard = TEST_SERIAL.lock().await;
+    let (mut conn, _url, _c) = make_conn_any().await;
+    insert_audit_rows(&mut conn, 3).await;
+    install(Arc::new(RecordingSink::new(200)), 10);
+    let metrics = RecordingMetrics::default();
+    fire_due_audit_exports(&mut conn, &None, &[], &metrics)
+        .await
+        .expect("scanner runs");
+    uninstall();
+    assert_eq!(unexported_idx_state(&mut conn).await, Some(true));
+}
+
+#[tokio::test]
+async fn an_unconfigured_tick_never_builds_the_index() {
+    let _guard = TEST_SERIAL.lock().await;
+    uninstall();
+    let (mut conn, _url, _c) = make_conn_any().await;
+    let metrics = RecordingMetrics::default();
+    fire_due_audit_exports(&mut conn, &None, &[], &metrics)
+        .await
+        .expect("scanner runs");
+    assert_eq!(unexported_idx_state(&mut conn).await, None);
+}
+
+#[tokio::test]
+async fn ensuring_the_index_twice_is_a_no_op() {
+    let (mut conn, _url, _c) = make_conn_any().await;
+    autumn_harvest::audit_export::ensure_unexported_index(&mut conn)
+        .await
+        .expect("first ensure");
+    autumn_harvest::audit_export::ensure_unexported_index(&mut conn)
+        .await
+        .expect("second ensure");
+    assert_eq!(unexported_idx_state(&mut conn).await, Some(true));
+}
+
+#[tokio::test]
+async fn an_invalid_index_is_rebuilt() {
+    let (mut conn, _url, _c) = make_conn_any().await;
+    create_unexported_idx(&mut conn).await;
+    conn.batch_execute(&format!(
+        "UPDATE pg_index SET indisvalid = false WHERE indexrelid = '{UNEXPORTED_IDX}'::regclass"
+    ))
+    .await
+    .expect("mark invalid");
+    autumn_harvest::audit_export::ensure_unexported_index(&mut conn)
+        .await
+        .expect("ensure");
+    assert_eq!(unexported_idx_state(&mut conn).await, Some(true));
+}
+
+#[tokio::test]
+async fn a_concurrent_builder_makes_ensure_skip_without_error() {
+    let (mut conn, url, _c) = make_conn_any().await;
+    // A second session stands in for another exporter mid-build.
+    let key = autumn_harvest::audit_export::UNEXPORTED_INDEX_LOCK_KEY;
+    #[derive(diesel::QueryableByName)]
+    struct Locked {
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        got: bool,
+    }
+    let got: Vec<Locked> = diesel::sql_query(format!("SELECT pg_try_advisory_lock({key}) AS got"))
+        .load(&mut conn)
+        .await
+        .expect("lock");
+    assert!(got[0].got);
+    // `conn` holds the lock. A second session must skip, not block.
+    let mut other = diesel_async::AsyncPgConnection::establish(&url)
+        .await
+        .expect("second session");
+    autumn_harvest::audit_export::ensure_unexported_index(&mut other)
+        .await
+        .expect("ensure skips");
+    assert_eq!(unexported_idx_state(&mut conn).await, None);
+}

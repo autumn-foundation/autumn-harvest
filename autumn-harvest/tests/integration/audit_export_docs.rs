@@ -439,3 +439,20 @@ fn guards_run_on_docs_only_changes() {
          stop running on docs-only PRs. Stanza:\n{stanza}"
     );
 }
+
+/// Issue #1667: the index is built lazily. Prose must not claim that an
+/// unconfigured deployment still pays for it.
+#[test]
+fn prose_says_the_index_is_built_lazily() {
+    for rel in ["autumn-harvest/src/audit_export.rs", "docs/audit-export.md"] {
+        let text = read_normalized(&repo_root().join(rel));
+        assert!(
+            markers_near(&text, "harvest_audit_log_unexported_idx", "1667"),
+            "{rel}: the index description must cite issue #1667"
+        );
+        assert!(
+            contains_collapsed(&text, "CONCURRENTLY") || contains_collapsed(&text, "built lazily"),
+            "{rel}: the index description must say it is built lazily"
+        );
+    }
+}

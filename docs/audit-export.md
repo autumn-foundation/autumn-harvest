@@ -16,18 +16,18 @@ HTTP client, a `reqwest` signed-webhook implementation in the plugin, a
 two-transaction scanner that never holds a row lock across network I/O, and a
 per-shard cursor that advances only on acknowledgement.
 
-- **It is opt-in, but one cost is not zero.** With no sink configured, no
-  sequence is assigned, no cursor row is created, and the scanner returns
-  before issuing a single query. Insert behavior is the exception:
-  `harvest_audit_log_unexported_idx` is a partial index on `export_seq IS
-  NULL`. An unconfigured deployment leaves every row `NULL` forever, so the
-  index matches the whole audit table. Every audit insert then pays its
-  maintenance cost. That cost is bounded only while retention actually
-  reclaims unexported rows. See "Retention interaction" below for the exact
-  conditions, which are more than one config flag. Tracked as issue #1272.
-  Even then the bound is not total. Retention can never purge a
-  decommission or reactivation record, exported or not. That holds no
-  matter how many requests a shard has seen.
+- **It is opt-in, and an unconfigured deployment pays nothing for it.** With no
+  sink configured, no sequence is assigned, no cursor row is created, and the
+  scanner returns before issuing a single query. The claim-scan index
+  `harvest_audit_log_unexported_idx` does not exist either. Before issue #1667
+  a migration always created it. It matched every row while `export_seq` stayed
+  `NULL`, so each audit insert paid its maintenance cost (issue #1272). The
+  exporter now builds the index on its first tick, with `CREATE INDEX
+  CONCURRENTLY`, so audit inserts continue during the build. A migration drops
+  the index from databases that never ran export. Databases with a cursor row
+  keep it. Once export runs, the index size is bounded only while retention
+  reclaims unexported rows. See "Retention interaction" below. Retention can never purge a decommission or reactivation
+  record, exported or not.
 - **It never touches workflow history.** No new `WorkflowEvent` variant, no
   replay-determinism impact. Audit rows are operational metadata; the exporter
   only reads them.
