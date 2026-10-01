@@ -178,6 +178,29 @@ pub fn is_terminal_state(state: &str) -> bool {
     TERMINAL_STATES.contains(&state)
 }
 
+/// Placeholder that [`render_states`] replaces in a SQL template.
+pub const STATES_PLACEHOLDER: &str = "{states}";
+
+/// Renders `states` as a SQL literal list, for example `'A', 'B'`.
+///
+/// State names are code constants, never user input, so no escaping is needed.
+#[must_use]
+pub fn sql_literal_list(states: &[&str]) -> String {
+    states
+        .iter()
+        .map(|state| format!("'{state}'"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Replaces every [`STATES_PLACEHOLDER`] in `template` with the literal list of `states`.
+///
+/// Raw SQL derives its state lists here, so the lists cannot drift from the constants.
+#[must_use]
+pub fn render_states(template: &str, states: &[&str]) -> String {
+    template.replace(STATES_PLACEHOLDER, &sql_literal_list(states))
+}
+
 /// Returns `true` if a workflow execution row's payload has been PII-erased
 /// (issue #495), from an O(1) check of its already-loaded `input` column.
 ///
@@ -1367,6 +1390,26 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn sql_literal_list_quotes_each_state_in_order() {
+        assert_eq!(sql_literal_list(&["A", "B"]), "'A', 'B'");
+        assert_eq!(sql_literal_list(&[]), "");
+    }
+
+    #[test]
+    fn render_states_replaces_every_placeholder() {
+        let sql = render_states("x IN ({states}) OR y IN ({states})", &["A", "B"]);
+        assert_eq!(sql, "x IN ('A', 'B') OR y IN ('A', 'B')");
+    }
+
+    #[test]
+    fn render_states_of_terminal_states_lists_every_state() {
+        let sql = render_states("{states}", TERMINAL_STATES);
+        for state in TERMINAL_STATES {
+            assert!(sql.contains(&format!("'{state}'")), "{state} missing");
+        }
+    }
 
     // ── tombstone_payload_fields ──────────────────────────────────────────────
 

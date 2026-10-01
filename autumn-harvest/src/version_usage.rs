@@ -90,7 +90,7 @@ struct VersionUsageSqlRow {
     shard_id: i32,
 }
 
-const VERSION_USAGE_SQL: &str = r"
+const VERSION_USAGE_SQL_TEMPLATE: &str = r"
 WITH version_markers AS (
     SELECT DISTINCT
         w.id AS workflow_exec_id,
@@ -114,25 +114,11 @@ WITH version_markers AS (
           $4::TEXT = 'all'
           OR (
               $4::TEXT = 'active'
-              AND w.state NOT IN (
-                  'COMPLETED',
-                  'FAILED',
-                  'CANCELLED',
-                  'TIMED_OUT',
-                  'CONTINUED_AS_NEW',
-                  'TERMINATED'
-              )
+              AND w.state NOT IN ({states})
           )
           OR (
               $4::TEXT = 'terminal'
-              AND w.state IN (
-                  'COMPLETED',
-                  'FAILED',
-                  'CANCELLED',
-                  'TIMED_OUT',
-                  'CONTINUED_AS_NEW',
-                  'TERMINATED'
-              )
+              AND w.state IN ({states})
           )
       )
       AND ($5::INT4 IS NULL OR w.shard_id = $5::INT4)
@@ -142,24 +128,10 @@ SELECT
     change_id::TEXT AS change_id,
     recorded_version::BIGINT AS recorded_version,
     COUNT(*) FILTER (
-        WHERE state NOT IN (
-            'COMPLETED',
-            'FAILED',
-            'CANCELLED',
-            'TIMED_OUT',
-            'CONTINUED_AS_NEW',
-            'TERMINATED'
-        )
+        WHERE state NOT IN ({states})
     )::BIGINT AS active_executions,
     COUNT(*) FILTER (
-        WHERE state IN (
-            'COMPLETED',
-            'FAILED',
-            'CANCELLED',
-            'TIMED_OUT',
-            'CONTINUED_AS_NEW',
-            'TERMINATED'
-        )
+        WHERE state IN ({states})
     )::BIGINT AS terminal_executions,
     MIN(started_at) AS oldest_matching_started_at,
     MAX(started_at) AS newest_matching_started_at,
@@ -168,6 +140,11 @@ FROM version_markers
 GROUP BY workflow_name, change_id, recorded_version, shard_id
 ORDER BY workflow_name, change_id, recorded_version, shard_id
 ";
+
+/// Builds the usage query with the terminal list from `erase::TERMINAL_STATES`.
+fn version_usage_sql() -> String {
+    crate::erase::render_states(VERSION_USAGE_SQL_TEMPLATE, crate::erase::TERMINAL_STATES)
+}
 
 /// Load grouped version-marker usage from a single shard without mutating state.
 ///
@@ -179,7 +156,7 @@ pub async fn load_version_usage(
     filters: &VersionUsageFilters,
 ) -> HarvestResult<Vec<VersionUsageShardRow>> {
     let version_filter = filters.recorded_version.map(i64::from);
-    let rows = diesel::sql_query(VERSION_USAGE_SQL)
+    let rows = diesel::sql_query(version_usage_sql())
         .bind::<Nullable<Text>, _>(filters.workflow_name.as_deref())
         .bind::<Nullable<Text>, _>(filters.change_id.as_deref())
         .bind::<Nullable<BigInt>, _>(version_filter)
@@ -214,6 +191,19 @@ pub async fn load_version_usage(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every rendered terminal list must equal `erase::TERMINAL_STATES`.
+    fn assert_terminal_lists_only(sql: &str) {
+        assert!(!sql.contains("{states}"), "unrendered placeholder");
+        for state in crate::erase::TERMINAL_STATES {
+            assert!(sql.contains(&format!("'{state}'")), "{state} missing");
+        }
+    }
+
+    #[test]
+    fn usage_sql_derives_terminal_list_from_terminal_states() {
+        assert_terminal_lists_only(&version_usage_sql());
+    }
 
     #[test]
     fn test_version_execution_state_group_as_str() {

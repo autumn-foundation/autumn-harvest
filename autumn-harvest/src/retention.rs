@@ -2190,45 +2190,7 @@ async fn run_shard_tick(
             // with a global age the fallback is bound as $3; without one it
             // is the `'-infinity'` literal and the cursor/limit binds shift
             // down by one.
-            let sql = if global_fallback.is_some() {
-                "SELECT id, workflow_name, workflow_id, state, completed_at, context_headers, legal_hold_set_at, legal_hold_until, execution_timeout, deadline_at, parent_id, queue_name
-                 FROM harvest_workflow_executions
-                 WHERE state IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW','TERMINATED')
-                   AND completed_at IS NOT NULL
-                   AND (sticky_worker_id IS NULL OR sticky_worker_id NOT LIKE 'retention-lease-%')
-                   AND completed_at < COALESCE(
-                       (SELECT ov.cut
-                          FROM unnest($1::text[], $2::timestamptz[]) AS ov(nm, cut)
-                         WHERE ov.nm = harvest_workflow_executions.workflow_name),
-                       $3)
-                   AND (
-                       $4 IS NULL
-                       OR completed_at > $4
-                       OR (completed_at = $4 AND id > $5)
-                   )
-                 ORDER BY completed_at ASC, id ASC
-                 LIMIT $6
-                 FOR UPDATE SKIP LOCKED"
-            } else {
-                "SELECT id, workflow_name, workflow_id, state, completed_at, context_headers, legal_hold_set_at, legal_hold_until, execution_timeout, deadline_at, parent_id, queue_name
-                 FROM harvest_workflow_executions
-                 WHERE state IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW','TERMINATED')
-                   AND completed_at IS NOT NULL
-                   AND (sticky_worker_id IS NULL OR sticky_worker_id NOT LIKE 'retention-lease-%')
-                   AND completed_at < COALESCE(
-                       (SELECT ov.cut
-                          FROM unnest($1::text[], $2::timestamptz[]) AS ov(nm, cut)
-                         WHERE ov.nm = harvest_workflow_executions.workflow_name),
-                       '-infinity'::timestamptz)
-                   AND (
-                       $3 IS NULL
-                       OR completed_at > $3
-                       OR (completed_at = $3 AND id > $4)
-                   )
-                 ORDER BY completed_at ASC, id ASC
-                 LIMIT $5
-                 FOR UPDATE SKIP LOCKED"
-            };
+            let sql = candidate_scan_sql(global_fallback.is_some());
             // Bind order maps to $1..$N regardless of textual position. The
             // override arrays ($1/$2) are always bound; $3 is the global
             // fallback only in the global-age variant.
@@ -2774,7 +2736,7 @@ enum CandidateDeleteOutcome {
 
 /// The execution states the retention candidate scan selects.
 ///
-/// The candidate SQL lists the same states. `MIGRATED` is absent on purpose:
+/// The candidate SQL renders this list. `MIGRATED` is absent on purpose:
 /// a sealed source row carries the forwarding pointer.
 #[cfg(feature = "db")]
 const RETENTION_CANDIDATE_STATES: &[&str] = &[
@@ -2785,6 +2747,89 @@ const RETENTION_CANDIDATE_STATES: &[&str] = &[
     "CONTINUED_AS_NEW",
     "TERMINATED",
 ];
+
+/// Candidate-scan template when a global age fallback is bound as `$3`.
+#[cfg(feature = "db")]
+const CANDIDATE_SCAN_GLOBAL_TEMPLATE: &str = r"SELECT id, workflow_name, workflow_id, state, completed_at, context_headers, legal_hold_set_at, legal_hold_until, execution_timeout, deadline_at, parent_id, queue_name
+                 FROM harvest_workflow_executions
+                 WHERE state IN ({states})
+                   AND completed_at IS NOT NULL
+                   AND (sticky_worker_id IS NULL OR sticky_worker_id NOT LIKE 'retention-lease-%')
+                   AND completed_at < COALESCE(
+                       (SELECT ov.cut
+                          FROM unnest($1::text[], $2::timestamptz[]) AS ov(nm, cut)
+                         WHERE ov.nm = harvest_workflow_executions.workflow_name),
+                       $3)
+                   AND (
+                       $4 IS NULL
+                       OR completed_at > $4
+                       OR (completed_at = $4 AND id > $5)
+                   )
+                 ORDER BY completed_at ASC, id ASC
+                 LIMIT $6
+                 FOR UPDATE SKIP LOCKED";
+
+/// Candidate-scan template when no global age is set; the fallback is `-infinity`.
+#[cfg(feature = "db")]
+const CANDIDATE_SCAN_NO_GLOBAL_TEMPLATE: &str = r"SELECT id, workflow_name, workflow_id, state, completed_at, context_headers, legal_hold_set_at, legal_hold_until, execution_timeout, deadline_at, parent_id, queue_name
+                 FROM harvest_workflow_executions
+                 WHERE state IN ({states})
+                   AND completed_at IS NOT NULL
+                   AND (sticky_worker_id IS NULL OR sticky_worker_id NOT LIKE 'retention-lease-%')
+                   AND completed_at < COALESCE(
+                       (SELECT ov.cut
+                          FROM unnest($1::text[], $2::timestamptz[]) AS ov(nm, cut)
+                         WHERE ov.nm = harvest_workflow_executions.workflow_name),
+                       '-infinity'::timestamptz)
+                   AND (
+                       $3 IS NULL
+                       OR completed_at > $3
+                       OR (completed_at = $3 AND id > $4)
+                   )
+                 ORDER BY completed_at ASC, id ASC
+                 LIMIT $5
+                 FOR UPDATE SKIP LOCKED";
+
+/// Builds the candidate-scan query from [`RETENTION_CANDIDATE_STATES`].
+#[cfg(feature = "db")]
+fn candidate_scan_sql(has_global_age: bool) -> String {
+    let template = if has_global_age {
+        CANDIDATE_SCAN_GLOBAL_TEMPLATE
+    } else {
+        CANDIDATE_SCAN_NO_GLOBAL_TEMPLATE
+    };
+    crate::erase::render_states(template, RETENTION_CANDIDATE_STATES)
+}
+
+/// Builds the live-child count query. `MIGRATED` stays outside the list, so a seal blocks the parent.
+#[cfg(feature = "db")]
+fn active_child_count_sql() -> String {
+    crate::erase::render_states(
+        "SELECT COUNT(*) AS count
+         FROM harvest_workflow_executions
+         WHERE parent_id = $1
+           AND state NOT IN ({states})",
+        RETENTION_CANDIDATE_STATES,
+    )
+}
+
+/// Builds the chain-link count query. It treats every terminal state, `MIGRATED` included, as settled.
+#[cfg(feature = "db")]
+fn chain_link_count_sql() -> String {
+    crate::erase::render_states(
+        "SELECT COUNT(*) AS count
+         FROM harvest_workflow_executions
+         WHERE workflow_name = $1
+           AND workflow_id = $2
+           AND id <> $3
+           AND (
+                state NOT IN ({states})
+               OR completed_at IS NULL
+               OR completed_at >= $4
+           )",
+        crate::erase::TERMINAL_STATES,
+    )
+}
 
 /// The two legal-hold timestamp columns `(legal_hold_set_at, legal_hold_until)`.
 #[cfg(feature = "db")]
@@ -3446,17 +3491,12 @@ async fn should_skip_candidate(
     candidate: &CandidateExecution,
     cutoff: DateTime<Utc>,
 ) -> HarvestResult<bool> {
-    let active_parent_ref_count = diesel::sql_query(
-        "SELECT COUNT(*) AS count
-         FROM harvest_workflow_executions
-         WHERE parent_id = $1
-           AND state NOT IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW','TERMINATED')",
-    )
-    .bind::<SqlUuid, _>(candidate.id)
-    .get_result::<CountRow>(conn)
-    .await
-    .map_err(database_error)?
-    .count;
+    let active_parent_ref_count = diesel::sql_query(active_child_count_sql())
+        .bind::<SqlUuid, _>(candidate.id)
+        .get_result::<CountRow>(conn)
+        .await
+        .map_err(database_error)?
+        .count;
 
     if active_parent_ref_count > 0 {
         return Ok(true);
@@ -3495,26 +3535,15 @@ async fn should_skip_candidate(
         return Ok(true);
     }
 
-    let chain_link_count = diesel::sql_query(
-        "SELECT COUNT(*) AS count
-         FROM harvest_workflow_executions
-         WHERE workflow_name = $1
-           AND workflow_id = $2
-           AND id <> $3
-           AND (
-                state NOT IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW','TERMINATED','MIGRATED')
-               OR completed_at IS NULL
-               OR completed_at >= $4
-           )",
-    )
-    .bind::<Text, _>(&candidate.workflow_name)
-    .bind::<Text, _>(&candidate.workflow_id)
-    .bind::<SqlUuid, _>(candidate.id)
-    .bind::<Timestamptz, _>(cutoff)
-    .get_result::<CountRow>(conn)
-    .await
-    .map_err(database_error)?
-    .count;
+    let chain_link_count = diesel::sql_query(chain_link_count_sql())
+        .bind::<Text, _>(&candidate.workflow_name)
+        .bind::<Text, _>(&candidate.workflow_id)
+        .bind::<SqlUuid, _>(candidate.id)
+        .bind::<Timestamptz, _>(cutoff)
+        .get_result::<CountRow>(conn)
+        .await
+        .map_err(database_error)?
+        .count;
 
     Ok(chain_link_count > 0)
 }
@@ -3818,6 +3847,47 @@ mod tests {
     use super::*;
     use crate::types::ShardId;
     use std::time::Duration;
+
+    fn count_of(sql: &str, needle: &str) -> usize {
+        sql.matches(needle).count()
+    }
+
+    #[test]
+    fn candidate_scan_sql_lists_exactly_the_candidate_states() {
+        for global in [true, false] {
+            let sql = candidate_scan_sql(global);
+            assert!(!sql.contains("{states}"), "unrendered placeholder");
+            for state in RETENTION_CANDIDATE_STATES {
+                assert_eq!(count_of(&sql, &format!("'{state}'")), 1, "{state}");
+            }
+            assert!(!sql.contains("'MIGRATED'"), "seal must stay unpurgeable");
+        }
+    }
+
+    #[test]
+    fn active_child_count_sql_keeps_the_candidate_states() {
+        let sql = active_child_count_sql();
+        assert!(sql.contains("NOT IN"));
+        for state in RETENTION_CANDIDATE_STATES {
+            assert!(sql.contains(&format!("'{state}'")), "{state}");
+        }
+        assert!(!sql.contains("'MIGRATED'"));
+    }
+
+    #[test]
+    fn chain_link_count_sql_lists_every_terminal_state() {
+        let sql = chain_link_count_sql();
+        for state in crate::erase::TERMINAL_STATES {
+            assert_eq!(count_of(&sql, &format!("'{state}'")), 1, "{state}");
+        }
+    }
+
+    #[test]
+    fn terminal_states_are_candidates_plus_migrated() {
+        let mut expected: Vec<&str> = RETENTION_CANDIDATE_STATES.to_vec();
+        expected.push("MIGRATED");
+        assert_eq!(expected, crate::erase::TERMINAL_STATES);
+    }
 
     #[test]
     fn test_retention_config_validation() {
