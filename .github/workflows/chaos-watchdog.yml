@@ -29,12 +29,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Alert when no scheduled chaos run succeeded in 48 h
+        # A step timeout is a step failure, so the report step below runs.
+        # A job timeout is a cancel, and then it does not run.
+        timeout-minutes: 3
         env:
           GH_TOKEN: ${{ github.token }}
         run: bash .github/ci/chaos-watchdog.sh
       # GitHub tells only the last editor of a cron about a failed scheduled
-      # run. This step puts a red watchdog run on the alert issue instead.
-      - name: Report a failed watchdog run on the alert issue
+      # run. This step puts a red watchdog run on its own issue instead.
+      - name: Report a failed watchdog run on an issue
         if: failure()
         env:
           GH_TOKEN: ${{ github.token }}

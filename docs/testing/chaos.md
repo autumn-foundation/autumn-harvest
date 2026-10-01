@@ -249,9 +249,10 @@ Before the fix for issue #1790, `chaos.yml` did not parse, so the nightly never
 ran. Two checks now catch a repeat:
 
 - `ci_run_coverage` parses every workflow file. It also checks that `chaos.yml`
-  has a cron and runs `chaos_tests::` with the `chaos` feature. An `if`, a
-  `continue-on-error`, or a flag such as `--no-run` or `--skip` on that step or
-  its job fails the check.
+  has a cron and runs `chaos_tests::` with the `chaos` feature. An `if` or a
+  `continue-on-error: true` on that step or its job fails the check. In the
+  step's `run:` text, a flag such as `--no-run` or `--skip` fails it too. So
+  does shell text that hides a failure, such as `|| true`.
 - `.github/workflows/chaos-watchdog.yml` runs daily at 10:41 UTC. It runs
   `.github/ci/chaos-watchdog.sh`. When no scheduled `chaos.yml` run succeeds in
   a 48-hour window, the script opens an issue with this title:
@@ -261,9 +262,12 @@ ran. Two checks now catch a repeat:
 
 The watchdog is a separate file, so a defect in `chaos.yml` cannot also stop the
 alert. An API error makes the watchdog run fail. It does not open a false alert.
-A final `if: failure()` step then runs `chaos-watchdog.sh self-failed`, which
-puts the failed run on the same alert issue. GitHub tells only the last editor of
-a cron about a failed scheduled run, so without this step the failure is silent.
+A final `if: failure()` step then runs `chaos-watchdog.sh self-failed`. It opens
+an issue titled `Chaos watchdog: a watchdog run failed`, or comments on the open
+one. GitHub tells only the last editor of a cron about a failed scheduled run, so
+without this step the failure is silent. The next clean watchdog run closes that
+issue. The check step has its own 3-minute timeout. A step timeout is a failure,
+so the report step still runs.
 
 ## Out of scope
 

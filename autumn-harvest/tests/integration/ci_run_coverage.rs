@@ -36,9 +36,10 @@
 //! keeps the `merge=union` manifest sorted + unique (a union-merge artifact is a
 //! benign, one-command-fix CI failure, never a conflict).
 //!
-//! A third assertion (issue #1790) parses `ci.yml` and each workflow that an
-//! `ALLOWLIST` or `FEATURE_GATE_EXEMPT` reason cites. A workflow that does not
-//! parse never runs, so a reason that cites it is false.
+//! A third assertion (issue #1790) parses every workflow file. It also checks
+//! that each workflow that an `ALLOWLIST` or `FEATURE_GATE_EXEMPT` reason cites
+//! exists. A workflow that does not parse never runs, so a reason that cites it
+//! is false.
 //!
 //! On failure the panic message lists every uncovered test and the exact
 //! manifest line to add.
@@ -1195,7 +1196,7 @@ fn linux_clone(row: &SuiteRow) -> SuiteRow {
     }
 }
 
-// ── Every workflow this guard cites must parse (issue #1790) ────────────────
+// ── Every workflow must parse (issue #1790) ─────────────────────────────────
 
 /// The repository root.
 pub fn repo_root() -> PathBuf {
@@ -1230,8 +1231,8 @@ fn cited_workflows() -> BTreeSet<String> {
 /// too, but `PyYAML` keeps the last value and hides the defect.
 ///
 /// This is a YAML syntax check only. It does not check the GitHub workflow
-/// schema, so an unknown key or a bad expression still passes. The chaos
-/// watchdog catches that case within 48 h.
+/// schema, so an unknown key or a bad expression still passes. For
+/// `chaos.yml`, the watchdog reports that case within about 2.5 days.
 fn parse_workflow_text(text: &str) -> Result<serde_yaml::Value, String> {
     serde_yaml::from_str(text).map_err(|e| e.to_string())
 }
@@ -1307,7 +1308,7 @@ fn workflow_parser_rejects_the_chaos_yml_defect_classes() {
 /// the suite. That claim is false when the workflow does not parse. The
 /// chaos suite stayed in that state from its first commit (issue #1790).
 #[test]
-fn every_cited_workflow_parses_and_has_jobs() {
+fn every_workflow_parses_and_has_jobs() {
     let cited = cited_workflows();
     assert!(
         cited.contains(".github/workflows/chaos.yml"),
@@ -1352,16 +1353,22 @@ fn all_workflows() -> BTreeSet<String> {
 /// `cargo test` flags that run no test, or less than the whole module.
 const NO_FULL_RUN_FLAGS: &[&str] = &["--no-run", "--exact", "--skip", "--ignored", "--list"];
 
-/// True when a job or step has no `if` and no `continue-on-error`.
+/// Shell text that makes a failed `cargo test` exit 0.
+const FAILURE_MASKS: &[&str] = &["||", "set +e", "exit 0"];
+
+/// True when a job or step has no `if` and no `continue-on-error: true`.
 ///
 /// An `if` can skip the step on the nightly. A `continue-on-error` makes a
 /// failed suite look green to the watchdog, which counts successful runs.
 fn ungated(node: &serde_yaml::Value) -> bool {
-    node.get("if").is_none() && node.get("continue-on-error").is_none()
+    let soft = node
+        .get("continue-on-error")
+        .is_some_and(|v| v.as_bool() != Some(false));
+    node.get("if").is_none() && !soft
 }
 
 /// True when an ungated step in an ungated job runs the whole `chaos_tests`
-/// module with the `chaos` feature.
+/// module with the `chaos` feature, and no shell text hides its failure.
 fn runs_the_chaos_suite_unconditionally(doc: &serde_yaml::Value) -> bool {
     let Some(jobs) = doc.get("jobs").and_then(serde_yaml::Value::as_mapping) else {
         return false;
@@ -1378,6 +1385,7 @@ fn runs_the_chaos_suite_unconditionally(doc: &serde_yaml::Value) -> bool {
                 && !run
                     .split_whitespace()
                     .any(|word| NO_FULL_RUN_FLAGS.iter().any(|f| word.starts_with(f)))
+                && !FAILURE_MASKS.iter().any(|mask| run.contains(mask))
         })
 }
 
