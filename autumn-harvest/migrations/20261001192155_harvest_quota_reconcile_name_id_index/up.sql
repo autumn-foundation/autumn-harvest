@@ -14,10 +14,14 @@
 -- `quota_key` is set or its execution turns terminal.
 --
 -- On a live deployment prefer the concurrent form, which cannot run inside
--- Diesel's migration transaction. Build it first, then drop the old index:
+-- Diesel's migration transaction. Build the new index first:
 --   CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_harvest_we_quota_reconcile_name_id
 --       ON harvest_workflow_executions (workflow_name, id)
 --       WHERE quota_key IS NULL AND state IN ('RUNNING', 'PAUSED');
+-- An interrupted concurrent build leaves an invalid index, and
+-- `IF NOT EXISTS` then skips it. Check `pg_index.indisvalid`. Drop and
+-- rebuild an invalid index. Then drop the old index without a long lock:
+--   DROP INDEX CONCURRENTLY IF EXISTS idx_harvest_we_quota_reconcile_candidates;
 CREATE INDEX IF NOT EXISTS idx_harvest_we_quota_reconcile_name_id
     ON harvest_workflow_executions (workflow_name, id)
     WHERE quota_key IS NULL AND state IN ('RUNNING', 'PAUSED');
