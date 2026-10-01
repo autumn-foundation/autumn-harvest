@@ -1663,7 +1663,7 @@ async fn batched_claim_skips_the_bucket_lock_for_a_candidate_already_past_its_de
 
     assert_eq!(claimed, None);
     assert!(
-        elapsed < std::time::Duration::from_millis(2000),
+        elapsed < std::time::Duration::from_secs(2),
         "candidate B's deadline expires during candidate A's ~1s bucket \
          wait, and bucket_b stays locked until ~3s -- B must be \
          rejected on its expired deadline alone, never waiting on its \
