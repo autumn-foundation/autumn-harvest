@@ -15494,19 +15494,25 @@ async fn process_activity_task(
     cancel.cancel();
     drop(activity_future);
 
-    // Finalization phase: re-acquire a connection now that the handler is done.
-    // The handler already ran, so a short pool incident must not drop its
-    // result. Each try is bounded (issue #1788).
-    let mut conn = crate::pool::acquire_with_retries(pool, FINALIZE_ACQUIRE_ATTEMPTS).await?;
-    let retry_policy_result = configured_retry_policy(task);
-    let retry_policy = fail_execution_on_error(
-        &mut conn,
-        task,
-        worker_id,
-        retry_policy_result,
-        registry.payload_codecs(),
-    )
-    .await?;
+    // Finalization phase. The handler already ran, so a short pool incident
+    // must not drop its result: each acquire is bounded and retried (issue
+    // #1788). Acquire only when a write is needed. An activity that committed
+    // through `run_transactional` needs none, so it must not wait on the pool.
+    let retry_policy = match configured_retry_policy(task) {
+        Ok(policy) => policy,
+        Err(error) => {
+            let mut conn =
+                crate::pool::acquire_with_retries(pool, FINALIZE_ACQUIRE_ATTEMPTS).await?;
+            fail_execution_on_error(
+                &mut conn,
+                task,
+                worker_id,
+                Err(error),
+                registry.payload_codecs(),
+            )
+            .await?
+        }
+    };
 
     // Circuit breaker (issue #369): record this attempt's outcome. A close →
     // open trip (or half-open re-open) and a recovery to closed are surfaced as
@@ -15592,6 +15598,7 @@ async fn process_activity_task(
     // (issue #1788). The handler already ran, so try again. Each finalization
     // re-checks `RUNNING` under a row lock, so a repeat is safe. An offloader
     // turns the repeats off; see `result_write_attempts`.
+    let mut conn = crate::pool::acquire_with_retries(pool, FINALIZE_ACQUIRE_ATTEMPTS).await?;
     let attempts = result_write_attempts(registry.payload_offloader().is_some());
     let mut attempt = 1;
     loop {
