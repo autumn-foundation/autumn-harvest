@@ -204,9 +204,9 @@ pub fn spawn_gate_refresh(
 /// Returns `None` when no queue has a policy, so a default deployment runs no
 /// sampler SQL. The sampler reads each physical pool once per tick.
 ///
-/// A sample that runs longer than two intervals is dropped as a failed tick.
-/// Ticks keep a fixed period, so a slow sample does not push the next one out.
-/// The shed state then stays inside its three-interval staleness bound.
+/// `sample_once` bounds its own read and audit writes. Ticks keep a fixed
+/// period, so a slow sample does not push the next one out. The shed state
+/// then stays inside its three-interval staleness bound.
 fn spawn_load_shed_sampler(
     api_state: &HarvestApiState,
     pools: &HarvestDbPool,
@@ -248,23 +248,16 @@ fn spawn_load_shed_sampler(
                         .to_vec()
                 })
                 .unwrap_or_default();
-            let sample = tokio::time::timeout(
-                interval.saturating_mul(2),
-                autumn_harvest::load_shed::sample_once(
-                    &shedder,
-                    &shard_pools,
-                    &audit_pool,
-                    metrics.as_deref(),
-                    &breakers,
-                ),
+            let sample = autumn_harvest::load_shed::sample_once(
+                &shedder,
+                &shard_pools,
+                &audit_pool,
+                metrics.as_deref(),
+                &breakers,
             );
             tokio::select! {
                 () = cancel.cancelled() => return,
-                result = sample => {
-                    if result.is_err() {
-                        tracing::warn!("load shed sample timed out; shed state unchanged");
-                    }
-                }
+                _ = sample => {}
             }
         }
     }))

@@ -647,6 +647,68 @@ async fn failed_sample_keeps_state() {
     assert_eq!(metrics.active(), [true, true]);
 }
 
+/// A hung audit write cannot undo or split a sample. The state change lands
+/// before the audit write, and the write is bounded by one sample interval.
+#[tokio::test]
+async fn hung_audit_write_keeps_the_committed_state() {
+    let Some(url) = db_url() else {
+        eprintln!("SKIP: HARVEST_TEST_DATABASE_URL unset");
+        return;
+    };
+    let _g = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    let metrics = Arc::new(CapturingMetrics::default());
+    let (api_state, _app, _cache, _) = seed(&pool, &mut conn, &metrics).await;
+    let fast = LoadShedConfig::new()
+        .with_sample_interval(Duration::from_secs(1))
+        .queue(
+            QUEUE,
+            LoadShedPolicy::new(
+                Duration::from_secs(60),
+                Duration::from_secs(10),
+                Duration::from_secs(7),
+            )
+            .unwrap(),
+        );
+    api_state.gate_cache().load_shedder().configure(fast);
+    set_backlog_age(&mut conn, 120).await;
+
+    // An audit pool of one connection, held here, so the audit write waits.
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.as_str());
+    let audit_pool: DbPool = deadpool::managed::Pool::builder(manager)
+        .max_size(1)
+        .build()
+        .unwrap();
+    let _held = audit_pool.get().await.unwrap();
+
+    let started = std::time::Instant::now();
+    let ok = sample_once(
+        api_state.gate_cache().load_shedder(),
+        std::slice::from_ref(&pool),
+        &audit_pool,
+        Some(metrics.as_ref()),
+        &[],
+    )
+    .await;
+    assert!(ok, "the read succeeded, so the sample succeeded");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the audit write must be bounded"
+    );
+    let cache = api_state.gate_cache();
+    assert!(
+        cache
+            .load_shedder()
+            .check(QUEUE, std::time::Instant::now())
+            .is_some(),
+        "the trip must be committed although its audit write hung"
+    );
+    assert_eq!(metrics.active(), [true]);
+}
+
 /// With no policy the shedder never sheds, whatever the backlog.
 #[tokio::test]
 async fn no_policy_never_sheds() {

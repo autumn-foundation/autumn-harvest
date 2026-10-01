@@ -360,9 +360,14 @@ impl LoadShedder {
 /// keeps the maximum age per queue. A configured queue with no claimable task
 /// has age 0. Each trip or clear writes one audit row to `audit_pool`.
 ///
-/// Returns `false` when a pool read fails. No state changes then, so a partial
-/// read cannot clear a shedding queue. The active gauge is still written, so
-/// it shows 0 once a stale state fails open.
+/// Returns `false` when a pool read fails or runs longer than two sample
+/// intervals. No state changes then, so a partial read cannot clear a
+/// shedding queue. The active gauge is still written, so it shows 0 once a
+/// stale state fails open.
+///
+/// A complete read updates every queue at once, with no await in between.
+/// The audit writes run after that, so a slow audit write cannot leave a
+/// partial sample behind. Each audit write is bounded by one sample interval.
 #[cfg(feature = "db")]
 pub async fn sample_once(
     shedder: &LoadShedder,
@@ -376,19 +381,40 @@ pub async fn sample_once(
         return true;
     }
     let queues = config.queues();
-    let Some(ages) = read_ages(pools, &queues, circuit_breaker_activities).await else {
+    let read_timeout = config.sample_interval().saturating_mul(2);
+    let read = tokio::time::timeout(
+        read_timeout,
+        read_ages(pools, &queues, circuit_breaker_activities),
+    )
+    .await;
+    let Ok(Some(ages)) = read else {
+        if read.is_err() {
+            tracing::warn!("load shed sample timed out; shed state unchanged");
+        }
         record_active(shedder, &queues, metrics, Instant::now());
         return false;
     };
 
     let now = Instant::now();
-    for queue in &queues {
-        let age_secs = ages.get(queue).copied().unwrap_or(0.0);
-        if let Some(transition) = shedder.observe(queue, age_secs, now) {
-            record_transition(audit_pool, queue, transition, age_secs).await;
+    let transitions: Vec<(&String, ShedTransition, f64)> = queues
+        .iter()
+        .filter_map(|queue| {
+            let age_secs = ages.get(queue).copied().unwrap_or(0.0);
+            shedder
+                .observe(queue, age_secs, now)
+                .map(|transition| (queue, transition, age_secs))
+        })
+        .collect();
+    record_active(shedder, &queues, metrics, now);
+    for (queue, transition, age_secs) in transitions {
+        let write = record_transition(audit_pool, queue, transition, age_secs);
+        if tokio::time::timeout(config.sample_interval(), write)
+            .await
+            .is_err()
+        {
+            tracing::warn!(queue = %queue, "load shed audit write timed out");
         }
     }
-    record_active(shedder, &queues, metrics, now);
     true
 }
 
