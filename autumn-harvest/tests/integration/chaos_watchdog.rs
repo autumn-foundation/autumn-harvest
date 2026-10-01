@@ -434,14 +434,11 @@ fn watchdog_workflow_runs_one_job_at_a_time() {
     assert!(!cancels, "`cancel-in-progress` must be false");
 }
 
-/// When `actions/checkout` fails, the script is not on disk. The report step
-/// must still open the watchdog-failure issue.
+/// The `run:` text of the watchdog's `if: failure()` step.
 #[cfg(target_os = "linux")]
-#[test]
-fn watchdog_report_step_works_without_checkout() {
+fn report_step_run() -> String {
     let doc = parse_workflow(WATCHDOG_WORKFLOW);
-    let report = doc
-        .get("jobs")
+    doc.get("jobs")
         .and_then(serde_yaml::Value::as_mapping)
         .into_iter()
         .flat_map(|jobs| jobs.values())
@@ -454,19 +451,33 @@ fn watchdog_report_step_works_without_checkout() {
         })
         .find_map(|step| step.get("run").and_then(serde_yaml::Value::as_str))
         .expect("an `if: failure()` step with a `run:`")
-        .to_string();
+        .to_string()
+}
 
+/// Runs the report step in an empty directory, as after a failed checkout.
+#[cfg(target_os = "linux")]
+fn run_report_step_without_checkout(issues: String) -> Outcome {
     let empty = tempfile::tempdir().expect("tempdir");
     let mut cmd = std::process::Command::new("bash");
-    cmd.arg("-c").arg(&report).current_dir(empty.path());
-    let out = run_stubbed(
+    cmd.arg("-c")
+        .arg(report_step_run())
+        .current_dir(empty.path());
+    run_stubbed(
         &Stub {
             runs: None,
-            issues: Some(Stub::no_issue()),
+            issues: Some(issues),
             arg: None,
         },
         cmd,
-    );
+    )
+}
+
+/// When `actions/checkout` fails, the script is not on disk. The report step
+/// must still open the watchdog-failure issue.
+#[cfg(target_os = "linux")]
+#[test]
+fn watchdog_report_step_works_without_checkout() {
+    let out = run_report_step_without_checkout(Stub::no_issue());
     assert!(out.success, "calls: {:?}", out.calls);
     let create = out
         .calls
@@ -477,4 +488,15 @@ fn watchdog_report_step_works_without_checkout() {
         create.contains(WATCHDOG_FAILED_TITLE) && create.contains("actions/runs/4242"),
         "the issue must use the watchdog-failure title and link the run: {create}"
     );
+}
+
+/// A checkout outage can fail several runs. Each one must comment on the open
+/// watchdog-failure issue, not open a duplicate.
+#[cfg(target_os = "linux")]
+#[test]
+fn watchdog_report_step_without_checkout_comments_on_the_open_issue() {
+    let out = run_report_step_without_checkout(Stub::issue(88, WATCHDOG_FAILED_TITLE));
+    assert!(out.success, "calls: {:?}", out.calls);
+    assert!(out.called("issue comment 88"), "calls: {:?}", out.calls);
+    assert!(!out.called("issue create"), "calls: {:?}", out.calls);
 }
