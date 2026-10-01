@@ -1158,52 +1158,28 @@ impl WorkflowHandleClient {
             input,
         } = identity;
         StartWorkflowParams {
-            workflow_name,
-            workflow_id,
-            exec_id,
-            input,
             parent_id: options.parent_id,
-            queue_name,
             execution_timeout: defaults.execution_timeout,
             memo: options.memo.clone(),
             search_attrs: options.search_attrs.clone(),
             reuse_policy: options.reuse_policy,
             conflict_policy: options.conflict_policy,
-            trace_context: None,
             max_execution_timeout_ceiling: defaults.max_workflow_execution_timeout_ceiling,
             chain_execution_timeout: defaults.chain_execution_timeout,
             max_workflow_chain_timeout_ceiling: defaults.max_workflow_chain_timeout_ceiling,
-            inherited_chain_deadline_at: None,
             concurrency_key: defaults.concurrency_key,
             concurrency_limit: defaults.concurrency_limit,
             concurrency_on_conflict: defaults.concurrency_on_conflict,
-            priority: crate::types::Priority::default(),
             max_workflow_input_bytes: defaults.max_workflow_input_bytes,
-            start_at: None,
-            delay: None,
             max_workflow_start_delay: Some(defaults.max_workflow_start_delay),
             owner: info.owner,
             runbook_url: info.runbook_url,
             severity: info.severity,
-            context_headers: None,
             sla: defaults.sla,
-            schedule_id: None,
-            scheduled_for: None,
-            // 1 = first attempt (see `StartWorkflowParams::workflow_attempt`'s doc
-            // comment). Every other fresh-start call site in the workspace uses
-            // `1`; using `0` here would silently grant one extra retry attempt
-            // beyond a workflow's configured `max_attempts` (e.g. a
-            // `max_attempts = 1` "never retry" policy would still retry once,
-            // since `0 >= 1` is false on the first attempt).
-            workflow_attempt: 1,
             workflow_retry_policy: info.retry_policy.clone(),
-            retry_of_exec_id: None,
             max_workflow_attempts_ceiling: self.inner.max_workflow_attempts,
-            origin: None,
-            completion_callbacks: None,
             start_source: StartSource::Transactional,
-            start_source_ref: None,
-            started_by: None,
+            ..StartWorkflowParams::new(workflow_name, workflow_id, exec_id, input, queue_name)
         }
     }
 

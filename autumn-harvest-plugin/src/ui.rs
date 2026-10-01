@@ -64,9 +64,7 @@ use autumn_harvest::schema::{
 use autumn_harvest::signal::send_signal;
 use autumn_harvest::start_or_load_workflow_execution_with_metrics_and_codecs;
 use autumn_harvest::store::admit_update_event_with_codecs;
-use autumn_harvest::types::{
-    ExecutionId as HarvestExecutionId, Priority, ShardId, UpdateId, WorkflowIdReusePolicy,
-};
+use autumn_harvest::types::{ExecutionId as HarvestExecutionId, ShardId, UpdateId};
 use autumn_harvest::worker::DispatchDeadline;
 use autumn_harvest::workers::{WorkerFilters, WorkerHealth, WorkerRow, list_workers};
 use autumn_harvest::{
@@ -9953,34 +9951,12 @@ async fn execute_schedule_trigger_ui(
     let result = start_or_load_workflow_execution_with_metrics_and_codecs(
         conn,
         StartWorkflowParams {
-            workflow_name,
-            workflow_id: &workflow_id,
-            exec_id,
-            input,
-            parent_id: None,
-            queue_name: queue,
             execution_timeout,
-            memo: None,
-            search_attrs: None,
-            reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
-            conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
-            trace_context: None,
             max_execution_timeout_ceiling,
-            chain_execution_timeout: None,
-            max_workflow_chain_timeout_ceiling: None,
-            inherited_chain_deadline_at: None,
-            concurrency_key: None,
-            concurrency_limit: None,
             concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
-            priority: Priority::default(),
-            max_workflow_input_bytes: 0,
-            start_at: None,
-            delay: None,
-            max_workflow_start_delay: None,
             owner,
             runbook_url,
             severity,
-            context_headers: None,
             sla,
             // Manual trigger-now fires are attributed to the schedule (schedule_id is
             // set) so they appear in GET /admin/schedules/{id}/runs, but scheduled_for
@@ -9988,18 +9964,15 @@ async fn execute_schedule_trigger_ui(
             // this run — NULL slot comparisons are false, so carryover is never
             // resolved for a manual fire.
             schedule_id: Some(row.id),
-            scheduled_for: None,
-            workflow_attempt: 1,
             workflow_retry_policy: ui_trigger_retry_policy,
-            retry_of_exec_id: None,
             max_workflow_attempts_ceiling: runtime.registry().max_workflow_attempts_ceiling,
             origin: Some(autumn_harvest::execution::ORIGIN_MANUAL_TRIGGER),
-            completion_callbacks: None,
             // Manual UI schedule trigger (issue #740): provenance is `schedule`,
             // referencing the schedule id, attributed to the UI operator.
             start_source: autumn_harvest::StartSource::Schedule,
             start_source_ref: Some(ui_schedule_id_str.as_str()),
             started_by: Some("ui"),
+            ..StartWorkflowParams::new(workflow_name, &workflow_id, exec_id, input, queue)
         },
         Some(runtime.registry().telemetry().metrics.as_ref()),
         None,
