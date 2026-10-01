@@ -45,8 +45,8 @@ pub struct StartWorkflowParams<'a> {
     pub workflow_name: &'a str,
     pub workflow_id: &'a str,
     pub exec_id: ExecutionId,
-    /// Shared so the start path hands the payload to each owner without a
-    /// deep copy (issue #1733).
+    /// The start path shares this payload with each owner. It makes no deep
+    /// copy (issue #1733).
     pub input: SharedJson,
     pub parent_id: Option<Uuid>,
     pub queue_name: &'a str,
@@ -499,8 +499,8 @@ mod start_params_new_tests {
         ExecutionId, Priority, StartSource, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
     };
 
-    /// The input is stored as a shared payload (issue #1733). A clone of the
-    /// params must not copy the JSON.
+    /// The constructor stores the input as a shared payload (issue #1733).
+    /// A clone of the params must not copy the JSON.
     #[test]
     fn new_shares_the_input_with_the_caller() {
         let input = crate::shared_json::SharedJson::from(serde_json::json!({"k": 1}));

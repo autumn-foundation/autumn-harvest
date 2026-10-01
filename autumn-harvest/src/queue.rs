@@ -335,7 +335,8 @@ pub struct EnqueueParams {
     pub workflow_exec_id: Option<Uuid>,
     pub activity_name: Option<String>,
     pub activity_id: Option<Uuid>,
-    /// Shared with the caller's other owners of the payload (issue #1733).
+    /// The caller and this struct share one allocation of the payload
+    /// (issue #1733).
     pub input: SharedJson,
     pub priority: i32,
     pub max_attempts: i32,
