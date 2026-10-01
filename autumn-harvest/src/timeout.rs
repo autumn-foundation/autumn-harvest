@@ -5565,8 +5565,21 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
                                 shard = %shard_label,
                                 "timeout scanner gave up its lease after failed passes"
                             );
-                            if let Err(e) = lease.release(&mut conn).await {
-                                tracing::warn!(error = %e, "timeout scanner lease release failed");
+                            // Bounded like the shutdown release. A failure
+                            // only leaves the lease to expire after its TTL.
+                            match tokio::time::timeout(
+                                crate::scanner_lease::LEASE_RELEASE_BOUND,
+                                lease.release(&mut conn),
+                            )
+                            .await
+                            {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => {
+                                    tracing::warn!(error = %e, "timeout scanner lease release failed");
+                                }
+                                Err(_elapsed) => {
+                                    tracing::warn!("timeout scanner lease release timed out");
+                                }
                             }
                         }
                     } else if let Err(e) =

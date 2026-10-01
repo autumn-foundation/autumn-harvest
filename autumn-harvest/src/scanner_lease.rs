@@ -397,14 +397,23 @@ mod db {
         ///
         /// Returns [`crate::error::HarvestError::Database`] on query failure.
         pub async fn release(&self, conn: &mut AsyncPgConnection) -> HarvestResult<()> {
-            diesel::sql_query(RELEASE_SQL)
-                .bind::<Integer, _>(self.shard.as_i32())
-                .bind::<Text, _>(self.scanner.as_str())
-                .bind::<Text, _>(&self.holder)
-                .execute(conn)
-                .await
-                .map_err(database_error)?;
-            Ok(())
+            // The same bounded lock wait as `try_acquire`, so a stuck row
+            // lock cannot hang the release either.
+            conn.transaction::<(), HarvestError, _>(async |conn| {
+                diesel::sql_query(LOCK_TIMEOUT_SQL)
+                    .execute(conn)
+                    .await
+                    .map_err(database_error)?;
+                diesel::sql_query(RELEASE_SQL)
+                    .bind::<Integer, _>(self.shard.as_i32())
+                    .bind::<Text, _>(self.scanner.as_str())
+                    .bind::<Text, _>(&self.holder)
+                    .execute(conn)
+                    .await
+                    .map_err(database_error)?;
+                Ok(())
+            })
+            .await
         }
     }
 
