@@ -797,20 +797,34 @@ mod tests {
 
     /// A connect that fails at once is a typed acquire failure, not a plain
     /// database error. The worker then releases the activity claim.
+    ///
+    /// The listener accepts and closes each connection, so the handshake
+    /// fails at once on every OS. A closed port does not: Windows retries a
+    /// refused connect for about two seconds.
     #[cfg(feature = "db")]
     #[tokio::test]
     async fn acquire_types_an_immediate_connect_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral loopback port");
+        let addr = listener.local_addr().expect("listener has a local address");
+        let closer = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
         let pool = engine_pool(
-            "postgres://refused@127.0.0.1:1/refused",
+            format!("postgres://closed@{addr}/closed"),
             1,
             DbRole::Hot,
-            &timeouts_with_pool(1_000),
+            &timeouts_with_pool(10_000),
         )
         .expect("pool builds without connecting");
-        let err = acquire(&pool, Duration::from_secs(1))
+        let err = acquire(&pool, Duration::from_secs(10))
             .await
             .err()
-            .expect("nothing listens on port 1");
+            .expect("the listener closes every connection");
+        closer.abort();
         assert!(
             matches!(err, HarvestError::PoolAcquireFailed { .. }),
             "{err}"
