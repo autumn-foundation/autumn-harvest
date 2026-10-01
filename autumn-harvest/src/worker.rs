@@ -5998,9 +5998,10 @@ async fn acquire_shard_conn(
     crate::pool::acquire(pool, bound).await
 }
 
-/// Pool acquire tries for an executed activity's result write.
+/// Tries for an executed activity's result write: pool acquires, and repeats
+/// after a session timeout.
 ///
-/// Each try waits up to the pool bound. Ten tries ride out a short pool
+/// Each acquire waits up to the pool bound. Ten tries ride out a short pool
 /// incident. A pool that stays full longer leaves the task to its heartbeat
 /// or `start_to_close` timeout, as before.
 const FINALIZE_ACQUIRE_ATTEMPTS: u32 = 10;
@@ -15572,22 +15573,44 @@ async fn process_activity_task(
 
     // activity_result is already cap-normalized (oversized Ok → non-retryable Err);
     // pass 0 so handle_activity_result skips the redundant cap check.
-    handle_activity_result(
-        &mut conn,
-        task,
-        exec_id,
-        activity_id,
-        worker_id,
-        retry_policy.as_ref(),
-        activity_result,
-        0,
-        activity_name,
-        registry.payload_offloader(),
-        telemetry.metrics.as_ref(),
-        registry.retry_after_ceiling,
-        registry.payload_codecs(),
-    )
-    .await
+    //
+    // A session `statement_timeout` or `lock_timeout` rolls the write back
+    // (issue #1788). The handler already ran, so try again. Each finalization
+    // re-checks `RUNNING` under a row lock, so a repeat is safe.
+    let mut attempt = 1;
+    loop {
+        let outcome = handle_activity_result(
+            &mut conn,
+            task,
+            exec_id,
+            activity_id,
+            worker_id,
+            retry_policy.as_ref(),
+            activity_result.clone(),
+            0,
+            activity_name,
+            registry.payload_offloader(),
+            telemetry.metrics.as_ref(),
+            registry.retry_after_ceiling,
+            registry.payload_codecs(),
+        )
+        .await;
+        match outcome {
+            Err(error)
+                if attempt < FINALIZE_ACQUIRE_ATTEMPTS
+                    && crate::pool::is_session_timeout(&error) =>
+            {
+                tracing::warn!(
+                    task_id = %task.id,
+                    attempt,
+                    error = %error,
+                    "session timeout while writing the activity result; trying again"
+                );
+                attempt += 1;
+            }
+            outcome => return outcome,
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]

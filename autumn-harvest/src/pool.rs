@@ -295,6 +295,23 @@ impl EngineDbTimeouts {
     }
 }
 
+/// Whether `error` is a `statement_timeout` or `lock_timeout` cancel.
+///
+/// Postgres rolls back the failed transaction and keeps the session, so the
+/// same connection can run the write again.
+#[must_use]
+pub fn is_session_timeout(error: &HarvestError) -> bool {
+    match error {
+        HarvestError::Database(msg) => {
+            msg.contains("57014")
+                || msg.contains("statement timeout")
+                || msg.contains("55P03")
+                || msg.contains("lock timeout")
+        }
+        _ => false,
+    }
+}
+
 /// A pooled engine connection.
 #[cfg(feature = "db")]
 pub type PooledConn = deadpool::managed::Object<
@@ -637,6 +654,20 @@ mod tests {
             ..EngineDbTimeouts::default()
         };
         assert!(at_limit.validate().is_ok());
+    }
+
+    #[test]
+    fn is_session_timeout_matches_statement_and_lock_timeouts_only() {
+        let statement =
+            HarvestError::Database("canceling statement due to statement timeout".into());
+        let lock = HarvestError::Database("canceling statement due to lock timeout".into());
+        let other = HarvestError::Database("duplicate key value violates unique constraint".into());
+        assert!(is_session_timeout(&statement));
+        assert!(is_session_timeout(&lock));
+        assert!(!is_session_timeout(&other));
+        assert!(!is_session_timeout(&HarvestError::NotFound(
+            "lock timeout".into()
+        )));
     }
 
     #[test]

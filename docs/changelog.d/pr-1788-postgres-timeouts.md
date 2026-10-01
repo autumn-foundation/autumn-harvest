@@ -33,7 +33,8 @@ writes only under the claim's `attempt` and `worker_id`, so a late heartbeat
 cannot reach a newer attempt. A payload with no matching claim is dropped. The
 executed activity's result write uses `pool::acquire_with_retries` (10 bounded
 tries). A try that fails early waits out its bound, so the tries also ride out
-a short outage.
+a short outage. A result write cancelled by a session `statement_timeout`
+or `lock_timeout` runs again, up to 10 times (`pool::is_session_timeout`).
 
 **Metrics.** `harvest.db.pool_acquire_timeout{site}` and
 `harvest.heartbeat.flush_failed{reason}`, with starter dashboard panels.

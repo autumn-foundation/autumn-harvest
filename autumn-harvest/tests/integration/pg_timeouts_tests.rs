@@ -517,3 +517,60 @@ async fn a_heartbeat_from_an_old_claim_is_rejected() {
         .expect("read details");
     assert_eq!(row.heartbeat_details, serde_json::json!({"from": "new"}));
 }
+
+/// The worker retries an activity result write after `lock_timeout`. This
+/// checks what that retry relies on: the error is a session timeout, and the
+/// same connection runs the write again once the lock frees.
+#[tokio::test]
+async fn a_lock_timeout_leaves_the_connection_ready_for_a_retry() {
+    let (url, _container) = setup_db().await;
+    let mut setup = connect(&url).await;
+    let queue_name = format!("q-lock-{}", Uuid::new_v4());
+    let task_id = autumn_harvest::queue::enqueue(
+        &mut setup,
+        &autumn_harvest::queue::EnqueueParams::new(
+            &queue_name,
+            autumn_harvest::queue::TaskType::Activity,
+            serde_json::json!({}),
+        ),
+    )
+    .await
+    .expect("enqueue");
+
+    // Another session holds the row lock for 600 ms.
+    let lock_url = url.clone();
+    let holder = tokio::spawn(async move {
+        let mut conn = connect(&lock_url).await;
+        diesel::sql_query(format!(
+            "DO $$ BEGIN PERFORM 1 FROM harvest_task_queue WHERE id = '{task_id}' FOR UPDATE; \
+             PERFORM pg_sleep(0.6); END $$"
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("hold the row lock");
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let session = SessionTimeouts {
+        lock: Duration::from_millis(150),
+        ..SessionTimeouts::for_role(DbRole::Hot)
+    };
+    let pool = engine_pool(url, 1, DbRole::Hot, &timeouts(5_000, session)).expect("engine pool");
+    let mut conn = pool.get().await.expect("engine connection");
+    let write = "UPDATE harvest_task_queue SET priority = priority WHERE id = $1";
+
+    let first = diesel::sql_query(write)
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .execute(&mut *conn)
+        .await
+        .map_err(autumn_harvest::error::database_error)
+        .expect_err("the held lock outlasts lock_timeout");
+    assert!(autumn_harvest::pool::is_session_timeout(&first), "{first}");
+
+    holder.await.expect("holder joins");
+    diesel::sql_query(write)
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .execute(&mut *conn)
+        .await
+        .expect("the same connection runs the write again");
+}
