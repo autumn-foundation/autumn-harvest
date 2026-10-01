@@ -87,22 +87,22 @@ struct Stub {
 #[cfg(target_os = "linux")]
 impl Stub {
     /// A run query that finds `count` successful runs.
-    fn runs(count: u32) -> Option<&'static str> {
+    const fn runs(count: u32) -> &'static str {
         match count {
-            0 => Some(r#"{"total_count":0,"workflow_runs":[]}"#),
-            1 => Some(r#"{"total_count":1,"workflow_runs":[{}]}"#),
-            _ => Some(r#"{"total_count":2,"workflow_runs":[{}]}"#),
+            0 => r#"{"total_count":0,"workflow_runs":[]}"#,
+            1 => r#"{"total_count":1,"workflow_runs":[{}]}"#,
+            _ => r#"{"total_count":2,"workflow_runs":[{}]}"#,
         }
     }
 
     /// An issue query that finds one open issue with this number and title.
-    fn issue(number: u32, title: &str) -> Option<String> {
-        Some(format!(r#"[{{"number":{number},"title":"{title}"}}]"#))
+    fn issue(number: u32, title: &str) -> String {
+        format!(r#"[{{"number":{number},"title":"{title}"}}]"#)
     }
 
     /// An issue query that finds no open issue.
-    fn no_issue() -> Option<String> {
-        Some("[]".to_string())
+    fn no_issue() -> String {
+        "[]".to_string()
     }
 }
 
@@ -170,9 +170,15 @@ esac
         .env("GITHUB_RUN_ID", "4242")
         .env("STUB_LOG", &log)
         .env("STUB_RUNS", stub.runs.unwrap_or_default())
-        .env("STUB_RUNS_FAIL", if stub.runs.is_none() { "1" } else { "0" })
+        .env(
+            "STUB_RUNS_FAIL",
+            if stub.runs.is_none() { "1" } else { "0" },
+        )
         .env("STUB_ISSUES", stub.issues.as_deref().unwrap_or_default())
-        .env("STUB_ISSUES_FAIL", if stub.issues.is_none() { "1" } else { "0" })
+        .env(
+            "STUB_ISSUES_FAIL",
+            if stub.issues.is_none() { "1" } else { "0" },
+        )
         .output()
         .expect("run bash");
     let calls = std::fs::read_to_string(&log)
@@ -192,8 +198,8 @@ esac
 #[test]
 fn watchdog_queries_successful_scheduled_chaos_runs_in_48_hours() {
     let out = run_watchdog(&Stub {
-        runs: Stub::runs(1),
-        issues: Stub::no_issue(),
+        runs: Some(Stub::runs(1)),
+        issues: Some(Stub::no_issue()),
         arg: None,
     });
     assert!(out.success, "calls: {:?}", out.calls);
@@ -216,8 +222,8 @@ fn watchdog_queries_successful_scheduled_chaos_runs_in_48_hours() {
 #[test]
 fn watchdog_opens_an_issue_when_no_nightly_run_succeeded() {
     let out = run_watchdog(&Stub {
-        runs: Stub::runs(0),
-        issues: Stub::no_issue(),
+        runs: Some(Stub::runs(0)),
+        issues: Some(Stub::no_issue()),
         arg: None,
     });
     assert!(out.success, "calls: {:?}", out.calls);
@@ -230,8 +236,8 @@ fn watchdog_opens_an_issue_when_no_nightly_run_succeeded() {
 #[test]
 fn watchdog_ignores_an_open_issue_with_a_similar_title() {
     let out = run_watchdog(&Stub {
-        runs: Stub::runs(0),
-        issues: Stub::issue(5, &format!("{ALERT_TITLE} (old)")),
+        runs: Some(Stub::runs(0)),
+        issues: Some(Stub::issue(5, &format!("{ALERT_TITLE} (old)"))),
         arg: None,
     });
     assert!(out.success, "calls: {:?}", out.calls);
@@ -244,8 +250,8 @@ fn watchdog_ignores_an_open_issue_with_a_similar_title() {
 #[test]
 fn watchdog_comments_on_the_open_issue_instead_of_a_duplicate() {
     let out = run_watchdog(&Stub {
-        runs: Stub::runs(0),
-        issues: Stub::issue(77, ALERT_TITLE),
+        runs: Some(Stub::runs(0)),
+        issues: Some(Stub::issue(77, ALERT_TITLE)),
         arg: None,
     });
     assert!(out.success, "calls: {:?}", out.calls);
@@ -258,8 +264,8 @@ fn watchdog_comments_on_the_open_issue_instead_of_a_duplicate() {
 #[test]
 fn watchdog_closes_the_open_issue_after_a_success() {
     let out = run_watchdog(&Stub {
-        runs: Stub::runs(2),
-        issues: Stub::issue(77, ALERT_TITLE),
+        runs: Some(Stub::runs(2)),
+        issues: Some(Stub::issue(77, ALERT_TITLE)),
         arg: None,
     });
     assert!(out.success, "calls: {:?}", out.calls);
@@ -271,8 +277,8 @@ fn watchdog_closes_the_open_issue_after_a_success() {
 #[test]
 fn watchdog_is_silent_when_the_nightly_is_green() {
     let out = run_watchdog(&Stub {
-        runs: Stub::runs(1),
-        issues: Stub::no_issue(),
+        runs: Some(Stub::runs(1)),
+        issues: Some(Stub::no_issue()),
         arg: None,
     });
     assert!(out.success, "calls: {:?}", out.calls);
@@ -287,7 +293,7 @@ fn watchdog_is_silent_when_the_nightly_is_green() {
 fn watchdog_fails_closed_when_the_run_query_fails() {
     let out = run_watchdog(&Stub {
         runs: None,
-        issues: Stub::no_issue(),
+        issues: Some(Stub::no_issue()),
         arg: None,
     });
     assert!(!out.success, "calls: {:?}", out.calls);
@@ -300,7 +306,7 @@ fn watchdog_fails_closed_when_the_run_query_fails() {
 fn watchdog_fails_closed_when_the_run_query_has_no_count() {
     let out = run_watchdog(&Stub {
         runs: Some(r#"{"message":"Not Found"}"#),
-        issues: Stub::no_issue(),
+        issues: Some(Stub::no_issue()),
         arg: None,
     });
     assert!(!out.success, "calls: {:?}", out.calls);
@@ -311,7 +317,7 @@ fn watchdog_fails_closed_when_the_run_query_has_no_count() {
 #[test]
 fn watchdog_fails_closed_when_the_issue_query_fails() {
     let out = run_watchdog(&Stub {
-        runs: Stub::runs(0),
+        runs: Some(Stub::runs(0)),
         issues: None,
         arg: None,
     });
@@ -326,7 +332,7 @@ fn watchdog_fails_closed_when_the_issue_query_fails() {
 fn watchdog_self_failed_mode_reports_on_the_alert_issue() {
     let out = run_watchdog(&Stub {
         runs: None,
-        issues: Stub::issue(77, ALERT_TITLE),
+        issues: Some(Stub::issue(77, ALERT_TITLE)),
         arg: Some("self-failed"),
     });
     assert!(out.success, "calls: {:?}", out.calls);

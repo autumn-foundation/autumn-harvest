@@ -248,9 +248,10 @@ explicit seeds to replay a printed failure.
 Before the fix for issue #1790, `chaos.yml` did not parse, so the nightly never
 ran. Two checks now catch a repeat:
 
-- `ci_run_coverage` parses `chaos.yml` and each other workflow that it cites.
-  It also checks that `chaos.yml` has a cron and runs `chaos_tests::` with the
-  `chaos` feature.
+- `ci_run_coverage` parses every workflow file. It also checks that `chaos.yml`
+  has a cron and runs `chaos_tests::` with the `chaos` feature. An `if`, a
+  `continue-on-error`, or a flag such as `--no-run` or `--skip` on that step or
+  its job fails the check.
 - `.github/workflows/chaos-watchdog.yml` runs daily at 10:41 UTC. It runs
   `.github/ci/chaos-watchdog.sh`. When no scheduled `chaos.yml` run succeeds in
   a 48-hour window, the script opens an issue with this title:
@@ -260,6 +261,9 @@ ran. Two checks now catch a repeat:
 
 The watchdog is a separate file, so a defect in `chaos.yml` cannot also stop the
 alert. An API error makes the watchdog run fail. It does not open a false alert.
+A final `if: failure()` step then runs `chaos-watchdog.sh self-failed`, which
+puts the failed run on the same alert issue. GitHub tells only the last editor of
+a cron about a failed scheduled run, so without this step the failure is silent.
 
 ## Out of scope
 

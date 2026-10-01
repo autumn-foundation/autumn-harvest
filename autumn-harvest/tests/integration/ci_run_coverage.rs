@@ -1228,6 +1228,10 @@ fn cited_workflows() -> BTreeSet<String> {
 ///
 /// `serde_yaml` also rejects a repeated mapping key. GitHub rejects that file
 /// too, but `PyYAML` keeps the last value and hides the defect.
+///
+/// This is a YAML syntax check only. It does not check the GitHub workflow
+/// schema, so an unknown key or a bad expression still passes. The chaos
+/// watchdog catches that case within 48 h.
 fn parse_workflow_text(text: &str) -> Result<serde_yaml::Value, String> {
     serde_yaml::from_str(text).map_err(|e| e.to_string())
 }
@@ -1311,7 +1315,10 @@ fn every_cited_workflow_parses_and_has_jobs() {
     );
     let all = all_workflows();
     for rel in &cited {
-        assert!(all.contains(rel), "{rel} is cited but is not a workflow file");
+        assert!(
+            all.contains(rel),
+            "{rel} is cited but is not a workflow file"
+        );
     }
     for rel in &all {
         let doc = parse_workflow(rel);
@@ -1324,16 +1331,54 @@ fn every_cited_workflow_parses_and_has_jobs() {
 }
 
 /// Every `.yml` or `.yaml` file in `.github/workflows/`, as a repository path.
+///
+/// The parse check covers all of them, not only the cited ones. An uncited
+/// workflow that does not parse fails as silently as `chaos.yml` did.
 fn all_workflows() -> BTreeSet<String> {
-    BTreeSet::new()
+    let dir = repo_root().join(".github/workflows");
+    std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+        .map(|entry| entry.expect("workflow dir entry").file_name())
+        .filter_map(|name| name.into_string().ok())
+        .filter(|name| {
+            std::path::Path::new(name).extension().is_some_and(|ext| {
+                ext.eq_ignore_ascii_case("yml") || ext.eq_ignore_ascii_case("yaml")
+            })
+        })
+        .map(|name| format!(".github/workflows/{name}"))
+        .collect()
 }
 
-/// True when some step runs the whole `chaos_tests` module with the `chaos`
-/// feature.
+/// `cargo test` flags that run no test, or less than the whole module.
+const NO_FULL_RUN_FLAGS: &[&str] = &["--no-run", "--exact", "--skip", "--ignored", "--list"];
+
+/// True when a job or step has no `if` and no `continue-on-error`.
+///
+/// An `if` can skip the step on the nightly. A `continue-on-error` makes a
+/// failed suite look green to the watchdog, which counts successful runs.
+fn ungated(node: &serde_yaml::Value) -> bool {
+    node.get("if").is_none() && node.get("continue-on-error").is_none()
+}
+
+/// True when an ungated step in an ungated job runs the whole `chaos_tests`
+/// module with the `chaos` feature.
 fn runs_the_chaos_suite_unconditionally(doc: &serde_yaml::Value) -> bool {
-    workflow_run_commands(doc)
-        .iter()
-        .any(|r| r.contains("--features chaos") && r.contains("--test integration chaos_tests:: "))
+    let Some(jobs) = doc.get("jobs").and_then(serde_yaml::Value::as_mapping) else {
+        return false;
+    };
+    jobs.values()
+        .filter(|job| ungated(job))
+        .filter_map(|job| job.get("steps").and_then(serde_yaml::Value::as_sequence))
+        .flatten()
+        .filter(|step| ungated(step))
+        .filter_map(|step| step.get("run").and_then(serde_yaml::Value::as_str))
+        .any(|run| {
+            run.contains("--features chaos")
+                && run.contains("--test integration chaos_tests:: ")
+                && !run
+                    .split_whitespace()
+                    .any(|word| NO_FULL_RUN_FLAGS.iter().any(|f| word.starts_with(f)))
+        })
 }
 
 /// Self-test: a gate or a flag that runs nothing must not count as a run.
@@ -1359,7 +1404,13 @@ fn chaos_suite_check_rejects_gated_and_empty_runs() {
         );
     }
 
-    for flag in ["--no-run", "--exact", "--skip chaos_tests", "--ignored", "--list"] {
+    for flag in [
+        "--no-run",
+        "--exact",
+        "--skip chaos_tests",
+        "--ignored",
+        "--list",
+    ] {
         let flagged = format!("{run} {flag}");
         assert!(
             !runs_the_chaos_suite_unconditionally(&workflow("", "", &flagged)),

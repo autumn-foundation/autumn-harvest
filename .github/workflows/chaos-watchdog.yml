@@ -32,3 +32,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: bash .github/ci/chaos-watchdog.sh
+      # GitHub tells only the last editor of a cron about a failed scheduled
+      # run. This step puts a red watchdog run on the alert issue instead.
+      - name: Report a failed watchdog run on the alert issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/ci/chaos-watchdog.sh self-failed
