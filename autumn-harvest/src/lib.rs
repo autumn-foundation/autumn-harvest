@@ -649,6 +649,7 @@ pub use retention::{
     RetentionMonitor, RetentionRuntime, RetentionStatus, RetentionTickResult, release_legal_hold,
     set_legal_hold,
 };
+pub use retry_budget::RetryBudgetConfig;
 pub use run_chain::{
     RunChainRecord, RunChainResponse, RunChainRow, assemble_run_chain, outcome_for_state,
 };

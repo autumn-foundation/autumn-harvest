@@ -1175,8 +1175,19 @@ impl HandlerRegistry {
     /// Mirrors [`crate::builder::WorkerConfig::with_retry_budget`]. The default
     /// gives every activity type the default
     /// [`RetryBudgetPolicy`](crate::policy::RetryBudgetPolicy).
+    ///
+    /// An override for a name that this registry does not register has no
+    /// effect. The call logs a warning for each such name.
     #[must_use]
     pub fn with_retry_budget(mut self, config: crate::retry_budget::RetryBudgetConfig) -> Self {
+        for name in config.overrides().keys() {
+            if !self.activities.contains_key(name) {
+                tracing::warn!(
+                    activity_name = %name,
+                    "retry budget override names an activity that is not registered; it has no effect"
+                );
+            }
+        }
         self.retry_budgets = Arc::new(crate::retry_budget::RetryBudgetRegistry::new(config));
         self
     }
@@ -14595,8 +14606,8 @@ enum RetryBudgetGate {
 /// Consult the retry budget for one claimed attempt and emit its metrics.
 ///
 /// A claim with `attempt > 1` is a retry. An orphan reclaim also raises
-/// `attempt`, so a re-run after a crash counts as a retry too. It loads the
-/// dependency like a retry does.
+/// `attempt`, so a re-run after a crash counts as a retry too. A re-run loads
+/// the dependency as a retry does.
 fn admit_retry_budget(
     registry: &HandlerRegistry,
     activity_name: &str,
@@ -14626,34 +14637,65 @@ fn admit_retry_budget(
     }
 }
 
-/// Undo a retry budget decision for an attempt that did not run, and update
-/// the gauge.
-fn release_retry_budget(
-    registry: &HandlerRegistry,
-    activity_name: &str,
-    ticket: crate::retry_budget::BudgetTicket,
-) {
-    let released =
-        registry
-            .retry_budgets()
-            .release(activity_name, ticket, std::time::Instant::now());
-    if let Some(available) = released {
-        registry
-            .telemetry()
-            .metrics
-            .record_retry_budget_available(activity_name, available);
+/// Releases a retry budget ticket when the attempt does not run.
+///
+/// Every return between the gate and `ActivityStarted` drops the guard. That
+/// includes a rate-limit deferral, a no-op start and an error from `?`. The
+/// drop gives the tokens back and updates the gauge. `commit` keeps the
+/// decision once the attempt runs.
+struct BudgetReleaseGuard<'a> {
+    registry: &'a HandlerRegistry,
+    activity_name: &'a str,
+    ticket: Option<crate::retry_budget::BudgetTicket>,
+}
+
+impl<'a> BudgetReleaseGuard<'a> {
+    const fn new(registry: &'a HandlerRegistry, activity_name: &'a str) -> Self {
+        Self {
+            registry,
+            activity_name,
+            ticket: None,
+        }
+    }
+
+    fn hold(&mut self, ticket: Option<crate::retry_budget::BudgetTicket>) {
+        self.ticket = ticket;
+    }
+
+    fn commit(&mut self) {
+        self.ticket = None;
+    }
+}
+
+impl Drop for BudgetReleaseGuard<'_> {
+    fn drop(&mut self) {
+        let Some(ticket) = self.ticket.take() else {
+            return;
+        };
+        let released = self.registry.retry_budgets().release(
+            self.activity_name,
+            ticket,
+            std::time::Instant::now(),
+        );
+        if let Some(available) = released {
+            self.registry
+                .telemetry()
+                .metrics
+                .record_retry_budget_available(self.activity_name, available);
+        }
     }
 }
 
 /// Defer a retry that the retry budget did not admit (issue #1793).
 ///
-/// The row goes back to `PENDING` at `now + retry_after`. The deferral lowers
-/// `attempt` again and leaves `error` as it is, so the retry keeps its attempt
-/// number and its previous failure. No event is appended.
+/// The row goes back to `PENDING` at `now + retry_after`. The write lowers
+/// `attempt` again and keeps `error` and `crash_strikes`. Thus the retry keeps
+/// its attempt number, its previous failure and its poison-pill count. The
+/// write appends no event.
 ///
 /// The claim debited a rate-limit token for an activity without a circuit
-/// breaker. The retry does not run, so the token goes back. A refund failure
-/// is logged and not propagated, like a capability-miss refund.
+/// breaker. The retry does not run, so the token goes back. The function logs
+/// a refund failure and does not return it, like a capability-miss refund.
 async fn defer_retry_for_budget(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
@@ -14673,7 +14715,7 @@ async fn defer_retry_for_budget(
     }
     let scheduled_at = chrono::Utc::now()
         + chrono::Duration::from_std(retry_after).unwrap_or_else(|_| chrono::Duration::seconds(1));
-    if queue::defer_claimed_rate_limited_task(conn, &claim_of_task(task)?, scheduled_at).await?
+    if queue::defer_claimed_retry_for_budget(conn, &claim_of_task(task)?, scheduled_at).await?
         == queue::ClaimWrite::LeaseLost
     {
         log_lease_lost(task, "retry-budget deferral");
@@ -15125,12 +15167,14 @@ async fn process_activity_task(
         crate::circuit_breaker::DispatchDecision::ShortCircuit { .. } => None,
     };
 
-    // Retry budget (issue #1793). Only a real call is gated: a short-circuit
-    // never reaches the dependency. The gate runs before ActivityStarted, so
-    // a deferred retry leaves no event behind.
-    let budget_ticket = if circuit_token.is_some() {
+    // Retry budget (issue #1793). The gate applies only to a real call. A
+    // short-circuit never reaches the dependency. A half-open probe is the
+    // breaker's recovery signal, so the budget never defers it. The gate
+    // runs before ActivityStarted, so a deferred retry leaves no event.
+    let mut budget_guard = BudgetReleaseGuard::new(registry, activity_name);
+    if circuit_token.is_some_and(|token| !token.is_probe()) {
         match admit_retry_budget(registry, activity_name, task) {
-            RetryBudgetGate::Run(ticket) => ticket,
+            RetryBudgetGate::Run(ticket) => budget_guard.hold(ticket),
             RetryBudgetGate::Defer(retry_after) => {
                 if let Some(token) = circuit_token {
                     circuit_breakers.on_cancelled(activity_name, token, std::time::Instant::now());
@@ -15139,15 +15183,7 @@ async fn process_activity_task(
                 return defer_retry_for_budget(&mut conn, task, activity, retry_after).await;
             }
         }
-    } else {
-        None
-    };
-    // Undo the budget decision for an attempt that does not run.
-    let release_budget = || {
-        if let Some(ticket) = budget_ticket {
-            release_retry_budget(registry, activity_name, ticket);
-        }
-    };
+    }
 
     // Dispatch-time rate limiting (issue #369): a circuit-breaker activity skips
     // the claim-time rate-limit gate/debit, so a genuine call (Allow) must reserve
@@ -15178,7 +15214,6 @@ async fn process_activity_task(
             if let Some(token) = circuit_token {
                 circuit_breakers.on_cancelled(activity_name, token, std::time::Instant::now());
             }
-            release_budget();
             let refill_delay = activity
                 .rate_limit_rps
                 .filter(|rps| *rps > 0.0)
@@ -15249,7 +15284,6 @@ async fn process_activity_task(
             if let Some(token) = circuit_token {
                 circuit_breakers.on_cancelled(activity_name, token, std::time::Instant::now());
             }
-            release_budget();
             if circuit_token.is_some()
                 && activity.circuit_breaker.is_some()
                 && let Some(key) = task.rate_limit_key.as_deref()
@@ -15267,6 +15301,8 @@ async fn process_activity_task(
         // conn is dropped here, returning the slot to the pool
     };
     let activity_id = started.activity_id;
+    // The attempt runs from here, so its budget decision stands.
+    budget_guard.commit();
 
     // Schedule-to-start latency (issue #501): record here, once the activity has
     // genuinely started (ActivityStarted appended). This is *past* the

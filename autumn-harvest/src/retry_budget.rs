@@ -1,8 +1,8 @@
 //! Per-activity-type retry budget (issue #1793).
 //!
-//! A retry policy limits the retries of one task. Nothing else limits retries
-//! in aggregate. During a dependency brownout, every failing task retries, and
-//! the retries multiply the load on the dependency.
+//! A retry policy limits the retries of one task. It does not limit retries in
+//! aggregate. During a dependency brownout, every failing task retries, and the
+//! retries multiply the load on the dependency.
 //!
 //! A retry budget caps that load. The worker keeps one token bucket for each
 //! activity type:
@@ -15,9 +15,14 @@
 //! When the bucket holds less than one token, the worker defers the retry. The
 //! task row goes back to `PENDING` at a later `scheduled_at`. The deferral does
 //! not use an attempt and appends no event. **A deferred retry is never lost.**
-//! Only the existing activity timeouts can end it.
+//! Only an activity timeout, or a cancel or reset of the owning run, can end
+//! it.
 //!
-//! See [`RetryBudgetPolicy`](crate::policy::RetryBudgetPolicy) for the knobs.
+//! A half-open circuit-breaker probe is never deferred. Deferred retries are
+//! not served in order.
+//!
+//! See [`RetryBudgetPolicy`](crate::policy::RetryBudgetPolicy) for the knobs
+//! and `docs/architecture.md`, design decision 10, for the full rules.
 //!
 //! ## Scope and durability
 //!
@@ -38,7 +43,11 @@ pub const MIN_RETRY_BUDGET_DEFER: Duration = Duration::from_millis(50);
 
 /// Longest deferral. A deferred retry checks the bucket again at least this
 /// often.
-pub const MAX_RETRY_BUDGET_DEFER: Duration = Duration::from_secs(30);
+pub const MAX_RETRY_BUDGET_DEFER: Duration = Duration::from_secs(60);
+
+/// Tolerance for the spend test. Ten deposits of 0.1 sum to slightly less
+/// than 1.0 in floating point, and they must still fund one retry.
+const SPEND_EPSILON: f64 = 1e-9;
 
 /// Which activity types have a retry budget, and with which policy.
 ///
@@ -97,10 +106,13 @@ impl RetryBudgetConfig {
         self.default_policy
     }
 
-    /// Number of per-type overrides.
+    /// The per-type overrides, sorted by activity name.
     #[must_use]
-    pub fn override_count(&self) -> usize {
-        self.overrides.len()
+    pub fn overrides(&self) -> std::collections::BTreeMap<String, Option<RetryBudgetPolicy>> {
+        self.overrides
+            .iter()
+            .map(|(name, policy)| (name.clone(), *policy))
+            .collect()
     }
 
     /// The policy that applies to `activity_name`, or `None` when it has no
@@ -124,7 +136,9 @@ fn sanitize(policy: RetryBudgetPolicy) -> RetryBudgetPolicy {
 ///
 /// Give it back to [`RetryBudgetRegistry::release`] when the admitted attempt
 /// does not run, for example when a rate limit defers it.
-#[derive(Debug, Clone, Copy, PartialEq)]
+///
+/// The ticket is not `Copy`, so one ticket can be released only once.
+#[derive(Debug, PartialEq)]
 pub struct BudgetTicket {
     kind: TicketKind,
 }
@@ -138,7 +152,7 @@ enum TicketKind {
 }
 
 /// Outcome of [`RetryBudgetRegistry::admit`].
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum Admission {
     /// The activity type has no budget. Run the attempt.
     Untracked,
@@ -163,7 +177,7 @@ struct Bucket {
     tokens: f64,
     refilled_at: Instant,
     /// Latest wake-up slot given to a deferred retry. Later deferrals are
-    /// spaced after it, so deferred retries do not wake in a herd.
+    /// spaced after it, at the refill rate.
     next_slot: Instant,
 }
 
@@ -215,9 +229,11 @@ impl RetryBudgetRegistry {
     ) -> Option<T> {
         let policy = self.config.policy_for(activity_name)?;
         let mut buckets = self.lock();
-        let bucket = buckets
-            .entry(activity_name.to_owned())
-            .or_insert_with(|| Bucket::full(&policy, now));
+        // Look up first, so the common path does not allocate a key.
+        if !buckets.contains_key(activity_name) {
+            buckets.insert(activity_name.to_owned(), Bucket::full(&policy, now));
+        }
+        let bucket = buckets.get_mut(activity_name)?;
         bucket.refill(&policy, now);
         let out = f(bucket, &policy);
         drop(buckets);
@@ -241,7 +257,7 @@ impl RetryBudgetRegistry {
                     available: bucket.tokens,
                 };
             }
-            if bucket.tokens >= 1.0 {
+            if bucket.tokens >= 1.0 - SPEND_EPSILON {
                 bucket.tokens -= 1.0;
                 return Admission::Admitted {
                     ticket: BudgetTicket {
@@ -260,11 +276,15 @@ impl RetryBudgetRegistry {
 
     /// Undo the bucket change that `ticket` records.
     ///
+    /// Releasing a deposit can leave the bucket below 0. A retry can spend
+    /// a deposit before the deposit is released. The debt keeps the bound
+    /// exact, because the next deposits must pay it back first.
+    ///
     /// Returns the tokens left, or `None` when the type has no budget.
     pub fn release(&self, activity_name: &str, ticket: BudgetTicket, now: Instant) -> Option<f64> {
         self.with_bucket(activity_name, now, |bucket, policy| {
             bucket.tokens = match ticket.kind {
-                TicketKind::Deposited(amount) => (bucket.tokens - amount).max(0.0),
+                TicketKind::Deposited(amount) => bucket.tokens - amount,
                 TicketKind::Spent => (bucket.tokens + 1.0).min(policy.max_tokens),
             };
             bucket.tokens
@@ -304,8 +324,11 @@ impl Bucket {
     ///
     /// The first slot is the time at which the time refill gives one token.
     /// Each later slot is one refill interval after the previous slot. Thus
-    /// deferred retries wake one at a time, at the refill rate. No slot is
-    /// later than [`MAX_RETRY_BUDGET_DEFER`].
+    /// the first deferred retries wake one at a time, at the refill rate.
+    ///
+    /// A slot later than [`MAX_RETRY_BUDGET_DEFER`] is not reserved. That
+    /// retry gets a random delay in the upper half of the cap instead. The
+    /// random spread stops a large backlog from waking at one instant.
     fn reserve_slot(&mut self, policy: &RetryBudgetPolicy, now: Instant) -> Duration {
         let rate = policy.min_retries_per_sec;
         let (until_token, interval) = if rate > 0.0 {
@@ -314,14 +337,20 @@ impl Bucket {
         } else {
             (MAX_RETRY_BUDGET_DEFER, MAX_RETRY_BUDGET_DEFER)
         };
-        let latest = now + MAX_RETRY_BUDGET_DEFER;
-        let slot = (now + until_token)
-            .max(self.next_slot + interval)
-            .min(latest);
+        let slot = (now + until_token).max(self.next_slot + interval);
+        if slot.saturating_duration_since(now) >= MAX_RETRY_BUDGET_DEFER {
+            return overflow_delay();
+        }
         self.next_slot = slot;
         slot.saturating_duration_since(now)
-            .clamp(MIN_RETRY_BUDGET_DEFER, MAX_RETRY_BUDGET_DEFER)
+            .max(MIN_RETRY_BUDGET_DEFER)
     }
+}
+
+/// A random delay in the upper half of [`MAX_RETRY_BUDGET_DEFER`].
+fn overflow_delay() -> Duration {
+    let half = MAX_RETRY_BUDGET_DEFER / 2;
+    half + half.mul_f64(rand::random::<f64>())
 }
 
 /// Convert seconds to a `Duration`, capped at [`MAX_RETRY_BUDGET_DEFER`].
@@ -407,7 +436,7 @@ mod tests {
         assert_eq!(config.policy_for(A), Some(custom));
         assert_eq!(config.policy_for(B), None);
         assert_eq!(config.policy_for("other"), config.default_policy());
-        assert_eq!(config.override_count(), 2);
+        assert_eq!(config.overrides().len(), 2);
 
         let reg = RetryBudgetRegistry::new(config);
         let now = Instant::now();
@@ -555,6 +584,65 @@ mod tests {
             let wait = retry_after(reg.admit(A, true, now));
             assert!(wait >= MIN_RETRY_BUDGET_DEFER && wait <= MAX_RETRY_BUDGET_DEFER);
         }
+    }
+
+    /// A deposit that a retry already spent leaves a debt when it is
+    /// released. Otherwise each released deposit funds an extra retry.
+    #[test]
+    fn releasing_a_spent_deposit_leaves_a_debt() {
+        let reg = registry(RetryBudgetPolicy::new(0.5, 1.0, 0.0));
+        let now = Instant::now();
+        assert_eq!(drain(&reg, A, now), 1);
+        let first_a = ticket(reg.admit(A, false, now));
+        let first_b = ticket(reg.admit(A, false, now));
+        assert!(is_admitted(reg.admit(A, true, now)));
+        reg.release(A, first_a, now);
+        reg.release(A, first_b, now);
+        assert_eq!(reg.available(A, now), Some(-1.0));
+        let _ = reg.admit(A, false, now);
+        let _ = reg.admit(A, false, now);
+        assert!(matches!(
+            reg.admit(A, true, now),
+            Admission::Deferred { .. }
+        ));
+    }
+
+    /// Ten deposits of 0.1 sum to slightly less than 1.0 in floating point.
+    /// They must still fund one retry.
+    #[test]
+    fn ten_deposits_of_a_tenth_fund_one_retry() {
+        let reg = registry(RetryBudgetPolicy::new(0.1, 1.0, 0.0));
+        let now = Instant::now();
+        assert_eq!(drain(&reg, A, now), 1);
+        for _ in 0..10 {
+            let _ = reg.admit(A, false, now);
+        }
+        assert!(is_admitted(reg.admit(A, true, now)));
+    }
+
+    /// Deferrals past the cap are spread over the upper half of the cap. They
+    /// must not all wake at the same instant.
+    #[test]
+    fn overflow_deferrals_are_spread_out() {
+        let reg = registry(RetryBudgetPolicy::new(0.0, 1.0, 1.0));
+        let now = Instant::now();
+        assert_eq!(drain(&reg, A, now), 1);
+        let waits: Vec<Duration> = (0..500)
+            .map(|_| retry_after(reg.admit(A, true, now)))
+            .collect();
+        let half = MAX_RETRY_BUDGET_DEFER / 2;
+        for wait in &waits {
+            assert!(*wait >= MIN_RETRY_BUDGET_DEFER && *wait <= MAX_RETRY_BUDGET_DEFER);
+        }
+        let overflow: Vec<&Duration> = waits.iter().filter(|w| **w >= half).collect();
+        let distinct: std::collections::HashSet<u128> =
+            overflow.iter().map(|w| w.as_millis()).collect();
+        assert!(
+            distinct.len() > overflow.len() / 2,
+            "overflow deferrals stack up: {} distinct of {}",
+            distinct.len(),
+            overflow.len()
+        );
     }
 
     #[test]

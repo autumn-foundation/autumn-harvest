@@ -3837,11 +3837,14 @@ pub struct WorkerConfig {
     /// Per-activity-type retry budgets (issue #1793).
     ///
     /// **On by default.** Every activity type gets the default
-    /// [`RetryBudgetPolicy`](crate::policy::RetryBudgetPolicy): a 10 % retry
-    /// ratio, 10 tokens of capacity and a floor of 1 retry each second. An
-    /// empty budget defers a retry and never drops it. Use
+    /// [`RetryBudgetPolicy`](crate::policy::RetryBudgetPolicy). The default
+    /// has a 10 % ratio, 10 tokens of capacity and 1 refill token each second.
+    /// An empty budget defers a retry and never drops it. Use
     /// [`RetryBudgetConfig::disabled`](crate::retry_budget::RetryBudgetConfig::disabled)
     /// to turn it off. Set via `with_retry_budget`.
+    ///
+    /// The Postgres worker enforces the budget. Local activities and the
+    /// SQLite backend do not use it.
     pub retry_budget: crate::retry_budget::RetryBudgetConfig,
 }
 

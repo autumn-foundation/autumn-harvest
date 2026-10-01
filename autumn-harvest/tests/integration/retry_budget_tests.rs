@@ -8,6 +8,9 @@
 //! - When one activity type fails every attempt, its retry rate stays within
 //!   the default budget. No retry is lost.
 //! - Exhausting that budget does not defer the retries of another type.
+//! - A disabled budget never defers.
+//! - A deferral keeps `crash_strikes` and refunds the claim-time rate-limit
+//!   token.
 //!
 //! Execution: set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run
 //! against it directly. Otherwise a fresh testcontainers Postgres boots.
@@ -21,6 +24,7 @@ use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
 use autumn_harvest::models::{NewWorkflowExecution, TaskQueueItem, WorkflowExecution};
 use autumn_harvest::queue::{self, EnqueueParams, TaskType};
+use autumn_harvest::retry_budget::RetryBudgetConfig;
 use autumn_harvest::schema::{harvest_task_queue, harvest_workflow_executions};
 use autumn_harvest::telemetry::{MetricsRecorder, TelemetryConfig};
 use autumn_harvest::types::ExecutionId;
@@ -255,13 +259,28 @@ fn build_worker(
     activities: Vec<ActivityInfo>,
     metrics: Arc<BudgetMetrics>,
 ) -> Arc<Worker> {
+    build_worker_with(worker_id, queue, activities, metrics, None)
+}
+
+/// A worker with an explicit retry budget config, or the default for `None`.
+fn build_worker_with(
+    worker_id: &str,
+    queue: &str,
+    activities: Vec<ActivityInfo>,
+    metrics: Arc<BudgetMetrics>,
+    budget: Option<RetryBudgetConfig>,
+) -> Arc<Worker> {
     let telemetry = Arc::new(TelemetryConfig::builder().metrics(metrics).build());
-    let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
+    let mut registry = HandlerRegistry::with_state_and_telemetry(
         vec![wf_info()],
         activities,
         autumn_harvest::context::empty_shared_state(),
         telemetry,
-    ));
+    );
+    if let Some(budget) = budget {
+        registry = registry.with_retry_budget(budget);
+    }
+    let registry = Arc::new(registry);
     Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
@@ -417,8 +436,85 @@ fn unique_queue(prefix: &str) -> String {
 // Tests
 // ---------------------------------------------------------------------------
 
-/// RED for issue #1793. One activity type fails 100 % of its attempts. Its
-/// retry rate must stay within the default budget:
+/// What one run of [`run_failing_window`] observed.
+struct WindowRun {
+    /// Attempts the handler saw when the window closed.
+    seen: Attempts,
+    /// Seconds from worker start to the end of the window.
+    elapsed: f64,
+    /// Attempts the handler saw after the worker stopped.
+    after: Attempts,
+    execs: Vec<ExecutionId>,
+    metrics: Arc<BudgetMetrics>,
+}
+
+/// Run `workflows` workflows that call `activity`, which always fails. Wait
+/// until every first attempt ran, then keep the worker running for `window`.
+async fn run_failing_window(
+    url: &str,
+    queue: &str,
+    activity: ActivityInfo,
+    budget: Option<RetryBudgetConfig>,
+    workflows: u32,
+    window: Duration,
+) -> WindowRun {
+    let name = activity.name;
+    let metrics = Arc::new(BudgetMetrics::default());
+    let worker = build_worker_with(
+        &format!("{queue}-worker"),
+        queue,
+        vec![activity],
+        Arc::clone(&metrics),
+        budget,
+    );
+    let pool = build_pool(url);
+    let mut conn = connect(url).await;
+    let mut execs = Vec::new();
+    for _ in 0..workflows {
+        execs.push(seed_workflow(&mut conn, queue, name).await);
+    }
+
+    let started = Instant::now();
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+    let handle = tokio::spawn(async move { runner.run(&pool_for_run).await });
+    wait_until("every first attempt", Duration::from_secs(20), || async {
+        attempts(name).first >= workflows
+    })
+    .await;
+    tokio::time::sleep(window).await;
+    let seen = attempts(name);
+    let elapsed = started.elapsed().as_secs_f64();
+    worker.shutdown();
+    handle.await.expect("worker joins");
+    // A claim taken before the snapshot can still run during shutdown, so
+    // the counter checks read the handler counts again here.
+    let after = attempts(name);
+    WindowRun {
+        seen,
+        elapsed,
+        after,
+        execs,
+        metrics,
+    }
+}
+
+fn default_budget(first_attempts: u32, elapsed: f64) -> f64 {
+    DEFAULT_MIN_RETRIES_PER_SEC.mul_add(
+        elapsed,
+        DEFAULT_RATIO.mul_add(f64::from(first_attempts), DEFAULT_MAX_TOKENS),
+    )
+}
+
+fn count_started(history: &[WorkflowEvent]) -> usize {
+    history
+        .iter()
+        .filter(|e| matches!(e, WorkflowEvent::ActivityStarted { .. }))
+        .count()
+}
+
+/// Regression test for issue #1793. One activity type fails 100 % of its
+/// attempts. Its retry rate must stay within the default budget:
 /// `max_tokens + ratio * first_attempts + min_retries_per_sec * elapsed`.
 ///
 /// Without a budget, each of the 20 tasks retries about every 20 ms, so the
@@ -429,53 +525,35 @@ async fn retry_rate_stays_within_the_default_budget_when_one_type_always_fails()
     const WORKFLOWS: u32 = 20;
     let (url, _container) = setup_db().await;
     let queue = unique_queue("rb-rate");
-    let metrics = Arc::new(BudgetMetrics::default());
-    let worker = build_worker(
-        "rb-rate-worker",
+    let run = run_failing_window(
+        &url,
         &queue,
-        vec![act_info(ACTIVITY, always_fails)],
-        Arc::clone(&metrics),
-    );
-    let pool = build_pool(&url);
-
-    let mut conn = connect(&url).await;
-    let mut execs = Vec::new();
-    for _ in 0..WORKFLOWS {
-        execs.push(seed_workflow(&mut conn, &queue, ACTIVITY).await);
-    }
-
-    let started = Instant::now();
-    let runner = Arc::clone(&worker);
-    let pool_for_run = pool.clone();
-    let handle = tokio::spawn(async move { runner.run(&pool_for_run).await });
-
-    wait_until("every first attempt", Duration::from_secs(20), || async {
-        attempts(ACTIVITY).first >= WORKFLOWS
-    })
+        act_info(ACTIVITY, always_fails),
+        None,
+        WORKFLOWS,
+        Duration::from_secs(3),
+    )
     .await;
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    let seen = attempts(ACTIVITY);
-    let elapsed = started.elapsed().as_secs_f64();
-    worker.shutdown();
-    handle.await.expect("worker joins");
+    let seen = run.seen;
 
     assert_eq!(seen.first, WORKFLOWS, "every first attempt runs: {seen:?}");
-    let budget = DEFAULT_MIN_RETRIES_PER_SEC.mul_add(
-        elapsed,
-        DEFAULT_RATIO.mul_add(f64::from(seen.first), DEFAULT_MAX_TOKENS),
-    );
+    let budget = default_budget(seen.first, run.elapsed);
     assert!(
         f64::from(seen.retries) <= budget + 1.0,
-        "{} retries ran in {elapsed:.2}s; the budget allows {budget:.1}",
-        seen.retries
+        "{} retries ran in {:.2}s; the budget allows {budget:.1}",
+        seen.retries,
+        run.elapsed
     );
     assert!(seen.retries > 0, "the budget must still let retries run");
-    assert!(metrics.exhausted(ACTIVITY) > 0, "deferrals must be counted");
+    assert!(
+        run.metrics.exhausted(ACTIVITY) > 0,
+        "deferrals must be counted"
+    );
 
     // A deferred retry is never lost. Each task row stays live, and no
     // execution fails.
     let rows = activity_rows(&url, &queue, ACTIVITY).await;
-    assert_eq!(rows.len(), execs.len(), "one task row per workflow");
+    assert_eq!(rows.len(), run.execs.len(), "one task row per workflow");
     for row in &rows {
         assert!(
             row.state == "PENDING" || row.state == "RUNNING",
@@ -484,19 +562,106 @@ async fn retry_rate_stays_within_the_default_budget_when_one_type_always_fails()
             row.state
         );
     }
-    for exec in execs {
-        assert_eq!(execution_state(&url, exec).await, "RUNNING");
+    let mut started_events = 0;
+    let mut conn = connect(&url).await;
+    for exec in &run.execs {
+        assert_eq!(execution_state(&url, *exec).await, "RUNNING");
+        let history = store::load_history(&mut conn, *exec)
+            .await
+            .expect("load history")
+            .events;
+        started_events += count_started(&history);
     }
 
-    // A deferral does not use an attempt. The attempt counters add up to the
-    // attempts that ran, plus at most one claim per row cut off by shutdown.
-    let total_attempts: i64 = rows.iter().map(|r| i64::from(r.attempt)).sum();
-    let ran = i64::from(seen.first + seen.retries);
+    // A deferral does not use an attempt and appends no event. The attempt
+    // counters and the ActivityStarted events add up to the attempts that
+    // ran, plus at most one claim per row cut off by shutdown.
+    let ran = i64::from(run.after.first + run.after.retries);
     let running = i64::try_from(rows.iter().filter(|r| r.state == "RUNNING").count()).unwrap();
+    let total_attempts: i64 = rows.iter().map(|r| i64::from(r.attempt)).sum();
     assert!(
         total_attempts >= ran && total_attempts <= ran + running,
         "attempt counters {total_attempts} do not match {ran} attempts that ran"
     );
+    let started_events = i64::try_from(started_events).unwrap();
+    assert!(
+        started_events >= ran && started_events <= ran + running,
+        "{started_events} ActivityStarted events for {ran} attempts that ran"
+    );
+}
+
+/// `RetryBudgetConfig::disabled()` restores the old behaviour: no retry is
+/// deferred, so the retry count goes far past the default budget.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn disabled_budget_never_defers() {
+    const ACTIVITY: &str = "rb_always_fails_disabled";
+    let (url, _container) = setup_db().await;
+    let queue = unique_queue("rb-disabled");
+    let run = run_failing_window(
+        &url,
+        &queue,
+        act_info(ACTIVITY, always_fails),
+        Some(RetryBudgetConfig::disabled()),
+        20,
+        Duration::from_secs(2),
+    )
+    .await;
+
+    assert_eq!(
+        run.metrics.exhausted(ACTIVITY),
+        0,
+        "no deferral when disabled"
+    );
+    let budget = default_budget(run.seen.first, run.elapsed);
+    assert!(
+        f64::from(run.seen.retries) > budget * 2.0,
+        "{} retries ran; without a budget the count must exceed {budget:.1} by far",
+        run.seen.retries
+    );
+}
+
+/// A budget deferral refunds the rate-limit token that the claim debited.
+/// Otherwise every deferral cycle burns a token without a call, and the
+/// rate limit starves the activity type.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn budget_deferral_refunds_the_claim_time_rate_limit_token() {
+    const ACTIVITY: &str = "rb_always_fails_rate_limited";
+    const BURST: f64 = 10_000.0;
+    let (url, _container) = setup_db().await;
+    let queue = unique_queue("rb-refund");
+    let key: &'static str = Box::leak(format!("rb-refund-{queue}").into_boxed_str());
+    let mut activity = act_info(ACTIVITY, always_fails);
+    // Effectively no time refill, so the bucket level counts the calls.
+    activity.rate_limit_rps = Some(0.000_001);
+    activity.rate_limit_burst = Some(BURST);
+    activity.rate_limit_key = Some(key);
+    let run = run_failing_window(&url, &queue, activity, None, 20, Duration::from_secs(3)).await;
+    assert!(run.metrics.exhausted(ACTIVITY) > 0, "the budget must defer");
+
+    let mut conn = connect(&url).await;
+    let tokens: f64 =
+        diesel::sql_query("SELECT tokens FROM harvest_rate_limit_buckets WHERE key = $1")
+            .bind::<diesel::sql_types::Text, _>(key)
+            .get_result::<TokensRow>(&mut conn)
+            .await
+            .expect("load bucket")
+            .tokens;
+    let rows = activity_rows(&url, &queue, ACTIVITY).await;
+    let running = rows.iter().filter(|r| r.state == "RUNNING").count();
+    let debited = BURST - tokens;
+    let ran = f64::from(run.after.first + run.after.retries);
+    #[allow(clippy::cast_precision_loss)]
+    let slack = running as f64 + 0.5;
+    assert!(
+        (debited - ran).abs() <= slack,
+        "{debited:.1} tokens debited for {ran} calls; deferrals must not keep tokens"
+    );
+}
+
+#[derive(diesel::QueryableByName)]
+struct TokensRow {
+    #[diesel(sql_type = diesel::sql_types::Double)]
+    tokens: f64,
 }
 
 /// One type exhausts its budget. A second type must keep its own budget, so
@@ -540,6 +705,11 @@ async fn other_activity_types_are_unaffected_when_one_type_exhausts_its_budget()
         .await
         .is_ok()
     };
+    if !exhausted {
+        worker.shutdown();
+        handle.await.expect("worker joins");
+        panic!("the failing type never exhausted its budget");
+    }
 
     let mut healthy = Vec::new();
     for _ in 0..HEALTHY_WORKFLOWS {
@@ -567,7 +737,6 @@ async fn other_activity_types_are_unaffected_when_one_type_exhausts_its_budget()
     worker.shutdown();
     handle.await.expect("worker joins");
 
-    assert!(exhausted, "the failing type never exhausted its budget");
     assert_eq!(
         metrics.exhausted(HEALTHY),
         0,
@@ -576,4 +745,80 @@ async fn other_activity_types_are_unaffected_when_one_type_exhausts_its_budget()
     let seen = attempts(HEALTHY);
     assert_eq!(seen.first, HEALTHY_WORKFLOWS, "{seen:?}");
     assert_eq!(seen.retries, HEALTHY_WORKFLOWS, "{seen:?}");
+}
+
+/// A budget deferral is not evidence about crashes. It must keep the crash
+/// strikes, so poison-pill quarantine still trips for a task that crashes
+/// workers. It also restores `attempt` and keeps `error`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn budget_deferral_keeps_crash_strikes_attempt_and_error() {
+    let (url, _container) = setup_db().await;
+    let queue = unique_queue("rb-strikes");
+    let mut conn = connect(&url).await;
+    let exec = seed_workflow(&mut conn, &queue, "rb_strikes").await;
+
+    let mut params = EnqueueParams::new(&queue, TaskType::Activity, serde_json::json!({}));
+    params.workflow_exec_id = Some(exec.as_uuid());
+    params.activity_name = Some("rb_strikes".to_string());
+    params.activity_id = Some(Uuid::new_v4());
+    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    let task_id = queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue activity");
+    diesel::sql_query(
+        "UPDATE harvest_task_queue SET attempt = 1, crash_strikes = 2, error = 'boom' \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .execute(&mut conn)
+    .await
+    .expect("seed a crashed retry");
+    diesel::sql_query("DELETE FROM harvest_task_queue WHERE queue_name = $1 AND id <> $2")
+        .bind::<diesel::sql_types::Text, _>(&queue)
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .execute(&mut conn)
+        .await
+        .expect("leave only the activity row");
+
+    let claimed = queue::claim_task(
+        &mut conn,
+        &[queue.clone()],
+        "rb-strikes-worker",
+        "",
+        None,
+        &[],
+        &[],
+    )
+    .await
+    .expect("claim")
+    .expect("a claimable task");
+    assert_eq!(claimed.id, task_id);
+    assert_eq!(claimed.attempt, 2, "the claim raises attempt");
+
+    let claim = queue::TaskClaim {
+        task_id,
+        worker_id: "rb-strikes-worker".to_string(),
+        attempt: claimed.attempt,
+    };
+    let later = Utc::now() + chrono::Duration::seconds(30);
+    let write = queue::defer_claimed_retry_for_budget(&mut conn, &claim, later)
+        .await
+        .expect("defer");
+    assert_eq!(write, queue::ClaimWrite::Applied);
+
+    let row: TaskQueueItem = harvest_task_queue::table
+        .find(task_id)
+        .select(TaskQueueItem::as_select())
+        .first(&mut conn)
+        .await
+        .expect("reload row");
+    assert_eq!(row.state, "PENDING");
+    assert_eq!(row.attempt, 1, "the deferral restores attempt");
+    assert_eq!(row.crash_strikes, 2, "the deferral keeps the crash strikes");
+    assert_eq!(
+        row.error.as_deref(),
+        Some("boom"),
+        "the deferral keeps error"
+    );
+    assert!(row.worker_id.is_none());
 }

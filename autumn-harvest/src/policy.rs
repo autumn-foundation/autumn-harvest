@@ -374,7 +374,8 @@ pub struct RetryBudgetPolicy {
     pub ratio: f64,
     /// Bucket capacity and start level. At least 1.
     pub max_tokens: f64,
-    /// Tokens that time adds each second, so retries never starve.
+    /// Tokens that time adds each second. A value above 0 keeps retries
+    /// from starving. With 0, only first-attempt deposits refill the bucket.
     pub min_retries_per_sec: f64,
 }
 

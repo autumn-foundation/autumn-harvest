@@ -46,6 +46,7 @@ pub use crate::policy::{
     Schedule, SkipPolicy, TaskStatus, TriggerRule, WorkflowSchedule,
 };
 pub use crate::query::QueryRegistry;
+pub use crate::retry_budget::RetryBudgetConfig;
 pub use crate::saga::Saga;
 #[cfg(feature = "db")]
 pub use crate::scheduler::{

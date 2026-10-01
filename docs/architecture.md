@@ -211,20 +211,25 @@ A retry policy limits the retries of one task. A retry budget limits the retries
 1. A claim with `attempt == 1` is a first attempt. It always runs and deposits `ratio` tokens.
 2. A claim with `attempt > 1` is a retry. An orphan re-claim is a retry too. A retry runs only if it can spend one token.
 3. The bucket never holds more than `max_tokens`.
-4. Only a real call is gated. A `CircuitOpen` short-circuit spends nothing.
-5. An attempt that does not run gives its tokens back. This applies to a rate-limit deferral and a no-op start.
+4. The gate applies only to a real call. A `CircuitOpen` short-circuit spends nothing. A half-open probe is never deferred, because it is the breaker's recovery signal.
+5. An attempt that does not run gives its tokens back. A drop guard does this on every return before `ActivityStarted`: a rate-limit deferral, a no-op start or an error.
+6. A released deposit can leave the bucket below 0, because a retry can spend the deposit first. The next deposits pay the debt back.
 
 So the retries that run in a window of `T` seconds are at most `max_tokens + ratio × first_attempts + min_retries_per_sec × T`.
 
-*Deferral.* An empty bucket defers the retry. The worker calls `defer_claimed_rate_limited_task`, the same fenced write as a rate-limit deferral. The row goes back to `PENDING` at a later `scheduled_at`. The write lowers `attempt` again and keeps `error`. No event is appended. The delay is the time to the next refill token. Each later deferral waits one more refill interval, so deferred retries do not wake in a herd. No delay is shorter than 50 ms or longer than 30 s. A deferral of a rate-limited activity without a circuit breaker refunds the claim-time rate-limit token.
+*Deferral.* An empty bucket defers the retry. The worker calls `queue::defer_claimed_retry_for_budget`. That fenced write puts the row back to `PENDING` at a later `scheduled_at`. It lowers `attempt` again and keeps `error` and `crash_strikes`. A deferral says nothing about crashes, so poison-pill quarantine still counts them. The write appends no event. A deferral of a rate-limited activity without a circuit breaker also refunds the claim-time rate-limit token.
 
-*A deferred retry is never lost.* The row stays in the queue until a worker runs it. The deferral does not use an attempt and does not move the task to the DLQ. Only the existing activity timeouts can end a deferred retry. For example, a `schedule_to_close` deadline that passes during a deferral times the activity out. The timeout is recorded as an ordinary `ActivityTimedOut` event.
+The first delay is the time to the next refill token. Each later deferral gets the next slot, one refill interval later. A slot more than 60 s away is not reserved. That retry gets a random delay from 30 s to 60 s instead, so a large backlog does not wake at one instant. No delay is shorter than 50 ms. Deferred retries are not served in order. The next retry that finds a token runs.
 
-*Configuration.* The budget is on by default. `WorkerConfig::with_retry_budget` takes a `RetryBudgetConfig`. `with_default` sets the policy for all types. `with_activity(name, policy)` overrides one type, and `None` turns the budget off for that type. `RetryBudgetConfig::disabled()` turns it off everywhere. `GET /admin/config` reports the default policy and the number of overrides.
+*A deferred retry is never lost.* The row stays in the queue until a worker runs it. The deferral does not use an attempt and does not move the task to the DLQ. Only an activity timeout, or a cancel or reset of the owning run, can end a deferred retry. For example, a `schedule_to_close` deadline can pass during a deferral. The timeout scanner then records an ordinary `ActivityTimedOut` event.
 
-*Scope.* The state is in process, like the circuit breaker. N workers allow up to N budgets. The event log is not touched, so replay is unaffected. Local activities retry inline, outside the queue, so the budget does not gate them. The SQLite backend does not use this path.
+*Starvation.* With `min_retries_per_sec = 0`, only first-attempt deposits refill the bucket. If no first attempts arrive, deferred retries wait until a timeout ends them or a worker restart refills the bucket. Keep the floor above 0 unless that is the intent.
 
-*Metrics.* The gauge `harvest.retry.budget.available{activity}` shows the tokens left. The counter `harvest.retry.budget.exhausted{activity}` counts deferrals. Prometheus exports the counter as `harvest_retry_budget_exhausted_total`. See [`telemetry.md`](telemetry.md#metric-catalogue-adr-0001-7).
+*Configuration.* The budget is on by default. `WorkerConfig::with_retry_budget` takes a `RetryBudgetConfig`. `with_default` sets the policy for all types. `with_activity(name, policy)` overrides one type, and `None` turns the budget off for that type. `RetryBudgetConfig::disabled()` turns it off everywhere. An override for an unregistered name logs a warning. `GET /admin/config` reports the default policy and every override.
+
+*Scope.* The state is in process, like the circuit breaker. N workers allow up to N budgets. The budget never touches the event log, so replay is unaffected. Local activities retry inline, outside the queue, so the budget does not gate them. The SQLite backend has its own worker and does not use this gate.
+
+*Metrics.* The gauge `harvest.retry.budget.available{activity}` shows the tokens left after each decision and release. It does not follow the time refill between decisions. The counter `harvest.retry.budget.exhausted{activity}` counts deferrals. Prometheus exports the counter as `harvest_retry_budget_exhausted_total`. See [`telemetry.md`](telemetry.md#metric-catalogue-adr-0001-7).
 
 ### Sharding
 
