@@ -1134,7 +1134,9 @@ Add the new shard to `writable_shards` and deploy. The fleet **automatically dra
 Shard coverage is configured in **Rust**, not in `autumn.toml` — there is no
 `[harvest.worker] shard_assignments` key. Multi-shard also runs through
 `HarvestRunner` only: `HarvestPlugin` rejects a multi-shard pool by design, so a
-plugin-hosted app is always single-shard.
+plugin-hosted app is always single-shard. `HarvestEmbedding` (issue #1613) is the
+standalone entry point for a multi-shard process. It needs one result-notification
+database URL per shard, and it refuses to start when a shard has none.
 
 ```rust
 use autumn_harvest::types::ShardId;
@@ -1152,6 +1154,18 @@ The pool itself is supplied to the runner:
 
 ```rust
 HarvestRunnerResources::new(harvest_pool).with_sharded_pool(sharded_pool)
+```
+
+With `HarvestEmbedding`, name each shard's notification URL as well:
+
+```rust
+HarvestEmbedding::new(built, config, resources)
+    .with_notification_database_urls([
+        (ShardId::new(0), shard0_url),
+        (ShardId::new(1), shard1_url),
+    ])
+    .start()
+    .await?
 ```
 
 Once flipped:

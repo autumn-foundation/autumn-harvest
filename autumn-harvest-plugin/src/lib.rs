@@ -15,6 +15,9 @@ pub mod callback_deliverer;
 /// `HarvestPlugin` when an embedder configures `audit_export_webhook(...)`
 /// without supplying their own sink (issue #953).
 pub mod audit_sink;
+/// Startup and shutdown steps that `HarvestPlugin` and `HarvestEmbedding`
+/// share (issue #1613).
+mod boot;
 pub mod canary;
 pub mod config;
 /// Broker event-source connectors for workflow triggers (issue #944).
@@ -33,6 +36,8 @@ pub mod dag_retry;
 /// run`. Development and evaluation only; see the module docs.
 #[cfg(feature = "dev-runtime")]
 pub mod dev;
+/// One entry point for a standalone embedding (issue #1613).
+pub mod embedding;
 pub mod lineage;
 pub mod outbox;
 pub mod plugin;
@@ -95,6 +100,7 @@ pub use config::{
     HarvestReadinessConfig, HarvestRedisConfig, HarvestRuntimeConfig, HarvestStartupConfig,
     OrphanStartupAction,
 };
+pub use embedding::{HarvestEmbedding, HarvestEmbeddingRuntime};
 pub use outbox::{
     WorkflowStartRequest, drain_workflow_start_outbox_once, enqueue_workflow_start_outbox,
     flush_workflow_start_outbox,

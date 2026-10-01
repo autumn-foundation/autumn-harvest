@@ -113,6 +113,51 @@ pub struct HarvestStartupConfig {
     pub orphaned_workflows: OrphanStartupAction,
 }
 
+impl HarvestStartupConfig {
+    /// Apply the operator settings over this code value (issue #1613).
+    ///
+    /// The sources are `autumn.toml`, then `autumn-{profile}.toml`, then
+    /// `AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS`. This is the precedence of
+    /// [`HarvestRuntimeConfig::load`]. A setting that no source names keeps
+    /// the code value. A plain `load()` would reset a code `fail` to `warn`.
+    ///
+    /// Only `[harvest.startup]` and its variable are read. An invalid value in
+    /// another setting does not block this overlay. A file that is not valid
+    /// TOML does block it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError`] when a config file cannot be read or parsed,
+    /// or when a startup value is invalid. A typo must not become `warn`.
+    /// A parse error names the file only. It does not quote the file, which
+    /// can hold a database password.
+    pub fn with_operator_overrides(mut self, env: &dyn Env) -> Result<Self, ConfigError> {
+        for path in operator_config_paths(env) {
+            if let Some(startup) = load_startup_section(&path)? {
+                self.apply_partial(startup);
+            }
+        }
+        self.apply_env_overrides(env)?;
+        Ok(self)
+    }
+
+    const fn apply_partial(&mut self, partial: PartialHarvestStartupConfig) {
+        if let Some(orphaned_workflows) = partial.orphaned_workflows {
+            self.orphaned_workflows = orphaned_workflows;
+        }
+    }
+
+    fn apply_env_overrides(&mut self, env: &dyn Env) -> Result<(), ConfigError> {
+        if let Ok(orphaned_workflows) = env.var("AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS") {
+            self.orphaned_workflows = parse_orphan_startup_action(
+                "AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS",
+                &orphaned_workflows,
+            )?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HarvestRuntimeConfig {
     pub mode: HarvestMode,
@@ -144,20 +189,10 @@ impl HarvestRuntimeConfig {
     /// Returns [`ConfigError`] when config files cannot be read or parsed, environment overrides
     /// are invalid, or the resulting topology configuration is not valid.
     pub fn load_with_env(env: &dyn Env) -> Result<Self, ConfigError> {
-        let profile = resolve_profile(env);
         let mut config = Self::default();
-
-        if let Some(root) = load_partial_root(&find_config_file_named("autumn.toml", env))? {
+        for root in load_operator_roots(env)? {
             config.apply_partial(root.harvest);
         }
-
-        if let Some(profile) = profile {
-            let path = find_config_file_named(&format!("autumn-{profile}.toml"), env);
-            if let Some(root) = load_partial_root(&path)? {
-                config.apply_partial(root.harvest);
-            }
-        }
-
         config.apply_env_overrides(env)?;
         config.validate()?;
         Ok(config)
@@ -206,9 +241,7 @@ impl HarvestRuntimeConfig {
         if let Some(require_shard_readiness) = partial.readiness.require_shard_readiness {
             self.readiness.require_shard_readiness = require_shard_readiness;
         }
-        if let Some(orphaned_workflows) = partial.startup.orphaned_workflows {
-            self.startup.orphaned_workflows = orphaned_workflows;
-        }
+        self.startup.apply_partial(partial.startup);
         if let Some(url) = partial.redis.url {
             self.redis.url = Some(url);
         }
@@ -299,12 +332,7 @@ impl HarvestRuntimeConfig {
                 &require_shard_readiness,
             )?;
         }
-        if let Ok(orphaned_workflows) = env.var("AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS") {
-            self.startup.orphaned_workflows = parse_orphan_startup_action(
-                "AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS",
-                &orphaned_workflows,
-            )?;
-        }
+        self.startup.apply_env_overrides(env)?;
 
         // Issue #1312. An empty `AUTUMN_HARVEST_REDIS__URL` means "off", the
         // same convention `AUTUMN_HARVEST_DATABASE__URL` uses above.
@@ -655,7 +683,7 @@ struct PartialHarvestReadinessConfig {
     require_shard_readiness: Option<bool>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, Deserialize)]
 struct PartialHarvestStartupConfig {
     orphaned_workflows: Option<OrphanStartupAction>,
 }
@@ -687,6 +715,67 @@ fn load_partial_root(path: &Path) -> Result<Option<PartialRoot>, ConfigError> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(ConfigError::Io(error)),
     }
+}
+
+/// The operator config files, in precedence order: `autumn.toml`, then
+/// `autumn-{profile}.toml`. A file that does not exist is skipped.
+fn load_operator_roots(env: &dyn Env) -> Result<Vec<PartialRoot>, ConfigError> {
+    let mut roots = Vec::new();
+    for path in operator_config_paths(env) {
+        if let Some(root) = load_partial_root(&path)? {
+            roots.push(root);
+        }
+    }
+    Ok(roots)
+}
+
+/// The operator config file paths, in precedence order.
+fn operator_config_paths(env: &dyn Env) -> Vec<PathBuf> {
+    let mut paths = vec![find_config_file_named("autumn.toml", env)];
+    if let Some(profile) = resolve_profile(env) {
+        paths.push(find_config_file_named(
+            &format!("autumn-{profile}.toml"),
+            env,
+        ));
+    }
+    paths
+}
+
+/// Only the `[harvest.startup]` table of a config file.
+#[derive(Debug, Default, Deserialize)]
+struct StartupOnlyRoot {
+    #[serde(default)]
+    harvest: StartupOnlyHarvest,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct StartupOnlyHarvest {
+    #[serde(default)]
+    startup: PartialHarvestStartupConfig,
+}
+
+/// Read `[harvest.startup]` from `path`. A missing file gives `None`.
+///
+/// The parse error names the file and the byte offset only. The TOML error
+/// text quotes the failing line, which can hold a password.
+fn load_startup_section(path: &Path) -> Result<Option<PartialHarvestStartupConfig>, ConfigError> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(ConfigError::Io(error)),
+    };
+    toml::from_str::<StartupOnlyRoot>(&contents)
+        .map(|root| Some(root.harvest.startup))
+        .map_err(|error| {
+            let offset = error
+                .span()
+                .map_or_else(String::new, |span| format!(" at byte {}", span.start));
+            ConfigError::Validation(format!(
+                "could not parse {}{offset}: the file is not valid TOML, or \
+                 [harvest.startup] holds an invalid value",
+                path.display()
+            ))
+        })
 }
 
 fn resolve_profile(env: &dyn Env) -> Option<String> {
@@ -1558,6 +1647,107 @@ url = "postgres://harvest:harvest@localhost:5432/harvest"
         let error = resolve_harvest_mode_source(&env)
             .expect_err("an unrecognised mode must fail resolution");
         assert!(error.to_string().contains("sideways"), "{error}");
+    }
+
+    // Issue #1613: the operator overlay for a code-built startup config.
+
+    #[test]
+    fn startup_overlay_keeps_the_code_value_when_the_operator_sets_nothing() {
+        let code = HarvestStartupConfig {
+            orphaned_workflows: OrphanStartupAction::Fail,
+        };
+        let resolved = code
+            .with_operator_overrides(&MockEnv::new())
+            .expect("an empty environment should resolve");
+        assert_eq!(resolved.orphaned_workflows, OrphanStartupAction::Fail);
+    }
+
+    #[test]
+    fn startup_overlay_applies_the_environment_override() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS", "fail");
+        let resolved = HarvestStartupConfig::default()
+            .with_operator_overrides(&env)
+            .expect("a valid override should resolve");
+        assert_eq!(resolved.orphaned_workflows, OrphanStartupAction::Fail);
+    }
+
+    #[test]
+    fn startup_overlay_applies_the_config_file_then_the_environment() {
+        let dir = unique_temp_dir("harvest-startup-overlay");
+        write_file(
+            &dir.join("autumn.toml"),
+            r#"
+[harvest.startup]
+orphaned_workflows = "off"
+"#,
+        );
+        let file_only = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref());
+        let resolved = HarvestStartupConfig::default()
+            .with_operator_overrides(&file_only)
+            .expect("the file should resolve");
+        assert_eq!(resolved.orphaned_workflows, OrphanStartupAction::Off);
+
+        let file_and_env = MockEnv::new()
+            .with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref())
+            .with("AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS", "fail");
+        let resolved = HarvestStartupConfig::default()
+            .with_operator_overrides(&file_and_env)
+            .expect("the file and the override should resolve");
+        assert_eq!(resolved.orphaned_workflows, OrphanStartupAction::Fail);
+    }
+
+    #[test]
+    fn startup_overlay_ignores_unrelated_invalid_settings() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST__WORKER_ENABLED", "maybe");
+        let resolved = HarvestStartupConfig::default()
+            .with_operator_overrides(&env)
+            .expect("an unrelated setting must not block the startup overlay");
+        assert_eq!(resolved.orphaned_workflows, OrphanStartupAction::Warn);
+    }
+
+    #[test]
+    fn startup_overlay_ignores_an_invalid_setting_outside_the_startup_table() {
+        let dir = unique_temp_dir("harvest-startup-narrow");
+        write_file(
+            &dir.join("autumn.toml"),
+            r#"
+[harvest]
+worker_enabled = "maybe"
+
+[harvest.startup]
+orphaned_workflows = "fail"
+"#,
+        );
+        let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref());
+        let resolved = HarvestStartupConfig::default()
+            .with_operator_overrides(&env)
+            .expect("an invalid setting outside [harvest.startup] must not block the overlay");
+        assert_eq!(resolved.orphaned_workflows, OrphanStartupAction::Fail);
+    }
+
+    #[test]
+    fn startup_overlay_parse_error_does_not_quote_the_file() {
+        let dir = unique_temp_dir("harvest-startup-secret");
+        write_file(
+            &dir.join("autumn.toml"),
+            "[database]\nurl = postgres://user:hunter2@db/app\n",
+        );
+        let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref());
+        let error = HarvestStartupConfig::default()
+            .with_operator_overrides(&env)
+            .expect_err("a file that is not valid TOML must refuse");
+        let message = error.to_string();
+        assert!(message.contains("autumn.toml"), "{message}");
+        assert!(!message.contains("hunter2"), "{message}");
+    }
+
+    #[test]
+    fn startup_overlay_rejects_an_invalid_startup_action() {
+        let env = MockEnv::new().with("AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS", "fial");
+        let error = HarvestStartupConfig::default()
+            .with_operator_overrides(&env)
+            .expect_err("a typo in the action must not silently become `warn`");
+        assert!(error.to_string().contains("fial"), "{error}");
     }
 
     fn unique_temp_dir(label: &str) -> PathBuf {
