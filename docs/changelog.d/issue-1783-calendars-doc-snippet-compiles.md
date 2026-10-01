@@ -4,7 +4,7 @@ The "Programmatic Helpers" example in `docs/calendars.md` called `apply_skip_pol
 
 The "Notes" bullet on `weekends-off` now says the flag controls the weekend check. Before, it implied weekends were always excluded.
 
-A `cfg(doctest)` item in `calendar.rs` now compiles every Rust fence in `docs/calendars.md` under `cargo test --doc`. The unlabeled metric fence became a `text` fence.
+A `cfg(doctest)` item in `calendar.rs` now compiles every Rust fence in `docs/calendars.md` under `cargo test --doc`. An ungated step in the CI `lint` job runs it, so docs-only PRs also run it. The unlabeled metric fence became a `text` fence.
 
 No migration. No `WorkflowEvent` variant. Nothing writes to `harvest_events`.
 
