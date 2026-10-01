@@ -1948,6 +1948,10 @@ impl HistoryMatcher {
     /// `WorkflowCancelled`, `WorkflowContinuedAsNew`), or if there are buffered
     /// signals that were never delivered via `wait_for_signal`.
     ///
+    /// The strict and canary executors use this check. The worker path uses
+    /// the narrower [`first_unconsumed_command_event`](Self::first_unconsumed_command_event)
+    /// (issue #1791).
+    ///
     /// Used by [`crate::context::WorkflowContext::history_has_unconsumed_events`] to avoid
     /// false non-determinism reports when replaying full histories that include
     /// a terminal event appended after workflow completion.
@@ -1998,6 +2002,97 @@ impl HistoryMatcher {
         // External awaits drained early that were never consumed by
         // await_external_workflow represent unconsumed history (issue #757).
         !self.pending_external_awaits.is_empty()
+    }
+
+    /// Returns `true` for events that only a workflow command writes.
+    ///
+    /// A deterministic replay re-issues every recorded command, so it
+    /// consumes each of these events. Signals, results and lifecycle events
+    /// come from outside the workflow code and are not in this set.
+    const fn is_command_event(event: &WorkflowEvent) -> bool {
+        matches!(
+            event,
+            WorkflowEvent::ActivityScheduled { .. }
+                | WorkflowEvent::LocalActivityScheduled { .. }
+                | WorkflowEvent::TimerStarted { .. }
+                | WorkflowEvent::TimerCancelled { .. }
+                | WorkflowEvent::ChildWorkflowStarted { .. }
+                | WorkflowEvent::ChildWorkflowSpawnedDetached { .. }
+                | WorkflowEvent::MarkerRecorded { .. }
+                | WorkflowEvent::SideEffectRecorded { .. }
+                | WorkflowEvent::ExternalSignalRequested { .. }
+                | WorkflowEvent::ExternalCancelRequested { .. }
+                | WorkflowEvent::ExternalAwaitRequested { .. }
+        )
+    }
+
+    /// Returns the first recorded command event that the replay did not
+    /// consume, as `(event_index, event_name)` (issue #1791).
+    ///
+    /// The live executor calls this at the end of a cycle. A hit means the
+    /// code no longer issues a command that the recorded run issued.
+    ///
+    /// This check is narrower than
+    /// [`has_non_lifecycle_unconsumed`](Self::has_non_lifecycle_unconsumed).
+    /// A live history can hold a signal, a result or a cancel request that
+    /// the code has not awaited yet. Those are not drift on the live path.
+    #[must_use]
+    pub fn first_unconsumed_command_event(&self) -> Option<(usize, String)> {
+        let at_or_after_cursor = (self.cursor..self.events.len())
+            .find(|&index| !self.is_consumed(index) && Self::is_command_event(&self.events[index]));
+        // A request drained early into an external stash is marked consumed.
+        // It is still drift if no command claimed it from the stash.
+        let stashed = self
+            .events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| self.is_unclaimed_stashed_request(event))
+            .map(|(index, _)| index);
+        at_or_after_cursor
+            .into_iter()
+            .chain(stashed)
+            .min()
+            .map(|index| (index, Self::command_event_name(&self.events[index])))
+    }
+
+    /// Names a command event for an ND diagnostic, in the format the
+    /// `Diverged` arms use, for example `ActivityScheduled(send_email)`.
+    fn command_event_name(event: &WorkflowEvent) -> String {
+        match event {
+            WorkflowEvent::ActivityScheduled { name, .. } => format!("ActivityScheduled({name})"),
+            WorkflowEvent::LocalActivityScheduled { name, .. } => {
+                format!("LocalActivityScheduled({name})")
+            }
+            WorkflowEvent::TimerStarted { timer_id, .. } => format!("TimerStarted({timer_id})"),
+            WorkflowEvent::TimerCancelled { timer_id } => format!("TimerCancelled({timer_id})"),
+            WorkflowEvent::ChildWorkflowStarted { workflow_name, .. } => {
+                format!("ChildWorkflowStarted({workflow_name})")
+            }
+            WorkflowEvent::ChildWorkflowSpawnedDetached { workflow_name, .. } => {
+                format!("ChildWorkflowSpawnedDetached({workflow_name})")
+            }
+            other => Self::actual_event_name(other),
+        }
+    }
+
+    /// Returns `true` if `event` is an `External*Requested` event that is
+    /// still in an external stash.
+    fn is_unclaimed_stashed_request(&self, event: &WorkflowEvent) -> bool {
+        match event {
+            WorkflowEvent::ExternalSignalRequested { signal_id, .. } => self
+                .pending_external_signals
+                .iter()
+                .any(|p| p.signal_id == *signal_id),
+            WorkflowEvent::ExternalCancelRequested { cancel_id, .. } => self
+                .pending_external_cancels
+                .iter()
+                .any(|p| p.cancel_id == *cancel_id),
+            WorkflowEvent::ExternalAwaitRequested { await_id, .. } => self
+                .pending_external_awaits
+                .iter()
+                .any(|p| p.await_id == *await_id),
+            _ => false,
+        }
     }
 
     /// End-of-drive count of genuinely-unconsumed `SignalReceived` events,
@@ -4154,8 +4249,10 @@ impl HistoryMatcher {
                 // runs BEFORE the sibling branches are polled. So it crosses
                 // everything NON-CONSUMINGLY (each event stays claimable exactly
                 // once by `match_timer_cancel` / `match_timer_arm` / etc.) and
-                // leaves the verdict to the end of the cycle, where `executor.rs`
-                // fails the workflow if `history_has_unconsumed_events()`.
+                // leaves the verdict to the end-of-cycle drift guard in
+                // `executor.rs`. Strict and canary replay use
+                // `history_has_unconsumed_events()`. The worker path uses
+                // `first_unconsumed_command_event()` (issue #1791).
                 //
                 // Round 13's protection is preserved in OUTCOME — pinned by
                 // `interleaved_sibling_signal_stray_timer_started_still_diverges`
@@ -4273,10 +4370,12 @@ impl HistoryMatcher {
         //     cycle (the #950 mixed batch) → the frontier is clean when the body
         //     suspends and the park is correct;
         //   * nothing claims it (a stray left by code that no longer runs, issue
-        //     #768 round 13) → it is still unconsumed at suspend, and
-        //     `executor.rs`'s `history_has_unconsumed_events()` guard nd-blocks
-        //     the workflow instead of letting it park forever on a signal that
-        //     will never arrive.
+        //     #768 round 13) → it is still unconsumed at suspend. The
+        //     end-of-cycle drift guard in `executor.rs` then fails the cycle.
+        //     The run does not park forever on a signal that never arrives.
+        //     Strict and canary replay use `history_has_unconsumed_events()`.
+        //     The worker path uses `first_unconsumed_command_event()`, and
+        //     the #603 gate ND-blocks the run (issue #1791).
         //
         // Deciding that here instead would mean guessing, since this scan runs
         // before the sibling branches of the same decision are polled — which is
@@ -9050,15 +9149,17 @@ mod tests {
         // whose sibling branch has not been polled yet — so diverging here
         // nd-blocked a supported composition on its first wake (Codex round 3 on
         // PR #1245). The scan now returns `NoMatch` and, crucially, leaves the
-        // event UNCONSUMED; the decision is made at the end of the cycle, where
-        // `executor.rs`'s `history_has_unconsumed_events()` sees that nothing
-        // claimed it and fails the workflow.
+        // event UNCONSUMED. The end-of-cycle drift guard in `executor.rs` sees
+        // that nothing claimed it and fails the cycle.
         //
         // So this asserts the two halves the cycle guard needs, not a verdict:
-        // park, and the stray event still unclaimed. The round-13 OUTCOME is
-        // pinned end-to-end by the integration test
-        // `interleaved_sibling_signal_stray_timer_started_still_diverges`, which
-        // asserts the replay is reported as non-determinism.
+        // park, and the stray event still unclaimed. Two integration tests pin
+        // the round-13 OUTCOME end to end:
+        //
+        // - `interleaved_sibling_signal_stray_timer_started_still_diverges`
+        //   pins strict replay (`history_has_unconsumed_events()`).
+        // - `stray_timer_before_signal_wait_blocks_instead_of_parking` pins the
+        //   worker path (`first_unconsumed_command_event()`, issue #1791).
         let events = vec![ts("timer-1", 10)];
         let mut m = HistoryMatcher::new(events);
         assert_eq!(
@@ -9071,6 +9172,11 @@ mod tests {
             !m.is_consumed(0),
             "the stray timer must be left UNCONSUMED — that is the whole signal \
              `history_has_unconsumed_events()` keys on to nd-block the run"
+        );
+        assert_eq!(
+            m.first_unconsumed_command_event(),
+            Some((0, "TimerStarted(timer-1)".to_string())),
+            "the worker-path guard must see the same stray timer (issue #1791)"
         );
     }
 
@@ -13655,5 +13761,95 @@ mod tests {
                 output: serde_json::json!({"done": true})
             }
         );
+    }
+
+    // ── End-of-cycle command drift check (issue #1791) ────────────────────
+
+    fn scheduled(name: &str) -> WorkflowEvent {
+        WorkflowEvent::ActivityScheduled {
+            activity_id: ActivityExecId::new(),
+            name: name.into(),
+            input: Value::Null,
+            queue: "default".into(),
+        }
+    }
+
+    fn signal(name: &str) -> WorkflowEvent {
+        WorkflowEvent::SignalReceived {
+            signal_name: name.into(),
+            payload: Value::Null,
+        }
+    }
+
+    #[test]
+    fn first_unconsumed_command_event_reports_a_trailing_activity() {
+        let mut m = HistoryMatcher::new(vec![scheduled("a"), scheduled("b")]);
+        let _ = m.match_activity("a");
+        assert_eq!(
+            m.first_unconsumed_command_event(),
+            Some((1, "ActivityScheduled(b)".to_string())),
+            "the code dropped activity b, so its event is drift"
+        );
+    }
+
+    #[test]
+    fn first_unconsumed_command_event_ignores_events_from_outside_the_code() {
+        // A live history can hold a signal, a fired timer or a result that
+        // the code has not awaited yet. None of them is drift.
+        let m = HistoryMatcher::new(vec![
+            signal("go"),
+            tf("t"),
+            WorkflowEvent::ActivityCompleted {
+                activity_id: ActivityExecId::new(),
+                output: Value::Null,
+            },
+        ]);
+        assert_eq!(m.first_unconsumed_command_event(), None);
+    }
+
+    #[test]
+    fn first_unconsumed_command_event_is_none_after_a_full_replay() {
+        let mut m = HistoryMatcher::new(vec![ts("t", 10), tf("t")]);
+        assert!(matches!(m.match_timer("t"), HistoryMatch::Matched { .. }));
+        assert_eq!(m.first_unconsumed_command_event(), None);
+    }
+
+    #[test]
+    fn first_unconsumed_command_event_reports_a_stray_timer_before_a_signal() {
+        // The signal scan crosses the stray timer and does not consume it.
+        let mut m = HistoryMatcher::new(vec![ts("t", 10), tf("t"), signal("go")]);
+        assert!(matches!(m.match_signal("go"), HistoryMatch::Matched { .. }));
+        assert_eq!(
+            m.first_unconsumed_command_event(),
+            Some((0, "TimerStarted(t)".to_string()))
+        );
+    }
+
+    #[test]
+    fn first_unconsumed_command_event_reports_an_unclaimed_stashed_request() {
+        // An early drain marks the request consumed and stashes it. Only
+        // the stash shows that no command claimed it.
+        let signal_id = ExternalSignalId::new();
+        let target = crate::types::ExternalTarget::ExecutionId(ExecutionId::new());
+        let mut m = HistoryMatcher::new(vec![
+            WorkflowEvent::ExternalSignalRequested {
+                signal_id,
+                target: target.clone(),
+                signal_name: "poke".into(),
+                payload: Value::Null,
+                idempotency_key: None,
+            },
+            WorkflowEvent::ExternalSignalDelivered { signal_id },
+        ]);
+        m.prepare_match();
+        assert_eq!(
+            m.first_unconsumed_command_event(),
+            Some((0, "ExternalSignalRequested".to_string()))
+        );
+        assert!(matches!(
+            m.match_external_signal(&target, "poke"),
+            HistoryMatch::Matched { .. }
+        ));
+        assert_eq!(m.first_unconsumed_command_event(), None);
     }
 }

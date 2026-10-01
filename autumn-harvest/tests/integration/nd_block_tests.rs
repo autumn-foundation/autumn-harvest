@@ -1480,12 +1480,13 @@ async fn inject_signal(conn: &mut AsyncPgConnection, exec_id: ExecutionId, name:
 
 /// Assert that the run is ND-blocked and was never completed or failed.
 ///
-/// `expected_event` is the recorded event that the new build skipped.
+/// `skipped_event` is the recorded event that the new build skipped. The
+/// diagnostic reports it as `actual`, the recorded side.
 async fn assert_drift_blocked(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     metrics: &RecordingMetrics,
-    expected_event: &str,
+    skipped_event: &str,
 ) {
     let (blocked, reason, count, attrs) = wait_for_nd_block(conn, exec_id, 1).await;
     assert!(blocked, "nd_blocked_at must be set");
@@ -1507,11 +1508,12 @@ async fn assert_drift_blocked(
     );
     let attrs = attrs.expect("search_attrs must be stamped");
     assert_eq!(attrs["failure_cause"], "non_determinism");
+    assert_eq!(attrs["actual"], skipped_event, "{attrs}");
     assert!(
         attrs["expected"]
             .as_str()
-            .is_some_and(|e| e.contains(expected_event)),
-        "expected must name the skipped event {expected_event}: {attrs}"
+            .is_some_and(|e| e.starts_with("<workflow ")),
+        "expected must say how the cycle ended: {attrs}"
     );
     assert!(attrs["event_index"].is_number());
     assert_eq!(attrs["build_id"], "v2");
@@ -1570,7 +1572,13 @@ async fn trailing_activity_drift_blocks_instead_of_completing() {
         ),
         build_pool(&url),
     );
-    assert_drift_blocked(&mut conn, exec_id, &metrics, "ActivityScheduled").await;
+    assert_drift_blocked(
+        &mut conn,
+        exec_id,
+        &metrics,
+        "ActivityScheduled(nd_trailing_a)",
+    )
+    .await;
     worker2.shutdown();
     let _ = handle2.await;
 }
@@ -1614,7 +1622,7 @@ async fn stray_timer_before_signal_wait_blocks_instead_of_parking() {
         ),
         build_pool(&url),
     );
-    assert_drift_blocked(&mut conn, exec_id, &metrics, "TimerStarted").await;
+    assert_drift_blocked(&mut conn, exec_id, &metrics, "TimerStarted(nd-gate)").await;
     worker2.shutdown();
     let _ = handle2.await;
 }
@@ -1662,7 +1670,7 @@ async fn stray_timer_before_delivered_signal_blocks_instead_of_completing() {
         ),
         build_pool(&url),
     );
-    assert_drift_blocked(&mut conn, exec_id, &metrics, "TimerStarted").await;
+    assert_drift_blocked(&mut conn, exec_id, &metrics, "TimerStarted(nd-gate)").await;
     worker2.shutdown();
     let _ = handle2.await;
 }
