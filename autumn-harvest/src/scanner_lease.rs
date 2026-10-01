@@ -63,6 +63,12 @@ pub const MAX_SCANNER_JITTER: f64 = 0.9;
 /// late wakeup.
 pub const MIN_LEASE_TICKS: u32 = 3;
 
+/// Longest time a graceful stop spends on releasing its lease.
+///
+/// The release is best effort. A stop that runs out of time leaves the lease
+/// to expire after its TTL.
+pub const LEASE_RELEASE_BOUND: Duration = Duration::from_secs(1);
+
 /// Failed passes in a row after which a leader gives up its lease.
 ///
 /// A pass can fail on one replica alone, for example on a codec only that

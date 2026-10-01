@@ -5547,19 +5547,22 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
 
         // Issue #1795: a graceful stop expires the lease at once, so a
         // standby leads on its next tick instead of after the TTL. Best
-        // effort and bounded: a failure here only delays the handover.
+        // effort: a failure here only delays the handover to the TTL.
+        //
+        // The bound is fixed, not the scan interval. Worker shutdown awaits
+        // each checker in turn, so a long interval would add up per shard.
         if let Some(lease) = &lease {
-            match tokio::time::timeout(interval, pool.get()).await {
-                Ok(Ok(mut conn)) => {
-                    if let Err(e) = lease.release(&mut conn).await {
-                        tracing::warn!(error = %e, "timeout scanner lease release failed");
-                    }
-                }
+            let release = async {
+                let mut conn = pool.get().await.map_err(|e| e.to_string())?;
+                lease.release(&mut conn).await.map_err(|e| e.to_string())
+            };
+            match tokio::time::timeout(crate::scanner_lease::LEASE_RELEASE_BOUND, release).await {
+                Ok(Ok(())) => {}
                 Ok(Err(e)) => {
-                    tracing::warn!(error = %e, "no connection to release the timeout scanner lease");
+                    tracing::warn!(error = %e, "timeout scanner lease release failed");
                 }
                 Err(_elapsed) => {
-                    tracing::warn!("no connection in time to release the timeout scanner lease");
+                    tracing::warn!("timeout scanner lease release timed out");
                 }
             }
         }
