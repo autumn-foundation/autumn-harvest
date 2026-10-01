@@ -5377,6 +5377,34 @@ async fn task_state_for_update(
         .map_err(crate::error::database_error)
 }
 
+/// The task row's state while `task`'s claim still holds it (issue #1788).
+///
+/// Locks the row. Returns `None` when the row is gone, or when another claim
+/// owns it: a different `worker_id` or `attempt`. A late finalization, for
+/// example a retried write, must not touch a newer claim. Another worker can
+/// reclaim the task while this worker waits on the pool. A task with no claim
+/// worker checks the row only.
+async fn claim_state_for_update(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+) -> HarvestResult<Option<String>> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    let row: Option<(String, Option<String>, i32)> = dsl::harvest_task_queue
+        .find(task.id)
+        .for_update()
+        .select((dsl::state, dsl::worker_id, dsl::attempt))
+        .first(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+    Ok(row.and_then(|(state, worker_id, attempt)| {
+        let ours =
+            task.worker_id.is_none() || (worker_id == task.worker_id && attempt == task.attempt);
+        ours.then_some(state)
+    }))
+}
+
 fn pending_activity_id_for_task(
     history: &[WorkflowEvent],
     task: &TaskQueueItem,
@@ -13352,7 +13380,7 @@ async fn finalize_activity_completion(
         if pending_activity_id_for_task(&history.events, task, activity_name)?.is_none() {
             return Ok(());
         }
-        let Some(state) = task_state_for_update(conn, task.id).await? else {
+        let Some(state) = claim_state_for_update(conn, task).await? else {
             return Ok(());
         };
         if state != "RUNNING" {
@@ -13435,7 +13463,7 @@ async fn finalize_activity_failure(
         if pending_activity_id_for_task(&history.events, task, activity_name)?.is_none() {
             return Ok(());
         }
-        let Some(state) = task_state_for_update(conn, task.id).await? else {
+        let Some(state) = claim_state_for_update(conn, task).await? else {
             return Ok(());
         };
         if state != "RUNNING" {
@@ -14721,7 +14749,18 @@ async fn handle_activity_result(
                 // attempt is NOT counted as a scheduled retry) and only when the
                 // DB requeue actually succeeds (avoids inflating the counter on
                 // transient DB errors or stale task state).
-                let result = queue::requeue_for_retry(conn, task.id, delay, &previous_error).await;
+                // The requeue checks the claim under the row lock (issue
+                // #1788). A retried write must not requeue a newer claim.
+                let result = Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
+                    if claim_state_for_update(conn, task).await?.as_deref() != Some("RUNNING") {
+                        return Err(HarvestError::NotFound(format!(
+                            "task queue item {} is not running under this claim",
+                            task.id
+                        )));
+                    }
+                    queue::requeue_for_retry(conn, task.id, delay, &previous_error).await
+                }))
+                .await;
                 if result.is_ok() {
                     metrics.record_activity_retried(activity_name_for_cap, &task.queue_name);
                 }
@@ -14731,6 +14770,44 @@ async fn handle_activity_result(
             finalize_activity_failure(conn, task, exec_id, activity_id, &error, codecs).await
         }
     }
+}
+
+/// Write one activity attempt's result through the normal finalization.
+///
+/// Tests use it to check the claim fence (issue #1788). It applies no result
+/// size cap, no offloader and no metrics.
+///
+/// # Errors
+///
+/// See `handle_activity_result`.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub async fn write_activity_result_for_task(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    exec_id: ExecutionId,
+    activity_id: ActivityExecId,
+    worker_id: &str,
+    retry_policy: Option<&RetryPolicy>,
+    result: Result<serde_json::Value, String>,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<()> {
+    handle_activity_result(
+        conn,
+        task,
+        exec_id,
+        activity_id,
+        worker_id,
+        retry_policy,
+        result,
+        0,
+        task.activity_name.as_deref().unwrap_or_default(),
+        None,
+        &crate::telemetry::NoOpMetrics,
+        crate::builder::DEFAULT_RETRY_AFTER_CEILING,
+        codecs,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]

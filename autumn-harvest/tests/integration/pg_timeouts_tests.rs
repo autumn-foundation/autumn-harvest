@@ -1436,6 +1436,146 @@ async fn a_lost_start_check_waits_for_a_busy_pool() {
     assert!(committed, "this claim's start committed");
 }
 
+/// A result write that runs after another worker reclaimed the task must not
+/// reach the newer attempt. The retries of issue #1788 widen that window, so
+/// each finalization checks the claim's `attempt` and `worker_id`.
+#[tokio::test]
+async fn a_stale_result_write_does_not_reach_a_newer_claim() {
+    #[derive(diesel::QueryableByName)]
+    struct Claim {
+        #[diesel(sql_type = Text)]
+        state: String,
+        #[diesel(sql_type = diesel::sql_types::Nullable<Text>)]
+        worker_id: Option<String>,
+    }
+
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    for (case, result) in [
+        ("completion", Ok(serde_json::json!({"done": true}))),
+        ("retry", Err("transient failure".to_owned())),
+    ] {
+        let (exec_id, activity_id, stale) = seed_claimed_activity(&mut conn, "q-sr").await;
+        let task_id = stale.id;
+
+        // Another worker reclaims the task.
+        diesel::sql_query(
+            "UPDATE harvest_task_queue SET worker_id = 'w-2', attempt = 2 WHERE id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .execute(&mut conn)
+        .await
+        .expect("model the newer claim");
+
+        let policy = autumn_harvest::policy::RetryPolicy::fixed(3, Duration::from_secs(1));
+        let _ = autumn_harvest::worker::write_activity_result_for_task(
+            &mut conn,
+            &stale,
+            exec_id,
+            activity_id,
+            "w-1",
+            Some(&policy),
+            result,
+            &autumn_harvest::payload_codec::PayloadCodecs::default(),
+        )
+        .await;
+
+        let claim =
+            diesel::sql_query("SELECT state, worker_id FROM harvest_task_queue WHERE id = $1")
+                .bind::<diesel::sql_types::Uuid, _>(task_id)
+                .get_result::<Claim>(&mut conn)
+                .await
+                .expect("read the claim");
+        assert_eq!(
+            (claim.state.as_str(), claim.worker_id.as_deref()),
+            ("RUNNING", Some("w-2")),
+            "{case}: the stale write changed the newer claim"
+        );
+        let history = store::load_history(&mut conn, exec_id)
+            .await
+            .expect("load history");
+        assert!(
+            !history
+                .events
+                .iter()
+                .any(|event| matches!(event, WorkflowEvent::ActivityCompleted { .. })),
+            "{case}: the stale write completed the activity"
+        );
+    }
+}
+
+/// Seed an activity that `w-1` scheduled, claimed (attempt 1) and started.
+/// Returns the execution, the activity and the claimed task row.
+async fn seed_claimed_activity(
+    conn: &mut AsyncPgConnection,
+    queue_prefix: &str,
+) -> (
+    ExecutionId,
+    autumn_harvest::types::ActivityExecId,
+    autumn_harvest::models::TaskQueueItem,
+) {
+    use autumn_harvest::models::TaskQueueItem;
+    use autumn_harvest::schema::harvest_task_queue;
+    use autumn_harvest::types::{ActivityExecId, WorkerId};
+    use diesel::{QueryDsl, SelectableHelper};
+
+    let queue_name = format!(
+        "{queue_prefix}-{}",
+        &Uuid::new_v4().simple().to_string()[..12]
+    );
+    let exec_id = seed_execution(conn, &queue_name).await;
+    let activity_id = ActivityExecId::from_uuid(Uuid::new_v4());
+    store::append_events(
+        conn,
+        exec_id,
+        &[
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "act".to_owned(),
+                input: serde_json::json!({}),
+                queue: queue_name.clone(),
+            },
+            WorkflowEvent::ActivityStarted {
+                activity_id,
+                worker_id: WorkerId::new("w-1"),
+            },
+        ],
+        1,
+    )
+    .await
+    .expect("schedule and start the activity");
+    let task_id = autumn_harvest::queue::enqueue(
+        conn,
+        &autumn_harvest::queue::EnqueueParams::new(
+            &queue_name,
+            autumn_harvest::queue::TaskType::Activity,
+            serde_json::json!({}),
+        ),
+    )
+    .await
+    .expect("enqueue");
+    register_live_worker(conn, "w-1").await;
+    register_live_worker(conn, "w-2").await;
+    diesel::sql_query(
+        "UPDATE harvest_task_queue SET state = 'RUNNING', worker_id = 'w-1', attempt = 1, \
+         started_at = NOW(), workflow_exec_id = $2, activity_id = $3, \
+         activity_name = 'act' WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Uuid, _>(activity_id.as_uuid())
+    .execute(conn)
+    .await
+    .expect("model the first claim");
+    let task: TaskQueueItem = harvest_task_queue::table
+        .find(task_id)
+        .select(TaskQueueItem::as_select())
+        .first(conn)
+        .await
+        .expect("load the first claim");
+    (exec_id, activity_id, task)
+}
+
 /// Mark `worker_id` as a live worker. A test row `RUNNING` under an unknown
 /// worker is an orphan, and a reclaimer of a parallel suite would requeue it.
 /// The row has no queues and a shard that does not exist, so no other code
