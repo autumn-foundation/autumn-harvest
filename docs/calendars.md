@@ -173,8 +173,9 @@ let next = apply_skip_policy(
 assert_eq!(next, NaiveDate::from_ymd_opt(2026, 1, 20));
 ```
 
-The fourth argument, `exclude_weekends`, treats Saturday and Sunday as excluded. Pass
-`calendar_excludes_weekends(name)` to match the scheduler. That function returns `true` only for `weekends-off`.
+The fourth argument, `exclude_weekends`, treats Saturday and Sunday as excluded.
+Pass `calendar_excludes_weekends(name)` to match the scheduler.
+That function returns `true` only for `weekends-off`.
 
 ---
 
