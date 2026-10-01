@@ -4797,10 +4797,13 @@ async fn heartbeat_checkpoints_are_unaffected_by_partitioning() {
     .id;
 
     let claim = autumn_harvest::queue::TaskClaim::new(task, "hb-worker", 1);
-    let write =
-        autumn_harvest::queue::record_heartbeat(&mut conn, &claim, serde_json::json!({"progress": 0.5}))
-            .await
-            .expect("AC6: heartbeat checkpoints must work on a partitioned deployment");
+    let write = autumn_harvest::queue::record_heartbeat(
+        &mut conn,
+        &claim,
+        serde_json::json!({"progress": 0.5}),
+    )
+    .await
+    .expect("AC6: heartbeat checkpoints must work on a partitioned deployment");
     assert_eq!(write, autumn_harvest::queue::ClaimWrite::Applied);
 
     assert_eq!(

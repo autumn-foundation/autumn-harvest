@@ -1,12 +1,14 @@
 //! Claim-epoch fence on activity ownership writes (issue #1789).
 //!
-//! Every test runs one scenario. Worker A claims an activity task. A has no
-//! liveness row, so the orphan reclaimer requeues the row. Worker B then
-//! claims the same row as the next attempt. A's late writes must not change
-//! B's attempt.
+//! Every test runs one scenario. Worker A claims an activity task. A's
+//! liveness row goes stale, so the orphan reclaimer requeues the row. Worker
+//! B then claims the same row as the next attempt. A's late writes must not
+//! change B's attempt.
 //!
-//! The requeue runs the reclaimer's own statement against this one row, so
-//! the tests are safe on a shared `HARVEST_TEST_DATABASE_URL` database.
+//! The requeue runs the reclaimer's own statement against this one row. Each
+//! test uses its own queue and worker ids, and B keeps a live liveness row.
+//! A background reclaimer in the same database can therefore race only on
+//! A's requeue, and the helper accepts that outcome.
 
 use std::time::Duration;
 
@@ -19,8 +21,9 @@ use autumn_harvest::schema::harvest_workflow_executions;
 use autumn_harvest::store;
 use autumn_harvest::types::{ActivityExecId, ExecutionId};
 use autumn_harvest::worker::{
-    DbPool, append_activity_started_for_test, finalize_activity_completion,
-    finalize_activity_failure, observe_task_cancellation,
+    DbPool, append_activity_started_for_test, fail_task_and_execution_with_history,
+    finalize_activity_completion, finalize_activity_failure, observe_task_cancellation,
+    preload_failure_history,
 };
 use chrono::Utc;
 use diesel::prelude::*;
@@ -118,16 +121,48 @@ async fn insert_execution(conn: &mut AsyncPgConnection, queue: &str) -> Executio
     exec_id
 }
 
-/// One scheduled activity on its own queue, so a shared database is safe.
+/// One scheduled activity on its own queue, with its own worker ids.
 struct Fixture {
     queue: String,
+    worker_a: String,
+    worker_b: String,
     exec_id: ExecutionId,
     activity_id: ActivityExecId,
     task_id: Uuid,
 }
 
+/// Insert or refresh a live liveness row for `worker_id`.
+async fn live_worker(conn: &mut AsyncPgConnection, worker_id: &str) {
+    diesel::sql_query(
+        "INSERT INTO harvest_workers (worker_id, last_heartbeat_at, max_concurrency, host) \
+         VALUES ($1, NOW(), 10, 'localhost') \
+         ON CONFLICT (worker_id) DO UPDATE SET last_heartbeat_at = NOW()",
+    )
+    .bind::<diesel::sql_types::Text, _>(worker_id)
+    .execute(conn)
+    .await
+    .expect("upsert live worker");
+}
+
+/// Make the liveness row of `worker_id` stale, as a partition or stall does.
+async fn stale_worker(conn: &mut AsyncPgConnection, worker_id: &str) {
+    diesel::sql_query(
+        "UPDATE harvest_workers SET last_heartbeat_at = NOW() - INTERVAL '1 hour' \
+         WHERE worker_id = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(worker_id)
+    .execute(conn)
+    .await
+    .expect("stale worker");
+}
+
 async fn seed_activity(conn: &mut AsyncPgConnection) -> Fixture {
-    let queue = format!("claim-epoch-{}", Uuid::new_v4());
+    let run = Uuid::new_v4();
+    let queue = format!("claim-epoch-{run}");
+    let worker_a = format!("claim-epoch-a-{run}");
+    let worker_b = format!("claim-epoch-b-{run}");
+    live_worker(conn, &worker_a).await;
+    live_worker(conn, &worker_b).await;
     let exec_id = insert_execution(conn, &queue).await;
     let activity_id = ActivityExecId::new();
     store::append_events(
@@ -162,6 +197,8 @@ async fn seed_activity(conn: &mut AsyncPgConnection) -> Fixture {
     let task_id = queue::enqueue(conn, &params).await.expect("enqueue");
     Fixture {
         queue,
+        worker_a,
+        worker_b,
         exec_id,
         activity_id,
         task_id,
@@ -169,21 +206,33 @@ async fn seed_activity(conn: &mut AsyncPgConnection) -> Fixture {
 }
 
 async fn claim(conn: &mut AsyncPgConnection, fx: &Fixture, worker_id: &str) -> TaskQueueItem {
-    let task = queue::claim_task(conn, &[fx.queue.clone()], worker_id, "", None, &[], &[])
-        .await
-        .expect("claim")
-        .expect("task is claimable");
+    let task = queue::claim_task(
+        conn,
+        std::slice::from_ref(&fx.queue),
+        worker_id,
+        "",
+        None,
+        &[],
+        &[],
+    )
+    .await
+    .expect("claim")
+    .expect("task is claimable");
     assert_eq!(task.id, fx.task_id);
     task
 }
 
-/// Run the orphan reclaimer's requeue statement on this row only.
+/// Make A's liveness stale, then run the orphan reclaimer's requeue
+/// statement on this row only.
 ///
-/// The `SELECT ... FOR UPDATE` comes first, as `requeue_orphan` requires.
+/// The `SELECT ... FOR UPDATE` comes first, as `requeue_orphan` requires. A
+/// background reclaimer can requeue the row first. The row is then already
+/// `PENDING` with no worker, which is the same outcome.
 async fn requeue_orphan(conn: &mut AsyncPgConnection, task: &TaskQueueItem) {
     let task_id = task.id;
     let worker_id = task.worker_id.clone().expect("claimed task has a worker");
     let strikes = task.crash_strikes;
+    stale_worker(conn, &worker_id).await;
     let requeued = conn
         .transaction::<usize, diesel::result::Error, _>(async |conn| {
             diesel::sql_query("SELECT id FROM harvest_task_queue WHERE id = $1 FOR UPDATE")
@@ -202,23 +251,35 @@ async fn requeue_orphan(conn: &mut AsyncPgConnection, task: &TaskQueueItem) {
         })
         .await
         .expect("requeue orphan");
-    assert_eq!(requeued, 1, "the reclaimer must requeue A's orphaned claim");
+    if requeued == 0 {
+        let r = row(conn, task_id).await;
+        assert_eq!(
+            (r.state.as_str(), r.worker_id),
+            ("PENDING", None),
+            "the reclaimer must requeue A's orphaned claim"
+        );
+    }
 }
 
 /// A claims and starts. The reclaimer requeues. B claims and starts.
 async fn a_then_b(conn: &mut AsyncPgConnection, fx: &Fixture) -> (TaskQueueItem, TaskQueueItem) {
     let codecs = PayloadCodecs::default();
-    let a = claim(conn, fx, "worker-a").await;
-    let started = append_activity_started_for_test(conn, &a, fx.exec_id, ACTIVITY, "worker-a", &codecs)
-        .await
-        .expect("A starts");
+    let a = claim(conn, fx, &fx.worker_a).await;
+    let started =
+        append_activity_started_for_test(conn, &a, fx.exec_id, ACTIVITY, &fx.worker_a, &codecs)
+            .await
+            .expect("A starts");
     assert_eq!(started, Some(fx.activity_id));
     requeue_orphan(conn, &a).await;
-    let b = claim(conn, fx, "worker-b").await;
-    assert!(b.attempt > a.attempt, "a reclaim must give B a later attempt");
-    let started = append_activity_started_for_test(conn, &b, fx.exec_id, ACTIVITY, "worker-b", &codecs)
-        .await
-        .expect("B starts");
+    let b = claim(conn, fx, &fx.worker_b).await;
+    assert!(
+        b.attempt > a.attempt,
+        "a reclaim must give B a later attempt"
+    );
+    let started =
+        append_activity_started_for_test(conn, &b, fx.exec_id, ACTIVITY, &fx.worker_b, &codecs)
+            .await
+            .expect("B starts");
     assert_eq!(started, Some(fx.activity_id));
     (a, b)
 }
@@ -350,6 +411,9 @@ async fn stale_completion_while_b_runs_changes_nothing_and_b_wins() {
     assert_eq!(after.output, Some(serde_json::json!("from B")));
 }
 
+/// Regression guard for the order that the issue names. The history check
+/// already blocks it, because B's terminal event exists, so it does not prove
+/// the fence on its own.
 #[tokio::test]
 async fn stale_completion_after_b_completes_changes_nothing() {
     let (url, _c) = setup_db().await;
@@ -422,9 +486,16 @@ async fn stale_failure_while_b_runs_changes_nothing() {
     let codecs = PayloadCodecs::default();
     let before = row(&mut conn, fx.task_id).await;
 
-    finalize_activity_failure(&mut conn, &a, fx.exec_id, fx.activity_id, "A failed", &codecs)
-        .await
-        .expect("a stale failure is a no-op, not an error");
+    finalize_activity_failure(
+        &mut conn,
+        &a,
+        fx.exec_id,
+        fx.activity_id,
+        "A failed",
+        &codecs,
+    )
+    .await
+    .expect("a stale failure is a no-op, not an error");
 
     assert_eq!(count_failed(&events(&mut conn, fx.exec_id).await), 0);
     assert_eq!(row(&mut conn, fx.task_id).await, before);
@@ -489,18 +560,24 @@ async fn stale_start_after_b_claims_appends_nothing() {
     let mut conn = connect(&url).await;
     let fx = seed_activity(&mut conn).await;
     let codecs = PayloadCodecs::default();
-    let a = claim(&mut conn, &fx, "worker-a").await;
+    let a = claim(&mut conn, &fx, &fx.worker_a).await;
     requeue_orphan(&mut conn, &a).await;
-    let _b = claim(&mut conn, &fx, "worker-b").await;
+    let _b = claim(&mut conn, &fx, &fx.worker_b).await;
 
-    let started =
-        append_activity_started_for_test(&mut conn, &a, fx.exec_id, ACTIVITY, "worker-a", &codecs)
-            .await
-            .expect("a stale start is a no-op, not an error");
+    let started = append_activity_started_for_test(
+        &mut conn,
+        &a,
+        fx.exec_id,
+        ACTIVITY,
+        &fx.worker_a,
+        &codecs,
+    )
+    .await
+    .expect("a stale start is a no-op, not an error");
 
     assert_eq!(started, None, "A must not start under B's claim");
     assert_eq!(
-        count_started_by(&events(&mut conn, fx.exec_id).await, "worker-a"),
+        count_started_by(&events(&mut conn, fx.exec_id).await, &fx.worker_a),
         0
     );
 }
@@ -526,7 +603,10 @@ async fn stale_heartbeat_leaves_b_checkpoint_and_timestamp_unchanged() {
     assert_eq!(write, ClaimWrite::LeaseLost);
     let after = row(&mut conn, fx.task_id).await;
     assert_eq!(after.last_heartbeat_at, before.last_heartbeat_at);
-    assert_eq!(after.heartbeat_details, Some(serde_json::json!({"owner": "B"})));
+    assert_eq!(
+        after.heartbeat_details,
+        Some(serde_json::json!({"owner": "B"}))
+    );
 }
 
 #[tokio::test]
@@ -579,10 +659,21 @@ async fn heartbeat_flusher_keeps_running_while_the_claim_is_held() {
         if r.heartbeat_details == Some(serde_json::json!({"owner": "B", "n": 1})) {
             break;
         }
-        assert!(tokio::time::Instant::now() < deadline, "B's heartbeat must flush");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "B's heartbeat must flush"
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(!cancel.is_cancelled(), "a held claim must not cancel the token");
+    // One more flush interval, so a wrong verdict on the next flush shows.
+    tx.send(serde_json::json!({"owner": "B", "n": 2}))
+        .await
+        .expect("send heartbeat");
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    assert!(
+        !cancel.is_cancelled(),
+        "a held claim must not cancel the token"
+    );
     cancel.cancel();
 }
 
@@ -623,4 +714,386 @@ async fn cancellation_observer_waits_while_the_claim_is_held() {
     .await;
 
     assert!(waited.is_err(), "a held claim must not read as cancelled");
+}
+
+#[tokio::test]
+async fn heartbeat_flusher_cancels_the_token_when_the_row_is_terminal() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let fx = seed_activity(&mut conn).await;
+    let (_a, b) = a_then_b(&mut conn, &fx).await;
+    let claim_b = TaskClaim::of(&b).expect("B holds a claim");
+    let done = queue::complete_claimed_task(&mut conn, &claim_b, serde_json::json!("done"))
+        .await
+        .expect("B completes");
+    assert_eq!(done, ClaimWrite::Applied);
+    let cancel = CancellationToken::new();
+
+    let tx = autumn_harvest::heartbeat::spawn_heartbeat_flusher(
+        claim_b,
+        build_pool(&url),
+        cancel.clone(),
+    );
+    tx.send(serde_json::json!({"late": true}))
+        .await
+        .expect("send heartbeat");
+
+    tokio::time::timeout(Duration::from_secs(10), cancel.cancelled())
+        .await
+        .expect("a heartbeat on a terminal row must cancel the activity's token");
+    assert_eq!(row(&mut conn, fx.task_id).await.heartbeat_details, None);
+}
+
+// ---------------------------------------------------------------------------
+// Execution failure guard
+// ---------------------------------------------------------------------------
+
+/// `crash_strikes` can return to an earlier value. Then a later claim of the
+/// same worker passes the `(worker_id, crash_strikes)` guard of the
+/// execution failure path. The claim epoch must still stop the stale write.
+#[tokio::test]
+async fn stale_execution_failure_under_a_reused_strike_count_changes_nothing() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let fx = seed_activity(&mut conn).await;
+    let codecs = PayloadCodecs::default();
+    let w = fx.worker_a.clone();
+
+    let first = claim(&mut conn, &fx, &w).await;
+    requeue_orphan(&mut conn, &first).await;
+    live_worker(&mut conn, &w).await;
+    let second = claim(&mut conn, &fx, &w).await;
+    let released =
+        queue::release_terminal_workflow_claim(&mut conn, second.id, &w, second.crash_strikes)
+            .await
+            .expect("release runs");
+    assert!(released, "the release must put the row back to PENDING");
+    let third = claim(&mut conn, &fx, &w).await;
+    assert_eq!(
+        (third.crash_strikes, third.worker_id.as_deref()),
+        (first.crash_strikes, Some(w.as_str())),
+        "the third claim must reuse the first claim's guard values"
+    );
+    assert!(third.attempt > first.attempt);
+    let before = row(&mut conn, fx.task_id).await;
+
+    let preloaded = preload_failure_history(&mut conn, &first).await;
+    fail_task_and_execution_with_history(&mut conn, &first, &w, "stale", preloaded, &codecs)
+        .await
+        .expect("a stale execution failure is a no-op, not an error");
+
+    assert!(
+        !events(&mut conn, fx.exec_id)
+            .await
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::WorkflowFailed { .. })),
+        "a stale attempt must not fail the workflow"
+    );
+    assert_eq!(row(&mut conn, fx.task_id).await, before);
+}
+
+// ---------------------------------------------------------------------------
+// Worker end to end
+// ---------------------------------------------------------------------------
+
+const E2E_ACTIVITY: &str = "claim_epoch_e2e_activity";
+
+static E2E_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static E2E_STOPPED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+type BoxFut<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>,
+>;
+
+fn e2e_workflow(ctx: &autumn_harvest::WorkflowContext, input: serde_json::Value) -> BoxFut<'_> {
+    Box::pin(async move {
+        let queue = input["queue"].as_str().unwrap_or("default").to_string();
+        ctx.execute_activity_raw(E2E_ACTIVITY, input, &queue)
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// Heartbeat until the engine reports the lost claim, then return a result
+/// that must never reach history.
+fn e2e_activity(ctx: &autumn_harvest::ActivityContext, _input: serde_json::Value) -> BoxFut<'_> {
+    Box::pin(async move {
+        E2E_STARTED.store(true, std::sync::atomic::Ordering::SeqCst);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let mut n = 0_u64;
+        let stop = loop {
+            n += 1;
+            if let Err(e) = ctx.heartbeat(serde_json::json!({"stale": n})).await {
+                break format!("heartbeat: {e}");
+            }
+            if ctx.is_cancelled() {
+                break "token cancelled".to_string();
+            }
+            if tokio::time::Instant::now() > deadline {
+                break "deadline".to_string();
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        *E2E_STOPPED.lock().expect("lock") = Some(stop);
+        Ok(serde_json::json!("from the stale attempt"))
+    })
+}
+
+fn e2e_registry() -> std::sync::Arc<autumn_harvest::worker::HandlerRegistry> {
+    use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
+    let telemetry = std::sync::Arc::new(
+        autumn_harvest::telemetry::TelemetryConfig::builder()
+            .metrics(std::sync::Arc::new(autumn_harvest::telemetry::NoOpMetrics)
+                as std::sync::Arc<dyn autumn_harvest::telemetry::MetricsRecorder>)
+            .build(),
+    );
+    let workflow = WorkflowInfo {
+        quota: None,
+        declared_activities: None,
+        declared_children: None,
+        mcp: false,
+        name: "claim_epoch_e2e_wf",
+        module: "activity_claim_epoch_tests",
+        handler: e2e_workflow,
+        execution_timeout: None,
+        chain_execution_timeout: None,
+        sla: None,
+        concurrency: None,
+        debounce: None,
+        batch: None,
+        throttle: None,
+        max_input_bytes: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        description: None,
+        input_schema: None,
+        output_schema: None,
+        error_schema: None,
+        retry_policy: None,
+    };
+    let activity = ActivityInfo {
+        name: E2E_ACTIVITY,
+        module: "activity_claim_epoch_tests",
+        default_retry_policy: None,
+        default_start_to_close: None,
+        default_heartbeat_timeout: None,
+        default_schedule_to_start: None,
+        default_schedule_to_close: None,
+        default_queue: None,
+        max_concurrent: None,
+        concurrency_key: None,
+        rate_limit_rps: None,
+        rate_limit_burst: None,
+        rate_limit_key: None,
+        rate_limit_key_expr: None,
+        circuit_breaker: None,
+        is_local: false,
+        max_input_bytes: None,
+        max_result_bytes: None,
+        requires: None,
+        handler: e2e_activity,
+    };
+    std::sync::Arc::new(
+        autumn_harvest::worker::HandlerRegistry::with_state_and_telemetry(
+            vec![workflow],
+            vec![activity],
+            autumn_harvest::context::empty_shared_state(),
+            telemetry,
+        ),
+    )
+}
+
+fn e2e_worker(
+    worker_id: &str,
+    queue: &str,
+    registry: std::sync::Arc<autumn_harvest::worker::HandlerRegistry>,
+) -> std::sync::Arc<autumn_harvest::worker::Worker> {
+    use autumn_harvest::types::ShardId;
+    std::sync::Arc::new(
+        autumn_harvest::worker::Worker::new(
+            autumn_harvest::worker::WorkerRuntimeConfig {
+                codec_rotation_batch_size: 0,
+                dr: autumn_harvest::replication::DrConfig::default(),
+                worker_id: worker_id.to_string(),
+                queues: vec![queue.to_string()],
+                notification_database_url: None,
+                max_concurrent_workflows: 2,
+                max_concurrent_activities: 2,
+                poll_interval: Duration::from_millis(25),
+                shutdown_timeout: Duration::from_secs(1),
+                cancellation_grace_period: Duration::from_secs(1),
+                sticky_timeout: Duration::from_secs(5),
+                max_local_activity_start_to_close: Duration::from_secs(60),
+                shard_assignments: vec![ShardId::new(0)],
+                worker_heartbeat_interval: Duration::from_secs(5),
+                build_id: String::new(),
+                deployment_name: None,
+                workflow_cache_size: 1000,
+                priority_aging_secs: None,
+                unknown_target_grace_window: Duration::from_secs(5),
+                poison_pill_threshold: 3,
+                capability_miss_max_redeliveries: 5,
+                workflow_task_timeout: Duration::from_secs(10),
+                workflow_panic_max_attempts: 3,
+                labels: std::collections::HashMap::new(),
+                queue_weights: std::collections::HashMap::new(),
+                max_workflow_pause_duration: Duration::from_secs(24 * 3600),
+                max_workflow_history_events: None,
+                shard_notification_database_urls: Vec::new(),
+                sharded_pool: None,
+                slot_tuner: None,
+                max_concurrent_sessions: 0,
+            },
+            registry,
+        )
+        .expect("worker builds"),
+    )
+}
+
+#[derive(QueryableByName)]
+struct ActivityTaskRow {
+    #[diesel(sql_type = diesel::sql_types::Uuid)]
+    id: Uuid,
+}
+
+/// Seed a started workflow on `queue` with one workflow task.
+async fn seed_e2e_workflow(conn: &mut AsyncPgConnection, queue: &str) -> ExecutionId {
+    let exec_id = insert_execution(conn, queue).await;
+    let input = serde_json::json!({ "queue": queue });
+    store::append_events(
+        conn,
+        exec_id,
+        &[WorkflowEvent::WorkflowStarted {
+            input: input.clone(),
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        }],
+        0,
+    )
+    .await
+    .expect("seed history");
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET workflow_name = 'claim_epoch_e2e_wf' WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(conn)
+    .await
+    .expect("name the workflow");
+    let mut params = EnqueueParams::new(queue, TaskType::Workflow, input);
+    params.workflow_exec_id = Some(exec_id.as_uuid());
+    params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    queue::enqueue(conn, &params)
+        .await
+        .expect("enqueue workflow task");
+    exec_id
+}
+
+/// Wait until the worker runs the activity, and return its task id.
+async fn wait_for_e2e_start(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    worker_id: &str,
+) -> Uuid {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let found: Option<ActivityTaskRow> = diesel::sql_query(
+            "SELECT id FROM harvest_task_queue \
+             WHERE workflow_exec_id = $1 AND task_type = 'activity' \
+               AND state = 'RUNNING' AND worker_id = $2",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .bind::<diesel::sql_types::Text, _>(worker_id)
+        .get_result(conn)
+        .await
+        .optional()
+        .expect("poll activity task");
+        if let Some(found) = found
+            && std::sync::atomic::AtomicBool::load(
+                &E2E_STARTED,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+        {
+            break found.id;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the activity must start"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The real worker stops an attempt whose claim moved, and drops its result.
+///
+/// This covers the wiring in `process_activity_task`. The flusher, the
+/// cancellation observer and the durable check get the claim. The finalize
+/// after the handler returns is fenced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn worker_stops_an_attempt_whose_claim_moved_and_drops_its_result() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let run = Uuid::new_v4();
+    // Short: the queue name becomes a `NOTIFY` channel name.
+    let queue = format!("ce-{}", &run.simple().to_string()[..12]);
+    let worker_id = format!("claim-epoch-e2e-worker-{run}");
+    let thief = format!("claim-epoch-e2e-thief-{run}");
+    live_worker(&mut conn, &thief).await;
+
+    let exec_id = seed_e2e_workflow(&mut conn, &queue).await;
+
+    let worker = e2e_worker(&worker_id, &queue, e2e_registry());
+    let pool = build_pool(&url);
+    let runner = std::sync::Arc::clone(&worker);
+    let run_pool = pool.clone();
+    let run_handle = tokio::spawn(async move { runner.run(&run_pool).await });
+
+    let task_id = wait_for_e2e_start(&mut conn, exec_id, &worker_id).await;
+
+    // Move the claim, as an orphan reclaim followed by a re-claim does.
+    diesel::sql_query(
+        "UPDATE harvest_task_queue \
+         SET worker_id = $2, attempt = attempt + 1, \
+             last_heartbeat_at = NULL, heartbeat_details = '{\"owner\": \"thief\"}'::jsonb \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .bind::<diesel::sql_types::Text, _>(&thief)
+    .execute(&mut conn)
+    .await
+    .expect("move the claim");
+    let moved = row(&mut conn, task_id).await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let stop = loop {
+        let stopped = E2E_STOPPED.lock().expect("lock").clone();
+        if let Some(stop) = stopped {
+            break stop;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the stale attempt must see its lost claim"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_ne!(
+        stop, "deadline",
+        "the stale attempt must stop on the lost claim"
+    );
+    // Give the worker time to run its finalize for the stale result.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    worker.shutdown();
+    let _ = run_handle.await;
+
+    assert!(
+        completed_outputs(&events(&mut conn, exec_id).await).is_empty(),
+        "the stale result must not reach history"
+    );
+    assert_eq!(
+        row(&mut conn, task_id).await,
+        moved,
+        "the stale attempt must leave the new claim untouched"
+    );
 }

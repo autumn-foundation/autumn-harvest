@@ -2505,7 +2505,7 @@ impl ClaimWrite {
     ///
     /// Returns [`crate::error::HarvestError::NotFound`] for
     /// [`ClaimWrite::LeaseLost`].
-    pub fn require_applied(self, task_id: Uuid) -> HarvestResult<()> {
+    pub(crate) fn require_applied(self, task_id: Uuid) -> HarvestResult<()> {
         match self {
             Self::Applied => Ok(()),
             Self::LeaseLost => Err(crate::error::HarvestError::NotFound(format!(
@@ -2516,8 +2516,9 @@ impl ClaimWrite {
 }
 
 /// The result of [`lock_claim_for_update`].
+#[must_use]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ClaimLock {
+pub(crate) enum ClaimLock {
     /// The claim is current. The row stays locked until the transaction ends.
     Held,
     /// The claim is not current. `state` is the row's state, or `None` when
@@ -2581,7 +2582,7 @@ const fn claim_write(updated: bool) -> ClaimWrite {
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] on query failure.
-pub async fn lock_claim_for_update(
+pub(crate) async fn lock_claim_for_update(
     conn: &mut AsyncPgConnection,
     claim: &TaskClaim,
 ) -> HarvestResult<ClaimLock> {
@@ -2602,20 +2603,70 @@ pub async fn lock_claim_for_update(
     })
 }
 
+/// A task row's `state` and `error`, read without a lock, and whether
+/// `claim` is current.
+///
+/// Returns `None` when the row does not exist.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub(crate) async fn task_status_for_claim(
+    conn: &mut AsyncPgConnection,
+    claim: &TaskClaim,
+) -> HarvestResult<Option<(String, Option<String>, bool)>> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    let row = dsl::harvest_task_queue
+        .find(claim.task_id)
+        .select((
+            dsl::state,
+            dsl::error,
+            claim_held(&claim.worker_id, claim.attempt),
+        ))
+        .first::<(String, Option<String>, Option<bool>)>(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+    Ok(row.map(|(state, error, held)| (state, error, held == Some(true))))
+}
+
 /// Whether `claim` is current, read without a lock.
 ///
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] on query failure.
-pub async fn claim_is_current(
+pub(crate) async fn claim_is_current(
     conn: &mut AsyncPgConnection,
     claim: &TaskClaim,
+) -> HarvestResult<bool> {
+    let status = task_status_for_claim(conn, claim).await?;
+    Ok(status.is_some_and(|(_, _, held)| held))
+}
+
+/// Whether a later claim of the same worker holds the row with the same
+/// `crash_strikes` (issue #1789).
+///
+/// Such a claim passes a guard on `(worker_id, crash_strikes)`, for example
+/// [`claim_still_held_for_update`], but it is not `claim`. The read takes no
+/// lock.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub(crate) async fn later_claim_shares_strikes(
+    conn: &mut AsyncPgConnection,
+    claim: &TaskClaim,
+    crash_strikes: i32,
 ) -> HarvestResult<bool> {
     use crate::schema::harvest_task_queue::dsl;
 
     dsl::harvest_task_queue
         .find(claim.task_id)
-        .filter(claim_held(&claim.worker_id, claim.attempt))
+        .filter(dsl::state.eq("RUNNING"))
+        .filter(dsl::worker_id.eq(claim.worker_id.as_str()))
+        .filter(dsl::crash_strikes.eq(crash_strikes))
+        .filter(dsl::attempt.ne(claim.attempt))
         .select(dsl::id)
         .first::<Uuid>(conn)
         .await
@@ -2751,8 +2802,9 @@ async fn complete_task_inner(
 /// Retry rescheduling uses [`requeue_for_retry`] instead and preserves the
 /// payload for the next attempt.
 ///
-/// This write is not fenced. Timeouts, cancellation and operator actions use
-/// it. The activity owner uses [`fail_claimed_task`] instead.
+/// This write is not fenced. The timeout sweeper in `timeout.rs`,
+/// cancellation and operator actions use it. The activity owner uses
+/// [`fail_claimed_task`] instead.
 ///
 /// # Errors
 ///
@@ -3103,8 +3155,8 @@ pub async fn oldest_pending_ages(
 /// Update the `last_heartbeat_at` timestamp and checkpoint payload of the
 /// task that `claim` holds.
 ///
-/// The write is fenced by `claim` (issue #1789). A stale owner cannot refresh
-/// or overwrite the checkpoint of a later attempt. It gets
+/// `claim` fences the write (issue #1789). A stale owner cannot refresh or
+/// overwrite the checkpoint of a later attempt. It gets
 /// [`ClaimWrite::LeaseLost`] and must stop the activity.
 ///
 /// # Errors

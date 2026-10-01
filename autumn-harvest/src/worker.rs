@@ -5375,9 +5375,34 @@ async fn lock_activity_claim(
     queue::lock_claim_for_update(conn, &claim).await
 }
 
-/// The claim of an activity row whose claim the caller already holds under
-/// [`lock_activity_claim`].
-fn held_activity_claim(task: &TaskQueueItem) -> HarvestResult<queue::TaskClaim> {
+/// Whether a later claim holds the activity row and still passes a
+/// `crash_strikes` guard for the `task` snapshot (issue #1789).
+async fn later_activity_claim_passes_guard(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+) -> HarvestResult<bool> {
+    let Some(claim) = queue::TaskClaim::of(task) else {
+        return Ok(false);
+    };
+    queue::later_claim_shares_strikes(conn, &claim, task.crash_strikes).await
+}
+
+/// Log a write that a lost claim turned into a no-op (issue #1789).
+fn log_lease_lost(task: &TaskQueueItem, write: &str) {
+    tracing::debug!(
+        task_id = %task.id,
+        worker_id = task.worker_id.as_deref().unwrap_or_default(),
+        attempt = task.attempt,
+        write,
+        "activity claim lost; the write is a no-op"
+    );
+}
+
+/// Return the claim that the `task` snapshot carries.
+///
+/// A claimed snapshot always has a `worker_id`, so a missing one is a bug and
+/// returns an error.
+fn claim_of_task(task: &TaskQueueItem) -> HarvestResult<queue::TaskClaim> {
     queue::TaskClaim::of(task).ok_or_else(|| {
         HarvestError::NotFound(format!("task queue item {} holds no claim", task.id))
     })
@@ -13018,6 +13043,16 @@ pub async fn fail_task_and_execution_with_history(
             lock_workflow_execution_row_only(conn, exec_id).await?;
         }
 
+        // Activity rows also carry a claim epoch (issue #1789). The guards
+        // below key on `crash_strikes`, and a clean release can reset it to
+        // 0. A later claim by the same worker can then pass them. That one
+        // case is a lost lease, so this failure is a no-op. Every other case
+        // keeps the guards' own outcome.
+        if task.task_type == "activity" && later_activity_claim_passes_guard(conn, task).await? {
+            log_lease_lost(task, "activity execution failure");
+            return Ok(());
+        }
+
         let (exec_id, next_event_id) = match preloaded {
             PreloadedFailureHistory::NoExecution => {
                 if !queue::claim_still_held_for_update(conn, task_id, worker_id, crash_strikes)
@@ -13066,6 +13101,16 @@ pub async fn fail_task_and_execution_with_history(
     .await
 }
 
+/// Append `ActivityCompleted` and complete the task row, under the claim
+/// that `task` carries.
+///
+/// Test seam for the activity claim-epoch fence (issue #1789). Not a stable
+/// API.
+///
+/// # Errors
+///
+/// Returns the error of the completion transaction. A lost claim is not an
+/// error.
 #[doc(hidden)]
 pub async fn finalize_activity_completion(
     conn: &mut AsyncPgConnection,
@@ -13095,6 +13140,7 @@ pub async fn finalize_activity_completion(
         // A lost lease is a no-op, not an error (issue #1789). The later
         // claim owns the outcome of this activity.
         if lock_activity_claim(conn, task).await? != queue::ClaimLock::Held {
+            log_lease_lost(task, "activity completion");
             return Ok(());
         }
         store::append_events_offloaded_with_codecs(
@@ -13106,7 +13152,7 @@ pub async fn finalize_activity_completion(
             codecs,
         )
         .await?;
-        queue::complete_claimed_task(conn, &held_activity_claim(task)?, output)
+        queue::complete_claimed_task(conn, &claim_of_task(task)?, output)
             .await?
             .require_applied(task.id)?;
         // Worker sessions (issue #606): a session member activity's
@@ -13136,6 +13182,16 @@ pub async fn finalize_activity_completion(
     crate::dispatch::settle_scope(result).await
 }
 
+/// Append `ActivityFailed` and fail the task row, under the claim that
+/// `task` carries.
+///
+/// Test seam for the activity claim-epoch fence (issue #1789). Not a stable
+/// API.
+///
+/// # Errors
+///
+/// Returns the error of the failure transaction. A lost claim is not an
+/// error.
 #[doc(hidden)]
 pub async fn finalize_activity_failure(
     conn: &mut AsyncPgConnection,
@@ -13179,6 +13235,7 @@ pub async fn finalize_activity_failure(
         }
         // A lost lease is a no-op, not an error (issue #1789).
         if let queue::ClaimLock::Lost { state } = lock_activity_claim(conn, task).await? {
+            log_lease_lost(task, "activity failure");
             // If the task reached COMPLETED before the handler returned
             // (e.g. via run_transactional) and the handler then returned
             // Err, the error is discarded — the workflow already observed
@@ -13203,7 +13260,7 @@ pub async fn finalize_activity_failure(
             codecs,
         )
         .await?;
-        queue::fail_claimed_task(conn, &held_activity_claim(task)?, &error)
+        queue::fail_claimed_task(conn, &claim_of_task(task)?, &error)
             .await?
             .require_applied(task.id)?;
         queue::wake_workflow_task(conn, exec_id).await
@@ -14087,8 +14144,11 @@ async fn create_detached_child_executions(
 /// reclaim, the row is `RUNNING` again under a later claim. A state check
 /// alone would let the stale attempt run on.
 ///
-/// Transient DB errors are retried silently; only a lost claim (a state
-/// transition, a later claim, or row deletion) resolves the future.
+/// The loop retries transient DB errors silently. Only a lost claim resolves
+/// the future: a state change, a later claim, or a deleted row.
+///
+/// Test seam for the activity claim-epoch fence (issue #1789). Not a stable
+/// API.
 #[doc(hidden)]
 pub async fn observe_task_cancellation(pool: &DbPool, claim: &queue::TaskClaim) {
     const POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -14100,7 +14160,7 @@ pub async fn observe_task_cancellation(pool: &DbPool, claim: &queue::TaskClaim) 
             continue;
         };
 
-        if let Ok(false) = queue::claim_is_current(&mut conn, claim).await {
+        if matches!(queue::claim_is_current(&mut conn, claim).await, Ok(false)) {
             return;
         }
     }
@@ -14131,7 +14191,7 @@ fn deadline_would_be_exceeded(
 /// the task terminally.
 ///
 /// Reads Postgres's own clock (issue #1389), not the host's: a fall-through
-/// here ends in [`queue::requeue_for_retry`], which stamps `scheduled_at`
+/// here ends in [`queue::requeue_claimed_task_for_retry`], which stamps `scheduled_at`
 /// from that same DB clock. A host-clock decision could pass this gate and
 /// still write a `scheduled_at` past `schedule_to_close_at`, stranding the
 /// row until a timeout scanner sweeps it. No query when the task carries no
@@ -14324,7 +14384,7 @@ async fn record_schedule_to_close_activity_timeout(
             //
             // `db_clock_now`, not the host clock (issue #1389): a
             // `DeadlineShifted` verdict here falls through to
-            // `queue::requeue_for_retry`, which stamps `scheduled_at` from
+            // `queue::requeue_claimed_task_for_retry`, which stamps `scheduled_at` from
             // Postgres's own clock. This transaction has already done other
             // work above, so a plain `NOW()` query would also be wrong here.
             // `db_clock_now` reads `clock_timestamp()` for exactly that
@@ -14350,7 +14410,7 @@ async fn record_schedule_to_close_activity_timeout(
                 codecs,
             )
             .await?;
-            queue::fail_claimed_task(conn, &held_activity_claim(task)?, &error)
+            queue::fail_claimed_task(conn, &claim_of_task(task)?, &error)
                 .await?
                 .require_applied(task.id)?;
             queue::wake_workflow_task(conn, exec_id).await?;
@@ -14468,12 +14528,14 @@ async fn handle_activity_result(
                 // transient DB errors or stale task state).
                 // A lost lease is a no-op (issue #1789). It must not count
                 // as a retry, and it must not requeue a later claim.
-                let claim = held_activity_claim(task)?;
+                let claim = claim_of_task(task)?;
                 let write =
                     queue::requeue_claimed_task_for_retry(conn, &claim, delay, &previous_error)
                         .await?;
                 if write == queue::ClaimWrite::Applied {
                     metrics.record_activity_retried(activity_name_for_cap, &task.queue_name);
+                } else {
+                    log_lease_lost(task, "activity retry requeue");
                 }
                 return Ok(());
             }
@@ -14506,7 +14568,8 @@ async fn execute_activity_future_with_cancellation(
                     task_id = %task_id,
                     activity = %activity_name,
                     grace_period_ms = %cancellation_grace_period.as_millis(),
-                    "workflow cancellation detected for running activity; awaiting cooperative unwind"
+                    "cancellation or lost lease detected for running activity; \
+                     awaiting cooperative unwind"
                 );
                 tokio::time::timeout(cancellation_grace_period, activity_future)
                     .await
@@ -14581,7 +14644,7 @@ async fn record_session_acquire_schedule_to_start_timeout(
             codecs,
         )
         .await?;
-        queue::fail_claimed_task(conn, &held_activity_claim(task)?, &error)
+        queue::fail_claimed_task(conn, &claim_of_task(task)?, &error)
             .await?
             .require_applied(task.id)?;
         queue::wake_workflow_task(conn, exec_id).await
@@ -14701,12 +14764,12 @@ async fn handle_session_acquire(
             + chrono::Duration::from_std(backoff)
                 .unwrap_or_else(|_| chrono::Duration::milliseconds(200));
         // A lost lease is a no-op (issue #1789).
-        let _ = queue::defer_claimed_rate_limited_task(
-            &mut conn,
-            &held_activity_claim(task)?,
-            scheduled_at,
-        )
-        .await?;
+        if queue::defer_claimed_rate_limited_task(&mut conn, &claim_of_task(task)?, scheduled_at)
+            .await?
+            == queue::ClaimWrite::LeaseLost
+        {
+            log_lease_lost(task, "session acquire deferral");
+        }
         return Ok(());
     }
 
@@ -14973,12 +15036,16 @@ async fn process_activity_task(
                 + chrono::Duration::from_std(refill_delay)
                     .unwrap_or_else(|_| chrono::Duration::seconds(5));
             // A lost lease is a no-op (issue #1789).
-            let _ = queue::defer_claimed_rate_limited_task(
+            if queue::defer_claimed_rate_limited_task(
                 &mut conn,
-                &held_activity_claim(task)?,
+                &claim_of_task(task)?,
                 scheduled_at,
             )
-            .await?;
+            .await?
+                == queue::ClaimWrite::LeaseLost
+            {
+                log_lease_lost(task, "rate-limit deferral");
+            }
             return Ok(());
         }
     }
@@ -15115,9 +15182,12 @@ async fn process_activity_task(
     }
 
     let cancel = CancellationToken::new();
-    let activity_claim = held_activity_claim(task)?;
-    let heartbeat_tx =
-        crate::heartbeat::spawn_heartbeat_flusher(activity_claim.clone(), pool.clone(), cancel.clone());
+    let activity_claim = claim_of_task(task)?;
+    let heartbeat_tx = crate::heartbeat::spawn_heartbeat_flusher(
+        activity_claim.clone(),
+        pool.clone(),
+        cancel.clone(),
+    );
     let trace_carrier = task
         .trace_context
         .as_ref()
@@ -15152,7 +15222,7 @@ async fn process_activity_task(
         Some(heartbeat_tx),
         task.heartbeat_details.clone(),
         cancel.clone(),
-        task.id,
+        activity_claim.clone(),
         pool.clone(),
         activity_identity,
     )
@@ -15580,11 +15650,11 @@ async fn process_activity_task(
 
     // Issue #680: a self-committed transactional activity has already sealed its
     // `ActivityCompleted` + task-COMPLETED atomically, so there is nothing left
-    // to persist. Skip the finalize/retry path entirely: `handle_activity_result`
-    // would at best no-op (the task is not RUNNING) and, on a retryable
-    // post-interceptor `Err` with retry budget, would spuriously attempt a
-    // `requeue_for_retry` that logs a NotFound against the already-COMPLETED
-    // task. An outer interceptor cannot un-commit the sealed outcome, so any
+    // to persist. Skip the finalize/retry path entirely. At best,
+    // `handle_activity_result` would no-op, because the task is not RUNNING.
+    // On a retryable post-interceptor `Err` with retry budget, it would
+    // attempt a needless retry requeue against the COMPLETED task. An outer
+    // interceptor cannot un-commit the sealed outcome, so any
     // result/error transform it applied after `next.run` is ignored; when that
     // transform turned the committed success into an `Err`, surface the misuse
     // with a single clear warning (mirroring the previous finalize-path warning).

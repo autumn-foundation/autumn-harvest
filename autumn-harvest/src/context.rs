@@ -313,7 +313,7 @@ const LOCAL_ACTIVITY_HEARTBEAT_REASON: &str =
 
 #[cfg(feature = "db")]
 struct ActivityCancellationCheck {
-    task_id: uuid::Uuid,
+    claim: crate::queue::TaskClaim,
     pool: ActivityCancellationPool,
     last_checked_at: Mutex<Option<Instant>>,
 }
@@ -14114,10 +14114,11 @@ impl ActivityContext {
         heartbeat_tx: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,
         heartbeat_details: Option<serde_json::Value>,
         cancel: tokio_util::sync::CancellationToken,
-        task_id: uuid::Uuid,
+        claim: crate::queue::TaskClaim,
         pool: ActivityCancellationPool,
         identity: ActivityIdentity,
     ) -> Self {
+        let task_id = claim.task_id;
         let heartbeat_unsupported_reason = heartbeat_tx
             .is_none()
             .then_some(NO_HEARTBEAT_FLUSHER_REASON);
@@ -14135,7 +14136,7 @@ impl ActivityContext {
             heartbeat_unsupported_reason,
             cancel,
             cancellation_check: Some(ActivityCancellationCheck {
-                task_id,
+                claim,
                 pool,
                 last_checked_at: Mutex::new(None),
             }),
@@ -15189,10 +15190,6 @@ impl ActivityContext {
 
     #[cfg(feature = "db")]
     async fn check_durable_cancellation(&self) -> crate::HarvestResult<()> {
-        use crate::schema::harvest_task_queue::dsl;
-        use diesel::{OptionalExtension, QueryDsl};
-        use diesel_async::RunQueryDsl;
-
         let Some(check) = &self.cancellation_check else {
             return Ok(());
         };
@@ -15206,30 +15203,27 @@ impl ActivityContext {
             .get()
             .await
             .map_err(crate::error::database_error)?;
-        let row = dsl::harvest_task_queue
-            .find(check.task_id)
-            .select((dsl::state, dsl::error))
-            .first::<(String, Option<String>)>(&mut conn)
-            .await
-            .optional()
-            .map_err(crate::error::database_error)?;
+        let task_id = check.claim.task_id;
+        let row = crate::queue::task_status_for_claim(&mut conn, &check.claim).await?;
 
         match row {
-            Some((state, _)) if state == "RUNNING" => Ok(()),
-            Some((_, Some(error))) if error.contains("workflow cancelled") => {
+            Some((_, _, true)) => Ok(()),
+            // A later claim holds the row (issue #1789). This attempt must
+            // stop, so its late writes do not race the live attempt.
+            Some((state, _, false)) if state == "RUNNING" => Err(HarvestError::ActivityCancelled(
+                format!("activity task {task_id} lease lost: a later claim holds it"),
+            )),
+            Some((_, Some(error), _)) if error.contains("workflow cancelled") => {
                 Err(HarvestError::ActivityCancelled(error))
             }
-            Some((state, Some(error))) => Err(HarvestError::Cancelled(format!(
-                "activity task {} is no longer running ({state}): {error}",
-                check.task_id
+            Some((state, Some(error), _)) => Err(HarvestError::Cancelled(format!(
+                "activity task {task_id} is no longer running ({state}): {error}"
             ))),
-            Some((state, None)) => Err(HarvestError::Cancelled(format!(
-                "activity task {} is no longer running ({state})",
-                check.task_id
+            Some((state, None, _)) => Err(HarvestError::Cancelled(format!(
+                "activity task {task_id} is no longer running ({state})"
             ))),
             None => Err(HarvestError::Cancelled(format!(
-                "activity task {} is no longer present",
-                check.task_id
+                "activity task {task_id} is no longer present"
             ))),
         }
     }
@@ -15423,27 +15417,24 @@ impl ActivityContext {
                 // Undecoded: this reads `next_event_id` only (see the helper's docs).
                 let history = crate::store::lock_and_load_history_undecoded(conn, exec_id).await?;
 
-                // Idempotency guard: verify that this attempt still holds the
-                // claim before we commit.  If the task is already COMPLETED
-                // (e.g. this is a crash-recovery attempt where the first
-                // transaction succeeded) we roll back the user writes so the
-                // caller sees a clean slate, matching the "exactly-once"
-                // contract.  A later claim of the same row also rolls back.
-                // Its own attempt owns the outcome (issue #1789).
+                // Idempotency guard: confirm that this attempt still holds the
+                // claim before the commit. The task can already be COMPLETED,
+                // for example after a crash-recovery attempt whose first
+                // transaction succeeded. The guard then rolls back the user
+                // writes, so the caller sees a clean slate. This matches the
+                // exactly-once contract. A later claim of the same row also
+                // rolls back, because that attempt owns the outcome (issue
+                // #1789).
                 match crate::queue::lock_claim_for_update(conn, &claim).await? {
                     crate::queue::ClaimLock::Held => {}
-                    crate::queue::ClaimLock::Lost {
-                        state: Some(other),
-                    } if other == "RUNNING" => {
+                    crate::queue::ClaimLock::Lost { state: Some(other) } if other == "RUNNING" => {
                         return Err(TxError::Harvest(HarvestError::Config(format!(
                             "transactional activity task {task_id} is held by a later \
                          claim; rolling back user writes (the lease of this attempt \
                          was lost)"
                         ))));
                     }
-                    crate::queue::ClaimLock::Lost {
-                        state: Some(other),
-                    } => {
+                    crate::queue::ClaimLock::Lost { state: Some(other) } => {
                         return Err(TxError::Harvest(HarvestError::Config(format!(
                             "transactional activity task {task_id} is in state '{other}', \
                          not RUNNING; rolling back user writes (the ActivityCompleted \
@@ -15472,16 +15463,12 @@ impl ActivityContext {
                 )
                 .await?;
 
-                // Mark the task COMPLETED.  The row lock above keeps the claim
-                // current, so a lost lease here is a bug.  Roll back.
-                if crate::queue::complete_claimed_task(conn, &claim, output).await?
-                    == crate::queue::ClaimWrite::LeaseLost
-                {
-                    return Err(TxError::Harvest(HarvestError::Config(format!(
-                        "transactional activity task {task_id} lost its claim under \
-                         the row lock; rolling back user writes"
-                    ))));
-                }
+                // Mark the task COMPLETED. The row lock above keeps the claim
+                // current, so a lost lease here is a bug, and the error rolls
+                // back.
+                crate::queue::complete_claimed_task(conn, &claim, output)
+                    .await?
+                    .require_applied(task_id)?;
 
                 // Wake the workflow so it can pick up the ActivityCompleted
                 // result on its next execution cycle.
@@ -18118,7 +18105,7 @@ mod tests {
             Some(tx),
             Some(serde_json::json!({"checkpoint": 42})),
             cancel,
-            uuid::Uuid::new_v4(),
+            crate::queue::TaskClaim::new(uuid::Uuid::new_v4(), "test-worker", 1),
             pool,
             ActivityIdentity::for_test(),
         )

@@ -13,15 +13,19 @@ every activity owner write in the same statement:
 - New fenced writes: `complete_claimed_task`, `fail_claimed_task`,
   `requeue_claimed_task_for_retry` and `defer_claimed_rate_limited_task`.
   Each returns `ClaimWrite::{Applied, LeaseLost}`.
-- `lock_claim_for_update` replaces the unfenced row-lock helpers in
-  `worker.rs` and `queue.rs`. The start fence, both finalize paths, the
-  schedule-to-close and session-acquire timeouts, and `run_transactional`
-  use it.
+- `lock_claim_for_update` replaces `worker::task_state_for_update` and
+  `queue::task_state_for_update`. The start fence, both finalize paths, the
+  in-worker schedule-to-close and session-acquire timeouts, and
+  `run_transactional` use it. `timeout::task_state_for_update` stays. The
+  broken-session reclaim in `sessions.rs` uses it, and that is not an owner
+  write.
 - `record_heartbeat` now takes a `&TaskClaim` and returns `ClaimWrite`.
   `spawn_heartbeat_flusher` now takes a `TaskClaim`. This is a breaking API
   change.
-- A lost lease appends no event and returns `Ok`. The heartbeat flusher and
-  the cancellation observer cancel the activity's token.
+- A lost lease appends no event and returns `Ok`, with a debug log. The
+  heartbeat flusher and the cancellation observer cancel the activity's
+  token. `ctx.heartbeat()` returns `ActivityCancelled` when a later claim
+  holds the row.
 
 The unfenced `complete_task`, `fail_task`, `requeue_for_retry` and
 `defer_rate_limited_task` stay for timeouts, cancellation and operator

@@ -167,21 +167,24 @@ An activity attempt owns its task row only through its claim. The claim is the p
 2. **Heartbeat.** The flusher writes `last_heartbeat_at` and `heartbeat_details` under the claim.
 3. **Orphan reclaim.** The worker's liveness row goes stale. `requeue_orphan` sets the row to `PENDING` and clears `worker_id`. It does not change `attempt`.
 4. **Re-claim.** A worker claims the row again. The new claim has a higher `attempt`.
-5. **Complete.** The owner appends the terminal event and writes the terminal row state, under its claim.
+5. **Complete.** The owner locks the execution row, then calls `lock_claim_for_update`. Only after `Held` does it append the terminal event and write the terminal row state with a fenced write.
 
-*Invariant.* At most one attempt's terminal write takes effect, and only the current claim's.
+*Invariant.* A task-row write takes effect only while its claim is current. So only the current claim writes the terminal event and the terminal row state.
 
-*Why the pair is a fencing token.* Every claim adds 1 to `attempt`. Only these writes subtract 1: the pause releases, the capability-miss release and the rate-limit deferral. Each one undoes the increment of the claim that releases itself. So after a foreign requeue, every later claim has a higher `attempt` than the stale one. The rate-limit deferral is fenced, so a stale owner cannot lower `attempt`. `worker_id` alone is not enough, because the same worker can win the row back.
+*Why the pair is a fencing token.* Every claim adds 1 to `attempt`. Only these writes subtract 1: the pause releases, the capability-miss release and the rate-limit deferral. Each one undoes the increment of the claim that releases itself. So after a foreign requeue, every later claim has a higher `attempt` than the stale one. The rate-limit deferral is fenced, so a stale owner cannot lower `attempt`. A self-release lets the next claim reuse its `(worker_id, attempt)` pair. That is safe, because each release runs before the handler and the heartbeat flusher start. `worker_id` alone is not enough, because the same worker can win the row back. `crash_strikes` is not enough either, because clean reschedules reset it to 0.
 
-*Enforcement.* `claim_held` in `queue.rs` is the one predicate: `state = 'RUNNING' AND worker_id = $w AND attempt = $a`. Every owner write adds it to its own statement:
+The capability-miss release still keys on `(worker_id, crash_strikes)`. It runs only on a worker without the handler. That worker never runs the activity, so it never issues an owner write for it.
 
-- `complete_claimed_task`, `fail_claimed_task`, `requeue_claimed_task_for_retry`, `defer_claimed_rate_limited_task` and `record_heartbeat`.
-- `lock_claim_for_update`. The start fence, both finalize paths, the schedule-to-close timeout, the session-acquire timeout and `run_transactional` take it after the execution row lock.
-- `claim_is_current`. The cancellation observer polls it.
+*Enforcement.* `claim_held` in `queue.rs` is the one predicate: `state = 'RUNNING' AND worker_id = $w AND attempt = $a`. Every owner write and claim check uses it, in its own statement:
 
-*Lease lost.* A write that matches 0 rows returns `ClaimWrite::LeaseLost`. The owner appends no event and returns `Ok`. It must not return an error, because `fail_execution_on_error` would then fail the workflow. The heartbeat flusher and the cancellation observer cancel the activity's token.
+- Writes: `complete_claimed_task`, `fail_claimed_task`, `requeue_claimed_task_for_retry`, `defer_claimed_rate_limited_task` and `record_heartbeat`.
+- `lock_claim_for_update`. The start fence, both finalize paths, the in-worker schedule-to-close and session-acquire timeouts, and `run_transactional` take it after the execution row lock.
+- `claim_is_current` and `task_status_for_claim`. The cancellation observer and `ActivityContext::check_durable_cancellation` read them.
+- `fail_task_and_execution_with_history` keeps its `claim_still_held_for_update` guard. For an activity row, it also returns `Ok` without a write when a later claim of the same worker passes that guard.
 
-*Not fenced.* `complete_task`, `fail_task`, `requeue_for_retry` and `defer_rate_limited_task` stay unfenced. Timeouts, cancellation and operator actions use them on purpose: they act on a row whatever its claim. Workflow-task writes use `claim_still_held_for_update` (issue #1184).
+*Lease lost.* A path that gets `ClaimLock::Lost` appends no event and returns `Ok`. It must not return an error, because `fail_execution_on_error` would then fail the workflow. After `Held`, a `LeaseLost` write is a bug, and `require_applied` rolls the transaction back. A fenced write outside the lock returns `LeaseLost` when it matches 0 rows. The heartbeat flusher, the cancellation observer and `check_durable_cancellation` stop the activity.
+
+*Not fenced.* `complete_task`, `fail_task`, `requeue_for_retry` and `defer_rate_limited_task` stay unfenced. The timeout sweeper in `timeout.rs`, cancellation and operator actions use them on purpose: they act on a row whatever its claim. Workflow-task writes use `claim_still_held_for_update` (issues #804 and #1184).
 
 A formal model of this protocol is tracked in issue #1819.
 
