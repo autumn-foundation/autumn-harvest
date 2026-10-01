@@ -16,6 +16,12 @@ on:
     # 45-minute timeout, so it is complete before this starts.
     - cron: "41 10 * * *"
 
+# One run at a time, so two runs cannot both open an alert issue. Queue, do
+# not cancel: a cancelled run skips the failure report step.
+concurrency:
+  group: chaos-watchdog
+  cancel-in-progress: false
+
 permissions:
   actions: read
   contents: read
@@ -41,4 +47,13 @@ jobs:
         if: failure()
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash .github/ci/chaos-watchdog.sh self-failed
+        # If checkout failed, the script is not on disk. Then open the issue
+        # directly. The title must match `failed_title` in the script.
+        run: |
+          if [ -f .github/ci/chaos-watchdog.sh ]; then
+            bash .github/ci/chaos-watchdog.sh self-failed
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" \
+              --title "Chaos watchdog: a watchdog run failed" \
+              --body "The chaos watchdog run failed before checkout: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          fi
