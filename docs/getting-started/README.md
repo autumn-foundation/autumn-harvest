@@ -62,8 +62,8 @@ Start with [Chapter 1 →](01-project-skeleton.md)
   compensation, child workflow, version gate, signal handoff, and a scheduled
   reconciliation DAG.
 - **Standalone runner.** [`examples/standalone-runner/`](../../examples/standalone-runner/)
-  shows the engine without `HarvestPlugin` — useful when embedding in a
-  non-Autumn service.
+  shows the engine on plain Axum, without `HarvestPlugin`. Its `Cargo.toml`
+  names no `autumn-web`.
 - **Embedded SQLite backend.** [`sqlite-backend.md`](../sqlite-backend.md) is a
   task-oriented guide to `autumn-harvest-sqlite`, a single-writer, no-server
   persistence backend for edge / local-first / single-server deployments (its

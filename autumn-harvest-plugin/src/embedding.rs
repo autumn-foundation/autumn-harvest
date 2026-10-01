@@ -372,6 +372,17 @@ impl OperatorInputs {
     }
 }
 
+/// The deployment profile that [`HarvestEmbedding::with_ambient_profile`]
+/// reads from the process environment.
+///
+/// Use it to make a decision before [`HarvestEmbedding::start`] on the same
+/// profile, for example to apply migrations only in `dev`. The name is
+/// normalized, so `development` gives `dev` (issue #1615).
+#[must_use]
+pub fn ambient_deployment_profile() -> Option<String> {
+    ambient_profile(&OsEnv)
+}
+
 /// The profile from `AUTUMN_ENV`, else `AUTUMN_PROFILE`, as autumn-web
 /// resolves it.
 ///

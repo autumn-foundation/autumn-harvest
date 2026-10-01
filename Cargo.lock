@@ -6136,13 +6136,24 @@ name = "standalone-runner"
 version = "0.6.0"
 dependencies = [
  "autumn-harvest",
+ "autumn-harvest-cli",
  "autumn-harvest-plugin",
- "autumn-web",
+ "axum",
+ "diesel",
+ "diesel-async",
+ "hex",
+ "hmac 0.12.1",
+ "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "testcontainers",
+ "testcontainers-modules",
  "tokio",
+ "toml 1.1.2+spec-1.1.0",
  "tower",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

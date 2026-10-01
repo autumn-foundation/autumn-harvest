@@ -330,7 +330,8 @@ fn allowlisted(key: &str) -> bool {
 struct SuiteRow {
     /// `linux` | `linuxpart` | `allos` | `compileonly`.
     osclass: String,
-    /// `autumn-harvest` | `autumn-harvest-plugin` | `autumn-harvest-redis`.
+    /// `autumn-harvest` | `autumn-harvest-plugin` | `autumn-harvest-redis` |
+    /// `standalone-runner`.
     krate: String,
     /// The `--test <target>` binary (core suites use `integration`).
     target: String,
@@ -387,6 +388,8 @@ fn parse_manifest() -> Vec<SuiteRow> {
         "autumn-harvest",
         "autumn-harvest-plugin",
         "autumn-harvest-redis",
+        // Issue #1615: the example's live-Postgres acceptance suite.
+        "standalone-runner",
     ];
     let mut out = Vec::new();
     for (n, line) in MANIFEST.lines().enumerate() {

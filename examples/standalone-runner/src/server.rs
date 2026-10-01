@@ -1,26 +1,38 @@
 use std::net::SocketAddr;
 
 use autumn_harvest_plugin::HarvestEmbedding;
+use autumn_harvest_plugin::api::{HarvestApiState, StandaloneAdminAuth};
+use autumn_harvest_plugin::embedding::ambient_deployment_profile;
 use autumn_harvest_plugin::metrics_scrape::HarvestMetricsRecorder;
 use autumn_harvest_plugin::prelude::*;
-use autumn_web::config::DatabaseConfig;
-use autumn_web::reexports::axum::{self, Json, routing::get};
+use autumn_harvest_plugin::webhook_receiver::{
+    WebhookConfig, WebhookEndpointConfig, build_webhook_router,
+};
+use axum::{Json, routing::get};
 use serde_json::json;
 
+use crate::db;
 use crate::runtime::{standalone_builder, standalone_runtime_config};
+use crate::{webhooks, workflows};
+
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+const DEFAULT_DATABASE_URL: &str = "postgres://runner:runner@localhost:5434/runner";
+const DEFAULT_ADDR: &str = "127.0.0.1:8082";
 
 /// Assemble the raw Axum app the runner listens on.
 ///
 /// It holds the runner health route and a Prometheus scrape route fed by
-/// `metrics`. It nests the `harvest` router under `/api/harvest`.
+/// `metrics`. It nests `harvest` under `/api/harvest` and merges `webhooks`
+/// at the root.
 ///
-/// Split out of [`run`] so a test can drive it with `tower::ServiceExt::oneshot`
-/// without a database (see `tests.rs`).
-///
-/// `harvest` is `Router<()>`, so the mount carries no autumn-web state (issue
-/// #1607). `/metrics` needs none either (issue #1611).
-pub fn build_router(harvest: axum::Router, metrics: HarvestMetricsRecorder) -> axum::Router {
-    axum::Router::new()
+/// Every input is a `Router<()>`, so the app carries no framework state.
+pub fn build_router(
+    harvest: axum::Router,
+    metrics: HarvestMetricsRecorder,
+    webhooks: Option<axum::Router>,
+) -> axum::Router {
+    let app = axum::Router::new()
         .route(
             "/",
             get(|| async { Json(json!({ "service": "standalone-runner" })) }),
@@ -40,27 +52,62 @@ pub fn build_router(harvest: axum::Router, metrics: HarvestMetricsRecorder) -> a
                 }
             }),
         )
-        .nest("/api/harvest", harvest)
+        .nest("/api/harvest", harvest);
+    match webhooks {
+        Some(webhooks) => app.merge(webhooks),
+        None => app,
+    }
 }
 
-/// Build a pool, start Harvest through `HarvestEmbedding`, and serve.
+/// The signed order webhook, verified with `secret`.
 ///
-/// `HarvestEmbedding` runs the whole startup sequence (issue #1613). It
-/// applies the operator's startup config. `with_ambient_profile` makes it read
-/// `AUTUMN_PROFILE`, as the README's `Run` command needs. It loads the
-/// persisted admission gates and installs the pool and the runtime.
-pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://runner:runner@localhost:5434/runner".to_owned());
-    if std::env::var("AUTUMN_PROFILE").as_deref() == Ok("dev") {
-        autumn_web::migrate::run_pending(&database_url, autumn_harvest::MIGRATIONS)?;
-    }
+/// Replay protection is off. The mapped workflow id dedupes a redelivery.
+pub fn order_webhook_router(
+    api_state: &HarvestApiState,
+    secret: &str,
+) -> Result<axum::Router, BoxError> {
+    let config = WebhookConfig {
+        endpoints: vec![
+            WebhookEndpointConfig::generic("orders", webhooks::ORDER_WEBHOOK_PATH, secret)
+                .without_replay_protection(),
+        ],
+        ..WebhookConfig::default()
+    };
+    let router = build_webhook_router(
+        &webhooks::webhooks(),
+        &workflows::workflows(),
+        &[],
+        api_state,
+        &config,
+    )?;
+    Ok(router)
+}
 
-    let pool = autumn_web::db::create_pool(&DatabaseConfig {
-        url: Some(database_url.clone()),
-        ..DatabaseConfig::default()
-    })?
-    .ok_or("DATABASE_URL must create a Postgres pool")?;
+/// Migrate in `dev`, start Harvest, and serve until Ctrl-C.
+///
+/// Each step that can fail runs before `start`. After `start`, the runtime
+/// always stops, also when the server fails.
+pub async fn run() -> Result<(), BoxError> {
+    let database_url =
+        std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_DATABASE_URL.to_owned());
+    let address: SocketAddr = std::env::var("STANDALONE_RUNNER_ADDR")
+        .unwrap_or_else(|_| DEFAULT_ADDR.to_owned())
+        .parse()?;
+
+    // `with_ambient_profile` below reads the same profile.
+    if ambient_deployment_profile().as_deref() == Some("dev") {
+        let report = db::run_pending_migrations(&database_url).await?;
+        tracing::info!(applied = report.applied.len(), "applied Harvest migrations");
+    }
+    let pool = db::create_pool(&database_url)?;
+
+    // The webhook router and the runtime share this state.
+    let api_state = HarvestApiState::new();
+    let webhooks = std::env::var("STANDALONE_RUNNER_WEBHOOK_SECRET")
+        .ok()
+        .map(|secret| order_webhook_router(&api_state, &secret))
+        .transpose()?;
+    let listener = tokio::net::TcpListener::bind(address).await?;
 
     let metrics = HarvestMetricsRecorder::new();
     let harvest = HarvestEmbedding::new(
@@ -68,21 +115,20 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         standalone_runtime_config(database_url),
         HarvestRunnerResources::new(pool),
     )
+    .with_api_state(api_state)
+    .with_admin_auth(StandaloneAdminAuth::new().with_api_tokens())
     .with_ambient_profile()
     .start()
     .await
     .map_err(|error| format!("failed to start Harvest: {error}"))?;
 
-    let app = build_router(harvest.router(), metrics);
-    let address = SocketAddr::from(([127, 0, 0, 1], 8082));
+    let app = build_router(harvest.router(), metrics, webhooks);
     tracing::info!(%address, "standalone Harvest runner listening");
-    let listener = tokio::net::TcpListener::bind(address).await?;
-    axum::serve(listener, app)
+    let served = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
-        .await?;
-
+        .await;
     harvest.stop().await;
-    Ok(())
+    Ok(served?)
 }
 
 async fn shutdown_signal() {

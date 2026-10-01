@@ -70,8 +70,9 @@ Need a real reference instead of the tiny hello-world path? See:
 - [`examples/billing-autumn-web/`](examples/billing-autumn-web/) for a full Autumn web billing
   integration with app routes, workflow outbox publication, `HarvestPlugin`, saga compensation,
   child workflows, version gates, signals, timers, deterministic side effects, and scheduled DAGs.
-- [`examples/standalone-runner/`](examples/standalone-runner/) for the out-of-the-box runner path:
-  no Autumn plugin, just `HarvestRunner` plus a manually mounted management API router.
+- [`examples/standalone-runner/`](examples/standalone-runner/) for Harvest on plain Axum. Its
+  `Cargo.toml` names no `autumn-web`. It shows the pool, migrations, management API, Vantage,
+  API tokens, metrics and webhooks.
 - [`examples/claude-agent-daemon/`](examples/claude-agent-daemon/) for a local daemon that runs
   Claude agent sessions as durable workflows on the embedded SQLite backend — no Postgres, no
   Docker. Each model call and tool call is an activity, a workspace write parks on an
@@ -328,7 +329,8 @@ no framework dependency of its own. To expose the management API (and, for
 the Vantage UI, `harvest_ui_router`) from a Rust service on plain Axum
 instead of autumn-web, mount `autumn-harvest-plugin`'s `harvest_api_router`
 yourself — [`examples/standalone-runner`](examples/standalone-runner/)
-demonstrates the management-API mount. Both routers return
+demonstrates the management-API mount with no `autumn-web` entry in its
+`Cargo.toml`. Both routers return
 `axum::Router<()>`, so this path is for Axum services, not an arbitrary
 framework.
 

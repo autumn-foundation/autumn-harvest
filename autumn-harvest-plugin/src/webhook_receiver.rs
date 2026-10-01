@@ -62,12 +62,18 @@ use autumn_harvest::webhook_trigger::{
     WebhookCtx, WebhookHandlerError, WebhookTarget, WebhookTriggerInfo, validate_webhook_triggers,
 };
 use autumn_web::reexports::axum;
-use autumn_web::webhook::{SignedWebhook, WebhookConfig, WebhookConfigError, WebhookRegistry};
+use autumn_web::webhook::{SignedWebhook, WebhookRegistry};
 use autumn_web::{AppState, Route};
 use axum::response::IntoResponse as _;
 use axum::{Extension, Json};
 
 use crate::api::{HarvestApiState, SignalWithStartRequest, StartWorkflowRequest};
+
+/// The configuration types that [`build_webhook_router`] takes.
+///
+/// The re-export lets an embedder configure a receiver with no `autumn-web`
+/// entry in its own manifest (issue #1615).
+pub use autumn_web::webhook::{WebhookConfig, WebhookConfigError, WebhookEndpointConfig};
 
 /// Build the app-level routes for a set of registered webhook triggers.
 ///

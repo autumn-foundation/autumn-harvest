@@ -973,9 +973,13 @@ jobs:
       - name: Run billing-autumn-web example tests
         if: needs.changes.outputs.code == 'true' && matrix.shard == 1
         run: cargo test -p billing-autumn-web
+      # Issue #1615. `--bins` runs the unit tests, including the guards that
+      # fail when the manifest or the source names autumn-web. The
+      # `acceptance` suite needs Postgres, so it runs from the manifest on
+      # `test-db-linux`.
       - name: Run standalone-runner example tests
         if: needs.changes.outputs.code == 'true' && matrix.shard == 2
-        run: cargo test -p standalone-runner
+        run: cargo test -p standalone-runner --bins
       - name: Run business_metrics example tests (issue #758)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 0
         run: cargo test -p autumn-harvest --no-default-features --features testing --example business_metrics
