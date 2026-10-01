@@ -10,9 +10,11 @@ not take it. The timeout then failed the task and fed the circuit breaker.
   permits first. With no free permit, it does not claim. With one kind free, it
   claims that kind only. With both free, it uses the unchanged claim statement.
   The opt-in Redis dispatch path already had this gate (issue #1312).
-- **Reservation.** The gate takes a `DispatchReservation` before the claim, as
-  the Redis path does. The spawned task drops it when it holds its permit. The
-  next poll therefore cannot count the same free permit twice.
+- **Held permit.** The gate takes one real permit of each admitted kind with
+  `try_acquire_owned` before the claim (`PollPermits`). The claimed row's
+  permit moves into the spawned task. Nothing else can take a held permit, so
+  a slot tuner shrink cannot leave a claimed row waiting while its timeout
+  runs. The read still honors the Redis path's `DispatchReservation`s.
 - **Kind-filtered claim query.** `queue::claim_task_query_for_kind` splices one
   literal `task_type` predicate into the `candidate` CTE. It composes with the
   DR fence. No bind numbers change. `queue::claim_task_of_kind_on_shard` runs
@@ -39,4 +41,5 @@ No migration. No new `WorkflowEvent` variant. `harvest_events` is not touched.
 Tests: `poll_capacity_gate_tests` (DB) covers AC1, AC2 and AC3, the
 kind-filtered statement, and the wake-up latency. AC1, AC2 and the wake-up test
 failed before their fix and pass after it. Unit tests pin `poll_admission`,
-`PollReservations`, `CapacityPermit` and the kind-filtered query splice.
+`PollPermits` (including a tuner shrink against a held permit),
+`CapacityPermit` and the kind-filtered query splice.

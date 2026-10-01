@@ -25362,13 +25362,11 @@ pub struct Worker {
     /// Longest dispatch wait for the activity semaphore (issue #548). See
     /// `workflow_permit_wait_micros`.
     activity_permit_wait_micros: Option<Arc<AtomicU64>>,
-    /// Workflow tasks claimed through the channel or the poll path that do
-    /// not hold their permit yet (issues #1312, #1787). See
-    /// [`DispatchReservation`].
+    /// Workflow tasks claimed through the dispatch channel that do not hold
+    /// their permit yet (issue #1312). See [`DispatchReservation`].
     dispatch_reserved_workflow: Arc<AtomicUsize>,
-    /// Activity tasks claimed through the channel or the poll path that do
-    /// not hold their permit yet (issues #1312, #1787). See
-    /// [`DispatchReservation`].
+    /// Activity tasks claimed through the dispatch channel that do not hold
+    /// their permit yet (issue #1312). See [`DispatchReservation`].
     dispatch_reserved_activity: Arc<AtomicUsize>,
     /// Wakes a saturated poll loop when a task releases its permit (issue
     /// #1787). See [`CapacityPermit`].
@@ -26539,8 +26537,8 @@ impl DispatchLoopState {
 ///
 /// The guard is created before the claim. It moves into the spawned task, which
 /// drops it as soon as it holds the permit. A claim that fails drops it at once.
-/// The Postgres poll path uses the same guard (issue #1787). See
-/// [`PollReservations`].
+/// The Postgres poll path holds a real permit instead (issue #1787). See
+/// [`PollPermits`].
 #[derive(Debug)]
 struct DispatchReservation(Arc<AtomicUsize>);
 
@@ -26606,36 +26604,55 @@ const fn poll_admission(free_workflow: usize, free_activity: usize) -> PollAdmis
     }
 }
 
-/// The reservations one Postgres poll holds across its claim (issue #1787).
+/// The permits one Postgres poll holds across its claim (issue #1787).
 ///
-/// The poll reserves each kind it may claim. The claimed row's reservation
-/// moves into the spawned task. The other reservation drops with this value.
+/// The poll takes one real permit of each kind it may claim, before the
+/// claim. Nothing else can take a held permit. A slot tuner shrink therefore
+/// cannot leave a claimed row without a permit while its timeout runs. The
+/// claimed row's permit moves into the spawned task. The other permit goes
+/// back when this value drops.
 #[derive(Debug)]
-struct PollReservations {
-    workflow: Option<DispatchReservation>,
-    activity: Option<DispatchReservation>,
+struct PollPermits {
+    workflow: Option<tokio::sync::OwnedSemaphorePermit>,
+    activity: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
-impl PollReservations {
-    /// Reserve `kind`, or both kinds when `kind` is `None`.
-    fn new(
-        kind: Option<crate::queue::TaskType>,
-        workflow: &Arc<AtomicUsize>,
-        activity: &Arc<AtomicUsize>,
+impl PollPermits {
+    /// Take one free permit of each kind that `admission` allows.
+    fn acquire(
+        admission: PollAdmission,
+        workflow: &Arc<Semaphore>,
+        activity: &Arc<Semaphore>,
     ) -> Self {
         use crate::queue::TaskType;
-        let reserve = |want: TaskType, counter: &Arc<AtomicUsize>| {
-            kind.is_none_or(|kind| kind == want)
-                .then(|| DispatchReservation::new(counter))
+        let take = |kind: TaskType, semaphore: &Arc<Semaphore>| {
+            let admitted = match admission {
+                PollAdmission::Saturated => false,
+                PollAdmission::Any => true,
+                PollAdmission::Only(only) => only == kind,
+            };
+            if admitted {
+                Arc::clone(semaphore).try_acquire_owned().ok()
+            } else {
+                None
+            }
         };
         Self {
-            workflow: reserve(TaskType::Workflow, workflow),
-            activity: reserve(TaskType::Activity, activity),
+            workflow: take(TaskType::Workflow, workflow),
+            activity: take(TaskType::Activity, activity),
         }
     }
 
-    /// Take the reservation for the `task_type` of a claimed row.
-    fn take(&mut self, task_type: &str) -> Option<DispatchReservation> {
+    /// What the held permits allow this poll to claim.
+    fn admission(&self) -> PollAdmission {
+        poll_admission(
+            usize::from(self.workflow.is_some()),
+            usize::from(self.activity.is_some()),
+        )
+    }
+
+    /// Take the permit for the `task_type` of a claimed row.
+    fn take(&mut self, task_type: &str) -> Option<tokio::sync::OwnedSemaphorePermit> {
         use crate::queue::TaskType;
         if task_type == TaskType::Workflow.as_str() {
             self.workflow.take()
@@ -26653,13 +26670,13 @@ impl PollReservations {
 /// `Drop` returns the permit first and then notifies. A loop woken before the
 /// return would read the pool as full and wait again. `notify_one` stores one
 /// wake-up when no loop waits, so a release during a claim is not lost.
-struct CapacityPermit<'a> {
-    permit: Option<tokio::sync::SemaphorePermit<'a>>,
+struct CapacityPermit {
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
     freed: Arc<tokio::sync::Notify>,
 }
 
-impl<'a> CapacityPermit<'a> {
-    fn new(permit: tokio::sync::SemaphorePermit<'a>, freed: &Arc<tokio::sync::Notify>) -> Self {
+impl CapacityPermit {
+    fn new(permit: tokio::sync::OwnedSemaphorePermit, freed: &Arc<tokio::sync::Notify>) -> Self {
         Self {
             permit: Some(permit),
             freed: Arc::clone(freed),
@@ -26667,7 +26684,7 @@ impl<'a> CapacityPermit<'a> {
     }
 }
 
-impl Drop for CapacityPermit<'_> {
+impl Drop for CapacityPermit {
     fn drop(&mut self) {
         drop(self.permit.take());
         self.freed.notify_one();
@@ -29442,7 +29459,7 @@ impl Worker {
                     queue = %task.queue_name,
                     "claimed task (dispatch)"
                 );
-                self.dispatch_task(task, pool, reservation);
+                self.dispatch_task(task, pool, reservation, None);
                 ReferenceDisposition::Dispatched(lease)
             }
             Ok(None) => {
@@ -30281,7 +30298,10 @@ impl Worker {
     /// `pool.get().await`) and `Some(poll_interval)` when one loop drains
     /// several shards in sequence, so an exhausted pool on one shard cannot
     /// park the loop and strand its peers -- see `shard_acquire_bound`.
-    #[allow(clippy::too_many_lines)]
+    // significant_drop_tightening: `permits` holds `OwnedSemaphorePermit`s
+    // across the claim on purpose (issue #1787). An earlier drop would let a
+    // slot tuner shrink take the permit of a row this poll then claims.
+    #[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
     async fn poll_once(
         &self,
         pool: &DbPool,
@@ -30289,21 +30309,21 @@ impl Worker {
         shard: Option<crate::types::ShardId>,
     ) -> bool {
         // Claim only against a free local permit (issue #1787). See
-        // [`poll_admission`]. A saturated poll takes no connection.
-        let admission = self.poll_admission_now();
+        // [`poll_admission`]. The read honors dispatch-channel reservations.
+        // The poll then holds a real permit of each admitted kind across the
+        // claim. See [`PollPermits`]. A saturated poll takes no connection.
+        let mut permits = PollPermits::acquire(
+            self.poll_admission_now(),
+            &self.workflow_semaphore,
+            &self.activity_semaphore,
+        );
+        let admission = permits.admission();
         self.record_gate_refusal(admission);
         let kind = match admission {
             PollAdmission::Saturated => return false,
             PollAdmission::Any => None,
             PollAdmission::Only(kind) => Some(kind),
         };
-        // Reserved before the claim, as on the dispatch-channel path. See
-        // [`DispatchReservation`].
-        let mut reservations = PollReservations::new(
-            kind,
-            &self.dispatch_reserved_workflow,
-            &self.dispatch_reserved_activity,
-        );
 
         let mut conn = match acquire_shard_conn(pool, acquire_bound).await {
             Ok(conn) => conn,
@@ -30371,8 +30391,8 @@ impl Worker {
                             queue = %task.queue_name,
                             "claimed task (weighted)"
                         );
-                        let reservation = reservations.take(&task.task_type);
-                        self.dispatch_task(task, pool, reservation);
+                        let permit = permits.take(&task.task_type);
+                        self.dispatch_task(task, pool, None, permit);
                         return true;
                     }
                     Ok(None) => {
@@ -30420,8 +30440,8 @@ impl Worker {
                 // recorded here. The sample runs from task eligibility. It
                 // includes the `PENDING` wait behind a saturated worker (issue
                 // #1787) and the short permit wait after the claim.
-                let reservation = reservations.take(&task.task_type);
-                self.dispatch_task(task, pool, reservation);
+                let permit = permits.take(&task.task_type);
+                self.dispatch_task(task, pool, None, permit);
                 true
             }
             Ok(None) => {
@@ -30436,12 +30456,16 @@ impl Worker {
     }
 
     /// Spawn a bounded Tokio task for the claimed work item.
+    ///
+    /// `held_permit` is the pool permit the poll gate took before the claim
+    /// (issue #1787). Without it, the task acquires a permit on spawn.
     #[allow(clippy::too_many_lines)]
     fn dispatch_task(
         &self,
         task: TaskQueueItem,
         pool: &DbPool,
         reservation: Option<DispatchReservation>,
+        held_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     ) {
         // Debug-only tripwire (issue #548 review): dispatch must never race
         // ahead of `spawn_monitoring_tasks`, which withholds a tuned
@@ -30582,13 +30606,21 @@ impl Worker {
         // body at the same nesting, so this change adds no reindentation to
         // the hottest file in the repo.
         let task_body = async move {
-            // Acquire semaphore permit — blocks if at concurrency limit.
-            let Ok(permit) = semaphore.acquire().await else {
-                tracing::error!(task_id = %task_id, "semaphore closed");
-                return;
-            };
+            // Acquire semaphore permit — blocks if at concurrency limit. A
+            // poll-path claim already holds one (issue #1787).
             // The release wakes a saturated poll loop (issue #1787).
-            let permit = CapacityPermit::new(permit, &capacity_freed);
+            let permit = CapacityPermit::new(
+                if let Some(permit) = held_permit {
+                    permit
+                } else {
+                    let Ok(permit) = Arc::clone(&semaphore).acquire_owned().await else {
+                        tracing::error!(task_id = %task_id, "semaphore closed");
+                        return;
+                    };
+                    permit
+                },
+                &capacity_freed,
+            );
             // The permit is held, so the reference no longer needs a
             // reservation against it (issue #1312). The early return above
             // drops it too, so a closed semaphore cannot leak one.
@@ -43063,40 +43095,91 @@ mod tests {
         assert_eq!(poll_admission(3, 5), PollAdmission::Any);
     }
 
-    /// A poll reserves each kind it may claim. The claimed kind keeps its
-    /// reservation. The other kind releases its reservation at once.
+    /// A poll holds one real permit of each kind it may claim. The claimed
+    /// kind keeps its permit. The other permit goes back at once.
+    #[allow(clippy::significant_drop_tightening)]
     #[test]
-    fn a_poll_keeps_only_the_reservation_of_the_kind_it_claimed() {
+    fn a_poll_keeps_only_the_permit_of_the_kind_it_claimed() {
         use crate::queue::TaskType;
-        let workflow = Arc::new(AtomicUsize::new(0));
-        let activity = Arc::new(AtomicUsize::new(0));
-        let mut reservations = PollReservations::new(None, &workflow, &activity);
-        assert_eq!(AtomicUsize::load(&workflow, Ordering::Relaxed), 1);
-        assert_eq!(AtomicUsize::load(&activity, Ordering::Relaxed), 1);
-        let kept = reservations.take(TaskType::Activity.as_str());
-        drop(reservations);
-        assert_eq!(AtomicUsize::load(&workflow, Ordering::Relaxed), 0);
-        assert_eq!(AtomicUsize::load(&activity, Ordering::Relaxed), 1);
+        let workflow = Arc::new(Semaphore::new(1));
+        let activity = Arc::new(Semaphore::new(1));
+        let mut permits = PollPermits::acquire(PollAdmission::Any, &workflow, &activity);
+        assert_eq!(permits.admission(), PollAdmission::Any);
+        assert_eq!(workflow.available_permits(), 0);
+        assert_eq!(activity.available_permits(), 0);
+        let kept = permits.take(TaskType::Activity.as_str());
+        drop(permits);
+        assert_eq!(workflow.available_permits(), 1);
+        assert_eq!(activity.available_permits(), 0);
         drop(kept);
-        assert_eq!(AtomicUsize::load(&activity, Ordering::Relaxed), 0);
+        assert_eq!(activity.available_permits(), 1);
 
-        let only = PollReservations::new(Some(TaskType::Workflow), &workflow, &activity);
-        assert_eq!(AtomicUsize::load(&workflow, Ordering::Relaxed), 1);
-        assert_eq!(
-            AtomicUsize::load(&activity, Ordering::Relaxed),
-            0,
-            "a kind the poll cannot claim is not reserved"
+        let only = PollPermits::acquire(
+            PollAdmission::Only(TaskType::Workflow),
+            &workflow,
+            &activity,
         );
-        drop(only);
-        assert_eq!(AtomicUsize::load(&workflow, Ordering::Relaxed), 0);
+        assert_eq!(only.admission(), PollAdmission::Only(TaskType::Workflow));
+        assert_eq!(
+            activity.available_permits(),
+            1,
+            "a kind the poll cannot claim keeps its permit free"
+        );
+    }
+
+    /// A permit taken between the read and the poll lowers the admission.
+    #[allow(clippy::significant_drop_tightening)]
+    #[test]
+    fn a_poll_admits_only_the_permits_it_holds() {
+        use crate::queue::TaskType;
+        let workflow = Arc::new(Semaphore::new(1));
+        let activity = Arc::new(Semaphore::new(0));
+        let permits = PollPermits::acquire(PollAdmission::Any, &workflow, &activity);
+        assert_eq!(permits.admission(), PollAdmission::Only(TaskType::Workflow));
+        let none = PollPermits::acquire(PollAdmission::Any, &workflow, &activity);
+        assert_eq!(none.admission(), PollAdmission::Saturated);
+    }
+
+    /// A slot tuner shrink cannot take the permit a poll holds for its claim
+    /// (issue #1787 review). The claim stamps `started_at`. A stolen permit
+    /// would start the timeout clock of a task that cannot run.
+    #[allow(clippy::significant_drop_tightening)]
+    #[tokio::test]
+    async fn a_tuner_shrink_cannot_take_the_permit_a_poll_holds() {
+        use crate::queue::TaskType;
+        use crate::slot_tuner::TunedSlotRuntime;
+        let workflow = Arc::new(Semaphore::new(2));
+        let activity = Arc::new(Semaphore::new(2));
+        let mut tuner = TunedSlotRuntime::new(Arc::clone(&activity), 2, 1, 2);
+        let _running = Arc::clone(&activity)
+            .acquire_owned()
+            .await
+            .expect("in-flight task");
+        let mut permits = PollPermits::acquire(PollAdmission::Any, &workflow, &activity);
+        assert_eq!(permits.admission(), PollAdmission::Any);
+
+        // A pool-pressure tick shrinks the activity target to 1.
+        tuner.resize_toward(1).await;
+
+        assert!(
+            permits.take(TaskType::Activity.as_str()).is_some(),
+            "the claimed activity keeps the permit it was admitted on"
+        );
     }
 
     /// A released permit wakes a saturated poll loop (issue #1787).
+    #[allow(clippy::significant_drop_tightening)]
     #[tokio::test]
     async fn a_released_permit_wakes_the_poll_loop() {
-        let semaphore = tokio::sync::Semaphore::new(1);
+        let semaphore = Arc::new(Semaphore::new(1));
         let freed = Arc::new(tokio::sync::Notify::new());
-        let permit = CapacityPermit::new(semaphore.acquire().await.expect("permit"), &freed);
+        let permit = CapacityPermit::new(
+            Arc::clone(&semaphore)
+                .acquire_owned()
+                .await
+                .expect("permit"),
+            &freed,
+        );
         assert_eq!(semaphore.available_permits(), 0);
         let waiter = {
             let freed = Arc::clone(&freed);

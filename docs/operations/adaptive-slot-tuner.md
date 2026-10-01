@@ -130,7 +130,8 @@ When a tuner is configured, a dispatch semaphore is created with
 
 **Fair-queue fallback for a busy worker.** `dispatch_task` spawns every
 claimed task as a queueing `semaphore.acquire()`. Claiming reads free
-permits, so withheld permits throttle it (issue #1787). A task in the short
+permits, so withheld permits throttle it (issue #1787). The poll path holds
+its permit before it claims. On the dispatch-channel path, a task in the short
 window between its claim and its permit can still queue on the semaphore.
 `tokio::sync::Semaphore` always assigns a released permit
 directly to the oldest queued waiter before it is ever visible to a
@@ -168,8 +169,8 @@ pressure. In practice the window is narrow (bounded by how many tasks were
 claimed beyond the current live target at the moment of shutdown) and every
 started task still completes normally — this does not corrupt state, only
 temporarily exceeds the tuned band during shutdown. Since issue #1787, a
-worker claims only against a free permit. Only a task in the short window
-between its claim and its permit can wait here. A future fix would have
+worker claims only against a free permit. Only a dispatch-channel task in the
+short window between its claim and its permit can wait here. A future fix would have
 `drain_in_flight` wait for the tuner's live target directly instead of the
 full `max_slots`, removing the need to force-release withheld permits at
 all; tracked as follow-up work under issue #548.
