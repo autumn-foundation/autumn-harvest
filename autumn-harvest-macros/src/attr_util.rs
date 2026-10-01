@@ -178,7 +178,8 @@ pub fn param_idents<'a>(params: &'a [&syn::FnArg]) -> Vec<&'a syn::Ident> {
 ///
 /// Zero parameters take no input. One parameter decodes the whole `args_ident`
 /// value. Many parameters decode a JSON array by position. The array binds to
-/// `__args`, so a handler parameter named `args` cannot shadow it.
+/// `__args`. The builder adds leading underscores until no handler parameter
+/// has that name, so a parameter cannot shadow the binding.
 ///
 /// The caller supplies the call shape. `ctx_expr` is the context argument.
 /// `await_tokens` is empty or `.await`. `encode_err` is the closure that maps
@@ -210,10 +211,15 @@ pub fn build_handler_dispatch(
         },
         names => {
             let indices = (0..names.len()).map(syn::Index::from);
+            let mut binding = String::from("__args");
+            while names.iter().any(|n| *n == &binding) {
+                binding.insert(0, '_');
+            }
+            let binding = syn::Ident::new(&binding, proc_macro2::Span::call_site());
             quote! {
-                let __args: ::autumn_harvest::serde_json::Value = #args_ident;
+                let #binding: ::autumn_harvest::serde_json::Value = #args_ident;
                 #(
-                    let #names = ::autumn_harvest::serde_json::from_value(__args[#indices].clone())
+                    let #names = ::autumn_harvest::serde_json::from_value(#binding[#indices].clone())
                         .map_err(|e| e.to_string())?;
                 )*
                 let result = #fn_name(#ctx_expr, #(#names),*) #await_tokens;
@@ -352,6 +358,14 @@ mod build_handler_dispatch_tests {
     }
 
     /// The index must advance for every parameter, not repeat or skip.
+    /// A parameter named `__args` moves the binding to `___args`.
+    #[test]
+    fn many_params_survive_a_parameter_named_dunder_args() {
+        let out = dispatch(&["__args", "b"], &quote! { ctx }, &quote! {});
+        assert!(out.starts_with("let ___args :"), "{out}");
+        assert!(out.contains("(___args [1] . clone ())"), "{out}");
+    }
+
     #[test]
     fn three_params_use_indices_zero_to_two() {
         let out = dispatch(&["a", "b", "c"], &quote! { ctx }, &quote! {});
