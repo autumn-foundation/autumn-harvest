@@ -6006,6 +6006,24 @@ async fn acquire_shard_conn(
 /// or `start_to_close` timeout, as before.
 const FINALIZE_ACQUIRE_ATTEMPTS: u32 = 10;
 
+/// Release the dispatch `token`, then return `error` unchanged.
+///
+/// Use it on each setup error after `on_dispatch` admitted the attempt and
+/// before the handler runs. A half-open probe that is not released keeps
+/// `probe_in_flight` set, so every later dispatch short-circuits. A token in
+/// the closed state makes this a no-op.
+fn release_probe_on_error(
+    circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry,
+    activity_name: &str,
+    token: Option<crate::circuit_breaker::DispatchToken>,
+    error: HarvestError,
+) -> HarvestError {
+    if let Some(token) = token {
+        circuit_breakers.on_cancelled(activity_name, token, std::time::Instant::now());
+    }
+    error
+}
+
 /// How many times to run an activity result write that a session timeout
 /// cancels (issue #1788).
 ///
@@ -14915,8 +14933,17 @@ async fn process_activity_task(
         && activity.circuit_breaker.is_some()
         && let Some(key) = task.rate_limit_key.as_deref()
     {
-        let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
-        if !queue::try_consume_rate_limit_token(&mut conn, key).await? {
+        let mut conn = crate::pool::acquire_within_pool_bound(pool)
+            .await
+            .map_err(|e| {
+                release_probe_on_error(&circuit_breakers, activity_name, circuit_token, e)
+            })?;
+        if !queue::try_consume_rate_limit_token(&mut conn, key)
+            .await
+            .map_err(|e| {
+                release_probe_on_error(&circuit_breakers, activity_name, circuit_token, e)
+            })?
+        {
             // No token available (bucket empty, or fail-closed when the bucket
             // row is missing): defer this real call instead of running it.
             //
@@ -14959,7 +14986,11 @@ async fn process_activity_task(
     // a deferred task never records a start it did not run; serves both the
     // short-circuit path (start + CircuitOpen failure) and the real-call path.
     let started = {
-        let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
+        let mut conn = crate::pool::acquire_within_pool_bound(pool)
+            .await
+            .map_err(|e| {
+                release_probe_on_error(&circuit_breakers, activity_name, circuit_token, e)
+            })?;
         let started_result = append_activity_started_if_pending(
             &mut conn,
             task,
@@ -14976,7 +15007,8 @@ async fn process_activity_task(
             started_result,
             registry.payload_codecs(),
         )
-        .await?
+        .await
+        .map_err(|e| release_probe_on_error(&circuit_breakers, activity_name, circuit_token, e))?
         else {
             // The activity will not run: it already has a terminal event, or the
             // task row stopped being RUNNING (cancelled / timed out concurrently).
@@ -34385,6 +34417,46 @@ mod tests {
         assert!(!releases_claim_after_error("activity", &other));
         assert!(releases_claim_after_error("workflow", &timeout));
         assert!(releases_claim_after_error("workflow", &other));
+    }
+
+    /// A setup error after `on_dispatch` admitted the half-open probe must
+    /// release the probe. Otherwise every later dispatch short-circuits and
+    /// the breaker never recovers (issue #1788).
+    #[test]
+    fn a_setup_error_releases_the_half_open_probe() {
+        use crate::circuit_breaker::{AttemptOutcome, CircuitBreakerRegistry, DispatchDecision};
+        use crate::policy::CircuitBreakerPolicy;
+        let mut policies = HashMap::new();
+        policies.insert(
+            "send_email".to_owned(),
+            CircuitBreakerPolicy::new(3, Duration::from_secs(30), Duration::from_secs(60)),
+        );
+        let reg = CircuitBreakerRegistry::new(policies);
+        let allow = |now| match reg.on_dispatch("send_email", now) {
+            DispatchDecision::Allow { token } => token,
+            DispatchDecision::ShortCircuit { .. } => panic!("expected Allow"),
+        };
+        let t0 = std::time::Instant::now();
+        for _ in 0..3 {
+            let token = allow(t0);
+            reg.on_result("send_email", AttemptOutcome::RetryableFailure, token, t0);
+        }
+        let probe_time = t0 + Duration::from_secs(61);
+        let probe = allow(probe_time);
+        assert!(probe.is_probe());
+
+        let error = release_probe_on_error(
+            &reg,
+            "send_email",
+            Some(probe),
+            HarvestError::PoolAcquireTimeout {
+                waited: Duration::from_secs(30),
+            },
+        );
+        assert!(error.is_pool_acquire_timeout(), "the error passes through");
+
+        let next = allow(probe_time + Duration::from_secs(61));
+        assert!(next.is_probe(), "a released probe lets a fresh probe in");
     }
 
     /// An offloaded result uploads a blob on each try. A repeat would leave
