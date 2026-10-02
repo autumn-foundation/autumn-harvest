@@ -421,5 +421,5 @@ async fn one_shard_down_is_partial_not_500() {
         "the down shard is named in the report"
     );
     assert_eq!(unavailable[0]["shard_id"], 1);
-    assert!(!unavailable[0]["reason"].as_str().unwrap().is_empty());
+    assert_ne!(unavailable[0]["reason"].as_str().unwrap(), "");
 }

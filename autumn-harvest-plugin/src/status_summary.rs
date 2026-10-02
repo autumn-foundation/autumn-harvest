@@ -1076,7 +1076,7 @@ mod tests {
         // No workers, no queued work ⇒ genuinely idle fresh install ⇒ healthy.
         let (status, codes) = classify_workers(0, 0, 0, 0, 0, &thresholds());
         assert_eq!(status, SubsystemStatus::Healthy);
-        assert!(codes.is_empty());
+        assert_eq!(codes, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -1113,7 +1113,7 @@ mod tests {
             "an all-Stopped fleet with no backlog must not read critical"
         );
         assert!(!codes.contains(&"worker_no_active".to_string()));
-        assert!(codes.is_empty());
+        assert_eq!(codes, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -1145,7 +1145,7 @@ mod tests {
     fn classify_workers_all_healthy() {
         let (status, codes) = classify_workers(5, 5, 0, 5, 0, &thresholds());
         assert_eq!(status, SubsystemStatus::Healthy);
-        assert!(codes.is_empty());
+        assert_eq!(codes, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -1160,7 +1160,7 @@ mod tests {
             SubsystemStatus::Healthy,
             "a scaled-down fleet of stale Stopped workers must not read critical"
         );
-        assert!(codes.is_empty());
+        assert_eq!(codes, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -1186,7 +1186,7 @@ mod tests {
         // healthy — no work is waiting for a claimant.
         let (status, codes) = classify_workers(0, 3, 0, 3, 0, &thresholds());
         assert_eq!(status, SubsystemStatus::Healthy);
-        assert!(codes.is_empty());
+        assert_eq!(codes, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -1209,7 +1209,7 @@ mod tests {
         // concern, not a worker-fleet fault.
         let (status, codes) = classify_workers(3, 6, 0, 6, 1_000_000, &thresholds());
         assert_eq!(status, SubsystemStatus::Healthy);
-        assert!(codes.is_empty());
+        assert_eq!(codes, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -1229,7 +1229,7 @@ mod tests {
     fn classify_dead_letters_none_is_healthy() {
         let (status, codes) = classify_dead_letters(0, None, &thresholds());
         assert_eq!(status, SubsystemStatus::Healthy);
-        assert!(codes.is_empty());
+        assert_eq!(codes, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -1262,7 +1262,7 @@ mod tests {
     fn classify_queues_below_thresholds_is_healthy() {
         let (status, codes) = classify_queues(10, &thresholds());
         assert_eq!(status, SubsystemStatus::Healthy);
-        assert!(codes.is_empty());
+        assert_eq!(codes, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -1285,7 +1285,7 @@ mod tests {
     fn classify_stalled_zero_is_healthy() {
         let (status, codes) = classify_stalled(0, &thresholds());
         assert_eq!(status, SubsystemStatus::Healthy);
-        assert!(codes.is_empty());
+        assert_eq!(codes, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -1313,7 +1313,7 @@ mod tests {
         let (status, codes, ready, degraded, unavailable) = classify_shards(&report);
         assert_eq!(status, SubsystemStatus::Healthy);
         assert_eq!((ready, degraded, unavailable), (1, 0, 0));
-        assert!(codes.is_empty());
+        assert_eq!(codes, [] as [std::string::String; 0]);
     }
 
     #[test]

@@ -17,13 +17,13 @@ use autumn_harvest::models::{NewWorkflowExecution, TaskQueueItem};
 use autumn_harvest::payload_codec::PayloadCodecs;
 use autumn_harvest::poison_pill::requeue_orphan_stmt;
 use autumn_harvest::queue::{self, ClaimWrite, EnqueueParams, TaskClaim, TaskType};
-use autumn_harvest::schema::harvest_workflow_executions;
+use autumn_harvest::schema::{harvest_task_queue, harvest_workflow_executions};
 use autumn_harvest::store;
 use autumn_harvest::types::{ActivityExecId, ExecutionId};
 use autumn_harvest::worker::{
     DbPool, append_activity_started_for_test, fail_task_and_execution_with_history,
     finalize_activity_completion, finalize_activity_failure, observe_task_cancellation,
-    preload_failure_history,
+    preload_failure_history, requeue_workflow_task_after_event_id_conflict,
 };
 use chrono::Utc;
 use diesel::prelude::*;
@@ -1129,4 +1129,108 @@ async fn stale_execution_failure_after_another_worker_claims_is_ambiguous() {
         "a stale attempt must not fail the workflow"
     );
     assert_eq!(row(&mut conn, fx.task_id).await, before);
+}
+
+// ---------------------------------------------------------------------------
+// Event-id conflict re-drive (issue #1787)
+// ---------------------------------------------------------------------------
+
+/// A claimed workflow task row, as the dispatching handler loaded it.
+async fn claimed_workflow_task(
+    conn: &mut AsyncPgConnection,
+    queue: &str,
+    exec_id: ExecutionId,
+    worker_id: &str,
+) -> TaskQueueItem {
+    let task_id = queue::enqueue(
+        conn,
+        &EnqueueParams::new(queue, TaskType::Workflow, serde_json::json!({})),
+    )
+    .await
+    .expect("enqueue");
+    diesel::sql_query(
+        "UPDATE harvest_task_queue SET state = 'RUNNING', worker_id = $2, attempt = 1, \
+         workflow_exec_id = $3 WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .bind::<diesel::sql_types::Text, _>(worker_id)
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(conn)
+    .await
+    .expect("model the claim");
+    harvest_task_queue::table
+        .find(task_id)
+        .select(TaskQueueItem::as_select())
+        .first::<TaskQueueItem>(conn)
+        .await
+        .expect("load the claim")
+}
+
+/// The claim holder's re-drive re-pends the row for an immediate re-claim.
+#[tokio::test]
+async fn event_id_conflict_redrive_by_the_claim_holder_repends_the_row() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let run = Uuid::new_v4().simple().to_string();
+    let queue = format!("ce-rd-{}", &run[..12]);
+    let worker_a = format!("redrive-a-{run}");
+    live_worker(&mut conn, &worker_a).await;
+    let exec_id = insert_execution(&mut conn, &queue).await;
+    let task = claimed_workflow_task(&mut conn, &queue, exec_id, &worker_a).await;
+
+    requeue_workflow_task_after_event_id_conflict(
+        &mut conn,
+        &task,
+        &worker_a,
+        Duration::ZERO,
+        exec_id,
+    )
+    .await
+    .expect("the holder re-drives its own row");
+
+    let after = row(&mut conn, task.id).await;
+    assert_eq!(after.state, "PENDING", "{after:?}");
+    assert_eq!(after.worker_id, None, "{after:?}");
+}
+
+/// A stale handler's re-drive leaves a peer's claim alone. The peer took the
+/// row after this handler loaded it. A park without the claim fence would
+/// clear the peer's ownership and let a third dispatch run.
+#[tokio::test]
+async fn stale_event_id_conflict_redrive_leaves_a_peer_claim_alone() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let run = Uuid::new_v4().simple().to_string();
+    let queue = format!("ce-sr-{}", &run[..12]);
+    let worker_a = format!("stale-redrive-a-{run}");
+    let worker_b = format!("stale-redrive-b-{run}");
+    live_worker(&mut conn, &worker_a).await;
+    live_worker(&mut conn, &worker_b).await;
+    let exec_id = insert_execution(&mut conn, &queue).await;
+    let stale = claimed_workflow_task(&mut conn, &queue, exec_id, &worker_a).await;
+    diesel::sql_query("UPDATE harvest_task_queue SET worker_id = $2, attempt = 2 WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(stale.id)
+        .bind::<diesel::sql_types::Text, _>(&worker_b)
+        .execute(&mut conn)
+        .await
+        .expect("model the peer's claim");
+
+    requeue_workflow_task_after_event_id_conflict(
+        &mut conn,
+        &stale,
+        &worker_a,
+        Duration::ZERO,
+        exec_id,
+    )
+    .await
+    .expect("a lost claim is a no-op");
+
+    let after = row(&mut conn, stale.id).await;
+    assert_eq!(after.state, "RUNNING", "{after:?}");
+    assert_eq!(
+        after.worker_id.as_deref(),
+        Some(worker_b.as_str()),
+        "{after:?}"
+    );
+    assert_eq!(after.attempt, 2, "{after:?}");
 }

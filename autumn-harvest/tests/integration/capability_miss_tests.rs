@@ -1402,7 +1402,10 @@ async fn activity_capability_miss_is_released_for_a_capable_peer() {
         Some(serde_json::json!("activity done")),
         "the workflow returned the capable peer's activity output"
     );
-    assert!(dead_letter_errors(&url, exec_id).await.is_empty());
+    assert_eq!(
+        dead_letter_errors(&url, exec_id).await,
+        [] as [std::string::String; 0]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1537,7 +1540,10 @@ async fn a_post_handler_release_does_not_re_emit_workflow_started() {
         "`harvest.workflow.started` must be emitted EXACTLY ONCE for this \
          execution across the whole incapable-then-capable dispatch sequence"
     );
-    assert!(dead_letter_errors(&url, exec_id).await.is_empty());
+    assert_eq!(
+        dead_letter_errors(&url, exec_id).await,
+        [] as [std::string::String; 0]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1669,7 +1675,10 @@ async fn a_local_activity_miss_releases_before_committing_its_batch() {
         "the capable worker DOES commit the breadcrumb -- without this the \
          phase-1 assertion would hold for the wrong reason"
     );
-    assert!(dead_letter_errors(&url, exec_id).await.is_empty());
+    assert_eq!(
+        dead_letter_errors(&url, exec_id).await,
+        [] as [std::string::String; 0]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -5964,7 +5973,10 @@ async fn cross_type_continue_as_new_missing_target_is_released_for_a_capable_pee
         "the predecessor seals cleanly once a capable peer runs the transition: {:?}",
         sealed.error
     );
-    assert!(dead_letter_errors(&url, exec_id).await.is_empty());
+    assert_eq!(
+        dead_letter_errors(&url, exec_id).await,
+        [] as [std::string::String; 0]
+    );
 }
 
 // -- Codex round-46 P1: evidence is keyed to the handler it is about ---------
