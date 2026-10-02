@@ -931,7 +931,7 @@ struct Cursor {
 }
 
 #[workflow]
-async fn incremental_etl(ctx: &WorkflowContext, _: ()) -> Result<Cursor, String> {
+async fn incremental_etl(ctx: &WorkflowContext, _input: ()) -> Result<Cursor, String> {
     // Read the cursor written by the previous successful run.
     let prior: Option<Cursor> = ctx
         .last_completion_result::<Cursor>()

@@ -179,6 +179,19 @@ pub fn param_idents<'a>(params: &'a [&syn::FnArg]) -> Vec<&'a syn::Ident> {
         .collect()
 }
 
+/// First input parameter whose pattern is not a bare identifier.
+///
+/// The generated dispatch code deserializes each input into a named binding,
+/// so a `_` or destructuring pattern has nothing to bind. [`param_idents`]
+/// drops such a parameter, which leaves the generated call one argument
+/// short and surfaces as an arity error on the attribute line.
+pub fn first_non_ident_param<'a>(params: &'a [&syn::FnArg]) -> Option<&'a syn::PatType> {
+    params.iter().find_map(|arg| match arg {
+        syn::FnArg::Typed(pt) if !matches!(&*pt.pat, syn::Pat::Ident(_)) => Some(pt),
+        _ => None,
+    })
+}
+
 #[cfg(test)]
 mod param_idents_tests {
     use super::param_idents;
@@ -204,6 +217,19 @@ mod param_idents_tests {
             .map(ToString::to_string)
             .collect();
         assert_eq!(names, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn first_non_ident_param_finds_underscore_and_destructuring() {
+        let owned = params_from("a: u32, _: (), c: bool");
+        let refs: Vec<_> = owned.iter().collect();
+        assert!(super::first_non_ident_param(&refs).is_some());
+        let owned = params_from("a: u32, c: bool");
+        let refs: Vec<_> = owned.iter().collect();
+        assert!(super::first_non_ident_param(&refs).is_none());
+        let owned = params_from("_input: ()");
+        let refs: Vec<_> = owned.iter().collect();
+        assert!(super::first_non_ident_param(&refs).is_none());
     }
 
     /// A non-ident pattern (destructuring, `_`) is silently dropped, not an
