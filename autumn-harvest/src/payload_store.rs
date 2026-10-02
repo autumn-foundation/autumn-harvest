@@ -40,7 +40,6 @@
 //! that way, or before this fix, still fails on read.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -117,14 +116,17 @@ pub trait PayloadStore: Send + Sync + 'static {
 
 /// The number of blob uploads that one counting offloader starts.
 ///
-/// See [`PayloadOffloader::counting_uploads`].
+/// See [`PayloadOffloader::counting_uploads`]. Only the worker's result write
+/// uses it, so it exists with the `db` feature only.
+#[cfg(feature = "db")]
 #[derive(Clone, Default)]
-pub(crate) struct UploadCount(Arc<AtomicUsize>);
+pub(crate) struct UploadCount(Arc<std::sync::atomic::AtomicUsize>);
 
+#[cfg(feature = "db")]
 impl UploadCount {
     /// Whether the offloader started at least one upload.
     pub(crate) fn any(&self) -> bool {
-        self.0.load(Ordering::SeqCst) > 0
+        self.0.load(std::sync::atomic::Ordering::SeqCst) > 0
     }
 }
 
@@ -132,18 +134,22 @@ impl UploadCount {
 ///
 /// A `put` counts when it starts. A `put` that fails can still leave a blob
 /// in the store, so it counts too.
+#[cfg(feature = "db")]
 struct CountingStore {
     inner: Arc<dyn PayloadStore>,
     uploads: UploadCount,
 }
 
+#[cfg(feature = "db")]
 impl PayloadStore for CountingStore {
     fn store_id(&self) -> &str {
         self.inner.store_id()
     }
 
     fn put(&self, bytes: &[u8]) -> PayloadStoreFuture<'_, String> {
-        self.uploads.0.fetch_add(1, Ordering::SeqCst);
+        self.uploads
+            .0
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.inner.put(bytes)
     }
 
@@ -292,6 +298,7 @@ impl PayloadOffloader {
     /// The copy writes to the same store under the same store id. Only its
     /// own uploads are counted. A caller makes one copy per write and so
     /// learns if that write uploaded a blob (issue #1788).
+    #[cfg(feature = "db")]
     pub(crate) fn counting_uploads(&self) -> (Self, UploadCount) {
         let uploads = UploadCount::default();
         let store = CountingStore {
@@ -449,6 +456,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// In-memory content-addressed store with put/get/delete spies.
     #[derive(Default)]
@@ -508,6 +516,7 @@ mod tests {
     }
 
     /// A counting copy counts the blobs it uploads and nothing else.
+    #[cfg(feature = "db")]
     #[tokio::test]
     async fn a_counting_copy_counts_its_own_uploads() {
         let store = MemStore::new();
