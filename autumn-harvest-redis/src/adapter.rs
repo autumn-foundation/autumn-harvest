@@ -55,8 +55,6 @@ impl ClaimedTask {
 /// claimed but not subsequently acknowledged via [`Self::complete`],
 /// [`Self::fail`], or [`Self::requeue_for_retry`] before its visibility
 /// timeout expires must become claimable again.
-// `async_trait` adds a `must_use` attribute that clippy 1.99 reports as a duplicate.
-#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait TaskQueueAdapter: Send + Sync {
     /// Add a new task to the queue.

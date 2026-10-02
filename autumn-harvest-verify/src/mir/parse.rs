@@ -1110,7 +1110,7 @@ mod tests {
             "    bb0: {\n        _1 = &/*tls*/ TL::{constant#0}::{closure#0}::__RUST_STD_INTERNAL_VAL;\n        return;\n    }\n",
         );
         assert_eq!(tls.ref_of, None);
-        assert!(tls.reads.is_empty());
+        assert_eq!(tls.reads, [] as [crate::mir::ast::Operand; 0]);
     }
 
     #[test]
@@ -1252,7 +1252,7 @@ mod tests {
         assert_eq!(false_unwind.successors(), vec!["bb1"]);
         let resume = terminator("    bb0: {\n        resume;\n    }\n");
         assert!(matches!(resume, Terminator::Other { .. }));
-        assert!(resume.successors().is_empty());
+        assert_eq!(resume.successors(), [] as [&str; 0]);
         let terminate = terminator("    bb0: {\n        terminate(cleanup);\n    }\n");
         assert!(matches!(terminate, Terminator::Other { .. }));
         let yielded = terminator(

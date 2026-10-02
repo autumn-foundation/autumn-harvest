@@ -150,8 +150,6 @@ impl Default for DispatchSettings {
 /// Implementations deliver each published reference at least once. They do
 /// not need to persist references: the worker's reconcile sweep republishes
 /// every due `PENDING` row that the channel does not hold.
-// `async_trait` adds a `must_use` attribute that clippy 1.99 reports as a duplicate.
-#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait TaskDispatch: Send + Sync + std::fmt::Debug {
     /// Publish references, keyed on `scheduled_at`.
@@ -2352,7 +2350,7 @@ mod tests {
         })
         .await;
         assert_eq!(leftover, vec![one.clone()]);
-        assert!(channel.published_ids().is_empty());
+        assert_eq!(channel.published_ids(), [] as [uuid::Uuid; 0]);
 
         publish_now(leftover).await;
         assert_eq!(channel.published_ids(), vec![one.task_id]);
@@ -2398,7 +2396,7 @@ mod tests {
             flush_scope().await;
         })
         .await;
-        assert!(leftover.is_empty());
+        assert_eq!(leftover, [] as [crate::dispatch::DispatchHint; 0]);
         assert_eq!(channel.published_ids(), vec![one.task_id]);
         uninstall();
     }
@@ -3479,6 +3477,6 @@ mod tests {
         uninstall();
 
         assert_eq!(bound.published_ids(), vec![one.task_id]);
-        assert!(live.published_ids().is_empty());
+        assert_eq!(live.published_ids(), [] as [uuid::Uuid; 0]);
     }
 }

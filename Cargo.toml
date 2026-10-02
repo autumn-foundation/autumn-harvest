@@ -84,13 +84,11 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
-# Clippy 1.99 reports diesel derive output on the user's field definitions.
-# The `QueryableByName` derive emits `field: field` initializers. A fix in the
-# user's code cannot clear the lint.
+# Clippy 1.99 reports these two lints inside macro expansions. The source has
+# no such code. Diesel derives expand to `field: field`. `async_trait` expands
+# to a second `#[must_use]`. Re-enable both when clippy skips macro output.
 redundant_field_names = "allow"
-# `assert!(x.is_empty())` is the plain form. The suggested `assert_eq!` needs
-# an explicit empty-array type at every call site.
-assert_is_empty = "allow"
+double_must_use = "allow"
 
 [profile.dev.package.bollard-stubs]
 opt-level = 0
