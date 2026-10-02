@@ -130,27 +130,33 @@ fn bench_decisions(
 ///
 /// - `decision_cost` measures the replay work. Its cost grows linearly with
 ///   history length, so a run of n decisions costs O(n²) in total.
-/// - `decision_wall` measures a decision that suspends. It adds the fixed
-///   100 ms suspension wait of issue #1797 on top of the replay work.
+/// - `decision_wall` measures a decision that suspends. The executor waits
+///   for a fixed 100 ms suspension timeout (issue #1797), so this group
+///   reads about max(100 ms, replay). It shows that floor, not the slope.
 ///
-/// Resident workflow state (issue #1798, step 2) would make a warm decision
-/// roughly constant in both groups.
+/// Resident workflow state (issue #1798, step 2) would make the replay work
+/// of a warm decision roughly constant. The 100 ms floor stays until issue
+/// #1797 lands.
 fn bench_decision_cost(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
 
-    // Each shape must produce the outcome that its group claims to measure.
-    let (exec_id, events, input) = decision_history(4, 0);
-    let done = rt.block_on(run_workflow(exec_id, events, sequential_workflow, input));
-    assert!(
-        matches!(done, WorkflowOutcome::Completed { .. }),
-        "a full-history decision must complete: {done:?}"
-    );
-    let (exec_id, events, input) = decision_history(4, 1);
-    let live = rt.block_on(run_workflow(exec_id, events, sequential_workflow, input));
-    assert!(
-        matches!(live, WorkflowOutcome::Suspended { .. }),
-        "a live decision must suspend on the next activity: {live:?}"
-    );
+    // Each shape must produce the outcome that its group claims to measure,
+    // at every size. A replay that overran the suspension timeout would
+    // otherwise time a cut-off run.
+    for events in DECISION_COST_EVENTS {
+        let (exec_id, history, input) = decision_history(events / 2, 0);
+        let done = rt.block_on(run_workflow(exec_id, history, sequential_workflow, input));
+        assert!(
+            matches!(done, WorkflowOutcome::Completed { .. }),
+            "a full-history decision at {events} events must complete: {done:?}"
+        );
+        let (exec_id, history, input) = decision_history(events / 2, 1);
+        let live = rt.block_on(run_workflow(exec_id, history, sequential_workflow, input));
+        assert!(
+            matches!(live, WorkflowOutcome::Suspended { .. }),
+            "a live decision at {events} events must suspend: {live:?}"
+        );
+    }
 
     let mut group = c.benchmark_group("decision_cost");
     bench_decisions(&mut group, &rt, 0);

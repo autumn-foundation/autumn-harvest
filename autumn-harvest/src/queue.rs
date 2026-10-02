@@ -1925,6 +1925,11 @@ pub struct DispatchProbe {
     pub scheduled_at: DateTime<Utc>,
     /// True when a worker holds the row.
     pub has_worker: bool,
+    /// True when a live sticky pin names another worker (issue #1798).
+    ///
+    /// Session rows never set it. A session pin is a hard pin that does not
+    /// expire, so the reference must keep its normal backoff.
+    pub pinned_elsewhere: bool,
 }
 
 impl DispatchProbe {
@@ -1946,6 +1951,7 @@ impl DispatchProbe {
 pub async fn dispatch_probe(
     conn: &mut AsyncPgConnection,
     task_id: Uuid,
+    worker_id: &str,
 ) -> HarvestResult<Option<DispatchProbe>> {
     #[derive(diesel::QueryableByName)]
     struct Row {
@@ -1955,10 +1961,13 @@ pub async fn dispatch_probe(
         scheduled_at: DateTime<Utc>,
         #[diesel(sql_type = diesel::sql_types::Bool)]
         has_worker: bool,
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        pinned_elsewhere: bool,
     }
 
     let rows: Vec<Row> = diesel::sql_query(dispatch_probe_query())
         .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .bind::<diesel::sql_types::Text, _>(worker_id)
         .load(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -1967,13 +1976,20 @@ pub async fn dispatch_probe(
         state: row.state,
         scheduled_at: row.scheduled_at,
         has_worker: row.has_worker,
+        pinned_elsewhere: row.pinned_elsewhere,
     }))
 }
 
-/// SQL for [`dispatch_probe`]. A primary-key read of three columns.
+/// SQL for [`dispatch_probe`]. A primary-key read of four values.
 #[must_use]
 pub const fn dispatch_probe_query() -> &'static str {
-    "SELECT state, scheduled_at, worker_id IS NOT NULL AS has_worker \
+    "SELECT state, scheduled_at, worker_id IS NOT NULL AS has_worker, \
+            COALESCE( \
+                session_id IS NULL \
+                AND sticky_worker_id <> $2 \
+                AND sticky_until > NOW(), \
+                FALSE \
+            ) AS pinned_elsewhere \
      FROM harvest_task_queue \
      WHERE id = $1"
 }
@@ -4963,11 +4979,12 @@ impl<'a> StickyHint<'a> {
 ///
 /// A pin hides a ready task from other workers until `sticky_until` passes.
 /// A wake also re-arms the pin of a parked task. Without a release, each
-/// execution pinned to a stopped worker waits for one full sticky window.
+/// execution pinned to a stopped worker waits up to one sticky window.
 ///
-/// The release clears pending rows and parked rows. It keeps rows that the
-/// worker still runs. It also keeps session rows, because a session pin is
-/// a hard pin (issue #606). Returns the number of released rows.
+/// The release clears the pins of pending and parked rows. It does not
+/// touch rows that the worker still runs. It also does not touch session
+/// rows, because a session pin is a hard pin (issue #606). Returns the
+/// number of released rows.
 ///
 /// # Errors
 ///
@@ -4986,7 +5003,8 @@ pub async fn release_worker_sticky_pins(
 /// SQL for [`release_worker_sticky_pins`].
 ///
 /// A parked row has `state = 'RUNNING'` with no `worker_id` and no
-/// `started_at`, the same shape that [`wake_workflow_task`] re-pends.
+/// `started_at`. That is the shape `primary_repend_workflow_task_query`
+/// re-pends.
 const fn release_worker_sticky_pins_query() -> &'static str {
     "UPDATE harvest_task_queue \
      SET sticky_worker_id = NULL, \
@@ -11645,6 +11663,10 @@ mod tests {
     fn dispatch_probe_query_reads_state_due_time_and_ownership() {
         let sql = dispatch_probe_query();
         assert!(sql.contains("SELECT state, scheduled_at, worker_id IS NOT NULL AS has_worker"));
+        assert!(sql.contains("session_id IS NULL"));
+        assert!(sql.contains("sticky_worker_id <> $2"));
+        assert!(sql.contains("sticky_until > NOW()"));
+        assert!(sql.contains("AS pinned_elsewhere"));
         assert!(sql.contains("WHERE id = $1"));
     }
 
@@ -11654,6 +11676,7 @@ mod tests {
             state: state.to_string(),
             scheduled_at: Utc::now(),
             has_worker: false,
+            pinned_elsewhere: false,
         };
         assert!(probe("PENDING").is_pending());
         assert!(!probe("RUNNING").is_pending());

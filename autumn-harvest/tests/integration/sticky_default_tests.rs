@@ -9,16 +9,23 @@
 //! 2. When that worker dies, a peer runs the next decision after the
 //!    sticky window closes.
 //! 3. A graceful shutdown releases the pins of the worker at once.
+//! 4. A draining worker releases its pins before the drain, so a wake
+//!    during the drain does not wait for the sticky window.
+//! 5. A warm decision keeps the update results of an earlier decision.
 //!
 //! A queue-level test also proves which rows the shutdown release touches.
+//! Each test uses its own queue and worker ids, so the tests can share one
+//! database.
 
-use autumn_harvest::info::WorkflowInfo;
+use autumn_harvest::event::WorkflowEvent;
+use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
 use autumn_harvest::queue::{self, EnqueueParams, TaskType};
+use autumn_harvest::store;
 use autumn_harvest::telemetry::{MetricsRecorder, NoOpPropagator, TelemetryConfig};
-use autumn_harvest::types::ExecutionId;
+use autumn_harvest::types::{ExecutionId, UpdateId};
 use autumn_harvest::worker::{DbPool, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{
-    HarvestBuilder, StartWorkflowParams, WorkerConfig, WorkflowContext,
+    ActivityContext, HarvestBuilder, StartWorkflowParams, WorkerConfig, WorkflowContext,
     start_or_load_workflow_execution,
 };
 use diesel::sql_types::{Nullable, Text};
@@ -83,15 +90,125 @@ fn two_signal_workflow<'a>(
     })
 }
 
+/// Live runs of the `bump` update handler. Replay does not run it.
+static UPDATE_RUNS: AtomicU64 = AtomicU64::new(0);
+
+/// Fixed id of the update that the test admits before the first decision.
+const UPDATE_UUID: uuid::Uuid = uuid::Uuid::from_u128(0x1798_0000_0000_4000_8000_0000_0000_0001);
+
+const UPDATE_WORKFLOW: &str = "sticky_default_update_wf";
+
+/// Completes an admitted update, signals another execution, then waits.
+///
+/// The update result and the external signal leave in one command batch.
+/// The worker resolves the signal inline and runs the workflow again in
+/// the same task. A later signal wakes it for a warm decision.
+fn update_then_signal_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.register_update_handler_no_validator("bump", |input: serde_json::Value| async move {
+            UPDATE_RUNS.fetch_add(1, Ordering::SeqCst);
+            Ok::<serde_json::Value, String>(input)
+        });
+        let _ = ctx
+            .execute_admitted_update(
+                UpdateId::from_uuid(UPDATE_UUID),
+                "bump",
+                serde_json::json!({}),
+            )
+            .await;
+        let target = input["target"]
+            .as_str()
+            .and_then(|s| uuid::Uuid::parse_str(s).ok())
+            .ok_or("missing target")?;
+        ctx.signal_external_workflow(ExecutionId::from_uuid(target), "first", "from-peer")
+            .await
+            .map_err(|e| e.to_string())?;
+        let done: serde_json::Value = ctx
+            .receive_signal("done")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(done)
+    })
+}
+
+const SLOW_WORKFLOW: &str = "sticky_default_slow_wf";
+const SLOW_ACTIVITY: &str = "sticky_default_slow_la";
+
+/// How long the slow local activity holds its decision in flight.
+const SLOW_ACTIVITY_TIME: Duration = Duration::from_secs(4);
+
+/// Runs a slow local activity after the `go` signal, then waits for `done`.
+///
+/// The local activity runs inside the decision, so the decision stays in
+/// flight while it sleeps. That keeps a shutdown in its drain phase.
+fn slow_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let _: serde_json::Value = ctx.receive_signal("go").await.map_err(|e| e.to_string())?;
+        ctx.execute_local_activity_raw(SLOW_ACTIVITY, serde_json::json!({}), None, Some(30))
+            .await
+            .map_err(|e| e.to_string())?;
+        let done: serde_json::Value = ctx
+            .receive_signal("done")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(done)
+    })
+}
+
+fn slow_activity<'a>(
+    _ctx: &'a ActivityContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        tokio::time::sleep(SLOW_ACTIVITY_TIME).await;
+        Ok(input)
+    })
+}
+
+fn slow_activity_info() -> ActivityInfo {
+    ActivityInfo {
+        name: SLOW_ACTIVITY,
+        module: "sticky_default_tests",
+        default_retry_policy: None,
+        default_start_to_close: None,
+        default_heartbeat_timeout: None,
+        default_schedule_to_start: None,
+        default_schedule_to_close: None,
+        default_queue: None,
+        max_concurrent: None,
+        concurrency_key: None,
+        rate_limit_rps: None,
+        rate_limit_burst: None,
+        rate_limit_key: None,
+        rate_limit_key_expr: None,
+        circuit_breaker: None,
+        is_local: true,
+        max_input_bytes: None,
+        max_result_bytes: None,
+        requires: None,
+        handler: slow_activity,
+    }
+}
+
 fn workflow_info() -> WorkflowInfo {
+    info_for(WORKFLOW, two_signal_workflow)
+}
+
+fn info_for(name: &'static str, handler: autumn_harvest::info::WorkflowHandlerFn) -> WorkflowInfo {
     WorkflowInfo {
         quota: None,
         declared_activities: None,
         declared_children: None,
         mcp: false,
-        name: WORKFLOW,
+        name,
         module: "sticky_default_tests",
-        handler: two_signal_workflow,
+        handler,
         execution_timeout: None,
         chain_execution_timeout: None,
         sla: None,
@@ -112,21 +229,29 @@ fn workflow_info() -> WorkflowInfo {
 }
 
 /// Builds a worker from `WorkerConfig::default()` with no sticky override.
-fn build_default_worker(worker_id: &str, metrics: Arc<CacheCounts>) -> Arc<Worker> {
+///
+/// The worker polls only `queue`. Pass ids from [`unique_id`].
+fn build_default_worker(queue: &str, worker_id: &str, metrics: Arc<CacheCounts>) -> Arc<Worker> {
     let built = HarvestBuilder::new()
-        .workflows(vec![workflow_info()])
+        .workflows(vec![
+            workflow_info(),
+            info_for(UPDATE_WORKFLOW, update_then_signal_workflow),
+            info_for(SLOW_WORKFLOW, slow_workflow),
+        ])
+        .activities(vec![slow_activity_info()])
         .telemetry(TelemetryConfig {
             service_name: Arc::from("sticky_default_tests"),
             propagator: Arc::new(NoOpPropagator),
             metrics: metrics as Arc<dyn MetricsRecorder>,
         })
-        .worker(WorkerConfig::default())
+        .worker(WorkerConfig::default().with_queues([queue]))
         .build();
     let (registry, _dags, _schedules, worker_config) = built.into_worker_parts();
     let mut runtime_config: WorkerRuntimeConfig = worker_config.into();
     runtime_config.worker_id = worker_id.to_string();
     runtime_config.poll_interval = Duration::from_millis(50);
-    runtime_config.shutdown_timeout = Duration::from_secs(2);
+    // Long enough that a drain outlives the slow local activity.
+    runtime_config.shutdown_timeout = Duration::from_secs(10);
     Arc::new(Worker::new(runtime_config, Arc::new(registry)).expect("worker should build"))
 }
 
@@ -136,14 +261,42 @@ fn spawn(worker: &Arc<Worker>, pool: &DbPool) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move { runner.run(&pool).await })
 }
 
-fn start_params(exec_id: ExecutionId, workflow_id: &str) -> StartWorkflowParams<'_> {
+/// Returns `prefix` with a random suffix, for worker ids and queues.
+fn unique_id(prefix: &str) -> String {
+    // Postgres caps a NOTIFY channel name at 63 bytes, and the queue name is
+    // part of it. Twelve hex digits keep the id short and still unique.
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    format!("{prefix}-{}", &suffix[..12])
+}
+
+fn start_params<'a>(
+    exec_id: ExecutionId,
+    workflow_id: &'a str,
+    queue_name: &'a str,
+) -> StartWorkflowParams<'a> {
+    start_workflow(
+        WORKFLOW,
+        exec_id,
+        workflow_id,
+        queue_name,
+        serde_json::json!({}),
+    )
+}
+
+fn start_workflow<'a>(
+    workflow_name: &'a str,
+    exec_id: ExecutionId,
+    workflow_id: &'a str,
+    queue_name: &'a str,
+    input: serde_json::Value,
+) -> StartWorkflowParams<'a> {
     StartWorkflowParams {
-        workflow_name: WORKFLOW,
+        workflow_name,
         workflow_id,
         exec_id,
-        input: serde_json::json!({}),
+        input,
         parent_id: None,
-        queue_name: "default",
+        queue_name,
         execution_timeout: None,
         memo: None,
         search_attrs: None,
@@ -242,23 +395,25 @@ async fn default_worker_keeps_its_execution_and_peer_takes_over_after_a_crash() 
     let (url, _container) = setup_test_database_url_or_env().await;
     let pool = build_test_pool(&url);
     let mut conn = connect(&url).await;
+    let queue = unique_id("crash-q");
+    let a_id = unique_id("crash-a");
 
     let a_counts = Arc::new(CacheCounts::default());
     let b_counts = Arc::new(CacheCounts::default());
-    let worker_a = build_default_worker("sticky-default-a", Arc::clone(&a_counts));
-    let worker_b = build_default_worker("sticky-default-b", Arc::clone(&b_counts));
+    let worker_a = build_default_worker(&queue, &a_id, Arc::clone(&a_counts));
+    let worker_b = build_default_worker(&queue, &unique_id("crash-b"), Arc::clone(&b_counts));
 
     // Only worker A runs, so A runs decision 1 and parks the task.
     let handle_a = spawn(&worker_a, &pool);
     let exec_id = ExecutionId::new();
-    let workflow_id = format!("sticky-default-crash-{}", exec_id.as_uuid());
-    start_or_load_workflow_execution(&mut conn, start_params(exec_id, &workflow_id), None)
+    let workflow_id = unique_id("crash-wf");
+    start_or_load_workflow_execution(&mut conn, start_params(exec_id, &workflow_id, &queue), None)
         .await
         .expect("start workflow");
     let pin = wait_parked_after(&mut conn, exec_id, &a_counts, 1).await;
     assert_eq!(
         pin.sticky_worker_id.as_deref(),
-        Some("sticky-default-a"),
+        Some(a_id.as_str()),
         "a default worker must pin the parked task to itself"
     );
     assert_eq!(a_counts.misses(), 1, "decision 1 is a cold load");
@@ -279,6 +434,11 @@ async fn default_worker_keeps_its_execution_and_peer_takes_over_after_a_crash() 
         .await;
 
     assert_eq!(b_counts.misses(), 1, "B runs decision 3 from a cold load");
+    assert_eq!(
+        a_counts.decisions(),
+        2,
+        "the dead worker must not run again"
+    );
     assert!(
         signalled_at.elapsed() >= Duration::from_secs(4),
         "B must wait for the sticky window to close; waited {:?}",
@@ -296,19 +456,21 @@ async fn graceful_shutdown_releases_the_sticky_pins_of_the_worker() {
     let (url, _container) = setup_test_database_url_or_env().await;
     let pool = build_test_pool(&url);
     let mut conn = connect(&url).await;
+    let queue = unique_id("release-q");
+    let a_id = unique_id("release-a");
 
     let a_counts = Arc::new(CacheCounts::default());
     let b_counts = Arc::new(CacheCounts::default());
-    let worker_a = build_default_worker("sticky-release-a", Arc::clone(&a_counts));
+    let worker_a = build_default_worker(&queue, &a_id, Arc::clone(&a_counts));
 
     let handle_a = spawn(&worker_a, &pool);
     let exec_id = ExecutionId::new();
-    let workflow_id = format!("sticky-default-release-{}", exec_id.as_uuid());
-    start_or_load_workflow_execution(&mut conn, start_params(exec_id, &workflow_id), None)
+    let workflow_id = unique_id("release-wf");
+    start_or_load_workflow_execution(&mut conn, start_params(exec_id, &workflow_id, &queue), None)
         .await
         .expect("start workflow");
     let pin = wait_parked_after(&mut conn, exec_id, &a_counts, 1).await;
-    assert_eq!(pin.sticky_worker_id.as_deref(), Some("sticky-release-a"));
+    assert_eq!(pin.sticky_worker_id.as_deref(), Some(a_id.as_str()));
 
     worker_a.shutdown();
     tokio::time::timeout(Duration::from_secs(10), handle_a)
@@ -325,7 +487,7 @@ async fn graceful_shutdown_releases_the_sticky_pins_of_the_worker() {
     );
 
     // A peer now runs the rest of the workflow.
-    let worker_b = build_default_worker("sticky-release-b", Arc::clone(&b_counts));
+    let worker_b = build_default_worker(&queue, &unique_id("release-b"), Arc::clone(&b_counts));
     let handle_b = spawn(&worker_b, &pool);
     signal(&mut conn, exec_id, "first").await;
     signal(&mut conn, exec_id, "second").await;
@@ -340,22 +502,219 @@ async fn graceful_shutdown_releases_the_sticky_pins_of_the_worker() {
     let _ = tokio::time::timeout(Duration::from_secs(10), handle_b).await;
 }
 
+/// A draining worker releases its pins before it waits for in-flight work.
+/// A wake during the drain must not re-arm a pin to the draining worker.
+#[tokio::test]
+async fn draining_worker_releases_its_pins_before_the_drain() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let mut conn = connect(&url).await;
+    let queue = unique_id("drain-q");
+    let a_id = unique_id("drain-a");
+
+    let a_counts = Arc::new(CacheCounts::default());
+    let b_counts = Arc::new(CacheCounts::default());
+    let worker_a = build_default_worker(&queue, &a_id, Arc::clone(&a_counts));
+    let handle_a = spawn(&worker_a, &pool);
+
+    // Worker A parks X (slow) and Y (plain). A pins both.
+    let slow = ExecutionId::new();
+    let slow_id = unique_id("drain-slow");
+    start_or_load_workflow_execution(
+        &mut conn,
+        start_workflow(SLOW_WORKFLOW, slow, &slow_id, &queue, serde_json::json!({})),
+        None,
+    )
+    .await
+    .expect("start slow workflow");
+    let plain = ExecutionId::new();
+    let plain_id = unique_id("drain-plain");
+    start_or_load_workflow_execution(&mut conn, start_params(plain, &plain_id, &queue), None)
+        .await
+        .expect("start plain workflow");
+    wait_parked_after(&mut conn, slow, &a_counts, 2).await;
+    let pin = wait_parked_after(&mut conn, plain, &a_counts, 2).await;
+    assert_eq!(pin.sticky_worker_id.as_deref(), Some(a_id.as_str()));
+
+    // X starts its slow local activity on A, so A has work in flight.
+    signal(&mut conn, slow, "go").await;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while claimed_by(&mut conn, slow).await.as_deref() != Some(a_id.as_str()) {
+        assert!(
+            Instant::now() < deadline,
+            "A did not claim the slow decision"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // A starts to drain. The pin of Y must go before the drain ends.
+    worker_a.shutdown();
+    let deadline = Instant::now() + SLOW_ACTIVITY_TIME / 2;
+    loop {
+        let pin = parked_pin(&mut conn, plain).await.expect("Y is parked");
+        if pin.sticky_worker_id.is_none() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "a draining worker must release its pins before the drain"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(!handle_a.is_finished(), "A must still be draining here");
+
+    // A peer runs Y to completion while A still drains.
+    let worker_b = build_default_worker(&queue, &unique_id("drain-b"), Arc::clone(&b_counts));
+    let handle_b = spawn(&worker_b, &pool);
+    signal(&mut conn, plain, "first").await;
+    signal(&mut conn, plain, "second").await;
+    wait_for_execution_state_with_timeout(&url, plain, "COMPLETED", Duration::from_secs(30)).await;
+    assert!(b_counts.decisions() >= 1, "B must run the woken decision");
+
+    // X parks after the drain. The release after the drain clears that pin.
+    tokio::time::timeout(Duration::from_secs(20), handle_a)
+        .await
+        .expect("worker A stops")
+        .expect("worker A task joins");
+    let pin = parked_pin(&mut conn, slow).await.expect("X is parked");
+    assert_eq!(
+        pin.sticky_worker_id, None,
+        "a pin set during the drain must go too"
+    );
+
+    worker_b.shutdown();
+    let _ = tokio::time::timeout(Duration::from_secs(10), handle_b).await;
+}
+
+/// Returns the worker that holds the workflow task of `exec_id`, if any.
+async fn claimed_by(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> Option<String> {
+    #[derive(diesel::QueryableByName)]
+    struct Claim {
+        #[diesel(sql_type = Nullable<Text>)]
+        worker_id: Option<String>,
+    }
+    let row: Option<Claim> = diesel::sql_query(
+        "SELECT worker_id FROM harvest_task_queue \
+         WHERE workflow_exec_id = $1 AND task_type = 'workflow' AND state = 'RUNNING'",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .get_result(conn)
+    .await
+    .ok();
+    row.and_then(|r| r.worker_id)
+}
+
+/// Counts the `UpdateCompleted` events of `update_id` in stored history.
+async fn stored_update_results(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    update_id: UpdateId,
+) -> usize {
+    store::load_history(conn, exec_id)
+        .await
+        .expect("load history")
+        .events
+        .iter()
+        .filter(|e| matches!(e, WorkflowEvent::UpdateCompleted { update_id: id, .. } if *id == update_id))
+        .count()
+}
+
+/// An update result that leaves with an external signal stays in the
+/// in-memory history. Otherwise the in-process re-run and the warm cache
+/// both miss it, and the update handler runs a second time.
+#[tokio::test]
+async fn warm_decisions_keep_update_results_batched_with_an_external_signal() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let mut conn = connect(&url).await;
+    let queue = unique_id("update-q");
+    UPDATE_RUNS.store(0, Ordering::SeqCst);
+
+    // The sink only receives the external signal.
+    let sink = ExecutionId::new();
+    let sink_id = unique_id("update-sink");
+    start_or_load_workflow_execution(&mut conn, start_params(sink, &sink_id, &queue), None)
+        .await
+        .expect("start sink");
+
+    // Admit the update before the first decision runs.
+    let exec_id = ExecutionId::new();
+    let workflow_id = unique_id("update-wf");
+    let input = serde_json::json!({ "target": sink.as_uuid().to_string() });
+    start_or_load_workflow_execution(
+        &mut conn,
+        start_workflow(UPDATE_WORKFLOW, exec_id, &workflow_id, &queue, input),
+        None,
+    )
+    .await
+    .expect("start workflow");
+    let update_id = UpdateId::from_uuid(UPDATE_UUID);
+    store::append_events(
+        &mut conn,
+        exec_id,
+        &[WorkflowEvent::UpdateAdmitted {
+            update_id,
+            name: "bump".to_string(),
+            input: serde_json::json!({}),
+            timestamp: chrono::Utc::now(),
+        }],
+        1,
+    )
+    .await
+    .expect("admit update");
+
+    let counts = Arc::new(CacheCounts::default());
+    let worker = build_default_worker(&queue, &unique_id("update-a"), Arc::clone(&counts));
+    let handle = spawn(&worker, &pool);
+
+    // Decision 1 completes the update, signals the sink and parks.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while parked_pin(&mut conn, exec_id).await.is_none() {
+        assert!(Instant::now() < deadline, "workflow did not park");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // The next decision is warm, so it reads the cached history.
+    let hits_before = counts.hits();
+    signal(&mut conn, exec_id, "done").await;
+    wait_for_execution_state_with_timeout(&url, exec_id, "COMPLETED", Duration::from_secs(30))
+        .await;
+    assert!(
+        counts.hits() > hits_before,
+        "the final decision must be warm"
+    );
+
+    assert_eq!(
+        AtomicU64::load(&UPDATE_RUNS, Ordering::SeqCst),
+        1,
+        "the update handler must run exactly once"
+    );
+    assert_eq!(
+        stored_update_results(&mut conn, exec_id, update_id).await,
+        1,
+        "history must hold exactly one result for the update"
+    );
+
+    worker.shutdown();
+    let _ = tokio::time::timeout(Duration::from_secs(10), handle).await;
+}
+
 #[derive(diesel::QueryableByName, Debug)]
 struct IdPin {
-    #[diesel(sql_type = diesel::sql_types::Uuid)]
-    id: uuid::Uuid,
     #[diesel(sql_type = Nullable<Text>)]
     sticky_worker_id: Option<String>,
 }
 
+/// Enqueues one workflow task on `queue`, pinned to `worker_id`.
 async fn enqueue_pinned(
     conn: &mut AsyncPgConnection,
+    queue: &str,
     worker_id: &str,
     session_id: Option<uuid::Uuid>,
 ) -> uuid::Uuid {
     let exec_id = ExecutionId::new();
-    let workflow_id = format!("sticky-release-row-{}", exec_id.as_uuid());
-    start_or_load_workflow_execution(conn, start_params(exec_id, &workflow_id), None)
+    let workflow_id = unique_id("release-row");
+    start_or_load_workflow_execution(conn, start_params(exec_id, &workflow_id, queue), None)
         .await
         .expect("start workflow");
     // Drop the start task so each test row is the only task of its execution.
@@ -364,7 +723,7 @@ async fn enqueue_pinned(
         .execute(conn)
         .await
         .expect("drop start task");
-    let mut params = EnqueueParams::new("default", TaskType::Workflow, serde_json::json!(null));
+    let mut params = EnqueueParams::new(queue, TaskType::Workflow, serde_json::json!(null));
     params.workflow_exec_id = Some(exec_id.as_uuid());
     let mut params = params.with_sticky(worker_id, Duration::from_secs(60));
     if let Some(session_id) = session_id {
@@ -395,7 +754,7 @@ async fn set_state(
 
 async fn pin_of(conn: &mut AsyncPgConnection, id: uuid::Uuid) -> Option<String> {
     let row: IdPin =
-        diesel::sql_query("SELECT id, sticky_worker_id FROM harvest_task_queue WHERE id = $1")
+        diesel::sql_query("SELECT sticky_worker_id FROM harvest_task_queue WHERE id = $1")
             .bind::<diesel::sql_types::Uuid, _>(id)
             .get_result(conn)
             .await
@@ -403,22 +762,32 @@ async fn pin_of(conn: &mut AsyncPgConnection, id: uuid::Uuid) -> Option<String> 
     row.sticky_worker_id
 }
 
-/// The release clears pending and parked pins of one worker. It keeps
-/// session pins, pins of other workers and rows the worker still runs.
+/// The release clears the pins of pending and parked rows of one worker.
+/// It keeps session pins, pins of other workers, rows the worker still
+/// runs and terminal rows. Each kept row differs from a released row in
+/// one column only, so a wrong `AND`/`OR` grouping fails the test.
 #[tokio::test]
 async fn release_worker_sticky_pins_clears_only_idle_unsessioned_rows_of_the_worker() {
     let (url, _container) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
-    let me = format!("release-me-{}", uuid::Uuid::new_v4());
-    let peer = format!("release-peer-{}", uuid::Uuid::new_v4());
+    let queue = unique_id("release-rows-q");
+    let me = unique_id("release-me");
+    let peer = unique_id("release-peer");
 
-    let pending = enqueue_pinned(&mut conn, &me, None).await;
-    let parked = enqueue_pinned(&mut conn, &me, None).await;
+    let pending = enqueue_pinned(&mut conn, &queue, &me, None).await;
+    let parked = enqueue_pinned(&mut conn, &queue, &me, None).await;
     set_state(&mut conn, parked, "RUNNING", None).await;
-    let running = enqueue_pinned(&mut conn, &me, None).await;
+
+    let running = enqueue_pinned(&mut conn, &queue, &me, None).await;
     set_state(&mut conn, running, "RUNNING", Some(&me)).await;
-    let session = enqueue_pinned(&mut conn, &me, Some(uuid::Uuid::new_v4())).await;
-    let other = enqueue_pinned(&mut conn, &peer, None).await;
+    let completed = enqueue_pinned(&mut conn, &queue, &me, None).await;
+    set_state(&mut conn, completed, "COMPLETED", None).await;
+    let pending_session = enqueue_pinned(&mut conn, &queue, &me, Some(uuid::Uuid::new_v4())).await;
+    let parked_session = enqueue_pinned(&mut conn, &queue, &me, Some(uuid::Uuid::new_v4())).await;
+    set_state(&mut conn, parked_session, "RUNNING", None).await;
+    let pending_peer = enqueue_pinned(&mut conn, &queue, &peer, None).await;
+    let parked_peer = enqueue_pinned(&mut conn, &queue, &peer, None).await;
+    set_state(&mut conn, parked_peer, "RUNNING", None).await;
 
     let released = queue::release_worker_sticky_pins(&mut conn, &me)
         .await
@@ -427,16 +796,25 @@ async fn release_worker_sticky_pins_clears_only_idle_unsessioned_rows_of_the_wor
     assert_eq!(released, 2, "only the pending and parked rows are released");
     assert_eq!(pin_of(&mut conn, pending).await, None);
     assert_eq!(pin_of(&mut conn, parked).await, None);
-    assert_eq!(
-        pin_of(&mut conn, running).await.as_deref(),
-        Some(me.as_str())
-    );
-    assert_eq!(
-        pin_of(&mut conn, session).await.as_deref(),
-        Some(me.as_str())
-    );
-    assert_eq!(
-        pin_of(&mut conn, other).await.as_deref(),
-        Some(peer.as_str())
-    );
+    for (name, id, owner) in [
+        ("running", running, &me),
+        ("completed", completed, &me),
+        ("pending session", pending_session, &me),
+        ("parked session", parked_session, &me),
+        ("pending peer", pending_peer, &peer),
+        ("parked peer", parked_peer, &peer),
+    ] {
+        assert_eq!(
+            pin_of(&mut conn, id).await.as_deref(),
+            Some(owner.as_str()),
+            "the {name} row must keep its pin"
+        );
+    }
+
+    // No worker polls this queue. Delete the rows so they cannot leak.
+    diesel::sql_query("DELETE FROM harvest_task_queue WHERE queue_name = $1")
+        .bind::<Text, _>(&queue)
+        .execute(&mut conn)
+        .await
+        .expect("clean up rows");
 }

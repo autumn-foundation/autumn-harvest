@@ -68,8 +68,9 @@ pub const DEFAULT_RETRY_AFTER_CEILING: Duration = Duration::from_secs(15 * 60);
 
 /// Default sticky routing window (issue #1798): 5 seconds.
 ///
-/// A follow-up task of a suspended execution waits this long for the worker
-/// that holds its cache. After the window, any eligible worker can claim it.
+/// A follow-up task of a suspended execution waits up to this long for the
+/// worker that holds its cache. After the window, any eligible worker can
+/// claim it.
 pub const DEFAULT_STICKY_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct HarvestBuilder {
@@ -3402,7 +3403,7 @@ fn validate_workflow_duration_fields(
 /// reducing cold event-history reloads from Postgres.
 ///
 /// Sticky routing is **on by default** with a [`DEFAULT_STICKY_TIMEOUT`]
-/// window (issue #1798). Tune or disable it with
+/// window (issue #1798). Change the window with
 /// [`WorkerConfig::with_sticky_routing`]. A zero `lease_ttl` disables it.
 ///
 /// ## Trade-offs
@@ -3413,8 +3414,8 @@ fn validate_workflow_duration_fields(
 /// | Failover latency | Fast (expired window → any eligible worker claims) | Slower |
 /// | Load distribution | Better (sticky windows expire quickly) | Skewed toward hot workers |
 ///
-/// A 5–30 second `lease_ttl` is a reasonable starting point for most
-/// deployments. See `docs/sticky-routing.md` for the full operator guide.
+/// Keep `lease_ttl` short. After a crash, each pinned execution waits up to
+/// one window. See `docs/sticky-routing.md` for the full operator guide.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StickyRoutingConfig {
     /// How long to prefer the owning worker for follow-up tasks after a
@@ -4387,14 +4388,16 @@ impl WorkerConfig {
     ///
     /// Sticky routing is **on by default** with a [`DEFAULT_STICKY_TIMEOUT`]
     /// lease (issue #1798). Each time a workflow suspends, the task queue
-    /// records a lease that points at the current worker. The next task for
-    /// that execution goes to the owning worker first. Its in-process LRU
-    /// cache stays warm, so the worker loads only new events from Postgres.
+    /// records a lease that points at the current worker. Until the lease
+    /// expires, only the owning worker can claim the next task for that
+    /// execution. Its in-process LRU cache stays warm, so the worker loads
+    /// only new events from Postgres.
     ///
     /// When the lease expires (after `config.lease_ttl`), any eligible worker
     /// can claim the task, so sticky routing never blocks progress. A graceful
-    /// shutdown releases the leases of the worker at once. A crash or an
-    /// unhealthy status does **not** release them early; only the TTL does.
+    /// shutdown releases the leases of the worker when the drain starts. A
+    /// crash or an unhealthy status does **not** release them. Only the TTL
+    /// does.
     /// A zero `lease_ttl` disables sticky routing.
     ///
     /// See `docs/sticky-routing.md` for the full operator guide including

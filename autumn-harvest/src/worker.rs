@@ -8570,16 +8570,14 @@ pub async fn persist_workflow_failure(
 /// Used to durably record in-flight update results before the terminal workflow
 /// event (`WorkflowCompleted`, `WorkflowFailed`, or a suspension side-effect).
 /// `next_event_id` is advanced by the number of events written.
-async fn persist_update_result_commands(
-    conn: &mut AsyncPgConnection,
-    exec_id: ExecutionId,
-    commands: &[WorkflowCommand],
-    next_event_id: &mut i32,
-    // Issue #1243: the configured payload-codec registry, so this write
-    // encodes under the same codecs replay decodes with.
-    codecs: &crate::payload_codec::PayloadCodecs,
-) -> HarvestResult<()> {
-    let events: Vec<WorkflowEvent> = commands
+/// Builds the `UpdateCompleted` / `UpdateFailed` events that
+/// [`persist_update_result_commands`] appends for `commands`.
+///
+/// A caller that persists update results inline and then keeps running
+/// on `history_events` must add these events too. Otherwise a replay of
+/// that history sees only `UpdateAdmitted`, and the handler runs again.
+fn update_result_events(commands: &[WorkflowCommand]) -> Vec<WorkflowEvent> {
+    commands
         .iter()
         .filter_map(|cmd| match cmd {
             WorkflowCommand::RecordUpdateResult { update_id, result } => Some(match result {
@@ -8594,7 +8592,19 @@ async fn persist_update_result_commands(
             }),
             _ => None,
         })
-        .collect();
+        .collect()
+}
+
+async fn persist_update_result_commands(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    commands: &[WorkflowCommand],
+    next_event_id: &mut i32,
+    // Issue #1243: the configured payload-codec registry, so this write
+    // encodes under the same codecs replay decodes with.
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<()> {
+    let events = update_result_events(commands);
 
     if events.is_empty() {
         return Ok(());
@@ -20998,24 +21008,7 @@ async fn process_workflow_task(
                     // them to `history_events` too. Otherwise that re-drive
                     // sees only `UpdateAdmitted`, `execute_admitted_update`
                     // takes its live path, and the handler runs a second time.
-                    let update_result_events: Vec<WorkflowEvent> = commands
-                        .iter()
-                        .filter_map(|cmd| match cmd {
-                            WorkflowCommand::RecordUpdateResult { update_id, result } => {
-                                Some(match result {
-                                    Ok(output) => WorkflowEvent::UpdateCompleted {
-                                        update_id: *update_id,
-                                        output: output.clone(),
-                                    },
-                                    Err(error) => WorkflowEvent::UpdateFailed {
-                                        update_id: *update_id,
-                                        error: error.clone(),
-                                    },
-                                })
-                            }
-                            _ => None,
-                        })
-                        .collect();
+                    let update_result_events = update_result_events(&commands);
                     persist_update_result_commands(
                         conn,
                         prepared.exec_id,
@@ -21295,6 +21288,10 @@ async fn process_workflow_task(
                     )
                     .await;
                 }
+                // Keep the persisted results in memory too (issue #1798). The
+                // in-process re-drive and the warm cache read `history_events`.
+                // Without them, the update handler runs a second time.
+                history_events.extend(update_result_events(&commands));
                 // Issue #684: the update results just persisted inline (autocommit)
                 // are stripped from the reconstructed suspension below, so they
                 // never reach the main-transaction Persisted-arm emission — emit
@@ -21550,6 +21547,10 @@ async fn process_workflow_task(
                     )
                     .await;
                 }
+                // Keep the persisted results in memory too (issue #1798). The
+                // warm cache stores `history_events` with `next_event_id`, so
+                // a result missing here never comes back on a delta load.
+                history_events.extend(update_result_events(&commands));
                 // Issue #684: `split_mixed_signal_batch` below drops
                 // `RecordUpdateResult` from `remaining_commands`, so these
                 // inline-persisted update results never reach the main-transaction
@@ -26958,9 +26959,15 @@ fn reference_outcome(
             .unwrap_or(settings.release_backoff_cap);
         return ReferenceOutcome::Release(until.min(settings.release_backoff_cap));
     }
-    // Due but gated: a queue pause, a concurrency cap, a rate limit, sticky
-    // affinity, or any other claim gate. Back off so a held row does not cycle
-    // once per poll interval.
+    if probe.pinned_elsewhere {
+        // A live sticky pin names another worker (issue #1798). Hand the
+        // reference on at once, so the owner can see it before the pin ends.
+        // A growing delay here would outlast the sticky window.
+        return ReferenceOutcome::Release(settings.poll_interval.min(settings.release_backoff_cap));
+    }
+    // Due but gated: a queue pause, a concurrency cap, a rate limit, a session
+    // pin, or any other claim gate. Back off so a held row does not cycle once
+    // per poll interval.
     ReferenceOutcome::Release(crate::dispatch::release_delay(
         redeliveries,
         settings.poll_interval,
@@ -27854,12 +27861,17 @@ impl Worker {
                 shutdown_acquire_bound,
             )
             .await;
+            // Release the pins before the drain, so a wake during the drain
+            // does not re-arm them.
+            self.release_sticky_pins(shard_pool, shutdown_acquire_bound)
+                .await;
         }
 
         tracing::info!(worker_id = %self.config.worker_id, "draining in-flight tasks (multi-shard)");
         self.drain_in_flight().await;
 
-        // No task runs here now. Release the pins on every shard pool.
+        // A decision that parked during the drain pinned its task again.
+        // Release once more. A task that outlived the drain keeps its pin.
         for (_, shard_pool) in &shard_targets {
             self.release_sticky_pins(shard_pool, shutdown_acquire_bound)
                 .await;
@@ -28291,10 +28303,15 @@ impl Worker {
         self.transition_fleet_status(pool, crate::workers::WorkerStatus::Draining, None)
             .await;
 
+        // This worker claims no new task now. Release its pins before the
+        // drain, so a wake during the drain does not re-arm them.
+        self.release_sticky_pins(pool, None).await;
+
         tracing::info!(worker_id = %self.config.worker_id, "draining in-flight tasks");
         self.drain_in_flight().await;
 
-        // No task runs here now. Release the pins so peers claim at once.
+        // A decision that parked during the drain pinned its task again.
+        // Release once more. A task that outlived the drain keeps its pin.
         self.release_sticky_pins(pool, None).await;
 
         // All tasks complete — mark Stopped, then stop the heartbeat task.
@@ -29637,7 +29654,13 @@ impl Worker {
                 ReferenceDisposition::Dispatched(lease)
             }
             Ok(None) => {
-                let probe = match queue::dispatch_probe(&mut conn, lease.task_id).await {
+                let probe = match queue::dispatch_probe(
+                    &mut conn,
+                    lease.task_id,
+                    &self.config.worker_id,
+                )
+                .await
+                {
                     Ok(probe) => probe,
                     Err(error) => {
                         tracing::warn!(error = %error, task_id = %lease.task_id, "dispatch probe failed");
@@ -30369,16 +30392,9 @@ impl Worker {
         }
     }
 
-    /// Transition this worker's status in the fleet table.
-    ///
-    /// `acquire_bound` follows `shard_acquire_bound`. `None` on the
-    /// single-shard path keeps the wait unbounded, byte-for-byte. `Some(_)`
-    /// applies during multi-shard shutdown. That sequence visits shards
-    /// sequentially, so one exhausted shard pool must not park the others'
-    /// Draining/Stopped writes (issue #1209).
     /// Release the sticky pins of this worker on one pool (issue #1798).
     ///
-    /// Best effort. A failure only makes a peer wait for one sticky window.
+    /// Best effort. A failure only makes a peer wait up to one sticky window.
     async fn release_sticky_pins(&self, pool: &DbPool, acquire_bound: Option<Duration>) {
         let worker_id = self.config.worker_id.as_str();
         match acquire_shard_conn(pool, acquire_bound).await {
@@ -30404,6 +30420,13 @@ impl Worker {
         }
     }
 
+    /// Transition this worker's status in the fleet table.
+    ///
+    /// `acquire_bound` follows `shard_acquire_bound`. `None` on the
+    /// single-shard path keeps the wait unbounded, byte-for-byte. `Some(_)`
+    /// applies during multi-shard shutdown. That sequence visits shards
+    /// sequentially, so one exhausted shard pool must not park the others'
+    /// Draining/Stopped writes (issue #1209).
     async fn transition_fleet_status(
         &self,
         pool: &DbPool,
@@ -43148,6 +43171,25 @@ mod tests {
             state: state.to_string(),
             scheduled_at,
             has_worker: state == "RUNNING",
+            pinned_elsewhere: false,
+        }
+    }
+
+    #[test]
+    fn a_row_pinned_to_another_worker_is_released_without_a_growing_delay() {
+        // The owner of the pin must see the reference soon, so the delay must
+        // not grow past the sticky window (issue #1798).
+        let settings = dispatch_settings();
+        let now = chrono::Utc::now();
+        let mut pinned = probe("PENDING", now - chrono::Duration::seconds(1));
+        pinned.pinned_elsewhere = true;
+
+        for redeliveries in [0, 3, 40] {
+            assert_eq!(
+                reference_outcome(Some(&pinned), redeliveries, now, &settings),
+                ReferenceOutcome::Release(settings.poll_interval),
+                "redelivery {redeliveries} must not back off"
+            );
         }
     }
 
@@ -43216,6 +43258,7 @@ mod tests {
             state: "RUNNING".to_string(),
             scheduled_at: now,
             has_worker: false,
+            pinned_elsewhere: false,
         };
 
         for redeliveries in 0..DISPATCH_PARKED_ROW_RELEASES {
