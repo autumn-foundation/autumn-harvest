@@ -241,7 +241,8 @@ The `read` gate uses the same `audit::CLASSIFIED_ROUTES` taxonomy as the
 read-only operator tier. It **fails closed**: an unclassified path resolves to
 `Mutating`, so a `read` token gets `403`.
 
-The admin-only routes are `audit::ADMIN_SCOPE_ROUTES` (issue #1803). Token
+The admin-only routes are `audit::ADMIN_SCOPE_ROUTES` (issue #1803), plus
+any mutation under `/admin/tokens`, `/admin/modules` or `/modules`. Token
 management is there because a token that mints tokens can copy itself. No
 management route publishes a workflow module today. A future publish route
 runs code, so it goes in the same list. A guard test fails if a mutating
@@ -290,6 +291,8 @@ identically to a route-minted one (shared core hashing helper).
   `enable_api_tokens()` as the only auth, any `hvst_` bearer triggers one indexed
   lookup before authentication (inherent to any bearer scheme). Front the API
   with a per-source rate-limiting proxy to bound unauthenticated lookup floods.
+- **Rotation needs `admin`.** `harvest token rotate` mints through
+  `POST /admin/tokens`, so only an `admin` token can rotate.
 - **A compromised `admin` token can mint replacement tokens.** Give `admin` to
   as few callers as you can. Give CI and services `mutate` or `read`: neither
   can mint (issue #1803). When an `admin` token leaks, revoking it is not
@@ -335,9 +338,24 @@ needs I/O implements `HarvestAuthorizer` directly and returns a boxed future.
 |---|---|
 | `principal` | `Token { id, scope }` for a verified `hvst_` token. `Embedder` for every other caller; read its claims from `extensions`. |
 | `route_class` | `CLASSIFIED_ROUTES`. An unclassified path is `Mutating`. |
-| `tenant_key` | The `x-harvest-tenant` header, trimmed. A blank value, a non-ASCII byte or more than 128 bytes gets `400`. |
-| `shard` | An execution id in the path, a `shard_id` query parameter, or the `shard_id` / `residency_key` of a `POST /workflows/{name}/start` body. |
+| `tenant_key` | The `x-harvest-tenant` header, trimmed. A repeated header, a blank value, a non-ASCII byte or more than 128 bytes gets `400`. |
+| `shard` | Only a source the route's handler uses. See the table below. |
 | `method`, `path`, `extensions` | The request. |
+
+| Route | Shard source |
+|---|---|
+| A path with an execution id, e.g. `GET /workflows/{id}`, also under `/ui` | The shard the id routes to. A percent-encoded id is decoded first. |
+| `GET /admin/history/exports`, `GET /admin/history/export-sample` | `shard_id`, `shard-id` or `shard` query parameter. |
+| `GET /admin/external-handoffs` | `shard_id` or `shard` query parameter. |
+| `POST /workflows/{name}/start` | Body `shard_id`, or the shard a body `residency_key` resolves to. |
+| `POST /dead-letters/replay`, `POST /dead-letters/discard` | Body `shard_id`, JSON or form. |
+| `POST /dlq/redrive`, `POST /admin/queues/{name}/pause`, `POST /admin/queues/{name}/resume` | Body `shard_id`. |
+| `POST /admin/audit-export/redrive`, `.../decommission`, `.../reactivate` | Body `shard`. |
+
+A shard named anywhere else is ignored. So `GET /workflows?shard_id=3` gives
+`None`, because that handler lists every shard. To read a body, the hook
+buffers it under the app's own body limit, then hands it to the handler. A body
+over the limit gets `413` before the hook runs.
 
 Harvest calls the hook once for each distinct shard a request names. With no
 shard, it calls it once with `shard: None`. `None` means Harvest cannot name
@@ -366,7 +384,8 @@ shard by hash. To confine a caller to some shards, deny `None` too.
 ### Deny audit (issue #1803)
 
 Every token-scope deny and every hook deny writes one `harvest_audit_log` row
-on the control shard. The write is best effort: a failed write is logged, and
+on the control shard. That includes the read-scope deny on a generated MCP tool
+route. The write is best effort: a failed write is logged, and
 the caller still gets `403`. A read-only-role deny and a tenant-header `400`
 write no row. The row holds these values:
 
@@ -375,10 +394,11 @@ write no row. The row holds these values:
 | `operation` | `authz.deny` |
 | `target_type` | `route` |
 | `status` | `failed`, so the SIEM export marks it `ERROR` |
-| `actor` | `token:{id}` for a token. Otherwise, the value of the actor extractor. By default, that is the `x-harvest-actor` header or `anonymous`. A caller with no credential can set it. |
+| `actor` | `token:{id}` for a token. Otherwise, the value of the actor extractor. By default, that is the `x-harvest-actor` header or `anonymous`. A caller with no credential can set it. Cut to 256 bytes. |
+| `request_id` | The `x-request-id` header, cut to 256 bytes |
 | `route_or_command` | `METHOD path`, with the path cut to 256 bytes |
 | `shard_id` | The denied shard, if any |
-| `error_summary` | `token scope '<scope>' does not allow this route`, or `authorizer denied (tenant=…, shard=…): <reason>`. Cut to 512 bytes. |
+| `error_summary` | `token scope '<scope>' does not allow this route`, or `authorizer denied (tenant="…", shard=…): <reason>`. The tenant is quoted and escaped. Cut to 512 bytes. |
 
 The [audit export](./audit-export.md) ships these rows like any other.
 

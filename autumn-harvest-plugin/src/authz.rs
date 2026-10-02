@@ -23,10 +23,12 @@
 //!   An unclassified path is `Mutating`.
 //! - `tenant_key`: the [`autumn_harvest::audit::HEADER_TENANT`] header.
 //!   The caller declares it. Harvest does not bind it to stored executions.
-//! - `shard`: from an execution id in the path, a `shard_id` query parameter,
-//!   or the `shard_id` / `residency_key` of a start body. `None` means Harvest
-//!   cannot name the shard before the handler runs. A list route reads every
-//!   shard. A by-id route or an unpinned start reaches one shard by hash.
+//! - `shard`: read only from a source the route's handler uses. That is an
+//!   execution id in the path (also under `/ui`), a shard query parameter on a
+//!   route that filters by it, or a shard field in the body of a route that
+//!   targets one shard (see [`SHARD_SOURCES`]). `None` means Harvest cannot
+//!   name the shard before the handler runs. A list route reads every shard.
+//!   A by-id route or an unpinned start reaches one shard by hash.
 //!
 //! # Audit volume
 //!
@@ -39,7 +41,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use autumn_web::reexports::axum;
-use axum::extract::{Request, State};
+use axum::body::{Body, Bytes};
+use axum::extract::{FromRequest, Request, State};
 use axum::http::{Extensions, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -54,17 +57,13 @@ use autumn_harvest::shard::ShardPlacement;
 use autumn_harvest::types::ShardId;
 
 use crate::api::{
-    HarvestApiState, acquire_conn, audit_context, classify_route, execution_id_in_path,
+    HarvestApiState, RouteMatchers, acquire_conn, audit_context, build_route_matchers,
+    classify_route, execution_id_in_path, is_form_urlencoded, match_route,
 };
 use crate::api_token::{TokenPrincipal, TokenScope};
 
 /// Longest accepted [`HEADER_TENANT`] value, in bytes.
 pub const MAX_TENANT_KEY_LEN: usize = 128;
-
-/// Largest start body the hook buffers to read its placement.
-///
-/// This is axum's default body limit, which the start route also applies.
-const MAX_START_BODY_BYTES: usize = 2 * 1024 * 1024;
 
 /// Longest request path an audit row records.
 const MAX_AUDITED_PATH_LEN: usize = 256;
@@ -72,8 +71,15 @@ const MAX_AUDITED_PATH_LEN: usize = 256;
 /// Longest `error_summary` an audit row records.
 const MAX_AUDITED_SUMMARY_LEN: usize = 512;
 
+/// Longest caller-supplied actor or request id an audit row records.
+///
+/// Both come from headers. Before `require_admin` runs, nothing has checked
+/// them, so the cap bounds what one denied request can write.
+const MAX_AUDITED_HEADER_LEN: usize = 256;
+
 /// Who made the request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AuthzPrincipal {
     /// A verified Harvest API token.
     Token {
@@ -169,7 +175,9 @@ pub type AuthzFuture<'a> = Pin<Box<dyn Future<Output = AuthzDecision> + Send + '
 /// A per-request authorization policy (issue #1803).
 ///
 /// A plain `Fn(&AuthzRequest) -> AuthzDecision` closure implements this trait.
-/// Implement it directly when the policy needs I/O.
+/// Annotate the closure argument as `|req: &AuthzRequest<'_>|`, or the
+/// compiler cannot infer it. Implement the trait directly when the policy
+/// needs I/O.
 ///
 /// A panic in `authorize` aborts the request. It never lets it through.
 pub trait HarvestAuthorizer: Send + Sync + 'static {
@@ -198,12 +206,12 @@ impl HarvestAuthorizer for AllowAll {
 
 /// A cloneable handle to an installed authorizer.
 #[derive(Clone)]
-pub struct SharedAuthorizer(Arc<dyn HarvestAuthorizer>);
+pub(crate) struct SharedAuthorizer(Arc<dyn HarvestAuthorizer>);
 
 impl SharedAuthorizer {
     /// Wrap `authorizer`.
     #[must_use]
-    pub fn new(authorizer: impl HarvestAuthorizer) -> Self {
+    pub(crate) fn new(authorizer: impl HarvestAuthorizer) -> Self {
         Self(Arc::new(authorizer))
     }
 }
@@ -249,12 +257,14 @@ pub(crate) async fn audit_deny(conn: &mut AsyncPgConnection, deny: &DenyAudit<'_
         truncate(deny.path, MAX_AUDITED_PATH_LEN)
     );
     let record = NewAuditRecord {
-        actor: deny.actor,
+        actor: truncate(deny.actor, MAX_AUDITED_HEADER_LEN),
         operation: OP_AUTHZ_DENY,
         target_type: TARGET_ROUTE,
         target_id: None,
         route_or_command: &route,
-        request_id: deny.request_id,
+        request_id: deny
+            .request_id
+            .map(|id| truncate(id, MAX_AUDITED_HEADER_LEN)),
         idempotency_key: None,
         status: STATUS_FAILED,
         error_summary: Some(truncate(deny.summary, MAX_AUDITED_SUMMARY_LEN)),
@@ -266,24 +276,122 @@ pub(crate) async fn audit_deny(conn: &mut AsyncPgConnection, deny: &DenyAudit<'_
     }
 }
 
-// ── Request inputs ────────────────────────────────────────────────────────────
+// ── Shard sources ─────────────────────────────────────────────────────────────
 
-/// Read the tenant header. `Err` means the header is present but unusable.
-fn tenant_key(request: &Request) -> Result<Option<String>, ()> {
-    let Some(raw) = request.headers().get(HEADER_TENANT) else {
-        return Ok(None);
-    };
-    let value = raw.to_str().map_err(|_| ())?.trim();
-    if value.is_empty() || value.len() > MAX_TENANT_KEY_LEN {
-        return Err(());
-    }
-    Ok(Some(value.to_string()))
+/// Where a route's handler reads the one shard it acts on.
+///
+/// The hook reads a shard only from the source the handler uses. A shard named
+/// anywhere else is ignored, so a caller cannot show the hook one shard while
+/// the handler acts on all of them.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ShardSource {
+    /// Query parameters with these names. Every value counts.
+    Query(&'static [&'static str]),
+    /// A JSON body field with this name. `form` also reads a form body.
+    Body { field: &'static str, form: bool },
+    /// A start body: `shard_id`, or a `residency_key` the router resolves.
+    StartBody,
+}
+
+/// Routes whose handler reads its shard from the query or the body.
+///
+/// Execution ids in the path are found from [`execution_id_in_path`] instead.
+/// Each template must be in [`autumn_harvest::audit::CLASSIFIED_ROUTES`].
+pub(crate) const SHARD_SOURCES: &[(&str, ShardSource)] = &[
+    (
+        "GET /admin/history/exports",
+        ShardSource::Query(&["shard_id", "shard-id", "shard"]),
+    ),
+    (
+        "GET /admin/history/export-sample",
+        ShardSource::Query(&["shard_id", "shard-id", "shard"]),
+    ),
+    (
+        "GET /admin/external-handoffs",
+        ShardSource::Query(&["shard_id", "shard"]),
+    ),
+    (
+        "POST /workflows/{workflow_name}/start",
+        ShardSource::StartBody,
+    ),
+    (
+        "POST /dead-letters/replay",
+        ShardSource::Body {
+            field: "shard_id",
+            form: true,
+        },
+    ),
+    (
+        "POST /dead-letters/discard",
+        ShardSource::Body {
+            field: "shard_id",
+            form: true,
+        },
+    ),
+    (
+        "POST /dlq/redrive",
+        ShardSource::Body {
+            field: "shard_id",
+            form: false,
+        },
+    ),
+    (
+        "POST /admin/queues/{queue_name}/pause",
+        ShardSource::Body {
+            field: "shard_id",
+            form: false,
+        },
+    ),
+    (
+        "POST /admin/queues/{queue_name}/resume",
+        ShardSource::Body {
+            field: "shard_id",
+            form: false,
+        },
+    ),
+    (
+        "POST /admin/audit-export/redrive",
+        ShardSource::Body {
+            field: "shard",
+            form: false,
+        },
+    ),
+    (
+        "POST /admin/audit-export/decommission",
+        ShardSource::Body {
+            field: "shard",
+            form: false,
+        },
+    ),
+    (
+        "POST /admin/audit-export/reactivate",
+        ShardSource::Body {
+            field: "shard",
+            form: false,
+        },
+    ),
+];
+
+/// The shard source of `method` and `path`, if the route has one.
+fn shard_source(method: &Method, path: &str) -> Option<ShardSource> {
+    static MATCHERS: std::sync::OnceLock<RouteMatchers<ShardSource>> = std::sync::OnceLock::new();
+    let matchers = MATCHERS
+        .get_or_init(|| build_route_matchers("SHARD_SOURCES", SHARD_SOURCES.iter().copied()));
+    match_route(matchers, method, path).map(|m| *m.value)
+}
+
+/// A non-negative shard number, or `None`.
+fn shard_number(raw: i64) -> Option<ShardId> {
+    i32::try_from(raw)
+        .ok()
+        .filter(|n| *n >= 0)
+        .map(ShardId::new)
 }
 
 /// The shard an execution id in the path routes to.
 ///
-/// A retired shard resolves to its successor. An id with no encoded shard
-/// resolves to the default shard.
+/// A retired shard resolves to its successor. With a storage pool, an id with
+/// no encoded shard resolves to the default shard. With no pool, it has none.
 fn path_shard(api_state: &HarvestApiState, method: &Method, path: &str) -> Option<ShardId> {
     let exec_id = execution_id_in_path(method, path)?;
     api_state.storage_pool().map_or_else(
@@ -292,61 +400,85 @@ fn path_shard(api_state: &HarvestApiState, method: &Method, path: &str) -> Optio
     )
 }
 
-/// The shards named by a `shard_id`, `shard-id` or `shard` query parameter.
+/// The shards named by `keys` in the query, decoded as the handlers decode it.
 ///
-/// Decoded as the handlers decode it. A value that does not parse is skipped,
-/// because the handler rejects it.
-fn query_shards(uri: &axum::http::Uri) -> Vec<ShardId> {
-    let Ok(axum::extract::Query(pairs)) =
-        axum::extract::Query::<Vec<(String, String)>>::try_from_uri(uri)
-    else {
+/// A query that does not decode, or a value that does not parse, names no
+/// shard. The handler rejects it.
+fn query_shards(query: Option<&str>, keys: &[&str]) -> Vec<ShardId> {
+    let Some(Ok(pairs)) = query.map(crate::strict_query::parse_raw_query_pairs_strict) else {
         return Vec::new();
     };
     pairs
         .into_iter()
-        .filter(|(k, _)| matches!(k.as_str(), "shard_id" | "shard-id" | "shard"))
-        .filter_map(|(_, v)| v.trim().parse::<i32>().ok())
-        .filter(|n| *n >= 0)
-        .map(ShardId::new)
+        .filter(|(k, _)| keys.contains(&k.as_str()))
+        .filter_map(|(_, v)| v.trim().parse::<i64>().ok())
+        .filter_map(shard_number)
         .collect()
 }
 
-/// The workflow name of a `POST /workflows/{workflow_name}/start` path.
-fn start_route_workflow<'p>(method: &Method, path: &'p str) -> Option<&'p str> {
-    if *method != Method::POST {
-        return None;
-    }
-    let rest = path.strip_prefix("/workflows/")?;
-    let name = rest.strip_suffix("/start")?;
-    (!name.is_empty() && !name.contains('/')).then_some(name)
+/// The start-body fields that pick a shard. Other fields are skipped.
+#[derive(serde::Deserialize)]
+struct StartPlacement {
+    #[serde(default)]
+    shard_id: Option<i64>,
+    #[serde(default)]
+    residency_key: Option<String>,
 }
 
 /// The shard a start body pins, if it pins one.
 ///
 /// A `residency_key` resolves through the shard router. A body that does not
-/// parse, or names no placement, pins nothing. The handler validates it.
-fn start_body_shard(api_state: &HarvestApiState, workflow: &str, body: &[u8]) -> Option<ShardId> {
-    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
-    if let Some(raw) = value.get("shard_id").and_then(serde_json::Value::as_i64) {
-        return i32::try_from(raw)
-            .ok()
-            .filter(|n| *n >= 0)
-            .map(ShardId::new);
+/// parse names no shard. The handler rejects it.
+fn start_body_shard(api_state: &HarvestApiState, body: &[u8]) -> Option<ShardId> {
+    let placement: StartPlacement = serde_json::from_slice(body).ok()?;
+    if let Some(raw) = placement.shard_id {
+        return shard_number(raw);
     }
-    let key = value.get("residency_key")?.as_str()?.trim();
+    let key = placement.residency_key?;
+    let key = key.trim();
     if key.is_empty() {
         return None;
     }
-    let runtime = api_state.runtime().ok()?;
-    let placement = ShardPlacement::residency_key(key);
-    let workflow_id = value
-        .get("workflow_id")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    runtime
+    // A residency key maps to one shard whatever the workflow name or id.
+    api_state
+        .runtime()
+        .ok()?
         .router()
-        .resolve_placement_for_lookup(&placement, workflow, workflow_id)
+        .resolve_placement_for_lookup(&ShardPlacement::residency_key(key), "", "")
         .ok()
+}
+
+/// The shard one body `field` names, from a JSON or a form body.
+fn body_field_shard(field: &str, form: bool, is_form: bool, body: &[u8]) -> Option<ShardId> {
+    if form && is_form {
+        let raw = std::str::from_utf8(body).ok()?;
+        let pairs = crate::strict_query::parse_raw_query_pairs_strict(raw).ok()?;
+        let value = pairs.into_iter().rev().find(|(k, _)| k == field)?.1;
+        return value.trim().parse::<i64>().ok().and_then(shard_number);
+    }
+    let value: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(body).ok()?;
+    value.get(field)?.as_i64().and_then(shard_number)
+}
+
+// ── Request inputs ────────────────────────────────────────────────────────────
+
+/// Read the tenant header. `Err` means the header is present but unusable.
+///
+/// A repeated header is refused, because two layers could each read a
+/// different value.
+fn tenant_key(request: &Request) -> Result<Option<String>, ()> {
+    let mut values = request.headers().get_all(HEADER_TENANT).iter();
+    let Some(raw) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(());
+    }
+    let value = raw.to_str().map_err(|_| ())?.trim();
+    if value.is_empty() || value.len() > MAX_TENANT_KEY_LEN {
+        return Err(());
+    }
+    Ok(Some(value.to_string()))
 }
 
 fn forbidden() -> Response {
@@ -362,7 +494,7 @@ fn bad_tenant() -> Response {
         StatusCode::BAD_REQUEST,
         axum::Json(serde_json::json!({
             "error": format!(
-                "invalid {HEADER_TENANT} header: expected 1 to {MAX_TENANT_KEY_LEN} visible characters"
+                "invalid {HEADER_TENANT} header: expected one value of 1 to {MAX_TENANT_KEY_LEN} visible characters"
             )
         })),
     )
@@ -375,7 +507,7 @@ fn bad_tenant() -> Response {
 ///
 /// Installed only by `with_authorizer`. It runs after the token layer, so it
 /// sees a verified [`TokenPrincipal`]. It runs before `require_admin`.
-pub async fn enforce_authorizer(
+pub(crate) async fn enforce_authorizer(
     State((api_state, authorizer)): State<(HarvestApiState, SharedAuthorizer)>,
     request: Request,
     next: Next,
@@ -392,18 +524,30 @@ pub async fn enforce_authorizer(
     let path = request.uri().path().to_string();
     let mut shards = Vec::new();
     shards.extend(path_shard(&api_state, &method, &path));
-    shards.extend(query_shards(request.uri()));
 
-    // Buffer a start body to read its placement, then put it back.
-    let request = if let Some(workflow) = start_route_workflow(&method, &path) {
-        let (parts, body) = request.into_parts();
-        let Ok(bytes) = axum::body::to_bytes(body, MAX_START_BODY_BYTES).await else {
-            return StatusCode::PAYLOAD_TOO_LARGE.into_response();
-        };
-        shards.extend(start_body_shard(&api_state, workflow, &bytes));
-        Request::from_parts(parts, axum::body::Body::from(bytes))
-    } else {
-        request
+    let request = match shard_source(&method, &path) {
+        None => request,
+        Some(ShardSource::Query(keys)) => {
+            shards.extend(query_shards(request.uri().query(), keys));
+            request
+        }
+        Some(source) => {
+            // Buffer the body under the app's own limit, read the shard, then
+            // put the body back for the handler.
+            let is_form = is_form_urlencoded(request.headers());
+            let (parts, body) = request.into_parts();
+            let bytes =
+                match Bytes::from_request(Request::from_parts(parts.clone(), body), &()).await {
+                    Ok(bytes) => bytes,
+                    Err(rejection) => return rejection.into_response(),
+                };
+            shards.extend(match source {
+                ShardSource::StartBody => start_body_shard(&api_state, &bytes),
+                ShardSource::Body { field, form } => body_field_shard(field, form, is_form, &bytes),
+                ShardSource::Query(_) => None,
+            });
+            Request::from_parts(parts, Body::from(bytes))
+        }
     };
     shards.sort_unstable_by_key(|s| s.as_i32());
     shards.dedup();
@@ -438,8 +582,10 @@ pub async fn enforce_authorizer(
             "harvest: authorizer denied request (403)"
         );
         let (actor, source, request_id) = audit_context(request.headers(), &api_state);
+        // Debug-quote the tenant, so a crafted value cannot forge the text
+        // that follows it.
         let summary = format!(
-            "authorizer denied (tenant={}, shard={}): {reason}",
+            "authorizer denied (tenant={:?}, shard={}): {reason}",
             tenant.as_deref().unwrap_or("-"),
             shard.map_or_else(|| "-".to_string(), |s| s.as_i32().to_string()),
         );
@@ -480,41 +626,60 @@ mod tests {
     }
 
     #[test]
-    fn query_shards_reads_every_alias() {
-        let shards = |q: &str| query_shards(&q.parse::<axum::http::Uri>().unwrap());
-        assert_eq!(shards("/workflows"), Vec::<ShardId>::new());
-        assert_eq!(shards("/workflows?shard_id=7"), vec![ShardId::new(7)]);
-        assert_eq!(shards("/workflows?shard=2&limit=5"), vec![ShardId::new(2)]);
-        assert_eq!(shards("/workflows?shard-id=3"), vec![ShardId::new(3)]);
-        // Percent-encoding decodes as in the handlers.
-        assert_eq!(shards("/workflows?shard%5Fid=4"), vec![ShardId::new(4)]);
-        assert_eq!(
-            shards("/workflows?shard_id=x&shard_id=-1"),
-            Vec::<ShardId>::new()
-        );
+    fn shard_sources_are_classified_routes() {
+        for (template, _) in SHARD_SOURCES {
+            assert!(
+                autumn_harvest::audit::CLASSIFIED_ROUTES
+                    .iter()
+                    .any(|(r, _)| r == template),
+                "{template} must be a classified route"
+            );
+        }
     }
 
     #[test]
-    fn start_route_workflow_matches_only_the_start_route() {
+    fn shard_source_matches_only_listed_routes() {
+        assert!(matches!(
+            shard_source(&Method::POST, "/workflows/wf/start"),
+            Some(ShardSource::StartBody)
+        ));
+        assert!(matches!(
+            shard_source(&Method::GET, "/admin/history/exports"),
+            Some(ShardSource::Query(_))
+        ));
+        assert!(shard_source(&Method::GET, "/workflows").is_none());
+        assert!(shard_source(&Method::POST, "/workflows/wf/signal-with-start").is_none());
+    }
+
+    #[test]
+    fn query_shards_reads_only_the_given_keys() {
+        let keys = &["shard_id", "shard"];
+        assert_eq!(query_shards(None, keys), Vec::<ShardId>::new());
         assert_eq!(
-            start_route_workflow(&Method::POST, "/workflows/wf/start"),
-            Some("wf")
+            query_shards(Some("shard_id=7"), keys),
+            vec![ShardId::new(7)]
         );
         assert_eq!(
-            start_route_workflow(&Method::GET, "/workflows/wf/start"),
-            None
+            query_shards(Some("shard=2&shard_id=3"), keys),
+            vec![ShardId::new(2), ShardId::new(3)]
         );
         assert_eq!(
-            start_route_workflow(&Method::POST, "/workflows//start"),
-            None
+            query_shards(Some("shard-id=3"), keys),
+            Vec::<ShardId>::new()
+        );
+        // Percent-encoding decodes as in the handlers.
+        assert_eq!(
+            query_shards(Some("shard%5Fid=4"), keys),
+            vec![ShardId::new(4)]
         );
         assert_eq!(
-            start_route_workflow(&Method::POST, "/workflows/a/b/start"),
-            None
+            query_shards(Some("shard_id=x&shard_id=-1"), keys),
+            Vec::<ShardId>::new()
         );
+        // A query that does not decode names no shard.
         assert_eq!(
-            start_route_workflow(&Method::POST, "/workflows/wf/signal-with-start"),
-            None
+            query_shards(Some("shard_id=%FF"), keys),
+            Vec::<ShardId>::new()
         );
     }
 
@@ -522,15 +687,36 @@ mod tests {
     fn start_body_shard_reads_an_explicit_shard() {
         let state = HarvestApiState::new();
         assert_eq!(
-            start_body_shard(&state, "wf", br#"{"shard_id": 4}"#),
+            start_body_shard(&state, br#"{"shard_id": 4, "input": {"shard_id": 9}}"#),
             Some(ShardId::new(4))
         );
-        assert_eq!(start_body_shard(&state, "wf", br#"{"shard_id": -4}"#), None);
-        assert_eq!(start_body_shard(&state, "wf", br"{}"), None);
-        assert_eq!(start_body_shard(&state, "wf", b"not json"), None);
+        assert_eq!(start_body_shard(&state, br#"{"shard_id": -4}"#), None);
+        assert_eq!(start_body_shard(&state, br"{}"), None);
+        assert_eq!(start_body_shard(&state, b"not json"), None);
         // No runtime is installed, so a residency key cannot resolve.
         assert_eq!(
-            start_body_shard(&state, "wf", br#"{"residency_key": "eu"}"#),
+            start_body_shard(&state, br#"{"residency_key": "eu"}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn body_field_shard_reads_json_and_form() {
+        assert_eq!(
+            body_field_shard("shard", false, false, br#"{"shard": 5}"#),
+            Some(ShardId::new(5))
+        );
+        assert_eq!(
+            body_field_shard("shard_id", true, true, b"dry_run=true&shard_id=6"),
+            Some(ShardId::new(6))
+        );
+        // A form body on a JSON-only route is read as JSON, and fails.
+        assert_eq!(
+            body_field_shard("shard_id", false, true, b"shard_id=6"),
+            None
+        );
+        assert_eq!(
+            body_field_shard("shard", false, false, br#"{"shard": "5"}"#),
             None
         );
     }

@@ -30,6 +30,7 @@ use autumn_harvest_plugin::api::{
 };
 use autumn_harvest_plugin::api_token::TokenScope;
 use autumn_harvest_plugin::authz::{AuthzDecision, AuthzPrincipal, AuthzRequest};
+use autumn_harvest_plugin::harvest_ui_router;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -69,6 +70,10 @@ fn build_pool(url: &str) -> DbPool {
 }
 
 fn api_state(pool: &DbPool) -> HarvestApiState {
+    api_state_with_router(pool, ShardRouter::default())
+}
+
+fn api_state_with_router(pool: &DbPool, router: ShardRouter) -> HarvestApiState {
     let api_state = HarvestApiState::new();
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
@@ -79,9 +84,15 @@ fn api_state(pool: &DbPool) -> HarvestApiState {
         vec!["default".to_string()],
         SchedulerMonitor::offline(),
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
-        ShardRouter::default(),
+        router,
     ));
     api_state
+}
+
+/// The management router with Vantage nested at `/ui`, as `HarvestPlugin`
+/// composes it.
+fn composed_router(state: &HarvestApiState) -> axum::Router {
+    harvest_api_router(state.clone()).nest("/ui", harvest_ui_router(state.clone()))
 }
 
 /// The embedder admin boundary plus the token layer. The boundary mints tokens.
@@ -106,12 +117,38 @@ fn authorized_app<F>(pool: &DbPool, authorizer: F) -> App
 where
     F: Fn(&AuthzRequest<'_>) -> AuthzDecision + Send + Sync + 'static,
 {
-    let state = api_state(pool);
+    authorized_app_with_state(&api_state(pool), authorizer)
+}
+
+fn authorized_app_with_state<F>(state: &HarvestApiState, authorizer: F) -> App
+where
+    F: Fn(&AuthzRequest<'_>) -> AuthzDecision + Send + Sync + 'static,
+{
     StandaloneAdminAuth::new()
         .with_api_tokens()
         .with_admin_auth_boundary()
         .with_authorizer(authorizer)
-        .mount(harvest_api_router(state.clone()), &state)
+        .mount(composed_router(state), state)
+}
+
+/// A hook that denies shard 7 and allows everything else.
+fn deny_shard_7(req: &AuthzRequest<'_>) -> AuthzDecision {
+    if req.shard == Some(ShardId::new(7)) {
+        AuthzDecision::deny("shard 7 is out of region")
+    } else {
+        AuthzDecision::Allow
+    }
+}
+
+/// A hook that records the shard of every call and allows it.
+fn recording_app(pool: &DbPool) -> (App, Arc<Mutex<Vec<Option<ShardId>>>>) {
+    let seen: Arc<Mutex<Vec<Option<ShardId>>>> = Arc::default();
+    let sink = seen.clone();
+    let app = authorized_app(pool, move |req| {
+        sink.lock().unwrap().push(req.shard);
+        AuthzDecision::Allow
+    });
+    (app, seen)
 }
 
 async fn scrub(conn: &mut AsyncPgConnection) {
@@ -128,6 +165,7 @@ struct Call<'a> {
     method: &'a str,
     uri: &'a str,
     body: Option<Value>,
+    form: Option<&'a str>,
     bearer: Option<&'a str>,
     tenant: Option<&'a str>,
 }
@@ -138,9 +176,15 @@ impl<'a> Call<'a> {
             method,
             uri,
             body: None,
+            form: None,
             bearer: None,
             tenant: None,
         }
+    }
+
+    const fn form(mut self, form: &'a str) -> Self {
+        self.form = Some(form);
+        self
     }
 
     fn body(mut self, body: Value) -> Self {
@@ -164,18 +208,21 @@ async fn send(app: &App, call: Call<'_>) -> (StatusCode, Value) {
     if call.body.is_some() {
         builder = builder.header("content-type", "application/json");
     }
+    if call.form.is_some() {
+        builder = builder.header("content-type", "application/x-www-form-urlencoded");
+    }
     if let Some(b) = call.bearer {
         builder = builder.header("authorization", format!("Bearer {b}"));
     }
     if let Some(t) = call.tenant {
         builder = builder.header("x-harvest-tenant", t);
     }
-    let req = builder
-        .body(
-            call.body
-                .map_or_else(Body::empty, |b| Body::from(b.to_string())),
-        )
-        .unwrap();
+    let body = match (call.body, call.form) {
+        (Some(json), _) => Body::from(json.to_string()),
+        (None, Some(form)) => Body::from(form.to_string()),
+        (None, None) => Body::empty(),
+    };
+    let req = builder.body(body).unwrap();
     let response = app.clone().oneshot(req).await.expect("request");
     let status = response.status();
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -218,6 +265,19 @@ struct DenyRow {
     shard_id: Option<i32>,
 }
 
+async fn count_tokens(conn: &mut AsyncPgConnection) -> i64 {
+    #[derive(diesel::QueryableByName)]
+    struct C {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    diesel::sql_query("SELECT COUNT(*) AS n FROM harvest_api_tokens")
+        .get_result::<C>(conn)
+        .await
+        .unwrap()
+        .n
+}
+
 async fn deny_rows(conn: &mut AsyncPgConnection) -> Vec<DenyRow> {
     diesel::sql_query(
         "SELECT actor, status, route_or_command, error_summary, shard_id \
@@ -241,7 +301,8 @@ async fn mutate_token_cannot_mint_or_revoke_tokens() {
     let standalone = standalone_app(&pool);
 
     let (mutate_id, mutate) = mint(&boundary, "ci", "mutate").await;
-    let (victim_id, _) = mint(&boundary, "victim", "read").await;
+    let (victim_id, victim) = mint(&boundary, "victim", "read").await;
+    let tokens_before = count_tokens(&mut conn).await;
 
     let (status, body) = send(
         &standalone,
@@ -258,6 +319,15 @@ async fn mutate_token_cannot_mint_or_revoke_tokens() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "mutate revoke: {body:?}");
+
+    // A deny has no side effect: no child token, and the victim still works.
+    assert_eq!(count_tokens(&mut conn).await, tokens_before);
+    let (status, _) = send(&standalone, Call::new("GET", "/workflows").bearer(&victim)).await;
+    assert_ne!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "the victim token is still live"
+    );
 
     // A `mutate` token still reaches an ordinary mutation.
     let (status, _) = send(
@@ -377,7 +447,7 @@ async fn authorizer_denies_by_tenant_key() {
     assert_eq!(rows.len(), 1, "{rows:?}");
     let summary = rows[0].error_summary.as_deref().unwrap_or_default();
     assert!(summary.contains("tenant globex is closed"), "{summary}");
-    assert!(summary.contains("tenant=globex"), "{summary}");
+    assert!(summary.contains(r#"tenant="globex""#), "{summary}");
     assert_eq!(rows[0].route_or_command, "GET /workflows");
 }
 
@@ -392,6 +462,13 @@ async fn oversized_tenant_header_is_400() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
+/// Percent-encode the first character of an id, as a client may.
+fn encode_first_char(id: &str) -> String {
+    let mut chars = id.chars();
+    let first = chars.next().expect("non-empty id");
+    format!("%{:02X}{}", u32::from(first), chars.as_str())
+}
+
 /// A custom authorizer denies by shard. The shard comes from the execution id
 /// in the path, a `shard_id` query parameter, or a start body.
 #[tokio::test]
@@ -400,13 +477,7 @@ async fn authorizer_denies_by_shard() {
     let pool = build_pool(&url);
     let mut conn = pool.get().await.unwrap();
     scrub(&mut conn).await;
-    let app = authorized_app(&pool, |req| {
-        if req.shard == Some(ShardId::new(7)) {
-            AuthzDecision::deny("shard 7 is out of region")
-        } else {
-            AuthzDecision::Allow
-        }
-    });
+    let app = authorized_app(&pool, deny_shard_7);
 
     let on_7 = ExecutionId::new_for_shard(ShardId::new(7));
     let on_3 = ExecutionId::new_for_shard(ShardId::new(3));
@@ -416,10 +487,34 @@ async fn authorizer_denies_by_shard() {
     let (status, _) = send(&app, Call::new("GET", &format!("/workflows/{on_3}"))).await;
     assert_ne!(status, StatusCode::FORBIDDEN, "exec id on shard 3");
 
-    let (status, _) = send(&app, Call::new("GET", "/workflows?shard_id=7")).await;
+    // The handler decodes the path, so the hook must too.
+    let encoded = encode_first_char(&on_7.to_string());
+    let (status, _) = send(
+        &app,
+        Call::new("POST", &format!("/workflows/{encoded}/cancel")).body(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "percent-encoded exec id");
+
+    // HEAD is served by the GET handler.
+    let (status, _) = send(&app, Call::new("HEAD", &format!("/workflows/{on_7}"))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "HEAD on shard 7");
+
+    // A query shard on a route that scopes by it.
+    let (status, _) = send(&app, Call::new("GET", "/admin/history/exports?shard_id=7")).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "query shard_id=7");
-    let (status, _) = send(&app, Call::new("GET", "/workflows?shard_id=3")).await;
+    let (status, _) = send(&app, Call::new("GET", "/admin/history/exports?shard_id=3")).await;
     assert_ne!(status, StatusCode::FORBIDDEN, "query shard_id=3");
+    let (status, _) = send(
+        &app,
+        Call::new("GET", "/admin/external-handoffs?shard=3&shard=7"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "every named shard is checked"
+    );
 
     let (status, _) = send(
         &app,
@@ -427,12 +522,19 @@ async fn authorizer_denies_by_shard() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "start pinned to shard 7");
-    let (status, _) = send(
+    // The handler gets the rebuilt body. A field of the wrong type proves it:
+    // the handler's JSON extractor answers 422, where an empty body gives 400.
+    let (status, body) = send(
         &app,
-        Call::new("POST", "/workflows/some-wf/start").body(json!({ "shard_id": 3 })),
+        Call::new("POST", "/workflows/some-wf/start")
+            .body(json!({ "shard_id": 3, "reuse_policy": 5 })),
     )
     .await;
-    assert_ne!(status, StatusCode::FORBIDDEN, "start pinned to shard 3");
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "the handler must see the start body: {body:?}"
+    );
 
     // Ids of other kinds never decode to a shard.
     let (status, _) = send(&app, Call::new("DELETE", &format!("/admin/tokens/{on_7}"))).await;
@@ -443,8 +545,228 @@ async fn authorizer_denies_by_shard() {
     );
 
     let rows = deny_rows(&mut conn).await;
-    assert_eq!(rows.len(), 3, "{rows:?}");
+    assert_eq!(rows.len(), 6, "{rows:?}");
     assert!(rows.iter().all(|r| r.shard_id == Some(7)), "{rows:?}");
+}
+
+/// A query shard on a route that ignores it must not reach the hook. The
+/// handler reads every shard, so the hook sees `None`.
+#[tokio::test]
+async fn query_shard_on_a_route_that_ignores_it_is_none() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let (app, seen) = recording_app(&pool);
+
+    let (status, _) = send(&app, Call::new("GET", "/workflows?shard_id=7")).await;
+    assert_ne!(status, StatusCode::FORBIDDEN);
+    assert_eq!(seen.lock().unwrap().clone(), vec![None]);
+}
+
+/// The nested `/ui` routes carry the shard of their execution id.
+#[tokio::test]
+async fn ui_execution_routes_carry_the_shard() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    scrub(&mut conn).await;
+    let app = authorized_app(&pool, deny_shard_7);
+
+    let on_7 = ExecutionId::new_for_shard(ShardId::new(7));
+    let on_3 = ExecutionId::new_for_shard(ShardId::new(3));
+    let (status, _) = send(
+        &app,
+        Call::new("POST", &format!("/ui/workflows/{on_7}/cancel")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "UI cancel on shard 7");
+    let (status, _) = send(&app, Call::new("GET", &format!("/ui/workflows/{on_7}"))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "UI detail on shard 7");
+    let (status, _) = send(
+        &app,
+        Call::new("POST", &format!("/ui/dags/nightly/runs/{on_7}/retry")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "UI DAG retry on shard 7");
+    let (status, _) = send(&app, Call::new("GET", &format!("/ui/workflows/{on_3}"))).await;
+    assert_ne!(status, StatusCode::FORBIDDEN, "UI detail on shard 3");
+    assert_eq!(deny_rows(&mut conn).await.len(), 3);
+}
+
+/// Mutations that name a shard in the body carry it to the hook.
+#[tokio::test]
+async fn body_shard_routes_carry_the_shard() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    scrub(&mut conn).await;
+    let app = authorized_app(&pool, deny_shard_7);
+
+    for (uri, body) in [
+        (
+            "/admin/queues/q/pause",
+            json!({ "shard_id": 7, "reason": "drill" }),
+        ),
+        (
+            "/admin/queues/q/resume",
+            json!({ "shard_id": 7, "reason": "drill" }),
+        ),
+        ("/dlq/redrive", json!({ "shard_id": 7 })),
+        ("/dead-letters/replay", json!({ "shard_id": 7 })),
+        ("/admin/audit-export/decommission", json!({ "shard": 7 })),
+        ("/admin/audit-export/reactivate", json!({ "shard": 7 })),
+        (
+            "/admin/audit-export/redrive",
+            json!({ "shard": 7, "to_seq": 0 }),
+        ),
+    ] {
+        let (status, resp) = send(&app, Call::new("POST", uri).body(body)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {resp:?}");
+    }
+    // The bulk DLQ routes also take a form body.
+    let (status, _) = send(
+        &app,
+        Call::new("POST", "/dead-letters/discard").form("shard_id=7&dry_run=true"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "form shard_id=7");
+
+    // No shard in the body means every shard, so the hook sees `None`.
+    let (status, _) = send(
+        &app,
+        Call::new("POST", "/admin/queues/q/pause").body(json!({ "reason": "drill" })),
+    )
+    .await;
+    assert_ne!(status, StatusCode::FORBIDDEN, "fleet-wide pause");
+    assert_eq!(deny_rows(&mut conn).await.len(), 8);
+}
+
+/// A start body `residency_key` resolves through the shard router.
+#[tokio::test]
+async fn residency_key_start_resolves_the_shard() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    scrub(&mut conn).await;
+    let shards = vec![ShardId::new(0), ShardId::new(7)];
+    let router = ShardRouter::new(shards.clone(), shards, ShardId::new(0))
+        .with_residency_map([("eu".to_string(), ShardId::new(7))]);
+    let app = authorized_app_with_state(&api_state_with_router(&pool, router), deny_shard_7);
+
+    let (status, _) = send(
+        &app,
+        Call::new("POST", "/workflows/some-wf/start").body(json!({ "residency_key": " eu " })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "eu resolves to shard 7");
+    let (status, _) = send(
+        &app,
+        Call::new("POST", "/workflows/some-wf/start").body(json!({ "residency_key": "us" })),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::FORBIDDEN,
+        "undeclared key: the handler decides"
+    );
+    let rows = deny_rows(&mut conn).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].shard_id, Some(7));
+}
+
+/// Repeated or malformed tenant headers are rejected. OPTIONS skips the hook.
+#[tokio::test]
+async fn tenant_header_edge_cases() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let (app, seen) = recording_app(&pool);
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/workflows")
+        .header("x-harvest-tenant", "acme")
+        .header("x-harvest-tenant", "globex")
+        .body(Body::empty())
+        .unwrap();
+    let status = app.clone().oneshot(req).await.unwrap().status();
+    assert_eq!(status, StatusCode::BAD_REQUEST, "two tenant headers");
+
+    let (status, _) = send(&app, Call::new("GET", "/workflows").tenant("   ")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "blank tenant");
+    let exact = "t".repeat(128);
+    let (status, _) = send(&app, Call::new("GET", "/workflows").tenant(&exact)).await;
+    assert_ne!(status, StatusCode::BAD_REQUEST, "128 bytes is accepted");
+
+    let calls_before = seen.lock().unwrap().len();
+    let (status, _) = send(&app, Call::new("OPTIONS", "/workflows").tenant("   ")).await;
+    assert_ne!(status, StatusCode::BAD_REQUEST, "OPTIONS skips the hook");
+    assert_eq!(seen.lock().unwrap().len(), calls_before);
+}
+
+/// With no audit store, a deny is still a deny.
+#[tokio::test]
+async fn deny_without_a_storage_pool_is_still_403() {
+    let state = HarvestApiState::new();
+    let app = StandaloneAdminAuth::new()
+        .with_admin_auth_boundary()
+        .with_authorizer(|_: &AuthzRequest<'_>| AuthzDecision::deny("closed"))
+        .mount(harvest_api_router(state.clone()), &state);
+    let (status, body) = send(&app, Call::new("GET", "/workflows")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body:?}");
+}
+
+/// A body over the request limit is refused before the hook runs.
+#[tokio::test]
+async fn oversized_start_body_is_413() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let (app, seen) = recording_app(&pool);
+    let big = json!({ "input": "x".repeat(2 * 1024 * 1024 + 1) });
+    let (status, _) = send(
+        &app,
+        Call::new("POST", "/workflows/some-wf/start").body(big),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(seen.lock().unwrap().len(), 0);
+}
+
+/// A `mutate` token is denied exactly the admin-only routes. An `admin` token
+/// is denied nothing.
+#[tokio::test]
+async fn mutate_token_403_exactly_on_admin_scope_routes() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    scrub(&mut conn).await;
+    let app = boundary_app(&pool);
+    let (_, mutate) = mint(&app, "ci", "mutate").await;
+    let (_, admin) = mint(&app, "root", "admin").await;
+
+    for (template, _) in autumn_harvest::audit::CLASSIFIED_ROUTES {
+        let Some((method, tmpl)) = template.split_once(' ') else {
+            continue;
+        };
+        let path: String = tmpl
+            .split('/')
+            .map(|seg| {
+                if seg.starts_with('{') && seg.ends_with('}') {
+                    "x"
+                } else {
+                    seg
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("/");
+        let admin_only = autumn_harvest::audit::ADMIN_SCOPE_ROUTES.contains(template);
+        let (status, _) = send(&app, Call::new(method, &path).bearer(&mutate)).await;
+        assert_eq!(
+            status == StatusCode::FORBIDDEN,
+            admin_only,
+            "mutate token on {template}: {status}"
+        );
+        let (status, _) = send(&app, Call::new(method, &path).bearer(&admin)).await;
+        assert_ne!(status, StatusCode::FORBIDDEN, "admin token on {template}");
+    }
 }
 
 /// The authorizer sees the verified token principal and the route class.
@@ -476,7 +798,7 @@ async fn authorizer_sees_token_principal_and_route_class() {
             assert_eq!(id.to_string(), read_id);
             assert_eq!(scope, TokenScope::Read);
         }
-        AuthzPrincipal::Embedder => panic!("expected a token principal"),
+        other => panic!("expected a token principal, got {other:?}"),
     }
     assert_eq!(seen[0].1, RouteClass::ReadOnly);
     assert!(matches!(seen[1].0, AuthzPrincipal::Embedder));
@@ -519,9 +841,6 @@ async fn deny_rows_reach_the_siem_export() {
     let pool = build_pool(&url);
     let mut conn = pool.get().await.unwrap();
     scrub(&mut conn).await;
-    let _ = diesel::sql_query("UPDATE harvest_audit_log SET export_seq = NULL")
-        .execute(&mut conn)
-        .await;
     let app = authorized_app(&pool, |req| {
         if req.tenant_key == Some("globex") {
             AuthzDecision::deny("tenant globex is closed")

@@ -1866,6 +1866,7 @@ enum TokenCommand {
     },
     /// Rotate a token: mint a replacement via the create route. Revoking the
     /// old token is a documented second step (`harvest token revoke <old-id>`).
+    /// Minting needs an `admin` token (issue #1803).
     Rotate {
         /// The existing token ID being rotated out (used to name the replacement).
         old_id: String,

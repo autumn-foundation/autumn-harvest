@@ -177,6 +177,7 @@ linux        autumn-harvest         integration                      wasm-activi
 linux        autumn-harvest-plugin  activity_info_api_integration    -                          -
 linux        autumn-harvest-plugin  admission_gate_authoritative_localpg  -                          -
 linux        autumn-harvest-plugin  api_scheduler_integration        -                          -
+linux        autumn-harvest-plugin  authz_integration                -                          -
 linux        autumn-harvest-plugin  awaitables_integration           -                          -
 linux        autumn-harvest-plugin  batch_operations_integration     -                          -
 linux        autumn-harvest-plugin  build_ramp_integration           -                          -

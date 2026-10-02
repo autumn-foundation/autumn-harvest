@@ -95,6 +95,7 @@ const LAST_USED_DEBOUNCE_SECS: i64 = 60;
 ///
 /// Each scope includes the one before it: `Read` < `Mutate` < `Admin`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TokenScope {
     /// Reaches every `ReadOnly`/`PublicSafe` route; denied 403 on mutations.
     Read,
@@ -572,13 +573,29 @@ pub async fn enforce_token_scope_mcp_mutation(
         return unauthorized("api token expired");
     }
     // Every generated route carrying this layer is a mutation, so a read token
-    // is always denied here.
-    if TokenScope::from_db(&token.scope) == Some(TokenScope::Read) {
+    // is always denied here. An unknown scope is `Read`, as in the main layer.
+    let scope = TokenScope::from_db(&token.scope).unwrap_or(TokenScope::Read);
+    if scope == TokenScope::Read {
         tracing::warn!(
             method = %request.method(),
             path = %request.uri().path(),
             "harvest: read-scoped api token denied MCP mutation tool (403)"
         );
+        let (_, source, request_id) = audit_context(request.headers(), &api_state);
+        let actor = format!("{TOKEN_ACTOR_PREFIX}{}", token.id);
+        crate::authz::audit_deny(
+            &mut conn,
+            &crate::authz::DenyAudit {
+                actor: &actor,
+                method: request.method(),
+                path: request.uri().path(),
+                request_id: request_id.as_deref(),
+                source: &source,
+                shard: None,
+                summary: "token scope 'read' does not allow this route",
+            },
+        )
+        .await;
         return read_only_forbidden_response();
     }
     next.run(request).await

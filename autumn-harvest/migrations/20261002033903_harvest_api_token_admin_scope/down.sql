@@ -2,7 +2,8 @@
 --
 -- The old CHECK rejects `admin`, so narrow those rows to `mutate` first.
 -- Under the old code a `mutate` token can mint tokens, so no admin token
--- loses access to the token routes.
+-- loses access to the token routes. This loses data: after a later upgrade,
+-- those rows stay `mutate` and cannot mint. Re-mint them as `admin`.
 UPDATE harvest_api_tokens SET scope = 'mutate' WHERE scope = 'admin';
 ALTER TABLE harvest_api_tokens
     DROP CONSTRAINT IF EXISTS harvest_api_tokens_scope_check;

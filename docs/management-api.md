@@ -51,15 +51,17 @@ for the full model.
   `{"error":"forbidden by authorization policy"}`.
 
 Send a tenant key in the `x-harvest-tenant` header. With a hook installed, a
-value that is blank, holds a non-ASCII byte, or is longer than 128 bytes gets
-`400`. Without a hook, Harvest ignores the header.
+value that is repeated, blank, holds a non-ASCII byte, or is longer than 128
+bytes gets `400`. Without a hook, Harvest ignores the header.
 
 | Request | Shard the hook sees |
 |---|---|
-| A path with an execution id, e.g. `GET /workflows/{id}` | The shard the id routes to. |
-| `?shard_id=N` (also `shard`, `shard-id`) | `N`. |
+| A path with an execution id, e.g. `GET /workflows/{id}`, also under `/ui` | The shard the id routes to. |
+| `GET /admin/history/exports`, `.../export-sample`, `GET /admin/external-handoffs` with a shard query parameter | That shard. |
 | `POST /workflows/{name}/start` with `shard_id` or `residency_key` | The pinned shard. |
-| Anything else | None. |
+| DLQ replay, discard and redrive, queue pause and resume, with body `shard_id` | That shard. |
+| `POST /admin/audit-export/...` with body `shard` | That shard. |
+| Anything else | None. A shard query parameter on a route that ignores it is not read. |
 
 `None` means Harvest cannot name the shard before the handler runs. A by-id
 route or a start with no placement still reaches one shard by hash. To confine

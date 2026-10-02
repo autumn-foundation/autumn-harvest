@@ -5966,11 +5966,11 @@ fn normalize_route_template(path: &str) -> String {
 /// Keyed per HTTP method because the same path can carry a different value per
 /// method (e.g. `GET /admin/schedules/{id}` is `ReadOnly`, `DELETE` is
 /// `Mutating`).
-type RouteMatchers<T> = HashMap<axum::http::Method, matchit::Router<T>>;
+pub(crate) type RouteMatchers<T> = HashMap<axum::http::Method, matchit::Router<T>>;
 
 /// Build [`RouteMatchers`] from `(template, value)` pairs. `table` names the
 /// source table in a conflict log.
-fn build_route_matchers<T>(
+pub(crate) fn build_route_matchers<T>(
     table: &str,
     entries: impl IntoIterator<Item = (&'static str, T)>,
 ) -> RouteMatchers<T> {
@@ -6009,7 +6009,7 @@ fn build_route_matchers<T>(
 ///
 /// `HEAD` is looked up under `GET` (F3): axum serves `HEAD` via the `GET`
 /// handler, so a `HEAD` probe inherits that route's value.
-fn match_route<'m, T>(
+pub(crate) fn match_route<'m, T>(
     matchers: &'m RouteMatchers<T>,
     method: &axum::http::Method,
     path: &'m str,
@@ -6043,12 +6043,30 @@ pub(crate) fn classify_route(method: &axum::http::Method, path: &str) -> RouteCl
     match_route(route_class_matchers(), method, path).map_or(RouteClass::Mutating, |m| *m.value)
 }
 
+/// Path prefixes under which every mutation is admin-only (issue #1803).
+///
+/// This catches a future token or module route that someone forgets to add to
+/// [`autumn_harvest::audit::ADMIN_SCOPE_ROUTES`].
+const ADMIN_SCOPE_PREFIXES: &[&str] = &["/admin/tokens", "/admin/modules", "/modules"];
+
 /// Whether only an `admin`-scoped token may call this route (issue #1803).
 ///
-/// Backed by [`autumn_harvest::audit::ADMIN_SCOPE_ROUTES`]. An unmatched path
-/// is not admin-only, but [`classify_route`] still treats it as `Mutating`.
+/// Backed by [`autumn_harvest::audit::ADMIN_SCOPE_ROUTES`], plus any mutation
+/// under [`ADMIN_SCOPE_PREFIXES`]. A path that matches neither is not
+/// admin-only, but [`classify_route`] still treats it as `Mutating`.
 pub(crate) fn requires_admin_scope(method: &axum::http::Method, path: &str) -> bool {
     static MATCHERS: std::sync::OnceLock<RouteMatchers<()>> = std::sync::OnceLock::new();
+    let safe = matches!(
+        *method,
+        axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
+    );
+    let under_prefix = ADMIN_SCOPE_PREFIXES.iter().any(|prefix| {
+        path.strip_prefix(prefix)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    });
+    if !safe && under_prefix {
+        return true;
+    }
     let matchers = MATCHERS.get_or_init(|| {
         build_route_matchers(
             "ADMIN_SCOPE_ROUTES",
@@ -6080,17 +6098,51 @@ fn execution_param(template: &str) -> Option<String> {
     None
 }
 
-/// The execution id a classified route names in its path, if any
-/// (issue #1803).
+/// Parse one raw path segment as an execution id.
 ///
-/// Only the parameter [`execution_param`] picks is decoded, so a token or gate
-/// UUID never yields a shard.
+/// The segment is percent-decoded first, as axum's `Path` extractor does.
+fn parse_execution_segment(raw: &str) -> Option<autumn_harvest::types::ExecutionId> {
+    let decoded = percent_encoding::percent_decode_str(raw)
+        .decode_utf8()
+        .ok()?;
+    let uuid = uuid::Uuid::parse_str(&decoded).ok()?;
+    Some(autumn_harvest::types::ExecutionId::from_uuid(uuid))
+}
+
+/// The execution id a Vantage route under `/ui` names, if any.
+///
+/// Vantage names an execution as `/ui/workflows/{id}/...` or
+/// `/ui/dags/{dag_name}/runs/{run_exec_id}/...`.
+fn ui_execution_id(path: &str) -> Option<autumn_harvest::types::ExecutionId> {
+    let mut segments = path.strip_prefix("/ui/")?.split('/');
+    match (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) {
+        (Some("workflows"), Some(id), _, _) | (Some("dags"), Some(_), Some("runs"), Some(id)) => {
+            parse_execution_segment(id)
+        }
+        _ => None,
+    }
+}
+
+/// The execution id a route names in its path, if any (issue #1803).
+///
+/// A management route is matched against `CLASSIFIED_ROUTES`. Only the
+/// parameter [`execution_param`] picks is decoded, so a token or gate UUID
+/// never yields a shard. A Vantage route under `/ui` uses
+/// [`ui_execution_id`].
 pub(crate) fn execution_id_in_path(
     method: &axum::http::Method,
     path: &str,
 ) -> Option<autumn_harvest::types::ExecutionId> {
     static MATCHERS: std::sync::OnceLock<RouteMatchers<Option<String>>> =
         std::sync::OnceLock::new();
+    if path.starts_with("/ui/") {
+        return ui_execution_id(path);
+    }
     let matchers = MATCHERS.get_or_init(|| {
         build_route_matchers(
             "CLASSIFIED_ROUTES",
@@ -6101,9 +6153,7 @@ pub(crate) fn execution_id_in_path(
     });
     let matched = match_route(matchers, method, path)?;
     let param = matched.value.as_deref()?;
-    let raw = matched.params.get(param)?;
-    let uuid = uuid::Uuid::parse_str(raw).ok()?;
-    Some(autumn_harvest::types::ExecutionId::from_uuid(uuid))
+    parse_execution_segment(matched.params.get(param)?)
 }
 
 /// A `403 Forbidden` for a read-only principal that attempted a mutation
@@ -32358,7 +32408,7 @@ fn parse_bulk_dlq_request(
     }
 }
 
-fn is_form_urlencoded(headers: &axum::http::HeaderMap) -> bool {
+pub(crate) fn is_form_urlencoded(headers: &axum::http::HeaderMap) -> bool {
     headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
@@ -55746,9 +55796,23 @@ mod tests {
             &axum::http::Method::GET,
             "/admin/tokens"
         ));
-        assert!(!requires_admin_scope(
+        // Any mutation under a token prefix is admin-only, listed or not.
+        assert!(requires_admin_scope(
             &axum::http::Method::POST,
             "/admin/tokens/"
+        ));
+        assert!(requires_admin_scope(
+            &axum::http::Method::POST,
+            &format!("/admin/tokens/{id}/rotate")
+        ));
+        assert!(requires_admin_scope(&axum::http::Method::PUT, "/modules/x"));
+        assert!(!requires_admin_scope(
+            &axum::http::Method::GET,
+            "/modules/x"
+        ));
+        assert!(!requires_admin_scope(
+            &axum::http::Method::POST,
+            "/admin/tokensx"
         ));
         assert!(!requires_admin_scope(
             &axum::http::Method::POST,
@@ -55766,8 +55830,16 @@ mod tests {
             format!("/workflows/{exec}/cancel"),
             format!("/executions/{exec}/events/stream"),
             format!("/dags/nightly/runs/{exec}"),
+            // Percent-encoded, as a client may send it.
+            format!(
+                "/workflows/%{:02X}{}/cancel",
+                exec.to_string().as_bytes()[0],
+                &exec.to_string()[1..]
+            ),
+            format!("/ui/workflows/{exec}/cancel"),
+            format!("/ui/dags/nightly/runs/{exec}/retry"),
         ] {
-            let method = if path.ends_with("/cancel") {
+            let method = if path.ends_with("/cancel") || path.ends_with("/retry") {
                 axum::http::Method::POST
             } else {
                 axum::http::Method::GET
@@ -55780,6 +55852,11 @@ mod tests {
             (axum::http::Method::POST, format!("/workflows/{exec}/start")),
             (axum::http::Method::GET, "/workflows/not-a-uuid".to_string()),
             (axum::http::Method::GET, "/workflows".to_string()),
+            (
+                axum::http::Method::POST,
+                format!("/ui/schedules/{exec}/pause"),
+            ),
+            (axum::http::Method::GET, "/ui/workflows".to_string()),
         ] {
             assert_eq!(execution_id_in_path(&method, &path), None, "{path}");
         }

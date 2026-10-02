@@ -15,10 +15,15 @@ capability.
 - **Authorizer hook.** `HarvestPlugin::with_authorizer` and
   `StandaloneAdminAuth::with_authorizer` install a `HarvestAuthorizer`. It sees
   the principal, route class, tenant key (`x-harvest-tenant`) and shard. The
-  shard comes from an execution id in the path, a `shard_id` query parameter,
-  or a start body's `shard_id` / `residency_key`. The hook runs after the
-  built-in gates, so it can only deny. A plain closure is an authorizer. With
-  no hook, the router is unchanged.
+  hook runs after the built-in gates, so it can only deny. A plain closure is
+  an authorizer. With no hook, the router is unchanged.
+- **Shard sources.** The hook reads a shard only where the handler reads it:
+  an execution id in the path (decoded, also under `/ui`), a shard query
+  parameter on the routes in `authz::SHARD_SOURCES`, or a shard field in their
+  body. A shard named anywhere else is ignored, so a caller cannot show the
+  hook one shard while the handler reads all of them.
+- **Admin prefixes.** Any mutation under `/admin/tokens`, `/admin/modules` or
+  `/modules` is admin-only, even if `ADMIN_SCOPE_ROUTES` does not list it.
 - **Deny audit.** Every token scope deny and every hook deny writes an
   `authz.deny` row with status `failed`. The reason is in `error_summary`. The
   caller gets a generic `403`. The audit export ships the row to the SIEM.
@@ -33,8 +38,10 @@ widens the `scope` CHECK only. No `WorkflowEvent` variant, no change to
 `403`. Mint an `admin` token for that caller.
 
 **Tests.** `authz_integration.rs` covers these cases. A `mutate` mint or
-revoke gets `403` and is audited. An `admin` token mints and revokes. A hook
-denies by tenant key, and by shard from all three sources. A hook cannot widen
-a scope. Deny rows reach an audit export claim. Unit tests cover the scope decision, the admin route matcher,
+revoke gets `403`, is audited, and changes nothing. A `mutate` token is denied
+exactly the admin routes. An `admin` token mints and revokes. A hook denies by
+tenant key, and by shard from the path, `/ui`, query, start body, residency key
+and other bodies. A query shard on a route that ignores it is not read. A hook
+cannot widen a scope. Deny rows reach an audit export claim. Unit tests cover the scope decision, the admin route matcher,
 execution-id decoding, query and body shard parsing, and the guard tests in
 `audit.rs`.
