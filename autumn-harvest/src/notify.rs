@@ -899,7 +899,7 @@ async fn send_outside_diesel_transaction(
 ) -> HarvestResult<()> {
     use diesel_async::SimpleAsyncConnection as _;
     if conn
-        .batch_execute("SAVEPOINT harvest_notify")
+        .batch_execute("SAVEPOINT harvest_notify_fallback")
         .await
         .is_err()
     {
@@ -908,23 +908,18 @@ async fn send_outside_diesel_transaction(
         }
         return Ok(());
     }
-    match send_wakes(conn, wakes).await {
-        Ok(()) => {
-            if let Err(error) = conn.batch_execute("RELEASE SAVEPOINT harvest_notify").await {
-                return Err(crate::error::database_error(error));
-            }
-        }
+    let undo = match send_wakes(conn, wakes).await {
+        Ok(()) => "RELEASE SAVEPOINT harvest_notify_fallback",
         Err(error) => {
             record_failures(count, &error);
-            if let Err(error) = conn
-                .batch_execute("ROLLBACK TO SAVEPOINT harvest_notify")
-                .await
-            {
-                return Err(crate::error::database_error(error));
-            }
+            // The rollback keeps the savepoint, so release it next.
+            "ROLLBACK TO SAVEPOINT harvest_notify_fallback; \
+             RELEASE SAVEPOINT harvest_notify_fallback"
         }
-    }
-    Ok(())
+    };
+    conn.batch_execute(undo)
+        .await
+        .map_err(crate::error::database_error)
 }
 
 /// True when the transaction manager of `conn` is in its error state.

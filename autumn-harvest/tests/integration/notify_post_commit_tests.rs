@@ -245,6 +245,16 @@ async fn append_in_a_raw_begin_block_commits_when_pg_notify_fails() {
     store::append_events(&mut conn, exec_id, &[started()], 0)
         .await
         .expect("the append must succeed");
+    // The fallback releases its savepoint. Probe behind a savepoint of our
+    // own, so the failed probe does not abort the block.
+    conn.batch_execute("SAVEPOINT probe").await.expect("probe");
+    let leftover = conn
+        .batch_execute("RELEASE SAVEPOINT harvest_notify_fallback")
+        .await;
+    assert!(leftover.is_err(), "the fallback must release its savepoint");
+    conn.batch_execute("ROLLBACK TO SAVEPOINT probe")
+        .await
+        .expect("undo the probe");
     conn.batch_execute("COMMIT").await.expect("commit");
 
     assert_eq!(event_count(&url, exec_id).await, 1, "the write must commit");
