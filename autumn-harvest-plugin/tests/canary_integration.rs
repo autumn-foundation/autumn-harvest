@@ -178,7 +178,7 @@ async fn seed_canary_execution(
         workflow_id: &wf_id,
         run_id: Uuid::new_v4(),
         shard_id: 0,
-        input: serde_json::json!({ "queue": queue }),
+        input: serde_json::json!({ "queue": queue }).into(),
         parent_id: None,
         queue_name: queue,
         execution_timeout: None,

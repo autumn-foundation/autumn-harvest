@@ -75,7 +75,7 @@ async fn insert(conn: &mut AsyncPgConnection, spec: InsertSpec<'_>) -> Execution
         workflow_id: spec.workflow_id,
         run_id: uuid::Uuid::new_v4(),
         shard_id: 0,
-        input: json!({}),
+        input: json!({}).into(),
         parent_id: spec.parent_id.map(|id| id.as_uuid()),
         queue_name: "default",
         execution_timeout: None,

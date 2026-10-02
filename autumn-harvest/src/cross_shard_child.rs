@@ -1395,7 +1395,7 @@ async fn start_child_on_target(
                     // column would make every shard-filtered scanner query (timeouts,
                     // outboxes, the SLA sweep) skip it.
                     shard_id: row.target_shard,
-                    input: spec.input.clone(),
+                    input: spec.input.clone().into(),
                     parent_id: Some(parent_exec_id.as_uuid()),
                     queue_name: &spec.queue_name,
                     execution_timeout: spec.execution_timeout_secs.map(chrono::Duration::seconds),
