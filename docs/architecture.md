@@ -196,27 +196,36 @@ A formal model of this protocol is tracked in issue #1819.
 
 **10. Suspension readiness (issue #1797)**
 
-A decision cycle suspends when the workflow is blocked on Harvest futures. No clock decides it. `executor::run_workflow_handler_cycle` applies this rule.
+A decision cycle suspends when the workflow is blocked on Harvest futures. No clock decides a suspension. A clock bounds only waits on foreign futures. `executor::run_workflow_handler_cycle` applies this rule.
 
 *Readiness rule.*
 
-1. Poll the handler. Catch a panic (issue #782). Poll inside `tokio::task::unconstrained`, so that the coop budget cannot make a ready oneshot return `Pending`.
+1. Poll the handler with the cycle's own waker. Catch a panic (issue #782). Poll inside `tokio::task::unconstrained`, so that the coop budget cannot decide when a ready tokio resource returns `Pending`.
 2. `Ready`: the handler returned. The cycle completes or fails.
-3. `Pending` with a parked Harvest future: the cycle suspends at once.
-4. `Pending` with no parked Harvest future: the handler waits on a foreign future, such as a raw `tokio::time::sleep`. The cycle waits for that future to wake it, then polls again.
+3. `Pending`, and a wake fired during the poll: a future is ready. Yield to the runtime and poll again. A `FuturesUnordered` that returns early after two self-woken children takes this path, so its other children still run.
+4. `Pending`, no wake, and a Harvest future is parked: the cycle suspends at once.
+5. `Pending`, no wake, and no parked Harvest future: the handler waits on a foreign future, such as a raw `tokio::time::sleep`. The cycle polls again when that future wakes it.
 
 *Parked Harvest future.* `WorkflowContext::has_parked_harvest_future` is true in two cases:
 
 - A buffered command holds an open result channel. `WorkflowCommand::awaits_result` lists these variants. Its match is exhaustive, so a new variant must decide whether it parks.
-- A `ParkToken` is held. A forever park (`continue_as_new`, a renewable timer, the mutex and external-await guards) and a false `await_condition` hold one. These futures have no result channel.
+- A `ParkToken` is held. These futures have no result channel. A forever park holds one: `continue_as_new`, the await of a cancellable timer (issue #768), and the fallback park after a dropped sender in mutex acquire and external await. A false `await_condition` also holds one.
 
 The worker sends results only after it drains the cycle. A parked Harvest future therefore cannot resolve in the same cycle, and waiting longer cannot change the outcome.
 
-*Deadlock timeout.* `executor::DEADLOCK_TIMEOUT` is 2 s from the start of the cycle. It applies only in step 4. A cycle that reaches it returns `WorkflowOutcome::TaskFailed`. The worker discards the cycle's commands, appends no event and re-pends the task after 5 s. The run stays `RUNNING`. A long CPU-bound step that ends at a Harvest park is not affected, because step 3 does not check the timeout.
+*Deadlock timeout.* `executor::DEADLOCK_TIMEOUT` is 2 s. The clock starts at the first step 3 or step 5 of a cycle. CPU time before that, such as a long replay, does not count. Step 4 does not check the clock. A cycle that is still in step 3 or step 5 when the clock expires returns `WorkflowOutcome::TaskFailed`. The worker then does this:
 
-*Mixed waits.* When a Harvest future and a foreign future are both pending, step 3 applies. The cycle suspends and drops the foreign future. Do not race a foreign future against a Harvest future.
+- It discards the cycle's commands and appends no event. The run stays `RUNNING`.
+- It re-pends the task under the claim fence (`queue::requeue_claimed_workflow_task_after_deadlock`). A dispatcher that lost its claim writes nothing.
+- It waits 5 s, doubling per consecutive deadlock up to 300 s. Retries never stop, because a deadlock never fails the run.
 
-*Proof.* The `executor.rs` tests `suspension_outcome_does_not_depend_on_step_duration`, `foreign_await_past_the_deadlock_timeout_fails_the_task_not_the_run`, `harvest_parks_suspend_without_waiting_on_the_clock` and `single_step_suspension_decides_in_under_100_ms`.
+Keep `workflow_task_timeout` above `DEADLOCK_TIMEOUT`. A shorter body budget cancels the cycle first, and that path counts timeout strikes.
+
+*Mixed waits.* When a Harvest future and a foreign future are both pending, step 4 applies. The cycle suspends and drops the foreign future. Do not race a foreign future against a Harvest future. A history recorded under the old 100 ms timer can hold commands that such a workflow now emits one cycle later. That run can block for non-determinism after the upgrade.
+
+*Query replay.* `drive_query_replay` and `drive_query_replay_async` keep their own rule (issue #612). They stop at a foreign await instead of waiting for it.
+
+*Proof.* The `executor.rs` tests `suspension_outcome_does_not_depend_on_step_duration`, `a_parked_harvest_future_decides_the_cycle_not_the_step_duration`, `foreign_await_past_the_deadlock_timeout_fails_the_task_not_the_run`, `harvest_parks_suspend_without_waiting_on_the_clock`, `a_wake_during_the_poll_is_polled_again_before_suspending`, `cpu_time_before_the_first_foreign_wait_does_not_count` and `single_step_suspension_decides_in_under_100_ms`. Against Postgres: `panic_containment_tests::deadlocked_workflow_task_is_re_pended_and_the_retry_completes_the_run`.
 
 ### Sharding
 

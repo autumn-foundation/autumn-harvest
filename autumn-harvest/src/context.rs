@@ -12342,7 +12342,7 @@ impl WorkflowContext {
     /// The returned future never resolves on its own — calling
     /// `ctx.continue_as_new(input).await?` is effectively a "tail call" to a
     /// new execution. The worker drains the emitted command after the
-    /// executor's suspension window elapses and performs the transition in a
+    /// executor suspends the cycle and performs the transition in a
     /// single transaction. Any code after the await is therefore unreachable
     /// in practice.
     ///
@@ -20692,9 +20692,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn freeze_completes_well_under_suspension_timeout_at_max_n() {
-        // R10: the executor gives a decision cycle a 100 ms budget. The scan is
-        // bounded and uses BTreeSet lookups, so even MAX_BUSINESS_DAYS is cheap.
+    async fn freeze_completes_well_under_a_decision_budget_at_max_n() {
+        // R10: a decision cycle must stay cheap. The scan is bounded and uses
+        // BTreeSet lookups, so even MAX_BUSINESS_DAYS is cheap.
         let holidays: Vec<chrono::NaiveDate> = (0..400)
             .filter_map(|i| {
                 chrono::NaiveDate::from_ymd_opt(2026, 1, 1)?.checked_add_days(chrono::Days::new(i))
@@ -20716,7 +20716,7 @@ mod tests {
         );
         assert!(
             elapsed < std::time::Duration::from_millis(50),
-            "the bounded scan must stay far under the 100 ms suspension budget, took {elapsed:?}"
+            "the bounded scan must stay far under 50 ms, took {elapsed:?}"
         );
     }
 

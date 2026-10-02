@@ -7522,12 +7522,26 @@ pub fn resolve_capability_miss_with_confidence(
 // Contained workflow handler-panic retry (issue #782)
 // ---------------------------------------------------------------------------
 
-/// Delay before a deadlocked workflow task runs again (issue #1797).
+/// Base delay before a deadlocked workflow task runs again (issue #1797).
+const DEADLOCK_RETRY_BACKOFF_BASE_SECS: u64 = 5;
+
+/// Ceiling on the deadlock retry delay (issue #1797).
 ///
-/// The delay is fixed. A deadlocked cycle already holds a slot for
-/// [`crate::executor::DEADLOCK_TIMEOUT`], so this delay bounds the cost of a
-/// workflow that deadlocks on every attempt.
-const DEADLOCK_RETRY_BACKOFF: chrono::Duration = chrono::Duration::seconds(5);
+/// Retries never stop, because a deadlock never fails the run. Each attempt
+/// holds a slot for up to [`crate::executor::DEADLOCK_TIMEOUT`]. The cap
+/// keeps a workflow that always deadlocks from crowding out healthy work.
+const DEADLOCK_RETRY_BACKOFF_CAP_SECS: u64 = 300;
+
+/// Capped exponential backoff for a deadlock retry: `5s * 2^(n-1)`, capped at
+/// 300 s (issue #1797). `strikes` is 1-based and counts this deadlock.
+fn deadlock_retry_backoff(strikes: u32) -> Duration {
+    crate::policy::compute_retry_delay(
+        Duration::from_secs(DEADLOCK_RETRY_BACKOFF_BASE_SECS),
+        2.0,
+        Duration::from_secs(DEADLOCK_RETRY_BACKOFF_CAP_SECS),
+        strikes.max(1),
+    )
+}
 
 /// Base delay before the first panic re-dispatch (issue #782). A short floor
 /// (>0) prevents a fast, deterministic panic from hot-looping worker slots
@@ -17189,7 +17203,8 @@ async fn recover_from_child_quota_exceeded(
 /// could suspend empty-handed while it was still mid-flight on other I/O. It
 /// was then failed terminally under the **stale** `worker_id`. The row could
 /// already belong to someone else. Examples are a poison-pill reclaim, an
-/// operator action, or the claim-theft race of issue #804. That guard covers only the
+/// operator action, or the claim-theft race of issue #804. Issue #804 guards
+/// the `AfterHandler` capability-miss branch against that race. That guard covers only the
 /// path reached via [`persist_scheduled_activities`]; a handler that never
 /// got far enough to push a single command skips that branch and lands here,
 /// where nothing checked the claim.
@@ -20491,6 +20506,8 @@ async fn process_workflow_task(
     // execution) and the configured re-dispatch budget.
     workflow_panic_strikes: &Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u32>>>,
     workflow_panic_max_attempts: u32,
+    // Issue #1797: in-process deadlock strike map (per execution).
+    workflow_deadlock_strikes: &Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u32>>>,
     // Issue #783: absolute cut-off of the enclosing workflow-task dispatch
     // (issue #494), forwarded to inline local activities so their reported
     // deadline cannot out-live the cycle. `None` when that timeout is disabled.
@@ -21824,28 +21841,46 @@ async fn process_workflow_task(
 
     // Issue #1797: a deadlocked cycle fails the workflow task, never the run.
     // Its commands are not trusted, so none persist and no event is appended.
-    // The task is re-pended with a fixed backoff, as a contained panic is.
-    // A deadlock is not a panic, so it clears the panic strike first.
+    // The task is re-pended with a capped exponential backoff. A deadlock is
+    // not a panic, so it clears the panic strike first.
+    //
+    // The requeue is fenced by the claim. The cycle ran for at least
+    // `DEADLOCK_TIMEOUT`, so a reclaim can have moved the row meanwhile.
     if let WorkflowOutcome::TaskFailed { error } = &outcome {
         clear_panic_strike(workflow_panic_strikes, prepared.exec_id.as_uuid());
+        let strikes = increment_panic_strike(workflow_deadlock_strikes, prepared.exec_id.as_uuid());
+        // `deadlock_retry_backoff` is capped at 300 s, so the fallback never
+        // runs. It is still non-zero, so it cannot hot-loop.
+        let backoff = chrono::Duration::from_std(deadlock_retry_backoff(strikes))
+            .unwrap_or_else(|_| chrono::Duration::seconds(300));
         tracing::warn!(
             execution_id = %prepared.exec_id,
             workflow = %prepared.execution.workflow_name,
             queue = %task.queue_name,
-            backoff_secs = DEADLOCK_RETRY_BACKOFF.num_seconds(),
+            strikes,
+            backoff_secs = backoff.num_seconds(),
             error = %error,
             "harvest: workflow task failed (issue #1797); the task is retried and the \
              run stays RUNNING"
         );
         drop(execute_span);
-        return queue::requeue_workflow_task_after_panic(
-            conn,
-            task.id,
-            DEADLOCK_RETRY_BACKOFF,
-            error,
-        )
-        .await;
+        // A claimed task always names its worker. Without one, no write can
+        // be fenced, so leave the row to the timeout sweeper.
+        let Some(claim) = queue::TaskClaim::of(task) else {
+            return Ok(());
+        };
+        if !queue::requeue_claimed_workflow_task_after_deadlock(conn, &claim, backoff, error)
+            .await?
+        {
+            tracing::debug!(
+                execution_id = %prepared.exec_id,
+                task_id = %task.id,
+                "harvest: deadlocked workflow task lost its claim; the new owner keeps the row"
+            );
+        }
+        return Ok(());
     }
+    clear_panic_strike(workflow_deadlock_strikes, prepared.exec_id.as_uuid());
 
     // Issue #782: a **contained handler panic** must NOT fail the workflow on
     // the first strike — buy time for a hotfix/redeploy by re-dispatching with
@@ -21916,7 +21951,7 @@ async fn process_workflow_task(
         // continued-as-new / author-Err failed) clears the consecutive-panic
         // strike counter so a later transient panic starts fresh and the map
         // does not grow unbounded (mirrors the timeout-strike clear discipline).
-        // ND-blocked outcomes returned above and never reach here.
+        // ND-blocked and TaskFailed outcomes returned above and never reach here.
         clear_panic_strike(workflow_panic_strikes, prepared.exec_id.as_uuid());
     }
 
@@ -22911,6 +22946,8 @@ async fn process_task(
     // only on the workflow path.
     workflow_panic_strikes: Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u32>>>,
     workflow_panic_max_attempts: u32,
+    // Issue #1797: deadlock strike map, consulted only on the workflow path.
+    workflow_deadlock_strikes: Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u32>>>,
     // Issue #783: absolute cut-off of the enclosing workflow-task dispatch
     // (issue #494); `None` when that timeout is disabled. Workflow path only —
     // an activity task is not wrapped in it.
@@ -22957,6 +22994,7 @@ async fn process_task(
                     dispatched_at,
                     &workflow_panic_strikes,
                     workflow_panic_max_attempts,
+                    &workflow_deadlock_strikes,
                     workflow_task_deadline,
                     &frontier_reset_committed,
                 ))
@@ -25621,6 +25659,11 @@ pub struct Worker {
     /// `process_workflow_task` may leak one bounded entry until worker restart —
     /// identical precedent to `workflow_task_timeout_strikes` (issue #494).
     workflow_panic_strikes: Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u32>>>,
+    /// Consecutive deadlocked workflow tasks per execution (issue #1797).
+    ///
+    /// It sets the retry backoff only. A deadlock never fails the run, so
+    /// there is no budget. The same leak bound as the panic map applies.
+    workflow_deadlock_strikes: Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u32>>>,
     /// In-process registry of worker sessions currently hosted by this
     /// worker (issue #606), bounded against `config.max_concurrent_sessions`
     /// via [`crate::sessions::try_acquire_session_slot`]. `0` (the default
@@ -27248,9 +27291,8 @@ impl Worker {
             workflow_task_timeout_strikes: Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
-            workflow_panic_strikes: Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            workflow_panic_strikes: Arc::default(),
+            workflow_deadlock_strikes: Arc::default(),
             session_slots_in_use: crate::sessions::new_session_slot_registry(),
             shard_dispatch,
             global_dispatch,
@@ -30779,6 +30821,7 @@ impl Worker {
         let timeout_strikes = Arc::clone(&self.workflow_task_timeout_strikes);
         // Issue #782: contained-handler-panic retry budget + strike map.
         let panic_strikes = Arc::clone(&self.workflow_panic_strikes);
+        let deadlock_strikes = Arc::clone(&self.workflow_deadlock_strikes);
         let workflow_panic_max_attempts = self.config.workflow_panic_max_attempts;
         // Issue #804: the redelivery budget plus the liveness window for the
         // fleet lookup. Derived here rather than threaded from
@@ -30893,6 +30936,7 @@ impl Worker {
                     &session_slots_in_use,
                     Arc::clone(&panic_strikes),
                     workflow_panic_max_attempts,
+                    Arc::clone(&deadlock_strikes),
                     workflow_task_deadline,
                     capability_miss_policy,
                     Some(workflow_task_timeout),
@@ -31109,6 +31153,7 @@ impl Worker {
                     &session_slots_in_use,
                     panic_strikes,
                     workflow_panic_max_attempts,
+                    deadlock_strikes,
                     // No enclosing workflow-task budget on this arm, so the
                     // local per-attempt budget is the only clock (issue #783).
                     None,
@@ -31863,6 +31908,11 @@ pub async fn chaos_drive_one_workflow_task(
             uuid::Uuid,
             u32,
         >::new()));
+        let workflow_deadlock_strikes =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+                uuid::Uuid,
+                u32,
+            >::new()));
         let frontier_reset_committed = std::sync::atomic::AtomicBool::new(false);
         // Boxed for the same reason as the production call site
         // (clippy::large_futures).
@@ -31878,6 +31928,7 @@ pub async fn chaos_drive_one_workflow_task(
             std::time::Instant::now(),
             &workflow_panic_strikes,
             3,
+            &workflow_deadlock_strikes,
             None,
             &frontier_reset_committed,
         ))
@@ -31923,6 +31974,11 @@ pub async fn chaos_drive_one_workflow_task_cancel_at_hold(
             uuid::Uuid,
             u32,
         >::new()));
+        let workflow_deadlock_strikes =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+                uuid::Uuid,
+                u32,
+            >::new()));
         let frontier_reset_committed = std::sync::atomic::AtomicBool::new(false);
         // Boxed for the same reason as `chaos_drive_one_workflow_task`
         // (clippy::large_futures).
@@ -31938,6 +31994,7 @@ pub async fn chaos_drive_one_workflow_task_cancel_at_hold(
             std::time::Instant::now(),
             &workflow_panic_strikes,
             3,
+            &workflow_deadlock_strikes,
             None,
             &frontier_reset_committed,
         ));
@@ -39853,6 +39910,17 @@ mod tests {
         // A degenerate `0` clamps to attempt 1 (base delay), not a zero-length
         // hot-loop.
         assert_eq!(panic_retry_backoff(0), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn deadlock_retry_backoff_starts_at_base_doubles_and_caps() {
+        // Issue #1797: 5 s, doubling, capped at 300 s; `0` clamps to the base.
+        assert_eq!(deadlock_retry_backoff(1), Duration::from_secs(5));
+        assert_eq!(deadlock_retry_backoff(2), Duration::from_secs(10));
+        assert_eq!(deadlock_retry_backoff(3), Duration::from_secs(20));
+        assert_eq!(deadlock_retry_backoff(0), Duration::from_secs(5));
+        assert_eq!(deadlock_retry_backoff(7), Duration::from_secs(300));
+        assert_eq!(deadlock_retry_backoff(u32::MAX), Duration::from_secs(300));
     }
 
     #[test]

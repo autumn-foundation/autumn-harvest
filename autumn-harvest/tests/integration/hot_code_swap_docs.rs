@@ -610,7 +610,7 @@ fn the_report_records_the_no_await_without_a_command_constraint() {
     assert!(
         executor.contains("ctx.has_parked_harvest_future()")
             && executor.contains("DEADLOCK_TIMEOUT")
-            && !executor.contains("tokio::time::timeout(SUSPENSION_TIMEOUT"),
+            && !executor.contains("SUSPENSION_TIMEOUT"),
         "the C9 update says the executor suspends on a parked Harvest future and \
          bounds foreign waits with `DEADLOCK_TIMEOUT`; if that changed, the \
          constraint needs re-deriving rather than re-asserting"

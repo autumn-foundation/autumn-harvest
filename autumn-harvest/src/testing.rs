@@ -7022,6 +7022,39 @@ mod tests {
     use std::future::Future;
     use std::pin::Pin;
 
+    /// Awaits a foreign 3 s sleep, past the deadlock timeout (issue #1797).
+    fn deadlocking_workflow(
+        _ctx: &crate::context::WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + '_>> {
+        Box::pin(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            Ok(Value::Null)
+        })
+    }
+
+    /// Issue #1797: the harness stops with the task error and records no
+    /// terminal event, as the worker does.
+    #[tokio::test(start_paused = true)]
+    async fn a_deadlocked_cycle_stops_the_harness_without_a_terminal_event() {
+        let outcome = WorkflowTestEnv::new()
+            .run(deadlocking_workflow, Value::Null)
+            .await;
+        let error = outcome
+            .result
+            .clone()
+            .expect_err("a deadlock must surface as an error");
+        assert!(error.contains("potential deadlock detected"), "{error}");
+        assert!(
+            !outcome.events().iter().any(|e| matches!(
+                e,
+                WorkflowEvent::WorkflowFailed { .. } | WorkflowEvent::WorkflowCompleted { .. }
+            )),
+            "a failed task must record no terminal event: {:?}",
+            outcome.events()
+        );
+    }
+
     fn ts(id: &str, secs: u64) -> WorkflowEvent {
         WorkflowEvent::TimerStarted {
             timer_id: TimerId::new(id),

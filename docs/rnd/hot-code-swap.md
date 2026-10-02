@@ -983,10 +983,11 @@ constraint on this whole boundary rather than a detail of the fix:
 > is pending and a Harvest future is parked (`has_parked_harvest_future`). A
 > pending handler with no parked Harvest future waits for its own wake. A
 > `yield_now()` therefore no longer causes a zero-command suspension. A host
-> await that holds a cycle for `DEADLOCK_TIMEOUT` (2 s) fails the workflow
-> task, and the worker retries the task. The run does not fail. The
-> trampoline keeps C9 as written: a yield adds a scheduler round trip per
-> decision and gives nothing back.
+> await that waits on foreign futures for `DEADLOCK_TIMEOUT` (2 s) fails the
+> workflow task, and the worker retries the task. The run does not fail. The
+> clock starts at the first foreign wait, so a slow guest does not use it
+> up. The trampoline keeps C9 as written: a yield adds a scheduler round trip
+> per decision and gives nothing back.
 
 Cancellation is still **not** threaded into a running decision, so worker
 shutdown cannot interrupt one mid-flight; it waits out the per-decision backstop.

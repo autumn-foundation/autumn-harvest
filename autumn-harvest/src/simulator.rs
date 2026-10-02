@@ -1003,6 +1003,38 @@ mod tests {
         }
     }
 
+    /// Awaits a foreign 3 s sleep, past the deadlock timeout (issue #1797).
+    fn deadlocking_workflow(
+        _ctx: &crate::context::WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + '_>> {
+        Box::pin(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            Ok(Value::Null)
+        })
+    }
+
+    /// Issue #1797: the simulation stops with the task error and records no
+    /// terminal event.
+    #[tokio::test(start_paused = true)]
+    async fn a_deadlocked_cycle_stops_the_simulation_without_a_terminal_event() {
+        let res = WorkflowSimulator::new(deadlocking_workflow)
+            .run(Value::Null)
+            .await;
+        let error = res
+            .final_output
+            .expect_err("a deadlock must surface as an error");
+        assert!(error.contains("potential deadlock detected"), "{error}");
+        assert!(
+            !res.history.iter().any(|e| matches!(
+                e,
+                WorkflowEvent::WorkflowFailed { .. } | WorkflowEvent::WorkflowCompleted { .. }
+            )),
+            "a failed task must record no terminal event: {:?}",
+            res.history
+        );
+    }
+
     fn single_activity_workflow(
         ctx: &crate::context::WorkflowContext,
         input: Value,

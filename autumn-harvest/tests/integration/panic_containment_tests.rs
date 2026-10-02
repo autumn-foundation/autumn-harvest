@@ -1302,21 +1302,33 @@ async fn child_workflow_panic_surfaces_to_parent_as_typed_handler_panic() {
 // Issue #1797 — a deadlocked cycle fails the workflow task, not the run.
 // ---------------------------------------------------------------------------
 
-/// `true` until the first cycle of [`deadlock_once_workflow`] starts.
-static DEADLOCK_ONCE_ARMED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(true);
+/// Executions whose next cycle of [`deadlock_once_workflow`] deadlocks.
+static DEADLOCK_ARMED: std::sync::LazyLock<Mutex<std::collections::HashSet<Uuid>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
 
-/// Deadlocks on its first cycle, then completes.
+/// Counts the cycles of [`deadlock_once_workflow`].
+static DEADLOCK_CYCLES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Records the cycle number as a side effect, then deadlocks once.
 ///
-/// The first cycle awaits a foreign 60 s sleep, which is not a Harvest
+/// An armed cycle awaits a foreign 60 s sleep, which is not a Harvest
 /// future. The executor fails that task after `DEADLOCK_TIMEOUT`. The retry
-/// skips the sleep and completes, which proves the run was not failed.
-fn deadlock_once_workflow(_ctx: &WorkflowContext, _input: serde_json::Value) -> BoxFut<'_> {
+/// is not armed, so it completes. Only the retry's side effect may persist.
+fn deadlock_once_workflow(ctx: &WorkflowContext, _input: serde_json::Value) -> BoxFut<'_> {
     Box::pin(async move {
-        if DEADLOCK_ONCE_ARMED.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        let cycle: u64 = ctx
+            .side_effect("cycle", || {
+                DEADLOCK_CYCLES.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+            })
+            .map_err(|e| e.to_string())?;
+        let armed = DEADLOCK_ARMED
+            .lock()
+            .unwrap()
+            .remove(&ctx.execution_id().as_uuid());
+        if armed {
             tokio::time::sleep(Duration::from_secs(60)).await;
         }
-        Ok(serde_json::json!("done"))
+        Ok(serde_json::json!(cycle))
     })
 }
 
@@ -1325,6 +1337,10 @@ async fn deadlocked_workflow_task_is_re_pended_and_the_retry_completes_the_run()
     let (url, _container) = setup_db().await;
     let mut conn = connect(&url).await;
     let exec_id = seed_workflow(&mut conn, "deadlock_once_wf", serde_json::json!({})).await;
+    DEADLOCK_ARMED.lock().unwrap().insert(exec_id.as_uuid());
+    let first_cycle =
+        std::sync::atomic::AtomicU64::load(&DEADLOCK_CYCLES, std::sync::atomic::Ordering::SeqCst)
+            + 1;
 
     let metrics = Arc::new(PanicMetrics::default());
     let registry = build_registry(
@@ -1379,18 +1395,25 @@ async fn deadlocked_workflow_task_is_re_pended_and_the_retry_completes_the_run()
         "a deadlock is not a panic and must not use the panic budget"
     );
 
-    // The deadlocked cycle appended nothing: history is Started → Completed.
+    // The deadlocked cycle recorded a side effect, but none of its commands
+    // persist. Only the retry's side effect is in history.
     let history = load_history(&url, exec_id).await;
-    assert!(
-        history.iter().all(|e| matches!(
-            e,
-            WorkflowEvent::WorkflowStarted { .. } | WorkflowEvent::WorkflowCompleted { .. }
-        )),
-        "a failed workflow task must append no event; history={history:?}"
+    let side_effects: Vec<_> = history
+        .iter()
+        .filter_map(|e| match e {
+            WorkflowEvent::SideEffectRecorded { value, .. } => Some(value.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        side_effects,
+        vec![serde_json::json!(first_cycle + 1)],
+        "only the retry's side effect may persist; history={history:?}"
     );
-    let tasks = load_tasks(&url, exec_id).await;
     assert!(
-        tasks.iter().all(|t| t.crash_strikes == 0),
-        "a deadlock must not count as a crash strike"
+        !history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::WorkflowFailed { .. })),
+        "a failed workflow task must not fail the run; history={history:?}"
     );
 }

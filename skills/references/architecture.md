@@ -33,7 +33,7 @@ it returns or blocks on Harvest futures (issue #1797). Returns one of:
 
 - `Completed { output }` — handler returned Ok
 - `Failed { error }` — handler returned Err
-- `Suspended { commands }` — handler blocked on oneshot (waiting for activity/timer)
+- `Suspended { commands }` — handler blocked on a parked Harvest future (a oneshot or a park token)
 - `TaskFailed { error }` — handler waited on a foreign future past the deadlock timeout; the task is retried
 
 ### 3. HistoryMatcher (`replay.rs`)

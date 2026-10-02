@@ -6,7 +6,7 @@
 //! - **Completed**: handler returned `Ok(output)`.
 //! - **Failed**: handler returned `Err(error)`.
 //! - **Suspended**: handler blocked on a parked Harvest future (issue #1797).
-//! - **`TaskFailed`**: handler waited on a foreign future for
+//! - **`TaskFailed`**: handler waited on foreign futures for
 //!   [`DEADLOCK_TIMEOUT`]. The worker retries the task.
 //!
 //! This module is pure async logic and does NOT require the `db` feature.
@@ -83,7 +83,7 @@ pub enum WorkflowOutcome {
     },
     /// The cycle made no decision, so the workflow **task** failed (issue #1797).
     ///
-    /// The handler waited on a foreign future for
+    /// The handler waited on foreign futures for
     /// [`DEADLOCK_TIMEOUT`](crate::executor::DEADLOCK_TIMEOUT). This is
     /// retryable. The worker discards the cycle's commands, appends no event,
     /// and requeues the task. The run stays `RUNNING`.
@@ -104,12 +104,13 @@ pub enum WorkflowOutcome {
     },
 }
 
-/// Longest time a cycle may wait on a foreign future (issue #1797).
+/// Longest time a cycle may wait on foreign futures (issue #1797).
 ///
 /// A foreign future is any future that is not a Harvest future, such as a
-/// raw `tokio::time::sleep`. The limit applies only while no Harvest future
-/// is parked. A cycle that reaches it fails the workflow task, which the
-/// worker retries. The run itself does not fail.
+/// raw `tokio::time::sleep`. The clock starts when the handler first waits
+/// with no Harvest future parked. CPU time before that wait does not count.
+/// A cycle that reaches the limit fails the workflow task, which the worker
+/// retries. The run itself does not fail.
 pub const DEADLOCK_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Outcome of running a workflow handler future for one executor cycle with
@@ -127,9 +128,54 @@ enum HandlerCycleResult {
     Suspended,
     /// The handler panicked; the payload was caught and extracted to a message.
     Panicked(String),
-    /// The handler waited on a foreign future for [`DEADLOCK_TIMEOUT`]
-    /// (issue #1797). The workflow task fails and the worker retries it.
+    /// The handler was still waiting on a foreign future
+    /// [`DEADLOCK_TIMEOUT`] after its first foreign wait (issue #1797).
+    /// The workflow task fails and the worker retries it.
     Deadlocked,
+}
+
+/// The waker a decision cycle gives the handler (issue #1797).
+///
+/// It records a wake that fires while the handler is polled. Such a wake
+/// means a future is ready, so the cycle polls again before it decides. A
+/// `FuturesUnordered` that yields early after two self-woken children is
+/// one example. Every wake is also forwarded to the runtime task.
+struct CycleWaker {
+    woken: std::sync::atomic::AtomicBool,
+    outer: std::sync::Mutex<std::task::Waker>,
+}
+
+impl CycleWaker {
+    fn new(outer: &std::task::Waker) -> Self {
+        Self {
+            woken: std::sync::atomic::AtomicBool::new(false),
+            outer: std::sync::Mutex::new(outer.clone()),
+        }
+    }
+
+    /// Store the runtime task's current waker.
+    fn set_outer(&self, outer: &std::task::Waker) {
+        let mut slot = self
+            .outer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !slot.will_wake(outer) {
+            slot.clone_from(outer);
+        }
+    }
+}
+
+impl futures::task::ArcWake for CycleWaker {
+    fn wake_by_ref(arc_self: &std::sync::Arc<Self>) {
+        arc_self
+            .woken
+            .store(true, std::sync::atomic::Ordering::Release);
+        arc_self
+            .outer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .wake_by_ref();
+    }
 }
 
 /// Run a workflow handler future for one executor cycle, containing any panic.
@@ -137,20 +183,24 @@ enum HandlerCycleResult {
 /// # Readiness rule (issue #1797)
 ///
 /// The cycle polls the handler until it returns or until it is blocked.
-/// After each `Poll::Pending`, the cycle asks the context whether a Harvest
-/// future is parked:
+/// After each `Poll::Pending`, the cycle checks two things in order:
 ///
-/// - Yes: the cycle is suspended at once. No clock is involved, so the
-///   result does not depend on how fast the host runs.
-/// - No: the handler waits on a foreign future. The cycle returns
-///   `Pending` to the runtime and polls again when that future wakes it.
+/// 1. A wake fired during the poll: a future is ready. The cycle yields to
+///    the runtime and polls again.
+/// 2. Otherwise, a Harvest future is parked: the cycle suspends at once. It
+///    does not check a clock.
+/// 3. Otherwise, the handler waits on a foreign future. The cycle returns
+///    `Pending` to the runtime and polls again when that future wakes it.
 ///
-/// A cycle that is still waiting on a foreign future [`DEADLOCK_TIMEOUT`]
-/// after it started is deadlocked. It fails the task, not the run.
+/// The first foreign wait starts the [`DEADLOCK_TIMEOUT`] clock. A cycle that
+/// is still pending without a parked Harvest future when the clock expires
+/// is deadlocked. It fails the task, not the run.
 ///
-/// The handler runs in [`tokio::task::unconstrained`]. Without it, an
-/// exhausted coop budget could make a ready oneshot return `Pending`, and
-/// the cycle could suspend before the handler saw a recorded result.
+/// The handler runs in [`tokio::task::unconstrained`]. The coop budget left
+/// by earlier work in the worker task would otherwise decide when a ready
+/// tokio resource returns `Pending`. The command batch would then depend on
+/// that budget. The cost: a handler that loops on always-ready resources
+/// never yields, like any other busy loop.
 ///
 /// `catch_unwind` requires `AssertUnwindSafe` because `&WorkflowContext` is not
 /// `UnwindSafe`. This is sound because the context is discarded after the
@@ -175,11 +225,24 @@ async fn run_workflow_handler_cycle(
     // reads that flag in its `Drop`. If the future dropped first, the guard
     // would push a `ReleaseMutex` and free the lock under a parked holder.
     // The poll loop therefore borrows `guarded`, and `guarded` drops only at
-    // the end of this function.
+    // the end of this function. A guard dropped mid-poll or at completion
+    // still sees `suspending == false` and releases normally.
     let mut guarded = std::pin::pin!(std::panic::AssertUnwindSafe(handler_fut).catch_unwind());
+    // Armed at the first foreign wait, so CPU time before it does not count.
     let mut deadline = std::pin::pin!(tokio::time::sleep(DEADLOCK_TIMEOUT));
+    let mut deadline_armed = false;
+    let mut cycle_waker: Option<(std::sync::Arc<CycleWaker>, std::task::Waker)> = None;
     let result = tokio::task::unconstrained(std::future::poll_fn(|cx| {
-        match guarded.as_mut().poll(cx) {
+        let (flag, waker) = cycle_waker.get_or_insert_with(|| {
+            let flag = std::sync::Arc::new(CycleWaker::new(cx.waker()));
+            let waker = futures::task::waker(std::sync::Arc::clone(&flag));
+            (flag, waker)
+        });
+        flag.set_outer(cx.waker());
+        flag.woken
+            .store(false, std::sync::atomic::Ordering::Release);
+        let mut handler_cx = std::task::Context::from_waker(waker);
+        match guarded.as_mut().poll(&mut handler_cx) {
             Poll::Ready(Ok(result)) => return Poll::Ready(HandlerCycleResult::Returned(result)),
             Poll::Ready(Err(panic_payload)) => {
                 return Poll::Ready(HandlerCycleResult::Panicked(crate::error::panic_message(
@@ -188,16 +251,27 @@ async fn run_workflow_handler_cycle(
             }
             Poll::Pending => {}
         }
-        if ctx.has_parked_harvest_future() {
+        // The wake also reached the runtime task, so returning `Pending`
+        // below polls the handler again.
+        let woken = flag.woken.load(std::sync::atomic::Ordering::Acquire);
+        if !woken && ctx.has_parked_harvest_future() {
             return Poll::Ready(HandlerCycleResult::Suspended);
         }
         // Only foreign futures are pending. Their wakes poll this cycle again.
+        if !deadline_armed {
+            deadline_armed = true;
+            deadline
+                .as_mut()
+                .reset(tokio::time::Instant::now() + DEADLOCK_TIMEOUT);
+        }
         deadline
             .as_mut()
             .poll(cx)
             .map(|()| HandlerCycleResult::Deadlocked)
     }))
     .await;
+    // A deadlocked cycle also sets the flag. The worker discards its
+    // commands, so a dropped guard must not push a `ReleaseMutex` either.
     if matches!(
         result,
         HandlerCycleResult::Suspended | HandlerCycleResult::Deadlocked
@@ -210,8 +284,8 @@ async fn run_workflow_handler_cycle(
 /// The `TaskFailed` error for a deadlocked cycle (issue #1797).
 fn deadlock_error() -> String {
     format!(
-        "potential deadlock detected: the workflow handler waited {DEADLOCK_TIMEOUT:?} on a \
-         future that is not a Harvest future; the workflow task fails and is retried"
+        "potential deadlock detected: the workflow handler waited {DEADLOCK_TIMEOUT:?} on \
+         futures that are not Harvest futures; the workflow task fails and is retried"
     )
 }
 
@@ -3311,6 +3385,83 @@ mod tests {
         )
     }
 
+    /// Returns `Pending` once and wakes itself during that poll, as
+    /// `futures::FuturesUnordered` sees a child that yields.
+    struct SelfWakeOnce(bool);
+
+    impl std::future::Future for SelfWakeOnce {
+        type Output = Result<Value, String>;
+
+        fn poll(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            if self.0 {
+                return std::task::Poll::Ready(Ok(Value::Null));
+            }
+            self.0 = true;
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    }
+
+    /// Parks one activity, then lets two children wake themselves, then
+    /// schedules two more activities, all in one `FuturesUnordered`.
+    /// After two self-wakes, `FuturesUnordered` returns `Pending` before it
+    /// polls the last two activities.
+    fn early_yield_fan_out_workflow<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            use futures::StreamExt as _;
+            type Branch<'b> =
+                Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'b>>;
+            let activity = |name: &'static str| -> Branch<'a> {
+                Box::pin(async move {
+                    ctx.execute_activity_raw(name, Value::Null, "default")
+                        .await
+                        .map_err(|e| e.to_string())
+                })
+            };
+            let mut branches = futures::stream::FuturesUnordered::<Branch<'a>>::new();
+            branches.push(activity("a0"));
+            branches.push(Box::pin(SelfWakeOnce(false)));
+            branches.push(Box::pin(SelfWakeOnce(false)));
+            branches.push(activity("a1"));
+            branches.push(activity("a2"));
+            while let Some(result) = branches.next().await {
+                result?;
+            }
+            Ok(Value::Null)
+        })
+    }
+
+    /// A wake during the poll means a future is ready, so the cycle must
+    /// poll again before it asks whether it is suspended. Otherwise a
+    /// combinator that yields early leaves siblings undispatched.
+    #[tokio::test]
+    async fn a_wake_during_the_poll_is_polled_again_before_suspending() {
+        let outcome = run_workflow(
+            ExecutionId::new(),
+            vec![started()],
+            early_yield_fan_out_workflow,
+            Value::Null,
+        )
+        .await;
+        let WorkflowOutcome::Suspended { commands } = outcome else {
+            panic!("expected a suspension, got {outcome:?}");
+        };
+        let names: Vec<&str> = commands
+            .iter()
+            .filter_map(|c| match c {
+                WorkflowCommand::ScheduleActivity { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, ["a0", "a1", "a2"], "every branch must be dispatched");
+    }
+
     /// AC RED 1: the outcome must not depend on how long a step takes.
     /// A 150 ms step used to lose the race with the 100 ms suspension
     /// timer and suspend with zero commands. A 50 ms step did not.
@@ -3352,19 +3503,154 @@ mod tests {
         }
     }
 
-    /// Every Harvest park kind suspends at once. The paused clock must not
-    /// move, because the executor no longer waits on a timer to decide.
+    /// Parks on a renewable timer. `ArmTimer` has no result channel, so only
+    /// the park token keeps this cycle parked.
+    fn renewable_timer_workflow<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            ctx.start_timer("renewable", 5)
+                .await_fire()
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(Value::Null)
+        })
+    }
+
+    /// Races an activity against a timer.
+    fn race_workflow<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            ctx.race()
+                .activity_raw("send_email", Value::Null, "default")
+                .timer(Duration::from_secs(5))
+                .run()
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(Value::Null)
+        })
+    }
+
+    /// Parks on a false condition with a timeout timer.
+    fn condition_timeout_workflow<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            ctx.await_condition_timeout("condition", 5, || false)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(Value::Null)
+        })
+    }
+
+    /// Parks on a local activity.
+    fn local_activity_workflow<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            ctx.execute_local_activity_raw("local", Value::Null, None, None)
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    /// Parks on a child workflow.
+    fn child_workflow<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            ctx.spawn_child_workflow_raw("child", Value::Null)
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    /// Parks on an external workflow's result.
+    fn external_await_workflow<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            ctx.await_external_workflow_value(ExecutionId::new())
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    /// The variant names of a suspension's commands, or of the outcome.
+    fn outcome_shape(outcome: &WorkflowOutcome) -> Vec<String> {
+        match outcome {
+            WorkflowOutcome::Suspended { commands } => commands
+                .iter()
+                .map(|c| {
+                    let debug = format!("{c:?}");
+                    debug
+                        .split([' ', '(', '{'])
+                        .next()
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .collect(),
+            other => vec![
+                format!("{other:?}")
+                    .split([' ', '(', '{'])
+                    .next()
+                    .unwrap_or_default()
+                    .to_string(),
+            ],
+        }
+    }
+
+    /// Every Harvest park kind suspends at once with its own command. The
+    /// paused clock must not move, because the executor no longer waits on a
+    /// timer to decide.
     #[tokio::test(start_paused = true)]
     async fn harvest_parks_suspend_without_waiting_on_the_clock() {
-        let cases: [(&str, WorkflowHandlerFn); 6] = [
-            ("activity", activity_workflow),
-            ("timer", timer_workflow),
-            ("signal", signal_wait_workflow),
-            ("mutex", mutex_workflow),
-            ("condition", false_condition_workflow),
-            ("continue_as_new", continue_as_new_workflow),
+        let cases: [(&str, WorkflowHandlerFn, &[&str]); 12] = [
+            ("activity", activity_workflow, &["ScheduleActivity"]),
+            ("timer", timer_workflow, &["StartTimer"]),
+            ("signal", signal_wait_workflow, &["WaitForSignal"]),
+            ("mutex", mutex_workflow, &["AcquireMutex"]),
+            ("condition", false_condition_workflow, &[]),
+            (
+                "continue_as_new",
+                continue_as_new_workflow,
+                &["ContinuedAsNew"],
+            ),
+            (
+                "renewable_timer",
+                renewable_timer_workflow,
+                &["ArmTimer", "ArmTimer"],
+            ),
+            (
+                "race",
+                race_workflow,
+                &["RecordMarker", "ScheduleActivity", "StartTimer"],
+            ),
+            (
+                "condition_timeout",
+                condition_timeout_workflow,
+                &["StartTimer"],
+            ),
+            (
+                "local_activity",
+                local_activity_workflow,
+                &["RunLocalActivity"],
+            ),
+            ("child", child_workflow, &["StartChildWorkflow"]),
+            (
+                "external_await",
+                external_await_workflow,
+                &["AwaitExternalWorkflow"],
+            ),
         ];
-        for (name, handler) in cases {
+        for (name, handler, expected) in cases {
             let started_at = tokio::time::Instant::now();
             let outcome =
                 run_workflow(ExecutionId::new(), vec![started()], handler, Value::Null).await;
@@ -3373,14 +3659,235 @@ mod tests {
                 Duration::ZERO,
                 "{name}: the executor waited on the clock before it suspended"
             );
-            assert!(
-                matches!(
-                    outcome,
-                    WorkflowOutcome::Suspended { .. } | WorkflowOutcome::ContinuedAsNew { .. }
-                ),
-                "{name}: expected a suspension, got {outcome:?}"
+            assert_eq!(outcome_shape(&outcome), expected, "{name}: got {outcome:?}");
+        }
+    }
+
+    /// Races a 60 s durable timer against a foreign step of `delay_ms`.
+    /// The timer is a Harvest future, so it parks before the step ends.
+    fn timer_or_foreign_step_workflow<'a>(
+        ctx: &'a WorkflowContext,
+        input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let delay_ms = input["delay_ms"].as_u64().unwrap_or(0);
+            let timer = ctx.timer("deadline", 60);
+            let step = tokio::time::sleep(Duration::from_millis(delay_ms));
+            tokio::pin!(timer, step);
+            tokio::select! {
+                biased;
+                fired = &mut timer => {
+                    fired.map_err(|e| e.to_string())?;
+                    Ok(serde_json::json!("timer"))
+                }
+                () = &mut step => Ok(serde_json::json!("step")),
+            }
+        })
+    }
+
+    /// AC RED 1, Harvest side: a parked Harvest future decides the cycle,
+    /// not the duration of a foreign step beside it. The old timer gave
+    /// `Completed("step")` at 50 ms and a suspension at 150 ms.
+    #[tokio::test(start_paused = true)]
+    async fn a_parked_harvest_future_decides_the_cycle_not_the_step_duration() {
+        for delay_ms in [50_u64, 150, 1_500] {
+            let outcome = run_workflow(
+                ExecutionId::new(),
+                vec![started()],
+                timer_or_foreign_step_workflow,
+                serde_json::json!({ "delay_ms": delay_ms }),
+            )
+            .await;
+            assert_eq!(
+                outcome_shape(&outcome),
+                ["StartTimer"],
+                "{delay_ms} ms: got {outcome:?}"
             );
         }
+    }
+
+    /// Polls a condition and an activity once each, drops both, waits on a
+    /// foreign step, then schedules `send_email`.
+    fn dropped_parks_workflow<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut condition = ctx.await_condition(|| false);
+            assert!(futures::poll!(&mut condition).is_pending());
+            drop(condition);
+            let mut dropped = Box::pin(ctx.execute_activity_raw("dropped", Value::Null, "default"));
+            assert!(futures::poll!(dropped.as_mut()).is_pending());
+            drop(dropped);
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            ctx.execute_activity_raw("send_email", Value::Null, "default")
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    /// A dropped Harvest future must not keep the cycle parked. A leaked
+    /// park token or an open channel would suspend at the foreign step.
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_harvest_future_does_not_keep_the_cycle_parked() {
+        let outcome = run_workflow(
+            ExecutionId::new(),
+            vec![started()],
+            dropped_parks_workflow,
+            Value::Null,
+        )
+        .await;
+        let WorkflowOutcome::Suspended { commands } = &outcome else {
+            panic!("expected a suspension, got {outcome:?}");
+        };
+        let names: Vec<&str> = commands
+            .iter()
+            .filter_map(|c| match c {
+                WorkflowCommand::ScheduleActivity { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, ["dropped", "send_email"], "got {outcome:?}");
+    }
+
+    /// Waits on a foreign step, then panics.
+    fn panic_after_foreign_wait_workflow<'a>(
+        _ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            panic!("boom after a foreign wait");
+        })
+    }
+
+    /// A panic after a foreign wait is contained as a panic (issue #782).
+    /// The old timer suspended first and never saw the panic.
+    #[tokio::test(start_paused = true)]
+    async fn a_panic_after_a_foreign_wait_is_contained_not_suspended() {
+        let outcome = run_workflow(
+            ExecutionId::new(),
+            vec![started()],
+            panic_after_foreign_wait_workflow,
+            Value::Null,
+        )
+        .await;
+        match outcome {
+            WorkflowOutcome::Failed {
+                error,
+                handler_panic: true,
+                ..
+            } => assert!(error.contains("boom after a foreign wait"), "{error}"),
+            other => panic!("expected a contained panic, got {other:?}"),
+        }
+    }
+
+    /// Parks activity `a`, burns the coop budget on ready oneshots, then
+    /// schedules activity `b`.
+    fn coop_budget_workflow<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let a = ctx.execute_activity_raw("a", Value::Null, "default");
+            let b = async {
+                for _ in 0..1_000 {
+                    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+                    tx.send(()).map_err(|()| "send failed".to_string())?;
+                    rx.await.map_err(|e| e.to_string())?;
+                }
+                ctx.execute_activity_raw("b", Value::Null, "default")
+                    .await
+                    .map_err(|e| e.to_string())
+            };
+            let (a, b) = tokio::join!(a, b);
+            a.map_err(|e| e.to_string())?;
+            b
+        })
+    }
+
+    /// The coop budget must not decide the command batch. Without
+    /// `unconstrained`, a budget-forced `Pending` on a ready oneshot would
+    /// suspend while `a` is parked, before `b` is scheduled.
+    #[tokio::test]
+    async fn coop_budget_exhaustion_does_not_suspend_early() {
+        let outcome = run_workflow(
+            ExecutionId::new(),
+            vec![started()],
+            coop_budget_workflow,
+            Value::Null,
+        )
+        .await;
+        assert_eq!(
+            outcome_shape(&outcome),
+            ["ScheduleActivity", "ScheduleActivity"],
+            "got {outcome:?}"
+        );
+    }
+
+    /// Records a side effect, then waits past the deadlock timeout.
+    fn side_effect_then_deadlock_workflow<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let _: u32 = ctx
+                .side_effect("attempt", || 1)
+                .map_err(|e| e.to_string())?;
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            Ok(Value::Null)
+        })
+    }
+
+    /// A deadlocked cycle returns no commands, so the worker persists none.
+    #[tokio::test(start_paused = true)]
+    async fn a_deadlocked_cycle_discards_its_commands() {
+        let (outcome, pending, _span, _router) = run_workflow_with_state(
+            ExecutionId::new(),
+            vec![started()],
+            side_effect_then_deadlock_workflow,
+            Value::Null,
+            empty_shared_state(),
+            None,
+        )
+        .await;
+        assert!(
+            matches!(outcome, WorkflowOutcome::TaskFailed { .. }),
+            "got {outcome:?}"
+        );
+        assert!(
+            pending.is_empty(),
+            "a deadlocked cycle must drop {pending:?}"
+        );
+    }
+
+    /// Spends longer than the deadlock timeout on CPU, then waits briefly on
+    /// a foreign step, then schedules `send_email`.
+    fn cpu_then_short_foreign_wait_workflow<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            std::thread::sleep(DEADLOCK_TIMEOUT + Duration::from_millis(100));
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            ctx.execute_activity_raw("send_email", Value::Null, "default")
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    /// The deadlock clock starts at the first foreign wait. CPU time before
+    /// it, such as a long replay, does not count.
+    #[tokio::test]
+    async fn cpu_time_before_the_first_foreign_wait_does_not_count() {
+        let outcome = run_workflow(
+            ExecutionId::new(),
+            vec![started()],
+            cpu_then_short_foreign_wait_workflow,
+            Value::Null,
+        )
+        .await;
+        assert!(is_send_email_suspension(&outcome), "got {outcome:?}");
     }
 
     /// AC benchmark: one single-step suspension decides in under 100 ms of
