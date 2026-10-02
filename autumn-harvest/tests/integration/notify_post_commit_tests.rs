@@ -235,6 +235,22 @@ async fn enqueue_outside_a_transaction_succeeds_when_pg_notify_fails() {
 }
 
 #[tokio::test]
+async fn append_in_a_raw_begin_block_commits_when_pg_notify_fails() {
+    let (url, _container) = setup().await;
+    let mut conn = shadowed_conn(&url).await;
+    let exec_id = insert_execution(&mut conn).await;
+
+    // Diesel does not track a transaction that a raw `BEGIN` opens.
+    conn.batch_execute("BEGIN").await.expect("begin");
+    store::append_events(&mut conn, exec_id, &[started()], 0)
+        .await
+        .expect("the append must succeed");
+    conn.batch_execute("COMMIT").await.expect("commit");
+
+    assert_eq!(event_count(&url, exec_id).await, 1, "the write must commit");
+}
+
+#[tokio::test]
 async fn wake_in_a_transaction_commits_when_pg_notify_fails() {
     let (url, _container) = setup().await;
     let (exec_id, task_id) = park_task(&url).await;

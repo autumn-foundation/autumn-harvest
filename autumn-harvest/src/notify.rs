@@ -844,7 +844,8 @@ async fn stage(conn: &mut AsyncPgConnection, notes: Vec<Note>) -> HarvestResult<
 ///
 /// Outside a transaction the write already committed, so the send goes at
 /// once. Inside one, the send runs in a savepoint. Its error then rolls back
-/// only the savepoint, and the write can still commit.
+/// only the savepoint, and the write can still commit. This holds for a raw
+/// `BEGIN` block too.
 ///
 /// # Errors
 ///
@@ -862,10 +863,7 @@ async fn send_on_write_connection(
     }
     let count = wakes.len();
     if !in_transaction(conn) {
-        if let Err(error) = send_wakes(conn, wakes).await {
-            record_failures(count, &error);
-        }
-        return Ok(());
+        return send_outside_diesel_transaction(conn, wakes, count).await;
     }
     let result = Box::pin(
         conn.transaction::<(), diesel::result::Error, _>(async |conn| {
@@ -879,6 +877,52 @@ async fn send_on_write_connection(
             return Err(crate::error::database_error(error));
         }
         record_failures(count, &error);
+    }
+    Ok(())
+}
+
+/// The fallback when diesel tracks no transaction on `conn`.
+///
+/// A raw `BEGIN` opens a block that diesel does not see. `SAVEPOINT` works
+/// only inside a block, so it tells the two cases apart. In a block, the send
+/// runs behind the savepoint, so its error cannot abort the write. Outside
+/// one, the write already committed, so the send goes at once.
+///
+/// # Errors
+///
+/// Returns an error only when the savepoint cannot roll back. The raw block
+/// then cannot commit.
+async fn send_outside_diesel_transaction(
+    conn: &mut AsyncPgConnection,
+    wakes: Vec<(String, String)>,
+    count: usize,
+) -> HarvestResult<()> {
+    use diesel_async::SimpleAsyncConnection as _;
+    if conn
+        .batch_execute("SAVEPOINT harvest_notify")
+        .await
+        .is_err()
+    {
+        if let Err(error) = send_wakes(conn, wakes).await {
+            record_failures(count, &error);
+        }
+        return Ok(());
+    }
+    match send_wakes(conn, wakes).await {
+        Ok(()) => {
+            if let Err(error) = conn.batch_execute("RELEASE SAVEPOINT harvest_notify").await {
+                return Err(crate::error::database_error(error));
+            }
+        }
+        Err(error) => {
+            record_failures(count, &error);
+            if let Err(error) = conn
+                .batch_execute("ROLLBACK TO SAVEPOINT harvest_notify")
+                .await
+            {
+                return Err(crate::error::database_error(error));
+            }
+        }
     }
     Ok(())
 }
