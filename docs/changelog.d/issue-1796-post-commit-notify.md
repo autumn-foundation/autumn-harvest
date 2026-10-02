@@ -13,10 +13,11 @@ sender for each pool. The sender reads `txid_status` on its own connection. It
 sends committed notes, drops rolled-back notes and holds open ones. One
 statement sends a batch, with one wake per queue channel and one per
 execution. `Worker::run`, `Worker::run_with_listener`,
-`WorkflowHandleClient::new` and `HarvestRunner::start` register their pools.
+`WorkflowHandleClient::new`, `HarvestRunner::start` and
+`SchedulerRuntime::spawn_sharded` register their pools.
 A pool registered outside a Tokio runtime starts its sender at the first
-notification a runtime stages. A stopping worker or runner flushes its
-senders, so the wakes of its last writes still go out.
+notification a runtime stages. A stopping worker, runner or scheduler
+flushes its senders, so the wakes of its last writes still go out.
 
 **Routing.** A note goes to a healthy sender whose database fingerprint
 (`current_database()` and `pg_postmaster_start_time()`) matches the write.

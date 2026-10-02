@@ -763,3 +763,49 @@ async fn a_sender_starts_again_after_its_runtime_ends() {
 
     assert_wake_from_sender(&mut shadowed, &mut listener, &sink).await;
 }
+
+#[tokio::test]
+async fn a_scheduler_runtime_registers_its_pool() {
+    let (url, _container) = setup().await;
+    let pool = build_pool(&url);
+    let registry = std::sync::Arc::new(autumn_harvest::worker::HandlerRegistry::new(
+        Vec::new(),
+        Vec::new(),
+    ));
+    let scheduler = autumn_harvest::scheduler::SchedulerRuntime::spawn(
+        pool.clone(),
+        registry,
+        std::sync::Arc::new(autumn_harvest::scheduler::DagCatalog::new()),
+        std::sync::Arc::new(Vec::new()),
+    );
+    let mut shadowed = shadowed_conn(&url).await;
+    let mut listener = WorkflowEventListener::connect(&url)
+        .await
+        .expect("listener");
+
+    // Nothing else registers this pool, and `shadowed` cannot send a wake.
+    // A wake therefore proves that the scheduler started the sender.
+    let mut woke = false;
+    for _ in 0..10 {
+        let exec_id = insert_execution(&mut shadowed).await;
+        Box::pin(
+            shadowed.transaction::<usize, HarvestError, _>(async |conn| {
+                store::append_events(conn, exec_id, &[started()], 0).await
+            }),
+        )
+        .await
+        .expect("append");
+        if let WorkflowEventWaitOutcome::Notification(p) = listener
+            .wait_for_notification_timeout(Duration::from_millis(500))
+            .await
+            .expect("payload parses")
+        {
+            assert_eq!(p.workflow_exec_id, exec_id.as_uuid());
+            woke = true;
+            break;
+        }
+    }
+    scheduler.shutdown();
+    scheduler.join().await.expect("scheduler stops");
+    assert!(woke, "the scheduler must register its pool");
+}
