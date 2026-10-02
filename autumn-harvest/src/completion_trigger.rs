@@ -2746,7 +2746,7 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
 /// Build the `next_attempt_at` `SET` clause used by the `QuotaBlocked` arm of
 /// [`relay_gate_checked_start`], so a no-DB unit test can assert the
 /// generated SQL shape (issue #1392). Mirrors the
-/// `queue::requeue_after_panic_query` shape-test precedent.
+/// `queue::workflow_backoff_sql` shape-test precedent.
 #[cfg(all(test, feature = "db"))]
 fn quota_blocked_backoff_query() -> String {
     use crate::schema::harvest_completion_trigger_outbox::dsl as outbox_dsl;

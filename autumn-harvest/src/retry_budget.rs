@@ -23,7 +23,7 @@
 //! not served in order.
 //!
 //! See [`RetryBudgetPolicy`](crate::policy::RetryBudgetPolicy) for the knobs
-//! and `docs/architecture.md`, design decision 10, for the full rules.
+//! and `docs/architecture.md`, design decision 11, for the full rules.
 //!
 //! ## Scope and durability
 //!

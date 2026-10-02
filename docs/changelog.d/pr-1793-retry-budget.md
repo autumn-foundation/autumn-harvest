@@ -37,7 +37,7 @@ defers the retry through the new fenced write
 - `GET /admin/config` reports `retry_budget_default` and
   `retry_budget_overrides`.
 
-The semantics are in `docs/architecture.md`, design decision 10. The budget is
+The semantics are in `docs/architecture.md`, design decision 11. The budget is
 per worker process. Local activities and the SQLite backend are not gated.
 
 No new `WorkflowEvent` variant, no migration, no schema change.
