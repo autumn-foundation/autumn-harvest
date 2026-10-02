@@ -585,6 +585,34 @@ impl SinkShared {
         self.alive() && lock(&self.last_ok).is_some_and(|at| at.elapsed() < HEALTHY_WITHIN)
     }
 
+    /// True when this sender holds no notes.
+    ///
+    /// The sender moves notes and publishes their count under the pending
+    /// lock. Both reads under that lock therefore see one state.
+    fn drained(&self) -> bool {
+        let pending = lock(&self.pending);
+        pending.is_empty() && AtomicUsize::load(&self.held, Ordering::Relaxed) == 0
+    }
+
+    /// Every sender that can hold a note written through this pool.
+    ///
+    /// [`sink_for`] routes a note to any healthy sender on the database of
+    /// the write, not only to the sender of the pool that wrote it. All
+    /// senders on the database of this one therefore count. Before this
+    /// sender knows its database, every sender counts.
+    fn peers(self: &Arc<Self>) -> Vec<Arc<Self>> {
+        let own = lock(&self.fingerprint).clone();
+        let mut peers: Vec<Arc<Self>> = lock(&SINKS)
+            .iter()
+            .filter(|sink| own.is_none() || *lock(&sink.fingerprint) == own)
+            .cloned()
+            .collect();
+        if !peers.iter().any(|sink| Arc::ptr_eq(sink, self)) {
+            peers.push(Arc::clone(self));
+        }
+        peers
+    }
+
     /// Start a sender task on `runtime` unless one runs or the pool dropped.
     fn restart(self: &Arc<Self>, runtime: &tokio::runtime::Handle) {
         let mut task = lock(&self.task);
@@ -690,28 +718,28 @@ impl NotifySink {
         *lock(&self.shared.queue_usage)
     }
 
-    /// Wait until the sender holds no notes, or until `timeout` elapses.
+    /// Wait until no sender on this database holds notes, or until `timeout`
+    /// elapses.
     ///
     /// Call this before a runtime stops. A sender task stops with its
-    /// runtime, and loses the notes it holds. Returns `true` when no note
-    /// waits.
+    /// runtime, and loses the notes it holds. A write through this pool can
+    /// go to the sender of another pool on the same database, so the wait
+    /// covers those senders too. Returns `true` when no note waits.
     pub async fn flush(&self, timeout: Duration) -> bool {
-        let shared = &self.shared;
-        // The sender moves notes and publishes their count under the
-        // pending lock. Both reads under that lock therefore see one state.
-        let drained = || {
-            let pending = lock(&shared.pending);
-            pending.is_empty() && AtomicUsize::load(&shared.held, Ordering::Relaxed) == 0
-        };
         let deadline = tokio::time::Instant::now() + timeout;
-        while !drained() {
-            if tokio::time::Instant::now() >= deadline || !shared.alive() {
-                return drained();
+        loop {
+            let peers = self.shared.peers();
+            if peers.iter().all(|sink| sink.drained()) {
+                return true;
             }
-            shared.wake.notify_one();
+            if tokio::time::Instant::now() >= deadline || !peers.iter().any(|sink| sink.alive()) {
+                return false;
+            }
+            for sink in &peers {
+                sink.wake.notify_one();
+            }
             tokio::time::sleep(GATE_RETRY_INTERVAL).await;
         }
-        true
     }
 }
 
@@ -2265,6 +2293,36 @@ mod tests {
         lock(&sink.task)
             .as_ref()
             .is_some_and(|task| !task.is_finished())
+    }
+
+    #[tokio::test]
+    async fn a_flush_waits_for_a_peer_sender_on_the_same_database() {
+        let fingerprint = Fingerprint {
+            database: "flush_peer_test".into(),
+            started_at: DateTime::<Utc>::UNIX_EPOCH,
+        };
+        let (_own_pool, own) = lazy_sink();
+        let (_peer_pool, peer) = lazy_sink();
+        *lock(&own.fingerprint) = Some(fingerprint.clone());
+        *lock(&peer.fingerprint) = Some(fingerprint);
+        let (own, peer) = (Arc::new(own), Arc::new(peer));
+        // Routing gave the write of the own pool to the peer sender.
+        let (note_fingerprint, notes) = test_note();
+        lock(&peer.pending).extend(notes.into_iter().map(|note| Staged {
+            txid: None,
+            fingerprint: Arc::clone(&note_fingerprint),
+            queued_at: Instant::now(),
+            note,
+        }));
+        lock(&SINKS).extend([Arc::clone(&own), Arc::clone(&peer)]);
+
+        let sink = NotifySink {
+            shared: Arc::clone(&own),
+        };
+        let drained = sink.flush(Duration::from_millis(50)).await;
+        lock(&SINKS).retain(|sink| !Arc::ptr_eq(sink, &own) && !Arc::ptr_eq(sink, &peer));
+
+        assert!(!drained, "the peer sender still holds the routed note");
     }
 
     #[tokio::test]
