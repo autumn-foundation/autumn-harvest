@@ -43,12 +43,16 @@ page explains each part of that chapter and the parts that it leaves out.
 not apply migrations. Apply them before the process starts:
 
 ```bash
-cargo run -p autumn-harvest-cli -- migrate run \
-  --database-url postgres://harvest:harvest@localhost:5435/harvest
+HARVEST_DATABASE_URL=postgres://harvest:harvest@localhost:5435/harvest \
+  cargo run -p autumn-harvest-cli -- migrate run
 ```
 
-`harvest migrate status --check` exits `1` while a migration is pending. Use it
-as a deploy gate. For a multi-shard pool, give `--database-url` once per shard.
+Pass the DSN through `HARVEST_DATABASE_URL`, not `--database-url`: a command
+line is visible host-wide (`ps`, `/proc`) for as long as the migration runs,
+and a production DSN carries a password. `harvest migrate status --check`
+exits `1` while a migration is pending. Use it as a deploy gate. For a
+multi-shard pool, run one invocation per shard, each with its own
+`HARVEST_DATABASE_URL`, as the [README](../README.md#migrating-a-dedicated-harvest-database) shows.
 
 **These crates.** The Axum types come from the `autumn_web::reexports::axum`
 re-export, so the version always matches the router. The `path` keys point
