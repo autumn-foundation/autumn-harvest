@@ -137,7 +137,7 @@ async fn seed_external_handoff(
         workflow_id,
         run_id: uuid::Uuid::new_v4(),
         shard_id: 0,
-        input: json!({ "raw": "not exposed in handoff list" }),
+        input: json!({ "raw": "not exposed in handoff list" }).into(),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,

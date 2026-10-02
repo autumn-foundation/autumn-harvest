@@ -205,7 +205,7 @@ fn params<'a>(
         workflow_name: wf,
         workflow_id: wf_id,
         exec_id,
-        input: serde_json::json!({ "doc_id": key }),
+        input: serde_json::json!({ "doc_id": key }).into(),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,

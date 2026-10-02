@@ -16,6 +16,7 @@ and all real work lives behind activities.
 
 ```rust
 use std::time::Duration;
+
 use autumn_harvest::prelude::*;
 
 #[workflow]
@@ -42,7 +43,8 @@ async fn send_welcome_email(
 }
 ```
 
-Register both with the plugin:
+Register both with the plugin. On plain Axum, with no plugin, take the fork
+instead: [The first workflow on plain Axum](standalone-axum.md).
 
 ```rust
 HarvestPlugin::new()

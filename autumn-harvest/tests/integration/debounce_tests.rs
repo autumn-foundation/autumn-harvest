@@ -723,7 +723,7 @@ async fn no_debounce_policy_uses_normal_start_path() {
             workflow_name: wf,
             workflow_id: wf_id,
             exec_id: ExecutionId::new(),
-            input: serde_json::json!({ "x": 1 }),
+            input: serde_json::json!({ "x": 1 }).into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,

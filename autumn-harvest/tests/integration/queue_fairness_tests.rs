@@ -75,7 +75,7 @@ async fn insert_execution_for_queue(
         workflow_id: &format!("fairness-{queue_name}-{suffix}"),
         run_id: Uuid::new_v4(),
         shard_id: 0,
-        input: serde_json::json!({}),
+        input: serde_json::json!({}).into(),
         parent_id: None,
         queue_name,
         execution_timeout: None,

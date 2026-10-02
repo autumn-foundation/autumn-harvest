@@ -72,7 +72,7 @@ async fn seed_run(
             workflow_name: "nightly_etl",
             workflow_id,
             exec_id,
-            input: json!(null),
+            input: json!(null).into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,

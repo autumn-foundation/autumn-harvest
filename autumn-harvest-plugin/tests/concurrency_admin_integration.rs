@@ -155,7 +155,7 @@ async fn seed_run(pool: &DbPool, wf: &str, wf_id: &str, key: &str, limit: u32) {
             workflow_name: wf,
             workflow_id: wf_id,
             exec_id,
-            input: json!({ "tenant_id": key }),
+            input: json!({ "tenant_id": key }).into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
