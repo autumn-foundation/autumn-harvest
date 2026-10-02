@@ -61,6 +61,7 @@ NOTIFY. They also show no wake after a rollback, one merged wake per queue, a
 counted send failure, a woken listener on a long queue name, and registration
 from a client and from outside a runtime.
 
-`benchmarks/notify-commit.sh` measures commit throughput. At 16 or more
-writers, the post-commit path commits about twice as many transactions per
-second as an in-transaction NOTIFY. See `docs/benchmarks/notify-commit.md`.
+`benchmarks/notify-commit.sh` measures commit throughput. At 16 to 64
+writers, the post-commit path commits 1.4 to 2.3 times as many transactions
+per second as an in-transaction NOTIFY, and loses no notification. See
+`docs/benchmarks/notify-commit.md`.
