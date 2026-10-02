@@ -638,6 +638,89 @@ async fn rebalanced_execution_is_checked_on_its_live_shard() {
     assert_eq!(rows[0].shard_id, Some(7));
 }
 
+/// A two-shard app: shard 0 on `entry_pool`, shard 7 on `live_pool`, with a
+/// hook that denies shard 7.
+fn two_shard_app(entry_pool: &DbPool, live_pool: DbPool) -> App {
+    let shards = vec![ShardId::new(0), ShardId::new(7)];
+    let state = HarvestApiState::new();
+    state.install_storage_pool(HarvestDbPool::from(ShardedDbPool::from_map(
+        [
+            (ShardId::new(0), entry_pool.clone()),
+            (ShardId::new(7), live_pool),
+        ]
+        .into_iter()
+        .collect(),
+        ShardId::new(0),
+    )));
+    state.install(HarvestApiRuntime::new(
+        Arc::new(HandlerRegistry::new(vec![], vec![])),
+        Arc::new(DagCatalog::default()),
+        Arc::new(Vec::new()),
+        Some("authz-test".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::new(shards.clone(), shards, ShardId::new(0)),
+    ));
+    authorized_app_with_state(&state, deny_shard_7)
+}
+
+/// Insert a bare execution row.
+async fn insert_execution(
+    conn: &mut AsyncPgConnection,
+    id: ExecutionId,
+    state: &str,
+    retry_of: Option<ExecutionId>,
+    migrated_to: Option<i32>,
+) {
+    diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions \
+         (id, workflow_name, workflow_id, shard_id, input, state, retry_of_exec_id, \
+          migrated_to_shard, migrated_at) \
+         VALUES ($1, 'wf', $2, 0, '{}'::jsonb, $3, $4, $5, \
+                 CASE WHEN $5 IS NULL THEN NULL ELSE NOW() END)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(id.as_uuid())
+    .bind::<diesel::sql_types::Text, _>(id.to_string())
+    .bind::<diesel::sql_types::Text, _>(state)
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Uuid>, _>(retry_of.map(|r| r.as_uuid()))
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(migrated_to)
+    .execute(conn)
+    .await
+    .unwrap();
+}
+
+/// A handler that follows the retry chain can reach a later attempt on
+/// another shard. The hook checks the shard of every attempt.
+#[tokio::test]
+async fn retry_chain_attempts_are_checked_on_their_shards() {
+    let (url, _c) = setup_database().await;
+    let entry_pool = build_pool(&url);
+    let live_url = second_database(&url).await;
+    let live_pool = build_pool(&live_url);
+    let mut conn = entry_pool.get().await.unwrap();
+    let mut live_conn = live_pool.get().await.unwrap();
+    scrub(&mut conn).await;
+
+    // Attempt 1 failed on shard 0. Attempt 2 was moved to shard 7.
+    let first = ExecutionId::new_for_shard(ShardId::new(0));
+    let second = ExecutionId::new_for_shard(ShardId::new(0));
+    insert_execution(&mut conn, first, "FAILED", None, None).await;
+    insert_execution(&mut conn, second, "MIGRATED", Some(first), Some(7)).await;
+    insert_execution(&mut live_conn, second, "RUNNING", Some(first), None).await;
+
+    let app = two_shard_app(&entry_pool, live_pool);
+    let (status, _) = send(
+        &app,
+        Call::new("GET", &format!("/workflows/{first}/result")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "attempt 2 lives on shard 7");
+    let rows = deny_rows(&mut conn).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].shard_id, Some(7));
+}
+
 /// A lineage route reads every shard for descendants, so the hook also sees
 /// `None`. A shard-confining policy then fails closed.
 #[tokio::test]

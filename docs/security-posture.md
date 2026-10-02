@@ -344,7 +344,7 @@ needs I/O implements `HarvestAuthorizer` directly and returns a boxed future.
 
 | Route | Shard source |
 |---|---|
-| A path with an execution id, e.g. `GET /workflows/{id}`, also under `/ui` | The entry shard of the id and the shard the run lives on now. A percent-encoded id is decoded first. |
+| A path with an execution id, e.g. `GET /workflows/{id}`, also under `/ui` | The entry shard of the id, the shard the run lives on now, and the shard of each later attempt in its retry chain. A percent-encoded id is decoded first. |
 | `GET /workflows/{id}/children`, `GET /workflows/{id}/tree` | The execution's shards, and also `None`, because the handler reads every shard for descendants. |
 | `GET /admin/history/exports`, `GET /admin/history/export-sample` | `shard_id`, `shard-id` or `shard` query parameter. |
 | `GET /admin/external-handoffs` | `shard_id` or `shard` query parameter. |
@@ -374,11 +374,12 @@ shard by hash. To confine a caller to some shards, deny `None` too.
 - **The tenant key is caller-declared.** Harvest does not bind it to stored
   executions. The hook decides if the principal may act for that tenant. To
   confine a caller to its own executions, also check the target in `path`.
-- **An execution id gives two shards: its entry shard and its live shard.**
-  A retired shard resolves to its successor. For a run that a shard rebalance
-  moved, the hook follows the forward, as the handler does. Both shards are
-  checked. This costs one indexed lookup per request. If the lookup fails, the
-  request gets `503`, because the handler would fail the same lookup.
+- **An execution id gives every shard its handler can reach.** That is the
+  entry shard, the live shard after a rebalance, and the shard of each later
+  attempt in the retry chain. Many handlers follow the chain to the live
+  attempt. The hook uses the same walks as the handlers, and checks every
+  shard. This costs a few indexed lookups per request. If a walk fails, the
+  request gets `503`, because the handler would fail the same walk.
 - **The hook does not cover the app-level MCP tool routes or webhook routes.**
   They live outside the management router.
 - **A panic in the hook aborts the request.** It never lets it through.

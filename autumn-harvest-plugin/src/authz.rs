@@ -394,12 +394,14 @@ fn shard_number(raw: i64) -> Option<ShardId> {
         .map(ShardId::new)
 }
 
-/// The shards an execution id in the path touches: its entry shard and the
-/// shard it lives on now.
+/// The shards an execution id in the path can touch.
 ///
-/// The handler follows a rebalance forward to the live shard, so the hook
-/// must check that shard too. The walk is the one the handler uses. If it
-/// fails, the handler fails the same walk, so the request gets `503`.
+/// That is the id's entry shard, the shard it lives on now, and the shard of
+/// every later attempt in its retry chain. Handlers follow a rebalance
+/// forward, and many follow the retry chain to the live attempt. The walks
+/// are the ones the handlers use. If a walk fails, the handler fails it too,
+/// so the request gets `503`. An unknown id adds no attempts; the handler
+/// answers `404`.
 ///
 /// A retired shard resolves to its successor. With a storage pool, an id with
 /// no encoded shard resolves to the default shard. With no pool, it has none.
@@ -418,14 +420,21 @@ async fn path_shards(
             .collect());
     };
     let pool = pool.sharded_pool();
-    let entry = pool.routed_shard_for_execution(exec_id);
-    match autumn_harvest::shard_rebalance::resolve_execution_shard(pool, exec_id).await {
-        Ok(live) => Ok(vec![entry, live]),
-        Err(e) => {
-            tracing::warn!(error = %e, path = %path, "harvest: authz could not resolve shard");
-            Err(StatusCode::SERVICE_UNAVAILABLE.into_response())
-        }
+    let unavailable = |e: &autumn_harvest::HarvestError| {
+        tracing::warn!(error = %e, path = %path, "harvest: authz could not resolve shard");
+        StatusCode::SERVICE_UNAVAILABLE.into_response()
+    };
+    let (mut conn, live) =
+        autumn_harvest::shard_rebalance::conn_for_execution_forwarded_with_shard(pool, exec_id)
+            .await
+            .map_err(|e| unavailable(&e))?;
+    let mut shards = vec![pool.routed_shard_for_execution(exec_id), live];
+    match autumn_harvest::execution::walk_retry_chain(&mut conn, pool, live, exec_id).await {
+        Ok(chain) => shards.extend(chain.into_iter().map(|(_, shard)| shard)),
+        Err(autumn_harvest::HarvestError::NotFound(_)) => {}
+        Err(e) => return Err(unavailable(&e)),
     }
+    Ok(shards)
 }
 
 /// The shards named by `keys` in the query, decoded as the handlers decode it.
