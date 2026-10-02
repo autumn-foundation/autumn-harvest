@@ -211,7 +211,7 @@ A retry policy limits the retries of one task. A retry budget limits the retries
 1. A claim with `attempt == 1` is a first attempt. It always runs and deposits `ratio` tokens.
 2. A claim with `attempt > 1` is a retry. An orphan re-claim is a retry too. A retry runs only if it can spend one token.
 3. The bucket never holds more than `max_tokens`.
-4. The gate applies only to a real call. A `CircuitOpen` short-circuit spends nothing. A half-open probe is never deferred, because it is the breaker's recovery signal.
+4. The gate applies only to a real call. A `CircuitOpen` short-circuit spends nothing. A half-open probe that is a retry is never deferred, because it is the breaker's recovery signal. A probe that is a first attempt still deposits.
 5. An attempt that does not run gives its tokens back. A drop guard does this on every return before `ActivityStarted`: a rate-limit deferral, a no-op start or an error.
 6. A released deposit can leave the bucket below 0, because a retry can spend the deposit first. The next deposits pay the debt back. A held deposit can also push the time refill over the cap. Its release gives back the refill that the cap discarded, up to the deposit amount.
 

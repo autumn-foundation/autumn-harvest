@@ -25,10 +25,10 @@ deferred retry is never lost.**
   type. `None` turns the budget off for that type. An override for an
   unregistered name logs a warning.
 - The gate in `process_activity_task` runs after the circuit breaker and
-  before `ActivityStarted`. A `CircuitOpen` short-circuit spends nothing, and a
-  half-open probe is never deferred. A drop guard gives the tokens back for an
-  attempt that does not run. A budget deferral refunds the claim-time
-  rate-limit token.
+  before `ActivityStarted`. A `CircuitOpen` short-circuit spends nothing. A
+  half-open probe that is a retry is never deferred. A drop guard gives the
+  tokens back for an attempt that does not run. A budget deferral refunds the
+  claim-time rate-limit token.
 - Deferral delays follow the refill rate, from 50 ms. Past 60 s, a delay is
   random from 30 s to 60 s, so a backlog does not wake at one instant.
 - New metrics: gauge `harvest.retry.budget.available{activity}` and counter

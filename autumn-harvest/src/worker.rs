@@ -14603,6 +14603,70 @@ enum RetryBudgetGate {
     Defer(Duration),
 }
 
+/// Whether the retry budget gates this attempt (issue #1793).
+///
+/// A `None` token is a circuit short-circuit. It never reaches the
+/// dependency, so the budget ignores it. A half-open probe that is a retry
+/// is the breaker's recovery signal, so the budget never defers it. A probe
+/// that is a first attempt still goes through the gate, so its deposit
+/// counts.
+fn retry_budget_gates(
+    circuit_token: Option<crate::circuit_breaker::DispatchToken>,
+    is_retry: bool,
+) -> bool {
+    circuit_token.is_some_and(|token| !(token.is_probe() && is_retry))
+}
+
+#[cfg(test)]
+mod retry_budget_gate_tests {
+    use super::retry_budget_gates;
+    use crate::circuit_breaker::{
+        AttemptOutcome, CircuitBreakerRegistry, DispatchDecision, DispatchToken,
+    };
+    use crate::policy::CircuitBreakerPolicy;
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    /// A normal token, and a half-open probe token from a tripped breaker.
+    fn tokens() -> (DispatchToken, DispatchToken) {
+        let policy = CircuitBreakerPolicy::new(1, Duration::from_secs(30), Duration::from_secs(5));
+        let reg = CircuitBreakerRegistry::new(HashMap::from([("act".to_owned(), policy)]));
+        let t0 = Instant::now();
+        let DispatchDecision::Allow { token: normal } = reg.on_dispatch("act", t0) else {
+            panic!("a closed breaker allows");
+        };
+        let _ = reg.on_result("act", AttemptOutcome::RetryableFailure, normal, t0);
+        let DispatchDecision::Allow { token: probe } =
+            reg.on_dispatch("act", t0 + Duration::from_secs(6))
+        else {
+            panic!("the cooldown admits a probe");
+        };
+        assert!(probe.is_probe());
+        (normal, probe)
+    }
+
+    #[test]
+    fn a_short_circuit_is_never_gated() {
+        assert!(!retry_budget_gates(None, false));
+        assert!(!retry_budget_gates(None, true));
+    }
+
+    #[test]
+    fn a_normal_dispatch_is_gated() {
+        let (normal, _) = tokens();
+        assert!(retry_budget_gates(Some(normal), false));
+        assert!(retry_budget_gates(Some(normal), true));
+    }
+
+    /// A retry probe is exempt, but a first-attempt probe still deposits.
+    #[test]
+    fn only_a_retry_probe_is_exempt() {
+        let (_, probe) = tokens();
+        assert!(!retry_budget_gates(Some(probe), true));
+        assert!(retry_budget_gates(Some(probe), false));
+    }
+}
+
 /// Consult the retry budget for one claimed attempt and emit its metrics.
 ///
 /// A claim with `attempt > 1` is a retry. An orphan reclaim also raises
@@ -15168,12 +15232,11 @@ async fn process_activity_task(
         crate::circuit_breaker::DispatchDecision::ShortCircuit { .. } => None,
     };
 
-    // Retry budget (issue #1793). The gate applies only to a real call. A
-    // short-circuit never reaches the dependency. A half-open probe is the
-    // breaker's recovery signal, so the budget never defers it. The gate
-    // runs before ActivityStarted, so a deferred retry leaves no event.
+    // Retry budget (issue #1793). See `retry_budget_gates` for which
+    // attempts it gates. The gate runs before ActivityStarted, so a deferred
+    // retry leaves no event.
     let mut budget_guard = BudgetReleaseGuard::new(registry, activity_name);
-    if circuit_token.is_some_and(|token| !token.is_probe()) {
+    if retry_budget_gates(circuit_token, task_attempt(task) > 1) {
         match admit_retry_budget(registry, activity_name, task) {
             RetryBudgetGate::Run(ticket) => budget_guard.hold(ticket),
             RetryBudgetGate::Defer(retry_after) => {
