@@ -778,6 +778,28 @@ async fn running_activity_execs(
         .collect()
 }
 
+/// The executions with an activity task that the old Postgres instance
+/// claimed. A claim sets `started_at` from the server clock, so a claim
+/// before the restart is older than `pg_postmaster_start_time()`. This set
+/// has no timing window, unlike a snapshot taken before or after the crash.
+async fn activities_claimed_before_restart(conn: &mut AsyncPgConnection) -> Vec<ExecutionId> {
+    #[derive(diesel::QueryableByName)]
+    struct ExecRow {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        workflow_exec_id: uuid::Uuid,
+    }
+    let rows: Vec<ExecRow> = diesel::sql_query(
+        "SELECT DISTINCT workflow_exec_id FROM harvest_task_queue \
+         WHERE task_type = 'activity' AND started_at < pg_postmaster_start_time()",
+    )
+    .load(conn)
+    .await
+    .expect("list activities claimed before the restart");
+    rows.into_iter()
+        .map(|r| ExecutionId::from_uuid(r.workflow_exec_id))
+        .collect()
+}
+
 /// Count tasks of `execs` that the orphan reclaimer requeued at least once.
 async fn reclaimed_tasks(admin_url: &str, execs: &[ExecutionId]) -> i64 {
     let ids: Vec<uuid::Uuid> = execs.iter().map(ExecutionId::as_uuid).collect();
@@ -884,10 +906,9 @@ async fn postgres_crash_restart_mid_workload() {
     db.crash_restart_postgres().await;
 
     // The crash can drop a write of an activity in flight, so the known
-    // failure applies to those workflows only. The list read after the
-    // restart holds every activity that was in flight across the crash.
+    // failure applies to those workflows only.
     let mut conn = connect(&db.admin_url).await;
-    let in_flight = running_activity_execs(&mut conn, None).await;
+    let in_flight = activities_claimed_before_restart(&mut conn).await;
     let accept = Accept::CompletedOrKnownFailure(&in_flight);
     converge(&db.admin_url, &execs, true, accept, "crash restart").await;
 }

@@ -350,8 +350,8 @@ Each test works around a bug only where the bug applies:
 - #1871 and #1870 turn a lost result write into `FAILED` after one
   `StartToClose` timeout. The rolled-back append test requires that outcome,
   so a fix for the bugs makes the test fail on purpose. The restart test
-  accepts it, but only for workflows that had an activity in flight across
-  the crash. Each accepted `FAILED` must have the exact history: one
+  accepts it, but only for workflows with an activity that the old Postgres
+  instance claimed. Each accepted `FAILED` must have the exact history: one
   `StartToClose` timeout, no activity result, and one `WorkflowFailed` for
   the timeout.
 - For #1876, the partition test sets `idle_in_transaction_session_timeout =
