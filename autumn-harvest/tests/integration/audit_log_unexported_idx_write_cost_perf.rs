@@ -15,6 +15,9 @@
 //! `audit_export_tests.rs`'s own module doc repeats the same deferral:
 //! "The insert-path index cost is separate (issue #1272)."
 //!
+//! Issue #1667 shipped option (1): the migration drops the index and the exporter
+//! builds it lazily. This harness now builds it for the with-index arm.
+//!
 //! This harness is that measurement. It seeds a production-shaped
 //! `harvest_audit_log` once. The fixture has 500,000 pre-existing rows,
 //! realistic operation-name and actor cardinality, and `occurred_at`
@@ -622,11 +625,16 @@ async fn measure(
         .await
         .expect("seed connection");
 
-    if drop_unexported_idx {
-        diesel::sql_query("DROP INDEX harvest_audit_log_unexported_idx")
-            .execute(&mut seed_conn)
-            .await
-            .expect("drop the counterfactual index");
+    // Issue #1667: no migration creates the index. The shipped-schema arm
+    // builds it, as the exporter does on its first tick.
+    if !drop_unexported_idx {
+        diesel::sql_query(
+            "CREATE INDEX IF NOT EXISTS harvest_audit_log_unexported_idx \
+             ON harvest_audit_log (occurred_at, id) WHERE export_seq IS NULL",
+        )
+        .execute(&mut seed_conn)
+        .await
+        .expect("build the index for the with-index arm");
     }
 
     let unexported_idx_bytes = if drop_unexported_idx {

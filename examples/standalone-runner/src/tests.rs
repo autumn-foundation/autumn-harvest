@@ -4,7 +4,6 @@ use autumn_harvest_plugin::api::{HarvestApiState, StandaloneAdminAuth, harvest_a
 use autumn_harvest_plugin::harvest_ui_router;
 use autumn_harvest_plugin::metrics_scrape::HarvestMetricsRecorder;
 use autumn_harvest_plugin::prelude::HarvestMode;
-use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::json;
@@ -99,11 +98,12 @@ async fn standalone_order_uses_version_gate_saga_and_child_workflow() {
 ///
 /// `run` gets its Harvest router from `HarvestEmbedding`, which needs a
 /// database. `harvest_mount` builds the same composition from a bare state.
-/// The plugin crate's `standalone_embedding.rs` tests the started router.
+/// `tests/acceptance.rs` tests the started binary against Postgres.
 fn router_under_test() -> axum::Router {
     build_router(
         harvest_mount(&StandaloneAdminAuth::new()),
         HarvestMetricsRecorder::new(),
+        None,
     )
 }
 
@@ -167,7 +167,7 @@ async fn preflight_without_a_credential_is_rejected() {
 #[tokio::test]
 async fn preflight_succeeds_once_dev_profile_is_declared() {
     let auth = StandaloneAdminAuth::new().with_deployment_profile("dev");
-    let app = build_router(harvest_mount(&auth), HarvestMetricsRecorder::new());
+    let app = build_router(harvest_mount(&auth), HarvestMetricsRecorder::new(), None);
 
     assert_eq!(
         get_status(app.clone(), "/api/harvest/admin/preflight").await,
@@ -187,7 +187,7 @@ async fn preflight_succeeds_once_dev_profile_is_declared() {
 async fn metrics_route_renders_a_recorded_sample_as_prometheus_text() {
     let metrics = HarvestMetricsRecorder::new();
     metrics.record_workflow_started("standalone_order", RUNNER_QUEUE);
-    let app = build_router(harvest_mount(&StandaloneAdminAuth::new()), metrics);
+    let app = build_router(harvest_mount(&StandaloneAdminAuth::new()), metrics, None);
 
     let response = app
         .oneshot(
@@ -215,4 +215,149 @@ async fn metrics_route_renders_a_recorded_sample_as_prometheus_text() {
     assert!(text.contains(&format!(
         "harvest_workflow_started_total{{workflow=\"standalone_order\",queue=\"{RUNNER_QUEUE}\"}} 1\n"
     )));
+}
+
+/// Issue #1615. The manifest must not name `autumn-web` in any dependency
+/// table. A rename through `package = "autumn-web"` counts as a name too.
+#[test]
+fn manifest_names_no_autumn_web() {
+    let manifest: toml::Table =
+        toml::from_str(include_str!("../Cargo.toml")).expect("Cargo.toml should parse");
+    let offenders = autumn_web_entries(&manifest);
+    assert!(
+        offenders.is_empty(),
+        "standalone-runner must not depend on autumn-web, found: {offenders:?}"
+    );
+}
+
+/// Return each dependency key that resolves to the `autumn-web` package.
+fn autumn_web_entries(manifest: &toml::Table) -> Vec<String> {
+    const TABLES: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
+    let mut scopes = vec![manifest];
+    if let Some(targets) = manifest.get("target").and_then(toml::Value::as_table) {
+        scopes.extend(targets.values().filter_map(toml::Value::as_table));
+    }
+    let mut found = Vec::new();
+    for scope in scopes {
+        for table in TABLES.iter().filter_map(|name| scope.get(*name)) {
+            for (key, spec) in table.as_table().into_iter().flatten() {
+                let package = spec
+                    .get("package")
+                    .and_then(toml::Value::as_str)
+                    .unwrap_or(key);
+                if package == "autumn-web" {
+                    found.push(key.clone());
+                }
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn guard_detects_every_way_to_name_autumn_web() {
+    let manifest: toml::Table = toml::from_str(
+        r#"
+        [dependencies]
+        autumn-web = "0.7"
+        [dev-dependencies]
+        web = { package = "autumn-web", version = "0.7" }
+        [target.'cfg(unix)'.build-dependencies]
+        autumn-web = "0.7"
+        "#,
+    )
+    .expect("fixture should parse");
+    assert_eq!(autumn_web_entries(&manifest).len(), 3);
+}
+
+/// Issue #1615. No code line may name the `autumn_web` crate. A re-export
+/// through another crate would compile, so the guard reads the source. It
+/// reads every `.rs` file of the crate, so a new `build.rs` is covered too.
+#[test]
+fn source_names_no_autumn_web_path() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut offenders = Vec::new();
+    for path in rust_files(root) {
+        let text = std::fs::read_to_string(&path).expect("source should read");
+        for (number, line) in text.lines().enumerate() {
+            if names_crate(code_part(line), CRATE) {
+                offenders.push(format!("{}:{}", path.display(), number + 1));
+            }
+        }
+    }
+    assert!(offenders.is_empty(), "autumn-web paths: {offenders:?}");
+}
+
+/// `line` up to its `//` comment. A `//` inside a string is code.
+fn code_part(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut in_string = false;
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' if in_string => index += 1,
+            b'"' => in_string = !in_string,
+            // A quote in a char literal does not open a string.
+            b'\'' if !in_string && bytes.get(index + 2) == Some(&b'\'') => index += 2,
+            b'/' if !in_string && bytes.get(index + 1) == Some(&b'/') => return &line[..index],
+            _ => {}
+        }
+        index += 1;
+    }
+    line
+}
+
+/// The crate name the source guard looks for, split so this file passes.
+const CRATE: &str = concat!("autumn", "_web");
+
+/// True when `code` holds `name` as a whole identifier.
+fn names_crate(code: &str, name: &str) -> bool {
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    code.match_indices(name).any(|(start, _)| {
+        let before = code[..start].chars().next_back();
+        let after = code[start + name.len()..].chars().next();
+        !before.is_some_and(is_ident) && !after.is_some_and(is_ident)
+    })
+}
+
+#[test]
+fn source_guard_reads_code_after_a_url_in_a_string() {
+    let line = format!("let u = \"http://x\"; {CRATE}::f(); // {CRATE}");
+    let code = code_part(&line);
+    assert!(names_crate(code, CRATE), "{code}");
+    assert!(!code.ends_with(CRATE), "the comment is cut: {code}");
+    assert_eq!(code_part("let c = '\"'; // x"), "let c = '\"'; ");
+}
+
+#[test]
+fn source_guard_matches_whole_identifiers_only() {
+    let path = format!("use {CRATE}::config;");
+    let longer = format!("fn {CRATE}_entries() {{}}");
+    assert!(names_crate(&path, CRATE));
+    assert!(names_crate(&format!("x::{CRATE}::y"), CRATE));
+    assert!(!names_crate(&longer, CRATE));
+    assert!(!names_crate(&format!("my_{CRATE}"), CRATE));
+}
+
+fn rust_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut files = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let skipped = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "target" || name.starts_with('.'));
+        if skipped {
+            continue;
+        }
+        if path.is_dir() {
+            files.extend(rust_files(&path));
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            files.push(path);
+        }
+    }
+    files
 }

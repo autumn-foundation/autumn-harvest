@@ -257,6 +257,13 @@ pub struct WorkerConfigView {
     /// Most rows per timeout reason that one timeout pass enforces, as
     /// configured. The checker raises 0 to 1.
     pub timeout_scan_batch_size: u32,
+    /// Retry budget policy for activity types without an override
+    /// (issue #1793). `null` = no default budget.
+    pub retry_budget_default: Option<crate::policy::RetryBudgetPolicy>,
+    /// Per-activity-type retry budget overrides (issue #1793). A `null`
+    /// policy turns the budget off for that type.
+    pub retry_budget_overrides:
+        std::collections::BTreeMap<String, Option<crate::policy::RetryBudgetPolicy>>,
     /// Max panic strikes before a panicking workflow task fails terminally
     /// (0 = terminal on first panic).
     pub workflow_panic_max_attempts: u32,
@@ -416,6 +423,7 @@ impl WorkerConfigView {
             workflow_panic_max_attempts,
             codec_rotation_batch_size,
             scanner,
+            retry_budget,
             // REDACTED — the registry holds live codec handles that may close
             // over key material. Only the operator-chosen key IDENTIFIERS are
             // safe to report, and those are served by
@@ -483,6 +491,8 @@ impl WorkerConfigView {
             scanner_jitter: scanner.jitter,
             timeout_scan_interval_ms: scanner.timeout_interval.map(dur_ms),
             timeout_scan_batch_size: scanner.timeout_batch_size,
+            retry_budget_default: retry_budget.default_policy(),
+            retry_budget_overrides: retry_budget.overrides(),
             workflow_panic_max_attempts: *workflow_panic_max_attempts,
             notification_channel_configured: notification_database_url.is_some(),
             shard_notification_channels_configured: shard_notification_database_urls.len(),
@@ -919,6 +929,16 @@ mod tests {
             );
             assert!(caps_json[key].is_null(), "expected null for {key}");
         }
+    }
+
+    #[test]
+    fn default_view_reports_sticky_routing_on_with_a_5s_fallback() {
+        let view = WorkerConfigView::from_worker_config(
+            &WorkerConfig::default(),
+            Duration::from_millis(500),
+        );
+        assert!(view.sticky_routing_enabled);
+        assert_eq!(view.sticky_timeout_ms, 5_000);
     }
 
     #[test]

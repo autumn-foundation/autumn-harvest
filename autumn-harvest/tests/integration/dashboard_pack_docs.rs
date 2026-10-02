@@ -105,6 +105,7 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     "harvest_activity_failed_total",
     "harvest_activity_attempts_total",
     "harvest_activity_retries_total",
+    "harvest_retry_budget_exhausted_total",
     "harvest_activity_pause_actions_total",
     "harvest_activity_circuit_tripped_total",
     "harvest_activity_circuit_closed_total",
@@ -193,6 +194,10 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     // Issue #1429 — dispatch background publisher backpressure (bare gauge,
     // no label, one series per process).
     "harvest_dispatch_dropped_hints",
+    // Issue #1796 — post-commit notify health (bare gauges, no label, one
+    // series per process).
+    "harvest_notify_send_failures",
+    "harvest_notify_queue_usage",
     // Issue #954 — cross-region DR. Four gauges (bare) and one counter.
     "harvest_replication_lag_seconds",
     "harvest_replication_lag_bytes",
@@ -214,6 +219,7 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     "harvest_workflow_active",
     "harvest_rate_limit_tokens_available",
     "harvest_rate_limit_refill_rate",
+    "harvest_retry_budget_available",
     "harvest_concurrency_in_flight",
     "harvest_concurrency_deferred",
     "harvest_mutex_contention_depth",
@@ -324,6 +330,8 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
         &["activity", "queue", "outcome"],
     ),
     ("harvest_activity_retries", &["activity", "queue"]),
+    ("harvest_retry_budget_available", &["activity"]),
+    ("harvest_retry_budget_exhausted", &["activity"]),
     ("harvest_activity_pause_actions", &["activity", "action"]),
     ("harvest_activity_circuit_tripped", &["activity_name"]),
     ("harvest_activity_circuit_closed", &["activity_name"]),
@@ -338,6 +346,8 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     ("harvest_shard_stranded_pending", &["shard"]),
     ("harvest_shard_dispatched", &["shard"]),
     ("harvest_dispatch_dropped_hints", &[]),
+    ("harvest_notify_send_failures", &[]),
+    ("harvest_notify_queue_usage", &[]),
     // Issue #954 — cross-region DR. All `{shard}`-only: a standby's
     // `application_name` is operator-chosen and unbounded (ADR-0001 §7).
     ("harvest_replication_lag_seconds", &["shard"]),

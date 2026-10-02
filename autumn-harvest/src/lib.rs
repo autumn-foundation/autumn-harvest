@@ -317,6 +317,10 @@ pub mod guardrail;
 pub mod handle;
 #[cfg(feature = "db")]
 pub mod handle_typed;
+/// Activity heartbeat flusher. The flush loop has no DB dependency. The
+/// Postgres sink needs the `db` feature (issue #1800).
+#[doc(hidden)]
+pub mod heartbeat;
 pub mod history_export;
 /// Hot code swap for workflow definitions via runtime modules (issue #967).
 ///
@@ -357,6 +361,10 @@ pub mod mutex;
 pub mod partition;
 pub mod payload_codec;
 pub mod payload_store;
+/// The connection transport a DSN's `sslmode` selects, with TLS through
+/// rustls.
+#[cfg(feature = "db")]
+pub mod pg_tls;
 pub mod poison_pill;
 pub mod policy;
 pub mod pool;
@@ -373,6 +381,8 @@ pub mod queue_pause;
 /// `db` feature; [`quota::load_quota_usage`]/[`quota::list_quota_usage`] are
 /// DB-gated.
 pub mod quota;
+#[cfg(feature = "db")]
+mod quota_lock_order;
 /// Registry-aware `quota_key` backfill for pre-upgrade executions (issue #1226).
 ///
 /// Pure logic ([`quota_reconcile::resolve_backfill`],
@@ -392,6 +402,8 @@ pub mod replication;
 #[cfg(feature = "db")]
 pub mod reset;
 pub mod retention;
+/// Per-activity-type retry budget that bounds retry load (issue #1793).
+pub mod retry_budget;
 /// Continue-as-new run-chain assembly (issue #701).
 pub mod run_chain;
 pub mod saga;
@@ -413,6 +425,12 @@ pub mod shard;
 pub mod shard_rebalance;
 /// Shared, immutable JSON payload for the workflow start path (issue #1733).
 pub mod shared_json;
+
+/// `cfg(shuttle)` async-primitive shim (tokio under normal builds).
+///
+/// Only the modules that opt into Shuttle model checking use it. See
+/// `docs/testing/shuttle.md`. Internal, not part of the public API.
+mod shuttle_sync;
 /// Signal handler registry for push-based reactive signal handling (issue #546).
 pub mod signal_handler;
 pub mod simulator;
@@ -456,9 +474,6 @@ pub mod webhook_trigger;
 #[cfg(feature = "db")]
 #[doc(hidden)]
 pub mod dlq;
-#[cfg(feature = "db")]
-#[doc(hidden)]
-pub mod heartbeat;
 #[cfg(feature = "db")]
 #[doc(hidden)]
 pub mod models;
@@ -626,8 +641,8 @@ pub use payload_store::{
 };
 pub use policy::validate_schedule;
 pub use policy::{
-    CatchupPolicy, MapFailurePolicy, OverlapPolicy, RetryPolicy, Schedule, SkipPolicy, TaskStatus,
-    TriggerRule, WorkflowSchedule,
+    CatchupPolicy, JitterPolicy, MapFailurePolicy, OverlapPolicy, RetryBudgetPolicy, RetryPolicy,
+    Schedule, SkipPolicy, TaskStatus, TriggerRule, WorkflowSchedule,
 };
 pub use pool::{HarvestPoolConfig, compute_pool_sizes};
 pub use query::QueryRegistry;
@@ -651,6 +666,7 @@ pub use retention::{
     RetentionMonitor, RetentionRuntime, RetentionStatus, RetentionTickResult, release_legal_hold,
     set_legal_hold,
 };
+pub use retry_budget::RetryBudgetConfig;
 pub use run_chain::{
     RunChainRecord, RunChainResponse, RunChainRow, assemble_run_chain, outcome_for_state,
 };

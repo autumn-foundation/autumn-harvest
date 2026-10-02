@@ -285,9 +285,12 @@ fails startup instead, in every mode.
   the supported shapes.
 - **Priority is best effort.** A stream delivers in publish order. Only the
   reconcile sweep publishes in priority order.
-- **Sticky affinity is best effort.** A non-pinned worker releases the
-  reference with backoff. Affinity stays a cache hint, never a correctness
-  rule.
+- **Sticky affinity is best effort.** Sticky routing is on by default
+  (issue #1798). A worker that is not the owner of a live pin releases the
+  reference after one poll interval, with no backoff. The reference then
+  circulates until the owner claims it or the pin expires. A session pin
+  keeps the normal backoff, because it never expires. Affinity stays a
+  cache hint, never a correctness rule.
 - **No new event variant and no migration.** The channel adds nothing to
   `harvest_events` and nothing to the schema.
 

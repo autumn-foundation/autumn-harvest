@@ -2719,6 +2719,10 @@ enum ScheduleCommand {
         /// Create the schedule in a paused state.
         #[arg(long)]
         paused: bool,
+        /// Jitter window in seconds. 0 disables jitter. If you omit it, a cron
+        /// with no seconds field gets 10 seconds (issue #1792).
+        #[arg(long)]
+        jitter_secs: Option<u64>,
     },
     /// Edit an existing schedule in place — partial update, `schedule_id` preserved (issue #771).
     Update {
@@ -5902,18 +5906,18 @@ impl DrShardStatus {
     }
 }
 
+/// Connect for a DR command. [`autumn_harvest::pg_tls`] picks the transport
+/// from the `sslmode`, so a managed Postgres that refuses plaintext is
+/// reachable.
 async fn dr_connect(
     dsn: &str,
 ) -> Result<autumn_harvest::diesel_async::AsyncPgConnection, CliError> {
-    use autumn_harvest::diesel_async::AsyncConnection as _;
-    autumn_harvest::diesel_async::AsyncPgConnection::establish(dsn)
-        .await
-        .map_err(|e| {
-            CliError::InvalidInput(format!(
-                "cannot connect to {}: {e}",
-                autumn_harvest::backup_verify::redact_dsn(dsn)
-            ))
-        })
+    autumn_harvest::pg_tls::connect(dsn).await.map_err(|e| {
+        CliError::InvalidInput(format!(
+            "cannot connect to {}: {e}",
+            autumn_harvest::backup_verify::redact_dsn(dsn)
+        ))
+    })
 }
 
 /// Connect for a read-only DR command, with the session pinned read-only.
@@ -11256,6 +11260,7 @@ fn schedule_request(command: &ScheduleCommand) -> Result<ApiRequest, CliError> {
             max_active_runs,
             catchup,
             paused,
+            jitter_secs,
         } => {
             let mut body = Map::new();
             body.insert("workflow_name".to_string(), Value::String(name.clone()));
@@ -11263,6 +11268,9 @@ fn schedule_request(command: &ScheduleCommand) -> Result<ApiRequest, CliError> {
             body.insert("max_active_runs".to_string(), json!(max_active_runs));
             body.insert("catchup".to_string(), json!(catchup));
             body.insert("paused".to_string(), json!(paused));
+            if let Some(secs) = jitter_secs {
+                body.insert("jitter_secs".to_string(), json!(secs));
+            }
             if let Some(input) =
                 parse_json_source(input_json.as_deref(), input_file.as_deref(), "input")?
             {
@@ -18976,5 +18984,25 @@ mod migrate_cli_tests {
         );
         assert!(rendered.contains(&redacted), "{rendered}");
         assert_eq!(error.exit_code(), 1);
+    }
+}
+
+#[cfg(test)]
+mod pg_tls_feature_tests {
+    /// `harvest dr` and `harvest backup verify` connect through
+    /// `autumn_harvest::pg_tls`. A standalone CLI build must carry its TLS
+    /// connector, or a managed Postgres that needs TLS is unreachable.
+    #[test]
+    fn the_cli_build_has_tls_for_its_database_probes() {
+        let result = autumn_harvest::pg_tls::prepare("postgres://u@h/db?sslmode=require");
+        let unsupported = matches!(
+            &result,
+            Err(autumn_harvest::pg_tls::PgTlsError::Unsupported(m)) if m.contains("`tls` feature")
+        );
+        assert!(
+            !unsupported,
+            "the CLI must enable autumn-harvest/tls: {:?}",
+            result.err()
+        );
     }
 }

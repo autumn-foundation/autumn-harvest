@@ -219,41 +219,14 @@ pub fn query_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn build_query_dispatch(fn_name: &syn::Ident, param_names: &[&syn::Ident]) -> TokenStream {
-    if param_names.is_empty() {
-        quote! {
-            let result = #fn_name(ctx);
-            result.map_err(|e| e.to_string())
-                .and_then(|v| {
-                    ::autumn_harvest::serde_json::to_value(v).map_err(|e| e.to_string())
-                })
-        }
-    } else if param_names.len() == 1 {
-        let name = &param_names[0];
-        quote! {
-            let #name = ::autumn_harvest::serde_json::from_value(args)
-                .map_err(|e| e.to_string())?;
-            let result = #fn_name(ctx, #name);
-            result.map_err(|e| e.to_string())
-                .and_then(|v| {
-                    ::autumn_harvest::serde_json::to_value(v).map_err(|e| e.to_string())
-                })
-        }
-    } else {
-        let indices = (0..param_names.len()).map(syn::Index::from);
-        let names = param_names.to_owned();
-        quote! {
-            let __args: ::autumn_harvest::serde_json::Value = args;
-            #(
-                let #names = ::autumn_harvest::serde_json::from_value(__args[#indices].clone())
-                    .map_err(|e| e.to_string())?;
-            )*
-            let result = #fn_name(ctx, #(#names),*);
-            result.map_err(|e| e.to_string())
-                .and_then(|v| {
-                    ::autumn_harvest::serde_json::to_value(v).map_err(|e| e.to_string())
-                })
-        }
-    }
+    crate::attr_util::build_handler_dispatch(
+        fn_name,
+        param_names,
+        &format_ident!("args"),
+        &quote! { ctx },
+        &quote! {},
+        &quote! { |e| e.to_string() },
+    )
 }
 
 // ── Characterization tests ──────────────────────────────────────────────────
@@ -435,5 +408,72 @@ mod signature_validation_characterization_tests {
             out.contains("return type must be") && out.contains("Result"),
             "expected the return-type rejection message, got:\n{out}"
         );
+    }
+}
+
+// Pins the output of `attr_util::build_handler_dispatch` as used by `#[query]`
+// (issue #1632).
+#[cfg(test)]
+mod dispatch_characterization_tests {
+    use super::query_macro;
+    use quote::quote;
+
+    /// Isolate the body of the generated `__dispatch` function.
+    fn extract_dispatch_body(full: &str) -> String {
+        let marker = "-> Result < :: autumn_harvest :: serde_json :: Value , String > {";
+        let start = full
+            .find(marker)
+            .unwrap_or_else(|| panic!("no dispatch marker in generated output:\n{full}"))
+            + marker.len();
+        let mut depth = 1i32;
+        let bytes = full.as_bytes();
+        let mut i = start;
+        while i < bytes.len() && depth > 0 {
+            match bytes[i] as char {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        full[start..i - 1].trim().to_string()
+    }
+
+    fn generate(item: proc_macro2::TokenStream) -> String {
+        query_macro(quote! { workflow = "MyWorkflow" }, item).to_string()
+    }
+
+    const QUERY_DISPATCH_0: &str = "let result = my_query (ctx) ; result . map_err (| e | e . to_string ()) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
+    const QUERY_DISPATCH_1: &str = "let n = :: autumn_harvest :: serde_json :: from_value (args) . map_err (| e | e . to_string ()) ? ; let result = my_query (ctx , n) ; result . map_err (| e | e . to_string ()) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
+    const QUERY_DISPATCH_N: &str = "let __args : :: autumn_harvest :: serde_json :: Value = args ; let a = :: autumn_harvest :: serde_json :: from_value (__args [0] . clone ()) . map_err (| e | e . to_string ()) ? ; let b = :: autumn_harvest :: serde_json :: from_value (__args [1] . clone ()) . map_err (| e | e . to_string ()) ? ; let result = my_query (ctx , a , b) ; result . map_err (| e | e . to_string ()) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
+
+    #[test]
+    fn zero_params_dispatch_is_pinned() {
+        let out = generate(quote! {
+            fn my_query(ctx: &WorkflowContext) -> Result<u32, String> {
+                Ok(1)
+            }
+        });
+        assert_eq!(extract_dispatch_body(&out), QUERY_DISPATCH_0);
+    }
+
+    #[test]
+    fn one_params_dispatch_is_pinned() {
+        let out = generate(quote! {
+            fn my_query(ctx: &WorkflowContext, n: u32) -> Result<u32, String> {
+                Ok(1)
+            }
+        });
+        assert_eq!(extract_dispatch_body(&out), QUERY_DISPATCH_1);
+    }
+
+    #[test]
+    fn multi_params_dispatch_is_pinned() {
+        let out = generate(quote! {
+            fn my_query(ctx: &WorkflowContext, a: u32, b: u32) -> Result<u32, String> {
+                Ok(1)
+            }
+        });
+        assert_eq!(extract_dispatch_body(&out), QUERY_DISPATCH_N);
     }
 }

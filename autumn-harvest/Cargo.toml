@@ -19,11 +19,13 @@ db = [
     "dep:diesel",
     "dep:diesel-async",
     "dep:diesel_migrations",
+    "dep:percent-encoding",
     "dep:tokio-postgres",
 ]
-# Verified TLS for LISTEN/NOTIFY connections whose DSN sets `sslmode=require`
-# (issue #1717). Uses rustls with the `ring` provider and the platform trust
-# store. Without this feature, such a DSN gets a clear configuration error.
+# TLS for the connections Harvest opens itself (`pg_tls`): LISTEN/NOTIFY,
+# `backup verify` and `dr`. Uses rustls with the `ring` provider and the
+# platform trust store. Without this feature, `prefer` stays plaintext and a
+# verified `sslmode` gets a clear configuration error.
 tls = [
     "db",
     "dep:rustls",
@@ -107,6 +109,8 @@ diesel_migrations = { workspace = true, optional = true }
 # 0.7.18 is the first release with the RUSTSEC advisory fix; pin the floor so a
 # downstream lockfile can't silently resolve back to a vulnerable 0.7.x.
 tokio-postgres = { version = "0.7.18", optional = true }
+# Decodes URL parts of a DSN in `pg_tls`.
+percent-encoding = { version = "2", optional = true }
 # The `tls` feature. These are the versions the CLI already uses for
 # `harvest migrate` (issue #1240), so the lockfile gets no new crate.
 # `default-features = false` keeps `aws-lc-rs` out of the build.
@@ -303,6 +307,17 @@ testcontainers-modules = { workspace = true }
 [target.'cfg(loom)'.dependencies]
 loom = "0.7.2"
 
+# Shuttle is only pulled in under `RUSTFLAGS="--cfg shuttle"` (issue #1800).
+# It is a target dependency for the same reason as loom above: the
+# `crate::shuttle_sync` shim names these crates from the library sources.
+# `shuttle-tokio` and `shuttle-tokio-util` mirror the tokio and tokio-util
+# APIs. Their `shuttle` feature swaps in the Shuttle-scheduled types. See
+# `docs/testing/shuttle.md`.
+[target.'cfg(shuttle)'.dependencies]
+shuttle = "0.9.5"
+shuttle-tokio = { version = "1.0.0", features = ["shuttle", "macros", "rt", "sync", "time"] }
+shuttle-tokio-util = { version = "0.7.0", features = ["shuttle"] }
+
 [[bench]]
 name = "replay_bench"
 required-features = ["testing"]
@@ -350,6 +365,10 @@ harness = false
 # builds are unaffected.
 [[bench]]
 name = "claim_bench"
+required-features = ["db"]
+harness = false
+[[bench]]
+name = "notify_commit_bench"
 required-features = ["db"]
 harness = false
 
