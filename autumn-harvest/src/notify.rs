@@ -551,6 +551,9 @@ struct SinkShared {
     last_ok: Mutex<Option<Instant>>,
     /// Notes the sender task holds. [`NotifySink::flush`] reads it.
     held: AtomicUsize,
+    /// The runtime of the last push. A sender task that stops while notes
+    /// wait starts again there.
+    runtime: Mutex<Option<tokio::runtime::Handle>>,
 }
 
 impl SinkShared {
@@ -582,9 +585,30 @@ impl SinkShared {
         self.alive() && lock(&self.last_ok).is_some_and(|at| at.elapsed() < HEALTHY_WITHIN)
     }
 
+    /// Start a sender task on `runtime` unless one runs or the pool dropped.
+    fn restart(self: &Arc<Self>, runtime: &tokio::runtime::Handle) {
+        let mut task = lock(&self.task);
+        if task
+            .as_ref()
+            .is_none_or(tokio::task::JoinHandle::is_finished)
+            && self.pool.upgrade().is_some()
+        {
+            *task = Some(runtime.spawn(run_sender(Arc::clone(self))));
+        }
+    }
+
     /// Queue `notes` for the sender. `fingerprint` names the database of the
     /// write.
-    fn push(&self, txid: Option<i64>, fingerprint: &Arc<Fingerprint>, notes: Vec<Note>) {
+    ///
+    /// The sender task can stop between the choice of this sender and the
+    /// push. The check after the push then starts it again. A task that
+    /// stops after that check finds the notes in its [`Held`] drop instead.
+    /// The runtime is stored before the push, so that drop finds it.
+    fn push(self: &Arc<Self>, txid: Option<i64>, fingerprint: &Arc<Fingerprint>, notes: Vec<Note>) {
+        let runtime = tokio::runtime::Handle::try_current().ok();
+        if let Some(runtime) = &runtime {
+            *lock(&self.runtime) = Some(runtime.clone());
+        }
         let queued_at = Instant::now();
         let mut pending = lock(&self.pending);
         let room = MAX_PENDING_NOTES.saturating_sub(pending.len());
@@ -598,6 +622,11 @@ impl SinkShared {
         drop(pending);
         self.record(dropped, &"the notify sender queue is full");
         self.wake.notify_one();
+        if let Some(runtime) = runtime
+            && self.deferred()
+        {
+            self.restart(&runtime);
+        }
     }
 }
 
@@ -721,6 +750,7 @@ pub fn register_pool(pool: &crate::worker::DbPool) -> NotifySink {
         failures: AtomicU64::new(0),
         last_ok: Mutex::new(None),
         held: AtomicUsize::new(0),
+        runtime: Mutex::new(None),
     });
     sinks.push(Arc::clone(&shared));
     drop(sinks);
@@ -740,8 +770,7 @@ static ANY_DEFERRED: AtomicBool = AtomicBool::new(false);
 fn start_deferred(runtime: &tokio::runtime::Handle) {
     ANY_DEFERRED.store(false, Ordering::Relaxed);
     for sink in lock(&SINKS).iter().filter(|sink| sink.deferred()) {
-        let task = runtime.spawn(run_sender(Arc::clone(sink)));
-        *lock(&sink.task) = Some(task);
+        sink.restart(runtime);
     }
 }
 
@@ -1026,7 +1055,8 @@ struct GateRow {
 /// The notes a sender task holds.
 ///
 /// A runtime that stops cancels the task. The drop then counts the held
-/// notes as lost. Notes still pending stay for the next sender task.
+/// notes as lost. Notes still pending stay for the next sender task. When
+/// notes wait, the drop starts that task on the runtime of the last push.
 struct Held {
     /// The sender state.
     sink: Arc<SinkShared>,
@@ -1051,6 +1081,14 @@ impl Drop for Held {
         if self.sink.pool.upgrade().is_some() {
             *lock(&self.sink.task) = None;
             ANY_DEFERRED.store(true, Ordering::Relaxed);
+            // A note pushed while this task stopped waits in `pending`. If
+            // the last push came from this stopping runtime, the spawn
+            // cancels at once and the next stage starts the sender instead.
+            let waiting = !lock(&self.sink.pending).is_empty();
+            let runtime = lock(&self.sink.runtime).clone();
+            if waiting && let Some(runtime) = runtime {
+                self.sink.restart(&runtime);
+            }
         }
     }
 }
@@ -2174,8 +2212,61 @@ mod tests {
             failures: AtomicU64::new(0),
             last_ok: Mutex::new(None),
             held: AtomicUsize::new(0),
+            runtime: Mutex::new(None),
         };
         (pool, sink)
+    }
+
+    /// A note for the queue `q`, on a database with no server.
+    fn test_note() -> (Arc<Fingerprint>, Vec<Note>) {
+        let fingerprint = Fingerprint {
+            database: "unused".into(),
+            started_at: DateTime::<Utc>::UNIX_EPOCH,
+        };
+        let note = Note::Task {
+            channel: queue_channel("q"),
+            task_id: Uuid::nil(),
+        };
+        (Arc::new(fingerprint), vec![note])
+    }
+
+    /// True while a sender task runs for `sink`.
+    fn runs(sink: &SinkShared) -> bool {
+        lock(&sink.task)
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
+    }
+
+    #[tokio::test]
+    async fn a_push_to_a_sender_that_just_stopped_starts_it_again() {
+        let (_pool, sink) = lazy_sink();
+        let sink = Arc::new(sink);
+        assert!(sink.deferred(), "no sender task runs yet");
+        let (fingerprint, notes) = test_note();
+        sink.push(None, &fingerprint, notes);
+        assert!(runs(&sink), "the push starts the stopped sender");
+    }
+
+    #[tokio::test]
+    async fn a_sender_that_stops_with_notes_waiting_starts_again() {
+        let (_pool, sink) = lazy_sink();
+        let sink = Arc::new(sink);
+        let (fingerprint, notes) = test_note();
+        lock(&sink.pending).extend(notes.into_iter().map(|note| Staged {
+            txid: None,
+            fingerprint: Arc::clone(&fingerprint),
+            queued_at: Instant::now(),
+            note,
+        }));
+        *lock(&sink.runtime) = Some(tokio::runtime::Handle::current());
+        drop(Held {
+            sink: Arc::clone(&sink),
+            notes: Vec::new(),
+        });
+        assert!(
+            runs(&sink),
+            "the drop starts the sender for the waiting note"
+        );
     }
 
     #[tokio::test]
