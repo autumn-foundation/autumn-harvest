@@ -17,7 +17,10 @@ execution. `Worker::run`, `Worker::run_with_listener`,
 `SchedulerRuntime::spawn_sharded` register their pools.
 A pool registered outside a Tokio runtime starts its sender at the first
 notification a runtime stages. A stopping worker, runner or scheduler
-flushes its senders, so the wakes of its last writes still go out.
+flushes its senders, so the wakes of its last writes still go out. A
+`WorkflowHandleClient` has no stop, so the new
+`WorkflowHandleClient::flush_notifications` does the same. Call it before a
+short-lived runtime stops.
 
 **Routing.** A note goes to a healthy sender whose database fingerprint
 (`current_database()` and `pg_postmaster_start_time()`) matches the write.

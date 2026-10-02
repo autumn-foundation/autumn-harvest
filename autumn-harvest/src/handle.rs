@@ -270,6 +270,23 @@ pub struct WorkflowHandleClient {
 }
 
 impl WorkflowHandleClient {
+    /// Send the wakes of this client's last writes (issue #1796).
+    ///
+    /// A start, signal or cancel returns after its commit. A sender task on
+    /// the current runtime then sends its wake. A runtime that stops first
+    /// loses that wake, and a worker finds the task only at its next poll.
+    /// Call this before a short-lived runtime stops.
+    ///
+    /// Waits up to `timeout` for each shard's sender. Returns `true` when
+    /// every sender holds no notes.
+    pub async fn flush_notifications(&self, timeout: Duration) -> bool {
+        let mut drained = true;
+        for (_, pool) in self.inner.pools.iter_shards() {
+            drained &= crate::notify::register_pool(pool).flush(timeout).await;
+        }
+        drained
+    }
+
     /// Build a single-shard handle client.
     #[must_use]
     pub fn single(pool: DbPool, notification_database_url: impl Into<String>) -> Self {

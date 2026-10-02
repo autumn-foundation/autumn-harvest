@@ -717,6 +717,49 @@ async fn a_handle_client_registers_its_pool() {
 }
 
 #[tokio::test]
+async fn a_handle_client_flushes_its_wakes_before_its_runtime_stops() {
+    let (url, _container) = setup().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let exec_id = insert_execution(&mut conn).await;
+    let mut listener = WorkflowEventListener::connect(&url)
+        .await
+        .expect("listener");
+
+    // The client lives on its own short runtime, as in a CLI that starts
+    // one workflow and exits.
+    let flushed = {
+        let url = url.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            runtime.block_on(async {
+                let pool = build_pool(&url);
+                let client =
+                    autumn_harvest::WorkflowHandleClient::single(pool.clone(), url.clone());
+                assert!(
+                    autumn_harvest::notify::register_pool(&pool)
+                        .wait_ready(READY)
+                        .await,
+                    "the client must have started the sender"
+                );
+                let mut conn = shadowed_conn(&url).await;
+                store::append_events(&mut conn, exec_id, &[started()], 0)
+                    .await
+                    .expect("append");
+                client.flush_notifications(WAIT).await
+            })
+        })
+        .join()
+        .expect("client thread")
+    };
+
+    assert!(flushed, "the flush must drain the sender");
+    wake_of(&mut listener, exec_id).await;
+}
+
+#[tokio::test]
 async fn a_pool_registered_outside_a_runtime_starts_its_sender_later() {
     let (url, _container) = setup().await;
     let pool = build_pool(&url);
