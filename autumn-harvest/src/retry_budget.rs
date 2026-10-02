@@ -247,28 +247,39 @@ impl RetryBudgetRegistry {
 
     /// Give back the wake-up slot of a deferral that was not persisted.
     ///
-    /// A slot is freed when no live deferral reserved a slot after it.
-    /// Cancellations can arrive in any order. A cancelled slot that is not
-    /// yet the tail is freed when every slot after it is cancelled too.
+    /// Cancellations can arrive in any order. See `Bucket::cancel`.
     pub fn cancel_deferral(&self, activity_name: &str, reservation: SlotReservation, now: Instant) {
         self.with_bucket(activity_name, now, |bucket, _| {
-            // A slot that has passed needs no rollback, and an old entry
-            // can never become the tail again. The gate ignores a tail that
-            // has passed, so such a slot is not stored.
-            bucket.cancelled.retain(|r| r.slot > now);
-            if reservation.slot <= now {
-                return;
-            }
-            bucket.cancelled.push(reservation);
-            // Walk back from the tail through every cancelled slot.
-            while let Some(i) = bucket
-                .cancelled
-                .iter()
-                .position(|r| r.slot == bucket.next_slot)
-            {
-                bucket.next_slot = bucket.cancelled.swap_remove(i).previous;
-            }
+            bucket.cancel(reservation, now);
         });
+    }
+
+    /// The delay to write for a deferral that should wake at `wake_at`.
+    ///
+    /// The worker calls this just before the write, so the time spent before
+    /// it is taken off. A slot closer than [`MIN_RETRY_BUDGET_DEFER`] is
+    /// given back, and a new slot is reserved in `reservation`. Late writes
+    /// therefore stay spaced at the refill rate.
+    pub fn wake_delay(
+        &self,
+        activity_name: &str,
+        wake_at: Instant,
+        reservation: &mut Option<SlotReservation>,
+        now: Instant,
+    ) -> Duration {
+        let left = wake_at.saturating_duration_since(now);
+        if left >= MIN_RETRY_BUDGET_DEFER {
+            return left;
+        }
+        self.with_bucket(activity_name, now, |bucket, policy| {
+            if let Some(old) = reservation.take() {
+                bucket.cancel(old, now);
+            }
+            let (delay, fresh) = bucket.reserve_slot(policy, now);
+            *reservation = fresh;
+            delay
+        })
+        .unwrap_or(MIN_RETRY_BUDGET_DEFER)
     }
 
     /// The config this registry enforces.
@@ -300,6 +311,9 @@ impl RetryBudgetRegistry {
         }
         let bucket = buckets.get_mut(activity_name)?;
         bucket.refill(&policy, now);
+        // A cancelled slot that has passed can never become the tail again.
+        // Each access drops such slots, so the list holds only live ones.
+        bucket.cancelled.retain(|r| r.slot > now);
         let out = f(bucket, &policy);
         // Publish under the lock, so the samples follow the mutation order.
         // A sample sent after the unlock could overwrite a newer one.
@@ -410,6 +424,24 @@ impl Bucket {
             .mul_add(policy.min_retries_per_sec, self.tokens)
             .min(policy.max_tokens);
         self.refilled_at = self.refilled_at.max(now);
+    }
+
+    /// Give back a slot that no deferral uses.
+    ///
+    /// A slot is freed when no live deferral reserved a slot after it.
+    /// Cancellations can arrive in any order. A cancelled slot that is not
+    /// yet the tail is freed when every slot after it is cancelled too.
+    fn cancel(&mut self, reservation: SlotReservation, now: Instant) {
+        // A slot that has passed needs no rollback. The gate ignores a tail
+        // that has passed, so such a slot is not stored.
+        if reservation.slot <= now {
+            return;
+        }
+        self.cancelled.push(reservation);
+        // Walk back from the tail through every cancelled slot.
+        while let Some(i) = self.cancelled.iter().position(|r| r.slot == self.next_slot) {
+            self.next_slot = self.cancelled.swap_remove(i).previous;
+        }
     }
 
     /// Give a deferred retry a wake-up slot and return the delay to it.
@@ -769,6 +801,90 @@ mod tests {
             .get(A)
             .map(|bucket| bucket.cancelled.len());
         assert_eq!(stored, Some(0), "a passed slot must not be stored");
+    }
+
+    /// A cancellation stored before its slot passed is pruned on the next
+    /// access of any kind. A later cancel is not needed.
+    #[test]
+    fn expired_cancellations_are_pruned_on_any_access() {
+        let reg = registry(RetryBudgetPolicy::new(0.0, 1.0, 2.0));
+        let now = Instant::now();
+        assert_eq!(drain(&reg, A, now), 1);
+        let Admission::Deferred {
+            reservation: Some(first),
+            ..
+        } = reg.admit(A, true, now)
+        else {
+            panic!("expected a reserved deferral");
+        };
+        let _live_tail = reg.admit(A, true, now);
+        reg.cancel_deferral(A, first, now);
+        let later = now + Duration::from_secs(10);
+        let _ = reg.admit(A, false, later);
+        let stored = reg
+            .buckets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(A)
+            .map(|bucket| bucket.cancelled.len());
+        assert_eq!(stored, Some(0), "a passed cancellation must be pruned");
+    }
+
+    /// The pre-write wait is taken off the delay. The reservation stays.
+    #[test]
+    fn a_write_before_the_slot_waits_only_the_time_left() {
+        let reg = registry(RetryBudgetPolicy::new(0.0, 1.0, 2.0));
+        let now = Instant::now();
+        assert_eq!(drain(&reg, A, now), 1);
+        let Admission::Deferred {
+            reservation: Some(original),
+            ..
+        } = reg.admit(A, true, now)
+        else {
+            panic!("expected a reserved deferral");
+        };
+        let mut reservation = Some(original);
+        let wake_at = now + Duration::from_secs(2);
+        let delay = reg.wake_delay(A, wake_at, &mut reservation, now + Duration::from_secs(1));
+        assert_eq!(delay, Duration::from_secs(1));
+        assert_eq!(reservation, Some(original));
+    }
+
+    /// Writes that arrive after their slots passed get new slots. The new
+    /// slots stay spaced at the refill rate, so the rows do not wake at one
+    /// instant.
+    #[test]
+    fn late_writes_get_new_spaced_slots() {
+        let reg = registry(RetryBudgetPolicy::new(0.0, 1.0, 2.0));
+        let now = Instant::now();
+        assert_eq!(drain(&reg, A, now), 1);
+        let mut pending = Vec::new();
+        for _ in 0..3 {
+            let Admission::Deferred {
+                retry_after,
+                reservation,
+                ..
+            } = reg.admit(A, true, now)
+            else {
+                panic!("expected a deferral");
+            };
+            pending.push((now + retry_after, reservation));
+        }
+        let late = now + Duration::from_secs(10);
+        let delays: Vec<Duration> = pending
+            .iter_mut()
+            .map(|(wake_at, reservation)| reg.wake_delay(A, *wake_at, reservation, late))
+            .collect();
+        assert!(
+            delays.iter().all(|d| *d >= MIN_RETRY_BUDGET_DEFER),
+            "{delays:?}"
+        );
+        for pair in delays.windows(2) {
+            assert!(
+                pair[1] >= pair[0] + Duration::from_millis(450),
+                "late writes must stay spaced: {delays:?}"
+            );
+        }
     }
 
     /// Records every gauge sample, in order.

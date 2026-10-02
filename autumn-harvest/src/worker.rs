@@ -14671,7 +14671,7 @@ fn retry_budget_gates(
 
 #[cfg(test)]
 mod retry_budget_gate_tests {
-    use super::{budget_defer_delay, retry_budget_gates};
+    use super::retry_budget_gates;
     use crate::circuit_breaker::{
         AttemptOutcome, CircuitBreakerRegistry, DispatchDecision, DispatchToken,
     };
@@ -14717,28 +14717,6 @@ mod retry_budget_gate_tests {
         assert!(!retry_budget_gates(Some(probe), true));
         assert!(retry_budget_gates(Some(probe), false));
     }
-
-    /// Time spent before the write is taken off the delay. A retry that
-    /// waits 1 s for a pool connection still wakes at its reserved slot.
-    #[test]
-    fn the_defer_delay_counts_from_the_reserved_wake_up_time() {
-        let admitted = Instant::now();
-        let wake_at = admitted + Duration::from_secs(2);
-        let written = admitted + Duration::from_secs(1);
-        assert_eq!(budget_defer_delay(wake_at, written), Duration::from_secs(1));
-    }
-
-    /// A write after the slot has passed still waits the minimum delay, so
-    /// a late write cannot cause a claim loop.
-    #[test]
-    fn a_late_defer_write_waits_the_minimum_delay() {
-        let wake_at = Instant::now();
-        let written = wake_at + Duration::from_secs(1);
-        assert_eq!(
-            budget_defer_delay(wake_at, written),
-            crate::retry_budget::MIN_RETRY_BUDGET_DEFER
-        );
-    }
 }
 
 /// Consult the retry budget for one claimed attempt.
@@ -14766,17 +14744,6 @@ fn admit_retry_budget(
             ..
         } => RetryBudgetGate::Defer(now + retry_after, reservation),
     }
-}
-
-/// The delay from `now` to the reserved wake-up time `wake_at`.
-///
-/// The worker computes it just before the write. Time spent on a pool
-/// connection or a refund is taken off, so each row wakes at its own slot.
-/// A late write still waits the minimum delay.
-fn budget_defer_delay(wake_at: std::time::Instant, now: std::time::Instant) -> Duration {
-    wake_at
-        .saturating_duration_since(now)
-        .max(crate::retry_budget::MIN_RETRY_BUDGET_DEFER)
 }
 
 /// Settles a retry budget ticket for one attempt.
@@ -14839,12 +14806,19 @@ impl Drop for BudgetReleaseGuard<'_> {
 /// breaker. The retry does not run, so the token goes back. The function logs
 /// a refund failure and does not return it, like a capability-miss refund.
 ///
+/// The delay is computed just before the write, so time spent on the pool
+/// connection or the refund is taken off. A slot that has passed by then is
+/// replaced by a new one in `reservation`.
+///
 /// Returns `false` when the lease was lost, so the write changed nothing.
 async fn defer_retry_for_budget(
     conn: &mut AsyncPgConnection,
+    budgets: &crate::retry_budget::RetryBudgetRegistry,
+    activity_name: &str,
     task: &TaskQueueItem,
     activity: &ActivityInfo,
     wake_at: std::time::Instant,
+    reservation: &mut Option<crate::retry_budget::SlotReservation>,
 ) -> HarvestResult<bool> {
     if activity.circuit_breaker.is_none()
         && let Some(key) = task.rate_limit_key.as_deref()
@@ -14858,7 +14832,12 @@ async fn defer_retry_for_budget(
         );
     }
     // The delay runs on the database clock. See `defer_claimed_retry_for_budget`.
-    let delay = budget_defer_delay(wake_at, std::time::Instant::now());
+    let delay = budgets.wake_delay(
+        activity_name,
+        wake_at,
+        reservation,
+        std::time::Instant::now(),
+    );
     let delay = chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::seconds(1));
     let write = queue::defer_claimed_retry_for_budget(conn, &claim_of_task(task)?, delay).await?;
     if write == queue::ClaimWrite::LeaseLost {
@@ -15318,13 +15297,22 @@ async fn process_activity_task(
     if retry_budget_gates(circuit_token, task_attempt(task) > 1) {
         match admit_retry_budget(registry, activity_name, task) {
             RetryBudgetGate::Run(ticket) => budget_guard.hold(ticket),
-            RetryBudgetGate::Defer(wake_at, reservation) => {
+            RetryBudgetGate::Defer(wake_at, mut reservation) => {
                 if let Some(token) = circuit_token {
                     circuit_breakers.on_cancelled(activity_name, token, std::time::Instant::now());
                 }
                 let deferred = match pool.get().await {
                     Ok(mut conn) => {
-                        defer_retry_for_budget(&mut conn, task, activity, wake_at).await
+                        defer_retry_for_budget(
+                            &mut conn,
+                            &registry.retry_budgets(),
+                            activity_name,
+                            task,
+                            activity,
+                            wake_at,
+                            &mut reservation,
+                        )
+                        .await
                     }
                     Err(error) => Err(crate::error::database_error(error)),
                 };
