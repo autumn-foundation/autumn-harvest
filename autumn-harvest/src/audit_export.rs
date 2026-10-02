@@ -1363,8 +1363,8 @@ const INDEX_BUILD_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::fr
 #[cfg(feature = "db")]
 const INDEX_NOTICE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
 
-/// A shard in one database. The database identity separates databases that
-/// share a shard number inside one process.
+/// A shard of one audit table in one database. The identity names the database
+/// and the schema, so neither merges with another that shares a shard number.
 #[cfg(feature = "db")]
 type NoticeKey = (i32, String);
 
@@ -1426,8 +1426,17 @@ async fn index_notice_wanted(conn: &mut diesel_async::AsyncPgConnection, shard_i
     if matches!(unexported_index_valid(conn).await, Ok(Some(true))) {
         return false;
     }
-    let key = (shard_id, database_identity(conn).await);
+    // Tenant schemas in one database share its identity and may share a shard
+    // number, so the resolved schema is part of the key.
+    let schema = audit_table_schema(conn).await.unwrap_or_default();
+    let key = notice_key(shard_id, &database_identity(conn).await, &schema);
     index_notice_due(&key)
+}
+
+/// The throttle key for one shard of one audit table in one database.
+#[cfg(feature = "db")]
+fn notice_key(shard_id: i32, database: &str, schema: &str) -> NoticeKey {
+    (shard_id, format!("{database}/{schema}"))
 }
 
 /// Wait after a failed or skipped background build before the next attempt.
@@ -4946,6 +4955,17 @@ mod tests {
             cleanup.contains("tenant.harvest_audit_log_unexported_idx"),
             "{cleanup}"
         );
+    }
+
+    /// Issue #1667: two tenant schemas in one database share a shard number
+    /// and a database identity. The schema must tell their notices apart.
+    #[cfg(feature = "db")]
+    #[test]
+    fn the_notice_key_names_the_schema() {
+        let first = notice_key(0, "db@host:5432", "tenant_a");
+        let second = notice_key(0, "db@host:5432", "tenant_b");
+        assert_ne!(first, second);
+        assert_eq!(first, notice_key(0, "db@host:5432", "tenant_a"));
     }
 
     /// Issue #1667: a privilege failure is the one error a retry cannot fix.
