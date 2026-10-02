@@ -1512,9 +1512,10 @@ mod tests {
     #[cfg(feature = "db")]
     #[test]
     fn decode_deferred_admission_fields_unparseable_reuse_policy_falls_back() {
-        // An unrecognised persisted string (e.g. written by a future version
-        // this build does not know) must fall back to AllowDuplicate rather
-        // than error -- mirrors every inline call site's prior behavior.
+        // An unrecognised persisted string must fall back to AllowDuplicate,
+        // not error. A future build version may write a string this build
+        // does not know. This mirrors every inline call site's prior
+        // behavior.
         let opts = DebounceStartOptions {
             reuse_policy: Some("some_future_policy".to_string()),
             ..DebounceStartOptions::default()
