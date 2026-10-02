@@ -377,6 +377,8 @@ pub mod queue_pause;
 /// `db` feature; [`quota::load_quota_usage`]/[`quota::list_quota_usage`] are
 /// DB-gated.
 pub mod quota;
+#[cfg(feature = "db")]
+mod quota_lock_order;
 /// Registry-aware `quota_key` backfill for pre-upgrade executions (issue #1226).
 ///
 /// Pure logic ([`quota_reconcile::resolve_backfill`],
@@ -633,8 +635,8 @@ pub use payload_store::{
 };
 pub use policy::validate_schedule;
 pub use policy::{
-    CatchupPolicy, MapFailurePolicy, OverlapPolicy, RetryBudgetPolicy, RetryPolicy, Schedule,
-    SkipPolicy, TaskStatus, TriggerRule, WorkflowSchedule,
+    CatchupPolicy, JitterPolicy, MapFailurePolicy, OverlapPolicy, RetryBudgetPolicy, RetryPolicy,
+    Schedule, SkipPolicy, TaskStatus, TriggerRule, WorkflowSchedule,
 };
 pub use pool::{HarvestPoolConfig, compute_pool_sizes};
 pub use query::QueryRegistry;
