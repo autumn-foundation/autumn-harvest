@@ -1004,9 +1004,9 @@ pub const fn resumed_queue_notify_task_query() -> &'static str {
 ///
 /// Must be called **inside** the resume transaction. The call stages the wake
 /// with the transaction id, and the sender sends it only after `COMMIT`
-/// (issue #1796). Listeners therefore wake exactly when the hold lifts —
-/// never earlier (an early wake would still see the uncommitted pause row and
-/// skip the queue) and never at all if the resume rolls back.
+/// (issue #1796). Listeners therefore wake exactly when the hold lifts. An
+/// earlier wake would still see the uncommitted pause row and skip the queue.
+/// A resume that rolls back sends no wake.
 ///
 /// Reuses [`crate::notify::notify_task_enqueued`] rather than introducing a
 /// second channel or payload shape, because [`crate::notify::QueueListener`]
@@ -1512,11 +1512,10 @@ pub async fn resume_queue(
         // place, so the deployments most likely to be tuned this way are
         // the ones that would sit idle longest.
         //
-        // Staged INSIDE this transaction on purpose: the sender sends the
-        // wake only after COMMIT (issue #1796), so listeners are woken
-        // exactly when the hold actually lifts — never before (a worker
-        // woken early would still see the uncommitted pause row and skip
-        // the queue) and never for a rollback.
+        // Staged INSIDE this transaction on purpose. The sender sends the
+        // wake only after COMMIT (issue #1796), so listeners wake exactly
+        // when the hold lifts. A worker woken earlier would still see the
+        // uncommitted pause row and skip the queue. A rollback sends no wake.
         //
         // Skipped when nothing was released: there is no held backlog to
         // wake for, and a spurious wake would just burn a poll cycle.
