@@ -273,8 +273,75 @@ after a hung checkout. When checkout fails, the report step opens the
 issue without the script, or comments on the open one. A concurrency group runs
 one watchdog job at a time, so two runs cannot both open an issue.
 
+## Infrastructure faults (issue #1801)
+
+A chaos KILL is a panic in one tokio task. The tests in
+`chaos_tests::infra_faults` inject faults below the engine instead. They are a
+submodule of `chaos_tests`, so the nightly `chaos_tests::` step runs them, and
+the watchdog alerts on a failure.
+
+Each test starts its own Postgres 16 container and a toxiproxy container on a
+private docker network. Workers connect through the `worker` proxy. The test
+reads state through the `admin` proxy, which never gets a toxic. A Postgres
+restart therefore does not change any URL. These tests ignore
+`HARVEST_TEST_DATABASE_URL`, because a restart or a pause cannot target a
+shared database.
+
+Workers use a 500 ms heartbeat, so the lease TTL (the stale threshold) is 1 s.
+
+| Scenario | Test | Fault | Proof the fault landed |
+|---|---|---|---|
+| Kill mid-commit | `terminate_backend_mid_commit_append` | `pg_terminate_backend` during the COMMIT of an `ActivityCompleted` insert | the blocked backend exits |
+| | `terminate_backend_mid_commit_complete` | the same, for a `WorkflowCompleted` insert | the blocked backend exits |
+| | `terminate_backend_mid_commit_claim` | the same, for a `PENDING` to `RUNNING` claim | the blocked backend exits |
+| Restart | `postgres_crash_restart_mid_workload` | stop Postgres with no grace period, then start it | an activity runs at the crash |
+| Pause | `postgres_pause_longer_than_lease_ttl` | `docker pause` for 4 s, two workers | activities run at the pause |
+| Latency | `toxiproxy_latency_between_worker_and_db` | 100 ms ± 50 ms in each direction | a probe round trip is slow |
+| Partition | `toxiproxy_partition_longer_than_lease_ttl` | blackhole worker A for 4 s, worker B on a clean path | B reclaims a task of A |
+| SIGKILL | `sigkill_child_worker_mid_activity` | SIGKILL of a worker that runs as a child process | the child dies by signal 9; its task is reclaimed |
+
+**The COMMIT rendezvous.** A test-only `DEFERRABLE INITIALLY DEFERRED`
+constraint trigger runs inside COMMIT. It waits on a shared advisory lock that
+the test holds. The test finds the waiting backend in `pg_locks`, terminates it
+with a wait for exit, and then releases the lock. The kill therefore lands
+after COMMIT is sent and before it is acknowledged. No production code changes.
+
+**The oracle.** Every test checks `assert_converged`, the oracle of the
+convergence sweep. It requires every workflow `COMPLETED`, exactly one terminal
+event per execution, no stranded `RUNNING` task, and no dangling
+`ExternalSignalRequested`. The table key does not stop a second terminal event
+at a new event id, so the oracle counts terminal events itself.
+`oracle_flags_a_duplicate_terminal_event` forges a duplicate to prove the
+check. Each activity workflow must also record exactly one `ActivityCompleted`.
+
+**Known bugs.** The tests found three bugs:
+
+- #1871: a DB error on the activity result write is not retried. The result is
+  lost, and only `start_to_close` recovers the task.
+- #1870: a `StartToClose` timeout ignores the retry policy and fails the
+  workflow.
+
+- #1876: Postgres keeps the open transaction of a partitioned worker, and
+  its row locks, until TCP keepalive ends the session. Orphan reclaim blocks
+  on such a lock, so no orphan is reclaimed. The partition test sets
+  `idle_in_transaction_session_timeout = 5s` on the server to end the session.
+
+The first two bugs together turn a killed or crashed result write into
+`FAILED`. The append
+and the restart tests accept that outcome, and only with its exact history:
+one `StartToClose` timeout, no activity result, and one `WorkflowFailed` for
+the timeout. All other tests require `COMPLETED`. Remove each workaround when
+its bug is fixed.
+
+**Replay.** Run one test locally with Docker:
+
+```bash
+cargo test -p autumn-harvest --features chaos --test integration \
+  chaos_tests::infra_faults::toxiproxy_partition_longer_than_lease_ttl -- --nocapture
+```
+
 ## Out of scope
 
-Production/runtime chaos (#796), network-partition / Jepsen / Antithesis-style
-testing, DAG what-if simulation, and *fixing* any new bug the harness surfaces —
-new bugs are filed and fixed separately.
+Production/runtime chaos (#796), Jepsen / Antithesis-style model checking, DAG
+what-if simulation, and *fixing* any new bug the harness surfaces — new bugs
+are filed and fixed separately.
