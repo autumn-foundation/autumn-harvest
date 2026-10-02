@@ -235,6 +235,9 @@ pub struct HarvestPlugin {
     /// [`Self::enable_api_tokens`]; installs the token verification + scope
     /// layer. Default off — the router is byte-for-byte unchanged (AC7).
     api_tokens_enabled: bool,
+    /// Opt-out that opens mutating routes with no auth (issue #1802). Set
+    /// true by [`Self::allow_unauthenticated_mutations`]. Default off.
+    allow_unauthenticated_mutations: bool,
     /// Thresholds for the rolled-up `GET /admin/status` verdict (issue #679).
     /// Set via [`Self::with_status_thresholds`]; starter defaults otherwise.
     status_thresholds: crate::status_summary::StatusThresholds,
@@ -333,6 +336,7 @@ impl HarvestPlugin {
             decode_payloads_on_read: false,
             role_auth_enabled: false,
             api_tokens_enabled: false,
+            allow_unauthenticated_mutations: false,
             status_thresholds: crate::status_summary::StatusThresholds::default(),
             canary_config: None,
             #[cfg(feature = "webhooks")]
@@ -579,6 +583,26 @@ impl HarvestPlugin {
     #[must_use]
     pub const fn enable_api_tokens(mut self) -> Self {
         self.api_tokens_enabled = true;
+        self
+    }
+
+    /// Open the mutating routes to a caller with no credential (issue #1802).
+    ///
+    /// Outside the `dev` profile, a mount with no [`Self::api_with_auth`]
+    /// refuses every mutating route with 401. This opt-out restores the
+    /// pre-#1802 posture for routes with no admin gate. Those are workflow
+    /// start, signal and update (with the with-start variants), reset, DAG
+    /// trigger, patch and retry, schedule changes, external-activity
+    /// callbacks and worker drain. The opt-out also opens the Vantage form
+    /// posts and the mutating MCP tool routes that have no admin gate.
+    /// Admin-gated routes keep their gate.
+    ///
+    /// Outside `dev`, startup logs a warning while the opt-out is set. Prefer
+    /// [`Self::api_with_auth`] or [`Self::enable_api_tokens`]. Tokens do not
+    /// cover the MCP tool routes.
+    #[must_use]
+    pub const fn allow_unauthenticated_mutations(mut self) -> Self {
+        self.allow_unauthenticated_mutations = true;
         self
     }
 
@@ -1091,6 +1115,7 @@ impl Plugin for HarvestPlugin {
             decode_payloads_on_read,
             role_auth_enabled,
             api_tokens_enabled,
+            allow_unauthenticated_mutations,
             status_thresholds,
             canary_config,
             #[cfg(feature = "webhooks")]
@@ -1109,6 +1134,7 @@ impl Plugin for HarvestPlugin {
         let app = register_plugin_migrations(app, require_embedded_harvest_mode);
 
         let api_state = HarvestApiState::new();
+        api_state.set_allow_unauthenticated_mutations(allow_unauthenticated_mutations);
         // Issue #1291: mirror onto `api_state` so `start_harvest_runtime` --
         // which only receives `api_state`, not this consumed `HarvestPlugin`
         // -- can also refuse a non-embedded ambient mode.
@@ -1363,12 +1389,12 @@ impl Plugin for HarvestPlugin {
             if mcp_tools_unprotected(mcp_tools_enabled, mcp_tool_middleware.is_some()) {
                 tracing::warn!(
                     "HarvestPlugin::mcp_tools() is enabled with no HarvestPlugin::api_with_auth(..) \
-                     configured -- the generated start_/signal_/update_ tool routes are reachable \
-                     UNAUTHENTICATED at their own HTTP path, even if the app also configures \
-                     autumn-web's secure_mcp(...) (which only gates the /mcp JSON-RPC envelope, not \
-                     these routes' direct paths). Configure HarvestPlugin::api_with_auth(path, mw) \
-                     to protect the generated tool routes, or disregard this warning if \
-                     unauthenticated access is intentional (e.g. local development)."
+                     configured. autumn-web's secure_mcp(...) gates only the /mcp JSON-RPC \
+                     envelope, not the direct HTTP paths of the generated tool routes. Outside the \
+                     dev profile, the start_/signal_/update_ tool routes answer 401 to a caller \
+                     with no admin session (issue #1802). In the dev profile, or with \
+                     allow_unauthenticated_mutations(), they are reachable UNAUTHENTICATED. \
+                     Configure HarvestPlugin::api_with_auth(path, mw) to protect them."
                 );
             }
             let prefix =
@@ -1568,12 +1594,13 @@ fn warn_if_dev_admin_api_is_open(profile: &str, auth_boundary_present: bool) {
     if dev_admin_api_is_open(profile, auth_boundary_present) {
         tracing::warn!(
             "AUTUMN_PROFILE=dev with no HarvestPlugin::api_with_auth(..) boundary: the Harvest \
-             management API (including every /admin route and the Vantage dashboard) is reachable \
-             UNAUTHENTICATED by any caller that can open a socket to this process. This is the \
-             documented dev-profile posture and is what lets `harvest preflight` run against a \
-             local quickstart app. Do not expose this process beyond localhost. To close it, \
-             configure HarvestPlugin::api_with_auth(path, middleware), or run a non-dev \
-             AUTUMN_PROFILE (where the API is fail-closed regardless)."
+             management API (including every /admin route, every mutating route and the Vantage \
+             dashboard) is reachable UNAUTHENTICATED by any caller that can open a socket to this \
+             process. This is the documented dev-profile posture and is what lets `harvest \
+             preflight` run against a local quickstart app. Do not expose this process beyond \
+             localhost. To close it, configure HarvestPlugin::api_with_auth(path, middleware), or \
+             run a non-dev AUTUMN_PROFILE (where the API fails closed unless \
+             allow_unauthenticated_mutations() is set)."
         );
     }
 }
@@ -1587,6 +1614,11 @@ async fn start_harvest_runtime(
     api_state.set_deployment_profile(state.profile().to_string());
     api_state.set_admin_auth_session_key(state.auth_session_key());
     warn_if_dev_admin_api_is_open(state.profile(), api_state.admin_auth_boundary());
+    crate::boot::warn_if_mutation_opt_out_is_open(
+        state.profile(),
+        api_state.admin_auth_boundary(),
+        api_state.allow_unauthenticated_mutations(),
+    );
     let app_config = resolve_app_config(state);
     let harvest_config = HarvestRuntimeConfig::load()
         .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
@@ -2552,6 +2584,75 @@ mod tests {
                 "profile {profile:?} is not `dev` and stays fail-closed"
             );
             assert!(!dev_admin_api_is_open(profile, true));
+        }
+    }
+
+    /// Issue #1802: the predicate is true exactly when a caller with no
+    /// credential reaches a mutating route. A declared boundary makes it false.
+    #[test]
+    fn unauthenticated_mutations_are_open_only_for_dev_or_the_opt_out() {
+        use crate::boot::unauthenticated_mutations_open;
+        assert!(unauthenticated_mutations_open("dev", false, false));
+        assert!(unauthenticated_mutations_open("prod", false, true));
+        assert!(unauthenticated_mutations_open("unknown", false, true));
+        assert!(!unauthenticated_mutations_open("dev", true, false));
+        assert!(!unauthenticated_mutations_open("prod", true, true));
+        for profile in ["prod", "staging", "unknown", "", "DEV", "development"] {
+            assert!(
+                !unauthenticated_mutations_open(profile, false, false),
+                "profile {profile:?} fails closed with no opt-out"
+            );
+        }
+    }
+
+    /// Issue #1802: the opt-out warning fires only when the opt-out, and not
+    /// the `dev` profile, opens the mutating routes.
+    #[test]
+    fn mutation_opt_out_warning_fires_only_when_the_opt_out_opens_the_routes() {
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self {
+                self.clone()
+            }
+        }
+        let capture = |profile: &str, boundary: bool, opt_out: bool| {
+            let buf = Buf::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(buf.clone())
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                crate::boot::warn_if_mutation_opt_out_is_open(profile, boundary, opt_out);
+            });
+            let bytes = buf.0.lock().unwrap().clone();
+            String::from_utf8_lossy(&bytes).into_owned()
+        };
+        let marker = "allow_unauthenticated_mutations is set";
+        for profile in ["prod", "unknown", "staging"] {
+            assert!(capture(profile, false, true).contains(marker), "{profile}");
+        }
+        for (profile, boundary, opt_out) in [
+            ("prod", true, true),
+            ("prod", false, false),
+            ("dev", false, true),
+            ("dev", false, false),
+        ] {
+            assert!(
+                !capture(profile, boundary, opt_out).contains(marker),
+                "{profile} boundary={boundary} opt_out={opt_out}"
+            );
         }
     }
 
