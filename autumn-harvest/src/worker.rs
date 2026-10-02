@@ -6260,6 +6260,132 @@ async fn acquire_shard_conn(
     crate::pool::acquire(pool, bound).await
 }
 
+/// Register the static rate-limit buckets of `registry`'s activities.
+///
+/// See `Worker::register_rate_limit_buckets`, which this backs.
+async fn register_static_rate_limit_buckets(
+    pool: &DbPool,
+    acquire_bound: Option<Duration>,
+    registry: &HandlerRegistry,
+    worker_id: &str,
+) -> bool {
+    match acquire_shard_conn(pool, acquire_bound).await {
+        Ok(mut conn) => {
+            let mut complete = true;
+            for activity in registry.activities.values() {
+                // A dynamic rate_limit(key = ...) with no rps is an invalid
+                // declaration that `HarvestBuilder::try_build` rejects. A
+                // worker built via a direct `HandlerRegistry` bypasses that
+                // validation; surface it loudly at startup (the enqueue path
+                // also fails the schedule transaction -- see
+                // `persist_scheduled_activities`) rather than silently running
+                // the activity unrated (issue #699 review, Codex P2).
+                if activity.rate_limit_key_expr.is_some() && activity.rate_limit_rps.is_none() {
+                    tracing::error!(
+                        worker_id = %worker_id,
+                        activity = %activity.name,
+                        "activity declares a dynamic rate_limit(key = ...) without \
+                         rate_limit_rps; it will fail at schedule time -- add an rps \
+                         or remove the key"
+                    );
+                    continue;
+                }
+                let Some(refill_rate) = activity.rate_limit_rps else {
+                    continue;
+                };
+                // Dynamic per-key limits (issue #699) register their buckets
+                // lazily at enqueue time (one per resolved tenant key), so
+                // there is no single static bucket to pre-register here.
+                if activity.rate_limit_key_expr.is_some() {
+                    continue;
+                }
+                // A static `rate_limit_key` beginning with a reserved
+                // caller-keyed prefix (`dyn-rate:`, #699; `start-throttle:`,
+                // #607) reaching a worker via a direct `HandlerRegistry`
+                // (bypassing the macro reject and
+                // `HarvestBuilder::try_build`) would collide with the
+                // generated buckets; since both this registration and the
+                // lazy enqueue registration use `ON CONFLICT DO NOTHING`,
+                // the bucket's rate/burst would become insertion-order
+                // dependent. Worse since issue #1127: the idle-bucket GC
+                // collects those namespaces on the guarantee that everything
+                // in them re-registers with the work that needs it, which a
+                // static key does not. Skip it loudly here, mirroring the
+                // dynamic-no-rps guard above (issue #699 review, Codex P2).
+                // The enqueue path also fails the schedule transaction (see
+                // `persist_scheduled_activities`).
+                // The EFFECTIVE key, since `rate_limit_key` falls back to
+                // the activity name below and that is what gets registered
+                // (issue #1127, Codex review round 1 P2).
+                let static_key = activity.rate_limit_key.unwrap_or(activity.name);
+                if let Some(prefix) = crate::builder::RESERVED_RATE_LIMIT_KEY_PREFIXES
+                    .into_iter()
+                    .find(|prefix| static_key.starts_with(prefix))
+                {
+                    tracing::error!(
+                        worker_id = %worker_id,
+                        activity = %activity.name,
+                        key = %static_key,
+                        prefix = %prefix,
+                        "activity resolves to a static rate-limit bucket key beginning with \
+                         a reserved caller-keyed prefix; not registering this colliding \
+                         bucket -- rename the activity or its key, or use \
+                         rate_limit(key = ...) for dynamic per-key buckets"
+                    );
+                    continue;
+                }
+                let burst = activity.rate_limit_burst.unwrap_or(refill_rate);
+                let key = activity.rate_limit_key.unwrap_or(activity.name);
+
+                // Insert rate limit bucket if it doesn't already exist.
+                // This preserves operator overrides.
+                if let Err(error) =
+                    queue::ensure_rate_limit_bucket(&mut conn, key, refill_rate, burst).await
+                {
+                    tracing::warn!(
+                        worker_id = %worker_id,
+                        key = %key,
+                        error = %error,
+                        "failed to auto-register rate limit bucket; continuing, and \
+                         the registration will run again"
+                    );
+                    complete = false;
+                }
+            }
+            complete
+        }
+        Err(error) => {
+            tracing::warn!(
+                worker_id = %worker_id,
+                error = %error,
+                "failed to acquire connection for rate limit bucket registration; \
+                 the registration will run again"
+            );
+            false
+        }
+    }
+}
+
+/// Run `attempt` every `interval` until it returns `true` or `cancel` fires.
+///
+/// The first run comes one `interval` after the call.
+async fn retry_until_done<F, Fut>(interval: Duration, cancel: CancellationToken, mut attempt: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    loop {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            () = tokio::time::sleep(interval) => {}
+        }
+        if attempt().await {
+            return;
+        }
+    }
+}
+
 /// Tries for an executed activity's result write: pool acquires, and repeats
 /// after a session timeout.
 ///
@@ -28701,16 +28827,9 @@ impl Worker {
             return;
         }
 
-        let startup_bound = shard_acquire_bound(true, self.config.poll_interval);
-        let mut registration_pending_per_shard: Vec<Arc<AtomicBool>> =
-            Vec::with_capacity(shard_targets.len());
-        for (_, shard_pool) in &shard_targets {
-            registration_pending_per_shard.push(Arc::new(AtomicBool::new(
-                self.register_in_fleet(shard_pool, startup_bound).await,
-            )));
-            self.register_rate_limit_buckets(shard_pool, startup_bound)
-                .await;
-        }
+        // The retry guards live as long as this run (issue #1788).
+        let (registration_pending_per_shard, _bucket_retries) =
+            self.register_shards(&shard_targets).await;
 
         // Monitoring tasks use the default pool for non-shard-specific monitors;
         // the stranded-work sampler (added in spawn_monitoring_tasks) uses the
@@ -29160,7 +29279,9 @@ impl Worker {
             Arc::new(AtomicBool::new(self.register_in_fleet(pool, None).await));
 
         // Auto-register rate limit buckets for the activities configured on this worker.
-        self.register_rate_limit_buckets(pool, None).await;
+        // A registration that does not complete runs again in the background.
+        let _bucket_retry = (!self.register_rate_limit_buckets(pool, None).await)
+            .then(|| self.spawn_rate_limit_bucket_retry(pool, None));
 
         let monitors = self.spawn_monitoring_tasks(pool, std::slice::from_ref(pool));
         let heartbeat_cancel = CancellationToken::new();
@@ -31195,97 +31316,93 @@ impl Worker {
         }
     }
 
-    /// Auto-upsert rate-limiting buckets for activities registered on this worker.
-    async fn register_rate_limit_buckets(&self, pool: &DbPool, acquire_bound: Option<Duration>) {
-        match acquire_shard_conn(pool, acquire_bound).await {
-            Ok(mut conn) => {
-                for activity in self.registry.activities.values() {
-                    // A dynamic rate_limit(key = ...) with no rps is an invalid
-                    // declaration that `HarvestBuilder::try_build` rejects. A
-                    // worker built via a direct `HandlerRegistry` bypasses that
-                    // validation; surface it loudly at startup (the enqueue path
-                    // also fails the schedule transaction -- see
-                    // `persist_scheduled_activities`) rather than silently running
-                    // the activity unrated (issue #699 review, Codex P2).
-                    if activity.rate_limit_key_expr.is_some() && activity.rate_limit_rps.is_none() {
-                        tracing::error!(
-                            worker_id = %self.config.worker_id,
-                            activity = %activity.name,
-                            "activity declares a dynamic rate_limit(key = ...) without \
-                             rate_limit_rps; it will fail at schedule time -- add an rps \
-                             or remove the key"
-                        );
-                        continue;
-                    }
-                    let Some(refill_rate) = activity.rate_limit_rps else {
-                        continue;
-                    };
-                    // Dynamic per-key limits (issue #699) register their buckets
-                    // lazily at enqueue time (one per resolved tenant key), so
-                    // there is no single static bucket to pre-register here.
-                    if activity.rate_limit_key_expr.is_some() {
-                        continue;
-                    }
-                    // A static `rate_limit_key` beginning with a reserved
-                    // caller-keyed prefix (`dyn-rate:`, #699; `start-throttle:`,
-                    // #607) reaching a worker via a direct `HandlerRegistry`
-                    // (bypassing the macro reject and
-                    // `HarvestBuilder::try_build`) would collide with the
-                    // generated buckets; since both this registration and the
-                    // lazy enqueue registration use `ON CONFLICT DO NOTHING`,
-                    // the bucket's rate/burst would become insertion-order
-                    // dependent. Worse since issue #1127: the idle-bucket GC
-                    // collects those namespaces on the guarantee that everything
-                    // in them re-registers with the work that needs it, which a
-                    // static key does not. Skip it loudly here, mirroring the
-                    // dynamic-no-rps guard above (issue #699 review, Codex P2).
-                    // The enqueue path also fails the schedule transaction (see
-                    // `persist_scheduled_activities`).
-                    // The EFFECTIVE key, since `rate_limit_key` falls back to
-                    // the activity name below and that is what gets registered
-                    // (issue #1127, Codex review round 1 P2).
-                    let static_key = activity.rate_limit_key.unwrap_or(activity.name);
-                    if let Some(prefix) = crate::builder::RESERVED_RATE_LIMIT_KEY_PREFIXES
-                        .into_iter()
-                        .find(|prefix| static_key.starts_with(prefix))
-                    {
-                        tracing::error!(
-                            worker_id = %self.config.worker_id,
-                            activity = %activity.name,
-                            key = %static_key,
-                            prefix = %prefix,
-                            "activity resolves to a static rate-limit bucket key beginning with \
-                             a reserved caller-keyed prefix; not registering this colliding \
-                             bucket -- rename the activity or its key, or use \
-                             rate_limit(key = ...) for dynamic per-key buckets"
-                        );
-                        continue;
-                    }
-                    let burst = activity.rate_limit_burst.unwrap_or(refill_rate);
-                    let key = activity.rate_limit_key.unwrap_or(activity.name);
-
-                    // Insert rate limit bucket if it doesn't already exist.
-                    // This preserves operator overrides.
-                    if let Err(error) =
-                        queue::ensure_rate_limit_bucket(&mut conn, key, refill_rate, burst).await
-                    {
-                        tracing::warn!(
-                            worker_id = %self.config.worker_id,
-                            key = %key,
-                            error = %error,
-                            "failed to auto-register rate limit bucket; continuing"
-                        );
-                    }
-                }
-            }
-            Err(error) => {
-                tracing::warn!(
-                    worker_id = %self.config.worker_id,
-                    error = %error,
-                    "failed to acquire connection for rate limit bucket registration"
-                );
+    /// Register this worker and its rate-limit buckets on each shard in turn.
+    ///
+    /// Each acquire uses the multi-shard startup bound, so a stuck shard does
+    /// not block its peers. Returns each shard's fleet-registration pending
+    /// flag, and a retry guard for each shard whose bucket registration did
+    /// not complete (issue #1788). A dropped guard stops its retry.
+    async fn register_shards(
+        &self,
+        shard_targets: &[(crate::types::ShardId, DbPool)],
+    ) -> (Vec<Arc<AtomicBool>>, Vec<AbortOnDrop>) {
+        let startup_bound = shard_acquire_bound(true, self.config.poll_interval);
+        let mut registration_pending_per_shard = Vec::with_capacity(shard_targets.len());
+        let mut bucket_retries = Vec::new();
+        for (_, shard_pool) in shard_targets {
+            registration_pending_per_shard.push(Arc::new(AtomicBool::new(
+                self.register_in_fleet(shard_pool, startup_bound).await,
+            )));
+            if !self
+                .register_rate_limit_buckets(shard_pool, startup_bound)
+                .await
+            {
+                bucket_retries.push(self.spawn_rate_limit_bucket_retry(shard_pool, startup_bound));
             }
         }
+        (registration_pending_per_shard, bucket_retries)
+    }
+
+    /// Auto-upsert rate-limiting buckets for activities registered on this worker.
+    ///
+    /// Returns `false` when a bucket may be missing: the acquire failed, or a
+    /// bucket write failed. The claim gate fails closed on a missing bucket,
+    /// so the caller retries (issue #1788). An invalid declaration counts as
+    /// done, because a retry cannot fix it.
+    async fn register_rate_limit_buckets(
+        &self,
+        pool: &DbPool,
+        acquire_bound: Option<Duration>,
+    ) -> bool {
+        register_static_rate_limit_buckets(
+            pool,
+            acquire_bound,
+            &self.registry,
+            &self.config.worker_id,
+        )
+        .await
+    }
+
+    /// Retry [`Self::register_rate_limit_buckets`] in the background until it
+    /// completes (issue #1788).
+    ///
+    /// The retry runs every `worker_heartbeat_interval` and stops at shutdown.
+    /// Without it, a pool outage at startup leaves a static bucket missing, and
+    /// its activity never runs until the worker restarts.
+    fn spawn_rate_limit_bucket_retry(
+        &self,
+        pool: &DbPool,
+        acquire_bound: Option<Duration>,
+    ) -> AbortOnDrop {
+        let pool = pool.clone();
+        let registry = Arc::clone(&self.registry);
+        let worker_id = self.config.worker_id.clone();
+        let interval = self.config.worker_heartbeat_interval;
+        let cancel = self.shutdown.clone();
+        AbortOnDrop::new(tokio::spawn(async move {
+            retry_until_done(interval, cancel, || {
+                let pool = pool.clone();
+                let registry = Arc::clone(&registry);
+                let worker_id = worker_id.clone();
+                async move {
+                    let done = register_static_rate_limit_buckets(
+                        &pool,
+                        acquire_bound,
+                        &registry,
+                        &worker_id,
+                    )
+                    .await;
+                    if done {
+                        tracing::info!(
+                            worker_id = %worker_id,
+                            "registered the rate limit buckets on a retry"
+                        );
+                    }
+                    done
+                }
+            })
+            .await;
+        }))
     }
 
     /// Transition this worker's status in the fleet table.
@@ -35921,6 +36038,36 @@ mod tests {
         record_activity_panic_once(&sink, "act", "default", &Err("plain error".to_owned()));
         record_activity_panic_once(&sink, "act", "default", &Ok(serde_json::json!({})));
         assert_eq!(*sink.0.lock().expect("lock"), 1);
+    }
+
+    /// A retry runs again after each failure and stops after a success.
+    #[tokio::test(start_paused = true)]
+    async fn a_retry_stops_after_its_first_success() {
+        let runs = std::cell::Cell::new(0_u32);
+        retry_until_done(Duration::from_secs(5), CancellationToken::new(), || {
+            runs.set(runs.get() + 1);
+            let run = runs.get();
+            async move { run == 3 }
+        })
+        .await;
+        assert_eq!(runs.get(), 3);
+    }
+
+    /// Shutdown stops a retry that never succeeds.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_stops_a_retry() {
+        let cancel = CancellationToken::new();
+        let retry = tokio::spawn(retry_until_done(
+            Duration::from_secs(5),
+            cancel.clone(),
+            || async { false },
+        ));
+        tokio::time::sleep(Duration::from_secs(12)).await;
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(1), retry)
+            .await
+            .expect("the retry stops at shutdown")
+            .expect("the retry task joins");
     }
 
     /// A result write repeats only while it has uploaded no blob (issue

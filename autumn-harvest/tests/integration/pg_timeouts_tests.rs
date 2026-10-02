@@ -254,6 +254,15 @@ impl MetricsRecorder for AcquireTimeouts {
 }
 
 fn build_worker(worker_id: &str, metrics: Arc<AcquireTimeouts>) -> Arc<Worker> {
+    build_worker_with(worker_id, metrics, vec![], Duration::from_secs(5))
+}
+
+fn build_worker_with(
+    worker_id: &str,
+    metrics: Arc<AcquireTimeouts>,
+    activities: Vec<autumn_harvest::info::ActivityInfo>,
+    worker_heartbeat_interval: Duration,
+) -> Arc<Worker> {
     let telemetry = Arc::new(
         TelemetryConfig::builder()
             .metrics(metrics as Arc<dyn MetricsRecorder>)
@@ -261,7 +270,7 @@ fn build_worker(worker_id: &str, metrics: Arc<AcquireTimeouts>) -> Arc<Worker> {
     );
     let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
         vec![],
-        vec![],
+        activities,
         autumn_harvest::context::empty_shared_state(),
         telemetry,
     ));
@@ -281,7 +290,7 @@ fn build_worker(worker_id: &str, metrics: Arc<AcquireTimeouts>) -> Arc<Worker> {
                 sticky_timeout: Duration::from_secs(5),
                 max_local_activity_start_to_close: Duration::from_secs(60),
                 shard_assignments: vec![ShardId::new(0)],
-                worker_heartbeat_interval: Duration::from_secs(5),
+                worker_heartbeat_interval,
                 build_id: String::new(),
                 deployment_name: None,
                 workflow_cache_size: 100,
@@ -422,6 +431,94 @@ async fn a_full_pool_fails_a_claim_within_the_bound() {
         .await
         .expect("worker stops")
         .expect("worker task joins");
+}
+
+/// A static rate-limit bucket whose startup registration times out is
+/// registered later. Without it the activity can never run, because the
+/// claim gate fails closed on a missing bucket.
+#[tokio::test]
+async fn a_rate_limit_bucket_registers_after_a_startup_timeout() {
+    let (url, _container) = setup_db().await;
+    let pool = engine_pool(
+        url.clone(),
+        1,
+        DbRole::Hot,
+        &timeouts(200, SessionTimeouts::for_role(DbRole::Hot)),
+    )
+    .expect("engine pool builds");
+    let key: &'static str = Box::leak(format!("rl-{}", Uuid::new_v4()).into_boxed_str());
+    let activity = autumn_harvest::info::ActivityInfo {
+        name: "rate_limited_work",
+        module: "test",
+        default_retry_policy: None,
+        default_start_to_close: Some(Duration::from_secs(5)),
+        default_heartbeat_timeout: None,
+        default_schedule_to_start: None,
+        default_schedule_to_close: None,
+        default_queue: None,
+        max_concurrent: None,
+        concurrency_key: None,
+        is_local: false,
+        max_input_bytes: None,
+        max_result_bytes: None,
+        rate_limit_rps: Some(5.0),
+        rate_limit_burst: None,
+        rate_limit_key: Some(key),
+        rate_limit_key_expr: None,
+        circuit_breaker: None,
+        requires: None,
+        handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+    };
+    let worker_id = format!("pg-timeouts-{}", Uuid::new_v4());
+    let worker = build_worker_with(
+        &worker_id,
+        Arc::new(AcquireTimeouts::default()),
+        vec![activity],
+        Duration::from_millis(200),
+    );
+
+    // Startup acquires wait 200 ms each, so two seconds covers them all.
+    let held = hold_every_connection(&pool).await;
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+    let run_handle = tokio::spawn(async move { runner.run(&pool_for_run).await });
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        !rate_limit_bucket_exists(&url, key).await,
+        "the bucket must not register while the pool is full"
+    );
+    drop(held);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !rate_limit_bucket_exists(&url, key).await {
+        assert!(
+            Instant::now() < deadline,
+            "the bucket never registered after the pool freed"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    worker.shutdown();
+    tokio::time::timeout(Duration::from_secs(15), run_handle)
+        .await
+        .expect("worker stops")
+        .expect("worker task joins");
+}
+
+async fn rate_limit_bucket_exists(url: &str, key: &str) -> bool {
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let mut conn = connect(url).await;
+    diesel::sql_query("SELECT count(*) AS n FROM harvest_rate_limit_buckets WHERE key = $1")
+        .bind::<Text, _>(key)
+        .get_result::<Count>(&mut conn)
+        .await
+        .expect("count buckets")
+        .n
+        == 1
 }
 
 // ---------------------------------------------------------------------------

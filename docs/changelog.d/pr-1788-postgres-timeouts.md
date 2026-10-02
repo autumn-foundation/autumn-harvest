@@ -16,7 +16,10 @@ cancellation observer and the DR generation pin. A zero `wait` still fails at
 once when no slot is free, and its retries start 100 ms apart. Before, a pool
 with no deadpool `wait` timeout made them wait without limit. This reverses the
 "single shard stays unbounded" rule from issue #961 AC7. A claim that times out
-reports no work, and the poll loop tries again.
+reports no work, and the poll loop tries again. A static rate-limit bucket
+registration that fails at startup runs again every worker heartbeat interval,
+on single-shard and multi-shard workers. Before, a pool outage at startup left
+the bucket missing, and the claim gate held back its activity until a restart.
 
 **Session timeouts per role (opt-in).** A pool built with `engine_pool` or
 `with_engine_timeouts` runs `SET` once on each new connection. The plugin's

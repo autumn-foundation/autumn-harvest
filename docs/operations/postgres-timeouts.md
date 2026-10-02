@@ -30,7 +30,9 @@ no slot is free. Retries on such a pool start 100 ms apart, not one bound apart.
 
 A timeout returns `HarvestError::PoolAcquireTimeout`. A claim that times out
 reports no work, and the poll loop tries again. A failed fleet registration
-arms the heartbeat retry. The write of an executed activity's result makes up
+arms the heartbeat retry. A failed rate-limit bucket registration runs again
+every worker heartbeat interval until every static bucket exists. Without the
+bucket, the claim gate holds back that activity. The write of an executed activity's result makes up
 to 10 tries. Each try spans at least the pool bound, so a short pool incident
 or outage does not drop the result. A result write that a session
 `statement_timeout` or `lock_timeout` cancels also runs again, up to 10 times.
