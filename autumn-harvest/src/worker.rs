@@ -6428,15 +6428,38 @@ pub async fn retry_policy_or_fail_task(
 /// How many times to run an activity result write that a session timeout
 /// cancels (issue #1788).
 ///
-/// An offloaded result uploads its blob on each try, before the transaction.
-/// The rollback then drops the reference row but not the blob. So with an
-/// offloader there is one try, and a session timeout releases the claim.
-const fn result_write_attempts(offloading: bool) -> u32 {
-    if offloading {
+/// An offloaded output uploads its blob on each try. The rollback then drops
+/// the reference row but not the blob. So a write that uploads has one try,
+/// and a session timeout releases the claim.
+const fn result_write_attempts(uploads: bool) -> u32 {
+    if uploads {
         1
     } else {
         FINALIZE_ACQUIRE_ATTEMPTS
     }
+}
+
+/// Whether the write of `activity_result` uploads a blob (issue #1788).
+///
+/// Only a successful output goes to the offloader. A handler failure and a
+/// retry requeue upload nothing. An output stays inline at or below the
+/// threshold, after codec encoding. The check encodes the output as the
+/// write does, so the two agree.
+///
+/// An encode error fails the write too. The check then reports an upload,
+/// so that write runs one time only.
+fn result_write_uploads(
+    offloader: Option<&crate::payload_store::PayloadOffloader>,
+    codecs: &crate::payload_codec::PayloadCodecs,
+    activity_result: &Result<serde_json::Value, String>,
+) -> bool {
+    let (Some(offloader), Ok(output)) = (offloader, activity_result) else {
+        return false;
+    };
+    codecs
+        .encode_payload(output)
+        .and_then(|field| offloader.would_offload_field(&field))
+        .unwrap_or(true)
 }
 
 /// The `site` label for a claim acquire timeout.
@@ -16536,8 +16559,8 @@ struct ActivityAttempt<'a> {
 /// drop the result. A session `statement_timeout` or `lock_timeout` rolls the
 /// write back, so the write runs again. A lost connection, for example after a
 /// `transaction_timeout`, gets a new connection first. Each finalization
-/// re-checks `RUNNING` under a row lock, so a repeat is safe. An offloader
-/// turns the repeats off; see `result_write_attempts`.
+/// re-checks `RUNNING` under a row lock, so a repeat is safe. A write that
+/// uploads a blob turns the repeats off; see `result_write_uploads`.
 ///
 /// `activity_result` is already cap-normalized: an oversized `Ok` is a
 /// non-retryable `Err`. So the cap passed to `handle_activity_result` is 0,
@@ -16557,7 +16580,11 @@ async fn write_activity_result(
         activity_name,
     } = *attempt_of;
     let mut conn = crate::pool::acquire_with_retries(pool, FINALIZE_ACQUIRE_ATTEMPTS).await?;
-    let attempts = result_write_attempts(registry.payload_offloader().is_some());
+    let attempts = result_write_attempts(result_write_uploads(
+        registry.payload_offloader(),
+        registry.payload_codecs(),
+        activity_result,
+    ));
     let mut attempt = 1;
     loop {
         let outcome = handle_activity_result(
@@ -35913,12 +35940,79 @@ mod tests {
         assert_eq!(*sink.0.lock().expect("lock"), 1);
     }
 
-    /// An offloaded result uploads a blob on each try. A repeat would leave
-    /// blobs that no row references, so offloading turns the repeats off.
+    /// An uploading result write puts a blob on each try. A repeat would leave
+    /// blobs that no row references, so an upload turns the repeats off.
     #[test]
-    fn offloading_turns_off_result_write_repeats() {
+    fn an_upload_turns_off_result_write_repeats() {
         assert_eq!(result_write_attempts(false), FINALIZE_ACQUIRE_ATTEMPTS);
         assert_eq!(result_write_attempts(true), 1);
+    }
+
+    /// A payload store for tests that never upload. A `put` fails the test.
+    struct NoUploadStore;
+
+    impl crate::payload_store::PayloadStore for NoUploadStore {
+        fn store_id(&self) -> &'static str {
+            "no-upload"
+        }
+        fn put(&self, _bytes: &[u8]) -> crate::payload_store::PayloadStoreFuture<'_, String> {
+            unreachable!("the upload check must not put a blob")
+        }
+        fn get(&self, _key: &str) -> crate::payload_store::PayloadStoreFuture<'_, Vec<u8>> {
+            unreachable!("the upload check must not get a blob")
+        }
+        fn delete(&self, _key: &str) -> crate::payload_store::PayloadStoreFuture<'_, ()> {
+            unreachable!("the upload check must not delete a blob")
+        }
+    }
+
+    fn offloader_over(threshold: u64) -> crate::payload_store::PayloadOffloader {
+        crate::payload_store::PayloadOffloader::new(
+            Arc::new(NoUploadStore),
+            threshold,
+            Arc::new(crate::telemetry::NoOpMetrics),
+        )
+    }
+
+    /// Only a result that puts a blob turns the repeats off (issue #1788).
+    /// A handler failure and an inline output keep them, so a session
+    /// timeout repeats the write and does not run the handler again.
+    #[test]
+    fn only_an_offloaded_output_counts_as_an_upload() {
+        let offloader = offloader_over(16);
+        let codecs = crate::payload_codec::PayloadCodecs::default();
+        let large = serde_json::json!("x".repeat(64));
+        let small = serde_json::json!("x");
+        let failure = Err::<serde_json::Value, _>("x".repeat(64));
+
+        assert!(result_write_uploads(
+            Some(&offloader),
+            &codecs,
+            &Ok(large.clone())
+        ));
+        assert!(!result_write_uploads(Some(&offloader), &codecs, &Ok(small)));
+        assert!(!result_write_uploads(
+            Some(&offloader),
+            &codecs,
+            &Ok(serde_json::Value::Null)
+        ));
+        assert!(!result_write_uploads(Some(&offloader), &codecs, &failure));
+        assert!(!result_write_uploads(None, &codecs, &Ok(large)));
+    }
+
+    /// An output that looks like a reference envelope is stored as a blob
+    /// whatever its size (issue #1758), so it counts as an upload.
+    #[test]
+    fn a_look_alike_reference_counts_as_an_upload() {
+        let offloader = offloader_over(1 << 20);
+        let codecs = crate::payload_codec::PayloadCodecs::default();
+        let look_alike = serde_json::json!({ crate::payload_store::OFFLOAD_ENVELOPE_KEY: 1 });
+
+        assert!(result_write_uploads(
+            Some(&offloader),
+            &codecs,
+            &Ok(look_alike)
+        ));
     }
 
     #[derive(Default)]

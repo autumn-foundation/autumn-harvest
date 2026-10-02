@@ -221,12 +221,10 @@ impl PayloadOffloader {
                 continue;
             }
             let bytes = serde_json::to_vec(field)?;
-            // A fresh value that carries the discriminator is business data.
-            // Store it as a blob so no bare look-alike reaches the log.
-            if !is_offload_envelope(field) && bytes.len() as u64 <= self.threshold {
+            let byte_len = bytes.len() as u64;
+            if !self.stores_as_blob(field, byte_len) {
                 continue;
             }
-            let byte_len = bytes.len() as u64;
             let checksum = hex_sha256(&bytes);
             let blob_key = self
                 .store
@@ -243,6 +241,30 @@ impl PayloadOffloader {
             });
         }
         Ok(refs)
+    }
+
+    /// Whether [`Self::offload_event_value`] stores `field` as a blob.
+    ///
+    /// `field` is one payload field, already codec-encoded. The check does
+    /// not touch the store. A caller uses it to learn if a write uploads.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Serialization`] if `field` cannot be serialized.
+    pub(crate) fn would_offload_field(&self, field: &Value) -> HarvestResult<bool> {
+        if field.is_null() {
+            return Ok(false);
+        }
+        let byte_len = serde_json::to_vec(field)?.len() as u64;
+        Ok(self.stores_as_blob(field, byte_len))
+    }
+
+    /// Whether a non-null field of `byte_len` serialized bytes becomes a blob.
+    ///
+    /// A fresh value that carries the discriminator is business data. It
+    /// becomes a blob, so no bare look-alike reaches the log.
+    fn stores_as_blob(&self, field: &Value, byte_len: u64) -> bool {
+        is_offload_envelope(field) || byte_len > self.threshold
     }
 
     /// Reconstruct any offloaded payload field inside a serialized event's
@@ -446,6 +468,26 @@ mod tests {
     #[allow(clippy::needless_pass_by_value)]
     fn event_with_output(output: Value) -> Value {
         serde_json::json!({ "type": "WorkflowCompleted", "data": { "output": output } })
+    }
+
+    /// The upload check agrees with the upload itself, field by field.
+    #[tokio::test]
+    async fn the_upload_check_matches_the_upload() {
+        let fields = [
+            Value::Null,
+            serde_json::json!("small"),
+            serde_json::json!("x".repeat(64)),
+            serde_json::json!({ OFFLOAD_ENVELOPE_KEY: 1 }),
+        ];
+        for field in fields {
+            let store = MemStore::new();
+            let off = offloader(store.clone(), 16);
+            let expected = off.would_offload_field(&field).expect("check");
+            let mut event = event_with_output(field.clone());
+            off.offload_event_value(&mut event).await.expect("offload");
+            let uploaded = store.puts.load(Ordering::SeqCst) == 1;
+            assert_eq!(expected, uploaded, "field {field}");
+        }
     }
 
     #[tokio::test]

@@ -35,8 +35,9 @@ to 10 tries. Each try spans at least the pool bound, so a short pool incident
 or outage does not drop the result. A result write that a session
 `statement_timeout` or `lock_timeout` cancels also runs again, up to 10 times.
 Each write re-checks that the task is `RUNNING` under a row lock, so a repeat
-is safe. With a payload offloader there is no repeat: each try would upload a
-blob that no row then references. The same tries apply to two more writes after
+is safe. A write that offloads its output to the payload store has no repeat:
+each try would upload a blob that no row then references. A handler failure and
+an inline output upload nothing, so they keep the repeats. The same tries apply to two more writes after
 `ActivityStarted`: the failure of a task whose retry policy does not parse, and
 the `CircuitOpen` failure.
 

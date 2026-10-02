@@ -42,8 +42,9 @@ dropped. The
 executed activity's result write uses `pool::acquire_with_retries` (10 bounded
 tries). A try that fails early waits out its bound, so the tries also ride out a
 short outage. A result write cancelled by a session `statement_timeout` or
-`lock_timeout` runs again, up to 10 times (`pool::is_session_timeout`). With a
-payload offloader there is one try, so no unreferenced blobs pile up. The
+`lock_timeout` runs again, up to 10 times (`pool::is_session_timeout`). A write
+that offloads its output has one try, so no unreferenced blobs pile up. A
+handler failure and an inline output keep the repeats. The
 `CircuitOpen` failure write and the failure write for a retry policy that does
 not parse use the same tries. A write that loses its connection, for example to
 `transaction_timeout`, runs again on a new connection (`pool::is_connection_lost`). An activity task that still fails to get a
