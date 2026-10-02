@@ -21,9 +21,7 @@ use crate::error::{HarvestError, HarvestResult};
 use crate::execution::{StartWorkflowParams, StartedWorkflowExecution};
 use crate::info::DagInfo;
 use crate::models::{HarvestSchedule, NewHarvestSchedule};
-use crate::policy::{
-    OverlapPolicy, Schedule, WorkflowSchedule, compute_jitter_offset, default_schedule_jitter,
-};
+use crate::policy::{OverlapPolicy, Schedule, WorkflowSchedule, compute_jitter_offset};
 use crate::schema::{harvest_schedules, harvest_workflow_executions};
 use crate::shard::{ShardRouter, ShardedDbPool};
 use crate::types::{ExecutionId, ShardId, WorkflowIdReusePolicy};
@@ -2743,25 +2741,17 @@ pub enum ScheduleUpdateOutcome {
 /// the stored `retry_policy` JSON does not deserialize as a `RetryPolicy` —
 /// erroring loudly instead of silently dropping the stored policy to NULL on
 /// an unrelated edit (repair by explicitly setting or clearing it).
-/// Resolve the jitter for a patch that does not set one (issue #1792).
 ///
-/// A stored jitter that equals the default of the stored cadence is a default.
-/// A cadence change then re-derives it, so a 10s cron default cannot follow the
-/// schedule onto a faster cadence. Any other stored jitter is explicit and stays.
-fn merged_jitter(
-    existing: &HarvestSchedule,
-    existing_schedule: &Schedule,
-    patch: &WorkflowSchedulePatch,
-) -> Duration {
-    let stored = Duration::from_secs(u64::try_from(existing.jitter_secs).unwrap_or(0));
-    match &patch.schedule {
-        Some(new_schedule) if stored == default_schedule_jitter(existing_schedule) => {
-            default_schedule_jitter(new_schedule)
-        }
-        _ => stored,
-    }
-}
-
+/// # Jitter
+///
+/// The default fire jitter applies on create only (issue #1792). The stored
+/// row does not record whether its `jitter_secs` came from the default or
+/// from an explicit request. The merge therefore never re-derives jitter: a
+/// patch that changes `schedule` keeps the stored jitter unless the same
+/// patch sets `jitter`. A value equality check against the old cadence's
+/// default cannot tell an explicit `jitter_secs: 0` from the interval default.
+/// Such a check would turn that opt-out into 10 s on a move to a five-field
+/// cron. That breaks the partial-update contract.
 fn merge_schedule_patch(
     existing: &HarvestSchedule,
     patch: &WorkflowSchedulePatch,
@@ -2810,7 +2800,7 @@ fn merge_schedule_patch(
 
     let jitter = patch
         .jitter
-        .unwrap_or_else(|| merged_jitter(existing, &existing_schedule, patch));
+        .unwrap_or_else(|| Duration::from_secs(u64::try_from(existing.jitter_secs).unwrap_or(0)));
     Ok(WorkflowSchedule {
         workflow_name,
         dag_name: None,
@@ -7093,10 +7083,30 @@ mod tests {
         assert_eq!(merged.calendar.as_deref(), Some("us-holidays"));
     }
 
-    /// A cadence change re-derives a defaulted jitter (issue #1792). A 10s
-    /// default must not follow a cron onto a faster cadence.
+    /// An explicit `jitter_secs: 0` on an interval schedule survives a patch
+    /// to a five-field cron (issue #1792). The stored row carries no
+    /// default-versus-explicit provenance, so the merge must not replace the
+    /// opt-out with the new cadence's 10 s default.
     #[test]
-    fn merge_schedule_patch_cadence_change_rederives_default_jitter() {
+    fn merge_schedule_patch_cadence_change_keeps_explicit_zero_jitter() {
+        let row = HarvestSchedule {
+            schedule_expr: Some("interval:3600".to_string()),
+            jitter_secs: 0,
+            ..merge_base_row()
+        };
+        let patch = WorkflowSchedulePatch {
+            schedule: Some(Schedule::Cron("0 3 * * *".to_string())),
+            ..Default::default()
+        };
+        let merged = merge_schedule_patch(&row, &patch).expect("merge");
+        assert_eq!(merged.jitter, Duration::ZERO);
+    }
+
+    /// A stored 10 s jitter on a five-field cron survives a patch to another
+    /// five-field cron, to a seconds-field cron and to an interval. The merge
+    /// never re-derives jitter from the new cadence (issue #1792).
+    #[test]
+    fn merge_schedule_patch_cadence_change_keeps_stored_jitter() {
         let row = HarvestSchedule {
             schedule_expr: Some("cron:0 3 * * *".to_string()),
             jitter_secs: 10,
@@ -7110,20 +7120,20 @@ mod tests {
             merge_schedule_patch(&row, &patch).expect("merge").jitter
         };
         assert_eq!(
-            merge_to(Schedule::Cron("*/5 * * * * *".to_string())),
-            Duration::ZERO
-        );
-        assert_eq!(
-            merge_to(Schedule::Interval(Duration::from_secs(5))),
-            Duration::ZERO
-        );
-        assert_eq!(
             merge_to(Schedule::Cron("0 4 * * *".to_string())),
-            crate::policy::DEFAULT_CRON_JITTER
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            merge_to(Schedule::Cron("*/5 * * * * *".to_string())),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            merge_to(Schedule::Interval(Duration::from_secs(3600))),
+            Duration::from_secs(10)
         );
     }
 
-    /// A non-default stored jitter is explicit, so a cadence change keeps it.
+    /// A non-default stored jitter also stays across a cadence change.
     #[test]
     fn merge_schedule_patch_cadence_change_keeps_explicit_jitter() {
         let row = merge_base_row();
@@ -7133,6 +7143,36 @@ mod tests {
         };
         let merged = merge_schedule_patch(&row, &patch).expect("merge");
         assert_eq!(merged.jitter, Duration::from_secs(30));
+    }
+
+    /// A patch that sets both the cadence and `jitter` applies the explicit
+    /// value, including an explicit zero (issue #1792).
+    #[test]
+    fn merge_schedule_patch_cadence_change_with_explicit_jitter_applies_it() {
+        let row = HarvestSchedule {
+            schedule_expr: Some("cron:0 3 * * *".to_string()),
+            jitter_secs: 10,
+            ..merge_base_row()
+        };
+        let merge_with = |schedule: Schedule, jitter: Duration| {
+            let patch = WorkflowSchedulePatch {
+                schedule: Some(schedule),
+                jitter: Some(jitter),
+                ..Default::default()
+            };
+            merge_schedule_patch(&row, &patch).expect("merge").jitter
+        };
+        assert_eq!(
+            merge_with(
+                Schedule::Interval(Duration::from_secs(60)),
+                Duration::from_secs(5)
+            ),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            merge_with(Schedule::Cron("0 4 * * *".to_string()), Duration::ZERO),
+            Duration::ZERO
+        );
     }
 
     /// Tri-state fields: `Some(None)` clears, outer `None` preserves.

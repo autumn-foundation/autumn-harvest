@@ -99,9 +99,11 @@ It does not apply to these schedules:
   than once per 10 s.
 - An interval schedule or a manual schedule.
 
-A PATCH that changes the cadence and sends no `jitter_secs` re-derives a
-defaulted jitter. Thus a 10 s default does not follow a cron onto a faster
-cadence.
+The default applies on create only. A `PATCH /admin/schedules/{id}` that
+changes `schedule_expr` keeps the stored jitter. The stored row does not record
+whether its jitter came from the default or from an explicit request, so a
+cadence change cannot safely re-derive it. To change the jitter with the
+cadence, send `jitter_secs` in the same PATCH.
 
 To opt out, set the jitter to zero:
 

@@ -15,7 +15,6 @@ same value.
 | Contained handler-panic re-dispatch | `1s * 2^(n-1)`, cap 30 s | `Equal`, `[base/2, base]` |
 | `WorkflowSchedule::new` and `#[dag(schedule)]` with a cron | 0 s fire jitter | `DEFAULT_CRON_JITTER` (10 s) |
 | `POST /admin/schedules/workflow` and `/preview` with no `jitter_secs`, cron | 0 s | 10 s |
-| `PATCH /admin/schedules/{id}` that changes the cadence, no `jitter_secs` | keeps the stored jitter | re-derives a defaulted jitter |
 
 Design decisions:
 
@@ -32,9 +31,10 @@ Design decisions:
   zero jitter.
 - `DEFAULT_CRON_JITTER` is a whole number of seconds, because
   `harvest_schedules.jitter_secs` stores whole seconds.
-- A PATCH that changes the cadence re-derives the jitter only when the stored
-  value equals the default of the old cadence. Any other stored value is
-  explicit and stays.
+- The default applies on create only. A PATCH that changes the cadence keeps
+  the stored jitter. The row does not record whether its jitter came from the
+  default or from an explicit request, so a cadence change cannot safely
+  re-derive it. Send `jitter_secs` in the same PATCH to change it.
 - `#[dag(jitter = "0s")]` opts out. The macro now checks the `jitter` string
   at compile time.
 - `harvest schedule create-workflow` gains `--jitter-secs`.
