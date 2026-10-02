@@ -15427,8 +15427,10 @@ pub async fn settle_session_slot_after_transient_error(
 /// re-check can read no row just before the acquire inserts one. It then
 /// releases the slot of a session that this worker hosts. Each key holds the
 /// registry address, so two workers in one process keep separate entries.
+/// The value counts the re-checks in progress. Two can overlap, and the mark
+/// must stay until the last one ends.
 static RECHECKED_SESSION_SLOTS: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashSet<(usize, crate::types::SessionId)>>,
+    std::sync::Mutex<std::collections::HashMap<(usize, crate::types::SessionId), usize>>,
 > = std::sync::LazyLock::new(Default::default);
 
 fn rechecked_slot_key(
@@ -15438,7 +15440,7 @@ fn rechecked_slot_key(
     (std::sync::Arc::as_ptr(registry).addr(), session_id)
 }
 
-/// Whether a background re-check of this slot is still in progress.
+/// Whether a re-check of this slot is still in progress.
 fn session_slot_rechecked(
     registry: &crate::sessions::SessionSlotRegistry,
     session_id: crate::types::SessionId,
@@ -15446,7 +15448,7 @@ fn session_slot_rechecked(
     RECHECKED_SESSION_SLOTS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .contains(&rechecked_slot_key(registry, session_id))
+        .contains_key(&rechecked_slot_key(registry, session_id))
 }
 
 /// Marks a slot as in re-check. The mark goes when this value drops, also
@@ -15459,20 +15461,26 @@ impl RecheckedSessionSlot {
         session_id: crate::types::SessionId,
     ) -> Self {
         let key = rechecked_slot_key(registry, session_id);
-        RECHECKED_SESSION_SLOTS
+        *RECHECKED_SESSION_SLOTS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(key);
+            .entry(key)
+            .or_insert(0) += 1;
         Self(key)
     }
 }
 
 impl Drop for RecheckedSessionSlot {
     fn drop(&mut self) {
-        RECHECKED_SESSION_SLOTS
+        let mut marks = RECHECKED_SESSION_SLOTS
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.0);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let std::collections::hash_map::Entry::Occupied(mut count) = marks.entry(self.0) {
+            *count.get_mut() -= 1;
+            if *count.get() == 0 {
+                count.remove();
+            }
+        }
     }
 }
 
@@ -35646,6 +35654,20 @@ mod tests {
 
         let next = allow(probe_time + Duration::from_secs(61));
         assert!(next.is_probe(), "a released probe lets a fresh probe in");
+    }
+
+    /// Two overlapping re-checks of one slot keep the mark until both end
+    /// (issue #1788). The first to end must not clear the other's mark.
+    #[test]
+    fn an_overlapping_recheck_keeps_the_slot_marked() {
+        let registry = crate::sessions::new_session_slot_registry();
+        let session_id = crate::types::SessionId::new();
+        let first = RecheckedSessionSlot::mark(&registry, session_id);
+        let second = RecheckedSessionSlot::mark(&registry, session_id);
+        drop(first);
+        assert!(session_slot_rechecked(&registry, session_id));
+        drop(second);
+        assert!(!session_slot_rechecked(&registry, session_id));
     }
 
     /// A quarantine that cannot reach the pool reports it, so the caller can
