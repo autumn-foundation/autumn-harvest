@@ -435,7 +435,7 @@ fn resolution_start_params(
         workflow_name: "tenant_wf",
         workflow_id,
         exec_id,
-        input,
+        input: input.into(),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
