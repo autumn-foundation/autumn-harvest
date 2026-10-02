@@ -380,6 +380,11 @@ shard by hash. To confine a caller to some shards, deny `None` too.
   attempt. The hook uses the same walks as the handlers, and checks every
   shard. This costs a few indexed lookups per request. If a walk fails, the
   request gets `503`, because the handler would fail the same walk.
+- **The check is point in time.** A rebalance cutover that runs between the
+  hook and the handler can move a run to a new shard. The handler then acts on
+  that shard without a second check. Only an operator starts a rebalance, so a
+  caller cannot open this window. Keep confined tenants off shards that a
+  rebalance in progress targets.
 - **The hook does not cover the app-level MCP tool routes or webhook routes.**
   They live outside the management router.
 - **A panic in the hook aborts the request.** It never lets it through.
