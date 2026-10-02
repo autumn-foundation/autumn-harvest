@@ -215,7 +215,7 @@ fn start_params_named(
         workflow_name,
         workflow_id,
         exec_id,
-        input: json!({"ok": true}),
+        input: json!({"ok": true}).into(),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,

@@ -131,7 +131,7 @@ async fn seed(
             workflow_name: name,
             workflow_id,
             exec_id,
-            input: json!({"n": 1}),
+            input: json!({"n": 1}).into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,

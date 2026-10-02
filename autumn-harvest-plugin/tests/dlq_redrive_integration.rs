@@ -113,7 +113,7 @@ async fn seed(
             workflow_name: "redrive_http_wf",
             workflow_id,
             exec_id: ExecutionId::new_for_shard(ShardId::new(0)),
-            input: json!({"k": "v"}),
+            input: json!({"k": "v"}).into(),
             parent_id: None,
             queue_name: queue,
             execution_timeout: None,

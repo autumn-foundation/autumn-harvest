@@ -413,6 +413,9 @@ pub mod shard;
 /// Shard rebalancing: migrating quiescent workflow executions across shards
 /// (issue #964).
 pub mod shard_rebalance;
+/// Shared, immutable JSON payload for the workflow start path (issue #1733).
+pub mod shared_json;
+
 /// `cfg(shuttle)` async-primitive shim (tokio under normal builds).
 ///
 /// Only the modules that opt into Shuttle model checking use it. See
@@ -673,6 +676,7 @@ pub use schema_contract::{
 #[cfg(feature = "db")]
 pub use shard::ShardedDbPool;
 pub use shard::{ShardPlacement, ShardPlacementError, ShardRouter, ShardRouterParts};
+pub use shared_json::SharedJson;
 pub use signal_handler::SignalHandlerRegistry;
 pub use simulator::{SimulatorResult, WorkflowSimulator};
 pub use stall_diagnosis::{

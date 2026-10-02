@@ -159,7 +159,7 @@ Single-param workflows/activities: input is passed as a single JSON value and de
 
 **8. Two boot paths, one set of startup steps**
 
-`HarvestPlugin` boots Harvest inside an autumn-web app. `HarvestEmbedding` (`embedding.rs`, issue #1613) boots it on any Axum server. Both call the shared steps in `autumn-harvest-plugin/src/boot.rs`: the limit mirror, the boot gate load, the admission globals, the gate refresh and the teardown. Add a new startup step there, not to one path only.
+`HarvestPlugin` boots Harvest inside an autumn-web app. `HarvestEmbedding` (`embedding.rs`, issue #1613) boots it on any Axum server. Both call the shared steps in `autumn-harvest-plugin/src/boot.rs`: the limit mirror, the boot gate load, the admission globals, the gate refresh and the teardown. Add a new startup step there, not to one path only. [`embedding.md`](embedding.md) documents the standalone path for embedders.
 
 The order is load-bearing. The gate cache loads before any worker spawns. The orphan gate runs before any admission global is published. The storage pool is installed before the API runtime. On stop, the admission globals are cleared only after the runner stops.
 
@@ -1035,7 +1035,7 @@ newly added field must be placed in one of the tiers above, in both this
 table and the `continue_as_new_as_type` rustdoc, so it can never silently
 land in "not consulted" unnoticed.
 
-**Single-shard only, enforced.** Rendezvous routing hashes the **pair** `(workflow_name, workflow_id)`, so changing the type re-routes the key — measured at ~75% of ids on a 4-shard router. The successor cannot follow it: the predecessor's seal and the successor's insert are one transaction, and there is no cross-shard transaction to relocate the row with. Left unguarded that would make the successor unreachable by `workflow_id`-addressed signal/cancel/await (#751) — the very addressing this feature exists to preserve — and would hide a live run of the target type on the routed shard, admitting two live runs under one key. So a transition whose target key routes to a different shard is **rejected terminally**, naming both shards. Naming the run's **own** type is exempt — it changes no key, so a run pinned off its hash-derived shard by explicit placement (#697) can still re-resolve its own declared defaults. Single-shard deployments never hit this (one shard, so the key can only resolve to it), and `HarvestPlugin` rejects multi-shard upstream, so the restriction binds only standalone-runner embedders. Relocation or a routing directory is the follow-up that would lift it.
+**Single-shard only, enforced.** Rendezvous routing hashes the **pair** `(workflow_name, workflow_id)`, so changing the type re-routes the key — measured at ~75% of ids on a 4-shard router. The successor cannot follow it: the predecessor's seal and the successor's insert are one transaction, and there is no cross-shard transaction to relocate the row with. Left unguarded that would make the successor unreachable by `workflow_id`-addressed signal/cancel/await (#751) — the very addressing this feature exists to preserve — and would hide a live run of the target type on the routed shard, admitting two live runs under one key. So a transition whose target key routes to a different shard is **rejected terminally**, naming both shards. Naming the run's **own** type is exempt — it changes no key, so a run pinned off its hash-derived shard by explicit placement (#697) can still re-resolve its own declared defaults. Single-shard deployments never hit this (one shard, so the key can only resolve to it), and `HarvestPlugin` rejects multi-shard upstream, so the restriction binds only standalone-runner embedders ([`embedding.md`](embedding.md#run-more-than-one-shard)). Relocation or a routing directory is the follow-up that would lift it.
 
 The fleet-wide `max_workflow_execution_timeout` ceiling is applied to the target's declared timeout, so a type change is not an escape hatch from that either. A declared timeout the ceiling does **not** bound and that cannot be resolved to an absolute deadline (an out-of-range duration) **rejects the transition** rather than persisting a run whose `execution_timeout` claims a hard cap the timeout scanner — which only enforces a non-NULL `deadline_at` — can never fire. An out-of-range **`sla`** instead maps to "no SLA" (both fields cleared), matching the #487 start-path rule: the SLA is observational, so degrading it is benign, whereas silently dropping a runaway cap is not.
 
@@ -1348,6 +1348,8 @@ async fn doc_index(ctx: &WorkflowContext, req: IndexRequest) -> Result<(), Strin
 This mirrors how the #618 admission gates and #607 throttles treat the same paths.
 
 New start sites build their params with `StartWorkflowParams::new(..)` and override only what they vary, with `..` (#1448). The retry site keeps an explicit `Defer`, so a change to the default cannot alter it.
+
+The start `input` is a `SharedJson` (#1733), an `Arc<Value>` newtype in `shared_json.rs`. The params, the execution row, the queue params and the queue row share one allocation. Constructors accept a plain `Value` through `Into`.
 
 **Interaction notes.**
 
