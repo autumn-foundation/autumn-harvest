@@ -1502,6 +1502,16 @@ static INDEX_PROBE_GATE: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<ProbeKey, std::time::Instant>>,
 > = std::sync::LazyLock::new(Default::default);
 
+/// The probe key of the direct export path, which has no pool.
+///
+/// The marker `direct` keeps it apart from every pooled key. The connection
+/// identity separates callers. A new connection probes at once, and a reused
+/// one waits for the interval.
+#[cfg(feature = "db")]
+fn direct_probe_key(shard_id: i32, conn_id: usize) -> ProbeKey {
+    (shard_id, "direct".to_owned(), conn_id)
+}
+
 /// Whether this checker may probe the index catalogs now.
 ///
 /// A healthy exporter ticks every poll interval. Two catalog reads per tick
@@ -1857,6 +1867,12 @@ async fn notice_missing_unexported_index(
     conn: &mut diesel_async::AsyncPgConnection,
     shard_id: i32,
 ) {
+    // A caller can tick quickly. One probe per interval for each connection
+    // keeps the catalog reads off the steady state.
+    let conn_id = std::ptr::from_ref::<diesel_async::AsyncPgConnection>(conn) as usize;
+    if !index_probe_due(&direct_probe_key(shard_id, conn_id)) {
+        return;
+    }
     if !index_notice_wanted(conn, shard_id).await {
         return;
     }
@@ -5234,6 +5250,26 @@ mod tests {
             index_probe_due(&other_pool),
             "another pool has its own gate"
         );
+    }
+
+    /// Issue #1667: the direct export path has no pool. Its probe key names
+    /// the connection instead. A new connection gets a fresh gate, a reused one
+    /// is throttled, and the key never equals a pooled checker's key.
+    #[cfg(feature = "db")]
+    #[test]
+    fn the_direct_probe_key_names_the_connection() {
+        let first = direct_probe_key(9_007, 100);
+        let second = direct_probe_key(9_007, 200);
+        assert_ne!(first, second);
+        assert_eq!(first, direct_probe_key(9_007, 100));
+        let pooled: ProbeKey = (9_007, String::new(), 100);
+        assert_ne!(
+            first, pooled,
+            "a direct key must not collide with a pooled key"
+        );
+        assert!(index_probe_due(&first));
+        assert!(!index_probe_due(&first), "a reused connection is throttled");
+        assert!(index_probe_due(&second), "a new connection probes at once");
     }
 
     /// Issue #1667: a privilege failure is the one error a retry cannot fix.
