@@ -1701,6 +1701,12 @@ jobs:
       (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
       needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
+    # `rust-toolchain.toml` pins the workspace to the current stable release,
+    # and rustup gives that file precedence over the `rustup default` the
+    # action sets. The environment variable outranks the file, so every
+    # cargo call in this job really compiles with the MSRV.
+    env:
+      RUSTUP_TOOLCHAIN: 1.88.0
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88.0
