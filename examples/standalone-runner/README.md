@@ -24,6 +24,10 @@ only formats.
 | Metrics | `GET /metrics` from `HarvestMetricsRecorder::render_prometheus()` |
 | Webhooks | `build_webhook_router` with a `#[webhook]` binding (`src/webhooks.rs`) |
 
+[`docs/embedding.md`](../../docs/embedding.md) is the reference for this path. The getting-started
+fork, [The first workflow on plain Axum](../../docs/getting-started/standalone-axum.md), is the
+short version.
+
 `HarvestEmbedding` (issue #1613) runs the startup sequence the plugin runs. It
 applies `[harvest.startup]`, reads the profile from `AUTUMN_ENV` or
 `AUTUMN_PROFILE`, loads the admission gates, and installs the pool and the API

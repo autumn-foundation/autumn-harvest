@@ -190,7 +190,7 @@ async fn seed_event_under_key(pool: &DbPool, codecs: &PayloadCodecs, key_id: &st
         workflow_id: &Uuid::new_v4().to_string(),
         run_id: Uuid::new_v4(),
         shard_id: 0,
-        input: json!({}),
+        input: json!({}).into(),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,

@@ -267,7 +267,7 @@ mod db_handle_surface {
                 workflow_id: &format!("wf-typed-{}", Uuid::new_v4()),
                 run_id: Uuid::new_v4(),
                 shard_id: 0,
-                input: serde_json::json!({}),
+                input: serde_json::json!({}).into(),
                 memo: None,
                 search_attrs: None,
                 queue_name: "default",

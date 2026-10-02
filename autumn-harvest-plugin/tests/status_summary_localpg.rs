@@ -176,7 +176,7 @@ async fn seed_running_execution(url: &str, shard: i32) -> Uuid {
         workflow_id: &wf_id,
         run_id: Uuid::new_v4(),
         shard_id: shard,
-        input: serde_json::json!({}),
+        input: serde_json::json!({}).into(),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,

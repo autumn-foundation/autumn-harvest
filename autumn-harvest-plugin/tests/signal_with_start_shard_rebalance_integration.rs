@@ -244,7 +244,7 @@ async fn seed_with_state(
             workflow_name: "onboarding",
             workflow_id,
             exec_id,
-            input: json!({}),
+            input: json!({}).into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,

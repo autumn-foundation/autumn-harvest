@@ -6133,6 +6133,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
+name = "standalone-quickstart"
+version = "0.1.0"
+dependencies = [
+ "autumn-harvest",
+ "autumn-harvest-plugin",
+ "autumn-web",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "standalone-runner"
 version = "0.6.0"
 dependencies = [

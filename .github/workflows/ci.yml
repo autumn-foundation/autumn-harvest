@@ -44,6 +44,7 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     outputs:
       code: ${{ steps.filter.outputs.code }}
+      chapter: ${{ steps.filter.outputs.chapter }}
       # Resolved base revision, exported so the issue #794 schema gate can
       # compare the checked-in artifact against its PREVIOUS revision. This job
       # is the only one with `fetch-depth: 0`, so it is the only place the base
@@ -95,6 +96,13 @@ jobs:
             echo "code=true" >> "$GITHUB_OUTPUT"
           else
             echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
+          # Issue #1614: a docs-only change to the standalone chapter, its
+          # reference or its crate still runs the `standalone-chapter` job.
+          if echo "$changed" | grep -qE '^(docs/embedding\.md|docs/getting-started/(standalone-axum|02-first-workflow)\.md|examples/standalone-quickstart/|scripts/run-standalone-chapter\.sh)'; then
+            echo "chapter=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "chapter=false" >> "$GITHUB_OUTPUT"
           fi
 
   lint:
@@ -407,6 +415,8 @@ jobs:
         run: cargo clippy -p billing-autumn-web --all-targets -- -D warnings
       - name: Clippy standalone-runner example
         run: cargo clippy -p standalone-runner --all-targets -- -D warnings
+      - name: "Clippy standalone-quickstart example (issue #1614)"
+        run: cargo clippy -p standalone-quickstart --all-targets -- -D warnings
       # Same issue #962 rule as the verify and redis crates below: a new
       # workspace member gets NO clippy coverage without its own step here.
       # `--no-deps` scopes the deny to the example, because it depends on
@@ -586,6 +596,14 @@ jobs:
       # hand. Pure Python stdlib, no deps, no network.
       - name: Quota-lock-ordering clone-class sync (docs/audits/quota-lock-ordering-sync.py)
         run: python3 docs/audits/quota-lock-ordering-sync.py
+
+      # Issue #1614: the standalone getting-started chapter shows the files of
+      # examples/standalone-quickstart byte for byte, and keeps the markers
+      # that the `standalone-chapter` job runs.
+      - name: Standalone chapter sync (docs/audits/standalone-chapter-sync.py)
+        run: |
+          python3 docs/audits/standalone-chapter-sync.py --self-test
+          python3 docs/audits/standalone-chapter-sync.py
 
       # Folio corpus harness: Rust syntax check for every ```rust fence in
       # docs/getting-started/*.md and README.md (see
@@ -987,6 +1005,9 @@ jobs:
       - name: Run standalone-runner example tests
         if: needs.changes.outputs.code == 'true' && matrix.shard == 2
         run: cargo test -p standalone-runner --bins
+      - name: "Run standalone-quickstart example tests (issue #1614)"
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 1
+        run: cargo test -p standalone-quickstart
       - name: Run business_metrics example tests (issue #758)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 0
         run: cargo test -p autumn-harvest --no-default-features --features testing --example business_metrics
@@ -1520,6 +1541,53 @@ jobs:
           done
           echo "::error::workflow did not reach COMPLETED within the timeout"; exit 1
 
+  standalone-chapter:
+    name: "Standalone chapter runs as written (issue #1614)"
+    needs: changes
+    # Draft-skip (see lint). A code change runs this job. A docs-only change
+    # runs it only when it touches the chapter, its reference or its crate.
+    if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      (needs.changes.outputs.code == 'true' || needs.changes.outputs.chapter == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # Matches examples/standalone-quickstart/compose.yaml, so the chapter's
+    # DATABASE_URL connects as written.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: harvest
+          POSTGRES_PASSWORD: harvest
+          POSTGRES_DB: harvest
+        ports:
+          - 5435:5432
+        options: >-
+          --health-cmd "pg_isready -U harvest"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # One package per command. The chapter runs each with `cargo run -p`,
+      # and a joint build resolves other features, so it would not be reused.
+      - name: Build the chapter's crate and the CLI
+        run: |
+          cargo build -p autumn-harvest-cli
+          cargo build -p standalone-quickstart
+      - name: Run the bash blocks of docs/getting-started/standalone-axum.md
+        run: ./scripts/run-standalone-chapter.sh
+      # The `docs/embedding.md` Rust fences compile as doctests. This job, not
+      # `lint`, runs them, because it already builds the plugin. A filter that
+      # matches nothing passes with "0 passed", so the step requires a pass.
+      - name: Compile the docs/embedding.md Rust blocks as doctests
+        run: |
+          set -o pipefail
+          cargo test -p autumn-harvest-plugin --features metrics,webhooks --doc EmbeddingDocSnippets 2>&1 | tee embedding-doctests.log
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed' embedding-doctests.log
+
   openapi-client-smoke:
     name: Generated TypeScript client drives a running plugin
     # IMPORTANT -- not yet enforced. Branch protection matches required checks
@@ -1705,6 +1773,12 @@ jobs:
       (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
       needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
+    # `rust-toolchain.toml` pins the workspace to the current stable release,
+    # and rustup gives that file precedence over the `rustup default` the
+    # action sets. The environment variable outranks the file, so every
+    # cargo call in this job really compiles with the MSRV.
+    env:
+      RUSTUP_TOOLCHAIN: 1.88.0
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88.0

@@ -325,14 +325,16 @@ for a compile-checked polling loop that works with and without the `db` feature.
 Use `autumn-harvest-plugin` if you're building an Autumn app. For a non-web
 context — a worker or CLI process with no HTTP surface at all — use the bare
 `autumn-harvest` crate directly; it is the executor and storage layer, with
-no framework dependency of its own. To expose the management API (and, for
-the Vantage UI, `harvest_ui_router`) from a Rust service on plain Axum
-instead of autumn-web, mount `autumn-harvest-plugin`'s `harvest_api_router`
-yourself. [`examples/standalone-runner`](examples/standalone-runner/)
-mounts both routers through `HarvestEmbedding`. Its `Cargo.toml` has no
-`autumn-web` entry. Both routers return
-`axum::Router<()>`, so this path is for Axum services, not an arbitrary
-framework.
+no framework dependency of its own. To run Harvest and serve the management
+API and Vantage from a Rust service on plain Axum instead of autumn-web, use
+`HarvestEmbedding`. Start with the getting-started fork,
+[The first workflow on plain Axum](docs/getting-started/standalone-axum.md).
+[`docs/embedding.md`](docs/embedding.md) is the reference: auth, metrics,
+webhooks, shutdown, and what is not available off the plugin path.
+[`examples/standalone-runner`](examples/standalone-runner/) is the larger
+example of that path. Its `Cargo.toml` has no `autumn-web` entry. The
+router is `axum::Router<()>`, so this path is for Axum services, not an
+arbitrary framework.
 
 ## CLI
 
@@ -1054,7 +1056,10 @@ The embedded Vantage UI (`harvest_ui_router`, typically mounted at `/api/harvest
 
 ## Requirements
 
-- Rust 1.88.0 or newer (MSRV)
+- Rust 1.88.0 or newer (MSRV). A checkout of this repository builds with the
+  release pinned in `rust-toolchain.toml` (currently 1.99.0); `rustup`
+  installs it on the first `cargo` call. CI uses the same pin, so a new
+  stable release changes CI only when that file changes.
 - Postgres 12+ — except for `cargo dev`, whose `dev-runtime-managed` tier
   downloads one for you
 - The `db` feature is enabled by default and pulls Diesel + diesel-async; build

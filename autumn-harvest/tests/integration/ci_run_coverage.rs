@@ -28,7 +28,7 @@
 //! run then executes nothing). Every DB-gated test must either have a covering
 //! `linux`/`allos` manifest row or be listed — with a reason — in `ALLOWLIST`.
 //! `ALLOWLIST` is fail-closed debt to SHRINK by adding manifest rows, not to
-//! grow (a soft ratchet caps its length below).
+//! grow. A hard ratchet holds its cap equal to its length (see below).
 //!
 //! A NEW assertion guards against the manifest being silently ignored: `ci.yml`
 //! must actually invoke the runner against the manifest, else the guard would
@@ -135,22 +135,6 @@ fn all_tests_ignored(source: &str) -> bool {
     tests > 0 && ignored >= tests
 }
 
-/// Whether a file's own leading `#![cfg(...)]` gates it on `feature = "testing"`.
-/// The dominant convention is a file-level `#![cfg(...)]` with a plain `mod X;`
-/// in `mod.rs`, so the covering-run `--features testing` requirement must be
-/// read from the file, not only from the `mod.rs` cfg line. The two are combined
-/// (unioned) by the caller — either gate requiring testing means the run must
-/// carry it — so the `mod.rs`-gated `all(testing, db)` submodules stay correct.
-fn file_requires_testing(source: &str) -> bool {
-    source
-        .lines()
-        .take_while(|l| {
-            let t = l.trim_start();
-            t.starts_with("#![") || t.starts_with("//") || t.is_empty()
-        })
-        .any(|l| l.trim_start().starts_with("#![cfg") && l.contains("feature = \"testing\""))
-}
-
 /// Meta-test files that are not DB tests but mention the classifier tokens as
 /// string literals (this guard defines `LIVE_DB_TOKENS`), so they'd otherwise
 /// be misclassified as needing a live DB.
@@ -178,10 +162,10 @@ fn is_db_harness_only(source: &str) -> bool {
 //
 // Keyed `core:<module>` / `plugin:<file-stem>`. Every entry carries a reason.
 // Seeded fail-closed with the tests that currently lack a covering manifest row
-// so the guard is green on commit. SHRINK this by adding manifest rows; the
-// ratchet below forbids silent growth. This guard PROVED it bites: during
-// development `nd_block_tests` was left out and the guard failed naming it (the
-// TDD red step). `nd_block_tests`, `worker_session_tests`, and the plugin
+// so the guard is green on commit. SHRINK this by adding manifest rows. The
+// ratchet below forbids silent growth. An entry that a row covers is stale.
+// This guard PROVED it bites: during development `nd_block_tests` was left
+// out and the guard failed naming it (the TDD red step). `nd_block_tests`, `worker_session_tests`, and the plugin
 // `build_ramp_integration` suites are wired (they have `linux` manifest rows),
 // so they are no longer here.
 
@@ -226,26 +210,20 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ("core:chaos_tests", ALLOWLIST_CHAOS_REASON),
     ("core:child_policy_tests", ALLOWLIST_DEBT_REASON),
     ("core:cross_workflow_cancel_tests", ALLOWLIST_DEBT_REASON),
-    ("core:cross_workflow_signal_tests", ALLOWLIST_DEBT_REASON),
     ("core:debounce_tests", ALLOWLIST_DEBT_REASON),
     ("core:delayed_start_tests", ALLOWLIST_DEBT_REASON),
     ("core:legal_hold_tests", ALLOWLIST_DEBT_REASON),
     ("core:payload_offload_db_tests", ALLOWLIST_DEBT_REASON),
-    ("core:poison_pill_tests", ALLOWLIST_DEBT_REASON),
     ("core:queue_fairness_tests", ALLOWLIST_DEBT_REASON),
     ("core:replay_canary_tests", ALLOWLIST_TESTING_REASON),
-    ("core:replayer_integration_tests", ALLOWLIST_TESTING_REASON),
     ("core:retry_now_tests", ALLOWLIST_DEBT_REASON),
     ("core:schedule_decisions", ALLOWLIST_DEBT_REASON),
     ("core:schedule_to_close_tests", ALLOWLIST_DEBT_REASON),
     ("core:schedule_update_tests", ALLOWLIST_DEBT_REASON),
     ("core:scheduled_time_tests", ALLOWLIST_TESTING_REASON),
-    ("core:scheduler_auto_pause_tests", ALLOWLIST_DEBT_REASON),
     ("core:scheduler_bounded_runs_tests", ALLOWLIST_DEBT_REASON),
     ("core:scheduler_carryover_tests", ALLOWLIST_TESTING_REASON),
     ("core:scheduler_catchup_tests", ALLOWLIST_DEBT_REASON),
-    ("core:scheduler_ha_tests", ALLOWLIST_DEBT_REASON),
-    ("core:signal_tests", ALLOWLIST_DEBT_REASON),
     ("core:signal_with_start_tests", ALLOWLIST_DEBT_REASON),
     ("core:sla_breach_tests", ALLOWLIST_DEBT_REASON),
     ("core:sticky_routing_tests", ALLOWLIST_DEBT_REASON),
@@ -256,14 +234,12 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ("core:updt_with_start_tests", ALLOWLIST_DEBT_REASON),
     // ── plugin (autumn-harvest-plugin/tests) ──
     ("plugin:archival_integration", ALLOWLIST_DEBT_REASON),
-    ("plugin:batch_operations_integration", ALLOWLIST_DEBT_REASON),
     ("plugin:build_routing_ui_integration", ALLOWLIST_DEBT_REASON),
     (
         "plugin:connector_kafka_broker",
         ALLOWLIST_KAFKA_BROKER_REASON,
     ),
     ("plugin:dag_retry_integration", ALLOWLIST_DEBT_REASON),
-    ("plugin:erase_payloads_integration", ALLOWLIST_DEBT_REASON),
     ("plugin:event_batch_integration", ALLOWLIST_DEBT_REASON),
     (
         "plugin:external_handoffs_integration",
@@ -307,18 +283,22 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ("plugin:workflow_result_integration", ALLOWLIST_DEBT_REASON),
 ];
 
-/// Soft ratchet: the allowlist may shrink but must never silently grow. Bump
-/// this ONLY with a deliberate justification (it should trend toward zero).
-/// 74 = the prior 77 minus the three wired to covering `linux` manifest rows
-/// (each was a test-harness bug, now fixed, so the whole module runs green):
-/// `core:workflow_retry_tests` (its `::workflow_typed` sub-filter is replaced by
-/// a whole-module row), `core:completion_callback_tests`, and
-/// `core:event_batch_tests`. 73 = minus `plugin:workflow_reachability_integration`,
-/// now wired to a covering `linux` manifest row (issue #700).
-/// 75 = plus `core:chaos_tests` (issue #940). It runs in the nightly
-/// `.github/workflows/chaos.yml` job, not in the manifest `test` job.
-/// `chaos_workflow_runs_the_chaos_suite_nightly` checks that claim.
-const ALLOWLIST_MAX_LEN: usize = 75;
+/// Hard ratchet: the cap must equal `ALLOWLIST.len()` (issue #1799).
+///
+/// When you wire a suite, remove its entry and lower this number. To add an
+/// entry, raise this number in the same change and give the reason there.
+/// A cap above the length would let the list grow back without review.
+///
+/// History: 77, then 74. Three test-harness bugs were fixed, and three
+/// suites were wired: `core:workflow_retry_tests`,
+/// `core:completion_callback_tests` and `core:event_batch_tests`. A
+/// whole-module row replaced the `::workflow_typed` sub-filter of the first.
+/// Then 73 with `plugin:workflow_reachability_integration` (issue #700).
+/// Then 75 with `core:chaos_tests` (issue #940), which runs nightly in
+/// `chaos.yml`.
+/// Then 55: issue #1799 wired five suites. It also removed three entries
+/// for suites that CI already ran.
+const ALLOWLIST_MAX_LEN: usize = 55;
 
 fn allowlisted(key: &str) -> bool {
     ALLOWLIST.iter().any(|&(k, _)| k == key)
@@ -432,11 +412,10 @@ fn parse_manifest() -> Vec<SuiteRow> {
 
 // ── Core coverage ───────────────────────────────────────────────────────────
 
-/// A core `integration` submodule is covered iff some executing (`linux`/`allos`)
-/// manifest row enables `db` (so the module compiles + its tests exist), carries
-/// `testing` when the module needs it, and targets it whole (a whole-target run,
-/// or a filter whose first `::`-segment prefixes the module name — a partial
-/// `module::test` filter never credits the whole module).
+/// A core `integration` submodule is covered when one executing row meets
+/// three conditions. The row is `linux` or `allos` and enables `db`. It
+/// enables every other feature in `required`, so the module compiles. Its
+/// filter selects the whole module (see [`filter_runs_whole_module`]).
 ///
 /// `autumn-harvest` has `default = ["db", "unified-dag-execution", "tls"]`; the runner
 /// keeps defaults for `linux`/`linuxpart` integration rows (Docker Postgres) and strips them
@@ -444,37 +423,29 @@ fn parse_manifest() -> Vec<SuiteRow> {
 /// `linux` integration row always has `db`; an `allos` integration row has it
 /// only if it lists it explicitly. `testing` is never a default, so it must be
 /// listed regardless of osclass.
-fn core_covers(rows: &[SuiteRow], module: &str, needs_testing: bool) -> bool {
-    rows.iter().any(|r| {
-        if r.krate != "autumn-harvest" || r.target != "integration" || !r.runs() {
-            return false;
-        }
-        let feats = r.feature_set();
-        let has_db = r.is_live_db() || feats.contains("db");
-        let has_testing = feats.contains("testing");
-        if !has_db {
-            return false;
-        }
-        if needs_testing && !has_testing {
-            return false;
-        }
-        if r.filter == "-" {
-            return true; // whole target
-        }
-        if r.filter.contains("::") {
-            return false; // partial slice — no whole-module credit
-        }
-        // No `::` here (guarded above), so the whole filter is the module segment.
-        let seg = r.filter.as_str();
-        module == seg || module.starts_with(seg)
-    })
+fn core_covers(rows: &[SuiteRow], module: &str, required: &BTreeSet<String>) -> bool {
+    let mut with_db = required.clone();
+    with_db.insert("db".to_string());
+    core_module_executes(rows, module, &with_db)
 }
 
-// ── mod.rs parsing: (module, needs_testing) ─────────────────────────────────
+/// True when a row with `filter` runs every test in `module`.
+///
+/// libtest matches a filter as a substring of the full test path
+/// (`module::test_fn`). A filter that occurs in the module name thus selects
+/// the whole module. A `module::test` filter can select a slice. A module
+/// name has no `::`, so such a filter never credits the whole module. `-`
+/// selects the whole target.
+fn filter_runs_whole_module(filter: &str, module: &str) -> bool {
+    filter == "-" || module.contains(filter)
+}
+
+// ── mod.rs parsing: (module, cfg line) ──────────────────────────────────────
 
 struct CoreModule {
     name: String,
-    needs_testing: bool,
+    /// The `#[cfg(...)]` line above `mod name;`, or an empty string.
+    cfg: String,
 }
 
 fn parse_core_modules() -> Vec<CoreModule> {
@@ -489,11 +460,7 @@ fn parse_core_modules() -> Vec<CoreModule> {
         if let Some(rest) = t.strip_prefix("mod ") {
             let name = rest.trim_end_matches(';').trim().to_string();
             let cfg = pending_cfg.take().unwrap_or_default();
-            let needs_testing = cfg.contains("feature = \"testing\"");
-            out.push(CoreModule {
-                name,
-                needs_testing,
-            });
+            out.push(CoreModule { name, cfg });
         } else if !t.is_empty() {
             // Any non-cfg, non-mod line clears a dangling cfg.
             pending_cfg = None;
@@ -641,8 +608,12 @@ fn subfilter_does_not_credit_whole_module() {
         filter: "workflow_retry_tests::workflow_typed".into(),
     }];
     assert!(
-        !core_covers(&sub, "workflow_retry_tests", false),
+        !core_covers(&sub, "workflow_retry_tests", &feats(&[])),
         "a `module::test` sub-filter must NOT credit the whole module as covered"
+    );
+    assert!(
+        !core_module_executes(&sub, "workflow_retry_tests", &feats(&[])),
+        "the feature-gate guard must not credit a sub-filter either"
     );
 
     // Whereas a whole-module filter DOES cover it.
@@ -654,8 +625,68 @@ fn subfilter_does_not_credit_whole_module() {
         filter: "workflow_retry_tests".into(),
     }];
     assert!(
-        core_covers(&whole, "workflow_retry_tests", false),
+        core_covers(&whole, "workflow_retry_tests", &feats(&[])),
         "a whole-module filter must credit the module"
+    );
+}
+
+/// A feature set built from string literals.
+fn feats(list: &[&str]) -> BTreeSet<String> {
+    list.iter().map(|f| (*f).to_string()).collect()
+}
+
+// ── A row covers a module only when it enables every feature gate ───────────
+
+/// A row without a module's feature compiles the module out, so it runs zero
+/// tests. Such a row must not credit the module. Otherwise the stale rule
+/// would force the removal of a valid allowlist entry.
+#[test]
+fn row_without_a_feature_gate_does_not_cover_the_module() {
+    let plain = vec![SuiteRow {
+        osclass: "linux".into(),
+        krate: "autumn-harvest".into(),
+        target: "integration".into(),
+        features: "-".into(),
+        filter: "chaos_tests".into(),
+    }];
+    assert!(
+        !core_covers(&plain, "chaos_tests", &feats(&["chaos"])),
+        "a row without `chaos` runs no `chaos_tests` test"
+    );
+    let gated = vec![SuiteRow {
+        features: "chaos".into(),
+        ..plain.into_iter().next().unwrap()
+    }];
+    assert!(core_covers(&gated, "chaos_tests", &feats(&["chaos"])));
+}
+
+// ── A filter credits every module that libtest runs with it ─────────────────
+
+/// libtest matches a filter as a substring of the full test path. A
+/// `pause_tests` row thus runs every test in `scheduler_auto_pause_tests`.
+/// The guard must credit what CI runs, so it matches by substring too.
+#[test]
+fn substring_filter_credits_every_module_it_runs() {
+    let rows = vec![SuiteRow {
+        osclass: "linux".into(),
+        krate: "autumn-harvest".into(),
+        target: "integration".into(),
+        features: "-".into(),
+        filter: "pause_tests".into(),
+    }];
+    assert!(core_covers(
+        &rows,
+        "scheduler_auto_pause_tests",
+        &feats(&[])
+    ));
+    assert!(core_module_executes(
+        &rows,
+        "scheduler_auto_pause_tests",
+        &BTreeSet::new()
+    ));
+    assert!(
+        !core_covers(&rows, "pause_test_helpers", &feats(&[])),
+        "a module whose name does not contain the filter is not run"
     );
 }
 
@@ -674,7 +705,7 @@ fn allos_row_without_db_does_not_cover_a_db_module() {
         filter: "-".into(),
     }];
     assert!(
-        !core_covers(&allos_no_db, "some_db_module", false),
+        !core_covers(&allos_no_db, "some_db_module", &feats(&[])),
         "an allos row without `db` (--no-default-features) must not cover a db-gated module"
     );
     // A `linux` row (defaults on ⇒ db) covers it.
@@ -685,7 +716,7 @@ fn allos_row_without_db_does_not_cover_a_db_module() {
         features: "-".into(),
         filter: "-".into(),
     }];
-    assert!(core_covers(&linux, "some_db_module", false));
+    assert!(core_covers(&linux, "some_db_module", &feats(&[])));
 }
 
 // ── Fail-CLOSED classifier & honesty about env-gated / no-DB HTTP tests ──────
@@ -797,12 +828,45 @@ fn claim_bench_support_is_classified_as_a_harness_not_a_suite() {
     );
 }
 
+/// Issue #1799 names five resilience suites that never ran in CI. Each must
+/// have a covering row and must not stay on the allowlist.
+#[test]
+fn issue_1799_suites_have_covering_rows() {
+    let rows = parse_manifest();
+    for (module, required) in [
+        ("scheduler_ha_tests", &[][..]),
+        ("poison_pill_tests", &[]),
+        ("signal_tests", &[]),
+        ("replayer_integration_tests", &["testing"]),
+    ] {
+        assert!(
+            core_covers(&rows, module, &feats(required)),
+            "core:{module} needs a covering `linux` manifest row"
+        );
+        assert!(
+            !allowlisted(&format!("core:{module}")),
+            "core:{module} is wired; remove its ALLOWLIST entry and lower ALLOWLIST_MAX_LEN"
+        );
+    }
+    let stem = "erase_payloads_integration";
+    let required =
+        plugin_required_features(&read_source(&plugin_tests_dir().join(format!("{stem}.rs"))));
+    assert!(
+        plugin_covered(&rows, stem, &required),
+        "plugin:{stem} needs a covering `linux` manifest row"
+    );
+    assert!(
+        !allowlisted(&format!("plugin:{stem}")),
+        "plugin:{stem} is wired; remove its ALLOWLIST entry and lower ALLOWLIST_MAX_LEN"
+    );
+}
+
 #[test]
 fn claim_budget_gate_has_a_covering_manifest_row() {
     // The gate is the whole point of issue #786; it must actually run in CI.
     let rows = parse_manifest();
     assert!(
-        core_covers(&rows, "claim_budget_tests", false),
+        core_covers(&rows, "claim_budget_tests", &feats(&[])),
         "the claim-path budget gate must have a covering `linux` manifest row —          a performance gate that never runs is not a gate"
     );
 }
@@ -847,16 +911,20 @@ fn strip_line_comments_drops_prose_container_tokens() {
 }
 
 #[test]
-fn file_requires_testing_reads_leading_file_cfg() {
-    assert!(file_requires_testing(
-        "#![cfg(all(feature = \"db\", feature = \"testing\"))]\nfn a() {}"
-    ));
-    assert!(file_requires_testing("#![cfg(feature = \"testing\")]\n"));
-    assert!(!file_requires_testing("#![cfg(feature = \"db\")]\n"));
-    // A mid-file `#[cfg(feature = \"testing\")]` on some item is not a file gate.
-    assert!(!file_requires_testing(
-        "use x;\n#[cfg(feature = \"testing\")]\nfn a() {}"
-    ));
+fn core_required_features_reads_mod_cfg_and_file_cfg() {
+    let file_gate = "#![cfg(all(feature = \"db\", feature = \"testing\"))]\nfn a() {}";
+    assert_eq!(core_required_features("", file_gate), feats(&["testing"]));
+    let mod_gate = "#[cfg(all(feature = \"testing\", feature = \"db\"))]";
+    assert_eq!(core_required_features(mod_gate, ""), feats(&["testing"]));
+    assert_eq!(
+        core_required_features("", "#![cfg(feature = \"db\")]\n"),
+        feats(&[])
+    );
+    // A mid-file `#[cfg(feature = "testing")]` on an item is not a file gate.
+    assert_eq!(
+        core_required_features("", "use x;\n#[cfg(feature = \"testing\")]\nfn a() {}"),
+        feats(&[])
+    );
 }
 
 // ── The manifest must actually be executed by CI ─────────────────────────────
@@ -922,6 +990,8 @@ fn every_db_gated_test_has_a_ci_run_step_or_is_allowlisted() {
     // Track which allowlist keys correspond to a real, still-DB-gated test, so
     // stale entries (test deleted or de-DB-ified) are surfaced.
     let mut live_db_keys: BTreeSet<String> = BTreeSet::new();
+    // Keys that a manifest row covers. An allowlist entry for one is stale.
+    let mut covered_keys: BTreeSet<String> = BTreeSet::new();
 
     // Core: mod.rs is the source of truth for which suites exist + their cfg.
     for m in parse_core_modules() {
@@ -944,25 +1014,25 @@ fn every_db_gated_test_has_a_ci_run_step_or_is_allowlisted() {
         }
         let key = format!("core:{}", m.name);
         live_db_keys.insert(key.clone());
-        // The covering-run `--features testing` requirement is the UNION of the
-        // `mod.rs` cfg and the file's own leading `#![cfg]` (either gate requiring
-        // testing means the run must carry it). This keeps the `mod.rs`-only
-        // `all(testing, db)` submodules correct while also picking up file-level
-        // `#![cfg(feature = "testing")]` on plain-`mod` files.
-        let needs_testing = m.needs_testing || file_requires_testing(&src);
-        // A covering run can't credit a target whose tests are all `#[ignore]`d —
-        // it would execute nothing.
-        let covered = core_covers(&rows, &m.name, needs_testing) && !all_tests_ignored(&src);
+        // The covering row must enable every feature the module needs. They
+        // come from the `mod.rs` cfg line and the file's own `#![cfg]`.
+        let required = core_required_features(&m.cfg, &src);
+        let covered = core_covers(&rows, &m.name, &required) && !all_tests_ignored(&src);
         if covered {
+            covered_keys.insert(key);
             continue;
         }
         if allowlisted(&key) {
             continue;
         }
+        let feats = if required.is_empty() {
+            "-".to_string()
+        } else {
+            required.into_iter().collect::<Vec<_>>().join(",")
+        };
         uncovered.push(format!(
-            "{key} (add manifest line `linux  autumn-harvest  integration  {}  {}` to \
+            "{key} (add manifest line `linux  autumn-harvest  integration  {feats}  {}` to \
              .github/ci/integration-suites.txt)",
-            if needs_testing { "testing" } else { "-" },
             m.name
         ));
     }
@@ -991,6 +1061,7 @@ fn every_db_gated_test_has_a_ci_run_step_or_is_allowlisted() {
         // nothing — so force it uncovered (→ must be allowlisted).
         let covered = plugin_covered(&rows, &stem, &req) && !all_tests_ignored(&src);
         if covered {
+            covered_keys.insert(key);
             continue;
         }
         if allowlisted(&key) {
@@ -1007,13 +1078,8 @@ fn every_db_gated_test_has_a_ci_run_step_or_is_allowlisted() {
         ));
     }
 
-    // Stale-allowlist check: every allowlisted key must still name a real,
-    // DB-gated test (otherwise the debt entry is dead and should be removed).
-    let mut stale: Vec<&str> = ALLOWLIST
-        .iter()
-        .map(|&(k, _)| k)
-        .filter(|k| !live_db_keys.contains(*k))
-        .collect();
+    let keys: Vec<&str> = ALLOWLIST.iter().map(|&(k, _)| k).collect();
+    let mut stale = stale_allowlist_keys(&keys, &live_db_keys, &covered_keys);
     stale.sort_unstable();
 
     assert!(
@@ -1025,18 +1091,45 @@ fn every_db_gated_test_has_a_ci_run_step_or_is_allowlisted() {
     );
     assert!(
         stale.is_empty(),
-        "ALLOWLIST has stale entries (test deleted or no longer DB-gated) — remove them:\n  {}",
+        "ALLOWLIST has stale entries (test deleted, no longer DB-gated, or now covered by a \
+         manifest row) — remove them and lower ALLOWLIST_MAX_LEN:\n  {}",
         stale.join("\n  ")
     );
 }
 
+/// Allowlist keys that are dead debt. A key is stale when it names no live
+/// DB-gated suite, or when a manifest row already covers that suite.
+fn stale_allowlist_keys<'a>(
+    keys: &[&'a str],
+    live: &BTreeSet<String>,
+    covered: &BTreeSet<String>,
+) -> Vec<&'a str> {
+    keys.iter()
+        .copied()
+        .filter(|k| !live.contains(*k) || covered.contains(*k))
+        .collect()
+}
+
 #[test]
-fn allowlist_does_not_grow_silently() {
-    assert!(
-        ALLOWLIST.len() <= ALLOWLIST_MAX_LEN,
-        "ALLOWLIST grew to {} entries (cap {ALLOWLIST_MAX_LEN}). It is technical debt to SHRINK \
-         by adding manifest rows, not to grow. If a new DB test genuinely cannot run in CI yet, \
-         raise the cap deliberately with justification.",
+fn covered_or_dead_allowlist_keys_are_stale() {
+    let live = feats(&["core:covered", "core:debt"]);
+    let covered = feats(&["core:covered"]);
+    let keys = ["core:covered", "core:debt", "core:deleted"];
+    assert_eq!(
+        stale_allowlist_keys(&keys, &live, &covered),
+        ["core:covered", "core:deleted"],
+        "a covered suite and a deleted suite are stale; a live, uncovered suite is debt"
+    );
+}
+
+#[test]
+fn allowlist_cap_equals_its_length() {
+    assert_eq!(
+        ALLOWLIST.len(),
+        ALLOWLIST_MAX_LEN,
+        "ALLOWLIST has {} entries but ALLOWLIST_MAX_LEN is {ALLOWLIST_MAX_LEN}. The cap must equal \
+         the length, so the list cannot grow back. When you remove an entry, lower the cap to match. \
+         To add an entry, raise the cap and give the reason in the same change.",
         ALLOWLIST.len()
     );
 }
@@ -1095,7 +1188,7 @@ fn core_module_executes(rows: &[SuiteRow], module: &str, required: &BTreeSet<Str
         if r.krate != "autumn-harvest" || r.target != "integration" || !r.runs() {
             return false;
         }
-        if !(r.filter == "-" || (!r.filter.contains("::") && module.starts_with(&r.filter))) {
+        if !filter_runs_whole_module(&r.filter, module) {
             return false;
         }
         let feats = core_row_features(r);

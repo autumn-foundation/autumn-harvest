@@ -257,7 +257,7 @@ async fn start_one(url: &str, n: usize) -> ExecutionId {
             workflow_name: "held_workflow",
             workflow_id: &workflow_id,
             exec_id,
-            input: json!({ "n": n }),
+            input: json!({ "n": n }).into(),
             parent_id: None,
             queue_name: TEST_QUEUE,
             execution_timeout: None,

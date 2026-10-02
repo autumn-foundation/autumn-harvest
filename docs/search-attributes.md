@@ -29,7 +29,7 @@ start_or_load_workflow_execution(
         workflow_name: "onboarding",
         workflow_id: format!("onboarding-{tenant_id}"),
         exec_id: ExecutionId::new_for_shard(shard_id),
-        input: serde_json::json!({ "user_id": user_id }),
+        input: serde_json::json!({ "user_id": user_id }).into(),
         search_attrs: Some(serde_json::json!({
             "tenant": tenant_id,
             "plan": "growth",
