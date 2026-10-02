@@ -436,6 +436,17 @@ fn unique_queue(prefix: &str) -> String {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// When [`run_failing_window`] closes its window.
+#[derive(Clone, Copy)]
+enum Window {
+    /// After a fixed time.
+    Fixed(Duration),
+    /// When the retries pass `factor` times the default budget. The run
+    /// panics if that does not occur before `deadline`. A slow, loaded
+    /// host then makes the run longer, not wrong.
+    PastBudget { factor: f64, deadline: Duration },
+}
+
 /// What one run of [`run_failing_window`] observed.
 struct WindowRun {
     /// Attempts the handler saw when the window closed.
@@ -449,14 +460,15 @@ struct WindowRun {
 }
 
 /// Run `workflows` workflows that call `activity`, which always fails. Wait
-/// until every first attempt ran, then keep the worker running for `window`.
+/// until every first attempt ran, then keep the worker running until `window`
+/// closes.
 async fn run_failing_window(
     url: &str,
     queue: &str,
     activity: ActivityInfo,
     budget: Option<RetryBudgetConfig>,
     workflows: u32,
-    window: Duration,
+    window: Window,
 ) -> WindowRun {
     let name = activity.name;
     let metrics = Arc::new(BudgetMetrics::default());
@@ -482,7 +494,17 @@ async fn run_failing_window(
         attempts(name).first >= workflows
     })
     .await;
-    tokio::time::sleep(window).await;
+    match window {
+        Window::Fixed(window) => tokio::time::sleep(window).await,
+        Window::PastBudget { factor, deadline } => {
+            wait_until("retries past the default budget", deadline, || async {
+                let seen = attempts(name);
+                let budget = default_budget(seen.first, started.elapsed().as_secs_f64());
+                f64::from(seen.retries) > budget * factor
+            })
+            .await;
+        }
+    }
     let seen = attempts(name);
     let elapsed = started.elapsed().as_secs_f64();
     worker.shutdown();
@@ -531,7 +553,7 @@ async fn retry_rate_stays_within_the_default_budget_when_one_type_always_fails()
         act_info(ACTIVITY, always_fails),
         None,
         WORKFLOWS,
-        Duration::from_secs(3),
+        Window::Fixed(Duration::from_secs(3)),
     )
     .await;
     let seen = run.seen;
@@ -603,7 +625,10 @@ async fn disabled_budget_never_defers() {
         act_info(ACTIVITY, always_fails),
         Some(RetryBudgetConfig::disabled()),
         20,
-        Duration::from_secs(2),
+        Window::PastBudget {
+            factor: 2.0,
+            deadline: Duration::from_secs(30),
+        },
     )
     .await;
 
@@ -612,10 +637,12 @@ async fn disabled_budget_never_defers() {
         0,
         "no deferral when disabled"
     );
+    // The window closed at twice the budget. The budget at the snapshot is
+    // a little larger, so this check asks only for an excess over it.
     let budget = default_budget(run.seen.first, run.elapsed);
     assert!(
-        f64::from(run.seen.retries) > budget * 2.0,
-        "{} retries ran; without a budget the count must exceed {budget:.1} by far",
+        f64::from(run.seen.retries) > budget,
+        "{} retries ran; without a budget the count must exceed {budget:.1}",
         run.seen.retries
     );
 }
@@ -635,7 +662,15 @@ async fn budget_deferral_refunds_the_claim_time_rate_limit_token() {
     activity.rate_limit_rps = Some(0.000_001);
     activity.rate_limit_burst = Some(BURST);
     activity.rate_limit_key = Some(key);
-    let run = run_failing_window(&url, &queue, activity, None, 20, Duration::from_secs(3)).await;
+    let run = run_failing_window(
+        &url,
+        &queue,
+        activity,
+        None,
+        20,
+        Window::Fixed(Duration::from_secs(3)),
+    )
+    .await;
     assert!(run.metrics.exhausted(ACTIVITY) > 0, "the budget must defer");
 
     let mut conn = connect(&url).await;
