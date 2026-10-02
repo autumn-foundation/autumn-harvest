@@ -5650,3 +5650,77 @@ async fn the_operator_remedy_replaces_an_invalid_index() {
         .expect("create");
     assert_eq!(unexported_idx_state(&mut conn).await, Some(true));
 }
+
+/// The build connection must reproduce the pool's `search_path`. A tenant
+/// schema in the same database must get its own index, not `public`'s.
+#[tokio::test]
+async fn the_build_follows_the_pools_search_path() {
+    let _guard = TEST_SERIAL.lock().await;
+    let sink = install(Arc::new(RecordingSink::new(200)), 100);
+    let (mut conn, url, _c) = make_conn_any().await;
+    conn.batch_execute(&format!(
+        "CREATE SCHEMA tenant; SET search_path = tenant; {} RESET search_path;",
+        autumn_harvest::full_migrations_sql()
+    ))
+    .await
+    .expect("tenant schema");
+    conn.batch_execute("SET search_path = tenant")
+        .await
+        .expect("search path");
+    insert_audit_rows(&mut conn, 3).await;
+    conn.batch_execute("RESET search_path")
+        .await
+        .expect("reset");
+    // The pool selects the tenant schema. The build URL does not.
+    let sep = if url.contains('?') { '&' } else { '?' };
+    let pool_url = format!("{url}{sep}options=-c%20search_path%3Dtenant");
+    let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+        diesel_async::AsyncPgConnection,
+    >::new(pool_url);
+    let pool = autumn_harvest::worker::DbPool::builder(manager)
+        .max_size(2)
+        .build()
+        .expect("pool");
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let handle = autumn_harvest::audit_export::spawn_audit_export_checker_for_shard(
+        pool,
+        cancel.clone(),
+        std::time::Duration::from_millis(20),
+        Arc::new(autumn_harvest::telemetry::TelemetryConfig::default()),
+        Some(ShardId::new(0)),
+        None,
+        Some(url),
+    );
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let rows: Vec<Count> = diesel::sql_query(
+            "SELECT count(*) AS n FROM pg_indexes \
+             WHERE schemaname = 'tenant' AND indexname = 'harvest_audit_log_unexported_idx'",
+        )
+        .load(&mut conn)
+        .await
+        .expect("count");
+        if rows.into_iter().next().is_some_and(|r| r.n == 1) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the tenant schema must get the index"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let _ = sink;
+    cancel.cancel();
+    let _ = handle.await;
+    uninstall();
+    assert_eq!(
+        unexported_idx_state(&mut conn).await,
+        None,
+        "public stays untouched"
+    );
+}

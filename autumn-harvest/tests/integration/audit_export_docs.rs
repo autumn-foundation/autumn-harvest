@@ -460,3 +460,24 @@ fn prose_says_the_index_is_built_lazily() {
         );
     }
 }
+
+/// Issue #1667: rolling back must not take a long table lock. An ordinary
+/// `CREATE INDEX` blocks audit writes for the whole build. The exporter
+/// rebuilds the index on demand, so the down migration restores nothing.
+#[test]
+fn the_lazy_migration_rollback_builds_no_index() {
+    let path = repo_root().join(
+        "autumn-harvest/migrations/20261001190405_harvest_audit_unexported_idx_lazy/down.sql",
+    );
+    let text = read_normalized(&path);
+    let code: String = text
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !code.to_uppercase().contains("CREATE INDEX"),
+        "{}: a rollback must not build the index inside the migration transaction",
+        path.display()
+    );
+}

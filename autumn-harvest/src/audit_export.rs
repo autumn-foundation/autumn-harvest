@@ -1306,6 +1306,10 @@ static INDEX_BUILD_GATE: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<BuildKey, std::time::Instant>>,
 > = std::sync::LazyLock::new(Default::default);
 
+/// Longest wait for the build connection to open.
+#[cfg(feature = "db")]
+const INDEX_BUILD_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Wait between repeats of an operator notice about the index.
 #[cfg(feature = "db")]
 const INDEX_NOTICE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
@@ -1441,10 +1445,30 @@ fn index_build_finished(key: &BuildKey, end: BuildEnd) {
 #[cfg(feature = "db")]
 async fn build_unexported_index_on_dedicated_connection(
     dsn: &str,
+    search_path: &str,
+    connect_timeout: std::time::Duration,
 ) -> crate::error::HarvestResult<UnexportedIndexOutcome> {
     use diesel_async::AsyncConnection;
+    use diesel_async::RunQueryDsl;
 
-    let mut conn = diesel_async::AsyncPgConnection::establish(dsn)
+    // A host can accept the socket and never finish the handshake. Without a
+    // bound, the stalled task outlives the retry gate and tasks pile up.
+    let mut conn = tokio::time::timeout(
+        connect_timeout,
+        diesel_async::AsyncPgConnection::establish(dsn),
+    )
+    .await
+    .map_err(|_| {
+        crate::error::HarvestError::Database(format!(
+            "connect to the index build URL timed out after {connect_timeout:?}"
+        ))
+    })?
+    .map_err(crate::error::database_error)?;
+    // The pool may select its relations through `search_path`. The build URL
+    // promises only connectivity, so copy the pool's setting.
+    diesel::sql_query("SELECT set_config('search_path', $1, false)")
+        .bind::<diesel::sql_types::Text, _>(search_path)
+        .execute(&mut conn)
         .await
         .map_err(crate::error::database_error)?;
     let outcome = ensure_unexported_index(&mut conn).await;
@@ -1452,6 +1476,29 @@ async fn build_unexported_index_on_dedicated_connection(
     // connection releases it either way.
     drop(conn);
     outcome
+}
+
+/// The `search_path` of the pool's own session.
+#[cfg(feature = "db")]
+async fn current_search_path(
+    conn: &mut diesel_async::AsyncPgConnection,
+) -> crate::error::HarvestResult<String> {
+    use diesel_async::RunQueryDsl;
+
+    #[derive(diesel::QueryableByName)]
+    struct Path {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        value: String,
+    }
+
+    let rows: Vec<Path> = diesel::sql_query("SELECT current_setting('search_path') AS value")
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(rows
+        .into_iter()
+        .next()
+        .map_or_else(|| "\"$user\", public".to_owned(), |row| row.value))
 }
 
 /// Start the index build in a detached task, off the export tick (issue #1667).
@@ -1516,11 +1563,23 @@ async fn spawn_unexported_index_build_if_due(
             return;
         }
     }
+    let search_path = match current_search_path(conn).await {
+        Ok(search_path) => search_path,
+        Err(error) => {
+            index_build_finished(&key, BuildEnd::Retry);
+            tracing::warn!(shard = shard_id, %error, "[audit_export] could not read the pool search_path");
+            return;
+        }
+    };
     let dsn = dsn.to_owned();
     let cancel = cancel.clone();
     tokio::spawn(async move {
         let end = tokio::select! {
-            result = build_unexported_index_on_dedicated_connection(&dsn) => match result {
+            result = build_unexported_index_on_dedicated_connection(
+                &dsn,
+                &search_path,
+                INDEX_BUILD_CONNECT_TIMEOUT,
+            ) => match result {
                 Ok(UnexportedIndexOutcome::Ready) => BuildEnd::Ready,
                 Ok(UnexportedIndexOutcome::LockBusy) => {
                     tracing::debug!(
@@ -4764,6 +4823,34 @@ mod tests {
             index_notice_due(&second),
             "another database with the same shard number is due"
         );
+    }
+
+    /// Issue #1667: a host that accepts the socket but never answers must not
+    /// hold the build task. The connect timeout turns the stall into an error.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn a_stalled_connect_ends_the_build_attempt() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let _holder = tokio::spawn(async move {
+            let Ok((_socket, _)) = listener.accept().await else {
+                return;
+            };
+            // Hold the socket open and never answer.
+            std::future::pending::<()>().await;
+        });
+        let dsn = format!("postgres://postgres@127.0.0.1:{port}/postgres");
+        let started = std::time::Instant::now();
+        let result = build_unexported_index_on_dedicated_connection(
+            &dsn,
+            "public",
+            std::time::Duration::from_millis(200),
+        )
+        .await;
+        assert!(result.is_err(), "a stalled connect must be an error");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
     /// Issue #1667: a privilege failure is the one error a retry cannot fix.
