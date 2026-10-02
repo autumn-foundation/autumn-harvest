@@ -1,6 +1,6 @@
 # Sticky Cross-Worker Routing
 
-Sticky routing is an opt-in performance feature that keeps follow-up workflow tasks on the worker that already has the execution's event history in its in-process LRU cache (issue #235).
+Sticky routing keeps follow-up workflow tasks on the worker that already has the execution's event history in its in-process LRU cache (issue #235). It is on by default with a 5 s window (issue #1798).
 
 ## Problem
 
@@ -18,7 +18,7 @@ On a cache hit the worker loads only the *delta* events appended since the last 
 
 ## Configuration
 
-Sticky routing is **off by default**. Enable it per-worker via `WorkerConfig::with_sticky_routing`:
+Sticky routing is **on by default**. `WorkerConfig::default()` sets `sticky_timeout` to `DEFAULT_STICKY_TIMEOUT` (5 s), the same fallback window that Temporal uses for its sticky queue. Change the window per worker with `WorkerConfig::with_sticky_routing`:
 
 ```rust
 use autumn_harvest::{StickyRoutingConfig, WorkerConfig};
@@ -32,12 +32,23 @@ let worker = WorkerConfig::default()
 
 `lease_ttl` controls how long a worker holds the affinity lease on an execution. After the TTL expires another worker may claim the task (a cache miss, which is always correct — it is just slower). See the operational recommendations below for guidance on sizing this value.
 
-To disable sticky routing after enabling it, pass `lease_ttl: Duration::ZERO`:
+To disable sticky routing, pass `lease_ttl: Duration::ZERO`. This also disables the warm workflow cache:
 
 ```rust
 let worker = WorkerConfig::default()
     .with_sticky_routing(StickyRoutingConfig { lease_ttl: Duration::ZERO });
 ```
+
+## Failover
+
+A pin never blocks progress for longer than one sticky window.
+
+- **Crash.** The pin stays until `sticky_until` passes. A peer then claims the task. With the default window, the next decision of each pinned execution waits up to 5 s.
+- **Graceful shutdown.** After the worker drains its in-flight tasks, it releases its pins before it marks itself `Stopped` (issue #1798). Peers claim the pending and parked tasks at once. The release keeps worker-session pins, because a session pin is a hard pin (issue #606).
+
+The release is best effort. If it fails, the pins expire after one sticky window. A decision that is still running when the drain times out can pin its task again when it parks. That pin also expires after one window.
+
+The release scans the parked rows of the task queue once per shutdown. Pending rows use the `idx_harvest_tq_sticky_poll` index.
 
 ## Metrics
 
@@ -48,7 +59,24 @@ let worker = WorkerConfig::default()
 
 Both metrics carry a `workflow` label (the workflow name). `execution.id` is deliberately excluded per ADR-0001 §7 (cardinality).
 
-Monitor the **hit ratio** (`cache_hit / (cache_hit + cache_miss)`) per worker. After enabling sticky routing, you should see this climb toward 1 for long-running workflows that suspend many times. A ratio that stays near 0 may indicate the lease TTL is shorter than the median inter-task delay.
+Monitor the **hit ratio** (`cache_hit / (cache_hit + cache_miss)`) per worker. With sticky routing on, you should see this climb toward 1 for long-running workflows that suspend many times. A ratio that stays near 0 may indicate the lease TTL is shorter than the median inter-task delay.
+
+## Decision cost
+
+Sticky routing makes the history load of a warm decision `O(new_events)`. The workflow still replays from the top on every decision, so the CPU cost of a decision still grows linearly with history length. The `decision_cost` and `decision_wall` groups in `autumn-harvest/benches/replay_bench.rs` measure this at 1k, 5k and 10k events:
+
+```sh
+cargo bench -p autumn-harvest --no-default-features --features testing \
+  --bench replay_bench -- decision_
+```
+
+| History | `decision_cost` (replay) | `decision_wall` (suspends) |
+|--------:|-------------------------:|---------------------------:|
+| 1,000 events | 0.10 ms | 101.6 ms |
+| 5,000 events | 0.56 ms | 101.7 ms |
+| 10,000 events | 1.13 ms | 101.9 ms |
+
+Measured on a 4-vCPU cloud container. Read the slope, not the absolute values. `decision_wall` adds the fixed 100 ms suspension wait that issue #1797 tracks. A cache that keeps the live workflow resident would make a warm decision roughly constant (issue #1798, step 2). That step depends on #1797.
 
 ## Cache eviction
 
@@ -66,8 +94,8 @@ The cache size is configured via `WorkerConfig::workflow_cache_size` (default: 1
 
 ## Operational recommendations
 
-- Enable sticky routing for workflows that suspend frequently (timer waits, fan-out/fan-in, multi-step human-in-the-loop).
+- Keep sticky routing on for workflows that suspend frequently (timer waits, fan-out/fan-in, multi-step human-in-the-loop).
 - For short-lived workflows that complete in a single task (no suspension), sticky routing has no effect — there is no follow-up task to benefit from the warm cache.
-- Set `lease_ttl` to 2-3× your median worker restart time. A value shorter than a typical deploy window will cause a burst of cold reloads during rolling restarts.
+- Keep `lease_ttl` short. A restarted worker starts with a cold cache, so a long window does not help a restart. A crash costs up to one window per pinned execution, and a graceful shutdown costs nothing.
 - **Timer duration vs. lease TTL**: the affinity lease is written when the workflow parks (`sticky_until = NOW() + lease_ttl`). If a timer fires *after* `sticky_until`, any worker can claim the follow-up task regardless of which worker set the pin. For timer-heavy workflows whose timers routinely exceed `lease_ttl`, set `lease_ttl` to at least the 95th-percentile timer duration, or accept that long-timer suspension points will incur a cold reload.
 - Watch the `harvest.workflow.cache_miss` counter during rolling deploys: it will spike as executions migrate to new workers and then settle as the new workers warm their caches.

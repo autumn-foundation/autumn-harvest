@@ -4959,6 +4959,47 @@ impl<'a> StickyHint<'a> {
     }
 }
 
+/// Release the sticky pins of a worker that stops (issue #1798).
+///
+/// A pin hides a ready task from other workers until `sticky_until` passes.
+/// A wake also re-arms the pin of a parked task. Without a release, each
+/// execution pinned to a stopped worker waits for one full sticky window.
+///
+/// The release clears pending rows and parked rows. It keeps rows that the
+/// worker still runs. It also keeps session rows, because a session pin is
+/// a hard pin (issue #606). Returns the number of released rows.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on update failure.
+pub async fn release_worker_sticky_pins(
+    conn: &mut AsyncPgConnection,
+    worker_id: &str,
+) -> HarvestResult<usize> {
+    diesel::sql_query(release_worker_sticky_pins_query())
+        .bind::<diesel::sql_types::Text, _>(worker_id)
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)
+}
+
+/// SQL for [`release_worker_sticky_pins`].
+///
+/// A parked row has `state = 'RUNNING'` with no `worker_id` and no
+/// `started_at`, the same shape that [`wake_workflow_task`] re-pends.
+const fn release_worker_sticky_pins_query() -> &'static str {
+    "UPDATE harvest_task_queue \
+     SET sticky_worker_id = NULL, \
+         sticky_until = NULL, \
+         sticky_timeout = NULL \
+     WHERE sticky_worker_id = $1 \
+       AND session_id IS NULL \
+       AND ( \
+           state = 'PENDING' \
+           OR (state = 'RUNNING' AND worker_id IS NULL AND started_at IS NULL) \
+       )"
+}
+
 /// Pin a task row to a specific worker for best-effort sticky routing.
 ///
 /// Overwrites any existing sticky affinity on the row with the new worker
@@ -9894,6 +9935,18 @@ mod tests {
             assert!(sql.contains("sticky_until = NOW() + $3"));
             assert!(sql.contains("sticky_timeout = $3"));
         }
+    }
+
+    #[test]
+    fn release_worker_sticky_pins_query_touches_only_idle_unsessioned_rows() {
+        let sql = release_worker_sticky_pins_query();
+        assert!(sql.contains("sticky_worker_id = NULL"));
+        assert!(sql.contains("sticky_until = NULL"));
+        assert!(sql.contains("sticky_timeout = NULL"));
+        assert!(sql.contains("WHERE sticky_worker_id = $1"));
+        assert!(sql.contains("session_id IS NULL"));
+        assert!(sql.contains("state = 'PENDING'"));
+        assert!(sql.contains("state = 'RUNNING' AND worker_id IS NULL AND started_at IS NULL"));
     }
 
     #[test]

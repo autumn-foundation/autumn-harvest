@@ -80,12 +80,12 @@ fn sticky_routing_config_zero_lease_ttl_is_valid() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn worker_config_default_has_sticky_routing_disabled() {
+fn worker_config_default_has_sticky_routing_enabled() {
     let config = WorkerConfig::default();
-    assert!(
-        config.sticky_timeout.is_zero(),
-        "sticky routing must be off by default; got sticky_timeout={:?}",
-        config.sticky_timeout
+    assert_eq!(
+        config.sticky_timeout,
+        Duration::from_secs(5),
+        "sticky routing must be on by default (issue #1798)"
     );
 }
 

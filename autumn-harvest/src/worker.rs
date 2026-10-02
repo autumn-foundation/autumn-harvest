@@ -27859,6 +27859,12 @@ impl Worker {
         tracing::info!(worker_id = %self.config.worker_id, "draining in-flight tasks (multi-shard)");
         self.drain_in_flight().await;
 
+        // No task runs here now. Release the pins on every shard pool.
+        for (_, shard_pool) in &shard_targets {
+            self.release_sticky_pins(shard_pool, shutdown_acquire_bound)
+                .await;
+        }
+
         // Stopped: mark every shard pool's worker row stopped, then cancel heartbeats.
         for (_, shard_pool) in &shard_targets {
             self.transition_fleet_status(
@@ -28287,6 +28293,9 @@ impl Worker {
 
         tracing::info!(worker_id = %self.config.worker_id, "draining in-flight tasks");
         self.drain_in_flight().await;
+
+        // No task runs here now. Release the pins so peers claim at once.
+        self.release_sticky_pins(pool, None).await;
 
         // All tasks complete — mark Stopped, then stop the heartbeat task.
         self.transition_fleet_status(pool, crate::workers::WorkerStatus::Stopped, None)
@@ -30367,6 +30376,34 @@ impl Worker {
     /// applies during multi-shard shutdown. That sequence visits shards
     /// sequentially, so one exhausted shard pool must not park the others'
     /// Draining/Stopped writes (issue #1209).
+    /// Release the sticky pins of this worker on one pool (issue #1798).
+    ///
+    /// Best effort. A failure only makes a peer wait for one sticky window.
+    async fn release_sticky_pins(&self, pool: &DbPool, acquire_bound: Option<Duration>) {
+        let worker_id = self.config.worker_id.as_str();
+        match acquire_shard_conn(pool, acquire_bound).await {
+            Ok(mut conn) => match queue::release_worker_sticky_pins(&mut conn, worker_id).await {
+                Ok(released) => {
+                    tracing::debug!(worker_id, released, "released sticky pins at shutdown");
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        worker_id,
+                        error = %error,
+                        "failed to release sticky pins at shutdown"
+                    );
+                }
+            },
+            Err(error) => {
+                tracing::warn!(
+                    worker_id,
+                    error = %error,
+                    "failed to get pool connection to release sticky pins"
+                );
+            }
+        }
+    }
+
     async fn transition_fleet_status(
         &self,
         pool: &DbPool,

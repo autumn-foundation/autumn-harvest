@@ -186,7 +186,7 @@ Common reason codes and their fixes:
   - Or kick/update the build policy on the queue.
 
 #### `sticky_owned_by_other_worker`
-- **Meaning**: The task is sticky-pinned to a specific worker that is currently offline or busy, and the sticky preference window has not yet expired.
+- **Meaning**: The task is sticky-pinned to a specific worker that is currently offline or busy, and the sticky preference window has not yet expired. Sticky routing is on by default with a 5 s window (issue #1798). A graceful shutdown releases the pins of the worker, so this reason usually means a crash or a busy worker.
 - **Fix**: 
   - Wait for the sticky window to expire (`sticky_until` timestamp in the task/eligibility response). Once expired, any worker can claim it.
   - Or restart the targeted worker process to let it resume the task.

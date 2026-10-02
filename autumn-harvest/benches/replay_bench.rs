@@ -34,9 +34,14 @@ mod e2e_bench_support;
 
 use std::sync::{Arc, Mutex};
 
+use autumn_harvest::event::WorkflowEvent;
+use autumn_harvest::executor::{WorkflowOutcome, run_workflow};
 use autumn_harvest::testing::WorkflowReplayer;
+use autumn_harvest::types::ExecutionId;
 use criterion::measurement::WallTime;
-use criterion::{BatchSize, BenchmarkGroup, Criterion, criterion_group, criterion_main};
+use criterion::{
+    BatchSize, BenchmarkGroup, BenchmarkId, Criterion, criterion_group, criterion_main,
+};
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
@@ -69,6 +74,93 @@ fn bench_replay_1k(c: &mut Criterion) {
             BatchSize::SmallInput,
         );
     });
+}
+
+// ---------------------------------------------------------------------------
+// Decision cost against history length (issue #1798)
+// ---------------------------------------------------------------------------
+
+/// History lengths, in events, that the decision groups measure.
+const DECISION_COST_EVENTS: [usize; 3] = [1_000, 5_000, 10_000];
+
+/// Builds the history and input of one decision.
+///
+/// With `extra = 0` the input matches the history, so the decision replays
+/// every event and completes. With `extra = 1` the workflow then schedules
+/// one more activity and suspends, which is a live decision of a long run.
+fn decision_history(
+    activities: usize,
+    extra: u64,
+) -> (ExecutionId, Vec<WorkflowEvent>, serde_json::Value) {
+    let (exec_id, mut events) = build_history(activities);
+    let input = serde_json::Value::from(activities as u64 + extra);
+    if let Some(WorkflowEvent::WorkflowStarted { input: started, .. }) = events.first_mut() {
+        started.clone_from(&input);
+    }
+    (exec_id, events, input)
+}
+
+/// Registers one decision bench per history length in `group`.
+fn bench_decisions(
+    group: &mut BenchmarkGroup<'_, WallTime>,
+    rt: &tokio::runtime::Runtime,
+    extra: u64,
+) {
+    for events in DECISION_COST_EVENTS {
+        group.bench_with_input(
+            BenchmarkId::from_parameter(events),
+            &events,
+            |b, &events| {
+                b.iter_batched(
+                    || decision_history(events / 2, extra),
+                    |(exec_id, history, input)| {
+                        rt.block_on(run_workflow(exec_id, history, sequential_workflow, input))
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+}
+
+/// Measures the cost of one decision at 1k, 5k and 10k events.
+///
+/// The bench calls `executor::run_workflow`, the entry point a worker uses
+/// for each decision. Each decision replays the workflow from the top.
+///
+/// - `decision_cost` measures the replay work. Its cost grows linearly with
+///   history length, so a run of n decisions costs O(n²) in total.
+/// - `decision_wall` measures a decision that suspends. It adds the fixed
+///   100 ms suspension wait of issue #1797 on top of the replay work.
+///
+/// Resident workflow state (issue #1798, step 2) would make a warm decision
+/// roughly constant in both groups.
+fn bench_decision_cost(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    // Each shape must produce the outcome that its group claims to measure.
+    let (exec_id, events, input) = decision_history(4, 0);
+    let done = rt.block_on(run_workflow(exec_id, events, sequential_workflow, input));
+    assert!(
+        matches!(done, WorkflowOutcome::Completed { .. }),
+        "a full-history decision must complete: {done:?}"
+    );
+    let (exec_id, events, input) = decision_history(4, 1);
+    let live = rt.block_on(run_workflow(exec_id, events, sequential_workflow, input));
+    assert!(
+        matches!(live, WorkflowOutcome::Suspended { .. }),
+        "a live decision must suspend on the next activity: {live:?}"
+    );
+
+    let mut group = c.benchmark_group("decision_cost");
+    bench_decisions(&mut group, &rt, 0);
+    group.finish();
+
+    // Each sample waits about 100 ms, so keep the sample count small.
+    let mut group = c.benchmark_group("decision_wall");
+    group.sample_size(10);
+    bench_decisions(&mut group, &rt, 1);
+    group.finish();
 }
 
 // ---------------------------------------------------------------------------
@@ -142,6 +234,7 @@ criterion_group!(
     benches,
     bench_replay_1k,
     bench_replay_10k,
+    bench_decision_cost,
     bench_span_noop_overhead
 );
 criterion_main!(benches);

@@ -252,6 +252,8 @@ mod sqlite_feasibility_docs;
 mod start_idempotency_tests;
 #[cfg(feature = "db")]
 mod start_source_tests;
+#[cfg(feature = "db")]
+mod sticky_default_tests;
 mod sticky_routing_tests;
 mod telemetry_span_tests;
 #[cfg(feature = "db")]
