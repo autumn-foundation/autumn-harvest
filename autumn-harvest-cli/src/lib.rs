@@ -18978,3 +18978,23 @@ mod migrate_cli_tests {
         assert_eq!(error.exit_code(), 1);
     }
 }
+
+#[cfg(test)]
+mod pg_tls_feature_tests {
+    /// `harvest dr` and `harvest backup verify` connect through
+    /// `autumn_harvest::pg_tls`. A standalone CLI build must carry its TLS
+    /// connector, or a managed Postgres that needs TLS is unreachable.
+    #[test]
+    fn the_cli_build_has_tls_for_its_database_probes() {
+        let result = autumn_harvest::pg_tls::prepare("postgres://u@h/db?sslmode=require");
+        let unsupported = matches!(
+            &result,
+            Err(autumn_harvest::pg_tls::PgTlsError::Unsupported(m)) if m.contains("`tls` feature")
+        );
+        assert!(
+            !unsupported,
+            "the CLI must enable autumn-harvest/tls: {:?}",
+            result.err()
+        );
+    }
+}
