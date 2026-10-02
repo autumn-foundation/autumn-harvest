@@ -2222,6 +2222,80 @@ async fn a_post_lookup_redrive_clears_capability_misses() {
     assert_eq!(row.capability_misses, 0);
 }
 
+/// A stale handler's re-drive leaves a peer's claim alone. The peer took the
+/// row after this handler loaded it. A park without the claim fence would
+/// clear the peer's ownership and let a third dispatch run.
+#[tokio::test]
+async fn a_stale_redrive_leaves_a_peer_claim_alone() {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = Text)]
+        state: String,
+        #[diesel(sql_type = diesel::sql_types::Nullable<Text>)]
+        worker_id: Option<String>,
+    }
+
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let queue_name = format!("q-sp-{}", &Uuid::new_v4().simple().to_string()[..12]);
+    let exec_id = seed_execution(&mut conn, &queue_name).await;
+    let task_id = autumn_harvest::queue::enqueue(
+        &mut conn,
+        &autumn_harvest::queue::EnqueueParams::new(
+            &queue_name,
+            autumn_harvest::queue::TaskType::Workflow,
+            serde_json::json!({}),
+        ),
+    )
+    .await
+    .expect("enqueue");
+    register_live_worker(&mut conn, "w-1").await;
+    register_live_worker(&mut conn, "w-2").await;
+    diesel::sql_query(
+        "UPDATE harvest_task_queue SET state = 'RUNNING', worker_id = 'w-1', attempt = 1, \
+         workflow_exec_id = $2 WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("model the first claim");
+    let stale = {
+        use autumn_harvest::models::TaskQueueItem;
+        use autumn_harvest::schema::harvest_task_queue;
+        use diesel::{QueryDsl, SelectableHelper};
+        harvest_task_queue::table
+            .find(task_id)
+            .select(TaskQueueItem::as_select())
+            .first::<TaskQueueItem>(&mut conn)
+            .await
+            .expect("load the first claim")
+    };
+    diesel::sql_query("UPDATE harvest_task_queue SET worker_id = 'w-2', attempt = 2 WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .execute(&mut conn)
+        .await
+        .expect("model the peer's claim");
+
+    autumn_harvest::worker::requeue_workflow_task_after_event_id_conflict(
+        &mut conn,
+        &stale,
+        "w-1",
+        Duration::ZERO,
+        exec_id,
+    )
+    .await
+    .expect("a lost claim is a no-op");
+
+    let row = diesel::sql_query("SELECT state, worker_id FROM harvest_task_queue WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .get_result::<Row>(&mut conn)
+        .await
+        .expect("read the row");
+    assert_eq!(row.state, "RUNNING");
+    assert_eq!(row.worker_id.as_deref(), Some("w-2"));
+}
+
 /// Mark `worker_id` as a live worker. A test row `RUNNING` under an unknown
 /// worker is an orphan, and a reclaimer of a parallel suite would requeue it.
 /// The row has no queues and a shard that does not exist, so no other code

@@ -13225,6 +13225,10 @@ async fn requeue_parent_on_transient_ingest_conflict(
 /// The lookup succeeded, so this worker can run the task. The park clears the
 /// capability-miss evidence, as every other post-lookup park does (issue
 /// #804). Stale evidence could otherwise end the redelivery budget early.
+///
+/// The park is fenced on this handler's claim. A handler that outlived its
+/// task timeout can hit the conflict after a peer took the row. A lost claim
+/// is a no-op, so the peer keeps its ownership.
 #[doc(hidden)] // exposed for its integration test; not a stable API
 pub async fn requeue_workflow_task_after_event_id_conflict(
     conn: &mut AsyncPgConnection,
@@ -13233,14 +13237,27 @@ pub async fn requeue_workflow_task_after_event_id_conflict(
     sticky_timeout: Duration,
     exec_id: ExecutionId,
 ) -> HarvestResult<()> {
+    let claim = queue::TaskClaim::new(task.id, worker_id, task.attempt);
     let sticky = if sticky_timeout.is_zero() {
         None
     } else {
         Some(queue::StickyHint::new(worker_id, sticky_timeout))
     };
-    let _ = queue::park_workflow_task(conn, task.id, sticky).await?;
-    queue::wake_workflow_task(conn, exec_id).await?;
-    Ok(())
+    Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
+        if let queue::ClaimLock::Lost { .. } = queue::lock_claim_for_update(conn, &claim).await? {
+            tracing::debug!(
+                task_id = %task.id,
+                worker_id = %worker_id,
+                attempt = task.attempt,
+                "event-id conflict re-drive skipped: a peer holds the claim"
+            );
+            return Ok(());
+        }
+        let _ = queue::park_workflow_task(conn, task.id, sticky).await?;
+        queue::wake_workflow_task(conn, exec_id).await?;
+        Ok(())
+    }))
+    .await
 }
 
 /// Run the wake-event ingest ([`ingest_due_timers_and_signals`]), converting a
