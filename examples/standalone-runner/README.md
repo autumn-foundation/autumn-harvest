@@ -20,7 +20,7 @@ only formats.
 | Storage pool | `diesel_async` `deadpool` pool (`src/db.rs`) |
 | Migrations | `autumn_harvest::migrate`, the code behind `harvest migrate run` (`src/db.rs`) |
 | Management API and Vantage | `HarvestEmbedding::start`, nested on an `axum::Router` (`src/server.rs`) |
-| Operator credential | `StandaloneAdminAuth::with_api_tokens()` and `harvest token bootstrap` |
+| Operator credential | `StandaloneAdminAuth::with_api_tokens()` outside `dev`, and `harvest token bootstrap` |
 | Metrics | `GET /metrics` from `HarvestMetricsRecorder::render_prometheus()` |
 | Webhooks | `build_webhook_router` with a `#[webhook]` binding (`src/webhooks.rs`) |
 
@@ -57,7 +57,7 @@ them.
 |---|---|---|
 | `DATABASE_URL` | `postgres://runner:runner@localhost:5434/runner` | The Harvest database. See [TLS](#tls). |
 | `AUTUMN_ENV` or `AUTUMN_PROFILE` | none (`unknown`) | Deployment profile. `AUTUMN_ENV` wins. `dev` or `development` also applies migrations. |
-| `STANDALONE_RUNNER_ADDR` | `127.0.0.1:8082` | Listen address. Port `0` picks a free port. Some routes have no auth, so keep it on localhost or behind your own auth layer. |
+| `STANDALONE_RUNNER_ADDR` | `127.0.0.1:8082` | Listen address. Port `0` picks a free port. In `dev`, the Harvest routes have no auth, so keep it on localhost. |
 | `STANDALONE_RUNNER_WEBHOOK_SECRET` | none | HMAC secret. The webhook route exists only when this is set. Outside `dev`, a secret under 32 bytes refuses boot. |
 
 Routes:
@@ -88,8 +88,9 @@ cargo run -p autumn-harvest-cli -- --base-url http://localhost:8082/api/harvest 
 
 ## Run outside `dev`
 
-Outside `dev`, the runner does not migrate. Every admin route needs a
-credential. Apply the migrations and seed the first API token first:
+Outside `dev`, the runner does not migrate. Every Harvest route except the
+public ones, such as `/api/harvest/health`, needs an API token. Apply the
+migrations and seed the first token first:
 
 ```bash
 export DATABASE_URL=postgres://runner:runner@localhost:5434/runner
@@ -106,16 +107,26 @@ AUTUMN_PROFILE=prod cargo run -p standalone-runner
 
 read -rs HARVEST_TOKEN && export HARVEST_TOKEN
 cargo run -p autumn-harvest-cli -- --base-url http://localhost:8082/api/harvest preflight
+
+curl -s -X POST http://localhost:8082/api/harvest/workflows/standalone_order/start \
+  -H "Authorization: Bearer $HARVEST_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "workflow_id":"order-1002",
+    "input":{"order_id":"order-1002","sku":"sku-book","quantity":2}
+  }' | jq .
 ```
 
-The token gates the admin routes only. A workflow start and the workflow reads
-have no auth here. For production, put your own auth layer in front of
-`harvest.router()`. Then declare it with
-`StandaloneAdminAuth::with_admin_auth_boundary()`.
+A request without a token gets `401`. The webhook route and `/metrics` are
+outside `harvest.router()`, so the token does not gate them. The webhook has
+its HMAC signature.
 
-Until you do, `preflight` reports `admin_auth_boundary` as `fail` under a
-named non-`dev` profile. It reports `warn` when the profile is unknown. Both
-results are correct. The acceptance suite pins the `fail`.
+`preflight` still reports `admin_auth_boundary` as `fail` under a named
+non-`dev` profile, and `warn` when the profile is unknown. The check counts
+only a declared embedder auth boundary, and API tokens are not one. To pass
+it, put your own auth layer in front of `harvest.router()`. Then declare it
+with `StandaloneAdminAuth::with_admin_auth_boundary()`. The acceptance suite
+pins the `fail`.
 
 ## TLS
 

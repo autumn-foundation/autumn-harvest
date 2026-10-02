@@ -18,8 +18,10 @@ the tree keeps one standalone reference, not two.
 - In `dev`, migrations go through `autumn_harvest::migrate`, the code behind
   `harvest migrate run`, not `autumn_web::migrate::run_pending`.
 - `HarvestEmbedding` mounts the API and Vantage on a plain `axum::Router`.
-- `StandaloneAdminAuth::with_api_tokens()` gates the admin routes. The first
-  token comes from `harvest token bootstrap`.
+- Outside `dev`, `StandaloneAdminAuth::with_api_tokens()` gates every Harvest
+  route except the public ones (#1865). The first token comes from
+  `harvest token bootstrap`. In `dev`, the runner mounts no token layer, so
+  the README quickstart needs no token.
 - `GET /metrics` serves `HarvestMetricsRecorder::render_prometheus()`.
 - `build_webhook_router` serves a `#[webhook]` binding. The route exists only
   when `STANDALONE_RUNNER_WEBHOOK_SECRET` is set. Outside `dev`, the example
@@ -62,10 +64,10 @@ the tree keeps one standalone reference, not two.
 **Known limits.**
 
 - Under a named non-`dev` profile, `harvest preflight` reports
-  `admin_auth_boundary: fail`. The token gates the admin routes only. A
-  workflow start, signal-with-start or update-with-start has no auth until
-  the embedder adds a layer and declares `with_admin_auth_boundary()`. The
-  plugin path behaves the same.
+  `admin_auth_boundary: fail`. Since #1865 the token gates every non-public
+  route, but the check counts only a declared embedder auth boundary. It
+  passes once the embedder adds a layer and declares
+  `with_admin_auth_boundary()`.
 - `HarvestEmbedding::start` still returns an `autumn-web` error type, and the
   webhook config types are `autumn-web` types behind a plugin re-export.
 

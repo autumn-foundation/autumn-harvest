@@ -329,16 +329,22 @@ async fn get(url: &str, bearer: Option<&str>) -> reqwest::Response {
     request.send().await.expect("GET should reach the runner")
 }
 
-async fn start_order(runner: &Runner, workflow_id: &str) {
-    let response = HTTP
+/// Post an order start, with `bearer` as the credential when given.
+async fn post_start(runner: &Runner, workflow_id: &str, bearer: Option<&str>) -> reqwest::Response {
+    let mut request = HTTP
         .post(runner.url("/api/harvest/workflows/standalone_order/start"))
         .json(&json!({
             "workflow_id": workflow_id,
             "input": { "order_id": workflow_id, "sku": "sku-book", "quantity": 2 },
-        }))
-        .send()
-        .await
-        .expect("start should reach the runner");
+        }));
+    if let Some(token) = bearer {
+        request = request.bearer_auth(token);
+    }
+    request.send().await.expect("start should reach the runner")
+}
+
+async fn start_order(runner: &Runner, workflow_id: &str) {
+    let response = post_start(runner, workflow_id, None).await;
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
     assert!(status.is_success(), "start failed: {status} {body}");
@@ -426,9 +432,9 @@ async fn dev_profile_migrates_runs_an_order_and_reports_metrics() {
     assert!(status.success(), "Ctrl-C should stop cleanly: {status}");
 }
 
-/// Outside `dev`, the admin API needs a credential. A token from the
-/// `harvest token bootstrap` SQL reaches `preflight`. An anonymous call
-/// does not.
+/// Outside `dev`, every Harvest route except the public ones needs a
+/// credential. A token from the `harvest token bootstrap` SQL reaches
+/// `preflight` and starts a workflow. An anonymous call does neither.
 #[tokio::test]
 async fn prod_profile_admits_a_bootstrap_token_and_nothing_else() {
     let _serial = SERIAL.lock().await;
@@ -444,13 +450,23 @@ async fn prod_profile_admits_a_bootstrap_token_and_nothing_else() {
     let wrong = get(&preflight, Some("hvst_not-a-real-token")).await;
     assert_eq!(wrong.status(), reqwest::StatusCode::UNAUTHORIZED);
 
+    let anonymous_start = post_start(&runner, "order-anonymous", None).await;
+    assert_eq!(anonymous_start.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let started = post_start(&runner, "order-with-token", Some(&token)).await;
+    let status = started.status();
+    let body = started.text().await.unwrap_or_default();
+    assert!(
+        status.is_success(),
+        "a token starts a workflow: {status} {body}"
+    );
+
     let admitted = get(&preflight, Some(&token)).await;
     let status = admitted.status();
     let body = admitted.text().await.unwrap_or_default();
     assert_eq!(status, reqwest::StatusCode::OK, "{body}");
     let report: Value = serde_json::from_str(&body).expect("preflight is JSON");
-    // The README says this check fails outside `dev`: the token gates only
-    // the admin routes. A `pass` here would mislead an operator.
+    // The README says this check fails outside `dev`. Preflight counts only
+    // a declared embedder auth boundary, and API tokens are not one.
     let boundary = check_named(&report, "admin_auth_boundary").expect("the check is present");
     assert_eq!(boundary["status"], json!("fail"), "{report}");
 }

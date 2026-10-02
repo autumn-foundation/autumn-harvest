@@ -131,7 +131,7 @@ pub async fn run() -> Result<(), BoxError> {
         HarvestRunnerResources::new(pool),
     )
     .with_api_state(api_state)
-    .with_admin_auth(StandaloneAdminAuth::new().with_api_tokens())
+    .with_admin_auth(admin_auth(is_dev))
     .with_ambient_profile()
     .start()
     .await
@@ -159,6 +159,21 @@ pub async fn run() -> Result<(), BoxError> {
     };
     harvest.stop().await;
     Ok(served?)
+}
+
+/// The auth for the Harvest routes.
+///
+/// Outside `dev`, every route except the public ones needs a Harvest API
+/// token. `harvest token bootstrap` seeds the first one.
+///
+/// In `dev`, there is no token layer, so the README quickstart works
+/// without a token. The embedding logs that the API is then open.
+fn admin_auth(is_dev: bool) -> StandaloneAdminAuth {
+    if is_dev {
+        StandaloneAdminAuth::new()
+    } else {
+        StandaloneAdminAuth::new().with_api_tokens()
+    }
 }
 
 /// Resolve on Ctrl-C, or on SIGTERM from a process manager.
