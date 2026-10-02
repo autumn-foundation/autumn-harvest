@@ -189,7 +189,7 @@ async fn start_workflow(
             workflow_name: name,
             workflow_id: id,
             exec_id: ExecutionId::new_for_shard(ShardId::new(0)),
-            input,
+            input: input.into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,

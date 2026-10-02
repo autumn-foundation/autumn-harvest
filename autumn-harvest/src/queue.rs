@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 use crate::error::HarvestResult;
 use crate::models::{NewTaskQueueItem, TaskQueueItem};
+use crate::shared_json::SharedJson;
 use crate::telemetry::TraceContextCarrier;
 use crate::types::{ExecutionId, Priority};
 
@@ -334,7 +335,9 @@ pub struct EnqueueParams {
     pub workflow_exec_id: Option<Uuid>,
     pub activity_name: Option<String>,
     pub activity_id: Option<Uuid>,
-    pub input: serde_json::Value,
+    /// The caller and this struct share one allocation of the payload
+    /// (issue #1733).
+    pub input: SharedJson,
     pub priority: i32,
     pub max_attempts: i32,
     pub scheduled_at: chrono::DateTime<Utc>,
@@ -395,7 +398,7 @@ impl EnqueueParams {
     pub fn new(
         queue_name: impl Into<String>,
         task_type: TaskType,
-        input: serde_json::Value,
+        input: impl Into<SharedJson>,
     ) -> Self {
         Self {
             queue_name: queue_name.into(),
@@ -403,7 +406,7 @@ impl EnqueueParams {
             workflow_exec_id: None,
             activity_name: None,
             activity_id: None,
-            input,
+            input: input.into(),
             priority: 0,
             max_attempts: 3,
             // Default immediate tasks slightly into the past to tolerate small
@@ -7735,6 +7738,19 @@ mod tests {
     use super::*;
     use crate::error::CapabilityMissPhase;
 
+    /// `EnqueueParams` shares its input with the caller (issue #1733).
+    #[test]
+    fn enqueue_params_share_the_input() {
+        use crate::shared_json::SharedJson;
+        let input = SharedJson::from(serde_json::json!({"k": 1}));
+        let p = EnqueueParams::new("q", TaskType::Workflow, input.clone());
+        let copy = p.clone();
+        assert!(SharedJson::ptr_eq(&copy.input, &input));
+        assert!(SharedJson::ptr_eq(&p.input, &input));
+        let plain = EnqueueParams::new("q", TaskType::Workflow, serde_json::json!({"k": 1}));
+        assert_eq!(plain.input, serde_json::json!({"k": 1}));
+    }
+
     // ── Issue #811: latest-wins strategy on the concurrency admin read ──────
 
     /// `GET /admin/concurrency` is a `free_form` contract route, so the
@@ -11168,7 +11184,7 @@ mod tests {
             workflow_exec_id: None,
             activity_name: None,
             activity_id: None,
-            input: serde_json::Value::Null,
+            input: serde_json::Value::Null.into(),
             priority: 0,
             max_attempts: 1,
             scheduled_at: Utc::now(),

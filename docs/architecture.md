@@ -1349,6 +1349,8 @@ This mirrors how the #618 admission gates and #607 throttles treat the same path
 
 New start sites build their params with `StartWorkflowParams::new(..)` and override only what they vary, with `..` (#1448). The retry site keeps an explicit `Defer`, so a change to the default cannot alter it.
 
+The start `input` is a `SharedJson` (#1733), an `Arc<Value>` newtype in `shared_json.rs`. The params, the execution row, the queue params and the queue row share one allocation. Constructors accept a plain `Value` through `Into`.
+
 **Interaction notes.**
 
 - **`ctx.mutex` (#691)** — combining `cancel_running` with the durable mutex on the same terminal path can produce a Postgres-detected lock-ordering cycle (`40P01`) on the *start*. It aborts atomically and is safe to retry; it is a liveness hazard, not a correctness one. See `docs/sharding.md` for the full note.
