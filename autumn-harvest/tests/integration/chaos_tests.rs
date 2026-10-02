@@ -1563,31 +1563,37 @@ async fn chaos_seeded_convergence_sweep() {
         }
 
         // Convergence invariant.
-        assert_converged(&url, seed, &execs, &diag).await;
+        assert_converged(&url, &format!("seed {seed}"), &execs, &diag).await;
     }
 }
 
-/// Assert the post-recovery convergence invariant for one sweep seed: every
-/// workflow terminal (`COMPLETED`), no task stranded `RUNNING` with a dead
-/// worker, and no `ExternalSignalRequested` without an eventual terminal.
-async fn assert_converged(url: &str, seed: u64, execs: &[ExecutionId], diag: &str) {
+/// Assert the post-recovery convergence invariant for one case, such as a
+/// sweep seed. Every workflow is `COMPLETED` and has exactly one terminal
+/// event. No task is stranded `RUNNING` with a dead worker. No
+/// `ExternalSignalRequested` lacks an eventual terminal.
+async fn assert_converged(url: &str, case: &str, execs: &[ExecutionId], diag: &str) {
     let mut conn = connect(url).await;
     for exec_id in execs {
         let state = exec_state(&mut conn, *exec_id).await;
         assert_eq!(
             state, "COMPLETED",
-            "seed {seed}: workflow {exec_id:?} must converge to terminal; got {state}; {diag}"
+            "{case}: workflow {exec_id:?} must converge to terminal; got {state}; {diag}"
+        );
+        let terminals = terminal_event_count(&mut conn, *exec_id).await;
+        assert_eq!(
+            terminals, 1,
+            "{case}: workflow {exec_id:?} must have exactly one terminal event; {diag}"
         );
     }
     let stranded = stranded_running_with_dead_worker(&mut conn).await;
     assert_eq!(
         stranded, 0,
-        "seed {seed}: no task may be stranded RUNNING with a dead worker; {diag}"
+        "{case}: no task may be stranded RUNNING with a dead worker; {diag}"
     );
     let dangling = dangling_external_requests(&mut conn).await;
     assert_eq!(
         dangling, 0,
-        "seed {seed}: no ExternalSignalRequested without a terminal; {diag}"
+        "{case}: no ExternalSignalRequested without a terminal; {diag}"
     );
 }
 
@@ -1619,11 +1625,11 @@ async fn oracle_flags_a_duplicate_terminal_event() {
     .await
     .expect("claim")
     .expect("a task is due");
-    let _ = chaos_drive_one_workflow_task(&url, Arc::clone(&registry), task, "oracle-w".into())
-        .await;
+    let _ =
+        chaos_drive_one_workflow_task(&url, Arc::clone(&registry), task, "oracle-w".into()).await;
 
     // The clean history converges.
-    assert_converged(&url, 0, &[exec_id], "clean").await;
+    assert_converged(&url, "oracle", &[exec_id], "clean").await;
 
     // Forge a second `WorkflowCompleted` at the next event id.
     conn.batch_execute(&format!(
@@ -1635,11 +1641,30 @@ async fn oracle_flags_a_duplicate_terminal_event() {
     .await
     .expect("forge duplicate terminal event");
 
-    let caught = std::panic::AssertUnwindSafe(assert_converged(&url, 0, &[exec_id], "forged"))
-        .catch_unwind()
-        .await
-        .is_err();
+    let caught =
+        std::panic::AssertUnwindSafe(assert_converged(&url, "oracle", &[exec_id], "forged"))
+            .catch_unwind()
+            .await
+            .is_err();
     assert!(caught, "the oracle must flag a duplicate terminal event");
+}
+
+/// Count the workflow-level terminal events of one execution (issue #1801).
+/// The table key is `(workflow_exec_id, event_id)`, so it does not stop a
+/// second terminal event at a new event id.
+async fn terminal_event_count(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> i64 {
+    diesel::sql_query(
+        "SELECT COUNT(*)::bigint AS n FROM harvest_events \
+         WHERE workflow_exec_id = $1 AND event_type IN ( \
+           'WorkflowCompleted', 'WorkflowFailed', 'WorkflowCancelled', \
+           'WorkflowContinuedAsNew', 'WorkflowResetTerminated', \
+           'WorkflowExecutionTimedOut')",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .get_result::<CountRow>(conn)
+    .await
+    .expect("count terminal events")
+    .n
 }
 
 /// Count `RUNNING` tasks whose `worker_id` has no live `harvest_workers`
