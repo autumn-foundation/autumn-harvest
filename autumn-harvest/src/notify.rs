@@ -399,14 +399,18 @@ impl QueueListener {
     /// [`Notification`]s through an internal channel. The connection stays
     /// alive as long as this `QueueListener` is held.
     ///
-    /// `sslmode=require` in `database_url` selects verified TLS. Other modes
-    /// connect in plaintext (issue #1717).
+    /// The `sslmode` in `database_url` selects the transport, through
+    /// [`crate::pg_tls`]. `prefer`, the default, uses TLS when the server
+    /// offers it and does not check the certificate. `require` and
+    /// `verify-full` verify the chain and the hostname, and `verify-ca` the
+    /// chain only. `disable` is plaintext. Without the `tls` feature, `prefer`
+    /// is plaintext and a verified mode is a configuration error.
     ///
     /// # Errors
     ///
     /// Returns [`HarvestError::Database`] if the connection or LISTEN fails.
-    /// Returns [`HarvestError::Config`] if the URL does not parse, or if TLS
-    /// cannot be configured.
+    /// Returns [`HarvestError::Config`] if the URL does not parse, its
+    /// `sslmode` is unknown, or TLS cannot be configured.
     pub async fn connect(database_url: &str, queues: &[String]) -> HarvestResult<Self> {
         let ListenConnection { client, rx, driver } =
             open_listen_connection(database_url, "postgres listener connection error").await?;
@@ -493,14 +497,18 @@ pub struct WorkflowEventListener {
 impl WorkflowEventListener {
     /// Connect to Postgres and subscribe to the `harvest_events` channel.
     ///
-    /// `sslmode=require` in `database_url` selects verified TLS. Other modes
-    /// connect in plaintext (issue #1717).
+    /// The `sslmode` in `database_url` selects the transport, through
+    /// [`crate::pg_tls`]. `prefer`, the default, uses TLS when the server
+    /// offers it and does not check the certificate. `require` and
+    /// `verify-full` verify the chain and the hostname, and `verify-ca` the
+    /// chain only. `disable` is plaintext. Without the `tls` feature, `prefer`
+    /// is plaintext and a verified mode is a configuration error.
     ///
     /// # Errors
     ///
     /// Returns [`HarvestError::Database`] if the connection or LISTEN fails.
-    /// Returns [`HarvestError::Config`] if the URL does not parse, or if TLS
-    /// cannot be configured.
+    /// Returns [`HarvestError::Config`] if the URL does not parse, its
+    /// `sslmode` is unknown, or TLS cannot be configured.
     pub async fn connect(database_url: &str) -> HarvestResult<Self> {
         let ListenConnection { client, rx, driver } =
             open_listen_connection(database_url, "postgres workflow event listener error").await?;
@@ -574,14 +582,18 @@ pub struct WorkflowProgressListener {
 impl WorkflowProgressListener {
     /// Connect to Postgres and subscribe to `exec_id`'s progress channel.
     ///
-    /// `sslmode=require` in `database_url` selects verified TLS. Other modes
-    /// connect in plaintext (issue #1717).
+    /// The `sslmode` in `database_url` selects the transport, through
+    /// [`crate::pg_tls`]. `prefer`, the default, uses TLS when the server
+    /// offers it and does not check the certificate. `require` and
+    /// `verify-full` verify the chain and the hostname, and `verify-ca` the
+    /// chain only. `disable` is plaintext. Without the `tls` feature, `prefer`
+    /// is plaintext and a verified mode is a configuration error.
     ///
     /// # Errors
     ///
     /// Returns [`HarvestError::Database`] if the connection or LISTEN fails.
-    /// Returns [`HarvestError::Config`] if the URL does not parse, or if TLS
-    /// cannot be configured.
+    /// Returns [`HarvestError::Config`] if the URL does not parse, its
+    /// `sslmode` is unknown, or TLS cannot be configured.
     pub async fn connect(database_url: &str, exec_id: Uuid) -> HarvestResult<Self> {
         let ListenConnection { client, rx, driver } =
             open_listen_connection(database_url, "postgres workflow progress listener error")
