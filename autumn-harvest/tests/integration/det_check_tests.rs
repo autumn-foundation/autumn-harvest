@@ -439,7 +439,7 @@ fn finding_carries_message() {
         .iter()
         .find(|f| f.rule_id == "DET001")
         .unwrap();
-    assert!(!finding.message.is_empty());
+    assert_ne!(finding.message, "");
 }
 
 // ── report aggregation ─────────────────────────────────────────────────────
@@ -540,7 +540,7 @@ async fn test_wf(ctx: &WorkflowContext) -> Result<(), String> {
         "active suppressions must appear in report output"
     );
     assert_eq!(report.suppressions[0].rule_id, "DET001");
-    assert!(!report.suppressions[0].reason.is_empty());
+    assert_ne!(report.suppressions[0].reason, "");
 }
 
 #[test]
@@ -1345,7 +1345,7 @@ fn det010_finding_carries_metadata() {
     let loc = finding.location.as_ref().expect("location");
     assert_eq!(loc.file, "test.rs");
     assert!(loc.line > 0);
-    assert!(!finding.message.is_empty());
+    assert_ne!(finding.message, "");
     assert!(
         finding.alternative.contains("BTreeMap") || finding.alternative.contains("sort"),
         "alternative must point at BTreeMap or sorted-Vec remediation, got: {}",
@@ -1824,7 +1824,7 @@ fn det011_finding_carries_metadata_and_names_race_alternative() {
     let loc = finding.location.as_ref().expect("location");
     assert_eq!(loc.file, "test.rs");
     assert!(loc.line > 0);
-    assert!(!finding.message.is_empty());
+    assert_ne!(finding.message, "");
     assert!(
         finding.alternative.contains("ctx.race()"),
         "alternative must point at ctx.race(), got: {}",
@@ -2185,7 +2185,7 @@ fn bad_time_helper() -> i64 {
         autumn_harvest::serde_json::from_str(&json).expect("JSON must parse");
 
     let findings = value["findings"].as_array().expect("findings array");
-    assert!(!findings.is_empty());
+    assert_ne!(findings.len(), 0);
     let det001 = findings
         .iter()
         .find(|f| f["rule_id"] == "DET001")
@@ -2815,7 +2815,7 @@ fn helper() {
         .iter()
         .find(|s| s.rule_id == "DET001")
         .unwrap_or_else(|| panic!("suppression must be echoed, got: {report:?}"));
-    assert!(!sup.reason.is_empty());
+    assert_ne!(sup.reason, "");
     // Location is inside the helper (line 9 of this fixture).
     assert_eq!(
         sup.location.line, 9,

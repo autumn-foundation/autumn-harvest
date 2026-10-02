@@ -8421,7 +8421,7 @@ mod tests {
 
         // Calling again must not re-deliver the same event.
         let second = matcher.claim_pending_signal("cancel");
-        assert!(second.is_empty());
+        assert_eq!(second, [] as [(usize, serde_json::Value); 0]);
     }
 
     #[test]
@@ -8561,7 +8561,7 @@ mod tests {
         }];
         let mut matcher = HistoryMatcher::new(events);
         let claimed = matcher.claim_pending_signal("cancel");
-        assert!(claimed.is_empty());
+        assert_eq!(claimed, [] as [(usize, serde_json::Value); 0]);
     }
 
     #[test]
