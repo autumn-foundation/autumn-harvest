@@ -212,8 +212,10 @@ schedule-to-close) return at most one batch per reason per pass (default 500
 rows). One scan queues up to 64 batches of expired ids, in `id` order. Each
 pass then loads one batch by primary key and checks it again. So draining a
 backlog does not repeat the full scan on every pass. A keyset cursor moves
-through the backlog and wraps at the end. A row that expires behind the
-cursor waits for the next sweep.
+through the backlog and wraps at the end. A sweep reads only the rows that
+had expired when it started. A row that expires later, or behind the
+cursor, waits for the next sweep. So new expiries cannot push an old row out
+of every sweep.
 
 A row that matches two reasons gets the first one, in the order above. So
 the recorded timeout type does not depend on where each cursor is.

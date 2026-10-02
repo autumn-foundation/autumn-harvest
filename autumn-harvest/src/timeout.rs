@@ -550,32 +550,40 @@ fn higher_reason_exclusions(higher: &[&str], bound: &str) -> String {
 /// new arrivals cannot stretch a sweep, and rows behind the cursor are
 /// reached within one sweep of the backlog at its start.
 ///
-/// With `after`, `$1` is the last id of the previous refill, `$2` is the
-/// high-water mark and `$3` is the limit. Without it, `$1` is the mark and
-/// `$2` is the limit.
+/// Each predicate compares against the sweep's clock, not `NOW()`. So the
+/// sweep reads only rows that had expired when it started. Rows that expire
+/// later cannot take their refill slots, even with lower ids.
+///
+/// With `after`, `$1` is the last id of the previous refill and `$2` is the
+/// high-water mark. Then `$3` is the limit and `$4` is the sweep's clock.
+/// Without it, `$1` is the mark, `$2` is the limit and `$3` is the clock.
 fn timeout_refill_query(predicate: &str, higher: &[&str], after: bool) -> String {
-    let (bound, limit) = if after {
-        (" AND id > $1 AND id <= $2", "$3")
+    let (bound, limit, clock) = if after {
+        (" AND id > $1 AND id <= $2", "$3", "$4")
     } else {
-        (" AND id <= $1", "$2")
+        (" AND id <= $1", "$2", "$3")
     };
-    let exclusions = higher_reason_exclusions(higher, bound);
+    let predicate = predicate.replace("NOW()", clock);
+    let higher: Vec<String> = higher.iter().map(|h| h.replace("NOW()", clock)).collect();
+    let higher: Vec<&str> = higher.iter().map(String::as_str).collect();
+    let exclusions = higher_reason_exclusions(&higher, bound);
     format!(
         "SELECT q.id FROM ({predicate}{bound} OFFSET 0) q WHERE TRUE{exclusions} \
          ORDER BY q.id LIMIT {limit}"
     )
 }
 
-/// The highest expired id at the start of a sweep, and the expired count
-/// (issue #1795).
+/// The highest expired id at the start of a sweep, the expired count, and
+/// the sweep's clock (issue #1795).
 ///
 /// The sweep stops at this id. See [`timeout_refill_query`]. The count sets
 /// the sweep's refill budget. Rows that arrive below the mark during the
-/// sweep cannot then stretch it, because the budget does not grow.
+/// sweep cannot then stretch it, because the budget does not grow. The
+/// refills compare against the clock, so the counted rows fill the budget.
 fn timeout_high_water_query(predicate: &str, higher: &[&str]) -> String {
     let exclusions = higher_reason_exclusions(higher, "");
     format!(
-        "SELECT q.id, COUNT(*) OVER () AS expired \
+        "SELECT q.id, COUNT(*) OVER () AS expired, NOW() AS as_of \
          FROM ({predicate} OFFSET 0) q WHERE TRUE{exclusions} \
          ORDER BY q.id DESC LIMIT 1"
     )
@@ -609,6 +617,9 @@ struct TimeoutScanLane {
     after: Option<uuid::Uuid>,
     /// The current sweep's high-water mark. The sweep stops at this id.
     until: Option<uuid::Uuid>,
+    /// The database clock when the current sweep started. Refills test
+    /// expiry against it.
+    as_of: Option<chrono::DateTime<chrono::Utc>>,
     /// Refills left in the current sweep. The last one ends the sweep,
     /// whether or not it is full.
     refills_left: i64,
@@ -627,7 +638,8 @@ struct TimeoutScanLane {
 ///
 /// A sweep reaches every row that stays expired and is at or below the mark.
 /// A row that expires behind the position, or above the mark, waits for the
-/// next sweep. The sweep also has a refill budget, set from the expired
+/// next sweep. So does a row that expires after the sweep starts, because
+/// refills test expiry against the sweep's clock. The sweep also has a refill budget, set from the expired
 /// count at its start. When the budget runs out, the sweep ends. So a sweep
 /// is bounded by the backlog at its start, and new arrivals cannot stretch
 /// it, wherever their ids fall. A queued row that stops matching
@@ -653,6 +665,8 @@ struct HighWater {
     id: uuid::Uuid,
     #[diesel(sql_type = diesel::sql_types::BigInt)]
     expired: i64,
+    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+    as_of: chrono::DateTime<chrono::Utc>,
 }
 
 /// Bounded form of [`find_timed_out_tasks`] (issue #1795).
@@ -689,11 +703,12 @@ pub async fn find_timed_out_tasks_batch(
                     .map_err(crate::error::database_error)?;
             let top = top.into_iter().next();
             lane.until = top.as_ref().map(|r| r.id);
+            lane.as_of = top.as_ref().map(|r| r.as_of);
             // Ceiling of `expired / refill`, and at least one refill.
             lane.refills_left = top.map_or(0, |r| (r.expired.max(1) - 1) / refill + 1);
         }
         if lane.queued.is_empty()
-            && let Some(until) = lane.until
+            && let (Some(until), Some(as_of)) = (lane.until, lane.as_of)
         {
             let ids: Vec<QueuedId> = match lane.after {
                 Some(after) => {
@@ -701,6 +716,7 @@ pub async fn find_timed_out_tasks_batch(
                         .bind::<diesel::sql_types::Uuid, _>(after)
                         .bind::<diesel::sql_types::Uuid, _>(until)
                         .bind::<diesel::sql_types::BigInt, _>(refill)
+                        .bind::<diesel::sql_types::Timestamptz, _>(as_of)
                         .load(conn)
                         .await
                 }
@@ -708,6 +724,7 @@ pub async fn find_timed_out_tasks_batch(
                     diesel::sql_query(timeout_refill_query(predicate, higher, false))
                         .bind::<diesel::sql_types::Uuid, _>(until)
                         .bind::<diesel::sql_types::BigInt, _>(refill)
+                        .bind::<diesel::sql_types::Timestamptz, _>(as_of)
                         .load(conn)
                         .await
                 }
@@ -6307,17 +6324,34 @@ mod tests {
         let first = timeout_refill_query(predicate, &[], false);
         // `OFFSET 0` keeps the predicate on its own index plan. The first
         // refill of a sweep is bounded only by the high-water mark.
+        let clocked = predicate.replace("NOW()", "$3");
         assert!(first.starts_with(&format!(
-            "SELECT q.id FROM ({predicate} AND id <= $1 OFFSET 0) q"
+            "SELECT q.id FROM ({clocked} AND id <= $1 OFFSET 0) q"
         )));
         assert!(first.ends_with("ORDER BY q.id LIMIT $2"));
-        assert!(!first.contains("$3"));
+        assert!(!first.contains("$4"));
         // The keyset bounds sit inside the subquery, where they reach the scan.
         let next = timeout_refill_query(predicate, &[], true);
+        let clocked = predicate.replace("NOW()", "$4");
         assert!(next.starts_with(&format!(
-            "SELECT q.id FROM ({predicate} AND id > $1 AND id <= $2 OFFSET 0) q"
+            "SELECT q.id FROM ({clocked} AND id > $1 AND id <= $2 OFFSET 0) q"
         )));
         assert!(next.ends_with("ORDER BY q.id LIMIT $3"));
+    }
+
+    #[test]
+    fn refill_query_tests_expiry_against_the_sweep_clock() {
+        // Every reason, with all its earlier reasons as exclusions.
+        let predicates = task_timeout_scans().map(|(_, predicate)| predicate);
+        for (index, predicate) in predicates.iter().enumerate() {
+            for after in [false, true] {
+                let sql = timeout_refill_query(predicate, &predicates[..index], after);
+                assert!(
+                    !sql.contains("NOW()"),
+                    "a refill must not use the live clock: {sql}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -6325,7 +6359,7 @@ mod tests {
         let predicate = start_to_close_timeout_query();
         let higher = heartbeat_timeout_query();
         let sql = timeout_high_water_query(predicate, &[higher]);
-        assert!(sql.starts_with("SELECT q.id, COUNT(*) OVER () AS expired"));
+        assert!(sql.starts_with("SELECT q.id, COUNT(*) OVER () AS expired, NOW() AS as_of"));
         assert!(sql.contains(&format!("FROM ({predicate} OFFSET 0) q")));
         assert!(sql.contains(&format!(
             "AND NOT EXISTS (SELECT 1 FROM ({higher}) h WHERE h.id = q.id)"
@@ -6339,6 +6373,7 @@ mod tests {
     fn refill_query_leaves_a_row_to_the_first_reason_it_matches() {
         let higher = heartbeat_timeout_query();
         let sql = timeout_refill_query(start_to_close_timeout_query(), &[higher], true);
+        let higher = higher.replace("NOW()", "$4");
         assert!(sql.contains(&format!(
             "AND NOT EXISTS (SELECT 1 FROM ({higher} AND id > $1 AND id <= $2) h WHERE h.id = q.id)"
         )));

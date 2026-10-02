@@ -584,6 +584,73 @@ async fn arrivals_below_the_mark_cannot_stretch_a_sweep() {
     );
 }
 
+/// A sweep reads the rows that were expired when it started. Rows that
+/// expire later cannot take their place, even with lower ids. Otherwise a
+/// steady stream of arrivals can push a high id out of every sweep.
+#[tokio::test]
+async fn later_expiries_cannot_displace_the_rows_a_sweep_counted() {
+    let (url, _container) = setup_test_db_url().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.expect("connection");
+    let queue = "scanner-lease-snapshot";
+    // At a batch of 1 a refill holds 64 ids, so 70 rows give two refills.
+    let ours = insert_expired_running_tasks(&mut conn, queue, 70).await;
+    assert_eq!(
+        foreign_expired_rows(&mut conn, queue).await,
+        0,
+        "precondition: no other expired rows in this database"
+    );
+
+    let mut cursor = TimeoutScanCursor::default();
+    let mut seen = start_to_close_ids(
+        &timeout::find_timed_out_tasks_batch(&mut conn, &mut cursor, 1)
+            .await
+            .expect("batch scan"),
+    );
+
+    // 100 rows that expire after the sweep started, with ids between the
+    // cursor (the 64th id) and the highest counted id (the 70th id).
+    let (low, high) = (ours[63], ours[69]);
+    let mut arrivals = Vec::with_capacity(100);
+    while arrivals.len() < 100 {
+        let id = uuid::Uuid::new_v4();
+        if low < id && id < high {
+            arrivals.push(id);
+        }
+    }
+    diesel::sql_query(
+        "INSERT INTO harvest_task_queue \
+         (id, queue_name, task_type, input, state, attempt, max_attempts, \
+          started_at, start_to_close) \
+         SELECT u, $2, 'activity', '{}'::jsonb, 'RUNNING', \
+                1, 1, NOW(), INTERVAL '1 millisecond' \
+         FROM unnest($1) AS u",
+    )
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&arrivals)
+    .bind::<diesel::sql_types::Text, _>(queue)
+    .execute(&mut conn)
+    .await
+    .expect("insert arrivals");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    for _ in 1..ours.len() {
+        let page = timeout::find_timed_out_tasks_batch(&mut conn, &mut cursor, 1)
+            .await
+            .expect("batch scan");
+        seen.extend(start_to_close_ids(&page));
+    }
+
+    diesel::sql_query("DELETE FROM harvest_task_queue WHERE queue_name = $1")
+        .bind::<diesel::sql_types::Text, _>(queue)
+        .execute(&mut conn)
+        .await
+        .expect("clear queue");
+    assert_eq!(
+        seen, ours,
+        "the sweep must read every row it counted, and only those"
+    );
+}
+
 /// AC2, end to end: the spawned checker enforces one batch per pass.
 #[tokio::test]
 async fn spawned_checker_enforces_one_batch_per_pass() {
