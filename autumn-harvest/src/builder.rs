@@ -4700,7 +4700,10 @@ mod tests {
     /// touches `shard_assignments` gets full coverage.
     #[test]
     fn default_worker_config_shard_assignments_are_auto() {
-        assert!(WorkerConfig::default().shard_assignments.is_empty());
+        assert_eq!(
+            WorkerConfig::default().shard_assignments,
+            [] as [crate::types::ShardId; 0]
+        );
     }
 
     /// An all-duplicates list must still leave a usable assignment rather than
@@ -4941,7 +4944,7 @@ mod tests {
     #[test]
     fn worker_config_with_empty_queues_clears_list() {
         let config = WorkerConfig::default().with_queues(Vec::<&str>::new());
-        assert!(config.queues.is_empty());
+        assert_eq!(config.queues, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -5619,7 +5622,7 @@ mod tests {
     #[test]
     fn worker_config_with_empty_iterator_clears_queues() {
         let config = WorkerConfig::default().with_queues(Vec::<&str>::new());
-        assert!(config.queues.is_empty());
+        assert_eq!(config.queues, [] as [std::string::String; 0]);
     }
 
     fn make_activity(
@@ -7777,11 +7780,9 @@ mod tests {
         // Identical-behavior guarantee: an embedder who never touches the
         // completion-callback API gets an empty default-target list.
         let built = HarvestBuilder::new().build();
-        assert!(
-            built
-                .completion_callback_config()
-                .default_targets
-                .is_empty()
+        assert_eq!(
+            built.completion_callback_config().default_targets,
+            [] as [crate::completion_callback::CallbackTarget; 0]
         );
         assert!(built.completion_callback_config().deliverer.is_none());
     }

@@ -476,7 +476,7 @@ mod tests {
         let resp = assemble_run_chain(Vec::new(), Uuid::nil());
         assert!(!resp.head_unknown);
         assert_eq!(resp.workflow_id, None);
-        assert!(resp.runs.is_empty());
+        assert_eq!(resp.runs, [] as [crate::run_chain::RunChainRecord; 0]);
     }
 
     #[test]
