@@ -69,10 +69,18 @@ pub const MIN_LEASE_TICKS: u32 = 3;
 /// zero, so every tick times out and skips the pass, yet still looks alive.
 pub const MIN_SCANNER_INTERVAL: Duration = Duration::from_millis(10);
 
-/// `interval`, raised to at least [`MIN_SCANNER_INTERVAL`].
+/// Longest scanner interval a loop accepts.
+///
+/// The lease TTL must cover [`MIN_LEASE_TICKS`] of the longest sleeps, and it
+/// is capped at one day. Four hours at the largest jitter needs 22.8 hours.
+/// A longer interval would let a live leader wake after its lease ends.
+pub const MAX_SCANNER_INTERVAL: Duration = Duration::from_secs(4 * 3600);
+
+/// `interval`, kept within [`MIN_SCANNER_INTERVAL`] and
+/// [`MAX_SCANNER_INTERVAL`].
 #[must_use]
 pub fn scanner_interval(interval: Duration) -> Duration {
-    interval.max(MIN_SCANNER_INTERVAL)
+    interval.clamp(MIN_SCANNER_INTERVAL, MAX_SCANNER_INTERVAL)
 }
 
 /// Longest time a graceful stop spends on releasing its lease.
@@ -151,8 +159,8 @@ pub struct ScannerConfig {
     /// to [`DEFAULT_SCANNER_JITTER`]. Clamped to `[0, MAX_SCANNER_JITTER]`.
     pub jitter: f64,
     /// Mean time between timeout-checker ticks. `None`, the default, uses the
-    /// worker poll interval (500 ms by default). Raised to at least
-    /// [`MIN_SCANNER_INTERVAL`].
+    /// worker poll interval (500 ms by default). Kept within
+    /// [`MIN_SCANNER_INTERVAL`] and [`MAX_SCANNER_INTERVAL`].
     pub timeout_interval: Option<Duration>,
     /// Most rows per timeout reason that one timeout pass enforces. Defaults
     /// to [`DEFAULT_TIMEOUT_SCAN_BATCH_SIZE`]. Raised to at least 1.
@@ -197,6 +205,31 @@ pub enum ScannerRole {
     Unelected,
     /// The lease query failed. This replica ran the pass anyway.
     FailOpen,
+}
+
+/// Failed leader passes in a row (issue #1795).
+///
+/// The count covers consecutive leader passes only. A tick in any other role
+/// ends the run, because the lease may have moved away and back. See
+/// [`ABDICATE_AFTER_FAILED_PASSES`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LeaderFailures(u32);
+
+impl LeaderFailures {
+    /// Records one tick in `role`. `failed` says whether the tick's pass
+    /// failed. Returns `true` when the leader must give up its lease.
+    pub(crate) fn record(&mut self, role: ScannerRole, failed: bool) -> bool {
+        if role != ScannerRole::Leader || !failed {
+            self.0 = 0;
+            return false;
+        }
+        self.0 += 1;
+        if self.0 >= ABDICATE_AFTER_FAILED_PASSES {
+            self.0 = 0;
+            return true;
+        }
+        false
+    }
 }
 
 impl ScannerRole {
@@ -475,6 +508,57 @@ mod tests {
     const BASE: Duration = Duration::from_secs(1);
 
     #[test]
+    fn a_leader_gives_up_after_three_failed_leader_passes_in_a_row() {
+        let mut failures = LeaderFailures::default();
+        assert!(!failures.record(ScannerRole::Leader, true));
+        assert!(!failures.record(ScannerRole::Leader, true));
+        assert!(failures.record(ScannerRole::Leader, true));
+        // The count starts again after the release.
+        assert!(!failures.record(ScannerRole::Leader, true));
+        // A good pass also starts it again.
+        assert!(!failures.record(ScannerRole::Leader, false));
+        assert!(!failures.record(ScannerRole::Leader, true));
+        assert!(!failures.record(ScannerRole::Leader, true));
+    }
+
+    #[test]
+    fn a_tick_in_any_other_role_ends_the_run_of_failures() {
+        for other in [
+            ScannerRole::Standby,
+            ScannerRole::Unelected,
+            ScannerRole::FailOpen,
+        ] {
+            for other_failed in [false, true] {
+                let mut failures = LeaderFailures::default();
+                assert!(!failures.record(ScannerRole::Leader, true));
+                assert!(!failures.record(ScannerRole::Leader, true));
+                // The lease moves away and comes back.
+                assert!(!failures.record(other, other_failed));
+                assert!(
+                    !failures.record(ScannerRole::Leader, true),
+                    "one failure after a {other:?} tick must not give up the lease"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_lease_outlives_the_longest_sleep_at_any_interval() {
+        let hours = |h: u64| Duration::from_secs(h * 3600);
+        for interval in [hours(1), hours(4), hours(20), hours(30), hours(1000)] {
+            for jitter in [0.0, DEFAULT_SCANNER_JITTER, MAX_SCANNER_JITTER] {
+                let interval = scanner_interval(interval);
+                let longest = max_jittered_interval(interval, jitter);
+                let ttl = effective_lease_ttl(DEFAULT_SCANNER_LEASE_TTL, interval, jitter);
+                assert!(
+                    ttl >= longest * MIN_LEASE_TICKS,
+                    "{interval:?} at jitter {jitter}: TTL {ttl:?} must cover three sleeps of {longest:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn jitter_spans_the_band_and_keeps_its_mean() {
         assert_eq!(
             jittered_interval(BASE, 0.2, 0.0),
@@ -574,6 +658,7 @@ mod tests {
     fn a_zero_interval_is_raised_to_the_floor() {
         assert_eq!(scanner_interval(Duration::ZERO), MIN_SCANNER_INTERVAL);
         assert_eq!(scanner_interval(BASE), BASE);
+        assert_eq!(scanner_interval(Duration::MAX), MAX_SCANNER_INTERVAL);
     }
 
     #[test]

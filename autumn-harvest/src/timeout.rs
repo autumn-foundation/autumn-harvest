@@ -5552,7 +5552,7 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
     crate::dispatch::spawn_bound(async move {
         let mut cursor = TimeoutScanCursor::default();
         let mut last_role: Option<ScannerRole> = None;
-        let mut failed_leader_passes: u32 = 0;
+        let mut leader_failures = crate::scanner_lease::LeaderFailures::default();
         let mut abdicated_until: Option<tokio::time::Instant> = None;
         loop {
             // Issue #1795: a random sleep in `[1 - jitter, 1 + jitter]` of
@@ -5623,7 +5623,7 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
                     }
 
                     if role.runs_pass() {
-                        match enforce_timeouts_once_on_conn_shard(
+                        let failed = match enforce_timeouts_once_on_conn_shard(
                             &mut conn,
                             pool_shard,
                             TaskScan::Batch {
@@ -5646,24 +5646,20 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
                                 if enforced_count > 0 {
                                     tracing::warn!(enforced_count, "enforced timed-out tasks");
                                 }
-                                failed_leader_passes = 0;
+                                false
                             }
                             Err(e) => {
                                 tracing::error!(error = %e, "failed to enforce timed-out tasks");
-                                if role == ScannerRole::Leader {
-                                    failed_leader_passes += 1;
-                                }
+                                true
                             }
-                        }
+                        };
                         // A pass can fail on one replica alone, for example on
                         // a codec only that replica lacks. Before #1795,
                         // another replica's pass did the work. So a leader
                         // that keeps failing gives up the lease.
-                        if failed_leader_passes
-                            >= crate::scanner_lease::ABDICATE_AFTER_FAILED_PASSES
+                        if leader_failures.record(role, failed)
                             && let Some(lease) = &lease
                         {
-                            failed_leader_passes = 0;
                             abdicated_until = Some(tokio::time::Instant::now() + lease_ttl);
                             tracing::warn!(
                                 shard = %shard_label,
@@ -5686,13 +5682,20 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
                                 }
                             }
                         }
-                    } else if let Err(e) =
-                        crate::codec_rotation::refresh_active_codec_key(&mut conn, &payload_codecs)
-                            .await
-                    {
-                        // A standby skips the pass but not this refresh. The
-                        // pass runs the same refresh first on the leader.
-                        tracing::warn!(error = %e, "codec key state refresh failed on a standby");
+                    } else {
+                        // A standby tick ends any run of failed leader passes.
+                        let _ = leader_failures.record(role, false);
+                        if let Err(e) = crate::codec_rotation::refresh_active_codec_key(
+                            &mut conn,
+                            &payload_codecs,
+                        )
+                        .await
+                        {
+                            // A standby skips the pass but not this refresh.
+                            // The pass runs the same refresh first on the
+                            // leader.
+                            tracing::warn!(error = %e, "codec key state refresh failed on a standby");
+                        }
                     }
 
                     telemetry.metrics.record_scanner_pass(

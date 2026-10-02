@@ -246,7 +246,7 @@ Set with `WorkerConfig::with_scanner_config(ScannerConfig { .. })`:
 | `elect` | `true` | `false` makes every replica run every pass, as before #1795. |
 | `lease_ttl` | 10 s | Failover bound after a crash. Capped at 300 s, then raised to at least three times the longest sleep. |
 | `jitter` | 0.2 | Random spread of each sleep, as a fraction of the interval. Clamped to `[0, 0.9]`. |
-| `timeout_interval` | `None` | Mean time between timeout-checker ticks. `None` uses the worker poll interval (500 ms). |
+| `timeout_interval` | `None` | Mean time between timeout-checker ticks. `None` uses the worker poll interval (500 ms). Kept within 10 ms and 4 h. |
 | `timeout_batch_size` | 500 | Most rows per timeout reason that one pass enforces. Raised to at least 1. |
 
 `GET /admin/config` reports the configured values under `worker.scanner_*`
