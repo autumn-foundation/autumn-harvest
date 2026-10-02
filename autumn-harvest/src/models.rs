@@ -710,7 +710,8 @@ pub struct HarvestSchedule {
     pub paused_by: Option<String>,
     /// Free-text reason recorded with the most recent pause. NULL when active or no reason given.
     pub pause_reason: Option<String>,
-    /// Maximum jitter window in seconds. 0 = no jitter (default).
+    /// Maximum jitter window in seconds. 0 = no jitter. The column defaults to 0;
+    /// `default_schedule_jitter` sets the value a registration writes.
     pub jitter_secs: i64,
     /// Overlap policy variant stored as a `snake_case` string (issue #241).
     pub overlap_policy: String,
