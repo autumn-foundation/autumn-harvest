@@ -2017,16 +2017,12 @@ pub fn module_workflow_handler(
                         .insert(key, response.clone(), fuel_consumed);
                 }
 
-                // NOTE: deliberately no `yield_now()` here (issue #967, Codex
-                // review round 1). `executor::run_workflow_handler_cycle` drives
-                // the handler inside `tokio::time::timeout(SUSPENSION_TIMEOUT)`,
-                // and a workflow that goes `Pending` is *by definition* treated
-                // as suspended. Yielding between decisions is therefore the one
-                // place the 100ms timer can fire while the trampoline has not
-                // yet recorded a command, producing a zero-command suspension —
-                // a workflow parked on nothing, which the worker fails
-                // terminally. It looks like ordinary runtime politeness and is
-                // actually a correctness hazard.
+                // NOTE: deliberately no `yield_now()` here (issue #967). Under
+                // the old 100 ms suspension timer, a yield between decisions
+                // could end a cycle before the trampoline recorded a command.
+                // The worker fails such a zero-command suspension terminally.
+                // Issue #1797 removed the timer, so a yield now only costs a
+                // scheduler round trip. The invariant below still holds.
                 //
                 // The invariant this preserves: the trampoline's *only* await is
                 // `execute_activity_raw`, which pushes its `ScheduleActivity`

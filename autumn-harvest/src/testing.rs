@@ -2307,8 +2307,8 @@ fn outcome_to_report(
         }
 
         // Suspension during strict replay means the workflow tried to issue a
-        // new command with no matching history event (the oneshot is never
-        // resolved in replay mode, so the 100 ms timeout fires).
+        // new command with no matching history event. The oneshot never
+        // resolves in replay mode, so the cycle parks on it.
         WorkflowOutcome::Suspended { .. } => {
             // Issue #952: replaying a run that was sealed FAILED. The failing
             // cycle never suspended — it returned `Err` with its dispatches

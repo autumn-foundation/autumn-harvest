@@ -389,8 +389,9 @@ pub enum WorkflowCommand {
     WaitForActivity {
         /// The existing activity execution ID from history.
         activity_id: ActivityExecId,
-        /// The parked coroutine waits on this channel until the executor
-        /// suspension timeout drops it and the worker can re-park durably.
+        /// The parked coroutine waits on this channel. The open channel tells
+        /// the executor that the cycle is suspended (issue #1797). The worker
+        /// then re-parks durably.
         result_tx: oneshot::Sender<Result<Value, String>>,
     },
     /// Start a durable timer.
@@ -476,10 +477,10 @@ pub enum WorkflowCommand {
     /// same `WorkflowId` (logical identity) but a new `ExecutionId` and a
     /// fresh event history.
     ///
-    /// The accompanying future returned by
-    /// [`WorkflowContext::continue_as_new`] never resolves: the worker drains
-    /// this command after the executor's suspension timeout and treats it as
-    /// terminal regardless of whether the workflow function later returns.
+    /// The future that [`WorkflowContext::continue_as_new`] returns never
+    /// resolves. The worker drains this command after the executor suspends
+    /// the cycle. It treats the command as terminal, even if the workflow
+    /// function later returns.
     ContinueAsNew {
         /// Input passed to the next iteration of the workflow.
         input: Value,

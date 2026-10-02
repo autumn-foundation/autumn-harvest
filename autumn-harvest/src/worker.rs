@@ -3220,9 +3220,8 @@ fn local_activity_history_cap_reached(next_event_id: i32, cap: Option<u64>) -> O
 /// Marker, detached-spawn, timer-bookkeeping, and update-result events are
 /// split around the local activity command so `LocalActivityScheduled` is
 /// written at its actual command position. The `result_tx` inside the
-/// command is dropped immediately — the workflow coroutine was already
-/// dropped when the 100 ms suspension timeout fired, so nobody is listening
-/// on the receiving end.
+/// command is dropped immediately. The executor dropped the workflow
+/// coroutine when it suspended the cycle, so nobody listens on the other end.
 ///
 /// Issue #1247: before this fix, the original four kinds
 /// (`RecordMarker`, `RecordSideEffect`, `SpawnDetachedChildWorkflow`,
@@ -17185,14 +17184,12 @@ async fn recover_from_child_quota_exceeded(
 /// claim (issue #1182).
 ///
 /// [`handle_suspended_workflow`]'s catch-all branch used to reach straight for
-/// [`persist_workflow_failure`], with no ownership recheck at all. A live
-/// dispatch that suspends empty-handed because it was still mid-flight on
-/// some other I/O -- a slow downstream call, a database round trip -- when
-/// [`crate::executor::SUSPENSION_TIMEOUT`] elapses would then be failed
-/// terminally under the **stale** `worker_id`, even when the row had already
-/// changed hands to a concurrent poison-pill reclaim, an operator action, or
-/// exactly the claim-theft race issue #804's round-28 fix guards the
-/// `AfterHandler` capability-miss branch against. That guard covers only the
+/// [`persist_workflow_failure`], with no ownership recheck at all. Under the
+/// old 100 ms suspension timer (removed by issue #1797), a live dispatch
+/// could suspend empty-handed while it was still mid-flight on other I/O. It
+/// was then failed terminally under the **stale** `worker_id`. The row could
+/// already belong to someone else. Examples are a poison-pill reclaim, an
+/// operator action, or the claim-theft race of issue #804. That guard covers only the
 /// path reached via [`persist_scheduled_activities`]; a handler that never
 /// got far enough to push a single command skips that branch and lands here,
 /// where nothing checked the claim.

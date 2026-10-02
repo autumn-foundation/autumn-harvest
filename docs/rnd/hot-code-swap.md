@@ -977,6 +977,16 @@ constraint on this whole boundary rather than a detail of the fix:
 > (DD-1) gives the executor no way to distinguish "the host is thinking" from
 > "the workflow is suspended", which is C5 restated — and C5 is why the decision
 > call is inline in the first place.
+>
+> **Update (issue #1797).** The executor no longer detects a suspension with
+> a timer, so `SUSPENSION_TIMEOUT` is gone. A cycle suspends when the handler
+> is pending and a Harvest future is parked (`has_parked_harvest_future`). A
+> pending handler with no parked Harvest future waits for its own wake. A
+> `yield_now()` therefore no longer causes a zero-command suspension. A host
+> await that holds a cycle for `DEADLOCK_TIMEOUT` (2 s) fails the workflow
+> task, and the worker retries the task. The run does not fail. The
+> trampoline keeps C9 as written: a yield adds a scheduler round trip per
+> decision and gives nothing back.
 
 Cancellation is still **not** threaded into a running decision, so worker
 shutdown cannot interrupt one mid-flight; it waits out the per-decision backstop.

@@ -1,11 +1,13 @@
 //! Workflow executor -- runs a single workflow function through replay + live execution.
 //!
-//! The executor builds a [`WorkflowContext`] from the event history, runs the
-//! handler with a short timeout, and classifies the outcome:
+//! The executor builds a [`WorkflowContext`] from the event history, polls the
+//! handler until it returns or blocks, and classifies the outcome:
 //!
 //! - **Completed**: handler returned `Ok(output)`.
 //! - **Failed**: handler returned `Err(error)`.
-//! - **Suspended**: handler blocked on a oneshot (waiting for activity/timer resolution).
+//! - **Suspended**: handler blocked on a parked Harvest future (issue #1797).
+//! - **`TaskFailed`**: handler waited on a foreign future for
+//!   [`DEADLOCK_TIMEOUT`]. The worker retries the task.
 //!
 //! This module is pure async logic and does NOT require the `db` feature.
 
@@ -868,8 +870,8 @@ pub async fn run_workflow(
 /// resolve child placement without mutating the process-global router that every
 /// other test in the same binary shares.
 ///
-/// Identical to [`run_workflow`] in every other respect: same suspension
-/// timeout, same panic containment, same outcome mapping.
+/// Identical to [`run_workflow`] in every other respect: same readiness rule,
+/// same panic containment, same outcome mapping.
 pub async fn run_workflow_with_context(
     ctx: crate::context::WorkflowContext,
     handler: WorkflowHandlerFn,
@@ -1207,10 +1209,8 @@ async fn run_strict_with_ctx(
     async {
         // Issue #782: run the handler with panic containment. A contained panic
         // short-circuits to a typed HandlerPanic `Failed` outcome, discarding
-        // the panicked cycle's commands (there are none to drain here). The
-        // Returned/Suspended arms are byte-equivalent to the pre-#782
-        // `timeout(SUSPENSION_TIMEOUT, handler(...))` call.
-        let timeout_result = match run_workflow_handler_cycle(&ctx, handler, input).await {
+        // the panicked cycle's commands (there are none to drain here).
+        let cycle_result = match run_workflow_handler_cycle(&ctx, handler, input).await {
             HandlerCycleResult::Returned(result) => Ok(result),
             HandlerCycleResult::Suspended => Err(()),
             HandlerCycleResult::Deadlocked => {
@@ -1227,7 +1227,7 @@ async fn run_strict_with_ctx(
                 };
             }
         };
-        match timeout_result {
+        match cycle_result {
             // An infallible built-in primitive (system_now/new_uuid/random_*) may
             // have absorbed a divergence and returned a fallback value (issue #384);
             // surface it before the other completion checks.
@@ -1337,7 +1337,7 @@ async fn run_strict_with_ctx(
                     },
                 )
             }
-            Err(_elapsed) => {
+            Err(()) => {
                 // A plain-value built-in primitive (system_now/new_uuid/random_*)
                 // may have recorded a divergence before the workflow parked on an
                 // await point. Fail the execution now rather than suspending from
@@ -1518,7 +1518,7 @@ pub(crate) async fn run_workflow_canary(
         // Issue #782: run the handler with panic containment (see
         // `run_strict_with_ctx` for rationale). A contained panic short-circuits
         // to a typed HandlerPanic `Failed` outcome.
-        let timeout_result = match run_workflow_handler_cycle(&ctx, handler, input).await {
+        let cycle_result = match run_workflow_handler_cycle(&ctx, handler, input).await {
             HandlerCycleResult::Returned(result) => Ok(result),
             HandlerCycleResult::Suspended => Err(()),
             HandlerCycleResult::Deadlocked => {
@@ -1535,7 +1535,7 @@ pub(crate) async fn run_workflow_canary(
                 };
             }
         };
-        match timeout_result {
+        match cycle_result {
             Ok(Ok(output)) => ctx.take_deferred_nd_error().map_or_else(
                 || {
                     // Issue #546 post-ship hardening: flush any push-based signal
@@ -1565,11 +1565,11 @@ pub(crate) async fn run_workflow_canary(
                         }
                     } else {
                         // Reaching the end of the workflow function with recorded
-                        // history fully consumed is always a legitimate outcome here
-                        // — never a stricter case than the sibling `Err(_elapsed)`
-                        // (suspended) arm below, which tolerates the same frontier by
-                        // checking only `history_has_unconsumed_events()` before
-                        // returning `Suspended` with its drained commands. Two
+                        // history fully consumed is always a legitimate outcome here.
+                        // It is never a stricter case than the sibling suspended arm
+                        // (`Err(())`) below. That arm tolerates the same frontier: it
+                        // checks only `history_has_unconsumed_events()` before it
+                        // returns `Suspended` with its drained commands. Two
                         // situations reach this arm:
                         //
                         // - Issue #952: history sealed by a terminal `WorkflowFailed`
@@ -1629,7 +1629,7 @@ pub(crate) async fn run_workflow_canary(
                     },
                 )
             }
-            Err(_elapsed) => {
+            Err(()) => {
                 if let Some(nd) = ctx.take_deferred_nd_error() {
                     let details = ctx.take_nd_details();
                     return WorkflowOutcome::Failed {
@@ -2006,11 +2006,11 @@ fn skipped_command_outcome(
     })
 }
 
-/// Core executor body: emit the `OTel` span, run the handler with a suspension
-/// timeout, and return the outcome.  Shared by all public entry points so the
-/// advancing-clock variant (`run_workflow_with_state_advancing_clock`) does not
-/// duplicate the span/timeout/drain logic.
-#[allow(clippy::too_many_lines)] // one linear span/timeout/drain orchestrator
+/// Core executor body: emit the `OTel` span, run the handler cycle, and return
+/// the outcome.  Shared by all public entry points so the advancing-clock
+/// variant (`run_workflow_with_state_advancing_clock`) does not duplicate the
+/// span/cycle/drain logic.
+#[allow(clippy::too_many_lines)] // one linear span/cycle/drain orchestrator
 async fn drive_workflow(
     ctx: WorkflowContext,
     handler: WorkflowHandlerFn,
@@ -2059,15 +2059,14 @@ async fn drive_workflow(
     let span_handle = span.clone();
 
     let (outcome, pending) = async {
-        // Run the handler with a timeout. If it completes, we get the result.
-        // If it blocks on a oneshot (suspended), the timeout fires and we drain
-        // the accumulated commands.
+        // Run the handler until it returns or blocks (issue #1797). On a
+        // suspension, drain the accumulated commands.
         //
         // Issue #782: run with panic containment. A contained panic short-circuits
         // to a typed HandlerPanic `Failed` outcome with NO pending commands — the
         // panicked cycle's commands are untrustworthy and are discarded (R5), so
         // `ctx.drain_commands()` is deliberately not called on this path.
-        let timeout_result = match run_workflow_handler_cycle(&ctx, handler, input).await {
+        let cycle_result = match run_workflow_handler_cycle(&ctx, handler, input).await {
             HandlerCycleResult::Returned(result) => Ok(result),
             HandlerCycleResult::Suspended => Err(()),
             // Issue #1797: the cycle's commands are discarded, as on a panic.
@@ -2092,8 +2091,8 @@ async fn drive_workflow(
             }
         };
 
-        match timeout_result {
-            // Handler completed within the timeout window.  Drain any commands
+        match cycle_result {
+            // Handler returned.  Drain any commands
             // emitted during live execution (e.g. RecordUpdateResult from
             // execute_admitted_update) so the worker can persist them before the
             // terminal WorkflowCompleted/WorkflowFailed event.
@@ -2156,11 +2155,11 @@ async fn drive_workflow(
                 (outcome, ctx.drain_commands())
             }
 
-            // Timeout elapsed -- the handler is suspended on a oneshot channel.
+            // The handler is parked on a Harvest future (issue #1797).
             // Drain the commands it emitted before suspending. RecordUpdateResult
             // commands emitted in this cycle are included in the commands list and
             // will be handled by the worker alongside the suspension side-effects.
-            Err(_elapsed) => {
+            Err(()) => {
                 // A plain-value built-in primitive (system_now/new_uuid/random_*)
                 // may have recorded a divergence before the workflow parked on an
                 // await point. Fail the execution now rather than suspending from
@@ -2941,8 +2940,8 @@ mod tests {
     ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
         Box::pin(async move {
             // The future returned by continue_as_new never resolves on its
-            // own; the executor's suspension timeout drains the command and
-            // surfaces it as ContinuedAsNew.
+            // own. It holds a park token, so the executor suspends, drains
+            // the command and surfaces it as ContinuedAsNew.
             let _ = ctx
                 .continue_as_new(serde_json::json!({"prev": input}))
                 .await;
