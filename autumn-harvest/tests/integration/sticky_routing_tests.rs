@@ -410,7 +410,7 @@ mod db_tests {
             workflow_id: &Uuid::new_v4().to_string(),
             run_id: Uuid::new_v4(),
             shard_id: 0,
-            input: serde_json::json!({}),
+            input: serde_json::json!({}).into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,

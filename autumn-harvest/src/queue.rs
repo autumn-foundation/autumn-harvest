@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 use crate::error::HarvestResult;
 use crate::models::{NewTaskQueueItem, TaskQueueItem};
+use crate::shared_json::SharedJson;
 use crate::telemetry::TraceContextCarrier;
 use crate::types::{ExecutionId, Priority};
 
@@ -334,7 +335,9 @@ pub struct EnqueueParams {
     pub workflow_exec_id: Option<Uuid>,
     pub activity_name: Option<String>,
     pub activity_id: Option<Uuid>,
-    pub input: serde_json::Value,
+    /// The caller and this struct share one allocation of the payload
+    /// (issue #1733).
+    pub input: SharedJson,
     pub priority: i32,
     pub max_attempts: i32,
     pub scheduled_at: chrono::DateTime<Utc>,
@@ -395,7 +398,7 @@ impl EnqueueParams {
     pub fn new(
         queue_name: impl Into<String>,
         task_type: TaskType,
-        input: serde_json::Value,
+        input: impl Into<SharedJson>,
     ) -> Self {
         Self {
             queue_name: queue_name.into(),
@@ -403,7 +406,7 @@ impl EnqueueParams {
             workflow_exec_id: None,
             activity_name: None,
             activity_id: None,
-            input,
+            input: input.into(),
             priority: 0,
             max_attempts: 3,
             // Default immediate tasks slightly into the past to tolerate small
@@ -3310,11 +3313,10 @@ pub async fn record_heartbeat(
     Ok(claim_write(updated > 0))
 }
 
-/// Shared "reset a claimed task back to `PENDING` with a future
-/// `scheduled_at`" changeset (code-review cleanup, issue #603): the 7 fields
-/// common to both [`requeue_for_retry`] (activity retry) and
-/// [`requeue_workflow_task_nd_blocked`] (ND-block backoff), previously
-/// duplicated verbatim in both functions.
+/// Shared changeset that resets a claimed task back to `PENDING` (issue #603).
+/// It holds the fields common to [`requeue_for_retry`] (activity retry) and
+/// [`requeue_workflow_task_with_backoff`] (every workflow-task backoff).
+/// Each caller adds its own `scheduled_at`.
 ///
 /// `treat_none_as_null = true` is required: Diesel's default `AsChangeset`
 /// behavior treats a `None` field as "omit this column from `SET`" rather
@@ -3495,31 +3497,150 @@ fn finish_workflow_backoff_requeue(
     Ok(())
 }
 
-/// Reset a `RUNNING` workflow task to `PENDING` with a future `scheduled_at`.
+/// Columns that release a workflow task's sticky worker affinity.
 ///
-/// This is the bounded backoff retry for a quota or shard-admission
-/// rejection (issue #956). It also clears a stale `mixed_signal_suspension`
-/// sentinel, and a mid-cycle wake flag, in the same update.
+/// `treat_none_as_null = true` binds each `None` as SQL `NULL`. Without it,
+/// Diesel omits the column from the `SET` clause.
+#[derive(AsChangeset)]
+#[diesel(table_name = crate::schema::harvest_task_queue, treat_none_as_null = true)]
+// Field names must match the column names.
+#[allow(clippy::struct_field_names)]
+struct StickyRelease {
+    sticky_worker_id: Option<String>,
+    sticky_until: Option<chrono::DateTime<Utc>>,
+    sticky_timeout: Option<chrono::Duration>,
+}
+
+impl StickyRelease {
+    const fn new() -> Self {
+        Self {
+            sticky_worker_id: None,
+            sticky_until: None,
+            sticky_timeout: None,
+        }
+    }
+}
+
+/// Build the `SET` clause shared by every workflow-task backoff requeue
+/// (issue #1751).
 ///
-/// Mirrors [`requeue_for_retry`], restricted to `task_type = 'workflow'`
-/// rows (every caller holds a workflow task), with two extra clears:
+/// This one builder holds the whole backoff decision. All three public
+/// requeues use it, so a fix lands once. Four earlier fixes (issues #1389,
+/// #1391, #1589, #1402) each patched one copy and missed another.
 ///
-/// - `activity_name`: without this clear, an old sentinel can survive. An
-///   earlier, unrelated cycle may stamp it during a timer-and-signal race
-///   (issue #476/#600). A surviving sentinel still matches the wake-forward
-///   arm of `primary_repend_workflow_task_query`. Any unrelated wake then
-///   resets `scheduled_at` to now. This defeats the backoff (issue #1391).
-/// - `wake_requested`: a wake captured mid-cycle must not short-circuit the
-///   backoff. The row is durably `PENDING`. It is deferred purely by
-///   `scheduled_at` (`claim_task` enforces `scheduled_at <= NOW()`). So a
-///   wake arriving during the backoff is not lost. The next claim's full
-///   history replay recovers it instead.
+/// - `scheduled_at` uses Postgres `clock_timestamp()`. A host clock that runs
+///   behind could otherwise bind a deadline that is already past (issue
+///   #1389). The row would then be claimable at once.
+/// - `wake_requested` is cleared. A wake captured mid-cycle must not cut the
+///   backoff short. The next claim replays the full history and finds it.
+/// - `activity_name` is cleared. A timer-and-signal race can leave a stale
+///   `mixed_signal_suspension` sentinel (issues #476, #600). It would match the wake-forward arm of `primary_repend_workflow_task_query`.
+///   An unrelated wake would then reset `scheduled_at` to now (issues #603,
+///   #1391).
+/// - `timer_fires_at` is cleared. A backoff is not a timer wake, so the marker
+///   must not name a stale timer when the row is due again (issue #1402).
+/// - `sticky` is `Some` to release sticky affinity, `None` to keep it.
+fn workflow_backoff_set(
+    delay: Duration,
+    sticky: Option<StickyRelease>,
+) -> impl AsChangeset<
+    Target = crate::schema::harvest_task_queue::table,
+    Changeset: diesel::query_builder::QueryFragment<diesel::pg::Pg> + Send,
+> {
+    use crate::schema::harvest_task_queue::dsl;
+    use diesel::dsl::sql;
+    use diesel::sql_types::{Double, Timestamptz};
+
+    (
+        dsl::scheduled_at.eq(
+            sql::<Timestamptz>("clock_timestamp() + make_interval(secs => ")
+                .bind::<Double, _>(delay_secs(delay))
+                .sql(")"),
+        ),
+        dsl::wake_requested.eq(false),
+        dsl::activity_name.eq(None::<String>),
+        dsl::timer_fires_at.eq(None::<chrono::DateTime<Utc>>),
+        sticky,
+    )
+}
+
+/// Re-pend a `RUNNING` workflow task to `PENDING` with a backoff (issue #1751).
 ///
-/// `requeue_workflow_task_nd_blocked` clears the same two columns for the
-/// similar ND-block backoff (issue #603).
+/// The one `UPDATE` behind [`requeue_workflow_task_nd_blocked`],
+/// [`requeue_workflow_task_after_panic`], and
+/// [`requeue_workflow_task_for_quota_retry`]. The caller picks the sticky
+/// policy. See [`workflow_backoff_set`] for the shared columns.
 ///
-/// No `pg_notify`: the task is deliberately not claimable until
-/// `scheduled_at`, so waking pollers early would be pure noise.
+/// No `pg_notify`: the task is not claimable until `scheduled_at`, so waking
+/// pollers early would be pure noise.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::NotFound`] when the task is not a
+/// claimed (`RUNNING`) workflow task, and
+/// [`crate::error::HarvestError::Database`] on update failure.
+async fn requeue_workflow_task_with_backoff(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    delay: Duration,
+    previous_error: &str,
+    sticky: Option<StickyRelease>,
+) -> HarvestResult<()> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    let updated = diesel::update(
+        dsl::harvest_task_queue
+            .find(task_id)
+            .filter(dsl::state.eq("RUNNING"))
+            .filter(dsl::task_type.eq("workflow")),
+    )
+    .set((
+        PendingRequeueChangeset::new(previous_error.to_string()),
+        workflow_backoff_set(delay, sticky),
+    ))
+    .returning((dsl::queue_name, dsl::priority, dsl::scheduled_at))
+    .get_results::<(String, i32, chrono::DateTime<Utc>)>(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+
+    finish_workflow_backoff_requeue(task_id, updated)
+}
+
+/// Build the backoff `UPDATE` text so a no-DB test can assert its shape
+/// (issue #1751). Uses the same [`workflow_backoff_set`] as production.
+#[cfg(test)]
+fn workflow_backoff_sql(
+    changeset: PendingRequeueChangeset,
+    delay: Duration,
+    sticky: Option<StickyRelease>,
+) -> String {
+    use crate::schema::harvest_task_queue::dsl;
+    use diesel::debug_query;
+    use diesel::pg::Pg;
+
+    let query = diesel::update(
+        dsl::harvest_task_queue
+            .find(Uuid::nil())
+            .filter(dsl::state.eq("RUNNING"))
+            .filter(dsl::task_type.eq("workflow")),
+    )
+    .set((changeset, workflow_backoff_set(delay, sticky)));
+    debug_query::<Pg, _>(&query).to_string()
+}
+
+/// Re-pend a workflow task after a quota or shard-admission rejection (issues
+/// #956, #1391).
+///
+/// This is a bounded backoff against a quota that is exhausted for now. It
+/// keeps sticky affinity. A quota rejection does not show that the pinned
+/// worker is faulty. The other two backoff requeues release affinity because
+/// their pinned worker is the suspect (issue #1751).
+///
+/// Affinity is a soft preference. It ends at `sticky_until`, and nothing here
+/// extends it. Any worker can claim the row after that time, so a kept pin
+/// cannot starve the retry. This holds for a shard-admission rejection too.
+///
+/// All other columns follow [`workflow_backoff_set`].
 ///
 /// # Errors
 ///
@@ -3532,104 +3653,15 @@ pub async fn requeue_workflow_task_for_quota_retry(
     delay: Duration,
     previous_error: &str,
 ) -> HarvestResult<()> {
-    use crate::schema::harvest_task_queue::dsl;
-    use diesel::dsl::sql;
-    use diesel::sql_types::{Double, Timestamptz};
-
-    let changeset = PendingRequeueChangeset::new(previous_error.to_string());
-
-    // `scheduled_at` is computed on Postgres's own `clock_timestamp()`, not
-    // the host's `Utc::now()` (Codex review, issue #1589). A trailing
-    // worker host clock could otherwise bind a `scheduled_at` already at
-    // or before the database's own `NOW()`. `claim_task` compares against
-    // that, so the row would be immediately claimable again. That defeats
-    // this function's whole purpose: a bounded backoff against a durably
-    // exhausted quota. Mirrors `requeue_for_retry`'s and
-    // `requeue_workflow_task_nd_blocked`'s identical DB-clock computation.
-    let updated = diesel::update(
-        dsl::harvest_task_queue
-            .find(task_id)
-            .filter(dsl::state.eq("RUNNING"))
-            .filter(dsl::task_type.eq("workflow")),
-    )
-    .set((
-        changeset,
-        dsl::scheduled_at.eq(
-            sql::<Timestamptz>("clock_timestamp() + make_interval(secs => ")
-                .bind::<Double, _>(delay_secs(delay))
-                .sql(")"),
-        ),
-        dsl::wake_requested.eq(false),
-        dsl::activity_name.eq(None::<String>),
-        // A quota/shard-admission backoff is not a timer wake (issue
-        // #1402). Clear the marker so it cannot survive to name a stale
-        // timer once this row becomes due again.
-        dsl::timer_fires_at.eq(None::<chrono::DateTime<Utc>>),
-    ))
-    .returning((dsl::queue_name, dsl::priority, dsl::scheduled_at))
-    .get_results::<(String, i32, chrono::DateTime<Utc>)>(conn)
-    .await
-    .map_err(crate::error::database_error)?;
-
-    finish_workflow_backoff_requeue(task_id, updated)
-}
-
-/// Build the `SET` clause used by [`requeue_workflow_task_for_quota_retry`]
-/// so a no-DB unit test can assert the generated SQL shape (issue #1391).
-/// Mirrors the `requeue_after_panic_query` shape-test precedent.
-#[cfg(test)]
-fn requeue_workflow_task_for_quota_retry_query(
-    changeset: PendingRequeueChangeset,
-    delay: Duration,
-) -> String {
-    use crate::schema::harvest_task_queue::dsl;
-    use diesel::debug_query;
-    use diesel::dsl::sql;
-    use diesel::pg::Pg;
-    use diesel::sql_types::{Double, Timestamptz};
-
-    let query = diesel::update(
-        dsl::harvest_task_queue
-            .find(Uuid::nil())
-            .filter(dsl::state.eq("RUNNING"))
-            .filter(dsl::task_type.eq("workflow")),
-    )
-    .set((
-        changeset,
-        dsl::scheduled_at.eq(
-            sql::<Timestamptz>("clock_timestamp() + make_interval(secs => ")
-                .bind::<Double, _>(delay_secs(delay))
-                .sql(")"),
-        ),
-        dsl::wake_requested.eq(false),
-        dsl::activity_name.eq(None::<String>),
-        dsl::timer_fires_at.eq(None::<chrono::DateTime<Utc>>),
-    ));
-    debug_query::<Pg, _>(&query).to_string()
+    requeue_workflow_task_with_backoff(conn, task_id, delay, previous_error, None).await
 }
 
 /// Re-pend an ND-blocked workflow task with a future `scheduled_at` (issue
 /// #603).
 ///
-/// Mirrors [`requeue_for_retry`] with four deliberate differences for the
-/// replay-non-determinism block path:
-/// - restricted to `task_type = 'workflow'` rows (defensive — the block path
-///   only ever holds a claimed workflow task);
-/// - clears the sticky affinity columns: the pinned worker is running the
-///   divergent build, so the re-dispatch must be claimable by any worker
-///   (e.g. one already running the rolled-back build);
-/// - clears `wake_requested`: a wake captured mid-cycle must not short-circuit
-///   the backoff — the row is durably `PENDING` and deferred purely by
-///   `scheduled_at` (`claim_task` enforces `scheduled_at <= NOW()`), so signals
-///   arriving while blocked are processed on the next backoff dispatch;
-/// - clears `activity_name`: a stale `'mixed_signal_suspension'` sentinel
-///   (issue #476/#600 timer+signal races) left on the row would otherwise let
-///   `primary_repend_workflow_task_query`'s wake fallback match this
-///   `PENDING`/future-`scheduled_at` row and reset `scheduled_at` to now on
-///   any unrelated wake, silently bypassing the backoff (issue #603 fix).
-///
-/// No `pg_notify`: the task is deliberately not claimable until `scheduled_at`,
-/// so waking pollers early would be pure noise.
+/// This path releases sticky affinity. The pinned worker runs the divergent
+/// build, so any worker must be able to claim the retry, such as one on the
+/// rolled-back build. All other columns follow [`workflow_backoff_set`].
 ///
 /// # Errors
 ///
@@ -3642,102 +3674,20 @@ pub async fn requeue_workflow_task_nd_blocked(
     delay: Duration,
     reason: &str,
 ) -> HarvestResult<()> {
-    use crate::schema::harvest_task_queue::dsl;
-    use diesel::dsl::sql;
-    use diesel::sql_types::{Double, Timestamptz};
-
-    let changeset = PendingRequeueChangeset::new(reason.to_string());
-
-    let updated = diesel::update(
-        dsl::harvest_task_queue
-            .find(task_id)
-            .filter(dsl::state.eq("RUNNING"))
-            .filter(dsl::task_type.eq("workflow")),
-    )
-    .set((
-        changeset,
-        dsl::scheduled_at.eq(
-            sql::<Timestamptz>("clock_timestamp() + make_interval(secs => ")
-                .bind::<Double, _>(delay_secs(delay))
-                .sql(")"),
-        ),
-        dsl::sticky_worker_id.eq(None::<String>),
-        dsl::sticky_until.eq(None::<chrono::DateTime<Utc>>),
-        dsl::sticky_timeout.eq(None::<chrono::Duration>),
-        dsl::wake_requested.eq(false),
-        dsl::activity_name.eq(None::<String>),
-        // A crash-recovery backoff is not a timer wake (issue #1402).
-        // Clear the marker so it cannot survive to name a stale timer
-        // once this row becomes due again.
-        dsl::timer_fires_at.eq(None::<chrono::DateTime<Utc>>),
-    ))
-    .returning((dsl::queue_name, dsl::priority, dsl::scheduled_at))
-    .get_results::<(String, i32, chrono::DateTime<Utc>)>(conn)
-    .await
-    .map_err(crate::error::database_error)?;
-
-    finish_workflow_backoff_requeue(task_id, updated)
+    requeue_workflow_task_with_backoff(conn, task_id, delay, reason, Some(StickyRelease::new()))
+        .await
 }
 
-/// Build the `SET` clause used by [`requeue_workflow_task_after_panic`] so a
-/// no-DB unit test can assert the generated SQL shape (issue #782). Mirrors the
-/// `park_workflow_task_query`/`PendingRequeueChangeset` shape-test precedent.
+/// Re-pend a workflow task after a contained handler panic (issue #782).
 ///
-/// Takes the changeset by value so the returned query owns it (the caller only
-/// needs the SQL text, never to execute it).
-#[cfg(test)]
-fn requeue_after_panic_query(changeset: PendingRequeueChangeset, delay: Duration) -> String {
-    use crate::schema::harvest_task_queue::dsl;
-    use diesel::debug_query;
-    use diesel::dsl::sql;
-    use diesel::pg::Pg;
-    use diesel::sql_types::{Double, Timestamptz};
-
-    let query = diesel::update(
-        dsl::harvest_task_queue
-            .find(Uuid::nil())
-            .filter(dsl::state.eq("RUNNING"))
-            .filter(dsl::task_type.eq("workflow")),
-    )
-    .set((
-        changeset,
-        dsl::scheduled_at.eq(
-            sql::<Timestamptz>("clock_timestamp() + make_interval(secs => ")
-                .bind::<Double, _>(delay_secs(delay))
-                .sql(")"),
-        ),
-        dsl::sticky_worker_id.eq(None::<String>),
-        dsl::sticky_until.eq(None::<chrono::DateTime<Utc>>),
-        dsl::sticky_timeout.eq(None::<chrono::Duration>),
-        dsl::wake_requested.eq(false),
-        dsl::activity_name.eq(None::<String>),
-        dsl::timer_fires_at.eq(None::<chrono::DateTime<Utc>>),
-    ));
-    debug_query::<Pg, _>(&query).to_string()
-}
-
-/// Re-pend a workflow task after a **contained handler panic** with a future
-/// `scheduled_at` (issue #782).
-///
-/// Behaviourally identical to [`requeue_workflow_task_nd_blocked`] — it reuses
-/// the shared [`PendingRequeueChangeset`] (task → `PENDING`, `crash_strikes =
-/// 0` so the poison-pill reclaimer never trips, `worker_id`/`started_at`/
-/// `last_heartbeat_at` nulled), plus clears the sticky affinity columns,
-/// `wake_requested`, and any stale `activity_name` sentinel, and appends **no**
-/// event — but is a distinct, named entry point so the panic-retry path is
-/// self-documenting and separately testable.
-///
-/// Unlike the ND-block path this stamps **no** execution-row diagnostic columns
-/// and needs **no** `FOR UPDATE` pause-guarded transaction: the panic re-pend
-/// touches only the task row, and the claim-layer `PAUSED` gate defers a
-/// re-pended task on a paused execution exactly like any pending workflow task.
-///
-/// The owning execution row (`harvest_workflow_executions`) is never touched, so
-/// its state stays `RUNNING` throughout the panic-retry loop; the task is
-/// deferred purely by `scheduled_at` (`claim_task` enforces `scheduled_at <=
-/// NOW()`), so a signal/timer arriving mid-backoff is processed on the next
-/// dispatch. No `pg_notify`: the row is deliberately not claimable until
-/// `scheduled_at`.
+/// This path releases sticky affinity, like [`requeue_workflow_task_nd_blocked`].
+/// It is a separate named entry point so the panic path stays easy to find.
+/// It appends no event and does not touch the execution row. The task row is
+/// deferred only by `scheduled_at`. A signal or timer that arrives during the
+/// backoff is handled on the next dispatch. The shared changeset resets
+/// `crash_strikes`, so the poison-pill reclaimer never trips on a panic loop.
+/// No `FOR UPDATE` guard is needed. The claim-layer `PAUSED` gate defers a
+/// re-pended task. All other columns follow [`workflow_backoff_set`].
 ///
 /// # Errors
 ///
@@ -3750,15 +3700,37 @@ pub async fn requeue_workflow_task_after_panic(
     delay: chrono::Duration,
     reason: &str,
 ) -> HarvestResult<()> {
+    requeue_workflow_task_with_backoff(conn, task_id, delay, reason, Some(StickyRelease::new()))
+        .await
+}
+
+/// Re-pend a deadlocked workflow task under its claim (issue #1797).
+///
+/// Writes the same columns as [`requeue_workflow_task_after_panic`]. The
+/// update also requires `claim` to be current. A deadlocked cycle runs for at
+/// least [`crate::executor::DEADLOCK_TIMEOUT`], so a reclaim can move the row
+/// in the meantime. A stale dispatcher then writes nothing.
+///
+/// Returns `Ok(false)` when the claim is no longer held.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on update failure.
+pub async fn requeue_claimed_workflow_task_after_deadlock(
+    conn: &mut AsyncPgConnection,
+    claim: &TaskClaim,
+    delay: chrono::Duration,
+    reason: &str,
+) -> HarvestResult<bool> {
     use crate::schema::harvest_task_queue::dsl;
     use diesel::dsl::sql;
     use diesel::sql_types::{Double, Timestamptz};
 
     let changeset = PendingRequeueChangeset::new(reason.to_string());
 
-    let updated = diesel::update(
+    let update = diesel::update(
         dsl::harvest_task_queue
-            .find(task_id)
+            .find(claim.task_id)
             .filter(dsl::state.eq("RUNNING"))
             .filter(dsl::task_type.eq("workflow")),
     )
@@ -3774,17 +3746,19 @@ pub async fn requeue_workflow_task_after_panic(
         dsl::sticky_timeout.eq(None::<chrono::Duration>),
         dsl::wake_requested.eq(false),
         dsl::activity_name.eq(None::<String>),
-        // A crash-recovery backoff is not a timer wake (issue #1402).
-        // Clear the marker so it cannot survive to name a stale timer
-        // once this row becomes due again.
         dsl::timer_fires_at.eq(None::<chrono::DateTime<Utc>>),
     ))
-    .returning((dsl::queue_name, dsl::priority, dsl::scheduled_at))
-    .get_results::<(String, i32, chrono::DateTime<Utc>)>(conn)
-    .await
-    .map_err(crate::error::database_error)?;
-
-    finish_workflow_backoff_requeue(task_id, updated)
+    .into_boxed();
+    let updated = fence(update, Some(claim))
+        .returning((dsl::queue_name, dsl::priority, dsl::scheduled_at))
+        .get_results::<(String, i32, chrono::DateTime<Utc>)>(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    if updated.is_empty() {
+        return Ok(false);
+    }
+    finish_workflow_backoff_requeue(claim.task_id, updated)?;
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------
@@ -7776,6 +7750,19 @@ mod tests {
     use super::*;
     use crate::error::CapabilityMissPhase;
 
+    /// `EnqueueParams` shares its input with the caller (issue #1733).
+    #[test]
+    fn enqueue_params_share_the_input() {
+        use crate::shared_json::SharedJson;
+        let input = SharedJson::from(serde_json::json!({"k": 1}));
+        let p = EnqueueParams::new("q", TaskType::Workflow, input.clone());
+        let copy = p.clone();
+        assert!(SharedJson::ptr_eq(&copy.input, &input));
+        assert!(SharedJson::ptr_eq(&p.input, &input));
+        let plain = EnqueueParams::new("q", TaskType::Workflow, serde_json::json!({"k": 1}));
+        assert_eq!(plain.input, serde_json::json!({"k": 1}));
+    }
+
     // ── Issue #811: latest-wins strategy on the concurrency admin read ──────
 
     /// `GET /admin/concurrency` is a `free_form` contract route, so the
@@ -10873,7 +10860,7 @@ mod tests {
     #[test]
     fn requeue_after_panic_query_resets_and_unpins_the_task_row() {
         let changeset = PendingRequeueChangeset::new("handler panic: boom".to_string());
-        let sql = requeue_after_panic_query(changeset, Duration::seconds(5));
+        let sql = workflow_backoff_sql(changeset, Duration::seconds(5), Some(StickyRelease::new()));
 
         // Every column is emitted as a bound parameter (`= $N`) by
         // `debug_query`, mirroring the sibling `pending_requeue_changeset`
@@ -10936,7 +10923,7 @@ mod tests {
     #[test]
     fn requeue_workflow_task_for_quota_retry_query_clears_sentinel_and_wake() {
         let changeset = PendingRequeueChangeset::new("quota exceeded".to_string());
-        let sql = requeue_workflow_task_for_quota_retry_query(changeset, Duration::seconds(5));
+        let sql = workflow_backoff_sql(changeset, Duration::seconds(5), None);
 
         for column in ["wake_requested", "activity_name", "timer_fires_at"] {
             assert!(
@@ -11024,6 +11011,55 @@ mod tests {
             result.is_ok(),
             "expected Ok(()) for a matched row: {result:?}"
         );
+    }
+
+    /// Issue #1751: every backoff path shares one `SET` builder. The shared
+    /// part must hold the DB-clock deadline and the three stale-marker clears.
+    #[test]
+    fn workflow_backoff_set_carries_the_shared_clears_with_or_without_sticky() {
+        for sticky in [None, Some(StickyRelease::new())] {
+            let changeset = PendingRequeueChangeset::new("why".to_string());
+            let sql = workflow_backoff_sql(changeset, Duration::seconds(5), sticky);
+
+            assert!(
+                sql.contains("\"scheduled_at\" = clock_timestamp() + make_interval(secs => $"),
+                "scheduled_at must use the DB clock: {sql}"
+            );
+            for column in ["wake_requested", "activity_name", "timer_fires_at"] {
+                assert!(
+                    sql.contains(&format!("\"{column}\" = $")),
+                    "{column} must be cleared: {sql}"
+                );
+            }
+        }
+    }
+
+    /// Issue #1751: sticky release is data, not a code fork. `None` leaves the
+    /// three sticky columns out of the `SET`. `Some` nulls all three.
+    #[test]
+    fn workflow_backoff_set_touches_sticky_columns_only_when_released() {
+        let columns = ["sticky_worker_id", "sticky_until", "sticky_timeout"];
+        let kept = workflow_backoff_sql(
+            PendingRequeueChangeset::new("why".to_string()),
+            Duration::seconds(5),
+            None,
+        );
+        let released = workflow_backoff_sql(
+            PendingRequeueChangeset::new("why".to_string()),
+            Duration::seconds(5),
+            Some(StickyRelease::new()),
+        );
+
+        for column in columns {
+            assert!(
+                !kept.contains(column),
+                "{column} must stay untouched: {kept}"
+            );
+            assert!(
+                released.contains(&format!("\"{column}\" = $")),
+                "{column} must be released: {released}"
+            );
+        }
     }
 
     #[test]
@@ -11221,7 +11257,7 @@ mod tests {
             workflow_exec_id: None,
             activity_name: None,
             activity_id: None,
-            input: serde_json::Value::Null,
+            input: serde_json::Value::Null.into(),
             priority: 0,
             max_attempts: 1,
             scheduled_at: Utc::now(),

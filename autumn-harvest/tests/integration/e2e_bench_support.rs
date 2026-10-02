@@ -3326,7 +3326,7 @@ pub mod db {
             workflow_name,
             workflow_id,
             exec_id,
-            input: serde_json::json!({}),
+            input: serde_json::json!({}).into(),
             parent_id: None,
             queue_name: BENCH_QUEUE,
             execution_timeout: None,

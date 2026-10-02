@@ -1506,3 +1506,162 @@ async fn join_of_a_signal_wait_and_an_activity_resolves_both_branches() {
         history.events
     );
 }
+
+/// Counts `record_activity_attempt` calls, the last metric a race-loser
+/// activity cancellation records.
+#[derive(Default)]
+struct AttemptCounter(std::sync::atomic::AtomicUsize);
+
+impl AttemptCounter {
+    fn count(&self) -> usize {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl autumn_harvest::telemetry::MetricsRecorder for AttemptCounter {
+    fn record_activity_attempt(
+        &self,
+        _activity_name: &str,
+        _queue: &str,
+        _outcome: autumn_harvest::telemetry::ActivityStatus,
+    ) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// A parked execution with one open race-loser activity and a metrics
+/// counter wired into its registry. Event id 0 is already taken.
+struct RaceLoserFixture {
+    conn: AsyncPgConnection,
+    exec_id: ExecutionId,
+    loser: autumn_harvest::types::ActivityExecId,
+    counter: Arc<AttemptCounter>,
+    registry: Arc<HandlerRegistry>,
+    _guard: Option<testcontainers::ContainerAsync<testcontainers_modules::postgres::Postgres>>,
+}
+
+async fn race_loser_fixture() -> RaceLoserFixture {
+    use autumn_harvest::queue::{self, EnqueueParams, TaskType};
+    use autumn_harvest::telemetry::TelemetryConfig;
+    use autumn_harvest::types::ActivityExecId;
+    use diesel_async::RunQueryDsl;
+
+    let (database_url, guard) = setup_test_database_url_or_env().await;
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("connect");
+
+    let exec_id = ExecutionId::new();
+    diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions \
+         (id, workflow_name, workflow_id, shard_id, input) \
+         VALUES ($1, 'race-loser-metrics', $2, 0, '{}'::jsonb)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Text, _>(exec_id.as_uuid().to_string())
+    .execute(&mut conn)
+    .await
+    .expect("insert execution");
+
+    let loser = ActivityExecId::new();
+    let mut params = EnqueueParams::new(
+        format!("rlm-{}", &exec_id.as_uuid().simple().to_string()[..12]),
+        TaskType::Activity,
+        serde_json::json!({}),
+    );
+    params.workflow_exec_id = Some(exec_id.as_uuid());
+    params.activity_name = Some("loser".to_string());
+    params.activity_id = Some(loser.as_uuid());
+    queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue the open loser");
+
+    autumn_harvest::store::append_events(
+        &mut conn,
+        exec_id,
+        &[WorkflowEvent::WorkflowCompleted {
+            output: serde_json::json!({}),
+        }],
+        0,
+    )
+    .await
+    .expect("seed the event at id 0");
+
+    let counter = Arc::new(AttemptCounter::default());
+    let telemetry = Arc::new(TelemetryConfig::builder().metrics(counter.clone()).build());
+    let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
+        vec![],
+        vec![],
+        autumn_harvest::context::empty_shared_state(),
+        telemetry,
+    ));
+    RaceLoserFixture {
+        conn,
+        exec_id,
+        loser,
+        counter,
+        registry,
+        _guard: guard,
+    }
+}
+
+async fn cancel_the_loser(
+    fixture: &mut RaceLoserFixture,
+    next_event_id: &mut i32,
+) -> autumn_harvest::error::HarvestResult<()> {
+    let commands = vec![autumn_harvest::WorkflowCommand::CancelRaceLosers {
+        activities: vec![fixture.loser],
+        children: vec![],
+        timers: vec![],
+    }];
+    autumn_harvest::worker::apply_race_loser_cancellations(
+        &mut fixture.conn,
+        fixture.exec_id,
+        &commands,
+        next_event_id,
+        &fixture.registry,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Issue #1787, Codex P2: race-loser metrics must wait for the synthetic
+/// loser append.
+///
+/// An event-id conflict on that append now rolls back and re-drives the
+/// workflow task. The re-drive cancels the same loser again. A metric
+/// recorded before the failed append would count the loser twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn race_loser_metrics_wait_for_the_synthetic_loser_append() {
+    let mut fixture = race_loser_fixture().await;
+    // Event id 0 is taken, so the append at cursor 0 conflicts.
+    let mut next_event_id = 0;
+
+    let result = cancel_the_loser(&mut fixture, &mut next_event_id).await;
+
+    assert!(
+        result
+            .as_ref()
+            .is_err_and(autumn_harvest::error::HarvestError::is_event_id_unique_violation),
+        "the synthetic loser append must conflict: {result:?}"
+    );
+    assert_eq!(
+        fixture.counter.count(),
+        0,
+        "no metric may be recorded before the append that can still fail"
+    );
+}
+
+/// The success path still records the loser once, after the append.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn race_loser_metrics_are_recorded_once_after_a_successful_append() {
+    let mut fixture = race_loser_fixture().await;
+    // Event id 0 is taken, so the free cursor is 1.
+    let mut next_event_id = 1;
+
+    cancel_the_loser(&mut fixture, &mut next_event_id)
+        .await
+        .expect("the append at a free cursor succeeds");
+
+    assert_eq!(fixture.counter.count(), 1, "one loser, one metric");
+}

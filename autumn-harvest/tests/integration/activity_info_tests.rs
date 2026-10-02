@@ -308,7 +308,7 @@ async fn seed_workflow(
         workflow_id: &workflow_id,
         run_id: Uuid::new_v4(),
         shard_id: 0,
-        input: input.clone(),
+        input: input.clone().into(),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,

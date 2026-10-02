@@ -71,7 +71,7 @@ Need a real reference instead of the tiny hello-world path? See:
   integration with app routes, workflow outbox publication, `HarvestPlugin`, saga compensation,
   child workflows, version gates, signals, timers, deterministic side effects, and scheduled DAGs.
 - [`examples/standalone-runner/`](examples/standalone-runner/) for the out-of-the-box runner path:
-  no Autumn plugin, just `HarvestRunner` plus a manually mounted management API router.
+  no Autumn plugin, just `HarvestEmbedding` on a plain Axum server, with a metrics route.
 - [`examples/claude-agent-daemon/`](examples/claude-agent-daemon/) for a local daemon that runs
   Claude agent sessions as durable workflows on the embedded SQLite backend — no Postgres, no
   Docker. Each model call and tool call is an activity, a workspace write parks on an
@@ -324,13 +324,14 @@ for a compile-checked polling loop that works with and without the `db` feature.
 Use `autumn-harvest-plugin` if you're building an Autumn app. For a non-web
 context — a worker or CLI process with no HTTP surface at all — use the bare
 `autumn-harvest` crate directly; it is the executor and storage layer, with
-no framework dependency of its own. To expose the management API (and, for
-the Vantage UI, `harvest_ui_router`) from a Rust service on plain Axum
-instead of autumn-web, mount `autumn-harvest-plugin`'s `harvest_api_router`
-yourself — [`examples/standalone-runner`](examples/standalone-runner/)
-demonstrates the management-API mount. Both routers return
-`axum::Router<()>`, so this path is for Axum services, not an arbitrary
-framework.
+no framework dependency of its own. To run Harvest and serve the management
+API and Vantage from a Rust service on plain Axum instead of autumn-web, use
+`HarvestEmbedding`. Start with the getting-started fork,
+[The first workflow on plain Axum](docs/getting-started/standalone-axum.md).
+[`docs/embedding.md`](docs/embedding.md) is the reference: auth, metrics,
+webhooks, shutdown, and what is not available off the plugin path. The
+router is `axum::Router<()>`, so this path is for Axum services, not an
+arbitrary framework.
 
 ## CLI
 
@@ -644,6 +645,7 @@ helpers directly.
 
 ```rust
 use autumn_harvest::prelude::*;
+use std::time::Duration;
 
 #[activity(retry = RetryPolicy::exponential(5, Duration::from_secs(1)))]
 async fn charge_card(ctx: &ActivityContext, amount: u32) -> Result<(), ActivityFailure> {
@@ -937,6 +939,7 @@ trigger rules, or multi-step pipelines between tasks.
 
 ```rust
 use autumn_harvest::policy::{Schedule, WorkflowSchedule};
+use autumn_harvest::prelude::*;
 
 // Register a daily billing run at 03:00 UTC with at-most-1 concurrent run.
 let sched = WorkflowSchedule::new(
@@ -946,12 +949,15 @@ let sched = WorkflowSchedule::new(
 .with_input(serde_json::json!({"region": "us-east"}))
 .with_max_active_runs(1);
 
-// Wire it into the builder alongside your workflow registration.
-let app = autumn_web::app()
+// Wire it into `HarvestBuilder` alongside your workflow registration.
+let harvest = HarvestBuilder::new()
     .workflows(workflows![daily_billing_report])
     .workflow_schedule(sched)
     .worker(WorkerConfig::default());
 ```
+
+`HarvestPlugin` has no `workflow_schedule` method. An app that mounts the
+plugin creates schedules at runtime with the CLI or HTTP API below.
 
 The scheduler tick derives a deterministic `workflow_id` of
 `sched:{name}:{unix_ts}` so retries after a crashed tick are idempotent.
@@ -1052,7 +1058,10 @@ The embedded Vantage UI (`harvest_ui_router`, typically mounted at `/api/harvest
 
 ## Requirements
 
-- Rust 1.88.0 or newer (MSRV)
+- Rust 1.88.0 or newer (MSRV). A checkout of this repository builds with the
+  release pinned in `rust-toolchain.toml` (currently 1.99.0); `rustup`
+  installs it on the first `cargo` call. CI uses the same pin, so a new
+  stable release changes CI only when that file changes.
 - Postgres 12+ — except for `cargo dev`, whose `dev-runtime-managed` tier
   downloads one for you
 - The `db` feature is enabled by default and pulls Diesel + diesel-async; build
