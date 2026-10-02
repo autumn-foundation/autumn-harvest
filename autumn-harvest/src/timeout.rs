@@ -640,6 +640,9 @@ struct TimeoutScanLane {
     as_of: Option<chrono::DateTime<chrono::Utc>>,
     /// Expired ids from the last refill, not yet handed out.
     queued: std::collections::VecDeque<uuid::Uuid>,
+    /// Ids that failed to enforce on the last pass. The next pass loads them
+    /// next to its batch, outside the batch limit.
+    retry: Vec<uuid::Uuid>,
 }
 
 /// Where the next batched task-timeout scan starts (issue #1795).
@@ -661,12 +664,41 @@ struct TimeoutScanLane {
 /// Each refill reads at most one page of index entries, and each pass loads
 /// at most one batch. So the work of a pass does not grow with the backlog.
 ///
-/// A failed pass still moves the lane. So one bad row cannot block the rows
-/// behind it. Rows that the failed pass did not reach wait for the next
-/// sweep.
+/// A row that fails to enforce is tried again on the next pass, next to the
+/// next batch. So one bad row cannot block the rows behind it, and a leader
+/// that fails on it keeps failing until it gives up its lease. A replica that
+/// comes back from standby starts a new sweep.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TimeoutScanCursor {
     lanes: [TimeoutScanLane; 4],
+}
+
+impl TimeoutScanCursor {
+    /// Tries `id` again on the next pass, in the lane of `reason`.
+    pub(crate) fn retry(&mut self, reason: &TimeoutReason, id: uuid::Uuid) {
+        self.lanes[timeout_lane(reason)].retry.push(id);
+    }
+
+    /// Prepares the cursor for a tick that runs the pass.
+    ///
+    /// After a tick that did not run the pass, for example as a standby, the
+    /// cursor starts a new sweep. The old sweep's clock and queue are stale,
+    /// and another replica may have done its work.
+    pub(crate) fn resume(&mut self, ran_last_tick: bool) {
+        if !ran_last_tick {
+            *self = Self::default();
+        }
+    }
+}
+
+/// The lane of `reason` in [`task_timeout_scans`] order.
+const fn timeout_lane(reason: &TimeoutReason) -> usize {
+    match reason {
+        TimeoutReason::Heartbeat => 0,
+        TimeoutReason::StartToClose => 1,
+        TimeoutReason::ScheduleToStart => 2,
+        TimeoutReason::ScheduleToClose => 3,
+    }
 }
 
 #[derive(diesel::QueryableByName)]
@@ -758,10 +790,13 @@ pub async fn find_timed_out_tasks_batch(
         let take = usize::try_from(limit)
             .unwrap_or(usize::MAX)
             .min(lane.queued.len());
-        if take == 0 {
+        // Retried ids ride along outside the limit, so a row that keeps
+        // failing cannot stall the rows behind it.
+        let mut batch = std::mem::take(&mut lane.retry);
+        batch.extend(lane.queued.drain(..take));
+        if batch.is_empty() {
             continue;
         }
-        let batch: Vec<uuid::Uuid> = lane.queued.drain(..take).collect();
         let page: Vec<TaskQueueItem> = diesel::sql_query(timeout_batch_query(predicate, higher))
             .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&batch)
             .load(conn)
@@ -5076,13 +5111,18 @@ pub(crate) async fn enforce_timeouts_once_on_conn_shard(
         ),
     }
 
-    let timed_out = match task_scan {
-        TaskScan::All => find_timed_out_tasks(conn).await?,
-        TaskScan::Batch { cursor, limit } => {
-            find_timed_out_tasks_batch(conn, cursor, limit).await?
-        }
+    let (timed_out, mut retry_cursor) = match task_scan {
+        TaskScan::All => (find_timed_out_tasks(conn).await?, None),
+        TaskScan::Batch { cursor, limit } => (
+            find_timed_out_tasks_batch(conn, cursor, limit).await?,
+            Some(cursor),
+        ),
     };
     count += timed_out.len();
+    // Issue #1795: in a batched pass, a row that fails is tried again on the
+    // next pass, and the rest of the pass goes on. The pass still reports the
+    // first error, so a leader that keeps failing gives up its lease.
+    let mut first_error = None;
 
     for (task, reason) in timed_out {
         let result = match (task.task_type.as_str(), task.workflow_exec_id) {
@@ -5120,7 +5160,13 @@ pub(crate) async fn enforce_timeouts_once_on_conn_shard(
                 error = %error,
                 "failed to enforce timed-out task"
             );
-            return Err(error);
+            match retry_cursor.as_deref_mut() {
+                Some(cursor) => {
+                    cursor.retry(&reason, task.id);
+                    first_error.get_or_insert(error);
+                }
+                None => return Err(error),
+            }
         }
     }
 
@@ -5304,7 +5350,7 @@ pub(crate) async fn enforce_timeouts_once_on_conn_shard(
             crate::mutex::reclaim_expired_leases_and_wake(conn).await
         })
         .await?;
-    Ok(count)
+    first_error.map_or(Ok(count), Err)
 }
 
 /// Spawn a background task that periodically checks for timed-out tasks.
@@ -5553,6 +5599,7 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
         let mut cursor = TimeoutScanCursor::default();
         let mut last_role: Option<ScannerRole> = None;
         let mut leader_failures = crate::scanner_lease::LeaderFailures::default();
+        let mut ran_last_tick = true;
         let mut abdicated_until: Option<tokio::time::Instant> = None;
         loop {
             // Issue #1795: a random sleep in `[1 - jitter, 1 + jitter]` of
@@ -5622,6 +5669,10 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
                         last_role = Some(role);
                     }
 
+                    if role.runs_pass() {
+                        cursor.resume(ran_last_tick);
+                    }
+                    ran_last_tick = role.runs_pass();
                     if role.runs_pass() {
                         let failed = match enforce_timeouts_once_on_conn_shard(
                             &mut conn,
@@ -6439,6 +6490,46 @@ mod tests {
             "AND NOT EXISTS (SELECT 1 FROM ({higher} AND id = ANY($1)) h WHERE h.id = q.id)"
         )));
         assert!(!sql.contains("LIMIT"));
+    }
+
+    #[test]
+    fn timeout_lanes_follow_the_scan_order() {
+        for (index, (reason, _)) in task_timeout_scans().into_iter().enumerate() {
+            assert_eq!(timeout_lane(&reason), index, "{reason:?}");
+        }
+    }
+
+    #[test]
+    fn a_cursor_starts_a_new_sweep_after_a_tick_without_a_pass() {
+        let mut cursor = TimeoutScanCursor::default();
+        cursor.lanes[1] = TimeoutScanLane {
+            after: Some((chrono::Utc::now(), uuid::Uuid::new_v4())),
+            as_of: Some(chrono::Utc::now()),
+            queued: std::collections::VecDeque::from([uuid::Uuid::new_v4()]),
+            retry: vec![uuid::Uuid::new_v4()],
+        };
+        let mid_sweep = cursor.clone();
+        // A leader that ran the last tick goes on with its sweep.
+        cursor.resume(true);
+        assert_eq!(cursor, mid_sweep);
+        // A replica back from standby starts again with a new clock.
+        cursor.resume(false);
+        assert_eq!(cursor, TimeoutScanCursor::default());
+    }
+
+    #[test]
+    fn a_failed_row_is_retried_in_its_own_lane() {
+        let mut cursor = TimeoutScanCursor::default();
+        let id = uuid::Uuid::new_v4();
+        cursor.retry(&TimeoutReason::ScheduleToStart, id);
+        assert_eq!(cursor.lanes[2].retry, vec![id]);
+        assert!(
+            cursor
+                .lanes
+                .iter()
+                .enumerate()
+                .all(|(i, l)| i == 2 || l.retry.is_empty())
+        );
     }
 
     #[test]

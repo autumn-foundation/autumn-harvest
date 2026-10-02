@@ -271,6 +271,104 @@ async fn a_coordinated_checker_reuses_its_connection_for_its_own_shard() {
     let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
 }
 
+/// Inserts an expired RUNNING activity row whose execution history cannot be
+/// decoded. Enforcing it fails on every pass.
+async fn insert_poisoned_task(conn: &mut AsyncPgConnection, queue: &str) -> uuid::Uuid {
+    let exec = uuid::Uuid::new_v4();
+    diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions (id, workflow_name, workflow_id, shard_id, input) \
+         VALUES ($1, 'scanner-lease-poison', $2, 0, '{}'::jsonb)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec)
+    .bind::<diesel::sql_types::Text, _>(exec.to_string())
+    .execute(conn)
+    .await
+    .expect("insert execution");
+    diesel::sql_query(
+        "INSERT INTO harvest_events (workflow_exec_id, event_id, event_type, event_data, timestamp) \
+         VALUES ($1, 1, 'WorkflowStarted', '{\"type\": \"NoSuchEvent\"}'::jsonb, NOW())",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec)
+    .execute(conn)
+    .await
+    .expect("insert undecodable event");
+    let id = uuid::Uuid::new_v4();
+    diesel::sql_query(
+        "INSERT INTO harvest_task_queue \
+         (id, queue_name, task_type, input, state, attempt, max_attempts, \
+          started_at, start_to_close, workflow_exec_id, activity_name) \
+         VALUES ($1, $2, 'activity', '{}'::jsonb, 'RUNNING', \
+                 1, 1, NOW() - INTERVAL '1 minute', INTERVAL '1 second', $3, 'poisoned')",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(id)
+    .bind::<diesel::sql_types::Text, _>(queue)
+    .bind::<diesel::sql_types::Uuid, _>(exec)
+    .execute(conn)
+    .await
+    .expect("insert poisoned task");
+    id
+}
+
+/// A row that fails to enforce is tried again on the next pass, next to the
+/// next batch. The other rows still drain. A leader that fails on it three
+/// passes in a row gives up the lease, so another replica can try.
+#[tokio::test]
+async fn a_failed_row_is_retried_until_the_leader_gives_up() {
+    let (url, _container) = setup_test_db_url().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.expect("connection");
+    let queue = "scanner-lease-poison";
+    let good = insert_expired_running_tasks(&mut conn, queue, 20).await;
+    let poisoned = insert_poisoned_task(&mut conn, queue).await;
+
+    let mut spec = Spec::new(
+        ShardId::new(17_959),
+        "poisoned-leader",
+        Duration::from_millis(50),
+        Duration::from_secs(10),
+    );
+    spec.batch = 1;
+    let checker = spawn_checker(&pool, spec);
+    let metrics = checker.metrics.clone();
+    wait_for(
+        "the leader to give up its lease",
+        Duration::from_secs(10),
+        || metrics.role("standby") > 0,
+    )
+    .await;
+    wait_for_running(&mut conn, &good, 0, Duration::from_secs(10)).await;
+    stop_all(vec![checker]).await;
+
+    let left = still_running(&mut conn, &[poisoned]).await;
+    diesel::sql_query("DELETE FROM harvest_task_queue WHERE queue_name = $1")
+        .bind::<diesel::sql_types::Text, _>(queue)
+        .execute(&mut conn)
+        .await
+        .expect("clear queue");
+    assert_eq!(left, 1, "the poisoned row cannot be enforced");
+}
+
+/// Waits until `want` rows among `ids` are still RUNNING.
+async fn wait_for_running(
+    conn: &mut AsyncPgConnection,
+    ids: &[uuid::Uuid],
+    want: i64,
+    limit: Duration,
+) {
+    let deadline = Instant::now() + limit;
+    loop {
+        let n = still_running(conn, ids).await;
+        if n == want {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{n} rows still RUNNING, want {want}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 async fn stop_all(checkers: Vec<Checker>) {
     for c in &checkers {
         c.cancel.cancel();

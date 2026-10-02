@@ -16,7 +16,10 @@ size, so adding workers to clear a backlog added database load in proportion.
   open: the replica runs the pass, as before.
 - **Abdication.** A holder whose pass fails three times in a row gives up the
   lease and stands by for one TTL. A pass can fail on one replica alone, for
-  example on a codec only that replica lacks.
+  example on a codec only that replica lacks. A row that fails to enforce is
+  tried again on the next pass, next to the next batch, so its failures run
+  in a row while the other rows still drain. A tick in any other role ends
+  the run, and a replica back from standby starts a new sweep.
 - **Not a fence.** Two holders for a short time are safe, because every
   sub-pass is already safe with concurrent runners.
 - **Bounded scans.** The checker enforces at most one batch per timeout
@@ -77,6 +80,9 @@ Tests run in `scanner_lease_tests` against Postgres 16:
   first pass, because each refill scanned every live row).
 - A spawned checker with a batch of 3 enforces exactly 3 of 7 rows in one
   pass.
+- A row whose history cannot be decoded is retried every pass. The 20 other
+  rows still drain, and the leader gives up its lease (RED: the row failed
+  once per sweep, so the leader never gave up).
 - An aborted holder keeps its lease until the TTL, then a standby takes over
   with a higher epoch. A renewal keeps the epoch. A graceful stop expires the
   lease, and a standby leads on its next tick (RED: no lease taken).

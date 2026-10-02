@@ -231,6 +231,11 @@ terminal rows.
 A row that matches two reasons gets the first one, in the order above. So
 the recorded timeout type does not depend on where each cursor is.
 
+A row that fails to enforce is tried again on the next pass, next to the
+next batch. So one bad row does not block the rows behind it. A leader that
+fails three passes in a row gives up its lease, and another replica tries.
+A replica that comes back from standby starts a new sweep.
+
 ### Jitter
 
 By default, each sleep is the interval times a random factor in
