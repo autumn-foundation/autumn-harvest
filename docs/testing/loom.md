@@ -128,7 +128,7 @@ normal build and only pulled in under `RUSTFLAGS="--cfg loom"`.
 ## Adding a new model
 
 1. Confirm the target is genuinely in-process and lock/atomic-based (not tokio
-   async — that's a Shuttle candidate).
+   async; use Shuttle for that, see [`shuttle.md`](shuttle.md)).
 2. Route its `Arc`/`Mutex`/atomics through `crate::loom_sync` (or `loom::sync::*`
    in an atomic's case), gated so the non-loom path stays `std`.
 3. Add a `#[test]` in `tests/loom_models.rs` wrapping the body in

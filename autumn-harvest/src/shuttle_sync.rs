@@ -5,7 +5,8 @@
 //!
 //! Under `RUSTFLAGS="--cfg shuttle"`, the same names resolve to the
 //! `shuttle-tokio` and `shuttle-tokio-util` types. Shuttle then controls every
-//! await on them. Only the `tests/shuttle_models.rs` target sets that flag.
+//! await on them. Only the `shuttle` CI job and the command in
+//! `docs/testing/shuttle.md` set that flag.
 //!
 //! Only [`crate::slot_tuner`] and [`crate::heartbeat`] import from this shim.
 //! The rest of the crate keeps its direct tokio imports. See

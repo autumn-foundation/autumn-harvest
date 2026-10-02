@@ -495,9 +495,11 @@ impl TunedSlotRuntime {
 
     /// Number of permits withheld from dispatch.
     ///
-    /// `withheld_permits() + live_target() == max_slots` holds between calls.
-    /// A permit that a background shrink holds still counts in the live
-    /// target. The Shuttle model checks this law (issue #1800).
+    /// `withheld_permits() + live_target() == max_slots` holds between calls
+    /// when the semaphore starts with exactly `max_slots` permits. A permit
+    /// that a background shrink holds still counts in the live target. The
+    /// Shuttle model checks this law (issue #1800). The fallback in
+    /// [`Self::new`] for a smaller semaphore does not keep it.
     #[must_use]
     pub fn withheld_permits(&self) -> usize {
         self.withheld
@@ -518,10 +520,11 @@ impl TunedSlotRuntime {
 
     /// Reap, cancel or keep the background shrink-acquire for `desired`.
     ///
-    /// A finished task's permit is withheld while the live target is still
-    /// above `desired`; otherwise it goes back to the semaphore. A task that
+    /// `resize_toward` calls this before and after its own adjustment. A
+    /// finished task's permit is withheld while the live target is still above
+    /// `desired`. Otherwise the permit goes back to the semaphore. A task that
     /// is still queued is cancelled once the live target is at or below
-    /// `desired`, and kept otherwise.
+    /// `desired`. Otherwise it is kept.
     async fn settle_pending_shrink(&mut self, desired: usize) {
         let Some(handle) = self.pending_shrink.take() else {
             return;
@@ -529,10 +532,10 @@ impl TunedSlotRuntime {
         if handle.is_finished() {
             // Never actually suspends: `is_finished()` already
             // confirmed the task has completed.
-            // Else (condition false) a later Grow reversed the earlier
-            // shrink intent (issue #548 review, round 2): `permit` just
-            // drops here, releasing it straight back to the semaphore
-            // rather than withholding it.
+            // If the live target is already at or below `desired`, `permit`
+            // drops here and goes straight back to the semaphore. That
+            // happens when a later Grow reverses the shrink (issue #548), or
+            // when the `try_acquire` loop already reached the target.
             if let Ok(Some(permit)) = handle.await
                 && self.live_target() > desired
             {
@@ -542,19 +545,17 @@ impl TunedSlotRuntime {
             // `Ok(None)` (semaphore closed) or `Err` (task panicked):
             // nothing to reap.
         } else if desired >= self.live_target() {
-            // No longer trying to shrink below what's already achieved
-            // (issue #548 review, round 4) — cancel the outstanding
-            // request instead of leaving it queued. Left in place, it
-            // could otherwise win a permit this same tick's own Grow
-            // is about to release below, silently taking one away from
-            // dispatch instead of letting it become genuinely
-            // available. `JoinHandle::abort` on a task still blocked
-            // in `.acquire()` cleanly removes it from the semaphore's
-            // wait list — no permit is lost, since one is only ever
-            // assigned once the acquire actually resolves.
+            // The tuner no longer needs this acquire (issue #548): the live
+            // target is already at or below `desired`. Cancel the request
+            // instead of leaving it queued. Left in place, it can take a
+            // permit that a Grow releases, or one that dispatch returns, and
+            // keep that permit from dispatch. `JoinHandle::abort` is
+            // asynchronous: the queued acquire drops on the task's next poll.
+            // A permit given to it before then goes back to the semaphore at
+            // that drop, so no permit is lost.
             handle.abort();
         } else {
-            // Still legitimately in flight toward a shrink we still want.
+            // Still in flight toward a shrink that the tuner still wants.
             self.pending_shrink = Some(handle);
         }
     }
@@ -609,7 +610,10 @@ impl TunedSlotRuntime {
             // Raise the live target before the permits become free (issue
             // #1800). Otherwise a dispatch task that takes a released permit
             // runs above the live target that readers see. The semaphore
-            // release orders this store before that acquire.
+            // release orders this store before that acquire. The occupancy
+            // sampler is not ordered with the tuner. For one sample it can
+            // read the new target with the old free count, and so count too
+            // many slots as in use.
             self.live_target.fetch_add(released, Ordering::Relaxed);
             drop(to_release);
         } else if desired < current {
@@ -674,10 +678,9 @@ impl TunedSlotRuntime {
         // wait list, it must be removed before the permits below are
         // released, or it could win one of them ahead of
         // `drain_in_flight`'s later request (which joins the same fair
-        // queue). `JoinHandle::abort` on a task blocked in `.acquire()`
-        // drops the inner future, which removes it from the wait list —
-        // this never loses a permit, since one is only assigned once the
-        // acquire actually resolves.
+        // queue). `JoinHandle::abort` is asynchronous: the queued acquire
+        // drops on the task's next poll. A permit given to it before then
+        // goes back to the semaphore at that drop, so no permit is lost.
         if let Some(handle) = self.pending_shrink.take() {
             handle.abort();
         }

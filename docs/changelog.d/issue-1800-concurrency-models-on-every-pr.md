@@ -27,9 +27,9 @@ them. `cfg(shuttle)` is in the workspace `check-cfg` list.
 
 **Heartbeat seam.** `heartbeat.rs` no longer needs the `db` feature for its
 loop. `run_heartbeat_flusher` drains the channel and writes through a
-`HeartbeatSink`. The Postgres sink keeps the old log lines, the lease-lost
-cancel and the retry-on-error behaviour. `spawn_heartbeat_flusher` has the
-same signature.
+`HeartbeatSink`. The Postgres sink keeps the old log lines, and logs and skips
+a failed write. On a lost lease, the loop cancels the activity, as before.
+`spawn_heartbeat_flusher` has the same signature.
 
 **Defects fixed.** The slot-tuner model found two defects in
 `TunedSlotRuntime::resize_toward`:

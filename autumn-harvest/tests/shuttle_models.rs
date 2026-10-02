@@ -22,8 +22,8 @@
 //! RUSTFLAGS="--cfg shuttle" cargo test -p autumn-harvest --no-default-features --test shuttle_models --release
 //! ```
 //!
-//! Shuttle samples schedules. It does not explore all of them, as loom does.
-//! A pass is strong evidence, not a proof. See `docs/testing/shuttle.md`.
+//! Loom explores every schedule. Shuttle samples them, so a pass is strong
+//! evidence, not a proof. See `docs/testing/shuttle.md`.
 
 #![cfg(shuttle)]
 
@@ -55,15 +55,17 @@ const MAX_SLOTS: usize = 4;
 
 /// Two dispatch tasks race a tuner that grows and shrinks the live target.
 ///
-/// The model checks three properties:
+/// The model checks four properties:
 ///
 /// 1. At every tuner step, `withheld + live_target == max_slots`.
 /// 2. Dispatch never holds more permits than the live target.
-/// 3. After the race, the tuner settles on its target, and a drain of all
-///    `max_slots` permits completes after `release_all_withheld`.
+/// 3. After the race, the tuner settles on its target. With no further tuner
+///    call, the free permit count then reaches the target. A permit that a
+///    stray background shrink keeps stops it short, and the wait never ends.
+/// 4. After `release_all_withheld`, a drain of all `max_slots` permits
+///    completes.
 ///
-/// Property 3 also covers the background shrink task. If that task kept a
-/// permit, the drain would deadlock, and Shuttle reports a deadlock as a
+/// Shuttle reports a deadlock, or a run that exceeds its step limit, as a
 /// failure.
 fn slot_tuner_model() {
     block_on(async {

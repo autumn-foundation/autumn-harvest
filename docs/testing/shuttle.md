@@ -25,8 +25,8 @@ types, so a `db` build does not compile under `--cfg shuttle`.
 
 ## What Shuttle checks, and what it does not
 
-- Shuttle samples schedules. It does not explore all of them, as loom does.
-  A pass is strong evidence, not a proof.
+- Loom explores every schedule. Shuttle samples them, so a pass is strong
+  evidence, not a proof.
 - Each model runs under two schedulers. The random scheduler picks a random
   task at each step. The PCT scheduler finds bugs of small depth with a
   known probability.
@@ -71,9 +71,9 @@ Each model is one function. Two `#[test]`s run it: one with
    - `withheld_permits() + live_target() == max_slots` after each resize;
    - dispatch never holds more permits than the live target;
    - after the race, the tuner settles on its target;
-   - after `release_all_withheld`, a drain of all permits completes. This
-     covers the background shrink task: a permit that it kept would block the
-     drain.
+   - with no further tuner call, the free permit count then reaches the
+     target. A permit that a stray background shrink keeps stops it short;
+   - after `release_all_withheld`, a drain of all permits completes.
 2. **`heartbeat_flush_keeps_send_order_*`.** An activity sends five numbered
    heartbeats into a channel of capacity two. The flusher drains it in
    parallel. The model checks that flushes keep send order, that the newest
@@ -95,13 +95,15 @@ Both are fixed in the change that added the model (issue #1800).
    before the dispatch task's acquire.
 2. **Stray background shrink.** A shrink can reach its target through
    `try_acquire` while an older background shrink still waits in the
-   semaphore queue. That task then took a free permit and held it until the
-   next tuner tick. Dispatch lost one slot, and the next tick read one slot too
-   many as in use. The fix settles the background task a second time, after
-   the `try_acquire` loop.
+   semaphore queue. That task then takes a free permit and holds it until the
+   next tuner tick. Dispatch loses one slot, and the next tick counts one
+   extra slot as in use. The fix settles the background task a second time,
+   after the `try_acquire` loop.
 
 Revert either fix and the model fails. The random scheduler catches both. The
-PCT scheduler catches the first.
+PCT scheduler catches the first. The tokio unit test
+`resize_toward_cancels_a_stray_background_shrink_once_the_target_lands` also
+catches the second, without Shuttle.
 
 ## The heartbeat seam
 
@@ -120,7 +122,7 @@ Shuttle prints a failing schedule. To replay it, pass it to
 ## Adding a model
 
 1. Confirm the target is in-process and async. For plain locks and atomics,
-   loom gives an exhaustive check; prefer it.
+   prefer loom. It gives an exhaustive check.
 2. Route the target's tokio types through `crate::shuttle_sync`.
 3. Add one model function and two `#[test]`s (random and PCT) in
    `tests/shuttle_models.rs`.

@@ -37,7 +37,8 @@ const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 /// What the flusher does after one flush.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlushOutcome {
-    /// Keep flushing. A failed write also continues; the next tick retries.
+    /// Keep flushing. A failed write also continues. The flusher drops the
+    /// failed payload, and the next heartbeat replaces it.
     Continue,
     /// The claim is no longer current (issue #1789). The flusher cancels the
     /// activity and stops.

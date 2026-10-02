@@ -317,7 +317,7 @@ pub mod guardrail;
 pub mod handle;
 #[cfg(feature = "db")]
 pub mod handle_typed;
-/// Activity heartbeat flusher. The flush loop has no DB dependency; the
+/// Activity heartbeat flusher. The flush loop has no DB dependency. The
 /// Postgres sink needs the `db` feature (issue #1800).
 #[doc(hidden)]
 pub mod heartbeat;

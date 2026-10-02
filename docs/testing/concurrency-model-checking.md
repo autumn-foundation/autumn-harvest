@@ -14,7 +14,7 @@ harvest's comparatively small in-process concurrency surface. The durable /
 cross-process races remain the province of the Docker-backed integration tests
 against a real database.
 
-## loom — adopted now
+## loom (tokio-rs/loom) — adopted
 
 **What it is.** Exhaustive permutation testing of in-process synchronization
 (instrumented `Arc`/`Mutex`/`RwLock`/atomics + `thread::spawn`). Explores every
@@ -45,38 +45,20 @@ gates testcontainers to `cfg(not(loom))` (see `loom.md`).
 **What it is.** A randomized concurrency-testing library from AWS with the same
 shape of API as loom. Instead of loom's *exhaustive* search it uses
 **randomized scheduling and probabilistic concurrency testing (PCT)**. That
-trades completeness for scale, and, crucially for harvest, **it models async
-tasks and tokio-style primitives** through `shuttle-tokio`.
+trades completeness for scale. Shuttle also models async tasks and tokio-style
+primitives through `shuttle-tokio`, which harvest needs.
 
 **Why it complements loom.** loom cannot reach `slot_tuner.rs` (issue #548).
 Its withheld-permit accounting is built on `tokio::sync::Semaphore` and
 `OwnedSemaphorePermit`. `heartbeat.rs` drains a `tokio::sync::mpsc` channel.
 Both are async-runtime properties.
 
-**Status: shipped.** Three models in `tests/shuttle_models.rs`, each under the
-random and the PCT scheduler (six tests). They drive the real code through
-the `src/shuttle_sync.rs` shim:
-
-- `slot_tuner_conserves_permits_*`: `withheld + live_target == max_slots`,
-  dispatch never above the live target, and a full drain after
-  `release_all_withheld`.
-- `heartbeat_flush_keeps_send_order_*`: flushes keep send order and the newest
-  heartbeat is flushed.
-- `heartbeat_lease_lost_stops_the_flusher_*`: a lost lease (issue #1789)
-  cancels the activity and stops the flusher.
-
-The `shuttle` job in `.github/workflows/ci.yml` runs them on every PR. See
-`shuttle.md`.
-
-**Defects found.** The slot-tuner model found two defects in `resize_toward`.
-Both are fixed in the same change:
-
-1. A grow released withheld permits before it raised `live_target`. A dispatch
-   task could take a released permit and run above the live target that
-   readers saw. `release_all_withheld` had the same order.
-2. A shrink could reach its target through `try_acquire` while an older
-   background shrink still waited in the semaphore queue. That task then took
-   a free permit and held it until the next tuner tick.
+**Status: shipped.** Three models in `tests/shuttle_models.rs` cover
+`slot_tuner.rs` and `heartbeat.rs`, each under the random and the PCT
+scheduler. They drive the real code through the `src/shuttle_sync.rs` shim.
+They found two `resize_toward` defects, both fixed. The `shuttle` job in
+`.github/workflows/ci.yml` runs them on every PR. See
+[`shuttle.md`](shuttle.md#defects-found).
 
 **Limits.** Shuttle samples schedules. A pass is strong evidence, not a proof.
 It does not model time (`sleep` is one yield) or Postgres.
@@ -119,11 +101,11 @@ today), revisit.
 
 | Tool | What it models | Coverage of harvest's concurrency **here** | Decision |
 |------|----------------|--------------------------------------------|----------|
-| **loom** | In-process locks/atomics, exhaustive interleavings | `circuit_breaker` generation fence + single probe; `sessions` slot bound/balance. Cannot reach async (`slot_tuner`, `heartbeat`) or any Postgres-coordinated race. | **Adopted** (runs on every PR since issue #1800) |
+| **loom** | In-process locks/atomics, exhaustive interleavings | `circuit_breaker` generation fence + single probe; `sessions` slot bound/balance. Cannot reach async (`slot_tuner`, `heartbeat`) or any Postgres-coordinated race. | **Adopted** (issue #1800; runs on every PR) |
 | **Shuttle** | In-process locks **+ async/futures**, randomized PCT (scales past loom) | Everything loom reaches, **plus** `slot_tuner.rs` semaphore accounting and `heartbeat.rs` mpsc ordering that loom structurally cannot. Still cannot model Postgres. | **Adopted** (issue #1800; runs on every PR) |
 | **Turmoil** | Simulated peer TCP/UDP networks, partitions/latency | ~none — harvest has no custom peer networking; it coordinates through Postgres, which Turmoil cannot simulate. | **No** |
 
 **Bottom line.** loom for in-process locks, Shuttle for async primitives,
-Turmoil not at all. Both loom and Shuttle run on every PR. And none of the three substitutes for the Docker-backed
-integration tests that exercise harvest's Postgres-coordinated concurrency — the
-bulk of the real surface.
+Turmoil not at all. Both loom and Shuttle run on every PR. And none of the
+three substitutes for the Docker-backed integration tests that exercise
+harvest's Postgres-coordinated concurrency — the bulk of the real surface.
