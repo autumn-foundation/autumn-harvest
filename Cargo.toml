@@ -86,6 +86,11 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(shuttle)'] }
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
+# Clippy 1.99 reports these two lints inside macro expansions. The source has
+# no such code. Diesel derives expand to `field: field`. `async_trait` expands
+# to a second `#[must_use]`. Re-enable both when clippy skips macro output.
+redundant_field_names = "allow"
+double_must_use = "allow"
 
 [profile.dev.package.bollard-stubs]
 opt-level = 0
