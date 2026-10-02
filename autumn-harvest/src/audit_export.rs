@@ -1487,6 +1487,40 @@ fn notice_key(shard_id: i32, database: &str, schema: &str) -> NoticeKey {
     (shard_id, format!("{database}/{schema}"))
 }
 
+/// A shard, build URL and pool. The pool separates tenant schemas that share a
+/// shard number and a build URL.
+#[cfg(feature = "db")]
+type ProbeKey = (i32, String, usize);
+
+/// Shortest wait between two catalog probes for one [`ProbeKey`].
+#[cfg(feature = "db")]
+const INDEX_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// When each [`ProbeKey`] may next probe the catalogs.
+#[cfg(feature = "db")]
+static INDEX_PROBE_GATE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<ProbeKey, std::time::Instant>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Whether this checker may probe the index catalogs now.
+///
+/// A healthy exporter ticks every poll interval. Two catalog reads per tick
+/// would run for as long as the worker lives. One probe per
+/// [`INDEX_PROBE_INTERVAL`] bounds that cost, and still finds a dropped or
+/// invalid index within the interval.
+#[cfg(feature = "db")]
+fn index_probe_due(key: &ProbeKey) -> bool {
+    let mut gate = INDEX_PROBE_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let now = std::time::Instant::now();
+    if gate.get(key).is_some_and(|not_before| now < *not_before) {
+        return false;
+    }
+    gate.insert(key.clone(), now + INDEX_PROBE_INTERVAL);
+    true
+}
+
 /// Wait after a failed or skipped background build before the next attempt.
 #[cfg(feature = "db")]
 const INDEX_BUILD_RETRY: std::time::Duration = std::time::Duration::from_secs(300);
@@ -1697,9 +1731,15 @@ async fn operator_ddl(conn: &mut diesel_async::AsyncPgConnection) -> (String, St
 async fn spawn_unexported_index_build_if_due(
     conn: &mut diesel_async::AsyncPgConnection,
     shard_id: i32,
+    pool_id: usize,
     build_dsn: Option<&str>,
     cancel: &tokio_util::sync::CancellationToken,
 ) {
+    // One probe per interval. Without it, every tick of a healthy exporter
+    // would read the catalogs.
+    if !index_probe_due(&(shard_id, build_dsn.unwrap_or_default().to_owned(), pool_id)) {
+        return;
+    }
     let Some(dsn) = build_dsn else {
         if index_notice_wanted(conn, shard_id).await {
             let (statement, cleanup) = operator_ddl(conn).await;
@@ -3541,7 +3581,13 @@ async fn export_once_via_pool(
     // the checker, and the claim phase below observes the same token.
     let _ = until_cancelled(
         cancel,
-        spawn_unexported_index_build_if_due(&mut conn, shard_id, index_build_dsn, cancel),
+        spawn_unexported_index_build_if_due(
+            &mut conn,
+            shard_id,
+            std::ptr::from_ref(pool.manager()) as usize,
+            index_build_dsn,
+            cancel,
+        ),
     )
     .await;
     // Raced against `cancel` (Codex review on PR #1520, follow-up P2, fifth
@@ -5168,6 +5214,26 @@ mod tests {
         let after_disarm = remaining(&key).expect("a disarmed guard keeps the entry");
         assert!(after_disarm > INDEX_BUILD_REFUSED_RETRY, "{after_disarm:?}");
         index_build_finished(&key, BuildEnd::Ready);
+    }
+
+    /// Issue #1667: a healthy exporter must not probe the catalogs on every
+    /// tick. The probe gate admits one probe per interval for each shard, build
+    /// URL and pool. A second pool with the same shard and URL has its own gate,
+    /// so two tenants cannot starve each other.
+    #[cfg(feature = "db")]
+    #[test]
+    fn the_index_probe_is_throttled_per_pool() {
+        let key: ProbeKey = (9_006, "postgres://probe-test/db".to_owned(), 1);
+        let other_pool: ProbeKey = (9_006, "postgres://probe-test/db".to_owned(), 2);
+        assert!(index_probe_due(&key), "the first tick probes");
+        assert!(
+            !index_probe_due(&key),
+            "the next tick inside the interval waits"
+        );
+        assert!(
+            index_probe_due(&other_pool),
+            "another pool has its own gate"
+        );
     }
 
     /// Issue #1667: a privilege failure is the one error a retry cannot fix.
