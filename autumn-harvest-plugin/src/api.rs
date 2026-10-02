@@ -1137,6 +1137,9 @@ impl HarvestApiState {
     /// `dev` allows an unauthenticated local management API; every other
     /// profile is treated as non-dev and must have an auth boundary.
     ///
+    /// A standalone embedder declares the profile with
+    /// [`StandaloneAdminAuth::with_deployment_profile`]. See `docs/embedding.md`.
+    ///
     /// # Panics
     ///
     /// Panics if the internal mutex is poisoned.
@@ -1150,7 +1153,8 @@ impl HarvestApiState {
     /// Mark whether the Harvest management API is mounted behind auth.
     ///
     /// This reports the boundary provided via [`crate::plugin::HarvestPlugin::api_with_auth`]
-    /// or an equivalent standalone integration. It does not implement RBAC.
+    /// or [`StandaloneAdminAuth::with_admin_auth_boundary`]. It does not implement RBAC.
+    /// See `docs/embedding.md` for the standalone path.
     ///
     /// # Panics
     ///
@@ -1167,6 +1171,7 @@ impl HarvestApiState {
     /// This mirrors `AppState::auth_session_key()` during plugin startup. Standalone
     /// integrations that mount `harvest_api_router` directly can call this to keep
     /// Harvest's built-in high-impact route guard aligned with their app auth config.
+    /// [`StandaloneAdminAuth::with_admin_auth_session_key`] declares it for them.
     ///
     /// # Panics
     ///
@@ -5486,7 +5491,8 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
 /// `require_harvest_admin` reads. An embedder that mounts
 /// [`harvest_api_router`] on a raw Axum server reached none of them. The one
 /// credential Harvest has that needs no autumn-web `Session` was therefore
-/// unusable standalone.
+/// unusable standalone. In a token-only mount, every route except those
+/// classified [`RouteClass::PublicSafe`] requires a verified Harvest token.
 ///
 /// The layer ordering is load-bearing, so this type applies it rather than
 /// documenting it. See [`Self::mount`].
@@ -5521,10 +5527,12 @@ impl StandaloneAdminAuth {
 
     /// Install the scoped-API-token layer (issue #942).
     ///
-    /// A request carrying a verified `hvst_` bearer reaches the admin routes
-    /// its scope allows. A `read` token is denied every mutating route with
-    /// 403, before any handler runs. The layer needs a token store, so install
-    /// the storage pool on the state as well.
+    /// A request carrying a verified `hvst_` bearer reaches the routes its
+    /// scope allows. Without a declared embedder auth boundary, requests to
+    /// non-public routes must carry such a token; missing and non-Harvest
+    /// credentials are rejected with 401. A `read` token is denied every
+    /// mutating route with 403, before any handler runs. The layer needs a
+    /// token store, so install the storage pool on the state as well.
     #[must_use]
     pub const fn with_api_tokens(mut self) -> Self {
         self.api_tokens = true;
@@ -5588,9 +5596,11 @@ impl StandaloneAdminAuth {
     /// Nesting first is what puts Vantage under the read-only-role layer, which
     /// is how [`HarvestPlugin`] composes it.
     ///
-    /// The returned router carries no embedder auth. Apply that outside, so the
-    /// request order is: embedder auth -> token layer -> read-only-role layer
-    /// -> per-route `require_admin` -> handler.
+    /// When an embedder auth boundary is declared, apply it outside. The
+    /// request order is then: embedder auth -> token layer -> read-only-role
+    /// layer -> per-route `require_admin` -> handler. Without that
+    /// declaration, enabling API tokens additionally installs a fail-closed
+    /// token requirement on every non-public route.
     ///
     /// [`harvest_ui_router`]: crate::harvest_ui_router
     /// [`HarvestPlugin`]: crate::HarvestPlugin
@@ -5602,7 +5612,15 @@ impl StandaloneAdminAuth {
         if let Some(session_key) = &self.admin_auth_session_key {
             api_state.set_admin_auth_session_key(session_key.clone());
         }
-        apply_admin_auth_layers(router, api_state, self.api_tokens, self.read_only_role)
+        let router =
+            apply_admin_auth_layers(router, api_state, self.api_tokens, self.read_only_role);
+        if self.api_tokens && !self.admin_auth_boundary {
+            router.layer(middleware::from_fn(
+                crate::api_token::require_token_for_non_public,
+            ))
+        } else {
+            router
+        }
     }
 }
 

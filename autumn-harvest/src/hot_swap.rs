@@ -1882,6 +1882,7 @@ fn check_await_allowed(
 ///
 /// Never: the only `expect` converts the loop index to `u32`, and the index is
 /// bounded by [`MAX_DECIDE_STEPS`], far below `u32::MAX`.
+#[must_use = "the future does nothing until awaited"]
 pub fn module_workflow_handler(
     ctx: &WorkflowContext,
     input: Value,

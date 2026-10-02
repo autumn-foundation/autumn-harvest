@@ -16,6 +16,10 @@ This example shows the out-of-the-box non-`HarvestPlugin` runner path. It does n
 
 `HarvestEmbeddingRuntime::stop` drains the worker and removes the process globals.
 
+[`docs/embedding.md`](../../docs/embedding.md) is the reference for this path. The getting-started
+fork, [The first workflow on plain Axum](../../docs/getting-started/standalone-axum.md), is the
+short version.
+
 The workflow is intentionally smaller than the billing Autumn app, but it still uses the same
 reference ideas: a saga reserves inventory with rollback, a child workflow buys the shipping
 label, and a version gate selects the v2 shipping payload. The point is runner ownership, not web
