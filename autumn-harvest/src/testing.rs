@@ -2307,8 +2307,8 @@ fn outcome_to_report(
         }
 
         // Suspension during strict replay means the workflow tried to issue a
-        // new command with no matching history event (the oneshot is never
-        // resolved in replay mode, so the 100 ms timeout fires).
+        // new command with no matching history event. The oneshot never
+        // resolves in replay mode, so the cycle parks on it.
         WorkflowOutcome::Suspended { .. } => {
             // Issue #952: replaying a run that was sealed FAILED. The failing
             // cycle never suspended — it returned `Err` with its dispatches
@@ -2346,6 +2346,19 @@ fn outcome_to_report(
                 }
             }
         }
+
+        // Issue #1797: a deadlocked replay made no decision. It is not drift,
+        // but a gate must not pass it, so it reports as a failed replay.
+        WorkflowOutcome::TaskFailed { error } => ReplayReport {
+            execution_id: exec_id,
+            events_replayed: total_events,
+            status: ReplayStatus::WorkflowFailed {
+                error,
+                event_index: total_events,
+            },
+            mismatched_command_summary: None,
+            reproduced_failure: None,
+        },
 
         WorkflowOutcome::Failed {
             error,
@@ -6110,6 +6123,10 @@ impl WorkflowTestEnv {
                 });
                 Ok(input)
             }
+            // Issue #1797: a deadlocked cycle fails the task, not the run. A
+            // retry would deadlock again, so the harness stops with the error
+            // and records no terminal event, as the worker does.
+            WorkflowOutcome::TaskFailed { error } => Err(error),
             WorkflowOutcome::Suspended { .. } => {
                 unreachable!("suspended outcomes are handled in run")
             }
@@ -7004,6 +7021,39 @@ mod tests {
     use chrono::Utc;
     use std::future::Future;
     use std::pin::Pin;
+
+    /// Awaits a foreign 3 s sleep, past the deadlock timeout (issue #1797).
+    fn deadlocking_workflow(
+        _ctx: &crate::context::WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + '_>> {
+        Box::pin(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            Ok(Value::Null)
+        })
+    }
+
+    /// Issue #1797: the harness stops with the task error and records no
+    /// terminal event, as the worker does.
+    #[tokio::test(start_paused = true)]
+    async fn a_deadlocked_cycle_stops_the_harness_without_a_terminal_event() {
+        let outcome = WorkflowTestEnv::new()
+            .run(deadlocking_workflow, Value::Null)
+            .await;
+        let error = outcome
+            .result
+            .clone()
+            .expect_err("a deadlock must surface as an error");
+        assert!(error.contains("potential deadlock detected"), "{error}");
+        assert!(
+            !outcome.events().iter().any(|e| matches!(
+                e,
+                WorkflowEvent::WorkflowFailed { .. } | WorkflowEvent::WorkflowCompleted { .. }
+            )),
+            "a failed task must record no terminal event: {:?}",
+            outcome.events()
+        );
+    }
 
     fn ts(id: &str, secs: u64) -> WorkflowEvent {
         WorkflowEvent::TimerStarted {

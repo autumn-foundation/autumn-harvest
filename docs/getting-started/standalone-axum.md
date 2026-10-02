@@ -240,9 +240,9 @@ cargo run -p standalone-quickstart
 profile opens the admin routes to any caller with no credential. The server
 logs a warning about this.
 
-Other profiles do not close everything. With no auth layer of your own, a
-workflow start or a signal is open in every profile. So keep this server on
-`127.0.0.1`.
+Other profiles refuse the admin routes and every mutating route to a caller
+with no credential (issue #1802). Read routes stay open when you add no auth
+layer of your own. So keep this server on `127.0.0.1`.
 
 ## 5. Start the workflow
 

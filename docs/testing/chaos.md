@@ -189,6 +189,10 @@ HARVEST_TEST_DATABASE_URL=postgres://harvest@127.0.0.1:5432/harvest_chaos \
 Without `HARVEST_TEST_DATABASE_URL` the suite spins a fresh migrated Postgres 16
 container per test (the CI path).
 
+The `infra_faults` tests always start their own containers and need Docker.
+To leave them out of a fast local run, add `--skip infra_faults` after the
+`--`.
+
 ## The convergence sweep (AC5)
 
 `chaos_seeded_convergence_sweep` runs a bounded workload under
@@ -273,8 +277,101 @@ after a hung checkout. When checkout fails, the report step opens the
 issue without the script, or comments on the open one. A concurrency group runs
 one watchdog job at a time, so two runs cannot both open an issue.
 
+## Infrastructure faults (issue #1801)
+
+A chaos KILL is a panic in one tokio task. The tests in
+`chaos_tests::infra_faults` inject faults below the engine instead. They are a
+submodule of `chaos_tests`, so the nightly `chaos_tests::` step runs them, and
+the watchdog alerts on a failure. The module compiles on Unix only.
+
+Each test starts its own Postgres 16 container and a toxiproxy container on a
+private docker network. Workers connect through the `worker` proxy. The test
+reads state through the `admin` proxy, which never gets a toxic. A Postgres
+restart therefore does not change any URL. These tests ignore
+`HARVEST_TEST_DATABASE_URL`, because a restart or a pause cannot target a
+shared database.
+
+Workers use a 500 ms heartbeat, so the lease TTL (the stale threshold) is 1 s.
+The latency test is the exception, see the known bugs below.
+
+| Scenario | Test | Fault | Proof the fault landed |
+|---|---|---|---|
+| Kill mid-commit | `terminate_backend_mid_commit_append` | `pg_terminate_backend` while COMMIT of an `ActivityCompleted` insert waits; the transaction rolls back | the blocked backend exits |
+| | `terminate_backend_mid_commit_complete` | the same, for a `WorkflowCompleted` insert | the blocked backend exits |
+| | `terminate_backend_mid_commit_claim` | the same, for the first `PENDING` to `RUNNING` claim | the blocked backend exits |
+| Lost COMMIT ack | `terminate_backend_after_commit_ack_lost_append` | a downstream blackhole drops the replies; the COMMIT lands; then `pg_terminate_backend` | the backend goes idle, then exits |
+| | `terminate_backend_after_commit_ack_lost_complete` | the same, for a `WorkflowCompleted` insert | the backend goes idle, then exits |
+| | `terminate_backend_after_commit_ack_lost_claim` | the same, for the first claim | the backend goes idle, then exits |
+| Restart | `postgres_crash_restart_mid_workload` | stop Postgres with no grace period, then start it | an activity runs at the crash |
+| Pause | `postgres_pause_longer_than_lease_ttl` | `docker pause` for 4 s, two workers | activities run at the pause |
+| Latency | `toxiproxy_latency_between_worker_and_db` | 100 ms ± 50 ms in each direction | a probe round trip is slow |
+| Partition | `toxiproxy_partition_longer_than_lease_ttl` | blackhole worker A for at least 4 s, until worker B holds every task | B reclaims all three tasks; the stale results of A are rejected |
+| SIGKILL | `sigkill_child_worker_mid_activity` | SIGKILL of a worker that runs as a child process | the child dies by signal 9; its task is reclaimed |
+
+**The COMMIT rendezvous.** A test-only `DEFERRABLE INITIALLY DEFERRED`
+constraint trigger runs inside COMMIT. It waits on a shared advisory lock that
+the test holds. The test finds the waiting backend in `pg_locks`. For a
+rollback, it terminates the backend, waits up to 10 s for the exit, and then
+releases the lock. For a lost acknowledgement, it first blackholes the
+replies, then releases the lock. The COMMIT lands, and the test terminates the
+idle backend. Either way the kill lands after COMMIT is sent and before the
+worker reads a reply. No production code changes.
+
+**The partition test.** Attempt 1 of each activity waits on worker A. Worker
+B reclaims the tasks, and its attempt 2 waits too. After the heal, the test
+releases attempt 1, and A writes three stale results. No result exists yet, so
+only the claim fence can reject them, and the test asserts that no
+`ActivityCompleted` exists. Then the test releases attempt 2, and B finishes
+the workflows. With the fence disabled, the test fails.
+
+**The oracle.** Every test checks `assert_converged`, the oracle of the
+convergence sweep. It requires every workflow `COMPLETED`, exactly one terminal
+event per execution, no stranded `RUNNING` task, and no dangling
+`ExternalSignalRequested`. The table key does not stop a second terminal event
+at a new event id, so the oracle counts terminal events itself.
+`oracle_flags_a_duplicate_terminal_event` forges a duplicate to prove the
+check. Each activity workflow must also have exactly one activity terminal
+event, an `ActivityCompleted`.
+
+**Known bugs.** The tests found four bugs:
+
+- #1871: the worker does not retry the activity result write after a DB
+  error. The result is lost, and only `start_to_close` recovers the task.
+- #1870: a `StartToClose` timeout ignores the retry policy and fails the
+  workflow.
+- #1876: Postgres keeps the open transaction of a partitioned worker until
+  TCP keepalive ends the session. That transaction keeps its row locks.
+  Orphan reclaim blocks on such a lock, so no orphan is reclaimed.
+- #1879: the heartbeat period is the interval plus the tick latency. When a
+  tick takes longer than one interval, a live worker looks dead. False
+  reclaims then count crash strikes and quarantine healthy work.
+
+Each test works around a bug only where the bug applies:
+
+- #1871 and #1870 turn a lost result write into `FAILED` after one
+  `StartToClose` timeout. The rolled-back append test requires that outcome,
+  so a fix for the bugs makes the test fail on purpose. The restart test
+  accepts it, but only for workflows with an activity that the old Postgres
+  instance claimed. Each accepted `FAILED` must have the exact history: one
+  activity terminal event, a `StartToClose` timeout, and one terminal event,
+  a `WorkflowFailed` for the timeout.
+- For #1876, the partition test sets `idle_in_transaction_session_timeout =
+  5s` on the server to end the session.
+- For #1879, the latency test uses a 2 s heartbeat. A decision cycle also
+  takes more than 10 s at that latency, so it keeps the default 60 s
+  workflow-task budget.
+
+When a fix for a bug merges, remove its workaround.
+
+**Replay.** Run one test locally with Docker:
+
+```bash
+cargo test -p autumn-harvest --features chaos --test integration \
+  chaos_tests::infra_faults::toxiproxy_partition_longer_than_lease_ttl -- --nocapture
+```
+
 ## Out of scope
 
-Production/runtime chaos (#796), network-partition / Jepsen / Antithesis-style
-testing, DAG what-if simulation, and *fixing* any new bug the harness surfaces —
-new bugs are filed and fixed separately.
+Production/runtime chaos (#796), Jepsen / Antithesis-style model checking, DAG
+what-if simulation, and *fixing* any new bug the harness surfaces — new bugs
+are filed and fixed separately.

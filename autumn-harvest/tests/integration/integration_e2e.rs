@@ -4618,23 +4618,13 @@ async fn worker_completes_parent_workflow_with_child_fan_out() {
 /// scheduling.
 ///
 /// **Must use `ctx.timer(...)`, never a raw `tokio::time::sleep` inside the
-/// workflow body.** `drive_workflow`'s live-execution poll wraps the entire
-/// handler call in `tokio::time::timeout(SUSPENSION_TIMEOUT, ...)` with
-/// `SUSPENSION_TIMEOUT = 100ms` (executor.rs) -- a hard, non-configurable
-/// budget for the workflow function to either complete or reach a genuine
-/// command-emitting suspension point (e.g. `rx.await` after pushing
-/// `WorkflowCommand::StartTimer`/`ScheduleActivity`/etc.). A raw
-/// `tokio::time::sleep` participates in neither: it blocks the same poll for
-/// its full duration with zero commands emitted, so any sleep longer than
-/// 100ms deterministically hits `drive_workflow`'s "workflow suspended
-/// without emitted commands; resumption is not implemented yet" fatal error
-/// on every single attempt -- not a CI-speed flake, a 100% reproducible bug
-/// in the test's own workflow code, confirmed via the diagnostic dump added
-/// to this test in an earlier PR #901 review round (every child showed
-/// exactly this error). `ctx.timer` pushes `StartTimer` and suspends via a
-/// real oneshot immediately, so the actual 1s wait happens on a later,
-/// separate decision cycle -- never inside the 100ms window -- exactly like
-/// every other durable-wait primitive in this engine.
+/// workflow body.** A raw sleep is not a Harvest future. Before issue #1797,
+/// a sleep over 100 ms ended the cycle with zero commands. The worker then
+/// failed the run (PR #901 found this in this test). Now the executor waits
+/// on the sleep for at most `executor::DEADLOCK_TIMEOUT` (2 s). It then fails
+/// the workflow task. A 1 s sleep would also hold a slot for the whole wait.
+/// `ctx.timer` pushes `StartTimer` and suspends at once. The 1 s wait then
+/// happens on a later decision cycle, like every other durable wait.
 fn slow_fan_child_workflow<'a>(
     ctx: &'a WorkflowContext,
     input: serde_json::Value,
@@ -4868,12 +4858,12 @@ async fn wait_for_completion_with_diagnostics(
 /// diagnostic dump in [`wait_for_completion_with_diagnostics`] (PR #901
 /// review rounds 2-8):** the original version of `slow_fan_child_workflow`
 /// used a raw `tokio::time::sleep` inside the workflow body instead of
-/// `ctx.timer(...)`. That is invalid workflow code for this engine --
-/// `drive_workflow`'s live-execution poll wraps the handler call in a hard,
-/// non-configurable 100ms `SUSPENSION_TIMEOUT`, and a raw sleep longer than
-/// that blocks the poll with zero commands emitted, deterministically
-/// hitting "workflow suspended without emitted commands; resumption is not
-/// implemented yet" on every attempt. This was mistaken for a series of
+/// `ctx.timer(...)`. That was invalid workflow code for this engine. The
+/// live-execution poll in `drive_workflow` then used a hard 100ms
+/// suspension timer (removed by issue #1797). A raw sleep longer than
+/// that ended the cycle with zero commands emitted. Every attempt hit
+/// "workflow suspended without emitted commands; resumption is not
+/// implemented yet". This was mistaken for a series of
 /// dropped-wake races across several review rounds (each of which found and
 /// fixed a real, independently-confirmed bug in `worker.rs`/`queue.rs` --
 /// none of them were the actual cause of *this test's* failures).
@@ -11016,8 +11006,8 @@ async fn signal_blocked_workflow_times_out_at_deadline() {
 /// `concurrency_cap = 2`.  Verifies the claim query allows at most 2 to be
 /// RUNNING simultaneously and that all 6 are eventually processed.  Uses
 /// direct `claim_task` / `complete_task` calls (same pattern as
-/// `concurrency_cap_limits_concurrent_claims_cluster_wide`) to avoid
-/// interaction with the executor's 100 ms suspension timeout.
+/// `concurrency_cap_limits_concurrent_claims_cluster_wide`) to keep the
+/// executor out of the measurement.
 #[tokio::test]
 async fn per_key_concurrency_cap_enforced_across_fleet() {
     const LIMIT: u32 = 2;
@@ -11131,8 +11121,8 @@ async fn per_key_concurrency_cap_enforced_across_fleet() {
 ///
 /// Enqueues 4 "loud" workflow tasks (cap=1) and 2 "quiet" workflow tasks
 /// (cap=10).  Verifies the quiet tasks can be claimed even while the loud cap
-/// is saturated.  Uses direct `claim_task` calls to avoid the executor's
-/// 100 ms suspension timeout.
+/// is saturated.  Uses direct `claim_task` calls to keep the executor out of
+/// the measurement.
 #[tokio::test]
 async fn per_key_concurrency_does_not_block_other_keys() {
     const LOUD_CAP: u32 = 1;
@@ -11850,7 +11840,7 @@ fn unbounded_fanout_e2e_workflow<'a>(
 /// Modestly-slow activity: doubles its numeric input after a short real sleep,
 /// so multiple in-flight activities are observable by a concurrent DB poller.
 /// (A `tokio::time::sleep` is fine here — this runs on the activity dispatch
-/// path, not inside the workflow poll's 100ms suspension window.)
+/// path, not inside a workflow decision cycle.)
 fn slow_double_activity<'a>(
     _ctx: &'a ActivityContext,
     input: serde_json::Value,

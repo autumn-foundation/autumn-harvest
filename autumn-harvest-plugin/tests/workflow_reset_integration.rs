@@ -67,6 +67,8 @@ fn build_pool(url: &str) -> DbPool {
 
 fn build_app(pool: &DbPool) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
+    // Issue #1802: set the opt-out. This test exercises the handler, not auth.
+    api_state.set_allow_unauthenticated_mutations(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
         Arc::new(HandlerRegistry::new(vec![], vec![])),

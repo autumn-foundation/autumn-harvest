@@ -172,13 +172,17 @@ fn build_app(pool: &DbPool, infos: Vec<WorkflowInfo>) -> HarvestApiApp {
 
 /// App with NO admin (`admin_auth_boundary = false`, default) and no session —
 /// so an admin-gated start (`terminate_existing` / `terminate_if_running`)
-/// returns `401`.
+/// returns `401`. It sets the issue #1802 opt-out. Without the opt-out, a
+/// non-dev deployment refuses every anonymous start.
 fn build_app_no_admin(pool: &DbPool, infos: Vec<WorkflowInfo>) -> HarvestApiApp {
     build_app_inner(pool, infos, false)
 }
 
 fn build_app_inner(pool: &DbPool, infos: Vec<WorkflowInfo>, admin: bool) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
+    // Issue #1802: set the opt-out. The start handler keeps its own admin
+    // check for destructive policies, and the no-admin tests probe it.
+    api_state.set_allow_unauthenticated_mutations(true);
     if admin {
         api_state.set_admin_auth_boundary(true);
     }
