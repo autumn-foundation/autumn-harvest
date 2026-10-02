@@ -1253,21 +1253,11 @@ async fn build_unexported_index(
         value: String,
     }
 
-    // Re-check under the lock: another exporter may have finished the build.
-    match unexported_index_valid(conn).await? {
-        Some(true) => return Ok(()),
-        Some(false) => {
-            diesel::sql_query("DROP INDEX CONCURRENTLY IF EXISTS harvest_audit_log_unexported_idx")
-                .execute(conn)
-                .await
-                .map_err(crate::error::database_error)?;
-        }
-        None => {}
-    }
-    tracing::info!("[audit_export] building harvest_audit_log_unexported_idx (issue #1667)");
     // A role or database timeout shorter than the build would fail it on every
-    // try. Capture the session value first and restore that exact value after
-    // the build. `RESET` would restore the role or database default instead.
+    // try. The drop of an invalid index waits for old snapshots too, so the
+    // override covers both statements. Capture the session value first and
+    // restore that exact value after. `RESET` would restore the role or
+    // database default instead.
     let previous: Vec<Setting> =
         diesel::sql_query("SELECT current_setting('statement_timeout') AS value")
             .load(conn)
@@ -1281,10 +1271,7 @@ async fn build_unexported_index(
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
-    let built = diesel::sql_query(UNEXPORTED_INDEX_DDL)
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error);
+    let built = repair_and_build_unexported_index(conn).await;
     let restored = diesel::sql_query("SELECT set_config('statement_timeout', $1, false)")
         .bind::<diesel::sql_types::Text, _>(previous)
         .execute(conn)
@@ -1292,6 +1279,32 @@ async fn build_unexported_index(
         .map_err(crate::error::database_error);
     built?;
     restored?;
+    Ok(())
+}
+
+/// Drop an invalid index, then build it. The caller disables the timeout.
+#[cfg(feature = "db")]
+async fn repair_and_build_unexported_index(
+    conn: &mut diesel_async::AsyncPgConnection,
+) -> crate::error::HarvestResult<()> {
+    use diesel_async::RunQueryDsl;
+
+    // Re-check under the lock: another exporter may have finished the build.
+    match unexported_index_valid(conn).await? {
+        Some(true) => return Ok(()),
+        Some(false) => {
+            diesel::sql_query("DROP INDEX CONCURRENTLY IF EXISTS harvest_audit_log_unexported_idx")
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+        }
+        None => {}
+    }
+    tracing::info!("[audit_export] building harvest_audit_log_unexported_idx (issue #1667)");
+    diesel::sql_query(UNEXPORTED_INDEX_DDL)
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
     Ok(())
 }
 
@@ -1445,7 +1458,7 @@ fn index_build_finished(key: &BuildKey, end: BuildEnd) {
 #[cfg(feature = "db")]
 async fn build_unexported_index_on_dedicated_connection(
     dsn: &str,
-    search_path: &str,
+    schema: &str,
     connect_timeout: std::time::Duration,
 ) -> crate::error::HarvestResult<UnexportedIndexOutcome> {
     use diesel_async::AsyncConnection;
@@ -1464,10 +1477,11 @@ async fn build_unexported_index_on_dedicated_connection(
         ))
     })?
     .map_err(crate::error::database_error)?;
-    // The pool may select its relations through `search_path`. The build URL
-    // promises only connectivity, so copy the pool's setting.
+    // The pool may select its relations through `search_path`, and the build
+    // role can differ from the pool role. `schema` names the schema that holds
+    // the pool session's table, so no `"$user"` token is re-expanded here.
     diesel::sql_query("SELECT set_config('search_path', $1, false)")
-        .bind::<diesel::sql_types::Text, _>(search_path)
+        .bind::<diesel::sql_types::Text, _>(schema)
         .execute(&mut conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -1478,27 +1492,33 @@ async fn build_unexported_index_on_dedicated_connection(
     outcome
 }
 
-/// The `search_path` of the pool's own session.
+/// The quoted name of the schema that holds `harvest_audit_log` for the
+/// pool's own session.
 #[cfg(feature = "db")]
-async fn current_search_path(
+async fn audit_table_schema(
     conn: &mut diesel_async::AsyncPgConnection,
 ) -> crate::error::HarvestResult<String> {
     use diesel_async::RunQueryDsl;
 
     #[derive(diesel::QueryableByName)]
-    struct Path {
+    struct Schema {
         #[diesel(sql_type = diesel::sql_types::Text)]
         value: String,
     }
 
-    let rows: Vec<Path> = diesel::sql_query("SELECT current_setting('search_path') AS value")
-        .load(conn)
-        .await
-        .map_err(crate::error::database_error)?;
-    Ok(rows
-        .into_iter()
-        .next()
-        .map_or_else(|| "\"$user\", public".to_owned(), |row| row.value))
+    let rows: Vec<Schema> = diesel::sql_query(
+        "SELECT quote_ident(n.nspname)::text AS value FROM pg_class c \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE c.oid = to_regclass('harvest_audit_log')",
+    )
+    .load(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+    rows.into_iter().next().map(|row| row.value).ok_or_else(|| {
+        crate::error::HarvestError::Database(
+            "harvest_audit_log is not visible to the pool session".to_owned(),
+        )
+    })
 }
 
 /// Start the index build in a detached task, off the export tick (issue #1667).
@@ -1563,11 +1583,11 @@ async fn spawn_unexported_index_build_if_due(
             return;
         }
     }
-    let search_path = match current_search_path(conn).await {
-        Ok(search_path) => search_path,
+    let schema = match audit_table_schema(conn).await {
+        Ok(schema) => schema,
         Err(error) => {
             index_build_finished(&key, BuildEnd::Retry);
-            tracing::warn!(shard = shard_id, %error, "[audit_export] could not read the pool search_path");
+            tracing::warn!(shard = shard_id, %error, "[audit_export] could not resolve the schema of harvest_audit_log");
             return;
         }
     };
@@ -1577,7 +1597,7 @@ async fn spawn_unexported_index_build_if_due(
         let end = tokio::select! {
             result = build_unexported_index_on_dedicated_connection(
                 &dsn,
-                &search_path,
+                &schema,
                 INDEX_BUILD_CONNECT_TIMEOUT,
             ) => match result {
                 Ok(UnexportedIndexOutcome::Ready) => BuildEnd::Ready,

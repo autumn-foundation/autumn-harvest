@@ -5724,3 +5724,111 @@ async fn the_build_follows_the_pools_search_path() {
         "public stays untouched"
     );
 }
+
+/// A short session timeout must also cover the drop of an invalid index. The
+/// concurrent drop waits for older snapshots like the build does.
+#[tokio::test]
+async fn a_short_session_timeout_does_not_break_the_invalid_index_repair() {
+    let (mut conn, url, _c) = make_conn_any().await;
+    create_unexported_idx(&mut conn).await;
+    conn.batch_execute(&format!(
+        "UPDATE pg_index SET indisvalid = false WHERE indexrelid = '{UNEXPORTED_IDX}'::regclass"
+    ))
+    .await
+    .expect("mark invalid");
+    let mut old_txn = diesel_async::AsyncPgConnection::establish(&url)
+        .await
+        .expect("second session");
+    old_txn
+        .batch_execute(
+            "BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM harvest_audit_log;",
+        )
+        .await
+        .expect("open transaction");
+    conn.batch_execute("SET statement_timeout = '100ms'")
+        .await
+        .expect("set timeout");
+    let release = async {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        old_txn.batch_execute("COMMIT").await.expect("commit");
+    };
+    let (built, ()) = tokio::join!(
+        autumn_harvest::audit_export::ensure_unexported_index(&mut conn),
+        release
+    );
+    built.expect("ensure");
+    conn.batch_execute("RESET statement_timeout")
+        .await
+        .expect("reset timeout");
+    assert_eq!(unexported_idx_state(&mut conn).await, Some(true));
+}
+
+/// The pool's default `search_path` is `"$user", public`. The build role can
+/// differ from the pool role, so the token must not be copied unresolved.
+#[tokio::test]
+async fn the_build_resolves_a_user_schema_for_the_pool_role() {
+    let _guard = TEST_SERIAL.lock().await;
+    let _sink = install(Arc::new(RecordingSink::new(200)), 100);
+    let (mut conn, url, _c) = make_conn_any().await;
+    // Roles are cluster-wide, so the name is unique per run.
+    let role = format!("tu_{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+    conn.batch_execute(&format!(
+        "CREATE ROLE {role} LOGIN PASSWORD 'postgres'; \
+         CREATE SCHEMA {role} AUTHORIZATION {role}; \
+         SET search_path = {role}; {} RESET search_path; \
+         GRANT ALL ON ALL TABLES IN SCHEMA {role} TO {role};",
+        autumn_harvest::full_migrations_sql()
+    ))
+    .await
+    .expect("role schema");
+    // `$user` is the new role for the pool. It is `postgres` for the build.
+    let pool_url = url.replacen("//postgres", &format!("//{role}"), 1);
+    let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+        diesel_async::AsyncPgConnection,
+    >::new(pool_url);
+    let pool = autumn_harvest::worker::DbPool::builder(manager)
+        .max_size(2)
+        .build()
+        .expect("pool");
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let handle = autumn_harvest::audit_export::spawn_audit_export_checker_for_shard(
+        pool,
+        cancel.clone(),
+        std::time::Duration::from_millis(20),
+        Arc::new(autumn_harvest::telemetry::TelemetryConfig::default()),
+        Some(ShardId::new(0)),
+        None,
+        Some(url),
+    );
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let rows: Vec<Count> = diesel::sql_query(format!(
+            "SELECT count(*) AS n FROM pg_indexes \
+             WHERE schemaname = '{role}' AND indexname = 'harvest_audit_log_unexported_idx'"
+        ))
+        .load(&mut conn)
+        .await
+        .expect("count");
+        if rows.into_iter().next().is_some_and(|r| r.n == 1) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the pool role's schema must get the index"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    cancel.cancel();
+    let _ = handle.await;
+    uninstall();
+    assert_eq!(
+        unexported_idx_state(&mut conn).await,
+        None,
+        "public stays untouched"
+    );
+}

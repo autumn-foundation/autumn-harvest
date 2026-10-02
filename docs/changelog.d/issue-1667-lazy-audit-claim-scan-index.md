@@ -31,8 +31,10 @@ An unconfigured deployment no longer pays for the audit export index.
   or without a build URL, idempotence, invalid-index rebuild, the lock-busy
   result, the `statement_timeout` restore, the one-connection pool, and the
   refused build of a non-owner role.
-- The build connection copies the pool's `search_path`, so a tenant schema gets
-  its own index. Opening the connection has a 15 s timeout. A stalled host ends
+- The build connection resolves the schema that holds `harvest_audit_log` for the
+  pool session and sets it explicitly. A tenant schema gets its own index, even
+  when the build role differs from the pool role. The timeout override covers
+  the drop of an invalid index too. Opening the connection has a 15 s timeout. A stalled host ends
   the attempt and waits five minutes.
 - The down migration restores nothing. An ordinary `CREATE INDEX` would block
   audit writes. An older binary works without the index, only slower.
