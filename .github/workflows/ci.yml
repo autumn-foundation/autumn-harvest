@@ -1794,6 +1794,60 @@ jobs:
       - name: Check MSRV compiles (autumn-harvest-plugin redis feature, issue #1312)
         run: cargo check -p autumn-harvest-plugin --features redis
 
+  # Concurrency model checking (issue #1800). The loom and Shuttle targets
+  # compile to empty crates unless RUSTFLAGS sets their cfg, so a normal
+  # `cargo test` never runs them. Each cfg rebuilds the crate, so each target
+  # has its own job and its own cache. Both use --no-default-features: under
+  # --cfg loom, tokio drops its `net` module, which `tokio-postgres` needs.
+  # Under --cfg shuttle, `slot_tuner` takes the Shuttle semaphore, which the
+  # db-gated `worker.rs` does not pass. See docs/testing/loom.md and
+  # docs/testing/shuttle.md. The guard in
+  # autumn-harvest/tests/integration/concurrency_model_ci.rs asserts this
+  # wiring.
+  #
+  # Branch protection lists required checks by name. Add "Loom models" and
+  # "Shuttle models" there to make these jobs required. A job that `if:`
+  # skips reports success, so a docs-only PR does not wait on them.
+  loom:
+    name: Loom models
+    needs: changes
+    # Draft-skip (see lint) + docs-only skip via the `changes` guard.
+    if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    # The models run in under a second. The compile under --cfg loom is the
+    # bulk of the time.
+    timeout-minutes: 30
+    env:
+      RUSTFLAGS: "--cfg loom"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run loom models
+        run: cargo test -p autumn-harvest --no-default-features --test loom_models --release
+
+  shuttle:
+    name: Shuttle models
+    needs: changes
+    # Draft-skip (see lint) + docs-only skip via the `changes` guard.
+    if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    # The models run in under a second. The compile under --cfg shuttle is
+    # the bulk of the time.
+    timeout-minutes: 30
+    env:
+      RUSTFLAGS: "--cfg shuttle"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run Shuttle models (random and PCT schedulers)
+        run: cargo test -p autumn-harvest --no-default-features --test shuttle_models --release
+
   # Dependency ledger harness (Ballast). Runs `cargo deny check` against
   # `deny.toml`: advisories (RUSTSEC, joined against the lockfile — every
   # `ignore` entry in deny.toml carries a reachability verdict and a revisit
