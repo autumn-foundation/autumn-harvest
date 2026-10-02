@@ -9,7 +9,8 @@
 //! worker URL. The test reads state through a second proxy that has no
 //! toxics. Each test then checks the sweep oracle, [`assert_converged`]:
 //! every workflow `COMPLETED`, no stranded task, and one terminal event per
-//! execution.
+//! execution. Two tests expect or accept one known `FAILED` outcome, see
+//! [`Accept`].
 //!
 //! Each test also asserts proof that its fault landed. A fault that does not
 //! land fails the test, so a healthy run cannot pass in its place.
@@ -17,15 +18,19 @@
 //! These tests always start their own containers. A restart or a pause cannot
 //! target a shared `HARVEST_TEST_DATABASE_URL` database.
 
-// `FaultDb` holds the `DB_BODY_SERIAL` guard for the whole test on purpose.
+// `FaultDb` holds the `DB_BODY_SERIAL` guard for the whole test. Serial runs
+// keep CPU contention low, because the 1 s lease TTL is sensitive to a
+// starved runtime.
 #![allow(clippy::significant_drop_tightening)]
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use autumn_harvest::prelude::*;
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker};
 use autumn_harvest::{ExecutionId, ShardId};
+use diesel::OptionalExtension;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::SimpleAsyncConnection;
@@ -33,13 +38,41 @@ use testcontainers::{ContainerAsync, GenericImage};
 use testcontainers_modules::postgres::Postgres;
 
 use super::{
-    CountRow, DB_BODY_SERIAL, assert_converged, base_params, chaos_noop_info, connect, event_count,
-    exec_state, terminal_event_count,
+    CountRow, DB_BODY_SERIAL, assert_converged, base_params, chaos_noop_info, connect, exec_state,
+    terminal_event_count,
 };
 
 /// The worker heartbeat interval. The stale threshold, the "lease TTL", is
 /// twice this value: 1 s.
 const HEARTBEAT: Duration = Duration::from_millis(500);
+
+/// The worker settings that a test changes.
+#[derive(Clone, Copy)]
+struct Tuning {
+    heartbeat: Duration,
+    /// The local-activity cap. It raises the 10 s workflow-task budget to
+    /// its own value. These tests run no local activity.
+    local_activity_cap: Duration,
+}
+
+/// The default tuning. The 5 s cap keeps the workflow-task budget at 10 s.
+/// The stuck-task backstop is then 4 × 10 s + 30 s = 70 s, inside
+/// [`CONVERGE_DEADLINE`].
+const FAST: Tuning = Tuning {
+    heartbeat: HEARTBEAT,
+    local_activity_cap: Duration::from_secs(5),
+};
+
+/// The tuning of the latency test.
+///
+/// A heartbeat tick must take less than one interval. At [`HEARTBEAT`], the
+/// latency toxic breaks that rule, and bug #1879 then quarantines healthy
+/// work. A decision cycle also takes more than 10 s at this latency. So the
+/// test keeps the default 60 s cap, which gives a 60 s budget.
+const SLOW_NETWORK: Tuning = Tuning {
+    heartbeat: Duration::from_secs(2),
+    local_activity_cap: Duration::from_secs(60),
+};
 
 /// A fault that must outlast the lease TTL lasts this long.
 const PAST_LEASE_TTL: Duration = Duration::from_secs(4);
@@ -59,24 +92,52 @@ const CHILD_ENTRY: &str = "chaos_tests::infra_faults::sigkill_child_worker_entry
 /// The child worker uses this worker id.
 const CHILD_WORKER_ID: &str = "infra-child-worker";
 
+/// The partition test sets this flag to release the held first attempts.
+static RELEASE_FIRST_ATTEMPTS: AtomicBool = AtomicBool::new(false);
+
+/// The number of held first attempts that returned after the release.
+static LATE_RETURNS: AtomicUsize = AtomicUsize::new(0);
+
+// Fully qualified: the blanket `RunQueryDsl` puts a `load` method on every
+// type, and that method wins method resolution.
+fn first_attempts_released() -> bool {
+    AtomicBool::load(&RELEASE_FIRST_ATTEMPTS, Ordering::SeqCst)
+}
+
+fn late_returns() -> usize {
+    AtomicUsize::load(&LATE_RETURNS, Ordering::SeqCst)
+}
+
 // ── Workload ────────────────────────────────────────────────────────────────
 
 /// Sleeps for `input.sleep_ms`. In the child worker process it sleeps for
 /// ten minutes, so the parent can kill the child while the activity runs.
+/// With `input.hold_first_attempt`, attempt 1 waits for
+/// [`RELEASE_FIRST_ATTEMPTS`].
 ///
 /// A lost result write recovers only through `start_to_close`. The retry
-/// policy should then start a new attempt, but bug #1870 fails the workflow.
+/// policy must then start a new attempt, but bug #1870 fails the workflow.
 /// The timeout is long, so a pause or a partition does not reach it.
 #[activity(
     start_to_close = "30s",
     retry = autumn_harvest::policy::RetryPolicy::fixed(5, Duration::from_millis(200))
 )]
 async fn infra_step(
-    _ctx: &ActivityContext,
+    ctx: &ActivityContext,
     input: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     if std::env::var_os(CHILD_DB_URL_VAR).is_some() {
         tokio::time::sleep(Duration::from_secs(600)).await;
+    }
+    if input["hold_first_attempt"].as_bool() == Some(true) && ctx.info().attempt == 1 {
+        // The bound stops a held attempt that a failed test never releases.
+        let deadline = Instant::now() + CONVERGE_DEADLINE;
+        while !first_attempts_released() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        if first_attempts_released() {
+            LATE_RETURNS.fetch_add(1, Ordering::SeqCst);
+        }
     }
     let ms = input["sleep_ms"].as_u64().unwrap_or(0);
     tokio::time::sleep(Duration::from_millis(ms)).await;
@@ -110,12 +171,13 @@ fn registry() -> Arc<HandlerRegistry> {
 /// Workers connect through the `worker` proxy. The test connects through the
 /// `admin` proxy, which never gets a toxic.
 struct FaultDb {
-    _body: tokio::sync::MutexGuard<'static, ()>,
     pg: ContainerAsync<Postgres>,
     _toxiproxy: ContainerAsync<GenericImage>,
     api: String,
     worker_url: String,
     admin_url: String,
+    // The last field drops last, so the lock outlives the containers.
+    _body: tokio::sync::MutexGuard<'static, ()>,
 }
 
 impl FaultDb {
@@ -174,12 +236,12 @@ impl FaultDb {
             .await
             .expect("migration");
         Self {
-            _body: body,
             pg,
             _toxiproxy: toxiproxy,
             api,
             worker_url,
             admin_url,
+            _body: body,
         }
     }
 
@@ -193,9 +255,11 @@ impl FaultDb {
         wait_for_db(&self.admin_url).await;
     }
 
-    /// End a session that stays idle in a transaction for `secs` seconds.
+    /// Make the server end a session that stays idle in a transaction for
+    /// `secs` seconds.
     async fn limit_idle_in_transaction(&self, secs: u32) {
-        // `ALTER SYSTEM` cannot share a batch: a batch is one transaction.
+        // `ALTER SYSTEM` cannot run in a transaction block. A batch is one
+        // transaction, so each statement has its own batch.
         let mut conn = connect(&self.admin_url).await;
         conn.batch_execute(&format!(
             "ALTER SYSTEM SET idle_in_transaction_session_timeout = '{secs}s'"
@@ -287,15 +351,25 @@ async fn wait_for_db(url: &str) {
     }
 }
 
-/// The transaction that a commit-blocking trigger stops in.
+/// The write whose COMMIT the blocking trigger holds.
 #[derive(Clone, Copy, Debug)]
 enum CommitSite {
     /// An `ActivityCompleted` event append.
     Append,
     /// A `WorkflowCompleted` event append, the terminal write.
     Complete,
-    /// A task claim: a `PENDING` to `RUNNING` task-queue update.
+    /// The first task claim, a `PENDING` to `RUNNING` update. That is the
+    /// claim of the first workflow task.
     Claim,
+}
+
+/// What happens to the held COMMIT.
+#[derive(Clone, Copy, Debug)]
+enum CommitFate {
+    /// The backend dies before the commit. The transaction rolls back.
+    RolledBack,
+    /// The commit lands, but the worker never gets the acknowledgement.
+    AckLost,
 }
 
 /// Holds the advisory lock that blocks the trigger, on its own connection.
@@ -339,11 +413,10 @@ impl CommitBlocker {
         Self { conn }
     }
 
-    /// Wait for a backend to block in the trigger, terminate it, and release
-    /// the lock. Return the terminated pid.
-    async fn terminate_blocked_backend(mut self) -> i32 {
+    /// Wait for a backend to block in the trigger, and return its pid.
+    async fn wait_for_blocked_backend(&mut self) -> i32 {
         let deadline = Instant::now() + RENDEZVOUS_DEADLINE;
-        let pid = loop {
+        loop {
             let waiting: Vec<PidRow> = diesel::sql_query(format!(
                 "SELECT pid FROM pg_locks WHERE locktype = 'advisory' \
                  AND classid = 0 AND objid = {BLOCK_LOCK_KEY} AND objsubid = 1 AND NOT granted"
@@ -352,27 +425,61 @@ impl CommitBlocker {
             .await
             .expect("find the blocked backend");
             if let Some(row) = waiting.into_iter().next() {
-                break row.pid;
+                return row.pid;
             }
             assert!(
                 Instant::now() < deadline,
                 "no backend blocked in the commit trigger"
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
-        };
-        // Wait for the backend to exit before the unlock, so the blocked
-        // COMMIT cannot finish.
+        }
+    }
+
+    /// Terminate backend `pid`, and wait up to 10 s for it to exit.
+    async fn terminate(&mut self, pid: i32) {
         let terminated: BoolRow = diesel::sql_query("SELECT pg_terminate_backend($1, 10000) AS ok")
             .bind::<diesel::sql_types::Integer, _>(pid)
             .get_result(&mut self.conn)
             .await
             .expect("terminate the blocked backend");
         assert!(terminated.ok, "backend {pid} did not exit");
+    }
+
+    /// Release the lock. A held COMMIT then continues.
+    async fn release(&mut self) {
         self.conn
             .batch_execute(&format!("SELECT pg_advisory_unlock({BLOCK_LOCK_KEY})"))
             .await
             .expect("release the commit-blocking lock");
-        pid
+    }
+
+    /// Wait until backend `pid` is idle, out of a transaction. Its held
+    /// COMMIT has then landed.
+    async fn wait_until_committed(&mut self, pid: i32) {
+        #[derive(diesel::QueryableByName)]
+        struct StateRow {
+            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+            state: Option<String>,
+        }
+        let deadline = Instant::now() + RENDEZVOUS_DEADLINE;
+        loop {
+            let row: Option<StateRow> =
+                diesel::sql_query("SELECT state FROM pg_stat_activity WHERE pid = $1")
+                    .bind::<diesel::sql_types::Integer, _>(pid)
+                    .get_result(&mut self.conn)
+                    .await
+                    .optional()
+                    .expect("read the backend state");
+            let state = row.and_then(|r| r.state);
+            if state.as_deref() == Some("idle") {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "backend {pid} did not commit; state {state:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 }
 
@@ -399,7 +506,11 @@ struct RunningWorker {
 
 impl RunningWorker {
     fn spawn(worker_id: &str, url: &str) -> Self {
-        let worker = build_worker(worker_id);
+        Self::spawn_tuned(worker_id, url, FAST)
+    }
+
+    fn spawn_tuned(worker_id: &str, url: &str, tuning: Tuning) -> Self {
+        let worker = build_worker(worker_id, tuning);
         let pool = crate::integration_e2e::build_test_pool(url);
         let handle = crate::integration_e2e::spawn_test_worker(Arc::clone(&worker), pool);
         Self { worker, handle }
@@ -413,11 +524,12 @@ impl Drop for RunningWorker {
     }
 }
 
-/// A worker with the short [`HEARTBEAT`], so the lease TTL is 1 s.
-fn build_worker(worker_id: &str) -> Arc<Worker> {
+/// A worker with a short heartbeat interval, so the lease TTL is short.
+fn build_worker(worker_id: &str, tuning: Tuning) -> Arc<Worker> {
     let mut config =
         crate::integration_e2e::runtime_config(worker_id, 4, 4, Duration::from_secs(10));
-    config.worker_heartbeat_interval = HEARTBEAT;
+    config.worker_heartbeat_interval = tuning.heartbeat;
+    config.max_local_activity_start_to_close = tuning.local_activity_cap;
     config.poll_interval = Duration::from_millis(50);
     Arc::new(Worker::new(config, registry()).expect("worker builds"))
 }
@@ -435,6 +547,18 @@ async fn start_activity_workload(
     start_workload(admin_url, "infra_activity_wf", tag, count, &input).await
 }
 
+/// Start `count` single-cycle `chaos_noop` workflows.
+async fn start_noop_workload(admin_url: &str, count: usize) -> Vec<ExecutionId> {
+    start_workload(
+        admin_url,
+        "chaos_noop",
+        "noop",
+        count,
+        &serde_json::Value::Null,
+    )
+    .await
+}
+
 /// Start `count` workflows of type `workflow_name` with `input`.
 async fn start_workload(
     admin_url: &str,
@@ -447,6 +571,7 @@ async fn start_workload(
     let mut execs = Vec::with_capacity(count);
     for i in 0..count {
         let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+        // `base_params` needs a `'static` workflow id. A leak is fine in a test.
         let wid: &'static str = Box::leak(format!("infra-{tag}-{i}").into_boxed_str());
         let params = base_params(workflow_name, wid, exec_id, input.clone());
         autumn_harvest::execution::start_or_load_workflow_execution(&mut conn, params, None)
@@ -458,30 +583,37 @@ async fn start_workload(
 }
 
 /// The outcomes that [`converge`] accepts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Accept {
+///
+/// The known failure is `FAILED` after one activity `StartToClose` timeout.
+/// Bug #1871: the worker does not retry a lost result write. Bug #1870: the
+/// timeout ignores the retry policy. When both bugs are fixed, the known
+/// failure becomes `COMPLETED`. Then remove the two known-failure variants.
+#[derive(Clone, Copy, Debug)]
+enum Accept<'a> {
     /// Every workflow is `COMPLETED`.
     Completed,
-    /// A workflow is `COMPLETED`, or `FAILED` by one activity `StartToClose`
-    /// timeout. Bugs #1871 and #1870 cause the second outcome: a lost result
-    /// write is not retried, and the timeout ignores the retry policy. Change
-    /// this to [`Accept::Completed`] when both are fixed.
-    CompletedOrStartToCloseFailure,
+    /// Every workflow ends in the known failure. A `COMPLETED` workflow fails
+    /// the check, so a fix for the bugs makes this test fail on purpose.
+    KnownFailure,
+    /// The listed workflows are `COMPLETED` or end in the known failure. All
+    /// other workflows are `COMPLETED`.
+    CompletedOrKnownFailure(&'a [ExecutionId]),
 }
 
 /// Wait until every execution is terminal, then check the outcomes.
 ///
 /// A `COMPLETED` workflow must pass the sweep oracle. An activity workflow
-/// must also record exactly one activity result. A `FAILED` workflow passes
-/// only under [`Accept::CompletedOrStartToCloseFailure`], and only with the
-/// exact history of that known failure.
+/// must also record exactly one activity terminal event, an
+/// `ActivityCompleted`. A `FAILED` workflow passes only where [`Accept`]
+/// allows the known failure, and only with its exact history.
 async fn converge(
     admin_url: &str,
     execs: &[ExecutionId],
     activity_wf: bool,
-    accept: Accept,
+    accept: Accept<'_>,
     diag: &str,
 ) {
+    // The admin proxy never gets a toxic, so one connection serves all polls.
     let deadline = Instant::now() + CONVERGE_DEADLINE;
     let mut conn = connect(admin_url).await;
     let states = loop {
@@ -500,60 +632,74 @@ async fn converge(
             panic!("{diag}: not terminal after {CONVERGE_DEADLINE:?}: {states:?}\n{history}");
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
-        conn = connect(admin_url).await;
     };
 
     let mut completed = Vec::new();
     for (exec_id, state) in states {
-        if state == "COMPLETED" {
-            completed.push(exec_id);
-            continue;
-        }
-        let known = accept == Accept::CompletedOrStartToCloseFailure
-            && state == "FAILED"
-            && failed_by_one_start_to_close_timeout(&mut conn, exec_id).await;
-        if !known {
+        let accepted = match (state.as_str(), accept) {
+            ("COMPLETED", Accept::KnownFailure) => false,
+            ("COMPLETED", _) => {
+                completed.push(exec_id);
+                true
+            }
+            ("FAILED", Accept::KnownFailure) => known_failure(&mut conn, exec_id).await,
+            ("FAILED", Accept::CompletedOrKnownFailure(allowed)) => {
+                allowed.contains(&exec_id) && known_failure(&mut conn, exec_id).await
+            }
+            _ => false,
+        };
+        if !accepted {
             let history = history_dump(&mut conn, execs).await;
             panic!("{diag}: workflow {exec_id:?} ended {state}, not accepted\n{history}");
         }
     }
-    assert_converged(admin_url, diag, &completed, "infra fault").await;
+    let history = history_dump(&mut conn, execs).await;
+    assert_converged(admin_url, diag, &completed, &history).await;
     if activity_wf {
         for exec_id in &completed {
-            let results = event_count(&mut conn, *exec_id, "ActivityCompleted").await;
-            assert_eq!(
-                results, 1,
-                "{diag}: workflow {exec_id:?} must record exactly one activity result"
+            assert!(
+                one_activity_result(&mut conn, *exec_id).await,
+                "{diag}: workflow {exec_id:?} must record exactly one activity result\n{history}"
             );
         }
     }
 }
 
-/// True when `exec_id` shows the known failure of
-/// [`Accept::CompletedOrStartToCloseFailure`]. The history has no activity
-/// result and one `StartToClose` timeout. Its one terminal event is a
-/// `WorkflowFailed` for that timeout.
-async fn failed_by_one_start_to_close_timeout(
-    conn: &mut AsyncPgConnection,
-    exec_id: ExecutionId,
-) -> bool {
-    let shape = diesel::sql_query(
-        "SELECT COUNT(*)::bigint AS n FROM harvest_events \
-         WHERE workflow_exec_id = $1 AND ( \
-           (event_type = 'ActivityTimedOut' \
-              AND event_data->'data'->>'timeout_type' = 'StartToClose') \
-           OR (event_type = 'WorkflowFailed' \
-              AND event_data->'data'->>'error' LIKE 'timeout: StartToClose %'))",
+/// Return true when the history of `exec_id` has one activity terminal
+/// event, and that event is an `ActivityCompleted`.
+async fn one_activity_result(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> bool {
+    diesel::sql_query(
+        "SELECT COUNT(*) FILTER (WHERE event_type IN ('ActivityCompleted', 'ActivityFailed', \
+                'ActivityTimedOut', 'ActivityCompletedExternally', 'ActivityFailedExternally')) = 1 \
+            AND COUNT(*) FILTER (WHERE event_type = 'ActivityCompleted') = 1 AS ok \
+         FROM harvest_events WHERE workflow_exec_id = $1",
     )
     .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
-    .get_result::<CountRow>(conn)
+    .get_result::<BoolRow>(conn)
+    .await
+    .expect("count activity terminal events")
+    .ok
+}
+
+/// Return true when `exec_id` shows the known failure of [`Accept`]. The
+/// history has no activity result and one `StartToClose` timeout. Its one
+/// terminal event is a `WorkflowFailed` for that timeout.
+async fn known_failure(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> bool {
+    let shape = diesel::sql_query(
+        "SELECT COUNT(*) FILTER (WHERE event_type = 'ActivityTimedOut') = 1 \
+            AND COUNT(*) FILTER (WHERE event_type = 'ActivityTimedOut' \
+                AND event_data->'data'->>'timeout_type' = 'StartToClose') = 1 \
+            AND COUNT(*) FILTER (WHERE event_type = 'ActivityCompleted') = 0 \
+            AND COUNT(*) FILTER (WHERE event_type = 'WorkflowFailed' \
+                AND event_data->'data'->>'error' LIKE 'timeout: StartToClose %') = 1 AS ok \
+         FROM harvest_events WHERE workflow_exec_id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .get_result::<BoolRow>(conn)
     .await
     .expect("read the failure shape")
-    .n;
-    shape == 2
-        && event_count(conn, exec_id, "ActivityTimedOut").await == 1
-        && event_count(conn, exec_id, "ActivityCompleted").await == 0
-        && terminal_event_count(conn, exec_id).await == 1
+    .ok;
+    shape && terminal_event_count(conn, exec_id).await == 1
 }
 
 /// Render the events and tasks of `execs` for a failure message.
@@ -585,31 +731,51 @@ async fn history_dump(conn: &mut AsyncPgConnection, execs: &[ExecutionId]) -> St
         .join("\n")
 }
 
-/// Wait until at least one activity task is `RUNNING`. When `worker_id` is
-/// set, the task must belong to that worker.
-async fn wait_for_running_activity(admin_url: &str, worker_id: Option<&str>) {
+/// Wait until at least `min` activity tasks are `RUNNING`, and return their
+/// executions. When `worker_id` is set, each task must belong to that worker.
+async fn wait_for_running_activities(
+    admin_url: &str,
+    worker_id: Option<&str>,
+    min: usize,
+) -> Vec<ExecutionId> {
     let deadline = Instant::now() + RENDEZVOUS_DEADLINE;
     let mut conn = connect(admin_url).await;
     loop {
-        let running = diesel::sql_query(
-            "SELECT COUNT(*)::bigint AS n FROM harvest_task_queue \
-             WHERE task_type = 'activity' AND state = 'RUNNING' \
-               AND ($1::text IS NULL OR worker_id = $1)",
-        )
-        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(worker_id)
-        .get_result::<CountRow>(&mut conn)
-        .await
-        .expect("count running activities")
-        .n;
-        if running > 0 {
-            return;
+        let running = running_activity_execs(&mut conn, worker_id).await;
+        if running.len() >= min {
+            return running;
         }
         assert!(
             Instant::now() < deadline,
-            "no activity started running (worker {worker_id:?})"
+            "fewer than {min} activities started running (worker {worker_id:?})"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// The executions that have a `RUNNING` activity task. When `worker_id` is
+/// set, the task must belong to that worker.
+async fn running_activity_execs(
+    conn: &mut AsyncPgConnection,
+    worker_id: Option<&str>,
+) -> Vec<ExecutionId> {
+    #[derive(diesel::QueryableByName)]
+    struct ExecRow {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        workflow_exec_id: uuid::Uuid,
+    }
+    let rows: Vec<ExecRow> = diesel::sql_query(
+        "SELECT workflow_exec_id FROM harvest_task_queue \
+         WHERE task_type = 'activity' AND state = 'RUNNING' \
+           AND ($1::text IS NULL OR worker_id = $1)",
+    )
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(worker_id)
+    .load(conn)
+    .await
+    .expect("list running activities");
+    rows.into_iter()
+        .map(|r| ExecutionId::from_uuid(r.workflow_exec_id))
+        .collect()
 }
 
 /// Count tasks of `execs` that the orphan reclaimer requeued at least once.
@@ -629,11 +795,15 @@ async fn reclaimed_tasks(admin_url: &str, execs: &[ExecutionId]) -> i64 {
 
 // ── Scenario 1: pg_terminate_backend mid-commit ─────────────────────────────
 
-/// Kill the worker's backend while its COMMIT waits in a deferred trigger.
-/// The transaction rolls back, and the worker sees a dropped connection.
-async fn terminate_backend_mid_commit(site: CommitSite) {
+/// Kill the worker's backend while a deferred trigger holds its COMMIT.
+///
+/// With [`CommitFate::RolledBack`], the backend dies before the commit. With
+/// [`CommitFate::AckLost`], a downstream blackhole drops the replies first.
+/// The commit then lands, and the backend dies before the worker reads the
+/// reply. Either way, the worker sees a dropped connection.
+async fn terminate_backend_in_commit(site: CommitSite, fate: CommitFate) {
     let db = FaultDb::start().await;
-    let blocker = CommitBlocker::install(&db.admin_url, site).await;
+    let mut blocker = CommitBlocker::install(&db.admin_url, site).await;
     let (execs, activity_wf) = match site {
         CommitSite::Complete => (start_noop_workload(&db.admin_url, 1).await, false),
         CommitSite::Append | CommitSite::Claim => (
@@ -643,48 +813,62 @@ async fn terminate_backend_mid_commit(site: CommitSite) {
     };
     let _worker = RunningWorker::spawn("infra-terminate", &db.worker_url);
 
-    let pid = blocker.terminate_blocked_backend().await;
-    assert!(pid > 0, "{site:?}: no backend was terminated");
+    let pid = blocker.wait_for_blocked_backend().await;
+    match fate {
+        CommitFate::RolledBack => {
+            // The backend exits before the unlock, so the COMMIT cannot land.
+            blocker.terminate(pid).await;
+            blocker.release().await;
+        }
+        CommitFate::AckLost => {
+            let blackhole = serde_json::json!({ "timeout": 0 });
+            db.add_toxic("ack_lost", "timeout", "downstream", blackhole)
+                .await;
+            blocker.release().await;
+            blocker.wait_until_committed(pid).await;
+            blocker.terminate(pid).await;
+            // The removal closes the held worker connections.
+            db.remove_toxic("ack_lost").await;
+        }
+    }
 
-    let accept = match site {
-        CommitSite::Append => Accept::CompletedOrStartToCloseFailure,
-        CommitSite::Complete | CommitSite::Claim => Accept::Completed,
+    // A rolled-back result write always ends in the known failure.
+    let accept = match (site, fate) {
+        (CommitSite::Append, CommitFate::RolledBack) => Accept::KnownFailure,
+        _ => Accept::Completed,
     };
-    converge(
-        &db.admin_url,
-        &execs,
-        activity_wf,
-        accept,
-        &format!("{site:?}"),
-    )
-    .await;
-}
-
-/// Start `count` single-cycle `chaos_noop` workflows.
-async fn start_noop_workload(admin_url: &str, count: usize) -> Vec<ExecutionId> {
-    start_workload(
-        admin_url,
-        "chaos_noop",
-        "noop",
-        count,
-        &serde_json::Value::Null,
-    )
-    .await
+    let diag = format!("{site:?} {fate:?}");
+    converge(&db.admin_url, &execs, activity_wf, accept, &diag).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn terminate_backend_mid_commit_append() {
-    terminate_backend_mid_commit(CommitSite::Append).await;
+    terminate_backend_in_commit(CommitSite::Append, CommitFate::RolledBack).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn terminate_backend_mid_commit_complete() {
-    terminate_backend_mid_commit(CommitSite::Complete).await;
+    terminate_backend_in_commit(CommitSite::Complete, CommitFate::RolledBack).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn terminate_backend_mid_commit_claim() {
-    terminate_backend_mid_commit(CommitSite::Claim).await;
+    terminate_backend_in_commit(CommitSite::Claim, CommitFate::RolledBack).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn terminate_backend_after_commit_ack_lost_append() {
+    terminate_backend_in_commit(CommitSite::Append, CommitFate::AckLost).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn terminate_backend_after_commit_ack_lost_complete() {
+    terminate_backend_in_commit(CommitSite::Complete, CommitFate::AckLost).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn terminate_backend_after_commit_ack_lost_claim() {
+    terminate_backend_in_commit(CommitSite::Claim, CommitFate::AckLost).await;
 }
 
 // ── Scenario 2: Postgres restart and pause ──────────────────────────────────
@@ -695,24 +879,31 @@ async fn postgres_crash_restart_mid_workload() {
     let db = FaultDb::start().await;
     let execs = start_activity_workload(&db.admin_url, "restart", 6, 1500).await;
     let _worker = RunningWorker::spawn("infra-restart", &db.worker_url);
-    wait_for_running_activity(&db.admin_url, None).await;
+    wait_for_running_activities(&db.admin_url, None, 1).await;
 
     db.crash_restart_postgres().await;
 
-    // The crash can drop an in-flight result write, so bug #1871 applies.
-    let accept = Accept::CompletedOrStartToCloseFailure;
+    // The crash can drop a write of an activity in flight, so the known
+    // failure applies to those workflows only. The list read after the
+    // restart holds every activity that was in flight across the crash.
+    let mut conn = connect(&db.admin_url).await;
+    let in_flight = running_activity_execs(&mut conn, None).await;
+    let accept = Accept::CompletedOrKnownFailure(&in_flight);
     converge(&db.admin_url, &execs, true, accept, "crash restart").await;
 }
 
 /// Pause Postgres for longer than the lease TTL while two workers hold
 /// activities. On unpause every heartbeat is stale at once.
+///
+/// The test does not assert a reclaim. A reclaim races the first heartbeats
+/// after the unpause, so its result is not deterministic.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn postgres_pause_longer_than_lease_ttl() {
     let db = FaultDb::start().await;
     let execs = start_activity_workload(&db.admin_url, "pause", 6, 1000).await;
     let _a = RunningWorker::spawn("infra-pause-a", &db.worker_url);
     let _b = RunningWorker::spawn("infra-pause-b", &db.worker_url);
-    wait_for_running_activity(&db.admin_url, None).await;
+    wait_for_running_activities(&db.admin_url, None, 1).await;
 
     db.pause_postgres().await;
     tokio::time::sleep(PAST_LEASE_TTL).await;
@@ -745,26 +936,40 @@ async fn toxiproxy_latency_between_worker_and_db() {
     drop(probe);
 
     let execs = start_activity_workload(&db.admin_url, "latency", 4, 200).await;
-    let _a = RunningWorker::spawn("infra-latency-a", &db.worker_url);
-    let _b = RunningWorker::spawn("infra-latency-b", &db.worker_url);
+    let _a = RunningWorker::spawn_tuned("infra-latency-a", &db.worker_url, SLOW_NETWORK);
+    let _b = RunningWorker::spawn_tuned("infra-latency-b", &db.worker_url, SLOW_NETWORK);
 
     converge(&db.admin_url, &execs, true, Accept::Completed, "latency").await;
 }
 
-/// Blackhole worker A for longer than the lease TTL while it holds
+/// Blackhole worker A for longer than the lease TTL while it holds three
 /// activities. Worker B, on a clean path, reclaims and finishes the work.
-/// Then the partition heals, and the late writes of A must not duplicate a
-/// result.
+///
+/// The first attempts on A wait until the partition heals. Then they return,
+/// and A writes three stale results. The claim fence must reject them, so
+/// each workflow keeps exactly one activity result.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn toxiproxy_partition_longer_than_lease_ttl() {
+    const HELD: usize = 3;
+
+    RELEASE_FIRST_ATTEMPTS.store(false, Ordering::SeqCst);
+    LATE_RETURNS.store(0, Ordering::SeqCst);
     let db = FaultDb::start().await;
-    // Postgres keeps the open transaction of a partitioned worker, and its
-    // row locks. Orphan reclaim then stalls behind those locks (bug #1876).
-    // This server timeout ends such a session.
+    // Postgres keeps the open transaction of a partitioned worker. That
+    // transaction keeps its row locks, and orphan reclaim stalls behind them
+    // (bug #1876). This server timeout ends such a session.
     db.limit_idle_in_transaction(5).await;
-    let execs = start_activity_workload(&db.admin_url, "partition", 3, 3000).await;
+    let input = serde_json::json!({ "sleep_ms": 0, "hold_first_attempt": true });
+    let execs = start_workload(
+        &db.admin_url,
+        "infra_activity_wf",
+        "partition",
+        HELD,
+        &input,
+    )
+    .await;
     let a = RunningWorker::spawn("infra-partition-a", &db.worker_url);
-    wait_for_running_activity(&db.admin_url, Some("infra-partition-a")).await;
+    wait_for_running_activities(&db.admin_url, Some("infra-partition-a"), HELD).await;
 
     let blackhole = serde_json::json!({ "timeout": 0 });
     db.add_toxic("bh_up", "timeout", "upstream", blackhole.clone())
@@ -773,35 +978,35 @@ async fn toxiproxy_partition_longer_than_lease_ttl() {
         .await;
     tokio::time::sleep(PAST_LEASE_TTL).await;
 
+    // Worker B uses the admin proxy, which has no toxic.
     let _b = RunningWorker::spawn("infra-partition-b", &db.admin_url);
-    converge(
-        &db.admin_url,
-        &execs,
-        true,
-        Accept::Completed,
-        "partition, before heal",
-    )
-    .await;
+    let before = "partition, before heal";
+    converge(&db.admin_url, &execs, true, Accept::Completed, before).await;
     let reclaimed = reclaimed_tasks(&db.admin_url, &execs).await;
     assert!(
         reclaimed >= 1,
         "worker B must reclaim at least one task of the partitioned worker"
     );
 
-    // Heal. Worker A sees its held connections drop and retries its writes.
+    // Remove the partition, then release the held attempts on A.
     db.remove_toxic("bh_up").await;
     db.remove_toxic("bh_down").await;
+    RELEASE_FIRST_ATTEMPTS.store(true, Ordering::SeqCst);
+    let deadline = Instant::now() + RENDEZVOUS_DEADLINE;
+    while late_returns() < HELD {
+        assert!(
+            Instant::now() < deadline,
+            "only {} of {HELD} held attempts on worker A returned",
+            late_returns()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Give worker A time to make its stale result writes before it stops.
     tokio::time::sleep(PAST_LEASE_TTL).await;
     drop(a);
 
-    converge(
-        &db.admin_url,
-        &execs,
-        true,
-        Accept::Completed,
-        "partition, after heal",
-    )
-    .await;
+    let after = "partition, after heal";
+    converge(&db.admin_url, &execs, true, Accept::Completed, after).await;
 }
 
 // ── Scenario 4: SIGKILL of a worker process ─────────────────────────────────
@@ -831,7 +1036,7 @@ async fn sigkill_child_worker_mid_activity() {
             .spawn()
             .expect("start the child worker"),
     );
-    wait_for_running_activity(&db.admin_url, Some(CHILD_WORKER_ID)).await;
+    wait_for_running_activities(&db.admin_url, Some(CHILD_WORKER_ID), 1).await;
 
     child.0.kill().expect("SIGKILL the child worker");
     let status = child.0.wait().expect("reap the child worker");
@@ -848,7 +1053,7 @@ async fn sigkill_child_worker_mid_activity() {
 }
 
 /// The child worker process. It runs only when the parent test sets
-/// [`CHILD_DB_URL_VAR`]; otherwise it returns at once.
+/// [`CHILD_DB_URL_VAR`]. Otherwise it returns at once.
 #[test]
 #[ignore = "started as a child process by sigkill_child_worker_mid_activity"]
 fn sigkill_child_worker_entry() {
@@ -867,7 +1072,7 @@ fn sigkill_child_worker_entry() {
     });
     let runtime = tokio::runtime::Runtime::new().expect("child runtime");
     runtime.block_on(async move {
-        let worker = build_worker(CHILD_WORKER_ID);
+        let worker = build_worker(CHILD_WORKER_ID, FAST);
         let pool: DbPool = crate::integration_e2e::build_test_pool(&url);
         worker.run(&pool).await;
     });

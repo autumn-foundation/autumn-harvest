@@ -20,6 +20,9 @@
 //! seed and the fired-action trace, so a failure is replayable with one command
 //! (`CHAOS_SEEDS=<seed> cargo test --features chaos ...`).
 
+// Unix only: the SIGKILL test reads the signal of the child process. CI runs
+// the module on the Linux chaos runner.
+#[cfg(unix)]
 mod infra_faults;
 
 use std::sync::Arc;
@@ -1598,8 +1601,9 @@ async fn assert_converged(url: &str, case: &str, execs: &[ExecutionId], diag: &s
 }
 
 /// Oracle self-test (issue #1801): a forged second terminal event must fail
-/// [`assert_converged`]. The table key is `(workflow_exec_id, event_id)`, so a
-/// duplicate at a new event id passes the key. Only the oracle catches it.
+/// [`assert_converged`]. The table key is `(workflow_exec_id, event_id)`. A
+/// duplicate at a new event id does not violate that key, so only the oracle
+/// catches it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::significant_drop_tightening)]
 async fn oracle_flags_a_duplicate_terminal_event() {
@@ -1631,7 +1635,7 @@ async fn oracle_flags_a_duplicate_terminal_event() {
     // The clean history converges.
     assert_converged(&url, "oracle", &[exec_id], "clean").await;
 
-    // Forge a second `WorkflowCompleted` at the next event id.
+    // Forge a second `WorkflowCompleted` at a new event id.
     conn.batch_execute(&format!(
         "INSERT INTO harvest_events (workflow_exec_id, event_id, event_type, event_data, timestamp) \
          SELECT workflow_exec_id, event_id + 1000, event_type, event_data, timestamp \
@@ -1641,17 +1645,26 @@ async fn oracle_flags_a_duplicate_terminal_event() {
     .await
     .expect("forge duplicate terminal event");
 
-    let caught =
+    let panic =
         std::panic::AssertUnwindSafe(assert_converged(&url, "oracle", &[exec_id], "forged"))
             .catch_unwind()
             .await
-            .is_err();
-    assert!(caught, "the oracle must flag a duplicate terminal event");
+            .expect_err("the oracle must flag a duplicate terminal event");
+    // Match the message, so a panic for another reason cannot pass the test.
+    let message = panic.downcast_ref::<String>().cloned().unwrap_or_default();
+    assert!(
+        message.contains("exactly one terminal event"),
+        "the oracle panicked for another reason: {message}"
+    );
 }
 
 /// Count the workflow-level terminal events of one execution (issue #1801).
-/// The table key is `(workflow_exec_id, event_id)`, so it does not stop a
-/// second terminal event at a new event id.
+/// The table key `(workflow_exec_id, event_id)` does not stop a second
+/// terminal event at a new event id.
+///
+/// The list is `WorkflowEvent::is_terminal_lifecycle` without its two
+/// linkage events. Those events follow a real terminal event, so counting
+/// them flags a false duplicate. Keep the two lists in step.
 async fn terminal_event_count(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> i64 {
     diesel::sql_query(
         "SELECT COUNT(*)::bigint AS n FROM harvest_events \
