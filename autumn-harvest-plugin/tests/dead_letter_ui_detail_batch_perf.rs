@@ -201,7 +201,7 @@ async fn insert_workflow(database_url: &str, workflow_id: &str) -> ExecutionId {
             workflow_name: "dlq_perf_workflow",
             workflow_id,
             exec_id,
-            input: json!({ "workflow_id": workflow_id }),
+            input: json!({ "workflow_id": workflow_id }).into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,

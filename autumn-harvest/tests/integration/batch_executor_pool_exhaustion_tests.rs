@@ -112,7 +112,7 @@ async fn insert_running_execution(conn: &mut AsyncPgConnection, workflow_id: &st
         workflow_id,
         run_id: Uuid::new_v4(),
         shard_id: SHARD.as_i32(),
-        input: json!({}),
+        input: json!({}).into(),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
