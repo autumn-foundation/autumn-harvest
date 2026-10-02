@@ -19,8 +19,9 @@ An unconfigured deployment no longer pays for the audit export index.
   runs. Shutdown closes the build connection. Only a confirmed valid index
   reopens the per-shard retry gate; a lost lock race or a failure waits five
   minutes. A worker role that does not own the table gets one `error!` line
-  with the `CREATE INDEX CONCURRENTLY` and `ALTER TABLE ... OWNER TO`
-  statements, then an hour's wait.
+  with the `CREATE INDEX CONCURRENTLY` statement, then an hour's wait. The
+  remedy is to run it through the owner role, never to transfer the table.
+  A sharded worker uses only its per-shard URL, never the global one.
 - Without a notification URL for the shard, and on the embedder-driven
   `fire_due_audit_exports` path, the exporter never builds. It logs the
   statement once an hour. Export is correct without the index.

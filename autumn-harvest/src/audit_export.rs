@@ -1109,11 +1109,6 @@ pub const UNEXPORTED_INDEX_DDL: &str = "CREATE INDEX CONCURRENTLY IF NOT EXISTS 
      harvest_audit_log_unexported_idx ON harvest_audit_log (occurred_at, id) \
      WHERE export_seq IS NULL";
 
-/// The statement that lets the worker role build the index itself.
-///
-/// `CREATE INDEX` needs table ownership. No `GRANT` confers it.
-pub const UNEXPORTED_INDEX_OWNER_DDL: &str = "ALTER TABLE harvest_audit_log OWNER TO <worker role>";
-
 /// Advisory-lock key that serializes builds of the claim-scan index.
 pub const UNEXPORTED_INDEX_LOCK_KEY: i64 = 0x6175_6469_745f_6978;
 
@@ -1488,11 +1483,10 @@ async fn spawn_unexported_index_build_if_due(
                         shard = shard_id,
                         %error,
                         statement = UNEXPORTED_INDEX_DDL,
-                        ownership = UNEXPORTED_INDEX_OWNER_DDL,
                         retry_in_secs = INDEX_BUILD_REFUSED_RETRY.as_secs(),
                         "[audit_export] the worker role cannot build the claim-scan index; \
-                         export continues without it. Run `statement` once as the table \
-                         owner, or run `ownership` so the worker can build it"
+                         export continues without it. Run `statement` once through the \
+                         role that owns the table, such as the migration role"
                     );
                     BuildEnd::Refused
                 }

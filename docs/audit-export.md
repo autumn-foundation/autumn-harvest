@@ -30,9 +30,11 @@ per-shard cursor that advances only on acknowledgement.
   with a cursor row keep it. Two cases cannot build: a worker with no
   notification URL for the shard, and a worker role that does not own
   `harvest_audit_log` (`CREATE INDEX` needs ownership; no `GRANT` confers
-  it). The exporter then logs the statement and, for a refused build, backs
-  off for an hour. Run the statement once as the table owner, or run `ALTER
-  TABLE harvest_audit_log OWNER TO <worker role>`. Export is correct without
+  it). A sharded worker needs a per-shard URL, because the global URL can
+  point at another database. The exporter then logs the statement and, for a
+  refused build, backs off for an hour. Run the statement once through the
+  role that owns the table, such as the migration role. Do not transfer the
+  table to the worker role. Export is correct without
   the index, only slower. Once export runs, the index size is bounded only
   while retention reclaims unexported rows. See "Retention interaction"
   below. Retention can never purge a decommission or reactivation record,

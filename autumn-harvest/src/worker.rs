@@ -26266,21 +26266,17 @@ fn multi_shard_listener_url(
 ///
 /// The build runs on a dedicated connection, never a pooled one. The engine
 /// holds no DSN for a pool, so the exporter reuses the LISTEN/NOTIFY URL for
-/// the shard. The rule is the queue listener's own. A per-shard entry wins.
-/// The global URL pairs with the default pool. It serves a shard only when
-/// that shard is the pool's default, or when there is no shard at all.
-/// Any other shard without an entry gets `None`: the exporter then logs the
+/// the shard. A sharded worker uses only the per-shard entry. The global URL
+/// is set apart from `sharded_pool` and can point at another database, even
+/// for the default shard. An unsharded worker has one pool and uses the global
+/// URL. A shard without a URL gets `None`: the exporter then logs the
 /// statement for an operator and never builds.
 fn audit_index_build_dsn<'a>(
     per_shard: &'a [(crate::types::ShardId, String)],
     global: Option<&'a str>,
     shard: Option<crate::types::ShardId>,
-    default_shard: Option<crate::types::ShardId>,
 ) -> Option<&'a str> {
-    shard.map_or(global, |shard| {
-        multi_shard_listener_url(per_shard, shard)
-            .or_else(|| (Some(shard) == default_shard).then_some(global).flatten())
-    })
+    shard.map_or(global, |shard| multi_shard_listener_url(per_shard, shard))
 }
 
 // ---------------------------------------------------------------------------
@@ -28815,10 +28811,6 @@ impl Worker {
                     &self.config.shard_notification_database_urls,
                     self.config.notification_database_url.as_deref(),
                     *shard,
-                    self.config
-                        .sharded_pool
-                        .as_ref()
-                        .map(crate::shard::ShardedDbPool::default_shard),
                 )
                 .map(str::to_owned);
                 Some(crate::audit_export::spawn_audit_export_checker_for_shard(
@@ -34592,8 +34584,9 @@ mod tests {
     }
 
     /// Issue #1667: the index build URL follows the listener's rule. A
-    /// per-shard entry wins. The global URL serves only the default shard, or
-    /// an unsharded worker.
+    /// per-shard entry wins. The global URL serves only an unsharded worker.
+    /// A sharded pool can leave it aimed at another database, even for the
+    /// default shard.
     #[test]
     fn audit_index_build_dsn_follows_the_listener_rule() {
         let per_shard = vec![(
@@ -34601,39 +34594,20 @@ mod tests {
             "postgres://host/shard1".to_string(),
         )];
         let global = Some("postgres://host/default");
-        let default = Some(crate::types::ShardId::new(0));
         assert_eq!(
-            audit_index_build_dsn(
-                &per_shard,
-                global,
-                Some(crate::types::ShardId::new(1)),
-                default
-            ),
+            audit_index_build_dsn(&per_shard, global, Some(crate::types::ShardId::new(1))),
             Some("postgres://host/shard1"),
         );
         assert_eq!(
-            audit_index_build_dsn(
-                &per_shard,
-                global,
-                Some(crate::types::ShardId::new(0)),
-                default
-            ),
-            global,
-        );
-        assert_eq!(
-            audit_index_build_dsn(
-                &per_shard,
-                global,
-                Some(crate::types::ShardId::new(2)),
-                default
-            ),
+            audit_index_build_dsn(&per_shard, global, Some(crate::types::ShardId::new(0))),
             None,
         );
         assert_eq!(
-            audit_index_build_dsn(&per_shard, global, None, None),
-            global
+            audit_index_build_dsn(&per_shard, global, Some(crate::types::ShardId::new(2))),
+            None,
         );
-        assert_eq!(audit_index_build_dsn(&[], None, None, None), None);
+        assert_eq!(audit_index_build_dsn(&per_shard, global, None), global);
+        assert_eq!(audit_index_build_dsn(&[], None, None), None);
     }
 
     /// **Issue #961 review (Codex P2).** A shard with no per-shard URL resolves
