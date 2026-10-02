@@ -2873,6 +2873,85 @@ pub async fn defer_claimed_rate_limited_task(
         .map(claim_write)
 }
 
+/// Defer the retry that `claim` holds because the retry budget is empty
+/// (issue #1793). A stale claim changes nothing.
+///
+/// The write is the rate-limit deferral with two differences:
+///
+/// - It keeps `crash_strikes`. An empty bucket says nothing about crashes. A
+///   reset would let a task that crashes workers escape poison-pill
+///   quarantine.
+/// - It computes `scheduled_at` as `clock_timestamp() + delay` in the
+///   statement (issue #1389). The claim checks `scheduled_at` on the same
+///   clock, so a host clock behind Postgres cannot make the row due at once.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on update failure.
+pub async fn defer_claimed_retry_for_budget(
+    conn: &mut AsyncPgConnection,
+    claim: &TaskClaim,
+    delay: Duration,
+) -> HarvestResult<ClaimWrite> {
+    use crate::schema::harvest_task_queue::dsl;
+    use diesel::dsl::sql;
+    use diesel::sql_types::{Double, Timestamptz};
+
+    let update = diesel::update(
+        dsl::harvest_task_queue
+            .find(claim.task_id)
+            .filter(dsl::state.eq("RUNNING")),
+    )
+    .set((
+        BudgetDeferralChangeset::new(),
+        dsl::scheduled_at.eq(
+            sql::<Timestamptz>("clock_timestamp() + make_interval(secs => ")
+                .bind::<Double, _>(delay_secs(delay))
+                .sql(")"),
+        ),
+        // Undo the claim-time attempt increment. A deferral is not an
+        // execution, so it must not use an attempt.
+        dsl::attempt.eq(diesel::dsl::sql::<diesel::sql_types::Integer>(
+            "GREATEST(attempt - 1, 0)",
+        )),
+    ))
+    .into_boxed();
+    let Some((queue_name, priority, task_type, scheduled_at)) = fence(update, Some(claim))
+        .returning((
+            dsl::queue_name,
+            dsl::priority,
+            dsl::task_type,
+            dsl::scheduled_at,
+        ))
+        .get_result::<(String, i32, String, chrono::DateTime<Utc>)>(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?
+    else {
+        return Ok(ClaimWrite::LeaseLost);
+    };
+    // The UPDATE already committed, so the row is durably deferred. The
+    // NOTIFY is best-effort, as for the retry requeue: a failed wake must not
+    // report the deferral as unpersisted. The poll loop still finds the row.
+    if let Err(error) = announce_deferred_task(
+        conn,
+        claim.task_id,
+        &queue_name,
+        scheduled_at,
+        priority,
+        &task_type,
+    )
+    .await
+    {
+        tracing::warn!(
+            task_id = %claim.task_id,
+            %error,
+            "failed to announce a retry-budget deferral; the poll loop still claims it"
+        );
+    }
+    Ok(ClaimWrite::Applied)
+}
+
 /// Mark a task as completed with the given output.
 ///
 /// Terminal completion clears any heartbeat checkpoint payload so it cannot be
@@ -3964,6 +4043,33 @@ struct CleanContinuationChangeset {
     scheduled_at: chrono::DateTime<Utc>,
 }
 
+/// [`CleanContinuationChangeset`] without `crash_strikes` and `scheduled_at`,
+/// for a retry-budget deferral (issue #1793). The caller sets `scheduled_at`
+/// on the database clock.
+#[derive(AsChangeset)]
+#[diesel(table_name = crate::schema::harvest_task_queue, treat_none_as_null = true)]
+struct BudgetDeferralChangeset {
+    state: &'static str,
+    worker_id: Option<String>,
+    started_at: Option<chrono::DateTime<Utc>>,
+    last_heartbeat_at: Option<chrono::DateTime<Utc>>,
+    capability_misses: i32,
+    capability_miss_workers: Vec<String>,
+}
+
+impl BudgetDeferralChangeset {
+    const fn new() -> Self {
+        Self {
+            state: "PENDING",
+            worker_id: None,
+            started_at: None,
+            last_heartbeat_at: None,
+            capability_misses: 0,
+            capability_miss_workers: Vec::new(),
+        }
+    }
+}
+
 impl CleanContinuationChangeset {
     const fn new(scheduled_at: chrono::DateTime<Utc>) -> Self {
         Self {
@@ -4098,17 +4204,38 @@ async fn defer_rate_limited_task_inner(
         return Ok(false);
     };
 
-    crate::notify::notify_task_enqueued(conn, &queue_name, task_id).await?;
-    // Dispatch hint (issue #1312).
-    record_pending_hint(
+    announce_deferred_task(
+        conn,
         task_id,
         &queue_name,
         scheduled_at,
         priority,
-        crate::dispatch::DispatchKind::from(task_type.as_str()),
-    );
-
+        &task_type,
+    )
+    .await?;
     Ok(true)
+}
+
+/// Notify listeners and record the dispatch hint for a row that a deferral
+/// put back to `PENDING`.
+async fn announce_deferred_task(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    queue_name: &str,
+    scheduled_at: chrono::DateTime<Utc>,
+    priority: i32,
+    task_type: &str,
+) -> HarvestResult<()> {
+    crate::notify::notify_task_enqueued(conn, queue_name, task_id).await?;
+    // Dispatch hint (issue #1312).
+    record_pending_hint(
+        task_id,
+        queue_name,
+        scheduled_at,
+        priority,
+        crate::dispatch::DispatchKind::from(task_type),
+    );
+    Ok(())
 }
 
 /// SQL for [`release_task_for_capability_miss`], exposed for no-DB shape tests

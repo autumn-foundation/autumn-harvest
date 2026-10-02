@@ -398,6 +398,8 @@ pub mod replication;
 #[cfg(feature = "db")]
 pub mod reset;
 pub mod retention;
+/// Per-activity-type retry budget that bounds retry load (issue #1793).
+pub mod retry_budget;
 /// Continue-as-new run-chain assembly (issue #701).
 pub mod run_chain;
 pub mod saga;
@@ -633,8 +635,8 @@ pub use payload_store::{
 };
 pub use policy::validate_schedule;
 pub use policy::{
-    CatchupPolicy, JitterPolicy, MapFailurePolicy, OverlapPolicy, RetryPolicy, Schedule,
-    SkipPolicy, TaskStatus, TriggerRule, WorkflowSchedule,
+    CatchupPolicy, JitterPolicy, MapFailurePolicy, OverlapPolicy, RetryBudgetPolicy, RetryPolicy,
+    Schedule, SkipPolicy, TaskStatus, TriggerRule, WorkflowSchedule,
 };
 pub use pool::{HarvestPoolConfig, compute_pool_sizes};
 pub use query::QueryRegistry;
@@ -658,6 +660,7 @@ pub use retention::{
     RetentionMonitor, RetentionRuntime, RetentionStatus, RetentionTickResult, release_legal_hold,
     set_legal_hold,
 };
+pub use retry_budget::RetryBudgetConfig;
 pub use run_chain::{
     RunChainRecord, RunChainResponse, RunChainRow, assemble_run_chain, outcome_for_state,
 };

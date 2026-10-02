@@ -2197,7 +2197,7 @@
     {
       "id": 39,
       "type": "row",
-      "title": "Circuit breakers",
+      "title": "Circuit breakers and retry budget",
       "collapsed": true,
       "gridPos": {
         "h": 1,
@@ -2303,6 +2303,104 @@
             }
           ],
           "description": "Circuit breakers recovered to closed in the last hour (half-open probe success or operator force-close)."
+        },
+        {
+          "id": 185255,
+          "type": "timeseries",
+          "title": "Retry budget tokens available",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 50
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "min by (activity) (harvest_retry_budget_available)",
+              "legendFormat": "{{activity}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Lowest retry budget token count per activity type across workers. Near 0 means the budget defers retries (issue #1793)."
+        },
+        {
+          "id": 185256,
+          "type": "timeseries",
+          "title": "Retries deferred by the retry budget",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 50
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (activity) (increase(harvest_retry_budget_exhausted_total[1h]))",
+              "legendFormat": "{{activity}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Retries that the retry budget deferred in the last hour, per activity type. A deferred retry is not lost. It runs later (issue #1793)."
         }
       ]
     },
