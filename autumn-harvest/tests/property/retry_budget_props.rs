@@ -4,8 +4,9 @@
 //! - Retries that run never exceed
 //!   `max_tokens + ratio * first_attempts + min_retries_per_sec * elapsed`.
 //!   An attempt that is released does not run, so it does not count.
+//!   A first attempt deposits only when it commits.
 //! - A first attempt always runs.
-//! - Available tokens never exceed `max_tokens`.
+//! - Available tokens stay in `[0, max_tokens]`.
 //! - A deferral delay stays in the documented band.
 
 use std::time::{Duration, Instant};
@@ -60,13 +61,16 @@ proptest! {
             last_admit = now;
             match reg.admit("act", s.is_retry, now) {
                 Admission::Admitted { ticket, available } => {
-                    prop_assert!(available <= policy.max_tokens + 1e-9);
+                    prop_assert!((-1e-9..=policy.max_tokens + 1e-9).contains(&available));
                     if s.released {
                         reg.release("act", ticket, now);
-                    } else if s.is_retry {
-                        retries_run += 1;
                     } else {
-                        first_attempts += 1;
+                        reg.commit("act", ticket, now);
+                        if s.is_retry {
+                            retries_run += 1;
+                        } else {
+                            first_attempts += 1;
+                        }
                     }
                 }
                 Admission::Deferred { retry_after, available } => {

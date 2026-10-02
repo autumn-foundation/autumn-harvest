@@ -14701,12 +14701,12 @@ fn admit_retry_budget(
     }
 }
 
-/// Releases a retry budget ticket when the attempt does not run.
+/// Settles a retry budget ticket for one attempt.
 ///
-/// Every return between the gate and `ActivityStarted` drops the guard. That
-/// includes a rate-limit deferral, a no-op start and an error from `?`. The
-/// drop gives the tokens back and updates the gauge. `commit` keeps the
-/// decision once the attempt runs.
+/// `commit` settles it once `ActivityStarted` is appended. A first attempt's
+/// deposit counts only then. Every return before that point drops the guard
+/// instead. That includes a rate-limit deferral, a no-op start and an error
+/// from `?`. The drop releases the ticket and updates the gauge.
 struct BudgetReleaseGuard<'a> {
     registry: &'a HandlerRegistry,
     activity_name: &'a str,
@@ -14726,8 +14726,22 @@ impl<'a> BudgetReleaseGuard<'a> {
         self.ticket = ticket;
     }
 
-    const fn commit(&mut self) {
-        self.ticket = None;
+    /// The attempt starts. A first attempt's deposit counts from here.
+    fn commit(&mut self) {
+        let Some(ticket) = self.ticket.take() else {
+            return;
+        };
+        let committed = self.registry.retry_budgets().commit(
+            self.activity_name,
+            ticket,
+            std::time::Instant::now(),
+        );
+        if let Some(available) = committed {
+            self.registry
+                .telemetry()
+                .metrics
+                .record_retry_budget_available(self.activity_name, available);
+        }
     }
 }
 
@@ -15365,7 +15379,8 @@ async fn process_activity_task(
         // conn is dropped here, returning the slot to the pool
     };
     let activity_id = started.activity_id;
-    // The attempt runs from here, so its budget decision stands.
+    // The attempt runs from here, so its budget decision stands. A first
+    // attempt's deposit counts from this point.
     budget_guard.commit();
 
     // Schedule-to-start latency (issue #501): record here, once the activity has

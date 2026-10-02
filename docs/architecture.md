@@ -208,14 +208,13 @@ A retry policy limits the retries of one task. A retry budget limits the retries
 
 *Rules.*
 
-1. A claim with `attempt == 1` is a first attempt. It always runs and deposits `ratio` tokens.
+1. A claim with `attempt == 1` is a first attempt. It always runs. It deposits `ratio` tokens when it starts, that is when `ActivityStarted` is appended. Until then the deposit is pending, and no retry can spend it.
 2. A claim with `attempt > 1` is a retry. An orphan re-claim is a retry too. A retry runs only if it can spend one token.
 3. The bucket never holds more than `max_tokens`.
 4. The gate applies only to a real call. A `CircuitOpen` short-circuit spends nothing. A half-open probe that is a retry is never deferred, because it is the breaker's recovery signal. A probe that is a first attempt still deposits.
-5. An attempt that does not run gives its tokens back. A drop guard does this on every return before `ActivityStarted`: a rate-limit deferral, a no-op start or an error.
-6. A released deposit can leave the bucket below 0, because a retry can spend the deposit first. The next deposits pay the debt back. A held deposit can also push the time refill over the cap. Its release gives back the refill that the cap discarded, up to the deposit amount.
+5. An attempt that does not run settles its ticket without effect on the bound. A drop guard does this on every return before `ActivityStarted`: a rate-limit deferral, a no-op start or an error. A retry gets its token back, up to the cap. A pending deposit is dropped, because it never entered the bucket.
 
-So the retries that run in a window of `T` seconds are at most `max_tokens + ratio × first_attempts + min_retries_per_sec × T`.
+So the retries that run in a window of `T` seconds are at most `max_tokens + ratio × first_attempts + min_retries_per_sec × T`, where `first_attempts` counts only first attempts that started. The bound holds at every instant, not only on average.
 
 *Deferral.* An empty bucket defers the retry. The worker calls `queue::defer_claimed_retry_for_budget`. That fenced write puts the row back to `PENDING`. It computes the new `scheduled_at` on the database clock, as the retry requeue does (issue #1389). It lowers `attempt` again and keeps `error` and `crash_strikes`. A deferral says nothing about crashes, so poison-pill quarantine still counts them. The write appends no event. A deferral of a rate-limited activity without a circuit breaker also refunds the claim-time rate-limit token.
 

@@ -10,11 +10,11 @@ retry each second plus 0.1 for each first attempt. Use
 `RetryBudgetConfig::disabled()` to keep the old behavior.
 
 **What shipped.** Each worker keeps one token bucket for each activity type.
-A first attempt deposits `ratio` tokens. A retry spends one token. Time adds
-`min_retries_per_sec` tokens each second. An empty bucket defers the retry
-through the new fenced write `queue::defer_claimed_retry_for_budget`. The row
-stays `PENDING` and keeps its `attempt`, `error` and `crash_strikes`. **A
-deferred retry is never lost.**
+A first attempt deposits `ratio` tokens once it starts. A retry spends one
+token. Time adds `min_retries_per_sec` tokens each second. An empty bucket
+defers the retry through the new fenced write
+`queue::defer_claimed_retry_for_budget`. The row stays `PENDING` and keeps its
+`attempt`, `error` and `crash_strikes`. **A deferred retry is never lost.**
 
 - New module `retry_budget.rs`: `RetryBudgetConfig`, `RetryBudgetRegistry`,
   `Admission` and `BudgetTicket`. `RetryBudgetConfig` is in the prelude.
