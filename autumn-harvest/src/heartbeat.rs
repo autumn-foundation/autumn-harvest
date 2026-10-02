@@ -123,11 +123,18 @@ type LatestHeartbeat = Arc<Mutex<Option<Pending>>>;
 /// This task never waits on the database. A flush can block for its acquire or
 /// statement timeout. A heartbeat sent in that time keeps its send time, so a
 /// stalled handler cannot look alive later.
+///
+/// Newest means the latest send time, not the latest arrival. A manual
+/// heartbeat and the auto-heartbeat ticker stamp before they send, so they can
+/// arrive out of order. A heartbeat older than one already seen is dropped,
+/// also when a flush already took the newer one. A write of it would move
+/// `last_heartbeat_at` backwards.
 async fn keep_newest_heartbeat(
     mut rx: mpsc::Receiver<StampedHeartbeat>,
     latest: LatestHeartbeat,
     cancel: CancellationToken,
 ) {
+    let mut newest_sent_at: Option<chrono::DateTime<chrono::Utc>> = None;
     loop {
         let beat = tokio::select! {
             () = cancel.cancelled() => break,
@@ -136,6 +143,10 @@ async fn keep_newest_heartbeat(
                 None => break,
             },
         };
+        if newest_sent_at.is_some_and(|newest| beat.sent_at < newest) {
+            continue;
+        }
+        newest_sent_at = Some(beat.sent_at);
         *latest.lock().unwrap_or_else(PoisonError::into_inner) = Some(Pending {
             payload: beat.details,
             sent_at: beat.sent_at,
@@ -296,6 +307,55 @@ const SITE_HEARTBEAT_FLUSH: &str = "heartbeat_flush";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Run `keep_newest_heartbeat` over `beats`, sent in order. Take the slot
+    /// after the beat at `take_after`, as a flush would.
+    async fn keep_newest_of(
+        beats: Vec<StampedHeartbeat>,
+        take_after: Option<usize>,
+    ) -> Option<chrono::DateTime<chrono::Utc>> {
+        let (tx, rx) = mpsc::channel(8);
+        let latest: LatestHeartbeat = Arc::new(Mutex::new(None));
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(keep_newest_heartbeat(rx, Arc::clone(&latest), cancel));
+        for (index, beat) in beats.into_iter().enumerate() {
+            tx.send(beat).await.expect("send");
+            tokio::task::yield_now().await;
+            while !tx.capacity().eq(&tx.max_capacity()) {
+                tokio::task::yield_now().await;
+            }
+            if take_after == Some(index) {
+                latest.lock().expect("lock").take();
+            }
+        }
+        drop(tx);
+        task.await.expect("join");
+        let slot = latest.lock().expect("lock");
+        slot.as_ref().map(|beat| beat.sent_at)
+    }
+
+    fn beat_at(secs: i64) -> StampedHeartbeat {
+        StampedHeartbeat {
+            details: Value::Null,
+            sent_at: chrono::DateTime::from_timestamp(secs, 0).expect("time"),
+        }
+    }
+
+    /// A heartbeat that arrives late keeps the newer one (issue #1788). Two
+    /// senders stamp before they send, so they can arrive out of order.
+    #[tokio::test]
+    async fn an_older_heartbeat_does_not_replace_a_newer_one() {
+        let newest = keep_newest_of(vec![beat_at(20), beat_at(10)], None).await;
+        assert_eq!(newest, Some(beat_at(20).sent_at));
+    }
+
+    /// An older heartbeat that arrives after a flush took the newer one is
+    /// dropped. A write of it would move `last_heartbeat_at` backwards.
+    #[tokio::test]
+    async fn an_older_heartbeat_after_a_flush_is_dropped() {
+        let newest = keep_newest_of(vec![beat_at(20), beat_at(10)], Some(0)).await;
+        assert_eq!(newest, None);
+    }
 
     /// Verify that the debounce logic keeps only the most recent payload.
     ///
