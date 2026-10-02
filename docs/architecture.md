@@ -218,7 +218,7 @@ So the retries that run in a window of `T` seconds are at most `max_tokens + rat
 
 *Deferral.* An empty bucket defers the retry. The worker calls `queue::defer_claimed_retry_for_budget`. That fenced write puts the row back to `PENDING`. It computes the new `scheduled_at` on the database clock, as the retry requeue does (issue #1389). It lowers `attempt` again and keeps `error` and `crash_strikes`. A deferral says nothing about crashes, so poison-pill quarantine still counts them. The write appends no event. A deferral of a rate-limited activity without a circuit breaker also refunds the claim-time rate-limit token.
 
-The first delay is the time to the next refill token. Each later deferral gets the next slot, one refill interval later. A slot more than 60 s away is not reserved. That retry gets a random delay from 30 s to 60 s instead, so a large backlog does not wake at one instant. No delay is shorter than 50 ms. Deferred retries are not served in order. The next retry that finds a token runs.
+The first delay is the time to the next refill token. Each later deferral gets the next slot, one refill interval later. A slot more than 60 s away is not reserved. That retry gets a random delay from 30 s to 60 s instead, so a large backlog does not wake at one instant. No delay is shorter than 50 ms. A deferral that is not persisted gives its slot back. Deferred retries are not served in order. The next retry that finds a token runs.
 
 *A deferred retry is never lost.* The row stays in the queue until a worker runs it. The deferral does not use an attempt and does not move the task to the DLQ. Only an activity timeout, or a cancel or reset of the owning run, can end a deferred retry. For example, a `schedule_to_close` deadline can pass during a deferral. The timeout scanner then records an ordinary `ActivityTimedOut` event.
 
@@ -228,7 +228,7 @@ The first delay is the time to the next refill token. Each later deferral gets t
 
 *Scope.* The state is in process, like the circuit breaker. N workers allow up to N budgets. The budget never touches the event log, so replay is unaffected. Local activities retry inline, outside the queue, so the budget does not gate them. The SQLite backend has its own worker and does not use this gate.
 
-*Metrics.* The gauge `harvest.retry.budget.available{activity}` shows the tokens left after each decision and release. It does not follow the time refill between decisions. The counter `harvest.retry.budget.exhausted{activity}` counts deferrals. Prometheus exports the counter as `harvest_retry_budget_exhausted_total`. See [`telemetry.md`](telemetry.md#metric-catalogue-adr-0001-7).
+*Metrics.* The gauge `harvest.retry.budget.available{activity}` shows the tokens left. The registry publishes it under the bucket lock after every access, so a stale sample cannot overwrite a newer one. It does not follow the time refill between accesses. The counter `harvest.retry.budget.exhausted{activity}` counts deferrals. Prometheus exports the counter as `harvest_retry_budget_exhausted_total`. See [`telemetry.md`](telemetry.md#metric-catalogue-adr-0001-7).
 
 ### Sharding
 

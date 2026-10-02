@@ -1220,8 +1220,9 @@ pub const METRIC_RATE_LIMIT_THROTTLED: &str = "harvest.rate_limit.throttled";
 
 /// Gauge: tokens left in the retry budget of one activity type (issue #1793).
 ///
-/// Labeled by `activity`. The worker sets it after each budget decision and
-/// each release. It does not follow the time refill between decisions.
+/// Labeled by `activity`. The budget registry sets it after every bucket
+/// access, under the bucket lock. It does not follow the time refill between
+/// accesses.
 pub const METRIC_RETRY_BUDGET_AVAILABLE: &str = "harvest.retry.budget.available";
 
 /// Counter: retries that the retry budget deferred (issue #1793).

@@ -33,10 +33,11 @@
 //! workers allows up to N budgets.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::policy::RetryBudgetPolicy;
+use crate::telemetry::MetricsRecorder;
 
 /// Shortest deferral. It keeps a deferred retry from spinning on the claim
 /// path.
@@ -173,7 +174,18 @@ pub enum Admission {
         retry_after: Duration,
         /// Tokens left after this decision.
         available: f64,
+        /// The wake-up slot this deferral reserved, if any. Give it to
+        /// [`RetryBudgetRegistry::cancel_deferral`] when the deferral is not
+        /// persisted.
+        reservation: Option<SlotReservation>,
     },
+}
+
+/// A wake-up slot that one deferral reserved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlotReservation {
+    slot: Instant,
+    previous: Instant,
 }
 
 #[derive(Debug)]
@@ -188,10 +200,20 @@ struct Bucket {
 /// In-process registry of per-activity-type retry budgets.
 ///
 /// The worker builds one registry and shares it behind an `Arc`.
-#[derive(Debug)]
 pub struct RetryBudgetRegistry {
     config: RetryBudgetConfig,
     buckets: Mutex<HashMap<String, Bucket>>,
+    metrics: Option<Arc<dyn MetricsRecorder>>,
+}
+
+impl std::fmt::Debug for RetryBudgetRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RetryBudgetRegistry")
+            .field("config", &self.config)
+            .field("buckets", &self.buckets)
+            .field("metrics", &self.metrics.is_some())
+            .finish()
+    }
 }
 
 impl Default for RetryBudgetRegistry {
@@ -207,7 +229,28 @@ impl RetryBudgetRegistry {
         Self {
             config,
             buckets: Mutex::new(HashMap::new()),
+            metrics: None,
         }
+    }
+
+    /// Publish `harvest.retry.budget.available` through `metrics`. The
+    /// registry sends a sample after every bucket access, under the bucket
+    /// lock.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<dyn MetricsRecorder>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    /// Give back the wake-up slot of a deferral that was not persisted.
+    ///
+    /// The slot is freed only if no later deferral reserved a slot after it.
+    pub fn cancel_deferral(&self, activity_name: &str, reservation: SlotReservation, now: Instant) {
+        self.with_bucket(activity_name, now, |bucket, _| {
+            if bucket.next_slot == reservation.slot {
+                bucket.next_slot = reservation.previous;
+            }
+        });
     }
 
     /// The config this registry enforces.
@@ -240,6 +283,11 @@ impl RetryBudgetRegistry {
         let bucket = buckets.get_mut(activity_name)?;
         bucket.refill(&policy, now);
         let out = f(bucket, &policy);
+        // Publish under the lock, so the samples follow the mutation order.
+        // A sample sent after the unlock could overwrite a newer one.
+        if let Some(metrics) = &self.metrics {
+            metrics.record_retry_budget_available(activity_name, bucket.tokens);
+        }
         drop(buckets);
         Some(out)
     }
@@ -270,9 +318,11 @@ impl RetryBudgetRegistry {
                     available: bucket.tokens,
                 };
             }
+            let (retry_after, reservation) = bucket.reserve_slot(policy, now);
             Admission::Deferred {
-                retry_after: bucket.reserve_slot(policy, now),
+                retry_after,
                 available: bucket.tokens,
+                reservation,
             }
         })
         .unwrap_or(Admission::Untracked)
@@ -353,7 +403,11 @@ impl Bucket {
     /// A slot later than [`MAX_RETRY_BUDGET_DEFER`] is not reserved. That
     /// retry gets a random delay in the upper half of the cap instead. The
     /// random spread stops a large backlog from waking at one instant.
-    fn reserve_slot(&mut self, policy: &RetryBudgetPolicy, now: Instant) -> Duration {
+    fn reserve_slot(
+        &mut self,
+        policy: &RetryBudgetPolicy,
+        now: Instant,
+    ) -> (Duration, Option<SlotReservation>) {
         let rate = policy.min_retries_per_sec;
         let (until_token, interval) = if rate > 0.0 {
             let deficit = (1.0 - self.tokens).max(0.0);
@@ -370,11 +424,17 @@ impl Bucket {
             ready
         };
         if slot.saturating_duration_since(now) >= MAX_RETRY_BUDGET_DEFER {
-            return overflow_delay();
+            return (overflow_delay(), None);
         }
+        let reservation = SlotReservation {
+            slot,
+            previous: self.next_slot,
+        };
         self.next_slot = slot;
-        slot.saturating_duration_since(now)
-            .max(MIN_RETRY_BUDGET_DEFER)
+        let delay = slot
+            .saturating_duration_since(now)
+            .max(MIN_RETRY_BUDGET_DEFER);
+        (delay, Some(reservation))
     }
 }
 
@@ -620,6 +680,76 @@ mod tests {
             wait >= Duration::from_millis(90) && wait <= Duration::from_millis(110),
             "expected about 100 ms, got {wait:?}"
         );
+    }
+
+    /// A deferral that was not persisted gives its slot back, so the next
+    /// deferral is not pushed later for nothing.
+    #[test]
+    fn cancelling_a_deferral_frees_its_slot() {
+        let reg = registry(RetryBudgetPolicy::new(0.0, 1.0, 2.0));
+        let now = Instant::now();
+        assert_eq!(drain(&reg, A, now), 1);
+        let Admission::Deferred {
+            retry_after: first,
+            reservation: Some(reservation),
+            ..
+        } = reg.admit(A, true, now)
+        else {
+            panic!("expected a reserved deferral");
+        };
+        reg.cancel_deferral(A, reservation, now);
+        let second = retry_after(reg.admit(A, true, now));
+        assert_eq!(first, second, "the cancelled slot must be free again");
+    }
+
+    /// Records every gauge sample, in order.
+    #[derive(Default)]
+    struct GaugeLog(std::sync::Mutex<Vec<f64>>);
+
+    impl MetricsRecorder for GaugeLog {
+        fn record_retry_budget_available(&self, _activity: &str, tokens: f64) {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(tokens);
+        }
+    }
+
+    /// Every bucket change publishes the gauge under the bucket lock, so
+    /// the last sample always equals the bucket level, even under
+    /// concurrent decisions.
+    #[test]
+    fn the_last_gauge_sample_matches_the_bucket_under_concurrency() {
+        let log = Arc::new(GaugeLog::default());
+        let reg = Arc::new(
+            RetryBudgetRegistry::new(
+                RetryBudgetConfig::disabled()
+                    .with_default(Some(RetryBudgetPolicy::new(0.5, 1_000.0, 0.0))),
+            )
+            .with_metrics(log.clone()),
+        );
+        let now = Instant::now();
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let reg = Arc::clone(&reg);
+                std::thread::spawn(move || {
+                    for _ in 0..200 {
+                        let t = ticket(reg.admit(A, i % 2 == 0, now));
+                        reg.commit(A, t, now);
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().expect("thread");
+        }
+        let last = *log
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .last()
+            .expect("the gauge was published");
+        assert_eq!(Some(last), reg.available(A, now));
     }
 
     #[test]

@@ -73,7 +73,7 @@ proptest! {
                         }
                     }
                 }
-                Admission::Deferred { retry_after, available } => {
+                Admission::Deferred { retry_after, available, .. } => {
                     prop_assert!(s.is_retry, "a first attempt was deferred");
                     prop_assert!(available < 1.0);
                     prop_assert!(retry_after >= MIN_RETRY_BUDGET_DEFER);

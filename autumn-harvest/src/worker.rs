@@ -789,6 +789,10 @@ impl HandlerRegistry {
             .filter(|(_, info)| !info.is_local)
             .filter_map(|(name, info)| info.circuit_breaker.map(|p| (name.clone(), p)))
             .collect();
+        let retry_budgets = Arc::new(
+            crate::retry_budget::RetryBudgetRegistry::default()
+                .with_metrics(Arc::clone(&telemetry.metrics)),
+        );
         Self {
             workflows,
             activities,
@@ -807,7 +811,7 @@ impl HandlerRegistry {
             circuit_breakers: Arc::new(crate::circuit_breaker::CircuitBreakerRegistry::new(
                 circuit_policies,
             )),
-            retry_budgets: Arc::new(crate::retry_budget::RetryBudgetRegistry::default()),
+            retry_budgets,
             max_workflow_attempts_ceiling: None,
             max_workflow_chain_timeout: None,
             max_workflow_execution_timeout: None,
@@ -1188,7 +1192,10 @@ impl HandlerRegistry {
                 );
             }
         }
-        self.retry_budgets = Arc::new(crate::retry_budget::RetryBudgetRegistry::new(config));
+        self.retry_budgets = Arc::new(
+            crate::retry_budget::RetryBudgetRegistry::new(config)
+                .with_metrics(Arc::clone(&self.telemetry.metrics)),
+        );
         self
     }
 
@@ -14599,8 +14606,9 @@ async fn handle_activity_result(
 enum RetryBudgetGate {
     /// Run the attempt. Release the ticket if the attempt does not run.
     Run(Option<crate::retry_budget::BudgetTicket>),
-    /// Do not run the retry. Defer it by this delay.
-    Defer(Duration),
+    /// Do not run the retry. Defer it by this delay. Cancel the reservation
+    /// if the deferral is not persisted.
+    Defer(Duration, Option<crate::retry_budget::SlotReservation>),
 }
 
 /// Whether the retry budget gates this attempt (issue #1793).
@@ -14680,23 +14688,24 @@ fn admit_retry_budget(
     use crate::retry_budget::Admission;
 
     let is_retry = task_attempt(task) > 1;
-    let metrics = &registry.telemetry().metrics;
+    // The budget registry publishes the `available` gauge itself, under its
+    // lock. The worker publishes only the deferral counter.
     match registry
         .retry_budgets()
         .admit(activity_name, is_retry, std::time::Instant::now())
     {
         Admission::Untracked => RetryBudgetGate::Run(None),
-        Admission::Admitted { ticket, available } => {
-            metrics.record_retry_budget_available(activity_name, available);
-            RetryBudgetGate::Run(Some(ticket))
-        }
+        Admission::Admitted { ticket, .. } => RetryBudgetGate::Run(Some(ticket)),
         Admission::Deferred {
             retry_after,
-            available,
+            reservation,
+            ..
         } => {
-            metrics.record_retry_budget_available(activity_name, available);
-            metrics.record_retry_budget_exhausted(activity_name);
-            RetryBudgetGate::Defer(retry_after)
+            registry
+                .telemetry()
+                .metrics
+                .record_retry_budget_exhausted(activity_name);
+            RetryBudgetGate::Defer(retry_after, reservation)
         }
     }
 }
@@ -14706,7 +14715,7 @@ fn admit_retry_budget(
 /// `commit` settles it once `ActivityStarted` is appended. A first attempt's
 /// deposit counts only then. Every return before that point drops the guard
 /// instead. That includes a rate-limit deferral, a no-op start and an error
-/// from `?`. The drop releases the ticket and updates the gauge.
+/// from `?`. The drop releases the ticket.
 struct BudgetReleaseGuard<'a> {
     registry: &'a HandlerRegistry,
     activity_name: &'a str,
@@ -14731,17 +14740,9 @@ impl<'a> BudgetReleaseGuard<'a> {
         let Some(ticket) = self.ticket.take() else {
             return;
         };
-        let committed = self.registry.retry_budgets().commit(
-            self.activity_name,
-            ticket,
-            std::time::Instant::now(),
-        );
-        if let Some(available) = committed {
-            self.registry
-                .telemetry()
-                .metrics
-                .record_retry_budget_available(self.activity_name, available);
-        }
+        self.registry
+            .retry_budgets()
+            .commit(self.activity_name, ticket, std::time::Instant::now());
     }
 }
 
@@ -14750,17 +14751,11 @@ impl Drop for BudgetReleaseGuard<'_> {
         let Some(ticket) = self.ticket.take() else {
             return;
         };
-        let released = self.registry.retry_budgets().release(
+        self.registry.retry_budgets().release(
             self.activity_name,
             ticket,
             std::time::Instant::now(),
         );
-        if let Some(available) = released {
-            self.registry
-                .telemetry()
-                .metrics
-                .record_retry_budget_available(self.activity_name, available);
-        }
     }
 }
 
@@ -14774,12 +14769,14 @@ impl Drop for BudgetReleaseGuard<'_> {
 /// The claim debited a rate-limit token for an activity without a circuit
 /// breaker. The retry does not run, so the token goes back. The function logs
 /// a refund failure and does not return it, like a capability-miss refund.
+///
+/// Returns `false` when the lease was lost, so the write changed nothing.
 async fn defer_retry_for_budget(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
     activity: &ActivityInfo,
     retry_after: Duration,
-) -> HarvestResult<()> {
+) -> HarvestResult<bool> {
     if activity.circuit_breaker.is_none()
         && let Some(key) = task.rate_limit_key.as_deref()
         && let Err(error) = queue::refund_rate_limit_token(conn, key).await
@@ -14794,12 +14791,11 @@ async fn defer_retry_for_budget(
     // The delay runs on the database clock. See `defer_claimed_retry_for_budget`.
     let delay =
         chrono::Duration::from_std(retry_after).unwrap_or_else(|_| chrono::Duration::seconds(1));
-    if queue::defer_claimed_retry_for_budget(conn, &claim_of_task(task)?, delay).await?
-        == queue::ClaimWrite::LeaseLost
-    {
+    let write = queue::defer_claimed_retry_for_budget(conn, &claim_of_task(task)?, delay).await?;
+    if write == queue::ClaimWrite::LeaseLost {
         log_lease_lost(task, "retry-budget deferral");
     }
-    Ok(())
+    Ok(write == queue::ClaimWrite::Applied)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -15253,12 +15249,27 @@ async fn process_activity_task(
     if retry_budget_gates(circuit_token, task_attempt(task) > 1) {
         match admit_retry_budget(registry, activity_name, task) {
             RetryBudgetGate::Run(ticket) => budget_guard.hold(ticket),
-            RetryBudgetGate::Defer(retry_after) => {
+            RetryBudgetGate::Defer(retry_after, reservation) => {
                 if let Some(token) = circuit_token {
                     circuit_breakers.on_cancelled(activity_name, token, std::time::Instant::now());
                 }
-                let mut conn = pool.get().await.map_err(crate::error::database_error)?;
-                return defer_retry_for_budget(&mut conn, task, activity, retry_after).await;
+                let deferred = match pool.get().await {
+                    Ok(mut conn) => {
+                        defer_retry_for_budget(&mut conn, task, activity, retry_after).await
+                    }
+                    Err(error) => Err(crate::error::database_error(error)),
+                };
+                // No row waits on a slot that the write did not persist.
+                if !matches!(deferred, Ok(true))
+                    && let Some(reservation) = reservation
+                {
+                    registry.retry_budgets().cancel_deferral(
+                        activity_name,
+                        reservation,
+                        std::time::Instant::now(),
+                    );
+                }
+                return deferred.map(|_| ());
             }
         }
     }
