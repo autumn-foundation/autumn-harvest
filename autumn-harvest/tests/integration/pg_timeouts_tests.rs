@@ -948,7 +948,7 @@ async fn seed_execution(conn: &mut AsyncPgConnection, queue: &str) -> ExecutionI
         workflow_id: &format!("wf-{}", exec_id.as_uuid()),
         run_id: Uuid::new_v4(),
         shard_id: 0,
-        input: serde_json::json!({}),
+        input: serde_json::json!({}).into(),
         parent_id: None,
         queue_name: queue,
         execution_timeout: None,

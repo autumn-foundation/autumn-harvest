@@ -6522,6 +6522,27 @@ fn release_probe_on_error(
     error
 }
 
+/// [`retry_policy_or_fail_task`] for the finalization of an attempt that ran
+/// (issue #1788).
+///
+/// The attempt's outcome reaches the circuit breaker only after this read.
+/// An error here skips that step, so it releases the dispatch `token` first.
+/// A half-open probe that is not released short-circuits every later
+/// dispatch, even after the database recovers.
+async fn finalization_retry_policy(
+    pool: &DbPool,
+    task: &TaskQueueItem,
+    worker_id: &str,
+    codecs: &crate::payload_codec::PayloadCodecs,
+    circuit_breakers: &crate::circuit_breaker::CircuitBreakerRegistry,
+    activity_name: &str,
+    token: Option<crate::circuit_breaker::DispatchToken>,
+) -> HarvestResult<Option<RetryPolicy>> {
+    retry_policy_or_fail_task(pool, task, worker_id, codecs)
+        .await
+        .map_err(|error| release_probe_on_error(circuit_breakers, activity_name, token, error))
+}
+
 /// Parse the task's retry policy. A policy that does not parse fails the task.
 ///
 /// The handler can already have run, so the failure write must not be lost
@@ -16594,7 +16615,16 @@ async fn process_activity_task(
     let retry_policy = if committed_transactionally {
         None
     } else {
-        retry_policy_or_fail_task(pool, task, worker_id, registry.payload_codecs()).await?
+        finalization_retry_policy(
+            pool,
+            task,
+            worker_id,
+            registry.payload_codecs(),
+            &circuit_breakers,
+            activity_name,
+            circuit_token,
+        )
+        .await?
     };
 
     // Circuit breaker (issue #369): record this attempt's outcome. A close →
@@ -35981,6 +36011,56 @@ mod tests {
             },
         );
         assert!(error.is_pool_acquire_timeout(), "the error passes through");
+
+        let next = allow(probe_time + Duration::from_secs(61));
+        assert!(next.is_probe(), "a released probe lets a fresh probe in");
+    }
+
+    /// A finalization that cannot read the retry policy releases the half-open
+    /// probe (issue #1788). The handler already ran, but its outcome reaches
+    /// the breaker only after this read. Without the release, every later
+    /// dispatch short-circuits, even after the database recovers.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_finalization_read_releases_the_half_open_probe() {
+        use crate::circuit_breaker::{AttemptOutcome, CircuitBreakerRegistry, DispatchDecision};
+        use crate::policy::CircuitBreakerPolicy;
+        let mut policies = HashMap::new();
+        policies.insert(
+            "send_email".to_owned(),
+            CircuitBreakerPolicy::new(3, Duration::from_secs(30), Duration::from_secs(60)),
+        );
+        let reg = CircuitBreakerRegistry::new(policies);
+        let allow = |now| match reg.on_dispatch("send_email", now) {
+            DispatchDecision::Allow { token } => token,
+            DispatchDecision::ShortCircuit { .. } => panic!("expected Allow"),
+        };
+        let t0 = std::time::Instant::now();
+        for _ in 0..3 {
+            let token = allow(t0);
+            reg.on_result("send_email", AttemptOutcome::RetryableFailure, token, t0);
+        }
+        let probe_time = t0 + Duration::from_secs(61);
+        let probe = allow(probe_time);
+        assert!(probe.is_probe());
+
+        // A policy that does not parse needs a write, and the pool has no
+        // connection to give.
+        let task = TaskQueueItem {
+            retry_policy: Some(serde_json::json!("not a retry policy")),
+            ..retry_after_test_task(1, 5)
+        };
+        let pool = unreachable_pool("postgres://127.0.0.1:1/finalize");
+        finalization_retry_policy(
+            &pool,
+            &task,
+            "w-1",
+            &crate::payload_codec::PayloadCodecs::default(),
+            &reg,
+            "send_email",
+            Some(probe),
+        )
+        .await
+        .expect_err("no connection, so the read fails");
 
         let next = allow(probe_time + Duration::from_secs(61));
         assert!(next.is_probe(), "a released probe lets a fresh probe in");
