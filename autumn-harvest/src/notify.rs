@@ -289,54 +289,7 @@ pub async fn notify_workflow_progress(
 // Listener connections (TLS: issue #1717)
 // ---------------------------------------------------------------------------
 
-/// The transport a listener connection uses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ListenTransport {
-    /// Plaintext, through `NoTls`.
-    Plain,
-    /// TLS, with a verified certificate chain and hostname.
-    Tls,
-    /// TLS when the server offers it, else plaintext. The certificate is
-    /// not checked.
-    Opportunistic,
-}
-
-/// Select the listener transport from the DSN's own `sslmode`.
-///
-/// `require` selects verified TLS (issue #1717). `disable` selects plaintext.
-/// `prefer`, which is also the default, follows libpq: the client asks for
-/// TLS, and goes on in plaintext only when the server declines.
-///
-/// A managed Postgres, Fly for example, hands out a URL with no `sslmode` and
-/// refuses plaintext. A plaintext-only `prefer` therefore could not reach it.
-/// libpq does not check the certificate for `prefer`, so neither does this.
-/// A server with a self-signed certificate thus keeps working.
-fn listen_transport(config: &tokio_postgres::Config) -> ListenTransport {
-    match config.get_ssl_mode() {
-        tokio_postgres::config::SslMode::Require => ListenTransport::Tls,
-        tokio_postgres::config::SslMode::Disable => ListenTransport::Plain,
-        _ => ListenTransport::Opportunistic,
-    }
-}
-
-/// Render an error and each error in its `source()` chain.
-///
-/// `tokio_postgres` shows a TLS failure as "error performing TLS handshake".
-/// The real cause is only in `source()`. A cause that the text already
-/// contains is not added again.
-fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
-    let mut out = error.to_string();
-    let mut source = error.source();
-    while let Some(cause) = source {
-        let text = cause.to_string();
-        if !out.contains(&text) {
-            out.push_str(": ");
-            out.push_str(&text);
-        }
-        source = cause.source();
-    }
-    out
-}
+use crate::pg_tls::error_chain;
 
 /// The error for a listener connection that failed to open.
 fn connect_error(error: &tokio_postgres::Error) -> HarvestError {
@@ -355,6 +308,10 @@ struct ListenConnection {
 
 /// Open a LISTEN connection with the transport that the DSN asks for.
 ///
+/// [`crate::pg_tls`] picks the transport from the `sslmode`. `prefer`, the
+/// default, uses TLS when the server offers it. `require` verifies the chain
+/// and the hostname (issue #1717).
+///
 /// `error_message` is the log message for a connection error after the open.
 async fn open_listen_connection(
     database_url: &str,
@@ -362,190 +319,17 @@ async fn open_listen_connection(
 ) -> HarvestResult<ListenConnection> {
     // A DSN that does not parse is a permanent misconfiguration, not an outage.
     // A result wait returns a `Config` error and does not poll over it.
-    let config: tokio_postgres::Config = database_url.parse().map_err(|e| {
-        HarvestError::Config(format!(
-            "invalid notification database URL: {}",
-            error_chain(&e)
-        ))
+    let (config, connector) = crate::pg_tls::prepare(database_url).map_err(|e| match e {
+        crate::pg_tls::PgTlsError::InvalidDsn(message) => {
+            HarvestError::Config(format!("invalid notification database URL: {message}"))
+        }
+        crate::pg_tls::PgTlsError::Unsupported(message) => HarvestError::Config(message),
     })?;
-    match listen_transport(&config) {
-        ListenTransport::Plain => {
-            let (client, connection) = config
-                .connect(tokio_postgres::NoTls)
-                .await
-                .map_err(|e| connect_error(&e))?;
-            Ok(spawn_listen_driver(client, connection, error_message))
-        }
-        ListenTransport::Tls => open_tls_listen_connection(&config, error_message).await,
-        ListenTransport::Opportunistic => {
-            open_opportunistic_listen_connection(&config, error_message).await
-        }
-    }
-}
-
-/// Open a verified TLS LISTEN connection.
-#[cfg(feature = "tls")]
-async fn open_tls_listen_connection(
-    config: &tokio_postgres::Config,
-    error_message: &'static str,
-) -> HarvestResult<ListenConnection> {
-    let tls = tokio_postgres_rustls::MakeRustlsConnect::new(tls_client_config()?);
-    let (client, connection) = config.connect(tls).await.map_err(|e| connect_error(&e))?;
-    Ok(spawn_listen_driver(client, connection, error_message))
-}
-
-/// Open a `prefer` LISTEN connection: TLS when the server offers it.
-///
-/// The config keeps `sslmode=prefer`, so `tokio_postgres` sends an
-/// `SSLRequest` and goes on in plaintext when the server answers `N`.
-#[cfg(feature = "tls")]
-async fn open_opportunistic_listen_connection(
-    config: &tokio_postgres::Config,
-    error_message: &'static str,
-) -> HarvestResult<ListenConnection> {
-    let tls = tokio_postgres_rustls::MakeRustlsConnect::new(encrypt_only_tls_config());
-    let (client, connection) = config.connect(tls).await.map_err(|e| connect_error(&e))?;
-    Ok(spawn_listen_driver(client, connection, error_message))
-}
-
-/// Without TLS support, `prefer` stays plaintext, as before.
-#[cfg(not(feature = "tls"))]
-async fn open_opportunistic_listen_connection(
-    config: &tokio_postgres::Config,
-    error_message: &'static str,
-) -> HarvestResult<ListenConnection> {
     let (client, connection) = config
-        .connect(tokio_postgres::NoTls)
+        .connect(connector)
         .await
         .map_err(|e| connect_error(&e))?;
     Ok(spawn_listen_driver(client, connection, error_message))
-}
-
-/// Refuse `sslmode=require` when the crate has no TLS support.
-#[cfg(not(feature = "tls"))]
-#[allow(clippy::unused_async, reason = "the signature matches the `tls` build")]
-async fn open_tls_listen_connection(
-    _config: &tokio_postgres::Config,
-    _error_message: &'static str,
-) -> HarvestResult<ListenConnection> {
-    Err(HarvestError::Config(
-        "sslmode=require needs the `tls` feature of autumn-harvest".to_string(),
-    ))
-}
-
-/// The rustls configuration for listener connections.
-///
-/// The trust store is read once per process. A failed read is not cached, so
-/// a later connection tries again.
-#[cfg(feature = "tls")]
-fn tls_client_config() -> HarvestResult<rustls::ClientConfig> {
-    static CONFIG: std::sync::OnceLock<rustls::ClientConfig> = std::sync::OnceLock::new();
-    if let Some(config) = CONFIG.get() {
-        return Ok(config.clone());
-    }
-    let built = build_tls_client_config()?;
-    Ok(CONFIG.get_or_init(|| built).clone())
-}
-
-/// Build a rustls configuration that trusts the platform trust store.
-///
-/// The chain and the hostname are always verified, as in `harvest migrate`
-/// (issue #1240). `SSL_CERT_FILE` or `SSL_CERT_DIR` can point at a private CA.
-/// The `ring` provider is explicit, because `ClientConfig::builder()` panics
-/// when no process-wide provider is installed.
-#[cfg(feature = "tls")]
-fn build_tls_client_config() -> HarvestResult<rustls::ClientConfig> {
-    let native = rustls_native_certs::load_native_certs();
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add_parsable_certificates(native.certs);
-    if roots.is_empty() {
-        return Err(HarvestError::Config(format!(
-            "sslmode=require: the platform trust store has no usable certificates. \
-             Install the ca-certificates package, or set SSL_CERT_FILE. \
-             Loader errors: {:?}",
-            native.errors
-        )));
-    }
-    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
-    let config = rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|e| HarvestError::Config(format!("rustls configuration failed: {e}")))?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    Ok(config)
-}
-
-/// The rustls configuration for `prefer`: encryption without authentication.
-///
-/// libpq does not check the certificate for `prefer`. This matches it. The
-/// handshake signatures are still verified, so the session key belongs to the
-/// peer that sent the certificate. The trust store is not read.
-#[cfg(feature = "tls")]
-fn encrypt_only_tls_config() -> rustls::ClientConfig {
-    static CONFIG: std::sync::OnceLock<rustls::ClientConfig> = std::sync::OnceLock::new();
-    CONFIG
-        .get_or_init(|| {
-            let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
-            let verifier = std::sync::Arc::new(EncryptOnly(std::sync::Arc::clone(&provider)));
-            rustls::ClientConfig::builder_with_provider(provider)
-                .with_safe_default_protocol_versions()
-                .expect("the ring provider supports the default protocol versions")
-                .dangerous()
-                .with_custom_certificate_verifier(verifier)
-                .with_no_client_auth()
-        })
-        .clone()
-}
-
-/// A certificate verifier that accepts any certificate, for `prefer`.
-#[cfg(feature = "tls")]
-#[derive(Debug)]
-struct EncryptOnly(std::sync::Arc<rustls::crypto::CryptoProvider>);
-
-#[cfg(feature = "tls")]
-impl rustls::client::danger::ServerCertVerifier for EncryptOnly {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
-    }
 }
 
 /// Spawn the task that drives a LISTEN connection.
@@ -920,45 +704,6 @@ mod tests {
 
     // ── TLS for listener connections (issue #1717) ───────────────────────
 
-    fn transport_for(dsn: &str) -> ListenTransport {
-        let config: tokio_postgres::Config = dsn.parse().expect("test DSN parses");
-        listen_transport(&config)
-    }
-
-    #[test]
-    fn sslmode_selects_the_listener_transport() {
-        let base = "postgres://u:p@db.internal/harvest";
-        assert_eq!(transport_for(base), ListenTransport::Opportunistic);
-        assert_eq!(
-            transport_for(&format!("{base}?sslmode=disable")),
-            ListenTransport::Plain
-        );
-        assert_eq!(
-            transport_for(&format!("{base}?sslmode=prefer")),
-            ListenTransport::Opportunistic
-        );
-        assert_eq!(
-            transport_for(&format!("{base}?sslmode=require")),
-            ListenTransport::Tls
-        );
-    }
-
-    #[test]
-    fn keyword_dsn_sslmode_selects_the_listener_transport() {
-        assert_eq!(
-            transport_for("host=db.internal dbname=harvest sslmode=require"),
-            ListenTransport::Tls
-        );
-        assert_eq!(
-            transport_for("host=db.internal dbname=harvest"),
-            ListenTransport::Opportunistic
-        );
-        assert_eq!(
-            transport_for("host=db.internal dbname=harvest sslmode=disable"),
-            ListenTransport::Plain
-        );
-    }
-
     /// An `SSLRequest` message: length 8, then the code 80877103.
     #[cfg(feature = "tls")]
     const SSL_REQUEST: [u8; 8] = [0, 0, 0, 8, 4, 210, 22, 47];
@@ -1039,14 +784,16 @@ mod tests {
 
     #[cfg(feature = "tls")]
     #[tokio::test]
-    async fn sslmode_require_starts_a_tls_handshake() {
-        let (header, next) = bytes_sent("?sslmode=require", Answer::AcceptTls).await;
-        assert_eq!(header, SSL_REQUEST);
-        assert_eq!(
-            next,
-            [CLIENT_HELLO],
-            "sslmode=require must send a ClientHello"
-        );
+    async fn verified_sslmodes_start_a_tls_handshake() {
+        for query in [
+            "?sslmode=require",
+            "?sslmode=verify-ca",
+            "?sslmode=verify-full",
+        ] {
+            let (header, next) = bytes_sent(query, Answer::AcceptTls).await;
+            assert_eq!(header, SSL_REQUEST, "{query} must ask for TLS");
+            assert_eq!(next, [CLIENT_HELLO], "{query} must send a ClientHello");
+        }
     }
 
     /// A managed Postgres such as Fly hands out a URL with no `sslmode` and
@@ -1119,7 +866,7 @@ mod tests {
     #[tokio::test]
     async fn an_unparseable_dsn_is_a_config_error() {
         let result = open_listen_connection(
-            "postgres://u@127.0.0.1:1/db?sslmode=verify-full",
+            "postgres://u@127.0.0.1:1/db?sslmode=bogus",
             "test listener error",
         )
         .await

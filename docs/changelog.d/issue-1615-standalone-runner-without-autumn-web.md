@@ -72,23 +72,30 @@ the tree keeps one standalone reference, not two.
 **`sslmode=prefer` and an unset `sslmode` use TLS when the server offers it.**
 
 A managed Postgres, Fly for example, hands out a URL with no `sslmode` and
-refuses plaintext. Harvest sent plaintext for such a URL, so the connection
-failed.
+refuses plaintext. Harvest sent plaintext for such a URL from every
+connection it opens itself, so those connections failed.
 
-- **LISTEN/NOTIFY listeners** (`notify.rs`). `prefer`, which is also the
-  default, now follows libpq. The client sends an `SSLRequest`. It goes on in
-  plaintext only when the server declines. The certificate is not checked, as
-  in libpq, so a self-signed server keeps working. `require` still verifies
-  the chain and the hostname (issue #1717). `disable` stays plaintext.
-- **`examples/standalone-runner`**. The pool and the `dev` migrations follow
-  the same rule.
-- Without the `tls` feature, `prefer` stays plaintext, as before.
+- New module `autumn_harvest::pg_tls` holds the rule once. `prefer`, which is
+  also the default, follows libpq: the client sends an `SSLRequest`, and goes
+  on in plaintext only when the server declines. The certificate is not
+  checked, as in libpq, so a self-signed server keeps working. `require` and
+  `verify-full` verify the chain and the hostname, `verify-ca` the chain.
+  `disable` and `allow` are plaintext. `sslmode` is read with the libpq
+  grammar, in both DSN forms.
+- Users: the LISTEN/NOTIFY listeners (`notify.rs`), `harvest backup verify`,
+  `harvest dr`, and the `standalone-runner` pool and `dev` migrations. The
+  listeners now also accept `verify-ca` and `verify-full`.
+- Without the `tls` feature, `prefer` stays plaintext, and a verified mode is
+  a configuration error.
+- `harvest migrate` keeps its own connector (issue #1240). It verifies the
+  certificate for `prefer` too.
 - `docs/getting-started/10-operations.md` shows the new table.
 
-Tests. The fake-server tests in `notify.rs` check the wire. `prefer` and an
-unset `sslmode` send `SSLRequest` and then a ClientHello. When the server
-answers `N`, they send a plaintext startup message. The example acceptance
-test runs a runner with no `sslmode`. It checks that every connection is
-encrypted when the server offers TLS, and plaintext when it does not.
+Tests. Fake-server tests in `notify.rs` and `pg_tls.rs` check the wire.
+`prefer` and an unset `sslmode` send `SSLRequest` and then a ClientHello. When
+the server answers `N`, they send a plaintext startup message. The example
+acceptance test runs a runner with no `sslmode`. It checks that every
+connection is encrypted when the server offers TLS, and plaintext when it
+does not.
 
 No migration. No new `WorkflowEvent` variant. No `harvest_events` change.

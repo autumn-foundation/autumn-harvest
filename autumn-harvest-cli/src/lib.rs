@@ -5902,18 +5902,18 @@ impl DrShardStatus {
     }
 }
 
+/// Connect for a DR command. [`autumn_harvest::pg_tls`] picks the transport
+/// from the `sslmode`, so a managed Postgres that refuses plaintext is
+/// reachable.
 async fn dr_connect(
     dsn: &str,
 ) -> Result<autumn_harvest::diesel_async::AsyncPgConnection, CliError> {
-    use autumn_harvest::diesel_async::AsyncConnection as _;
-    autumn_harvest::diesel_async::AsyncPgConnection::establish(dsn)
-        .await
-        .map_err(|e| {
-            CliError::InvalidInput(format!(
-                "cannot connect to {}: {e}",
-                autumn_harvest::backup_verify::redact_dsn(dsn)
-            ))
-        })
+    autumn_harvest::pg_tls::connect(dsn).await.map_err(|e| {
+        CliError::InvalidInput(format!(
+            "cannot connect to {}: {e}",
+            autumn_harvest::backup_verify::redact_dsn(dsn)
+        ))
+    })
 }
 
 /// Connect for a read-only DR command, with the session pinned read-only.

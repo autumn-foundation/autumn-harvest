@@ -197,13 +197,15 @@ the target database:
 
 Workers and result waits open their own LISTEN connection. The URL comes from
 `with_notification_database_url` or `with_shard_notification_database_urls`.
-The `sslmode` in that URL sets the transport:
+`harvest backup verify` and `harvest dr` also open their own connections.
+The `sslmode` in the URL sets the transport for all of them:
 
 | `sslmode` | Transport |
 |---|---|
-| `disable` | Plaintext. |
+| `disable`, `allow` | Plaintext. |
 | `prefer`, or not set | TLS when the server offers it, else plaintext. The certificate is not checked, as in libpq. |
-| `require` | TLS. The chain and the hostname are verified. |
+| `require`, `verify-full` | TLS. The chain and the hostname are verified. |
+| `verify-ca` | TLS. The chain is verified, the hostname is not. |
 
 A managed Postgres, Fly for example, often hands out a URL with no `sslmode`
 and refuses plaintext. The default `prefer` reaches it over TLS. Set
@@ -212,10 +214,9 @@ and refuses plaintext. The default `prefer` reaches it over TLS. Set
 - The trust store is the platform store. To trust a private CA, such as the
   RDS CA, set `SSL_CERT_FILE` or `SSL_CERT_DIR`. These variables replace the
   platform store.
-- TLS needs the `tls` feature. It is on by default. Without it, a `require`
-  URL gets a configuration error.
-- A listener URL with `verify-ca` or `verify-full` does not parse yet. Use
-  `require`. It already verifies the chain and the hostname.
+- TLS needs the `tls` feature. It is on by default. Without it, `prefer`
+  stays plaintext, and a verified `sslmode` gets a configuration error.
+- `sslmode` is read with the libpq grammar, in URL and keyword/value form.
 - A result wait (`result_raw`, `result_raw_with_timeout`,
   `result_snapshot_with_wait`) does not fail when the listener cannot connect
   within 5 s. It logs a warning and polls every 500 ms. After 30 s it tries

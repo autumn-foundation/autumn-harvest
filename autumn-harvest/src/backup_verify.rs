@@ -1435,7 +1435,7 @@ mod probes {
     use chrono::{DateTime, Utc};
     use diesel::OptionalExtension as _;
     use diesel::sql_types::{BigInt, Integer, Nullable, Text, Timestamptz};
-    use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+    use diesel_async::{AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
     use uuid::Uuid;
 
     use super::{
@@ -1558,8 +1558,11 @@ mod probes {
     /// Postgres then rejects any write with SQLSTATE 25006, so AC4's
     /// "never mutates" is enforced mechanically by the server rather than by
     /// code review of every probe.
+    ///
+    /// [`crate::pg_tls`] picks the transport from the `sslmode`, so a
+    /// managed Postgres that refuses plaintext is reachable.
     async fn connect_read_only(dsn: &str) -> Result<AsyncPgConnection, String> {
-        let mut conn = AsyncPgConnection::establish(dsn)
+        let mut conn = crate::pg_tls::connect(dsn)
             .await
             .map_err(|e| format!("connect failed: {e}"))?;
         conn.batch_execute(READ_ONLY_SESSION_SQL)
