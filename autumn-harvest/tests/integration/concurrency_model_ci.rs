@@ -132,8 +132,8 @@ fn manual_only_loom_workflow_is_gone() {
 #[test]
 fn shuttle_target_models_slot_tuner_and_heartbeat() {
     let path = repo_root().join("autumn-harvest/tests/shuttle_models.rs");
-    let source = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let source =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     for prefix in ["fn slot_tuner_", "fn heartbeat_"] {
         assert!(
             source.contains(prefix),
