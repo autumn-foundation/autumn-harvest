@@ -1310,27 +1310,71 @@ static INDEX_BUILD_GATE: std::sync::LazyLock<
 #[cfg(feature = "db")]
 const INDEX_NOTICE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
 
-/// When each shard last logged an operator notice about the index.
+/// A shard in one database. The database identity separates databases that
+/// share a shard number inside one process.
+#[cfg(feature = "db")]
+type NoticeKey = (i32, String);
+
+/// When each shard in each database last logged an operator notice.
 #[cfg(feature = "db")]
 static INDEX_NOTICE_GATE: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<i32, std::time::Instant>>,
+    std::sync::Mutex<std::collections::HashMap<NoticeKey, std::time::Instant>>,
 > = std::sync::LazyLock::new(Default::default);
 
 /// Whether this shard may log an operator notice about the index now.
 #[cfg(feature = "db")]
-fn index_notice_due(shard_id: i32) -> bool {
+fn index_notice_due(key: &NoticeKey) -> bool {
     let mut gate = INDEX_NOTICE_GATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let now = std::time::Instant::now();
     if gate
-        .get(&shard_id)
+        .get(key)
         .is_some_and(|last| now.duration_since(*last) < INDEX_NOTICE_INTERVAL)
     {
         return false;
     }
-    gate.insert(shard_id, now);
+    gate.insert(key.clone(), now);
     true
+}
+
+/// Name the database behind a connection: its name, host address and port.
+///
+/// An empty name on error only merges the gates of the databases it cannot
+/// name.
+#[cfg(feature = "db")]
+async fn database_identity(conn: &mut diesel_async::AsyncPgConnection) -> String {
+    use diesel_async::RunQueryDsl;
+
+    #[derive(diesel::QueryableByName)]
+    struct Identity {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        name: String,
+    }
+
+    let rows: Result<Vec<Identity>, _> = diesel::sql_query(
+        "SELECT current_database()::text || '@' || COALESCE(inet_server_addr()::text, '') \
+         || ':' || COALESCE(inet_server_port()::text, '') AS name",
+    )
+    .load(conn)
+    .await;
+    rows.ok()
+        .and_then(|rows| rows.into_iter().next())
+        .map(|row| row.name)
+        .unwrap_or_default()
+}
+
+/// Log an operator notice once per interval, only while the index is not valid.
+///
+/// A valid index never uses the gate, so a healthy database cannot hide the
+/// notice of another database that has the same shard number.
+#[cfg(feature = "db")]
+async fn index_notice_wanted(conn: &mut diesel_async::AsyncPgConnection, shard_id: i32) -> bool {
+    if matches!(unexported_index_valid(conn).await, Ok(Some(true))) {
+        return false;
+    }
+    let key = (shard_id, database_identity(conn).await);
+    index_notice_due(&key)
 }
 
 /// Wait after a failed or skipped background build before the next attempt.
@@ -1443,9 +1487,7 @@ async fn spawn_unexported_index_build_if_due(
     cancel: &tokio_util::sync::CancellationToken,
 ) {
     let Some(dsn) = build_dsn else {
-        if index_notice_due(shard_id)
-            && !matches!(unexported_index_valid(conn).await, Ok(Some(true)))
-        {
+        if index_notice_wanted(conn, shard_id).await {
             tracing::warn!(
                 shard = shard_id,
                 statement = UNEXPORTED_INDEX_DDL,
@@ -1539,10 +1581,7 @@ async fn notice_missing_unexported_index(
     conn: &mut diesel_async::AsyncPgConnection,
     shard_id: i32,
 ) {
-    if !index_notice_due(shard_id) {
-        return;
-    }
-    if matches!(unexported_index_valid(conn).await, Ok(Some(true))) {
+    if !index_notice_wanted(conn, shard_id).await {
         return;
     }
     tracing::warn!(
@@ -4707,6 +4746,24 @@ mod tests {
             "a refused build waits longer than an ordinary retry: {remaining:?}"
         );
         index_build_finished(&key, BuildEnd::Ready);
+    }
+
+    /// Issue #1667: the notice gate is per database. Two databases can share a
+    /// shard number inside one process. One must not hide the other's notice.
+    #[cfg(feature = "db")]
+    #[test]
+    fn the_index_notice_gate_is_per_database() {
+        let first: NoticeKey = (9_002, "notice-test-db-a".to_owned());
+        let second: NoticeKey = (9_002, "notice-test-db-b".to_owned());
+        assert!(index_notice_due(&first), "a fresh key is due");
+        assert!(
+            !index_notice_due(&first),
+            "a repeat inside the interval waits"
+        );
+        assert!(
+            index_notice_due(&second),
+            "another database with the same shard number is due"
+        );
     }
 
     /// Issue #1667: a privilege failure is the one error a retry cannot fix.
