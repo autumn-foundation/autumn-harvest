@@ -319,16 +319,17 @@ async fn open_listen_connection(
 ) -> HarvestResult<ListenConnection> {
     // A DSN that does not parse is a permanent misconfiguration, not an outage.
     // A result wait returns a `Config` error and does not poll over it.
-    let (config, connector) = crate::pg_tls::prepare(database_url).map_err(|e| match e {
-        crate::pg_tls::PgTlsError::InvalidDsn(message) => {
-            HarvestError::Config(format!("invalid notification database URL: {message}"))
-        }
-        crate::pg_tls::PgTlsError::Unsupported(message) => HarvestError::Config(message),
-    })?;
-    let (client, connection) = config
-        .connect(connector)
+    let (client, connection) = crate::pg_tls::open(database_url)
         .await
-        .map_err(|e| connect_error(&e))?;
+        .map_err(|e| match e {
+            crate::pg_tls::OpenError::Prepare(crate::pg_tls::PgTlsError::InvalidDsn(message)) => {
+                HarvestError::Config(format!("invalid notification database URL: {message}"))
+            }
+            crate::pg_tls::OpenError::Prepare(crate::pg_tls::PgTlsError::Unsupported(message)) => {
+                HarvestError::Config(message)
+            }
+            crate::pg_tls::OpenError::Connect(error) => connect_error(&error),
+        })?;
     Ok(spawn_listen_driver(client, connection, error_message))
 }
 
@@ -403,8 +404,10 @@ impl QueueListener {
     /// [`crate::pg_tls`]. `prefer`, the default, uses TLS when the server
     /// offers it and does not check the certificate. `require` and
     /// `verify-full` verify the chain and the hostname, and `verify-ca` the
-    /// chain only. `disable` is plaintext. Without the `tls` feature, `prefer`
-    /// is plaintext and a verified mode is a configuration error.
+    /// chain only. `allow` is plaintext, with one TLS retry when the server
+    /// rejects plaintext. `disable` is plaintext. Without the `tls` feature,
+    /// `prefer` and `allow` are plaintext and a verified mode is a
+    /// configuration error.
     ///
     /// # Errors
     ///
@@ -501,8 +504,10 @@ impl WorkflowEventListener {
     /// [`crate::pg_tls`]. `prefer`, the default, uses TLS when the server
     /// offers it and does not check the certificate. `require` and
     /// `verify-full` verify the chain and the hostname, and `verify-ca` the
-    /// chain only. `disable` is plaintext. Without the `tls` feature, `prefer`
-    /// is plaintext and a verified mode is a configuration error.
+    /// chain only. `allow` is plaintext, with one TLS retry when the server
+    /// rejects plaintext. `disable` is plaintext. Without the `tls` feature,
+    /// `prefer` and `allow` are plaintext and a verified mode is a
+    /// configuration error.
     ///
     /// # Errors
     ///
@@ -586,8 +591,10 @@ impl WorkflowProgressListener {
     /// [`crate::pg_tls`]. `prefer`, the default, uses TLS when the server
     /// offers it and does not check the certificate. `require` and
     /// `verify-full` verify the chain and the hostname, and `verify-ca` the
-    /// chain only. `disable` is plaintext. Without the `tls` feature, `prefer`
-    /// is plaintext and a verified mode is a configuration error.
+    /// chain only. `allow` is plaintext, with one TLS retry when the server
+    /// rejects plaintext. `disable` is plaintext. Without the `tls` feature,
+    /// `prefer` and `allow` are plaintext and a verified mode is a
+    /// configuration error.
     ///
     /// # Errors
     ///

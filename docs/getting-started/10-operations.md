@@ -202,7 +202,8 @@ The `sslmode` in the URL sets the transport for all of them:
 
 | `sslmode` | Transport |
 |---|---|
-| `disable`, `allow` | Plaintext. |
+| `disable` | Plaintext. |
+| `allow` | Plaintext. When the server rejects it, one retry with TLS and no certificate check, as in libpq. |
 | `prefer`, or not set | TLS when the server offers it, else plaintext. The certificate is not checked, as in libpq. |
 | `require`, `verify-full` | TLS. The chain and the hostname are verified. |
 | `verify-ca` | TLS. The chain is verified, the hostname is not. |

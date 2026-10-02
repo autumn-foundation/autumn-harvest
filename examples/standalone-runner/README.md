@@ -127,6 +127,7 @@ migrations and the LISTEN listeners all follow it:
 | `prefer`, or not set | TLS when the server offers it, else plaintext. The certificate is not checked, as in libpq. |
 | `require`, `verify-full` | TLS. The chain must reach the platform trust store, and the host name must match. |
 | `verify-ca` | TLS. The chain is checked, the host name is not. |
+| `allow` | Plaintext. When the server rejects it, one retry with TLS and no certificate check, as in libpq. |
 | `disable` | Plaintext. |
 
 A managed Postgres, Fly for example, hands out a URL with no `sslmode` and

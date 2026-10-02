@@ -80,13 +80,14 @@ connection it opens itself, so those connections failed.
   on in plaintext only when the server declines. The certificate is not
   checked, as in libpq, so a self-signed server keeps working. `require` and
   `verify-full` verify the chain and the hostname, `verify-ca` the chain.
-  `disable` and `allow` are plaintext. `sslmode` is read with the libpq
-  grammar, in both DSN forms.
+  `allow` starts in plaintext and, as in libpq, retries once with TLS when
+  the server rejects it. `disable` is plaintext. `sslmode` is read with the
+  libpq grammar, in both DSN forms.
 - Users: the LISTEN/NOTIFY listeners (`notify.rs`), `harvest backup verify`,
   `harvest dr`, and the `standalone-runner` pool and `dev` migrations. The
   listeners now also accept `verify-ca` and `verify-full`.
-- Without the `tls` feature, `prefer` stays plaintext, and a verified mode is
-  a configuration error.
+- Without the `tls` feature, `prefer` and `allow` stay plaintext, and a
+  verified mode is a configuration error.
 - `harvest migrate` keeps its own connector (issue #1240). It verifies the
   certificate for `prefer` too.
 - `docs/getting-started/10-operations.md` shows the new table.

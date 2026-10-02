@@ -3,15 +3,17 @@
 //! `diesel-async` and a bare `tokio_postgres::connect` use `NoTls`. That
 //! cannot reach a server that refuses plaintext. A managed Postgres, Fly for
 //! example, does refuse it, and often hands out a URL with no `sslmode`. Every
-//! connection Harvest opens itself goes through [`prepare`] or [`connect`]
-//! instead, so the rule below holds in one place:
+//! connection Harvest opens itself goes through [`open`] or [`connect`]
+//! instead, so the rule below holds in one place. [`prepare`] alone does not
+//! make the `allow` retry.
 //!
 //! | `sslmode` | Transport |
 //! |---|---|
 //! | `prefer`, or not set | TLS when the server offers it, else plaintext. The certificate is not checked, as in libpq. |
 //! | `require`, `verify-full` | TLS. The chain must reach the platform trust store, and the host name must match. |
 //! | `verify-ca` | TLS. The chain is checked, the host name is not. |
-//! | `disable`, `allow` | Plaintext. |
+//! | `allow` | Plaintext. When the server rejects it, one retry with TLS and no certificate check, as in libpq. |
+//! | `disable` | Plaintext. |
 //!
 //! `require` is stricter than in libpq. `SSL_CERT_FILE` or `SSL_CERT_DIR` can
 //! point the trust store at a private CA. `sslrootcert` is not read.
@@ -21,17 +23,22 @@
 //! percent-encoded. `tokio-postgres` reads fewer forms, so [`prepare`]
 //! rewrites the `sslmode` into one it parses.
 //!
-//! Without the `tls` feature there is no connector. `prefer` then stays
-//! plaintext, and a verified mode is a configuration error.
+//! Without the `tls` feature there is no connector. `prefer` and `allow` then
+//! stay plaintext, and a verified mode is a configuration error.
 
 use diesel::ConnectionError;
 use diesel_async::AsyncPgConnection;
+use tokio_postgres::Socket;
+use tokio_postgres::tls::MakeTlsConnect;
 
 /// The transport a DSN asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Transport {
-    /// Plaintext: `disable` or `allow`.
+    /// Plaintext: `disable`.
     Plain,
+    /// Plaintext, then TLS without a certificate check when the server
+    /// rejects plaintext: `allow`.
+    Allow,
     /// TLS when the server offers it, without a certificate check: `prefer`,
     /// or no `sslmode`.
     Prefer,
@@ -45,7 +52,8 @@ impl Transport {
     /// The `sslmode` value `tokio-postgres` parses for this transport.
     const fn tokio_postgres_sslmode(self) -> &'static str {
         match self {
-            Self::Plain => "disable",
+            // `allow` starts in plaintext. [`open`] makes the TLS retry.
+            Self::Plain | Self::Allow => "disable",
             Self::Prefer => "prefer",
             Self::VerifyCa | Self::VerifyFull => "require",
         }
@@ -78,7 +86,8 @@ impl std::error::Error for PgTlsError {}
 pub fn transport(dsn: &str) -> Option<Transport> {
     let sslmode = Dsn::parse(dsn)?.sslmode();
     match sslmode.as_deref().unwrap_or("prefer") {
-        "disable" | "allow" => Some(Transport::Plain),
+        "disable" => Some(Transport::Plain),
+        "allow" => Some(Transport::Allow),
         "prefer" => Some(Transport::Prefer),
         "verify-ca" => Some(Transport::VerifyCa),
         "require" | "verify-full" => Some(Transport::VerifyFull),
@@ -102,11 +111,37 @@ pub type Connector = tokio_postgres_rustls::MakeRustlsConnect;
 #[cfg(not(feature = "tls"))]
 pub type Connector = tokio_postgres::NoTls;
 
+/// The stream of a connection that [`open`] returns.
+pub type Stream = <Connector as MakeTlsConnect<Socket>>::Stream;
+
+/// Why [`open`] failed.
+#[derive(Debug)]
+pub enum OpenError {
+    /// The DSN cannot be prepared. See [`prepare`].
+    Prepare(PgTlsError),
+    /// The server cannot be reached, or it refused the connection.
+    Connect(tokio_postgres::Error),
+}
+
+impl std::fmt::Display for OpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Prepare(error) => error.fmt(f),
+            Self::Connect(error) => f.write_str(&error_chain(error)),
+        }
+    }
+}
+
+impl std::error::Error for OpenError {}
+
 /// The `tokio-postgres` config and the connector for `dsn`.
 ///
 /// Pass both to `Config::connect`. The config keeps `sslmode=prefer` for
 /// [`Transport::Prefer`], so the client goes on in plaintext when the server
 /// declines TLS.
+///
+/// For `allow`, the config is the first, plaintext attempt only. [`open`]
+/// also makes the TLS retry, so prefer it.
 ///
 /// # Errors
 ///
@@ -114,6 +149,12 @@ pub type Connector = tokio_postgres::NoTls;
 /// [`PgTlsError::Unsupported`] when a verified mode meets a build without
 /// the `tls` feature, or a host with no usable trust store.
 pub fn prepare(dsn: &str) -> Result<(tokio_postgres::Config, Connector), PgTlsError> {
+    prepare_transport(dsn).map(|(config, connector, _)| (config, connector))
+}
+
+fn prepare_transport(
+    dsn: &str,
+) -> Result<(tokio_postgres::Config, Connector, Transport), PgTlsError> {
     let transport = transport(dsn).ok_or_else(|| {
         PgTlsError::InvalidDsn(
             "the database URL does not parse, or its sslmode is unknown".to_owned(),
@@ -122,7 +163,45 @@ pub fn prepare(dsn: &str) -> Result<(tokio_postgres::Config, Connector), PgTlsEr
     let config: tokio_postgres::Config = tokio_postgres_dsn(dsn, transport)
         .parse()
         .map_err(|error: tokio_postgres::Error| PgTlsError::InvalidDsn(error.to_string()))?;
-    Ok((config, connector(transport)?))
+    Ok((config, connector(transport)?, transport))
+}
+
+/// Open one `tokio-postgres` connection with the transport `dsn` asks for.
+///
+/// Spawn or poll the returned connection to drive it.
+///
+/// For `allow`, a server error on the plaintext attempt leads to one retry
+/// with TLS, as in libpq. A server that accepts TLS only, through
+/// `hostssl` in `pg_hba.conf`, rejects the plaintext attempt with such an
+/// error. A network error does not lead to a retry.
+///
+/// # Errors
+///
+/// [`OpenError::Prepare`] when [`prepare`] fails. [`OpenError::Connect`] when
+/// the server cannot be reached or refuses the connection.
+pub async fn open(
+    dsn: &str,
+) -> Result<
+    (
+        tokio_postgres::Client,
+        tokio_postgres::Connection<Socket, Stream>,
+    ),
+    OpenError,
+> {
+    let (mut config, tls, transport) = prepare_transport(dsn).map_err(OpenError::Prepare)?;
+    match config.connect(tls).await {
+        Err(error)
+            if transport == Transport::Allow
+                && cfg!(feature = "tls")
+                && error.as_db_error().is_some() =>
+        {
+            config.ssl_mode(tokio_postgres::config::SslMode::Require);
+            let tls = connector(transport).map_err(OpenError::Prepare)?;
+            config.connect(tls).await
+        }
+        attempt => attempt,
+    }
+    .map_err(OpenError::Connect)
 }
 
 /// Open one connection with the transport `dsn` asks for.
@@ -132,12 +211,9 @@ pub fn prepare(dsn: &str) -> Result<(tokio_postgres::Config, Connector), PgTlsEr
 /// A [`ConnectionError`] when the DSN is invalid, the transport is not
 /// available, or the server cannot be reached.
 pub async fn connect(dsn: &str) -> Result<AsyncPgConnection, ConnectionError> {
-    let (config, connector) =
-        prepare(dsn).map_err(|error| ConnectionError::BadConnection(error.to_string()))?;
-    let (client, connection) = config
-        .connect(connector)
+    let (client, connection) = open(dsn)
         .await
-        .map_err(|error| ConnectionError::BadConnection(error_chain(&error)))?;
+        .map_err(|error| ConnectionError::BadConnection(error.to_string()))?;
     AsyncPgConnection::try_from_client_and_connection(client, connection).await
 }
 
@@ -163,7 +239,7 @@ pub(crate) fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
 #[cfg(not(feature = "tls"))]
 fn connector(transport: Transport) -> Result<Connector, PgTlsError> {
     match transport {
-        Transport::Plain | Transport::Prefer => Ok(tokio_postgres::NoTls),
+        Transport::Plain | Transport::Allow | Transport::Prefer => Ok(tokio_postgres::NoTls),
         Transport::VerifyCa | Transport::VerifyFull => Err(PgTlsError::Unsupported(
             "a verified sslmode needs the `tls` feature of autumn-harvest".to_owned(),
         )),
@@ -174,7 +250,7 @@ fn connector(transport: Transport) -> Result<Connector, PgTlsError> {
 fn connector(transport: Transport) -> Result<Connector, PgTlsError> {
     let config = match transport {
         // `disable` sends no `SSLRequest`, so the connector stays unused.
-        Transport::Plain | Transport::Prefer => tls::encrypt_only(),
+        Transport::Plain | Transport::Allow | Transport::Prefer => tls::encrypt_only(),
         Transport::VerifyCa => tls::verified()?.0,
         Transport::VerifyFull => tls::verified()?.1,
     };
@@ -199,8 +275,9 @@ mod tls {
         Arc::new(rustls::crypto::ring::default_provider())
     }
 
-    /// The `prefer` config: encryption without a certificate check. It reads
-    /// no trust store, so a host without CA certificates can still encrypt.
+    /// The `prefer` and `allow` config: encryption without a certificate
+    /// check. It reads no trust store, so a host without CA certificates can
+    /// still encrypt.
     pub(super) fn encrypt_only() -> rustls::ClientConfig {
         static CONFIG: OnceLock<rustls::ClientConfig> = OnceLock::new();
         CONFIG
@@ -259,7 +336,7 @@ mod tls {
     }
 
     /// A verifier that does not compare the host name, as libpq does for
-    /// `verify-ca` and `prefer`.
+    /// `verify-ca`, `prefer` and `allow`.
     ///
     /// With `roots`, the chain must reach a trusted root (`verify-ca`).
     /// Without, any certificate passes (`prefer`). The handshake signatures
@@ -461,7 +538,7 @@ mod tests {
     fn sslmode_selects_the_transport() {
         let url = |mode: &str| format!("postgres://u@h/db?sslmode={mode}");
         assert_eq!(transport(&url("disable")), Some(Transport::Plain));
-        assert_eq!(transport(&url("allow")), Some(Transport::Plain));
+        assert_eq!(transport(&url("allow")), Some(Transport::Allow));
         assert_eq!(transport(&url("prefer")), Some(Transport::Prefer));
         assert_eq!(transport(&url("verify-ca")), Some(Transport::VerifyCa));
         assert_eq!(transport(&url("require")), Some(Transport::VerifyFull));
@@ -592,6 +669,61 @@ mod tests {
         }
         let plain = first_message("?sslmode=disable").await;
         assert_eq!(plain[4..], [0, 3, 0, 0], "disable sends a startup message");
+    }
+
+    /// A server with only `hostssl` lines in `pg_hba.conf` rejects plaintext
+    /// with an error. For `allow`, libpq then retries with TLS, so [`super::open`]
+    /// must too.
+    #[cfg(feature = "tls")]
+    #[tokio::test]
+    async fn allow_retries_with_tls_when_the_server_rejects_plaintext() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const SSL_REQUEST: [u8; 8] = [0, 0, 0, 8, 4, 210, 22, 47];
+        let mut body = Vec::new();
+        for (code, value) in [
+            (b'S', "FATAL"),
+            (b'V', "FATAL"),
+            (b'C', "28000"),
+            (b'M', "no pg_hba.conf entry, no encryption"),
+        ] {
+            body.push(code);
+            body.extend_from_slice(value.as_bytes());
+            body.push(0);
+        }
+        body.push(0);
+        let mut rejection = vec![b'E'];
+        let length = u32::try_from(body.len() + 4).expect("a short message");
+        rejection.extend_from_slice(&length.to_be_bytes());
+        rejection.extend(body);
+
+        let server = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a fake server");
+        let port = server.local_addr().expect("fake server address").port();
+        let fake = tokio::spawn(async move {
+            let (mut first, _) = server.accept().await.expect("accept");
+            let mut startup = [0_u8; 8];
+            first.read_exact(&mut startup).await.expect("first header");
+            let length = u32::from_be_bytes([startup[0], startup[1], startup[2], startup[3]]);
+            let mut rest = vec![0_u8; usize::try_from(length).expect("a length") - 8];
+            first.read_exact(&mut rest).await.expect("startup body");
+            first.write_all(&rejection).await.expect("reject");
+            drop(first);
+            let (mut second, _) = server.accept().await.expect("accept the retry");
+            let mut retry = [0_u8; 8];
+            second.read_exact(&mut retry).await.expect("retry header");
+            (startup, retry)
+        });
+        let dsn = format!("postgres://u@127.0.0.1:{port}/db?sslmode=allow");
+        let client = tokio::spawn(async move { super::open(&dsn).await.map(|_| ()) });
+        let (startup, retry) = tokio::time::timeout(std::time::Duration::from_secs(10), fake)
+            .await
+            .expect("the client retries")
+            .expect("fake server task");
+        client.abort();
+        assert_eq!(startup[4..], [0, 3, 0, 0], "allow starts in plaintext");
+        assert_eq!(retry, SSL_REQUEST, "the retry asks for TLS");
     }
 
     /// `disable` and `prefer` never read the trust store, so a host without
