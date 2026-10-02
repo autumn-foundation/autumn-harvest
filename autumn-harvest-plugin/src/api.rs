@@ -19697,8 +19697,8 @@ async fn batch_start_workflows(
         std::collections::BTreeMap::new();
     let mut gate_rejected: Vec<BatchStartItemResult> = Vec::new();
     // Load shedding (issue #1794). A throttle defer in Phase 2 skips the
-    // primitive's check, so each item is checked here. The check repeats per
-    // item, because the idempotency lookups below can outlast a sample.
+    // primitive's check, so each item is checked here. The first check per
+    // item is a hint. A fresh check after the idempotency lookups decides.
     let mut shed_rejected = 0_usize;
     let mut last_shed: Option<autumn_harvest::load_shed::ShedDecision> = None;
     for (idx, item) in request.items.iter().enumerate() {
@@ -19842,7 +19842,14 @@ async fn batch_start_workflows(
                 });
                 continue;
             }
-            if let Some(decision) = shed_hit {
+            // `shed_hit` is only a hint. The lookups above can outlast a
+            // sample, so the decision comes from a fresh check, as on the
+            // single-start route. A cleared or stale state then fails open.
+            if let Some(decision) = api_state
+                .gate_cache()
+                .load_shedder()
+                .check(item_queue, std::time::Instant::now())
+            {
                 runtime
                     .registry
                     .telemetry()

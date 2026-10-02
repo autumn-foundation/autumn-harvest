@@ -505,7 +505,7 @@ async fn manual_gate_wins_over_load_shed() {
 
 /// Signal-with-start sheds only its create path. A throttled start is shed
 /// before it can defer. Batch items are shed per item, and an atomic batch of
-/// sheds answers 429.
+/// sheds answers 429. After a clear, the same batch items start.
 #[tokio::test]
 async fn other_start_routes_shed_fresh_creates() {
     let Some(url) = db_url() else {
@@ -605,6 +605,36 @@ async fn other_start_routes_shed_fresh_creates() {
 
     // sws create, throttled start, two batch items, one atomic item.
     assert_eq!(metrics.rejected(), 5);
+
+    // The batch arm decides on the live shedder state, not on the hint it
+    // took before the idempotency lookups. After the backlog drains, the
+    // same explicit ids start.
+    diesel::sql_query("DELETE FROM harvest_task_queue")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    sample(&api_state, &pool, &metrics).await;
+    let reply = post(
+        &app,
+        "/workflows/batch_start",
+        json!({
+            "atomic": false,
+            "items": [
+                { "workflow_name": WF, "workflow_id": "b-1" },
+                { "workflow_name": WF, "workflow_id": "b-2" },
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{:?}", reply.body);
+    let results = reply.body["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2);
+    for item in results {
+        assert_eq!(item["status"], "started", "{item:?}");
+    }
+    assert_eq!(executions_with_id(&mut conn, "b-1").await, 1);
+    assert_eq!(executions_with_id(&mut conn, "b-2").await, 1);
+    assert_eq!(metrics.rejected(), 5, "a cleared queue sheds nothing");
 }
 
 /// A failed sample changes no state. The gauge still reports the live state.
