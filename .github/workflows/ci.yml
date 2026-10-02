@@ -115,7 +115,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned, not `@stable`. This job runs clippy with `-D warnings`, so
+      # each new stable release can turn its new lints into a red build on
+      # every open PR at once. Clippy 1.99 did: about 700 errors, mostly
+      # `redundant_field_names` on `#[derive(QueryableByName)]` output.
+      # Raise this pin in its own PR, together with the lint fixes it needs.
+      - uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
