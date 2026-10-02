@@ -396,16 +396,25 @@ async fn stamped_heartbeat_loop(
     // The newest payload not yet written, with its send time. A failed flush
     // puts it back here. A retry writes that time, not the retry time.
     let mut pending: Option<Pending> = None;
+    // Set when a write that blocked for an interval or more succeeds while a
+    // newer heartbeat waits. The loop then writes that heartbeat at once.
+    let mut flush_now = false;
 
     loop {
+        if cancel.is_cancelled() {
+            tracing::debug!(task_id = %task_id, "heartbeat flusher cancelled");
+            break;
+        }
         // Wait for either: a heartbeat arrives, the interval expires, or cancellation.
-        tokio::select! {
-            () = cancel.cancelled() => {
-                tracing::debug!(task_id = %task_id, "heartbeat flusher cancelled");
-                break;
-            }
-            () = tokio::time::sleep(flush_interval) => {
-                // Interval elapsed -- drain and flush.
+        if !std::mem::take(&mut flush_now) {
+            tokio::select! {
+                () = cancel.cancelled() => {
+                    tracing::debug!(task_id = %task_id, "heartbeat flusher cancelled");
+                    break;
+                }
+                () = tokio::time::sleep(flush_interval) => {
+                    // Interval elapsed -- drain and flush.
+                }
             }
         }
 
@@ -417,8 +426,22 @@ async fn stamped_heartbeat_loop(
 
         // If we got at least one heartbeat, flush to DB.
         if let Some(beat) = pending.take() {
+            let started = tokio::time::Instant::now();
             match flush(&pool, &claim, &beat, options.acquire_timeout).await {
-                Ok(ClaimWrite::Applied) => {}
+                Ok(ClaimWrite::Applied) => {
+                    // A write that blocked leaves the row with an old send
+                    // time. A newer heartbeat that waits then goes at once,
+                    // so a timeout scanner does not see a live activity as
+                    // stale (issue #1788).
+                    flush_now = flushes_again_at_once(
+                        started.elapsed(),
+                        flush_interval,
+                        latest
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .is_some(),
+                    );
+                }
                 // The claim is no longer current (issue #1789). Stop the
                 // activity, so this stale attempt does no more work.
                 Ok(ClaimWrite::LeaseLost) => {
@@ -456,6 +479,16 @@ async fn stamped_heartbeat_loop(
             break;
         }
     }
+}
+
+/// Whether the stamped flush loop writes a waiting heartbeat without the
+/// usual pause (issue #1788).
+///
+/// Only a write that took `interval` or more qualifies. A quick write keeps
+/// the steady rate of one write per interval.
+#[cfg(feature = "db")]
+fn flushes_again_at_once(took: Duration, interval: Duration, newer_waits: bool) -> bool {
+    newer_waits && took >= interval
 }
 
 /// The `site` label for a heartbeat flush acquire timeout.
@@ -582,6 +615,17 @@ mod tests {
                 details: Value::Null,
                 sent_at: chrono::DateTime::from_timestamp(secs, 0).expect("time"),
             }
+        }
+
+        /// Only a write that blocked for an interval, with a newer heartbeat
+        /// waiting, skips the pause (issue #1788).
+        #[test]
+        fn only_a_blocked_write_flushes_again_at_once() {
+            let interval = Duration::from_secs(1);
+            assert!(flushes_again_at_once(interval * 3, interval, true));
+            assert!(flushes_again_at_once(interval, interval, true));
+            assert!(!flushes_again_at_once(interval * 3, interval, false));
+            assert!(!flushes_again_at_once(interval / 10, interval, true));
         }
 
         /// A heartbeat that arrives late keeps the newer one (issue #1788). Two

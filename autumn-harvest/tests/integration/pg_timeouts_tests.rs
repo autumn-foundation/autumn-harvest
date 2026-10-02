@@ -1905,6 +1905,98 @@ async fn a_heartbeat_sent_during_a_blocked_flush_keeps_its_time() {
     );
 }
 
+/// A newer heartbeat that waits behind a blocked flush is written as soon as
+/// that flush ends, not one interval later. Until then the row shows the old
+/// send time, and a timeout scanner could reclaim a live activity.
+#[tokio::test]
+async fn a_newer_heartbeat_follows_a_blocked_flush_at_once() {
+    #[derive(diesel::QueryableByName)]
+    struct Beat {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
+        last_heartbeat_at: Option<chrono::DateTime<Utc>>,
+    }
+
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let suffix = Uuid::new_v4().simple().to_string()[..12].to_owned();
+    let worker_id = format!("w-hb-{suffix}");
+    register_live_worker(&mut conn, &worker_id).await;
+    let task_id = autumn_harvest::queue::enqueue(
+        &mut conn,
+        &autumn_harvest::queue::EnqueueParams::new(
+            format!("q-hb-{suffix}"),
+            autumn_harvest::queue::TaskType::Activity,
+            serde_json::json!({}),
+        ),
+    )
+    .await
+    .expect("enqueue");
+    diesel::sql_query(
+        "UPDATE harvest_task_queue SET state = 'RUNNING', worker_id = $2, attempt = 1 \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .bind::<Text, _>(&worker_id)
+    .execute(&mut conn)
+    .await
+    .expect("model the claim");
+
+    let pool = engine_pool(
+        url,
+        1,
+        DbRole::Hot,
+        &timeouts(10_000, SessionTimeouts::for_role(DbRole::Hot)),
+    )
+    .expect("engine pool");
+    let held = hold_every_connection(&pool).await;
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let tx = autumn_harvest::heartbeat::spawn_heartbeat_flusher_with(
+        autumn_harvest::queue::TaskClaim::new(task_id, worker_id.clone(), 1),
+        pool.clone(),
+        cancel.clone(),
+        autumn_harvest::heartbeat::HeartbeatFlushOptions {
+            acquire_timeout: Duration::from_secs(10),
+            metrics: Arc::new(autumn_harvest::telemetry::NoOpMetrics),
+        },
+    );
+    tx.send(serde_json::json!({"progress": 1}).into())
+        .await
+        .expect("send the first heartbeat");
+    // The first flush starts at about 1 s and blocks on the held pool.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let newer_sent_at = Utc::now();
+    tx.send(serde_json::json!({"progress": 2}).into())
+        .await
+        .expect("send the newer heartbeat");
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    drop(held);
+    let released = Instant::now();
+
+    let deadline = released + Duration::from_secs(5);
+    let written_after = loop {
+        let beat =
+            diesel::sql_query("SELECT last_heartbeat_at FROM harvest_task_queue WHERE id = $1")
+                .bind::<diesel::sql_types::Uuid, _>(task_id)
+                .get_result::<Beat>(&mut conn)
+                .await
+                .expect("read the heartbeat")
+                .last_heartbeat_at;
+        if beat.is_some_and(|at| at >= newer_sent_at) {
+            break released.elapsed();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the newer heartbeat was never written"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    cancel.cancel();
+    assert!(
+        written_after < Duration::from_millis(600),
+        "the newer heartbeat waited for another interval: {written_after:?}"
+    );
+}
+
 /// A start that lost its connection on a one-slot pool must still find its
 /// committed `ActivityStarted`. The dead connection holds the only slot. The
 /// reconcile read needs that slot, so the dead connection must go back first.
