@@ -1732,7 +1732,9 @@ mod tests {
             "the same run seen twice is one run"
         );
         match merged {
-            TargetLocation::Found { other_live, .. } => assert!(other_live.is_empty()),
+            TargetLocation::Found { other_live, .. } => {
+                assert_eq!(other_live, [] as [crate::types::ShardId; 0]);
+            }
             other => panic!("expected Found, got {other:?}"),
         }
     }

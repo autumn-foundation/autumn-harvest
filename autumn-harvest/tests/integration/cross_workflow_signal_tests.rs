@@ -144,29 +144,6 @@ fn target_workflow<'a>(
     })
 }
 
-// ── Branch poll order in the `select!` races ────────────────────────────────
-//
-// Each race below polls its parked branch (a timer, signal wait, activity or
-// child) before its external branch. The `biased;` mode fixes that order.
-// Without it, `tokio::select!` starts each poll at a random branch.
-//
-// The order matters on the replay after the wake. History then holds the
-// external terminal and the event of the parked branch, such as `TimerStarted`.
-// If the external branch is polled first, it resolves from history and the
-// race returns. The parked branch then never emits its command again. Its
-// recorded event stays unconsumed, so replay reports "workflow returned early"
-// and blocks the run as non-deterministic.
-//
-// A blocked run retries after a 5 s, a 10 s and then a 20 s backoff. A random
-// start fails each replay with a probability of one half. Three failures in a
-// row exceed the 30 s bound of the inline-wake tests. An unbiased race thus
-// fails such a test in about one run of eight.
-//
-// Guardrail HVG010 forbids `select!` in a `#[workflow]` body for this reason.
-// These plain handler functions are outside that guardrail on purpose, because
-// they must build a mixed suspension batch. The fixed order keeps each replay
-// identical to the live run, as the guardrail requires.
-
 fn mixed_suspension_workflow<'a>(
     ctx: &'a WorkflowContext,
     input: serde_json::Value,
@@ -181,8 +158,11 @@ fn mixed_suspension_workflow<'a>(
         let signal_fut =
             ctx.signal_external_workflow(target, "my_signal", serde_json::json!({"data": "hello"}));
 
-        // Poll the parked branch first. See "Branch poll order" above.
         tokio::select! {
+            // DET011/HVG010: poll in source order. The durable branch must
+            // consume its recorded events before the external branch resolves
+            // from history. An unbiased select! polls at random, and a replay
+            // that returns early is ND-blocked with a 5 s to 20 s backoff.
             biased;
             res = timer_fut => {
                 res.map_err(|e| e.to_string())?;
@@ -226,8 +206,11 @@ fn mixed_suspension_cancel_workflow<'a>(
         let timer_fut = ctx.timer("long_timer", 3600);
         let cancel_fut = ctx.request_cancel_external_workflow(target);
 
-        // Poll the parked branch first. See "Branch poll order" above.
         tokio::select! {
+            // DET011/HVG010: poll in source order. The durable branch must
+            // consume its recorded events before the external branch resolves
+            // from history. An unbiased select! polls at random, and a replay
+            // that returns early is ND-blocked with a 5 s to 20 s backoff.
             biased;
             res = timer_fut => {
                 res.map_err(|e| e.to_string())?;
@@ -299,8 +282,11 @@ fn mixed_signal_wait_external_signal_workflow<'a>(
         let signal_fut =
             ctx.signal_external_workflow(target, "my_signal", serde_json::json!({"data": "hello"}));
 
-        // Poll the parked branch first. See "Branch poll order" above.
         tokio::select! {
+            // DET011/HVG010: poll in source order. The durable branch must
+            // consume its recorded events before the external branch resolves
+            // from history. An unbiased select! polls at random, and a replay
+            // that returns early is ND-blocked with a 5 s to 20 s backoff.
             biased;
             res = wait_fut => {
                 res.map_err(|e| e.to_string())?;
@@ -329,8 +315,11 @@ fn mixed_signal_wait_external_cancel_workflow<'a>(
         let wait_fut = ctx.receive_signal::<serde_json::Value>("parent_never_arrives");
         let cancel_fut = ctx.request_cancel_external_workflow(target);
 
-        // Poll the parked branch first. See "Branch poll order" above.
         tokio::select! {
+            // DET011/HVG010: poll in source order. The durable branch must
+            // consume its recorded events before the external branch resolves
+            // from history. An unbiased select! polls at random, and a replay
+            // that returns early is ND-blocked with a 5 s to 20 s backoff.
             biased;
             res = wait_fut => {
                 res.map_err(|e| e.to_string())?;
@@ -380,8 +369,11 @@ fn mixed_activity_external_signal_workflow<'a>(
         let signal_fut =
             ctx.signal_external_workflow(target, "my_signal", serde_json::json!({"data": "hello"}));
 
-        // Poll the parked branch first. See "Branch poll order" above.
         tokio::select! {
+            // DET011/HVG010: poll in source order. The durable branch must
+            // consume its recorded events before the external branch resolves
+            // from history. An unbiased select! polls at random, and a replay
+            // that returns early is ND-blocked with a 5 s to 20 s backoff.
             biased;
             res = activity_fut => {
                 res.map_err(|e| e.to_string())?;
@@ -433,8 +425,11 @@ fn mixed_child_workflow_external_signal_workflow<'a>(
         let signal_fut =
             ctx.signal_external_workflow(target, "my_signal", serde_json::json!({"data": "hello"}));
 
-        // Poll the parked branch first. See "Branch poll order" above.
         tokio::select! {
+            // DET011/HVG010: poll in source order. The durable branch must
+            // consume its recorded events before the external branch resolves
+            // from history. An unbiased select! polls at random, and a replay
+            // that returns early is ND-blocked with a 5 s to 20 s backoff.
             biased;
             res = child_fut => {
                 res.map_err(|e| e.to_string())?;
