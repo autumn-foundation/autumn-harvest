@@ -853,45 +853,14 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! { |e| e.to_string() }
     };
 
-    let dispatch = if param_names.is_empty() {
-        quote! {
-            let result = #fn_name(ctx).await;
-            result.map_err(#encode_err)
-                .and_then(|v| {
-                    ::autumn_harvest::serde_json::to_value(v)
-                        .map_err(|e| e.to_string())
-                })
-        }
-    } else if param_names.len() == 1 {
-        let name = &param_names[0];
-        quote! {
-            let #name = ::autumn_harvest::serde_json::from_value(input)
-                .map_err(|e| e.to_string())?;
-            let result = #fn_name(ctx, #name).await;
-            result.map_err(#encode_err)
-                .and_then(|v| {
-                    ::autumn_harvest::serde_json::to_value(v)
-                        .map_err(|e| e.to_string())
-                })
-        }
-    } else {
-        // Multiple params: expect input to be a JSON array [arg1, arg2, ...]
-        let indices = (0..param_names.len()).map(syn::Index::from);
-        let names = param_names.clone();
-        quote! {
-            let args: ::autumn_harvest::serde_json::Value = input;
-            #(
-                let #names = ::autumn_harvest::serde_json::from_value(args[#indices].clone())
-                    .map_err(|e| e.to_string())?;
-            )*
-            let result = #fn_name(ctx, #(#names),*).await;
-            result.map_err(#encode_err)
-                .and_then(|v| {
-                    ::autumn_harvest::serde_json::to_value(v)
-                        .map_err(|e| e.to_string())
-                })
-        }
-    };
+    let dispatch = crate::attr_util::build_handler_dispatch(
+        fn_name,
+        &param_names,
+        &format_ident!("input"),
+        &quote! { ctx },
+        &quote! { .await },
+        &encode_err,
+    );
 
     // Emit execution_timeout as Option<Duration> using the task_duration helper.
     let execution_timeout_expr = attrs.execution_timeout.as_deref().map_or_else(
@@ -1511,15 +1480,10 @@ mod rate_validation_tests {
 
 // ── Dispatch-block characterization tests (issue #1632) ─────────────────────
 //
-// `workflow_macro`'s arity-keyed dispatch block (0/1/N non-`ctx` params, plus
-// the `encode_err` branch for a plain vs. `WorkflowFailure` return type) is
-// byte-identical to `activity.rs`'s `activity_macro` dispatch block, and
-// shares its 0/1/N structure with `query.rs`/`update.rs`. Issue #1632
-// documents this as one decision, hand-mirrored across all four macros. It
-// defers a merge until characterization tests exist for `workflow.rs` and
-// `activity.rs` (neither had macro-expansion tests before this commit).
-// Pinned here first so a follow-up move to a shared `build_handler_dispatch`
-// cannot silently change what a handler's dispatch closure does.
+// `workflow_macro` builds its dispatch block with
+// `attr_util::build_handler_dispatch`. These tests pin the generated block for
+// 0, 1, and many non-`ctx` params. They cover a plain return type and a
+// `WorkflowFailure` return type.
 #[cfg(test)]
 mod dispatch_characterization_tests {
     use super::workflow_macro;
@@ -1557,8 +1521,8 @@ mod dispatch_characterization_tests {
     const WORKFLOW_DISPATCH_0_TYPED: &str = "let result = my_workflow (ctx) . await ; result . map_err (| e | :: autumn_harvest :: failure :: IntoWorkflowErrorString :: into_workflow_error_payload (e)) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
     const WORKFLOW_DISPATCH_1_LEGACY: &str = "let n = :: autumn_harvest :: serde_json :: from_value (input) . map_err (| e | e . to_string ()) ? ; let result = my_workflow (ctx , n) . await ; result . map_err (| e | e . to_string ()) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
     const WORKFLOW_DISPATCH_1_TYPED: &str = "let n = :: autumn_harvest :: serde_json :: from_value (input) . map_err (| e | e . to_string ()) ? ; let result = my_workflow (ctx , n) . await ; result . map_err (| e | :: autumn_harvest :: failure :: IntoWorkflowErrorString :: into_workflow_error_payload (e)) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
-    const WORKFLOW_DISPATCH_N_LEGACY: &str = "let args : :: autumn_harvest :: serde_json :: Value = input ; let a = :: autumn_harvest :: serde_json :: from_value (args [0] . clone ()) . map_err (| e | e . to_string ()) ? ; let b = :: autumn_harvest :: serde_json :: from_value (args [1] . clone ()) . map_err (| e | e . to_string ()) ? ; let result = my_workflow (ctx , a , b) . await ; result . map_err (| e | e . to_string ()) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
-    const WORKFLOW_DISPATCH_N_TYPED: &str = "let args : :: autumn_harvest :: serde_json :: Value = input ; let a = :: autumn_harvest :: serde_json :: from_value (args [0] . clone ()) . map_err (| e | e . to_string ()) ? ; let b = :: autumn_harvest :: serde_json :: from_value (args [1] . clone ()) . map_err (| e | e . to_string ()) ? ; let result = my_workflow (ctx , a , b) . await ; result . map_err (| e | :: autumn_harvest :: failure :: IntoWorkflowErrorString :: into_workflow_error_payload (e)) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
+    const WORKFLOW_DISPATCH_N_LEGACY: &str = "let __args : :: autumn_harvest :: serde_json :: Value = input ; let a = :: autumn_harvest :: serde_json :: from_value (__args [0] . clone ()) . map_err (| e | e . to_string ()) ? ; let b = :: autumn_harvest :: serde_json :: from_value (__args [1] . clone ()) . map_err (| e | e . to_string ()) ? ; let result = my_workflow (ctx , a , b) . await ; result . map_err (| e | e . to_string ()) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
+    const WORKFLOW_DISPATCH_N_TYPED: &str = "let __args : :: autumn_harvest :: serde_json :: Value = input ; let a = :: autumn_harvest :: serde_json :: from_value (__args [0] . clone ()) . map_err (| e | e . to_string ()) ? ; let b = :: autumn_harvest :: serde_json :: from_value (__args [1] . clone ()) . map_err (| e | e . to_string ()) ? ; let result = my_workflow (ctx , a , b) . await ; result . map_err (| e | :: autumn_harvest :: failure :: IntoWorkflowErrorString :: into_workflow_error_payload (e)) . and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })";
 
     #[test]
     fn zero_params_legacy_error_dispatch_is_pinned() {
