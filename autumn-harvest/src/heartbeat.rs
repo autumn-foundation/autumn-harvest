@@ -240,9 +240,9 @@ mod tests {
     struct CountingSink(usize);
 
     impl HeartbeatSink for CountingSink {
-        async fn flush(&mut self, _payload: Value) -> FlushOutcome {
+        fn flush(&mut self, _payload: Value) -> impl Future<Output = FlushOutcome> + Send {
             self.0 += 1;
-            FlushOutcome::Continue
+            std::future::ready(FlushOutcome::Continue)
         }
     }
 
