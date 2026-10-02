@@ -1392,7 +1392,17 @@ fn index_notice_due(key: &NoticeKey) -> bool {
     true
 }
 
-/// Name the database behind a connection: its name, host address and port.
+/// Join the parts that name a database cluster.
+///
+/// A Unix-socket connection has no address and no port. The start time of the
+/// postmaster then tells two clusters with the same database name apart.
+#[cfg(feature = "db")]
+fn database_identity_of(name: &str, addr: &str, port: &str, started: &str) -> String {
+    format!("{name}@{addr}:{port}@{started}")
+}
+
+/// Name the database behind a connection: its name, host address, port and
+/// postmaster start time.
 ///
 /// An empty name on error only merges the gates of the databases it cannot
 /// name.
@@ -1404,18 +1414,41 @@ async fn database_identity(conn: &mut diesel_async::AsyncPgConnection) -> String
     struct Identity {
         #[diesel(sql_type = diesel::sql_types::Text)]
         name: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        addr: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        port: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        started: String,
     }
 
     let rows: Result<Vec<Identity>, _> = diesel::sql_query(
-        "SELECT current_database()::text || '@' || COALESCE(inet_server_addr()::text, '') \
-         || ':' || COALESCE(inet_server_port()::text, '') AS name",
+        "SELECT current_database()::text AS name, \
+                COALESCE(inet_server_addr()::text, '') AS addr, \
+                COALESCE(inet_server_port()::text, '') AS port, \
+                pg_postmaster_start_time()::text AS started",
     )
     .load(conn)
     .await;
     rows.ok()
         .and_then(|rows| rows.into_iter().next())
-        .map(|row| row.name)
+        .map(|row| database_identity_of(&row.name, &row.addr, &row.port, &row.started))
         .unwrap_or_default()
+}
+
+/// Run `future` unless `cancel` fires first. `None` means shutdown won.
+///
+/// A catalog probe on a stalled connection never returns. Graceful shutdown
+/// awaits the checker, so each probe must race the cancel token.
+#[cfg(feature = "db")]
+async fn until_cancelled<F: std::future::Future>(
+    cancel: &tokio_util::sync::CancellationToken,
+    future: F,
+) -> Option<F::Output> {
+    tokio::select! {
+        output = future => Some(output),
+        () = cancel.cancelled() => None,
+    }
 }
 
 /// Log an operator notice once per interval, only while the index is not valid.
@@ -3457,7 +3490,13 @@ async fn export_once_via_pool(
     else {
         return Ok(0);
     };
-    spawn_unexported_index_build_if_due(&mut conn, shard_id, index_build_dsn, cancel).await;
+    // The pre-build probes race shutdown. A stalled catalog read must not hold
+    // the checker, and the claim phase below observes the same token.
+    let _ = until_cancelled(
+        cancel,
+        spawn_unexported_index_build_if_due(&mut conn, shard_id, index_build_dsn, cancel),
+    )
+    .await;
     // Raced against `cancel` (Codex review on PR #1520, follow-up P2, fifth
     // round). `claim_shard`'s locked read can wait indefinitely behind
     // another session holding the cursor row. A bare await here would then
@@ -5021,6 +5060,34 @@ mod tests {
         assert!(index_build_due(&second), "the other schema is not blocked");
         index_build_finished(&first, BuildEnd::Ready);
         index_build_finished(&second, BuildEnd::Ready);
+    }
+
+    /// Issue #1667: Unix-socket connections report no address and no port. Two
+    /// clusters with the same database name must still differ, so the start
+    /// time of the postmaster is part of the identity.
+    #[cfg(feature = "db")]
+    #[test]
+    fn the_database_identity_tells_unix_socket_clusters_apart() {
+        let first = database_identity_of("harvest", "", "", "2026-10-02 08:00:00+00");
+        let second = database_identity_of("harvest", "", "", "2026-10-02 08:05:00+00");
+        assert_ne!(first, second);
+        assert_eq!(
+            first,
+            database_identity_of("harvest", "", "", "2026-10-02 08:00:00+00")
+        );
+    }
+
+    /// Issue #1667: a probe on a stalled connection must not hold shutdown. The
+    /// race against the cancel token ends it.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn a_stalled_probe_ends_when_shutdown_is_requested() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let stalled = std::future::pending::<u8>();
+        assert_eq!(until_cancelled(&cancel, stalled).await, None);
+        let live = tokio_util::sync::CancellationToken::new();
+        assert_eq!(until_cancelled(&live, async { 7_u8 }).await, Some(7));
     }
 
     /// Issue #1667: a privilege failure is the one error a retry cannot fix.
