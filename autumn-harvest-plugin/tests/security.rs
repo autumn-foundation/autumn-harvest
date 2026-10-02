@@ -2435,3 +2435,22 @@ async fn nemesis_opt_out_restores_vantage_mutations() {
         assert_ne!(res.status(), StatusCode::UNAUTHORIZED, "POST {uri}");
     }
 }
+
+/// An `OPTIONS` preflight is not a mutation, so the gate never answers it.
+#[tokio::test]
+async fn nemesis_options_preflight_is_not_refused_by_the_gate() {
+    for uri in [
+        "/workflows/my-workflow/start",
+        "/workflows/00000000-0000-0000-0000-000000000001/cancel",
+    ] {
+        let request = Request::builder()
+            .method(Method::OPTIONS)
+            .uri(uri)
+            .header("Origin", "https://app.example.com")
+            .header("Access-Control-Request-Method", "POST")
+            .body(Body::empty())
+            .unwrap();
+        let res = closed_app().oneshot(request).await.unwrap();
+        assert_ne!(res.status(), StatusCode::UNAUTHORIZED, "OPTIONS {uri}");
+    }
+}

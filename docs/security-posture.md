@@ -96,7 +96,8 @@ to any caller.
 The gate covers three surfaces:
 
 - every `Mutating` route of `harvest_api_router`, by its
-  `CLASSIFIED_ROUTES` class (an unclassified route counts as `Mutating`);
+  `CLASSIFIED_ROUTES` class (an unclassified route counts as `Mutating`, and
+  an `OPTIONS` preflight passes);
 - every Vantage `/ui` route, for any method except `GET`, `HEAD` and
   `OPTIONS`;
 - every mutating MCP tool route (`start_{wf}`, `start_{dag}`, `signal_{wf}`

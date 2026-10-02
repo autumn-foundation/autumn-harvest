@@ -5733,7 +5733,8 @@ pub(crate) async fn require_harvest_admin(
 /// Refuse an unauthenticated call to a `Mutating` route (issue #1802).
 ///
 /// The class comes from `CLASSIFIED_ROUTES`, and an unclassified route counts
-/// as `Mutating`. A route with an admin gate runs this check first, then its
+/// as `Mutating`. An `OPTIONS` preflight is not a mutation, so it passes. A
+/// route with an admin gate runs this check first, then its
 /// own. This check admits every caller the admin gate admits, so the admin
 /// gate still decides. The per-route same-origin guard on the bulk
 /// dead-letter routes runs after this check, so an anonymous cross-site post
@@ -5743,7 +5744,9 @@ pub(crate) async fn require_classified_mutation_auth(
     request: axum::extract::Request,
     next: Next,
 ) -> axum::response::Response {
-    if classify_route(request.method(), request.uri().path()) != RouteClass::Mutating {
+    if request.method() == axum::http::Method::OPTIONS
+        || classify_route(request.method(), request.uri().path()) != RouteClass::Mutating
+    {
         return next.run(request).await;
     }
     admit_mutation(&api_state, request, next).await
