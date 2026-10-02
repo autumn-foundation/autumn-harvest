@@ -1484,7 +1484,7 @@ mod tests {
             reason_codes.contains(&REASON_NO_LIVE_WORKER.to_string()),
             "should emit no_live_worker when no worker covers the shard"
         );
-        assert!(!blocking_reasons.is_empty());
+        assert_ne!(blocking_reasons, [] as [std::string::String; 0]);
     }
 
     /// Run the gate for shard 0 and return its single blocking reason.
@@ -1784,7 +1784,7 @@ mod tests {
             reason_codes.contains(&REASON_NO_LIVE_WORKER.to_string()),
             "candidate shard with uncovered pending work should fire no_live_worker"
         );
-        assert!(!blocking_reasons.is_empty());
+        assert_ne!(blocking_reasons, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -1812,7 +1812,7 @@ mod tests {
             !reason_codes.contains(&REASON_NO_LIVE_WORKER.to_string()),
             "read-only non-candidate shard should not fire no_live_worker"
         );
-        assert!(blocking_reasons.is_empty());
+        assert_eq!(blocking_reasons, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -1865,7 +1865,7 @@ mod tests {
             !reason_codes.contains(&REASON_NO_LIVE_WORKER.to_string()),
             "should not fire when a healthy active worker covers the shard"
         );
-        assert!(blocking_reasons.is_empty());
+        assert_eq!(blocking_reasons, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -2055,7 +2055,7 @@ mod tests {
             !reason_codes.contains(&REASON_NO_LIVE_WORKER.to_string()),
             "should not fire when every pending queue has a covering worker"
         );
-        assert!(blocking_reasons.is_empty());
+        assert_eq!(blocking_reasons, [] as [std::string::String; 0]);
     }
 
     /// Build a `QueueDepthSummary` with one capability-bearing pending task on
@@ -2181,7 +2181,7 @@ mod tests {
             !reason_codes.contains(&REASON_NO_LIVE_WORKER.to_string()),
             "should not fire when a covering worker satisfies the capabilities"
         );
-        assert!(blocking_reasons.is_empty());
+        assert_eq!(blocking_reasons, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -2248,7 +2248,7 @@ mod tests {
             !reason_codes.contains(&REASON_NO_LIVE_WORKER.to_string()),
             "should not fire when a covering worker's build is eligible"
         );
-        assert!(blocking_reasons.is_empty());
+        assert_eq!(blocking_reasons, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -2281,7 +2281,7 @@ mod tests {
             !reason_codes.contains(&REASON_NO_LIVE_WORKER.to_string()),
             "should not fire when a compat declaration makes the worker build-eligible"
         );
-        assert!(blocking_reasons.is_empty());
+        assert_eq!(blocking_reasons, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -2346,6 +2346,6 @@ mod tests {
             !reason_codes.contains(&REASON_NO_LIVE_WORKER.to_string()),
             "should not fire when the sticky-lease owner is the live covering worker"
         );
-        assert!(blocking_reasons.is_empty());
+        assert_eq!(blocking_reasons, [] as [std::string::String; 0]);
     }
 }

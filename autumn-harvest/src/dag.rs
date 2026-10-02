@@ -1844,7 +1844,7 @@ mod tests {
         let builder = DagBuilder::new();
         let dag = builder.build().expect("build should succeed");
         assert!(dag.tasks().is_empty());
-        assert!(dag.execution_levels().is_empty());
+        assert_eq!(dag.execution_levels().len(), 0);
     }
 
     #[test]
@@ -1856,7 +1856,7 @@ mod tests {
         let tasks = dag.tasks();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].activity_name, "dummy_activity");
-        assert!(tasks[0].upstreams.is_empty());
+        assert_eq!(tasks[0].upstreams, [] as [usize; 0]);
         assert_eq!(tasks[0].trigger_rule, TriggerRule::AllSuccess);
         assert!(tasks[0].retry_policy.is_none());
         assert!(tasks[0].start_to_close.is_none());
@@ -1909,7 +1909,7 @@ mod tests {
         let tasks = dag.tasks();
 
         assert_eq!(tasks.len(), 3);
-        assert!(tasks[0].upstreams.is_empty());
+        assert_eq!(tasks[0].upstreams, [] as [usize; 0]);
         assert_eq!(tasks[1].upstreams, vec![0]);
         // upstreams are inserted in order
         assert_eq!(tasks[2].upstreams, vec![0, 1]);

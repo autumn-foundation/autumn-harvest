@@ -2830,7 +2830,7 @@ mod tests {
             CODEC_LEGACY_KEY_ID,
             "an unconfigured registry is on the legacy key"
         );
-        assert!(codecs.registered_key_ids().is_empty());
+        assert_eq!(codecs.registered_key_ids(), [] as [std::string::String; 0]);
 
         codecs
             .register_key("k1", Arc::new(XorCodec(1)))
