@@ -23,12 +23,12 @@
 //!   An unclassified path is `Mutating`.
 //! - `tenant_key`: the [`autumn_harvest::audit::HEADER_TENANT`] header.
 //!   The caller declares it. Harvest does not bind it to stored executions.
-//! - `shard`: read only from a source the route's handler uses. That is an
-//!   execution id in the path (also under `/ui`), a shard query parameter on a
-//!   route that filters by it, or a shard field in the body of a route that
-//!   targets one shard (see [`SHARD_SOURCES`]). `None` means Harvest cannot
-//!   name the shard before the handler runs. A list route reads every shard.
-//!   A by-id route or an unpinned start reaches one shard by hash.
+//! - `shard`: read only from a source the route's handler uses. One source is
+//!   an execution id in the path, also under `/ui`. The others are a shard
+//!   query parameter or body field on the routes in `SHARD_SOURCES`. `None`
+//!   means Harvest cannot name the shard before the handler runs. A list
+//!   route reads every shard. A by-id route or an unpinned start reaches one
+//!   shard by hash.
 //!
 //! # Audit volume
 //!
