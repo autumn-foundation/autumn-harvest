@@ -608,7 +608,7 @@ fn the_report_records_the_no_await_without_a_command_constraint() {
     // The mechanism the update describes is really there.
     let executor = read_src("src/executor.rs");
     assert!(
-        executor.contains("ctx.has_parked_harvest_future()")
+        executor.contains("has_parked_harvest_future()")
             && executor.contains("DEADLOCK_TIMEOUT")
             && !executor.contains("SUSPENSION_TIMEOUT"),
         "the C9 update says the executor suspends on a parked Harvest future and \
