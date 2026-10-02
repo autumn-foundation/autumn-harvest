@@ -1502,16 +1502,6 @@ static INDEX_PROBE_GATE: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<ProbeKey, std::time::Instant>>,
 > = std::sync::LazyLock::new(Default::default);
 
-/// The probe key of the direct export path, which has no pool.
-///
-/// The marker `direct` keeps it apart from every pooled key. The connection
-/// identity separates callers. A new connection probes at once, and a reused
-/// one waits for the interval.
-#[cfg(feature = "db")]
-fn direct_probe_key(shard_id: i32, conn_id: usize) -> ProbeKey {
-    (shard_id, "direct".to_owned(), conn_id)
-}
-
 /// Whether this checker may probe the index catalogs now.
 ///
 /// A healthy exporter ticks every poll interval. Two catalog reads per tick
@@ -1862,17 +1852,17 @@ async fn spawn_unexported_index_build_if_due(
 /// dedicated export task builds the index on its own connection. An embedder
 /// that drives this primitive by hand runs [`ensure_unexported_index`] on a
 /// dedicated connection, or runs [`UNEXPORTED_INDEX_DDL`] as the table owner.
+///
+/// Each call reads the index catalog once. A valid index ends the call there.
+/// This path has no pool and no state handle, so it has no key that names a
+/// database without a query. A throttle keyed by the connection address would
+/// alias unrelated databases. The caller sets the cost with its own cadence.
+/// The pooled exporter throttles its probes per shard, URL and pool.
 #[cfg(feature = "db")]
 async fn notice_missing_unexported_index(
     conn: &mut diesel_async::AsyncPgConnection,
     shard_id: i32,
 ) {
-    // A caller can tick quickly. One probe per interval for each connection
-    // keeps the catalog reads off the steady state.
-    let conn_id = std::ptr::from_ref::<diesel_async::AsyncPgConnection>(conn) as usize;
-    if !index_probe_due(&direct_probe_key(shard_id, conn_id)) {
-        return;
-    }
     if !index_notice_wanted(conn, shard_id).await {
         return;
     }
@@ -3307,6 +3297,13 @@ async fn emit_lag_and_observed(
 /// corruption of the `(shard, seq)` identity the whole feature rests on.
 /// Acquiring the exact pool can at worst skip a shard, loudly. See the comment
 /// in the match arm for the full reasoning and its cost.
+///
+/// # Claim-scan index (issue #1667)
+///
+/// On the unsharded fallback this primitive never builds the claim-scan index.
+/// Each call reads the index catalog once, and logs the build statement hourly
+/// while the index is missing. The caller sets the cost with its call cadence.
+/// The dedicated export task throttles the same probe and builds the index.
 ///
 /// # Errors
 /// Returns `HarvestError` if a database query fails. A sink's transport
@@ -5250,26 +5247,6 @@ mod tests {
             index_probe_due(&other_pool),
             "another pool has its own gate"
         );
-    }
-
-    /// Issue #1667: the direct export path has no pool. Its probe key names
-    /// the connection instead. A new connection gets a fresh gate, a reused one
-    /// is throttled, and the key never equals a pooled checker's key.
-    #[cfg(feature = "db")]
-    #[test]
-    fn the_direct_probe_key_names_the_connection() {
-        let first = direct_probe_key(9_007, 100);
-        let second = direct_probe_key(9_007, 200);
-        assert_ne!(first, second);
-        assert_eq!(first, direct_probe_key(9_007, 100));
-        let pooled: ProbeKey = (9_007, String::new(), 100);
-        assert_ne!(
-            first, pooled,
-            "a direct key must not collide with a pooled key"
-        );
-        assert!(index_probe_due(&first));
-        assert!(!index_probe_due(&first), "a reused connection is throttled");
-        assert!(index_probe_due(&second), "a new connection probes at once");
     }
 
     /// Issue #1667: a privilege failure is the one error a retry cannot fix.
