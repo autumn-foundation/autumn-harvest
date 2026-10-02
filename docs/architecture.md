@@ -1702,8 +1702,11 @@ randomized- and model-checking-based testing layers:
   in the production code path.
 * [`docs/testing/loom.md`](testing/loom.md) — permutation-testing
   concurrent Rust with [Loom](https://github.com/tokio-rs/loom).
+* [`docs/testing/shuttle.md`](testing/shuttle.md) — async model checking
+  with [Shuttle](https://github.com/awslabs/shuttle) for `slot_tuner.rs` and
+  `heartbeat.rs` (issue #1800).
 * [`docs/testing/concurrency-model-checking.md`](testing/concurrency-model-checking.md)
-  — the evaluation of loom / Shuttle / Turmoil behind the loom adoption above.
+  — the evaluation of loom / Shuttle / Turmoil behind the adoptions above.
 
 ---
 

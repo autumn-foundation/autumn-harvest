@@ -679,6 +679,17 @@ jobs:
           python3 -m openapi_spec_validator docs/openapi.json
           python3 -m openapi_spec_validator autumn-harvest-plugin/openapi.json
 
+      # Workflow YAML parse check (see docs/audits/workflow-yaml-parse.py).
+      # GitHub runs an unparsable workflow file as a zero-job failed run on
+      # every push and never fires its triggers. chaos.yml sat in that state
+      # from its first commit, so its nightly suite never ran. Runs after
+      # `setup-python` above, which is where PyYAML can be installed. The pin
+      # keeps a PyYAML release from reddening lint.
+      - name: Workflow YAML parses (docs/audits/workflow-yaml-parse.py)
+        run: |
+          python3 -m pip install --quiet --disable-pip-version-check "PyYAML==6.0.2"
+          python3 docs/audits/workflow-yaml-parse.py
+
       # The contract is what the OpenAPI document is generated from, so a
       # status or a mandatory field missing there is missing from every
       # generated client. Reads api.rs and the contract, builds nothing.
@@ -1309,6 +1320,14 @@ jobs:
       matrix:
         shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
     runs-on: ubuntu-latest
+    # The shard count and index live here once. The pre-pull step and the
+    # suite step both read them, so a re-shard cannot leave the pre-pull
+    # asking about a different assignment than the suites run under. Keep
+    # the count equal to the `matrix.shard` list above. The partitioned pass
+    # at the end of this job overrides the count to run whole.
+    env:
+      SEMAPHORE_SHARD_COUNT: "21"
+      SEMAPHORE_SHARD_INDEX: ${{ matrix.shard }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -1343,12 +1362,23 @@ jobs:
       # `postgres:16-alpine` (one outlier suite's override), and `redis:5.0`
       # (Redis's default, un-overridden anywhere; needed by the issue #1312
       # dispatch suites this job also forces via HARVEST_TEST_REQUIRE_REDIS
-      # below).
+      # below), and `softwaremill/elasticmq:1.5.2` on the one shard that runs the
+      # `connector_sqs_broker` suite (its ElasticMQ default, which "bytes
+      # remaining on stream" failed on PR #1773 because it was not pre-pulled).
       - name: Pre-pull Docker test images (retry transient pull failures)
         if: needs.changes.outputs.code == 'true'
         shell: bash
         run: |
-          for image in postgres:11-alpine postgres:16 postgres:16-alpine redis:5.0; do
+          images="postgres:11-alpine postgres:16 postgres:16-alpine redis:5.0"
+          # Pull ElasticMQ only on the shard that runs `connector_sqs_broker`.
+          # The dry run prints this shard's cargo invocations without running
+          # them, so no shard number is hardcoded here. It is captured first:
+          # `grep -q` closing a pipe early would trip `pipefail`.
+          plan="$(DRY_RUN=1 bash .github/ci/run-suites.sh run linux)"
+          if grep -q -- '--test connector_sqs_broker' <<<"$plan"; then
+            images="$images softwaremill/elasticmq:1.5.2"
+          fi
+          for image in $images; do
             for attempt in 1 2 3 4 5; do
               if docker pull "$image"; then
                 continue 2
@@ -1378,8 +1408,6 @@ jobs:
           # into a panic, so "the Redis suites stopped testing anything" is a
           # red build here rather than a silent green.
           HARVEST_TEST_REQUIRE_REDIS: "1"
-          SEMAPHORE_SHARD_COUNT: "21"
-          SEMAPHORE_SHARD_INDEX: ${{ matrix.shard }}
         run: bash .github/ci/run-suites.sh run linux
       # Issue #958, AC2: re-run the store/replay/retention suites against the
       # opt-in PARTITIONED `harvest_events` layout. Same suites, same
@@ -1391,6 +1419,10 @@ jobs:
       - name: Integration suites (partitioned harvest_events layout)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 0
         shell: bash
+        env:
+          # Empty count: run-suites.sh treats it as unsharded, so this pass
+          # runs all its rows on this one shard.
+          SEMAPHORE_SHARD_COUNT: ""
         run: bash .github/ci/run-suites.sh run linuxpart
 
   quickstart:
@@ -1793,6 +1825,60 @@ jobs:
       # `runner.rs` never reach the MSRV compiler. Issue #1312.
       - name: Check MSRV compiles (autumn-harvest-plugin redis feature, issue #1312)
         run: cargo check -p autumn-harvest-plugin --features redis
+
+  # Concurrency model checking (issue #1800). The loom and Shuttle targets
+  # compile to empty crates unless RUSTFLAGS sets their cfg, so a normal
+  # `cargo test` never runs them. Each cfg rebuilds the crate, so each target
+  # has its own job and its own cache. Both use --no-default-features: under
+  # --cfg loom, tokio drops its `net` module, which `tokio-postgres` needs.
+  # Under --cfg shuttle, `slot_tuner` takes the Shuttle semaphore, which the
+  # db-gated `worker.rs` does not pass. See docs/testing/loom.md and
+  # docs/testing/shuttle.md. The guard in
+  # autumn-harvest/tests/integration/concurrency_model_ci.rs asserts this
+  # wiring.
+  #
+  # Branch protection lists required checks by name. Add "Loom models" and
+  # "Shuttle models" there to make these jobs required. A job that `if:`
+  # skips reports success, so a docs-only PR does not wait on them.
+  loom:
+    name: Loom models
+    needs: changes
+    # Draft-skip (see lint) + docs-only skip via the `changes` guard.
+    if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    # The models run in under a second. The compile under --cfg loom is the
+    # bulk of the time.
+    timeout-minutes: 30
+    env:
+      RUSTFLAGS: "--cfg loom"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run loom models
+        run: cargo test -p autumn-harvest --no-default-features --test loom_models --release
+
+  shuttle:
+    name: Shuttle models
+    needs: changes
+    # Draft-skip (see lint) + docs-only skip via the `changes` guard.
+    if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    # The models run in under a second. The compile under --cfg shuttle is
+    # the bulk of the time.
+    timeout-minutes: 30
+    env:
+      RUSTFLAGS: "--cfg shuttle"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run Shuttle models (random and PCT schedulers)
+        run: cargo test -p autumn-harvest --no-default-features --test shuttle_models --release
 
   # Dependency ledger harness (Ballast). Runs `cargo deny check` against
   # `deny.toml`: advisories (RUSTSEC, joined against the lockfile — every
