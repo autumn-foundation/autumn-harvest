@@ -5499,7 +5499,8 @@ async fn export_delivers_while_the_background_build_waits() {
         );
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    assert_eq!(unexported_idx_state(&mut conn).await, Some(false));
+    // The build may not have started yet. It cannot be valid while the snapshot is open.
+    assert_ne!(unexported_idx_state(&mut conn).await, Some(true));
     old_txn.batch_execute("COMMIT").await.expect("commit");
     // Let the build finish, so it clears its process-wide retry gate.
     while unexported_idx_state(&mut conn).await != Some(true) {
