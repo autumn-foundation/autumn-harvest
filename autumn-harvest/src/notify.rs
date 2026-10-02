@@ -803,6 +803,9 @@ async fn stage(conn: &mut AsyncPgConnection, notes: Vec<Note>) -> HarvestResult<
     {
         start_deferred(&runtime);
     }
+    // Outside a diesel transaction, the stage reads `txid_current_if_assigned()`.
+    // The fallback reuses that reading to find a raw `BEGIN` block.
+    let mut raw_block = RawBlock::Unknown;
     if any_sink() {
         let in_tx = in_transaction(conn);
         // Inside a diesel transaction, `txid_current()` assigns an id when
@@ -824,6 +827,9 @@ async fn stage(conn: &mut AsyncPgConnection, notes: Vec<Note>) -> HarvestResult<
         .await;
         match row {
             Ok(row) => {
+                if !in_tx {
+                    raw_block = RawBlock::from_txid(row.txid);
+                }
                 let fingerprint = Fingerprint {
                     database: row.database,
                     started_at: row.started_at,
@@ -838,7 +844,7 @@ async fn stage(conn: &mut AsyncPgConnection, notes: Vec<Note>) -> HarvestResult<
             Err(_) => {}
         }
     }
-    send_on_write_connection(conn, notes).await
+    send_on_write_connection(conn, notes, raw_block).await
 }
 
 /// The fallback: send `notes` on the write connection.
@@ -855,6 +861,7 @@ async fn stage(conn: &mut AsyncPgConnection, notes: Vec<Note>) -> HarvestResult<
 async fn send_on_write_connection(
     conn: &mut AsyncPgConnection,
     notes: Vec<Note>,
+    raw_block: RawBlock,
 ) -> HarvestResult<()> {
     let rejected = notes.iter().filter(|n| !valid_channel(n.channel())).count();
     record_failures(rejected, &"Postgres rejects the channel name");
@@ -864,7 +871,7 @@ async fn send_on_write_connection(
     }
     let count = wakes.len();
     if !in_transaction(conn) {
-        return send_outside_diesel_transaction(conn, wakes, count).await;
+        return send_outside_diesel_transaction(conn, wakes, count, raw_block).await;
     }
     let result = Box::pin(
         conn.transaction::<(), diesel::result::Error, _>(async |conn| {
@@ -882,12 +889,37 @@ async fn send_on_write_connection(
     Ok(())
 }
 
+/// Whether a connection that diesel tracks no transaction on is inside a raw
+/// `BEGIN` block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RawBlock {
+    /// Not read yet.
+    Unknown,
+    /// Autocommit, or a block that has not written yet.
+    Outside,
+    /// A block that has written, so it has a transaction id.
+    Inside,
+}
+
+impl RawBlock {
+    /// Classify a reading of `txid_current_if_assigned()`.
+    const fn from_txid(txid: Option<i64>) -> Self {
+        if txid.is_some() {
+            Self::Inside
+        } else {
+            Self::Outside
+        }
+    }
+}
+
 /// The fallback when diesel tracks no transaction on `conn`.
 ///
-/// A raw `BEGIN` opens a block that diesel does not see. `SAVEPOINT` works
-/// only inside a block, so it tells the two cases apart. In a block, the send
-/// runs behind the savepoint, so its error cannot abort the write. Outside
-/// one, the write already committed, so the send goes at once.
+/// A raw `BEGIN` opens a block that diesel does not see. Only a block that
+/// has written has a transaction id, so `txid_current_if_assigned()` tells the
+/// two cases apart without an error. `raw_block` carries that reading when the
+/// stage already took it. In a block, the send runs behind a savepoint, so its
+/// error cannot abort the write. Outside one, the write already committed, so
+/// the send goes at once.
 ///
 /// # Errors
 ///
@@ -897,18 +929,29 @@ async fn send_outside_diesel_transaction(
     conn: &mut AsyncPgConnection,
     wakes: Vec<(String, String)>,
     count: usize,
+    raw_block: RawBlock,
 ) -> HarvestResult<()> {
     use diesel_async::SimpleAsyncConnection as _;
-    if conn
-        .batch_execute("SAVEPOINT harvest_notify_fallback")
-        .await
-        .is_err()
-    {
+    let raw_block = match raw_block {
+        RawBlock::Unknown => RawBlock::from_txid(
+            diesel::select(diesel::dsl::sql::<
+                diesel::sql_types::Nullable<diesel::sql_types::BigInt>,
+            >("txid_current_if_assigned()"))
+            .get_result::<Option<i64>>(conn)
+            .await
+            .unwrap_or(None),
+        ),
+        known => known,
+    };
+    if raw_block != RawBlock::Inside {
         if let Err(error) = send_wakes(conn, wakes).await {
             record_failures(count, &error);
         }
         return Ok(());
     }
+    conn.batch_execute("SAVEPOINT harvest_notify_fallback")
+        .await
+        .map_err(crate::error::database_error)?;
     let undo = match send_wakes(conn, wakes).await {
         Ok(()) => "RELEASE SAVEPOINT harvest_notify_fallback",
         Err(error) => {
