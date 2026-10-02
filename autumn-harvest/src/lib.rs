@@ -1,5 +1,13 @@
 //! Durable workflow orchestration engine core.
 
+// Clippy 1.99 flags code that derive macros generate. The diesel
+// `QueryableByName` derive emits `field: field` initializers, and the span
+// points at the user's field. Fixing the user's code cannot clear the lint.
+#![allow(clippy::redundant_field_names)]
+// `assert!(x.is_empty())` is the plain form. The suggested `assert_eq!` needs
+// an explicit empty-array type at every call site.
+#![allow(clippy::assert_is_empty)]
+
 /// Embedded migrations for the harvest engine schema.
 ///
 /// Downstream crates (such as `autumn-harvest-plugin`) should consume this

@@ -150,6 +150,8 @@ impl Default for DispatchSettings {
 /// Implementations deliver each published reference at least once. They do
 /// not need to persist references: the worker's reconcile sweep republishes
 /// every due `PENDING` row that the channel does not hold.
+// `async_trait` adds a `must_use` attribute that clippy 1.99 reports as a duplicate.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait TaskDispatch: Send + Sync + std::fmt::Debug {
     /// Publish references, keyed on `scheduled_at`.
