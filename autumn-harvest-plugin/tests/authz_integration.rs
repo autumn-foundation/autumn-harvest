@@ -12,10 +12,13 @@
 //!   - the shard comes from an execution id, a query parameter, or a start body
 //!   - the authorizer cannot widen what a token scope allows
 //!   - every deny writes an `authz.deny` audit row that the SIEM export claims
+//!   - a cutover between the hook and the handler is fenced with `503`, and
+//!     the handler touches nothing on the new shard
 
 #![allow(clippy::too_many_lines)]
 #![allow(clippy::items_after_statements)]
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use autumn_harvest::audit::RouteClass;
@@ -29,7 +32,9 @@ use autumn_harvest_plugin::api::{
     harvest_api_router,
 };
 use autumn_harvest_plugin::api_token::TokenScope;
-use autumn_harvest_plugin::authz::{AuthzDecision, AuthzPrincipal, AuthzRequest};
+use autumn_harvest_plugin::authz::{
+    AuthzDecision, AuthzFuture, AuthzPrincipal, AuthzRequest, HarvestAuthorizer,
+};
 use autumn_harvest_plugin::harvest_ui_router;
 use autumn_web::reexports::axum;
 use axum::body::Body;
@@ -641,6 +646,13 @@ async fn rebalanced_execution_is_checked_on_its_live_shard() {
 /// A two-shard app: shard 0 on `entry_pool`, shard 7 on `live_pool`, with a
 /// hook that denies shard 7.
 fn two_shard_app(entry_pool: &DbPool, live_pool: DbPool) -> App {
+    let state = two_shard_state(entry_pool, live_pool);
+    authorized_app_with_state(&state, deny_shard_7)
+}
+
+/// The state of a two-shard app: shard 0 on `entry_pool`, shard 7 on
+/// `live_pool`. Shard 0 is the default shard.
+fn two_shard_state(entry_pool: &DbPool, live_pool: DbPool) -> HarvestApiState {
     let shards = vec![ShardId::new(0), ShardId::new(7)];
     let state = HarvestApiState::new();
     state.install_storage_pool(HarvestDbPool::from(ShardedDbPool::from_map(
@@ -662,7 +674,7 @@ fn two_shard_app(entry_pool: &DbPool, live_pool: DbPool) -> App {
         HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
         ShardRouter::new(shards.clone(), shards, ShardId::new(0)),
     ));
-    authorized_app_with_state(&state, deny_shard_7)
+    state
 }
 
 /// Insert a bare execution row.
@@ -732,6 +744,205 @@ async fn retry_chain_attempts_are_checked_on_their_shards() {
         "history reads only attempt 1"
     );
     assert_eq!(deny_rows(&mut conn).await.len(), 1);
+}
+
+/// Move `exec` from shard 0 to shard 7 the way a rebalance cutover leaves it.
+/// The entry database keeps a sealed `MIGRATED` row that forwards to shard 7.
+/// The shard 7 database holds the live row.
+///
+/// Uses its own connections, so the app's pool for shard 7 stays untouched.
+async fn cut_over_to_shard_7(entry_url: &str, live_url: &str, exec: ExecutionId) {
+    use diesel_async::AsyncConnection;
+    let mut entry = AsyncPgConnection::establish(entry_url)
+        .await
+        .expect("entry connect");
+    let mut live = AsyncPgConnection::establish(live_url)
+        .await
+        .expect("live connect");
+    insert_execution(&mut live, exec, "RUNNING", None, None).await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions \
+         SET state = 'MIGRATED', migrated_to_shard = 7, migrated_at = NOW() \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec.as_uuid())
+    .execute(&mut entry)
+    .await
+    .expect("seal entry row");
+}
+
+/// The state of `exec` on the database at `url`, if it has a row there.
+async fn execution_state(url: &str, exec: ExecutionId) -> Option<String> {
+    use diesel::OptionalExtension;
+    use diesel_async::AsyncConnection;
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        state: String,
+    }
+    let mut conn = AsyncPgConnection::establish(url).await.expect("connect");
+    diesel::sql_query("SELECT state FROM harvest_workflow_executions WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(exec.as_uuid())
+        .get_result::<Row>(&mut conn)
+        .await
+        .optional()
+        .expect("read state")
+        .map(|r| r.state)
+}
+
+/// A policy that allows shard 0 and denies shard 7. The first time it allows
+/// shard 0 for `exec`, it also cuts `exec` over to shard 7. The hook has
+/// already resolved and checked shard 0 at that point, and the handler has
+/// not run yet. That is the window a concurrent rebalance cutover can hit.
+struct CutoverAfterCheck {
+    entry_url: String,
+    live_url: String,
+    exec: ExecutionId,
+    cut: AtomicBool,
+}
+
+impl HarvestAuthorizer for CutoverAfterCheck {
+    fn authorize<'a>(&'a self, request: &'a AuthzRequest<'a>) -> AuthzFuture<'a> {
+        Box::pin(async move {
+            match request.shard {
+                Some(shard) if shard == ShardId::new(7) => {
+                    AuthzDecision::deny("shard 7 is out of region")
+                }
+                Some(shard) if shard == ShardId::new(0) => {
+                    if !self.cut.swap(true, Ordering::SeqCst) {
+                        cut_over_to_shard_7(&self.entry_url, &self.live_url, self.exec).await;
+                    }
+                    AuthzDecision::Allow
+                }
+                _ => AuthzDecision::Allow,
+            }
+        })
+    }
+}
+
+/// A cutover between the hook's check and the handler cannot lead the
+/// handler onto a shard the policy denies. The handler gets `503`, reads and
+/// writes nothing on the new shard, and the retry is checked on that shard.
+#[tokio::test]
+async fn cutover_between_hook_and_handler_is_fenced() {
+    let (url, _c) = setup_database().await;
+    let entry_pool = build_pool(&url);
+    let live_url = second_database(&url).await;
+    // The app's own pool for shard 7. The test never uses it, so its size
+    // counts the handler's checkouts on shard 7 exactly.
+    let live_pool = build_pool(&live_url);
+    let mut conn = entry_pool.get().await.unwrap();
+    scrub(&mut conn).await;
+
+    let exec = ExecutionId::new_for_shard(ShardId::new(0));
+    insert_execution(&mut conn, exec, "RUNNING", None, None).await;
+    let state = two_shard_state(&entry_pool, live_pool.clone());
+    let app = StandaloneAdminAuth::new()
+        .with_api_tokens()
+        .with_admin_auth_boundary()
+        .with_authorizer(CutoverAfterCheck {
+            entry_url: url.clone(),
+            live_url: live_url.clone(),
+            exec,
+            cut: AtomicBool::new(false),
+        })
+        .mount(composed_router(&state), &state);
+
+    // The hook checks shard 0. The policy allows it and cuts the run over to
+    // shard 7. The handler then follows the forward onto shard 7.
+    let (status, body) = send(
+        &app,
+        Call::new("POST", &format!("/workflows/{exec}/cancel")).body(json!({})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the fence must stop the handler: {body:?}"
+    );
+    let text = body.to_string();
+    assert!(text.contains("retry"), "a retry hint: {text}");
+    assert!(
+        !text.contains("out of region"),
+        "the deny reason stays out of the response: {text}"
+    );
+    assert_eq!(
+        live_pool.status().size,
+        0,
+        "the handler checked out nothing on shard 7"
+    );
+    assert_eq!(
+        execution_state(&live_url, exec).await.as_deref(),
+        Some("RUNNING"),
+        "the handler wrote nothing on shard 7"
+    );
+    assert!(
+        deny_rows(&mut conn).await.is_empty(),
+        "a fenced miss is not a policy deny"
+    );
+
+    // The retry is checked on the shard the run lives on now.
+    let (status, _) = send(
+        &app,
+        Call::new("POST", &format!("/workflows/{exec}/cancel")).body(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "the retry sees shard 7");
+    let rows = deny_rows(&mut conn).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].shard_id, Some(7));
+    assert_eq!(
+        execution_state(&live_url, exec).await.as_deref(),
+        Some("RUNNING")
+    );
+
+    // The happy path: a run that stays on shard 0 is cancelled.
+    let steady = ExecutionId::new_for_shard(ShardId::new(0));
+    insert_execution(&mut conn, steady, "RUNNING", None, None).await;
+    let (status, body) = send(
+        &app,
+        Call::new("POST", &format!("/workflows/{steady}/cancel")).body(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body:?}");
+    assert_eq!(
+        execution_state(&url, steady).await.as_deref(),
+        Some("CANCELLED")
+    );
+    assert_eq!(deny_rows(&mut conn).await.len(), 1);
+}
+
+/// With no authorizer, no fence is installed. The handler follows the
+/// forward onto the new shard, as it did before the hook existed.
+#[tokio::test]
+async fn cutover_without_an_authorizer_is_followed() {
+    let (url, _c) = setup_database().await;
+    let entry_pool = build_pool(&url);
+    let live_url = second_database(&url).await;
+    let live_pool = build_pool(&live_url);
+    let mut conn = entry_pool.get().await.unwrap();
+    scrub(&mut conn).await;
+
+    let exec = ExecutionId::new_for_shard(ShardId::new(0));
+    insert_execution(&mut conn, exec, "RUNNING", None, None).await;
+    cut_over_to_shard_7(&url, &live_url, exec).await;
+    let state = two_shard_state(&entry_pool, live_pool.clone());
+    let app = StandaloneAdminAuth::new()
+        .with_api_tokens()
+        .with_admin_auth_boundary()
+        .mount(composed_router(&state), &state);
+
+    let (status, body) = send(
+        &app,
+        Call::new("POST", &format!("/workflows/{exec}/cancel")).body(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body:?}");
+    assert!(live_pool.status().size >= 1, "the handler reached shard 7");
+    assert_eq!(
+        execution_state(&live_url, exec).await.as_deref(),
+        Some("CANCELLED")
+    );
 }
 
 /// A lineage route reads every shard for descendants, so the hook also sees

@@ -13,6 +13,12 @@
 //!   deny. It cannot grant what a token scope withholds.
 //! - A deny returns `403` with a generic body. The deny reason goes only to the
 //!   audit row ([`autumn_harvest::audit::OP_AUTHZ_DENY`]).
+//! - An allow fences the handler to the shards the policy saw
+//!   ([`autumn_harvest::shard_fence`]). A rebalance cutover after the check
+//!   cannot lead the handler onto a shard the policy never saw. A checkout
+//!   outside the fence gets `503` with a retry hint, and the retry is
+//!   authorized on the run's new shard. A request the policy saw with
+//!   `shard: None` gets no fence.
 //! - The default is no hook. The router is then byte-for-byte unchanged.
 //!
 //! # Inputs
@@ -55,6 +61,7 @@ use autumn_harvest::audit::{
 };
 use autumn_harvest::models::NewAuditRecord;
 use autumn_harvest::shard::ShardPlacement;
+use autumn_harvest::shard_fence::ShardFence;
 use autumn_harvest::types::ShardId;
 
 use crate::api::{
@@ -402,6 +409,12 @@ fn shard_number(raw: i64) -> Option<ShardId> {
 /// so the request gets `503`. An unknown id adds no attempts; the handler
 /// answers `404`.
 ///
+/// The walks run under [`autumn_harvest::shard_fence::record`]. Every shard
+/// a walk names, such as a forwarding hop or an attempt's own entry shard,
+/// is in the result. The handler runs the same walk under the fence, so it
+/// names the same shards. A request whose run has not moved never trips its
+/// own fence.
+///
 /// A retired shard resolves to its successor. With a storage pool, an id with
 /// no encoded shard resolves to the default shard. With no pool, it has none.
 async fn path_shards(
@@ -423,19 +436,25 @@ async fn path_shards(
         tracing::warn!(error = %e, path = %path, "harvest: authz could not resolve shard");
         StatusCode::SERVICE_UNAVAILABLE
     };
-    let (mut conn, live) =
-        autumn_harvest::shard_rebalance::conn_for_execution_forwarded_with_shard(pool, exec_id)
-            .await
-            .map_err(|e| unavailable(&e))?;
-    let mut shards = vec![pool.routed_shard_for_execution(exec_id), live];
-    if !follows_retry_chain(method, path) {
-        return Ok(shards);
-    }
-    match autumn_harvest::execution::walk_retry_chain(&mut conn, pool, live, exec_id).await {
-        Ok(chain) => shards.extend(chain.into_iter().map(|(_, shard)| shard)),
-        Err(autumn_harvest::HarvestError::NotFound(_)) => {}
-        Err(e) => return Err(unavailable(&e)),
-    }
+    let retry_chain = follows_retry_chain(method, path);
+    let (resolved, named) = autumn_harvest::shard_fence::record(async {
+        let (mut conn, live) =
+            autumn_harvest::shard_rebalance::conn_for_execution_forwarded_with_shard(pool, exec_id)
+                .await?;
+        let mut shards = vec![pool.routed_shard_for_execution(exec_id), live];
+        if !retry_chain {
+            return Ok(shards);
+        }
+        match autumn_harvest::execution::walk_retry_chain(&mut conn, pool, live, exec_id).await {
+            Ok(chain) => shards.extend(chain.into_iter().map(|(_, shard)| shard)),
+            Err(autumn_harvest::HarvestError::NotFound(_)) => {}
+            Err(e) => return Err(e),
+        }
+        Ok::<_, autumn_harvest::HarvestError>(shards)
+    })
+    .await;
+    let mut shards = resolved.map_err(|e| unavailable(&e))?;
+    shards.extend(named);
     Ok(shards)
 }
 
@@ -636,10 +655,15 @@ pub(crate) async fn enforce_authorizer(
             });
     let route_class = classify_route(&method, &path);
     let fan_out = matches!(source, Some(ShardSource::FanOut));
-    let mut candidates: Vec<Option<ShardId>> = shards.into_iter().map(Some).collect();
+    let mut candidates: Vec<Option<ShardId>> = shards.iter().copied().map(Some).collect();
     if candidates.is_empty() || fan_out {
         candidates.push(None);
     }
+    // The policy sees `None` when the handler reads every shard by design.
+    // Such a request gets no fence. Every other request is fenced to the
+    // shards the policy saw. A cutover after this check then cannot lead the
+    // handler onto a shard the policy never decided on.
+    let fence = (!candidates.contains(&None)).then(|| ShardFence::new(shards));
 
     for shard in candidates {
         let authz = AuthzRequest::new(principal, route_class, &method, &path, request.extensions())
@@ -684,7 +708,10 @@ pub(crate) async fn enforce_authorizer(
         }
         return forbidden();
     }
-    next.run(request).await
+    match fence {
+        Some(fence) => fence.scope(next.run(request)).await,
+        None => next.run(request).await,
+    }
 }
 
 #[cfg(test)]

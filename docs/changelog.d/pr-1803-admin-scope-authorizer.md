@@ -25,6 +25,15 @@ capability.
   field. A shard named anywhere else is ignored, so a caller cannot show the
   hook one shard while the handler reads all of them. The lineage routes
   (`/children`, `/tree`) read every shard, so the hook also sees `None`.
+- **Shard fence.** An allow fences the handler to the shards the policy saw
+  (`autumn_harvest::shard_fence`, a task-local set). A rebalance cutover
+  between the check and the handler moves a run to a new shard. Every
+  shard-named checkout in `shard_rebalance` checks the fence first, so the
+  handler reads and writes nothing on that shard. The caller gets `503` with
+  a retry hint (`HarvestError::OutsideShardFence`), never `403`, and the retry
+  is checked on the new shard. A request the policy saw with `shard: None`
+  gets no fence. Control rows on the default pool are not fenced. With no
+  hook, no fence exists.
 - **Admin prefixes.** Any mutation under `/admin/tokens`, `/admin/modules` or
   `/modules` is admin-only, even if `ADMIN_SCOPE_ROUTES` does not list it.
 - **Deny audit.** Every token scope deny and every hook deny writes an
@@ -38,14 +47,18 @@ widens the `scope` CHECK only. No `WorkflowEvent` variant, no change to
 `harvest_events`, no replay impact.
 
 **Behavior change.** A `mutate` token that minted or revoked tokens now gets
-`403`. Mint an `admin` token for that caller.
+`403`. Mint an `admin` token for that caller. With a hook installed, a request
+whose run moves between the check and the handler gets `503`. Retry it.
 
 **Tests.** `authz_integration.rs` covers these cases. A `mutate` mint or
 revoke gets `403`, is audited, and changes nothing. A `mutate` token is denied
 exactly the admin routes. An `admin` token mints and revokes. A hook denies by
 tenant key, and by shard from the path, `/ui`, query, start body, residency key
 and other bodies. A rebalanced run and a moved retry attempt are checked on
-their live shards. A query shard on a route that ignores it is not read. A hook
-cannot widen a scope. Deny rows reach an audit export claim. Unit tests cover the scope decision, the admin route matcher,
-execution-id decoding, query and body shard parsing, and the guard tests in
-`audit.rs`.
+their live shards. A cutover between the hook and the handler gets `503`, the
+handler checks out nothing on the new shard, and the retry is denied on that
+shard. With no hook, the handler follows the cutover as before. A query shard
+on a route that ignores it is not read. A hook cannot widen a scope. Deny rows
+reach an audit export claim. Unit tests cover the scope decision, the admin
+route matcher, execution-id decoding, query and body shard parsing, the fence
+scope in `shard_fence.rs`, and the guard tests in `audit.rs`.

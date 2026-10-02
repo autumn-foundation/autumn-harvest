@@ -4051,6 +4051,9 @@ mod db {
         let forwarded = !exec_id.shard().is_unencoded() && origin != exec_id.shard();
         let mut current = origin;
         for hop in 0..MAX_FORWARD_HOPS {
+            // A hop that reads on the held connection makes no checkout, so
+            // the shard fence is checked here for every hop (issue #1803).
+            crate::shard_fence::check(current)?;
             // The ORIGIN hop is tolerant (see `checkout_entry`) unless routing
             // already forwarded it, exactly like `resolve_execution_shard`.
             // Every hop after it names one specific database, and must fail
@@ -4422,6 +4425,9 @@ mod db {
         held_shard: ShardId,
         target_shard: ShardId,
     ) -> HarvestResult<ResidentConn<'a>> {
+        // The held branch makes no checkout, so the shard fence is checked
+        // here for both branches (issue #1803).
+        crate::shard_fence::check(target_shard)?;
         if target_shard == held_shard || pool.same_physical_pool(target_shard, held_shard) {
             return Ok(ResidentConn::Held(held_conn));
         }
@@ -4538,6 +4544,10 @@ mod db {
         } else {
             pool.default_shard()
         };
+        // The entry hop bypasses `checkout_entry`, so it checks the shard
+        // fence itself (issue #1803). The fence names `origin`, the shard
+        // the authorizer hook showed the policy, as `checkout_entry` does.
+        crate::shard_fence::check(origin)?;
         let mut conn = pool.pool_for_execution(exec_id).get().await.map_err(|e| {
             HarvestError::ShardUnavailable {
                 shard_id: origin.as_i32(),
@@ -4554,6 +4564,10 @@ mod db {
             let Some(next) = read_forward(&mut conn, exec_id).await? else {
                 return Ok((conn, current));
             };
+            // A pointer names the shard the run lives on now. The fence
+            // decides on that name before any read there, also when the
+            // aliasing shortcut below reuses `conn` (issue #1803).
+            crate::shard_fence::check(next)?;
             // A pre-split staging rollout can alias `next` onto `current`'s
             // own physical pool (issue #1596 follow-up review, comment
             // 4054062532). An unconditional checkout here would wait on
@@ -4828,10 +4842,15 @@ mod db {
     /// Each of those names one specific database, and a silent fallback to the
     /// default there would resolve the run to the wrong shard -- or, on the
     /// erase path, scrub the wrong copy.
+    ///
+    /// The fence check names `shard`, not the pool the fallback reaches. The
+    /// authorizer hook shows the policy the shard an id routes to, and the
+    /// fallback is a deployment detail below that name (issue #1803).
     async fn checkout_entry(
         pool: &ShardedDbPool,
         shard: ShardId,
     ) -> HarvestResult<diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>> {
+        crate::shard_fence::check(shard)?;
         pool.pool_for(shard)
             .get()
             .await
@@ -4841,10 +4860,15 @@ mod db {
             })
     }
 
+    /// Check out a connection to exactly `shard`, with no fallback.
+    ///
+    /// This is the one checkout every forwarding hop goes through, so the
+    /// shard fence (issue #1803) is checked here before the pool is touched.
     async fn checkout(
         pool: &ShardedDbPool,
         shard: ShardId,
     ) -> HarvestResult<diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>> {
+        crate::shard_fence::check(shard)?;
         let shard_pool =
             pool.exact_pool_for(shard)
                 .ok_or_else(|| HarvestError::ShardUnavailable {

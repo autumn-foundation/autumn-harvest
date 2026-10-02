@@ -450,11 +450,17 @@ shard by hash. To confine a caller to some shards, deny `None` too.
   each later attempt in the retry chain (`authz::RETRY_CHAIN_ROUTES`). The
   hook uses the same walks as the handlers. This costs a few indexed lookups per request. If a walk fails, the
   request gets `503`, because the handler would fail the same walk.
-- **The check is point in time.** A rebalance cutover that runs between the
-  hook and the handler can move a run to a new shard. The handler then acts on
-  that shard without a second check. Only an operator starts a rebalance, so a
-  caller cannot open this window. Keep confined tenants off shards that a
-  rebalance in progress targets.
+- **A cutover after the check is fenced.** The hook fences the handler to the
+  shards the policy allowed (`autumn_harvest::shard_fence`). A rebalance
+  cutover between the check and the handler moves a run to a new shard. The
+  handler then names that shard at its first checkout, and the fence refuses
+  the checkout before any read or write there. The caller gets `503` with a
+  retry hint. The retry resolves the run on its new shard, and the policy
+  decides on that shard. The fence never widens access. A fenced miss writes
+  no `authz.deny` row, because the policy did not deny. A request the policy
+  saw with `shard: None` gets no fence, because its handler reads every shard
+  by design. Control rows (audit, tokens, gates) are reached through the
+  default pool, which names no shard, so the fence does not apply to them.
 - **The hook does not cover the app-level MCP tool routes or webhook routes.**
   They live outside the management router.
 - **A panic in the hook aborts the request.** It never lets it through.

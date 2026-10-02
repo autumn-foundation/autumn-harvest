@@ -406,6 +406,8 @@ pub mod schema_contract;
 /// Worker session fleet-side registry and pure decision functions (issue #606).
 pub mod sessions;
 pub mod shard;
+/// A task-local fence on the shards one request may reach (issue #1803).
+pub mod shard_fence;
 /// Shard rebalancing: migrating quiescent workflow executions across shards
 /// (issue #964).
 pub mod shard_rebalance;

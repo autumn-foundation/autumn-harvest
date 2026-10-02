@@ -43870,8 +43870,13 @@ async fn stream_execution_events(
     let keepalive_interval = api_state.sse_keepalive_interval();
     let api_clone = api_state.clone();
 
+    // The producer re-resolves the run on every poll. It runs under the
+    // request's shard fence, so a cutover mid-stream cannot lead it onto a
+    // shard the authorizer never saw (issue #1803).
+    let fence = ::autumn_harvest::shard_fence::current();
+
     // Producer task: runs independently of the HTTP handler after we return
-    tokio::spawn(async move {
+    tokio::spawn(::autumn_harvest::shard_fence::scoped(fence, async move {
         use autumn_harvest::audit::OP_EXECUTION_STREAM_CLOSE;
 
         // Frames are built by sse_frame_data: the inner payload of the
@@ -44260,7 +44265,7 @@ async fn stream_execution_events(
             };
             let _ = audit::insert_audit(&mut conn, &ar).await;
         }
-    });
+    }));
 
     // Return the SSE response. axum's KeepAlive wrapper sends `: ping\n\n`
     // comments every keepalive_interval so proxies don't idle the connection.
@@ -44459,8 +44464,10 @@ async fn stream_workflow_progress(
         let _ = tx.try_send(Ok(Event::default().event("end").data(end_data)));
     } else {
         let api_clone = api_state.clone();
+        // The producer runs under the request's shard fence (issue #1803).
+        let fence = ::autumn_harvest::shard_fence::current();
         // Producer task: runs independently of the HTTP handler after we return.
-        tokio::spawn(async move {
+        tokio::spawn(::autumn_harvest::shard_fence::scoped(fence, async move {
             // Emit a progress chunk NON-BLOCKING. Returns `false` when the
             // receiver has been dropped (client disconnected) so the caller
             // ends the stream; a full channel (slow consumer) DROPS the chunk
@@ -44570,7 +44577,7 @@ async fn stream_workflow_progress(
                     Err(_) => break,
                 }
             }
-        });
+        }));
     }
 
     Sse::new(rx)
@@ -44707,6 +44714,13 @@ pub(crate) fn map_error(error: HarvestError) -> AutumnError {
             AutumnError::validation(details).with_status(axum::http::StatusCode::TOO_MANY_REQUESTS)
         }
         HarvestError::Database(message) => AutumnError::service_unavailable_msg(message),
+        // The run moved after the authorizer hook checked it (issue #1803).
+        // Nothing was read or written on the new shard. The body is the
+        // retry hint only. The policy's reason never reaches the caller,
+        // and a `403` here would leak that a shard is denied.
+        error @ HarvestError::OutsideShardFence { .. } => {
+            AutumnError::service_unavailable_msg(error.to_string())
+        }
         other => AutumnError::service_unavailable_msg(other.to_string()),
     }
 }
