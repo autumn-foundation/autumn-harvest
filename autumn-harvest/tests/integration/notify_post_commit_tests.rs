@@ -261,6 +261,30 @@ async fn append_in_a_raw_begin_block_commits_when_pg_notify_fails() {
 }
 
 #[tokio::test]
+async fn a_failed_probe_in_a_raw_begin_block_fails_the_append() {
+    let (url, _container) = setup().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let exec_id = insert_execution(&mut conn).await;
+    // Make the raw-block probe fail on this session only.
+    conn.batch_execute(
+        "CREATE SCHEMA IF NOT EXISTS probe_fail; \
+         CREATE OR REPLACE FUNCTION probe_fail.txid_current_if_assigned() RETURNS bigint \
+         LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'probe disabled'; END $$; \
+         SET search_path = probe_fail, pg_catalog, public",
+    )
+    .await
+    .expect("shadow the probe");
+
+    conn.batch_execute("BEGIN").await.expect("begin");
+    let result = store::append_events(&mut conn, exec_id, &[started()], 0).await;
+    conn.batch_execute("ROLLBACK").await.expect("rollback");
+
+    // The failed probe aborted the block, so a false `Ok` would let the
+    // caller's `COMMIT` roll back silently.
+    assert!(result.is_err(), "the append must report the aborted block");
+}
+
+#[tokio::test]
 async fn wake_in_a_transaction_commits_when_pg_notify_fails() {
     let (url, _container) = setup().await;
     let (exec_id, task_id) = park_task(&url).await;

@@ -923,8 +923,8 @@ impl RawBlock {
 ///
 /// # Errors
 ///
-/// Returns an error only when the savepoint cannot roll back. The raw block
-/// then cannot commit.
+/// Returns an error when the probe fails or the savepoint cannot roll back.
+/// A raw block then cannot commit, so the caller must see the error.
 async fn send_outside_diesel_transaction(
     conn: &mut AsyncPgConnection,
     wakes: Vec<(String, String)>,
@@ -933,13 +933,15 @@ async fn send_outside_diesel_transaction(
 ) -> HarvestResult<()> {
     use diesel_async::SimpleAsyncConnection as _;
     let raw_block = match raw_block {
+        // A failed probe inside a raw block has aborted that block, so the
+        // error must reach the caller. Its `COMMIT` would roll back silently.
         RawBlock::Unknown => RawBlock::from_txid(
             diesel::select(diesel::dsl::sql::<
                 diesel::sql_types::Nullable<diesel::sql_types::BigInt>,
             >("txid_current_if_assigned()"))
             .get_result::<Option<i64>>(conn)
             .await
-            .unwrap_or(None),
+            .map_err(crate::error::database_error)?,
         ),
         known => known,
     };
