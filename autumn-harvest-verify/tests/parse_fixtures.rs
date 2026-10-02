@@ -694,7 +694,7 @@ fn truncation_inside_a_body_is_recorded_as_a_parse_failure() {
         failure.line > 0,
         "a parse failure must name its line: {failure:?}"
     );
-    assert!(!failure.reason.is_empty());
+    assert_ne!(failure.reason, "");
 }
 
 #[test]
@@ -733,8 +733,11 @@ fn injected_junk_lines_never_panic_and_are_recorded() {
 fn empty_and_whitespace_input_is_an_empty_doc() {
     for text in ["", "\n\n\n", "   ", "// only a comment\n"] {
         let doc = parse_no_panic("degenerate", text);
-        assert!(doc.bodies.is_empty());
-        assert!(doc.statics.is_empty());
+        assert_eq!(doc.bodies, [] as [autumn_harvest_verify::mir::Body; 0]);
+        assert_eq!(
+            doc.statics,
+            [] as [autumn_harvest_verify::mir::StaticItem; 0]
+        );
         assert!(
             doc.parse_failures.is_empty(),
             "nothing to fail on: {:#?}",
@@ -771,7 +774,7 @@ fn terminator_successors_excludes_unwind_edges() {
         target: None,
         unwind: None,
     };
-    assert!(diverging.successors().is_empty());
+    assert_eq!(diverging.successors(), [] as [&str; 0]);
 
     assert_eq!(
         Terminator::Goto {
@@ -780,8 +783,8 @@ fn terminator_successors_excludes_unwind_edges() {
         .successors(),
         vec!["bb1"]
     );
-    assert!(Terminator::Return.successors().is_empty());
-    assert!(Terminator::Unreachable.successors().is_empty());
+    assert_eq!(Terminator::Return.successors(), [] as [&str; 0]);
+    assert_eq!(Terminator::Unreachable.successors(), [] as [&str; 0]);
     assert_eq!(
         Terminator::SwitchInt {
             operand: Operand::Move(local(3)),

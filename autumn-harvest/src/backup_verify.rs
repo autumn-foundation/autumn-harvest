@@ -4431,7 +4431,10 @@ mod tests {
 
         let routing = route_trigger_fires(fires, &router);
 
-        assert!(routing.pending.is_empty());
+        assert_eq!(
+            routing.pending,
+            [] as [crate::backup_verify::PendingTriggerFire; 0]
+        );
         assert_eq!(
             routing.uncertain.len(),
             MAX_FINDING_SAMPLES,
