@@ -371,7 +371,9 @@ exactly: **read** (describe/result/stack/children/query) and **signal** are
 guessability of business ids removes the unguessable-`exec_id` defense-in-depth,
 mount the harvest management API **behind your own auth boundary** (e.g.
 `api_with_auth` / your app's authenticated admin surface) rather than relying on
-id opacity to gate read/signal access.
+id opacity to gate read/signal access. Outside the `dev` profile, the by-id
+signal route answers `401` to an anonymous caller even with no auth layer
+(issue #1802). The by-id read routes stay open.
 
 ### Examples
 
