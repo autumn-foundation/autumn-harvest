@@ -104,6 +104,8 @@ fn build_pool(url: &str) -> DbPool {
 
 fn build_app(pool: HarvestDbPool) -> HarvestUiApp {
     let api_state = HarvestApiState::new();
+    // Issue #1802: keep the data plane open; this test exercises the handler, not auth.
+    api_state.set_allow_unauthenticated_mutations(true);
     api_state.install_storage_pool(pool);
     api_state.install(HarvestApiRuntime::new(
         Arc::new(HandlerRegistry::new(vec![], vec![])),

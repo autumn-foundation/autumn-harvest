@@ -161,7 +161,9 @@ fn harvest_plugin() -> HarvestPlugin {
         .updates(updates![set_priority, set_priority_validated, ping_relay])
         .worker(WorkerConfig::default())
         .api("/api/harvest")
-        .mcp_tools();
+        .mcp_tools()
+        // Issue #1802: keep the tool routes open; this test exercises the tools, not auth.
+        .allow_unauthenticated_mutations();
     #[cfg(feature = "unified-dag-execution")]
     let plugin = plugin
         .activities(activities![dag_mcp_slow_task])

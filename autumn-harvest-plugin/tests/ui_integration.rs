@@ -503,6 +503,8 @@ async fn ui_lists_workflows_and_renders_detail_page() {
     let pool = build_test_pool(&database_url);
     let registry = echo_registry();
     let api_state = HarvestApiState::new();
+    // Issue #1802: keep the data plane open; this test exercises the handler, not auth.
+    api_state.set_allow_unauthenticated_mutations(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
         Arc::clone(&registry),
@@ -5891,6 +5893,8 @@ async fn ui_trigger_preserves_dag_metadata() {
     let schedule_id = insert_test_schedule(&database_url, "Dag", dag_name, false).await;
 
     let api_state = HarvestApiState::new();
+    // Issue #1802: keep the data plane open; this test exercises the handler, not auth.
+    api_state.set_allow_unauthenticated_mutations(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
         Arc::clone(&registry),
@@ -6005,6 +6009,8 @@ async fn ui_trigger_now_threads_dag_execution_timeout_sla_and_fleet_ceiling() {
     let schedule_id = insert_test_schedule(&database_url, "Dag", dag_name, false).await;
 
     let api_state = HarvestApiState::new();
+    // Issue #1802: keep the data plane open; this test exercises the handler, not auth.
+    api_state.set_allow_unauthenticated_mutations(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
         Arc::clone(&registry),

@@ -179,6 +179,9 @@ fn build_app_no_admin(pool: &DbPool, infos: Vec<WorkflowInfo>) -> HarvestApiApp 
 
 fn build_app_inner(pool: &DbPool, infos: Vec<WorkflowInfo>, admin: bool) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
+    // Issue #1802: keep the data plane open. The start handler keeps its own
+    // admin check for destructive policies, and the no-admin tests probe it.
+    api_state.set_allow_unauthenticated_mutations(true);
     if admin {
         api_state.set_admin_auth_boundary(true);
     }
