@@ -59,6 +59,8 @@ child workflows, idempotency, and operating the service — read
 Upgrading an existing deployment? See the
 [0.5.0 → 0.6.0 upgrade guide](docs/upgrading/0.6.0.md) — the previous
 [0.4.0 → 0.5.0 upgrade guide](docs/upgrading/0.5.0.md) covers the hop before that.
+Unreleased breaking changes since 0.6.0 are in the
+[0.7.0 upgrade guide](docs/upgrading/0.7.0.md).
 
 Working on the engine itself? [`docs/architecture.md`](docs/architecture.md) is
 the workspace, design-decision, module and macro reference, and
@@ -648,6 +650,7 @@ helpers directly.
 
 ```rust
 use autumn_harvest::prelude::*;
+use std::time::Duration;
 
 #[activity(retry = RetryPolicy::exponential(5, Duration::from_secs(1)))]
 async fn charge_card(ctx: &ActivityContext, amount: u32) -> Result<(), ActivityFailure> {
@@ -941,6 +944,7 @@ trigger rules, or multi-step pipelines between tasks.
 
 ```rust
 use autumn_harvest::policy::{Schedule, WorkflowSchedule};
+use autumn_harvest::prelude::*;
 
 // Register a daily billing run at 03:00 UTC with at-most-1 concurrent run.
 let sched = WorkflowSchedule::new(
@@ -950,12 +954,15 @@ let sched = WorkflowSchedule::new(
 .with_input(serde_json::json!({"region": "us-east"}))
 .with_max_active_runs(1);
 
-// Wire it into the builder alongside your workflow registration.
-let app = autumn_web::app()
+// Wire it into `HarvestBuilder` alongside your workflow registration.
+let harvest = HarvestBuilder::new()
     .workflows(workflows![daily_billing_report])
     .workflow_schedule(sched)
     .worker(WorkerConfig::default());
 ```
+
+`HarvestPlugin` has no `workflow_schedule` method. An app that mounts the
+plugin creates schedules at runtime with the CLI or HTTP API below.
 
 The scheduler tick derives a deterministic `workflow_id` of
 `sched:{name}:{unix_ts}` so retries after a crashed tick are idempotent.

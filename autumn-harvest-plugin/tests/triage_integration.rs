@@ -135,7 +135,11 @@ fn router_for(shards: &[i32]) -> ShardRouter {
 /// exercise the admin-guard rejection: without an admin session, admin-only
 /// routes return 401 before reaching the handler (no storage needed).
 fn build_unauth_app() -> HarvestApiApp {
-    harvest_api_router(HarvestApiState::new())
+    let api_state = HarvestApiState::new();
+    // Issue #1802: set the opt-out, so the 401 comes from the admin gate and
+    // not from the mutation gate.
+    api_state.set_allow_unauthenticated_mutations(true);
+    harvest_api_router(api_state)
 }
 
 async fn scrub(conn: &mut AsyncPgConnection) {

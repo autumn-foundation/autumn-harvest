@@ -913,6 +913,9 @@ curl -X POST "$HARVEST/api/harvest/workflows/fulfil_order/start" \
   -d '{"workflow_id":"order-A-1001","input":{...the body...}}'
 ```
 
+Outside `dev`, send a credential with this call: an admin session or a
+`mutate` token (issue #1802).
+
 Finally delete the row, so it does not show up in the next triage:
 
 ```sql

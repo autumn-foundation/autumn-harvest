@@ -32,6 +32,9 @@ short version.
 applies `[harvest.startup]`, reads the profile from `AUTUMN_ENV` or
 `AUTUMN_PROFILE`, loads the admission gates, and installs the pool and the API
 runtime. `HarvestEmbeddingRuntime::stop` drains the worker on shutdown.
+`with_ambient_profile()` turns on the profile read. Without it, the profile is
+`unknown`, and the admin API and every mutating route fail closed (issue
+#1802).
 
 The workflow is small, but it uses the reference ideas of the billing app. A
 saga reserves inventory with rollback, a child workflow buys the shipping
