@@ -22,7 +22,8 @@ capability.
   run checked on both its entry and live shard), a shard query
   parameter on the routes in `authz::SHARD_SOURCES`, or a shard field in their
   body. A shard named anywhere else is ignored, so a caller cannot show the
-  hook one shard while the handler reads all of them.
+  hook one shard while the handler reads all of them. The lineage routes
+  (`/children`, `/tree`) read every shard, so the hook also sees `None`.
 - **Admin prefixes.** Any mutation under `/admin/tokens`, `/admin/modules` or
   `/modules` is admin-only, even if `ADMIN_SCOPE_ROUTES` does not list it.
 - **Deny audit.** Every token scope deny and every hook deny writes an

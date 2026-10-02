@@ -638,6 +638,31 @@ async fn rebalanced_execution_is_checked_on_its_live_shard() {
     assert_eq!(rows[0].shard_id, Some(7));
 }
 
+/// A lineage route reads every shard for descendants, so the hook also sees
+/// `None`. A shard-confining policy then fails closed.
+#[tokio::test]
+async fn lineage_fan_out_routes_also_check_none() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let (app, seen) = recording_app(&pool);
+    let on_3 = ExecutionId::new_for_shard(ShardId::new(3));
+    for route in ["children", "tree"] {
+        seen.lock().unwrap().clear();
+        let _ = send(
+            &app,
+            Call::new("GET", &format!("/workflows/{on_3}/{route}")),
+        )
+        .await;
+        let calls = seen.lock().unwrap().clone();
+        assert!(calls.contains(&None), "{route}: {calls:?}");
+        assert!(calls.contains(&Some(ShardId::new(3))), "{route}: {calls:?}");
+    }
+    // A single-execution route does not fan out.
+    seen.lock().unwrap().clear();
+    let _ = send(&app, Call::new("GET", &format!("/workflows/{on_3}"))).await;
+    assert!(!seen.lock().unwrap().contains(&None));
+}
+
 /// A query shard on a route that ignores it must not reach the hook. The
 /// handler reads every shard, so the hook sees `None`.
 #[tokio::test]

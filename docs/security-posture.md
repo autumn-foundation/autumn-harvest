@@ -345,6 +345,7 @@ needs I/O implements `HarvestAuthorizer` directly and returns a boxed future.
 | Route | Shard source |
 |---|---|
 | A path with an execution id, e.g. `GET /workflows/{id}`, also under `/ui` | The entry shard of the id and the shard the run lives on now. A percent-encoded id is decoded first. |
+| `GET /workflows/{id}/children`, `GET /workflows/{id}/tree` | The execution's shards, and also `None`, because the handler reads every shard for descendants. |
 | `GET /admin/history/exports`, `GET /admin/history/export-sample` | `shard_id`, `shard-id` or `shard` query parameter. |
 | `GET /admin/external-handoffs` | `shard_id` or `shard` query parameter. |
 | `POST /workflows/{name}/start` | Body `shard_id`, or the shard a body `residency_key` resolves to. |

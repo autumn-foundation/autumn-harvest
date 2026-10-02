@@ -28,7 +28,8 @@
 //!   query parameter or body field on the routes in `SHARD_SOURCES`. `None`
 //!   means Harvest cannot name the shard before the handler runs. A list
 //!   route reads every shard. A by-id route or an unpinned start reaches one
-//!   shard by hash.
+//!   shard by hash. A lineage route (`/children`, `/tree`) gets its
+//!   execution's shards and also `None`, because it reads every shard.
 //!
 //! # Audit volume
 //!
@@ -291,6 +292,9 @@ pub(crate) enum ShardSource {
     Body { field: &'static str, form: bool },
     /// A start body: `shard_id`, or a `residency_key` the router resolves.
     StartBody,
+    /// The handler reads its execution's shards, then every shard for
+    /// descendants. The hook is also called with `None`.
+    FanOut,
 }
 
 /// Routes whose handler reads its shard from the query or the body.
@@ -298,6 +302,8 @@ pub(crate) enum ShardSource {
 /// Execution ids in the path are found from [`execution_id_in_path`] instead.
 /// Each template must be in [`autumn_harvest::audit::CLASSIFIED_ROUTES`].
 pub(crate) const SHARD_SOURCES: &[(&str, ShardSource)] = &[
+    ("GET /workflows/{id}/children", ShardSource::FanOut),
+    ("GET /workflows/{id}/tree", ShardSource::FanOut),
     (
         "GET /admin/history/exports",
         ShardSource::Query(&["shard_id", "shard-id", "shard"]),
@@ -549,8 +555,9 @@ pub(crate) async fn enforce_authorizer(
         Err(response) => return response,
     };
 
-    let request = match shard_source(&method, &path) {
-        None => request,
+    let source = shard_source(&method, &path);
+    let request = match source {
+        None | Some(ShardSource::FanOut) => request,
         Some(ShardSource::Query(keys)) => {
             shards.extend(query_shards(request.uri().query(), keys));
             request
@@ -568,7 +575,7 @@ pub(crate) async fn enforce_authorizer(
             shards.extend(match source {
                 ShardSource::StartBody => start_body_shard(&api_state, &bytes),
                 ShardSource::Body { field, form } => body_field_shard(field, form, is_form, &bytes),
-                ShardSource::Query(_) => None,
+                ShardSource::Query(_) | ShardSource::FanOut => None,
             });
             Request::from_parts(parts, Body::from(bytes))
         }
@@ -585,11 +592,11 @@ pub(crate) async fn enforce_authorizer(
                 scope: t.scope,
             });
     let route_class = classify_route(&method, &path);
-    let candidates: Vec<Option<ShardId>> = if shards.is_empty() {
-        vec![None]
-    } else {
-        shards.into_iter().map(Some).collect()
-    };
+    let fan_out = matches!(source, Some(ShardSource::FanOut));
+    let mut candidates: Vec<Option<ShardId>> = shards.into_iter().map(Some).collect();
+    if candidates.is_empty() || fan_out {
+        candidates.push(None);
+    }
 
     for shard in candidates {
         let authz = AuthzRequest::new(principal, route_class, &method, &path, request.extensions())
