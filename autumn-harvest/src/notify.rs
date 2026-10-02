@@ -526,6 +526,25 @@ struct Fingerprint {
     started_at: DateTime<Utc>,
 }
 
+/// The database of a sender and when the sender last read it.
+///
+/// One lock holds both. The sender publishes a new database and its read time
+/// in one step, so routing never sees a fresh read under the old database.
+#[derive(Default)]
+struct Health {
+    /// The database the sender sends to. `None` until its first read.
+    fingerprint: Option<Fingerprint>,
+    /// When the sender last read the commit state.
+    last_ok: Option<Instant>,
+}
+
+impl Health {
+    /// True when the last read is recent.
+    fn fresh(&self) -> bool {
+        self.last_ok.is_some_and(|at| at.elapsed() < HEALTHY_WITHIN)
+    }
+}
+
 /// State one sender shares with the stage calls.
 struct SinkShared {
     /// The pool the sender sends on. Weak, so the sender never keeps a pool
@@ -533,8 +552,8 @@ struct SinkShared {
     pool: WeakPool<AsyncDieselConnectionManager<AsyncPgConnection>>,
     /// The address of the pool manager. It identifies the pool.
     pool_key: usize,
-    /// The database the sender sends to. `None` until its first read.
-    fingerprint: Mutex<Option<Fingerprint>>,
+    /// The database of the sender and when it last read it.
+    health: Mutex<Health>,
     /// Notes that wait for the sender.
     pending: Mutex<Vec<Staged>>,
     /// Wakes the sender when a note arrives.
@@ -547,8 +566,6 @@ struct SinkShared {
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Notifications this sender lost to an error.
     failures: AtomicU64,
-    /// When the sender last read the commit state.
-    last_ok: Mutex<Option<Instant>>,
     /// Notes the sender task holds. [`NotifySink::flush`] reads it.
     held: AtomicUsize,
     /// The runtime of the last push. A sender task that stops while notes
@@ -582,7 +599,7 @@ impl SinkShared {
 
     /// True when the sender read the commit state recently.
     fn healthy(&self) -> bool {
-        self.alive() && lock(&self.last_ok).is_some_and(|at| at.elapsed() < HEALTHY_WITHIN)
+        self.alive() && lock(&self.health).fresh()
     }
 
     /// True when this sender holds no notes.
@@ -601,10 +618,10 @@ impl SinkShared {
     /// senders on the database of this one therefore count. Before this
     /// sender knows its database, every sender counts.
     fn peers(self: &Arc<Self>) -> Vec<Arc<Self>> {
-        let own = lock(&self.fingerprint).clone();
+        let own = lock(&self.health).fingerprint.clone();
         let mut peers: Vec<Arc<Self>> = lock(&SINKS)
             .iter()
-            .filter(|sink| own.is_none() || *lock(&sink.fingerprint) == own)
+            .filter(|sink| own.is_none() || lock(&sink.health).fingerprint == own)
             .cloned()
             .collect();
         if !peers.iter().any(|sink| Arc::ptr_eq(sink, self)) {
@@ -769,14 +786,13 @@ pub fn register_pool(pool: &crate::worker::DbPool) -> NotifySink {
     let shared = Arc::new(SinkShared {
         pool: pool.weak(),
         pool_key,
-        fingerprint: Mutex::new(None),
+        health: Mutex::new(Health::default()),
         pending: Mutex::new(Vec::new()),
         wake: tokio::sync::Notify::new(),
         ready: tokio::sync::watch::Sender::new(false),
         queue_usage: Mutex::new(None),
         task: Mutex::new(None),
         failures: AtomicU64::new(0),
-        last_ok: Mutex::new(None),
         held: AtomicUsize::new(0),
         runtime: Mutex::new(None),
     });
@@ -807,9 +823,15 @@ fn sink_for(fingerprint: &Fingerprint) -> Option<Arc<SinkShared>> {
     let sinks = lock(&SINKS);
     let found = sinks
         .iter()
-        .filter(|sink| sink.healthy() && lock(&sink.fingerprint).as_ref() == Some(fingerprint))
-        .max_by_key(|sink| *lock(&sink.last_ok))
-        .cloned();
+        .filter(|sink| sink.alive())
+        .filter_map(|sink| {
+            // One snapshot, so the database and the read time agree.
+            let health = lock(&sink.health);
+            (health.fresh() && health.fingerprint.as_ref() == Some(fingerprint))
+                .then(|| (health.last_ok, Arc::clone(sink)))
+        })
+        .max_by_key(|(last_ok, _)| *last_ok)
+        .map(|(_, sink)| sink);
     if found.is_none() && sinks.iter().any(|sink| sink.deferred()) {
         ANY_DEFERRED.store(true, Ordering::Relaxed);
     }
@@ -910,6 +932,14 @@ async fn stage(conn: &mut AsyncPgConnection, notes: Vec<Note>) -> HarvestResult<
             }
             // The failed statement aborted the transaction, so it cannot commit.
             Err(error) if in_tx => return Err(crate::error::database_error(error)),
+            // A second probe in an aborted raw block would fail with `25P02`
+            // too. The classification then cannot tell it from a repeated
+            // transient cause, so this failure is classified here.
+            Err(error) if raw_block_aborted(conn, &error).await => {
+                return Err(crate::error::database_error(error));
+            }
+            // No aborted block. The fallback probes again on a healthy
+            // connection.
             Err(_) => {}
         }
     }
@@ -1015,7 +1045,7 @@ async fn send_outside_diesel_transaction(
                 // A failed probe inside a raw block has aborted that block,
                 // so the error must reach the caller. Its `COMMIT` would roll
                 // back silently.
-                Err(error) if raw_block_aborted(conn).await => {
+                Err(error) if raw_block_aborted(conn, &error).await => {
                     return Err(crate::error::database_error(error));
                 }
                 // An autocommit write already committed. An error here would
@@ -1048,23 +1078,59 @@ async fn send_outside_diesel_transaction(
         .map_err(crate::error::database_error)
 }
 
-/// True when a failed statement aborted a raw `BEGIN` block on `conn`.
+/// The start of the Postgres message for SQLSTATE `25P02`.
+const ABORTED_BLOCK_MESSAGE: &str = "current transaction is aborted";
+
+/// True when the failed `probe` aborted a raw `BEGIN` block on `conn`.
 ///
-/// In an aborted block, the server rejects every statement. Outside a block,
-/// `SELECT 1` succeeds. A lost connection fails with no answer from the
-/// server. Its block, if any, already rolled back, and the `COMMIT` of the
-/// caller then fails. That case therefore does not count as aborted.
-async fn raw_block_aborted(conn: &mut AsyncPgConnection) -> bool {
-    use diesel::result::{DatabaseErrorKind, Error};
+/// The check runs `SELECT 1` and classifies its result with
+/// [`follow_up_shows_aborted_block`].
+async fn raw_block_aborted(conn: &mut AsyncPgConnection, probe: &diesel::result::Error) -> bool {
     use diesel_async::SimpleAsyncConnection as _;
-    !matches!(
-        conn.batch_execute("SELECT 1").await,
+    let follow_up = conn.batch_execute("SELECT 1").await;
+    follow_up_shows_aborted_block(probe, &follow_up)
+}
+
+/// Classify the follow-up `SELECT 1` after the failed `probe`.
+///
+/// A failed statement aborts a raw block. The server then rejects every later
+/// statement with SQLSTATE `25P02`. Diesel exposes no SQLSTATE, so the
+/// classification reads the result and its message:
+/// - Success means autocommit. Its write already committed, so an error would
+///   make a retry write it twice.
+/// - A lost connection is not an aborted block. A block, if any, already
+///   rolled back, and the `COMMIT` of the caller then fails.
+/// - The `25P02` message shows an aborted block.
+/// - The message of the probe again shows one transient cause, such as a
+///   statement timeout, that failed both statements. That is no block.
+/// - Any other rejection counts as an aborted block.
+///
+/// The `25P02` match is locale-sensitive, as in `partition.rs`. With another
+/// `lc_messages`, the last rule still finds an aborted block. Its `25P02`
+/// message differs from the probe error. A wrong `false` would let the
+/// `COMMIT` of the caller roll back silently. Doubt therefore resolves to an
+/// aborted block.
+fn follow_up_shows_aborted_block(
+    probe: &diesel::result::Error,
+    follow_up: &Result<(), diesel::result::Error>,
+) -> bool {
+    use diesel::result::{DatabaseErrorKind, Error};
+    match follow_up {
         Ok(())
-            | Err(Error::DatabaseError(
-                DatabaseErrorKind::UnableToSendCommand | DatabaseErrorKind::ClosedConnection,
-                _,
-            ))
-    )
+        | Err(Error::DatabaseError(
+            DatabaseErrorKind::UnableToSendCommand | DatabaseErrorKind::ClosedConnection,
+            _,
+        )) => false,
+        Err(Error::DatabaseError(_, rejection)) => {
+            let message = rejection.message();
+            let repeated = matches!(
+                probe,
+                Error::DatabaseError(_, first) if first.message() == message
+            );
+            message.starts_with(ABORTED_BLOCK_MESSAGE) || !repeated
+        }
+        Err(_) => true,
+    }
 }
 
 /// True when the transaction manager of `conn` is in its error state.
@@ -1258,7 +1324,12 @@ async fn tick(sink: &SinkShared, conn: &mut AsyncPgConnection, held: &mut Vec<St
         started_at: gate.started_at,
     };
     *lock(&sink.queue_usage) = Some(gate.queue_usage);
-    *lock(&sink.last_ok) = Some(Instant::now());
+    // The new database and the read time go out together. A write to the old
+    // server then never picks this sender as its freshest one.
+    *lock(&sink.health) = Health {
+        fingerprint: Some(fingerprint.clone()),
+        last_ok: Some(Instant::now()),
+    };
 
     let mut statuses = gate.statuses.into_iter();
     let mut ready_notes = Vec::new();
@@ -1287,7 +1358,6 @@ async fn tick(sink: &SinkShared, conn: &mut AsyncPgConnection, held: &mut Vec<St
         }
     }
     *held = waiting;
-    *lock(&sink.fingerprint) = Some(fingerprint);
     sink.ready.send_replace(true);
     sink.record(stale, &"a write transaction stays open too long");
     sink.record(moved, &"the database of the notify sender changed");
@@ -2364,14 +2434,13 @@ mod tests {
         let sink = SinkShared {
             pool: pool.weak(),
             pool_key: 0,
-            fingerprint: Mutex::new(None),
+            health: Mutex::new(Health::default()),
             pending: Mutex::new(Vec::new()),
             wake: tokio::sync::Notify::new(),
             ready: tokio::sync::watch::Sender::new(false),
             queue_usage: Mutex::new(None),
             task: Mutex::new(None),
             failures: AtomicU64::new(0),
-            last_ok: Mutex::new(None),
             held: AtomicUsize::new(0),
             runtime: Mutex::new(None),
         };
@@ -2398,6 +2467,67 @@ mod tests {
             .is_some_and(|task| !task.is_finished())
     }
 
+    /// A server error with `message`, as diesel reports it.
+    fn server_error(message: &str) -> diesel::result::Error {
+        diesel::result::Error::DatabaseError(
+            diesel::result::DatabaseErrorKind::Unknown,
+            Box::new(message.to_owned()),
+        )
+    }
+
+    #[test]
+    fn a_follow_up_that_succeeds_or_loses_the_connection_shows_no_block() {
+        let probe = server_error("permission denied for function txid_current_if_assigned");
+        assert!(!follow_up_shows_aborted_block(&probe, &Ok(())));
+        let lost = diesel::result::Error::DatabaseError(
+            diesel::result::DatabaseErrorKind::UnableToSendCommand,
+            Box::new("connection closed".to_owned()),
+        );
+        assert!(!follow_up_shows_aborted_block(&probe, &Err(lost)));
+    }
+
+    #[test]
+    fn the_aborted_block_message_shows_a_block() {
+        let probe = server_error("permission denied for function txid_current_if_assigned");
+        let aborted = server_error(
+            "current transaction is aborted, commands ignored until end of transaction block",
+        );
+        assert!(follow_up_shows_aborted_block(&probe, &Err(aborted)));
+    }
+
+    #[test]
+    fn the_aborted_block_message_shows_a_block_after_the_same_message() {
+        let aborted =
+            "current transaction is aborted, commands ignored until end of transaction block";
+        assert!(follow_up_shows_aborted_block(
+            &server_error(aborted),
+            &Err(server_error(aborted))
+        ));
+    }
+
+    #[test]
+    fn one_transient_cause_that_fails_both_statements_shows_no_block() {
+        for cause in [
+            "canceling statement due to statement timeout",
+            "canceling statement due to user request",
+        ] {
+            assert!(
+                !follow_up_shows_aborted_block(&server_error(cause), &Err(server_error(cause))),
+                "{cause}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_translated_aborted_block_message_still_shows_a_block() {
+        // A server with a German `lc_messages`.
+        let probe = server_error("keine Berechtigung für Funktion txid_current_if_assigned");
+        let aborted = server_error(
+            "aktuelle Transaktion wurde abgebrochen, Befehle werden bis zum Ende der Transaktion ignoriert",
+        );
+        assert!(follow_up_shows_aborted_block(&probe, &Err(aborted)));
+    }
+
     #[tokio::test]
     async fn a_flush_waits_for_a_peer_sender_on_the_same_database() {
         let fingerprint = Fingerprint {
@@ -2406,8 +2536,8 @@ mod tests {
         };
         let (_own_pool, own) = lazy_sink();
         let (_peer_pool, peer) = lazy_sink();
-        *lock(&own.fingerprint) = Some(fingerprint.clone());
-        *lock(&peer.fingerprint) = Some(fingerprint);
+        lock(&own.health).fingerprint = Some(fingerprint.clone());
+        lock(&peer.health).fingerprint = Some(fingerprint);
         let (own, peer) = (Arc::new(own), Arc::new(peer));
         // Routing gave the write of the own pool to the peer sender.
         let (note_fingerprint, notes) = test_note();

@@ -308,6 +308,42 @@ async fn a_failed_probe_after_an_autocommit_write_reports_the_commit() {
 }
 
 #[tokio::test]
+async fn a_failed_stage_probe_with_a_ready_sender_classifies_the_write() {
+    let (url, _container) = setup().await;
+    let pool = build_pool(&url);
+    assert!(
+        autumn_harvest::notify::register_pool(&pool)
+            .wait_ready(READY)
+            .await,
+        "the sender must be ready, so the stage runs its own probe"
+    );
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let committed = insert_execution(&mut conn).await;
+    let aborted = insert_execution(&mut conn).await;
+    conn.batch_execute(
+        "CREATE SCHEMA IF NOT EXISTS probe_fail; \
+         CREATE OR REPLACE FUNCTION probe_fail.txid_current_if_assigned() RETURNS bigint \
+         LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'probe disabled'; END $$; \
+         SET search_path = probe_fail, pg_catalog, public",
+    )
+    .await
+    .expect("shadow the probe");
+
+    // Autocommit: the write committed, so it reports success.
+    store::append_events(&mut conn, committed, &[started()], 0)
+        .await
+        .expect("the committed append must report success");
+    assert_eq!(event_count(&url, committed).await, 1);
+
+    // A raw block: the failed probe aborted it, so the append reports it.
+    conn.batch_execute("BEGIN").await.expect("begin");
+    let result = store::append_events(&mut conn, aborted, &[started()], 0).await;
+    conn.batch_execute("ROLLBACK").await.expect("rollback");
+    assert!(result.is_err(), "the append must report the aborted block");
+    assert_eq!(event_count(&url, aborted).await, 0);
+}
+
+#[tokio::test]
 async fn wake_in_a_transaction_commits_when_pg_notify_fails() {
     let (url, _container) = setup().await;
     let (exec_id, task_id) = park_task(&url).await;
