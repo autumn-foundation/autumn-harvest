@@ -676,7 +676,7 @@ async fn start_workflow(
             workflow_name,
             workflow_id,
             exec_id: ExecutionId::new_for_shard(ShardId::new(0)),
-            input: serde_json::Value::Null,
+            input: serde_json::Value::Null.into(),
             parent_id: None,
             queue_name: QUEUE,
             execution_timeout: None,

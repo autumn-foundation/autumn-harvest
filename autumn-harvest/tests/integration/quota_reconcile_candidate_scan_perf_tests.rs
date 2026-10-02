@@ -1,12 +1,17 @@
 #![cfg(feature = "db")]
 //! Ledger perf pass: `quota_reconcile::CANDIDATE_SQL`'s residual
-//! `workflow_name = ANY($1)` filter (issue #1226).
+//! `workflow_name = ANY($1)` filter (issue #1226,
+//! superseded by #1631).
+//!
+//! Historical evidence. Issue #1631 replaced the query and the index this
+//! file measures. `quota_reconcile_candidate_bound_tests.rs` guards the
+//! fix.
 //!
 //! # Workload
 //!
 //! [`reconcile_quota_keys_from`] runs on `worker_heartbeat_interval`
-//! cadence, once per assigned shard, on every worker process. Its candidate
-//! scan is backed by `idx_harvest_we_quota_reconcile_candidates` (migration
+//! cadence, once per assigned shard, on every worker process. Before #1631, its
+//! candidate scan was backed by `idx_harvest_we_quota_reconcile_candidates` (migration
 //! `20260910192721_harvest_quota_reconcile_candidate_index`), a partial
 //! index on `(id) WHERE quota_key IS NULL AND state IN ('RUNNING',
 //! 'PAUSED')`. That index has no `workflow_name` column, so

@@ -21,6 +21,7 @@ use crate::schema::{
     harvest_task_queue, harvest_timers, harvest_wasm_modules, harvest_workers,
     harvest_workflow_executions, harvest_workflow_logs,
 };
+use crate::shared_json::SharedJson;
 
 // ── Calendar ──────────────────────────────────────────────────────────────────
 
@@ -314,7 +315,7 @@ pub struct NewWorkflowExecution<'a> {
     pub workflow_id: &'a str,
     pub run_id: Uuid,
     pub shard_id: i32,
-    pub input: serde_json::Value,
+    pub input: SharedJson,
     pub parent_id: Option<Uuid>,
     pub queue_name: &'a str,
     pub execution_timeout: Option<chrono::Duration>,
@@ -589,7 +590,7 @@ pub struct NewTaskQueueItem<'a> {
     pub workflow_exec_id: Option<Uuid>,
     pub activity_name: Option<&'a str>,
     pub activity_id: Option<Uuid>,
-    pub input: serde_json::Value,
+    pub input: SharedJson,
     pub priority: i32,
     pub max_attempts: i32,
     pub scheduled_at: DateTime<Utc>,

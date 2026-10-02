@@ -66,6 +66,9 @@ fn build_app(pool: DbPool) -> HarvestApiApp {
 
 fn build_app_no_admin(pool: DbPool) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
+    // Issue #1802: set the opt-out, so the 401 comes from the admin gate and
+    // not from the mutation gate.
+    api_state.set_allow_unauthenticated_mutations(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool));
     harvest_api_router(api_state)
 }
@@ -113,7 +116,7 @@ async fn seed(
             workflow_name: "redrive_http_wf",
             workflow_id,
             exec_id: ExecutionId::new_for_shard(ShardId::new(0)),
-            input: json!({"k": "v"}),
+            input: json!({"k": "v"}).into(),
             parent_id: None,
             queue_name: queue,
             execution_timeout: None,

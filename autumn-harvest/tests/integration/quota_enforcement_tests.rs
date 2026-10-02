@@ -205,7 +205,7 @@ fn params<'a>(
         workflow_name,
         workflow_id,
         exec_id,
-        input,
+        input: input.into(),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,

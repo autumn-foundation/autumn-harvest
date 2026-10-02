@@ -185,6 +185,7 @@ mod queue_pause_tests;
 mod quota_enforcement_tests;
 mod quota_history_bytes_perf_tests;
 mod quota_lock_ordering_tests;
+mod quota_reconcile_candidate_bound_tests;
 mod quota_reconcile_candidate_scan_perf_tests;
 mod quota_reconcile_tests;
 mod quota_supersede_ordering_tests;
@@ -279,6 +280,7 @@ mod webhook_trigger_tests;
 #[cfg(feature = "db")]
 mod with_start_shared_tests;
 mod worker_session_tests;
+mod workflow_backoff_requeue_tests;
 #[cfg(feature = "db")]
 mod workflow_handle_tests;
 #[cfg(feature = "db")]

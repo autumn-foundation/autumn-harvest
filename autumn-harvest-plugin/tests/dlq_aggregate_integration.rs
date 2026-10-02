@@ -179,7 +179,7 @@ async fn insert_execution(database_url: &str, shard: i32, workflow_name: &str) -
         workflow_id: &format!("{workflow_name}-{}", uuid::Uuid::new_v4().simple()),
         run_id: uuid::Uuid::new_v4(),
         shard_id: shard,
-        input: json!({}),
+        input: json!({}).into(),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,

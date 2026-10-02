@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use autumn_harvest::dispatch::DEFAULT_DISPATCH_RECONCILE_BATCH;
-use autumn_web::config::{ConfigError, DatabaseConfig, Env, OsEnv};
+use autumn_web::config::{ConfigError, DatabaseConfig, Env, OsEnv, normalize_profile_name};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
@@ -779,10 +779,22 @@ fn load_startup_section(path: &Path) -> Result<Option<PartialHarvestStartupConfi
 }
 
 fn resolve_profile(env: &dyn Env) -> Option<String> {
-    if let Ok(profile) = env.var("AUTUMN_PROFILE")
-        && !profile.is_empty()
-    {
-        return Some(profile);
+    resolve_profile_input(env).and_then(|profile| normalize_profile_name(&profile))
+}
+
+/// The raw profile selector, in the autumn-web order (issue #1614).
+///
+/// The order is `AUTUMN_ENV`, `AUTUMN_PROFILE`, `--profile`, then
+/// `AUTUMN_IS_DEBUG`. `HarvestEmbedding::with_ambient_profile` also reads
+/// `AUTUMN_ENV` first. A different order here would read the wrong
+/// `autumn-{profile}.toml`, and a `fail` orphan setting in it would be lost.
+fn resolve_profile_input(env: &dyn Env) -> Option<String> {
+    for key in ["AUTUMN_ENV", "AUTUMN_PROFILE"] {
+        if let Ok(profile) = env.var(key)
+            && !profile.trim().is_empty()
+        {
+            return Some(profile);
+        }
     }
 
     let args: Vec<String> = std::env::args().collect();
@@ -1694,6 +1706,52 @@ orphaned_workflows = "off"
             .with_operator_overrides(&file_and_env)
             .expect("the file and the override should resolve");
         assert_eq!(resolved.orphaned_workflows, OrphanStartupAction::Fail);
+    }
+
+    // Issue #1614: the profile file follows the autumn-web profile order.
+
+    #[test]
+    fn startup_overlay_reads_the_profile_file_that_autumn_env_selects() {
+        let dir = unique_temp_dir("harvest-startup-autumn-env");
+        write_file(
+            &dir.join("autumn-prod.toml"),
+            r#"
+[harvest.startup]
+orphaned_workflows = "fail"
+"#,
+        );
+        let env = MockEnv::new()
+            .with("AUTUMN_MANIFEST_DIR", dir.to_string_lossy().as_ref())
+            .with("AUTUMN_ENV", "production")
+            .with("AUTUMN_PROFILE", "dev");
+        let resolved = HarvestStartupConfig::default()
+            .with_operator_overrides(&env)
+            .expect("the profile file should resolve");
+        assert_eq!(resolved.orphaned_workflows, OrphanStartupAction::Fail);
+    }
+
+    #[test]
+    fn profile_resolution_matches_autumn_web() {
+        let resolve = |pairs: &[(&str, &str)]| {
+            let env = pairs
+                .iter()
+                .fold(MockEnv::new(), |env, (key, value)| env.with(key, value));
+            resolve_profile(&env)
+        };
+        assert_eq!(resolve(&[("AUTUMN_ENV", "prod")]).as_deref(), Some("prod"));
+        assert_eq!(
+            resolve(&[("AUTUMN_ENV", "staging"), ("AUTUMN_PROFILE", "dev")]).as_deref(),
+            Some("staging")
+        );
+        assert_eq!(
+            resolve(&[("AUTUMN_ENV", " "), ("AUTUMN_PROFILE", "Development")]).as_deref(),
+            Some("dev")
+        );
+        assert_eq!(
+            resolve(&[("AUTUMN_IS_DEBUG", "0")]).as_deref(),
+            Some("prod")
+        );
+        assert_eq!(resolve(&[]), None);
     }
 
     #[test]

@@ -358,6 +358,8 @@ pub struct HarvestApiState {
     deployment_profile: Arc<Mutex<String>>,
     /// Whether the management API was mounted behind an embedder-provided auth boundary.
     admin_auth_boundary: Arc<Mutex<bool>>,
+    /// Explicit opt-out that opens mutating routes with no auth (issue #1802).
+    allow_unauthenticated_mutations: Arc<Mutex<bool>>,
     /// Autumn session key used by built-in guards when no outer auth boundary is configured.
     admin_auth_session_key: Arc<Mutex<String>>,
     /// When enabled, `/health` returns 503 until writable shards are ready.
@@ -461,6 +463,7 @@ impl Default for HarvestApiState {
             audit_retention_days: Arc::new(Mutex::new(None)),
             deployment_profile: Arc::new(Mutex::new("unknown".to_string())),
             admin_auth_boundary: Arc::new(Mutex::new(false)),
+            allow_unauthenticated_mutations: Arc::new(Mutex::new(false)),
             admin_auth_session_key: Arc::new(Mutex::new("user_id".to_string())),
             health_requires_shard_readiness: Arc::new(Mutex::new(false)),
             worker_shutdown_timeout: Arc::new(Mutex::new(std::time::Duration::from_secs(30))),
@@ -1137,6 +1140,9 @@ impl HarvestApiState {
     /// `dev` allows an unauthenticated local management API; every other
     /// profile is treated as non-dev and must have an auth boundary.
     ///
+    /// A standalone embedder declares the profile with
+    /// [`StandaloneAdminAuth::with_deployment_profile`]. See `docs/embedding.md`.
+    ///
     /// # Panics
     ///
     /// Panics if the internal mutex is poisoned.
@@ -1150,7 +1156,8 @@ impl HarvestApiState {
     /// Mark whether the Harvest management API is mounted behind auth.
     ///
     /// This reports the boundary provided via [`crate::plugin::HarvestPlugin::api_with_auth`]
-    /// or an equivalent standalone integration. It does not implement RBAC.
+    /// or [`StandaloneAdminAuth::with_admin_auth_boundary`]. It does not implement RBAC.
+    /// See `docs/embedding.md` for the standalone path.
     ///
     /// # Panics
     ///
@@ -1162,11 +1169,30 @@ impl HarvestApiState {
             .expect("harvest api state lock poisoned") = present;
     }
 
+    /// Open the mutating routes to a caller with no credential (issue #1802).
+    ///
+    /// Outside the `dev` profile, a mount with no auth boundary refuses every
+    /// mutating route with 401. This opt-out restores the pre-#1802 posture
+    /// for routes with no admin gate. Admin-gated routes keep their gate.
+    /// `HarvestPlugin` and `HarvestEmbedding` log a startup warning while the
+    /// opt-out opens the routes. A raw router mount logs nothing.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn set_allow_unauthenticated_mutations(&self, allow: bool) {
+        *self
+            .allow_unauthenticated_mutations
+            .lock()
+            .expect("harvest api state lock poisoned") = allow;
+    }
+
     /// Set the Autumn session key used by built-in management guards.
     ///
     /// This mirrors `AppState::auth_session_key()` during plugin startup. Standalone
     /// integrations that mount `harvest_api_router` directly can call this to keep
     /// Harvest's built-in high-impact route guard aligned with their app auth config.
+    /// [`StandaloneAdminAuth::with_admin_auth_session_key`] declares it for them.
     ///
     /// # Panics
     ///
@@ -1214,6 +1240,13 @@ impl HarvestApiState {
     pub(crate) fn admin_auth_boundary(&self) -> bool {
         *self
             .admin_auth_boundary
+            .lock()
+            .expect("harvest api state lock poisoned")
+    }
+
+    pub(crate) fn allow_unauthenticated_mutations(&self) -> bool {
+        *self
+            .allow_unauthenticated_mutations
             .lock()
             .expect("harvest api state lock poisoned")
     }
@@ -4767,6 +4800,11 @@ async fn by_id_missing_workflow_id(Path(_workflow_name): Path<String>) -> axum::
 #[allow(clippy::too_many_lines)]
 pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
     let require_admin = middleware::from_fn_with_state(api_state.clone(), require_harvest_admin);
+    // Issue #1802: outside `dev`, this gate refuses a mutating call with no
+    // credential. A declared boundary, a scoped token, an admin session or the
+    // opt-out admits it.
+    let require_mutation_auth =
+        middleware::from_fn_with_state(api_state.clone(), require_classified_mutation_auth);
     // issue #1278: the Vantage dead-letter page's bulk-action forms submit
     // here directly (a relative `../dead-letters/replay` /
     // `../dead-letters/discard` action from `/ui/dead-letters`), carrying
@@ -5475,6 +5513,9 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
             "/admin/tasks/{id}/eligibility",
             get(get_task_eligibility).route_layer(require_admin),
         )
+        // A route layer runs on a matched route only, so an unknown path
+        // still answers 404. It wraps every per-route layer above.
+        .route_layer(require_mutation_auth)
         .layer(Extension(api_state))
 }
 
@@ -5486,7 +5527,8 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
 /// `require_harvest_admin` reads. An embedder that mounts
 /// [`harvest_api_router`] on a raw Axum server reached none of them. The one
 /// credential Harvest has that needs no autumn-web `Session` was therefore
-/// unusable standalone.
+/// unusable standalone. In a token-only mount, every route except those
+/// classified [`RouteClass::PublicSafe`] requires a verified Harvest token.
 ///
 /// The layer ordering is load-bearing, so this type applies it rather than
 /// documenting it. See [`Self::mount`].
@@ -5502,11 +5544,14 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
 /// ```
 ///
 /// [`HarvestPlugin`]: crate::HarvestPlugin
+// Each bool is an independent opt-in. A state machine would not fit them.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, Default)]
 pub struct StandaloneAdminAuth {
     api_tokens: bool,
     read_only_role: bool,
     admin_auth_boundary: bool,
+    allow_unauthenticated_mutations: bool,
     deployment_profile: Option<String>,
     admin_auth_session_key: Option<String>,
 }
@@ -5521,10 +5566,12 @@ impl StandaloneAdminAuth {
 
     /// Install the scoped-API-token layer (issue #942).
     ///
-    /// A request carrying a verified `hvst_` bearer reaches the admin routes
-    /// its scope allows. A `read` token is denied every mutating route with
-    /// 403, before any handler runs. The layer needs a token store, so install
-    /// the storage pool on the state as well.
+    /// A request carrying a verified `hvst_` bearer reaches the routes its
+    /// scope allows. Without a declared embedder auth boundary, requests to
+    /// non-public routes must carry such a token; missing and non-Harvest
+    /// credentials are rejected with 401. A `read` token is denied every
+    /// mutating route with 403, before any handler runs. The layer needs a
+    /// token store, so install the storage pool on the state as well.
     #[must_use]
     pub const fn with_api_tokens(mut self) -> Self {
         self.api_tokens = true;
@@ -5551,6 +5598,19 @@ impl StandaloneAdminAuth {
     #[must_use]
     pub const fn with_admin_auth_boundary(mut self) -> Self {
         self.admin_auth_boundary = true;
+        self
+    }
+
+    /// Open the mutating routes to a caller with no credential (issue #1802).
+    ///
+    /// Outside the `dev` profile, a mount with no declared auth boundary
+    /// refuses every mutating route with 401. This opt-out restores the
+    /// pre-#1802 posture for routes with no admin gate. [`Self::mount`] sets
+    /// the state from this declaration, the same as the boundary. See
+    /// [`HarvestApiState::set_allow_unauthenticated_mutations`].
+    #[must_use]
+    pub const fn allow_unauthenticated_mutations(mut self) -> Self {
+        self.allow_unauthenticated_mutations = true;
         self
     }
 
@@ -5588,21 +5648,32 @@ impl StandaloneAdminAuth {
     /// Nesting first is what puts Vantage under the read-only-role layer, which
     /// is how [`HarvestPlugin`] composes it.
     ///
-    /// The returned router carries no embedder auth. Apply that outside, so the
-    /// request order is: embedder auth -> token layer -> read-only-role layer
-    /// -> per-route `require_admin` -> handler.
+    /// When an embedder auth boundary is declared, apply it outside. The
+    /// request order is then: embedder auth -> token layer -> read-only-role
+    /// layer -> per-route `require_admin` -> handler. Without that
+    /// declaration, enabling API tokens additionally installs a fail-closed
+    /// token requirement on every non-public route.
     ///
     /// [`harvest_ui_router`]: crate::harvest_ui_router
     /// [`HarvestPlugin`]: crate::HarvestPlugin
     pub fn mount(&self, router: Router<()>, api_state: &HarvestApiState) -> Router<()> {
         api_state.set_admin_auth_boundary(self.admin_auth_boundary);
+        api_state.set_allow_unauthenticated_mutations(self.allow_unauthenticated_mutations);
         if let Some(profile) = &self.deployment_profile {
             api_state.set_deployment_profile(profile.clone());
         }
         if let Some(session_key) = &self.admin_auth_session_key {
             api_state.set_admin_auth_session_key(session_key.clone());
         }
-        apply_admin_auth_layers(router, api_state, self.api_tokens, self.read_only_role)
+        let router =
+            apply_admin_auth_layers(router, api_state, self.api_tokens, self.read_only_role);
+        if self.api_tokens && !self.admin_auth_boundary {
+            router.layer(middleware::from_fn(
+                crate::api_token::require_token_for_non_public,
+            ))
+        } else {
+            router
+        }
     }
 }
 
@@ -5675,6 +5746,88 @@ pub(crate) async fn require_harvest_admin(
     } else {
         AutumnError::unauthorized_msg("authentication required").into_response()
     }
+}
+
+/// Refuse an unauthenticated call to a `Mutating` route (issue #1802).
+///
+/// The class comes from `CLASSIFIED_ROUTES`, and an unclassified route counts
+/// as `Mutating`. An `OPTIONS` preflight is not a mutation, so it passes. A
+/// route with an admin gate runs this check first, then its
+/// own. This check admits every caller the admin gate admits, so the admin
+/// gate still decides. The per-route same-origin guard on the bulk
+/// dead-letter routes runs after this check, so an anonymous cross-site post
+/// there gets 401, not 403.
+pub(crate) async fn require_classified_mutation_auth(
+    State(api_state): State<HarvestApiState>,
+    request: axum::extract::Request,
+    next: Next,
+) -> axum::response::Response {
+    if request.method() == axum::http::Method::OPTIONS
+        || classify_route(request.method(), request.uri().path()) != RouteClass::Mutating
+    {
+        return next.run(request).await;
+    }
+    admit_mutation(&api_state, request, next).await
+}
+
+/// Refuse an unauthenticated mutation on a route outside `CLASSIFIED_ROUTES`
+/// (issue #1802).
+///
+/// Vantage and the MCP tool routes use it. Every method except `GET`, `HEAD`
+/// and `OPTIONS` counts as a mutation.
+pub(crate) async fn require_mutation_auth_by_method(
+    State(api_state): State<HarvestApiState>,
+    request: axum::extract::Request,
+    next: Next,
+) -> axum::response::Response {
+    if matches!(
+        *request.method(),
+        axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
+    ) {
+        return next.run(request).await;
+    }
+    admit_mutation(&api_state, request, next).await
+}
+
+async fn admit_mutation(
+    api_state: &HarvestApiState,
+    request: axum::extract::Request,
+    next: Next,
+) -> axum::response::Response {
+    let has_token = request
+        .extensions()
+        .get::<crate::api_token::TokenPrincipal>()
+        .is_some();
+    let session = request.extensions().get::<Session>().cloned();
+    if mutation_admitted(api_state, has_token, session).await {
+        next.run(request).await
+    } else {
+        AutumnError::unauthorized_msg("authentication required").into_response()
+    }
+}
+
+/// Whether the mutation gate admits a caller (issue #1802).
+///
+/// The gate is open in the `dev` profile, under a declared auth boundary, and
+/// under the explicit opt-out. Otherwise the caller must present a verified
+/// scoped token or pass the admin check.
+async fn mutation_admitted(
+    api_state: &HarvestApiState,
+    has_token: bool,
+    session: Option<Session>,
+) -> bool {
+    let auth_boundary_present = api_state.admin_auth_boundary();
+    if auth_boundary_present
+        || crate::boot::unauthenticated_mutations_open(
+            &api_state.deployment_profile(),
+            auth_boundary_present,
+            api_state.allow_unauthenticated_mutations(),
+        )
+        || has_token
+    {
+        return true;
+    }
+    has_harvest_admin_access(api_state, session).await
 }
 
 /// Whether the request established a session principal at all (issue #1284).
@@ -33467,13 +33620,11 @@ async fn run_replay_canary_handler(
 ///     The `query_timeout` bound applies to async-yielding replays; a workflow
 ///     function that busy-loops synchronously without ever `.await`-ing is out of
 ///     scope, exactly as for the live executor. A large but healthy history is
-///     not at risk: `SUSPENSION_TIMEOUT` (the executor's per-cycle 100 ms
-///     suspension heuristic) only fires when the handler future is genuinely
-///     *pending* on an unresolved oneshot at the replay frontier — it never cuts
-///     off a CPU-bound replay consuming recorded events, so a completed history
-///     replays to its verdict regardless of wall-clock duration, bounded only by
-///     this outer `query_timeout` (ample headroom for the ~<200 ms/10k-event
-///     replay budget, issue #135).
+///     not at risk. The executor suspends only when the handler is pending on
+///     a parked Harvest future (issue #1797). It never cuts off a CPU-bound
+///     replay that consumes recorded events. A completed history therefore
+///     replays to its verdict, bounded only by this outer `query_timeout`. That
+///     gives ample headroom for the ~<200 ms/10k-event replay budget (issue #135).
 ///   * `410` — history unavailable: a terminal execution whose recorded history
 ///     is incomplete (truncated before its terminal seal — pruned by retention
 ///     or released on reset), or a terminal execution whose payloads were
@@ -52458,7 +52609,7 @@ mod tests {
                 workflow_name: "snapshot_listenerless",
                 workflow_id: "snapshot-listenerless-1",
                 exec_id,
-                input: serde_json::json!({ "ok": true }),
+                input: serde_json::json!({ "ok": true }).into(),
                 parent_id: None,
                 queue_name: "default",
                 execution_timeout: None,
@@ -52547,7 +52698,7 @@ mod tests {
                 workflow_name: "admit_update_no_runtime",
                 workflow_id: "admit-update-no-runtime-1",
                 exec_id,
-                input: serde_json::json!({ "ok": true }),
+                input: serde_json::json!({ "ok": true }).into(),
                 parent_id: None,
                 queue_name: "default",
                 execution_timeout: None,
@@ -52674,7 +52825,7 @@ mod tests {
                 workflow_name: "signal_no_runtime",
                 workflow_id: "signal-no-runtime-1",
                 exec_id,
-                input: serde_json::json!({ "ok": true }),
+                input: serde_json::json!({ "ok": true }).into(),
                 parent_id: None,
                 queue_name: "default",
                 execution_timeout: None,
@@ -52807,7 +52958,7 @@ mod tests {
                 workflow_name: "rerun_no_runtime",
                 workflow_id: "rerun-no-runtime-1",
                 exec_id,
-                input: serde_json::json!({ "ok": true }),
+                input: serde_json::json!({ "ok": true }).into(),
                 parent_id: None,
                 queue_name: "default",
                 execution_timeout: None,
@@ -58573,5 +58724,45 @@ mod tests {
             &no_build_ids,
             ""
         ));
+    }
+}
+
+#[cfg(test)]
+mod mutation_gate_tests {
+    use super::*;
+    use tower::ServiceExt as _;
+
+    async fn start_status(with_token: bool) -> StatusCode {
+        let api_state = HarvestApiState::new();
+        api_state.set_deployment_profile("prod");
+        let mut request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/workflows/w/start")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from("{}"))
+            .unwrap();
+        if with_token {
+            request
+                .extensions_mut()
+                .insert(crate::api_token::TokenPrincipal {
+                    id: uuid::Uuid::nil(),
+                    scope: crate::api_token::TokenScope::Mutate,
+                });
+        }
+        harvest_api_router(api_state)
+            .oneshot(request)
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// Issue #1802: a verified scoped token passes the gate on a route with
+    /// no admin gate. The token layer sets `TokenPrincipal` in production.
+    #[tokio::test]
+    async fn a_verified_token_passes_the_mutation_gate() {
+        assert_eq!(start_status(false).await, StatusCode::UNAUTHORIZED);
+        let status = start_status(true).await;
+        assert_ne!(status, StatusCode::UNAUTHORIZED);
+        assert_ne!(status, StatusCode::FORBIDDEN);
     }
 }
