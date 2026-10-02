@@ -437,6 +437,74 @@ fn build_tls_client_config() -> HarvestResult<rustls::ClientConfig> {
     Ok(config)
 }
 
+/// Open a diesel-async connection with the transport that the DSN asks for.
+///
+/// The claim-scan index build (issue #1667) opens its own connection. It must
+/// follow the listener's rule: `sslmode=require` selects verified TLS, and any
+/// other mode stays plaintext. The plain `AsyncPgConnection::establish` cannot
+/// satisfy `require`, so a TLS-only server would refuse every build.
+///
+/// # Errors
+/// Returns `HarvestError::Config` for a DSN that does not parse, or for
+/// `sslmode=require` in a build without the `tls` feature. Returns
+/// `HarvestError::Database` when the connection fails.
+#[cfg(feature = "db")]
+pub(crate) async fn connect_async_pg(
+    database_url: &str,
+) -> HarvestResult<diesel_async::AsyncPgConnection> {
+    let config: tokio_postgres::Config = database_url.parse().map_err(|e| {
+        HarvestError::Config(format!(
+            "invalid notification database URL: {}",
+            error_chain(&e)
+        ))
+    })?;
+    match listen_transport(&config) {
+        ListenTransport::Plain => {
+            let (client, connection) = config
+                .connect(tokio_postgres::NoTls)
+                .await
+                .map_err(|e| connect_error(&e))?;
+            async_pg_from_parts(client, connection).await
+        }
+        ListenTransport::Tls => connect_async_pg_tls(&config).await,
+    }
+}
+
+/// Wrap an open client and connection in a diesel-async connection.
+#[cfg(feature = "db")]
+async fn async_pg_from_parts<S>(
+    client: tokio_postgres::Client,
+    connection: tokio_postgres::Connection<tokio_postgres::Socket, S>,
+) -> HarvestResult<diesel_async::AsyncPgConnection>
+where
+    S: tokio_postgres::tls::TlsStream + Unpin + Send + 'static,
+{
+    diesel_async::AsyncPgConnection::try_from_client_and_connection(client, connection)
+        .await
+        .map_err(|e| HarvestError::Database(format!("pg connect failed: {e}")))
+}
+
+/// Open a verified TLS diesel-async connection.
+#[cfg(all(feature = "db", feature = "tls"))]
+async fn connect_async_pg_tls(
+    config: &tokio_postgres::Config,
+) -> HarvestResult<diesel_async::AsyncPgConnection> {
+    let tls = tokio_postgres_rustls::MakeRustlsConnect::new(tls_client_config()?);
+    let (client, connection) = config.connect(tls).await.map_err(|e| connect_error(&e))?;
+    async_pg_from_parts(client, connection).await
+}
+
+/// Refuse `sslmode=require` when the crate has no TLS support.
+#[cfg(all(feature = "db", not(feature = "tls")))]
+#[allow(clippy::unused_async, reason = "the signature matches the `tls` build")]
+async fn connect_async_pg_tls(
+    _config: &tokio_postgres::Config,
+) -> HarvestResult<diesel_async::AsyncPgConnection> {
+    Err(HarvestError::Config(
+        "sslmode=require needs the `tls` feature of autumn-harvest".to_string(),
+    ))
+}
+
 /// Spawn the task that drives a LISTEN connection.
 ///
 /// The task calls `poll_message()` to get each notification. The default
@@ -895,6 +963,41 @@ mod tests {
         assert_eq!(header, SSL_REQUEST);
         // 0x16 is the TLS handshake record type, so this is a ClientHello.
         // A `NoTls` connector sends nothing after the server accepts TLS.
+        assert_eq!(next, Some(0x16), "sslmode=require must send a ClientHello");
+    }
+
+    /// Issue #1667: the dedicated index build connection follows the same
+    /// transport rule as the listener. `sslmode=require` must start a TLS
+    /// handshake. The plain diesel-async connector never does.
+    #[cfg(feature = "tls")]
+    #[tokio::test]
+    async fn the_build_connection_honors_sslmode_require() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let server = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake server");
+        let port = server.local_addr().expect("fake server address").port();
+        let accept = tokio::spawn(async move {
+            let (mut socket, _) = server.accept().await.expect("accept");
+            let mut header = [0_u8; 8];
+            socket
+                .read_exact(&mut header)
+                .await
+                .expect("message header");
+            socket.write_all(b"S").await.expect("accept TLS");
+            let mut next = [0_u8; 1];
+            let next = socket.read_exact(&mut next).await.ok().map(|_| next[0]);
+            (header, next)
+        });
+        let url = format!("postgres://u@127.0.0.1:{port}/db?sslmode=require");
+        let client = tokio::spawn(async move { connect_async_pg(&url).await.map(|_| ()) });
+        let (header, next) = tokio::time::timeout(Duration::from_secs(10), accept)
+            .await
+            .expect("fake server sees the client")
+            .expect("fake server task");
+        client.abort();
+        assert_eq!(header, SSL_REQUEST);
         assert_eq!(next, Some(0x16), "sslmode=require must send a ClientHello");
     }
 

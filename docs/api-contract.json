@@ -1486,7 +1486,7 @@
         },
         {
           "status": 401,
-          "description": "Requires admin authentication only when the request can forcibly cancel a currently-ACTIVE (RUNNING/PAUSED) prior \u2014 i.e. the resolved active-conflict behavior is Terminate (issue #685): conflict_policy=terminate_existing (any reuse_policy), or reuse_policy=terminate_if_running with the default/omitted conflict_policy. Non-destructive combinations \u2014 e.g. reuse_policy=terminate_if_running combined with conflict_policy=use_existing (the idempotent-starter shape) or conflict_policy=fail \u2014 cannot cancel a live run and do NOT require admin. Returned only when admin is required and admin auth is absent."
+          "description": "Requires admin authentication only when the request can forcibly cancel a currently-ACTIVE (RUNNING/PAUSED) prior \u2014 i.e. the resolved active-conflict behavior is Terminate (issue #685): conflict_policy=terminate_existing (any reuse_policy), or reuse_policy=terminate_if_running with the default/omitted conflict_policy. Non-destructive combinations \u2014 e.g. reuse_policy=terminate_if_running combined with conflict_policy=use_existing (the idempotent-starter shape) or conflict_policy=fail \u2014 cannot cancel a live run and do NOT require admin. Returned when admin is required and admin auth is absent. Outside the dev profile, with no declared auth boundary, also returned to any caller with no scoped token or admin session (issue #1802)."
         },
         {
           "status": 404,
@@ -7096,7 +7096,7 @@
   "name": "jitter_secs",
   "type": "integer",
   "required": false,
-  "description": "Random delay added to each fire, in seconds, to spread a thundering herd."
+  "description": "Jitter window in seconds. It spreads fires to avoid a thundering herd. 0 disables jitter. If omitted, a cron schedule with no seconds field gets 10 seconds. Other schedules get 0."
           },
           {
   "name": "overlap_policy",
@@ -7831,7 +7831,7 @@
           {
             "name": "jitter_secs",
             "type": "integer",
-            "description": "Jitter window in seconds. 0 disables jitter. Validated via validate_jitter."
+            "description": "Jitter window in seconds. 0 disables jitter. If omitted, a cron schedule with no seconds field gets 10 seconds, as on create. Validated via validate_jitter."
           },
           {
             "name": "overlap_policy",

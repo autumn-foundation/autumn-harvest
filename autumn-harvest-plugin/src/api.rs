@@ -90,7 +90,8 @@ use autumn_harvest::models::{
 };
 use autumn_harvest::payload_codec::{LossyDecodeOutcome, PayloadCodecs};
 use autumn_harvest::policy::{
-    Schedule, SkipPolicy, WorkflowSchedule, compute_jitter_offset, validate_jitter,
+    Schedule, SkipPolicy, WorkflowSchedule, compute_jitter_offset, default_schedule_jitter,
+    validate_jitter,
 };
 use autumn_harvest::queue::{self, ConcurrencyKeyStats};
 use autumn_harvest::reset::{
@@ -358,6 +359,8 @@ pub struct HarvestApiState {
     deployment_profile: Arc<Mutex<String>>,
     /// Whether the management API was mounted behind an embedder-provided auth boundary.
     admin_auth_boundary: Arc<Mutex<bool>>,
+    /// Explicit opt-out that opens mutating routes with no auth (issue #1802).
+    allow_unauthenticated_mutations: Arc<Mutex<bool>>,
     /// Autumn session key used by built-in guards when no outer auth boundary is configured.
     admin_auth_session_key: Arc<Mutex<String>>,
     /// When enabled, `/health` returns 503 until writable shards are ready.
@@ -461,6 +464,7 @@ impl Default for HarvestApiState {
             audit_retention_days: Arc::new(Mutex::new(None)),
             deployment_profile: Arc::new(Mutex::new("unknown".to_string())),
             admin_auth_boundary: Arc::new(Mutex::new(false)),
+            allow_unauthenticated_mutations: Arc::new(Mutex::new(false)),
             admin_auth_session_key: Arc::new(Mutex::new("user_id".to_string())),
             health_requires_shard_readiness: Arc::new(Mutex::new(false)),
             worker_shutdown_timeout: Arc::new(Mutex::new(std::time::Duration::from_secs(30))),
@@ -1166,6 +1170,24 @@ impl HarvestApiState {
             .expect("harvest api state lock poisoned") = present;
     }
 
+    /// Open the mutating routes to a caller with no credential (issue #1802).
+    ///
+    /// Outside the `dev` profile, a mount with no auth boundary refuses every
+    /// mutating route with 401. This opt-out restores the pre-#1802 posture
+    /// for routes with no admin gate. Admin-gated routes keep their gate.
+    /// `HarvestPlugin` and `HarvestEmbedding` log a startup warning while the
+    /// opt-out opens the routes. A raw router mount logs nothing.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn set_allow_unauthenticated_mutations(&self, allow: bool) {
+        *self
+            .allow_unauthenticated_mutations
+            .lock()
+            .expect("harvest api state lock poisoned") = allow;
+    }
+
     /// Set the Autumn session key used by built-in management guards.
     ///
     /// This mirrors `AppState::auth_session_key()` during plugin startup. Standalone
@@ -1219,6 +1241,13 @@ impl HarvestApiState {
     pub(crate) fn admin_auth_boundary(&self) -> bool {
         *self
             .admin_auth_boundary
+            .lock()
+            .expect("harvest api state lock poisoned")
+    }
+
+    pub(crate) fn allow_unauthenticated_mutations(&self) -> bool {
+        *self
+            .allow_unauthenticated_mutations
             .lock()
             .expect("harvest api state lock poisoned")
     }
@@ -3042,6 +3071,14 @@ struct PauseResumeRequest {
     reason: Option<String>,
 }
 
+/// Resolve a request `jitter_secs`. An omitted value gets `default_schedule_jitter`.
+fn requested_jitter(jitter_secs: Option<u64>, schedule: &Schedule) -> std::time::Duration {
+    jitter_secs.map_or_else(
+        || default_schedule_jitter(schedule),
+        std::time::Duration::from_secs,
+    )
+}
+
 /// Request body for `POST /admin/schedules/workflow`.
 #[derive(Debug, Deserialize)]
 struct CreateWorkflowScheduleRequest {
@@ -3064,9 +3101,10 @@ struct CreateWorkflowScheduleRequest {
     paused: bool,
     #[serde(default = "default_queue_name")]
     queue_name: String,
-    /// Jitter window in seconds. `0` disables jitter (default).
+    /// Jitter window in seconds. `0` disables jitter. If the request omits this
+    /// field, the schedule gets `default_schedule_jitter` (issue #1792).
     #[serde(default)]
-    jitter_secs: u64,
+    jitter_secs: Option<u64>,
     /// Overlap policy string (e.g. `"skip"`, `"buffer_one"`, `"buffer_all"`,
     /// `"cancel_other"`, `"terminate_other"`). Defaults to `"skip"`.
     #[serde(default = "default_overlap_policy")]
@@ -4772,6 +4810,11 @@ async fn by_id_missing_workflow_id(Path(_workflow_name): Path<String>) -> axum::
 #[allow(clippy::too_many_lines)]
 pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
     let require_admin = middleware::from_fn_with_state(api_state.clone(), require_harvest_admin);
+    // Issue #1802: outside `dev`, this gate refuses a mutating call with no
+    // credential. A declared boundary, a scoped token, an admin session or the
+    // opt-out admits it.
+    let require_mutation_auth =
+        middleware::from_fn_with_state(api_state.clone(), require_classified_mutation_auth);
     // issue #1278: the Vantage dead-letter page's bulk-action forms submit
     // here directly (a relative `../dead-letters/replay` /
     // `../dead-letters/discard` action from `/ui/dead-letters`), carrying
@@ -5480,6 +5523,9 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
             "/admin/tasks/{id}/eligibility",
             get(get_task_eligibility).route_layer(require_admin),
         )
+        // A route layer runs on a matched route only, so an unknown path
+        // still answers 404. It wraps every per-route layer above.
+        .route_layer(require_mutation_auth)
         .layer(Extension(api_state))
 }
 
@@ -5508,11 +5554,14 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
 /// ```
 ///
 /// [`HarvestPlugin`]: crate::HarvestPlugin
+// Each bool is an independent opt-in. A state machine would not fit them.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, Default)]
 pub struct StandaloneAdminAuth {
     api_tokens: bool,
     read_only_role: bool,
     admin_auth_boundary: bool,
+    allow_unauthenticated_mutations: bool,
     deployment_profile: Option<String>,
     admin_auth_session_key: Option<String>,
 }
@@ -5562,6 +5611,19 @@ impl StandaloneAdminAuth {
         self
     }
 
+    /// Open the mutating routes to a caller with no credential (issue #1802).
+    ///
+    /// Outside the `dev` profile, a mount with no declared auth boundary
+    /// refuses every mutating route with 401. This opt-out restores the
+    /// pre-#1802 posture for routes with no admin gate. [`Self::mount`] sets
+    /// the state from this declaration, the same as the boundary. See
+    /// [`HarvestApiState::set_allow_unauthenticated_mutations`].
+    #[must_use]
+    pub const fn allow_unauthenticated_mutations(mut self) -> Self {
+        self.allow_unauthenticated_mutations = true;
+        self
+    }
+
     /// Declare the deployment profile `preflight` reports.
     ///
     /// The profile is `unknown` when undeclared, which `preflight` reports as a
@@ -5606,6 +5668,7 @@ impl StandaloneAdminAuth {
     /// [`HarvestPlugin`]: crate::HarvestPlugin
     pub fn mount(&self, router: Router<()>, api_state: &HarvestApiState) -> Router<()> {
         api_state.set_admin_auth_boundary(self.admin_auth_boundary);
+        api_state.set_allow_unauthenticated_mutations(self.allow_unauthenticated_mutations);
         if let Some(profile) = &self.deployment_profile {
             api_state.set_deployment_profile(profile.clone());
         }
@@ -5693,6 +5756,88 @@ pub(crate) async fn require_harvest_admin(
     } else {
         AutumnError::unauthorized_msg("authentication required").into_response()
     }
+}
+
+/// Refuse an unauthenticated call to a `Mutating` route (issue #1802).
+///
+/// The class comes from `CLASSIFIED_ROUTES`, and an unclassified route counts
+/// as `Mutating`. An `OPTIONS` preflight is not a mutation, so it passes. A
+/// route with an admin gate runs this check first, then its
+/// own. This check admits every caller the admin gate admits, so the admin
+/// gate still decides. The per-route same-origin guard on the bulk
+/// dead-letter routes runs after this check, so an anonymous cross-site post
+/// there gets 401, not 403.
+pub(crate) async fn require_classified_mutation_auth(
+    State(api_state): State<HarvestApiState>,
+    request: axum::extract::Request,
+    next: Next,
+) -> axum::response::Response {
+    if request.method() == axum::http::Method::OPTIONS
+        || classify_route(request.method(), request.uri().path()) != RouteClass::Mutating
+    {
+        return next.run(request).await;
+    }
+    admit_mutation(&api_state, request, next).await
+}
+
+/// Refuse an unauthenticated mutation on a route outside `CLASSIFIED_ROUTES`
+/// (issue #1802).
+///
+/// Vantage and the MCP tool routes use it. Every method except `GET`, `HEAD`
+/// and `OPTIONS` counts as a mutation.
+pub(crate) async fn require_mutation_auth_by_method(
+    State(api_state): State<HarvestApiState>,
+    request: axum::extract::Request,
+    next: Next,
+) -> axum::response::Response {
+    if matches!(
+        *request.method(),
+        axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
+    ) {
+        return next.run(request).await;
+    }
+    admit_mutation(&api_state, request, next).await
+}
+
+async fn admit_mutation(
+    api_state: &HarvestApiState,
+    request: axum::extract::Request,
+    next: Next,
+) -> axum::response::Response {
+    let has_token = request
+        .extensions()
+        .get::<crate::api_token::TokenPrincipal>()
+        .is_some();
+    let session = request.extensions().get::<Session>().cloned();
+    if mutation_admitted(api_state, has_token, session).await {
+        next.run(request).await
+    } else {
+        AutumnError::unauthorized_msg("authentication required").into_response()
+    }
+}
+
+/// Whether the mutation gate admits a caller (issue #1802).
+///
+/// The gate is open in the `dev` profile, under a declared auth boundary, and
+/// under the explicit opt-out. Otherwise the caller must present a verified
+/// scoped token or pass the admin check.
+async fn mutation_admitted(
+    api_state: &HarvestApiState,
+    has_token: bool,
+    session: Option<Session>,
+) -> bool {
+    let auth_boundary_present = api_state.admin_auth_boundary();
+    if auth_boundary_present
+        || crate::boot::unauthenticated_mutations_open(
+            &api_state.deployment_profile(),
+            auth_boundary_present,
+            api_state.allow_unauthenticated_mutations(),
+        )
+        || has_token
+    {
+        return true;
+    }
+    has_harvest_admin_access(api_state, session).await
 }
 
 /// Whether the request established a session principal at all (issue #1284).
@@ -27345,6 +27490,7 @@ async fn create_workflow_schedule(
         }
     }
 
+    let jitter = requested_jitter(request.jitter_secs, &schedule);
     let ws = WorkflowSchedule {
         workflow_name: request.workflow_name.clone(),
         dag_name: None,
@@ -27354,7 +27500,7 @@ async fn create_workflow_schedule(
         max_active_runs: request.max_active_runs,
         paused: request.paused,
         queue_name: request.queue_name.clone(),
-        jitter: std::time::Duration::from_secs(request.jitter_secs),
+        jitter,
         overlap_policy,
         buffer_all_max: request.buffer_all_max,
         execution_timeout: None,
@@ -33485,13 +33631,11 @@ async fn run_replay_canary_handler(
 ///     The `query_timeout` bound applies to async-yielding replays; a workflow
 ///     function that busy-loops synchronously without ever `.await`-ing is out of
 ///     scope, exactly as for the live executor. A large but healthy history is
-///     not at risk: `SUSPENSION_TIMEOUT` (the executor's per-cycle 100 ms
-///     suspension heuristic) only fires when the handler future is genuinely
-///     *pending* on an unresolved oneshot at the replay frontier — it never cuts
-///     off a CPU-bound replay consuming recorded events, so a completed history
-///     replays to its verdict regardless of wall-clock duration, bounded only by
-///     this outer `query_timeout` (ample headroom for the ~<200 ms/10k-event
-///     replay budget, issue #135).
+///     not at risk. The executor suspends only when the handler is pending on
+///     a parked Harvest future (issue #1797). It never cuts off a CPU-bound
+///     replay that consumes recorded events. A completed history therefore
+///     replays to its verdict, bounded only by this outer `query_timeout`. That
+///     gives ample headroom for the ~<200 ms/10k-event replay budget (issue #135).
 ///   * `410` — history unavailable: a terminal execution whose recorded history
 ///     is incomplete (truncated before its terminal seal — pruned by retention
 ///     or released on reset), or a terminal execution whose payloads were
@@ -44734,8 +44878,10 @@ struct CandidateSchedulePreviewRequest {
     max_active_runs: u32,
     #[serde(default)]
     paused: bool,
+    /// If the request omits this field, the preview uses `default_schedule_jitter`,
+    /// as create does.
     #[serde(default)]
-    jitter_secs: u64,
+    jitter_secs: Option<u64>,
     #[serde(default = "default_overlap_policy")]
     overlap_policy: String,
     #[serde(default = "default_buffer_all_max")]
@@ -45207,9 +45353,9 @@ async fn preview_candidate_schedule_handler(
         ));
     }
 
-    // Validate jitter before i64 conversion; body.jitter_secs is u64 so an
-    // overly large value would overflow chrono::Duration::seconds and panic.
-    let jitter_duration = std::time::Duration::from_secs(body.jitter_secs);
+    // Validate jitter before the i64 conversion. A u64 second count can
+    // overflow chrono::Duration::seconds and panic.
+    let jitter_duration = requested_jitter(body.jitter_secs, &schedule);
     if let Err(e) = validate_jitter(&schedule, jitter_duration) {
         return Ok((
             StatusCode::BAD_REQUEST,
@@ -45218,7 +45364,7 @@ async fn preview_candidate_schedule_handler(
     }
     // Safe after validate_jitter: valid jitter is at most 3600 s for cron,
     // or less than the interval period, both well within i64 range.
-    let jitter_secs = i64::try_from(body.jitter_secs).unwrap_or(i64::MAX);
+    let jitter_secs = i64::try_from(jitter_duration.as_secs()).unwrap_or(i64::MAX);
 
     // Verify the calendar exists before returning any result so that a typo
     // here gets a 400 even when the schedule is paused.  Exclusion dates are
@@ -45295,10 +45441,9 @@ async fn preview_candidate_schedule_handler(
         raw_entries.iter().map(|e| e.effective_at).collect();
 
     if jitter_secs > 0 {
-        let jitter_window = std::time::Duration::from_secs(body.jitter_secs);
         for entry in &mut raw_entries {
             if let Some(t) = entry.effective_at {
-                let offset = compute_jitter_offset(schedule_id, t, jitter_window);
+                let offset = compute_jitter_offset(schedule_id, t, jitter_duration);
                 if let Ok(d) = chrono::Duration::from_std(offset) {
                     entry.effective_at = Some(t + d);
                 }
@@ -54249,10 +54394,28 @@ mod tests {
             serde_json::from_str(json).expect("should deserialize minimal body");
         assert_eq!(req.schedule_expr, "0 9 * * 1-5");
         assert_eq!(req.timezone, "UTC");
-        assert_eq!(req.jitter_secs, 0);
+        assert_eq!(req.jitter_secs, None);
         assert_eq!(req.overlap_policy, "skip");
         assert_eq!(req.count, 10);
         assert!(req.from.is_none());
+    }
+
+    /// An omitted `jitter_secs` gets the cron default; an explicit 0 opts out
+    /// (issue #1792).
+    #[test]
+    fn requested_jitter_defaults_only_when_omitted() {
+        let cron = Schedule::Cron("0 9 * * *".to_string());
+        assert_eq!(
+            requested_jitter(None, &cron),
+            autumn_harvest::policy::DEFAULT_CRON_JITTER
+        );
+        assert_eq!(requested_jitter(Some(0), &cron), std::time::Duration::ZERO);
+        assert_eq!(
+            requested_jitter(Some(300), &cron),
+            std::time::Duration::from_secs(300)
+        );
+        let seconds = Schedule::Cron("*/5 * * * * *".to_string());
+        assert_eq!(requested_jitter(None, &seconds), std::time::Duration::ZERO);
     }
 
     #[test]
@@ -54269,7 +54432,7 @@ mod tests {
         let req: CandidateSchedulePreviewRequest =
             serde_json::from_str(json).expect("should deserialize full body");
         assert_eq!(req.timezone, "America/Los_Angeles");
-        assert_eq!(req.jitter_secs, 300);
+        assert_eq!(req.jitter_secs, Some(300));
         assert_eq!(req.overlap_policy, "cancel_other");
         assert_eq!(req.count, 20);
         assert_eq!(req.from.as_deref(), Some("2026-06-01T09:00:00Z"));
@@ -54910,7 +55073,7 @@ mod tests {
         );
         let req: CandidateSchedulePreviewRequest =
             serde_json::from_str(&json).expect("u64::MAX must parse into the struct");
-        assert_eq!(req.jitter_secs, u64::MAX);
+        assert_eq!(req.jitter_secs, Some(u64::MAX));
     }
 
     #[test]
@@ -58591,5 +58754,45 @@ mod tests {
             &no_build_ids,
             ""
         ));
+    }
+}
+
+#[cfg(test)]
+mod mutation_gate_tests {
+    use super::*;
+    use tower::ServiceExt as _;
+
+    async fn start_status(with_token: bool) -> StatusCode {
+        let api_state = HarvestApiState::new();
+        api_state.set_deployment_profile("prod");
+        let mut request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/workflows/w/start")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from("{}"))
+            .unwrap();
+        if with_token {
+            request
+                .extensions_mut()
+                .insert(crate::api_token::TokenPrincipal {
+                    id: uuid::Uuid::nil(),
+                    scope: crate::api_token::TokenScope::Mutate,
+                });
+        }
+        harvest_api_router(api_state)
+            .oneshot(request)
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// Issue #1802: a verified scoped token passes the gate on a route with
+    /// no admin gate. The token layer sets `TokenPrincipal` in production.
+    #[tokio::test]
+    async fn a_verified_token_passes_the_mutation_gate() {
+        assert_eq!(start_status(false).await, StatusCode::UNAUTHORIZED);
+        let status = start_status(true).await;
+        assert_ne!(status, StatusCode::UNAUTHORIZED);
+        assert_ne!(status, StatusCode::FORBIDDEN);
     }
 }

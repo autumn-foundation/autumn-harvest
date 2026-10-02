@@ -16,7 +16,10 @@ non-terminally:
   `worker.rs`). Retries are otherwise **unbounded** — the block is
   rate-limited, not attempt-capped, so a rollback at *any* later time still
   resumes the execution. A permanently diverging history costs one dispatch
-  per ≤300s, never a hot loop.
+  every 150s to 300s, never a hot loop.
+- **Jittered re-dispatch.** Each delay is in `[base/2, base]` (issue #1792).
+  The seed comes from the execution id. When one deploy blocks many
+  executions, they do not re-dispatch together.
 - **Diagnostic stamped.** The execution row records `nd_blocked_at` (most
   recent observation), `nd_block_reason` (the divergence error), and
   `nd_block_count` (consecutive blocks — drives the backoff); `search_attrs`
@@ -76,8 +79,10 @@ recorded command under an earlier deploy blocks on its next wake. The
 run to before `event_index`, or terminate it.
 
 A block with `expected: <workflow suspended early>` and a `clean` diagnosis
-has a different cause. The workflow body awaits non-durable work for more
-than 100 ms during replay. Move that work into an activity.
+has a different cause. The workflow body awaits non-durable work beside a
+durable await, so the cycle suspends before that work ends (issue #1797).
+Move that work into an activity. Non-durable work alone does not block: after
+2 s it fails the workflow task, and the worker retries the task.
 
 ## Diagnose the divergence (issue #614)
 
@@ -134,8 +139,8 @@ released on reset, or PII-erased); `408` = the replay exceeded the bounded
 `query_timeout` budget — the bound applies to async-yielding replays, and a
 workflow that busy-loops synchronously without ever `.await`-ing is out of scope,
 exactly as for the live executor (a large but healthy history is not at risk:
-the executor's 100 ms per-cycle suspension heuristic only fires at a genuine
-frontier suspension, never on a CPU-bound replay of recorded events).
+the executor suspends only on a parked durable await (issue #1797), never on
+a CPU-bound replay of recorded events).
 
 ## Roll back
 

@@ -36,16 +36,16 @@
 //! still returns before any query. It then reports `export_observed = 0` for
 //! each shard it serves, because the gauges would otherwise keep a healthy value.
 //!
-//! Write behavior does not. `harvest_audit_log_unexported_idx` is a partial
-//! index on `export_seq IS NULL`. An unconfigured deployment leaves every row
-//! `NULL` forever, so the index matches the whole audit table, and every
-//! audit insert pays its maintenance cost. That cost is bounded only while
-//! retention actually reclaims unexported rows. See `docs/audit-export.md`'s
-//! "Retention interaction" section for the exact conditions: they are more
-//! than one config flag. Tracked as issue #1272. Even then the bound is not
-//! total. Retention can never purge a decommission or reactivation record,
-//! exported or not. That holds no matter how many requests a shard has
-//! seen.
+//! Write behavior matched that before issue #1667. The partial index
+//! `harvest_audit_log_unexported_idx` matches every row while `export_seq` stays
+//! `NULL`. It then added maintenance cost to each audit insert and served no
+//! read (issue #1272). The index is now built lazily. [`ensure_unexported_index`]
+//! builds it on the first export tick, and a migration drops it from databases
+//! that never ran export. An unconfigured deployment pays no index maintenance
+//! cost. Once export runs, the index size is bounded only while retention
+//! reclaims unexported rows. See "Retention interaction" in
+//! `docs/audit-export.md`. Retention can never
+//! purge a decommission or reactivation record, exported or not.
 //!
 //! # Where the monotonic sequence comes from (and why not `BIGSERIAL`)
 //!
@@ -491,8 +491,8 @@ pub const fn resolve_rewind(current_acked: i64, requested: i64) -> RewindOutcome
 ///
 /// With `sink` and `webhook_url` both `None` — the default — audit export is
 /// never installed and the scanner is entirely inert (AC8). The partial
-/// index still costs insert-time maintenance; see the module-level caveat
-/// above (issue #1272).
+/// index does not exist until export first runs; see the module-level note
+/// above (issues #1272 and #1667).
 #[derive(Clone)]
 pub struct AuditExportBuilderConfig {
     /// Allowed sink hosts. Required (non-empty) for a `webhook_url` to
@@ -788,9 +788,8 @@ pub const DEFAULT_EXPORT_LEASE: std::time::Duration = std::time::Duration::from_
 /// `None` (the default, before any builder wiring runs) means the scanner is
 /// fully inert. [`fire_due_audit_exports`] returns `Ok(0)` before issuing a
 /// query, so an embedder who never configures a sink sees zero query
-/// behavior change and zero scanner work (AC8). The partial index is not
-/// part of that guarantee — see the module-level caveat above (issue
-/// #1272).
+/// behavior change and zero scanner work (AC8). The partial index is built
+/// lazily on the first tick; see the module-level note above (issue #1667).
 #[derive(Clone)]
 pub struct AuditExportRuntimeConfig {
     /// Embedder-supplied (or plugin-default) transport.
@@ -1100,6 +1099,802 @@ pub async fn ensure_cursor_row(
     .await
     .map_err(crate::error::database_error)?;
     Ok(())
+}
+
+/// The statement that builds the claim-scan index.
+///
+/// The exporter runs it on a dedicated connection. An operator runs it once,
+/// as the table owner, when the worker role cannot.
+pub const UNEXPORTED_INDEX_DDL: &str = "CREATE INDEX CONCURRENTLY IF NOT EXISTS \
+     harvest_audit_log_unexported_idx ON harvest_audit_log (occurred_at, id) \
+     WHERE export_seq IS NULL";
+
+/// The statement that clears an invalid claim-scan index.
+///
+/// An operator runs it before [`UNEXPORTED_INDEX_DDL`] when the index exists
+/// but is invalid. `IF NOT EXISTS` skips an invalid index, so the build
+/// statement alone leaves it in place. Run each statement on its own: a
+/// concurrent index statement cannot share a transaction.
+pub const UNEXPORTED_INDEX_DROP_DDL: &str =
+    "DROP INDEX CONCURRENTLY IF EXISTS harvest_audit_log_unexported_idx";
+
+/// [`UNEXPORTED_INDEX_DDL`] for a named schema.
+///
+/// `CREATE INDEX` takes an unqualified index name. The index lands in the
+/// schema of its table, so only the table is qualified.
+#[must_use]
+pub fn unexported_index_ddl_in(schema: &str) -> String {
+    format!(
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS harvest_audit_log_unexported_idx \
+         ON {schema}.harvest_audit_log (occurred_at, id) WHERE export_seq IS NULL"
+    )
+}
+
+/// [`UNEXPORTED_INDEX_DROP_DDL`] for a named schema.
+#[must_use]
+pub fn unexported_index_drop_ddl_in(schema: &str) -> String {
+    format!("DROP INDEX CONCURRENTLY IF EXISTS {schema}.harvest_audit_log_unexported_idx")
+}
+
+/// Advisory-lock class for builds of the claim-scan index.
+///
+/// The lock takes two keys: this class and [`UNEXPORTED_INDEX_LOCK_OBJECT_SQL`].
+pub const UNEXPORTED_INDEX_LOCK_CLASS: i32 = 0x6175_6469;
+
+/// SQL for the second lock key: the identity of the audit table.
+///
+/// Advisory locks are scoped to a database. Tenant schemas in one database each
+/// hold their own table and index, so the key names the table the session
+/// resolves. Only builders of the same table then serialize.
+pub const UNEXPORTED_INDEX_LOCK_OBJECT_SQL: &str =
+    "hashtext(to_regclass('harvest_audit_log')::oid::text)";
+
+/// What [`ensure_unexported_index`] found or did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnexportedIndexOutcome {
+    /// The index exists and `pg_index.indisvalid` is true.
+    Ready,
+    /// Another session holds the lock for this audit table. Nothing was built.
+    /// The caller must try again later.
+    LockBusy,
+}
+
+/// Build the claim-scan index if it is missing or invalid (issue #1667).
+///
+/// The index `harvest_audit_log_unexported_idx` matches every audit row while
+/// no sink is configured. It would add cost to each insert and serve no read.
+/// So no migration creates it. The exporter builds it here, off the export
+/// tick.
+///
+/// The build uses `CREATE INDEX CONCURRENTLY`, so audit inserts continue. A
+/// failed concurrent build leaves an invalid index. This function drops and
+/// rebuilds such an index. A session advisory lock keeps two exporters from
+/// dropping each other's build. A caller that loses the race gets
+/// [`UnexportedIndexOutcome::LockBusy`] at once. The claim scan is correct
+/// without the index, only slower.
+///
+/// `conn` must be a dedicated connection, outside a transaction. The build can
+/// hold it for minutes, so a pooled connection would starve the pool. On `Err`
+/// the caller must drop the connection: the advisory lock may still be held,
+/// and `statement_timeout` may still be off.
+///
+/// [`UnexportedIndexOutcome::Ready`] is returned only after a fresh read of
+/// `pg_index.indisvalid` confirms the index.
+///
+/// # Errors
+/// Returns `HarvestError` on a database failure. A role that does not own the
+/// table gets a privilege error; see [`index_build_needs_owner`].
+#[cfg(feature = "db")]
+pub async fn ensure_unexported_index(
+    conn: &mut diesel_async::AsyncPgConnection,
+) -> crate::error::HarvestResult<UnexportedIndexOutcome> {
+    use diesel_async::RunQueryDsl;
+
+    #[derive(diesel::QueryableByName)]
+    struct Flag {
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        flag: bool,
+    }
+
+    if unexported_index_valid(conn).await? == Some(true) {
+        return Ok(UnexportedIndexOutcome::Ready);
+    }
+    let locked: Vec<Flag> = diesel::sql_query(format!(
+        "SELECT pg_try_advisory_lock($1, {UNEXPORTED_INDEX_LOCK_OBJECT_SQL}) AS flag"
+    ))
+    .bind::<diesel::sql_types::Integer, _>(UNEXPORTED_INDEX_LOCK_CLASS)
+    .load(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+    if !locked.into_iter().next().is_some_and(|row| row.flag) {
+        return Ok(UnexportedIndexOutcome::LockBusy);
+    }
+    let built = build_unexported_index(conn).await;
+    // The lock belongs to the session. A failed unlock leaves the lock on a
+    // live session, so this error takes precedence over the build result.
+    diesel::sql_query(format!(
+        "SELECT pg_advisory_unlock($1, {UNEXPORTED_INDEX_LOCK_OBJECT_SQL})"
+    ))
+    .bind::<diesel::sql_types::Integer, _>(UNEXPORTED_INDEX_LOCK_CLASS)
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+    built?;
+    // `CREATE INDEX CONCURRENTLY` can return without an error and still leave
+    // an invalid index. Only the catalog proves the build.
+    match unexported_index_valid(conn).await? {
+        Some(true) => Ok(UnexportedIndexOutcome::Ready),
+        state => Err(crate::error::HarvestError::Database(format!(
+            "harvest_audit_log_unexported_idx is not valid after the build: {state:?}"
+        ))),
+    }
+}
+
+/// Whether an [`ensure_unexported_index`] error means the role cannot build.
+///
+/// `CREATE INDEX` on `harvest_audit_log` needs table ownership. A worker role
+/// with DML rights only gets SQLSTATE `42501`. A retry cannot fix that. The
+/// caller logs the statements an operator must run and waits
+/// [`INDEX_BUILD_REFUSED_RETRY`].
+#[cfg(feature = "db")]
+#[must_use]
+pub fn index_build_needs_owner(error: &crate::error::HarvestError) -> bool {
+    match error {
+        crate::error::HarvestError::Database(message) => {
+            message.contains("42501")
+                || message.contains("must be owner")
+                || message.contains("permission denied")
+        }
+        _ => false,
+    }
+}
+
+/// `None` when the index is missing, else whether it is valid.
+#[cfg(feature = "db")]
+async fn unexported_index_valid(
+    conn: &mut diesel_async::AsyncPgConnection,
+) -> crate::error::HarvestResult<Option<bool>> {
+    use diesel_async::RunQueryDsl;
+
+    #[derive(diesel::QueryableByName)]
+    struct State {
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        valid: bool,
+    }
+
+    // Bind the index to the table this session resolves. An index of the same
+    // name in another schema of `search_path` must not count.
+    let rows: Vec<State> = diesel::sql_query(
+        "SELECT i.indisvalid AS valid FROM pg_index i \
+         JOIN pg_class c ON c.oid = i.indexrelid \
+         WHERE c.relname = 'harvest_audit_log_unexported_idx' \
+           AND i.indrelid = to_regclass('harvest_audit_log')",
+    )
+    .load(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+    Ok(rows.into_iter().next().map(|row| row.valid))
+}
+
+/// Build the index. The caller holds the advisory lock for this audit table.
+#[cfg(feature = "db")]
+async fn build_unexported_index(
+    conn: &mut diesel_async::AsyncPgConnection,
+) -> crate::error::HarvestResult<()> {
+    use diesel_async::RunQueryDsl;
+
+    #[derive(diesel::QueryableByName)]
+    struct Setting {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        value: String,
+    }
+
+    // A role or database timeout shorter than the build would fail it on every
+    // try. A short `lock_timeout` fails the concurrent statements the same
+    // way while they wait for a conflicting lock. The drop of an invalid index
+    // waits like the build, so the override covers both statements. Capture
+    // each session value first and restore that exact value after. `RESET`
+    // would restore the role or database default instead.
+    const OVERRIDDEN: [&str; 2] = ["statement_timeout", "lock_timeout"];
+    let mut previous = Vec::with_capacity(OVERRIDDEN.len());
+    for name in OVERRIDDEN {
+        let value: Vec<Setting> =
+            diesel::sql_query(format!("SELECT current_setting('{name}') AS value"))
+                .load(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+        previous.push(
+            value
+                .into_iter()
+                .next()
+                .map_or_else(|| "0".to_owned(), |row| row.value),
+        );
+    }
+    for name in OVERRIDDEN {
+        diesel::sql_query(format!("SET {name} = 0"))
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+    }
+    let built = repair_and_build_unexported_index(conn).await;
+    let mut restored = Ok(());
+    for (name, value) in OVERRIDDEN.into_iter().zip(previous) {
+        let result = diesel::sql_query(format!("SELECT set_config('{name}', $1, false)"))
+            .bind::<diesel::sql_types::Text, _>(value)
+            .execute(conn)
+            .await
+            .map(|_| ())
+            .map_err(crate::error::database_error);
+        restored = restored.and(result);
+    }
+    built?;
+    restored?;
+    Ok(())
+}
+
+/// Drop an invalid index, then build it. The caller disables the timeouts.
+#[cfg(feature = "db")]
+async fn repair_and_build_unexported_index(
+    conn: &mut diesel_async::AsyncPgConnection,
+) -> crate::error::HarvestResult<()> {
+    use diesel_async::RunQueryDsl;
+
+    // Re-check under the lock: another exporter may have finished the build.
+    match unexported_index_valid(conn).await? {
+        Some(true) => return Ok(()),
+        Some(false) => {
+            diesel::sql_query("DROP INDEX CONCURRENTLY IF EXISTS harvest_audit_log_unexported_idx")
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+        }
+        None => {}
+    }
+    tracing::info!("[audit_export] building harvest_audit_log_unexported_idx (issue #1667)");
+    diesel::sql_query(UNEXPORTED_INDEX_DDL)
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(())
+}
+
+/// A fingerprint of a database URL for use in a gate key.
+///
+/// The gates are process-wide statics. A URL can carry a password, and a key
+/// outlives the worker that made it. So a key holds this hash and never the
+/// URL text. The hash is stable inside one process, which is all a gate needs.
+#[cfg(feature = "db")]
+fn dsn_fingerprint(dsn: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    dsn.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// A shard of one audit table. The URL separates databases that share a shard
+/// number inside one process. The schema separates tenant tables in one
+/// database.
+#[cfg(feature = "db")]
+type BuildKey = (i32, u64, String);
+
+/// Earliest time each shard may try another background index build.
+#[cfg(feature = "db")]
+static INDEX_BUILD_GATE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<BuildKey, std::time::Instant>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Longest wait for the build connection to open.
+#[cfg(feature = "db")]
+const INDEX_BUILD_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Wait between repeats of an operator notice about the index.
+#[cfg(feature = "db")]
+const INDEX_NOTICE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// A shard of one audit table in one database. The identity names the database
+/// and the schema, so neither merges with another that shares a shard number.
+#[cfg(feature = "db")]
+type NoticeKey = (i32, String);
+
+/// When each shard in each database last logged an operator notice.
+#[cfg(feature = "db")]
+static INDEX_NOTICE_GATE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<NoticeKey, std::time::Instant>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Whether this shard may log an operator notice about the index now.
+#[cfg(feature = "db")]
+fn index_notice_due(key: &NoticeKey) -> bool {
+    let mut gate = INDEX_NOTICE_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let now = std::time::Instant::now();
+    if gate
+        .get(key)
+        .is_some_and(|last| now.duration_since(*last) < INDEX_NOTICE_INTERVAL)
+    {
+        return false;
+    }
+    gate.retain(|_, last| now.duration_since(*last) < INDEX_NOTICE_INTERVAL);
+    gate.insert(key.clone(), now);
+    true
+}
+
+/// Join the parts that name a database cluster.
+///
+/// A Unix-socket connection has no address and no port. The start time of the
+/// postmaster then tells two clusters with the same database name apart.
+#[cfg(feature = "db")]
+fn database_identity_of(name: &str, addr: &str, port: &str, started: &str) -> String {
+    format!("{name}@{addr}:{port}@{started}")
+}
+
+/// Name the database behind a connection: its name, host address, port and
+/// postmaster start time.
+///
+/// An empty name on error only merges the gates of the databases it cannot
+/// name.
+#[cfg(feature = "db")]
+async fn database_identity(conn: &mut diesel_async::AsyncPgConnection) -> String {
+    use diesel_async::RunQueryDsl;
+
+    #[derive(diesel::QueryableByName)]
+    struct Identity {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        name: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        addr: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        port: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        started: String,
+    }
+
+    let rows: Result<Vec<Identity>, _> = diesel::sql_query(
+        "SELECT current_database()::text AS name, \
+                COALESCE(inet_server_addr()::text, '') AS addr, \
+                COALESCE(inet_server_port()::text, '') AS port, \
+                pg_postmaster_start_time()::text AS started",
+    )
+    .load(conn)
+    .await;
+    rows.ok()
+        .and_then(|rows| rows.into_iter().next())
+        .map(|row| database_identity_of(&row.name, &row.addr, &row.port, &row.started))
+        .unwrap_or_default()
+}
+
+/// Run `future` unless `cancel` fires first. `None` means shutdown won.
+///
+/// A catalog probe on a stalled connection never returns. Graceful shutdown
+/// awaits the checker, so each probe must race the cancel token.
+#[cfg(feature = "db")]
+async fn until_cancelled<F: std::future::Future>(
+    cancel: &tokio_util::sync::CancellationToken,
+    future: F,
+) -> Option<F::Output> {
+    tokio::select! {
+        output = future => Some(output),
+        () = cancel.cancelled() => None,
+    }
+}
+
+/// Log an operator notice once per interval, only while the index is not valid.
+///
+/// A valid index never uses the gate, so a healthy database cannot hide the
+/// notice of another database that has the same shard number.
+#[cfg(feature = "db")]
+async fn index_notice_wanted(conn: &mut diesel_async::AsyncPgConnection, shard_id: i32) -> bool {
+    if matches!(unexported_index_valid(conn).await, Ok(Some(true))) {
+        return false;
+    }
+    // Tenant schemas in one database share its identity and may share a shard
+    // number, so the resolved schema is part of the key.
+    let schema = audit_table_schema(conn).await.unwrap_or_default();
+    let key = notice_key(shard_id, &database_identity(conn).await, &schema);
+    index_notice_due(&key)
+}
+
+/// The throttle key for one shard of one audit table in one database.
+#[cfg(feature = "db")]
+fn notice_key(shard_id: i32, database: &str, schema: &str) -> NoticeKey {
+    (shard_id, format!("{database}/{schema}"))
+}
+
+/// A shard, build URL and pool. The pool separates tenant schemas that share a
+/// shard number and a build URL.
+#[cfg(feature = "db")]
+type ProbeKey = (i32, u64, usize);
+
+/// Shortest wait between two catalog probes for one [`ProbeKey`].
+#[cfg(feature = "db")]
+const INDEX_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// When each [`ProbeKey`] may next probe the catalogs.
+#[cfg(feature = "db")]
+static INDEX_PROBE_GATE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<ProbeKey, std::time::Instant>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Whether this checker may probe the index catalogs now.
+///
+/// A healthy exporter ticks every poll interval. Two catalog reads per tick
+/// would run for as long as the worker lives. One probe per
+/// [`INDEX_PROBE_INTERVAL`] bounds that cost, and still finds a dropped or
+/// invalid index within the interval.
+#[cfg(feature = "db")]
+fn index_probe_due(key: &ProbeKey) -> bool {
+    let mut gate = INDEX_PROBE_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let now = std::time::Instant::now();
+    if gate.get(key).is_some_and(|not_before| now < *not_before) {
+        return false;
+    }
+    // An expired entry means the same as no entry. Evict it, so churn in
+    // workers and pools cannot grow the map.
+    gate.retain(|_, not_before| now < *not_before);
+    gate.insert(*key, now + INDEX_PROBE_INTERVAL);
+    true
+}
+
+/// Wait after a failed or skipped background build before the next attempt.
+#[cfg(feature = "db")]
+const INDEX_BUILD_RETRY: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Gate wait while a build task is alive. The end of the task replaces it.
+#[cfg(feature = "db")]
+const INDEX_BUILD_IN_FLIGHT: std::time::Duration = std::time::Duration::from_secs(365 * 24 * 3600);
+
+/// Wait after a build the role may not run. Only an operator can fix it.
+#[cfg(feature = "db")]
+pub const INDEX_BUILD_REFUSED_RETRY: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// How a background build ended, and so when the shard may try again.
+#[cfg(feature = "db")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuildEnd {
+    /// The catalog confirmed a valid index. The gate opens at once.
+    Ready,
+    /// A failure, a lost lock race, or a shutdown. Wait [`INDEX_BUILD_RETRY`].
+    Retry,
+    /// The role cannot build. Wait [`INDEX_BUILD_REFUSED_RETRY`].
+    Refused,
+}
+
+/// Holds the in-flight mark of a build gate.
+///
+/// Shutdown can drop a build future at any await point. A dropped guard turns
+/// the gate into an ordinary retry wait, so the in-flight period never
+/// outlives the future that owns it. `disarm` hands the end of the build to
+/// the caller.
+#[cfg(feature = "db")]
+struct InFlightGuard(Option<BuildKey>);
+
+#[cfg(feature = "db")]
+impl InFlightGuard {
+    const fn new(key: BuildKey) -> Self {
+        Self(Some(key))
+    }
+
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+#[cfg(feature = "db")]
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if let Some(key) = self.0.take() {
+            index_build_finished(&key, BuildEnd::Retry);
+        }
+    }
+}
+
+/// Claim the right to start a build for this shard. Marks it in flight.
+#[cfg(feature = "db")]
+fn index_build_due(key: &BuildKey) -> bool {
+    let mut gate = INDEX_BUILD_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let now = std::time::Instant::now();
+    if gate.get(key).is_some_and(|not_before| now < *not_before) {
+        return false;
+    }
+    // The task is in flight until it calls `index_build_finished`. A task can
+    // stall after it connects, and a build can outlive any retry wait. A timed
+    // gate would then reopen and stack another task per wait. So the gate stays
+    // closed while the task lives, and its end sets the next wait.
+    gate.retain(|_, not_before| now < *not_before);
+    gate.insert(key.clone(), now + INDEX_BUILD_IN_FLIGHT);
+    true
+}
+
+/// Record how a build ended. Only [`BuildEnd::Ready`] opens the gate.
+#[cfg(feature = "db")]
+fn index_build_finished(key: &BuildKey, end: BuildEnd) {
+    let mut gate = INDEX_BUILD_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let now = std::time::Instant::now();
+    match end {
+        BuildEnd::Ready => {
+            gate.remove(key);
+        }
+        BuildEnd::Retry => {
+            gate.insert(key.clone(), now + INDEX_BUILD_RETRY);
+        }
+        BuildEnd::Refused => {
+            gate.insert(key.clone(), now + INDEX_BUILD_REFUSED_RETRY);
+        }
+    }
+}
+
+/// Open a dedicated connection to `dsn` and run [`ensure_unexported_index`].
+///
+/// The connection is never pooled. It closes when this function returns, or
+/// when the caller drops the future. Postgres then cancels a running build and
+/// leaves an invalid index, which the next attempt drops and rebuilds.
+#[cfg(feature = "db")]
+async fn build_unexported_index_on_dedicated_connection(
+    dsn: &str,
+    schema: &str,
+    connect_timeout: std::time::Duration,
+) -> crate::error::HarvestResult<UnexportedIndexOutcome> {
+    use diesel_async::RunQueryDsl;
+
+    // A host can accept the socket and never finish the handshake. Without a
+    // bound, the stalled task outlives the retry gate and tasks pile up. The
+    // connector follows the listener's transport rule, so `sslmode=require`
+    // gets verified TLS.
+    let mut conn = tokio::time::timeout(connect_timeout, crate::notify::connect_async_pg(dsn))
+        .await
+        .map_err(|_| {
+            crate::error::HarvestError::Database(format!(
+                "connect to the index build URL timed out after {connect_timeout:?}"
+            ))
+        })??;
+    // The pool may select its relations through `search_path`, and the build
+    // role can differ from the pool role. `schema` names the schema that holds
+    // the pool session's table, so no `"$user"` token is re-expanded here.
+    diesel::sql_query("SELECT set_config('search_path', $1, false)")
+        .bind::<diesel::sql_types::Text, _>(schema)
+        .execute(&mut conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    let outcome = ensure_unexported_index(&mut conn).await;
+    // On `Err` the session may still hold the advisory lock. Closing the
+    // connection releases it either way.
+    drop(conn);
+    outcome
+}
+
+/// The quoted name of the schema that holds `harvest_audit_log` for the
+/// pool's own session.
+#[cfg(feature = "db")]
+async fn audit_table_schema(
+    conn: &mut diesel_async::AsyncPgConnection,
+) -> crate::error::HarvestResult<String> {
+    use diesel_async::RunQueryDsl;
+
+    #[derive(diesel::QueryableByName)]
+    struct Schema {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        value: String,
+    }
+
+    let rows: Vec<Schema> = diesel::sql_query(
+        "SELECT quote_ident(n.nspname)::text AS value FROM pg_class c \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE c.oid = to_regclass('harvest_audit_log')",
+    )
+    .load(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+    rows.into_iter().next().map(|row| row.value).ok_or_else(|| {
+        crate::error::HarvestError::Database(
+            "harvest_audit_log is not visible to the pool session".to_owned(),
+        )
+    })
+}
+
+/// The build and cleanup statements for the schema this session resolves.
+///
+/// An operator may run them through a role with another default path. Without
+/// a resolved schema they fall back to the unqualified statements.
+#[cfg(feature = "db")]
+async fn operator_ddl(conn: &mut diesel_async::AsyncPgConnection) -> (String, String) {
+    audit_table_schema(conn).await.map_or_else(
+        |_| {
+            (
+                UNEXPORTED_INDEX_DDL.to_owned(),
+                UNEXPORTED_INDEX_DROP_DDL.to_owned(),
+            )
+        },
+        |schema| {
+            (
+                unexported_index_ddl_in(&schema),
+                unexported_index_drop_ddl_in(&schema),
+            )
+        },
+    )
+}
+
+/// Start the index build in a detached task, off the export tick (issue #1667).
+///
+/// The build can take minutes on a large table. It must not delay a claim,
+/// the lag gauge or the lease. It must not hold a pooled connection either: a
+/// shard pool may have one connection, and that connection serves the export.
+/// So the task opens its own connection to `build_dsn`, the database URL of
+/// this shard, and closes it when the build ends. A pool of any size exports
+/// while the build runs.
+///
+/// `conn` is the tick's own connection. It serves one catalog read here and
+/// nothing longer.
+///
+/// With no `build_dsn` the exporter cannot build. It logs
+/// [`UNEXPORTED_INDEX_DDL`] for an operator once per
+/// [`INDEX_NOTICE_INTERVAL`]. Export is correct without the index, only
+/// slower.
+///
+/// The gate for this shard opens only after the catalog confirms a valid
+/// index. A lost lock race, a failure or a shutdown keeps it closed for
+/// [`INDEX_BUILD_RETRY`]. A role that cannot build keeps it closed for
+/// [`INDEX_BUILD_REFUSED_RETRY`], after one `error!` line that names the
+/// statements an operator must run.
+///
+/// `cancel` stops a running build. Dropping the build future closes its
+/// connection, and Postgres cancels the statement.
+#[cfg(feature = "db")]
+async fn spawn_unexported_index_build_if_due(
+    conn: &mut diesel_async::AsyncPgConnection,
+    shard_id: i32,
+    pool_id: usize,
+    build_dsn: Option<&str>,
+    cancel: &tokio_util::sync::CancellationToken,
+) {
+    // One probe per interval. Without it, every tick of a healthy exporter
+    // would read the catalogs.
+    if !index_probe_due(&(shard_id, build_dsn.map_or(0, dsn_fingerprint), pool_id)) {
+        return;
+    }
+    let Some(dsn) = build_dsn else {
+        if index_notice_wanted(conn, shard_id).await {
+            let (statement, cleanup) = operator_ddl(conn).await;
+            tracing::warn!(
+                shard = shard_id,
+                statement = %statement,
+                cleanup = %cleanup,
+                "[audit_export] no database URL for a dedicated connection, so the exporter \
+                 cannot build the claim-scan index; export continues without it. Set \
+                 WorkerConfig::with_notification_database_url or \
+                 with_shard_notification_database_urls, or run the statement once as the \
+                 table owner. If the index exists but is invalid, run `cleanup` first"
+            );
+        }
+        return;
+    };
+    // The schema is part of the key: tenant schemas can share a shard number
+    // and a build URL while they manage different indexes.
+    let schema = match audit_table_schema(conn).await {
+        Ok(schema) => schema,
+        Err(error) => {
+            tracing::warn!(shard = shard_id, %error, "[audit_export] could not resolve the schema of harvest_audit_log");
+            return;
+        }
+    };
+    let key: BuildKey = (shard_id, dsn_fingerprint(dsn), schema.clone());
+    if !index_build_due(&key) {
+        return;
+    }
+    // Dropping this future mid-probe, or panicking, leaves a retry wait.
+    let guard = InFlightGuard::new(key.clone());
+    match unexported_index_valid(conn).await {
+        Ok(Some(true)) => {
+            index_build_finished(&key, BuildEnd::Ready);
+            guard.disarm();
+            return;
+        }
+        Ok(_) => {}
+        Err(error) => {
+            // The guard turns the gate into a retry wait.
+            tracing::warn!(shard = shard_id, %error, "[audit_export] could not inspect the claim-scan index");
+            return;
+        }
+    }
+    let dsn = dsn.to_owned();
+    let cancel = cancel.clone();
+    tokio::spawn(async move {
+        // The task owns the in-flight mark now. A panic or an abort that drops
+        // the task leaves a retry wait too.
+        let guard = guard;
+        let end = tokio::select! {
+            result = build_unexported_index_on_dedicated_connection(
+                &dsn,
+                &schema,
+                INDEX_BUILD_CONNECT_TIMEOUT,
+            ) => match result {
+                Ok(UnexportedIndexOutcome::Ready) => BuildEnd::Ready,
+                Ok(UnexportedIndexOutcome::LockBusy) => {
+                    tracing::debug!(
+                        shard = shard_id,
+                        "[audit_export] another session is building the claim-scan index"
+                    );
+                    BuildEnd::Retry
+                }
+                Err(error) if index_build_needs_owner(&error) => {
+                    tracing::error!(
+                        shard = shard_id,
+                        %error,
+                        statement = %unexported_index_ddl_in(&schema),
+                        cleanup = %unexported_index_drop_ddl_in(&schema),
+                        retry_in_secs = INDEX_BUILD_REFUSED_RETRY.as_secs(),
+                        "[audit_export] the worker role cannot build the claim-scan index; \
+                         export continues without it. Run `statement` once through the \
+                         role that owns the table, such as the migration role. If the \
+                         index exists but is invalid, run `cleanup` first"
+                    );
+                    BuildEnd::Refused
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        shard = shard_id,
+                        %error,
+                        statement = %unexported_index_ddl_in(&schema),
+                        "[audit_export] could not build the claim-scan index; export continues \
+                         without it. The next attempt follows after the retry wait"
+                    );
+                    BuildEnd::Retry
+                }
+            },
+            () = cancel.cancelled() => {
+                tracing::info!(
+                    shard = shard_id,
+                    "[audit_export] shutdown requested during the claim-scan index build; \
+                     closing its connection"
+                );
+                BuildEnd::Retry
+            }
+        };
+        index_build_finished(&key, end);
+        guard.disarm();
+    });
+}
+
+/// Tell an operator once per [`INDEX_NOTICE_INTERVAL`] that the index is
+/// missing (issue #1667).
+///
+/// [`fire_due_audit_exports`] runs on a connection its caller owns. It never
+/// builds the index there. The build would hold that connection for minutes,
+/// and an error could leave the session with the advisory lock held. The
+/// dedicated export task builds the index on its own connection. An embedder
+/// that drives this primitive by hand runs [`ensure_unexported_index`] on a
+/// dedicated connection, or runs [`UNEXPORTED_INDEX_DDL`] as the table owner.
+///
+/// Each call reads the index catalog once. A valid index ends the call there.
+/// This path has no pool and no state handle, so it has no key that names a
+/// database without a query. A throttle keyed by the connection address would
+/// alias unrelated databases. The caller sets the cost with its own cadence.
+/// The pooled exporter throttles its probes per shard, URL and pool.
+#[cfg(feature = "db")]
+async fn notice_missing_unexported_index(
+    conn: &mut diesel_async::AsyncPgConnection,
+    shard_id: i32,
+) {
+    if !index_notice_wanted(conn, shard_id).await {
+        return;
+    }
+    let (statement, cleanup) = operator_ddl(conn).await;
+    tracing::warn!(
+        shard = shard_id,
+        statement = %statement,
+        cleanup = %cleanup,
+        "[audit_export] the claim-scan index is missing; fire_due_audit_exports never builds \
+         it on its caller's connection. Use the dedicated export task, run \
+         ensure_unexported_index on a dedicated connection, or run the statement once as \
+         the table owner. If the index exists but is invalid, run `cleanup` first"
+    );
 }
 
 /// Result of resolving a decommission or reactivate request against the live
@@ -1760,7 +2555,7 @@ struct OldestInWindow {
 /// scale with the backlog.
 ///
 /// - Not-yet-sequenced rows: `MIN(occurred_at) WHERE export_seq IS NULL`.
-///   An index-min on `harvest_audit_log_unexported_idx` serves this.
+///   An index-min on `harvest_audit_log_unexported_idx` serves this once export runs.
 /// - Sequenced-but-unacknowledged rows: `MIN(occurred_at)` over the lowest
 ///   [`EXPORT_LAG_LOOKBACK_ROWS`] pending sequences (issue #1271). The
 ///   covering index `harvest_audit_log_export_seq_idx` on
@@ -2306,6 +3101,7 @@ async fn export_once_on_conn(
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> crate::error::HarvestResult<usize> {
     let config = config_arc.as_ref();
+    notice_missing_unexported_index(conn, shard_id).await;
     ensure_cursor_row(conn, shard_id).await?;
 
     let now = Utc::now();
@@ -2520,6 +3316,13 @@ async fn emit_lag_and_observed(
 /// corruption of the `(shard, seq)` identity the whole feature rests on.
 /// Acquiring the exact pool can at worst skip a shard, loudly. See the comment
 /// in the match arm for the full reasoning and its cost.
+///
+/// # Claim-scan index (issue #1667)
+///
+/// On the unsharded fallback this primitive never builds the claim-scan index.
+/// Each call reads the index catalog once, and logs the build statement hourly
+/// while the index is missing. The caller sets the cost with its call cadence.
+/// The dedicated export task throttles the same probe and builds the index.
 ///
 /// # Errors
 /// Returns `HarvestError` if a database query fails. A sink's transport
@@ -2790,6 +3593,7 @@ async fn export_once_via_pool(
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
     cancel: &tokio_util::sync::CancellationToken,
     config_arc: Option<std::sync::Arc<AuditExportRuntimeConfig>>,
+    index_build_dsn: Option<&str>,
 ) -> crate::error::HarvestResult<usize> {
     let shard_u16 = u16::try_from(shard_id).unwrap_or(u16::MAX);
     let Some(config_arc) = config_arc else {
@@ -2805,6 +3609,19 @@ async fn export_once_via_pool(
     else {
         return Ok(0);
     };
+    // The pre-build probes race shutdown. A stalled catalog read must not hold
+    // the checker, and the claim phase below observes the same token.
+    let _ = until_cancelled(
+        cancel,
+        spawn_unexported_index_build_if_due(
+            &mut conn,
+            shard_id,
+            std::ptr::from_ref(pool.manager()) as usize,
+            index_build_dsn,
+            cancel,
+        ),
+    )
+    .await;
     // Raced against `cancel` (Codex review on PR #1520, follow-up P2, fifth
     // round). `claim_shard`'s locked read can wait indefinitely behind
     // another session holding the cursor row. A bare await here would then
@@ -3152,6 +3969,13 @@ async fn export_once_via_pool(
 /// resolves the shard actually stamped on exported records when `shard` is
 /// `None` (the unsharded fallback). This is the same rule
 /// [`fire_due_audit_exports`] applies in its own unsharded arm.
+///
+/// `index_build_dsn` is the database URL of this shard (issue #1667). The
+/// task opens one dedicated connection to it for the claim-scan index build,
+/// so no pooled connection is held for the build. The worker passes the
+/// shard's notification URL, which reaches the same database. With `None`
+/// the task never builds the index and logs [`UNEXPORTED_INDEX_DDL`] for an
+/// operator instead. See [`ensure_unexported_index`].
 /// The worst-case wall-clock span of one audit-export checker tick.
 ///
 /// See [`spawn_audit_export_checker_for_shard`]'s doc comment for why the
@@ -3178,6 +4002,7 @@ pub fn spawn_audit_export_checker_for_shard(
     telemetry: std::sync::Arc<crate::telemetry::TelemetryConfig>,
     shard: Option<crate::types::ShardId>,
     sharded_pool: Option<&crate::shard::ShardedDbPool>,
+    index_build_dsn: Option<String>,
 ) -> tokio::task::JoinHandle<()> {
     // See this function's doc comment: the registered threshold must cover
     // the worst legitimate tick, not just the poll cadence.
@@ -3237,6 +4062,7 @@ pub fn spawn_audit_export_checker_for_shard(
                 &*telemetry.metrics,
                 &cancel,
                 config_snapshot,
+                index_build_dsn.as_deref(),
             )
             .await
             {
@@ -4208,5 +5034,329 @@ mod tests {
         assert_eq!(disabled_tick_shards(Some(0), &assigned), vec![4, 7]);
         assert_eq!(disabled_tick_shards(Some(2), &[]), vec![2]);
         assert_eq!(disabled_tick_shards(None, &assigned), vec![0]);
+    }
+
+    /// Issue #1667: only a confirmed valid index opens the build gate. A lost
+    /// lock race keeps the retry wait. A refused build waits far longer.
+    #[cfg(feature = "db")]
+    #[test]
+    fn the_index_build_gate_opens_only_on_a_ready_index() {
+        let key: BuildKey = (
+            9_001,
+            dsn_fingerprint("postgres://gate-test/lock-busy"),
+            "public".to_owned(),
+        );
+        assert!(index_build_due(&key), "a fresh key is due");
+        assert!(!index_build_due(&key), "an in-flight build is not due");
+
+        index_build_finished(&key, BuildEnd::Retry);
+        assert!(
+            !index_build_due(&key),
+            "a lost lock race keeps the gate closed"
+        );
+
+        index_build_finished(&key, BuildEnd::Ready);
+        assert!(index_build_due(&key), "a valid index opens the gate");
+
+        index_build_finished(&key, BuildEnd::Refused);
+        let not_before = INDEX_BUILD_GATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            .copied()
+            .expect("a refused build leaves a gate entry");
+        let remaining = not_before.saturating_duration_since(std::time::Instant::now());
+        assert!(
+            remaining > INDEX_BUILD_RETRY,
+            "a refused build waits longer than an ordinary retry: {remaining:?}"
+        );
+        index_build_finished(&key, BuildEnd::Ready);
+    }
+
+    /// Issue #1667: the notice gate is per database. Two databases can share a
+    /// shard number inside one process. One must not hide the other's notice.
+    #[cfg(feature = "db")]
+    #[test]
+    fn the_index_notice_gate_is_per_database() {
+        let first: NoticeKey = (9_002, "notice-test-db-a".to_owned());
+        let second: NoticeKey = (9_002, "notice-test-db-b".to_owned());
+        assert!(index_notice_due(&first), "a fresh key is due");
+        assert!(
+            !index_notice_due(&first),
+            "a repeat inside the interval waits"
+        );
+        assert!(
+            index_notice_due(&second),
+            "another database with the same shard number is due"
+        );
+    }
+
+    /// Issue #1667: a host that accepts the socket but never answers must not
+    /// hold the build task. The connect timeout turns the stall into an error.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn a_stalled_connect_ends_the_build_attempt() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let _holder = tokio::spawn(async move {
+            let Ok((_socket, _)) = listener.accept().await else {
+                return;
+            };
+            // Hold the socket open and never answer.
+            std::future::pending::<()>().await;
+        });
+        let dsn = format!("postgres://postgres@127.0.0.1:{port}/postgres");
+        let started = std::time::Instant::now();
+        let result = build_unexported_index_on_dedicated_connection(
+            &dsn,
+            "public",
+            std::time::Duration::from_millis(200),
+        )
+        .await;
+        assert!(result.is_err(), "a stalled connect must be an error");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    /// Issue #1667: the operator statements name the schema the builder
+    /// resolved. A migration role with another default path then acts on the
+    /// right table. `CREATE INDEX` takes an unqualified index name.
+    #[test]
+    fn the_operator_statements_name_the_resolved_schema() {
+        let build = unexported_index_ddl_in("tenant");
+        assert!(build.contains("ON tenant.harvest_audit_log"), "{build}");
+        assert!(build.contains("CONCURRENTLY"), "{build}");
+        let cleanup = unexported_index_drop_ddl_in("tenant");
+        assert!(
+            cleanup.contains("tenant.harvest_audit_log_unexported_idx"),
+            "{cleanup}"
+        );
+    }
+
+    /// Issue #1667: two tenant schemas in one database share a shard number
+    /// and a database identity. The schema must tell their notices apart.
+    #[cfg(feature = "db")]
+    #[test]
+    fn the_notice_key_names_the_schema() {
+        let first = notice_key(0, "db@host:5432", "tenant_a");
+        let second = notice_key(0, "db@host:5432", "tenant_b");
+        assert_ne!(first, second);
+        assert_eq!(first, notice_key(0, "db@host:5432", "tenant_a"));
+    }
+
+    /// Issue #1667: a task that is still alive keeps its gate closed. A task
+    /// can stall after it connects, so the retry wait must not reopen the gate
+    /// while the task runs. Only the end of the task sets the next wait.
+    #[cfg(feature = "db")]
+    #[test]
+    fn an_in_flight_build_keeps_the_gate_closed_past_the_retry_wait() {
+        let key: BuildKey = (
+            9_003,
+            dsn_fingerprint("postgres://gate-test/in-flight"),
+            "public".to_owned(),
+        );
+        assert!(index_build_due(&key));
+        let not_before = INDEX_BUILD_GATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            .copied()
+            .expect("an in-flight build leaves a gate entry");
+        let remaining = not_before.saturating_duration_since(std::time::Instant::now());
+        assert!(
+            remaining > INDEX_BUILD_REFUSED_RETRY,
+            "an in-flight build must outlast every retry wait: {remaining:?}"
+        );
+        index_build_finished(&key, BuildEnd::Ready);
+    }
+
+    /// Issue #1667: two tenant schemas can share a shard number and a build
+    /// URL. A refused build in one must not close the gate of the other.
+    #[cfg(feature = "db")]
+    #[test]
+    fn the_build_gate_is_per_schema() {
+        let dsn = dsn_fingerprint("postgres://gate-test/schemas");
+        let first: BuildKey = (9_004, dsn, "tenant_a".to_owned());
+        let second: BuildKey = (9_004, dsn, "tenant_b".to_owned());
+        assert!(index_build_due(&first));
+        index_build_finished(&first, BuildEnd::Refused);
+        assert!(!index_build_due(&first), "the refused schema waits");
+        assert!(index_build_due(&second), "the other schema is not blocked");
+        index_build_finished(&first, BuildEnd::Ready);
+        index_build_finished(&second, BuildEnd::Ready);
+    }
+
+    /// Issue #1667: Unix-socket connections report no address and no port. Two
+    /// clusters with the same database name must still differ, so the start
+    /// time of the postmaster is part of the identity.
+    #[cfg(feature = "db")]
+    #[test]
+    fn the_database_identity_tells_unix_socket_clusters_apart() {
+        let first = database_identity_of("harvest", "", "", "2026-10-02 08:00:00+00");
+        let second = database_identity_of("harvest", "", "", "2026-10-02 08:05:00+00");
+        assert_ne!(first, second);
+        assert_eq!(
+            first,
+            database_identity_of("harvest", "", "", "2026-10-02 08:00:00+00")
+        );
+    }
+
+    /// Issue #1667: a probe on a stalled connection must not hold shutdown. The
+    /// race against the cancel token ends it.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn a_stalled_probe_ends_when_shutdown_is_requested() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let stalled = std::future::pending::<u8>();
+        assert_eq!(until_cancelled(&cancel, stalled).await, None);
+        let live = tokio_util::sync::CancellationToken::new();
+        assert_eq!(until_cancelled(&live, async { 7_u8 }).await, Some(7));
+    }
+
+    /// Issue #1667: a dropped build future must not leave the gate closed for
+    /// the in-flight period. Shutdown can drop it mid-probe. The guard turns
+    /// the gate into an ordinary retry wait. A disarmed guard changes nothing.
+    #[cfg(feature = "db")]
+    #[test]
+    fn a_dropped_in_flight_guard_leaves_a_retry_wait() {
+        let key: BuildKey = (
+            9_005,
+            dsn_fingerprint("postgres://gate-test/guard"),
+            "public".to_owned(),
+        );
+        let remaining = |key: &BuildKey| {
+            INDEX_BUILD_GATE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(key)
+                .copied()
+                .map(|not_before| not_before.saturating_duration_since(std::time::Instant::now()))
+        };
+        assert!(index_build_due(&key));
+        drop(InFlightGuard::new(key.clone()));
+        let after_drop = remaining(&key).expect("a dropped guard leaves an entry");
+        assert!(after_drop <= INDEX_BUILD_RETRY, "{after_drop:?}");
+        assert!(!index_build_due(&key), "the retry wait still holds");
+        index_build_finished(&key, BuildEnd::Ready);
+
+        assert!(index_build_due(&key));
+        InFlightGuard::new(key.clone()).disarm();
+        let after_disarm = remaining(&key).expect("a disarmed guard keeps the entry");
+        assert!(after_disarm > INDEX_BUILD_REFUSED_RETRY, "{after_disarm:?}");
+        index_build_finished(&key, BuildEnd::Ready);
+    }
+
+    /// Issue #1667: a healthy exporter must not probe the catalogs on every
+    /// tick. The probe gate admits one probe per interval for each shard, build
+    /// URL and pool. A second pool with the same shard and URL has its own gate,
+    /// so two tenants cannot starve each other.
+    #[cfg(feature = "db")]
+    #[test]
+    fn the_index_probe_is_throttled_per_pool() {
+        let dsn = dsn_fingerprint("postgres://probe-test/db");
+        let key: ProbeKey = (9_006, dsn, 1);
+        let other_pool: ProbeKey = (9_006, dsn, 2);
+        assert!(index_probe_due(&key), "the first tick probes");
+        assert!(
+            !index_probe_due(&key),
+            "the next tick inside the interval waits"
+        );
+        assert!(
+            index_probe_due(&other_pool),
+            "another pool has its own gate"
+        );
+    }
+
+    /// Issue #1667: the gates are process-wide statics. A build URL can carry a
+    /// password, so no key may hold its text. A fingerprint stands in for it.
+    #[cfg(feature = "db")]
+    #[test]
+    fn the_gate_keys_hold_no_dsn_text() {
+        let dsn = "postgres://user:s3cret-pass@host/db";
+        let fingerprint = dsn_fingerprint(dsn);
+        assert_eq!(fingerprint, dsn_fingerprint(dsn), "stable inside a process");
+        assert_ne!(
+            fingerprint,
+            dsn_fingerprint("postgres://user:other@host/db")
+        );
+        let key: ProbeKey = (1, fingerprint, 0);
+        assert!(!format!("{key:?}").contains("s3cret"));
+    }
+
+    /// Issue #1667: a gate entry that has expired means the same as no entry.
+    /// A long-lived process that churns workers must not keep it. Each new
+    /// admission evicts the expired entries.
+    #[cfg(feature = "db")]
+    #[test]
+    fn expired_gate_entries_are_evicted() {
+        let expired = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("an instant one second ago");
+        let stale_probe: ProbeKey = (9_008, dsn_fingerprint("postgres://evict/probe"), 1);
+        INDEX_PROBE_GATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(stale_probe, expired);
+        assert!(index_probe_due(&(
+            9_008,
+            dsn_fingerprint("postgres://evict/probe"),
+            2
+        )));
+        assert!(
+            !INDEX_PROBE_GATE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&stale_probe),
+            "an expired probe entry must be evicted"
+        );
+
+        let stale_build: BuildKey = (
+            9_008,
+            dsn_fingerprint("postgres://evict/build"),
+            "s".to_owned(),
+        );
+        INDEX_BUILD_GATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(stale_build.clone(), expired);
+        let fresh: BuildKey = (
+            9_008,
+            dsn_fingerprint("postgres://evict/build"),
+            "t".to_owned(),
+        );
+        assert!(index_build_due(&fresh));
+        assert!(
+            !INDEX_BUILD_GATE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&stale_build),
+            "an expired build entry must be evicted"
+        );
+        index_build_finished(&fresh, BuildEnd::Ready);
+    }
+
+    /// Issue #1667: a privilege failure is the one error a retry cannot fix.
+    #[cfg(feature = "db")]
+    #[test]
+    fn a_privilege_error_needs_an_owner() {
+        use crate::error::HarvestError;
+        for message in [
+            "must be owner of table harvest_audit_log",
+            "permission denied for table harvest_audit_log",
+            "SQLSTATE 42501",
+        ] {
+            assert!(
+                index_build_needs_owner(&HarvestError::Database(message.to_owned())),
+                "{message}"
+            );
+        }
+        assert!(!index_build_needs_owner(&HarvestError::Database(
+            "canceling statement due to statement timeout".to_owned()
+        )));
+        assert!(!index_build_needs_owner(&HarvestError::Config(
+            "must be owner".to_owned()
+        )));
     }
 }
