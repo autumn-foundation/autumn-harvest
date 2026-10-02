@@ -327,5 +327,5 @@ async fn existence_probe_returns_empty_for_empty_input() {
     let parents = load_parents_with_children(&mut conn, &[])
         .await
         .expect("probe");
-    assert_eq!(parents.len(), 0);
+    assert_eq!(parents, [] as [uuid::Uuid; 0]);
 }

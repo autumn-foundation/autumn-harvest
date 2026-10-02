@@ -36,6 +36,11 @@
 //! keeps the `merge=union` manifest sorted + unique (a union-merge artifact is a
 //! benign, one-command-fix CI failure, never a conflict).
 //!
+//! A third assertion (issue #1790) parses every workflow file. It also checks
+//! that each workflow that an `ALLOWLIST` or `FEATURE_GATE_EXEMPT` reason cites
+//! exists. A workflow that does not parse never runs, so a reason that cites it
+//! is false.
+//!
 //! On failure the panic message lists every uncovered test and the exact
 //! manifest line to add.
 
@@ -196,10 +201,12 @@ const ALLOWLIST_KAFKA_BROKER_REASON: &str = "kafka-feature-gated: DOES run in CI
      vendored librdkafka on macOS/Windows). Not a coverage gap — see the `Run plugin Kafka broker connector tests` step.";
 const ALLOWLIST_WEBHOOKS_IGNORED_REASON: &str = "webhooks-feature-gated — not run in CI (no manifest row) — AND all tests are #[ignore]d \
      (TestDb/run_pending paved-path DB harness); tracked";
-const ALLOWLIST_CHAOS_REASON: &str = "chaos-feature-gated (issue #940): DOES run in CI, via a dedicated \
-     workflow_dispatch + nightly job (.github/workflows/chaos.yml) that runs the suite with >=5 distinct \
-     seeds — NOT the manifest's `test` job (chaos is `#[cfg(feature = \"chaos\")]`, off by default and \
-     seed-driven/slower, so it is deliberately not part of every PR run). Not a coverage gap.";
+const ALLOWLIST_CHAOS_REASON: &str = "chaos-feature-gated (issue #940): not in the manifest's `test` job. \
+     The `chaos` feature is off by default, and the seeded sweep is slow, so each PR does not run it. \
+     It runs only in the nightly and manual job in .github/workflows/chaos.yml, with at least 5 seeds. \
+     `chaos_workflow_runs_the_chaos_suite_nightly` checks that claim. \
+     .github/workflows/chaos-watchdog.yml opens an issue when no scheduled run succeeds in 48 h. \
+     Before the fix for issue #1790, chaos.yml did not parse, and this suite never ran. Not a coverage gap.";
 const ALLOWLIST_PERF_EVIDENCE_REASON: &str = "manual pg_stat_statements perf-evidence generator (issue #1620): its \
      one test is #[ignore]d by design, run by hand per docs/performance-outbox-start-relay.md's `Reproduce` \
      section against a real local Postgres — no CI run should execute it automatically. Not a coverage gap.";
@@ -241,7 +248,6 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ("core:signal_tests", ALLOWLIST_DEBT_REASON),
     ("core:signal_with_start_tests", ALLOWLIST_DEBT_REASON),
     ("core:sla_breach_tests", ALLOWLIST_DEBT_REASON),
-    ("core:slot_tuner_tests", ALLOWLIST_DEBT_REASON),
     ("core:sticky_routing_tests", ALLOWLIST_DEBT_REASON),
     ("core:telemetry_span_tests", ALLOWLIST_DEBT_REASON),
     ("core:throttle_tests", ALLOWLIST_DEBT_REASON),
@@ -309,9 +315,9 @@ const ALLOWLIST: &[(&str, &str)] = &[
 /// a whole-module row), `core:completion_callback_tests`, and
 /// `core:event_batch_tests`. 73 = minus `plugin:workflow_reachability_integration`,
 /// now wired to a covering `linux` manifest row (issue #700).
-/// 75 = plus `core:chaos_tests` (issue #940): a chaos-feature-gated suite that
-/// runs via a dedicated `.github/workflows/chaos.yml` seed-driven job, not the
-/// manifest `test` job — deliberate, not a coverage gap (see the reason above).
+/// 75 = plus `core:chaos_tests` (issue #940). It runs in the nightly
+/// `.github/workflows/chaos.yml` job, not in the manifest `test` job.
+/// `chaos_workflow_runs_the_chaos_suite_nightly` checks that claim.
 const ALLOWLIST_MAX_LEN: usize = 75;
 
 fn allowlisted(key: &str) -> bool {
@@ -1074,7 +1080,7 @@ fn core_module_executes(rows: &[SuiteRow], module: &str, required: &BTreeSet<Str
 /// shrinks. The DB guard above covers the `db` feature separately.
 const FEATURE_GATE_EXEMPT: &[(&str, &str)] = &[(
     "chaos_tests",
-    "chaos-feature-gated: runs in the dedicated nightly chaos.yml job",
+    "chaos-feature-gated: runs only in the nightly and manual job in .github/workflows/chaos.yml",
 )];
 
 /// A suite behind a feature gate can compile in every CI job and still run in
@@ -1187,4 +1193,279 @@ fn linux_clone(row: &SuiteRow) -> SuiteRow {
         features: row.features.clone(),
         filter: row.filter.clone(),
     }
+}
+
+// ── Every workflow must parse (issue #1790) ─────────────────────────────────
+
+/// The repository root.
+pub fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..")
+}
+
+/// Workflow files that this guard cites as proof that a suite runs.
+///
+/// The set is `ci.yml` plus each `.github/workflows/` path that an `ALLOWLIST`
+/// or `FEATURE_GATE_EXEMPT` reason names. A new citation is checked with no
+/// edit here.
+fn cited_workflows() -> BTreeSet<String> {
+    let mut out = BTreeSet::from([".github/workflows/ci.yml".to_string()]);
+    let reasons = ALLOWLIST.iter().chain(FEATURE_GATE_EXEMPT).map(|&(_, r)| r);
+    for reason in reasons {
+        let mut rest = reason;
+        while let Some(idx) = rest.find(".github/workflows/") {
+            let tail = &rest[idx..];
+            let end = tail
+                .find(|c: char| !(c.is_ascii_alphanumeric() || "./-_".contains(c)))
+                .unwrap_or(tail.len());
+            out.insert(tail[..end].trim_end_matches('.').to_string());
+            rest = &tail[end..];
+        }
+    }
+    out
+}
+
+/// Parses workflow text as YAML 1.2, which keeps `on` as a string key.
+///
+/// `serde_yaml` also rejects a repeated mapping key. GitHub rejects that file
+/// too, but `PyYAML` keeps the last value and hides the defect.
+///
+/// This is a YAML syntax check only. It does not check the GitHub workflow
+/// schema, so an unknown key or a bad expression still passes. For
+/// `chaos.yml`, the watchdog reports that case within about 2.5 days.
+fn parse_workflow_text(text: &str) -> Result<serde_yaml::Value, String> {
+    serde_yaml::from_str(text).map_err(|e| e.to_string())
+}
+
+/// Reads and parses one workflow. Panics with the path and the parse error.
+pub fn parse_workflow(rel: &str) -> serde_yaml::Value {
+    let text = read_source(&repo_root().join(rel));
+    parse_workflow_text(&text).unwrap_or_else(|e| {
+        panic!(
+            "{rel} does not parse as YAML: {e}\nGitHub runs an unparsable workflow as a \
+             zero-job failure and never fires its triggers. Quote a `run:` value that holds \
+             `: ` (for example `chaos:: --`)."
+        )
+    })
+}
+
+/// The `run:` text of every step in every job of a parsed workflow.
+pub fn workflow_run_commands(doc: &serde_yaml::Value) -> Vec<String> {
+    let Some(jobs) = doc.get("jobs").and_then(serde_yaml::Value::as_mapping) else {
+        return Vec::new();
+    };
+    jobs.values()
+        .filter_map(|job| job.get("steps").and_then(serde_yaml::Value::as_sequence))
+        .flatten()
+        .filter_map(|step| step.get("run").and_then(serde_yaml::Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The `cron` strings under a parsed workflow's `on.schedule`.
+pub fn workflow_crons(doc: &serde_yaml::Value) -> Vec<String> {
+    doc.get("on")
+        .and_then(|on| on.get("schedule"))
+        .and_then(serde_yaml::Value::as_sequence)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("cron").and_then(serde_yaml::Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Self-test: the parser rejects the defect classes that it must catch.
+#[test]
+fn workflow_parser_rejects_the_chaos_yml_defect_classes() {
+    let unquoted = "jobs:\n  a:\n    steps:\n      - run: cargo test chaos:: -- --nocapture\n";
+    assert!(
+        parse_workflow_text(unquoted).is_err(),
+        "an unquoted `run:` value that holds `:: ` must not parse"
+    );
+    let quoted = "jobs:\n  a:\n    steps:\n      - run: 'cargo test chaos:: -- --nocapture'\n";
+    let doc = parse_workflow_text(quoted).expect("the quoted form must parse");
+    assert_eq!(
+        workflow_run_commands(&doc),
+        ["cargo test chaos:: -- --nocapture"]
+    );
+
+    let repeated = "jobs:\n  a:\n    runs-on: x\n  a:\n    runs-on: y\n";
+    assert!(
+        parse_workflow_text(repeated).is_err(),
+        "a repeated mapping key must not parse"
+    );
+
+    let scheduled = "on:\n  schedule:\n    - cron: \"17 4 * * *\"\njobs: {}\n";
+    let doc = parse_workflow_text(scheduled).expect("a schedule must parse");
+    assert_eq!(
+        workflow_crons(&doc),
+        ["17 4 * * *"],
+        "`on` must stay a string key (YAML 1.2), not the boolean `true` (YAML 1.1)"
+    );
+}
+
+/// An `ALLOWLIST` reason that cites a workflow claims that the workflow runs
+/// the suite. That claim is false when the workflow does not parse. The
+/// chaos suite stayed in that state from its first commit (issue #1790).
+#[test]
+fn every_workflow_parses_and_has_jobs() {
+    let cited = cited_workflows();
+    assert!(
+        cited.contains(".github/workflows/chaos.yml"),
+        "the `core:chaos_tests` reason must cite .github/workflows/chaos.yml; found {cited:?}"
+    );
+    let all = all_workflows();
+    for rel in &cited {
+        assert!(
+            all.contains(rel),
+            "{rel} is cited but is not a workflow file"
+        );
+    }
+    for rel in &all {
+        let doc = parse_workflow(rel);
+        let jobs = doc.get("jobs").and_then(serde_yaml::Value::as_mapping);
+        assert!(
+            jobs.is_some_and(|j| !j.is_empty()),
+            "{rel} must have a non-empty `jobs` mapping"
+        );
+    }
+}
+
+/// Every `.yml` or `.yaml` file in `.github/workflows/`, as a repository path.
+///
+/// The parse check covers all of them, not only the cited ones. An uncited
+/// workflow that does not parse fails as silently as `chaos.yml` did.
+fn all_workflows() -> BTreeSet<String> {
+    let dir = repo_root().join(".github/workflows");
+    std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+        .map(|entry| entry.expect("workflow dir entry").file_name())
+        .filter_map(|name| name.into_string().ok())
+        .filter(|name| {
+            std::path::Path::new(name).extension().is_some_and(|ext| {
+                ext.eq_ignore_ascii_case("yml") || ext.eq_ignore_ascii_case("yaml")
+            })
+        })
+        .map(|name| format!(".github/workflows/{name}"))
+        .collect()
+}
+
+/// `cargo test` flags that run no test, or less than the whole module.
+const NO_FULL_RUN_FLAGS: &[&str] = &["--no-run", "--exact", "--skip", "--ignored", "--list"];
+
+/// Shell text that joins a second command to the step, or runs the command
+/// inside another one. Either can hide a failed `cargo test` or replace it.
+const SHELL_OPERATORS: &[&str] = &[";", "&", "|", "\n", "`", "$("];
+
+/// True when a job or step has no `if` and no `continue-on-error: true`.
+///
+/// An `if` can skip the step on the nightly. A `continue-on-error` makes a
+/// failed suite look green to the watchdog, which counts successful runs.
+fn ungated(node: &serde_yaml::Value) -> bool {
+    let soft = node
+        .get("continue-on-error")
+        .is_some_and(|v| v.as_bool() != Some(false));
+    node.get("if").is_none() && !soft
+}
+
+/// True when an ungated step in an ungated job runs the whole `chaos_tests`
+/// module with the `chaos` feature.
+///
+/// The step must be one plain `cargo test` command. Text that only contains
+/// the right arguments, such as an `echo`, runs no test.
+fn runs_the_chaos_suite_unconditionally(doc: &serde_yaml::Value) -> bool {
+    let Some(jobs) = doc.get("jobs").and_then(serde_yaml::Value::as_mapping) else {
+        return false;
+    };
+    jobs.values()
+        .filter(|job| ungated(job))
+        .filter_map(|job| job.get("steps").and_then(serde_yaml::Value::as_sequence))
+        .flatten()
+        .filter(|step| ungated(step))
+        .filter_map(|step| step.get("run").and_then(serde_yaml::Value::as_str))
+        .any(|run| {
+            run.contains("--features chaos")
+                && run.contains("--test integration chaos_tests:: ")
+                && !run
+                    .split_whitespace()
+                    .any(|word| NO_FULL_RUN_FLAGS.iter().any(|f| word.starts_with(f)))
+                && run.trim().starts_with("cargo test ")
+                && !SHELL_OPERATORS.iter().any(|op| run.trim().contains(op))
+        })
+}
+
+/// Self-test: a gate or a flag that runs nothing must not count as a run.
+#[test]
+fn chaos_suite_check_rejects_gated_and_empty_runs() {
+    let run = "cargo test -p autumn-harvest --features chaos --test integration chaos_tests:: -- --test-threads=1";
+    let workflow = |job_extra: &str, step_extra: &str, run: &str| {
+        let text = format!(
+            "jobs:\n  chaos:\n    runs-on: x\n{job_extra}    steps:\n      - run: '{run}'\n{step_extra}"
+        );
+        parse_workflow_text(&text).expect("synthetic workflow must parse")
+    };
+    assert!(runs_the_chaos_suite_unconditionally(&workflow("", "", run)));
+
+    let job_if = "    if: github.event_name == 'workflow_dispatch'\n";
+    let job_soft = "    continue-on-error: true\n";
+    let step_if = "        if: false\n";
+    let step_soft = "        continue-on-error: true\n";
+    for (job_extra, step_extra) in [(job_if, ""), (job_soft, ""), ("", step_if), ("", step_soft)] {
+        assert!(
+            !runs_the_chaos_suite_unconditionally(&workflow(job_extra, step_extra, run)),
+            "a gate must not count: job {job_extra:?}, step {step_extra:?}"
+        );
+    }
+
+    let kept = "        continue-on-error: false\n";
+    assert!(
+        runs_the_chaos_suite_unconditionally(&workflow("", kept, run)),
+        "`continue-on-error: false` is the default, so it must count"
+    );
+
+    for masked in [
+        format!("{run} || true"),
+        format!("{run}; exit 0"),
+        format!("set +e; {run}"),
+        format!("{run}; true"),
+        format!("{run} & wait"),
+        format!("echo {}", run.trim_start_matches("cargo test ")),
+        format!("echo $({run})"),
+    ] {
+        assert!(
+            !runs_the_chaos_suite_unconditionally(&workflow("", "", &masked)),
+            "`{masked}` hides a failed suite or runs no test, so it must not count"
+        );
+    }
+
+    for flag in [
+        "--no-run",
+        "--exact",
+        "--skip chaos_tests",
+        "--ignored",
+        "--list",
+    ] {
+        let flagged = format!("{run} {flag}");
+        assert!(
+            !runs_the_chaos_suite_unconditionally(&workflow("", "", &flagged)),
+            "`{flag}` runs no test or not the whole module, so it must not count"
+        );
+    }
+}
+
+/// The `core:chaos_tests` exemption is true only when `chaos.yml` runs the
+/// whole `chaos_tests` module, with the `chaos` feature, on a cron.
+#[test]
+fn chaos_workflow_runs_the_chaos_suite_nightly() {
+    let doc = parse_workflow(".github/workflows/chaos.yml");
+    assert!(
+        !workflow_crons(&doc).is_empty(),
+        "chaos.yml must have an `on.schedule` cron; without one no nightly run exists"
+    );
+    assert!(
+        runs_the_chaos_suite_unconditionally(&doc),
+        "chaos.yml must have a step that runs \
+         `--features chaos --test integration chaos_tests:: ` with no `if`, no \
+         `continue-on-error` and no flag that skips tests; found {:?}",
+        workflow_run_commands(&doc)
+    );
 }

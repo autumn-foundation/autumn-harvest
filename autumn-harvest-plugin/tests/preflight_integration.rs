@@ -423,8 +423,8 @@ async fn preflight_endpoint_returns_all_green_single_shard_report() {
         scanner_check["details"]["scanners"]
             .as_array()
             .expect("scanners must be an array")
-            .len(),
-        0
+            .as_slice(),
+        [] as [serde_json::Value; 0]
     );
 }
 

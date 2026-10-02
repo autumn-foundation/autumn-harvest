@@ -1275,7 +1275,10 @@ async fn a_purge_with_nothing_eligible_returns_zero_and_writes_no_watermark() {
         .await
         .expect("purge");
     assert_eq!(deleted, 0);
-    assert_eq!(watermark_row(&mut conn).await.len(), 0);
+    assert_eq!(
+        watermark_row(&mut conn).await,
+        [] as [(chrono::DateTime<chrono::Utc>, i64); 0]
+    );
 }
 
 #[tokio::test]

@@ -811,7 +811,10 @@ async fn interface_omits_schema_fields_for_schema_less_workflow() {
     assert_eq!(names(&body["signals"]), vec!["plain_sig"]);
     assert!(body["signals"][0].get("arg_schema").is_none());
     assert!(body["signals"][0].get("description").is_none());
-    assert_eq!(body["queries"].as_array().unwrap().len(), 0);
+    assert_eq!(
+        body["queries"].as_array().unwrap().as_slice(),
+        [] as [serde_json::Value; 0]
+    );
     assert_eq!(names(&body["updates"]), vec!["plain_upd"]);
     assert!(body["updates"][0].get("arg_schema").is_none());
     assert!(body["updates"][0].get("response_schema").is_none());

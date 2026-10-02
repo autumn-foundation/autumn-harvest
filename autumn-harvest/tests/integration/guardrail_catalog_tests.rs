@@ -234,7 +234,7 @@ fn suppression_accepts_nonempty_reason() {
     )
     .expect("non-empty reason must succeed");
     assert_eq!(suppression.rule_id(), "HVG001");
-    assert_ne!(suppression.reason().len(), 0);
+    assert_ne!(suppression.reason(), "");
 }
 
 #[test]
@@ -468,6 +468,6 @@ fn finding_from_rule_entry() {
     let finding = GuardrailFinding::from_rule(entry, "rand called here", None, None);
     assert_eq!(finding.rule_id, "HVG002");
     assert!(matches!(finding.category, RuleCategory::Randomness));
-    assert_ne!(finding.message.len(), 0);
-    assert_ne!(finding.alternative.len(), 0);
+    assert_ne!(finding.message, "");
+    assert_ne!(finding.alternative, "");
 }

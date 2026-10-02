@@ -12,12 +12,12 @@
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
+use crate::queue::{ClaimWrite, TaskClaim};
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::deadpool::Pool;
 
-/// Spawn a background heartbeat flusher for the given task.
+/// Spawn a background heartbeat flusher for the task that `claim` holds.
 ///
 /// Returns an `mpsc::Sender<Value>` that the activity should use to send
 /// heartbeat payloads. The flusher task will:
@@ -25,32 +25,36 @@ use diesel_async::pooled_connection::deadpool::Pool;
 /// 1. Wait up to 1 second for heartbeats to arrive.
 /// 2. Drain all pending heartbeats, keeping only the most recent.
 /// 3. Call `queue::record_heartbeat()` to update the DB timestamp and payload.
-/// 4. Repeat until the cancellation token is triggered.
+/// 4. Repeat until `cancel` fires or the claim is lost.
+///
+/// `claim` fences the write (issue #1789). When the claim is no longer
+/// current, the flusher cancels `cancel` and stops.
 ///
 /// The returned sender has a buffer of 64 messages -- if the activity sends
 /// heartbeats faster than that without the flusher draining, sends will
 /// await (backpressure).
 #[must_use]
 pub fn spawn_heartbeat_flusher(
-    task_id: Uuid,
+    claim: TaskClaim,
     pool: Pool<AsyncPgConnection>,
     cancel: CancellationToken,
 ) -> mpsc::Sender<Value> {
     let (tx, rx) = mpsc::channel(64);
 
-    tokio::spawn(heartbeat_loop(task_id, pool, rx, cancel));
+    tokio::spawn(heartbeat_loop(claim, pool, rx, cancel));
 
     tx
 }
 
 /// The main heartbeat flushing loop.
 async fn heartbeat_loop(
-    task_id: Uuid,
+    claim: TaskClaim,
     pool: Pool<AsyncPgConnection>,
     mut rx: mpsc::Receiver<Value>,
     cancel: CancellationToken,
 ) {
     let flush_interval = std::time::Duration::from_secs(1);
+    let task_id = claim.task_id;
 
     loop {
         // Wait for either: a heartbeat arrives, the interval expires, or cancellation.
@@ -74,14 +78,28 @@ async fn heartbeat_loop(
         if let Some(payload) = latest {
             match pool.get().await {
                 Ok(mut conn) => {
-                    if let Err(e) =
-                        crate::queue::record_heartbeat(&mut conn, task_id, payload).await
-                    {
-                        tracing::warn!(
-                            task_id = %task_id,
-                            error = %e,
-                            "failed to flush heartbeat to database"
-                        );
+                    match crate::queue::record_heartbeat(&mut conn, &claim, payload).await {
+                        Ok(ClaimWrite::Applied) => {}
+                        // The claim is no longer current (issue #1789). Stop
+                        // the activity, so this stale attempt does no more
+                        // work.
+                        Ok(ClaimWrite::LeaseLost) => {
+                            tracing::warn!(
+                                task_id = %task_id,
+                                worker_id = %claim.worker_id,
+                                attempt = claim.attempt,
+                                "activity lease lost on heartbeat; cancelling the activity"
+                            );
+                            cancel.cancel();
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                task_id = %task_id,
+                                error = %e,
+                                "failed to flush heartbeat to database"
+                            );
+                        }
                     }
                 }
                 Err(e) => {

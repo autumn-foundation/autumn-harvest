@@ -8,6 +8,7 @@ use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, Utc};
 use diesel::AsChangeset;
+use diesel::BoolExpressionMethods;
 use diesel::ExpressionMethods;
 use diesel::OptionalExtension;
 use diesel::QueryDsl;
@@ -1292,7 +1293,7 @@ pub async fn claim_task(
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] on query failure.
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub async fn claim_task_on_shard(
     conn: &mut AsyncPgConnection,
     queues: &[String],
@@ -1302,6 +1303,41 @@ pub async fn claim_task_on_shard(
     circuit_breaker_activities: &[String],
     ineligible_activities: &[String],
     shard: Option<crate::types::ShardId>,
+) -> HarvestResult<Option<TaskQueueItem>> {
+    claim_task_of_kind_on_shard(
+        conn,
+        queues,
+        worker_id,
+        worker_build_id,
+        priority_aging_secs,
+        circuit_breaker_activities,
+        ineligible_activities,
+        shard,
+        None,
+    )
+    .await
+}
+
+/// [`claim_task_on_shard`], limited to one task kind when `kind` is set
+/// (issue #1787).
+///
+/// `None` issues the unchanged statement. `Some` adds one literal predicate.
+/// See [`claim_task_query_for_kind`].
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+pub async fn claim_task_of_kind_on_shard(
+    conn: &mut AsyncPgConnection,
+    queues: &[String],
+    worker_id: &str,
+    worker_build_id: &str,
+    priority_aging_secs: Option<u32>,
+    circuit_breaker_activities: &[String],
+    ineligible_activities: &[String],
+    shard: Option<crate::types::ShardId>,
+    kind: Option<TaskType>,
 ) -> HarvestResult<Option<TaskQueueItem>> {
     // Two-phase claim using a CTE to avoid holding advisory locks during
     // broad WHERE filtering.
@@ -1443,7 +1479,10 @@ pub async fn claim_task_on_shard(
                 // engine's hottest statement.
                 let result: Vec<TaskQueueItem> = match fence_binding(shard) {
                     None => {
-                        diesel::sql_query(claim_task_query())
+                        let query = kind.map_or_else(claim_task_query, |kind| {
+                            claim_task_query_for_kind(kind, false)
+                        });
+                        diesel::sql_query(query)
                             .bind::<diesel::sql_types::Text, _>(worker_id)
                             .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
                             .bind::<diesel::sql_types::Text, _>(worker_build_id)
@@ -1460,7 +1499,10 @@ pub async fn claim_task_on_shard(
                             .await
                     }
                     Some((fence_shard, generation)) => {
-                        diesel::sql_query(claim_task_query_fenced())
+                        let query = kind.map_or_else(claim_task_query_fenced, |kind| {
+                            claim_task_query_for_kind(kind, true)
+                        });
+                        diesel::sql_query(query)
                             .bind::<diesel::sql_types::Text, _>(worker_id)
                             .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
                             .bind::<diesel::sql_types::Text, _>(worker_build_id)
@@ -1593,6 +1635,49 @@ pub fn claim_task_by_id_query_fenced() -> &'static str {
     static BY_ID_FENCED: std::sync::LazyLock<String> =
         std::sync::LazyLock::new(|| splice_by_id_predicate(claim_task_query_fenced(), "$9"));
     &BY_ID_FENCED
+}
+
+/// Splice a literal task-kind predicate into the `candidate` CTE of `base`.
+///
+/// The by-id anchor appears exactly once in the base query. The assertion
+/// makes an edit that breaks it panic at first use.
+fn splice_kind_predicate(base: &str, kind: TaskType) -> String {
+    assert_eq!(
+        base.matches(BY_ID_ANCHOR).count(),
+        1,
+        "claim query kind anchor must appear exactly once"
+    );
+    base.replace(
+        BY_ID_ANCHOR,
+        &format!(
+            "{BY_ID_ANCHOR}AND harvest_task_queue.task_type = '{}' ",
+            kind.as_str()
+        ),
+    )
+}
+
+/// [`claim_task_query`] limited to one task kind (issue #1787).
+///
+/// A worker with a free permit for one kind only claims through this form.
+/// The predicate is a literal, so the binds do not change. With `fenced`, the
+/// base is [`claim_task_query_fenced`], which binds `$7` and `$8`.
+#[must_use]
+pub fn claim_task_query_for_kind(kind: TaskType, fenced: bool) -> &'static str {
+    use std::sync::LazyLock;
+    static WORKFLOW: LazyLock<String> =
+        LazyLock::new(|| splice_kind_predicate(claim_task_query(), TaskType::Workflow));
+    static ACTIVITY: LazyLock<String> =
+        LazyLock::new(|| splice_kind_predicate(claim_task_query(), TaskType::Activity));
+    static WORKFLOW_FENCED: LazyLock<String> =
+        LazyLock::new(|| splice_kind_predicate(claim_task_query_fenced(), TaskType::Workflow));
+    static ACTIVITY_FENCED: LazyLock<String> =
+        LazyLock::new(|| splice_kind_predicate(claim_task_query_fenced(), TaskType::Activity));
+    match (kind, fenced) {
+        (TaskType::Workflow, false) => &WORKFLOW,
+        (TaskType::Activity, false) => &ACTIVITY,
+        (TaskType::Workflow, true) => &WORKFLOW_FENCED,
+        (TaskType::Activity, true) => &ACTIVITY_FENCED,
+    }
 }
 
 /// What one claim transaction concluded.
@@ -2445,42 +2530,365 @@ const CONCURRENCY_ATTRIBUTION_SQL: &str = "SELECT \
            AND (t.state = 'PENDING' OR (t.state = 'RUNNING' AND t.worker_id IS NOT NULL)) \
          GROUP BY t.concurrency_key, t.task_type, e.workflow_name";
 
+/// The claim epoch of one activity attempt (issue #1789).
+///
+/// `claim_task` sets `worker_id` and increments `attempt` on every claim. The
+/// pair therefore identifies one claim of a row, like a fencing token. See
+/// `docs/architecture.md`, section "Activity claim epoch", for the protocol.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskClaim {
+    /// The claimed task queue row.
+    pub task_id: Uuid,
+    /// The worker that holds the claim.
+    pub worker_id: String,
+    /// The row's `attempt` value that this claim wrote.
+    pub attempt: i32,
+}
+
+impl TaskClaim {
+    /// Build a claim from its parts.
+    #[must_use]
+    pub fn new(task_id: Uuid, worker_id: impl Into<String>, attempt: i32) -> Self {
+        Self {
+            task_id,
+            worker_id: worker_id.into(),
+            attempt,
+        }
+    }
+
+    /// The claim that a claimed task snapshot carries.
+    ///
+    /// Returns `None` when the snapshot has no `worker_id`. Such a row is not
+    /// claimed, so no write can be fenced to it.
+    #[must_use]
+    pub fn of(task: &TaskQueueItem) -> Option<Self> {
+        task.worker_id
+            .as_deref()
+            .map(|worker_id| Self::new(task.id, worker_id, task.attempt))
+    }
+}
+
+/// The result of a write fenced by a [`TaskClaim`].
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimWrite {
+    /// The claim was current, and the write took effect.
+    Applied,
+    /// The claim was not current, and the write changed nothing.
+    LeaseLost,
+}
+
+impl ClaimWrite {
+    /// Turn a lost lease into an error.
+    ///
+    /// Use it only after [`lock_claim_for_update`] returned
+    /// [`ClaimLock::Held`] in the same transaction. The lock keeps the claim
+    /// current, so a lost lease there is a bug, and the error rolls back.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::HarvestError::NotFound`] for
+    /// [`ClaimWrite::LeaseLost`].
+    pub(crate) fn require_applied(self, task_id: Uuid) -> HarvestResult<()> {
+        match self {
+            Self::Applied => Ok(()),
+            Self::LeaseLost => Err(crate::error::HarvestError::NotFound(format!(
+                "task queue item {task_id} lost its claim under the row lock"
+            ))),
+        }
+    }
+}
+
+/// The result of [`lock_claim_for_update`].
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ClaimLock {
+    /// The claim is current. The row stays locked until the transaction ends.
+    Held,
+    /// The claim is not current. `state` is the row's state, or `None` when
+    /// the row does not exist.
+    Lost {
+        /// The row's current state.
+        state: Option<String>,
+    },
+}
+
+/// The claim-epoch predicate (issue #1789).
+///
+/// Every write fenced by a [`TaskClaim`] adds this predicate to its own
+/// statement. Only the holder of the current claim can then match the row.
+#[diesel::dsl::auto_type(no_type_alias)]
+fn claim_held<'a>(worker_id: &'a str, attempt: i32) -> _ {
+    let running: &'static str = "RUNNING";
+    crate::schema::harvest_task_queue::state
+        .eq(running)
+        .and(crate::schema::harvest_task_queue::worker_id.eq(worker_id))
+        .and(crate::schema::harvest_task_queue::attempt.eq(attempt))
+}
+
+/// An `UPDATE harvest_task_queue` with a boxed `WHERE` clause.
+type TaskUpdate<'a, V, Ret> = diesel::query_builder::BoxedUpdateStatement<
+    'a,
+    diesel::pg::Pg,
+    crate::schema::harvest_task_queue::table,
+    V,
+    Ret,
+>;
+
+/// Add the claim-epoch predicate to `update` when `claim` is set.
+///
+/// This is the one place that fences a task row write. `None` keeps the
+/// unfenced behavior for writers that are not the claim owner, for example
+/// timeouts and operator actions.
+fn fence<'a, V, Ret>(
+    update: TaskUpdate<'a, V, Ret>,
+    claim: Option<&'a TaskClaim>,
+) -> TaskUpdate<'a, V, Ret> {
+    match claim {
+        Some(claim) => update.filter(claim_held(&claim.worker_id, claim.attempt)),
+        None => update,
+    }
+}
+
+const fn claim_write(updated: bool) -> ClaimWrite {
+    if updated {
+        ClaimWrite::Applied
+    } else {
+        ClaimWrite::LeaseLost
+    }
+}
+
+/// Lock the claimed row `FOR UPDATE` and report whether `claim` is current.
+///
+/// Call it after the execution row lock, as every activity write path does.
+/// While the transaction lives, no other writer can move the claim.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub(crate) async fn lock_claim_for_update(
+    conn: &mut AsyncPgConnection,
+    claim: &TaskClaim,
+) -> HarvestResult<ClaimLock> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    let row = dsl::harvest_task_queue
+        .find(claim.task_id)
+        .for_update()
+        .select((dsl::state, claim_held(&claim.worker_id, claim.attempt)))
+        .first::<(String, Option<bool>)>(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+    Ok(match row {
+        Some((_, Some(true))) => ClaimLock::Held,
+        Some((state, _)) => ClaimLock::Lost { state: Some(state) },
+        None => ClaimLock::Lost { state: None },
+    })
+}
+
+/// A task row's `state` and `error`, read without a lock, and whether
+/// `claim` is current.
+///
+/// Returns `None` when the row does not exist.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub(crate) async fn task_status_for_claim(
+    conn: &mut AsyncPgConnection,
+    claim: &TaskClaim,
+) -> HarvestResult<Option<(String, Option<String>, bool)>> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    let row = dsl::harvest_task_queue
+        .find(claim.task_id)
+        .select((
+            dsl::state,
+            dsl::error,
+            claim_held(&claim.worker_id, claim.attempt),
+        ))
+        .first::<(String, Option<String>, Option<bool>)>(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+    Ok(row.map(|(state, error, held)| (state, error, held == Some(true))))
+}
+
+/// Whether `claim` is current, read without a lock.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub(crate) async fn claim_is_current(
+    conn: &mut AsyncPgConnection,
+    claim: &TaskClaim,
+) -> HarvestResult<bool> {
+    let status = task_status_for_claim(conn, claim).await?;
+    Ok(status.is_some_and(|(_, _, held)| held))
+}
+
+/// Lock the row `FOR UPDATE SKIP LOCKED` when `claim` is current.
+///
+/// Returns `false` when the claim is lost, or when another transaction holds
+/// the row lock. The caller treats both the same way, as in
+/// [`claim_still_held_for_update`].
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub(crate) async fn claim_held_for_update_skip_locked(
+    conn: &mut AsyncPgConnection,
+    claim: &TaskClaim,
+) -> HarvestResult<bool> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    dsl::harvest_task_queue
+        .find(claim.task_id)
+        .filter(claim_held(&claim.worker_id, claim.attempt))
+        .select(dsl::id)
+        .for_update()
+        .skip_locked()
+        .first::<Uuid>(conn)
+        .await
+        .optional()
+        .map(|row| row.is_some())
+        .map_err(crate::error::database_error)
+}
+
+/// Whether a later claim of the same worker holds the row with the same
+/// `crash_strikes` (issue #1789).
+///
+/// Such a claim passes a guard on `(worker_id, crash_strikes)`, for example
+/// [`claim_still_held_for_update`], but it is not `claim`. The read takes no
+/// lock.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub(crate) async fn later_claim_shares_strikes(
+    conn: &mut AsyncPgConnection,
+    claim: &TaskClaim,
+    crash_strikes: i32,
+) -> HarvestResult<bool> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    dsl::harvest_task_queue
+        .find(claim.task_id)
+        .filter(dsl::state.eq("RUNNING"))
+        .filter(dsl::worker_id.eq(claim.worker_id.as_str()))
+        .filter(dsl::crash_strikes.eq(crash_strikes))
+        .filter(dsl::attempt.ne(claim.attempt))
+        .select(dsl::id)
+        .first::<Uuid>(conn)
+        .await
+        .optional()
+        .map(|row| row.is_some())
+        .map_err(crate::error::database_error)
+}
+
+/// Complete the task that `claim` holds. A stale claim changes nothing.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on update failure.
+pub async fn complete_claimed_task(
+    conn: &mut AsyncPgConnection,
+    claim: &TaskClaim,
+    output: serde_json::Value,
+) -> HarvestResult<ClaimWrite> {
+    complete_task_inner(conn, claim.task_id, Some(claim), output)
+        .await
+        .map(claim_write)
+}
+
+/// Fail the task that `claim` holds. A stale claim changes nothing.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on update failure.
+pub async fn fail_claimed_task(
+    conn: &mut AsyncPgConnection,
+    claim: &TaskClaim,
+    error: &str,
+) -> HarvestResult<ClaimWrite> {
+    fail_task_inner(conn, claim.task_id, Some(claim), error)
+        .await
+        .map(claim_write)
+}
+
+/// Requeue the task that `claim` holds for retry. A stale claim changes
+/// nothing.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on update failure.
+pub async fn requeue_claimed_task_for_retry(
+    conn: &mut AsyncPgConnection,
+    claim: &TaskClaim,
+    delay: Duration,
+    previous_error: &str,
+) -> HarvestResult<ClaimWrite> {
+    requeue_for_retry_inner(conn, claim.task_id, Some(claim), delay, previous_error)
+        .await
+        .map(claim_write)
+}
+
+/// Defer the rate-limited task that `claim` holds. A stale claim changes
+/// nothing.
+///
+/// The deferral lowers `attempt` by one. A stale owner must not do that. It
+/// would let a later claim reuse an old `attempt` value and match a stale
+/// claim again.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on update failure.
+pub async fn defer_claimed_rate_limited_task(
+    conn: &mut AsyncPgConnection,
+    claim: &TaskClaim,
+    scheduled_at: chrono::DateTime<Utc>,
+) -> HarvestResult<ClaimWrite> {
+    defer_rate_limited_task_inner(conn, claim.task_id, Some(claim), scheduled_at)
+        .await
+        .map(claim_write)
+}
+
 /// Mark a task as completed with the given output.
 ///
 /// Terminal completion clears any heartbeat checkpoint payload so it cannot be
 /// observed after the activity has successfully finished.
 ///
-/// # Errors
-/// Lock the task queue row `FOR UPDATE` and return its current `state`.
+/// This write is not fenced. The activity owner uses
+/// [`complete_claimed_task`] instead.
 ///
-/// Used by [`crate::context::ActivityContext::run_transactional`] to verify
-/// the task is still `RUNNING` before committing the transactional activity
-/// result.  Returns `None` when the row no longer exists.
-pub(crate) async fn task_state_for_update(
-    conn: &mut AsyncPgConnection,
-    task_id: Uuid,
-) -> HarvestResult<Option<String>> {
-    use crate::schema::harvest_task_queue::dsl;
-
-    dsl::harvest_task_queue
-        .find(task_id)
-        .for_update()
-        .select(dsl::state)
-        .first::<String>(conn)
-        .await
-        .optional()
-        .map_err(crate::error::database_error)
-}
-
-/// Returns [`crate::error::HarvestError::Database`] on update failure.
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::NotFound`] when the task is not
+/// running, and [`crate::error::HarvestError::Database`] on update failure.
 pub async fn complete_task(
     conn: &mut AsyncPgConnection,
     task_id: Uuid,
     output: serde_json::Value,
 ) -> HarvestResult<()> {
+    if !complete_task_inner(conn, task_id, None, output).await? {
+        return Err(crate::error::HarvestError::NotFound(format!(
+            "task queue item {task_id} is not running"
+        )));
+    }
+
+    Ok(())
+}
+
+async fn complete_task_inner(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    claim: Option<&TaskClaim>,
+    output: serde_json::Value,
+) -> HarvestResult<bool> {
     use crate::schema::harvest_task_queue::dsl;
 
-    let updated = diesel::update(
+    let update = diesel::update(
         dsl::harvest_task_queue
             .find(task_id)
             .filter(dsl::state.eq("RUNNING")),
@@ -2492,17 +2900,12 @@ pub async fn complete_task(
         dsl::error.eq(None::<String>),
         dsl::completed_at.eq(Some(Utc::now())),
     ))
-    .execute(conn)
-    .await
-    .map_err(crate::error::database_error)?;
-
-    if updated == 0 {
-        return Err(crate::error::HarvestError::NotFound(format!(
-            "task queue item {task_id} is not running"
-        )));
-    }
-
-    Ok(())
+    .into_boxed();
+    let updated = fence(update, claim)
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(updated > 0)
 }
 
 /// Mark a task as failed with the given error message.
@@ -2511,17 +2914,38 @@ pub async fn complete_task(
 /// Retry rescheduling uses [`requeue_for_retry`] instead and preserves the
 /// payload for the next attempt.
 ///
+/// This write is not fenced. The timeout sweeper in `timeout.rs`,
+/// cancellation and operator actions use it. The activity owner uses
+/// [`fail_claimed_task`] instead.
+///
 /// # Errors
 ///
-/// Returns [`crate::error::HarvestError::Database`] on update failure.
+/// Returns [`crate::error::HarvestError::NotFound`] when the task is not
+/// pending or running, and [`crate::error::HarvestError::Database`] on update
+/// failure.
 pub async fn fail_task(
     conn: &mut AsyncPgConnection,
     task_id: Uuid,
     error: &str,
 ) -> HarvestResult<()> {
+    if !fail_task_inner(conn, task_id, None, error).await? {
+        return Err(crate::error::HarvestError::NotFound(format!(
+            "task queue item {task_id} is not pending or running"
+        )));
+    }
+
+    Ok(())
+}
+
+async fn fail_task_inner(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    claim: Option<&TaskClaim>,
+    error: &str,
+) -> HarvestResult<bool> {
     use crate::schema::harvest_task_queue::dsl;
 
-    let updated = diesel::update(
+    let update = diesel::update(
         dsl::harvest_task_queue
             .find(task_id)
             .filter(dsl::state.eq_any(["PENDING", "RUNNING"])),
@@ -2532,17 +2956,12 @@ pub async fn fail_task(
         dsl::heartbeat_details.eq(None::<serde_json::Value>),
         dsl::completed_at.eq(Some(Utc::now())),
     ))
-    .execute(conn)
-    .await
-    .map_err(crate::error::database_error)?;
-
-    if updated == 0 {
-        return Err(crate::error::HarvestError::NotFound(format!(
-            "task queue item {task_id} is not pending or running"
-        )));
-    }
-
-    Ok(())
+    .into_boxed();
+    let updated = fence(update, claim)
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(updated > 0)
 }
 
 /// Mark all pending or running tasks for a workflow execution as failed.
@@ -2845,38 +3264,34 @@ pub async fn oldest_pending_ages(
         .collect())
 }
 
-/// Update the `last_heartbeat_at` timestamp and checkpoint payload for a running task.
+/// Update the `last_heartbeat_at` timestamp and checkpoint payload of the
+/// task that `claim` holds.
+///
+/// `claim` fences the write (issue #1789). A stale owner cannot refresh or
+/// overwrite the checkpoint of a later attempt. It gets
+/// [`ClaimWrite::LeaseLost`] and must stop the activity.
 ///
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] on update failure.
 pub async fn record_heartbeat(
     conn: &mut AsyncPgConnection,
-    task_id: Uuid,
+    claim: &TaskClaim,
     details: serde_json::Value,
-) -> HarvestResult<()> {
+) -> HarvestResult<ClaimWrite> {
     use crate::schema::harvest_task_queue::dsl;
 
-    let updated = diesel::update(
-        dsl::harvest_task_queue
-            .find(task_id)
-            .filter(dsl::state.eq("RUNNING")),
-    )
-    .set((
-        dsl::last_heartbeat_at.eq(Some(Utc::now())),
-        dsl::heartbeat_details.eq(Some(details)),
-    ))
-    .execute(conn)
-    .await
-    .map_err(crate::error::database_error)?;
-
-    if updated == 0 {
-        return Err(crate::error::HarvestError::NotFound(format!(
-            "task queue item {task_id} is not running"
-        )));
-    }
-
-    Ok(())
+    let update = diesel::update(dsl::harvest_task_queue.find(claim.task_id))
+        .set((
+            dsl::last_heartbeat_at.eq(Some(Utc::now())),
+            dsl::heartbeat_details.eq(Some(details)),
+        ))
+        .into_boxed();
+    let updated = fence(update, Some(claim))
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(claim_write(updated > 0))
 }
 
 /// Shared "reset a claimed task back to `PENDING` with a future
@@ -2926,11 +3341,6 @@ impl PendingRequeueChangeset {
     }
 }
 
-/// Reset a task to `PENDING` with a future `scheduled_at` for retry.
-///
-/// # Errors
-///
-/// Returns [`crate::error::HarvestError::Database`] on update failure.
 /// Reschedule a `RUNNING` task back to `PENDING` after a retryable failure.
 ///
 /// Stores `previous_error` in the task row's `error` column so the next
@@ -2938,22 +3348,41 @@ impl PendingRequeueChangeset {
 /// The heartbeat details payload is preserved so the retry attempt can resume
 /// from the last flushed checkpoint.
 ///
+/// This write is not fenced. The activity owner uses
+/// [`requeue_claimed_task_for_retry`] instead.
+///
 /// # Errors
 ///
-/// Returns [`crate::error::HarvestError::Database`] on update failure.
+/// Returns [`crate::error::HarvestError::NotFound`] when the task is not
+/// running, and [`crate::error::HarvestError::Database`] on update failure.
 pub async fn requeue_for_retry(
     conn: &mut AsyncPgConnection,
     task_id: Uuid,
     delay: Duration,
     previous_error: &str,
 ) -> HarvestResult<()> {
+    if !requeue_for_retry_inner(conn, task_id, None, delay, previous_error).await? {
+        return Err(crate::error::HarvestError::NotFound(format!(
+            "task queue item {task_id} is not running"
+        )));
+    }
+    Ok(())
+}
+
+async fn requeue_for_retry_inner(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    claim: Option<&TaskClaim>,
+    delay: Duration,
+    previous_error: &str,
+) -> HarvestResult<bool> {
     use crate::schema::harvest_task_queue::dsl;
     use diesel::dsl::sql;
     use diesel::sql_types::{Double, Timestamptz};
 
     let changeset = PendingRequeueChangeset::new(previous_error.to_string());
 
-    let (queue_name, priority, task_type, next_run) = diesel::update(
+    let update = diesel::update(
         dsl::harvest_task_queue
             .find(task_id)
             .filter(dsl::state.eq("RUNNING")),
@@ -2966,19 +3395,21 @@ pub async fn requeue_for_retry(
                 .sql(")"),
         ),
     ))
-    .returning((
-        dsl::queue_name,
-        dsl::priority,
-        dsl::task_type,
-        dsl::scheduled_at,
-    ))
-    .get_result::<(String, i32, String, chrono::DateTime<Utc>)>(conn)
-    .await
-    .optional()
-    .map_err(crate::error::database_error)?
-    .ok_or_else(|| {
-        crate::error::HarvestError::NotFound(format!("task queue item {task_id} is not running"))
-    })?;
+    .into_boxed();
+    let Some((queue_name, priority, task_type, next_run)) = fence(update, claim)
+        .returning((
+            dsl::queue_name,
+            dsl::priority,
+            dsl::task_type,
+            dsl::scheduled_at,
+        ))
+        .get_result::<(String, i32, String, chrono::DateTime<Utc>)>(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?
+    else {
+        return Ok(false);
+    };
 
     // Dispatch hint (issue #1312). The retry is due at `next_run`, so the
     // channel parks the reference until then.
@@ -3003,7 +3434,7 @@ pub async fn requeue_for_retry(
         );
     }
 
-    Ok(())
+    Ok(true)
 }
 
 /// Finish a backoff-style workflow-task re-pend: record a dispatch hint for
@@ -3625,17 +4056,35 @@ pub async fn reschedule_task(
 /// Otherwise mirrors [`reschedule_task`] (clean continuation: resets the
 /// poison-pill crash streak and re-notifies the queue).
 ///
+/// This write is not fenced. The activity owner uses
+/// [`defer_claimed_rate_limited_task`] instead.
+///
 /// # Errors
 ///
-/// Returns [`crate::error::HarvestError::Database`] on update failure.
+/// Returns [`crate::error::HarvestError::NotFound`] when the task is not
+/// running, and [`crate::error::HarvestError::Database`] on update failure.
 pub async fn defer_rate_limited_task(
     conn: &mut AsyncPgConnection,
     task_id: Uuid,
     scheduled_at: chrono::DateTime<Utc>,
 ) -> HarvestResult<()> {
+    if !defer_rate_limited_task_inner(conn, task_id, None, scheduled_at).await? {
+        return Err(crate::error::HarvestError::NotFound(format!(
+            "task queue item {task_id} is not running"
+        )));
+    }
+    Ok(())
+}
+
+async fn defer_rate_limited_task_inner(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    claim: Option<&TaskClaim>,
+    scheduled_at: chrono::DateTime<Utc>,
+) -> HarvestResult<bool> {
     use crate::schema::harvest_task_queue::dsl;
 
-    let (queue_name, priority, task_type) = diesel::update(
+    let update = diesel::update(
         dsl::harvest_task_queue
             .find(task_id)
             .filter(dsl::state.eq("RUNNING")),
@@ -3648,14 +4097,16 @@ pub async fn defer_rate_limited_task(
             "GREATEST(attempt - 1, 0)",
         )),
     ))
-    .returning((dsl::queue_name, dsl::priority, dsl::task_type))
-    .get_result::<(String, i32, String)>(conn)
-    .await
-    .optional()
-    .map_err(crate::error::database_error)?
-    .ok_or_else(|| {
-        crate::error::HarvestError::NotFound(format!("task queue item {task_id} is not running"))
-    })?;
+    .into_boxed();
+    let Some((queue_name, priority, task_type)) = fence(update, claim)
+        .returning((dsl::queue_name, dsl::priority, dsl::task_type))
+        .get_result::<(String, i32, String)>(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?
+    else {
+        return Ok(false);
+    };
 
     crate::notify::notify_task_enqueued(conn, &queue_name, task_id).await?;
     // Dispatch hint (issue #1312).
@@ -3667,7 +4118,7 @@ pub async fn defer_rate_limited_task(
         crate::dispatch::DispatchKind::from(task_type.as_str()),
     );
 
-    Ok(())
+    Ok(true)
 }
 
 /// SQL for [`release_task_for_capability_miss`], exposed for no-DB shape tests
@@ -7334,7 +7785,10 @@ mod tests {
             "pending": 0,
         }))
         .expect("a pre-#811 payload must still deserialize");
-        assert_eq!(legacy.workflows.len(), 0);
+        assert_eq!(
+            legacy.workflows,
+            [] as [crate::queue::ConcurrencyWorkflowStrategy; 0]
+        );
     }
 
     /// The attribution query must select exactly the same live rows the stats
@@ -11029,6 +11483,50 @@ mod tests {
         assert!(
             keys < predicate && predicate < counts,
             "the by-id key predicate must sit inside concurrency_pending_keys"
+        );
+    }
+
+    /// The kind form differs from its base by one literal predicate (issue
+    /// #1787). Every gate the base query proves therefore holds for it too.
+    #[test]
+    fn kind_claim_query_is_the_base_query_plus_one_predicate() {
+        for (kind, literal) in [
+            (TaskType::Workflow, "'workflow'"),
+            (TaskType::Activity, "'activity'"),
+        ] {
+            let predicate = format!("AND harvest_task_queue.task_type = {literal} ");
+            for (fenced, base) in [
+                (false, claim_task_query()),
+                (true, claim_task_query_fenced()),
+            ] {
+                let query = claim_task_query_for_kind(kind, fenced);
+                assert_eq!(query.matches(&predicate).count(), 1, "{kind} {fenced}");
+                assert_eq!(query.replacen(&predicate, "", 1), base, "{kind} {fenced}");
+            }
+        }
+    }
+
+    /// The kind form adds no bind. The fence keeps `$7` and `$8`.
+    #[test]
+    fn kind_claim_query_adds_no_bind() {
+        for kind in [TaskType::Workflow, TaskType::Activity] {
+            assert!(!claim_task_query_for_kind(kind, false).contains("$7"));
+            assert!(claim_task_query_for_kind(kind, true).contains("$8"));
+            assert!(!claim_task_query_for_kind(kind, true).contains("$9"));
+        }
+    }
+
+    #[test]
+    fn the_kind_predicate_lands_inside_the_candidate_cte() {
+        let query = claim_task_query_for_kind(TaskType::Activity, false);
+        let predicate = query
+            .find("AND harvest_task_queue.task_type = 'activity'")
+            .expect("predicate");
+        let candidate = query.find("candidate AS (").expect("candidate CTE");
+        let claimed = query.find("claimed AS (").expect("claimed CTE");
+        assert!(
+            candidate < predicate && predicate < claimed,
+            "the kind predicate must sit inside the candidate CTE"
         );
     }
 

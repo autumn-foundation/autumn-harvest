@@ -496,9 +496,8 @@ mod tests {
             offloader(store.clone(), exact)
                 .offload_event_value(&mut e1)
                 .await
-                .unwrap()
-                .len(),
-            0
+                .unwrap(),
+            [] as [crate::payload_store::OffloadedRef; 0]
         );
         // One below -> offloaded.
         let mut e2 = event_with_output(payload);
@@ -586,7 +585,10 @@ mod tests {
             let off = offloader(store.clone(), 1_000_000);
             let original = serde_json::json!({ "_harvest_offload_envelope": marker });
             let mut event = event_with_output(original.clone());
-            assert_eq!(off.offload_event_value(&mut event).await.unwrap().len(), 0);
+            assert_eq!(
+                off.offload_event_value(&mut event).await.unwrap(),
+                [] as [crate::payload_store::OffloadedRef; 0]
+            );
             assert_eq!(event["data"]["output"], original);
         }
     }

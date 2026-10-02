@@ -5301,9 +5301,11 @@ async fn reschedule_task_clears_stale_heartbeat_timestamp() {
     assert_eq!(claimed.id, task_id);
 
     let checkpoint = serde_json::json!({"next_offset": 7});
-    queue::record_heartbeat(&mut conn, task_id, checkpoint.clone())
+    let claim = queue::TaskClaim::of(&claimed).expect("claimed task has a worker");
+    let write = queue::record_heartbeat(&mut conn, &claim, checkpoint.clone())
         .await
         .expect("record heartbeat should succeed");
+    assert_eq!(write, queue::ClaimWrite::Applied);
     let heartbeating = load_task_from_url(&database_url, task_id).await;
     assert!(
         heartbeating.last_heartbeat_at.is_some(),
@@ -8961,7 +8963,7 @@ async fn drain_accepted_sets_status_to_draining() {
         "drain_deadline_at must be set when a deadline is supplied"
     );
     assert_eq!(resp.worker_id, "w-drain-1");
-    assert_eq!(resp.unavailable_shards.len(), 0);
+    assert_eq!(resp.unavailable_shards, [] as [i32; 0]);
 }
 
 #[tokio::test]

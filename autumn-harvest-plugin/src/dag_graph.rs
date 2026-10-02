@@ -1429,7 +1429,7 @@ mod tests {
     fn depends_on_linear() {
         let def = linear_dag();
         let nodes = build_run_graph(&def, &[(ts(0), started())], "RUNNING");
-        assert_eq!(node(&nodes, "a").depends_on.len(), 0);
+        assert_eq!(node(&nodes, "a").depends_on, [] as [std::string::String; 0]);
         assert_eq!(node(&nodes, "b").depends_on, vec!["a".to_string()]);
         assert_eq!(node(&nodes, "c").depends_on, vec!["b".to_string()]);
         assert_eq!(node(&nodes, "d").depends_on, vec!["c".to_string()]);
@@ -1439,7 +1439,7 @@ mod tests {
     fn depends_on_fanout_join() {
         let def = fanout_dag();
         let nodes = build_run_graph(&def, &[(ts(0), started())], "RUNNING");
-        assert_eq!(node(&nodes, "a").depends_on.len(), 0);
+        assert_eq!(node(&nodes, "a").depends_on, [] as [std::string::String; 0]);
         assert_eq!(node(&nodes, "b").depends_on, vec!["a".to_string()]);
         assert_eq!(node(&nodes, "c").depends_on, vec!["a".to_string()]);
         assert_eq!(node(&nodes, "d").depends_on, vec!["a".to_string()]);

@@ -1171,7 +1171,7 @@ mod tests {
     fn empty_history_has_no_steps() {
         let rows = vec![started(0)];
         let tl = derive(&rows, Some(50), 50);
-        assert_eq!(tl.steps.len(), 0);
+        assert_eq!(tl.steps, [] as [crate::timeline::TimelineStep; 0]);
         assert!(tl.rollup.slowest_step.is_none());
         assert_eq!(tl.rollup.busy_ms, 0);
         assert_eq!(tl.rollup.wait_ms, 0);

@@ -440,7 +440,10 @@ fn timer_history_opens_and_closes_its_awaitable() {
     ];
     let trace = trace_of(&events);
     assert_eq!(trace.steps[1].open_awaitables.len(), 1);
-    assert_eq!(trace.steps[2].open_awaitables.len(), 0);
+    assert_eq!(
+        trace.steps[2].open_awaitables,
+        [] as [autumn_harvest::debugger::OpenAwaitable; 0]
+    );
     let out = render_step_detail(&trace, 1);
     assert!(out.contains("cooldown"), "{out}");
 }

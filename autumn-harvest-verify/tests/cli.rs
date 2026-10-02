@@ -120,7 +120,7 @@ fn json_output_over_a_clean_fixture_exits_zero_and_parses_as_a_report() {
         !report.model_version.is_empty(),
         "the model version is part of the contract"
     );
-    assert_ne!(report.rustc_version.len(), 0);
+    assert_ne!(report.rustc_version, "");
     assert_eq!(report.summary().analyzed, 1);
     assert_eq!(report.summary().found, 0);
 }
@@ -439,5 +439,5 @@ fn a_missing_mir_path_is_a_tool_error() {
 fn an_unknown_flag_is_a_usage_error() {
     let out = run(&["--not-a-real-flag"]);
     assert_ne!(code(&out), 0);
-    assert_ne!(stderr(&out).len(), 0);
+    assert_ne!(stderr(&out), "");
 }

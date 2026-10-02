@@ -84,10 +84,11 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
-# Clippy 1.99 flags the field declarations inside `#[derive(diesel::QueryableByName)]`
-# structs as "redundant field names in struct initialization". The lint fires on
-# macro-generated code, and `cargo clippy --fix` cannot repair it.
+# Clippy 1.99 reports these two lints inside macro expansions. The source has
+# no such code. Diesel derives expand to `field: field`. `async_trait` expands
+# to a second `#[must_use]`. Re-enable both when clippy skips macro output.
 redundant_field_names = "allow"
+double_must_use = "allow"
 
 [profile.dev.package.bollard-stubs]
 opt-level = 0

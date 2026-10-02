@@ -2576,8 +2576,8 @@ mod tests {
     fn preview_item_from_row_handles_empty_queues_and_shards() {
         let row = make_worker_row_full("w-2", "Draining", 0, &[], &[]);
         let item = preview_item_from_row(&row);
-        assert_eq!(item.queues.len(), 0);
-        assert_eq!(item.shard_ids.len(), 0);
+        assert_eq!(item.queues, [] as [std::string::String; 0]);
+        assert_eq!(item.shard_ids, [] as [i32; 0]);
     }
 
     #[test]

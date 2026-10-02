@@ -108,6 +108,8 @@ fn build_pool(url: &str) -> DbPool {
 async fn scrub(conn: &mut AsyncPgConnection) {
     for stmt in [
         "DELETE FROM harvest_execution_summaries",
+        "DELETE FROM harvest_completion_trigger_fires",
+        "DELETE FROM harvest_completion_trigger_outbox",
         "DELETE FROM harvest_completion_deliveries",
         "DELETE FROM harvest_dead_letters",
         "DELETE FROM harvest_workflow_executions",
@@ -723,6 +725,270 @@ async fn summary_gc_deletes_expired_and_emits_metric() {
         vec![("gc_wf".to_string(), 2)],
         "summary GC emits the per-workflow deletion count"
     );
+}
+
+// ── Completion-trigger fire GC (issue #1676) ────────────────────────────────
+
+/// Inserts a delivered fire (`outcome IS NULL`) for `source`, fired at
+/// `fired_at`.
+async fn insert_fire(conn: &mut AsyncPgConnection, source: uuid::Uuid, fired_at: DateTime<Utc>) {
+    diesel::sql_query(
+        "INSERT INTO harvest_completion_trigger_fires
+            (source_exec_id, trigger_id, fired_at)
+         VALUES ($1, gen_random_uuid(), $2)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(source)
+    .bind::<Timestamptz, _>(fired_at)
+    .execute(conn)
+    .await
+    .expect("insert fire");
+}
+
+/// Inserts a fire already resolved with `outcome`, for example
+/// `admission_blocked`.
+async fn insert_resolved_fire(
+    conn: &mut AsyncPgConnection,
+    fired_at: DateTime<Utc>,
+    outcome: &str,
+) {
+    diesel::sql_query(
+        "INSERT INTO harvest_completion_trigger_fires
+            (source_exec_id, trigger_id, fired_at, outcome)
+         VALUES (gen_random_uuid(), gen_random_uuid(), $1, $2)",
+    )
+    .bind::<Timestamptz, _>(fired_at)
+    .bind::<Text, _>(outcome)
+    .execute(conn)
+    .await
+    .expect("insert resolved fire");
+}
+
+/// Inserts an undelivered outbox row for `source`'s fire.
+async fn insert_outbox_for(conn: &mut AsyncPgConnection, source: uuid::Uuid) {
+    diesel::sql_query(
+        "INSERT INTO harvest_completion_trigger_outbox
+            (source_exec_id, trigger_id, target_shard, target_workflow_name,
+             target_workflow_id, target_input, priority, max_workflow_input_bytes)
+         SELECT source_exec_id, trigger_id, 0, 't', 'tid', '{}'::jsonb,
+                '\"Normal\"'::jsonb, 1024
+         FROM harvest_completion_trigger_fires WHERE source_exec_id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(source)
+    .execute(conn)
+    .await
+    .expect("insert outbox");
+}
+
+async fn count_fires(conn: &mut AsyncPgConnection) -> i64 {
+    diesel::sql_query("SELECT COUNT(*) AS n FROM harvest_completion_trigger_fires")
+        .get_result::<CountRow>(conn)
+        .await
+        .expect("count fires")
+        .n
+}
+
+fn summary_gc_config() -> RetentionConfig {
+    history_only(Some(Duration::from_secs(86_400)))
+        .with_summary_retention(SummaryPolicy::for_duration(Duration::from_secs(3_600)))
+}
+
+/// A delivered fire older than the summary horizon is deleted. A younger
+/// one stays. `backup verify` then never scans a fire whose target summary
+/// has aged out.
+#[tokio::test]
+async fn summary_gc_prunes_a_delivered_fire_past_the_horizon() {
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    scrub(&mut conn).await;
+
+    let now = Utc::now();
+    insert_fire(
+        &mut conn,
+        uuid::Uuid::new_v4(),
+        now - chrono::Duration::days(2),
+    )
+    .await;
+    insert_fire(
+        &mut conn,
+        uuid::Uuid::new_v4(),
+        now - chrono::Duration::minutes(5),
+    )
+    .await;
+
+    run_one_tick(
+        pool,
+        summary_gc_config(),
+        Arc::new(CapturingMetrics::default()),
+    )
+    .await;
+
+    assert_eq!(count_fires(&mut conn).await, 1, "only the young fire stays");
+}
+
+/// A fire with an outbox row is still awaiting relay. Deleting it would
+/// drop a delivery, so it stays whatever its age.
+#[tokio::test]
+async fn summary_gc_keeps_a_fire_that_still_has_an_outbox_row() {
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    scrub(&mut conn).await;
+
+    let source = uuid::Uuid::new_v4();
+    insert_fire(&mut conn, source, Utc::now() - chrono::Duration::days(2)).await;
+    insert_outbox_for(&mut conn, source).await;
+
+    run_one_tick(
+        pool,
+        summary_gc_config(),
+        Arc::new(CapturingMetrics::default()),
+    )
+    .await;
+
+    assert_eq!(count_fires(&mut conn).await, 1, "pending relay is kept");
+}
+
+/// The fire row also guards against a second fire for the same source
+/// run. It stays while that run still has an execution row.
+#[tokio::test]
+async fn summary_gc_keeps_a_fire_whose_source_execution_still_exists() {
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    scrub(&mut conn).await;
+
+    // Completed inside the history horizon, so the tick keeps the row.
+    let source = insert_completed(
+        &mut conn,
+        "src",
+        "s1",
+        Utc::now() - chrono::Duration::hours(2),
+    )
+    .await;
+    insert_fire(&mut conn, source, Utc::now() - chrono::Duration::days(2)).await;
+
+    run_one_tick(
+        pool,
+        summary_gc_config(),
+        Arc::new(CapturingMetrics::default()),
+    )
+    .await;
+
+    assert_eq!(
+        count_fires(&mut conn).await,
+        1,
+        "live source keeps its fire"
+    );
+}
+
+/// With no summary horizon, the fire table keeps every row. The summary
+/// horizon is the only retention signal the prune follows.
+#[tokio::test]
+async fn fire_gc_is_off_without_a_summary_horizon() {
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    scrub(&mut conn).await;
+
+    insert_fire(
+        &mut conn,
+        uuid::Uuid::new_v4(),
+        Utc::now() - chrono::Duration::days(30),
+    )
+    .await;
+
+    let config = history_only(Some(Duration::from_secs(86_400)));
+    run_one_tick(pool, config, Arc::new(CapturingMetrics::default())).await;
+
+    assert_eq!(count_fires(&mut conn).await, 1);
+}
+
+/// A small batch size drains every expired fire over several loop passes.
+/// Five rows with a batch of two ends on a short batch. Four rows with a
+/// batch of two ends on an empty batch.
+#[tokio::test]
+async fn fire_gc_drains_several_batches() {
+    for (rows, batch) in [(5_usize, 2_usize), (4, 2)] {
+        let (url, _c) = setup_db().await;
+        let pool = build_pool(&url);
+        let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+        scrub(&mut conn).await;
+
+        let old = Utc::now() - chrono::Duration::days(2);
+        for _ in 0..rows {
+            insert_fire(&mut conn, uuid::Uuid::new_v4(), old).await;
+        }
+        let mut config = summary_gc_config();
+        config.batch_size = batch;
+        run_one_tick(pool, config, Arc::new(CapturingMetrics::default())).await;
+
+        assert_eq!(
+            count_fires(&mut conn).await,
+            0,
+            "{rows} rows, batch {batch}"
+        );
+    }
+}
+
+/// A resolved fire (no target, no outbox row) expires like a delivered one.
+/// Pinned and deletable rows in one run are handled separately.
+#[tokio::test]
+async fn fire_gc_deletes_resolved_fires_and_keeps_only_pinned_rows() {
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    scrub(&mut conn).await;
+
+    let old = Utc::now() - chrono::Duration::days(2);
+    insert_resolved_fire(&mut conn, old, "admission_blocked").await;
+    insert_resolved_fire(&mut conn, old, "payload_too_large").await;
+    insert_fire(&mut conn, uuid::Uuid::new_v4(), old).await;
+    let pinned = uuid::Uuid::new_v4();
+    insert_fire(&mut conn, pinned, old - chrono::Duration::days(1)).await;
+    insert_outbox_for(&mut conn, pinned).await;
+
+    run_one_tick(
+        pool,
+        summary_gc_config(),
+        Arc::new(CapturingMetrics::default()),
+    )
+    .await;
+
+    assert_eq!(
+        count_fires(&mut conn).await,
+        1,
+        "only the pinned fire stays"
+    );
+    let kept: CountRow = diesel::sql_query(
+        "SELECT COUNT(*) AS n FROM harvest_completion_trigger_fires WHERE source_exec_id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(pinned)
+    .get_result(&mut conn)
+    .await
+    .expect("count pinned");
+    assert_eq!(kept.n, 1, "the surviving row is the pinned one");
+}
+
+/// A dry-run tick deletes no fire row.
+#[tokio::test]
+async fn fire_gc_does_nothing_in_dry_run() {
+    let (url, _c) = setup_db().await;
+    let pool = build_pool(&url);
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    scrub(&mut conn).await;
+
+    insert_fire(
+        &mut conn,
+        uuid::Uuid::new_v4(),
+        Utc::now() - chrono::Duration::days(2),
+    )
+    .await;
+    let mut config = summary_gc_config();
+    config.dry_run = true;
+    run_one_tick(pool, config, Arc::new(CapturingMetrics::default())).await;
+
+    assert_eq!(count_fires(&mut conn).await, 1);
 }
 
 /// Issue #1317 review, P1 follow-up. A summary demoted from a row that was

@@ -105,13 +105,13 @@ fn day_granular_versions(list: &str) -> Vec<&str> {
 #[test]
 fn day_granular_detection_flags_a_zero_time_version_after_the_cutoff() {
     // Before the cutoff: grandfathered, however zeroed.
-    assert_eq!(day_granular_versions("20260101000000_old").len(), 0);
+    assert_eq!(day_granular_versions("20260101000000_old"), [] as [&str; 0]);
     // The cutoff itself is the last grandfathered version, not the first
     // flagged one — `20260728000000_harvest_audit_export` is on disk and must
     // keep its name.
     assert_eq!(
-        day_granular_versions("20260728000000_audit_export").len(),
-        0
+        day_granular_versions("20260728000000_audit_export"),
+        [] as [&str; 0]
     );
     // After it: flagged.
     assert_eq!(
@@ -120,7 +120,7 @@ fn day_granular_detection_flags_a_zero_time_version_after_the_cutoff() {
         "a zero time component after the cutoff must be detected"
     );
     // A real time of day passes.
-    assert_eq!(day_granular_versions("20260901115500_new").len(), 0);
+    assert_eq!(day_granular_versions("20260901115500_new"), [] as [&str; 0]);
 }
 
 /// Migration versions must carry a real time of day, not just a date.
@@ -247,7 +247,10 @@ fn version_collision_detection_covers_both_trees() {
     // A distinct version is not a collision, so the guard cannot be vacuously
     // green by flagging everything.
     let distinct = ["20260719000000_plugin_thing".to_string()];
-    assert_eq!(versions_colliding_with_core(&distinct, core).len(), 0);
+    assert_eq!(
+        versions_colliding_with_core(&distinct, core),
+        [] as [&str; 0]
+    );
 }
 
 #[test]

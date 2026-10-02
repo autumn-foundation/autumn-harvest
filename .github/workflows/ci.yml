@@ -319,6 +319,13 @@ jobs:
         # match arms textually. See
         # scripts/check-sqlite-outcome-match-example.sh.
         run: ./scripts/check-sqlite-outcome-match-example.sh
+      - name: Check chapter 8 and 11 snippets compile
+        # Guards two getting-started snippets that declared the workflow
+        # input as `_: ()`. `#[workflow]` silently dropped the `_` pattern,
+        # so the generated call passed one argument to a two-argument
+        # function. rustc reported E0061 "takes 5 arguments" on the
+        # attribute line. See scripts/check-underscore-input-snippets.sh.
+        run: ./scripts/check-underscore-input-snippets.sh
       - name: Check webhooks chapter documents the webhooks feature
         # Guards a real, reproduced-live defect an Onramp clean-room pass
         # found in chapter 12: it showed the `#[webhook]` mapping function
@@ -447,6 +454,11 @@ jobs:
       # `performance_docs::ci_yaml_plain_scalars_do_not_contain_a_mapping_colon`.
       - name: Run docs/performance.md guards (also on docs-only PRs)
         run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration performance_docs::"
+
+      # Issue #1783: the `docs/calendars.md` Rust fences compile as doctests.
+      # A docs-only PR skips the `test` matrix, so the doctests run here, ungated.
+      - name: Run docs/calendars.md doctests (also on docs-only PRs)
+        run: "cargo test -p autumn-harvest --no-default-features --doc calendar::CalendarsDocSnippets"
 
       # Issue #966: same reasoning as the step above, for the R&D report's
       # coupling-inventory guards. `docs/rnd/sqlite-feasibility.md` matches BOTH

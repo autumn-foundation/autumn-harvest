@@ -1552,8 +1552,8 @@ mod tests {
         );
         anchors.mark_durable(1);
         assert_eq!(
-            anchors_needing_durability(OffsetReset::Latest, &anchors).len(),
-            0
+            anchors_needing_durability(OffsetReset::Latest, &anchors),
+            [] as [(i32, i64); 0]
         );
     }
 

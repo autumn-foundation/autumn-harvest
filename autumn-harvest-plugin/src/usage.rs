@@ -703,7 +703,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(resp.status, UsageReportStatus::Unavailable);
-        assert_eq!(resp.groups.len(), 0);
+        assert_eq!(resp.groups, [] as [crate::usage::UsageGroupRecord; 0]);
         assert_eq!(resp.unavailable_shards.len(), 1);
     }
 

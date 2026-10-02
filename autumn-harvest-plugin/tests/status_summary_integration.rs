@@ -319,7 +319,10 @@ async fn healthy_fleet_reports_healthy_with_five_subsystems() {
         assert!(names.contains(&expected), "{expected} subsystem present");
     }
     assert!(body["as_of"].is_string());
-    assert_eq!(body["unavailable_shards"].as_array().unwrap().len(), 0);
+    assert_eq!(
+        body["unavailable_shards"].as_array().unwrap().as_slice(),
+        [] as [serde_json::Value; 0]
+    );
     // Every healthy subsystem has a null drill_down.
     assert!(
         body["subsystems"]
@@ -402,8 +405,7 @@ async fn one_shard_down_degrades_and_names_the_shard() {
     assert_ne!(
         unavailable.iter().find(|u| u["shard_id"] == 1).unwrap()["reason"]
             .as_str()
-            .unwrap()
-            .len(),
-        0
+            .unwrap(),
+        ""
     );
 }

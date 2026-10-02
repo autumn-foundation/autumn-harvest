@@ -333,7 +333,7 @@ mod tests {
         let result = analyzer.analyze();
 
         assert_eq!(result.total_duration, Duration::ZERO);
-        assert_eq!(result.path_indices.len(), 0);
+        assert_eq!(result.path_indices, [] as [usize; 0]);
     }
 
     #[test]

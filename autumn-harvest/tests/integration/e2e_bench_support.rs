@@ -1661,7 +1661,7 @@ mod tests {
         let unique: std::collections::BTreeSet<&&str> = ids.iter().collect();
         assert_eq!(unique.len(), ids.len(), "scenario ids must be distinct");
         for id in &ids {
-            assert_ne!(id.len(), 0);
+            assert_ne!(*id, "");
             assert!(
                 id.chars()
                     .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
@@ -1777,7 +1777,10 @@ mod tests {
                 .any(|r| r.contains(&MIN_LATENCY_SAMPLES.to_string())),
             "the reason must name the bar it missed: {reasons:?}"
         );
-        assert_eq!(latency_soundness(MIN_LATENCY_SAMPLES, 0, 0).len(), 0);
+        assert_eq!(
+            latency_soundness(MIN_LATENCY_SAMPLES, 0, 0),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]
@@ -1819,8 +1822,8 @@ mod tests {
             "a shard that drained nothing cannot be published as part of a 4-shard number: {reasons:?}"
         );
         assert_eq!(
-            throughput_soundness(1000, 1000, &[250, 250, 250, 250]).len(),
-            0
+            throughput_soundness(1000, 1000, &[250, 250, 250, 250]),
+            [] as [std::string::String; 0]
         );
     }
 
@@ -2020,8 +2023,11 @@ mod tests {
             unknown_scenario_ids(Some("throughput,typo")),
             vec!["typo".to_owned()]
         );
-        assert_eq!(unknown_scenario_ids(Some("throughput")).len(), 0);
-        assert_eq!(unknown_scenario_ids(None).len(), 0);
+        assert_eq!(
+            unknown_scenario_ids(Some("throughput")),
+            [] as [std::string::String; 0]
+        );
+        assert_eq!(unknown_scenario_ids(None), [] as [std::string::String; 0]);
 
         // Shard counts get the same treatment. `1,3` used to run only the
         // 1-shard cells while looking like it had accepted the whole request,
@@ -2032,8 +2038,11 @@ mod tests {
             unknown_shard_counts(Some("2,banana")),
             vec!["banana".to_owned()]
         );
-        assert_eq!(unknown_shard_counts(Some("1,2,4")).len(), 0);
-        assert_eq!(unknown_shard_counts(None).len(), 0);
+        assert_eq!(
+            unknown_shard_counts(Some("1,2,4")),
+            [] as [std::string::String; 0]
+        );
+        assert_eq!(unknown_shard_counts(None), [] as [std::string::String; 0]);
         assert_eq!(
             selected_shard_counts(Some("3")),
             Vec::<u32>::new(),
@@ -2071,7 +2080,10 @@ mod tests {
         );
         // Same magnitude either way: a database clock that runs ahead
         // understates the latency just as badly.
-        assert_ne!(clock_offset_soundness(&[-30.0], &[-30.0], 37.78).len(), 0);
+        assert_ne!(
+            clock_offset_soundness(&[-30.0], &[-30.0], 37.78),
+            [] as [std::string::String; 0]
+        );
         // Small at both ends but drifting across the window.
         let reasons = clock_offset_soundness(&[0.0], &[5.0], 37.78);
         assert!(
@@ -2082,7 +2094,10 @@ mod tests {
 
     #[test]
     fn a_dispatch_population_far_below_what_ran_is_unsound() {
-        assert_eq!(dispatch_population_soundness(1200, 1200, 0, 0).len(), 0);
+        assert_eq!(
+            dispatch_population_soundness(1200, 1200, 0, 0),
+            [] as [std::string::String; 0]
+        );
         assert!(
             dispatch_population_soundness(1200, 1080, 0, 0).is_empty(),
             "the leading-tenth warmup discard must not itself trip the coverage floor"
@@ -2098,13 +2113,22 @@ mod tests {
             !dispatch_population_soundness(1200, 1200, 1, 0).is_empty(),
             "a re-dispatched row makes a re-delivery delay look like dispatch latency"
         );
-        assert_ne!(dispatch_population_soundness(1200, 1200, 0, 1).len(), 0);
+        assert_ne!(
+            dispatch_population_soundness(1200, 1200, 0, 1),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]
     fn a_warmup_that_did_not_drain_is_unsound() {
-        assert_eq!(warmup_soundness("throughput", 240, &[240]).len(), 0);
-        assert_eq!(warmup_soundness("throughput", 240, &[120, 120]).len(), 0);
+        assert_eq!(
+            warmup_soundness("throughput", 240, &[240]),
+            [] as [std::string::String; 0]
+        );
+        assert_eq!(
+            warmup_soundness("throughput", 240, &[120, 120]),
+            [] as [std::string::String; 0]
+        );
         let reasons = warmup_soundness("throughput", 240, &[100]);
         assert!(
             reasons
@@ -2150,7 +2174,10 @@ mod tests {
             per_shard_inflight_soundness(32, &[Some(32.0), Some(31.0)]).is_empty(),
             "every shard within the hold ratio publishes"
         );
-        assert_ne!(per_shard_inflight_soundness(32, &[]).len(), 0);
+        assert_ne!(
+            per_shard_inflight_soundness(32, &[]),
+            [] as [std::string::String; 0]
+        );
         assert!(
             !per_shard_inflight_soundness(32, &[Some(32.0), None]).is_empty(),
             "a shard that collected nothing is not evidence of an engine-bound run"

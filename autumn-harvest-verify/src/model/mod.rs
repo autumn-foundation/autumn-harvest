@@ -355,7 +355,7 @@ mod tests {
         let a = Model::builtin_ref().expect("builtin");
         let b = Model::builtin_ref().expect("builtin");
         assert!(std::ptr::eq(a, b), "the builtin model must be cached");
-        assert_ne!(a.version.len(), 0);
+        assert_ne!(a.version, "");
         assert!(!a.source.is_empty() && !a.sink.is_empty());
     }
 

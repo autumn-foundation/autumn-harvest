@@ -297,7 +297,7 @@ async fn admin_gates_exposes_producer_contract() {
         .get("producers")
         .and_then(Value::as_array)
         .expect("response must carry a `producers` block (AC5)");
-    assert_ne!(producers.len(), 0);
+    assert_ne!(producers.as_slice(), [] as [serde_json::Value; 0]);
 
     let by_name = |name: &str| -> Value {
         producers

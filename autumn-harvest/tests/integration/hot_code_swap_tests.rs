@@ -1592,9 +1592,8 @@ async fn retiring_a_build_hides_its_modules_from_every_read_path() {
     assert_eq!(
         list_workflow_modules_for_build(&mut conn, "wf-v1")
             .await
-            .expect("list")
-            .len(),
-        0
+            .expect("list"),
+        [] as [autumn_harvest::ModuleDescriptor; 0]
     );
 }
 

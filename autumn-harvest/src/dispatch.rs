@@ -2351,7 +2351,7 @@ mod tests {
         })
         .await;
         assert_eq!(leftover, vec![one.clone()]);
-        assert_eq!(channel.published_ids().len(), 0);
+        assert_eq!(channel.published_ids(), [] as [uuid::Uuid; 0]);
 
         publish_now(leftover).await;
         assert_eq!(channel.published_ids(), vec![one.task_id]);
@@ -2397,7 +2397,7 @@ mod tests {
             flush_scope().await;
         })
         .await;
-        assert_eq!(leftover.len(), 0);
+        assert_eq!(leftover, [] as [crate::dispatch::DispatchHint; 0]);
         assert_eq!(channel.published_ids(), vec![one.task_id]);
         uninstall();
     }
@@ -3478,6 +3478,6 @@ mod tests {
         uninstall();
 
         assert_eq!(bound.published_ids(), vec![one.task_id]);
-        assert_eq!(live.published_ids().len(), 0);
+        assert_eq!(live.published_ids(), [] as [uuid::Uuid; 0]);
     }
 }

@@ -2492,7 +2492,10 @@ mod tests {
         }
 
         assert!(sink.entries().is_empty());
-        assert_eq!(source.acked().len(), 0);
+        assert_eq!(
+            source.acked(),
+            [] as [crate::connector::message::MessageHandle; 0]
+        );
         assert_eq!(source.abandoned().len(), 5, "redelivered on every lap");
         assert_eq!(
             rt.poison.lock().await.tracked(),
@@ -2520,7 +2523,10 @@ mod tests {
 
         assert_eq!(summary.dead_lettered, 1);
         assert!(sink.entries().is_empty(), "the broker owns the DLQ here");
-        assert_eq!(source.acked().len(), 0);
+        assert_eq!(
+            source.acked(),
+            [] as [crate::connector::message::MessageHandle; 0]
+        );
         // The POISON path, not the transient-retry path: the two are opposite
         // intents (drive the receive count toward the redrive threshold vs.
         // return gently with backoff) and SQS implements them differently.
@@ -2548,7 +2554,10 @@ mod tests {
         let summary = rt.run_once().await.unwrap();
 
         assert_eq!(summary.retried, 1);
-        assert_eq!(source.acked().len(), 0);
+        assert_eq!(
+            source.acked(),
+            [] as [crate::connector::message::MessageHandle; 0]
+        );
         assert_eq!(source.abandoned().len(), 1);
         assert!(
             source.nacked_for_dead_letter().is_empty(),
@@ -3594,7 +3603,7 @@ mod tests {
         let rt = runtime_with_metrics(malformed_binding(), source, sink, Arc::clone(&metrics));
 
         rt.run_once().await.unwrap();
-        assert_eq!(metrics.lag().len(), 0);
+        assert_eq!(metrics.lag(), [] as [(std::string::String, i64); 0]);
     }
 
     #[tokio::test]

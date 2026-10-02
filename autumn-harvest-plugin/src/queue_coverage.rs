@@ -1284,8 +1284,14 @@ mod tests {
 
     #[test]
     fn merge_excluded_paused_queues_empty_input_is_empty() {
-        assert_eq!(merge_excluded_paused_queues(Vec::new()).len(), 0);
-        assert_eq!(merge_excluded_paused_queues(vec![BTreeSet::new()]).len(), 0);
+        assert_eq!(
+            merge_excluded_paused_queues(Vec::new()),
+            [] as [std::string::String; 0]
+        );
+        assert_eq!(
+            merge_excluded_paused_queues(vec![BTreeSet::new()]),
+            [] as [std::string::String; 0]
+        );
     }
 
     // ── QueueCoverageQuery::from_query_pairs (AC8) ──────────────────────

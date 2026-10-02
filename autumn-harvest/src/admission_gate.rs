@@ -1493,7 +1493,7 @@ mod tests {
                 ProducerGateStatus::GatedAtAdmission,
                 "{split} must be gated-at-admission"
             );
-            assert_ne!(e.rationale.len(), 0);
+            assert_ne!(e.rationale, "");
         }
         // The cross-shard completion-trigger relay is gated authoritatively at
         // relay time (issue #618, F-round7).
@@ -1502,7 +1502,7 @@ mod tests {
             .find(|e| e.producer == "completion_trigger_outbox")
             .expect("completion_trigger_outbox entry");
         assert_eq!(cto.status, ProducerGateStatus::GatedAtRelay);
-        assert_ne!(cto.rationale.len(), 0);
+        assert_ne!(cto.rationale, "");
         // Throttle is gated authoritatively at fire time (issue #1053): a closed
         // gate blocks the deferred fire and RE-DEFERS the row (nothing dropped).
         let throttle = contract
@@ -1510,7 +1510,7 @@ mod tests {
             .find(|e| e.producer == "throttle")
             .expect("throttle entry");
         assert_eq!(throttle.status, ProducerGateStatus::GatedAtRelay);
-        assert_ne!(throttle.rationale.len(), 0);
+        assert_ne!(throttle.rationale, "");
         // The transactional in-process start (issue #763) is gated via
         // `check_cached`, not exempt — see `start_workflow_transactional`'s
         // doc comment for why `check_cached` (not `check`) is the right choice
@@ -1520,7 +1520,7 @@ mod tests {
             .find(|e| e.producer == "transactional")
             .expect("transactional entry");
         assert_eq!(transactional.status, ProducerGateStatus::Gated);
-        assert_ne!(transactional.rationale.len(), 0);
+        assert_ne!(transactional.rationale, "");
     }
 
     #[test]

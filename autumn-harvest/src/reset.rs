@@ -1776,7 +1776,10 @@ mod tests {
         let plan = validate_reset_point(&events, 0).expect("workflow start is always valid");
         assert_eq!(plan.reset_to_event_id, 0);
         assert_eq!(plan.events_carried_over, 1);
-        assert_eq!(plan.unresolved_side_effects.len(), 0);
+        assert_eq!(
+            plan.unresolved_side_effects,
+            [] as [crate::reset::ResetUnresolvedSideEffect; 0]
+        );
     }
 
     #[test]
@@ -1873,7 +1876,10 @@ mod tests {
         ];
 
         let plan = validate_reset_point(&events, 2).expect("resolved cancel is a valid boundary");
-        assert_eq!(plan.unresolved_side_effects.len(), 0);
+        assert_eq!(
+            plan.unresolved_side_effects,
+            [] as [crate::reset::ResetUnresolvedSideEffect; 0]
+        );
     }
 
     #[test]
@@ -1977,7 +1983,10 @@ mod tests {
         // the pending arm, so the fork validates.
         let plan = validate_reset_point(&events, 2)
             .expect("a cancelled timer resolves the pending arm, like a fire");
-        assert_eq!(plan.unresolved_side_effects.len(), 0);
+        assert_eq!(
+            plan.unresolved_side_effects,
+            [] as [crate::reset::ResetUnresolvedSideEffect; 0]
+        );
         assert_eq!(plan.reset_to_event_id, 2);
     }
 
@@ -2067,7 +2076,10 @@ mod tests {
         let plan =
             validate_reset_point(&events, 3).expect("exhausted local activity is fully resolved");
         assert_eq!(plan.reset_to_event_id, 3);
-        assert_eq!(plan.unresolved_side_effects.len(), 0);
+        assert_eq!(
+            plan.unresolved_side_effects,
+            [] as [crate::reset::ResetUnresolvedSideEffect; 0]
+        );
     }
 
     #[test]
