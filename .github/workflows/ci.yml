@@ -1313,6 +1313,14 @@ jobs:
       matrix:
         shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
     runs-on: ubuntu-latest
+    # The shard count and index live here once. The pre-pull step and the
+    # suite step both read them, so a re-shard cannot leave the pre-pull
+    # asking about a different assignment than the suites run under. Keep
+    # the count equal to the `matrix.shard` list above. The partitioned pass
+    # at the end of this job overrides the count to run whole.
+    env:
+      SEMAPHORE_SHARD_COUNT: "21"
+      SEMAPHORE_SHARD_INDEX: ${{ matrix.shard }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -1353,9 +1361,6 @@ jobs:
       - name: Pre-pull Docker test images (retry transient pull failures)
         if: needs.changes.outputs.code == 'true'
         shell: bash
-        env:
-          SEMAPHORE_SHARD_COUNT: "21"
-          SEMAPHORE_SHARD_INDEX: ${{ matrix.shard }}
         run: |
           images="postgres:11-alpine postgres:16 postgres:16-alpine redis:5.0"
           # Pull ElasticMQ only on the shard that runs `connector_sqs_broker`.
@@ -1396,8 +1401,6 @@ jobs:
           # into a panic, so "the Redis suites stopped testing anything" is a
           # red build here rather than a silent green.
           HARVEST_TEST_REQUIRE_REDIS: "1"
-          SEMAPHORE_SHARD_COUNT: "21"
-          SEMAPHORE_SHARD_INDEX: ${{ matrix.shard }}
         run: bash .github/ci/run-suites.sh run linux
       # Issue #958, AC2: re-run the store/replay/retention suites against the
       # opt-in PARTITIONED `harvest_events` layout. Same suites, same
@@ -1409,6 +1412,10 @@ jobs:
       - name: Integration suites (partitioned harvest_events layout)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 0
         shell: bash
+        env:
+          # Empty count: run-suites.sh treats it as unsharded, so this pass
+          # runs all its rows on this one shard.
+          SEMAPHORE_SHARD_COUNT: ""
         run: bash .github/ci/run-suites.sh run linuxpart
 
   quickstart:
