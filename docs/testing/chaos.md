@@ -353,8 +353,8 @@ Each test works around a bug only where the bug applies:
   so a fix for the bugs makes the test fail on purpose. The restart test
   accepts it, but only for workflows with an activity that the old Postgres
   instance claimed. Each accepted `FAILED` must have the exact history: one
-  `StartToClose` timeout, no activity result, and one `WorkflowFailed` for
-  the timeout.
+  activity terminal event, a `StartToClose` timeout, and one terminal event,
+  a `WorkflowFailed` for the timeout.
 - For #1876, the partition test sets `idle_in_transaction_session_timeout =
   5s` on the server to end the session.
 - For #1879, the latency test uses a 2 s heartbeat. A decision cycle also

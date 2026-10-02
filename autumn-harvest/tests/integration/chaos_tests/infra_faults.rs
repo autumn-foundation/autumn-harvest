@@ -696,15 +696,15 @@ async fn one_activity_result(conn: &mut AsyncPgConnection, exec_id: ExecutionId)
     .ok
 }
 
-/// Return true when `exec_id` shows the known failure of [`Accept`]. The
-/// history has no activity result and one `StartToClose` timeout. Its one
-/// terminal event is a `WorkflowFailed` for that timeout.
+/// Return true when `exec_id` shows the known failure of [`Accept`]. Its one
+/// activity terminal event is a `StartToClose` timeout. Its one terminal
+/// event is a `WorkflowFailed` for that timeout.
 async fn known_failure(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> bool {
     let shape = diesel::sql_query(
-        "SELECT COUNT(*) FILTER (WHERE event_type = 'ActivityTimedOut') = 1 \
+        "SELECT COUNT(*) FILTER (WHERE event_type IN ('ActivityCompleted', 'ActivityFailed', \
+                'ActivityTimedOut', 'ActivityCompletedExternally', 'ActivityFailedExternally')) = 1 \
             AND COUNT(*) FILTER (WHERE event_type = 'ActivityTimedOut' \
                 AND event_data->'data'->>'timeout_type' = 'StartToClose') = 1 \
-            AND COUNT(*) FILTER (WHERE event_type = 'ActivityCompleted') = 0 \
             AND COUNT(*) FILTER (WHERE event_type = 'WorkflowFailed' \
                 AND event_data->'data'->>'error' LIKE 'timeout: StartToClose %') = 1 AS ok \
          FROM harvest_events WHERE workflow_exec_id = $1",
