@@ -502,10 +502,10 @@ async fn token_authed_mutation_audit_actor_is_token_id() {
     let (_, list) = send(&app, "GET", "/admin/tokens", None, None, true, None).await;
     let id = list[0]["id"].as_str().unwrap().to_string();
 
-    // Clear the mint audit rows for a clean assertion, but KEEP the api token
-    // rows — the admin token (`secret`) authenticates the revoke below, so the
-    // two-table `scrub` (which also wipes `harvest_api_tokens`) would delete the
-    // very token we authenticate with and 401 before the actor assertion runs.
+    // Clear the mint audit rows for a clean assertion. KEEP the api token rows.
+    // The admin token (`secret`) authenticates the revoke below. The two-table
+    // `scrub` also wipes `harvest_api_tokens`. It would delete that token, and
+    // the revoke would 401 before the actor assertion runs.
     let _ = diesel::sql_query("DELETE FROM harvest_audit_log")
         .execute(&mut conn)
         .await;
@@ -713,10 +713,11 @@ async fn bootstrap_seeded_token_authenticates_identically_to_route_minted() {
     );
 
     // ── Part B: a bootstrap-seeded row authenticates + audits identically ─────
-    // Seed an `admin` token EXACTLY as `harvest token bootstrap` does: mint the
-    // secret and compute the hash via the shared helpers, then INSERT the row
-    // directly (as the operator runs the printed SQL). The SQL stores ONLY the
-    // hash — never the secret.
+    //
+    // Seed an `admin` token EXACTLY as `harvest token bootstrap` does. Mint the
+    // secret and compute the hash with the shared helpers. Then INSERT the row
+    // directly, as the operator runs the printed SQL. The SQL stores ONLY the
+    // hash, never the secret.
     let seed_secret = autumn_harvest::api_token::mint_secret();
     let seed_hash = autumn_harvest::api_token::hash_secret(&seed_secret);
     assert!(seed_secret.starts_with("hvst_"));

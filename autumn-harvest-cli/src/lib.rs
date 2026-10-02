@@ -1881,7 +1881,7 @@ enum TokenCommand {
     /// against your database — no API call and no DB connection is made.
     ///
     /// Standalone (tokens-only) deployments use this to mint their first
-    /// `admin` token: with tokens as the only auth there is no admin caller
+    /// `admin` token. With tokens as the only auth, no admin caller exists
     /// yet to mint one via `POST /admin/tokens`. Run the printed SQL once (you
     /// already have DB access — the trust anchor), then mint every further
     /// token through the API. The printed SQL contains ONLY the hash; the
