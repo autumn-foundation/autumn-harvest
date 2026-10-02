@@ -208,7 +208,7 @@ async fn run() {
                 .batch_execute("TRUNCATE harvest_notify_bench")
                 .await
                 .expect("truncate the scratch table");
-            let wakes_before = wakes.load(Ordering::Relaxed);
+            let wakes_before = AtomicUsize::load(&wakes, Ordering::Relaxed);
             let outcome = scenario(&url, writers, mode, window).await;
             println!(
                 "| {writers} | {} | {:.0} | {:.2} | {:.2} | {} | {} |",
@@ -216,7 +216,7 @@ async fn run() {
                 outcome.per_second(),
                 outcome.percentile(50.0),
                 outcome.percentile(99.0),
-                wakes.load(Ordering::Relaxed) - wakes_before,
+                AtomicUsize::load(&wakes, Ordering::Relaxed) - wakes_before,
                 outcome.lost,
             );
         }
