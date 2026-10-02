@@ -498,7 +498,10 @@ async fn retirement_check_state_group_active_hides_terminal_rows() {
 
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["status"], "safe");
-    assert!(body["blockers"].as_array().unwrap().is_empty());
+    assert_eq!(
+        body["blockers"].as_array().unwrap().as_slice(),
+        [] as [serde_json::Value; 0]
+    );
 }
 
 #[tokio::test]

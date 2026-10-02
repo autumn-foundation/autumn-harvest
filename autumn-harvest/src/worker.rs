@@ -12862,6 +12862,47 @@ async fn requeue_parent_on_transient_ingest_conflict(
     Ok(())
 }
 
+/// Re-drive a workflow task after an event-id conflict in an append made
+/// after the handler lookup (issue #1787).
+///
+/// The lookup succeeded, so this worker can run the task. The park clears the
+/// capability-miss evidence, as every other post-lookup park does (issue
+/// #804). Stale evidence could otherwise end the redelivery budget early.
+///
+/// The park is fenced on this handler's claim. A handler that outlived its
+/// task timeout can hit the conflict after a peer took the row. A lost claim
+/// is a no-op, so the peer keeps its ownership.
+#[doc(hidden)] // exposed for its integration test; not a stable API
+pub async fn requeue_workflow_task_after_event_id_conflict(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    worker_id: &str,
+    sticky_timeout: Duration,
+    exec_id: ExecutionId,
+) -> HarvestResult<()> {
+    let claim = queue::TaskClaim::new(task.id, worker_id, task.attempt);
+    let sticky = if sticky_timeout.is_zero() {
+        None
+    } else {
+        Some(queue::StickyHint::new(worker_id, sticky_timeout))
+    };
+    Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
+        if let queue::ClaimLock::Lost { .. } = queue::lock_claim_for_update(conn, &claim).await? {
+            tracing::debug!(
+                task_id = %task.id,
+                worker_id = %worker_id,
+                attempt = task.attempt,
+                "event-id conflict re-drive skipped: a peer holds the claim"
+            );
+            return Ok(());
+        }
+        let _ = queue::park_workflow_task(conn, task.id, sticky).await?;
+        queue::wake_workflow_task(conn, exec_id).await?;
+        Ok(())
+    }))
+    .await
+}
+
 /// Run the wake-event ingest ([`ingest_due_timers_and_signals`]), converting a
 /// transient `(workflow_exec_id, event_id)` UNIQUE conflict into a re-drive of
 /// the parent workflow task rather than a terminal failure (issue #779).
@@ -21132,6 +21173,29 @@ async fn process_workflow_task(
                 .await
                 {
                     Ok(outcome) => outcome,
+                    Err(e) if e.is_event_id_unique_violation() => {
+                        // A concurrent append took this cycle's `event_id`.
+                        // An example is the `ActivityStarted` of a race loser
+                        // that a freed permit admits (issue #1787). The
+                        // transaction rolled back, so re-drive, as the
+                        // wake-event ingest does (issue #779). A fresh load
+                        // reads past the other event.
+                        requeue_workflow_task_after_event_id_conflict(
+                            conn,
+                            task,
+                            worker_id,
+                            sticky_timeout,
+                            prepared.exec_id,
+                        )
+                        .await?;
+                        tracing::warn!(
+                            task_id = %task.id,
+                            workflow_exec_id = %prepared.exec_id,
+                            "harvest: event-id conflict in a local activity append; \
+                             re-driving the workflow task"
+                        );
+                        return Ok(());
+                    }
                     Err(e) => {
                         // Issue #946, Codex round-3/round-4 review:
                         // `run_local_activity_inline` calls
@@ -32947,7 +33011,10 @@ mod tests {
         // genuinely-overdue schedule living on the failed shard).
         let previous = key_set(&[("workflow", "a"), ("workflow", "b")]);
         let current = key_set(&[("workflow", "a")]);
-        assert!(labels_to_clear(&previous, &current, false).is_empty());
+        assert_eq!(
+            labels_to_clear(&previous, &current, false),
+            [] as [(std::string::String, std::string::String); 0]
+        );
     }
 
     #[test]
@@ -32955,7 +33022,10 @@ mod tests {
         // previous ⊆ current → [] (nothing disappeared).
         let previous = key_set(&[("workflow", "a")]);
         let current = key_set(&[("workflow", "a"), ("dag", "b")]);
-        assert!(labels_to_clear(&previous, &current, true).is_empty());
+        assert_eq!(
+            labels_to_clear(&previous, &current, true),
+            [] as [(std::string::String, std::string::String); 0]
+        );
     }
 
     #[test]
@@ -32963,7 +33033,10 @@ mod tests {
         // Empty previous (first pass) → [] regardless of current.
         let previous = std::collections::HashSet::new();
         let current = key_set(&[("workflow", "a")]);
-        assert!(labels_to_clear(&previous, &current, true).is_empty());
+        assert_eq!(
+            labels_to_clear(&previous, &current, true),
+            [] as [(std::string::String, std::string::String); 0]
+        );
     }
 
     /// A pool that builds without connecting, aimed at a closed port.
@@ -33655,7 +33728,7 @@ mod tests {
             value: "x".to_string(),
             explicit_clear: false,
         }];
-        assert!(collect_log_lines(&cmds).is_empty());
+        assert_eq!(collect_log_lines(&cmds), [] as [store::WorkflowLogLine; 0]);
     }
 
     #[test]
@@ -34666,7 +34739,10 @@ mod tests {
     fn monitor_shard_scope_passes_the_full_list_through_on_the_single_pool_fallback() {
         let all = vec![crate::types::ShardId::new(0), crate::types::ShardId::new(1)];
         assert_eq!(monitor_shard_scope(None, &all), all);
-        assert!(monitor_shard_scope(None, &[]).is_empty());
+        assert_eq!(
+            monitor_shard_scope(None, &[]),
+            [] as [crate::types::ShardId; 0]
+        );
     }
 
     /// The multi-shard loop bounds its pool acquisition; the single-shard path
@@ -35144,7 +35220,10 @@ mod tests {
         let resolved = resolved_external_ids(&new_events);
         assert!(!resolved.is_empty());
         assert_eq!(resolved.signal_ids, vec![sid]);
-        assert!(resolved.cancel_ids.is_empty());
+        assert_eq!(
+            resolved.cancel_ids,
+            [] as [crate::types::ExternalCancelId; 0]
+        );
     }
 
     #[test]
@@ -35157,7 +35236,10 @@ mod tests {
         let resolved = resolved_external_ids(&new_events);
         assert!(!resolved.is_empty());
         assert_eq!(resolved.cancel_ids, vec![cid]);
-        assert!(resolved.signal_ids.is_empty());
+        assert_eq!(
+            resolved.signal_ids,
+            [] as [crate::types::ExternalSignalId; 0]
+        );
     }
 
     #[test]
@@ -35209,7 +35291,10 @@ mod tests {
         ];
         let resolved = resolved_external_ids(&new_events);
         assert_eq!(resolved.signal_ids, vec![sid_a]);
-        assert!(resolved.cancel_ids.is_empty());
+        assert_eq!(
+            resolved.cancel_ids,
+            [] as [crate::types::ExternalCancelId; 0]
+        );
     }
 
     #[test]
@@ -35233,8 +35318,14 @@ mod tests {
         ];
         let resolved = resolved_external_ids(&new_events);
         assert_eq!(resolved.await_ids, vec![aid]);
-        assert!(resolved.signal_ids.is_empty());
-        assert!(resolved.cancel_ids.is_empty());
+        assert_eq!(
+            resolved.signal_ids,
+            [] as [crate::types::ExternalSignalId; 0]
+        );
+        assert_eq!(
+            resolved.cancel_ids,
+            [] as [crate::types::ExternalCancelId; 0]
+        );
     }
 
     // ── inline-vs-outbox await terminal de-duplication (issue #757 review, P1) ──
@@ -36383,7 +36474,10 @@ mod tests {
             batch.children.is_empty(),
             "a detached spawn is NOT an awaited child"
         );
-        assert!(batch.activity_waits.is_empty());
+        assert_eq!(
+            batch.activity_waits,
+            [] as [crate::types::ActivityExecId; 0]
+        );
         assert!(!batch.waits_on_signal);
     }
 
@@ -37134,7 +37228,7 @@ mod tests {
             ..default_runtime_config()
         };
         let worker = Worker::new(cfg, registry.clone()).unwrap();
-        assert!(worker.ineligible_activities.is_empty());
+        assert_eq!(worker.ineligible_activities, [] as [std::string::String; 0]);
 
         // Worker with cpu only, region = us-east-1 (act_gpu is ineligible)
         let mut labels = std::collections::HashMap::new();
@@ -40443,7 +40537,14 @@ mod tests {
             name: "m".into(),
             details: Value::Null,
         }];
-        assert!(collect_update_result_metrics(&history, &cmds).is_empty());
+        assert_eq!(
+            collect_update_result_metrics(&history, &cmds),
+            [] as [(
+                std::string::String,
+                bool,
+                std::option::Option<chrono::DateTime<chrono::Utc>>
+            ); 0]
+        );
     }
 
     #[test]

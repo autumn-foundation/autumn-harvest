@@ -793,7 +793,10 @@ async fn the_sweep_is_batched_and_converges_within_a_tick() {
         5,
         "the drain loop must converge rather than leaving a permanent backlog"
     );
-    assert!(surviving_keys(&mut conn).await.is_empty());
+    assert_eq!(
+        surviving_keys(&mut conn).await,
+        [] as [std::string::String; 0]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -978,7 +981,10 @@ async fn the_per_tick_batch_budget_is_enforced_and_the_next_tick_drains_the_rest
 
     let result = run_one_tick(pool, config, Arc::new(CapturingMetrics::default())).await;
     assert_eq!(collected(&result), 5, "successive ticks converge");
-    assert!(surviving_keys(&mut conn).await.is_empty());
+    assert_eq!(
+        surviving_keys(&mut conn).await,
+        [] as [std::string::String; 0]
+    );
 }
 
 #[tokio::test]
@@ -1272,7 +1278,10 @@ async fn the_dry_run_preview_forecasts_the_whole_per_tick_budget() {
     };
     let result = run_one_tick(pool, real, Arc::new(CapturingMetrics::default())).await;
     assert_eq!(collected(&result), 5);
-    assert!(surviving_keys(&mut conn).await.is_empty());
+    assert_eq!(
+        surviving_keys(&mut conn).await,
+        [] as [std::string::String; 0]
+    );
 }
 
 #[tokio::test]

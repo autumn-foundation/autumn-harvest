@@ -1,0 +1,5 @@
+error: #[workflow] input parameters must be plain identifiers, so `_` and destructuring patterns are not supported; name the parameter, for example `_input: ()` (the leading underscore silences the unused warning)
+ --> tests/compile_fail/workflow_underscore_input.rs:7:43
+  |
+7 | async fn bad_input(ctx: &WorkflowContext, _: ()) -> HarvestResult<()> {
+  |                                           ^

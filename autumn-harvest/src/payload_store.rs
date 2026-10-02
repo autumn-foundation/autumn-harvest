@@ -492,12 +492,12 @@ mod tests {
         let exact = serde_json::to_vec(&payload).unwrap().len() as u64; // 32
         // At threshold == exact -> stays inline (uses <=).
         let mut e1 = event_with_output(payload.clone());
-        assert!(
+        assert_eq!(
             offloader(store.clone(), exact)
                 .offload_event_value(&mut e1)
                 .await
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            [] as [crate::payload_store::OffloadedRef; 0]
         );
         // One below -> offloaded.
         let mut e2 = event_with_output(payload);
@@ -585,11 +585,9 @@ mod tests {
             let off = offloader(store.clone(), 1_000_000);
             let original = serde_json::json!({ "_harvest_offload_envelope": marker });
             let mut event = event_with_output(original.clone());
-            assert!(
-                off.offload_event_value(&mut event)
-                    .await
-                    .unwrap()
-                    .is_empty()
+            assert_eq!(
+                off.offload_event_value(&mut event).await.unwrap(),
+                [] as [crate::payload_store::OffloadedRef; 0]
             );
             assert_eq!(event["data"]["output"], original);
         }
