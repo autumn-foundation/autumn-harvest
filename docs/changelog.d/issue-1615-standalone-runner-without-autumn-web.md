@@ -10,11 +10,11 @@ the tree keeps one standalone reference, not two.
   depends on it, so it stays in the build graph. The embedder never names it.
 - The pool is a `diesel-async` `deadpool` pool, not `autumn_web::db::create_pool`.
   A checkout waits at most 5 s, as the `autumn-web` pool did.
-- `diesel-async` connects without TLS. For `sslmode=require`, `verify-ca` and
-  `verify-full`, the pool and the migration connection use rustls with the
-  platform trust store. `verify-ca` checks the chain only. The other two also
-  check the host name. Other modes stay plaintext, as with `autumn-web`.
-  `sslmode` is read with the libpq grammar, in both DSN forms.
+- `diesel-async` connects without TLS, so the pool and the migration
+  connection go through rustls. `require` and `verify-full` check the chain
+  against the platform trust store and the host name. `verify-ca` checks the
+  chain only. `prefer` and an unset `sslmode` are below. `sslmode` is read
+  with the libpq grammar, in both DSN forms.
 - In `dev`, migrations go through `autumn_harvest::migrate`, the code behind
   `harvest migrate run`, not `autumn_web::migrate::run_pending`.
 - `HarvestEmbedding` mounts the API and Vantage on a plain `axum::Router`.
@@ -68,5 +68,27 @@ the tree keeps one standalone reference, not two.
   plugin path behaves the same.
 - `HarvestEmbedding::start` still returns an `autumn-web` error type, and the
   webhook config types are `autumn-web` types behind a plugin re-export.
+
+**`sslmode=prefer` and an unset `sslmode` use TLS when the server offers it.**
+
+A managed Postgres, Fly for example, hands out a URL with no `sslmode` and
+refuses plaintext. Harvest sent plaintext for such a URL, so the connection
+failed.
+
+- **LISTEN/NOTIFY listeners** (`notify.rs`). `prefer`, which is also the
+  default, now follows libpq. The client sends an `SSLRequest`. It goes on in
+  plaintext only when the server declines. The certificate is not checked, as
+  in libpq, so a self-signed server keeps working. `require` still verifies
+  the chain and the hostname (issue #1717). `disable` stays plaintext.
+- **`examples/standalone-runner`**. The pool and the `dev` migrations follow
+  the same rule.
+- Without the `tls` feature, `prefer` stays plaintext, as before.
+- `docs/getting-started/10-operations.md` shows the new table.
+
+Tests. The fake-server tests in `notify.rs` check the wire. `prefer` and an
+unset `sslmode` send `SSLRequest` and then a ClientHello. When the server
+answers `N`, they send a plaintext startup message. The example acceptance
+test runs a runner with no `sslmode`. It checks that every connection is
+encrypted when the server offers TLS, and plaintext when it does not.
 
 No migration. No new `WorkflowEvent` variant. No `harvest_events` change.

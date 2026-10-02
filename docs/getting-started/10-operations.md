@@ -201,8 +201,13 @@ The `sslmode` in that URL sets the transport:
 
 | `sslmode` | Transport |
 |---|---|
-| `disable`, `prefer`, or not set | Plaintext, as before. `prefer` never encrypts listener traffic. |
+| `disable` | Plaintext. |
+| `prefer`, or not set | TLS when the server offers it, else plaintext. The certificate is not checked, as in libpq. |
 | `require` | TLS. The chain and the hostname are verified. |
+
+A managed Postgres, Fly for example, often hands out a URL with no `sslmode`
+and refuses plaintext. The default `prefer` reaches it over TLS. Set
+`sslmode=require` when the certificate must be verified.
 
 - The trust store is the platform store. To trust a private CA, such as the
   RDS CA, set `SSL_CERT_FILE` or `SSL_CERT_DIR`. These variables replace the

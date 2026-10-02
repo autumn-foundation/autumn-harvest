@@ -3,12 +3,18 @@
 //! `autumn_harvest::migrate` is the code behind `harvest migrate run`. The
 //! pool is the `deadpool` pool that `diesel-async` builds.
 //!
-//! `diesel-async` connects without TLS. A URL whose `sslmode` is `require`,
-//! `verify-ca` or `verify-full` therefore connects through rustls here. The
-//! server certificate must chain to the platform trust store in all three
-//! modes. `verify-full` and `require` also check the host name. That is
-//! stricter than libpq for `require`. Other modes connect in plaintext, as
-//! the `autumn-web` pool did.
+//! `diesel-async` connects without TLS, so every connection here goes through
+//! rustls instead. The `sslmode` decides the check:
+//!
+//! * `prefer`, the default: TLS when the server offers it, else plaintext.
+//!   The certificate is not checked, as in libpq. A managed Postgres such as
+//!   Fly hands out a URL with no `sslmode` and refuses plaintext, so this
+//!   default must negotiate TLS.
+//! * `require` and `verify-full`: the chain must reach the platform trust
+//!   store, and the host name must match. That is stricter than libpq for
+//!   `require`.
+//! * `verify-ca`: the chain only.
+//! * `disable`: plaintext.
 
 use std::sync::{Arc, OnceLock};
 
@@ -61,14 +67,17 @@ async fn connect(database_url: &str) -> Result<AsyncPgConnection, ConnectionErro
     let Some(verify) = tls_verify(database_url) else {
         return AsyncPgConnection::establish(database_url).await;
     };
-    // `tokio-postgres` parses only `require`. The connector does the check
-    // that the original mode asks for, so the rewrite drops none.
-    let config: tokio_postgres::Config =
-        tls_dsn(database_url)
-            .parse()
-            .map_err(|error: tokio_postgres::Error| {
-                ConnectionError::BadConnection(error.to_string())
-            })?;
+    // `tokio-postgres` parses `prefer` and `require` only. The `verify-*`
+    // modes become `require`, and the connector does the check that the
+    // original mode asks for, so the rewrite drops none. `prefer` stays
+    // `prefer`, so the client goes on in plaintext when the server declines.
+    let dsn = match verify {
+        Verify::EncryptOnly => tls_dsn(database_url, "prefer"),
+        Verify::Chain | Verify::ChainAndName => tls_dsn(database_url, "require"),
+    };
+    let config: tokio_postgres::Config = dsn.parse().map_err(|error: tokio_postgres::Error| {
+        ConnectionError::BadConnection(error.to_string())
+    })?;
     let tls = tokio_postgres_rustls::MakeRustlsConnect::new(tls_config(verify)?);
     let (client, connection) = config
         .connect(tls)
@@ -84,6 +93,8 @@ enum Verify {
     Chain,
     /// The chain and the host name. `verify-full` and `require` use it.
     ChainAndName,
+    /// No certificate check. `prefer`, the default, uses it, as libpq does.
+    EncryptOnly,
 }
 
 /// The certificate check `database_url` asks for, or `None` for plaintext.
@@ -92,17 +103,19 @@ enum Verify {
 /// string. Names and values are case-insensitive, and URL parts may be
 /// percent-encoded.
 fn tls_verify(database_url: &str) -> Option<Verify> {
-    match Dsn::parse(database_url)?.sslmode()?.as_str() {
+    let sslmode = Dsn::parse(database_url)?.sslmode();
+    match sslmode.as_deref().unwrap_or("prefer") {
         "verify-ca" => Some(Verify::Chain),
         "require" | "verify-full" => Some(Verify::ChainAndName),
+        "prefer" => Some(Verify::EncryptOnly),
         _ => None,
     }
 }
 
-/// `database_url` with `sslmode=require`, the one TLS mode
-/// `tokio-postgres` parses.
-fn tls_dsn(database_url: &str) -> String {
-    Dsn::parse(database_url).map_or_else(|| database_url.to_owned(), |dsn| dsn.with_require())
+/// `database_url` with `sslmode=mode`, spelled the way `tokio-postgres`
+/// parses it. That parser knows `prefer` and `require` only, in lowercase.
+fn tls_dsn(database_url: &str, mode: &str) -> String {
+    Dsn::parse(database_url).map_or_else(|| database_url.to_owned(), |dsn| dsn.with_sslmode(mode))
 }
 
 /// The options of a connection string.
@@ -152,15 +165,17 @@ impl<'a> Dsn<'a> {
             .map(|(_, value)| value.trim().to_ascii_lowercase())
     }
 
-    /// The DSN again, with every `sslmode` set to `require`.
-    fn with_require(&self) -> String {
+    /// The DSN again, with every `sslmode` set to `mode`.
+    fn with_sslmode(&self, mode: &str) -> String {
         match self {
+            Self::Url { base, pairs } if pairs.is_empty() => (*base).to_owned(),
             Self::Url { base, pairs } => {
+                let sslmode = format!("sslmode={mode}");
                 let query: Vec<&str> = pairs
                     .iter()
                     .map(|(raw, key, _)| {
                         if key.eq_ignore_ascii_case("sslmode") {
-                            "sslmode=require"
+                            sslmode.as_str()
                         } else {
                             raw
                         }
@@ -172,7 +187,7 @@ impl<'a> Dsn<'a> {
                 .iter()
                 .map(|(key, value)| {
                     if key.eq_ignore_ascii_case("sslmode") {
-                        "sslmode='require'".to_owned()
+                        format!("sslmode='{mode}'")
                     } else {
                         let quoted = value.replace('\\', "\\\\").replace('\'', "\\'");
                         format!("{key}='{quoted}'")
@@ -225,19 +240,42 @@ fn parse_keywords(dsn: &str) -> Option<Vec<(String, String)>> {
     }
 }
 
-/// The rustls client config for `verify`, built once. It trusts the
-/// platform store.
+/// The rustls client config for `verify`, built once. The verified configs
+/// trust the platform store. The `prefer` config reads no trust store, so a
+/// host without CA certificates can still encrypt.
 fn tls_config(verify: Verify) -> Result<rustls::ClientConfig, ConnectionError> {
     type Configs = Result<(rustls::ClientConfig, rustls::ClientConfig), String>;
     static CONFIGS: OnceLock<Configs> = OnceLock::new();
+    if verify == Verify::EncryptOnly {
+        return Ok(encrypt_only_config());
+    }
     let (chain, chain_and_name) = CONFIGS
         .get_or_init(build_tls_configs)
         .as_ref()
         .map_err(|error| ConnectionError::BadConnection(error.clone()))?;
     Ok(match verify {
         Verify::Chain => chain.clone(),
-        Verify::ChainAndName => chain_and_name.clone(),
+        Verify::ChainAndName | Verify::EncryptOnly => chain_and_name.clone(),
     })
+}
+
+/// The `prefer` config: encryption without a certificate check.
+fn encrypt_only_config() -> rustls::ClientConfig {
+    static CONFIG: OnceLock<rustls::ClientConfig> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            let provider = Arc::new(rustls::crypto::ring::default_provider());
+            rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+                .with_safe_default_protocol_versions()
+                .expect("the ring provider supports the default protocol versions")
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(Relaxed {
+                    roots: None,
+                    provider,
+                }))
+                .with_no_client_auth()
+        })
+        .clone()
 }
 
 /// Build the `verify-ca` config and the `verify-full` config.
@@ -262,23 +300,27 @@ fn build_tls_configs() -> Result<(rustls::ClientConfig, rustls::ClientConfig), S
         .with_no_client_auth();
     let chain = builder()?
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(ChainOnly {
-            roots,
+        .with_custom_certificate_verifier(Arc::new(Relaxed {
+            roots: Some(roots),
             provider: Arc::clone(&provider),
         }))
         .with_no_client_auth();
     Ok((chain, chain_and_name))
 }
 
-/// The `verify-ca` check: the chain must reach a trusted root. The host name
-/// is not compared, as in libpq.
+/// A verifier that does not compare the host name, as libpq does for
+/// `verify-ca` and `prefer`.
+///
+/// With `roots`, the chain must reach a trusted root (`verify-ca`). Without,
+/// any certificate passes (`prefer`). The handshake signatures are always
+/// checked, so the session key belongs to the peer that sent the certificate.
 #[derive(Debug)]
-struct ChainOnly {
-    roots: Arc<rustls::RootCertStore>,
+struct Relaxed {
+    roots: Option<Arc<rustls::RootCertStore>>,
     provider: Arc<rustls::crypto::CryptoProvider>,
 }
 
-impl ServerCertVerifier for ChainOnly {
+impl ServerCertVerifier for Relaxed {
     fn verify_server_cert(
         &self,
         end_entity: &CertificateDer<'_>,
@@ -287,10 +329,13 @@ impl ServerCertVerifier for ChainOnly {
         _ocsp_response: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
+        let Some(roots) = &self.roots else {
+            return Ok(ServerCertVerified::assertion());
+        };
         let cert = rustls::server::ParsedCertificate::try_from(end_entity)?;
         rustls::client::verify_server_cert_signed_by_trust_anchor(
             &cert,
-            &self.roots,
+            roots,
             intermediates,
             now,
             self.provider.signature_verification_algorithms.all,
@@ -337,8 +382,9 @@ impl ServerCertVerifier for ChainOnly {
 mod tests {
     use super::{Verify, tls_dsn, tls_verify};
 
+    /// True when the URL asks for verified TLS.
     fn wants_tls(url: &str) -> bool {
-        tls_verify(url).is_some()
+        matches!(tls_verify(url), Some(Verify::Chain | Verify::ChainAndName))
     }
 
     #[test]
@@ -347,8 +393,23 @@ mod tests {
         assert_eq!(tls_verify(&url("verify-ca")), Some(Verify::Chain));
         assert_eq!(tls_verify(&url("verify-full")), Some(Verify::ChainAndName));
         assert_eq!(tls_verify(&url("require")), Some(Verify::ChainAndName));
-        assert_eq!(tls_verify(&url("prefer")), None);
-        assert_eq!(tls_verify("postgres://u@h/db"), None);
+        assert_eq!(tls_verify(&url("disable")), None);
+    }
+
+    /// A managed Postgres such as Fly hands out a URL with no `sslmode` and
+    /// refuses plaintext. `prefer`, the default, must use the TLS the server
+    /// offers. libpq does not check the certificate for `prefer`.
+    #[test]
+    fn prefer_and_an_absent_sslmode_encrypt_when_the_server_offers_tls() {
+        for url in [
+            "postgres://u@h/db",
+            "postgres://u@h/db?sslmode=prefer",
+            "postgres://u@h/db?SSLMODE=Prefer",
+            "host=h user=u",
+            "host=h user=u sslmode = prefer",
+        ] {
+            assert_eq!(tls_verify(url), Some(Verify::EncryptOnly), "{url}");
+        }
     }
 
     #[test]
@@ -362,22 +423,48 @@ mod tests {
         ] {
             assert!(wants_tls(url), "{url}");
         }
+        // `sslmode=require` inside another value is no `sslmode`, so the
+        // default `prefer` applies.
         for url in [
             "host=db application_name='sslmode=require'",
             "postgres://u@h/db?application_name=sslmode%3Drequire",
         ] {
-            assert!(!wants_tls(url), "{url}");
+            assert_eq!(tls_verify(url), Some(Verify::EncryptOnly), "{url}");
         }
+    }
+
+    /// `tokio-postgres` reads `sslmode` case-sensitively. The DSN it gets
+    /// must spell the mode the way it parses.
+    #[test]
+    fn tls_dsn_spells_prefer_the_way_tokio_postgres_parses_it() {
+        assert_eq!(
+            tls_dsn("postgres://u@h/db?SSLMODE=Prefer&a=1", "prefer"),
+            "postgres://u@h/db?sslmode=prefer&a=1"
+        );
+        assert_eq!(tls_dsn("postgres://u@h/db", "prefer"), "postgres://u@h/db");
+        let parsed: tokio_postgres::Config = tls_dsn("host=h SSLMODE = Prefer", "prefer")
+            .parse()
+            .expect("the rewritten DSN parses");
+        assert_eq!(
+            parsed.get_ssl_mode(),
+            tokio_postgres::config::SslMode::Prefer
+        );
     }
 
     #[test]
     fn tls_dsn_sets_require_and_keeps_the_other_options() {
         assert_eq!(
-            tls_dsn("postgres://u@h/db?a=1&SSLMODE=verify-full&b=x%20y"),
+            tls_dsn(
+                "postgres://u@h/db?a=1&SSLMODE=verify-full&b=x%20y",
+                "require"
+            ),
             "postgres://u@h/db?a=1&sslmode=require&b=x%20y"
         );
         assert_eq!(
-            tls_dsn(r"host=h sslmode = verify-ca password='it\'s a \\ b'"),
+            tls_dsn(
+                r"host=h sslmode = verify-ca password='it\'s a \\ b'",
+                "require"
+            ),
             r"host='h' sslmode='require' password='it\'s a \\ b'"
         );
     }
@@ -400,6 +487,12 @@ mod tests {
             "postgres://u@h/require",
         ] {
             assert!(!wants_tls(url), "{url}");
+        }
+        for url in [
+            "postgres://u@h/db?sslmode=disable",
+            "host=h sslmode=disable",
+        ] {
+            assert_eq!(tls_verify(url), None, "{url}");
         }
     }
 }

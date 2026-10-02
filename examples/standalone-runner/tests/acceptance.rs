@@ -560,6 +560,63 @@ async fn sigterm_stops_cleanly_with_an_open_stream() {
     drop(stream);
 }
 
+/// A managed Postgres such as Fly hands out a URL with no `sslmode` and
+/// refuses plaintext. With no `sslmode`, every runner connection must use the
+/// TLS the server offers: the pool, the migrations and the LISTEN listeners.
+/// A server without TLS gets plaintext instead, and the runner still works.
+///
+/// The local server offers TLS with a self-signed certificate. The CI
+/// container offers none. So the two paths cover both answers.
+#[tokio::test]
+async fn an_absent_sslmode_uses_tls_when_the_server_offers_it() {
+    #[derive(diesel::QueryableByName)]
+    struct Transport {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        server_ssl: String,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        encrypted: i64,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        total: i64,
+    }
+
+    let _serial = SERIAL.lock().await;
+    let (url, _db) = empty_database().await;
+    let bare = url.split('?').next().expect("a URL").to_owned();
+    let runner = Launch::new(&bare, "dev").start().await;
+    start_order(&runner, "order-tls").await;
+    await_output(&runner, "order-tls").await;
+    let mut conn = AsyncPgConnection::establish(&url)
+        .await
+        .expect("connect to inspect the runner");
+    let seen: Transport = diesel::sql_query(
+        "SELECT current_setting('ssl') AS server_ssl, \
+                count(*) FILTER (WHERE s.ssl) AS encrypted, \
+                count(*) AS total \
+         FROM pg_stat_activity a JOIN pg_stat_ssl s USING (pid) \
+         WHERE a.datname = current_database() \
+           AND a.backend_type = 'client backend' \
+           AND a.pid <> pg_backend_pid()",
+    )
+    .get_result(&mut conn)
+    .await
+    .expect("read the runner connections");
+    assert!(seen.total > 0, "the runner holds connections");
+    let expected = if seen.server_ssl == "on" {
+        seen.total
+    } else {
+        0
+    };
+    assert_eq!(
+        seen.encrypted,
+        expected,
+        "server ssl={}: {} of {} runner connections use TLS\n{}",
+        seen.server_ssl,
+        seen.encrypted,
+        seen.total,
+        runner.log()
+    );
+}
+
 /// SIGTERM, as Docker, systemd and Kubernetes send it, also drains the
 /// worker and exits cleanly.
 #[tokio::test]

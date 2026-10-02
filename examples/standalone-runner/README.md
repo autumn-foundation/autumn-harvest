@@ -115,14 +115,21 @@ results are correct. The acceptance suite pins the `fail`.
 
 ## TLS
 
-`sslmode=require`, `verify-ca` and `verify-full` connect through rustls. The
-server certificate must chain to the platform trust store in all three modes.
-`verify-full` and `require` also check the host name, so `require` is
-stricter here than in libpq. `verify-ca` checks the chain only. The runner
-reads `sslmode` with the libpq grammar. `sslrootcert` is not read. Put a
-private CA in the platform store, or point `SSL_CERT_FILE` at a bundle that
-holds it. A URL with no `sslmode`, `disable` or `prefer` connects in
-plaintext.
+The `sslmode` in `DATABASE_URL` sets the transport. The pool, the `dev`
+migrations and the LISTEN listeners all follow it:
+
+| `sslmode` | Transport |
+|---|---|
+| `prefer`, or not set | TLS when the server offers it, else plaintext. The certificate is not checked, as in libpq. |
+| `require`, `verify-full` | TLS. The chain must reach the platform trust store, and the host name must match. |
+| `verify-ca` | TLS. The chain is checked, the host name is not. |
+| `disable` | Plaintext. |
+
+A managed Postgres, Fly for example, hands out a URL with no `sslmode` and
+refuses plaintext. The default reaches it over TLS. Set `sslmode=require` when
+the certificate must be verified. `require` is stricter here than in libpq.
+`sslrootcert` is not read. Put a private CA in the platform store, or point
+`SSL_CERT_FILE` at a bundle that holds it.
 
 ## Webhooks
 

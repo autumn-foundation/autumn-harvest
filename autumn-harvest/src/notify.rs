@@ -296,18 +296,26 @@ enum ListenTransport {
     Plain,
     /// TLS, with a verified certificate chain and hostname.
     Tls,
+    /// TLS when the server offers it, else plaintext. The certificate is
+    /// not checked.
+    Opportunistic,
 }
 
 /// Select the listener transport from the DSN's own `sslmode`.
 ///
-/// Only `require` selects TLS, because `NoTls` cannot satisfy it. `disable`,
-/// `prefer` and an absent `sslmode` stay plaintext. That is the behavior before
-/// issue #1717, and it matches a pool built with `NoTls`. Thus a server with a
-/// self-signed certificate does not break a `prefer` DSN.
+/// `require` selects verified TLS (issue #1717). `disable` selects plaintext.
+/// `prefer`, which is also the default, follows libpq: the client asks for
+/// TLS, and goes on in plaintext only when the server declines.
+///
+/// A managed Postgres, Fly for example, hands out a URL with no `sslmode` and
+/// refuses plaintext. A plaintext-only `prefer` therefore could not reach it.
+/// libpq does not check the certificate for `prefer`, so neither does this.
+/// A server with a self-signed certificate thus keeps working.
 fn listen_transport(config: &tokio_postgres::Config) -> ListenTransport {
     match config.get_ssl_mode() {
         tokio_postgres::config::SslMode::Require => ListenTransport::Tls,
-        _ => ListenTransport::Plain,
+        tokio_postgres::config::SslMode::Disable => ListenTransport::Plain,
+        _ => ListenTransport::Opportunistic,
     }
 }
 
@@ -369,6 +377,9 @@ async fn open_listen_connection(
             Ok(spawn_listen_driver(client, connection, error_message))
         }
         ListenTransport::Tls => open_tls_listen_connection(&config, error_message).await,
+        ListenTransport::Opportunistic => {
+            open_opportunistic_listen_connection(&config, error_message).await
+        }
     }
 }
 
@@ -380,6 +391,33 @@ async fn open_tls_listen_connection(
 ) -> HarvestResult<ListenConnection> {
     let tls = tokio_postgres_rustls::MakeRustlsConnect::new(tls_client_config()?);
     let (client, connection) = config.connect(tls).await.map_err(|e| connect_error(&e))?;
+    Ok(spawn_listen_driver(client, connection, error_message))
+}
+
+/// Open a `prefer` LISTEN connection: TLS when the server offers it.
+///
+/// The config keeps `sslmode=prefer`, so `tokio_postgres` sends an
+/// `SSLRequest` and goes on in plaintext when the server answers `N`.
+#[cfg(feature = "tls")]
+async fn open_opportunistic_listen_connection(
+    config: &tokio_postgres::Config,
+    error_message: &'static str,
+) -> HarvestResult<ListenConnection> {
+    let tls = tokio_postgres_rustls::MakeRustlsConnect::new(encrypt_only_tls_config());
+    let (client, connection) = config.connect(tls).await.map_err(|e| connect_error(&e))?;
+    Ok(spawn_listen_driver(client, connection, error_message))
+}
+
+/// Without TLS support, `prefer` stays plaintext, as before.
+#[cfg(not(feature = "tls"))]
+async fn open_opportunistic_listen_connection(
+    config: &tokio_postgres::Config,
+    error_message: &'static str,
+) -> HarvestResult<ListenConnection> {
+    let (client, connection) = config
+        .connect(tokio_postgres::NoTls)
+        .await
+        .map_err(|e| connect_error(&e))?;
     Ok(spawn_listen_driver(client, connection, error_message))
 }
 
@@ -435,6 +473,79 @@ fn build_tls_client_config() -> HarvestResult<rustls::ClientConfig> {
         .with_root_certificates(roots)
         .with_no_client_auth();
     Ok(config)
+}
+
+/// The rustls configuration for `prefer`: encryption without authentication.
+///
+/// libpq does not check the certificate for `prefer`. This matches it. The
+/// handshake signatures are still verified, so the session key belongs to the
+/// peer that sent the certificate. The trust store is not read.
+#[cfg(feature = "tls")]
+fn encrypt_only_tls_config() -> rustls::ClientConfig {
+    static CONFIG: std::sync::OnceLock<rustls::ClientConfig> = std::sync::OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+            let verifier = std::sync::Arc::new(EncryptOnly(std::sync::Arc::clone(&provider)));
+            rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .expect("the ring provider supports the default protocol versions")
+                .dangerous()
+                .with_custom_certificate_verifier(verifier)
+                .with_no_client_auth()
+        })
+        .clone()
+}
+
+/// A certificate verifier that accepts any certificate, for `prefer`.
+#[cfg(feature = "tls")]
+#[derive(Debug)]
+struct EncryptOnly(std::sync::Arc<rustls::crypto::CryptoProvider>);
+
+#[cfg(feature = "tls")]
+impl rustls::client::danger::ServerCertVerifier for EncryptOnly {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
 }
 
 /// Spawn the task that drives a LISTEN connection.
@@ -815,16 +926,16 @@ mod tests {
     }
 
     #[test]
-    fn only_sslmode_require_selects_tls() {
+    fn sslmode_selects_the_listener_transport() {
         let base = "postgres://u:p@db.internal/harvest";
-        assert_eq!(transport_for(base), ListenTransport::Plain);
+        assert_eq!(transport_for(base), ListenTransport::Opportunistic);
         assert_eq!(
             transport_for(&format!("{base}?sslmode=disable")),
             ListenTransport::Plain
         );
         assert_eq!(
             transport_for(&format!("{base}?sslmode=prefer")),
-            ListenTransport::Plain
+            ListenTransport::Opportunistic
         );
         assert_eq!(
             transport_for(&format!("{base}?sslmode=require")),
@@ -833,13 +944,17 @@ mod tests {
     }
 
     #[test]
-    fn keyword_dsn_with_sslmode_require_selects_tls() {
+    fn keyword_dsn_sslmode_selects_the_listener_transport() {
         assert_eq!(
             transport_for("host=db.internal dbname=harvest sslmode=require"),
             ListenTransport::Tls
         );
         assert_eq!(
             transport_for("host=db.internal dbname=harvest"),
+            ListenTransport::Opportunistic
+        );
+        assert_eq!(
+            transport_for("host=db.internal dbname=harvest sslmode=disable"),
             ListenTransport::Plain
         );
     }
@@ -848,11 +963,22 @@ mod tests {
     #[cfg(feature = "tls")]
     const SSL_REQUEST: [u8; 8] = [0, 0, 0, 8, 4, 210, 22, 47];
 
+    /// The answer a fake server gives to an `SSLRequest`.
+    #[derive(Clone, Copy)]
+    enum Answer {
+        /// Read the first message header only.
+        Nothing,
+        /// Accept TLS with `S`, then read one more byte.
+        AcceptTls,
+        /// Decline TLS with `N`, then read the next message header.
+        DeclineTls,
+    }
+
     /// Open a listener connection to a fake server, and record what arrives.
     ///
-    /// The fake server reads the first message header. When `answer_tls` is
-    /// true, it accepts TLS with `S` and also reads the next byte.
-    async fn first_bytes_sent(sslmode: &str, answer_tls: bool) -> ([u8; 8], Option<u8>) {
+    /// `query` is the DSN query, for example `?sslmode=prefer`, or empty. The
+    /// second value is what the client sends after the server answers.
+    async fn bytes_sent(query: &str, answer: Answer) -> ([u8; 8], Vec<u8>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let server = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -866,15 +992,30 @@ mod tests {
                 .read_exact(&mut header)
                 .await
                 .expect("message header");
-            if !answer_tls {
-                return (header, None);
-            }
-            socket.write_all(b"S").await.expect("accept TLS");
-            let mut next = [0_u8; 1];
-            let next = socket.read_exact(&mut next).await.ok().map(|_| next[0]);
+            let next = match answer {
+                Answer::Nothing => return (header, Vec::new()),
+                Answer::AcceptTls => {
+                    socket.write_all(b"S").await.expect("accept TLS");
+                    let mut next = vec![0_u8; 1];
+                    socket
+                        .read_exact(&mut next)
+                        .await
+                        .map(|_| next)
+                        .unwrap_or_default()
+                }
+                Answer::DeclineTls => {
+                    socket.write_all(b"N").await.expect("decline TLS");
+                    let mut next = vec![0_u8; 8];
+                    socket
+                        .read_exact(&mut next)
+                        .await
+                        .map(|_| next)
+                        .unwrap_or_default()
+                }
+            };
             (header, next)
         });
-        let url = format!("postgres://u@127.0.0.1:{port}/db?sslmode={sslmode}");
+        let url = format!("postgres://u@127.0.0.1:{port}/db{query}");
         let client = tokio::spawn(async move {
             open_listen_connection(&url, "test listener error")
                 .await
@@ -888,21 +1029,75 @@ mod tests {
         seen
     }
 
+    /// A startup message carries protocol version 3.0 after its length.
+    const STARTUP_VERSION: [u8; 4] = [0, 3, 0, 0];
+
+    /// 0x16 is the TLS handshake record type, so this byte opens a
+    /// `ClientHello`. A `NoTls` connector sends nothing after the server
+    /// accepts TLS.
+    const CLIENT_HELLO: u8 = 0x16;
+
     #[cfg(feature = "tls")]
     #[tokio::test]
     async fn sslmode_require_starts_a_tls_handshake() {
-        let (header, next) = first_bytes_sent("require", true).await;
+        let (header, next) = bytes_sent("?sslmode=require", Answer::AcceptTls).await;
         assert_eq!(header, SSL_REQUEST);
-        // 0x16 is the TLS handshake record type, so this is a ClientHello.
-        // A `NoTls` connector sends nothing after the server accepts TLS.
-        assert_eq!(next, Some(0x16), "sslmode=require must send a ClientHello");
+        assert_eq!(
+            next,
+            [CLIENT_HELLO],
+            "sslmode=require must send a ClientHello"
+        );
+    }
+
+    /// A managed Postgres such as Fly hands out a URL with no `sslmode` and
+    /// refuses plaintext. The listener must then use the TLS the server
+    /// offers, as libpq does for its default `prefer`.
+    #[cfg(feature = "tls")]
+    #[tokio::test]
+    async fn prefer_and_an_absent_sslmode_use_tls_when_the_server_offers_it() {
+        for query in ["?sslmode=prefer", ""] {
+            let (header, next) = bytes_sent(query, Answer::AcceptTls).await;
+            assert_eq!(header, SSL_REQUEST, "{query:?} must ask for TLS");
+            assert_eq!(next, [CLIENT_HELLO], "{query:?} must send a ClientHello");
+        }
+    }
+
+    /// A server without TLS answers `N`. `prefer` then goes on in plaintext.
+    #[cfg(feature = "tls")]
+    #[tokio::test]
+    async fn prefer_goes_on_in_plaintext_when_the_server_declines_tls() {
+        for query in ["?sslmode=prefer", ""] {
+            let (header, next) = bytes_sent(query, Answer::DeclineTls).await;
+            assert_eq!(header, SSL_REQUEST, "{query:?} must ask for TLS");
+            assert_eq!(
+                next[4..],
+                STARTUP_VERSION,
+                "{query:?} must send a startup message"
+            );
+        }
     }
 
     #[tokio::test]
-    async fn sslmode_prefer_stays_plaintext() {
-        let (header, _) = first_bytes_sent("prefer", false).await;
-        // A startup message carries protocol version 3.0 after its length.
-        assert_eq!(header[4..], [0, 3, 0, 0], "prefer must not send SSLRequest");
+    async fn sslmode_disable_stays_plaintext() {
+        let (header, _) = bytes_sent("?sslmode=disable", Answer::Nothing).await;
+        assert_eq!(
+            header[4..],
+            STARTUP_VERSION,
+            "disable must not send SSLRequest"
+        );
+    }
+
+    /// Without the `tls` feature there is no connector, so `prefer` stays
+    /// plaintext, as before.
+    #[cfg(not(feature = "tls"))]
+    #[tokio::test]
+    async fn prefer_without_the_tls_feature_stays_plaintext() {
+        let (header, _) = bytes_sent("?sslmode=prefer", Answer::Nothing).await;
+        assert_eq!(
+            header[4..],
+            STARTUP_VERSION,
+            "prefer must not send SSLRequest"
+        );
     }
 
     #[cfg(not(feature = "tls"))]
