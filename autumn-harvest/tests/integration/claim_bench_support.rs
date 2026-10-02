@@ -1650,7 +1650,7 @@ mod pure_tests {
         assert_eq!(out.total_claimed, 0);
         assert_eq!(out.claimed, 0);
         assert_eq!(out.empty, 0);
-        assert!(out.samples.is_empty());
+        assert_eq!(out.samples, [] as [f64; 0]);
         assert!(out.truncated, "truncation must survive the split");
     }
 
@@ -4287,7 +4287,7 @@ pub mod db {
             workflow_exec_id: None,
             activity_name: Some(BENCH_ACTIVITY.to_string()),
             activity_id: Some(uuid::Uuid::new_v4()),
-            input: serde_json::json!({}),
+            input: serde_json::json!({}).into(),
             priority: 0,
             max_attempts: 3,
             scheduled_at: chrono::Utc::now(),

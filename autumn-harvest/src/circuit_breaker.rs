@@ -1135,10 +1135,11 @@ mod tests {
         assert_eq!(reg.snapshot("alpha", now).unwrap().state, "open");
         assert_eq!(reg.tracked_activity_names(), ["alpha", "zeta"]);
 
-        assert!(
+        assert_eq!(
             CircuitBreakerRegistry::empty()
                 .tracked_activity_names()
-                .is_empty()
+                .len(),
+            0
         );
     }
 

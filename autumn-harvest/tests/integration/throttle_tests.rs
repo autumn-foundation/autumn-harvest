@@ -229,7 +229,7 @@ async fn start(conn: &mut AsyncPgConnection, wf: &str, wf_id: &str, input: serde
             workflow_name: wf,
             workflow_id: wf_id,
             exec_id: ExecutionId::new(),
-            input,
+            input: input.into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,

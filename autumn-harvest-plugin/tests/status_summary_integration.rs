@@ -154,7 +154,7 @@ async fn seed_execution(url: &str, shard: i32, workflow_name: &str, state: &str)
         workflow_id: &wf_id,
         run_id: Uuid::new_v4(),
         shard_id: shard,
-        input: serde_json::json!({}),
+        input: serde_json::json!({}).into(),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
@@ -319,7 +319,10 @@ async fn healthy_fleet_reports_healthy_with_five_subsystems() {
         assert!(names.contains(&expected), "{expected} subsystem present");
     }
     assert!(body["as_of"].is_string());
-    assert!(body["unavailable_shards"].as_array().unwrap().is_empty());
+    assert_eq!(
+        body["unavailable_shards"].as_array().unwrap().as_slice(),
+        [] as [serde_json::Value; 0]
+    );
     // Every healthy subsystem has a null drill_down.
     assert!(
         body["subsystems"]
@@ -399,10 +402,10 @@ async fn one_shard_down_degrades_and_names_the_shard() {
         unavailable.iter().any(|u| u["shard_id"] == 1),
         "the down shard is named in unavailable_shards"
     );
-    assert!(
-        !unavailable.iter().find(|u| u["shard_id"] == 1).unwrap()["reason"]
+    assert_ne!(
+        unavailable.iter().find(|u| u["shard_id"] == 1).unwrap()["reason"]
             .as_str()
-            .unwrap()
-            .is_empty()
+            .unwrap(),
+        ""
     );
 }

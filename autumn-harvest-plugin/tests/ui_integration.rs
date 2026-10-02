@@ -275,7 +275,7 @@ async fn insert_workflow_on_url(
             workflow_name,
             workflow_id,
             exec_id,
-            input: json!({ "workflow_id": workflow_id, "shard": shard.as_i32() }),
+            input: json!({ "workflow_id": workflow_id, "shard": shard.as_i32() }).into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -503,6 +503,8 @@ async fn ui_lists_workflows_and_renders_detail_page() {
     let pool = build_test_pool(&database_url);
     let registry = echo_registry();
     let api_state = HarvestApiState::new();
+    // Issue #1802: set the opt-out. This test exercises the handler, not auth.
+    api_state.set_allow_unauthenticated_mutations(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
         Arc::clone(&registry),
@@ -4668,7 +4670,7 @@ async fn insert_child_workflow_on_url(
             workflow_name,
             workflow_id,
             exec_id,
-            input: serde_json::json!({}),
+            input: serde_json::json!({}).into(),
             parent_id: Some(parent_id.as_uuid()),
             queue_name: "default",
             execution_timeout: None,
@@ -5891,6 +5893,8 @@ async fn ui_trigger_preserves_dag_metadata() {
     let schedule_id = insert_test_schedule(&database_url, "Dag", dag_name, false).await;
 
     let api_state = HarvestApiState::new();
+    // Issue #1802: set the opt-out. This test exercises the handler, not auth.
+    api_state.set_allow_unauthenticated_mutations(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
         Arc::clone(&registry),
@@ -6005,6 +6009,8 @@ async fn ui_trigger_now_threads_dag_execution_timeout_sla_and_fleet_ceiling() {
     let schedule_id = insert_test_schedule(&database_url, "Dag", dag_name, false).await;
 
     let api_state = HarvestApiState::new();
+    // Issue #1802: set the opt-out. This test exercises the handler, not auth.
+    api_state.set_allow_unauthenticated_mutations(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
         Arc::clone(&registry),
@@ -6318,7 +6324,7 @@ async fn workflow_detail_ui_renders_decoded_input() {
             workflow_name: "encrypted_workflow",
             workflow_id: "detail-decode-1",
             exec_id,
-            input: input_envelope.clone(),
+            input: input_envelope.clone().into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -6510,7 +6516,7 @@ async fn rejected_signal_render_attributes_decode_audit_to_the_post_route() {
             workflow_name: "encrypted_workflow",
             workflow_id: "reject-decode-1",
             exec_id,
-            input: input_envelope.clone(),
+            input: input_envelope.clone().into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -6600,7 +6606,7 @@ async fn workflow_detail_ui_writes_no_audit_row_when_only_hidden_fields_carry_en
             exec_id,
             // A plain, already-decoded input: the rendered fields carry no
             // envelopes at all in this fixture.
-            input: json!({"user": "plain-input"}),
+            input: json!({"user": "plain-input"}).into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -6897,7 +6903,7 @@ async fn dag957_seed_run(
             workflow_name: dag_name,
             workflow_id,
             exec_id,
-            input: json!({}),
+            input: json!({}).into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -8116,6 +8122,10 @@ async fn ui_timeline_200_steps_under_1s() {
 #[tokio::test]
 async fn vantage_and_dlq_mutations_reject_cross_site_post() {
     let api_state = HarvestApiState::new();
+    // Issue #1802: set the opt-out, so this test isolates the same-origin
+    // guard. On a closed state, the API gate answers the DLQ post with 401
+    // first. The `/ui` guard is the outer layer, so it answers first there.
+    api_state.set_allow_unauthenticated_mutations(true);
     let app = autumn_harvest_plugin::harvest_api_router(api_state.clone())
         .nest("/ui", harvest_ui_router(api_state));
 

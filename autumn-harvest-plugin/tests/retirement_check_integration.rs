@@ -170,7 +170,7 @@ async fn insert_versioned_execution(
         workflow_id,
         run_id: uuid::Uuid::new_v4(),
         shard_id: shard.as_i32(),
-        input: json!({}),
+        input: json!({}).into(),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
@@ -263,7 +263,7 @@ async fn insert_execution_without_marker(
         workflow_id,
         run_id: uuid::Uuid::new_v4(),
         shard_id: shard.as_i32(),
-        input: json!({}),
+        input: json!({}).into(),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
@@ -498,7 +498,10 @@ async fn retirement_check_state_group_active_hides_terminal_rows() {
 
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["status"], "safe");
-    assert!(body["blockers"].as_array().unwrap().is_empty());
+    assert_eq!(
+        body["blockers"].as_array().unwrap().as_slice(),
+        [] as [serde_json::Value; 0]
+    );
 }
 
 #[tokio::test]

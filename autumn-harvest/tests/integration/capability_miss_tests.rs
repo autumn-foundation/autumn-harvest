@@ -342,7 +342,7 @@ async fn seed_execution(
         workflow_id: &format!("wf-{}", exec_id.as_uuid()),
         run_id: Uuid::new_v4(),
         shard_id: 0,
-        input: input.clone(),
+        input: input.clone().into(),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
@@ -925,28 +925,27 @@ fn decoy_workflow(_ctx: &WorkflowContext, _input: serde_json::Value) -> BoxFut<'
 /// peer whose evidence it clears (issue #804 round 27).
 ///
 /// A **pool**, not a URL, for the exact reason [`CLAIM_THEFT_INJECTION`]
-/// documents: the whole body has only `executor::SUSPENSION_TIMEOUT` (100 ms)
-/// to reach a command-emitting suspension, and a fresh
+/// documents. The whole body has a bounded window to reach a
+/// command-emitting suspension. That window was 100 ms, and since issue
+/// #1797 it is `executor::DEADLOCK_TIMEOUT`. A fresh
 /// `AsyncPgConnection::establish` per dispatch pays a full TCP+auth handshake
-/// inside that window — slow enough under load to blow the budget outright
-/// (issue #1182, Codex round-3: this test failed the exact same way the
-/// primary #1182 regression did, `"workflow suspended without emitted
-/// commands"`, because the raw connect never resolved in time and the miss
-/// this test exists to exercise was never reached). A pooled, pre-warmed
+/// inside that window. Under load that was slow enough to blow the budget
+/// (issue #1182). This test then failed exactly like the primary #1182
+/// regression, with `"workflow suspended without emitted commands"`. The raw
+/// connect never resolved in time, so the body never reached the miss. A pooled, pre-warmed
 /// checkout reuses a live connection and pays only the `UPDATE`.
 ///
 /// A `OnceLock` rather than a parameter because a `WorkflowHandlerFn` is a bare
 /// `fn` pointer with a fixed signature and cannot capture.
 ///
 /// A **pool**, not a URL, for exactly the reason [`CLAIM_THEFT_INJECTION`]
-/// documents one round later: the invalidation has to land inside the dispatch
-/// window, and the whole body has only `executor::SUSPENSION_TIMEOUT` (100 ms)
-/// to reach a command-emitting suspension. A fresh
-/// `AsyncPgConnection::establish` pays a full TCP+auth handshake *inside* that
-/// window on a database this suite shares; blow the 100 ms and the dispatch is
-/// failed with "workflow suspended without emitted commands", the run goes
-/// terminal, and this test fails claiming the decision used a stale snapshot
-/// when in truth the body never reached the miss at all. The pool must be
+/// documents one round later. The invalidation has to land inside the
+/// dispatch window. The whole body has a bounded window to reach a
+/// command-emitting suspension (`executor::DEADLOCK_TIMEOUT` since #1797).
+/// A fresh `AsyncPgConnection::establish` pays a full TCP+auth handshake
+/// *inside* that window, on a database this suite shares. If it blows the
+/// window, the body never reaches the miss. This test then fails and claims
+/// the decision used a stale snapshot, which is false. The pool must be
 /// pre-warmed before the worker starts — see [`prewarm_race_injection`].
 static RACE_INJECTION: std::sync::OnceLock<(DbPool, String)> = std::sync::OnceLock::new();
 
@@ -1018,11 +1017,11 @@ fn workflow_invalidates_peer_then_misses(
 /// [`prewarm_claim_theft_injection`]. `deadpool` builds lazily, so an unwarmed
 /// pool pays that same TCP+auth handshake on its *first* `get()`, and this test
 /// performs exactly one dispatch: without the pre-warm the handshake lands
-/// inside the very window the pool exists to protect. The whole body has only
-/// `executor::SUSPENSION_TIMEOUT` (100 ms) to reach a command-emitting
-/// suspension; blow that and the dispatch is failed with "workflow suspended
-/// without emitted commands", the theft never happens, and this test fails as a
-/// bare `wait_for_task_owner` timeout that names none of the above.
+/// inside the very window the pool exists to protect. The whole body has a
+/// bounded window to reach a command-emitting suspension
+/// (`executor::DEADLOCK_TIMEOUT` since issue #1797). If it blows that window,
+/// the dispatch never reaches the theft. This test then fails as a bare
+/// `wait_for_task_owner` timeout that names none of the above.
 static CLAIM_THEFT_INJECTION: std::sync::OnceLock<DbPool> = std::sync::OnceLock::new();
 
 /// Force [`CLAIM_THEFT_INJECTION`]'s lazy `deadpool` to establish a connection
@@ -1401,7 +1400,10 @@ async fn activity_capability_miss_is_released_for_a_capable_peer() {
         Some(serde_json::json!("activity done")),
         "the workflow returned the capable peer's activity output"
     );
-    assert!(dead_letter_errors(&url, exec_id).await.is_empty());
+    assert_eq!(
+        dead_letter_errors(&url, exec_id).await,
+        [] as [std::string::String; 0]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1536,7 +1538,10 @@ async fn a_post_handler_release_does_not_re_emit_workflow_started() {
         "`harvest.workflow.started` must be emitted EXACTLY ONCE for this \
          execution across the whole incapable-then-capable dispatch sequence"
     );
-    assert!(dead_letter_errors(&url, exec_id).await.is_empty());
+    assert_eq!(
+        dead_letter_errors(&url, exec_id).await,
+        [] as [std::string::String; 0]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1668,7 +1673,10 @@ async fn a_local_activity_miss_releases_before_committing_its_batch() {
         "the capable worker DOES commit the breadcrumb -- without this the \
          phase-1 assertion would hold for the wrong reason"
     );
-    assert!(dead_letter_errors(&url, exec_id).await.is_empty());
+    assert_eq!(
+        dead_letter_errors(&url, exec_id).await,
+        [] as [std::string::String; 0]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2854,14 +2862,13 @@ async fn a_claim_lost_mid_dispatch_makes_no_terminal_decision() {
 /// Deterministic companion to
 /// [`a_claim_lost_mid_dispatch_makes_no_terminal_decision`] (issue #1182).
 ///
-/// That test relies on winning a real race between a slow in-body database
-/// round trip and `executor::SUSPENSION_TIMEOUT`, so it exercises
-/// [`handle_suspended_workflow`]'s catch-all branch -- reached when a live
-/// dispatch cycle suspends having emitted **zero** commands at all -- only
-/// when the round trip happens to land on the wrong side of that 100 ms
-/// budget. Under a loaded CI runner it reliably does (issue #1182); under a
-/// fast one it can just as reliably not, silently skipping this branch for
-/// months without anyone noticing. This test drives the exact same primitive
+/// That test used to win a real race between a slow in-body database round
+/// trip and the old 100 ms suspension timer. Only then did it exercise
+/// [`handle_suspended_workflow`]'s catch-all branch, which a live dispatch
+/// cycle reaches when it suspends with **zero** commands. Issue #1797 removed
+/// that timer, so a slow round trip no longer produces the empty suspension.
+/// The branch is still reachable, for example by a false `await_condition`
+/// with no command. This test drives the exact same primitive
 /// the branch now delegates to,
 /// [`fail_suspended_workflow_if_still_claimed`], directly and
 /// unconditionally: the claim theft is committed for real *before* the call,
@@ -2899,8 +2906,7 @@ async fn a_stale_dispatcher_with_zero_emitted_commands_makes_no_terminal_decisio
         .expect("transfer the claim");
 
     // The live dispatch cycle suspended having emitted no commands at all --
-    // the shape produced when a handler's whole `SUSPENSION_TIMEOUT` budget is
-    // spent on something other than a command-emitting await point. This is
+    // the shape a false `await_condition` with no command produces. This is
     // `handle_suspended_workflow`'s catch-all `else` branch, driven here via
     // the exact error text it builds for an empty command set.
     let error = "workflow suspended without emitted commands; resumption is not implemented yet";
@@ -5963,7 +5969,10 @@ async fn cross_type_continue_as_new_missing_target_is_released_for_a_capable_pee
         "the predecessor seals cleanly once a capable peer runs the transition: {:?}",
         sealed.error
     );
-    assert!(dead_letter_errors(&url, exec_id).await.is_empty());
+    assert_eq!(
+        dead_letter_errors(&url, exec_id).await,
+        [] as [std::string::String; 0]
+    );
 }
 
 // -- Codex round-46 P1: evidence is keyed to the handler it is about ---------

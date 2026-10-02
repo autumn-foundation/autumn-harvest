@@ -297,7 +297,7 @@ async fn admin_gates_exposes_producer_contract() {
         .get("producers")
         .and_then(Value::as_array)
         .expect("response must carry a `producers` block (AC5)");
-    assert!(!producers.is_empty());
+    assert_ne!(producers.as_slice(), [] as [serde_json::Value; 0]);
 
     let by_name = |name: &str| -> Value {
         producers
@@ -672,7 +672,7 @@ async fn fleet_gate_leaves_zero_uncounted_admissions() {
             workflow_name: "ag_source_wf",
             workflow_id: "ag-src-success",
             exec_id: source_exec_id,
-            input: json!({}),
+            input: json!({}).into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -905,7 +905,7 @@ async fn seed_target_prior(conn: &mut AsyncPgConnection, workflow_id: &str, stat
             workflow_name: "ag_target_wf",
             workflow_id,
             exec_id,
-            input: json!({}),
+            input: json!({}).into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,

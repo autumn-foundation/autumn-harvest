@@ -59,6 +59,8 @@ async fn setup_database_url_with_migrations() -> (String, ContainerAsync<Postgre
 
 fn build_api_app(pool: HarvestDbPool) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
+    // Issue #1802: set the opt-out. This test exercises the handler, not auth.
+    api_state.set_allow_unauthenticated_mutations(true);
     api_state.install_storage_pool(pool);
     api_state.install(HarvestApiRuntime::new(
         Arc::new(HandlerRegistry::new(vec![], vec![])),
@@ -137,7 +139,7 @@ async fn seed_external_handoff(
         workflow_id,
         run_id: uuid::Uuid::new_v4(),
         shard_id: 0,
-        input: json!({ "raw": "not exposed in handoff list" }),
+        input: json!({ "raw": "not exposed in handoff list" }).into(),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
@@ -268,7 +270,10 @@ async fn pending_handoff_can_be_listed_completed_and_retried_idempotently() {
 
     let (status, pending) = get_json(&app, "/admin/external-handoffs?state=PENDING").await;
     assert_eq!(status, StatusCode::OK, "{pending}");
-    assert!(pending["items"].as_array().expect("items array").is_empty());
+    assert_eq!(
+        pending["items"].as_array().expect("items array").as_slice(),
+        [] as [serde_json::Value; 0]
+    );
 
     let (status, completed) = get_json(&app, "/admin/external-handoffs?state=COMPLETED").await;
     assert_eq!(status, StatusCode::OK, "{completed}");

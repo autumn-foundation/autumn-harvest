@@ -351,7 +351,8 @@ terminate_existing`, or `reuse_policy = terminate_if_running` with the
 default/omitted `conflict_policy`. The flagship idempotent-starter shape above
 (`terminate_if_running` + `use_existing`) resolves to *attach* and provably
 cannot cancel a live run, so it does **not** require admin — non-admin
-webhook/cron callers can use it directly. `terminate_if_running` +
+webhook/cron callers can use it directly. Outside `dev`, those callers still
+need a credential or a declared auth layer (issue #1802). `terminate_if_running` +
 `fail` (resolves to `409`) is likewise non-admin.
 
 `conflict_policy` is **not** supported combined with a throttle / debounce /

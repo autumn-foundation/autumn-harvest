@@ -221,7 +221,7 @@ async fn seed_execution(
         workflow_id,
         run_id: Uuid::new_v4(),
         shard_id: shard.as_i32(),
-        input: json!({ "secret": "plaintext-payload" }),
+        input: json!({ "secret": "plaintext-payload" }).into(),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
@@ -975,13 +975,19 @@ async fn idle_fleet_yields_an_empty_but_complete_manifest() {
 
     let (status, body) = get_json(&app, SAMPLE_ROUTE).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert!(body["exports"].as_array().expect("array").is_empty());
+    assert_eq!(
+        body["exports"].as_array().expect("array").as_slice(),
+        [] as [serde_json::Value; 0]
+    );
     let manifest = manifest_of(&body);
     assert!(manifest.is_complete());
     assert!(!manifest.is_truncated());
     assert_eq!(manifest.sampled_total, 0);
     assert_eq!(manifest.in_flight_total, 0);
-    assert!(manifest.per_workflow.is_empty());
+    assert_eq!(
+        manifest.per_workflow,
+        [] as [autumn_harvest::replay_sample::SampleWorkflowCoverage; 0]
+    );
 }
 
 // ---------------------------------------------------------------------------

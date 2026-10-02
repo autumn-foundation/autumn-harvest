@@ -75,7 +75,7 @@ async fn insert(conn: &mut AsyncPgConnection, spec: InsertSpec<'_>) -> Execution
         workflow_id: spec.workflow_id,
         run_id: uuid::Uuid::new_v4(),
         shard_id: 0,
-        input: json!({}),
+        input: json!({}).into(),
         parent_id: spec.parent_id.map(|id| id.as_uuid()),
         queue_name: "default",
         execution_timeout: None,
@@ -327,5 +327,5 @@ async fn existence_probe_returns_empty_for_empty_input() {
     let parents = load_parents_with_children(&mut conn, &[])
         .await
         .expect("probe");
-    assert!(parents.is_empty());
+    assert_eq!(parents, [] as [uuid::Uuid; 0]);
 }

@@ -173,7 +173,7 @@ async fn seed_execution(
         workflow_id: &wf_id,
         run_id: Uuid::new_v4(),
         shard_id: shard,
-        input: serde_json::json!({}),
+        input: serde_json::json!({}).into(),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
@@ -278,7 +278,10 @@ async fn empty_fleet_returns_complete_zero_groups() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "complete");
     assert_eq!(body["groups"].as_array().unwrap().len(), 0);
-    assert!(body["unavailable_shards"].as_array().unwrap().is_empty());
+    assert_eq!(
+        body["unavailable_shards"].as_array().unwrap().as_slice(),
+        [] as [serde_json::Value; 0]
+    );
 }
 
 #[tokio::test]
@@ -826,7 +829,7 @@ async fn one_shard_down_is_partial_not_500() {
     let unavailable = body["unavailable_shards"].as_array().unwrap();
     assert_eq!(unavailable.len(), 1);
     assert_eq!(unavailable[0]["shard_id"], 1);
-    assert!(!unavailable[0]["reason"].as_str().unwrap().is_empty());
+    assert_ne!(unavailable[0]["reason"].as_str().unwrap(), "");
 }
 
 #[tokio::test]

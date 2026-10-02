@@ -750,6 +750,36 @@ impl std::fmt::Debug for PayloadCodecs {
     }
 }
 
+/// Deserialize a wire event without serde's `Content` buffering.
+///
+/// `WorkflowEvent` is adjacently tagged. Without the `preserve_order` feature,
+/// `serde_json::Map` iterates keys in sorted order, so `data` comes before `type`. Serde then buffers the whole
+/// event in `Content` before it can pick a variant. This function feeds
+/// `type` first, so serde reads `data` straight into the chosen variant.
+///
+/// Any other shape takes the plain `from_value` path, so every error message
+/// stays the same. That covers a non-object root, a missing `type`, and extra
+/// keys.
+fn event_from_wire(value: Value) -> Result<crate::event::WorkflowEvent, serde_json::Error> {
+    use serde::de::IntoDeserializer;
+    use serde::de::value::MapDeserializer;
+
+    let Value::Object(mut map) = value else {
+        return serde_json::from_value(value);
+    };
+    let tagged = map.get("type").is_some_and(Value::is_string)
+        && map.keys().all(|key| key == "type" || key == "data");
+    if !tagged {
+        return serde_json::from_value(Value::Object(map));
+    }
+    let tag = map.remove("type").unwrap_or_default();
+    let data = map.remove("data");
+    let pairs = std::iter::once(("type", tag)).chain(data.map(|data| ("data", data)));
+    let de: MapDeserializer<'_, _, serde_json::Error> =
+        MapDeserializer::new(pairs.map(|(key, value)| (key.into_deserializer(), value)));
+    serde::Deserialize::deserialize(de)
+}
+
 /// Validate an operator-supplied codec key id (issue #948).
 ///
 /// Key ids are persisted inside stored envelopes and echoed in the rotation
@@ -1168,7 +1198,7 @@ impl PayloadCodecs {
     /// Returns [`HarvestError`] if codec decoding or event deserialization fails.
     pub fn decode_event(&self, mut value: Value) -> HarvestResult<crate::event::WorkflowEvent> {
         self.transform_event_data(&mut value, false)?;
-        Ok(serde_json::from_value(value)?)
+        Ok(event_from_wire(value)?)
     }
 
     fn transform_event_data(&self, root: &mut Value, encode: bool) -> HarvestResult<()> {
@@ -2830,7 +2860,7 @@ mod tests {
             CODEC_LEGACY_KEY_ID,
             "an unconfigured registry is on the legacy key"
         );
-        assert!(codecs.registered_key_ids().is_empty());
+        assert_eq!(codecs.registered_key_ids(), [] as [std::string::String; 0]);
 
         codecs
             .register_key("k1", Arc::new(XorCodec(1)))

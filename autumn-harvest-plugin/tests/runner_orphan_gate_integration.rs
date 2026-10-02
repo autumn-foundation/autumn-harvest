@@ -256,7 +256,7 @@ async fn insert_execution(
         workflow_id,
         run_id: uuid::Uuid::new_v4(),
         shard_id: shard.as_i32(),
-        input: json!({}),
+        input: json!({}).into(),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,

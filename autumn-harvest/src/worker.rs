@@ -3220,9 +3220,8 @@ fn local_activity_history_cap_reached(next_event_id: i32, cap: Option<u64>) -> O
 /// Marker, detached-spawn, timer-bookkeeping, and update-result events are
 /// split around the local activity command so `LocalActivityScheduled` is
 /// written at its actual command position. The `result_tx` inside the
-/// command is dropped immediately — the workflow coroutine was already
-/// dropped when the 100 ms suspension timeout fired, so nobody is listening
-/// on the receiving end.
+/// command is dropped immediately. The executor dropped the workflow
+/// coroutine when it suspended the cycle, so nobody listens on the other end.
 ///
 /// Issue #1247: before this fix, the original four kinds
 /// (`RecordMarker`, `RecordSideEffect`, `SpawnDetachedChildWorkflow`,
@@ -7523,6 +7522,71 @@ pub fn resolve_capability_miss_with_confidence(
 // Contained workflow handler-panic retry (issue #782)
 // ---------------------------------------------------------------------------
 
+/// Consecutive deadlocked workflow tasks per execution (issue #1797).
+///
+/// The count sets the retry backoff only. A retry often runs on another
+/// worker, so this worker may never see the outcome that would clear an
+/// entry. An entry older than [`DEADLOCK_STRIKE_TTL`] therefore counts as
+/// reset, and [`Self::record`] prunes such entries.
+#[derive(Debug, Default)]
+struct DeadlockStrikes(
+    std::sync::Mutex<std::collections::HashMap<uuid::Uuid, (u32, std::time::Instant)>>,
+);
+
+/// Age after which a deadlock strike no longer counts: twice the backoff cap.
+const DEADLOCK_STRIKE_TTL: Duration = Duration::from_secs(2 * DEADLOCK_RETRY_BACKOFF_CAP_SECS);
+
+impl DeadlockStrikes {
+    /// Count one more deadlock for `exec_id` and return the new count.
+    fn record(&self, exec_id: uuid::Uuid) -> u32 {
+        self.record_at(exec_id, std::time::Instant::now())
+    }
+
+    /// [`Self::record`] at a given instant, so that tests can age entries.
+    fn record_at(&self, exec_id: uuid::Uuid, now: std::time::Instant) -> u32 {
+        let mut map = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.retain(|_, (_, seen)| now.duration_since(*seen) < DEADLOCK_STRIKE_TTL);
+        let entry = map.entry(exec_id).or_insert((0, now));
+        entry.0 = entry.0.saturating_add(1);
+        entry.1 = now;
+        let count = entry.0;
+        drop(map);
+        count
+    }
+
+    /// Forget the strikes of `exec_id`.
+    fn clear(&self, exec_id: uuid::Uuid) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&exec_id);
+    }
+}
+
+/// Base delay before a deadlocked workflow task runs again (issue #1797).
+const DEADLOCK_RETRY_BACKOFF_BASE_SECS: u64 = 5;
+
+/// Ceiling on the deadlock retry delay (issue #1797).
+///
+/// Retries never stop, because a deadlock never fails the run. Each attempt
+/// holds a slot for up to [`crate::executor::DEADLOCK_TIMEOUT`]. The cap
+/// keeps a workflow that always deadlocks from crowding out healthy work.
+const DEADLOCK_RETRY_BACKOFF_CAP_SECS: u64 = 300;
+
+/// Capped exponential backoff for a deadlock retry: `5s * 2^(n-1)`, capped at
+/// 300 s (issue #1797). `strikes` is 1-based and counts this deadlock.
+fn deadlock_retry_backoff(strikes: u32) -> Duration {
+    crate::policy::compute_retry_delay(
+        Duration::from_secs(DEADLOCK_RETRY_BACKOFF_BASE_SECS),
+        2.0,
+        Duration::from_secs(DEADLOCK_RETRY_BACKOFF_CAP_SECS),
+        strikes.max(1),
+    )
+}
+
 /// Base delay before the first panic re-dispatch (issue #782). A short floor
 /// (>0) prevents a fast, deterministic panic from hot-looping worker slots
 /// while the operator hotfixes-and-redeploys.
@@ -11379,7 +11443,7 @@ fn build_child_row<'p>(
         workflow_id: &plan.child_workflow_id,
         run_id: uuid::Uuid::new_v4(),
         shard_id,
-        input: child.input.clone(),
+        input: child.input.clone().into(),
         parent_id: Some(parent_exec_id.as_uuid()),
         queue_name,
         execution_timeout: plan.defaults.execution_timeout,
@@ -11732,7 +11796,7 @@ async fn insert_awaited_child_execution(
         workflow_id: &child_workflow_id,
         run_id: uuid::Uuid::new_v4(),
         shard_id,
-        input: child.input.clone(),
+        input: child.input.clone().into(),
         parent_id: Some(parent_exec_id.as_uuid()),
         queue_name: &queue_name,
         execution_timeout: defaults.execution_timeout,
@@ -12860,6 +12924,47 @@ async fn requeue_parent_on_transient_ingest_conflict(
     let _ = queue::park_workflow_task_preserving_capability_misses(conn, task.id, sticky).await?;
     queue::wake_workflow_task(conn, exec_id).await?;
     Ok(())
+}
+
+/// Re-drive a workflow task after an event-id conflict in an append made
+/// after the handler lookup (issue #1787).
+///
+/// The lookup succeeded, so this worker can run the task. The park clears the
+/// capability-miss evidence, as every other post-lookup park does (issue
+/// #804). Stale evidence could otherwise end the redelivery budget early.
+///
+/// The park is fenced on this handler's claim. A handler that outlived its
+/// task timeout can hit the conflict after a peer took the row. A lost claim
+/// is a no-op, so the peer keeps its ownership.
+#[doc(hidden)] // exposed for its integration test; not a stable API
+pub async fn requeue_workflow_task_after_event_id_conflict(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    worker_id: &str,
+    sticky_timeout: Duration,
+    exec_id: ExecutionId,
+) -> HarvestResult<()> {
+    let claim = queue::TaskClaim::new(task.id, worker_id, task.attempt);
+    let sticky = if sticky_timeout.is_zero() {
+        None
+    } else {
+        Some(queue::StickyHint::new(worker_id, sticky_timeout))
+    };
+    Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
+        if let queue::ClaimLock::Lost { .. } = queue::lock_claim_for_update(conn, &claim).await? {
+            tracing::debug!(
+                task_id = %task.id,
+                worker_id = %worker_id,
+                attempt = task.attempt,
+                "event-id conflict re-drive skipped: a peer holds the claim"
+            );
+            return Ok(());
+        }
+        let _ = queue::park_workflow_task(conn, task.id, sticky).await?;
+        queue::wake_workflow_task(conn, exec_id).await?;
+        Ok(())
+    }))
+    .await
 }
 
 /// Run the wake-event ingest ([`ingest_due_timers_and_signals`]), converting a
@@ -14048,7 +14153,7 @@ async fn create_detached_child_executions(
             workflow_id: &child_workflow_id,
             run_id: uuid::Uuid::new_v4(),
             shard_id: parent_execution.shard_id,
-            input: input.clone(),
+            input: input.clone().into(),
             parent_id: Some(parent_execution.id),
             queue_name: &parent_execution.queue_name,
             execution_timeout: None,
@@ -15991,8 +16096,8 @@ pub async fn apply_race_loser_cancellations(
     let function_entry_next_event_id = *next_event_id;
     let mut child_terminal_metrics: Vec<(String, String)> = Vec::new();
     // Issue #1247: same deferral as `child_terminal_metrics`, for the
-    // activity-loser trio below. The post-loop reload can fail, and these
-    // metrics have no undo either.
+    // activity-loser trio below. The post-loop reload and the final append
+    // can fail, and these metrics have no undo either.
     let mut activity_loser_metrics: Vec<(String, String)> = Vec::new();
 
     for cmd in commands {
@@ -16122,14 +16227,12 @@ pub async fn apply_race_loser_cancellations(
     }
 
     child_terminal_events.extend(
-        reload_race_loser_events_and_emit_metrics(
+        reload_race_loser_events(
             conn,
             exec_id,
             registry,
             function_entry_next_event_id,
             *next_event_id,
-            &child_terminal_metrics,
-            &activity_loser_metrics,
         )
         .await?,
     );
@@ -16146,6 +16249,12 @@ pub async fn apply_race_loser_cancellations(
         *next_event_id = next_event_id.saturating_add(i32::try_from(inserted).unwrap_or(0));
     }
 
+    // Issue #1787: the append above is the last step that can fail here. A
+    // unique violation on it rolls back and re-drives the task, and the
+    // re-drive cancels the same losers again. Emit only now, so a failed
+    // attempt records nothing.
+    emit_race_loser_metrics(registry, &child_terminal_metrics, &activity_loser_metrics);
+
     // Issue #1247: return every event this call durably appended. Child
     // terminals come first — appended inline, mid-loop, so they hold the
     // lower ids — then the batched activity terminals just above. A caller
@@ -16160,18 +16269,12 @@ pub async fn apply_race_loser_cancellations(
 /// function entry and at loop-end is exactly the events those
 /// cancellations appended. Synthetic activity-loser events are appended
 /// separately, after this call. They are excluded by construction.
-///
-/// Emits every deferred child-cancellation and activity-loser metric only
-/// after the reload succeeds (issue #1247). A reload failure then rolls
-/// back the transaction with no metric recorded for it.
-async fn reload_race_loser_events_and_emit_metrics(
+async fn reload_race_loser_events(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     registry: &HandlerRegistry,
     function_entry_next_event_id: i32,
     next_event_id: i32,
-    child_terminal_metrics: &[(String, String)],
-    activity_loser_metrics: &[(String, String)],
 ) -> HarvestResult<Vec<WorkflowEvent>> {
     let mut child_terminal_events = Vec::new();
     let total_child_events_appended =
@@ -16185,6 +16288,19 @@ async fn reload_race_loser_events_and_emit_metrics(
             .saturating_sub(total_child_events_appended);
         child_terminal_events.extend_from_slice(&history.events[start..]);
     }
+    Ok(child_terminal_events)
+}
+
+/// Emit the child-cancellation and activity-loser metrics that
+/// `apply_race_loser_cancellations` deferred (issues #1247, #1787).
+///
+/// The caller runs this after its last fallible step. A failure before
+/// that point rolls back the transaction with no metric recorded.
+fn emit_race_loser_metrics(
+    registry: &HandlerRegistry,
+    child_terminal_metrics: &[(String, String)],
+    activity_loser_metrics: &[(String, String)],
+) {
     let metrics = &registry.telemetry().metrics;
     for (child_workflow_name, queue_name) in child_terminal_metrics {
         crate::telemetry::emit_workflow_terminal(
@@ -16205,7 +16321,6 @@ async fn reload_race_loser_events_and_emit_metrics(
         metrics.record_activity_failed(activity_name, "", "Error", true);
         metrics.record_activity_attempt(activity_name, queue_name, ActivityStatus::Failed);
     }
-    Ok(child_terminal_events)
 }
 
 /// Pure event-emission plan for the **fresh-arm** timer commands
@@ -17178,14 +17293,13 @@ async fn recover_from_child_quota_exceeded(
 /// claim (issue #1182).
 ///
 /// [`handle_suspended_workflow`]'s catch-all branch used to reach straight for
-/// [`persist_workflow_failure`], with no ownership recheck at all. A live
-/// dispatch that suspends empty-handed because it was still mid-flight on
-/// some other I/O -- a slow downstream call, a database round trip -- when
-/// [`crate::executor::SUSPENSION_TIMEOUT`] elapses would then be failed
-/// terminally under the **stale** `worker_id`, even when the row had already
-/// changed hands to a concurrent poison-pill reclaim, an operator action, or
-/// exactly the claim-theft race issue #804's round-28 fix guards the
-/// `AfterHandler` capability-miss branch against. That guard covers only the
+/// [`persist_workflow_failure`], with no ownership recheck at all. Under the
+/// old 100 ms suspension timer (removed by issue #1797), a live dispatch
+/// could suspend empty-handed while it was still mid-flight on other I/O. It
+/// was then failed terminally under the **stale** `worker_id`. The row could
+/// already belong to someone else. Examples are a poison-pill reclaim, an
+/// operator action, or the claim-theft race of issue #804. Issue #804 guards
+/// the `AfterHandler` capability-miss branch against that race. That guard covers only the
 /// path reached via [`persist_scheduled_activities`]; a handler that never
 /// got far enough to push a single command skips that branch and lands here,
 /// where nothing checked the claim.
@@ -18726,7 +18840,7 @@ async fn persist_workflow_continue_as_new_with_verdict(
         workflow_id: &execution.workflow_id,
         run_id: uuid::Uuid::new_v4(),
         shard_id: execution.shard_id,
-        input: input.clone(),
+        input: input.clone().into(),
         parent_id: None,
         queue_name: &execution.queue_name,
         execution_timeout: defaults.execution_timeout,
@@ -19013,6 +19127,11 @@ async fn persist_workflow_outcome(
     let is_detached_child = execution.parent_close_policy.is_some();
 
     match (outcome, parent_exec_id) {
+        // Issue #1797: a failed workflow task persists nothing. The dispatch
+        // path returns before this call, so this arm only guards misuse.
+        (WorkflowOutcome::TaskFailed { error }, _) => Err(HarvestError::Dispatch(format!(
+            "a TaskFailed outcome has no persistence path: {error}"
+        ))),
         (WorkflowOutcome::Completed { output, .. }, Some(parent_id)) if !is_detached_child => {
             let res = persist_child_workflow_completion(
                 conn,
@@ -20482,6 +20601,8 @@ async fn process_workflow_task(
     // execution) and the configured re-dispatch budget.
     workflow_panic_strikes: &Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u32>>>,
     workflow_panic_max_attempts: u32,
+    // Issue #1797: in-process deadlock strike map (per execution).
+    workflow_deadlock_strikes: &Arc<DeadlockStrikes>,
     // Issue #783: absolute cut-off of the enclosing workflow-task dispatch
     // (issue #494), forwarded to inline local activities so their reported
     // deadline cannot out-live the cycle. `None` when that timeout is disabled.
@@ -21132,6 +21253,29 @@ async fn process_workflow_task(
                 .await
                 {
                     Ok(outcome) => outcome,
+                    Err(e) if e.is_event_id_unique_violation() => {
+                        // A concurrent append took this cycle's `event_id`.
+                        // An example is the `ActivityStarted` of a race loser
+                        // that a freed permit admits (issue #1787). The
+                        // transaction rolled back, so re-drive, as the
+                        // wake-event ingest does (issue #779). A fresh load
+                        // reads past the other event.
+                        requeue_workflow_task_after_event_id_conflict(
+                            conn,
+                            task,
+                            worker_id,
+                            sticky_timeout,
+                            prepared.exec_id,
+                        )
+                        .await?;
+                        tracing::warn!(
+                            task_id = %task.id,
+                            workflow_exec_id = %prepared.exec_id,
+                            "harvest: event-id conflict in a local activity append; \
+                             re-driving the workflow task"
+                        );
+                        return Ok(());
+                    }
                     Err(e) => {
                         // Issue #946, Codex round-3/round-4 review:
                         // `run_local_activity_inline` calls
@@ -21813,6 +21957,49 @@ async fn process_workflow_task(
         .await;
     }
 
+    // Issue #1797: a deadlocked cycle fails the workflow task, never the run.
+    // Its commands are not trusted, so none persist and no event is appended.
+    // The task is re-pended with a capped exponential backoff. A deadlock is
+    // not a panic, so it clears the panic strike first.
+    //
+    // The requeue is fenced by the claim. The cycle ran for at least
+    // `DEADLOCK_TIMEOUT`, so a reclaim can have moved the row meanwhile.
+    if let WorkflowOutcome::TaskFailed { error } = &outcome {
+        clear_panic_strike(workflow_panic_strikes, prepared.exec_id.as_uuid());
+        let strikes = workflow_deadlock_strikes.record(prepared.exec_id.as_uuid());
+        // `deadlock_retry_backoff` is capped at 300 s, so the fallback never
+        // runs. It is still non-zero, so it cannot hot-loop.
+        let backoff = chrono::Duration::from_std(deadlock_retry_backoff(strikes))
+            .unwrap_or_else(|_| chrono::Duration::seconds(300));
+        tracing::warn!(
+            execution_id = %prepared.exec_id,
+            workflow = %prepared.execution.workflow_name,
+            queue = %task.queue_name,
+            strikes,
+            backoff_secs = backoff.num_seconds(),
+            error = %error,
+            "harvest: workflow task failed (issue #1797); the task is retried and the \
+             run stays RUNNING"
+        );
+        drop(execute_span);
+        // A claimed task always names its worker. Without one, no write can
+        // be fenced, so leave the row to the timeout sweeper.
+        let Some(claim) = queue::TaskClaim::of(task) else {
+            return Ok(());
+        };
+        if !queue::requeue_claimed_workflow_task_after_deadlock(conn, &claim, backoff, error)
+            .await?
+        {
+            tracing::debug!(
+                execution_id = %prepared.exec_id,
+                task_id = %task.id,
+                "harvest: deadlocked workflow task lost its claim; the new owner keeps the row"
+            );
+        }
+        return Ok(());
+    }
+    workflow_deadlock_strikes.clear(prepared.exec_id.as_uuid());
+
     // Issue #782: a **contained handler panic** must NOT fail the workflow on
     // the first strike — buy time for a hotfix/redeploy by re-dispatching with
     // capped backoff up to `workflow_panic_max_attempts`, then fail terminally
@@ -21882,7 +22069,7 @@ async fn process_workflow_task(
         // continued-as-new / author-Err failed) clears the consecutive-panic
         // strike counter so a later transient panic starts fresh and the map
         // does not grow unbounded (mirrors the timeout-strike clear discipline).
-        // ND-blocked outcomes returned above and never reach here.
+        // ND-blocked and TaskFailed outcomes returned above and never reach here.
         clear_panic_strike(workflow_panic_strikes, prepared.exec_id.as_uuid());
     }
 
@@ -22059,6 +22246,8 @@ async fn process_workflow_task(
                 .saturating_add(terminal_parent_close_cascade_events)
                 .saturating_add(abandoned)
         }
+        // Issue #1797: returned at the gate above; it appends no event.
+        WorkflowOutcome::TaskFailed { .. } => 0,
     };
     let current_history_event_count = u64::try_from(history_events.len())
         .unwrap_or(u64::MAX)
@@ -22107,6 +22296,9 @@ async fn process_workflow_task(
         WorkflowOutcome::Failed { .. } => WorkflowStatus::Failed,
         WorkflowOutcome::Suspended { .. } => WorkflowStatus::Suspended,
         WorkflowOutcome::ContinuedAsNew { .. } => WorkflowStatus::ContinuedAsNew,
+        WorkflowOutcome::TaskFailed { .. } => {
+            unreachable!("a TaskFailed outcome returns at the issue #1797 gate")
+        }
     };
     // Issue #1184 (Codex review round 2, P2): these used to be EMITTED right
     // here, before the persist transaction below. A claim-ambiguity rollback
@@ -22144,6 +22336,9 @@ async fn process_workflow_task(
         },
         WorkflowOutcome::ContinuedAsNew { .. } => TerminalMetricsKind::ContinuedAsNew,
         WorkflowOutcome::Suspended { .. } => TerminalMetricsKind::Suspended,
+        WorkflowOutcome::TaskFailed { .. } => {
+            unreachable!("a TaskFailed outcome returns at the issue #1797 gate")
+        }
     };
     // Issue #1184 (Codex review round 4, P2): stop these clocks HERE, at the
     // moment the decision cycle itself finished -- not at emission time in
@@ -22869,6 +23064,8 @@ async fn process_task(
     // only on the workflow path.
     workflow_panic_strikes: Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u32>>>,
     workflow_panic_max_attempts: u32,
+    // Issue #1797: deadlock strike map, consulted only on the workflow path.
+    workflow_deadlock_strikes: Arc<DeadlockStrikes>,
     // Issue #783: absolute cut-off of the enclosing workflow-task dispatch
     // (issue #494); `None` when that timeout is disabled. Workflow path only —
     // an activity task is not wrapped in it.
@@ -22915,6 +23112,7 @@ async fn process_task(
                     dispatched_at,
                     &workflow_panic_strikes,
                     workflow_panic_max_attempts,
+                    &workflow_deadlock_strikes,
                     workflow_task_deadline,
                     &frontier_reset_committed,
                 ))
@@ -25579,6 +25777,8 @@ pub struct Worker {
     /// `process_workflow_task` may leak one bounded entry until worker restart —
     /// identical precedent to `workflow_task_timeout_strikes` (issue #494).
     workflow_panic_strikes: Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u32>>>,
+    /// Consecutive deadlocked workflow tasks per execution (issue #1797).
+    workflow_deadlock_strikes: Arc<DeadlockStrikes>,
     /// In-process registry of worker sessions currently hosted by this
     /// worker (issue #606), bounded against `config.max_concurrent_sessions`
     /// via [`crate::sessions::try_acquire_session_slot`]. `0` (the default
@@ -27206,9 +27406,8 @@ impl Worker {
             workflow_task_timeout_strikes: Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
-            workflow_panic_strikes: Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            workflow_panic_strikes: Arc::default(),
+            workflow_deadlock_strikes: Arc::default(),
             session_slots_in_use: crate::sessions::new_session_slot_registry(),
             shard_dispatch,
             global_dispatch,
@@ -30737,6 +30936,7 @@ impl Worker {
         let timeout_strikes = Arc::clone(&self.workflow_task_timeout_strikes);
         // Issue #782: contained-handler-panic retry budget + strike map.
         let panic_strikes = Arc::clone(&self.workflow_panic_strikes);
+        let deadlock_strikes = Arc::clone(&self.workflow_deadlock_strikes);
         let workflow_panic_max_attempts = self.config.workflow_panic_max_attempts;
         // Issue #804: the redelivery budget plus the liveness window for the
         // fleet lookup. Derived here rather than threaded from
@@ -30851,6 +31051,7 @@ impl Worker {
                     &session_slots_in_use,
                     Arc::clone(&panic_strikes),
                     workflow_panic_max_attempts,
+                    Arc::clone(&deadlock_strikes),
                     workflow_task_deadline,
                     capability_miss_policy,
                     Some(workflow_task_timeout),
@@ -31067,6 +31268,7 @@ impl Worker {
                     &session_slots_in_use,
                     panic_strikes,
                     workflow_panic_max_attempts,
+                    deadlock_strikes,
                     // No enclosing workflow-task budget on this arm, so the
                     // local per-attempt budget is the only clock (issue #783).
                     None,
@@ -31821,6 +32023,7 @@ pub async fn chaos_drive_one_workflow_task(
             uuid::Uuid,
             u32,
         >::new()));
+        let workflow_deadlock_strikes = Arc::new(DeadlockStrikes::default());
         let frontier_reset_committed = std::sync::atomic::AtomicBool::new(false);
         // Boxed for the same reason as the production call site
         // (clippy::large_futures).
@@ -31836,6 +32039,7 @@ pub async fn chaos_drive_one_workflow_task(
             std::time::Instant::now(),
             &workflow_panic_strikes,
             3,
+            &workflow_deadlock_strikes,
             None,
             &frontier_reset_committed,
         ))
@@ -31881,6 +32085,7 @@ pub async fn chaos_drive_one_workflow_task_cancel_at_hold(
             uuid::Uuid,
             u32,
         >::new()));
+        let workflow_deadlock_strikes = Arc::new(DeadlockStrikes::default());
         let frontier_reset_committed = std::sync::atomic::AtomicBool::new(false);
         // Boxed for the same reason as `chaos_drive_one_workflow_task`
         // (clippy::large_futures).
@@ -31896,6 +32101,7 @@ pub async fn chaos_drive_one_workflow_task_cancel_at_hold(
             std::time::Instant::now(),
             &workflow_panic_strikes,
             3,
+            &workflow_deadlock_strikes,
             None,
             &frontier_reset_committed,
         ));
@@ -32010,7 +32216,7 @@ mod tests {
             workflow_id: "wf-id",
             run_id: uuid::Uuid::nil(),
             shard_id: 0,
-            input: serde_json::Value::Null,
+            input: serde_json::Value::Null.into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
@@ -32947,7 +33153,10 @@ mod tests {
         // genuinely-overdue schedule living on the failed shard).
         let previous = key_set(&[("workflow", "a"), ("workflow", "b")]);
         let current = key_set(&[("workflow", "a")]);
-        assert!(labels_to_clear(&previous, &current, false).is_empty());
+        assert_eq!(
+            labels_to_clear(&previous, &current, false),
+            [] as [(std::string::String, std::string::String); 0]
+        );
     }
 
     #[test]
@@ -32955,7 +33164,10 @@ mod tests {
         // previous ⊆ current → [] (nothing disappeared).
         let previous = key_set(&[("workflow", "a")]);
         let current = key_set(&[("workflow", "a"), ("dag", "b")]);
-        assert!(labels_to_clear(&previous, &current, true).is_empty());
+        assert_eq!(
+            labels_to_clear(&previous, &current, true),
+            [] as [(std::string::String, std::string::String); 0]
+        );
     }
 
     #[test]
@@ -32963,7 +33175,10 @@ mod tests {
         // Empty previous (first pass) → [] regardless of current.
         let previous = std::collections::HashSet::new();
         let current = key_set(&[("workflow", "a")]);
-        assert!(labels_to_clear(&previous, &current, true).is_empty());
+        assert_eq!(
+            labels_to_clear(&previous, &current, true),
+            [] as [(std::string::String, std::string::String); 0]
+        );
     }
 
     /// A pool that builds without connecting, aimed at a closed port.
@@ -33655,7 +33870,7 @@ mod tests {
             value: "x".to_string(),
             explicit_clear: false,
         }];
-        assert!(collect_log_lines(&cmds).is_empty());
+        assert_eq!(collect_log_lines(&cmds), [] as [store::WorkflowLogLine; 0]);
     }
 
     #[test]
@@ -34666,7 +34881,10 @@ mod tests {
     fn monitor_shard_scope_passes_the_full_list_through_on_the_single_pool_fallback() {
         let all = vec![crate::types::ShardId::new(0), crate::types::ShardId::new(1)];
         assert_eq!(monitor_shard_scope(None, &all), all);
-        assert!(monitor_shard_scope(None, &[]).is_empty());
+        assert_eq!(
+            monitor_shard_scope(None, &[]),
+            [] as [crate::types::ShardId; 0]
+        );
     }
 
     /// The multi-shard loop bounds its pool acquisition; the single-shard path
@@ -35144,7 +35362,10 @@ mod tests {
         let resolved = resolved_external_ids(&new_events);
         assert!(!resolved.is_empty());
         assert_eq!(resolved.signal_ids, vec![sid]);
-        assert!(resolved.cancel_ids.is_empty());
+        assert_eq!(
+            resolved.cancel_ids,
+            [] as [crate::types::ExternalCancelId; 0]
+        );
     }
 
     #[test]
@@ -35157,7 +35378,10 @@ mod tests {
         let resolved = resolved_external_ids(&new_events);
         assert!(!resolved.is_empty());
         assert_eq!(resolved.cancel_ids, vec![cid]);
-        assert!(resolved.signal_ids.is_empty());
+        assert_eq!(
+            resolved.signal_ids,
+            [] as [crate::types::ExternalSignalId; 0]
+        );
     }
 
     #[test]
@@ -35209,7 +35433,10 @@ mod tests {
         ];
         let resolved = resolved_external_ids(&new_events);
         assert_eq!(resolved.signal_ids, vec![sid_a]);
-        assert!(resolved.cancel_ids.is_empty());
+        assert_eq!(
+            resolved.cancel_ids,
+            [] as [crate::types::ExternalCancelId; 0]
+        );
     }
 
     #[test]
@@ -35233,8 +35460,14 @@ mod tests {
         ];
         let resolved = resolved_external_ids(&new_events);
         assert_eq!(resolved.await_ids, vec![aid]);
-        assert!(resolved.signal_ids.is_empty());
-        assert!(resolved.cancel_ids.is_empty());
+        assert_eq!(
+            resolved.signal_ids,
+            [] as [crate::types::ExternalSignalId; 0]
+        );
+        assert_eq!(
+            resolved.cancel_ids,
+            [] as [crate::types::ExternalCancelId; 0]
+        );
     }
 
     // ── inline-vs-outbox await terminal de-duplication (issue #757 review, P1) ──
@@ -36383,7 +36616,10 @@ mod tests {
             batch.children.is_empty(),
             "a detached spawn is NOT an awaited child"
         );
-        assert!(batch.activity_waits.is_empty());
+        assert_eq!(
+            batch.activity_waits,
+            [] as [crate::types::ActivityExecId; 0]
+        );
         assert!(!batch.waits_on_signal);
     }
 
@@ -37134,7 +37370,7 @@ mod tests {
             ..default_runtime_config()
         };
         let worker = Worker::new(cfg, registry.clone()).unwrap();
-        assert!(worker.ineligible_activities.is_empty());
+        assert_eq!(worker.ineligible_activities, [] as [std::string::String; 0]);
 
         // Worker with cpu only, region = us-east-1 (act_gpu is ineligible)
         let mut labels = std::collections::HashMap::new();
@@ -39814,6 +40050,32 @@ mod tests {
     }
 
     #[test]
+    fn deadlock_strikes_count_up_clear_and_expire() {
+        let strikes = DeadlockStrikes::default();
+        let exec = uuid::Uuid::new_v4();
+        assert_eq!(strikes.record(exec), 1);
+        assert_eq!(strikes.record(exec), 2);
+        strikes.clear(exec);
+        assert_eq!(strikes.record(exec), 1);
+        // An entry older than the TTL counts as reset and is pruned.
+        let other = uuid::Uuid::new_v4();
+        let later = std::time::Instant::now() + DEADLOCK_STRIKE_TTL + Duration::from_secs(1);
+        assert_eq!(strikes.record_at(other, later), 1);
+        assert_eq!(strikes.record_at(exec, later), 1);
+    }
+
+    #[test]
+    fn deadlock_retry_backoff_starts_at_base_doubles_and_caps() {
+        // Issue #1797: 5 s, doubling, capped at 300 s; `0` clamps to the base.
+        assert_eq!(deadlock_retry_backoff(1), Duration::from_secs(5));
+        assert_eq!(deadlock_retry_backoff(2), Duration::from_secs(10));
+        assert_eq!(deadlock_retry_backoff(3), Duration::from_secs(20));
+        assert_eq!(deadlock_retry_backoff(0), Duration::from_secs(5));
+        assert_eq!(deadlock_retry_backoff(7), Duration::from_secs(300));
+        assert_eq!(deadlock_retry_backoff(u32::MAX), Duration::from_secs(300));
+    }
+
+    #[test]
     fn panic_retry_decision_truth_table() {
         // Default budget of 3: panics 1 and 2 re-dispatch, panic 3 is terminal.
         assert_eq!(panic_retry_decision(1, 3), PanicRetryDecision::Requeue);
@@ -40443,7 +40705,14 @@ mod tests {
             name: "m".into(),
             details: Value::Null,
         }];
-        assert!(collect_update_result_metrics(&history, &cmds).is_empty());
+        assert_eq!(
+            collect_update_result_metrics(&history, &cmds),
+            [] as [(
+                std::string::String,
+                bool,
+                std::option::Option<chrono::DateTime<chrono::Utc>>
+            ); 0]
+        );
     }
 
     #[test]

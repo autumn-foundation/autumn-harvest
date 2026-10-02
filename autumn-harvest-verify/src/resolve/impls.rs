@@ -351,7 +351,7 @@ mod tests {
         let header = parse_impl_header("impl Plan for HashSet<String>").expect("header");
         assert_eq!(header.trait_.as_deref(), Some("Plan"));
         assert_eq!(header.self_ty, "HashSet<String>");
-        assert!(header.generics.is_empty());
+        assert_eq!(header.generics, [] as [std::string::String; 0]);
     }
 
     #[test]

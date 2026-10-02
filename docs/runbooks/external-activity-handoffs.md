@@ -75,7 +75,7 @@ Output from stdin:
 printf '{"approved":true}' | harvest handoff complete <TOKEN> --output-file -
 ```
 
-API:
+API (outside `dev`, the caller needs a credential, issue #1802):
 
 ```text
 POST /activities/external/<TOKEN>/complete

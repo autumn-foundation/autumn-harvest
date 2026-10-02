@@ -1137,6 +1137,7 @@ Shard coverage is configured in **Rust**, not in `autumn.toml` — there is no
 plugin-hosted app is always single-shard. `HarvestEmbedding` (issue #1613) is the
 standalone entry point for a multi-shard process. It needs one result-notification
 database URL per shard, and it refuses to start when a shard has none.
+[`embedding.md`](embedding.md) is the reference for the standalone path.
 
 ```rust
 use autumn_harvest::types::ShardId;

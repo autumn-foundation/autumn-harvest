@@ -2148,7 +2148,7 @@ mod tests {
         assert_eq!(rotate(&queues, 1), vec!["b", "c", "a"]);
         assert_eq!(rotate(&queues, 2), vec!["c", "a", "b"]);
         assert_eq!(rotate(&queues, 3), vec!["a", "b", "c"], "the offset wraps");
-        assert!(rotate::<String>(&[], 5).is_empty());
+        assert_eq!(rotate::<String>(&[], 5), [] as [std::string::String; 0]);
     }
 
     /// `next_inner` rotates `(queue, key)` pairs, not two separately

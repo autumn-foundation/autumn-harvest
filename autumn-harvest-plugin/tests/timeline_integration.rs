@@ -317,7 +317,7 @@ async fn seed_running(conn: &mut AsyncPgConnection, workflow_id: &str) -> Execut
             workflow_name: "timeline-wf",
             workflow_id,
             exec_id,
-            input: json!({"n": 1}),
+            input: json!({"n": 1}).into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,

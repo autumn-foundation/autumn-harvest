@@ -159,7 +159,7 @@ async fn seed_execution(
         workflow_id: &wf_id,
         run_id: Uuid::new_v4(),
         shard_id: shard,
-        input: serde_json::json!({}),
+        input: serde_json::json!({}).into(),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
@@ -421,5 +421,5 @@ async fn one_shard_down_is_partial_not_500() {
         "the down shard is named in the report"
     );
     assert_eq!(unavailable[0]["shard_id"], 1);
-    assert!(!unavailable[0]["reason"].as_str().unwrap().is_empty());
+    assert_ne!(unavailable[0]["reason"].as_str().unwrap(), "");
 }

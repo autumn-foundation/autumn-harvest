@@ -178,7 +178,7 @@ async fn seed_canary_execution(
         workflow_id: &wf_id,
         run_id: Uuid::new_v4(),
         shard_id: 0,
-        input: serde_json::json!({ "queue": queue }),
+        input: serde_json::json!({ "queue": queue }).into(),
         parent_id: None,
         queue_name: queue,
         execution_timeout: None,
@@ -289,7 +289,10 @@ async fn admin_canary_reports_fresh_probe() {
         probe["last_roundtrip_ms"].as_i64().unwrap() >= 0,
         "roundtrip present: {probe}"
     );
-    assert!(body["unavailable_shards"].as_array().unwrap().is_empty());
+    assert_eq!(
+        body["unavailable_shards"].as_array().unwrap().as_slice(),
+        [] as [serde_json::Value; 0]
+    );
 }
 
 // ── (c) stale probe ─────────────────────────────────────────────────────────

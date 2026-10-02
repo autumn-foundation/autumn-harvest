@@ -340,14 +340,15 @@ ack, it refuses; with the ack, it still only reads.
   pulls the visible restore point back to before `fired_at`, misreading a
   coherent restore as `completion_trigger_fire_lost`. Enabling
   `harvest_execution_summaries` closes this, since it is checked first and
-  wins regardless of the timestamp — but only within the summary's OWN
-  retention horizon (`--summary-age`). `harvest_completion_trigger_fires`
-  has no cleanup path, so a fire outlives its target's summary once that
-  summary ages out. This gap is not limited to summaries being disabled:
-  it recurs for old fires under ANY finite summary horizon. Closing it
-  unconditionally needs a genuine durable restore-point marker — exactly
-  the durable-marker work issue #1401 chose not to require. Tracked as a
-  possible follow-up: tying fires-table retention to the summary horizon.
+  wins regardless of the timestamp — but only within the summary's own
+  retention horizon (`--summary-age`). With a finite horizon, retention
+  deletes a fire row at the same horizon (issue #1676), so a fire does not
+  normally outlive its target's summary. A fire stays while its outbox row
+  or its source execution row exists. The source row can outlive the summary
+  when `--summary-age` is not above the history horizon. The residual gap
+  remains when summaries are disabled: no summary exists to prove the fire,
+  and retention never deletes a fire row. With unbounded summaries the gap
+  does not occur, but fire rows also stay.
 
   **Pre-migration fires** (rows written before `20260920215812` shipped)
   carry no recorded `target_shard`/`target_workflow_name` and fall back to

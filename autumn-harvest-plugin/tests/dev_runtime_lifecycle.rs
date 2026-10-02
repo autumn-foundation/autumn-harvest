@@ -99,7 +99,8 @@ impl Drop for EnvVarGuard {
 /// `AUTUMN_IS_DEBUG` (Codex review, issue #1291), so this unsets that too.
 /// Otherwise an inherited `AUTUMN_IS_DEBUG=1`/`0` could still select a
 /// profile and reopen the same checkout-root fallback for its file.
-fn harvest_mode_env_cleared() -> [EnvVarGuard; 5] {
+/// `AUTUMN_ENV` selects a profile first (issue #1614), so this unsets it too.
+fn harvest_mode_env_cleared() -> [EnvVarGuard; 6] {
     let manifest_dir = std::env::temp_dir().join(format!(
         "autumn-harvest-plugin-embedded-manifest-{}",
         uuid::Uuid::new_v4()
@@ -110,6 +111,7 @@ fn harvest_mode_env_cleared() -> [EnvVarGuard; 5] {
     [
         EnvVarGuard::unset("AUTUMN_HARVEST__MODE"),
         EnvVarGuard::unset("AUTUMN_HARVEST_DATABASE__URL"),
+        EnvVarGuard::unset("AUTUMN_ENV"),
         EnvVarGuard::unset("AUTUMN_IS_DEBUG"),
         EnvVarGuard::unset("AUTUMN_PROFILE"),
         EnvVarGuard::set("AUTUMN_MANIFEST_DIR", &manifest_dir),
