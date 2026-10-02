@@ -28,7 +28,7 @@
 //! run then executes nothing). Every DB-gated test must either have a covering
 //! `linux`/`allos` manifest row or be listed — with a reason — in `ALLOWLIST`.
 //! `ALLOWLIST` is fail-closed debt to SHRINK by adding manifest rows, not to
-//! grow (a soft ratchet caps its length below).
+//! grow. A hard ratchet holds its cap equal to its length (see below).
 //!
 //! A NEW assertion guards against the manifest being silently ignored: `ci.yml`
 //! must actually invoke the runner against the manifest, else the guard would
@@ -178,8 +178,8 @@ fn is_db_harness_only(source: &str) -> bool {
 //
 // Keyed `core:<module>` / `plugin:<file-stem>`. Every entry carries a reason.
 // Seeded fail-closed with the tests that currently lack a covering manifest row
-// so the guard is green on commit. SHRINK this by adding manifest rows; the
-// ratchet below forbids silent growth. This guard PROVED it bites: during
+// so the guard is green on commit. SHRINK this by adding manifest rows. The
+// ratchet below forbids silent growth. An entry that a row covers is stale. This guard PROVED it bites: during
 // development `nd_block_tests` was left out and the guard failed naming it (the
 // TDD red step). `nd_block_tests`, `worker_session_tests`, and the plugin
 // `build_ramp_integration` suites are wired (they have `linux` manifest rows),
@@ -226,26 +226,20 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ("core:chaos_tests", ALLOWLIST_CHAOS_REASON),
     ("core:child_policy_tests", ALLOWLIST_DEBT_REASON),
     ("core:cross_workflow_cancel_tests", ALLOWLIST_DEBT_REASON),
-    ("core:cross_workflow_signal_tests", ALLOWLIST_DEBT_REASON),
     ("core:debounce_tests", ALLOWLIST_DEBT_REASON),
     ("core:delayed_start_tests", ALLOWLIST_DEBT_REASON),
     ("core:legal_hold_tests", ALLOWLIST_DEBT_REASON),
     ("core:payload_offload_db_tests", ALLOWLIST_DEBT_REASON),
-    ("core:poison_pill_tests", ALLOWLIST_DEBT_REASON),
     ("core:queue_fairness_tests", ALLOWLIST_DEBT_REASON),
     ("core:replay_canary_tests", ALLOWLIST_TESTING_REASON),
-    ("core:replayer_integration_tests", ALLOWLIST_TESTING_REASON),
     ("core:retry_now_tests", ALLOWLIST_DEBT_REASON),
     ("core:schedule_decisions", ALLOWLIST_DEBT_REASON),
     ("core:schedule_to_close_tests", ALLOWLIST_DEBT_REASON),
     ("core:schedule_update_tests", ALLOWLIST_DEBT_REASON),
     ("core:scheduled_time_tests", ALLOWLIST_TESTING_REASON),
-    ("core:scheduler_auto_pause_tests", ALLOWLIST_DEBT_REASON),
     ("core:scheduler_bounded_runs_tests", ALLOWLIST_DEBT_REASON),
     ("core:scheduler_carryover_tests", ALLOWLIST_TESTING_REASON),
     ("core:scheduler_catchup_tests", ALLOWLIST_DEBT_REASON),
-    ("core:scheduler_ha_tests", ALLOWLIST_DEBT_REASON),
-    ("core:signal_tests", ALLOWLIST_DEBT_REASON),
     ("core:signal_with_start_tests", ALLOWLIST_DEBT_REASON),
     ("core:sla_breach_tests", ALLOWLIST_DEBT_REASON),
     ("core:sticky_routing_tests", ALLOWLIST_DEBT_REASON),
@@ -256,14 +250,12 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ("core:updt_with_start_tests", ALLOWLIST_DEBT_REASON),
     // ── plugin (autumn-harvest-plugin/tests) ──
     ("plugin:archival_integration", ALLOWLIST_DEBT_REASON),
-    ("plugin:batch_operations_integration", ALLOWLIST_DEBT_REASON),
     ("plugin:build_routing_ui_integration", ALLOWLIST_DEBT_REASON),
     (
         "plugin:connector_kafka_broker",
         ALLOWLIST_KAFKA_BROKER_REASON,
     ),
     ("plugin:dag_retry_integration", ALLOWLIST_DEBT_REASON),
-    ("plugin:erase_payloads_integration", ALLOWLIST_DEBT_REASON),
     ("plugin:event_batch_integration", ALLOWLIST_DEBT_REASON),
     (
         "plugin:external_handoffs_integration",
@@ -307,18 +299,17 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ("plugin:workflow_result_integration", ALLOWLIST_DEBT_REASON),
 ];
 
-/// Soft ratchet: the allowlist may shrink but must never silently grow. Bump
-/// this ONLY with a deliberate justification (it should trend toward zero).
-/// 74 = the prior 77 minus the three wired to covering `linux` manifest rows
-/// (each was a test-harness bug, now fixed, so the whole module runs green):
-/// `core:workflow_retry_tests` (its `::workflow_typed` sub-filter is replaced by
-/// a whole-module row), `core:completion_callback_tests`, and
-/// `core:event_batch_tests`. 73 = minus `plugin:workflow_reachability_integration`,
-/// now wired to a covering `linux` manifest row (issue #700).
-/// 75 = plus `core:chaos_tests` (issue #940). It runs in the nightly
-/// `.github/workflows/chaos.yml` job, not in the manifest `test` job.
-/// `chaos_workflow_runs_the_chaos_suite_nightly` checks that claim.
-const ALLOWLIST_MAX_LEN: usize = 75;
+/// Hard ratchet: the cap must equal `ALLOWLIST.len()` (issue #1799).
+///
+/// When you wire a suite, remove its entry and lower this number. To add an
+/// entry, raise this number in the same change and give the reason there.
+/// A cap above the length would let the list grow back without review.
+///
+/// History: 77, then 73 after four suites were wired. Then 75 with
+/// `core:chaos_tests` (issue #940), which runs nightly in `chaos.yml`.
+/// Then 55: issue #1799 wired five suites. It also removed three entries
+/// for suites that CI already ran.
+const ALLOWLIST_MAX_LEN: usize = 55;
 
 fn allowlisted(key: &str) -> bool {
     ALLOWLIST.iter().any(|&(k, _)| k == key)
@@ -431,9 +422,8 @@ fn parse_manifest() -> Vec<SuiteRow> {
 
 /// A core `integration` submodule is covered iff some executing (`linux`/`allos`)
 /// manifest row enables `db` (so the module compiles + its tests exist), carries
-/// `testing` when the module needs it, and targets it whole (a whole-target run,
-/// or a filter whose first `::`-segment prefixes the module name — a partial
-/// `module::test` filter never credits the whole module).
+/// `testing` when the module needs it, and targets it whole. See
+/// [`filter_runs_whole_module`] for which filters select a whole module.
 ///
 /// `autumn-harvest` has `default = ["db", "unified-dag-execution", "tls"]`; the runner
 /// keeps defaults for `linux`/`linuxpart` integration rows (Docker Postgres) and strips them
@@ -455,16 +445,18 @@ fn core_covers(rows: &[SuiteRow], module: &str, needs_testing: bool) -> bool {
         if needs_testing && !has_testing {
             return false;
         }
-        if r.filter == "-" {
-            return true; // whole target
-        }
-        if r.filter.contains("::") {
-            return false; // partial slice — no whole-module credit
-        }
-        // No `::` here (guarded above), so the whole filter is the module segment.
-        let seg = r.filter.as_str();
-        module == seg || module.starts_with(seg)
+        filter_runs_whole_module(&r.filter, module)
     })
+}
+
+/// True when a row with `filter` runs every test in `module`.
+///
+/// libtest matches a filter as a substring of the full test path
+/// (`module::test_fn`). A filter without `::` that occurs in the module name
+/// thus selects the whole module. A filter with `::` can select a slice, so
+/// it never credits the whole module. `-` selects the whole target.
+fn filter_runs_whole_module(filter: &str, module: &str) -> bool {
+    filter == "-" || (!filter.contains("::") && module.contains(filter))
 }
 
 // ── mod.rs parsing: (module, needs_testing) ─────────────────────────────────
@@ -1122,7 +1114,7 @@ fn core_module_executes(rows: &[SuiteRow], module: &str, required: &BTreeSet<Str
         if r.krate != "autumn-harvest" || r.target != "integration" || !r.runs() {
             return false;
         }
-        if !(r.filter == "-" || (!r.filter.contains("::") && module.starts_with(&r.filter))) {
+        if !filter_runs_whole_module(&r.filter, module) {
             return false;
         }
         let feats = core_row_features(r);
