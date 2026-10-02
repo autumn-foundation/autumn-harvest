@@ -253,8 +253,12 @@ impl RetryBudgetRegistry {
     pub fn cancel_deferral(&self, activity_name: &str, reservation: SlotReservation, now: Instant) {
         self.with_bucket(activity_name, now, |bucket, _| {
             // A slot that has passed needs no rollback, and an old entry
-            // can never become the tail again.
+            // can never become the tail again. The gate ignores a tail that
+            // has passed, so such a slot is not stored.
             bucket.cancelled.retain(|r| r.slot > now);
+            if reservation.slot <= now {
+                return;
+            }
             bucket.cancelled.push(reservation);
             // Walk back from the tail through every cancelled slot.
             while let Some(i) = bucket
@@ -738,6 +742,32 @@ mod tests {
         reg.cancel_deferral(A, second, now);
         let next = retry_after(reg.admit(A, true, now));
         assert_eq!(next, first_wait, "both cancelled slots must be free");
+    }
+
+    /// A cancelled slot that has already passed is not stored. A later live
+    /// deferral can stay the tail, so nothing would remove that entry.
+    #[test]
+    fn cancelling_a_passed_slot_stores_nothing() {
+        let reg = registry(RetryBudgetPolicy::new(0.0, 1.0, 2.0));
+        let now = Instant::now();
+        assert_eq!(drain(&reg, A, now), 1);
+        let reserve = |reg: &RetryBudgetRegistry| match reg.admit(A, true, now) {
+            Admission::Deferred {
+                reservation: Some(reservation),
+                ..
+            } => reservation,
+            other => panic!("expected a reserved deferral, got {other:?}"),
+        };
+        let first = reserve(&reg);
+        let _live_tail = reserve(&reg);
+        reg.cancel_deferral(A, first, first.slot);
+        let stored = reg
+            .buckets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(A)
+            .map(|bucket| bucket.cancelled.len());
+        assert_eq!(stored, Some(0), "a passed slot must not be stored");
     }
 
     /// Records every gauge sample, in order.
