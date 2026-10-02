@@ -20,6 +20,8 @@
 //! seed and the fired-action trace, so a failure is replayable with one command
 //! (`CHAOS_SEEDS=<seed> cargo test --features chaos ...`).
 
+mod infra_faults;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1587,6 +1589,57 @@ async fn assert_converged(url: &str, seed: u64, execs: &[ExecutionId], diag: &st
         dangling, 0,
         "seed {seed}: no ExternalSignalRequested without a terminal; {diag}"
     );
+}
+
+/// Oracle self-test (issue #1801): a forged second terminal event must fail
+/// [`assert_converged`]. The table key is `(workflow_exec_id, event_id)`, so a
+/// duplicate at a new event id passes the key. Only the oracle catches it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::significant_drop_tightening)]
+async fn oracle_flags_a_duplicate_terminal_event() {
+    use futures::FutureExt;
+
+    let (_body, url, _c) = chaos_db().await;
+    let registry = Arc::new(HandlerRegistry::new(vec![chaos_noop_info()], vec![]));
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let mut conn = connect(&url).await;
+    let params = base_params("chaos_noop", "oracle-dup", exec_id, serde_json::json!(null));
+    autumn_harvest::execution::start_or_load_workflow_execution(&mut conn, params, None)
+        .await
+        .expect("start");
+    let task = autumn_harvest::queue::claim_task(
+        &mut conn,
+        &["default".to_string()],
+        "oracle-w",
+        "",
+        None,
+        &[],
+        &[],
+    )
+    .await
+    .expect("claim")
+    .expect("a task is due");
+    let _ = chaos_drive_one_workflow_task(&url, Arc::clone(&registry), task, "oracle-w".into())
+        .await;
+
+    // The clean history converges.
+    assert_converged(&url, 0, &[exec_id], "clean").await;
+
+    // Forge a second `WorkflowCompleted` at the next event id.
+    conn.batch_execute(&format!(
+        "INSERT INTO harvest_events (workflow_exec_id, event_id, event_type, event_data, timestamp) \
+         SELECT workflow_exec_id, event_id + 1000, event_type, event_data, timestamp \
+         FROM harvest_events WHERE workflow_exec_id = '{}' AND event_type = 'WorkflowCompleted'",
+        exec_id.as_uuid()
+    ))
+    .await
+    .expect("forge duplicate terminal event");
+
+    let caught = std::panic::AssertUnwindSafe(assert_converged(&url, 0, &[exec_id], "forged"))
+        .catch_unwind()
+        .await
+        .is_err();
+    assert!(caught, "the oracle must flag a duplicate terminal event");
 }
 
 /// Count `RUNNING` tasks whose `worker_id` has no live `harvest_workers`
