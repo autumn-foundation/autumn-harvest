@@ -3688,6 +3688,63 @@ pub async fn requeue_workflow_task_after_panic(
         .await
 }
 
+/// Re-pend a deadlocked workflow task under its claim (issue #1797).
+///
+/// Writes the same columns as [`requeue_workflow_task_after_panic`]. The
+/// update also requires `claim` to be current. A deadlocked cycle runs for at
+/// least [`crate::executor::DEADLOCK_TIMEOUT`], so a reclaim can move the row
+/// in the meantime. A stale dispatcher then writes nothing.
+///
+/// Returns `Ok(false)` when the claim is no longer held.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on update failure.
+pub async fn requeue_claimed_workflow_task_after_deadlock(
+    conn: &mut AsyncPgConnection,
+    claim: &TaskClaim,
+    delay: chrono::Duration,
+    reason: &str,
+) -> HarvestResult<bool> {
+    use crate::schema::harvest_task_queue::dsl;
+    use diesel::dsl::sql;
+    use diesel::sql_types::{Double, Timestamptz};
+
+    let changeset = PendingRequeueChangeset::new(reason.to_string());
+
+    let update = diesel::update(
+        dsl::harvest_task_queue
+            .find(claim.task_id)
+            .filter(dsl::state.eq("RUNNING"))
+            .filter(dsl::task_type.eq("workflow")),
+    )
+    .set((
+        changeset,
+        dsl::scheduled_at.eq(
+            sql::<Timestamptz>("clock_timestamp() + make_interval(secs => ")
+                .bind::<Double, _>(delay_secs(delay))
+                .sql(")"),
+        ),
+        dsl::sticky_worker_id.eq(None::<String>),
+        dsl::sticky_until.eq(None::<chrono::DateTime<Utc>>),
+        dsl::sticky_timeout.eq(None::<chrono::Duration>),
+        dsl::wake_requested.eq(false),
+        dsl::activity_name.eq(None::<String>),
+        dsl::timer_fires_at.eq(None::<chrono::DateTime<Utc>>),
+    ))
+    .into_boxed();
+    let updated = fence(update, Some(claim))
+        .returning((dsl::queue_name, dsl::priority, dsl::scheduled_at))
+        .get_results::<(String, i32, chrono::DateTime<Utc>)>(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    if updated.is_empty() {
+        return Ok(false);
+    }
+    finish_workflow_backoff_requeue(claim.task_id, updated)?;
+    Ok(true)
+}
+
 // ---------------------------------------------------------------------------
 // force_retry_activity_now (issue #516)
 // ---------------------------------------------------------------------------

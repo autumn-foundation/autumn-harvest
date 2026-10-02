@@ -33485,13 +33485,11 @@ async fn run_replay_canary_handler(
 ///     The `query_timeout` bound applies to async-yielding replays; a workflow
 ///     function that busy-loops synchronously without ever `.await`-ing is out of
 ///     scope, exactly as for the live executor. A large but healthy history is
-///     not at risk: `SUSPENSION_TIMEOUT` (the executor's per-cycle 100 ms
-///     suspension heuristic) only fires when the handler future is genuinely
-///     *pending* on an unresolved oneshot at the replay frontier — it never cuts
-///     off a CPU-bound replay consuming recorded events, so a completed history
-///     replays to its verdict regardless of wall-clock duration, bounded only by
-///     this outer `query_timeout` (ample headroom for the ~<200 ms/10k-event
-///     replay budget, issue #135).
+///     not at risk. The executor suspends only when the handler is pending on
+///     a parked Harvest future (issue #1797). It never cuts off a CPU-bound
+///     replay that consumes recorded events. A completed history therefore
+///     replays to its verdict, bounded only by this outer `query_timeout`. That
+///     gives ample headroom for the ~<200 ms/10k-event replay budget (issue #135).
 ///   * `410` — history unavailable: a terminal execution whose recorded history
 ///     is incomplete (truncated before its terminal seal — pruned by retention
 ///     or released on reset), or a terminal execution whose payloads were
