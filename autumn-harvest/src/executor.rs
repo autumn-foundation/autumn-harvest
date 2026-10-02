@@ -3855,10 +3855,7 @@ mod tests {
             matches!(outcome, WorkflowOutcome::TaskFailed { .. }),
             "got {outcome:?}"
         );
-        assert!(
-            pending.is_empty(),
-            "a deadlocked cycle must drop {pending:?}"
-        );
+        assert_eq!(pending.len(), 0, "a deadlocked cycle must drop {pending:?}");
     }
 
     /// Spends longer than the deadlock timeout on CPU, then waits briefly on
