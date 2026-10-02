@@ -5868,3 +5868,31 @@ async fn a_valid_index_in_another_schema_does_not_hide_a_missing_one() {
     .expect("count");
     assert_eq!(rows.into_iter().next().map(|r| r.n), Some(1));
 }
+
+/// A short session `lock_timeout` must not break the build while a conflicting
+/// table lock is held for a moment. The old value comes back afterwards.
+#[tokio::test]
+async fn a_short_session_lock_timeout_does_not_break_the_build() {
+    let (mut conn, url, _c) = make_conn_any().await;
+    let mut holder = diesel_async::AsyncPgConnection::establish(&url)
+        .await
+        .expect("second session");
+    holder
+        .batch_execute("BEGIN; LOCK TABLE harvest_audit_log IN SHARE ROW EXCLUSIVE MODE;")
+        .await
+        .expect("hold lock");
+    conn.batch_execute("SET lock_timeout = '100ms'")
+        .await
+        .expect("set timeout");
+    let release = async {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        holder.batch_execute("COMMIT").await.expect("commit");
+    };
+    let (built, ()) = tokio::join!(
+        autumn_harvest::audit_export::ensure_unexported_index(&mut conn),
+        release
+    );
+    built.expect("ensure");
+    assert_eq!(setting(&mut conn, "lock_timeout").await, "100ms");
+    assert_eq!(unexported_idx_state(&mut conn).await, Some(true));
+}

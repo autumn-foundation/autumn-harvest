@@ -1276,35 +1276,49 @@ async fn build_unexported_index(
     }
 
     // A role or database timeout shorter than the build would fail it on every
-    // try. The drop of an invalid index waits for old snapshots too, so the
-    // override covers both statements. Capture the session value first and
-    // restore that exact value after. `RESET` would restore the role or
-    // database default instead.
-    let previous: Vec<Setting> =
-        diesel::sql_query("SELECT current_setting('statement_timeout') AS value")
-            .load(conn)
+    // try. A short `lock_timeout` fails the concurrent statements the same
+    // way while they wait for a conflicting lock. The drop of an invalid index
+    // waits like the build, so the override covers both statements. Capture
+    // each session value first and restore that exact value after. `RESET`
+    // would restore the role or database default instead.
+    const OVERRIDDEN: [&str; 2] = ["statement_timeout", "lock_timeout"];
+    let mut previous = Vec::with_capacity(OVERRIDDEN.len());
+    for name in OVERRIDDEN {
+        let value: Vec<Setting> =
+            diesel::sql_query(format!("SELECT current_setting('{name}') AS value"))
+                .load(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+        previous.push(
+            value
+                .into_iter()
+                .next()
+                .map_or_else(|| "0".to_owned(), |row| row.value),
+        );
+    }
+    for name in OVERRIDDEN {
+        diesel::sql_query(format!("SET {name} = 0"))
+            .execute(conn)
             .await
             .map_err(crate::error::database_error)?;
-    let previous = previous
-        .into_iter()
-        .next()
-        .map_or_else(|| "0".to_owned(), |row| row.value);
-    diesel::sql_query("SET statement_timeout = 0")
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error)?;
+    }
     let built = repair_and_build_unexported_index(conn).await;
-    let restored = diesel::sql_query("SELECT set_config('statement_timeout', $1, false)")
-        .bind::<diesel::sql_types::Text, _>(previous)
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error);
+    let mut restored = Ok(());
+    for (name, value) in OVERRIDDEN.into_iter().zip(previous) {
+        let result = diesel::sql_query(format!("SELECT set_config('{name}', $1, false)"))
+            .bind::<diesel::sql_types::Text, _>(value)
+            .execute(conn)
+            .await
+            .map(|_| ())
+            .map_err(crate::error::database_error);
+        restored = restored.and(result);
+    }
     built?;
     restored?;
     Ok(())
 }
 
-/// Drop an invalid index, then build it. The caller disables the timeout.
+/// Drop an invalid index, then build it. The caller disables the timeouts.
 #[cfg(feature = "db")]
 async fn repair_and_build_unexported_index(
     conn: &mut diesel_async::AsyncPgConnection,
