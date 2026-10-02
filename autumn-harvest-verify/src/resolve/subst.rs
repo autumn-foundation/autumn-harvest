@@ -317,7 +317,7 @@ mod tests {
             turbofish("LocalKey::<RefCell<u64>>::with::<{closure@s.rs:1:1: 1:2}, u64>"),
             vec!["{closure@s.rs:1:1: 1:2}".to_string(), "u64".to_string()]
         );
-        assert!(turbofish("SystemTime::now").is_empty());
+        assert_eq!(turbofish("SystemTime::now"), [] as [std::string::String; 0]);
     }
 
     #[test]
