@@ -18,6 +18,15 @@ pub const DEFAULT_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
 /// The shortest accepted time between two samples.
 pub const MIN_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 
+/// The longest accepted time between two samples.
+///
+/// The sampler timers add the interval, or a small multiple of it, to the
+/// current instant. An unbounded interval overflows that sum and panics the
+/// sampler task. One hour keeps every such deadline finite. It is also far
+/// above any useful cadence, because the gate ignores a state older than
+/// [`STALE_AFTER_SAMPLES`] intervals.
+pub const MAX_SAMPLE_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
 /// The gate ignores a state older than this many sample intervals.
 ///
 /// The gate then admits starts. It fails open, so a dead sampler cannot keep a
@@ -175,11 +184,14 @@ impl LoadShedConfig {
 
     /// Set the sample interval.
     ///
-    /// The setter raises a value below [`MIN_SAMPLE_INTERVAL`] to that minimum.
-    /// Each sample runs one query per shard pool.
+    /// The setter clamps the value to the range from [`MIN_SAMPLE_INTERVAL`]
+    /// to [`MAX_SAMPLE_INTERVAL`]. A value below the minimum becomes the
+    /// minimum. A value above the maximum becomes the maximum. The upper
+    /// bound keeps every sampler timer deadline finite. Each sample runs one
+    /// query per shard pool.
     #[must_use]
     pub fn with_sample_interval(mut self, interval: Duration) -> Self {
-        self.sample_interval = interval.max(MIN_SAMPLE_INTERVAL);
+        self.sample_interval = interval.clamp(MIN_SAMPLE_INTERVAL, MAX_SAMPLE_INTERVAL);
         self
     }
 
@@ -197,17 +209,22 @@ impl LoadShedConfig {
     }
 
     /// The time between two samples.
+    ///
+    /// The value is always inside [`MIN_SAMPLE_INTERVAL`] and
+    /// [`MAX_SAMPLE_INTERVAL`].
     #[must_use]
     pub const fn sample_interval(&self) -> Duration {
         self.sample_interval
     }
 
     /// The age after which the gate ignores a state.
+    ///
+    /// This is [`STALE_AFTER_SAMPLES`] sample intervals. The interval bound
+    /// keeps the product below three hours, so a timer deadline built from it
+    /// cannot overflow.
     #[must_use]
-    pub fn stale_after(&self) -> Duration {
-        self.sample_interval
-            .checked_mul(STALE_AFTER_SAMPLES)
-            .unwrap_or(Duration::MAX)
+    pub const fn stale_after(&self) -> Duration {
+        self.sample_interval.saturating_mul(STALE_AFTER_SAMPLES)
     }
 
     /// The policy for `queue`, if any.
@@ -383,6 +400,7 @@ pub async fn sample_once(
         return true;
     }
     let queues = config.queues();
+    // The interval is at most `MAX_SAMPLE_INTERVAL`, so this deadline is finite.
     let read_timeout = config.sample_interval().saturating_mul(2);
     let read = tokio::time::timeout(
         read_timeout,
@@ -693,9 +711,55 @@ mod tests {
     }
 
     #[test]
-    fn stale_after_saturates() {
+    fn sample_interval_above_max_clamps_to_max() {
         let c = LoadShedConfig::new().with_sample_interval(Duration::MAX);
-        assert_eq!(c.stale_after(), Duration::MAX);
+        assert_eq!(c.sample_interval(), MAX_SAMPLE_INTERVAL);
+        assert_eq!(c.stale_after(), MAX_SAMPLE_INTERVAL * STALE_AFTER_SAMPLES);
+    }
+
+    #[test]
+    fn sample_interval_at_max_is_accepted() {
+        let c = LoadShedConfig::new().with_sample_interval(MAX_SAMPLE_INTERVAL);
+        assert_eq!(c.sample_interval(), MAX_SAMPLE_INTERVAL);
+        let just_above = MAX_SAMPLE_INTERVAL + Duration::from_nanos(1);
+        let c = LoadShedConfig::new().with_sample_interval(just_above);
+        assert_eq!(c.sample_interval(), MAX_SAMPLE_INTERVAL);
+    }
+
+    /// The sampler adds the interval and its multiples to the clock. Every
+    /// such sum must stay finite for the largest accepted interval.
+    #[test]
+    fn bounded_multiples_never_overflow_a_deadline() {
+        let c = LoadShedConfig::new().with_sample_interval(Duration::MAX);
+        let now = Instant::now();
+        assert!(now.checked_add(c.sample_interval()).is_some());
+        assert!(
+            now.checked_add(c.sample_interval().saturating_mul(2))
+                .is_some()
+        );
+        assert!(now.checked_add(c.stale_after()).is_some());
+        assert!(c.stale_after() < Duration::MAX);
+    }
+
+    /// `Duration::MAX` reaches the real tokio timers through the clamp. The
+    /// interval must tick and the timeouts must resolve without a panic.
+    #[tokio::test(start_paused = true)]
+    async fn sampler_timers_accept_a_clamped_max_interval() {
+        let c = LoadShedConfig::new()
+            .with_sample_interval(Duration::MAX)
+            .queue("q", policy());
+        assert!(c.is_enabled());
+        let mut ticks = tokio::time::interval(c.sample_interval());
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticks.tick().await;
+        ticks.tick().await;
+        let read_timeout = c.sample_interval().saturating_mul(2);
+        let read = tokio::time::timeout(read_timeout, std::future::ready(1)).await;
+        assert_eq!(read, Ok(1));
+        let write = tokio::time::timeout(c.sample_interval(), std::future::ready(2)).await;
+        assert_eq!(write, Ok(2));
+        let stale = tokio::time::timeout(c.stale_after(), std::future::ready(3)).await;
+        assert_eq!(stale, Ok(3));
     }
 
     #[test]

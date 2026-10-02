@@ -27,6 +27,9 @@ Design decisions:
   `Retry-After`. A non-atomic batch reports each shed item as `rejected`.
 - The gate fails open. A failed or slow sample changes no state. The gate
   ignores a state older than three sample intervals and then admits starts.
+- `with_sample_interval` clamps the interval to the range from 1 second to
+  1 hour (`MIN_SAMPLE_INTERVAL` and `MAX_SAMPLE_INTERVAL`). The sampler timers
+  add the interval to the clock, so the bound keeps every deadline finite.
 - A default deployment has no policy, so it runs no sampler and no SQL.
 
 New surface: `HarvestError::LoadShed`, the `harvest.load_shed.active{queue}`
