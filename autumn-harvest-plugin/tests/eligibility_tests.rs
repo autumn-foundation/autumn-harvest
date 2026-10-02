@@ -872,11 +872,12 @@ async fn test_eligibility_optimizations_and_resilience() {
     .await;
     assert_eq!(status_multi, StatusCode::OK);
     assert_eq!(body_multi["summary"]["diagnosis"], "no_eligible_workers");
-    assert!(
+    assert_eq!(
         body_multi["eligible_workers"]
             .as_array()
             .unwrap()
-            .is_empty()
+            .as_slice(),
+        [] as [serde_json::Value; 0]
     );
 
     // 6. Test all_draining classification refinement
@@ -1025,11 +1026,12 @@ async fn test_eligibility_optimizations_and_resilience() {
     .await;
     assert_eq!(status_mixed, StatusCode::OK);
     assert_eq!(body_mixed["summary"]["diagnosis"], "healthy");
-    assert!(
-        !body_mixed["eligible_workers"]
+    assert_ne!(
+        body_mixed["eligible_workers"]
             .as_array()
             .unwrap()
-            .is_empty()
+            .as_slice(),
+        [] as [serde_json::Value; 0]
     );
 
     // Now test service unavailable: if we only query a broken queue, or if all shards fail

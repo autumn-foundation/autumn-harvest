@@ -319,6 +319,13 @@ jobs:
         # match arms textually. See
         # scripts/check-sqlite-outcome-match-example.sh.
         run: ./scripts/check-sqlite-outcome-match-example.sh
+      - name: Check chapter 8 and 11 snippets compile
+        # Guards two getting-started snippets that declared the workflow
+        # input as `_: ()`. `#[workflow]` silently dropped the `_` pattern,
+        # so the generated call passed one argument to a two-argument
+        # function. rustc reported E0061 "takes 5 arguments" on the
+        # attribute line. See scripts/check-underscore-input-snippets.sh.
+        run: ./scripts/check-underscore-input-snippets.sh
       - name: Check webhooks chapter documents the webhooks feature
         # Guards a real, reproduced-live defect an Onramp clean-room pass
         # found in chapter 12: it showed the `#[webhook]` mapping function

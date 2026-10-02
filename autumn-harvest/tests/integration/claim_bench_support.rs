@@ -1650,7 +1650,7 @@ mod pure_tests {
         assert_eq!(out.total_claimed, 0);
         assert_eq!(out.claimed, 0);
         assert_eq!(out.empty, 0);
-        assert!(out.samples.is_empty());
+        assert_eq!(out.samples, [] as [f64; 0]);
         assert!(out.truncated, "truncation must survive the split");
     }
 

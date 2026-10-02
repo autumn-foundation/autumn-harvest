@@ -419,11 +419,12 @@ async fn preflight_endpoint_returns_all_green_single_shard_report() {
         .expect("scanner_liveness must be part of the preflight report");
     assert_eq!(scanner_check["status"], "pass");
     assert_eq!(scanner_check["details"]["scanners_registered"], 0);
-    assert!(
+    assert_eq!(
         scanner_check["details"]["scanners"]
             .as_array()
             .expect("scanners must be an array")
-            .is_empty()
+            .as_slice(),
+        [] as [serde_json::Value; 0]
     );
 }
 
