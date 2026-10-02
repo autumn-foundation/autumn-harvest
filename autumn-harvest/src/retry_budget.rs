@@ -352,8 +352,9 @@ impl Bucket {
     /// Give a deferred retry a wake-up slot and return the delay to it.
     ///
     /// The first slot is the time at which the time refill gives one token.
-    /// Each later slot is one refill interval after the previous slot. Thus
-    /// the first deferred retries wake one at a time, at the refill rate.
+    /// While that slot is still pending, each later slot is one refill
+    /// interval after the previous slot. Thus the first deferred retries wake
+    /// one at a time, at the refill rate.
     ///
     /// A slot later than [`MAX_RETRY_BUDGET_DEFER`] is not reserved. That
     /// retry gets a random delay in the upper half of the cap instead. The
@@ -366,7 +367,14 @@ impl Bucket {
         } else {
             (MAX_RETRY_BUDGET_DEFER, MAX_RETRY_BUDGET_DEFER)
         };
-        let slot = (now + until_token).max(self.next_slot + interval);
+        let ready = now + until_token;
+        // Space after a reservation that is still pending. An expired one
+        // says nothing about the next token, so it does not delay this slot.
+        let slot = if self.next_slot > now {
+            ready.max(self.next_slot + interval)
+        } else {
+            ready
+        };
         if slot.saturating_duration_since(now) >= MAX_RETRY_BUDGET_DEFER {
             return overflow_delay();
         }
@@ -583,6 +591,21 @@ mod tests {
         assert!(
             wait >= Duration::from_millis(450) && wait <= Duration::from_millis(550),
             "expected about 500 ms, got {wait:?}"
+        );
+    }
+
+    /// With no live reservation, the first deferral waits only for the next
+    /// token, not for a whole refill interval.
+    #[test]
+    fn first_deferral_waits_only_for_the_missing_fraction() {
+        let reg = registry(RetryBudgetPolicy::new(0.9, 1.0, 1.0));
+        let now = Instant::now();
+        assert_eq!(drain(&reg, A, now), 1);
+        let _ = reg.admit(A, false, now);
+        let wait = retry_after(reg.admit(A, true, now));
+        assert!(
+            wait >= Duration::from_millis(90) && wait <= Duration::from_millis(110),
+            "expected about 100 ms, got {wait:?}"
         );
     }
 
