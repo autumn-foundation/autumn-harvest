@@ -255,7 +255,9 @@ pub struct DebounceAdmitOutcome {
     pub debounce_key: String,
     /// The stable `workflow_id` the eventual run will be created with. This is
     /// the **first** request's id for the key (kept across retriggers), which
-    /// the caller should echo instead of its own generated id.
+    /// the caller should echo instead of its own generated id. See
+    /// [`admit_debounced_start`]'s doc comment for the legacy-empty-id healing
+    /// exception (issue #1430).
     pub workflow_id: String,
     /// Current fire deadline after this admission.
     pub fire_at: DateTime<Utc>,
@@ -294,6 +296,12 @@ pub struct PendingDebounceRecord {
 /// first request** so the stable id echoed in every `202` response is the one
 /// the run will actually be created with; the stored id is returned so the
 /// caller can echo it rather than its own (possibly-discarded) generated id.
+///
+/// **Legacy healing (issue #1430):** a row admitted before the #1353 empty-id
+/// check shipped can hold a stored empty `workflow_id`. Such a row can never
+/// start. A conflicting upsert heals it: the stored id becomes this request's
+/// id instead of staying empty. Only an empty stored id is ever healed. A
+/// valid first-request id is still kept, as documented above.
 ///
 /// Returns the current state of the record after the upsert.
 ///
@@ -390,8 +398,18 @@ pub async fn admit_debounced_start(
         VALUES
             ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1, $10, NOW(), NOW())
         ON CONFLICT (workflow_name, debounce_key) DO UPDATE SET
-            -- workflow_id is intentionally NOT overwritten: the first request's
-            -- id is the one the run is created with, and every 202 echoes it.
+            -- workflow_id keeps the first request's id. That is the id the
+            -- run is created with, and every 202 echoes it. One exception
+            -- (issue #1430): a row admitted before #1353's empty-id check
+            -- shipped can hold a stored empty id. Heal it to this request's
+            -- valid id instead of keeping the poisoned empty string.
+            -- Otherwise this request's merged payload rides a row the fire
+            -- path can only drop as unfireable (see the EmptyWorkflowId arm
+            -- in fire_claimed_debounce_row).
+            workflow_id = CASE
+                WHEN harvest_debounce.workflow_id = '' THEN EXCLUDED.workflow_id
+                ELSE harvest_debounce.workflow_id
+            END,
             queue_name        = EXCLUDED.queue_name,
             last_input        = EXCLUDED.last_input,
             -- issue #921 review (Codex P2): start_options is last-input-wins
@@ -564,6 +582,13 @@ type FiredDebounce = (
 /// #1230 Finding 2 review). See
 /// [`order_due_rows_for_deadlock_free_firing`]'s doc comment for the full
 /// history.
+///
+/// Sibling of `throttle.rs`'s copy of this function (clone class, tracked
+/// in issue #1695). It differs only in the one field name `FireDueRow`
+/// forces to differ (`last_input` here, `input` there).
+/// `docs/audits/quota-lock-ordering-sync.py` normalizes that one field and
+/// gates CI on the rest staying byte-identical. A fix here must land in
+/// both files in the same change.
 #[cfg(feature = "db")]
 fn resolve_row_quota_lock_key(
     row: &FireDueRow,
@@ -581,6 +606,11 @@ fn resolve_row_quota_lock_key(
 /// [`crate::completion_trigger::GLOBAL_WORKFLOW_METADATA`] in one read, for
 /// [`order_due_rows_for_deadlock_free_firing`] to resolve an entire batch
 /// against. One read per batch, not one per row.
+///
+/// Sibling of `throttle.rs`'s copy of this function (issue #1230 Finding 2
+/// clone class, tracked in issue #1695). `docs/audits/quota-lock-ordering-sync.py`
+/// gates CI on the two copies staying byte-identical. A fix here must land
+/// in both files in the same change.
 #[cfg(feature = "db")]
 fn snapshot_quota_policies() -> std::collections::HashMap<String, crate::quota::QuotaPolicy> {
     crate::completion_trigger::GLOBAL_WORKFLOW_METADATA
@@ -683,6 +713,11 @@ fn snapshot_quota_policies() -> std::collections::HashMap<String, crate::quota::
 /// None of them took the shared mutex (review). Splitting the map out as
 /// an explicit argument removes the shared global from the tested code
 /// path entirely. So there is nothing left to race.
+///
+/// Sibling of `throttle.rs`'s copy of this function (issue #1230 Finding 2
+/// clone class, tracked in issue #1695). `docs/audits/quota-lock-ordering-sync.py`
+/// gates CI on the two copies staying byte-identical. A fix here must land
+/// in both files in the same change.
 #[cfg(feature = "db")]
 async fn order_due_rows_for_deadlock_free_firing(
     conn: &mut diesel_async::AsyncPgConnection,
@@ -709,6 +744,11 @@ async fn order_due_rows_for_deadlock_free_firing(
 /// [`order_rows_by_quota_lock_id`]'s sort and the lock
 /// [`crate::quota::lock_quota_key`] will actually take (Codex review,
 /// issue #1230 Finding 2 follow-up).
+///
+/// Sibling of `throttle.rs`'s copy of this function (issue #1230 Finding 2
+/// clone class, tracked in issue #1695). `docs/audits/quota-lock-ordering-sync.py`
+/// gates CI on the two copies staying byte-identical. A fix here must land
+/// in both files in the same change.
 #[cfg(feature = "db")]
 async fn resolve_quota_lock_ids(
     conn: &mut diesel_async::AsyncPgConnection,
@@ -774,6 +814,11 @@ async fn resolve_quota_lock_ids(
 /// exactly the ABBA cycle this ordering exists to close. Sorting the
 /// id itself cannot have that failure mode. A colliding pair simply
 /// compares equal, like same-key rows already do.
+///
+/// Sibling of `throttle.rs`'s copy of this function (issue #1230 Finding 2
+/// clone class, tracked in issue #1695). `docs/audits/quota-lock-ordering-sync.py`
+/// gates CI on the two copies staying byte-identical. A fix here must land
+/// in both files in the same change.
 #[cfg(feature = "db")]
 fn order_rows_by_quota_lock_id(
     due_rows: Vec<FireDueRow>,
@@ -911,6 +956,28 @@ pub async fn fire_due_debounced_starts_with_codecs(
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> crate::error::HarvestResult<usize> {
+    fire_due_debounced_starts_on_conn_shard(
+        conn,
+        None,
+        sharded_pool.as_ref(),
+        shard_assignments,
+        metrics,
+        codecs,
+    )
+    .await
+}
+
+/// [`fire_due_debounced_starts_with_codecs`] for a caller that knows `conn`'s
+/// shard. See [`crate::shard::connect_or_reuse`].
+#[cfg(feature = "db")]
+pub(crate) async fn fire_due_debounced_starts_on_conn_shard(
+    conn: &mut diesel_async::AsyncPgConnection,
+    conn_shard: Option<crate::types::ShardId>,
+    sharded_pool: Option<&crate::shard::ShardedDbPool>,
+    shard_assignments: &[crate::types::ShardId],
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> crate::error::HarvestResult<usize> {
     // Spawn a shard's fired follow-ups + record metrics, returning the count.
     // Done per-shard immediately after that shard's claim transaction commits, so
     // an error on a *later* shard can never drop an earlier shard's already-
@@ -952,17 +1019,17 @@ pub async fn fire_due_debounced_starts_with_codecs(
         // Multi-shard: scan each assigned shard's own harvest_debounce table.
         Some(sp) if !shard_assignments.is_empty() => {
             for shard in shard_assignments {
-                let Some(pool) = sp.exact_pool_for(*shard).cloned() else {
+                let Some(mut shard_conn) = crate::shard::connect_or_reuse(
+                    conn,
+                    conn_shard,
+                    sp,
+                    *shard,
+                    "debounce",
+                    crate::shard::ShardConnectError::LogAndSkip,
+                )
+                .await?
+                else {
                     continue;
-                };
-                let mut shard_conn = match pool.get().await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::error!(
-                            "[debounce] failed to get connection to shard {shard:?}: {e:?}"
-                        );
-                        continue;
-                    }
                 };
                 // Spawn this shard's results before moving on; on this shard's own
                 // error the transaction rolled back, so there is nothing committed
@@ -1131,48 +1198,39 @@ async fn fire_claimed_debounce_row(
     let started_by = opts.started_by;
 
     let params = crate::execution::StartWorkflowParams {
-        workflow_name: &workflow_name,
-        workflow_id: &workflow_id,
-        exec_id,
-        input: row.last_input,
-        parent_id: None,
-        queue_name: &queue_name,
         execution_timeout,
         memo: opts.memo,
         search_attrs: opts.search_attrs,
         reuse_policy,
-        conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
         trace_context: opts.trace_context,
         max_execution_timeout_ceiling,
         chain_execution_timeout,
         max_workflow_chain_timeout_ceiling,
-        inherited_chain_deadline_at: None,
         concurrency_key: opts.concurrency_key,
         concurrency_limit: opts.concurrency_limit,
         concurrency_on_conflict: opts.concurrency_on_conflict.unwrap_or_default(),
         priority,
         max_workflow_input_bytes: opts.max_workflow_input_bytes.unwrap_or(u64::MAX),
-        start_at: None,
-        delay: None,
-        max_workflow_start_delay: None,
         owner: owner.as_deref(),
         runbook_url: runbook_url.as_deref(),
         severity: severity.as_deref(),
         context_headers: opts.context_headers,
         sla,
-        schedule_id: None,
-        scheduled_for: None,
-        workflow_attempt: 1,
         workflow_retry_policy: opts
             .workflow_retry_policy
             .and_then(|v| serde_json::from_value(v).ok()),
-        retry_of_exec_id: None,
         max_workflow_attempts_ceiling: opts.max_workflow_attempts_ceiling,
-        origin: None,
         completion_callbacks: opts.completion_callbacks,
         start_source,
         start_source_ref: start_source_ref.as_deref(),
         started_by: started_by.as_deref(),
+        ..crate::execution::StartWorkflowParams::new(
+            &workflow_name,
+            &workflow_id,
+            exec_id,
+            row.last_input,
+            &queue_name,
+        )
     };
 
     // `in_outer_transaction = true`: this runs inside the scanner's fire

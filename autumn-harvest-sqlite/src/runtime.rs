@@ -675,7 +675,7 @@ impl SqliteRuntime {
                         Some((prior_exec, prior_state)),
                     ) => {
                         if prior_state == "FAILED" {
-                            store::seal_execution(&tx, prior_exec, SEALED_STATE)?;
+                            cancel_and_seal_prior(&tx, prior_exec, &prior_state)?;
                             insert_fresh_execution(&tx, workflow_name, Some(id), input)?
                         } else {
                             StartOutcome {
@@ -717,7 +717,10 @@ impl SqliteRuntime {
     ///
     /// # Errors
     ///
-    /// Returns a persistence error if the signal row cannot be written.
+    /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id and
+    /// [`SqliteError::WorkflowNotRunning`] for a terminal execution. Returns
+    /// [`SqliteError::PayloadTooLarge`] for an oversized payload. Returns a
+    /// persistence error if the signal row cannot be written.
     // Owned-value ingress API: callers hand over a `serde_json::Value` payload
     // that is serialized into durable storage; `store::stage_signal` only borrows
     // it at the leaf, so taking it by value keeps the call site ergonomic
@@ -750,7 +753,7 @@ impl SqliteRuntime {
     ///
     /// # Errors
     ///
-    /// Returns a persistence error if the signal row cannot be written.
+    /// See [`send_signal`](Self::send_signal).
     #[doc(hidden)]
     #[allow(clippy::needless_pass_by_value)]
     pub fn send_signal_as_of(
@@ -764,16 +767,13 @@ impl SqliteRuntime {
         // has no FK/state check, so an unconditional stage returns `Ok(())` for a
         // typoed id or a sealed run and silently loses the wakeup — no live
         // `wait_for_signal` will ever consume it. Mirror the Postgres `send_signal`
-        // rejections (and the [`outcome`](Self::outcome) not-found pattern): an
-        // unknown id → `ExecutionNotFound`; a terminal execution →
-        // `WorkflowNotRunning`. A RUNNING (non-terminal) execution stages as before.
+        // rejections. `store::execution_state` returns `ExecutionNotFound` for an
+        // unknown id. A terminal execution is `WorkflowNotRunning`. A RUNNING
+        // (non-terminal) execution stages as before.
         //
         // The single-writer runtime holds `SQLite`'s only write handle, so the
         // state read and the stage cannot race a concurrent transition: no other
         // writer exists to seal the execution between the check and the insert.
-        if !store::execution_exists(&self.conn, exec)? {
-            return Err(SqliteError::ExecutionNotFound(exec));
-        }
         let state = store::execution_state(&self.conn, exec)?;
         if autumn_harvest::erase::is_terminal_state(&state) {
             return Err(SqliteError::WorkflowNotRunning {
@@ -821,10 +821,11 @@ impl SqliteRuntime {
     ///
     /// # Errors
     ///
-    /// Returns a persistence error if the history cannot be read or a stored
-    /// event cannot be parsed.
+    /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id. Returns a
+    /// persistence error if the history cannot be read or a stored event
+    /// cannot be parsed.
     pub fn load_history(&self, exec: ExecutionId) -> SqliteResult<Vec<WorkflowEvent>> {
-        store::load_history(&self.conn, exec)
+        self.known_or_not_found(exec, store::load_history(&self.conn, exec)?)
     }
 
     /// The per-attempt audit log for `activity_name` (retryable failures live
@@ -838,15 +839,33 @@ impl SqliteRuntime {
     /// history in [`load_history`](Self::load_history) is the per-instance source
     /// of truth.
     ///
+    /// A known execution with no attempts for `activity_name` returns an empty
+    /// list.
+    ///
     /// # Errors
     ///
-    /// Returns a persistence error if the audit rows cannot be read.
+    /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id. Returns a
+    /// persistence error if the audit rows cannot be read.
     pub fn activity_attempts(
         &self,
         exec: ExecutionId,
         activity_name: &str,
     ) -> SqliteResult<Vec<store::ActivityAttempt>> {
-        store::load_attempts(&self.conn, exec, activity_name)
+        self.known_or_not_found(exec, store::load_attempts(&self.conn, exec, activity_name)?)
+    }
+
+    /// Returns `rows`, or [`SqliteError::ExecutionNotFound`] when `rows` is
+    /// empty and `exec` has no execution row (issue #1735).
+    ///
+    /// The existence check runs only on an empty result. A non-empty result
+    /// proves that `exec` exists, so the common read costs no extra query.
+    /// The proof holds because the runtime never deletes an execution row and
+    /// writes child rows only for a stored execution.
+    fn known_or_not_found<T>(&self, exec: ExecutionId, rows: Vec<T>) -> SqliteResult<Vec<T>> {
+        if rows.is_empty() && !store::execution_exists(&self.conn, exec)? {
+            return Err(SqliteError::ExecutionNotFound(exec));
+        }
+        Ok(rows)
     }
 
     /// The stored, non-driving outcome of `exec` (a pure read; does not advance
@@ -857,9 +876,6 @@ impl SqliteRuntime {
     /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id, or a
     /// persistence error.
     pub fn outcome(&self, exec: ExecutionId) -> SqliteResult<ExecutionOutcome> {
-        if !store::execution_exists(&self.conn, exec)? {
-            return Err(SqliteError::ExecutionNotFound(exec));
-        }
         match store::execution_state(&self.conn, exec)?.as_str() {
             "COMPLETED" => Ok(ExecutionOutcome::Completed(
                 store::execution_output(&self.conn, exec)?.unwrap_or(Value::Null),
@@ -893,9 +909,14 @@ impl SqliteRuntime {
     ///
     /// # Errors
     ///
-    /// Returns [`SqliteError::Stuck`] if the run makes no progress and cannot be
-    /// classified, [`SqliteError::Unsupported`] for an unsupported command, or a
-    /// persistence error.
+    /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id. Returns
+    /// [`SqliteError::Stuck`] if the run makes no progress and cannot be
+    /// classified. Returns [`SqliteError::Unsupported`] for an unsupported
+    /// command and [`SqliteError::UnknownWorkflow`] for an unregistered workflow.
+    /// Returns [`SqliteError::UnregisteredActivity`] for an unregistered activity.
+    /// Returns [`SqliteError::NonDeterministic`] on replay divergence and
+    /// [`SqliteError::WorkflowPanicked`] for a contained panic. Otherwise returns
+    /// a persistence error.
     pub async fn run_until_blocked(&mut self, exec: ExecutionId) -> SqliteResult<RunState> {
         // Re-read the wall clock at the START of EACH cycle (issue #1069 P2), NOT
         // once for the whole call: a cycle can consume real time (e.g. a 2s
@@ -982,7 +1003,8 @@ impl SqliteRuntime {
     /// Returns the FIRST execution's error, in `ExecutionId` order, if any.
     /// Every other error in the same pass is logged (`tracing::warn!`), not
     /// dropped. See [`run_until_blocked`](Self::run_until_blocked) for the
-    /// error variants a single execution can produce.
+    /// error variants a single execution can produce. A fleet pass never
+    /// returns `ExecutionNotFound`, because it drives only stored executions.
     pub async fn poll_once(&mut self) -> SqliteResult<bool> {
         let mut skip = HashSet::new();
         let (progress, first_error) = self.poll_once_pass(&mut skip).await?;

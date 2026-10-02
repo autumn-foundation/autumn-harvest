@@ -12,8 +12,9 @@
 //! `docs/plans/2026-09-07-redis-dispatch-worker-integration.md`.
 //!
 //! The installed channel is process-global, like the mutex lease TTL and the
-//! DR config. The worker reads it at run time, and every enqueue path in the
-//! same process publishes through it.
+//! DR config. Every enqueue path outside a bound worker scope publishes
+//! through it. A worker binds the channel it starts with and keeps it (issue
+//! #1431). Its reads and its hints then ignore a later install.
 
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -186,9 +187,65 @@ pub trait TaskDispatch: Send + Sync + std::fmt::Debug {
     /// Give a reference back so it is delivered again after `delay`.
     async fn release(&self, lease: &DispatchLease, delay: Duration) -> HarvestResult<()>;
 
+    /// Drop several references at once (issue #1429).
+    ///
+    /// The default calls [`Self::ack`] once per lease, so an implementation
+    /// with no batched path stays correct. An implementation that can dispose
+    /// of a batch in one round trip should override this.
+    ///
+    /// One lease's `ack` failing must not skip the rest of the batch (Codex
+    /// review, issue #1429). The pre-batch worker path called `ack` once per
+    /// lease independently, so one lease's error never stranded a sibling
+    /// lease's reference pending until visibility recovery. Every lease is
+    /// attempted; the first error, if any, is returned after the loop.
+    async fn ack_many(&self, leases: &[DispatchLease]) -> HarvestResult<()> {
+        let mut first_error = None;
+        for lease in leases {
+            if let Err(error) = self.ack(lease).await {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// Give several references back at once, each after its own delay
+    /// (issue #1429).
+    ///
+    /// The default calls [`Self::release`] once per lease. An implementation
+    /// that can requeue a batch in one round trip should override this.
+    ///
+    /// One lease's `release` failing must not skip the rest of the batch,
+    /// for the same reason as [`Self::ack_many`]'s default above (Codex
+    /// review, issue #1429). Every lease is attempted; the first error, if
+    /// any, is returned after the loop.
+    async fn release_many(&self, leases: &[(DispatchLease, Duration)]) -> HarvestResult<()> {
+        let mut first_error = None;
+        for (lease, delay) in leases {
+            if let Err(error) = self.release(lease, *delay).await {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
     /// Promote due delayed references and recover references held by a
     /// consumer that stopped acking.
     async fn maintain(&self, queues: &[String]) -> HarvestResult<DispatchMaintenance>;
+
+    /// The most sequential round trips that one [`Self::next`] call over
+    /// `queue_count` queues can make outside its `wait`. The default is one
+    /// per queue.
+    ///
+    /// The worker times out a read after `wait` plus one call timeout per
+    /// such round trip. A timeout drops the read future, so an entry the
+    /// read already claimed stays pending until recovery. An implementation
+    /// that makes more round trips must return its real worst case, including
+    /// any work before or after the read itself. The count applies to this
+    /// implementation only, so a stalled channel with the default still
+    /// reaches the worker's timeout quickly (#1756).
+    fn next_round_trips(&self, queue_count: usize) -> usize {
+        queue_count
+    }
 }
 
 /// The installed channel and its settings.
@@ -198,28 +255,155 @@ pub struct InstalledDispatch {
     pub channel: Arc<dyn TaskDispatch>,
     /// Worker-side tuning.
     pub settings: DispatchSettings,
+    /// The generation [`install`]/[`install_for_shard`] stamped on this
+    /// install, for [`uninstall_if_current`]/[`uninstall_all_shards_if_current`]
+    /// (Codex review, issue #1429 follow-up). Not read by anything else.
+    generation: u64,
+}
+
+#[cfg(all(test, feature = "testing"))]
+impl InstalledDispatch {
+    /// An install record that no slot holds. Unit tests use it to call a
+    /// resolver without a write to the process-global slot.
+    pub(crate) fn unslotted(channel: Arc<dyn TaskDispatch>) -> Self {
+        Self {
+            channel,
+            settings: DispatchSettings::default(),
+            generation: 0,
+        }
+    }
 }
 
 static INSTALLED: RwLock<Option<InstalledDispatch>> = RwLock::new(None);
 
+/// Serializes every unit test that writes the dispatch slots or the
+/// publisher (issue #1431). The `dispatch` and `worker` tests share these
+/// globals in one test binary, so one lock must cover both modules.
+#[cfg(all(test, feature = "testing"))]
+pub(crate) static TEST_SLOT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Shared source for every install's generation stamp, across both the
+/// single-shard and per-shard slots (Codex review, issue #1429 follow-up).
+///
+/// One counter for both slots keeps the ownership check simple. A caller
+/// that captured a generation from either [`install`] or
+/// [`install_for_shard`] can ask "is this still the current occupant of
+/// the slot I installed into". No single-shard generation ever collides
+/// with a per-shard one.
+static INSTALL_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Serializes every dispatch install/uninstall call, across both slots
+/// (Codex review, issue #1429 follow-up).
+///
+/// Each mutating function writes its own slot, then separately reads the
+/// *other* slot to recompute [`ANY_INSTALLED`] and decide whether to stop
+/// the publisher. A concurrent call touching the other slot could land in
+/// that gap. Its own `ANY_INSTALLED` write would then get overwritten by
+/// this call's stale recomputation, true clobbered back to false or the
+/// reverse. Every mutating function now holds this lock for its whole
+/// body. Its slot write and the `ANY_INSTALLED`/publisher decision it
+/// drives become one atomic step. No other install or uninstall call can
+/// land in between. [`installed`]/[`installed_for_shard`]/[`is_installed`]
+/// never take it, so a read never blocks on a concurrent install.
+static DISPATCH_SLOT_LOCK: Mutex<()> = Mutex::new(());
+
 /// Install the process-global channel. A later call replaces the earlier one.
-pub fn install(channel: Arc<dyn TaskDispatch>, settings: DispatchSettings) {
-    if let Ok(mut slot) = INSTALLED.write() {
-        *slot = Some(InstalledDispatch { channel, settings });
-        ANY_INSTALLED.store(true, Ordering::Relaxed);
-    }
+///
+/// A worker keeps the channel it bound (issue #1431). A replacement reaches
+/// only a worker that has not bound a channel yet.
+///
+/// Returns the generation this install was stamped with. A caller that may
+/// need to undo only *this* install keeps this value, for
+/// [`uninstall_if_current`] (Codex review, issue #1429 follow-up). That
+/// call, unlike the unconditional [`uninstall`], never also clears a later
+/// install that has since replaced this one.
+pub fn install(channel: Arc<dyn TaskDispatch>, settings: DispatchSettings) -> u64 {
+    let _guard = lock(&DISPATCH_SLOT_LOCK);
+    let Ok(mut slot) = INSTALLED.write() else {
+        return 0;
+    };
+    // The generation is minted and stamped while still holding the write
+    // lock. Two racing installs cannot interleave: whichever call last
+    // wrote the slot is also the one whose generation the slot now carries.
+    let generation = INSTALL_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    *slot = Some(InstalledDispatch {
+        channel,
+        settings,
+        generation,
+    });
+    ANY_INSTALLED.store(true, Ordering::Relaxed);
+    generation
 }
 
-/// Remove the process-global channel. Tests use this between cases.
+/// Remove the process-global channel unconditionally. Tests use this between
+/// cases.
+///
+/// A production caller wants [`uninstall_if_current`] instead, when it
+/// installed a channel earlier and wants to undo specifically that
+/// install. A later install may have replaced it in the same process, and
+/// this function's own unconditional clear does not distinguish that case.
 ///
 /// The background publisher is stopped as well, so the next install starts
 /// with an empty publisher queue. A hint still in that queue is dropped; the
 /// reconcile sweep republishes its row.
+///
+/// Clears [`ANY_INSTALLED`] only when [`INSTALLED_BY_SHARD`] is also empty
+/// (Codex review, issue #1429), mirroring the check [`uninstall_all_shards`]
+/// already runs for the inverse case. A direct embedder using the
+/// per-shard API can call this on the independent single-shard slot while
+/// shard channels are still installed. Clearing the flag unconditionally
+/// then let `is_installed()` read false while `installed_for_shard` still
+/// returned live channels. `Worker::new` skips its full-coverage
+/// validation whenever `is_installed()` is false. A partial shard map
+/// could then run silently with mixed Redis/Postgres dispatch behaviour.
 pub fn uninstall() {
+    let _guard = lock(&DISPATCH_SLOT_LOCK);
     if let Ok(mut slot) = INSTALLED.write() {
         *slot = None;
+    }
+    if INSTALLED_BY_SHARD.read().is_ok_and(|slot| slot.is_none()) {
         ANY_INSTALLED.store(false, Ordering::Relaxed);
     }
+    stop_publisher();
+}
+
+/// Remove the process-global channel, but only if `generation` still names
+/// the currently installed one (Codex review, issue #1429 follow-up).
+/// `generation` is a value [`install`] returned earlier.
+///
+/// A process may start a replacement runner before stopping the previous
+/// one. The replacement's `install` overwrites the slot and returns a new
+/// generation of its own. The previous runner's later, unconditional
+/// `uninstall` would then clear the replacement's channel out from under
+/// it. The replacement believes Redis dispatch is still active, since its
+/// own effective-config snapshot says so, while every read and publish
+/// silently falls through to Postgres. Checking the generation first means
+/// a stop call overtaken by a fresher install becomes a no-op instead.
+pub fn uninstall_if_current(generation: u64) {
+    let _guard = lock(&DISPATCH_SLOT_LOCK);
+    let Ok(mut slot) = INSTALLED.write() else {
+        return;
+    };
+    let still_current = slot
+        .as_ref()
+        .is_some_and(|installed| installed.generation == generation);
+    if !still_current {
+        return;
+    }
+    *slot = None;
+    drop(slot);
+    if INSTALLED_BY_SHARD.read().is_ok_and(|slot| slot.is_none()) {
+        ANY_INSTALLED.store(false, Ordering::Relaxed);
+    }
+    stop_publisher();
+}
+
+/// Abort the background publisher task and drop its sender, if either is
+/// installed.
+///
+/// A later hint starts a fresh publisher lazily ([`publish_in_background`]),
+/// so this never needs to be re-armed by its own caller.
+fn stop_publisher() {
     let publisher = lock(&PUBLISHER).take();
     if let Some(publisher) = publisher {
         publisher.task.abort();
@@ -230,6 +414,516 @@ pub fn uninstall() {
 #[must_use]
 pub fn installed() -> Option<InstalledDispatch> {
     INSTALLED.read().ok().and_then(|slot| slot.clone())
+}
+
+// ---------------------------------------------------------------------------
+// Per-shard channels (issue #1429)
+// ---------------------------------------------------------------------------
+
+/// One channel per shard, for a runtime that spans more than one shard.
+///
+/// [`install`]/[`installed`] above stay the single-shard slot. A multi-shard
+/// runtime never touches them. A worker that spans several shards cannot
+/// tell, from a task id alone, which shard's database holds the named row.
+/// A reference read from the wrong shard's channel would then always miss.
+/// Each shard here therefore gets its own channel, keyed to its own Redis
+/// key family. The multi-shard poll loop reads and claims against the
+/// matching pair.
+///
+/// Immediate hints still publish through the single-shard slot only, which
+/// stays empty here. `record_hint`/`record_hints` raise them from
+/// `queue.rs` helpers that do not know which shard they run on. So on a
+/// multi-shard runtime they fall through to the Postgres path, same as no
+/// channel installed at all. Only the reconcile sweep publishes into a
+/// per-shard channel. It already runs once per shard, against that shard's
+/// own pool connection. This costs a reconcile interval of latency on the
+/// first dispatch of a row, never a lost or duplicated one. That is the
+/// same durability floor every other dispatch path relies on.
+static INSTALLED_BY_SHARD: RwLock<
+    Option<std::collections::HashMap<crate::types::ShardId, InstalledDispatch>>,
+> = RwLock::new(None);
+
+/// Install a channel for one shard of a multi-shard runtime.
+///
+/// A later call for the same shard replaces the earlier one. Does not touch
+/// [`install`]'s single-shard slot.
+///
+/// Returns the generation this shard's install was stamped with, drawn from
+/// the same counter [`install`] uses. A caller that may need to undo only
+/// the shards it installed keeps these values, for
+/// [`uninstall_all_shards_if_current`] (Codex review, issue #1429
+/// follow-up). That call, unlike the unconditional [`uninstall_all_shards`],
+/// never also clears a later install that has since replaced one of them.
+pub fn install_for_shard(
+    shard: crate::types::ShardId,
+    channel: Arc<dyn TaskDispatch>,
+    settings: DispatchSettings,
+) -> u64 {
+    let _guard = lock(&DISPATCH_SLOT_LOCK);
+    let Ok(mut slot) = INSTALLED_BY_SHARD.write() else {
+        return 0;
+    };
+    let generation = INSTALL_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    slot.get_or_insert_with(std::collections::HashMap::new)
+        .insert(
+            shard,
+            InstalledDispatch {
+                channel,
+                settings,
+                generation,
+            },
+        );
+    ANY_INSTALLED.store(true, Ordering::Relaxed);
+    generation
+}
+
+/// The channel installed for `shard`, if any.
+#[must_use]
+pub fn installed_for_shard(shard: crate::types::ShardId) -> Option<InstalledDispatch> {
+    INSTALLED_BY_SHARD
+        .read()
+        .ok()
+        .and_then(|slot| slot.as_ref().and_then(|map| map.get(&shard).cloned()))
+}
+
+/// The channel installed for `shard`, but only while it still carries
+/// exactly `generation` (Codex review, issue #1429 follow-up).
+///
+/// `generation` is the value [`install_for_shard`]/[`install_shards`]
+/// stamped on the caller's own install. A caller that installed `shard`'s
+/// channel itself, then later wants to use exactly that install (not
+/// whatever is live now), calls this instead of [`installed_for_shard`].
+/// A later, unrelated install for the same shard mints a new generation
+/// from the shared counter. So a mismatch here can only mean a different
+/// call replaced the slot since. Returns `None` in that case, the same as
+/// if nothing were installed at all, rather than silently handing back
+/// the stranger's channel.
+#[must_use]
+pub fn installed_for_shard_if_current(
+    shard: crate::types::ShardId,
+    generation: u64,
+) -> Option<InstalledDispatch> {
+    installed_for_shard(shard).filter(|installed| installed.generation == generation)
+}
+
+/// Each of `assignments`' own per-shard channel, all read from one
+/// `INSTALLED_BY_SHARD` snapshot (Codex review, issue #1429 follow-up).
+///
+/// [`installed_for_shard`] called once per shard, in a caller's own loop,
+/// takes a separate read-lock acquisition each time. A concurrent
+/// [`install_shards`] call can replace the whole map between two of
+/// those reads. The loop could then see one shard from the map before
+/// the replacement, and another shard from the map after it. Each
+/// individual read still returns `Some`, so nothing
+/// about either read looks wrong on its own. The loop ends up mixing two
+/// different topologies into one captured result. This reads the whole
+/// map exactly once, so every shard in the result comes from the same
+/// point in time.
+///
+/// When `expected_generations` is given, a shard's entry is kept only
+/// while it still carries exactly the generation named for it there.
+/// That is the same contract [`installed_for_shard_if_current`]
+/// enforces, checked here against this one snapshot instead of a fresh
+/// read per shard. `expected_generations = None` keeps whatever this
+/// snapshot holds for each assigned shard, with no generation check.
+#[must_use]
+pub fn installed_for_shards(
+    assignments: &[crate::types::ShardId],
+    expected_generations: Option<&[(crate::types::ShardId, u64)]>,
+) -> std::collections::HashMap<crate::types::ShardId, InstalledDispatch> {
+    let Ok(snapshot) = INSTALLED_BY_SHARD.read() else {
+        return std::collections::HashMap::new();
+    };
+    let Some(installed_map) = snapshot.as_ref() else {
+        return std::collections::HashMap::new();
+    };
+    assignments
+        .iter()
+        .filter_map(|shard| {
+            let installed = installed_map.get(shard)?;
+            let current = expected_generations.is_none_or(|expected| {
+                expected.iter().any(|(candidate, generation)| {
+                    candidate == shard && installed.generation == *generation
+                })
+            });
+            current.then(|| (*shard, installed.clone()))
+        })
+        .collect()
+}
+
+/// Remove every per-shard channel. Tests use this between cases.
+///
+/// Also stops the background publisher, mirroring [`uninstall`] (Codex
+/// review, issue #1429). A multi-shard runtime can start that publisher
+/// through [`crate::dispatch::buffered_settled_in_background`]. It can
+/// never actually publish there, though: `publish_now` only ever reads
+/// the single-shard slot, never a per-shard one. Left running past this
+/// call, its task and channel sender would otherwise leak across an
+/// embedded runner's restart. It would wait on hints that only ever
+/// reach a dead end.
+pub fn uninstall_all_shards() {
+    let _guard = lock(&DISPATCH_SLOT_LOCK);
+    if let Ok(mut slot) = INSTALLED_BY_SHARD.write() {
+        *slot = None;
+    }
+    if INSTALLED.read().is_ok_and(|slot| slot.is_none()) {
+        ANY_INSTALLED.store(false, Ordering::Relaxed);
+    }
+    stop_publisher();
+}
+
+/// Remove both the single-shard slot and every per-shard channel, in one
+/// [`DISPATCH_SLOT_LOCK`] acquisition (Codex review, issue #1429
+/// follow-up).
+///
+/// A caller that instead calls [`uninstall`] and [`uninstall_all_shards`]
+/// separately still leaves a gap between the two clears. [`install_shards`]
+/// replaces both slots in one atomic step specifically so a racing,
+/// overlapping install is never observed half-applied. A two-step clear
+/// can still straddle it.
+///
+/// A concurrent [`install_shards`] call landing between the two separate
+/// clears has its per-shard topology wiped out by the second one. That
+/// happens immediately after the first one found nothing to clear.
+///
+/// That runtime's own `Worker::new` then sees `is_installed()` false,
+/// both slots now empty. It skips per-shard coverage validation entirely.
+/// It starts on the Postgres fallback for every shard — silently. Its
+/// own effective-config snapshot (captured before this race, from its
+/// own successful install) still reports Redis dispatch as installed.
+///
+/// A caller turning Redis dispatch off for this process calls this instead
+/// of `uninstall()` followed by `uninstall_all_shards()`. A caller whose
+/// own startup can still fail after that same clear uses
+/// [`uninstall_all_capturing`] instead. It can then undo the clear on
+/// that later failure (Codex review, issue #1429 follow-up).
+pub fn uninstall_all() {
+    let _guard = lock(&DISPATCH_SLOT_LOCK);
+    if let Ok(mut slot) = INSTALLED.write() {
+        *slot = None;
+    }
+    if let Ok(mut slot) = INSTALLED_BY_SHARD.write() {
+        *slot = None;
+    }
+    ANY_INSTALLED.store(false, Ordering::Relaxed);
+    stop_publisher();
+}
+
+/// As [`uninstall_all`], but returns a [`TopologySnapshot`] of both slots
+/// as they stood immediately before the clear (Codex review, issue #1429
+/// follow-up).
+///
+/// A caller turning Redis dispatch off for *this* startup, while a still-
+/// running previous runtime owns whatever this clears, keeps this
+/// snapshot. A later step in that same startup can still fail. On that
+/// failure, [`restore_cleared_if_still_empty`] puts the previous topology
+/// back. The still-running previous runtime is then not left stranded
+/// on the Postgres fallback for a clear its replacement never actually
+/// committed to.
+pub fn uninstall_all_capturing() -> TopologySnapshot {
+    let _guard = lock(&DISPATCH_SLOT_LOCK);
+    let previous = TopologySnapshot {
+        single: INSTALLED.read().ok().and_then(|slot| slot.clone()),
+        shards: INSTALLED_BY_SHARD.read().ok().and_then(|slot| slot.clone()),
+    };
+    if let Ok(mut slot) = INSTALLED.write() {
+        *slot = None;
+    }
+    if let Ok(mut slot) = INSTALLED_BY_SHARD.write() {
+        *slot = None;
+    }
+    ANY_INSTALLED.store(false, Ordering::Relaxed);
+    stop_publisher();
+    previous
+}
+
+/// Undo [`uninstall_all_capturing`], restoring the topology `snapshot`
+/// names, but only while both dispatch slots are still empty (Codex
+/// review, issue #1429 follow-up).
+///
+/// Neither the clear nor this restore mints a generation, unlike
+/// [`install_single`]/[`install_shards`] and their own
+/// [`restore_single_if_current`]/[`restore_shards_if_current`]
+/// counterparts. There is nothing to compare against, so this checks that
+/// both slots are still empty instead. A later, unrelated install may
+/// have already populated one or both slots since `snapshot` was
+/// captured. Restoring over it would discard that install instead of
+/// the failed startup this call is meant to undo. So this leaves both
+/// slots alone whenever either is no longer empty.
+pub fn restore_cleared_if_still_empty(snapshot: &TopologySnapshot) {
+    let _guard = lock(&DISPATCH_SLOT_LOCK);
+    let still_empty = INSTALLED.read().is_ok_and(|slot| slot.is_none())
+        && INSTALLED_BY_SHARD.read().is_ok_and(|slot| slot.is_none());
+    if !still_empty {
+        return;
+    }
+    if let Ok(mut slot) = INSTALLED.write() {
+        slot.clone_from(&snapshot.single);
+    }
+    if let Ok(mut slot) = INSTALLED_BY_SHARD.write() {
+        slot.clone_from(&snapshot.shards);
+    }
+    let any_installed =
+        snapshot.single.is_some() || snapshot.shards.as_ref().is_some_and(|map| !map.is_empty());
+    ANY_INSTALLED.store(any_installed, Ordering::Relaxed);
+    stop_publisher();
+}
+
+/// Remove only the shards in `expected` whose currently installed channel
+/// still carries the generation [`install_for_shard`] stamped on it.
+///
+/// `expected` holds the values that call returned earlier, one per shard
+/// (Codex review, issue #1429 follow-up). A shard whose generation has
+/// moved on was reinstalled by a later,
+/// unrelated call since `expected` was captured. This leaves it alone,
+/// rather than tearing out a replacement runner's channel for that shard.
+/// See [`uninstall_if_current`] for the single-shard version of the same
+/// race.
+pub fn uninstall_all_shards_if_current(expected: &[(crate::types::ShardId, u64)]) {
+    let _guard = lock(&DISPATCH_SLOT_LOCK);
+    let mut any_removed = false;
+    if let Ok(mut slot) = INSTALLED_BY_SHARD.write()
+        && let Some(map) = slot.as_mut()
+    {
+        for (shard, generation) in expected {
+            let still_current = map
+                .get(shard)
+                .is_some_and(|installed| installed.generation == *generation);
+            if still_current {
+                map.remove(shard);
+                any_removed = true;
+            }
+        }
+        if map.is_empty() {
+            *slot = None;
+        }
+    }
+    if !any_removed {
+        return;
+    }
+    let shards_now_empty = INSTALLED_BY_SHARD.read().is_ok_and(|slot| {
+        slot.as_ref()
+            .is_none_or(std::collections::HashMap::is_empty)
+    });
+    if shards_now_empty && INSTALLED.read().is_ok_and(|slot| slot.is_none()) {
+        ANY_INSTALLED.store(false, Ordering::Relaxed);
+    }
+    stop_publisher();
+}
+
+/// Replace the whole multi-shard topology atomically: clear both slots and
+/// install every given shard's channel in one [`DISPATCH_SLOT_LOCK`]
+/// acquisition (Codex review, issue #1429 follow-up).
+///
+/// A caller that instead clears the slots and then calls
+/// [`install_for_shard`] once per shard still leaves a gap between those
+/// calls. That holds even though each one is individually serialized
+/// against every other install or uninstall call. Two runtimes racing to
+/// install a fresh multi-shard topology could interleave their per-shard
+/// installs. Each runtime's own worker would then see a map mixing shards
+/// from both. It could read and claim through the wrong Redis endpoint or
+/// key prefix for a shard it does not actually own. Every entry here
+/// lands in the map as one atomic step. No other install or uninstall
+/// call can observe, or contribute to, a partial result.
+///
+/// Returns the generation stamped on each shard, in `channels`' order.
+/// It is paired with a [`TopologySnapshot`] of both slots as they stood
+/// immediately before this call replaced them.
+///
+/// A caller whose own startup can still fail after this call keeps that
+/// snapshot (Codex review, issue #1429 follow-up). It passes the
+/// snapshot to [`restore_shards_if_current`] on that later failure, to
+/// put the previous topology back rather than leave the slots empty. The
+/// snapshot is captured under the same [`DISPATCH_SLOT_LOCK`] acquisition
+/// as the replacement itself. No concurrent install can therefore land
+/// between the two and be captured as "previous" by mistake.
+pub fn install_shards(
+    channels: Vec<(
+        crate::types::ShardId,
+        Arc<dyn TaskDispatch>,
+        DispatchSettings,
+    )>,
+) -> (Vec<(crate::types::ShardId, u64)>, TopologySnapshot) {
+    let _guard = lock(&DISPATCH_SLOT_LOCK);
+    let previous = TopologySnapshot {
+        single: INSTALLED.read().ok().and_then(|slot| slot.clone()),
+        shards: INSTALLED_BY_SHARD.read().ok().and_then(|slot| slot.clone()),
+    };
+    if let Ok(mut slot) = INSTALLED.write() {
+        *slot = None;
+    }
+    let mut installed_shards = Vec::with_capacity(channels.len());
+    if let Ok(mut slot) = INSTALLED_BY_SHARD.write() {
+        let mut map = std::collections::HashMap::with_capacity(channels.len());
+        for (shard, channel, settings) in channels {
+            let generation = INSTALL_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+            map.insert(
+                shard,
+                InstalledDispatch {
+                    channel,
+                    settings,
+                    generation,
+                },
+            );
+            installed_shards.push((shard, generation));
+        }
+        *slot = if map.is_empty() { None } else { Some(map) };
+    }
+    ANY_INSTALLED.store(!installed_shards.is_empty(), Ordering::Relaxed);
+    stop_publisher();
+    (installed_shards, previous)
+}
+
+/// Replace the single-shard topology atomically: clear both slots and
+/// install `channel` into the single-shard slot, in one
+/// [`DISPATCH_SLOT_LOCK`] acquisition (Codex review, issue #1429
+/// follow-up).
+///
+/// Mirrors [`install_shards`]'s own reasoning, for the single-shard case.
+/// A caller that instead clears both slots and then calls [`install`]
+/// leaves a gap between those two calls. A racing [`install_shards`] call
+/// could land in that gap and end up installed alongside this one, rather
+/// than cleanly replaced by it.
+///
+/// Returns the generation stamped on the installed channel, paired with a
+/// [`TopologySnapshot`] of both slots as they stood immediately before
+/// this call replaced them. See [`install_shards`]'s own doc for why the
+/// snapshot is captured under the same lock acquisition as the
+/// replacement. See [`restore_single_if_current`] for how a caller uses
+/// it.
+pub fn install_single(
+    channel: Arc<dyn TaskDispatch>,
+    settings: DispatchSettings,
+) -> (u64, TopologySnapshot) {
+    let _guard = lock(&DISPATCH_SLOT_LOCK);
+    let previous = TopologySnapshot {
+        single: INSTALLED.read().ok().and_then(|slot| slot.clone()),
+        shards: INSTALLED_BY_SHARD.read().ok().and_then(|slot| slot.clone()),
+    };
+    if let Ok(mut slot) = INSTALLED_BY_SHARD.write() {
+        *slot = None;
+    }
+    let mut generation = 0;
+    if let Ok(mut slot) = INSTALLED.write() {
+        generation = INSTALL_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+        *slot = Some(InstalledDispatch {
+            channel,
+            settings,
+            generation,
+        });
+    }
+    ANY_INSTALLED.store(true, Ordering::Relaxed);
+    stop_publisher();
+    (generation, previous)
+}
+
+/// Both dispatch slots exactly as [`install_single`]/[`install_shards`]
+/// found them, immediately before replacing them (Codex review, issue
+/// #1429 follow-up).
+///
+/// A caller whose own startup can still fail after that replacement keeps
+/// this, and passes it to [`restore_single_if_current`] or
+/// [`restore_shards_if_current`] on that later failure. Restoring writes
+/// these slots back with their original generations, rather than minting
+/// fresh ones through [`install`]/[`install_for_shard`]. A still-running
+/// previous runner remembers its own, older generation for its eventual
+/// `stop()` call. A restore that minted a new generation for the same
+/// channel would desync that call. Its `uninstall_if_current` would then
+/// find a mismatch, treat itself as already superseded, and leave the
+/// restored channel installed forever.
+#[derive(Debug, Clone, Default)]
+pub struct TopologySnapshot {
+    single: Option<InstalledDispatch>,
+    shards: Option<std::collections::HashMap<crate::types::ShardId, InstalledDispatch>>,
+}
+
+/// Undo [`install_single`], restoring the topology `snapshot` names, but
+/// only while `generation` still names the single-shard slot's current
+/// occupant (Codex review, issue #1429 follow-up).
+///
+/// A later, unrelated install may have already replaced this one since
+/// `snapshot` was captured. Restoring over it would discard that install
+/// instead of the failed startup this call is meant to undo. This checks
+/// the generation first, mirroring [`uninstall_if_current`]'s own
+/// reasoning.
+///
+/// The per-shard slot is restored too, but only while it is still empty.
+/// `install_single` left it empty. A direct embedder may since have
+/// populated it with its own, unrelated [`install_for_shard`] calls; this
+/// leaves that alone rather than discarding it.
+pub fn restore_single_if_current(snapshot: &TopologySnapshot, generation: u64) {
+    let _guard = lock(&DISPATCH_SLOT_LOCK);
+    let mut restored = false;
+    if let Ok(mut slot) = INSTALLED.write() {
+        let still_current = slot
+            .as_ref()
+            .is_some_and(|installed| installed.generation == generation);
+        if still_current {
+            slot.clone_from(&snapshot.single);
+            restored = true;
+        }
+    }
+    if restored
+        && let Ok(mut slot) = INSTALLED_BY_SHARD.write()
+        && slot.is_none()
+    {
+        slot.clone_from(&snapshot.shards);
+    }
+    if !restored {
+        return;
+    }
+    let any_installed = INSTALLED.read().is_ok_and(|slot| slot.is_some())
+        || INSTALLED_BY_SHARD
+            .read()
+            .is_ok_and(|slot| slot.as_ref().is_some_and(|map| !map.is_empty()));
+    ANY_INSTALLED.store(any_installed, Ordering::Relaxed);
+    stop_publisher();
+}
+
+/// Undo [`install_shards`], restoring the topology `snapshot` names, but
+/// only while `generations` still names exactly the per-shard slot's
+/// current occupants (Codex review, issue #1429 follow-up).
+///
+/// Every shard `install_shards` installed must still carry the same
+/// generation, and no other shard may be present, or this leaves the
+/// per-shard slot alone. A later, unrelated install may have already
+/// replaced or extended it since `snapshot` was captured. See
+/// [`restore_single_if_current`] for the single-shard mirror of this same
+/// check.
+pub fn restore_shards_if_current(
+    snapshot: &TopologySnapshot,
+    generations: &[(crate::types::ShardId, u64)],
+) {
+    let _guard = lock(&DISPATCH_SLOT_LOCK);
+    let mut restored = false;
+    if let Ok(mut slot) = INSTALLED_BY_SHARD.write() {
+        let still_current = slot.as_ref().is_some_and(|map| {
+            map.len() == generations.len()
+                && generations.iter().all(|(shard, generation)| {
+                    map.get(shard)
+                        .is_some_and(|installed| installed.generation == *generation)
+                })
+        });
+        if still_current {
+            slot.clone_from(&snapshot.shards);
+            restored = true;
+        }
+    }
+    if restored
+        && let Ok(mut slot) = INSTALLED.write()
+        && slot.is_none()
+    {
+        slot.clone_from(&snapshot.single);
+    }
+    if !restored {
+        return;
+    }
+    let any_installed = INSTALLED.read().is_ok_and(|slot| slot.is_some())
+        || INSTALLED_BY_SHARD
+            .read()
+            .is_ok_and(|slot| slot.as_ref().is_some_and(|map| !map.is_empty()));
+    ANY_INSTALLED.store(any_installed, Ordering::Relaxed);
+    stop_publisher();
 }
 
 // ---------------------------------------------------------------------------
@@ -355,7 +1049,168 @@ where
     outcome
 }
 
-/// Publish `hints` on the installed channel now.
+/// Same contract as [`buffered_settled`], but hands a committed `f`'s hints
+/// to the background publisher instead of awaiting the channel inline
+/// (Codex review, issue #1429).
+///
+/// `buffered_settled` is right for a caller that processes one row and then
+/// waits, such as a worker's own dispatch loop. A caller that instead loops
+/// over many rows in one sweep pays that same await once per row. That can
+/// cost up to `DISPATCH_CALL_TIMEOUT` per call when the channel is slow,
+/// stalling the sweep even though Postgres already committed. Reconciliation
+/// is the durability fallback regardless. This uses [`publish_in_background`].
+/// That is the same non-blocking, bounded-queue path [`record_hint`] falls
+/// back to outside a scope. So the sweep moves on to its next row
+/// immediately after commit.
+///
+/// # Errors
+///
+/// Returns the result of `f` unchanged.
+pub async fn buffered_settled_in_background<T, E, F>(f: F) -> Result<T, E>
+where
+    F: Future<Output = Result<T, E>>,
+{
+    let (outcome, hints) = buffered(f).await;
+    if outcome.is_ok() {
+        for hint in hints {
+            publish_in_background(hint);
+        }
+    }
+    outcome
+}
+
+/// Run `f` and tie its own hints to its own outcome, nested or not (Codex
+/// review, issue #1429).
+///
+/// `f` owns a nested transaction (typically a SAVEPOINT) inside an already
+/// active scope: a worker's outer [`buffered`] call around the whole task
+/// body, for example. [`buffered_settled`] cannot make that guarantee
+/// there. Nested, `buffered` is a documented no-op passthrough. So a hint
+/// `f` raises lands in the *outer* buffer and is flushed with the outer
+/// task's own outcome, not `f`'s. A `wake_workflow_task` call whose own
+/// transaction then fails to commit still gets its hint published, because
+/// the outer task around it went on to succeed.
+///
+/// This runs `f` against a fresh, private buffer nested inside the active
+/// scope, then merges that buffer into the enclosing one only when `f`
+/// succeeds. When no scope is active yet, this opens one and settles it
+/// against `f`'s own outcome, identically to [`buffered_settled`].
+///
+/// A length checkpoint on the *shared* enclosing buffer cannot isolate two
+/// sibling `run_transactional` calls an activity joins concurrently — say
+/// with `tokio::join!`. `run_transactional` takes `&self` and pools its
+/// own connection per call, so this interleaving is supported (Codex
+/// review, issue #1429). Both calls would capture the same checkpoint
+/// before either transaction finishes. A later rollback would then
+/// truncate away an earlier sibling's already-committed hint, not just its
+/// own. `tokio::task_local!`'s `.scope()` sets its ambient value only for
+/// the span it wraps, even under concurrent polling on the same task. So
+/// nesting a private buffer per call gives each one its own hints
+/// regardless of interleaving. Only this call's own successful outcome
+/// then merges them into whichever buffer is ambient once the nested scope
+/// ends. That is the enclosing scope normally, or a still-more-tightly
+/// nested `buffered_checkpoint` call when `f` itself calls one.
+///
+/// # Errors
+///
+/// Returns the result of `f` unchanged.
+pub async fn buffered_checkpoint<T, E, F>(f: F) -> Result<T, E>
+where
+    F: Future<Output = Result<T, E>>,
+{
+    if !scope_active() {
+        return buffered_settled(f).await;
+    }
+    let inner: Arc<Mutex<Vec<DispatchHint>>> = Arc::new(Mutex::new(Vec::new()));
+    let handle = Arc::clone(&inner);
+    let outcome = HINT_BUFFER.scope(inner, f).await;
+    if outcome.is_ok() {
+        let hints = std::mem::take(&mut *lock(&handle));
+        let _ = HINT_BUFFER.try_with(|buffer| lock(buffer).extend(hints));
+    }
+    outcome
+}
+
+// ---------------------------------------------------------------------------
+// Bound channel
+// ---------------------------------------------------------------------------
+
+tokio::task_local! {
+    /// The channel every publish from the current task uses (issue #1431).
+    ///
+    /// `None` means publish nothing. With no scope, a publish uses the live
+    /// slot.
+    static BOUND_CHANNEL: Option<Arc<dyn TaskDispatch>>;
+}
+
+/// Run `f` with every publish it makes bound to `channel` (issue #1431).
+///
+/// The slot is process-global, so a second runtime in the same process can
+/// replace it. A worker keeps the channel it started with. Its task hints must
+/// follow that channel. The replacement's worker would otherwise read them,
+/// probe its own database, miss, and ack them as absent.
+///
+/// `None` binds to no channel, so nothing in `f` publishes. A worker that
+/// does not read a channel must not feed one.
+///
+/// The binding is task-local. A task that `f` spawns does not inherit it.
+// The callers need the `db` feature (issue #1431).
+#[cfg_attr(not(feature = "db"), allow(dead_code))]
+pub(crate) async fn with_bound_channel<F: Future>(
+    channel: Option<Arc<dyn TaskDispatch>>,
+    f: F,
+) -> F::Output {
+    BOUND_CHANNEL.scope(channel, f).await
+}
+
+/// Where a publish from the current task goes (issue #1431).
+enum PublishTarget {
+    /// No bound scope is active. The publish uses the live slot.
+    Live,
+    /// A bound scope is active. `None` publishes nothing.
+    Bound(Option<Arc<dyn TaskDispatch>>),
+}
+
+/// The publish target of the current task.
+fn publish_target() -> PublishTarget {
+    BOUND_CHANNEL
+        .try_with(Clone::clone)
+        .map_or(PublishTarget::Live, PublishTarget::Bound)
+}
+
+/// Spawn `f` with the binding of the current task (issue #1431).
+///
+/// A worker spawns its maintenance loops through this call, so their hints
+/// follow the worker's channel too. With no bound scope, this is a plain
+/// `tokio::spawn`.
+// The callers need the `db` feature (issue #1431).
+#[cfg_attr(not(feature = "db"), allow(dead_code))]
+pub(crate) fn spawn_bound<F>(f: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    match BOUND_CHANNEL.try_with(Clone::clone) {
+        Ok(channel) => tokio::spawn(with_bound_channel(channel, f)),
+        Err(_) => tokio::spawn(f),
+    }
+}
+
+/// True when a hint raised now can reach a channel (issue #1431).
+///
+/// An active binding decides first. A task bound to a channel wants hints,
+/// even after another runtime clears the slot. A task bound to no channel
+/// wants none, even while another runtime has a channel installed. With no
+/// binding, the live slot decides. Hint writers check this call, not
+/// [`is_installed`], before they build a hint.
+#[must_use]
+pub fn hints_wanted() -> bool {
+    BOUND_CHANNEL
+        .try_with(Option::is_some)
+        .unwrap_or_else(|_| is_installed())
+}
+
+/// Publish `hints` on the bound channel, or else on the installed one, now.
 ///
 /// Errors are logged and dropped. The reconcile sweep in the worker is the
 /// durability floor. It republishes every due `PENDING` row the channel does
@@ -364,10 +1219,18 @@ pub async fn publish_now(hints: Vec<DispatchHint>) {
     if hints.is_empty() {
         return;
     }
-    let Some(installed) = installed() else {
-        return;
+    let channel = match publish_target() {
+        PublishTarget::Bound(bound) => bound,
+        PublishTarget::Live => installed().map(|installed| installed.channel),
     };
-    if let Err(error) = installed.channel.publish(&hints).await {
+    if let Some(channel) = channel {
+        publish_on(channel.as_ref(), hints).await;
+    }
+}
+
+/// Publish `hints` on `channel`, and log a failure.
+async fn publish_on(channel: &dyn TaskDispatch, hints: Vec<DispatchHint>) {
+    if let Err(error) = channel.publish(&hints).await {
         tracing::warn!(
             error = %error,
             count = hints.len(),
@@ -380,10 +1243,10 @@ pub async fn publish_now(hints: Vec<DispatchHint>) {
 ///
 /// Inside a [`buffered`] scope the hint waits for the flush after commit.
 /// Outside one it goes to a background publisher that batches hints, so the
-/// caller never awaits the channel. The call is a single atomic load when no
-/// channel is installed.
+/// caller never awaits the channel. With no channel, the call costs one atomic
+/// load and one task-local read.
 pub fn record_hint(hint: DispatchHint) {
-    if !is_installed() {
+    if !hints_wanted() {
         return;
     }
     let mut carried = Some(hint);
@@ -404,7 +1267,7 @@ pub fn record_hint(hint: DispatchHint) {
 pub fn record_hints(hints: Vec<DispatchHint>) {
     // One guard for the whole batch, so a deployment with no channel does not
     // pay one load per hint.
-    if !is_installed() {
+    if !hints_wanted() {
         return;
     }
     for hint in hints {
@@ -482,10 +1345,19 @@ fn record_dropped_hint() {
     }
 }
 
+/// One hint in the publisher queue, with the channel it must go to.
+#[derive(Debug)]
+struct QueuedHint {
+    hint: DispatchHint,
+    /// The bound channel of the scope that queued the hint (issue #1431).
+    /// `None` means the live slot at publish time.
+    channel: Option<Arc<dyn TaskDispatch>>,
+}
+
 /// The background publisher task and the channel that feeds it.
 #[derive(Debug)]
 struct Publisher {
-    sender: tokio::sync::mpsc::Sender<DispatchHint>,
+    sender: tokio::sync::mpsc::Sender<QueuedHint>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -506,7 +1378,16 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// The task is spawned lazily from inside a Tokio runtime. A caller with no
 /// current runtime cannot spawn one, so the hint is dropped and the reconcile
 /// sweep republishes the row.
-fn publish_in_background(mut hint: DispatchHint) {
+///
+/// A hint queued in a bound scope keeps that scope's channel (issue #1431).
+/// A scope bound to no channel drops the hint here.
+fn publish_in_background(hint: DispatchHint) {
+    let channel = match publish_target() {
+        PublishTarget::Live => None,
+        PublishTarget::Bound(Some(channel)) => Some(channel),
+        PublishTarget::Bound(None) => return,
+    };
+    let mut hint = QueuedHint { hint, channel };
     let mut slot = lock(&PUBLISHER);
     if let Some(publisher) = slot.as_ref()
         && !publisher.task.is_finished()
@@ -538,17 +1419,52 @@ fn publish_in_background(mut hint: DispatchHint) {
 }
 
 /// Drain the publisher channel and issue one `publish` call per batch.
-async fn publisher_loop(mut receiver: tokio::sync::mpsc::Receiver<DispatchHint>) {
+async fn publisher_loop(mut receiver: tokio::sync::mpsc::Receiver<QueuedHint>) {
     while let Some(first) = receiver.recv().await {
         let mut batch = Vec::with_capacity(1);
         batch.push(first);
         while batch.len() < PUBLISH_BATCH_MAX {
             match receiver.try_recv() {
-                Ok(hint) => batch.push(hint),
+                Ok(queued) => batch.push(queued),
                 Err(_) => break,
             }
         }
-        publish_now(batch).await;
+        publish_batch(batch).await;
+    }
+}
+
+/// Publish `batch` with one call per run of hints that share a channel.
+///
+/// The publisher task has no bound scope, so a run with no channel uses the
+/// live slot.
+async fn publish_batch(batch: Vec<QueuedHint>) {
+    let mut run: Vec<DispatchHint> = Vec::new();
+    let mut run_channel: Option<Arc<dyn TaskDispatch>> = None;
+    for queued in batch {
+        if !run.is_empty() && !same_channel(run_channel.as_ref(), queued.channel.as_ref()) {
+            publish_run(run_channel.take(), std::mem::take(&mut run)).await;
+        }
+        run_channel = queued.channel;
+        run.push(queued.hint);
+    }
+    publish_run(run_channel, run).await;
+}
+
+/// True when both name the live slot, or both name the same channel.
+fn same_channel(a: Option<&Arc<dyn TaskDispatch>>, b: Option<&Arc<dyn TaskDispatch>>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        _ => false,
+    }
+}
+
+/// Publish one run of hints on its channel, or on the live slot.
+async fn publish_run(channel: Option<Arc<dyn TaskDispatch>>, hints: Vec<DispatchHint>) {
+    match channel {
+        Some(channel) if !hints.is_empty() => publish_on(channel.as_ref(), hints).await,
+        Some(_) => {}
+        None => publish_now(hints).await,
     }
 }
 
@@ -992,7 +1908,7 @@ mod tests {
     use super::*;
 
     /// Serializes the cases that install the process-global channel.
-    static INSTALL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    use super::TEST_SLOT_LOCK as INSTALL_LOCK;
 
     fn hint(queue: &str, at: DateTime<Utc>) -> DispatchHint {
         DispatchHint {
@@ -1016,6 +1932,15 @@ mod tests {
             .expect("read")
             .into_iter()
             .next()
+    }
+
+    /// A channel with no override reports one round trip per queue. The
+    /// worker's read timeout then keeps its old bound (#1756).
+    #[test]
+    fn a_channel_reports_one_read_round_trip_per_queue_by_default() {
+        let channel = MemoryDispatch::new();
+        assert_eq!(channel.next_round_trips(1), 1);
+        assert_eq!(channel.next_round_trips(4), 4);
     }
 
     /// The kind is the `task_type`
@@ -1090,6 +2015,298 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn per_shard_channels_are_independent_of_each_other_and_of_the_global_slot() {
+        // Issue #1429. A multi-shard runtime installs one channel per shard;
+        // this pins that the slots do not leak into each other or into the
+        // single-shard `install`/`installed` pair.
+        let _guard = INSTALL_LOCK.lock().await;
+        uninstall();
+        uninstall_all_shards();
+
+        let shard_a = crate::types::ShardId::new(1);
+        let shard_b = crate::types::ShardId::new(2);
+        let channel_a = Arc::new(MemoryDispatch::new());
+        let channel_b = Arc::new(MemoryDispatch::new());
+        install_for_shard(
+            shard_a,
+            Arc::clone(&channel_a) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+        install_for_shard(
+            shard_b,
+            Arc::clone(&channel_b) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        assert!(installed_for_shard(shard_a).is_some());
+        assert!(installed_for_shard(shard_b).is_some());
+        assert!(
+            installed_for_shard(crate::types::ShardId::new(9)).is_none(),
+            "an unregistered shard has no channel"
+        );
+        assert!(
+            installed().is_none(),
+            "installing per-shard channels must not populate the single-shard slot"
+        );
+
+        uninstall_all_shards();
+        assert!(installed_for_shard(shard_a).is_none());
+        assert!(installed_for_shard(shard_b).is_none());
+    }
+
+    /// `install_shards` replaces the whole topology — both slots, and
+    /// every shard — in one atomic step (Codex review, issue #1429
+    /// follow-up).
+    ///
+    /// A caller that instead clears both slots and then calls
+    /// `install_for_shard` once per shard leaves a gap between those
+    /// calls. A racing installer could land in that gap. This pins the
+    /// single-call replacement's own correctness. It clears a stale
+    /// single-shard channel, and a stale per-shard channel for a shard
+    /// the new topology no longer names. It installs every given shard,
+    /// and returns generations that match what is actually in the map.
+    #[tokio::test]
+    async fn install_shards_replaces_both_slots_and_every_shard_atomically() {
+        let _guard = INSTALL_LOCK.lock().await;
+        uninstall();
+        uninstall_all_shards();
+
+        install(
+            Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+        let stale_shard = crate::types::ShardId::new(9);
+        install_for_shard(
+            stale_shard,
+            Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        let shard_a = crate::types::ShardId::new(1);
+        let shard_b = crate::types::ShardId::new(2);
+        let (installed_shards, previous) = install_shards(vec![
+            (
+                shard_a,
+                Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+                DispatchSettings::default(),
+            ),
+            (
+                shard_b,
+                Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+                DispatchSettings::default(),
+            ),
+        ]);
+
+        assert!(
+            previous.single.is_some(),
+            "the snapshot must carry the single-shard slot install_shards just cleared"
+        );
+        assert!(
+            installed().is_none(),
+            "install_shards must clear the single-shard slot too"
+        );
+        assert!(
+            installed_for_shard(stale_shard).is_none(),
+            "install_shards must clear a shard the new topology no longer names"
+        );
+        assert_eq!(installed_shards.len(), 2);
+        for (shard, generation) in installed_shards {
+            let live = installed_for_shard(shard).expect("each returned shard must be installed");
+            assert_eq!(
+                live.generation, generation,
+                "the returned generation must match the one actually stamped on the slot"
+            );
+        }
+
+        uninstall_all_shards();
+    }
+
+    /// `install_single` is the single-shard mirror of `install_shards`
+    /// (Codex review, issue #1429 follow-up): it replaces both slots, not
+    /// only the single-shard one, in one `DISPATCH_SLOT_LOCK` acquisition.
+    #[tokio::test]
+    async fn install_single_replaces_both_slots_atomically() {
+        let _guard = INSTALL_LOCK.lock().await;
+        uninstall();
+        uninstall_all_shards();
+
+        let stale_shard = crate::types::ShardId::new(3);
+        install_for_shard(
+            stale_shard,
+            Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        let (generation, previous) = install_single(
+            Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        assert!(
+            previous.shards.is_some(),
+            "the snapshot must carry the per-shard slot install_single just cleared"
+        );
+        assert!(
+            installed_for_shard(stale_shard).is_none(),
+            "install_single must clear a stale per-shard channel too"
+        );
+        let live = installed().expect("install_single must install the single-shard slot");
+        assert_eq!(
+            live.generation, generation,
+            "the returned generation must match the one actually stamped on the slot"
+        );
+
+        uninstall();
+    }
+
+    /// `restore_single_if_current` puts the previous single-shard channel
+    /// back with its own, original generation, not a freshly minted one
+    /// (Codex review, issue #1429 follow-up).
+    ///
+    /// A caller whose own startup fails after `install_single` replaced
+    /// the topology restores it this way, rather than through `install`.
+    /// The still-running previous runner's own remembered generation
+    /// still names the slot's occupant this way. This pins that: the
+    /// original generation's own `uninstall_if_current` clears the slot
+    /// again after the restore, proving the restored slot still carries
+    /// it.
+    #[tokio::test]
+    async fn restore_single_if_current_puts_back_the_previous_channel_and_its_generation() {
+        let _guard = INSTALL_LOCK.lock().await;
+        uninstall();
+        uninstall_all_shards();
+
+        let original_generation = install(
+            Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        let (replacement_generation, previous) = install_single(
+            Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+        assert_eq!(
+            previous
+                .single
+                .as_ref()
+                .map(|installed| installed.generation),
+            Some(original_generation)
+        );
+
+        restore_single_if_current(&previous, replacement_generation);
+        let live = installed().expect("restore must put the previous channel back");
+        assert_eq!(
+            live.generation, original_generation,
+            "restore must not mint a fresh generation for the restored channel"
+        );
+
+        uninstall_if_current(original_generation);
+        assert!(
+            installed().is_none(),
+            "the original generation's own uninstall must still clear the restored slot"
+        );
+    }
+
+    /// `restore_single_if_current` is a no-op once a newer, unrelated
+    /// install has already replaced the one it was meant to undo (Codex
+    /// review, issue #1429 follow-up).
+    ///
+    /// A restore that ignored this could discard that newer install
+    /// instead of undoing its own caller's failed startup.
+    #[tokio::test]
+    async fn restore_single_if_current_is_a_no_op_once_a_newer_install_has_replaced_it() {
+        let _guard = INSTALL_LOCK.lock().await;
+        uninstall();
+        uninstall_all_shards();
+
+        let (replacement_generation, previous) = install_single(
+            Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+        let newer_generation = install(
+            Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        restore_single_if_current(&previous, replacement_generation);
+        let live = installed().expect("the newer install must still be in place");
+        assert_eq!(
+            live.generation, newer_generation,
+            "restore must leave a newer, unrelated install alone"
+        );
+
+        uninstall();
+    }
+
+    /// `restore_shards_if_current` mirrors
+    /// `restore_single_if_current_puts_back_the_previous_channel_and_its_generation`
+    /// for the per-shard slot (Codex review, issue #1429 follow-up).
+    #[tokio::test]
+    async fn restore_shards_if_current_puts_back_the_previous_shards_and_their_generations() {
+        let _guard = INSTALL_LOCK.lock().await;
+        uninstall();
+        uninstall_all_shards();
+
+        let shard = crate::types::ShardId::new(4);
+        let original_generation = install_for_shard(
+            shard,
+            Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        let (replacement_shards, previous) = install_shards(vec![(
+            shard,
+            Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        )]);
+
+        restore_shards_if_current(&previous, &replacement_shards);
+        let live = installed_for_shard(shard).expect("restore must put the previous shard back");
+        assert_eq!(
+            live.generation, original_generation,
+            "restore must not mint a fresh generation for the restored shard"
+        );
+
+        uninstall_all_shards();
+    }
+
+    /// `restore_shards_if_current` is a no-op once a newer, unrelated
+    /// install has already replaced the shards it was meant to undo
+    /// (Codex review, issue #1429 follow-up).
+    #[tokio::test]
+    async fn restore_shards_if_current_is_a_no_op_once_a_newer_install_has_replaced_it() {
+        let _guard = INSTALL_LOCK.lock().await;
+        uninstall();
+        uninstall_all_shards();
+
+        let shard = crate::types::ShardId::new(5);
+        let (replacement_shards, previous) = install_shards(vec![(
+            shard,
+            Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        )]);
+        let (newer_shards, _newer_previous) = install_shards(vec![(
+            shard,
+            Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        )]);
+
+        restore_shards_if_current(&previous, &replacement_shards);
+        let live = installed_for_shard(shard).expect("the newer install must still be in place");
+        let newer_generation = newer_shards
+            .iter()
+            .find(|(installed_shard, _)| *installed_shard == shard)
+            .map(|(_, generation)| *generation)
+            .expect("the newer install must cover this shard");
+        assert_eq!(
+            live.generation, newer_generation,
+            "restore must leave a newer, unrelated install alone"
+        );
+
+        uninstall_all_shards();
+    }
+
+    #[tokio::test]
     async fn a_hint_outside_a_scope_reaches_the_channel() {
         let _guard = INSTALL_LOCK.lock().await;
         let channel = Arc::new(MemoryDispatch::new());
@@ -1133,7 +2350,7 @@ mod tests {
         })
         .await;
         assert_eq!(leftover, vec![one.clone()]);
-        assert!(channel.published_ids().is_empty());
+        assert_eq!(channel.published_ids(), [] as [uuid::Uuid; 0]);
 
         publish_now(leftover).await;
         assert_eq!(channel.published_ids(), vec![one.task_id]);
@@ -1179,7 +2396,7 @@ mod tests {
             flush_scope().await;
         })
         .await;
-        assert!(leftover.is_empty());
+        assert_eq!(leftover, [] as [crate::dispatch::DispatchHint; 0]);
         assert_eq!(channel.published_ids(), vec![one.task_id]);
         uninstall();
     }
@@ -1307,6 +2524,269 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checkpoint_discards_only_its_own_hints_on_error_when_nested() {
+        // Codex review, issue #1429. `buffered_settled` degrades to a no-op
+        // passthrough when nested. So a nested owner's own failure could
+        // not stop its hint from riding out with the enclosing scope. This
+        // is the guarantee `buffered_checkpoint` adds.
+        let _guard = INSTALL_LOCK.lock().await;
+        let channel = Arc::new(MemoryDispatch::new());
+        install(
+            Arc::clone(&channel) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        let sibling = hint("q", Utc::now());
+        let failed = hint("q", Utc::now());
+        let sibling_inner = sibling.clone();
+        let failed_inner = failed.clone();
+        let ((), outer) = buffered(async move {
+            // A sibling call earlier in the same enclosing scope.
+            record_hint(sibling_inner);
+
+            let outcome = buffered_checkpoint(async move {
+                record_hint(failed_inner);
+                Err::<(), &str>("commit failed")
+            })
+            .await;
+            assert!(outcome.is_err());
+        })
+        .await;
+
+        assert_eq!(
+            outer,
+            vec![sibling],
+            "the failed checkpoint's own hint is gone; the sibling's is not"
+        );
+        uninstall();
+    }
+
+    #[tokio::test]
+    async fn checkpoint_keeps_its_hints_on_success_when_nested() {
+        let _guard = INSTALL_LOCK.lock().await;
+        let channel = Arc::new(MemoryDispatch::new());
+        install(
+            Arc::clone(&channel) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        let one = hint("q", Utc::now());
+        let inner = one.clone();
+        let observed = Arc::clone(&channel);
+        let ((), outer) = buffered(async move {
+            let outcome = buffered_checkpoint(async move {
+                record_hint(inner);
+                Ok::<(), &str>(())
+            })
+            .await;
+            assert!(outcome.is_ok());
+            assert!(
+                observed.published_ids().is_empty(),
+                "a nested checkpoint must not publish before the enclosing scope flushes"
+            );
+        })
+        .await;
+
+        assert_eq!(outer, vec![one]);
+        uninstall();
+    }
+
+    #[tokio::test]
+    async fn checkpoint_matches_buffered_settled_when_not_nested() {
+        let _guard = INSTALL_LOCK.lock().await;
+        let channel = Arc::new(MemoryDispatch::new());
+        install(
+            Arc::clone(&channel) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        let committed = hint("q", Utc::now());
+        let inner = committed.clone();
+        let outcome = buffered_checkpoint(async move {
+            record_hint(inner);
+            Ok::<(), &str>(())
+        })
+        .await;
+        assert!(outcome.is_ok());
+        assert_eq!(channel.published_ids(), vec![committed.task_id]);
+        uninstall();
+    }
+
+    #[tokio::test]
+    async fn concurrent_checkpoints_do_not_clobber_each_others_hints() {
+        // Codex review, issue #1429. `run_transactional` takes `&self` and
+        // pools its own connection per call, so an activity can join two
+        // calls concurrently. A length checkpoint on the shared enclosing
+        // buffer cannot isolate them. Both capture the same checkpoint
+        // before either pushes a hint, so a later rollback truncates away
+        // an earlier sibling's already-committed hint too. Forcing that
+        // exact interleaving here reproduces the bug against the old
+        // checkpoint-and-truncate implementation. See
+        // `buffered_checkpoint`'s own doc comment.
+        let _guard = INSTALL_LOCK.lock().await;
+        let channel = Arc::new(MemoryDispatch::new());
+        install(
+            Arc::clone(&channel) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        let committed = hint("q", Utc::now());
+        let committed_inner = committed.clone();
+        let rolled_back = hint("q", Utc::now());
+
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+        let (committed_tx, committed_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let ((), outer) = buffered(async move {
+            let succeeding = async move {
+                // Wait until the failing sibling has entered its own
+                // checkpoint, while the buffer is still empty, before
+                // this one pushes anything.
+                ready_rx.await.unwrap();
+                let outcome = buffered_checkpoint(async move {
+                    record_hint(committed_inner);
+                    Ok::<(), &str>(())
+                })
+                .await;
+                assert!(outcome.is_ok());
+                committed_tx.send(()).unwrap();
+            };
+            let failing = async move {
+                let outcome = buffered_checkpoint(async move {
+                    // Signal readiness, then wait for the sibling to push
+                    // and commit its own hint before this one pushes and
+                    // fails.
+                    ready_tx.send(()).unwrap();
+                    committed_rx.await.unwrap();
+                    record_hint(rolled_back);
+                    Err::<(), &str>("commit failed")
+                })
+                .await;
+                assert!(outcome.is_err());
+            };
+            tokio::join!(succeeding, failing);
+        })
+        .await;
+
+        assert_eq!(
+            outer,
+            vec![committed],
+            "a concurrent sibling's rollback must not discard this call's committed hint"
+        );
+        uninstall();
+    }
+
+    /// `uninstall_all_shards` stops the background publisher, the
+    /// multi-shard mirror of `uninstall`'s own cleanup (Codex review,
+    /// issue #1429).
+    ///
+    /// A multi-shard runtime can start the publisher through
+    /// `buffered_settled_in_background`, even though `publish_now` only
+    /// ever reads the single-shard slot and can never actually publish
+    /// there. Left running, that task and its sender would leak across an
+    /// embedded runner's restart.
+    #[tokio::test]
+    async fn uninstall_all_shards_stops_the_background_publisher() {
+        let _guard = INSTALL_LOCK.lock().await;
+        publish_in_background(hint("q", Utc::now()));
+        assert!(
+            lock(&PUBLISHER)
+                .as_ref()
+                .is_some_and(|publisher| !publisher.task.is_finished()),
+            "the test fixture must start the publisher"
+        );
+
+        uninstall_all_shards();
+
+        assert!(
+            lock(&PUBLISHER).is_none(),
+            "uninstall_all_shards must stop and clear the background publisher"
+        );
+    }
+
+    /// `uninstall` must not clear [`is_installed`] while a per-shard
+    /// channel is still installed (Codex review, issue #1429).
+    ///
+    /// A direct embedder can call the single-shard `install`/`uninstall`
+    /// pair alongside the independent per-shard API. Clearing the flag
+    /// unconditionally on `uninstall` let `is_installed()` read false
+    /// while `installed_for_shard` still returned a live channel.
+    /// `Worker::new` skips its full-coverage validation whenever
+    /// `is_installed()` is false, so a partial shard map could then run
+    /// silently with mixed Redis/Postgres dispatch behaviour.
+    #[tokio::test]
+    async fn uninstall_leaves_the_flag_set_while_a_shard_channel_remains() {
+        let _guard = INSTALL_LOCK.lock().await;
+        uninstall();
+        uninstall_all_shards();
+
+        install(
+            Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+        install_for_shard(
+            crate::types::ShardId::new(1),
+            Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        uninstall();
+
+        assert!(installed().is_none(), "uninstall must clear its own slot");
+        assert!(
+            is_installed(),
+            "a shard channel is still installed, so the flag must stay set"
+        );
+
+        uninstall_all_shards();
+        assert!(!is_installed(), "the flag clears once every slot is empty");
+    }
+
+    /// Concurrent install/uninstall calls never leave `is_installed()`
+    /// disagreeing with `installed()` (Codex review, issue #1429
+    /// follow-up).
+    ///
+    /// `uninstall_if_current` used to drop its slot's write lock, then
+    /// separately read the other slot to recompute `ANY_INSTALLED`. A
+    /// concurrent `install` could land in that gap and set
+    /// `ANY_INSTALLED = true` for its own fresh channel. The stale
+    /// recomputation then clobbered it back to `false`: `is_installed()`
+    /// said no channel was installed while `installed()` still returned
+    /// one. `DISPATCH_SLOT_LOCK` now serializes every mutating call. This
+    /// hammers `install`/`uninstall_if_current` from several threads at
+    /// once, then checks the flag and the slot agree once every thread has
+    /// finished.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_install_and_uninstall_never_desyncs_the_installed_flag() {
+        let _guard = INSTALL_LOCK.lock().await;
+        uninstall();
+        uninstall_all_shards();
+
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    for _ in 0..200 {
+                        let channel = Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>;
+                        let generation = install(channel, DispatchSettings::default());
+                        uninstall_if_current(generation);
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("a racing thread must not panic");
+        }
+
+        assert_eq!(
+            is_installed(),
+            installed().is_some(),
+            "the fast-path flag must never disagree with the slot it mirrors"
+        );
+
+        uninstall();
+    }
+
+    #[tokio::test]
     async fn no_channel_makes_every_hook_a_no_op() {
         let _guard = INSTALL_LOCK.lock().await;
         uninstall();
@@ -1333,6 +2813,207 @@ mod tests {
         channel.ack(&lease).await.expect("ack");
         assert_eq!(channel.acked_ids(), vec![one.task_id]);
         assert!(channel.is_drained());
+    }
+
+    #[tokio::test]
+    async fn ack_many_drops_every_lease_in_the_batch() {
+        // Issue #1429. `MemoryDispatch` does not override `ack_many`, so this
+        // exercises the trait's default sequential implementation.
+        let channel = MemoryDispatch::new();
+        let a = hint("q", Utc::now());
+        let b = hint("q", Utc::now());
+        channel
+            .publish(&[a.clone(), b.clone()])
+            .await
+            .expect("publish");
+
+        // One `next` call already returns both ready entries (`max` is 8).
+        // Two separate `read_one` calls would silently drop the second,
+        // since it never returns more than one lease per call.
+        let leases = channel
+            .next(&queues(), "c", 8, Duration::from_millis(0))
+            .await
+            .expect("read");
+        assert_eq!(leases.len(), 2, "both entries are ready in one read");
+        assert_eq!(channel.outstanding_leases(), 2);
+
+        channel.ack_many(&leases).await.expect("ack_many");
+        let mut acked = channel.acked_ids();
+        acked.sort();
+        let mut expected = vec![a.task_id, b.task_id];
+        expected.sort();
+        assert_eq!(acked, expected);
+        assert!(channel.is_drained());
+    }
+
+    /// Wraps [`MemoryDispatch`] and fails `ack`/`release` on one named
+    /// lease. `ack_many`'s and `release_many`'s trait-default sequential
+    /// loops then have something to fail partway through (Codex review,
+    /// issue #1429).
+    #[derive(Debug)]
+    struct FailOneLease {
+        inner: MemoryDispatch,
+        fails: Uuid,
+    }
+
+    #[async_trait]
+    impl TaskDispatch for FailOneLease {
+        async fn publish(&self, hints: &[DispatchHint]) -> HarvestResult<()> {
+            self.inner.publish(hints).await
+        }
+
+        async fn next(
+            &self,
+            queues: &[String],
+            consumer: &str,
+            max: usize,
+            wait: Duration,
+        ) -> HarvestResult<Vec<DispatchLease>> {
+            self.inner.next(queues, consumer, max, wait).await
+        }
+
+        async fn ack(&self, lease: &DispatchLease) -> HarvestResult<()> {
+            if lease.task_id == self.fails {
+                return Err(crate::error::HarvestError::Dispatch(
+                    "injected ack failure".to_string(),
+                ));
+            }
+            self.inner.ack(lease).await
+        }
+
+        async fn release(&self, lease: &DispatchLease, delay: Duration) -> HarvestResult<()> {
+            if lease.task_id == self.fails {
+                return Err(crate::error::HarvestError::Dispatch(
+                    "injected release failure".to_string(),
+                ));
+            }
+            self.inner.release(lease, delay).await
+        }
+
+        async fn maintain(&self, queues: &[String]) -> HarvestResult<DispatchMaintenance> {
+            self.inner.maintain(queues).await
+        }
+    }
+
+    #[tokio::test]
+    async fn ack_many_default_attempts_every_lease_despite_one_failure() {
+        let a = hint("q", Utc::now());
+        let b = hint("q", Utc::now());
+        let inner = MemoryDispatch::new();
+        inner
+            .publish(&[a.clone(), b.clone()])
+            .await
+            .expect("publish");
+        let leases = inner
+            .next(&queues(), "c", 8, Duration::from_millis(0))
+            .await
+            .expect("read");
+        assert_eq!(leases.len(), 2, "both entries are ready in one read");
+
+        let channel = FailOneLease {
+            inner,
+            fails: a.task_id,
+        };
+        let result = channel.ack_many(&leases).await;
+        assert!(result.is_err(), "the injected failure surfaces");
+        // `b` still got acked despite `a`'s failure (Codex review, issue
+        // #1429): the default loop attempts every lease rather than
+        // stopping at the first error.
+        assert_eq!(channel.inner.acked_ids(), vec![b.task_id]);
+    }
+
+    #[tokio::test]
+    async fn release_many_default_attempts_every_lease_despite_one_failure() {
+        let a = hint("q", Utc::now());
+        let b = hint("q", Utc::now());
+        let inner = MemoryDispatch::new();
+        inner
+            .publish(&[a.clone(), b.clone()])
+            .await
+            .expect("publish");
+        let leases = inner
+            .next(&queues(), "c", 8, Duration::from_millis(0))
+            .await
+            .expect("read");
+        assert_eq!(leases.len(), 2, "both entries are ready in one read");
+        let delay = Duration::from_millis(5);
+        let batch: Vec<(DispatchLease, Duration)> =
+            leases.into_iter().map(|lease| (lease, delay)).collect();
+
+        let channel = FailOneLease {
+            inner,
+            fails: a.task_id,
+        };
+        let result = channel.release_many(&batch).await;
+        assert!(result.is_err(), "the injected failure surfaces");
+        // `b` still got released despite `a`'s failure, the same guarantee
+        // as `ack_many_default_attempts_every_lease_despite_one_failure`.
+        assert_eq!(channel.inner.released_ids(), vec![b.task_id]);
+    }
+
+    #[tokio::test]
+    async fn release_many_gives_every_lease_back_with_its_own_delay() {
+        // Issue #1429. Each lease in the batch carries its own delay, so a
+        // batch may mix an immediate return with a backed-off one. A shared
+        // delay for the whole batch would pass this assertion too, so the
+        // two leases here get different delays. Only the short one is ready
+        // right away; the long one is still not ready by then.
+        let channel = MemoryDispatch::new();
+        let a = hint("q", Utc::now());
+        let b = hint("q", Utc::now());
+        channel
+            .publish(&[a.clone(), b.clone()])
+            .await
+            .expect("publish");
+
+        // One `next` call already returns both ready entries; see the note
+        // in `ack_many_drops_every_lease_in_the_batch` above.
+        let mut leases = channel
+            .next(&queues(), "c", 8, Duration::from_millis(0))
+            .await
+            .expect("read");
+        assert_eq!(leases.len(), 2, "both entries are ready in one read");
+        leases.sort_by_key(|lease| lease.task_id);
+        let mut by_id = [a.task_id, b.task_id];
+        by_id.sort_unstable();
+        let (short, long) = (leases.remove(0), leases.remove(0));
+        assert_eq!(short.task_id, by_id[0]);
+        assert_eq!(long.task_id, by_id[1]);
+
+        channel
+            .release_many(&[
+                (short, Duration::from_millis(0)),
+                (long, Duration::from_millis(200)),
+            ])
+            .await
+            .expect("release_many");
+        let mut released = channel.released_ids();
+        released.sort();
+        let mut expected = vec![a.task_id, b.task_id];
+        expected.sort();
+        assert_eq!(released, expected);
+
+        let immediate = read_one(&channel).await.expect("the short delay is ready");
+        assert_eq!(
+            immediate.task_id, by_id[0],
+            "only the lease released with no delay is ready yet"
+        );
+        assert!(
+            channel
+                .next(&queues(), "c", 8, Duration::from_millis(0))
+                .await
+                .expect("read")
+                .is_empty(),
+            "the lease released with a 200ms delay must not be ready yet"
+        );
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        channel.maintain(&queues()).await.expect("maintain");
+        let delayed = read_one(&channel)
+            .await
+            .expect("the long delay is ready now");
+        assert_eq!(delayed.task_id, by_id[1]);
+        assert_eq!(delayed.redeliveries, 1);
     }
 
     #[tokio::test]
@@ -1603,5 +3284,199 @@ mod tests {
         assert_eq!(leases.len(), 1);
         assert_eq!(leases[0].task_id, second.task_id);
         assert_eq!(channel.delivered_ids().len(), 2);
+    }
+
+    /// A publish inside a bound scope goes to the bound channel, not to the
+    /// live slot (issue #1431).
+    ///
+    /// Runner B can replace runner A's channel while A's worker still runs.
+    /// A's task hints must stay on A's channel. B's worker would otherwise
+    /// probe its own database, miss, and ack them as absent.
+    #[tokio::test]
+    async fn a_bound_scope_publishes_to_its_own_channel_not_the_live_slot() {
+        let _guard = INSTALL_LOCK.lock().await;
+        let live = Arc::new(MemoryDispatch::new());
+        install(
+            Arc::clone(&live) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+        let bound = Arc::new(MemoryDispatch::new());
+
+        let one = hint("q", Utc::now());
+        let inner = one.clone();
+        with_bound_channel(
+            Some(Arc::clone(&bound) as Arc<dyn TaskDispatch>),
+            async move {
+                let ((), hints) = buffered(async move { record_hint(inner) }).await;
+                publish_now(hints).await;
+            },
+        )
+        .await;
+        uninstall();
+
+        assert_eq!(bound.published_ids(), vec![one.task_id]);
+        assert!(
+            live.published_ids().is_empty(),
+            "the live slot must not receive a bound scope's hint"
+        );
+    }
+
+    /// A scope bound to no channel publishes nothing, even while another
+    /// runtime has a channel installed (issue #1431).
+    #[tokio::test]
+    async fn a_scope_bound_to_no_channel_publishes_nothing() {
+        let _guard = INSTALL_LOCK.lock().await;
+        let live = Arc::new(MemoryDispatch::new());
+        install(
+            Arc::clone(&live) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+
+        let wanted = with_bound_channel(None, async { hints_wanted() }).await;
+        with_bound_channel(None, publish_now(vec![hint("q", Utc::now())])).await;
+        with_bound_channel(None, async { publish_in_background(hint("q", Utc::now())) }).await;
+        // The publisher queue is FIFO. A leaked hint lands before this one.
+        let sentinel = hint("q", Utc::now());
+        publish_in_background(sentinel.clone());
+        for _ in 0..100 {
+            if !live.published_ids().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        uninstall();
+
+        assert!(
+            !wanted,
+            "a scope bound to no channel must not ask writers to build hints"
+        );
+        assert_eq!(
+            live.published_ids(),
+            vec![sentinel.task_id],
+            "a scope bound to no channel must not publish into the live slot"
+        );
+    }
+
+    /// The publisher splits a batch into runs by channel and keeps the order
+    /// inside each channel (issue #1431).
+    #[tokio::test]
+    async fn the_publisher_groups_a_mixed_batch_by_channel() {
+        let first = Arc::new(MemoryDispatch::new());
+        let second = Arc::new(MemoryDispatch::new());
+        let queued = |channel: &Arc<MemoryDispatch>| QueuedHint {
+            hint: hint("q", Utc::now()),
+            channel: Some(Arc::clone(channel) as Arc<dyn TaskDispatch>),
+        };
+        let batch = vec![
+            queued(&first),
+            queued(&second),
+            queued(&first),
+            queued(&first),
+        ];
+        let first_ids = [&batch[0], &batch[2], &batch[3]].map(|q| q.hint.task_id);
+        let second_ids = [batch[1].hint.task_id];
+
+        publish_batch(batch).await;
+
+        assert_eq!(first.published_ids(), first_ids.to_vec());
+        assert_eq!(second.published_ids(), second_ids.to_vec());
+    }
+
+    /// The background publisher honours the binding of the scope that
+    /// queued the hint (issue #1431).
+    #[tokio::test]
+    async fn a_background_publish_in_a_bound_scope_uses_the_bound_channel() {
+        let _guard = INSTALL_LOCK.lock().await;
+        let live = Arc::new(MemoryDispatch::new());
+        install(
+            Arc::clone(&live) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+        let bound = Arc::new(MemoryDispatch::new());
+
+        let one = hint("q", Utc::now());
+        let unbound = hint("q", Utc::now());
+        let inner = one.clone();
+        with_bound_channel(
+            Some(Arc::clone(&bound) as Arc<dyn TaskDispatch>),
+            async move { publish_in_background(inner) },
+        )
+        .await;
+        publish_in_background(unbound.clone());
+        for _ in 0..100 {
+            if !bound.published_ids().is_empty() && !live.published_ids().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        uninstall();
+
+        assert_eq!(bound.published_ids(), vec![one.task_id]);
+        assert_eq!(
+            live.published_ids(),
+            vec![unbound.task_id],
+            "a hint queued outside a bound scope still uses the live slot"
+        );
+    }
+
+    /// A bound task keeps publishing after another runtime clears the slot
+    /// (issue #1431). The hint gate reads the binding, not only the slot.
+    #[tokio::test]
+    async fn a_bound_task_publishes_with_the_slot_empty() {
+        let _guard = INSTALL_LOCK.lock().await;
+        uninstall_all();
+        let bound = Arc::new(MemoryDispatch::new());
+
+        let one = hint("q", Utc::now());
+        let inner = one.clone();
+        let wanted = with_bound_channel(
+            Some(Arc::clone(&bound) as Arc<dyn TaskDispatch>),
+            async move {
+                let wanted = hints_wanted();
+                record_hint(inner);
+                wanted
+            },
+        )
+        .await;
+        for _ in 0..100 {
+            if !bound.published_ids().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        uninstall_all();
+
+        assert!(wanted, "a bound task must want hints with the slot empty");
+        assert!(!hints_wanted(), "an unbound task with no slot wants none");
+        assert_eq!(bound.published_ids(), vec![one.task_id]);
+    }
+
+    /// A task spawned through `spawn_bound` inherits the binding (issue
+    /// #1431). A plain `tokio::spawn` would lose it.
+    #[tokio::test]
+    async fn spawn_bound_carries_the_binding_into_the_new_task() {
+        let _guard = INSTALL_LOCK.lock().await;
+        let live = Arc::new(MemoryDispatch::new());
+        install(
+            Arc::clone(&live) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+        let bound = Arc::new(MemoryDispatch::new());
+
+        let one = hint("q", Utc::now());
+        let inner = one.clone();
+        with_bound_channel(
+            Some(Arc::clone(&bound) as Arc<dyn TaskDispatch>),
+            async move {
+                spawn_bound(publish_now(vec![inner]))
+                    .await
+                    .expect("the spawned task must finish");
+            },
+        )
+        .await;
+        uninstall();
+
+        assert_eq!(bound.published_ids(), vec![one.task_id]);
+        assert_eq!(live.published_ids(), [] as [uuid::Uuid; 0]);
     }
 }

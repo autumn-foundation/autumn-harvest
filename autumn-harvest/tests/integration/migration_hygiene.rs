@@ -105,11 +105,14 @@ fn day_granular_versions(list: &str) -> Vec<&str> {
 #[test]
 fn day_granular_detection_flags_a_zero_time_version_after_the_cutoff() {
     // Before the cutoff: grandfathered, however zeroed.
-    assert!(day_granular_versions("20260101000000_old").is_empty());
+    assert_eq!(day_granular_versions("20260101000000_old"), [] as [&str; 0]);
     // The cutoff itself is the last grandfathered version, not the first
     // flagged one — `20260728000000_harvest_audit_export` is on disk and must
     // keep its name.
-    assert!(day_granular_versions("20260728000000_audit_export").is_empty());
+    assert_eq!(
+        day_granular_versions("20260728000000_audit_export"),
+        [] as [&str; 0]
+    );
     // After it: flagged.
     assert_eq!(
         day_granular_versions("20260901000000_new"),
@@ -117,7 +120,7 @@ fn day_granular_detection_flags_a_zero_time_version_after_the_cutoff() {
         "a zero time component after the cutoff must be detected"
     );
     // A real time of day passes.
-    assert!(day_granular_versions("20260901115500_new").is_empty());
+    assert_eq!(day_granular_versions("20260901115500_new"), [] as [&str; 0]);
 }
 
 /// Migration versions must carry a real time of day, not just a date.
@@ -244,7 +247,10 @@ fn version_collision_detection_covers_both_trees() {
     // A distinct version is not a collision, so the guard cannot be vacuously
     // green by flagging everything.
     let distinct = ["20260719000000_plugin_thing".to_string()];
-    assert!(versions_colliding_with_core(&distinct, core).is_empty());
+    assert_eq!(
+        versions_colliding_with_core(&distinct, core),
+        [] as [&str; 0]
+    );
 }
 
 #[test]
@@ -334,6 +340,12 @@ const ALLOWED_HANDROLLED_MIGRATION_INCLUDES: &[&str] = &[
     // Separate plugin app-DB `harvest_workflow_outbox` migration — not part of
     // the core `migrations/` bundle that `test_init_sql()` emits.
     "autumn-harvest-plugin/tests/outbox_integration.rs",
+    // Same plugin app-DB `harvest_workflow_outbox` migration as
+    // `outbox_integration.rs` above, for the same reason. The manual
+    // `pg_stat_statements` perf-evidence harness for issue #1620 builds
+    // its own split app/Harvest database pair, not through
+    // `test_init_sql()`.
+    "autumn-harvest-plugin/tests/outbox_start_relay_perf.rs",
     // The three connector suites (issue #944) each build
     // `test_init_sql()` and then append the plugin-owned
     // `harvest_connector_dead_letters` migration, which likewise lives in
@@ -352,6 +364,16 @@ const ALLOWED_HANDROLLED_MIGRATION_INCLUDES: &[&str] = &[
     // suite bootstraps its databases through `test_init_sql()` like every
     // other.
     "autumn-harvest/tests/integration/event_partitioning_tests.rs",
+    // Does not BUILD a schema from the include either: the suite bootstraps
+    // through `test_init_sql()` like every other. It only REPLAYS the
+    // already-applied `20260921011505_harvest_task_queue_timer_fires_at`
+    // migration's own `up.sql`, a second time, idempotently (issue #1402
+    // review, Codex finding). The target is a row seeded to look like one
+    // that predates the column. That is the only way to test the
+    // migration's own backfill `UPDATE` against pre-existing data.
+    // `test_init_sql()` always applies every migration to an empty
+    // database instead.
+    "autumn-harvest-plugin/tests/stall_diagnosis_integration.rs",
 ];
 
 /// True when a single source line reintroduces a hand-rolled migration bundle: a

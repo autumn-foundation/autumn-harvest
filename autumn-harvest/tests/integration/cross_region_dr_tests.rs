@@ -1073,6 +1073,135 @@ async fn a_fence_bump_cannot_commit_while_a_persist_holds_the_fence() {
     FenceRegistry::clear();
 }
 
+/// A [`PayloadStore`](autumn_harvest::payload_store::PayloadStore) whose
+/// `put` blocks until released. A test can hold a batched append mid-
+/// upload with it, and probe whether it holds the fence lock at that
+/// moment.
+struct BlockingStore {
+    started: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+impl autumn_harvest::payload_store::PayloadStore for BlockingStore {
+    fn put(&self, bytes: &[u8]) -> autumn_harvest::payload_store::PayloadStoreFuture<'_, String> {
+        let started = self.started.lock().unwrap().take();
+        let release = self.release.lock().unwrap().take();
+        let key = format!("blocked-{}", bytes.len());
+        Box::pin(async move {
+            if let Some(tx) = started {
+                let _ = tx.send(());
+            }
+            if let Some(rx) = release {
+                let _ = rx.await;
+            }
+            Ok(key)
+        })
+    }
+    fn get(&self, _key: &str) -> autumn_harvest::payload_store::PayloadStoreFuture<'_, Vec<u8>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+    fn delete(&self, _key: &str) -> autumn_harvest::payload_store::PayloadStoreFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// A batched append must not hold the DR fence lock across its offload
+/// upload (issue #1589 review).
+///
+/// `append_new_execution_started_events_batch` offloads before opening its
+/// fenced transaction, per chunk. This mirrors the fix
+/// `append_events_offloaded_with_codecs` already applies to the single-
+/// execution append path. A concurrent `bump_generation` started while
+/// the upload is in flight must therefore succeed immediately. It must
+/// not block behind a fence read the pre-fix code would have held across
+/// the whole upload. That is exactly the barrier the previous test
+/// proves DOES block a persist that holds the fence.
+#[tokio::test]
+async fn a_batched_append_does_not_hold_the_fence_across_its_offload_upload() {
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("batchoffload");
+    let mut setup = connect(&url).await;
+    ensure_generation_row(&mut setup, ShardId::new(0))
+        .await
+        .unwrap();
+
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions \
+             (id, workflow_name, workflow_id, state, input, shard_id) \
+         VALUES ($1, 'wf', 'k1', 'RUNNING', '{}'::jsonb, 0)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut setup)
+    .await
+    .unwrap();
+
+    FenceRegistry::clear();
+    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(0))
+        .expect("no conflicting pin in this test");
+    FenceRegistry::set_default_shard(ShardId::new(0))
+        .expect("no conflicting default shard in this test");
+
+    let events = vec![(
+        exec_id,
+        autumn_harvest::event::WorkflowEvent::WorkflowStarted {
+            input: serde_json::json!({}),
+            timestamp: chrono::Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+    )];
+
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let store = std::sync::Arc::new(BlockingStore {
+        started: std::sync::Mutex::new(Some(started_tx)),
+        release: std::sync::Mutex::new(Some(release_rx)),
+    });
+    // Threshold 0: even `input: {}` offloads, so `put` is guaranteed to run.
+    let offloader = autumn_harvest::payload_store::PayloadOffloader::new(
+        store,
+        0,
+        std::sync::Arc::new(NoOpMetrics),
+    );
+
+    let mut appender = connect(&url).await;
+    let append_handle = tokio::spawn(async move {
+        autumn_harvest::store::append_new_execution_started_events_batch(
+            &mut appender,
+            &events,
+            Some(&offloader),
+            &autumn_harvest::payload_codec::PayloadCodecs::default(),
+        )
+        .await
+    });
+
+    started_rx
+        .await
+        .expect("the offload upload must start before the append can proceed");
+
+    // The upload is in flight, blocked on `release_rx`. If the fence lock
+    // were held across it (the pre-fix bug), this bump would block behind
+    // it and time out. That is exactly what the previous test proves for
+    // a persist that DOES hold the fence across an in-progress
+    // transaction.
+    let mut bumper = connect(&url).await;
+    let generation = bump_generation(&mut bumper, ShardId::new(0), "concurrent bump", "test")
+        .await
+        .expect("a bump during the upload must not block on the fence lock");
+    assert_eq!(generation, ShardGeneration::new(1));
+
+    release_tx.send(()).expect("release the blocked upload");
+    let result = append_handle.await.expect("append task must not panic");
+    let err = result.expect_err("the fence must still catch the now-superseded generation");
+    assert!(
+        matches!(err, autumn_harvest::error::HarvestError::ShardFenced { .. }),
+        "expected ShardFenced, got {err:?}"
+    );
+    FenceRegistry::clear();
+}
+
 /// A sequence owned by a **view** must never reach the promotion helper.
 ///
 /// `ALTER SEQUENCE s OWNED BY <view>.<col>` is accepted by Postgres. Without a
@@ -1908,19 +2037,42 @@ struct Regions {
 
 impl Regions {
     async fn teardown(&self) {
-        if let Ok(mut b) = AsyncPgConnection::establish(&self.standby_url).await {
-            let _ = b
-                .batch_execute(&format!("DROP SUBSCRIPTION IF EXISTS {}", self.sub))
-                .await;
+        // `DROP SUBSCRIPTION` can deadlock against a sync worker that is still
+        // creating its slot. Each step is therefore bounded. A step that times
+        // out is logged and skipped, so cleanup never pins a CI shard.
+        let bound = std::time::Duration::from_secs(30);
+        let drop_subscription = async {
+            if let Ok(mut b) = AsyncPgConnection::establish(&self.standby_url).await {
+                let _ = b
+                    .batch_execute(&format!("DROP SUBSCRIPTION IF EXISTS {}", self.sub))
+                    .await;
+            }
+        };
+        if tokio::time::timeout(bound, drop_subscription)
+            .await
+            .is_err()
+        {
+            eprintln!(
+                "teardown: DROP SUBSCRIPTION {} did not finish within 30s, skipped",
+                self.sub
+            );
         }
-        if let Ok(mut a) = AsyncPgConnection::establish(&self.primary_url).await {
-            let _ = diesel::sql_query(
-                "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots \
-                 WHERE slot_name = $1",
-            )
-            .bind::<diesel::sql_types::Text, _>(self.slot.clone())
-            .execute(&mut a)
-            .await;
+        let drop_slot = async {
+            if let Ok(mut a) = AsyncPgConnection::establish(&self.primary_url).await {
+                let _ = diesel::sql_query(
+                    "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots \
+                     WHERE slot_name = $1",
+                )
+                .bind::<diesel::sql_types::Text, _>(self.slot.clone())
+                .execute(&mut a)
+                .await;
+            }
+        };
+        if tokio::time::timeout(bound, drop_slot).await.is_err() {
+            eprintln!(
+                "teardown: dropping slot {} did not finish within 30s, skipped",
+                self.slot
+            );
         }
     }
 }
@@ -1980,16 +2132,31 @@ async fn two_regions(tag: &str) -> Option<Regions> {
 
     let conninfo = server_side_conninfo(&mut a, &admin, &primary_db).await;
     let mut b = connect(&standby_url).await;
+    // The migrations seed some tables, such as `harvest_calendars`, in both
+    // databases. The initial copy of such a table then fails on a duplicate
+    // key and retries forever. A real standby starts empty, so the standby
+    // here is emptied first. The copy then brings the primary's rows.
+    b.batch_execute(
+        "DO $$ DECLARE tables text; BEGIN \
+           SELECT string_agg(format('%I.%I', schemaname, tablename), ', ') INTO tables \
+             FROM pg_tables \
+            WHERE schemaname NOT IN ('pg_catalog', 'information_schema') \
+              AND tablename <> '__diesel_schema_migrations'; \
+           IF tables IS NOT NULL THEN EXECUTE 'TRUNCATE ' || tables || ' CASCADE'; END IF; \
+         END $$;",
+    )
+    .await
+    .expect("empty the standby before the initial copy");
     let create_subscription = format!(
         "CREATE SUBSCRIPTION {sub} CONNECTION '{conninfo}' PUBLICATION harvest_dr \
          WITH (create_slot = false, slot_name = '{slot}', copy_data = true)"
     );
     // `copy_data = true` blocks until the STANDBY's Postgres *server* process
-    // (not this test client) reaches the primary at `conninfo` and finishes an
-    // initial table sync — reachability that depends on the runner's own
-    // container networking, not on this test's logic, and that Postgres places
-    // no timeout on. A bad or momentarily-unreachable address here therefore
-    // hangs this `.await` forever rather than erroring, which is exactly what
+    // reaches the primary at `conninfo`. This test client does not make that
+    // connection. It depends on the runner's container networking, not on
+    // this test's logic, and Postgres places no timeout on it. A bad or
+    // momentarily-unreachable address here therefore hangs this `.await`
+    // forever rather than erroring, which is exactly what
     // pinned `Test DB (linux, shard 1)` for a full 6-hour CI job on a run whose
     // diff never touched this file (see the PR discussion this comment was
     // added from). Bounding it turns that into a fast, clear skip — consistent
@@ -2022,13 +2189,36 @@ async fn two_regions(tag: &str) -> Option<Regions> {
         }
     }
 
-    Some(Regions {
+    let regions = Regions {
         primary_url,
         primary_db,
         standby_url,
         slot,
         sub,
-    })
+    };
+    // `CREATE SUBSCRIPTION` returns before the initial copy ends. Sync workers
+    // copy each table on their own, so one table can lag behind another. A
+    // test that drops the subscription too early loses the rows that are not
+    // copied yet. One such loss was a `harvest_workflow_executions` row: the
+    // promoted region then failed an append on `harvest_events_workflow_exec_id_fkey`.
+    // So the topology is ready only when every table is in state `r` (ready).
+    // From then on one apply worker applies changes in commit order.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        let syncing = count_on(
+            &regions.standby_url,
+            "SELECT COUNT(*) AS n FROM pg_subscription_rel WHERE srsubstate <> 'r'",
+        )
+        .await;
+        if syncing == 0 {
+            return Some(regions);
+        }
+        if std::time::Instant::now() >= deadline {
+            regions.teardown().await;
+            panic!("{tag}: {syncing} table(s) did not finish the initial sync within 120s");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
 }
 
 macro_rules! require_regions {

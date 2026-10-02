@@ -19,6 +19,7 @@
 //! list endpoint itself. See [`crate::audit::EXCLUDED_ROUTES`] for the full list.
 
 use chrono::{DateTime, Utc};
+use diesel::BoolExpressionMethods;
 use diesel::ExpressionMethods;
 use diesel::QueryDsl;
 use diesel::SelectableHelper;
@@ -1426,6 +1427,16 @@ pub struct AuditFilters {
     pub status: Option<String>,
     pub since: Option<DateTime<Utc>>,
     pub before: Option<DateTime<Utc>>,
+    /// Row id tiebreaker for `before` (issue #1408).
+    ///
+    /// `list_audit` orders by `(occurred_at, id)` DESC. Pass the last row's
+    /// `id` from the prior page along with `before` to page past a tie
+    /// without loss. A caller that sends `before` alone keeps the legacy,
+    /// single-column cursor, which can skip rows tied on `occurred_at`.
+    ///
+    /// Has no effect without `before`: `list_audit` applies no cursor filter
+    /// at all when `before` is absent, even if this field is set.
+    pub before_id: Option<Uuid>,
     /// Maximum number of records to return. Clamped to [1, 500].
     pub limit: i64,
 }
@@ -1447,6 +1458,7 @@ impl Default for AuditFilters {
             status: None,
             since: None,
             before: None,
+            before_id: None,
             limit: Self::default_limit(),
         }
     }
@@ -1519,10 +1531,18 @@ pub async fn insert_audit_batch(
     Ok(ids)
 }
 
-/// List audit records matching the given filters, ordered by `occurred_at DESC`.
+/// List audit records matching the given filters, ordered by
+/// `(occurred_at, id) DESC`.
 ///
 /// The `limit` in `filters` is clamped to [1, 500]. The caller is responsible
 /// for merging and re-sorting results when aggregating across multiple shards.
+///
+/// ## Paging past tied timestamps (issue #1408)
+///
+/// A batch insert (see [`insert_audit_batch`]) gives every row in the batch
+/// the same `occurred_at`. Set `filters.before_id` to the prior page's last
+/// row id. Pair it with `filters.before`. The cursor then breaks the tie by
+/// `id`, instead of dropping rows that share the boundary timestamp.
 ///
 /// # Errors
 ///
@@ -1535,7 +1555,10 @@ pub async fn list_audit(
 
     let mut query = harvest_audit_log::table
         .into_boxed()
-        .order(harvest_audit_log::occurred_at.desc())
+        .order((
+            harvest_audit_log::occurred_at.desc(),
+            harvest_audit_log::id.desc(),
+        ))
         .limit(limit);
 
     if let Some(actor) = &filters.actor {
@@ -1556,8 +1579,20 @@ pub async fn list_audit(
     if let Some(since) = filters.since {
         query = query.filter(harvest_audit_log::occurred_at.ge(since));
     }
-    if let Some(before) = filters.before {
-        query = query.filter(harvest_audit_log::occurred_at.lt(before));
+    match (filters.before, filters.before_id) {
+        (Some(before), Some(before_id)) => {
+            query = query.filter(
+                harvest_audit_log::occurred_at
+                    .lt(before)
+                    .or(harvest_audit_log::occurred_at
+                        .eq(before)
+                        .and(harvest_audit_log::id.lt(before_id))),
+            );
+        }
+        (Some(before), None) => {
+            query = query.filter(harvest_audit_log::occurred_at.lt(before));
+        }
+        (None, _) => {}
     }
 
     query
@@ -1729,6 +1764,9 @@ pub async fn list_audit(
 /// admin-triggered operations, to make that narrower guarantee
 /// unconditionally true.
 ///
+/// The delete also advances `harvest_audit_purge_watermark` in the same
+/// statement (issue #1508). See [`crate::audit_export::redrive_window_truncated`].
+///
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] if the delete fails.
@@ -1829,8 +1867,14 @@ pub async fn purge_old_audit_records(
     //
     // Also never one of the two audit-export lifecycle records exempted
     // above (issue #1273).
+    //
+    // The same statement records a watermark (issue #1508). A `before`
+    // redrive reads it to detect a purged prefix. The delete and the
+    // upsert commit together, so a purge cannot leave records gone without
+    // a trace. Unsequenced rows are skipped: no redrive ever selects one.
     diesel::sql_query(
-        "DELETE FROM harvest_audit_log a \
+        "WITH deleted AS ( \
+         DELETE FROM harvest_audit_log a \
          WHERE a.occurred_at < $1 \
            AND a.operation NOT IN ($5, $6) \
            AND NOT ( \
@@ -1872,7 +1916,24 @@ pub async fn purge_old_audit_records(
                               ) \
                    ) \
                  ) \
-           )",
+           ) \
+         RETURNING a.occurred_at, a.export_seq \
+         ), \
+         stamped AS ( \
+           SELECT MAX(occurred_at) AS max_at, COUNT(*) AS n \
+           FROM deleted WHERE export_seq IS NOT NULL \
+         ), \
+         mark AS ( \
+           INSERT INTO harvest_audit_purge_watermark AS w \
+                  (singleton, max_purged_occurred_at, purged_records) \
+           SELECT TRUE, max_at, n FROM stamped WHERE n > 0 \
+           ON CONFLICT (singleton) DO UPDATE SET \
+                  max_purged_occurred_at = \
+                      GREATEST(w.max_purged_occurred_at, EXCLUDED.max_purged_occurred_at), \
+                  purged_records = w.purged_records + EXCLUDED.purged_records, \
+                  updated_at = NOW() \
+         ) \
+         SELECT COUNT(*) AS deleted FROM deleted",
     )
     .bind::<diesel::sql_types::Timestamptz, _>(cutoff)
     .bind::<diesel::sql_types::Bool, _>(protect_unexported_audit)
@@ -1881,9 +1942,17 @@ pub async fn purge_old_audit_records(
     .bind::<diesel::sql_types::Text, _>(OP_AUDIT_EXPORT_DECOMMISSION)
     .bind::<diesel::sql_types::Text, _>(OP_AUDIT_EXPORT_REACTIVATE)
     .bind::<diesel::sql_types::Bool, _>(crate::audit_export::is_configured())
-    .execute(conn)
+    .get_result::<PurgeCount>(conn)
     .await
     .map_err(database_error)
+    .map(|row| usize::try_from(row.deleted).unwrap_or(0))
+}
+
+/// Row count returned by the purge statement.
+#[derive(diesel::QueryableByName)]
+struct PurgeCount {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    deleted: i64,
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────

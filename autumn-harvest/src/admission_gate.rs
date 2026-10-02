@@ -44,20 +44,22 @@
 //! The core completion-trigger path reaches the shared [`AdmissionGateCache`]
 //! through the process-global [`GLOBAL_ADMISSION_GATE_CACHE`] static (mirroring
 //! `GLOBAL_WORKFLOW_METADATA` / `GLOBAL_CALLBACK_CONFIG`), populated by the
-//! plugin at boot with the same `Arc` the management API uses. When the static
-//! is unset (standalone integrations, or the plugin's brief boot window) the
-//! core gate check is skipped — byte-identical to pre-#618 behaviour.
+//! plugin at boot with the same `Arc` the management API uses. `HarvestEmbedding`
+//! publishes it the same way. When the static is unset (a hand-built
+//! standalone mount, or the brief boot window) the core gate check is skipped
+//! — byte-identical to pre-#618 behaviour.
 //!
 //! ## Standalone router note
 //!
 //! [`AdmissionGateCache::new`] initialises the cache as **open** (no gates).
-//! Standalone integrations that mount `harvest_api_router` without the plugin
-//! boot loader (i.e. without calling `HarvestPlugin::on_startup`) must
-//! explicitly call `load_active_gates` from the DB and pass the result to
-//! [`AdmissionGateCache::refresh`] on startup to pick up any gates that were
-//! persisted before the process restarted. Without this step, gates created in
-//! a previous process lifetime are invisible until a local create/lift happens
-//! on the same replica.
+//! A standalone integration starts through `HarvestEmbedding` (issue #1613).
+//! It loads the persisted gates before any worker spawns and publishes the
+//! cache. It also starts the refresh loop.
+//!
+//! An integration that mounts `harvest_api_router` without `HarvestEmbedding`
+//! must do this step itself. It calls `load_active_gates` at startup and
+//! passes the result to [`AdmissionGateCache::refresh`]. Without this step, a
+//! gate from a previous process lifetime is invisible on this replica.
 //!
 //! Such an integration declares its admin credential with
 //! `StandaloneAdminAuth` (issue #1608), which installs the scoped-API-token
@@ -1491,7 +1493,7 @@ mod tests {
                 ProducerGateStatus::GatedAtAdmission,
                 "{split} must be gated-at-admission"
             );
-            assert!(!e.rationale.is_empty());
+            assert_ne!(e.rationale, "");
         }
         // The cross-shard completion-trigger relay is gated authoritatively at
         // relay time (issue #618, F-round7).
@@ -1500,7 +1502,7 @@ mod tests {
             .find(|e| e.producer == "completion_trigger_outbox")
             .expect("completion_trigger_outbox entry");
         assert_eq!(cto.status, ProducerGateStatus::GatedAtRelay);
-        assert!(!cto.rationale.is_empty());
+        assert_ne!(cto.rationale, "");
         // Throttle is gated authoritatively at fire time (issue #1053): a closed
         // gate blocks the deferred fire and RE-DEFERS the row (nothing dropped).
         let throttle = contract
@@ -1508,7 +1510,7 @@ mod tests {
             .find(|e| e.producer == "throttle")
             .expect("throttle entry");
         assert_eq!(throttle.status, ProducerGateStatus::GatedAtRelay);
-        assert!(!throttle.rationale.is_empty());
+        assert_ne!(throttle.rationale, "");
         // The transactional in-process start (issue #763) is gated via
         // `check_cached`, not exempt — see `start_workflow_transactional`'s
         // doc comment for why `check_cached` (not `check`) is the right choice
@@ -1518,7 +1520,7 @@ mod tests {
             .find(|e| e.producer == "transactional")
             .expect("transactional entry");
         assert_eq!(transactional.status, ProducerGateStatus::Gated);
-        assert!(!transactional.rationale.is_empty());
+        assert_ne!(transactional.rationale, "");
     }
 
     #[test]

@@ -1,0 +1,16 @@
+                                                                             QUERY PLAN                                                                              
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Update on public.harvest_workflow_outbox  (cost=0.42..8.45 rows=0 width=0) (actual time=0.186..0.187 rows=0 loops=1)
+   Buffers: shared hit=17
+   ->  Index Scan using harvest_workflow_outbox_pkey on public.harvest_workflow_outbox  (cost=0.42..8.45 rows=1 width=126) (actual time=0.081..0.082 rows=1 loops=1)
+         Output: (delivery_attempts + 1), NULL::text, 'exec-single-row-explain-500k'::text, now(), NULL::timestamp without time zone, NULL::text, ctid
+         Index Cond: (harvest_workflow_outbox.id = 500090)
+         Filter: (harvest_workflow_outbox.claimed_by = 'explain-claimant-2'::text)
+         Buffers: shared hit=7
+ Query Identifier: -1011275364528800705
+ Planning:
+   Buffers: shared hit=132
+ Planning Time: 0.538 ms
+ Execution Time: 0.272 ms
+(12 rows)
+

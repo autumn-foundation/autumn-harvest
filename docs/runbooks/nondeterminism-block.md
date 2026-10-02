@@ -60,6 +60,25 @@ For any blocked row, read `search_attrs`:
 `nd_block_reason` / `nd_block_count` / `nd_blocked_at` on the embedded
 execution object.
 
+**Skipped recorded command (issue #1791).** The deployed code can also stop
+before a command that the recorded run issued. For example, a deploy deletes
+an activity call or a timer. Then `expected` is `<workflow returned early>` or
+`<workflow suspended early>`. `actual` names the skipped event, for example
+`ActivityScheduled(send_email)`. `event_index` is its history position. The
+replay-diagnosis endpoint below reports the same drift with strict-replay
+labels. There, `<workflow returned early>` or `<workflow suspended early>`
+appears in `actual`, and `event_index` can differ. Use the block's
+`event_index` to choose a reset point.
+
+The engine upgrade alone can surface this case. A run that skipped a
+recorded command under an earlier deploy blocks on its next wake. The
+`build_id` is then the current build, so a rollback does not help. Reset the
+run to before `event_index`, or terminate it.
+
+A block with `expected: <workflow suspended early>` and a `clean` diagnosis
+has a different cause. The workflow body awaits non-durable work for more
+than 100 ms during replay. Move that work into an activity.
+
 ## Diagnose the divergence (issue #614)
 
 To confirm — on demand, for one specific execution — exactly how the
@@ -75,7 +94,8 @@ This is read-only (it appends no events and performs no writes) and admin-gated.
 The response verdict is one of `clean` / `diverged` / `workflow_failed` /
 `not_registered` / `not_replayable_dag` (all `200`; the diagnosis, not the HTTP
 status, carries the answer). For a blocked run the verdict is `diverged`, with a
-`divergence` object using the **same vocabulary as the block diagnostic** above:
+`divergence` object using the **same vocabulary as the block diagnostic** above.
+A skipped recorded command (issue #1791) is the exception, as noted above:
 
 ```json
 {
@@ -178,7 +198,11 @@ POST /api/harvest/workflows/{execution_id}/reset
 ```
 
 Reset to an event index before the divergence (`event_index` in the
-diagnostic), which forks a fresh run from the compatible prefix.
+diagnostic), which forks a fresh run from the compatible prefix. The full
+request body (`reset_to_event_id`, required `reason` and `operator_id`,
+`signal_reapply`) is in `docs/api-contract.json` under this path; the worked
+CLI walkthrough — dry-run first, then commit — is
+[README.md § Resetting a workflow after a bad deploy](../../README.md#resetting-a-workflow-after-a-bad-deploy).
 
 ## Prevention (complementary, not replaced by this safety net)
 

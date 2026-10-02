@@ -1222,16 +1222,22 @@ async fn heartbeat_checkpoint_preserved_across_cancel_signal() {
         .expect("enqueue should succeed");
 
     diesel::update(dsl::harvest_task_queue.find(task_id))
-        .set(dsl::state.eq("RUNNING"))
+        .set((
+            dsl::state.eq("RUNNING"),
+            dsl::worker_id.eq("checkpoint-worker"),
+            dsl::attempt.eq(1),
+        ))
         .execute(&mut conn)
         .await
         .expect("set RUNNING");
 
     // Flush a checkpoint (simulates the heartbeat flusher writing mid-run).
     let checkpoint = serde_json::json!({"offset": 42, "batch": "2026-05"});
-    queue::record_heartbeat(&mut conn, task_id, checkpoint.clone())
+    let claim = queue::TaskClaim::new(task_id, "checkpoint-worker", 1);
+    let write = queue::record_heartbeat(&mut conn, &claim, checkpoint.clone())
         .await
         .expect("record heartbeat should succeed");
+    assert_eq!(write, queue::ClaimWrite::Applied);
 
     // Read checkpoint the way the worker does at dispatch time — this is the
     // value that goes into ActivityContext::heartbeat_details.

@@ -417,6 +417,12 @@ const HARVEST_WRITE_PRIVILEGE_REQUIREMENTS: &[(&str, &[&str])] = &[
     ("harvest_workers", &["SELECT", "INSERT", "UPDATE"]),
     ("harvest_batch_jobs", &["SELECT", "INSERT", "UPDATE"]),
     ("harvest_audit_log", &["SELECT", "INSERT", "DELETE"]),
+    // The retention purge writes this table in the same statement as its
+    // delete (issue #1508). A missing grant fails the whole purge.
+    (
+        "harvest_audit_purge_watermark",
+        &["SELECT", "INSERT", "UPDATE"],
+    ),
     // Claim-path gate tables. The claim CTE reads all four unconditionally on
     // every poll, so a storage role missing `SELECT` on any one of them makes
     // `claim_task` error and the worker claim *nothing* -- a missing grant
@@ -1922,11 +1928,12 @@ mod tests {
         assert_eq!(result.name, "scanner_liveness");
         assert_eq!(result.status, PreflightStatus::Pass);
         assert_eq!(result.details["scanners_registered"], 2);
-        assert!(
+        assert_eq!(
             result.details["stale_scanners"]
                 .as_array()
                 .expect("stale_scanners must be an array")
-                .is_empty()
+                .as_slice(),
+            [] as [serde_json::Value; 0]
         );
         assert!(result.remediation.is_none());
     }
@@ -2273,7 +2280,7 @@ mod tests {
             privilege_row("harvest_task_queue", "UPDATE", true),
         ]);
 
-        assert!(missing.is_empty());
+        assert_eq!(missing, [] as [crate::preflight::MissingWritePrivilege; 0]);
     }
 
     #[test]
@@ -2370,7 +2377,10 @@ mod tests {
             true,
         )]);
 
-        assert!(missing.is_empty());
+        assert_eq!(
+            missing,
+            [] as [crate::preflight::MissingSequencePrivilege; 0]
+        );
     }
 
     #[test]
@@ -2645,13 +2655,13 @@ mod tests {
                 Some(&["send_email", "charge_card"]),
                 Some(&["generate_report"]),
             )];
-            assert!(
+            assert_eq!(
                 failures_for(
                     &workflows,
                     &["send_email", "charge_card"],
                     &["onboarding", "generate_report"],
-                )
-                .is_empty()
+                ),
+                [] as [std::string::String; 0]
             );
         }
 
@@ -2660,7 +2670,10 @@ mod tests {
             // The zero-false-positive guarantee: `None` is skipped outright, so
             // an empty registry cannot produce a failure for it.
             let workflows = [wf("legacy", None, None)];
-            assert!(failures_for(&workflows, &[], &[]).is_empty());
+            assert_eq!(
+                failures_for(&workflows, &[], &[]),
+                [] as [std::string::String; 0]
+            );
         }
 
         #[test]
@@ -2673,7 +2686,10 @@ mod tests {
             // and on the wire by
             // `registered_workflow_record_distinguishes_empty_declaration_from_absent`.
             let workflows = [wf("noop", Some(&[]), Some(&[]))];
-            assert!(failures_for(&workflows, &[], &[]).is_empty());
+            assert_eq!(
+                failures_for(&workflows, &[], &[]),
+                [] as [std::string::String; 0]
+            );
         }
 
         #[test]
@@ -2746,7 +2762,10 @@ mod tests {
             // Self-recursion is legal (`spawn_child_workflow` of one's own type);
             // the name resolves against the registry like any other.
             let workflows = [wf("recursive", None, Some(&["recursive"]))];
-            assert!(failures_for(&workflows, &[], &["recursive"]).is_empty());
+            assert_eq!(
+                failures_for(&workflows, &[], &["recursive"]),
+                [] as [std::string::String; 0]
+            );
         }
 
         #[test]

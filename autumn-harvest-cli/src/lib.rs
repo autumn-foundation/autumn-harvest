@@ -1797,6 +1797,13 @@ enum AuditCommand {
         /// Upper bound (exclusive), RFC 3339.
         #[arg(long)]
         before: Option<String>,
+        /// Row id tiebreaker for `--before` (issue #1408).
+        ///
+        /// Pass the prior page's last row id, alongside `--before`, to page
+        /// past rows tied on that timestamp. Has no effect without
+        /// `--before`.
+        #[arg(long)]
+        before_id: Option<String>,
         /// Maximum number of records to return [1–500].
         #[arg(long, value_parser = clap::value_parser!(i64).range(1..=500))]
         limit: Option<i64>,
@@ -1924,6 +1931,17 @@ enum ShardCommand {
         /// Report what would move without writing anything.
         #[arg(long)]
         dry_run: bool,
+        /// Resume a prior call's candidate scan past this cursor (issue
+        /// #1317), instead of always starting at the shard's oldest
+        /// `RUNNING` row. Copy both fields verbatim from a prior report's
+        /// `next_scan_cursor`. Without this, a shard whose oldest rows are
+        /// permanently blocked (an active session, a parked child) makes
+        /// every repeated call re-examine the same rows forever.
+        #[arg(long, requires = "after_execution_id")]
+        after_created_at: Option<autumn_harvest::chrono::DateTime<autumn_harvest::chrono::Utc>>,
+        /// See `--after-created-at`; both must be supplied together.
+        #[arg(long, requires = "after_created_at")]
+        after_execution_id: Option<autumn_harvest::uuid::Uuid>,
         /// Print the raw JSON report instead of a human table.
         #[arg(long)]
         json: bool,
@@ -1945,6 +1963,40 @@ enum ShardCommand {
         #[arg(long, default_value_t = 100)]
         limit: i64,
         /// Print the raw JSON report instead of a human table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Release a rebalanced source seal's business key once its live copy
+    /// has finished (issue #1317).
+    ///
+    /// Without this, `migrated_run_terminal_at` is never populated in a
+    /// deployment that does not run its own maintenance driver. A finished
+    /// migration then keeps blocking a same-key restart forever. Safe
+    /// to run on a schedule: idempotent, and a no-op once every eligible
+    /// seal on the shard is already marked.
+    ReconcileMigratedSeals {
+        /// Shard databases, as `<ID>=<DSN>`. Supply the shard whose seals to
+        /// reconcile, plus every shard any of those seals' live copies (or
+        /// forwarding chains) may currently reside on.
+        #[arg(long = "shard", value_name = "ID=DSN", required = true)]
+        shards: Vec<String>,
+        /// The shard whose `MIGRATED` seals to sweep.
+        #[arg(long)]
+        from: i32,
+        /// Maximum seals to examine in this run.
+        #[arg(long, default_value_t = 100)]
+        limit: i64,
+        /// Resume a prior call's scan past this cursor (issue #1317 review),
+        /// instead of always starting at the shard's oldest seal. Without
+        /// this, a shard whose oldest seals are permanently still-live or
+        /// unreachable makes every repeated call re-examine the same rows
+        /// forever. Copy both fields verbatim from a prior run's resume hint.
+        #[arg(long, requires = "after_execution_id")]
+        after_migrated_at: Option<autumn_harvest::chrono::DateTime<autumn_harvest::chrono::Utc>>,
+        /// See `--after-migrated-at`; both must be supplied together.
+        #[arg(long, requires = "after_migrated_at")]
+        after_execution_id: Option<autumn_harvest::uuid::Uuid>,
+        /// Print the raw JSON count instead of a human summary.
         #[arg(long)]
         json: bool,
     },
@@ -3365,10 +3417,13 @@ enum EventsCommand {
     Tail {
         /// Workflow execution ID to watch.
         execution_id: String,
-        /// Resume from this event row ID (Last-Event-ID header).
-        /// Events with id > this value are replayed before entering live-tail mode.
+        /// Resume from this `event_id` (issue #1405), sent as the
+        /// Last-Event-ID header. NOT the shard-local `harvest_events.id` --
+        /// this is the per-execution sequence number the server's `id:`
+        /// SSE field carries. Events after it are replayed before entering
+        /// live-tail mode.
         #[arg(long)]
-        last_event_id: Option<i64>,
+        last_event_id: Option<i32>,
     },
 }
 
@@ -3585,7 +3640,9 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
     if let Commands::Shard { command } = &cli.command
         && matches!(
             command,
-            ShardCommand::Rebalance { .. } | ShardCommand::RebalanceResume { .. }
+            ShardCommand::Rebalance { .. }
+                | ShardCommand::RebalanceResume { .. }
+                | ShardCommand::ReconcileMigratedSeals { .. }
         )
     {
         return run_shard_rebalance(command, cli.actor.as_deref()).await;
@@ -4680,7 +4737,7 @@ pub fn format_backup_verify_text(report: &RestoreVerifyReport) -> String {
             replay.unreadable,
             replay.unreadable
         );
-    } else if replay.unreadable > 0 {
+    } else if replay.unreadable > 0 && replay.skipped_no_handler == 0 {
         // Every sample that reached this check was unreadable, and none
         // replayed at all. This is distinct from the branch below, where
         // nothing replayed because no handler was registered. Handlers may
@@ -4694,6 +4751,23 @@ pub fn format_backup_verify_text(report: &RestoreVerifyReport) -> String {
              history failed to read; see the history_unreadable finding above for the cause. \
              Registering workflow handlers will not fix this.",
             replay.sampled, replay.unreadable
+        );
+    } else if replay.unreadable > 0 {
+        // Nothing replayed, for two separate reasons at once: some samples
+        // were unreadable, others had no registered handler. A fleet-wide
+        // merge across shards can produce this mix (issue #1410). Name both
+        // counts. Registering handlers fixes only the second group.
+        let _ = writeln!(
+            out,
+            "  replay: NOT VERIFIED — {} sampled, {} unreadable, {} skipped (no handler), \
+             0 replayed. {} history/histories failed to read; see the history_unreadable \
+             finding above for the cause. {} had no registered handler. Registering \
+             handlers may fix part of this, not all of it.",
+            replay.sampled,
+            replay.unreadable,
+            replay.skipped_no_handler,
+            replay.unreadable,
+            replay.skipped_no_handler
         );
     } else {
         let _ = writeln!(
@@ -7614,7 +7688,7 @@ pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
 async fn run_events_tail(
     cli: &Cli,
     execution_id: &str,
-    last_event_id: Option<i64>,
+    last_event_id: Option<i32>,
 ) -> Result<(), CliError> {
     let path = format!("/executions/{}", path_segment(execution_id));
     let url = format!(
@@ -9991,7 +10065,9 @@ fn shard_request(command: &ShardCommand) -> ApiRequest {
         // directly (issue #964); they never reach the management API. Kept in
         // the match rather than a `_` arm so a future shard subcommand is a
         // compile error here until it declares which path it takes.
-        ShardCommand::Rebalance { .. } | ShardCommand::RebalanceResume { .. } => {
+        ShardCommand::Rebalance { .. }
+        | ShardCommand::RebalanceResume { .. }
+        | ShardCommand::ReconcileMigratedSeals { .. } => {
             unreachable!("shard rebalance commands are dispatched in-process by run_cli")
         }
     }
@@ -10040,6 +10116,8 @@ async fn run_shard_rebalance(command: &ShardCommand, actor: Option<&str>) -> Res
             to,
             limit,
             dry_run,
+            after_created_at,
+            after_execution_id,
             json,
         } => {
             let targets = parse_shard_targets(shards)?;
@@ -10051,7 +10129,10 @@ async fn run_shard_rebalance(command: &ShardCommand, actor: Option<&str>) -> Res
                 ));
             }
             let pool = build_pool(&targets)?;
-            let report = autumn_harvest::shard_rebalance::migrate_quiescent_executions(
+            let after = after_created_at
+                .zip(*after_execution_id)
+                .map(|(at, id)| (at, autumn_harvest::types::ExecutionId::from_uuid(id)));
+            let report = autumn_harvest::shard_rebalance::migrate_quiescent_executions_after(
                 &pool,
                 ShardId::new(*from),
                 ShardId::new(*to),
@@ -10059,6 +10140,7 @@ async fn run_shard_rebalance(command: &ShardCommand, actor: Option<&str>) -> Res
                 *dry_run,
                 actor.unwrap_or("anonymous"),
                 &PayloadCodecs::default(),
+                after,
             )
             .await
             .map_err(|e| CliError::InvalidInput(e.to_string()))?;
@@ -10108,6 +10190,59 @@ async fn run_shard_rebalance(command: &ShardCommand, actor: Option<&str>) -> Res
             }
             Ok(())
         }
+        ShardCommand::ReconcileMigratedSeals {
+            shards,
+            from,
+            limit,
+            after_migrated_at,
+            after_execution_id,
+            json,
+        } => {
+            let targets = parse_shard_targets(shards)?;
+            require_shard(&targets, *from, "from")?;
+            let pool = build_pool(&targets)?;
+            let after = after_migrated_at
+                .zip(*after_execution_id)
+                .map(|(at, id)| (at, autumn_harvest::types::ExecutionId::from_uuid(id)));
+            let (reconciled, failures, next_cursor) =
+                autumn_harvest::shard_rebalance::reconcile_migrated_seals_after(
+                    &pool,
+                    ShardId::new(*from),
+                    *limit,
+                    after,
+                )
+                .await
+                .map_err(|e| CliError::InvalidInput(e.to_string()))?;
+
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "reconciled": reconciled,
+                        "failures": failures,
+                        "next_scan_cursor": next_cursor.map(|(at, id)| serde_json::json!({
+                            "migrated_at": at.to_rfc3339(),
+                            "execution_id": id.as_uuid(),
+                        })),
+                    }))
+                    .map_err(|e| CliError::InvalidInput(e.to_string()))?
+                );
+            } else {
+                println!("reconciled {reconciled} seal(s) on shard {from}");
+                for failure in &failures {
+                    println!("  failed    {}  ({})", failure.execution_id, failure.reason);
+                }
+                if let Some((at, id)) = next_cursor {
+                    println!(
+                        "more may remain past this window; resume with:\n  \
+                         --after-migrated-at {} --after-execution-id {}",
+                        at.to_rfc3339(),
+                        id.as_uuid()
+                    );
+                }
+            }
+            Ok(())
+        }
         ShardCommand::Health { .. } => unreachable!("health goes through the management API"),
     }
 }
@@ -10140,6 +10275,15 @@ fn format_rebalance_report(
         report.skipped(),
         report.aborted()
     );
+    if let Some((at, id)) = report.next_scan_cursor {
+        let _ = writeln!(
+            out,
+            "more may remain past this window; resume with:\n  \
+             --after-created-at {} --after-execution-id {}",
+            at.to_rfc3339(),
+            id.as_uuid()
+        );
+    }
     out
 }
 
@@ -11583,6 +11727,7 @@ fn audit_request(command: &AuditCommand) -> ApiRequest {
             status,
             since,
             before,
+            before_id,
             limit,
         } => {
             let mut params: Vec<(&'static str, String)> = Vec::new();
@@ -11606,6 +11751,9 @@ fn audit_request(command: &AuditCommand) -> ApiRequest {
             }
             if let Some(v) = before {
                 params.push(("before", v.clone()));
+            }
+            if let Some(v) = before_id {
+                params.push(("before_id", v.clone()));
             }
             if let Some(v) = limit {
                 params.push(("limit", v.to_string()));
@@ -17914,7 +18062,7 @@ mod migrate_cli_tests {
         else {
             panic!("expected migrate status");
         };
-        assert!(include_dir.is_empty());
+        assert_eq!(include_dir, [] as [std::path::PathBuf; 0]);
         assert_eq!(format, MigrateFormat::Text);
         assert!(!check, "the deploy gate must be opt-in");
     }

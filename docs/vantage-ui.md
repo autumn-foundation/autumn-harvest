@@ -42,9 +42,28 @@ Shows a single workflow execution in full detail.
 
 - **Cancel** — POST to `/workflows/{exec_id}/cancel` with a confirmation dialog. Redirects to the detail page with a flash message.
 - **Terminate** — Disabled button (not yet available).
-- **Send signal** — Expandable form (collapsed by default). POST to `/workflows/{exec_id}/signal` with `signal_name` and an optional JSON `payload`. Redirects with flash.
-- **Reset to event N** — Expandable form. POST to `/workflows/{exec_id}/reset` with `reset_to_event_id` (1-based event number, as shown in the timeline "#" column) and optional `reason`. Creates a new fork execution. Redirects with flash.
-- **Trigger update** — Expandable form. POST to `/workflows/{exec_id}/trigger-update` with `update_name` and optional JSON `payload`. Redirects with flash.
+- **Send signal** — Expandable form (collapsed by default). POST to `/workflows/{exec_id}/signal` with `signal_name` and an optional JSON `payload`. Redirects with flash on success.
+- **Reset to event N** — Expandable form. POST to `/workflows/{exec_id}/reset` with `reset_to_event_id` (1-based event number, as shown in the timeline "#" column) and optional `reason`. Creates a new fork execution. Redirects with flash on success.
+- **Trigger update** — Expandable form. POST to `/workflows/{exec_id}/trigger-update` with `update_name` and optional JSON `payload`. Redirects with flash on success.
+
+  On a rejected submission (malformed JSON payload, non-numeric event
+  number, or the engine call itself failing), all three forms instead
+  render the detail page directly as the POST's own response — no
+  redirect — with the rejected form **open**, the operator's entered
+  values pre-filled, and the error shown inline next to the field that
+  caused it (issue #1687). A typo does not cost the whole entry. This is
+  deliberately not a redirect: putting a signal or update payload in a
+  redirect's query string would put it in browser history, proxy/server
+  access logs, and the same-origin referrer, and a large payload could
+  push the URL past a typical request-line limit. Because the response is
+  served from one path segment below the canonical `/workflows/{exec_id}`
+  page, it carries a `<base href="..">` element so every relative link and
+  form action on the page keeps resolving correctly. A `<base>` element
+  only fixes *path*-relative references, not a bare `?query` reference
+  (which inherits the browser's whole current base path, not just its
+  directory) — so the event-timeline pagination links and the "Jump to
+  event" form's action are execution-id-prefixed explicitly, rather than
+  relying on that distinction.
 - **Export history** — GET link to `…/workflows/{exec_id}/history/export` for the full JSON event log.
 
 **Event timeline collapsible payload** — each event row in the history table has a `<details>` element. Click "view payload" to expand and see the full JSON event data.
@@ -90,7 +109,7 @@ condition:
 |---|---|
 | `Paused` | `is_paused` |
 | `Auto-paused` | `auto_paused_at` set (#360) — supersedes `Paused` |
-| `Exhausted: <reason>` | `exhausted_at` set (#478), **or** the row is terminal on its live bounds before a tick has stamped the column: `runs_started >= max_runs` (for `max_runs > 0`), or the **pending slot** is at/past the cutoff (`next_run_at >= end_at`; falling back to `now >= end_at` only when there is no pending slot). An unstamped exhaustion names its bound (`run budget spent` / `past end_at`). |
+| `Exhausted: <reason>` | `exhausted_at` set (#478), **or** the row is terminal on its live bounds before a tick has stamped the column: `runs_started >= max_runs` (for `max_runs > 0`), or the **pending slot** is at/past the cutoff (`next_run_at >= end_at`; falling back to `now >= end_at` only when there is no pending slot). An unstamped exhaustion names its bound (`run budget spent` / `past end_at`). The pending slot includes jitter (#1293). Rows with a calendar, or with `MostRecent` or `Window` catchup, use the raw `next_run_at` (#1568). The scheduler may stop such a row before the badge shows. |
 | `Catchup dropped ×N` | `last_catchup_dropped > 0` (#484) |
 
 Unhealthy schedules **sort above** healthy ones; healthy rows keep their existing

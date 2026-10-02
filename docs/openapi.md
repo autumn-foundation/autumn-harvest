@@ -111,9 +111,10 @@ compiles the workspace, which is the slow part; the client steps take seconds.
   are described in prose on the response, not as a `oneOf`.
 - **Error responses carry no schema.** The contract records a description per
   error status, not a body shape.
-- **Most query parameters are typed `string`**, because the contract records a
-  type for only a few. A generated client sends the value as text, which is
-  what the handler parses.
+- **No check reads the type of a hand-parsed query key.** Every parameter
+  declares a type, and the transform rejects one without it. The audit checks
+  each `Query<T>` field against the contract. A key parsed from `RawQuery` has
+  a type set by hand. No check compares that type with the parser.
 - **Inline schemas, no `$ref`.** Nothing is shared between operations, so
   `openapi-generator` names response models positionally.
 - `GET /workflows/by-id/{workflow_name}/{workflow_id}/children` declares
@@ -148,6 +149,11 @@ Five checks hold the chain together:
    handlers: every status a handler returns must be declared, every
    request-body field that is mandatory on the wire must be marked required,
    and every query key a hand-rolled parser matches must be documented.
+   Every field serde accepts must be documented. The contract must mark a
+   body required when the handler cannot run without it. Each `Query<T>`
+   field must be documented with its type and required flag. The audit also
+   reads a body parsed from raw `Bytes`. A type the audit cannot resolve
+   fails the check.
 
 ## Why the document is derived, not annotated
 

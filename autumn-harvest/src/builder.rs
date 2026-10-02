@@ -585,6 +585,18 @@ pub enum HarvestBuilderError {
         name: String,
     },
 
+    /// A registered DAG definition does not compile: it has a cycle, a bad
+    /// input binding or a bad compensator. Without this check the other DAG
+    /// validators skip such a DAG. The error then appears only when the
+    /// plugin compiles its DAG catalog, or at run time as a FAILED run.
+    #[error("DAG '{dag}' does not compile: {error}")]
+    InvalidDagDefinition {
+        /// DAG whose definition failed to compile.
+        dag: String,
+        /// The build error, as its display text.
+        error: String,
+    },
+
     /// A DAG references an activity registered as local-only. Local activities
     /// run inline on the workflow worker and cannot be scheduled through the
     /// DAG activity queue lowering.
@@ -1194,6 +1206,17 @@ impl BuiltHarvest {
     }
 
     /// Convert the built harvest registration into worker-ready parts.
+    ///
+    /// Clone-class note: the three `install_global_*_for_direct_worker` and
+    /// `set_purge_window_secs` calls, and the registry-builder chain below,
+    /// repeat verbatim in [`Self::into_worker_parts_with_extra_state`].
+    /// Apply any change to either block to both functions.
+    ///
+    /// Two instances only. Three separate features (issue #605, issue
+    /// #808, issue #953) each added one new install call here. Each
+    /// landed in both copies in the same change. No copy has ever shipped
+    /// the call alone. The merge bar (rule of three, or a missed-fix) is
+    /// not met yet, so the duplication stays.
     #[cfg(feature = "db")]
     #[must_use]
     pub fn into_worker_parts(
@@ -1299,6 +1322,12 @@ impl BuiltHarvest {
 
     /// Convert the built harvest registration into worker-ready parts while
     /// injecting additional typed runtime state.
+    ///
+    /// Clone-class note: the three `install_global_*_for_direct_worker` and
+    /// `set_purge_window_secs` calls, and the registry-builder chain below,
+    /// repeat verbatim in [`Self::into_worker_parts`]. Apply any change to
+    /// either block to both functions. Two instances only, so the merge
+    /// bar is not met yet. See the note on `into_worker_parts`.
     #[cfg(feature = "db")]
     #[must_use]
     pub fn into_worker_parts_with_extra_state(
@@ -2426,6 +2455,7 @@ impl HarvestBuilder {
             &self.activities,
             self.worker_config.max_local_activity_start_to_close,
         )?;
+        validate_dag_definitions_compile(&self.dags)?;
         validate_dags_do_not_use_local_activities(&self.dags, &self.activities)?;
         validate_classic_dags_have_no_signal_gates(&self.dags)?;
         validate_classic_dags_have_no_compensators(&self.dags)?;
@@ -2526,6 +2556,22 @@ impl HarvestBuilder {
             wasm_module_registrations: self.wasm_module_registrations,
         })
     }
+}
+
+/// Reject a registered DAG whose definition does not compile.
+///
+/// The DAG validators below skip a definition that fails to build. This check
+/// runs first, so no invalid definition passes `try_build` unreported.
+fn validate_dag_definitions_compile(dags: &[DagInfo]) -> Result<(), HarvestBuilderError> {
+    for dag in dags {
+        if let Err(error) = dag.build_definition() {
+            return Err(HarvestBuilderError::InvalidDagDefinition {
+                dag: dag.name.to_string(),
+                error: error.to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn validate_dags_do_not_use_local_activities(
@@ -3753,7 +3799,7 @@ pub struct WorkerConfig {
     /// `max_concurrent_activities`) are auto-resized within
     /// `[SlotTunerConfig::min_slots, SlotTunerConfig::max_slots]`, driven by
     /// in-process slot utilization, worker DB-pool pressure, and recent
-    /// claim-to-dispatch permit-wait latency. The controller never resizes
+    /// dispatch-wait latency. The controller never resizes
     /// below `min_slots` (liveness floor) or above `max_slots` (hard safety
     /// cap); a shrink decision only withholds *new* permits and never cancels
     /// or reclaims an already-dispatched task, so graceful shutdown and
@@ -4418,8 +4464,8 @@ impl WorkerConfig {
     /// behaviour is byte-for-byte identical to today.
     ///
     /// See [`crate::slot_tuner`] for the default controller's signals
-    /// (slot utilization, worker DB-pool pressure, claim-to-dispatch permit
-    /// wait) and `docs/operations/adaptive-slot-tuner.md` for the operator
+    /// (slot utilization, worker DB-pool pressure, dispatch wait) and
+    /// `docs/operations/adaptive-slot-tuner.md` for the operator
     /// guide.
     #[must_use]
     pub fn with_slot_tuner(mut self, cfg: crate::slot_tuner::SlotTunerConfig) -> Self {
@@ -4640,7 +4686,10 @@ mod tests {
     /// touches `shard_assignments` gets full coverage.
     #[test]
     fn default_worker_config_shard_assignments_are_auto() {
-        assert!(WorkerConfig::default().shard_assignments.is_empty());
+        assert_eq!(
+            WorkerConfig::default().shard_assignments,
+            [] as [crate::types::ShardId; 0]
+        );
     }
 
     /// An all-duplicates list must still leave a usable assignment rather than
@@ -4871,7 +4920,7 @@ mod tests {
     #[test]
     fn worker_config_with_empty_queues_clears_list() {
         let config = WorkerConfig::default().with_queues(Vec::<&str>::new());
-        assert!(config.queues.is_empty());
+        assert_eq!(config.queues, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -4888,6 +4937,50 @@ mod tests {
     fn harvest_builder_collects_dags() {
         let builder = HarvestBuilder::new().dags(vec![fake_dag_info()]);
         assert_eq!(builder.dag_count(), 1);
+    }
+
+    /// A DAG whose definition does not compile fails `try_build`. The other
+    /// DAG validators skip such a definition, so without this check a cycle
+    /// passed the build and surfaced only at run time.
+    #[test]
+    fn a_cyclic_dag_is_rejected_by_the_builder() {
+        fn forward() {}
+
+        let cyclic_dag = DagInfo {
+            name: "cyclic_dag",
+            module: "test",
+            schedule: None,
+            catchup: false,
+            max_active_runs: 1,
+            default_queue: None,
+            builder: |dag: &mut DagBuilder| {
+                let node = dag.activity(forward);
+                let same = node.clone();
+                let _ = node.upstream(&same);
+            },
+            workflow_handler: Some(|_ctx, input| Box::pin(async move { Ok(input) })),
+            jitter: ::std::time::Duration::ZERO,
+            overlap_policy: crate::policy::OverlapPolicy::Skip,
+            buffer_all_max: 100,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            mcp: false,
+            execution_timeout: None,
+            sla: None,
+        };
+
+        let err = HarvestBuilder::new()
+            .dags(vec![cyclic_dag])
+            .try_build()
+            .expect_err("a cyclic DAG must be rejected");
+        assert!(
+            matches!(
+                err,
+                HarvestBuilderError::InvalidDagDefinition { ref dag, .. } if dag == "cyclic_dag"
+            ),
+            "the rejection must name the DAG, got: {err:?}"
+        );
     }
 
     // ── Issue #780 — declarative DAG node compensation validations ──────────
@@ -5505,7 +5598,7 @@ mod tests {
     #[test]
     fn worker_config_with_empty_iterator_clears_queues() {
         let config = WorkerConfig::default().with_queues(Vec::<&str>::new());
-        assert!(config.queues.is_empty());
+        assert_eq!(config.queues, [] as [std::string::String; 0]);
     }
 
     fn make_activity(
@@ -7663,11 +7756,9 @@ mod tests {
         // Identical-behavior guarantee: an embedder who never touches the
         // completion-callback API gets an empty default-target list.
         let built = HarvestBuilder::new().build();
-        assert!(
-            built
-                .completion_callback_config()
-                .default_targets
-                .is_empty()
+        assert_eq!(
+            built.completion_callback_config().default_targets,
+            [] as [crate::completion_callback::CallbackTarget; 0]
         );
         assert!(built.completion_callback_config().deliverer.is_none());
     }

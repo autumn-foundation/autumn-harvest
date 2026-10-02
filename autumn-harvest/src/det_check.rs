@@ -3037,8 +3037,8 @@ mod tests {
         assert_eq!(mods, vec!["workflows".to_string()]);
         // Closing the module empties both stacks.
         apply_line_braces_scoped("}", &mut scopes, &mut mods, false, None);
-        assert!(scopes.is_empty());
-        assert!(mods.is_empty());
+        assert_eq!(scopes, [] as [crate::det_check::ScopeKind; 0]);
+        assert_eq!(mods, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -3048,8 +3048,8 @@ mod tests {
         let mut scopes = vec![ScopeKind::Module, ScopeKind::Opaque];
         let mut mods = vec!["outer".to_string()];
         apply_line_braces_scoped("} }", &mut scopes, &mut mods, false, None);
-        assert!(scopes.is_empty());
-        assert!(mods.is_empty());
+        assert_eq!(scopes, [] as [crate::det_check::ScopeKind; 0]);
+        assert_eq!(mods, [] as [std::string::String; 0]);
     }
 
     #[test]

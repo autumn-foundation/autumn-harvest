@@ -1097,30 +1097,19 @@ async fn fire_claimed_throttle_row(
     let is_scheduled_fire = opts.origin.as_deref() == Some(crate::execution::ORIGIN_SCHEDULED);
 
     let params = crate::execution::StartWorkflowParams {
-        workflow_name: &workflow_name,
-        workflow_id: &workflow_id,
-        exec_id,
-        input: row.input,
-        parent_id: None,
-        queue_name: &queue_name,
         execution_timeout,
         memo: opts.memo,
         search_attrs: opts.search_attrs,
         reuse_policy,
-        conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
         trace_context: opts.trace_context,
         max_execution_timeout_ceiling,
         chain_execution_timeout,
         max_workflow_chain_timeout_ceiling,
-        inherited_chain_deadline_at: None,
         concurrency_key: opts.concurrency_key,
         concurrency_limit: opts.concurrency_limit,
         concurrency_on_conflict: opts.concurrency_on_conflict.unwrap_or_default(),
         priority,
         max_workflow_input_bytes: opts.max_workflow_input_bytes.unwrap_or(u64::MAX),
-        start_at: None,
-        delay: None,
-        max_workflow_start_delay: None,
         owner: owner.as_deref(),
         runbook_url: runbook_url.as_deref(),
         severity: severity.as_deref(),
@@ -1132,17 +1121,22 @@ async fn fire_claimed_throttle_row(
         // the schedule exactly as an immediate fire would be.
         schedule_id: opts.schedule_id,
         scheduled_for: opts.scheduled_for,
-        workflow_attempt: 1,
         workflow_retry_policy: opts
             .workflow_retry_policy
             .and_then(|v| serde_json::from_value(v).ok()),
-        retry_of_exec_id: None,
         max_workflow_attempts_ceiling: opts.max_workflow_attempts_ceiling,
         origin: opts.origin.as_deref(),
         completion_callbacks: opts.completion_callbacks,
         start_source,
         start_source_ref: start_source_ref.as_deref(),
         started_by: started_by.as_deref(),
+        ..crate::execution::StartWorkflowParams::new(
+            &workflow_name,
+            &workflow_id,
+            exec_id,
+            row.input,
+            &queue_name,
+        )
     };
 
     // `in_outer_transaction = true`: runs inside the scanner's fire transaction,
@@ -1313,6 +1307,13 @@ async fn fire_claimed_throttle_row(
 /// #1230 Finding 2 review). See
 /// [`order_due_rows_for_deadlock_free_firing`]'s doc comment for the full
 /// history.
+///
+/// Sibling of `debounce.rs`'s copy of this function (clone class, tracked
+/// in issue #1695). It differs only in the one field name `FireDueRow`
+/// forces to differ (`input` here, `last_input` there).
+/// `docs/audits/quota-lock-ordering-sync.py` normalizes that one field and
+/// gates CI on the rest staying byte-identical. A fix here must land in
+/// both files in the same change.
 #[cfg(feature = "db")]
 fn resolve_row_quota_lock_key(
     row: &FireDueRow,
@@ -1330,6 +1331,11 @@ fn resolve_row_quota_lock_key(
 /// [`crate::completion_trigger::GLOBAL_WORKFLOW_METADATA`] in one read, for
 /// [`order_due_rows_for_deadlock_free_firing`] to resolve an entire batch
 /// against. One read per batch, not one per row.
+///
+/// Sibling of `debounce.rs`'s copy of this function (issue #1230 Finding 2
+/// clone class, tracked in issue #1695). `docs/audits/quota-lock-ordering-sync.py`
+/// gates CI on the two copies staying byte-identical. A fix here must land
+/// in both files in the same change.
 #[cfg(feature = "db")]
 fn snapshot_quota_policies() -> std::collections::HashMap<String, crate::quota::QuotaPolicy> {
     crate::completion_trigger::GLOBAL_WORKFLOW_METADATA
@@ -1455,6 +1461,11 @@ fn snapshot_quota_policies() -> std::collections::HashMap<String, crate::quota::
 /// bucket that mixes quota keys can, rarely, admit a newer row before an
 /// older one. That only happens in the same tick, under scarce tokens.
 /// The delayed row is not lost. It fires on the very next scan.
+///
+/// Sibling of `debounce.rs`'s copy of this function (issue #1230 Finding 2
+/// clone class, tracked in issue #1695). `docs/audits/quota-lock-ordering-sync.py`
+/// gates CI on the two copies staying byte-identical. A fix here must land
+/// in both files in the same change.
 #[cfg(feature = "db")]
 async fn order_due_rows_for_deadlock_free_firing(
     conn: &mut diesel_async::AsyncPgConnection,
@@ -1512,19 +1523,43 @@ async fn order_due_rows_for_deadlock_free_firing(
 /// re-acquires the SAME already-held row lock. Postgres row locks are
 /// re-entrant within one session. It still does the actual
 /// debit-if-available check then, unchanged.
+///
+/// One round trip locks the whole batch. An earlier cut issued one
+/// `FOR UPDATE` statement per distinct bucket key. A claimed batch of
+/// [`THROTTLE_FIRE_BATCH_SIZE`] rows from that many tenants paid that
+/// many extra round trips on every scanner tick.
+///
+/// `ORDER BY key` on the batched query preserves the sorted-order
+/// requirement above. Postgres plans a `LockRows` node above the `Sort`.
+/// Rows lock in the sorted order the query returns them, not in scan
+/// order. `EXPLAIN (ANALYZE, BUFFERS)` on this exact shape confirms this
+/// (`docs/perf-artifacts/rate-limit-bucket-prelock-batch/`).
+///
+/// `COLLATE "C"` pins that order to a plain byte comparison. Rust's
+/// `BTreeSet<String>` -- [`collect_distinct_bucket_keys`]'s own type --
+/// always sorts by byte value, never by locale. A database with a
+/// locale-aware collation (`en_US.UTF-8` and similar) would otherwise
+/// lock in a different order. A peer still running the pre-fix per-key
+/// loop locks in Rust's byte order. During a rolling upgrade that
+/// mismatch reopens the same ABBA hazard this function exists to close.
 #[cfg(feature = "db")]
 async fn pre_lock_rate_limit_buckets_for_claimed_batch(
     conn: &mut diesel_async::AsyncPgConnection,
     due_rows: &[FireDueRow],
 ) -> crate::error::HarvestResult<()> {
     use diesel_async::RunQueryDsl;
-    for bucket_key in collect_distinct_bucket_keys(due_rows) {
-        diesel::sql_query("SELECT key FROM harvest_rate_limit_buckets WHERE key = $1 FOR UPDATE")
-            .bind::<diesel::sql_types::Text, _>(&bucket_key)
-            .execute(conn)
-            .await
-            .map_err(crate::error::database_error)?;
+    let bucket_keys: Vec<String> = collect_distinct_bucket_keys(due_rows).into_iter().collect();
+    if bucket_keys.is_empty() {
+        return Ok(());
     }
+    diesel::sql_query(
+        "SELECT key FROM harvest_rate_limit_buckets WHERE key = ANY($1) \
+         ORDER BY key COLLATE \"C\" FOR UPDATE",
+    )
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(&bucket_keys)
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
     Ok(())
 }
 
@@ -1549,6 +1584,11 @@ fn collect_distinct_bucket_keys(due_rows: &[FireDueRow]) -> std::collections::BT
 /// [`order_rows_by_quota_lock_id`]'s sort and the lock
 /// [`crate::quota::lock_quota_key`] will actually take (Codex review,
 /// issue #1230 Finding 2 follow-up).
+///
+/// Sibling of `debounce.rs`'s copy of this function (issue #1230 Finding 2
+/// clone class, tracked in issue #1695). `docs/audits/quota-lock-ordering-sync.py`
+/// gates CI on the two copies staying byte-identical. A fix here must land
+/// in both files in the same change.
 #[cfg(feature = "db")]
 async fn resolve_quota_lock_ids(
     conn: &mut diesel_async::AsyncPgConnection,
@@ -1614,6 +1654,11 @@ async fn resolve_quota_lock_ids(
 /// exactly the ABBA cycle this ordering exists to close. Sorting the
 /// id itself cannot have that failure mode. A colliding pair simply
 /// compares equal, like same-key rows already do.
+///
+/// Sibling of `debounce.rs`'s copy of this function (issue #1230 Finding 2
+/// clone class, tracked in issue #1695). `docs/audits/quota-lock-ordering-sync.py`
+/// gates CI on the two copies staying byte-identical. A fix here must land
+/// in both files in the same change.
 #[cfg(feature = "db")]
 fn order_rows_by_quota_lock_id(
     due_rows: Vec<FireDueRow>,
@@ -1820,6 +1865,28 @@ pub async fn fire_due_throttled_starts_with_codecs(
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> crate::error::HarvestResult<usize> {
+    fire_due_throttled_starts_on_conn_shard(
+        conn,
+        None,
+        sharded_pool.as_ref(),
+        shard_assignments,
+        metrics,
+        codecs,
+    )
+    .await
+}
+
+/// [`fire_due_throttled_starts_with_codecs`] for a caller that knows `conn`'s
+/// shard. See [`crate::shard::connect_or_reuse`].
+#[cfg(feature = "db")]
+pub(crate) async fn fire_due_throttled_starts_on_conn_shard(
+    conn: &mut diesel_async::AsyncPgConnection,
+    conn_shard: Option<crate::types::ShardId>,
+    sharded_pool: Option<&crate::shard::ShardedDbPool>,
+    shard_assignments: &[crate::types::ShardId],
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> crate::error::HarvestResult<usize> {
     async fn spawn_fired(
         fired: Vec<FiredThrottle>,
         metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
@@ -1878,17 +1945,17 @@ pub async fn fire_due_throttled_starts_with_codecs(
     match sharded_pool {
         Some(sp) if !shard_assignments.is_empty() => {
             for shard in shard_assignments {
-                let Some(pool) = sp.exact_pool_for(*shard).cloned() else {
+                let Some(mut shard_conn) = crate::shard::connect_or_reuse(
+                    conn,
+                    conn_shard,
+                    sp,
+                    *shard,
+                    "throttle",
+                    crate::shard::ShardConnectError::LogAndSkip,
+                )
+                .await?
+                else {
                     continue;
-                };
-                let mut shard_conn = match pool.get().await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::error!(
-                            "[throttle] failed to get connection to shard {shard:?}: {e:?}"
-                        );
-                        continue;
-                    }
                 };
                 let fired = fire_due_on_conn(&mut shard_conn, metrics, codecs).await?;
                 fired_count += spawn_fired(fired, metrics, &mut shard_conn).await;

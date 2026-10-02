@@ -696,6 +696,14 @@ and tenant-identifying (ADR-0001 §7).
 The gauge is emitted on **every** exporter tick, including ticks that deliver
 nothing — the signal must not go stale precisely when delivery has stopped.
 
+> **Disabled export (issue #1506).** A runtime rebuilt with no sink stops
+> exporting. Each export tick then sets `export_observed` to `0` for each shard
+> it serves, until a sink is configured again. `export_lag` keeps its last
+> value. A process that never configured export emits no new series. Set the
+> config only through `set_global_audit_export_config`. A deliberate disable
+> fires `harvest_audit_export_unobservable`, so silence that alert for the
+> process.
+
 A suggested alert: `harvest_audit_export_lag > 300` for 10 minutes. Sustained
 lag means privileged-action logs are not reaching the SIEM. Nothing is lost —
 the cursor is held rather than advanced — but the window during which a
@@ -784,12 +792,16 @@ Three properties worth knowing:
   and timestamp order can disagree; anchoring this way means any skew makes the
   rewind reach *further back* (costing duplicate deliveries your receiver
   dedupes) rather than skipping records the operator asked for.
-  **Known gap (issue #1508):** that lowest sequence is found among *surviving*
-  rows. If retention already purged the earliest records at or after the
-  instant, `before` silently resolves as if they were never part of the
-  window — `already_purged_records` (below) cannot see a prefix the resolver
-  itself already dropped. `to_seq` does not have this gap: it names an exact
-  position, so `already_purged_records` is exact for it.
+  That lowest sequence comes from *surviving* rows. Retention may have purged
+  the earliest records at or after the instant. The response then sets
+  `window_truncated` to `true` (issue #1508). Retention records the latest
+  `occurred_at` it purges in `harvest_audit_purge_watermark`, and the redrive
+  compares that value with the instant. The flag shows that a record at or
+  after the instant is gone. It does not count the lost records. Shards that
+  share a database share one watermark, so the flag can be `true` for a shard
+  that lost nothing. Purges before the upgrade left no trace. A refused
+  `before` request (`400`) names the loss too when the flag is set. `to_seq` does not need the flag: it names an
+  exact position, so `already_purged_records` is exact for it.
 - **The redrive is itself audited** (`audit_export.redrive`), so re-exporting is
   as auditable as the operations being exported. The rewind and its audit
   record are **one transaction on one connection** — the audit row is written

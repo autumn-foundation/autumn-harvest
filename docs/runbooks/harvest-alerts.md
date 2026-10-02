@@ -640,6 +640,16 @@ harvest dlq redrive \
   --max 500 --reason "stripe rate-limit cleared, incident-1234"
 ```
 
+Redrive specific rows instead of a filter when you already have their ids —
+from `harvest dlq list`, or from a bug report — with `--dead-letter-id`
+(repeatable, or comma-separated):
+
+```bash
+harvest dlq redrive \
+  --dead-letter-id 8f14e2c1-4b3a-4d9e-9a2f-6c1d0b5e7f31,a93c0752-1e6d-4a8b-8f0c-2d9b7a4e1c56 \
+  --reason "stripe rate-limit cleared, incident-1234"
+```
+
 The response distinguishes `matched` (total filtered), `redriven`,
 `skipped`, and `failed`. Read it:
 
@@ -841,6 +851,8 @@ or queue coverage or fix worker eligibility.
 2. Inspect `no_live_worker` and its `blocking_reasons`. The reason code means no
    live worker can claim at least one demand. It does not prove poller absence.
 3. Branch on `blocking_reasons`:
+   - `are stale, unhealthy, draining, or stopped` means an assigned poller exists but is not
+     live. Restore, restart, or reactivate that worker.
    - `polls queue(s)` means no shard-assigned worker polls the pending queue.
      Start or widen a worker's shard and queue coverage.
    - `capability/build/sticky requirements` means a covering poller is present
@@ -893,7 +905,8 @@ while it finishes — cross-check `harvest shard health` for its writable flag.
 ### Safe actions
 
 For a `polls queue(s)` block, remove explicit `with_shard_assignments`
-narrowing, add the shard, or add the queue. For a
+narrowing, add the shard, or add the queue. For a `are stale, unhealthy, draining, or stopped`
+block, restore, restart, or reactivate the assigned worker. For a
 `capability/build/sticky requirements` block, fix the named eligibility
 constraint. Configuration changes take effect on worker restart. Do **not**
 move executions across shards. Execution ids encode the original shard.
@@ -1064,7 +1077,8 @@ per-execution operator action**. Full playbook:
    - `build_id` (the build ID of the worker that observed the divergence)
 3. Diagnose one specific execution on demand against the **currently-deployed**
    code with `POST /api/harvest/workflows/{id}/replay-diagnosis` (issue #614) —
-   it returns the same `{kind, event_index, expected, actual}` vocabulary and,
+   it returns the same `{kind, event_index, expected, actual}` vocabulary (one
+   exception: a skipped recorded command, see the playbook) and,
    after a candidate rollback/fix is deployed, a `clean` verdict confirms the
    run will resume. See the **"Diagnose the divergence"** section of
    [`docs/runbooks/nondeterminism-block.md`](nondeterminism-block.md#diagnose-the-divergence-issue-614)
@@ -1077,10 +1091,13 @@ per-execution operator action**. Full playbook:
 - Code deployment that modifies workflow logic (adding, removing, or reordering activities, signals, timers, or child workflows) without updating the version gate.
 - Side effects that are not wrapped in `WorkflowContext::side_effect()`, such as direct system calls, time queries (`Instant::now()`), or random number generation.
 - Iteration order on non-deterministic collections (like `HashMap` or `HashSet`) in the workflow function.
+- Drift from an earlier deploy that the engine upgrade surfaces (issue #1791). The worker now blocks a cycle that skips a recorded command. The `build_id` is then the current build, and a rollback does not clear the block.
 
 ### False positives
 
-None. A non-determinism mismatch means the workflow code generated a different sequence of commands/actions than what was recorded in history, making replay safety impossible. Author `Err(...)` returns are never classified as divergence — they still fail terminally.
+None for a mismatch. A non-determinism mismatch means the workflow code generated a different sequence of commands/actions than what was recorded in history, making replay safety impossible. Author `Err(...)` returns are never classified as divergence — they still fail terminally.
+
+One misdiagnosis is possible (issue #1791). A workflow body that awaits non-durable work for more than 100 ms during replay can block with `expected: <workflow suspended early>`. Replay-diagnosis then reports `clean`. Move that work into an activity.
 
 ### Safe actions
 
@@ -3041,6 +3058,7 @@ invisible to detection is growing, and the audit table is growing with it.
   | Process down | `up == 0` |
   | Exporter never ran for a shard | `absent(harvest_audit_export_lag{shard="N"})` |
   | Sink failing or slow, exporter observing normally | the lag threshold — the cursor is held, so the oldest unacknowledged record ages and the gauge climbs |
+  | Export **disabled** in a live process (issue #1506) | `harvest_audit_export_unobservable` — the exporter reports `observed = 0` |
   | Exporter alive but **cannot observe the shard** | `harvest_audit_export_unobservable` — see the runbook section below |
   | **One shard** never scanned while others report | **nothing in the shipped rules.** `absent()` is false as soon as any shard reports. Template one absence rule per configured shard from your own inventory: `absent(harvest_audit_export_lag{shard="N"})` |
 
@@ -3116,6 +3134,12 @@ This is a ticket rather than a page: the sink may be working fine, and
 records already sequenced are not lost — the cursor is simply not advancing
 because the exporter cannot currently reach this shard to advance it.
 
+This alert also fires when export was disabled in a live process (issue
+#1506). A runtime rebuilt with no sink sets `export_observed` to `0` for each
+shard. In that case `GET /admin/audit-export` shows `sink_configured: false`.
+Configure a sink again, or silence the alert if you disabled export on purpose.
+Check `sink_configured` first.
+
 ### Triage steps
 
 1. `curl -s "$HARVEST/admin/audit-export" | jq '.shards[] | select(.shard == <id>)'`.
@@ -3176,3 +3200,56 @@ posture allows for privileged-action logs to sit unconfirmed, or when the
 underlying database outage is itself a page-worthy incident. Escalate to
 the team owning that shard's database first; this signal names an
 availability problem with the shard, not with the SIEM sink.
+
+## harvest_dispatch_dropped_hints
+
+**What to do when the Redis dispatch channel drops hints:** the dispatch
+background publisher's bounded queue was full (issue #1429). The gauge
+`harvest.dispatch.dropped_hints` reports the running total for this
+process. A dropped hint costs latency only. The row stays `PENDING`, and
+the worker's reconcile sweep republishes it on its own cadence.
+
+This is a health signal, not a durability one. Nothing is lost.
+
+### Triage steps
+
+1. Check the alert labels to find the affected worker process.
+2. Read `harvest.dispatch.dropped_hints` for that process over time. A step
+   change means a burst; a steady climb means sustained saturation.
+3. Compare against `harvest.queue.depth` for the queues that process
+   serves. A rising backlog alongside dropped hints confirms the publisher
+   cannot keep up with the enqueue rate.
+4. Check the Redis endpoint's own latency and error rate. A slow or
+   degraded Redis backs up the publisher queue from the other end.
+
+### Likely causes
+
+- The enqueue rate on this process exceeds the publisher's fixed queue
+  capacity (10,000 hints) for a sustained period.
+- Redis is slow or unreachable, so the publisher cannot drain its queue as
+  fast as new hints arrive.
+- A burst enqueue (a large batch start, a backfill) that exceeds the queue
+  in one spike.
+
+### False positives
+
+A brief spike during a known batch enqueue that clears within one or two
+reconcile intervals. Alert only when the counter keeps climbing past a
+single burst window.
+
+### Safe actions
+
+- Nothing here is urgent by itself: the reconcile sweep is the durability
+  floor, so a dropped hint never loses or duplicates work.
+- If the climb is sustained, investigate Redis health first — a slow
+  channel is the common cause.
+- A sustained high enqueue rate that outpaces the fixed publisher queue
+  capacity is a capacity question for the team that owns this tunable, not
+  an operator action.
+
+### Escalation criteria
+
+Escalate when dropped hints climb alongside a growing queue backlog and
+Redis itself shows no sign of degradation — that combination points at
+undersized publisher capacity for the deployment's enqueue rate, which
+needs a code change, not an operator fix.

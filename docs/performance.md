@@ -697,6 +697,10 @@ checking against this hot path's documented advisory-lock-ordering,
 exactly-once-claim, and `SKIP LOCKED`-concurrency-safety invariants by
 someone with full context on `queue.rs`. It is out of scope for this page and
 is not decided here; it is tracked separately as issue #1340.
+`docs/assays/0005-claim-batched-seek-and-refine.md` prototyped that shape and
+`docs/performance-claim-batched-seek-and-refine.md` measures a real,
+DB-tested implementation (`queue::claim_task_batched`, additive, not wired
+into the default claim path) against the single-row query above.
 
 This also corrects, without fully resolving, the
 [known limitations](#known-limitations) bullet that called `schedule_to_close`
@@ -1766,6 +1770,14 @@ from the benchmark are directly comparable.
   per RUNNING execution on every timeout-scanner tick.
 * Issue #1177 — reproduction and full `EXPLAIN` captures for
   [any residual predicate defeats sort-elision](#any-residual-predicate-defeats-sort-elision-issue-1177).
+* [`docs/performance-claim-batched-seek-and-refine.md`](performance-claim-batched-seek-and-refine.md) —
+  issue #1340's batched seek-and-refine claim (`queue::claim_task_batched`,
+  additive, not wired into the default claim path), measured against the
+  single-row query above.
+* `docs/perf-artifacts/claim-batched-seek-and-refine/` — committed `EXPLAIN`
+  evidence for that measurement.
+* `autumn-harvest/scripts/claim_batched_seek_and_refine_perf_repro.sh` —
+  regenerates that evidence from a clean checkout.
 
 ### Other profiling notes
 
@@ -1781,6 +1793,12 @@ standalone note rather than part of the claim-path attribution table above:
   — lazy JSON-Pointer path construction in schema validation (issue #373).
 * [`docs/performance-det-check.md`](performance-det-check.md) — fusing a
   redundant per-line comment scan in `harvest det-check` (issue #778).
+* [`docs/performance-det-check-line-trim.md`](performance-det-check-line-trim.md)
+  — an ASCII-fast-path `str::trim()` replacement for the same scan's
+  per-line whitespace trim; a real but sub-floor win (best corrected
+  variant: 2.35% instruction reduction against a >=5% floor) — a negative
+  result. An earlier cut of the same variant had a real vertical-tab
+  correctness bug, caught by review before it shipped.
 * [`docs/performance-dag-graph.md`](performance-dag-graph.md) — hoisting a
   per-node rebuild out of `GET /dag-run-graph` (issue #690).
 * [`docs/performance-dlq-aggregate.md`](performance-dlq-aggregate.md) — DLQ
@@ -1815,6 +1833,11 @@ standalone note rather than part of the claim-path attribution table above:
 * [`docs/performance-quota-history-bytes.md`](performance-quota-history-bytes.md)
   — measuring the `history_bytes` admission check's cost claim (issue #946
   AC7); partially inaccurate claim, no fix identified.
+* [`docs/performance-quota-reconcile-candidate-scan.md`](performance-quota-reconcile-candidate-scan.md)
+  — `reconcile_quota_keys_from` candidate-scan cost under mixed-deployment
+  skew (issue #1226 follow-up); confirms the scaling risk is a permanent
+  per-tick cost, not a rollout expense, and diagnoses a planner
+  cardinality misestimate as the cause. No fix ships in this pass.
 * [`docs/performance-codec-rotation-reencrypt.md`](performance-codec-rotation-reencrypt.md)
   — skipping a JSON round-trip in the codec-key-rotation re-encryption sweep
   (issue #948).
@@ -1843,6 +1866,15 @@ standalone note rather than part of the claim-path attribution table above:
   one statement per key (`calls` -66.7% at every swept size; buffers flat
   by design, so the fix is measured in DB-socket syscalls instead: `sendto`
   -44.5%, `recvfrom` -40.9%).
+* [`docs/performance-mutex-terminal-sweep-table-present.md`](performance-mutex-terminal-sweep-table-present.md)
+  — `mutex::sweep_terminal_holder_and_wake`, reached from the workflow
+  completion-trigger evaluator (skipped on a successfully-retried failure),
+  continue-as-new sealing, and reset, issuing its `table_present()`
+  migration guard three redundant times in one transaction (issue #691
+  follow-up); `calls` is really 3 → 1, but measured on a single reused
+  connection (matching production) the buffer delta is 0 — Postgres's own
+  backend-local syscache
+  already makes calls 2 and 3 free. No fix ships.
 * [`docs/performance-metrics-sampler-guard.md`](performance-metrics-sampler-guard.md)
   — four worker samplers issuing SQL with no `metrics.is_enabled()` guard
   (issue #1428), eliminated entirely rather than reduced (pool-touch count
@@ -1852,6 +1884,11 @@ standalone note rather than part of the claim-path attribution table above:
   `completion_trigger::enforce_completion_triggers_outbox`'s cross-shard
   relay scan, batched into one `workflow_name = ANY($1)` call via
   `resolve_target_queues_batch` (`lookup_calls` n → 1 at every swept size).
+* [`docs/performance-completion-callback-outcome-batch.md`](performance-completion-callback-outcome-batch.md)
+  — the completion-callback scanner's per-row `apply_outcome` UPDATE in
+  `completion_callback::fire_due_on_conn`, batched into one write per outcome
+  class (`Delivered`, `Backoff`), not one per row (statement calls 100 → 2 on
+  the measured mixed tick, PR #1748).
 * [`docs/performance-critical-path.md`](performance-critical-path.md) — a
   redundant second edge-set traversal in
   `critical_path::CriticalPathAnalyzer::analyze`'s sink detection, folded
@@ -1890,8 +1927,46 @@ standalone note rather than part of the claim-path attribution table above:
   actually admits; `nodes` and `by_parent` stay growing from empty after a
   post-review correction (instructions -2.37%, alloc bytes -27.12%, this
   fix's final fifth-round-corrected numbers).
+* [`docs/performance-outbox-start-relay.md`](performance-outbox-start-relay.md)
+  — the per-row delivery-mark N+1 in
+  `outbox::drain_workflow_start_outbox_batch`, the workflow-start outbox
+  relay's periodic drain (issue #1620), batched into one
+  `UPDATE ... FROM UNNEST(...)` call per outcome (delivered, failed) per
+  chunk of `OUTBOX_MARK_FLUSH_EVERY` outcomes, not one call per row and
+  not one call per drain (review-round correction: chunking, not a single
+  end-of-drain flush, bounds how long a row's claim stays held;
+  `mark_calls` n → 1/3/7 at n=5/20/50, an eightfold constant-factor
+  reduction, not a complexity-class one; `mark_buffers` -28.2% at n=50).
 * [`docs/performance-harvest-verify-split-top.md`](performance-harvest-verify-split-top.md)
   — `autumn-harvest-verify`'s `util::split_top`, the balanced-delimiter
   splitter every path/type decomposition in the MIR-level determinism
   analyzer goes through (issue #962), guarded with a first-byte check
   before its `starts_with` call (instructions -13.54%, PR #1597).
+* [`docs/performance-status-summary-stalled.md`](performance-status-summary-stalled.md)
+  — `status_summary::count_stalled_candidates`'s correlated `NOT EXISTS`
+  anti-join, 86.9% of a `GET /admin/status` request's buffers on a
+  3,000-active-execution fixture (issue #1643), rewritten as a
+  `MATERIALIZED` CTE anti-joined by equality (`Nested Loop Anti Join` →
+  `Hash Anti Join`; -97.8% buffers in the execution-heavy regime, a
+  smaller but real win in the other two measured regimes, PR #1656).
+* [`docs/performance-queue-fairness.md`](performance-queue-fairness.md) —
+  `queue_fairness::weighted_queue_order`, the weighted-random queue-selection
+  step `Worker::poll_once` runs on every poll once an operator configures
+  `WorkerConfig::queue_weights` (issue #515), 53.72% of a 16-queue/20,000-poll
+  harness; a per-queue `String` clone eliminated by returning a borrowed
+  permutation instead (instructions -36.26%, allocations -76.18%).
+* [`docs/performance-payload-codec-owned-transform.md`](performance-payload-codec-owned-transform.md)
+  — `payload_codec::{encode_payload, decode_payload}`'s identity-codec fast
+  path, run once per payload-bearing field of every workflow event ever
+  appended or replayed (`store.rs`'s `encode_event`/`decode_event`), 52.05%
+  of a 454,000-event-round-trip harness's allocation blocks; a redundant
+  `serde_json::Value` clone eliminated by taking the field by value
+  (`std::mem::take`) instead of borrowing it from the event tree the caller
+  already owns (instructions -36.89%, allocation blocks -52.05%).
+* [`docs/performance-parent-close-cascade-unfinished-handlers.md`](performance-parent-close-cascade-unfinished-handlers.md)
+  — the per-child `harvest_events` N+1 in
+  `check_and_report_unfinished_handlers`'s parent-close-cascade callers,
+  spanning eighteen call sites across `worker.rs`, `timeout.rs`,
+  `execution.rs`, and `completion_trigger.rs`; batched into a chunked
+  `eq_any` query via `check_and_report_unfinished_handlers_batch` (calls
+  400→4 at a 400-child fixture, 100 executions per chunk).

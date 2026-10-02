@@ -333,6 +333,8 @@ pub mod info;
 /// Activity execution interceptors (issue #680): an ordered middleware chain
 /// wrapping every activity execution on the worker (regular + local).
 pub mod interceptor;
+/// Every persisted workflow execution state and every sanctioned transition.
+pub mod lifecycle;
 /// `cfg(loom)` synchronization-primitive shim (std under normal builds).
 ///
 /// Contained to the modules that opt into loom model checking; see
@@ -539,8 +541,8 @@ pub use dag::{
 pub use dag_export::export_profile_mermaid_gantt;
 pub use dag_export::{export_dot, export_mermaid, export_mermaid_with_critical_path};
 pub use dag_linter::{
-    DagLinter, DagRule, DagWarning, ExcessiveParallelismRule, MissingRetryPolicyRule,
-    MissingTimeoutRule,
+    DagLinter, DagRule, DagWarning, DuplicateNodeNameRule, ExcessiveParallelismRule,
+    MissingRetryPolicyRule, MissingTimeoutRule,
 };
 #[cfg(any(test, feature = "testing"))]
 pub use dag_profiler::{DagProfile, DagProfiler, ProfilerEvent, ProfilerEventKind};

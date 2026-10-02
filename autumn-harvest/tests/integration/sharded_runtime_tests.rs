@@ -156,12 +156,20 @@ fn build_sharded_pool(urls: &BTreeMap<ShardId, String>) -> ShardedDbPool {
     ShardedDbPool::from_map(pools, ShardId::new(0))
 }
 
-/// Like [`build_sharded_pool`], but `saturated` gets a one-connection pool so a
-/// test can hold its only connection and make every further acquisition on that
-/// shard block (issue #961 review, Codex P1).
+/// Like [`build_sharded_pool`], but `saturated` gets a `max_size`-connection
+/// pool instead of the fixed default. A test can then hold every one of
+/// its connections and make further acquisition on that shard block
+/// (issue #961 review, Codex P1). Parameterized for issue #1426.
+///
+/// Keep `max_size` well under Postgres's own `max_connections` (100 by
+/// default on this suite's test database). Every shard's pool is built
+/// concurrently with the others across the whole test binary. This suite
+/// runs its Linux DB job serially, but it does not tear down the shared
+/// server between tests.
 fn build_sharded_pool_with_saturable_shard(
     urls: &BTreeMap<ShardId, String>,
     saturated: ShardId,
+    max_size: usize,
 ) -> ShardedDbPool {
     let pools: BTreeMap<ShardId, DbPool> = urls
         .iter()
@@ -169,7 +177,7 @@ fn build_sharded_pool_with_saturable_shard(
             if *shard == saturated {
                 let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.as_str());
                 let pool = deadpool::managed::Pool::builder(manager)
-                    .max_size(1)
+                    .max_size(max_size)
                     .build()
                     .expect("failed to build saturable test pool");
                 (*shard, pool)
@@ -476,7 +484,7 @@ async fn auto_shard_assignments_drain_every_writable_shard() {
 async fn a_saturated_shard_pool_does_not_strand_its_peers() {
     let (urls, _container) = setup_shard_databases(&SHARDS).await;
     let saturated = ShardId::new(0);
-    let sharded = build_sharded_pool_with_saturable_shard(&urls, saturated);
+    let sharded = build_sharded_pool_with_saturable_shard(&urls, saturated, 1);
     let metrics = Arc::new(ShardMetrics::default());
 
     // Seed work on the two healthy shards *before* saturating shard 0, so the
@@ -654,7 +662,8 @@ async fn explicit_shard_assignment_is_never_widened() {
 /// `pool.get()`. A worker that runs long enough lets one of those loops
 /// start a real acquisition against a permanently-exhausted shard before
 /// shutdown is requested. That case is not covered by this test — see
-/// issue #1426.
+/// `shutdown_completes_when_a_shard_pool_is_exhausted_after_monitors_have_ticked`
+/// below (issue #1426).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shutdown_completes_when_a_shard_pool_is_permanently_exhausted() {
     let _ = tracing_subscriber::fmt()
@@ -662,7 +671,7 @@ async fn shutdown_completes_when_a_shard_pool_is_permanently_exhausted() {
         .try_init();
     let (urls, _container) = setup_shard_databases(&SHARDS).await;
     let saturated = ShardId::new(0);
-    let sharded = build_sharded_pool_with_saturable_shard(&urls, saturated);
+    let sharded = build_sharded_pool_with_saturable_shard(&urls, saturated, 1);
     let metrics = Arc::new(ShardMetrics::default());
 
     // Take shard 0's ONLY connection and hold it for the whole test. Every
@@ -731,6 +740,176 @@ async fn shutdown_completes_when_a_shard_pool_is_permanently_exhausted() {
             Some("Stopped"),
             "shard {shard}'s worker row must reach Stopped even though shard 0's \
              pool never yielded a connection (issue #1209 AC1)",
+        );
+    }
+}
+
+// ── issue #1426 ──────────────────────────────────────────────────────────
+
+/// **Issue #1426.** Shutdown must stay bounded even when a per-shard
+/// monitor loop is caught **mid-tick** against a permanently exhausted
+/// shard pool. The pool need not have failed from the very start.
+///
+/// The #1209 fix above bounded the startup and shutdown transitions. It
+/// also made the heartbeat and schedule-overdue sampler cancel-aware. It
+/// left roughly a dozen other per-shard monitor/sampler loops unfixed.
+/// Each one only checked cancellation between ticks. A tick already
+/// parked in `pool.get()` when shutdown was requested was never rescued.
+/// The #1209 test's 300ms shutdown delay never let any of these loops
+/// start a real acquisition. Every one of them observed cancellation at
+/// the top of its loop, before ever calling `pool.get()` (see that
+/// test's own "Scope note").
+///
+/// This test closes that gap. It lets the worker run long enough for
+/// every monitor loop, poll-interval and heartbeat-cadence alike, to
+/// tick at least once against a *healthy* shard 0. It then exhausts
+/// shard 0's pool and requests shutdown, so at least one loop is caught
+/// mid-acquisition.
+///
+/// Reverting the cancel-aware acquisition fix in `poison_pill.rs`,
+/// `sessions.rs`, `quota_reconcile.rs`, or any of the samplers in
+/// `worker.rs` reproduces the hang and makes this test time out.
+///
+/// `timeout.rs`'s own acquisition was already bounded to its tick
+/// interval before this fix. Reverting only its `select!` costs at most
+/// one interval per tick there, not a hang. Its cancel-select still
+/// closes that smaller, shutdown-latency gap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_completes_when_a_shard_pool_is_exhausted_after_monitors_have_ticked() {
+    // Shard 0 gets a generous pool. That pool sits well above the ~15
+    // periodic consumers that share it: the per-shard monitors, the
+    // fleet-wide samplers, the heartbeat, and the poll loop. Shards 1
+    // and 2 keep `build_pool`'s ordinary default. Every earlier run of
+    // this suite shows that size is already enough. It keeps an
+    // unexhausted shard healthy under the same load. Postgres's own
+    // `max_connections` (100 by default on this suite's test database)
+    // is the real ceiling. A uniformly large pool on every shard was
+    // tried, and it tripped that ceiling.
+    const SATURATED_MAX_SIZE: usize = 24;
+
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+    let (urls, _container) = setup_shard_databases(&SHARDS).await;
+    let saturated = ShardId::new(0);
+    let sharded = build_sharded_pool_with_saturable_shard(&urls, saturated, SATURATED_MAX_SIZE);
+    let metrics = Arc::new(ShardMetrics::default());
+
+    let worker_id = "w-shutdown-hang-mid-tick";
+    let worker = build_worker_with(
+        &sharded,
+        Vec::new(),
+        Arc::clone(&metrics),
+        worker_id,
+        |cfg| {
+            // These shard databases are genuine Postgres instances, over
+            // TCP. A tighter interval would queue ~15 periodic consumers
+            // against shard 0 faster than a real round trip can service
+            // them. That saturates the pool organically, defeating the
+            // "healthy, then deliberately exhausted" scenario this test
+            // isolates. 500ms is still short enough that every
+            // heartbeat-cadence monitor ticks several times in this
+            // test's grace window below. That includes the poison-pill
+            // reclaimer, session reconciler, pause auto-resumer, and
+            // quota reconciler.
+            cfg.poll_interval = Duration::from_millis(100);
+            cfg.worker_heartbeat_interval = Duration::from_millis(500);
+        },
+    );
+    assert_eq!(
+        worker.config.shard_assignments.len(),
+        SHARDS.len(),
+        "auto-resolution should have widened this worker to every pool shard",
+    );
+
+    let default_pool = sharded
+        .exact_pool_for(ShardId::new(1))
+        .expect("shard 1 pool")
+        .clone();
+    let runner = Arc::clone(&worker);
+    let handle = tokio::spawn(async move {
+        runner.run(&default_pool).await;
+    });
+
+    // Let startup finish. Let every monitor loop, poll-interval (100ms)
+    // and heartbeat-cadence (500ms) alike, tick at least once against a
+    // healthy shard 0.
+    tokio::time::sleep(Duration::from_millis(3_000)).await;
+
+    // *Now* exhaust shard 0's pool: claim every connection it has, all at
+    // once. The monitors have already had a chance to complete real
+    // acquisitions against it. This test claims every connection only
+    // after that. The next round of ticks then finds the pool saturated
+    // mid-flight.
+    //
+    // Claimed concurrently, not one at a time. A sequential loop
+    // re-enters deadpool's FIFO wait queue on every single connection.
+    // Each of its requests can then lose ground to a live monitor tick
+    // that queues in between two of the loop's own iterations. Firing
+    // every request at once queues them all ahead of the *next* round of
+    // monitor ticks. That bounds this step by the monitors' currently
+    // in-flight work, not by however many more ticks land while a
+    // sequential loop is still running.
+    let shard0_pool = sharded.exact_pool_for(saturated).expect("shard 0 pool");
+    let acquisitions = (0..SATURATED_MAX_SIZE).map(|_| shard0_pool.get());
+    let saturating_conns: Vec<_> = tokio::time::timeout(
+        Duration::from_secs(60),
+        futures::future::try_join_all(acquisitions),
+    )
+    .await
+    .expect("claiming shard 0's pool queued behind other work longer than expected")
+    .expect("acquire every shard 0 connection to hold");
+
+    // Give the next round of ticks time to actually start their
+    // acquisitions against the now-exhausted pool before shutdown is
+    // requested. This is what puts a monitor loop mid-`pool.get()` at
+    // the moment `shutdown()` is called.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    worker.shutdown();
+
+    // Generous but finite, mirroring the #1209 test above: the property
+    // under test is "bounded", not "fast". Fixed cost on a correct
+    // shutdown is two bounded shard-0 acquisitions (5s each) for the
+    // Draining and Stopped fleet transitions. Add the 2s
+    // `shutdown_timeout` and the monitor-task joins themselves. About
+    // 19s was observed in practice. `90s` leaves the same comfortable
+    // headroom over that as the #1209 test leaves over its own ~22s.
+    //
+    // `expect` twice, not `assert!(result.is_ok())`: a worker task that
+    // panicked (`Ok(Err(JoinError))`) must fail this test too, not read
+    // as a timeout.
+    tokio::time::timeout(Duration::from_secs(90), handle)
+        .await
+        .expect(
+            "worker shutdown did not complete within 90s after shard 0's pool went \
+             permanently exhausted while monitor loops were already ticking against \
+             it — every per-shard monitor/sampler acquisition must be selected \
+             against its cancellation token (issue #1426)",
+        )
+        .expect("worker task panicked during shutdown");
+
+    // Held until after the join above, on purpose. Releasing these
+    // earlier would let a still-unfixed monitor loop be rescued by a
+    // freed connection instead of by cancellation. That would silently
+    // defeat this test's own premise.
+    drop(saturating_conns);
+
+    // The healthy shards' fleet rows must still reach Stopped even though
+    // shard 0 went exhausted mid-run.
+    for shard in [1, 2] {
+        let url = &urls[&ShardId::new(shard)];
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(url)
+            .await
+            .expect("connect to healthy shard for status check");
+        let status = autumn_harvest::workers::read_worker_status(&mut conn, worker_id)
+            .await
+            .expect("read worker status");
+        assert_eq!(
+            status.as_deref(),
+            Some("Stopped"),
+            "shard {shard}'s worker row must reach Stopped even though shard 0's \
+             pool went exhausted mid-run (issue #1426)",
         );
     }
 }

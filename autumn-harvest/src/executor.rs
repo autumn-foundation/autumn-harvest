@@ -23,7 +23,7 @@ use crate::telemetry::{
     ATTR_EXECUTION_ID, ATTR_QUEUE, ATTR_REPLAY, ATTR_SHARD_ID, ATTR_WORKFLOW_ID, MetricsRecorder,
     NoOpMetrics,
 };
-use crate::types::ExecutionId;
+use crate::types::{ExecutionId, ShardId};
 
 /// The outcome of running a workflow function through the executor.
 #[derive(Debug)]
@@ -43,7 +43,12 @@ pub enum WorkflowOutcome {
         /// every non-terminal-arm construction.
         unhandled_signals: std::collections::BTreeMap<String, u64>,
     },
-    /// The workflow function returned an error.
+    /// The workflow function returned an error, or the engine detected
+    /// non-determinism.
+    ///
+    /// Non-determinism includes a cycle that completed or suspended with a
+    /// recorded command left unconsumed (issue #1791). In that case
+    /// `non_deterministic_details` is `Some`.
     Failed {
         /// The string description of the error encountered.
         error: String,
@@ -64,7 +69,8 @@ pub enum WorkflowOutcome {
         /// the executor's `Ok(Err)` / deferred-nd-reroute terminal arms; a
         /// `Failed { non_deterministic_details: Some(_) }` ND-block outcome
         /// carries it too but is diverted by the worker's #603 gate before the
-        /// emission site, so it is never counted.
+        /// emission site, so it is never counted. The skipped-command arm
+        /// (issue #1791) also populates it.
         unhandled_signals: std::collections::BTreeMap<String, u64>,
     },
     /// The workflow suspended awaiting activity results or timer firings.
@@ -786,6 +792,9 @@ pub const fn classify_terminal_query(
 /// timeout, the result is `Completed` or `Failed`. If it blocks (suspended on
 /// a oneshot waiting for activity/timer resolution), the accumulated commands
 /// are returned as `Suspended`.
+///
+/// A cycle that completes or suspends with a recorded command left
+/// unconsumed returns `Failed` with `non_deterministic_details` (issue #1791).
 ///
 /// # Arguments
 ///
@@ -1721,6 +1730,15 @@ pub async fn run_workflow_with_state_advancing_clock(
     // pause/resume/redrive-shifted `deadline_at`) so `ctx.deadline()` matches
     // the timeout scanner rather than a stale start+timeout recompute.
     .with_deadline(span_meta.and_then(|m| m.deadline_at))
+    // Issue #1405: thread the row's current shard. A `ParentShard` child
+    // then places on where this run actually lives, not the origin bits
+    // `exec_id` encodes. Lets a WorkflowTestEnv run exercise a rebalanced
+    // parent.
+    .with_current_shard_id(
+        span_meta
+            .and_then(|m| i32::try_from(m.shard_id).ok())
+            .map(ShardId::new),
+    )
     // Issue #698: thread the spawning parent's execution id so a child workflow
     // can read it via `ctx.info()` / `ctx.parent_execution_id()`.
     .with_parent_execution_id(span_meta.and_then(|m| m.parent_execution_id))
@@ -1829,6 +1847,15 @@ pub async fn run_workflow_with_state_history_policy_and_caps(
     // pause/resume/redrive-shifted `deadline_at`) so `ctx.deadline()` matches
     // the timeout scanner rather than a stale start+timeout recompute.
     .with_deadline(span_meta.and_then(|m| m.deadline_at))
+    // Issue #1405: thread the row's current shard (`span_meta.shard_id` is
+    // read live from the execution row, see worker.rs). A `ParentShard`
+    // child then places where this run actually lives, not the origin bits
+    // `exec_id` encodes.
+    .with_current_shard_id(
+        span_meta
+            .and_then(|m| i32::try_from(m.shard_id).ok())
+            .map(ShardId::new),
+    )
     // Issue #698: thread the spawning parent's execution id so a child workflow
     // can read it via `ctx.info()` / `ctx.parent_execution_id()`.
     .with_parent_execution_id(span_meta.and_then(|m| m.parent_execution_id))
@@ -1862,6 +1889,64 @@ pub async fn run_workflow_with_state_history_policy_and_caps(
     }
 
     drive_workflow(ctx, handler, input, span_meta).await
+}
+
+/// Build the ND-block outcome for a cycle that skipped a recorded command
+/// event (issue #1791).
+///
+/// Returns `None` when the cycle consumed every recorded command event.
+/// The outcome carries ND details, so the worker ND-blocks the run (issue
+/// #603) and appends no event from this cycle.
+///
+/// `ended` names how the cycle ended. The `expected` field holds `ended`,
+/// which is what the code did. The `actual` field holds the recorded event,
+/// as in the #603 runbook. Earlier ND details take priority, because that
+/// divergence is the root cause.
+///
+/// The check counts command events only. A live history can hold a signal
+/// or a result that the code has not awaited yet. These events are not drift.
+fn skipped_command_outcome(
+    ctx: &WorkflowContext,
+    ended: &str,
+    unhandled_signals: &std::collections::BTreeMap<String, u64>,
+) -> Option<WorkflowOutcome> {
+    let (event_index, recorded) = ctx.first_unconsumed_command_event()?;
+    // An earlier divergence that the workflow swallowed is the root cause.
+    // Report it instead of the skipped command, as the strict executor does.
+    // The error text and the details then describe the same divergence.
+    let (error, details) = ctx.take_nd_details().map_or_else(
+        || {
+            (
+                format!(
+                    "non-deterministic replay: early completion mismatch: expected \
+                     {ended}, got {recorded} at event {event_index}"
+                ),
+                crate::error::NonDeterministicDetails {
+                    event_index: i32::try_from(event_index).ok(),
+                    expected: Some(ended.to_string()),
+                    actual: Some(recorded.clone()),
+                    workflow_type: Some(ctx.workflow_type().to_string()),
+                    build_id: ctx.build_id().map(String::from),
+                },
+            )
+        },
+        |earlier| {
+            (
+                format!(
+                    "non-deterministic replay: expected {}, got {}",
+                    earlier.expected.as_deref().unwrap_or("<unknown>"),
+                    earlier.actual.as_deref().unwrap_or("<unknown>"),
+                ),
+                earlier,
+            )
+        },
+    );
+    Some(WorkflowOutcome::Failed {
+        error,
+        non_deterministic_details: Some(details),
+        handler_panic: false,
+        unhandled_signals: unhandled_signals.clone(),
+    })
 }
 
 /// Core executor body: emit the `OTel` span, run the handler with a suspension
@@ -1962,19 +2047,22 @@ async fn drive_workflow(
                 // may have absorbed a replay divergence and recorded it as a
                 // deferred non-determinism error (issue #384). Surface it as a
                 // failure rather than letting the workflow complete silently.
-                let details = ctx.take_nd_details();
-                let outcome = ctx.take_deferred_nd_error().map_or_else(
-                    || WorkflowOutcome::Completed {
-                        output,
-                        unhandled_signals: unhandled_signals.clone(),
-                    },
-                    |nd| WorkflowOutcome::Failed {
+                let outcome = if let Some(nd) = ctx.take_deferred_nd_error() {
+                    WorkflowOutcome::Failed {
                         error: format!("non-deterministic replay: {nd}"),
-                        non_deterministic_details: details,
+                        non_deterministic_details: ctx.take_nd_details(),
                         handler_panic: false,
-                        unhandled_signals: unhandled_signals.clone(),
-                    },
-                );
+                        unhandled_signals,
+                    }
+                } else {
+                    // Issue #1791: a return that skipped a recorded command is
+                    // drift, not completion.
+                    skipped_command_outcome(&ctx, "<workflow returned early>", &unhandled_signals)
+                        .unwrap_or(WorkflowOutcome::Completed {
+                            output,
+                            unhandled_signals,
+                        })
+                };
                 (outcome, ctx.drain_commands())
             }
             // A primitive may have drifted before the workflow returned Err from
@@ -2022,6 +2110,16 @@ async fn drive_workflow(
                         },
                         ctx.drain_commands(),
                     );
+                }
+                // Issue #1791: a park that skipped a recorded command is drift.
+                // It can wait forever on an event that never comes. This runs
+                // before the continue-as-new check, as on the strict path.
+                if let Some(outcome) = skipped_command_outcome(
+                    &ctx,
+                    "<workflow suspended early>",
+                    &std::collections::BTreeMap::new(),
+                ) {
+                    return (outcome, ctx.drain_commands());
                 }
                 let mut commands = ctx.drain_commands();
                 // ContinueAsNew is terminal: when the workflow body parks on
@@ -2485,6 +2583,259 @@ mod tests {
             }
             other => panic!("expected Failed(non-determinism), got {other:?}"),
         }
+    }
+
+    // ── Issue #1791: unconsumed recorded commands on the live path ──────
+
+    /// A workflow that waits for the `go` signal, then completes.
+    fn signal_wait_workflow<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move { ctx.wait_for_signal("go").await.map_err(|e| e.to_string()) })
+    }
+
+    fn started() -> WorkflowEvent {
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        }
+    }
+
+    fn scheduled_send_email() -> WorkflowEvent {
+        WorkflowEvent::ActivityScheduled {
+            activity_id: ActivityExecId::new(),
+            name: "send_email".to_string(),
+            input: Value::Null,
+            queue: "default".to_string(),
+        }
+    }
+
+    /// Unwrap the ND details of a `Failed` outcome, or panic.
+    fn nd_details(outcome: WorkflowOutcome) -> crate::error::NonDeterministicDetails {
+        match outcome {
+            WorkflowOutcome::Failed {
+                error,
+                non_deterministic_details: Some(details),
+                handler_panic: false,
+                ..
+            } => {
+                assert!(error.contains("non-deterministic replay"), "{error}");
+                details
+            }
+            other => panic!("expected an ND failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_that_skips_a_recorded_activity_is_an_nd_failure() {
+        let history = vec![started(), scheduled_send_email()];
+        let outcome = run_workflow(ExecutionId::new(), history, echo_workflow, Value::Null).await;
+        let details = nd_details(outcome);
+        assert_eq!(
+            details.expected.as_deref(),
+            Some("<workflow returned early>")
+        );
+        assert_eq!(
+            details.actual.as_deref(),
+            Some("ActivityScheduled(send_email)")
+        );
+        assert_eq!(details.event_index, Some(1));
+    }
+
+    /// Swallows the activity result, including an ND error, then completes.
+    fn swallowing_activity_workflow<'a>(
+        ctx: &'a WorkflowContext,
+        input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let _ = ctx
+                .execute_activity_raw("send_email", input, "default")
+                .await;
+            Ok(Value::Null)
+        })
+    }
+
+    #[tokio::test]
+    async fn an_earlier_swallowed_divergence_takes_priority_over_the_skipped_command() {
+        // The activity call diverges against the recorded timer. The workflow
+        // swallows that error and returns, so the timer stays unconsumed.
+        let history = vec![
+            started(),
+            WorkflowEvent::TimerStarted {
+                timer_id: crate::types::TimerId::new("t1"),
+                duration_secs: 60,
+            },
+        ];
+        let outcome = run_workflow(
+            ExecutionId::new(),
+            history,
+            swallowing_activity_workflow,
+            Value::Null,
+        )
+        .await;
+        let WorkflowOutcome::Failed {
+            error,
+            non_deterministic_details: Some(details),
+            ..
+        } = outcome
+        else {
+            panic!("expected an ND failure, got {outcome:?}");
+        };
+        assert_eq!(
+            details.expected.as_deref(),
+            Some("ActivityScheduled(send_email)")
+        );
+        assert_eq!(details.actual.as_deref(), Some("TimerStarted"));
+        assert_eq!(
+            error,
+            "non-deterministic replay: expected ActivityScheduled(send_email), got TimerStarted",
+            "the error text must describe the same divergence as the details"
+        );
+    }
+
+    #[tokio::test]
+    async fn suspension_that_skips_a_recorded_timer_is_an_nd_failure() {
+        let history = vec![
+            started(),
+            WorkflowEvent::TimerStarted {
+                timer_id: crate::types::TimerId::new("t1"),
+                duration_secs: 60,
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: crate::types::TimerId::new("t1"),
+            },
+        ];
+        let outcome = run_workflow(
+            ExecutionId::new(),
+            history,
+            signal_wait_workflow,
+            Value::Null,
+        )
+        .await;
+        let details = nd_details(outcome);
+        assert_eq!(
+            details.expected.as_deref(),
+            Some("<workflow suspended early>")
+        );
+        assert_eq!(details.actual.as_deref(), Some("TimerStarted(t1)"));
+        assert_eq!(details.event_index, Some(1));
+    }
+
+    /// Awaits one external activity, then completes.
+    fn external_activity_workflow<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            ctx.execute_activity_external("approve", Value::Null, "default", 60)
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    #[tokio::test]
+    async fn signal_wake_while_awaiting_an_external_activity_still_suspends() {
+        // A signal wakes the run while the external activity is pending. The
+        // worker then writes a duplicate `ActivityAwaitingExternal`. The
+        // duplicate is not drift, so the cycle must park.
+        let activity_id = ActivityExecId::new();
+        let token = crate::types::ExternalActivityToken::new();
+        let awaiting = WorkflowEvent::ActivityAwaitingExternal {
+            activity_id,
+            token,
+            name: "approve".to_string(),
+            input: Value::Null,
+            queue: "default".to_string(),
+            schedule_to_close_secs: 60,
+        };
+        let history = vec![
+            started(),
+            awaiting.clone(),
+            WorkflowEvent::SignalReceived {
+                signal_name: "nudge".to_string(),
+                payload: Value::Null,
+            },
+            awaiting,
+        ];
+        let outcome = run_workflow(
+            ExecutionId::new(),
+            history,
+            external_activity_workflow,
+            Value::Null,
+        )
+        .await;
+        assert!(
+            matches!(outcome, WorkflowOutcome::Suspended { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_that_skips_a_stashed_external_signal_is_an_nd_failure() {
+        // The drive drains the request into the external stash. The guard
+        // must still see it.
+        let signal_id = crate::types::ExternalSignalId::new();
+        let history = vec![
+            started(),
+            WorkflowEvent::ExternalSignalRequested {
+                signal_id,
+                target: crate::types::ExternalTarget::ExecutionId(ExecutionId::new()),
+                signal_name: "poke".to_string(),
+                payload: Value::Null,
+                idempotency_key: None,
+            },
+            WorkflowEvent::ExternalSignalDelivered { signal_id },
+        ];
+        let outcome = run_workflow(ExecutionId::new(), history, echo_workflow, Value::Null).await;
+        let details = nd_details(outcome);
+        assert_eq!(details.actual.as_deref(), Some("ExternalSignalRequested"));
+        assert_eq!(details.event_index, Some(1));
+    }
+
+    #[tokio::test]
+    async fn suspension_with_only_a_pending_signal_still_suspends() {
+        // A signal that the code has not awaited yet is not drift.
+        let history = vec![
+            started(),
+            WorkflowEvent::SignalReceived {
+                signal_name: "other".to_string(),
+                payload: Value::Null,
+            },
+        ];
+        let outcome = run_workflow(
+            ExecutionId::new(),
+            history,
+            signal_wait_workflow,
+            Value::Null,
+        )
+        .await;
+        assert!(
+            matches!(outcome, WorkflowOutcome::Suspended { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn author_error_that_skips_a_recorded_activity_still_fails_terminally() {
+        // The guard skips the author `Err` arm, as the strict executor does.
+        // A fail-fast join that returns `Err` does not poll every branch.
+        let history = vec![started(), scheduled_send_email()];
+        let outcome =
+            run_workflow(ExecutionId::new(), history, failing_workflow, Value::Null).await;
+        assert!(
+            matches!(
+                outcome,
+                WorkflowOutcome::Failed {
+                    non_deterministic_details: None,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
     }
 
     #[tokio::test]

@@ -1,0 +1,29 @@
+                                                                                                                                                                                                                                                                                                                                                          QUERY PLAN                                                                                                                                                                                                                                                                                                                                                           
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Update on public.harvest_workflow_outbox outbox  (cost=0.44..271.29 rows=0 width=0) (actual time=0.573..0.574 rows=0 loops=1)
+   Buffers: shared hit=327 dirtied=1 written=1
+   ->  Nested Loop  (cost=0.44..271.29 rows=1 width=190) (actual time=0.098..0.227 rows=32 loops=1)
+         Output: (outbox.delivery_attempts + 1), NULL::text, v.exec_id, now(), NULL::timestamp without time zone, NULL::text, outbox.ctid, v.*
+         Inner Unique: true
+         Buffers: shared hit=128
+         ->  Function Scan on v  (cost=0.01..0.33 rows=32 width=104) (actual time=0.042..0.055 rows=32 loops=1)
+               Output: v.exec_id, v.*, v.id
+               Function Call: unnest('{500058,500059,500060,500061,500062,500063,500064,500065,500066,500067,500068,500069,500070,500071,500072,500073,500074,500075,500076,500077,500078,500079,500080,500081,500082,500083,500084,500085,500086,500087,500088,500089}'::bigint[]), unnest('{exec-live-0,exec-live-1,exec-live-2,exec-live-3,exec-live-4,exec-live-5,exec-live-6,exec-live-7,exec-live-8,exec-live-9,exec-live-10,exec-live-11,exec-live-12,exec-live-13,exec-live-14,exec-live-15,exec-live-16,exec-live-17,exec-live-18,exec-live-19,exec-live-20,exec-live-21,exec-live-22,exec-live-23,exec-live-24,exec-live-25,exec-live-26,exec-live-27,exec-live-28,exec-live-29,exec-live-30,exec-live-31}'::text[])
+         ->  Memoize  (cost=0.43..8.45 rows=1 width=22) (actual time=0.005..0.005 rows=1 loops=32)
+               Output: outbox.delivery_attempts, outbox.ctid, outbox.id
+               Cache Key: v.id
+               Cache Mode: logical
+               Hits: 0  Misses: 32  Evictions: 0  Overflows: 0  Memory Usage: 4kB
+               Buffers: shared hit=128
+               ->  Index Scan using harvest_workflow_outbox_pkey on public.harvest_workflow_outbox outbox  (cost=0.42..8.44 rows=1 width=22) (actual time=0.004..0.004 rows=1 loops=32)
+                     Output: outbox.delivery_attempts, outbox.ctid, outbox.id
+                     Index Cond: (outbox.id = v.id)
+                     Filter: (outbox.claimed_by = 'explain-claimant'::text)
+                     Buffers: shared hit=128
+ Query Identifier: 7193770785077071135
+ Planning:
+   Buffers: shared hit=209
+ Planning Time: 0.730 ms
+ Execution Time: 0.965 ms
+(25 rows)
+

@@ -726,3 +726,121 @@ async fn purge_deletes_only_expired_rows() {
         "the expired claim is gone"
     );
 }
+
+// ── A start-replace keeps the replaced run's outcome ────────────────────────
+
+#[tokio::test]
+async fn a_replaced_failed_run_still_reads_as_failed() {
+    // `AllowDuplicateFailedOnly` replaces a FAILED prior by sealing it
+    // `CONTINUED_AS_NEW`, with no event. Nothing continued that run. An
+    // `await_external_workflow` on it once waited forever for a
+    // `WorkflowContinuedAsNew` event that was never written.
+    use autumn_harvest::event::WorkflowEvent;
+    use autumn_harvest::execution::{
+        ExternalAwaitOutcome, ExternalAwaitReadResult, read_external_await_outcome,
+        start_or_load_workflow_execution,
+    };
+
+    let (mut conn, container) = setup_db().await;
+    let host = container.get_host().await.expect("host");
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgresql://postgres:postgres@{host}:{port}/postgres");
+    let first = ExecutionId::new_for_shard(ShardId::new(0));
+    start_or_load_workflow_execution(
+        &mut conn,
+        params(
+            "wf",
+            "replace-me",
+            first,
+            WorkflowIdReusePolicy::AllowDuplicate,
+        ),
+        None,
+    )
+    .await
+    .expect("first start");
+    autumn_harvest::store::append_single_event(
+        &mut conn,
+        first,
+        WorkflowEvent::workflow_failed("boom"),
+    )
+    .await
+    .expect("append WorkflowFailed");
+    conn.batch_execute(&format!(
+        "UPDATE harvest_workflow_executions SET state = 'FAILED', error = 'boom', \
+         completed_at = NOW() WHERE id = '{}'; \
+         UPDATE harvest_task_queue SET state = 'FAILED' WHERE workflow_exec_id = '{}'",
+        first.as_uuid(),
+        first.as_uuid()
+    ))
+    .await
+    .expect("seal the first run FAILED");
+
+    let second = ExecutionId::new_for_shard(ShardId::new(0));
+    let started = start_or_load_workflow_execution(
+        &mut conn,
+        params(
+            "wf",
+            "replace-me",
+            second,
+            WorkflowIdReusePolicy::AllowDuplicateFailedOnly,
+        ),
+        None,
+    )
+    .await
+    .expect("replacing start");
+    assert!(started.created, "a FAILED prior is replaced");
+    assert_eq!(
+        scalar_i64(
+            &mut conn,
+            &format!(
+                "SELECT COUNT(*) AS n FROM harvest_workflow_executions \
+                 WHERE id = '{}' AND state = 'CONTINUED_AS_NEW'",
+                first.as_uuid()
+            ),
+        )
+        .await,
+        1,
+        "the prior is sealed CONTINUED_AS_NEW to free its business key"
+    );
+
+    // A handle reads the same outcome. The pool has one connection, so a
+    // second checkout while the first is held would hang; the timeout turns
+    // that hang into a failure.
+    let pool: autumn_harvest::worker::DbPool = deadpool::managed::Pool::builder(
+        diesel_async::pooled_connection::AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+            &url,
+        ),
+    )
+    .max_size(1)
+    .build()
+    .expect("size-1 pool");
+    let shard = ShardId::new(0);
+    let client = autumn_harvest::WorkflowHandleClient::new(
+        autumn_harvest::shard::ShardedDbPool::single(pool),
+        autumn_harvest::shard::ShardRouter::new(vec![shard], vec![shard], shard),
+        [(shard, url.clone())],
+    );
+    let snapshot = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        client.handle(first).result_snapshot(),
+    )
+    .await
+    .expect("a size-1 pool must not deadlock the result read")
+    .expect("result snapshot");
+    assert_eq!(
+        snapshot.state,
+        autumn_harvest::handle::WorkflowResultState::Failed
+    );
+
+    match read_external_await_outcome(&mut conn, first)
+        .await
+        .expect("read outcome")
+    {
+        ExternalAwaitReadResult::Terminal(ExternalAwaitOutcome::Terminal {
+            reason_code, ..
+        }) => {
+            assert_eq!(reason_code, "target_failed");
+        }
+        _ => panic!("a replaced FAILED run must read as a terminal failure"),
+    }
+}

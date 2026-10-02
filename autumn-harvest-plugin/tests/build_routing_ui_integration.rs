@@ -629,6 +629,113 @@ async fn ui_declare_compat_form_action_redirects() {
     assert!(location.contains("flash="));
 }
 
+/// Wayfinder error-path fix — issue #1687's sibling gap on this page.
+/// A rejected set-policy submission used to redirect with only a flash
+/// message. That discarded the queue name, build id and deployment name
+/// the operator had typed. The redirect now carries those values back, so
+/// the redisplayed page pre-fills the form instead of showing it empty.
+#[tokio::test]
+async fn ui_set_policy_empty_queue_name_preserves_entered_values() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let api_state = build_api_state_with_pool(&pool);
+    let app = harvest_ui_router(api_state);
+
+    let (status, headers, _body) = post_form(
+        &app,
+        "/build-routing/set-policy",
+        "queue_name=&build_id=sha-v2&deployment_name=prod-v2",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "a rejected set-policy submission must still redirect, not abort"
+    );
+    let location = headers.get("location").unwrap().to_str().unwrap();
+    assert!(
+        location.contains("set_policy_error="),
+        "redirect must carry the validation error: {location}"
+    );
+    assert!(
+        location.contains("set_policy_build_id=sha-v2"),
+        "redirect must carry the entered build id back: {location}"
+    );
+    assert!(
+        location.contains("set_policy_deployment_name=prod-v2"),
+        "redirect must carry the entered deployment name back: {location}"
+    );
+
+    // Resolve the relative redirect the way a browser would against
+    // /build-routing/set-policy, whose base directory is /build-routing/.
+    let Some(rest) = location.strip_prefix("../") else {
+        panic!("set-policy redirect must climb a segment: {location}");
+    };
+    let resolved = format!("/{rest}");
+    let (status, html) = fetch_html(&app, &resolved).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("queue_name and build_id must not be empty"),
+        "redisplayed page must show the error inline: {html}"
+    );
+    assert!(
+        html.contains(r#"name="build_id" required placeholder="e.g. sha-abc123""#)
+            && html.contains(r#"value="sha-v2""#),
+        "redisplayed Set Policy form must keep the entered build id: {html}"
+    );
+    assert!(
+        html.contains(r#"value="prod-v2""#),
+        "redisplayed Set Policy form must keep the entered deployment name: {html}"
+    );
+}
+
+/// Same gap as above, for Declare Compatibility's two free-text fields.
+#[tokio::test]
+async fn ui_declare_compat_empty_field_preserves_entered_values() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let api_state = build_api_state_with_pool(&pool);
+    let app = harvest_ui_router(api_state);
+
+    let (status, headers, _body) = post_form(
+        &app,
+        "/build-routing/declare-compat",
+        "build_id=sha-v2&compatible_with=",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "a rejected declare-compat submission must still redirect, not abort"
+    );
+    let location = headers.get("location").unwrap().to_str().unwrap();
+    assert!(
+        location.contains("compat_error="),
+        "redirect must carry the validation error: {location}"
+    );
+    assert!(
+        location.contains("compat_build_id=sha-v2"),
+        "redirect must carry the entered build id back: {location}"
+    );
+
+    // Resolve the relative redirect the way a browser would against
+    // /build-routing/declare-compat, whose base directory is /build-routing/.
+    let Some(rest) = location.strip_prefix("../") else {
+        panic!("declare-compat redirect must climb a segment: {location}");
+    };
+    let resolved = format!("/{rest}");
+    let (status, html) = fetch_html(&app, &resolved).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("build_id and compatible_with must not be empty"),
+        "redisplayed page must show the error inline: {html}"
+    );
+    assert!(
+        html.contains(r#"name="build_id" required placeholder="e.g. sha-new" style="display:block;width:100%;margin-top:4px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:6px 8px;font-size:12px" value="sha-v2""#),
+        "redisplayed Declare Compat form must keep the entered build id: {html}"
+    );
+}
+
 /// Red Phase: UI revoke-compat form action redirects with flash (AC #5).
 #[tokio::test]
 async fn ui_revoke_compat_form_action_redirects() {

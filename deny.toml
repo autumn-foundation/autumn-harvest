@@ -20,16 +20,32 @@ feature-depth = 1
 # ---------------------------------------------------------------------------
 [advisories]
 yanked = "deny"
-# `unsound` defaults to cargo-deny's `Scope::Workspace`, which only reports
-# an informational=unsound advisory when a *workspace member* directly
-# depends on the affected instance. That silently drops any unsound finding
-# reached only transitively (the common case: an unsound advisory sitting
-# two or more hops below a workspace member, as both RUSTSEC-2026-0253 and
-# RUSTSEC-2026-0190 turned out to be) -- cargo-deny simply never evaluates
-# those instances, ignore-listed or not. `unmaintained` already defaults to
-# `Scope::All` below; `unsound` is the one category with a narrower default,
-# so it needs the same override made explicit here rather than left to
-# cargo-deny's default.
+# `unsound` scopes which crates can surface an `unsound` advisory at all.
+# History, so the next person doesn't relitigate this: cargo-deny 0.18
+# removed the field outright and unconditionally denied `unsound` findings
+# for every reachable instance, workspace or transitive -- this file used to
+# document that as the permanent fix for the gap `unsound` used to have
+# (silently dropping any unsound finding reached only transitively, e.g.
+# two-or-more hops below a workspace member). That was accurate for 0.18.x
+# but did not hold: cargo-deny 0.19.0 (PR#826) reintroduced
+# `[advisories.unsound]`, this time defaulting to `Scope::Workspace` --
+# the exact gap 0.18 had supposedly closed, back, silently, with no
+# deprecation warning and no config-validation failure to flag it. This
+# repo's Cargo.lock-pinned `cargo-deny` tracked that upgrade (0.18.9 ->
+# 0.20.2) without anyone touching this file, so the gap reopened
+# unannounced: a run with the field absent still printed "advisories ok"
+# with only a low-signal `advisory-not-detected` warning on the
+# RUSTSEC-2026-0253 ignore entry below, not a failure -- indistinguishable
+# at a glance from the entry simply having become stale. Caught by Ballast's
+# 2026-09-28 run: `cargo deny check advisories -s` went from "0 errors, 1
+# warnings, 6 notes" (field absent) to "0 errors, 0 warnings, 8 notes"
+# (`unsound = "all"` set) -- the two new notes are RUSTSEC-2026-0253 against
+# `lru` 0.16.4 (ratatui-core's transitive pin) actually being evaluated
+# again, matching the ignore entry's documented "unreachable" verdict rather
+# than silently skipping it. Set explicitly again; treat any future
+# cargo-deny upgrade that touches `[advisories]` defaults as a reason to
+# re-diff `cargo deny check advisories -s` output, not just the version
+# number.
 unsound = "all"
 ignore = [
     # RUSTSEC-2026-0253 — lru, use-after-free in LruCache::pop() when a
@@ -67,16 +83,19 @@ ignore = [
     # Revisit: ratatui-core raises its own `lru` requirement past 0.18.2, or
     # starts calling `pop()` on this cache.
     #
-    # This entry went stale between PR #1417 and this run for a reason worth
-    # recording: once our own instance moved off `lru = "0.16"`, the only
-    # remaining affected instance (ratatui-core's) was no longer a *direct*
-    # dependency of any workspace member, and cargo-deny's `unsound` default
-    # (`Scope::Workspace`, see above) stopped evaluating it at all --
-    # `cargo deny check` reported "advisory was not encountered" for this
-    # ignore entry, not because the ratatui-core instance disappeared or its
-    # own revisit trigger fired, but because the scope no longer looked at it.
-    # The `unsound = "all"` override above restores the match; the reasoning
-    # and revisit trigger below are unchanged from PR #1417.
+    # This entry has gone stale twice for the same underlying reason, worth
+    # recording both times: once our own instance moved off `lru = "0.16"`,
+    # the only remaining affected instance (ratatui-core's) was no longer a
+    # *direct* dependency of any workspace member, so any `unsound` scope
+    # narrower than "all" stops evaluating it -- `cargo deny check` reports
+    # "advisory was not encountered" for this ignore entry, not because the
+    # ratatui-core instance disappeared or its own revisit trigger fired, but
+    # because the scope stopped looking at it. First seen under PR #1417
+    # (cargo-deny's then-current `Scope::Workspace` default), fixed there
+    # with `unsound = "all"`. Recurred under this repo's cargo-deny 0.18.9 ->
+    # 0.20.2 upgrade, caught by Ballast's 2026-09-28 run: see the
+    # `[advisories]` comment above for the full history. The reasoning and
+    # revisit trigger below are unchanged from PR #1417.
     { id = "RUSTSEC-2026-0253", reason = "unreachable: only remaining affected instance is ratatui-core 0.1.0's own `lru = \"0.16\"` pin (external, resolves 0.16.4); our own instance is fixed (0.18.4). ratatui-core's cache only calls pop_lru() via resize(), never the vulnerable pop(), and its key type (Rect, Layout) has no custom Drop either. Revisit: ratatui-core bumps past 0.18.2 or starts calling pop()." },
 
     # RUSTSEC-2026-0190 — anyhow, unsoundness in `Error::downcast_mut()`.
@@ -95,10 +114,10 @@ ignore = [
     # direct dependency of ours to bump. No ignore entry needed once patched.
     #
     # This is also the second instance (after RUSTSEC-2026-0253, above) of
-    # an unsound advisory that `unsound = "all"` was needed to even see:
-    # `anyhow` is never a direct workspace dependency either, so under the
-    # cargo-deny default this would have stayed invisible indefinitely, not
-    # just until some pin aged out.
+    # an unsound advisory that the old `unsound = "all"` override was needed
+    # to even see: `anyhow` is never a direct workspace dependency either, so
+    # under cargo-deny's then-default this would have stayed invisible
+    # indefinitely, not just until some pin aged out.
 
     # RUSTSEC-2026-0258 — h2, unbounded empty DATA frames. The hyper-1.x/
     # axum/autumn-web instance (h2 0.4.13) was fixed in the harness PR
