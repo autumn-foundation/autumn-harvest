@@ -305,7 +305,8 @@ async fn three_checkers_on_one_shard_run_about_one_pass_per_tick() {
 }
 
 /// Inserts `n` RUNNING activity rows on `queue` whose start-to-close budget
-/// has run out. Removes earlier rows on `queue` first.
+/// has run out. Removes earlier rows on `queue` first. Returns the ids in
+/// creation order, which is the order a sweep reads them.
 async fn insert_expired_running_tasks(
     conn: &mut AsyncPgConnection,
     queue: &str,
@@ -333,7 +334,6 @@ async fn insert_expired_running_tasks(
         .expect("insert expired task");
         ids.push(id);
     }
-    ids.sort();
     ids
 }
 
@@ -410,12 +410,24 @@ async fn timeout_scan_is_bounded_per_pass_and_converges() {
         );
         pages.push(ids);
     }
-    let first_sweep: Vec<_> = pages[..3].concat();
+    // A batch loads in id order, so compare each page as a set.
+    let sorted = |ids: &[uuid::Uuid]| {
+        let mut ids = ids.to_vec();
+        ids.sort();
+        ids
+    };
+    for (page, rows) in pages[..3].iter().zip(ours.chunks(3)) {
+        assert_eq!(
+            sorted(page),
+            sorted(rows),
+            "one sweep reads every row once, in creation order"
+        );
+    }
     assert_eq!(
-        first_sweep, ours,
-        "one sweep reads every row once, in id order"
+        sorted(&pages[3]),
+        sorted(&ours[..3]),
+        "a short page wraps the cursor"
     );
-    assert_eq!(pages[3], ours[..3], "a short page wraps the cursor");
 
     // A limit below 1 counts as 1.
     let page = timeout::find_timed_out_tasks_batch(&mut conn, &mut TimeoutScanCursor::default(), 0)
@@ -442,11 +454,11 @@ async fn timeout_scan_is_bounded_per_pass_and_converges() {
     );
 }
 
-/// A sweep stops at the high-water mark it fixed when it started. A row
-/// that expires above the mark during the sweep waits for the next one. So
-/// new arrivals cannot stretch the sweep past the rows behind the cursor.
+/// A sweep reads the rows created before it started, and stops there. A row
+/// created during the sweep waits for the next one, even with the highest
+/// id. So new rows cannot stretch the sweep.
 #[tokio::test]
-async fn a_sweep_stops_at_its_high_water_mark() {
+async fn a_row_created_during_a_sweep_waits_for_the_next() {
     let (url, _container) = setup_test_db_url().await;
     let pool = build_pool(&url);
     let mut conn = pool.get().await.expect("connection");
@@ -490,7 +502,7 @@ async fn a_sweep_stops_at_its_high_water_mark() {
     }
     assert_eq!(
         seen, ours,
-        "the sweep reads the backlog it started with, in id order"
+        "the sweep reads the backlog it started with, in creation order"
     );
 
     // The late row comes in the next sweep.
@@ -513,10 +525,10 @@ async fn a_sweep_stops_at_its_high_water_mark() {
 }
 
 /// A sweep reads only the rows that were live at its start. Rows created
-/// later, between the cursor and the mark, wait for the next sweep. So they
-/// cannot stretch the sweep, even when they are already expired.
+/// later wait for the next sweep. So they cannot stretch the sweep, even
+/// when they are already expired.
 #[tokio::test]
-async fn arrivals_below_the_mark_cannot_stretch_a_sweep() {
+async fn arrivals_cannot_stretch_a_sweep() {
     let (url, _container) = setup_test_db_url().await;
     let pool = build_pool(&url);
     let mut conn = pool.get().await.expect("connection");
@@ -536,16 +548,9 @@ async fn arrivals_below_the_mark_cannot_stretch_a_sweep() {
         .expect("batch scan");
     assert_eq!(start_to_close_ids(&first), ours[..1]);
 
-    // 100 expired arrivals with ids between the cursor (the 64th id) and the
-    // mark (the 70th id). Read in this sweep, they would add two pages.
-    let (low, high) = (ours[63], ours[69]);
-    let mut arrivals = Vec::with_capacity(100);
-    while arrivals.len() < 100 {
-        let id = uuid::Uuid::new_v4();
-        if low < id && id < high {
-            arrivals.push(id);
-        }
-    }
+    // 100 arrivals that are already expired. Read in this sweep, they would
+    // add two pages.
+    let arrivals: Vec<uuid::Uuid> = (0..100).map(|_| uuid::Uuid::new_v4()).collect();
     diesel::sql_query(
         "INSERT INTO harvest_task_queue \
          (id, queue_name, task_type, input, state, attempt, max_attempts, \
@@ -585,8 +590,8 @@ async fn arrivals_below_the_mark_cannot_stretch_a_sweep() {
 }
 
 /// A sweep reads the rows that were expired when it started. Rows that
-/// expire later cannot take their place, even with lower ids. Otherwise a
-/// steady stream of arrivals can push a high id out of every sweep.
+/// expire later cannot take their place. Otherwise a steady stream of
+/// arrivals can push an old row out of every sweep.
 #[tokio::test]
 async fn later_expiries_cannot_displace_the_rows_a_sweep_counted() {
     let (url, _container) = setup_test_db_url().await;
@@ -608,16 +613,8 @@ async fn later_expiries_cannot_displace_the_rows_a_sweep_counted() {
             .expect("batch scan"),
     );
 
-    // 100 rows that expire after the sweep started, with ids between the
-    // cursor (the 64th id) and the highest counted id (the 70th id).
-    let (low, high) = (ours[63], ours[69]);
-    let mut arrivals = Vec::with_capacity(100);
-    while arrivals.len() < 100 {
-        let id = uuid::Uuid::new_v4();
-        if low < id && id < high {
-            arrivals.push(id);
-        }
-    }
+    // 100 rows that expire after the sweep started.
+    let arrivals: Vec<uuid::Uuid> = (0..100).map(|_| uuid::Uuid::new_v4()).collect();
     diesel::sql_query(
         "INSERT INTO harvest_task_queue \
          (id, queue_name, task_type, input, state, attempt, max_attempts, \
@@ -651,8 +648,8 @@ async fn later_expiries_cannot_displace_the_rows_a_sweep_counted() {
     );
 }
 
-/// A refill reads one bounded page of live rows, in id order. It does not
-/// scan every live row to find the expired ones. So a refill costs the same
+/// A refill reads one bounded page of live rows, in creation order. It does
+/// not scan every live row to find the expired ones. So a refill costs the same
 /// at any backlog size, and one sweep reads each live row once.
 #[tokio::test]
 async fn a_refill_reads_one_bounded_page_of_live_rows() {
@@ -678,7 +675,7 @@ async fn a_refill_reads_one_bounded_page_of_live_rows() {
     .execute(&mut conn)
     .await
     .expect("insert live tasks");
-    // One expired row above them all.
+    // One expired row, created after them all.
     let target = uuid::Uuid::from_u128(u128::MAX - 1);
     diesel::sql_query(
         "INSERT INTO harvest_task_queue \
@@ -710,8 +707,8 @@ async fn a_refill_reads_one_bounded_page_of_live_rows() {
         .execute(&mut conn)
         .await
         .expect("clear queue");
-    // At least 200 live rows sort below the target, so it is on the fourth
-    // page or later. Other suites' live rows can only push it further.
+    // At least 200 live rows were created before the target, so it is on the
+    // fourth page or later. Other suites' live rows can only push it further.
     let found_at = found_at.expect("the sweep must reach the expired row");
     assert!(
         found_at >= 4,

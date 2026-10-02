@@ -531,63 +531,81 @@ fn higher_reason_exclusions(higher: &[&str], bound: &str) -> String {
     sql
 }
 
+/// The sort key of a live row in a timeout sweep (issue #1795).
+///
+/// It is the row's creation time. Rows enqueued before migration
+/// `20260619000000` have no `created_at`, so they sort first. The partial
+/// index `idx_harvest_tq_live_created` holds live rows in `(key, id)` order.
+/// The text must match the index expression, or Postgres cannot use it.
+const LIVE_ROW_KEY: &str = "COALESCE(created_at, TIMESTAMPTZ '1970-01-01 00:00:00+00')";
+
 /// One refill of a task-timeout queue (issue #1795).
 ///
-/// The refill reads one page of live rows in `id` order. A live row is
-/// `PENDING` or `RUNNING`. The partial index `idx_harvest_tq_live_id` holds
-/// them in `id` order, so the page reads at most `LIMIT` index entries. The
-/// primary key also holds terminal rows, so a page on it is not bounded.
+/// The refill reads one page of live rows in `(key, id)` order, where the
+/// key is [`LIVE_ROW_KEY`]. A live row is `PENDING` or `RUNNING`. The page
+/// reads only rows created at or before the sweep's clock. The index scan
+/// applies that bound and the keyset bound itself. So the page reads at most
+/// `LIMIT` index entries, and rows created later are never visited.
 ///
-/// The query then tests the page against the predicate and returns the
-/// expired ids. It also returns the last id of the page and the number of
-/// rows read. So the work of a refill does not grow with the backlog, and
-/// one sweep reads each live row once.
-///
-/// The predicate is wrapped as a subquery, and the predicate consts stay
-/// plain, because the backup drill `UNION`s them. `OFFSET 0` keeps the
-/// subquery apart, so its `id = ANY` bound reaches the scan. Every predicate
-/// has one table at its top level, so the bare `id` is not ambiguous.
-///
-/// The upper bound is the sweep's mark, from [`TIMEOUT_SWEEP_START_SQL`].
-/// The page also leaves out rows created after the sweep started. So new
-/// rows cannot stretch a sweep, wherever their ids fall.
+/// The page holds whole rows. Each predicate then reads the page, not the
+/// table, so no predicate can fall back to its own index and scan past the
+/// page. A row that also matches an earlier reason is left to that reason. The query returns the expired ids, oldest first. It also returns the
+/// key and id of the last row of the page, and the number of rows read. So
+/// the work of a refill does not grow with the backlog. One sweep reads once
+/// each row that was live at its start.
 ///
 /// Each predicate compares against the sweep's clock, not `NOW()`. So the
-/// sweep queues only rows that had expired when it started.
+/// sweep queues only rows that had expired when it started. The predicate
+/// consts stay plain, because the backup drill `UNION`s them.
 ///
-/// With `after`, `$1` is the last id of the previous page and `$2` is the
-/// mark. Then `$3` is the page size and `$4` is the sweep's clock. Without
-/// it, `$1` is the mark, `$2` is the page size and `$3` is the clock.
+/// With `after`, `$1` and `$2` are the key and id of the last row of the
+/// previous page. Then `$3` is the page size and `$4` is the sweep's clock.
+/// Without it, `$1` is the page size and `$2` is the clock.
 fn timeout_refill_query(predicate: &str, higher: &[&str], after: bool) -> String {
+    use std::fmt::Write as _;
+
     let (keyset, limit, clock) = if after {
-        ("id > $1 AND id <= $2", "$3", "$4")
+        (format!(" AND ({LIVE_ROW_KEY}, id) > ($1, $2)"), "$3", "$4")
     } else {
-        ("id <= $1", "$2", "$3")
+        (String::new(), "$1", "$2")
     };
-    let bound = " AND id = ANY(ARRAY(SELECT id FROM page))";
-    let predicate = predicate.replace("NOW()", clock);
-    let higher: Vec<String> = higher.iter().map(|h| h.replace("NOW()", clock)).collect();
-    let higher: Vec<&str> = higher.iter().map(String::as_str).collect();
-    let exclusions = higher_reason_exclusions(&higher, bound);
+    let on_page = |sql: &str| on_refill_page(sql).replace("NOW()", clock);
+    // `EXCEPT` leaves a row to an earlier reason. A set operation stays near
+    // linear in the page. A correlated `NOT EXISTS` on the page can run as a
+    // nested loop, because the planner cannot estimate the page's rows.
+    let mut expired = format!("SELECT q.id, q.row_key FROM ({}) q", on_page(predicate));
+    for earlier in higher {
+        let _ = write!(
+            expired,
+            " EXCEPT SELECT h.id, h.row_key FROM ({}) h",
+            on_page(earlier)
+        );
+    }
     format!(
-        "WITH page AS MATERIALIZED (SELECT id FROM harvest_task_queue \
-         WHERE state IN ('PENDING', 'RUNNING') AND {keyset} \
-         AND (created_at IS NULL OR created_at <= {clock}) \
-         ORDER BY id LIMIT {limit}) \
-         SELECT (SELECT id FROM page ORDER BY id DESC LIMIT 1) AS last_id, \
+        "WITH page AS MATERIALIZED (SELECT harvest_task_queue.*, {LIVE_ROW_KEY} AS row_key \
+         FROM harvest_task_queue \
+         WHERE state IN ('PENDING', 'RUNNING') AND {LIVE_ROW_KEY} <= {clock}{keyset} \
+         ORDER BY {LIVE_ROW_KEY}, id LIMIT {limit}), \
+         tail AS (SELECT row_key, id FROM page ORDER BY row_key DESC, id DESC LIMIT 1) \
+         SELECT (SELECT row_key FROM tail) AS last_key, (SELECT id FROM tail) AS last_id, \
          (SELECT COUNT(*) FROM page) AS rows_read, \
-         ARRAY(SELECT q.id FROM ({predicate}{bound} OFFSET 0) q WHERE TRUE{exclusions} \
-         ORDER BY q.id) AS expired"
+         ARRAY(SELECT e.id FROM ({expired}) e ORDER BY e.row_key, e.id) AS expired"
     )
 }
 
-/// The start of a sweep (issue #1795): the highest live id and the
-/// database clock.
+/// Points a timeout predicate at the refill page instead of the table.
 ///
-/// The sweep stops at this id and tests expiry against this clock. See
-/// [`timeout_refill_query`]. The live-row index answers it with one lookup.
-const TIMEOUT_SWEEP_START_SQL: &str = "SELECT id, NOW() AS as_of FROM harvest_task_queue \
-     WHERE state IN ('PENDING', 'RUNNING') ORDER BY id DESC LIMIT 1";
+/// Every predicate reads `harvest_task_queue` once, at its top level. Its
+/// subqueries read other tables only. A unit test holds both facts.
+fn on_refill_page(predicate: &str) -> String {
+    predicate.replacen("FROM harvest_task_queue", "FROM page", 1)
+}
+
+/// The start of a sweep (issue #1795): the database clock.
+///
+/// The sweep reads the rows created at or before this time, and tests
+/// expiry against it. See [`timeout_refill_query`].
+const TIMEOUT_SWEEP_START_SQL: &str = "SELECT NOW() AS as_of";
 
 /// The rows of one batch of queued ids (issue #1795).
 ///
@@ -613,27 +631,26 @@ const MAX_PAGE_ROWS: i64 = 100_000;
 /// One timeout reason's place in its sweep.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct TimeoutScanLane {
-    /// The last id of the last full page. `None` starts a new sweep.
-    after: Option<uuid::Uuid>,
-    /// The current sweep's mark: the highest live id at its start. The
-    /// sweep stops at this id.
-    until: Option<uuid::Uuid>,
-    /// The database clock when the current sweep started. Refills test
-    /// expiry against it.
+    /// The key and id of the last row of the last full page. `None` starts
+    /// the sweep from its first row.
+    after: Option<(chrono::DateTime<chrono::Utc>, uuid::Uuid)>,
+    /// The database clock when the current sweep started. `None` means no
+    /// sweep is open. Refills read rows created by then, and test expiry
+    /// against it.
     as_of: Option<chrono::DateTime<chrono::Utc>>,
-    /// Expired ids from the last refill, in id order, not yet handed out.
+    /// Expired ids from the last refill, not yet handed out.
     queued: std::collections::VecDeque<uuid::Uuid>,
 }
 
 /// Where the next batched task-timeout scan starts (issue #1795).
 ///
-/// One lane per timeout reason. A sweep starts by fixing a mark and a
-/// clock: the highest live id and the database time at that moment. When a
-/// lane runs empty, one refill reads the next page of live rows, in id
-/// order, up to the mark. It queues the rows of that page that had expired
-/// by the clock. Each pass then takes one batch from the queue and loads it
-/// by primary key. A full page moves the position to its last id. A short
-/// page ends the sweep, so the next sweep starts again at the lowest id.
+/// One lane per timeout reason. A sweep starts by fixing a clock: the
+/// database time at that moment. When a lane runs empty, one refill reads
+/// the next page of live rows created by then, in creation order. It queues
+/// the rows of that page that had expired by the clock. Each pass then takes
+/// one batch from the queue and loads it by primary key. A full page moves
+/// the position to its last row. A short page ends the sweep, so the next
+/// sweep starts again with a new clock.
 ///
 /// A sweep reads each row that was live at its start once. It queues each
 /// such row that had expired by its clock and still matches. A row created
@@ -641,8 +658,8 @@ struct TimeoutScanLane {
 /// So new rows cannot stretch a sweep or push an older row out of it. A
 /// queued row that stops matching is dropped when its batch loads.
 ///
-/// Each refill reads at most one page, and each pass loads at most one
-/// batch. So the work of a pass does not grow with the backlog.
+/// Each refill reads at most one page of index entries, and each pass loads
+/// at most one batch. So the work of a pass does not grow with the backlog.
 ///
 /// A failed pass still moves the lane. So one bad row cannot block the rows
 /// behind it. Rows that the failed pass did not reach wait for the next
@@ -654,14 +671,14 @@ pub struct TimeoutScanCursor {
 
 #[derive(diesel::QueryableByName)]
 struct SweepStart {
-    #[diesel(sql_type = diesel::sql_types::Uuid)]
-    id: uuid::Uuid,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
     as_of: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(diesel::QueryableByName)]
 struct Refill {
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
+    last_key: Option<chrono::DateTime<chrono::Utc>>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
     last_id: Option<uuid::Uuid>,
     #[diesel(sql_type = diesel::sql_types::BigInt)]
@@ -696,23 +713,21 @@ pub async fn find_timed_out_tasks_batch(
     for (index, (lane, (reason, predicate))) in cursor.lanes.iter_mut().zip(scans).enumerate() {
         let higher = &predicates[..index];
         if lane.queued.is_empty() && lane.after.is_none() {
-            // A new sweep: fix its mark and its clock.
+            // A new sweep: fix its clock.
             let start: Vec<SweepStart> = diesel::sql_query(TIMEOUT_SWEEP_START_SQL)
                 .load(conn)
                 .await
                 .map_err(crate::error::database_error)?;
-            let start = start.into_iter().next();
-            lane.until = start.as_ref().map(|r| r.id);
-            lane.as_of = start.map(|r| r.as_of);
+            lane.as_of = start.into_iter().next().map(|r| r.as_of);
         }
         if lane.queued.is_empty()
-            && let (Some(until), Some(as_of)) = (lane.until, lane.as_of)
+            && let Some(as_of) = lane.as_of
         {
             let refill: Vec<Refill> = match lane.after {
-                Some(after) => {
+                Some((after_key, after_id)) => {
                     diesel::sql_query(timeout_refill_query(predicate, higher, true))
-                        .bind::<diesel::sql_types::Uuid, _>(after)
-                        .bind::<diesel::sql_types::Uuid, _>(until)
+                        .bind::<diesel::sql_types::Timestamptz, _>(after_key)
+                        .bind::<diesel::sql_types::Uuid, _>(after_id)
                         .bind::<diesel::sql_types::BigInt, _>(page_rows)
                         .bind::<diesel::sql_types::Timestamptz, _>(as_of)
                         .load(conn)
@@ -720,7 +735,6 @@ pub async fn find_timed_out_tasks_batch(
                 }
                 None => {
                     diesel::sql_query(timeout_refill_query(predicate, higher, false))
-                        .bind::<diesel::sql_types::Uuid, _>(until)
                         .bind::<diesel::sql_types::BigInt, _>(page_rows)
                         .bind::<diesel::sql_types::Timestamptz, _>(as_of)
                         .load(conn)
@@ -733,7 +747,10 @@ pub async fn find_timed_out_tasks_batch(
             lane.after = refill
                 .as_ref()
                 .filter(|r| r.rows_read >= page_rows)
-                .and_then(|r| r.last_id);
+                .and_then(|r| r.last_key.zip(r.last_id));
+            if lane.after.is_none() {
+                lane.as_of = None;
+            }
             lane.queued
                 .extend(refill.into_iter().flat_map(|r| r.expired));
         }
@@ -6318,29 +6335,59 @@ mod tests {
     #[test]
     fn refill_query_reads_one_bounded_page_of_live_rows() {
         let predicate = start_to_close_timeout_query();
-        // The first page of a sweep is bounded only by the mark.
+        // The first page of a sweep is bounded only by the clock.
         let first = timeout_refill_query(predicate, &[], false);
-        assert!(first.starts_with(
-            "WITH page AS MATERIALIZED (SELECT id FROM harvest_task_queue \
-             WHERE state IN ('PENDING', 'RUNNING') AND id <= $1 \
-             AND (created_at IS NULL OR created_at <= $3) \
-             ORDER BY id LIMIT $2)"
-        ));
-        assert!(!first.contains("$4"));
-        // A later page starts after the last one.
-        let next = timeout_refill_query(predicate, &[], true);
-        assert!(next.contains(
-            "AND id > $1 AND id <= $2 AND (created_at IS NULL OR created_at <= $4) \
-             ORDER BY id LIMIT $3)"
-        ));
-        // `OFFSET 0` keeps the page bound inside the predicate's scan.
-        let clocked = predicate.replace("NOW()", "$4");
-        assert!(next.contains(&format!(
-            "ARRAY(SELECT q.id FROM ({clocked} AND id = ANY(ARRAY(SELECT id FROM page)) \
-             OFFSET 0) q"
+        assert!(first.starts_with(&format!(
+            "WITH page AS MATERIALIZED (SELECT harvest_task_queue.*, {LIVE_ROW_KEY} AS row_key \
+             FROM harvest_task_queue WHERE state IN ('PENDING', 'RUNNING') \
+             AND {LIVE_ROW_KEY} <= $2 ORDER BY {LIVE_ROW_KEY}, id LIMIT $1)"
         )));
+        assert!(!first.contains("$3"));
+        // A later page starts after the last row of the previous one. Both
+        // bounds are on the index key, so the index scan applies them.
+        let next = timeout_refill_query(predicate, &[], true);
+        assert!(next.contains(&format!(
+            "AND {LIVE_ROW_KEY} <= $4 AND ({LIVE_ROW_KEY}, id) > ($1, $2) \
+             ORDER BY {LIVE_ROW_KEY}, id LIMIT $3)"
+        )));
+        // The predicate reads the page, not the table.
+        let on_page = on_refill_page(predicate).replace("NOW()", "$4");
+        assert!(next.contains(&format!(
+            "ARRAY(SELECT e.id FROM (SELECT q.id, q.row_key FROM ({on_page}) q) e"
+        )));
+        // The queue keeps the page's order, oldest first.
+        assert!(next.contains("ORDER BY e.row_key, e.id) AS expired"));
+        assert!(next.contains("AS last_key"));
         assert!(next.contains("AS last_id"));
         assert!(next.contains("(SELECT COUNT(*) FROM page) AS rows_read"));
+    }
+
+    #[test]
+    fn every_predicate_reads_the_task_queue_once_at_its_top_level() {
+        for (reason, predicate) in task_timeout_scans() {
+            assert_eq!(
+                predicate.matches("harvest_task_queue").count(),
+                1,
+                "{reason:?} must read the task queue once, or the page rewrite misses a read"
+            );
+            let on_page = on_refill_page(predicate);
+            assert!(
+                on_page.contains("FROM page") && !on_page.contains("harvest_task_queue"),
+                "{reason:?} must read the page after the rewrite: {on_page}"
+            );
+        }
+    }
+
+    #[test]
+    fn live_row_key_matches_the_index_expression() {
+        // Read at run time: the migration hygiene guard bans `include_str!`
+        // of a migration outside the paved-path helper.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("migrations")
+            .join("20261002110913_harvest_task_queue_live_created_index")
+            .join("up.sql");
+        let migration = std::fs::read_to_string(path).expect("read the index migration");
+        assert!(migration.contains(&format!("(({LIVE_ROW_KEY}), id)")));
     }
 
     #[test]
@@ -6359,23 +6406,16 @@ mod tests {
     }
 
     #[test]
-    fn sweep_start_takes_the_top_live_id_and_the_clock() {
-        assert_eq!(
-            TIMEOUT_SWEEP_START_SQL,
-            "SELECT id, NOW() AS as_of FROM harvest_task_queue \
-             WHERE state IN ('PENDING', 'RUNNING') ORDER BY id DESC LIMIT 1"
-        );
+    fn sweep_start_takes_the_database_clock() {
+        assert_eq!(TIMEOUT_SWEEP_START_SQL, "SELECT NOW() AS as_of");
     }
 
     #[test]
     fn refill_query_leaves_a_row_to_the_first_reason_it_matches() {
         let higher = heartbeat_timeout_query();
         let sql = timeout_refill_query(start_to_close_timeout_query(), &[higher], true);
-        let higher = higher.replace("NOW()", "$4");
-        assert!(sql.contains(&format!(
-            "AND NOT EXISTS (SELECT 1 FROM ({higher} AND id = ANY(ARRAY(SELECT id FROM page))) h \
-             WHERE h.id = q.id)"
-        )));
+        let higher = on_refill_page(higher).replace("NOW()", "$4");
+        assert!(sql.contains(&format!(" EXCEPT SELECT h.id, h.row_key FROM ({higher}) h")));
     }
 
     #[test]
