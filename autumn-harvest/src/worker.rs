@@ -14689,7 +14689,7 @@ fn admit_retry_budget(
 
     let is_retry = task_attempt(task) > 1;
     // The budget registry publishes the `available` gauge itself, under its
-    // lock. The worker publishes only the deferral counter.
+    // lock. The worker counts a deferral only once the deferral persists.
     match registry
         .retry_budgets()
         .admit(activity_name, is_retry, std::time::Instant::now())
@@ -14700,13 +14700,7 @@ fn admit_retry_budget(
             retry_after,
             reservation,
             ..
-        } => {
-            registry
-                .telemetry()
-                .metrics
-                .record_retry_budget_exhausted(activity_name);
-            RetryBudgetGate::Defer(retry_after, reservation)
-        }
+        } => RetryBudgetGate::Defer(retry_after, reservation),
     }
 }
 
@@ -15259,10 +15253,15 @@ async fn process_activity_task(
                     }
                     Err(error) => Err(crate::error::database_error(error)),
                 };
-                // No row waits on a slot that the write did not persist.
-                if !matches!(deferred, Ok(true))
-                    && let Some(reservation) = reservation
-                {
+                if matches!(deferred, Ok(true)) {
+                    // Count only a deferral that persisted, so the counter
+                    // does not grow during DB errors or lease races.
+                    registry
+                        .telemetry()
+                        .metrics
+                        .record_retry_budget_exhausted(activity_name);
+                } else if let Some(reservation) = reservation {
+                    // No row waits on a slot that the write did not persist.
                     registry.retry_budgets().cancel_deferral(
                         activity_name,
                         reservation,
