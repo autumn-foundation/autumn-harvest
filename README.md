@@ -644,6 +644,7 @@ helpers directly.
 
 ```rust
 use autumn_harvest::prelude::*;
+use std::time::Duration;
 
 #[activity(retry = RetryPolicy::exponential(5, Duration::from_secs(1)))]
 async fn charge_card(ctx: &ActivityContext, amount: u32) -> Result<(), ActivityFailure> {
@@ -946,12 +947,15 @@ let sched = WorkflowSchedule::new(
 .with_input(serde_json::json!({"region": "us-east"}))
 .with_max_active_runs(1);
 
-// Wire it into the builder alongside your workflow registration.
-let app = autumn_web::app()
+// Wire it into `HarvestBuilder` alongside your workflow registration.
+let harvest = HarvestBuilder::new()
     .workflows(workflows![daily_billing_report])
     .workflow_schedule(sched)
     .worker(WorkerConfig::default());
 ```
+
+`HarvestPlugin` has no `workflow_schedule` method. An app that mounts the
+plugin creates schedules at runtime with the CLI or HTTP API below.
 
 The scheduler tick derives a deterministic `workflow_id` of
 `sched:{name}:{unix_ts}` so retries after a crashed tick are idempotent.
