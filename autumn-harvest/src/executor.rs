@@ -3164,4 +3164,199 @@ mod tests {
             "a suspended workflow must not emit or carry harvest.signal.unhandled"
         );
     }
+
+    // ── Issue #1797: deterministic suspension readiness ─────────────────
+
+    /// Waits `delay_ms` on a foreign tokio timer, then schedules one activity.
+    /// The timer is not a Harvest future, so the executor must wait for it.
+    fn foreign_delay_then_activity_workflow<'a>(
+        ctx: &'a WorkflowContext,
+        input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let delay_ms = input["delay_ms"].as_u64().unwrap_or(0);
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            ctx.execute_activity_raw("send_email", input, "default")
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    /// Yields to the runtime many times, then schedules one activity.
+    /// This is the hot-swap trampoline shape that C9 warns about.
+    fn yielding_then_activity_workflow<'a>(
+        ctx: &'a WorkflowContext,
+        input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            for _ in 0..1_000 {
+                tokio::task::yield_now().await;
+            }
+            ctx.execute_activity_raw("send_email", input, "default")
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    /// Parks on a condition that never becomes true. No command is pushed.
+    fn false_condition_workflow<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            ctx.await_condition(|| false)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(Value::Null)
+        })
+    }
+
+    /// Parks on a new durable timer.
+    fn timer_workflow<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            ctx.timer("wait", 5).await.map_err(|e| e.to_string())?;
+            Ok(Value::Null)
+        })
+    }
+
+    /// Parks on a new durable mutex acquire.
+    fn mutex_workflow<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let _guard = ctx.mutex("k").acquire().await.map_err(|e| e.to_string())?;
+            Ok(Value::Null)
+        })
+    }
+
+    /// Returns `true` when `outcome` is a one-command `send_email` suspension.
+    fn is_send_email_suspension(outcome: &WorkflowOutcome) -> bool {
+        matches!(
+            outcome,
+            WorkflowOutcome::Suspended { commands }
+                if commands.len() == 1
+                    && matches!(
+                        &commands[0],
+                        WorkflowCommand::ScheduleActivity { name, .. } if name == "send_email"
+                    )
+        )
+    }
+
+    /// AC RED 1: the outcome must not depend on how long a step takes.
+    /// A 150 ms step used to lose the race with the 100 ms suspension
+    /// timer and suspend with zero commands. A 50 ms step did not.
+    #[tokio::test(start_paused = true)]
+    async fn suspension_outcome_does_not_depend_on_step_duration() {
+        for delay_ms in [50_u64, 150, 1_500] {
+            let outcome = run_workflow(
+                ExecutionId::new(),
+                vec![started()],
+                foreign_delay_then_activity_workflow,
+                serde_json::json!({ "delay_ms": delay_ms }),
+            )
+            .await;
+            assert!(
+                is_send_email_suspension(&outcome),
+                "a {delay_ms} ms step must still suspend on send_email, got {outcome:?}"
+            );
+        }
+    }
+
+    /// AC RED 2: a foreign await that outlives the deadlock timeout fails
+    /// the workflow task, which the worker retries. It must not end the run,
+    /// and it must not suspend with a partial command set.
+    #[tokio::test(start_paused = true)]
+    async fn foreign_await_past_the_deadlock_timeout_fails_the_task_not_the_run() {
+        let outcome = run_workflow(
+            ExecutionId::new(),
+            vec![started()],
+            foreign_delay_then_activity_workflow,
+            serde_json::json!({ "delay_ms": 3_000 }),
+        )
+        .await;
+        assert!(
+            !matches!(
+                outcome,
+                WorkflowOutcome::Completed { .. }
+                    | WorkflowOutcome::Failed { .. }
+                    | WorkflowOutcome::Suspended { .. }
+                    | WorkflowOutcome::ContinuedAsNew { .. }
+            ),
+            "a deadlocked cycle must fail the task, got {outcome:?}"
+        );
+    }
+
+    /// Every Harvest park kind suspends at once. The paused clock must not
+    /// move, because the executor no longer waits on a timer to decide.
+    #[tokio::test(start_paused = true)]
+    async fn harvest_parks_suspend_without_waiting_on_the_clock() {
+        let cases: [(&str, WorkflowHandlerFn); 6] = [
+            ("activity", activity_workflow),
+            ("timer", timer_workflow),
+            ("signal", signal_wait_workflow),
+            ("mutex", mutex_workflow),
+            ("condition", false_condition_workflow),
+            ("continue_as_new", continue_as_new_workflow),
+        ];
+        for (name, handler) in cases {
+            let started_at = tokio::time::Instant::now();
+            let outcome = run_workflow(ExecutionId::new(), vec![started()], handler, Value::Null).await;
+            assert_eq!(
+                started_at.elapsed(),
+                Duration::ZERO,
+                "{name}: the executor waited on the clock before it suspended"
+            );
+            assert!(
+                matches!(
+                    outcome,
+                    WorkflowOutcome::Suspended { .. } | WorkflowOutcome::ContinuedAsNew { .. }
+                ),
+                "{name}: expected a suspension, got {outcome:?}"
+            );
+        }
+    }
+
+    /// AC benchmark: one single-step suspension decides in under 100 ms of
+    /// real time. The old floor was the 100 ms suspension timer itself.
+    /// The median of several runs keeps one slow run from failing the test.
+    #[tokio::test]
+    async fn single_step_suspension_decides_in_under_100_ms() {
+        let mut samples = Vec::new();
+        for _ in 0..9 {
+            let started_at = std::time::Instant::now();
+            let outcome = run_workflow(
+                ExecutionId::new(),
+                vec![started()],
+                activity_workflow,
+                Value::Null,
+            )
+            .await;
+            samples.push(started_at.elapsed());
+            assert!(is_send_email_suspension(&outcome), "got {outcome:?}");
+        }
+        samples.sort();
+        let median = samples[samples.len() / 2];
+        assert!(
+            median < Duration::from_millis(100),
+            "median single-step decision latency is {median:?}"
+        );
+    }
+
+    /// A yield between steps is not a suspension (hot-swap C9). The cycle
+    /// must run past the yields and suspend on the activity command.
+    #[tokio::test]
+    async fn yields_before_a_park_do_not_suspend_early() {
+        let outcome = run_workflow(
+            ExecutionId::new(),
+            vec![started()],
+            yielding_then_activity_workflow,
+            Value::Null,
+        )
+        .await;
+        assert!(is_send_email_suspension(&outcome), "got {outcome:?}");
+    }
 }
