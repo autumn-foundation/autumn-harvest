@@ -29,6 +29,10 @@
 -- Then run this migration. The guard below accepts an index that already
 -- exists with the expected definition and is valid.
 --
+-- `pg_get_indexdef` prints the epoch constant in the session time zone. The
+-- guard sets the time zone to UTC for this transaction only, so the check
+-- does not depend on the session that runs the migration.
+--
 -- The guard rejects two states. A same-named index with a different
 -- definition means this migration never installed the intended index, and
 -- down.sql would drop an unrelated one. A matching but INVALID index means an
@@ -40,6 +44,8 @@ DECLARE
     existing_def text;
     existing_valid boolean;
 BEGIN
+    PERFORM set_config('TimeZone', 'UTC', true);
+
     SELECT pg_class.oid, pg_get_indexdef(pg_class.oid), pg_index.indisvalid
       INTO existing_index_oid, existing_def, existing_valid
     FROM pg_class
