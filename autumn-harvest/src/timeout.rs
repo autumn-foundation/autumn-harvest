@@ -5412,7 +5412,12 @@ pub fn spawn_timeout_checker_for_shard(
 /// task-timeout rows that one pass reads per reason. See
 /// [`crate::scanner_lease`].
 ///
-/// The lease key is `shard`, or shard 0 when `shard` is `None`.
+/// `pool_shard` names the shard whose own pool `pool` is, when the caller
+/// knows it. The pass then reuses its held connection for that shard. Without
+/// it, a pass that also scans that shard through `sharded_pool` checks out a
+/// second connection, and a pool of one connection waits forever.
+///
+/// The lease key is `pool_shard`, then `shard`, then shard 0.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_coordinated_timeout_checker_for_shard(
@@ -5427,6 +5432,7 @@ pub fn spawn_coordinated_timeout_checker_for_shard(
     max_workflow_history_events: Option<u64>,
     session_worker_stale_secs: i64,
     shard: Option<crate::types::ShardId>,
+    pool_shard: Option<crate::types::ShardId>,
     payload_codecs: crate::payload_codec::PayloadCodecs,
     codec_rotation_batch_size: i64,
     coordination: crate::scanner_lease::ScannerCoordination,
@@ -5444,7 +5450,7 @@ pub fn spawn_coordinated_timeout_checker_for_shard(
         max_workflow_history_events,
         session_worker_stale_secs,
         shard,
-        None,
+        pool_shard,
         payload_codecs,
         codec_rotation_batch_size,
         coordination,

@@ -51,7 +51,9 @@ size, so adding workers to clear a backlog added database load in proportion.
   passes by role" panel.
 - **Public API.** `timeout::spawn_coordinated_timeout_checker_for_shard`,
   `timeout::find_timed_out_tasks_batch`, `timeout::TimeoutScanCursor`, and the
-  `scanner_lease` module. The older spawn helpers keep running unelected with
+  `scanner_lease` module. The coordinated helper takes a `pool_shard`: pass
+  the shard whose own pool you give it, so a pass reuses its connection for
+  that shard and a one-connection pool cannot wedge. The older spawn helpers keep running unelected with
   a fixed cadence. They now use the bounded scan.
 - **Preflight.** `harvest_scanner_leases` joins the write-privilege probe.
 - **Scope.** Only the timeout checker uses the lease. The other per-shard

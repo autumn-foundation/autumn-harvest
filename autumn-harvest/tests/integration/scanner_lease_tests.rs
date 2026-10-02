@@ -196,6 +196,7 @@ fn spawn_checker(pool: &DbPool, spec: Spec<'_>) -> Checker {
         None,
         60,
         Some(spec.shard),
+        None,
         spec.codecs,
         0,
         ScannerCoordination {
@@ -211,6 +212,63 @@ fn spawn_checker(pool: &DbPool, spec: Spec<'_>) -> Checker {
         cancel,
         handle,
     }
+}
+
+/// The coordinated checker reuses its own connection for its own shard. A
+/// sharded embedder can give it a pool of one connection. A pass that asked
+/// the pool for a second connection to the same shard would wait forever.
+#[tokio::test]
+async fn a_coordinated_checker_reuses_its_connection_for_its_own_shard() {
+    let (url, _container) = setup_test_db_url().await;
+    let shard = ShardId::new(17_958);
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.as_str());
+    let pool = DbPool::builder(manager)
+        .max_size(1)
+        .build()
+        .expect("failed to build pool");
+    // Open the one connection now. A 50 ms tick may be too short to open it.
+    drop(pool.get().await.expect("connection"));
+    let sharded = autumn_harvest::shard::ShardedDbPool::from_map(
+        BTreeMap::from([(shard, pool.clone())]),
+        shard,
+    );
+    let metrics = Arc::new(PassRecorder::default());
+    let telemetry = Arc::new(autumn_harvest::telemetry::TelemetryConfig {
+        metrics: metrics.clone(),
+        ..Default::default()
+    });
+    let cancel = CancellationToken::new();
+    let handle = timeout::spawn_coordinated_timeout_checker_for_shard(
+        pool,
+        cancel.clone(),
+        Duration::from_millis(50),
+        telemetry,
+        Duration::from_secs(5),
+        Some(sharded),
+        vec![shard],
+        Arc::new(autumn_harvest::circuit_breaker::CircuitBreakerRegistry::default()),
+        None,
+        60,
+        Some(shard),
+        Some(shard),
+        PayloadCodecs::default(),
+        0,
+        ScannerCoordination {
+            holder: Some("one-connection".to_owned()),
+            lease_ttl: Duration::from_secs(10),
+            jitter: JITTER,
+        },
+        timeout::DEFAULT_TIMEOUT_SCAN_BATCH_SIZE,
+    );
+
+    wait_for(
+        "three passes on a one-connection pool",
+        Duration::from_secs(10),
+        || metrics.ran() >= 3,
+    )
+    .await;
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
 }
 
 async fn stop_all(checkers: Vec<Checker>) {
