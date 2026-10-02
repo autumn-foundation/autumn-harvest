@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use autumn_harvest::heartbeat::{FlushOutcome, HeartbeatSink, run_heartbeat_flusher};
+use autumn_harvest::heartbeat::{FlushOutcome, FlusherExit, HeartbeatSink, run_heartbeat_flusher};
 use autumn_harvest::slot_tuner::TunedSlotRuntime;
 use serde_json::{Value, json};
 use shuttle::future::{block_on, yield_now};
@@ -40,9 +40,9 @@ use shuttle_tokio::sync::{Semaphore, mpsc};
 use shuttle_tokio_util::sync::CancellationToken;
 
 /// Iterations per random-scheduler model.
-const RANDOM_ITERATIONS: usize = 2_000;
+const RANDOM_ITERATIONS: usize = 10_000;
 /// Iterations per PCT model.
-const PCT_ITERATIONS: usize = 2_000;
+const PCT_ITERATIONS: usize = 10_000;
 /// PCT bug depth. Depth 3 finds bugs that need two forced preemptions.
 const PCT_DEPTH: usize = 3;
 
@@ -123,8 +123,14 @@ fn slot_tuner_model() {
             runtime.resize_toward(target).await;
             yield_now().await;
         }
-        assert_eq!(semaphore.available_permits(), target);
         assert_eq!(runtime.withheld_permits(), MAX_SLOTS - target);
+
+        // An aborted shrink task frees its acquire on its next poll, as in
+        // tokio. The free count must then reach the target with no further
+        // tuner call. Shuttle fails the run if this loop never ends.
+        while semaphore.available_permits() != target {
+            yield_now().await;
+        }
 
         runtime.release_all_withheld();
         let all = Arc::clone(&semaphore)
@@ -197,38 +203,39 @@ fn heartbeat_order_model() {
             flushed: Arc::clone(&flushed),
             lose_lease_on: None,
         };
-        let flusher = shuttle_tokio::spawn(run_heartbeat_flusher(
+        let flusher_task = shuttle_tokio::spawn(run_heartbeat_flusher(
             rx,
             cancel.clone(),
             Duration::from_secs(1),
             sink,
         ));
 
-        let sender = shuttle_tokio::spawn(async move {
+        let sender_task = shuttle_tokio::spawn(async move {
             for i in 0..HEARTBEATS {
                 tx.send(json!({ "progress": i }))
                     .await
                     .expect("the flusher is still running");
             }
         });
-        sender.await.expect("the sender panicked");
+        sender_task.await.expect("the sender panicked");
 
         // Shuttle fails the run if this loop never ends.
-        while flushed
-            .lock()
-            .expect("not poisoned")
-            .last()
-            .map(progress)
-            != Some(HEARTBEATS - 1)
-        {
+        while flushed.lock().expect("not poisoned").last().map(progress) != Some(HEARTBEATS - 1) {
             yield_now().await;
         }
 
         cancel.cancel();
-        flusher.await.expect("the flusher panicked");
+        assert_eq!(
+            flusher_task.await.expect("the flusher panicked"),
+            FlusherExit::Cancelled
+        );
 
-        let flushed = flushed.lock().expect("not poisoned");
-        let order: Vec<u64> = flushed.iter().map(progress).collect();
+        let order: Vec<u64> = flushed
+            .lock()
+            .expect("not poisoned")
+            .iter()
+            .map(progress)
+            .collect();
         assert!(
             order.windows(2).all(|pair| pair[0] < pair[1]),
             "flushes must keep send order: {order:?}"
@@ -247,14 +254,14 @@ fn heartbeat_lease_lost_model() {
             flushed: Arc::clone(&flushed),
             lose_lease_on: Some(1),
         };
-        let flusher = shuttle_tokio::spawn(run_heartbeat_flusher(
+        let flusher_task = shuttle_tokio::spawn(run_heartbeat_flusher(
             rx,
             cancel.clone(),
             Duration::from_secs(1),
             sink,
         ));
 
-        let sender = shuttle_tokio::spawn(async move {
+        let sender_task = shuttle_tokio::spawn(async move {
             for i in 0..HEARTBEATS {
                 // The flusher drops the receiver when it stops.
                 if tx.send(json!({ "progress": i })).await.is_err() {
@@ -263,8 +270,11 @@ fn heartbeat_lease_lost_model() {
             }
         });
 
-        flusher.await.expect("the flusher panicked");
-        sender.await.expect("the sender panicked");
+        assert_eq!(
+            flusher_task.await.expect("the flusher panicked"),
+            FlusherExit::LeaseLost
+        );
+        sender_task.await.expect("the sender panicked");
 
         assert!(
             cancel.is_cancelled(),

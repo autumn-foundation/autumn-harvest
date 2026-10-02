@@ -317,6 +317,10 @@ pub mod guardrail;
 pub mod handle;
 #[cfg(feature = "db")]
 pub mod handle_typed;
+/// Activity heartbeat flusher. The flush loop has no DB dependency; the
+/// Postgres sink needs the `db` feature (issue #1800).
+#[doc(hidden)]
+pub mod heartbeat;
 pub mod history_export;
 /// Hot code swap for workflow definitions via runtime modules (issue #967).
 ///
@@ -409,6 +413,11 @@ pub mod shard;
 /// Shard rebalancing: migrating quiescent workflow executions across shards
 /// (issue #964).
 pub mod shard_rebalance;
+/// `cfg(shuttle)` async-primitive shim (tokio under normal builds).
+///
+/// Only the modules that opt into Shuttle model checking use it. See
+/// `docs/testing/shuttle.md`. Internal, not part of the public API.
+mod shuttle_sync;
 /// Signal handler registry for push-based reactive signal handling (issue #546).
 pub mod signal_handler;
 pub mod simulator;
@@ -452,9 +461,6 @@ pub mod webhook_trigger;
 #[cfg(feature = "db")]
 #[doc(hidden)]
 pub mod dlq;
-#[cfg(feature = "db")]
-#[doc(hidden)]
-pub mod heartbeat;
 #[cfg(feature = "db")]
 #[doc(hidden)]
 pub mod models;

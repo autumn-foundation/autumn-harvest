@@ -42,8 +42,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
+
+// Shuttle swaps these types under `cfg(shuttle)` (issue #1800). See
+// `crate::shuttle_sync`.
+use crate::shuttle_sync::{JoinHandle, OwnedSemaphorePermit, Semaphore};
 
 use crate::telemetry::{SlotType, TelemetryConfig, TunerDecision};
 
@@ -426,9 +429,9 @@ pub struct TunedSlotRuntime {
     /// succeed while the queue stays non-empty. Joining the same fair
     /// queue instead guarantees eventual forward progress: once queued,
     /// nothing can "cut in front" of this request. At most one such task
-    /// is ever in flight per runtime; `resize_toward` reaps it (once
-    /// finished) at the top of every subsequent call.
-    pending_shrink: Option<tokio::task::JoinHandle<Option<OwnedSemaphorePermit>>>,
+    /// is ever in flight per runtime. `resize_toward` settles it through
+    /// `settle_pending_shrink` before and after its own adjustment.
+    pending_shrink: Option<JoinHandle<Option<OwnedSemaphorePermit>>>,
 }
 
 impl TunedSlotRuntime {
@@ -490,6 +493,19 @@ impl TunedSlotRuntime {
         self.live_target.load(Ordering::Relaxed)
     }
 
+    /// Number of permits withheld from dispatch.
+    ///
+    /// `withheld_permits() + live_target() == max_slots` holds between calls.
+    /// A permit that a background shrink holds still counts in the live
+    /// target. The Shuttle model checks this law (issue #1800).
+    #[must_use]
+    pub fn withheld_permits(&self) -> usize {
+        self.withheld
+            .iter()
+            .map(OwnedSemaphorePermit::num_permits)
+            .sum()
+    }
+
     /// The most recently requested target (issue #548 review), regardless of
     /// how much of it has actually been achieved. Callers computing the next
     /// tick's target should build on this value rather than [`Self::live_target`]
@@ -498,6 +514,49 @@ impl TunedSlotRuntime {
     #[must_use]
     pub const fn desired_target(&self) -> usize {
         self.desired_target
+    }
+
+    /// Reap, cancel or keep the background shrink-acquire for `desired`.
+    ///
+    /// A finished task's permit is withheld while the live target is still
+    /// above `desired`; otherwise it goes back to the semaphore. A task that
+    /// is still queued is cancelled once the live target is at or below
+    /// `desired`, and kept otherwise.
+    async fn settle_pending_shrink(&mut self, desired: usize) {
+        let Some(handle) = self.pending_shrink.take() else {
+            return;
+        };
+        if handle.is_finished() {
+            // Never actually suspends: `is_finished()` already
+            // confirmed the task has completed.
+            // Else (condition false) a later Grow reversed the earlier
+            // shrink intent (issue #548 review, round 2): `permit` just
+            // drops here, releasing it straight back to the semaphore
+            // rather than withholding it.
+            if let Ok(Some(permit)) = handle.await
+                && self.live_target() > desired
+            {
+                self.withheld.push(permit);
+                self.live_target.fetch_sub(1, Ordering::Relaxed);
+            }
+            // `Ok(None)` (semaphore closed) or `Err` (task panicked):
+            // nothing to reap.
+        } else if desired >= self.live_target() {
+            // No longer trying to shrink below what's already achieved
+            // (issue #548 review, round 4) — cancel the outstanding
+            // request instead of leaving it queued. Left in place, it
+            // could otherwise win a permit this same tick's own Grow
+            // is about to release below, silently taking one away from
+            // dispatch instead of letting it become genuinely
+            // available. `JoinHandle::abort` on a task still blocked
+            // in `.acquire()` cleanly removes it from the semaphore's
+            // wait list — no permit is lost, since one is only ever
+            // assigned once the acquire actually resolves.
+            handle.abort();
+        } else {
+            // Still legitimately in flight toward a shrink we still want.
+            self.pending_shrink = Some(handle);
+        }
     }
 
     /// Move the live target toward `desired` (already band-clamped by the
@@ -519,44 +578,13 @@ impl TunedSlotRuntime {
 
         // Reap a finished background shrink-acquire before this tick's own
         // adjustment, so its effect on live_target is visible below.
-        if let Some(handle) = self.pending_shrink.take() {
-            if handle.is_finished() {
-                // Never actually suspends: `is_finished()` already
-                // confirmed the task has completed.
-                // Else (condition false) a later Grow reversed the earlier
-                // shrink intent (issue #548 review, round 2): `permit` just
-                // drops here, releasing it straight back to the semaphore
-                // rather than withholding it.
-                if let Ok(Some(permit)) = handle.await
-                    && self.live_target() > desired
-                {
-                    self.withheld.push(permit);
-                    self.live_target.fetch_sub(1, Ordering::Relaxed);
-                }
-                // `Ok(None)` (semaphore closed) or `Err` (task panicked):
-                // nothing to reap.
-            } else if desired >= self.live_target() {
-                // No longer trying to shrink below what's already achieved
-                // (issue #548 review, round 4) — cancel the outstanding
-                // request instead of leaving it queued. Left in place, it
-                // could otherwise win a permit this same tick's own Grow
-                // is about to release below, silently taking one away from
-                // dispatch instead of letting it become genuinely
-                // available. `JoinHandle::abort` on a task still blocked
-                // in `.acquire()` cleanly removes it from the semaphore's
-                // wait list — no permit is lost, since one is only ever
-                // assigned once the acquire actually resolves.
-                handle.abort();
-            } else {
-                // Still legitimately in flight toward a shrink we still want.
-                self.pending_shrink = Some(handle);
-            }
-        }
+        self.settle_pending_shrink(desired).await;
 
         let current = self.live_target();
 
         if desired > current {
             let mut remaining = desired - current;
+            let mut to_release = Vec::new();
             while remaining > 0 {
                 let Some(mut permit) = self.withheld.pop() else {
                     break;
@@ -564,9 +592,9 @@ impl TunedSlotRuntime {
                 let held = permit.num_permits();
                 if held <= remaining {
                     remaining -= held;
-                    drop(permit);
+                    to_release.push(permit);
                 } else if let Some(release) = permit.split(remaining) {
-                    drop(release);
+                    to_release.push(release);
                     self.withheld.push(permit);
                     remaining = 0;
                 } else {
@@ -578,7 +606,12 @@ impl TunedSlotRuntime {
                 }
             }
             let released = (desired - current) - remaining;
+            // Raise the live target before the permits become free (issue
+            // #1800). Otherwise a dispatch task that takes a released permit
+            // runs above the live target that readers see. The semaphore
+            // release orders this store before that acquire.
             self.live_target.fetch_add(released, Ordering::Relaxed);
+            drop(to_release);
         } else if desired < current {
             while self.live_target.load(Ordering::Relaxed) > desired {
                 match Arc::clone(&self.semaphore).try_acquire_owned() {
@@ -598,6 +631,12 @@ impl TunedSlotRuntime {
             }
         }
 
+        // The loop above can reach `desired` while an older background
+        // acquire still waits in the queue (issue #1800). Cancel it now.
+        // Otherwise it takes a free permit and keeps it from dispatch until
+        // the next call.
+        self.settle_pending_shrink(desired).await;
+
         // Still short of `desired` and no background acquire already in
         // flight: join the semaphore's real (fair, FIFO) wait queue for
         // one permit instead of only ever retrying `try_acquire` (issue
@@ -608,10 +647,9 @@ impl TunedSlotRuntime {
         // sustained backlog instead of indefinite starvation.
         if self.live_target() > desired && self.pending_shrink.is_none() {
             let semaphore = Arc::clone(&self.semaphore);
-            self.pending_shrink =
-                Some(tokio::spawn(
-                    async move { semaphore.acquire_owned().await.ok() },
-                ));
+            self.pending_shrink = Some(crate::shuttle_sync::spawn(async move {
+                semaphore.acquire_owned().await.ok()
+            }));
         }
 
         self.live_target()
@@ -643,8 +681,10 @@ impl TunedSlotRuntime {
         if let Some(handle) = self.pending_shrink.take() {
             handle.abort();
         }
-        self.withheld.clear();
+        // Raise the live target first, for the same reason as the grow path
+        // in `resize_toward` (issue #1800).
         self.live_target.store(self.max_slots, Ordering::Relaxed);
+        self.withheld.clear();
         self.desired_target = self.max_slots;
     }
 }
@@ -1426,6 +1466,44 @@ mod tests {
             "shrink must eventually succeed via the fair FIFO queue"
         );
         assert_eq!(semaphore.available_permits(), 0);
+    }
+
+    #[tokio::test]
+    async fn resize_toward_cancels_a_stray_background_shrink_once_the_target_lands() {
+        // Regression test (issue #1800, found by the Shuttle model). The
+        // `try_acquire` loop can reach the target while an older background
+        // shrink still waits in the queue. That task must not keep a permit
+        // from dispatch.
+        let semaphore = Arc::new(Semaphore::new(3));
+        let mut runtime = TunedSlotRuntime::new(Arc::clone(&semaphore), 3, 1, 3);
+        let mut in_flight: Vec<_> = (0..3)
+            .map(|_| Arc::clone(&semaphore).try_acquire_owned().unwrap())
+            .collect();
+
+        // No permit is free, so the shrink queues a background acquire.
+        runtime.resize_toward(2).await;
+        assert_eq!(runtime.live_target(), 3);
+        tokio::task::yield_now().await;
+
+        // Two tasks finish. tokio gives the first permit to the queued
+        // background acquire, which has not run yet. The second is free.
+        in_flight.truncate(1);
+        assert_eq!(semaphore.available_permits(), 1);
+
+        // `try_acquire` takes the free permit and the target lands.
+        assert_eq!(runtime.resize_toward(2).await, 2);
+        assert_eq!(runtime.withheld_permits(), 1);
+
+        // The background acquire must give its permit back without another
+        // tuner call.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            semaphore.available_permits(),
+            1,
+            "live target 2 minus 1 in-flight task leaves 1 permit for dispatch"
+        );
     }
 
     #[tokio::test]
