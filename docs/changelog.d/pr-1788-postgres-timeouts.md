@@ -60,8 +60,9 @@ claim's `ActivityStarted` committed, the handler runs instead.
 retries its acquire. Its write is fenced on the claim, so a late quarantine
 cannot fail a run that a peer claimed in the meantime. A session acquire that
 fails on a transient error keeps its slot until a read of the session row
-settles it. When no read succeeds, a background task reads again. A new
-acquire of that session on the same worker defers until the read ends.
+settles it. When no read succeeds, a background task reads again, and
+worker shutdown stops it. A new acquire of that session on the same worker
+defers until the read ends.
 
 **Metrics.** `harvest.db.pool_acquire_timeout{site}` and
 `harvest.heartbeat.flush_failed{reason}`, with starter dashboard panels.

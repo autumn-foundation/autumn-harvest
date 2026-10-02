@@ -6368,7 +6368,8 @@ async fn register_static_rate_limit_buckets(
 
 /// Run `attempt` every `interval` until it returns `true` or `cancel` fires.
 ///
-/// The first run comes one `interval` after the call.
+/// The first run comes one `interval` after the call. A cancel also stops a
+/// run that is in progress.
 async fn retry_until_done<F, Fut>(interval: Duration, cancel: CancellationToken, mut attempt: F)
 where
     F: FnMut() -> Fut,
@@ -6380,7 +6381,12 @@ where
             () = cancel.cancelled() => return,
             () = tokio::time::sleep(interval) => {}
         }
-        if attempt().await {
+        let done = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            done = attempt() => done,
+        };
+        if done {
             return;
         }
     }
@@ -15261,6 +15267,8 @@ async fn handle_session_acquire(
     exec_id: ExecutionId,
     max_concurrent_sessions: i32,
     session_slots_in_use: &crate::sessions::SessionSlotRegistry,
+    // Stops a background slot re-check at worker shutdown (issue #1788).
+    shutdown: &CancellationToken,
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
     // Issue #1243: configured codecs, so this write encodes under the
     // same registry replay decodes with.
@@ -15434,6 +15442,7 @@ async fn handle_session_acquire(
                     session_id,
                     worker_id,
                     recheck,
+                    shutdown,
                 )
                 .await;
                 return Err(error);
@@ -15535,17 +15544,19 @@ async fn handle_session_release(
 ///   exceed `max_concurrent_sessions`. A background task reads again until
 ///   the database answers, then settles the slot. The reconciler only
 ///   handles rows that exist, so it cannot release a slot with no row.
+///   `shutdown` stops that task, so it does not outlive the worker.
 #[doc(hidden)]
 pub async fn settle_session_slot_after_transient_error(
     pool: &DbPool,
     registry: &crate::sessions::SessionSlotRegistry,
     session_id: crate::types::SessionId,
     worker_id: &str,
+    shutdown: &CancellationToken,
 ) {
     // Mark before the first read. Those reads can take ten pool bounds, and an
     // orphan reclaim can retry the task on this worker in that time.
     let recheck = RecheckedSessionSlot::mark(registry, session_id);
-    settle_session_slot_with_mark(pool, registry, session_id, worker_id, recheck).await;
+    settle_session_slot_with_mark(pool, registry, session_id, worker_id, recheck, shutdown).await;
 }
 
 /// [`settle_session_slot_after_transient_error`] with a mark that the caller
@@ -15556,6 +15567,7 @@ async fn settle_session_slot_with_mark(
     session_id: crate::types::SessionId,
     worker_id: &str,
     recheck: RecheckedSessionSlot,
+    shutdown: &CancellationToken,
 ) {
     if settle_session_slot_once(pool, registry, session_id, worker_id).await {
         return;
@@ -15567,8 +15579,13 @@ async fn settle_session_slot_with_mark(
     let pool = pool.clone();
     let registry = std::sync::Arc::clone(registry);
     let worker_id = worker_id.to_owned();
+    let shutdown = shutdown.clone();
     tokio::spawn(async move {
-        while !settle_session_slot_once(&pool, &registry, session_id, &worker_id).await {}
+        let spacing = crate::pool::retry_spacing(&pool);
+        retry_until_done(spacing, shutdown, || {
+            settle_session_slot_once(&pool, &registry, session_id, &worker_id)
+        })
+        .await;
         drop(recheck);
     });
 }
@@ -15804,6 +15821,7 @@ pub async fn handle_session_acquire_for_test(
         exec_id,
         max_concurrent_sessions,
         registry,
+        &CancellationToken::new(),
         &crate::telemetry::NoOpMetrics,
         &crate::payload_codec::PayloadCodecs::default(),
     )
@@ -15820,6 +15838,7 @@ async fn process_activity_task(
     dispatched_at: std::time::Instant,
     max_concurrent_sessions: i32,
     session_slots_in_use: &crate::sessions::SessionSlotRegistry,
+    shutdown: &CancellationToken,
 ) -> HarvestResult<()> {
     let Some(exec_uuid) = task.workflow_exec_id else {
         let mut conn = crate::pool::acquire_within_pool_bound(pool).await?;
@@ -15846,6 +15865,7 @@ async fn process_activity_task(
             exec_id,
             max_concurrent_sessions,
             session_slots_in_use,
+            shutdown,
             registry.telemetry().metrics.as_ref(),
             registry.payload_codecs(),
         )
@@ -23919,6 +23939,9 @@ async fn process_task(
     dispatched_at: std::time::Instant,
     max_concurrent_sessions: i32,
     session_slots_in_use: &crate::sessions::SessionSlotRegistry,
+    // The worker's shutdown token. It stops background slot re-checks
+    // (issue #1788).
+    shutdown: &CancellationToken,
     // Issue #782: contained-handler-panic strike map + retry budget, consulted
     // only on the workflow path.
     workflow_panic_strikes: Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u32>>>,
@@ -23999,6 +24022,7 @@ async fn process_task(
                 dispatched_at,
                 max_concurrent_sessions,
                 session_slots_in_use,
+                shutdown,
             )
             .await;
             // Acquire only if we actually need to act on a capability miss or
@@ -31726,6 +31750,7 @@ impl Worker {
             ClaimedTaskKind::Activity => self.activity_permit_wait_micros.clone(),
         };
         let session_slots_in_use = Arc::clone(&self.session_slots_in_use);
+        let shutdown = self.shutdown.clone();
         let max_concurrent_sessions = self.config.max_concurrent_sessions;
         let capacity_freed = Arc::clone(&self.capacity_freed);
         // The row waited in `PENDING` from eligibility to claim. Database
@@ -31901,6 +31926,7 @@ impl Worker {
                     dispatched_at,
                     max_concurrent_sessions,
                     &session_slots_in_use,
+                    &shutdown,
                     Arc::clone(&panic_strikes),
                     workflow_panic_max_attempts,
                     workflow_task_deadline,
@@ -32126,6 +32152,7 @@ impl Worker {
                     dispatched_at,
                     max_concurrent_sessions,
                     &session_slots_in_use,
+                    &shutdown,
                     panic_strikes,
                     workflow_panic_max_attempts,
                     // No enclosing workflow-task budget on this arm, so the
@@ -36067,6 +36094,23 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), retry)
             .await
             .expect("the retry stops at shutdown")
+            .expect("the retry task joins");
+    }
+
+    /// Shutdown also stops an attempt that is still running.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_stops_a_retry_mid_attempt() {
+        let cancel = CancellationToken::new();
+        let retry = tokio::spawn(retry_until_done(
+            Duration::from_secs(5),
+            cancel.clone(),
+            std::future::pending::<bool>,
+        ));
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(1), retry)
+            .await
+            .expect("the retry stops during its attempt")
             .expect("the retry task joins");
     }
 

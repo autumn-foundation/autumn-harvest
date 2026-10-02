@@ -2078,7 +2078,11 @@ async fn a_transient_session_acquire_keeps_the_slot_only_for_its_own_session() {
         assert!(try_acquire_session_slot(&registry, 4, session_id));
 
         autumn_harvest::worker::settle_session_slot_after_transient_error(
-            &pool, &registry, session_id, "w-1",
+            &pool,
+            &registry,
+            session_id,
+            "w-1",
+            &tokio_util::sync::CancellationToken::new(),
         )
         .await;
         assert_eq!(
@@ -2114,7 +2118,11 @@ async fn a_kept_session_slot_is_released_once_the_row_proves_absent() {
     let registry = new_session_slot_registry();
     assert!(try_acquire_session_slot(&registry, 4, session_id));
     autumn_harvest::worker::settle_session_slot_after_transient_error(
-        &pool, &registry, session_id, "w-1",
+        &pool,
+        &registry,
+        session_id,
+        "w-1",
+        &tokio_util::sync::CancellationToken::new(),
     )
     .await;
     assert_eq!(
@@ -2177,7 +2185,11 @@ async fn a_session_acquire_defers_while_its_slot_is_rechecked() {
     let registry = new_session_slot_registry();
     assert!(try_acquire_session_slot(&registry, 4, session_id));
     autumn_harvest::worker::settle_session_slot_after_transient_error(
-        &starved, &registry, session_id, "w-1",
+        &starved,
+        &registry,
+        session_id,
+        "w-1",
+        &tokio_util::sync::CancellationToken::new(),
     )
     .await;
 
@@ -2206,6 +2218,74 @@ async fn a_session_acquire_defers_while_its_slot_is_rechecked() {
             .expect("count session rows")
     };
     assert_eq!(rows, 0, "the acquire must not record the session yet");
+    drop(held);
+}
+
+/// Worker shutdown stops a slot re-check that gets no answer. The re-check
+/// then releases its mark, so an acquire of the session no longer defers.
+#[tokio::test]
+async fn shutdown_stops_a_slot_recheck_that_gets_no_answer() {
+    use autumn_harvest::sessions::{new_session_slot_registry, try_acquire_session_slot};
+    use autumn_harvest::types::SessionId;
+
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let (exec_id, _activity_id, task) = seed_claimed_activity(&mut conn, "q-sd").await;
+    let session_id = SessionId::new();
+    diesel::sql_query("UPDATE harvest_task_queue SET input = to_jsonb($2::text) WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(task.id)
+        .bind::<Text, _>(session_id.to_string())
+        .execute(&mut conn)
+        .await
+        .expect("make the input a session id");
+    let task = {
+        use autumn_harvest::models::TaskQueueItem;
+        use autumn_harvest::schema::harvest_task_queue;
+        use diesel::{QueryDsl, SelectableHelper};
+        harvest_task_queue::table
+            .find(task.id)
+            .select(TaskQueueItem::as_select())
+            .first::<TaskQueueItem>(&mut conn)
+            .await
+            .expect("reload the claim")
+    };
+
+    let starved = engine_pool(
+        url.clone(),
+        1,
+        DbRole::Hot,
+        &timeouts(100, SessionTimeouts::for_role(DbRole::Hot)),
+    )
+    .expect("starved pool");
+    let held = hold_every_connection(&starved).await;
+    let registry = new_session_slot_registry();
+    assert!(try_acquire_session_slot(&registry, 4, session_id));
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    autumn_harvest::worker::settle_session_slot_after_transient_error(
+        &starved, &registry, session_id, "w-1", &shutdown,
+    )
+    .await;
+
+    shutdown.cancel();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let pool = engine_pool(
+        url,
+        2,
+        DbRole::Hot,
+        &timeouts(5_000, SessionTimeouts::for_role(DbRole::Hot)),
+    )
+    .expect("engine pool");
+    autumn_harvest::worker::handle_session_acquire_for_test(
+        &pool, &task, "w-1", exec_id, 4, &registry,
+    )
+    .await
+    .expect("the acquire runs");
+    assert_eq!(
+        task_state(&mut conn, task.id).await,
+        "COMPLETED",
+        "the acquire must not defer once shutdown stopped the re-check"
+    );
     drop(held);
 }
 
@@ -2437,7 +2517,11 @@ async fn a_session_acquire_defers_during_the_first_recheck() {
         let registry = registry.clone();
         tokio::spawn(async move {
             autumn_harvest::worker::settle_session_slot_after_transient_error(
-                &starved, &registry, session_id, "w-1",
+                &starved,
+                &registry,
+                session_id,
+                "w-1",
+                &tokio_util::sync::CancellationToken::new(),
             )
             .await;
         })
