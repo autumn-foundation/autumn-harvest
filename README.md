@@ -938,6 +938,7 @@ trigger rules, or multi-step pipelines between tasks.
 
 ```rust
 use autumn_harvest::policy::{Schedule, WorkflowSchedule};
+use autumn_harvest::prelude::*;
 
 // Register a daily billing run at 03:00 UTC with at-most-1 concurrent run.
 let sched = WorkflowSchedule::new(

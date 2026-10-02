@@ -43,10 +43,15 @@ fi
 
 {
   echo "#![allow(dead_code, unused)]"
-  echo "mod schedule {"
+  # The stub workflow lives in its own module so the snippet must carry its
+  # own `use` lines; the glob re-exports only the workflow items.
+  echo "mod stub {"
   echo "use autumn_harvest::prelude::*;"
   echo "#[workflow]"
-  echo "async fn daily_billing_report(ctx: &WorkflowContext, input: serde_json::Value) -> HarvestResult<()> { Ok(()) }"
+  echo "pub async fn daily_billing_report(ctx: &WorkflowContext, input: serde_json::Value) -> HarvestResult<()> { Ok(()) }"
+  echo "}"
+  echo "mod schedule {"
+  echo "use super::stub::*;"
   echo "fn wiring() -> Result<(), Box<dyn std::error::Error>> {"
   echo "$schedule"
   echo "Ok(()) }"
