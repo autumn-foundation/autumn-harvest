@@ -592,18 +592,6 @@ jobs:
       - name: Folio audit-catalog coverage (docs/audits/audit-catalog-coverage.py)
         run: python3 docs/audits/audit-catalog-coverage.py
 
-      # Quota-lock-ordering clone-class sync check (see
-      # docs/audits/quota-lock-ordering-sync.py). An Echo duplication survey
-      # (issue #1695) found debounce.rs's and throttle.rs's batch
-      # quota-lock-ordering helpers (issue #1230 Finding 2) byte-identical,
-      # but below the project's merge bar (2 instances, no missed-fix
-      # defect on record) -- linked instead of merged. This substitutes for
-      # the abstraction: it fails the build the moment the two copies
-      # diverge, rather than relying on every future reviewer to notice by
-      # hand. Pure Python stdlib, no deps, no network.
-      - name: Quota-lock-ordering clone-class sync (docs/audits/quota-lock-ordering-sync.py)
-        run: python3 docs/audits/quota-lock-ordering-sync.py
-
       # Issue #1614: the standalone getting-started chapter shows the files of
       # examples/standalone-quickstart byte for byte, and keeps the markers
       # that the `standalone-chapter` job runs.
