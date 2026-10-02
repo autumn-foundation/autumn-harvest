@@ -326,6 +326,13 @@ jobs:
         # function. rustc reported E0061 "takes 5 arguments" on the
         # attribute line. See scripts/check-underscore-input-snippets.sh.
         run: ./scripts/check-underscore-input-snippets.sh
+      - name: Check README schedule and retry snippets compile
+        # Guards two front-door README snippets. The cron-schedule block
+        # called `.workflows(..)` and `.workflow_schedule(..)` on
+        # `autumn_web::app()`, which has neither method. The retry block
+        # used `Duration` without importing it. See
+        # scripts/check-readme-front-door-snippets.sh.
+        run: ./scripts/check-readme-front-door-snippets.sh
       - name: Check webhooks chapter documents the webhooks feature
         # Guards a real, reproduced-live defect an Onramp clean-room pass
         # found in chapter 12: it showed the `#[webhook]` mapping function
