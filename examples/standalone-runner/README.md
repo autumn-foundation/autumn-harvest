@@ -1,30 +1,44 @@
 # standalone-runner
 
-This example shows the out-of-the-box non-`HarvestPlugin` runner path. It does not call
-`autumn_web::app()` and does not install `HarvestPlugin`. Instead it builds a pool, calls
-`HarvestEmbedding::start`, and serves the returned router on a raw Axum server.
+This example embeds Harvest in a plain Axum server. Its `Cargo.toml` has no
+`autumn-web` entry (issue #1615). It does not call `autumn_web::app()` and does
+not install `HarvestPlugin`.
 
-`HarvestEmbedding` (issue #1613) runs the startup sequence the plugin runs:
+`autumn-harvest-plugin` still depends on `autumn-web`, so the crate is in the
+build graph. The point is that the embedder never names it. A plugin API that
+needs an `autumn_web::` type with no plugin re-export fails to compile here.
+Two tests in `src/tests.rs` also fail when the manifest or the source names
+`autumn-web`.
 
-- It applies `[harvest.startup] orphaned_workflows` from `autumn.toml`,
-  `autumn-{profile}.toml` or `AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS`.
-- `with_ambient_profile()` makes it read the deployment profile from `AUTUMN_ENV` or
-  `AUTUMN_PROFILE`. Without it, the profile is `unknown`. The admin API and every mutating
-  route then fail closed (issue #1802).
-  Declare a credential with `with_admin_auth(StandaloneAdminAuth::new().with_api_tokens())`.
-- It loads the persisted admission gates before the worker starts.
-- It installs the storage pool and the API runtime, in that order.
+Some types still come from `autumn-web`. The webhook config types are
+`autumn-web` types that `autumn_harvest_plugin::webhook_receiver` re-exports.
+`HarvestEmbedding::start` returns an `autumn-web` error, which the example
+only formats.
 
-`HarvestEmbeddingRuntime::stop` drains the worker and removes the process globals.
+| Need | How the example does it, with no `autumn-web` |
+|---|---|
+| Storage pool | `diesel_async` `deadpool` pool (`src/db.rs`) |
+| Migrations | `autumn_harvest::migrate`, the code behind `harvest migrate run` (`src/db.rs`) |
+| Management API and Vantage | `HarvestEmbedding::start`, nested on an `axum::Router` (`src/server.rs`) |
+| Operator credential | `StandaloneAdminAuth::with_api_tokens()` outside `dev`, and `harvest token bootstrap` |
+| Metrics | `GET /metrics` from `HarvestMetricsRecorder::render_prometheus()` |
+| Webhooks | `build_webhook_router` with a `#[webhook]` binding (`src/webhooks.rs`) |
 
 [`docs/embedding.md`](../../docs/embedding.md) is the reference for this path. The getting-started
 fork, [The first workflow on plain Axum](../../docs/getting-started/standalone-axum.md), is the
 short version.
 
-The workflow is intentionally smaller than the billing Autumn app, but it still uses the same
-reference ideas: a saga reserves inventory with rollback, a child workflow buys the shipping
-label, and a version gate selects the v2 shipping payload. The point is runner ownership, not web
-framework ceremony.
+`HarvestEmbedding` (issue #1613) runs the startup sequence the plugin runs. It
+applies `[harvest.startup]`, reads the profile from `AUTUMN_ENV` or
+`AUTUMN_PROFILE`, loads the admission gates, and installs the pool and the API
+runtime. `HarvestEmbeddingRuntime::stop` drains the worker on shutdown.
+`with_ambient_profile()` turns on the profile read. Without it, the profile is
+`unknown`, and the admin API and every mutating route fail closed (issue
+#1802).
+
+The workflow is small, but it uses the reference ideas of the billing app. A
+saga reserves inventory with rollback, a child workflow buys the shipping
+label, and a version gate selects the v2 shipping payload.
 
 ## Run
 
@@ -36,24 +50,27 @@ AUTUMN_PROFILE=dev \
 cargo run -p standalone-runner
 ```
 
-The raw Axum process listens on `http://localhost:8082`.
+In the `dev` profile the runner applies the Harvest migrations itself. The
+`dev` admin API needs no credential. Do not expose a `dev` process beyond
+localhost. Ctrl-C or SIGTERM drains the worker and stops the process. Open
+responses, such as an SSE stream, get 10 seconds before the server closes
+them.
 
-- Runner health route: `GET /`
-- Harvest API: `GET /api/harvest/health`
-- Start workflow: `POST /api/harvest/workflows/standalone_order/start`
-- Prometheus scrape endpoint: `GET /metrics` — `HarvestMetricsRecorder::render_prometheus()`
-  (issue #1611), the framework-neutral counterpart of the plugin path's
-  `/actuator/prometheus`. No `autumn_web::actuator` endpoint is mounted here at all.
+| Variable | Default | Use |
+|---|---|---|
+| `DATABASE_URL` | `postgres://runner:runner@localhost:5434/runner` | The Harvest database. See [TLS](#tls). |
+| `AUTUMN_ENV` or `AUTUMN_PROFILE` | none (`unknown`) | Deployment profile. `AUTUMN_ENV` wins. `dev` or `development` also applies migrations. |
+| `STANDALONE_RUNNER_ADDR` | `127.0.0.1:8082` | Listen address. Port `0` picks a free port. In `dev`, the Harvest routes have no auth, so keep it on localhost. |
+| `STANDALONE_RUNNER_WEBHOOK_SECRET` | none | HMAC secret. The webhook route exists only when this is set. Outside `dev`, a secret under 32 bytes refuses boot. |
 
-```bash
-curl -s http://localhost:8082/metrics | grep ^harvest_
-```
+Routes:
 
-Run the deployment preflight before starting work:
-
-```bash
-cargo run -p autumn-harvest-cli -- --base-url http://localhost:8082/api/harvest preflight
-```
+- `GET /`: runner health.
+- `GET /api/harvest/health`: Harvest health.
+- `GET /api/harvest/ui`: the Vantage dashboard.
+- `POST /api/harvest/workflows/standalone_order/start`: start an order.
+- `GET /metrics`: Prometheus text.
+- `POST /hooks/orders`: the signed order webhook.
 
 ```bash
 curl -s -X POST http://localhost:8082/api/harvest/workflows/standalone_order/start \
@@ -62,9 +79,99 @@ curl -s -X POST http://localhost:8082/api/harvest/workflows/standalone_order/sta
     "workflow_id":"order-1001",
     "input":{"order_id":"order-1001","sku":"sku-book","quantity":2}
   }' | jq .
+
+curl -s http://localhost:8082/metrics | grep ^harvest_
 ```
 
-Use `examples/billing-autumn-web` when you want the full Autumn web integration with app routes,
-outbox publication, saga rollback, child workflow orchestration, version fencing, scheduled DAGs,
-signals, timers, and the plugin-managed runner. Use this one when you want to see the runner
-wired manually.
+Run the deployment preflight:
+
+```bash
+cargo run -p autumn-harvest-cli -- --base-url http://localhost:8082/api/harvest preflight
+```
+
+## Run outside `dev`
+
+Outside `dev`, the runner does not migrate. Every Harvest route except the
+public ones, such as `/api/harvest/health`, needs an API token. Apply the
+migrations and seed the first token first:
+
+```bash
+export DATABASE_URL=postgres://runner:runner@localhost:5434/runner
+HARVEST_DATABASE_URL="$DATABASE_URL" cargo run -p autumn-harvest-cli -- migrate run
+cargo run -p autumn-harvest-cli -- token bootstrap
+```
+
+`token bootstrap` prints a secret and an `INSERT` statement. Run the statement
+against the database, and keep the secret. Then start the runner and send the
+secret as a bearer token. `read -rs` keeps the secret out of the shell history:
+
+```bash
+AUTUMN_PROFILE=prod cargo run -p standalone-runner
+
+read -rs HARVEST_TOKEN && export HARVEST_TOKEN
+cargo run -p autumn-harvest-cli -- --base-url http://localhost:8082/api/harvest preflight
+
+curl -s -X POST http://localhost:8082/api/harvest/workflows/standalone_order/start \
+  -H "Authorization: Bearer $HARVEST_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "workflow_id":"order-1002",
+    "input":{"order_id":"order-1002","sku":"sku-book","quantity":2}
+  }' | jq .
+```
+
+A request without a token gets `401`. The webhook route and `/metrics` are
+outside `harvest.router()`, so the token does not gate them. The webhook has
+its HMAC signature.
+
+`preflight` still reports `admin_auth_boundary` as `fail` under a named
+non-`dev` profile, and `warn` when the profile is unknown. The check counts
+only a declared embedder auth boundary, and API tokens are not one. To pass
+it, put your own auth layer in front of `harvest.router()`. Then declare it
+with `StandaloneAdminAuth::with_admin_auth_boundary()`. The acceptance suite
+pins the `fail`.
+
+## TLS
+
+The `sslmode` in `DATABASE_URL` sets the transport. The pool, the `dev`
+migrations and the LISTEN listeners all follow it:
+
+| `sslmode` | Transport |
+|---|---|
+| `prefer`, or not set | TLS when the server offers it, else plaintext. The certificate is not checked, as in libpq. |
+| `require`, `verify-full` | TLS. The chain must reach the platform trust store, and the host name must match. |
+| `verify-ca` | TLS. The chain is checked, the host name is not. |
+| `allow` | Plaintext. When the server rejects it, one retry with TLS and no certificate check, as in libpq. |
+| `disable` | Plaintext. |
+
+A managed Postgres, Fly for example, hands out a URL with no `sslmode` and
+refuses plaintext. The default reaches it over TLS. Set `sslmode=require` when
+the certificate must be verified. `require` is stricter here than in libpq.
+`sslrootcert` is not read. Put a private CA in the platform store, or point
+`SSL_CERT_FILE` at a bundle that holds it.
+
+## Webhooks
+
+```bash
+STANDALONE_RUNNER_WEBHOOK_SECRET=<random secret, 32 bytes or more> \
+AUTUMN_PROFILE=dev cargo run -p standalone-runner
+```
+
+Sign the raw body with HMAC-SHA256 and send it as
+`X-Webhook-Signature: sha256=<hex>`. The `order_placed` binding starts
+`standalone_order` with the workflow id `order-<order_id>`.
+
+## Test
+
+```bash
+cargo test -p standalone-runner --bins
+HARVEST_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
+  cargo test -p standalone-runner --test acceptance -- --test-threads=1
+```
+
+The `acceptance` suite runs the built binary against Postgres and drives the
+steps above over HTTP. Without `HARVEST_TEST_DATABASE_URL`, it starts a
+Postgres container.
+
+Use `examples/billing-autumn-web` for the full Autumn web integration through
+`HarvestPlugin`. Use this one to embed the runner in any Axum service.

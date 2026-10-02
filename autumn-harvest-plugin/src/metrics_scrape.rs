@@ -183,6 +183,11 @@ struct Inner {
     // already exists (`dispatch::dropped_hints()`); without an override here
     // it stays invisible to the built-in scrape endpoint.
     dispatch_dropped_hints: Gauge,
+    // Issue #1796: the post-commit notify path exposes two in-process
+    // readings. Without an override here, the built-in scrape endpoint
+    // discards both of them.
+    notify_send_failures: Gauge,
+    notify_queue_usage: Gauge,
 }
 
 /// In-process aggregator for the built-in Prometheus scrape endpoint
@@ -360,6 +365,15 @@ impl MetricsRecorder for HarvestMetricsRecorder {
     #[allow(clippy::cast_precision_loss)]
     fn record_dispatch_dropped_hints(&self, total: u64) {
         self.0.dispatch_dropped_hints.set(Vec::new(), total as f64);
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn record_notify_send_failures(&self, total: u64) {
+        self.0.notify_send_failures.set(Vec::new(), total as f64);
+    }
+
+    fn record_notify_queue_usage(&self, ratio: f64) {
+        self.0.notify_queue_usage.set(Vec::new(), ratio);
     }
 
     fn record_schedule_run(&self, kind: &str, name: &str) {
@@ -703,6 +717,20 @@ fn push_sampler_adjacent_metrics(families: &mut Vec<MetricFamily>, inner: &Inner
         "Cumulative dispatch hints dropped because the background publisher queue was full",
         &[],
         inner.dispatch_dropped_hints.snapshot(),
+    );
+    push_gauge(
+        families,
+        "harvest_notify_send_failures",
+        "Cumulative post-commit notifications lost to an error since process start",
+        &[],
+        inner.notify_send_failures.snapshot(),
+    );
+    push_gauge(
+        families,
+        "harvest_notify_queue_usage",
+        "Largest Postgres notification queue usage a live notify sender read last (0 to 1)",
+        &[],
+        inner.notify_queue_usage.snapshot(),
     );
 }
 
@@ -1055,6 +1083,31 @@ mod tests {
         assert_eq!(f.samples.len(), 1);
         assert_eq!(f.samples[0].labels.len(), 0);
         assert_eq!(f.samples[0].value, 5.0);
+    }
+
+    #[test]
+    fn notify_metrics_are_unlabeled_last_write_wins_gauges() {
+        // Issue #1796: the notify module exposes a send-failure total and a
+        // queue-usage ratio. This test pins that the built-in scrape recorder
+        // renders both. A later sample replaces the earlier one.
+        let recorder = HarvestMetricsRecorder::new();
+        recorder.record_notify_send_failures(2);
+        recorder.record_notify_send_failures(4);
+        recorder.record_notify_queue_usage(0.25);
+        recorder.record_notify_queue_usage(0.5);
+
+        let families = recorder.collect();
+        let f = family(&families, "harvest_notify_send_failures");
+        assert_eq!(f.kind, MetricKind::Gauge);
+        assert_eq!(f.samples.len(), 1);
+        assert_eq!(f.samples[0].labels.len(), 0);
+        assert_eq!(f.samples[0].value, 4.0);
+
+        let f = family(&families, "harvest_notify_queue_usage");
+        assert_eq!(f.kind, MetricKind::Gauge);
+        assert_eq!(f.samples.len(), 1);
+        assert_eq!(f.samples[0].labels.len(), 0);
+        assert_eq!(f.samples[0].value, 0.5);
     }
 
     #[test]

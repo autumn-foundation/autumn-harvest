@@ -124,6 +124,9 @@ const STABLE_PROMETHEUS_METRICS: &[&str] = &[
     "harvest_workflow_external_cancel_sent_total",
     // Issue #1429 — the dispatch background publisher's dropped-hint count.
     "harvest_dispatch_dropped_hints",
+    // Issue #1796 — post-commit notify health.
+    "harvest_notify_send_failures",
+    "harvest_notify_queue_usage",
 ];
 
 #[test]

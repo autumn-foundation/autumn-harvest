@@ -61,6 +61,10 @@ use crate::types::{
     TimerId, WorkerId,
 };
 
+/// How long a stopping worker waits for each notify sender to drain
+/// (issue #1796).
+const NOTIFY_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Type alias for the deadpool-managed async Diesel connection pool.
 pub type DbPool = deadpool::managed::Pool<
     diesel_async::pooled_connection::AsyncDieselConnectionManager<diesel_async::AsyncPgConnection>,
@@ -558,6 +562,8 @@ pub struct HandlerRegistry {
     /// in-process state. Built from the registered activities' declared
     /// [`CircuitBreakerPolicy`](crate::policy::CircuitBreakerPolicy)s.
     circuit_breakers: Arc<crate::circuit_breaker::CircuitBreakerRegistry>,
+    /// Per-activity-type retry budgets (issue #1793). On by default.
+    retry_budgets: Arc<crate::retry_budget::RetryBudgetRegistry>,
     /// Maximum byte length for `current_details` strings passed to the
     /// workflow context (issue #473). Default: 1 KiB.
     pub max_current_details_bytes: usize,
@@ -787,6 +793,10 @@ impl HandlerRegistry {
             .filter(|(_, info)| !info.is_local)
             .filter_map(|(name, info)| info.circuit_breaker.map(|p| (name.clone(), p)))
             .collect();
+        let retry_budgets = Arc::new(
+            crate::retry_budget::RetryBudgetRegistry::default()
+                .with_metrics(Arc::clone(&telemetry.metrics)),
+        );
         Self {
             workflows,
             activities,
@@ -805,6 +815,7 @@ impl HandlerRegistry {
             circuit_breakers: Arc::new(crate::circuit_breaker::CircuitBreakerRegistry::new(
                 circuit_policies,
             )),
+            retry_budgets,
             max_workflow_attempts_ceiling: None,
             max_workflow_chain_timeout: None,
             max_workflow_execution_timeout: None,
@@ -1167,6 +1178,37 @@ impl HandlerRegistry {
         Arc::clone(&self.circuit_breakers)
     }
 
+    /// Replace the per-activity-type retry budgets (issue #1793).
+    ///
+    /// Mirrors [`crate::builder::WorkerConfig::with_retry_budget`]. The default
+    /// gives every activity type the default
+    /// [`RetryBudgetPolicy`](crate::policy::RetryBudgetPolicy).
+    ///
+    /// An override for a name that this registry does not register has no
+    /// effect. The call logs a warning for each such name.
+    #[must_use]
+    pub fn with_retry_budget(mut self, config: crate::retry_budget::RetryBudgetConfig) -> Self {
+        for name in config.overrides().keys() {
+            if !self.activities.contains_key(name) {
+                tracing::warn!(
+                    activity_name = %name,
+                    "retry budget override names an activity that is not registered; it has no effect"
+                );
+            }
+        }
+        self.retry_budgets = Arc::new(
+            crate::retry_budget::RetryBudgetRegistry::new(config)
+                .with_metrics(Arc::clone(&self.telemetry.metrics)),
+        );
+        self
+    }
+
+    /// Access the per-activity-type retry budgets (issue #1793).
+    #[must_use]
+    pub fn retry_budgets(&self) -> Arc<crate::retry_budget::RetryBudgetRegistry> {
+        Arc::clone(&self.retry_budgets)
+    }
+
     /// History-size guardrails applied to workflow contexts run by this registry.
     #[must_use]
     pub const fn history_policy(&self) -> WorkflowHistoryPolicy {
@@ -1442,6 +1484,7 @@ impl std::fmt::Debug for HandlerRegistry {
             .field("max_current_details_bytes", &self.max_current_details_bytes)
             .field("workflow_log_policy", &self.workflow_log_policy)
             .field("circuit_breakers", &self.circuit_breakers)
+            .field("retry_budgets", &self.retry_budgets)
             .field(
                 "max_workflow_attempts_ceiling",
                 &self.max_workflow_attempts_ceiling,
@@ -14799,6 +14842,209 @@ async fn handle_activity_result(
     }
 }
 
+/// Outcome of the retry budget gate in `process_activity_task` (issue #1793).
+enum RetryBudgetGate {
+    /// Run the attempt. Release the ticket if the attempt does not run.
+    Run(Option<crate::retry_budget::BudgetTicket>),
+    /// Do not run the retry. Defer it to this wake-up time. Cancel the
+    /// reservation if the deferral is not persisted.
+    Defer(
+        std::time::Instant,
+        Option<crate::retry_budget::SlotReservation>,
+    ),
+}
+
+/// Whether the retry budget gates this attempt (issue #1793).
+///
+/// A `None` token is a circuit short-circuit. It never reaches the
+/// dependency, so the budget ignores it. A half-open probe that is a retry
+/// is the breaker's recovery signal, so the budget never defers it. A probe
+/// that is a first attempt still goes through the gate, so its deposit
+/// counts.
+fn retry_budget_gates(
+    circuit_token: Option<crate::circuit_breaker::DispatchToken>,
+    is_retry: bool,
+) -> bool {
+    circuit_token.is_some_and(|token| !(token.is_probe() && is_retry))
+}
+
+#[cfg(test)]
+mod retry_budget_gate_tests {
+    use super::retry_budget_gates;
+    use crate::circuit_breaker::{
+        AttemptOutcome, CircuitBreakerRegistry, DispatchDecision, DispatchToken,
+    };
+    use crate::policy::CircuitBreakerPolicy;
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    /// A normal token, and a half-open probe token from a tripped breaker.
+    fn tokens() -> (DispatchToken, DispatchToken) {
+        let policy = CircuitBreakerPolicy::new(1, Duration::from_secs(30), Duration::from_secs(5));
+        let reg = CircuitBreakerRegistry::new(HashMap::from([("act".to_owned(), policy)]));
+        let t0 = Instant::now();
+        let DispatchDecision::Allow { token: normal } = reg.on_dispatch("act", t0) else {
+            panic!("a closed breaker allows");
+        };
+        let _ = reg.on_result("act", AttemptOutcome::RetryableFailure, normal, t0);
+        let DispatchDecision::Allow { token: probe } =
+            reg.on_dispatch("act", t0 + Duration::from_secs(6))
+        else {
+            panic!("the cooldown admits a probe");
+        };
+        assert!(probe.is_probe());
+        (normal, probe)
+    }
+
+    #[test]
+    fn a_short_circuit_is_never_gated() {
+        assert!(!retry_budget_gates(None, false));
+        assert!(!retry_budget_gates(None, true));
+    }
+
+    #[test]
+    fn a_normal_dispatch_is_gated() {
+        let (normal, _) = tokens();
+        assert!(retry_budget_gates(Some(normal), false));
+        assert!(retry_budget_gates(Some(normal), true));
+    }
+
+    /// A retry probe is exempt, but a first-attempt probe still deposits.
+    #[test]
+    fn only_a_retry_probe_is_exempt() {
+        let (_, probe) = tokens();
+        assert!(!retry_budget_gates(Some(probe), true));
+        assert!(retry_budget_gates(Some(probe), false));
+    }
+}
+
+/// Consult the retry budget for one claimed attempt.
+///
+/// A claim with `attempt > 1` is a retry. An orphan reclaim also raises
+/// `attempt`, so a re-run after a crash counts as a retry too. A re-run loads
+/// the dependency as a retry does.
+fn admit_retry_budget(
+    registry: &HandlerRegistry,
+    activity_name: &str,
+    task: &TaskQueueItem,
+) -> RetryBudgetGate {
+    use crate::retry_budget::Admission;
+
+    let is_retry = task_attempt(task) > 1;
+    let now = std::time::Instant::now();
+    // The budget registry publishes the `available` gauge itself, under its
+    // lock. The worker counts a deferral only once the deferral persists.
+    match registry.retry_budgets().admit(activity_name, is_retry, now) {
+        Admission::Untracked => RetryBudgetGate::Run(None),
+        Admission::Admitted { ticket, .. } => RetryBudgetGate::Run(Some(ticket)),
+        Admission::Deferred {
+            retry_after,
+            reservation,
+            ..
+        } => RetryBudgetGate::Defer(now + retry_after, reservation),
+    }
+}
+
+/// Settles a retry budget ticket for one attempt.
+///
+/// `commit` settles it once `ActivityStarted` is appended. A first attempt's
+/// deposit counts only then. Every return before that point drops the guard
+/// instead. That includes a rate-limit deferral, a no-op start and an error
+/// from `?`. The drop releases the ticket.
+struct BudgetReleaseGuard<'a> {
+    registry: &'a HandlerRegistry,
+    activity_name: &'a str,
+    ticket: Option<crate::retry_budget::BudgetTicket>,
+}
+
+impl<'a> BudgetReleaseGuard<'a> {
+    const fn new(registry: &'a HandlerRegistry, activity_name: &'a str) -> Self {
+        Self {
+            registry,
+            activity_name,
+            ticket: None,
+        }
+    }
+
+    const fn hold(&mut self, ticket: Option<crate::retry_budget::BudgetTicket>) {
+        self.ticket = ticket;
+    }
+
+    /// The attempt starts. A first attempt's deposit counts from here.
+    fn commit(&mut self) {
+        let Some(ticket) = self.ticket.take() else {
+            return;
+        };
+        self.registry
+            .retry_budgets()
+            .commit(self.activity_name, ticket, std::time::Instant::now());
+    }
+}
+
+impl Drop for BudgetReleaseGuard<'_> {
+    fn drop(&mut self) {
+        let Some(ticket) = self.ticket.take() else {
+            return;
+        };
+        self.registry.retry_budgets().release(
+            self.activity_name,
+            ticket,
+            std::time::Instant::now(),
+        );
+    }
+}
+
+/// Defer a retry that the retry budget did not admit (issue #1793).
+///
+/// The row goes back to `PENDING` `retry_after` past the database clock. The
+/// write lowers `attempt` again and keeps `error` and `crash_strikes`. Thus the
+/// retry keeps its attempt number, its previous failure and its poison-pill
+/// count. The write appends no event.
+///
+/// The claim debited a rate-limit token for an activity without a circuit
+/// breaker. The retry does not run, so the token goes back. The function logs
+/// a refund failure and does not return it, like a capability-miss refund.
+///
+/// The delay is computed just before the write, so time spent on the pool
+/// connection or the refund is taken off. A slot that has passed by then is
+/// replaced by a new one in `reservation`.
+///
+/// Returns `false` when the lease was lost, so the write changed nothing.
+async fn defer_retry_for_budget(
+    conn: &mut AsyncPgConnection,
+    budgets: &crate::retry_budget::RetryBudgetRegistry,
+    activity_name: &str,
+    task: &TaskQueueItem,
+    activity: &ActivityInfo,
+    wake_at: std::time::Instant,
+    reservation: &mut Option<crate::retry_budget::SlotReservation>,
+) -> HarvestResult<bool> {
+    if activity.circuit_breaker.is_none()
+        && let Some(key) = task.rate_limit_key.as_deref()
+        && let Err(error) = queue::refund_rate_limit_token(conn, key).await
+    {
+        tracing::warn!(
+            task_id = %task.id,
+            rate_limit_key = %key,
+            %error,
+            "failed to refund the rate-limit token for a retry-budget deferral"
+        );
+    }
+    // The delay runs on the database clock. See `defer_claimed_retry_for_budget`.
+    let delay = budgets.wake_delay(
+        activity_name,
+        wake_at,
+        reservation,
+        std::time::Instant::now(),
+    );
+    let delay = chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::seconds(1));
+    let write = queue::defer_claimed_retry_for_budget(conn, &claim_of_task(task)?, delay).await?;
+    if write == queue::ClaimWrite::LeaseLost {
+        log_lease_lost(task, "retry-budget deferral");
+    }
+    Ok(write == queue::ClaimWrite::Applied)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_activity_future_with_cancellation(
     activity_name: &str,
@@ -15243,6 +15489,52 @@ async fn process_activity_task(
         crate::circuit_breaker::DispatchDecision::ShortCircuit { .. } => None,
     };
 
+    // Retry budget (issue #1793). See `retry_budget_gates` for which
+    // attempts it gates. The gate runs before ActivityStarted, so a deferred
+    // retry leaves no event.
+    let mut budget_guard = BudgetReleaseGuard::new(registry, activity_name);
+    if retry_budget_gates(circuit_token, task_attempt(task) > 1) {
+        match admit_retry_budget(registry, activity_name, task) {
+            RetryBudgetGate::Run(ticket) => budget_guard.hold(ticket),
+            RetryBudgetGate::Defer(wake_at, mut reservation) => {
+                if let Some(token) = circuit_token {
+                    circuit_breakers.on_cancelled(activity_name, token, std::time::Instant::now());
+                }
+                let deferred = match pool.get().await {
+                    Ok(mut conn) => {
+                        defer_retry_for_budget(
+                            &mut conn,
+                            &registry.retry_budgets(),
+                            activity_name,
+                            task,
+                            activity,
+                            wake_at,
+                            &mut reservation,
+                        )
+                        .await
+                    }
+                    Err(error) => Err(crate::error::database_error(error)),
+                };
+                if matches!(deferred, Ok(true)) {
+                    // Count only a deferral that persisted, so the counter
+                    // does not grow during DB errors or lease races.
+                    registry
+                        .telemetry()
+                        .metrics
+                        .record_retry_budget_exhausted(activity_name);
+                } else if let Some(reservation) = reservation {
+                    // No row waits on a slot that the write did not persist.
+                    registry.retry_budgets().cancel_deferral(
+                        activity_name,
+                        reservation,
+                        std::time::Instant::now(),
+                    );
+                }
+                return deferred.map(|_| ());
+            }
+        }
+    }
+
     // Dispatch-time rate limiting (issue #369): a circuit-breaker activity skips
     // the claim-time rate-limit gate/debit, so a genuine call (Allow) must reserve
     // a token here, gated on the authoritative `on_dispatch` decision. This runs
@@ -15359,6 +15651,9 @@ async fn process_activity_task(
         // conn is dropped here, returning the slot to the pool
     };
     let activity_id = started.activity_id;
+    // The attempt runs from here, so its budget decision stands. A first
+    // attempt's deposit counts from this point.
+    budget_guard.commit();
 
     // Schedule-to-start latency (issue #501): record here, once the activity has
     // genuinely started (ActivityStarted appended). This is *past* the
@@ -23589,6 +23884,10 @@ async fn read_live_fleet_or_degrade(
 /// other path — retry requeue, orphan reclaim, timeout, cancel — refunds, so a
 /// second credit for one debit cannot arise.
 ///
+/// A retry-budget deferral (issue #1793) also refunds a claim-time debit. It
+/// runs only after the handler lookup succeeds, so it never shares a dispatch
+/// with a capability miss.
+///
 /// Pinned by `stale_dispatcher_refund_leaves_one_debit_for_the_live_claim` in
 /// `capability_miss_tests`, which drives the exact interleaving above and
 /// asserts the middle column.
@@ -25076,6 +25375,11 @@ fn spawn_queue_pause_sampler(
 /// stays `PENDING` and the reconcile sweep republishes it. This is a health
 /// signal, not a durability one.
 ///
+/// Under the `db` feature, the same loop also samples the notify readings
+/// (issue #1796). It emits `harvest.notify.send_failures` on every tick. It
+/// emits `harvest.notify.queue_usage` once a notify sender has read the queue
+/// usage. Both readings are in-process and query no database.
+///
 /// `pub`, not worker-private: the dispatch background publisher installs
 /// unconditionally at startup (issue #1312), including in an API-only
 /// process with `worker_enabled = false`. Such a process still needs this
@@ -25093,6 +25397,8 @@ pub fn spawn_dispatch_metrics_sampler(
         if !telemetry.metrics.is_enabled() {
             return;
         }
+        #[cfg(feature = "db")]
+        let mut usage_seen = false;
         loop {
             tokio::select! {
                 () = cancel.cancelled() => break,
@@ -25101,6 +25407,22 @@ pub fn spawn_dispatch_metrics_sampler(
             telemetry
                 .metrics
                 .record_dispatch_dropped_hints(crate::dispatch::dropped_hints());
+            #[cfg(feature = "db")]
+            {
+                telemetry
+                    .metrics
+                    .record_notify_send_failures(crate::notify::send_failures());
+                // After the last live sender stops, report 0, so the gauge
+                // does not keep a stale high value.
+                match crate::notify::queue_usage() {
+                    Some(ratio) => {
+                        usage_seen = true;
+                        telemetry.metrics.record_notify_queue_usage(ratio);
+                    }
+                    None if usage_seen => telemetry.metrics.record_notify_queue_usage(0.0),
+                    None => {}
+                }
+            }
             if cancel.is_cancelled() {
                 break;
             }
@@ -27665,11 +27987,13 @@ impl Worker {
     /// Otherwise it falls through to the existing single-shard path
     /// (`run_with_listener`) byte-for-byte unchanged.
     pub async fn run(&self, pool: &DbPool) {
+        self.register_notify_pools(pool);
         // Bind the global dispatch channel at the run boundary (issue #1431).
         // Every hint the run raises, in the poll loop or in a maintenance
         // loop, then goes to that channel.
         let bound = self.bound_channel();
         crate::dispatch::with_bound_channel(bound, Box::pin(self.run_bound(pool))).await;
+        self.flush_notify_pools(pool).await;
     }
 
     /// The body of [`Worker::run`], inside the dispatch binding.
@@ -28395,7 +28719,7 @@ impl Worker {
             }
         }
         if notified {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(crate::notify::settle_delay()).await;
         }
     }
 
@@ -28500,12 +28824,42 @@ impl Worker {
     ) {
         // A direct caller of this entry point skips `run`, so bind here too
         // (issue #1431).
+        self.register_notify_pools(pool);
         let bound = self.bound_channel();
         crate::dispatch::with_bound_channel(
             bound,
             Box::pin(self.run_with_listener_bound(pool, listener)),
         )
         .await;
+        self.flush_notify_pools(pool).await;
+    }
+
+    /// Start the post-commit notify sender for each pool this worker writes
+    /// to (issue #1796).
+    fn register_notify_pools(&self, pool: &DbPool) {
+        for pool in self.notify_pools(pool) {
+            crate::notify::register_pool(pool);
+        }
+    }
+
+    /// Send the wakes of the last writes before the runtime can stop the
+    /// notify senders (issue #1796).
+    async fn flush_notify_pools(&self, pool: &DbPool) {
+        for pool in self.notify_pools(pool) {
+            crate::notify::register_pool(pool)
+                .flush(NOTIFY_FLUSH_TIMEOUT)
+                .await;
+        }
+    }
+
+    /// The run pool and every shard pool of this worker.
+    fn notify_pools<'a>(&'a self, pool: &'a DbPool) -> impl Iterator<Item = &'a DbPool> {
+        std::iter::once(pool).chain(
+            self.config
+                .sharded_pool
+                .iter()
+                .flat_map(|sharded| sharded.iter_shards().map(|(_, pool)| pool)),
+        )
     }
 
     /// The body of [`Worker::run_with_listener`], inside the dispatch binding.
@@ -30321,9 +30675,10 @@ impl Worker {
                         .await
                     {
                         Ok(Some(_)) => {
-                            // Host-side timestamps can be slightly ahead of Postgres NOW(),
-                            // so give newly notified tasks a brief moment to become claimable.
-                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            // Host clocks can run ahead of the database NOW(). A
+                            // jittered delay lets a new task become claimable,
+                            // and spreads the claims of many workers (issue #1796).
+                            tokio::time::sleep(crate::notify::settle_delay()).await;
                         }
                         Ok(None) => {}
                         Err(error) => {
@@ -34679,6 +35034,7 @@ mod tests {
             slot_tuner: None,
             max_concurrent_sessions: 0,
             codec_rotation_batch_size: crate::codec_rotation::CODEC_ROTATION_DEFAULT_BATCH,
+            retry_budget: crate::retry_budget::RetryBudgetConfig::default(),
             #[cfg(feature = "db")]
             sharded_pool: None,
         };

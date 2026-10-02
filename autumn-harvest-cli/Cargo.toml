@@ -23,7 +23,10 @@ default-run = "harvest"
 # and diesel-async/tokio-postgres are pure Rust, so the Windows/macOS CI legs
 # build it without a system libpq/OpenSSL, and the workspace already compiles
 # diesel for the core crate.
-autumn-harvest = { version = "0.6.0", path = "../autumn-harvest", default-features = false, features = ["db", "testing", "debugger"] }
+# `tls` gives `harvest dr` and `harvest backup verify` the `pg_tls` connector,
+# so a managed Postgres that refuses plaintext is reachable. Its rustls crates
+# are the ones `harvest migrate` already uses.
+autumn-harvest = { version = "0.6.0", path = "../autumn-harvest", default-features = false, features = ["db", "testing", "debugger", "tls"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 # `harvest migrate` builds its own Postgres connection so it can offer TLS,
 # which `AsyncPgConnection::establish` (NoTls) cannot -- a managed Harvest

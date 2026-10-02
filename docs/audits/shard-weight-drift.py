@@ -219,6 +219,15 @@ def linuxpart_rows_in_order(records):
     return [r for r in records if r[0] == "linuxpart"]
 
 
+def crate_dir(crate):
+    """The directory of a manifest `crate`. Library crates sit at the repo
+    root. An example crate, such as `standalone-runner` (issue #1615), sits
+    under `examples/`."""
+    root_dir = REPO_ROOT / crate
+    example_dir = REPO_ROOT / "examples" / crate
+    return example_dir if not root_dir.exists() and example_dir.exists() else root_dir
+
+
 def resolve_test_file(crate, target):
     """The dedicated test binary source for a `linux` row's `crate`/`target`
     — every crate/target other than `autumn-harvest`/`integration`, which
@@ -226,7 +235,7 @@ def resolve_test_file(crate, target):
     ONE shared binary (`tests/integration/mod.rs`), so a manifest row there
     is weighed by substring-matching `crate_integration_test_index()`
     instead (see `integration_row_weight()`), not by resolving one file."""
-    return REPO_ROOT / crate / "tests" / f"{target}.rs"
+    return crate_dir(crate) / "tests" / f"{target}.rs"
 
 
 _DEFAULT_FEATURES_CACHE = {}
@@ -239,7 +248,7 @@ def crate_default_features(crate):
     an empty default set, matching Cargo's own behavior."""
     if crate in _DEFAULT_FEATURES_CACHE:
         return _DEFAULT_FEATURES_CACHE[crate]
-    path = REPO_ROOT / crate / "Cargo.toml"
+    path = crate_dir(crate) / "Cargo.toml"
     features = set()
     try:
         text = path.read_text(encoding="utf-8")

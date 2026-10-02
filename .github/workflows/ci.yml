@@ -991,7 +991,7 @@ jobs:
       # signal/child-workflow saga (docs/getting-started/04-signals.md tells a
       # reader to run `cargo test -p saga-choreography` directly),
       # billing-autumn-web's checkout saga (README.md's first pointer past
-      # hello-world), and standalone-runner's external-runner mode -- but
+      # hello-world), and standalone-runner's plain-Axum embedding -- but
       # nothing before this step exercised any of them beyond `cargo build`.
       # The only existing coverage was narrow grep guards for specific past
       # docs defects (check-search-attr-query-syntax.sh,
@@ -1004,9 +1004,13 @@ jobs:
       - name: Run billing-autumn-web example tests
         if: needs.changes.outputs.code == 'true' && matrix.shard == 1
         run: cargo test -p billing-autumn-web
+      # Issue #1615. `--bins` runs the unit tests, including the guards that
+      # fail when the manifest or the source names autumn-web. The
+      # `acceptance` suite needs Postgres, so it runs from the manifest on
+      # `test-db-linux`.
       - name: Run standalone-runner example tests
         if: needs.changes.outputs.code == 'true' && matrix.shard == 2
-        run: cargo test -p standalone-runner
+        run: cargo test -p standalone-runner --bins
       - name: "Run standalone-quickstart example tests (issue #1614)"
         if: needs.changes.outputs.code == 'true' && matrix.shard == 1
         run: cargo test -p standalone-quickstart
