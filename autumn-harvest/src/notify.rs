@@ -327,10 +327,10 @@ const HEALTHY_WITHIN: Duration = Duration::from_secs(3);
 const FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Shortest delay before a worker claims after a wake.
-pub(crate) const SETTLE_DELAY_MIN: Duration = Duration::from_millis(25);
+pub(crate) const SETTLE_DELAY_MIN: Duration = Duration::from_millis(50);
 
 /// Longest delay before a worker claims after a wake.
-pub(crate) const SETTLE_DELAY_MAX: Duration = Duration::from_millis(50);
+pub(crate) const SETTLE_DELAY_MAX: Duration = Duration::from_millis(75);
 
 /// Notifications lost to an error since the process started.
 static SEND_FAILURES: AtomicU64 = AtomicU64::new(0);
@@ -447,8 +447,9 @@ fn coalesce(notes: Vec<Note>) -> Vec<(String, String)> {
 ///
 /// A worker sleeps this long after a wake and before it claims. Host clocks
 /// can run ahead of the database `NOW()`, so a new task needs a short time to
-/// become claimable. The jitter stops every worker from claiming at the same
-/// instant after one wake.
+/// become claimable. The floor keeps the 50 ms margin the fixed delay gave.
+/// The jitter above it stops every worker from claiming at the same instant
+/// after one wake.
 #[must_use]
 pub(crate) fn settle_delay() -> Duration {
     use rand::Rng as _;

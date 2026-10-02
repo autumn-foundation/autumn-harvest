@@ -106,7 +106,7 @@ database work, and worker execution; this suite does not instrument that
 split for the throughput scenario itself. Adding workers, or giving Postgres
 its own cores, moves the number, and neither is an architectural change. The
 poll interval is not as direct a lever as it looks: with LISTEN/NOTIFY wired,
-as it is here, a successful notification wakes a worker in 25 to 50 ms
+as it is here, a successful notification wakes a worker in 50 to 75 ms
 regardless of the configured interval (a fixed 50 ms when these numbers were
 taken; issue #1796 added the jitter), and a worker claiming tasks back to
 back under load never waits at all. The interval mainly bounds a *missed*

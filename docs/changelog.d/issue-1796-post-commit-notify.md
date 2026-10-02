@@ -41,8 +41,8 @@ cut on a character boundary, as `LISTEN` already cut it. Before, `pg_notify`
 rejected the long name and failed the enqueue.
 
 **Settle delay.** The worker slept a fixed 50 ms after each wake. It now
-sleeps a random 25 to 50 ms, so the workers that one wake reaches do not all
-claim at once.
+sleeps a random 50 to 75 ms. The 50 ms floor keeps the clock-skew margin, and
+the jitter stops the workers that one wake reaches from all claiming at once.
 
 **Metrics.** `harvest.notify.send_failures` is the running total of lost
 notifications. `harvest.notify.queue_usage` is the largest

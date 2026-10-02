@@ -53,7 +53,7 @@ Option 6 fails because diesel emits `CommitTransaction` before `COMMIT` runs.
 | Fail one batch because one channel name is too long. | Filter invalid channels before the send. Count them. |
 | Lose wakes with no signal. | Count send failures. Sample `pg_notification_queue_usage()`. |
 | Wake all workers at the same time after one notify. | Jitter the settle delay. |
-| Remove the settle delay and break the clock-skew margin. | Keep a jittered delay from 25 ms to 50 ms. |
+| Remove the settle delay and break the clock-skew margin. | Keep the 50 ms floor and add jitter above it, to 75 ms. |
 | Keep a dead sender after its runtime stops. | Check `JoinHandle::is_finished` on lookup. Drop the sink. |
 
 ## Six hats
@@ -96,7 +96,7 @@ returns `Ok(())`.
 6. **Measure.** `harvest.notify.send_failures` is the running total of lost
    notifications. `harvest.notify.queue_usage` is the largest
    `pg_notification_queue_usage()` that a sender read.
-7. **Settle.** The worker sleeps a random 25 ms to 50 ms after a wake, not a
+7. **Settle.** The worker sleeps a random 50 ms to 75 ms after a wake, not a
    fixed 50 ms.
 
 The progress channel (`notify_workflow_progress`) is out of scope. Its
