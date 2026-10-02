@@ -2079,7 +2079,14 @@ async fn start_harvest_runtime(
     // than an empty snapshot.
 
     // issue #377: spawn background gate-cache refresh (≤2 s p95 cross-replica propagation).
-    let gate_refresh = Some(crate::boot::spawn_gate_refresh(api_state, &harvest_db_pool));
+    // The load-shed sampler takes its registry data from the runtime here, not
+    // from `api_state.install(...)` below, so its first tick cannot race the
+    // install (issue #1794).
+    let gate_refresh = Some(crate::boot::spawn_gate_refresh(
+        api_state,
+        &harvest_db_pool,
+        &runner.api_runtime(),
+    ));
 
     let outbox = app_pool.as_ref().and_then(|_| {
         if harvest_config.outbox.enabled {

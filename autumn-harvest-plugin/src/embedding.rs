@@ -260,7 +260,10 @@ impl HarvestEmbedding {
 
         let storage_pool = runner.storage_pool();
         api_state.install_storage_pool(storage_pool.clone());
-        let gate_refresh = boot::spawn_gate_refresh(&api_state, &storage_pool);
+        // The load-shed sampler takes its registry data from the runtime here,
+        // not from the install below, so its first tick cannot race the install.
+        let gate_refresh =
+            boot::spawn_gate_refresh(&api_state, &storage_pool, &runner.api_runtime());
         api_state.install(runner.api_runtime());
         admission_guard.commit();
 
