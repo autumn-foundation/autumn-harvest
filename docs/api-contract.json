@@ -9171,7 +9171,7 @@
         },
         {
           "status": 403,
-          "description": "The bearer token is not 'admin'-scoped, or the authorizer hook denied the request (issue #1803)."
+          "description": "The bearer token is not 'admin'-scoped, the caller holds the read-only role, or the authorizer hook denied the request (issue #1803)."
         },
         {
           "status": 503,
@@ -9217,7 +9217,7 @@
         },
         {
           "status": 403,
-          "description": "The bearer token is not 'admin'-scoped, or the authorizer hook denied the request (issue #1803)."
+          "description": "The bearer token is not 'admin'-scoped, the caller holds the read-only role, or the authorizer hook denied the request (issue #1803)."
         },
         {
           "status": 500,

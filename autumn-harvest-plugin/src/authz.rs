@@ -24,8 +24,9 @@
 //! - `tenant_key`: the [`autumn_harvest::audit::HEADER_TENANT`] header.
 //!   The caller declares it. Harvest does not bind it to stored executions.
 //! - `shard`: from an execution id in the path, a `shard_id` query parameter,
-//!   or the `shard_id` / `residency_key` of a start body. `None` means the
-//!   request names no single shard. A list route then reads every shard.
+//!   or the `shard_id` / `residency_key` of a start body. `None` means Harvest
+//!   cannot name the shard before the handler runs. A list route reads every
+//!   shard. A by-id route or an unpinned start reaches one shard by hash.
 //!
 //! # Audit volume
 //!
@@ -185,7 +186,7 @@ where
     }
 }
 
-/// An authorizer that allows every request: today's behaviour.
+/// An authorizer that allows every request. It acts the same as no hook.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AllowAll;
 

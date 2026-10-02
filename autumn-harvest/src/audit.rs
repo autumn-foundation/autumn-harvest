@@ -2371,7 +2371,7 @@ mod tests {
     #[test]
     fn admin_scope_routes_are_classified_mutations() {
         // Issue #1803: a typo in the admin list must fail here, not open a route.
-        assert!(!ADMIN_SCOPE_ROUTES.is_empty());
+        assert_ne!(ADMIN_SCOPE_ROUTES.len(), 0);
         for route in ADMIN_SCOPE_ROUTES {
             assert!(
                 CLASSIFIED_ROUTES

@@ -2,7 +2,7 @@
   "components": {
     "securitySchemes": {
       "HarvestBearerToken": {
-        "description": "Scoped Harvest API token (issue #942). Tokens carry an `hvst_` prefix and a read or admin scope.",
+        "description": "Scoped Harvest API token (issue #942). Tokens carry an `hvst_` prefix and a `read`, `mutate` or `admin` scope.",
         "scheme": "bearer",
         "type": "http"
       },
@@ -4967,7 +4967,7 @@
             "description": "Unauthenticated request."
           },
           "403": {
-            "description": "The bearer token is not 'admin'-scoped, or the authorizer hook denied the request (issue #1803)."
+            "description": "The bearer token is not 'admin'-scoped, the caller holds the read-only role, or the authorizer hook denied the request (issue #1803)."
           },
           "500": {
             "description": "The token row could not be written. The response carries a generic message; the detail is in the audit record."
@@ -5018,7 +5018,7 @@
             "description": "Unauthenticated request."
           },
           "403": {
-            "description": "The bearer token is not 'admin'-scoped, or the authorizer hook denied the request (issue #1803)."
+            "description": "The bearer token is not 'admin'-scoped, the caller holds the read-only role, or the authorizer hook denied the request (issue #1803)."
           },
           "500": {
             "description": "The storage pool is unavailable, or the database revoke operation fails."

@@ -51,8 +51,8 @@ for the full model.
   `{"error":"forbidden by authorization policy"}`.
 
 Send a tenant key in the `x-harvest-tenant` header. With a hook installed, a
-value that is blank or longer than 128 bytes gets `400`. Without a hook,
-Harvest ignores the header.
+value that is blank, holds a non-ASCII byte, or is longer than 128 bytes gets
+`400`. Without a hook, Harvest ignores the header.
 
 | Request | Shard the hook sees |
 |---|---|
@@ -61,8 +61,12 @@ Harvest ignores the header.
 | `POST /workflows/{name}/start` with `shard_id` or `residency_key` | The pinned shard. |
 | Anything else | None. |
 
-Every deny writes an `authz.deny` audit row with status `failed`. The audit
-export ships it to the SIEM.
+`None` means Harvest cannot name the shard before the handler runs. A by-id
+route or a start with no placement still reaches one shard by hash. To confine
+a caller to some shards, deny `None` too.
+
+Every token-scope deny and every hook deny writes an `authz.deny` audit row
+with status `failed`. The audit export ships it to the SIEM.
 
 ## SSE Execution Event Stream
 

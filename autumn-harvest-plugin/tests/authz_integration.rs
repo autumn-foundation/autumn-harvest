@@ -318,7 +318,8 @@ async fn admin_token_mints_and_revokes_tokens() {
     .await;
     assert_eq!(status, StatusCode::OK, "admin revoke: {body:?}");
     assert_eq!(body["revoked"], true);
-    assert!(deny_rows(&mut conn).await.is_empty());
+    let rows = deny_rows(&mut conn).await;
+    assert_eq!(rows.len(), 0, "{rows:?}");
 }
 
 /// A `read` token denied a mutation is audited too.

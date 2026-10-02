@@ -186,8 +186,9 @@ The postures above delegate authentication entirely to the host application. As
 an alternative or complement, Harvest ships a first-class, least-privilege token
 layer for the management API: create / list / revoke scoped, optionally-expiring,
 individually-revocable API tokens, with every mutating operation attributable to
-a named actor. It is a `autumn-harvest-plugin` auth layer plus one additive
-config-table migration (`20260713000000_harvest_api_tokens`) — no new
+a named actor. It is a `autumn-harvest-plugin` auth layer plus two additive
+config-table migrations (`20260713000000_harvest_api_tokens`,
+`20261002033903_harvest_api_token_admin_scope`) — no new
 `WorkflowEvent` variant, no change to `harvest_events`, no replay-determinism
 impact. The deterministic execution core is untouched.
 
@@ -253,9 +254,9 @@ Every scope deny writes an `authz.deny` audit row. See
 
 | Route | Method | Effect |
 |---|---|---|
-| `/api/harvest/admin/tokens` | `POST` | Create a token → `201`, audited `token.create`. The plaintext secret is returned **exactly once** and never persists. |
+| `/api/harvest/admin/tokens` | `POST` | Create a token → `201`, audited `token.create`. A token caller needs `admin` scope. The plaintext secret is returned **exactly once** and never persists. |
 | `/api/harvest/admin/tokens` | `GET` | List tokens (metadata-only DTO — structurally cannot hold the hash/secret). |
-| `/api/harvest/admin/tokens/{id}` | `DELETE` | Revoke a token → audited `token.revoke`. |
+| `/api/harvest/admin/tokens/{id}` | `DELETE` | Revoke a token → audited `token.revoke`. A token caller needs `admin` scope. |
 
 Wire format: a secret is opaque `hvst_<base64url(32 random bytes)>`. Only
 `token_hash = hex(SHA256(secret))` is stored (UNIQUE-indexed).
@@ -269,8 +270,9 @@ connection and issues no HTTP request. It prints a fresh secret **once** and the
 exact `INSERT INTO harvest_api_tokens (...)` statement (embedding only the hash,
 never the secret) for the operator — who already holds DB access, the trust
 anchor — to run out-of-band. It defaults `--scope` to `admin` so the seed token
-can mint the rest through the API. Only an `admin` token can mint (issue #1803). A bootstrap-seeded token authenticates
-byte-for-byte identically to a route-minted one (shared core hashing helper).
+can mint the rest through the API. Among tokens, only an `admin` token can
+mint (issue #1803). A bootstrap-seeded token authenticates byte-for-byte
+identically to a route-minted one (shared core hashing helper).
 
 ### Rotation, expiry, and actor attribution
 
@@ -311,9 +313,10 @@ the router is byte-for-byte unchanged.
 
 ```rust
 use autumn_harvest::types::ShardId;
+use autumn_harvest_plugin::HarvestPlugin;
 use autumn_harvest_plugin::authz::{AuthzDecision, AuthzPrincipal, AuthzRequest};
 
-let plugin = HarvestPlugin::new(/* … */)
+let plugin = HarvestPlugin::new()
     .enable_api_tokens()
     .with_authorizer(|req: &AuthzRequest<'_>| match req.principal {
         AuthzPrincipal::Token { .. } if req.shard == Some(ShardId::new(2)) => {
@@ -332,14 +335,15 @@ needs I/O implements `HarvestAuthorizer` directly and returns a boxed future.
 |---|---|
 | `principal` | `Token { id, scope }` for a verified `hvst_` token. `Embedder` for every other caller; read its claims from `extensions`. |
 | `route_class` | `CLASSIFIED_ROUTES`. An unclassified path is `Mutating`. |
-| `tenant_key` | The `x-harvest-tenant` header, trimmed. At most 128 bytes, or the request gets `400`. |
+| `tenant_key` | The `x-harvest-tenant` header, trimmed. A blank value, a non-ASCII byte or more than 128 bytes gets `400`. |
 | `shard` | An execution id in the path, a `shard_id` query parameter, or the `shard_id` / `residency_key` of a `POST /workflows/{name}/start` body. |
 | `method`, `path`, `extensions` | The request. |
 
 Harvest calls the hook once for each distinct shard a request names. With no
-shard, it calls it once with `shard: None`. `None` means the request names no
-single shard, so a list route reads every shard. A by-id route
-(`/workflows/by-id/...`) also gives `None`.
+shard, it calls it once with `shard: None`. `None` means Harvest cannot name
+the shard before the handler runs. A list route then reads every shard. A by-id
+route (`/workflows/by-id/...`) and a start with no placement each reach one
+shard by hash. To confine a caller to some shards, deny `None` too.
 
 ### Rules
 
@@ -353,24 +357,28 @@ single shard, so a list route reads every shard. A by-id route
   confine a caller to its own executions, also check the target in `path`.
 - **The shard is the entry shard of an execution id.** A retired shard resolves
   to its successor. An execution moved by a shard rebalance is resolved later,
-  inside the handler.
+  inside the handler. So the hook sees the source shard of a moved run, not the
+  shard where it lives now.
 - **The hook does not cover the app-level MCP tool routes or webhook routes.**
   They live outside the management router.
 - **A panic in the hook aborts the request.** It never lets it through.
 
 ### Deny audit (issue #1803)
 
-Every deny writes one `harvest_audit_log` row on the control shard:
+Every token-scope deny and every hook deny writes one `harvest_audit_log` row
+on the control shard. The write is best effort: a failed write is logged, and
+the caller still gets `403`. A read-only-role deny and a tenant-header `400`
+write no row. The row holds these values:
 
 | Column | Value |
 |---|---|
 | `operation` | `authz.deny` |
 | `target_type` | `route` |
 | `status` | `failed`, so the SIEM export marks it `ERROR` |
-| `actor` | `token:{id}`, or the embedder actor |
+| `actor` | `token:{id}` for a token. Otherwise, the value of the actor extractor. By default, that is the `x-harvest-actor` header or `anonymous`. A caller with no credential can set it. |
 | `route_or_command` | `METHOD path`, with the path cut to 256 bytes |
 | `shard_id` | The denied shard, if any |
-| `error_summary` | The scope, or `tenant=…, shard=…` and the hook's reason |
+| `error_summary` | `token scope '<scope>' does not allow this route`, or `authorizer denied (tenant=…, shard=…): <reason>`. Cut to 512 bytes. |
 
 The [audit export](./audit-export.md) ships these rows like any other.
 

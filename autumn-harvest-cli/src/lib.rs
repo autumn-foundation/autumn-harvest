@@ -1848,7 +1848,7 @@ enum TokenCommand {
         /// Human-readable label for the caller (CI job, dashboard, on-call, SDK).
         name: String,
         /// Verb-level scope: `read` (read-only routes), `mutate` (all but token
-        /// management) or `admin` (everything). Defaults to `read`.
+        /// mint and revoke) or `admin` (everything). Defaults to `read`.
         #[arg(long, default_value = "read")]
         scope: String,
         /// Optional RFC 3339 expiry after which the token is rejected 401.

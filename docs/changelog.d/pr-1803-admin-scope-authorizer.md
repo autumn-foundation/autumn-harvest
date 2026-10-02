@@ -32,9 +32,9 @@ widens the `scope` CHECK only. No `WorkflowEvent` variant, no change to
 **Behavior change.** A `mutate` token that minted or revoked tokens now gets
 `403`. Mint an `admin` token for that caller.
 
-**Tests.** `authz_integration.rs`: `mutate` mint and revoke get `403` and are
-audited; `admin` mints and revokes; a hook denies by tenant key and by shard
-from all three sources; a hook cannot widen a scope; deny rows reach an audit
-export claim. Unit tests cover the scope decision, the admin route matcher,
+**Tests.** `authz_integration.rs` covers these cases. A `mutate` mint or
+revoke gets `403` and is audited. An `admin` token mints and revokes. A hook
+denies by tenant key, and by shard from all three sources. A hook cannot widen
+a scope. Deny rows reach an audit export claim. Unit tests cover the scope decision, the admin route matcher,
 execution-id decoding, query and body shard parsing, and the guard tests in
 `audit.rs`.
