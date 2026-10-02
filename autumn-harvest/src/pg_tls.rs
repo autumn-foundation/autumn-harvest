@@ -29,6 +29,7 @@
 use diesel::ConnectionError;
 use diesel_async::AsyncPgConnection;
 use tokio_postgres::Socket;
+use tokio_postgres::error::SqlState;
 use tokio_postgres::tls::MakeTlsConnect;
 
 /// The transport a DSN asks for.
@@ -173,7 +174,11 @@ fn prepare_transport(
 /// For `allow`, a server error on the plaintext attempt leads to one retry
 /// with TLS, as in libpq. A server that accepts TLS only, through
 /// `hostssl` in `pg_hba.conf`, rejects the plaintext attempt with such an
-/// error. A network error does not lead to a retry.
+/// error. libpq 17 retries on that error only, so these cases get no retry:
+///
+/// - a network error, or a socket that closes without an error message;
+/// - SQLSTATE `57P03`, "cannot connect now". The server is starting, and TLS
+///   does not change that.
 ///
 /// # Errors
 ///
@@ -193,7 +198,9 @@ pub async fn open(
         Err(error)
             if transport == Transport::Allow
                 && cfg!(feature = "tls")
-                && error.as_db_error().is_some() =>
+                && error
+                    .code()
+                    .is_some_and(|code| *code != SqlState::CANNOT_CONNECT_NOW) =>
         {
             config.ssl_mode(tokio_postgres::config::SslMode::Require);
             let tls = connector(transport).map_err(OpenError::Prepare)?;
@@ -533,6 +540,8 @@ fn parse_keywords(dsn: &str) -> Option<Vec<(String, String)>> {
 mod tests {
     use super::{PgTlsError, Transport, prepare, tokio_postgres_dsn, transport};
     use tokio_postgres::config::SslMode;
+    #[cfg(feature = "tls")]
+    use tokio_postgres::error::SqlState;
 
     #[test]
     fn sslmode_selects_the_transport() {
@@ -671,31 +680,37 @@ mod tests {
         assert_eq!(plain[4..], [0, 3, 0, 0], "disable sends a startup message");
     }
 
-    /// A server with only `hostssl` lines in `pg_hba.conf` rejects plaintext
-    /// with an error. For `allow`, libpq then retries with TLS, so [`super::open`]
-    /// must too.
+    /// A startup `ErrorResponse` with SQLSTATE `code`.
     #[cfg(feature = "tls")]
-    #[tokio::test]
-    async fn allow_retries_with_tls_when_the_server_rejects_plaintext() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        const SSL_REQUEST: [u8; 8] = [0, 0, 0, 8, 4, 210, 22, 47];
+    fn rejection(code: &str) -> Vec<u8> {
         let mut body = Vec::new();
-        for (code, value) in [
+        for (field, value) in [
             (b'S', "FATAL"),
             (b'V', "FATAL"),
-            (b'C', "28000"),
-            (b'M', "no pg_hba.conf entry, no encryption"),
+            (b'C', code),
+            (b'M', "rejected by the fake server"),
         ] {
-            body.push(code);
+            body.push(field);
             body.extend_from_slice(value.as_bytes());
             body.push(0);
         }
         body.push(0);
-        let mut rejection = vec![b'E'];
+        let mut message = vec![b'E'];
         let length = u32::try_from(body.len() + 4).expect("a short message");
-        rejection.extend_from_slice(&length.to_be_bytes());
-        rejection.extend(body);
+        message.extend_from_slice(&length.to_be_bytes());
+        message.extend(body);
+        message
+    }
+
+    /// A fake server that answers the first startup message with
+    /// `rejection`. It returns the first header, and the header of a second
+    /// connection if one comes within `wait`.
+    #[cfg(feature = "tls")]
+    async fn reject_plaintext(
+        rejection: Vec<u8>,
+        wait: std::time::Duration,
+    ) -> (u16, tokio::task::JoinHandle<([u8; 8], Option<[u8; 8]>)>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let server = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -710,20 +725,55 @@ mod tests {
             first.read_exact(&mut rest).await.expect("startup body");
             first.write_all(&rejection).await.expect("reject");
             drop(first);
-            let (mut second, _) = server.accept().await.expect("accept the retry");
-            let mut retry = [0_u8; 8];
-            second.read_exact(&mut retry).await.expect("retry header");
+            let retry = tokio::time::timeout(wait, async {
+                let (mut second, _) = server.accept().await.expect("accept the retry");
+                let mut retry = [0_u8; 8];
+                second.read_exact(&mut retry).await.expect("retry header");
+                retry
+            })
+            .await
+            .ok();
             (startup, retry)
         });
+        (port, fake)
+    }
+
+    /// A server with only `hostssl` lines in `pg_hba.conf` rejects plaintext
+    /// with an error. For `allow`, libpq then retries with TLS, so
+    /// [`super::open`] must too.
+    #[cfg(feature = "tls")]
+    #[tokio::test]
+    async fn allow_retries_with_tls_when_the_server_rejects_plaintext() {
+        const SSL_REQUEST: [u8; 8] = [0, 0, 0, 8, 4, 210, 22, 47];
+        let wait = std::time::Duration::from_secs(10);
+        let (port, fake) = reject_plaintext(rejection("28000"), wait).await;
         let dsn = format!("postgres://u@127.0.0.1:{port}/db?sslmode=allow");
         let client = tokio::spawn(async move { super::open(&dsn).await.map(|_| ()) });
-        let (startup, retry) = tokio::time::timeout(std::time::Duration::from_secs(10), fake)
-            .await
-            .expect("the client retries")
-            .expect("fake server task");
+        let (startup, retry) = fake.await.expect("fake server task");
         client.abort();
         assert_eq!(startup[4..], [0, 3, 0, 0], "allow starts in plaintext");
-        assert_eq!(retry, SSL_REQUEST, "the retry asks for TLS");
+        assert_eq!(retry, Some(SSL_REQUEST), "the retry asks for TLS");
+    }
+
+    /// libpq does not retry `57P03`, "cannot connect now", with TLS. The
+    /// server is starting, and TLS does not change that.
+    #[cfg(feature = "tls")]
+    #[tokio::test]
+    async fn allow_does_not_retry_when_the_server_cannot_accept_connections_yet() {
+        let wait = std::time::Duration::from_secs(2);
+        let (port, fake) = reject_plaintext(rejection("57P03"), wait).await;
+        let dsn = format!("postgres://u@127.0.0.1:{port}/db?sslmode=allow");
+        let result = tokio::time::timeout(wait, super::open(&dsn))
+            .await
+            .expect("open returns without a retry");
+        let (_, retry) = fake.await.expect("fake server task");
+        assert_eq!(retry, None, "no second connection");
+        match result {
+            Err(super::OpenError::Connect(error)) => {
+                assert_eq!(error.code(), Some(&SqlState::CANNOT_CONNECT_NOW));
+            }
+            other => panic!("expected the 57P03 error, got {:?}", other.map(|_| ())),
+        }
     }
 
     /// `disable` and `prefer` never read the trust store, so a host without
