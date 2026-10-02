@@ -186,7 +186,7 @@ async fn seed_workflows(database_url: &str, workflow_name: &str, count: usize) -
                 workflow_name,
                 workflow_id: &format!("wf-{index}"),
                 exec_id,
-                input: json!({"i": index}),
+                input: json!({"i": index}).into(),
                 parent_id: None,
                 queue_name: "default",
                 execution_timeout: None,

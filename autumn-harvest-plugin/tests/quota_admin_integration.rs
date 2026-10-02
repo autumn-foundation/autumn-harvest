@@ -333,7 +333,7 @@ async fn insert_running_execution(
         workflow_id: &workflow_id,
         run_id: uuid::Uuid::new_v4(),
         shard_id: shard,
-        input: json!({ "tenant_id": quota_key }),
+        input: json!({ "tenant_id": quota_key }).into(),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,

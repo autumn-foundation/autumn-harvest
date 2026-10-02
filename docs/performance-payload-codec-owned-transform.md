@@ -45,7 +45,8 @@ Callgrind's flat, self-cost profile does not attribute cost to
 `encode_payload`/`decode_payload` directly — both are small enough that
 LLVM inlines their callers' cost into generic `serde_json`/`BTreeMap`
 symbols shared with the (unrelated, unavoidable) `serde_json::to_value`/
-`from_value` conversion `encode_event`/`decode_event` also do. dhat's
+`from_value` conversion `encode_event`/`decode_event` also do
+(issue #1721 later removed the `Content` buffering from `decode_event`). dhat's
 per-call-stack allocation attribution does not have that problem: every
 allocation site in `docs/perf-artifacts/payload-codec-owned-transform/before-dhat.json`
 carries its full call stack, so summing every program point whose stack

@@ -528,6 +528,28 @@ pub async fn enforce_token_scope(
     next.run(request).await
 }
 
+/// Require a Harvest bearer on every route that is not explicitly public.
+///
+/// This is the fail-closed outer half of standalone token authentication.
+/// [`enforce_token_scope`] intentionally permits missing and non-Harvest
+/// credentials so it can compose with an embedder's authentication boundary;
+/// a standalone mount has no such boundary. Claimed Harvest credentials are
+/// verified by the inner scope layer rather than duplicated here.
+pub(crate) async fn require_token_for_non_public(request: Request, next: Next) -> Response {
+    if *request.method() == Method::OPTIONS
+        || classify_route(request.method(), request.uri().path())
+            == autumn_harvest::audit::RouteClass::PublicSafe
+    {
+        return next.run(request).await;
+    }
+
+    if harvest_bearer(request.headers()).is_none() {
+        return unauthorized("harvest api token required");
+    }
+
+    next.run(request).await
+}
+
 /// The class gate for a **known-mutating** generated MCP tool route under token
 /// auth (issue #942, mirrors [`crate::api::enforce_read_only_mcp_mutation`]).
 ///
