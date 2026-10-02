@@ -146,6 +146,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          slot_tuner_tests
 linux        autumn-harvest         integration                      -                          start_idempotency_tests
 linux        autumn-harvest         integration                      -                          start_source_tests
+linux        autumn-harvest         integration                      -                          sticky_default_tests
 linux        autumn-harvest         integration                      -                          terminal_write_ownership_tests
 linux        autumn-harvest         integration                      -                          throttle_bucket_prelock_batch_perf
 linux        autumn-harvest         integration                      -                          transactional_start_tests

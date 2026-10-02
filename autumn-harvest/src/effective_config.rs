@@ -912,6 +912,16 @@ mod tests {
     }
 
     #[test]
+    fn default_view_reports_sticky_routing_on_with_a_5s_fallback() {
+        let view = WorkerConfigView::from_worker_config(
+            &WorkerConfig::default(),
+            Duration::from_millis(500),
+        );
+        assert!(view.sticky_routing_enabled);
+        assert_eq!(view.sticky_timeout_ms, 5_000);
+    }
+
+    #[test]
     fn derived_bools_track_their_source_tunable() {
         // Off: zero sticky timeout, zero poison-pill threshold, no tuner.
         let off = WorkerConfig {
