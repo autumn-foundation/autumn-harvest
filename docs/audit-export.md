@@ -23,14 +23,20 @@ per-shard cursor that advances only on acknowledgement.
   a migration always created it. It matched every row while `export_seq` stayed
   `NULL`, so each audit insert paid its maintenance cost (issue #1272). The
   exporter now builds the index on its first tick, with `CREATE INDEX
-  CONCURRENTLY`, so audit inserts continue during the build. A migration drops
-  the index from databases that never ran export. Databases with a cursor row
-  keep it. A pool under four connections, or a role that does not own the
-  table, cannot build it. The exporter then logs the statement. Run it once as
-  the table owner. Export is correct without the index, only slower. Once
-  export runs, the index size is bounded only while retention
-  reclaims unexported rows. See "Retention interaction" below. Retention can never purge a decommission or reactivation
-  record, exported or not.
+  CONCURRENTLY`, so audit inserts continue during the build. The build runs on
+  a dedicated connection opened from the shard's notification database URL,
+  never on a pooled one, so a pool of any size exports during the build. A
+  migration drops the index from databases that never ran export. Databases
+  with a cursor row keep it. Two cases cannot build: a worker with no
+  notification URL for the shard, and a worker role that does not own
+  `harvest_audit_log` (`CREATE INDEX` needs ownership; no `GRANT` confers
+  it). The exporter then logs the statement and, for a refused build, backs
+  off for an hour. Run the statement once as the table owner, or run `ALTER
+  TABLE harvest_audit_log OWNER TO <worker role>`. Export is correct without
+  the index, only slower. Once export runs, the index size is bounded only
+  while retention reclaims unexported rows. See "Retention interaction"
+  below. Retention can never purge a decommission or reactivation record,
+  exported or not.
 - **It never touches workflow history.** No new `WorkflowEvent` variant, no
   replay-determinism impact. Audit rows are operational metadata; the exporter
   only reads them.

@@ -1103,37 +1103,59 @@ pub async fn ensure_cursor_row(
 
 /// The statement that builds the claim-scan index.
 ///
-/// The exporter runs it on a large enough pool. An operator can run it as the
-/// table owner when the runtime role cannot, or the pool is too small.
+/// The exporter runs it on a dedicated connection. An operator runs it once,
+/// as the table owner, when the worker role cannot.
 pub const UNEXPORTED_INDEX_DDL: &str = "CREATE INDEX CONCURRENTLY IF NOT EXISTS \
      harvest_audit_log_unexported_idx ON harvest_audit_log (occurred_at, id) \
      WHERE export_seq IS NULL";
 
+/// The statement that lets the worker role build the index itself.
+///
+/// `CREATE INDEX` needs table ownership. No `GRANT` confers it.
+pub const UNEXPORTED_INDEX_OWNER_DDL: &str = "ALTER TABLE harvest_audit_log OWNER TO <worker role>";
+
 /// Advisory-lock key that serializes builds of the claim-scan index.
 pub const UNEXPORTED_INDEX_LOCK_KEY: i64 = 0x6175_6469_745f_6978;
+
+/// What [`ensure_unexported_index`] found or did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnexportedIndexOutcome {
+    /// The index exists and `pg_index.indisvalid` is true.
+    Ready,
+    /// Another session holds [`UNEXPORTED_INDEX_LOCK_KEY`]. Nothing was built.
+    /// The caller must try again later.
+    LockBusy,
+}
 
 /// Build the claim-scan index if it is missing or invalid (issue #1667).
 ///
 /// The index `harvest_audit_log_unexported_idx` matches every audit row while
 /// no sink is configured. It would add cost to each insert and serve no read.
-/// So no migration creates it. The exporter builds it here, before its first
-/// claim.
+/// So no migration creates it. The exporter builds it here, off the export
+/// tick.
 ///
 /// The build uses `CREATE INDEX CONCURRENTLY`, so audit inserts continue. A
 /// failed concurrent build leaves an invalid index. This function drops and
 /// rebuilds such an index. A session advisory lock keeps two exporters from
-/// dropping each other's build. A caller that loses the race returns at once.
-/// The claim scan is correct without the index, only slower.
+/// dropping each other's build. A caller that loses the race gets
+/// [`UnexportedIndexOutcome::LockBusy`] at once. The claim scan is correct
+/// without the index, only slower.
 ///
-/// The connection must not be inside a transaction. On `Err` the caller must
-/// drop the connection: the advisory lock may still be held.
+/// `conn` must be a dedicated connection, outside a transaction. The build can
+/// hold it for minutes, so a pooled connection would starve the pool. On `Err`
+/// the caller must drop the connection: the advisory lock may still be held,
+/// and `statement_timeout` may still be off.
+///
+/// [`UnexportedIndexOutcome::Ready`] is returned only after a fresh read of
+/// `pg_index.indisvalid` confirms the index.
 ///
 /// # Errors
-/// Returns `HarvestError` on a database failure.
+/// Returns `HarvestError` on a database failure. A role that does not own the
+/// table gets a privilege error; see [`index_build_needs_owner`].
 #[cfg(feature = "db")]
 pub async fn ensure_unexported_index(
     conn: &mut diesel_async::AsyncPgConnection,
-) -> crate::error::HarvestResult<()> {
+) -> crate::error::HarvestResult<UnexportedIndexOutcome> {
     use diesel_async::RunQueryDsl;
 
     #[derive(diesel::QueryableByName)]
@@ -1143,7 +1165,7 @@ pub async fn ensure_unexported_index(
     }
 
     if unexported_index_valid(conn).await? == Some(true) {
-        return Ok(());
+        return Ok(UnexportedIndexOutcome::Ready);
     }
     let locked: Vec<Flag> = diesel::sql_query("SELECT pg_try_advisory_lock($1) AS flag")
         .bind::<diesel::sql_types::BigInt, _>(UNEXPORTED_INDEX_LOCK_KEY)
@@ -1151,18 +1173,44 @@ pub async fn ensure_unexported_index(
         .await
         .map_err(crate::error::database_error)?;
     if !locked.into_iter().next().is_some_and(|row| row.flag) {
-        return Ok(());
+        return Ok(UnexportedIndexOutcome::LockBusy);
     }
     let built = build_unexported_index(conn).await;
-    // The lock belongs to the session, and the pool reuses the session.
-    // A failed unlock leaves the lock on a live session. The caller must drop
-    // the connection, so this error takes precedence over the build result.
+    // The lock belongs to the session. A failed unlock leaves the lock on a
+    // live session, so this error takes precedence over the build result.
     diesel::sql_query("SELECT pg_advisory_unlock($1)")
         .bind::<diesel::sql_types::BigInt, _>(UNEXPORTED_INDEX_LOCK_KEY)
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
-    built
+    built?;
+    // `CREATE INDEX CONCURRENTLY` can return without an error and still leave
+    // an invalid index. Only the catalog proves the build.
+    match unexported_index_valid(conn).await? {
+        Some(true) => Ok(UnexportedIndexOutcome::Ready),
+        state => Err(crate::error::HarvestError::Database(format!(
+            "harvest_audit_log_unexported_idx is not valid after the build: {state:?}"
+        ))),
+    }
+}
+
+/// Whether an [`ensure_unexported_index`] error means the role cannot build.
+///
+/// `CREATE INDEX` on `harvest_audit_log` needs table ownership. A worker role
+/// with DML rights only gets SQLSTATE `42501`. A retry cannot fix that. The
+/// caller logs the statements an operator must run and waits
+/// [`INDEX_BUILD_REFUSED_RETRY`].
+#[cfg(feature = "db")]
+#[must_use]
+pub fn index_build_needs_owner(error: &crate::error::HarvestError) -> bool {
+    match error {
+        crate::error::HarvestError::Database(message) => {
+            message.contains("42501")
+                || message.contains("must be owner")
+                || message.contains("permission denied")
+        }
+        _ => false,
+    }
 }
 
 /// `None` when the index is missing, else whether it is valid.
@@ -1213,8 +1261,9 @@ async fn build_unexported_index(
         None => {}
     }
     tracing::info!("[audit_export] building harvest_audit_log_unexported_idx (issue #1667)");
-    // A pool or role timeout shorter than the build would fail it on every try.
-    // Restore the exact value afterwards: the pool reuses this session.
+    // A role or database timeout shorter than the build would fail it on every
+    // try. Capture the session value first and restore that exact value after
+    // the build. `RESET` would restore the role or database default instead.
     let previous: Vec<Setting> =
         diesel::sql_query("SELECT current_setting('statement_timeout') AS value")
             .load(conn)
@@ -1232,25 +1281,20 @@ async fn build_unexported_index(
         .execute(conn)
         .await
         .map_err(crate::error::database_error);
-    let reset = diesel::sql_query("SELECT set_config('statement_timeout', $1, false)")
+    let restored = diesel::sql_query("SELECT set_config('statement_timeout', $1, false)")
         .bind::<diesel::sql_types::Text, _>(previous)
         .execute(conn)
         .await
         .map_err(crate::error::database_error);
     built?;
-    reset?;
+    restored?;
     Ok(())
 }
 
-/// A shard in one pool. The pool identity separates databases that share a
-/// shard number.
+/// A shard in one database. The URL separates databases that share a shard
+/// number inside one process.
 #[cfg(feature = "db")]
-type BuildKey = (i32, usize);
-
-#[cfg(feature = "db")]
-fn build_key(pool: &crate::worker::DbPool, shard_id: i32) -> BuildKey {
-    (shard_id, std::ptr::from_ref(pool.manager()) as usize)
-}
+type BuildKey = (i32, String);
 
 /// Earliest time each shard may try another background index build.
 #[cfg(feature = "db")]
@@ -1258,26 +1302,26 @@ static INDEX_BUILD_GATE: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<BuildKey, std::time::Instant>>,
 > = std::sync::LazyLock::new(Default::default);
 
-/// Wait between repeats of the "pool too small" notice.
+/// Wait between repeats of an operator notice about the index.
 #[cfg(feature = "db")]
-const INDEX_BUILD_NOTICE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+const INDEX_NOTICE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
 
-/// When each shard last logged the "pool too small" notice.
+/// When each shard last logged an operator notice about the index.
 #[cfg(feature = "db")]
-static POOL_NOTICE_GATE: std::sync::LazyLock<
+static INDEX_NOTICE_GATE: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<i32, std::time::Instant>>,
 > = std::sync::LazyLock::new(Default::default);
 
-/// Whether this shard may log the "pool too small" notice now.
+/// Whether this shard may log an operator notice about the index now.
 #[cfg(feature = "db")]
-fn pool_notice_due(shard_id: i32) -> bool {
-    let mut gate = POOL_NOTICE_GATE
+fn index_notice_due(shard_id: i32) -> bool {
+    let mut gate = INDEX_NOTICE_GATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let now = std::time::Instant::now();
     if gate
         .get(&shard_id)
-        .is_some_and(|last| now.duration_since(*last) < INDEX_BUILD_NOTICE_INTERVAL)
+        .is_some_and(|last| now.duration_since(*last) < INDEX_NOTICE_INTERVAL)
     {
         return false;
     }
@@ -1285,149 +1329,225 @@ fn pool_notice_due(shard_id: i32) -> bool {
     true
 }
 
-/// Wait after a failed background build before the next attempt.
+/// Wait after a failed or skipped background build before the next attempt.
 #[cfg(feature = "db")]
 const INDEX_BUILD_RETRY: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// Wait after a build the role may not run. Only an operator can fix it.
+#[cfg(feature = "db")]
+pub const INDEX_BUILD_REFUSED_RETRY: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// How a background build ended, and so when the shard may try again.
+#[cfg(feature = "db")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuildEnd {
+    /// The catalog confirmed a valid index. The gate opens at once.
+    Ready,
+    /// A failure, a lost lock race, or a shutdown. Wait [`INDEX_BUILD_RETRY`].
+    Retry,
+    /// The role cannot build. Wait [`INDEX_BUILD_REFUSED_RETRY`].
+    Refused,
+}
+
 /// Claim the right to start a build for this shard. Marks it in flight.
 #[cfg(feature = "db")]
-fn index_build_due(key: BuildKey) -> bool {
+fn index_build_due(key: &BuildKey) -> bool {
     let mut gate = INDEX_BUILD_GATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let now = std::time::Instant::now();
-    if gate.get(&key).is_some_and(|not_before| now < *not_before) {
+    if gate.get(key).is_some_and(|not_before| now < *not_before) {
         return false;
     }
     // A build can outlive the retry wait. The advisory lock then skips the
-    // duplicate.
-    gate.insert(key, now + INDEX_BUILD_RETRY);
+    // duplicate, and that duplicate keeps the gate closed.
+    gate.insert(key.clone(), now + INDEX_BUILD_RETRY);
     true
 }
 
+/// Record how a build ended. Only [`BuildEnd::Ready`] opens the gate.
 #[cfg(feature = "db")]
-fn index_build_finished(key: BuildKey, succeeded: bool) {
+fn index_build_finished(key: &BuildKey, end: BuildEnd) {
     let mut gate = INDEX_BUILD_GATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if succeeded {
-        gate.remove(&key);
+    let now = std::time::Instant::now();
+    match end {
+        BuildEnd::Ready => {
+            gate.remove(key);
+        }
+        BuildEnd::Retry => {
+            gate.insert(key.clone(), now + INDEX_BUILD_RETRY);
+        }
+        BuildEnd::Refused => {
+            gate.insert(key.clone(), now + INDEX_BUILD_REFUSED_RETRY);
+        }
     }
 }
 
-/// Smallest pool that can lend a connection to a long build.
+/// Open a dedicated connection to `dsn` and run [`ensure_unexported_index`].
 ///
-/// A smaller pool would starve the export or other workers for the whole
-/// build.
+/// The connection is never pooled. It closes when this function returns, or
+/// when the caller drops the future. Postgres then cancels a running build and
+/// leaves an invalid index, which the next attempt drops and rebuilds.
 #[cfg(feature = "db")]
-const MIN_POOL_FOR_BACKGROUND_BUILD: usize = 4;
+async fn build_unexported_index_on_dedicated_connection(
+    dsn: &str,
+) -> crate::error::HarvestResult<UnexportedIndexOutcome> {
+    use diesel_async::AsyncConnection;
+
+    let mut conn = diesel_async::AsyncPgConnection::establish(dsn)
+        .await
+        .map_err(crate::error::database_error)?;
+    let outcome = ensure_unexported_index(&mut conn).await;
+    // On `Err` the session may still hold the advisory lock. Closing the
+    // connection releases it either way.
+    drop(conn);
+    outcome
+}
 
 /// Start the index build in a detached task, off the export tick (issue #1667).
 ///
 /// The build can take minutes on a large table. It must not delay a claim,
-/// the lag gauge or the lease. The task uses its own pooled connection. A
-/// failure drops that connection and waits [`INDEX_BUILD_RETRY`]. Export is
-/// correct without the index, only slower.
+/// the lag gauge or the lease. It must not hold a pooled connection either: a
+/// shard pool may have one connection, and that connection serves the export.
+/// So the task opens its own connection to `build_dsn`, the database URL of
+/// this shard, and closes it when the build ends. A pool of any size exports
+/// while the build runs.
 ///
-/// A pool under [`MIN_POOL_FOR_BACKGROUND_BUILD`] connections never builds. The
-/// build would starve every other session of a connection. The exporter logs
-/// [`UNEXPORTED_INDEX_DDL`] for an operator instead.
+/// `conn` is the tick's own connection. It serves one catalog read here and
+/// nothing longer.
+///
+/// With no `build_dsn` the exporter cannot build. It logs
+/// [`UNEXPORTED_INDEX_DDL`] for an operator once per
+/// [`INDEX_NOTICE_INTERVAL`]. Export is correct without the index, only
+/// slower.
+///
+/// The gate for this shard opens only after the catalog confirms a valid
+/// index. A lost lock race, a failure or a shutdown keeps it closed for
+/// [`INDEX_BUILD_RETRY`]. A role that cannot build keeps it closed for
+/// [`INDEX_BUILD_REFUSED_RETRY`], after one `error!` line that names the
+/// statements an operator must run.
+///
+/// `cancel` stops a running build. Dropping the build future closes its
+/// connection, and Postgres cancels the statement.
 #[cfg(feature = "db")]
 async fn spawn_unexported_index_build_if_due(
-    pool: &crate::worker::DbPool,
     conn: &mut diesel_async::AsyncPgConnection,
     shard_id: i32,
+    build_dsn: Option<&str>,
+    cancel: &tokio_util::sync::CancellationToken,
 ) {
-    if pool.status().max_size < MIN_POOL_FOR_BACKGROUND_BUILD {
-        if pool_notice_due(shard_id)
+    let Some(dsn) = build_dsn else {
+        if index_notice_due(shard_id)
             && !matches!(unexported_index_valid(conn).await, Ok(Some(true)))
         {
             tracing::warn!(
                 shard = shard_id,
                 statement = UNEXPORTED_INDEX_DDL,
-                "[audit_export] the pool is too small to build the claim-scan index; \
-                 export continues without it. Run the statement as the table owner"
+                "[audit_export] no database URL for a dedicated connection, so the exporter \
+                 cannot build the claim-scan index; export continues without it. Set \
+                 WorkerConfig::with_notification_database_url or \
+                 with_shard_notification_database_urls, or run the statement once as the \
+                 table owner"
             );
         }
         return;
-    }
-    let key = build_key(pool, shard_id);
-    if !index_build_due(key) {
+    };
+    let key: BuildKey = (shard_id, dsn.to_owned());
+    if !index_build_due(&key) {
         return;
     }
     match unexported_index_valid(conn).await {
         Ok(Some(true)) => {
-            index_build_finished(key, true);
+            index_build_finished(&key, BuildEnd::Ready);
             return;
         }
         Ok(_) => {}
         Err(error) => {
-            index_build_finished(key, false);
+            index_build_finished(&key, BuildEnd::Retry);
             tracing::warn!(shard = shard_id, %error, "[audit_export] could not inspect the claim-scan index");
             return;
         }
     }
-    let pool = pool.clone();
+    let dsn = dsn.to_owned();
+    let cancel = cancel.clone();
     tokio::spawn(async move {
-        let Ok(mut build_conn) = pool.get().await else {
-            index_build_finished(key, false);
-            return;
-        };
-        match ensure_unexported_index(&mut build_conn).await {
-            // A skipped build also returns `Ok`: another session holds the lock.
-            // Only a valid index clears the retry gate.
-            Ok(()) => {
-                let valid = matches!(
-                    unexported_index_valid(&mut build_conn).await,
-                    Ok(Some(true))
-                );
-                index_build_finished(key, valid);
-            }
-            Err(error) => {
-                tracing::warn!(
+        let end = tokio::select! {
+            result = build_unexported_index_on_dedicated_connection(&dsn) => match result {
+                Ok(UnexportedIndexOutcome::Ready) => BuildEnd::Ready,
+                Ok(UnexportedIndexOutcome::LockBusy) => {
+                    tracing::debug!(
+                        shard = shard_id,
+                        "[audit_export] another session is building the claim-scan index"
+                    );
+                    BuildEnd::Retry
+                }
+                Err(error) if index_build_needs_owner(&error) => {
+                    tracing::error!(
+                        shard = shard_id,
+                        %error,
+                        statement = UNEXPORTED_INDEX_DDL,
+                        ownership = UNEXPORTED_INDEX_OWNER_DDL,
+                        retry_in_secs = INDEX_BUILD_REFUSED_RETRY.as_secs(),
+                        "[audit_export] the worker role cannot build the claim-scan index; \
+                         export continues without it. Run `statement` once as the table \
+                         owner, or run `ownership` so the worker can build it"
+                    );
+                    BuildEnd::Refused
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        shard = shard_id,
+                        %error,
+                        statement = UNEXPORTED_INDEX_DDL,
+                        "[audit_export] could not build the claim-scan index; export continues \
+                         without it. The next attempt follows after the retry wait"
+                    );
+                    BuildEnd::Retry
+                }
+            },
+            () = cancel.cancelled() => {
+                tracing::info!(
                     shard = shard_id,
-                    %error,
-                    statement = UNEXPORTED_INDEX_DDL,
-                    "[audit_export] could not build the claim-scan index; export continues \
-                     without it. The role may lack ownership: run the statement as the table owner"
+                    "[audit_export] shutdown requested during the claim-scan index build; \
+                     closing its connection"
                 );
-                index_build_finished(key, false);
-                drop(deadpool::managed::Object::take(build_conn));
+                BuildEnd::Retry
             }
-        }
+        };
+        index_build_finished(&key, end);
     });
 }
 
-/// Run [`ensure_unexported_index`] without failing the tick on a build error.
+/// Tell an operator once per [`INDEX_NOTICE_INTERVAL`] that the index is
+/// missing (issue #1667).
 ///
-/// A failed build leaves export correct but slower. The next tick retries.
-/// After an error the session state is unknown: a cleanup statement may have
-/// failed. A probe query checks the connection. If the probe fails, this
-/// function returns the error so the caller discards the connection.
-///
-/// # Errors
-/// Returns `HarvestError` when the connection no longer works.
+/// [`fire_due_audit_exports`] runs on a connection its caller owns. It never
+/// builds the index there. The build would hold that connection for minutes,
+/// and an error could leave the session with the advisory lock held. The
+/// dedicated export task builds the index on its own connection. An embedder
+/// that drives this primitive by hand runs [`ensure_unexported_index`] on a
+/// dedicated connection, or runs [`UNEXPORTED_INDEX_DDL`] as the table owner.
 #[cfg(feature = "db")]
-async fn ensure_unexported_index_best_effort(
+async fn notice_missing_unexported_index(
     conn: &mut diesel_async::AsyncPgConnection,
     shard_id: i32,
-) -> crate::error::HarvestResult<()> {
-    use diesel_async::RunQueryDsl;
-
-    if let Err(error) = ensure_unexported_index(conn).await {
-        tracing::warn!(
-            shard = shard_id,
-            %error,
-            statement = UNEXPORTED_INDEX_DDL,
-            "[audit_export] could not build the claim-scan index; export continues \
-             without it. The role may lack ownership: run the statement as the table owner"
-        );
-        diesel::sql_query("SELECT 1")
-            .execute(conn)
-            .await
-            .map_err(crate::error::database_error)?;
+) {
+    if !index_notice_due(shard_id) {
+        return;
     }
-    Ok(())
+    if matches!(unexported_index_valid(conn).await, Ok(Some(true))) {
+        return;
+    }
+    tracing::warn!(
+        shard = shard_id,
+        statement = UNEXPORTED_INDEX_DDL,
+        "[audit_export] the claim-scan index is missing; fire_due_audit_exports never builds \
+         it on its caller's connection. Use the dedicated export task, run \
+         ensure_unexported_index on a dedicated connection, or run the statement once as \
+         the table owner"
+    );
 }
 
 /// Result of resolving a decommission or reactivate request against the live
@@ -2634,7 +2754,7 @@ async fn export_once_on_conn(
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> crate::error::HarvestResult<usize> {
     let config = config_arc.as_ref();
-    ensure_unexported_index_best_effort(conn, shard_id).await?;
+    notice_missing_unexported_index(conn, shard_id).await;
     ensure_cursor_row(conn, shard_id).await?;
 
     let now = Utc::now();
@@ -3119,6 +3239,7 @@ async fn export_once_via_pool(
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
     cancel: &tokio_util::sync::CancellationToken,
     config_arc: Option<std::sync::Arc<AuditExportRuntimeConfig>>,
+    index_build_dsn: Option<&str>,
 ) -> crate::error::HarvestResult<usize> {
     let shard_u16 = u16::try_from(shard_id).unwrap_or(u16::MAX);
     let Some(config_arc) = config_arc else {
@@ -3134,7 +3255,7 @@ async fn export_once_via_pool(
     else {
         return Ok(0);
     };
-    spawn_unexported_index_build_if_due(pool, &mut conn, shard_id).await;
+    spawn_unexported_index_build_if_due(&mut conn, shard_id, index_build_dsn, cancel).await;
     // Raced against `cancel` (Codex review on PR #1520, follow-up P2, fifth
     // round). `claim_shard`'s locked read can wait indefinitely behind
     // another session holding the cursor row. A bare await here would then
@@ -3482,6 +3603,13 @@ async fn export_once_via_pool(
 /// resolves the shard actually stamped on exported records when `shard` is
 /// `None` (the unsharded fallback). This is the same rule
 /// [`fire_due_audit_exports`] applies in its own unsharded arm.
+///
+/// `index_build_dsn` is the database URL of this shard (issue #1667). The
+/// task opens one dedicated connection to it for the claim-scan index build,
+/// so no pooled connection is held for the build. The worker passes the
+/// shard's notification URL, which reaches the same database. With `None`
+/// the task never builds the index and logs [`UNEXPORTED_INDEX_DDL`] for an
+/// operator instead. See [`ensure_unexported_index`].
 /// The worst-case wall-clock span of one audit-export checker tick.
 ///
 /// See [`spawn_audit_export_checker_for_shard`]'s doc comment for why the
@@ -3508,6 +3636,7 @@ pub fn spawn_audit_export_checker_for_shard(
     telemetry: std::sync::Arc<crate::telemetry::TelemetryConfig>,
     shard: Option<crate::types::ShardId>,
     sharded_pool: Option<&crate::shard::ShardedDbPool>,
+    index_build_dsn: Option<String>,
 ) -> tokio::task::JoinHandle<()> {
     // See this function's doc comment: the registered threshold must cover
     // the worst legitimate tick, not just the poll cadence.
@@ -3567,6 +3696,7 @@ pub fn spawn_audit_export_checker_for_shard(
                 &*telemetry.metrics,
                 &cancel,
                 config_snapshot,
+                index_build_dsn.as_deref(),
             )
             .await
             {
@@ -4538,5 +4668,61 @@ mod tests {
         assert_eq!(disabled_tick_shards(Some(0), &assigned), vec![4, 7]);
         assert_eq!(disabled_tick_shards(Some(2), &[]), vec![2]);
         assert_eq!(disabled_tick_shards(None, &assigned), vec![0]);
+    }
+
+    /// Issue #1667: only a confirmed valid index opens the build gate. A lost
+    /// lock race keeps the retry wait. A refused build waits far longer.
+    #[cfg(feature = "db")]
+    #[test]
+    fn the_index_build_gate_opens_only_on_a_ready_index() {
+        let key: BuildKey = (9_001, "postgres://gate-test/lock-busy".to_owned());
+        assert!(index_build_due(&key), "a fresh key is due");
+        assert!(!index_build_due(&key), "an in-flight build is not due");
+
+        index_build_finished(&key, BuildEnd::Retry);
+        assert!(
+            !index_build_due(&key),
+            "a lost lock race keeps the gate closed"
+        );
+
+        index_build_finished(&key, BuildEnd::Ready);
+        assert!(index_build_due(&key), "a valid index opens the gate");
+
+        index_build_finished(&key, BuildEnd::Refused);
+        let not_before = INDEX_BUILD_GATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            .copied()
+            .expect("a refused build leaves a gate entry");
+        let remaining = not_before.saturating_duration_since(std::time::Instant::now());
+        assert!(
+            remaining > INDEX_BUILD_RETRY,
+            "a refused build waits longer than an ordinary retry: {remaining:?}"
+        );
+        index_build_finished(&key, BuildEnd::Ready);
+    }
+
+    /// Issue #1667: a privilege failure is the one error a retry cannot fix.
+    #[cfg(feature = "db")]
+    #[test]
+    fn a_privilege_error_needs_an_owner() {
+        use crate::error::HarvestError;
+        for message in [
+            "must be owner of table harvest_audit_log",
+            "permission denied for table harvest_audit_log",
+            "SQLSTATE 42501",
+        ] {
+            assert!(
+                index_build_needs_owner(&HarvestError::Database(message.to_owned())),
+                "{message}"
+            );
+        }
+        assert!(!index_build_needs_owner(&HarvestError::Database(
+            "canceling statement due to statement timeout".to_owned()
+        )));
+        assert!(!index_build_needs_owner(&HarvestError::Config(
+            "must be owner".to_owned()
+        )));
     }
 }

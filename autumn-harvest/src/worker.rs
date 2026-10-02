@@ -26261,6 +26261,28 @@ fn multi_shard_listener_url(
         .map(|(_, url)| url.as_str())
 }
 
+/// The database URL the audit exporter uses for its claim-scan index build
+/// (issue #1667).
+///
+/// The build runs on a dedicated connection, never a pooled one. The engine
+/// holds no DSN for a pool, so the exporter reuses the LISTEN/NOTIFY URL for
+/// the shard. The rule is the queue listener's own. A per-shard entry wins.
+/// The global URL pairs with the default pool, so it serves a shard only
+/// when that shard is the pool's default, or when there is no shard at all.
+/// Any other shard without an entry gets `None`: the exporter then logs the
+/// statement for an operator and never builds.
+fn audit_index_build_dsn<'a>(
+    per_shard: &'a [(crate::types::ShardId, String)],
+    global: Option<&'a str>,
+    shard: Option<crate::types::ShardId>,
+    default_shard: Option<crate::types::ShardId>,
+) -> Option<&'a str> {
+    shard.map_or(global, |shard| {
+        multi_shard_listener_url(per_shard, shard)
+            .or_else(|| (Some(shard) == default_shard).then_some(global).flatten())
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Dispatch channel consume path (issue #1312)
 // ---------------------------------------------------------------------------
@@ -28785,6 +28807,20 @@ impl Worker {
                     } else {
                         shard_pool.clone()
                     };
+                // The claim-scan index build opens its own connection
+                // (issue #1667). The shard's notification URL reaches the
+                // same database as its pool, by the rule the queue listener
+                // applies above. See `audit_index_build_dsn`.
+                let index_build_dsn = audit_index_build_dsn(
+                    &self.config.shard_notification_database_urls,
+                    self.config.notification_database_url.as_deref(),
+                    *shard,
+                    self.config
+                        .sharded_pool
+                        .as_ref()
+                        .map(crate::shard::ShardedDbPool::default_shard),
+                )
+                .map(str::to_owned);
                 Some(crate::audit_export::spawn_audit_export_checker_for_shard(
                     resolved,
                     self.shutdown.clone(),
@@ -28792,6 +28828,7 @@ impl Worker {
                     self.registry.telemetry().clone(),
                     *shard,
                     self.config.sharded_pool.as_ref(),
+                    index_build_dsn,
                 ))
             })
             .collect();
@@ -34552,6 +34589,51 @@ mod tests {
             multi_shard_listener_url(&per_shard, crate::types::ShardId::new(1)),
             Some("postgres://host/shard1"),
         );
+    }
+
+    /// Issue #1667: the index build URL follows the listener's rule. A
+    /// per-shard entry wins. The global URL serves only the default shard, or
+    /// an unsharded worker.
+    #[test]
+    fn audit_index_build_dsn_follows_the_listener_rule() {
+        let per_shard = vec![(
+            crate::types::ShardId::new(1),
+            "postgres://host/shard1".to_string(),
+        )];
+        let global = Some("postgres://host/default");
+        let default = Some(crate::types::ShardId::new(0));
+        assert_eq!(
+            audit_index_build_dsn(
+                &per_shard,
+                global,
+                Some(crate::types::ShardId::new(1)),
+                default
+            ),
+            Some("postgres://host/shard1"),
+        );
+        assert_eq!(
+            audit_index_build_dsn(
+                &per_shard,
+                global,
+                Some(crate::types::ShardId::new(0)),
+                default
+            ),
+            global,
+        );
+        assert_eq!(
+            audit_index_build_dsn(
+                &per_shard,
+                global,
+                Some(crate::types::ShardId::new(2)),
+                default
+            ),
+            None,
+        );
+        assert_eq!(
+            audit_index_build_dsn(&per_shard, global, None, None),
+            global
+        );
+        assert_eq!(audit_index_build_dsn(&[], None, None, None), None);
     }
 
     /// **Issue #961 review (Codex P2).** A shard with no per-shard URL resolves

@@ -2448,6 +2448,7 @@ async fn a_dedicated_export_tasks_own_connection_failure_marks_its_shard_unobser
         telemetry,
         Some(autumn_harvest::types::ShardId::new(7)),
         None,
+        None,
     );
 
     // Poll (bounded) rather than sleeping a fixed span: fast when the fix
@@ -2514,6 +2515,7 @@ async fn a_dedicated_export_tasks_unsharded_fallback_labels_the_pools_default_sh
         telemetry,
         None,
         Some(&sharded),
+        None,
     );
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -4558,6 +4560,7 @@ async fn spawn_audit_export_checker_for_shard_exports_independently() {
         std::sync::Arc::new(autumn_harvest::telemetry::TelemetryConfig::default()),
         Some(autumn_harvest::types::ShardId::new(0)),
         None,
+        None,
     );
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -4609,6 +4612,7 @@ async fn an_unconfigured_dedicated_task_never_attempts_a_connection_checkout() {
         std::time::Duration::from_millis(20),
         telemetry,
         Some(autumn_harvest::types::ShardId::new(0)),
+        None,
         None,
     );
 
@@ -4662,6 +4666,7 @@ async fn audit_export_checker_re_registers_when_the_configured_lease_grows() {
         poll_interval,
         telemetry,
         Some(shard),
+        None,
         None,
     );
 
@@ -4769,6 +4774,7 @@ async fn a_dedicated_export_task_still_exports_on_a_size_one_pool_shared_with_th
         telemetry,
         Some(autumn_harvest::types::ShardId::new(0)),
         None,
+        None,
     );
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -4851,6 +4857,7 @@ async fn an_in_flight_slow_delivery_never_blocks_the_timeout_checker_on_a_size_o
         std::time::Duration::from_millis(20),
         telemetry,
         Some(autumn_harvest::types::ShardId::new(0)),
+        None,
         None,
     );
 
@@ -4936,6 +4943,7 @@ async fn graceful_shutdown_does_not_wait_for_an_in_flight_delivery() {
         Arc::new(autumn_harvest::telemetry::TelemetryConfig::default()),
         Some(autumn_harvest::types::ShardId::new(0)),
         None,
+        None,
     );
 
     // Give the task time to claim the row and enter the blocked delivery.
@@ -5010,6 +5018,7 @@ async fn the_delivery_deadline_reserves_time_for_the_acknowledgement() {
         Arc::new(autumn_harvest::telemetry::TelemetryConfig::default()),
         Some(autumn_harvest::types::ShardId::new(0)),
         None,
+        None,
     );
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
@@ -5075,6 +5084,7 @@ async fn a_short_lease_still_keeps_a_positive_delivery_window() {
         std::time::Duration::from_millis(20),
         Arc::new(autumn_harvest::telemetry::TelemetryConfig::default()),
         Some(autumn_harvest::types::ShardId::new(0)),
+        None,
         None,
     );
 
@@ -5207,18 +5217,23 @@ async fn the_lazy_migration_keeps_the_index_when_a_cursor_row_exists() {
     assert_eq!(unexported_idx_state(&mut conn).await, Some(true));
 }
 
+/// The embedder-driven primitive runs on a connection its caller owns. It
+/// never builds the index there: the build would hold that connection for
+/// minutes. Export still works. The dedicated task builds the index; see
+/// `the_dedicated_task_builds_the_index_in_the_background`.
 #[tokio::test]
-async fn the_first_export_tick_builds_the_index() {
+async fn the_direct_path_exports_without_building_the_index() {
     let _guard = TEST_SERIAL.lock().await;
     let (mut conn, _url, _c) = make_conn_any().await;
     insert_audit_rows(&mut conn, 3).await;
-    install(Arc::new(RecordingSink::new(200)), 10);
+    let sink = install(Arc::new(RecordingSink::new(200)), 10);
     let metrics = RecordingMetrics::default();
     fire_due_audit_exports(&mut conn, &None, &[], &metrics)
         .await
         .expect("scanner runs");
     uninstall();
-    assert_eq!(unexported_idx_state(&mut conn).await, Some(true));
+    assert_eq!(sink.all_seqs(), vec![1, 2, 3]);
+    assert_eq!(unexported_idx_state(&mut conn).await, None);
 }
 
 #[tokio::test]
@@ -5261,7 +5276,7 @@ async fn an_invalid_index_is_rebuilt() {
 }
 
 #[tokio::test]
-async fn a_concurrent_builder_makes_ensure_skip_without_error() {
+async fn a_concurrent_builder_makes_ensure_report_lock_busy() {
     let (mut conn, url, _c) = make_conn_any().await;
     // A second session stands in for another exporter mid-build.
     let key = autumn_harvest::audit_export::UNEXPORTED_INDEX_LOCK_KEY;
@@ -5279,9 +5294,13 @@ async fn a_concurrent_builder_makes_ensure_skip_without_error() {
     let mut other = diesel_async::AsyncPgConnection::establish(&url)
         .await
         .expect("second session");
-    autumn_harvest::audit_export::ensure_unexported_index(&mut other)
+    let outcome = autumn_harvest::audit_export::ensure_unexported_index(&mut other)
         .await
         .expect("ensure skips");
+    assert_eq!(
+        outcome,
+        autumn_harvest::audit_export::UnexportedIndexOutcome::LockBusy
+    );
     assert_eq!(unexported_idx_state(&mut conn).await, None);
 }
 
@@ -5326,7 +5345,7 @@ async fn the_dedicated_task_builds_the_index_in_the_background() {
     insert_audit_rows(&mut conn, 3).await;
     let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
         diesel_async::AsyncPgConnection,
-    >::new(url);
+    >::new(url.clone());
     let pool = autumn_harvest::worker::DbPool::builder(manager)
         .max_size(4)
         .build()
@@ -5339,6 +5358,7 @@ async fn the_dedicated_task_builds_the_index_in_the_background() {
         Arc::new(autumn_harvest::telemetry::TelemetryConfig::default()),
         Some(ShardId::new(0)),
         None,
+        Some(url),
     );
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while unexported_idx_state(&mut conn).await != Some(true) || sink.all_seqs().len() < 3 {
@@ -5408,9 +5428,12 @@ async fn the_build_restores_the_sessions_statement_timeout() {
     conn.batch_execute("SET statement_timeout = '7s'")
         .await
         .expect("set timeout");
-    autumn_harvest::audit_export::ensure_unexported_index(&mut conn)
-        .await
-        .expect("ensure");
+    assert_eq!(
+        autumn_harvest::audit_export::ensure_unexported_index(&mut conn)
+            .await
+            .expect("ensure"),
+        autumn_harvest::audit_export::UnexportedIndexOutcome::Ready
+    );
     assert_eq!(setting(&mut conn, "statement_timeout").await, "7s");
 }
 
@@ -5453,7 +5476,7 @@ async fn export_delivers_while_the_background_build_waits() {
         .expect("open transaction");
     let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
         diesel_async::AsyncPgConnection,
-    >::new(url);
+    >::new(url.clone());
     let pool = autumn_harvest::worker::DbPool::builder(manager)
         .max_size(4)
         .build()
@@ -5466,6 +5489,7 @@ async fn export_delivers_while_the_background_build_waits() {
         Arc::new(autumn_harvest::telemetry::TelemetryConfig::default()),
         Some(ShardId::new(0)),
         None,
+        Some(url),
     );
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while sink.all_seqs().len() < 3 {
@@ -5490,16 +5514,17 @@ async fn export_delivers_while_the_background_build_waits() {
     uninstall();
 }
 
-/// A one-connection pool must never run the long build. Export still works.
+/// A one-connection pool builds the index on a dedicated connection. The pool's
+/// only connection keeps serving the export during the build.
 #[tokio::test]
-async fn a_one_connection_pool_exports_without_building_the_index() {
+async fn a_one_connection_pool_builds_the_index_on_a_dedicated_connection() {
     let _guard = TEST_SERIAL.lock().await;
     let sink = install(Arc::new(RecordingSink::new(200)), 100);
     let (mut conn, url, _c) = make_conn_any().await;
     insert_audit_rows(&mut conn, 3).await;
     let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
         diesel_async::AsyncPgConnection,
-    >::new(url);
+    >::new(url.clone());
     let pool = autumn_harvest::worker::DbPool::builder(manager)
         .max_size(1)
         .build()
@@ -5512,14 +5537,94 @@ async fn a_one_connection_pool_exports_without_building_the_index() {
         Arc::new(autumn_harvest::telemetry::TelemetryConfig::default()),
         Some(ShardId::new(0)),
         None,
+        Some(url),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while sink.all_seqs().len() < 3 || unexported_idx_state(&mut conn).await != Some(true) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "records must export and the index must exist"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    cancel.cancel();
+    let _ = handle.await;
+    uninstall();
+}
+
+/// Without a database URL for a dedicated connection, the task never builds.
+/// Export still works.
+#[tokio::test]
+async fn an_export_task_without_a_build_url_never_builds_the_index() {
+    let _guard = TEST_SERIAL.lock().await;
+    let sink = install(Arc::new(RecordingSink::new(200)), 100);
+    let (mut conn, url, _c) = make_conn_any().await;
+    insert_audit_rows(&mut conn, 3).await;
+    let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+        diesel_async::AsyncPgConnection,
+    >::new(url);
+    let pool = autumn_harvest::worker::DbPool::builder(manager)
+        .max_size(4)
+        .build()
+        .expect("pool");
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let handle = autumn_harvest::audit_export::spawn_audit_export_checker_for_shard(
+        pool,
+        cancel.clone(),
+        std::time::Duration::from_millis(20),
+        Arc::new(autumn_harvest::telemetry::TelemetryConfig::default()),
+        Some(ShardId::new(0)),
+        None,
+        None,
     );
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while sink.all_seqs().len() < 3 {
         assert!(std::time::Instant::now() < deadline, "records must export");
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
+    // Several more ticks run. None of them builds.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     cancel.cancel();
     let _ = handle.await;
     uninstall();
     assert_eq!(unexported_idx_state(&mut conn).await, None);
+}
+
+/// A worker role that does not own the table cannot build the index. The
+/// error is classified so the exporter backs off for an hour, and the session
+/// releases the advisory lock when it closes.
+#[tokio::test]
+async fn a_role_without_table_ownership_gets_a_refused_build() {
+    let (mut conn, url, _c) = make_conn_any().await;
+    conn.batch_execute(
+        "DO $$ BEGIN \
+           IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'lazy_idx_tenant') THEN \
+             CREATE ROLE lazy_idx_tenant LOGIN PASSWORD 'lazy_idx_tenant'; \
+           END IF; \
+         END $$; \
+         GRANT SELECT, INSERT, UPDATE ON harvest_audit_log TO lazy_idx_tenant;",
+    )
+    .await
+    .expect("tenant role");
+    let (_, host_and_db) = url.rsplit_once('@').expect("url has credentials");
+    let tenant_url = format!("postgresql://lazy_idx_tenant:lazy_idx_tenant@{host_and_db}");
+    let mut tenant = diesel_async::AsyncPgConnection::establish(&tenant_url)
+        .await
+        .expect("tenant connect");
+    let error = autumn_harvest::audit_export::ensure_unexported_index(&mut tenant)
+        .await
+        .expect_err("a non-owner cannot build");
+    assert!(
+        autumn_harvest::audit_export::index_build_needs_owner(&error),
+        "the error must be classified as a privilege failure: {error}"
+    );
+    assert_eq!(unexported_idx_state(&mut conn).await, None);
+    drop(tenant);
+    // The owner can still build at once: the failed session holds no lock.
+    assert_eq!(
+        autumn_harvest::audit_export::ensure_unexported_index(&mut conn)
+            .await
+            .expect("owner builds"),
+        autumn_harvest::audit_export::UnexportedIndexOutcome::Ready
+    );
 }
