@@ -5591,11 +5591,11 @@ impl StandaloneAdminAuth {
     /// Nesting first is what puts Vantage under the read-only-role layer, which
     /// is how [`HarvestPlugin`] composes it.
     ///
-    /// When an embedder auth boundary is declared, apply it outside, so the
-    /// request order is: embedder auth -> token layer -> read-only-role layer
-    /// -> per-route `require_admin` -> handler. Without that declaration,
-    /// enabling API tokens additionally installs a fail-closed token
-    /// requirement on every non-public route.
+    /// When an embedder auth boundary is declared, apply it outside. The
+    /// request order is then: embedder auth -> token layer -> read-only-role
+    /// layer -> per-route `require_admin` -> handler. Without that
+    /// declaration, enabling API tokens additionally installs a fail-closed
+    /// token requirement on every non-public route.
     ///
     /// [`harvest_ui_router`]: crate::harvest_ui_router
     /// [`HarvestPlugin`]: crate::HarvestPlugin
