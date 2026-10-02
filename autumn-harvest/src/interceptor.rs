@@ -219,7 +219,7 @@ impl<'a> ActivityInterceptorNext<'a> {
 
     /// Proceed to the next interceptor, or the terminal handler when the chain
     /// is exhausted, with the (possibly transformed) `input`.
-    #[must_use]
+    #[must_use = "the future does nothing until awaited"]
     pub fn run(self, input: serde_json::Value) -> ActivityInterceptorFuture<'a> {
         match self.interceptors.split_first() {
             Some((head, tail)) => {
@@ -264,7 +264,7 @@ pub trait ActivityInterceptor: Send + Sync + 'static {
 /// When `interceptors` is empty this is a zero-overhead direct call to
 /// `terminal` (no boxing of the continuation), so a worker with no interceptors
 /// registered behaves byte-for-byte as it did before issue #680.
-#[must_use]
+#[must_use = "the future does nothing until awaited"]
 pub(crate) fn dispatch_with_interceptors<'a>(
     interceptors: &'a [Arc<dyn ActivityInterceptor>],
     invocation: &'a ActivityInvocation<'a>,
@@ -289,7 +289,7 @@ pub(crate) fn dispatch_with_interceptors<'a>(
 ///
 /// Only available under `cfg(test)` or the `testing` feature.
 #[cfg(any(test, feature = "testing"))]
-#[must_use]
+#[must_use = "the future does nothing until awaited"]
 pub fn run_interceptor_chain_for_test<'a>(
     interceptors: &'a [Arc<dyn ActivityInterceptor>],
     invocation: &'a ActivityInvocation<'a>,
