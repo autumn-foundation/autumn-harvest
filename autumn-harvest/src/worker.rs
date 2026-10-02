@@ -4598,11 +4598,19 @@ async fn run_local_activity_inline(
         || !race_loser_commands.is_empty()
     {
         let events = prefix_events.clone();
-        let event_start = *next_event_id;
         let events_len = i32::try_from(events.len())
             .map_err(|_| HarvestError::Config("event count overflow".into()))?;
-        let (deferred, loser_events) =
+        let (event_start, deferred, loser_events) =
             Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
+                // Re-read the true next event id under the execution row lock.
+                // `*next_event_id` was snapshotted when the task was prepared,
+                // before this transaction opened. A concurrent writer can
+                // commit onto the same history in between. An activity worker
+                // appending `ActivityStarted` for a still-open race loser is
+                // one. The batch below would then reuse its id and collide on
+                // `UNIQUE(workflow_exec_id, event_id)` (issue #1787). Same
+                // defence as the other persist paths.
+                let event_start = store::next_event_id_for(conn, exec_id).await?;
                 store::append_events_with_codecs(
                     conn,
                     exec_id,
@@ -4630,14 +4638,15 @@ async fn run_local_activity_inline(
                 // its own detached-child rows commit or roll back with the
                 // rest of this transaction, atomically.
                 let mut cursor = event_start + events_len;
-                apply_race_loser_cancellations(
+                let (deferred, loser_events) = apply_race_loser_cancellations(
                     conn,
                     exec_id,
                     &race_loser_commands,
                     &mut cursor,
                     registry,
                 )
-                .await
+                .await?;
+                Ok((event_start, deferred, loser_events))
             }))
             .await?;
         let loser_events_len = i32::try_from(loser_events.len())
