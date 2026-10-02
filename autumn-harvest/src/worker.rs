@@ -27861,21 +27861,9 @@ impl Worker {
                 shutdown_acquire_bound,
             )
             .await;
-            // Release the pins before the drain, so a wake during the drain
-            // does not re-arm them.
-            self.release_sticky_pins(shard_pool, shutdown_acquire_bound)
-                .await;
         }
-
-        tracing::info!(worker_id = %self.config.worker_id, "draining in-flight tasks (multi-shard)");
-        self.drain_in_flight().await;
-
-        // A decision that parked during the drain pinned its task again.
-        // Release once more. A task that outlived the drain keeps its pin.
-        for (_, shard_pool) in &shard_targets {
-            self.release_sticky_pins(shard_pool, shutdown_acquire_bound)
-                .await;
-        }
+        self.drain_releasing_sticky_pins(&shard_targets, shutdown_acquire_bound)
+            .await;
 
         // Stopped: mark every shard pool's worker row stopped, then cancel heartbeats.
         for (_, shard_pool) in &shard_targets {
@@ -30417,6 +30405,28 @@ impl Worker {
                     "failed to get pool connection to release sticky pins"
                 );
             }
+        }
+    }
+
+    /// Drain in-flight tasks of a multi-shard worker, with a sticky-pin
+    /// release on every shard pool before and after the drain (issue #1798).
+    ///
+    /// The first release stops a wake during the drain from re-arming a pin.
+    /// A decision that parks during the drain pins its task again, so the
+    /// second release clears that pin. A task that outlives the drain keeps
+    /// its pin.
+    async fn drain_releasing_sticky_pins(
+        &self,
+        shard_targets: &[(crate::types::ShardId, DbPool)],
+        acquire_bound: Option<Duration>,
+    ) {
+        for (_, shard_pool) in shard_targets {
+            self.release_sticky_pins(shard_pool, acquire_bound).await;
+        }
+        tracing::info!(worker_id = %self.config.worker_id, "draining in-flight tasks (multi-shard)");
+        self.drain_in_flight().await;
+        for (_, shard_pool) in shard_targets {
+            self.release_sticky_pins(shard_pool, acquire_bound).await;
         }
     }
 

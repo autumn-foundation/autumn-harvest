@@ -369,10 +369,10 @@ async fn wait_parked_after(
 ) -> PinRow {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        if counts.decisions() >= decisions {
-            if let Some(row) = parked_pin(conn, exec_id).await {
-                return row;
-            }
+        if counts.decisions() >= decisions
+            && let Some(row) = parked_pin(conn, exec_id).await
+        {
+            return row;
         }
         assert!(
             Instant::now() < deadline,
