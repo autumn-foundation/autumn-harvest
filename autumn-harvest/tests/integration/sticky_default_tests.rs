@@ -294,7 +294,7 @@ fn start_workflow<'a>(
         workflow_name,
         workflow_id,
         exec_id,
-        input,
+        input: input.into(),
         parent_id: None,
         queue_name,
         execution_timeout: None,
