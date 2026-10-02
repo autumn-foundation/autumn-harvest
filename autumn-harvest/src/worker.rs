@@ -15191,9 +15191,12 @@ async fn handle_session_acquire(
         .await;
     }
 
-    // A background re-check of an earlier failed acquire can still release
-    // this slot (issue #1788). Defer until it ends, as at full capacity.
-    if session_slot_rechecked(session_slots_in_use, session_id)
+    // A re-check of an earlier failed acquire can still release this slot
+    // (issue #1788). Defer until it ends, as at full capacity. The hold
+    // keeps any later re-check from releasing the slot while this acquire
+    // runs.
+    let mut acquire_hold = SessionAcquireHold::begin(session_slots_in_use, session_id);
+    if acquire_hold.is_none()
         || !crate::sessions::try_acquire_session_slot(
             session_slots_in_use,
             max_concurrent_sessions,
@@ -15289,11 +15292,18 @@ async fn handle_session_acquire(
             // so settle the slot from the recorded row.
             if crate::pool::is_transient_db_error(&error) {
                 drop(conn);
-                settle_session_slot_after_transient_error(
+                // The hold becomes the re-check in one step, so no other
+                // acquire can start between them.
+                let recheck = acquire_hold.take().map_or_else(
+                    || RecheckedSessionSlot::mark(session_slots_in_use, session_id),
+                    SessionAcquireHold::into_recheck,
+                );
+                settle_session_slot_with_mark(
                     pool,
                     session_slots_in_use,
                     session_id,
                     worker_id,
+                    recheck,
                 )
                 .await;
                 return Err(error);
@@ -15405,6 +15415,18 @@ pub async fn settle_session_slot_after_transient_error(
     // Mark before the first read. Those reads can take ten pool bounds, and an
     // orphan reclaim can retry the task on this worker in that time.
     let recheck = RecheckedSessionSlot::mark(registry, session_id);
+    settle_session_slot_with_mark(pool, registry, session_id, worker_id, recheck).await;
+}
+
+/// [`settle_session_slot_after_transient_error`] with a mark that the caller
+/// already holds.
+async fn settle_session_slot_with_mark(
+    pool: &DbPool,
+    registry: &crate::sessions::SessionSlotRegistry,
+    session_id: crate::types::SessionId,
+    worker_id: &str,
+    recheck: RecheckedSessionSlot,
+) {
     if settle_session_slot_once(pool, registry, session_id, worker_id).await {
         return;
     }
@@ -15421,66 +15443,143 @@ pub async fn settle_session_slot_after_transient_error(
     });
 }
 
-/// Session slots that a re-check can still release (issue #1788).
+/// What runs on one session slot of this worker (issue #1788).
 ///
-/// An acquire of such a session defers until the re-check ends. Otherwise the
-/// re-check can read no row just before the acquire inserts one. It then
-/// releases the slot of a session that this worker hosts. Each key holds the
-/// registry address, so two workers in one process keep separate entries.
-/// The value counts the re-checks in progress. Two can overlap, and the mark
-/// must stay until the last one ends.
-static RECHECKED_SESSION_SLOTS: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<(usize, crate::types::SessionId), usize>>,
+/// A re-check reads the session row and can then release the slot. An acquire
+/// that runs at the same time can insert the row just after that read. The
+/// re-check would then release the slot of a session that this worker hosts.
+/// So the two exclude each other here:
+///
+/// - An acquire does not begin while a re-check runs. It defers instead.
+/// - A re-check does not release a slot while an acquire runs. That acquire
+///   settles the slot itself.
+///
+/// Both are counts, because attempts of one session can overlap.
+#[derive(Default)]
+struct SlotActivity {
+    acquires: usize,
+    rechecks: usize,
+}
+
+/// A slot of one worker: the registry address and the session. Two workers
+/// in one process keep separate entries.
+type SlotKey = (usize, crate::types::SessionId);
+
+static SESSION_SLOT_ACTIVITY: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<SlotKey, SlotActivity>>,
 > = std::sync::LazyLock::new(Default::default);
 
-fn rechecked_slot_key(
+fn slot_key(
     registry: &crate::sessions::SessionSlotRegistry,
     session_id: crate::types::SessionId,
-) -> (usize, crate::types::SessionId) {
+) -> SlotKey {
     (std::sync::Arc::as_ptr(registry).addr(), session_id)
 }
 
+fn slot_activity()
+-> std::sync::MutexGuard<'static, std::collections::HashMap<SlotKey, SlotActivity>> {
+    SESSION_SLOT_ACTIVITY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Apply `change` to the activity of `key`, and drop an entry that is idle.
+fn update_slot_activity(key: SlotKey, change: impl FnOnce(&mut SlotActivity)) {
+    let mut activity = slot_activity();
+    let entry = activity.entry(key).or_default();
+    change(entry);
+    if entry.acquires == 0 && entry.rechecks == 0 {
+        activity.remove(&key);
+    }
+}
+
 /// Whether a re-check of this slot is still in progress.
+#[cfg(test)]
 fn session_slot_rechecked(
     registry: &crate::sessions::SessionSlotRegistry,
     session_id: crate::types::SessionId,
 ) -> bool {
-    RECHECKED_SESSION_SLOTS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .contains_key(&rechecked_slot_key(registry, session_id))
+    slot_activity()
+        .get(&slot_key(registry, session_id))
+        .is_some_and(|activity| activity.rechecks > 0)
+}
+
+/// Release the slot, unless an acquire of it runs. That acquire settles the
+/// slot itself.
+// The lock stays held across the release. Then no acquire can begin between
+// the check and the release.
+#[allow(clippy::significant_drop_tightening)]
+fn release_session_slot_unless_acquiring(
+    registry: &crate::sessions::SessionSlotRegistry,
+    session_id: crate::types::SessionId,
+) {
+    let activity = slot_activity();
+    if activity
+        .get(&slot_key(registry, session_id))
+        .is_some_and(|slot| slot.acquires > 0)
+    {
+        return;
+    }
+    crate::sessions::release_session_slot(registry, session_id);
+}
+
+/// An acquire in progress on a slot. The count goes when this value drops.
+struct SessionAcquireHold(SlotKey);
+
+impl SessionAcquireHold {
+    /// Start an acquire. Returns `None` while a re-check of the slot runs.
+    fn begin(
+        registry: &crate::sessions::SessionSlotRegistry,
+        session_id: crate::types::SessionId,
+    ) -> Option<Self> {
+        let key = slot_key(registry, session_id);
+        let mut activity = slot_activity();
+        let entry = activity.entry(key).or_default();
+        let admitted = entry.rechecks == 0;
+        if admitted {
+            entry.acquires += 1;
+        }
+        drop(activity);
+        admitted.then(|| Self(key))
+    }
+
+    /// Turn this acquire into a re-check in one step. No other acquire can
+    /// begin between the two.
+    fn into_recheck(self) -> RecheckedSessionSlot {
+        let key = self.0;
+        update_slot_activity(key, |activity| {
+            activity.acquires -= 1;
+            activity.rechecks += 1;
+        });
+        std::mem::forget(self);
+        RecheckedSessionSlot(key)
+    }
+}
+
+impl Drop for SessionAcquireHold {
+    fn drop(&mut self) {
+        update_slot_activity(self.0, |activity| activity.acquires -= 1);
+    }
 }
 
 /// Marks a slot as in re-check. The mark goes when this value drops, also
 /// when the runtime cancels the re-check task.
-struct RecheckedSessionSlot((usize, crate::types::SessionId));
+struct RecheckedSessionSlot(SlotKey);
 
 impl RecheckedSessionSlot {
     fn mark(
         registry: &crate::sessions::SessionSlotRegistry,
         session_id: crate::types::SessionId,
     ) -> Self {
-        let key = rechecked_slot_key(registry, session_id);
-        *RECHECKED_SESSION_SLOTS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(key)
-            .or_insert(0) += 1;
+        let key = slot_key(registry, session_id);
+        update_slot_activity(key, |activity| activity.rechecks += 1);
         Self(key)
     }
 }
 
 impl Drop for RecheckedSessionSlot {
     fn drop(&mut self) {
-        let mut marks = RECHECKED_SESSION_SLOTS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let std::collections::hash_map::Entry::Occupied(mut count) = marks.entry(self.0) {
-            *count.get_mut() -= 1;
-            if *count.get() == 0 {
-                count.remove();
-            }
-        }
+        update_slot_activity(self.0, |activity| activity.rechecks -= 1);
     }
 }
 
@@ -15512,7 +15611,7 @@ async fn settle_session_slot_once(
             Ok(row) => {
                 let ours = row.is_some_and(|(host, state)| host == worker_id && state == "ACTIVE");
                 if !ours {
-                    crate::sessions::release_session_slot(registry, session_id);
+                    release_session_slot_unless_acquiring(registry, session_id);
                 }
                 return true;
             }
@@ -35654,6 +35753,40 @@ mod tests {
 
         let next = allow(probe_time + Duration::from_secs(61));
         assert!(next.is_probe(), "a released probe lets a fresh probe in");
+    }
+
+    /// A re-check does not release a slot while an acquire of it runs (issue
+    /// #1788). That acquire settles the slot itself.
+    #[test]
+    fn a_recheck_keeps_a_slot_that_an_acquire_holds() {
+        let registry = crate::sessions::new_session_slot_registry();
+        let session_id = crate::types::SessionId::new();
+        assert!(crate::sessions::try_acquire_session_slot(
+            &registry, 4, session_id
+        ));
+        let hold = SessionAcquireHold::begin(&registry, session_id).expect("no re-check runs");
+        release_session_slot_unless_acquiring(&registry, session_id);
+        assert_eq!(crate::sessions::session_slot_count(&registry), 1);
+        drop(hold);
+        release_session_slot_unless_acquiring(&registry, session_id);
+        assert_eq!(crate::sessions::session_slot_count(&registry), 0);
+    }
+
+    /// An acquire does not begin while a re-check of its slot runs, and a
+    /// failed acquire turns into a re-check in one step (issue #1788).
+    #[test]
+    fn an_acquire_waits_for_a_recheck_and_becomes_one() {
+        let registry = crate::sessions::new_session_slot_registry();
+        let session_id = crate::types::SessionId::new();
+        let recheck = RecheckedSessionSlot::mark(&registry, session_id);
+        assert!(SessionAcquireHold::begin(&registry, session_id).is_none());
+        drop(recheck);
+        let hold = SessionAcquireHold::begin(&registry, session_id).expect("the re-check ended");
+        let recheck = hold.into_recheck();
+        assert!(session_slot_rechecked(&registry, session_id));
+        assert!(SessionAcquireHold::begin(&registry, session_id).is_none());
+        drop(recheck);
+        assert!(!session_slot_rechecked(&registry, session_id));
     }
 
     /// Two overlapping re-checks of one slot keep the mark until both end
