@@ -297,7 +297,7 @@ impl RetryBudgetRegistry {
     #[allow(clippy::needless_pass_by_value)]
     pub fn release(&self, activity_name: &str, ticket: BudgetTicket, now: Instant) -> Option<f64> {
         self.with_bucket(activity_name, now, |bucket, policy| {
-            bucket.tokens = match ticket.kind {
+            let level = match ticket.kind {
                 TicketKind::Deposited {
                     amount,
                     discarded_at,
@@ -305,10 +305,14 @@ impl RetryBudgetRegistry {
                     let credit = (bucket.discarded - discarded_at).clamp(0.0, amount);
                     // Another release cannot claim the same discarded refill.
                     bucket.discarded -= credit;
-                    (bucket.tokens - amount + credit).min(policy.max_tokens)
+                    bucket.tokens - amount + credit
                 }
-                TicketKind::Spent => (bucket.tokens + 1.0).min(policy.max_tokens),
+                TicketKind::Spent => bucket.tokens + 1.0,
             };
+            // The cap discards any excess, the same as for the time refill.
+            // A later deposit release can then give it back.
+            bucket.discarded += (level - policy.max_tokens).max(0.0);
+            bucket.tokens = level.min(policy.max_tokens);
             bucket.tokens
         })
     }
@@ -648,6 +652,21 @@ mod tests {
         let partial = ticket(reg.admit(A, false, t10));
         let t13 = t10 + Duration::from_secs(3);
         assert_eq!(reg.release(A, partial, t13), Some(3.0));
+    }
+
+    /// A released spend that the cap clamps must count as discarded refill.
+    /// Otherwise a later deposit release gives back too little.
+    #[test]
+    fn a_clamped_spend_release_still_counts_as_discarded_refill() {
+        let reg = registry(RetryBudgetPolicy::new(10.0, 10.0, 1.0));
+        let t0 = Instant::now();
+        assert_eq!(drain(&reg, A, t0), 10);
+        let deposit = ticket(reg.admit(A, false, t0));
+        let spend = ticket(reg.admit(A, true, t0));
+        let t5 = t0 + Duration::from_secs(5);
+        reg.release(A, spend, t5);
+        // No attempt ran, so only the 5 s of refill remain.
+        assert_eq!(reg.release(A, deposit, t5), Some(5.0));
     }
 
     /// Ten deposits of 0.1 sum to slightly less than 1.0 in floating point.
