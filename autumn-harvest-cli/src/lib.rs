@@ -5906,18 +5906,18 @@ impl DrShardStatus {
     }
 }
 
+/// Connect for a DR command. [`autumn_harvest::pg_tls`] picks the transport
+/// from the `sslmode`, so a managed Postgres that refuses plaintext is
+/// reachable.
 async fn dr_connect(
     dsn: &str,
 ) -> Result<autumn_harvest::diesel_async::AsyncPgConnection, CliError> {
-    use autumn_harvest::diesel_async::AsyncConnection as _;
-    autumn_harvest::diesel_async::AsyncPgConnection::establish(dsn)
-        .await
-        .map_err(|e| {
-            CliError::InvalidInput(format!(
-                "cannot connect to {}: {e}",
-                autumn_harvest::backup_verify::redact_dsn(dsn)
-            ))
-        })
+    autumn_harvest::pg_tls::connect(dsn).await.map_err(|e| {
+        CliError::InvalidInput(format!(
+            "cannot connect to {}: {e}",
+            autumn_harvest::backup_verify::redact_dsn(dsn)
+        ))
+    })
 }
 
 /// Connect for a read-only DR command, with the session pinned read-only.
@@ -18984,5 +18984,25 @@ mod migrate_cli_tests {
         );
         assert!(rendered.contains(&redacted), "{rendered}");
         assert_eq!(error.exit_code(), 1);
+    }
+}
+
+#[cfg(test)]
+mod pg_tls_feature_tests {
+    /// `harvest dr` and `harvest backup verify` connect through
+    /// `autumn_harvest::pg_tls`. A standalone CLI build must carry its TLS
+    /// connector, or a managed Postgres that needs TLS is unreachable.
+    #[test]
+    fn the_cli_build_has_tls_for_its_database_probes() {
+        let result = autumn_harvest::pg_tls::prepare("postgres://u@h/db?sslmode=require");
+        let unsupported = matches!(
+            &result,
+            Err(autumn_harvest::pg_tls::PgTlsError::Unsupported(m)) if m.contains("`tls` feature")
+        );
+        assert!(
+            !unsupported,
+            "the CLI must enable autumn-harvest/tls: {:?}",
+            result.err()
+        );
     }
 }

@@ -361,6 +361,10 @@ pub mod mutex;
 pub mod partition;
 pub mod payload_codec;
 pub mod payload_store;
+/// The connection transport a DSN's `sslmode` selects, with TLS through
+/// rustls.
+#[cfg(feature = "db")]
+pub mod pg_tls;
 pub mod poison_pill;
 pub mod policy;
 pub mod pool;

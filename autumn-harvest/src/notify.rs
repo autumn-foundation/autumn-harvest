@@ -1447,46 +1447,7 @@ pub async fn notify_workflow_progress(
 // Listener connections (TLS: issue #1717)
 // ---------------------------------------------------------------------------
 
-/// The transport a listener connection uses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ListenTransport {
-    /// Plaintext, through `NoTls`.
-    Plain,
-    /// TLS, with a verified certificate chain and hostname.
-    Tls,
-}
-
-/// Select the listener transport from the DSN's own `sslmode`.
-///
-/// Only `require` selects TLS, because `NoTls` cannot satisfy it. `disable`,
-/// `prefer` and an absent `sslmode` stay plaintext. That is the behavior before
-/// issue #1717, and it matches a pool built with `NoTls`. Thus a server with a
-/// self-signed certificate does not break a `prefer` DSN.
-fn listen_transport(config: &tokio_postgres::Config) -> ListenTransport {
-    match config.get_ssl_mode() {
-        tokio_postgres::config::SslMode::Require => ListenTransport::Tls,
-        _ => ListenTransport::Plain,
-    }
-}
-
-/// Render an error and each error in its `source()` chain.
-///
-/// `tokio_postgres` shows a TLS failure as "error performing TLS handshake".
-/// The real cause is only in `source()`. A cause that the text already
-/// contains is not added again.
-fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
-    let mut out = error.to_string();
-    let mut source = error.source();
-    while let Some(cause) = source {
-        let text = cause.to_string();
-        if !out.contains(&text) {
-            out.push_str(": ");
-            out.push_str(&text);
-        }
-        source = cause.source();
-    }
-    out
-}
+use crate::pg_tls::error_chain;
 
 /// The error for a listener connection that failed to open.
 fn connect_error(error: &tokio_postgres::Error) -> HarvestError {
@@ -1505,6 +1466,10 @@ struct ListenConnection {
 
 /// Open a LISTEN connection with the transport that the DSN asks for.
 ///
+/// [`crate::pg_tls`] picks the transport from the `sslmode`. `prefer`, the
+/// default, uses TLS when the server offers it. `require` verifies the chain
+/// and the hostname (issue #1717).
+///
 /// `error_message` is the log message for a connection error after the open.
 async fn open_listen_connection(
     database_url: &str,
@@ -1512,155 +1477,51 @@ async fn open_listen_connection(
 ) -> HarvestResult<ListenConnection> {
     // A DSN that does not parse is a permanent misconfiguration, not an outage.
     // A result wait returns a `Config` error and does not poll over it.
-    let config: tokio_postgres::Config = database_url.parse().map_err(|e| {
-        HarvestError::Config(format!(
-            "invalid notification database URL: {}",
-            error_chain(&e)
-        ))
-    })?;
-    match listen_transport(&config) {
-        ListenTransport::Plain => {
-            let (client, connection) = config
-                .connect(tokio_postgres::NoTls)
-                .await
-                .map_err(|e| connect_error(&e))?;
-            Ok(spawn_listen_driver(client, connection, error_message))
-        }
-        ListenTransport::Tls => open_tls_listen_connection(&config, error_message).await,
-    }
-}
-
-/// Open a verified TLS LISTEN connection.
-#[cfg(feature = "tls")]
-async fn open_tls_listen_connection(
-    config: &tokio_postgres::Config,
-    error_message: &'static str,
-) -> HarvestResult<ListenConnection> {
-    let tls = tokio_postgres_rustls::MakeRustlsConnect::new(tls_client_config()?);
-    let (client, connection) = config.connect(tls).await.map_err(|e| connect_error(&e))?;
+    let (client, connection) = crate::pg_tls::open(database_url)
+        .await
+        .map_err(|e| match e {
+            crate::pg_tls::OpenError::Prepare(crate::pg_tls::PgTlsError::InvalidDsn(message)) => {
+                HarvestError::Config(format!("invalid notification database URL: {message}"))
+            }
+            crate::pg_tls::OpenError::Prepare(crate::pg_tls::PgTlsError::Unsupported(message)) => {
+                HarvestError::Config(message)
+            }
+            crate::pg_tls::OpenError::Connect(error) => connect_error(&error),
+        })?;
     Ok(spawn_listen_driver(client, connection, error_message))
-}
-
-/// Refuse `sslmode=require` when the crate has no TLS support.
-#[cfg(not(feature = "tls"))]
-#[allow(clippy::unused_async, reason = "the signature matches the `tls` build")]
-async fn open_tls_listen_connection(
-    _config: &tokio_postgres::Config,
-    _error_message: &'static str,
-) -> HarvestResult<ListenConnection> {
-    Err(HarvestError::Config(
-        "sslmode=require needs the `tls` feature of autumn-harvest".to_string(),
-    ))
-}
-
-/// The rustls configuration for listener connections.
-///
-/// The trust store is read once per process. A failed read is not cached, so
-/// a later connection tries again.
-#[cfg(feature = "tls")]
-fn tls_client_config() -> HarvestResult<rustls::ClientConfig> {
-    static CONFIG: std::sync::OnceLock<rustls::ClientConfig> = std::sync::OnceLock::new();
-    if let Some(config) = CONFIG.get() {
-        return Ok(config.clone());
-    }
-    let built = build_tls_client_config()?;
-    Ok(CONFIG.get_or_init(|| built).clone())
-}
-
-/// Build a rustls configuration that trusts the platform trust store.
-///
-/// The chain and the hostname are always verified, as in `harvest migrate`
-/// (issue #1240). `SSL_CERT_FILE` or `SSL_CERT_DIR` can point at a private CA.
-/// The `ring` provider is explicit, because `ClientConfig::builder()` panics
-/// when no process-wide provider is installed.
-#[cfg(feature = "tls")]
-fn build_tls_client_config() -> HarvestResult<rustls::ClientConfig> {
-    let native = rustls_native_certs::load_native_certs();
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add_parsable_certificates(native.certs);
-    if roots.is_empty() {
-        return Err(HarvestError::Config(format!(
-            "sslmode=require: the platform trust store has no usable certificates. \
-             Install the ca-certificates package, or set SSL_CERT_FILE. \
-             Loader errors: {:?}",
-            native.errors
-        )));
-    }
-    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
-    let config = rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|e| HarvestError::Config(format!("rustls configuration failed: {e}")))?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    Ok(config)
 }
 
 /// Open a diesel-async connection with the transport that the DSN asks for.
 ///
-/// The claim-scan index build (issue #1667) opens its own connection. It must
-/// follow the listener's rule: `sslmode=require` selects verified TLS, and any
-/// other mode stays plaintext. The plain `AsyncPgConnection::establish` cannot
-/// satisfy `require`, so a TLS-only server would refuse every build.
+/// The claim-scan index build (issue #1667) opens its own connection. It goes
+/// through [`crate::pg_tls`], so it follows the same transport rule as the
+/// listener and every other connection the crate opens itself. The plain
+/// `AsyncPgConnection::establish` cannot satisfy `sslmode=require`, so a
+/// TLS-only server would refuse every build.
 ///
 /// # Errors
-/// Returns `HarvestError::Config` for a DSN that does not parse, or for
-/// `sslmode=require` in a build without the `tls` feature. Returns
-/// `HarvestError::Database` when the connection fails.
+/// Returns `HarvestError::Config` for a DSN that does not parse, or for a
+/// transport this build cannot provide. Returns `HarvestError::Database` when
+/// the connection fails.
 #[cfg(feature = "db")]
 pub(crate) async fn connect_async_pg(
     database_url: &str,
 ) -> HarvestResult<diesel_async::AsyncPgConnection> {
-    let config: tokio_postgres::Config = database_url.parse().map_err(|e| {
-        HarvestError::Config(format!(
-            "invalid notification database URL: {}",
-            error_chain(&e)
-        ))
-    })?;
-    match listen_transport(&config) {
-        ListenTransport::Plain => {
-            let (client, connection) = config
-                .connect(tokio_postgres::NoTls)
-                .await
-                .map_err(|e| connect_error(&e))?;
-            async_pg_from_parts(client, connection).await
-        }
-        ListenTransport::Tls => connect_async_pg_tls(&config).await,
-    }
-}
-
-/// Wrap an open client and connection in a diesel-async connection.
-#[cfg(feature = "db")]
-async fn async_pg_from_parts<S>(
-    client: tokio_postgres::Client,
-    connection: tokio_postgres::Connection<tokio_postgres::Socket, S>,
-) -> HarvestResult<diesel_async::AsyncPgConnection>
-where
-    S: tokio_postgres::tls::TlsStream + Unpin + Send + 'static,
-{
+    let (client, connection) =
+        crate::pg_tls::open(database_url)
+            .await
+            .map_err(|error| match error {
+                crate::pg_tls::OpenError::Prepare(crate::pg_tls::PgTlsError::InvalidDsn(
+                    message,
+                )) => HarvestError::Config(format!("invalid notification database URL: {message}")),
+                crate::pg_tls::OpenError::Prepare(crate::pg_tls::PgTlsError::Unsupported(
+                    message,
+                )) => HarvestError::Config(message),
+                crate::pg_tls::OpenError::Connect(error) => connect_error(&error),
+            })?;
     diesel_async::AsyncPgConnection::try_from_client_and_connection(client, connection)
         .await
         .map_err(|e| HarvestError::Database(format!("pg connect failed: {e}")))
-}
-
-/// Open a verified TLS diesel-async connection.
-#[cfg(all(feature = "db", feature = "tls"))]
-async fn connect_async_pg_tls(
-    config: &tokio_postgres::Config,
-) -> HarvestResult<diesel_async::AsyncPgConnection> {
-    let tls = tokio_postgres_rustls::MakeRustlsConnect::new(tls_client_config()?);
-    let (client, connection) = config.connect(tls).await.map_err(|e| connect_error(&e))?;
-    async_pg_from_parts(client, connection).await
-}
-
-/// Refuse `sslmode=require` when the crate has no TLS support.
-#[cfg(all(feature = "db", not(feature = "tls")))]
-#[allow(clippy::unused_async, reason = "the signature matches the `tls` build")]
-async fn connect_async_pg_tls(
-    _config: &tokio_postgres::Config,
-) -> HarvestResult<diesel_async::AsyncPgConnection> {
-    Err(HarvestError::Config(
-        "sslmode=require needs the `tls` feature of autumn-harvest".to_string(),
-    ))
 }
 
 /// Spawn the task that drives a LISTEN connection.
@@ -1730,14 +1591,20 @@ impl QueueListener {
     /// [`Notification`]s through an internal channel. The connection stays
     /// alive as long as this `QueueListener` is held.
     ///
-    /// `sslmode=require` in `database_url` selects verified TLS. Other modes
-    /// connect in plaintext (issue #1717).
+    /// The `sslmode` in `database_url` selects the transport, through
+    /// [`crate::pg_tls`]. `prefer`, the default, uses TLS when the server
+    /// offers it and does not check the certificate. `require` and
+    /// `verify-full` verify the chain and the hostname, and `verify-ca` the
+    /// chain only. `allow` is plaintext, with one TLS retry when the server
+    /// rejects plaintext. `disable` is plaintext. Without the `tls` feature,
+    /// `prefer` and `allow` are plaintext and a verified mode is a
+    /// configuration error.
     ///
     /// # Errors
     ///
     /// Returns [`HarvestError::Database`] if the connection or LISTEN fails.
-    /// Returns [`HarvestError::Config`] if the URL does not parse, or if TLS
-    /// cannot be configured.
+    /// Returns [`HarvestError::Config`] if the URL does not parse, its
+    /// `sslmode` is unknown, or TLS cannot be configured.
     pub async fn connect(database_url: &str, queues: &[String]) -> HarvestResult<Self> {
         let ListenConnection { client, rx, driver } =
             open_listen_connection(database_url, "postgres listener connection error").await?;
@@ -1824,14 +1691,20 @@ pub struct WorkflowEventListener {
 impl WorkflowEventListener {
     /// Connect to Postgres and subscribe to the `harvest_events` channel.
     ///
-    /// `sslmode=require` in `database_url` selects verified TLS. Other modes
-    /// connect in plaintext (issue #1717).
+    /// The `sslmode` in `database_url` selects the transport, through
+    /// [`crate::pg_tls`]. `prefer`, the default, uses TLS when the server
+    /// offers it and does not check the certificate. `require` and
+    /// `verify-full` verify the chain and the hostname, and `verify-ca` the
+    /// chain only. `allow` is plaintext, with one TLS retry when the server
+    /// rejects plaintext. `disable` is plaintext. Without the `tls` feature,
+    /// `prefer` and `allow` are plaintext and a verified mode is a
+    /// configuration error.
     ///
     /// # Errors
     ///
     /// Returns [`HarvestError::Database`] if the connection or LISTEN fails.
-    /// Returns [`HarvestError::Config`] if the URL does not parse, or if TLS
-    /// cannot be configured.
+    /// Returns [`HarvestError::Config`] if the URL does not parse, its
+    /// `sslmode` is unknown, or TLS cannot be configured.
     pub async fn connect(database_url: &str) -> HarvestResult<Self> {
         let ListenConnection { client, rx, driver } =
             open_listen_connection(database_url, "postgres workflow event listener error").await?;
@@ -1905,14 +1778,20 @@ pub struct WorkflowProgressListener {
 impl WorkflowProgressListener {
     /// Connect to Postgres and subscribe to `exec_id`'s progress channel.
     ///
-    /// `sslmode=require` in `database_url` selects verified TLS. Other modes
-    /// connect in plaintext (issue #1717).
+    /// The `sslmode` in `database_url` selects the transport, through
+    /// [`crate::pg_tls`]. `prefer`, the default, uses TLS when the server
+    /// offers it and does not check the certificate. `require` and
+    /// `verify-full` verify the chain and the hostname, and `verify-ca` the
+    /// chain only. `allow` is plaintext, with one TLS retry when the server
+    /// rejects plaintext. `disable` is plaintext. Without the `tls` feature,
+    /// `prefer` and `allow` are plaintext and a verified mode is a
+    /// configuration error.
     ///
     /// # Errors
     ///
     /// Returns [`HarvestError::Database`] if the connection or LISTEN fails.
-    /// Returns [`HarvestError::Config`] if the URL does not parse, or if TLS
-    /// cannot be configured.
+    /// Returns [`HarvestError::Config`] if the URL does not parse, its
+    /// `sslmode` is unknown, or TLS cannot be configured.
     pub async fn connect(database_url: &str, exec_id: Uuid) -> HarvestResult<Self> {
         let ListenConnection { client, rx, driver } =
             open_listen_connection(database_url, "postgres workflow progress listener error")
@@ -2166,50 +2045,26 @@ mod tests {
 
     // ── TLS for listener connections (issue #1717) ───────────────────────
 
-    fn transport_for(dsn: &str) -> ListenTransport {
-        let config: tokio_postgres::Config = dsn.parse().expect("test DSN parses");
-        listen_transport(&config)
-    }
-
-    #[test]
-    fn only_sslmode_require_selects_tls() {
-        let base = "postgres://u:p@db.internal/harvest";
-        assert_eq!(transport_for(base), ListenTransport::Plain);
-        assert_eq!(
-            transport_for(&format!("{base}?sslmode=disable")),
-            ListenTransport::Plain
-        );
-        assert_eq!(
-            transport_for(&format!("{base}?sslmode=prefer")),
-            ListenTransport::Plain
-        );
-        assert_eq!(
-            transport_for(&format!("{base}?sslmode=require")),
-            ListenTransport::Tls
-        );
-    }
-
-    #[test]
-    fn keyword_dsn_with_sslmode_require_selects_tls() {
-        assert_eq!(
-            transport_for("host=db.internal dbname=harvest sslmode=require"),
-            ListenTransport::Tls
-        );
-        assert_eq!(
-            transport_for("host=db.internal dbname=harvest"),
-            ListenTransport::Plain
-        );
-    }
-
     /// An `SSLRequest` message: length 8, then the code 80877103.
     #[cfg(feature = "tls")]
     const SSL_REQUEST: [u8; 8] = [0, 0, 0, 8, 4, 210, 22, 47];
 
+    /// The answer a fake server gives to an `SSLRequest`.
+    #[derive(Clone, Copy)]
+    enum Answer {
+        /// Read the first message header only.
+        Nothing,
+        /// Accept TLS with `S`, then read one more byte.
+        AcceptTls,
+        /// Decline TLS with `N`, then read the next message header.
+        DeclineTls,
+    }
+
     /// Open a listener connection to a fake server, and record what arrives.
     ///
-    /// The fake server reads the first message header. When `answer_tls` is
-    /// true, it accepts TLS with `S` and also reads the next byte.
-    async fn first_bytes_sent(sslmode: &str, answer_tls: bool) -> ([u8; 8], Option<u8>) {
+    /// `query` is the DSN query, for example `?sslmode=prefer`, or empty. The
+    /// second value is what the client sends after the server answers.
+    async fn bytes_sent(query: &str, answer: Answer) -> ([u8; 8], Vec<u8>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let server = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -2223,15 +2078,30 @@ mod tests {
                 .read_exact(&mut header)
                 .await
                 .expect("message header");
-            if !answer_tls {
-                return (header, None);
-            }
-            socket.write_all(b"S").await.expect("accept TLS");
-            let mut next = [0_u8; 1];
-            let next = socket.read_exact(&mut next).await.ok().map(|_| next[0]);
+            let next = match answer {
+                Answer::Nothing => return (header, Vec::new()),
+                Answer::AcceptTls => {
+                    socket.write_all(b"S").await.expect("accept TLS");
+                    let mut next = vec![0_u8; 1];
+                    socket
+                        .read_exact(&mut next)
+                        .await
+                        .map(|_| next)
+                        .unwrap_or_default()
+                }
+                Answer::DeclineTls => {
+                    socket.write_all(b"N").await.expect("decline TLS");
+                    let mut next = vec![0_u8; 8];
+                    socket
+                        .read_exact(&mut next)
+                        .await
+                        .map(|_| next)
+                        .unwrap_or_default()
+                }
+            };
             (header, next)
         });
-        let url = format!("postgres://u@127.0.0.1:{port}/db?sslmode={sslmode}");
+        let url = format!("postgres://u@127.0.0.1:{port}/db{query}");
         let client = tokio::spawn(async move {
             open_listen_connection(&url, "test listener error")
                 .await
@@ -2245,14 +2115,54 @@ mod tests {
         seen
     }
 
+    /// A startup message carries protocol version 3.0 after its length.
+    const STARTUP_VERSION: [u8; 4] = [0, 3, 0, 0];
+
+    /// 0x16 is the TLS handshake record type, so this byte opens a
+    /// `ClientHello`. A `NoTls` connector sends nothing after the server
+    /// accepts TLS.
+    const CLIENT_HELLO: u8 = 0x16;
+
     #[cfg(feature = "tls")]
     #[tokio::test]
-    async fn sslmode_require_starts_a_tls_handshake() {
-        let (header, next) = first_bytes_sent("require", true).await;
-        assert_eq!(header, SSL_REQUEST);
-        // 0x16 is the TLS handshake record type, so this is a ClientHello.
-        // A `NoTls` connector sends nothing after the server accepts TLS.
-        assert_eq!(next, Some(0x16), "sslmode=require must send a ClientHello");
+    async fn verified_sslmodes_start_a_tls_handshake() {
+        for query in [
+            "?sslmode=require",
+            "?sslmode=verify-ca",
+            "?sslmode=verify-full",
+        ] {
+            let (header, next) = bytes_sent(query, Answer::AcceptTls).await;
+            assert_eq!(header, SSL_REQUEST, "{query} must ask for TLS");
+            assert_eq!(next, [CLIENT_HELLO], "{query} must send a ClientHello");
+        }
+    }
+
+    /// A managed Postgres such as Fly hands out a URL with no `sslmode` and
+    /// refuses plaintext. The listener must then use the TLS the server
+    /// offers, as libpq does for its default `prefer`.
+    #[cfg(feature = "tls")]
+    #[tokio::test]
+    async fn prefer_and_an_absent_sslmode_use_tls_when_the_server_offers_it() {
+        for query in ["?sslmode=prefer", ""] {
+            let (header, next) = bytes_sent(query, Answer::AcceptTls).await;
+            assert_eq!(header, SSL_REQUEST, "{query:?} must ask for TLS");
+            assert_eq!(next, [CLIENT_HELLO], "{query:?} must send a ClientHello");
+        }
+    }
+
+    /// A server without TLS answers `N`. `prefer` then goes on in plaintext.
+    #[cfg(feature = "tls")]
+    #[tokio::test]
+    async fn prefer_goes_on_in_plaintext_when_the_server_declines_tls() {
+        for query in ["?sslmode=prefer", ""] {
+            let (header, next) = bytes_sent(query, Answer::DeclineTls).await;
+            assert_eq!(header, SSL_REQUEST, "{query:?} must ask for TLS");
+            assert_eq!(
+                next[4..],
+                STARTUP_VERSION,
+                "{query:?} must send a startup message"
+            );
+        }
     }
 
     /// Issue #1667: the dedicated index build connection follows the same
@@ -2291,10 +2201,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sslmode_prefer_stays_plaintext() {
-        let (header, _) = first_bytes_sent("prefer", false).await;
-        // A startup message carries protocol version 3.0 after its length.
-        assert_eq!(header[4..], [0, 3, 0, 0], "prefer must not send SSLRequest");
+    async fn sslmode_disable_stays_plaintext() {
+        let (header, _) = bytes_sent("?sslmode=disable", Answer::Nothing).await;
+        assert_eq!(
+            header[4..],
+            STARTUP_VERSION,
+            "disable must not send SSLRequest"
+        );
+    }
+
+    /// Without the `tls` feature there is no connector, so `prefer` stays
+    /// plaintext, as before.
+    #[cfg(not(feature = "tls"))]
+    #[tokio::test]
+    async fn prefer_without_the_tls_feature_stays_plaintext() {
+        let (header, _) = bytes_sent("?sslmode=prefer", Answer::Nothing).await;
+        assert_eq!(
+            header[4..],
+            STARTUP_VERSION,
+            "prefer must not send SSLRequest"
+        );
     }
 
     #[cfg(not(feature = "tls"))]
@@ -2316,7 +2242,7 @@ mod tests {
     #[tokio::test]
     async fn an_unparseable_dsn_is_a_config_error() {
         let result = open_listen_connection(
-            "postgres://u@127.0.0.1:1/db?sslmode=verify-full",
+            "postgres://u@127.0.0.1:1/db?sslmode=bogus",
             "test listener error",
         )
         .await

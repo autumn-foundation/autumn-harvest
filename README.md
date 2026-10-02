@@ -72,8 +72,9 @@ Need a real reference instead of the tiny hello-world path? See:
 - [`examples/billing-autumn-web/`](examples/billing-autumn-web/) for a full Autumn web billing
   integration with app routes, workflow outbox publication, `HarvestPlugin`, saga compensation,
   child workflows, version gates, signals, timers, deterministic side effects, and scheduled DAGs.
-- [`examples/standalone-runner/`](examples/standalone-runner/) for the out-of-the-box runner path:
-  no Autumn plugin, just `HarvestEmbedding` on a plain Axum server, with a metrics route.
+- [`examples/standalone-runner/`](examples/standalone-runner/) for Harvest on plain Axum. Its
+  `Cargo.toml` names no `autumn-web`. It shows the pool, migrations, management API, Vantage,
+  API tokens, metrics and webhooks.
 - [`examples/claude-agent-daemon/`](examples/claude-agent-daemon/) for a local daemon that runs
   Claude agent sessions as durable workflows on the embedded SQLite backend — no Postgres, no
   Docker. Each model call and tool call is an activity, a workspace write parks on an
@@ -331,7 +332,9 @@ API and Vantage from a Rust service on plain Axum instead of autumn-web, use
 `HarvestEmbedding`. Start with the getting-started fork,
 [The first workflow on plain Axum](docs/getting-started/standalone-axum.md).
 [`docs/embedding.md`](docs/embedding.md) is the reference: auth, metrics,
-webhooks, shutdown, and what is not available off the plugin path. The
+webhooks, shutdown, and what is not available off the plugin path.
+[`examples/standalone-runner`](examples/standalone-runner/) is the larger
+example of that path. Its `Cargo.toml` has no `autumn-web` entry. The
 router is `axum::Router<()>`, so this path is for Axum services, not an
 arbitrary framework.
 

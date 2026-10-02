@@ -310,7 +310,8 @@ fn allowlisted(key: &str) -> bool {
 struct SuiteRow {
     /// `linux` | `linuxpart` | `allos` | `compileonly`.
     osclass: String,
-    /// `autumn-harvest` | `autumn-harvest-plugin` | `autumn-harvest-redis`.
+    /// `autumn-harvest` | `autumn-harvest-plugin` | `autumn-harvest-redis` |
+    /// `standalone-runner`.
     krate: String,
     /// The `--test <target>` binary (core suites use `integration`).
     target: String,
@@ -367,6 +368,8 @@ fn parse_manifest() -> Vec<SuiteRow> {
         "autumn-harvest",
         "autumn-harvest-plugin",
         "autumn-harvest-redis",
+        // Issue #1615: the example's live-Postgres acceptance suite.
+        "standalone-runner",
     ];
     let mut out = Vec::new();
     for (n, line) in MANIFEST.lines().enumerate() {
@@ -866,6 +869,32 @@ fn claim_budget_gate_has_a_covering_manifest_row() {
         core_covers(&rows, "claim_budget_tests", &feats(&[])),
         "the claim-path budget gate must have a covering `linux` manifest row —          a performance gate that never runs is not a gate"
     );
+}
+
+/// Issue #1615. Each test target of the `standalone-runner` example runs
+/// from a manifest row. The guard above scans only the core and plugin
+/// test directories, so a deleted row would go unseen.
+#[test]
+fn standalone_runner_test_targets_have_a_running_row() {
+    let rows = parse_manifest();
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../examples/standalone-runner/tests");
+    let targets: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            (path.extension()? == "rs").then(|| path.file_stem()?.to_str().map(str::to_owned))?
+        })
+        .collect();
+    assert!(!targets.is_empty(), "the example has an acceptance suite");
+    for target in targets {
+        assert!(
+            rows.iter().any(|r| r.krate == "standalone-runner"
+                && r.target == target
+                && r.osclass == "linux"
+                && r.filter == "-"),
+            "examples/standalone-runner/tests/{target}.rs needs a `linux standalone-runner {target}` row"
+        );
+    }
 }
 
 #[test]
