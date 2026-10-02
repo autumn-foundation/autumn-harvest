@@ -1497,6 +1497,35 @@ enum BuildEnd {
     Refused,
 }
 
+/// Holds the in-flight mark of a build gate.
+///
+/// Shutdown can drop a build future at any await point. A dropped guard turns
+/// the gate into an ordinary retry wait, so the in-flight period never
+/// outlives the future that owns it. `disarm` hands the end of the build to
+/// the caller.
+#[cfg(feature = "db")]
+struct InFlightGuard(Option<BuildKey>);
+
+#[cfg(feature = "db")]
+impl InFlightGuard {
+    const fn new(key: BuildKey) -> Self {
+        Self(Some(key))
+    }
+
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+#[cfg(feature = "db")]
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if let Some(key) = self.0.take() {
+            index_build_finished(&key, BuildEnd::Retry);
+        }
+    }
+}
+
 /// Claim the right to start a build for this shard. Marks it in flight.
 #[cfg(feature = "db")]
 fn index_build_due(key: &BuildKey) -> bool {
@@ -1689,14 +1718,17 @@ async fn spawn_unexported_index_build_if_due(
     if !index_build_due(&key) {
         return;
     }
+    // Dropping this future mid-probe, or panicking, leaves a retry wait.
+    let guard = InFlightGuard::new(key.clone());
     match unexported_index_valid(conn).await {
         Ok(Some(true)) => {
             index_build_finished(&key, BuildEnd::Ready);
+            guard.disarm();
             return;
         }
         Ok(_) => {}
         Err(error) => {
-            index_build_finished(&key, BuildEnd::Retry);
+            // The guard turns the gate into a retry wait.
             tracing::warn!(shard = shard_id, %error, "[audit_export] could not inspect the claim-scan index");
             return;
         }
@@ -1704,6 +1736,9 @@ async fn spawn_unexported_index_build_if_due(
     let dsn = dsn.to_owned();
     let cancel = cancel.clone();
     tokio::spawn(async move {
+        // The task owns the in-flight mark now. A panic or an abort that drops
+        // the task leaves a retry wait too.
+        let guard = guard;
         let end = tokio::select! {
             result = build_unexported_index_on_dedicated_connection(
                 &dsn,
@@ -1753,6 +1788,7 @@ async fn spawn_unexported_index_build_if_due(
             }
         };
         index_build_finished(&key, end);
+        guard.disarm();
     });
 }
 
@@ -5088,6 +5124,39 @@ mod tests {
         assert_eq!(until_cancelled(&cancel, stalled).await, None);
         let live = tokio_util::sync::CancellationToken::new();
         assert_eq!(until_cancelled(&live, async { 7_u8 }).await, Some(7));
+    }
+
+    /// Issue #1667: a dropped build future must not leave the gate closed for
+    /// the in-flight period. Shutdown can drop it mid-probe. The guard turns
+    /// the gate into an ordinary retry wait. A disarmed guard changes nothing.
+    #[cfg(feature = "db")]
+    #[test]
+    fn a_dropped_in_flight_guard_leaves_a_retry_wait() {
+        let key: BuildKey = (
+            9_005,
+            "postgres://gate-test/guard".to_owned(),
+            "public".to_owned(),
+        );
+        let remaining = |key: &BuildKey| {
+            INDEX_BUILD_GATE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(key)
+                .copied()
+                .map(|not_before| not_before.saturating_duration_since(std::time::Instant::now()))
+        };
+        assert!(index_build_due(&key));
+        drop(InFlightGuard::new(key.clone()));
+        let after_drop = remaining(&key).expect("a dropped guard leaves an entry");
+        assert!(after_drop <= INDEX_BUILD_RETRY, "{after_drop:?}");
+        assert!(!index_build_due(&key), "the retry wait still holds");
+        index_build_finished(&key, BuildEnd::Ready);
+
+        assert!(index_build_due(&key));
+        InFlightGuard::new(key.clone()).disarm();
+        let after_disarm = remaining(&key).expect("a disarmed guard keeps the entry");
+        assert!(after_disarm > INDEX_BUILD_REFUSED_RETRY, "{after_disarm:?}");
+        index_build_finished(&key, BuildEnd::Ready);
     }
 
     /// Issue #1667: a privilege failure is the one error a retry cannot fix.
