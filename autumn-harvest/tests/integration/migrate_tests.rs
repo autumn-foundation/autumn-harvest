@@ -96,7 +96,7 @@ async fn applies_harvests_own_schema_to_an_empty_database_and_is_idempotent() {
     let plan = migrate::plan(&url, &scripts).await.expect("plan");
     assert!(!plan.ledger_exists, "an empty database has no ledger yet");
     assert_eq!(plan.pending.len(), scripts.len());
-    assert!(plan.already_applied.is_empty());
+    assert_eq!(plan.already_applied, [] as [std::string::String; 0]);
     assert!(
         !relation_exists(&url, "__diesel_schema_migrations").await,
         "plan() must not create the ledger"
@@ -104,8 +104,8 @@ async fn applies_harvests_own_schema_to_an_empty_database_and_is_idempotent() {
 
     let report = migrate::apply(&url, &scripts).await.expect("apply");
     assert_eq!(report.applied.len(), scripts.len());
-    assert!(report.already_applied.is_empty());
-    assert!(report.unrecognized.is_empty());
+    assert_eq!(report.already_applied, [] as [std::string::String; 0]);
+    assert_eq!(report.unrecognized, [] as [std::string::String; 0]);
 
     // The schema is really there, not just recorded.
     assert!(relation_exists(&url, "harvest_workflow_executions").await);
