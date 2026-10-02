@@ -285,6 +285,29 @@ async fn a_failed_probe_in_a_raw_begin_block_fails_the_append() {
 }
 
 #[tokio::test]
+async fn a_failed_probe_after_an_autocommit_write_reports_the_commit() {
+    let (url, _container) = setup().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let exec_id = insert_execution(&mut conn).await;
+    // A hardened role that cannot run the probe behaves the same way.
+    conn.batch_execute(
+        "CREATE SCHEMA IF NOT EXISTS probe_fail; \
+         CREATE OR REPLACE FUNCTION probe_fail.txid_current_if_assigned() RETURNS bigint \
+         LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'probe disabled'; END $$; \
+         SET search_path = probe_fail, pg_catalog, public",
+    )
+    .await
+    .expect("shadow the probe");
+
+    let result = store::append_events(&mut conn, exec_id, &[started()], 0).await;
+
+    // The autocommit write is durable. An error would make a retry write it
+    // twice.
+    result.expect("the committed append must report success");
+    assert_eq!(event_count(&url, exec_id).await, 1);
+}
+
+#[tokio::test]
 async fn wake_in_a_transaction_commits_when_pg_notify_fails() {
     let (url, _container) = setup().await;
     let (exec_id, task_id) = park_task(&url).await;

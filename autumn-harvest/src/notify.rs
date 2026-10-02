@@ -964,8 +964,10 @@ impl RawBlock {
 ///
 /// # Errors
 ///
-/// Returns an error when the probe fails or the savepoint cannot roll back.
-/// A raw block then cannot commit, so the caller must see the error.
+/// Returns an error when a failed probe aborted a raw block, or when the
+/// savepoint cannot roll back. The block then cannot commit, so the caller
+/// must see the error. A failed probe after an autocommit write returns no
+/// error, because that write already committed.
 async fn send_outside_diesel_transaction(
     conn: &mut AsyncPgConnection,
     wakes: Vec<(String, String)>,
@@ -974,16 +976,25 @@ async fn send_outside_diesel_transaction(
 ) -> HarvestResult<()> {
     use diesel_async::SimpleAsyncConnection as _;
     let raw_block = match raw_block {
-        // A failed probe inside a raw block has aborted that block, so the
-        // error must reach the caller. Its `COMMIT` would roll back silently.
-        RawBlock::Unknown => RawBlock::from_txid(
-            diesel::select(diesel::dsl::sql::<
+        RawBlock::Unknown => {
+            let probe = diesel::select(diesel::dsl::sql::<
                 diesel::sql_types::Nullable<diesel::sql_types::BigInt>,
             >("txid_current_if_assigned()"))
             .get_result::<Option<i64>>(conn)
-            .await
-            .map_err(crate::error::database_error)?,
-        ),
+            .await;
+            match probe {
+                Ok(txid) => RawBlock::from_txid(txid),
+                // A failed probe inside a raw block has aborted that block,
+                // so the error must reach the caller. Its `COMMIT` would roll
+                // back silently.
+                Err(error) if raw_block_aborted(conn).await => {
+                    return Err(crate::error::database_error(error));
+                }
+                // An autocommit write already committed. An error here would
+                // make a retry write it twice.
+                Err(_) => RawBlock::Outside,
+            }
+        }
         known => known,
     };
     if raw_block != RawBlock::Inside {
@@ -1007,6 +1018,25 @@ async fn send_outside_diesel_transaction(
     conn.batch_execute(undo)
         .await
         .map_err(crate::error::database_error)
+}
+
+/// True when a failed statement aborted a raw `BEGIN` block on `conn`.
+///
+/// In an aborted block, the server rejects every statement. Outside a block,
+/// `SELECT 1` succeeds. A lost connection fails with no answer from the
+/// server. Its block, if any, already rolled back, and the `COMMIT` of the
+/// caller then fails. That case therefore does not count as aborted.
+async fn raw_block_aborted(conn: &mut AsyncPgConnection) -> bool {
+    use diesel::result::{DatabaseErrorKind, Error};
+    use diesel_async::SimpleAsyncConnection as _;
+    !matches!(
+        conn.batch_execute("SELECT 1").await,
+        Ok(())
+            | Err(Error::DatabaseError(
+                DatabaseErrorKind::UnableToSendCommand | DatabaseErrorKind::ClosedConnection,
+                _,
+            ))
+    )
 }
 
 /// True when the transaction manager of `conn` is in its error state.
