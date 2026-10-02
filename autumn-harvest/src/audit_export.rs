@@ -1358,11 +1358,25 @@ async fn repair_and_build_unexported_index(
     Ok(())
 }
 
+/// A fingerprint of a database URL for use in a gate key.
+///
+/// The gates are process-wide statics. A URL can carry a password, and a key
+/// outlives the worker that made it. So a key holds this hash and never the
+/// URL text. The hash is stable inside one process, which is all a gate needs.
+#[cfg(feature = "db")]
+fn dsn_fingerprint(dsn: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    dsn.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// A shard of one audit table. The URL separates databases that share a shard
 /// number inside one process. The schema separates tenant tables in one
 /// database.
 #[cfg(feature = "db")]
-type BuildKey = (i32, String, String);
+type BuildKey = (i32, u64, String);
 
 /// Earliest time each shard may try another background index build.
 #[cfg(feature = "db")]
@@ -1402,6 +1416,7 @@ fn index_notice_due(key: &NoticeKey) -> bool {
     {
         return false;
     }
+    gate.retain(|_, last| now.duration_since(*last) < INDEX_NOTICE_INTERVAL);
     gate.insert(key.clone(), now);
     true
 }
@@ -1490,7 +1505,7 @@ fn notice_key(shard_id: i32, database: &str, schema: &str) -> NoticeKey {
 /// A shard, build URL and pool. The pool separates tenant schemas that share a
 /// shard number and a build URL.
 #[cfg(feature = "db")]
-type ProbeKey = (i32, String, usize);
+type ProbeKey = (i32, u64, usize);
 
 /// Shortest wait between two catalog probes for one [`ProbeKey`].
 #[cfg(feature = "db")]
@@ -1517,7 +1532,10 @@ fn index_probe_due(key: &ProbeKey) -> bool {
     if gate.get(key).is_some_and(|not_before| now < *not_before) {
         return false;
     }
-    gate.insert(key.clone(), now + INDEX_PROBE_INTERVAL);
+    // An expired entry means the same as no entry. Evict it, so churn in
+    // workers and pools cannot grow the map.
+    gate.retain(|_, not_before| now < *not_before);
+    gate.insert(*key, now + INDEX_PROBE_INTERVAL);
     true
 }
 
@@ -1588,6 +1606,7 @@ fn index_build_due(key: &BuildKey) -> bool {
     // stall after it connects, and a build can outlive any retry wait. A timed
     // gate would then reopen and stack another task per wait. So the gate stays
     // closed while the task lives, and its end sets the next wait.
+    gate.retain(|_, not_before| now < *not_before);
     gate.insert(key.clone(), now + INDEX_BUILD_IN_FLIGHT);
     true
 }
@@ -1737,7 +1756,7 @@ async fn spawn_unexported_index_build_if_due(
 ) {
     // One probe per interval. Without it, every tick of a healthy exporter
     // would read the catalogs.
-    if !index_probe_due(&(shard_id, build_dsn.unwrap_or_default().to_owned(), pool_id)) {
+    if !index_probe_due(&(shard_id, build_dsn.map_or(0, dsn_fingerprint), pool_id)) {
         return;
     }
     let Some(dsn) = build_dsn else {
@@ -1765,7 +1784,7 @@ async fn spawn_unexported_index_build_if_due(
             return;
         }
     };
-    let key: BuildKey = (shard_id, dsn.to_owned(), schema.clone());
+    let key: BuildKey = (shard_id, dsn_fingerprint(dsn), schema.clone());
     if !index_build_due(&key) {
         return;
     }
@@ -5024,7 +5043,7 @@ mod tests {
     fn the_index_build_gate_opens_only_on_a_ready_index() {
         let key: BuildKey = (
             9_001,
-            "postgres://gate-test/lock-busy".to_owned(),
+            dsn_fingerprint("postgres://gate-test/lock-busy"),
             "public".to_owned(),
         );
         assert!(index_build_due(&key), "a fresh key is due");
@@ -5134,7 +5153,7 @@ mod tests {
     fn an_in_flight_build_keeps_the_gate_closed_past_the_retry_wait() {
         let key: BuildKey = (
             9_003,
-            "postgres://gate-test/in-flight".to_owned(),
+            dsn_fingerprint("postgres://gate-test/in-flight"),
             "public".to_owned(),
         );
         assert!(index_build_due(&key));
@@ -5157,8 +5176,8 @@ mod tests {
     #[cfg(feature = "db")]
     #[test]
     fn the_build_gate_is_per_schema() {
-        let dsn = "postgres://gate-test/schemas".to_owned();
-        let first: BuildKey = (9_004, dsn.clone(), "tenant_a".to_owned());
+        let dsn = dsn_fingerprint("postgres://gate-test/schemas");
+        let first: BuildKey = (9_004, dsn, "tenant_a".to_owned());
         let second: BuildKey = (9_004, dsn, "tenant_b".to_owned());
         assert!(index_build_due(&first));
         index_build_finished(&first, BuildEnd::Refused);
@@ -5204,7 +5223,7 @@ mod tests {
     fn a_dropped_in_flight_guard_leaves_a_retry_wait() {
         let key: BuildKey = (
             9_005,
-            "postgres://gate-test/guard".to_owned(),
+            dsn_fingerprint("postgres://gate-test/guard"),
             "public".to_owned(),
         );
         let remaining = |key: &BuildKey| {
@@ -5236,8 +5255,9 @@ mod tests {
     #[cfg(feature = "db")]
     #[test]
     fn the_index_probe_is_throttled_per_pool() {
-        let key: ProbeKey = (9_006, "postgres://probe-test/db".to_owned(), 1);
-        let other_pool: ProbeKey = (9_006, "postgres://probe-test/db".to_owned(), 2);
+        let dsn = dsn_fingerprint("postgres://probe-test/db");
+        let key: ProbeKey = (9_006, dsn, 1);
+        let other_pool: ProbeKey = (9_006, dsn, 2);
         assert!(index_probe_due(&key), "the first tick probes");
         assert!(
             !index_probe_due(&key),
@@ -5247,6 +5267,74 @@ mod tests {
             index_probe_due(&other_pool),
             "another pool has its own gate"
         );
+    }
+
+    /// Issue #1667: the gates are process-wide statics. A build URL can carry a
+    /// password, so no key may hold its text. A fingerprint stands in for it.
+    #[cfg(feature = "db")]
+    #[test]
+    fn the_gate_keys_hold_no_dsn_text() {
+        let dsn = "postgres://user:s3cret-pass@host/db";
+        let fingerprint = dsn_fingerprint(dsn);
+        assert_eq!(fingerprint, dsn_fingerprint(dsn), "stable inside a process");
+        assert_ne!(
+            fingerprint,
+            dsn_fingerprint("postgres://user:other@host/db")
+        );
+        let key: ProbeKey = (1, fingerprint, 0);
+        assert!(!format!("{key:?}").contains("s3cret"));
+    }
+
+    /// Issue #1667: a gate entry that has expired means the same as no entry.
+    /// A long-lived process that churns workers must not keep it. Each new
+    /// admission evicts the expired entries.
+    #[cfg(feature = "db")]
+    #[test]
+    fn expired_gate_entries_are_evicted() {
+        let expired = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("an instant one second ago");
+        let stale_probe: ProbeKey = (9_008, dsn_fingerprint("postgres://evict/probe"), 1);
+        INDEX_PROBE_GATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(stale_probe, expired);
+        assert!(index_probe_due(&(
+            9_008,
+            dsn_fingerprint("postgres://evict/probe"),
+            2
+        )));
+        assert!(
+            !INDEX_PROBE_GATE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&stale_probe),
+            "an expired probe entry must be evicted"
+        );
+
+        let stale_build: BuildKey = (
+            9_008,
+            dsn_fingerprint("postgres://evict/build"),
+            "s".to_owned(),
+        );
+        INDEX_BUILD_GATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(stale_build.clone(), expired);
+        let fresh: BuildKey = (
+            9_008,
+            dsn_fingerprint("postgres://evict/build"),
+            "t".to_owned(),
+        );
+        assert!(index_build_due(&fresh));
+        assert!(
+            !INDEX_BUILD_GATE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&stale_build),
+            "an expired build entry must be evicted"
+        );
+        index_build_finished(&fresh, BuildEnd::Ready);
     }
 
     /// Issue #1667: a privilege failure is the one error a retry cannot fix.
