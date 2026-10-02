@@ -1551,7 +1551,7 @@ mod tests {
             &mut warnings,
         );
         assert_eq!(selections, vec![TargetSel::Lib]);
-        assert!(warnings.is_empty());
+        assert_eq!(warnings, [] as [std::string::String; 0]);
     }
 
     #[test]

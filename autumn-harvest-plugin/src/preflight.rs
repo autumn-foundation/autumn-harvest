@@ -1992,11 +1992,12 @@ mod tests {
         assert_eq!(result.name, "scanner_liveness");
         assert_eq!(result.status, PreflightStatus::Pass);
         assert_eq!(result.details["scanners_registered"], 2);
-        assert!(
+        assert_eq!(
             result.details["stale_scanners"]
                 .as_array()
                 .expect("stale_scanners must be an array")
-                .is_empty()
+                .as_slice(),
+            [] as [serde_json::Value; 0]
         );
         assert!(result.remediation.is_none());
     }
@@ -2343,7 +2344,7 @@ mod tests {
             privilege_row("harvest_task_queue", "UPDATE", true),
         ]);
 
-        assert!(missing.is_empty());
+        assert_eq!(missing, [] as [crate::preflight::MissingWritePrivilege; 0]);
     }
 
     #[test]
@@ -2440,7 +2441,10 @@ mod tests {
             true,
         )]);
 
-        assert!(missing.is_empty());
+        assert_eq!(
+            missing,
+            [] as [crate::preflight::MissingSequencePrivilege; 0]
+        );
     }
 
     #[test]
@@ -2715,13 +2719,13 @@ mod tests {
                 Some(&["send_email", "charge_card"]),
                 Some(&["generate_report"]),
             )];
-            assert!(
+            assert_eq!(
                 failures_for(
                     &workflows,
                     &["send_email", "charge_card"],
                     &["onboarding", "generate_report"],
-                )
-                .is_empty()
+                ),
+                [] as [std::string::String; 0]
             );
         }
 
@@ -2730,7 +2734,10 @@ mod tests {
             // The zero-false-positive guarantee: `None` is skipped outright, so
             // an empty registry cannot produce a failure for it.
             let workflows = [wf("legacy", None, None)];
-            assert!(failures_for(&workflows, &[], &[]).is_empty());
+            assert_eq!(
+                failures_for(&workflows, &[], &[]),
+                [] as [std::string::String; 0]
+            );
         }
 
         #[test]
@@ -2743,7 +2750,10 @@ mod tests {
             // and on the wire by
             // `registered_workflow_record_distinguishes_empty_declaration_from_absent`.
             let workflows = [wf("noop", Some(&[]), Some(&[]))];
-            assert!(failures_for(&workflows, &[], &[]).is_empty());
+            assert_eq!(
+                failures_for(&workflows, &[], &[]),
+                [] as [std::string::String; 0]
+            );
         }
 
         #[test]
@@ -2816,7 +2826,10 @@ mod tests {
             // Self-recursion is legal (`spawn_child_workflow` of one's own type);
             // the name resolves against the registry like any other.
             let workflows = [wf("recursive", None, Some(&["recursive"]))];
-            assert!(failures_for(&workflows, &[], &["recursive"]).is_empty());
+            assert_eq!(
+                failures_for(&workflows, &[], &["recursive"]),
+                [] as [std::string::String; 0]
+            );
         }
 
         #[test]

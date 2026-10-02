@@ -530,7 +530,7 @@ async fn discard_dead_letters_batch_on_empty_slice_is_a_no_op() {
     let deleted = discard_dead_letters_batch(&mut conn, &[])
         .await
         .expect("empty batch must succeed");
-    assert!(deleted.is_empty());
+    assert_eq!(deleted, [] as [uuid::Uuid; 0]);
 }
 
 /// A batch well past the old per-chunk cap other batched writers in this
