@@ -399,8 +399,8 @@ async fn one_shard_down_degrades_and_names_the_shard() {
         unavailable.iter().any(|u| u["shard_id"] == 1),
         "the down shard is named in unavailable_shards"
     );
-    assert_eq!(
-        !unavailable.iter().find(|u| u["shard_id"] == 1).unwrap()["reason"]
+    assert_ne!(
+        unavailable.iter().find(|u| u["shard_id"] == 1).unwrap()["reason"]
             .as_str()
             .unwrap()
             .len(),
