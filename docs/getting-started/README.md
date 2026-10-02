@@ -71,7 +71,7 @@ Start with [Chapter 1 →](01-project-skeleton.md)
 - **Embedding on plain Axum.** [`embedding.md`](../embedding.md) is the
   reference for the path without `HarvestPlugin`: auth, metrics, webhooks,
   shutdown, and multi-shard. [`examples/standalone-runner/`](../../examples/standalone-runner/)
-  is a larger example of that path.
+  is a larger example of that path. Its `Cargo.toml` names no `autumn-web`.
 - **Embedded SQLite backend.** [`sqlite-backend.md`](../sqlite-backend.md) is a
   task-oriented guide to `autumn-harvest-sqlite`, a single-writer, no-server
   persistence backend for edge / local-first / single-server deployments (its

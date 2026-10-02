@@ -1945,6 +1945,47 @@ fn schedule_runs_threads_filters_into_query() {
     assert!(path.contains("limit=50"), "path was {path}");
 }
 
+// ── schedule create-workflow jitter (issue #1792) ───────────────────────────
+
+#[test]
+fn schedule_create_workflow_sends_jitter_secs_only_when_set() {
+    let request = Cli::try_parse_from([
+        "harvest",
+        "schedule",
+        "create-workflow",
+        "--name",
+        "nightly",
+        "--cron",
+        "0 0 * * *",
+        "--jitter-secs",
+        "0",
+    ])
+    .expect("create-workflow args should parse")
+    .api_request()
+    .expect("create-workflow request should build");
+    let body = request.body.expect("create request must have a body");
+    assert_eq!(body["jitter_secs"], 0);
+
+    let request = Cli::try_parse_from([
+        "harvest",
+        "schedule",
+        "create-workflow",
+        "--name",
+        "nightly",
+        "--cron",
+        "0 0 * * *",
+    ])
+    .expect("create-workflow args should parse")
+    .api_request()
+    .expect("create-workflow request should build");
+    let body = request.body.expect("create request must have a body");
+    let obj = body.as_object().expect("body must be an object");
+    assert!(
+        !obj.contains_key("jitter_secs"),
+        "an omitted flag must leave the server default"
+    );
+}
+
 // ── schedule update (issue #771) ─────────────────────────────────────────────
 
 #[test]

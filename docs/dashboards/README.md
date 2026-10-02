@@ -127,6 +127,8 @@ panel finds the way back to the rule and its runbook section.
 | `harvest_shard_unready` | Readiness checks | Readiness: Shard readiness (text) | [runbook](../runbooks/harvest-alerts.md#harvest_shard_unready) |
 | `harvest_shard_undrained` | Cache, retention & shards | Stranded pending tasks by shard (companion: Dispatch rate by shard) | [runbook](../runbooks/harvest-alerts.md#harvest_shard_undrained) |
 | `harvest_dispatch_dropped_hints` | Cache, retention & shards | Dispatch dropped hints | [runbook](../runbooks/harvest-alerts.md#harvest_dispatch_dropped_hints) |
+| `harvest_notify_send_failures` | Cache, retention & shards | Notify send failures | [runbook](../runbooks/harvest-alerts.md#harvest_notify_send_failures) |
+| `harvest_notify_queue_usage_high` | Cache, retention & shards | Notify queue usage | [runbook](../runbooks/harvest-alerts.md#harvest_notify_queue_usage_high) |
 | `harvest_no_compatible_worker` | Readiness checks | Readiness: Build-routing compatibility (text) | [runbook](../runbooks/harvest-alerts.md#harvest_no_compatible_worker) |
 | `harvest_schedule_ha_domination` | Schedules & triggers | Schedule HA fire attempts | [runbook](../runbooks/harvest-alerts.md#harvest_schedule_ha_domination) |
 | `harvest_workflow_failure_rate` | Overview | Workflow failure ratio | [runbook](../runbooks/harvest-alerts.md#harvest_workflow_failure_rate) |

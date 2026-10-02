@@ -785,6 +785,29 @@ pub enum HarvestError {
         reason: String,
     },
 
+    /// A shard checkout named a shard outside the request's shard fence
+    /// (issue #1803).
+    ///
+    /// The authorizer hook fences a request to the shards its policy allowed
+    /// ([`crate::shard_fence`]). A rebalance cutover after that check can
+    /// move the run to another shard. The handler then names that shard, and
+    /// this error stops the checkout before any read or write there.
+    ///
+    /// **Retryable.** Nothing was read or written on `shard_id`. The
+    /// management API answers `503` with a retry hint. The retry resolves
+    /// the run on its new shard, and the policy decides on that shard.
+    ///
+    /// Distinct from [`HarvestError::ShardFenced`]. That variant is the
+    /// write-authority fence, and a caller must not retry it.
+    #[error(
+        "shard {shard_id} is outside the authorized shard set of this request: \
+         the execution moved after authorization; retry the request"
+    )]
+    OutsideShardFence {
+        /// The shard the checkout named.
+        shard_id: i32,
+    },
+
     /// Delivery of a `signal_external_workflow`/`signal_external_workflow_by_id`
     /// call failed permanently.
     ///

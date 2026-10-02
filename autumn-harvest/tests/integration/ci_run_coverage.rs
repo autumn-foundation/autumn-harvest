@@ -310,7 +310,8 @@ fn allowlisted(key: &str) -> bool {
 struct SuiteRow {
     /// `linux` | `linuxpart` | `allos` | `compileonly`.
     osclass: String,
-    /// `autumn-harvest` | `autumn-harvest-plugin` | `autumn-harvest-redis`.
+    /// `autumn-harvest` | `autumn-harvest-plugin` | `autumn-harvest-redis` |
+    /// `standalone-runner`.
     krate: String,
     /// The `--test <target>` binary (core suites use `integration`).
     target: String,
@@ -367,6 +368,8 @@ fn parse_manifest() -> Vec<SuiteRow> {
         "autumn-harvest",
         "autumn-harvest-plugin",
         "autumn-harvest-redis",
+        // Issue #1615: the example's live-Postgres acceptance suite.
+        "standalone-runner",
     ];
     let mut out = Vec::new();
     for (n, line) in MANIFEST.lines().enumerate() {
@@ -868,6 +871,32 @@ fn claim_budget_gate_has_a_covering_manifest_row() {
     );
 }
 
+/// Issue #1615. Each test target of the `standalone-runner` example runs
+/// from a manifest row. The guard above scans only the core and plugin
+/// test directories, so a deleted row would go unseen.
+#[test]
+fn standalone_runner_test_targets_have_a_running_row() {
+    let rows = parse_manifest();
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../examples/standalone-runner/tests");
+    let targets: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            (path.extension()? == "rs").then(|| path.file_stem()?.to_str().map(str::to_owned))?
+        })
+        .collect();
+    assert!(!targets.is_empty(), "the example has an acceptance suite");
+    for target in targets {
+        assert!(
+            rows.iter().any(|r| r.krate == "standalone-runner"
+                && r.target == target
+                && r.osclass == "linux"
+                && r.filter == "-"),
+            "examples/standalone-runner/tests/{target}.rs needs a `linux standalone-runner {target}` row"
+        );
+    }
+}
+
 #[test]
 fn strip_line_comments_drops_prose_container_tokens() {
     let src = "//! see the testcontainers suite\nlet x = 1; // TestDb reference in prose\ncode();";
@@ -1325,7 +1354,7 @@ fn cited_workflows() -> BTreeSet<String> {
 /// This is a YAML syntax check only. It does not check the GitHub workflow
 /// schema, so an unknown key or a bad expression still passes. For
 /// `chaos.yml`, the watchdog reports that case within about 2.5 days.
-fn parse_workflow_text(text: &str) -> Result<serde_yaml::Value, String> {
+pub fn parse_workflow_text(text: &str) -> Result<serde_yaml::Value, String> {
     serde_yaml::from_str(text).map_err(|e| e.to_string())
 }
 
@@ -1443,17 +1472,17 @@ fn all_workflows() -> BTreeSet<String> {
 }
 
 /// `cargo test` flags that run no test, or less than the whole module.
-const NO_FULL_RUN_FLAGS: &[&str] = &["--no-run", "--exact", "--skip", "--ignored", "--list"];
+pub const NO_FULL_RUN_FLAGS: &[&str] = &["--no-run", "--exact", "--skip", "--ignored", "--list"];
 
 /// Shell text that joins a second command to the step, or runs the command
 /// inside another one. Either can hide a failed `cargo test` or replace it.
-const SHELL_OPERATORS: &[&str] = &[";", "&", "|", "\n", "`", "$("];
+pub const SHELL_OPERATORS: &[&str] = &[";", "&", "|", "\n", "`", "$("];
 
 /// True when a job or step has no `if` and no `continue-on-error: true`.
 ///
 /// An `if` can skip the step on the nightly. A `continue-on-error` makes a
 /// failed suite look green to the watchdog, which counts successful runs.
-fn ungated(node: &serde_yaml::Value) -> bool {
+pub fn ungated(node: &serde_yaml::Value) -> bool {
     let soft = node
         .get("continue-on-error")
         .is_some_and(|v| v.as_bool() != Some(false));

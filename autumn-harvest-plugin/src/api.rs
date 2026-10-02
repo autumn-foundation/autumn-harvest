@@ -90,7 +90,8 @@ use autumn_harvest::models::{
 };
 use autumn_harvest::payload_codec::{LossyDecodeOutcome, PayloadCodecs};
 use autumn_harvest::policy::{
-    Schedule, SkipPolicy, WorkflowSchedule, compute_jitter_offset, validate_jitter,
+    Schedule, SkipPolicy, WorkflowSchedule, compute_jitter_offset, default_schedule_jitter,
+    validate_jitter,
 };
 use autumn_harvest::queue::{self, ConcurrencyKeyStats};
 use autumn_harvest::reset::{
@@ -3070,6 +3071,14 @@ struct PauseResumeRequest {
     reason: Option<String>,
 }
 
+/// Resolve a request `jitter_secs`. An omitted value gets `default_schedule_jitter`.
+fn requested_jitter(jitter_secs: Option<u64>, schedule: &Schedule) -> std::time::Duration {
+    jitter_secs.map_or_else(
+        || default_schedule_jitter(schedule),
+        std::time::Duration::from_secs,
+    )
+}
+
 /// Request body for `POST /admin/schedules/workflow`.
 #[derive(Debug, Deserialize)]
 struct CreateWorkflowScheduleRequest {
@@ -3092,9 +3101,10 @@ struct CreateWorkflowScheduleRequest {
     paused: bool,
     #[serde(default = "default_queue_name")]
     queue_name: String,
-    /// Jitter window in seconds. `0` disables jitter (default).
+    /// Jitter window in seconds. `0` disables jitter. If the request omits this
+    /// field, the schedule gets `default_schedule_jitter` (issue #1792).
     #[serde(default)]
-    jitter_secs: u64,
+    jitter_secs: Option<u64>,
     /// Overlap policy string (e.g. `"skip"`, `"buffer_one"`, `"buffer_all"`,
     /// `"cancel_other"`, `"terminate_other"`). Defaults to `"skip"`.
     #[serde(default = "default_overlap_policy")]
@@ -4058,8 +4068,8 @@ async fn lift_gate_handler(
 #[derive(serde::Deserialize)]
 struct CreateTokenRequest {
     name: String,
-    /// `"read"` or `"mutate"` — the verb-level scope drawn from the route
-    /// classification. Defaults to `read` (least privilege) when omitted.
+    /// `"read"`, `"mutate"` or `"admin"`: the verb-level scope drawn from the
+    /// route classification. Defaults to `read` (least privilege) when omitted.
     #[serde(default = "default_token_scope")]
     scope: String,
     /// Optional expiry; an expired token is rejected 401 on the next request.
@@ -4084,7 +4094,10 @@ async fn create_token_handler(
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
-                "error": format!("unknown scope '{}' (expected 'read' or 'mutate')", body.scope)
+                "error": format!(
+                    "unknown scope '{}' (expected 'read', 'mutate' or 'admin')",
+                    body.scope
+                )
             })),
         )
             .into_response();
@@ -5550,6 +5563,7 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
 pub struct StandaloneAdminAuth {
     api_tokens: bool,
     read_only_role: bool,
+    authorizer: Option<crate::authz::SharedAuthorizer>,
     admin_auth_boundary: bool,
     allow_unauthenticated_mutations: bool,
     deployment_profile: Option<String>,
@@ -5585,6 +5599,17 @@ impl StandaloneAdminAuth {
     #[must_use]
     pub const fn with_read_only_role(mut self) -> Self {
         self.read_only_role = true;
+        self
+    }
+
+    /// Install an authorizer hook (issue #1803).
+    ///
+    /// The hook sees each request after the token and read-only layers. It can
+    /// deny by principal, route class, tenant key or shard. See
+    /// [`crate::authz`] for the contract.
+    #[must_use]
+    pub fn with_authorizer(mut self, authorizer: impl crate::authz::HarvestAuthorizer) -> Self {
+        self.authorizer = Some(crate::authz::SharedAuthorizer::new(authorizer));
         self
     }
 
@@ -5650,9 +5675,9 @@ impl StandaloneAdminAuth {
     ///
     /// When an embedder auth boundary is declared, apply it outside. The
     /// request order is then: embedder auth -> token layer -> read-only-role
-    /// layer -> per-route `require_admin` -> handler. Without that
-    /// declaration, enabling API tokens additionally installs a fail-closed
-    /// token requirement on every non-public route.
+    /// layer -> authorizer -> per-route `require_admin` -> handler. Without
+    /// that declaration, enabling API tokens additionally installs a
+    /// fail-closed token requirement on every non-public route.
     ///
     /// [`harvest_ui_router`]: crate::harvest_ui_router
     /// [`HarvestPlugin`]: crate::HarvestPlugin
@@ -5665,8 +5690,15 @@ impl StandaloneAdminAuth {
         if let Some(session_key) = &self.admin_auth_session_key {
             api_state.set_admin_auth_session_key(session_key.clone());
         }
-        let router =
-            apply_admin_auth_layers(router, api_state, self.api_tokens, self.read_only_role);
+        let router = apply_admin_auth_layers(
+            router,
+            api_state,
+            &AdminAuthLayers {
+                api_tokens: self.api_tokens,
+                read_only_role: self.read_only_role,
+                authorizer: self.authorizer.clone(),
+            },
+        );
         if self.api_tokens && !self.admin_auth_boundary {
             router.layer(middleware::from_fn(
                 crate::api_token::require_token_for_non_public,
@@ -5675,6 +5707,16 @@ impl StandaloneAdminAuth {
             router
         }
     }
+}
+
+/// The opt-in layers [`apply_admin_auth_layers`] installs.
+pub(crate) struct AdminAuthLayers {
+    /// The scoped-API-token layer (issue #942).
+    pub api_tokens: bool,
+    /// The read-only-role layer (issue #776).
+    pub read_only_role: bool,
+    /// The authorizer hook (issue #1803).
+    pub authorizer: Option<crate::authz::SharedAuthorizer>,
 }
 
 /// Wrap a composed Harvest router in the admin-auth layer stack.
@@ -5696,19 +5738,28 @@ impl StandaloneAdminAuth {
 /// sets `TokenPrincipal` and the authoritative actor, then denies a read-scope
 /// mutation. It sits INSIDE the embedder's auth middleware.
 ///
-/// Neither layer is installed unless asked for, so a deployment that declares
-/// neither does an identical amount of work as before.
+/// Issue #1803: the authorizer layer is installed INSIDE the read-only-class
+/// layer. It runs after both built-in gates, so it can only deny. It sees the
+/// `TokenPrincipal` the token layer sets.
+///
+/// No layer is installed unless asked for, so a deployment that declares none
+/// does an identical amount of work as before.
 pub(crate) fn apply_admin_auth_layers(
     router: Router<()>,
     api_state: &HarvestApiState,
-    api_tokens: bool,
-    read_only_role: bool,
+    layers: &AdminAuthLayers,
 ) -> Router<()> {
     let mut router = router;
-    if read_only_role {
+    if let Some(authorizer) = &layers.authorizer {
+        router = router.layer(middleware::from_fn_with_state(
+            (api_state.clone(), authorizer.clone()),
+            crate::authz::enforce_authorizer,
+        ));
+    }
+    if layers.read_only_role {
         router = router.layer(middleware::from_fn(enforce_read_only_class));
     }
-    if api_tokens {
+    if layers.api_tokens {
         router = router.layer(middleware::from_fn_with_state(
             api_state.clone(),
             crate::api_token::enforce_token_scope,
@@ -6072,45 +6123,72 @@ fn normalize_route_template(path: &str) -> String {
     out
 }
 
-/// Per-method radix-tree matchers over `CLASSIFIED_ROUTES`, built once.
+/// Per-method radix-tree matchers over one route table.
 ///
-/// Keyed per HTTP method because the same path can carry a different class per
+/// Keyed per HTTP method because the same path can carry a different value per
 /// method (e.g. `GET /admin/schedules/{id}` is `ReadOnly`, `DELETE` is
 /// `Mutating`).
-fn route_class_matchers() -> &'static HashMap<axum::http::Method, matchit::Router<RouteClass>> {
-    static MATCHERS: std::sync::OnceLock<HashMap<axum::http::Method, matchit::Router<RouteClass>>> =
-        std::sync::OnceLock::new();
-    MATCHERS.get_or_init(|| {
-        let mut by_method: HashMap<axum::http::Method, matchit::Router<RouteClass>> =
-            HashMap::new();
-        for (template, class) in CLASSIFIED_ROUTES {
-            let Some((method, path)) = template.split_once(' ') else {
-                debug_assert!(false, "malformed CLASSIFIED_ROUTES template: {template}");
-                continue;
-            };
-            let Ok(method) = method.parse::<axum::http::Method>() else {
-                debug_assert!(false, "unknown method in CLASSIFIED_ROUTES: {template}");
-                continue;
-            };
-            let normalized = normalize_route_template(path);
-            let router = by_method.entry(method).or_default();
-            if let Err(e) = router.insert(normalized, *class) {
-                // Fail closed, never panic (F4): a future post-normalization
-                // collision must not crash the first read-only request and
-                // poison the `OnceLock`. A skipped route stays unclassified →
-                // `classify_route` → `Mutating` → denied to read-only
-                // principals (over-restriction, never exposure). The
-                // build-time `route_class_matchers_build_without_conflict`
-                // test (debug_assert active) still fails CI on any conflict.
-                tracing::error!(
-                    template = %template,
-                    error = %e,
-                    "harvest: CLASSIFIED_ROUTES matcher insert failed; route will fail closed (deny read-only)"
-                );
-                debug_assert!(false, "matcher insert conflict for '{template}': {e}");
-            }
+pub(crate) type RouteMatchers<T> = HashMap<axum::http::Method, matchit::Router<T>>;
+
+/// Build [`RouteMatchers`] from `(template, value)` pairs. `table` names the
+/// source table in a conflict log.
+pub(crate) fn build_route_matchers<T>(
+    table: &str,
+    entries: impl IntoIterator<Item = (&'static str, T)>,
+) -> RouteMatchers<T> {
+    let mut by_method: RouteMatchers<T> = HashMap::new();
+    for (template, value) in entries {
+        let Some((method, path)) = template.split_once(' ') else {
+            debug_assert!(false, "malformed {table} template: {template}");
+            continue;
+        };
+        let Ok(method) = method.parse::<axum::http::Method>() else {
+            debug_assert!(false, "unknown method in {table}: {template}");
+            continue;
+        };
+        let normalized = normalize_route_template(path);
+        let router = by_method.entry(method).or_default();
+        if let Err(e) = router.insert(normalized, value) {
+            // Fail closed, never panic (F4): a future post-normalization
+            // collision must not crash the first request and poison the
+            // `OnceLock`. A skipped route stays unmatched, and every caller
+            // treats unmatched as the restrictive answer. The build-time
+            // `route_class_matchers_build_without_conflict` test (debug_assert
+            // active) still fails CI on any conflict.
+            tracing::error!(
+                table = %table,
+                template = %template,
+                error = %e,
+                "harvest: route matcher insert failed; route will fail closed"
+            );
+            debug_assert!(false, "matcher insert conflict for '{template}': {e}");
         }
-        by_method
+    }
+    by_method
+}
+
+/// Look up `path` for `method` in `matchers`.
+///
+/// `HEAD` is looked up under `GET` (F3): axum serves `HEAD` via the `GET`
+/// handler, so a `HEAD` probe inherits that route's value.
+pub(crate) fn match_route<'m, T>(
+    matchers: &'m RouteMatchers<T>,
+    method: &axum::http::Method,
+    path: &'m str,
+) -> Option<matchit::Match<'m, 'm, &'m T>> {
+    let lookup_method = if *method == axum::http::Method::HEAD {
+        &axum::http::Method::GET
+    } else {
+        method
+    };
+    matchers.get(lookup_method)?.at(path).ok()
+}
+
+/// Per-method matchers over `CLASSIFIED_ROUTES`, built once.
+fn route_class_matchers() -> &'static RouteMatchers<RouteClass> {
+    static MATCHERS: std::sync::OnceLock<RouteMatchers<RouteClass>> = std::sync::OnceLock::new();
+    MATCHERS.get_or_init(|| {
+        build_route_matchers("CLASSIFIED_ROUTES", CLASSIFIED_ROUTES.iter().copied())
     })
 }
 
@@ -6124,19 +6202,120 @@ fn route_class_matchers() -> &'static HashMap<axum::http::Method, matchit::Route
 /// read class rather than fail closed to `Mutating` and 403 a read-only
 /// dashboard's existence/size probe.
 pub(crate) fn classify_route(method: &axum::http::Method, path: &str) -> RouteClass {
-    let get = axum::http::Method::GET;
-    let lookup_method = if *method == axum::http::Method::HEAD {
-        &get
-    } else {
-        method
-    };
-    let Some(router) = route_class_matchers().get(lookup_method) else {
-        return RouteClass::Mutating;
-    };
-    match router.at(path) {
-        Ok(m) => *m.value,
-        Err(_) => RouteClass::Mutating,
+    match_route(route_class_matchers(), method, path).map_or(RouteClass::Mutating, |m| *m.value)
+}
+
+/// Path prefixes under which every mutation is admin-only (issue #1803).
+///
+/// This catches a future token or module route that someone forgets to add to
+/// [`autumn_harvest::audit::ADMIN_SCOPE_ROUTES`].
+const ADMIN_SCOPE_PREFIXES: &[&str] = &["/admin/tokens", "/admin/modules", "/modules"];
+
+/// Whether only an `admin`-scoped token may call this route (issue #1803).
+///
+/// Backed by [`autumn_harvest::audit::ADMIN_SCOPE_ROUTES`], plus any mutation
+/// under [`ADMIN_SCOPE_PREFIXES`]. A path that matches neither is not
+/// admin-only, but [`classify_route`] still treats it as `Mutating`.
+pub(crate) fn requires_admin_scope(method: &axum::http::Method, path: &str) -> bool {
+    static MATCHERS: std::sync::OnceLock<RouteMatchers<()>> = std::sync::OnceLock::new();
+    let safe = matches!(
+        *method,
+        axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
+    );
+    let under_prefix = ADMIN_SCOPE_PREFIXES.iter().any(|prefix| {
+        path.strip_prefix(prefix)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    });
+    if !safe && under_prefix {
+        return true;
     }
+    let matchers = MATCHERS.get_or_init(|| {
+        build_route_matchers(
+            "ADMIN_SCOPE_ROUTES",
+            autumn_harvest::audit::ADMIN_SCOPE_ROUTES
+                .iter()
+                .map(|route| (*route, ())),
+        )
+    });
+    match_route(matchers, method, path).is_some()
+}
+
+/// The positional name of the execution-id parameter in a route template.
+///
+/// `{exec_id}` and `{run_exec_id}` are execution ids wherever they occur.
+/// `{id}` is one only directly under `/workflows/`. Elsewhere `{id}` names a
+/// token, gate or schedule, whose UUID bits do not encode a shard.
+fn execution_param(template: &str) -> Option<String> {
+    let (_, path) = template.split_once(' ')?;
+    let params = path
+        .split('/')
+        .filter(|seg| seg.starts_with('{') && seg.ends_with('}'));
+    for (idx, param) in params.enumerate() {
+        let is_exec = matches!(param, "{exec_id}" | "{run_exec_id}")
+            || (param == "{id}" && path.starts_with("/workflows/{id}"));
+        if is_exec {
+            return Some(format!("p{idx}"));
+        }
+    }
+    None
+}
+
+/// Parse one raw path segment as an execution id.
+///
+/// The segment is percent-decoded first, as axum's `Path` extractor does.
+fn parse_execution_segment(raw: &str) -> Option<autumn_harvest::types::ExecutionId> {
+    let decoded = percent_encoding::percent_decode_str(raw)
+        .decode_utf8()
+        .ok()?;
+    let uuid = uuid::Uuid::parse_str(&decoded).ok()?;
+    Some(autumn_harvest::types::ExecutionId::from_uuid(uuid))
+}
+
+/// The execution id a Vantage route under `/ui` names, if any.
+///
+/// Vantage names an execution as `/ui/workflows/{id}/...` or
+/// `/ui/dags/{dag_name}/runs/{run_exec_id}/...`.
+fn ui_execution_id(path: &str) -> Option<autumn_harvest::types::ExecutionId> {
+    let mut segments = path.strip_prefix("/ui/")?.split('/');
+    match (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) {
+        (Some("workflows"), Some(id), _, _) | (Some("dags"), Some(_), Some("runs"), Some(id)) => {
+            parse_execution_segment(id)
+        }
+        _ => None,
+    }
+}
+
+/// The execution id a route names in its path, if any (issue #1803).
+///
+/// A management route is matched against `CLASSIFIED_ROUTES`. Only the
+/// parameter [`execution_param`] picks is decoded, so a token or gate UUID
+/// never yields a shard. A Vantage route under `/ui` uses
+/// [`ui_execution_id`].
+pub(crate) fn execution_id_in_path(
+    method: &axum::http::Method,
+    path: &str,
+) -> Option<autumn_harvest::types::ExecutionId> {
+    static MATCHERS: std::sync::OnceLock<RouteMatchers<Option<String>>> =
+        std::sync::OnceLock::new();
+    if path.starts_with("/ui/") {
+        return ui_execution_id(path);
+    }
+    let matchers = MATCHERS.get_or_init(|| {
+        build_route_matchers(
+            "CLASSIFIED_ROUTES",
+            CLASSIFIED_ROUTES
+                .iter()
+                .map(|(template, _)| (*template, execution_param(template))),
+        )
+    });
+    let matched = match_route(matchers, method, path)?;
+    let param = matched.value.as_deref()?;
+    parse_execution_segment(matched.params.get(param)?)
 }
 
 /// A `403 Forbidden` for a read-only principal that attempted a mutation
@@ -27688,6 +27867,7 @@ async fn create_workflow_schedule(
         }
     }
 
+    let jitter = requested_jitter(request.jitter_secs, &schedule);
     let ws = WorkflowSchedule {
         workflow_name: request.workflow_name.clone(),
         dag_name: None,
@@ -27697,7 +27877,7 @@ async fn create_workflow_schedule(
         max_active_runs: request.max_active_runs,
         paused: request.paused,
         queue_name: request.queue_name.clone(),
-        jitter: std::time::Duration::from_secs(request.jitter_secs),
+        jitter,
         overlap_policy,
         buffer_all_max: request.buffer_all_max,
         execution_timeout: None,
@@ -32599,7 +32779,7 @@ fn parse_bulk_dlq_request(
     }
 }
 
-fn is_form_urlencoded(headers: &axum::http::HeaderMap) -> bool {
+pub(crate) fn is_form_urlencoded(headers: &axum::http::HeaderMap) -> bool {
     headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
@@ -40664,6 +40844,85 @@ pub(crate) async fn resolve_shard_best_effort(
         .ok()
 }
 
+/// Whether `error` is the request's shard fence refusing a checkout
+/// (issue #1803). The match is on the variant, never on the message text.
+const fn left_shard_fence(error: &HarvestError) -> bool {
+    matches!(error, HarvestError::OutsideShardFence { .. })
+}
+
+/// The outcome of a checkout an SSE producer makes on a run's live shard
+/// (issue #1803).
+///
+/// The producers run under the request's shard fence. A cutover after the
+/// stream opened moves the run to a shard the policy never saw. The fence
+/// then refuses every checkout there. The producer must not keep waiting on
+/// the old shard. The keepalive pings would hold the connection open, and
+/// the client would never reconnect. So a fenced miss ends the stream with
+/// an `error` frame. The reconnect is authorized against the live shard.
+enum FencedCheckout<T> {
+    /// The checkout succeeded.
+    Ready(T),
+    /// A transient failure. The producer keeps its listener and retries on
+    /// the next tick, as it did before the fence existed.
+    Retry,
+    /// The run left the request's shard fence. The producer ends the stream.
+    LeftFence,
+}
+
+impl<T> FencedCheckout<T> {
+    /// Sort an engine result into the three outcomes.
+    fn from_result(result: HarvestResult<T>) -> Self {
+        match result {
+            Ok(value) => Self::Ready(value),
+            Err(error) if left_shard_fence(&error) => Self::LeftFence,
+            Err(_) => Self::Retry,
+        }
+    }
+}
+
+/// [`db_conn_for_execution`] for an SSE producer. It keeps the engine error,
+/// so a fenced miss is told apart from a transient failure by its variant.
+async fn stream_conn_for_execution(
+    api_state: &HarvestApiState,
+    exec_id: ExecutionId,
+) -> FencedCheckout<PoolConn> {
+    let Ok(pool) = api_state.storage_pool() else {
+        return FencedCheckout::Retry;
+    };
+    FencedCheckout::from_result(
+        ::autumn_harvest::shard_rebalance::conn_for_execution_forwarded(
+            pool.sharded_pool(),
+            exec_id,
+        )
+        .await,
+    )
+}
+
+/// The shard `exec_id` lives on now, for an SSE producer's listener rebind.
+/// The walk follows the forwarding pointer with a checkout on each hop, so
+/// a run that moved outside the fence is caught here first.
+async fn stream_live_shard(
+    api_state: &HarvestApiState,
+    exec_id: ExecutionId,
+) -> FencedCheckout<ShardId> {
+    let Ok(pool) = api_state.storage_pool() else {
+        return FencedCheckout::Retry;
+    };
+    FencedCheckout::from_result(
+        ::autumn_harvest::shard_rebalance::resolve_execution_shard(pool.sharded_pool(), exec_id)
+            .await,
+    )
+}
+
+/// The final frame of a stream whose run left the request's shard fence
+/// (issue #1803). `retry` tells the client to reconnect. The reconnect is
+/// authorized against the live shard.
+fn shard_fence_error_event() -> axum::response::sse::Event {
+    axum::response::sse::Event::default()
+        .event("error")
+        .data(serde_json::json!({ "error": "outside_shard_fence", "retry": true }).to_string())
+}
+
 /// Resolve a connection to the shard that *owns* `exec_id`, with **no default
 /// fallback** — for reads whose answer is "does this execution exist?".
 ///
@@ -43909,8 +44168,15 @@ async fn stream_execution_events(
     let keepalive_interval = api_state.sse_keepalive_interval();
     let api_clone = api_state.clone();
 
+    // The producer re-resolves the run on every poll. It runs under the
+    // request's shard fence, so a cutover mid-stream cannot lead it onto a
+    // shard the authorizer never saw (issue #1803). A fenced miss ends the
+    // stream with an `error` frame, so the client reconnects and the
+    // reconnect is authorized against the live shard. See `FencedCheckout`.
+    let fence = ::autumn_harvest::shard_fence::current();
+
     // Producer task: runs independently of the HTTP handler after we return
-    tokio::spawn(async move {
+    tokio::spawn(::autumn_harvest::shard_fence::scoped(fence, async move {
         use autumn_harvest::audit::OP_EXECUTION_STREAM_CLOSE;
 
         // Frames are built by sse_frame_data: the inner payload of the
@@ -44050,13 +44316,18 @@ async fn stream_execution_events(
                 // shard. Without this rebind the stream would silently
                 // degrade from event-driven to poll-only delivery for the
                 // rest of its life once a migration happens.
-                if let Ok(pool) = api_clone.storage_pool()
-                    && let Ok(current_shard) =
-                        ::autumn_harvest::shard_rebalance::resolve_execution_shard(
-                            pool.sharded_pool(),
-                            exec_id,
-                        )
-                        .await
+                //
+                // A fenced miss ends the stream (issue #1803). The run moved
+                // to a shard the policy never saw.
+                let current_shard = match stream_live_shard(&api_clone, exec_id).await {
+                    FencedCheckout::Ready(shard) => Some(shard),
+                    FencedCheckout::Retry => None,
+                    FencedCheckout::LeftFence => {
+                        let _ = tx.send(Ok(shard_fence_error_event())).await;
+                        break 'notify;
+                    }
+                };
+                if let Some(current_shard) = current_shard
                     && current_shard != listener_shard
                     && let Ok(url) = api_clone.sse_notification_url(current_shard)
                     && let Ok(l) = WorkflowEventListener::connect(&url).await
@@ -44082,18 +44353,26 @@ async fn stream_execution_events(
                     // the new shard's own `id` sequence. That is the
                     // exact bug this translation exists to prevent.
                     last_seen_id = match last_seen_event_id {
-                        Some(event_id) => match db_conn_for_execution(&api_clone, exec_id).await {
-                            Ok(mut target_conn) => ::autumn_harvest::store::row_id_for_event_id(
-                                &mut target_conn,
-                                exec_id,
-                                event_id,
-                            )
-                            .await
-                            .ok()
-                            .flatten()
-                            .unwrap_or(-1),
-                            Err(_) => -1,
-                        },
+                        Some(event_id) => {
+                            match stream_conn_for_execution(&api_clone, exec_id).await {
+                                FencedCheckout::Ready(mut target_conn) => {
+                                    ::autumn_harvest::store::row_id_for_event_id(
+                                        &mut target_conn,
+                                        exec_id,
+                                        event_id,
+                                    )
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                    .unwrap_or(-1)
+                                }
+                                FencedCheckout::LeftFence => {
+                                    let _ = tx.send(Ok(shard_fence_error_event())).await;
+                                    break 'notify;
+                                }
+                                FencedCheckout::Retry => -1,
+                            }
+                        }
                         None => -1,
                     };
                     listener = l;
@@ -44113,8 +44392,8 @@ async fn stream_execution_events(
 
                         // Load new events from the pool — capped to buffer_depth so
                         // rapid bursts between notifications stay bounded in memory.
-                        let new_rows = match db_conn_for_execution(&api_clone, exec_id).await {
-                            Ok(mut conn) => {
+                        let new_rows = match stream_conn_for_execution(&api_clone, exec_id).await {
+                            FencedCheckout::Ready(mut conn) => {
                                 match store::load_events_after_row_id(
                                     &mut conn,
                                     exec_id,
@@ -44130,7 +44409,12 @@ async fn stream_execution_events(
                                     Err(_) => continue,
                                 }
                             }
-                            Err(_) => continue,
+                            // The run left the fence (issue #1803): end the stream.
+                            FencedCheckout::LeftFence => {
+                                let _ = tx.send(Ok(shard_fence_error_event())).await;
+                                break 'notify;
+                            }
+                            FencedCheckout::Retry => continue,
                         };
 
                         let (new_id, new_event_id, terminal_state, should_break) =
@@ -44170,8 +44454,14 @@ async fn stream_execution_events(
                         }
                         // Periodic safety-net poll: catch any events missed due to a
                         // prior DB failure on a notification (e.g. terminal event).
-                        let Ok(mut conn) = db_conn_for_execution(&api_clone, exec_id).await else {
-                            continue 'notify;
+                        // A run that left the fence ends the stream (issue #1803).
+                        let mut conn = match stream_conn_for_execution(&api_clone, exec_id).await {
+                            FencedCheckout::Ready(conn) => conn,
+                            FencedCheckout::LeftFence => {
+                                let _ = tx.send(Ok(shard_fence_error_event())).await;
+                                break 'notify;
+                            }
+                            FencedCheckout::Retry => continue 'notify,
                         };
                         let Ok(missed) = store::load_events_after_row_id(
                             &mut conn,
@@ -44226,9 +44516,15 @@ async fn stream_execution_events(
                             break 'notify;
                         };
                         listener = l;
-                        // Backfill events missed during reconnection window
-                        let Ok(mut conn) = db_conn_for_execution(&api_clone, exec_id).await else {
-                            continue 'notify;
+                        // Backfill events missed during reconnection window.
+                        // A run that left the fence ends the stream (issue #1803).
+                        let mut conn = match stream_conn_for_execution(&api_clone, exec_id).await {
+                            FencedCheckout::Ready(conn) => conn,
+                            FencedCheckout::LeftFence => {
+                                let _ = tx.send(Ok(shard_fence_error_event())).await;
+                                break 'notify;
+                            }
+                            FencedCheckout::Retry => continue 'notify,
                         };
                         let Ok(missed) = store::load_events_after_row_id(
                             &mut conn,
@@ -44299,7 +44595,7 @@ async fn stream_execution_events(
             };
             let _ = audit::insert_audit(&mut conn, &ar).await;
         }
-    });
+    }));
 
     // Return the SSE response. axum's KeepAlive wrapper sends `: ping\n\n`
     // comments every keepalive_interval so proxies don't idle the connection.
@@ -44336,30 +44632,51 @@ const PROGRESS_STREAM_CHANNEL_CAPACITY: usize = 256;
 /// chunk is not lost on close.
 const PROGRESS_STREAM_FINAL_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(75);
 
+/// What the progress stream's terminal-state poll found.
+enum ProgressPoll {
+    /// The run reached a terminal state, or its row is gone. The stream ends
+    /// with `event: end` and this reason.
+    End(String),
+    /// The run is still live, or the poll hit a transient failure. The next
+    /// idle tick polls again.
+    Wait,
+    /// The run left the request's shard fence (issue #1803). The stream ends
+    /// with `event: error`, and the client reconnects.
+    LeftFence,
+}
+
 /// Poll the execution's terminal state for the progress stream's close check.
 ///
-/// Returns `Some(reason)` when the stream should end — the execution reached a
-/// terminal state, or its row was retention-deleted (which only happens once an
-/// execution is already terminal) — and `None` to keep waiting (still running,
-/// or a transient DB/pool error the next idle tick retries).
+/// [`ProgressPoll::End`] means the stream should end. The execution reached
+/// a terminal state, or retention deleted its row. Retention only deletes a
+/// terminal execution. [`ProgressPoll::Wait`] keeps the stream waiting. The
+/// run is still live, or a transient DB or pool error hit, and the next idle
+/// tick retries. A checkout the shard fence refuses is
+/// [`ProgressPoll::LeftFence`], never a wait.
 async fn progress_stream_end_reason(
     api_state: &HarvestApiState,
     exec_id: ExecutionId,
-) -> Option<String> {
-    let mut conn = db_conn_for_execution(api_state, exec_id).await.ok()?;
-    let state: Option<String> = harvest_workflow_executions::table
+) -> ProgressPoll {
+    let mut conn = match stream_conn_for_execution(api_state, exec_id).await {
+        FencedCheckout::Ready(conn) => conn,
+        FencedCheckout::Retry => return ProgressPoll::Wait,
+        FencedCheckout::LeftFence => return ProgressPoll::LeftFence,
+    };
+    let Ok(state) = harvest_workflow_executions::table
         .find(exec_id.as_uuid())
         .select(harvest_workflow_executions::state)
-        .first(&mut conn)
+        .first::<String>(&mut conn)
         .await
         .optional()
-        .ok()?;
+    else {
+        return ProgressPoll::Wait;
+    };
     match state {
         // Row gone: retention only deletes terminal executions, so end the stream.
-        None => Some("deleted".to_string()),
-        Some(s) if is_terminal_state(&s) => Some(s.to_lowercase().replace('_', "-")),
+        None => ProgressPoll::End("deleted".to_string()),
+        Some(s) if is_terminal_state(&s) => ProgressPoll::End(s.to_lowercase().replace('_', "-")),
         // Still running — keep the live loop open.
-        Some(_) => None,
+        Some(_) => ProgressPoll::Wait,
     }
 }
 
@@ -44386,9 +44703,12 @@ async fn progress_stream_end_reason(
 ///
 /// ```
 /// A final `event: end` frame is emitted when the execution reaches a terminal
-/// state and the stream then closes; `event: error` is sent if the LISTEN
-/// connection drops. Keepalive `: ping` comments (axum `KeepAlive`) keep proxies
-/// from idling the connection.
+/// state, and the stream then closes. `event: error` is sent if the LISTEN
+/// connection drops. It is also sent if the run leaves the request's shard
+/// fence after a rebalance cutover (issue #1803). That frame carries
+/// `{"error":"outside_shard_fence","retry":true}`. The client then reconnects,
+/// and the reconnect is authorized against the live shard. Keepalive `: ping`
+/// comments (axum `KeepAlive`) keep proxies from idling the connection.
 ///
 /// **Progress chunks are EPHEMERAL**: never recorded in `harvest_events`, never
 /// replayed, and there is **no backfill** on (re)connect. A subscriber that
@@ -44498,8 +44818,13 @@ async fn stream_workflow_progress(
         let _ = tx.try_send(Ok(Event::default().event("end").data(end_data)));
     } else {
         let api_clone = api_state.clone();
+        // The producer runs under the request's shard fence (issue #1803).
+        // A fenced miss ends the stream with an `error` frame, so the
+        // client reconnects and the reconnect is authorized against the
+        // live shard. See `FencedCheckout`.
+        let fence = ::autumn_harvest::shard_fence::current();
         // Producer task: runs independently of the HTTP handler after we return.
-        tokio::spawn(async move {
+        tokio::spawn(::autumn_harvest::shard_fence::scoped(fence, async move {
             // Emit a progress chunk NON-BLOCKING. Returns `false` when the
             // receiver has been dropped (client disconnected) so the caller
             // ends the stream; a full channel (slow consumer) DROPS the chunk
@@ -44540,13 +44865,18 @@ async fn stream_workflow_progress(
                 // stop chunk delivery until the workflow finished on its
                 // new shard. Re-resolving here before every wait catches
                 // that promptly instead.
-                if let Ok(pool) = api_clone.storage_pool()
-                    && let Ok(current_shard) =
-                        ::autumn_harvest::shard_rebalance::resolve_execution_shard(
-                            pool.sharded_pool(),
-                            exec_id,
-                        )
-                        .await
+                //
+                // A fenced miss ends the stream (issue #1803). The run moved
+                // to a shard the policy never saw.
+                let current_shard = match stream_live_shard(&api_clone, exec_id).await {
+                    FencedCheckout::Ready(shard) => Some(shard),
+                    FencedCheckout::Retry => None,
+                    FencedCheckout::LeftFence => {
+                        let _ = tx.send(Ok(shard_fence_error_event())).await;
+                        break;
+                    }
+                };
+                if let Some(current_shard) = current_shard
                     && current_shard != listener_shard
                     && let Ok(url) = api_clone.sse_notification_url(current_shard)
                     && let Ok(l) = WorkflowProgressListener::connect(&url, exec_id.as_uuid()).await
@@ -44570,31 +44900,37 @@ async fn stream_workflow_progress(
                         }
                         // Periodic terminal-state poll: there is no terminal
                         // chunk, so this bounds close latency to one keepalive.
-                        if let Some(reason) = progress_stream_end_reason(&api_clone, exec_id).await
-                        {
-                            // Bounded final-chunk drain: the workflow's LAST
-                            // published chunk may have arrived on the listener
-                            // socket but not yet been forwarded by the driver
-                            // task when this idle tick fired. Drain (non-blocking)
-                            // with a short grace so the primary "here's your
-                            // answer" frame is not dropped on close. A non-Chunk
-                            // outcome (no more chunks in flight, timeout, or the
-                            // listener dropped) exits the drain and proceeds to
-                            // close.
-                            while let Ok(ProgressWaitOutcome::Chunk(payload)) = listener
-                                .wait_for_progress_timeout(PROGRESS_STREAM_FINAL_DRAIN_GRACE)
-                                .await
-                            {
-                                if !emit_chunk(&mut tx, payload) {
-                                    return; // client disconnected mid-drain
-                                }
+                        // A run that left the fence ends the stream (issue #1803).
+                        let reason = match progress_stream_end_reason(&api_clone, exec_id).await {
+                            ProgressPoll::End(reason) => reason,
+                            ProgressPoll::Wait => continue,
+                            ProgressPoll::LeftFence => {
+                                let _ = tx.send(Ok(shard_fence_error_event())).await;
+                                break;
                             }
-                            let end_data = serde_json::json!({ "reason": reason }).to_string();
-                            let _ = tx
-                                .send(Ok(Event::default().event("end").data(end_data)))
-                                .await;
-                            break;
+                        };
+                        // Bounded final-chunk drain: the workflow's LAST
+                        // published chunk may have arrived on the listener
+                        // socket but not yet been forwarded by the driver
+                        // task when this idle tick fired. Drain (non-blocking)
+                        // with a short grace so the primary "here's your
+                        // answer" frame is not dropped on close. A non-Chunk
+                        // outcome (no more chunks in flight, timeout, or the
+                        // listener dropped) exits the drain and proceeds to
+                        // close.
+                        while let Ok(ProgressWaitOutcome::Chunk(payload)) = listener
+                            .wait_for_progress_timeout(PROGRESS_STREAM_FINAL_DRAIN_GRACE)
+                            .await
+                        {
+                            if !emit_chunk(&mut tx, payload) {
+                                return; // client disconnected mid-drain
+                            }
                         }
+                        let end_data = serde_json::json!({ "reason": reason }).to_string();
+                        let _ = tx
+                            .send(Ok(Event::default().event("end").data(end_data)))
+                            .await;
+                        break;
                     }
                     Ok(ProgressWaitOutcome::ChannelClosed) => {
                         // LISTEN connection dropped; end with an error frame
@@ -44609,7 +44945,7 @@ async fn stream_workflow_progress(
                     Err(_) => break,
                 }
             }
-        });
+        }));
     }
 
     Sse::new(rx)
@@ -44750,6 +45086,13 @@ pub(crate) fn map_error(error: HarvestError) -> AutumnError {
         error @ HarvestError::LoadShed { .. } => AutumnError::bad_request_msg(error.to_string())
             .with_status(axum::http::StatusCode::TOO_MANY_REQUESTS),
         HarvestError::Database(message) => AutumnError::service_unavailable_msg(message),
+        // The run moved after the authorizer hook checked it (issue #1803).
+        // Nothing was read or written on the new shard. The body is the
+        // retry hint only. The policy's reason never reaches the caller,
+        // and a `403` here would leak that a shard is denied.
+        error @ HarvestError::OutsideShardFence { .. } => {
+            AutumnError::service_unavailable_msg(error.to_string())
+        }
         other => AutumnError::service_unavailable_msg(other.to_string()),
     }
 }
@@ -45079,8 +45422,10 @@ struct CandidateSchedulePreviewRequest {
     max_active_runs: u32,
     #[serde(default)]
     paused: bool,
+    /// If the request omits this field, the preview uses `default_schedule_jitter`,
+    /// as create does.
     #[serde(default)]
-    jitter_secs: u64,
+    jitter_secs: Option<u64>,
     #[serde(default = "default_overlap_policy")]
     overlap_policy: String,
     #[serde(default = "default_buffer_all_max")]
@@ -45552,9 +45897,9 @@ async fn preview_candidate_schedule_handler(
         ));
     }
 
-    // Validate jitter before i64 conversion; body.jitter_secs is u64 so an
-    // overly large value would overflow chrono::Duration::seconds and panic.
-    let jitter_duration = std::time::Duration::from_secs(body.jitter_secs);
+    // Validate jitter before the i64 conversion. A u64 second count can
+    // overflow chrono::Duration::seconds and panic.
+    let jitter_duration = requested_jitter(body.jitter_secs, &schedule);
     if let Err(e) = validate_jitter(&schedule, jitter_duration) {
         return Ok((
             StatusCode::BAD_REQUEST,
@@ -45563,7 +45908,7 @@ async fn preview_candidate_schedule_handler(
     }
     // Safe after validate_jitter: valid jitter is at most 3600 s for cron,
     // or less than the interval period, both well within i64 range.
-    let jitter_secs = i64::try_from(body.jitter_secs).unwrap_or(i64::MAX);
+    let jitter_secs = i64::try_from(jitter_duration.as_secs()).unwrap_or(i64::MAX);
 
     // Verify the calendar exists before returning any result so that a typo
     // here gets a 400 even when the schedule is paused.  Exclusion dates are
@@ -45640,10 +45985,9 @@ async fn preview_candidate_schedule_handler(
         raw_entries.iter().map(|e| e.effective_at).collect();
 
     if jitter_secs > 0 {
-        let jitter_window = std::time::Duration::from_secs(body.jitter_secs);
         for entry in &mut raw_entries {
             if let Some(t) = entry.effective_at {
-                let offset = compute_jitter_offset(schedule_id, t, jitter_window);
+                let offset = compute_jitter_offset(schedule_id, t, jitter_duration);
                 if let Ok(d) = chrono::Duration::from_std(offset) {
                     entry.effective_at = Some(t + d);
                 }
@@ -54594,10 +54938,28 @@ mod tests {
             serde_json::from_str(json).expect("should deserialize minimal body");
         assert_eq!(req.schedule_expr, "0 9 * * 1-5");
         assert_eq!(req.timezone, "UTC");
-        assert_eq!(req.jitter_secs, 0);
+        assert_eq!(req.jitter_secs, None);
         assert_eq!(req.overlap_policy, "skip");
         assert_eq!(req.count, 10);
         assert!(req.from.is_none());
+    }
+
+    /// An omitted `jitter_secs` gets the cron default; an explicit 0 opts out
+    /// (issue #1792).
+    #[test]
+    fn requested_jitter_defaults_only_when_omitted() {
+        let cron = Schedule::Cron("0 9 * * *".to_string());
+        assert_eq!(
+            requested_jitter(None, &cron),
+            autumn_harvest::policy::DEFAULT_CRON_JITTER
+        );
+        assert_eq!(requested_jitter(Some(0), &cron), std::time::Duration::ZERO);
+        assert_eq!(
+            requested_jitter(Some(300), &cron),
+            std::time::Duration::from_secs(300)
+        );
+        let seconds = Schedule::Cron("*/5 * * * * *".to_string());
+        assert_eq!(requested_jitter(None, &seconds), std::time::Duration::ZERO);
     }
 
     #[test]
@@ -54614,7 +54976,7 @@ mod tests {
         let req: CandidateSchedulePreviewRequest =
             serde_json::from_str(json).expect("should deserialize full body");
         assert_eq!(req.timezone, "America/Los_Angeles");
-        assert_eq!(req.jitter_secs, 300);
+        assert_eq!(req.jitter_secs, Some(300));
         assert_eq!(req.overlap_policy, "cancel_other");
         assert_eq!(req.count, 20);
         assert_eq!(req.from.as_deref(), Some("2026-06-01T09:00:00Z"));
@@ -55255,7 +55617,7 @@ mod tests {
         );
         let req: CandidateSchedulePreviewRequest =
             serde_json::from_str(&json).expect("u64::MAX must parse into the struct");
-        assert_eq!(req.jitter_secs, u64::MAX);
+        assert_eq!(req.jitter_secs, Some(u64::MAX));
     }
 
     #[test]
@@ -55980,6 +56342,88 @@ mod tests {
         assert!(matchers.contains_key(&axum::http::Method::GET));
         assert!(matchers.contains_key(&axum::http::Method::POST));
         assert!(matchers.contains_key(&axum::http::Method::DELETE));
+    }
+
+    #[test]
+    fn requires_admin_scope_matches_only_token_management() {
+        // Issue #1803.
+        let id = "0b7e6a52-4a3c-4f62-9d55-1f6a1c0a7e11";
+        assert!(requires_admin_scope(
+            &axum::http::Method::POST,
+            "/admin/tokens"
+        ));
+        assert!(requires_admin_scope(
+            &axum::http::Method::DELETE,
+            &format!("/admin/tokens/{id}")
+        ));
+        assert!(!requires_admin_scope(
+            &axum::http::Method::GET,
+            "/admin/tokens"
+        ));
+        // Any mutation under a token prefix is admin-only, listed or not.
+        assert!(requires_admin_scope(
+            &axum::http::Method::POST,
+            "/admin/tokens/"
+        ));
+        assert!(requires_admin_scope(
+            &axum::http::Method::POST,
+            &format!("/admin/tokens/{id}/rotate")
+        ));
+        assert!(requires_admin_scope(&axum::http::Method::PUT, "/modules/x"));
+        assert!(!requires_admin_scope(
+            &axum::http::Method::GET,
+            "/modules/x"
+        ));
+        assert!(!requires_admin_scope(
+            &axum::http::Method::POST,
+            "/admin/tokensx"
+        ));
+        assert!(!requires_admin_scope(
+            &axum::http::Method::POST,
+            "/workflows/x/cancel"
+        ));
+    }
+
+    #[test]
+    fn execution_id_in_path_decodes_only_execution_params() {
+        use autumn_harvest::types::{ExecutionId, ShardId};
+        // Issue #1803: only execution-id positions yield a shard.
+        let exec = ExecutionId::new_for_shard(ShardId::new(7));
+        for path in [
+            format!("/workflows/{exec}"),
+            format!("/workflows/{exec}/cancel"),
+            format!("/executions/{exec}/events/stream"),
+            format!("/dags/nightly/runs/{exec}"),
+            // Percent-encoded, as a client may send it.
+            format!(
+                "/workflows/%{:02X}{}/cancel",
+                exec.to_string().as_bytes()[0],
+                &exec.to_string()[1..]
+            ),
+            format!("/ui/workflows/{exec}/cancel"),
+            format!("/ui/dags/nightly/runs/{exec}/retry"),
+        ] {
+            let method = if path.ends_with("/cancel") || path.ends_with("/retry") {
+                axum::http::Method::POST
+            } else {
+                axum::http::Method::GET
+            };
+            assert_eq!(execution_id_in_path(&method, &path), Some(exec), "{path}");
+        }
+        for (method, path) in [
+            (axum::http::Method::DELETE, format!("/admin/tokens/{exec}")),
+            (axum::http::Method::DELETE, format!("/admin/gates/{exec}")),
+            (axum::http::Method::POST, format!("/workflows/{exec}/start")),
+            (axum::http::Method::GET, "/workflows/not-a-uuid".to_string()),
+            (axum::http::Method::GET, "/workflows".to_string()),
+            (
+                axum::http::Method::POST,
+                format!("/ui/schedules/{exec}/pause"),
+            ),
+            (axum::http::Method::GET, "/ui/workflows".to_string()),
+        ] {
+            assert_eq!(execution_id_in_path(&method, &path), None, "{path}");
+        }
     }
 
     #[test]

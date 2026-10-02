@@ -91,6 +91,6 @@ curl -s -X POST http://localhost:8081/api/harvest/dags/billing_reconciliation/tr
   -d '{"conf":{"date":"2026-05-01"}}' | jq .
 ```
 
-The standalone runner example in `examples/standalone-runner` uses the same saga, child workflow,
-version, and runner vocabulary from the other side of the integration: no `HarvestPlugin`, just
-`HarvestRunner` and a manually mounted management router.
+`examples/standalone-runner` uses the same saga, child workflow, version and runner vocabulary.
+It has no `HarvestPlugin` and no `autumn-web` in its manifest. It runs `HarvestEmbedding` on a
+plain Axum router.

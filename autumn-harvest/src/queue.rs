@@ -1928,6 +1928,11 @@ pub struct DispatchProbe {
     pub scheduled_at: DateTime<Utc>,
     /// True when a worker holds the row.
     pub has_worker: bool,
+    /// True when a live sticky pin names another worker (issue #1798).
+    ///
+    /// Session rows never set it. A session pin is a hard pin that does not
+    /// expire, so the reference must keep its normal backoff.
+    pub pinned_elsewhere: bool,
 }
 
 impl DispatchProbe {
@@ -1949,6 +1954,7 @@ impl DispatchProbe {
 pub async fn dispatch_probe(
     conn: &mut AsyncPgConnection,
     task_id: Uuid,
+    worker_id: &str,
 ) -> HarvestResult<Option<DispatchProbe>> {
     #[derive(diesel::QueryableByName)]
     struct Row {
@@ -1958,10 +1964,13 @@ pub async fn dispatch_probe(
         scheduled_at: DateTime<Utc>,
         #[diesel(sql_type = diesel::sql_types::Bool)]
         has_worker: bool,
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        pinned_elsewhere: bool,
     }
 
     let rows: Vec<Row> = diesel::sql_query(dispatch_probe_query())
         .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .bind::<diesel::sql_types::Text, _>(worker_id)
         .load(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -1970,13 +1979,20 @@ pub async fn dispatch_probe(
         state: row.state,
         scheduled_at: row.scheduled_at,
         has_worker: row.has_worker,
+        pinned_elsewhere: row.pinned_elsewhere,
     }))
 }
 
-/// SQL for [`dispatch_probe`]. A primary-key read of three columns.
+/// SQL for [`dispatch_probe`]. A primary-key read of four values.
 #[must_use]
 pub const fn dispatch_probe_query() -> &'static str {
-    "SELECT state, scheduled_at, worker_id IS NOT NULL AS has_worker \
+    "SELECT state, scheduled_at, worker_id IS NOT NULL AS has_worker, \
+            COALESCE( \
+                session_id IS NULL \
+                AND sticky_worker_id <> $2 \
+                AND sticky_until > NOW(), \
+                FALSE \
+            ) AS pinned_elsewhere \
      FROM harvest_task_queue \
      WHERE id = $1"
 }
@@ -2857,6 +2873,85 @@ pub async fn defer_claimed_rate_limited_task(
         .map(claim_write)
 }
 
+/// Defer the retry that `claim` holds because the retry budget is empty
+/// (issue #1793). A stale claim changes nothing.
+///
+/// The write is the rate-limit deferral with two differences:
+///
+/// - It keeps `crash_strikes`. An empty bucket says nothing about crashes. A
+///   reset would let a task that crashes workers escape poison-pill
+///   quarantine.
+/// - It computes `scheduled_at` as `clock_timestamp() + delay` in the
+///   statement (issue #1389). The claim checks `scheduled_at` on the same
+///   clock, so a host clock behind Postgres cannot make the row due at once.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on update failure.
+pub async fn defer_claimed_retry_for_budget(
+    conn: &mut AsyncPgConnection,
+    claim: &TaskClaim,
+    delay: Duration,
+) -> HarvestResult<ClaimWrite> {
+    use crate::schema::harvest_task_queue::dsl;
+    use diesel::dsl::sql;
+    use diesel::sql_types::{Double, Timestamptz};
+
+    let update = diesel::update(
+        dsl::harvest_task_queue
+            .find(claim.task_id)
+            .filter(dsl::state.eq("RUNNING")),
+    )
+    .set((
+        BudgetDeferralChangeset::new(),
+        dsl::scheduled_at.eq(
+            sql::<Timestamptz>("clock_timestamp() + make_interval(secs => ")
+                .bind::<Double, _>(delay_secs(delay))
+                .sql(")"),
+        ),
+        // Undo the claim-time attempt increment. A deferral is not an
+        // execution, so it must not use an attempt.
+        dsl::attempt.eq(diesel::dsl::sql::<diesel::sql_types::Integer>(
+            "GREATEST(attempt - 1, 0)",
+        )),
+    ))
+    .into_boxed();
+    let Some((queue_name, priority, task_type, scheduled_at)) = fence(update, Some(claim))
+        .returning((
+            dsl::queue_name,
+            dsl::priority,
+            dsl::task_type,
+            dsl::scheduled_at,
+        ))
+        .get_result::<(String, i32, String, chrono::DateTime<Utc>)>(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?
+    else {
+        return Ok(ClaimWrite::LeaseLost);
+    };
+    // The UPDATE already committed, so the row is durably deferred. The
+    // NOTIFY is best-effort, as for the retry requeue: a failed wake must not
+    // report the deferral as unpersisted. The poll loop still finds the row.
+    if let Err(error) = announce_deferred_task(
+        conn,
+        claim.task_id,
+        &queue_name,
+        scheduled_at,
+        priority,
+        &task_type,
+    )
+    .await
+    {
+        tracing::warn!(
+            task_id = %claim.task_id,
+            %error,
+            "failed to announce a retry-budget deferral; the poll loop still claims it"
+        );
+    }
+    Ok(ClaimWrite::Applied)
+}
+
 /// Mark a task as completed with the given output.
 ///
 /// Terminal completion clears any heartbeat checkpoint payload so it cannot be
@@ -3423,18 +3518,10 @@ async fn requeue_for_retry_inner(
         crate::dispatch::DispatchKind::from(task_type.as_str()),
     );
 
-    // Notify is best-effort: the task is already durably PENDING after the
-    // UPDATE above and will be claimed on the next poll cycle even if
-    // pg_notify is unavailable. Callers that count retries should key on
-    // Ok(()) meaning "state update succeeded", not "notify succeeded".
-    if let Err(e) = crate::notify::notify_task_enqueued(conn, &queue_name, task_id).await {
-        tracing::warn!(
-            task_id = %task_id,
-            queue = %queue_name,
-            error = %e,
-            "pg_notify failed after retry requeue; task is PENDING and will be claimed on next poll"
-        );
-    }
+    // A failed send never fails this call (issue #1796). The poll loop still
+    // claims the task. An error here means the transaction has already
+    // failed, so the UPDATE above cannot commit and the caller must see it.
+    crate::notify::notify_task_enqueued(conn, &queue_name, task_id).await?;
 
     Ok(true)
 }
@@ -3948,6 +4035,33 @@ struct CleanContinuationChangeset {
     scheduled_at: chrono::DateTime<Utc>,
 }
 
+/// [`CleanContinuationChangeset`] without `crash_strikes` and `scheduled_at`,
+/// for a retry-budget deferral (issue #1793). The caller sets `scheduled_at`
+/// on the database clock.
+#[derive(AsChangeset)]
+#[diesel(table_name = crate::schema::harvest_task_queue, treat_none_as_null = true)]
+struct BudgetDeferralChangeset {
+    state: &'static str,
+    worker_id: Option<String>,
+    started_at: Option<chrono::DateTime<Utc>>,
+    last_heartbeat_at: Option<chrono::DateTime<Utc>>,
+    capability_misses: i32,
+    capability_miss_workers: Vec<String>,
+}
+
+impl BudgetDeferralChangeset {
+    const fn new() -> Self {
+        Self {
+            state: "PENDING",
+            worker_id: None,
+            started_at: None,
+            last_heartbeat_at: None,
+            capability_misses: 0,
+            capability_miss_workers: Vec::new(),
+        }
+    }
+}
+
 impl CleanContinuationChangeset {
     const fn new(scheduled_at: chrono::DateTime<Utc>) -> Self {
         Self {
@@ -4082,17 +4196,38 @@ async fn defer_rate_limited_task_inner(
         return Ok(false);
     };
 
-    crate::notify::notify_task_enqueued(conn, &queue_name, task_id).await?;
-    // Dispatch hint (issue #1312).
-    record_pending_hint(
+    announce_deferred_task(
+        conn,
         task_id,
         &queue_name,
         scheduled_at,
         priority,
-        crate::dispatch::DispatchKind::from(task_type.as_str()),
-    );
-
+        &task_type,
+    )
+    .await?;
     Ok(true)
+}
+
+/// Notify listeners and record the dispatch hint for a row that a deferral
+/// put back to `PENDING`.
+async fn announce_deferred_task(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    queue_name: &str,
+    scheduled_at: chrono::DateTime<Utc>,
+    priority: i32,
+    task_type: &str,
+) -> HarvestResult<()> {
+    crate::notify::notify_task_enqueued(conn, queue_name, task_id).await?;
+    // Dispatch hint (issue #1312).
+    record_pending_hint(
+        task_id,
+        queue_name,
+        scheduled_at,
+        priority,
+        crate::dispatch::DispatchKind::from(task_type),
+    );
+    Ok(())
 }
 
 /// SQL for [`release_task_for_capability_miss`], exposed for no-DB shape tests
@@ -4931,6 +5066,49 @@ impl<'a> StickyHint<'a> {
             )
         })
     }
+}
+
+/// Release the sticky pins of a worker that stops (issue #1798).
+///
+/// A pin hides a ready task from other workers until `sticky_until` passes.
+/// A wake also re-arms the pin of a parked task. Without a release, each
+/// execution pinned to a stopped worker waits up to one sticky window.
+///
+/// The release clears the pins of pending and parked rows. It does not
+/// touch rows that the worker still runs. It also does not touch session
+/// rows, because a session pin is a hard pin (issue #606). Returns the
+/// number of released rows.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on update failure.
+pub async fn release_worker_sticky_pins(
+    conn: &mut AsyncPgConnection,
+    worker_id: &str,
+) -> HarvestResult<usize> {
+    diesel::sql_query(release_worker_sticky_pins_query())
+        .bind::<diesel::sql_types::Text, _>(worker_id)
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)
+}
+
+/// SQL for [`release_worker_sticky_pins`].
+///
+/// A parked row has `state = 'RUNNING'` with no `worker_id` and no
+/// `started_at`. That is the shape `primary_repend_workflow_task_query`
+/// re-pends.
+const fn release_worker_sticky_pins_query() -> &'static str {
+    "UPDATE harvest_task_queue \
+     SET sticky_worker_id = NULL, \
+         sticky_until = NULL, \
+         sticky_timeout = NULL \
+     WHERE sticky_worker_id = $1 \
+       AND session_id IS NULL \
+       AND ( \
+           state = 'PENDING' \
+           OR (state = 'RUNNING' AND worker_id IS NULL AND started_at IS NULL) \
+       )"
 }
 
 /// Pin a task row to a specific worker for best-effort sticky routing.
@@ -9887,6 +10065,18 @@ mod tests {
     }
 
     #[test]
+    fn release_worker_sticky_pins_query_touches_only_idle_unsessioned_rows() {
+        let sql = release_worker_sticky_pins_query();
+        assert!(sql.contains("sticky_worker_id = NULL"));
+        assert!(sql.contains("sticky_until = NULL"));
+        assert!(sql.contains("sticky_timeout = NULL"));
+        assert!(sql.contains("WHERE sticky_worker_id = $1"));
+        assert!(sql.contains("session_id IS NULL"));
+        assert!(sql.contains("state = 'PENDING'"));
+        assert!(sql.contains("state = 'RUNNING' AND worker_id IS NULL AND started_at IS NULL"));
+    }
+
+    #[test]
     fn park_workflow_task_query_clears_sticky_columns() {
         for sql in [
             park_workflow_task_query(true),
@@ -11631,6 +11821,10 @@ mod tests {
     fn dispatch_probe_query_reads_state_due_time_and_ownership() {
         let sql = dispatch_probe_query();
         assert!(sql.contains("SELECT state, scheduled_at, worker_id IS NOT NULL AS has_worker"));
+        assert!(sql.contains("session_id IS NULL"));
+        assert!(sql.contains("sticky_worker_id <> $2"));
+        assert!(sql.contains("sticky_until > NOW()"));
+        assert!(sql.contains("AS pinned_elsewhere"));
         assert!(sql.contains("WHERE id = $1"));
     }
 
@@ -11640,6 +11834,7 @@ mod tests {
             state: state.to_string(),
             scheduled_at: Utc::now(),
             has_worker: false,
+            pinned_elsewhere: false,
         };
         assert!(probe("PENDING").is_pending());
         assert!(!probe("RUNNING").is_pending());

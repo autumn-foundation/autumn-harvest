@@ -188,7 +188,7 @@ pub mod points {
         caps: CAP_ERROR,
     };
 
-    /// In `notify::notify_task_enqueued`, guarding the `pg_notify` send.
+    /// In `notify::notify_task_enqueued`, guarding the post-commit wake.
     ///
     /// A dropped wake (AC1(c)) means a listening worker never receives the
     /// `LISTEN`/`NOTIFY` and must fall back to its poll loop to claim the task.

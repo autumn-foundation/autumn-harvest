@@ -118,4 +118,26 @@ proptest! {
             "Equal jitter {equal_d:?} below base/2 {base_half:?}"
         );
     }
+
+    /// A default policy jitters within `[0, cap]` and repeats for one seed and
+    /// attempt (issue #1792).
+    #[test]
+    fn default_policy_jitter_is_bounded_and_deterministic(
+        initial_millis in 1u64..=600_000,
+        attempt in 1u32..=64,
+        seed in any::<u64>(),
+    ) {
+        let policy = RetryPolicy::exponential(u32::MAX, Duration::from_millis(initial_millis));
+        prop_assert_eq!(policy.jitter, JitterPolicy::Full);
+        let cap = compute_retry_delay(
+            policy.initial_interval,
+            policy.backoff_coefficient,
+            policy.max_interval,
+            attempt,
+        );
+        let first = compute_retry_delay_with_seed(&policy, attempt, seed);
+        let second = compute_retry_delay_with_seed(&policy, attempt, seed);
+        prop_assert!(first <= cap, "delay {first:?} exceeded cap {cap:?}");
+        prop_assert_eq!(first, second);
+    }
 }

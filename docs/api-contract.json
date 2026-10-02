@@ -7139,7 +7139,7 @@
   "name": "jitter_secs",
   "type": "integer",
   "required": false,
-  "description": "Random delay added to each fire, in seconds, to spread a thundering herd."
+  "description": "Jitter window in seconds. It spreads fires to avoid a thundering herd. 0 disables jitter. If omitted, a cron schedule with no seconds field gets 10 seconds. Other schedules get 0."
           },
           {
   "name": "overlap_policy",
@@ -7874,7 +7874,7 @@
           {
             "name": "jitter_secs",
             "type": "integer",
-            "description": "Jitter window in seconds. 0 disables jitter. Validated via validate_jitter."
+            "description": "Jitter window in seconds. 0 disables jitter. If omitted, a cron schedule with no seconds field gets 10 seconds, as on create. Validated via validate_jitter."
           },
           {
             "name": "overlap_policy",
@@ -9166,7 +9166,7 @@
       "path": "/admin/tokens",
       "category": "api_tokens",
       "read_only": false,
-      "description": "Mint a scoped API token (issue #942). The plaintext secret is returned exactly once in this response; only its SHA-256 hash is stored at rest. Scope is drawn from the route classification: 'read' reaches every read-only route and is denied 403 on mutations; 'mutate' reaches everything.",
+      "description": "Mint a scoped API token (issue #942). The plaintext secret is returned exactly once in this response; only its SHA-256 hash is stored at rest. Scope is drawn from the route classification: 'read' reaches every read-only route and is denied 403 on mutations; 'mutate' reaches every route except token mint and revoke; 'admin' reaches everything (issue #1803). Only an 'admin' token, or a caller the embedder admin boundary admits, can call this route.",
       "idempotency": "Not idempotent: each call mints a new token row with a fresh UUID and secret.",
       "params": [],
       "request_body": {
@@ -9181,7 +9181,7 @@
           {
             "name": "scope",
             "required": false,
-            "description": "Verb-level scope: 'read' (default) or 'mutate'."
+            "description": "Verb-level scope: 'read' (default), 'mutate' or 'admin'."
           },
           {
             "name": "expires_at",
@@ -9206,11 +9206,15 @@
       "error_responses": [
         {
           "status": 400,
-          "description": "Unknown scope (expected 'read' or 'mutate')."
+          "description": "Unknown scope (expected 'read', 'mutate' or 'admin')."
         },
         {
           "status": 401,
           "description": "Unauthenticated request."
+        },
+        {
+          "status": 403,
+          "description": "The bearer token is not 'admin'-scoped, the caller holds the read-only role, or the authorizer hook denied the request (issue #1803)."
         },
         {
           "status": 503,
@@ -9227,7 +9231,7 @@
       "path": "/admin/tokens/{id}",
       "category": "api_tokens",
       "read_only": false,
-      "description": "Revoke a scoped API token (issue #942). Revocation is effective on the next request (no grant cache).",
+      "description": "Revoke a scoped API token (issue #942). Revocation is effective on the next request (no grant cache). Only an 'admin' token, or a caller the embedder admin boundary admits, can call this route (issue #1803).",
       "idempotency": "Idempotent: revoking an unknown or already-revoked token returns revoked=false without error.",
       "params": [
         {
@@ -9253,6 +9257,10 @@
         {
           "status": 401,
           "description": "Unauthenticated request."
+        },
+        {
+          "status": 403,
+          "description": "The bearer token is not 'admin'-scoped, the caller holds the read-only role, or the authorizer hook denied the request (issue #1803)."
         },
         {
           "status": 500,
