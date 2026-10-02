@@ -253,7 +253,7 @@ async fn seed_run(
             workflow_name: dag_name,
             workflow_id,
             exec_id,
-            input: json!({}),
+            input: json!({}).into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
