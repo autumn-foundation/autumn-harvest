@@ -246,9 +246,11 @@ impl LoadShedSamplerInputs {
 /// the install order.
 ///
 /// `sample_once` bounds its own read and audit writes. Ticks keep a fixed
-/// period, so a slow sample does not push the next one out. The shed state
-/// then stays inside its three-interval staleness bound. The config clamps
-/// the interval to `MAX_SAMPLE_INTERVAL`, so the tick deadline is finite.
+/// period, so a slow sample does not push the next one out. An overdue tick
+/// fires at once. The staleness bound exceeds the read and audit bounds
+/// together by one interval. The shed state therefore stays fresh across a
+/// slow sample and the next read. The config clamps the interval to
+/// `MAX_SAMPLE_INTERVAL`, so the tick deadline is finite.
 fn spawn_load_shed_sampler(
     api_state: &HarvestApiState,
     pools: &HarvestDbPool,

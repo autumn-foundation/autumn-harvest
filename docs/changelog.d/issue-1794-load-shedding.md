@@ -26,7 +26,10 @@ Design decisions:
 - An atomic batch whose only rejections are sheds answers `429` with
   `Retry-After`. A non-atomic batch reports each shed item as `rejected`.
 - The gate fails open. A failed or slow sample changes no state. The gate
-  ignores a state older than three sample intervals and then admits starts.
+  ignores a state older than four sample intervals and then admits starts.
+  The bound is the read bound (two intervals), the audit bound (one interval)
+  and one interval of scheduling slack, so a slow audit batch followed by a
+  slow read cannot make a shedding gate fail open mid-incident.
 - `with_sample_interval` clamps the interval to the range from 1 second to
   1 hour (`MIN_SAMPLE_INTERVAL` and `MAX_SAMPLE_INTERVAL`). The sampler timers
   add the interval to the clock, so the bound keeps every deadline finite.

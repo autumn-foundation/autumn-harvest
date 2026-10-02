@@ -45,9 +45,14 @@ just under `trip_age` stays shed until its age falls to `clear_age`.
 The gate fails **open**. This is the opposite of the manual gate.
 
 - A sampler tick with any shard read failure changes no state.
-- A sample that runs longer than two sample intervals counts as a failure.
-- The gate ignores a state older than three sample intervals. It then admits
-  starts.
+- A sample whose reads run longer than two sample intervals counts as a
+  failure.
+- The audit writes of one sample share one bound of one sample interval.
+- The gate ignores a state older than four sample intervals. It then admits
+  starts. The bound is a budget: the read bound, the audit bound and one
+  interval of scheduling slack. A slow audit batch followed by a slow read
+  therefore leaves the state fresh, and the gate does not fail open during
+  the saturation it exists to handle.
 - After such a gap, a shedding queue sheds again only at `trip_age`. That is
   a new trip.
 

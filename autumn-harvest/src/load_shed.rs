@@ -27,11 +27,33 @@ pub const MIN_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 /// [`STALE_AFTER_SAMPLES`] intervals.
 pub const MAX_SAMPLE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
+/// The sampler read bound, in sample intervals.
+///
+/// A pool read that runs longer than this counts as a failed sample.
+pub const READ_TIMEOUT_SAMPLES: u32 = 2;
+
+/// The sampler audit bound, in sample intervals.
+///
+/// The audit writes of one sample share one timeout of this length.
+pub const AUDIT_TIMEOUT_SAMPLES: u32 = 1;
+
 /// The gate ignores a state older than this many sample intervals.
 ///
 /// The gate then admits starts. It fails open, so a dead sampler cannot keep a
 /// queue shed.
-pub const STALE_AFTER_SAMPLES: u32 = 3;
+///
+/// The value is a budget. A sample records its state when its read ends. The
+/// audit writes then run for at most [`AUDIT_TIMEOUT_SAMPLES`] intervals. The
+/// next tick is overdue by then, so it fires at once. The next read runs for
+/// at most [`READ_TIMEOUT_SAMPLES`] intervals before it records a new state.
+/// The gap between two states is therefore at most the sum of the two bounds,
+/// plus the scheduling time of the next tick. One more interval covers that
+/// scheduling time. The gate must not find the state stale inside this gap.
+/// A stale state fails open, and the next sample then trips again with
+/// another slow audit cycle. That is a gap in the shedding during the
+/// saturation the gate exists to handle.
+/// `stale_after_leaves_one_interval_of_slack` pins the budget.
+pub const STALE_AFTER_SAMPLES: u32 = READ_TIMEOUT_SAMPLES + AUDIT_TIMEOUT_SAMPLES + 1;
 
 // ── LoadShedPolicy ────────────────────────────────────────────────────────────
 
@@ -217,11 +239,28 @@ impl LoadShedConfig {
         self.sample_interval
     }
 
+    /// The longest time the sampler waits for the pool reads of one sample.
+    ///
+    /// This is [`READ_TIMEOUT_SAMPLES`] sample intervals.
+    #[must_use]
+    pub const fn read_timeout(&self) -> Duration {
+        self.sample_interval.saturating_mul(READ_TIMEOUT_SAMPLES)
+    }
+
+    /// The longest time the sampler waits for the audit writes of one sample.
+    ///
+    /// This is [`AUDIT_TIMEOUT_SAMPLES`] sample intervals.
+    #[must_use]
+    pub const fn audit_timeout(&self) -> Duration {
+        self.sample_interval.saturating_mul(AUDIT_TIMEOUT_SAMPLES)
+    }
+
     /// The age after which the gate ignores a state.
     ///
-    /// This is [`STALE_AFTER_SAMPLES`] sample intervals. The interval bound
-    /// keeps the product below three hours, so a timer deadline built from it
-    /// cannot overflow.
+    /// This is [`STALE_AFTER_SAMPLES`] sample intervals. It exceeds the sum of
+    /// [`Self::read_timeout`] and [`Self::audit_timeout`] by one interval. The
+    /// interval bound keeps the product below four hours, so a timer deadline
+    /// built from it cannot overflow.
     #[must_use]
     pub const fn stale_after(&self) -> Duration {
         self.sample_interval.saturating_mul(STALE_AFTER_SAMPLES)
@@ -377,16 +416,21 @@ impl LoadShedder {
 /// keeps the maximum age per queue. A configured queue with no claimable task
 /// has age 0. Each trip or clear writes one audit row to `audit_pool`.
 ///
-/// Returns `false` when a pool read fails or runs longer than two sample
-/// intervals. No state changes then, so a partial read cannot clear a
-/// shedding queue. The active gauge is still written, so it shows 0 once a
-/// stale state fails open.
+/// Returns `false` when a pool read fails or runs longer than
+/// [`LoadShedConfig::read_timeout`], two sample intervals. No state changes
+/// then, so a partial read cannot clear a shedding queue. The active gauge is
+/// still written, so it shows 0 once a stale state fails open.
 ///
 /// A complete read updates every queue at once, with no await in between.
 /// The audit writes run after that, so a slow audit write cannot leave a
-/// partial sample behind. They run concurrently under one timeout of one
-/// sample interval. A sample therefore ends within three intervals, inside
-/// the staleness bound, whatever the number of transitions.
+/// partial sample behind. They run concurrently under one timeout of
+/// [`LoadShedConfig::audit_timeout`], one sample interval. A sample therefore
+/// ends within three intervals, whatever the number of transitions.
+///
+/// The state carries the instant at which the read ended. The next state
+/// lands at most one audit bound, one tick schedule and one read bound later.
+/// [`LoadShedConfig::stale_after`] is one interval longer than the two bounds
+/// together, so the gate holds the state through that whole gap.
 #[cfg(feature = "db")]
 pub async fn sample_once(
     shedder: &LoadShedder,
@@ -401,9 +445,8 @@ pub async fn sample_once(
     }
     let queues = config.queues();
     // The interval is at most `MAX_SAMPLE_INTERVAL`, so this deadline is finite.
-    let read_timeout = config.sample_interval().saturating_mul(2);
     let read = tokio::time::timeout(
-        read_timeout,
+        config.read_timeout(),
         read_ages(pools, &queues, circuit_breaker_activities),
     )
     .await;
@@ -431,7 +474,7 @@ pub async fn sample_once(
         .map(|(queue, transition, age_secs)| {
             record_transition(audit_pool, queue, transition, age_secs)
         });
-    if tokio::time::timeout(config.sample_interval(), futures::future::join_all(writes))
+    if tokio::time::timeout(config.audit_timeout(), futures::future::join_all(writes))
         .await
         .is_err()
     {
@@ -733,10 +776,8 @@ mod tests {
         let c = LoadShedConfig::new().with_sample_interval(Duration::MAX);
         let now = Instant::now();
         assert!(now.checked_add(c.sample_interval()).is_some());
-        assert!(
-            now.checked_add(c.sample_interval().saturating_mul(2))
-                .is_some()
-        );
+        assert!(now.checked_add(c.read_timeout()).is_some());
+        assert!(now.checked_add(c.audit_timeout()).is_some());
         assert!(now.checked_add(c.stale_after()).is_some());
         assert!(c.stale_after() < Duration::MAX);
     }
@@ -753,13 +794,88 @@ mod tests {
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         ticks.tick().await;
         ticks.tick().await;
-        let read_timeout = c.sample_interval().saturating_mul(2);
-        let read = tokio::time::timeout(read_timeout, std::future::ready(1)).await;
+        let read = tokio::time::timeout(c.read_timeout(), std::future::ready(1)).await;
         assert_eq!(read, Ok(1));
-        let write = tokio::time::timeout(c.sample_interval(), std::future::ready(2)).await;
+        let write = tokio::time::timeout(c.audit_timeout(), std::future::ready(2)).await;
         assert_eq!(write, Ok(2));
         let stale = tokio::time::timeout(c.stale_after(), std::future::ready(3)).await;
         assert_eq!(stale, Ok(3));
+    }
+
+    /// The two sampler bounds and one interval of scheduling slack must fit
+    /// inside the staleness bound. Without the slack a full audit batch and a
+    /// full read make the gate fail open mid-incident and trip again.
+    #[test]
+    fn stale_after_leaves_one_interval_of_slack() {
+        for interval in [
+            MIN_SAMPLE_INTERVAL,
+            DEFAULT_SAMPLE_INTERVAL,
+            Duration::from_millis(7_300),
+            MAX_SAMPLE_INTERVAL,
+        ] {
+            let c = LoadShedConfig::new().with_sample_interval(interval);
+            let bounds = c.read_timeout() + c.audit_timeout();
+            assert!(
+                c.stale_after() >= bounds + c.sample_interval(),
+                "{interval:?}: read {:?} + audit {:?} leaves {:?} before stale_after {:?}",
+                c.read_timeout(),
+                c.audit_timeout(),
+                c.stale_after().saturating_sub(bounds),
+                c.stale_after()
+            );
+        }
+    }
+
+    /// The worst-case sampler timeline. The audit batch of a trip takes its
+    /// full bound. The next tick is overdue, so it fires at once. The next
+    /// read takes its full bound. The runtime adds a little scheduling delay.
+    /// The state must still be fresh when that read records its sample.
+    #[tokio::test(start_paused = true)]
+    async fn full_audit_then_full_read_keeps_the_state_fresh() {
+        let s = shedder();
+        let c = s.config();
+        let mut ticks = tokio::time::interval(c.sample_interval());
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticks.tick().await;
+
+        // Sample 1: the read ends just inside its bound, then the queue trips.
+        let almost_full_read = c.read_timeout().saturating_sub(Duration::from_millis(1));
+        tokio::time::sleep(almost_full_read).await;
+        let observed = tokio::time::Instant::now().into_std();
+        assert_eq!(
+            s.observe("q", 61.0, observed),
+            Some(ShedTransition::Tripped)
+        );
+        // The audit batch uses its whole bound.
+        tokio::time::sleep(c.audit_timeout()).await;
+
+        // Sample 2: the tick is overdue and returns at once.
+        let before = tokio::time::Instant::now();
+        ticks.tick().await;
+        assert_eq!(
+            tokio::time::Instant::now(),
+            before,
+            "an overdue tick fires at once"
+        );
+        // The runtime schedules the task a little late. The read then uses
+        // its whole bound.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(almost_full_read).await;
+        let now = tokio::time::Instant::now().into_std();
+        assert!(
+            s.check("q", now).is_some(),
+            "the gate must hold through the audit and read bounds"
+        );
+        assert_eq!(
+            s.observe("q", 90.0, now),
+            None,
+            "a fresh shedding state does not trip again"
+        );
+
+        // A whole interval of scheduling delay is still inside the budget.
+        let late = observed + c.audit_timeout() + c.read_timeout() + c.sample_interval();
+        assert!(s.check("q", late).is_some());
+        assert_eq!(s.observe("q", 90.0, late), None);
     }
 
     #[test]
