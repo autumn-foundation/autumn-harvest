@@ -1575,22 +1575,19 @@ async fn build_unexported_index_on_dedicated_connection(
     schema: &str,
     connect_timeout: std::time::Duration,
 ) -> crate::error::HarvestResult<UnexportedIndexOutcome> {
-    use diesel_async::AsyncConnection;
     use diesel_async::RunQueryDsl;
 
     // A host can accept the socket and never finish the handshake. Without a
-    // bound, the stalled task outlives the retry gate and tasks pile up.
-    let mut conn = tokio::time::timeout(
-        connect_timeout,
-        diesel_async::AsyncPgConnection::establish(dsn),
-    )
-    .await
-    .map_err(|_| {
-        crate::error::HarvestError::Database(format!(
-            "connect to the index build URL timed out after {connect_timeout:?}"
-        ))
-    })?
-    .map_err(crate::error::database_error)?;
+    // bound, the stalled task outlives the retry gate and tasks pile up. The
+    // connector follows the listener's transport rule, so `sslmode=require`
+    // gets verified TLS.
+    let mut conn = tokio::time::timeout(connect_timeout, crate::notify::connect_async_pg(dsn))
+        .await
+        .map_err(|_| {
+            crate::error::HarvestError::Database(format!(
+                "connect to the index build URL timed out after {connect_timeout:?}"
+            ))
+        })??;
     // The pool may select its relations through `search_path`, and the build
     // role can differ from the pool role. `schema` names the schema that holds
     // the pool session's table, so no `"$user"` token is re-expanded here.

@@ -38,3 +38,7 @@ An unconfigured deployment no longer pays for the audit export index.
   the attempt and waits five minutes.
 - The down migration restores nothing. An ordinary `CREATE INDEX` would block
   audit writes. An older binary works without the index, only slower.
+- The build connection follows the listener's transport rule. `sslmode=require`
+  in the notification URL selects verified TLS. Any other mode stays plaintext.
+  A build without the `tls` feature refuses `sslmode=require` with a config
+  error.
