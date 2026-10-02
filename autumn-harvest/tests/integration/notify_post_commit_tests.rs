@@ -458,6 +458,39 @@ async fn a_registered_pool_wakes_after_commit_and_not_before() {
 }
 
 #[tokio::test]
+async fn a_raw_begin_block_wakes_after_commit_and_not_before() {
+    let (url, _container) = setup().await;
+    let pool = build_pool(&url);
+    assert!(
+        autumn_harvest::notify::register_pool(&pool)
+            .wait_ready(READY)
+            .await
+    );
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let exec_id = insert_execution(&mut conn).await;
+    let mut listener = WorkflowEventListener::connect(&url)
+        .await
+        .expect("listener");
+
+    // Diesel does not track a transaction that a raw `BEGIN` opens.
+    conn.batch_execute("BEGIN").await.expect("begin");
+    store::append_events(&mut conn, exec_id, &[started()], 0)
+        .await
+        .expect("append");
+    assert_eq!(
+        listener
+            .wait_for_notification_timeout(Duration::from_millis(500))
+            .await
+            .expect("payload parses"),
+        WorkflowEventWaitOutcome::TimedOut,
+        "no wake may arrive before commit"
+    );
+    conn.batch_execute("COMMIT").await.expect("commit");
+
+    wake_of(&mut listener, exec_id).await;
+}
+
+#[tokio::test]
 async fn a_registered_pool_never_notifies_on_the_write_connection() {
     let (url, _container) = setup().await;
     let pool = build_pool(&url);

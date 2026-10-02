@@ -804,13 +804,15 @@ async fn stage(conn: &mut AsyncPgConnection, notes: Vec<Note>) -> HarvestResult<
     }
     if any_sink() {
         let in_tx = in_transaction(conn);
-        // Inside a transaction, `txid_current()` assigns an id when the
-        // transaction has none yet. Thus the gate can never send before the
-        // commit. Outside one, the write already committed, so no id is read.
+        // Inside a diesel transaction, `txid_current()` assigns an id when
+        // the transaction has none yet. Thus the gate never sends before the
+        // commit. Outside one, `txid_current_if_assigned()` still finds a raw
+        // `BEGIN` block that wrote. After an autocommit write it reads NULL,
+        // because that write already committed.
         let txid = if in_tx {
             "txid_current()"
         } else {
-            "NULL::bigint"
+            "txid_current_if_assigned()"
         };
         let row = diesel::sql_query(format!(
             "SELECT {txid} AS txid, \
