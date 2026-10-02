@@ -1043,30 +1043,15 @@ async fn fire_claimed_throttle_row(
     let shard = crate::types::ShardId::new(row.shard_id);
     let exec_id = crate::types::ExecutionId::new_for_shard(shard);
 
-    let reuse_policy = opts
-        .reuse_policy
-        .as_deref()
-        .and_then(crate::debounce::parse_reuse_policy)
-        .unwrap_or(crate::types::WorkflowIdReusePolicy::AllowDuplicate);
-    let execution_timeout = opts
-        .execution_timeout_secs
-        .and_then(chrono::Duration::try_seconds);
-    let sla = opts.sla_secs.and_then(chrono::Duration::try_seconds);
-    let max_execution_timeout_ceiling = opts
-        .max_execution_timeout_ceiling_secs
-        .and_then(chrono::Duration::try_seconds);
-    // Chain-scoped lifetime cap captured at admission (issue #617), so a throttled
-    // start of a chain-capped workflow does not silently drop the declared cap.
-    let chain_execution_timeout = opts
-        .chain_execution_timeout_secs
-        .and_then(chrono::Duration::try_seconds);
-    let max_workflow_chain_timeout_ceiling = opts
-        .max_workflow_chain_timeout_ceiling_secs
-        .and_then(chrono::Duration::try_seconds);
-    let priority = opts
-        .priority
-        .and_then(crate::types::Priority::from_i32)
-        .unwrap_or_default();
+    let crate::debounce::DeferredAdmissionFields {
+        reuse_policy,
+        execution_timeout,
+        sla,
+        max_execution_timeout_ceiling,
+        chain_execution_timeout,
+        max_workflow_chain_timeout_ceiling,
+        priority,
+    } = crate::debounce::decode_deferred_admission_fields(&opts);
 
     let workflow_name = row.workflow_name;
     let workflow_id = row.workflow_id;
