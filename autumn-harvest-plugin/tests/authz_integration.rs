@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 
 use autumn_harvest::audit::RouteClass;
 use autumn_harvest::scheduler::{DagCatalog, SchedulerMonitor};
-use autumn_harvest::shard::ShardRouter;
+use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
 use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry};
 use autumn_harvest_plugin::HarvestDbPool;
@@ -547,6 +547,95 @@ async fn authorizer_denies_by_shard() {
     let rows = deny_rows(&mut conn).await;
     assert_eq!(rows.len(), 6, "{rows:?}");
     assert!(rows.iter().all(|r| r.shard_id == Some(7)), "{rows:?}");
+}
+
+/// Create and migrate a second database on the same server as `url`.
+async fn second_database(url: &str) -> String {
+    use diesel_async::{AsyncConnection, SimpleAsyncConnection};
+    let db = format!("harvest_authz_live_{}", uuid::Uuid::new_v4().simple());
+    let mut admin = AsyncPgConnection::establish(url)
+        .await
+        .expect("admin connect");
+    diesel::sql_query(format!("CREATE DATABASE {db}"))
+        .execute(&mut admin)
+        .await
+        .expect("create db");
+    let (base, query) = url
+        .split_once('?')
+        .map_or((url, None), |(b, q)| (b, Some(q)));
+    let prefix = base.rsplit_once('/').map_or(base, |(p, _)| p);
+    let live = query.map_or_else(
+        || format!("{prefix}/{db}"),
+        |q| format!("{prefix}/{db}?{q}"),
+    );
+    let mut conn = AsyncPgConnection::establish(&live)
+        .await
+        .expect("db connect");
+    conn.batch_execute(&autumn_harvest::test_init_sql())
+        .await
+        .expect("migrate db");
+    live
+}
+
+/// A rebalanced execution is checked against the shard it lives on now, as
+/// well as its entry shard. The handler follows the forward to the live shard.
+#[tokio::test]
+async fn rebalanced_execution_is_checked_on_its_live_shard() {
+    let (url, _c) = setup_database().await;
+    let entry_pool = build_pool(&url);
+    let live_pool = build_pool(&second_database(&url).await);
+    let mut conn = entry_pool.get().await.unwrap();
+    scrub(&mut conn).await;
+
+    // A sealed source row on shard 0 that forwards to shard 7.
+    let exec = ExecutionId::new_for_shard(ShardId::new(0));
+    diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions \
+         (id, workflow_name, workflow_id, shard_id, input, state, migrated_to_shard, migrated_at) \
+         VALUES ($1, 'wf', $2, 0, '{}'::jsonb, 'MIGRATED', 7, NOW())",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec.as_uuid())
+    .bind::<diesel::sql_types::Text, _>(exec.to_string())
+    .execute(&mut conn)
+    .await
+    .unwrap();
+
+    let shards = vec![ShardId::new(0), ShardId::new(7)];
+    let state = HarvestApiState::new();
+    state.install_storage_pool(HarvestDbPool::from(ShardedDbPool::from_map(
+        [
+            (ShardId::new(0), entry_pool.clone()),
+            (ShardId::new(7), live_pool),
+        ]
+        .into_iter()
+        .collect(),
+        ShardId::new(0),
+    )));
+    state.install(HarvestApiRuntime::new(
+        Arc::new(HandlerRegistry::new(vec![], vec![])),
+        Arc::new(DagCatalog::default()),
+        Arc::new(Vec::new()),
+        Some("authz-test".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::new(shards.clone(), shards, ShardId::new(0)),
+    ));
+    let app = authorized_app_with_state(&state, deny_shard_7);
+
+    let (status, _) = send(
+        &app,
+        Call::new("POST", &format!("/workflows/{exec}/cancel")).body(json!({})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "live shard 7 must be checked"
+    );
+    let rows = deny_rows(&mut conn).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].shard_id, Some(7));
 }
 
 /// A query shard on a route that ignores it must not reach the hook. The

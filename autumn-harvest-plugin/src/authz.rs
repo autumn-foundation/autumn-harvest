@@ -388,16 +388,38 @@ fn shard_number(raw: i64) -> Option<ShardId> {
         .map(ShardId::new)
 }
 
-/// The shard an execution id in the path routes to.
+/// The shards an execution id in the path touches: its entry shard and the
+/// shard it lives on now.
+///
+/// The handler follows a rebalance forward to the live shard, so the hook
+/// must check that shard too. The walk is the one the handler uses. If it
+/// fails, the handler fails the same walk, so the request gets `503`.
 ///
 /// A retired shard resolves to its successor. With a storage pool, an id with
 /// no encoded shard resolves to the default shard. With no pool, it has none.
-fn path_shard(api_state: &HarvestApiState, method: &Method, path: &str) -> Option<ShardId> {
-    let exec_id = execution_id_in_path(method, path)?;
-    api_state.storage_pool().map_or_else(
-        |_| Some(exec_id.shard()).filter(|s| !s.is_unencoded()),
-        |pool| Some(pool.sharded_pool().routed_shard_for_execution(exec_id)),
-    )
+async fn path_shards(
+    api_state: &HarvestApiState,
+    method: &Method,
+    path: &str,
+) -> Result<Vec<ShardId>, Response> {
+    let Some(exec_id) = execution_id_in_path(method, path) else {
+        return Ok(Vec::new());
+    };
+    let Ok(pool) = api_state.storage_pool() else {
+        return Ok(Some(exec_id.shard())
+            .filter(|s| !s.is_unencoded())
+            .into_iter()
+            .collect());
+    };
+    let pool = pool.sharded_pool();
+    let entry = pool.routed_shard_for_execution(exec_id);
+    match autumn_harvest::shard_rebalance::resolve_execution_shard(pool, exec_id).await {
+        Ok(live) => Ok(vec![entry, live]),
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path, "harvest: authz could not resolve shard");
+            Err(StatusCode::SERVICE_UNAVAILABLE.into_response())
+        }
+    }
 }
 
 /// The shards named by `keys` in the query, decoded as the handlers decode it.
@@ -522,8 +544,10 @@ pub(crate) async fn enforce_authorizer(
 
     let method = request.method().clone();
     let path = request.uri().path().to_string();
-    let mut shards = Vec::new();
-    shards.extend(path_shard(&api_state, &method, &path));
+    let mut shards = match path_shards(&api_state, &method, &path).await {
+        Ok(shards) => shards,
+        Err(response) => return response,
+    };
 
     let request = match shard_source(&method, &path) {
         None => request,

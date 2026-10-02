@@ -56,7 +56,7 @@ bytes gets `400`. Without a hook, Harvest ignores the header.
 
 | Request | Shard the hook sees |
 |---|---|
-| A path with an execution id, e.g. `GET /workflows/{id}`, also under `/ui` | The shard the id routes to. |
+| A path with an execution id, e.g. `GET /workflows/{id}`, also under `/ui` | The entry shard of the id and, for a rebalanced run, its live shard. |
 | `GET /admin/history/exports`, `.../export-sample`, `GET /admin/external-handoffs` with a shard query parameter | That shard. |
 | `POST /workflows/{name}/start` with `shard_id` or `residency_key` | The pinned shard. |
 | DLQ replay, discard and redrive, queue pause and resume, with body `shard_id` | That shard. |

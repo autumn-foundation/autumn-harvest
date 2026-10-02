@@ -18,7 +18,8 @@ capability.
   hook runs after the built-in gates, so it can only deny. A plain closure is
   an authorizer. With no hook, the router is unchanged.
 - **Shard sources.** The hook reads a shard only where the handler reads it:
-  an execution id in the path (decoded, also under `/ui`), a shard query
+  an execution id in the path (decoded, also under `/ui`, with a rebalanced
+  run checked on both its entry and live shard), a shard query
   parameter on the routes in `authz::SHARD_SOURCES`, or a shard field in their
   body. A shard named anywhere else is ignored, so a caller cannot show the
   hook one shard while the handler reads all of them.
@@ -41,7 +42,7 @@ widens the `scope` CHECK only. No `WorkflowEvent` variant, no change to
 revoke gets `403`, is audited, and changes nothing. A `mutate` token is denied
 exactly the admin routes. An `admin` token mints and revokes. A hook denies by
 tenant key, and by shard from the path, `/ui`, query, start body, residency key
-and other bodies. A query shard on a route that ignores it is not read. A hook
+and other bodies. A rebalanced run is checked on its live shard. A query shard on a route that ignores it is not read. A hook
 cannot widen a scope. Deny rows reach an audit export claim. Unit tests cover the scope decision, the admin route matcher,
 execution-id decoding, query and body shard parsing, and the guard tests in
 `audit.rs`.
