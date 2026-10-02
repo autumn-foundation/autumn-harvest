@@ -1443,6 +1443,10 @@ fn notice_key(shard_id: i32, database: &str, schema: &str) -> NoticeKey {
 #[cfg(feature = "db")]
 const INDEX_BUILD_RETRY: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// Gate wait while a build task is alive. The end of the task replaces it.
+#[cfg(feature = "db")]
+const INDEX_BUILD_IN_FLIGHT: std::time::Duration = std::time::Duration::from_secs(365 * 24 * 3600);
+
 /// Wait after a build the role may not run. Only an operator can fix it.
 #[cfg(feature = "db")]
 pub const INDEX_BUILD_REFUSED_RETRY: std::time::Duration = std::time::Duration::from_secs(3600);
@@ -1469,9 +1473,11 @@ fn index_build_due(key: &BuildKey) -> bool {
     if gate.get(key).is_some_and(|not_before| now < *not_before) {
         return false;
     }
-    // A build can outlive the retry wait. The advisory lock then skips the
-    // duplicate, and that duplicate keeps the gate closed.
-    gate.insert(key.clone(), now + INDEX_BUILD_RETRY);
+    // The task is in flight until it calls `index_build_finished`. A task can
+    // stall after it connects, and a build can outlive any retry wait. A timed
+    // gate would then reopen and stack another task per wait. So the gate stays
+    // closed while the task lives, and its end sets the next wait.
+    gate.insert(key.clone(), now + INDEX_BUILD_IN_FLIGHT);
     true
 }
 
@@ -4966,6 +4972,28 @@ mod tests {
         let second = notice_key(0, "db@host:5432", "tenant_b");
         assert_ne!(first, second);
         assert_eq!(first, notice_key(0, "db@host:5432", "tenant_a"));
+    }
+
+    /// Issue #1667: a task that is still alive keeps its gate closed. A task
+    /// can stall after it connects, so the retry wait must not reopen the gate
+    /// while the task runs. Only the end of the task sets the next wait.
+    #[cfg(feature = "db")]
+    #[test]
+    fn an_in_flight_build_keeps_the_gate_closed_past_the_retry_wait() {
+        let key: BuildKey = (9_003, "postgres://gate-test/in-flight".to_owned());
+        assert!(index_build_due(&key));
+        let not_before = INDEX_BUILD_GATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            .copied()
+            .expect("an in-flight build leaves a gate entry");
+        let remaining = not_before.saturating_duration_since(std::time::Instant::now());
+        assert!(
+            remaining > INDEX_BUILD_REFUSED_RETRY,
+            "an in-flight build must outlast every retry wait: {remaining:?}"
+        );
+        index_build_finished(&key, BuildEnd::Ready);
     }
 
     /// Issue #1667: a privilege failure is the one error a retry cannot fix.
