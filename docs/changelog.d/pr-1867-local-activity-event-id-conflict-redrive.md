@@ -1,11 +1,12 @@
 ## Fix — re-drive a workflow task on a local activity event-id conflict (issue #1787)
 
-**Local activity append conflict.** The local activity prefix transaction
-now reads the next `event_id` under the execution row lock, as the other
-persist paths do, instead of the cursor snapshotted at task preparation. A
-local activity append that still loses its `event_id` to a concurrent append
-(the completion or retry-failure writes after the handler ran) re-drives the
-workflow task. Before, either case failed the run. Since #1787 (PR #1846), the poll path claims a race loser only
+**Local activity append conflict.** A local activity append that loses its
+`event_id` to a concurrent append now re-drives the workflow task. Before, it
+failed the run. The cursor snapshotted at task preparation is kept on purpose:
+a handler that outlived its task timeout collides with the events a peer
+committed, and the collision is what routes it to the claim fence. Re-reading
+the cursor under the row lock would let that stale handler append past the
+peer's events instead. Since #1787 (PR #1846), the poll path claims a race loser only
 when the winner frees its permit, so the loser appends `ActivityStarted` while
 the winner's workflow task runs. The local activity prefix append, at an
 `event_id` precomputed from the cycle's history load, then hit the
