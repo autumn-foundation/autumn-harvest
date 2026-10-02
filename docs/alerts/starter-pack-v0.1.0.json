@@ -1454,6 +1454,72 @@
         "harvest queue backlog --output json"
       ],
       "runbook": "docs/runbooks/harvest-alerts.md#harvest_dispatch_dropped_hints"
+    },
+    {
+      "id": "harvest_notify_send_failures",
+      "status": "enforceable",
+      "signal_source": "METRIC_NOTIFY_SEND_FAILURES / harvest.notify.send_failures, a per-process gauge sampled from the post-commit notify sender's failure counter (issue #1796).",
+      "default_threshold": "Ticket when the counter keeps climbing for 15 minutes past a single burst window.",
+      "severity": "ticket",
+      "owner_persona": "service on-call",
+      "description": "The post-commit notify sender on this process is losing notifications: a send error, a full sender queue, or a channel name Postgres rejects. A lost notification costs latency only -- the row is committed and workers find it on their next poll -- so this is a health signal, not a durability one.",
+      "first_action": "Search this process's logs for 'harvest: notifications lost; workers find the rows on their next poll' and read the cause field.",
+      "dependencies": [
+        {
+          "ref": "#1796",
+          "status": "shipped",
+          "surface": "METRIC_NOTIFY_SEND_FAILURES / harvest.notify.send_failures"
+        }
+      ],
+      "prometheus": {
+        "mode": "native-metric",
+        "notes": "Unlabeled gauge, one series per process. The same sustained-growth shape as harvest_dispatch_dropped_hints: the 15m clause requires growth over the window, the 5m clause requires growth in the most recent slice, and `for: 15m` keeps one burst (a brief database blip) from opening a ticket.",
+        "expressions": [
+          {
+            "kind": "promql",
+            "expr": "increase(harvest_notify_send_failures[15m]) > 0 and increase(harvest_notify_send_failures[5m]) > 0",
+            "for": "15m"
+          }
+        ]
+      },
+      "management_checks": [
+        "Worker and API process logs for 'harvest: notifications lost' (rate-limited to one warning every 30 seconds; the total field carries the running count)",
+        "harvest queue backlog --output json"
+      ],
+      "runbook": "docs/runbooks/harvest-alerts.md#harvest_notify_send_failures"
+    },
+    {
+      "id": "harvest_notify_queue_usage_high",
+      "status": "enforceable",
+      "signal_source": "METRIC_NOTIFY_QUEUE_USAGE / harvest.notify.queue_usage, the largest pg_notification_queue_usage() a live notify sender on this process read last (issue #1796).",
+      "default_threshold": "Ticket when the Postgres notification queue stays more than half full for 10 minutes.",
+      "severity": "ticket",
+      "owner_persona": "service on-call",
+      "description": "The Postgres asynchronous notification queue is filling up. A listening session that does not consume its notifications, often one held inside a long open transaction, pins the queue tail. Postgres rejects every NOTIFY once the queue is full, so harvest_notify_send_failures climbs next and workers fall back to polling latency.",
+      "first_action": "psql -c \"SELECT pid, state, xact_start, query FROM pg_stat_activity WHERE xact_start < now() - interval '10 minutes' ORDER BY xact_start\"",
+      "dependencies": [
+        {
+          "ref": "#1796",
+          "status": "shipped",
+          "surface": "METRIC_NOTIFY_QUEUE_USAGE / harvest.notify.queue_usage"
+        }
+      ],
+      "prometheus": {
+        "mode": "native-metric",
+        "notes": "Unlabeled gauge, one series per process, from 0 to 1. The queue belongs to the database, so every process on one database reports about the same value; max() collapses them into one alert. The series is absent until a notify sender has read the queue usage, so an absent series is not an alert condition.",
+        "expressions": [
+          {
+            "kind": "promql",
+            "expr": "max(harvest_notify_queue_usage) > 0.5",
+            "for": "10m"
+          }
+        ]
+      },
+      "management_checks": [
+        "psql -c \"SELECT pg_notification_queue_usage()\"",
+        "psql -c \"SELECT pid, state, xact_start, query FROM pg_stat_activity ORDER BY xact_start NULLS LAST\""
+      ],
+      "runbook": "docs/runbooks/harvest-alerts.md#harvest_notify_queue_usage_high"
     }
   ]
 }

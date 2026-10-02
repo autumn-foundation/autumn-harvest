@@ -3253,3 +3253,111 @@ Escalate when dropped hints climb alongside a growing queue backlog and
 Redis itself shows no sign of degradation — that combination points at
 undersized publisher capacity for the deployment's enqueue rate, which
 needs a code change, not an operator fix.
+
+## harvest_notify_send_failures
+
+**What to do when post-commit notifications fail:** the notify sender on
+this process is losing notifications (issue #1796). The gauge
+`harvest.notify.send_failures` reports the running total for this process.
+A send error, a full sender queue, or a channel name that Postgres rejects
+each count once.
+
+A lost notification costs latency only. The row is already committed, and
+workers find it on their next poll. This is a health signal, not a
+durability one. Nothing is lost.
+
+### Triage steps
+
+1. Check the alert labels to find the affected process.
+2. Search that process's logs for `harvest: notifications lost`. The
+   `cause` field names the failure. The warning repeats at most once every
+   30 seconds, and its `total` field carries the running count.
+3. Read `harvest.notify.queue_usage` for the same process. A high value
+   means the Postgres notification queue is filling up. See
+   [harvest_notify_queue_usage_high](#harvest_notify_queue_usage_high).
+4. Check the database itself for connection errors, failover, or
+   connection-pool exhaustion around the time the counter climbed.
+
+### Likely causes
+
+- The database is unreachable or failing over, so each `NOTIFY` fails.
+- The Postgres notification queue is full, so Postgres rejects each
+  `NOTIFY` until a listener drains it.
+- The sender holds more notes than its bound (10,000) because it cannot
+  read commit state fast enough. The sender drops the excess.
+- A write transaction stays open longer than 60 seconds. The sender drops
+  the notes that wait on it.
+- A queue name maps to a channel name that is 64 bytes or longer, which
+  Postgres rejects.
+
+### False positives
+
+A short climb during a planned database restart or failover. Alert only
+when the counter keeps climbing past a single burst window.
+
+### Safe actions
+
+- Nothing here is urgent by itself. Polling is the durability floor, so a
+  lost notification never loses or duplicates work.
+- Fix the database-side cause first: connectivity, a full notification
+  queue, or a long open transaction.
+- Shorten a queue name that Postgres rejects as a channel name. Expect the
+  counter to climb on every enqueue to that queue until the name changes.
+
+### Escalation criteria
+
+Escalate when the counter climbs while the database shows no errors and
+the notification queue is nearly empty. That combination points at the
+sender itself and needs a code change, not an operator fix.
+
+## harvest_notify_queue_usage_high
+
+**What to do when the Postgres notification queue fills up:** the gauge
+`harvest.notify.queue_usage` reports the largest
+`pg_notification_queue_usage()` that a live notify sender on this process
+read last (issue #1796). The value runs from `0` to `1`. Postgres rejects
+every `NOTIFY` once the queue is full.
+
+The queue belongs to the database, not to one process. Every process on
+one database reports about the same value.
+
+### Triage steps
+
+1. Run `SELECT pg_notification_queue_usage();` on the database to confirm
+   the reading.
+2. Find long open transactions:
+   `SELECT pid, state, xact_start, query FROM pg_stat_activity ORDER BY xact_start NULLS LAST;`.
+   A listening session inside an old transaction pins the queue tail.
+3. Find the listening sessions. Look for `LISTEN` in the `query` column of
+   `pg_stat_activity`, and match each `pid` to a process.
+4. Read `harvest.notify.send_failures`. A climb there means Postgres
+   already rejects notifications.
+
+### Likely causes
+
+- A session that ran `LISTEN` sits idle in an open transaction, so
+  Postgres cannot discard the notifications behind it.
+- A listener process is stuck or overloaded and does not read its
+  connection.
+- A large burst of notifications arrives faster than the listeners
+  consume them.
+
+### False positives
+
+A brief rise during a large batch enqueue that falls again within a few
+minutes. The `for: 10m` clause covers most of these.
+
+### Safe actions
+
+- End the transaction that holds the queue tail. Prefer a graceful
+  restart of the owning process over `pg_terminate_backend`.
+- Restart a stuck listener process. Its tasks stay safe in the queue.
+- Workers keep polling while notifications fail, so the queue fills
+  without data loss. Only latency degrades.
+
+### Escalation criteria
+
+Escalate when the queue usage keeps rising after the long transactions
+end, or when it reaches `1` and `harvest.notify.send_failures` climbs.
+Escalate to the database owner first, because the queue is a
+database-wide resource that other applications can also fill.

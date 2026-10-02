@@ -24759,6 +24759,11 @@ fn spawn_queue_pause_sampler(
 /// stays `PENDING` and the reconcile sweep republishes it. This is a health
 /// signal, not a durability one.
 ///
+/// Under the `db` feature, the same loop also samples the notify readings
+/// (issue #1796). It emits `harvest.notify.send_failures` on every tick. It
+/// emits `harvest.notify.queue_usage` once a notify sender has read the queue
+/// usage. Both readings are in-process and query no database.
+///
 /// `pub`, not worker-private: the dispatch background publisher installs
 /// unconditionally at startup (issue #1312), including in an API-only
 /// process with `worker_enabled = false`. Such a process still needs this
@@ -24784,6 +24789,15 @@ pub fn spawn_dispatch_metrics_sampler(
             telemetry
                 .metrics
                 .record_dispatch_dropped_hints(crate::dispatch::dropped_hints());
+            #[cfg(feature = "db")]
+            {
+                telemetry
+                    .metrics
+                    .record_notify_send_failures(crate::notify::send_failures());
+                if let Some(ratio) = crate::notify::queue_usage() {
+                    telemetry.metrics.record_notify_queue_usage(ratio);
+                }
+            }
             if cancel.is_cancelled() {
                 break;
             }
@@ -27323,6 +27337,7 @@ impl Worker {
     /// Otherwise it falls through to the existing single-shard path
     /// (`run_with_listener`) byte-for-byte unchanged.
     pub async fn run(&self, pool: &DbPool) {
+        self.register_notify_pools(pool);
         // Bind the global dispatch channel at the run boundary (issue #1431).
         // Every hint the run raises, in the poll loop or in a maintenance
         // loop, then goes to that channel.
@@ -28054,7 +28069,7 @@ impl Worker {
             }
         }
         if notified {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(crate::notify::settle_delay()).await;
         }
     }
 
@@ -28159,12 +28174,24 @@ impl Worker {
     ) {
         // A direct caller of this entry point skips `run`, so bind here too
         // (issue #1431).
+        self.register_notify_pools(pool);
         let bound = self.bound_channel();
         crate::dispatch::with_bound_channel(
             bound,
             Box::pin(self.run_with_listener_bound(pool, listener)),
         )
         .await;
+    }
+
+    /// Start the post-commit notify sender for each pool this worker writes
+    /// to (issue #1796).
+    fn register_notify_pools(&self, pool: &DbPool) {
+        crate::notify::register_pool(pool);
+        if let Some(sharded) = self.config.sharded_pool.as_ref() {
+            for (_, shard_pool) in sharded.iter_shards() {
+                crate::notify::register_pool(shard_pool);
+            }
+        }
     }
 
     /// The body of [`Worker::run_with_listener`], inside the dispatch binding.
@@ -29955,9 +29982,10 @@ impl Worker {
                         .await
                     {
                         Ok(Some(_)) => {
-                            // Host-side timestamps can be slightly ahead of Postgres NOW(),
-                            // so give newly notified tasks a brief moment to become claimable.
-                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            // Host clocks can run ahead of the database NOW(). A
+                            // jittered delay lets a new task become claimable,
+                            // and spreads the claims of many workers (issue #1796).
+                            tokio::time::sleep(crate::notify::settle_delay()).await;
                         }
                         Ok(None) => {}
                         Err(error) => {

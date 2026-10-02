@@ -1268,6 +1268,9 @@ impl HarvestRunner {
         // publisher this metric describes is installed unconditionally,
         // above. That happens specifically because an API-only process
         // still publishes references for the fleet (issue #1429 review).
+        // The same sampler also emits the notify gauges (issue #1796). An
+        // API-only process starts workflows, so its client sends notifications
+        // and needs them too.
         // Only spawn when there is no `Worker` to double up with.
         let dispatch_metrics_sampler = if worker.is_none() {
             let cancel = CancellationToken::new();

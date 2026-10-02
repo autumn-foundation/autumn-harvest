@@ -460,6 +460,21 @@ pub const METRIC_DLQ_ENTRIES: &str = "harvest.dlq.entries";
 /// the publisher queue is undersized for the enqueue rate.
 pub const METRIC_DISPATCH_DROPPED_HINTS: &str = "harvest.dispatch.dropped_hints";
 
+/// Gauge: cumulative notifications this process has lost to an error
+/// (issue #1796).
+///
+/// A send error, a full sender queue, or a rejected channel name each count
+/// once. A lost notification costs latency, not work. Polling finds the row.
+/// A sustained non-zero rate means the post-commit notify path is unhealthy.
+pub const METRIC_NOTIFY_SEND_FAILURES: &str = "harvest.notify.send_failures";
+
+/// Gauge: the largest `pg_notification_queue_usage()` that a live notify
+/// sender read last, from `0.0` to `1.0` (issue #1796).
+///
+/// Postgres rejects a `NOTIFY` when this queue is full. A value that stays
+/// high means a listener does not drain its notifications.
+pub const METRIC_NOTIFY_QUEUE_USAGE: &str = "harvest.notify.queue_usage";
+
 /// Gauge: `1` while a task queue is paused by an operator, `0` once it resumes
 /// (issue #619).
 ///
@@ -2804,6 +2819,26 @@ pub trait MetricsRecorder: Send + Sync {
     /// the running total from [`crate::dispatch::dropped_hints`].
     fn record_dispatch_dropped_hints(&self, total: u64) {
         let _ = total;
+    }
+
+    /// Cumulative notifications this process has lost to an error
+    /// (issue #1796).
+    ///
+    /// Emitted by a periodic in-process sampler, no label. Maps to the gauge
+    /// `harvest_notify_send_failures`. Not incremental: each call carries the
+    /// running total from `crate::notify::send_failures`.
+    fn record_notify_send_failures(&self, total: u64) {
+        let _ = total;
+    }
+
+    /// The largest Postgres notification queue usage that a live notify
+    /// sender read last, from `0.0` to `1.0` (issue #1796).
+    ///
+    /// Emitted by a periodic in-process sampler, no label. Maps to the gauge
+    /// `harvest_notify_queue_usage`. The sampler skips the call until a
+    /// sender has read the queue usage.
+    fn record_notify_queue_usage(&self, ratio: f64) {
+        let _ = ratio;
     }
 
     /// Whether a task queue is currently held by an operator queue pause

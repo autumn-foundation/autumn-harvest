@@ -28,6 +28,13 @@
 //! default is 5 seconds. `HARVEST_NOTIFY_BENCH_WRITERS` sets the writer counts
 //! as a comma list. The default is `1,4,16,32`.
 
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "commit counts and ranks stay far below 2^52"
+)]
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -58,7 +65,7 @@ enum Mode {
 }
 
 impl Mode {
-    fn label(self) -> &'static str {
+    const fn label(self) -> &'static str {
         match self {
             Self::None => "none",
             Self::InTransaction => "in_transaction",

@@ -343,7 +343,7 @@ impl Note {
 }
 
 /// True when Postgres accepts `channel` as a channel name.
-fn valid_channel(channel: &str) -> bool {
+const fn valid_channel(channel: &str) -> bool {
     !channel.is_empty() && channel.len() < PG_NAMEDATALEN
 }
 
@@ -366,34 +366,30 @@ fn coalesce(notes: Vec<Note>) -> Vec<(String, String)> {
             continue;
         }
         match note {
-            Note::Task { channel, task_id } => match index.get(&channel) {
-                Some(&i) => {
+            Note::Task { channel, task_id } => {
+                if let Some(&i) = index.get(&channel) {
                     if let Merged::Task(_, id) = &mut merged[i] {
                         *id = Uuid::nil();
                     }
-                }
-                None => {
+                } else {
                     index.insert(channel.clone(), merged.len());
                     merged.push(Merged::Task(channel, task_id));
                 }
-            },
+            }
             Note::Events {
                 exec_id,
                 count,
                 last_event_type,
             } => {
                 let key = format!("events:{exec_id}");
-                match index.get(&key) {
-                    Some(&i) => {
-                        if let Merged::Events(_, total, last) = &mut merged[i] {
-                            *total += count;
-                            *last = last_event_type;
-                        }
+                if let Some(&i) = index.get(&key) {
+                    if let Merged::Events(_, total, last) = &mut merged[i] {
+                        *total += count;
+                        *last = last_event_type;
                     }
-                    None => {
-                        index.insert(key, merged.len());
-                        merged.push(Merged::Events(exec_id, count, last_event_type));
-                    }
+                } else {
+                    index.insert(key, merged.len());
+                    merged.push(Merged::Events(exec_id, count, last_event_type));
                 }
             }
         }
@@ -461,9 +457,15 @@ fn record_failures(count: usize, cause: &dyn std::fmt::Display) {
         return;
     }
     let total = SEND_FAILURES.fetch_add(count as u64, Ordering::Relaxed) + count as u64;
-    let mut logged = lock(&FAILURE_LOGGED);
-    if logged.is_none_or(|at| at.elapsed() >= FAILURE_LOG_INTERVAL) {
-        *logged = Some(Instant::now());
+    let due = {
+        let mut logged = lock(&FAILURE_LOGGED);
+        let due = logged.is_none_or(|at| at.elapsed() >= FAILURE_LOG_INTERVAL);
+        if due {
+            *logged = Some(Instant::now());
+        }
+        due
+    };
+    if due {
         tracing::warn!(
             lost = count,
             total,
@@ -525,13 +527,13 @@ impl SinkShared {
 
     /// Queue `notes` for the sender.
     fn push(&self, txid: Option<i64>, notes: Vec<Note>) {
-        let staged_at = Instant::now();
+        let queued_at = Instant::now();
         let mut pending = lock(&self.pending);
         let room = MAX_PENDING_NOTES.saturating_sub(pending.len());
         let dropped = notes.len().saturating_sub(room);
         pending.extend(notes.into_iter().take(room).map(|note| Staged {
             txid,
-            staged_at,
+            queued_at,
             note,
         }));
         drop(pending);
@@ -546,7 +548,7 @@ struct Staged {
     /// already committed, or when the transaction had no id yet.
     txid: Option<i64>,
     /// When the note was staged.
-    staged_at: Instant,
+    queued_at: Instant,
     /// The note.
     note: Note,
 }
@@ -613,15 +615,14 @@ pub fn register_pool(pool: &crate::worker::DbPool) -> NotifySink {
         queue_usage: Mutex::new(None),
         task: Mutex::new(None),
     });
-    match tokio::runtime::Handle::try_current() {
-        Ok(runtime) => {
-            let task = runtime.spawn(run_sender(Arc::clone(&shared)));
-            *lock(&shared.task) = Some(task);
-            sinks.push(Arc::clone(&shared));
-        }
-        Err(_) => {
-            tracing::debug!("harvest: no Tokio runtime; notifications use the fallback");
-        }
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        let task = runtime.spawn(run_sender(Arc::clone(&shared)));
+        *lock(&shared.task) = Some(task);
+        sinks.push(Arc::clone(&shared));
+        drop(sinks);
+    } else {
+        drop(sinks);
+        tracing::debug!("harvest: no Tokio runtime; notifications use the fallback");
     }
     NotifySink { shared }
 }
@@ -847,7 +848,7 @@ async fn tick(sink: &SinkShared, conn: &mut AsyncPgConnection, held: &mut Vec<St
         match status.as_deref() {
             Some("aborted") => {}
             Some("in progress") => {
-                if staged.staged_at.elapsed() < MAX_GATE_WAIT {
+                if staged.queued_at.elapsed() < MAX_GATE_WAIT {
                     waiting.push(staged);
                 } else {
                     tracing::debug!("harvest: dropped a notification whose transaction stays open");
