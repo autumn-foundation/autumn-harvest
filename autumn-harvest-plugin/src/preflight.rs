@@ -1503,6 +1503,13 @@ fn check_admin_auth_boundary(api_state: &HarvestApiState) -> PreflightCheckResul
     // carry it. Always present (never conditionally omitted) so a CI script can
     // assert on the field rather than on its absence.
     let unauthenticated_access = is_dev && !has_boundary;
+    // Issue #1802: report open mutating routes the same way. The opt-out can
+    // open them outside `dev`, so this is not the same field as above.
+    let unauthenticated_mutations = crate::boot::unauthenticated_mutations_open(
+        &profile,
+        has_boundary,
+        api_state.allow_unauthenticated_mutations(),
+    );
 
     check(
         "admin_auth_boundary",
@@ -1536,6 +1543,7 @@ fn check_admin_auth_boundary(api_state: &HarvestApiState) -> PreflightCheckResul
             "profile": profile,
             "auth_boundary_present": has_boundary,
             "unauthenticated_access": unauthenticated_access,
+            "unauthenticated_mutations": unauthenticated_mutations,
         }),
     )
 }
@@ -1771,6 +1779,32 @@ mod tests {
                 result.details["unauthenticated_access"],
                 serde_json::json!(false),
                 "profile {profile:?} must not report unauthenticated access"
+            );
+        }
+    }
+
+    /// Issue #1802: the check reports open mutating routes as data. The
+    /// field is always present, so a release script can gate on it.
+    #[test]
+    fn admin_auth_boundary_reports_unauthenticated_mutations() {
+        let cases = [
+            ("dev", false, false, true),
+            ("dev", true, false, false),
+            ("prod", false, false, false),
+            ("prod", false, true, true),
+            ("prod", true, true, false),
+            ("unknown", false, false, false),
+        ];
+        for (profile, boundary, opt_out, expected) in cases {
+            let state = HarvestApiState::new();
+            state.set_deployment_profile(profile);
+            state.set_admin_auth_boundary(boundary);
+            state.set_allow_unauthenticated_mutations(opt_out);
+            let result = check_admin_auth_boundary(&state);
+            assert_eq!(
+                result.details["unauthenticated_mutations"],
+                serde_json::json!(expected),
+                "profile={profile} boundary={boundary} opt_out={opt_out}"
             );
         }
     }

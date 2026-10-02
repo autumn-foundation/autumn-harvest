@@ -213,6 +213,43 @@ pub fn dev_admin_api_is_open(profile: &str, auth_boundary_present: bool) -> bool
     profile == "dev" && !auth_boundary_present
 }
 
+/// Whether a caller with no credential reaches a mutating route (issue #1802).
+///
+/// The `dev` profile and the `allow_unauthenticated_mutations` opt-out open
+/// the routes. A declared auth boundary hands the decision to the embedder's
+/// middleware, so the routes are not open to Harvest's own check. Every other
+/// posture fails closed. The mutation gate, the startup warning and
+/// `preflight` all read this one predicate.
+pub fn unauthenticated_mutations_open(
+    profile: &str,
+    auth_boundary_present: bool,
+    allow_unauthenticated_mutations: bool,
+) -> bool {
+    !auth_boundary_present && (profile == "dev" || allow_unauthenticated_mutations)
+}
+
+/// Log the `allow_unauthenticated_mutations` opt-out when it opens the routes.
+///
+/// The `dev` profile has its own warning, so this one names the opt-out only.
+pub fn warn_if_mutation_opt_out_is_open(
+    profile: &str,
+    auth_boundary_present: bool,
+    allow_unauthenticated_mutations: bool,
+) {
+    if allow_unauthenticated_mutations
+        && unauthenticated_mutations_open(profile, auth_boundary_present, true)
+    {
+        tracing::warn!(
+            profile,
+            "allow_unauthenticated_mutations is set and no auth boundary is declared: every \
+             Harvest mutating route without an admin gate (workflow start, signal, reset, \
+             update, DAG trigger, schedule changes, external-activity callbacks, worker drain, \
+             Vantage and MCP tool mutations) is reachable UNAUTHENTICATED. Remove the opt-out \
+             once an auth layer wraps the management API."
+        );
+    }
+}
+
 /// How many times a guard has published a gate cache in this process.
 ///
 /// A refused boot restores the previous globals, so the globals alone cannot

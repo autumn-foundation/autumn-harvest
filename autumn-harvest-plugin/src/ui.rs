@@ -792,6 +792,12 @@ pub fn harvest_ui_router(api_state: HarvestApiState) -> Router<()> {
             "/admin/gates/{id}/lift",
             post(lift_gate_ui).route_layer(require_admin),
         )
+        // Issue #1802: outside `dev`, a Vantage form post fails closed unless
+        // an auth layer is declared or the opt-out is set. Pages stay open.
+        .route_layer(middleware::from_fn_with_state(
+            api_state.clone(),
+            crate::api::require_mutation_auth_by_method,
+        ))
         .layer(Extension(api_state))
         // issue #1278: reject a cross-site POST before it reaches any
         // handler or admin check. The guard then covers every mutation

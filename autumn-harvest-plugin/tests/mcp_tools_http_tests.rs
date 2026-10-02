@@ -62,6 +62,16 @@ fn daily_etl_dag(dag: &mut DagBuilder) {
     let _ = dag.activity(noop_task);
 }
 
+/// An API state with the issue #1802 opt-out set.
+///
+/// These tests probe each tool's own pipeline. The opt-out keeps the
+/// fail-closed mutation gate from masking it.
+fn open_mutations_state() -> HarvestApiState {
+    let api_state = HarvestApiState::new();
+    api_state.set_allow_unauthenticated_mutations(true);
+    api_state
+}
+
 fn order_input_schema() -> Value {
     json!({
         "type": "object",
@@ -90,7 +100,7 @@ fn build_client() -> TestClient {
     let routes = build_mcp_tool_routes(
         "/api/harvest/mcp",
         &descriptors,
-        &HarvestApiState::new(),
+        &open_mutations_state(),
         None,
         false,
     );
@@ -388,7 +398,7 @@ fn build_dag_client() -> TestClient {
     let routes = build_mcp_tool_routes(
         "/api/harvest/mcp",
         &descriptors,
-        &HarvestApiState::new(),
+        &open_mutations_state(),
         None,
         false,
     );
@@ -529,16 +539,19 @@ type RouteMeta = Vec<(Method, String)>;
 /// scaffolding), so a `Session` can be injected per request. Returns the app
 /// plus the mutating and read `(Method, concrete_path)` sets.
 fn build_router(role_auth_enabled: bool) -> (Router, RouteMeta, RouteMeta) {
+    build_router_with(&open_mutations_state(), role_auth_enabled)
+}
+
+/// Like [`build_router`], with a caller-chosen API state (issue #1802).
+fn build_router_with(
+    api_state: &HarvestApiState,
+    role_auth_enabled: bool,
+) -> (Router, RouteMeta, RouteMeta) {
     let descriptors = all_descriptors();
     record_schemas(&descriptors);
     let muts = mutation_paths(&descriptors);
-    let tool_routes = build_mcp_tool_routes(
-        MCP_PREFIX,
-        &descriptors,
-        &HarvestApiState::new(),
-        None,
-        role_auth_enabled,
-    );
+    let tool_routes =
+        build_mcp_tool_routes(MCP_PREFIX, &descriptors, api_state, None, role_auth_enabled);
 
     let mut app: Router<AppState> = Router::new();
     let mut mutating = Vec::new();
@@ -640,5 +653,54 @@ async fn role_auth_off_leaves_mcp_tools_ungated() {
             StatusCode::FORBIDDEN,
             "role-auth OFF: read-only principal must reach MCP tool {method} {path}"
         );
+    }
+}
+
+// ── Fail-closed MCP mutations (issue #1802) ──────────────────────────────────
+//
+// The tool routes are app-level, so the gate on the management router does
+// not cover them. Each mutating tool carries its own gate.
+
+#[tokio::test]
+async fn anonymous_caller_is_refused_mutating_mcp_tools_outside_dev() {
+    let api_state = HarvestApiState::new();
+    api_state.set_deployment_profile("prod");
+    let (app, mutating, reading) = build_router_with(&api_state, false);
+    for (method, path) in &mutating {
+        let (status, _) = drive(&app, method, path, None).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "anonymous caller must get 401 on mutating MCP tool {method} {path}"
+        );
+    }
+    for (method, path) in &reading {
+        let (status, _) = drive(&app, method, path, None).await;
+        assert_ne!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "read MCP tool {method} {path} must stay open"
+        );
+    }
+    for (method, path) in &mutating {
+        let (status, _) = drive(&app, method, path, Some(admin_session())).await;
+        assert_ne!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "admin principal must reach MCP tool {method} {path}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn opt_out_and_dev_profile_keep_mcp_mutations_open() {
+    let dev = HarvestApiState::new();
+    dev.set_deployment_profile("dev");
+    for api_state in [open_mutations_state(), dev] {
+        let (app, mutating, _) = build_router_with(&api_state, false);
+        for (method, path) in &mutating {
+            let (status, _) = drive(&app, method, path, None).await;
+            assert_ne!(status, StatusCode::UNAUTHORIZED, "{method} {path}");
+        }
     }
 }

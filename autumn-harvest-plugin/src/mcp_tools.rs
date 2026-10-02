@@ -878,6 +878,7 @@ fn build_tool_route(
     let path: &'static str = leak(spec.path.clone());
     let operation_id: &'static str = leak(spec.operation_id.clone());
     let workflow: &'static str = leak(spec.workflow.clone());
+    let gate_state = api_state.clone();
 
     let handler: MethodRouter<autumn_web::AppState> = match spec.kind {
         ToolKind::Start => axum::routing::post(
@@ -940,6 +941,17 @@ fn build_tool_route(
     let handler = if role_auth_enabled && spec.kind.is_mutation() {
         handler.layer(axum::middleware::from_fn(
             crate::api::enforce_read_only_mcp_mutation,
+        ))
+    } else {
+        handler
+    };
+    // Issue #1802: outside `dev`, a mutating tool fails closed unless an auth
+    // layer is declared or the opt-out is set. It sits inside the auth
+    // middleware below, so it reads the `Session` that middleware sets.
+    let handler = if spec.kind.is_mutation() {
+        handler.layer(axum::middleware::from_fn_with_state(
+            gate_state,
+            crate::api::require_mutation_auth_by_method,
         ))
     } else {
         handler

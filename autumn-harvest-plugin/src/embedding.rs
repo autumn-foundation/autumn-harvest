@@ -237,6 +237,11 @@ impl HarvestEmbedding {
             apply_ambient_profile(&api_state, &admin_auth, operator.profile.as_deref());
         }
         warn_if_dev_admin_api_is_open(&api_state);
+        boot::warn_if_mutation_opt_out_is_open(
+            &api_state.deployment_profile(),
+            api_state.admin_auth_boundary(),
+            api_state.allow_unauthenticated_mutations(),
+        );
         // Reject a start that arrives before the boot gate load completes.
         api_state.arm_gate_cache_fail_closed();
         api_state.set_health_requires_shard_readiness(config.readiness.require_shard_readiness);
@@ -411,9 +416,9 @@ fn warn_if_dev_admin_api_is_open(api_state: &HarvestApiState) {
     ) {
         tracing::warn!(
             "The dev deployment profile is active with no admin auth boundary declared: the \
-             Harvest management API (every /admin route and the Vantage dashboard) is reachable \
-             UNAUTHENTICATED by any caller that can open a socket to this process. Do not \
-             expose this process beyond localhost. To close it, declare \
+             Harvest management API (every /admin route, every mutating route and the Vantage \
+             dashboard) is reachable UNAUTHENTICATED by any caller that can open a socket to \
+             this process. Do not expose this process beyond localhost. To close it, declare \
              StandaloneAdminAuth::with_admin_auth_boundary() behind your own auth layer, or \
              declare a non-dev profile."
         );

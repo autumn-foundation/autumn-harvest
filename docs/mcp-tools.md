@@ -217,13 +217,15 @@ An already-terminal run yields the result frame immediately.
   caller could bypass `secure_mcp` entirely by hitting a tool's route path
   directly instead of going through `/mcp`). Configure `api_with_auth`
   wherever the management API needs a credential and MCP tools are also
-  enabled; `.api(path)` (no auth) leaves both surfaces open, matching today's
-  unauthenticated-by-default posture for that configuration. **`secure_mcp`
+  enabled. With `.api(path)` (no auth), the mutating tool routes fail closed
+  with `401` outside the `dev` profile (issue #1802). They stay open in `dev`
+  and under `allow_unauthenticated_mutations()`. Read tools stay open.
+  Scoped API tokens do not reach these routes. **`secure_mcp`
   alone is not enough**: `HarvestPlugin` cannot detect or intercept it (it's
   configured on the outer `AppBuilder`, after `Plugin::build` returns), so
   enabling `mcp_tools()` without also configuring `api_with_auth` logs a
-  `tracing::warn!` at startup naming this exact gap — the generated routes
-  are reachable unauthenticated at their own path regardless of `secure_mcp`.
+  `tracing::warn!` at startup naming this exact gap. `secure_mcp` does not
+  gate a generated route's own path.
 
 ## Testing
 
