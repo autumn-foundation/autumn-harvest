@@ -165,7 +165,7 @@ async fn seed_orphan(database_url: &str, workflow_name: &str) {
         workflow_id: "orphan-1",
         run_id: uuid::Uuid::new_v4(),
         shard_id: 0,
-        input: json!({}),
+        input: json!({}).into(),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,

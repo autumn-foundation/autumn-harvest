@@ -64,6 +64,7 @@ pub enum ConnectorError {
 /// acknowledgement is a high-water mark (Kafka) must use
 /// [`super::disposition::OffsetTracker`] so a committed offset can never run
 /// ahead of an in-flight message.
+// `async_trait` adds its own `#[must_use]` to each method.
 #[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait EventSource: Send + Sync {

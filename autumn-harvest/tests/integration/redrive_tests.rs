@@ -98,7 +98,7 @@ async fn start_running(
             workflow_name,
             workflow_id,
             exec_id: ExecutionId::new_for_shard(ShardId::new(0)),
-            input: serde_json::json!({"k": "v"}),
+            input: serde_json::json!({"k": "v"}).into(),
             parent_id: None,
             queue_name: queue,
             execution_timeout: None,

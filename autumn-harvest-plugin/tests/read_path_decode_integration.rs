@@ -320,7 +320,7 @@ async fn seed_running(
             workflow_name: "decode-wf",
             workflow_id,
             exec_id,
-            input,
+            input: input.into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
