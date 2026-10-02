@@ -815,6 +815,34 @@ async fn a_sender_starts_again_after_its_runtime_ends() {
 }
 
 #[tokio::test]
+async fn a_sender_cancelled_before_its_first_poll_starts_again() {
+    let (url, _container) = setup().await;
+    let pool = build_pool(&url);
+    let sink = {
+        let pool = pool.clone();
+        std::thread::spawn(move || {
+            // The block finishes at its first poll, so the runtime never
+            // polls the sender task. The drop cancels that task.
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let sink = runtime.block_on(async { autumn_harvest::notify::register_pool(&pool) });
+            drop(runtime);
+            sink
+        })
+        .join()
+        .expect("a short-lived runtime")
+    };
+    let mut shadowed = shadowed_conn(&url).await;
+    let mut listener = WorkflowEventListener::connect(&url)
+        .await
+        .expect("listener");
+
+    assert_wake_from_sender(&mut shadowed, &mut listener, &sink).await;
+}
+
+#[tokio::test]
 async fn a_scheduler_runtime_registers_its_pool() {
     let (url, _container) = setup().await;
     let pool = build_pool(&url);

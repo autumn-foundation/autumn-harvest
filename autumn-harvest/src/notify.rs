@@ -761,8 +761,19 @@ fn sink_for(fingerprint: &Fingerprint) -> Option<Arc<SinkShared>> {
 }
 
 /// True when the process has at least one healthy sender.
+///
+/// With no healthy sender, a deferred sender sets [`ANY_DEFERRED`]. A task
+/// that a runtime cancels before its first poll never builds its [`Held`]
+/// guard, so this check is the only one that finds it.
 fn any_sink() -> bool {
-    lock(&SINKS).iter().any(|sink| sink.healthy())
+    let sinks = lock(&SINKS);
+    let found = sinks.iter().any(|sink| sink.healthy());
+    let deferred = !found && sinks.iter().any(|sink| sink.deferred());
+    drop(sinks);
+    if deferred {
+        ANY_DEFERRED.store(true, Ordering::Relaxed);
+    }
+    found
 }
 
 /// True unless `conn` is certainly outside a transaction.
@@ -798,6 +809,7 @@ struct StageRow {
 /// Postgres answers `COMMIT` on a failed transaction with a silent rollback.
 /// The error therefore tells the caller that its write did not commit.
 async fn stage(conn: &mut AsyncPgConnection, notes: Vec<Note>) -> HarvestResult<()> {
+    let has_sink = any_sink();
     if AtomicBool::load(&ANY_DEFERRED, Ordering::Relaxed)
         && let Ok(runtime) = tokio::runtime::Handle::try_current()
     {
@@ -806,7 +818,7 @@ async fn stage(conn: &mut AsyncPgConnection, notes: Vec<Note>) -> HarvestResult<
     // Outside a diesel transaction, the stage reads `txid_current_if_assigned()`.
     // The fallback reuses that reading to find a raw `BEGIN` block.
     let mut raw_block = RawBlock::Unknown;
-    if any_sink() {
+    if has_sink {
         let in_tx = in_transaction(conn);
         // Inside a diesel transaction, `txid_current()` assigns an id when
         // the transaction has none yet. Thus the gate never sends before the
