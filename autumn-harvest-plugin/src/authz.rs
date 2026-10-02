@@ -34,8 +34,9 @@
 //!   query parameter or body field on the routes in `SHARD_SOURCES`. `None`
 //!   means Harvest cannot name the shard before the handler runs. A list
 //!   route reads every shard. A by-id route or an unpinned start reaches one
-//!   shard by hash. A lineage route (`/children`, `/tree`) gets its
-//!   execution's shards and also `None`, because it reads every shard.
+//!   shard by hash. A lineage route (`/children`, `/tree`, `erase-payloads`)
+//!   gets its execution's shards and also `None`, because it reads, or
+//!   erases, every shard.
 //!
 //! # Audit volume
 //!
@@ -59,8 +60,8 @@ use uuid::Uuid;
 use autumn_harvest::audit::{
     self, HEADER_TENANT, OP_AUTHZ_DENY, RouteClass, STATUS_FAILED, TARGET_ROUTE,
 };
-use autumn_harvest::models::NewAuditRecord;
-use autumn_harvest::shard::ShardPlacement;
+use autumn_harvest::models::{NewAuditRecord, WorkflowExecution};
+use autumn_harvest::shard::{ShardPlacement, ShardedDbPool};
 use autumn_harvest::shard_fence::ShardFence;
 use autumn_harvest::types::ShardId;
 
@@ -299,8 +300,8 @@ pub(crate) enum ShardSource {
     Body { field: &'static str, form: bool },
     /// A start body: `shard_id`, or a `residency_key` the router resolves.
     StartBody,
-    /// The handler reads its execution's shards, then every shard for
-    /// descendants. The hook is also called with `None`.
+    /// The handler reads its execution's shards, then reads or erases
+    /// descendants on every shard. The hook is also called with `None`.
     FanOut,
 }
 
@@ -311,6 +312,7 @@ pub(crate) enum ShardSource {
 pub(crate) const SHARD_SOURCES: &[(&str, ShardSource)] = &[
     ("GET /workflows/{id}/children", ShardSource::FanOut),
     ("GET /workflows/{id}/tree", ShardSource::FanOut),
+    ("POST /workflows/{id}/erase-payloads", ShardSource::FanOut),
     (
         "GET /admin/history/exports",
         ShardSource::Query(&["shard_id", "shard-id", "shard"]),
@@ -405,9 +407,10 @@ fn shard_number(raw: i64) -> Option<ShardId> {
 ///
 /// That is the id's entry shard and the shard it lives on now. On a route in
 /// [`RETRY_CHAIN_ROUTES`], it is also the shard of every later attempt in the
-/// retry chain. The walks are the ones the handlers use. If a walk fails, the handler fails it too,
-/// so the request gets `503`. An unknown id adds no attempts; the handler
-/// answers `404`.
+/// retry chain. On a route in [`CONTINUED_AS_NEW_ROUTES`], it is also every
+/// shard of each continued-as-new successor. The walks are the ones the
+/// handlers use. If a walk fails, the handler fails it too, so the request
+/// gets `503`. An unknown id adds no attempts; the handler answers `404`.
 ///
 /// The walks run under [`autumn_harvest::shard_fence::record`]. Every shard
 /// a walk names, such as a forwarding hop or an attempt's own entry shard,
@@ -437,6 +440,7 @@ async fn path_shards(
         StatusCode::SERVICE_UNAVAILABLE
     };
     let retry_chain = follows_retry_chain(method, path);
+    let continued_as_new = follows_continued_as_new(method, path);
     let (resolved, named) = autumn_harvest::shard_fence::record(async {
         let (mut conn, live) =
             autumn_harvest::shard_rebalance::conn_for_execution_forwarded_with_shard(pool, exec_id)
@@ -445,10 +449,19 @@ async fn path_shards(
         if !retry_chain {
             return Ok(shards);
         }
-        match autumn_harvest::execution::walk_retry_chain(&mut conn, pool, live, exec_id).await {
-            Ok(chain) => shards.extend(chain.into_iter().map(|(_, shard)| shard)),
-            Err(autumn_harvest::HarvestError::NotFound(_)) => {}
-            Err(e) => return Err(e),
+        let mut chain =
+            match autumn_harvest::execution::walk_retry_chain(&mut conn, pool, live, exec_id).await
+            {
+                Ok(chain) => chain,
+                Err(autumn_harvest::HarvestError::NotFound(_)) => return Ok(shards),
+                Err(e) => return Err(e),
+            };
+        shards.extend(chain.iter().map(|(_, shard)| *shard));
+        // The handler holds no connection across a successor hop. Release
+        // this one, so a pool of size one cannot wait on itself.
+        drop(conn);
+        if continued_as_new && let Some((attempt, _)) = chain.pop() {
+            continued_as_new_shards(pool, attempt, &mut shards).await?;
         }
         Ok::<_, autumn_harvest::HarvestError>(shards)
     })
@@ -456,6 +469,79 @@ async fn path_shards(
     let mut shards = resolved.map_err(|e| unavailable(&e))?;
     shards.extend(named);
     Ok(shards)
+}
+
+/// The most continued-as-new hops a walk follows. The same bound as the
+/// `/result` handler.
+const CONTINUED_AS_NEW_MAX_HOPS: usize = 128;
+
+/// Add the shards of every continued-as-new successor of `attempt`.
+///
+/// This is the walk the `/result` handler runs. While the live attempt is
+/// `CONTINUED_AS_NEW`, its history names a successor. The successor's routed
+/// shard, its live shard and the shards of its retry chain are added. The
+/// walk then goes on from the successor's live attempt. A successor with no
+/// row ends the walk, because the handler then answers with the last row it
+/// found. Any other failure is an error, as it is in the handler.
+async fn continued_as_new_shards(
+    pool: &ShardedDbPool,
+    mut attempt: WorkflowExecution,
+    shards: &mut Vec<ShardId>,
+) -> autumn_harvest::HarvestResult<()> {
+    use autumn_harvest::HarvestError;
+    for _ in 0..CONTINUED_AS_NEW_MAX_HOPS {
+        if attempt.state != "CONTINUED_AS_NEW" {
+            return Ok(());
+        }
+        let effective = autumn_harvest::types::ExecutionId::from_uuid(attempt.id);
+        let Some(next) = continued_as_new_successor(pool, effective).await? else {
+            return Ok(());
+        };
+        shards.push(pool.routed_shard_for_execution(next));
+        let (mut conn, live) =
+            match autumn_harvest::shard_rebalance::conn_for_execution_forwarded_with_shard(
+                pool, next,
+            )
+            .await
+            {
+                Ok(found) => found,
+                Err(HarvestError::NotFound(_)) => return Ok(()),
+                Err(e) => return Err(e),
+            };
+        shards.push(live);
+        let mut chain =
+            match autumn_harvest::execution::walk_retry_chain(&mut conn, pool, live, next).await {
+                Ok(chain) => chain,
+                Err(HarvestError::NotFound(_)) => return Ok(()),
+                Err(e) => return Err(e),
+            };
+        shards.extend(chain.iter().map(|(_, shard)| *shard));
+        let Some((last, _)) = chain.pop() else {
+            return Ok(());
+        };
+        attempt = last;
+    }
+    Ok(())
+}
+
+/// The successor named by the `WorkflowContinuedAsNew` event of `exec_id`.
+///
+/// The history is read undecoded, as the handler reads it. Only the typed
+/// successor id is used, so a codec envelope rides along untouched.
+async fn continued_as_new_successor(
+    pool: &ShardedDbPool,
+    exec_id: autumn_harvest::types::ExecutionId,
+) -> autumn_harvest::HarvestResult<Option<autumn_harvest::types::ExecutionId>> {
+    let (mut conn, _) =
+        autumn_harvest::shard_rebalance::conn_for_execution_forwarded_with_shard(pool, exec_id)
+            .await?;
+    let history = autumn_harvest::store::load_history_undecoded(&mut conn, exec_id).await?;
+    Ok(history.events.into_iter().find_map(|event| match event {
+        autumn_harvest::WorkflowEvent::WorkflowContinuedAsNew { new_exec_id, .. } => {
+            Some(new_exec_id)
+        }
+        _ => None,
+    }))
 }
 
 /// The shards named by `keys` in the query, decoded as the handlers decode it.
@@ -510,6 +596,26 @@ fn follows_retry_chain(method: &Method, path: &str) -> bool {
         build_route_matchers(
             "RETRY_CHAIN_ROUTES",
             RETRY_CHAIN_ROUTES.iter().map(|route| (*route, ())),
+        )
+    });
+    match_route(matchers, method, path).is_some()
+}
+
+/// Routes whose handler follows the continued-as-new chain to its end.
+///
+/// Each successor is read from the predecessor's history, so the successor
+/// can live on any shard. Every template must also be in
+/// [`RETRY_CHAIN_ROUTES`], because the walk starts at the live attempt. Each
+/// template must be in [`autumn_harvest::audit::CLASSIFIED_ROUTES`].
+pub(crate) const CONTINUED_AS_NEW_ROUTES: &[&str] = &["GET /workflows/{id}/result"];
+
+/// Whether the handler of `method` and `path` follows continued-as-new.
+fn follows_continued_as_new(method: &Method, path: &str) -> bool {
+    static MATCHERS: std::sync::OnceLock<RouteMatchers<()>> = std::sync::OnceLock::new();
+    let matchers = MATCHERS.get_or_init(|| {
+        build_route_matchers(
+            "CONTINUED_AS_NEW_ROUTES",
+            CONTINUED_AS_NEW_ROUTES.iter().map(|route| (*route, ())),
         )
     });
     match_route(matchers, method, path).is_some()
@@ -758,6 +864,38 @@ mod tests {
     }
 
     #[test]
+    fn continued_as_new_routes_are_retry_chain_routes() {
+        for template in CONTINUED_AS_NEW_ROUTES {
+            assert!(
+                autumn_harvest::audit::CLASSIFIED_ROUTES
+                    .iter()
+                    .any(|(r, _)| r == template),
+                "{template} must be a classified route"
+            );
+            assert!(
+                RETRY_CHAIN_ROUTES.contains(template),
+                "{template} must follow the retry chain first"
+            );
+        }
+        assert!(follows_continued_as_new(
+            &Method::GET,
+            "/workflows/x/result"
+        ));
+        assert!(follows_continued_as_new(
+            &Method::HEAD,
+            "/workflows/x/result"
+        ));
+        assert!(!follows_continued_as_new(
+            &Method::POST,
+            "/workflows/x/cancel"
+        ));
+        assert!(!follows_continued_as_new(
+            &Method::GET,
+            "/workflows/x/history"
+        ));
+    }
+
+    #[test]
     fn shard_source_matches_only_listed_routes() {
         assert!(matches!(
             shard_source(&Method::POST, "/workflows/wf/start"),
@@ -769,6 +907,16 @@ mod tests {
         ));
         assert!(shard_source(&Method::GET, "/workflows").is_none());
         assert!(shard_source(&Method::POST, "/workflows/wf/signal-with-start").is_none());
+        for (method, path) in [
+            (Method::GET, "/workflows/x/children"),
+            (Method::GET, "/workflows/x/tree"),
+            (Method::POST, "/workflows/x/erase-payloads"),
+        ] {
+            assert!(
+                matches!(shard_source(&method, path), Some(ShardSource::FanOut)),
+                "{method} {path} fans out"
+            );
+        }
     }
 
     #[test]

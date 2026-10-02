@@ -21,9 +21,11 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use autumn_harvest::WorkflowEvent;
 use autumn_harvest::audit::RouteClass;
 use autumn_harvest::scheduler::{DagCatalog, SchedulerMonitor};
 use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
+use autumn_harvest::store;
 use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry};
 use autumn_harvest_plugin::HarvestDbPool;
@@ -746,6 +748,93 @@ async fn retry_chain_attempts_are_checked_on_their_shards() {
     assert_eq!(deny_rows(&mut conn).await.len(), 1);
 }
 
+/// Record that `exec` continued as new into `successor`. The row of `exec`
+/// must already be `CONTINUED_AS_NEW`.
+async fn continue_as_new(conn: &mut AsyncPgConnection, exec: ExecutionId, successor: ExecutionId) {
+    let events = [WorkflowEvent::WorkflowContinuedAsNew {
+        new_exec_id: successor,
+        input: json!({}),
+        new_workflow_type: None,
+    }];
+    store::append_events(conn, exec, &events, 0)
+        .await
+        .expect("append the continued-as-new event");
+}
+
+/// A predecessor `first` on shard 0 that continued as new into `second`.
+/// `second` was then moved to shard 7, where it completed.
+async fn continued_as_new_onto_shard_7(
+    conn: &mut AsyncPgConnection,
+    live_conn: &mut AsyncPgConnection,
+) -> (ExecutionId, ExecutionId) {
+    let first = ExecutionId::new_for_shard(ShardId::new(0));
+    let second = ExecutionId::new_for_shard(ShardId::new(0));
+    insert_execution(conn, first, "CONTINUED_AS_NEW", None, None).await;
+    continue_as_new(conn, first, second).await;
+    insert_execution(conn, second, "MIGRATED", None, Some(7)).await;
+    insert_execution(live_conn, second, "COMPLETED", None, None).await;
+    (first, second)
+}
+
+/// `/result` follows a continued-as-new chain to its end. A successor on
+/// another shard is checked on that shard.
+#[tokio::test]
+async fn continued_as_new_successor_is_checked_on_its_shard() {
+    let (url, _c) = setup_database().await;
+    let entry_pool = build_pool(&url);
+    let live_pool = build_pool(&second_database(&url).await);
+    let mut conn = entry_pool.get().await.unwrap();
+    let mut live_conn = live_pool.get().await.unwrap();
+    scrub(&mut conn).await;
+    let (first, _second) = continued_as_new_onto_shard_7(&mut conn, &mut live_conn).await;
+    drop(live_conn);
+
+    let app = two_shard_app(&entry_pool, live_pool);
+    let (status, body) = send(
+        &app,
+        Call::new("GET", &format!("/workflows/{first}/result")),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the successor lives on shard 7: {body:?}"
+    );
+    let rows = deny_rows(&mut conn).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].shard_id, Some(7));
+}
+
+/// The shards of a continued-as-new successor are inside the fence. An
+/// allowed `/result` reaches the successor and does not trip its own fence.
+#[tokio::test]
+async fn continued_as_new_successor_is_inside_the_fence() {
+    let (url, _c) = setup_database().await;
+    let entry_pool = build_pool(&url);
+    let live_pool = build_pool(&second_database(&url).await);
+    let mut conn = entry_pool.get().await.unwrap();
+    let mut live_conn = live_pool.get().await.unwrap();
+    scrub(&mut conn).await;
+    let (first, _second) = continued_as_new_onto_shard_7(&mut conn, &mut live_conn).await;
+    drop(live_conn);
+
+    let state = two_shard_state(&entry_pool, live_pool);
+    let app = authorized_app_with_state(&state, |_| AuthzDecision::Allow);
+    let (status, body) = send(
+        &app,
+        Call::new("GET", &format!("/workflows/{first}/result")),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the successor's shard is inside the fence: {body:?}"
+    );
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["state"], json!("completed"), "{body:?}");
+    assert!(deny_rows(&mut conn).await.is_empty());
+}
+
 /// Move `exec` from shard 0 to shard 7 the way a rebalance cutover leaves it.
 /// The entry database keeps a sealed `MIGRATED` row that forwards to shard 7.
 /// The shard 7 database holds the live row.
@@ -945,21 +1034,26 @@ async fn cutover_without_an_authorizer_is_followed() {
     );
 }
 
-/// A lineage route reads every shard for descendants, so the hook also sees
-/// `None`. A shard-confining policy then fails closed.
+/// A lineage route reads, or erases, every shard for descendants, so the
+/// hook also sees `None`. A shard-confining policy then fails closed.
 #[tokio::test]
 async fn lineage_fan_out_routes_also_check_none() {
     let (url, _c) = setup_database().await;
     let pool = build_pool(&url);
     let (app, seen) = recording_app(&pool);
     let on_3 = ExecutionId::new_for_shard(ShardId::new(3));
-    for route in ["children", "tree"] {
+    for (method, route, body) in [
+        ("GET", "children", None),
+        ("GET", "tree", None),
+        ("POST", "erase-payloads", Some(json!({"reason": "drill"}))),
+    ] {
         seen.lock().unwrap().clear();
-        let _ = send(
-            &app,
-            Call::new("GET", &format!("/workflows/{on_3}/{route}")),
-        )
-        .await;
+        let uri = format!("/workflows/{on_3}/{route}");
+        let mut call = Call::new(method, &uri);
+        if let Some(body) = body {
+            call = call.body(body);
+        }
+        let _ = send(&app, call).await;
         let calls = seen.lock().unwrap().clone();
         assert!(calls.contains(&None), "{route}: {calls:?}");
         assert!(calls.contains(&Some(ShardId::new(3))), "{route}: {calls:?}");

@@ -20,11 +20,13 @@ capability.
 - **Shard sources.** The hook reads a shard only where the handler reads it.
   For an execution id in the path (decoded, also under `/ui`), it checks the
   entry shard and the live shard. On a route that acts on the live attempt,
-  it also checks the shard of every retry attempt. On the
+  it also checks the shard of every retry attempt. On `/result`, it also
+  checks every shard of each continued-as-new successor. On the
   routes in `authz::SHARD_SOURCES`, it reads a shard query parameter or body
   field. A shard named anywhere else is ignored, so a caller cannot show the
   hook one shard while the handler reads all of them. The lineage routes
-  (`/children`, `/tree`) read every shard, so the hook also sees `None`.
+  (`/children`, `/tree`, `erase-payloads`) read or erase descendants on every
+  shard, so the hook also sees `None`.
 - **Shard fence.** An allow fences the handler to the shards the policy saw
   (`autumn_harvest::shard_fence`, a task-local set). A rebalance cutover
   between the check and the handler moves a run to a new shard. Every

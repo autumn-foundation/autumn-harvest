@@ -413,8 +413,8 @@ needs I/O implements `HarvestAuthorizer` directly and returns a boxed future.
 
 | Route | Shard source |
 |---|---|
-| A path with an execution id, e.g. `GET /workflows/{id}`, also under `/ui` | The entry shard of the id and the shard the run lives on now. On a route that acts on the live attempt, also the shard of each later attempt in the retry chain. A percent-encoded id is decoded first. |
-| `GET /workflows/{id}/children`, `GET /workflows/{id}/tree` | The execution's shards, and also `None`, because the handler reads every shard for descendants. |
+| A path with an execution id, e.g. `GET /workflows/{id}`, also under `/ui` | The entry shard of the id and the shard the run lives on now. On a route that acts on the live attempt, also the shard of each later attempt in the retry chain. On `/result`, also every shard of each continued-as-new successor. A percent-encoded id is decoded first. |
+| `GET /workflows/{id}/children`, `GET /workflows/{id}/tree`, `POST /workflows/{id}/erase-payloads` | The execution's shards, and also `None`, because the handler reads, or erases, every shard for descendants. |
 | `GET /admin/history/exports`, `GET /admin/history/export-sample` | `shard_id`, `shard-id` or `shard` query parameter. |
 | `GET /admin/external-handoffs` | `shard_id` or `shard` query parameter. |
 | `POST /workflows/{name}/start` | Body `shard_id`, or the shard a body `residency_key` resolves to. |
@@ -447,8 +447,10 @@ shard by hash. To confine a caller to some shards, deny `None` too.
   entry shard and the live shard after a rebalance. Some routes act on the
   live attempt: `/result`, `cancel`, `terminate`, `pause`, `resume`, `signal`,
   `query`, `queries` and `update`. On those, the hook also checks the shard of
-  each later attempt in the retry chain (`authz::RETRY_CHAIN_ROUTES`). The
-  hook uses the same walks as the handlers. This costs a few indexed lookups per request. If a walk fails, the
+  each later attempt in the retry chain (`authz::RETRY_CHAIN_ROUTES`).
+  `/result` also follows continued-as-new successors
+  (`authz::CONTINUED_AS_NEW_ROUTES`), so the hook also checks every shard of
+  each successor. The hook uses the same walks as the handlers. This costs a few indexed lookups per request. If a walk fails, the
   request gets `503`, because the handler would fail the same walk.
 - **A cutover after the check is fenced.** The hook fences the handler to the
   shards the policy allowed (`autumn_harvest::shard_fence`). A rebalance
