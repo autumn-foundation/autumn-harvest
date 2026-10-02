@@ -1,8 +1,4 @@
 #![allow(dead_code)]
-// Clippy 1.99 reports diesel derive output on the user's field definitions.
-// See the same allows in `src/lib.rs`.
-#![allow(clippy::redundant_field_names)]
-#![allow(clippy::assert_is_empty)]
 
 #[cfg(feature = "db")]
 mod active_workflow_gauge_tests;
