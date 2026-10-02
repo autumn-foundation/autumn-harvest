@@ -79,6 +79,16 @@ pub enum WorkflowOutcome {
         /// A list of commands representing the side effects (e.g. activities) requested.
         commands: Vec<WorkflowCommand>,
     },
+    /// The cycle made no decision, so the workflow **task** failed (issue #1797).
+    ///
+    /// The handler waited on a foreign future for
+    /// [`DEADLOCK_TIMEOUT`](crate::executor::DEADLOCK_TIMEOUT). This is
+    /// retryable. The worker discards the cycle's commands, appends no event,
+    /// and requeues the task. The run stays `RUNNING`.
+    TaskFailed {
+        /// Why the task failed.
+        error: String,
+    },
     /// The workflow signalled `continue_as_new`. The current execution is
     /// terminal and the worker should atomically start a fresh execution
     /// with the same logical `WorkflowId` but a new `ExecutionId`, passing
@@ -92,45 +102,64 @@ pub enum WorkflowOutcome {
     },
 }
 
-/// Default timeout for detecting suspension -- if the workflow hasn't completed
-/// within this window, it's blocked on a oneshot channel (suspended).
-const SUSPENSION_TIMEOUT: Duration = Duration::from_millis(100);
+/// Longest time a cycle may wait on a foreign future (issue #1797).
+///
+/// A foreign future is any future that is not a Harvest future, such as a
+/// raw `tokio::time::sleep`. The limit applies only while no Harvest future
+/// is parked. A cycle that reaches it fails the workflow task, which the
+/// worker retries. The run itself does not fail.
+pub const DEADLOCK_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Outcome of running a workflow handler future for one executor cycle with
 /// panic containment (issue #782).
 ///
 /// Every executor entry point runs the handler through
-/// [`run_workflow_handler_cycle`], which wraps it in `catch_unwind` **inside**
-/// the [`SUSPENSION_TIMEOUT`] so a handler that unwinds (panics) is contained
-/// rather than crashing the spawned worker task and leaving its
-/// `harvest_task_queue` row stuck `RUNNING`.
+/// [`run_workflow_handler_cycle`], which wraps every poll in `catch_unwind`.
+/// A handler that unwinds (panics) is therefore contained. It does not crash
+/// the spawned worker task or leave its `harvest_task_queue` row `RUNNING`.
 enum HandlerCycleResult {
-    /// The handler returned within the suspension timeout (`Ok`/`Err`).
+    /// The handler returned (`Ok`/`Err`).
     Returned(Result<Value, String>),
-    /// The suspension timeout elapsed — the handler is parked on a oneshot
-    /// (this is the normal suspension signal, not an error).
+    /// The handler is parked on a Harvest future (issue #1797).
+    /// This is the normal suspension signal, not an error.
     Suspended,
     /// The handler panicked; the payload was caught and extracted to a message.
     Panicked(String),
+    /// The handler waited on a foreign future for [`DEADLOCK_TIMEOUT`]
+    /// (issue #1797). The workflow task fails and the worker retries it.
+    Deadlocked,
 }
 
 /// Run a workflow handler future for one executor cycle, containing any panic.
 ///
-/// Mirrors the pre-#782 `tokio::time::timeout(SUSPENSION_TIMEOUT, handler(...))`
-/// call exactly for the non-panic paths (`Returned`/`Suspended`), but a panic
-/// during any poll — including a poll during the post-await tail — is caught and
-/// returned as [`HandlerCycleResult::Panicked`] instead of unwinding the caller.
+/// # Readiness rule (issue #1797)
+///
+/// The cycle polls the handler until it returns or until it is blocked.
+/// After each `Poll::Pending`, the cycle asks the context whether a Harvest
+/// future is parked:
+///
+/// - Yes: the cycle is suspended at once. No clock is involved, so the
+///   result does not depend on how fast the host runs.
+/// - No: the handler waits on a foreign future. The cycle returns
+///   `Pending` to the runtime and polls again when that future wakes it.
+///
+/// A cycle that is still waiting on a foreign future [`DEADLOCK_TIMEOUT`]
+/// after it started is deadlocked. It fails the task, not the run.
+///
+/// The handler runs in [`tokio::task::unconstrained`]. Without it, an
+/// exhausted coop budget could make a ready oneshot return `Pending`, and
+/// the cycle could suspend before the handler saw a recorded result.
 ///
 /// `catch_unwind` requires `AssertUnwindSafe` because `&WorkflowContext` is not
-/// `UnwindSafe`; this is sound here because the context is discarded after the
-/// cycle (the same assertion the synchronous query/update dispatch sites already
-/// make).
+/// `UnwindSafe`. This is sound because the context is discarded after the
+/// cycle, as at the synchronous query and update dispatch sites.
 async fn run_workflow_handler_cycle(
     ctx: &WorkflowContext,
     handler: WorkflowHandlerFn,
     input: Value,
 ) -> HandlerCycleResult {
     use futures::FutureExt as _;
+    use std::task::Poll;
     // Issue #782 (PR #1012 review): contain a panic during future *construction*.
     // The `catch_unwind` below wraps only the future's poll; a hand-written
     // handler that does synchronous work before returning its boxed future would
@@ -139,31 +168,49 @@ async fn run_workflow_handler_cycle(
         Ok(fut) => fut,
         Err(message) => return HandlerCycleResult::Panicked(message),
     };
-    // Issue #691 (durable mutex) TIMEOUT-GUARD FIX — the borrow is load-bearing.
-    //
-    // `tokio::time::timeout(dur, fut)` OWNS `fut`; on timeout the `Timeout`
-    // future is consumed by the `.await` and drops `fut` (and any `MutexGuard`
-    // the workflow holds across the suspension) BEFORE the `Err(_elapsed)` arm
-    // runs — so setting `suspending` in that arm would run too late, the guard's
-    // `Drop` would see `suspending == false`, push a `ReleaseMutex`, and free the
-    // lock under the still-parked holder (a mutual-exclusion break after the very
-    // first suspension). Instead we pin the future and pass `&mut guarded` so the
-    // `Timeout` owns only the reference; on timeout the reference is dropped but
-    // `guarded` (owning the suspended future + guard) lives to this function's
-    // scope exit, dropping only AFTER `ctx.set_suspending(true)` has run. A guard
-    // dropped mid-poll or at genuine completion still sees `suspending == false`
-    // (never set on the `Ok(..)` arms) and releases normally.
+    // Issue #691 (durable mutex): the handler future must outlive the
+    // `set_suspending(true)` call below. A `MutexGuard` held across the park
+    // reads that flag in its `Drop`. If the future dropped first, the guard
+    // would push a `ReleaseMutex` and free the lock under a parked holder.
+    // The poll loop therefore borrows `guarded`, and `guarded` drops only at
+    // the end of this function.
     let mut guarded = std::pin::pin!(std::panic::AssertUnwindSafe(handler_fut).catch_unwind());
-    match tokio::time::timeout(SUSPENSION_TIMEOUT, &mut guarded).await {
-        Ok(Ok(result)) => HandlerCycleResult::Returned(result),
-        Ok(Err(panic_payload)) => {
-            HandlerCycleResult::Panicked(crate::error::panic_message(panic_payload))
+    let mut deadline = std::pin::pin!(tokio::time::sleep(DEADLOCK_TIMEOUT));
+    let result = tokio::task::unconstrained(std::future::poll_fn(|cx| {
+        match guarded.as_mut().poll(cx) {
+            Poll::Ready(Ok(result)) => return Poll::Ready(HandlerCycleResult::Returned(result)),
+            Poll::Ready(Err(panic_payload)) => {
+                return Poll::Ready(HandlerCycleResult::Panicked(crate::error::panic_message(
+                    panic_payload,
+                )));
+            }
+            Poll::Pending => {}
         }
-        Err(_elapsed) => {
-            ctx.set_suspending(true);
-            HandlerCycleResult::Suspended
+        if ctx.has_parked_harvest_future() {
+            return Poll::Ready(HandlerCycleResult::Suspended);
         }
+        // Only foreign futures are pending. Their wakes poll this cycle again.
+        deadline
+            .as_mut()
+            .poll(cx)
+            .map(|()| HandlerCycleResult::Deadlocked)
+    }))
+    .await;
+    if matches!(
+        result,
+        HandlerCycleResult::Suspended | HandlerCycleResult::Deadlocked
+    ) {
+        ctx.set_suspending(true);
     }
+    result
+}
+
+/// The `TaskFailed` error for a deadlocked cycle (issue #1797).
+fn deadlock_error() -> String {
+    format!(
+        "potential deadlock detected: the workflow handler waited {DEADLOCK_TIMEOUT:?} on a \
+         future that is not a Harvest future; the workflow task fails and is retried"
+    )
 }
 
 /// Encode a contained workflow-handler panic message as the typed
@@ -1166,6 +1213,11 @@ async fn run_strict_with_ctx(
         let timeout_result = match run_workflow_handler_cycle(&ctx, handler, input).await {
             HandlerCycleResult::Returned(result) => Ok(result),
             HandlerCycleResult::Suspended => Err(()),
+            HandlerCycleResult::Deadlocked => {
+                return WorkflowOutcome::TaskFailed {
+                    error: deadlock_error(),
+                };
+            }
             HandlerCycleResult::Panicked(message) => {
                 return WorkflowOutcome::Failed {
                     error: encode_workflow_panic(message),
@@ -1469,6 +1521,11 @@ pub(crate) async fn run_workflow_canary(
         let timeout_result = match run_workflow_handler_cycle(&ctx, handler, input).await {
             HandlerCycleResult::Returned(result) => Ok(result),
             HandlerCycleResult::Suspended => Err(()),
+            HandlerCycleResult::Deadlocked => {
+                return WorkflowOutcome::TaskFailed {
+                    error: deadlock_error(),
+                };
+            }
             HandlerCycleResult::Panicked(message) => {
                 return WorkflowOutcome::Failed {
                     error: encode_workflow_panic(message),
@@ -2013,6 +2070,15 @@ async fn drive_workflow(
         let timeout_result = match run_workflow_handler_cycle(&ctx, handler, input).await {
             HandlerCycleResult::Returned(result) => Ok(result),
             HandlerCycleResult::Suspended => Err(()),
+            // Issue #1797: the cycle's commands are discarded, as on a panic.
+            HandlerCycleResult::Deadlocked => {
+                return (
+                    WorkflowOutcome::TaskFailed {
+                        error: deadlock_error(),
+                    },
+                    Vec::new(),
+                );
+            }
             HandlerCycleResult::Panicked(message) => {
                 return (
                     WorkflowOutcome::Failed {
@@ -3278,16 +3344,13 @@ mod tests {
             serde_json::json!({ "delay_ms": 3_000 }),
         )
         .await;
-        assert!(
-            !matches!(
-                outcome,
-                WorkflowOutcome::Completed { .. }
-                    | WorkflowOutcome::Failed { .. }
-                    | WorkflowOutcome::Suspended { .. }
-                    | WorkflowOutcome::ContinuedAsNew { .. }
+        match outcome {
+            WorkflowOutcome::TaskFailed { error } => assert!(
+                error.contains("potential deadlock detected"),
+                "unexpected task failure: {error}"
             ),
-            "a deadlocked cycle must fail the task, got {outcome:?}"
-        );
+            other => panic!("a deadlocked cycle must fail the task, got {other:?}"),
+        }
     }
 
     /// Every Harvest park kind suspends at once. The paused clock must not
@@ -3304,7 +3367,8 @@ mod tests {
         ];
         for (name, handler) in cases {
             let started_at = tokio::time::Instant::now();
-            let outcome = run_workflow(ExecutionId::new(), vec![started()], handler, Value::Null).await;
+            let outcome =
+                run_workflow(ExecutionId::new(), vec![started()], handler, Value::Null).await;
             assert_eq!(
                 started_at.elapsed(),
                 Duration::ZERO,

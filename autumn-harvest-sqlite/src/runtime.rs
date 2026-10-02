@@ -1343,6 +1343,13 @@ impl SqliteRuntime {
             WorkflowOutcome::ContinuedAsNew { .. } => {
                 Err(SqliteError::Unsupported("ContinueAsNew".to_string()))
             }
+            // Issue #1797: a deadlocked cycle fails the task, not the run.
+            // Discard the cycle, as for non-determinism above, and surface the
+            // error so the decision loop stops instead of spinning on it.
+            WorkflowOutcome::TaskFailed { error } => Err(SqliteError::TaskFailed {
+                execution_id: exec,
+                details: error,
+            }),
             WorkflowOutcome::Suspended { commands } => {
                 self.drive_suspension(exec, &history, &commands, now, failure_now)
             }

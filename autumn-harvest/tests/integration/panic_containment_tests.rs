@@ -1297,3 +1297,100 @@ async fn child_workflow_panic_surfaces_to_parent_as_typed_handler_panic() {
         "no PoisonPill DLQ for a contained child panic"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #1797 — a deadlocked cycle fails the workflow task, not the run.
+// ---------------------------------------------------------------------------
+
+/// `true` until the first cycle of [`deadlock_once_workflow`] starts.
+static DEADLOCK_ONCE_ARMED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Deadlocks on its first cycle, then completes.
+///
+/// The first cycle awaits a foreign 60 s sleep, which is not a Harvest
+/// future. The executor fails that task after `DEADLOCK_TIMEOUT`. The retry
+/// skips the sleep and completes, which proves the run was not failed.
+fn deadlock_once_workflow(_ctx: &WorkflowContext, _input: serde_json::Value) -> BoxFut<'_> {
+    Box::pin(async move {
+        if DEADLOCK_ONCE_ARMED.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
+        Ok(serde_json::json!("done"))
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deadlocked_workflow_task_is_re_pended_and_the_retry_completes_the_run() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let exec_id = seed_workflow(&mut conn, "deadlock_once_wf", serde_json::json!({})).await;
+
+    let metrics = Arc::new(PanicMetrics::default());
+    let registry = build_registry(
+        vec![workflow_info("deadlock_once_wf", deadlock_once_workflow)],
+        vec![],
+        Arc::clone(&metrics),
+    );
+    let worker = build_worker("worker-workflow-deadlock", Arc::clone(&registry), 3);
+    let pool = build_pool(&url);
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+    let handle = tokio::spawn(async move { runner.run(&pool_for_run).await });
+
+    // Watch for the re-pend: the task is PENDING in the future and carries the
+    // deadlock error, while the execution stays RUNNING.
+    let observer_url = url.clone();
+    let observer = tokio::spawn(async move {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while tokio::time::Instant::now() < deadline {
+            let exec = load_execution(&observer_url, exec_id).await;
+            for t in load_tasks(&observer_url, exec_id).await {
+                if t.task_type == "workflow"
+                    && t.state == "PENDING"
+                    && t.scheduled_at > Utc::now()
+                    && t.error
+                        .as_deref()
+                        .is_some_and(|e| e.contains("potential deadlock detected"))
+                {
+                    return Some(exec.state);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        None
+    });
+
+    let execution = wait_for_state(&url, exec_id, "COMPLETED", Duration::from_secs(30)).await;
+    let state_during_backoff = observer.await.expect("observer joins");
+
+    worker.shutdown();
+    handle.await.expect("worker task joins cleanly");
+
+    assert_eq!(
+        state_during_backoff.as_deref(),
+        Some("RUNNING"),
+        "the deadlocked task must be re-pended with the deadlock error while the run stays RUNNING"
+    );
+    assert_eq!(execution.state, "COMPLETED");
+    assert_eq!(
+        metrics.workflow_panic_count(),
+        0,
+        "a deadlock is not a panic and must not use the panic budget"
+    );
+
+    // The deadlocked cycle appended nothing: history is Started → Completed.
+    let history = load_history(&url, exec_id).await;
+    assert!(
+        history.iter().all(|e| matches!(
+            e,
+            WorkflowEvent::WorkflowStarted { .. } | WorkflowEvent::WorkflowCompleted { .. }
+        )),
+        "a failed workflow task must append no event; history={history:?}"
+    );
+    let tasks = load_tasks(&url, exec_id).await;
+    assert!(
+        tasks.iter().all(|t| t.crash_strikes == 0),
+        "a deadlock must not count as a crash strike"
+    );
+}

@@ -823,6 +823,45 @@ pub enum WorkflowCommand {
 }
 
 // Manual Debug because oneshot::Sender is not Debug.
+impl WorkflowCommand {
+    /// Returns `true` when a parked Harvest future still waits on this
+    /// command's result channel (issue #1797).
+    ///
+    /// The worker sends results only after the cycle drains, so an open
+    /// channel means the handler is parked here. The match is exhaustive on
+    /// purpose: a new variant must decide whether it parks.
+    pub(crate) fn awaits_result(&self) -> bool {
+        match self {
+            Self::ScheduleActivity { result_tx, .. }
+            | Self::WaitForActivity { result_tx, .. }
+            | Self::StartChildWorkflow { result_tx, .. }
+            | Self::ScheduleExternalActivity { result_tx, .. }
+            | Self::RunLocalActivity { result_tx, .. } => !result_tx.is_closed(),
+            Self::StartTimer { result_tx, .. } => !result_tx.is_closed(),
+            Self::WaitForSignal { result_tx, .. } => !result_tx.is_closed(),
+            Self::SignalExternalWorkflow { result_tx, .. }
+            | Self::RequestCancelExternalWorkflow { result_tx, .. }
+            | Self::AwaitExternalWorkflow { result_tx, .. } => !result_tx.is_closed(),
+            Self::AcquireMutex { result_tx, .. } => !result_tx.is_closed(),
+            Self::RecordMarker { .. }
+            | Self::RecordSideEffect { .. }
+            | Self::Complete { .. }
+            | Self::Fail { .. }
+            | Self::ContinueAsNew { .. }
+            | Self::RecordUpdateResult { .. }
+            | Self::UpsertSearchAttributes { .. }
+            | Self::SetCurrentDetails { .. }
+            | Self::PublishProgress { .. }
+            | Self::RecordLog { .. }
+            | Self::SpawnDetachedChildWorkflow { .. }
+            | Self::CancelRaceLosers { .. }
+            | Self::ArmTimer { .. }
+            | Self::CancelTimer { .. }
+            | Self::ReleaseMutex { .. } => false,
+        }
+    }
+}
+
 impl std::fmt::Debug for WorkflowCommand {
     #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1031,13 +1070,62 @@ impl std::fmt::Debug for WorkflowCommand {
     }
 }
 
-/// Suspend forever — used by terminal commands like `continue_as_new` whose
-/// resolution is performed by the worker after draining the command rather
-/// than by completing a oneshot. The executor's suspension timeout will fire
-/// long before this future could resolve naturally.
-async fn park_until_dropped() -> HarvestResult<()> {
-    std::future::pending::<()>().await;
-    Ok(())
+/// Counts the Harvest futures that wait with no result channel (issue #1797).
+///
+/// Most Harvest futures wait on a oneshot whose sender is in the command
+/// buffer, and the executor sees those there. A forever park or a false
+/// `await_condition` has no channel, so it holds a [`ParkToken`] instead.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ParkCounter(Arc<std::sync::atomic::AtomicUsize>);
+
+impl ParkCounter {
+    /// Returns `true` when at least one token holds a park.
+    fn is_held(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire) > 0
+    }
+}
+
+/// Marks one Harvest future as parked while it waits (issue #1797).
+///
+/// The mark is released when the future resolves or is dropped. A dropped
+/// future therefore never keeps a cycle suspended.
+#[derive(Debug)]
+pub(crate) struct ParkToken {
+    counter: ParkCounter,
+    held: bool,
+}
+
+impl ParkToken {
+    fn new(counter: &ParkCounter) -> Self {
+        Self {
+            counter: counter.clone(),
+            held: false,
+        }
+    }
+
+    fn hold(&mut self) {
+        if !self.held {
+            self.held = true;
+            self.counter
+                .0
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+
+    fn release(&mut self) {
+        if self.held {
+            self.held = false;
+            self.counter
+                .0
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+}
+
+impl Drop for ParkToken {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1235,7 +1323,9 @@ impl<'a> MutexHandle<'a> {
                     result_tx: tx,
                 });
                 let _ = rx.await;
-                std::future::pending::<HarvestResult<MutexGuard<'a>>>().await
+                self.context
+                    .park_forever::<HarvestResult<MutexGuard<'a>>>()
+                    .await
             }
             MutexGrantMatch::Diverged {
                 expected,
@@ -2577,6 +2667,8 @@ pub struct WorkflowContext {
     matcher: Mutex<HistoryMatcher>,
     /// Commands accumulated during live execution, drained by the worker.
     commands: Mutex<Vec<WorkflowCommand>>,
+    /// Harvest futures parked with no result channel (issue #1797).
+    parks: ParkCounter,
     /// Deterministic "now" -- the timestamp from the `WorkflowStarted` event.
     start_time: DateTime<Utc>,
     /// History-size thresholds visible to author code.
@@ -3350,6 +3442,7 @@ impl WorkflowContext {
             exec_id,
             matcher: Mutex::new(matcher),
             commands: Mutex::new(Vec::new()),
+            parks: ParkCounter::default(),
             start_time,
             history_policy,
             execution_timeout: None,
@@ -3522,6 +3615,7 @@ impl WorkflowContext {
             exec_id,
             matcher: Mutex::new(crate::replay::HistoryMatcher::new(vec![])),
             commands: Mutex::new(Vec::new()),
+            parks: ParkCounter::default(),
             start_time,
             history_policy: WorkflowHistoryPolicy::default(),
             execution_timeout: None,
@@ -3592,6 +3686,7 @@ impl WorkflowContext {
             exec_id,
             matcher: Mutex::new(HistoryMatcher::new(vec![])),
             commands: Mutex::new(Vec::new()),
+            parks: ParkCounter::default(),
             start_time,
             history_policy: WorkflowHistoryPolicy::default(),
             execution_timeout: None,
@@ -7289,7 +7384,7 @@ impl WorkflowContext {
                     });
                     // Park: the armed timer wakes the task on fire (or a cancel
                     // recorded earlier is observed on the next cycle).
-                    park_until_dropped().await?;
+                    self.park_until_dropped().await?;
                 }
             }
         }
@@ -8718,11 +8813,14 @@ impl WorkflowContext {
     }
 
     /// Block until a predicate over workflow local state evaluates to true.
-    pub const fn await_condition<F>(&self, predicate: F) -> AwaitConditionFut<F>
+    pub fn await_condition<F>(&self, predicate: F) -> AwaitConditionFut<F>
     where
         F: FnMut() -> bool + Unpin,
     {
-        AwaitConditionFut { predicate }
+        AwaitConditionFut {
+            predicate,
+            park: ParkToken::new(&self.parks),
+        }
     }
 
     /// Block until a predicate over workflow local state evaluates to true, or the timeout expires.
@@ -9855,7 +9953,7 @@ impl WorkflowContext {
         // forever as a belt-and-braces guard so a spuriously-dropped sender
         // re-parks rather than resolving with a bogus value.
         let _ = rx.await;
-        std::future::pending::<HarvestResult<Value>>().await
+        self.park_forever::<HarvestResult<Value>>().await
     }
 
     // ── Fan-out / parallel activities (issue #359) ───────────────────────────
@@ -12477,7 +12575,7 @@ impl WorkflowContext {
                     input: output,
                     new_workflow_type,
                 });
-                park_until_dropped().await
+                self.park_until_dropped().await
             }
             HistoryMatch::Diverged {
                 expected,
@@ -12541,7 +12639,7 @@ impl WorkflowContext {
                     input,
                     new_workflow_type,
                 });
-                park_until_dropped().await
+                self.park_until_dropped().await
             }
         }
     }
@@ -13486,6 +13584,40 @@ impl WorkflowContext {
         ActivityExecId::new()
     }
 
+    /// Park forever and hold a park mark (issue #1797).
+    ///
+    /// Terminal commands such as `continue_as_new` use this. The worker
+    /// acts on the drained command, so this future never resolves.
+    async fn park_forever<T>(&self) -> T {
+        let mut park = ParkToken::new(&self.parks);
+        park.hold();
+        std::future::pending::<T>().await
+    }
+
+    /// Park forever, typed for the `HarvestResult<()>` call sites.
+    async fn park_until_dropped(&self) -> HarvestResult<()> {
+        self.park_forever().await
+    }
+
+    /// Returns `true` when a Harvest future is parked (issue #1797).
+    ///
+    /// A future is parked when a buffered command still holds an open result
+    /// channel, or when a [`ParkToken`] is held. The executor treats a pending
+    /// handler with a parked future as suspended.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the commands mutex is poisoned.
+    pub(crate) fn has_parked_harvest_future(&self) -> bool {
+        self.parks.is_held()
+            || self
+                .commands
+                .lock()
+                .expect("commands lock poisoned")
+                .iter()
+                .any(WorkflowCommand::awaits_result)
+    }
+
     /// Push a command onto the pending commands queue.
     fn push_command(&self, cmd: WorkflowCommand) {
         self.commands
@@ -13499,6 +13631,8 @@ impl WorkflowContext {
 #[must_use = "futures do nothing unless you .await or poll them"]
 pub struct AwaitConditionFut<F> {
     predicate: F,
+    /// Holds the park mark while the predicate is false (issue #1797).
+    park: ParkToken,
 }
 
 impl<F> std::future::Future for AwaitConditionFut<F>
@@ -13513,8 +13647,10 @@ where
     ) -> std::task::Poll<Self::Output> {
         let this = self.get_mut();
         if (this.predicate)() {
+            this.park.release();
             std::task::Poll::Ready(Ok(()))
         } else {
+            this.park.hold();
             std::task::Poll::Pending
         }
     }

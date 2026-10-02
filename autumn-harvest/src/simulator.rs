@@ -290,6 +290,15 @@ impl WorkflowSimulator {
                         history,
                     };
                 }
+                // Issue #1797: a deadlocked cycle fails the task, not the run.
+                // A retry would deadlock again, so the simulation stops here.
+                // No terminal event is recorded, as on the worker.
+                WorkflowOutcome::TaskFailed { error } => {
+                    return SimulatorResult {
+                        final_output: Err(error),
+                        history,
+                    };
+                }
                 WorkflowOutcome::ContinuedAsNew {
                     input: cont_input,
                     new_workflow_type,

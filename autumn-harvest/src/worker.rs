@@ -7523,6 +7523,13 @@ pub fn resolve_capability_miss_with_confidence(
 // Contained workflow handler-panic retry (issue #782)
 // ---------------------------------------------------------------------------
 
+/// Delay before a deadlocked workflow task runs again (issue #1797).
+///
+/// The delay is fixed. A deadlocked cycle already holds a slot for
+/// [`crate::executor::DEADLOCK_TIMEOUT`], so this delay bounds the cost of a
+/// workflow that deadlocks on every attempt.
+const DEADLOCK_RETRY_BACKOFF: chrono::Duration = chrono::Duration::seconds(5);
+
 /// Base delay before the first panic re-dispatch (issue #782). A short floor
 /// (>0) prevents a fast, deterministic panic from hot-looping worker slots
 /// while the operator hotfixes-and-redeploys.
@@ -19013,6 +19020,11 @@ async fn persist_workflow_outcome(
     let is_detached_child = execution.parent_close_policy.is_some();
 
     match (outcome, parent_exec_id) {
+        // Issue #1797: a failed workflow task persists nothing. The dispatch
+        // path returns before this call, so this arm only guards misuse.
+        (WorkflowOutcome::TaskFailed { error }, _) => Err(HarvestError::Dispatch(format!(
+            "a TaskFailed outcome has no persistence path: {error}"
+        ))),
         (WorkflowOutcome::Completed { output, .. }, Some(parent_id)) if !is_detached_child => {
             let res = persist_child_workflow_completion(
                 conn,
@@ -21813,6 +21825,31 @@ async fn process_workflow_task(
         .await;
     }
 
+    // Issue #1797: a deadlocked cycle fails the workflow task, never the run.
+    // Its commands are not trusted, so none persist and no event is appended.
+    // The task is re-pended with a fixed backoff, as a contained panic is.
+    // A deadlock is not a panic, so it clears the panic strike first.
+    if let WorkflowOutcome::TaskFailed { error } = &outcome {
+        clear_panic_strike(workflow_panic_strikes, prepared.exec_id.as_uuid());
+        tracing::warn!(
+            execution_id = %prepared.exec_id,
+            workflow = %prepared.execution.workflow_name,
+            queue = %task.queue_name,
+            backoff_secs = DEADLOCK_RETRY_BACKOFF.num_seconds(),
+            error = %error,
+            "harvest: workflow task failed (issue #1797); the task is retried and the \
+             run stays RUNNING"
+        );
+        drop(execute_span);
+        return queue::requeue_workflow_task_after_panic(
+            conn,
+            task.id,
+            DEADLOCK_RETRY_BACKOFF,
+            error,
+        )
+        .await;
+    }
+
     // Issue #782: a **contained handler panic** must NOT fail the workflow on
     // the first strike — buy time for a hotfix/redeploy by re-dispatching with
     // capped backoff up to `workflow_panic_max_attempts`, then fail terminally
@@ -22059,6 +22096,8 @@ async fn process_workflow_task(
                 .saturating_add(terminal_parent_close_cascade_events)
                 .saturating_add(abandoned)
         }
+        // Issue #1797: returned at the gate above; it appends no event.
+        WorkflowOutcome::TaskFailed { .. } => 0,
     };
     let current_history_event_count = u64::try_from(history_events.len())
         .unwrap_or(u64::MAX)
@@ -22107,6 +22146,9 @@ async fn process_workflow_task(
         WorkflowOutcome::Failed { .. } => WorkflowStatus::Failed,
         WorkflowOutcome::Suspended { .. } => WorkflowStatus::Suspended,
         WorkflowOutcome::ContinuedAsNew { .. } => WorkflowStatus::ContinuedAsNew,
+        WorkflowOutcome::TaskFailed { .. } => {
+            unreachable!("a TaskFailed outcome returns at the issue #1797 gate")
+        }
     };
     // Issue #1184 (Codex review round 2, P2): these used to be EMITTED right
     // here, before the persist transaction below. A claim-ambiguity rollback
@@ -22144,6 +22186,9 @@ async fn process_workflow_task(
         },
         WorkflowOutcome::ContinuedAsNew { .. } => TerminalMetricsKind::ContinuedAsNew,
         WorkflowOutcome::Suspended { .. } => TerminalMetricsKind::Suspended,
+        WorkflowOutcome::TaskFailed { .. } => {
+            unreachable!("a TaskFailed outcome returns at the issue #1797 gate")
+        }
     };
     // Issue #1184 (Codex review round 4, P2): stop these clocks HERE, at the
     // moment the decision cycle itself finished -- not at emission time in

@@ -2347,6 +2347,19 @@ fn outcome_to_report(
             }
         }
 
+        // Issue #1797: a deadlocked replay made no decision. It is not drift,
+        // but a gate must not pass it, so it reports as a failed replay.
+        WorkflowOutcome::TaskFailed { error } => ReplayReport {
+            execution_id: exec_id,
+            events_replayed: total_events,
+            status: ReplayStatus::WorkflowFailed {
+                error,
+                event_index: total_events,
+            },
+            mismatched_command_summary: None,
+            reproduced_failure: None,
+        },
+
         WorkflowOutcome::Failed {
             error,
             non_deterministic_details,
@@ -6110,6 +6123,10 @@ impl WorkflowTestEnv {
                 });
                 Ok(input)
             }
+            // Issue #1797: a deadlocked cycle fails the task, not the run. A
+            // retry would deadlock again, so the harness stops with the error
+            // and records no terminal event, as the worker does.
+            WorkflowOutcome::TaskFailed { error } => Err(error),
             WorkflowOutcome::Suspended { .. } => {
                 unreachable!("suspended outcomes are handled in run")
             }
