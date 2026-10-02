@@ -15794,7 +15794,8 @@ async fn handle_session_release(
 ///   exceed `max_concurrent_sessions`. A background task reads again until
 ///   the database answers, then settles the slot. The reconciler only
 ///   handles rows that exist, so it cannot release a slot with no row.
-///   `shutdown` stops that task, so it does not outlive the worker.
+///   `shutdown` stops the reads, the first round included, so they do not
+///   outlive the worker.
 #[doc(hidden)]
 pub async fn settle_session_slot_after_transient_error(
     pool: &DbPool,
@@ -15819,7 +15820,15 @@ async fn settle_session_slot_with_mark(
     recheck: RecheckedSessionSlot,
     shutdown: &CancellationToken,
 ) {
-    if settle_session_slot_once(pool, registry, session_id, worker_id).await {
+    // One round can take ten pool bounds. Shutdown stops it too, so the
+    // dispatch cannot outlive the worker's drain deadline. The mark drops
+    // with this call.
+    let settled = tokio::select! {
+        biased;
+        () = shutdown.cancelled() => return,
+        settled = settle_session_slot_once(pool, registry, session_id, worker_id) => settled,
+    };
+    if settled {
         return;
     }
     tracing::warn!(

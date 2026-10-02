@@ -2221,6 +2221,53 @@ async fn a_session_acquire_defers_while_its_slot_is_rechecked() {
     drop(held);
 }
 
+/// Worker shutdown also stops the first, awaited round of a slot re-check.
+/// That round can take ten pool bounds, so a worker that waits for it would
+/// outlive its drain deadline.
+#[tokio::test]
+async fn shutdown_stops_the_first_slot_recheck_round() {
+    use autumn_harvest::sessions::{new_session_slot_registry, try_acquire_session_slot};
+    use autumn_harvest::types::SessionId;
+
+    let (url, _container) = setup_db().await;
+    let starved = engine_pool(
+        url,
+        1,
+        DbRole::Hot,
+        &timeouts(1_000, SessionTimeouts::for_role(DbRole::Hot)),
+    )
+    .expect("starved pool");
+    let held = hold_every_connection(&starved).await;
+    let registry = new_session_slot_registry();
+    let session_id = SessionId::new();
+    assert!(try_acquire_session_slot(&registry, 4, session_id));
+
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let canceller = {
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            shutdown.cancel();
+        })
+    };
+    let clock = Instant::now();
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        autumn_harvest::worker::settle_session_slot_after_transient_error(
+            &starved, &registry, session_id, "w-1", &shutdown,
+        ),
+    )
+    .await
+    .expect("the re-check ends");
+    assert!(
+        clock.elapsed() < Duration::from_secs(3),
+        "shutdown must stop the first round, not wait out ten bounds: {:?}",
+        clock.elapsed()
+    );
+    canceller.await.expect("canceller joins");
+    drop(held);
+}
+
 /// Worker shutdown stops a slot re-check that gets no answer. The re-check
 /// then releases its mark, so an acquire of the session no longer defers.
 #[tokio::test]
