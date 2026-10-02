@@ -107,8 +107,8 @@ pub enum WorkflowOutcome {
 /// Longest time a cycle may wait on foreign futures (issue #1797).
 ///
 /// A foreign future is any future that is not a Harvest future, such as a
-/// raw `tokio::time::sleep`. The clock starts when the handler first waits
-/// with no Harvest future parked. CPU time before that wait does not count.
+/// raw `tokio::time::sleep`. The clock starts at the first poll that does not
+/// suspend. CPU time before that poll does not count.
 /// A cycle that reaches the limit fails the workflow task, which the worker
 /// retries. The run itself does not fail.
 pub const DEADLOCK_TIMEOUT: Duration = Duration::from_secs(2);
@@ -133,11 +133,6 @@ enum HandlerCycleResult {
     /// The workflow task fails and the worker retries it.
     Deadlocked,
 }
-
-/// Woken re-polls without a new command before a parked cycle suspends
-/// (issue #1797). The count, not a clock, decides, so the result is
-/// deterministic.
-const MAX_IDLE_REPOLLS: u32 = 64;
 
 /// The waker a decision cycle gives the handler (issue #1797).
 ///
@@ -221,18 +216,18 @@ impl futures::task::ArcWake for CycleWaker {
 /// After each `Poll::Pending`, the cycle checks two things in order:
 ///
 /// 1. A wake fired synchronously during the poll: a future is ready. The
-///    cycle yields to the runtime and polls again. With a parked Harvest
-///    future, it stops after [`MAX_IDLE_REPOLLS`] polls that add no command.
-///    A wake that tokio defers to the end of the task poll, such as
+///    cycle yields to the runtime and polls again, however many times that
+///    takes. A wake that tokio defers to the end of the task poll, such as
 ///    `tokio::task::yield_now`, is not seen here.
 /// 2. Otherwise, a Harvest future is parked: the cycle suspends at once. It
 ///    does not check a clock.
 /// 3. Otherwise, the handler waits on a foreign future. The cycle returns
 ///    `Pending` to the runtime and polls again when that future wakes it.
 ///
-/// The first foreign wait starts the [`DEADLOCK_TIMEOUT`] clock. A cycle that
-/// is still pending without a parked Harvest future when the clock expires
-/// is deadlocked. It fails the task, not the run.
+/// The first poll that does not suspend starts the [`DEADLOCK_TIMEOUT`]
+/// clock. A cycle that has still not suspended when the clock expires is
+/// deadlocked, for example a future that wakes itself forever. It fails the
+/// task, not the run, and never suspends with a partial batch.
 ///
 /// The handler runs in [`tokio::task::unconstrained`]. The coop budget left
 /// by earlier work in the worker task would otherwise decide when a ready
@@ -270,8 +265,6 @@ async fn run_workflow_handler_cycle(
     let mut deadline = std::pin::pin!(tokio::time::sleep(DEADLOCK_TIMEOUT));
     let mut deadline_armed = false;
     let mut cycle_waker: Option<(std::sync::Arc<CycleWaker>, std::task::Waker)> = None;
-    let mut last_commands = 0_usize;
-    let mut idle_repolls = 0_u32;
     let result = tokio::task::unconstrained(std::future::poll_fn(|cx| {
         let (flag, waker) = cycle_waker.get_or_insert_with(|| {
             let flag = std::sync::Arc::new(CycleWaker::new(cx.waker()));
@@ -294,25 +287,11 @@ async fn run_workflow_handler_cycle(
         }
         // The wake also reached the runtime task, so returning `Pending`
         // below polls the handler again.
-        if ctx.has_parked_harvest_future() {
-            if !woken {
-                return Poll::Ready(HandlerCycleResult::Suspended);
-            }
-            // Poll again while each poll adds commands. A future that only
-            // wakes itself adds none, so it cannot hold a parked cycle open.
-            let commands = ctx.count_commands(is_replay_significant_command);
-            if commands == last_commands {
-                idle_repolls += 1;
-            } else {
-                last_commands = commands;
-                idle_repolls = 0;
-            }
-            if idle_repolls >= MAX_IDLE_REPOLLS {
-                return Poll::Ready(HandlerCycleResult::Suspended);
-            }
-            return Poll::Pending;
+        if !woken && ctx.has_parked_harvest_future() {
+            return Poll::Ready(HandlerCycleResult::Suspended);
         }
-        // Only foreign futures are pending. Their wakes poll this cycle again.
+        // A future is ready, or only foreign futures are pending. Either way
+        // a wake polls this cycle again, bounded by the deadlock timeout.
         if !deadline_armed {
             deadline_armed = true;
             deadline
@@ -3546,12 +3525,66 @@ mod tests {
         })
     }
 
-    /// A self-waking future beside a parked Harvest future must not hold
-    /// the cycle until the deadlock timeout. The cycle suspends after a
-    /// bounded number of polls that add no command.
+    /// Parks one activity, then runs 300 self-woken children, then
+    /// schedules a second activity, all in one `FuturesUnordered`.
+    fn long_early_yield_fan_out_workflow<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            use futures::StreamExt as _;
+            type Branch<'b> =
+                Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'b>>;
+            let activity = |name: &'static str| -> Branch<'a> {
+                Box::pin(async move {
+                    ctx.execute_activity_raw(name, Value::Null, "default")
+                        .await
+                        .map_err(|e| e.to_string())
+                })
+            };
+            let mut branches = futures::stream::FuturesUnordered::<Branch<'a>>::new();
+            branches.push(activity("first"));
+            for _ in 0..300 {
+                branches.push(Box::pin(SelfWakeOnce(false)));
+            }
+            branches.push(activity("last"));
+            while let Some(result) = branches.next().await {
+                result?;
+            }
+            Ok(Value::Null)
+        })
+    }
+
+    /// A long but finite run of ready futures beside a parked Harvest future
+    /// must run to the end. No fixed poll count may cut the batch short.
     #[tokio::test(start_paused = true)]
-    async fn a_self_waking_future_beside_a_park_still_suspends() {
-        let started_at = tokio::time::Instant::now();
+    async fn a_long_finite_run_of_ready_futures_is_polled_to_the_end() {
+        let outcome = run_workflow(
+            ExecutionId::new(),
+            vec![started()],
+            long_early_yield_fan_out_workflow,
+            Value::Null,
+        )
+        .await;
+        let WorkflowOutcome::Suspended { commands } = &outcome else {
+            panic!("expected a suspension, got {outcome:?}");
+        };
+        let names: Vec<&str> = commands
+            .iter()
+            .filter_map(|c| match c {
+                WorkflowCommand::ScheduleActivity { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, ["first", "last"], "every branch must be dispatched");
+    }
+
+    /// A future that wakes itself forever never lets the cycle settle, even
+    /// beside a parked Harvest future. That is a deadlock: the task fails and
+    /// is retried. The cycle never suspends with a partial batch. Real time:
+    /// a paused clock never advances while the runtime is busy.
+    #[tokio::test]
+    async fn a_self_waking_future_beside_a_park_fails_the_task() {
         let outcome = run_workflow(
             ExecutionId::new(),
             vec![started()],
@@ -3559,8 +3592,10 @@ mod tests {
             Value::Null,
         )
         .await;
-        assert_eq!(outcome_shape(&outcome), ["StartTimer"], "got {outcome:?}");
-        assert_eq!(started_at.elapsed(), Duration::ZERO);
+        assert!(
+            matches!(outcome, WorkflowOutcome::TaskFailed { .. }),
+            "got {outcome:?}"
+        );
     }
 
     /// AC RED 1: the outcome must not depend on how long a step takes.
