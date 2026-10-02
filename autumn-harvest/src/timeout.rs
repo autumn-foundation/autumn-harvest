@@ -566,13 +566,17 @@ fn timeout_refill_query(predicate: &str, higher: &[&str], after: bool) -> String
     )
 }
 
-/// The highest expired id at the start of a sweep (issue #1795).
+/// The highest expired id at the start of a sweep, and the expired count
+/// (issue #1795).
 ///
-/// The sweep stops at this id. See [`timeout_refill_query`].
+/// The sweep stops at this id. See [`timeout_refill_query`]. The count sets
+/// the sweep's refill budget. Rows that arrive below the mark during the
+/// sweep cannot then stretch it, because the budget does not grow.
 fn timeout_high_water_query(predicate: &str, higher: &[&str]) -> String {
     let exclusions = higher_reason_exclusions(higher, "");
     format!(
-        "SELECT q.id FROM ({predicate} OFFSET 0) q WHERE TRUE{exclusions} \
+        "SELECT q.id, COUNT(*) OVER () AS expired \
+         FROM ({predicate} OFFSET 0) q WHERE TRUE{exclusions} \
          ORDER BY q.id DESC LIMIT 1"
     )
 }
@@ -605,6 +609,9 @@ struct TimeoutScanLane {
     after: Option<uuid::Uuid>,
     /// The current sweep's high-water mark. The sweep stops at this id.
     until: Option<uuid::Uuid>,
+    /// Refills left in the current sweep. The last one ends the sweep,
+    /// whether or not it is full.
+    refills_left: i64,
     /// Expired ids from the last refill, in id order, not yet handed out.
     queued: std::collections::VecDeque<uuid::Uuid>,
 }
@@ -620,8 +627,10 @@ struct TimeoutScanLane {
 ///
 /// A sweep reaches every row that stays expired and is at or below the mark.
 /// A row that expires behind the position, or above the mark, waits for the
-/// next sweep. So a sweep is bounded by the backlog at its start, and new
-/// arrivals cannot stretch it. A queued row that stops matching
+/// next sweep. The sweep also has a refill budget, set from the expired
+/// count at its start. When the budget runs out, the sweep ends. So a sweep
+/// is bounded by the backlog at its start, and new arrivals cannot stretch
+/// it, wherever their ids fall. A queued row that stops matching
 /// is dropped when its batch loads.
 ///
 /// A failed pass still moves the lane. So one bad row cannot block the rows
@@ -636,6 +645,14 @@ pub struct TimeoutScanCursor {
 struct QueuedId {
     #[diesel(sql_type = diesel::sql_types::Uuid)]
     id: uuid::Uuid,
+}
+
+#[derive(diesel::QueryableByName)]
+struct HighWater {
+    #[diesel(sql_type = diesel::sql_types::Uuid)]
+    id: uuid::Uuid,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    expired: i64,
 }
 
 /// Bounded form of [`find_timed_out_tasks`] (issue #1795).
@@ -664,12 +681,16 @@ pub async fn find_timed_out_tasks_batch(
     for (index, (lane, (reason, predicate))) in cursor.lanes.iter_mut().zip(scans).enumerate() {
         let higher = &predicates[..index];
         if lane.queued.is_empty() && lane.after.is_none() {
-            // A new sweep: fix its high-water mark first.
-            let top: Vec<QueuedId> = diesel::sql_query(timeout_high_water_query(predicate, higher))
-                .load(conn)
-                .await
-                .map_err(crate::error::database_error)?;
-            lane.until = top.into_iter().next().map(|r| r.id);
+            // A new sweep: fix its high-water mark and its refill budget.
+            let top: Vec<HighWater> =
+                diesel::sql_query(timeout_high_water_query(predicate, higher))
+                    .load(conn)
+                    .await
+                    .map_err(crate::error::database_error)?;
+            let top = top.into_iter().next();
+            lane.until = top.as_ref().map(|r| r.id);
+            // Ceiling of `expired / refill`, and at least one refill.
+            lane.refills_left = top.map_or(0, |r| (r.expired.max(1) - 1) / refill + 1);
         }
         if lane.queued.is_empty()
             && let Some(until) = lane.until
@@ -693,7 +714,13 @@ pub async fn find_timed_out_tasks_batch(
             }
             .map_err(crate::error::database_error)?;
             let full = i64::try_from(ids.len()).is_ok_and(|n| n >= refill);
-            lane.after = if full { ids.last().map(|r| r.id) } else { None };
+            lane.refills_left -= 1;
+            // A spent budget ends the sweep even after a full refill.
+            lane.after = if full && lane.refills_left > 0 {
+                ids.last().map(|r| r.id)
+            } else {
+                None
+            };
             lane.queued.extend(ids.into_iter().map(|r| r.id));
         }
 
@@ -6295,11 +6322,14 @@ mod tests {
         let predicate = start_to_close_timeout_query();
         let higher = heartbeat_timeout_query();
         let sql = timeout_high_water_query(predicate, &[higher]);
-        assert!(sql.starts_with(&format!("SELECT q.id FROM ({predicate} OFFSET 0) q")));
+        assert!(sql.starts_with("SELECT q.id, COUNT(*) OVER () AS expired"));
+        assert!(sql.contains(&format!("FROM ({predicate} OFFSET 0) q")));
         assert!(sql.contains(&format!(
             "AND NOT EXISTS (SELECT 1 FROM ({higher}) h WHERE h.id = q.id)"
         )));
         assert!(sql.ends_with("ORDER BY q.id DESC LIMIT 1"));
+        // The same scan counts the backlog, which sets the refill budget.
+        assert!(sql.contains("COUNT(*) OVER () AS expired"));
     }
 
     #[test]
