@@ -213,7 +213,7 @@ A retry policy limits the retries of one task. A retry budget limits the retries
 3. The bucket never holds more than `max_tokens`.
 4. The gate applies only to a real call. A `CircuitOpen` short-circuit spends nothing. A half-open probe is never deferred, because it is the breaker's recovery signal.
 5. An attempt that does not run gives its tokens back. A drop guard does this on every return before `ActivityStarted`: a rate-limit deferral, a no-op start or an error.
-6. A released deposit can leave the bucket below 0, because a retry can spend the deposit first. The next deposits pay the debt back.
+6. A released deposit can leave the bucket below 0, because a retry can spend the deposit first. The next deposits pay the debt back. A held deposit can also push the time refill over the cap. Its release gives back the refill that the cap discarded, up to the deposit amount.
 
 So the retries that run in a window of `T` seconds are at most `max_tokens + ratio × first_attempts + min_retries_per_sec × T`.
 

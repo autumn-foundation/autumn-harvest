@@ -145,8 +145,9 @@ pub struct BudgetTicket {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum TicketKind {
-    /// A first attempt added this many tokens.
-    Deposited(f64),
+    /// A first attempt added `amount` tokens. `discarded_at` is the bucket's
+    /// [`Bucket::discarded`] count at that moment.
+    Deposited { amount: f64, discarded_at: f64 },
     /// A retry spent one token.
     Spent,
 }
@@ -176,6 +177,9 @@ pub enum Admission {
 struct Bucket {
     tokens: f64,
     refilled_at: Instant,
+    /// Total time refill that the cap discarded. A released deposit uses it
+    /// to give back the refill that the deposit pushed over the cap.
+    discarded: f64,
     /// Latest wake-up slot given to a deferred retry. Later deferrals are
     /// spaced after it, at the refill rate.
     next_slot: Instant,
@@ -252,7 +256,10 @@ impl RetryBudgetRegistry {
                 bucket.tokens += deposit;
                 return Admission::Admitted {
                     ticket: BudgetTicket {
-                        kind: TicketKind::Deposited(deposit),
+                        kind: TicketKind::Deposited {
+                            amount: deposit,
+                            discarded_at: bucket.discarded,
+                        },
                     },
                     available: bucket.tokens,
                 };
@@ -280,13 +287,26 @@ impl RetryBudgetRegistry {
     /// a deposit before the deposit is released. The debt keeps the bound
     /// exact, because the next deposits must pay it back first.
     ///
+    /// A held deposit can also push the time refill over the cap. Without
+    /// the deposit, that refill would have stayed in the bucket. So the
+    /// release gives back the refill that the cap discarded since the
+    /// deposit, up to the deposit amount.
+    ///
     /// Returns the tokens left, or `None` when the type has no budget.
     // The ticket is taken by value so that one ticket is released only once.
     #[allow(clippy::needless_pass_by_value)]
     pub fn release(&self, activity_name: &str, ticket: BudgetTicket, now: Instant) -> Option<f64> {
         self.with_bucket(activity_name, now, |bucket, policy| {
             bucket.tokens = match ticket.kind {
-                TicketKind::Deposited(amount) => bucket.tokens - amount,
+                TicketKind::Deposited {
+                    amount,
+                    discarded_at,
+                } => {
+                    let credit = (bucket.discarded - discarded_at).clamp(0.0, amount);
+                    // Another release cannot claim the same discarded refill.
+                    bucket.discarded -= credit;
+                    (bucket.tokens - amount + credit).min(policy.max_tokens)
+                }
                 TicketKind::Spent => (bucket.tokens + 1.0).min(policy.max_tokens),
             };
             bucket.tokens
@@ -306,6 +326,7 @@ impl Bucket {
         Self {
             tokens: policy.max_tokens,
             refilled_at: now,
+            discarded: 0.0,
             next_slot: now,
         }
     }
@@ -316,9 +337,11 @@ impl Bucket {
         let elapsed = now
             .saturating_duration_since(self.refilled_at)
             .as_secs_f64();
-        self.tokens = elapsed
-            .mul_add(policy.min_retries_per_sec, self.tokens)
-            .min(policy.max_tokens);
+        let refilled = elapsed.mul_add(policy.min_retries_per_sec, self.tokens);
+        // Count only the refill that the cap discards, not the part of the
+        // level that was already over the cap.
+        self.discarded += (refilled - policy.max_tokens.max(self.tokens)).max(0.0);
+        self.tokens = refilled.min(policy.max_tokens);
         self.refilled_at = self.refilled_at.max(now);
     }
 
@@ -607,6 +630,24 @@ mod tests {
             reg.admit(A, true, now),
             Admission::Deferred { .. }
         ));
+    }
+
+    /// A held deposit can push the time refill past the cap. Releasing the
+    /// deposit must give back the refill that the cap discarded.
+    #[test]
+    fn releasing_a_deposit_keeps_the_refill_the_cap_discarded() {
+        let reg = registry(RetryBudgetPolicy::new(10.0, 10.0, 1.0));
+        let t0 = Instant::now();
+        assert_eq!(drain(&reg, A, t0), 10);
+        let full = ticket(reg.admit(A, false, t0));
+        assert_eq!(reg.available(A, t0), Some(10.0));
+        let t10 = t0 + Duration::from_secs(10);
+        assert_eq!(reg.release(A, full, t10), Some(10.0));
+
+        assert_eq!(drain(&reg, A, t10), 10);
+        let partial = ticket(reg.admit(A, false, t10));
+        let t13 = t10 + Duration::from_secs(3);
+        assert_eq!(reg.release(A, partial, t13), Some(3.0));
     }
 
     /// Ten deposits of 0.1 sum to slightly less than 1.0 in floating point.
