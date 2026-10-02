@@ -409,7 +409,7 @@ async fn path_shards(
     api_state: &HarvestApiState,
     method: &Method,
     path: &str,
-) -> Result<Vec<ShardId>, Response> {
+) -> Result<Vec<ShardId>, StatusCode> {
     let Some(exec_id) = execution_id_in_path(method, path) else {
         return Ok(Vec::new());
     };
@@ -422,7 +422,7 @@ async fn path_shards(
     let pool = pool.sharded_pool();
     let unavailable = |e: &autumn_harvest::HarvestError| {
         tracing::warn!(error = %e, path = %path, "harvest: authz could not resolve shard");
-        StatusCode::SERVICE_UNAVAILABLE.into_response()
+        StatusCode::SERVICE_UNAVAILABLE
     };
     let (mut conn, live) =
         autumn_harvest::shard_rebalance::conn_for_execution_forwarded_with_shard(pool, exec_id)
@@ -561,7 +561,7 @@ pub(crate) async fn enforce_authorizer(
     let path = request.uri().path().to_string();
     let mut shards = match path_shards(&api_state, &method, &path).await {
         Ok(shards) => shards,
-        Err(response) => return response,
+        Err(status) => return status.into_response(),
     };
 
     let source = shard_source(&method, &path);
