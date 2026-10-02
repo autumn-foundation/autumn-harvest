@@ -14042,8 +14042,12 @@ impl ActivityExecutionInfo {
 pub struct StampedHeartbeat {
     /// The heartbeat payload.
     pub details: serde_json::Value,
-    /// When the activity sent the heartbeat.
+    /// When the activity sent the heartbeat, by the wall clock. The flush
+    /// writes this time.
     pub sent_at: chrono::DateTime<chrono::Utc>,
+    /// When the activity sent the heartbeat, by the monotonic clock. The
+    /// flusher orders heartbeats by it, because the wall clock can step back.
+    pub sent_order: std::time::Instant,
 }
 
 impl StampedHeartbeat {
@@ -14053,6 +14057,7 @@ impl StampedHeartbeat {
         Self {
             details,
             sent_at: chrono::Utc::now(),
+            sent_order: std::time::Instant::now(),
         }
     }
 }

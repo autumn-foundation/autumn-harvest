@@ -279,18 +279,22 @@ type LatestHeartbeat = Arc<Mutex<Option<Pending>>>;
 /// statement timeout. A heartbeat sent in that time keeps its send time, so a
 /// stalled handler cannot look alive later.
 ///
-/// Newest means the latest send time, not the latest arrival. A manual
-/// heartbeat and the auto-heartbeat ticker stamp before they send, so they can
-/// arrive out of order. A heartbeat older than one already seen is dropped,
-/// also when a flush already took the newer one. A write of it would move
+/// Newest means the latest send, not the latest arrival. A manual heartbeat
+/// and the auto-heartbeat ticker stamp before they send, so they can arrive
+/// out of order. A heartbeat sent before one already seen is dropped, also
+/// when a flush already took the newer one. A write of it would move
 /// `last_heartbeat_at` backwards.
+///
+/// The order comes from the monotonic `sent_order`, not from the wall clock.
+/// The wall clock can step back, for example after an NTP correction. Every
+/// later heartbeat would then look older, and all of them would be dropped.
 #[cfg(feature = "db")]
 async fn keep_newest_heartbeat(
     mut rx: mpsc::Receiver<StampedHeartbeat>,
     latest: LatestHeartbeat,
     cancel: CancellationToken,
 ) {
-    let mut newest_sent_at: Option<chrono::DateTime<chrono::Utc>> = None;
+    let mut newest_sent: Option<std::time::Instant> = None;
     loop {
         let beat = tokio::select! {
             () = cancel.cancelled() => break,
@@ -299,10 +303,10 @@ async fn keep_newest_heartbeat(
                 None => break,
             },
         };
-        if newest_sent_at.is_some_and(|newest| beat.sent_at < newest) {
+        if newest_sent.is_some_and(|newest| beat.sent_order < newest) {
             continue;
         }
-        newest_sent_at = Some(beat.sent_at);
+        newest_sent = Some(beat.sent_order);
         *latest.lock().unwrap_or_else(PoisonError::into_inner) = Some(Pending {
             payload: beat.details,
             sent_at: beat.sent_at,
@@ -610,11 +614,39 @@ mod tests {
             slot.as_ref().map(|beat| beat.sent_at)
         }
 
-        fn beat_at(secs: i64) -> StampedHeartbeat {
+        /// One process start, shared by every test beat, so their send
+        /// order compares.
+        static BASE: std::sync::LazyLock<std::time::Instant> =
+            std::sync::LazyLock::new(std::time::Instant::now);
+
+        /// A beat sent `order` seconds after `BASE`, with a wall clock that
+        /// read `wall` seconds.
+        fn beat_sent(order: u64, wall: i64) -> StampedHeartbeat {
             StampedHeartbeat {
                 details: Value::Null,
-                sent_at: chrono::DateTime::from_timestamp(secs, 0).expect("time"),
+                sent_at: chrono::DateTime::from_timestamp(wall, 0).expect("time"),
+                sent_order: *BASE + Duration::from_secs(order),
             }
+        }
+
+        /// A beat whose wall clock agrees with its send order.
+        fn beat_at(secs: i64) -> StampedHeartbeat {
+            beat_sent(secs.unsigned_abs(), secs)
+        }
+
+        /// The wall clock can step back, after an NTP or VM correction. A
+        /// heartbeat sent after the step is still the newest (issue #1788).
+        /// Ordering by wall time would drop every heartbeat until the clock
+        /// caught up, and a timeout scanner could reclaim a live activity.
+        #[tokio::test]
+        async fn a_backward_clock_step_keeps_the_later_heartbeat() {
+            let before_step = beat_sent(1, 20);
+            let after_step = beat_sent(2, 10);
+            let newest = keep_newest_of(vec![before_step, after_step.clone()], None).await;
+            assert_eq!(newest, Some(after_step.sent_at));
+            let newest_after_flush =
+                keep_newest_of(vec![beat_sent(1, 20), after_step.clone()], Some(0)).await;
+            assert_eq!(newest_after_flush, Some(after_step.sent_at));
         }
 
         /// Only a write that blocked for an interval, with a newer heartbeat
