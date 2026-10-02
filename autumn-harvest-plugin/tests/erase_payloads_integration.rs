@@ -177,7 +177,7 @@ async fn seed_execution_with_pii(
             workflow_name: "erasable",
             workflow_id,
             exec_id,
-            input: json!({ "email": pii, "user_id": 42 }),
+            input: json!({ "email": pii, "user_id": 42 }).into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,

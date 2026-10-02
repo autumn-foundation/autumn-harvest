@@ -552,7 +552,7 @@ async fn seed_workflow_with_headers(
         workflow_id: &format!("wf-{}", exec_id.as_uuid()),
         run_id: Uuid::new_v4(),
         shard_id: 0,
-        input: input.clone(),
+        input: input.clone().into(),
         parent_id: None,
         queue_name: queue,
         execution_timeout: None,

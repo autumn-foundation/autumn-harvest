@@ -201,7 +201,7 @@ async fn seed_workflow_with_history_size(
             workflow_name: "history_bloat_filter_test",
             workflow_id,
             exec_id,
-            input: json!({}),
+            input: json!({}).into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,

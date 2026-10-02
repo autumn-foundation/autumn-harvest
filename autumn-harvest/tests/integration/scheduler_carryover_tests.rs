@@ -359,7 +359,7 @@ async fn manual_start_has_no_carryover() {
             workflow_name: wf_name,
             workflow_id: "manual-1",
             exec_id,
-            input: json!(null),
+            input: json!(null).into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,

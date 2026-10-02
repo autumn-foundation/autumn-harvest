@@ -108,7 +108,7 @@ fn params<'a>(
         workflow_name,
         workflow_id,
         exec_id,
-        input: serde_json::json!({ "tenant_id": key }),
+        input: serde_json::json!({ "tenant_id": key }).into(),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
@@ -168,7 +168,7 @@ fn params_with_distinct_keys<'a>(
         concurrency_key,
         on_conflict,
     );
-    request.input = serde_json::json!({ "tenant_id": tenant_id });
+    request.input = serde_json::json!({ "tenant_id": tenant_id }).into();
     request.concurrency_limit = Some(concurrency_limit);
     request
 }

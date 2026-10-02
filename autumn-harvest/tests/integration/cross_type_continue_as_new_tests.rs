@@ -212,7 +212,7 @@ async fn start_root(
         workflow_name,
         workflow_id,
         exec_id: ExecutionId::new(),
-        input,
+        input: input.into(),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,

@@ -95,7 +95,7 @@ async fn start_running_workflow(
             workflow_name: "echo",
             workflow_id: "echo-1",
             exec_id,
-            input: serde_json::json!({"name": "Mina"}),
+            input: serde_json::json!({"name": "Mina"}).into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,

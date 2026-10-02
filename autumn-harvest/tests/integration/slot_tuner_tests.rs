@@ -217,7 +217,7 @@ async fn start_workflow(database_url: &str, workflow_id: &str) -> ExecutionId {
             workflow_name: "slot_tuner_slow_workflow",
             workflow_id,
             exec_id,
-            input: Value::Null,
+            input: Value::Null.into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,

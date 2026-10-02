@@ -314,7 +314,7 @@ fn all_adr_0001_span_kinds_are_emitted() {
                     workflow_name: "telemetry_master_workflow",
                     workflow_id: "telem-master-001",
                     exec_id,
-                    input: Value::Null,
+                    input: Value::Null.into(),
                     parent_id: None,
                     queue_name: "default",
                     execution_timeout: None,
