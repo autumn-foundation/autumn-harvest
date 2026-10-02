@@ -512,17 +512,17 @@ async fn a_sweep_stops_at_its_high_water_mark() {
     assert_eq!(next, [late], "the next sweep reaches the late row");
 }
 
-/// A sweep has a refill budget, set from the expired count at its start.
-/// Rows that arrive between the cursor and the mark fill later refills, but
-/// they cannot add refills. So the sweep still ends on budget.
+/// A sweep reads only the rows that were live at its start. Rows created
+/// later, between the cursor and the mark, wait for the next sweep. So they
+/// cannot stretch the sweep, even when they are already expired.
 #[tokio::test]
 async fn arrivals_below_the_mark_cannot_stretch_a_sweep() {
     let (url, _container) = setup_test_db_url().await;
     let pool = build_pool(&url);
     let mut conn = pool.get().await.expect("connection");
     let queue = "scanner-lease-budget";
-    // At a batch of 1 a refill holds 64 ids, so 70 rows give a budget of two
-    // refills: passes 1-64 and 65-128. Pass 129 starts the next sweep.
+    // At a batch of 1 a page holds 64 rows, so 70 rows give two pages:
+    // passes 1-64 and 65-70. Pass 71 starts the next sweep.
     let ours = insert_expired_running_tasks(&mut conn, queue, 70).await;
     assert_eq!(
         foreign_expired_rows(&mut conn, queue).await,
@@ -536,8 +536,8 @@ async fn arrivals_below_the_mark_cannot_stretch_a_sweep() {
         .expect("batch scan");
     assert_eq!(start_to_close_ids(&first), ours[..1]);
 
-    // 100 arrivals with ids between the cursor (the 64th id) and the mark
-    // (the 70th id). Unbounded, they would add a third refill.
+    // 100 expired arrivals with ids between the cursor (the 64th id) and the
+    // mark (the 70th id). Read in this sweep, they would add two pages.
     let (low, high) = (ours[63], ours[69]);
     let mut arrivals = Vec::with_capacity(100);
     while arrivals.len() < 100 {
@@ -579,8 +579,8 @@ async fn arrivals_below_the_mark_cannot_stretch_a_sweep() {
         .expect("clear queue");
     assert_eq!(
         wrapped_at,
-        Some(129),
-        "the sweep must end after its two-refill budget, not after a third refill"
+        Some(71),
+        "the sweep must end at the rows live at its start, not read the arrivals"
     );
 }
 
@@ -648,6 +648,74 @@ async fn later_expiries_cannot_displace_the_rows_a_sweep_counted() {
     assert_eq!(
         seen, ours,
         "the sweep must read every row it counted, and only those"
+    );
+}
+
+/// A refill reads one bounded page of live rows, in id order. It does not
+/// scan every live row to find the expired ones. So a refill costs the same
+/// at any backlog size, and one sweep reads each live row once.
+#[tokio::test]
+async fn a_refill_reads_one_bounded_page_of_live_rows() {
+    let (url, _container) = setup_test_db_url().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.expect("connection");
+    let queue = "scanner-lease-page";
+    diesel::sql_query("DELETE FROM harvest_task_queue WHERE queue_name = $1")
+        .bind::<diesel::sql_types::Text, _>(queue)
+        .execute(&mut conn)
+        .await
+        .expect("clear queue");
+    // 200 live rows that are not expired. At a batch of 1, a page holds 64.
+    diesel::sql_query(
+        "INSERT INTO harvest_task_queue \
+         (id, queue_name, task_type, input, state, attempt, max_attempts, \
+          started_at, start_to_close) \
+         SELECT gen_random_uuid(), $1, 'activity', '{}'::jsonb, 'RUNNING', \
+                1, 1, NOW(), INTERVAL '1 hour' \
+         FROM generate_series(1, 200)",
+    )
+    .bind::<diesel::sql_types::Text, _>(queue)
+    .execute(&mut conn)
+    .await
+    .expect("insert live tasks");
+    // One expired row above them all.
+    let target = uuid::Uuid::from_u128(u128::MAX - 1);
+    diesel::sql_query(
+        "INSERT INTO harvest_task_queue \
+         (id, queue_name, task_type, input, state, attempt, max_attempts, \
+          started_at, start_to_close) \
+         VALUES ($1, $2, 'activity', '{}'::jsonb, 'RUNNING', \
+                 1, 1, NOW() - INTERVAL '1 minute', INTERVAL '1 second')",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(target)
+    .bind::<diesel::sql_types::Text, _>(queue)
+    .execute(&mut conn)
+    .await
+    .expect("insert expired task");
+
+    let mut cursor = TimeoutScanCursor::default();
+    let mut found_at = None;
+    for pass in 1..=100 {
+        let page = timeout::find_timed_out_tasks_batch(&mut conn, &mut cursor, 1)
+            .await
+            .expect("batch scan");
+        if start_to_close_ids(&page).contains(&target) {
+            found_at = Some(pass);
+            break;
+        }
+    }
+
+    diesel::sql_query("DELETE FROM harvest_task_queue WHERE queue_name = $1")
+        .bind::<diesel::sql_types::Text, _>(queue)
+        .execute(&mut conn)
+        .await
+        .expect("clear queue");
+    // At least 200 live rows sort below the target, so it is on the fourth
+    // page or later. Other suites' live rows can only push it further.
+    let found_at = found_at.expect("the sweep must reach the expired row");
+    assert!(
+        found_at >= 4,
+        "a refill must read one page of live rows, not all of them: found on pass {found_at}"
     );
 }
 

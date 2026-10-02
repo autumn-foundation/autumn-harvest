@@ -20,15 +20,17 @@ size, so adding workers to clear a backlog added database load in proportion.
 - **Not a fence.** Two holders for a short time are safe, because every
   sub-pass is already safe with concurrent runners.
 - **Bounded scans.** The checker enforces at most one batch per timeout
-  reason per pass (default 500). One scan queues up to 64 batches of expired
-  ids, and each pass loads one batch by primary key and checks it again. So
-  draining a backlog does not repeat the full scan on every pass. A keyset
-  cursor walks the backlog in `id` order and wraps at the end, so a row that
-  stays expired cannot starve the rest. A sweep tests expiry against the
-  database clock at its start, so rows that expire later cannot displace
-  the rows it counted. `OFFSET 0` keeps each predicate on
-  its own partial index, with the keyset bound inside the subquery. A row that
-  matches two reasons gets the first one, as in the full scan. The four
+  reason per pass (default 500). A sweep walks the live task rows in `id`
+  order, one page of up to 64 batches per refill, through the new partial
+  index `idx_harvest_tq_live_id` (migration
+  `20261002110913_harvest_task_queue_live_id_index`). Each refill queues the
+  expired rows of its page, and each pass loads one batch by primary key and
+  checks it again. So the work of a pass does not grow with the backlog, and
+  one sweep reads each live row once. The cursor wraps at the end, so a row
+  that stays expired cannot starve the rest. A sweep reads only the rows
+  live at its start, and tests expiry against the database clock at its
+  start. So new rows cannot stretch a sweep or displace the rows it counted.
+  A row that matches two reasons gets the first one, as in the full scan. The four
   predicate consts are unchanged, so the backup drill's `UNION` still works.
   The public `enforce_timeouts_once` keeps its full scan.
 - **Jitter.** By default, each sleep is the interval times a factor in
@@ -64,6 +66,9 @@ Tests run in `scanner_lease_tests` against Postgres 16:
   batch drains the backlog in 3 passes (RED: 7 rows in one pass).
 - Rows that expire after a sweep starts, with lower ids, do not displace the
   rows the sweep counted (RED: the highest counted row is skipped).
+- A refill reads one page of live rows: with 200 live rows below it, an
+  expired row is found on the fourth pass at a batch of 1 (RED: the first
+  pass, because each refill scanned every live row).
 - A spawned checker with a batch of 3 enforces exactly 3 of 7 rows in one
   pass.
 - An aborted holder keeps its lease until the TTL, then a standby takes over

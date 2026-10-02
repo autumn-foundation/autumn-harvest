@@ -209,13 +209,23 @@ tick.
 
 The four task-timeout scans (heartbeat, start-to-close, schedule-to-start,
 schedule-to-close) return at most one batch per reason per pass (default 500
-rows). One scan queues up to 64 batches of expired ids, in `id` order. Each
-pass then loads one batch by primary key and checks it again. So draining a
-backlog does not repeat the full scan on every pass. A keyset cursor moves
-through the backlog and wraps at the end. A sweep reads only the rows that
-had expired when it started. A row that expires later, or behind the
-cursor, waits for the next sweep. So new expiries cannot push an old row out
-of every sweep.
+rows). A sweep walks the live task rows (`PENDING` or `RUNNING`) in `id`
+order. Each refill reads one page of up to 64 batches of live rows, through
+the partial index `idx_harvest_tq_live_id`, and queues the expired ones.
+Each pass then loads one batch by primary key and checks it again. So the
+work of a pass does not grow with the backlog, and one sweep reads each live
+row once. The cursor wraps at the end of the sweep.
+
+A sweep reads only the rows that were live when it started, and queues only
+those that had expired by then. A row created later, or that expires later,
+waits for the next sweep. So new rows cannot stretch a sweep or push an old
+row out of it.
+
+On a large deployment, a sweep takes more than one pass. It needs about
+(live rows) / (64 × batch size) passes. At the default batch of 500, that is
+one pass per 32,000 live rows. A timeout can be enforced that much later.
+If the index is missing, the scan still works, but each page can read many
+terminal rows.
 
 A row that matches two reasons gets the first one, in the order above. So
 the recorded timeout type does not depend on where each cursor is.
