@@ -4025,8 +4025,8 @@ async fn lift_gate_handler(
 #[derive(serde::Deserialize)]
 struct CreateTokenRequest {
     name: String,
-    /// `"read"` or `"mutate"` — the verb-level scope drawn from the route
-    /// classification. Defaults to `read` (least privilege) when omitted.
+    /// `"read"`, `"mutate"` or `"admin"`: the verb-level scope drawn from the
+    /// route classification. Defaults to `read` (least privilege) when omitted.
     #[serde(default = "default_token_scope")]
     scope: String,
     /// Optional expiry; an expired token is rejected 401 on the next request.
@@ -4051,7 +4051,10 @@ async fn create_token_handler(
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
-                "error": format!("unknown scope '{}' (expected 'read' or 'mutate')", body.scope)
+                "error": format!(
+                    "unknown scope '{}' (expected 'read', 'mutate' or 'admin')",
+                    body.scope
+                )
             })),
         )
             .into_response();
@@ -5506,6 +5509,7 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
 pub struct StandaloneAdminAuth {
     api_tokens: bool,
     read_only_role: bool,
+    authorizer: Option<crate::authz::SharedAuthorizer>,
     admin_auth_boundary: bool,
     deployment_profile: Option<String>,
     admin_auth_session_key: Option<String>,
@@ -5538,6 +5542,17 @@ impl StandaloneAdminAuth {
     #[must_use]
     pub const fn with_read_only_role(mut self) -> Self {
         self.read_only_role = true;
+        self
+    }
+
+    /// Install an authorizer hook (issue #1803).
+    ///
+    /// The hook sees each request after the token and read-only layers. It can
+    /// deny by principal, route class, tenant key or shard. See
+    /// [`crate::authz`] for the contract.
+    #[must_use]
+    pub fn with_authorizer(mut self, authorizer: impl crate::authz::HarvestAuthorizer) -> Self {
+        self.authorizer = Some(crate::authz::SharedAuthorizer::new(authorizer));
         self
     }
 
@@ -5590,7 +5605,7 @@ impl StandaloneAdminAuth {
     ///
     /// The returned router carries no embedder auth. Apply that outside, so the
     /// request order is: embedder auth -> token layer -> read-only-role layer
-    /// -> per-route `require_admin` -> handler.
+    /// -> authorizer -> per-route `require_admin` -> handler.
     ///
     /// [`harvest_ui_router`]: crate::harvest_ui_router
     /// [`HarvestPlugin`]: crate::HarvestPlugin
@@ -5602,8 +5617,26 @@ impl StandaloneAdminAuth {
         if let Some(session_key) = &self.admin_auth_session_key {
             api_state.set_admin_auth_session_key(session_key.clone());
         }
-        apply_admin_auth_layers(router, api_state, self.api_tokens, self.read_only_role)
+        apply_admin_auth_layers(
+            router,
+            api_state,
+            &AdminAuthLayers {
+                api_tokens: self.api_tokens,
+                read_only_role: self.read_only_role,
+                authorizer: self.authorizer.clone(),
+            },
+        )
     }
+}
+
+/// The opt-in layers [`apply_admin_auth_layers`] installs.
+pub(crate) struct AdminAuthLayers {
+    /// The scoped-API-token layer (issue #942).
+    pub api_tokens: bool,
+    /// The read-only-role layer (issue #776).
+    pub read_only_role: bool,
+    /// The authorizer hook (issue #1803).
+    pub authorizer: Option<crate::authz::SharedAuthorizer>,
 }
 
 /// Wrap a composed Harvest router in the admin-auth layer stack.
@@ -5625,19 +5658,28 @@ impl StandaloneAdminAuth {
 /// sets `TokenPrincipal` and the authoritative actor, then denies a read-scope
 /// mutation. It sits INSIDE the embedder's auth middleware.
 ///
-/// Neither layer is installed unless asked for, so a deployment that declares
-/// neither does an identical amount of work as before.
+/// Issue #1803: the authorizer layer is installed INSIDE the read-only-class
+/// layer. It runs after both built-in gates, so it can only deny. It sees the
+/// `TokenPrincipal` the token layer sets.
+///
+/// No layer is installed unless asked for, so a deployment that declares none
+/// does an identical amount of work as before.
 pub(crate) fn apply_admin_auth_layers(
     router: Router<()>,
     api_state: &HarvestApiState,
-    api_tokens: bool,
-    read_only_role: bool,
+    layers: &AdminAuthLayers,
 ) -> Router<()> {
     let mut router = router;
-    if read_only_role {
+    if let Some(authorizer) = &layers.authorizer {
+        router = router.layer(middleware::from_fn_with_state(
+            (api_state.clone(), authorizer.clone()),
+            crate::authz::enforce_authorizer,
+        ));
+    }
+    if layers.read_only_role {
         router = router.layer(middleware::from_fn(enforce_read_only_class));
     }
-    if api_tokens {
+    if layers.api_tokens {
         router = router.layer(middleware::from_fn_with_state(
             api_state.clone(),
             crate::api_token::enforce_token_scope,
@@ -5919,45 +5961,72 @@ fn normalize_route_template(path: &str) -> String {
     out
 }
 
-/// Per-method radix-tree matchers over `CLASSIFIED_ROUTES`, built once.
+/// Per-method radix-tree matchers over one route table.
 ///
-/// Keyed per HTTP method because the same path can carry a different class per
+/// Keyed per HTTP method because the same path can carry a different value per
 /// method (e.g. `GET /admin/schedules/{id}` is `ReadOnly`, `DELETE` is
 /// `Mutating`).
-fn route_class_matchers() -> &'static HashMap<axum::http::Method, matchit::Router<RouteClass>> {
-    static MATCHERS: std::sync::OnceLock<HashMap<axum::http::Method, matchit::Router<RouteClass>>> =
-        std::sync::OnceLock::new();
-    MATCHERS.get_or_init(|| {
-        let mut by_method: HashMap<axum::http::Method, matchit::Router<RouteClass>> =
-            HashMap::new();
-        for (template, class) in CLASSIFIED_ROUTES {
-            let Some((method, path)) = template.split_once(' ') else {
-                debug_assert!(false, "malformed CLASSIFIED_ROUTES template: {template}");
-                continue;
-            };
-            let Ok(method) = method.parse::<axum::http::Method>() else {
-                debug_assert!(false, "unknown method in CLASSIFIED_ROUTES: {template}");
-                continue;
-            };
-            let normalized = normalize_route_template(path);
-            let router = by_method.entry(method).or_default();
-            if let Err(e) = router.insert(normalized, *class) {
-                // Fail closed, never panic (F4): a future post-normalization
-                // collision must not crash the first read-only request and
-                // poison the `OnceLock`. A skipped route stays unclassified →
-                // `classify_route` → `Mutating` → denied to read-only
-                // principals (over-restriction, never exposure). The
-                // build-time `route_class_matchers_build_without_conflict`
-                // test (debug_assert active) still fails CI on any conflict.
-                tracing::error!(
-                    template = %template,
-                    error = %e,
-                    "harvest: CLASSIFIED_ROUTES matcher insert failed; route will fail closed (deny read-only)"
-                );
-                debug_assert!(false, "matcher insert conflict for '{template}': {e}");
-            }
+type RouteMatchers<T> = HashMap<axum::http::Method, matchit::Router<T>>;
+
+/// Build [`RouteMatchers`] from `(template, value)` pairs. `table` names the
+/// source table in a conflict log.
+fn build_route_matchers<T>(
+    table: &str,
+    entries: impl IntoIterator<Item = (&'static str, T)>,
+) -> RouteMatchers<T> {
+    let mut by_method: RouteMatchers<T> = HashMap::new();
+    for (template, value) in entries {
+        let Some((method, path)) = template.split_once(' ') else {
+            debug_assert!(false, "malformed {table} template: {template}");
+            continue;
+        };
+        let Ok(method) = method.parse::<axum::http::Method>() else {
+            debug_assert!(false, "unknown method in {table}: {template}");
+            continue;
+        };
+        let normalized = normalize_route_template(path);
+        let router = by_method.entry(method).or_default();
+        if let Err(e) = router.insert(normalized, value) {
+            // Fail closed, never panic (F4): a future post-normalization
+            // collision must not crash the first request and poison the
+            // `OnceLock`. A skipped route stays unmatched, and every caller
+            // treats unmatched as the restrictive answer. The build-time
+            // `route_class_matchers_build_without_conflict` test (debug_assert
+            // active) still fails CI on any conflict.
+            tracing::error!(
+                table = %table,
+                template = %template,
+                error = %e,
+                "harvest: route matcher insert failed; route will fail closed"
+            );
+            debug_assert!(false, "matcher insert conflict for '{template}': {e}");
         }
-        by_method
+    }
+    by_method
+}
+
+/// Look up `path` for `method` in `matchers`.
+///
+/// `HEAD` is looked up under `GET` (F3): axum serves `HEAD` via the `GET`
+/// handler, so a `HEAD` probe inherits that route's value.
+fn match_route<'m, T>(
+    matchers: &'m RouteMatchers<T>,
+    method: &axum::http::Method,
+    path: &'m str,
+) -> Option<matchit::Match<'m, 'm, &'m T>> {
+    let lookup_method = if *method == axum::http::Method::HEAD {
+        &axum::http::Method::GET
+    } else {
+        method
+    };
+    matchers.get(lookup_method)?.at(path).ok()
+}
+
+/// Per-method matchers over `CLASSIFIED_ROUTES`, built once.
+fn route_class_matchers() -> &'static RouteMatchers<RouteClass> {
+    static MATCHERS: std::sync::OnceLock<RouteMatchers<RouteClass>> = std::sync::OnceLock::new();
+    MATCHERS.get_or_init(|| {
+        build_route_matchers("CLASSIFIED_ROUTES", CLASSIFIED_ROUTES.iter().copied())
     })
 }
 
@@ -5971,19 +6040,70 @@ fn route_class_matchers() -> &'static HashMap<axum::http::Method, matchit::Route
 /// read class rather than fail closed to `Mutating` and 403 a read-only
 /// dashboard's existence/size probe.
 pub(crate) fn classify_route(method: &axum::http::Method, path: &str) -> RouteClass {
-    let get = axum::http::Method::GET;
-    let lookup_method = if *method == axum::http::Method::HEAD {
-        &get
-    } else {
-        method
-    };
-    let Some(router) = route_class_matchers().get(lookup_method) else {
-        return RouteClass::Mutating;
-    };
-    match router.at(path) {
-        Ok(m) => *m.value,
-        Err(_) => RouteClass::Mutating,
+    match_route(route_class_matchers(), method, path).map_or(RouteClass::Mutating, |m| *m.value)
+}
+
+/// Whether only an `admin`-scoped token may call this route (issue #1803).
+///
+/// Backed by [`autumn_harvest::audit::ADMIN_SCOPE_ROUTES`]. An unmatched path
+/// is not admin-only, but [`classify_route`] still treats it as `Mutating`.
+pub(crate) fn requires_admin_scope(method: &axum::http::Method, path: &str) -> bool {
+    static MATCHERS: std::sync::OnceLock<RouteMatchers<()>> = std::sync::OnceLock::new();
+    let matchers = MATCHERS.get_or_init(|| {
+        build_route_matchers(
+            "ADMIN_SCOPE_ROUTES",
+            autumn_harvest::audit::ADMIN_SCOPE_ROUTES
+                .iter()
+                .map(|route| (*route, ())),
+        )
+    });
+    match_route(matchers, method, path).is_some()
+}
+
+/// The positional name of the execution-id parameter in a route template.
+///
+/// `{exec_id}` and `{run_exec_id}` are execution ids wherever they occur.
+/// `{id}` is one only directly under `/workflows/`. Elsewhere `{id}` names a
+/// token, gate or schedule, whose UUID bits do not encode a shard.
+fn execution_param(template: &str) -> Option<String> {
+    let (_, path) = template.split_once(' ')?;
+    let params = path
+        .split('/')
+        .filter(|seg| seg.starts_with('{') && seg.ends_with('}'));
+    for (idx, param) in params.enumerate() {
+        let is_exec = matches!(param, "{exec_id}" | "{run_exec_id}")
+            || (param == "{id}" && path.starts_with("/workflows/{id}"));
+        if is_exec {
+            return Some(format!("p{idx}"));
+        }
     }
+    None
+}
+
+/// The execution id a classified route names in its path, if any
+/// (issue #1803).
+///
+/// Only the parameter [`execution_param`] picks is decoded, so a token or gate
+/// UUID never yields a shard.
+pub(crate) fn execution_id_in_path(
+    method: &axum::http::Method,
+    path: &str,
+) -> Option<autumn_harvest::types::ExecutionId> {
+    static MATCHERS: std::sync::OnceLock<RouteMatchers<Option<String>>> =
+        std::sync::OnceLock::new();
+    let matchers = MATCHERS.get_or_init(|| {
+        build_route_matchers(
+            "CLASSIFIED_ROUTES",
+            CLASSIFIED_ROUTES
+                .iter()
+                .map(|(template, _)| (*template, execution_param(template))),
+        )
+    });
+    let matched = match_route(matchers, method, path)?;
+    let param = matched.value.as_deref()?;
+    let raw = matched.params.get(param)?;
+    let uuid = uuid::Uuid::parse_str(raw).ok()?;
+    Some(autumn_harvest::types::ExecutionId::from_uuid(uuid))
 }
 
 /// A `403 Forbidden` for a read-only principal that attempted a mutation
@@ -55608,6 +55728,61 @@ mod tests {
         assert!(matchers.contains_key(&axum::http::Method::GET));
         assert!(matchers.contains_key(&axum::http::Method::POST));
         assert!(matchers.contains_key(&axum::http::Method::DELETE));
+    }
+
+    #[test]
+    fn requires_admin_scope_matches_only_token_management() {
+        // Issue #1803.
+        let id = "0b7e6a52-4a3c-4f62-9d55-1f6a1c0a7e11";
+        assert!(requires_admin_scope(
+            &axum::http::Method::POST,
+            "/admin/tokens"
+        ));
+        assert!(requires_admin_scope(
+            &axum::http::Method::DELETE,
+            &format!("/admin/tokens/{id}")
+        ));
+        assert!(!requires_admin_scope(
+            &axum::http::Method::GET,
+            "/admin/tokens"
+        ));
+        assert!(!requires_admin_scope(
+            &axum::http::Method::POST,
+            "/admin/tokens/"
+        ));
+        assert!(!requires_admin_scope(
+            &axum::http::Method::POST,
+            "/workflows/x/cancel"
+        ));
+    }
+
+    #[test]
+    fn execution_id_in_path_decodes_only_execution_params() {
+        use autumn_harvest::types::{ExecutionId, ShardId};
+        // Issue #1803: only execution-id positions yield a shard.
+        let exec = ExecutionId::new_for_shard(ShardId::new(7));
+        for path in [
+            format!("/workflows/{exec}"),
+            format!("/workflows/{exec}/cancel"),
+            format!("/executions/{exec}/events/stream"),
+            format!("/dags/nightly/runs/{exec}"),
+        ] {
+            let method = if path.ends_with("/cancel") {
+                axum::http::Method::POST
+            } else {
+                axum::http::Method::GET
+            };
+            assert_eq!(execution_id_in_path(&method, &path), Some(exec), "{path}");
+        }
+        for (method, path) in [
+            (axum::http::Method::DELETE, format!("/admin/tokens/{exec}")),
+            (axum::http::Method::DELETE, format!("/admin/gates/{exec}")),
+            (axum::http::Method::POST, format!("/workflows/{exec}/start")),
+            (axum::http::Method::GET, "/workflows/not-a-uuid".to_string()),
+            (axum::http::Method::GET, "/workflows".to_string()),
+        ] {
+            assert_eq!(execution_id_in_path(&method, &path), None, "{path}");
+        }
     }
 
     #[test]

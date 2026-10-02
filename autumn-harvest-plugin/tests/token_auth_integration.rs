@@ -497,14 +497,13 @@ async fn token_authed_mutation_audit_actor_is_token_id() {
     scrub(&mut conn).await;
     let app = build_app_boundary(&pool);
 
-    // Mint a second token WITH the mutate scope (creating a token is itself an
-    // audited mutation — but we assert on a revoke below to get a clean id).
-    let secret = mint(&app, "actor-test", "mutate", None).await;
+    // Mint a token WITH the admin scope. Only admin may revoke (issue #1803).
+    let secret = mint(&app, "actor-test", "admin", None).await;
     let (_, list) = send(&app, "GET", "/admin/tokens", None, None, true, None).await;
     let id = list[0]["id"].as_str().unwrap().to_string();
 
     // Clear the mint audit rows for a clean assertion, but KEEP the api token
-    // rows — the mutate token (`secret`) authenticates the revoke below, so the
+    // rows — the admin token (`secret`) authenticates the revoke below, so the
     // two-table `scrub` (which also wipes `harvest_api_tokens`) would delete the
     // very token we authenticate with and 401 before the actor assertion runs.
     let _ = diesel::sql_query("DELETE FROM harvest_audit_log")
@@ -525,7 +524,7 @@ async fn token_authed_mutation_audit_actor_is_token_id() {
         .unwrap()
         .to_string();
 
-    // Revoke the throwaway, authenticating with the mutate token, and try to
+    // Revoke the throwaway, authenticating with the admin token, and try to
     // spoof a different actor via the header — the server must ignore it.
     let (status, _) = send(
         &app,
@@ -539,7 +538,7 @@ async fn token_authed_mutation_audit_actor_is_token_id() {
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    // The revoke audit row's actor is token:{id-of-the-mutate-token}.
+    // The revoke audit row's actor is token:{id-of-the-admin-token}.
     #[derive(diesel::QueryableByName)]
     struct A {
         #[diesel(sql_type = diesel::sql_types::Text)]
@@ -714,7 +713,7 @@ async fn bootstrap_seeded_token_authenticates_identically_to_route_minted() {
     );
 
     // ── Part B: a bootstrap-seeded row authenticates + audits identically ─────
-    // Seed a `mutate` token EXACTLY as `harvest token bootstrap` does: mint the
+    // Seed an `admin` token EXACTLY as `harvest token bootstrap` does: mint the
     // secret and compute the hash via the shared helpers, then INSERT the row
     // directly (as the operator runs the printed SQL). The SQL stores ONLY the
     // hash — never the secret.
@@ -733,7 +732,7 @@ async fn bootstrap_seeded_token_authenticates_identically_to_route_minted() {
     }
     let seeded: IdRow = diesel::sql_query(
         "INSERT INTO harvest_api_tokens (name, token_hash, scope, created_by) \
-         VALUES ('bootstrap-seed', $1, 'mutate', 'bootstrap') RETURNING id::text AS id",
+         VALUES ('bootstrap-seed', $1, 'admin', 'bootstrap') RETURNING id::text AS id",
     )
     .bind::<diesel::sql_types::Text, _>(&seed_hash)
     .get_result(&mut conn)
@@ -742,7 +741,7 @@ async fn bootstrap_seeded_token_authenticates_identically_to_route_minted() {
     let seed_id = seeded.id;
 
     // B1: parity with `mutate_token_reaches_admin_route_standalone` — the seeded
-    // mutate token satisfies `require_admin` on the standalone (no-boundary) app.
+    // admin token satisfies `require_admin` on the standalone (no-boundary) app.
     let standalone = build_app_standalone(&pool);
     let (authed, _) = send(
         &standalone,
@@ -757,12 +756,12 @@ async fn bootstrap_seeded_token_authenticates_identically_to_route_minted() {
     assert_ne!(
         authed,
         StatusCode::UNAUTHORIZED,
-        "bootstrap-seeded mutate token must pass require_admin standalone"
+        "bootstrap-seeded admin token must pass require_admin standalone"
     );
     assert_ne!(
         authed,
         StatusCode::FORBIDDEN,
-        "bootstrap-seeded mutate token is not read-scoped"
+        "bootstrap-seeded admin token is not read-scoped"
     );
 
     // B2: parity with `token_authed_mutation_audit_actor_is_token_id` — a

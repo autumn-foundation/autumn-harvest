@@ -225,13 +225,29 @@ The layer inspects the `Authorization: Bearer` value:
   through untouched, so `api_with_auth` still runs. Token auth composes with the
   embedder's own middleware rather than short-circuiting it.
 
-### Scopes (read / mutate)
+### Scopes (read / mutate / admin)
 
-A token carries `read` or `mutate`, derived from the same
-`audit::CLASSIFIED_ROUTES` taxonomy the read-only operator tier uses (no second
-route taxonomy). The gate **fails closed**: an unclassified path resolves to
-`Mutating` and is denied to a `read` token. A `read` token is rejected `403` on
-every mutating route and admitted on every read-only route.
+A token carries `read`, `mutate` or `admin`. Each scope includes the one before
+it.
+
+| Scope | Reaches | Denied (`403`) |
+|---|---|---|
+| `read` | Every `ReadOnly` and `PublicSafe` route. | Every mutating route. |
+| `mutate` | Every route except the admin-only ones. | `POST /admin/tokens`, `DELETE /admin/tokens/{id}`. |
+| `admin` | Every route. | Nothing. |
+
+The `read` gate uses the same `audit::CLASSIFIED_ROUTES` taxonomy as the
+read-only operator tier. It **fails closed**: an unclassified path resolves to
+`Mutating`, so a `read` token gets `403`.
+
+The admin-only routes are `audit::ADMIN_SCOPE_ROUTES` (issue #1803). Token
+management is there because a token that mints tokens can copy itself. No
+management route publishes a workflow module today. A future publish route
+runs code, so it goes in the same list. A guard test fails if a mutating
+`/admin/tokens` or `/modules` route is missing from it.
+
+Every scope deny writes an `authz.deny` audit row. See
+[Deny audit](#deny-audit-issue-1803).
 
 ### Routes (admin-gated, audited)
 
@@ -252,8 +268,8 @@ an admin-gated mutation, so minting a token requires a previously-minted token.
 connection and issues no HTTP request. It prints a fresh secret **once** and the
 exact `INSERT INTO harvest_api_tokens (...)` statement (embedding only the hash,
 never the secret) for the operator — who already holds DB access, the trust
-anchor — to run out-of-band. It defaults `--scope` to `mutate` so the seed token
-can mint the rest through the API. A bootstrap-seeded token authenticates
+anchor — to run out-of-band. It defaults `--scope` to `admin` so the seed token
+can mint the rest through the API. Only an `admin` token can mint (issue #1803). A bootstrap-seeded token authenticates
 byte-for-byte identically to a route-minted one (shared core hashing helper).
 
 ### Rotation, expiry, and actor attribution
@@ -272,14 +288,96 @@ byte-for-byte identically to a route-minted one (shared core hashing helper).
   `enable_api_tokens()` as the only auth, any `hvst_` bearer triggers one indexed
   lookup before authentication (inherent to any bearer scheme). Front the API
   with a per-source rate-limiting proxy to bound unauthenticated lookup floods.
-- **A compromised `mutate` token can mint replacement tokens** (the 2-level
-  read/mutate model has no scope that grants mutation but withholds token
-  management — fine-grained RBAC is out of scope). Revoking a leaked `mutate`
-  token is insufficient on its own: also audit the `created_by` provenance and
-  revoke the entire lineage of tokens it minted.
+- **A compromised `admin` token can mint replacement tokens.** Give `admin` to
+  as few callers as you can. Give CI and services `mutate` or `read`: neither
+  can mint (issue #1803). When an `admin` token leaks, revoking it is not
+  enough. Also audit the `created_by` provenance and revoke every token it
+  minted.
+- **Upgrading from the two-scope model.** A `mutate` token that minted or
+  revoked tokens before issue #1803 now gets `403` on those routes. Mint an
+  `admin` token for that caller, through the embedder boundary or
+  `harvest token bootstrap`.
 
 CLI: `harvest token create | list | revoke` (plus a client-side `rotate`
 convenience) and the offline `harvest token bootstrap`.
+
+---
+
+## Authorizer hook (issue #1803)
+
+The built-in gates decide by verb only. The authorizer hook adds a policy by
+principal, route class, tenant and shard. It is off by default. With no hook,
+the router is byte-for-byte unchanged.
+
+```rust
+use autumn_harvest::types::ShardId;
+use autumn_harvest_plugin::authz::{AuthzDecision, AuthzPrincipal, AuthzRequest};
+
+let plugin = HarvestPlugin::new(/* … */)
+    .enable_api_tokens()
+    .with_authorizer(|req: &AuthzRequest<'_>| match req.principal {
+        AuthzPrincipal::Token { .. } if req.shard == Some(ShardId::new(2)) => {
+            AuthzDecision::deny("tokens may not reach shard 2")
+        }
+        _ => AuthzDecision::Allow,
+    });
+```
+
+A standalone mount uses `StandaloneAdminAuth::with_authorizer`. A policy that
+needs I/O implements `HarvestAuthorizer` directly and returns a boxed future.
+
+### What the hook sees
+
+| Field | Source |
+|---|---|
+| `principal` | `Token { id, scope }` for a verified `hvst_` token. `Embedder` for every other caller; read its claims from `extensions`. |
+| `route_class` | `CLASSIFIED_ROUTES`. An unclassified path is `Mutating`. |
+| `tenant_key` | The `x-harvest-tenant` header, trimmed. At most 128 bytes, or the request gets `400`. |
+| `shard` | An execution id in the path, a `shard_id` query parameter, or the `shard_id` / `residency_key` of a `POST /workflows/{name}/start` body. |
+| `method`, `path`, `extensions` | The request. |
+
+Harvest calls the hook once for each distinct shard a request names. With no
+shard, it calls it once with `shard: None`. `None` means the request names no
+single shard, so a list route reads every shard. A by-id route
+(`/workflows/by-id/...`) also gives `None`.
+
+### Rules
+
+- **The hook can only deny.** It runs after the token layer and the read-only
+  layer, so it cannot grant what a token scope withholds.
+- **A deny is a generic `403`.** The body is
+  `{"error":"forbidden by authorization policy"}`. The reason goes only to the
+  audit row, so the policy is not an oracle.
+- **The tenant key is caller-declared.** Harvest does not bind it to stored
+  executions. The hook decides if the principal may act for that tenant. To
+  confine a caller to its own executions, also check the target in `path`.
+- **The shard is the entry shard of an execution id.** A retired shard resolves
+  to its successor. An execution moved by a shard rebalance is resolved later,
+  inside the handler.
+- **The hook does not cover the app-level MCP tool routes or webhook routes.**
+  They live outside the management router.
+- **A panic in the hook aborts the request.** It never lets it through.
+
+### Deny audit (issue #1803)
+
+Every deny writes one `harvest_audit_log` row on the control shard:
+
+| Column | Value |
+|---|---|
+| `operation` | `authz.deny` |
+| `target_type` | `route` |
+| `status` | `failed`, so the SIEM export marks it `ERROR` |
+| `actor` | `token:{id}`, or the embedder actor |
+| `route_or_command` | `METHOD path`, with the path cut to 256 bytes |
+| `shard_id` | The denied shard, if any |
+| `error_summary` | The scope, or `tenant=…, shard=…` and the hook's reason |
+
+The [audit export](./audit-export.md) ships these rows like any other.
+
+A deny row costs one insert. A token scope deny comes only from a valid token,
+so its author is known. The hook can also deny a caller with no credential.
+For such a request, return `Allow` and let `require_admin` answer `401` with
+no audit write. Keep the rate-limiting proxy advice above.
 
 ---
 
@@ -290,13 +388,13 @@ that pins the new workflow (and, by shard inheritance, its whole descendant
 tree) to a specific database. See [`sharding.md`](./sharding.md#explicit-shard-placement-and-data-residency-issue-697)
 for the mechanism. Security-relevant properties:
 
-- **`shard_id` is not a capability.** Any caller authorised to start a workflow
-  can pin it to any *placeable* shard. Placement selects a database within the
-  deployment; it does not grant access to data already there, and there is no
-  per-shard authorisation tier. If a caller must be confined to one region,
-  enforce that in your own auth layer before delegating to the start route —
+- **`shard_id` is not a capability by default.** Any caller authorised to start
+  a workflow can pin it to any *placeable* shard. Placement selects a database
+  within the deployment; it does not grant access to data already there.
   Harvest validates that a requested shard exists and accepts writes, not that
-  *this* caller is entitled to it.
+  *this* caller is entitled to it. To confine a caller to one region, install
+  an [authorizer hook](#authorizer-hook-issue-1803). It sees the shard a start
+  body pins, including one a `residency_key` resolves to.
 - **Rejections do not enumerate the deployment.** A refused placement names only
   what the caller asked for (`shard N is not a placeable shard for this
   deployment`, `residency key 'K' is not declared for this deployment`). The
