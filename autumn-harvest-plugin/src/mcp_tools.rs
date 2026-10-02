@@ -1567,7 +1567,10 @@ mod tests {
         let descriptors = collect_descriptors(&[wf("plain", false), wf("exposed", true)], &[], &[]);
         assert_eq!(descriptors.len(), 1);
         assert_eq!(descriptors[0].name, "exposed");
-        assert!(descriptors[0].updates.is_empty());
+        assert_eq!(
+            descriptors[0].updates,
+            [] as [crate::mcp_tools::McpUpdateDescriptor; 0]
+        );
     }
 
     /// Code-review regression test (issue #597, PR #908): a debounced or
@@ -1924,7 +1927,7 @@ mod tests {
         assert_eq!(start.kind, ToolKind::Start);
         assert_eq!(start.method, "POST");
         assert_eq!(start.path, "/api/harvest/mcp/workflows/order_flow/start");
-        assert!(start.path_params.is_empty());
+        assert_eq!(start.path_params, [] as [&str; 0]);
         assert_eq!(
             start.body_component.as_deref(),
             Some("HarvestMcpInput_order_flow")
