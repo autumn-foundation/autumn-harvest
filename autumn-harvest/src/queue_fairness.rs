@@ -157,7 +157,7 @@ mod tests {
     #[test]
     fn empty_queues_returns_empty() {
         let result = effective_queue_weights(&[], &HashMap::new());
-        assert!(result.is_empty());
+        assert_eq!(result, [] as [(&str, u32); 0]);
     }
 
     // -----------------------------------------------------------------------
@@ -261,7 +261,7 @@ mod tests {
         let pairs: Vec<(&str, u32)> = vec![];
         let mut rng = StdRng::seed_from_u64(0);
         let order = weighted_queue_order(&pairs, &mut rng);
-        assert!(order.is_empty());
+        assert_eq!(order, [] as [&str; 0]);
     }
 
     /// No-starvation property: the low-weight queue must appear somewhere in the
