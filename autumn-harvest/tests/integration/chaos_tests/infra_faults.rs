@@ -38,8 +38,8 @@ use testcontainers::{ContainerAsync, GenericImage};
 use testcontainers_modules::postgres::Postgres;
 
 use super::{
-    CountRow, DB_BODY_SERIAL, assert_converged, base_params, chaos_noop_info, connect, exec_state,
-    terminal_event_count,
+    CountRow, DB_BODY_SERIAL, assert_converged, base_params, chaos_noop_info, connect, event_count,
+    exec_state, terminal_event_count,
 };
 
 /// The worker heartbeat interval. The stale threshold, the "lease TTL", is
@@ -95,25 +95,31 @@ const CHILD_WORKER_ID: &str = "infra-child-worker";
 /// The partition test sets this flag to release the held first attempts.
 static RELEASE_FIRST_ATTEMPTS: AtomicBool = AtomicBool::new(false);
 
+/// The partition test sets this flag to release the held second attempts.
+static RELEASE_SECOND_ATTEMPTS: AtomicBool = AtomicBool::new(false);
+
+/// The number of first attempts that entered the hold.
+static HELD_FIRST_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+
 /// The number of held first attempts that returned after the release.
 static LATE_RETURNS: AtomicUsize = AtomicUsize::new(0);
 
 // Fully qualified: the blanket `RunQueryDsl` puts a `load` method on every
 // type, and that method wins method resolution.
-fn first_attempts_released() -> bool {
-    AtomicBool::load(&RELEASE_FIRST_ATTEMPTS, Ordering::SeqCst)
+fn released(flag: &AtomicBool) -> bool {
+    AtomicBool::load(flag, Ordering::SeqCst)
 }
 
-fn late_returns() -> usize {
-    AtomicUsize::load(&LATE_RETURNS, Ordering::SeqCst)
+fn count(counter: &AtomicUsize) -> usize {
+    AtomicUsize::load(counter, Ordering::SeqCst)
 }
 
 // ── Workload ────────────────────────────────────────────────────────────────
 
 /// Sleeps for `input.sleep_ms`. In the child worker process it sleeps for
 /// ten minutes, so the parent can kill the child while the activity runs.
-/// With `input.hold_first_attempt`, attempt 1 waits for
-/// [`RELEASE_FIRST_ATTEMPTS`].
+/// With `input.hold_attempts`, attempt 1 waits for [`RELEASE_FIRST_ATTEMPTS`],
+/// and attempt 2 waits for [`RELEASE_SECOND_ATTEMPTS`].
 ///
 /// A lost result write recovers only through `start_to_close`. The retry
 /// policy must then start a new attempt, but bug #1870 fails the workflow.
@@ -129,13 +135,22 @@ async fn infra_step(
     if std::env::var_os(CHILD_DB_URL_VAR).is_some() {
         tokio::time::sleep(Duration::from_secs(600)).await;
     }
-    if input["hold_first_attempt"].as_bool() == Some(true) && ctx.info().attempt == 1 {
+    let attempt = ctx.info().attempt;
+    if input["hold_attempts"].as_bool() == Some(true) && attempt <= 2 {
+        let flag = if attempt == 1 {
+            &RELEASE_FIRST_ATTEMPTS
+        } else {
+            &RELEASE_SECOND_ATTEMPTS
+        };
+        if attempt == 1 {
+            HELD_FIRST_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+        }
         // The bound stops a held attempt that a failed test never releases.
         let deadline = Instant::now() + CONVERGE_DEADLINE;
-        while !first_attempts_released() && Instant::now() < deadline {
+        while !released(flag) && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        if first_attempts_released() {
+        if attempt == 1 && released(flag) {
             LATE_RETURNS.fetch_add(1, Ordering::SeqCst);
         }
     }
@@ -800,6 +815,19 @@ async fn activities_claimed_before_restart(conn: &mut AsyncPgConnection) -> Vec<
         .collect()
 }
 
+/// Wait until `counter` reaches `target`.
+async fn wait_for_count(counter: &AtomicUsize, target: usize, what: &str) {
+    let deadline = Instant::now() + RENDEZVOUS_DEADLINE;
+    while count(counter) < target {
+        assert!(
+            Instant::now() < deadline,
+            "only {} of {target} {what}",
+            count(counter)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// Count tasks of `execs` that the orphan reclaimer requeued at least once.
 async fn reclaimed_tasks(admin_url: &str, execs: &[ExecutionId]) -> i64 {
     let ids: Vec<uuid::Uuid> = execs.iter().map(ExecutionId::as_uuid).collect();
@@ -964,23 +992,26 @@ async fn toxiproxy_latency_between_worker_and_db() {
 }
 
 /// Blackhole worker A for longer than the lease TTL while it holds three
-/// activities. Worker B, on a clean path, reclaims and finishes the work.
+/// activities. Worker B, on a clean path, reclaims the tasks.
 ///
-/// The first attempts on A wait until the partition heals. Then they return,
-/// and A writes three stale results. The claim fence must reject them, so
-/// each workflow keeps exactly one activity result.
+/// Attempt 1 on A and attempt 2 on B both wait. After the heal, the test
+/// releases attempt 1, so A writes three stale results. No result exists yet,
+/// so only the claim fence can reject them. Then the test releases attempt 2,
+/// and B finishes the work.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn toxiproxy_partition_longer_than_lease_ttl() {
     const HELD: usize = 3;
 
     RELEASE_FIRST_ATTEMPTS.store(false, Ordering::SeqCst);
+    RELEASE_SECOND_ATTEMPTS.store(false, Ordering::SeqCst);
+    HELD_FIRST_ATTEMPTS.store(0, Ordering::SeqCst);
     LATE_RETURNS.store(0, Ordering::SeqCst);
     let db = FaultDb::start().await;
     // Postgres keeps the open transaction of a partitioned worker. That
     // transaction keeps its row locks, and orphan reclaim stalls behind them
     // (bug #1876). This server timeout ends such a session.
     db.limit_idle_in_transaction(5).await;
-    let input = serde_json::json!({ "sleep_ms": 0, "hold_first_attempt": true });
+    let input = serde_json::json!({ "sleep_ms": 0, "hold_attempts": true });
     let execs = start_workload(
         &db.admin_url,
         "infra_activity_wf",
@@ -990,7 +1021,14 @@ async fn toxiproxy_partition_longer_than_lease_ttl() {
     )
     .await;
     let a = RunningWorker::spawn("infra-partition-a", &db.worker_url);
-    wait_for_running_activities(&db.admin_url, Some("infra-partition-a"), HELD).await;
+    // A claimed task can still be on its way to the handler. Wait until every
+    // handler on A is inside the hold, so each one returns after the heal.
+    wait_for_count(
+        &HELD_FIRST_ATTEMPTS,
+        HELD,
+        "first attempts held on worker A",
+    )
+    .await;
 
     let blackhole = serde_json::json!({ "timeout": 0 });
     db.add_toxic("bh_up", "timeout", "upstream", blackhole.clone())
@@ -999,35 +1037,43 @@ async fn toxiproxy_partition_longer_than_lease_ttl() {
         .await;
     tokio::time::sleep(PAST_LEASE_TTL).await;
 
-    // Worker B uses the admin proxy, which has no toxic.
+    // Worker B uses the admin proxy, which has no toxic. Wait until B holds
+    // every task, so each claim of A is stale.
     let _b = RunningWorker::spawn("infra-partition-b", &db.admin_url);
-    let before = "partition, before heal";
-    converge(&db.admin_url, &execs, true, Accept::Completed, before).await;
+    wait_for_running_activities(&db.admin_url, Some("infra-partition-b"), HELD).await;
     let reclaimed = reclaimed_tasks(&db.admin_url, &execs).await;
-    assert!(
-        reclaimed >= 1,
-        "worker B must reclaim at least one task of the partitioned worker"
+    assert_eq!(
+        usize::try_from(reclaimed).ok(),
+        Some(HELD),
+        "worker B must reclaim every task of the partitioned worker"
     );
 
     // Remove the partition, then release the held attempts on A.
     db.remove_toxic("bh_up").await;
     db.remove_toxic("bh_down").await;
     RELEASE_FIRST_ATTEMPTS.store(true, Ordering::SeqCst);
-    let deadline = Instant::now() + RENDEZVOUS_DEADLINE;
-    while late_returns() < HELD {
-        assert!(
-            Instant::now() < deadline,
-            "only {} of {HELD} held attempts on worker A returned",
-            late_returns()
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    wait_for_count(
+        &LATE_RETURNS,
+        HELD,
+        "held attempts on worker A that returned",
+    )
+    .await;
     // Give worker A time to make its stale result writes before it stops.
     tokio::time::sleep(PAST_LEASE_TTL).await;
     drop(a);
 
-    let after = "partition, after heal";
-    converge(&db.admin_url, &execs, true, Accept::Completed, after).await;
+    // The fence must have rejected every stale write: no result exists yet.
+    let mut conn = connect(&db.admin_url).await;
+    for exec_id in &execs {
+        assert_eq!(
+            event_count(&mut conn, *exec_id, "ActivityCompleted").await,
+            0,
+            "the claim fence must reject the stale result of worker A for {exec_id:?}"
+        );
+    }
+
+    RELEASE_SECOND_ATTEMPTS.store(true, Ordering::SeqCst);
+    converge(&db.admin_url, &execs, true, Accept::Completed, "partition").await;
 }
 
 // ── Scenario 4: SIGKILL of a worker process ─────────────────────────────────

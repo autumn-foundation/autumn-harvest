@@ -11,9 +11,9 @@ workers against a Postgres 16 container and a toxiproxy container:
   so the worker never gets the acknowledgement.
 - A crash restart of Postgres, and a `docker pause` longer than the lease TTL.
 - toxiproxy latency, and a toxiproxy partition longer than the lease TTL. In
-  the partition test, a second worker on a clean path finishes the work. The
-  held attempts on the cut-off worker then write stale results, which the
-  claim fence must reject.
+  the partition test, a second worker on a clean path reclaims the work. The
+  held attempts on the cut-off worker then write stale results before any
+  result exists, so only the claim fence can reject them.
 - SIGKILL of a worker that runs as a child process.
 
 Each test checks the sweep oracle and asserts proof that its fault landed.

@@ -305,7 +305,7 @@ The latency test is the exception, see the known bugs below.
 | Restart | `postgres_crash_restart_mid_workload` | stop Postgres with no grace period, then start it | an activity runs at the crash |
 | Pause | `postgres_pause_longer_than_lease_ttl` | `docker pause` for 4 s, two workers | activities run at the pause |
 | Latency | `toxiproxy_latency_between_worker_and_db` | 100 ms ± 50 ms in each direction | a probe round trip is slow |
-| Partition | `toxiproxy_partition_longer_than_lease_ttl` | blackhole worker A for at least 4 s, until worker B finishes the work | a task is reclaimed; the three held attempts on A return after the heal |
+| Partition | `toxiproxy_partition_longer_than_lease_ttl` | blackhole worker A for at least 4 s, until worker B holds every task | B reclaims all three tasks; the stale results of A are rejected |
 | SIGKILL | `sigkill_child_worker_mid_activity` | SIGKILL of a worker that runs as a child process | the child dies by signal 9; its task is reclaimed |
 
 **The COMMIT rendezvous.** A test-only `DEFERRABLE INITIALLY DEFERRED`
@@ -317,11 +317,12 @@ replies, then releases the lock. The COMMIT lands, and the test terminates the
 idle backend. Either way the kill lands after COMMIT is sent and before the
 worker reads a reply. No production code changes.
 
-**The partition test.** Attempt 1 of each activity waits on worker A until
-the partition heals. Worker B reclaims the tasks and finishes the workflows
-with attempt 2. Then the test releases the held attempts, and A writes three
-stale results. The claim fence must reject them, so each workflow keeps
-exactly one activity result.
+**The partition test.** Attempt 1 of each activity waits on worker A. Worker
+B reclaims the tasks, and its attempt 2 waits too. After the heal, the test
+releases attempt 1, and A writes three stale results. No result exists yet, so
+only the claim fence can reject them, and the test asserts that no
+`ActivityCompleted` exists. Then the test releases attempt 2, and B finishes
+the workflows. With the fence disabled, the test fails.
 
 **The oracle.** Every test checks `assert_converged`, the oracle of the
 convergence sweep. It requires every workflow `COMPLETED`, exactly one terminal
