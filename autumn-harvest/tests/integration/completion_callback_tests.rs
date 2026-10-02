@@ -48,7 +48,7 @@ use autumn_harvest::completion_callback::{
     fire_due_completion_deliveries, list_deliveries_for_execution, redrive_delivery,
 };
 use autumn_harvest::completion_trigger::{TerminalState, evaluate_triggers_for_execution};
-use autumn_harvest::policy::RetryPolicy;
+use autumn_harvest::policy::{JitterPolicy, RetryPolicy};
 use autumn_harvest::shard::ShardedDbPool;
 use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::DbPool;
@@ -721,7 +721,7 @@ async fn scanner_schedules_backoff_from_attempt_completion_not_claim_time() {
     });
     install_config(
         deliverer.clone(),
-        RetryPolicy::exponential(5, Duration::from_millis(50)),
+        RetryPolicy::exponential(5, Duration::from_millis(50)).with_jitter(JitterPolicy::None),
     );
 
     let exec_id = ExecutionId::new();

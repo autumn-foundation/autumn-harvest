@@ -48,7 +48,7 @@ use autumn_harvest::schema::{
 use autumn_harvest::telemetry::{MetricsRecorder, TelemetryConfig};
 use autumn_harvest::types::ExecutionId;
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
-use autumn_harvest::{RetryPolicy, WorkflowContext, store};
+use autumn_harvest::{JitterPolicy, RetryPolicy, WorkflowContext, store};
 
 use chrono::Utc;
 use diesel::prelude::*;
@@ -743,7 +743,8 @@ async fn workflow_handler_panic_is_re_dispatched_then_terminal_within_budget() {
     // (b/c) Observe the non-terminal re-dispatch: between the first and second
     // panic the workflow task is re-pended PENDING (state stays RUNNING, no
     // event appended, crash_strikes stays 0) with a future scheduled_at rather
-    // than wedged in RUNNING. The ~1s backoff window makes this reliable.
+    // than wedged in RUNNING. The 0.5s to 1s backoff window makes this
+    // reliable (Equal jitter, issue #1792).
     let observer_url = url.clone();
     let observer = tokio::spawn(async move {
         let mut saw_repended_pending = false;
@@ -1161,7 +1162,7 @@ async fn backing_off_activity_task_error_column_carries_the_panic_message() {
             "panic_activity",
             panic_activity,
             false,
-            Some(RetryPolicy::fixed(3, Duration::from_secs(3))),
+            Some(RetryPolicy::fixed(3, Duration::from_secs(3)).with_jitter(JitterPolicy::None)),
         )],
         Arc::clone(&metrics),
     );

@@ -52,6 +52,13 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<DagAttrs> {
             Ok(())
         } else if meta.path.is_ident("jitter") {
             let value: LitStr = meta.value()?.parse()?;
+            // Zero is valid here: `jitter = "0s"` opts out (issue #1792).
+            if crate::attr_util::task_duration_secs(&value.value()).is_none() {
+                return Err(syn::Error::new_spanned(
+                    &value,
+                    "invalid jitter duration; expected e.g. \"0s\", \"30s\", \"5m\"",
+                ));
+            }
             result.jitter = Some(value.value());
             Ok(())
         } else if meta.path.is_ident("owner") {
@@ -144,15 +151,23 @@ pub fn dag_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .as_deref()
         .map_or_else(|| quote! { None }, |queue| quote! { Some(#queue) });
 
-    let jitter_expr = attrs.jitter.as_deref().map_or_else(
-        || quote! { ::std::time::Duration::ZERO },
-        |s| {
-            quote! {
-                ::autumn_harvest::task_duration(#s)
-                    .expect(concat!("invalid jitter duration string: ", #s))
-            }
+    // A scheduled DAG with no `jitter` gets the cron default (issue #1792).
+    // An explicit zero, such as `"0s"`, opts out.
+    let jitter_expr = match (attrs.jitter.as_deref(), attrs.schedule.as_deref()) {
+        (Some(s), _) if crate::attr_util::is_zero_task_duration(s) => {
+            quote! { ::std::time::Duration::ZERO }
+        }
+        (Some(s), _) => quote! {
+            ::autumn_harvest::task_duration(#s)
+                .expect(concat!("invalid jitter duration string: ", #s))
         },
-    );
+        (None, Some(expr)) => quote! {
+            ::autumn_harvest::policy::default_schedule_jitter(
+                &::autumn_harvest::Schedule::Cron(#expr.to_string()),
+            )
+        },
+        (None, None) => quote! { ::std::time::Duration::ZERO },
+    };
 
     // Emit execution_timeout/sla as Option<Duration> (issue #743). Already
     // validated for parseability in `parse_attrs`, so `task_duration` here
