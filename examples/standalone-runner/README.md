@@ -9,7 +9,8 @@ This example shows the out-of-the-box non-`HarvestPlugin` runner path. It does n
 - It applies `[harvest.startup] orphaned_workflows` from `autumn.toml`,
   `autumn-{profile}.toml` or `AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS`.
 - `with_ambient_profile()` makes it read the deployment profile from `AUTUMN_ENV` or
-  `AUTUMN_PROFILE`. Without it, the profile is `unknown` and the admin API fails closed.
+  `AUTUMN_PROFILE`. Without it, the profile is `unknown`. The admin API and every mutating
+  route then fail closed (issue #1802).
   Declare a credential with `with_admin_auth(StandaloneAdminAuth::new().with_api_tokens())`.
 - It loads the persisted admission gates before the worker starts.
 - It installs the storage pool and the API runtime, in that order.

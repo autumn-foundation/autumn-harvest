@@ -219,8 +219,10 @@ under any path. It holds these routes:
 The admin guard is on selected high-impact routes only, for example
 `/workflows/{id}/cancel` and most `/admin` routes. Many routes have no
 built-in guard, for example a workflow start, a signal and some `/admin`
-schedule routes. Put your own auth layer around the router, as on the plugin
-path.
+schedule routes. Outside the `dev` profile, the mutation gate refuses an
+anonymous call to every mutating route (issue #1802). Read routes with no
+admin guard stay open. Put your own auth layer around the router, as on the
+plugin path.
 
 The layer order sets which layer sees a request first. A request passes
 through these layers, from the outside in:
@@ -228,9 +230,10 @@ through these layers, from the outside in:
 1. Your auth layer.
 2. The scoped-token layer, if you call `StandaloneAdminAuth::with_api_tokens()`.
 3. The read-only-role layer, if you call `StandaloneAdminAuth::with_read_only_role()`.
-4. The admin guard on each guarded route.
+4. The mutation gate on each mutating route (issue #1802).
+5. The admin guard on each guarded route.
 
-`router()` applies layers 2 to 4. Apply layer 1 to the router that it returns.
+`router()` applies layers 2 to 5. Apply layer 1 to the router that it returns.
 
 ## What you own
 
@@ -272,7 +275,11 @@ Declare it with `with_deployment_profile("prod")`, or call
 `HarvestEmbedding::with_ambient_profile()` to read it from the environment.
 Under the `dev` profile with no declared boundary, the admin guard admits
 every caller that presents no session. So a caller needs no credential. The server logs a warning
-when this is the case. Use `dev` on a workstation only.
+when this is the case. Use `dev` on a workstation only. Under every other
+profile, a mutating route needs a credential. The
+`allow_unauthenticated_mutations()` opt-out reopens the mutating routes with
+no admin guard. See
+[Fail-closed mutations](security-posture.md#fail-closed-mutations-issue-1802).
 
 ### Scoped API tokens
 
@@ -375,13 +382,15 @@ has no effect. [`operator-role.md`](operator-role.md) describes the role.
 ### What preflight reports
 
 `harvest preflight` calls `GET /admin/preflight`. Its `admin_auth_boundary`
-check reads only the profile and the boundary declaration.
+check reads the profile, the boundary declaration and the
+`allow_unauthenticated_mutations()` opt-out.
 
 | Profile | `with_admin_auth_boundary()` | `admin_auth_boundary` check |
 |---|---|---|
 | `dev` | No | Pass, with `unauthenticated_access: true` |
 | `unknown` | No | Warn |
 | Any other | No | **Fail**, also when tokens are on |
+| Not `dev`, with `allow_unauthenticated_mutations()` | No | **Fail**, with `unauthenticated_mutations: true` |
 | Any profile | Yes | Pass |
 
 Tokens alone do not pass this check. The token layer admits a request with no

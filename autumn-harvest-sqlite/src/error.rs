@@ -47,6 +47,18 @@ pub enum SqliteError {
         state: String,
     },
 
+    /// A decision cycle failed the workflow **task**, not the run
+    /// (issue #1797). The handler waited too long on a future that is not a
+    /// Harvest future. Nothing was persisted and the run stays `RUNNING`, so
+    /// a later drive retries it.
+    #[error("workflow task for execution {execution_id} failed and can be retried: {details}")]
+    TaskFailed {
+        /// The execution whose task failed.
+        execution_id: ExecutionId,
+        /// Why the task failed.
+        details: String,
+    },
+
     /// A workflow emitted a [`WorkflowCommand`](autumn_harvest::WorkflowCommand)
     /// outside the single-writer backend's supported subset (child workflows,
     /// external signals/cancels, continue-as-new, local activities, …).
