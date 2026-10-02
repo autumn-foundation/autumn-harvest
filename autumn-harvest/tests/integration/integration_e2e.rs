@@ -8963,7 +8963,7 @@ async fn drain_accepted_sets_status_to_draining() {
         "drain_deadline_at must be set when a deadline is supplied"
     );
     assert_eq!(resp.worker_id, "w-drain-1");
-    assert!(resp.unavailable_shards.is_empty());
+    assert_eq!(resp.unavailable_shards, [] as [i32; 0]);
 }
 
 #[tokio::test]
