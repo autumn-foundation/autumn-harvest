@@ -1136,15 +1136,25 @@ pub fn unexported_index_drop_ddl_in(schema: &str) -> String {
     format!("DROP INDEX CONCURRENTLY IF EXISTS {schema}.harvest_audit_log_unexported_idx")
 }
 
-/// Advisory-lock key that serializes builds of the claim-scan index.
-pub const UNEXPORTED_INDEX_LOCK_KEY: i64 = 0x6175_6469_745f_6978;
+/// Advisory-lock class for builds of the claim-scan index.
+///
+/// The lock takes two keys: this class and [`UNEXPORTED_INDEX_LOCK_OBJECT_SQL`].
+pub const UNEXPORTED_INDEX_LOCK_CLASS: i32 = 0x6175_6469;
+
+/// SQL for the second lock key: the identity of the audit table.
+///
+/// Advisory locks are scoped to a database. Tenant schemas in one database each
+/// hold their own table and index, so the key names the table the session
+/// resolves. Only builders of the same table then serialize.
+pub const UNEXPORTED_INDEX_LOCK_OBJECT_SQL: &str =
+    "hashtext(to_regclass('harvest_audit_log')::oid::text)";
 
 /// What [`ensure_unexported_index`] found or did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnexportedIndexOutcome {
     /// The index exists and `pg_index.indisvalid` is true.
     Ready,
-    /// Another session holds [`UNEXPORTED_INDEX_LOCK_KEY`]. Nothing was built.
+    /// Another session holds the lock for this audit table. Nothing was built.
     /// The caller must try again later.
     LockBusy,
 }
@@ -1189,22 +1199,26 @@ pub async fn ensure_unexported_index(
     if unexported_index_valid(conn).await? == Some(true) {
         return Ok(UnexportedIndexOutcome::Ready);
     }
-    let locked: Vec<Flag> = diesel::sql_query("SELECT pg_try_advisory_lock($1) AS flag")
-        .bind::<diesel::sql_types::BigInt, _>(UNEXPORTED_INDEX_LOCK_KEY)
-        .load(conn)
-        .await
-        .map_err(crate::error::database_error)?;
+    let locked: Vec<Flag> = diesel::sql_query(format!(
+        "SELECT pg_try_advisory_lock($1, {UNEXPORTED_INDEX_LOCK_OBJECT_SQL}) AS flag"
+    ))
+    .bind::<diesel::sql_types::Integer, _>(UNEXPORTED_INDEX_LOCK_CLASS)
+    .load(conn)
+    .await
+    .map_err(crate::error::database_error)?;
     if !locked.into_iter().next().is_some_and(|row| row.flag) {
         return Ok(UnexportedIndexOutcome::LockBusy);
     }
     let built = build_unexported_index(conn).await;
     // The lock belongs to the session. A failed unlock leaves the lock on a
     // live session, so this error takes precedence over the build result.
-    diesel::sql_query("SELECT pg_advisory_unlock($1)")
-        .bind::<diesel::sql_types::BigInt, _>(UNEXPORTED_INDEX_LOCK_KEY)
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error)?;
+    diesel::sql_query(format!(
+        "SELECT pg_advisory_unlock($1, {UNEXPORTED_INDEX_LOCK_OBJECT_SQL})"
+    ))
+    .bind::<diesel::sql_types::Integer, _>(UNEXPORTED_INDEX_LOCK_CLASS)
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
     built?;
     // `CREATE INDEX CONCURRENTLY` can return without an error and still leave
     // an invalid index. Only the catalog proves the build.
@@ -1262,7 +1276,7 @@ async fn unexported_index_valid(
     Ok(rows.into_iter().next().map(|row| row.valid))
 }
 
-/// Build the index. The caller holds [`UNEXPORTED_INDEX_LOCK_KEY`].
+/// Build the index. The caller holds the advisory lock for this audit table.
 #[cfg(feature = "db")]
 async fn build_unexported_index(
     conn: &mut diesel_async::AsyncPgConnection,

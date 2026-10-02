@@ -5282,7 +5282,7 @@ async fn an_invalid_index_is_rebuilt() {
 async fn a_concurrent_builder_makes_ensure_report_lock_busy() {
     let (mut conn, url, _c) = make_conn_any().await;
     // A second session stands in for another exporter mid-build.
-    let key = autumn_harvest::audit_export::UNEXPORTED_INDEX_LOCK_KEY;
+    let key = table_lock_args();
     #[derive(diesel::QueryableByName)]
     struct Locked {
         #[diesel(sql_type = diesel::sql_types::Bool)]
@@ -5402,7 +5402,7 @@ async fn ensure_releases_the_build_lock() {
     let mut other = diesel_async::AsyncPgConnection::establish(&url)
         .await
         .expect("second session");
-    let key = autumn_harvest::audit_export::UNEXPORTED_INDEX_LOCK_KEY;
+    let key = table_lock_args();
     let got: Vec<Locked> = diesel::sql_query(format!("SELECT pg_try_advisory_lock({key}) AS got"))
         .load(&mut other)
         .await
@@ -5898,4 +5898,73 @@ async fn a_short_session_lock_timeout_does_not_break_the_build() {
     built.expect("ensure");
     assert_eq!(setting(&mut conn, "lock_timeout").await, "100ms");
     assert_eq!(unexported_idx_state(&mut conn).await, Some(true));
+}
+
+/// The arguments of the table-scoped advisory lock, as the exporter takes it.
+fn table_lock_args() -> String {
+    format!(
+        "{}, {}",
+        autumn_harvest::audit_export::UNEXPORTED_INDEX_LOCK_CLASS,
+        autumn_harvest::audit_export::UNEXPORTED_INDEX_LOCK_OBJECT_SQL
+    )
+}
+
+/// The lock is per audit table. A build that holds the lock for one tenant
+/// schema must not make a build in another tenant schema report lock-busy.
+#[tokio::test]
+async fn a_build_in_one_tenant_schema_does_not_block_another() {
+    let (mut conn, url, _c) = make_conn_any().await;
+    conn.batch_execute(&format!(
+        "CREATE SCHEMA tenant_a; SET search_path = tenant_a; {m} \
+         CREATE SCHEMA tenant_b; SET search_path = tenant_b; {m} RESET search_path;",
+        m = autumn_harvest::full_migrations_sql()
+    ))
+    .await
+    .expect("tenant schemas");
+    // Session A stands in for a long build on tenant_a.
+    let mut holder = diesel_async::AsyncPgConnection::establish(&url)
+        .await
+        .expect("second session");
+    holder
+        .batch_execute("SET search_path = tenant_a")
+        .await
+        .expect("search path");
+    #[derive(diesel::QueryableByName)]
+    struct Locked {
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        got: bool,
+    }
+    let key = table_lock_args();
+    let got: Vec<Locked> = diesel::sql_query(format!("SELECT pg_try_advisory_lock({key}) AS got"))
+        .load(&mut holder)
+        .await
+        .expect("lock");
+    assert!(got.into_iter().next().is_some_and(|row| row.got));
+    // Session B builds for tenant_b while tenant_a's lock is held.
+    conn.batch_execute("SET search_path = tenant_b")
+        .await
+        .expect("search path");
+    let outcome = autumn_harvest::audit_export::ensure_unexported_index(&mut conn)
+        .await
+        .expect("ensure");
+    assert_eq!(
+        outcome,
+        autumn_harvest::audit_export::UnexportedIndexOutcome::Ready
+    );
+    conn.batch_execute("RESET search_path")
+        .await
+        .expect("reset");
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let rows: Vec<Count> = diesel::sql_query(
+        "SELECT count(*) AS n FROM pg_indexes \
+         WHERE schemaname = 'tenant_b' AND indexname = 'harvest_audit_log_unexported_idx'",
+    )
+    .load(&mut conn)
+    .await
+    .expect("count");
+    assert_eq!(rows.into_iter().next().map(|r| r.n), Some(1));
 }
