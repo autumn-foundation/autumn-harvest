@@ -40,6 +40,7 @@
 //! that way, or before this fix, still fails on read.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -112,6 +113,47 @@ pub trait PayloadStore: Send + Sync + 'static {
 
     /// Delete the blob stored under `key`.
     fn delete(&self, key: &str) -> PayloadStoreFuture<'_, ()>;
+}
+
+/// The number of blob uploads that one counting offloader starts.
+///
+/// See [`PayloadOffloader::counting_uploads`].
+#[derive(Clone, Default)]
+pub(crate) struct UploadCount(Arc<AtomicUsize>);
+
+impl UploadCount {
+    /// Whether the offloader started at least one upload.
+    pub(crate) fn any(&self) -> bool {
+        self.0.load(Ordering::SeqCst) > 0
+    }
+}
+
+/// A store that counts each `put` before it passes it to the inner store.
+///
+/// A `put` counts when it starts. A `put` that fails can still leave a blob
+/// in the store, so it counts too.
+struct CountingStore {
+    inner: Arc<dyn PayloadStore>,
+    uploads: UploadCount,
+}
+
+impl PayloadStore for CountingStore {
+    fn store_id(&self) -> &str {
+        self.inner.store_id()
+    }
+
+    fn put(&self, bytes: &[u8]) -> PayloadStoreFuture<'_, String> {
+        self.uploads.0.fetch_add(1, Ordering::SeqCst);
+        self.inner.put(bytes)
+    }
+
+    fn get(&self, key: &str) -> PayloadStoreFuture<'_, Vec<u8>> {
+        self.inner.get(key)
+    }
+
+    fn delete(&self, key: &str) -> PayloadStoreFuture<'_, ()> {
+        self.inner.delete(key)
+    }
 }
 
 /// A reference to an offloaded blob, recorded per execution so the retention
@@ -221,10 +263,12 @@ impl PayloadOffloader {
                 continue;
             }
             let bytes = serde_json::to_vec(field)?;
-            let byte_len = bytes.len() as u64;
-            if !self.stores_as_blob(field, byte_len) {
+            // A fresh value that carries the discriminator is business data.
+            // Store it as a blob so no bare look-alike reaches the log.
+            if !is_offload_envelope(field) && bytes.len() as u64 <= self.threshold {
                 continue;
             }
+            let byte_len = bytes.len() as u64;
             let checksum = hex_sha256(&bytes);
             let blob_key = self
                 .store
@@ -243,28 +287,22 @@ impl PayloadOffloader {
         Ok(refs)
     }
 
-    /// Whether [`Self::offload_event_value`] stores `field` as a blob.
+    /// A copy of this offloader that counts the blobs it uploads.
     ///
-    /// `field` is one payload field, already codec-encoded. The check does
-    /// not touch the store. A caller uses it to learn if a write uploads.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`HarvestError::Serialization`] if `field` cannot be serialized.
-    pub(crate) fn would_offload_field(&self, field: &Value) -> HarvestResult<bool> {
-        if field.is_null() {
-            return Ok(false);
-        }
-        let byte_len = serde_json::to_vec(field)?.len() as u64;
-        Ok(self.stores_as_blob(field, byte_len))
-    }
-
-    /// Whether a non-null field of `byte_len` serialized bytes becomes a blob.
-    ///
-    /// A fresh value that carries the discriminator is business data. It
-    /// becomes a blob, so no bare look-alike reaches the log.
-    fn stores_as_blob(&self, field: &Value, byte_len: u64) -> bool {
-        is_offload_envelope(field) || byte_len > self.threshold
+    /// The copy writes to the same store under the same store id. Only its
+    /// own uploads are counted. A caller makes one copy per write and so
+    /// learns if that write uploaded a blob (issue #1788).
+    pub(crate) fn counting_uploads(&self) -> (Self, UploadCount) {
+        let uploads = UploadCount::default();
+        let store = CountingStore {
+            inner: Arc::clone(&self.store),
+            uploads: uploads.clone(),
+        };
+        let copy = Self {
+            store: Arc::new(store),
+            ..self.clone()
+        };
+        (copy, uploads)
     }
 
     /// Reconstruct any offloaded payload field inside a serialized event's
@@ -411,7 +449,6 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// In-memory content-addressed store with put/get/delete spies.
     #[derive(Default)]
@@ -470,24 +507,32 @@ mod tests {
         serde_json::json!({ "type": "WorkflowCompleted", "data": { "output": output } })
     }
 
-    /// The upload check agrees with the upload itself, field by field.
+    /// A counting copy counts the blobs it uploads and nothing else.
     #[tokio::test]
-    async fn the_upload_check_matches_the_upload() {
-        let fields = [
-            Value::Null,
-            serde_json::json!("small"),
-            serde_json::json!("x".repeat(64)),
-            serde_json::json!({ OFFLOAD_ENVELOPE_KEY: 1 }),
-        ];
-        for field in fields {
-            let store = MemStore::new();
-            let off = offloader(store.clone(), 16);
-            let expected = off.would_offload_field(&field).expect("check");
-            let mut event = event_with_output(field.clone());
-            off.offload_event_value(&mut event).await.expect("offload");
-            let uploaded = store.puts.load(Ordering::SeqCst) == 1;
-            assert_eq!(expected, uploaded, "field {field}");
-        }
+    async fn a_counting_copy_counts_its_own_uploads() {
+        let store = MemStore::new();
+        let off = offloader(store.clone(), 16);
+        let (counting, uploads) = off.counting_uploads();
+
+        let mut small = event_with_output(serde_json::json!("x"));
+        counting
+            .offload_event_value(&mut small)
+            .await
+            .expect("offload");
+        assert!(!uploads.any(), "an inline field uploads nothing");
+
+        let mut other = event_with_output(serde_json::json!("y".repeat(64)));
+        off.offload_event_value(&mut other).await.expect("offload");
+        assert!(!uploads.any(), "the original handle is not counted");
+
+        let mut large = event_with_output(serde_json::json!("x".repeat(64)));
+        let refs = counting
+            .offload_event_value(&mut large)
+            .await
+            .expect("offload");
+        assert!(uploads.any(), "a blob upload is counted");
+        assert_eq!(refs[0].store_id, "mem", "the store id is unchanged");
+        assert_eq!(store.puts.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
