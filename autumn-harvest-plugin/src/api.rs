@@ -40636,6 +40636,85 @@ pub(crate) async fn resolve_shard_best_effort(
         .ok()
 }
 
+/// Whether `error` is the request's shard fence refusing a checkout
+/// (issue #1803). The match is on the variant, never on the message text.
+const fn left_shard_fence(error: &HarvestError) -> bool {
+    matches!(error, HarvestError::OutsideShardFence { .. })
+}
+
+/// The outcome of a checkout an SSE producer makes on a run's live shard
+/// (issue #1803).
+///
+/// The producers run under the request's shard fence. A cutover after the
+/// stream opened moves the run to a shard the policy never saw. The fence
+/// then refuses every checkout there. The producer must not keep waiting on
+/// the old shard. The keepalive pings would hold the connection open, and
+/// the client would never reconnect. So a fenced miss ends the stream with
+/// an `error` frame. The reconnect is authorized against the live shard.
+enum FencedCheckout<T> {
+    /// The checkout succeeded.
+    Ready(T),
+    /// A transient failure. The producer keeps its listener and retries on
+    /// the next tick, as it did before the fence existed.
+    Retry,
+    /// The run left the request's shard fence. The producer ends the stream.
+    LeftFence,
+}
+
+impl<T> FencedCheckout<T> {
+    /// Sort an engine result into the three outcomes.
+    fn from_result(result: HarvestResult<T>) -> Self {
+        match result {
+            Ok(value) => Self::Ready(value),
+            Err(error) if left_shard_fence(&error) => Self::LeftFence,
+            Err(_) => Self::Retry,
+        }
+    }
+}
+
+/// [`db_conn_for_execution`] for an SSE producer. It keeps the engine error,
+/// so a fenced miss is told apart from a transient failure by its variant.
+async fn stream_conn_for_execution(
+    api_state: &HarvestApiState,
+    exec_id: ExecutionId,
+) -> FencedCheckout<PoolConn> {
+    let Ok(pool) = api_state.storage_pool() else {
+        return FencedCheckout::Retry;
+    };
+    FencedCheckout::from_result(
+        ::autumn_harvest::shard_rebalance::conn_for_execution_forwarded(
+            pool.sharded_pool(),
+            exec_id,
+        )
+        .await,
+    )
+}
+
+/// The shard `exec_id` lives on now, for an SSE producer's listener rebind.
+/// The walk follows the forwarding pointer with a checkout on each hop, so
+/// a run that moved outside the fence is caught here first.
+async fn stream_live_shard(
+    api_state: &HarvestApiState,
+    exec_id: ExecutionId,
+) -> FencedCheckout<ShardId> {
+    let Ok(pool) = api_state.storage_pool() else {
+        return FencedCheckout::Retry;
+    };
+    FencedCheckout::from_result(
+        ::autumn_harvest::shard_rebalance::resolve_execution_shard(pool.sharded_pool(), exec_id)
+            .await,
+    )
+}
+
+/// The final frame of a stream whose run left the request's shard fence
+/// (issue #1803). `retry` tells the client to reconnect. The reconnect is
+/// authorized against the live shard.
+fn shard_fence_error_event() -> axum::response::sse::Event {
+    axum::response::sse::Event::default()
+        .event("error")
+        .data(serde_json::json!({ "error": "outside_shard_fence", "retry": true }).to_string())
+}
+
 /// Resolve a connection to the shard that *owns* `exec_id`, with **no default
 /// fallback** — for reads whose answer is "does this execution exist?".
 ///
@@ -43883,7 +43962,9 @@ async fn stream_execution_events(
 
     // The producer re-resolves the run on every poll. It runs under the
     // request's shard fence, so a cutover mid-stream cannot lead it onto a
-    // shard the authorizer never saw (issue #1803).
+    // shard the authorizer never saw (issue #1803). A fenced miss ends the
+    // stream with an `error` frame, so the client reconnects and the
+    // reconnect is authorized against the live shard. See `FencedCheckout`.
     let fence = ::autumn_harvest::shard_fence::current();
 
     // Producer task: runs independently of the HTTP handler after we return
@@ -44027,13 +44108,18 @@ async fn stream_execution_events(
                 // shard. Without this rebind the stream would silently
                 // degrade from event-driven to poll-only delivery for the
                 // rest of its life once a migration happens.
-                if let Ok(pool) = api_clone.storage_pool()
-                    && let Ok(current_shard) =
-                        ::autumn_harvest::shard_rebalance::resolve_execution_shard(
-                            pool.sharded_pool(),
-                            exec_id,
-                        )
-                        .await
+                //
+                // A fenced miss ends the stream (issue #1803). The run moved
+                // to a shard the policy never saw.
+                let current_shard = match stream_live_shard(&api_clone, exec_id).await {
+                    FencedCheckout::Ready(shard) => Some(shard),
+                    FencedCheckout::Retry => None,
+                    FencedCheckout::LeftFence => {
+                        let _ = tx.send(Ok(shard_fence_error_event())).await;
+                        break 'notify;
+                    }
+                };
+                if let Some(current_shard) = current_shard
                     && current_shard != listener_shard
                     && let Ok(url) = api_clone.sse_notification_url(current_shard)
                     && let Ok(l) = WorkflowEventListener::connect(&url).await
@@ -44059,18 +44145,26 @@ async fn stream_execution_events(
                     // the new shard's own `id` sequence. That is the
                     // exact bug this translation exists to prevent.
                     last_seen_id = match last_seen_event_id {
-                        Some(event_id) => match db_conn_for_execution(&api_clone, exec_id).await {
-                            Ok(mut target_conn) => ::autumn_harvest::store::row_id_for_event_id(
-                                &mut target_conn,
-                                exec_id,
-                                event_id,
-                            )
-                            .await
-                            .ok()
-                            .flatten()
-                            .unwrap_or(-1),
-                            Err(_) => -1,
-                        },
+                        Some(event_id) => {
+                            match stream_conn_for_execution(&api_clone, exec_id).await {
+                                FencedCheckout::Ready(mut target_conn) => {
+                                    ::autumn_harvest::store::row_id_for_event_id(
+                                        &mut target_conn,
+                                        exec_id,
+                                        event_id,
+                                    )
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                    .unwrap_or(-1)
+                                }
+                                FencedCheckout::LeftFence => {
+                                    let _ = tx.send(Ok(shard_fence_error_event())).await;
+                                    break 'notify;
+                                }
+                                FencedCheckout::Retry => -1,
+                            }
+                        }
                         None => -1,
                     };
                     listener = l;
@@ -44090,8 +44184,8 @@ async fn stream_execution_events(
 
                         // Load new events from the pool — capped to buffer_depth so
                         // rapid bursts between notifications stay bounded in memory.
-                        let new_rows = match db_conn_for_execution(&api_clone, exec_id).await {
-                            Ok(mut conn) => {
+                        let new_rows = match stream_conn_for_execution(&api_clone, exec_id).await {
+                            FencedCheckout::Ready(mut conn) => {
                                 match store::load_events_after_row_id(
                                     &mut conn,
                                     exec_id,
@@ -44107,7 +44201,12 @@ async fn stream_execution_events(
                                     Err(_) => continue,
                                 }
                             }
-                            Err(_) => continue,
+                            // The run left the fence (issue #1803): end the stream.
+                            FencedCheckout::LeftFence => {
+                                let _ = tx.send(Ok(shard_fence_error_event())).await;
+                                break 'notify;
+                            }
+                            FencedCheckout::Retry => continue,
                         };
 
                         let (new_id, new_event_id, terminal_state, should_break) =
@@ -44147,8 +44246,14 @@ async fn stream_execution_events(
                         }
                         // Periodic safety-net poll: catch any events missed due to a
                         // prior DB failure on a notification (e.g. terminal event).
-                        let Ok(mut conn) = db_conn_for_execution(&api_clone, exec_id).await else {
-                            continue 'notify;
+                        // A run that left the fence ends the stream (issue #1803).
+                        let mut conn = match stream_conn_for_execution(&api_clone, exec_id).await {
+                            FencedCheckout::Ready(conn) => conn,
+                            FencedCheckout::LeftFence => {
+                                let _ = tx.send(Ok(shard_fence_error_event())).await;
+                                break 'notify;
+                            }
+                            FencedCheckout::Retry => continue 'notify,
                         };
                         let Ok(missed) = store::load_events_after_row_id(
                             &mut conn,
@@ -44203,9 +44308,15 @@ async fn stream_execution_events(
                             break 'notify;
                         };
                         listener = l;
-                        // Backfill events missed during reconnection window
-                        let Ok(mut conn) = db_conn_for_execution(&api_clone, exec_id).await else {
-                            continue 'notify;
+                        // Backfill events missed during reconnection window.
+                        // A run that left the fence ends the stream (issue #1803).
+                        let mut conn = match stream_conn_for_execution(&api_clone, exec_id).await {
+                            FencedCheckout::Ready(conn) => conn,
+                            FencedCheckout::LeftFence => {
+                                let _ = tx.send(Ok(shard_fence_error_event())).await;
+                                break 'notify;
+                            }
+                            FencedCheckout::Retry => continue 'notify,
                         };
                         let Ok(missed) = store::load_events_after_row_id(
                             &mut conn,
@@ -44313,30 +44424,51 @@ const PROGRESS_STREAM_CHANNEL_CAPACITY: usize = 256;
 /// chunk is not lost on close.
 const PROGRESS_STREAM_FINAL_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(75);
 
+/// What the progress stream's terminal-state poll found.
+enum ProgressPoll {
+    /// The run reached a terminal state, or its row is gone. The stream ends
+    /// with `event: end` and this reason.
+    End(String),
+    /// The run is still live, or the poll hit a transient failure. The next
+    /// idle tick polls again.
+    Wait,
+    /// The run left the request's shard fence (issue #1803). The stream ends
+    /// with `event: error`, and the client reconnects.
+    LeftFence,
+}
+
 /// Poll the execution's terminal state for the progress stream's close check.
 ///
-/// Returns `Some(reason)` when the stream should end — the execution reached a
-/// terminal state, or its row was retention-deleted (which only happens once an
-/// execution is already terminal) — and `None` to keep waiting (still running,
-/// or a transient DB/pool error the next idle tick retries).
+/// [`ProgressPoll::End`] means the stream should end. The execution reached
+/// a terminal state, or retention deleted its row. Retention only deletes a
+/// terminal execution. [`ProgressPoll::Wait`] keeps the stream waiting. The
+/// run is still live, or a transient DB or pool error hit, and the next idle
+/// tick retries. A checkout the shard fence refuses is
+/// [`ProgressPoll::LeftFence`], never a wait.
 async fn progress_stream_end_reason(
     api_state: &HarvestApiState,
     exec_id: ExecutionId,
-) -> Option<String> {
-    let mut conn = db_conn_for_execution(api_state, exec_id).await.ok()?;
-    let state: Option<String> = harvest_workflow_executions::table
+) -> ProgressPoll {
+    let mut conn = match stream_conn_for_execution(api_state, exec_id).await {
+        FencedCheckout::Ready(conn) => conn,
+        FencedCheckout::Retry => return ProgressPoll::Wait,
+        FencedCheckout::LeftFence => return ProgressPoll::LeftFence,
+    };
+    let Ok(state) = harvest_workflow_executions::table
         .find(exec_id.as_uuid())
         .select(harvest_workflow_executions::state)
-        .first(&mut conn)
+        .first::<String>(&mut conn)
         .await
         .optional()
-        .ok()?;
+    else {
+        return ProgressPoll::Wait;
+    };
     match state {
         // Row gone: retention only deletes terminal executions, so end the stream.
-        None => Some("deleted".to_string()),
-        Some(s) if is_terminal_state(&s) => Some(s.to_lowercase().replace('_', "-")),
+        None => ProgressPoll::End("deleted".to_string()),
+        Some(s) if is_terminal_state(&s) => ProgressPoll::End(s.to_lowercase().replace('_', "-")),
         // Still running — keep the live loop open.
-        Some(_) => None,
+        Some(_) => ProgressPoll::Wait,
     }
 }
 
@@ -44363,9 +44495,12 @@ async fn progress_stream_end_reason(
 ///
 /// ```
 /// A final `event: end` frame is emitted when the execution reaches a terminal
-/// state and the stream then closes; `event: error` is sent if the LISTEN
-/// connection drops. Keepalive `: ping` comments (axum `KeepAlive`) keep proxies
-/// from idling the connection.
+/// state, and the stream then closes. `event: error` is sent if the LISTEN
+/// connection drops. It is also sent if the run leaves the request's shard
+/// fence after a rebalance cutover (issue #1803). That frame carries
+/// `{"error":"outside_shard_fence","retry":true}`. The client then reconnects,
+/// and the reconnect is authorized against the live shard. Keepalive `: ping`
+/// comments (axum `KeepAlive`) keep proxies from idling the connection.
 ///
 /// **Progress chunks are EPHEMERAL**: never recorded in `harvest_events`, never
 /// replayed, and there is **no backfill** on (re)connect. A subscriber that
@@ -44476,6 +44611,9 @@ async fn stream_workflow_progress(
     } else {
         let api_clone = api_state.clone();
         // The producer runs under the request's shard fence (issue #1803).
+        // A fenced miss ends the stream with an `error` frame, so the
+        // client reconnects and the reconnect is authorized against the
+        // live shard. See `FencedCheckout`.
         let fence = ::autumn_harvest::shard_fence::current();
         // Producer task: runs independently of the HTTP handler after we return.
         tokio::spawn(::autumn_harvest::shard_fence::scoped(fence, async move {
@@ -44519,13 +44657,18 @@ async fn stream_workflow_progress(
                 // stop chunk delivery until the workflow finished on its
                 // new shard. Re-resolving here before every wait catches
                 // that promptly instead.
-                if let Ok(pool) = api_clone.storage_pool()
-                    && let Ok(current_shard) =
-                        ::autumn_harvest::shard_rebalance::resolve_execution_shard(
-                            pool.sharded_pool(),
-                            exec_id,
-                        )
-                        .await
+                //
+                // A fenced miss ends the stream (issue #1803). The run moved
+                // to a shard the policy never saw.
+                let current_shard = match stream_live_shard(&api_clone, exec_id).await {
+                    FencedCheckout::Ready(shard) => Some(shard),
+                    FencedCheckout::Retry => None,
+                    FencedCheckout::LeftFence => {
+                        let _ = tx.send(Ok(shard_fence_error_event())).await;
+                        break;
+                    }
+                };
+                if let Some(current_shard) = current_shard
                     && current_shard != listener_shard
                     && let Ok(url) = api_clone.sse_notification_url(current_shard)
                     && let Ok(l) = WorkflowProgressListener::connect(&url, exec_id.as_uuid()).await
@@ -44549,31 +44692,37 @@ async fn stream_workflow_progress(
                         }
                         // Periodic terminal-state poll: there is no terminal
                         // chunk, so this bounds close latency to one keepalive.
-                        if let Some(reason) = progress_stream_end_reason(&api_clone, exec_id).await
-                        {
-                            // Bounded final-chunk drain: the workflow's LAST
-                            // published chunk may have arrived on the listener
-                            // socket but not yet been forwarded by the driver
-                            // task when this idle tick fired. Drain (non-blocking)
-                            // with a short grace so the primary "here's your
-                            // answer" frame is not dropped on close. A non-Chunk
-                            // outcome (no more chunks in flight, timeout, or the
-                            // listener dropped) exits the drain and proceeds to
-                            // close.
-                            while let Ok(ProgressWaitOutcome::Chunk(payload)) = listener
-                                .wait_for_progress_timeout(PROGRESS_STREAM_FINAL_DRAIN_GRACE)
-                                .await
-                            {
-                                if !emit_chunk(&mut tx, payload) {
-                                    return; // client disconnected mid-drain
-                                }
+                        // A run that left the fence ends the stream (issue #1803).
+                        let reason = match progress_stream_end_reason(&api_clone, exec_id).await {
+                            ProgressPoll::End(reason) => reason,
+                            ProgressPoll::Wait => continue,
+                            ProgressPoll::LeftFence => {
+                                let _ = tx.send(Ok(shard_fence_error_event())).await;
+                                break;
                             }
-                            let end_data = serde_json::json!({ "reason": reason }).to_string();
-                            let _ = tx
-                                .send(Ok(Event::default().event("end").data(end_data)))
-                                .await;
-                            break;
+                        };
+                        // Bounded final-chunk drain: the workflow's LAST
+                        // published chunk may have arrived on the listener
+                        // socket but not yet been forwarded by the driver
+                        // task when this idle tick fired. Drain (non-blocking)
+                        // with a short grace so the primary "here's your
+                        // answer" frame is not dropped on close. A non-Chunk
+                        // outcome (no more chunks in flight, timeout, or the
+                        // listener dropped) exits the drain and proceeds to
+                        // close.
+                        while let Ok(ProgressWaitOutcome::Chunk(payload)) = listener
+                            .wait_for_progress_timeout(PROGRESS_STREAM_FINAL_DRAIN_GRACE)
+                            .await
+                        {
+                            if !emit_chunk(&mut tx, payload) {
+                                return; // client disconnected mid-drain
+                            }
                         }
+                        let end_data = serde_json::json!({ "reason": reason }).to_string();
+                        let _ = tx
+                            .send(Ok(Event::default().event("end").data(end_data)))
+                            .await;
+                        break;
                     }
                     Ok(ProgressWaitOutcome::ChannelClosed) => {
                         // LISTEN connection dropped; end with an error frame

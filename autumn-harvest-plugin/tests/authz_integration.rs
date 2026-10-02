@@ -14,12 +14,15 @@
 //!   - every deny writes an `authz.deny` audit row that the SIEM export claims
 //!   - a cutover between the hook and the handler is fenced with `503`, and
 //!     the handler touches nothing on the new shard
+//!   - a cutover after an SSE stream opened ends the stream with an `error`
+//!     frame, so the client reconnects and is checked on the new shard
 
 #![allow(clippy::too_many_lines)]
 #![allow(clippy::items_after_statements)]
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use autumn_harvest::WorkflowEvent;
 use autumn_harvest::audit::RouteClass;
@@ -43,6 +46,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use futures::StreamExt as _;
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
@@ -999,6 +1003,127 @@ async fn cutover_between_hook_and_handler_is_fenced() {
         Some("CANCELLED")
     );
     assert_eq!(deny_rows(&mut conn).await.len(), 1);
+}
+
+/// Open an SSE stream through `app` and return its body as a chunk stream.
+async fn open_stream(app: &App, uri: &str) -> axum::body::BodyDataStream {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("stream request");
+    assert_eq!(response.status(), StatusCode::OK, "the stream opens");
+    response.into_body().into_data_stream()
+}
+
+/// The next chunk of `body`, or `None` once the body ends.
+///
+/// Panics when no chunk arrives within `wait`. A live stream pings at
+/// least once per keepalive interval, so a silent body is a hang.
+async fn next_chunk(body: &mut axum::body::BodyDataStream, wait: Duration) -> Option<String> {
+    match tokio::time::timeout(wait, body.next()).await {
+        Ok(Some(Ok(bytes))) => Some(String::from_utf8_lossy(&bytes).to_string()),
+        Ok(Some(Err(e))) => panic!("stream body error: {e}"),
+        Ok(None) => None,
+        Err(elapsed) => panic!("no SSE chunk within {wait:?}: {elapsed}"),
+    }
+}
+
+/// Read chunks until one contains `needle`, the body ends, or `deadline`
+/// elapses. Returns every chunk read and whether `needle` was found.
+async fn read_until(
+    body: &mut axum::body::BodyDataStream,
+    needle: &str,
+    deadline: Duration,
+) -> (Vec<String>, bool) {
+    let start = std::time::Instant::now();
+    let mut chunks = Vec::new();
+    loop {
+        let Some(left) = deadline.checked_sub(start.elapsed()) else {
+            return (chunks, false);
+        };
+        match tokio::time::timeout(left, body.next()).await {
+            Ok(Some(Ok(bytes))) => {
+                let chunk = String::from_utf8_lossy(&bytes).to_string();
+                let found = chunk.contains(needle);
+                chunks.push(chunk);
+                if found {
+                    return (chunks, true);
+                }
+            }
+            Ok(Some(Err(e))) => panic!("stream body error: {e}"),
+            Ok(None) | Err(_) => return (chunks, false),
+        }
+    }
+}
+
+/// A rebalance cutover after an SSE stream opened moves the run to a shard
+/// the policy never saw. The fenced producer cannot follow it. The stream
+/// must end with an `error` frame instead of pinging on the old shard
+/// forever. The client then reconnects, and the reconnect is checked on the
+/// live shard. `uri` names the stream route for the execution.
+async fn assert_cutover_ends_the_stream(uri: impl Fn(ExecutionId) -> String) {
+    let (url, _c) = setup_database().await;
+    let entry_pool = build_pool(&url);
+    let live_url = second_database(&url).await;
+    let live_pool = build_pool(&live_url);
+    let mut conn = entry_pool.get().await.unwrap();
+    scrub(&mut conn).await;
+
+    let exec = ExecutionId::new_for_shard(ShardId::new(0));
+    insert_execution(&mut conn, exec, "RUNNING", None, None).await;
+    let state = two_shard_state(&entry_pool, live_pool);
+    state.set_workflow_result_notification_database_urls([
+        (ShardId::new(0), url.clone()),
+        (ShardId::new(7), live_url.clone()),
+    ]);
+    state.set_sse_keepalive_interval(Duration::from_millis(200));
+    let app = authorized_app_with_state(&state, |_| AuthzDecision::Allow);
+
+    // The stream is live on shard 0: a keepalive ping arrives.
+    let mut body = open_stream(&app, &uri(exec)).await;
+    let (chunks, found) = read_until(&mut body, "ping", Duration::from_secs(3)).await;
+    assert!(found, "a keepalive ping on the old shard: {chunks:?}");
+
+    // The run moves to shard 7, which the policy never saw.
+    cut_over_to_shard_7(&url, &live_url, exec).await;
+
+    // The fenced producer ends the stream with an error frame.
+    let (chunks, found) =
+        read_until(&mut body, "outside_shard_fence", Duration::from_secs(3)).await;
+    assert!(
+        found,
+        "the fenced stream must end with an error frame, not keep pinging: {chunks:?}"
+    );
+    let frame = chunks.last().unwrap();
+    assert!(frame.contains("event: error"), "{frame}");
+    assert!(frame.contains("\"retry\":true"), "{frame}");
+
+    // The body ends, so the client reconnects. No ping follows the frame.
+    let after = next_chunk(&mut body, Duration::from_secs(3)).await;
+    assert_eq!(after, None, "the body ends after the error frame");
+    assert!(
+        deny_rows(&mut conn).await.is_empty(),
+        "a fenced miss is not a policy deny"
+    );
+}
+
+/// The progress stream, `GET /workflows/{id}/stream`.
+#[tokio::test]
+async fn cutover_mid_stream_ends_the_sse_stream() {
+    assert_cutover_ends_the_stream(|exec| format!("/workflows/{exec}/stream")).await;
+}
+
+/// The execution event stream, `GET /executions/{exec_id}/events/stream`.
+#[tokio::test]
+async fn cutover_mid_stream_ends_the_event_stream() {
+    assert_cutover_ends_the_stream(|exec| format!("/executions/{exec}/events/stream")).await;
 }
 
 /// With no authorizer, no fence is installed. The handler follows the

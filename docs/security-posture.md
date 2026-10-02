@@ -458,11 +458,14 @@ shard by hash. To confine a caller to some shards, deny `None` too.
   handler then names that shard at its first checkout, and the fence refuses
   the checkout before any read or write there. The caller gets `503` with a
   retry hint. The retry resolves the run on its new shard, and the policy
-  decides on that shard. The fence never widens access. A fenced miss writes
-  no `authz.deny` row, because the policy did not deny. A request the policy
-  saw with `shard: None` gets no fence, because its handler reads every shard
-  by design. Control rows (audit, tokens, gates) are reached through the
-  default pool, which names no shard, so the fence does not apply to them.
+  decides on that shard. An SSE stream whose run moves after the check ends
+  with an `error` frame (`outside_shard_fence`, `retry: true`), and the
+  reconnect is authorized against the live shard. The fence never widens
+  access. A fenced miss writes no `authz.deny` row, because the policy did
+  not deny. A request the policy saw with `shard: None` gets no fence,
+  because its handler reads every shard by design. Control rows (audit,
+  tokens, gates) are reached through the default pool, which names no shard,
+  so the fence does not apply to them.
 - **The hook does not cover the app-level MCP tool routes or webhook routes.**
   They live outside the management router.
 - **A panic in the hook aborts the request.** It never lets it through.

@@ -33,9 +33,11 @@ capability.
   shard-named checkout in `shard_rebalance` checks the fence first, so the
   handler reads and writes nothing on that shard. The caller gets `503` with
   a retry hint (`HarvestError::OutsideShardFence`), never `403`, and the retry
-  is checked on the new shard. A request the policy saw with `shard: None`
-  gets no fence. Control rows on the default pool are not fenced. With no
-  hook, no fence exists.
+  is checked on the new shard. An SSE stream whose run moves mid-stream ends
+  with an `error` frame (`outside_shard_fence`, `retry: true`) instead of
+  pinging on the old shard, and the reconnect is checked on the new shard. A
+  request the policy saw with `shard: None` gets no fence. Control rows on
+  the default pool are not fenced. With no hook, no fence exists.
 - **Admin prefixes.** Any mutation under `/admin/tokens`, `/admin/modules` or
   `/modules` is admin-only, even if `ADMIN_SCOPE_ROUTES` does not list it.
 - **Deny audit.** Every token scope deny and every hook deny writes an
