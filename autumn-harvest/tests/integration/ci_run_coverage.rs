@@ -420,10 +420,10 @@ fn parse_manifest() -> Vec<SuiteRow> {
 
 // ── Core coverage ───────────────────────────────────────────────────────────
 
-/// A core `integration` submodule is covered iff some executing (`linux`/`allos`)
-/// manifest row enables `db` (so the module compiles + its tests exist), carries
-/// `testing` when the module needs it, and targets it whole. See
-/// [`filter_runs_whole_module`] for which filters select a whole module.
+/// A core `integration` submodule is covered when one executing row meets
+/// three conditions. The row is `linux` or `allos` and enables `db`, so the
+/// module compiles. It carries `testing` when the module needs it. Its filter
+/// selects the whole module (see [`filter_runs_whole_module`]).
 ///
 /// `autumn-harvest` has `default = ["db", "unified-dag-execution", "tls"]`; the runner
 /// keeps defaults for `linux`/`linuxpart` integration rows (Docker Postgres) and strips them
