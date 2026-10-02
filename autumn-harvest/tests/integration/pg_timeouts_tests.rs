@@ -1522,7 +1522,7 @@ async fn a_stale_result_write_does_not_reach_a_newer_claim() {
         ("retry", Err("transient failure".to_owned())),
         ("deadline", Err("transient failure".to_owned())),
     ] {
-        let (exec_id, activity_id, mut stale) = seed_claimed_activity(&mut conn, "q-sr").await;
+        let (exec_id, _activity_id, mut stale) = seed_claimed_activity(&mut conn, "q-sr").await;
         let task_id = stale.id;
         if case == "deadline" {
             // The 1 s retry delay crosses this deadline, so the write takes
@@ -1552,8 +1552,6 @@ async fn a_stale_result_write_does_not_reach_a_newer_claim() {
         let _ = autumn_harvest::worker::write_activity_result_for_task(
             &mut conn,
             &stale,
-            exec_id,
-            activity_id,
             "w-1",
             Some(&policy),
             result,

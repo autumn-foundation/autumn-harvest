@@ -17,11 +17,11 @@
 //! #1431). Its reads and its hints then ignore a later install.
 
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
@@ -145,12 +145,19 @@ impl Default for DispatchSettings {
     }
 }
 
+/// The future that a [`TaskDispatch`] method returns.
+pub type DispatchFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
 /// A channel that carries task references between processes.
 ///
 /// Implementations deliver each published reference at least once. They do
 /// not need to persist references: the worker's reconcile sweep republishes
 /// every due `PENDING` row that the channel does not hold.
-#[async_trait]
+///
+/// Implement it with `#[async_trait]` on the `impl` block and `async fn`
+/// methods. The method signatures here are the ones that `#[async_trait]`
+/// generates. They are written out because `#[async_trait]` on the trait adds
+/// a `#[must_use]` that clippy rejects as `double_must_use`.
 pub trait TaskDispatch: Send + Sync + std::fmt::Debug {
     /// Publish references, keyed on `scheduled_at`.
     ///
@@ -169,23 +176,50 @@ pub trait TaskDispatch: Send + Sync + std::fmt::Debug {
     /// backoff parked it under. The reconcile sweep republishes a row with the
     /// row's own `scheduled_at`, so a sweep never disturbs a backoff. A wake or
     /// a retry writes a new `scheduled_at`, so it does move the reference.
-    async fn publish(&self, hints: &[DispatchHint]) -> HarvestResult<()>;
+    fn publish<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        hints: &'life1 [DispatchHint],
+    ) -> DispatchFuture<'async_trait, HarvestResult<()>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait;
 
     /// Read up to `max` due references for `queues`. Wait up to `wait` when
     /// the channel is empty. `consumer` names the caller for recovery.
-    async fn next(
-        &self,
-        queues: &[String],
-        consumer: &str,
+    fn next<'life0, 'life1, 'life2, 'async_trait>(
+        &'life0 self,
+        queues: &'life1 [String],
+        consumer: &'life2 str,
         max: usize,
         wait: Duration,
-    ) -> HarvestResult<Vec<DispatchLease>>;
+    ) -> DispatchFuture<'async_trait, HarvestResult<Vec<DispatchLease>>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        Self: 'async_trait;
 
     /// Drop a reference. The row was claimed, or it is no longer claimable.
-    async fn ack(&self, lease: &DispatchLease) -> HarvestResult<()>;
+    fn ack<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        lease: &'life1 DispatchLease,
+    ) -> DispatchFuture<'async_trait, HarvestResult<()>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait;
 
     /// Give a reference back so it is delivered again after `delay`.
-    async fn release(&self, lease: &DispatchLease, delay: Duration) -> HarvestResult<()>;
+    fn release<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        lease: &'life1 DispatchLease,
+        delay: Duration,
+    ) -> DispatchFuture<'async_trait, HarvestResult<()>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait;
 
     /// Drop several references at once (issue #1429).
     ///
@@ -198,14 +232,24 @@ pub trait TaskDispatch: Send + Sync + std::fmt::Debug {
     /// lease independently, so one lease's error never stranded a sibling
     /// lease's reference pending until visibility recovery. Every lease is
     /// attempted; the first error, if any, is returned after the loop.
-    async fn ack_many(&self, leases: &[DispatchLease]) -> HarvestResult<()> {
-        let mut first_error = None;
-        for lease in leases {
-            if let Err(error) = self.ack(lease).await {
-                first_error.get_or_insert(error);
+    fn ack_many<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        leases: &'life1 [DispatchLease],
+    ) -> DispatchFuture<'async_trait, HarvestResult<()>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            let mut first_error = None;
+            for lease in leases {
+                if let Err(error) = self.ack(lease).await {
+                    first_error.get_or_insert(error);
+                }
             }
-        }
-        first_error.map_or(Ok(()), Err)
+            first_error.map_or(Ok(()), Err)
+        })
     }
 
     /// Give several references back at once, each after its own delay
@@ -218,19 +262,36 @@ pub trait TaskDispatch: Send + Sync + std::fmt::Debug {
     /// for the same reason as [`Self::ack_many`]'s default above (Codex
     /// review, issue #1429). Every lease is attempted; the first error, if
     /// any, is returned after the loop.
-    async fn release_many(&self, leases: &[(DispatchLease, Duration)]) -> HarvestResult<()> {
-        let mut first_error = None;
-        for (lease, delay) in leases {
-            if let Err(error) = self.release(lease, *delay).await {
-                first_error.get_or_insert(error);
+    fn release_many<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        leases: &'life1 [(DispatchLease, Duration)],
+    ) -> DispatchFuture<'async_trait, HarvestResult<()>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            let mut first_error = None;
+            for (lease, delay) in leases {
+                if let Err(error) = self.release(lease, *delay).await {
+                    first_error.get_or_insert(error);
+                }
             }
-        }
-        first_error.map_or(Ok(()), Err)
+            first_error.map_or(Ok(()), Err)
+        })
     }
 
     /// Promote due delayed references and recover references held by a
     /// consumer that stopped acking.
-    async fn maintain(&self, queues: &[String]) -> HarvestResult<DispatchMaintenance>;
+    fn maintain<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        queues: &'life1 [String],
+    ) -> DispatchFuture<'async_trait, HarvestResult<DispatchMaintenance>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait;
 
     /// The most sequential round trips that one [`Self::next`] call over
     /// `queue_count` queues can make outside its `wait`. The default is one
@@ -1729,7 +1790,7 @@ impl MemoryDispatch {
 }
 
 #[cfg(feature = "testing")]
-#[async_trait]
+#[async_trait::async_trait]
 impl TaskDispatch for MemoryDispatch {
     async fn publish(&self, hints: &[DispatchHint]) -> HarvestResult<()> {
         let mut state = lock(&self.state);
@@ -2350,7 +2411,7 @@ mod tests {
         })
         .await;
         assert_eq!(leftover, vec![one.clone()]);
-        assert!(channel.published_ids().is_empty());
+        assert_eq!(channel.published_ids(), [] as [uuid::Uuid; 0]);
 
         publish_now(leftover).await;
         assert_eq!(channel.published_ids(), vec![one.task_id]);
@@ -2396,7 +2457,7 @@ mod tests {
             flush_scope().await;
         })
         .await;
-        assert!(leftover.is_empty());
+        assert_eq!(leftover, [] as [crate::dispatch::DispatchHint; 0]);
         assert_eq!(channel.published_ids(), vec![one.task_id]);
         uninstall();
     }
@@ -2856,7 +2917,7 @@ mod tests {
         fails: Uuid,
     }
 
-    #[async_trait]
+    #[async_trait::async_trait]
     impl TaskDispatch for FailOneLease {
         async fn publish(&self, hints: &[DispatchHint]) -> HarvestResult<()> {
             self.inner.publish(hints).await
@@ -3477,6 +3538,6 @@ mod tests {
         uninstall();
 
         assert_eq!(bound.published_ids(), vec![one.task_id]);
-        assert!(live.published_ids().is_empty());
+        assert_eq!(live.published_ids(), [] as [uuid::Uuid; 0]);
     }
 }

@@ -572,7 +572,7 @@ async fn insert_audit_batch_on_empty_slice_is_a_no_op() {
     let returned = insert_audit_batch(&mut conn, &[])
         .await
         .expect("empty batch must succeed");
-    assert!(returned.is_empty());
+    assert_eq!(returned, [] as [uuid::Uuid; 0]);
 }
 
 /// A batch spanning more than one chunk boundary must still insert every

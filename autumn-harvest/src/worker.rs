@@ -14958,23 +14958,30 @@ async fn handle_activity_result(
 /// Write one activity attempt's result through the normal finalization.
 ///
 /// Tests use it to check the claim fence (issue #1788). It applies no result
-/// size cap, no offloader and no metrics.
+/// size cap, no offloader and no metrics. The execution and activity ids come
+/// from `task`.
 ///
 /// # Errors
 ///
-/// See `handle_activity_result`.
+/// [`HarvestError::Config`] when `task` has no execution or activity id.
+/// Otherwise see `handle_activity_result`.
 #[doc(hidden)]
-#[allow(clippy::too_many_arguments)]
 pub async fn write_activity_result_for_task(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
-    exec_id: ExecutionId,
-    activity_id: ActivityExecId,
     worker_id: &str,
     retry_policy: Option<&RetryPolicy>,
     result: Result<serde_json::Value, String>,
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
+    let (Some(exec_uuid), Some(activity_uuid)) = (task.workflow_exec_id, task.activity_id) else {
+        return Err(HarvestError::Config(format!(
+            "task {} has no execution or activity id",
+            task.id
+        )));
+    };
+    let exec_id = execution_id_from_uuid(exec_uuid);
+    let activity_id = ActivityExecId::from_uuid(activity_uuid);
     handle_activity_result(
         conn,
         task,
@@ -15506,21 +15513,20 @@ fn session_slot_rechecked(
 
 /// Release the slot, unless an acquire of it runs. That acquire settles the
 /// slot itself.
-// The lock stays held across the release. Then no acquire can begin between
-// the check and the release.
-#[allow(clippy::significant_drop_tightening)]
 fn release_session_slot_unless_acquiring(
     registry: &crate::sessions::SessionSlotRegistry,
     session_id: crate::types::SessionId,
 ) {
     let activity = slot_activity();
-    if activity
+    let acquiring = activity
         .get(&slot_key(registry, session_id))
-        .is_some_and(|slot| slot.acquires > 0)
-    {
-        return;
+        .is_some_and(|slot| slot.acquires > 0);
+    if !acquiring {
+        crate::sessions::release_session_slot(registry, session_id);
     }
-    crate::sessions::release_session_slot(registry, session_id);
+    // Hold the lock until after the release. No acquire can then begin between
+    // the check and the release.
+    drop(activity);
 }
 
 /// An acquire in progress on a slot. The count goes when this value drops.
@@ -15977,16 +15983,19 @@ async fn process_activity_task(
         // (issue #1788). A released claim would append a second start.
         let retry_policy =
             retry_policy_or_fail_task(pool, task, worker_id, registry.payload_codecs()).await?;
-        return write_activity_result(
-            pool,
-            registry,
+        let attempt = ActivityAttempt {
             task,
             exec_id,
             activity_id,
             worker_id,
+            activity_name,
+        };
+        return write_activity_result(
+            pool,
+            registry,
+            &attempt,
             retry_policy.as_ref(),
             &Err(payload),
-            activity_name,
         )
         .await;
     }
@@ -16494,18 +16503,31 @@ async fn process_activity_task(
         &task.queue_name,
         &activity_result,
     );
-    write_activity_result(
-        pool,
-        registry,
+    let attempt = ActivityAttempt {
         task,
         exec_id,
         activity_id,
         worker_id,
+        activity_name,
+    };
+    write_activity_result(
+        pool,
+        registry,
+        &attempt,
         retry_policy.as_ref(),
         &activity_result,
-        activity_name,
     )
     .await
+}
+
+/// The activity attempt whose result [`write_activity_result`] writes.
+#[derive(Clone, Copy)]
+struct ActivityAttempt<'a> {
+    task: &'a TaskQueueItem,
+    exec_id: ExecutionId,
+    activity_id: ActivityExecId,
+    worker_id: &'a str,
+    activity_name: &'a str,
 }
 
 /// Write the result of an activity attempt that has started (issue #1788).
@@ -16520,18 +16542,20 @@ async fn process_activity_task(
 /// `activity_result` is already cap-normalized: an oversized `Ok` is a
 /// non-retryable `Err`. So the cap passed to `handle_activity_result` is 0,
 /// which skips a second check.
-#[allow(clippy::too_many_arguments)]
 async fn write_activity_result(
     pool: &DbPool,
     registry: &HandlerRegistry,
-    task: &TaskQueueItem,
-    exec_id: ExecutionId,
-    activity_id: ActivityExecId,
-    worker_id: &str,
+    attempt_of: &ActivityAttempt<'_>,
     retry_policy: Option<&RetryPolicy>,
     activity_result: &Result<serde_json::Value, String>,
-    activity_name: &str,
 ) -> HarvestResult<()> {
+    let ActivityAttempt {
+        task,
+        exec_id,
+        activity_id,
+        worker_id,
+        activity_name,
+    } = *attempt_of;
     let mut conn = crate::pool::acquire_with_retries(pool, FINALIZE_ACQUIRE_ATTEMPTS).await?;
     let attempts = result_write_attempts(registry.payload_offloader().is_some());
     let mut attempt = 1;
@@ -33932,7 +33956,10 @@ mod tests {
         // genuinely-overdue schedule living on the failed shard).
         let previous = key_set(&[("workflow", "a"), ("workflow", "b")]);
         let current = key_set(&[("workflow", "a")]);
-        assert!(labels_to_clear(&previous, &current, false).is_empty());
+        assert_eq!(
+            labels_to_clear(&previous, &current, false),
+            [] as [(std::string::String, std::string::String); 0]
+        );
     }
 
     #[test]
@@ -33940,7 +33967,10 @@ mod tests {
         // previous ⊆ current → [] (nothing disappeared).
         let previous = key_set(&[("workflow", "a")]);
         let current = key_set(&[("workflow", "a"), ("dag", "b")]);
-        assert!(labels_to_clear(&previous, &current, true).is_empty());
+        assert_eq!(
+            labels_to_clear(&previous, &current, true),
+            [] as [(std::string::String, std::string::String); 0]
+        );
     }
 
     #[test]
@@ -33948,7 +33978,10 @@ mod tests {
         // Empty previous (first pass) → [] regardless of current.
         let previous = std::collections::HashSet::new();
         let current = key_set(&[("workflow", "a")]);
-        assert!(labels_to_clear(&previous, &current, true).is_empty());
+        assert_eq!(
+            labels_to_clear(&previous, &current, true),
+            [] as [(std::string::String, std::string::String); 0]
+        );
     }
 
     /// A pool that builds without connecting, aimed at a closed port.
@@ -34640,7 +34673,7 @@ mod tests {
             value: "x".to_string(),
             explicit_clear: false,
         }];
-        assert!(collect_log_lines(&cmds).is_empty());
+        assert_eq!(collect_log_lines(&cmds), [] as [store::WorkflowLogLine; 0]);
     }
 
     #[test]
@@ -35651,7 +35684,10 @@ mod tests {
     fn monitor_shard_scope_passes_the_full_list_through_on_the_single_pool_fallback() {
         let all = vec![crate::types::ShardId::new(0), crate::types::ShardId::new(1)];
         assert_eq!(monitor_shard_scope(None, &all), all);
-        assert!(monitor_shard_scope(None, &[]).is_empty());
+        assert_eq!(
+            monitor_shard_scope(None, &[]),
+            [] as [crate::types::ShardId; 0]
+        );
     }
 
     /// The multi-shard loop floors its bound at `MIN_SHARD_ACQUIRE_BOUND`.
@@ -36432,7 +36468,10 @@ mod tests {
         let resolved = resolved_external_ids(&new_events);
         assert!(!resolved.is_empty());
         assert_eq!(resolved.signal_ids, vec![sid]);
-        assert!(resolved.cancel_ids.is_empty());
+        assert_eq!(
+            resolved.cancel_ids,
+            [] as [crate::types::ExternalCancelId; 0]
+        );
     }
 
     #[test]
@@ -36445,7 +36484,10 @@ mod tests {
         let resolved = resolved_external_ids(&new_events);
         assert!(!resolved.is_empty());
         assert_eq!(resolved.cancel_ids, vec![cid]);
-        assert!(resolved.signal_ids.is_empty());
+        assert_eq!(
+            resolved.signal_ids,
+            [] as [crate::types::ExternalSignalId; 0]
+        );
     }
 
     #[test]
@@ -36497,7 +36539,10 @@ mod tests {
         ];
         let resolved = resolved_external_ids(&new_events);
         assert_eq!(resolved.signal_ids, vec![sid_a]);
-        assert!(resolved.cancel_ids.is_empty());
+        assert_eq!(
+            resolved.cancel_ids,
+            [] as [crate::types::ExternalCancelId; 0]
+        );
     }
 
     #[test]
@@ -36521,8 +36566,14 @@ mod tests {
         ];
         let resolved = resolved_external_ids(&new_events);
         assert_eq!(resolved.await_ids, vec![aid]);
-        assert!(resolved.signal_ids.is_empty());
-        assert!(resolved.cancel_ids.is_empty());
+        assert_eq!(
+            resolved.signal_ids,
+            [] as [crate::types::ExternalSignalId; 0]
+        );
+        assert_eq!(
+            resolved.cancel_ids,
+            [] as [crate::types::ExternalCancelId; 0]
+        );
     }
 
     // ── inline-vs-outbox await terminal de-duplication (issue #757 review, P1) ──
@@ -37671,7 +37722,10 @@ mod tests {
             batch.children.is_empty(),
             "a detached spawn is NOT an awaited child"
         );
-        assert!(batch.activity_waits.is_empty());
+        assert_eq!(
+            batch.activity_waits,
+            [] as [crate::types::ActivityExecId; 0]
+        );
         assert!(!batch.waits_on_signal);
     }
 
@@ -38422,7 +38476,7 @@ mod tests {
             ..default_runtime_config()
         };
         let worker = Worker::new(cfg, registry.clone()).unwrap();
-        assert!(worker.ineligible_activities.is_empty());
+        assert_eq!(worker.ineligible_activities, [] as [std::string::String; 0]);
 
         // Worker with cpu only, region = us-east-1 (act_gpu is ineligible)
         let mut labels = std::collections::HashMap::new();
@@ -41731,7 +41785,14 @@ mod tests {
             name: "m".into(),
             details: Value::Null,
         }];
-        assert!(collect_update_result_metrics(&history, &cmds).is_empty());
+        assert_eq!(
+            collect_update_result_metrics(&history, &cmds),
+            [] as [(
+                std::string::String,
+                bool,
+                std::option::Option<chrono::DateTime<chrono::Utc>>
+            ); 0]
+        );
     }
 
     #[test]
