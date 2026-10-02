@@ -159,6 +159,8 @@ struct Spec<'a> {
     lease_ttl: Duration,
     batch: u32,
     codecs: PayloadCodecs,
+    /// The shards this checker scans. Defaults to `[shard]`.
+    scope: Vec<ShardId>,
 }
 
 impl<'a> Spec<'a> {
@@ -170,6 +172,7 @@ impl<'a> Spec<'a> {
             lease_ttl,
             batch: timeout::DEFAULT_TIMEOUT_SCAN_BATCH_SIZE,
             codecs: PayloadCodecs::default(),
+            scope: vec![shard],
         }
     }
 }
@@ -188,7 +191,7 @@ fn spawn_checker(pool: &DbPool, spec: Spec<'_>) -> Checker {
         telemetry,
         Duration::from_secs(5),
         None,
-        vec![spec.shard],
+        spec.scope,
         Arc::new(autumn_harvest::circuit_breaker::CircuitBreakerRegistry::default()),
         None,
         60,
@@ -720,6 +723,43 @@ async fn standby_takes_over_within_lease_ttl() {
     }
 
     stop_all(checkers).await;
+}
+
+/// Checkers on one pool that scan different shards must not share a lease.
+/// A shared lease would leave the standby's shards unscanned, because each
+/// pass scans only its own checker's shards.
+#[tokio::test]
+async fn checkers_with_different_scopes_each_lead() {
+    let (url, _container) = setup_test_db_url().await;
+    let pool = build_pool(&url);
+    let shard = ShardId::new(17_956);
+    let interval = Duration::from_millis(100);
+
+    let checkers: Vec<Checker> = [("own", vec![shard]), ("other", vec![ShardId::new(17_957)])]
+        .into_iter()
+        .map(|(holder, scope)| {
+            let mut spec = Spec::new(shard, holder, interval, Duration::from_secs(5));
+            spec.scope = scope;
+            spawn_checker(&pool, spec)
+        })
+        .collect();
+    wait_for("10 ticks on every checker", Duration::from_secs(30), || {
+        checkers.iter().all(|c| c.metrics.ticks() >= 10)
+    })
+    .await;
+    let standby: Vec<usize> = checkers.iter().map(|c| c.metrics.role("standby")).collect();
+    let leader: Vec<usize> = checkers.iter().map(|c| c.metrics.role("leader")).collect();
+    stop_all(checkers).await;
+
+    assert_eq!(
+        standby,
+        [0, 0],
+        "neither checker may stand by for the other"
+    );
+    assert!(
+        leader.iter().all(|n| *n > 0),
+        "each scope must have its own leader, got {leader:?}"
+    );
 }
 
 /// A failed lease query does not stop enforcement: the checker runs the

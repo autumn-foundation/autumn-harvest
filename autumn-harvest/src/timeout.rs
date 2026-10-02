@@ -5468,14 +5468,17 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
         .unwrap_or(crate::types::ShardId::new(0));
     let lease_ttl =
         crate::scanner_lease::effective_lease_ttl(coordination.lease_ttl, interval, jitter);
-    let lease = coordination.holder.map(|holder| {
-        ScannerLease::new(
-            lease_shard,
-            crate::scanner_health::Scanner::Timeout,
-            holder,
-            lease_ttl,
-        )
-    });
+    // The key carries this checker's scope when the scope is not just the
+    // lease shard. Checkers on one pool with different shard assignments then
+    // each lead their own scope, instead of one leaving the others unscanned.
+    let lease_key = crate::scanner_lease::lease_scanner_key(
+        crate::scanner_health::Scanner::Timeout,
+        lease_shard,
+        &shard_assignments,
+    );
+    let lease = coordination
+        .holder
+        .map(|holder| ScannerLease::new(lease_shard, lease_key, holder, lease_ttl));
     let task_batch_size = i64::from(task_batch_size.max(1));
 
     // Issue #797: declare this loop (and the sub-passes it drives) before the

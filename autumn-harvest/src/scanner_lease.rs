@@ -271,6 +271,29 @@ pub fn effective_lease_ttl(ttl: Duration, interval: Duration, jitter: f64) -> Du
         .min(LEASE_TTL_HARD_CAP)
 }
 
+/// The `scanner` column of a checker's lease row.
+///
+/// A checker that scans exactly its lease shard uses the bare scanner name.
+/// Any other scope adds its sorted shard ids, for example `timeout:1,2`. Two
+/// checkers then share a lease only when they scan the same shards. This
+/// matters when workers share one pool but have different shard assignments.
+/// A shared lease there would leave the standbys' shards unscanned.
+#[must_use]
+pub fn lease_scanner_key(
+    scanner: crate::scanner_health::Scanner,
+    lease_shard: crate::types::ShardId,
+    scope: &[crate::types::ShardId],
+) -> String {
+    let mut ids: Vec<i32> = scope.iter().map(|s| s.as_i32()).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.is_empty() || ids == [lease_shard.as_i32()] {
+        return scanner.as_str().to_owned();
+    }
+    let ids: Vec<String> = ids.iter().map(i32::to_string).collect();
+    format!("{}:{}", scanner.as_str(), ids.join(","))
+}
+
 #[cfg(feature = "db")]
 pub use db::ScannerLease;
 
@@ -283,7 +306,6 @@ mod db {
     use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 
     use crate::error::{HarvestError, HarvestResult, database_error};
-    use crate::scanner_health::Scanner;
     use crate::types::ShardId;
 
     /// Take the lease, or renew it when this holder has it.
@@ -331,23 +353,25 @@ mod db {
     #[derive(Debug, Clone)]
     pub struct ScannerLease {
         shard: ShardId,
-        scanner: Scanner,
+        scanner: String,
         holder: String,
         ttl: Duration,
     }
 
     impl ScannerLease {
         /// A lease on `scanner` for `shard`, held as `holder` for `ttl`.
+        ///
+        /// `scanner` is the row key, from [`super::lease_scanner_key`].
         #[must_use]
         pub fn new(
             shard: ShardId,
-            scanner: Scanner,
+            scanner: impl Into<String>,
             holder: impl Into<String>,
             ttl: Duration,
         ) -> Self {
             Self {
                 shard,
-                scanner,
+                scanner: scanner.into(),
                 holder: holder.into(),
                 ttl,
             }
@@ -378,7 +402,7 @@ mod db {
                     .map_err(database_error)?;
                 let rows: Vec<EpochRow> = diesel::sql_query(ACQUIRE_SQL)
                     .bind::<Integer, _>(self.shard.as_i32())
-                    .bind::<Text, _>(self.scanner.as_str())
+                    .bind::<Text, _>(&self.scanner)
                     .bind::<Text, _>(&self.holder)
                     .bind::<Double, _>(self.ttl.as_secs_f64())
                     .load(conn)
@@ -406,7 +430,7 @@ mod db {
                     .map_err(database_error)?;
                 diesel::sql_query(RELEASE_SQL)
                     .bind::<Integer, _>(self.shard.as_i32())
-                    .bind::<Text, _>(self.scanner.as_str())
+                    .bind::<Text, _>(&self.scanner)
                     .bind::<Text, _>(&self.holder)
                     .execute(conn)
                     .await
@@ -522,6 +546,28 @@ mod tests {
         }
         .coordination("w1");
         assert_eq!(off.holder, None);
+    }
+
+    #[test]
+    fn lease_key_adds_the_scope_only_when_it_differs_from_the_lease_shard() {
+        use crate::scanner_health::Scanner;
+        use crate::types::ShardId;
+        let s = |n| ShardId::new(n);
+        assert_eq!(lease_scanner_key(Scanner::Timeout, s(0), &[]), "timeout");
+        assert_eq!(
+            lease_scanner_key(Scanner::Timeout, s(3), &[s(3)]),
+            "timeout"
+        );
+        assert_eq!(
+            lease_scanner_key(Scanner::Timeout, s(0), &[s(2), s(1), s(2)]),
+            "timeout:1,2",
+            "sorted and deduplicated, so the same set gives the same key"
+        );
+        assert_ne!(
+            lease_scanner_key(Scanner::Timeout, s(0), &[s(1)]),
+            lease_scanner_key(Scanner::Timeout, s(0), &[s(2)]),
+            "different scopes must not share a lease"
+        );
     }
 
     #[test]
