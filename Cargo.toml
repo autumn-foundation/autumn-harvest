@@ -84,6 +84,12 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
+# Clippy 1.99 flags the field init that `#[derive(diesel::QueryableByName)]`
+# generates. The derive output is not editable.
+redundant_field_names = "allow"
+# The lint suggests `assert_eq!(x, [] as [T; 0])`. That reads worse than
+# `assert!(x.is_empty())`.
+assert_is_empty = "allow"
 
 [profile.dev.package.bollard-stubs]
 opt-level = 0
