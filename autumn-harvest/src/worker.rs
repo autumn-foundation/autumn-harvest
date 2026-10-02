@@ -26267,8 +26267,8 @@ fn multi_shard_listener_url(
 /// The build runs on a dedicated connection, never a pooled one. The engine
 /// holds no DSN for a pool, so the exporter reuses the LISTEN/NOTIFY URL for
 /// the shard. The rule is the queue listener's own. A per-shard entry wins.
-/// The global URL pairs with the default pool, so it serves a shard only
-/// when that shard is the pool's default, or when there is no shard at all.
+/// The global URL pairs with the default pool. It serves a shard only when
+/// that shard is the pool's default, or when there is no shard at all.
 /// Any other shard without an entry gets `None`: the exporter then logs the
 /// statement for an operator and never builds.
 fn audit_index_build_dsn<'a>(

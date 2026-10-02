@@ -5178,7 +5178,7 @@ async fn unexported_idx_state(conn: &mut diesel_async::AsyncPgConnection) -> Opt
     .load(conn)
     .await
     .expect("index state");
-    rows.iter().next().map(|r| r.valid)
+    rows.into_iter().next().map(|r| r.valid)
 }
 
 async fn create_unexported_idx(conn: &mut diesel_async::AsyncPgConnection) {
