@@ -898,32 +898,15 @@ async fn fire_claimed_debounce_row(
     let shard = crate::types::ShardId::new(row.shard_id);
     let exec_id = crate::types::ExecutionId::new_for_shard(shard);
 
-    let reuse_policy = opts
-        .reuse_policy
-        .as_deref()
-        .and_then(parse_reuse_policy)
-        .unwrap_or(crate::types::WorkflowIdReusePolicy::AllowDuplicate);
-
-    let execution_timeout = opts
-        .execution_timeout_secs
-        .and_then(chrono::Duration::try_seconds);
-    let sla = opts.sla_secs.and_then(chrono::Duration::try_seconds);
-    let max_execution_timeout_ceiling = opts
-        .max_execution_timeout_ceiling_secs
-        .and_then(chrono::Duration::try_seconds);
-    // Chain-scoped lifetime cap captured at admission (issue #617), so a debounced
-    // start of a `#[workflow(chain_execution_timeout = ...)]` workflow does not
-    // silently drop the declared cap.
-    let chain_execution_timeout = opts
-        .chain_execution_timeout_secs
-        .and_then(chrono::Duration::try_seconds);
-    let max_workflow_chain_timeout_ceiling = opts
-        .max_workflow_chain_timeout_ceiling_secs
-        .and_then(chrono::Duration::try_seconds);
-    let priority = opts
-        .priority
-        .and_then(crate::types::Priority::from_i32)
-        .unwrap_or_default();
+    let DeferredAdmissionFields {
+        reuse_policy,
+        execution_timeout,
+        sla,
+        max_execution_timeout_ceiling,
+        chain_execution_timeout,
+        max_workflow_chain_timeout_ceiling,
+        priority,
+    } = decode_deferred_admission_fields(&opts);
 
     let workflow_name = row.workflow_name;
     let workflow_id = row.workflow_id;
@@ -1099,6 +1082,63 @@ pub(crate) fn parse_reuse_policy(s: &str) -> Option<crate::types::WorkflowIdReus
         "allow_duplicate_failed_only" => Some(AllowDuplicateFailedOnly),
         "terminate_if_running" => Some(TerminateIfRunning),
         _ => None,
+    }
+}
+
+/// Timing, reuse-policy and priority fields common to every deferred
+/// (debounce/throttle/batch) fire path, decoded from the persisted
+/// [`DebounceStartOptions`].
+///
+/// Shared with `throttle.rs` and `event_batch.rs`, which each fire a
+/// different deferred-start carrier from the same `DebounceStartOptions`
+/// blob. `start_source`'s pre-#740-row fallback differs by carrier (API vs.
+/// batch vs. schedule/backfill-derived), so it stays decoded at each call
+/// site rather than here.
+#[cfg(feature = "db")]
+pub(crate) struct DeferredAdmissionFields {
+    pub reuse_policy: crate::types::WorkflowIdReusePolicy,
+    pub execution_timeout: Option<chrono::Duration>,
+    pub sla: Option<chrono::Duration>,
+    pub max_execution_timeout_ceiling: Option<chrono::Duration>,
+    /// Chain-scoped lifetime cap captured at admission (issue #617), so a
+    /// deferred start of a `#[workflow(chain_execution_timeout = ...)]`
+    /// workflow does not silently drop the declared cap.
+    pub chain_execution_timeout: Option<chrono::Duration>,
+    pub max_workflow_chain_timeout_ceiling: Option<chrono::Duration>,
+    pub priority: crate::types::Priority,
+}
+
+/// Decode [`DeferredAdmissionFields`] from persisted start options.
+///
+/// Pure and unit-testable without a database.
+#[cfg(feature = "db")]
+#[must_use]
+pub(crate) fn decode_deferred_admission_fields(
+    opts: &DebounceStartOptions,
+) -> DeferredAdmissionFields {
+    DeferredAdmissionFields {
+        reuse_policy: opts
+            .reuse_policy
+            .as_deref()
+            .and_then(parse_reuse_policy)
+            .unwrap_or(crate::types::WorkflowIdReusePolicy::AllowDuplicate),
+        execution_timeout: opts
+            .execution_timeout_secs
+            .and_then(chrono::Duration::try_seconds),
+        sla: opts.sla_secs.and_then(chrono::Duration::try_seconds),
+        max_execution_timeout_ceiling: opts
+            .max_execution_timeout_ceiling_secs
+            .and_then(chrono::Duration::try_seconds),
+        chain_execution_timeout: opts
+            .chain_execution_timeout_secs
+            .and_then(chrono::Duration::try_seconds),
+        max_workflow_chain_timeout_ceiling: opts
+            .max_workflow_chain_timeout_ceiling_secs
+            .and_then(chrono::Duration::try_seconds),
+        priority: opts
+            .priority
+            .and_then(crate::types::Priority::from_i32)
+            .unwrap_or_default(),
     }
 }
 
@@ -1407,4 +1447,93 @@ mod tests {
     }
 
     const QUOTA_REDEFER_BACKOFF_FOR_TEST: chrono::Duration = chrono::Duration::seconds(5);
+
+    // ── decode_deferred_admission_fields ─────────────────────────────────────
+    //
+    // Characterizes the field-by-field decode shared by debounce/throttle/
+    // batch fire (clone class: debounce.rs, throttle.rs, event_batch.rs x2;
+    // co-changed in 896978eb (#617) and 3fa812d2 (#740)). Pins the behavior
+    // that was previously inlined at each of those four call sites.
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn decode_deferred_admission_fields_all_absent_uses_defaults() {
+        let decoded = decode_deferred_admission_fields(&DebounceStartOptions::default());
+        assert_eq!(
+            decoded.reuse_policy,
+            crate::types::WorkflowIdReusePolicy::AllowDuplicate
+        );
+        assert_eq!(decoded.execution_timeout, None);
+        assert_eq!(decoded.sla, None);
+        assert_eq!(decoded.max_execution_timeout_ceiling, None);
+        assert_eq!(decoded.chain_execution_timeout, None);
+        assert_eq!(decoded.max_workflow_chain_timeout_ceiling, None);
+        assert_eq!(decoded.priority, crate::types::Priority::default());
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn decode_deferred_admission_fields_decodes_every_present_field() {
+        let opts = DebounceStartOptions {
+            reuse_policy: Some("reject_duplicate".to_string()),
+            execution_timeout_secs: Some(30),
+            sla_secs: Some(60),
+            max_execution_timeout_ceiling_secs: Some(3600),
+            chain_execution_timeout_secs: Some(7200),
+            max_workflow_chain_timeout_ceiling_secs: Some(86400),
+            priority: Some(crate::types::Priority::High.as_i32()),
+            ..DebounceStartOptions::default()
+        };
+        let decoded = decode_deferred_admission_fields(&opts);
+        assert_eq!(
+            decoded.reuse_policy,
+            crate::types::WorkflowIdReusePolicy::RejectDuplicate
+        );
+        assert_eq!(
+            decoded.execution_timeout,
+            Some(chrono::Duration::seconds(30))
+        );
+        assert_eq!(decoded.sla, Some(chrono::Duration::seconds(60)));
+        assert_eq!(
+            decoded.max_execution_timeout_ceiling,
+            Some(chrono::Duration::seconds(3600))
+        );
+        assert_eq!(
+            decoded.chain_execution_timeout,
+            Some(chrono::Duration::seconds(7200))
+        );
+        assert_eq!(
+            decoded.max_workflow_chain_timeout_ceiling,
+            Some(chrono::Duration::seconds(86400))
+        );
+        assert_eq!(decoded.priority, crate::types::Priority::High);
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn decode_deferred_admission_fields_unparseable_reuse_policy_falls_back() {
+        // An unrecognised persisted string (e.g. written by a future version
+        // this build does not know) must fall back to AllowDuplicate rather
+        // than error -- mirrors every inline call site's prior behavior.
+        let opts = DebounceStartOptions {
+            reuse_policy: Some("some_future_policy".to_string()),
+            ..DebounceStartOptions::default()
+        };
+        let decoded = decode_deferred_admission_fields(&opts);
+        assert_eq!(
+            decoded.reuse_policy,
+            crate::types::WorkflowIdReusePolicy::AllowDuplicate
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn decode_deferred_admission_fields_unparseable_priority_falls_back() {
+        let opts = DebounceStartOptions {
+            priority: Some(999),
+            ..DebounceStartOptions::default()
+        };
+        let decoded = decode_deferred_admission_fields(&opts);
+        assert_eq!(decoded.priority, crate::types::Priority::default());
+    }
 }
