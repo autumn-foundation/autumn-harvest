@@ -107,6 +107,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          metrics_integration
 linux        autumn-harvest         integration                      -                          migrate_tests
 linux        autumn-harvest         integration                      -                          mixed_suspension_tests
+linux        autumn-harvest         integration                      -                          mixed_suspension_timer_batch_perf
 linux        autumn-harvest         integration                      -                          mutex_lease_reclaim_perf
 linux        autumn-harvest         integration                      -                          mutex_tests
 linux        autumn-harvest         integration                      -                          notify_post_commit_tests
@@ -145,6 +146,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          slot_tuner_tests
 linux        autumn-harvest         integration                      -                          start_idempotency_tests
 linux        autumn-harvest         integration                      -                          start_source_tests
+linux        autumn-harvest         integration                      -                          sticky_default_tests
 linux        autumn-harvest         integration                      -                          terminal_write_ownership_tests
 linux        autumn-harvest         integration                      -                          throttle_bucket_prelock_batch_perf
 linux        autumn-harvest         integration                      -                          transactional_start_tests

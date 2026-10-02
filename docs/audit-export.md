@@ -16,18 +16,34 @@ HTTP client, a `reqwest` signed-webhook implementation in the plugin, a
 two-transaction scanner that never holds a row lock across network I/O, and a
 per-shard cursor that advances only on acknowledgement.
 
-- **It is opt-in, but one cost is not zero.** With no sink configured, no
-  sequence is assigned, no cursor row is created, and the scanner returns
-  before issuing a single query. Insert behavior is the exception:
-  `harvest_audit_log_unexported_idx` is a partial index on `export_seq IS
-  NULL`. An unconfigured deployment leaves every row `NULL` forever, so the
-  index matches the whole audit table. Every audit insert then pays its
-  maintenance cost. That cost is bounded only while retention actually
-  reclaims unexported rows. See "Retention interaction" below for the exact
-  conditions, which are more than one config flag. Tracked as issue #1272.
-  Even then the bound is not total. Retention can never purge a
-  decommission or reactivation record, exported or not. That holds no
-  matter how many requests a shard has seen.
+- **It is opt-in, and an unconfigured deployment pays nothing for it.** With no
+  sink configured, no sequence is assigned, no cursor row is created, and the
+  scanner returns before issuing a single query. The claim-scan index
+  `harvest_audit_log_unexported_idx` does not exist either. Before issue #1667
+  a migration always created it. It matched every row while `export_seq` stayed
+  `NULL`, so each audit insert paid its maintenance cost (issue #1272). The
+  exporter now builds the index on its first tick, with `CREATE INDEX
+  CONCURRENTLY`, so audit inserts continue during the build. The build runs on
+  a dedicated connection opened from the shard's notification database URL,
+  never on a pooled one, so a pool of any size exports during the build. A
+  migration drops the index from databases that never ran export. Databases
+  with a cursor row keep it. Two cases cannot build: a worker with no
+  notification URL for the shard, and a worker role that does not own
+  `harvest_audit_log` (`CREATE INDEX` needs ownership; no `GRANT` confers
+  it). A sharded worker needs a per-shard URL, because the global URL can
+  point at another database. The exporter then logs the statement and, for a
+  refused build, backs off for an hour. Run the statement once through the
+  role that owns the table, such as the migration role. The logged statement
+  names the schema that holds the worker's `harvest_audit_log`. The migration
+  role can have another default `search_path`, so keep that schema in the
+  statement. If an interrupted build left an invalid index, run `DROP INDEX
+  CONCURRENTLY IF EXISTS <schema>.harvest_audit_log_unexported_idx` first, as
+  its own statement. Do not transfer the table to the worker role. Export is
+  correct without
+  the index, only slower. Once export runs, the index size is bounded only
+  while retention reclaims unexported rows. See "Retention interaction"
+  below. Retention can never purge a decommission or reactivation record,
+  exported or not.
 - **It never touches workflow history.** No new `WorkflowEvent` variant, no
   replay-determinism impact. Audit rows are operational metadata; the exporter
   only reads them.

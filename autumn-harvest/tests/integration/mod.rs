@@ -78,6 +78,7 @@ mod completion_callback_tests;
 #[cfg(feature = "db")]
 mod completion_trigger_outbox_queue_perf;
 mod concurrency_key_tests;
+mod concurrency_model_ci;
 mod concurrency_supersede_tests;
 mod context_headers_tests;
 mod cross_region_dr_docs;
@@ -151,6 +152,8 @@ mod migrating_from_temporal_docs;
 mod migration_hygiene;
 #[cfg(feature = "db")]
 mod mixed_suspension_tests;
+#[cfg(feature = "db")]
+mod mixed_suspension_timer_batch_perf;
 #[cfg(feature = "db")]
 mod mutex_lease_reclaim_perf;
 #[cfg(feature = "db")]
@@ -255,6 +258,8 @@ mod sqlite_feasibility_docs;
 mod start_idempotency_tests;
 #[cfg(feature = "db")]
 mod start_source_tests;
+#[cfg(feature = "db")]
+mod sticky_default_tests;
 mod sticky_routing_tests;
 mod telemetry_span_tests;
 #[cfg(feature = "db")]

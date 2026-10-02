@@ -4959,10 +4959,12 @@ async fn run_local_activity_inline(
                 // clamped to the configured ceiling -- previously this only
                 // ever consulted the registered RetryPolicy's own backoff,
                 // silently ignoring a downstream-supplied delay hint.
-                let policy_delay = run
-                    .retry_policy
-                    .as_ref()
-                    .and_then(|p| p.next_delay(attempt));
+                let policy_delay = local_policy_delay(
+                    run.retry_policy.as_ref(),
+                    exec_id,
+                    run.activity_id,
+                    attempt,
+                );
                 if let Some(delay) =
                     local_retry_delay(policy_delay, typed.as_ref(), registry.retry_after_ceiling)
                 {
@@ -5022,17 +5024,39 @@ pub(crate) fn task_attempt(task: &TaskQueueItem) -> u32 {
     u32::try_from(task.attempt.max(1)).unwrap_or(1)
 }
 
-#[allow(clippy::missing_const_for_fn)]
 fn retry_stream_seed(task: &TaskQueueItem) -> u64 {
+    retry_stream_seed_from_ids(task.workflow_exec_id, task.activity_id)
+}
+
+/// Retry jitter seed for a local activity (issue #1792).
+///
+/// The seed comes from the execution id and the activity id. With seed `0`,
+/// every local activity draws the same jitter and stays in step.
+fn local_retry_stream_seed(exec_id: ExecutionId, activity_id: ActivityExecId) -> u64 {
+    retry_stream_seed_from_ids(Some(exec_id.as_uuid()), Some(activity_id.as_uuid()))
+}
+
+/// The policy delay before local-activity `attempt`, jittered per activity.
+fn local_policy_delay(
+    policy: Option<&RetryPolicy>,
+    exec_id: ExecutionId,
+    activity_id: ActivityExecId,
+    attempt: u32,
+) -> Option<Duration> {
+    policy?.next_delay_with_seed(attempt, local_retry_stream_seed(exec_id, activity_id))
+}
+
+#[allow(clippy::missing_const_for_fn)]
+fn retry_stream_seed_from_ids(exec_id: Option<uuid::Uuid>, activity_id: Option<uuid::Uuid>) -> u64 {
     let mut seed = 0xcbf2_9ce4_8422_2325_u64;
-    if let Some(exec) = task.workflow_exec_id {
+    if let Some(exec) = exec_id {
         let raw = exec.as_u128().to_le_bytes();
         seed ^= u64::from_le_bytes(raw[..8].try_into().unwrap_or([0_u8; 8]));
         seed = seed.wrapping_mul(0x1000_0000_01b3);
         seed ^= u64::from_le_bytes(raw[8..].try_into().unwrap_or([0_u8; 8]));
         seed = seed.wrapping_mul(0x1000_0000_01b3);
     }
-    if let Some(activity) = task.activity_id {
+    if let Some(activity) = activity_id {
         let raw = activity.as_u128().to_le_bytes();
         seed ^= u64::from_le_bytes(raw[..8].try_into().unwrap_or([0_u8; 8]));
         seed = seed.wrapping_mul(0x1000_0000_01b3);
@@ -5040,6 +5064,60 @@ fn retry_stream_seed(task: &TaskQueueItem) -> u64 {
         seed = seed.wrapping_mul(0x1000_0000_01b3);
     }
     seed
+}
+
+/// PostgreSQL's bind-parameter ceiling for one statement.
+const TIMER_POSTGRES_MAX_BIND_PARAMS: usize = 65_535;
+
+/// Columns `NewHarvestTimer` binds per row.
+const NEW_HARVEST_TIMER_COLUMNS: usize = 3;
+
+/// Rows per multi-row `INSERT INTO harvest_timers`.
+///
+/// A mixed batch has no cap on its timer count. At three binds per row,
+/// `TIMER_ROWS_PER_INSERT_CHUNK * NEW_HARVEST_TIMER_COLUMNS` never reaches
+/// [`TIMER_POSTGRES_MAX_BIND_PARAMS`].
+const TIMER_ROWS_PER_INSERT_CHUNK: usize =
+    TIMER_POSTGRES_MAX_BIND_PARAMS / NEW_HARVEST_TIMER_COLUMNS;
+
+/// Timer ids per batched lookup.
+///
+/// The lookup binds one parameter per id, plus the execution id and the
+/// `fired` flag. Two spare slots keep it under the ceiling.
+const TIMER_LOOKUP_ID_CHUNK: usize = TIMER_POSTGRES_MAX_BIND_PARAMS - 2;
+
+/// Loads the un-fired `harvest_timers` rows for `timer_ids` on one execution,
+/// keyed by `timer_id`, in one statement.
+///
+/// The mixed-batch paths used to issue one `LIMIT 1` lookup per `StartTimer`.
+/// `harvest_timers` has no `(workflow_exec_id, timer_id)` index, so each of
+/// those lookups scanned the pending-timer index. One `eq_any` lookup scans it
+/// once. The table has no unique index either, so a duplicate un-fired row for
+/// one `timer_id` is possible in principle. The earliest `fires_at` wins, with
+/// `id` as the tiebreaker, which makes the choice deterministic.
+async fn load_unfired_timers_by_id(
+    conn: &mut AsyncPgConnection,
+    exec_id: uuid::Uuid,
+    timer_ids: &[&str],
+) -> HarvestResult<HashMap<String, HarvestTimer>> {
+    let mut by_id = HashMap::with_capacity(timer_ids.len());
+    if timer_ids.is_empty() {
+        return Ok(by_id);
+    }
+    for chunk in timer_ids.chunks(TIMER_LOOKUP_ID_CHUNK) {
+        let rows: Vec<HarvestTimer> = harvest_timers::table
+            .filter(harvest_timers::workflow_exec_id.eq(exec_id))
+            .filter(harvest_timers::timer_id.eq_any(chunk))
+            .filter(harvest_timers::fired.eq(false))
+            .order((harvest_timers::fires_at.asc(), harvest_timers::id.asc()))
+            .load(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+        for row in rows {
+            by_id.entry(row.timer_id.clone()).or_insert(row);
+        }
+    }
+    Ok(by_id)
 }
 
 /// Read the current time from the database clock (`NOW()`).
@@ -5091,15 +5169,15 @@ fn next_retry_delay(
         return Ok(None);
     }
 
+    let seed = retry_stream_seed(task);
     let policy_delay: Option<Duration> = retry_policy.map_or_else(
         || {
-            if task.attempt < task.max_attempts {
-                Some(Duration::from_secs(1))
-            } else {
-                None
-            }
+            // Full jitter over the 1s fallback (issue #1792).
+            (task.attempt < task.max_attempts).then(|| {
+                crate::policy::full_jitter(Duration::from_secs(1), seed, task_attempt(task))
+            })
         },
-        |policy| policy.next_delay_with_seed(task_attempt(task), retry_stream_seed(task)),
+        |policy| policy.next_delay_with_seed(task_attempt(task), seed),
     );
 
     // The attempt-cap gate is authoritative and must never be bypassed by a
@@ -5127,16 +5205,16 @@ fn next_retry_delay(
 /// Local activities retry INLINE in `run_local_activity_inline`, an entirely
 /// separate code path from the remote/task-queue retry loop `next_retry_delay`
 /// governs -- local activities never get a `harvest_task_queue` row, so there
-/// is no `schedule_to_close`/attempt-cap re-derivation to share here. The
-/// caller already parses the failure once (`parse_typed_payload`, for the
-/// existing `non_retryable` check) and only invokes this helper on a
-/// NON-terminal attempt, where `policy_delay`
-/// (`run.retry_policy.next_delay(attempt)`) is always `Some` in practice --
-/// `attempt < max_attempts` is guaranteed by the caller's `terminal_attempt`
-/// computation, and `RetryPolicy::next_delay` returns `None` only when
-/// `attempt >= max_attempts`. The attempt-cap gate is therefore already
-/// authoritative before this helper ever runs and is never bypassed by a
-/// `retry_after` hint (AC2).
+/// is no `schedule_to_close`/attempt-cap re-derivation to share here.
+///
+/// The caller parses the failure once, with `parse_typed_payload`, for the
+/// `non_retryable` check. It calls this helper only on a NON-terminal attempt.
+/// There, `policy_delay` (from `local_policy_delay`) is always `Some` in
+/// practice. The caller's `terminal_attempt` computation guarantees
+/// `attempt < max_attempts`. `RetryPolicy::next_delay_with_seed` returns `None`
+/// only when `attempt >= max_attempts`. The attempt-cap gate is therefore
+/// authoritative before this helper runs. A `retry_after` hint never bypasses
+/// it (AC2).
 fn local_retry_delay(
     policy_delay: Option<Duration>,
     typed: Option<&crate::failure::ActivityFailure>,
@@ -5668,9 +5746,10 @@ async fn update_workflow_execution_completed(
 /// Base delay before the first blocked re-dispatch (issue #603).
 const ND_BLOCK_BACKOFF_BASE_SECS: u64 = 5;
 
-/// Ceiling on the blocked re-dispatch delay (issue #603). A permanently
-/// diverging history is re-dispatched at most once per this interval, so a
-/// blocked cohort can never hot-loop worker slots. Retries are otherwise
+/// Ceiling on the blocked re-dispatch delay (issue #603). Equal jitter puts the
+/// delay at the cap in `[150s, 300s]` (issue #1792). A permanently diverging
+/// history thus re-dispatches at most once per 150s, so a blocked cohort can
+/// never hot-loop worker slots. Retries are otherwise
 /// unbounded — the block is rate-limited, not attempt-capped, so a rollback at
 /// any later time still resumes the execution (Temporal workflow-task-retry
 /// semantics; see `docs/runbooks/nondeterminism-block.md`).
@@ -5680,21 +5759,41 @@ const ND_BLOCK_BACKOFF_CAP_SECS: u64 = 300;
 /// capped at 300s (issue #603).
 ///
 /// `block_count` is the execution's `nd_block_count` *before* this block is
-/// recorded, so the first block waits 5s and the seventh-and-later waits the
-/// full 300s cap. Thin wrapper over the shared, more robust
+/// recorded. The first block thus has a 5s ceiling. The seventh and later
+/// blocks have the full 300s cap. [`nd_block_backoff_jittered`] picks the real
+/// delay in `[ceiling/2, ceiling]`. Thin wrapper over the shared, more robust
 /// [`crate::policy::compute_retry_delay`] (reuse per code-review finding) —
 /// `attempt` is 1-based there, so `block_count` (0-based) maps to
 /// `block_count + 1`; negative counts (impossible via the DB column, but
 /// defensive) clamp to attempt 1.
 fn nd_block_backoff(block_count: i32) -> Duration {
-    let attempt = u32::try_from(block_count.max(0))
-        .unwrap_or(u32::MAX)
-        .saturating_add(1);
     crate::policy::compute_retry_delay(
         Duration::from_secs(ND_BLOCK_BACKOFF_BASE_SECS),
         2.0,
         Duration::from_secs(ND_BLOCK_BACKOFF_CAP_SECS),
-        attempt,
+        count_to_attempt(block_count),
+    )
+}
+
+/// Map a 0-based count to the 1-based `attempt` of `compute_retry_delay`.
+///
+/// A negative count maps to attempt 1.
+fn count_to_attempt(count: i32) -> u32 {
+    u32::try_from(count.max(0))
+        .unwrap_or(u32::MAX)
+        .saturating_add(1)
+}
+
+/// [`nd_block_backoff`] with Equal jitter, in `[base/2, base]` (issue #1792).
+///
+/// When one bad deploy blocks many executions, they must not re-dispatch
+/// together. The block loop has no attempt cap. Equal jitter keeps half the
+/// backoff as a floor, so the loop cannot become a hot loop.
+fn nd_block_backoff_jittered(block_count: i32, task: &TaskQueueItem) -> Duration {
+    crate::policy::equal_jitter(
+        nd_block_backoff(block_count),
+        retry_stream_seed(task),
+        count_to_attempt(block_count),
     )
 }
 
@@ -6387,14 +6486,11 @@ pub const fn capability_miss_decision(
 /// `attempt`), mirroring [`nd_block_backoff`].
 #[must_use]
 pub fn capability_miss_backoff(misses_before_this_release: i32) -> Duration {
-    let attempt = u32::try_from(misses_before_this_release.max(0))
-        .unwrap_or(u32::MAX)
-        .saturating_add(1);
     crate::policy::compute_retry_delay(
         Duration::from_secs(CAPABILITY_MISS_BACKOFF_BASE_SECS),
         2.0,
         Duration::from_secs(CAPABILITY_MISS_BACKOFF_CAP_SECS),
-        attempt,
+        count_to_attempt(misses_before_this_release),
     )
 }
 
@@ -7591,9 +7687,10 @@ fn deadlock_retry_backoff(strikes: u32) -> Duration {
     )
 }
 
-/// Base delay before the first panic re-dispatch (issue #782). A short floor
-/// (>0) prevents a fast, deterministic panic from hot-looping worker slots
-/// while the operator hotfixes-and-redeploys.
+/// Base delay before the first panic re-dispatch (issue #782). Equal jitter
+/// keeps a floor of half this base (issue #1792). The floor (>0) prevents a
+/// fast, deterministic panic from hot-looping worker slots while the operator
+/// hotfixes-and-redeploys.
 const PANIC_RETRY_BACKOFF_BASE_SECS: u64 = 1;
 
 /// Ceiling on the panic re-dispatch delay (issue #782). The panic budget is
@@ -7605,7 +7702,8 @@ const PANIC_RETRY_BACKOFF_CAP_SECS: u64 = 30;
 /// capped at 30s (issue #782).
 ///
 /// `strikes` is the panic-strike count **after** this cycle's increment (1-based),
-/// so the first re-dispatch (`strikes == 1`) waits the base delay. Thin wrapper
+/// so the first re-dispatch (`strikes == 1`) has the base delay as its ceiling.
+/// [`panic_retry_backoff_jittered`] picks the real delay. Thin wrapper
 /// over the shared [`crate::policy::compute_retry_delay`] (`attempt` is 1-based
 /// there), so `strikes` maps directly to `attempt`; a `0` is clamped to `1`.
 fn panic_retry_backoff(strikes: u32) -> Duration {
@@ -7613,6 +7711,18 @@ fn panic_retry_backoff(strikes: u32) -> Duration {
         Duration::from_secs(PANIC_RETRY_BACKOFF_BASE_SECS),
         2.0,
         Duration::from_secs(PANIC_RETRY_BACKOFF_CAP_SECS),
+        strikes.max(1),
+    )
+}
+
+/// [`panic_retry_backoff`] with Equal jitter, in `[base/2, base]` (issue #1792).
+///
+/// Half the backoff is a floor. The floor stops a fast, deterministic panic
+/// from causing a hot loop.
+fn panic_retry_backoff_jittered(strikes: u32, task: &TaskQueueItem) -> Duration {
+    crate::policy::equal_jitter(
+        panic_retry_backoff(strikes),
+        retry_stream_seed(task),
         strikes.max(1),
     )
 }
@@ -7997,7 +8107,7 @@ async fn block_workflow_for_non_determinism(
     error: &str,
     details: &crate::error::NonDeterministicDetails,
 ) -> HarvestResult<()> {
-    let backoff = nd_block_backoff(execution.nd_block_count);
+    let backoff = nd_block_backoff_jittered(execution.nd_block_count, task);
     let backoff_chrono = chrono::Duration::from_std(backoff).unwrap_or_default();
     let error_owned = error.to_string();
     let patch = nd_search_attrs_patch(details);
@@ -8082,6 +8192,7 @@ async fn block_workflow_for_non_determinism(
         build_id,
         block_count = execution.nd_block_count.saturating_add(1),
         backoff_secs = backoff.as_secs(),
+        backoff_ms = backoff.as_millis(),
         event_index = ?details.event_index,
         expected = ?details.expected,
         actual = ?details.actual,
@@ -8638,16 +8749,14 @@ pub async fn persist_workflow_failure(
 /// Used to durably record in-flight update results before the terminal workflow
 /// event (`WorkflowCompleted`, `WorkflowFailed`, or a suspension side-effect).
 /// `next_event_id` is advanced by the number of events written.
-async fn persist_update_result_commands(
-    conn: &mut AsyncPgConnection,
-    exec_id: ExecutionId,
-    commands: &[WorkflowCommand],
-    next_event_id: &mut i32,
-    // Issue #1243: the configured payload-codec registry, so this write
-    // encodes under the same codecs replay decodes with.
-    codecs: &crate::payload_codec::PayloadCodecs,
-) -> HarvestResult<()> {
-    let events: Vec<WorkflowEvent> = commands
+/// Builds the `UpdateCompleted` / `UpdateFailed` events that
+/// [`persist_update_result_commands`] appends for `commands`.
+///
+/// A caller that persists update results inline and then keeps running
+/// on `history_events` must add these events too. Otherwise a replay of
+/// that history sees only `UpdateAdmitted`, and the handler runs again.
+fn update_result_events(commands: &[WorkflowCommand]) -> Vec<WorkflowEvent> {
+    commands
         .iter()
         .filter_map(|cmd| match cmd {
             WorkflowCommand::RecordUpdateResult { update_id, result } => Some(match result {
@@ -8662,7 +8771,19 @@ async fn persist_update_result_commands(
             }),
             _ => None,
         })
-        .collect();
+        .collect()
+}
+
+async fn persist_update_result_commands(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    commands: &[WorkflowCommand],
+    next_event_id: &mut i32,
+    // Issue #1243: the configured payload-codec registry, so this write
+    // encodes under the same codecs replay decodes with.
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<()> {
+    let events = update_result_events(commands);
 
     if events.is_empty() {
         return Ok(());
@@ -12363,21 +12484,26 @@ async fn persist_mixed_suspension_batch(
         let mut new_timer_rows: Vec<(TimerId, chrono::DateTime<chrono::Utc>)> = Vec::new();
         let mut timer_started_events: std::collections::VecDeque<Option<WorkflowEvent>> =
             std::collections::VecDeque::with_capacity(batch.timers.len());
+        let timer_ids: Vec<&str> = batch.timers.iter().map(|t| t.timer_id.as_str()).collect();
+        let existing_timers =
+            load_unfired_timers_by_id(conn, exec_id.as_uuid(), &timer_ids).await?;
+        // `NOW()` is the transaction start time, so one read serves every new
+        // timer in this batch.
+        let mut db_now: Option<chrono::DateTime<chrono::Utc>> = None;
         for timer in &batch.timers {
-            let existing: Option<HarvestTimer> = harvest_timers::table
-                .filter(harvest_timers::workflow_exec_id.eq(exec_id.as_uuid()))
-                .filter(harvest_timers::timer_id.eq(timer.timer_id.as_str()))
-                .filter(harvest_timers::fired.eq(false))
-                .first::<HarvestTimer>(conn)
-                .await
-                .optional()
-                .map_err(crate::error::database_error)?;
-            let fires_at = if let Some(ref ext) = existing {
+            let existing = existing_timers.get(timer.timer_id.as_str());
+            let fires_at = if let Some(ext) = existing {
                 ext.fires_at
             } else {
                 let fire_delay = chrono_duration_from_secs(timer.duration_secs, "timer duration")?;
-                let db_now = db_clock_now(conn).await?;
-                let fires_at = db_now + fire_delay;
+                let now = if let Some(now) = db_now {
+                    now
+                } else {
+                    let now = db_clock_now(conn).await?;
+                    db_now = Some(now);
+                    now
+                };
+                let fires_at = now + fire_delay;
                 new_timer_rows.push((timer.timer_id.clone(), fires_at));
                 fires_at
             };
@@ -12543,17 +12669,22 @@ async fn persist_mixed_suspension_batch(
         let activity_task_ids = queue::enqueue_batch(conn, &enqueued).await?;
 
         // Insert the durable rows for genuinely new timers.
-        for (timer_id, fires_at) in &new_timer_rows {
-            let new_timer = NewHarvestTimer {
-                workflow_exec_id: exec_id.as_uuid(),
-                timer_id: timer_id.as_str(),
-                fires_at: *fires_at,
-            };
-            diesel::insert_into(harvest_timers::table)
-                .values(&new_timer)
-                .execute(conn)
-                .await
-                .map_err(crate::error::database_error)?;
+        if !new_timer_rows.is_empty() {
+            let new_timers: Vec<NewHarvestTimer<'_>> = new_timer_rows
+                .iter()
+                .map(|(timer_id, fires_at)| NewHarvestTimer {
+                    workflow_exec_id: exec_id.as_uuid(),
+                    timer_id: timer_id.as_str(),
+                    fires_at: *fires_at,
+                })
+                .collect();
+            for chunk in new_timers.chunks(TIMER_ROWS_PER_INSERT_CHUNK) {
+                diesel::insert_into(harvest_timers::table)
+                    .values(chunk)
+                    .execute(conn)
+                    .await
+                    .map_err(crate::error::database_error)?;
+            }
         }
 
         // Issue #1484 review: already locked above. That combined pre-lock
@@ -20105,16 +20236,11 @@ async fn suspended_command_event_count(
         branch_events = branch_events
             .saturating_add(new_child_workflow_event_count(conn, &mixed.children).await?);
         if let Some(exec_uuid) = workflow_exec_id {
+            let timer_ids: Vec<&str> = mixed.timers.iter().map(|t| t.timer_id.as_str()).collect();
+            let existing_timers = load_unfired_timers_by_id(conn, exec_uuid, &timer_ids).await?;
             for timer in &mixed.timers {
-                let existing: Option<HarvestTimer> = harvest_timers::table
-                    .filter(harvest_timers::workflow_exec_id.eq(exec_uuid))
-                    .filter(harvest_timers::timer_id.eq(timer.timer_id.as_str()))
-                    .filter(harvest_timers::fired.eq(false))
-                    .first::<HarvestTimer>(conn)
-                    .await
-                    .optional()
-                    .map_err(crate::error::database_error)?;
-                branch_events = branch_events.saturating_add(u64::from(existing.is_none()));
+                let is_new = !existing_timers.contains_key(timer.timer_id.as_str());
+                branch_events = branch_events.saturating_add(u64::from(is_new));
             }
         } else {
             // No execution id to resolve against (the pure-preflight caller):
@@ -21123,24 +21249,7 @@ async fn process_workflow_task(
                     // them to `history_events` too. Otherwise that re-drive
                     // sees only `UpdateAdmitted`, `execute_admitted_update`
                     // takes its live path, and the handler runs a second time.
-                    let update_result_events: Vec<WorkflowEvent> = commands
-                        .iter()
-                        .filter_map(|cmd| match cmd {
-                            WorkflowCommand::RecordUpdateResult { update_id, result } => {
-                                Some(match result {
-                                    Ok(output) => WorkflowEvent::UpdateCompleted {
-                                        update_id: *update_id,
-                                        output: output.clone(),
-                                    },
-                                    Err(error) => WorkflowEvent::UpdateFailed {
-                                        update_id: *update_id,
-                                        error: error.clone(),
-                                    },
-                                })
-                            }
-                            _ => None,
-                        })
-                        .collect();
+                    let update_result_events = update_result_events(&commands);
                     persist_update_result_commands(
                         conn,
                         prepared.exec_id,
@@ -21443,6 +21552,10 @@ async fn process_workflow_task(
                     )
                     .await;
                 }
+                // Keep the persisted results in memory too (issue #1798). The
+                // in-process re-drive and the warm cache read `history_events`.
+                // Without them, the update handler runs a second time.
+                history_events.extend(update_result_events(&commands));
                 // Issue #684: the update results just persisted inline (autocommit)
                 // are stripped from the reconstructed suspension below, so they
                 // never reach the main-transaction Persisted-arm emission — emit
@@ -21698,6 +21811,10 @@ async fn process_workflow_task(
                     )
                     .await;
                 }
+                // Keep the persisted results in memory too (issue #1798). The
+                // warm cache stores `history_events` with `next_event_id`, so
+                // a result missing here never comes back on a delta load.
+                history_events.extend(update_result_events(&commands));
                 // Issue #684: `split_mixed_signal_batch` below drops
                 // `RecordUpdateResult` from `remaining_commands`, so these
                 // inline-persisted update results never reach the main-transaction
@@ -22032,7 +22149,8 @@ async fn process_workflow_task(
                 // `panic_retry_backoff` is bounded by PANIC_RETRY_BACKOFF_CAP_SECS
                 // (30s), always representable as a chrono::Duration; the fallback
                 // is defensive and still non-zero so it can never hot-loop.
-                let backoff = chrono::Duration::from_std(panic_retry_backoff(strikes))
+                let backoff = panic_retry_backoff_jittered(strikes, task);
+                let backoff = chrono::Duration::from_std(backoff)
                     .unwrap_or_else(|_| chrono::Duration::seconds(30));
                 tracing::warn!(
                     execution_id = %prepared.exec_id,
@@ -22041,6 +22159,7 @@ async fn process_workflow_task(
                     strikes,
                     max_attempts = workflow_panic_max_attempts,
                     backoff_secs = backoff.num_seconds(),
+                    backoff_ms = backoff.num_milliseconds(),
                     "harvest: workflow handler panicked; containing as a non-terminal \
                      re-dispatch (issue #782) — roll back or fix the panicking build"
                 );
@@ -26488,6 +26607,24 @@ fn multi_shard_listener_url(
         .map(|(_, url)| url.as_str())
 }
 
+/// The database URL the audit exporter uses for its claim-scan index build
+/// (issue #1667).
+///
+/// The build runs on a dedicated connection, never a pooled one. The engine
+/// holds no DSN for a pool, so the exporter reuses the LISTEN/NOTIFY URL for
+/// the shard. A sharded worker uses only the per-shard entry. The global URL
+/// is set apart from `sharded_pool` and can point at another database, even
+/// for the default shard. An unsharded worker has one pool and uses the global
+/// URL. A shard without a URL gets `None`: the exporter then logs the
+/// statement for an operator and never builds.
+fn audit_index_build_dsn<'a>(
+    per_shard: &'a [(crate::types::ShardId, String)],
+    global: Option<&'a str>,
+    shard: Option<crate::types::ShardId>,
+) -> Option<&'a str> {
+    shard.map_or(global, |shard| multi_shard_listener_url(per_shard, shard))
+}
+
 // ---------------------------------------------------------------------------
 // Dispatch channel consume path (issue #1312)
 // ---------------------------------------------------------------------------
@@ -27185,9 +27322,15 @@ fn reference_outcome(
             .unwrap_or(settings.release_backoff_cap);
         return ReferenceOutcome::Release(until.min(settings.release_backoff_cap));
     }
-    // Due but gated: a queue pause, a concurrency cap, a rate limit, sticky
-    // affinity, or any other claim gate. Back off so a held row does not cycle
-    // once per poll interval.
+    if probe.pinned_elsewhere {
+        // A live sticky pin names another worker (issue #1798). Hand the
+        // reference on at once, so the owner can see it before the pin ends.
+        // A growing delay here would outlast the sticky window.
+        return ReferenceOutcome::Release(settings.poll_interval.min(settings.release_backoff_cap));
+    }
+    // Due but gated: a queue pause, a concurrency cap, a rate limit, a session
+    // pin, or any other claim gate. Back off so a held row does not cycle once
+    // per poll interval.
     ReferenceOutcome::Release(crate::dispatch::release_delay(
         redeliveries,
         settings.poll_interval,
@@ -28083,9 +28226,8 @@ impl Worker {
             )
             .await;
         }
-
-        tracing::info!(worker_id = %self.config.worker_id, "draining in-flight tasks (multi-shard)");
-        self.drain_in_flight().await;
+        self.drain_releasing_sticky_pins(&shard_targets, shutdown_acquire_bound)
+            .await;
 
         // Stopped: mark every shard pool's worker row stopped, then cancel heartbeats.
         for (_, shard_pool) in &shard_targets {
@@ -28543,8 +28685,16 @@ impl Worker {
         self.transition_fleet_status(pool, crate::workers::WorkerStatus::Draining, None)
             .await;
 
+        // This worker claims no new task now. Release its pins before the
+        // drain, so a wake during the drain does not re-arm them.
+        self.release_sticky_pins(pool, None).await;
+
         tracing::info!(worker_id = %self.config.worker_id, "draining in-flight tasks");
         self.drain_in_flight().await;
+
+        // A decision that parked during the drain pinned its task again.
+        // Release once more. A task that outlived the drain keeps its pin.
+        self.release_sticky_pins(pool, None).await;
 
         // All tasks complete — mark Stopped, then stop the heartbeat task.
         self.transition_fleet_status(pool, crate::workers::WorkerStatus::Stopped, None)
@@ -29043,6 +29193,16 @@ impl Worker {
                     } else {
                         shard_pool.clone()
                     };
+                // The claim-scan index build opens its own connection
+                // (issue #1667). The shard's notification URL reaches the
+                // same database as its pool, by the rule the queue listener
+                // applies above. See `audit_index_build_dsn`.
+                let index_build_dsn = audit_index_build_dsn(
+                    &self.config.shard_notification_database_urls,
+                    self.config.notification_database_url.as_deref(),
+                    *shard,
+                )
+                .map(str::to_owned);
                 Some(crate::audit_export::spawn_audit_export_checker_for_shard(
                     resolved,
                     self.shutdown.clone(),
@@ -29050,6 +29210,7 @@ impl Worker {
                     self.registry.telemetry().clone(),
                     *shard,
                     self.config.sharded_pool.as_ref(),
+                    index_build_dsn,
                 ))
             })
             .collect();
@@ -29886,7 +30047,13 @@ impl Worker {
                 ReferenceDisposition::Dispatched(lease)
             }
             Ok(None) => {
-                let probe = match queue::dispatch_probe(&mut conn, lease.task_id).await {
+                let probe = match queue::dispatch_probe(
+                    &mut conn,
+                    lease.task_id,
+                    &self.config.worker_id,
+                )
+                .await
+                {
                     Ok(probe) => probe,
                     Err(error) => {
                         tracing::warn!(error = %error, task_id = %lease.task_id, "dispatch probe failed");
@@ -30616,6 +30783,56 @@ impl Worker {
                     "failed to acquire connection for rate limit bucket registration"
                 );
             }
+        }
+    }
+
+    /// Release the sticky pins of this worker on one pool (issue #1798).
+    ///
+    /// Best effort. A failure only makes a peer wait up to one sticky window.
+    async fn release_sticky_pins(&self, pool: &DbPool, acquire_bound: Option<Duration>) {
+        let worker_id = self.config.worker_id.as_str();
+        match acquire_shard_conn(pool, acquire_bound).await {
+            Ok(mut conn) => match queue::release_worker_sticky_pins(&mut conn, worker_id).await {
+                Ok(released) => {
+                    tracing::debug!(worker_id, released, "released sticky pins at shutdown");
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        worker_id,
+                        error = %error,
+                        "failed to release sticky pins at shutdown"
+                    );
+                }
+            },
+            Err(error) => {
+                tracing::warn!(
+                    worker_id,
+                    error = %error,
+                    "failed to get pool connection to release sticky pins"
+                );
+            }
+        }
+    }
+
+    /// Drain in-flight tasks of a multi-shard worker, with a sticky-pin
+    /// release on every shard pool before and after the drain (issue #1798).
+    ///
+    /// The first release stops a wake during the drain from re-arming a pin.
+    /// A decision that parks during the drain pins its task again, so the
+    /// second release clears that pin. A task that outlives the drain keeps
+    /// its pin.
+    async fn drain_releasing_sticky_pins(
+        &self,
+        shard_targets: &[(crate::types::ShardId, DbPool)],
+        acquire_bound: Option<Duration>,
+    ) {
+        for (_, shard_pool) in shard_targets {
+            self.release_sticky_pins(shard_pool, acquire_bound).await;
+        }
+        tracing::info!(worker_id = %self.config.worker_id, "draining in-flight tasks (multi-shard)");
+        self.drain_in_flight().await;
+        for (_, shard_pool) in shard_targets {
+            self.release_sticky_pins(shard_pool, acquire_bound).await;
         }
     }
 
@@ -32244,7 +32461,23 @@ pub(crate) fn under_provisioned_shard_pools(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn timer_batch_chunks_stay_under_the_bind_parameter_ceiling() {
+        const {
+            assert!(
+                TIMER_ROWS_PER_INSERT_CHUNK * NEW_HARVEST_TIMER_COLUMNS
+                    <= TIMER_POSTGRES_MAX_BIND_PARAMS
+            );
+            assert!(TIMER_LOOKUP_ID_CHUNK + 2 <= TIMER_POSTGRES_MAX_BIND_PARAMS);
+        }
+        // 21,845 rows fill one insert chunk. The next row starts a second chunk.
+        assert_eq!(21_845usize.div_ceil(TIMER_ROWS_PER_INSERT_CHUNK), 1);
+        assert_eq!(21_846usize.div_ceil(TIMER_ROWS_PER_INSERT_CHUNK), 2);
+        assert_eq!(65_536usize.div_ceil(TIMER_ROWS_PER_INSERT_CHUNK), 4);
+    }
+
     use super::*;
+    use crate::policy::JitterPolicy;
 
     /// Serializes every test below that installs or uninstalls a dispatch
     /// channel, global or per-shard (Codex review, issue #1429).
@@ -34827,6 +35060,33 @@ mod tests {
             multi_shard_listener_url(&per_shard, crate::types::ShardId::new(1)),
             Some("postgres://host/shard1"),
         );
+    }
+
+    /// Issue #1667: the index build URL follows the listener's rule. A
+    /// per-shard entry wins. The global URL serves only an unsharded worker.
+    /// A sharded pool can leave it aimed at another database, even for the
+    /// default shard.
+    #[test]
+    fn audit_index_build_dsn_follows_the_listener_rule() {
+        let per_shard = vec![(
+            crate::types::ShardId::new(1),
+            "postgres://host/shard1".to_string(),
+        )];
+        let global = Some("postgres://host/default");
+        assert_eq!(
+            audit_index_build_dsn(&per_shard, global, Some(crate::types::ShardId::new(1))),
+            Some("postgres://host/shard1"),
+        );
+        assert_eq!(
+            audit_index_build_dsn(&per_shard, global, Some(crate::types::ShardId::new(0))),
+            None,
+        );
+        assert_eq!(
+            audit_index_build_dsn(&per_shard, global, Some(crate::types::ShardId::new(2))),
+            None,
+        );
+        assert_eq!(audit_index_build_dsn(&per_shard, global, None), global);
+        assert_eq!(audit_index_build_dsn(&[], None, None), None);
     }
 
     /// **Issue #961 review (Codex P2).** A shard with no per-shard URL resolves
@@ -37483,6 +37743,38 @@ mod tests {
         assert_eq!(nd_block_backoff(i32::MAX), Duration::from_secs(300));
     }
 
+    /// Executions that block together must not re-dispatch together (issue #1792).
+    #[test]
+    fn nd_block_backoff_jittered_spreads_a_blocked_cohort() {
+        for count in [0, 3, 6, 20] {
+            let delays: std::collections::HashSet<Duration> = (0..100_u64)
+                .map(|exec| nd_block_backoff_jittered(count, &test_task(exec)))
+                .collect();
+            assert!(delays.len() > 1, "count {count}: one delay {delays:?}");
+        }
+    }
+
+    #[test]
+    fn nd_block_backoff_jittered_keeps_half_the_backoff_as_a_floor() {
+        for count in [-1, 0, 1, 5, 6, i32::MAX] {
+            let ceiling = nd_block_backoff(count);
+            for exec in 0..200_u64 {
+                let delay = nd_block_backoff_jittered(count, &test_task(exec));
+                assert!(delay <= ceiling, "count {count}: {delay:?} > {ceiling:?}");
+                assert!(delay >= ceiling / 2, "count {count}: {delay:?} < half");
+                assert_eq!(delay, nd_block_backoff_jittered(count, &test_task(exec)));
+            }
+        }
+    }
+
+    /// A workflow task for execution `n`, like the task an ND block or a panic sees.
+    fn test_task(n: u64) -> TaskQueueItem {
+        TaskQueueItem {
+            workflow_exec_id: Some(uuid::Uuid::from_u128(u128::from(n))),
+            ..retry_after_test_task(1, 3)
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Capability-miss release / escalate (issue #804)
     // -----------------------------------------------------------------------
@@ -40099,6 +40391,29 @@ mod tests {
         assert_eq!(panic_retry_backoff(4), Duration::from_secs(8));
     }
 
+    /// Panicking executions must not re-dispatch together (issue #1792).
+    #[test]
+    fn panic_retry_backoff_jittered_spreads_and_keeps_a_floor() {
+        for strikes in [0, 1, 3, 6, u32::MAX] {
+            let ceiling = panic_retry_backoff(strikes);
+            let mut delays = std::collections::HashSet::new();
+            for exec in 0..100_u64 {
+                let delay = panic_retry_backoff_jittered(strikes, &test_task(exec));
+                assert!(
+                    delay <= ceiling,
+                    "strikes {strikes}: {delay:?} > {ceiling:?}"
+                );
+                assert!(delay >= ceiling / 2, "strikes {strikes}: {delay:?} < half");
+                assert_eq!(
+                    delay,
+                    panic_retry_backoff_jittered(strikes, &test_task(exec))
+                );
+                delays.insert(delay);
+            }
+            assert!(delays.len() > 1, "strikes {strikes}: one delay {delays:?}");
+        }
+    }
+
     #[test]
     fn panic_retry_backoff_caps_and_clamps() {
         // 1 * 2^5 = 32 > 30 — first strike that hits the cap.
@@ -41239,7 +41554,7 @@ mod tests {
         // AC3: a non-positive (here, exactly zero) hint falls through to the
         // policy delay -- it must NOT resolve to an immediate retry.
         let task = retry_after_test_task(1, 3);
-        let policy = RetryPolicy::fixed(3, Duration::from_secs(2));
+        let policy = RetryPolicy::fixed(3, Duration::from_secs(2)).with_jitter(JitterPolicy::None);
         let error = ActivityFailure::retryable("Http429", "rate limited")
             .with_retry_after(Duration::ZERO)
             .into_error_payload();
@@ -41258,7 +41573,7 @@ mod tests {
         // A plain legacy `Err(String)` recovers no typed `ActivityFailure`, so
         // `retry_after` is `None` and the policy delay is used verbatim.
         let task = retry_after_test_task(1, 3);
-        let policy = RetryPolicy::fixed(3, Duration::from_secs(5));
+        let policy = RetryPolicy::fixed(3, Duration::from_secs(5)).with_jitter(JitterPolicy::None);
         let delay = next_retry_delay(&task, "boom", Some(&policy), Duration::from_secs(900))
             .unwrap()
             .expect("an attempt is still available");
@@ -41285,16 +41600,81 @@ mod tests {
         assert_eq!(delay, chrono::Duration::seconds(0));
     }
 
+    /// The no-policy fallback jitters within one second (issue #1792).
     #[test]
-    fn next_retry_delay_no_policy_no_retry_after_uses_one_second_fallback() {
-        // The `retry_policy: None` branch's own `Duration::from_secs(1)`
-        // fallback (when an attempt remains) is untouched when no hint is
-        // present.
-        let task = retry_after_test_task(1, 3);
-        let delay = next_retry_delay(&task, "boom", None, Duration::from_secs(900))
-            .unwrap()
-            .expect("an attempt is still available");
-        assert_eq!(delay, chrono::Duration::seconds(1));
+    fn next_retry_delay_no_policy_no_retry_after_jitters_the_one_second_fallback() {
+        let mut delays = std::collections::HashSet::new();
+        for n in 0..100_u128 {
+            let task = TaskQueueItem {
+                activity_id: Some(uuid::Uuid::from_u128(n)),
+                ..retry_after_test_task(1, 3)
+            };
+            let delay = next_retry_delay(&task, "boom", None, Duration::from_secs(900))
+                .unwrap()
+                .expect("an attempt is still available");
+            assert!(delay >= chrono::Duration::zero());
+            assert!(delay <= chrono::Duration::seconds(1), "{delay:?} > 1s");
+            delays.insert(delay);
+        }
+        assert!(delays.len() > 1, "100 tasks got one delay {delays:?}");
+    }
+
+    /// A default policy spreads remote retries across tasks (issue #1792).
+    #[test]
+    fn next_retry_delay_default_policy_spreads_tasks() {
+        let policy = RetryPolicy::default();
+        let mut delays = std::collections::HashSet::new();
+        for n in 0..100_u128 {
+            let task = TaskQueueItem {
+                activity_id: Some(uuid::Uuid::from_u128(n)),
+                ..retry_after_test_task(1, 3)
+            };
+            let delay = next_retry_delay(&task, "boom", Some(&policy), Duration::from_secs(900))
+                .unwrap()
+                .expect("an attempt is still available");
+            assert!(delay <= chrono::Duration::seconds(1), "{delay:?} > 1s");
+            delays.insert(delay);
+        }
+        assert!(delays.len() > 1, "100 tasks got one delay {delays:?}");
+    }
+
+    /// A default policy spreads local-activity retries (issue #1792).
+    #[test]
+    fn local_policy_delay_spreads_activities_of_one_execution() {
+        let policy = RetryPolicy::default();
+        let exec = ExecutionId::from_uuid(uuid::Uuid::from_u128(7));
+        let delays: std::collections::HashSet<Duration> = (0..100_u128)
+            .map(|n| {
+                let activity = ActivityExecId::from_uuid(uuid::Uuid::from_u128(n));
+                local_policy_delay(Some(&policy), exec, activity, 1).expect("attempt 1 retries")
+            })
+            .collect();
+        assert!(
+            delays.len() > 1,
+            "100 local activities got one delay {delays:?}"
+        );
+        let activity = ActivityExecId::from_uuid(uuid::Uuid::from_u128(1));
+        assert_eq!(local_policy_delay(None, exec, activity, 1), None);
+    }
+
+    #[test]
+    fn local_retry_stream_seed_differs_per_activity_and_repeats() {
+        let exec = ExecutionId::from_uuid(uuid::Uuid::from_u128(7));
+        let a = crate::types::ActivityExecId::from_uuid(uuid::Uuid::from_u128(1));
+        let b = crate::types::ActivityExecId::from_uuid(uuid::Uuid::from_u128(2));
+        assert_eq!(
+            local_retry_stream_seed(exec, a),
+            local_retry_stream_seed(exec, a)
+        );
+        assert_ne!(
+            local_retry_stream_seed(exec, a),
+            local_retry_stream_seed(exec, b)
+        );
+        let other_exec = ExecutionId::from_uuid(uuid::Uuid::from_u128(8));
+        assert_ne!(
+            local_retry_stream_seed(exec, a),
+            local_retry_stream_seed(other_exec, a)
+        );
     }
 
     #[test]
@@ -43440,6 +43820,25 @@ mod tests {
             state: state.to_string(),
             scheduled_at,
             has_worker: state == "RUNNING",
+            pinned_elsewhere: false,
+        }
+    }
+
+    #[test]
+    fn a_row_pinned_to_another_worker_is_released_without_a_growing_delay() {
+        // The owner of the pin must see the reference soon, so the delay must
+        // not grow past the sticky window (issue #1798).
+        let settings = dispatch_settings();
+        let now = chrono::Utc::now();
+        let mut pinned = probe("PENDING", now - chrono::Duration::seconds(1));
+        pinned.pinned_elsewhere = true;
+
+        for redeliveries in [0, 3, 40] {
+            assert_eq!(
+                reference_outcome(Some(&pinned), redeliveries, now, &settings),
+                ReferenceOutcome::Release(settings.poll_interval),
+                "redelivery {redeliveries} must not back off"
+            );
         }
     }
 
@@ -43508,6 +43907,7 @@ mod tests {
             state: "RUNNING".to_string(),
             scheduled_at: now,
             has_worker: false,
+            pinned_elsewhere: false,
         };
 
         for redeliveries in 0..DISPATCH_PARKED_ROW_RELEASES {

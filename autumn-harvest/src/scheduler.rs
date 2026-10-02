@@ -2759,6 +2759,17 @@ pub enum ScheduleUpdateOutcome {
 /// the stored `retry_policy` JSON does not deserialize as a `RetryPolicy` —
 /// erroring loudly instead of silently dropping the stored policy to NULL on
 /// an unrelated edit (repair by explicitly setting or clearing it).
+///
+/// # Jitter
+///
+/// The default fire jitter applies on create only (issue #1792). The stored
+/// row does not record whether its `jitter_secs` came from the default or
+/// from an explicit request. The merge therefore never re-derives jitter: a
+/// patch that changes `schedule` keeps the stored jitter unless the same
+/// patch sets `jitter`. A value equality check against the old cadence's
+/// default cannot tell an explicit `jitter_secs: 0` from the interval default.
+/// Such a check would turn that opt-out into 10 s on a move to a five-field
+/// cron. That breaks the partial-update contract.
 fn merge_schedule_patch(
     existing: &HarvestSchedule,
     patch: &WorkflowSchedulePatch,
@@ -2805,6 +2816,9 @@ fn merge_schedule_patch(
         },
     };
 
+    let jitter = patch
+        .jitter
+        .unwrap_or_else(|| Duration::from_secs(u64::try_from(existing.jitter_secs).unwrap_or(0)));
     Ok(WorkflowSchedule {
         workflow_name,
         dag_name: None,
@@ -2826,9 +2840,7 @@ fn merge_schedule_patch(
             .clone()
             .or_else(|| existing.queue_name.clone())
             .unwrap_or_else(|| "default".to_string()),
-        jitter: patch.jitter.unwrap_or_else(|| {
-            Duration::from_secs(u64::try_from(existing.jitter_secs).unwrap_or(0))
-        }),
+        jitter,
         overlap_policy: patch
             .overlap_policy
             .unwrap_or_else(|| OverlapPolicy::from_db(&existing.overlap_policy)),
@@ -2931,6 +2943,10 @@ pub async fn update_workflow_schedule(
         // before any write; a Config error rolls the transaction back.
         let merged = merge_schedule_patch(&existing, patch)?;
         crate::policy::validate_schedule(&merged.schedule).map_err(HarvestError::Config)?;
+        // The merge keeps the stored jitter on a cadence change (issue #1792).
+        // The new cadence must still hold it.
+        crate::policy::validate_jitter(&merged.schedule, merged.jitter)
+            .map_err(HarvestError::Config)?;
 
         match apply_workflow_schedule_update(conn, &merged, &existing, true).await? {
             AppliedScheduleUpdate::Updated(row) => Ok(ScheduleUpdateOutcome::Updated(row)),
@@ -7087,6 +7103,98 @@ mod tests {
         assert_eq!(merged.queue_name, "etl");
         assert_eq!(merged.overlap_policy, OverlapPolicy::BufferOne);
         assert_eq!(merged.calendar.as_deref(), Some("us-holidays"));
+    }
+
+    /// An explicit `jitter_secs: 0` on an interval schedule survives a patch
+    /// to a five-field cron (issue #1792). The stored row carries no
+    /// default-versus-explicit provenance, so the merge must not replace the
+    /// opt-out with the new cadence's 10 s default.
+    #[test]
+    fn merge_schedule_patch_cadence_change_keeps_explicit_zero_jitter() {
+        let row = HarvestSchedule {
+            schedule_expr: Some("interval:3600".to_string()),
+            jitter_secs: 0,
+            ..merge_base_row()
+        };
+        let patch = WorkflowSchedulePatch {
+            schedule: Some(Schedule::Cron("0 3 * * *".to_string())),
+            ..Default::default()
+        };
+        let merged = merge_schedule_patch(&row, &patch).expect("merge");
+        assert_eq!(merged.jitter, Duration::ZERO);
+    }
+
+    /// A stored 10 s jitter on a five-field cron survives a patch to another
+    /// five-field cron, to a seconds-field cron and to an interval. The merge
+    /// never re-derives jitter from the new cadence (issue #1792).
+    #[test]
+    fn merge_schedule_patch_cadence_change_keeps_stored_jitter() {
+        let row = HarvestSchedule {
+            schedule_expr: Some("cron:0 3 * * *".to_string()),
+            jitter_secs: 10,
+            ..merge_base_row()
+        };
+        let merge_to = |schedule: Schedule| {
+            let patch = WorkflowSchedulePatch {
+                schedule: Some(schedule),
+                ..Default::default()
+            };
+            merge_schedule_patch(&row, &patch).expect("merge").jitter
+        };
+        assert_eq!(
+            merge_to(Schedule::Cron("0 4 * * *".to_string())),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            merge_to(Schedule::Cron("*/5 * * * * *".to_string())),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            merge_to(Schedule::Interval(Duration::from_secs(3600))),
+            Duration::from_secs(10)
+        );
+    }
+
+    /// A non-default stored jitter also stays across a cadence change.
+    #[test]
+    fn merge_schedule_patch_cadence_change_keeps_explicit_jitter() {
+        let row = merge_base_row();
+        let patch = WorkflowSchedulePatch {
+            schedule: Some(Schedule::Cron("0 3 * * *".to_string())),
+            ..Default::default()
+        };
+        let merged = merge_schedule_patch(&row, &patch).expect("merge");
+        assert_eq!(merged.jitter, Duration::from_secs(30));
+    }
+
+    /// A patch that sets both the cadence and `jitter` applies the explicit
+    /// value, including an explicit zero (issue #1792).
+    #[test]
+    fn merge_schedule_patch_cadence_change_with_explicit_jitter_applies_it() {
+        let row = HarvestSchedule {
+            schedule_expr: Some("cron:0 3 * * *".to_string()),
+            jitter_secs: 10,
+            ..merge_base_row()
+        };
+        let merge_with = |schedule: Schedule, jitter: Duration| {
+            let patch = WorkflowSchedulePatch {
+                schedule: Some(schedule),
+                jitter: Some(jitter),
+                ..Default::default()
+            };
+            merge_schedule_patch(&row, &patch).expect("merge").jitter
+        };
+        assert_eq!(
+            merge_with(
+                Schedule::Interval(Duration::from_secs(60)),
+                Duration::from_secs(5)
+            ),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            merge_with(Schedule::Cron("0 4 * * *".to_string()), Duration::ZERO),
+            Duration::ZERO
+        );
     }
 
     /// Tri-state fields: `Some(None)` clears, outer `None` preserves.
