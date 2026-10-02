@@ -33,7 +33,9 @@ per-shard cursor that advances only on acknowledgement.
   it). A sharded worker needs a per-shard URL, because the global URL can
   point at another database. The exporter then logs the statement and, for a
   refused build, backs off for an hour. Run the statement once through the
-  role that owns the table, such as the migration role. Do not transfer the
+  role that owns the table, such as the migration role. If an interrupted
+  build left an invalid index, run `DROP INDEX CONCURRENTLY IF EXISTS
+  harvest_audit_log_unexported_idx` first, as its own statement. Do not transfer the
   table to the worker role. Export is correct without
   the index, only slower. Once export runs, the index size is bounded only
   while retention reclaims unexported rows. See "Retention interaction"

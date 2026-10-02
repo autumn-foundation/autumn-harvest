@@ -1109,6 +1109,15 @@ pub const UNEXPORTED_INDEX_DDL: &str = "CREATE INDEX CONCURRENTLY IF NOT EXISTS 
      harvest_audit_log_unexported_idx ON harvest_audit_log (occurred_at, id) \
      WHERE export_seq IS NULL";
 
+/// The statement that clears an invalid claim-scan index.
+///
+/// An operator runs it before [`UNEXPORTED_INDEX_DDL`] when the index exists
+/// but is invalid. `IF NOT EXISTS` skips an invalid index, so the build
+/// statement alone leaves it in place. Run each statement on its own: a
+/// concurrent index statement cannot share a transaction.
+pub const UNEXPORTED_INDEX_DROP_DDL: &str =
+    "DROP INDEX CONCURRENTLY IF EXISTS harvest_audit_log_unexported_idx";
+
 /// Advisory-lock key that serializes builds of the claim-scan index.
 pub const UNEXPORTED_INDEX_LOCK_KEY: i64 = 0x6175_6469_745f_6978;
 
@@ -1483,10 +1492,12 @@ async fn spawn_unexported_index_build_if_due(
                         shard = shard_id,
                         %error,
                         statement = UNEXPORTED_INDEX_DDL,
+                        cleanup = UNEXPORTED_INDEX_DROP_DDL,
                         retry_in_secs = INDEX_BUILD_REFUSED_RETRY.as_secs(),
                         "[audit_export] the worker role cannot build the claim-scan index; \
                          export continues without it. Run `statement` once through the \
-                         role that owns the table, such as the migration role"
+                         role that owns the table, such as the migration role. If the \
+                         index exists but is invalid, run `cleanup` first"
                     );
                     BuildEnd::Refused
                 }
@@ -1537,10 +1548,11 @@ async fn notice_missing_unexported_index(
     tracing::warn!(
         shard = shard_id,
         statement = UNEXPORTED_INDEX_DDL,
+        cleanup = UNEXPORTED_INDEX_DROP_DDL,
         "[audit_export] the claim-scan index is missing; fire_due_audit_exports never builds \
          it on its caller's connection. Use the dedicated export task, run \
          ensure_unexported_index on a dedicated connection, or run the statement once as \
-         the table owner"
+         the table owner. If the index exists but is invalid, run `cleanup` first"
     );
 }
 

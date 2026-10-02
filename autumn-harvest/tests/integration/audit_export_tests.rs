@@ -5629,3 +5629,24 @@ async fn a_role_without_table_ownership_gets_a_refused_build() {
         autumn_harvest::audit_export::UnexportedIndexOutcome::Ready
     );
 }
+
+/// The logged remedy must also repair an invalid index. An operator runs the
+/// two statements in turn and ends with a valid index.
+#[tokio::test]
+async fn the_operator_remedy_replaces_an_invalid_index() {
+    let (mut conn, _url, _c) = make_conn_any().await;
+    create_unexported_idx(&mut conn).await;
+    conn.batch_execute(&format!(
+        "UPDATE pg_index SET indisvalid = false WHERE indexrelid = '{UNEXPORTED_IDX}'::regclass"
+    ))
+    .await
+    .expect("mark invalid");
+    // `IF NOT EXISTS` alone would leave the invalid index in place.
+    conn.batch_execute(autumn_harvest::audit_export::UNEXPORTED_INDEX_DROP_DDL)
+        .await
+        .expect("drop");
+    conn.batch_execute(autumn_harvest::audit_export::UNEXPORTED_INDEX_DDL)
+        .await
+        .expect("create");
+    assert_eq!(unexported_idx_state(&mut conn).await, Some(true));
+}
