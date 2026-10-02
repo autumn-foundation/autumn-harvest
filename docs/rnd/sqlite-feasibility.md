@@ -58,7 +58,7 @@ module counts at the audited revision, recomputed by CI:
 | `skip-locked` claim (`FOR UPDATE SKIP LOCKED`) | 15 modules | Only by dropping multi-worker concurrency. |
 | `row-lock` blocking row lock (Diesel `.for_update()`) | 17 modules | Subsumed by the single write lock. |
 | `interval-sql` (`INTERVAL '…'`, `make_interval()`) | 14 modules | Yes — integer epoch milliseconds. |
-| `raw-sql` — reaches for Diesel's raw-SQL escape hatch (`sql::<…>`, `sql_query`) | 41 modules | Case by case — the SQL must be read, not inferred from the ORM. |
+| `raw-sql` — reaches for Diesel's raw-SQL escape hatch (`sql::<…>`, `sql_query`) | 42 modules | Case by case — the SQL must be read, not inferred from the ORM. |
 | `raw-pg-sql` — *identified* Postgres-only syntax within that SQL (JSONB `#>>`/`@>`, `::TYPE` casts in either case, `EXTRACT(EPOCH …)`, `JOIN LATERAL`, `~` regex) | 30 modules | Mostly — but each is a hand rewrite, and `~` has no SQLite equivalent at all. |
 | `advisory-lock` (`pg_advisory_*` / `pg_try_advisory_*`) | 13 modules | Subsumed by the single write lock. |
 | `to_regclass` table-existence probes | 9 modules | Yes — `sqlite_master` lookup. |
@@ -70,7 +70,7 @@ Plus **115 migrations** written in Postgres DDL (`JSONB`, `TIMESTAMPTZ`,
 which apply to SQLite. The SQLite crate does not translate them; it declares
 its own schema.
 
-**59 of the 116 core modules** exhibit at least one mechanism — a shade under
+**60 of the 117 core modules** exhibit at least one mechanism — a shade under
 half. That ratio is the headline finding, and it cuts *both* ways: the
 determinism core really is clean, and the persistence layer really is
 saturated.
