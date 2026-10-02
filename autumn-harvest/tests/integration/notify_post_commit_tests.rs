@@ -658,8 +658,22 @@ async fn a_pool_registered_outside_a_runtime_starts_its_sender_later() {
 
     // A parallel test can start the sender on its own runtime, which ends
     // with that test. The next note then starts the sender again here.
+    assert_wake_from_sender(&mut shadowed, &mut listener, &sink).await;
+}
+
+/// Append on `shadowed` until a wake for the append arrives, up to three
+/// times.
+///
+/// `shadowed` cannot send a wake itself, so a wake proves the sender sent it.
+/// A sender that is not running when a note is staged starts again at that
+/// note, so a later attempt succeeds.
+async fn assert_wake_from_sender(
+    shadowed: &mut AsyncPgConnection,
+    listener: &mut WorkflowEventListener,
+    sink: &autumn_harvest::notify::NotifySink,
+) {
     for attempt in 1..=3 {
-        let exec_id = insert_execution(&mut shadowed).await;
+        let exec_id = insert_execution(shadowed).await;
         Box::pin(
             shadowed.transaction::<usize, HarvestError, _>(async |conn| {
                 store::append_events(conn, exec_id, &[started()], 0).await
@@ -687,5 +701,32 @@ async fn a_pool_registered_outside_a_runtime_starts_its_sender_later() {
         }
         assert!(sink.wait_ready(READY).await, "attempt {attempt}");
     }
-    panic!("the deferred sender never delivered a wake");
+    panic!("the sender never delivered a wake");
+}
+
+#[tokio::test]
+async fn a_sender_starts_again_after_its_runtime_ends() {
+    let (url, _container) = setup().await;
+    let pool = build_pool(&url);
+    let sink = {
+        let pool = pool.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Runtime::new().expect("runtime");
+            let sink = runtime.block_on(async {
+                let sink = autumn_harvest::notify::register_pool(&pool);
+                assert!(sink.wait_ready(READY).await);
+                sink
+            });
+            drop(runtime);
+            sink
+        })
+        .join()
+        .expect("a short-lived runtime")
+    };
+    let mut shadowed = shadowed_conn(&url).await;
+    let mut listener = WorkflowEventListener::connect(&url)
+        .await
+        .expect("listener");
+
+    assert_wake_from_sender(&mut shadowed, &mut listener, &sink).await;
 }

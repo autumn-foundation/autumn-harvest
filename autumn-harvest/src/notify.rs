@@ -667,9 +667,11 @@ impl NotifySink {
     /// waits.
     pub async fn flush(&self, timeout: Duration) -> bool {
         let shared = &self.shared;
+        // The sender moves notes and publishes their count under the
+        // pending lock. Both reads under that lock therefore see one state.
         let drained = || {
-            lock(&shared.pending).is_empty()
-                && AtomicUsize::load(&shared.held, Ordering::Relaxed) == 0
+            let pending = lock(&shared.pending);
+            pending.is_empty() && AtomicUsize::load(&shared.held, Ordering::Relaxed) == 0
         };
         let deadline = tokio::time::Instant::now() + timeout;
         while !drained() {
@@ -946,6 +948,12 @@ impl Drop for Held {
         self.sink.held.store(0, Ordering::Relaxed);
         self.sink
             .record(self.notes.len(), &"the notify sender task stopped");
+        // A task that stops while its pool exists ended with its runtime. The
+        // next note staged in a runtime starts the sender again.
+        if self.sink.pool.upgrade().is_some() {
+            *lock(&self.sink.task) = None;
+            ANY_DEFERRED.store(true, Ordering::Relaxed);
+        }
     }
 }
 
@@ -971,11 +979,15 @@ async fn run_sender(sink: Arc<SinkShared>) {
         let Some(pool) = sink.pool.upgrade() else {
             break;
         };
-        held.notes.append(&mut lock(&sink.pending));
-        let excess = held.notes.len().saturating_sub(MAX_PENDING_NOTES);
-        held.notes.drain(..excess);
-        held.publish();
-        sink.record(excess, &"the notify sender queue is full");
+        {
+            let mut pending = lock(&sink.pending);
+            held.notes.append(&mut pending);
+            let excess = held.notes.len().saturating_sub(MAX_PENDING_NOTES);
+            held.notes.drain(..excess);
+            held.publish();
+            drop(pending);
+            sink.record(excess, &"the notify sender queue is full");
+        }
 
         let read = match tokio::time::timeout(CONNECT_TIMEOUT, pool.get()).await {
             Ok(Ok(mut conn)) => {
