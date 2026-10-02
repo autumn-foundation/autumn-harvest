@@ -723,12 +723,11 @@ pub fn register_pool(pool: &crate::worker::DbPool) -> NotifySink {
     });
     sinks.push(Arc::clone(&shared));
     drop(sinks);
-    match runtime {
-        Some(runtime) => start_deferred(&runtime),
-        None => {
-            ANY_DEFERRED.store(true, Ordering::Relaxed);
-            tracing::debug!("harvest: no Tokio runtime; the notify sender starts later");
-        }
+    if let Some(runtime) = runtime {
+        start_deferred(&runtime);
+    } else {
+        ANY_DEFERRED.store(true, Ordering::Relaxed);
+        tracing::debug!("harvest: no Tokio runtime; the notify sender starts later");
     }
     NotifySink { shared }
 }
