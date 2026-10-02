@@ -1326,14 +1326,26 @@ jobs:
       # `postgres:16-alpine` (one outlier suite's override), and `redis:5.0`
       # (Redis's default, un-overridden anywhere; needed by the issue #1312
       # dispatch suites this job also forces via HARVEST_TEST_REQUIRE_REDIS
-      # below), and `softwaremill/elasticmq:1.5.2` (the `connector_sqs_broker`
-      # suite's ElasticMQ default, which "bytes remaining on stream" failed on
-      # PR #1773 because it was the one image not pre-pulled).
+      # below), and `softwaremill/elasticmq:1.5.2` on the one shard that runs the
+      # `connector_sqs_broker` suite (its ElasticMQ default, which "bytes
+      # remaining on stream" failed on PR #1773 because it was not pre-pulled).
       - name: Pre-pull Docker test images (retry transient pull failures)
         if: needs.changes.outputs.code == 'true'
         shell: bash
+        env:
+          SEMAPHORE_SHARD_COUNT: "21"
+          SEMAPHORE_SHARD_INDEX: ${{ matrix.shard }}
         run: |
-          for image in postgres:11-alpine postgres:16 postgres:16-alpine redis:5.0 softwaremill/elasticmq:1.5.2; do
+          images="postgres:11-alpine postgres:16 postgres:16-alpine redis:5.0"
+          # Pull ElasticMQ only on the shard that runs `connector_sqs_broker`.
+          # The dry run prints this shard's cargo invocations without running
+          # them, so no shard number is hardcoded here. It is captured first:
+          # `grep -q` closing a pipe early would trip `pipefail`.
+          plan="$(DRY_RUN=1 bash .github/ci/run-suites.sh run linux)"
+          if grep -q -- '--test connector_sqs_broker' <<<"$plan"; then
+            images="$images softwaremill/elasticmq:1.5.2"
+          fi
+          for image in $images; do
             for attempt in 1 2 3 4 5; do
               if docker pull "$image"; then
                 continue 2
