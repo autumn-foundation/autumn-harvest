@@ -145,8 +145,11 @@ pub enum SkipReason {
     /// Issue #1299: `pg_ctl` may have already launched Postgres before the
     /// owner was killed, and `postmaster.pid` appears only once the
     /// postmaster itself writes it. Absence is evidence only once the
-    /// startup grace period has passed.
+    /// startup grace period has passed and no live process names the data
+    /// directory (issue #1585).
     PossiblyStillStarting,
+    /// No postmaster pid is known, but a live process names the data directory.
+    PostmasterProcessFound,
 }
 
 /// Identity of the process at a recorded postmaster pid.
@@ -164,6 +167,11 @@ pub enum PostmasterIdentity {
     /// The pid is alive, but identity cannot be proven. The record has no
     /// start token, or the platform cannot supply one.
     Unknown,
+    /// No pid is recorded, but a live process names this data directory.
+    ///
+    /// Issue #1585: a live process is positive evidence. Wall-clock age is
+    /// not, because a system suspend freezes a starting postmaster.
+    ProcessFound,
 }
 
 /// Whether a session record describes a directory we are willing to act on.
@@ -186,6 +194,10 @@ pub fn record_is_self_consistent(record: &SessionRecord, session_dir: &Path) -> 
 /// mid-start. One old enough to clear this window can, because a real
 /// postmaster writes its pid file within a small fraction of it.
 ///
+/// This is the fallback. The reaper first looks for a live process on the
+/// data directory (issue #1585). A suspend ages a wall-clock deadline without
+/// letting the postmaster run.
+///
 /// Wall-clock, like `created_at` itself: a clock set backward after a
 /// record is written could delay reaping it, never bring one forward. This
 /// is a dev-only tool, and the cost of that is a leaked directory, not a
@@ -197,13 +209,14 @@ const POSTMASTER_STARTUP_GRACE: chrono::Duration = chrono::Duration::seconds(15)
 /// Pure: liveness, identity and the current time are all supplied by the
 /// caller. The whole table can be tested without processes or a real clock.
 ///
-/// `postmaster` decides between three outcomes, not two. `Confirmed` reaps
+/// `postmaster` selects the outcome. `Confirmed` reaps
 /// through `StopThenRemove`. `NotRunning` removes the directory with no
 /// signal — nothing is there to signal. The exception is a record still
 /// within its startup grace period (issue #1299): there, absence is not yet
 /// proof, so the session is skipped instead. `Unknown` skips reaping
 /// outright: the pid is alive, but identity is unproven. Neither stopping it
-/// nor deleting its directory is safe (issue #1295).
+/// nor deleting its directory is safe (issue #1295). `ProcessFound` also
+/// skips, whatever the record age (issue #1585).
 #[must_use]
 pub fn decide_reap(
     record: &SessionRecord,
@@ -229,6 +242,10 @@ pub fn decide_reap(
         };
     }
     match (record.postmaster_pid, postmaster) {
+        // Positive evidence outranks the wall-clock grace period (issue #1585).
+        (_, PostmasterIdentity::ProcessFound) => {
+            ReapDecision::Skip(SkipReason::PostmasterProcessFound)
+        }
         (Some(postmaster_pid), PostmasterIdentity::Confirmed) => {
             ReapDecision::StopThenRemove { postmaster_pid }
         }

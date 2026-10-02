@@ -829,6 +829,15 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Collect parameter names after the first (ctx is first, rest are inputs).
     let params: Vec<_> = input_fn.sig.inputs.iter().skip(1).collect();
     let param_names: Vec<_> = crate::attr_util::param_idents(&params);
+    if let Some(pt) = crate::attr_util::first_non_ident_param(&params) {
+        return syn::Error::new_spanned(
+            &pt.pat,
+            "#[workflow] input parameters must be plain identifiers, so `_` and \
+             destructuring patterns are not supported; name the parameter, for \
+             example `_input: ()` (the leading underscore silences the unused warning)",
+        )
+        .to_compile_error();
+    }
 
     // If the workflow returns `Result<_, WorkflowFailure>`, route the error
     // through `WorkflowFailure`'s `IntoWorkflowErrorString` impl so the engine
@@ -1278,22 +1287,15 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     };
 
                     let params = ::autumn_harvest::execution::StartWorkflowParams {
-                        workflow_name: info.name,
-                        workflow_id: &workflow_id,
-                        exec_id,
-                        input,
                         parent_id: opts.parent_id,
-                        queue_name: opts.queue_name.as_deref().unwrap_or("default"),
                         execution_timeout,
                         memo: opts.memo,
                         search_attrs: opts.search_attrs,
                         reuse_policy: opts.reuse_policy.unwrap_or(::autumn_harvest::types::WorkflowIdReusePolicy::AllowDuplicate),
-                        conflict_policy: ::autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
                         trace_context: opts.trace_context,
                         max_execution_timeout_ceiling,
                         chain_execution_timeout,
                         max_workflow_chain_timeout_ceiling,
-                        inherited_chain_deadline_at: ::std::option::Option::None,
                         concurrency_key,
                         concurrency_limit,
                         concurrency_on_conflict,
@@ -1309,17 +1311,16 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         sla: opts.sla.or(info.sla).and_then(|d|
                             ::autumn_harvest::chrono::Duration::from_std(d).ok()
                         ),
-                        schedule_id: ::std::option::Option::None,
-                        scheduled_for: ::std::option::Option::None,
-                        workflow_attempt: 1,
                         workflow_retry_policy: info.retry_policy.clone(),
-                        retry_of_exec_id: ::std::option::Option::None,
                         max_workflow_attempts_ceiling: client.max_workflow_attempts(),
-                        origin: None,
-                        completion_callbacks: ::std::option::Option::None,
                         start_source: ::autumn_harvest::types::StartSource::Api,
-                        start_source_ref: ::std::option::Option::None,
-                        started_by: ::std::option::Option::None,
+                        ..::autumn_harvest::execution::StartWorkflowParams::new(
+                            info.name,
+                            &workflow_id,
+                            exec_id,
+                            input,
+                            opts.queue_name.as_deref().unwrap_or("default"),
+                        )
                     };
 
                     let started = client.start_or_load(conn, params).await?;

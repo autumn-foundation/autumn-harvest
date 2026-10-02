@@ -329,51 +329,41 @@ pub async fn admit_batched_start_with_codecs(
                         .cloned();
 
                     let params = crate::execution::StartWorkflowParams {
-                        workflow_name: &row.workflow_name,
-                        workflow_id: &row.workflow_id,
-                        exec_id,
-                        input: row
-                            .buffered_payloads
-                            .unwrap_or_else(|| serde_json::Value::Array(Vec::new())),
-                        parent_id: None,
-                        queue_name: &row.queue_name,
                         execution_timeout,
                         memo: opts.memo,
                         search_attrs: opts.search_attrs,
                         reuse_policy,
-                        conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
                         trace_context: opts.trace_context,
                         max_execution_timeout_ceiling,
                         chain_execution_timeout,
                         max_workflow_chain_timeout_ceiling,
-                        inherited_chain_deadline_at: None,
                         concurrency_key: opts.concurrency_key,
                         concurrency_limit: opts.concurrency_limit,
                         concurrency_on_conflict: opts.concurrency_on_conflict.unwrap_or_default(),
                         priority,
                         max_workflow_input_bytes: opts.max_workflow_input_bytes.unwrap_or(u64::MAX),
-                        start_at: None,
-                        delay: None,
-                        max_workflow_start_delay: None,
                         owner: opts.owner.as_deref(),
                         runbook_url: opts.runbook_url.as_deref(),
                         severity: opts.severity.as_deref(),
                         context_headers: opts.context_headers,
                         sla,
-                        schedule_id: None,
-                        scheduled_for: None,
-                        workflow_attempt: 1,
                         workflow_retry_policy: opts
                             .workflow_retry_policy
                             .clone()
                             .and_then(|v| serde_json::from_value(v).ok()),
-                        retry_of_exec_id: None,
                         max_workflow_attempts_ceiling: opts.max_workflow_attempts_ceiling,
-                        origin: None,
                         completion_callbacks: opts.completion_callbacks.clone(),
                         start_source: batch_start_source,
                         start_source_ref: batch_start_source_ref.as_deref(),
                         started_by: batch_started_by.as_deref(),
+                        ..crate::execution::StartWorkflowParams::new(
+                            &row.workflow_name,
+                            &row.workflow_id,
+                            exec_id,
+                            row.buffered_payloads
+                                .unwrap_or_else(|| serde_json::Value::Array(Vec::new())),
+                            &row.queue_name,
+                        )
                     };
 
                     let (started, deferred_starts, deferred_checks, cancel_metrics) =
@@ -680,48 +670,39 @@ async fn fire_claimed_batch_row(
         .cloned();
 
     let params = crate::execution::StartWorkflowParams {
-        workflow_name: &workflow_name,
-        workflow_id: &workflow_id,
-        exec_id,
-        input: row.buffered_payloads,
-        parent_id: None,
-        queue_name: &queue_name,
         execution_timeout,
         memo: opts.memo,
         search_attrs: opts.search_attrs,
         reuse_policy,
-        conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
         trace_context: opts.trace_context,
         max_execution_timeout_ceiling,
         chain_execution_timeout,
         max_workflow_chain_timeout_ceiling,
-        inherited_chain_deadline_at: None,
         concurrency_key: opts.concurrency_key,
         concurrency_limit: opts.concurrency_limit,
         concurrency_on_conflict: opts.concurrency_on_conflict.unwrap_or_default(),
         priority,
         max_workflow_input_bytes: opts.max_workflow_input_bytes.unwrap_or(u64::MAX),
-        start_at: None,
-        delay: None,
-        max_workflow_start_delay: None,
         owner: opts.owner.as_deref(),
         runbook_url: opts.runbook_url.as_deref(),
         severity: opts.severity.as_deref(),
         context_headers: opts.context_headers,
         sla,
-        schedule_id: None,
-        scheduled_for: None,
-        workflow_attempt: 1,
         workflow_retry_policy: opts
             .workflow_retry_policy
             .and_then(|v| serde_json::from_value(v).ok()),
-        retry_of_exec_id: None,
         max_workflow_attempts_ceiling: opts.max_workflow_attempts_ceiling,
-        origin: None,
         completion_callbacks: opts.completion_callbacks,
         start_source: batch_start_source,
         start_source_ref: batch_start_source_ref.as_deref(),
         started_by: batch_started_by.as_deref(),
+        ..crate::execution::StartWorkflowParams::new(
+            &workflow_name,
+            &workflow_id,
+            exec_id,
+            row.buffered_payloads,
+            &queue_name,
+        )
     };
 
     let start_res =

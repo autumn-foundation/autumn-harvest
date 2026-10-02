@@ -851,6 +851,8 @@ or queue coverage or fix worker eligibility.
 2. Inspect `no_live_worker` and its `blocking_reasons`. The reason code means no
    live worker can claim at least one demand. It does not prove poller absence.
 3. Branch on `blocking_reasons`:
+   - `are stale, unhealthy, draining, or stopped` means an assigned poller exists but is not
+     live. Restore, restart, or reactivate that worker.
    - `polls queue(s)` means no shard-assigned worker polls the pending queue.
      Start or widen a worker's shard and queue coverage.
    - `capability/build/sticky requirements` means a covering poller is present
@@ -903,7 +905,8 @@ while it finishes — cross-check `harvest shard health` for its writable flag.
 ### Safe actions
 
 For a `polls queue(s)` block, remove explicit `with_shard_assignments`
-narrowing, add the shard, or add the queue. For a
+narrowing, add the shard, or add the queue. For a `are stale, unhealthy, draining, or stopped`
+block, restore, restart, or reactivate the assigned worker. For a
 `capability/build/sticky requirements` block, fix the named eligibility
 constraint. Configuration changes take effect on worker restart. Do **not**
 move executions across shards. Execution ids encode the original shard.
@@ -1074,7 +1077,8 @@ per-execution operator action**. Full playbook:
    - `build_id` (the build ID of the worker that observed the divergence)
 3. Diagnose one specific execution on demand against the **currently-deployed**
    code with `POST /api/harvest/workflows/{id}/replay-diagnosis` (issue #614) —
-   it returns the same `{kind, event_index, expected, actual}` vocabulary and,
+   it returns the same `{kind, event_index, expected, actual}` vocabulary (one
+   exception: a skipped recorded command, see the playbook) and,
    after a candidate rollback/fix is deployed, a `clean` verdict confirms the
    run will resume. See the **"Diagnose the divergence"** section of
    [`docs/runbooks/nondeterminism-block.md`](nondeterminism-block.md#diagnose-the-divergence-issue-614)
@@ -1087,10 +1091,13 @@ per-execution operator action**. Full playbook:
 - Code deployment that modifies workflow logic (adding, removing, or reordering activities, signals, timers, or child workflows) without updating the version gate.
 - Side effects that are not wrapped in `WorkflowContext::side_effect()`, such as direct system calls, time queries (`Instant::now()`), or random number generation.
 - Iteration order on non-deterministic collections (like `HashMap` or `HashSet`) in the workflow function.
+- Drift from an earlier deploy that the engine upgrade surfaces (issue #1791). The worker now blocks a cycle that skips a recorded command. The `build_id` is then the current build, and a rollback does not clear the block.
 
 ### False positives
 
-None. A non-determinism mismatch means the workflow code generated a different sequence of commands/actions than what was recorded in history, making replay safety impossible. Author `Err(...)` returns are never classified as divergence — they still fail terminally.
+None for a mismatch. A non-determinism mismatch means the workflow code generated a different sequence of commands/actions than what was recorded in history, making replay safety impossible. Author `Err(...)` returns are never classified as divergence — they still fail terminally.
+
+One misdiagnosis is possible (issue #1791). A workflow body that awaits non-durable work for more than 100 ms during replay can block with `expected: <workflow suspended early>`. Replay-diagnosis then reports `clean`. Move that work into an activity.
 
 ### Safe actions
 
@@ -3051,6 +3058,7 @@ invisible to detection is growing, and the audit table is growing with it.
   | Process down | `up == 0` |
   | Exporter never ran for a shard | `absent(harvest_audit_export_lag{shard="N"})` |
   | Sink failing or slow, exporter observing normally | the lag threshold — the cursor is held, so the oldest unacknowledged record ages and the gauge climbs |
+  | Export **disabled** in a live process (issue #1506) | `harvest_audit_export_unobservable` — the exporter reports `observed = 0` |
   | Exporter alive but **cannot observe the shard** | `harvest_audit_export_unobservable` — see the runbook section below |
   | **One shard** never scanned while others report | **nothing in the shipped rules.** `absent()` is false as soon as any shard reports. Template one absence rule per configured shard from your own inventory: `absent(harvest_audit_export_lag{shard="N"})` |
 
@@ -3125,6 +3133,12 @@ shard is frozen, commonly at `0`, and looks healthy.
 This is a ticket rather than a page: the sink may be working fine, and
 records already sequenced are not lost — the cursor is simply not advancing
 because the exporter cannot currently reach this shard to advance it.
+
+This alert also fires when export was disabled in a live process (issue
+#1506). A runtime rebuilt with no sink sets `export_observed` to `0` for each
+shard. In that case `GET /admin/audit-export` shows `sink_configured: false`.
+Configure a sink again, or silence the alert if you disabled export on purpose.
+Check `sink_configured` first.
 
 ### Triage steps
 

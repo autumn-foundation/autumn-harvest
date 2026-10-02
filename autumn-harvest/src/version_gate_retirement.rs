@@ -90,7 +90,7 @@ struct RetirementCheckSqlRow {
 /// Maximum number of sample blocker IDs returned per row.
 const SAMPLE_BLOCKER_LIMIT: i64 = 10;
 
-const RETIREMENT_CHECK_SQL: &str = r"
+const RETIREMENT_CHECK_SQL_TEMPLATE: &str = r"
 WITH version_markers AS (
     SELECT DISTINCT
         w.id AS workflow_exec_id,
@@ -127,17 +127,11 @@ WITH version_markers AS (
           $4::TEXT = 'all'
           OR (
               $4::TEXT = 'active'
-              AND w.state NOT IN (
-                  'COMPLETED', 'FAILED', 'CANCELLED',
-                  'TIMED_OUT', 'CONTINUED_AS_NEW', 'TERMINATED'
-              )
+              AND w.state NOT IN ({states})
           )
           OR (
               $4::TEXT = 'terminal'
-              AND w.state IN (
-                  'COMPLETED', 'FAILED', 'CANCELLED',
-                  'TIMED_OUT', 'CONTINUED_AS_NEW', 'TERMINATED'
-              )
+              AND w.state IN ({states})
           )
       )
       AND ($5::INT4 IS NULL OR w.shard_id = $5::INT4)
@@ -164,17 +158,11 @@ WITH version_markers AS (
           $4::TEXT = 'all'
           OR (
               $4::TEXT = 'active'
-              AND w.state NOT IN (
-                  'COMPLETED', 'FAILED', 'CANCELLED',
-                  'TIMED_OUT', 'CONTINUED_AS_NEW', 'TERMINATED'
-              )
+              AND w.state NOT IN ({states})
           )
           OR (
               $4::TEXT = 'terminal'
-              AND w.state IN (
-                  'COMPLETED', 'FAILED', 'CANCELLED',
-                  'TIMED_OUT', 'CONTINUED_AS_NEW', 'TERMINATED'
-              )
+              AND w.state IN ({states})
           )
       )
       AND ($5::INT4 IS NULL OR w.shard_id = $5::INT4)
@@ -191,16 +179,10 @@ SELECT
     change_id::TEXT AS change_id,
     recorded_version::BIGINT AS recorded_version,
     COUNT(*) FILTER (
-        WHERE state NOT IN (
-            'COMPLETED', 'FAILED', 'CANCELLED',
-            'TIMED_OUT', 'CONTINUED_AS_NEW', 'TERMINATED'
-        )
+        WHERE state NOT IN ({states})
     )::BIGINT AS active_executions,
     COUNT(*) FILTER (
-        WHERE state IN (
-            'COMPLETED', 'FAILED', 'CANCELLED',
-            'TIMED_OUT', 'CONTINUED_AS_NEW', 'TERMINATED'
-        )
+        WHERE state IN ({states})
     )::BIGINT AS terminal_executions,
     MIN(started_at) AS oldest_blocker_started_at,
     MAX(started_at) AS newest_blocker_started_at,
@@ -214,10 +196,7 @@ SELECT
                   AND vm2.change_id = vm.change_id
                   AND vm2.recorded_version = vm.recorded_version
                   AND vm2.shard_id = vm.shard_id
-                  AND vm2.state NOT IN (
-                      'COMPLETED', 'FAILED', 'CANCELLED',
-                      'TIMED_OUT', 'CONTINUED_AS_NEW', 'TERMINATED'
-                  )
+                  AND vm2.state NOT IN ({states})
                 ORDER BY vm2.started_at
                 LIMIT $6
             ) sub
@@ -229,6 +208,20 @@ FROM version_markers vm
 GROUP BY workflow_name, change_id, recorded_version, shard_id
 ORDER BY workflow_name, change_id, recorded_version, shard_id
 ";
+
+static RETIREMENT_CHECK_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    crate::erase::render_states(
+        RETIREMENT_CHECK_SQL_TEMPLATE,
+        crate::erase::TERMINAL_STATES_WITHOUT_MIGRATED,
+    )
+});
+
+/// Returns the retirement query, rendered once.
+///
+/// `MIGRATED` stays outside the list, so a seal counts as active here.
+fn retirement_check_sql() -> &'static str {
+    &RETIREMENT_CHECK_SQL
+}
 
 /// Load retirement-check rows from a single shard without mutating state.
 ///
@@ -253,7 +246,7 @@ pub async fn load_retirement_check(
     let marker_name = format!("version:{}", filters.change_id);
     let min_safe_version = i64::from(filters.min_safe_version);
     let version_filter = min_safe_version;
-    let rows = diesel::sql_query(RETIREMENT_CHECK_SQL)
+    let rows = diesel::sql_query(retirement_check_sql())
         .bind::<Text, _>(marker_name)
         .bind::<BigInt, _>(version_filter)
         .bind::<Nullable<Text>, _>(filters.workflow_name.as_deref())
@@ -307,10 +300,28 @@ fn parse_sample_ids(json_text: &str) -> Result<Vec<Uuid>, String> {
 mod tests {
     use super::*;
 
+    /// The rendered SQL must hold no placeholder and list every state of the set.
+    fn assert_lists_every_state(sql: &str) {
+        assert!(!sql.contains("{states}"), "unrendered placeholder");
+        for state in crate::erase::TERMINAL_STATES_WITHOUT_MIGRATED {
+            assert!(sql.contains(&format!("'{state}'")), "{state} missing");
+        }
+        assert!(!sql.contains("'MIGRATED'"), "a seal counts as active here");
+    }
+
+    #[test]
+    fn retirement_sql_derives_terminal_list_from_terminal_states() {
+        assert_lists_every_state(retirement_check_sql());
+        assert!(
+            !RETIREMENT_CHECK_SQL_TEMPLATE.contains("'COMPLETED'"),
+            "state literal in template"
+        );
+    }
+
     #[test]
     fn parse_sample_ids_handles_empty_array() {
         let ids = parse_sample_ids("[]").expect("empty array is valid");
-        assert!(ids.is_empty());
+        assert_eq!(ids, [] as [uuid::Uuid; 0]);
     }
 
     #[test]
@@ -351,7 +362,7 @@ mod tests {
         // present so that non-identity PayloadCodec deployments are never
         // silently excluded from the blocker set.
         assert!(
-            RETIREMENT_CHECK_SQL.contains("_harvest_codec_envelope"),
+            retirement_check_sql().contains("_harvest_codec_envelope"),
             "SQL must detect codec-envelope details to avoid false-safe reports"
         );
     }
@@ -363,7 +374,7 @@ mod tests {
         // (and therefore have no MarkerRecorded event) are invisible to the check,
         // causing a false-safe result.
         assert!(
-            RETIREMENT_CHECK_SQL.contains("NOT EXISTS"),
+            retirement_check_sql().contains("NOT EXISTS"),
             "SQL must include pre-gate anti-join to catch executions with no marker"
         );
     }

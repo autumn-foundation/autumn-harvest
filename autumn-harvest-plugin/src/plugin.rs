@@ -17,7 +17,8 @@ use autumn_web::plugin::Plugin;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::api::{HarvestApiState, acquire_conn, harvest_api_router};
+use crate::api::{HarvestApiState, harvest_api_router};
+use crate::boot::{AdmissionGlobalsGuard, GateRefreshRuntime, dev_admin_api_is_open};
 use crate::config::{HarvestMode, HarvestRuntimeConfig};
 use crate::outbox::spawn_workflow_start_outbox_relay;
 use crate::runner::{HarvestRunner, HarvestRunnerResources};
@@ -128,11 +129,6 @@ fn migration_registration_mode(
 }
 
 struct OutboxRuntime {
-    shutdown: CancellationToken,
-    handle: JoinHandle<()>,
-}
-
-struct GateRefreshRuntime {
     shutdown: CancellationToken,
     handle: JoinHandle<()>,
 }
@@ -1509,84 +1505,6 @@ impl Plugin for HarvestPlugin {
     }
 }
 
-/// RAII guard (issue #618, F-round7) that clears the process-global admission
-/// gate cache and metrics recorder if `start_harvest_runtime` returns early with
-/// an error AFTER publishing them — so a failed startup never leaves the globals
-/// pointing at a dead runtime's stale cache/recorder. Defused with `.commit()`
-/// only once startup fully succeeds. Each clear is ptr-eq-guarded against THIS
-/// runtime's `Arc`s (mirroring `stop_harvest_runtime`) so a concurrently-live
-/// sibling runtime's globals are never clobbered.
-struct AdmissionGlobalsGuard {
-    gate_cache: Arc<autumn_harvest::admission_gate::AdmissionGateCache>,
-    /// The global gate cache installed BEFORE this guard published its own (a
-    /// concurrently-live sibling runtime's, or `None`). Restored — not cleared to
-    /// `None` — on a drop-without-commit, so a failed second-runtime startup in the
-    /// same process does not wipe a still-running sibling's enforcement (issue #618
-    /// final pass).
-    prev_gate_cache: Option<Arc<autumn_harvest::admission_gate::AdmissionGateCache>>,
-    metrics: Option<Arc<dyn autumn_harvest::telemetry::MetricsRecorder>>,
-    /// The global metrics recorder installed before `publish_metrics` ran (restored
-    /// on a drop-without-commit, same rationale as `prev_gate_cache`).
-    prev_metrics: Option<Arc<dyn autumn_harvest::telemetry::MetricsRecorder>>,
-    committed: bool,
-}
-
-impl AdmissionGlobalsGuard {
-    /// Publish the gate cache to the global static and begin guarding it.
-    fn publish_gate_cache(cache: Arc<autumn_harvest::admission_gate::AdmissionGateCache>) -> Self {
-        // Capture the previous global BEFORE overwriting it, so a failed startup
-        // restores a live sibling's cache rather than clearing to None.
-        let prev_gate_cache = autumn_harvest::admission_gate::global_admission_gate_cache();
-        autumn_harvest::admission_gate::set_global_admission_gate_cache(Some(cache.clone()));
-        Self {
-            gate_cache: cache,
-            prev_gate_cache,
-            metrics: None,
-            prev_metrics: None,
-            committed: false,
-        }
-    }
-
-    /// Publish the metrics recorder to the global static and begin guarding it.
-    fn publish_metrics(&mut self, recorder: Arc<dyn autumn_harvest::telemetry::MetricsRecorder>) {
-        self.prev_metrics = autumn_harvest::admission_gate::global_admission_metrics();
-        autumn_harvest::admission_gate::set_global_admission_metrics(Some(recorder.clone()));
-        self.metrics = Some(recorder);
-    }
-
-    /// Defuse the guard: startup succeeded, keep the published globals.
-    fn commit(mut self) {
-        self.committed = true;
-    }
-}
-
-impl Drop for AdmissionGlobalsGuard {
-    fn drop(&mut self) {
-        if self.committed {
-            return;
-        }
-        // RESTORE the previous global (a still-running sibling runtime's cache, or
-        // `None` when there was no prior) instead of clearing to `None`: a failed
-        // second-runtime startup in the same process must not wipe a live sibling's
-        // enforcement (issue #618 final pass). Guard on ptr_eq so we only touch the
-        // global while it is still OUR published value (a third party may have
-        // replaced it — then leave it, as before).
-        if let Some(installed) = autumn_harvest::admission_gate::global_admission_gate_cache()
-            && Arc::ptr_eq(&installed, &self.gate_cache)
-        {
-            autumn_harvest::admission_gate::set_global_admission_gate_cache(
-                self.prev_gate_cache.take(),
-            );
-        }
-        if let Some(ref m) = self.metrics
-            && let Some(installed) = autumn_harvest::admission_gate::global_admission_metrics()
-            && Arc::ptr_eq(&installed, m)
-        {
-            autumn_harvest::admission_gate::set_global_admission_metrics(self.prev_metrics.take());
-        }
-    }
-}
-
 /// The application configuration this startup hook should read.
 ///
 /// `state.config()` first, **not** `AutumnConfig::load()`. Re-loading reads
@@ -1658,14 +1576,6 @@ fn warn_if_dev_admin_api_is_open(profile: &str, auth_boundary_present: bool) {
              AUTUMN_PROFILE (where the API is fail-closed regardless)."
         );
     }
-}
-
-/// The predicate behind [`warn_if_dev_admin_api_is_open`], and the exact
-/// condition `has_harvest_admin_access` admits an unauthenticated caller under.
-/// Mirrored by `preflight::check_admin_auth_boundary`'s `unauthenticated_access`
-/// detail field.
-fn dev_admin_api_is_open(profile: &str, auth_boundary_present: bool) -> bool {
-    profile == "dev" && !auth_boundary_present
 }
 
 #[allow(clippy::too_many_lines, clippy::unused_async)]
@@ -1773,64 +1683,12 @@ async fn start_harvest_runtime(
         built.workflow_infos().to_vec(),
     );
 
-    // Derive the API stale threshold from the worker heartbeat interval so that
-    // /workers correctly classifies workers under non-default configurations.
-    api_state.set_worker_stale_threshold(built.worker_config().worker_heartbeat_interval * 2);
-    // Mirror the configured shutdown timeout so drain requests can compute a
-    // sensible default deadline without the caller having to supply one.
-    api_state.set_worker_shutdown_timeout(built.worker_config().shutdown_timeout);
-    // Propagate the per-query timeout from WorkerConfig (issue #234).
-    api_state.set_query_timeout(built.worker_config().query_timeout);
-    // Propagate the server-side execution timeout ceiling (issue #243).
-    api_state.set_max_workflow_execution_timeout(built.max_workflow_execution_timeout);
-    // Propagate the server-side chain-cap ceiling / fleet-wide default (issue #617).
-    api_state.set_max_workflow_chain_timeout(built.max_workflow_chain_timeout);
-    // Propagate the hard history event ceiling (issue #493).
-    // Prefer the builder-level value; fall back to the WorkerConfig value so
-    // that /admin/preflight accurately reflects the ceiling even when it was
-    // configured via WorkerConfig::with_max_workflow_history_events rather
-    // than HarvestBuilder::max_workflow_history_events.
-    api_state.set_max_workflow_history_events(
-        built
-            .max_workflow_history_events
-            .or_else(|| built.worker_config().max_workflow_history_events),
-    );
-    // Propagate the server-side start delay ceiling (issue #322).
-    api_state.set_max_workflow_start_delay(built.worker_config().max_workflow_start_delay);
-    // Propagate the default debounce max-wait cap (issue #499).
-    api_state.set_default_debounce_max_wait(built.worker_config().default_debounce_max_wait);
-    // Propagate the server-side workflow retry attempt ceiling (issue #523).
-    api_state.set_max_workflow_attempts(built.max_workflow_attempts);
-    // Propagate the request-scoped start-idempotency retention window (issue
-    // #808): the HTTP start route reads it to dedup a repeated idempotency_key,
-    // and the background expiry sweep reads the same value from a process-global
-    // static (mirroring GLOBAL_CALLBACK_CONFIG) so it needs no extra param
-    // threaded through enforce_timeouts_once.
-    api_state.set_start_idempotency_window(built.start_idempotency_window);
-    autumn_harvest::start_idempotency::set_purge_window_secs(built.start_idempotency_window);
-    // Propagate the GET /admin/usage window ceiling (issue #596).
-    api_state.set_usage_window_ceiling(built.usage_window_ceiling);
-    // Propagate the GET /admin/usage group-count cap (issue #596).
-    api_state.set_usage_max_groups(built.usage_max_groups);
-    // Propagate batch start caps from builder config (issue #357).
-    api_state.set_batch_start_config(&built.batch_start_config);
-    // Propagate the completion-callback SSRF policy (issue #605) so the
-    // HTTP start route validates a per-execution target against the same
-    // allowlist the scanner re-validates at delivery time. The full runtime
-    // config (deliverer/secret/defaults/retry policy) is installed by
-    // `PreparedHarvestRuntime::build` inside `HarvestRunner::start` below,
-    // which every `BuiltHarvest` consumer (this plugin and the standalone
-    // runner) funnels through.
-    api_state.set_completion_callback_ssrf_policy(built.completion_callback_config().ssrf_policy());
+    // Copy the builder limits into the API state. `HarvestEmbedding` runs the
+    // same step, so the two boot paths serve the same limits (issue #1613).
+    crate::boot::mirror_built_config(api_state, &mut built);
     // The read-path decode codec registry (issue #608) is mirrored in
     // `Plugin::build`, together with the opt-in flag, so it is in place
     // before the HTTP server binds — not here.
-
-    // Apply the api_state audit retention override only when explicitly set,
-    // so that builder-level retention config is not silently clobbered.
-    if let Some(days) = api_state.audit_retention_days() {
-        built.set_audit_retention_days(days);
-    }
 
     // The resolved effective runtime configuration (issue #695) served by
     // `GET /admin/config` is captured inside `PreparedHarvestRuntime::build`
@@ -1859,18 +1717,7 @@ async fn start_harvest_runtime(
     // caveat as a mid-run fail-closed with no cached match. We deliberately do
     // NOT block-drop on boot-load failure (that reintroduces the permanent-drop
     // fixed in F3); the direct HTTP start path still fails closed via `check()`.
-    if let Ok(mut boot_conn) = acquire_conn(&harvest_pool).await {
-        match autumn_harvest::admission_gate::db::load_active_gates(&mut boot_conn).await {
-            Ok(gates) => {
-                api_state.gate_cache().refresh(gates);
-                tracing::debug!("admission gate cache populated at startup (before workers spawn)");
-            }
-            Err(e) => tracing::warn!(
-                error = %e,
-                "could not load admission gates at startup; cache stays empty until first refresh"
-            ),
-        }
-    }
+    crate::boot::load_boot_admission_gates(api_state, &harvest_pool).await;
 
     let mut runner_resources = HarvestRunnerResources::new(harvest_pool)
         .with_app_state(runtime_state.clone())
@@ -2133,52 +1980,29 @@ async fn start_harvest_runtime(
                     // sealed/absent run's fresh create is gated (matching gate → block+count;
                     // fail-closed sentinel → block a fresh start, per round 5).
                     let start_params = autumn_harvest::execution::StartWorkflowParams {
-                        workflow_name: "webhook_delivery",
-                        workflow_id: &workflow_id,
-                        exec_id,
-                        input: serde_json::json!({
-                            "subscription_id": sub.id,
-                            "topic": log.topic,
-                            "payload": log.payload,
-                        }),
-                        parent_id: None,
-                        queue_name: "webhooks",
-                        execution_timeout: None,
-                        memo: None,
-                        search_attrs: None,
                         reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
-                        conflict_policy:
-                            autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
-                        trace_context: None,
-                        max_execution_timeout_ceiling: None,
-                        chain_execution_timeout: None,
-                        max_workflow_chain_timeout_ceiling: None,
-                        inherited_chain_deadline_at: None,
-                        concurrency_key: None,
-                        concurrency_limit: None,
                         concurrency_on_conflict:
                             autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
                         priority: autumn_harvest::prelude::Priority::default(),
                         max_workflow_input_bytes,
-                        start_at: None,
-                        delay: None,
-                        max_workflow_start_delay: None,
                         owner,
                         runbook_url,
                         severity,
-                        context_headers: None,
                         sla,
-                        schedule_id: None,
-                        scheduled_for: None,
-                        workflow_attempt: 1,
                         workflow_retry_policy: webhook_retry_policy,
-                        retry_of_exec_id: None,
                         max_workflow_attempts_ceiling: client.max_workflow_attempts(),
-                        origin: None,
-                        completion_callbacks: None,
                         start_source: autumn_harvest::StartSource::Api,
-                        start_source_ref: None,
-                        started_by: None,
+                        ..autumn_harvest::execution::StartWorkflowParams::new(
+                            "webhook_delivery",
+                            &workflow_id,
+                            exec_id,
+                            serde_json::json!({
+                                "subscription_id": sub.id,
+                                "topic": log.topic,
+                                "payload": log.payload,
+                            }),
+                            "webhooks",
+                        )
                     };
 
                     // The metrics recorder (`Arc<dyn MetricsRecorder>`) coerced to the
@@ -2245,58 +2069,10 @@ async fn start_harvest_runtime(
     // than an empty snapshot.
 
     // issue #377: spawn background gate-cache refresh (≤2 s p95 cross-replica propagation).
-    let gate_refresh = {
-        let cache = api_state.gate_cache();
-        let api_state_for_metrics = api_state.clone();
-        let pool = harvest_db_pool.clone_inner();
-        let shutdown = CancellationToken::new();
-        let cancel_for_task = shutdown.child_token();
-        let handle = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    () = cancel_for_task.cancelled() => return,
-                    () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
-                }
-                // Fail-closed on any error: if the gate table is
-                // unreadable the cache transitions to uninitialized so
-                // check() blocks new starts rather than silently admitting
-                // them with a stale open snapshot.
-                match acquire_conn(&pool).await {
-                    Ok(mut conn) => {
-                        match autumn_harvest::admission_gate::db::load_active_gates(&mut conn).await
-                        {
-                            Ok(gates) => {
-                                let count = i64::try_from(gates.len()).unwrap_or(0);
-                                cache.refresh(gates);
-                                if let Ok(rt) = api_state_for_metrics.runtime() {
-                                    rt.registry()
-                                        .telemetry()
-                                        .metrics
-                                        .record_admission_gates_active(count);
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    "admission gate refresh failed; entering fail-closed mode"
-                                );
-                                cache.set_fail_closed();
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "admission gate refresh: could not acquire DB connection; \
-                             entering fail-closed mode"
-                        );
-                        cache.set_fail_closed();
-                    }
-                }
-            }
-        });
-        Some(GateRefreshRuntime { shutdown, handle })
-    };
+    let gate_refresh = Some(crate::boot::spawn_gate_refresh(
+        api_state,
+        harvest_db_pool.clone_inner(),
+    ));
 
     let outbox = app_pool.as_ref().and_then(|_| {
         if harvest_config.outbox.enabled {
@@ -2430,11 +2206,7 @@ async fn stop_harvest_runtime(slot: Arc<Mutex<HarvestRuntimeSlot>>, api_state: H
         // plugin never clobbers a concurrently-live sibling's cache. The metrics
         // recorder is not cleared here: without a runtime we have no recorder Arc to
         // ptr-eq against (it was either never published by us or already cleared).
-        if let Some(installed) = autumn_harvest::admission_gate::global_admission_gate_cache()
-            && Arc::ptr_eq(&installed, &api_state.gate_cache())
-        {
-            autumn_harvest::admission_gate::set_global_admission_gate_cache(None);
-        }
+        crate::boot::clear_admission_globals(&api_state, None);
         api_state.clear();
         return;
     };
@@ -2458,8 +2230,7 @@ async fn stop_harvest_runtime(slot: Arc<Mutex<HarvestRuntimeSlot>>, api_state: H
     stop_connectors(runtime.connectors).await;
 
     if let Some(gate_refresh) = runtime.gate_refresh {
-        gate_refresh.shutdown.cancel();
-        let _ = gate_refresh.handle.await;
+        gate_refresh.stop().await;
     }
     if let Some(outbox) = runtime.outbox {
         outbox.shutdown.cancel();
@@ -2485,16 +2256,7 @@ async fn stop_harvest_runtime(slot: Arc<Mutex<HarvestRuntimeSlot>>, api_state: H
     // completion-trigger gate check. Each clear is ptr-eq guarded so tearing down one
     // plugin never clobbers a concurrently-live sibling's cache/recorder. Mirrors
     // #921's teardown of GLOBAL_CALLBACK_CONFIG.
-    if let Some(installed) = autumn_harvest::admission_gate::global_admission_gate_cache()
-        && Arc::ptr_eq(&installed, &api_state.gate_cache())
-    {
-        autumn_harvest::admission_gate::set_global_admission_gate_cache(None);
-    }
-    if let Some(installed) = autumn_harvest::admission_gate::global_admission_metrics()
-        && Arc::ptr_eq(&installed, &stopped_metrics)
-    {
-        autumn_harvest::admission_gate::set_global_admission_metrics(None);
-    }
+    crate::boot::clear_admission_globals(&api_state, Some(&stopped_metrics));
     api_state.clear();
 }
 
@@ -2752,198 +2514,6 @@ mod migration_remedy_tests {
             "the core-storage warning needs no extra directory -- the binary \
              embeds that set: {HARVEST_MIGRATE_REMEDY}"
         );
-    }
-}
-
-#[cfg(test)]
-mod admission_globals_guard_tests {
-    use super::AdmissionGlobalsGuard;
-    use autumn_harvest::admission_gate::{
-        AdmissionGateCache, global_admission_gate_cache, global_admission_metrics,
-        set_global_admission_gate_cache, set_global_admission_metrics,
-    };
-    use autumn_harvest::telemetry::{MetricsRecorder, NoOpMetrics};
-    use std::sync::Arc;
-
-    // The guard mutates the process-global admission statics; serialize the tests.
-    static GUARD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn recorder() -> Arc<dyn MetricsRecorder> {
-        Arc::new(NoOpMetrics)
-    }
-
-    /// F-round7: an early-return error path (guard dropped without `commit()`)
-    /// clears BOTH published globals.
-    #[test]
-    fn guard_drop_clears_both_globals() {
-        let _g = GUARD_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        set_global_admission_gate_cache(None);
-        set_global_admission_metrics(None);
-        {
-            let mut guard =
-                AdmissionGlobalsGuard::publish_gate_cache(Arc::new(AdmissionGateCache::new()));
-            guard.publish_metrics(recorder());
-            assert!(global_admission_gate_cache().is_some());
-            assert!(global_admission_metrics().is_some());
-            // dropped here WITHOUT commit -> simulates a startup error after publish
-        }
-        assert!(
-            global_admission_gate_cache().is_none(),
-            "guard drop clears the gate cache"
-        );
-        assert!(
-            global_admission_metrics().is_none(),
-            "guard drop clears the metrics recorder"
-        );
-    }
-
-    /// F-round7: an error while only the gate cache has been published (before the
-    /// adjacent `publish_metrics` call runs) still clears the gate cache. As of
-    /// F-round14 both publishes happen back-to-back BEFORE `HarvestRunner::start`, so
-    /// this guards the guard's own Drop semantics in isolation rather than a specific
-    /// `start_harvest_runtime` error site.
-    #[test]
-    fn guard_drop_before_metrics_publish_clears_the_gate_cache() {
-        let _g = GUARD_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        set_global_admission_gate_cache(None);
-        set_global_admission_metrics(None);
-        {
-            let _guard =
-                AdmissionGlobalsGuard::publish_gate_cache(Arc::new(AdmissionGateCache::new()));
-            // dropped before publish_metrics
-        }
-        assert!(
-            global_admission_gate_cache().is_none(),
-            "early drop (pre-metrics-publish) clears the gate cache"
-        );
-        assert!(global_admission_metrics().is_none());
-    }
-
-    /// F-round7: `commit()` (successful startup) keeps both globals published.
-    #[test]
-    fn guard_commit_keeps_both_globals() {
-        let _g = GUARD_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        set_global_admission_gate_cache(None);
-        set_global_admission_metrics(None);
-        {
-            let mut guard =
-                AdmissionGlobalsGuard::publish_gate_cache(Arc::new(AdmissionGateCache::new()));
-            guard.publish_metrics(recorder());
-            guard.commit();
-        }
-        assert!(
-            global_admission_gate_cache().is_some(),
-            "commit keeps the gate cache"
-        );
-        assert!(
-            global_admission_metrics().is_some(),
-            "commit keeps the metrics recorder"
-        );
-        set_global_admission_gate_cache(None);
-        set_global_admission_metrics(None);
-    }
-
-    /// F-round14: both globals are visible after the two publishes run back-to-back,
-    /// BEFORE any consumer (the worker poll loops / timeout scanner spawned by
-    /// `HarvestRunner::start`) could observe them. In `start_harvest_runtime` both
-    /// `publish_gate_cache` and `publish_metrics` now run before the runner starts, so
-    /// a cancel / terminate / parent-close-cascade completion-trigger block firing in
-    /// the boot window finds a live `global_admission_metrics()` and counts the block
-    /// rather than dropping it.
-    #[test]
-    fn guard_publishes_both_globals_before_any_consumer_runs() {
-        let _g = GUARD_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        set_global_admission_gate_cache(None);
-        set_global_admission_metrics(None);
-        let mut guard =
-            AdmissionGlobalsGuard::publish_gate_cache(Arc::new(AdmissionGateCache::new()));
-        guard.publish_metrics(recorder());
-        // Both must be live at this point — this is the state the runner (and its
-        // workers/scanner) is started against in `start_harvest_runtime`.
-        assert!(
-            global_admission_gate_cache().is_some(),
-            "gate cache is published before the runner starts"
-        );
-        assert!(
-            global_admission_metrics().is_some(),
-            "metrics recorder is published before the runner starts (F-round14)"
-        );
-        drop(guard);
-        set_global_admission_gate_cache(None);
-        set_global_admission_metrics(None);
-    }
-
-    /// F-round7: a stopping guard must NOT clobber a concurrently-live sibling's
-    /// globals — the clear is ptr-eq-guarded against THIS guard's Arcs.
-    #[test]
-    fn guard_drop_does_not_clobber_a_sibling_cache() {
-        let _g = GUARD_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        set_global_admission_gate_cache(None);
-        set_global_admission_metrics(None);
-        let sibling = Arc::new(AdmissionGateCache::new());
-        {
-            let _guard =
-                AdmissionGlobalsGuard::publish_gate_cache(Arc::new(AdmissionGateCache::new()));
-            // A sibling runtime overwrites the global with its OWN cache.
-            set_global_admission_gate_cache(Some(Arc::clone(&sibling)));
-            // our guard drops here -> ptr-eq(our cache, sibling) is false -> no clear
-        }
-        assert!(
-            global_admission_gate_cache().is_some_and(|c| Arc::ptr_eq(&c, &sibling)),
-            "guard drop must not clobber a sibling's installed cache"
-        );
-        set_global_admission_gate_cache(None);
-    }
-
-    /// issue #618 (final pass): when THIS guard published its cache OVER a
-    /// still-running sibling's (the sibling was installed first), a
-    /// drop-without-commit must RESTORE the sibling's cache — not clear the global
-    /// to `None`, which would wipe the live sibling's gate enforcement. Same for
-    /// the metrics recorder.
-    #[test]
-    fn guard_drop_restores_the_previous_sibling_globals_not_none() {
-        let _g = GUARD_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Sibling runtime A is already live with its own cache + metrics.
-        let sibling_cache = Arc::new(AdmissionGateCache::new());
-        let sibling_metrics: Arc<dyn MetricsRecorder> = recorder();
-        set_global_admission_gate_cache(Some(Arc::clone(&sibling_cache)));
-        set_global_admission_metrics(Some(Arc::clone(&sibling_metrics)));
-        {
-            // Second runtime B publishes its OWN globals over A's, then fails
-            // (dropped without commit).
-            let mut guard =
-                AdmissionGlobalsGuard::publish_gate_cache(Arc::new(AdmissionGateCache::new()));
-            guard.publish_metrics(recorder());
-            // Sanity: B's globals are installed now (not A's).
-            assert!(
-                global_admission_gate_cache().is_some_and(|c| !Arc::ptr_eq(&c, &sibling_cache)),
-                "B's cache is installed over A's before the failure"
-            );
-        }
-        // B's guard dropped without commit -> A's cache + metrics must be restored,
-        // NOT cleared to None (the live sibling keeps its enforcement).
-        assert!(
-            global_admission_gate_cache().is_some_and(|c| Arc::ptr_eq(&c, &sibling_cache)),
-            "a failed second-runtime startup must RESTORE the sibling's cache, not clear it"
-        );
-        assert!(
-            global_admission_metrics().is_some_and(|m| Arc::ptr_eq(&m, &sibling_metrics)),
-            "a failed second-runtime startup must RESTORE the sibling's metrics recorder"
-        );
-        set_global_admission_gate_cache(None);
-        set_global_admission_metrics(None);
     }
 }
 

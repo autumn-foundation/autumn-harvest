@@ -1,6 +1,7 @@
 use autumn_harvest::telemetry::MetricsRecorder;
 use autumn_harvest::{WorkflowEvent, WorkflowSimulator};
-use autumn_harvest_plugin::HarvestApiState;
+use autumn_harvest_plugin::api::{HarvestApiState, StandaloneAdminAuth, harvest_api_router};
+use autumn_harvest_plugin::harvest_ui_router;
 use autumn_harvest_plugin::metrics_scrape::HarvestMetricsRecorder;
 use autumn_harvest_plugin::prelude::HarvestMode;
 use autumn_web::reexports::axum;
@@ -11,7 +12,7 @@ use tower::ServiceExt;
 
 use crate::domain::{RUNNER_QUEUE, StandaloneOrder};
 use crate::runtime::{standalone_builder, standalone_runtime_config};
-use crate::server::{build_router, declare_deployment_profile};
+use crate::server::build_router;
 use crate::workflows;
 
 #[test]
@@ -95,8 +96,24 @@ async fn standalone_order_uses_version_gate_saga_and_child_workflow() {
 /// step (issue #1609). No database is needed here. `HarvestApiState::new()`
 /// with nothing installed matches a router that has never received traffic.
 /// That is exactly the state these three routes must tolerate.
+///
+/// `run` gets its Harvest router from `HarvestEmbedding`, which needs a
+/// database. `harvest_mount` builds the same composition from a bare state.
+/// The plugin crate's `standalone_embedding.rs` tests the started router.
 fn router_under_test() -> axum::Router {
-    build_router(HarvestApiState::new(), HarvestMetricsRecorder::new())
+    build_router(
+        harvest_mount(&StandaloneAdminAuth::new()),
+        HarvestMetricsRecorder::new(),
+    )
+}
+
+/// The composition `HarvestEmbedding` mounts: the API with Vantage nested,
+/// under the declared auth layers. It covers the composition only.
+fn harvest_mount(auth: &StandaloneAdminAuth) -> axum::Router {
+    let api_state = HarvestApiState::new();
+    let router =
+        harvest_api_router(api_state.clone()).nest("/ui", harvest_ui_router(api_state.clone()));
+    auth.mount(router, &api_state)
 }
 
 async fn get_status(app: axum::Router, uri: &str) -> StatusCode {
@@ -137,9 +154,9 @@ async fn preflight_without_a_credential_is_rejected() {
     );
 }
 
-/// Closes issue #1609. `declare_deployment_profile` is what `run` calls
-/// before installing the runner's API runtime, so this reproduces the
-/// exact posture the README's `AUTUMN_PROFILE=dev` command produces.
+/// Closes issue #1609. `HarvestEmbedding` reads the README's
+/// `AUTUMN_PROFILE=dev` and declares it through `StandaloneAdminAuth`. This
+/// declares the same profile directly.
 ///
 /// The request runs twice. The `preflight` handler used to reset the
 /// deployment profile from the router's `autumn_web::AppState` on every
@@ -149,9 +166,8 @@ async fn preflight_without_a_credential_is_rejected() {
 /// has no source left. This pins its absence.
 #[tokio::test]
 async fn preflight_succeeds_once_dev_profile_is_declared() {
-    let api_state = HarvestApiState::new();
-    declare_deployment_profile(&api_state, Some("dev"));
-    let app = build_router(api_state, HarvestMetricsRecorder::new());
+    let auth = StandaloneAdminAuth::new().with_deployment_profile("dev");
+    let app = build_router(harvest_mount(&auth), HarvestMetricsRecorder::new());
 
     assert_eq!(
         get_status(app.clone(), "/api/harvest/admin/preflight").await,
@@ -171,7 +187,7 @@ async fn preflight_succeeds_once_dev_profile_is_declared() {
 async fn metrics_route_renders_a_recorded_sample_as_prometheus_text() {
     let metrics = HarvestMetricsRecorder::new();
     metrics.record_workflow_started("standalone_order", RUNNER_QUEUE);
-    let app = build_router(HarvestApiState::new(), metrics);
+    let app = build_router(harvest_mount(&StandaloneAdminAuth::new()), metrics);
 
     let response = app
         .oneshot(

@@ -5575,6 +5575,11 @@ impl StandaloneAdminAuth {
         self
     }
 
+    /// The declared deployment profile, if any.
+    pub(crate) fn declared_deployment_profile(&self) -> Option<&str> {
+        self.deployment_profile.as_deref()
+    }
+
     /// Apply the declaration to `api_state` and wrap `router` in the declared
     /// layers.
     ///
@@ -8077,6 +8082,7 @@ pub const fn management_api_response_fields()
                 "to",
                 "recoverable_records",
                 "already_purged_records",
+                "window_truncated",
             ]),
         ),
         (
@@ -18859,12 +18865,6 @@ pub(crate) async fn start_workflow(
         let idem = autumn_harvest::start_or_load_workflow_execution_idempotent_with_codecs(
             &mut conn,
             StartWorkflowParams {
-                workflow_name: &workflow_name,
-                workflow_id: &workflow_id,
-                exec_id,
-                input,
-                parent_id: None,
-                queue_name: &queue_name,
                 execution_timeout: request
                     .execution_timeout_secs
                     .map(chrono::Duration::seconds)
@@ -18883,7 +18883,6 @@ pub(crate) async fn start_workflow(
                 // fleet-wide ceiling-as-default, at parity with the per-run timeout.
                 chain_execution_timeout: info_chain_timeout_chrono,
                 max_workflow_chain_timeout_ceiling: max_chain_timeout_ceiling,
-                inherited_chain_deadline_at: None,
                 concurrency_key,
                 concurrency_limit,
                 concurrency_on_conflict,
@@ -18897,17 +18896,18 @@ pub(crate) async fn start_workflow(
                 severity,
                 context_headers: request.context_headers.clone(),
                 sla: effective_sla,
-                schedule_id: None,
-                scheduled_for: None,
-                workflow_attempt: 1,
                 workflow_retry_policy,
-                retry_of_exec_id: None,
                 max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
-                origin: None,
                 completion_callbacks,
                 start_source: effective_start_source,
                 start_source_ref: effective_start_source_ref.as_deref(),
-                started_by: None,
+                ..StartWorkflowParams::new(
+                    &workflow_name,
+                    &workflow_id,
+                    exec_id,
+                    input,
+                    &queue_name,
+                )
             },
             key,
             window_secs,
@@ -19093,12 +19093,6 @@ pub(crate) async fn start_workflow(
     }
 
     let start_params = StartWorkflowParams {
-        workflow_name: &workflow_name,
-        workflow_id: &workflow_id,
-        exec_id,
-        input,
-        parent_id: None,
-        queue_name: &queue_name,
         execution_timeout: request
             .execution_timeout_secs
             .map(chrono::Duration::seconds)
@@ -19115,7 +19109,6 @@ pub(crate) async fn start_workflow(
         // fleet-wide ceiling-as-default, at parity with the per-run timeout.
         chain_execution_timeout: info_chain_timeout_chrono,
         max_workflow_chain_timeout_ceiling: max_chain_timeout_ceiling,
-        inherited_chain_deadline_at: None,
         concurrency_key,
         concurrency_limit,
         concurrency_on_conflict,
@@ -19129,17 +19122,12 @@ pub(crate) async fn start_workflow(
         severity,
         context_headers: request.context_headers.clone(),
         sla: effective_sla,
-        schedule_id: None,
-        scheduled_for: None,
-        workflow_attempt: 1,
         workflow_retry_policy,
-        retry_of_exec_id: None,
         max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
-        origin: None,
         completion_callbacks,
         start_source: effective_start_source,
         start_source_ref: effective_start_source_ref.as_deref(),
-        started_by: None,
+        ..StartWorkflowParams::new(&workflow_name, &workflow_id, exec_id, input, &queue_name)
     };
     let metrics_ref: Option<&(dyn autumn_harvest::telemetry::MetricsRecorder + Send + Sync)> =
         Some(runtime.registry.telemetry().metrics.as_ref());
@@ -20210,18 +20198,7 @@ async fn batch_start_workflows(
                 autumn_harvest::execution::start_or_load_workflow_execution_collect_with_codecs(
                     &mut conn,
                     StartWorkflowParams {
-                        workflow_name: &item.workflow_name,
-                        workflow_id,
-                        exec_id,
-                        input,
-                        parent_id: None,
-                        queue_name: &queue_name,
-                        execution_timeout: None,
-                        memo: None,
                         search_attrs: item.search_attributes.clone(),
-                        reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
-                        conflict_policy:
-                            autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
                         trace_context: trace_ctx,
                         max_execution_timeout_ceiling: max_exec_timeout_ceiling,
                         // Chain-scoped lifetime cap (issue #617): workflow-type default
@@ -20230,34 +20207,30 @@ async fn batch_start_workflows(
                         chain_execution_timeout: info_chain_execution_timeout
                             .and_then(|d| chrono::Duration::from_std(d).ok()),
                         max_workflow_chain_timeout_ceiling: max_chain_timeout_ceiling,
-                        inherited_chain_deadline_at: None,
                         concurrency_key,
                         concurrency_limit,
                         concurrency_on_conflict,
                         priority: item.priority.unwrap_or_default(),
                         max_workflow_input_bytes: effective_wf_cap,
-                        start_at: None,
-                        delay: None,
-                        max_workflow_start_delay: None,
                         owner,
                         runbook_url,
                         severity,
                         context_headers: item.context_headers.clone(),
                         sla,
-                        schedule_id: None,
-                        scheduled_for: None,
-                        workflow_attempt: 1,
                         workflow_retry_policy: item_workflow_retry_policy,
-                        retry_of_exec_id: None,
                         max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
-                        origin: None,
-                        completion_callbacks: None,
                         // Batch-start API immediate path (issue #740): provenance is
                         // `batch`, attributed to the operator that issued the batch.
                         // Mirrors the throttle-carrier branch above.
                         start_source: autumn_harvest::StartSource::Batch,
-                        start_source_ref: None,
                         started_by: Some(actor.as_str()),
+                        ..StartWorkflowParams::new(
+                            &item.workflow_name,
+                            workflow_id,
+                            exec_id,
+                            input,
+                            &queue_name,
+                        )
                     },
                     false,
                     item_reject_fresh,
@@ -29536,18 +29509,7 @@ async fn trigger_schedule_now(
     let result = start_or_load_workflow_execution_with_metrics_and_codecs(
         &mut exec_conn,
         StartWorkflowParams {
-            workflow_name: &workflow_name,
-            workflow_id: &workflow_id,
-            exec_id,
-            input: input.clone(),
-            parent_id: None,
-            queue_name: &queue_name,
             execution_timeout: info_execution_timeout,
-            memo: None,
-            search_attrs: None,
-            reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
-            conflict_policy: autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
-            trace_context: None,
             max_execution_timeout_ceiling: api_state
                 .max_workflow_execution_timeout()
                 .map(|d| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)),
@@ -29557,11 +29519,9 @@ async fn trigger_schedule_now(
             max_workflow_chain_timeout_ceiling: api_state
                 .max_workflow_chain_timeout()
                 .map(|d| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)),
-            inherited_chain_deadline_at: None,
             concurrency_key,
             concurrency_limit,
             concurrency_on_conflict,
-            priority: Priority::default(),
             max_workflow_input_bytes: runtime
                 .registry
                 .workflows
@@ -29570,13 +29530,9 @@ async fn trigger_schedule_now(
                 .map_or(runtime.registry.max_workflow_input_bytes, |per| {
                     per.max(runtime.registry.max_workflow_input_bytes)
                 }),
-            start_at: None,
-            delay: None,
-            max_workflow_start_delay: None,
             owner,
             runbook_url,
             severity,
-            context_headers: None,
             sla,
             // Manual trigger-now is *attributed* to its schedule (issue #534) so it shows
             // up in GET /admin/schedules/{id}/runs, but is marked origin=manual_trigger so
@@ -29587,16 +29543,19 @@ async fn trigger_schedule_now(
             // trigger path also lacks the budget/exhaustion checks the automated lineage
             // relies on — only scheduled fires and backfills advance the carryover cursor.
             schedule_id: Some(schedule_id),
-            scheduled_for: None,
-            workflow_attempt: 1,
             workflow_retry_policy: manual_trigger_retry_policy,
-            retry_of_exec_id: None,
             max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
             origin: Some(autumn_harvest::execution::ORIGIN_MANUAL_TRIGGER),
-            completion_callbacks: None,
             start_source: autumn_harvest::StartSource::Schedule,
             start_source_ref: Some(manual_schedule_id_str.as_str()),
             started_by: Some(actor.as_str()),
+            ..StartWorkflowParams::new(
+                &workflow_name,
+                &workflow_id,
+                exec_id,
+                input.clone(),
+                &queue_name,
+            )
         },
         Some(runtime.registry.telemetry().metrics.as_ref()),
         None,
@@ -30993,19 +30952,8 @@ pub(crate) async fn schedule_backfill_inner(
                 let result = start_or_load_workflow_execution_with_metrics_and_codecs(
                     &mut conn,
                     StartWorkflowParams {
-                        workflow_name: &wf_name,
-                        workflow_id: &workflow_id,
-                        exec_id,
-                        input: input.clone(),
-                        parent_id: None,
-                        queue_name: dispatch_queue,
                         execution_timeout: workflow_execution_timeout,
-                        memo: None,
-                        search_attrs: None,
                         reuse_policy: WorkflowIdReusePolicy::RejectDuplicate,
-                        conflict_policy:
-                            autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
-                        trace_context: None,
                         max_execution_timeout_ceiling: workflow_max_execution_timeout_ceiling,
                         // Chain-scoped lifetime cap (issue #617): backfilled runs
                         // inherit the workflow-type default + fleet-wide
@@ -31018,12 +30966,8 @@ pub(crate) async fn schedule_backfill_inner(
                             .map(|d| {
                                 chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)
                             }),
-                        inherited_chain_deadline_at: None,
-                        concurrency_key: None,
-                        concurrency_limit: None,
                         concurrency_on_conflict:
                             autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
-                        priority: Priority::default(),
                         max_workflow_input_bytes: runtime
                             .registry
                             .workflows
@@ -31032,18 +30976,13 @@ pub(crate) async fn schedule_backfill_inner(
                             .map_or(runtime.registry.max_workflow_input_bytes, |per| {
                                 per.max(runtime.registry.max_workflow_input_bytes)
                             }),
-                        start_at: None,
-                        delay: None,
-                        max_workflow_start_delay: None,
                         owner,
                         runbook_url,
                         severity,
-                        context_headers: None,
                         sla,
                         // Backfilled runs share the schedule's carryover lineage (issue #488).
                         schedule_id: Some(schedule_id),
                         scheduled_for: Some(*original_slot),
-                        workflow_attempt: 1,
                         workflow_retry_policy: schedule
                             .retry_policy
                             .as_ref()
@@ -31055,16 +30994,21 @@ pub(crate) async fn schedule_backfill_inner(
                                     .get(&wf_name)
                                     .and_then(|info| info.retry_policy.clone())
                             }),
-                        retry_of_exec_id: None,
                         max_workflow_attempts_ceiling: runtime
                             .registry
                             .max_workflow_attempts_ceiling,
                         // Distinguish a backfill storm from normal cadence (issue #534).
                         origin: Some(autumn_harvest::execution::ORIGIN_BACKFILL),
-                        completion_callbacks: None,
                         start_source: autumn_harvest::StartSource::Backfill,
                         start_source_ref: Some(&schedule_id_str),
                         started_by: Some(actor.as_str()),
+                        ..StartWorkflowParams::new(
+                            &wf_name,
+                            &workflow_id,
+                            exec_id,
+                            input.clone(),
+                            dispatch_queue,
+                        )
                     },
                     Some(runtime.registry.telemetry().metrics.as_ref()),
                     None,
@@ -31344,56 +31288,37 @@ pub(crate) async fn schedule_backfill_inner(
                 let start_result = start_or_load_workflow_execution_with_metrics_and_codecs(
                     &mut conn,
                     StartWorkflowParams {
-                        workflow_name: &dag_name,
-                        workflow_id: &workflow_id,
-                        exec_id,
-                        input: serde_json::json!({"_harvest_run_source": "backfill"}),
-                        parent_id: None,
-                        queue_name: dag_queue,
                         execution_timeout: dag_execution_timeout,
-                        memo: None,
-                        search_attrs: None,
                         reuse_policy: autumn_harvest::types::WorkflowIdReusePolicy::RejectDuplicate,
-                        conflict_policy:
-                            autumn_harvest::types::WorkflowIdConflictPolicy::Unspecified,
-                        trace_context: None,
                         max_execution_timeout_ceiling: dag_max_execution_timeout_ceiling,
-                        chain_execution_timeout: None,
-                        max_workflow_chain_timeout_ceiling: None,
-                        inherited_chain_deadline_at: None,
-                        concurrency_key: None,
-                        concurrency_limit: None,
                         concurrency_on_conflict:
                             autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
-                        priority: Priority::default(),
-                        max_workflow_input_bytes: 0,
-                        start_at: None,
-                        delay: None,
-                        max_workflow_start_delay: None,
                         owner,
                         runbook_url,
                         severity,
-                        context_headers: None,
-
                         sla: dag_sla,
                         // Backfilled runs share the schedule's carryover lineage (issue #488).
                         schedule_id: Some(schedule_id),
                         scheduled_for: Some(*original_slot),
-                        workflow_attempt: 1,
                         workflow_retry_policy: schedule
                             .retry_policy
                             .as_ref()
                             .and_then(|v| serde_json::from_value(v.clone()).ok()),
-                        retry_of_exec_id: None,
                         max_workflow_attempts_ceiling: runtime
                             .registry
                             .max_workflow_attempts_ceiling,
                         // Distinguish a backfill storm from normal cadence (issue #534).
                         origin: Some(autumn_harvest::execution::ORIGIN_BACKFILL),
-                        completion_callbacks: None,
                         start_source: autumn_harvest::StartSource::Backfill,
                         start_source_ref: Some(&schedule_id_str),
                         started_by: Some(actor.as_str()),
+                        ..StartWorkflowParams::new(
+                            &dag_name,
+                            &workflow_id,
+                            exec_id,
+                            serde_json::json!({"_harvest_run_source": "backfill"}),
+                            dag_queue,
+                        )
                     },
                     Some(runtime.registry.telemetry().metrics.as_ref()),
                     None,
@@ -37868,6 +37793,10 @@ struct AuditExportRedriveRequest {
     before: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// Appended to the redrive audit detail and refusal when retention cut the window.
+const TRUNCATED_NOTE: &str = "; retention already purged records at or after the requested \
+                              instant, so the window is incomplete";
+
 /// What `rewind_cursor_locked` decided, plus how much of it the database can
 /// actually deliver (issue #1267).
 ///
@@ -37880,6 +37809,8 @@ struct RedriveApplied {
     outcome: ::autumn_harvest::audit_export::RewindOutcome,
     recoverable_records: i64,
     already_purged_records: i64,
+    /// Retention purged records a `before` request named (issue #1508).
+    window_truncated: bool,
 }
 
 /// `POST /admin/audit-export/redrive` — rewind one shard's export cursor so
@@ -38012,12 +37943,19 @@ async fn audit_export_redrive_handler(
                         ::autumn_harvest::audit_export::redrive_recovery_counts(conn, outcome)
                             .await?;
 
+                    // A `before` window comes from surviving rows, so the
+                    // counts above cannot see a purged prefix (issue #1508).
+                    let window_truncated = ::autumn_harvest::audit_export::redrive_window_truncated(
+                        conn, target, outcome,
+                    )
+                    .await?;
+
                     // Only a rewind that actually moved the cursor is a
                     // SUCCEEDED privileged action; a refused request changed
                     // nothing and must not read as one in the trail.
                     let (status, detail) = match &outcome {
                         ::autumn_harvest::audit_export::RewindOutcome::Rewound { from, to } => {
-                            let detail = if already_purged_records > 0 {
+                            let mut detail = if already_purged_records > 0 {
                                 format!(
                                     "cursor rewound from {from} to {to}; {already_purged_records} \
                                      of {} records in that window were already purged by \
@@ -38027,6 +37965,9 @@ async fn audit_export_redrive_handler(
                             } else {
                                 format!("cursor rewound from {from} to {to}")
                             };
+                            if window_truncated {
+                                detail.push_str(TRUNCATED_NOTE);
+                            }
                             (STATUS_SUCCEEDED, Some(detail))
                         }
                         ::autumn_harvest::audit_export::RewindOutcome::NoOp {
@@ -38036,7 +37977,8 @@ async fn audit_export_redrive_handler(
                             STATUS_FAILED,
                             Some(format!(
                                 "refused: cursor is at {cursor}, requested {requested}; a \
-                                 cursor may only be rewound"
+                                 cursor may only be rewound{}",
+                                if window_truncated { TRUNCATED_NOTE } else { "" }
                             )),
                         ),
                         ::autumn_harvest::audit_export::RewindOutcome::NotConfigured => (
@@ -38063,6 +38005,7 @@ async fn audit_export_redrive_handler(
                         outcome,
                         recoverable_records,
                         already_purged_records,
+                        window_truncated,
                     })
                 }))
                 .await
@@ -38116,6 +38059,7 @@ async fn audit_export_redrive_handler(
                 "to": to,
                 "recoverable_records": applied.recoverable_records,
                 "already_purged_records": applied.already_purged_records,
+                "window_truncated": applied.window_truncated,
             })),
         )
             .into_response(),
@@ -38123,8 +38067,13 @@ async fn audit_export_redrive_handler(
             AutumnError::bad_request_msg(format!(
                 "refusing to move shard {}'s audit-export cursor to {requested} (it is at \
                  {cursor}); a cursor may only be rewound, since advancing it would mark \
-                 records delivered that never were",
-                request.shard
+                 records delivered that never were{}",
+                request.shard,
+                if applied.window_truncated {
+                    TRUNCATED_NOTE
+                } else {
+                    ""
+                }
             ))
             .into_response()
         }
@@ -49937,7 +49886,10 @@ mod tests {
 
     #[test]
     fn merge_paused_queues_is_empty_when_nothing_is_held() {
-        assert!(merge_paused_queue_rows(Vec::new(), &[0]).is_empty());
+        assert_eq!(
+            merge_paused_queue_rows(Vec::new(), &[0]),
+            [] as [serde_json::Value; 0]
+        );
     }
 
     /// Issue #619 review: `effective_scope` must be derived from the shards that
@@ -50534,7 +50486,7 @@ mod tests {
 
         let mut empty: Vec<String> = Vec::new();
         sort_reason_codes(&mut empty);
-        assert!(empty.is_empty());
+        assert_eq!(empty, [] as [std::string::String; 0]);
 
         // Issue #807: the activity-level hold leads too, and a task held by
         // BOTH reports them in a deterministic order rather than whichever the
@@ -50915,8 +50867,11 @@ mod tests {
             obs.error.is_some(),
             "a poolless expected shard must be an unavailable observation, not skipped"
         );
-        assert!(obs.runs.is_empty());
-        assert!(obs.summary.is_empty());
+        assert_eq!(obs.runs, [] as [autumn_harvest::ScheduleRunRow; 0]);
+        assert_eq!(
+            obs.summary,
+            [] as [autumn_harvest::ScheduleRunStateCount; 0]
+        );
 
         // The unavailable observation, combined with a healthy inspected shard,
         // must drive the report status to `partial` — never `complete`.
@@ -51564,9 +51519,9 @@ mod tests {
     fn parse_workflow_filters_defaults_to_empty_filters_with_default_limit() {
         let filters = parse_workflow_filters(&[]).expect("no params should parse");
         assert_eq!(filters.limit, DEFAULT_WORKFLOW_LIMIT);
-        assert!(filters.states.is_empty());
+        assert_eq!(filters.states, [] as [std::string::String; 0]);
         assert!(filters.workflow_name.is_none());
-        assert!(filters.search_attrs.is_empty());
+        assert_eq!(filters.search_attrs, [] as [serde_json::Value; 0]);
     }
 
     #[test]
@@ -51909,7 +51864,7 @@ mod tests {
     fn parse_workflow_filters_ignores_unknown_query_keys() {
         let filters = parse_workflow_filters(&pairs(&[("ignored", "value")]))
             .expect("unknown keys should be skipped");
-        assert!(filters.states.is_empty());
+        assert_eq!(filters.states, [] as [std::string::String; 0]);
         assert!(filters.workflow_name.is_none());
     }
 
@@ -53468,7 +53423,10 @@ mod tests {
 
     #[test]
     fn shard_population_of_no_rows_is_empty() {
-        assert!(shard_population(&[]).is_empty());
+        assert_eq!(
+            shard_population(&[]),
+            [] as [autumn_harvest::replay_sample::SampleWorkflowCoverage; 0]
+        );
     }
 
     /// Two logical shards may share one physical database — a supported
@@ -57917,7 +57875,10 @@ mod tests {
             rate_limit_bucket_missing: false,
             concurrency_saturated: false,
         };
-        assert!(contributing_reasons_for(&[facts], chrono::Utc::now()).is_empty());
+        assert_eq!(
+            contributing_reasons_for(&[facts], chrono::Utc::now()),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]
@@ -58345,8 +58306,8 @@ mod tests {
         // A co-located worker that has not registered a row yet, and an
         // API-only replica, both leave the local build unidentified -- which
         // `registry_fallback_binds` reads as "no build identity configured".
-        assert!(local_build_id_from_workers(&workers, Some("w-missing")).is_empty());
-        assert!(local_build_id_from_workers(&workers, None).is_empty());
+        assert_eq!(local_build_id_from_workers(&workers, Some("w-missing")), "");
+        assert_eq!(local_build_id_from_workers(&workers, None), "");
     }
 
     #[test]

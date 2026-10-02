@@ -140,7 +140,7 @@ Never remove or reorder `WorkflowEvent` variants. Stored JSON in `harvest_events
 
 **Sanctioned in-place mutation exceptions.** Exactly two operations write existing `harvest_events.event_data` rows. `CLAUDE.md` ("`harvest_events` is append-only") is the authority on this list, with each scope guarantee and its proof.
 
-- **Payload erasure** (`erase.rs`, issue #495). `erase_workflow_payloads` replaces payload-bearing field values within the `data` object with a tombstone `{"_harvest_erased": true}`. The event `type`, variant structure, event IDs, timestamps, and sequence number are never touched. This exception is **terminal-only** (execution must be COMPLETED/FAILED/CANCELLED/TIMED_OUT/CONTINUED_AS_NEW/TERMINATED) to protect replay determinism of any resumable run, and is **irreversible**. No new `WorkflowEvent` variant is introduced.
+- **Payload erasure** (`erase.rs`, issue #495). `erase_workflow_payloads` replaces payload-bearing field values within the `data` object with a tombstone `{"_harvest_erased": true}`. The event `type`, variant structure, event IDs, timestamps, and sequence number are never touched. This exception is **terminal-only** (execution must be COMPLETED/FAILED/CANCELLED/TIMED_OUT/CONTINUED_AS_NEW/TERMINATED/MIGRATED) to protect replay determinism of any resumable run, and is **irreversible**. No new `WorkflowEvent` variant is introduced.
 - **Codec key re-encryption** (`codec_rotation.rs`, issue #948). The rotation sweep decodes a payload field's ciphertext under a retired key and re-encodes it under the active key. The decoded plaintext is byte-identical before and after. The write is a compare-and-swap on the row's previous bytes, so it always loses a race against an erasure.
 
 Heartbeat checkpoints (`queue::record_heartbeat`) are not an exception. They write the `harvest_task_queue` row, not the event log. Continue-as-new carries a stored `last_completion_result` into the successor's first event by patching the row before its INSERT, not after, so it is not an exception either.
@@ -156,6 +156,43 @@ Both types are `fn` (not `Box<dyn Fn>`). The macro generates a closure body cast
 **7. Multi-param dispatch packs into JSON array**
 
 Single-param workflows/activities: input is passed as a single JSON value and deserialized directly. Multi-param: input is expected to be a JSON array `[arg1, arg2, ...]`, indexed by position.
+
+**8. Two boot paths, one set of startup steps**
+
+`HarvestPlugin` boots Harvest inside an autumn-web app. `HarvestEmbedding` (`embedding.rs`, issue #1613) boots it on any Axum server. Both call the shared steps in `autumn-harvest-plugin/src/boot.rs`: the limit mirror, the boot gate load, the admission globals, the gate refresh and the teardown. Add a new startup step there, not to one path only.
+
+The order is load-bearing. The gate cache loads before any worker spawns. The orphan gate runs before any admission global is published. The storage pool is installed before the API runtime. On stop, the admission globals are cleared only after the runner stops.
+
+**9. Activity claim epoch (issue #1789)**
+
+An activity attempt owns its task row only through its claim. The claim is the pair `(worker_id, attempt)`, held in `queue::TaskClaim`.
+
+*Protocol.*
+
+1. **Claim.** `claim_task` sets `state = 'RUNNING'` and `worker_id`, and adds 1 to `attempt`.
+2. **Heartbeat.** The flusher writes `last_heartbeat_at` and `heartbeat_details` under the claim.
+3. **Orphan reclaim.** The worker's liveness row goes stale. `requeue_orphan` sets the row to `PENDING` and clears `worker_id`. It does not change `attempt`.
+4. **Re-claim.** A worker claims the row again. The new claim has a higher `attempt`.
+5. **Complete.** The owner locks the execution row, then calls `lock_claim_for_update`. Only after `Held` does it append the terminal event and write the terminal row state with a fenced write.
+
+*Invariant.* A task-row write takes effect only while its claim is current. So only the current claim writes the terminal event and the terminal row state.
+
+*Why the pair is a fencing token.* Every claim adds 1 to `attempt`. Only these writes subtract 1: the pause releases, the capability-miss release and the rate-limit deferral. Each one undoes the increment of the claim that releases itself. So after a foreign requeue, every later claim has a higher `attempt` than the stale one. The rate-limit deferral is fenced, so a stale owner cannot lower `attempt`. A self-release lets the next claim reuse its `(worker_id, attempt)` pair. That is safe, because each release runs before the handler and the heartbeat flusher start. `worker_id` alone is not enough, because the same worker can win the row back. `crash_strikes` is not enough either, because clean reschedules reset it to 0.
+
+The capability-miss release still keys on `(worker_id, crash_strikes)`. It runs only on a worker without the handler. That worker never runs the activity, so it never issues an owner write for it.
+
+*Enforcement.* `claim_held` in `queue.rs` is the one predicate: `state = 'RUNNING' AND worker_id = $w AND attempt = $a`. Every owner write and claim check uses it, in its own statement:
+
+- Writes: `complete_claimed_task`, `fail_claimed_task`, `requeue_claimed_task_for_retry`, `defer_claimed_rate_limited_task` and `record_heartbeat`.
+- `lock_claim_for_update`. The start fence, both finalize paths, the in-worker schedule-to-close and session-acquire timeouts, and `run_transactional` take it after the execution row lock.
+- `claim_is_current` and `task_status_for_claim`. The cancellation observer and `ActivityContext::check_durable_cancellation` read them.
+- `claim_held_for_update_skip_locked`. For an activity row, `fail_task_and_execution_with_history` takes it before its `claim_still_held_for_update` guard. A later claim of the same worker returns `Ok` without a write. Any other miss returns `TerminalWriteClaimAmbiguous`, as the guard does.
+
+*Lease lost.* A path that gets `ClaimLock::Lost` appends no event and returns `Ok`. It must not return an error, because `fail_execution_on_error` would then fail the workflow. After `Held`, a `LeaseLost` write is a bug, and `require_applied` rolls the transaction back. A fenced write outside the lock returns `LeaseLost` when it matches 0 rows. The heartbeat flusher, the cancellation observer and `check_durable_cancellation` stop the activity.
+
+*Not fenced.* `complete_task`, `fail_task`, `requeue_for_retry` and `defer_rate_limited_task` stay unfenced. The timeout sweeper in `timeout.rs`, cancellation and operator actions use them on purpose: they act on a row whatever its claim. Workflow-task writes use `claim_still_held_for_update` (issues #804 and #1184).
+
+A formal model of this protocol is tracked in issue #1819.
 
 ### Sharding
 
@@ -330,6 +367,17 @@ from the partial unique index, so `RejectDuplicate` no longer treats it as a
 duplicate. The reset operator explicitly opted the prior row out of the
 uniqueness scope, matching the broader `start_or_load_workflow_execution`
 semantics.
+
+**Shared start step (#1440).** Signal-with-start and update-with-start share
+one start path in `execution.rs`. `with_start_params!` builds the
+`StartWorkflowParams`. `start_or_attach` resolves the policy, starts or loads
+the run, checks the input, escalates a terminal prior, and applies the debounce
+gate. `StartEffects` holds the work that runs after commit. Each route passes
+its differences as data: the start provenance, the live states, and the input
+schema. Update-with-start accepts `SUSPENDED` as live. Signal-with-start does
+not. The input check runs only when the start creates a run. An attach
+writes no input (issue #918). Signal-with-start also cancels a `TerminateIfRunning` prior before the
+start step. Update-with-start cancels it inside the start step.
 
 **Idempotency dedupe is scoped to the logical workflow**, not the
 `workflow_exec_id`. A webhook retry carrying the same `idempotency_key` that
@@ -1298,6 +1346,8 @@ async fn doc_index(ctx: &WorkflowContext, req: IndexRequest) -> Result<(), Strin
 | Schedule **backfill**, outbox relay, Vantage manual trigger, plugin bootstrap | **No** — explicit `Defer` | These pass `concurrency_key: None`, so `on_conflict` is inert. Matches #247, which never applied per-key concurrency on those paths — a backfill deliberately materialises historical slots and must not cancel live work |
 
 This mirrors how the #618 admission gates and #607 throttles treat the same paths.
+
+New start sites build their params with `StartWorkflowParams::new(..)` and override only what they vary, with `..` (#1448). The retry site keeps an explicit `Defer`, so a change to the default cannot alter it.
 
 **Interaction notes.**
 

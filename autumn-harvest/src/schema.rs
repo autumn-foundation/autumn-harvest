@@ -635,6 +635,19 @@ diesel::table! {
 diesel::table! {
     use diesel::sql_types::*;
 
+    /// Latest `occurred_at` of any sequenced audit record retention purged
+    /// (issue #1508). One row per database; see the migration.
+    harvest_audit_purge_watermark (singleton) {
+        singleton -> Bool,
+        max_purged_occurred_at -> Timestamptz,
+        purged_records -> Int8,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
     /// Scoped API tokens for the management API (issue #942). Control-plane
     /// config state — no `shard_id`; verified on the default shard.
     harvest_api_tokens (id) {
@@ -1244,6 +1257,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_batch_jobs,
     harvest_audit_log,
     harvest_audit_export_cursor,
+    harvest_audit_purge_watermark,
     harvest_api_tokens,
     harvest_build_policies,
     harvest_build_compat,

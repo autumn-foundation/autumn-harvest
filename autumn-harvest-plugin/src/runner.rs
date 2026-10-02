@@ -141,6 +141,39 @@ impl HarvestRunnerResources {
     pub const fn startup_orphan_gate_already_run(&self) -> bool {
         self.startup_orphan_gate_already_run
     }
+
+    /// The default shard and its pool, as the runtime will resolve them.
+    ///
+    /// Uses the precedence of [`resolve_runtime_storage_pool`] and installs
+    /// no process global. The admission gate table is read from this pool.
+    pub(crate) fn default_shard_pool(&self, built: &BuiltHarvest) -> (ShardId, DbPool) {
+        match pick_runtime_pool_source(
+            self.sharded_pool.as_ref(),
+            built.worker_config().sharded_pool.as_ref(),
+            &self.harvest_pool,
+        ) {
+            RuntimePoolSource::Sharded(sp) => {
+                let shard = sp.default_shard();
+                (shard, sp.pool_for(shard).clone())
+            }
+            RuntimePoolSource::Single(pool) => (ShardId::new(0), pool.clone()),
+        }
+    }
+
+    /// The shards the runtime will hold a pool for.
+    ///
+    /// Uses the precedence of [`resolve_runtime_storage_pool`] and installs
+    /// no process global.
+    pub(crate) fn pool_shards(&self, built: &BuiltHarvest) -> Vec<ShardId> {
+        match pick_runtime_pool_source(
+            self.sharded_pool.as_ref(),
+            built.worker_config().sharded_pool.as_ref(),
+            &self.harvest_pool,
+        ) {
+            RuntimePoolSource::Sharded(sp) => sp.shard_ids(),
+            RuntimePoolSource::Single(_) => vec![ShardId::new(0)],
+        }
+    }
 }
 
 /// Which pool source the runtime resolves to, before any installation.
@@ -666,13 +699,12 @@ fn prepare_audit_export_config(
 ///
 /// Deliberately the **last** thing `PreparedHarvestRuntime::build` does, after
 /// every fallible step has succeeded — see [`prepare_audit_export_config`].
+///
+/// Committing `None` over a live config marks export as disabled (issue #1506).
 fn commit_audit_export_config(
     config: Option<Arc<autumn_harvest::audit_export::AuditExportRuntimeConfig>>,
 ) {
-    let Ok(mut lock) = autumn_harvest::audit_export::GLOBAL_AUDIT_EXPORT_CONFIG.write() else {
-        return;
-    };
-    *lock = config;
+    autumn_harvest::audit_export::set_global_audit_export_config(config);
 }
 
 /// This runtime's audit-export config, held **unpublished** until every

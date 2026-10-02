@@ -1397,9 +1397,12 @@ async fn workflow_hard_cap_moves_offender_to_dlq() {
                 last_error: None,
                 scheduled_time: None,
             },
-            WorkflowEvent::MarkerRecorded {
-                name: "already-large".into(),
-                details: serde_json::json!({}),
+            // Padding from outside the workflow code. A command event such
+            // as `MarkerRecorded` that the handler never issues is drift,
+            // and the worker ND-blocks it before the cap (issue #1791).
+            WorkflowEvent::SignalReceived {
+                signal_name: "already-large".into(),
+                payload: serde_json::json!({}),
             },
         ],
         0,
@@ -1561,9 +1564,12 @@ async fn workflow_hard_cap_dlq_preserves_terminal_attempt_count() {
                 last_error: None,
                 scheduled_time: None,
             },
-            WorkflowEvent::MarkerRecorded {
-                name: "already-large".into(),
-                details: serde_json::json!({}),
+            // Padding from outside the workflow code. A command event such
+            // as `MarkerRecorded` that the handler never issues is drift,
+            // and the worker ND-blocks it before the cap (issue #1791).
+            WorkflowEvent::SignalReceived {
+                signal_name: "already-large".into(),
+                payload: serde_json::json!({}),
             },
         ],
         0,

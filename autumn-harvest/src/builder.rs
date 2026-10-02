@@ -1206,6 +1206,17 @@ impl BuiltHarvest {
     }
 
     /// Convert the built harvest registration into worker-ready parts.
+    ///
+    /// Clone-class note: the three `install_global_*_for_direct_worker` and
+    /// `set_purge_window_secs` calls, and the registry-builder chain below,
+    /// repeat verbatim in [`Self::into_worker_parts_with_extra_state`].
+    /// Apply any change to either block to both functions.
+    ///
+    /// Two instances only. Three separate features (issue #605, issue
+    /// #808, issue #953) each added one new install call here. Each
+    /// landed in both copies in the same change. No copy has ever shipped
+    /// the call alone. The merge bar (rule of three, or a missed-fix) is
+    /// not met yet, so the duplication stays.
     #[cfg(feature = "db")]
     #[must_use]
     pub fn into_worker_parts(
@@ -1311,6 +1322,12 @@ impl BuiltHarvest {
 
     /// Convert the built harvest registration into worker-ready parts while
     /// injecting additional typed runtime state.
+    ///
+    /// Clone-class note: the three `install_global_*_for_direct_worker` and
+    /// `set_purge_window_secs` calls, and the registry-builder chain below,
+    /// repeat verbatim in [`Self::into_worker_parts`]. Apply any change to
+    /// either block to both functions. Two instances only, so the merge
+    /// bar is not met yet. See the note on `into_worker_parts`.
     #[cfg(feature = "db")]
     #[must_use]
     pub fn into_worker_parts_with_extra_state(
@@ -3782,7 +3799,7 @@ pub struct WorkerConfig {
     /// `max_concurrent_activities`) are auto-resized within
     /// `[SlotTunerConfig::min_slots, SlotTunerConfig::max_slots]`, driven by
     /// in-process slot utilization, worker DB-pool pressure, and recent
-    /// claim-to-dispatch permit-wait latency. The controller never resizes
+    /// dispatch-wait latency. The controller never resizes
     /// below `min_slots` (liveness floor) or above `max_slots` (hard safety
     /// cap); a shrink decision only withholds *new* permits and never cancels
     /// or reclaims an already-dispatched task, so graceful shutdown and
@@ -4447,8 +4464,8 @@ impl WorkerConfig {
     /// behaviour is byte-for-byte identical to today.
     ///
     /// See [`crate::slot_tuner`] for the default controller's signals
-    /// (slot utilization, worker DB-pool pressure, claim-to-dispatch permit
-    /// wait) and `docs/operations/adaptive-slot-tuner.md` for the operator
+    /// (slot utilization, worker DB-pool pressure, dispatch wait) and
+    /// `docs/operations/adaptive-slot-tuner.md` for the operator
     /// guide.
     #[must_use]
     pub fn with_slot_tuner(mut self, cfg: crate::slot_tuner::SlotTunerConfig) -> Self {
@@ -4669,7 +4686,10 @@ mod tests {
     /// touches `shard_assignments` gets full coverage.
     #[test]
     fn default_worker_config_shard_assignments_are_auto() {
-        assert!(WorkerConfig::default().shard_assignments.is_empty());
+        assert_eq!(
+            WorkerConfig::default().shard_assignments,
+            [] as [crate::types::ShardId; 0]
+        );
     }
 
     /// An all-duplicates list must still leave a usable assignment rather than
@@ -4900,7 +4920,7 @@ mod tests {
     #[test]
     fn worker_config_with_empty_queues_clears_list() {
         let config = WorkerConfig::default().with_queues(Vec::<&str>::new());
-        assert!(config.queues.is_empty());
+        assert_eq!(config.queues, [] as [std::string::String; 0]);
     }
 
     #[test]
@@ -5578,7 +5598,7 @@ mod tests {
     #[test]
     fn worker_config_with_empty_iterator_clears_queues() {
         let config = WorkerConfig::default().with_queues(Vec::<&str>::new());
-        assert!(config.queues.is_empty());
+        assert_eq!(config.queues, [] as [std::string::String; 0]);
     }
 
     fn make_activity(
@@ -7736,11 +7756,9 @@ mod tests {
         // Identical-behavior guarantee: an embedder who never touches the
         // completion-callback API gets an empty default-target list.
         let built = HarvestBuilder::new().build();
-        assert!(
-            built
-                .completion_callback_config()
-                .default_targets
-                .is_empty()
+        assert_eq!(
+            built.completion_callback_config().default_targets,
+            [] as [crate::completion_callback::CallbackTarget; 0]
         );
         assert!(built.completion_callback_config().deliverer.is_none());
     }

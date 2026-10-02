@@ -356,9 +356,8 @@ impl WorkerRuntimeConfig {
                 ));
             }
             // `min_slots == 0` is a liveness hazard, not just a degenerate
-            // band: the default controller's grow signal depends on
-            // observing a claim-to-dispatch permit wait, which requires a
-            // task to actually be dispatched. If pool pressure ever shrinks
+            // band. The grow signal of the default controller needs a
+            // dispatch wait. A dispatch wait needs a dispatched task. If pool pressure ever shrinks
             // the target to 0, no task can dispatch, so no permit wait is
             // ever recorded and the worker is permanently stuck at zero
             // capacity — the same silent-outage shape as `max_slots == 0`.
@@ -5361,20 +5360,75 @@ async fn lock_workflow_execution_row_only(
         .map_err(crate::error::database_error)
 }
 
-async fn task_state_for_update(
+/// Lock an activity row under the claim that the `task` snapshot carries.
+///
+/// Every activity owner write checks this first (issue #1789). A snapshot
+/// with no `worker_id` holds no claim, so it reads as lost.
+async fn lock_activity_claim(
     conn: &mut AsyncPgConnection,
-    task_id: uuid::Uuid,
-) -> HarvestResult<Option<String>> {
-    use crate::schema::harvest_task_queue::dsl;
+    task: &TaskQueueItem,
+) -> HarvestResult<queue::ClaimLock> {
+    let Some(claim) = queue::TaskClaim::of(task) else {
+        return Ok(queue::ClaimLock::Lost { state: None });
+    };
+    queue::lock_claim_for_update(conn, &claim).await
+}
 
-    dsl::harvest_task_queue
-        .find(task_id)
-        .for_update()
-        .select(dsl::state)
-        .first(conn)
-        .await
-        .optional()
-        .map_err(crate::error::database_error)
+/// Check the claim epoch of an activity row under its lock (issue #1789).
+///
+/// The guards in [`fail_task_and_execution_with_history`] key on
+/// `(worker_id, crash_strikes)`. A clean release resets `crash_strikes` to 0,
+/// so a later claim by the same worker can pass them. This check locks the
+/// row with the epoch in the same statement. The later guards then read a row
+/// that this transaction holds, so the epoch cannot move under them.
+///
+/// `SKIP LOCKED`, as in [`queue::claim_still_held_for_update`], keeps this
+/// transaction out of a lock cycle.
+async fn activity_epoch_check(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+) -> HarvestResult<ActivityEpoch> {
+    let Some(claim) = queue::TaskClaim::of(task) else {
+        return Ok(ActivityEpoch::Unconfirmed);
+    };
+    if queue::claim_held_for_update_skip_locked(conn, &claim).await? {
+        return Ok(ActivityEpoch::Held);
+    }
+    if queue::later_claim_shares_strikes(conn, &claim, task.crash_strikes).await? {
+        return Ok(ActivityEpoch::Reused);
+    }
+    Ok(ActivityEpoch::Unconfirmed)
+}
+
+/// The result of [`activity_epoch_check`].
+enum ActivityEpoch {
+    /// The claim is current, and this transaction holds the row lock.
+    Held,
+    /// A later claim of the same worker passes the `crash_strikes` guards.
+    Reused,
+    /// The claim is lost, or another transaction holds the row lock.
+    Unconfirmed,
+}
+
+/// Log a write that a lost claim turned into a no-op (issue #1789).
+fn log_lease_lost(task: &TaskQueueItem, write: &str) {
+    tracing::debug!(
+        task_id = %task.id,
+        worker_id = task.worker_id.as_deref().unwrap_or_default(),
+        attempt = task.attempt,
+        write,
+        "activity claim lost; the write is a no-op"
+    );
+}
+
+/// Return the claim that the `task` snapshot carries.
+///
+/// A claimed snapshot always has a `worker_id`, so a missing one is a bug and
+/// returns an error.
+fn claim_of_task(task: &TaskQueueItem) -> HarvestResult<queue::TaskClaim> {
+    queue::TaskClaim::of(task).ok_or_else(|| {
+        HarvestError::NotFound(format!("task queue item {} holds no claim", task.id))
+    })
 }
 
 fn pending_activity_id_for_task(
@@ -5427,10 +5481,9 @@ async fn append_activity_started_if_pending(
             else {
                 return Ok(None);
             };
-            let Some(state) = task_state_for_update(conn, task.id).await? else {
-                return Ok(None);
-            };
-            if state != "RUNNING" {
+            // Claim-epoch start fence (issue #1789). A stale owner must not
+            // start an attempt that a later claim now holds.
+            if lock_activity_claim(conn, task).await? != queue::ClaimLock::Held {
                 return Ok(None);
             }
 
@@ -5454,6 +5507,27 @@ async fn append_activity_started_if_pending(
         }),
     )
     .await
+}
+
+/// Test seam for the activity start fence (issue #1789).
+///
+/// Returns the started activity id, or `None` when the start is a no-op.
+///
+/// # Errors
+///
+/// Returns the error of the start transaction.
+#[doc(hidden)]
+pub async fn append_activity_started_for_test(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    exec_id: ExecutionId,
+    activity_name: &str,
+    worker_id: &str,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<Option<ActivityExecId>> {
+    append_activity_started_if_pending(conn, task, exec_id, activity_name, worker_id, codecs)
+        .await
+        .map(|started| started.map(|s| s.activity_id))
 }
 
 async fn load_workflow_execution(
@@ -8310,38 +8384,24 @@ pub async fn persist_workflow_failure(
             {
                 let retry_workflow_id = rid.to_string();
                 let retry_params = crate::execution::StartWorkflowParams {
-                    workflow_name: &exec_ref.workflow_name,
-                    workflow_id: &retry_workflow_id,
-                    exec_id: rid,
-                    input: exec_ref.input.clone(),
-                    parent_id: None,
-                    queue_name: &exec_ref.queue_name,
                     execution_timeout: exec_ref.execution_timeout,
                     memo: exec_ref.memo.clone(),
                     search_attrs: exec_ref.search_attrs.clone(),
-                    reuse_policy: crate::types::WorkflowIdReusePolicy::AllowDuplicate,
-                    conflict_policy: crate::types::WorkflowIdConflictPolicy::Unspecified,
-                    trace_context: None,
-                    max_execution_timeout_ceiling: None,
                     // Workflow-level retry (issue #523) is the same logical run
                     // continuing, so the chain-scoped lifetime cap (issue #617)
                     // is inherited verbatim: carry the origin's absolute
                     // `chain_deadline_at` forward rather than re-anchoring it.
                     chain_execution_timeout: exec_ref.chain_execution_timeout,
-                    max_workflow_chain_timeout_ceiling: None,
                     inherited_chain_deadline_at: exec_ref.chain_deadline_at,
                     concurrency_key: concurrency_key.clone(),
                     concurrency_limit,
-                    // Workflow-level retry (issue #523) is the same logical run
-                    // continuing, not a fresh admission, so it never supersedes
-                    // (issue #811). Letting it cancel a run admitted AFTER the
-                    // failure would invert latest-wins.
+                    // A retry never supersedes (issue #811). It is the same
+                    // logical run, not a fresh admission. `CancelRunning` here
+                    // could cancel a run admitted after the failure and invert
+                    // latest-wins.
                     concurrency_on_conflict: crate::concurrency::ConcurrencyOnConflict::Defer,
                     priority,
-                    max_workflow_input_bytes: 0,
-                    start_at: None,
                     delay: start_delay,
-                    max_workflow_start_delay: None,
                     owner: exec_ref.owner.as_deref(),
                     runbook_url: exec_ref.runbook_url.as_deref(),
                     severity: exec_ref.severity.as_deref(),
@@ -8355,22 +8415,25 @@ pub async fn persist_workflow_failure(
                     workflow_attempt: attempt + 1,
                     workflow_retry_policy: Some(policy),
                     retry_of_exec_id: Some(exec_id.as_uuid()),
-                    max_workflow_attempts_ceiling: None,
                     origin: exec_ref.origin.as_deref(),
-                    // Workflow-level retry (issue #523) is the same
-                    // logical run trying again — inherit the
-                    // predecessor's completion-callback targets (#605)
-                    // rather than silently dropping them.
+                    // A retry is the same logical run trying again (issue #523).
+                    // It inherits the predecessor's completion-callback targets
+                    // (issue #605) instead of dropping them.
                     completion_callbacks: exec_ref.completion_callbacks.clone(),
-                    // Workflow-level retry (issue #523/#740) is the same
-                    // logical run trying again — inherit the predecessor's
-                    // start provenance rather than re-attributing it as a
-                    // fresh `api` start.
+                    // A retry also inherits the predecessor's start provenance
+                    // (issue #740). It is not a fresh `api` start.
                     start_source: crate::types::StartSource::from_str(
                         exec_ref.start_source.as_deref().unwrap_or("unknown"),
                     ),
                     start_source_ref: exec_ref.start_source_ref.as_deref(),
                     started_by: exec_ref.started_by.as_deref(),
+                    ..crate::execution::StartWorkflowParams::new(
+                        &exec_ref.workflow_name,
+                        &retry_workflow_id,
+                        rid,
+                        exec_ref.input.clone(),
+                        &exec_ref.queue_name,
+                    )
                 };
 
                 match crate::execution::start_or_load_workflow_execution_collect_with_codecs(
@@ -12799,6 +12862,47 @@ async fn requeue_parent_on_transient_ingest_conflict(
     Ok(())
 }
 
+/// Re-drive a workflow task after an event-id conflict in an append made
+/// after the handler lookup (issue #1787).
+///
+/// The lookup succeeded, so this worker can run the task. The park clears the
+/// capability-miss evidence, as every other post-lookup park does (issue
+/// #804). Stale evidence could otherwise end the redelivery budget early.
+///
+/// The park is fenced on this handler's claim. A handler that outlived its
+/// task timeout can hit the conflict after a peer took the row. A lost claim
+/// is a no-op, so the peer keeps its ownership.
+#[doc(hidden)] // exposed for its integration test; not a stable API
+pub async fn requeue_workflow_task_after_event_id_conflict(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    worker_id: &str,
+    sticky_timeout: Duration,
+    exec_id: ExecutionId,
+) -> HarvestResult<()> {
+    let claim = queue::TaskClaim::new(task.id, worker_id, task.attempt);
+    let sticky = if sticky_timeout.is_zero() {
+        None
+    } else {
+        Some(queue::StickyHint::new(worker_id, sticky_timeout))
+    };
+    Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
+        if let queue::ClaimLock::Lost { .. } = queue::lock_claim_for_update(conn, &claim).await? {
+            tracing::debug!(
+                task_id = %task.id,
+                worker_id = %worker_id,
+                attempt = task.attempt,
+                "event-id conflict re-drive skipped: a peer holds the claim"
+            );
+            return Ok(());
+        }
+        let _ = queue::park_workflow_task(conn, task.id, sticky).await?;
+        queue::wake_workflow_task(conn, exec_id).await?;
+        Ok(())
+    }))
+    .await
+}
+
 /// Run the wake-event ingest ([`ingest_due_timers_and_signals`]), converting a
 /// transient `(workflow_exec_id, event_id)` UNIQUE conflict into a re-drive of
 /// the parent workflow task rather than a terminal failure (issue #779).
@@ -12992,6 +13096,22 @@ pub async fn fail_task_and_execution_with_history(
             lock_workflow_execution_row_only(conn, exec_id).await?;
         }
 
+        // Activity rows also carry a claim epoch (issue #1789). A reused
+        // claim is a lost lease, so this failure is a no-op. An unconfirmed
+        // claim takes the same blameless path as the guards below.
+        if task.task_type == "activity" {
+            match activity_epoch_check(conn, task).await? {
+                ActivityEpoch::Held => {}
+                ActivityEpoch::Reused => {
+                    log_lease_lost(task, "activity execution failure");
+                    return Ok(());
+                }
+                ActivityEpoch::Unconfirmed => {
+                    return Err(HarvestError::TerminalWriteClaimAmbiguous { task_id });
+                }
+            }
+        }
+
         let (exec_id, next_event_id) = match preloaded {
             PreloadedFailureHistory::NoExecution => {
                 if !queue::claim_still_held_for_update(conn, task_id, worker_id, crash_strikes)
@@ -13040,7 +13160,18 @@ pub async fn fail_task_and_execution_with_history(
     .await
 }
 
-async fn finalize_activity_completion(
+/// Append `ActivityCompleted` and complete the task row, under the claim
+/// that `task` carries.
+///
+/// Test seam for the activity claim-epoch fence (issue #1789). Not a stable
+/// API.
+///
+/// # Errors
+///
+/// Returns the error of the completion transaction. A lost claim is not an
+/// error.
+#[doc(hidden)]
+pub async fn finalize_activity_completion(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
     exec_id: ExecutionId,
@@ -13065,10 +13196,10 @@ async fn finalize_activity_completion(
         if pending_activity_id_for_task(&history.events, task, activity_name)?.is_none() {
             return Ok(());
         }
-        let Some(state) = task_state_for_update(conn, task.id).await? else {
-            return Ok(());
-        };
-        if state != "RUNNING" {
+        // A lost lease is a no-op, not an error (issue #1789). The later
+        // claim owns the outcome of this activity.
+        if lock_activity_claim(conn, task).await? != queue::ClaimLock::Held {
+            log_lease_lost(task, "activity completion");
             return Ok(());
         }
         store::append_events_offloaded_with_codecs(
@@ -13080,7 +13211,9 @@ async fn finalize_activity_completion(
             codecs,
         )
         .await?;
-        queue::complete_task(conn, task.id, output).await?;
+        queue::complete_claimed_task(conn, &claim_of_task(task)?, output)
+            .await?
+            .require_applied(task.id)?;
         // Worker sessions (issue #606): a session member activity's
         // completion pushes the session's lease forward, so a
         // long-running but still-legitimate pipeline isn't reclaimed by
@@ -13108,7 +13241,18 @@ async fn finalize_activity_completion(
     crate::dispatch::settle_scope(result).await
 }
 
-async fn finalize_activity_failure(
+/// Append `ActivityFailed` and fail the task row, under the claim that
+/// `task` carries.
+///
+/// Test seam for the activity claim-epoch fence (issue #1789). Not a stable
+/// API.
+///
+/// # Errors
+///
+/// Returns the error of the failure transaction. A lost claim is not an
+/// error.
+#[doc(hidden)]
+pub async fn finalize_activity_failure(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
     exec_id: ExecutionId,
@@ -13148,15 +13292,14 @@ async fn finalize_activity_failure(
         if pending_activity_id_for_task(&history.events, task, activity_name)?.is_none() {
             return Ok(());
         }
-        let Some(state) = task_state_for_update(conn, task.id).await? else {
-            return Ok(());
-        };
-        if state != "RUNNING" {
+        // A lost lease is a no-op, not an error (issue #1789).
+        if let queue::ClaimLock::Lost { state } = lock_activity_claim(conn, task).await? {
+            log_lease_lost(task, "activity failure");
             // If the task reached COMPLETED before the handler returned
             // (e.g. via run_transactional) and the handler then returned
             // Err, the error is discarded — the workflow already observed
             // ActivityCompleted.  Emit a warning so the misuse is visible.
-            if state == "COMPLETED" {
+            if state.as_deref() == Some("COMPLETED") {
                 tracing::warn!(
                     task_id = %task.id,
                     activity_name = %activity_name,
@@ -13176,7 +13319,9 @@ async fn finalize_activity_failure(
             codecs,
         )
         .await?;
-        queue::fail_task(conn, task.id, &error).await?;
+        queue::fail_claimed_task(conn, &claim_of_task(task)?, &error)
+            .await?
+            .require_applied(task.id)?;
         queue::wake_workflow_task(conn, exec_id).await
     }))
     .await;
@@ -14051,14 +14196,20 @@ async fn create_detached_child_executions(
     Ok(())
 }
 
-/// Poll the task queue row for `task_id` until its state leaves `RUNNING`,
-/// at which point the caller should treat the activity as cancelled.
+/// Poll the task queue row until `claim` is no longer current. The caller
+/// then treats the activity as cancelled.
 ///
-/// Transient DB errors are retried silently; only a state transition (or
-/// row deletion) resolves the future.
-async fn observe_task_cancellation(pool: &DbPool, task_id: uuid::Uuid) {
-    use crate::schema::harvest_task_queue::dsl;
-
+/// A lost claim also resolves the future (issue #1789). After an orphan
+/// reclaim, the row is `RUNNING` again under a later claim. A state check
+/// alone would let the stale attempt run on.
+///
+/// The loop retries transient DB errors silently. Only a lost claim resolves
+/// the future: a state change, a later claim, or a deleted row.
+///
+/// Test seam for the activity claim-epoch fence (issue #1789). Not a stable
+/// API.
+#[doc(hidden)]
+pub async fn observe_task_cancellation(pool: &DbPool, claim: &queue::TaskClaim) {
     const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
     loop {
@@ -14068,19 +14219,7 @@ async fn observe_task_cancellation(pool: &DbPool, task_id: uuid::Uuid) {
             continue;
         };
 
-        let row = dsl::harvest_task_queue
-            .find(task_id)
-            .select(dsl::state)
-            .first::<String>(&mut conn)
-            .await
-            .optional();
-
-        if let Ok(Some(state)) = &row
-            && state == "RUNNING"
-        {
-            continue;
-        }
-        if row.is_ok() {
+        if matches!(queue::claim_is_current(&mut conn, claim).await, Ok(false)) {
             return;
         }
     }
@@ -14111,7 +14250,7 @@ fn deadline_would_be_exceeded(
 /// the task terminally.
 ///
 /// Reads Postgres's own clock (issue #1389), not the host's: a fall-through
-/// here ends in [`queue::requeue_for_retry`], which stamps `scheduled_at`
+/// here ends in [`queue::requeue_claimed_task_for_retry`], which stamps `scheduled_at`
 /// from that same DB clock. A host-clock decision could pass this gate and
 /// still write a `scheduled_at` past `schedule_to_close_at`, stranding the
 /// row until a timeout scanner sweeps it. No query when the task carries no
@@ -14291,6 +14430,10 @@ async fn record_schedule_to_close_activity_timeout(
             let error = error.clone();
             let (execution, history) =
                 lock_workflow_execution_row_and_load_history(conn, exec_id, codecs).await?;
+            // A stale owner must not time out a later claim (issue #1789).
+            if lock_activity_claim(conn, task).await? != queue::ClaimLock::Held {
+                return Ok(ScheduleToCloseTimeoutOutcome::Handled);
+            }
             let task_row = task_state_and_deadline_for_update(conn, task.id).await?;
             // Authoritative re-check under the execution row lock: bail
             // without mutation when the task was concurrently resolved, the
@@ -14300,7 +14443,7 @@ async fn record_schedule_to_close_activity_timeout(
             //
             // `db_clock_now`, not the host clock (issue #1389): a
             // `DeadlineShifted` verdict here falls through to
-            // `queue::requeue_for_retry`, which stamps `scheduled_at` from
+            // `queue::requeue_claimed_task_for_retry`, which stamps `scheduled_at` from
             // Postgres's own clock. This transaction has already done other
             // work above, so a plain `NOW()` query would also be wrong here.
             // `db_clock_now` reads `clock_timestamp()` for exactly that
@@ -14326,7 +14469,9 @@ async fn record_schedule_to_close_activity_timeout(
                 codecs,
             )
             .await?;
-            queue::fail_task(conn, task.id, &error).await?;
+            queue::fail_claimed_task(conn, &claim_of_task(task)?, &error)
+                .await?
+                .require_applied(task.id)?;
             queue::wake_workflow_task(conn, exec_id).await?;
             Ok(ScheduleToCloseTimeoutOutcome::Handled)
         }),
@@ -14440,11 +14585,18 @@ async fn handle_activity_result(
                 // attempt is NOT counted as a scheduled retry) and only when the
                 // DB requeue actually succeeds (avoids inflating the counter on
                 // transient DB errors or stale task state).
-                let result = queue::requeue_for_retry(conn, task.id, delay, &previous_error).await;
-                if result.is_ok() {
+                // A lost lease is a no-op (issue #1789). It must not count
+                // as a retry, and it must not requeue a later claim.
+                let claim = claim_of_task(task)?;
+                let write =
+                    queue::requeue_claimed_task_for_retry(conn, &claim, delay, &previous_error)
+                        .await?;
+                if write == queue::ClaimWrite::Applied {
                     metrics.record_activity_retried(activity_name_for_cap, &task.queue_name);
+                } else {
+                    log_lease_lost(task, "activity retry requeue");
                 }
-                return result;
+                return Ok(());
             }
 
             finalize_activity_failure(conn, task, exec_id, activity_id, &error, codecs).await
@@ -14475,7 +14627,8 @@ async fn execute_activity_future_with_cancellation(
                     task_id = %task_id,
                     activity = %activity_name,
                     grace_period_ms = %cancellation_grace_period.as_millis(),
-                    "workflow cancellation detected for running activity; awaiting cooperative unwind"
+                    "cancellation or lost lease detected for running activity; \
+                     awaiting cooperative unwind"
                 );
                 tokio::time::timeout(cancellation_grace_period, activity_future)
                     .await
@@ -14535,10 +14688,7 @@ async fn record_session_acquire_schedule_to_start_timeout(
     let result = Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
         let error = error.clone();
         let history = lock_workflow_execution_and_load_history(conn, exec_id, codecs).await?;
-        let Some(state) = task_state_for_update(conn, task.id).await? else {
-            return Ok(());
-        };
-        if state != "RUNNING" {
+        if lock_activity_claim(conn, task).await? != queue::ClaimLock::Held {
             return Ok(());
         }
         let timeout_event = WorkflowEvent::ActivityTimedOut {
@@ -14553,7 +14703,9 @@ async fn record_session_acquire_schedule_to_start_timeout(
             codecs,
         )
         .await?;
-        queue::fail_task(conn, task.id, &error).await?;
+        queue::fail_claimed_task(conn, &claim_of_task(task)?, &error)
+            .await?
+            .require_applied(task.id)?;
         queue::wake_workflow_task(conn, exec_id).await
     }))
     .await;
@@ -14670,7 +14822,14 @@ async fn handle_session_acquire(
         let scheduled_at = chrono::Utc::now()
             + chrono::Duration::from_std(backoff)
                 .unwrap_or_else(|_| chrono::Duration::milliseconds(200));
-        return queue::defer_rate_limited_task(&mut conn, task.id, scheduled_at).await;
+        // A lost lease is a no-op (issue #1789).
+        if queue::defer_claimed_rate_limited_task(&mut conn, &claim_of_task(task)?, scheduled_at)
+            .await?
+            == queue::ClaimWrite::LeaseLost
+        {
+            log_lease_lost(task, "session acquire deferral");
+        }
+        return Ok(());
     }
 
     let expires_at = chrono::Utc::now()
@@ -14935,7 +15094,17 @@ async fn process_activity_task(
             let scheduled_at = chrono::Utc::now()
                 + chrono::Duration::from_std(refill_delay)
                     .unwrap_or_else(|_| chrono::Duration::seconds(5));
-            queue::defer_rate_limited_task(&mut conn, task.id, scheduled_at).await?;
+            // A lost lease is a no-op (issue #1789).
+            if queue::defer_claimed_rate_limited_task(
+                &mut conn,
+                &claim_of_task(task)?,
+                scheduled_at,
+            )
+            .await?
+                == queue::ClaimWrite::LeaseLost
+            {
+                log_lease_lost(task, "rate-limit deferral");
+            }
             return Ok(());
         }
     }
@@ -15072,8 +15241,12 @@ async fn process_activity_task(
     }
 
     let cancel = CancellationToken::new();
-    let heartbeat_tx =
-        crate::heartbeat::spawn_heartbeat_flusher(task.id, pool.clone(), cancel.clone());
+    let activity_claim = claim_of_task(task)?;
+    let heartbeat_tx = crate::heartbeat::spawn_heartbeat_flusher(
+        activity_claim.clone(),
+        pool.clone(),
+        cancel.clone(),
+    );
     let trace_carrier = task
         .trace_context
         .as_ref()
@@ -15108,7 +15281,7 @@ async fn process_activity_task(
         Some(heartbeat_tx),
         task.heartbeat_details.clone(),
         cancel.clone(),
-        task.id,
+        activity_claim.clone(),
         pool.clone(),
         activity_identity,
     )
@@ -15152,7 +15325,7 @@ async fn process_activity_task(
             pool: pool.clone(),
             exec_id,
             activity_id,
-            task_id: task.id,
+            claim: activity_claim.clone(),
             max_result_bytes: effective_result_cap,
         });
 
@@ -15361,7 +15534,7 @@ async fn process_activity_task(
             }
         }
     };
-    let cancellation_observer = observe_task_cancellation(pool, task.id);
+    let cancellation_observer = observe_task_cancellation(pool, &activity_claim);
     tokio::pin!(cancellation_observer);
 
     let activity_result = execute_activity_future_with_cancellation(
@@ -15536,11 +15709,11 @@ async fn process_activity_task(
 
     // Issue #680: a self-committed transactional activity has already sealed its
     // `ActivityCompleted` + task-COMPLETED atomically, so there is nothing left
-    // to persist. Skip the finalize/retry path entirely: `handle_activity_result`
-    // would at best no-op (the task is not RUNNING) and, on a retryable
-    // post-interceptor `Err` with retry budget, would spuriously attempt a
-    // `requeue_for_retry` that logs a NotFound against the already-COMPLETED
-    // task. An outer interceptor cannot un-commit the sealed outcome, so any
+    // to persist. Skip the finalize/retry path entirely. At best,
+    // `handle_activity_result` would no-op, because the task is not RUNNING.
+    // On a retryable post-interceptor `Err` with retry budget, it would
+    // attempt a needless retry requeue against the COMPLETED task. An outer
+    // interceptor cannot un-commit the sealed outcome, so any
     // result/error transform it applied after `next.run` is ignored; when that
     // transform turned the committed success into an `Err`, surface the misuse
     // with a single clear warning (mirroring the previous finalize-path warning).
@@ -18479,8 +18652,8 @@ async fn persist_workflow_continue_as_new_with_verdict(
 
     // Carry the predecessor's `last_completion_result` forward by its *stored*
     // representation (issue #524 / #488). If it was offloaded, copy the
-    // reference envelope verbatim and record a new ref for the successor so the
-    // blob is NOT re-uploaded; the offloader skips already-enveloped fields.
+    // reference envelope verbatim. Record a new ref for the successor. The blob
+    // is NOT re-uploaded, because the raw reference bypasses the offloader.
     let raw_carryover = store::load_raw_started_carryover(conn, persistence.exec_id).await?;
     let carried_lcr_ref = raw_carryover
         .as_ref()
@@ -21000,6 +21173,29 @@ async fn process_workflow_task(
                 .await
                 {
                     Ok(outcome) => outcome,
+                    Err(e) if e.is_event_id_unique_violation() => {
+                        // A concurrent append took this cycle's `event_id`.
+                        // An example is the `ActivityStarted` of a race loser
+                        // that a freed permit admits (issue #1787). The
+                        // transaction rolled back, so re-drive, as the
+                        // wake-event ingest does (issue #779). A fresh load
+                        // reads past the other event.
+                        requeue_workflow_task_after_event_id_conflict(
+                            conn,
+                            task,
+                            worker_id,
+                            sticky_timeout,
+                            prepared.exec_id,
+                        )
+                        .await?;
+                        tracing::warn!(
+                            task_id = %task.id,
+                            workflow_exec_id = %prepared.exec_id,
+                            "harvest: event-id conflict in a local activity append; \
+                             re-driving the workflow task"
+                        );
+                        return Ok(());
+                    }
                     Err(e) => {
                         // Issue #946, Codex round-3/round-4 review:
                         // `run_local_activity_inline` calls
@@ -25344,8 +25540,9 @@ pub struct Worker {
     /// Total permits behind `activity_semaphore` (issue #548). See
     /// `workflow_permit_total`.
     activity_permit_total: usize,
-    /// Longest claim-to-dispatch permit-wait observed since the slot tuner's
-    /// last tick, in microseconds (issue #548). `None` when no tuner is
+    /// Longest dispatch wait observed since the slot tuner's last tick, in
+    /// microseconds (issue #548). See `SlotObservations::max_permit_wait`
+    /// for what a dispatch wait includes (issue #1787). `None` when no tuner is
     /// configured, so the hot dispatch path performs no extra work in the
     /// default (untuned) case. Reset to 0 by the tuner loop each tick
     /// (`AtomicU64::swap`).
@@ -25359,15 +25556,23 @@ pub struct Worker {
     /// tuner-loop task in the same call, before any task can be dispatched —
     /// see the comment there.
     workflow_permit_wait_micros: Option<Arc<AtomicU64>>,
-    /// Longest claim-to-dispatch permit-wait for the activity semaphore
-    /// (issue #548). See `workflow_permit_wait_micros`.
+    /// Longest dispatch wait for the activity semaphore (issue #548). See
+    /// `workflow_permit_wait_micros`.
     activity_permit_wait_micros: Option<Arc<AtomicU64>>,
-    /// Workflow references claimed through the channel that do not hold their
-    /// permit yet (issue #1312). See [`DispatchReservation`].
+    /// Workflow tasks claimed through the dispatch channel that do not hold
+    /// their permit yet (issue #1312). See [`DispatchReservation`].
     dispatch_reserved_workflow: Arc<AtomicUsize>,
-    /// Activity references claimed through the channel that do not hold their
-    /// permit yet (issue #1312). See [`DispatchReservation`].
+    /// Activity tasks claimed through the dispatch channel that do not hold
+    /// their permit yet (issue #1312). See [`DispatchReservation`].
     dispatch_reserved_activity: Arc<AtomicUsize>,
+    /// Wakes a saturated poll loop when a task releases its permit (issue
+    /// #1787). See [`CapacityPermit`].
+    capacity_freed: Arc<tokio::sync::Notify>,
+    /// Kinds the poll gate refused since the last claim of that kind (issue
+    /// #1787). The slot tuner counts a claimed task's queue wait only when
+    /// the gate held its kind back. Otherwise a NOTIFY delay reads as a
+    /// backlog.
+    gate_refused: Arc<GateRefused>,
     /// Set the first time `spawn_monitoring_tasks` runs to completion (issue
     /// #548 review). Guards against a hypothetical second invocation (e.g. a
     /// future caller wrapping `run`/`run_with_listener` in a retry loop)
@@ -26519,7 +26724,7 @@ impl DispatchLoopState {
     }
 }
 
-/// One reference claimed through the channel that does not hold its permit yet.
+/// One claimed task that does not hold its permit yet.
 ///
 /// A worker dispatches a claimed task by spawning it. The spawned task is what
 /// acquires the pool permit, so `available_permits` still counts that permit as
@@ -26529,6 +26734,8 @@ impl DispatchLoopState {
 ///
 /// The guard is created before the claim. It moves into the spawned task, which
 /// drops it as soon as it holds the permit. A claim that fails drops it at once.
+/// The Postgres poll path holds a real permit instead (issue #1787). See
+/// [`PollPermits`].
 #[derive(Debug)]
 struct DispatchReservation(Arc<AtomicUsize>);
 
@@ -26542,6 +26749,36 @@ impl DispatchReservation {
 impl Drop for DispatchReservation {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Owns a task handle and aborts the task when dropped (issue #1552).
+///
+/// A bare `JoinHandle` detaches its task on drop. Cancelling the future that
+/// owns the handle then leaves the task running with nothing to stop it. This
+/// guard requests an abort instead. `Drop` cannot await, so the task may need
+/// one more poll to stop. The graceful path calls [`AbortOnDrop::join`].
+#[derive(Debug)]
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl AbortOnDrop {
+    const fn new(handle: tokio::task::JoinHandle<()>) -> Self {
+        Self(handle)
+    }
+
+    /// Wait for the task to end on its own.
+    ///
+    /// The handle stays in the guard while `join` waits. If the caller is
+    /// cancelled during the wait, the guard still aborts the task. Aborting a
+    /// finished task does nothing, so a completed `join` needs no disarming.
+    async fn join(mut self) -> Result<(), tokio::task::JoinError> {
+        (&mut self.0).await
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -26565,6 +26802,127 @@ const fn dispatch_kind_admitted(
         Some(crate::dispatch::DispatchKind::Activity) => free_activity > 0,
         None => true,
     }
+}
+
+/// What one Postgres poll may claim (issue #1787).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PollAdmission {
+    /// No pool has a free permit. The poll claims nothing.
+    Saturated,
+    /// Both pools have a free permit. The poll claims any kind.
+    Any,
+    /// Only the pool of this kind has a free permit.
+    Only(crate::queue::TaskType),
+}
+
+/// Which kinds one Postgres poll may claim (issue #1787).
+///
+/// A claim stamps `started_at`. Start-to-close and heartbeat deadlines run
+/// from `started_at`. A row claimed with no free permit waits on the local
+/// semaphore and uses its timeout budget. A peer with capacity cannot claim it.
+/// [`dispatch_kind_admitted`] is the same gate on the dispatch-channel path.
+const fn poll_admission(free_workflow: usize, free_activity: usize) -> PollAdmission {
+    use crate::queue::TaskType;
+    match (free_workflow > 0, free_activity > 0) {
+        (false, false) => PollAdmission::Saturated,
+        (true, true) => PollAdmission::Any,
+        (true, false) => PollAdmission::Only(TaskType::Workflow),
+        (false, true) => PollAdmission::Only(TaskType::Activity),
+    }
+}
+
+/// The permits one Postgres poll holds across its claim (issue #1787).
+///
+/// The poll takes one real permit of each kind it may claim, before the
+/// claim. Nothing else can take a held permit. A slot tuner shrink therefore
+/// cannot leave a claimed row without a permit while its timeout runs. The
+/// claimed row's permit moves into the spawned task. The other permit goes
+/// back when this value drops.
+#[derive(Debug)]
+struct PollPermits {
+    workflow: Option<tokio::sync::OwnedSemaphorePermit>,
+    activity: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl PollPermits {
+    /// Take one free permit of each kind that `admission` allows.
+    fn acquire(
+        admission: PollAdmission,
+        workflow: &Arc<Semaphore>,
+        activity: &Arc<Semaphore>,
+    ) -> Self {
+        use crate::queue::TaskType;
+        let take = |kind: TaskType, semaphore: &Arc<Semaphore>| {
+            let admitted = match admission {
+                PollAdmission::Saturated => false,
+                PollAdmission::Any => true,
+                PollAdmission::Only(only) => only == kind,
+            };
+            if admitted {
+                Arc::clone(semaphore).try_acquire_owned().ok()
+            } else {
+                None
+            }
+        };
+        Self {
+            workflow: take(TaskType::Workflow, workflow),
+            activity: take(TaskType::Activity, activity),
+        }
+    }
+
+    /// What the held permits allow this poll to claim.
+    fn admission(&self) -> PollAdmission {
+        poll_admission(
+            usize::from(self.workflow.is_some()),
+            usize::from(self.activity.is_some()),
+        )
+    }
+
+    /// Take the permit for the `task_type` of a claimed row.
+    fn take(&mut self, task_type: &str) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        use crate::queue::TaskType;
+        if task_type == TaskType::Workflow.as_str() {
+            self.workflow.take()
+        } else if task_type == TaskType::Activity.as_str() {
+            self.activity.take()
+        } else {
+            None
+        }
+    }
+}
+
+/// A held pool permit that wakes a saturated poll loop on release (issue
+/// #1787).
+///
+/// `Drop` returns the permit first and then notifies. A loop woken before the
+/// return would read the pool as full and wait again. `notify_one` stores one
+/// wake-up when no loop waits, so a release during a claim is not lost.
+struct CapacityPermit {
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    freed: Arc<tokio::sync::Notify>,
+}
+
+impl CapacityPermit {
+    fn new(permit: tokio::sync::OwnedSemaphorePermit, freed: &Arc<tokio::sync::Notify>) -> Self {
+        Self {
+            permit: Some(permit),
+            freed: Arc::clone(freed),
+        }
+    }
+}
+
+impl Drop for CapacityPermit {
+    fn drop(&mut self) {
+        drop(self.permit.take());
+        self.freed.notify_one();
+    }
+}
+
+/// One flag per task kind: the poll gate refused this kind (issue #1787).
+#[derive(Debug, Default)]
+struct GateRefused {
+    workflow: AtomicBool,
+    activity: AtomicBool,
 }
 
 /// Whether one more lease of `kind` fits this shard's own fair share of its
@@ -26902,6 +27260,8 @@ impl Worker {
             activity_permit_wait_micros: activity_parts.permit_wait_micros,
             dispatch_reserved_workflow: Arc::new(AtomicUsize::new(0)),
             dispatch_reserved_activity: Arc::new(AtomicUsize::new(0)),
+            capacity_freed: Arc::new(tokio::sync::Notify::new()),
+            gate_refused: Arc::new(GateRefused::default()),
             monitoring_started: std::sync::atomic::AtomicBool::new(false),
             shutdown: CancellationToken::new(),
             remote_drain_deadline: Arc::new(Mutex::new(None)),
@@ -27509,13 +27869,13 @@ impl Worker {
             .iter()
             .zip(&registration_pending_per_shard)
             .map(|((_, shard_pool), pending)| {
-                self.spawn_heartbeat_task(
+                AbortOnDrop::new(self.spawn_heartbeat_task(
                     shard_pool,
                     Arc::clone(&monitors.workflow_slot_target),
                     Arc::clone(&monitors.activity_slot_target),
                     heartbeat_cancel.clone(),
                     Arc::clone(pending),
-                )
+                ))
             })
             .collect();
 
@@ -27575,7 +27935,7 @@ impl Worker {
         heartbeat_cancel.cancel();
 
         for handle in heartbeat_handles {
-            if let Err(error) = handle.await {
+            if let Err(error) = handle.join().await {
                 tracing::warn!(
                     worker_id = %self.config.worker_id,
                     error = %error,
@@ -27685,56 +28045,80 @@ impl Worker {
             // wake the loop.
             let poll_interval = self.config.poll_interval;
             let shutdown = &self.shutdown;
+            // A full pool also wakes on a released permit (issue #1787).
+            let capacity_bound = self.capacity_bound();
 
             if shard_listeners.iter().all(Option::is_none) {
                 tokio::select! {
                     () = shutdown.cancelled() => break,
+                    () = self.capacity_freed.notified(), if capacity_bound => {}
                     () = tokio::time::sleep(poll_interval) => {}
                 }
             } else {
-                // Poll each listener with a short cap; overall timeout = poll_interval.
-                let per_check = Duration::from_millis(10).min(poll_interval);
-                let deadline = tokio::time::Instant::now() + poll_interval;
-                let mut notified = false;
+                self.wait_on_shard_listeners(&mut shard_listeners, capacity_bound)
+                    .await;
+            }
+        }
+    }
 
-                'notify_wait: while tokio::time::Instant::now() < deadline
-                    && !shutdown.is_cancelled()
-                {
-                    let mut broken_idx: Option<usize> = None;
-                    for (i, slot) in shard_listeners.iter_mut().enumerate() {
-                        if let Some(listener) = slot.as_mut() {
-                            match listener.wait_for_notification(per_check).await {
-                                Ok(Some(_)) => {
-                                    notified = true;
-                                    break 'notify_wait;
-                                }
-                                Ok(None) => {}
-                                Err(error) => {
-                                    tracing::warn!(
-                                        worker_id = %self.config.worker_id,
-                                        shard_idx = i,
-                                        error = %error,
-                                        "LISTEN/NOTIFY wait failed for shard; removing listener"
-                                    );
-                                    broken_idx = Some(i);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    if let Some(i) = broken_idx {
-                        shard_listeners[i] = None;
-                        // All listeners gone: nothing left to await in this loop,
-                        // so bail out instead of busy-spinning until the deadline.
-                        if shard_listeners.iter().all(Option::is_none) {
+    /// Wait on every per-shard listener in round-robin, for up to one
+    /// `poll_interval` (extracted from [`Self::run_poll_loop_multi`]).
+    ///
+    /// With `capacity_bound`, a released permit also ends the wait (issue
+    /// #1787).
+    async fn wait_on_shard_listeners(
+        &self,
+        shard_listeners: &mut [Option<crate::notify::QueueListener>],
+        capacity_bound: bool,
+    ) {
+        let poll_interval = self.config.poll_interval;
+        let shutdown = &self.shutdown;
+        // Poll each listener with a short cap; overall timeout = poll_interval.
+        let per_check = Duration::from_millis(10).min(poll_interval);
+        let deadline = tokio::time::Instant::now() + poll_interval;
+        let mut notified = false;
+
+        'notify_wait: while tokio::time::Instant::now() < deadline && !shutdown.is_cancelled() {
+            // One check per round of listener slices. A released
+            // permit waits at most one round.
+            if capacity_bound
+                && futures::FutureExt::now_or_never(self.capacity_freed.notified()).is_some()
+            {
+                break 'notify_wait;
+            }
+            let mut broken_idx: Option<usize> = None;
+            for (i, slot) in shard_listeners.iter_mut().enumerate() {
+                if let Some(listener) = slot.as_mut() {
+                    match listener.wait_for_notification(per_check).await {
+                        Ok(Some(_)) => {
+                            notified = true;
                             break 'notify_wait;
                         }
+                        Ok(None) => {}
+                        Err(error) => {
+                            tracing::warn!(
+                                worker_id = %self.config.worker_id,
+                                shard_idx = i,
+                                error = %error,
+                                "LISTEN/NOTIFY wait failed for shard; removing listener"
+                            );
+                            broken_idx = Some(i);
+                            break;
+                        }
                     }
                 }
-                if notified {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            if let Some(i) = broken_idx {
+                shard_listeners[i] = None;
+                // All listeners gone: nothing left to await in this loop,
+                // so bail out instead of busy-spinning until the deadline.
+                if shard_listeners.iter().all(Option::is_none) {
+                    break 'notify_wait;
                 }
             }
+        }
+        if notified {
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 
@@ -27916,13 +28300,13 @@ impl Worker {
 
         let monitors = self.spawn_monitoring_tasks(pool, std::slice::from_ref(pool));
         let heartbeat_cancel = CancellationToken::new();
-        let heartbeat_handle = self.spawn_heartbeat_task(
+        let heartbeat_handle = AbortOnDrop::new(self.spawn_heartbeat_task(
             pool,
             Arc::clone(&monitors.workflow_slot_target),
             Arc::clone(&monitors.activity_slot_target),
             heartbeat_cancel.clone(),
             Arc::clone(&registration_pending),
-        );
+        ));
 
         // The single-shard path resolves at most one shard target, and that
         // target is always `shard_assignments[0]` (see the shard-target
@@ -28572,11 +28956,13 @@ impl Worker {
                         runtime: workflow_runtime,
                         permit_wait_micros: workflow_permit_wait,
                         slot_type: SlotType::Workflow,
+                        capacity_freed: Some(Arc::clone(&self.capacity_freed)),
                     },
                     crate::slot_tuner::TunedSlot {
                         runtime: activity_runtime,
                         permit_wait_micros: activity_permit_wait,
                         slot_type: SlotType::Activity,
+                        capacity_freed: Some(Arc::clone(&self.capacity_freed)),
                     },
                     Arc::clone(&tuner_cfg.tuner),
                     move || {
@@ -29109,7 +29495,7 @@ impl Worker {
         dispatched
     }
 
-    /// Permits of one pool that no claimed reference has spoken for yet.
+    /// Permits of one pool that no claimed task has reserved yet.
     fn free_permits(semaphore: &tokio::sync::Semaphore, reserved: &Arc<AtomicUsize>) -> usize {
         // Fully qualified: diesel's blanket `RunQueryDsl::load` is in scope here
         // and shadows the inherent `AtomicUsize::load` through the `Arc` deref.
@@ -29120,8 +29506,9 @@ impl Worker {
 
     /// Drain the backlog through the Postgres claim path (issue #1312).
     ///
-    /// This is the ordinary poll loop, one iteration of it: claim until the
-    /// backlog is empty, then wait one poll interval. A degraded worker
+    /// This is the ordinary poll loop, one iteration of it. It claims until
+    /// the backlog is empty or no permit is free, then waits one poll
+    /// interval. A released permit ends that wait early (issue #1787). A degraded worker
     /// therefore claims at the Postgres rate, not at one row per failed channel
     /// call. A channel call that fails can cost the poll interval plus the call
     /// timeout. One claim per call is a throughput collapse, not a fallback.
@@ -29184,8 +29571,11 @@ impl Worker {
         // idle, so it always waits, unchanged.
         if idle {
             let wait = dispatch_read_block(shard_count, self.config.poll_interval);
+            // A full pool also wakes on a released permit (issue #1787).
+            let capacity_bound = self.capacity_bound();
             tokio::select! {
                 () = self.shutdown.cancelled() => {}
+                () = self.capacity_freed.notified(), if capacity_bound => {}
                 () = tokio::time::sleep(wait) => {}
             }
         }
@@ -29298,7 +29688,7 @@ impl Worker {
                     queue = %task.queue_name,
                     "claimed task (dispatch)"
                 );
-                self.dispatch_task(task, pool, reservation);
+                self.dispatch_task(task, pool, reservation, None);
                 ReferenceDisposition::Dispatched(lease)
             }
             Ok(None) => {
@@ -29622,28 +30012,36 @@ impl Worker {
                 continue;
             }
 
-            if let Some(listener) = listener.as_mut() {
-                match listener
-                    .wait_for_notification(self.config.poll_interval)
-                    .await
-                {
-                    Ok(Some(_)) => {
-                        // Host-side timestamps can be slightly ahead of Postgres NOW(),
-                        // so give newly notified tasks a brief moment to become claimable.
-                        tokio::time::sleep(Duration::from_millis(50)).await;
+            let idle_wait = async {
+                if let Some(listener) = listener.as_mut() {
+                    match listener
+                        .wait_for_notification(self.config.poll_interval)
+                        .await
+                    {
+                        Ok(Some(_)) => {
+                            // Host-side timestamps can be slightly ahead of Postgres NOW(),
+                            // so give newly notified tasks a brief moment to become claimable.
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            tracing::warn!(
+                                worker_id = %self.config.worker_id,
+                                error = %error,
+                                "LISTEN/NOTIFY wait failed; sleeping before retry"
+                            );
+                            tokio::time::sleep(self.config.poll_interval).await;
+                        }
                     }
-                    Ok(None) => {}
-                    Err(error) => {
-                        tracing::warn!(
-                            worker_id = %self.config.worker_id,
-                            error = %error,
-                            "LISTEN/NOTIFY wait failed; sleeping before retry"
-                        );
-                        tokio::time::sleep(self.config.poll_interval).await;
-                    }
+                } else {
+                    tokio::time::sleep(self.config.poll_interval).await;
                 }
-            } else {
-                tokio::time::sleep(self.config.poll_interval).await;
+            };
+            // A full pool also wakes on a released permit (issue #1787).
+            let capacity_bound = self.capacity_bound();
+            tokio::select! {
+                () = self.capacity_freed.notified(), if capacity_bound => {}
+                () = idle_wait => {}
             }
         }
     }
@@ -29655,10 +30053,10 @@ impl Worker {
     #[allow(clippy::too_many_lines)]
     async fn shutdown_and_cleanup(
         &self,
-        heartbeat_handle: tokio::task::JoinHandle<()>,
+        heartbeat_handle: AbortOnDrop,
         monitors: WorkerMonitoringHandles,
     ) {
-        if let Err(error) = heartbeat_handle.await {
+        if let Err(error) = heartbeat_handle.join().await {
             tracing::warn!(
                 worker_id = %self.config.worker_id,
                 error = %error,
@@ -30083,23 +30481,79 @@ impl Worker {
         }
     }
 
+    /// What a Postgres poll may claim now. See [`poll_admission`].
+    fn poll_admission_now(&self) -> PollAdmission {
+        poll_admission(
+            Self::free_permits(&self.workflow_semaphore, &self.dispatch_reserved_workflow),
+            Self::free_permits(&self.activity_semaphore, &self.dispatch_reserved_activity),
+        )
+    }
+
+    /// Whether a released permit can unblock a claim this worker refuses
+    /// (issue #1787).
+    ///
+    /// True when at least one pool has no free permit. The idle wait then
+    /// also wakes on `capacity_freed`. A NOTIFY alone does not do it: the
+    /// backlog that waits for the permit sent its NOTIFY long ago.
+    fn capacity_bound(&self) -> bool {
+        self.poll_admission_now() != PollAdmission::Any
+    }
+
+    /// Mark each kind the gate refuses (issue #1787). See `gate_refused`.
+    fn record_gate_refusal(&self, admission: PollAdmission) {
+        use crate::queue::TaskType;
+        let (workflow, activity) = match admission {
+            PollAdmission::Saturated => (true, true),
+            PollAdmission::Any => (false, false),
+            PollAdmission::Only(TaskType::Workflow) => (false, true),
+            PollAdmission::Only(TaskType::Activity) => (true, false),
+        };
+        if workflow {
+            AtomicBool::store(&self.gate_refused.workflow, true, Ordering::Relaxed);
+        }
+        if activity {
+            AtomicBool::store(&self.gate_refused.activity, true, Ordering::Relaxed);
+        }
+    }
+
     /// Execute a single poll iteration.
     ///
-    /// Gets a connection from the pool, tries to claim a task, dispatches it
-    /// if found, or sleeps for `poll_interval` if the queue was empty.
+    /// Claims one task of a kind with a free permit and dispatches it. Returns
+    /// `false` when no permit is free, no task is claimable, or the claim
+    /// fails. The caller then waits (issue #1787).
     ///
     /// `acquire_bound` optionally caps the pool acquisition. It is `None` on
     /// the single-shard path (byte-for-byte the original unbounded
     /// `pool.get().await`) and `Some(poll_interval)` when one loop drains
     /// several shards in sequence, so an exhausted pool on one shard cannot
     /// park the loop and strand its peers -- see `shard_acquire_bound`.
-    #[allow(clippy::too_many_lines)]
+    // significant_drop_tightening: `permits` holds `OwnedSemaphorePermit`s
+    // across the claim on purpose (issue #1787). An earlier drop would let a
+    // slot tuner shrink take the permit of a row this poll then claims.
+    #[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
     async fn poll_once(
         &self,
         pool: &DbPool,
         acquire_bound: Option<Duration>,
         shard: Option<crate::types::ShardId>,
     ) -> bool {
+        // Claim only against a free local permit (issue #1787). See
+        // [`poll_admission`]. The read honors dispatch-channel reservations.
+        // The poll then holds a real permit of each admitted kind across the
+        // claim. See [`PollPermits`]. A saturated poll takes no connection.
+        let mut permits = PollPermits::acquire(
+            self.poll_admission_now(),
+            &self.workflow_semaphore,
+            &self.activity_semaphore,
+        );
+        let admission = permits.admission();
+        self.record_gate_refusal(admission);
+        let kind = match admission {
+            PollAdmission::Saturated => return false,
+            PollAdmission::Any => None,
+            PollAdmission::Only(kind) => Some(kind),
+        };
+
         let mut conn = match acquire_shard_conn(pool, acquire_bound).await {
             Ok(conn) => conn,
             Err(e) => {
@@ -30146,7 +30600,7 @@ impl Worker {
                 // permutation. A claim that succeeds on the first
                 // (typically highest-weight) queue never pays for the rest.
                 let single_queue = [(*queue_name).to_owned()];
-                match queue::claim_task_on_shard(
+                match queue::claim_task_of_kind_on_shard(
                     &mut conn,
                     &single_queue,
                     &self.config.worker_id,
@@ -30155,6 +30609,7 @@ impl Worker {
                     circuit_breaker_activities,
                     &self.ineligible_activities,
                     shard,
+                    kind,
                 )
                 .await
                 {
@@ -30165,7 +30620,8 @@ impl Worker {
                             queue = %task.queue_name,
                             "claimed task (weighted)"
                         );
-                        self.dispatch_task(task, pool, None);
+                        let permit = permits.take(&task.task_type);
+                        self.dispatch_task(task, pool, None, permit);
                         return true;
                     }
                     Ok(None) => {
@@ -30188,7 +30644,7 @@ impl Worker {
         }
 
         // --- Default (unweighted) path: original single ANY($2) query ---
-        match queue::claim_task_on_shard(
+        match queue::claim_task_of_kind_on_shard(
             &mut conn,
             &self.config.queues,
             &self.config.worker_id,
@@ -30197,6 +30653,7 @@ impl Worker {
             circuit_breaker_activities,
             &self.ineligible_activities,
             shard,
+            kind,
         )
         .await
         {
@@ -30207,17 +30664,13 @@ impl Worker {
                     queue = %task.queue_name,
                     "claimed task"
                 );
-                // schedule-to-start latency is recorded once the handler
-                // genuinely begins (in `process_workflow_task` /
-                // `process_activity_task`, past the dispatch-time defer/no-op
-                // gates), not here at claim time: the worker can over-claim past
-                // `max_concurrent_*` (the semaphore gates execution, not
-                // claiming), so measuring at claim would hide the time a task
-                // spends waiting behind a local permit on a saturated worker —
-                // exactly the capacity bottleneck the SLI is meant to page on.
-                // `schedule_to_start_secs` measures from task eligibility, so that
-                // permit wait is still captured in the recorded sample.
-                self.dispatch_task(task, pool, None);
+                // Schedule-to-start is recorded when the handler begins, in
+                // `process_workflow_task` / `process_activity_task`. It is not
+                // recorded here. The sample runs from task eligibility. It
+                // includes the `PENDING` wait behind a saturated worker (issue
+                // #1787) and the short permit wait after the claim.
+                let permit = permits.take(&task.task_type);
+                self.dispatch_task(task, pool, None, permit);
                 true
             }
             Ok(None) => {
@@ -30232,12 +30685,16 @@ impl Worker {
     }
 
     /// Spawn a bounded Tokio task for the claimed work item.
+    ///
+    /// `held_permit` is the pool permit the poll gate took before the claim
+    /// (issue #1787). Without it, the task acquires a permit on spawn.
     #[allow(clippy::too_many_lines)]
     fn dispatch_task(
         &self,
         task: TaskQueueItem,
         pool: &DbPool,
         reservation: Option<DispatchReservation>,
+        held_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     ) {
         // Debug-only tripwire (issue #548 review): dispatch must never race
         // ahead of `spawn_monitoring_tasks`, which withholds a tuned
@@ -30282,6 +30739,27 @@ impl Worker {
         };
         let session_slots_in_use = Arc::clone(&self.session_slots_in_use);
         let max_concurrent_sessions = self.config.max_concurrent_sessions;
+        let capacity_freed = Arc::clone(&self.capacity_freed);
+        // The row waited in `PENDING` from eligibility to claim. Database
+        // clocks measure this wait. The poll gate holds a backlog in
+        // `PENDING`, not at the permit (issue #1787). The tuner signal below
+        // adds this wait only when the gate refused this kind since its last
+        // claim. Read only when a tuner is configured.
+        let gate_refused = match kind {
+            ClaimedTaskKind::Workflow => &self.gate_refused.workflow,
+            ClaimedTaskKind::Activity => &self.gate_refused.activity,
+        };
+        let queue_wait = permit_wait_micros
+            .as_ref()
+            .filter(|_| AtomicBool::swap(gate_refused, false, Ordering::Relaxed))
+            .map(|_| {
+                Duration::try_from_secs_f64(queue::schedule_to_start_secs(
+                    task.scheduled_at,
+                    task.created_at,
+                    task.started_at.unwrap_or(task.scheduled_at),
+                ))
+                .unwrap_or_default()
+            });
 
         // Per-queue dispatch counter for live split observability (issue #515).
         self.registry
@@ -30357,11 +30835,21 @@ impl Worker {
         // body at the same nesting, so this change adds no reindentation to
         // the hottest file in the repo.
         let task_body = async move {
-            // Acquire semaphore permit — blocks if at concurrency limit.
-            let Ok(permit) = semaphore.acquire().await else {
-                tracing::error!(task_id = %task_id, "semaphore closed");
-                return;
-            };
+            // Acquire semaphore permit — blocks if at concurrency limit. A
+            // poll-path claim already holds one (issue #1787).
+            // The release wakes a saturated poll loop (issue #1787).
+            let permit = CapacityPermit::new(
+                if let Some(permit) = held_permit {
+                    permit
+                } else {
+                    let Ok(permit) = Arc::clone(&semaphore).acquire_owned().await else {
+                        tracing::error!(task_id = %task_id, "semaphore closed");
+                        return;
+                    };
+                    permit
+                },
+                &capacity_freed,
+            );
             // The permit is held, so the reference no longer needs a
             // reservation against it (issue #1312). The early return above
             // drops it too, so a closed semaphore cannot leak one.
@@ -30370,10 +30858,11 @@ impl Worker {
             // Feed the adaptive slot tuner's permit-wait signal (issue #548).
             // A lock-free fetch_max so concurrent dispatches never contend;
             // the tuner loop consumes (and resets) this via `swap(0, ..)`
-            // once per tick, off this hot path entirely.
+            // once per tick, off this hot path entirely. The signal is the
+            // queue wait plus the permit wait (issue #1787).
             if let Some(acc) = &permit_wait_micros {
-                let wait_micros =
-                    u64::try_from(dispatched_at.elapsed().as_micros()).unwrap_or(u64::MAX);
+                let wait = dispatched_at.elapsed() + queue_wait.unwrap_or_default();
+                let wait_micros = u64::try_from(wait.as_micros()).unwrap_or(u64::MAX);
                 acc.fetch_max(wait_micros, Ordering::Relaxed);
             }
 
@@ -32522,7 +33011,10 @@ mod tests {
         // genuinely-overdue schedule living on the failed shard).
         let previous = key_set(&[("workflow", "a"), ("workflow", "b")]);
         let current = key_set(&[("workflow", "a")]);
-        assert!(labels_to_clear(&previous, &current, false).is_empty());
+        assert_eq!(
+            labels_to_clear(&previous, &current, false),
+            [] as [(std::string::String, std::string::String); 0]
+        );
     }
 
     #[test]
@@ -32530,7 +33022,10 @@ mod tests {
         // previous ⊆ current → [] (nothing disappeared).
         let previous = key_set(&[("workflow", "a")]);
         let current = key_set(&[("workflow", "a"), ("dag", "b")]);
-        assert!(labels_to_clear(&previous, &current, true).is_empty());
+        assert_eq!(
+            labels_to_clear(&previous, &current, true),
+            [] as [(std::string::String, std::string::String); 0]
+        );
     }
 
     #[test]
@@ -32538,7 +33033,10 @@ mod tests {
         // Empty previous (first pass) → [] regardless of current.
         let previous = std::collections::HashSet::new();
         let current = key_set(&[("workflow", "a")]);
-        assert!(labels_to_clear(&previous, &current, true).is_empty());
+        assert_eq!(
+            labels_to_clear(&previous, &current, true),
+            [] as [(std::string::String, std::string::String); 0]
+        );
     }
 
     /// A pool that builds without connecting, aimed at a closed port.
@@ -33230,7 +33728,7 @@ mod tests {
             value: "x".to_string(),
             explicit_clear: false,
         }];
-        assert!(collect_log_lines(&cmds).is_empty());
+        assert_eq!(collect_log_lines(&cmds), [] as [store::WorkflowLogLine; 0]);
     }
 
     #[test]
@@ -34241,7 +34739,10 @@ mod tests {
     fn monitor_shard_scope_passes_the_full_list_through_on_the_single_pool_fallback() {
         let all = vec![crate::types::ShardId::new(0), crate::types::ShardId::new(1)];
         assert_eq!(monitor_shard_scope(None, &all), all);
-        assert!(monitor_shard_scope(None, &[]).is_empty());
+        assert_eq!(
+            monitor_shard_scope(None, &[]),
+            [] as [crate::types::ShardId; 0]
+        );
     }
 
     /// The multi-shard loop bounds its pool acquisition; the single-shard path
@@ -34381,6 +34882,81 @@ mod tests {
              refuse to start: one pool covers every assignment",
         );
         worker.shutdown();
+    }
+
+    /// Cancels `run` once its heartbeat task exists. Then waits for the
+    /// heartbeat to release its `drain_deadline_max` handle.
+    ///
+    /// Only the heartbeat tasks hold that `Arc` besides the worker, so the
+    /// count is `1 + heartbeats` while they run and `1` after they stop.
+    /// Each wait lasts up to 30 seconds. A refused connection to a closed
+    /// port is slow on Windows, and startup visits each shard pool in turn.
+    /// The wait only runs out when the code is broken.
+    async fn heartbeats_stop_after_run_is_cancelled(
+        worker: &Worker,
+        run: impl std::future::Future<Output = ()>,
+        heartbeats: usize,
+    ) {
+        let spawned = async {
+            for _ in 0..3000 {
+                if Arc::strong_count(&worker.drain_deadline_max) == 1 + heartbeats {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            false
+        };
+        let seen = tokio::select! {
+            () = run => panic!("the run returned before its heartbeat started"),
+            seen = spawned => seen,
+        };
+        assert!(seen, "the run must spawn its heartbeat before the cancel");
+
+        for _ in 0..3000 {
+            if Arc::strong_count(&worker.drain_deadline_max) == 1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("a cancelled run must not leave a detached heartbeat task");
+    }
+
+    /// Cancelling `run_with_listener` from outside stops its heartbeat
+    /// (issue #1552). A bare `JoinHandle` would detach the task instead.
+    #[tokio::test]
+    async fn cancelling_run_with_listener_aborts_its_heartbeat() {
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(default_runtime_config(), registry).expect("valid config");
+        let pool = unreachable_pool("postgres://127.0.0.1:1/s0");
+
+        heartbeats_stop_after_run_is_cancelled(&worker, worker.run_with_listener(&pool, None), 1)
+            .await;
+    }
+
+    /// Cancelling the multi-shard runner from outside stops every shard
+    /// heartbeat (issue #1552).
+    #[tokio::test]
+    async fn cancelling_run_multi_shard_aborts_every_heartbeat() {
+        let mut pools = std::collections::BTreeMap::new();
+        pools.insert(
+            crate::types::ShardId::new(0),
+            unreachable_pool("postgres://127.0.0.1:1/s0"),
+        );
+        pools.insert(
+            crate::types::ShardId::new(1),
+            unreachable_pool("postgres://127.0.0.1:1/s1"),
+        );
+        let mut cfg = default_runtime_config();
+        cfg.shard_assignments = vec![crate::types::ShardId::new(0), crate::types::ShardId::new(1)];
+        cfg.sharded_pool = Some(crate::shard::ShardedDbPool::from_map(
+            pools,
+            crate::types::ShardId::new(0),
+        ));
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(cfg, registry).expect("valid config");
+        let pool = unreachable_pool("postgres://127.0.0.1:1/s0");
+
+        heartbeats_stop_after_run_is_cancelled(&worker, worker.run(&pool), 2).await;
     }
 
     /// The pending flag is per pool, not per worker (issue #804, Codex
@@ -34644,7 +35220,10 @@ mod tests {
         let resolved = resolved_external_ids(&new_events);
         assert!(!resolved.is_empty());
         assert_eq!(resolved.signal_ids, vec![sid]);
-        assert!(resolved.cancel_ids.is_empty());
+        assert_eq!(
+            resolved.cancel_ids,
+            [] as [crate::types::ExternalCancelId; 0]
+        );
     }
 
     #[test]
@@ -34657,7 +35236,10 @@ mod tests {
         let resolved = resolved_external_ids(&new_events);
         assert!(!resolved.is_empty());
         assert_eq!(resolved.cancel_ids, vec![cid]);
-        assert!(resolved.signal_ids.is_empty());
+        assert_eq!(
+            resolved.signal_ids,
+            [] as [crate::types::ExternalSignalId; 0]
+        );
     }
 
     #[test]
@@ -34709,7 +35291,10 @@ mod tests {
         ];
         let resolved = resolved_external_ids(&new_events);
         assert_eq!(resolved.signal_ids, vec![sid_a]);
-        assert!(resolved.cancel_ids.is_empty());
+        assert_eq!(
+            resolved.cancel_ids,
+            [] as [crate::types::ExternalCancelId; 0]
+        );
     }
 
     #[test]
@@ -34733,8 +35318,14 @@ mod tests {
         ];
         let resolved = resolved_external_ids(&new_events);
         assert_eq!(resolved.await_ids, vec![aid]);
-        assert!(resolved.signal_ids.is_empty());
-        assert!(resolved.cancel_ids.is_empty());
+        assert_eq!(
+            resolved.signal_ids,
+            [] as [crate::types::ExternalSignalId; 0]
+        );
+        assert_eq!(
+            resolved.cancel_ids,
+            [] as [crate::types::ExternalCancelId; 0]
+        );
     }
 
     // ── inline-vs-outbox await terminal de-duplication (issue #757 review, P1) ──
@@ -35883,7 +36474,10 @@ mod tests {
             batch.children.is_empty(),
             "a detached spawn is NOT an awaited child"
         );
-        assert!(batch.activity_waits.is_empty());
+        assert_eq!(
+            batch.activity_waits,
+            [] as [crate::types::ActivityExecId; 0]
+        );
         assert!(!batch.waits_on_signal);
     }
 
@@ -36634,7 +37228,7 @@ mod tests {
             ..default_runtime_config()
         };
         let worker = Worker::new(cfg, registry.clone()).unwrap();
-        assert!(worker.ineligible_activities.is_empty());
+        assert_eq!(worker.ineligible_activities, [] as [std::string::String; 0]);
 
         // Worker with cpu only, region = us-east-1 (act_gpu is ineligible)
         let mut labels = std::collections::HashMap::new();
@@ -39943,7 +40537,14 @@ mod tests {
             name: "m".into(),
             details: Value::Null,
         }];
-        assert!(collect_update_result_metrics(&history, &cmds).is_empty());
+        assert_eq!(
+            collect_update_result_metrics(&history, &cmds),
+            [] as [(
+                std::string::String,
+                bool,
+                std::option::Option<chrono::DateTime<chrono::Utc>>
+            ); 0]
+        );
     }
 
     #[test]
@@ -42815,6 +43416,124 @@ mod tests {
         );
     }
 
+    /// The Postgres poll path claims only a kind with a free permit (issue
+    /// #1787). A claimed row that waits on the local semaphore uses its
+    /// start-to-close budget, and a peer cannot take it.
+    #[test]
+    fn a_poll_claims_only_a_kind_with_a_free_permit() {
+        use crate::queue::TaskType;
+        assert_eq!(poll_admission(0, 0), PollAdmission::Saturated);
+        assert_eq!(
+            poll_admission(1, 0),
+            PollAdmission::Only(TaskType::Workflow),
+            "a free workflow permit cannot start an activity row"
+        );
+        assert_eq!(
+            poll_admission(0, 1),
+            PollAdmission::Only(TaskType::Activity),
+            "a free activity permit cannot start a workflow row"
+        );
+        assert_eq!(poll_admission(3, 5), PollAdmission::Any);
+    }
+
+    /// A poll holds one real permit of each kind it may claim. The claimed
+    /// kind keeps its permit. The other permit goes back at once.
+    #[allow(clippy::significant_drop_tightening)]
+    #[test]
+    fn a_poll_keeps_only_the_permit_of_the_kind_it_claimed() {
+        use crate::queue::TaskType;
+        let workflow = Arc::new(Semaphore::new(1));
+        let activity = Arc::new(Semaphore::new(1));
+        let mut permits = PollPermits::acquire(PollAdmission::Any, &workflow, &activity);
+        assert_eq!(permits.admission(), PollAdmission::Any);
+        assert_eq!(workflow.available_permits(), 0);
+        assert_eq!(activity.available_permits(), 0);
+        let kept = permits.take(TaskType::Activity.as_str());
+        drop(permits);
+        assert_eq!(workflow.available_permits(), 1);
+        assert_eq!(activity.available_permits(), 0);
+        drop(kept);
+        assert_eq!(activity.available_permits(), 1);
+
+        let only = PollPermits::acquire(
+            PollAdmission::Only(TaskType::Workflow),
+            &workflow,
+            &activity,
+        );
+        assert_eq!(only.admission(), PollAdmission::Only(TaskType::Workflow));
+        assert_eq!(
+            activity.available_permits(),
+            1,
+            "a kind the poll cannot claim keeps its permit free"
+        );
+    }
+
+    /// A permit taken between the read and the poll lowers the admission.
+    #[allow(clippy::significant_drop_tightening)]
+    #[test]
+    fn a_poll_admits_only_the_permits_it_holds() {
+        use crate::queue::TaskType;
+        let workflow = Arc::new(Semaphore::new(1));
+        let activity = Arc::new(Semaphore::new(0));
+        let permits = PollPermits::acquire(PollAdmission::Any, &workflow, &activity);
+        assert_eq!(permits.admission(), PollAdmission::Only(TaskType::Workflow));
+        let none = PollPermits::acquire(PollAdmission::Any, &workflow, &activity);
+        assert_eq!(none.admission(), PollAdmission::Saturated);
+    }
+
+    /// A slot tuner shrink cannot take the permit a poll holds for its claim
+    /// (issue #1787 review). The claim stamps `started_at`. A stolen permit
+    /// would start the timeout clock of a task that cannot run.
+    #[allow(clippy::significant_drop_tightening)]
+    #[tokio::test]
+    async fn a_tuner_shrink_cannot_take_the_permit_a_poll_holds() {
+        use crate::queue::TaskType;
+        use crate::slot_tuner::TunedSlotRuntime;
+        let workflow = Arc::new(Semaphore::new(2));
+        let activity = Arc::new(Semaphore::new(2));
+        let mut tuner = TunedSlotRuntime::new(Arc::clone(&activity), 2, 1, 2);
+        let _running = Arc::clone(&activity)
+            .acquire_owned()
+            .await
+            .expect("in-flight task");
+        let mut permits = PollPermits::acquire(PollAdmission::Any, &workflow, &activity);
+        assert_eq!(permits.admission(), PollAdmission::Any);
+
+        // A pool-pressure tick shrinks the activity target to 1.
+        tuner.resize_toward(1).await;
+
+        assert!(
+            permits.take(TaskType::Activity.as_str()).is_some(),
+            "the claimed activity keeps the permit it was admitted on"
+        );
+    }
+
+    /// A released permit wakes a saturated poll loop (issue #1787).
+    #[allow(clippy::significant_drop_tightening)]
+    #[tokio::test]
+    async fn a_released_permit_wakes_the_poll_loop() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let freed = Arc::new(tokio::sync::Notify::new());
+        let permit = CapacityPermit::new(
+            Arc::clone(&semaphore)
+                .acquire_owned()
+                .await
+                .expect("permit"),
+            &freed,
+        );
+        assert_eq!(semaphore.available_permits(), 0);
+        let waiter = {
+            let freed = Arc::clone(&freed);
+            tokio::spawn(async move { freed.notified().await })
+        };
+        drop(permit);
+        assert_eq!(semaphore.available_permits(), 1);
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("the poll loop must wake")
+            .expect("waiter task");
+    }
+
     /// A shard's batch must not spend a sibling's share of one kind's pool.
     /// It must not do so even while the pool's live total still reads free
     /// (Codex review, issue #1429). `dispatch_read_size` bounds the whole
@@ -43731,5 +44450,108 @@ mod tests {
         crate::dispatch::uninstall_all();
 
         assert!(!bound, "a pinned worker must not adopt a later install");
+    }
+
+    /// Signals through a channel when the task that owns it is dropped.
+    struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    fn parked_task() -> (
+        tokio::task::JoinHandle<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let _signal = DropSignal(Some(tx));
+            std::future::pending::<()>().await;
+        });
+        (handle, rx)
+    }
+
+    /// A bare `JoinHandle` detaches its task on drop (issue #1552).
+    #[tokio::test]
+    async fn dropping_the_guard_aborts_its_task() {
+        let (handle, dropped) = parked_task();
+        tokio::task::yield_now().await;
+
+        drop(AbortOnDrop::new(handle));
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), dropped)
+            .await
+            .expect("the task must stop after the guard drops")
+            .expect("the task future must drop its signal");
+    }
+
+    /// External cancellation of the owning future drops its locals.
+    #[tokio::test]
+    async fn aborting_the_owner_future_aborts_the_guarded_task() {
+        let (handle, dropped) = parked_task();
+        let owner = tokio::spawn(async move {
+            let _guard = AbortOnDrop::new(handle);
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+
+        owner.abort();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), dropped)
+            .await
+            .expect("the guarded task must stop with its owner")
+            .expect("the task future must drop its signal");
+    }
+
+    /// Cancelling a caller that waits in `join` must not detach the task.
+    #[tokio::test]
+    async fn aborting_a_caller_inside_join_aborts_the_guarded_task() {
+        let (handle, dropped) = parked_task();
+        let guard = AbortOnDrop::new(handle);
+        let caller = tokio::spawn(async move {
+            let _ = guard.join().await;
+        });
+        tokio::task::yield_now().await;
+
+        caller.abort();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), dropped)
+            .await
+            .expect("the guarded task must stop with a cancelled join")
+            .expect("the task future must drop its signal");
+    }
+
+    /// The graceful path must keep the task's own exit, not force one.
+    #[tokio::test]
+    async fn join_waits_for_a_clean_exit_and_does_not_abort() {
+        let cancel = CancellationToken::new();
+        let token = cancel.clone();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            token.cancelled().await;
+            tokio::task::yield_now().await;
+            let _ = done_tx.send(());
+        });
+        let guard = AbortOnDrop::new(handle);
+
+        cancel.cancel();
+        let joined = guard.join().await;
+
+        assert!(joined.is_ok(), "a clean exit must not read as cancelled");
+        assert!(done_rx.await.is_ok(), "the task must run to its own end");
+    }
+
+    /// A panic in the task must reach the caller, as with a bare handle.
+    #[tokio::test]
+    async fn join_reports_a_task_panic() {
+        let handle = tokio::spawn(async { panic!("heartbeat boom") });
+
+        let joined = AbortOnDrop::new(handle).join().await;
+
+        assert!(joined.is_err_and(|error| error.is_panic()));
     }
 }
