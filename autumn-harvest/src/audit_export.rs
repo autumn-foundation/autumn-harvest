@@ -1118,6 +1118,24 @@ pub const UNEXPORTED_INDEX_DDL: &str = "CREATE INDEX CONCURRENTLY IF NOT EXISTS 
 pub const UNEXPORTED_INDEX_DROP_DDL: &str =
     "DROP INDEX CONCURRENTLY IF EXISTS harvest_audit_log_unexported_idx";
 
+/// [`UNEXPORTED_INDEX_DDL`] for a named schema.
+///
+/// `CREATE INDEX` takes an unqualified index name. The index lands in the
+/// schema of its table, so only the table is qualified.
+#[must_use]
+pub fn unexported_index_ddl_in(schema: &str) -> String {
+    format!(
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS harvest_audit_log_unexported_idx \
+         ON {schema}.harvest_audit_log (occurred_at, id) WHERE export_seq IS NULL"
+    )
+}
+
+/// [`UNEXPORTED_INDEX_DROP_DDL`] for a named schema.
+#[must_use]
+pub fn unexported_index_drop_ddl_in(schema: &str) -> String {
+    format!("DROP INDEX CONCURRENTLY IF EXISTS {schema}.harvest_audit_log_unexported_idx")
+}
+
 /// Advisory-lock key that serializes builds of the claim-scan index.
 pub const UNEXPORTED_INDEX_LOCK_KEY: i64 = 0x6175_6469_745f_6978;
 
@@ -1230,9 +1248,13 @@ async fn unexported_index_valid(
         valid: bool,
     }
 
+    // Bind the index to the table this session resolves. An index of the same
+    // name in another schema of `search_path` must not count.
     let rows: Vec<State> = diesel::sql_query(
-        "SELECT indisvalid AS valid FROM pg_index \
-         WHERE indexrelid = to_regclass('harvest_audit_log_unexported_idx')",
+        "SELECT i.indisvalid AS valid FROM pg_index i \
+         JOIN pg_class c ON c.oid = i.indexrelid \
+         WHERE c.relname = 'harvest_audit_log_unexported_idx' \
+           AND i.indrelid = to_regclass('harvest_audit_log')",
     )
     .load(conn)
     .await
@@ -1521,6 +1543,28 @@ async fn audit_table_schema(
     })
 }
 
+/// The build and cleanup statements for the schema this session resolves.
+///
+/// An operator may run them through a role with another default path. Without
+/// a resolved schema they fall back to the unqualified statements.
+#[cfg(feature = "db")]
+async fn operator_ddl(conn: &mut diesel_async::AsyncPgConnection) -> (String, String) {
+    audit_table_schema(conn).await.map_or_else(
+        |_| {
+            (
+                UNEXPORTED_INDEX_DDL.to_owned(),
+                UNEXPORTED_INDEX_DROP_DDL.to_owned(),
+            )
+        },
+        |schema| {
+            (
+                unexported_index_ddl_in(&schema),
+                unexported_index_drop_ddl_in(&schema),
+            )
+        },
+    )
+}
+
 /// Start the index build in a detached task, off the export tick (issue #1667).
 ///
 /// The build can take minutes on a large table. It must not delay a claim,
@@ -1555,9 +1599,10 @@ async fn spawn_unexported_index_build_if_due(
 ) {
     let Some(dsn) = build_dsn else {
         if index_notice_wanted(conn, shard_id).await {
+            let (statement, _) = operator_ddl(conn).await;
             tracing::warn!(
                 shard = shard_id,
-                statement = UNEXPORTED_INDEX_DDL,
+                statement = %statement,
                 "[audit_export] no database URL for a dedicated connection, so the exporter \
                  cannot build the claim-scan index; export continues without it. Set \
                  WorkerConfig::with_notification_database_url or \
@@ -1612,8 +1657,8 @@ async fn spawn_unexported_index_build_if_due(
                     tracing::error!(
                         shard = shard_id,
                         %error,
-                        statement = UNEXPORTED_INDEX_DDL,
-                        cleanup = UNEXPORTED_INDEX_DROP_DDL,
+                        statement = %unexported_index_ddl_in(&schema),
+                        cleanup = %unexported_index_drop_ddl_in(&schema),
                         retry_in_secs = INDEX_BUILD_REFUSED_RETRY.as_secs(),
                         "[audit_export] the worker role cannot build the claim-scan index; \
                          export continues without it. Run `statement` once through the \
@@ -1626,7 +1671,7 @@ async fn spawn_unexported_index_build_if_due(
                     tracing::warn!(
                         shard = shard_id,
                         %error,
-                        statement = UNEXPORTED_INDEX_DDL,
+                        statement = %unexported_index_ddl_in(&schema),
                         "[audit_export] could not build the claim-scan index; export continues \
                          without it. The next attempt follows after the retry wait"
                     );
@@ -1663,10 +1708,11 @@ async fn notice_missing_unexported_index(
     if !index_notice_wanted(conn, shard_id).await {
         return;
     }
+    let (statement, cleanup) = operator_ddl(conn).await;
     tracing::warn!(
         shard = shard_id,
-        statement = UNEXPORTED_INDEX_DDL,
-        cleanup = UNEXPORTED_INDEX_DROP_DDL,
+        statement = %statement,
+        cleanup = %cleanup,
         "[audit_export] the claim-scan index is missing; fire_due_audit_exports never builds \
          it on its caller's connection. Use the dedicated export task, run \
          ensure_unexported_index on a dedicated connection, or run the statement once as \
@@ -4871,6 +4917,21 @@ mod tests {
         .await;
         assert!(result.is_err(), "a stalled connect must be an error");
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    /// Issue #1667: the operator statements name the schema the builder
+    /// resolved. A migration role with another default path then acts on the
+    /// right table. `CREATE INDEX` takes an unqualified index name.
+    #[test]
+    fn the_operator_statements_name_the_resolved_schema() {
+        let build = unexported_index_ddl_in("tenant");
+        assert!(build.contains("ON tenant.harvest_audit_log"), "{build}");
+        assert!(build.contains("CONCURRENTLY"), "{build}");
+        let cleanup = unexported_index_drop_ddl_in("tenant");
+        assert!(
+            cleanup.contains("tenant.harvest_audit_log_unexported_idx"),
+            "{cleanup}"
+        );
     }
 
     /// Issue #1667: a privilege failure is the one error a retry cannot fix.

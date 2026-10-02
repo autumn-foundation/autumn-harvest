@@ -5832,3 +5832,39 @@ async fn the_build_resolves_a_user_schema_for_the_pool_role() {
         "public stays untouched"
     );
 }
+
+/// With `search_path = tenant, public`, a valid `public` index must not hide a
+/// missing index on the tenant table that the session actually resolves.
+#[tokio::test]
+async fn a_valid_index_in_another_schema_does_not_hide_a_missing_one() {
+    let (mut conn, _url, _c) = make_conn_any().await;
+    conn.batch_execute(&format!(
+        "CREATE SCHEMA tenant; SET search_path = tenant; {} RESET search_path;",
+        autumn_harvest::full_migrations_sql()
+    ))
+    .await
+    .expect("tenant schema");
+    create_unexported_idx(&mut conn).await;
+    conn.batch_execute("SET search_path = tenant, public")
+        .await
+        .expect("search path");
+    autumn_harvest::audit_export::ensure_unexported_index(&mut conn)
+        .await
+        .expect("ensure");
+    conn.batch_execute("RESET search_path")
+        .await
+        .expect("reset");
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let rows: Vec<Count> = diesel::sql_query(
+        "SELECT count(*) AS n FROM pg_indexes \
+         WHERE schemaname = 'tenant' AND indexname = 'harvest_audit_log_unexported_idx'",
+    )
+    .load(&mut conn)
+    .await
+    .expect("count");
+    assert_eq!(rows.into_iter().next().map(|r| r.n), Some(1));
+}
