@@ -36,6 +36,7 @@ const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 
 /// What the flusher does after one flush.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FlushOutcome {
     /// Keep flushing. A failed write also continues. The flusher drops the
     /// failed payload, and the next heartbeat replaces it.
@@ -47,6 +48,7 @@ pub enum FlushOutcome {
 
 /// Why [`run_heartbeat_flusher`] returned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FlusherExit {
     /// The cancellation token fired.
     Cancelled,
@@ -56,6 +58,9 @@ pub enum FlusherExit {
 }
 
 /// The destination of the newest heartbeat payload.
+///
+/// This is an engine seam for tests (issue #1800), not a stable extension
+/// point.
 pub trait HeartbeatSink: Send {
     /// Write one heartbeat payload.
     fn flush(&mut self, payload: Value) -> impl Future<Output = FlushOutcome> + Send;
@@ -128,6 +133,7 @@ pub fn spawn_heartbeat_flusher(
 ) -> mpsc::Sender<Value> {
     let (tx, rx) = mpsc::channel(64);
 
+    // Plain tokio, not the shim: the `db` build never sets `--cfg shuttle`.
     tokio::spawn(heartbeat_loop(claim, pool, rx, cancel));
 
     tx
@@ -163,9 +169,9 @@ impl HeartbeatSink for PgHeartbeatSink {
             Ok(mut conn) => {
                 match crate::queue::record_heartbeat(&mut conn, &self.claim, payload).await {
                     Ok(ClaimWrite::Applied) => FlushOutcome::Continue,
-                    // The claim is no longer current (issue #1789). Stop
-                    // the activity, so this stale attempt does no more
-                    // work.
+                    // The claim is no longer current (issue #1789). The loop
+                    // then cancels the activity, so this stale attempt does
+                    // no more work.
                     Ok(ClaimWrite::LeaseLost) => {
                         tracing::warn!(
                             task_id = %task_id,
@@ -227,6 +233,45 @@ mod tests {
             latest,
             serde_json::json!({"progress": 4}),
             "debounce should keep only the most recent heartbeat"
+        );
+    }
+
+    /// A sink that counts its flushes.
+    struct CountingSink(usize);
+
+    impl HeartbeatSink for CountingSink {
+        async fn flush(&mut self, _payload: Value) -> FlushOutcome {
+            self.0 += 1;
+            FlushOutcome::Continue
+        }
+    }
+
+    /// Cancellation stops the flusher at once, not at the next tick.
+    ///
+    /// Shuttle does not model time, so the Shuttle models cannot see a late
+    /// stop. Paused tokio time can (issue #1800).
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_stops_the_flusher_before_the_next_tick() {
+        let (_tx, rx) = mpsc::channel::<Value>(64);
+        let cancel = CancellationToken::new();
+        let interval = Duration::from_secs(3600);
+        let start = tokio::time::Instant::now();
+        let flusher = tokio::spawn(run_heartbeat_flusher(
+            rx,
+            cancel.clone(),
+            interval,
+            CountingSink(0),
+        ));
+        tokio::task::yield_now().await;
+
+        cancel.cancel();
+        let exit = flusher.await.expect("the flusher must not panic");
+
+        assert_eq!(exit, FlusherExit::Cancelled);
+        assert!(
+            start.elapsed() < interval,
+            "the flusher must stop before its next tick, not after {:?}",
+            start.elapsed()
         );
     }
 

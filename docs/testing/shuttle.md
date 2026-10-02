@@ -63,7 +63,7 @@ depends on a generator it does not control.
 ## The models (`tests/shuttle_models.rs`)
 
 Each model is one function. Two `#[test]`s run it: one with
-`shuttle::check_random` and one with `shuttle::check_pct` (depth 3).
+`shuttle::check_random` and one with `shuttle::check_pct` (depth 4).
 
 1. **`slot_tuner_conserves_permits_*`.** Two dispatch tasks acquire and
    release permits. In parallel, the tuner grows, shrinks, grows and shrinks
@@ -100,8 +100,8 @@ Both are fixed in the change that added the model (issue #1800).
    extra slot as in use. The fix settles the background task a second time,
    after the `try_acquire` loop.
 
-Revert either fix and the model fails. The random scheduler catches both. The
-PCT scheduler catches the first. The tokio unit test
+Revert either fix and the model fails under both schedulers. PCT needs depth
+4 for the second defect. Depth 3 misses it. The tokio unit test
 `resize_toward_cancels_a_stray_background_shrink_once_the_target_lands` also
 catches the second, without Shuttle.
 

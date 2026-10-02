@@ -43,8 +43,9 @@ use shuttle_tokio_util::sync::CancellationToken;
 const RANDOM_ITERATIONS: usize = 10_000;
 /// Iterations per PCT model.
 const PCT_ITERATIONS: usize = 10_000;
-/// PCT bug depth. Depth 3 finds bugs that need two forced preemptions.
-const PCT_DEPTH: usize = 3;
+/// PCT bug depth. Depth 4 finds bugs that need three forced preemptions.
+/// Depth 3 misses the stray-shrink defect in `slot_tuner_model`.
+const PCT_DEPTH: usize = 4;
 
 // ---------------------------------------------------------------------------
 // slot_tuner
@@ -160,6 +161,10 @@ fn slot_tuner_conserves_permits_pct() {
 /// Number of heartbeats the activity sends.
 const HEARTBEATS: u64 = 5;
 
+/// Yields to wait for the newest flush. The limit is far below Shuttle's
+/// step limit, so a lost heartbeat fails with a clear message.
+const NEWEST_FLUSH_WAIT_LIMIT: usize = 100_000;
+
 /// A sink that records each flushed payload. It reports a lost lease on the
 /// flush number `lose_lease_on`, if set.
 struct RecordingSink {
@@ -192,7 +197,8 @@ fn progress(value: &Value) -> u64 {
 ///
 /// The model checks three properties:
 ///
-/// 1. Flushes keep send order. A later flush never carries an older payload.
+/// 1. No flush is stale or a duplicate: each flush carries a newer payload
+///    than the flush before it.
 /// 2. The newest heartbeat is flushed, even when the channel fills up.
 /// 3. After cancellation, the flusher stops.
 fn heartbeat_order_model() {
@@ -221,8 +227,13 @@ fn heartbeat_order_model() {
         });
         sender_task.await.expect("the sender panicked");
 
-        // Shuttle fails the run if this loop never ends.
+        let mut waits = 0;
         while flushed.lock().expect("not poisoned").last().map(progress) != Some(HEARTBEATS - 1) {
+            waits += 1;
+            assert!(
+                waits < NEWEST_FLUSH_WAIT_LIMIT,
+                "the newest heartbeat was not flushed after the sender finished"
+            );
             yield_now().await;
         }
 
