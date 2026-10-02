@@ -16032,8 +16032,8 @@ pub async fn apply_race_loser_cancellations(
     let function_entry_next_event_id = *next_event_id;
     let mut child_terminal_metrics: Vec<(String, String)> = Vec::new();
     // Issue #1247: same deferral as `child_terminal_metrics`, for the
-    // activity-loser trio below. The post-loop reload can fail, and these
-    // metrics have no undo either.
+    // activity-loser trio below. The post-loop reload and the final append
+    // can fail, and these metrics have no undo either.
     let mut activity_loser_metrics: Vec<(String, String)> = Vec::new();
 
     for cmd in commands {
@@ -16163,14 +16163,12 @@ pub async fn apply_race_loser_cancellations(
     }
 
     child_terminal_events.extend(
-        reload_race_loser_events_and_emit_metrics(
+        reload_race_loser_events(
             conn,
             exec_id,
             registry,
             function_entry_next_event_id,
             *next_event_id,
-            &child_terminal_metrics,
-            &activity_loser_metrics,
         )
         .await?,
     );
@@ -16187,6 +16185,12 @@ pub async fn apply_race_loser_cancellations(
         *next_event_id = next_event_id.saturating_add(i32::try_from(inserted).unwrap_or(0));
     }
 
+    // Issue #1787: the append above is the last step that can fail here. A
+    // unique violation on it rolls back and re-drives the task, and the
+    // re-drive cancels the same losers again. Emit only now, so a failed
+    // attempt records nothing.
+    emit_race_loser_metrics(registry, &child_terminal_metrics, &activity_loser_metrics);
+
     // Issue #1247: return every event this call durably appended. Child
     // terminals come first — appended inline, mid-loop, so they hold the
     // lower ids — then the batched activity terminals just above. A caller
@@ -16201,18 +16205,12 @@ pub async fn apply_race_loser_cancellations(
 /// function entry and at loop-end is exactly the events those
 /// cancellations appended. Synthetic activity-loser events are appended
 /// separately, after this call. They are excluded by construction.
-///
-/// Emits every deferred child-cancellation and activity-loser metric only
-/// after the reload succeeds (issue #1247). A reload failure then rolls
-/// back the transaction with no metric recorded for it.
-async fn reload_race_loser_events_and_emit_metrics(
+async fn reload_race_loser_events(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     registry: &HandlerRegistry,
     function_entry_next_event_id: i32,
     next_event_id: i32,
-    child_terminal_metrics: &[(String, String)],
-    activity_loser_metrics: &[(String, String)],
 ) -> HarvestResult<Vec<WorkflowEvent>> {
     let mut child_terminal_events = Vec::new();
     let total_child_events_appended =
@@ -16226,6 +16224,19 @@ async fn reload_race_loser_events_and_emit_metrics(
             .saturating_sub(total_child_events_appended);
         child_terminal_events.extend_from_slice(&history.events[start..]);
     }
+    Ok(child_terminal_events)
+}
+
+/// Emit the child-cancellation and activity-loser metrics that
+/// `apply_race_loser_cancellations` deferred (issues #1247, #1787).
+///
+/// The caller runs this after its last fallible step. A failure before
+/// that point rolls back the transaction with no metric recorded.
+fn emit_race_loser_metrics(
+    registry: &HandlerRegistry,
+    child_terminal_metrics: &[(String, String)],
+    activity_loser_metrics: &[(String, String)],
+) {
     let metrics = &registry.telemetry().metrics;
     for (child_workflow_name, queue_name) in child_terminal_metrics {
         crate::telemetry::emit_workflow_terminal(
@@ -16246,7 +16257,6 @@ async fn reload_race_loser_events_and_emit_metrics(
         metrics.record_activity_failed(activity_name, "", "Error", true);
         metrics.record_activity_attempt(activity_name, queue_name, ActivityStatus::Failed);
     }
-    Ok(child_terminal_events)
 }
 
 /// Pure event-emission plan for the **fresh-arm** timer commands
