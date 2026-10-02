@@ -1203,12 +1203,42 @@ async fn tick(sink: &SinkShared, conn: &mut AsyncPgConnection, held: &mut Vec<St
     sink.record(rejected, &"Postgres rejects the channel name");
     let wakes = coalesce(ready_notes);
     let count = wakes.len();
-    if count > 0
-        && let Err(error) = send_wakes(conn, wakes).await
-    {
-        sink.record(count, &error);
+    if count > 0 {
+        send_counted(sink, count, send_wakes(conn, wakes)).await;
     }
     true
+}
+
+/// Await `send` and count its `count` wakes as lost when it fails.
+///
+/// A runtime that stops can cancel the sender task during the send. The
+/// wakes have already left [`Held`], so the [`Unsent`] guard counts them.
+async fn send_counted<E: std::fmt::Display>(
+    sink: &SinkShared,
+    count: usize,
+    send: impl Future<Output = Result<(), E>>,
+) {
+    let mut unsent = Unsent { sink, count };
+    let result = send.await;
+    unsent.count = 0;
+    if let Err(error) = result {
+        sink.record(count, &error);
+    }
+}
+
+/// The wakes of a send that has not finished.
+struct Unsent<'a> {
+    /// The sender state.
+    sink: &'a SinkShared,
+    /// The wakes. Zero once the send finishes.
+    count: usize,
+}
+
+impl Drop for Unsent<'_> {
+    fn drop(&mut self) {
+        self.sink
+            .record(self.count, &"the notify sender task stopped during a send");
+    }
 }
 
 /// Fire a `NOTIFY` carrying one ephemeral progress chunk on the per-execution
@@ -2118,5 +2148,51 @@ mod tests {
              pg_notify limit (max-u64 seq + max chunk), was {} bytes",
             serialized.len()
         );
+    }
+
+    /// A sender state on a lazy pool that never connects.
+    fn lazy_sink() -> (
+        diesel_async::pooled_connection::deadpool::Pool<AsyncPgConnection>,
+        SinkShared,
+    ) {
+        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+            "postgres://unused@127.0.0.1:1/unused",
+        );
+        let pool = deadpool::managed::Pool::builder(manager)
+            .max_size(1)
+            .build()
+            .expect("lazy pool");
+        let sink = SinkShared {
+            pool: pool.weak(),
+            pool_key: 0,
+            fingerprint: Mutex::new(None),
+            pending: Mutex::new(Vec::new()),
+            wake: tokio::sync::Notify::new(),
+            ready: tokio::sync::watch::Sender::new(false),
+            queue_usage: Mutex::new(None),
+            task: Mutex::new(None),
+            failures: AtomicU64::new(0),
+            last_ok: Mutex::new(None),
+            held: AtomicUsize::new(0),
+        };
+        (pool, sink)
+    }
+
+    #[tokio::test]
+    async fn a_send_cancelled_midway_counts_its_wakes() {
+        let (_pool, sink) = lazy_sink();
+        let send = send_counted(&sink, 3, std::future::pending::<Result<(), String>>());
+        let cancelled = tokio::time::timeout(Duration::from_millis(10), send).await;
+        assert!(cancelled.is_err(), "the send never finishes");
+        assert_eq!(AtomicU64::load(&sink.failures, Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn a_finished_send_counts_only_a_failure() {
+        let (_pool, sink) = lazy_sink();
+        send_counted(&sink, 2, async { Ok::<(), String>(()) }).await;
+        assert_eq!(AtomicU64::load(&sink.failures, Ordering::Relaxed), 0);
+        send_counted(&sink, 2, async { Err::<(), String>("refused".into()) }).await;
+        assert_eq!(AtomicU64::load(&sink.failures, Ordering::Relaxed), 2);
     }
 }
