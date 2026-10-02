@@ -591,12 +591,15 @@ impl HarvestPlugin {
     /// Outside the `dev` profile, a mount with no [`Self::api_with_auth`]
     /// refuses every mutating route with 401. This opt-out restores the
     /// pre-#1802 posture for routes with no admin gate. Those are workflow
-    /// start, signal, reset and update, DAG trigger, schedule changes,
-    /// external-activity callbacks and worker drain. Vantage forms and MCP
-    /// tools open too. Admin-gated routes keep their gate.
+    /// start, signal and update (with the with-start variants), reset, DAG
+    /// trigger, patch and retry, schedule changes, external-activity
+    /// callbacks and worker drain. The opt-out also opens the Vantage form
+    /// posts and the mutating MCP tool routes that have no admin gate.
+    /// Admin-gated routes keep their gate.
     ///
-    /// Startup logs a warning while the opt-out is set. Prefer
-    /// [`Self::api_with_auth`] or [`Self::enable_api_tokens`].
+    /// Outside `dev`, startup logs a warning while the opt-out is set. Prefer
+    /// [`Self::api_with_auth`] or [`Self::enable_api_tokens`]. Tokens do not
+    /// cover the MCP tool routes.
     #[must_use]
     pub const fn allow_unauthenticated_mutations(mut self) -> Self {
         self.allow_unauthenticated_mutations = true;
@@ -1596,7 +1599,8 @@ fn warn_if_dev_admin_api_is_open(profile: &str, auth_boundary_present: bool) {
              process. This is the documented dev-profile posture and is what lets `harvest \
              preflight` run against a local quickstart app. Do not expose this process beyond \
              localhost. To close it, configure HarvestPlugin::api_with_auth(path, middleware), or \
-             run a non-dev AUTUMN_PROFILE (where the API is fail-closed regardless)."
+             run a non-dev AUTUMN_PROFILE (where the API fails closed unless \
+             allow_unauthenticated_mutations() is set)."
         );
     }
 }
@@ -2583,8 +2587,8 @@ mod tests {
         }
     }
 
-    /// Issue #1802: the mutation warning fires exactly when a caller with no
-    /// credential reaches a mutating route. A declared boundary closes it.
+    /// Issue #1802: the predicate is true exactly when a caller with no
+    /// credential reaches a mutating route. A declared boundary makes it false.
     #[test]
     fn unauthenticated_mutations_are_open_only_for_dev_or_the_opt_out() {
         use crate::boot::unauthenticated_mutations_open;
@@ -2597,6 +2601,57 @@ mod tests {
             assert!(
                 !unauthenticated_mutations_open(profile, false, false),
                 "profile {profile:?} fails closed with no opt-out"
+            );
+        }
+    }
+
+    /// Issue #1802: the opt-out warning fires only when the opt-out, and not
+    /// the `dev` profile, opens the mutating routes.
+    #[test]
+    fn mutation_opt_out_warning_fires_only_when_the_opt_out_opens_the_routes() {
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self {
+                self.clone()
+            }
+        }
+        let capture = |profile: &str, boundary: bool, opt_out: bool| {
+            let buf = Buf::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(buf.clone())
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                crate::boot::warn_if_mutation_opt_out_is_open(profile, boundary, opt_out);
+            });
+            let bytes = buf.0.lock().unwrap().clone();
+            String::from_utf8_lossy(&bytes).into_owned()
+        };
+        let marker = "allow_unauthenticated_mutations is set";
+        for profile in ["prod", "unknown", "staging"] {
+            assert!(capture(profile, false, true).contains(marker), "{profile}");
+        }
+        for (profile, boundary, opt_out) in [
+            ("prod", true, true),
+            ("prod", false, false),
+            ("dev", false, true),
+            ("dev", false, false),
+        ] {
+            assert!(
+                !capture(profile, boundary, opt_out).contains(marker),
+                "{profile} boundary={boundary} opt_out={opt_out}"
             );
         }
     }

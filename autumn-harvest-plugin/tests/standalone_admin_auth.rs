@@ -205,3 +205,47 @@ async fn the_declared_settings_reach_harvest_api_state() {
     assert_eq!(boundary["details"]["profile"], "prod");
     assert_eq!(boundary["details"]["auth_boundary_present"], true);
 }
+
+async fn post_start(app: axum::Router) -> StatusCode {
+    app.oneshot(
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/harvest/workflows/w/start")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .expect("request should build"),
+    )
+    .await
+    .expect("router should serve the request")
+    .status()
+}
+
+/// Issue #1802: the mount sets the opt-out from its declaration. The gate
+/// also classifies the path with the `/api/harvest` prefix stripped.
+#[tokio::test]
+async fn the_mutation_opt_out_reaches_the_gate_through_the_mount() {
+    let closed = StandaloneAdminAuth::new().with_deployment_profile("prod");
+    assert_eq!(
+        post_start(standalone_app(&closed)).await,
+        StatusCode::UNAUTHORIZED
+    );
+
+    let open = closed.clone().allow_unauthenticated_mutations();
+    let status = post_start(standalone_app(&open)).await;
+    assert_ne!(status, StatusCode::UNAUTHORIZED);
+    assert_ne!(status, StatusCode::FORBIDDEN);
+}
+
+/// Issue #1802: a mount without the opt-out clears an opt-out already set on
+/// a reused state. The declaration decides, the same as the boundary.
+#[tokio::test]
+async fn a_mount_without_the_opt_out_clears_a_stale_one() {
+    let api_state = HarvestApiState::new();
+    api_state.set_allow_unauthenticated_mutations(true);
+    let auth = StandaloneAdminAuth::new().with_deployment_profile("prod");
+    let app = axum::Router::new().nest(
+        "/api/harvest",
+        auth.mount(harvest_api_router(api_state.clone()), &api_state),
+    );
+    assert_eq!(post_start(app).await, StatusCode::UNAUTHORIZED);
+}

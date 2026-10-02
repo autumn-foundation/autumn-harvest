@@ -66,6 +66,9 @@ fn build_app(pool: DbPool) -> HarvestApiApp {
 
 fn build_app_no_admin(pool: DbPool) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
+    // Issue #1802: set the opt-out, so the 401 comes from the admin gate and
+    // not from the mutation gate.
+    api_state.set_allow_unauthenticated_mutations(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool));
     harvest_api_router(api_state)
 }

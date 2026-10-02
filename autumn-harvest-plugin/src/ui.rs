@@ -792,8 +792,9 @@ pub fn harvest_ui_router(api_state: HarvestApiState) -> Router<()> {
             "/admin/gates/{id}/lift",
             post(lift_gate_ui).route_layer(require_admin),
         )
-        // Issue #1802: outside `dev`, a Vantage form post fails closed unless
-        // an auth layer is declared or the opt-out is set. Pages stay open.
+        // Issue #1802: outside `dev`, this gate refuses a form post with no
+        // credential. A declared boundary, a scoped token, an admin session or
+        // the opt-out admits it. The gate passes `GET`, `HEAD` and `OPTIONS`.
         .route_layer(middleware::from_fn_with_state(
             api_state.clone(),
             crate::api::require_mutation_auth_by_method,

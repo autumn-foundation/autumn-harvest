@@ -162,7 +162,7 @@ fn harvest_plugin() -> HarvestPlugin {
         .worker(WorkerConfig::default())
         .api("/api/harvest")
         .mcp_tools()
-        // Issue #1802: keep the tool routes open; this test exercises the tools, not auth.
+        // Issue #1802: set the opt-out. This test exercises the tools, not auth.
         .allow_unauthenticated_mutations();
     #[cfg(feature = "unified-dag-execution")]
     let plugin = plugin

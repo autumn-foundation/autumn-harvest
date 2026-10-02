@@ -1486,7 +1486,16 @@ fn check_admin_auth_boundary(api_state: &HarvestApiState) -> PreflightCheckResul
     let profile = api_state.deployment_profile();
     let has_boundary = api_state.admin_auth_boundary();
     let is_dev = profile == "dev";
-    let status = if is_dev || has_boundary {
+    // Issue #1802: the opt-out opens the mutating routes outside `dev`. That
+    // is a known open state, so the check fails rather than warns.
+    let opt_out_open = crate::boot::mutation_opt_out_opens_routes(
+        &profile,
+        has_boundary,
+        api_state.allow_unauthenticated_mutations(),
+    );
+    let status = if opt_out_open {
+        PreflightStatus::Fail
+    } else if is_dev || has_boundary {
         PreflightStatus::Pass
     } else if profile == "unknown" {
         PreflightStatus::Warn
@@ -1525,6 +1534,9 @@ fn check_admin_auth_boundary(api_state: &HarvestApiState) -> PreflightCheckResul
             PreflightStatus::Warn => {
                 "admin API auth boundary cannot be confirmed because the deployment profile is unknown"
             }
+            PreflightStatus::Fail if opt_out_open => {
+                "mutating routes are reachable unauthenticated: allow_unauthenticated_mutations is set without an auth boundary"
+            }
             PreflightStatus::Fail => {
                 "admin API is mounted without an auth boundary in a non-dev profile"
             }
@@ -1534,6 +1546,9 @@ fn check_admin_auth_boundary(api_state: &HarvestApiState) -> PreflightCheckResul
             PreflightStatus::Warn => {
                 Some("Set the deployment profile or mark the admin auth boundary explicitly.")
             }
+            PreflightStatus::Fail if opt_out_open => Some(
+                "Remove allow_unauthenticated_mutations, or use HarvestPlugin::api_with_auth or equivalent middleware.",
+            ),
             PreflightStatus::Fail => Some(
                 "Use HarvestPlugin::api_with_auth or mount equivalent middleware before the Harvest admin API.",
             ),
@@ -1805,6 +1820,21 @@ mod tests {
                 result.details["unauthenticated_mutations"],
                 serde_json::json!(expected),
                 "profile={profile} boundary={boundary} opt_out={opt_out}"
+            );
+        }
+
+        // The opt-out outside `dev` is a known open state, so the check
+        // fails and names the opt-out. An `unknown` profile does not soften it.
+        for profile in ["prod", "unknown"] {
+            let state = HarvestApiState::new();
+            state.set_deployment_profile(profile);
+            state.set_allow_unauthenticated_mutations(true);
+            let result = check_admin_auth_boundary(&state);
+            assert_eq!(result.status, PreflightStatus::Fail, "{profile}");
+            assert!(
+                result.summary.contains("allow_unauthenticated_mutations"),
+                "{profile}: {}",
+                result.summary
             );
         }
     }

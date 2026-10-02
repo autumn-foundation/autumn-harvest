@@ -9,7 +9,24 @@ use autumn_web::session::Session;
 use tower::ServiceExt;
 
 /// Build an unauthenticated test app (no middleware applied).
+///
+/// It sets the issue #1802 opt-out, which restores the pre-#1802 posture.
+/// The tests that use it probe the admin gate and the handlers' own gates,
+/// so the outer mutation gate must not answer for them.
 fn unauthenticated_app() -> impl tower::Service<
+    Request<Body>,
+    Response = autumn_web::reexports::axum::response::Response,
+    Error = std::convert::Infallible,
+    Future = impl std::future::Future,
+> + Clone {
+    let api_state = HarvestApiState::new();
+    api_state.set_allow_unauthenticated_mutations(true);
+    harvest_api_router(api_state)
+}
+
+/// Build an app in the default posture: profile `unknown`, no boundary, no
+/// opt-out. The issue #1802 gate is closed.
+fn closed_app() -> impl tower::Service<
     Request<Body>,
     Response = autumn_web::reexports::axum::response::Response,
     Error = std::convert::Infallible,
@@ -29,21 +46,6 @@ fn app_with_api_state(
     harvest_api_router(api_state)
 }
 
-/// Build an app with the explicit opt-out set (issue #1802).
-///
-/// The opt-out restores the open data plane. Tests that probe a handler's
-/// own gate use it, so the outer mutation gate does not mask that gate.
-fn open_mutations_app() -> impl tower::Service<
-    Request<Body>,
-    Response = autumn_web::reexports::axum::response::Response,
-    Error = std::convert::Infallible,
-    Future = impl std::future::Future,
-> + Clone {
-    let api_state = HarvestApiState::new();
-    api_state.set_allow_unauthenticated_mutations(true);
-    harvest_api_router(api_state)
-}
-
 fn unauthenticated_app_with_ui() -> impl tower::Service<
     Request<Body>,
     Response = autumn_web::reexports::axum::response::Response,
@@ -55,13 +57,17 @@ fn unauthenticated_app_with_ui() -> impl tower::Service<
 }
 
 /// Build a test app protected by `RequireAuth`.
+///
+/// It sets the issue #1802 opt-out, so every 401 comes from `RequireAuth`.
 fn authenticated_app() -> impl tower::Service<
     Request<Body>,
     Response = autumn_web::reexports::axum::response::Response,
     Error = std::convert::Infallible,
     Future = impl std::future::Future,
 > + Clone {
-    harvest_api_router(HarvestApiState::new()).route_layer(RequireAuth::new("user_id"))
+    let api_state = HarvestApiState::new();
+    api_state.set_allow_unauthenticated_mutations(true);
+    harvest_api_router(api_state).route_layer(RequireAuth::new("user_id"))
 }
 
 fn get(uri: &str) -> Request<Body> {
@@ -133,7 +139,7 @@ async fn eris_unauthenticated_list_workflows_is_accessible() {
 
 #[tokio::test]
 async fn eris_unauthenticated_start_workflow_is_blocked() {
-    let app = unauthenticated_app();
+    let app = closed_app();
     let res = app
         .oneshot(post_json("/workflows/my-workflow/start", "{}"))
         .await
@@ -178,7 +184,7 @@ async fn eris_unauthenticated_start_workflow_terminate_existing_conflict_is_bloc
 // "allowed through" eris start case, so we assert only "not blocked by auth").
 #[tokio::test]
 async fn eris_unauthenticated_start_workflow_terminate_if_running_plus_use_existing_is_allowed() {
-    let app = open_mutations_app();
+    let app = unauthenticated_app();
     let res = app
         .oneshot(post_json(
             "/workflows/my-workflow/start",
@@ -195,7 +201,7 @@ async fn eris_unauthenticated_start_workflow_terminate_if_running_plus_use_exist
 // it is likewise NOT admin-gated.
 #[tokio::test]
 async fn eris_unauthenticated_start_workflow_terminate_if_running_plus_fail_is_allowed() {
-    let app = open_mutations_app();
+    let app = unauthenticated_app();
     let res = app
         .oneshot(post_json(
             "/workflows/my-workflow/start",
@@ -212,7 +218,7 @@ async fn eris_unauthenticated_start_workflow_terminate_if_running_plus_fail_is_a
 // admin-gated.
 #[tokio::test]
 async fn eris_unauthenticated_start_workflow_use_existing_conflict_is_allowed() {
-    let app = open_mutations_app();
+    let app = unauthenticated_app();
     let res = app
         .oneshot(post_json(
             "/workflows/my-workflow/start",
@@ -239,7 +245,7 @@ async fn eris_unauthenticated_start_workflow_use_existing_conflict_is_allowed() 
 // probe — that requires a DB and is covered by the #808 integration tests.)
 #[tokio::test]
 async fn eris_keyed_terminate_if_running_defers_past_early_gate() {
-    let app = open_mutations_app();
+    let app = unauthenticated_app();
     let req = Request::builder()
         .method(Method::POST)
         .uri("/workflows/my-workflow/start")
@@ -259,7 +265,7 @@ async fn eris_keyed_terminate_if_running_defers_past_early_gate() {
 // gate (the UNKEYED variant above asserts `401`).
 #[tokio::test]
 async fn eris_keyed_terminate_existing_conflict_defers_past_early_gate() {
-    let app = open_mutations_app();
+    let app = unauthenticated_app();
     let req = Request::builder()
         .method(Method::POST)
         .uri("/workflows/my-workflow/start")
@@ -315,7 +321,7 @@ async fn eris_unauthenticated_get_workflow_is_accessible() {
 
 #[tokio::test]
 async fn eris_unauthenticated_signal_workflow_is_blocked() {
-    let app = unauthenticated_app();
+    let app = closed_app();
     let res = app
         .oneshot(post_json(
             "/workflows/00000000-0000-0000-0000-000000000001/signal/approve",
@@ -533,7 +539,7 @@ async fn eris_unauthenticated_list_dag_runs_is_accessible() {
 
 #[tokio::test]
 async fn eris_unauthenticated_trigger_dag_is_blocked() {
-    let app = unauthenticated_app();
+    let app = closed_app();
     let res = app
         .oneshot(post_json("/dags/my-dag/trigger", "{}"))
         .await
@@ -543,7 +549,7 @@ async fn eris_unauthenticated_trigger_dag_is_blocked() {
 
 #[tokio::test]
 async fn eris_unauthenticated_patch_dag_is_blocked() {
-    let app = unauthenticated_app();
+    let app = closed_app();
     let res = app
         .oneshot(patch_json("/dags/my-dag", r#"{"paused": true}"#))
         .await
@@ -811,7 +817,7 @@ async fn eris_require_auth_blocks_replay_dead_letter() {
 
 #[tokio::test]
 async fn eris_unauthenticated_reset_workflow_is_blocked() {
-    let app = unauthenticated_app();
+    let app = closed_app();
     let res = app
         .oneshot(post_json(
             "/workflows/00000000-0000-0000-0000-000000000001/reset",
@@ -835,6 +841,8 @@ async fn eris_unauthenticated_retention_run_now_is_blocked() {
 #[tokio::test]
 async fn eris_non_admin_session_is_blocked_in_non_dev_profile() {
     let api_state = HarvestApiState::new();
+    // Issue #1802: open the mutation gate, so the admin gate decides.
+    api_state.set_allow_unauthenticated_mutations(true);
     let app = app_with_api_state(api_state);
 
     let mut request = post_json("/admin/retention/run-now", "{}");
@@ -852,6 +860,8 @@ async fn eris_non_admin_session_is_blocked_in_non_dev_profile() {
 #[tokio::test]
 async fn eris_admin_session_is_allowed_in_non_dev_profile() {
     let api_state = HarvestApiState::new();
+    // Issue #1802: open the mutation gate, so the admin gate decides.
+    api_state.set_allow_unauthenticated_mutations(true);
     let app = app_with_api_state(api_state);
 
     let mut request = post_json("/admin/retention/run-now", "{}");
@@ -869,7 +879,7 @@ async fn eris_admin_session_is_allowed_in_non_dev_profile() {
 
 #[tokio::test]
 async fn eris_unauthenticated_create_schedule_is_blocked() {
-    let app = unauthenticated_app();
+    let app = closed_app();
     let res = app
         .oneshot(post_json("/admin/schedules/workflow", "{}"))
         .await
@@ -905,7 +915,7 @@ async fn eris_unauthenticated_submit_batch_terminate_operation_is_blocked() {
 
 #[tokio::test]
 async fn eris_unauthenticated_worker_drain_is_blocked() {
-    let app = unauthenticated_app();
+    let app = closed_app();
     let res = app
         .oneshot(post_json(
             "/workers/worker-abc/drain",
@@ -1770,7 +1780,7 @@ async fn embedder_only_router_has_no_token_layer() {
 /// cannot pass for an unrelated 400.
 #[tokio::test]
 async fn eris_a_reserved_connector_idempotency_key_is_refused_on_the_signal_route() {
-    let app = open_mutations_app();
+    let app = unauthenticated_app();
     let res = app
         .oneshot(
             Request::builder()
@@ -1801,7 +1811,7 @@ async fn eris_a_reserved_connector_idempotency_key_is_refused_on_the_signal_rout
 #[tokio::test]
 async fn eris_a_near_miss_idempotency_key_is_not_refused_as_reserved() {
     for key in ["CONN:x", "conn", "connector-key", "xconn:y"] {
-        let app = open_mutations_app();
+        let app = unauthenticated_app();
         let res = app
             .oneshot(
                 Request::builder()
@@ -2086,7 +2096,7 @@ fn request_with_session(method: Method, uri: &str, data: &[(&str, &str)]) -> Req
     request
 }
 
-/// Mutating routes that had no admin gate before issue #1802.
+/// Mutating routes with no admin gate (issue #1802).
 const DATA_PLANE_MUTATIONS: &[(&str, &str)] = &[
     ("POST", "/workflows/my-workflow/start"),
     ("POST", "/workflows/my-workflow/signal-with-start"),
@@ -2148,8 +2158,9 @@ async fn data_plane_status(api_state: &HarvestApiState, method: &str, uri: &str)
         .status()
 }
 
-/// AC1: with no auth and a non-dev profile, start, signal and cancel fail
-/// closed. So does every other mutation that had no admin gate.
+/// AC1: with no auth and a non-dev profile, start and signal fail closed. So
+/// does every other mutation with no admin gate. Cancel has an admin gate, so
+/// the sweep below covers it.
 #[tokio::test]
 async fn nemesis_unauthenticated_data_plane_mutations_fail_closed() {
     for profile in [None, Some("prod"), Some("staging")] {
@@ -2199,23 +2210,98 @@ async fn nemesis_opt_out_restores_unauthenticated_data_plane_mutations() {
     }
 }
 
-/// The opt-out covers the data plane only. Admin-gated routes keep their gate.
+/// `CLASSIFIED_ROUTES` templates of [`DATA_PLANE_MUTATIONS`], spelled as in
+/// `autumn-harvest/src/audit.rs`.
+const DATA_PLANE_TEMPLATES: &[&str] = &[
+    "POST /workflows/{workflow_name}/start",
+    "POST /workflows/{workflow_name}/signal-with-start",
+    "POST /workflows/{workflow_name}/update-with-start",
+    "POST /workflows/{id}/signal/{signal_name}",
+    "POST /workflows/{id}/reset",
+    "POST /workflows/{id}/update/{update_name}",
+    "POST /workflows/by-id/{workflow_name}/{workflow_id}/signal/{signal_name}",
+    "POST /dags/{dag_name}/trigger",
+    "PATCH /dags/{dag_name}",
+    "POST /dags/{dag_name}/runs/{run_exec_id}/retry",
+    "POST /admin/schedules/workflow",
+    "PATCH /admin/schedules/{id}",
+    "DELETE /admin/schedules/{id}",
+    "POST /admin/schedules/{id}/pause",
+    "POST /admin/schedules/{id}/resume",
+    "POST /admin/schedules/{id}/backfill",
+    "POST /activities/external/{token}/complete",
+    "POST /activities/external/{token}/fail",
+    "POST /activities/external/{token}/heartbeat",
+    "POST /workers/{worker_id}/drain",
+];
+
+/// The opt-out opens exactly the data plane. Every admin-gated route keeps
+/// its gate. A new mutating route with no admin gate fails this test.
 #[tokio::test]
-async fn nemesis_opt_out_does_not_open_admin_routes() {
+async fn nemesis_opt_out_opens_exactly_the_data_plane() {
+    assert_eq!(DATA_PLANE_TEMPLATES.len(), DATA_PLANE_MUTATIONS.len());
     let api_state = HarvestApiState::new();
+    api_state.set_deployment_profile("prod");
     api_state.set_allow_unauthenticated_mutations(true);
-    let cancel = data_plane_status(
-        &api_state,
-        "POST",
-        "/workflows/00000000-0000-0000-0000-000000000001/cancel",
-    )
-    .await;
-    assert_eq!(cancel, StatusCode::UNAUTHORIZED);
-    let retention = data_plane_status(&api_state, "POST", "/admin/retention/run-now").await;
-    assert_eq!(retention, StatusCode::UNAUTHORIZED);
+    let mut opened = 0;
+    for (template, class) in CLASSIFIED_ROUTES {
+        if *class != RouteClass::Mutating {
+            continue;
+        }
+        let (method, path) = template.split_once(' ').unwrap();
+        let status = data_plane_status(&api_state, method, &concrete_request_path(path)).await;
+        if DATA_PLANE_TEMPLATES.contains(template) {
+            opened += 1;
+            assert_ne!(status, StatusCode::UNAUTHORIZED, "{template} opens");
+        } else {
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{template} keeps its admin gate"
+            );
+        }
+    }
+    assert_eq!(
+        opened,
+        DATA_PLANE_TEMPLATES.len(),
+        "every data-plane template is a classified mutation"
+    );
 }
 
-/// The `dev` profile keeps today's open data plane.
+/// The opt-out keeps the handlers' own admin checks on a start that can
+/// cancel a live run.
+#[tokio::test]
+async fn nemesis_opt_out_keeps_the_destructive_start_policy_gates() {
+    let api_state = HarvestApiState::new();
+    api_state.set_deployment_profile("prod");
+    api_state.set_allow_unauthenticated_mutations(true);
+    for (uri, body) in [
+        (
+            "/workflows/my-workflow/start",
+            r#"{"reuse_policy":"terminate_if_running"}"#,
+        ),
+        (
+            "/workflows/my-workflow/start",
+            r#"{"conflict_policy":"terminate_existing"}"#,
+        ),
+        (
+            "/workflows/my-workflow/signal-with-start",
+            r#"{"workflow_id":"w-1","signal_name":"approve","id_reuse_policy":"terminate_if_running"}"#,
+        ),
+        (
+            "/workflows/my-workflow/update-with-start",
+            r#"{"workflow_id":"w-1","update_name":"approve","id_reuse_policy":"terminate_if_running"}"#,
+        ),
+    ] {
+        let res = harvest_api_router(api_state.clone())
+            .oneshot(post_json(uri, body))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{uri} {body}");
+    }
+}
+
+/// The `dev` profile leaves the mutating routes open.
 #[tokio::test]
 async fn nemesis_dev_profile_keeps_data_plane_mutations_open() {
     let api_state = HarvestApiState::new();
@@ -2271,7 +2357,7 @@ async fn nemesis_admin_session_passes_and_plain_session_fails() {
 /// The gate runs only on a matched route. An unknown path stays 404.
 #[tokio::test]
 async fn nemesis_unknown_path_is_still_not_found() {
-    let res = unauthenticated_app()
+    let res = closed_app()
         .oneshot(post_json("/no-such-route", "{}"))
         .await
         .unwrap();
@@ -2279,21 +2365,63 @@ async fn nemesis_unknown_path_is_still_not_found() {
 }
 
 /// Vantage forms post to their own `/ui` routes. Those mutations fail closed
-/// too, but the pages stay readable.
+/// too. The pages stay readable.
 #[tokio::test]
 async fn nemesis_vantage_mutations_fail_closed_and_pages_stay_open() {
     let app = unauthenticated_app_with_ui();
-    for uri in [
-        "/ui/workflows/00000000-0000-0000-0000-000000000001/cancel",
-        "/ui/workflows/00000000-0000-0000-0000-000000000001/signal",
-        "/ui/workflows/00000000-0000-0000-0000-000000000001/reset",
-        "/ui/schedules/sched-1/pause",
-    ] {
+    for uri in VANTAGE_DATA_PLANE_POSTS {
         let res = app.clone().oneshot(post_json(uri, "{}")).await.unwrap();
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "POST {uri}");
     }
     let page = app.oneshot(get("/ui/workflows")).await.unwrap();
     assert_ne!(page.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// Vantage form posts with no admin gate (`ui.rs`).
+const VANTAGE_DATA_PLANE_POSTS: &[&str] = &[
+    "/ui/workflows/00000000-0000-0000-0000-000000000001/cancel",
+    "/ui/workflows/00000000-0000-0000-0000-000000000001/pause",
+    "/ui/workflows/00000000-0000-0000-0000-000000000001/resume",
+    "/ui/workflows/00000000-0000-0000-0000-000000000001/signal",
+    "/ui/workflows/00000000-0000-0000-0000-000000000001/reset",
+    "/ui/workflows/00000000-0000-0000-0000-000000000001/trigger-update",
+    "/ui/schedules/bulk-pause",
+    "/ui/schedules/bulk-resume",
+    "/ui/schedules/sched-1/pause",
+    "/ui/schedules/sched-1/resume",
+    "/ui/schedules/sched-1/delete",
+    "/ui/schedules/sched-1/trigger-now",
+    "/ui/schedules/sched-1/backfill",
+];
+
+/// An admin session passes the Vantage gate outside `dev`. A plain session
+/// does not.
+#[tokio::test]
+async fn nemesis_admin_session_passes_the_vantage_gate_outside_dev() {
+    let api_state = HarvestApiState::new();
+    api_state.set_deployment_profile("prod");
+    let app = harvest_api_router(api_state.clone()).nest("/ui", harvest_ui_router(api_state));
+    let uri = "/ui/workflows/00000000-0000-0000-0000-000000000001/cancel";
+    let admin = app
+        .clone()
+        .oneshot(request_with_session(
+            Method::POST,
+            uri,
+            &[("user_id", "u-1"), ("role", "admin")],
+        ))
+        .await
+        .unwrap();
+    assert_ne!(admin.status(), StatusCode::UNAUTHORIZED);
+    assert_ne!(admin.status(), StatusCode::FORBIDDEN);
+    let plain = app
+        .oneshot(request_with_session(
+            Method::POST,
+            uri,
+            &[("user_id", "u-1")],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(plain.status(), StatusCode::UNAUTHORIZED);
 }
 
 /// The opt-out also restores the Vantage mutations.
@@ -2302,12 +2430,8 @@ async fn nemesis_opt_out_restores_vantage_mutations() {
     let api_state = HarvestApiState::new();
     api_state.set_allow_unauthenticated_mutations(true);
     let app = harvest_api_router(api_state.clone()).nest("/ui", harvest_ui_router(api_state));
-    let res = app
-        .oneshot(post_json(
-            "/ui/workflows/00000000-0000-0000-0000-000000000001/cancel",
-            "{}",
-        ))
-        .await
-        .unwrap();
-    assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
+    for uri in VANTAGE_DATA_PLANE_POSTS {
+        let res = app.clone().oneshot(post_json(uri, "{}")).await.unwrap();
+        assert_ne!(res.status(), StatusCode::UNAUTHORIZED, "POST {uri}");
+    }
 }

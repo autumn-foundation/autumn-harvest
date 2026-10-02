@@ -666,6 +666,8 @@ async fn anonymous_caller_is_refused_mutating_mcp_tools_outside_dev() {
     let api_state = HarvestApiState::new();
     api_state.set_deployment_profile("prod");
     let (app, mutating, reading) = build_router_with(&api_state, false);
+    assert_ne!(mutating.len(), 0, "sanity: mutating MCP tools present");
+    assert_ne!(reading.len(), 0, "sanity: read MCP tools present");
     for (method, path) in &mutating {
         let (status, _) = drive(&app, method, path, None).await;
         assert_eq!(
@@ -698,6 +700,7 @@ async fn opt_out_and_dev_profile_keep_mcp_mutations_open() {
     dev.set_deployment_profile("dev");
     for api_state in [open_mutations_state(), dev] {
         let (app, mutating, _) = build_router_with(&api_state, false);
+        assert_ne!(mutating.len(), 0, "sanity: mutating MCP tools present");
         for (method, path) in &mutating {
             let (status, _) = drive(&app, method, path, None).await;
             assert_ne!(status, StatusCode::UNAUTHORIZED, "{method} {path}");

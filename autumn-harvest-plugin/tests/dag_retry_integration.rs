@@ -129,7 +129,7 @@ fn build_app(pool: &DbPool) -> HarvestApiApp {
     let catalog = compile_dag_catalog(dags![linear_retry_dag, fanout_retry_dag])
         .expect("dag catalog compiles");
     let api_state = HarvestApiState::new();
-    // Issue #1802: keep the data plane open; this test exercises the handler, not auth.
+    // Issue #1802: set the opt-out. This test exercises the handler, not auth.
     api_state.set_allow_unauthenticated_mutations(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(

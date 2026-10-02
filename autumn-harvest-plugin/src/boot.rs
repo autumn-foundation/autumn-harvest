@@ -217,9 +217,9 @@ pub fn dev_admin_api_is_open(profile: &str, auth_boundary_present: bool) -> bool
 ///
 /// The `dev` profile and the `allow_unauthenticated_mutations` opt-out open
 /// the routes. A declared auth boundary hands the decision to the embedder's
-/// middleware, so the routes are not open to Harvest's own check. Every other
-/// posture fails closed. The mutation gate, the startup warning and
-/// `preflight` all read this one predicate.
+/// middleware. The predicate then returns false, and the gate admits every
+/// caller that middleware passes. Every other posture fails closed. The
+/// mutation gate, the opt-out warning and `preflight` read this predicate.
 pub fn unauthenticated_mutations_open(
     profile: &str,
     auth_boundary_present: bool,
@@ -230,15 +230,18 @@ pub fn unauthenticated_mutations_open(
 
 /// Log the `allow_unauthenticated_mutations` opt-out when it opens the routes.
 ///
-/// The `dev` profile has its own warning, so this one names the opt-out only.
+/// It fires only outside `dev`. In `dev` the routes are open anyway, and the
+/// `dev` warning names them. A declared boundary keeps it silent.
 pub fn warn_if_mutation_opt_out_is_open(
     profile: &str,
     auth_boundary_present: bool,
     allow_unauthenticated_mutations: bool,
 ) {
-    if allow_unauthenticated_mutations
-        && unauthenticated_mutations_open(profile, auth_boundary_present, true)
-    {
+    if mutation_opt_out_opens_routes(
+        profile,
+        auth_boundary_present,
+        allow_unauthenticated_mutations,
+    ) {
         tracing::warn!(
             profile,
             "allow_unauthenticated_mutations is set and no auth boundary is declared: every \
@@ -248,6 +251,22 @@ pub fn warn_if_mutation_opt_out_is_open(
              once an auth layer wraps the management API."
         );
     }
+}
+
+/// Whether the opt-out, and not the `dev` profile, opens the mutating routes.
+///
+/// The opt-out warning and `preflight` read it.
+pub fn mutation_opt_out_opens_routes(
+    profile: &str,
+    auth_boundary_present: bool,
+    allow_unauthenticated_mutations: bool,
+) -> bool {
+    profile != "dev"
+        && unauthenticated_mutations_open(
+            profile,
+            auth_boundary_present,
+            allow_unauthenticated_mutations,
+        )
 }
 
 /// How many times a guard has published a gate cache in this process.

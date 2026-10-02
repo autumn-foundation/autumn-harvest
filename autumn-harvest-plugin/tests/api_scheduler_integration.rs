@@ -788,7 +788,7 @@ fn build_sharded_dag_api_app(
     router: ShardRouter,
 ) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
-    // Issue #1802: keep the data plane open; this test exercises the handler, not auth.
+    // Issue #1802: set the opt-out. This test exercises the handler, not auth.
     api_state.set_allow_unauthenticated_mutations(true);
     api_state.install_storage_pool(build_two_shard_pool(shard0_url, shard1_url));
     let registered_dag_names = dag_catalog.keys().cloned().collect::<Vec<_>>();
@@ -2000,7 +2000,7 @@ async fn harvest_api_uses_the_installed_storage_pool() {
     let pool = build_test_pool(&database_url);
     let registry = approval_registry();
     let api_state = HarvestApiState::new();
-    // Issue #1802: keep the data plane open; this test exercises the handler, not auth.
+    // Issue #1802: set the opt-out. This test exercises the handler, not auth.
     api_state.set_allow_unauthenticated_mutations(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
@@ -2584,7 +2584,7 @@ async fn harvest_api_duplicate_start_reuses_existing_execution() {
     let pool = build_test_pool(&database_url);
     let registry = approval_registry();
     let api_state = HarvestApiState::new();
-    // Issue #1802: keep the data plane open; this test exercises the handler, not auth.
+    // Issue #1802: set the opt-out. This test exercises the handler, not auth.
     api_state.set_allow_unauthenticated_mutations(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
@@ -2645,7 +2645,7 @@ async fn harvest_api_stack_endpoint_returns_shape() {
     let pool = build_test_pool(&database_url);
     let registry = approval_registry();
     let api_state = HarvestApiState::new();
-    // Issue #1802: keep the data plane open; this test exercises the handler, not auth.
+    // Issue #1802: set the opt-out. This test exercises the handler, not auth.
     api_state.set_allow_unauthenticated_mutations(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
@@ -2986,7 +2986,7 @@ async fn external_runner_processes_workflows_started_via_management_api() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
     let api_state = HarvestApiState::new();
-    // Issue #1802: keep the data plane open; this test exercises the handler, not auth.
+    // Issue #1802: set the opt-out. This test exercises the handler, not auth.
     api_state.set_allow_unauthenticated_mutations(true);
 
     let web_runtime = HarvestRunner::start(
@@ -3780,7 +3780,7 @@ async fn harvest_api_signal_does_not_wake_timer_waits_early() {
     let pool = build_test_pool(&database_url);
     let registry = approval_and_timer_signal_registry();
     let api_state = HarvestApiState::new();
-    // Issue #1802: keep the data plane open; this test exercises the handler, not auth.
+    // Issue #1802: set the opt-out. This test exercises the handler, not auth.
     api_state.set_allow_unauthenticated_mutations(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
@@ -4085,7 +4085,7 @@ async fn harvest_api_lists_and_triggers_manual_dags() {
     .await;
 
     let api_state = HarvestApiState::new();
-    // Issue #1802: keep the data plane open; this test exercises the handler, not auth.
+    // Issue #1802: set the opt-out. This test exercises the handler, not auth.
     api_state.set_allow_unauthenticated_mutations(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
@@ -4141,7 +4141,7 @@ async fn harvest_api_rejects_dag_trigger_for_workflow_without_dag_registration()
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
     let api_state = HarvestApiState::new();
-    // Issue #1802: keep the data plane open; this test exercises the handler, not auth.
+    // Issue #1802: set the opt-out. This test exercises the handler, not auth.
     api_state.set_allow_unauthenticated_mutations(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
@@ -4216,7 +4216,7 @@ async fn harvest_api_triggers_manual_only_unified_dag_on_declared_default_queue(
     ));
 
     let api_state = HarvestApiState::new();
-    // Issue #1802: keep the data plane open; this test exercises the handler, not auth.
+    // Issue #1802: set the opt-out. This test exercises the handler, not auth.
     api_state.set_allow_unauthenticated_mutations(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
@@ -4264,7 +4264,7 @@ async fn harvest_api_enforces_max_active_runs_for_manual_dag_triggers() {
     ));
 
     let api_state = HarvestApiState::new();
-    // Issue #1802: keep the data plane open; this test exercises the handler, not auth.
+    // Issue #1802: set the opt-out. This test exercises the handler, not auth.
     api_state.set_allow_unauthenticated_mutations(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
@@ -4371,7 +4371,7 @@ async fn harvest_api_defers_manual_dag_trigger_when_schedule_is_paused() {
         .expect("paused DAG schedule should register");
 
     let api_state = HarvestApiState::new();
-    // Issue #1802: keep the data plane open; this test exercises the handler, not auth.
+    // Issue #1802: set the opt-out. This test exercises the handler, not auth.
     api_state.set_allow_unauthenticated_mutations(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
@@ -4420,7 +4420,7 @@ async fn harvest_api_patch_creates_pause_row_for_manual_only_unified_dag() {
     ));
 
     let api_state = HarvestApiState::new();
-    // Issue #1802: keep the data plane open; this test exercises the handler, not auth.
+    // Issue #1802: set the opt-out. This test exercises the handler, not auth.
     api_state.set_allow_unauthenticated_mutations(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
@@ -4475,7 +4475,7 @@ async fn harvest_api_rejects_workflow_schedule_creation_for_registered_dag_name(
     ));
 
     let api_state = HarvestApiState::new();
-    // Issue #1802: keep the data plane open; this test exercises the handler, not auth.
+    // Issue #1802: set the opt-out. This test exercises the handler, not auth.
     api_state.set_allow_unauthenticated_mutations(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
@@ -4678,7 +4678,7 @@ async fn harvest_api_rejects_non_dry_run_backfill_for_paused_dag_schedule() {
     }
 
     let api_state = HarvestApiState::new();
-    // Issue #1802: keep the data plane open; this test exercises the handler, not auth.
+    // Issue #1802: set the opt-out. This test exercises the handler, not auth.
     api_state.set_allow_unauthenticated_mutations(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
@@ -4773,7 +4773,7 @@ async fn harvest_api_backfills_legacy_dag_schedule_null_queue_on_dag_default_que
     );
 
     let api_state = HarvestApiState::new();
-    // Issue #1802: keep the data plane open; this test exercises the handler, not auth.
+    // Issue #1802: set the opt-out. This test exercises the handler, not auth.
     api_state.set_allow_unauthenticated_mutations(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
@@ -4896,7 +4896,7 @@ async fn harvest_api_backfill_matches_fractional_legacy_dag_workflow_id() {
     mark_workflow_completed_on_url(&database_url, seeded_exec, backfill_at).await;
 
     let api_state = HarvestApiState::new();
-    // Issue #1802: keep the data plane open; this test exercises the handler, not auth.
+    // Issue #1802: set the opt-out. This test exercises the handler, not auth.
     api_state.set_allow_unauthenticated_mutations(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
@@ -4976,7 +4976,7 @@ async fn harvest_api_rejects_backfill_for_unregistered_dag_schedule_row() {
     let schedule = load_schedule_from_url(&database_url, dag_name).await;
 
     let api_state = HarvestApiState::new();
-    // Issue #1802: keep the data plane open; this test exercises the handler, not auth.
+    // Issue #1802: set the opt-out. This test exercises the handler, not auth.
     api_state.set_allow_unauthenticated_mutations(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
@@ -5068,7 +5068,7 @@ async fn setup_workflow_backfill_app(
         vec![],
     ));
     let api_state = HarvestApiState::new();
-    // Issue #1802: keep the data plane open; this test exercises the handler, not auth.
+    // Issue #1802: set the opt-out. This test exercises the handler, not auth.
     api_state.set_allow_unauthenticated_mutations(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
@@ -5149,7 +5149,7 @@ async fn setup_throttled_workflow_backfill_app(
 
     let registry = Arc::new(HandlerRegistry::new(vec![info], vec![]));
     let api_state = HarvestApiState::new();
-    // Issue #1802: keep the data plane open; this test exercises the handler, not auth.
+    // Issue #1802: set the opt-out. This test exercises the handler, not auth.
     api_state.set_allow_unauthenticated_mutations(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
@@ -5647,7 +5647,7 @@ async fn backfill_dag_over_window_dispatches_only_remaining_budget() {
         vec![],
     ));
     let api_state = HarvestApiState::new();
-    // Issue #1802: keep the data plane open; this test exercises the handler, not auth.
+    // Issue #1802: set the opt-out. This test exercises the handler, not auth.
     api_state.set_allow_unauthenticated_mutations(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
@@ -5776,7 +5776,7 @@ async fn backfill_dag_threads_declared_execution_timeout_sla_and_fleet_ceiling()
             .with_max_workflow_execution_timeout(Some(std::time::Duration::from_secs(3600))),
     );
     let api_state = HarvestApiState::new();
-    // Issue #1802: keep the data plane open; this test exercises the handler, not auth.
+    // Issue #1802: set the opt-out. This test exercises the handler, not auth.
     api_state.set_allow_unauthenticated_mutations(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
@@ -5911,7 +5911,7 @@ async fn backfill_workflow_threads_declared_execution_timeout_sla_and_fleet_ceil
             .with_max_workflow_execution_timeout(Some(std::time::Duration::from_secs(3600))),
     );
     let api_state = HarvestApiState::new();
-    // Issue #1802: keep the data plane open; this test exercises the handler, not auth.
+    // Issue #1802: set the opt-out. This test exercises the handler, not auth.
     api_state.set_allow_unauthenticated_mutations(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
@@ -7534,7 +7534,7 @@ async fn schedule_pause_with_reason_records_pause_metadata() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
     let api_state = HarvestApiState::new();
-    // Issue #1802: keep the data plane open; this test exercises the handler, not auth.
+    // Issue #1802: set the opt-out. This test exercises the handler, not auth.
     api_state.set_allow_unauthenticated_mutations(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool));
     let app = harvest_api_router(api_state);
@@ -7576,7 +7576,7 @@ async fn schedule_pause_idempotent_does_not_overwrite_paused_at() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
     let api_state = HarvestApiState::new();
-    // Issue #1802: keep the data plane open; this test exercises the handler, not auth.
+    // Issue #1802: set the opt-out. This test exercises the handler, not auth.
     api_state.set_allow_unauthenticated_mutations(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool));
     let app = harvest_api_router(api_state);
@@ -7638,7 +7638,7 @@ async fn schedule_resume_clears_pause_metadata() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
     let api_state = HarvestApiState::new();
-    // Issue #1802: keep the data plane open; this test exercises the handler, not auth.
+    // Issue #1802: set the opt-out. This test exercises the handler, not auth.
     api_state.set_allow_unauthenticated_mutations(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool));
     let app = harvest_api_router(api_state);
@@ -7695,7 +7695,7 @@ async fn schedule_resume_idempotent_when_schedule_is_not_paused() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
     let api_state = HarvestApiState::new();
-    // Issue #1802: keep the data plane open; this test exercises the handler, not auth.
+    // Issue #1802: set the opt-out. This test exercises the handler, not auth.
     api_state.set_allow_unauthenticated_mutations(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool));
     let app = harvest_api_router(api_state);
@@ -7734,7 +7734,7 @@ async fn get_schedule_by_id_returns_entry_with_pause_fields() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
     let api_state = HarvestApiState::new();
-    // Issue #1802: keep the data plane open; this test exercises the handler, not auth.
+    // Issue #1802: set the opt-out. This test exercises the handler, not auth.
     api_state.set_allow_unauthenticated_mutations(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool));
     let app = harvest_api_router(api_state);
@@ -8255,7 +8255,7 @@ async fn schedule_create_response_at_capacity_is_not_overdue() {
         vec![],
     ));
     let api_state = HarvestApiState::new();
-    // Issue #1802: keep the data plane open; this test exercises the handler, not auth.
+    // Issue #1802: set the opt-out. This test exercises the handler, not auth.
     api_state.set_allow_unauthenticated_mutations(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(

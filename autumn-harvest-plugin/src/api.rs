@@ -1170,7 +1170,8 @@ impl HarvestApiState {
     /// Outside the `dev` profile, a mount with no auth boundary refuses every
     /// mutating route with 401. This opt-out restores the pre-#1802 posture
     /// for routes with no admin gate. Admin-gated routes keep their gate.
-    /// Startup logs a warning while the opt-out is set.
+    /// `HarvestPlugin` and `HarvestEmbedding` log a startup warning while the
+    /// opt-out opens the routes. A raw router mount logs nothing.
     ///
     /// # Panics
     ///
@@ -4794,8 +4795,9 @@ async fn by_id_missing_workflow_id(Path(_workflow_name): Path<String>) -> axum::
 #[allow(clippy::too_many_lines)]
 pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
     let require_admin = middleware::from_fn_with_state(api_state.clone(), require_harvest_admin);
-    // Issue #1802: outside `dev`, every mutating route fails closed unless an
-    // auth layer is declared or the opt-out is set.
+    // Issue #1802: outside `dev`, this gate refuses a mutating call with no
+    // credential. A declared boundary, a scoped token, an admin session or the
+    // opt-out admits it.
     let require_mutation_auth =
         middleware::from_fn_with_state(api_state.clone(), require_classified_mutation_auth);
     // issue #1278: the Vantage dead-letter page's bulk-action forms submit
@@ -5595,7 +5597,8 @@ impl StandaloneAdminAuth {
     ///
     /// Outside the `dev` profile, a mount with no declared auth boundary
     /// refuses every mutating route with 401. This opt-out restores the
-    /// pre-#1802 posture for routes with no admin gate. See
+    /// pre-#1802 posture for routes with no admin gate. [`Self::mount`] sets
+    /// the state from this declaration, the same as the boundary. See
     /// [`HarvestApiState::set_allow_unauthenticated_mutations`].
     #[must_use]
     pub const fn allow_unauthenticated_mutations(mut self) -> Self {
@@ -5645,9 +5648,7 @@ impl StandaloneAdminAuth {
     /// [`HarvestPlugin`]: crate::HarvestPlugin
     pub fn mount(&self, router: Router<()>, api_state: &HarvestApiState) -> Router<()> {
         api_state.set_admin_auth_boundary(self.admin_auth_boundary);
-        if self.allow_unauthenticated_mutations {
-            api_state.set_allow_unauthenticated_mutations(true);
-        }
+        api_state.set_allow_unauthenticated_mutations(self.allow_unauthenticated_mutations);
         if let Some(profile) = &self.deployment_profile {
             api_state.set_deployment_profile(profile.clone());
         }
@@ -5733,7 +5734,10 @@ pub(crate) async fn require_harvest_admin(
 ///
 /// The class comes from `CLASSIFIED_ROUTES`, and an unclassified route counts
 /// as `Mutating`. A route with an admin gate runs this check first, then its
-/// own. The check is the same, so the result does not change.
+/// own. This check admits every caller the admin gate admits, so the admin
+/// gate still decides. The per-route same-origin guard on the bulk
+/// dead-letter routes runs after this check, so an anonymous cross-site post
+/// there gets 401, not 403.
 pub(crate) async fn require_classified_mutation_auth(
     State(api_state): State<HarvestApiState>,
     request: axum::extract::Request,
@@ -58689,5 +58693,45 @@ mod tests {
             &no_build_ids,
             ""
         ));
+    }
+}
+
+#[cfg(test)]
+mod mutation_gate_tests {
+    use super::*;
+    use tower::ServiceExt as _;
+
+    async fn start_status(with_token: bool) -> StatusCode {
+        let api_state = HarvestApiState::new();
+        api_state.set_deployment_profile("prod");
+        let mut request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/workflows/w/start")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from("{}"))
+            .unwrap();
+        if with_token {
+            request
+                .extensions_mut()
+                .insert(crate::api_token::TokenPrincipal {
+                    id: uuid::Uuid::nil(),
+                    scope: crate::api_token::TokenScope::Mutate,
+                });
+        }
+        harvest_api_router(api_state)
+            .oneshot(request)
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// Issue #1802: a verified scoped token passes the gate on a route with
+    /// no admin gate. The token layer sets `TokenPrincipal` in production.
+    #[tokio::test]
+    async fn a_verified_token_passes_the_mutation_gate() {
+        assert_eq!(start_status(false).await, StatusCode::UNAUTHORIZED);
+        let status = start_status(true).await;
+        assert_ne!(status, StatusCode::UNAUTHORIZED);
+        assert_ne!(status, StatusCode::FORBIDDEN);
     }
 }

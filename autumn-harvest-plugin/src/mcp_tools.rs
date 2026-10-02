@@ -945,9 +945,10 @@ fn build_tool_route(
     } else {
         handler
     };
-    // Issue #1802: outside `dev`, a mutating tool fails closed unless an auth
-    // layer is declared or the opt-out is set. It sits inside the auth
-    // middleware below, so it reads the `Session` that middleware sets.
+    // Issue #1802: outside `dev`, this gate refuses a mutating tool call with
+    // no credential. A declared boundary, an admin session or the opt-out
+    // admits it. It sits inside the auth middleware below, so it reads the
+    // `Session` that middleware sets.
     let handler = if spec.kind.is_mutation() {
         handler.layer(axum::middleware::from_fn_with_state(
             gate_state,
@@ -2286,10 +2287,10 @@ mod tests {
 
         let descriptors = collect_descriptors(&[wf("order_flow", true)], &[], &[]);
         record_schemas(&descriptors);
-        // Issue #1802: open the mutation gate, so the 401 comes from the
-        // configured middleware alone.
+        // Issue #1802: `api_with_auth` declares a boundary, which opens the
+        // mutation gate. So the 401 comes from the configured middleware alone.
         let api_state = crate::api::HarvestApiState::new();
-        api_state.set_allow_unauthenticated_mutations(true);
+        api_state.set_admin_auth_boundary(true);
         let routes = build_mcp_tool_routes(
             "/api/harvest/mcp",
             &descriptors,
