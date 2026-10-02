@@ -148,7 +148,7 @@ fn build_worker() -> Arc<Worker> {
         Worker::new(
             WorkerRuntimeConfig {
                 codec_rotation_batch_size: 0,
-                scanner: Default::default(),
+                scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
                 dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: "dag-retry-worker".to_string(),
                 queues: vec!["default".to_string()],

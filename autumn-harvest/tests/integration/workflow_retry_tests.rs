@@ -297,7 +297,7 @@ fn make_worker(
     Worker::new(
         WorkerRuntimeConfig {
             codec_rotation_batch_size: 0,
-            scanner: Default::default(),
+            scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
             dr: autumn_harvest::replication::DrConfig::default(),
             worker_id: uuid::Uuid::new_v4().to_string(),
             queues: vec!["default".to_string()],

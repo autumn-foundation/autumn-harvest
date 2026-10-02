@@ -483,7 +483,7 @@ fn build_worker(worker_id: &str, queue: &str, registry: Arc<HandlerRegistry>) ->
         Worker::new(
             WorkerRuntimeConfig {
                 codec_rotation_batch_size: 0,
-                scanner: Default::default(),
+                scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
                 dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: worker_id.to_string(),
                 queues: vec![queue.to_string()],

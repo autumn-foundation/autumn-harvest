@@ -2172,7 +2172,7 @@ mod one_worker_process {
             Worker::new(
                 WorkerRuntimeConfig {
                     codec_rotation_batch_size: 0,
-                    scanner: Default::default(),
+                    scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
                     dr: autumn_harvest::replication::DrConfig::default(),
                     worker_id: "hot-swap-host-1".to_string(),
                     queues: vec![queue.to_string()],

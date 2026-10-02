@@ -14,7 +14,7 @@
 //!    codec key.
 #![cfg(feature = "db")]
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
