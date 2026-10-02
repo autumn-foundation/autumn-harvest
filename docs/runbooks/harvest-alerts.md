@@ -1097,7 +1097,7 @@ per-execution operator action**. Full playbook:
 
 None for a mismatch. A non-determinism mismatch means the workflow code generated a different sequence of commands/actions than what was recorded in history, making replay safety impossible. Author `Err(...)` returns are never classified as divergence — they still fail terminally.
 
-One misdiagnosis is possible (issue #1791). A workflow body that awaits non-durable work for more than 100 ms during replay can block with `expected: <workflow suspended early>`. Replay-diagnosis then reports `clean`. Move that work into an activity.
+One misdiagnosis is possible (issue #1791). A workflow body that awaits non-durable work beside a durable await can block with `expected: <workflow suspended early>` (issue #1797). Replay-diagnosis then reports `clean`. Move that work into an activity.
 
 ### Safe actions
 

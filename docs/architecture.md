@@ -184,6 +184,7 @@ The capability-miss release still keys on `(worker_id, crash_strikes)`. It runs 
 *Enforcement.* `claim_held` in `queue.rs` is the one predicate: `state = 'RUNNING' AND worker_id = $w AND attempt = $a`. Every owner write and claim check uses it, in its own statement:
 
 - Writes: `complete_claimed_task`, `fail_claimed_task`, `requeue_claimed_task_for_retry`, `defer_claimed_rate_limited_task` and `record_heartbeat`.
+- Workflow-task writes: `requeue_claimed_workflow_task_after_deadlock` (issue #1797).
 - `lock_claim_for_update`. The start fence, both finalize paths, the in-worker schedule-to-close and session-acquire timeouts, and `run_transactional` take it after the execution row lock.
 - `claim_is_current` and `task_status_for_claim`. The cancellation observer and `ActivityContext::check_durable_cancellation` read them.
 - `claim_held_for_update_skip_locked`. For an activity row, `fail_task_and_execution_with_history` takes it before its `claim_still_held_for_update` guard. A later claim of the same worker returns `Ok` without a write. Any other miss returns `TerminalWriteClaimAmbiguous`, as the guard does.
@@ -193,6 +194,39 @@ The capability-miss release still keys on `(worker_id, crash_strikes)`. It runs 
 *Not fenced.* `complete_task`, `fail_task`, `requeue_for_retry` and `defer_rate_limited_task` stay unfenced. The timeout sweeper in `timeout.rs`, cancellation and operator actions use them on purpose: they act on a row whatever its claim. Workflow-task writes use `claim_still_held_for_update` (issues #804 and #1184).
 
 A formal model of this protocol is tracked in issue #1819.
+
+**10. Suspension readiness (issue #1797)**
+
+A decision cycle suspends when the workflow is blocked on Harvest futures. No clock decides a suspension. A clock bounds only waits on foreign futures. `executor::run_workflow_handler_cycle` applies this rule.
+
+*Readiness rule.*
+
+1. Poll the handler with the cycle's own waker. Catch a panic (issue #782). Poll inside `tokio::task::unconstrained`, so that the coop budget cannot decide when a ready tokio resource returns `Pending`.
+2. `Ready`: the handler returned. The cycle completes or fails.
+3. `Pending`, and a wake fired synchronously during the poll: a future is ready. Yield to the runtime and poll again. A `FuturesUnordered` that returns early after two self-woken children takes this path, so its other children still run. A wake from another thread after the poll does not count, because the poll window closes in one atomic step. A wake that tokio defers to the end of the task poll, such as `tokio::task::yield_now`, is not seen either. The cycle polls again however many times that takes, so a long but finite run of ready futures always completes. Only the deadlock timeout ends a run that never settles.
+4. `Pending`, no wake, and a Harvest future is parked: the cycle suspends at once.
+5. `Pending`, no wake, and no parked Harvest future: the handler waits on a foreign future, such as a raw `tokio::time::sleep`. The cycle polls again when that future wakes it.
+
+*Parked Harvest future.* `WorkflowContext::has_parked_harvest_future` is true in two cases:
+
+- A buffered command holds an open result channel. `WorkflowCommand::awaits_result` lists these variants. Its match is exhaustive, so a new variant must decide whether it parks.
+- A `ParkToken` is held. These futures have no result channel. A forever park holds one: `continue_as_new`, the await of a cancellable timer (issue #768), and the fallback park after a dropped sender in mutex acquire and external await. A false `await_condition` also holds one.
+
+The worker sends results only after it drains the cycle. A parked Harvest future therefore cannot resolve in the same cycle, and waiting longer cannot change the outcome.
+
+*Deadlock timeout.* `executor::DEADLOCK_TIMEOUT` is 2 s. The clock starts at the first poll that does not suspend (step 3 or step 5). CPU time before that, such as a long replay, does not count. Step 4 never checks the clock. A cycle that has still not suspended when the clock expires returns `WorkflowOutcome::TaskFailed`. A future that wakes itself forever ends this way, even beside a parked Harvest future, so the cycle never suspends with a partial batch. The worker then does this:
+
+- It discards the cycle's commands and appends no event. The run stays `RUNNING`.
+- It re-pends the task under the claim fence (`queue::requeue_claimed_workflow_task_after_deadlock`). A dispatcher that lost its claim writes nothing.
+- It waits 5 s, doubling per consecutive deadlock up to 300 s. Retries never stop, because a deadlock never fails the run. The strike count is per worker and expires after 600 s.
+
+Keep `workflow_task_timeout` above `DEADLOCK_TIMEOUT`. A shorter body budget cancels the cycle first, and that path counts timeout strikes.
+
+*Mixed waits.* When a Harvest future and a foreign future are both pending, step 4 applies. The cycle suspends and drops the foreign future. Do not race a foreign future against a Harvest future. A history recorded under the old 100 ms timer can hold commands that such a workflow now emits one cycle later. That run can block for non-determinism after the upgrade.
+
+*Query replay.* `drive_query_replay` and `drive_query_replay_async` keep their own rule (issue #612). They stop at a foreign await instead of waiting for it.
+
+*Proof.* The `executor.rs` tests `suspension_outcome_does_not_depend_on_step_duration`, `a_parked_harvest_future_decides_the_cycle_not_the_step_duration`, `foreign_await_past_the_deadlock_timeout_fails_the_task_not_the_run`, `harvest_parks_suspend_without_waiting_on_the_clock`, `a_wake_during_the_poll_is_polled_again_before_suspending`, `a_long_finite_run_of_ready_futures_is_polled_to_the_end`, `a_self_waking_future_beside_a_park_fails_the_task`, `cpu_time_before_the_first_foreign_wait_does_not_count` and `single_step_suspension_decides_in_under_100_ms`. Against Postgres: `panic_containment_tests::deadlocked_workflow_task_is_re_pended_and_the_retry_completes_the_run`.
 
 ### Sharding
 
@@ -244,7 +278,7 @@ Current implementation scope: `ExecutionId`/`ShardId` encoding, `ShardRouter`, `
 | `timeline.rs` | 3.50 | Per-execution timeline read model (issue #739): pure `db`-free `derive_timeline(...) -> Timeline`; `Timeline`/`TimelineStep`/`TimelineRollup`/`SlowestStep`/`StepKind`/`StepOutcome`/`TimelineEventRow` (re-exported from `lib.rs`). Reconstructs a run's wall-clock breakdown (per-step wait/exec split where derivable, busy/wait totals, slowest step) purely from recorded `harvest_events` timestamps. No new event variant, no migration, no write path. Route `GET /workflows/{id}/timeline`. |
 | `stall_diagnosis.rs` | 3.51 | Per-execution stall diagnosis — the pure root-cause classifier (issue #809): `ExecutionHealth`, the discriminated `BlockedOn` enum, `PendingActivityFacts`/`ExternalHandoffFacts`/`PendingChildFacts`/`AwaitedSignalFacts`/`PendingTimerFacts`/`WorkflowTaskFacts`/`ReplayWaitFacts`/`NdBlockFacts`/`DiagnosisInputs`, `classify_pending_activity`, `classify_execution`, `classify_workflow_task`, `workflow_task_hard_impediment`, `workflow_wake_was_missed`, `activity_precedence`, `summarize`, `TIMER_OVERDUE_GRACE_SECONDS` (all re-exported from `lib.rs`). No `db` feature, no DB access, no event variant, no migration. Route `GET /workflows/{id}/diagnose`. |
 | `replay.rs` | 2 | Deterministic replay engine: `HistoryMatcher` walks event history, detects non-determinism |
-| `executor.rs` | 2 | Workflow executor: `run_workflow` drives replay + live execution, handles suspension |
+| `executor.rs` | 2 | Workflow executor: `run_workflow` drives replay + live execution, detects suspension by readiness (issue #1797) |
 | `queue.rs` | 2 | Postgres task queue: `enqueue`, `claim` (FOR UPDATE SKIP LOCKED), `complete`, `fail` |
 | `notify.rs` | 2 | LISTEN/NOTIFY wrapper: `Listener` (async stream), `Notifier` (pg_notify), channel naming. `sslmode=require` selects verified TLS (issue #1717). Wakes for appends and enqueues go after commit, from a per-pool sender on its own connection (issue #1796). |
 | `dispatch.rs` | 3.x | Task dispatch channel seam (issue #1312): `TaskDispatch` trait (`publish`/`next`/`ack`/`release`/`maintain`), `DispatchHint` (task id, queue, `scheduled_at`, priority, shard), `DispatchLease`, `DispatchMaintenance`, `DispatchSettings` (`poll_interval`, `reconcile_interval`, `reconcile_batch`, `release_backoff_cap`) and the process-global `install`/`installed`/`uninstall`. The channel carries references to claimable `harvest_task_queue` rows; Postgres stays the source of truth, and a worker still claims the named row with the full claim predicate. It is a latency and throughput optimization, never a durability store: the worker's reconcile sweep republishes every due `PENDING` row the channel does not hold. No new event variant, no migration. The Redis Streams implementation lives in `autumn-harvest-redis`; see [`docs/operations/redis-dispatch.md`](operations/redis-dispatch.md). |
