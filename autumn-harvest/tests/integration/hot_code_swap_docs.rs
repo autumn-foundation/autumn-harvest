@@ -586,12 +586,10 @@ fn the_reports_quoted_constants_match_the_source() {
 
 #[test]
 fn the_report_records_the_no_await_without_a_command_constraint() {
-    // Codex review round 1's sharpest finding was that a `yield_now()` between
-    // guest decisions is read by `executor::run_workflow_handler_cycle` — which
-    // drives the handler inside `tokio::time::timeout(SUSPENSION_TIMEOUT)` — as a
-    // zero-command suspension, failing the workflow terminally. That is a
-    // property of the boundary, not a bug in one line, so it belongs in the
-    // report as a constraint a future extender will read.
+    // Issue #967 found that a `yield_now()` between guest decisions could
+    // end a cycle with zero commands under the old 100 ms suspension timer.
+    // Issue #1797 replaced that timer with a readiness rule. C9 stays in the
+    // report as a constraint, and the report must record why it changed.
     let report = read_report();
     assert!(
         report.contains("C9"),
@@ -599,20 +597,22 @@ fn the_report_records_the_no_await_without_a_command_constraint() {
          await that records no command"
     );
     assert!(
-        report.contains("SUSPENSION_TIMEOUT"),
-        "C9 has to name `SUSPENSION_TIMEOUT`, the mechanism that makes it true"
-    );
-    assert!(
         report.contains("zero-command suspension"),
         "C9 has to name the failure mode it prevents"
     );
+    assert!(
+        report.contains("issue #1797") && report.contains("DEADLOCK_TIMEOUT"),
+        "C9 has to record the issue #1797 readiness rule that replaced the timer"
+    );
 
-    // The mechanism the constraint asserts is really there.
+    // The mechanism the update describes is really there.
     let executor = read_src("src/executor.rs");
     assert!(
-        executor.contains("tokio::time::timeout(SUSPENSION_TIMEOUT"),
-        "C9's premise is that the executor drives the handler inside \
-         `tokio::time::timeout(SUSPENSION_TIMEOUT, ..)`; if that changed, the \
-          constraint needs re-deriving rather than re-asserting"
+        executor.contains("has_parked_harvest_future()")
+            && executor.contains("DEADLOCK_TIMEOUT")
+            && !executor.contains("SUSPENSION_TIMEOUT"),
+        "the C9 update says the executor suspends on a parked Harvest future and \
+         bounds foreign waits with `DEADLOCK_TIMEOUT`; if that changed, the \
+         constraint needs re-deriving rather than re-asserting"
     );
 }

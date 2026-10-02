@@ -107,6 +107,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          metrics_integration
 linux        autumn-harvest         integration                      -                          migrate_tests
 linux        autumn-harvest         integration                      -                          mixed_suspension_tests
+linux        autumn-harvest         integration                      -                          mixed_suspension_timer_batch_perf
 linux        autumn-harvest         integration                      -                          mutex_lease_reclaim_perf
 linux        autumn-harvest         integration                      -                          mutex_tests
 linux        autumn-harvest         integration                      -                          panic_containment_tests
@@ -119,6 +120,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          quota_enforcement_tests
 linux        autumn-harvest         integration                      -                          quota_history_bytes_perf_tests
 linux        autumn-harvest         integration                      -                          quota_lock_ordering_tests
+linux        autumn-harvest         integration                      -                          quota_reconcile_candidate_bound_tests
 linux        autumn-harvest         integration                      -                          quota_reconcile_candidate_scan_perf_tests
 linux        autumn-harvest         integration                      -                          quota_reconcile_tests
 linux        autumn-harvest         integration                      -                          quota_supersede_ordering_tests
@@ -151,6 +153,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          typed_workflow_failure_tests
 linux        autumn-harvest         integration                      -                          usage_report_activity_lookback_tests
 linux        autumn-harvest         integration                      -                          with_start_shared_tests
+linux        autumn-harvest         integration                      -                          workflow_backoff_requeue_tests
 linux        autumn-harvest         integration                      -                          workflow_handle_tests
 linux        autumn-harvest         integration                      -                          workflow_id_targeted_tests
 linux        autumn-harvest         integration                      -                          workflow_logs_tests

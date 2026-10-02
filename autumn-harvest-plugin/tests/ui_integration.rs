@@ -503,6 +503,8 @@ async fn ui_lists_workflows_and_renders_detail_page() {
     let pool = build_test_pool(&database_url);
     let registry = echo_registry();
     let api_state = HarvestApiState::new();
+    // Issue #1802: set the opt-out. This test exercises the handler, not auth.
+    api_state.set_allow_unauthenticated_mutations(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
         Arc::clone(&registry),
@@ -5891,6 +5893,8 @@ async fn ui_trigger_preserves_dag_metadata() {
     let schedule_id = insert_test_schedule(&database_url, "Dag", dag_name, false).await;
 
     let api_state = HarvestApiState::new();
+    // Issue #1802: set the opt-out. This test exercises the handler, not auth.
+    api_state.set_allow_unauthenticated_mutations(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
         Arc::clone(&registry),
@@ -6005,6 +6009,8 @@ async fn ui_trigger_now_threads_dag_execution_timeout_sla_and_fleet_ceiling() {
     let schedule_id = insert_test_schedule(&database_url, "Dag", dag_name, false).await;
 
     let api_state = HarvestApiState::new();
+    // Issue #1802: set the opt-out. This test exercises the handler, not auth.
+    api_state.set_allow_unauthenticated_mutations(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
         Arc::clone(&registry),
@@ -8116,6 +8122,10 @@ async fn ui_timeline_200_steps_under_1s() {
 #[tokio::test]
 async fn vantage_and_dlq_mutations_reject_cross_site_post() {
     let api_state = HarvestApiState::new();
+    // Issue #1802: set the opt-out, so this test isolates the same-origin
+    // guard. On a closed state, the API gate answers the DLQ post with 401
+    // first. The `/ui` guard is the outer layer, so it answers first there.
+    api_state.set_allow_unauthenticated_mutations(true);
     let app = autumn_harvest_plugin::harvest_api_router(api_state.clone())
         .nest("/ui", harvest_ui_router(api_state));
 

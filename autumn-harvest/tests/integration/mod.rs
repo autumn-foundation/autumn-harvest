@@ -78,6 +78,7 @@ mod completion_callback_tests;
 #[cfg(feature = "db")]
 mod completion_trigger_outbox_queue_perf;
 mod concurrency_key_tests;
+mod concurrency_model_ci;
 mod concurrency_supersede_tests;
 mod context_headers_tests;
 mod cross_region_dr_docs;
@@ -152,6 +153,8 @@ mod migration_hygiene;
 #[cfg(feature = "db")]
 mod mixed_suspension_tests;
 #[cfg(feature = "db")]
+mod mixed_suspension_timer_batch_perf;
+#[cfg(feature = "db")]
 mod mutex_lease_reclaim_perf;
 #[cfg(feature = "db")]
 mod mutex_tests;
@@ -185,6 +188,7 @@ mod queue_pause_tests;
 mod quota_enforcement_tests;
 mod quota_history_bytes_perf_tests;
 mod quota_lock_ordering_tests;
+mod quota_reconcile_candidate_bound_tests;
 mod quota_reconcile_candidate_scan_perf_tests;
 mod quota_reconcile_tests;
 mod quota_supersede_ordering_tests;
@@ -279,6 +283,7 @@ mod webhook_trigger_tests;
 #[cfg(feature = "db")]
 mod with_start_shared_tests;
 mod worker_session_tests;
+mod workflow_backoff_requeue_tests;
 #[cfg(feature = "db")]
 mod workflow_handle_tests;
 #[cfg(feature = "db")]
