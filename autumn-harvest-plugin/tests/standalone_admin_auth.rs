@@ -113,6 +113,46 @@ async fn the_token_layer_is_installed_on_a_standalone_mount() {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 }
 
+/// Token-only standalone mode must fail closed before an unguarded workflow
+/// handler can inspect attacker-controlled input.
+#[tokio::test]
+async fn standalone_token_mode_rejects_missing_and_non_harvest_credentials() {
+    let auth = StandaloneAdminAuth::new().with_api_tokens();
+
+    for bearer in [None, Some("some.jwt.value")] {
+        let status = get(
+            standalone_app(&auth),
+            "/api/harvest/workflows/not-an-exec-id",
+            bearer,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    let mutation = standalone_app(&auth)
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/harvest/workflows/not-an-exec-id/signal/approve")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should serve the request");
+    assert_eq!(mutation.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// Health is explicitly public-safe and remains usable by unauthenticated
+/// load balancers in token-only mode.
+#[tokio::test]
+async fn standalone_token_mode_preserves_public_safe_routes() {
+    let auth = StandaloneAdminAuth::new().with_api_tokens();
+
+    let status = get(standalone_app(&auth), "/api/harvest/health", None).await;
+
+    assert_eq!(status, StatusCode::OK);
+}
+
 /// Without the opt-in the token layer is absent, so the same request falls
 /// through to the admin gate and is rejected there. This is the state every
 /// standalone mount was in.

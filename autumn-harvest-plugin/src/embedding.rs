@@ -160,10 +160,11 @@ impl HarvestEmbedding {
 
     /// Start the runtime and mount its router.
     ///
-    /// The order is the `HarvestPlugin` order. The posture and the limits
-    /// come first. The gate cache loads before any worker spawns. The orphan
-    /// gate runs before any admission global is published. The storage pool
-    /// is installed before the API runtime.
+    /// The order is the `HarvestPlugin` order, with one difference. The
+    /// builder limits are copied after the orphan gate, not first, because
+    /// the copy sets a process global. The gate cache loads before any worker
+    /// spawns. The orphan gate runs before any admission global is published.
+    /// The storage pool is installed before the API runtime.
     ///
     /// # Errors
     ///
@@ -179,7 +180,7 @@ impl HarvestEmbedding {
     /// to their previous values. The start-idempotency purge window keeps the
     /// value of the failed start. An API state from [`Self::with_api_state`]
     /// can keep the posture settings of a failed start. It holds no runtime,
-    /// so its routes answer 503.
+    /// so its routes that need the runtime or the database fail.
     pub fn start(
         self,
     ) -> impl Future<Output = autumn_web::AutumnResult<HarvestEmbeddingRuntime>> + Send {
@@ -306,9 +307,9 @@ impl HarvestEmbeddingRuntime {
     /// the read-only-role layer, the admin guard.
     ///
     /// The router holds the Vantage dashboard unless
-    /// [`HarvestEmbedding::without_ui`] was called. The admin guard covers
-    /// only the admin routes. The other routes, for example a workflow start
-    /// or a cancel, need your own auth layer, as on the plugin path.
+    /// [`HarvestEmbedding::without_ui`] was called. The admin guard is on
+    /// selected high-impact routes only. Other routes, for example a workflow
+    /// start or a signal, need your own auth layer, as on the plugin path.
     pub fn router(&self) -> Router<()> {
         self.router.clone()
     }
@@ -330,7 +331,8 @@ impl HarvestEmbeddingRuntime {
     /// The order is the `HarvestPlugin` order. The gate refresh stops first.
     /// The runner then drains its worker, up to `WorkerConfig::shutdown_timeout`.
     /// The admission globals are cleared only after the runner stops. The API
-    /// state is emptied last, so the router answers 503.
+    /// state is emptied last, so the routes that need the runtime or the
+    /// database fail.
     pub async fn stop(self) {
         let metrics = Arc::clone(&self.runner.api_runtime().registry().telemetry().metrics);
         self.gate_refresh.stop().await;

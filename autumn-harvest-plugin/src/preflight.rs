@@ -1547,10 +1547,16 @@ fn check_admin_auth_boundary(api_state: &HarvestApiState) -> PreflightCheckResul
                 Some("Set the deployment profile or mark the admin auth boundary explicitly.")
             }
             PreflightStatus::Fail if opt_out_open => Some(
-                "Remove allow_unauthenticated_mutations, or use HarvestPlugin::api_with_auth or equivalent middleware.",
+                "Remove allow_unauthenticated_mutations, or declare an auth layer: \
+                 HarvestPlugin::api_with_auth on autumn-web, or \
+                 StandaloneAdminAuth::with_admin_auth_boundary on a standalone mount.",
             ),
             PreflightStatus::Fail => Some(
-                "Use HarvestPlugin::api_with_auth or mount equivalent middleware before the Harvest admin API.",
+                "Wrap the Harvest API in your own auth layer and declare it: \
+                 HarvestPlugin::api_with_auth on autumn-web, or \
+                 StandaloneAdminAuth::with_admin_auth_boundary on a standalone mount. \
+                 API tokens alone are not a boundary, because a request with no token \
+                 still reaches each route that has no admin guard.",
             ),
         },
         Vec::new(),
@@ -1837,6 +1843,32 @@ mod tests {
                 result.summary
             );
         }
+    }
+
+    /// Issue #1614. A standalone embedder reads this remediation too, so it
+    /// names the standalone declaration. It also says that a token layer alone
+    /// is not a boundary.
+    #[test]
+    fn admin_auth_boundary_remediation_names_the_standalone_declaration() {
+        let state = HarvestApiState::new();
+        state.set_deployment_profile("prod");
+        let result = check_admin_auth_boundary(&state);
+        assert_eq!(result.status, PreflightStatus::Fail);
+        let remediation = result.remediation.unwrap_or_default();
+        for needle in [
+            "HarvestPlugin::api_with_auth",
+            "StandaloneAdminAuth::with_admin_auth_boundary",
+            "API tokens alone",
+        ] {
+            assert!(
+                remediation.contains(needle),
+                "remediation must name {needle:?}, got: {remediation}"
+            );
+        }
+        assert!(
+            !remediation.contains("  "),
+            "each line continuation must leave one space, got: {remediation}"
+        );
     }
 
     /// Build a `WorkerRow` with the given registered `shard_assignments`.
