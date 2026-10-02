@@ -541,19 +541,39 @@ fn higher_reason_exclusions(higher: &[&str], bound: &str) -> String {
 /// `ORDER BY id LIMIT`. That reads the whole table. Kept apart, the
 /// predicate uses its own partial index.
 ///
-/// The keyset bound `id > $1` goes inside the subquery, where it reaches the
-/// scan. Every predicate has one table at its top level, so the bare `id` is
-/// not ambiguous. The query returns ids only, so the sort stays small.
+/// The keyset bounds go inside the subquery, where they reach the scan.
+/// Every predicate has one table at its top level, so the bare `id` is not
+/// ambiguous. The query returns ids only, so the sort stays small.
 ///
-/// With `after`, `$1` is the last id of the previous refill and `$2` is the
-/// limit. Without it, `$1` is the limit.
+/// The upper bound is the sweep's high-water mark, from
+/// [`timeout_high_water_query`]. Rows past it wait for the next sweep. So
+/// new arrivals cannot stretch a sweep, and rows behind the cursor are
+/// reached within one sweep of the backlog at its start.
+///
+/// With `after`, `$1` is the last id of the previous refill, `$2` is the
+/// high-water mark and `$3` is the limit. Without it, `$1` is the mark and
+/// `$2` is the limit.
 fn timeout_refill_query(predicate: &str, higher: &[&str], after: bool) -> String {
-    let bound = if after { " AND id > $1" } else { "" };
-    let limit = if after { "$2" } else { "$1" };
+    let (bound, limit) = if after {
+        (" AND id > $1 AND id <= $2", "$3")
+    } else {
+        (" AND id <= $1", "$2")
+    };
     let exclusions = higher_reason_exclusions(higher, bound);
     format!(
         "SELECT q.id FROM ({predicate}{bound} OFFSET 0) q WHERE TRUE{exclusions} \
          ORDER BY q.id LIMIT {limit}"
+    )
+}
+
+/// The highest expired id at the start of a sweep (issue #1795).
+///
+/// The sweep stops at this id. See [`timeout_refill_query`].
+fn timeout_high_water_query(predicate: &str, higher: &[&str]) -> String {
+    let exclusions = higher_reason_exclusions(higher, "");
+    format!(
+        "SELECT q.id FROM ({predicate} OFFSET 0) q WHERE TRUE{exclusions} \
+         ORDER BY q.id DESC LIMIT 1"
     )
 }
 
@@ -581,22 +601,27 @@ const MAX_QUEUED_IDS: i64 = 100_000;
 /// One timeout reason's place in its sweep.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct TimeoutScanLane {
-    /// The last id of the last full refill. `None` starts at the lowest id.
+    /// The last id of the last full refill. `None` starts a new sweep.
     after: Option<uuid::Uuid>,
+    /// The current sweep's high-water mark. The sweep stops at this id.
+    until: Option<uuid::Uuid>,
     /// Expired ids from the last refill, in id order, not yet handed out.
     queued: std::collections::VecDeque<uuid::Uuid>,
 }
 
 /// Where the next batched task-timeout scan starts (issue #1795).
 ///
-/// One lane per timeout reason. When a lane runs empty, one scan queues up
-/// to [`REFILL_BATCHES`] batches of expired ids, in id order, past the
-/// lane's keyset position. Each pass then takes one batch from the queue and
+/// One lane per timeout reason. A sweep starts by fixing a high-water mark:
+/// the highest expired id at that moment. When a lane runs empty, one scan
+/// queues up to [`REFILL_BATCHES`] batches of expired ids, in id order. The
+/// ids lie between the lane's keyset position and the mark. Each pass then takes one batch from the queue and
 /// loads it by primary key. A full refill moves the position to its last id.
 /// A short refill resets it, so the next sweep starts again at the lowest id.
 ///
-/// A sweep reaches every row that stays expired. A row that expires behind
-/// the position waits for the next sweep. A queued row that stops matching
+/// A sweep reaches every row that stays expired and is at or below the mark.
+/// A row that expires behind the position, or above the mark, waits for the
+/// next sweep. So a sweep is bounded by the backlog at its start, and new
+/// arrivals cannot stretch it. A queued row that stops matching
 /// is dropped when its batch loads.
 ///
 /// A failed pass still moves the lane. So one bad row cannot block the rows
@@ -638,17 +663,29 @@ pub async fn find_timed_out_tasks_batch(
     let predicates = scans.clone().map(|(_, predicate)| predicate);
     for (index, (lane, (reason, predicate))) in cursor.lanes.iter_mut().zip(scans).enumerate() {
         let higher = &predicates[..index];
-        if lane.queued.is_empty() {
+        if lane.queued.is_empty() && lane.after.is_none() {
+            // A new sweep: fix its high-water mark first.
+            let top: Vec<QueuedId> = diesel::sql_query(timeout_high_water_query(predicate, higher))
+                .load(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+            lane.until = top.into_iter().next().map(|r| r.id);
+        }
+        if lane.queued.is_empty()
+            && let Some(until) = lane.until
+        {
             let ids: Vec<QueuedId> = match lane.after {
-                Some(id) => {
+                Some(after) => {
                     diesel::sql_query(timeout_refill_query(predicate, higher, true))
-                        .bind::<diesel::sql_types::Uuid, _>(id)
+                        .bind::<diesel::sql_types::Uuid, _>(after)
+                        .bind::<diesel::sql_types::Uuid, _>(until)
                         .bind::<diesel::sql_types::BigInt, _>(refill)
                         .load(conn)
                         .await
                 }
                 None => {
                     diesel::sql_query(timeout_refill_query(predicate, higher, false))
+                        .bind::<diesel::sql_types::Uuid, _>(until)
                         .bind::<diesel::sql_types::BigInt, _>(refill)
                         .load(conn)
                         .await
@@ -6238,16 +6275,31 @@ mod tests {
     fn refill_query_wraps_the_predicate_in_a_keyset_page_of_ids() {
         let predicate = start_to_close_timeout_query();
         let first = timeout_refill_query(predicate, &[], false);
-        // `OFFSET 0` keeps the predicate on its own index plan.
-        assert!(first.starts_with(&format!("SELECT q.id FROM ({predicate} OFFSET 0) q")));
-        assert!(first.ends_with("ORDER BY q.id LIMIT $1"));
-        assert!(!first.contains("$2"));
-        // The keyset bound sits inside the subquery, where it reaches the scan.
+        // `OFFSET 0` keeps the predicate on its own index plan. The first
+        // refill of a sweep is bounded only by the high-water mark.
+        assert!(first.starts_with(&format!(
+            "SELECT q.id FROM ({predicate} AND id <= $1 OFFSET 0) q"
+        )));
+        assert!(first.ends_with("ORDER BY q.id LIMIT $2"));
+        assert!(!first.contains("$3"));
+        // The keyset bounds sit inside the subquery, where they reach the scan.
         let next = timeout_refill_query(predicate, &[], true);
         assert!(next.starts_with(&format!(
-            "SELECT q.id FROM ({predicate} AND id > $1 OFFSET 0) q"
+            "SELECT q.id FROM ({predicate} AND id > $1 AND id <= $2 OFFSET 0) q"
         )));
-        assert!(next.ends_with("ORDER BY q.id LIMIT $2"));
+        assert!(next.ends_with("ORDER BY q.id LIMIT $3"));
+    }
+
+    #[test]
+    fn high_water_query_takes_the_top_id_of_the_same_set() {
+        let predicate = start_to_close_timeout_query();
+        let higher = heartbeat_timeout_query();
+        let sql = timeout_high_water_query(predicate, &[higher]);
+        assert!(sql.starts_with(&format!("SELECT q.id FROM ({predicate} OFFSET 0) q")));
+        assert!(sql.contains(&format!(
+            "AND NOT EXISTS (SELECT 1 FROM ({higher}) h WHERE h.id = q.id)"
+        )));
+        assert!(sql.ends_with("ORDER BY q.id DESC LIMIT 1"));
     }
 
     #[test]
@@ -6255,7 +6307,7 @@ mod tests {
         let higher = heartbeat_timeout_query();
         let sql = timeout_refill_query(start_to_close_timeout_query(), &[higher], true);
         assert!(sql.contains(&format!(
-            "AND NOT EXISTS (SELECT 1 FROM ({higher} AND id > $1) h WHERE h.id = q.id)"
+            "AND NOT EXISTS (SELECT 1 FROM ({higher} AND id > $1 AND id <= $2) h WHERE h.id = q.id)"
         )));
     }
 
