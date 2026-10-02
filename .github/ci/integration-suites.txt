@@ -111,6 +111,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          mixed_suspension_tests
 linux        autumn-harvest         integration                      -                          mutex_lease_reclaim_perf
 linux        autumn-harvest         integration                      -                          mutex_tests
+linux        autumn-harvest         integration                      -                          notify_post_commit_tests
 linux        autumn-harvest         integration                      -                          panic_containment_tests
 linux        autumn-harvest         integration                      -                          parent_close_cascade_unfinished_handlers_perf
 linux        autumn-harvest         integration                      -                          pause_tests

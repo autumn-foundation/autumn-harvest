@@ -807,6 +807,123 @@ mod tests {
         assert_eq!(original, deserialized);
     }
 
+    // ── Post-commit sender (issue #1796) ─────────────────────────────────
+
+    fn task_note(queue_name: &str, task_id: Uuid) -> Note {
+        Note::Task {
+            channel: queue_channel(queue_name),
+            task_id,
+        }
+    }
+
+    fn events_note(exec_id: Uuid, count: usize, last_event_type: &str) -> Note {
+        Note::Events {
+            exec_id,
+            count,
+            last_event_type: last_event_type.to_string(),
+        }
+    }
+
+    fn task_payload(task_id: Uuid) -> String {
+        serde_json::to_string(&NotifyPayload { task_id }).expect("serialize")
+    }
+
+    #[test]
+    fn one_task_on_a_channel_keeps_its_task_id() {
+        let id = Uuid::new_v4();
+        let sent = coalesce(vec![task_note("default", id)]);
+        assert_eq!(
+            sent,
+            vec![("harvest_queue_default".to_string(), task_payload(id))]
+        );
+    }
+
+    #[test]
+    fn several_tasks_on_a_channel_merge_into_one_nil_wake() {
+        let sent = coalesce(vec![
+            task_note("default", Uuid::new_v4()),
+            task_note("email", Uuid::new_v4()),
+            task_note("default", Uuid::new_v4()),
+        ]);
+        assert_eq!(sent.len(), 2);
+        assert_eq!(
+            sent[0],
+            (
+                "harvest_queue_default".to_string(),
+                task_payload(Uuid::nil())
+            )
+        );
+        assert_eq!(sent[1].0, "harvest_queue_email");
+        assert_ne!(sent[1].1, task_payload(Uuid::nil()));
+    }
+
+    #[test]
+    fn event_notes_merge_for_each_execution() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let sent = coalesce(vec![
+            events_note(a, 2, "ActivityScheduled"),
+            events_note(b, 1, "WorkflowStarted"),
+            events_note(a, 1, "WorkflowCompleted"),
+        ]);
+        let payloads: Vec<WorkflowEventNotifyPayload> = sent
+            .iter()
+            .map(|(channel, payload)| {
+                assert_eq!(channel, workflow_events_channel());
+                serde_json::from_str(payload).expect("payload parses")
+            })
+            .collect();
+        assert_eq!(
+            payloads,
+            vec![
+                WorkflowEventNotifyPayload {
+                    workflow_exec_id: a,
+                    event_count: 3,
+                    last_event_type: "WorkflowCompleted".to_string(),
+                },
+                WorkflowEventNotifyPayload {
+                    workflow_exec_id: b,
+                    event_count: 1,
+                    last_event_type: "WorkflowStarted".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_channel_name_postgres_rejects_is_not_valid() {
+        assert!(valid_channel("harvest_queue_default"));
+        assert!(valid_channel(&"c".repeat(63)));
+        assert!(!valid_channel(&"c".repeat(64)));
+        assert!(!valid_channel(""));
+    }
+
+    #[test]
+    fn coalesce_drops_a_channel_postgres_rejects() {
+        let long_queue = "q".repeat(60);
+        let sent = coalesce(vec![
+            task_note(&long_queue, Uuid::new_v4()),
+            task_note("default", Uuid::nil()),
+        ]);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, "harvest_queue_default");
+    }
+
+    #[test]
+    fn the_settle_delay_is_jittered_within_its_bounds() {
+        let delays: Vec<Duration> = (0..200).map(|_| settle_delay()).collect();
+        for delay in &delays {
+            assert!(
+                (SETTLE_DELAY_MIN..=SETTLE_DELAY_MAX).contains(delay),
+                "{delay:?}"
+            );
+        }
+        assert!(
+            delays.iter().any(|d| *d != delays[0]),
+            "the delay must vary between wakes"
+        );
+    }
+
     // ── TLS for listener connections (issue #1717) ───────────────────────
 
     fn transport_for(dsn: &str) -> ListenTransport {
