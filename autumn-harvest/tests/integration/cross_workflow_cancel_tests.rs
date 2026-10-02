@@ -179,7 +179,7 @@ fn default_start_params(
         exec_id,
         workflow_name,
         workflow_id,
-        input,
+        input: input.into(),
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
