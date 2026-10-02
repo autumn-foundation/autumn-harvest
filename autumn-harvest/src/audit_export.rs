@@ -1344,10 +1344,11 @@ async fn repair_and_build_unexported_index(
     Ok(())
 }
 
-/// A shard in one database. The URL separates databases that share a shard
-/// number inside one process.
+/// A shard of one audit table. The URL separates databases that share a shard
+/// number inside one process. The schema separates tenant tables in one
+/// database.
 #[cfg(feature = "db")]
-type BuildKey = (i32, String);
+type BuildKey = (i32, String, String);
 
 /// Earliest time each shard may try another background index build.
 #[cfg(feature = "db")]
@@ -1628,20 +1629,30 @@ async fn spawn_unexported_index_build_if_due(
 ) {
     let Some(dsn) = build_dsn else {
         if index_notice_wanted(conn, shard_id).await {
-            let (statement, _) = operator_ddl(conn).await;
+            let (statement, cleanup) = operator_ddl(conn).await;
             tracing::warn!(
                 shard = shard_id,
                 statement = %statement,
+                cleanup = %cleanup,
                 "[audit_export] no database URL for a dedicated connection, so the exporter \
                  cannot build the claim-scan index; export continues without it. Set \
                  WorkerConfig::with_notification_database_url or \
                  with_shard_notification_database_urls, or run the statement once as the \
-                 table owner"
+                 table owner. If the index exists but is invalid, run `cleanup` first"
             );
         }
         return;
     };
-    let key: BuildKey = (shard_id, dsn.to_owned());
+    // The schema is part of the key: tenant schemas can share a shard number
+    // and a build URL while they manage different indexes.
+    let schema = match audit_table_schema(conn).await {
+        Ok(schema) => schema,
+        Err(error) => {
+            tracing::warn!(shard = shard_id, %error, "[audit_export] could not resolve the schema of harvest_audit_log");
+            return;
+        }
+    };
+    let key: BuildKey = (shard_id, dsn.to_owned(), schema.clone());
     if !index_build_due(&key) {
         return;
     }
@@ -1657,14 +1668,6 @@ async fn spawn_unexported_index_build_if_due(
             return;
         }
     }
-    let schema = match audit_table_schema(conn).await {
-        Ok(schema) => schema,
-        Err(error) => {
-            index_build_finished(&key, BuildEnd::Retry);
-            tracing::warn!(shard = shard_id, %error, "[audit_export] could not resolve the schema of harvest_audit_log");
-            return;
-        }
-    };
     let dsn = dsn.to_owned();
     let cancel = cancel.clone();
     tokio::spawn(async move {
@@ -4874,7 +4877,11 @@ mod tests {
     #[cfg(feature = "db")]
     #[test]
     fn the_index_build_gate_opens_only_on_a_ready_index() {
-        let key: BuildKey = (9_001, "postgres://gate-test/lock-busy".to_owned());
+        let key: BuildKey = (
+            9_001,
+            "postgres://gate-test/lock-busy".to_owned(),
+            "public".to_owned(),
+        );
         assert!(index_build_due(&key), "a fresh key is due");
         assert!(!index_build_due(&key), "an in-flight build is not due");
 
@@ -4980,7 +4987,11 @@ mod tests {
     #[cfg(feature = "db")]
     #[test]
     fn an_in_flight_build_keeps_the_gate_closed_past_the_retry_wait() {
-        let key: BuildKey = (9_003, "postgres://gate-test/in-flight".to_owned());
+        let key: BuildKey = (
+            9_003,
+            "postgres://gate-test/in-flight".to_owned(),
+            "public".to_owned(),
+        );
         assert!(index_build_due(&key));
         let not_before = INDEX_BUILD_GATE
             .lock()
@@ -4994,6 +5005,22 @@ mod tests {
             "an in-flight build must outlast every retry wait: {remaining:?}"
         );
         index_build_finished(&key, BuildEnd::Ready);
+    }
+
+    /// Issue #1667: two tenant schemas can share a shard number and a build
+    /// URL. A refused build in one must not close the gate of the other.
+    #[cfg(feature = "db")]
+    #[test]
+    fn the_build_gate_is_per_schema() {
+        let dsn = "postgres://gate-test/schemas".to_owned();
+        let first: BuildKey = (9_004, dsn.clone(), "tenant_a".to_owned());
+        let second: BuildKey = (9_004, dsn, "tenant_b".to_owned());
+        assert!(index_build_due(&first));
+        index_build_finished(&first, BuildEnd::Refused);
+        assert!(!index_build_due(&first), "the refused schema waits");
+        assert!(index_build_due(&second), "the other schema is not blocked");
+        index_build_finished(&first, BuildEnd::Ready);
+        index_build_finished(&second, BuildEnd::Ready);
     }
 
     /// Issue #1667: a privilege failure is the one error a retry cannot fix.
