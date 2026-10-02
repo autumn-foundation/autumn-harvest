@@ -5968,3 +5968,45 @@ async fn a_build_in_one_tenant_schema_does_not_block_another() {
     .expect("count");
     assert_eq!(rows.into_iter().next().map(|r| r.n), Some(1));
 }
+
+/// With `search_path = tenant, public`, the migration must act on the schema
+/// that holds the session's audit table. A valid index in `public` is another
+/// table's index, and its cursor table is not the one the migration checked.
+#[tokio::test]
+async fn the_lazy_migration_leaves_another_schemas_index_alone() {
+    let (mut conn, _url, _c) = make_conn_any().await;
+    conn.batch_execute(&format!(
+        "CREATE SCHEMA tenant; SET search_path = tenant; {} RESET search_path;",
+        autumn_harvest::full_migrations_sql()
+    ))
+    .await
+    .expect("tenant schema");
+    // `public` has an index that its own export cursor justifies.
+    create_unexported_idx(&mut conn).await;
+    conn.batch_execute("SET search_path = tenant, public")
+        .await
+        .expect("search path");
+    conn.batch_execute(LAZY_IDX_MIGRATION)
+        .await
+        .expect("migration");
+    conn.batch_execute("RESET search_path")
+        .await
+        .expect("reset");
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let rows: Vec<Count> = diesel::sql_query(
+        "SELECT count(*) AS n FROM pg_indexes \
+         WHERE schemaname = 'public' AND indexname = 'harvest_audit_log_unexported_idx'",
+    )
+    .load(&mut conn)
+    .await
+    .expect("count");
+    assert_eq!(
+        rows.into_iter().next().map(|r| r.n),
+        Some(1),
+        "the migration must not drop the index of another schema"
+    );
+}

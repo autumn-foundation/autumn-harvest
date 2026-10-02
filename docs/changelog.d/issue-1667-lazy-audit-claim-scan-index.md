@@ -42,3 +42,5 @@ An unconfigured deployment no longer pays for the audit export index.
   in the notification URL selects verified TLS. Any other mode stays plaintext.
   A build without the `tls` feature refuses `sslmode=require` with a config
   error.
+- The migration drops the index from the schema that holds the session's
+  `harvest_audit_log`, never from another schema on the `search_path`.

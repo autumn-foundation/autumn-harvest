@@ -18,11 +18,23 @@
 -- It is set with `set_config(..., true)` inside the block, because the block
 -- also runs as a standalone statement in the test fixture, where a bare
 -- `SET LOCAL` would have no transaction to bind to.
+--
+-- The drop names the schema that holds this session's `harvest_audit_log`. A
+-- `search_path` such as `tenant, public` could otherwise reach an index of the
+-- same name in another schema. That index belongs to another table, and its
+-- own cursor table was not the one checked here.
 DO $$
+DECLARE
+    audit_schema TEXT;
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM harvest_audit_export_cursor) THEN
+    SELECT n.nspname INTO audit_schema
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE c.oid = to_regclass('harvest_audit_log');
+    IF audit_schema IS NOT NULL
+       AND NOT EXISTS (SELECT 1 FROM harvest_audit_export_cursor) THEN
         PERFORM set_config('lock_timeout', '5s', true);
-        DROP INDEX IF EXISTS harvest_audit_log_unexported_idx;
+        EXECUTE format('DROP INDEX IF EXISTS %I.harvest_audit_log_unexported_idx', audit_schema);
     END IF;
 END
 $$;
