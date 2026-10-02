@@ -158,12 +158,11 @@ fn mixed_suspension_workflow<'a>(
         let signal_fut =
             ctx.signal_external_workflow(target, "my_signal", serde_json::json!({"data": "hello"}));
 
-        // `biased` polls in declaration order, so a replay always re-emits
-        // the parked branch's command first. `tokio::select!` picks a random
-        // order otherwise. A replay that polls the inline-resolved branch
-        // first returns before it consumes the recorded command, and the
-        // drift guard (#1791) blocks the run.
         tokio::select! {
+            // DET011/HVG010: poll in source order. The durable branch must
+            // consume its recorded events before the external branch resolves
+            // from history. An unbiased select! polls at random, and a replay
+            // that returns early is ND-blocked with a 5 s to 20 s backoff.
             biased;
             res = timer_fut => {
                 res.map_err(|e| e.to_string())?;
@@ -207,12 +206,11 @@ fn mixed_suspension_cancel_workflow<'a>(
         let timer_fut = ctx.timer("long_timer", 3600);
         let cancel_fut = ctx.request_cancel_external_workflow(target);
 
-        // `biased` polls in declaration order, so a replay always re-emits
-        // the parked branch's command first. `tokio::select!` picks a random
-        // order otherwise. A replay that polls the inline-resolved branch
-        // first returns before it consumes the recorded command, and the
-        // drift guard (#1791) blocks the run.
         tokio::select! {
+            // DET011/HVG010: poll in source order. The durable branch must
+            // consume its recorded events before the external branch resolves
+            // from history. An unbiased select! polls at random, and a replay
+            // that returns early is ND-blocked with a 5 s to 20 s backoff.
             biased;
             res = timer_fut => {
                 res.map_err(|e| e.to_string())?;
@@ -284,12 +282,11 @@ fn mixed_signal_wait_external_signal_workflow<'a>(
         let signal_fut =
             ctx.signal_external_workflow(target, "my_signal", serde_json::json!({"data": "hello"}));
 
-        // `biased` polls in declaration order, so a replay always re-emits
-        // the parked branch's command first. `tokio::select!` picks a random
-        // order otherwise. A replay that polls the inline-resolved branch
-        // first returns before it consumes the recorded command, and the
-        // drift guard (#1791) blocks the run.
         tokio::select! {
+            // DET011/HVG010: poll in source order. The durable branch must
+            // consume its recorded events before the external branch resolves
+            // from history. An unbiased select! polls at random, and a replay
+            // that returns early is ND-blocked with a 5 s to 20 s backoff.
             biased;
             res = wait_fut => {
                 res.map_err(|e| e.to_string())?;
@@ -318,12 +315,11 @@ fn mixed_signal_wait_external_cancel_workflow<'a>(
         let wait_fut = ctx.receive_signal::<serde_json::Value>("parent_never_arrives");
         let cancel_fut = ctx.request_cancel_external_workflow(target);
 
-        // `biased` polls in declaration order, so a replay always re-emits
-        // the parked branch's command first. `tokio::select!` picks a random
-        // order otherwise. A replay that polls the inline-resolved branch
-        // first returns before it consumes the recorded command, and the
-        // drift guard (#1791) blocks the run.
         tokio::select! {
+            // DET011/HVG010: poll in source order. The durable branch must
+            // consume its recorded events before the external branch resolves
+            // from history. An unbiased select! polls at random, and a replay
+            // that returns early is ND-blocked with a 5 s to 20 s backoff.
             biased;
             res = wait_fut => {
                 res.map_err(|e| e.to_string())?;
@@ -373,12 +369,11 @@ fn mixed_activity_external_signal_workflow<'a>(
         let signal_fut =
             ctx.signal_external_workflow(target, "my_signal", serde_json::json!({"data": "hello"}));
 
-        // `biased` polls in declaration order, so a replay always re-emits
-        // the parked branch's command first. `tokio::select!` picks a random
-        // order otherwise. A replay that polls the inline-resolved branch
-        // first returns before it consumes the recorded command, and the
-        // drift guard (#1791) blocks the run.
         tokio::select! {
+            // DET011/HVG010: poll in source order. The durable branch must
+            // consume its recorded events before the external branch resolves
+            // from history. An unbiased select! polls at random, and a replay
+            // that returns early is ND-blocked with a 5 s to 20 s backoff.
             biased;
             res = activity_fut => {
                 res.map_err(|e| e.to_string())?;
@@ -430,12 +425,11 @@ fn mixed_child_workflow_external_signal_workflow<'a>(
         let signal_fut =
             ctx.signal_external_workflow(target, "my_signal", serde_json::json!({"data": "hello"}));
 
-        // `biased` polls in declaration order, so a replay always re-emits
-        // the parked branch's command first. `tokio::select!` picks a random
-        // order otherwise. A replay that polls the inline-resolved branch
-        // first returns before it consumes the recorded command, and the
-        // drift guard (#1791) blocks the run.
         tokio::select! {
+            // DET011/HVG010: poll in source order. The durable branch must
+            // consume its recorded events before the external branch resolves
+            // from history. An unbiased select! polls at random, and a replay
+            // that returns early is ND-blocked with a 5 s to 20 s backoff.
             biased;
             res = child_fut => {
                 res.map_err(|e| e.to_string())?;
