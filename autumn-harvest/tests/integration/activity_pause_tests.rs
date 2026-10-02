@@ -1168,7 +1168,7 @@ async fn scheduled_at_of(conn: &mut AsyncPgConnection, id: Uuid) -> chrono::Date
 /// wiring is a three-statement arrangement verified by reading, exactly as the
 /// arrangement it replaces was. A test that falsified the wiring would have to
 /// land a concurrent commit *inside* the notification pass, and that window is
-/// not blockable: `pg_notify` takes no lock, and the notify `SELECT` blocks only
+/// not blockable: the notify stage takes no lock, and the notify `SELECT` blocks only
 /// on `ACCESS EXCLUSIVE`, which the resume's own transaction already holds
 /// conflicting rights against. The available alternative — flooding inserts and
 /// hoping one lands in the window — is probabilistic in the *passing*

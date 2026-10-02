@@ -61,6 +61,10 @@ use crate::types::{
     TimerId, WorkerId,
 };
 
+/// How long a stopping worker waits for each notify sender to drain
+/// (issue #1796).
+const NOTIFY_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Type alias for the deadpool-managed async Diesel connection pool.
 pub type DbPool = deadpool::managed::Pool<
     diesel_async::pooled_connection::AsyncDieselConnectionManager<diesel_async::AsyncPgConnection>,
@@ -24781,6 +24785,8 @@ pub fn spawn_dispatch_metrics_sampler(
         if !telemetry.metrics.is_enabled() {
             return;
         }
+        #[cfg(feature = "db")]
+        let mut usage_seen = false;
         loop {
             tokio::select! {
                 () = cancel.cancelled() => break,
@@ -24794,8 +24800,15 @@ pub fn spawn_dispatch_metrics_sampler(
                 telemetry
                     .metrics
                     .record_notify_send_failures(crate::notify::send_failures());
-                if let Some(ratio) = crate::notify::queue_usage() {
-                    telemetry.metrics.record_notify_queue_usage(ratio);
+                // After the last live sender stops, report 0, so the gauge
+                // does not keep a stale high value.
+                match crate::notify::queue_usage() {
+                    Some(ratio) => {
+                        usage_seen = true;
+                        telemetry.metrics.record_notify_queue_usage(ratio);
+                    }
+                    None if usage_seen => telemetry.metrics.record_notify_queue_usage(0.0),
+                    None => {}
                 }
             }
             if cancel.is_cancelled() {
@@ -27343,6 +27356,7 @@ impl Worker {
         // loop, then goes to that channel.
         let bound = self.bound_channel();
         crate::dispatch::with_bound_channel(bound, Box::pin(self.run_bound(pool))).await;
+        self.flush_notify_pools(pool).await;
     }
 
     /// The body of [`Worker::run`], inside the dispatch binding.
@@ -28181,17 +28195,35 @@ impl Worker {
             Box::pin(self.run_with_listener_bound(pool, listener)),
         )
         .await;
+        self.flush_notify_pools(pool).await;
     }
 
     /// Start the post-commit notify sender for each pool this worker writes
     /// to (issue #1796).
     fn register_notify_pools(&self, pool: &DbPool) {
-        crate::notify::register_pool(pool);
-        if let Some(sharded) = self.config.sharded_pool.as_ref() {
-            for (_, shard_pool) in sharded.iter_shards() {
-                crate::notify::register_pool(shard_pool);
-            }
+        for pool in self.notify_pools(pool) {
+            crate::notify::register_pool(pool);
         }
+    }
+
+    /// Send the wakes of the last writes before the runtime can stop the
+    /// notify senders (issue #1796).
+    async fn flush_notify_pools(&self, pool: &DbPool) {
+        for pool in self.notify_pools(pool) {
+            crate::notify::register_pool(pool)
+                .flush(NOTIFY_FLUSH_TIMEOUT)
+                .await;
+        }
+    }
+
+    /// The run pool and every shard pool of this worker.
+    fn notify_pools<'a>(&'a self, pool: &'a DbPool) -> impl Iterator<Item = &'a DbPool> {
+        std::iter::once(pool).chain(
+            self.config
+                .sharded_pool
+                .iter()
+                .flat_map(|sharded| sharded.iter_shards().map(|(_, pool)| pool)),
+        )
     }
 
     /// The body of [`Worker::run_with_listener`], inside the dispatch binding.

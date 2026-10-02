@@ -1462,7 +1462,7 @@
       "default_threshold": "Ticket when the counter keeps climbing for 15 minutes past a single burst window.",
       "severity": "ticket",
       "owner_persona": "service on-call",
-      "description": "The post-commit notify sender on this process is losing notifications: a send error, a full sender queue, or a channel name Postgres rejects. A lost notification costs latency only -- the row is committed and workers find it on their next poll -- so this is a health signal, not a durability one.",
+      "description": "The post-commit notify sender on this process is losing notifications. Causes are a send error, a full sender queue, or a sender that stops before it drains. A lost notification costs latency only. The row is committed, and workers find it on their next poll. This is a health signal, not a durability signal.",
       "first_action": "Search this process's logs for 'harvest: notifications lost; workers find the rows on their next poll' and read the cause field.",
       "dependencies": [
         {
@@ -1473,7 +1473,7 @@
       ],
       "prometheus": {
         "mode": "native-metric",
-        "notes": "Unlabeled gauge, one series per process. The same sustained-growth shape as harvest_dispatch_dropped_hints: the 15m clause requires growth over the window, the 5m clause requires growth in the most recent slice, and `for: 15m` keeps one burst (a brief database blip) from opening a ticket.",
+        "notes": "Unlabeled gauge, one series per process. The rule uses the same shape as harvest_dispatch_dropped_hints. The 15m clause requires growth over the window. The 5m clause requires recent growth. `for: 15m` stops one short burst from opening a ticket.",
         "expressions": [
           {
             "kind": "promql",
@@ -1506,7 +1506,7 @@
       ],
       "prometheus": {
         "mode": "native-metric",
-        "notes": "Unlabeled gauge, one series per process, from 0 to 1. The queue belongs to the database, so every process on one database reports about the same value; max() collapses them into one alert. The series is absent until a notify sender has read the queue usage, so an absent series is not an alert condition.",
+        "notes": "Unlabeled gauge, one series per process, from 0 to 1. The queue belongs to the database, so every process on one database reports about the same value. max() collapses them into one alert. The series is absent until a notify sender reads the queue usage, and an absent series is not an alert condition.",
         "expressions": [
           {
             "kind": "promql",

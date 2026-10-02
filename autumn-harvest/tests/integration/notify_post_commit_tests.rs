@@ -202,25 +202,42 @@ async fn enqueue_in_a_transaction_commits_when_pg_notify_fails() {
     assert_eq!(task_count(&url, task_id).await, 1);
 }
 
-#[tokio::test]
-async fn wake_in_a_transaction_commits_when_pg_notify_fails() {
-    let (url, _container) = setup().await;
-    let mut setup_conn = AsyncPgConnection::establish(&url).await.expect("connect");
-    let exec_id = insert_execution(&mut setup_conn).await;
+/// Enqueue, claim and park a workflow task, so a wake has a row to re-pend.
+async fn park_task(url: &str) -> (ExecutionId, Uuid) {
+    let mut conn = AsyncPgConnection::establish(url).await.expect("connect");
+    let exec_id = insert_execution(&mut conn).await;
     let mut params = enqueue_params("default", exec_id);
     params.scheduled_at = chrono::Utc::now() - chrono::Duration::seconds(1);
-    let task_id = queue::enqueue(&mut setup_conn, &params)
-        .await
-        .expect("enqueue");
+    let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
     let queues = vec!["default".to_string()];
-    let claimed = queue::claim_task(&mut setup_conn, &queues, "notify-test", "", None, &[], &[])
+    let claimed = queue::claim_task(&mut conn, &queues, "notify-test", "", None, &[], &[])
         .await
         .expect("claim")
         .expect("a claimable task");
     assert_eq!(claimed.id, task_id);
-    queue::park_workflow_task(&mut setup_conn, task_id, None)
+    queue::park_workflow_task(&mut conn, task_id, None)
         .await
         .expect("park");
+    (exec_id, task_id)
+}
+
+#[tokio::test]
+async fn enqueue_outside_a_transaction_succeeds_when_pg_notify_fails() {
+    let (url, _container) = setup().await;
+    let mut conn = shadowed_conn(&url).await;
+    let exec_id = insert_execution(&mut conn).await;
+
+    let task_id = queue::enqueue(&mut conn, &enqueue_params("default", exec_id))
+        .await
+        .expect("the enqueue must succeed");
+
+    assert_eq!(task_count(&url, task_id).await, 1);
+}
+
+#[tokio::test]
+async fn wake_in_a_transaction_commits_when_pg_notify_fails() {
+    let (url, _container) = setup().await;
+    let (exec_id, task_id) = park_task(&url).await;
 
     let mut conn = shadowed_conn(&url).await;
     let result = Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
@@ -230,6 +247,47 @@ async fn wake_in_a_transaction_commits_when_pg_notify_fails() {
 
     result.expect("the wake must commit");
     assert_eq!(pending_count(&url, task_id).await, 1);
+}
+
+#[tokio::test]
+async fn wake_outside_a_transaction_succeeds_when_pg_notify_fails() {
+    let (url, _container) = setup().await;
+    let (exec_id, task_id) = park_task(&url).await;
+
+    let mut conn = shadowed_conn(&url).await;
+    queue::wake_workflow_task(&mut conn, exec_id)
+        .await
+        .expect("the wake must succeed");
+
+    assert_eq!(pending_count(&url, task_id).await, 1);
+}
+
+#[tokio::test]
+async fn a_long_queue_name_commits_and_wakes_its_listener() {
+    let (url, _container) = setup().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let exec_id = insert_execution(&mut conn).await;
+    // `harvest_queue_` plus 60 bytes is longer than a Postgres identifier.
+    let queue_name = "q".repeat(60);
+    let mut listener = QueueListener::connect(&url, std::slice::from_ref(&queue_name))
+        .await
+        .expect("listener");
+    let params = enqueue_params(&queue_name, exec_id);
+
+    let result =
+        Box::pin(conn.transaction::<Uuid, HarvestError, _>(async |conn| {
+            queue::enqueue(conn, &params).await
+        }))
+        .await;
+
+    let task_id = result.expect("the enqueue must commit");
+    assert_eq!(task_count(&url, task_id).await, 1);
+    let wake = listener
+        .wait_for_notification(Duration::from_secs(5))
+        .await
+        .expect("payload parses")
+        .expect("the listener of the long queue must wake");
+    assert_eq!(wake.task_id, task_id);
 }
 
 // ── Fallback delivery without a registered pool ────────────────────────
@@ -264,11 +322,105 @@ async fn an_unregistered_database_still_gets_the_wake_after_commit() {
 /// How long a test waits for a registered sender to become ready.
 const READY: Duration = Duration::from_secs(10);
 
-/// The tolerance on the wake latency after commit.
+/// How long a test waits for a wake that must arrive.
+const WAIT: Duration = Duration::from_secs(5);
+
+/// The extra wake latency the sender may add over an in-transaction NOTIFY.
 ///
-/// An in-transaction NOTIFY reaches the listener at commit. The sender adds
-/// one tick. The bound is wide, so a loaded CI host does not flake.
-const WAKE_TOLERANCE: Duration = Duration::from_secs(2);
+/// The sender reads an open transaction again at most 25 ms later. The rest
+/// of the bound absorbs a loaded CI host.
+const WAKE_TOLERANCE: Duration = Duration::from_millis(250);
+
+/// Samples per mode in the latency test.
+const LATENCY_SAMPLES: usize = 5;
+
+/// How long each latency sample holds its transaction open.
+const HOLD: Duration = Duration::from_millis(100);
+
+fn median(mut samples: Vec<Duration>) -> Duration {
+    samples.sort();
+    samples[samples.len() / 2]
+}
+
+/// Wait for the wake of `exec_id` and return when it arrived.
+async fn wake_of(listener: &mut WorkflowEventListener, exec_id: ExecutionId) -> Instant {
+    loop {
+        match listener
+            .wait_for_notification_timeout(WAIT)
+            .await
+            .expect("payload parses")
+        {
+            WorkflowEventWaitOutcome::Notification(p)
+                if p.workflow_exec_id == exec_id.as_uuid() =>
+            {
+                return Instant::now();
+            }
+            WorkflowEventWaitOutcome::Notification(_) => {}
+            other => panic!("no wake for {exec_id}: {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn wake_latency_stays_within_tolerance_of_an_in_transaction_notify() {
+    let (url, _container) = setup().await;
+    let pool = build_pool(&url);
+    assert!(
+        autumn_harvest::notify::register_pool(&pool)
+            .wait_ready(READY)
+            .await
+    );
+    let mut conn = pool.get().await.expect("pool connection");
+    let mut listener = WorkflowEventListener::connect(&url)
+        .await
+        .expect("listener");
+
+    // Before issue #1796: `pg_notify` inside the write transaction.
+    let mut before = Vec::new();
+    for _ in 0..LATENCY_SAMPLES {
+        let exec_id = insert_execution(&mut conn).await;
+        let payload = serde_json::to_string(&autumn_harvest::notify::WorkflowEventNotifyPayload {
+            workflow_exec_id: exec_id.as_uuid(),
+            event_count: 1,
+            last_event_type: "WorkflowStarted".to_string(),
+        })
+        .expect("payload");
+        Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
+            diesel::sql_query("SELECT pg_notify('harvest_events', $1)")
+                .bind::<diesel::sql_types::Text, _>(&payload)
+                .execute(conn)
+                .await
+                .map_err(autumn_harvest::error::database_error)?;
+            tokio::time::sleep(HOLD).await;
+            Ok(())
+        }))
+        .await
+        .expect("in-transaction notify");
+        let committed_at = Instant::now();
+        before.push(wake_of(&mut listener, exec_id).await - committed_at);
+    }
+
+    // After issue #1796: the sender sends after commit.
+    let mut after = Vec::new();
+    for _ in 0..LATENCY_SAMPLES {
+        let exec_id = insert_execution(&mut conn).await;
+        Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
+            store::append_events(conn, exec_id, &[started()], 0).await?;
+            tokio::time::sleep(HOLD).await;
+            Ok(())
+        }))
+        .await
+        .expect("append");
+        let committed_at = Instant::now();
+        after.push(wake_of(&mut listener, exec_id).await - committed_at);
+    }
+
+    let (before, after) = (median(before), median(after));
+    assert!(
+        after <= before + WAKE_TOLERANCE,
+        "median wake latency {after:?} after the change, {before:?} before"
+    );
+}
 
 #[tokio::test]
 async fn a_registered_pool_wakes_after_commit_and_not_before() {
@@ -301,18 +453,8 @@ async fn a_registered_pool_wakes_after_commit_and_not_before() {
     }))
     .await
     .expect("append");
-    let committed_at = Instant::now();
 
-    let outcome = listener
-        .wait_for_notification_timeout(WAKE_TOLERANCE)
-        .await
-        .expect("payload parses");
-    let latency = committed_at.elapsed();
-    assert!(
-        matches!(&outcome, WorkflowEventWaitOutcome::Notification(p) if p.workflow_exec_id == exec_id.as_uuid()),
-        "{outcome:?}"
-    );
-    assert!(latency < WAKE_TOLERANCE, "wake latency {latency:?}");
+    wake_of(&mut listener, exec_id).await;
 }
 
 #[tokio::test]
@@ -337,7 +479,7 @@ async fn a_registered_pool_never_notifies_on_the_write_connection() {
     .expect("append");
 
     let outcome = listener
-        .wait_for_notification_timeout(WAKE_TOLERANCE)
+        .wait_for_notification_timeout(WAIT)
         .await
         .expect("payload parses");
     assert!(
@@ -376,7 +518,7 @@ async fn a_rolled_back_write_sends_no_wake() {
 }
 
 #[tokio::test]
-async fn one_tick_sends_one_wake_per_queue() {
+async fn three_enqueues_in_one_commit_send_one_merged_wake() {
     let (url, _container) = setup().await;
     let pool = build_pool(&url);
     assert!(
@@ -396,9 +538,8 @@ async fn one_tick_sends_one_wake_per_queue() {
         for _ in 0..3 {
             queue::enqueue(conn, &params).await?;
         }
-        // Hold the commit, so the sender holds all three notes when it sees
-        // the commit. A note whose write committed before the sender read it
-        // goes in its own tick.
+        // Hold the commit until the sender holds all three notes. A note that
+        // is still pending at the gate read goes in a later tick.
         tokio::time::sleep(Duration::from_millis(300)).await;
         Ok(())
     }))
@@ -406,7 +547,7 @@ async fn one_tick_sends_one_wake_per_queue() {
     .expect("enqueue");
 
     let first = listener
-        .wait_for_notification(WAKE_TOLERANCE)
+        .wait_for_notification(WAIT)
         .await
         .expect("payload parses")
         .expect("one wake");
@@ -424,14 +565,13 @@ async fn a_failed_send_is_counted_and_the_append_commits() {
     // Every connection of this pool reaches the failing `pg_notify`.
     let failing_url = format!("{url}?options=-c%20search_path%3Dnotify_fail%2Cpg_catalog%2Cpublic");
     let pool = build_pool(&failing_url);
-    assert!(
-        autumn_harvest::notify::register_pool(&pool)
-            .wait_ready(READY)
-            .await
-    );
-    let before = autumn_harvest::notify::send_failures();
+    let sink = autumn_harvest::notify::register_pool(&pool);
+    assert!(sink.wait_ready(READY).await);
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     let exec_id = insert_execution(&mut conn).await;
+    let mut listener = WorkflowEventListener::connect(&url)
+        .await
+        .expect("listener");
 
     let appended = store::append_events(&mut conn, exec_id, &[started()], 0)
         .await
@@ -439,12 +579,20 @@ async fn a_failed_send_is_counted_and_the_append_commits() {
     assert_eq!(appended, 1);
 
     let deadline = Instant::now() + READY;
-    while autumn_harvest::notify::send_failures() == before && Instant::now() < deadline {
+    while sink.send_failures() == 0 && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(
-        autumn_harvest::notify::send_failures() > before,
-        "a failed send must be counted"
+        sink.send_failures() > 0,
+        "the sender must count its failed send"
+    );
+    assert_eq!(
+        listener
+            .wait_for_notification_timeout(Duration::from_millis(500))
+            .await
+            .expect("payload parses"),
+        WorkflowEventWaitOutcome::TimedOut,
+        "the failing sender, not the write connection, owned the wake"
     );
     assert_eq!(event_count(&url, exec_id).await, 1);
 }
@@ -453,11 +601,91 @@ async fn a_failed_send_is_counted_and_the_append_commits() {
 async fn a_sender_samples_the_notification_queue_usage() {
     let (url, _container) = setup().await;
     let pool = build_pool(&url);
+    let sink = autumn_harvest::notify::register_pool(&pool);
+    assert!(sink.wait_ready(READY).await);
+    let usage = sink.queue_usage().expect("a ready sender reads the usage");
+    assert!((0.0..=1.0).contains(&usage), "usage {usage}");
+}
+
+#[tokio::test]
+async fn a_handle_client_registers_its_pool() {
+    let (url, _container) = setup().await;
+    let pool = build_pool(&url);
+    let _client = autumn_harvest::WorkflowHandleClient::single(pool.clone(), url.clone());
     assert!(
         autumn_harvest::notify::register_pool(&pool)
             .wait_ready(READY)
-            .await
+            .await,
+        "the client must have started the sender"
     );
-    let usage = autumn_harvest::notify::queue_usage().expect("a ready sender reads the usage");
-    assert!((0.0..=1.0).contains(&usage), "usage {usage}");
+    let mut conn = shadowed_conn(&url).await;
+    let exec_id = insert_execution(&mut conn).await;
+    let mut listener = WorkflowEventListener::connect(&url)
+        .await
+        .expect("listener");
+
+    Box::pin(conn.transaction::<usize, HarvestError, _>(async |conn| {
+        store::append_events(conn, exec_id, &[started()], 0).await
+    }))
+    .await
+    .expect("append");
+
+    wake_of(&mut listener, exec_id).await;
+}
+
+#[tokio::test]
+async fn a_pool_registered_outside_a_runtime_starts_its_sender_later() {
+    let (url, _container) = setup().await;
+    let pool = build_pool(&url);
+    let sink = {
+        let pool = pool.clone();
+        std::thread::spawn(move || autumn_harvest::notify::register_pool(&pool))
+            .join()
+            .expect("register outside a runtime")
+    };
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let mut shadowed = shadowed_conn(&url).await;
+    let mut listener = WorkflowEventListener::connect(&url)
+        .await
+        .expect("listener");
+
+    // The first note staged in a runtime starts the sender.
+    let exec_id = insert_execution(&mut conn).await;
+    store::append_events(&mut conn, exec_id, &[started()], 0)
+        .await
+        .expect("append");
+    assert!(sink.wait_ready(READY).await, "the sender must start");
+
+    // A parallel test can start the sender on its own runtime, which ends
+    // with that test. The next note then starts the sender again here.
+    for attempt in 1..=3 {
+        let exec_id = insert_execution(&mut shadowed).await;
+        Box::pin(
+            shadowed.transaction::<usize, HarvestError, _>(async |conn| {
+                store::append_events(conn, exec_id, &[started()], 0).await
+            }),
+        )
+        .await
+        .expect("append");
+        let woke = loop {
+            match listener
+                .wait_for_notification_timeout(Duration::from_secs(2))
+                .await
+                .expect("payload parses")
+            {
+                WorkflowEventWaitOutcome::Notification(p)
+                    if p.workflow_exec_id == exec_id.as_uuid() =>
+                {
+                    break true;
+                }
+                WorkflowEventWaitOutcome::Notification(_) => {}
+                _ => break false,
+            }
+        };
+        if woke {
+            return;
+        }
+        assert!(sink.wait_ready(READY).await, "attempt {attempt}");
+    }
+    panic!("the deferred sender never delivered a wake");
 }

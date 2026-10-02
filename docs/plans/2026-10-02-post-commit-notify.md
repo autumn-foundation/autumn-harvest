@@ -12,15 +12,16 @@ also fails the append, because the error propagates.
 - `pg_notify` only records the notification. Postgres queues it in
   `PreCommit_Notify`, under a database-wide lock, so a full queue fails the
   `COMMIT`.
-- A notify-only transaction has no transaction id. Its commit writes no WAL
-  record, so it holds the lock for a very short time.
+- A notify-only transaction writes no data. Its commit does not wait for a
+  WAL flush, so it holds the lock for a very short time.
 - `store.rs` calls `notify_workflow_events_appended` in four append paths.
   `queue.rs`, `queue_pause.rs` and `activity_pause.rs` call
   `notify_task_enqueued` or `notify_tasks_enqueued` in about ten paths.
 - Polling is the correctness floor. A lost wake costs latency, never work.
 - The worker sleeps a fixed 50 ms after every wake, in two poll loops.
 - CI runs Postgres 16, and some suites run Postgres 11.
-  `txid_current_if_assigned()` and `txid_status()` exist from Postgres 10.
+  `txid_current()`, `txid_status()` and `txid_current_snapshot()` exist from
+  Postgres 10.
 
 ## Brainstorm
 
@@ -47,7 +48,7 @@ Option 6 fails because diesel emits `CommitTransaction` before `COMMIT` runs.
 | Send to the wrong database. | Match a database fingerprint before staging. Else use the fallback. |
 | Grow memory without limit while the database is down. | Bound the queue. Drop and count the overflow. |
 | Make the write path wait for the sender. | Push into a mutex-guarded queue. Never await the sender. |
-| Force a transaction id on a read-only transaction. | Use `txid_current_if_assigned()`. |
+| Stage before the first write, with no transaction id yet. | Read `txid_current()` inside a transaction, which assigns an id. Outside one, read no id. |
 | Keep an entry for a transaction that never ends. | Drop it after a maximum wait. |
 | Fail one batch because one channel name is too long. | Filter invalid channels before the send. Count them. |
 | Lose wakes with no signal. | Count send failures. Sample `pg_notification_queue_usage()`. |
@@ -77,9 +78,9 @@ returns `Ok(())`.
 
 1. **Register.** `notify::register_pool(&pool)` starts one sender for each
    pool. `Worker::run`, `Worker::run_with_listener` and
-   `WorkflowHandleClient::new` call it.
+   `WorkflowHandleClient::new` and `HarvestRunner::start` call it.
 2. **Stage.** One statement on the write connection reads
-   `txid_current_if_assigned()` and a fingerprint of the database. The
+   `txid_current()` and a fingerprint of the database. The
    fingerprint is `current_database()` and `pg_postmaster_start_time()`.
    A live sender with the same fingerprint gets the note.
 3. **Send.** The sender reads `txid_status` for each staged id on its own
@@ -104,7 +105,29 @@ deliver-on-commit behavior is part of its contract (issue #791).
 ## Limits
 
 The fallback still sends inside the transaction. A full queue can still fail
-that commit. Only a write to a database that no runtime registered uses it.
+that commit. These writes use it:
+
+- a write to a database that no healthy sender serves,
+- a write before the first read of a new sender,
+- a write after the pool of its sender drops.
+
+## Review fixes
+
+Four review agents read the change: concurrency, Postgres semantics,
+integration, and tests with docs. Their main findings and the fixes:
+
+- A failed stage statement aborts the write transaction, and Postgres turns
+  the later `COMMIT` into a silent rollback. The call now returns the error.
+- A note staged on another server cannot be gated. Each note keeps its
+  fingerprint, and a guard stops `txid_status` from raising an error.
+- A sender loses held notes when its runtime stops. A drop guard counts them,
+  and `NotifySink::flush` drains a sender before shutdown.
+- An unhealthy sender could keep winning the routing. Routing now needs a
+  recent successful read, and the sender times out on its pool.
+- An API-only `HarvestRunner` and a client built outside a runtime did not
+  register. Both now do.
+- `LISTEN` cuts a long channel name, but `pg_notify` rejects it. The channel
+  is now cut on both sides.
 
 ## Tests
 
@@ -112,9 +135,12 @@ that commit. Only a write to a database that no runtime registered uses it.
   outside a transaction. Each must still commit.
 - A registered sender does not use the write connection. A shadowed
   `pg_notify` on the write session does not stop the wake.
-- No wake arrives before commit. The wake arrives within tolerance after
-  commit. A rolled-back write sends nothing.
+- No wake arrives before commit. The median wake latency stays within 250 ms
+  of an in-transaction NOTIFY. A rolled-back write sends nothing.
 - A failing sender counts the failure, and the append commits.
-- Unit tests cover coalescing, channel validation and the settle delay.
+- A long queue name commits and wakes its listener.
+- A client registers its pool, and a pool registered outside a runtime starts
+  its sender later.
+- Unit tests cover coalescing, channel cuts, validation and the settle delay.
 - `benchmarks/notify-commit.sh` measures commit throughput for N concurrent
   writers, with NOTIFY inside the transaction and after it.

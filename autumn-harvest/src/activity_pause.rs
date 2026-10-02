@@ -1046,11 +1046,11 @@ pub async fn resume_activity(
             let released = shifted.len();
             let shifted_ids: Vec<uuid::Uuid> = shifted.into_iter().map(|r| r.id).collect();
 
-            // Ring the doorbell INSIDE the transaction: Postgres queues NOTIFY
-            // and delivers it at COMMIT, so listeners wake exactly when the
-            // hold lifts -- never earlier (an early wake would still see the
-            // uncommitted pause row and skip the task) and never at all if this
-            // rolls back.
+            // Ring the doorbell INSIDE the transaction: the sender sends the
+            // wake only after COMMIT (issue #1796), so listeners wake exactly
+            // when the hold lifts -- never earlier (an early wake would still
+            // see the uncommitted pause row and skip the task) and never at
+            // all if this rolls back.
             //
             // Ordered BEFORE the late-arrivals credit pass so that pass is the
             // last statement this transaction runs (issue #807 review, Codex

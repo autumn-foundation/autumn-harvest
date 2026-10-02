@@ -463,8 +463,9 @@ pub const METRIC_DISPATCH_DROPPED_HINTS: &str = "harvest.dispatch.dropped_hints"
 /// Gauge: cumulative notifications this process has lost to an error
 /// (issue #1796).
 ///
-/// A send error, a full sender queue, or a rejected channel name each count
-/// once. A lost notification costs latency, not work. Polling finds the row.
+/// A failed send counts once for each merged wake. A dropped or rejected note
+/// counts once. A lost notification costs latency, not work. Polling finds
+/// the row.
 /// A sustained non-zero rate means the post-commit notify path is unhealthy.
 pub const METRIC_NOTIFY_SEND_FAILURES: &str = "harvest.notify.send_failures";
 
@@ -2836,7 +2837,8 @@ pub trait MetricsRecorder: Send + Sync {
     ///
     /// Emitted by a periodic in-process sampler, no label. Maps to the gauge
     /// `harvest_notify_queue_usage`. The sampler skips the call until a
-    /// sender has read the queue usage.
+    /// sender has read the queue usage. It reports `0.0` after the last live
+    /// sender stops.
     fn record_notify_queue_usage(&self, ratio: f64) {
         let _ = ratio;
     }

@@ -1002,8 +1002,9 @@ pub const fn resumed_queue_notify_task_query() -> &'static str {
 /// Ring the queue's `LISTEN`/`NOTIFY` doorbell so parked workers re-poll as
 /// soon as this resume commits (issue #619 round-17 review).
 ///
-/// Must be called **inside** the resume transaction: Postgres queues `NOTIFY`
-/// and delivers it at `COMMIT`, so listeners wake exactly when the hold lifts —
+/// Must be called **inside** the resume transaction. The call stages the wake
+/// with the transaction id, and the sender sends it only after `COMMIT`
+/// (issue #1796). Listeners therefore wake exactly when the hold lifts —
 /// never earlier (an early wake would still see the uncommitted pause row and
 /// skip the queue) and never at all if the resume rolls back.
 ///
@@ -1013,7 +1014,8 @@ pub const fn resumed_queue_notify_task_query() -> &'static str {
 /// failure as an error — which the poll loop handles by logging and sleeping a
 /// full `poll_interval`, i.e. strictly worse than sending nothing. A synthetic
 /// or nil id would be a lie in a field that is typed as a real task; a genuine
-/// id is both honest and free (one indexed row).
+/// id is both honest and free (one indexed row). The sender can still merge
+/// this wake with others on the queue into one nil-id wake (issue #1796).
 ///
 /// A queue that raced to empty between the shift and this lookup needs no
 /// doorbell, so the lookup returning nothing is a silent no-op.
@@ -1510,11 +1512,11 @@ pub async fn resume_queue(
         // place, so the deployments most likely to be tuned this way are
         // the ones that would sit idle longest.
         //
-        // Emitted INSIDE this transaction on purpose: Postgres queues
-        // `NOTIFY` and delivers it at COMMIT, so listeners are woken
+        // Staged INSIDE this transaction on purpose: the sender sends the
+        // wake only after COMMIT (issue #1796), so listeners are woken
         // exactly when the hold actually lifts — never before (a worker
         // woken early would still see the uncommitted pause row and skip
-        // the queue) and never lost to a rollback.
+        // the queue) and never for a rollback.
         //
         // Skipped when nothing was released: there is no held backlog to
         // wake for, and a spurious wake would just burn a poll cycle.

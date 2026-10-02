@@ -36,6 +36,7 @@
 )]
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use autumn_harvest::worker::DbPool;
@@ -79,6 +80,8 @@ struct Outcome {
     commits: usize,
     seconds: f64,
     latencies_ms: Vec<f64>,
+    /// Notifications the sender lost.
+    lost: u64,
 }
 
 impl Outcome {
@@ -167,38 +170,61 @@ async fn run() {
     let mut listener = autumn_harvest::notify::QueueListener::connect(&url, &[QUEUE.to_string()])
         .await
         .expect("listener");
-    let drain = tokio::spawn(async move {
-        while listener
-            .wait_for_notification_outcome(Duration::from_secs(3600))
-            .await
-            .is_ok_and(|outcome| outcome != autumn_harvest::notify::QueueWaitOutcome::ChannelClosed)
-        {
-        }
-    });
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let drain = {
+        let wakes = Arc::clone(&wakes);
+        tokio::spawn(async move {
+            while let Ok(autumn_harvest::notify::QueueWaitOutcome::Notification(_)) = listener
+                .wait_for_notification_outcome(Duration::from_secs(3600))
+                .await
+            {
+                wakes.fetch_add(1, Ordering::Relaxed);
+            }
+        })
+    };
 
     let window = window();
+    let writer_counts = writer_counts();
     println!("# Commit throughput with NOTIFY (issue #1796)");
     println!();
-    println!("Window: {} s per scenario.", window.as_secs());
+    println!(
+        "Window: {} s per scenario. Writers: {}.",
+        window.as_secs(),
+        writer_counts
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
     println!();
-    println!("| writers | mode | commits/s | p50 ms | p99 ms |");
-    println!("|---:|---|---:|---:|---:|");
-    for writers in writer_counts() {
-        for mode in [Mode::None, Mode::InTransaction, Mode::PostCommit] {
+    println!("| writers | mode | commits/s | p50 ms | p99 ms | wakes | lost |");
+    println!("|---:|---|---:|---:|---:|---:|---:|");
+    let modes = [Mode::None, Mode::InTransaction, Mode::PostCommit];
+    for (round, writers) in writer_counts.into_iter().enumerate() {
+        // Rotate the order, so no mode always runs last.
+        for step in 0..modes.len() {
+            let mode = modes[(round + step) % modes.len()];
+            admin
+                .batch_execute("TRUNCATE harvest_notify_bench")
+                .await
+                .expect("truncate the scratch table");
+            let wakes_before = wakes.load(Ordering::Relaxed);
             let outcome = scenario(&url, writers, mode, window).await;
             println!(
-                "| {writers} | {} | {:.0} | {:.2} | {:.2} |",
+                "| {writers} | {} | {:.0} | {:.2} | {:.2} | {} | {} |",
                 mode.label(),
                 outcome.per_second(),
                 outcome.percentile(50.0),
                 outcome.percentile(99.0),
+                wakes.load(Ordering::Relaxed) - wakes_before,
+                outcome.lost,
             );
         }
     }
     println!();
     println!(
-        "Lost notifications: {}.",
-        autumn_harvest::notify::send_failures()
+        "A wake can stand for several commits, so `wakes` can be below the \
+         commit count in `post_commit` mode."
     );
 
     drain.abort();
@@ -212,14 +238,16 @@ async fn run() {
 async fn scenario(url: &str, writers: usize, mode: Mode, window: Duration) -> Outcome {
     // One extra connection for the sender.
     let pool = build_pool(url, writers + 1);
-    if mode == Mode::PostCommit {
+    let sink = if mode == Mode::PostCommit {
+        let sink = autumn_harvest::notify::register_pool(&pool);
         assert!(
-            autumn_harvest::notify::register_pool(&pool)
-                .wait_ready(Duration::from_secs(10))
-                .await,
+            sink.wait_ready(Duration::from_secs(10)).await,
             "the notify sender must become ready"
         );
-    }
+        Some(sink)
+    } else {
+        None
+    };
     let start = Instant::now() + Duration::from_millis(200);
     let deadline = start + window;
     let pool = Arc::new(pool);
@@ -242,13 +270,19 @@ async fn scenario(url: &str, writers: usize, mode: Mode, window: Duration) -> Ou
     for task in tasks {
         latencies_ms.extend(task.await.expect("writer task"));
     }
-    // Let the sender drain before the pool drops. A sender loses the notes it
-    // still holds when its pool drops.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Let the sender drain before the pool drops, and let the last wakes
+    // reach the listener.
+    if let Some(sink) = &sink {
+        sink.flush(Duration::from_secs(5)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
     Outcome {
         commits: latencies_ms.len(),
         seconds: window.as_secs_f64(),
         latencies_ms,
+        lost: sink
+            .as_ref()
+            .map_or(0, autumn_harvest::notify::NotifySink::send_failures),
     }
 }
 

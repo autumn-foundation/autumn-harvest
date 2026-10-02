@@ -3673,7 +3673,7 @@
               }
             }
           ],
-          "description": "Alert: harvest_notify_send_failures. Running total of post-commit notifications this process has lost to an error since start (issue #1796): a send error, a full sender queue, or a rejected channel name. A lost notification costs latency only — polling finds the row — so this is a health signal, not a durability one. A step change means a burst; a steady climb means the notify path is unhealthy. Cross-check against 'Notify queue usage' and the database's own health."
+          "description": "Alert: harvest_notify_send_failures. Running total of post-commit notifications that this process lost (issue #1796). Causes are a send error, a full sender queue, or a sender that stops before it drains. A lost notification costs latency only, because polling finds the row. A step change means a burst. A steady climb means the notify path is unhealthy. Cross-check against 'Notify queue usage' and the health of the database."
         },
         {
           "id": 385141,

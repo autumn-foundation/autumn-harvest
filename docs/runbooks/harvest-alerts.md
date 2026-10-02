@@ -3259,8 +3259,7 @@ needs a code change, not an operator fix.
 **What to do when post-commit notifications fail:** the notify sender on
 this process is losing notifications (issue #1796). The gauge
 `harvest.notify.send_failures` reports the running total for this process.
-A send error, a full sender queue, or a channel name that Postgres rejects
-each count once.
+A failed send counts once for each merged wake. A dropped note counts once.
 
 A lost notification costs latency only. The row is already committed, and
 workers find it on their next poll. This is a health signal, not a
@@ -3287,8 +3286,10 @@ durability one. Nothing is lost.
   read commit state fast enough. The sender drops the excess.
 - A write transaction stays open longer than 60 seconds. The sender drops
   the notes that wait on it.
-- A queue name maps to a channel name that is 64 bytes or longer, which
-  Postgres rejects.
+- The process stopped, or its Tokio runtime ended, before the sender sent
+  the notes it held.
+- The database failed over to another server. Notes staged on the old server
+  cannot be checked on the new one, so the sender drops them.
 
 ### False positives
 
@@ -3301,8 +3302,8 @@ when the counter keeps climbing past a single burst window.
   lost notification never loses or duplicates work.
 - Fix the database-side cause first: connectivity, a full notification
   queue, or a long open transaction.
-- Shorten a queue name that Postgres rejects as a channel name. Expect the
-  counter to climb on every enqueue to that queue until the name changes.
+- Give a short-lived process time to flush its sender before it exits.
+  `Worker::run` and `HarvestRunner::stop` already do this.
 
 ### Escalation criteria
 
@@ -3313,10 +3314,9 @@ sender itself and needs a code change, not an operator fix.
 ## harvest_notify_queue_usage_high
 
 **What to do when the Postgres notification queue fills up:** the gauge
-`harvest.notify.queue_usage` reports the largest
-`pg_notification_queue_usage()` that a live notify sender on this process
-read last (issue #1796). The value runs from `0` to `1`. Postgres rejects
-every `NOTIFY` once the queue is full.
+`harvest.notify.queue_usage` reads from `0` to `1`. It is the largest
+`pg_notification_queue_usage()` that a live sender on this process read last
+(issue #1796). Postgres rejects every `NOTIFY` once the queue is full.
 
 The queue belongs to the database, not to one process. Every process on
 one database reports about the same value.
