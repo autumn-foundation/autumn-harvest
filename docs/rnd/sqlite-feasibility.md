@@ -59,7 +59,7 @@ module counts at the audited revision, recomputed by CI:
 | `row-lock` blocking row lock (Diesel `.for_update()`) | 17 modules | Subsumed by the single write lock. |
 | `interval-sql` (`INTERVAL '…'`, `make_interval()`) | 14 modules | Yes — integer epoch milliseconds. |
 | `raw-sql` — reaches for Diesel's raw-SQL escape hatch (`sql::<…>`, `sql_query`) | 42 modules | Case by case — the SQL must be read, not inferred from the ORM. |
-| `raw-pg-sql` — *identified* Postgres-only syntax within that SQL (JSONB `#>>`/`@>`, `::TYPE` casts in either case, `EXTRACT(EPOCH …)`, `JOIN LATERAL`, `~` regex) | 30 modules | Mostly — but each is a hand rewrite, and `~` has no SQLite equivalent at all. |
+| `raw-pg-sql` — *identified* Postgres-only syntax within that SQL (JSONB `#>>`/`@>`, `::TYPE` casts in either case, `EXTRACT(EPOCH …)`, `JOIN LATERAL`, `~` regex) | 31 modules | Mostly — but each is a hand rewrite, and `~` has no SQLite equivalent at all. |
 | `advisory-lock` (`pg_advisory_*` / `pg_try_advisory_*`) | 14 modules | Subsumed by the single write lock. |
 | `to_regclass` table-existence probes | 10 modules | Yes — `sqlite_master` lookup. |
 | `listen/notify` push wakeups | 4 modules | No — polling is a degradation, not a translation. |
@@ -188,7 +188,7 @@ Classification rule:
 | `migrate` | diesel, raw-sql, to_regclass | (c) | Applies the Postgres migration set to a dedicated Harvest database (issue #1240). The ledger CRUD and the `to_regclass` probe are mechanical (`sqlite_master`), but the payload is 96 files of Postgres DDL: `autumn-harvest-sqlite` declares its own schema rather than translating them, so there is nothing here to port. |
 | `models` | diesel | (c) | Postgres type layer (`Jsonb`/`Timestamptz`/`Interval`/`Uuid`); reimplemented wholesale. |
 | `mutex` | diesel, advisory-lock, to_regclass, interval-sql, raw-pg-sql, raw-sql | (b) | Advisory lock subsumed by the write lock; lease TTL as epoch ms. |
-| `notify` | diesel, listen/notify, raw-sql | (c) | **The one mechanism with no SQLite equivalent at all.** Polling replaces it. |
+| `notify` | diesel, listen/notify, raw-pg-sql, raw-sql | (c) | **The one mechanism with no SQLite equivalent at all.** Polling replaces it. |
 | `partition` | diesel, raw-pg-sql, raw-sql | (c) | Native Postgres declarative partitioning of `harvest_events` (issue #958). Nothing to translate: SQLite has no partitioned tables, no `ATTACH PARTITION`, and no metadata-only `DROP TABLE`-as-reclamation — and it does not need them. The pain this module removes is dead-tuple bloat and autovacuum pressure from row-level retention deletes, neither of which a single-writer SQLite file exhibits in the same way (`DELETE` there is followed by an incremental vacuum the single writer already owns). The whole module is a no-op under the SQLite backend, which is why it is (c) rather than a port: it is Postgres-specific *relief for a Postgres-specific problem*. |
 | `poison_pill` | diesel, skip-locked, row-lock, interval-sql, raw-pg-sql, raw-sql | (c) | Crash reclaim keyed on *peer* worker liveness — no peers single-writer. |
 | `queue` | diesel, skip-locked, row-lock, advisory-lock, listen/notify, interval-sql, raw-pg-sql, raw-sql | (c) | The claim path itself. Reimplemented on `BEGIN IMMEDIATE`. |

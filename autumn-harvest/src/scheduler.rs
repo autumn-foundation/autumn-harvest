@@ -380,6 +380,10 @@ impl SchedulerMonitor {
     }
 }
 
+/// How long a stopping scheduler waits for each notify sender to drain
+/// (issue #1796).
+const NOTIFY_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// The background runtime that drives DAG and workflow scheduling.
 pub struct SchedulerRuntime {
     shutdown: CancellationToken,
@@ -431,6 +435,12 @@ impl SchedulerRuntime {
             if let Err(error) = reject_classic_dags_without_unified_execution(dags.as_ref()) {
                 panic!("{error}");
             }
+        }
+
+        // Start the post-commit notify sender for each pool, so schedule
+        // fires send their wakes after commit (issue #1796).
+        for (_, shard_pool) in pool.iter_shards() {
+            crate::notify::register_pool(shard_pool);
         }
 
         let shutdown = CancellationToken::new();
@@ -486,6 +496,14 @@ impl SchedulerRuntime {
 
             let total = dags.len() + workflow_schedules.len();
             monitor_for_task.mark_stopped(total);
+
+            // Send the wakes of the last fires before the runtime can stop
+            // the notify senders (issue #1796).
+            for (_, shard_pool) in pool.iter_shards() {
+                crate::notify::register_pool(shard_pool)
+                    .flush(NOTIFY_FLUSH_TIMEOUT)
+                    .await;
+            }
         });
 
         Self {

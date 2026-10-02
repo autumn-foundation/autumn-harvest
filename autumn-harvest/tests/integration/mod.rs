@@ -159,6 +159,8 @@ mod mutex_lease_reclaim_perf;
 #[cfg(feature = "db")]
 mod mutex_tests;
 mod nd_block_tests;
+#[cfg(feature = "db")]
+mod notify_post_commit_tests;
 mod panic_containment_tests;
 #[cfg(feature = "db")]
 mod parent_close_cascade_unfinished_handlers_perf;

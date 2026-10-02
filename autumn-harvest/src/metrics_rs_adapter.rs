@@ -66,8 +66,9 @@ use crate::telemetry::{
     METRIC_LABEL_SLOT_TYPE, METRIC_LABEL_SOURCE, METRIC_LABEL_STATE, METRIC_LABEL_STATUS,
     METRIC_LABEL_TASK_TYPE, METRIC_LABEL_TRIGGER, METRIC_LABEL_WORKFLOW,
     METRIC_LABEL_WORKFLOW_TYPE, METRIC_MUTEX_CONTENTION, METRIC_MUTEX_HELD, METRIC_MUTEX_WAIT,
-    METRIC_PAYLOAD_BYTES, METRIC_PAYLOAD_OFFLOAD_FETCH_DURATION, METRIC_PAYLOAD_OFFLOADED,
-    METRIC_PAYLOAD_REJECTED, METRIC_QUERY_DURATION, METRIC_QUEUE_DEPTH, METRIC_QUEUE_DISPATCHED,
+    METRIC_NOTIFY_QUEUE_USAGE, METRIC_NOTIFY_SEND_FAILURES, METRIC_PAYLOAD_BYTES,
+    METRIC_PAYLOAD_OFFLOAD_FETCH_DURATION, METRIC_PAYLOAD_OFFLOADED, METRIC_PAYLOAD_REJECTED,
+    METRIC_QUERY_DURATION, METRIC_QUEUE_DEPTH, METRIC_QUEUE_DISPATCHED,
     METRIC_QUEUE_OLDEST_PENDING_AGE, METRIC_QUEUE_PAUSED, METRIC_QUEUE_SCHEDULE_TO_START,
     METRIC_QUOTA_REJECTED, METRIC_QUOTA_SUPERSEDE_CREDIT_NOT_SHED,
     METRIC_RATE_LIMIT_BUCKETS_DELETED, METRIC_RATE_LIMIT_REFILL_RATE, METRIC_RATE_LIMIT_THROTTLED,
@@ -325,6 +326,15 @@ impl MetricsRecorder for MetricsRsRecorder {
     #[allow(clippy::cast_precision_loss)]
     fn record_dispatch_dropped_hints(&self, total: u64) {
         gauge!(METRIC_DISPATCH_DROPPED_HINTS).set(total as f64);
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn record_notify_send_failures(&self, total: u64) {
+        gauge!(METRIC_NOTIFY_SEND_FAILURES).set(total as f64);
+    }
+
+    fn record_notify_queue_usage(&self, ratio: f64) {
+        gauge!(METRIC_NOTIFY_QUEUE_USAGE).set(ratio);
     }
 
     fn record_queue_paused(&self, queue: &str, paused: bool) {
@@ -1377,6 +1387,8 @@ mod tests {
         rec.record_queue_depth("q", 5);
         rec.record_dlq_entries(0, 2);
         rec.record_dispatch_dropped_hints(0);
+        rec.record_notify_send_failures(0);
+        rec.record_notify_queue_usage(0.0);
         rec.record_schedule_run("workflow", "nightly");
         rec.record_schedule_skipped("workflow", "nightly", "paused");
         rec.record_schedule_decision_write_failed();

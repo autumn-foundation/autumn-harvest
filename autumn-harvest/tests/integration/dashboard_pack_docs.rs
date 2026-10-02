@@ -193,6 +193,10 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     // Issue #1429 — dispatch background publisher backpressure (bare gauge,
     // no label, one series per process).
     "harvest_dispatch_dropped_hints",
+    // Issue #1796 — post-commit notify health (bare gauges, no label, one
+    // series per process).
+    "harvest_notify_send_failures",
+    "harvest_notify_queue_usage",
     // Issue #954 — cross-region DR. Four gauges (bare) and one counter.
     "harvest_replication_lag_seconds",
     "harvest_replication_lag_bytes",
@@ -339,6 +343,8 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     ("harvest_shard_stranded_pending", &["shard"]),
     ("harvest_shard_dispatched", &["shard"]),
     ("harvest_dispatch_dropped_hints", &[]),
+    ("harvest_notify_send_failures", &[]),
+    ("harvest_notify_queue_usage", &[]),
     // Issue #954 — cross-region DR. All `{shard}`-only: a standby's
     // `application_name` is operator-chosen and unbounded (ADR-0001 §7).
     ("harvest_replication_lag_seconds", &["shard"]),

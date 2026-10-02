@@ -3723,6 +3723,106 @@
             }
           ],
           "description": "Alert: harvest_dispatch_dropped_hints. Running total of hints the Redis dispatch background publisher has dropped because its bounded queue was full (issue #1429), per process. A dropped hint costs latency only — the row stays PENDING and the worker's reconcile sweep republishes it — so this is a health signal, not a durability one. A step change means a burst; a steady climb means sustained saturation. Cross-check against 'Queue depth' and the Redis endpoint's own latency."
+        },
+        {
+          "id": 221658,
+          "type": "timeseries",
+          "title": "Notify send failures",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 92
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "harvest_notify_send_failures",
+              "legendFormat": "{{instance}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Alert: harvest_notify_send_failures. Running total of post-commit notifications that this process lost (issue #1796). Causes are a send error, a full sender queue, or a sender that stops before it drains. A lost notification costs latency only, because polling finds the row. A step change means a burst. A steady climb means the notify path is unhealthy. Cross-check against 'Notify queue usage' and the health of the database."
+        },
+        {
+          "id": 385141,
+          "type": "timeseries",
+          "title": "Notify queue usage",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 92
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "min": 0,
+              "max": 1,
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "harvest_notify_queue_usage",
+              "legendFormat": "{{instance}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Alert: harvest_notify_queue_usage_high. The largest pg_notification_queue_usage() a live notify sender read last, per process (issue #1796), from 0 to 1. Postgres rejects a NOTIFY when this queue is full, so a value that stays high means a listener does not drain its notifications. The series is absent until a sender has read the queue usage."
         }
       ]
     },
