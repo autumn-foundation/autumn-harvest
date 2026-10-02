@@ -84,12 +84,11 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
-# Clippy 1.99 flags the field init that `#[derive(diesel::QueryableByName)]`
-# generates. The derive output is not editable.
+# Clippy 1.99 reports these two lints inside macro expansions. The source has
+# no such code. Diesel derives expand to `field: field`. `async_trait` expands
+# to a second `#[must_use]`. Re-enable both when clippy skips macro output.
 redundant_field_names = "allow"
-# The lint suggests `assert_eq!(x, [] as [T; 0])`. That reads worse than
-# `assert!(x.is_empty())`.
-assert_is_empty = "allow"
+double_must_use = "allow"
 
 [profile.dev.package.bollard-stubs]
 opt-level = 0
