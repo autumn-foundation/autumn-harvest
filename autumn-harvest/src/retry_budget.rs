@@ -195,6 +195,9 @@ struct Bucket {
     /// Latest wake-up slot given to a deferred retry. Later deferrals are
     /// spaced after it, at the refill rate.
     next_slot: Instant,
+    /// Cancelled reservations that are not yet the tail. When the tail is
+    /// cancelled, the rollback continues through these.
+    cancelled: Vec<SlotReservation>,
 }
 
 /// In-process registry of per-activity-type retry budgets.
@@ -244,11 +247,22 @@ impl RetryBudgetRegistry {
 
     /// Give back the wake-up slot of a deferral that was not persisted.
     ///
-    /// The slot is freed only if no later deferral reserved a slot after it.
+    /// A slot is freed when no live deferral reserved a slot after it.
+    /// Cancellations can arrive in any order. A cancelled slot that is not
+    /// yet the tail is freed when every slot after it is cancelled too.
     pub fn cancel_deferral(&self, activity_name: &str, reservation: SlotReservation, now: Instant) {
         self.with_bucket(activity_name, now, |bucket, _| {
-            if bucket.next_slot == reservation.slot {
-                bucket.next_slot = reservation.previous;
+            // A slot that has passed needs no rollback, and an old entry
+            // can never become the tail again.
+            bucket.cancelled.retain(|r| r.slot > now);
+            bucket.cancelled.push(reservation);
+            // Walk back from the tail through every cancelled slot.
+            while let Some(i) = bucket
+                .cancelled
+                .iter()
+                .position(|r| r.slot == bucket.next_slot)
+            {
+                bucket.next_slot = bucket.cancelled.swap_remove(i).previous;
             }
         });
     }
@@ -378,6 +392,7 @@ impl Bucket {
             tokens: policy.max_tokens,
             refilled_at: now,
             next_slot: now,
+            cancelled: Vec::new(),
         }
     }
 
@@ -700,6 +715,29 @@ mod tests {
         reg.cancel_deferral(A, reservation, now);
         let second = retry_after(reg.admit(A, true, now));
         assert_eq!(first, second, "the cancelled slot must be free again");
+    }
+
+    /// Two reservations cancelled oldest first must both be freed. The
+    /// rollback must not stop at a slot that is already cancelled.
+    #[test]
+    fn cancelling_reservations_in_order_frees_them_all() {
+        let reg = registry(RetryBudgetPolicy::new(0.0, 1.0, 2.0));
+        let now = Instant::now();
+        assert_eq!(drain(&reg, A, now), 1);
+        let reserve = |reg: &RetryBudgetRegistry| match reg.admit(A, true, now) {
+            Admission::Deferred {
+                retry_after,
+                reservation: Some(reservation),
+                ..
+            } => (retry_after, reservation),
+            other => panic!("expected a reserved deferral, got {other:?}"),
+        };
+        let (first_wait, first) = reserve(&reg);
+        let (_, second) = reserve(&reg);
+        reg.cancel_deferral(A, first, now);
+        reg.cancel_deferral(A, second, now);
+        let next = retry_after(reg.admit(A, true, now));
+        assert_eq!(next, first_wait, "both cancelled slots must be free");
     }
 
     /// Records every gauge sample, in order.

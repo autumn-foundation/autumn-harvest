@@ -2911,7 +2911,10 @@ pub async fn defer_claimed_retry_for_budget(
     else {
         return Ok(ClaimWrite::LeaseLost);
     };
-    announce_deferred_task(
+    // The UPDATE already committed, so the row is durably deferred. The
+    // NOTIFY is best-effort, as for the retry requeue: a failed wake must not
+    // report the deferral as unpersisted. The poll loop still finds the row.
+    if let Err(error) = announce_deferred_task(
         conn,
         claim.task_id,
         &queue_name,
@@ -2919,7 +2922,14 @@ pub async fn defer_claimed_retry_for_budget(
         priority,
         &task_type,
     )
-    .await?;
+    .await
+    {
+        tracing::warn!(
+            task_id = %claim.task_id,
+            %error,
+            "failed to announce a retry-budget deferral; the poll loop still claims it"
+        );
+    }
     Ok(ClaimWrite::Applied)
 }
 

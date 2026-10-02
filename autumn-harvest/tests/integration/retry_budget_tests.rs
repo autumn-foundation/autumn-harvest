@@ -822,3 +822,62 @@ async fn budget_deferral_keeps_crash_strikes_attempt_and_error() {
     );
     assert!(row.worker_id.is_none());
 }
+
+/// The deferral write and its NOTIFY are separate statements. A failed
+/// NOTIFY must not make an applied deferral look unpersisted, or the worker
+/// would give back a slot that a row still waits on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn budget_deferral_reports_applied_when_only_the_notify_fails() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    // Postgres rejects a NOTIFY channel over 63 bytes, so this queue name
+    // makes the NOTIFY fail after the UPDATE has applied.
+    let queue = format!(
+        "rb-notify-fails-{}-{}",
+        Uuid::new_v4().simple(),
+        "x".repeat(32)
+    );
+    let task_id = Uuid::new_v4();
+    diesel::sql_query(
+        "INSERT INTO harvest_task_queue \
+             (id, queue_name, task_type, input, state, attempt, max_attempts, scheduled_at) \
+         VALUES ($1, $2, 'activity', '{}'::jsonb, 'PENDING', 1, 10, NOW() - INTERVAL '5 seconds')",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .bind::<diesel::sql_types::Text, _>(&queue)
+    .execute(&mut conn)
+    .await
+    .expect("insert a task row directly");
+    let claimed = queue::claim_task(
+        &mut conn,
+        std::slice::from_ref(&queue),
+        "rb-notify-worker",
+        "",
+        None,
+        &[],
+        &[],
+    )
+    .await
+    .expect("claim")
+    .expect("a claimable task");
+    assert_eq!(claimed.id, task_id, "the claim must take the inserted row");
+    let claim = queue::TaskClaim {
+        task_id,
+        worker_id: "rb-notify-worker".to_string(),
+        attempt: claimed.attempt,
+    };
+
+    let write =
+        queue::defer_claimed_retry_for_budget(&mut conn, &claim, chrono::Duration::seconds(30))
+            .await
+            .expect("an applied deferral is not an error when only the NOTIFY fails");
+    assert_eq!(write, queue::ClaimWrite::Applied);
+
+    let row: TaskQueueItem = harvest_task_queue::table
+        .find(task_id)
+        .select(TaskQueueItem::as_select())
+        .first(&mut conn)
+        .await
+        .expect("reload row");
+    assert_eq!(row.state, "PENDING");
+}
