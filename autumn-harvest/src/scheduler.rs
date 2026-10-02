@@ -2925,6 +2925,10 @@ pub async fn update_workflow_schedule(
         // before any write; a Config error rolls the transaction back.
         let merged = merge_schedule_patch(&existing, patch)?;
         crate::policy::validate_schedule(&merged.schedule).map_err(HarvestError::Config)?;
+        // The merge keeps the stored jitter on a cadence change (issue #1792).
+        // The new cadence must still hold it.
+        crate::policy::validate_jitter(&merged.schedule, merged.jitter)
+            .map_err(HarvestError::Config)?;
 
         match apply_workflow_schedule_update(conn, &merged, &existing, true).await? {
             AppliedScheduleUpdate::Updated(row) => Ok(ScheduleUpdateOutcome::Updated(row)),

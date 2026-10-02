@@ -35,6 +35,9 @@ Design decisions:
   the stored jitter. The row does not record whether its jitter came from the
   default or from an explicit request, so a cadence change cannot safely
   re-derive it. Send `jitter_secs` in the same PATCH to change it.
+- A PATCH now validates the merged jitter against the merged cadence. A
+  stored 10 s on a cron that moves to `interval:5` returns 400 and writes
+  nothing. Before, no PATCH checked the jitter.
 - `#[dag(jitter = "0s")]` opts out. The macro now checks the `jitter` string
   at compile time.
 - `harvest schedule create-workflow` gains `--jitter-secs`.

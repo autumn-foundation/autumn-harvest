@@ -103,7 +103,8 @@ The default applies on create only. A `PATCH /admin/schedules/{id}` that
 changes `schedule_expr` keeps the stored jitter. The stored row does not record
 whether its jitter came from the default or from an explicit request, so a
 cadence change cannot safely re-derive it. To change the jitter with the
-cadence, send `jitter_secs` in the same PATCH.
+cadence, send `jitter_secs` in the same PATCH. The PATCH rejects a jitter
+that the new cadence cannot hold, such as 10 s on a 5 s interval, with a 400.
 
 To opt out, set the jitter to zero:
 
