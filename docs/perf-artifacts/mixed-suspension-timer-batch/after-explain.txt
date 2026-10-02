@@ -1,0 +1,27 @@
+-- per-timer lookup (one call; the loop issues this once per timer)
+Limit  (cost=0.15..46.17 rows=1 width=54) (actual time=0.453..0.453 rows=0 loops=1)
+  Output: id, workflow_exec_id, timer_id, fires_at, fired
+  Buffers: shared hit=230
+  ->  Index Scan using idx_harvest_timers_pending on public.harvest_timers  (cost=0.15..46.17 rows=1 width=54) (actual time=0.452..0.452 rows=0 loops=1)
+        Output: id, workflow_exec_id, timer_id, fires_at, fired
+        Filter: ((harvest_timers.workflow_exec_id = 'ffff0547-3420-4d8c-83b6-93d6cc3586cd'::uuid) AND (harvest_timers.timer_id = 'timer-0'::text))
+        Rows Removed by Filter: 1010
+        Buffers: shared hit=230
+Query Identifier: 7776928070776577454
+Planning:
+  Buffers: shared hit=35
+Planning Time: 0.244 ms
+Execution Time: 0.470 ms
+
+-- batched lookup over 10 timer ids
+Index Scan using idx_harvest_timers_pending on public.harvest_timers  (cost=0.18..48.95 rows=1 width=54) (actual time=0.324..0.324 rows=0 loops=1)
+  Output: id, workflow_exec_id, timer_id, fires_at, fired
+  Filter: ((harvest_timers.workflow_exec_id = 'ffff0547-3420-4d8c-83b6-93d6cc3586cd'::uuid) AND (harvest_timers.timer_id = ANY ('{t0,t1,t2,t3,t4,t5,t6,t7,t8,t9}'::text[])))
+  Rows Removed by Filter: 1010
+  Buffers: shared hit=230
+Query Identifier: -4015315641059886956
+Planning:
+  Buffers: shared hit=3
+Planning Time: 0.117 ms
+Execution Time: 0.332 ms
+

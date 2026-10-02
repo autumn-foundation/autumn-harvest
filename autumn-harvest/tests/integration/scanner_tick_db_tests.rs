@@ -444,6 +444,7 @@ async fn spawned_audit_export_checker_registers_ticks_and_deregisters() {
         telemetry,
         Some(ShardId::new(0)),
         None,
+        None,
     );
     assert_eq!(
         global_scanner_liveness().registrations(Scanner::AuditExport),

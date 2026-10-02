@@ -374,6 +374,15 @@ const ALLOWED_HANDROLLED_MIGRATION_INCLUDES: &[&str] = &[
     // `test_init_sql()` always applies every migration to an empty
     // database instead.
     "autumn-harvest-plugin/tests/stall_diagnosis_integration.rs",
+    // Does not BUILD a schema from the include. The suite bootstraps through
+    // `full_migrations_sql()` like every other. It REPLAYS the lazy
+    // audit-index migration's own `up.sql` (issue #1667), named
+    // `20261001190405_harvest_audit_unexported_idx_lazy`. The replay runs
+    // against hand-built states: an index in another schema, a held table
+    // lock, and a database with and without an export cursor. A migration
+    // that has already run on a fresh database cannot meet those states any
+    // other way.
+    "autumn-harvest/tests/integration/audit_export_tests.rs",
 ];
 
 /// True when a single source line reintroduces a hand-rolled migration bundle: a

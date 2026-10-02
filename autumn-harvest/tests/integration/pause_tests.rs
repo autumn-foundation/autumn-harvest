@@ -1234,10 +1234,10 @@ async fn retry_path_requeues_when_a_concurrent_resume_shifted_the_deadline() {
     // lock is the guarantee; this test constructs the stale-snapshot state
     // deterministically by letting the activity itself perform the shift
     // mid-attempt.
-    use autumn_harvest::RetryPolicy;
     use autumn_harvest::info::ActivityInfo;
     use autumn_harvest::queue::{EnqueueParams, TaskType};
     use autumn_harvest::types::ActivityExecId;
+    use autumn_harvest::{JitterPolicy, RetryPolicy};
 
     let (url, _c) = setup().await;
     let mut conn = connect(&url).await;
@@ -1294,8 +1294,10 @@ async fn retry_path_requeues_when_a_concurrent_resume_shifted_the_deadline() {
     params.max_attempts = 5;
     params.schedule_to_close_at = Some(chrono::Utc::now() + chrono::Duration::seconds(30));
     params.retry_policy = Some(
-        serde_json::to_value(RetryPolicy::fixed(5, Duration::from_secs(300)))
-            .expect("retry policy serializes"),
+        serde_json::to_value(
+            RetryPolicy::fixed(5, Duration::from_secs(300)).with_jitter(JitterPolicy::None),
+        )
+        .expect("retry policy serializes"),
     );
     let task_id = queue::enqueue(&mut conn, &params)
         .await
@@ -1493,10 +1495,10 @@ async fn retry_path_requeues_when_a_concurrent_pause_committed_after_the_gate() 
     // Both the claim-time snapshot deadline AND the row-current deadline are
     // exceeded, so neither the snapshot gate nor the resume-shift staleness
     // re-check can save the task — only the new PAUSED re-check.
-    use autumn_harvest::RetryPolicy;
     use autumn_harvest::info::ActivityInfo;
     use autumn_harvest::queue::{EnqueueParams, TaskType};
     use autumn_harvest::types::ActivityExecId;
+    use autumn_harvest::{JitterPolicy, RetryPolicy};
 
     let (url, _c) = setup().await;
     let mut conn = connect(&url).await;
@@ -1550,8 +1552,10 @@ async fn retry_path_requeues_when_a_concurrent_pause_committed_after_the_gate() 
     params.max_attempts = 5;
     params.schedule_to_close_at = Some(chrono::Utc::now() + chrono::Duration::seconds(30));
     params.retry_policy = Some(
-        serde_json::to_value(RetryPolicy::fixed(5, Duration::from_secs(300)))
-            .expect("retry policy serializes"),
+        serde_json::to_value(
+            RetryPolicy::fixed(5, Duration::from_secs(300)).with_jitter(JitterPolicy::None),
+        )
+        .expect("retry policy serializes"),
     );
     let task_id = queue::enqueue(&mut conn, &params)
         .await

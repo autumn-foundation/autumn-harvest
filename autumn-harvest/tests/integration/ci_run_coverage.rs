@@ -1325,7 +1325,7 @@ fn cited_workflows() -> BTreeSet<String> {
 /// This is a YAML syntax check only. It does not check the GitHub workflow
 /// schema, so an unknown key or a bad expression still passes. For
 /// `chaos.yml`, the watchdog reports that case within about 2.5 days.
-fn parse_workflow_text(text: &str) -> Result<serde_yaml::Value, String> {
+pub fn parse_workflow_text(text: &str) -> Result<serde_yaml::Value, String> {
     serde_yaml::from_str(text).map_err(|e| e.to_string())
 }
 
@@ -1443,17 +1443,17 @@ fn all_workflows() -> BTreeSet<String> {
 }
 
 /// `cargo test` flags that run no test, or less than the whole module.
-const NO_FULL_RUN_FLAGS: &[&str] = &["--no-run", "--exact", "--skip", "--ignored", "--list"];
+pub const NO_FULL_RUN_FLAGS: &[&str] = &["--no-run", "--exact", "--skip", "--ignored", "--list"];
 
 /// Shell text that joins a second command to the step, or runs the command
 /// inside another one. Either can hide a failed `cargo test` or replace it.
-const SHELL_OPERATORS: &[&str] = &[";", "&", "|", "\n", "`", "$("];
+pub const SHELL_OPERATORS: &[&str] = &[";", "&", "|", "\n", "`", "$("];
 
 /// True when a job or step has no `if` and no `continue-on-error: true`.
 ///
 /// An `if` can skip the step on the nightly. A `continue-on-error` makes a
 /// failed suite look green to the watchdog, which counts successful runs.
-fn ungated(node: &serde_yaml::Value) -> bool {
+pub fn ungated(node: &serde_yaml::Value) -> bool {
     let soft = node
         .get("continue-on-error")
         .is_some_and(|v| v.as_bool() != Some(false));
