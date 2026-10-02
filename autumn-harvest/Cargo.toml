@@ -129,7 +129,7 @@ schemars = { version = "0.8", optional = true }
 # `wasm-activities` can't silently resolve back to a vulnerable 48.0.x (same
 # reasoning as tokio-postgres above -- a workspace's own Cargo.lock never
 # propagates to downstream consumers, only the manifest constraint does).
-wasmtime = { version = "48.0.3", optional = true }
+wasmtime = { version = "48.0.4", optional = true }
 wat = { version = "1", optional = true }
 
 [[test]]

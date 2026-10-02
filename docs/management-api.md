@@ -36,6 +36,41 @@ New route families added in **0.5.0** (all in the contract; each has a CLI verb)
 - `GET /admin/workflow-types/reachability` — safe-handler-removal pre-flight (#520).
 - `GET /dags/{dag_name}/runs/{run_exec_id}` — DAG run graph view (#690).
 
+## Authorization: token scopes and the authorizer hook
+
+Two opt-in gates sit in front of every route. See
+[`security-posture.md`](security-posture.md#scoped-api-tokens-built-in-opt-in--issue-942)
+for the full model.
+
+- **Token scopes** (issue #942, #1803). A `read` token gets `403` on every
+  mutation. A `mutate` token gets `403` on `POST /admin/tokens` and
+  `DELETE /admin/tokens/{id}`. Only an `admin` token mints or revokes tokens.
+- **Authorizer hook** (issue #1803). An embedder policy that sees the
+  principal, route class, tenant key and shard of each request. It can only
+  deny. A deny answers `403` with
+  `{"error":"forbidden by authorization policy"}`.
+
+Send a tenant key in the `x-harvest-tenant` header. With a hook installed, a
+value that is repeated, blank, holds a non-ASCII byte, or is longer than 128
+bytes gets `400`. Without a hook, Harvest ignores the header.
+
+| Request | Shard the hook sees |
+|---|---|
+| A path with an execution id, e.g. `GET /workflows/{id}`, also under `/ui` | The entry shard of the id and its live shard after a rebalance. On a route that acts on the live attempt (`cancel`, `signal`, `/result` and others), also the shard of each later retry attempt. |
+| `GET /workflows/{id}/children` or `/tree` | The execution's shards, and also None. These routes read every shard. |
+| `GET /admin/history/exports`, `.../export-sample`, `GET /admin/external-handoffs` with a shard query parameter | That shard. |
+| `POST /workflows/{name}/start` with `shard_id` or `residency_key` | The pinned shard. |
+| DLQ replay, discard and redrive, queue pause and resume, with body `shard_id` | That shard. |
+| `POST /admin/audit-export/...` with body `shard` | That shard. |
+| Anything else | None. A shard query parameter on a route that ignores it is not read. |
+
+`None` means Harvest cannot name the shard before the handler runs. A by-id
+route or a start with no placement still reaches one shard by hash. To confine
+a caller to some shards, deny `None` too.
+
+Every token-scope deny and every hook deny writes an `authz.deny` audit row
+with status `failed`. The audit export ships it to the SIEM.
+
 ## SSE Execution Event Stream
 
 ### Endpoint

@@ -235,6 +235,9 @@ pub struct HarvestPlugin {
     /// [`Self::enable_api_tokens`]; installs the token verification + scope
     /// layer. Default off — the router is byte-for-byte unchanged (AC7).
     api_tokens_enabled: bool,
+    /// The authorizer hook (issue #1803). Set via [`Self::with_authorizer`].
+    /// `None` installs no layer, so the router is unchanged.
+    authorizer: Option<crate::authz::SharedAuthorizer>,
     /// Opt-out that opens mutating routes with no auth (issue #1802). Set
     /// true by [`Self::allow_unauthenticated_mutations`]. Default off.
     allow_unauthenticated_mutations: bool,
@@ -336,6 +339,7 @@ impl HarvestPlugin {
             decode_payloads_on_read: false,
             role_auth_enabled: false,
             api_tokens_enabled: false,
+            authorizer: None,
             allow_unauthenticated_mutations: false,
             status_thresholds: crate::status_summary::StatusThresholds::default(),
             canary_config: None,
@@ -583,6 +587,19 @@ impl HarvestPlugin {
     #[must_use]
     pub const fn enable_api_tokens(mut self) -> Self {
         self.api_tokens_enabled = true;
+        self
+    }
+
+    /// Install an authorizer hook on the management API (issue #1803).
+    ///
+    /// The hook sees each request after the token and read-only layers. It can
+    /// deny by principal, route class, tenant key or shard, and each deny is
+    /// audited. It cannot widen a token scope. See [`crate::authz`].
+    ///
+    /// Default off: with no hook the router is byte-for-byte unchanged.
+    #[must_use]
+    pub fn with_authorizer(mut self, authorizer: impl crate::authz::HarvestAuthorizer) -> Self {
+        self.authorizer = Some(crate::authz::SharedAuthorizer::new(authorizer));
         self
     }
 
@@ -1115,6 +1132,7 @@ impl Plugin for HarvestPlugin {
             decode_payloads_on_read,
             role_auth_enabled,
             api_tokens_enabled,
+            authorizer,
             allow_unauthenticated_mutations,
             status_thresholds,
             canary_config,
@@ -1513,8 +1531,11 @@ impl Plugin for HarvestPlugin {
             let mut router = crate::api::apply_admin_auth_layers(
                 router,
                 &api_state,
-                api_tokens_enabled,
-                role_auth_enabled,
+                &crate::api::AdminAuthLayers {
+                    api_tokens: api_tokens_enabled,
+                    read_only_role: role_auth_enabled,
+                    authorizer,
+                },
             );
             if let Some(mw) = api_middleware {
                 router = mw(router);
@@ -1525,7 +1546,7 @@ impl Plugin for HarvestPlugin {
             // extractor for it.
             app.nest(&path, router.with_state(()))
         } else {
-            let _ = api_tokens_enabled;
+            let _ = (api_tokens_enabled, authorizer);
             app
         }
     }
