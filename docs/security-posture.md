@@ -27,7 +27,9 @@ classes, declared in `autumn_harvest::audit::CLASSIFIED_ROUTES`:
 ### Mutating routes (must be protected in production)
 
 The following categories carry production risk and **must** be behind
-authentication middleware in any non-local deployment:
+authentication middleware in any non-local deployment. Outside the `dev`
+profile, Harvest refuses them with `401` when the mount declares no auth layer.
+See [Fail-closed mutations](#fail-closed-mutations-issue-1802).
 
 - **Workflow lifecycle** — `start`, `signal`, `cancel`, `reset`
 - **DLQ replay/discard** — single and bulk
@@ -51,9 +53,9 @@ other routes should be behind your authentication boundary in production.
 ### Local / development (no auth)
 
 Mount the API without middleware **and run under `AUTUMN_PROFILE=dev`**. All
-routes — including every `/admin` route and the Vantage dashboard — are then
-reachable by any caller that can open a socket to the process, with no session,
-cookie or token. Suitable for local development and CI environments where the
+routes — including every `/admin` route, every mutating route and the Vantage
+dashboard — are then reachable by any caller that can open a socket to the
+process, with no session, cookie or token. Suitable for local development and CI environments where the
 network boundary already limits access.
 
 ```rust
@@ -66,7 +68,7 @@ Both halves are load-bearing (issue #1284). The admin gate
 deployment profile is exactly `dev` *and* no auth boundary was declared. Under
 any other profile — including the default `unknown` a standalone integration
 gets when it never sets one — the same mount is fail-closed and every `/admin`
-route answers `401`, which is why `harvest preflight` against a non-dev
+route and every mutating route answers `401`, which is why `harvest preflight` against a non-dev
 deployment needs a [scoped token](#scoped-api-tokens-built-in-opt-in--issue-942)
 or an admin session.
 
@@ -81,6 +83,73 @@ A process in this posture says so, twice, so it is never a silent surprise:
 A caller that *does* present an established (cookie-backed) session is still
 judged by `admin_auth_session_key` even in `dev` — so an embedder running its
 own auth middleware without going through `api_with_auth` keeps that gate.
+
+### Fail-closed mutations (issue #1802)
+
+Outside the `dev` profile, a mount with no declared auth boundary refuses
+every `Mutating` route with `401`. Before this change, only the admin-gated
+routes did. Workflow start, signal and update (with the with-start variants),
+reset, DAG trigger, patch and retry, schedule changes, external-activity
+callbacks, worker drain, Vantage form posts and MCP tool mutations were open
+to any caller.
+
+The gate covers three surfaces:
+
+- every `Mutating` route of `harvest_api_router`, by its
+  `CLASSIFIED_ROUTES` class (an unclassified route counts as `Mutating`, and
+  an `OPTIONS` preflight passes);
+- every Vantage `/ui` route, for any method except `GET`, `HEAD` and
+  `OPTIONS`;
+- every mutating MCP tool route (`start_{wf}`, `start_{dag}`, `signal_{wf}`
+  and `{wf}_update_{name}`).
+
+A request passes the gate when one of these is true:
+
+| Condition | How to set it |
+|---|---|
+| The profile is `dev` | `AUTUMN_PROFILE=dev` |
+| An auth boundary is declared | `HarvestPlugin::api_with_auth`, `api_with_role_auth`, or `StandaloneAdminAuth::with_admin_auth_boundary` |
+| The request carries a verified scoped token | [`enable_api_tokens`](#scoped-api-tokens-built-in-opt-in--issue-942) or `StandaloneAdminAuth::with_api_tokens`, and a `mutate` token. Tokens do not cover the MCP tool routes. |
+| The session carries an admin marker | the same markers the `/admin` gate reads |
+| The opt-out is set | see below |
+
+Read routes do not change. A route that already had an admin gate keeps it.
+The gate runs on a matched route only, so an unknown path still answers `404`.
+
+**Which profile is `dev`.** autumn-web reads `AUTUMN_ENV`, then
+`AUTUMN_PROFILE`, then `--profile`. With none of them, a release build from
+`#[autumn_web::main]` resolves to `prod`, and any other build resolves to
+`dev`. So a debug build with no profile set runs with the gate open. Set the
+profile explicitly in every deployment. `HarvestEmbedding` and a raw router
+default to `unknown`, which is not `dev`.
+
+**The opt-out.** `HarvestPlugin::allow_unauthenticated_mutations()`,
+`StandaloneAdminAuth::allow_unauthenticated_mutations()` or
+`HarvestApiState::set_allow_unauthenticated_mutations(true)` restores the
+pre-#1802 posture. Outside `dev`, `HarvestPlugin` and `HarvestEmbedding` then
+log a `tracing::warn!` at startup that names the open routes. A raw router
+mount logs nothing. `StandaloneAdminAuth::mount` sets the state from its own
+declaration, so a mount without the opt-out clears it. Use the opt-out only
+while you add an auth layer.
+
+**Visibility.** The `admin_auth_boundary` check in `GET /admin/preflight`
+reports `unauthenticated_mutations: true` whenever a caller with no credential
+can reach a mutating route. That is the `dev` profile, or the opt-out, with no
+declared boundary. When the opt-out opens the routes outside `dev`, the check
+fails and names the opt-out.
+
+**Remote callers.** External-activity callbacks (`complete`, `fail`,
+`heartbeat`) are mutating routes. Outside `dev`, a remote worker needs a
+credential. A `mutate` token also admits every admin route, so prefer an auth
+layer that admits the worker to the callback routes only.
+
+**MCP callers.** A `tools/call` through `secure_mcp` replays against the tool
+route with the caller's headers. Outside `dev`, a mutating tool then needs
+`api_with_auth` or an admin session. A scoped token does not authorize these
+routes, because the token layer wraps only the nested management router.
+
+**Not covered.** A raw `harvest_api_router` mount has no startup hook, so it
+logs no warning. Its gate still fails closed.
 
 ### Read-only operator tier (least-privilege triage)
 
@@ -380,11 +449,14 @@ Without authentication middleware:
 - The CLI token is sent but ignored by the server (unless it is a
   [scoped `hvst_` token](#scoped-api-tokens-built-in-opt-in--issue-942), which
   the built-in layer validates on its own).
-- Any caller can reach the ungated mutating endpoints without credentials.
-- The **admin-gated** routes additionally depend on the deployment profile: they
-  are reachable without credentials under `AUTUMN_PROFILE=dev` and answer `401`
-  under every other profile (issue #1284). So a bare `harvest preflight` works
-  against a local dev app and fails closed against anything else.
+- Read routes with no admin gate stay reachable without credentials.
+- Every **mutating** route and every **admin-gated** route depends on the
+  deployment profile. It is reachable without credentials under
+  `AUTUMN_PROFILE=dev`. It answers `401` under every other profile (issues
+  #1284 and #1802). The `allow_unauthenticated_mutations()` opt-out reopens
+  the mutating routes that have no admin gate. So a bare `harvest preflight`
+  or `harvest workflow start` works against a local dev app and fails closed
+  against anything else.
 
 With `RequireAuth` (session guard):
 
@@ -441,6 +513,10 @@ HarvestPlugin::new()
 
 Run each command **without credentials**. Every request must return `401` or
 `403` before any workflow, DLQ, schedule, batch, or retention side effect occurs.
+Outside the `dev` profile, Harvest returns `401` here even with no middleware
+(issue #1802). A `2xx` or a handler error means one of three things. The
+profile is `dev`, the opt-out is set, or your declared auth layer admits
+anonymous callers.
 
 ```bash
 BASE="https://your-app.example.com/api/harvest"

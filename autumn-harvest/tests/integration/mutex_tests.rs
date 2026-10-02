@@ -797,7 +797,7 @@ async fn start(url: &str, workflow_name: &str, workflow_id: &str, input: Value) 
             workflow_name,
             workflow_id,
             exec_id,
-            input,
+            input: input.into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,

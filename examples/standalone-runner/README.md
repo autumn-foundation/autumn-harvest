@@ -9,12 +9,17 @@ This example shows the out-of-the-box non-`HarvestPlugin` runner path. It does n
 - It applies `[harvest.startup] orphaned_workflows` from `autumn.toml`,
   `autumn-{profile}.toml` or `AUTUMN_HARVEST_STARTUP__ORPHANED_WORKFLOWS`.
 - `with_ambient_profile()` makes it read the deployment profile from `AUTUMN_ENV` or
-  `AUTUMN_PROFILE`. Without it, the profile is `unknown` and the admin API fails closed.
+  `AUTUMN_PROFILE`. Without it, the profile is `unknown`. The admin API and every mutating
+  route then fail closed (issue #1802).
   Declare a credential with `with_admin_auth(StandaloneAdminAuth::new().with_api_tokens())`.
 - It loads the persisted admission gates before the worker starts.
 - It installs the storage pool and the API runtime, in that order.
 
 `HarvestEmbeddingRuntime::stop` drains the worker and removes the process globals.
+
+[`docs/embedding.md`](../../docs/embedding.md) is the reference for this path. The getting-started
+fork, [The first workflow on plain Axum](../../docs/getting-started/standalone-axum.md), is the
+short version.
 
 The workflow is intentionally smaller than the billing Autumn app, but it still uses the same
 reference ideas: a saga reserves inventory with rollback, a child workflow buys the shipping

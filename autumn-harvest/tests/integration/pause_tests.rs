@@ -145,7 +145,7 @@ async fn start(conn: &mut AsyncPgConnection, name: &str, id: &str) -> ExecutionI
             workflow_name: name,
             workflow_id: id,
             exec_id: ExecutionId::new_for_shard(ShardId::new(0)),
-            input: Value::Null,
+            input: Value::Null.into(),
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,

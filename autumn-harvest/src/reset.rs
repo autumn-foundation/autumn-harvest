@@ -1390,7 +1390,7 @@ async fn insert_fork_execution(
         workflow_id: &source.workflow_id,
         run_id: Uuid::new_v4(),
         shard_id: source.shard_id,
-        input: source.input.clone(),
+        input: source.input.clone().into(),
         parent_id: None,
         queue_name: &source.queue_name,
         execution_timeout: source.execution_timeout,

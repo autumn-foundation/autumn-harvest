@@ -1486,7 +1486,16 @@ fn check_admin_auth_boundary(api_state: &HarvestApiState) -> PreflightCheckResul
     let profile = api_state.deployment_profile();
     let has_boundary = api_state.admin_auth_boundary();
     let is_dev = profile == "dev";
-    let status = if is_dev || has_boundary {
+    // Issue #1802: the opt-out opens the mutating routes outside `dev`. That
+    // is a known open state, so the check fails rather than warns.
+    let opt_out_open = crate::boot::mutation_opt_out_opens_routes(
+        &profile,
+        has_boundary,
+        api_state.allow_unauthenticated_mutations(),
+    );
+    let status = if opt_out_open {
+        PreflightStatus::Fail
+    } else if is_dev || has_boundary {
         PreflightStatus::Pass
     } else if profile == "unknown" {
         PreflightStatus::Warn
@@ -1503,6 +1512,13 @@ fn check_admin_auth_boundary(api_state: &HarvestApiState) -> PreflightCheckResul
     // carry it. Always present (never conditionally omitted) so a CI script can
     // assert on the field rather than on its absence.
     let unauthenticated_access = is_dev && !has_boundary;
+    // Issue #1802: report open mutating routes the same way. The opt-out can
+    // open them outside `dev`, so this is not the same field as above.
+    let unauthenticated_mutations = crate::boot::unauthenticated_mutations_open(
+        &profile,
+        has_boundary,
+        api_state.allow_unauthenticated_mutations(),
+    );
 
     check(
         "admin_auth_boundary",
@@ -1518,6 +1534,9 @@ fn check_admin_auth_boundary(api_state: &HarvestApiState) -> PreflightCheckResul
             PreflightStatus::Warn => {
                 "admin API auth boundary cannot be confirmed because the deployment profile is unknown"
             }
+            PreflightStatus::Fail if opt_out_open => {
+                "mutating routes are reachable unauthenticated: allow_unauthenticated_mutations is set without an auth boundary"
+            }
             PreflightStatus::Fail => {
                 "admin API is mounted without an auth boundary in a non-dev profile"
             }
@@ -1527,8 +1546,17 @@ fn check_admin_auth_boundary(api_state: &HarvestApiState) -> PreflightCheckResul
             PreflightStatus::Warn => {
                 Some("Set the deployment profile or mark the admin auth boundary explicitly.")
             }
+            PreflightStatus::Fail if opt_out_open => Some(
+                "Remove allow_unauthenticated_mutations, or declare an auth layer: \
+                 HarvestPlugin::api_with_auth on autumn-web, or \
+                 StandaloneAdminAuth::with_admin_auth_boundary on a standalone mount.",
+            ),
             PreflightStatus::Fail => Some(
-                "Use HarvestPlugin::api_with_auth or mount equivalent middleware before the Harvest admin API.",
+                "Wrap the Harvest API in your own auth layer and declare it: \
+                 HarvestPlugin::api_with_auth on autumn-web, or \
+                 StandaloneAdminAuth::with_admin_auth_boundary on a standalone mount. \
+                 API tokens alone are not a boundary, because a request with no token \
+                 still reaches each route that has no admin guard.",
             ),
         },
         Vec::new(),
@@ -1536,6 +1564,7 @@ fn check_admin_auth_boundary(api_state: &HarvestApiState) -> PreflightCheckResul
             "profile": profile,
             "auth_boundary_present": has_boundary,
             "unauthenticated_access": unauthenticated_access,
+            "unauthenticated_mutations": unauthenticated_mutations,
         }),
     )
 }
@@ -1773,6 +1802,73 @@ mod tests {
                 "profile {profile:?} must not report unauthenticated access"
             );
         }
+    }
+
+    /// Issue #1802: the check reports open mutating routes as data. The
+    /// field is always present, so a release script can gate on it.
+    #[test]
+    fn admin_auth_boundary_reports_unauthenticated_mutations() {
+        let cases = [
+            ("dev", false, false, true),
+            ("dev", true, false, false),
+            ("prod", false, false, false),
+            ("prod", false, true, true),
+            ("prod", true, true, false),
+            ("unknown", false, false, false),
+        ];
+        for (profile, boundary, opt_out, expected) in cases {
+            let state = HarvestApiState::new();
+            state.set_deployment_profile(profile);
+            state.set_admin_auth_boundary(boundary);
+            state.set_allow_unauthenticated_mutations(opt_out);
+            let result = check_admin_auth_boundary(&state);
+            assert_eq!(
+                result.details["unauthenticated_mutations"],
+                serde_json::json!(expected),
+                "profile={profile} boundary={boundary} opt_out={opt_out}"
+            );
+        }
+
+        // The opt-out outside `dev` is a known open state, so the check
+        // fails and names the opt-out. An `unknown` profile does not soften it.
+        for profile in ["prod", "unknown"] {
+            let state = HarvestApiState::new();
+            state.set_deployment_profile(profile);
+            state.set_allow_unauthenticated_mutations(true);
+            let result = check_admin_auth_boundary(&state);
+            assert_eq!(result.status, PreflightStatus::Fail, "{profile}");
+            assert!(
+                result.summary.contains("allow_unauthenticated_mutations"),
+                "{profile}: {}",
+                result.summary
+            );
+        }
+    }
+
+    /// Issue #1614. A standalone embedder reads this remediation too, so it
+    /// names the standalone declaration. It also says that a token layer alone
+    /// is not a boundary.
+    #[test]
+    fn admin_auth_boundary_remediation_names_the_standalone_declaration() {
+        let state = HarvestApiState::new();
+        state.set_deployment_profile("prod");
+        let result = check_admin_auth_boundary(&state);
+        assert_eq!(result.status, PreflightStatus::Fail);
+        let remediation = result.remediation.unwrap_or_default();
+        for needle in [
+            "HarvestPlugin::api_with_auth",
+            "StandaloneAdminAuth::with_admin_auth_boundary",
+            "API tokens alone",
+        ] {
+            assert!(
+                remediation.contains(needle),
+                "remediation must name {needle:?}, got: {remediation}"
+            );
+        }
+        assert!(
+            !remediation.contains("  "),
+            "each line continuation must leave one space, got: {remediation}"
+        );
     }
 
     /// Build a `WorkerRow` with the given registered `shard_assignments`.

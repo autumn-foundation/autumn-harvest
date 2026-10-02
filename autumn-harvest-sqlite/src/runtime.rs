@@ -915,8 +915,9 @@ impl SqliteRuntime {
     /// command and [`SqliteError::UnknownWorkflow`] for an unregistered workflow.
     /// Returns [`SqliteError::UnregisteredActivity`] for an unregistered activity.
     /// Returns [`SqliteError::NonDeterministic`] on replay divergence and
-    /// [`SqliteError::WorkflowPanicked`] for a contained panic. Otherwise returns
-    /// a persistence error.
+    /// [`SqliteError::WorkflowPanicked`] for a contained panic. Returns
+    /// [`SqliteError::TaskFailed`] when a cycle deadlocks (issue #1797).
+    /// Otherwise returns a persistence error.
     pub async fn run_until_blocked(&mut self, exec: ExecutionId) -> SqliteResult<RunState> {
         // Re-read the wall clock at the START of EACH cycle (issue #1069 P2), NOT
         // once for the whole call: a cycle can consume real time (e.g. a 2s
@@ -1148,6 +1149,7 @@ impl SqliteRuntime {
     /// The wall-clock drivers pass a closure that re-reads [`Self::now_fn`]; the
     /// `_as_of` drivers pass one that returns the caller-fixed epoch, so simulation
     /// stays deterministic (`failure_now() == now`).
+    #[allow(clippy::too_many_lines)] // one arm per `WorkflowOutcome` variant
     async fn drive_one_cycle(
         &mut self,
         exec: ExecutionId,
@@ -1343,6 +1345,12 @@ impl SqliteRuntime {
             WorkflowOutcome::ContinuedAsNew { .. } => {
                 Err(SqliteError::Unsupported("ContinueAsNew".to_string()))
             }
+            // Issue #1797: discard a deadlocked cycle, as for non-determinism
+            // above. The error stops the decision loop, so it cannot spin.
+            WorkflowOutcome::TaskFailed { error } => Err(SqliteError::TaskFailed {
+                execution_id: exec,
+                details: error,
+            }),
             WorkflowOutcome::Suspended { commands } => {
                 self.drive_suspension(exec, &history, &commands, now, failure_now)
             }

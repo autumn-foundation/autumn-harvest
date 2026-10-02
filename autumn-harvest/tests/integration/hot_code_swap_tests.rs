@@ -2229,7 +2229,7 @@ mod one_worker_process {
             workflow_id: &format!("wf-{}", exec_id.as_uuid()),
             run_id: Uuid::new_v4(),
             shard_id: 0,
-            input: input.clone(),
+            input: input.clone().into(),
             parent_id: None,
             queue_name: queue,
             execution_timeout: None,
@@ -2573,14 +2573,11 @@ async fn an_unpinned_host_still_reports_a_missing_module() {
 
 #[tokio::test]
 async fn the_trampoline_never_yields_between_decisions() {
-    // P1, and the subtlest of the three. `executor::run_workflow_handler_cycle`
-    // drives the handler inside `tokio::time::timeout(SUSPENSION_TIMEOUT)` —
-    // 100ms — and a workflow that returns `Poll::Pending` is BY DEFINITION
-    // treated as suspended. A `yield_now()` between guest decisions was
-    // therefore the one point at which that timer could fire while the
-    // trampoline had not yet recorded a command, yielding a zero-command
-    // suspension: a workflow parked on nothing, which the worker fails
-    // terminally.
+    // P1, and the subtlest of the three. Under the old 100 ms suspension
+    // timer, a `yield_now()` between guest decisions could end a cycle before
+    // the trampoline recorded a command. That was a zero-command suspension,
+    // which the worker fails terminally. Issue #1797 removed the timer, so a
+    // yield now only costs a scheduler round trip. The invariant stays.
     //
     // The invariant that replaces it: the trampoline's ONLY await is
     // `execute_activity_raw`, which pushes its `ScheduleActivity` command before
@@ -2600,9 +2597,8 @@ async fn the_trampoline_never_yields_between_decisions() {
         .join("\n");
     assert!(
         !live.contains("yield_now"),
-        "the trampoline must not yield between decisions: a `Poll::Pending` \
-         without a recorded command is read as a zero-command suspension and \
-         fails the workflow terminally"
+        "the trampoline must not yield between decisions: C9 keeps every \
+         suspension of a hosted workflow tied to a recorded command"
     );
 
     // And the guest still completes when its decisions are the slow part.
