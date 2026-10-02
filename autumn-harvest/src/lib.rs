@@ -409,6 +409,8 @@ pub mod shard;
 /// Shard rebalancing: migrating quiescent workflow executions across shards
 /// (issue #964).
 pub mod shard_rebalance;
+/// Shared, immutable JSON payload for the workflow start path (issue #1733).
+pub mod shared_json;
 /// Signal handler registry for push-based reactive signal handling (issue #546).
 pub mod signal_handler;
 pub mod simulator;
@@ -669,6 +671,7 @@ pub use schema_contract::{
 #[cfg(feature = "db")]
 pub use shard::ShardedDbPool;
 pub use shard::{ShardPlacement, ShardPlacementError, ShardRouter, ShardRouterParts};
+pub use shared_json::SharedJson;
 pub use signal_handler::SignalHandlerRegistry;
 pub use simulator::{SimulatorResult, WorkflowSimulator};
 pub use stall_diagnosis::{

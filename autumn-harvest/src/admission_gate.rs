@@ -65,6 +65,8 @@
 //! `StandaloneAdminAuth` (issue #1608), which installs the scoped-API-token
 //! layer and the read-only-role layer in the one correct order.
 //!
+//! `docs/embedding.md` lists every step of the standalone path.
+//!
 //! ## Scope semantics
 //!
 //! | Scope | Blocks |
