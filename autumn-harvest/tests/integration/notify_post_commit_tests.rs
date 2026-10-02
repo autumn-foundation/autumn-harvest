@@ -41,7 +41,9 @@ async fn setup() -> (String, ContainerAsync<Postgres>) {
     conn.batch_execute(&autumn_harvest::test_init_sql())
         .await
         .expect("migrations");
-    conn.batch_execute(SHADOW_SQL).await.expect("shadow pg_notify");
+    conn.batch_execute(SHADOW_SQL)
+        .await
+        .expect("shadow pg_notify");
     (url, container)
 }
 
@@ -190,10 +192,11 @@ async fn enqueue_in_a_transaction_commits_when_pg_notify_fails() {
     let exec_id = insert_execution(&mut conn).await;
     let params = enqueue_params("default", exec_id);
 
-    let result = Box::pin(conn.transaction::<Uuid, HarvestError, _>(async |conn| {
-        queue::enqueue(conn, &params).await
-    }))
-    .await;
+    let result =
+        Box::pin(conn.transaction::<Uuid, HarvestError, _>(async |conn| {
+            queue::enqueue(conn, &params).await
+        }))
+        .await;
 
     let task_id = result.expect("the enqueue must commit");
     assert_eq!(task_count(&url, task_id).await, 1);
@@ -393,6 +396,10 @@ async fn one_tick_sends_one_wake_per_queue() {
         for _ in 0..3 {
             queue::enqueue(conn, &params).await?;
         }
+        // Hold the commit, so the sender holds all three notes when it sees
+        // the commit. A note whose write committed before the sender read it
+        // goes in its own tick.
+        tokio::time::sleep(Duration::from_millis(300)).await;
         Ok(())
     }))
     .await
@@ -415,9 +422,7 @@ async fn one_tick_sends_one_wake_per_queue() {
 async fn a_failed_send_is_counted_and_the_append_commits() {
     let (url, _container) = setup().await;
     // Every connection of this pool reaches the failing `pg_notify`.
-    let failing_url = format!(
-        "{url}?options=-c%20search_path%3Dnotify_fail%2Cpg_catalog%2Cpublic"
-    );
+    let failing_url = format!("{url}?options=-c%20search_path%3Dnotify_fail%2Cpg_catalog%2Cpublic");
     let pool = build_pool(&failing_url);
     assert!(
         autumn_harvest::notify::register_pool(&pool)

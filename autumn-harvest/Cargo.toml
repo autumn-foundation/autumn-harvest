@@ -352,6 +352,10 @@ harness = false
 name = "claim_bench"
 required-features = ["db"]
 harness = false
+[[bench]]
+name = "notify_commit_bench"
+required-features = ["db"]
+harness = false
 
 # Retention-reclamation benchmark for the opt-in partitioned `harvest_events`
 # layout (issue #958). `harness = false` for the same reason as `claim_bench`:

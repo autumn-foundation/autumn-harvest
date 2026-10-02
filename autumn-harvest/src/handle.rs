@@ -295,6 +295,10 @@ impl WorkflowHandleClient {
         I: IntoIterator<Item = (ShardId, S)>,
         S: Into<String>,
     {
+        // Start the post-commit notify sender for each pool (issue #1796).
+        for (_, pool) in pools.iter_shards() {
+            crate::notify::register_pool(pool);
+        }
         Self {
             inner: Arc::new(WorkflowHandleClientInner {
                 pools,

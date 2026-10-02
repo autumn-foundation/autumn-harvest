@@ -4,12 +4,40 @@
 //! to a Postgres NOTIFY channel and wake immediately when a new task is enqueued.
 //! This module provides the channel naming convention, the notification payload
 //! type, and a [`QueueListener`] that wraps `tokio-postgres` for async LISTEN.
+//!
+//! # Post-commit delivery
+//!
+//! A transaction that calls `pg_notify` takes a database-wide lock at commit,
+//! so these commits run one at a time. A full notification queue also fails
+//! the commit (issue #1796). Thus [`notify_task_enqueued`],
+//! [`notify_tasks_enqueued`] and [`notify_workflow_events_appended`] never
+//! send inside the write transaction, and never fail the write.
+//!
+//! Each call stages a note with the transaction id of the write. The sender
+//! of a pool from [`register_pool`] reads `txid_status` on its own connection.
+//! It sends a note only after the write commits, and drops the note of a
+//! write that rolls back. One statement sends a batch, with one wake per
+//! queue and one per execution. That statement has no transaction id, so its
+//! commit is short.
+//!
+//! A write to a database with no registered pool uses the fallback. Outside a
+//! transaction, the write already committed, so the wake goes at once. Inside
+//! one, the wake goes in a savepoint, so its error cannot abort the write. A
+//! full queue can still fail that commit.
+//!
+//! Polling stays the correctness floor. A lost wake costs latency, not work.
+//! [`send_failures`] counts lost wakes.
 
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
+use deadpool::managed::WeakPool;
 use diesel::sql_types::Text;
-use diesel_async::AsyncPgConnection;
-use diesel_async::RunQueryDsl;
+use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+use diesel_async::{AsyncConnection as _, AsyncPgConnection, RunQueryDsl};
 use uuid::Uuid;
 
 use crate::error::{HarvestError, HarvestResult};
@@ -154,23 +182,21 @@ pub enum ProgressWaitOutcome {
 // Send notification (via diesel connection)
 // ---------------------------------------------------------------------------
 
-/// Send a `NOTIFY` on the appropriate channel for the given queue.
+/// Wake the workers that listen on `queue_name`, after the write commits.
 ///
-/// This is typically called immediately after [`crate::queue::enqueue()`] to
-/// wake any listening workers.
+/// Call this in the transaction that wrote the task row. See
+/// [post-commit delivery](crate::notify#post-commit-delivery) for how the wake
+/// is sent.
 ///
 /// # Errors
 ///
-/// Returns [`HarvestError::Database`] if the `NOTIFY` SQL fails.
+/// Never returns an error. A failed send is counted in [`send_failures`]. The
+/// `Result` is kept for callers that use `?`.
 pub async fn notify_task_enqueued(
     conn: &mut AsyncPgConnection,
     queue_name: &str,
     task_id: Uuid,
 ) -> HarvestResult<()> {
-    let channel = queue_channel(queue_name);
-    let payload = serde_json::to_string(&NotifyPayload { task_id })
-        .map_err(|e| HarvestError::Database(format!("failed to serialize notify payload: {e}")))?;
-
     // Chaos: drop this LISTEN/NOTIFY wake (issue #940 AC1(c)). The task row is
     // already committed; a dropped wake must still converge via the poll loop,
     // which is the source of truth (NOTIFY is only a latency optimization).
@@ -178,21 +204,24 @@ pub async fn notify_task_enqueued(
         return Ok(());
     }
 
-    diesel::sql_query("SELECT pg_notify($1, $2)")
-        .bind::<Text, _>(&channel)
-        .bind::<Text, _>(&payload)
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error)?;
-
+    stage(
+        conn,
+        vec![Note::Task {
+            channel: queue_channel(queue_name),
+            task_id,
+        }],
+    )
+    .await;
     Ok(())
 }
 
-/// Send a `NOTIFY` on the appropriate channels for multiple queues in a single roundtrip.
+/// Wake the workers of several queues, after the write commits.
+///
+/// Same contract as [`notify_task_enqueued`].
 ///
 /// # Errors
 ///
-/// Returns [`HarvestError::Database`] if the `NOTIFY` SQL fails.
+/// Never returns an error. A failed send is counted in [`send_failures`].
 pub async fn notify_tasks_enqueued(
     conn: &mut AsyncPgConnection,
     queue_names: &[String],
@@ -201,52 +230,647 @@ pub async fn notify_tasks_enqueued(
     if queue_names.is_empty() {
         return Ok(());
     }
-
-    let channels: Vec<String> = queue_names.iter().map(|q| queue_channel(q)).collect();
-    let payload = serde_json::to_string(&NotifyPayload { task_id })
-        .map_err(|e| HarvestError::Database(format!("failed to serialize notify payload: {e}")))?;
-
-    diesel::sql_query("SELECT pg_notify(channel, $2) FROM unnest($1) AS channel")
-        .bind::<diesel::sql_types::Array<Text>, _>(channels)
-        .bind::<Text, _>(&payload)
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error)?;
-
+    let notes = queue_names
+        .iter()
+        .map(|queue_name| Note::Task {
+            channel: queue_channel(queue_name),
+            task_id,
+        })
+        .collect();
+    stage(conn, notes).await;
     Ok(())
 }
 
-/// Send a notification that one or more workflow events were appended.
+/// Tell the listeners of [`workflow_events_channel`] that history advanced,
+/// after the write commits.
 ///
-/// When called inside a transaction, Postgres delivers the notification only
-/// after the transaction commits, so listeners wake after the execution row and
-/// event rows are mutually visible.
+/// Same contract as [`notify_task_enqueued`]. A listener wakes only after the
+/// execution row and the event rows are visible.
 ///
 /// # Errors
 ///
-/// Returns [`HarvestError::Database`] if payload serialization or `pg_notify`
-/// fails.
+/// Never returns an error. A failed send is counted in [`send_failures`].
 pub async fn notify_workflow_events_appended(
     conn: &mut AsyncPgConnection,
     workflow_exec_id: Uuid,
     event_count: usize,
     last_event_type: &str,
 ) -> HarvestResult<()> {
-    let payload = serde_json::to_string(&WorkflowEventNotifyPayload {
-        workflow_exec_id,
-        event_count,
-        last_event_type: last_event_type.to_string(),
-    })
-    .map_err(|e| HarvestError::Database(format!("failed to serialize notify payload: {e}")))?;
+    stage(
+        conn,
+        vec![Note::Events {
+            exec_id: workflow_exec_id,
+            count: event_count,
+            last_event_type: last_event_type.to_string(),
+        }],
+    )
+    .await;
+    Ok(())
+}
 
-    diesel::sql_query("SELECT pg_notify($1, $2)")
-        .bind::<Text, _>(workflow_events_channel())
-        .bind::<Text, _>(&payload)
+// ---------------------------------------------------------------------------
+// Post-commit delivery (issue #1796)
+// ---------------------------------------------------------------------------
+
+/// Postgres rejects a channel name of this many bytes or more (`NAMEDATALEN`).
+const PG_NAMEDATALEN: usize = 64;
+
+/// Most notes one sender holds. A note over the bound is dropped and counted.
+const MAX_PENDING_NOTES: usize = 10_000;
+
+/// How long the sender first waits before it reads an open transaction again.
+const GATE_RETRY_INTERVAL: Duration = Duration::from_millis(5);
+
+/// The retry wait doubles on each idle tick up to this bound.
+const GATE_RETRY_MAX: Duration = Duration::from_millis(200);
+
+/// How often an idle sender samples the queue usage and checks its pool.
+const IDLE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The sender drops a note whose transaction stays open longer than this.
+const MAX_GATE_WAIT: Duration = Duration::from_secs(60);
+
+/// How long the sender waits after it fails to get a connection.
+const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Shortest interval between two warnings about lost notifications.
+const FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Shortest delay before a worker claims after a wake.
+pub(crate) const SETTLE_DELAY_MIN: Duration = Duration::from_millis(25);
+
+/// Longest delay before a worker claims after a wake.
+pub(crate) const SETTLE_DELAY_MAX: Duration = Duration::from_millis(50);
+
+/// Notifications lost to an error since the process started.
+static SEND_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// When the lost-notification warning was last emitted.
+static FAILURE_LOGGED: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Every registered sender in the process.
+static SINKS: Mutex<Vec<Arc<SinkShared>>> = Mutex::new(Vec::new());
+
+/// A notification that waits for its write to commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Note {
+    /// A task became claimable on a queue channel.
+    Task {
+        /// The channel from [`queue_channel`].
+        channel: String,
+        /// The task, or the nil id for a wake that names no task.
+        task_id: Uuid,
+    },
+    /// History of one execution advanced.
+    Events {
+        /// The execution.
+        exec_id: Uuid,
+        /// Number of events appended.
+        count: usize,
+        /// Type name of the last appended event.
+        last_event_type: String,
+    },
+}
+
+impl Note {
+    /// The channel the note goes to.
+    fn channel(&self) -> &str {
+        match self {
+            Self::Task { channel, .. } => channel,
+            Self::Events { .. } => workflow_events_channel(),
+        }
+    }
+}
+
+/// True when Postgres accepts `channel` as a channel name.
+fn valid_channel(channel: &str) -> bool {
+    !channel.is_empty() && channel.len() < PG_NAMEDATALEN
+}
+
+/// Merge notes into one `(channel, payload)` pair per wake, in first-seen
+/// order.
+///
+/// Task notes merge per channel. One task keeps its id. Several tasks give
+/// the nil id, as [`notify_tasks_enqueued`] does. Event notes merge per
+/// execution: the counts add up, and the last type wins. A note on a channel
+/// that Postgres rejects is dropped.
+fn coalesce(notes: Vec<Note>) -> Vec<(String, String)> {
+    enum Merged {
+        Task(String, Uuid),
+        Events(Uuid, usize, String),
+    }
+    let mut merged: Vec<Merged> = Vec::new();
+    let mut index: HashMap<String, usize> = HashMap::new();
+    for note in notes {
+        if !valid_channel(note.channel()) {
+            continue;
+        }
+        match note {
+            Note::Task { channel, task_id } => match index.get(&channel) {
+                Some(&i) => {
+                    if let Merged::Task(_, id) = &mut merged[i] {
+                        *id = Uuid::nil();
+                    }
+                }
+                None => {
+                    index.insert(channel.clone(), merged.len());
+                    merged.push(Merged::Task(channel, task_id));
+                }
+            },
+            Note::Events {
+                exec_id,
+                count,
+                last_event_type,
+            } => {
+                let key = format!("events:{exec_id}");
+                match index.get(&key) {
+                    Some(&i) => {
+                        if let Merged::Events(_, total, last) = &mut merged[i] {
+                            *total += count;
+                            *last = last_event_type;
+                        }
+                    }
+                    None => {
+                        index.insert(key, merged.len());
+                        merged.push(Merged::Events(exec_id, count, last_event_type));
+                    }
+                }
+            }
+        }
+    }
+    merged
+        .into_iter()
+        .filter_map(|m| match m {
+            Merged::Task(channel, task_id) => serde_json::to_string(&NotifyPayload { task_id })
+                .ok()
+                .map(|payload| (channel, payload)),
+            Merged::Events(workflow_exec_id, event_count, last_event_type) => {
+                serde_json::to_string(&WorkflowEventNotifyPayload {
+                    workflow_exec_id,
+                    event_count,
+                    last_event_type,
+                })
+                .ok()
+                .map(|payload| (workflow_events_channel().to_string(), payload))
+            }
+        })
+        .collect()
+}
+
+/// A random delay from [`SETTLE_DELAY_MIN`] to [`SETTLE_DELAY_MAX`].
+///
+/// A worker sleeps this long after a wake and before it claims. Host clocks
+/// can run ahead of the database `NOW()`, so a new task needs a short time to
+/// become claimable. The jitter stops every worker from claiming at the same
+/// instant after one wake.
+#[must_use]
+pub fn settle_delay() -> Duration {
+    use rand::Rng as _;
+    let min = u64::try_from(SETTLE_DELAY_MIN.as_micros()).unwrap_or(u64::MAX);
+    let max = u64::try_from(SETTLE_DELAY_MAX.as_micros()).unwrap_or(u64::MAX);
+    Duration::from_micros(rand::thread_rng().gen_range(min..=max))
+}
+
+/// Notifications lost to an error since the process started.
+///
+/// A send that fails, a full sender queue and a rejected channel name each
+/// add one per note. A lost notification costs latency, not work, because the
+/// poll loop still finds the row.
+#[must_use]
+pub fn send_failures() -> u64 {
+    AtomicU64::load(&SEND_FAILURES, Ordering::Relaxed)
+}
+
+/// The largest `pg_notification_queue_usage()` that a live sender read last.
+///
+/// `None` when no sender has read it yet. A value near `1.0` means the queue
+/// is almost full. A listener that does not read its notifications causes
+/// this.
+#[must_use]
+pub fn queue_usage() -> Option<f64> {
+    lock(&SINKS)
+        .iter()
+        .filter(|sink| sink.alive())
+        .filter_map(|sink| *lock(&sink.queue_usage))
+        .reduce(f64::max)
+}
+
+/// Count `count` lost notifications and log the cause at a bounded rate.
+fn record_failures(count: usize, cause: &dyn std::fmt::Display) {
+    if count == 0 {
+        return;
+    }
+    let total = SEND_FAILURES.fetch_add(count as u64, Ordering::Relaxed) + count as u64;
+    let mut logged = lock(&FAILURE_LOGGED);
+    if logged.is_none_or(|at| at.elapsed() >= FAILURE_LOG_INTERVAL) {
+        *logged = Some(Instant::now());
+        tracing::warn!(
+            lost = count,
+            total,
+            cause = %cause,
+            "harvest: notifications lost; workers find the rows on their next poll"
+        );
+    }
+}
+
+/// Lock `mutex` and ignore poisoning. The guarded data stays valid after a
+/// panic, because every update is a single assignment or push.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The identity of one database, as both sides of a sender read it.
+///
+/// A database name alone is not unique across servers. The start time of the
+/// server tells two servers apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Fingerprint {
+    /// `current_database()`.
+    database: String,
+    /// `pg_postmaster_start_time()`.
+    started_at: DateTime<Utc>,
+}
+
+/// State one sender shares with the stage calls.
+struct SinkShared {
+    /// The pool the sender sends on. Weak, so the sender never keeps a pool
+    /// alive.
+    pool: WeakPool<AsyncDieselConnectionManager<AsyncPgConnection>>,
+    /// The address of the pool manager. It identifies the pool.
+    pool_key: usize,
+    /// The database the sender sends to. `None` until its first read.
+    fingerprint: Mutex<Option<Fingerprint>>,
+    /// Notes that wait for the sender.
+    pending: Mutex<Vec<Staged>>,
+    /// Wakes the sender when a note arrives.
+    wake: tokio::sync::Notify,
+    /// True after the first read of the fingerprint.
+    ready: tokio::sync::watch::Sender<bool>,
+    /// The last `pg_notification_queue_usage()` the sender read.
+    queue_usage: Mutex<Option<f64>>,
+    /// The sender task.
+    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl SinkShared {
+    /// True while the sender runs and its pool exists.
+    fn alive(&self) -> bool {
+        lock(&self.task)
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
+            && self.pool.upgrade().is_some()
+    }
+
+    /// Queue `notes` for the sender.
+    fn push(&self, txid: Option<i64>, notes: Vec<Note>) {
+        let staged_at = Instant::now();
+        let mut pending = lock(&self.pending);
+        let room = MAX_PENDING_NOTES.saturating_sub(pending.len());
+        let dropped = notes.len().saturating_sub(room);
+        pending.extend(notes.into_iter().take(room).map(|note| Staged {
+            txid,
+            staged_at,
+            note,
+        }));
+        drop(pending);
+        record_failures(dropped, &"the notify sender queue is full");
+        self.wake.notify_one();
+    }
+}
+
+/// A note with the transaction id of its write.
+struct Staged {
+    /// `txid_current_if_assigned()` of the write. `None` when the write had
+    /// already committed, or when the transaction had no id yet.
+    txid: Option<i64>,
+    /// When the note was staged.
+    staged_at: Instant,
+    /// The note.
+    note: Note,
+}
+
+/// A handle to the post-commit sender of one pool.
+///
+/// Dropping the handle does not stop the sender. The sender stops when its
+/// pool drops.
+#[derive(Clone)]
+pub struct NotifySink {
+    /// The shared sender state.
+    shared: Arc<SinkShared>,
+}
+
+impl std::fmt::Debug for NotifySink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NotifySink")
+            .field("pool_key", &self.shared.pool_key)
+            .field("ready", &*self.shared.ready.borrow())
+            .finish_non_exhaustive()
+    }
+}
+
+impl NotifySink {
+    /// Wait until the sender knows its database, or until `timeout` elapses.
+    ///
+    /// Returns `true` when the sender is ready. Before that, writes to the
+    /// database use the fallback.
+    pub async fn wait_ready(&self, timeout: Duration) -> bool {
+        let mut ready = self.shared.ready.subscribe();
+        matches!(
+            tokio::time::timeout(timeout, ready.wait_for(|ready| *ready)).await,
+            Ok(Ok(_))
+        )
+    }
+}
+
+/// Start the post-commit sender for `pool`, or return the running one.
+///
+/// After the sender is ready, a notification for a write to the database of
+/// `pool` goes after commit, on a connection from `pool`. This holds for a
+/// write on any connection to that database, pooled or not. `Worker::run`
+/// and `WorkflowHandleClient::new` call this. Call it for any other pool
+/// that writes history or tasks.
+///
+/// The sender runs on the current Tokio runtime. With no runtime, nothing
+/// starts and writes use the fallback.
+pub fn register_pool(pool: &crate::worker::DbPool) -> NotifySink {
+    let pool_key = std::ptr::from_ref(pool.manager()).addr();
+    let mut sinks = lock(&SINKS);
+    sinks.retain(|sink| sink.alive());
+    if let Some(sink) = sinks.iter().find(|sink| sink.pool_key == pool_key) {
+        return NotifySink {
+            shared: Arc::clone(sink),
+        };
+    }
+    let shared = Arc::new(SinkShared {
+        pool: pool.weak(),
+        pool_key,
+        fingerprint: Mutex::new(None),
+        pending: Mutex::new(Vec::new()),
+        wake: tokio::sync::Notify::new(),
+        ready: tokio::sync::watch::Sender::new(false),
+        queue_usage: Mutex::new(None),
+        task: Mutex::new(None),
+    });
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime) => {
+            let task = runtime.spawn(run_sender(Arc::clone(&shared)));
+            *lock(&shared.task) = Some(task);
+            sinks.push(Arc::clone(&shared));
+        }
+        Err(_) => {
+            tracing::debug!("harvest: no Tokio runtime; notifications use the fallback");
+        }
+    }
+    NotifySink { shared }
+}
+
+/// The live sender for the database `fingerprint` names.
+fn sink_for(fingerprint: &Fingerprint) -> Option<Arc<SinkShared>> {
+    lock(&SINKS)
+        .iter()
+        .find(|sink| sink.alive() && lock(&sink.fingerprint).as_ref() == Some(fingerprint))
+        .cloned()
+}
+
+/// True when the process has at least one sender.
+fn any_sink() -> bool {
+    !lock(&SINKS).is_empty()
+}
+
+/// True unless `conn` is certainly outside a transaction.
+///
+/// A broken transaction state counts as inside, so the caller takes the safe
+/// path.
+fn in_transaction(conn: &mut AsyncPgConnection) -> bool {
+    use diesel_async::TransactionManager as _;
+    let status =
+        <AsyncPgConnection as diesel_async::AsyncConnection>::TransactionManager::transaction_manager_status_mut(conn);
+    !matches!(status.transaction_depth(), Ok(None))
+}
+
+/// The row the write connection reads to stage a note.
+#[derive(diesel::QueryableByName)]
+struct StageRow {
+    /// `txid_current_if_assigned()`.
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::BigInt>)]
+    txid: Option<i64>,
+    /// `current_database()`.
+    #[diesel(sql_type = Text)]
+    database: String,
+    /// `pg_postmaster_start_time()`.
+    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+    started_at: DateTime<Utc>,
+}
+
+/// Stage `notes` for the write on `conn`. Never fails the write.
+///
+/// The statement reads only built-in functions, so it fails only on a
+/// transaction that has already failed. That transaction cannot commit
+/// anyway, so the error is counted and dropped.
+async fn stage(conn: &mut AsyncPgConnection, notes: Vec<Note>) {
+    if any_sink() {
+        let row = diesel::sql_query(
+            "SELECT txid_current_if_assigned() AS txid, \
+                    current_database()::text AS database, \
+                    pg_postmaster_start_time() AS started_at",
+        )
+        .get_result::<StageRow>(conn)
+        .await;
+        match row {
+            Ok(row) => {
+                let fingerprint = Fingerprint {
+                    database: row.database,
+                    started_at: row.started_at,
+                };
+                if let Some(sink) = sink_for(&fingerprint) {
+                    sink.push(row.txid, notes);
+                    return;
+                }
+            }
+            Err(error) if in_transaction(conn) => {
+                record_failures(notes.len(), &error);
+                return;
+            }
+            Err(_) => {}
+        }
+    }
+    send_on_write_connection(conn, notes).await;
+}
+
+/// The fallback: send `notes` on the write connection.
+///
+/// Outside a transaction the write already committed, so the send goes at
+/// once. Inside one, the send runs in a savepoint. Its error then rolls back
+/// only the savepoint, and the write can still commit.
+async fn send_on_write_connection(conn: &mut AsyncPgConnection, notes: Vec<Note>) {
+    let rejected = notes.iter().filter(|n| !valid_channel(n.channel())).count();
+    record_failures(rejected, &"Postgres rejects the channel name");
+    let wakes = coalesce(notes);
+    if wakes.is_empty() {
+        return;
+    }
+    let count = wakes.len();
+    let result = if in_transaction(conn) {
+        Box::pin(
+            conn.transaction::<(), diesel::result::Error, _>(async |conn| {
+                send_wakes(conn, wakes).await
+            }),
+        )
+        .await
+    } else {
+        send_wakes(conn, wakes).await
+    };
+    if let Err(error) = result {
+        record_failures(count, &error);
+    }
+}
+
+/// Send each `(channel, payload)` pair in one statement.
+async fn send_wakes(
+    conn: &mut AsyncPgConnection,
+    wakes: Vec<(String, String)>,
+) -> Result<(), diesel::result::Error> {
+    let (channels, payloads): (Vec<String>, Vec<String>) = wakes.into_iter().unzip();
+    diesel::sql_query("SELECT pg_notify(t.c, t.p) FROM unnest($1::text[], $2::text[]) AS t(c, p)")
+        .bind::<diesel::sql_types::Array<Text>, _>(channels)
+        .bind::<diesel::sql_types::Array<Text>, _>(payloads)
         .execute(conn)
         .await
-        .map_err(crate::error::database_error)?;
+        .map(drop)
+}
 
-    Ok(())
+/// The row the sender reads on its own connection.
+#[derive(diesel::QueryableByName)]
+struct GateRow {
+    /// `current_database()`.
+    #[diesel(sql_type = Text)]
+    database: String,
+    /// `pg_postmaster_start_time()`.
+    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+    started_at: DateTime<Utc>,
+    /// `pg_notification_queue_usage()`.
+    #[diesel(sql_type = diesel::sql_types::Double)]
+    queue_usage: f64,
+    /// `txid_status()` of each staged id, in order.
+    #[diesel(sql_type = diesel::sql_types::Array<diesel::sql_types::Nullable<Text>>)]
+    statuses: Vec<Option<String>>,
+}
+
+/// Run the sender of one pool until the pool drops.
+async fn run_sender(sink: Arc<SinkShared>) {
+    let mut held: Vec<Staged> = Vec::new();
+    let mut retry = GATE_RETRY_INTERVAL;
+    loop {
+        if *sink.ready.borrow() {
+            let wait = if held.is_empty() {
+                IDLE_INTERVAL
+            } else {
+                retry
+            };
+            tokio::select! {
+                () = sink.wake.notified() => retry = GATE_RETRY_INTERVAL,
+                () = tokio::time::sleep(wait) => retry = (retry * 2).min(GATE_RETRY_MAX),
+            }
+        }
+        let Some(pool) = sink.pool.upgrade() else {
+            break;
+        };
+        held.append(&mut lock(&sink.pending));
+        let excess = held.len().saturating_sub(MAX_PENDING_NOTES);
+        held.drain(..excess);
+        record_failures(excess, &"the notify sender queue is full");
+
+        let read = match pool.get().await {
+            Ok(mut conn) => {
+                drop(pool);
+                tick(&sink, &mut conn, &mut held).await
+            }
+            Err(error) => {
+                tracing::debug!(error = %error, "harvest: notify sender has no connection");
+                false
+            }
+        };
+        if !read {
+            tokio::time::sleep(CONNECT_RETRY_INTERVAL).await;
+        }
+    }
+    let lost = held.len() + lock(&sink.pending).len();
+    record_failures(lost, &"the pool of the notify sender dropped");
+}
+
+/// Read the commit state of every held note, then send the committed ones.
+///
+/// A committed note, a note with no transaction id and a note too old for
+/// `txid_status` go now. An aborted note is dropped. A note whose
+/// transaction is still open waits for the next tick, up to
+/// [`MAX_GATE_WAIT`].
+///
+/// Returns `false` when the commit state cannot be read. The notes then stay
+/// held for the next tick.
+async fn tick(sink: &SinkShared, conn: &mut AsyncPgConnection, held: &mut Vec<Staged>) -> bool {
+    let txids: Vec<i64> = held.iter().filter_map(|staged| staged.txid).collect();
+    let gate = diesel::sql_query(
+        "SELECT current_database()::text AS database, \
+                pg_postmaster_start_time() AS started_at, \
+                pg_notification_queue_usage() AS queue_usage, \
+                ARRAY(SELECT txid_status(t.x) \
+                      FROM unnest($1::bigint[]) WITH ORDINALITY AS t(x, n) \
+                      ORDER BY t.n) AS statuses",
+    )
+    .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(txids)
+    .get_result::<GateRow>(conn)
+    .await;
+    let gate = match gate {
+        Ok(gate) => gate,
+        Err(error) => {
+            tracing::debug!(error = %error, "harvest: notify sender cannot read commit state");
+            return false;
+        }
+    };
+    *lock(&sink.fingerprint) = Some(Fingerprint {
+        database: gate.database,
+        started_at: gate.started_at,
+    });
+    *lock(&sink.queue_usage) = Some(gate.queue_usage);
+    sink.ready.send_replace(true);
+
+    let mut statuses = gate.statuses.into_iter();
+    let mut ready_notes = Vec::new();
+    let mut waiting = Vec::new();
+    for staged in held.drain(..) {
+        let status = match staged.txid {
+            Some(_) => statuses.next().flatten(),
+            None => None,
+        };
+        match status.as_deref() {
+            Some("aborted") => {}
+            Some("in progress") => {
+                if staged.staged_at.elapsed() < MAX_GATE_WAIT {
+                    waiting.push(staged);
+                } else {
+                    tracing::debug!("harvest: dropped a notification whose transaction stays open");
+                }
+            }
+            _ => ready_notes.push(staged.note),
+        }
+    }
+    *held = waiting;
+
+    let rejected = ready_notes
+        .iter()
+        .filter(|n| !valid_channel(n.channel()))
+        .count();
+    record_failures(rejected, &"Postgres rejects the channel name");
+    let wakes = coalesce(ready_notes);
+    let count = wakes.len();
+    if count > 0
+        && let Err(error) = send_wakes(conn, wakes).await
+    {
+        record_failures(count, &error);
+    }
+    true
 }
 
 /// Fire a `NOTIFY` carrying one ephemeral progress chunk on the per-execution
