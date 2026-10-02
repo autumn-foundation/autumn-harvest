@@ -19,7 +19,8 @@ capability.
   an authorizer. With no hook, the router is unchanged.
 - **Shard sources.** The hook reads a shard only where the handler reads it.
   For an execution id in the path (decoded, also under `/ui`), it checks the
-  entry shard, the live shard and the shard of every retry attempt. On the
+  entry shard and the live shard. On a route that acts on the live attempt,
+  it also checks the shard of every retry attempt. On the
   routes in `authz::SHARD_SOURCES`, it reads a shard query parameter or body
   field. A shard named anywhere else is ignored, so a caller cannot show the
   hook one shard while the handler reads all of them. The lineage routes

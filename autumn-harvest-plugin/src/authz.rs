@@ -396,10 +396,9 @@ fn shard_number(raw: i64) -> Option<ShardId> {
 
 /// The shards an execution id in the path can touch.
 ///
-/// That is the id's entry shard, the shard it lives on now, and the shard of
-/// every later attempt in its retry chain. Handlers follow a rebalance
-/// forward, and many follow the retry chain to the live attempt. The walks
-/// are the ones the handlers use. If a walk fails, the handler fails it too,
+/// That is the id's entry shard and the shard it lives on now. On a route in
+/// [`RETRY_CHAIN_ROUTES`], it is also the shard of every later attempt in the
+/// retry chain. The walks are the ones the handlers use. If a walk fails, the handler fails it too,
 /// so the request gets `503`. An unknown id adds no attempts; the handler
 /// answers `404`.
 ///
@@ -429,6 +428,9 @@ async fn path_shards(
             .await
             .map_err(|e| unavailable(&e))?;
     let mut shards = vec![pool.routed_shard_for_execution(exec_id), live];
+    if !follows_retry_chain(method, path) {
+        return Ok(shards);
+    }
     match autumn_harvest::execution::walk_retry_chain(&mut conn, pool, live, exec_id).await {
         Ok(chain) => shards.extend(chain.into_iter().map(|(_, shard)| shard)),
         Err(autumn_harvest::HarvestError::NotFound(_)) => {}
@@ -460,6 +462,38 @@ struct StartPlacement {
     shard_id: Option<i64>,
     #[serde(default)]
     residency_key: Option<String>,
+}
+
+/// Routes whose handler follows the retry chain to the live attempt.
+///
+/// Every other execution-id route acts on the attempt it names. Checking the
+/// chain there would deny, or fail, a request that never touches a later
+/// attempt. Each template must be in
+/// [`autumn_harvest::audit::CLASSIFIED_ROUTES`].
+pub(crate) const RETRY_CHAIN_ROUTES: &[&str] = &[
+    "GET /workflows/{id}/result",
+    "POST /workflows/{id}/cancel",
+    "POST /workflows/{id}/terminate",
+    "POST /workflows/{id}/pause",
+    "POST /workflows/{id}/resume",
+    "POST /workflows/{id}/signal/{signal_name}",
+    "GET /workflows/{id}/query/{query_name}",
+    "POST /workflows/{id}/query/{query_name}",
+    "GET /workflows/{id}/queries",
+    "POST /workflows/{id}/update/{update_name}",
+    "GET /workflows/{id}/update/{update_id}/result",
+];
+
+/// Whether the handler of `method` and `path` follows the retry chain.
+fn follows_retry_chain(method: &Method, path: &str) -> bool {
+    static MATCHERS: std::sync::OnceLock<RouteMatchers<()>> = std::sync::OnceLock::new();
+    let matchers = MATCHERS.get_or_init(|| {
+        build_route_matchers(
+            "RETRY_CHAIN_ROUTES",
+            RETRY_CHAIN_ROUTES.iter().map(|route| (*route, ())),
+        )
+    });
+    match_route(matchers, method, path).is_some()
 }
 
 /// The shard a start body pins, if it pins one.
@@ -675,6 +709,25 @@ mod tests {
                 "{template} must be a classified route"
             );
         }
+    }
+
+    #[test]
+    fn retry_chain_routes_are_classified_routes() {
+        for template in RETRY_CHAIN_ROUTES {
+            assert!(
+                autumn_harvest::audit::CLASSIFIED_ROUTES
+                    .iter()
+                    .any(|(r, _)| r == template),
+                "{template} must be a classified route"
+            );
+        }
+        assert!(follows_retry_chain(&Method::POST, "/workflows/x/cancel"));
+        assert!(follows_retry_chain(&Method::HEAD, "/workflows/x/result"));
+        assert!(!follows_retry_chain(&Method::GET, "/workflows/x/history"));
+        assert!(!follows_retry_chain(
+            &Method::POST,
+            "/ui/workflows/x/cancel"
+        ));
     }
 
     #[test]

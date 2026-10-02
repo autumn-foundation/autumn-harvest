@@ -719,6 +719,19 @@ async fn retry_chain_attempts_are_checked_on_their_shards() {
     let rows = deny_rows(&mut conn).await;
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0].shard_id, Some(7));
+
+    // An exact-attempt route reads only attempt 1, so shard 7 is not checked.
+    let (status, _) = send(
+        &app,
+        Call::new("GET", &format!("/workflows/{first}/history")),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::FORBIDDEN,
+        "history reads only attempt 1"
+    );
+    assert_eq!(deny_rows(&mut conn).await.len(), 1);
 }
 
 /// A lineage route reads every shard for descendants, so the hook also sees
