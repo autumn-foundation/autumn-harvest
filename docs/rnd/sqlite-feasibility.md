@@ -60,12 +60,12 @@ module counts at the audited revision, recomputed by CI:
 | `interval-sql` (`INTERVAL '…'`, `make_interval()`) | 14 modules | Yes — integer epoch milliseconds. |
 | `raw-sql` — reaches for Diesel's raw-SQL escape hatch (`sql::<…>`, `sql_query`) | 40 modules | Case by case — the SQL must be read, not inferred from the ORM. |
 | `raw-pg-sql` — *identified* Postgres-only syntax within that SQL (JSONB `#>>`/`@>`, `::TYPE` casts in either case, `EXTRACT(EPOCH …)`, `JOIN LATERAL`, `~` regex) | 29 modules | Mostly — but each is a hand rewrite, and `~` has no SQLite equivalent at all. |
-| `advisory-lock` (`pg_advisory_*` / `pg_try_advisory_*`) | 13 modules | Subsumed by the single write lock. |
-| `to_regclass` table-existence probes | 9 modules | Yes — `sqlite_master` lookup. |
+| `advisory-lock` (`pg_advisory_*` / `pg_try_advisory_*`) | 14 modules | Subsumed by the single write lock. |
+| `to_regclass` table-existence probes | 10 modules | Yes — `sqlite_master` lookup. |
 | `listen/notify` push wakeups | 4 modules | No — polling is a degradation, not a translation. |
 | `gen_random_uuid` server-side ids | 1 module | Yes — mint application-side. |
 
-Plus **114 migrations** written in Postgres DDL (`JSONB`, `TIMESTAMPTZ`,
+Plus **115 migrations** written in Postgres DDL (`JSONB`, `TIMESTAMPTZ`,
 `INTERVAL`, `UUID`, partial indexes, `gen_random_uuid()` defaults), none of
 which apply to SQLite. The SQLite crate does not translate them; it declares
 its own schema.
@@ -161,7 +161,7 @@ Classification rule:
 | `activity_pause` | diesel, raw-sql | (b) | Claim-time gate on one activity type. The snapshot-window re-check and the two-pass resume credit exist only for READ COMMITTED; a single writer subsumes both. |
 | `admission_gate` | diesel, advisory-lock, raw-sql | (b) | Advisory lock subsumed by the single write lock. |
 | `audit` | diesel, raw-sql | (b) | Append-only row writes, plus one hand-written statement: the retention purge carries a `NOT EXISTS` guard against `harvest_audit_export_cursor` so a sweep can never delete an audit record the exporter has not yet shipped (#953). Written as one statement deliberately -- a read-then-delete pair would widen the window in which a concurrent redrive lowers the cursor between the two. Plain DML with nothing Postgres-specific in it, so the substitute is a direct transcription; it is (b) rather than (a) only because the SQL is hand-written and must be read rather than inferred from the ORM. |
-| `audit_export` | diesel, raw-pg-sql, raw-sql, row-lock | (b) | Off-box audit export (#953). `SELECT ... FOR UPDATE` on the per-shard cursor row serializes exporters (`row-lock`); a single writer subsumes it. The sequence-assignment statement uses a `row_number() OVER (ORDER BY ...)` window in an `UPDATE ... FROM` CTE -- SQLite has window functions (3.25+) but not `UPDATE ... FROM` before 3.33, so it needs a correlated-subquery rewrite. |
+| `audit_export` | advisory-lock, diesel, raw-pg-sql, raw-sql, row-lock, to_regclass | (b) | Off-box audit export (#953). `SELECT ... FOR UPDATE` on the per-shard cursor row serializes exporters (`row-lock`); a single writer subsumes it. The lazy claim-scan index build (#1667) takes a session advisory lock so two exporters never drop each other's build (`advisory-lock`), subsumed by the single write lock. It also probes `to_regclass` for the audit table and its index, a `sqlite_master` lookup. SQLite has no concurrent index build, so the build becomes a plain `CREATE INDEX`. The sequence-assignment statement uses a `row_number() OVER (ORDER BY ...)` window in an `UPDATE ... FROM` CTE -- SQLite has window functions (3.25+) but not `UPDATE ... FROM` before 3.33, so it needs a correlated-subquery rewrite. |
 | `backup_verify` | diesel, interval-sql, raw-pg-sql, raw-sql | (b) | Read-only post-restore probes (issue #943). Every statement is a `SELECT`, but the reused scanner predicates carry `NOW() - ($1 * INTERVAL '1 second')` interval arithmetic — rewrite against integer epoch ms, as `build_routing` does. `COUNT(*) OVER ()` already works (SQLite window functions, 3.25+). |
 | `batch` | diesel, raw-pg-sql, raw-sql | (b) | JSONB `\|\|` concatenation and `search_attrs @> $jsonb` containment. SQLite JSON1 has neither — rewrite with `json_patch`/`json_extract`. |
 | `build_routing` | diesel, interval-sql, raw-sql | (b) | Integer epoch ms for the interval arithmetic. |
