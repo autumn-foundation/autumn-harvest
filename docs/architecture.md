@@ -184,6 +184,7 @@ The capability-miss release still keys on `(worker_id, crash_strikes)`. It runs 
 *Enforcement.* `claim_held` in `queue.rs` is the one predicate: `state = 'RUNNING' AND worker_id = $w AND attempt = $a`. Every owner write and claim check uses it, in its own statement:
 
 - Writes: `complete_claimed_task`, `fail_claimed_task`, `requeue_claimed_task_for_retry`, `defer_claimed_rate_limited_task` and `record_heartbeat`.
+- Workflow-task writes: `requeue_claimed_workflow_task_after_deadlock` (issue #1797).
 - `lock_claim_for_update`. The start fence, both finalize paths, the in-worker schedule-to-close and session-acquire timeouts, and `run_transactional` take it after the execution row lock.
 - `claim_is_current` and `task_status_for_claim`. The cancellation observer and `ActivityContext::check_durable_cancellation` read them.
 - `claim_held_for_update_skip_locked`. For an activity row, `fail_task_and_execution_with_history` takes it before its `claim_still_held_for_update` guard. A later claim of the same worker returns `Ok` without a write. Any other miss returns `TerminalWriteClaimAmbiguous`, as the guard does.
@@ -202,7 +203,7 @@ A decision cycle suspends when the workflow is blocked on Harvest futures. No cl
 
 1. Poll the handler with the cycle's own waker. Catch a panic (issue #782). Poll inside `tokio::task::unconstrained`, so that the coop budget cannot decide when a ready tokio resource returns `Pending`.
 2. `Ready`: the handler returned. The cycle completes or fails.
-3. `Pending`, and a wake fired during the poll: a future is ready. Yield to the runtime and poll again. A `FuturesUnordered` that returns early after two self-woken children takes this path, so its other children still run.
+3. `Pending`, and a wake fired synchronously during the poll: a future is ready. Yield to the runtime and poll again. A `FuturesUnordered` that returns early after two self-woken children takes this path, so its other children still run. A wake from another thread after the poll does not count, because the poll window closes in one atomic step. A wake that tokio defers to the end of the task poll, such as `tokio::task::yield_now`, is not seen either. With a parked Harvest future, the cycle suspends after 64 such polls that add no command, so a future that only wakes itself cannot hold the cycle open.
 4. `Pending`, no wake, and a Harvest future is parked: the cycle suspends at once.
 5. `Pending`, no wake, and no parked Harvest future: the handler waits on a foreign future, such as a raw `tokio::time::sleep`. The cycle polls again when that future wakes it.
 
@@ -213,11 +214,11 @@ A decision cycle suspends when the workflow is blocked on Harvest futures. No cl
 
 The worker sends results only after it drains the cycle. A parked Harvest future therefore cannot resolve in the same cycle, and waiting longer cannot change the outcome.
 
-*Deadlock timeout.* `executor::DEADLOCK_TIMEOUT` is 2 s. The clock starts at the first step 3 or step 5 of a cycle. CPU time before that, such as a long replay, does not count. Step 4 does not check the clock. A cycle that is still in step 3 or step 5 when the clock expires returns `WorkflowOutcome::TaskFailed`. The worker then does this:
+*Deadlock timeout.* `executor::DEADLOCK_TIMEOUT` is 2 s. The clock starts at the first poll that ends with no parked Harvest future. CPU time before that, such as a long replay, does not count. A cycle with a parked Harvest future never checks the clock. A cycle that is still pending with no parked Harvest future when the clock expires returns `WorkflowOutcome::TaskFailed`. The worker then does this:
 
 - It discards the cycle's commands and appends no event. The run stays `RUNNING`.
 - It re-pends the task under the claim fence (`queue::requeue_claimed_workflow_task_after_deadlock`). A dispatcher that lost its claim writes nothing.
-- It waits 5 s, doubling per consecutive deadlock up to 300 s. Retries never stop, because a deadlock never fails the run.
+- It waits 5 s, doubling per consecutive deadlock up to 300 s. Retries never stop, because a deadlock never fails the run. The strike count is per worker and expires after 600 s.
 
 Keep `workflow_task_timeout` above `DEADLOCK_TIMEOUT`. A shorter body budget cancels the cycle first, and that path counts timeout strikes.
 

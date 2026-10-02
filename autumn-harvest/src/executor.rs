@@ -134,23 +134,53 @@ enum HandlerCycleResult {
     Deadlocked,
 }
 
+/// Woken re-polls without a new command before a parked cycle suspends
+/// (issue #1797). The count, not a clock, decides, so the result is
+/// deterministic.
+const MAX_IDLE_REPOLLS: u32 = 64;
+
 /// The waker a decision cycle gives the handler (issue #1797).
 ///
 /// It records a wake that fires while the handler is polled. Such a wake
 /// means a future is ready, so the cycle polls again before it decides. A
 /// `FuturesUnordered` that yields early after two self-woken children is
 /// one example. Every wake is also forwarded to the runtime task.
+///
+/// The poll window closes and is read in one atomic step. A wake from
+/// another thread after the poll ends only schedules the next outer poll.
+/// It cannot change how the cycle classifies the poll that just ended.
 struct CycleWaker {
-    woken: std::sync::atomic::AtomicBool,
+    /// [`POLL_IDLE`], [`POLL_ACTIVE`] or [`POLL_WOKEN`].
+    state: std::sync::atomic::AtomicU8,
     outer: std::sync::Mutex<std::task::Waker>,
 }
+
+/// No handler poll is running.
+const POLL_IDLE: u8 = 0;
+/// A handler poll is running and no wake has fired.
+const POLL_ACTIVE: u8 = 1;
+/// A wake fired while the handler poll was running.
+const POLL_WOKEN: u8 = 2;
 
 impl CycleWaker {
     fn new(outer: &std::task::Waker) -> Self {
         Self {
-            woken: std::sync::atomic::AtomicBool::new(false),
+            state: std::sync::atomic::AtomicU8::new(POLL_IDLE),
             outer: std::sync::Mutex::new(outer.clone()),
         }
+    }
+
+    /// Open the poll window.
+    fn begin_poll(&self) {
+        self.state
+            .store(POLL_ACTIVE, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Close the poll window. Returns `true` when a wake fired inside it.
+    fn end_poll(&self) -> bool {
+        self.state
+            .swap(POLL_IDLE, std::sync::atomic::Ordering::AcqRel)
+            == POLL_WOKEN
     }
 
     /// Store the runtime task's current waker.
@@ -167,9 +197,14 @@ impl CycleWaker {
 
 impl futures::task::ArcWake for CycleWaker {
     fn wake_by_ref(arc_self: &std::sync::Arc<Self>) {
-        arc_self
-            .woken
-            .store(true, std::sync::atomic::Ordering::Release);
+        // Only a wake inside the poll window counts. Any other wake fails
+        // the exchange and just schedules the runtime task.
+        let _ = arc_self.state.compare_exchange(
+            POLL_ACTIVE,
+            POLL_WOKEN,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        );
         arc_self
             .outer
             .lock()
@@ -185,8 +220,11 @@ impl futures::task::ArcWake for CycleWaker {
 /// The cycle polls the handler until it returns or until it is blocked.
 /// After each `Poll::Pending`, the cycle checks two things in order:
 ///
-/// 1. A wake fired during the poll: a future is ready. The cycle yields to
-///    the runtime and polls again.
+/// 1. A wake fired synchronously during the poll: a future is ready. The
+///    cycle yields to the runtime and polls again. With a parked Harvest
+///    future, it stops after [`MAX_IDLE_REPOLLS`] polls that add no command.
+///    A wake that tokio defers to the end of the task poll, such as
+///    `tokio::task::yield_now`, is not seen here.
 /// 2. Otherwise, a Harvest future is parked: the cycle suspends at once. It
 ///    does not check a clock.
 /// 3. Otherwise, the handler waits on a foreign future. The cycle returns
@@ -232,6 +270,8 @@ async fn run_workflow_handler_cycle(
     let mut deadline = std::pin::pin!(tokio::time::sleep(DEADLOCK_TIMEOUT));
     let mut deadline_armed = false;
     let mut cycle_waker: Option<(std::sync::Arc<CycleWaker>, std::task::Waker)> = None;
+    let mut last_commands = 0_usize;
+    let mut idle_repolls = 0_u32;
     let result = tokio::task::unconstrained(std::future::poll_fn(|cx| {
         let (flag, waker) = cycle_waker.get_or_insert_with(|| {
             let flag = std::sync::Arc::new(CycleWaker::new(cx.waker()));
@@ -239,10 +279,11 @@ async fn run_workflow_handler_cycle(
             (flag, waker)
         });
         flag.set_outer(cx.waker());
-        flag.woken
-            .store(false, std::sync::atomic::Ordering::Release);
         let mut handler_cx = std::task::Context::from_waker(waker);
-        match guarded.as_mut().poll(&mut handler_cx) {
+        flag.begin_poll();
+        let polled = guarded.as_mut().poll(&mut handler_cx);
+        let woken = flag.end_poll();
+        match polled {
             Poll::Ready(Ok(result)) => return Poll::Ready(HandlerCycleResult::Returned(result)),
             Poll::Ready(Err(panic_payload)) => {
                 return Poll::Ready(HandlerCycleResult::Panicked(crate::error::panic_message(
@@ -253,9 +294,23 @@ async fn run_workflow_handler_cycle(
         }
         // The wake also reached the runtime task, so returning `Pending`
         // below polls the handler again.
-        let woken = flag.woken.load(std::sync::atomic::Ordering::Acquire);
-        if !woken && ctx.has_parked_harvest_future() {
-            return Poll::Ready(HandlerCycleResult::Suspended);
+        if ctx.has_parked_harvest_future() {
+            if !woken {
+                return Poll::Ready(HandlerCycleResult::Suspended);
+            }
+            // Poll again while each poll adds commands. A future that only
+            // wakes itself adds none, so it cannot hold a parked cycle open.
+            let commands = ctx.count_commands(is_replay_significant_command);
+            if commands == last_commands {
+                idle_repolls += 1;
+            } else {
+                last_commands = commands;
+                idle_repolls = 0;
+            }
+            if idle_repolls >= MAX_IDLE_REPOLLS {
+                return Poll::Ready(HandlerCycleResult::Suspended);
+            }
+            return Poll::Pending;
         }
         // Only foreign futures are pending. Their wakes poll this cycle again.
         if !deadline_armed {
@@ -3460,6 +3515,52 @@ mod tests {
             })
             .collect();
         assert_eq!(names, ["a0", "a1", "a2"], "every branch must be dispatched");
+    }
+
+    /// Wakes itself on every poll and never resolves.
+    struct SpinForever;
+
+    impl std::future::Future for SpinForever {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    }
+
+    /// Races a durable timer against a future that only wakes itself.
+    fn timer_or_spin_workflow<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            tokio::select! {
+                biased;
+                fired = ctx.timer("deadline", 60) => {
+                    fired.map_err(|e| e.to_string())?;
+                    Ok(serde_json::json!("timer"))
+                }
+                () = SpinForever => Ok(serde_json::json!("spin")),
+            }
+        })
+    }
+
+    /// A self-waking future beside a parked Harvest future must not hold
+    /// the cycle until the deadlock timeout. The cycle suspends after a
+    /// bounded number of polls that add no command.
+    #[tokio::test(start_paused = true)]
+    async fn a_self_waking_future_beside_a_park_still_suspends() {
+        let started_at = tokio::time::Instant::now();
+        let outcome = run_workflow(
+            ExecutionId::new(),
+            vec![started()],
+            timer_or_spin_workflow,
+            Value::Null,
+        )
+        .await;
+        assert_eq!(outcome_shape(&outcome), ["StartTimer"], "got {outcome:?}");
+        assert_eq!(started_at.elapsed(), Duration::ZERO);
     }
 
     /// AC RED 1: the outcome must not depend on how long a step takes.

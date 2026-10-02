@@ -7522,6 +7522,50 @@ pub fn resolve_capability_miss_with_confidence(
 // Contained workflow handler-panic retry (issue #782)
 // ---------------------------------------------------------------------------
 
+/// Consecutive deadlocked workflow tasks per execution (issue #1797).
+///
+/// The count sets the retry backoff only. A retry often runs on another
+/// worker, so this worker may never see the outcome that would clear an
+/// entry. An entry older than [`DEADLOCK_STRIKE_TTL`] therefore counts as
+/// reset, and [`Self::record`] prunes such entries.
+#[derive(Debug, Default)]
+struct DeadlockStrikes(
+    std::sync::Mutex<std::collections::HashMap<uuid::Uuid, (u32, std::time::Instant)>>,
+);
+
+/// Age after which a deadlock strike no longer counts: twice the backoff cap.
+const DEADLOCK_STRIKE_TTL: Duration = Duration::from_secs(2 * DEADLOCK_RETRY_BACKOFF_CAP_SECS);
+
+impl DeadlockStrikes {
+    /// Count one more deadlock for `exec_id` and return the new count.
+    fn record(&self, exec_id: uuid::Uuid) -> u32 {
+        self.record_at(exec_id, std::time::Instant::now())
+    }
+
+    /// [`Self::record`] at a given instant, so that tests can age entries.
+    fn record_at(&self, exec_id: uuid::Uuid, now: std::time::Instant) -> u32 {
+        let mut map = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.retain(|_, (_, seen)| now.duration_since(*seen) < DEADLOCK_STRIKE_TTL);
+        let entry = map.entry(exec_id).or_insert((0, now));
+        entry.0 = entry.0.saturating_add(1);
+        entry.1 = now;
+        let count = entry.0;
+        drop(map);
+        count
+    }
+
+    /// Forget the strikes of `exec_id`.
+    fn clear(&self, exec_id: uuid::Uuid) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&exec_id);
+    }
+}
+
 /// Base delay before a deadlocked workflow task runs again (issue #1797).
 const DEADLOCK_RETRY_BACKOFF_BASE_SECS: u64 = 5;
 
@@ -20507,7 +20551,7 @@ async fn process_workflow_task(
     workflow_panic_strikes: &Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u32>>>,
     workflow_panic_max_attempts: u32,
     // Issue #1797: in-process deadlock strike map (per execution).
-    workflow_deadlock_strikes: &Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u32>>>,
+    workflow_deadlock_strikes: &Arc<DeadlockStrikes>,
     // Issue #783: absolute cut-off of the enclosing workflow-task dispatch
     // (issue #494), forwarded to inline local activities so their reported
     // deadline cannot out-live the cycle. `None` when that timeout is disabled.
@@ -21848,7 +21892,7 @@ async fn process_workflow_task(
     // `DEADLOCK_TIMEOUT`, so a reclaim can have moved the row meanwhile.
     if let WorkflowOutcome::TaskFailed { error } = &outcome {
         clear_panic_strike(workflow_panic_strikes, prepared.exec_id.as_uuid());
-        let strikes = increment_panic_strike(workflow_deadlock_strikes, prepared.exec_id.as_uuid());
+        let strikes = workflow_deadlock_strikes.record(prepared.exec_id.as_uuid());
         // `deadlock_retry_backoff` is capped at 300 s, so the fallback never
         // runs. It is still non-zero, so it cannot hot-loop.
         let backoff = chrono::Duration::from_std(deadlock_retry_backoff(strikes))
@@ -21880,7 +21924,7 @@ async fn process_workflow_task(
         }
         return Ok(());
     }
-    clear_panic_strike(workflow_deadlock_strikes, prepared.exec_id.as_uuid());
+    workflow_deadlock_strikes.clear(prepared.exec_id.as_uuid());
 
     // Issue #782: a **contained handler panic** must NOT fail the workflow on
     // the first strike — buy time for a hotfix/redeploy by re-dispatching with
@@ -22947,7 +22991,7 @@ async fn process_task(
     workflow_panic_strikes: Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u32>>>,
     workflow_panic_max_attempts: u32,
     // Issue #1797: deadlock strike map, consulted only on the workflow path.
-    workflow_deadlock_strikes: Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u32>>>,
+    workflow_deadlock_strikes: Arc<DeadlockStrikes>,
     // Issue #783: absolute cut-off of the enclosing workflow-task dispatch
     // (issue #494); `None` when that timeout is disabled. Workflow path only —
     // an activity task is not wrapped in it.
@@ -25660,10 +25704,7 @@ pub struct Worker {
     /// identical precedent to `workflow_task_timeout_strikes` (issue #494).
     workflow_panic_strikes: Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u32>>>,
     /// Consecutive deadlocked workflow tasks per execution (issue #1797).
-    ///
-    /// It sets the retry backoff only. A deadlock never fails the run, so
-    /// there is no budget. The same leak bound as the panic map applies.
-    workflow_deadlock_strikes: Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u32>>>,
+    workflow_deadlock_strikes: Arc<DeadlockStrikes>,
     /// In-process registry of worker sessions currently hosted by this
     /// worker (issue #606), bounded against `config.max_concurrent_sessions`
     /// via [`crate::sessions::try_acquire_session_slot`]. `0` (the default
@@ -31908,11 +31949,7 @@ pub async fn chaos_drive_one_workflow_task(
             uuid::Uuid,
             u32,
         >::new()));
-        let workflow_deadlock_strikes =
-            Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
-                uuid::Uuid,
-                u32,
-            >::new()));
+        let workflow_deadlock_strikes = Arc::new(DeadlockStrikes::default());
         let frontier_reset_committed = std::sync::atomic::AtomicBool::new(false);
         // Boxed for the same reason as the production call site
         // (clippy::large_futures).
@@ -31974,11 +32011,7 @@ pub async fn chaos_drive_one_workflow_task_cancel_at_hold(
             uuid::Uuid,
             u32,
         >::new()));
-        let workflow_deadlock_strikes =
-            Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
-                uuid::Uuid,
-                u32,
-            >::new()));
+        let workflow_deadlock_strikes = Arc::new(DeadlockStrikes::default());
         let frontier_reset_committed = std::sync::atomic::AtomicBool::new(false);
         // Boxed for the same reason as `chaos_drive_one_workflow_task`
         // (clippy::large_futures).
@@ -39910,6 +39943,21 @@ mod tests {
         // A degenerate `0` clamps to attempt 1 (base delay), not a zero-length
         // hot-loop.
         assert_eq!(panic_retry_backoff(0), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn deadlock_strikes_count_up_clear_and_expire() {
+        let strikes = DeadlockStrikes::default();
+        let exec = uuid::Uuid::new_v4();
+        assert_eq!(strikes.record(exec), 1);
+        assert_eq!(strikes.record(exec), 2);
+        strikes.clear(exec);
+        assert_eq!(strikes.record(exec), 1);
+        // An entry older than the TTL counts as reset and is pruned.
+        let other = uuid::Uuid::new_v4();
+        let later = std::time::Instant::now() + DEADLOCK_STRIKE_TTL + Duration::from_secs(1);
+        assert_eq!(strikes.record_at(other, later), 1);
+        assert_eq!(strikes.record_at(exec, later), 1);
     }
 
     #[test]
