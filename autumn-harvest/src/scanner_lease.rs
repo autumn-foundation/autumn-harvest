@@ -212,9 +212,11 @@ pub enum ScannerRole {
 /// The count covers consecutive leader passes only. A tick in any other role
 /// ends the run, because the lease may have moved away and back. See
 /// [`ABDICATE_AFTER_FAILED_PASSES`].
+#[cfg(feature = "db")]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LeaderFailures(u32);
 
+#[cfg(feature = "db")]
 impl LeaderFailures {
     /// Records one tick in `role`. `failed` says whether the tick's pass
     /// failed. Returns `true` when the leader must give up its lease.
@@ -507,6 +509,7 @@ mod tests {
 
     const BASE: Duration = Duration::from_secs(1);
 
+    #[cfg(feature = "db")]
     #[test]
     fn a_leader_gives_up_after_three_failed_leader_passes_in_a_row() {
         let mut failures = LeaderFailures::default();
@@ -521,6 +524,7 @@ mod tests {
         assert!(!failures.record(ScannerRole::Leader, true));
     }
 
+    #[cfg(feature = "db")]
     #[test]
     fn a_tick_in_any_other_role_ends_the_run_of_failures() {
         for other in [
