@@ -5785,6 +5785,13 @@ async fn the_startup_invalidation_is_index_servable_not_a_backlog_scan() {
          register_worker's transaction, so a backlog scan delays publishing the \
          very worker that resolves the miss. Plan was:\n{plan}"
     );
+    // The live-row index of issue #1795 also matches `state IN (...)`. A walk
+    // over it still reads every live row, so the plan must name this index.
+    assert!(
+        plan.contains("idx_harvest_tq_capability_miss_workers"),
+        "the startup invalidation must use the capability-miss partial index, \
+         not an index over every live row. Plan was:\n{plan}"
+    );
 }
 
 /// The empty-array guard in the invalidation's `WHERE` clause is
@@ -5827,11 +5834,13 @@ async fn dropping_the_empty_array_guard_returns_the_invalidation_to_a_full_scan(
     let without_guard = statement.replace(guard, "");
 
     let plan = explain_plan(&mut conn, &without_guard).await;
+    // Another index can still serve `state IN (...)`, for example the
+    // live-row index of issue #1795. So the check names the partial index.
     assert!(
-        plan.contains("Seq Scan on harvest_task_queue"),
+        !plan.contains("idx_harvest_tq_capability_miss_workers"),
         "without the empty-array guard the planner cannot match the partial \
-         index, so this variant must fall back to a scan — that is precisely \
-         why the conjunct is not redundant. Plan was:\n{plan}"
+         index, so this variant must fall back to a wider scan — that is \
+         precisely why the conjunct is not redundant. Plan was:\n{plan}"
     );
 }
 
