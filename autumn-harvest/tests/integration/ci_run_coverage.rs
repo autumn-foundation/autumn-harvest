@@ -656,6 +656,32 @@ fn subfilter_does_not_credit_whole_module() {
     );
 }
 
+// ── A filter credits every module that libtest runs with it ─────────────────
+
+/// libtest matches a filter as a substring of the full test path. A
+/// `pause_tests` row thus runs every test in `scheduler_auto_pause_tests`.
+/// The guard must credit what CI runs, so it matches by substring too.
+#[test]
+fn substring_filter_credits_every_module_it_runs() {
+    let rows = vec![SuiteRow {
+        osclass: "linux".into(),
+        krate: "autumn-harvest".into(),
+        target: "integration".into(),
+        features: "-".into(),
+        filter: "pause_tests".into(),
+    }];
+    assert!(core_covers(&rows, "scheduler_auto_pause_tests", false));
+    assert!(core_module_executes(
+        &rows,
+        "scheduler_auto_pause_tests",
+        &BTreeSet::new()
+    ));
+    assert!(
+        !core_covers(&rows, "pause_test_helpers", false),
+        "a module whose name does not contain the filter is not run"
+    );
+}
+
 // ── An `allos` core `integration` row without `db` does not cover a db module ─
 
 #[test]
@@ -794,6 +820,30 @@ fn claim_bench_support_is_classified_as_a_harness_not_a_suite() {
     );
 }
 
+/// Issue #1799 names five resilience suites that never ran in CI. Each must
+/// have a covering row and must not stay on the allowlist.
+#[test]
+fn issue_1799_suites_have_covering_rows() {
+    let rows = parse_manifest();
+    for (module, needs_testing) in [
+        ("scheduler_ha_tests", false),
+        ("poison_pill_tests", false),
+        ("signal_tests", false),
+        ("replayer_integration_tests", true),
+    ] {
+        assert!(
+            core_covers(&rows, module, needs_testing),
+            "core:{module} needs a covering `linux` manifest row"
+        );
+        assert!(!allowlisted(&format!("core:{module}")));
+    }
+    assert!(
+        plugin_covered(&rows, "erase_payloads_integration", &[]),
+        "plugin:erase_payloads_integration needs a covering `linux` manifest row"
+    );
+    assert!(!allowlisted("plugin:erase_payloads_integration"));
+}
+
 #[test]
 fn claim_budget_gate_has_a_covering_manifest_row() {
     // The gate is the whole point of issue #786; it must actually run in CI.
@@ -893,6 +943,8 @@ fn every_db_gated_test_has_a_ci_run_step_or_is_allowlisted() {
     // Track which allowlist keys correspond to a real, still-DB-gated test, so
     // stale entries (test deleted or de-DB-ified) are surfaced.
     let mut live_db_keys: BTreeSet<String> = BTreeSet::new();
+    // Keys that a manifest row covers. An allowlist entry for one is stale.
+    let mut covered_keys: BTreeSet<String> = BTreeSet::new();
 
     // Core: mod.rs is the source of truth for which suites exist + their cfg.
     for m in parse_core_modules() {
@@ -925,6 +977,7 @@ fn every_db_gated_test_has_a_ci_run_step_or_is_allowlisted() {
         // it would execute nothing.
         let covered = core_covers(&rows, &m.name, needs_testing) && !all_tests_ignored(&src);
         if covered {
+            covered_keys.insert(key);
             continue;
         }
         if allowlisted(&key) {
@@ -962,6 +1015,7 @@ fn every_db_gated_test_has_a_ci_run_step_or_is_allowlisted() {
         // nothing — so force it uncovered (→ must be allowlisted).
         let covered = plugin_covered(&rows, &stem, &req) && !all_tests_ignored(&src);
         if covered {
+            covered_keys.insert(key);
             continue;
         }
         if allowlisted(&key) {
@@ -979,11 +1033,11 @@ fn every_db_gated_test_has_a_ci_run_step_or_is_allowlisted() {
     }
 
     // Stale-allowlist check: every allowlisted key must still name a real,
-    // DB-gated test (otherwise the debt entry is dead and should be removed).
+    // DB-gated test that no row covers. Otherwise the debt entry is dead.
     let mut stale: Vec<&str> = ALLOWLIST
         .iter()
         .map(|&(k, _)| k)
-        .filter(|k| !live_db_keys.contains(*k))
+        .filter(|k| !live_db_keys.contains(*k) || covered_keys.contains(*k))
         .collect();
     stale.sort_unstable();
 
@@ -996,18 +1050,20 @@ fn every_db_gated_test_has_a_ci_run_step_or_is_allowlisted() {
     );
     assert!(
         stale.is_empty(),
-        "ALLOWLIST has stale entries (test deleted or no longer DB-gated) — remove them:\n  {}",
+        "ALLOWLIST has stale entries (test deleted, no longer DB-gated, or now covered by a \
+         manifest row) — remove them and lower ALLOWLIST_MAX_LEN:\n  {}",
         stale.join("\n  ")
     );
 }
 
 #[test]
-fn allowlist_does_not_grow_silently() {
-    assert!(
-        ALLOWLIST.len() <= ALLOWLIST_MAX_LEN,
-        "ALLOWLIST grew to {} entries (cap {ALLOWLIST_MAX_LEN}). It is technical debt to SHRINK \
-         by adding manifest rows, not to grow. If a new DB test genuinely cannot run in CI yet, \
-         raise the cap deliberately with justification.",
+fn allowlist_cap_equals_its_length() {
+    assert_eq!(
+        ALLOWLIST.len(),
+        ALLOWLIST_MAX_LEN,
+        "ALLOWLIST has {} entries but ALLOWLIST_MAX_LEN is {ALLOWLIST_MAX_LEN}. The cap must equal \
+         the length, so the list cannot grow back. When you remove an entry, lower the cap to match. \
+         To add an entry, raise the cap and give the reason in the same change.",
         ALLOWLIST.len()
     );
 }
