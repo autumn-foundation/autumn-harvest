@@ -107,8 +107,10 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          metrics_integration
 linux        autumn-harvest         integration                      -                          migrate_tests
 linux        autumn-harvest         integration                      -                          mixed_suspension_tests
+linux        autumn-harvest         integration                      -                          mixed_suspension_timer_batch_perf
 linux        autumn-harvest         integration                      -                          mutex_lease_reclaim_perf
 linux        autumn-harvest         integration                      -                          mutex_tests
+linux        autumn-harvest         integration                      -                          notify_post_commit_tests
 linux        autumn-harvest         integration                      -                          panic_containment_tests
 linux        autumn-harvest         integration                      -                          parent_close_cascade_unfinished_handlers_perf
 linux        autumn-harvest         integration                      -                          pause_tests
@@ -129,6 +131,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          retention_overrides_tests
 linux        autumn-harvest         integration                      -                          retention_summary_tests
 linux        autumn-harvest         integration                      -                          retry_after_tests
+linux        autumn-harvest         integration                      -                          retry_budget_tests
 linux        autumn-harvest         integration                      -                          retry_chain_routing_tests
 linux        autumn-harvest         integration                      -                          retry_clock_skew_tests
 linux        autumn-harvest         integration                      -                          scanner_tick_db_tests
@@ -144,6 +147,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          slot_tuner_tests
 linux        autumn-harvest         integration                      -                          start_idempotency_tests
 linux        autumn-harvest         integration                      -                          start_source_tests
+linux        autumn-harvest         integration                      -                          sticky_default_tests
 linux        autumn-harvest         integration                      -                          terminal_write_ownership_tests
 linux        autumn-harvest         integration                      -                          throttle_bucket_prelock_batch_perf
 linux        autumn-harvest         integration                      -                          transactional_start_tests

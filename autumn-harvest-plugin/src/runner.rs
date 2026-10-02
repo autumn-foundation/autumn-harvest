@@ -878,6 +878,9 @@ impl PreparedHarvestRuntime {
     }
 }
 
+/// How long [`HarvestRunner::stop`] waits for each notify sender to drain.
+const NOTIFY_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Running Harvest runtime ownership for a process.
 ///
 /// This owns any locally started worker and scheduler tasks while also
@@ -1104,6 +1107,11 @@ impl HarvestRunner {
         let harvest_pool = prepared.storage_pool.clone_inner();
         let shard_router = prepared.shard_router.clone();
         autumn_harvest::shard::install_global_router(shard_router.clone());
+        // Start the post-commit notify sender for each storage pool (issue
+        // #1796). An API-only process has no `Worker` to do it.
+        for (_, shard_pool) in prepared.storage_pool.iter_shards() {
+            autumn_harvest::notify::register_pool(shard_pool);
+        }
 
         if !config.worker_enabled && !config.scheduler_enabled {
             tracing::info!(
@@ -1268,6 +1276,9 @@ impl HarvestRunner {
         // publisher this metric describes is installed unconditionally,
         // above. That happens specifically because an API-only process
         // still publishes references for the fleet (issue #1429 review).
+        // The same sampler also emits the notify gauges (issue #1796). An
+        // API-only process writes through the pools registered above, so it
+        // sends notifications and needs them too.
         // Only spawn when there is no `Worker` to double up with.
         let dispatch_metrics_sampler = if worker.is_none() {
             let cancel = CancellationToken::new();
@@ -1438,7 +1449,7 @@ impl HarvestRunner {
     pub async fn stop(self) {
         let Self {
             api_runtime: _,
-            storage_pool: _,
+            storage_pool,
             worker,
             worker_handle,
             scheduler,
@@ -1496,6 +1507,13 @@ impl HarvestRunner {
             && let Err(error) = worker_handle.await
         {
             tracing::warn!(error = %error, "harvest worker task failed during shutdown");
+        }
+        // Send the wakes of the last writes before the runtime can stop the
+        // notify senders (issue #1796).
+        for (_, shard_pool) in storage_pool.iter_shards() {
+            autumn_harvest::notify::register_pool(shard_pool)
+                .flush(NOTIFY_FLUSH_TIMEOUT)
+                .await;
         }
     }
 }

@@ -279,6 +279,30 @@ async fn requeue_workflow_task_for_quota_retry_computes_scheduled_at_on_the_db_c
 /// `make_interval(secs => 0)` is a no-op. This needs no special case in
 /// production code. The earlier host-side padding fix needed one: it had to
 /// carve zero out, or strand a queue-pause reset (issue #1389).
+/// A retry-budget deferral (issue #1793) must wait on Postgres's clock. A
+/// host clock that trails Postgres would make the deferred row due at once.
+/// The worker would then claim and defer it again in a loop.
+#[tokio::test]
+async fn defer_claimed_retry_for_budget_computes_scheduled_at_on_the_db_clock() {
+    let (mut conn, _c) = setup_db().await;
+    let q = unique_queue("budget-skew");
+    let task = enqueue_activity_task(&mut conn, &q).await;
+    assert_eq!(claim_one(&mut conn, &q).await, task);
+
+    let claim = queue::TaskClaim {
+        task_id: task,
+        worker_id: "w1".to_string(),
+        attempt: 1,
+    };
+    let delay = Duration::seconds(2);
+    let write = queue::defer_claimed_retry_for_budget(&mut conn, &claim, delay)
+        .await
+        .expect("defer for budget");
+    assert_eq!(write, queue::ClaimWrite::Applied);
+
+    assert_scheduled_at_matches_delay_on_db_clock(&mut conn, task, delay).await;
+}
+
 #[tokio::test]
 async fn requeue_for_retry_zero_delay_computes_scheduled_at_on_the_db_clock() {
     let (mut conn, _c) = setup_db().await;

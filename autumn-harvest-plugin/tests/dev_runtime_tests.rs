@@ -2489,6 +2489,8 @@ impl Drop for KillOnDrop {
 #[cfg(unix)]
 #[test]
 fn an_old_session_with_a_live_process_on_its_data_dir_survives_the_full_reap_pipeline() {
+    use std::io::BufRead as _;
+
     // Issue #1585, end to end. The record is far older than the grace period
     // and has no pid file. A live process names the data directory, so the
     // reaper must leave the session alone.
@@ -2509,12 +2511,28 @@ fn an_old_session_with_a_live_process_on_its_data_dir_survives_the_full_reap_pip
 
     // The trailing `:` stops `sh` from exec-ing `sleep`, which would drop the
     // data directory from the command line.
-    let child = std::process::Command::new("sh")
-        .args(["-c", "sleep 30; :", "--pgdata"])
+    //
+    // `spawn` returns before the kernel publishes the new argv. Linux wakes
+    // the parent when `execve` releases the old address space. It fills in
+    // the argv bounds later, so `/proc/<pid>/cmdline` reads empty for some
+    // milliseconds. A loaded CI runner lets the reaper scan win that race.
+    // The `ready` line proves the shell runs, so its argv is visible.
+    let mut child = std::process::Command::new("sh")
+        .args(["-c", "echo ready; sleep 30; :", "--pgdata"])
         .arg(&data_dir)
+        .stdout(std::process::Stdio::piped())
         .spawn()
         .expect("spawn stand-in postmaster");
+    let mut handshake = std::io::BufReader::new(child.stdout.take().expect("piped stdout"));
     let _guard = KillOnDrop(child);
+    let mut ready = String::new();
+    handshake
+        .read_line(&mut ready)
+        .expect("read the ready line");
+    assert_eq!(
+        ready, "ready\n",
+        "the stand-in postmaster must report that it runs"
+    );
     let reclaimed = autumn_harvest_plugin::dev::reap_stale_sessions(&root).expect("reap");
 
     assert_eq!(

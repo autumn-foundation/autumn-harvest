@@ -1,0 +1,6 @@
+-- after: mixed-suspension timer persist, pg_stat_statements sweep --
+seed: 20000 executions, ~110000 timer rows, 5% pending
+n	lookup_calls	lookup_buffers	clock_calls	insert_calls	insert_buffers	target_calls	target_buffers	park_calls	park_buffers
+3	2	458	1	1	98	4	556	111	7189
+10	2	458	1	1	231	4	689	113	7456
+40	2	458	1	1	531	4	989	111	8142

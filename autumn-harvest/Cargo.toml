@@ -307,6 +307,17 @@ testcontainers-modules = { workspace = true }
 [target.'cfg(loom)'.dependencies]
 loom = "0.7.2"
 
+# Shuttle is only pulled in under `RUSTFLAGS="--cfg shuttle"` (issue #1800).
+# It is a target dependency for the same reason as loom above: the
+# `crate::shuttle_sync` shim names these crates from the library sources.
+# `shuttle-tokio` and `shuttle-tokio-util` mirror the tokio and tokio-util
+# APIs. Their `shuttle` feature swaps in the Shuttle-scheduled types. See
+# `docs/testing/shuttle.md`.
+[target.'cfg(shuttle)'.dependencies]
+shuttle = "0.9.5"
+shuttle-tokio = { version = "1.0.0", features = ["shuttle", "macros", "rt", "sync", "time"] }
+shuttle-tokio-util = { version = "0.7.0", features = ["shuttle"] }
+
 [[bench]]
 name = "replay_bench"
 required-features = ["testing"]
@@ -354,6 +365,10 @@ harness = false
 # builds are unaffected.
 [[bench]]
 name = "claim_bench"
+required-features = ["db"]
+harness = false
+[[bench]]
+name = "notify_commit_bench"
 required-features = ["db"]
 harness = false
 
