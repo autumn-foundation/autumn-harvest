@@ -2286,10 +2286,14 @@ mod tests {
 
         let descriptors = collect_descriptors(&[wf("order_flow", true)], &[], &[]);
         record_schemas(&descriptors);
+        // Issue #1802: open the mutation gate, so the 401 comes from the
+        // configured middleware alone.
+        let api_state = crate::api::HarvestApiState::new();
+        api_state.set_allow_unauthenticated_mutations(true);
         let routes = build_mcp_tool_routes(
             "/api/harvest/mcp",
             &descriptors,
-            &crate::api::HarvestApiState::new(),
+            &api_state,
             Some(&tool_middleware),
             false,
         );
@@ -2313,18 +2317,18 @@ mod tests {
     /// Without a configured middleware (`None`, matching every existing
     /// test above), a request must still reach the real handler — i.e. this
     /// module's hardening does not accidentally start gating requests when
-    /// the embedder never opted into `api_with_auth`.
+    /// the embedder never opted into `api_with_auth`. The issue #1802 gate
+    /// is a separate check, so this test opens it.
     #[tokio::test]
     async fn mcp_tool_routes_are_unwrapped_when_no_middleware_is_configured() {
         let descriptors = collect_descriptors(&[wf("order_flow", true)], &[], &[]);
         record_schemas(&descriptors);
-        let routes = build_mcp_tool_routes(
-            "/api/harvest/mcp",
-            &descriptors,
-            &crate::api::HarvestApiState::new(),
-            None,
-            false,
-        );
+        // Issue #1802: the opt-out opens the mutation gate, so this test sees
+        // the absent middleware and not the gate.
+        let api_state = crate::api::HarvestApiState::new();
+        api_state.set_allow_unauthenticated_mutations(true);
+        let routes =
+            build_mcp_tool_routes("/api/harvest/mcp", &descriptors, &api_state, None, false);
 
         let client = autumn_web::test::TestApp::new().routes(routes).build();
 

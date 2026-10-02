@@ -8122,6 +8122,9 @@ async fn ui_timeline_200_steps_under_1s() {
 #[tokio::test]
 async fn vantage_and_dlq_mutations_reject_cross_site_post() {
     let api_state = HarvestApiState::new();
+    // Issue #1802: open the mutation gate, so this test isolates the
+    // same-origin guard. On a closed state, the gate answers 401 first.
+    api_state.set_allow_unauthenticated_mutations(true);
     let app = autumn_harvest_plugin::harvest_api_router(api_state.clone())
         .nest("/ui", harvest_ui_router(api_state));
 
