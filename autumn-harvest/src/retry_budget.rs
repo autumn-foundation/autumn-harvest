@@ -442,6 +442,10 @@ impl Bucket {
         } else {
             ready
         };
+        // Reserve the real wake-up time. At a fast rate the minimum delay
+        // is longer than the refill interval, and the next slot must follow
+        // this one.
+        let slot = slot.max(now + MIN_RETRY_BUDGET_DEFER);
         if slot.saturating_duration_since(now) >= MAX_RETRY_BUDGET_DEFER {
             return (overflow_delay(), None);
         }
@@ -450,10 +454,7 @@ impl Bucket {
             previous: self.next_slot,
         };
         self.next_slot = slot;
-        let delay = slot
-            .saturating_duration_since(now)
-            .max(MIN_RETRY_BUDGET_DEFER);
-        (delay, Some(reservation))
+        (slot.saturating_duration_since(now), Some(reservation))
     }
 }
 
@@ -836,6 +837,25 @@ mod tests {
             third >= second + Duration::from_millis(450),
             "{second:?} {third:?}"
         );
+    }
+
+    /// At a fast refill rate, the 50 ms minimum delay is longer than the
+    /// refill interval. Each slot must then follow the clamped wake-up time,
+    /// or several retries wake at one instant.
+    #[test]
+    fn fast_refill_deferrals_are_spaced_after_the_minimum_delay() {
+        let reg = registry(RetryBudgetPolicy::new(0.0, 1.0, 100.0));
+        let now = Instant::now();
+        assert_eq!(drain(&reg, A, now), 1);
+        let waits: Vec<Duration> = (0..5)
+            .map(|_| retry_after(reg.admit(A, true, now)))
+            .collect();
+        for pair in waits.windows(2) {
+            assert!(
+                pair[1] >= pair[0] + Duration::from_millis(9),
+                "deferrals must not share a wake-up time: {waits:?}"
+            );
+        }
     }
 
     #[test]
