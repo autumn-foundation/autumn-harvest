@@ -158,7 +158,13 @@ fn mixed_suspension_workflow<'a>(
         let signal_fut =
             ctx.signal_external_workflow(target, "my_signal", serde_json::json!({"data": "hello"}));
 
+        // `biased` polls in declaration order, so a replay always re-emits
+        // the parked branch's command first. `tokio::select!` picks a random
+        // order otherwise. A replay that polls the inline-resolved branch
+        // first returns before it consumes the recorded command, and the
+        // drift guard (#1791) blocks the run.
         tokio::select! {
+            biased;
             res = timer_fut => {
                 res.map_err(|e| e.to_string())?;
                 Ok(serde_json::json!({"status": "timer_fired"}))
@@ -201,7 +207,13 @@ fn mixed_suspension_cancel_workflow<'a>(
         let timer_fut = ctx.timer("long_timer", 3600);
         let cancel_fut = ctx.request_cancel_external_workflow(target);
 
+        // `biased` polls in declaration order, so a replay always re-emits
+        // the parked branch's command first. `tokio::select!` picks a random
+        // order otherwise. A replay that polls the inline-resolved branch
+        // first returns before it consumes the recorded command, and the
+        // drift guard (#1791) blocks the run.
         tokio::select! {
+            biased;
             res = timer_fut => {
                 res.map_err(|e| e.to_string())?;
                 Ok(serde_json::json!({"status": "timer_fired"}))
@@ -272,7 +284,13 @@ fn mixed_signal_wait_external_signal_workflow<'a>(
         let signal_fut =
             ctx.signal_external_workflow(target, "my_signal", serde_json::json!({"data": "hello"}));
 
+        // `biased` polls in declaration order, so a replay always re-emits
+        // the parked branch's command first. `tokio::select!` picks a random
+        // order otherwise. A replay that polls the inline-resolved branch
+        // first returns before it consumes the recorded command, and the
+        // drift guard (#1791) blocks the run.
         tokio::select! {
+            biased;
             res = wait_fut => {
                 res.map_err(|e| e.to_string())?;
                 Ok(serde_json::json!({"status": "signal_received"}))
@@ -300,7 +318,13 @@ fn mixed_signal_wait_external_cancel_workflow<'a>(
         let wait_fut = ctx.receive_signal::<serde_json::Value>("parent_never_arrives");
         let cancel_fut = ctx.request_cancel_external_workflow(target);
 
+        // `biased` polls in declaration order, so a replay always re-emits
+        // the parked branch's command first. `tokio::select!` picks a random
+        // order otherwise. A replay that polls the inline-resolved branch
+        // first returns before it consumes the recorded command, and the
+        // drift guard (#1791) blocks the run.
         tokio::select! {
+            biased;
             res = wait_fut => {
                 res.map_err(|e| e.to_string())?;
                 Ok(serde_json::json!({"status": "signal_received"}))
@@ -349,7 +373,13 @@ fn mixed_activity_external_signal_workflow<'a>(
         let signal_fut =
             ctx.signal_external_workflow(target, "my_signal", serde_json::json!({"data": "hello"}));
 
+        // `biased` polls in declaration order, so a replay always re-emits
+        // the parked branch's command first. `tokio::select!` picks a random
+        // order otherwise. A replay that polls the inline-resolved branch
+        // first returns before it consumes the recorded command, and the
+        // drift guard (#1791) blocks the run.
         tokio::select! {
+            biased;
             res = activity_fut => {
                 res.map_err(|e| e.to_string())?;
                 Ok(serde_json::json!({"status": "activity_done"}))
@@ -400,7 +430,13 @@ fn mixed_child_workflow_external_signal_workflow<'a>(
         let signal_fut =
             ctx.signal_external_workflow(target, "my_signal", serde_json::json!({"data": "hello"}));
 
+        // `biased` polls in declaration order, so a replay always re-emits
+        // the parked branch's command first. `tokio::select!` picks a random
+        // order otherwise. A replay that polls the inline-resolved branch
+        // first returns before it consumes the recorded command, and the
+        // drift guard (#1791) blocks the run.
         tokio::select! {
+            biased;
             res = child_fut => {
                 res.map_err(|e| e.to_string())?;
                 Ok(serde_json::json!({"status": "child_done"}))
