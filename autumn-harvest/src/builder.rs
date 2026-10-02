@@ -4388,8 +4388,8 @@ impl WorkerConfig {
     /// Sticky routing is **on by default** with a [`DEFAULT_STICKY_TIMEOUT`]
     /// lease (issue #1798). Each time a workflow suspends, the task queue
     /// records a lease that points at the current worker. The next task for
-    /// that execution goes to the owning worker first, so its in-process LRU
-    /// cache stays warm and the worker loads only new events from Postgres.
+    /// that execution goes to the owning worker first. Its in-process LRU
+    /// cache stays warm, so the worker loads only new events from Postgres.
     ///
     /// When the lease expires (after `config.lease_ttl`), any eligible worker
     /// can claim the task, so sticky routing never blocks progress. A graceful
