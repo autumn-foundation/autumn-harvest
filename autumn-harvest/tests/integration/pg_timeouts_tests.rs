@@ -2327,6 +2327,26 @@ async fn a_nested_drain_restores_the_session_limits() {
     assert_eq!(limits.lock_ms, "3s");
 }
 
+/// A drain step that fails returns its own error. Postgres aborts the
+/// transaction on an error, so a restore of the limits would fail and hide
+/// the cause. The rollback restores the limits instead.
+#[tokio::test]
+async fn a_failed_drain_step_keeps_its_own_error() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let error = Box::pin(
+        conn.transaction::<(), autumn_harvest::error::HarvestError, _>(async |conn| {
+            autumn_harvest::partition::exec_with_session_limits_off(conn, "SELECT 1 / 0").await
+        }),
+    )
+    .await
+    .expect_err("the statement fails");
+    assert!(
+        error.to_string().contains("division by zero"),
+        "the drain must return the failing statement's error, got: {error}"
+    );
+}
+
 /// A re-drive after the handler lookup clears the capability-miss evidence.
 /// The lookup proved this worker capable. Stale evidence could end the
 /// redelivery budget early.

@@ -6392,6 +6392,40 @@ where
     }
 }
 
+/// Hand an execution's timeout strikes to a quarantine (issue #1788).
+///
+/// The count becomes 0, so a concurrent reclaim does not quarantine twice.
+/// The 0 also marks the entry as untouched. Every dispatch that clears the
+/// strikes removes the entry, and a newer timeout increments it.
+fn begin_quarantine_strikes(
+    strikes: &mut std::collections::HashMap<uuid::Uuid, i32>,
+    exec_id: uuid::Uuid,
+) {
+    strikes.insert(exec_id, 0);
+}
+
+/// Settle an execution's strikes after its quarantine (issue #1788).
+///
+/// A committed quarantine ends the streak. A quarantine that did not commit
+/// gets its strikes back, so the next timeout quarantines at once. It does so
+/// only while the entry is still the untouched mark. A newer dispatch that
+/// cleared the strikes, or a newer timeout, keeps its own state. That can
+/// count too few strikes, which only delays a quarantine.
+fn settle_quarantine_strikes(
+    strikes: &mut std::collections::HashMap<uuid::Uuid, i32>,
+    exec_id: uuid::Uuid,
+    quarantined: bool,
+    new_strikes: i32,
+) {
+    if quarantined {
+        strikes.remove(&exec_id);
+    } else if let Some(count) = strikes.get_mut(&exec_id)
+        && *count == 0
+    {
+        *count = new_strikes;
+    }
+}
+
 /// Tries for an executed activity's result write: pool acquires, and repeats
 /// after a session timeout.
 ///
@@ -32088,10 +32122,12 @@ impl Worker {
                                 // async DB call so a concurrent reclaim
                                 // doesn't double-quarantine.
                                 if let Some(exec_id) = exec_id_for_timeout {
-                                    timeout_strikes
-                                        .lock()
-                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                        .remove(&exec_id);
+                                    begin_quarantine_strikes(
+                                        &mut timeout_strikes
+                                            .lock()
+                                            .unwrap_or_else(std::sync::PoisonError::into_inner),
+                                        exec_id,
+                                    );
                                 }
                                 let quarantined = quarantine_workflow_task_timeout(
                                     &pool,
@@ -32110,13 +32146,18 @@ impl Worker {
                                     telemetry.payload_codecs(),
                                 )
                                 .await;
-                                // No connection: put the strikes back so the
-                                // next timeout quarantines at once (issue #1788).
-                                if !quarantined && let Some(exec_id) = exec_id_for_timeout {
-                                    timeout_strikes
-                                        .lock()
-                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                        .insert(exec_id, new_strikes);
+                                // No commit: put the strikes back so the next
+                                // timeout quarantines at once, unless a newer
+                                // dispatch touched them (issue #1788).
+                                if let Some(exec_id) = exec_id_for_timeout {
+                                    settle_quarantine_strikes(
+                                        &mut timeout_strikes
+                                            .lock()
+                                            .unwrap_or_else(std::sync::PoisonError::into_inner),
+                                        exec_id,
+                                        quarantined,
+                                        new_strikes,
+                                    );
                                 }
                             }
                             crate::poison_pill::ReclaimAction::Requeue => {
@@ -36112,6 +36153,57 @@ mod tests {
             .await
             .expect("the retry stops during its attempt")
             .expect("the retry task joins");
+    }
+
+    /// A quarantine that does not commit gets its strikes back while no
+    /// newer dispatch touched them (issue #1788).
+    #[test]
+    fn a_failed_quarantine_restores_untouched_strikes() {
+        let exec_id = uuid::Uuid::new_v4();
+        let mut strikes = std::collections::HashMap::new();
+        begin_quarantine_strikes(&mut strikes, exec_id);
+        settle_quarantine_strikes(&mut strikes, exec_id, false, 3);
+        assert_eq!(strikes.get(&exec_id), Some(&3));
+    }
+
+    /// A newer dispatch that succeeds clears the strikes. A late restore must
+    /// not bring them back.
+    #[test]
+    fn a_failed_quarantine_leaves_strikes_that_a_newer_dispatch_cleared() {
+        let exec_id = uuid::Uuid::new_v4();
+        let mut strikes = std::collections::HashMap::new();
+        begin_quarantine_strikes(&mut strikes, exec_id);
+        strikes.remove(&exec_id);
+        settle_quarantine_strikes(&mut strikes, exec_id, false, 3);
+        assert_eq!(strikes.get(&exec_id), None);
+        strikes.insert(exec_id, 1);
+        settle_quarantine_strikes(&mut strikes, exec_id, false, 3);
+        assert_eq!(
+            strikes.get(&exec_id),
+            Some(&1),
+            "a later streak is not inflated"
+        );
+    }
+
+    /// A newer timeout during the quarantine keeps its own count.
+    #[test]
+    fn a_failed_quarantine_leaves_strikes_that_a_newer_timeout_wrote() {
+        let exec_id = uuid::Uuid::new_v4();
+        let mut strikes = std::collections::HashMap::new();
+        begin_quarantine_strikes(&mut strikes, exec_id);
+        *strikes.entry(exec_id).or_insert(0) += 1;
+        settle_quarantine_strikes(&mut strikes, exec_id, false, 3);
+        assert_eq!(strikes.get(&exec_id), Some(&1));
+    }
+
+    /// A quarantine that commits ends the streak.
+    #[test]
+    fn a_committed_quarantine_clears_the_strikes() {
+        let exec_id = uuid::Uuid::new_v4();
+        let mut strikes = std::collections::HashMap::new();
+        begin_quarantine_strikes(&mut strikes, exec_id);
+        settle_quarantine_strikes(&mut strikes, exec_id, true, 3);
+        assert_eq!(strikes.get(&exec_id), None);
     }
 
     /// A result write repeats only while it has uploaded no blob (issue

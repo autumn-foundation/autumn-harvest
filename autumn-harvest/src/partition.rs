@@ -3414,6 +3414,38 @@ async fn switch_off_session_limits(conn: &mut AsyncPgConnection) -> HarvestResul
     Ok(prior)
 }
 
+/// Run `body` with the session limits switched off, inside the caller's
+/// transaction (issue #1788).
+///
+/// Only a success restores the limits. An error aborts the transaction, so
+/// a restore would fail too and hide the cause. The rollback that follows
+/// the error restores the limits instead.
+#[cfg(feature = "db")]
+async fn with_session_limits_off<T>(
+    conn: &mut AsyncPgConnection,
+    body: impl AsyncFnOnce(&mut AsyncPgConnection) -> HarvestResult<T>,
+) -> HarvestResult<T> {
+    let prior = switch_off_session_limits(conn).await?;
+    let value = body(conn).await?;
+    restore_session_limits(conn, &prior).await?;
+    Ok(value)
+}
+
+/// Run one statement through [`with_session_limits_off`]. Tests use it
+/// (issue #1788). Call it inside a transaction.
+///
+/// # Errors
+///
+/// The statement's error, or an error of the limit switch.
+#[cfg(feature = "db")]
+#[doc(hidden)]
+pub async fn exec_with_session_limits_off(
+    conn: &mut AsyncPgConnection,
+    sql: &str,
+) -> HarvestResult<()> {
+    with_session_limits_off(conn, async |conn| exec(conn, sql).await).await
+}
+
 /// Put back the limits that [`switch_off_session_limits`] replaced. Also
 /// restores `lock_timeout`, which a drain step can set.
 #[cfg(feature = "db")]
@@ -4822,8 +4854,7 @@ async fn drain_default_bounded_inner(
     // scans the whole DEFAULT partition. On a large backlog it can need longer
     // than a role default, and a timeout would then stop every pass.
     let census = Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
-        let prior = switch_off_session_limits(conn).await?;
-        let census = async {
+        with_session_limits_off(conn, async |conn| {
             let width = match detect_layout(conn).await? {
                 EventLayout::Unpartitioned => return Ok(None),
                 EventLayout::Partitioned { cohort_width_secs } => cohort_width_secs,
@@ -4863,10 +4894,8 @@ async fn drain_default_bounded_inner(
                     .map_err(database_error)?
             };
             Ok::<_, HarvestError>(Some((width, census)))
-        }
-        .await;
-        restore_session_limits(conn, &prior).await?;
-        census
+        })
+        .await
     }))
     .await?;
     let Some((width, census)) = census else {
@@ -4902,8 +4931,7 @@ async fn drain_default_bounded_inner(
         // would discard a completed pass rather than bound one. An engine
         // pool or `ALTER ROLE` can set a session default (issue #1788), so
         // switch it and `transaction_timeout` off for this transaction only.
-        let prior = switch_off_session_limits(conn).await?;
-        let moved = async {
+        with_session_limits_off(conn, async |conn| {
             exec(conn, "SET LOCAL lock_timeout = '5s'").await?;
             exec(
                 conn,
@@ -5060,10 +5088,8 @@ async fn drain_default_bounded_inner(
                 .await
                 .map_err(database_error)?;
             Ok::<_, HarvestError>(moved)
-        }
-        .await;
-        restore_session_limits(conn, &prior).await?;
-        moved
+        })
+        .await
     }))
     .await
 }
