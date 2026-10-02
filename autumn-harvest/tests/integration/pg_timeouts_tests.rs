@@ -2296,6 +2296,81 @@ async fn a_stale_redrive_leaves_a_peer_claim_alone() {
     assert_eq!(row.worker_id.as_deref(), Some("w-2"));
 }
 
+/// An acquire also waits while the first, synchronous re-check runs. That
+/// re-check can take ten pool bounds. An orphan reclaim can retry the task on
+/// this worker in that time.
+#[tokio::test]
+async fn a_session_acquire_defers_during_the_first_recheck() {
+    use autumn_harvest::sessions::{new_session_slot_registry, try_acquire_session_slot};
+    use autumn_harvest::types::SessionId;
+
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let (exec_id, _activity_id, task) = seed_claimed_activity(&mut conn, "q-sf").await;
+    let session_id = SessionId::new();
+    diesel::sql_query("UPDATE harvest_task_queue SET input = to_jsonb($2::text) WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(task.id)
+        .bind::<Text, _>(session_id.to_string())
+        .execute(&mut conn)
+        .await
+        .expect("make the input a session id");
+    let task = {
+        use autumn_harvest::models::TaskQueueItem;
+        use autumn_harvest::schema::harvest_task_queue;
+        use diesel::{QueryDsl, SelectableHelper};
+        harvest_task_queue::table
+            .find(task.id)
+            .select(TaskQueueItem::as_select())
+            .first::<TaskQueueItem>(&mut conn)
+            .await
+            .expect("reload the claim")
+    };
+
+    // Every read of the first re-check waits out a full pool.
+    let starved = engine_pool(
+        url.clone(),
+        1,
+        DbRole::Hot,
+        &timeouts(300, SessionTimeouts::for_role(DbRole::Hot)),
+    )
+    .expect("starved pool");
+    let held = hold_every_connection(&starved).await;
+    let registry = new_session_slot_registry();
+    assert!(try_acquire_session_slot(&registry, 4, session_id));
+    let recheck = {
+        let starved = starved.clone();
+        let registry = registry.clone();
+        tokio::spawn(async move {
+            autumn_harvest::worker::settle_session_slot_after_transient_error(
+                &starved, &registry, session_id, "w-1",
+            )
+            .await;
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        !recheck.is_finished(),
+        "the first re-check is still running"
+    );
+
+    let pool = engine_pool(
+        url,
+        2,
+        DbRole::Hot,
+        &timeouts(5_000, SessionTimeouts::for_role(DbRole::Hot)),
+    )
+    .expect("engine pool");
+    autumn_harvest::worker::handle_session_acquire_for_test(
+        &pool, &task, "w-1", exec_id, 4, &registry,
+    )
+    .await
+    .expect("the acquire defers");
+
+    assert_eq!(task_state(&mut conn, task.id).await, "PENDING");
+    drop(held);
+    recheck.await.expect("the re-check ends");
+}
+
 /// Mark `worker_id` as a live worker. A test row `RUNNING` under an unknown
 /// worker is an orphan, and a reclaimer of a parallel suite would requeue it.
 /// The row has no queues and a shard that does not exist, so no other code

@@ -15402,6 +15402,9 @@ pub async fn settle_session_slot_after_transient_error(
     session_id: crate::types::SessionId,
     worker_id: &str,
 ) {
+    // Mark before the first read. Those reads can take ten pool bounds, and an
+    // orphan reclaim can retry the task on this worker in that time.
+    let recheck = RecheckedSessionSlot::mark(registry, session_id);
     if settle_session_slot_once(pool, registry, session_id, worker_id).await {
         return;
     }
@@ -15409,7 +15412,6 @@ pub async fn settle_session_slot_after_transient_error(
         session_id = %session_id,
         "could not read a session after a failed acquire; keeping its slot until a read succeeds"
     );
-    let recheck = RecheckedSessionSlot::mark(registry, session_id);
     let pool = pool.clone();
     let registry = std::sync::Arc::clone(registry);
     let worker_id = worker_id.to_owned();
@@ -15419,7 +15421,7 @@ pub async fn settle_session_slot_after_transient_error(
     });
 }
 
-/// Session slots that a background re-check can still release (issue #1788).
+/// Session slots that a re-check can still release (issue #1788).
 ///
 /// An acquire of such a session defers until the re-check ends. Otherwise the
 /// re-check can read no row just before the acquire inserts one. It then
