@@ -7777,7 +7777,10 @@ mod tests {
             "pending": 0,
         }))
         .expect("a pre-#811 payload must still deserialize");
-        assert!(legacy.workflows.is_empty());
+        assert_eq!(
+            legacy.workflows,
+            [] as [crate::queue::ConcurrencyWorkflowStrategy; 0]
+        );
     }
 
     /// The attribution query must select exactly the same live rows the stats
