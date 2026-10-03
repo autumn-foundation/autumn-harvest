@@ -187,11 +187,12 @@ The capability-miss release still keys on `(worker_id, crash_strikes)`. It runs 
 - Workflow-task writes: `requeue_claimed_workflow_task_after_deadlock` (issue #1797).
 - `lock_claim_for_update`. The start fence, both finalize paths, the in-worker schedule-to-close and session-acquire timeouts, and `run_transactional` take it after the execution row lock.
 - `claim_is_current` and `task_status_for_claim`. The cancellation observer and `ActivityContext::check_durable_cancellation` read them.
+- `claim_still_held_for_update`. The workflow-task terminal guard takes `claim_held` and adds `crash_strikes = $c` (issue #1806). The stuck-running requeue keeps `crash_strikes`, so only `attempt` tells a same-worker re-claim apart.
 - `claim_held_for_update_skip_locked`. For an activity row, `fail_task_and_execution_with_history` takes it before its `claim_still_held_for_update` guard. A later claim of the same worker returns `Ok` without a write. Any other miss returns `TerminalWriteClaimAmbiguous`, as the guard does.
 
 *Lease lost.* A path that gets `ClaimLock::Lost` appends no event and returns `Ok`. It must not return an error, because `fail_execution_on_error` would then fail the workflow. After `Held`, a `LeaseLost` write is a bug, and `require_applied` rolls the transaction back. A fenced write outside the lock returns `LeaseLost` when it matches 0 rows. The heartbeat flusher, the cancellation observer and `check_durable_cancellation` stop the activity.
 
-*Not fenced.* `complete_task`, `fail_task`, `requeue_for_retry` and `defer_rate_limited_task` stay unfenced. The timeout sweeper in `timeout.rs`, cancellation and operator actions use them on purpose: they act on a row whatever its claim. Workflow-task writes use `claim_still_held_for_update` (issues #804 and #1184).
+*Not fenced.* `complete_task`, `fail_task`, `requeue_for_retry` and `defer_rate_limited_task` stay unfenced. The timeout sweeper in `timeout.rs`, cancellation and operator actions use them on purpose: they act on a row whatever its claim. Workflow-task writes use `claim_still_held_for_update`, which also checks `attempt` (issues #804, #1184 and #1806).
 
 A formal model of this protocol is tracked in issue #1819.
 

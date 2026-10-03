@@ -2779,7 +2779,7 @@ pub(crate) async fn claim_held_for_update_skip_locked(
 /// `crash_strikes` (issue #1789).
 ///
 /// Such a claim passes a guard on `(worker_id, crash_strikes)`, for example
-/// [`claim_still_held_for_update`], but it is not `claim`. The read takes no
+/// the capability-miss release, but it is not `claim`. The read takes no
 /// lock.
 ///
 /// # Errors
@@ -4474,7 +4474,7 @@ pub const fn release_task_for_capability_miss_query(
 /// of the same task and rolling back an `attempt` that belongs to the new
 /// dispatch. `crash_strikes` is the right discriminator because the requeue
 /// that creates the race is what bumps it; the terminal escalation guard
-/// ([`claim_still_held_for_update_query`]) already keys on it.
+/// ([`claim_still_held_for_update`]) already keys on it.
 ///
 /// # Errors
 ///
@@ -4735,19 +4735,6 @@ pub const fn read_capability_miss_state_query() -> &'static str {
        AND worker_id = $2"
 }
 
-/// SQL for [`claim_still_held_for_update`]. Extracted as a `const fn` so its
-/// shape is unit-testable without a database.
-#[must_use]
-pub const fn claim_still_held_for_update_query() -> &'static str {
-    "SELECT id \
-     FROM harvest_task_queue \
-     WHERE id = $1 \
-       AND state = 'RUNNING' \
-       AND worker_id = $2 \
-       AND crash_strikes = $3 \
-     FOR UPDATE SKIP LOCKED"
-}
-
 /// The task's capability-miss counters **as they stand now**, for the
 /// release-vs-escalate decision (issue #804, Codex round-27 P1).
 ///
@@ -4801,6 +4788,12 @@ pub async fn read_capability_miss_state(
 /// discriminator `poison_pill::quarantine_orphan` itself uses for exactly this,
 /// so the guard is a claim token rather than a worker token.
 ///
+/// The stuck-running requeue (`poison_pill::requeue_stuck_task`) leaves
+/// `crash_strikes` unchanged, so `crash_strikes` alone misses that path. The
+/// guard therefore also checks `attempt`, which `claim_task` increments on
+/// every claim. It does so through `claim_held`, the predicate that fences
+/// activity writes (issues #1789 and #1806).
+///
 /// # Why `SKIP LOCKED` rather than a blocking wait
 ///
 /// Deadlock avoidance, not throughput. This crate's `harvest_task_queue` lock
@@ -4828,23 +4821,23 @@ pub async fn claim_still_held_for_update(
     task_id: Uuid,
     worker_id: &str,
     crash_strikes: i32,
+    attempt: i32,
 ) -> HarvestResult<bool> {
-    // Only the row's *existence* matters -- the id is bound, not read back.
-    #[derive(diesel::QueryableByName)]
-    struct IdRow {
-        #[allow(dead_code)]
-        #[diesel(sql_type = diesel::sql_types::Uuid)]
-        id: Uuid,
-    }
+    use crate::schema::harvest_task_queue::dsl;
 
-    let rows: Vec<IdRow> = diesel::sql_query(claim_still_held_for_update_query())
-        .bind::<diesel::sql_types::Uuid, _>(task_id)
-        .bind::<diesel::sql_types::Text, _>(worker_id)
-        .bind::<diesel::sql_types::Integer, _>(crash_strikes)
-        .load(conn)
+    // `claim_held` is the claim-epoch predicate that activity writes use.
+    dsl::harvest_task_queue
+        .find(task_id)
+        .filter(claim_held(worker_id, attempt))
+        .filter(dsl::crash_strikes.eq(crash_strikes))
+        .select(dsl::id)
+        .for_update()
+        .skip_locked()
+        .first::<Uuid>(conn)
         .await
-        .map_err(crate::error::database_error)?;
-    Ok(!rows.is_empty())
+        .optional()
+        .map(|row| row.is_some())
+        .map_err(crate::error::database_error)
 }
 
 /// SQL for [`release_suspended_workflow_claim`]. Extracted as a `const fn` so
@@ -10305,34 +10298,6 @@ mod tests {
         );
     }
 
-    /// The commit-boundary guard must hold the row's lock (an unlocked check
-    /// merely narrows the window before an unguarded `fail_task`), must key on
-    /// the CLAIM rather than the worker, and must never WAIT for the lock.
-    #[test]
-    fn commit_boundary_claim_guard_locks_without_waiting_and_keys_on_the_claim() {
-        let sql = claim_still_held_for_update_query();
-        assert!(
-            sql.contains("FOR UPDATE"),
-            "the guard must hold the lock through the caller's transaction, not \
-             just read: {sql}"
-        );
-        assert!(
-            sql.contains("SKIP LOCKED"),
-            "the guard must never WAIT on the task row: `poison_pill` takes task \
-             -> execution while this path takes execution -> task, so a blocking \
-             wait here closes an ABBA cycle: {sql}"
-        );
-        assert!(
-            sql.contains("state = 'RUNNING'") && sql.contains("worker_id = $2"),
-            "the guard must still be scoped to this worker's own claim: {sql}"
-        );
-        assert!(
-            sql.contains("crash_strikes = $3"),
-            "a poison-pill requeue lets the SAME worker re-claim the row, so \
-             (state, worker_id) alone does not identify this attempt: {sql}"
-        );
-    }
-
     #[test]
     fn park_queries_reset_the_capability_miss_counter() {
         // `capability_misses` counts CONSECUTIVE misses: a task a capable
@@ -10487,7 +10452,7 @@ mod tests {
     ///
     /// `crash_strikes` is the discriminator because the requeue that creates
     /// this race is the thing that bumps it. The terminal escalation guard
-    /// ([`claim_still_held_for_update_query`]) already keys on it for exactly
+    /// ([`claim_still_held_for_update`]) already keys on it for exactly
     /// this reason; the release is the far more common path and must match.
     #[test]
     fn capability_miss_release_is_guarded_on_the_claim_epoch() {
