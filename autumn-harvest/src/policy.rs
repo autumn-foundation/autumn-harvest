@@ -321,27 +321,37 @@ pub fn resolve_retry_after_hint(
 /// When attached to an activity (via the `#[activity(circuit_breaker = ...)]`
 /// attribute or builder registration), the worker tracks consecutive failures
 /// of that activity within a rolling window. Once `failure_threshold` failures
-/// accumulate inside `window`, the breaker **trips open** and subsequent
-/// dispatches fast-fail with a non-retryable
-/// [`ActivityFailure`](crate::failure::ActivityFailure) of error type
-/// `"CircuitOpen"` instead of being retried against a downstream that is known
-/// to be down. After `cooldown` elapses the breaker moves to half-open and
+/// accumulate inside `window`, the breaker **trips open**. `open_mode` then
+/// decides what happens to each later dispatch:
+///
+/// - [`CircuitOpenMode::Defer`] (default): the task goes back to `PENDING`
+///   until the next probe. It uses no attempt and appends no event.
+/// - [`CircuitOpenMode::FailFast`]: the attempt fails with a non-retryable
+///   [`ActivityFailure`](crate::failure::ActivityFailure) of error type
+///   `"CircuitOpen"`.
+///
+/// After `cooldown` elapses the breaker moves to half-open and
 /// admits a single probe; success re-closes it, failure re-opens it.
 ///
 /// Circuit state is tracked in-process and per-shard — it never touches the
 /// workflow event log, so the append-only contract is unchanged and replay is
-/// unaffected (a short-circuited attempt records an ordinary `ActivityFailed`
-/// event).
+/// unaffected. A deferral appends no event. A fail-fast short circuit
+/// records an ordinary `ActivityFailed` event.
 ///
 /// ## Examples
 ///
 /// ```rust
 /// use std::time::Duration;
-/// use autumn_harvest::policy::CircuitBreakerPolicy;
+/// use autumn_harvest::policy::{CircuitBreakerPolicy, CircuitOpenMode};
 ///
 /// // Trip after 10 failures within 30s; re-probe after 60s.
 /// let policy = CircuitBreakerPolicy::new(10, Duration::from_secs(30), Duration::from_secs(60));
 /// assert_eq!(policy.failure_threshold, 10);
+/// assert_eq!(policy.open_mode, CircuitOpenMode::Defer);
+///
+/// // A Saga that compensates on `CircuitOpen` needs the fast failure.
+/// let fail_fast = policy.with_open_mode(CircuitOpenMode::FailFast);
+/// assert_eq!(fail_fast.open_mode, CircuitOpenMode::FailFast);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CircuitBreakerPolicy {
@@ -353,6 +363,27 @@ pub struct CircuitBreakerPolicy {
     /// Cooldown after the breaker opens before a single half-open probe is
     /// admitted.
     pub cooldown: Duration,
+    /// What a dispatch does while the breaker is open (issue #1809).
+    /// A policy serialized before this field existed reads as the default.
+    #[serde(default)]
+    pub open_mode: CircuitOpenMode,
+}
+
+/// What a dispatch does while its circuit breaker is open (issue #1809).
+///
+/// `docs/adr/0004-activity-timeout-retry-and-open-circuit.md` records why
+/// [`Defer`](Self::Defer) is the default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CircuitOpenMode {
+    /// Put the claimed task back to `PENDING` until the next probe. The
+    /// deferral uses no attempt and appends no event.
+    #[default]
+    Defer,
+    /// Fail the attempt with a non-retryable `CircuitOpen` failure. Use it
+    /// when a workflow must react to the outage at once, for example with a
+    /// Saga compensation.
+    FailFast,
 }
 
 impl CircuitBreakerPolicy {
@@ -367,7 +398,15 @@ impl CircuitBreakerPolicy {
             failure_threshold: failure_threshold.max(1),
             window,
             cooldown,
+            open_mode: CircuitOpenMode::Defer,
         }
+    }
+
+    /// Set what a dispatch does while the breaker is open (issue #1809).
+    #[must_use]
+    pub const fn with_open_mode(mut self, open_mode: CircuitOpenMode) -> Self {
+        self.open_mode = open_mode;
+        self
     }
 }
 
@@ -1573,6 +1612,47 @@ pub(crate) fn resolve_effective_start_to_close(
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    // ── Circuit open mode (issue #1809) ────────────────────────────────────
+
+    #[test]
+    fn circuit_breaker_policy_defers_by_default() {
+        let policy = CircuitBreakerPolicy::new(3, Duration::from_secs(30), Duration::from_secs(60));
+        assert_eq!(policy.open_mode, CircuitOpenMode::Defer);
+        assert_eq!(CircuitOpenMode::default(), CircuitOpenMode::Defer);
+    }
+
+    #[test]
+    fn circuit_breaker_policy_with_open_mode_sets_fail_fast() {
+        let policy = CircuitBreakerPolicy::new(3, Duration::from_secs(30), Duration::from_secs(60))
+            .with_open_mode(CircuitOpenMode::FailFast);
+        assert_eq!(policy.open_mode, CircuitOpenMode::FailFast);
+    }
+
+    #[test]
+    fn circuit_breaker_policy_without_open_mode_deserializes_to_defer() {
+        let mut json = serde_json::to_value(CircuitBreakerPolicy::new(
+            3,
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+        ))
+        .unwrap();
+        json.as_object_mut().unwrap().remove("open_mode");
+        let policy: CircuitBreakerPolicy = serde_json::from_value(json).unwrap();
+        assert_eq!(policy.open_mode, CircuitOpenMode::Defer);
+    }
+
+    #[test]
+    fn circuit_open_mode_serializes_as_snake_case() {
+        assert_eq!(
+            serde_json::to_value(CircuitOpenMode::FailFast).unwrap(),
+            serde_json::json!("fail_fast")
+        );
+        assert_eq!(
+            serde_json::to_value(CircuitOpenMode::Defer).unwrap(),
+            serde_json::json!("defer")
+        );
+    }
 
     // ── Retry-After hint clamp/resolve (issue #744) ────────────────────────────
     //

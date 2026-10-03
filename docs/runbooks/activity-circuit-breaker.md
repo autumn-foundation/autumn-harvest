@@ -5,10 +5,20 @@ downstream service it depends on (email provider, payment gateway, search
 index, …) is hard-down. Instead of retrying every failing attempt across its
 full `RetryPolicy` curve — flooding `harvest_task_queue` and piling up identical
 `harvest_dead_letters` entries across thousands of in-flight workflows — the
-breaker **trips open** and new dispatches fast-fail with a non-retryable
-`CircuitOpen` error within seconds. Workflows that handle failure (Saga
-compensation, branching, non-retryable surfaces) reach their recovery path
-quickly; doomed work stops consuming worker capacity.
+breaker **trips open** and doomed work stops consuming worker capacity. The
+policy's `open_mode` sets what a dispatch does while the breaker is open
+(issue #1809):
+
+- **`CircuitOpenMode::Defer`** (default). The task goes back to `PENDING` until
+  the next probe. It uses no attempt and appends no event. When the breaker
+  closes, the work runs.
+- **`CircuitOpenMode::FailFast`**. The dispatch fails with a non-retryable
+  `CircuitOpen` error within seconds. Workflows that handle failure (Saga
+  compensation, branching) reach their recovery path quickly.
+
+[ADR 0004](../adr/0004-activity-timeout-retry-and-open-circuit.md) records why
+defer is the default: a fail-fast breaker turns overload into permanent
+failure.
 
 This is opt-in per activity. Activities without a declared policy keep today's
 behaviour exactly (no breaker; the full retry policy applies).
@@ -27,7 +37,11 @@ behaviour exactly (no breaker; the full retry policy applies).
 ```
 
 - **Closed** (normal): dispatches proceed unchanged.
-- **Open** (tripped): new dispatches fast-fail with
+- **Open** (tripped): in defer mode, each new dispatch goes back to
+  `PENDING`. It waits for the time until the next probe, plus up to 25%
+  jitter. When no probe time is known (a forced-open breaker, or a probe in
+  flight), it waits for the cooldown. The wait is clamped to 100 ms – 30 s.
+  In fail-fast mode, new dispatches fail with
   `ActivityFailure { error_type: "CircuitOpen", non_retryable: true, .. }`.
   This is a terminal failure for the in-flight attempt — the workflow author
   chooses whether to compensate, branch, or fail the workflow.
@@ -46,20 +60,28 @@ use std::time::Duration;
     start_to_close = "30s",
     retry = RetryPolicy::exponential(5, Duration::from_secs(1)),
     // Trip after 10 failures within 30s; re-probe after 60s.
+    // While open, fail at once so the workflow can compensate.
     circuit_breaker = CircuitBreakerPolicy::new(10, Duration::from_secs(30), Duration::from_secs(60))
+        .with_open_mode(CircuitOpenMode::FailFast)
 )]
 async fn charge_card(ctx: &ActivityContext, req: ChargeRequest) -> Result<Receipt, ActivityFailure> {
     // ... call the payment gateway ...
 }
 ```
 
-The three knobs are:
+The four knobs are:
 
 | Field | Meaning |
 |-------|---------|
 | `failure_threshold` | Failures within `window` that trip the breaker open (min 1). |
 | `window` | Rolling window over which failures are counted. |
 | `cooldown` | Time the breaker stays open before admitting one half-open probe. |
+| `open_mode` | `Defer` (default) or `FailFast`. Set it with `with_open_mode`. |
+
+> **Defer mode and deadlines.** A deferred task waits as long as the breaker
+> stays open. Set `schedule_to_close` on the activity to bound the wait. With
+> no deadline, a breaker that an operator forced open holds the work until
+> `force-close`.
 
 > **Only retryable failures count toward a trip.** A *non-retryable*
 > `ActivityFailure` (a permanent per-request error such as bad input or a
@@ -68,12 +90,21 @@ The three knobs are:
 > bad requests cannot trip the circuit and starve healthy callers. Only
 > transient/downstream-style retryable failures move the breaker toward open.
 >
+> **Only timeouts of started attempts count (issue #1809).** A start-to-close,
+> heartbeat or running schedule-to-close timeout counts only when the attempt's
+> handler started. It then counts as a retryable failure. A task that waited after its claim,
+> or never left the queue, made no downstream call, so a backlog cannot trip
+> the breaker.
+>
 > **Local activities cannot declare a circuit breaker.** The breaker is enforced
 > on the task-dispatch path, which local activities (`local = true`) bypass by
 > running inline on the workflow worker; the `#[activity]` macro rejects
 > `circuit_breaker` on a local activity at compile time.
 
 ## Handling `CircuitOpen` in workflow code
+
+This section applies to `FailFast` mode. In defer mode, the workflow never
+sees `CircuitOpen`.
 
 The failure flows through the typed activity-failure surface (#227), so workflow
 code branches on the typed error class — **not** by parsing the human message.
@@ -112,7 +143,7 @@ use all four.
 
 | Failure mode | Reach for | Why |
 |---|---|---|
-| **Downstream is hard-down** (100% failures, will stay down for minutes/hours) | **Circuit breaker** (#369) | Stop calling it. Retrying a dead target just floods the queue and DLQ. The breaker fast-fails so workflows recover in seconds, not hours. |
+| **Downstream is hard-down** (100% failures, will stay down for minutes/hours) | **Circuit breaker** (#369) | Stop calling it. Retrying a dead target just floods the queue and DLQ. The breaker defers the work until the downstream recovers, or, in `FailFast` mode, fails it so workflows recover in seconds, not hours. |
 | **Transient, self-healing blip** (a few % failures, recovers on its own in seconds) | **Retry policy** + **jitter** (#342) | The next attempt will likely succeed. Jitter spreads the retries so a fleet-wide blip doesn't thundering-herd the recovering downstream. |
 | **You are the overload** (downstream is fine but rate-limits you, or you'd overwhelm it) | **Rate limit** (#332) | Throttle dispatch to stay within the downstream's budget. The downstream is healthy — you don't want to stop calling it, just pace yourself. |
 | **Permanent, per-request error** (bad input, validation failure) | **Non-retryable `ActivityFailure`** (#227) | The request will never succeed; skip retries for that one attempt without affecting other calls or tripping a breaker. |
@@ -146,8 +177,8 @@ Rules of thumb:
   declares **both** `rate_limit_*` and `circuit_breaker`, its rate limiting is
   enforced at *dispatch* rather than at claim time. The claim query skips the
   rate-limit gate and token debit for any activity with a breaker, so a
-  `CircuitOpen` short-circuit is always claimable and fast-fails at full speed
-  during an outage (never paced by, or burning tokens from, the downstream's
+  `CircuitOpen` short-circuit is always claimable and defers or fast-fails at
+  full speed during an outage (never paced by, or burning tokens from, the downstream's
   bucket). A *genuine* call — admitted by the authoritative `on_dispatch` check —
   atomically reserves one token at dispatch; if the bucket is empty the task is
   rescheduled (one refill interval ahead) instead of running, so a real call can
@@ -168,10 +199,12 @@ per-shard ACID model; an outage that hits every shard trips each independently).
 |---|---|---|---|
 | `harvest.activity.circuit.tripped` | counter | `activity.name` | Breaker trips closed→open, or re-opens after a failed half-open probe. |
 | `harvest.activity.circuit.closed` | counter | `activity.name` | Breaker recovers to closed after a successful half-open probe. |
+| `harvest.activity.circuit.deferred` | counter | `activity.name` | An open breaker in defer mode puts a claimed task back to `PENDING` (issue #1809). |
 
 Existing alerting (#176 rules, #355 Prometheus) picks these up for free. A useful
 alert: `increase(harvest_activity_circuit_tripped_total[5m]) > 0` — a trip means
-a downstream is down and workflows are taking their failure path.
+a downstream is down. Work waits in `PENDING` (defer mode) or takes its failure
+path (fail-fast mode).
 
 ### Management API
 
@@ -184,7 +217,8 @@ a downstream is down and workflows are taking their failure path.
 
 Each response carries `state` (`closed`/`open`/`half_open`), `forced_open`,
 `last_trip`, `rolling_failure_count`, `time_until_probe_secs`, and the configured
-`failure_threshold` / `window_secs` / `cooldown_secs`.
+`failure_threshold` / `window_secs` / `cooldown_secs` / `open_mode` (`defer` or
+`fail_fast`).
 
 > The breaker state is in-process. The management API reflects the breaker state
 > of the worker process serving the request. In a split web/worker deployment,
@@ -201,17 +235,20 @@ are filling with retries for one activity.
    should already be curbed.
 2. If you need to stop dispatch **now** (e.g. the breaker hasn't tripped yet, or
    you're taking the downstream down for maintenance):
-   `POST /admin/circuits/{activity_name}/force-open`. New attempts fast-fail with
-   `CircuitOpen` until you force-close.
+   `POST /admin/circuits/{activity_name}/force-open`. New attempts wait in
+   `PENDING` (defer mode) or fail with `CircuitOpen` (fail-fast mode) until you
+   force-close.
 3. When the downstream is confirmed healthy again:
    `POST /admin/circuits/{activity_name}/force-close`. Normal tracking resumes —
    if the downstream is actually still bad, the breaker re-trips on its own.
-4. Replay any workflows that failed via the DLQ / reset surfaces once the
-   downstream is stable.
+4. In fail-fast mode, replay any workflows that failed via the DLQ / reset
+   surfaces once the downstream is stable. In defer mode, the waiting work
+   runs on its own.
 
 ## Replay safety & durability
 
-A short-circuited attempt records an ordinary `ActivityFailed` event carrying the
+A deferral appends no event, so replay never sees it. A fail-fast
+short-circuited attempt records an ordinary `ActivityFailed` event carrying the
 typed `CircuitOpen` payload — **no new `WorkflowEvent` variant** is introduced and
 circuit state lives entirely outside the event log. Replay therefore reproduces
 the recorded outcome regardless of the breaker's state at replay time: a workflow

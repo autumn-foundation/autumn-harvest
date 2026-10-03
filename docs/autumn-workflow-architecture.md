@@ -1124,9 +1124,14 @@ Four distinct timeouts, matching Temporal's model:
 | Timeout | What it measures | Default | Effect on failure |
 |---------|-----------------|---------|-------------------|
 | **Schedule-to-Start** | Time from task enqueued to worker claiming it | None (unlimited) | Task marked `TIMED_OUT`, NOT retried (requeuing to same queue would repeat the problem) |
-| **Start-to-Close** | Time from worker claiming task to completion | 5 minutes | Task marked `TIMED_OUT`, retried per policy |
-| **Heartbeat** | Time between consecutive heartbeats from the activity | None (disabled unless set) | Task marked `TIMED_OUT`, retried per policy |
+| **Start-to-Close** | Time from worker claiming task to completion | 10 minutes (`DEFAULT_ACTIVITY_START_TO_CLOSE`) | Attempt ends and retries per policy (row back to `PENDING`). The last attempt appends `ActivityTimedOut`, and the row becomes `FAILED` |
+| **Heartbeat** | Time between consecutive heartbeats from the activity | None (disabled unless set) | Same as start-to-close |
 | **Schedule-to-Close** | Total time from enqueue to final completion (across all retries) | None (unlimited) | Task and all retries cancelled |
+
+[ADR 0004](adr/0004-activity-timeout-retry-and-open-circuit.md) records the
+retry rule and how the code applies it (issue #1809). A retried timeout appends
+no event. Only the last attempt appends `ActivityTimedOut`. A timeout feeds the
+circuit breaker only when the attempt's handler started.
 
 The scheduler enforces timeouts by running a periodic check (every 10 seconds):
 

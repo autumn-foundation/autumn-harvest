@@ -10,11 +10,11 @@
 //! | Primitive | What it does | Issue |
 //! |---|---|---|
 //! | Admission gate | Halts new workflow **starts**; in-flight runs keep scheduling activities | #377 / #618 |
-//! | Circuit breaker | **Fast-fails** dispatch, burning retry budget and pushing workflows down error branches | #369 |
+//! | Circuit breaker | **Short-circuits** dispatch: defers it by default, or fails it and pushes workflows down error branches (`FailFast`) | #369 / #1809 |
 //! | Per-execution pause | Holds **one** execution — useless when you know the queue, not the 50,000 executions | #383 / #609 |
 //! | **Queue pause (this)** | **Holds dispatch** on a named queue: nothing fails, nothing retries, nothing dead-letters | **#619** |
 //!
-//! Gate the *door*, breaker the *fast-fail*, pause the *hold*.
+//! Gate the *door*, breaker the *short circuit*, pause the *hold*.
 //!
 //! # Enforcement model — anti-join, not cache
 //!

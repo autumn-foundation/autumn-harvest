@@ -56,7 +56,10 @@
 //! the **maximum** `attempt` field seen on `ActivityFailed` (resp.
 //! `LocalActivityFailed`/`LocalActivityExhausted`) events for the id, defaulting
 //! to `1` for a first-try completion. `ActivityTimedOut` carries no `attempt`
-//! field, so a timed-out step reports the max prior failed attempt (or `1`).
+//! field. A retried timeout appends no event (issue #1809). So a timed-out
+//! step reports the number of its `ActivityStarted` events, or `1` when it
+//! never started. That is a lower bound: an attempt that timed out before its
+//! handler started appends no `ActivityStarted`.
 //!
 //! ### signal_wait caveat
 //!
@@ -202,7 +205,9 @@ pub struct TimelineStep {
     /// `ActivityFailed`/`LocalActivityFailed`/`LocalActivityExhausted` events
     /// (default `1`). Success and timeout events carry no attempt field, so a
     /// succeeded-after-N-failures step reports `N`, not the true final `N+1` —
-    /// treat it as a **lower bound** on the final attempt number.
+    /// treat it as a **lower bound** on the final attempt number. A timed-out
+    /// step reports the number of its `ActivityStarted` events (issue #1809).
+    /// An attempt that timed out before its handler started is not counted.
     pub attempt: Option<i32>,
 }
 
@@ -369,6 +374,7 @@ fn build_accs(rows: &[TimelineEventRow], started_at: DateTime<Utc>) -> Vec<Acc> 
                     acc.start_ts = Some(ts);
                     acc.ended_at = None;
                     acc.outcome = None;
+                    acc.starts = acc.starts.saturating_add(1);
                 }
             }
             // Regular and external completions close the step identically; an
@@ -392,6 +398,11 @@ fn build_accs(rows: &[TimelineEventRow], started_at: DateTime<Utc>) -> Vec<Acc> 
             }
             WorkflowEvent::ActivityTimedOut { activity_id, .. } => {
                 if let Some(acc) = lookup_mut(&keyed, &mut accs, AccKey::Activity(*activity_id)) {
+                    // A retried timeout appends no event (issue #1809), so the
+                    // starts count the attempts.
+                    if acc.starts > 0 {
+                        acc.record_attempt(acc.starts);
+                    }
                     acc.close(ts, StepOutcome::TimedOut);
                 }
             }
@@ -688,6 +699,9 @@ struct Acc {
     ended_at: Option<DateTime<Utc>>,
     outcome: Option<StepOutcome>,
     max_failed_attempt: Option<i32>,
+    /// `ActivityStarted` events seen. A timed-out step reports it as its
+    /// attempt (issue #1809).
+    starts: u32,
     /// Whether the wait/exec split can ever apply (regular activities only).
     split_applicable: bool,
     /// Whether this kind reports an `attempt` (activities / local activities).
@@ -712,6 +726,7 @@ impl Acc {
             ended_at: None,
             outcome: None,
             max_failed_attempt: None,
+            starts: 0,
             split_applicable,
             retrying,
         }
@@ -1333,6 +1348,45 @@ mod tests {
         assert_eq!(act.outcome, StepOutcome::TimedOut);
         assert_eq!(act.attempt, Some(1));
         assert_eq!(act.total_ms, 190);
+    }
+
+    /// A retried timeout appends no event (issue #1809). The attempt of a
+    /// timed-out step is the number of its starts.
+    #[test]
+    fn retried_timeout_reports_each_started_attempt() {
+        let a1 = ActivityExecId::new();
+        let mut rows = vec![
+            started(0),
+            row(
+                10,
+                WorkflowEvent::ActivityScheduled {
+                    activity_id: a1,
+                    name: "slow".into(),
+                    input: serde_json::Value::Null,
+                    queue: "default".into(),
+                },
+            ),
+        ];
+        for at in [20, 40, 60] {
+            rows.push(row(
+                at,
+                WorkflowEvent::ActivityStarted {
+                    activity_id: a1,
+                    worker_id: WorkerId::new("w"),
+                },
+            ));
+        }
+        rows.push(row(
+            200,
+            WorkflowEvent::ActivityTimedOut {
+                activity_id: a1,
+                timeout_type: crate::error::TimeoutType::StartToClose,
+            },
+        ));
+        let tl = derive(&rows, Some(200), 200);
+        let act = find(&tl.steps, StepKind::Activity);
+        assert_eq!(act.outcome, StepOutcome::TimedOut);
+        assert_eq!(act.attempt, Some(3));
     }
 
     // ── child workflow failed ──

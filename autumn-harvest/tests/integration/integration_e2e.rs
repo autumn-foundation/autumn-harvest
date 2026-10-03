@@ -3390,7 +3390,12 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                 vec![ActivityInfo {
                     name: "slow_activity",
                     module: "integration_e2e",
-                    default_retry_policy: None,
+                    // One attempt keeps the timeout terminal (ADR 0004,
+                    // issue #1809). The default policy would retry it.
+                    default_retry_policy: Some(autumn_harvest::RetryPolicy::fixed(
+                        1,
+                        Duration::from_millis(10),
+                    )),
                     default_start_to_close: Some(Duration::from_millis(100)),
                     default_heartbeat_timeout: None,
                     default_schedule_to_start: None,
@@ -9458,11 +9463,15 @@ async fn circuit_breaker_short_circuits_after_tripping() {
             rate_limit_key: None,
             rate_limit_key_expr: None,
             // Trip after a single failure; long cooldown so it stays open.
-            circuit_breaker: Some(autumn_harvest::policy::CircuitBreakerPolicy::new(
-                1,
-                Duration::from_secs(60),
-                Duration::from_secs(300),
-            )),
+            // Fail-fast, so the open breaker ends the activity (issue #1809).
+            circuit_breaker: Some(
+                autumn_harvest::policy::CircuitBreakerPolicy::new(
+                    1,
+                    Duration::from_secs(60),
+                    Duration::from_secs(300),
+                )
+                .with_open_mode(autumn_harvest::policy::CircuitOpenMode::FailFast),
+            ),
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,

@@ -5246,6 +5246,31 @@ fn next_retry_delay(
     chrono_duration_from_std(delay, "retry delay").map(Some)
 }
 
+/// The delay before the retry of a timed-out attempt (issue #1809).
+///
+/// The timeout enforcer calls it for a start-to-close or heartbeat timeout.
+/// The rules are those of a handler failure in [`next_retry_delay`]: the
+/// attempt cap, backoff, jitter and `non_retryable_errors` apply. A timeout
+/// carries no `retry_after` hint, so the ceiling is unused.
+///
+/// `None` means the timeout is terminal. A retry policy that does not parse
+/// is terminal too. The worker fails the execution in that case, but the
+/// enforcer only fails the activity, which the workflow can handle.
+pub(crate) fn timeout_retry_delay(task: &TaskQueueItem, error: &str) -> Option<chrono::Duration> {
+    let policy = configured_retry_policy(task)
+        .inspect_err(|e| {
+            tracing::warn!(
+                task_id = %task.id,
+                error = %e,
+                "retry policy does not parse; the activity timeout is terminal"
+            );
+        })
+        .ok()?;
+    next_retry_delay(task, error, policy.as_ref(), Duration::ZERO)
+        .ok()
+        .flatten()
+}
+
 /// Local-activity counterpart to [`next_retry_delay`] (issue #744, Codex
 /// review on PR #1140): resolve the sleep duration for a non-terminal
 /// local-activity retry attempt, honoring `ActivityFailure::retry_after`
@@ -5618,6 +5643,12 @@ async fn append_activity_started_if_pending(
             if lock_activity_claim(conn, task).await? != queue::ClaimLock::Held {
                 return Ok(None);
             }
+            // This claim appends `ActivityStarted` now (issue #1809). Only such
+            // an attempt can time out against the downstream, so only its
+            // timeout feeds the circuit breaker.
+            queue::mark_claim_handler_started(conn, &claim_of_task(task)?)
+                .await?
+                .require_applied(task.id)?;
 
             let started_event = WorkflowEvent::ActivityStarted {
                 activity_id,
@@ -14509,8 +14540,9 @@ pub async fn observe_task_cancellation(pool: &DbPool, claim: &queue::TaskClaim) 
 /// before the next retry attempt could start (issue #378).
 ///
 /// Pure so both the claim-time snapshot check and the in-transaction fresh
-/// re-check (issue #609 post-review hardening) share one decision rule.
-fn deadline_would_be_exceeded(
+/// re-check (issue #609 post-review hardening) share one decision rule. The
+/// timeout enforcer uses it too (issue #1809).
+pub(crate) fn deadline_would_be_exceeded(
     deadline: Option<chrono::DateTime<chrono::Utc>>,
     now: chrono::DateTime<chrono::Utc>,
     retry_delay: chrono::Duration,
@@ -15134,6 +15166,76 @@ async fn execute_activity_future_with_cancellation(
     .await
 }
 
+/// Releases an admitted half-open probe unless the attempt reports its result
+/// (issue #1809).
+///
+/// `on_dispatch` sets `probe_in_flight`. Only `on_result` or `on_cancelled`
+/// clears it. An early return that calls neither leaves the breaker half-open
+/// for good. Every later dispatch then short-circuits, and in defer mode the
+/// work waits forever. The drop calls `on_cancelled`, which re-arms the
+/// cooldown. A repeat call after an explicit release is a no-op, because the
+/// release bumps the breaker generation.
+struct CircuitProbeGuard<'a> {
+    breakers: &'a crate::circuit_breaker::CircuitBreakerRegistry,
+    activity_name: &'a str,
+    token: Option<crate::circuit_breaker::DispatchToken>,
+}
+
+impl<'a> CircuitProbeGuard<'a> {
+    const fn new(
+        breakers: &'a crate::circuit_breaker::CircuitBreakerRegistry,
+        activity_name: &'a str,
+        token: Option<crate::circuit_breaker::DispatchToken>,
+    ) -> Self {
+        Self {
+            breakers,
+            activity_name,
+            token,
+        }
+    }
+
+    /// The attempt now reports its own outcome to the breaker.
+    const fn disarm(&mut self) {
+        self.token = None;
+    }
+}
+
+impl Drop for CircuitProbeGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() {
+            self.breakers
+                .on_cancelled(self.activity_name, token, std::time::Instant::now());
+        }
+    }
+}
+
+/// Lower clamp on an open-circuit deferral, so a probe that is due at once
+/// cannot spin the claim loop hot (issue #1809).
+const CIRCUIT_DEFER_MIN: Duration = Duration::from_millis(100);
+/// Upper clamp on an open-circuit deferral (issue #1809). A forced-open
+/// breaker, or a probe in flight, reports no time until the next probe. The
+/// task then checks again at least this often, so it runs soon after a
+/// recovery.
+const CIRCUIT_DEFER_MAX: Duration = Duration::from_secs(30);
+
+/// The delay of a task that an open breaker defers (issue #1809).
+///
+/// The base is the time until the next probe. With no such time, the base is
+/// the cooldown. The base is clamped to `[CIRCUIT_DEFER_MIN,
+/// CIRCUIT_DEFER_MAX]`. Jitter adds up to a quarter of the base, so the
+/// deferred tasks do not all wake at the same instant.
+fn circuit_defer_delay(
+    retry_after: Option<Duration>,
+    cooldown: Duration,
+    task: &TaskQueueItem,
+) -> chrono::Duration {
+    let base = retry_after
+        .unwrap_or(cooldown)
+        .clamp(CIRCUIT_DEFER_MIN, CIRCUIT_DEFER_MAX);
+    let jitter = crate::policy::full_jitter(base / 4, retry_stream_seed(task), task_attempt(task));
+    chrono::Duration::from_std(base + jitter).unwrap_or(chrono::Duration::seconds(1))
+}
+
 /// Fallback defer delay when a rate-limited circuit-breaker activity has no
 /// configured `rate_limit_rps` to derive a one-token refill interval from.
 const RATE_LIMIT_DEFER_FALLBACK: Duration = Duration::from_millis(250);
@@ -15531,6 +15633,32 @@ async fn process_activity_task(
         crate::circuit_breaker::DispatchDecision::Allow { token } => Some(token),
         crate::circuit_breaker::DispatchDecision::ShortCircuit { .. } => None,
     };
+    // Releases a half-open probe on every early return, `?` included (issue
+    // #1809). In defer mode a leaked probe would defer this activity forever.
+    let mut probe_guard = CircuitProbeGuard::new(&circuit_breakers, activity_name, circuit_token);
+
+    // Defer mode (issue #1809): an open breaker puts the task back to
+    // PENDING until the next probe. The deferral runs before
+    // ActivityStarted, so it appends no event. A short circuit admits no
+    // probe and reserves no rate-limit token, so there is nothing to undo.
+    if let crate::circuit_breaker::DispatchDecision::ShortCircuit { retry_after, .. } =
+        dispatch_decision
+        && let Some(policy) = activity.circuit_breaker
+        && policy.open_mode == crate::policy::CircuitOpenMode::Defer
+    {
+        let delay = circuit_defer_delay(retry_after, policy.cooldown, task);
+        let mut conn = pool.get().await.map_err(crate::error::database_error)?;
+        match queue::defer_claimed_task_for_open_circuit(&mut conn, &claim_of_task(task)?, delay)
+            .await?
+        {
+            queue::ClaimWrite::Applied => registry
+                .telemetry()
+                .metrics
+                .record_circuit_deferred(activity_name),
+            queue::ClaimWrite::LeaseLost => log_lease_lost(task, "open-circuit deferral"),
+        }
+        return Ok(());
+    }
 
     // Retry budget (issue #1793). See `retry_budget_gates` for which
     // attempts it gates. The gate runs before ActivityStarted, so a deferred
@@ -15644,8 +15772,9 @@ async fn process_activity_task(
     // slot is free before the handler runs (prevents a deadlock when
     // `run_transactional` needs a second slot while max_size connections are held
     // by concurrent activity tasks). Appended AFTER the rate-limit reservation so
-    // a deferred task never records a start it did not run; serves both the
-    // short-circuit path (start + CircuitOpen failure) and the real-call path.
+    // a deferred task never records a start it did not run. It serves the
+    // fail-fast short-circuit path (start + CircuitOpen failure) and the
+    // real-call path.
     let started = {
         let mut conn = pool.get().await.map_err(crate::error::database_error)?;
         let started_result = append_activity_started_if_pending(
@@ -16204,6 +16333,7 @@ async fn process_activity_task(
     // its slot must still be released via `on_cancelled`, or the breaker would
     // stay HalfOpen with `probe_in_flight = true` forever and short-circuit every
     // later dispatch. Only genuine handler outcomes feed the breaker as outcomes.
+    probe_guard.disarm();
     let circuit_outcome = if was_cancelled {
         if let Some(token) = circuit_token {
             circuit_breakers.on_cancelled(activity_name, token, std::time::Instant::now());
@@ -16225,10 +16355,26 @@ async fn process_activity_task(
     };
     // `circuit_token` is always `Some` here: the short-circuit path returned
     // early above, so reaching this point means the attempt was dispatched.
+    //
+    // A timeout can requeue the attempt before its handler returns (issue
+    // #1809). The enforcer then marks the claim and counts the timeout. A
+    // late result of that claim must not count again, and a late success must
+    // not clear the failure window. `on_claim_result` checks the mark under
+    // the breaker lock, so the check cannot race the enforcer.
+    let claim_key = crate::circuit_breaker::ClaimKey {
+        task_id: activity_claim.task_id,
+        attempt: activity_claim.attempt,
+    };
     if let Some(transition) = circuit_token
         .zip(circuit_outcome)
         .and_then(|(token, outcome)| {
-            circuit_breakers.on_result(activity_name, outcome, token, std::time::Instant::now())
+            circuit_breakers.on_claim_result(
+                activity_name,
+                outcome,
+                token,
+                claim_key,
+                std::time::Instant::now(),
+            )
         })
     {
         match transition {
@@ -41984,7 +42130,77 @@ mod tests {
             capability_miss_workers: Vec::new(),
             capability_miss_handler: None,
             timer_fires_at: None,
+            handler_started_attempt: None,
         }
+    }
+
+    // ── Timeout retries and open-circuit deferral (issue #1809) ────────
+
+    #[test]
+    fn timeout_retry_delay_retries_under_the_attempt_cap() {
+        let mut task = retry_after_test_task(1, 3);
+        task.retry_policy =
+            Some(serde_json::to_value(RetryPolicy::fixed(3, Duration::from_secs(2))).unwrap());
+        let delay = timeout_retry_delay(&task, "timeout: StartToClose for call_api")
+            .expect("attempt 1 of 3 retries");
+        assert!(delay > chrono::Duration::zero());
+        assert!(delay <= chrono::Duration::seconds(2));
+    }
+
+    #[test]
+    fn timeout_retry_delay_is_terminal_at_the_attempt_cap() {
+        let mut task = retry_after_test_task(3, 3);
+        task.retry_policy =
+            Some(serde_json::to_value(RetryPolicy::fixed(3, Duration::from_secs(2))).unwrap());
+        assert_eq!(
+            timeout_retry_delay(&task, "timeout: StartToClose for call_api"),
+            None
+        );
+    }
+
+    #[test]
+    fn timeout_retry_delay_honours_non_retryable_errors() {
+        let error = "timeout: Heartbeat for call_api";
+        let mut policy = RetryPolicy::fixed(3, Duration::from_secs(2));
+        policy.non_retryable_errors = vec![error.to_owned()];
+        let mut task = retry_after_test_task(1, 3);
+        task.retry_policy = Some(serde_json::to_value(policy).unwrap());
+        assert_eq!(timeout_retry_delay(&task, error), None);
+    }
+
+    #[test]
+    fn timeout_retry_delay_is_terminal_for_a_policy_that_does_not_parse() {
+        let mut task = retry_after_test_task(1, 3);
+        task.retry_policy = Some(serde_json::json!({ "max_attempts": "many" }));
+        assert_eq!(
+            timeout_retry_delay(&task, "timeout: StartToClose for call_api"),
+            None
+        );
+    }
+
+    #[test]
+    fn circuit_defer_delay_waits_for_the_next_probe_plus_jitter() {
+        let task = retry_after_test_task(1, 3);
+        let delay =
+            circuit_defer_delay(Some(Duration::from_secs(4)), Duration::from_secs(60), &task);
+        assert!(delay >= chrono::Duration::seconds(4), "{delay:?}");
+        assert!(delay <= chrono::Duration::seconds(5), "{delay:?}");
+    }
+
+    #[test]
+    fn circuit_defer_delay_uses_the_clamped_cooldown_without_a_probe_time() {
+        let task = retry_after_test_task(1, 3);
+        let delay = circuit_defer_delay(None, Duration::from_secs(3600), &task);
+        let max = chrono::Duration::from_std(CIRCUIT_DEFER_MAX).unwrap();
+        assert!(delay >= max, "{delay:?}");
+        assert!(delay <= max + max / 4, "{delay:?}");
+    }
+
+    #[test]
+    fn circuit_defer_delay_never_spins_hot() {
+        let task = retry_after_test_task(1, 3);
+        let delay = circuit_defer_delay(Some(Duration::from_millis(1)), Duration::ZERO, &task);
+        assert!(delay >= chrono::Duration::from_std(CIRCUIT_DEFER_MIN).unwrap());
     }
 
     #[test]
