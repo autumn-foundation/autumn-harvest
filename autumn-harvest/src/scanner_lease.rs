@@ -163,7 +163,7 @@ pub struct ScannerConfig {
     /// [`MIN_SCANNER_INTERVAL`] and [`MAX_SCANNER_INTERVAL`].
     pub timeout_interval: Option<Duration>,
     /// Most rows per timeout reason that one timeout pass enforces. Defaults
-    /// to [`DEFAULT_TIMEOUT_SCAN_BATCH_SIZE`]. Raised to at least 1.
+    /// to [`DEFAULT_TIMEOUT_SCAN_BATCH_SIZE`]. Kept within 1 and 100,000.
     pub timeout_batch_size: u32,
 }
 

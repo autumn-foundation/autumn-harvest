@@ -611,6 +611,16 @@ const REFILL_BATCHES: i64 = 64;
 /// Most live rows that one refill reads, whatever the batch size.
 const MAX_PAGE_ROWS: i64 = 100_000;
 
+/// The batch limit and the refill page size for a requested `limit`.
+///
+/// The limit is kept within 1 and [`MAX_PAGE_ROWS`]. So no setting can make
+/// a refill read more than [`MAX_PAGE_ROWS`] rows.
+fn timeout_scan_bounds(limit: i64) -> (i64, i64) {
+    let limit = limit.clamp(1, MAX_PAGE_ROWS);
+    let page_rows = limit.saturating_mul(REFILL_BATCHES).min(MAX_PAGE_ROWS);
+    (limit, page_rows)
+}
+
 /// One timeout reason's place in its sweep.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct TimeoutScanLane {
@@ -730,7 +740,7 @@ struct Refill {
 /// Bounded form of [`find_timed_out_tasks`] (issue #1795).
 ///
 /// Returns at most `limit` rows per timeout reason, from `cursor` onward, and
-/// moves `cursor`. A `limit` below 1 counts as 1.
+/// moves `cursor`. The `limit` is kept within 1 and 100,000.
 ///
 /// # Errors
 ///
@@ -740,11 +750,7 @@ pub async fn find_timed_out_tasks_batch(
     cursor: &mut TimeoutScanCursor,
     limit: i64,
 ) -> HarvestResult<Vec<(TaskQueueItem, TimeoutReason)>> {
-    let limit = limit.max(1);
-    let page_rows = limit
-        .saturating_mul(REFILL_BATCHES)
-        .min(MAX_PAGE_ROWS)
-        .max(limit);
+    let (limit, page_rows) = timeout_scan_bounds(limit);
     let mut results = Vec::new();
     let mut seen = HashSet::new();
 
@@ -6515,6 +6521,14 @@ mod tests {
         lane.commit_batch(3);
         assert_eq!(lane.retry, Vec::<uuid::Uuid>::new());
         assert_eq!(lane.queued.len(), 2);
+    }
+
+    #[test]
+    fn an_oversized_batch_cannot_raise_the_page_bound() {
+        assert_eq!(timeout_scan_bounds(0), (1, REFILL_BATCHES));
+        assert_eq!(timeout_scan_bounds(500), (500, 500 * REFILL_BATCHES));
+        let (limit, page_rows) = timeout_scan_bounds(i64::from(u32::MAX));
+        assert_eq!((limit, page_rows), (MAX_PAGE_ROWS, MAX_PAGE_ROWS));
     }
 
     #[test]

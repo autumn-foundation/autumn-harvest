@@ -51,7 +51,8 @@ size, so adding workers to clear a backlog added database load in proportion.
   lease_ttl, jitter, timeout_interval, timeout_batch_size })`, reported by
   `GET /admin/config`. `timeout_interval: None` keeps the poll-interval
   cadence. The interval is kept within 10 ms and 4 h, so the lease always
-  covers three of the longest sleeps. The worker uses its
+  covers three of the longest sleeps. The batch size is kept within 1 and
+  100,000, so a refill never reads more than 100,000 rows. The worker uses its
   `worker_id` as the holder id.
 - **Metric.** `harvest.scanner.pass{scanner, shard, role}` with `role` one of
   `leader`, `standby`, `unelected`, `fail_open`. The metrics-rs bridge emits
