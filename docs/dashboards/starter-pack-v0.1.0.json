@@ -6992,9 +6992,18 @@
                 "type": "prometheus",
                 "uid": "${datasource}"
               }
+            },
+            {
+              "refId": "C",
+              "expr": "min by (shard) (harvest_db_pool_idle{shard=~\"$shard\"})",
+              "legendFormat": "fewest idle on one replica, shard {{shard}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
             }
           ],
-          "description": "Connections each shard pool lends out and holds idle, summed over worker replicas (issue #1815). Each replica owns its pool, so sum is valid. Idle near 0 with rising acquire wait means the pool is too small. Colocated shards that share one pool show the same values."
+          "description": "Connections each shard pool lends out and holds idle, summed over worker replicas (issue #1815). Each replica owns its pool, so sum is valid. A sum can hide one starved replica, so series C shows the fewest idle connections on any one replica. Idle near 0 with rising acquire wait means the pool is too small. Colocated shards that share one pool show the same values."
         },
         {
           "id": 376911,
@@ -7151,7 +7160,7 @@
           "targets": [
             {
               "refId": "A",
-              "expr": "sum by (queue) (harvest_worker_pollers{queue=~\"$queue\"})",
+              "expr": "sum by (queue) (harvest_worker_pollers{queue=~\"$queue\"}) or max by (queue) (harvest_queue_depth{queue=~\"$queue\"}) * 0",
               "legendFormat": "{{queue}}",
               "datasource": {
                 "type": "prometheus",
@@ -7159,7 +7168,7 @@
               }
             }
           ],
-          "description": "Poll loops that claim from each queue, summed over worker replicas (issue #1815). One worker runs one poll loop over all its queues. A drained worker reports 0. A queue at 0 has no poller and its backlog grows."
+          "description": "Poll loops that claim from each queue, summed over worker replicas (issue #1815). One worker runs one poll loop over all its queues. A drained worker reports 0. When the last poller of a queue exits, its series ends; the queue-depth fallback then draws that queue at 0, and its backlog grows."
         },
         {
           "id": 872151,
@@ -7208,7 +7217,7 @@
               }
             }
           ],
-          "description": "1 when a worker fails a far higher share of tasks, or has a far higher p99 task latency, than the median of its live peers (issue #1815). The worker is alive and passes the heartbeat check, so worker health alone misses it. GET /admin/status lists the same workers under workers.outliers. Alert: harvest_worker_gray_failure (docs/runbooks/harvest-alerts.md#harvest_worker_gray_failure)."
+          "description": "1 when a worker fails a far higher share of tasks, or has a far higher p99 task latency, than the median of its live peers on the same queues (issue #1815). The worker is alive and passes the heartbeat check, so worker health alone misses it. GET /admin/status lists the same workers under workers.outliers. Alert: harvest_worker_gray_failure (docs/runbooks/harvest-alerts.md#harvest_worker_gray_failure)."
         }
       ]
     }

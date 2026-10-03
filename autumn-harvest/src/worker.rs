@@ -23106,8 +23106,9 @@ async fn process_workflow_task(
     let execution_ref = &prepared.execution;
     let exec_uuid = prepared.exec_id.as_uuid();
 
-    // Issue #1815: the `persist` op spans the whole transaction, COMMIT included.
-    let persist_started = std::time::Instant::now();
+    // Issue #1815: the `persist` op spans the whole transaction, COMMIT
+    // included. The guard also records a transaction that a timeout cancels.
+    let persist_timer = DbOpTimer::start(&registry.telemetry().metrics, DbOp::Persist);
     let persist_flow = Box::pin(conn.transaction::<WorkflowPersistFlow, HarvestError, _>(
         async |conn| {
             if check_paused_and_park(
@@ -23199,10 +23200,7 @@ async fn process_workflow_task(
         },
     ))
     .await;
-    registry
-        .telemetry()
-        .metrics
-        .record_db_query_duration(DbOp::Persist, persist_started.elapsed().as_secs_f64());
+    drop(persist_timer);
     // execute_span is moved into and dropped by the transaction closure above,
     // closing the OTel span after all producer spans have been emitted as its
     // children.
@@ -25862,13 +25860,23 @@ fn spawn_db_pool_sampler(
 
 /// Split a deadpool status into `(in_use, idle)` connections (issue #1815).
 ///
-/// `size` counts open connections and `available` counts the idle ones. A
-/// negative `available` means callers wait, and no connection is idle.
+/// `size` counts open connections and `available` counts the idle ones.
+/// Callers that wait are in `waiting`, not in `available`. The clamp keeps the
+/// subtraction safe if a racy snapshot reads more idle than open connections.
 fn pool_occupancy(status: &deadpool::Status) -> (u64, u64) {
     let idle = status.available.min(status.size);
     let in_use = status.size - idle;
     (in_use as u64, idle as u64)
 }
+
+/// Running poll loops per queue in this process (issue #1815).
+///
+/// The gauge has no worker label, and two `Worker`s in one process share one
+/// recorder. A per-worker count would let one worker's drain write 0 over a
+/// peer that still polls. So the count is process-wide.
+static POLLERS_BY_QUEUE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, u64>>,
+> = std::sync::LazyLock::new(std::sync::Mutex::default);
 
 /// Counts one running poll loop and keeps `harvest.worker.pollers` current
 /// (issue #1815).
@@ -25876,38 +25884,75 @@ fn pool_occupancy(status: &deadpool::Status) -> (u64, u64) {
 /// The guard sets the gauge when its loop starts and again when the loop
 /// ends. So a drained worker reads 0 at once, with no wait for a sampler tick.
 struct PollerGuard {
-    count: Arc<AtomicUsize>,
     queues: Vec<String>,
     metrics: Arc<dyn crate::telemetry::MetricsRecorder>,
 }
 
 impl PollerGuard {
-    fn new(
-        count: &Arc<AtomicUsize>,
-        queues: &[String],
-        metrics: &Arc<dyn crate::telemetry::MetricsRecorder>,
-    ) -> Self {
+    fn new(queues: &[String], metrics: &Arc<dyn crate::telemetry::MetricsRecorder>) -> Self {
+        let mut queues = queues.to_vec();
+        queues.sort_unstable();
+        queues.dedup();
         let guard = Self {
-            count: Arc::clone(count),
-            queues: queues.to_vec(),
+            queues,
             metrics: Arc::clone(metrics),
         };
-        let pollers = count.fetch_add(1, Ordering::SeqCst) + 1;
-        guard.emit(pollers);
+        guard.adjust(true);
         guard
     }
 
-    fn emit(&self, pollers: usize) {
+    /// Add or remove this loop from each of its queues and emit the counts.
+    ///
+    /// The lock stays held while the counts go out. Two loops that start or
+    /// stop together then emit in count order, so the last write is current.
+    #[allow(clippy::significant_drop_tightening)]
+    fn adjust(&self, start: bool) {
+        let mut counts = POLLERS_BY_QUEUE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for queue in &self.queues {
-            self.metrics.record_worker_pollers(queue, pollers as u64);
+            let count = counts.entry(queue.clone()).or_insert(0);
+            *count = if start {
+                count.saturating_add(1)
+            } else {
+                count.saturating_sub(1)
+            };
+            self.metrics.record_worker_pollers(queue, *count);
         }
     }
 }
 
 impl Drop for PollerGuard {
     fn drop(&mut self) {
-        let pollers = self.count.fetch_sub(1, Ordering::SeqCst).saturating_sub(1);
-        self.emit(pollers);
+        self.adjust(false);
+    }
+}
+
+/// Records one [`DbOp`]'s duration when it drops (issue #1815).
+///
+/// A guard records an op that a timeout cancels, too. The slowest ops are the
+/// ones most likely to be cancelled, so a plain timer after the `await` would
+/// drop exactly the samples that show saturation.
+struct DbOpTimer {
+    metrics: Arc<dyn crate::telemetry::MetricsRecorder>,
+    op: DbOp,
+    started: std::time::Instant,
+}
+
+impl DbOpTimer {
+    fn start(metrics: &Arc<dyn crate::telemetry::MetricsRecorder>, op: DbOp) -> Self {
+        Self {
+            metrics: Arc::clone(metrics),
+            op,
+            started: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for DbOpTimer {
+    fn drop(&mut self) {
+        self.metrics
+            .record_db_query_duration(self.op, self.started.elapsed().as_secs_f64());
     }
 }
 
@@ -26547,8 +26592,6 @@ pub struct Worker {
     /// This worker's rolling task outcomes (issue #1815). The liveness
     /// heartbeat publishes a snapshot for outlier detection.
     task_outcomes: Arc<crate::worker_outlier::TaskOutcomeWindow>,
-    /// Running poll loops, behind `harvest.worker.pollers` (issue #1815).
-    active_pollers: Arc<AtomicUsize>,
     /// Each assigned shard's per-shard dispatch channel, captured once at
     /// construction (issue #1429 follow-up). See the capture site in
     /// [`Worker::new`] for why this is decided here rather than later, at
@@ -28190,7 +28233,6 @@ impl Worker {
             workflow_deadlock_strikes: Arc::default(),
             session_slots_in_use: crate::sessions::new_session_slot_registry(),
             task_outcomes: Arc::default(),
-            active_pollers: Arc::default(),
             shard_dispatch,
             global_dispatch,
         })
@@ -28682,6 +28724,7 @@ impl Worker {
         shard_listeners
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn run_multi_shard(
         &self,
         shard_targets: Vec<(crate::types::ShardId, DbPool)>,
@@ -28787,13 +28830,15 @@ impl Worker {
         let heartbeat_handles: Vec<_> = shard_targets
             .iter()
             .zip(&registration_pending_per_shard)
-            .map(|((_, shard_pool), pending)| {
+            .enumerate()
+            .map(|(index, ((_, shard_pool), pending))| {
                 AbortOnDrop::new(self.spawn_heartbeat_task(
                     shard_pool,
                     Arc::clone(&monitors.workflow_slot_target),
                     Arc::clone(&monitors.activity_slot_target),
                     heartbeat_cancel.clone(),
                     Arc::clone(pending),
+                    index == 0,
                 ))
             })
             .collect();
@@ -29260,6 +29305,7 @@ impl Worker {
             Arc::clone(&monitors.activity_slot_target),
             heartbeat_cancel.clone(),
             Arc::clone(&registration_pending),
+            true,
         ));
 
         // The single-shard path resolves at most one shard target, and that
@@ -30144,6 +30190,10 @@ impl Worker {
         activity_slot_target: Arc<AtomicUsize>,
         heartbeat_cancel: CancellationToken,
         registration_pending: Arc<AtomicBool>,
+        // Issue #1815: whether this heartbeat compares the worker with its
+        // peers. Exactly one heartbeat per worker does: the single pool's, or
+        // the first shard's in `run_multi_shard`.
+        compare_outliers: bool,
     ) -> tokio::task::JoinHandle<()> {
         // Spawn the heartbeat background task with a dedicated cancel token so
         // that liveness updates continue during the Draining phase and only stop
@@ -30195,6 +30245,7 @@ impl Worker {
                 fleet_stale_secs: capability_miss_fleet_stale_secs(
                     self.config.worker_heartbeat_interval,
                 ),
+                compare: compare_outliers,
             },
         )
     }
@@ -31629,11 +31680,7 @@ impl Worker {
 
     /// Count this poll loop until the guard drops (issue #1815).
     fn poller_guard(&self) -> PollerGuard {
-        PollerGuard::new(
-            &self.active_pollers,
-            &self.config.queues,
-            &self.registry.telemetry().metrics,
-        )
+        PollerGuard::new(&self.config.queues, &self.registry.telemetry().metrics)
     }
 
     /// Record the duration of one database op that began at `started`
@@ -39796,6 +39843,51 @@ mod tests {
         assert!(
             reason.contains("never missed this task"),
             "the operator's next step is the live peer, not the deploy: {reason}"
+        );
+    }
+
+    /// Issue #1815: the pool gauges split open connections into lent and idle.
+    #[test]
+    fn pool_occupancy_splits_open_connections_into_in_use_and_idle() {
+        let status = |size, available| deadpool::Status {
+            max_size: 10,
+            size,
+            available,
+            waiting: 0,
+        };
+        assert_eq!(pool_occupancy(&status(0, 0)), (0, 0));
+        assert_eq!(pool_occupancy(&status(4, 1)), (3, 1));
+        assert_eq!(pool_occupancy(&status(4, 4)), (0, 4));
+        // A racy snapshot never yields a negative in-use count.
+        assert_eq!(pool_occupancy(&status(2, 5)), (0, 2));
+    }
+
+    /// Issue #1815: two poll loops on one queue read 2, and the gauge falls
+    /// back to 0 as each loop ends.
+    #[test]
+    fn poller_guard_counts_loops_per_queue_across_the_process() {
+        #[derive(Default)]
+        struct Pollers(std::sync::Mutex<Vec<(String, u64)>>);
+        impl crate::telemetry::MetricsRecorder for Pollers {
+            fn record_worker_pollers(&self, queue: &str, pollers: u64) {
+                self.0.lock().unwrap().push((queue.to_owned(), pollers));
+            }
+        }
+        let recorder = Arc::new(Pollers::default());
+        let metrics: Arc<dyn crate::telemetry::MetricsRecorder> = recorder.clone();
+        let queue = format!("poller-guard-{}", uuid::Uuid::new_v4().simple());
+        let queues = vec![queue.clone(), queue.clone()];
+
+        let first = PollerGuard::new(&queues, &metrics);
+        let second = PollerGuard::new(std::slice::from_ref(&queue), &metrics);
+        drop(first);
+        drop(second);
+
+        let seen: Vec<u64> = recorder.0.lock().unwrap().iter().map(|(_, n)| *n).collect();
+        assert_eq!(
+            seen,
+            vec![1, 2, 1, 0],
+            "a duplicate queue counts once per loop"
         );
     }
 

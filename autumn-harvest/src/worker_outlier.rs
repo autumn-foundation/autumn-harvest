@@ -166,7 +166,8 @@ impl TaskOutcomeWindow {
 pub struct OutlierConfig {
     /// A worker with fewer tasks than this is not judged, and is not a peer.
     pub min_samples: u32,
-    /// The fewest judged peers that a comparison needs.
+    /// The fewest judged peers that a comparison needs. A value of 0 acts
+    /// as 1, because a median needs at least one value.
     pub min_peers: usize,
     /// The failure ratio must exceed the peer median by this much (0.0 to 1.0).
     pub failure_ratio_margin: f64,
@@ -223,10 +224,11 @@ pub fn outlier_dimensions(
         .iter()
         .filter(|p| judged(p, config).is_some())
         .collect();
+    let min_peers = config.min_peers.max(1);
     let mut dimensions = Vec::new();
 
     let peer_ratios: Vec<f64> = peers.iter().filter_map(|p| p.failure_ratio()).collect();
-    if peer_ratios.len() >= config.min_peers {
+    if peer_ratios.len() >= min_peers {
         let median = median_f64(peer_ratios);
         if own_ratio - median >= config.failure_ratio_margin
             && own_ratio >= config.failure_ratio_factor * median
@@ -237,7 +239,7 @@ pub fn outlier_dimensions(
 
     let peer_p99s: Vec<u64> = peers.iter().filter_map(|p| p.p99_latency_ms).collect();
     if let Some(own_p99) = own.p99_latency_ms
-        && peer_p99s.len() >= config.min_peers
+        && peer_p99s.len() >= min_peers
     {
         let median = median_u64(peer_p99s);
         #[allow(clippy::cast_precision_loss)]
@@ -288,6 +290,32 @@ pub fn detect_outliers(
                 .map(median_u64),
             })
         })
+        .collect()
+}
+
+/// [`detect_outliers`] within each cohort of `fleet`.
+///
+/// Each entry is `(worker_id, cohort, stats)`. A cohort groups workers that do
+/// the same work, such as workers that poll the same queues. A worker is
+/// judged only against peers in its own cohort. So a worker on a slow queue
+/// is not an outlier against workers on a fast queue. The result is ordered
+/// by cohort, then by the order of `fleet`.
+#[must_use]
+pub fn detect_outliers_in_cohorts(
+    fleet: &[(String, String, WorkerTaskStats)],
+    config: &OutlierConfig,
+) -> Vec<WorkerOutlier> {
+    let mut cohorts: std::collections::BTreeMap<&str, Vec<(String, WorkerTaskStats)>> =
+        std::collections::BTreeMap::new();
+    for (worker_id, cohort, stats) in fleet {
+        cohorts
+            .entry(cohort.as_str())
+            .or_default()
+            .push((worker_id.clone(), *stats));
+    }
+    cohorts
+        .values()
+        .flat_map(|members| detect_outliers(members, config))
         .collect()
 }
 
@@ -541,6 +569,50 @@ mod tests {
         }
         assert_eq!(window.snapshot_at(now).p99_latency_ms, Some(99));
         assert_eq!(TaskOutcomeWindow::default().snapshot().p99_latency_ms, None);
+    }
+
+    #[test]
+    fn worker_on_a_slow_queue_is_judged_only_against_its_cohort() {
+        let fleet = vec![
+            (
+                "transcode".to_string(),
+                "[\"video\"]".to_string(),
+                stats(100, 0, 90_000),
+            ),
+            (
+                "mail-1".to_string(),
+                "[\"email\"]".to_string(),
+                stats(100, 0, 50),
+            ),
+            (
+                "mail-2".to_string(),
+                "[\"email\"]".to_string(),
+                stats(100, 0, 50),
+            ),
+            (
+                "mail-3".to_string(),
+                "[\"email\"]".to_string(),
+                stats(100, 50, 50),
+            ),
+        ];
+        let outliers = detect_outliers_in_cohorts(&fleet, &OutlierConfig::default());
+        assert_eq!(outliers.len(), 1, "{outliers:?}");
+        assert_eq!(outliers[0].worker_id, "mail-3");
+        assert_eq!(outliers[0].dimensions, vec![OutlierDimension::FailureRatio]);
+    }
+
+    #[test]
+    fn zero_min_peers_with_no_peers_flags_nothing_and_does_not_panic() {
+        let config = OutlierConfig {
+            min_peers: 0,
+            ..OutlierConfig::default()
+        };
+        assert_eq!(
+            outlier_dimensions(&stats(100, 90, 9_000), &[], &config),
+            NONE
+        );
+        let alone = detect_outliers(&fleet(&[("only", stats(100, 90, 9_000))]), &config);
+        assert_eq!(alone, Vec::<WorkerOutlier>::new());
     }
 
     #[test]

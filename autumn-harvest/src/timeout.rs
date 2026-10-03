@@ -5251,8 +5251,12 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
                 result = tokio::time::timeout(interval, pool.get()) => result,
             };
             // Issue #1815: a wait that ends in an error or a timeout counts too.
+            // A single-pool checker has no `pool_shard`, so it falls back to its
+            // assigned shard. That matches the claim path and the pool gauges.
             telemetry.metrics.record_db_pool_wait(
-                pool_shard.map_or(0, crate::worker::shard_metric_label),
+                pool_shard
+                    .or(shard)
+                    .map_or(0, crate::worker::shard_metric_label),
                 wait_started.elapsed().as_secs_f64(),
             );
             match get_result {

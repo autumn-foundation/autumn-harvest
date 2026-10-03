@@ -24,7 +24,7 @@ use autumn_harvest::worker::{DbPool, Worker, WorkerRuntimeConfig};
 use autumn_harvest::worker_outlier::{
     OutlierConfig, OutlierDimension, TaskOutcomeWindow, WorkerTaskStats,
 };
-use autumn_harvest::workers::{self, OutlierProbe};
+use autumn_harvest::workers::{self, LiveWorkerTaskStats, OutlierProbe};
 use autumn_harvest::{
     ActivityContext, HarvestBuilder, RetryPolicy, ShardedDbPool, StartWorkflowParams, WorkerConfig,
     WorkflowContext, start_or_load_workflow_execution, timeout,
@@ -44,6 +44,8 @@ use crate::integration_e2e::{
 enum Sample {
     Pool {
         shard: u16,
+        in_use: u64,
+        idle: u64,
     },
     PoolWait {
         shard: u16,
@@ -83,8 +85,12 @@ impl MetricsRecorder for Recording {
         true
     }
 
-    fn record_db_pool(&self, shard: u16, _in_use: u64, _idle: u64) {
-        self.push(Sample::Pool { shard });
+    fn record_db_pool(&self, shard: u16, in_use: u64, idle: u64) {
+        self.push(Sample::Pool {
+            shard,
+            in_use,
+            idle,
+        });
     }
 
     fn record_db_pool_wait(&self, shard: u16, _seconds: f64) {
@@ -159,7 +165,50 @@ fn probe(window: Arc<TaskOutcomeWindow>, metrics: Arc<Recording>) -> OutlierProb
         metrics,
         config: OutlierConfig::default(),
         fleet_stale_secs: 60,
+        compare: true,
     }
+}
+
+/// One comparing, non-draining outlier tick.
+async fn tick(
+    conn: &mut AsyncPgConnection,
+    worker_id: &str,
+    probe: &OutlierProbe,
+) -> Vec<OutlierDimension> {
+    workers::run_outlier_tick(conn, worker_id, probe, false)
+        .await
+        .expect("outlier tick")
+}
+
+fn find(rows: &[LiveWorkerTaskStats], worker_id: &str) -> Option<WorkerTaskStats> {
+    rows.iter()
+        .find(|row| row.worker_id == worker_id)
+        .map(|row| row.stats)
+}
+
+/// Registers `n` healthy peers on `queue` and publishes their stats.
+async fn healthy_peers(conn: &mut AsyncPgConnection, queue: &str, n: usize) -> Vec<String> {
+    let metrics = Arc::new(Recording::default());
+    let mut peers = Vec::with_capacity(n);
+    for i in 0..n {
+        let peer = unique_id(&format!("w-ok{i}"));
+        register(conn, &peer, queue).await;
+        let flagged = tick(conn, &peer, &probe(window(100, None), Arc::clone(&metrics))).await;
+        assert!(flagged.is_empty(), "a healthy peer is not flagged");
+        peers.push(peer);
+    }
+    peers
+}
+
+async fn count_stats_rows(conn: &mut AsyncPgConnection, worker_id: &str) -> i64 {
+    let row: Count = diesel::sql_query(
+        "SELECT COUNT(*) AS n FROM harvest_worker_task_stats WHERE worker_id = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(worker_id)
+    .get_result(conn)
+    .await
+    .expect("count");
+    row.n
 }
 
 // ---------------------------------------------------------------------------
@@ -173,42 +222,21 @@ fn probe(window: Arc<TaskOutcomeWindow>, metrics: Arc<Recording>) -> OutlierProb
 async fn outlier_tick_flags_the_worker_failing_half_its_tasks() {
     let (url, _container) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
+    // The unique queue makes a cohort of this test's workers only. Other
+    // tests that share the database take no part in the comparison.
     let queue = unique_id("outlier-q");
     let sick = unique_id("w-sick");
-    let peers: Vec<String> = (0..3).map(|i| unique_id(&format!("w-ok{i}"))).collect();
-    // Other tests share this database. Clear stats left by earlier runs so
-    // only this test's fleet takes part.
-    diesel::sql_query("DELETE FROM harvest_worker_task_stats")
-        .execute(&mut conn)
-        .await
-        .expect("clear stats");
-
     register(&mut conn, &sick, &queue).await;
-    for peer in &peers {
-        register(&mut conn, peer, &queue).await;
-    }
-
-    // Peers publish first, so the sick worker sees a full fleet.
-    let peer_metrics = Arc::new(Recording::default());
-    for peer in &peers {
-        let flagged = workers::run_outlier_tick(
-            &mut conn,
-            peer,
-            &probe(window(100, None), Arc::clone(&peer_metrics)),
-        )
-        .await
-        .expect("peer tick");
-        assert!(flagged.is_empty(), "a healthy peer is not flagged");
-    }
+    // Peers publish first, so the sick worker sees a full cohort.
+    let peers = healthy_peers(&mut conn, &queue, 3).await;
 
     let sick_metrics = Arc::new(Recording::default());
-    let flagged = workers::run_outlier_tick(
+    let flagged = tick(
         &mut conn,
         &sick,
         &probe(window(100, Some(2)), Arc::clone(&sick_metrics)),
     )
-    .await
-    .expect("sick tick");
+    .await;
     assert_eq!(flagged, vec![OutlierDimension::FailureRatio]);
     assert_eq!(
         sick_metrics.samples(),
@@ -225,15 +253,14 @@ async fn outlier_tick_flags_the_worker_failing_half_its_tasks() {
         "the tick sets every dimension, flagged or not"
     );
 
-    // A peer that ticks again, now with the sick worker in the fleet, stays 0.
+    // A peer that ticks again, now with the sick worker in the cohort, stays 0.
     let again = Arc::new(Recording::default());
-    let flagged = workers::run_outlier_tick(
+    let flagged = tick(
         &mut conn,
         &peers[0],
         &probe(window(100, None), Arc::clone(&again)),
     )
-    .await
-    .expect("peer tick");
+    .await;
     assert_eq!(flagged, Vec::<OutlierDimension>::new());
     assert!(again.has(&Sample::Outlier {
         dimension: OutlierDimension::FailureRatio,
@@ -241,21 +268,82 @@ async fn outlier_tick_flags_the_worker_failing_half_its_tasks() {
     }));
 
     // The stored row is the snapshot the sick worker published.
-    let stats = workers::load_live_worker_task_stats(&mut conn, 60)
+    let rows = workers::load_live_worker_task_stats(&mut conn, 60)
         .await
         .expect("load stats");
-    let own = stats
-        .iter()
-        .find(|(id, _)| id == &sick)
-        .map(|(_, s)| *s)
-        .expect("sick row");
     assert_eq!(
-        own,
-        WorkerTaskStats {
+        find(&rows, &sick),
+        Some(WorkerTaskStats {
             tasks: 100,
             failures: 50,
             p99_latency_ms: Some(20)
-        }
+        })
+    );
+    let cohort = rows
+        .iter()
+        .find(|row| row.worker_id == sick)
+        .map(|row| row.cohort.clone());
+    assert_eq!(
+        cohort,
+        Some(format!("[\"{queue}\"]")),
+        "the cohort is the queue list"
+    );
+}
+
+/// A sick worker whose peers all poll another queue has no peers in its
+/// cohort, so it is not flagged.
+#[tokio::test]
+async fn outlier_tick_compares_only_within_the_queue_cohort() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+    let sick = unique_id("w-sick");
+    register(&mut conn, &sick, &unique_id("cohort-slow")).await;
+    healthy_peers(&mut conn, &unique_id("cohort-fast"), 3).await;
+
+    let metrics = Arc::new(Recording::default());
+    let flagged = tick(&mut conn, &sick, &probe(window(100, Some(2)), metrics)).await;
+    assert_eq!(flagged, Vec::<OutlierDimension>::new());
+}
+
+/// A draining worker reads 0. A heartbeat that does not compare publishes its
+/// stats and leaves the gauge alone.
+#[tokio::test]
+async fn draining_or_non_comparing_ticks_never_flag() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+    let queue = unique_id("drain-q");
+    let sick = unique_id("w-sick");
+    register(&mut conn, &sick, &queue).await;
+    healthy_peers(&mut conn, &queue, 3).await;
+
+    let draining = Arc::new(Recording::default());
+    let flagged = workers::run_outlier_tick(
+        &mut conn,
+        &sick,
+        &probe(window(100, Some(2)), Arc::clone(&draining)),
+        true,
+    )
+    .await
+    .expect("draining tick");
+    assert_eq!(flagged, Vec::<OutlierDimension>::new());
+    assert!(draining.has(&Sample::Outlier {
+        dimension: OutlierDimension::FailureRatio,
+        flagged: false
+    }));
+
+    let quiet = Arc::new(Recording::default());
+    let mut silent = probe(window(100, Some(2)), Arc::clone(&quiet));
+    silent.compare = false;
+    let flagged = tick(&mut conn, &sick, &silent).await;
+    assert_eq!(flagged, Vec::<OutlierDimension>::new());
+    assert_eq!(quiet.samples(), Vec::new(), "no comparison, no gauge write");
+    let rows = workers::load_live_worker_task_stats(&mut conn, 60)
+        .await
+        .expect("load");
+    assert_eq!(
+        find(&rows, &sick).map(|s| s.failures),
+        Some(50),
+        "the stats are still published"
     );
 }
 
@@ -287,41 +375,85 @@ async fn live_stats_skip_draining_workers_and_follow_worker_deletes() {
         .await
         .expect("drain");
 
-    let ids: Vec<String> = workers::load_live_worker_task_stats(&mut conn, 60)
+    let rows = workers::load_live_worker_task_stats(&mut conn, 60)
         .await
-        .expect("load")
-        .into_iter()
-        .map(|(id, _)| id)
-        .collect();
-    assert!(ids.contains(&active));
-    assert!(!ids.contains(&draining), "a draining worker is not a peer");
+        .expect("load");
+    assert!(find(&rows, &active).is_some());
+    assert!(
+        find(&rows, &draining).is_none(),
+        "a draining worker is not a peer"
+    );
 
     // A second upsert replaces the row.
     let newer = WorkerTaskStats { tasks: 40, ..stats };
     workers::upsert_worker_task_stats(&mut conn, &active, &newer)
         .await
         .expect("upsert again");
-    let row = workers::load_live_worker_task_stats(&mut conn, 60)
+    let rows = workers::load_live_worker_task_stats(&mut conn, 60)
         .await
-        .expect("load")
-        .into_iter()
-        .find(|(id, _)| id == &active)
-        .map(|(_, s)| s);
-    assert_eq!(row, Some(newer));
+        .expect("load");
+    assert_eq!(find(&rows, &active), Some(newer));
 
     diesel::sql_query("DELETE FROM harvest_workers WHERE worker_id = $1")
         .bind::<diesel::sql_types::Text, _>(&active)
         .execute(&mut conn)
         .await
         .expect("delete worker");
-    let left: Count = diesel::sql_query(
-        "SELECT COUNT(*) AS n FROM harvest_worker_task_stats WHERE worker_id = $1",
-    )
-    .bind::<diesel::sql_types::Text, _>(&active)
-    .get_result(&mut conn)
-    .await
-    .expect("count");
-    assert_eq!(left.n, 0, "the FK cascade drops the stats row");
+    assert_eq!(
+        count_stats_rows(&mut conn, &active).await,
+        0,
+        "the FK cascade drops the stats row"
+    );
+}
+
+/// A frozen stats row leaves the live set. The prune deletes a row once it
+/// outlives the retention.
+#[tokio::test]
+async fn frozen_stats_leave_the_live_set_and_old_rows_are_pruned() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+    let queue = unique_id("frozen-q");
+    let frozen = unique_id("w-frozen");
+    let ancient = unique_id("w-ancient");
+    let stats = WorkerTaskStats {
+        tasks: 30,
+        failures: 15,
+        p99_latency_ms: Some(10),
+    };
+    for (id, age_secs) in [(&frozen, 120_i64), (&ancient, 7_200)] {
+        register(&mut conn, id, &queue).await;
+        workers::upsert_worker_task_stats(&mut conn, id, &stats)
+            .await
+            .expect("upsert");
+        diesel::sql_query(
+            "UPDATE harvest_worker_task_stats \
+             SET updated_at = NOW() - ($2::bigint * INTERVAL '1 second') WHERE worker_id = $1",
+        )
+        .bind::<diesel::sql_types::Text, _>(id)
+        .bind::<diesel::sql_types::BigInt, _>(age_secs)
+        .execute(&mut conn)
+        .await
+        .expect("age the row");
+    }
+
+    let rows = workers::load_live_worker_task_stats(&mut conn, 60)
+        .await
+        .expect("load");
+    assert_eq!(find(&rows, &frozen), None, "a frozen row is not live");
+
+    workers::prune_worker_task_stats(&mut conn)
+        .await
+        .expect("prune");
+    assert_eq!(
+        count_stats_rows(&mut conn, &frozen).await,
+        1,
+        "inside the retention"
+    );
+    assert_eq!(
+        count_stats_rows(&mut conn, &ancient).await,
+        0,
+        "past the retention"
+    );
 }
 
 /// An upsert for a worker with no row fails on the foreign key. The heartbeat
@@ -348,11 +480,17 @@ const ACTIVITY: &str = "saturation_always_fails";
 static ACTIVITY_CALLS: AtomicU32 = AtomicU32::new(0);
 
 fn failing_activity<'a>(
-    _ctx: &'a ActivityContext,
+    ctx: &'a ActivityContext,
     _input: serde_json::Value,
 ) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
     Box::pin(async move {
         ACTIVITY_CALLS.fetch_add(1, Ordering::SeqCst);
+        // One heartbeat, then a wait past the one-second flush interval, so
+        // the flusher records the `heartbeat` op and its pool wait.
+        ctx.heartbeat(serde_json::json!({ "step": 1 }))
+            .await
+            .map_err(|e| e.to_string())?;
+        tokio::time::sleep(Duration::from_millis(1_300)).await;
         Err("boom".to_owned())
     })
 }
@@ -568,8 +706,14 @@ async fn running_worker_emits_saturation_metrics_and_publishes_task_stats() {
     // Wait for one more sampler pass so the gauges have a value.
     tokio::time::sleep(Duration::from_millis(200)).await;
     let shard = 0u16;
+    assert!(
+        metrics.samples().iter().any(|s| matches!(
+            s,
+            Sample::Pool { shard: 0, in_use, idle } if in_use + idle > 0
+        )),
+        "the pool sampler reports the open connections"
+    );
     for wanted in [
-        Sample::Pool { shard },
         Sample::PoolWait { shard },
         Sample::Query(DbOp::Claim.as_str()),
         Sample::Query(DbOp::Persist.as_str()),

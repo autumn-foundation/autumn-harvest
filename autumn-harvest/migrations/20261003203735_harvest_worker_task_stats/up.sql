@@ -6,6 +6,8 @@
 --
 -- Worker health state only: no `WorkflowEvent` variant, no change to
 -- `harvest_events`, no replay impact. The FK drops a row with its worker.
+-- Most worker rows are never deleted, so the outlier tick also prunes rows
+-- by `updated_at`. The index keeps that prune and the freshness filter cheap.
 CREATE TABLE IF NOT EXISTS harvest_worker_task_stats (
     worker_id       TEXT        PRIMARY KEY
                                 REFERENCES harvest_workers (worker_id) ON DELETE CASCADE,
@@ -14,3 +16,6 @@ CREATE TABLE IF NOT EXISTS harvest_worker_task_stats (
     p99_latency_ms  INT8        NULL CHECK (p99_latency_ms >= 0),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE INDEX IF NOT EXISTS harvest_worker_task_stats_updated_at_idx
+    ON harvest_worker_task_stats (updated_at);

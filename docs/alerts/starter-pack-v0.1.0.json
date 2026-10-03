@@ -1528,7 +1528,7 @@
       "default_threshold": "Ticket when one worker stays an outlier on any dimension for 10 minutes. Page instead when the outlier worker serves a latency-critical queue.",
       "severity": "ticket",
       "owner_persona": "workflow on-call",
-      "description": "A worker is alive and passes its heartbeat, but it fails a far higher share of tasks, or runs them far slower, than its peers. This is a gray failure: worker health alone shows the worker as healthy. A fault that hits the whole fleet moves the peer median too, so it does not fire this rule.",
+      "description": "A worker is alive and passes its heartbeat, but it fails a far higher share of tasks, or runs them far slower, than its peers on the same queues. This is a gray failure: worker health alone shows the worker as healthy. A fault that hits the whole fleet moves the peer median too, so it does not fire this rule.",
       "first_action": "curl -s https://your-app/api/harvest/admin/status | jq '.subsystems[] | select(.name==\"workers\") | .outliers'",
       "dependencies": [
         {
@@ -1544,7 +1544,7 @@
       ],
       "prometheus": {
         "mode": "native-metric",
-        "notes": "Gauge, 1 or 0, one series per worker and dimension. Each worker reports itself, so the instance label identifies the worker. A worker needs at least 20 tasks in its 5-minute window, and the fleet needs at least 3 such workers, before the gauge can read 1.",
+        "notes": "Gauge, 1 or 0, one series per worker and dimension. Each worker reports itself, so the instance label identifies the worker. A worker is compared only with live peers that poll the same queues. It needs at least 20 tasks in its window, and 2 such peers, before the gauge can read 1. The window holds the last 5 minutes and at most 1024 tasks. A tick that cannot compare sets 0.",
         "expressions": [
           {
             "kind": "promql",
@@ -1578,7 +1578,7 @@
       ],
       "prometheus": {
         "mode": "native-metric",
-        "notes": "Needs histogram bucket boundaries on the exporter (set_buckets_for_metric for harvest_db_pool_wait_duration, see docs/telemetry.md). Without buckets, use the _sum/_count average from the dashboard panel instead.",
+        "notes": "The p99 rule needs histogram bucket boundaries on the metrics-rs Prometheus exporter (set_buckets_for_metric for harvest_db_pool_wait_duration, see docs/telemetry.md). The built-in scrape endpoint renders no _bucket series, so use the average fallback there.",
         "expressions": [
           {
             "kind": "promql",
@@ -1587,8 +1587,14 @@
           },
           {
             "kind": "promql",
-            "expr": "sum by (shard) (harvest_db_pool_idle) == 0 and sum by (shard) (harvest_db_pool_in_use) > 0",
-            "note": "Companion: no idle connection anywhere on the shard. Read it with the wait p99, because a busy but healthy pool also has few idle connections."
+            "expr": "sum by (shard) (rate(harvest_db_pool_wait_duration_sum[5m])) / sum by (shard) (rate(harvest_db_pool_wait_duration_count[5m])) > 0.05",
+            "for": "10m",
+            "note": "Bucket-less fallback: the average wait. Use it on the built-in scrape endpoint, which renders only _sum and _count."
+          },
+          {
+            "kind": "promql",
+            "expr": "(harvest_db_pool_idle == 0) and on (instance, shard) (harvest_db_pool_in_use > 0)",
+            "note": "Companion, per replica: this replica's pool for the shard has no idle connection. Pools are per replica, so a sum across replicas would hide one starved replica. deadpool opens connections only when it needs them, so read this with the wait p99: a busy but healthy pool also has few idle connections."
           }
         ]
       },
@@ -1601,7 +1607,7 @@
     {
       "id": "harvest_db_query_latency_high",
       "status": "enforceable",
-      "signal_source": "METRIC_DB_QUERY_DURATION / harvest.db.query.duration{op}, one sample per claim, workflow-task persist transaction, timeout-scanner pass and heartbeat (issue #1815).",
+      "signal_source": "METRIC_DB_QUERY_DURATION / harvest.db.query.duration{op}, one sample per claim, workflow-task persist transaction, timeout-scanner pass and activity heartbeat write (issue #1815).",
       "default_threshold": "Ticket when the p99 claim or persist duration exceeds 500 ms for 10 minutes. Scan passes are longer by design, so tune that op on its own.",
       "severity": "ticket",
       "owner_persona": "service on-call",
@@ -1616,12 +1622,18 @@
       ],
       "prometheus": {
         "mode": "native-metric",
-        "notes": "Needs histogram bucket boundaries on the exporter (set_buckets_for_metric for harvest_db_query_duration). The op label is bounded to claim, persist, scan and heartbeat.",
+        "notes": "The p99 rule needs histogram bucket boundaries on the metrics-rs Prometheus exporter (set_buckets_for_metric for harvest_db_query_duration). The built-in scrape endpoint renders no _bucket series, so use the average fallback there. The op label is bounded to claim, persist, scan and heartbeat.",
         "expressions": [
           {
             "kind": "promql",
             "expr": "histogram_quantile(0.99, sum by (le, op) (rate(harvest_db_query_duration_bucket{op=~\"claim|persist\"}[5m]))) > 0.5",
             "for": "10m"
+          },
+          {
+            "kind": "promql",
+            "expr": "sum by (op) (rate(harvest_db_query_duration_sum{op=~\"claim|persist\"}[5m])) / sum by (op) (rate(harvest_db_query_duration_count{op=~\"claim|persist\"}[5m])) > 0.25",
+            "for": "10m",
+            "note": "Bucket-less fallback: the average duration. Use it on the built-in scrape endpoint, which renders only _sum and _count."
           }
         ]
       },

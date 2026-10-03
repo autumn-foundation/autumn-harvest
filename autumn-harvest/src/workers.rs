@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::error::{HarvestError, HarvestResult};
-use crate::telemetry::{DbOp, MetricsRecorder};
+use crate::telemetry::MetricsRecorder;
 use crate::worker_outlier::{
     OutlierConfig, OutlierDimension, TaskOutcomeWindow, WorkerTaskStats, outlier_dimensions,
 };
@@ -483,18 +483,31 @@ pub async fn heartbeat_worker(
     Ok(affected)
 }
 
+/// How long a task-stats row outlives its last write (issue #1815).
+///
+/// A worker with a random id leaves an orphan row each time it restarts, and
+/// nothing deletes its `harvest_workers` row. The outlier tick prunes rows
+/// older than this, so the table stays bounded by the live fleet.
+pub const WORKER_TASK_STATS_RETENTION: Duration = Duration::from_secs(3600);
+
 /// What the liveness heartbeat needs to publish task stats and to flag this
 /// worker as an outlier (issue #1815).
 #[derive(Clone)]
 pub struct OutlierProbe {
     /// This worker's rolling task window.
     pub window: Arc<TaskOutcomeWindow>,
-    /// Receives the outlier gauge and the heartbeat duration.
+    /// Receives the outlier gauge.
     pub metrics: Arc<dyn MetricsRecorder>,
     /// The detection thresholds.
     pub config: OutlierConfig,
-    /// A peer with an older heartbeat than this is not compared.
+    /// A peer whose heartbeat or stats are older than this is not compared.
     pub fleet_stale_secs: i64,
+    /// Whether this heartbeat compares the worker and sets the gauge.
+    ///
+    /// A multi-shard worker runs one heartbeat per shard, and each one
+    /// publishes the stats. Only one of them compares. The gauge has no shard
+    /// label, so two comparisons with different peer sets would make it flap.
+    pub compare: bool,
 }
 
 impl std::fmt::Debug for OutlierProbe {
@@ -502,8 +515,49 @@ impl std::fmt::Debug for OutlierProbe {
         f.debug_struct("OutlierProbe")
             .field("config", &self.config)
             .field("fleet_stale_secs", &self.fleet_stale_secs)
+            .field("compare", &self.compare)
             .finish_non_exhaustive()
     }
+}
+
+impl OutlierProbe {
+    /// Set the gauge to 0 on every dimension.
+    ///
+    /// A tick that cannot compare calls this. An unknown state then reads as
+    /// "not an outlier", and a stale 1 cannot keep an alert firing.
+    pub fn clear_gauge(&self) {
+        if self.compare {
+            for dimension in OutlierDimension::ALL {
+                self.metrics.record_worker_outlier(dimension, false);
+            }
+        }
+    }
+}
+
+/// One live worker's published task stats (issue #1815).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveWorkerTaskStats {
+    /// The worker id.
+    pub worker_id: String,
+    /// The worker's cohort: its sorted queue list, as a JSON array.
+    ///
+    /// Workers in one cohort poll the same queues, so they do the same work.
+    /// A worker is compared only with peers in its own cohort.
+    pub cohort: String,
+    /// The published snapshot.
+    pub stats: WorkerTaskStats,
+}
+
+/// The cohort key for a worker's `queues` JSON: the sorted, deduplicated
+/// queue names, as a JSON array.
+fn queue_cohort(queues: &serde_json::Value) -> String {
+    let mut names: Vec<&str> = queues
+        .as_array()
+        .map(|a| a.iter().filter_map(serde_json::Value::as_str).collect())
+        .unwrap_or_default();
+    names.sort_unstable();
+    names.dedup();
+    serde_json::to_string(&names).unwrap_or_default()
 }
 
 /// Write one worker's task stats snapshot (issue #1815).
@@ -544,10 +598,30 @@ pub async fn upsert_worker_task_stats(
     Ok(())
 }
 
+/// Delete task-stats rows older than [`WORKER_TASK_STATS_RETENTION`] (issue
+/// #1815). Returns the number of rows deleted.
+///
+/// # Errors
+///
+/// Returns [`HarvestError`] on database failure.
+pub async fn prune_worker_task_stats(conn: &mut AsyncPgConnection) -> HarvestResult<usize> {
+    let retention = i64::try_from(WORKER_TASK_STATS_RETENTION.as_secs()).unwrap_or(i64::MAX);
+    diesel::sql_query(
+        "DELETE FROM harvest_worker_task_stats \
+         WHERE updated_at < NOW() - ($1::bigint * INTERVAL '1 second')",
+    )
+    .bind::<diesel::sql_types::BigInt, _>(retention)
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)
+}
+
 #[derive(diesel::QueryableByName)]
 struct TaskStatsRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
     worker_id: String,
+    #[diesel(sql_type = diesel::sql_types::Jsonb)]
+    queues: serde_json::Value,
     #[diesel(sql_type = diesel::sql_types::Integer)]
     window_tasks: i32,
     #[diesel(sql_type = diesel::sql_types::Integer)]
@@ -556,11 +630,12 @@ struct TaskStatsRow {
     p99_latency_ms: Option<i64>,
 }
 
-/// The task stats of every `Active` worker with a fresh heartbeat (issue
-/// #1815), ordered by worker id.
+/// The task stats of every `Active` worker with a fresh heartbeat and fresh
+/// stats (issue #1815), ordered by worker id.
 ///
-/// A draining, stopped or stale worker is left out, so its old stats cannot
-/// move the fleet median.
+/// A draining, stopped or stale worker is left out. So is a frozen stats row,
+/// for example from a worker that a rollback took back to an older build. Old
+/// stats then cannot move the peer median.
 ///
 /// # Errors
 ///
@@ -568,14 +643,15 @@ struct TaskStatsRow {
 pub async fn load_live_worker_task_stats(
     conn: &mut AsyncPgConnection,
     worker_stale_secs: i64,
-) -> HarvestResult<Vec<(String, WorkerTaskStats)>> {
+) -> HarvestResult<Vec<LiveWorkerTaskStats>> {
     let stale = worker_stale_secs.clamp(0, crate::poison_pill::MAX_WORKER_STALE_SECS);
     let rows: Vec<TaskStatsRow> = diesel::sql_query(
-        "SELECT s.worker_id, s.window_tasks, s.window_failures, s.p99_latency_ms \
+        "SELECT s.worker_id, w.queues, s.window_tasks, s.window_failures, s.p99_latency_ms \
          FROM harvest_worker_task_stats s \
          JOIN harvest_workers w ON w.worker_id = s.worker_id \
          WHERE w.status = $1 \
            AND w.last_heartbeat_at > NOW() - ($2::bigint * INTERVAL '1 second') \
+           AND s.updated_at > NOW() - ($2::bigint * INTERVAL '1 second') \
          ORDER BY s.worker_id",
     )
     .bind::<diesel::sql_types::Text, _>(WorkerStatus::Active.as_str())
@@ -585,44 +661,61 @@ pub async fn load_live_worker_task_stats(
     .map_err(crate::error::database_error)?;
     Ok(rows
         .into_iter()
-        .map(|r| {
-            (
-                r.worker_id,
-                WorkerTaskStats {
-                    tasks: u32::try_from(r.window_tasks).unwrap_or(0),
-                    failures: u32::try_from(r.window_failures).unwrap_or(0),
-                    p99_latency_ms: r.p99_latency_ms.and_then(|ms| u64::try_from(ms).ok()),
-                },
-            )
+        .map(|r| LiveWorkerTaskStats {
+            cohort: queue_cohort(&r.queues),
+            worker_id: r.worker_id,
+            stats: WorkerTaskStats {
+                tasks: u32::try_from(r.window_tasks).unwrap_or(0),
+                failures: u32::try_from(r.window_failures).unwrap_or(0),
+                p99_latency_ms: r.p99_latency_ms.and_then(|ms| u64::try_from(ms).ok()),
+            },
         })
         .collect())
 }
 
-/// Publish this worker's task stats, compare it with its live peers, and set
-/// the outlier gauge (issue #1815).
+/// Publish this worker's task stats. Then, when `probe.compare` holds,
+/// compare the worker with its live peers and set the outlier gauge (issue
+/// #1815).
 ///
-/// The gauge gets a value for every dimension on every call, so a worker that
-/// heals reads 0 again. Returns the dimensions on which this worker is an
-/// outlier.
+/// The comparison uses only peers in the worker's own queue cohort. It sets
+/// every dimension on each call, so a worker that heals reads 0 again. A
+/// draining worker, or a worker missing from the live set, reads 0. With
+/// metrics off, the tick publishes the stats and skips the peer read.
+///
+/// Returns the dimensions on which this worker is an outlier.
 ///
 /// # Errors
 ///
-/// Returns [`HarvestError`] on database failure. The gauge keeps its last
-/// value in that case.
+/// Returns [`HarvestError`] on database failure. The caller then clears the
+/// gauge with [`OutlierProbe::clear_gauge`].
 pub async fn run_outlier_tick(
     conn: &mut AsyncPgConnection,
     worker_id: &str,
     probe: &OutlierProbe,
+    draining: bool,
 ) -> HarvestResult<Vec<OutlierDimension>> {
     let own = probe.window.snapshot();
     upsert_worker_task_stats(conn, worker_id, &own).await?;
-    let peers: Vec<WorkerTaskStats> = load_live_worker_task_stats(conn, probe.fleet_stale_secs)
-        .await?
-        .into_iter()
-        .filter(|(id, _)| id != worker_id)
-        .map(|(_, stats)| stats)
-        .collect();
-    let flagged = outlier_dimensions(&own, &peers, &probe.config);
+    if !probe.compare || !probe.metrics.is_enabled() {
+        return Ok(Vec::new());
+    }
+    prune_worker_task_stats(conn).await?;
+    let flagged = if draining {
+        Vec::new()
+    } else {
+        let live = load_live_worker_task_stats(conn, probe.fleet_stale_secs).await?;
+        live.iter()
+            .find(|row| row.worker_id == worker_id)
+            .map(|me| {
+                let peers: Vec<WorkerTaskStats> = live
+                    .iter()
+                    .filter(|row| row.worker_id != worker_id && row.cohort == me.cohort)
+                    .map(|row| row.stats)
+                    .collect();
+                outlier_dimensions(&own, &peers, &probe.config)
+            })
+            .unwrap_or_default()
+    };
     for dimension in OutlierDimension::ALL {
         probe
             .metrics
@@ -1897,7 +1990,6 @@ pub fn spawn_worker_heartbeat(
             let registered_codec_key_ids = codecs.registered_key_ids();
             match get_result {
                 Ok(mut conn) => {
-                    let started = std::time::Instant::now();
                     let () = do_heartbeat_tick(
                         &mut conn,
                         &registration,
@@ -1911,17 +2003,20 @@ pub fn spawn_worker_heartbeat(
                         &registered_codec_key_ids,
                     )
                     .await;
-                    outliers
-                        .metrics
-                        .record_db_query_duration(DbOp::Heartbeat, started.elapsed().as_secs_f64());
-                    if let Err(error) =
-                        run_outlier_tick(&mut conn, &registration.worker_id, &outliers).await
+                    if let Err(error) = run_outlier_tick(
+                        &mut conn,
+                        &registration.worker_id,
+                        &outliers,
+                        worker_shutdown.is_cancelled(),
+                    )
+                    .await
                     {
-                        tracing::debug!(
+                        tracing::warn!(
                             worker_id = %registration.worker_id,
                             error = %error,
-                            "worker task-stats publish failed; outlier gauge keeps its last value"
+                            "worker task-stats tick failed; outlier gauge cleared"
                         );
+                        outliers.clear_gauge();
                     }
                 }
                 Err(error) => {
@@ -1930,6 +2025,7 @@ pub fn spawn_worker_heartbeat(
                         error = %error,
                         "worker heartbeat failed to get pool connection"
                     );
+                    outliers.clear_gauge();
                 }
             }
         }

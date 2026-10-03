@@ -21,10 +21,11 @@ use std::collections::BTreeMap;
 
 use autumn_harvest::worker::DbPool;
 use autumn_harvest::worker_outlier::{
-    OutlierConfig, WorkerOutlier, WorkerTaskStats, detect_outliers,
+    OutlierConfig, WorkerOutlier, WorkerTaskStats, detect_outliers_in_cohorts,
 };
 use autumn_harvest::workers::{
-    WorkerFilters, WorkerHealth, WorkerRow, WorkerStatus, list_workers, load_live_worker_task_stats,
+    LiveWorkerTaskStats, WorkerFilters, WorkerHealth, WorkerRow, WorkerStatus, list_workers,
+    load_live_worker_task_stats,
 };
 use chrono::{DateTime, Utc};
 use diesel::sql_types::{BigInt, Nullable};
@@ -46,6 +47,9 @@ const REASON_WORKER_NO_ACTIVE: &str = "worker_no_active";
 const REASON_WORKER_UNHEALTHY_FRACTION: &str = "worker_unhealthy_fraction";
 /// A live worker fails or slows far more than its peers (issue #1815).
 const REASON_WORKER_OUTLIER: &str = "worker_outlier";
+/// The most outliers the workers block lists (issue #1815). The block also
+/// reports `outliers_total`, so a cut list still shows the full count.
+const MAX_LISTED_OUTLIERS: usize = 20;
 const REASON_DLQ_BACKLOG: &str = "dlq_backlog";
 const REASON_DLQ_RECENT_ENTRY: &str = "dlq_recent_entry";
 const REASON_QUEUE_BACKLOG: &str = "queue_backlog";
@@ -405,8 +409,11 @@ pub struct StatusBundleMerge {
     pub queue_max_backlog_queue: Option<String>,
     /// Stalled-execution count summed across shards (bounded per shard).
     pub stalled_count: i64,
-    /// Live workers that are outliers against their peers (issue #1815).
+    /// Live workers that are outliers against their peers (issue #1815),
+    /// the worst first. Holds at most [`MAX_LISTED_OUTLIERS`] entries.
     pub worker_outliers: Vec<WorkerOutlier>,
+    /// All outliers found, including any cut from `worker_outliers`.
+    pub worker_outliers_total: usize,
     /// `true` when at least one expected shard could not be inspected in the
     /// bundle pass — the non-shard subsystems cannot assert `healthy` on
     /// incomplete data.
@@ -424,7 +431,7 @@ struct ShardBundle {
     by_queue: BTreeMap<String, i64>,
     stalled_count: i64,
     /// Task stats of the live workers in this shard (issue #1815).
-    task_stats: Vec<(String, WorkerTaskStats)>,
+    task_stats: Vec<LiveWorkerTaskStats>,
 }
 
 /// Merge per-shard bundle observations into the cross-shard numbers (pure).
@@ -444,15 +451,17 @@ fn merge_bundle(observations: Vec<ShardObservation<ShardBundle>>) -> StatusBundl
     let mut stalled_count = 0i64;
     // One entry per worker. A multi-shard worker writes the same snapshot to
     // each shard, so the entry with the most tasks wins.
-    let mut task_stats: BTreeMap<String, WorkerTaskStats> = BTreeMap::new();
+    let mut task_stats: BTreeMap<String, (String, WorkerTaskStats)> = BTreeMap::new();
 
     for observation in observations {
         for bundle in observation.rows {
             all_workers.extend(bundle.workers);
-            for (worker_id, stats) in bundle.task_stats {
-                let entry = task_stats.entry(worker_id).or_insert(stats);
-                if stats.tasks > entry.tasks {
-                    *entry = stats;
+            for row in bundle.task_stats {
+                let entry = task_stats
+                    .entry(row.worker_id)
+                    .or_insert_with(|| (row.cohort.clone(), row.stats));
+                if row.stats.tasks > entry.1.tasks {
+                    *entry = (row.cohort, row.stats);
                 }
             }
             dlq_total += bundle.dlq_total;
@@ -505,8 +514,21 @@ fn merge_bundle(observations: Vec<ShardObservation<ShardBundle>>) -> StatusBundl
         }
     }
 
-    let fleet: Vec<(String, WorkerTaskStats)> = task_stats.into_iter().collect();
-    let worker_outliers = detect_outliers(&fleet, &OutlierConfig::default());
+    let fleet: Vec<(String, String, WorkerTaskStats)> = task_stats
+        .into_iter()
+        .map(|(worker_id, (cohort, stats))| (worker_id, cohort, stats))
+        .collect();
+    let mut worker_outliers = detect_outliers_in_cohorts(&fleet, &OutlierConfig::default());
+    let worker_outliers_total = worker_outliers.len();
+    // The worst first: the highest failure ratio, then the slowest p99.
+    worker_outliers.sort_by(|a, b| {
+        let ratio = |o: &WorkerOutlier| o.stats.failure_ratio().unwrap_or(0.0);
+        ratio(b)
+            .total_cmp(&ratio(a))
+            .then(b.stats.p99_latency_ms.cmp(&a.stats.p99_latency_ms))
+            .then(a.worker_id.cmp(&b.worker_id))
+    });
+    worker_outliers.truncate(MAX_LISTED_OUTLIERS);
 
     StatusBundleMerge {
         workers_active,
@@ -520,6 +542,7 @@ fn merge_bundle(observations: Vec<ShardObservation<ShardBundle>>) -> StatusBundl
         queue_max_backlog_queue,
         stalled_count,
         worker_outliers,
+        worker_outliers_total,
         incomplete,
         unavailable_shards,
     }
@@ -608,7 +631,7 @@ pub fn build_status_response(
     );
     // A gray failure (issue #1815) passes the heartbeat check, so it degrades
     // the workers verdict on its own.
-    if !bundle.worker_outliers.is_empty() {
+    if bundle.worker_outliers_total > 0 {
         workers_status = worst_status([workers_status, SubsystemStatus::Degraded]);
         workers_codes.push(REASON_WORKER_OUTLIER.to_string());
     }
@@ -624,6 +647,7 @@ pub fn build_status_response(
             "unhealthy": bundle.workers_unhealthy,
             "total": bundle.workers_total,
             "outliers": bundle.worker_outliers,
+            "outliers_total": bundle.worker_outliers_total,
         }),
     );
 
@@ -1060,6 +1084,7 @@ mod tests {
             queue_max_backlog_queue: None,
             stalled_count: 0,
             worker_outliers: Vec::new(),
+            worker_outliers_total: 0,
             incomplete: false,
             unavailable_shards: Vec::new(),
         }
@@ -1075,7 +1100,15 @@ mod tests {
         }
     }
 
-    fn stats_bundle(task_stats: Vec<(String, WorkerTaskStats)>) -> ShardBundle {
+    fn live(worker_id: &str, cohort: &str, stats: WorkerTaskStats) -> LiveWorkerTaskStats {
+        LiveWorkerTaskStats {
+            worker_id: worker_id.to_string(),
+            cohort: cohort.to_string(),
+            stats,
+        }
+    }
+
+    fn stats_bundle(task_stats: Vec<LiveWorkerTaskStats>) -> ShardBundle {
         ShardBundle {
             workers: Vec::new(),
             dlq_total: 0,
@@ -1086,40 +1119,73 @@ mod tests {
         }
     }
 
+    fn observe(shard_id: i32, bundle: ShardBundle) -> ShardObservation<ShardBundle> {
+        ShardObservation {
+            shard_id,
+            rows: vec![bundle],
+            error: None,
+        }
+    }
+
     /// The issue #1815 RED test for `status_summary`: one worker fails 50% of
     /// its tasks while its peers fail none. The merge flags it once, even when
     /// two shards report the same multi-shard worker.
     #[test]
     fn merge_bundle_flags_the_worker_failing_half_its_tasks() {
-        let ok = |id: &str| (id.to_string(), task_stats(100, 0));
+        const Q: &str = "[\"default\"]";
+        let ok = |id: &str| live(id, Q, task_stats(100, 0));
         let shard0 = stats_bundle(vec![
-            ("w-sick".to_string(), task_stats(100, 50)),
+            live("w-sick", Q, task_stats(100, 50)),
             ok("w-1"),
             ok("w-2"),
         ]);
-        let shard1 = stats_bundle(vec![("w-sick".to_string(), task_stats(100, 50)), ok("w-3")]);
-        let merged = merge_bundle(vec![
-            ShardObservation {
-                shard_id: 0,
-                rows: vec![shard0],
-                error: None,
-            },
-            ShardObservation {
-                shard_id: 1,
-                rows: vec![shard1],
-                error: None,
-            },
-        ]);
+        // Shard 1 holds an older, smaller snapshot of the same worker. The
+        // merge keeps the snapshot with the most tasks.
+        let shard1 = stats_bundle(vec![live("w-sick", Q, task_stats(40, 0)), ok("w-3")]);
+        let merged = merge_bundle(vec![observe(0, shard0), observe(1, shard1)]);
         assert_eq!(
             merged.worker_outliers.len(),
             1,
             "{:?}",
             merged.worker_outliers
         );
+        assert_eq!(merged.worker_outliers_total, 1);
         let outlier = &merged.worker_outliers[0];
         assert_eq!(outlier.worker_id, "w-sick");
         assert_eq!(outlier.dimensions, vec![OutlierDimension::FailureRatio]);
+        assert_eq!(outlier.stats, task_stats(100, 50));
         assert_eq!(outlier.peer_median_failure_ratio, Some(0.0));
+    }
+
+    #[test]
+    fn merge_bundle_compares_workers_only_within_their_queue_cohort() {
+        let bundle = stats_bundle(vec![
+            live("transcode", "[\"video\"]", task_stats(100, 60)),
+            live("mail-1", "[\"email\"]", task_stats(100, 0)),
+            live("mail-2", "[\"email\"]", task_stats(100, 0)),
+        ]);
+        let merged = merge_bundle(vec![observe(0, bundle)]);
+        assert!(
+            merged.worker_outliers.is_empty(),
+            "a worker alone in its cohort has no peers: {:?}",
+            merged.worker_outliers
+        );
+    }
+
+    #[test]
+    fn merge_bundle_lists_at_most_the_cap_and_reports_the_total() {
+        const Q: &str = "[\"default\"]";
+        let mut rows: Vec<LiveWorkerTaskStats> = (0..100)
+            .map(|i| live(&format!("ok-{i:03}"), Q, task_stats(100, 0)))
+            .collect();
+        rows.extend((0..30).map(|i| live(&format!("sick-{i:02}"), Q, task_stats(100, 40 + i))));
+        let merged = merge_bundle(vec![observe(0, stats_bundle(rows))]);
+        assert_eq!(merged.worker_outliers_total, 30);
+        assert_eq!(merged.worker_outliers.len(), MAX_LISTED_OUTLIERS);
+        assert_eq!(
+            merged.worker_outliers[0].worker_id, "sick-29",
+            "worst first"
+        );
     }
 
     #[test]
@@ -1129,6 +1195,7 @@ mod tests {
             vec![shard_row(0, ShardReadiness::Ready, true, &[])],
         );
         let mut bundle = healthy_bundle();
+        bundle.worker_outliers_total = 1;
         bundle.worker_outliers = vec![WorkerOutlier {
             worker_id: "w-sick".to_string(),
             dimensions: vec![OutlierDimension::FailureRatio],
@@ -1174,6 +1241,7 @@ mod tests {
             resp.subsystems[0].metrics["outliers"],
             serde_json::json!([])
         );
+        assert_eq!(resp.subsystems[0].metrics["outliers_total"], 0);
         assert_eq!(resp.subsystems[0].status, SubsystemStatus::Healthy);
     }
 

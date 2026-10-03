@@ -135,7 +135,11 @@ const STABLE_PROMETHEUS_METRICS: &[&str] = &[
     "harvest_db_pool_in_use",
     "harvest_db_pool_idle",
     "harvest_db_pool_wait_duration_bucket",
+    "harvest_db_pool_wait_duration_count",
+    "harvest_db_pool_wait_duration_sum",
     "harvest_db_query_duration_bucket",
+    "harvest_db_query_duration_count",
+    "harvest_db_query_duration_sum",
     "harvest_worker_outlier",
 ];
 

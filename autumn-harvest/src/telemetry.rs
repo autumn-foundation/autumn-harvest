@@ -302,7 +302,7 @@ pub const METRIC_WORKER_TUNER_DECISIONS: &str = "harvest.worker.tuner_decisions"
 
 /// Gauge: database connections that a worker's pool lends out now (issue #1815).
 ///
-/// Sampled in-process from the deadpool status. No query runs. Labelled
+/// An in-process sampler reads the deadpool status. No query runs. Labelled
 /// `{shard}`. Each replica owns its pool, so a sum across replicas is valid.
 /// Colocated shards that share one pool report the same value.
 pub const METRIC_DB_POOL_IN_USE: &str = "harvest.db.pool.in_use";
@@ -313,9 +313,9 @@ pub const METRIC_DB_POOL_IDLE: &str = "harvest.db.pool.idle";
 
 /// Histogram: seconds a caller waits to get a pooled connection (issue #1815).
 ///
-/// Labelled `{shard}`. Recorded at the claim path, the timeout scanner and
-/// the activity heartbeat flush. A high value with a full pool shows that the
-/// pool is too small for the load.
+/// Labelled `{shard}`. The claim path, the timeout scanner and the activity
+/// heartbeat flush record it. A high value with no idle connection shows that
+/// the pool is too small for the load.
 pub const METRIC_DB_POOL_WAIT: &str = "harvest.db.pool.wait_duration";
 
 /// Histogram: seconds that one database operation takes (issue #1815).
@@ -328,8 +328,9 @@ pub const METRIC_DB_QUERY_DURATION: &str = "harvest.db.query.duration";
 /// Gauge: poll loops that claim work from a queue on this worker (issue #1815).
 ///
 /// Labelled `{queue}`. One poll loop claims from all the worker's queues, so
-/// each queue reports the same count. The value drops to 0 when the worker
-/// drains. This is the Harvest form of `temporal_num_pollers`.
+/// each queue reports the same count. The count covers every worker in the
+/// process. It drops when a worker drains. This is the Harvest form of
+/// `temporal_num_pollers`.
 pub const METRIC_WORKER_POLLERS: &str = "harvest.worker.pollers";
 
 /// Gauge: 1 when this worker is an outlier against its peers, else 0 (issue
@@ -2351,7 +2352,7 @@ pub enum DbOp {
     Persist,
     /// One timeout-scanner pass on one shard.
     Scan,
-    /// One activity heartbeat write or one worker liveness heartbeat tick.
+    /// One activity heartbeat write.
     Heartbeat,
 }
 
