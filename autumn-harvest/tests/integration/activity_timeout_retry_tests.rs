@@ -24,7 +24,7 @@ use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
 use autumn_harvest::models::{NewWorkflowExecution, TaskQueueItem, WorkflowExecution};
 use autumn_harvest::payload_codec::PayloadCodecs;
-use autumn_harvest::policy::CircuitBreakerPolicy;
+use autumn_harvest::policy::{CircuitBreakerPolicy, CircuitOpenMode};
 use autumn_harvest::queue::{self, EnqueueParams, TaskType};
 use autumn_harvest::schema::{harvest_task_queue, harvest_workflow_executions};
 use autumn_harvest::telemetry::NoOpMetrics;
@@ -316,7 +316,9 @@ async fn start_to_close_timeout_retries_until_max_attempts() {
             assert_eq!(row.attempt, attempt, "a retry keeps the attempt number");
             assert!(row.worker_id.is_none(), "a retry releases the claim");
             assert!(
-                row.error.as_deref().is_some_and(|e| e.contains("StartToClose")),
+                row.error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("StartToClose")),
                 "the retry records the timeout as the previous failure: {:?}",
                 row.error
             );
@@ -390,8 +392,7 @@ async fn timeout_retry_stops_at_the_schedule_to_close_deadline() {
         schedule_to_close: Some(Duration::from_secs(3600)),
         ..Timeouts::default()
     };
-    let (exec_id, task_id) =
-        seed_activity(&mut conn, &queue, "t1809_deadline", 3, timeouts).await;
+    let (exec_id, task_id) = seed_activity(&mut conn, &queue, "t1809_deadline", 3, timeouts).await;
 
     claim(&mut conn, &queue, "w-deadline").await;
     age_claim(&mut conn, task_id).await;
@@ -404,16 +405,14 @@ async fn timeout_retry_stops_at_the_schedule_to_close_deadline() {
     .execute(&mut conn)
     .await
     .expect("move the deadline close");
-    diesel::sql_query(
-        "UPDATE harvest_task_queue SET retry_policy = $2 WHERE id = $1",
-    )
-    .bind::<diesel::sql_types::Uuid, _>(task_id)
-    .bind::<diesel::sql_types::Jsonb, _>(
-        serde_json::to_value(RetryPolicy::fixed(3, Duration::from_secs(60))).expect("json"),
-    )
-    .execute(&mut conn)
-    .await
-    .expect("use a long backoff");
+    diesel::sql_query("UPDATE harvest_task_queue SET retry_policy = $2 WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .bind::<diesel::sql_types::Jsonb, _>(
+            serde_json::to_value(RetryPolicy::fixed(3, Duration::from_secs(60))).expect("json"),
+        )
+        .execute(&mut conn)
+        .await
+        .expect("use a long backoff");
     enforce(&mut conn, None).await;
 
     let row = task_row(&mut conn, task_id).await;
@@ -807,6 +806,51 @@ async fn open_breaker_defers_work_by_default() {
         }
     })
     .await;
+
+    worker.shutdown();
+    handle.await.expect("worker joins");
+}
+
+/// ADR 0004 §3: `FailFast` keeps the old behaviour. The open breaker fails
+/// the attempt with a non-retryable `CircuitOpen`, so the workflow fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fail_fast_mode_fails_the_attempt() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let queue = unique("t1809-failfast");
+    let activity = "t1809_failfast";
+    let policy = CircuitBreakerPolicy::new(1, Duration::from_secs(60), Duration::from_secs(60))
+        .with_open_mode(CircuitOpenMode::FailFast);
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![wf_info()],
+        vec![act_info(activity, policy)],
+    ));
+    registry
+        .circuit_breakers()
+        .force_open(activity, Instant::now());
+
+    let exec_id = seed_workflow(&mut conn, &queue, activity).await;
+    let worker = build_worker(&queue, Arc::clone(&registry));
+    let pool = build_pool(&url);
+    let runner = Arc::clone(&worker);
+    let handle = tokio::spawn(async move { runner.run(&pool).await });
+
+    wait_until("the workflow fails", Duration::from_secs(20), || {
+        let url = url.clone();
+        async move {
+            let mut conn = connect(&url).await;
+            execution_state(&mut conn, exec_id).await == "FAILED"
+        }
+    })
+    .await;
+    let failed = history(&mut conn, exec_id).await.into_iter().any(|e| {
+        matches!(
+            e,
+            WorkflowEvent::ActivityFailed { error_type, non_retryable: true, .. }
+                if error_type == "CircuitOpen"
+        )
+    });
+    assert!(failed, "the activity fails with CircuitOpen");
 
     worker.shutdown();
     handle.await.expect("worker joins");

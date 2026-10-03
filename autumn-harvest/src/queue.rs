@@ -2807,6 +2807,32 @@ pub(crate) async fn later_claim_shares_strikes(
         .map_err(crate::error::database_error)
 }
 
+/// Record that the handler of `claim` started (issue #1809).
+///
+/// The write sets `handler_started_attempt` to the claim's `attempt`. The
+/// timeout enforcer feeds the circuit breaker only when the two are equal.
+/// Call it in the transaction that appends `ActivityStarted`, after
+/// [`lock_claim_for_update`] returned [`ClaimLock::Held`].
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on update failure.
+pub(crate) async fn mark_claim_handler_started(
+    conn: &mut AsyncPgConnection,
+    claim: &TaskClaim,
+) -> HarvestResult<ClaimWrite> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    let update = diesel::update(dsl::harvest_task_queue.find(claim.task_id))
+        .set(dsl::handler_started_attempt.eq(claim.attempt))
+        .into_boxed();
+    let updated = fence(update, Some(claim))
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(claim_write(updated == 1))
+}
+
 /// Complete the task that `claim` holds. A stale claim changes nothing.
 ///
 /// # Errors
@@ -2894,6 +2920,34 @@ pub async fn defer_claimed_retry_for_budget(
     claim: &TaskClaim,
     delay: Duration,
 ) -> HarvestResult<ClaimWrite> {
+    defer_claimed_task(conn, claim, delay).await
+}
+
+/// Defer the task that `claim` holds because its circuit breaker is open
+/// (issue #1809). A stale claim changes nothing.
+///
+/// The write is the retry-budget deferral. An open breaker, like an empty
+/// bucket, says nothing about this task, so the deferral uses no attempt.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on update failure.
+pub async fn defer_claimed_task_for_open_circuit(
+    conn: &mut AsyncPgConnection,
+    claim: &TaskClaim,
+    delay: Duration,
+) -> HarvestResult<ClaimWrite> {
+    defer_claimed_task(conn, claim, delay).await
+}
+
+/// Put the task that `claim` holds back to `PENDING` for `delay`, on the
+/// database clock. The write undoes the claim-time `attempt` increment and
+/// keeps `error` and `crash_strikes`. It appends no event.
+async fn defer_claimed_task(
+    conn: &mut AsyncPgConnection,
+    claim: &TaskClaim,
+    delay: Duration,
+) -> HarvestResult<ClaimWrite> {
     use crate::schema::harvest_task_queue::dsl;
     use diesel::dsl::sql;
     use diesel::sql_types::{Double, Timestamptz};
@@ -2947,7 +3001,7 @@ pub async fn defer_claimed_retry_for_budget(
         tracing::warn!(
             task_id = %claim.task_id,
             %error,
-            "failed to announce a retry-budget deferral; the poll loop still claims it"
+            "failed to announce a deferred task; the poll loop still claims it"
         );
     }
     Ok(ClaimWrite::Applied)

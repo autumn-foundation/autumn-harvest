@@ -62,6 +62,17 @@ impl std::fmt::Display for TimeoutReason {
 }
 
 impl TimeoutReason {
+    /// Whether this timeout retries per the retry policy (issue #1809).
+    ///
+    /// ADR 0004 records the rule. A start-to-close or heartbeat timeout ends
+    /// one attempt, and the next attempt can succeed. A schedule-to-start
+    /// retry goes back to the same starved queue. Schedule-to-close is the
+    /// deadline for all attempts.
+    #[must_use]
+    pub const fn retries_per_policy(&self) -> bool {
+        matches!(self, Self::Heartbeat | Self::StartToClose)
+    }
+
     const fn timeout_type(&self) -> TimeoutType {
         match self {
             Self::Heartbeat => TimeoutType::Heartbeat,
@@ -736,26 +747,62 @@ pub(crate) async fn task_state_for_update(
         .map_err(crate::error::database_error)
 }
 
-/// Locked (`FOR UPDATE`) read of a task row's current state **and**
-/// row-current `schedule_to_close_at`. [`enforce_activity_timeout`] needs the
-/// deadline in addition to the state so the frozen-row half of the PAUSED
-/// re-check ([`pause_suppresses_timeout_enforcement`]) can be evaluated
-/// against the row's current value under the execution row lock, not the
-/// scan-time snapshot.
-async fn task_state_and_deadline_for_update(
+/// A task row read under its `FOR UPDATE` lock by [`enforce_activity_timeout`].
+struct LockedTask {
+    state: String,
+    /// The row-current deadline. The frozen-row half of the PAUSED re-check
+    /// ([`pause_suppresses_timeout_enforcement`]) and the retry deadline
+    /// check (issue #1809) read it, not the scan-time snapshot.
+    schedule_to_close_at: Option<chrono::DateTime<Utc>>,
+    /// The handler of the scanned claim started (issue #1809).
+    handler_started: bool,
+}
+
+/// Locked (`FOR UPDATE`) read of a task row for [`enforce_activity_timeout`].
+///
+/// `handler_started` is true only while the row is `RUNNING` under the
+/// claim of `task` and that claim started its handler.
+async fn lock_task_for_timeout(
     conn: &mut AsyncPgConnection,
-    task_id: uuid::Uuid,
-) -> HarvestResult<Option<(String, Option<chrono::DateTime<Utc>>)>> {
+    task: &TaskQueueItem,
+) -> HarvestResult<Option<LockedTask>> {
     use crate::schema::harvest_task_queue::dsl;
 
-    dsl::harvest_task_queue
-        .find(task_id)
+    let row = dsl::harvest_task_queue
+        .find(task.id)
         .for_update()
-        .select((dsl::state, dsl::schedule_to_close_at))
-        .first(conn)
+        .select((
+            dsl::state,
+            dsl::schedule_to_close_at,
+            dsl::attempt,
+            dsl::handler_started_attempt,
+        ))
+        .first::<(String, Option<chrono::DateTime<Utc>>, i32, Option<i32>)>(conn)
         .await
         .optional()
-        .map_err(crate::error::database_error)
+        .map_err(crate::error::database_error)?;
+    Ok(row.map(
+        |(state, schedule_to_close_at, attempt, handler_started_attempt)| LockedTask {
+            handler_started: state == "RUNNING"
+                && attempt == task.attempt
+                && handler_started_attempt == Some(attempt),
+            state,
+            schedule_to_close_at,
+        },
+    ))
+}
+
+/// The result of [`enforce_activity_timeout`]'s transaction. `None` means
+/// the task moved on and the transaction changed nothing.
+type TimeoutEnforcement = Option<ActivityTimeoutOutcome>;
+
+/// What [`enforce_activity_timeout`] did to a timed-out activity task.
+#[derive(Debug, Clone, Copy)]
+struct ActivityTimeoutOutcome {
+    /// The task went back to `PENDING` for a retry (issue #1809).
+    retried: bool,
+    /// The handler of the timed-out attempt started (issue #1809).
+    handler_started: bool,
 }
 
 /// SQL for [`schedule_to_start_still_expired`], exposed for shape tests.
@@ -1232,8 +1279,8 @@ async fn enforce_activity_timeout(
     };
     let error = timeout_error(activity_name, reason);
 
-    // Did we actually append a timeout (vs. a no-op because the task already
-    // moved on)? Only a real enforcement should count toward the breaker.
+    // Did the task time out (vs. a no-op because the task already moved on)?
+    // Only a real enforcement can count toward the breaker.
     //
     // Pinned `READ COMMITTED`, not the session default (issue #619 round-24
     // review). The queue advisory lock taken below is a `SELECT`, so it fixes
@@ -1258,7 +1305,7 @@ async fn enforce_activity_timeout(
     // background publisher instead, the same fix already applied to the
     // outbox sweeps in this file.
     let enforced = crate::dispatch::buffered_settled_in_background(Box::pin(
-        tx.run::<bool, HarvestError, _>(async |conn| {
+        tx.run::<TimeoutEnforcement, HarvestError, _>(async |conn| {
             let error = error.clone();
 
             // Authoritative QUEUE-pause re-check (issue #619). The scan predicate
@@ -1304,7 +1351,7 @@ async fn enforce_activity_timeout(
                     reason,
                     crate::queue_pause::is_queue_paused(conn, &task.queue_name).await?,
                 ) {
-                    return Ok(false);
+                    return Ok(None);
                 }
                 // Authoritative ACTIVITY-pause re-check (issue #807), the
                 // per-activity-type sibling of the queue re-check above. Same
@@ -1341,7 +1388,7 @@ async fn enforce_activity_timeout(
                         crate::activity_pause::is_activity_paused(conn, activity_name).await?,
                     )
                 {
-                    return Ok(false);
+                    return Ok(None);
                 }
                 // A *completed* pause/resume cycle leaves nothing for either check
                 // above to suppress on, but resume has already credited the held
@@ -1357,24 +1404,22 @@ async fn enforce_activity_timeout(
                 // execution lock and history load for the common held-task case;
                 // the authoritative locked re-read runs after the row locks below.
                 if !schedule_to_start_still_expired_unlocked(conn, task.id).await? {
-                    return Ok(false);
+                    return Ok(None);
                 }
             }
 
             let (execution, history) =
                 lock_workflow_execution_row_and_load_history(conn, exec_id, codecs).await?;
-            let Some((state, row_schedule_to_close_at)) =
-                task_state_and_deadline_for_update(conn, task.id).await?
-            else {
-                return Ok(false);
+            let Some(locked) = lock_task_for_timeout(conn, task).await? else {
+                return Ok(None);
             };
-            if !expected_task_states_for_timeout(reason).contains(&state.as_str()) {
-                return Ok(false);
+            if !expected_task_states_for_timeout(reason).contains(&locked.state.as_str()) {
+                return Ok(None);
             }
             // Authoritative `schedule_to_start` deadline re-read (round-18 review),
             // now placed here — after the execution row lock above and while this
             // transaction already holds the task row from
-            // `task_state_and_deadline_for_update` — so it preserves the
+            // `lock_task_for_timeout` — so it preserves the
             // execution-row -> task-row order (round-22 review). The unlocked
             // fast-path check near the top of this transaction is advisory; this is
             // the one that must be trusted, because only a lock held across the
@@ -1382,7 +1427,7 @@ async fn enforce_activity_timeout(
             if matches!(reason, TimeoutReason::ScheduleToStart)
                 && !schedule_to_start_still_expired(conn, task.id).await?
             {
-                return Ok(false);
+                return Ok(None);
             }
             // Authoritative ACTIVITY-pause re-check, AFTER the blocking row
             // acquisitions above (issue #807, round-17 review, P1).
@@ -1418,7 +1463,7 @@ async fn enforce_activity_timeout(
                     crate::activity_pause::is_activity_paused(conn, activity_name).await?,
                 )
             {
-                return Ok(false);
+                return Ok(None);
             }
             // Authoritative PAUSED re-check under the execution row lock
             // (issue #609 post-review hardening, second bot-review round):
@@ -1432,23 +1477,59 @@ async fn enforce_activity_timeout(
             if pause_suppresses_timeout_enforcement(
                 reason,
                 &execution.state,
-                row_schedule_to_close_at,
+                locked.schedule_to_close_at,
                 Utc::now(),
             ) {
-                return Ok(false);
+                return Ok(None);
             }
             // (The queue-pause re-check runs at the TOP of this transaction, before
             // the row locks above — see the lock-ordering note there.)
             let activity_id =
                 match pending_activity_id_for_task(&history.events, task, activity_name) {
                     Ok(Some(activity_id)) => activity_id,
-                    Ok(None) => return Ok(false),
+                    Ok(None) => return Ok(None),
                     Err(missing_error) => {
                         let fallback = missing_error.to_string();
                         queue::fail_task(conn, task.id, &fallback).await?;
-                        return Ok(false);
+                        return Ok(None);
                     }
                 };
+            let outcome = |retried| {
+                Some(ActivityTimeoutOutcome {
+                    retried,
+                    handler_started: locked.handler_started,
+                })
+            };
+            // Timeout retry (issue #1809, ADR 0004). A start-to-close or
+            // heartbeat timeout retries per the retry policy, as a handler
+            // failure does. The requeue is fenced by the scanned claim, so a
+            // later claim of the row is never requeued. It appends no event:
+            // the workflow sees only the final outcome.
+            //
+            // No retry starts after `schedule_to_close`. A paused execution
+            // is the exception, because a pause stops that clock. Resume then
+            // shifts the deadline, as on the worker retry path.
+            if reason.retries_per_policy()
+                && let Some(delay) = crate::worker::timeout_retry_delay(task, &error)
+                && let Some(claim) = queue::TaskClaim::of(task)
+            {
+                let past_deadline = execution.state != "PAUSED"
+                    && crate::worker::deadline_would_be_exceeded(
+                        locked.schedule_to_close_at,
+                        queue::db_clock_now(conn).await?,
+                        delay,
+                    );
+                if !past_deadline {
+                    return Ok(
+                        match queue::requeue_claimed_task_for_retry(conn, &claim, delay, &error)
+                            .await?
+                        {
+                            queue::ClaimWrite::Applied => outcome(true),
+                            queue::ClaimWrite::LeaseLost => None,
+                        },
+                    );
+                }
+            }
             let timeout_event = WorkflowEvent::ActivityTimedOut {
                 activity_id,
                 timeout_type: reason.timeout_type(),
@@ -1463,30 +1544,29 @@ async fn enforce_activity_timeout(
             .await?;
             queue::fail_task(conn, task.id, &error).await?;
             queue::wake_workflow_task(conn, exec_id).await?;
-            Ok(true)
+            Ok(outcome(false))
         }),
     ))
     .await?;
+    let Some(enforced) = enforced else {
+        return Ok(());
+    };
+    if enforced.retried {
+        metrics.record_activity_retried(activity_name, &task.queue_name);
+    }
 
-    // Circuit breaker (issue #369): a start-to-close / heartbeat timeout against
-    // a protected downstream is a retryable, downstream-style failure that the
-    // handler-result path never sees (the worker may be gone). Record it
-    // out-of-band so a hanging downstream trips the breaker just like an
-    // explicit error would.
+    // Circuit breaker (issues #369, #1809): a timeout against a protected
+    // downstream is a retryable, downstream-style failure that the
+    // handler-result path never sees (the worker may be gone). Record it out
+    // of band so a hanging downstream trips the breaker, as an explicit error
+    // would.
     //
-    // ScheduleToClose on a PENDING task means the activity sat in the queue
-    // until its total deadline elapsed without any handler being dispatched.
-    // No downstream call was made, so the breaker must NOT be fed — a backlog
-    // spike would otherwise incorrectly open the circuit.
-    // ScheduleToStart: task sat in the queue until the schedule-to-start window
-    // expired without ever being dispatched — no downstream call was made.
-    // ScheduleToClose on a PENDING task: total deadline expired before dispatch.
-    // Neither case represents a downstream failure; suppress the breaker so a
-    // queue backlog does not incorrectly open the circuit.
-    let downstream_call_made = matches!(reason, TimeoutReason::ScheduleToStart)
-        || (matches!(reason, TimeoutReason::ScheduleToClose) && task.state == "PENDING");
-    if enforced
-        && !downstream_call_made
+    // Only an attempt whose handler started can say anything about the
+    // downstream. A task that waited after its claim made no call, and
+    // neither did a `PENDING` task that timed out in the queue. Counting
+    // them would let a backlog open the circuit and turn overload into
+    // failure (#1785).
+    if enforced.handler_started
         && let Some(breakers) = circuit_breakers
         && breakers.on_external_failure(activity_name, std::time::Instant::now())
             == Some(crate::circuit_breaker::CircuitTransition::Tripped)
@@ -5541,6 +5621,17 @@ pub async fn enforce_workflow_history_ceiling_with_codecs(
 
 #[cfg(test)]
 mod tests {
+    // ── Timeout retry rule (issue #1809, ADR 0004) ───────────────────────
+
+    #[test]
+    fn only_start_to_close_and_heartbeat_timeouts_retry() {
+        use super::TimeoutReason;
+        assert!(TimeoutReason::StartToClose.retries_per_policy());
+        assert!(TimeoutReason::Heartbeat.retries_per_policy());
+        assert!(!TimeoutReason::ScheduleToStart.retries_per_policy());
+        assert!(!TimeoutReason::ScheduleToClose.retries_per_policy());
+    }
+
     // ── workflow task timeout against the locked execution state ─────────
 
     #[test]

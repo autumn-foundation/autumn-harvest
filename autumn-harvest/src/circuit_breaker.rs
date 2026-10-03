@@ -1,4 +1,4 @@
-//! Per-activity circuit breaker that fast-fails dispatch during downstream
+//! Per-activity circuit breaker that stops dispatch during downstream
 //! outages (issue #369).
 //!
 //! When a downstream service an activity depends on goes hard-down, harvest's
@@ -10,9 +10,12 @@
 //! A [`CircuitBreakerPolicy`](crate::policy::CircuitBreakerPolicy) attached to
 //! an activity lets the worker track that activity's recent failures and
 //! **trip open** once they cross a threshold within a rolling window. While the
-//! breaker is open, new dispatches short-circuit with a non-retryable
-//! `"CircuitOpen"` failure instead of running the doomed work; workflows that
-//! handle the failure (Saga compensation, branching) see it within seconds.
+//! breaker is open, new dispatches short-circuit instead of running the doomed
+//! work. The policy's `open_mode` decides how (issue #1809). In `Defer` mode,
+//! the default, the task goes back to `PENDING` until the next probe. In
+//! `FailFast` mode, it fails with a non-retryable `"CircuitOpen"` failure;
+//! workflows that handle the failure (Saga compensation, branching) see it
+//! within seconds.
 //!
 //! ## State model
 //!
@@ -30,9 +33,10 @@
 //! ## Scope and durability
 //!
 //! State is tracked **in-process and per-shard** (`Mutex<HashMap>`). It never
-//! touches the workflow event log: a short-circuited attempt records an
-//! ordinary `ActivityFailed` event with a typed `"CircuitOpen"` payload, so the
-//! append-only contract and deterministic replay are both unaffected. Each
+//! touches the workflow event log: a deferral appends no event, and a
+//! fail-fast short circuit records an ordinary `ActivityFailed` event with a
+//! typed `"CircuitOpen"` payload, so the append-only contract and
+//! deterministic replay are both unaffected. Each
 //! shard / worker process tracks its own breaker; an outage that hits every
 //! shard trips each independently, matching the per-shard ACID model.
 
@@ -61,7 +65,7 @@ use crate::policy::CircuitBreakerPolicy;
 pub enum CircuitPhase {
     /// Normal operation: dispatches proceed unchanged.
     Closed,
-    /// Tripped: dispatches fast-fail until the cooldown elapses.
+    /// Tripped: dispatches short-circuit until the cooldown elapses.
     Open,
     /// Cooldown elapsed: a single probe dispatch is admitted.
     HalfOpen,

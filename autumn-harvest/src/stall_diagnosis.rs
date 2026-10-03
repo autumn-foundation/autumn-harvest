@@ -473,10 +473,11 @@ impl BlockedOn {
             | Self::WorkflowQueuePaused { .. } => ExecutionHealth::BlockedExternal,
             // Issue #1193: an ORGANICALLY-TRIPPED open breaker admits a
             // recovery probe on its own cooldown timer -- no human clears it
-            // faster. But it is not `Healthy` either: every dispatch
-            // fast-fails NON-RETRYABLY until then (issue #369's
-            // `ActivityFailure::circuit_open`), so the run is heading for a
-            // terminal `ActivityFailed`, not progress. This arm MUST stay
+            // faster. But it is not `Healthy` either: no dispatch runs
+            // until then. In fail-fast mode each one fails NON-RETRYABLY
+            // (issue #369's `ActivityFailure::circuit_open`). In defer mode
+            // (the default since issue #1809) each one waits in `PENDING`.
+            // Neither is progress. This arm MUST stay
             // above the `ActivityCircuitOpen { .. }` catch-all below for the
             // split to bind, and below the HalfOpen arm above (HalfOpen is
             // the one case that clears with no fast-fail at all).

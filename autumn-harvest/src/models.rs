@@ -578,6 +578,11 @@ pub struct TaskQueueItem {
     /// owns this row, or once a different wake reason repends it.
     #[serde(default)]
     pub timer_fires_at: Option<DateTime<Utc>>,
+    /// The `attempt` whose activity handler started (issue #1809). Written
+    /// with `ActivityStarted`. Equal to `attempt` only after the current
+    /// claim started its handler. `NULL` when no attempt started.
+    #[serde(default)]
+    pub handler_started_attempt: Option<i32>,
 }
 
 /// Insert struct for enqueuing a new task.
