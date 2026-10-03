@@ -126,6 +126,7 @@ mod guardrail_catalog_tests;
 mod havoc_reentrancy;
 mod havoc_tests;
 mod history_ceiling_claim_tests;
+mod host_clock_skew_tests;
 mod hot_code_swap_docs;
 #[cfg(all(feature = "hot-code-swap", feature = "testing"))]
 mod hot_code_swap_tests;
@@ -214,7 +215,6 @@ mod retention_summary_tests;
 mod retry_after_tests;
 mod retry_budget_tests;
 mod retry_chain_routing_tests;
-mod host_clock_skew_tests;
 mod retry_clock_skew_tests;
 mod retry_now_tests;
 mod saga_tests;

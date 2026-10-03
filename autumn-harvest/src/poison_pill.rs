@@ -432,7 +432,9 @@ mod scanner {
                     // earlier attempt must not survive into the fresh one it
                     // no longer describes.
                     dsl::error.eq(None::<String>),
-                    dsl::scheduled_at.eq(Utc::now()),
+                    // Database clock, as `claim_task` reads it (issue #1807).
+                    dsl::scheduled_at
+                        .eq(crate::queue::db_clock_stamp::<diesel::sql_types::Timestamptz>()),
                 ))
                 .execute(conn)
                 .await

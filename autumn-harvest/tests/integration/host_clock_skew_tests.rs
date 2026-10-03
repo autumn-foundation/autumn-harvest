@@ -329,5 +329,8 @@ async fn force_retry_stamps_scheduled_at_on_the_database_clock() {
 
     let stamp = read_column(&mut conn, "scheduled_at", task).await;
     assert_on_db_clock(&mut conn, "scheduled_at", stamp).await;
-    assert_eq!(outcome.scheduled_at, stamp, "outcome reports the stored value");
+    assert_eq!(
+        outcome.scheduled_at, stamp,
+        "outcome reports the stored value"
+    );
 }

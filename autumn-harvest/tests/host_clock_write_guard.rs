@@ -15,11 +15,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Columns that timeout scans compare with `NOW()` (see `timeout.rs`).
-const SCAN_COLUMNS: &[&str] = &[
-    "last_heartbeat_at",
-    "scheduled_at",
-    "schedule_to_close_at",
-];
+const SCAN_COLUMNS: &[&str] = &["last_heartbeat_at", "scheduled_at", "schedule_to_close_at"];
 
 const MARKER: &str = "host-clock-ok:";
 
@@ -31,7 +27,9 @@ fn violations(source: &str) -> Vec<(usize, String)> {
         let trimmed = line.trim();
         let test_cfg = trimmed.starts_with("#[cfg(") && trimmed.contains("test");
         if test_cfg
-            && lines.get(index + 1).is_some_and(|next| next.trim_start().starts_with("mod "))
+            && lines
+                .get(index + 1)
+                .is_some_and(|next| next.trim_start().starts_with("mod "))
         {
             break;
         }
@@ -39,7 +37,9 @@ fn violations(source: &str) -> Vec<(usize, String)> {
             continue;
         }
         let allowed = line.contains(MARKER)
-            || index.checked_sub(1).is_some_and(|prev| lines[prev].contains(MARKER));
+            || index
+                .checked_sub(1)
+                .is_some_and(|prev| lines[prev].contains(MARKER));
         if allowed {
             continue;
         }
