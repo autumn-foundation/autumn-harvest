@@ -71,9 +71,11 @@ list-partitioned. It is not. The doc now says so and describes the janitor.
 **Dashboard.** The starter pack gains a panel for the new counter.
 
 **Benchmark.** `task_queue_hygiene_bench` measures claim latency after 1M
-terminal rows, before and after the fix. Before vacuum, claim p50 doubles
-(303 ms to 596 ms). After the sweep, it is back at the baseline. Results are
-in `docs/performance-task-queue-hygiene.md`. CI compiles the bench.
+terminal rows, before and after the fix. Dead tuples from the churn raise
+claim p50 by 72% (284 ms to 488 ms). The janitor's own deletes are dead
+tuples too, until vacuum runs. After the sweep and a vacuum, p50 is at the
+baseline and the heap is back to its size. Results are in
+`docs/performance-task-queue-hygiene.md`. CI compiles the bench.
 
 **Also fixed.** `activity_default_timeout_tests.rs` did not compile on
 `trunk-dev`. It builds a `WorkerRuntimeConfig` literal without the
