@@ -32,7 +32,8 @@ What the numbers show:
   303 ms, and the heap goes back to 2.4 MB.
 - **Index files do not shrink.** VACUUM makes the freed index pages
   reusable, but the files keep their size (241.7 MB). New entries reuse the
-  pages. To return the space after the first sweep of a large backlog, run
+  pages. The after schema also has `idx_harvest_tq_terminal_completed_at`,
+  which held all 1M rows before the sweep. To return the space after the first sweep of a large backlog, run
   `REINDEX INDEX CONCURRENTLY` on each `harvest_task_queue` index once.
 
 In steady state the janitor runs every tick, so the table holds at most

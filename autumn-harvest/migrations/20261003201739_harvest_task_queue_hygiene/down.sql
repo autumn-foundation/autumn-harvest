@@ -14,6 +14,7 @@ CREATE INDEX IF NOT EXISTS idx_harvest_tq_running
 DROP INDEX IF EXISTS idx_harvest_tq_running_started;
 
 DROP INDEX IF EXISTS idx_harvest_tq_terminal_completed_at;
+DROP INDEX IF EXISTS idx_harvest_dl_workflow_exec_id;
 
 ALTER TABLE harvest_task_queue RESET (
     fillfactor,

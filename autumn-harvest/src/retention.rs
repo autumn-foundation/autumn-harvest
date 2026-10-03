@@ -75,17 +75,19 @@ pub const MIN_RATE_LIMIT_BUCKET_RETENTION: Duration = Duration::from_secs(60 * 6
 /// 7 days.
 ///
 /// The janitor is on by default. History retention is off by default, so
-/// without it finished `harvest_task_queue` rows stay forever. The engine
-/// reads no terminal task row that is more than a few minutes old.
+/// without it finished `harvest_task_queue` rows stay forever. Two paths read
+/// an old terminal row: the concurrency supersede scan, and a DLQ redrive
+/// that revives an execution. The janitor keeps the rows those paths need.
 /// [`RetentionConfig::without_terminal_task_gc`] turns it off.
 pub const DEFAULT_TERMINAL_TASK_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
 
 /// Shortest configurable age for the terminal-task janitor (issue #1811):
 /// 1 hour.
 ///
-/// A worker that lost its lease can still report on a row shortly after the
-/// row ends. Such a late report must find the row, so the floor stays well
-/// above any lease or timeout window.
+/// The floor keeps a just-finished row visible to the triage routes
+/// (`retry-now`, `fail-now`, `GET /admin/tasks/{id}/eligibility`) for at least
+/// an hour. A late worker report is fenced on `state = 'RUNNING'`. It gets the
+/// same lease-lost result for a deleted row as for a finished one.
 pub const MIN_TERMINAL_TASK_RETENTION: Duration = Duration::from_secs(60 * 60);
 
 /// Default byte cap for an opt-in captured summary payload (issue #752).
@@ -707,8 +709,8 @@ impl RetentionConfig {
 
     /// Set the age after which a terminal task row is deleted (issue #1811).
     ///
-    /// `validate` rejects an age outside
-    /// [`MIN_TERMINAL_TASK_RETENTION`]`..=MAX_MAX_AGE`.
+    /// `validate` rejects an age below [`MIN_TERMINAL_TASK_RETENTION`] or
+    /// above `MAX_MAX_AGE`.
     #[must_use]
     pub const fn with_terminal_task_retention(mut self, age: Duration) -> Self {
         self.terminal_task_retention_secs = Some(age.as_secs());
@@ -891,13 +893,15 @@ impl RetentionConfig {
         Ok(())
     }
 
-    /// Returns `true` if any retention feature is enabled.
+    /// Returns `true` if any retention feature is enabled. The features are:
     ///
-    /// The features are: workflow-history retention (global or per-type),
-    /// audit-log purging, and schedule-decision purging. They also include
-    /// bounded summary GC (issue #752) and partition maintenance (issue #958).
-    /// The last two are the idle rate-limit-bucket GC (issue #1127) and the
-    /// terminal-task janitor (issue #1811).
+    /// - workflow-history retention, global or per type;
+    /// - audit-log purging;
+    /// - schedule-decision purging;
+    /// - bounded summary GC (issue #752);
+    /// - partition maintenance (issue #958);
+    /// - the idle rate-limit-bucket GC (issue #1127);
+    /// - the terminal-task janitor (issue #1811).
     ///
     /// Per-workflow-type overrides count as enabling workflow-history retention
     /// even when the global `max_age` is unset (issue #737), so an
@@ -934,6 +938,8 @@ impl RetentionConfig {
             // keep growing one row per tenant key.
             || self.rate_limit_bucket_gc_active()
             // Issue #1811: the terminal-task janitor is work in its own right.
+            // Without this clause, a config with every other pass off never
+            // spawns the runtime, and finished task rows stay forever.
             || self.terminal_task_gc_active()
     }
 }
@@ -994,8 +1000,10 @@ pub struct RetentionTickResult {
     pub rate_limit_bucket_gc: Option<RateLimitBucketGcOutcome>,
     /// Terminal-task janitor outcome for this shard this tick (issue #1811).
     ///
-    /// `None` means the janitor is off. `Some` with a zero count means it ran
-    /// and found nothing. `Some` with an `error` means it could not run.
+    /// `None` means the janitor is off or has not run on this shard yet.
+    /// `Some` with a zero count means it ran and found nothing. `Some` with an
+    /// `error` means the pass failed; the counts are the rows deleted before
+    /// the failure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_task_gc: Option<TerminalTaskGcOutcome>,
 }
@@ -1015,10 +1023,13 @@ pub struct TerminalTaskGcOutcome {
     pub error: Option<String>,
 }
 
+/// Constructors for the janitor loop, which is `db`-gated. They stay private
+/// so the public API does not grow, as for [`RateLimitBucketGcOutcome`].
+#[cfg(any(feature = "db", test))]
 impl TerminalTaskGcOutcome {
     /// A completed pass, real or a `dry_run` preview.
     #[must_use]
-    pub fn deleted(deleted_by_state: BTreeMap<String, u64>, dry_run: bool) -> Self {
+    fn deleted(deleted_by_state: BTreeMap<String, u64>, dry_run: bool) -> Self {
         Self {
             deleted: deleted_by_state.values().sum(),
             deleted_by_state,
@@ -1028,12 +1039,26 @@ impl TerminalTaskGcOutcome {
     }
 
     /// A pass that could not run on this shard.
+    ///
+    /// Takes `dry_run` from the config, so a failed preview still reads as a
+    /// preview (issue #1316).
+    #[cfg(test)]
     #[must_use]
-    pub fn failed(error: String, dry_run: bool) -> Self {
+    fn failed(error: String, dry_run: bool) -> Self {
         Self {
             error: Some(error),
             dry_run,
             ..Self::default()
+        }
+    }
+
+    /// A pass that failed after some batches committed. The counts are the
+    /// rows those batches deleted.
+    #[must_use]
+    fn partial(deleted_by_state: BTreeMap<String, u64>, error: String, dry_run: bool) -> Self {
+        Self {
+            error: Some(error),
+            ..Self::deleted(deleted_by_state, dry_run)
         }
     }
 }
@@ -1113,8 +1138,9 @@ pub struct RetentionMonitor {
     inner: Arc<Mutex<RetentionStatus>>,
     /// Count of full main-loop iterations completed.
     ///
-    /// One iteration covers history retention, partition maintenance, and
-    /// the audit, schedule, summary, and rate-limit-bucket GC passes. This
+    /// One iteration covers history retention, partition maintenance, the
+    /// audit, schedule, summary and rate-limit-bucket GC passes, and the
+    /// terminal-task janitor (issue #1811). This
     /// counter advances once, at the same point as the unconditional
     /// end-of-iteration liveness tick from issue #797.
     ///
@@ -1232,8 +1258,10 @@ impl RetentionMonitor {
         }
     }
 
-    /// Record this shard's terminal-task janitor outcome (issue #1811). It
-    /// runs outside the history-retention phase, as the bucket GC does.
+    /// Record this shard's terminal-task janitor outcome (issue #1811).
+    ///
+    /// The janitor runs outside the history-retention phase, so its outcome
+    /// cannot ride along in that phase's `update`.
     #[cfg(feature = "db")]
     fn update_terminal_tasks(&self, shard: ShardId, outcome: TerminalTaskGcOutcome) {
         let mut guard = self.inner.lock().expect("retention monitor lock poisoned");
@@ -1275,6 +1303,82 @@ impl RetentionMonitor {
 struct PartitionSweepCursor {
     resume_after: Option<DateTime<Utc>>,
     catch_up_target: Option<DateTime<Utc>>,
+}
+
+/// One terminal-task janitor pass over every shard (issue #1811).
+///
+/// The pass is shard-local and best-effort. A failed shard is reported and
+/// retried next tick. Under `dry_run`, the pass is a read-only preview and
+/// records no metric. A pass that fails after some batches committed still reports and
+/// meters those rows. Shutdown takes effect at the next shard boundary, where
+/// no statement is open.
+#[cfg(feature = "db")]
+async fn run_terminal_task_pass(
+    pools: &ShardedDbPool,
+    config: &RetentionConfig,
+    monitor: &RetentionMonitor,
+    metrics: &dyn MetricsRecorder,
+    shutdown: &CancellationToken,
+) {
+    let Some(age) = config.terminal_task_retention() else {
+        return;
+    };
+    // `validate` bounds the age. A config that skipped it must not panic the
+    // retention task, so an age out of range skips the pass.
+    let Some(cutoff) = chrono::Duration::from_std(age)
+        .ok()
+        .and_then(|age| Utc::now().checked_sub_signed(age))
+    else {
+        tracing::warn!(
+            age_secs = age.as_secs(),
+            "harvest terminal-task janitor skipped: the age is out of range"
+        );
+        return;
+    };
+    for (shard, pool) in pools.iter_shards() {
+        if shutdown.is_cancelled() {
+            return;
+        }
+        let mut by_state = BTreeMap::new();
+        let result = match pool.get().await {
+            Ok(mut conn) => crate::queue::sweep_terminal_tasks_into(
+                &mut conn,
+                cutoff,
+                config.batch_size,
+                config.dry_run,
+                &mut by_state,
+            )
+            .await
+            .map_err(|err| err.to_string()),
+            Err(err) => Err(err.to_string()),
+        };
+        // Real deletes only. A preview is a forecast.
+        if !config.dry_run {
+            for (state, count) in &by_state {
+                metrics.record_terminal_tasks_deleted(state, *count);
+            }
+        }
+        let outcome = match result {
+            Ok(()) => TerminalTaskGcOutcome::deleted(by_state, config.dry_run),
+            Err(error) => TerminalTaskGcOutcome::partial(by_state, error, config.dry_run),
+        };
+        if let Some(error) = &outcome.error {
+            tracing::warn!(
+                shard = %shard,
+                deleted = outcome.deleted,
+                error = %error,
+                "harvest terminal-task janitor failed"
+            );
+        } else if outcome.deleted > 0 {
+            tracing::info!(
+                shard = %shard,
+                rows = outcome.deleted,
+                dry_run = config.dry_run,
+                "harvest terminal-task janitor pass"
+            );
+        }
+        monitor.update_terminal_tasks(shard, outcome);
+    }
 }
 
 /// One pass of engine-automated partition maintenance (issue #958, AC8):
@@ -1517,7 +1621,8 @@ impl RetentionRuntime {
     /// partition maintenance (issue #958) or the idle rate-limit-bucket GC
     /// (issue #1127) each spawn the runtime on their own — so `max_age` being
     /// unset is an ordinary, fully-supported state here: the history-retention
-    /// phase is gated on `loosest_cutoff_age()` and is simply skipped.
+    /// phase is gated on `loosest_cutoff_age()` and is simply skipped. The
+    /// terminal-task janitor (issue #1811) also spawns the runtime on its own.
     #[must_use]
     #[allow(clippy::too_many_lines)]
     pub fn spawn(
@@ -1952,58 +2057,16 @@ impl RetentionRuntime {
                 }
 
                 // Terminal-task janitor (issue #1811). It is outside the
-                // history-retention gate, because history retention is off by
-                // default. Shard-local and best-effort: a failed shard is
-                // reported and retried next tick. Under `dry_run` it runs as
-                // a read-only preview.
-                if let Some(age) = config.terminal_task_retention()
-                    && let Ok(age) = chrono::Duration::from_std(age)
-                {
-                    let cutoff = Utc::now() - age;
-                    for (shard, pool) in pools.iter_shards() {
-                        let outcome = match pool.get().await {
-                            Ok(mut conn) => match crate::queue::sweep_terminal_tasks(
-                                &mut conn,
-                                cutoff,
-                                config.batch_size,
-                                config.dry_run,
-                            )
-                            .await
-                            {
-                                Ok(by_state) => {
-                                    // Real deletes only. A preview is a forecast.
-                                    if !config.dry_run {
-                                        for (state, count) in &by_state {
-                                            metrics.record_terminal_tasks_deleted(state, *count);
-                                        }
-                                    }
-                                    TerminalTaskGcOutcome::deleted(by_state, config.dry_run)
-                                }
-                                Err(err) => {
-                                    TerminalTaskGcOutcome::failed(err.to_string(), config.dry_run)
-                                }
-                            },
-                            Err(err) => {
-                                TerminalTaskGcOutcome::failed(err.to_string(), config.dry_run)
-                            }
-                        };
-                        if let Some(error) = &outcome.error {
-                            tracing::warn!(
-                                shard = %shard,
-                                error = %error,
-                                "harvest terminal-task janitor failed"
-                            );
-                        } else if outcome.deleted > 0 {
-                            tracing::info!(
-                                shard = %shard,
-                                deleted = outcome.deleted,
-                                dry_run = config.dry_run,
-                                "harvest terminal task rows deleted"
-                            );
-                        }
-                        monitor_task.update_terminal_tasks(shard, outcome);
-                    }
-                }
+                // history-retention gate: task rows grow with traffic, and
+                // history retention is off by default.
+                run_terminal_task_pass(
+                    &pools,
+                    &config,
+                    &monitor_task,
+                    metrics.as_ref(),
+                    &shutdown_task,
+                )
+                .await;
 
                 // Issue #797: unconditional end-of-iteration liveness tick. A
                 // tick that deleted nothing still proves the janitor is alive —
@@ -4653,9 +4716,10 @@ mod tests {
         }
         // Issue #1127: the idle rate-limit bucket GC is on by default and is
         // itself an enabling reason, so "nothing enabled" now has to switch it
-        // off too.
-        .without_rate_limit_bucket_gc();
-        // no purging AND no partition maintenance AND no bucket GC is not enabled
+        // off too. Issue #1811 adds the terminal-task janitor, which is the same.
+        .without_rate_limit_bucket_gc()
+        .without_terminal_task_gc();
+        // No purging, partition maintenance, bucket GC or task janitor.
         assert!(!config.enabled());
 
         // …but partition maintenance ALONE is (issue #958). An opted-in
@@ -4769,12 +4833,14 @@ mod tests {
             },
             ..config
         }
-        // Issue #1127: the bucket GC is on by default and enabling on its own.
-        .without_rate_limit_bucket_gc();
+        // Issues #1127 and #1811: the bucket GC and the task janitor are on by
+        // default and each is enabling on its own.
+        .without_rate_limit_bucket_gc()
+        .without_terminal_task_gc();
         assert!(
             !config.enabled(),
             "an unbounded-summary-only config with no history/audit horizon, no \
-             partition maintenance and no bucket GC is not enabled"
+             partition maintenance, no bucket GC and no task janitor is not enabled"
         );
 
         // But a history horizon + unbounded summary IS enabled (via history).
@@ -4886,7 +4952,8 @@ mod tests {
                 ..PartitionMaintenanceConfig::default()
             },
             ..RetentionConfig::default()
-        };
+        }
+        .without_terminal_task_gc();
         assert!(config.rate_limit_bucket_gc_active());
         assert!(
             config.enabled(),

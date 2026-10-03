@@ -1605,6 +1605,14 @@ mod tests {
     }
 
     #[test]
+    fn record_terminal_tasks_deleted_does_not_panic() {
+        // Terminal-task janitor counter bridge (issue #1811).
+        let rec = MetricsRsRecorder;
+        rec.record_terminal_tasks_deleted("COMPLETED", 5);
+        rec.record_terminal_tasks_deleted("FAILED", 0);
+    }
+
+    #[test]
     fn record_retention_deleted_does_not_panic() {
         // Per-workflow-type retention deletion counter bridge (issue #737).
         // Must not panic with no global recorder installed.

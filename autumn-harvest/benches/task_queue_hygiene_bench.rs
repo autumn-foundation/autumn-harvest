@@ -10,6 +10,7 @@
 //! | `baseline` | after | none |
 //! | `before-dead` | before | 1M, dead tuples not yet vacuumed |
 //! | `before-vacuumed` | before | 1M, vacuumed |
+//! | `after-swept-unvacuumed` | after | 1M, deleted by the janitor, not yet vacuumed |
 //! | `after-swept` | after | 1M, deleted by the janitor, then vacuumed |
 //!
 //! "Before" applies the migration's `down.sql`: the old indexes and default
@@ -75,6 +76,7 @@ enum Terminal {
     None,
     Dead,
     Vacuumed,
+    SweptDead,
     Swept,
 }
 
@@ -84,7 +86,7 @@ struct Arm {
     terminal: Terminal,
 }
 
-const ARMS: [Arm; 4] = [
+const ARMS: [Arm; 5] = [
     Arm {
         name: "baseline",
         schema: Schema::After,
@@ -99,6 +101,11 @@ const ARMS: [Arm; 4] = [
         name: "before-vacuumed",
         schema: Schema::Before,
         terminal: Terminal::Vacuumed,
+    },
+    Arm {
+        name: "after-swept-unvacuumed",
+        schema: Schema::After,
+        terminal: Terminal::SweptDead,
     },
     Arm {
         name: "after-swept",
@@ -208,14 +215,14 @@ async fn prepare(
     if arm.terminal != Terminal::None {
         seed_terminal_rows(conn, rows).await;
     }
-    if arm.terminal == Terminal::Swept {
+    if matches!(arm.terminal, Terminal::Swept | Terminal::SweptDead) {
         *sweep = Some(run_janitor(conn).await);
     }
     // Flush this backend's pending table counters before VACUUM. Otherwise
     // they reach the stats view after VACUUM resets its dead-row count.
     flush_stats(conn).await;
     match arm.terminal {
-        Terminal::Dead => exec(conn, "ANALYZE harvest_task_queue").await,
+        Terminal::Dead | Terminal::SweptDead => exec(conn, "ANALYZE harvest_task_queue").await,
         Terminal::None | Terminal::Vacuumed | Terminal::Swept => {
             exec(conn, "VACUUM (ANALYZE) harvest_task_queue").await;
         }
@@ -316,9 +323,13 @@ async fn table_state(conn: &mut AsyncPgConnection) -> TableState {
 /// Push this backend's pending table counters to the stats view.
 ///
 /// The call schedules the flush for the end of the current statement. The
-/// next statement then reads the flushed counters.
+/// next statement then reads the flushed counters. The function exists on
+/// PostgreSQL 15 and later. On older servers the counters flush on their own
+/// schedule, so the dead-row column can lag.
 async fn flush_stats(conn: &mut AsyncPgConnection) {
-    exec(conn, "SELECT pg_stat_force_next_flush()").await;
+    let _ = conn
+        .batch_execute("SELECT pg_stat_force_next_flush()")
+        .await;
     exec(conn, "SELECT 1").await;
 }
 
@@ -363,10 +374,13 @@ fn sweep_note(sweep: Option<&SweepRun>) {
     println!("> `⚠` marks an arm cut short by the scenario wall-clock budget.");
 }
 
-/// Print the `harvest_task_queue` scan nodes of three hot queries under each
-/// schema. The migration replaces `idx_harvest_tq_running`, which the claim
-/// query and the timeout scans read as a RUNNING-row index. This shows that
-/// the replacement serves the same nodes.
+/// Print the `harvest_task_queue` scan nodes of three hot queries and the
+/// janitor's delete under each schema.
+///
+/// The migration replaces `idx_harvest_tq_running`. The timeout scans read it
+/// as a RUNNING-row index. The output shows three things. The replacement
+/// serves the same timeout-scan nodes. The claim plan does not change. The
+/// janitor reads its own index.
 async fn explain_section(conn: &mut AsyncPgConnection) {
     println!();
     println!("## Plans: `harvest_task_queue` scan nodes");
@@ -379,6 +393,12 @@ async fn explain_section(conn: &mut AsyncPgConnection) {
         println!("```text");
         let claim = db::explain_claim(conn, headline_scenario()).await;
         print_scan_nodes("claim_task", &claim);
+        if label == "after" {
+            let sweep = autumn_harvest::queue::terminal_task_sweep_sql(false)
+                .replace("$1", "NOW() - INTERVAL '7 days'")
+                .replace("$2", "1000");
+            print_scan_nodes("janitor_delete", &explain(conn, &sweep).await);
+        }
         for (name, sql) in [
             (
                 "heartbeat_timeout",
@@ -398,7 +418,8 @@ async fn explain_section(conn: &mut AsyncPgConnection) {
 fn print_scan_nodes(query: &str, plan: &str) {
     for line in plan.lines() {
         let node = line.trim().trim_start_matches("-> ").trim();
-        let task_queue_scan = node.contains("Scan") && node.contains("harvest_task_queue");
+        let task_queue_scan = node.contains("Scan")
+            && (node.contains("harvest_task_queue") || node.contains("harvest_dead_letters"));
         if task_queue_scan || node.starts_with("Bitmap Index Scan on idx_harvest_tq") {
             println!("{query}: {node}");
         }

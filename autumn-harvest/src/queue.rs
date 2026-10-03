@@ -6684,14 +6684,22 @@ pub async fn sweep_idle_rate_limit_buckets(
 /// Task states that end a task row (issue #1811).
 ///
 /// The state check constraint also allows `PENDING` and `RUNNING`. No code
-/// path moves a row out of these three states.
+/// path moves a row out of `COMPLETED`, `FAILED` or `CANCELLED`.
 pub const TERMINAL_TASK_STATES: &[&str] = &["COMPLETED", "FAILED", "CANCELLED"];
+
+/// Largest `LIMIT` one terminal-task sweep statement uses (issue #1811).
+///
+/// `batch_size` also sizes history retention, and it has no upper bound. The
+/// cap keeps one statement, and the row locks it holds, small.
+pub const MAX_TERMINAL_TASK_SWEEP_BATCH: usize = 10_000;
 
 /// Maximum `DELETE` batches the terminal-task sweep issues per shard per tick
 /// (issue #1811).
 ///
-/// This is the bucket GC budget. At the default `batch_size` of 1000, one tick
-/// deletes at most 50k rows per shard. The next tick continues.
+/// It equals [`MAX_RATE_LIMIT_SWEEP_BATCHES_PER_TICK`]. A bounded budget stops
+/// one tick from holding a pooled connection for an open-ended delete loop.
+/// At the default `batch_size` of 1000, one tick deletes at most 50k rows per
+/// shard. The next tick continues.
 pub const MAX_TERMINAL_TASK_SWEEP_BATCHES_PER_TICK: usize = 50;
 
 /// The keyset bound for every page after the first, on `(completed_at, id)`.
@@ -6703,10 +6711,15 @@ const TERMINAL_TASK_CURSOR: &str = "AND (t.completed_at, t.id) > ($3, $4) ";
 /// - **State.** A positive list of terminal states. The sweep never deletes
 ///   a new state until someone adds it to [`TERMINAL_TASK_STATES`].
 /// - **Age.** `completed_at` is before the cutoff `$1`. Every terminal write
-///   sets `completed_at`, so a NULL never matches and that row stays.
+///   sets `completed_at`. A row with a NULL `completed_at` never matches, so
+///   it stays.
 /// - **Live execution.** A terminal `workflow` row stays while its execution
 ///   is not terminal. The concurrency supersede scan finds a live execution
-///   through that row, in any row state. Nothing reads an old activity row.
+///   through that row, in any row state. No engine path reads an old
+///   activity row.
+/// - **Dead letter.** A terminal `workflow` row also stays while a dead
+///   letter exists for its execution. A DLQ redrive can move a `FAILED`
+///   execution back to `RUNNING`, and the supersede scan then needs the row.
 #[must_use]
 fn terminal_task_predicates() -> String {
     let terminal = crate::erase::sql_literal_list(TERMINAL_TASK_STATES);
@@ -6714,10 +6727,16 @@ fn terminal_task_predicates() -> String {
     format!(
         "t.state IN ({terminal}) \
          AND t.completed_at < $1 \
-         AND (t.task_type = 'activity' OR NOT EXISTS ( \
-             SELECT 1 FROM harvest_workflow_executions e \
-              WHERE e.id = t.workflow_exec_id \
-                AND e.state NOT IN ({execution_terminal}) \
+         AND (t.task_type = 'activity' OR ( \
+             NOT EXISTS ( \
+                 SELECT 1 FROM harvest_workflow_executions e \
+                  WHERE e.id = t.workflow_exec_id \
+                    AND e.state NOT IN ({execution_terminal}) \
+             ) \
+             AND NOT EXISTS ( \
+                 SELECT 1 FROM harvest_dead_letters dl \
+                  WHERE dl.workflow_exec_id = t.workflow_exec_id \
+             ) \
          ))"
     )
 }
@@ -6735,8 +6754,11 @@ fn terminal_task_predicates() -> String {
 ///
 /// `after_cursor` adds the keyset bound for every page after the first. The
 /// cursor skips rows that `SKIP LOCKED` left behind in this tick.
+///
+/// Public only so `task_queue_hygiene_bench` can EXPLAIN it.
+#[doc(hidden)]
 #[must_use]
-fn terminal_task_sweep_sql(after_cursor: bool) -> String {
+pub fn terminal_task_sweep_sql(after_cursor: bool) -> String {
     let predicates = terminal_task_predicates();
     let cursor = if after_cursor {
         TERMINAL_TASK_CURSOR
@@ -6798,13 +6820,37 @@ fn terminal_task_preview_sql(after_cursor: bool) -> String {
 ///
 /// # Errors
 ///
-/// Returns [`crate::error::HarvestError::Database`] on query failure.
+/// Returns [`crate::error::HarvestError::Database`] on query failure. Use
+/// [`sweep_terminal_tasks_into`] to keep the counts of batches that
+/// committed before the failure.
 pub async fn sweep_terminal_tasks(
     conn: &mut AsyncPgConnection,
     cutoff: DateTime<Utc>,
     batch_size: usize,
     preview: bool,
 ) -> HarvestResult<std::collections::BTreeMap<String, u64>> {
+    let mut counts = std::collections::BTreeMap::new();
+    sweep_terminal_tasks_into(conn, cutoff, batch_size, preview, &mut counts).await?;
+    Ok(counts)
+}
+
+/// [`sweep_terminal_tasks`], adding each batch's counts to `counts` as it
+/// commits (issue #1811).
+///
+/// Each batch commits on its own. When a later batch fails, `counts` still
+/// holds the rows that earlier batches deleted, so the caller can report
+/// them.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn sweep_terminal_tasks_into(
+    conn: &mut AsyncPgConnection,
+    cutoff: DateTime<Utc>,
+    batch_size: usize,
+    preview: bool,
+    counts: &mut std::collections::BTreeMap<String, u64>,
+) -> HarvestResult<()> {
     #[derive(diesel::QueryableByName)]
     struct SweptRow {
         #[diesel(sql_type = diesel::sql_types::Uuid)]
@@ -6816,7 +6862,8 @@ pub async fn sweep_terminal_tasks(
     }
 
     // A `batch_size` of 0 would make `LIMIT 0` delete nothing forever.
-    let batch = i64::try_from(batch_size).unwrap_or(i64::MAX).max(1);
+    let batch = i64::try_from(batch_size.clamp(1, MAX_TERMINAL_TASK_SWEEP_BATCH))
+        .expect("the cap fits in i64");
     let (first_sql, next_sql) = if preview {
         (
             terminal_task_preview_sql(false),
@@ -6828,7 +6875,6 @@ pub async fn sweep_terminal_tasks(
             terminal_task_sweep_sql(true),
         )
     };
-    let mut counts = std::collections::BTreeMap::new();
     let mut cursor: Option<(DateTime<Utc>, Uuid)> = None;
 
     for _ in 0..MAX_TERMINAL_TASK_SWEEP_BATCHES_PER_TICK {
@@ -6863,7 +6909,7 @@ pub async fn sweep_terminal_tasks(
             break;
         }
     }
-    Ok(counts)
+    Ok(())
 }
 
 /// `WHERE` clause that excludes *unbounded* rate-limit key families from the
@@ -9698,6 +9744,20 @@ mod tests {
             }
             assert_eq!(sql.contains("($3, $4)"), after_cursor);
         }
+    }
+
+    #[test]
+    fn terminal_task_predicates_keep_a_dead_lettered_executions_workflow_row() {
+        // A DLQ redrive can revive a `FAILED` execution.
+        let sql = terminal_task_predicates();
+        assert!(sql.contains("FROM harvest_dead_letters dl"));
+        assert!(sql.contains("dl.workflow_exec_id = t.workflow_exec_id"));
+    }
+
+    #[test]
+    fn terminal_task_sweep_batch_is_capped() {
+        assert_eq!(MAX_TERMINAL_TASK_SWEEP_BATCH, 10_000);
+        assert!(i64::try_from(MAX_TERMINAL_TASK_SWEEP_BATCH).is_ok());
     }
 
     #[test]

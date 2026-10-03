@@ -1830,8 +1830,11 @@ pub const METRIC_LABEL_QUEUE: &str = "queue";
 pub const METRIC_LABEL_TASK_TYPE: &str = "task_type";
 /// Metric label: terminal outcome status (e.g. `"completed"`, `"failed"`).
 pub const METRIC_LABEL_STATUS: &str = "status";
-/// Metric label: active workflow lifecycle state (issue #770) — one of the
-/// bounded values `"running"` / `"paused"`.
+/// Metric label: lifecycle state.
+///
+/// `harvest.workflow.active` uses `"running"` / `"paused"` (issue #770).
+/// `harvest.retention.terminal_tasks_deleted` uses the task states
+/// `COMPLETED` / `FAILED` / `CANCELLED` (issue #1811).
 pub const METRIC_LABEL_STATE: &str = "state";
 /// Metric label: low-cardinality error class on failed activity records.
 pub const METRIC_LABEL_ERROR_TYPE: &str = "error.type";
