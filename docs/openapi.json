@@ -9678,6 +9678,9 @@
                         },
                         "chain_execution_timeout": {
                           "description": "A duration as [seconds, nanoseconds].",
+                          "items": {
+                            "type": "integer"
+                          },
                           "type": [
                             "array",
                             "null"
@@ -9725,6 +9728,9 @@
                         },
                         "execution_timeout": {
                           "description": "A duration as [seconds, nanoseconds].",
+                          "items": {
+                            "type": "integer"
+                          },
                           "type": [
                             "array",
                             "null"
@@ -9908,6 +9914,9 @@
                         },
                         "sla": {
                           "description": "A duration as [seconds, nanoseconds].",
+                          "items": {
+                            "type": "integer"
+                          },
                           "type": [
                             "array",
                             "null"
@@ -10034,6 +10043,10 @@
                     },
                     "external_handoffs": {
                       "description": "Pending external activity hand-offs.",
+                      "items": {
+                        "description": "One pending hand-off. No live test creates one yet, so the shape stays open.",
+                        "x-harvest-any": true
+                      },
                       "type": "array"
                     },
                     "history": {
@@ -13009,22 +13022,6 @@
               "application/json": {
                 "schema": {
                   "properties": {
-                    "batch_key": {
-                      "description": "Batch only. The 202 carries it, not this status.",
-                      "type": "string"
-                    },
-                    "batched": {
-                      "description": "Present and true when a batch flushed at once. That is a 201.",
-                      "type": "boolean"
-                    },
-                    "debounce_key": {
-                      "description": "Debounce only. The 202 carries it, not this status.",
-                      "type": "string"
-                    },
-                    "debounced": {
-                      "description": "Debounce only. The 202 carries it, not this status.",
-                      "type": "boolean"
-                    },
                     "deduplicated": {
                       "description": "Present on an idempotency-key start. True when an earlier start matched the key.",
                       "type": "boolean"
@@ -13032,22 +13029,6 @@
                     "execution_id": {
                       "description": "The execution id, a UUID.",
                       "type": "string"
-                    },
-                    "fire_at": {
-                      "description": "Debounce and batch only. The 202 carries it, not this status.",
-                      "type": "string"
-                    },
-                    "flushed": {
-                      "description": "Present and true when a batch flushed at once. That is a 201.",
-                      "type": "boolean"
-                    },
-                    "max_size": {
-                      "description": "Batch only. The 202 carries it, not this status.",
-                      "type": "integer"
-                    },
-                    "pending_count": {
-                      "description": "Debounce and batch only. The 202 carries it, not this status.",
-                      "type": "integer"
                     },
                     "shard_id": {
                       "description": "Present when the request pins `shard_id` or `residency_key`.",
@@ -13085,20 +13066,8 @@
               "application/json": {
                 "schema": {
                   "properties": {
-                    "batch_key": {
-                      "description": "Batch only. The 202 carries it, not this status.",
-                      "type": "string"
-                    },
                     "batched": {
-                      "description": "Present and true when a batch flushed at once. That is a 201.",
-                      "type": "boolean"
-                    },
-                    "debounce_key": {
-                      "description": "Debounce only. The 202 carries it, not this status.",
-                      "type": "string"
-                    },
-                    "debounced": {
-                      "description": "Debounce only. The 202 carries it, not this status.",
+                      "description": "Present and true when an event batch flushed at once.",
                       "type": "boolean"
                     },
                     "deduplicated": {
@@ -13109,21 +13078,9 @@
                       "description": "The execution id, a UUID.",
                       "type": "string"
                     },
-                    "fire_at": {
-                      "description": "Debounce and batch only. The 202 carries it, not this status.",
-                      "type": "string"
-                    },
                     "flushed": {
-                      "description": "Present and true when a batch flushed at once. That is a 201.",
+                      "description": "Present and true when an event batch flushed at once.",
                       "type": "boolean"
-                    },
-                    "max_size": {
-                      "description": "Batch only. The 202 carries it, not this status.",
-                      "type": "integer"
-                    },
-                    "pending_count": {
-                      "description": "Debounce and batch only. The 202 carries it, not this status.",
-                      "type": "integer"
                     },
                     "shard_id": {
                       "description": "Present when the request pins `shard_id` or `residency_key`.",
@@ -13218,6 +13175,10 @@
                       "type": "string"
                     }
                   },
+                  "required": [
+                    "workflow_name",
+                    "workflow_id"
+                  ],
                   "type": "object"
                 }
               }

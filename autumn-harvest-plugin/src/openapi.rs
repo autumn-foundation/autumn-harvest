@@ -60,10 +60,11 @@ const SESSION_SCHEME: &str = "HarvestSessionCookie";
 /// `x-harvest-route-class` value for a route that needs no credential.
 const PUBLIC_SAFE: &str = "public_safe";
 
-/// Routes whose success fields all carry a type (issue #1616).
+/// Routes whose success fields and array elements all declare a type (issue #1616).
 ///
-/// The published TypeScript client depends on these routes. Each type is
-/// proven against the live handler by `tests/openapi_response_conformance.rs`.
+/// The published TypeScript client depends on these routes.
+/// `tests/openapi_response_conformance.rs` checks each type against the live
+/// handler.
 pub const CORE_CLIENT_ROUTES: &[(&str, &str)] = &[
     ("POST", "/workflows/{workflow_name}/start"),
     ("GET", "/workflows/{id}"),
@@ -754,17 +755,31 @@ const FIELD_TYPES: &[&str] = &[
     "string", "integer", "number", "boolean", "object", "array", "any",
 ];
 
+/// Keys a contract field object may carry. A typo fails the transform.
+const FIELD_KEYS: &[&str] = &[
+    "name",
+    "description",
+    "required",
+    "type",
+    "nullable",
+    "fields",
+    "items",
+];
+
+/// Keys an `items` object may carry. An element has no name of its own.
+const ITEM_KEYS: &[&str] = &["description", "type", "nullable", "fields", "items"];
+
 /// An object schema built from a contract field list.
 ///
 /// The contract records field names, and sometimes a type; it does not record a
 /// full JSON Schema. Properties are therefore left open unless a type is
-/// declared. `additionalProperties` stays unset because the contract allows
-/// additive response fields without a breaking change.
+/// declared. The object this function builds leaves `additionalProperties`
+/// unset, because the contract allows additive fields without a breaking
+/// change. A bare `object` field is different; see [`type_schema`].
 ///
-/// A field is either a bare name or an object carrying `name`, `description`,
-/// `type`, `nullable`, `fields`, `items` and `required`. Response lists use
-/// both forms; request lists use the object form only. `at` names the list in
-/// an error.
+/// A field is either a bare name or an object with the keys in [`FIELD_KEYS`].
+/// Response lists use both forms; request lists use the object form only.
+/// `at` names the list in an error.
 fn object_schema(
     fields: &[Value],
     field_notes: Option<&Map<String, Value>>,
@@ -775,11 +790,17 @@ fn object_schema(
     let mut required = Vec::new();
     for field in fields {
         let Some(name) = field_name(field) else {
+            if field.is_object() {
+                return Err(OpenApiError(format!(
+                    "{at}: a field object has no string `name`"
+                )));
+            }
             continue;
         };
-        let mut property = match field.as_object() {
-            Some(_) => type_schema(field, &format!("{at}.{name}"))?,
-            None => Map::new(),
+        let mut property = if field.is_object() {
+            type_schema(field, FIELD_KEYS, &format!("{at}.{name}"))?
+        } else {
+            Map::new()
         };
         let note = field_notes
             .and_then(|notes| notes.get(name))
@@ -792,8 +813,14 @@ fn object_schema(
         if let Some(text) = text {
             property.insert("description".to_owned(), json!(text));
         }
-        if field["required"].as_bool().unwrap_or(false) {
-            required.push(json!(name));
+        match field.get("required") {
+            None | Some(Value::Bool(false)) => {}
+            Some(Value::Bool(true)) => required.push(json!(name)),
+            Some(_) => {
+                return Err(OpenApiError(format!(
+                    "{at}.{name}: `required` must be a boolean"
+                )));
+            }
         }
         properties.insert(name.to_owned(), Value::Object(property));
     }
@@ -812,25 +839,34 @@ fn object_schema(
 
 /// The type keywords of one field, or of an array's `items`.
 ///
-/// `any` publishes `x-harvest-any`, so a reader can tell a deliberately open
-/// field from one that has no type yet. A bare `object` publishes
-/// `additionalProperties: true`. Without it, `openapi-typescript` emits
-/// `Record<string, never>`, which says the object is empty.
-fn type_schema(spec: &Value, at: &str) -> Result<Map<String, Value>, OpenApiError> {
-    let mut schema = Map::new();
+/// `allowed` lists the keys `spec` may carry. `any` publishes `x-harvest-any`,
+/// so a reader can tell a deliberately open field from one that has no type
+/// yet. A bare `object` publishes `additionalProperties: true`. Without it,
+/// `openapi-typescript` emits `Record<string, never>`, which says the object is
+/// empty. An empty `fields` list closes the object the same way, so it is
+/// rejected.
+fn type_schema(
+    spec: &Value,
+    allowed: &[&str],
+    at: &str,
+) -> Result<Map<String, Value>, OpenApiError> {
+    let reject = |what: &str| Err(OpenApiError(format!("{at}: {what}")));
+    if let Some(unknown) = spec
+        .as_object()
+        .and_then(|map| map.keys().find(|key| !allowed.contains(&key.as_str())))
+    {
+        return reject(&format!("unknown key `{unknown}`. Use one of {allowed:?}"));
+    }
     let declared = match spec.get("type") {
         None => None,
         Some(Value::String(name)) if FIELD_TYPES.contains(&name.as_str()) => Some(name.as_str()),
-        Some(other) => {
-            let shown = other
-                .as_str()
-                .map_or_else(|| other.to_string(), str::to_owned);
-            return Err(OpenApiError(format!(
-                "{at}: type `{shown}` is not one of {FIELD_TYPES:?}. Use `any` for an open value"
-            )));
+        Some(Value::String(name)) => {
+            return reject(&format!(
+                "type `{name}` is not one of {FIELD_TYPES:?}. Use `any` for an open value"
+            ));
         }
+        Some(_) => return reject("`type` must be a string"),
     };
-    let reject = |what: &str| Err(OpenApiError(format!("{at}: {what}")));
     let nullable = match spec.get("nullable") {
         None => false,
         Some(Value::Bool(flag)) => *flag,
@@ -848,6 +884,7 @@ fn type_schema(spec: &Value, at: &str) -> Result<Map<String, Value>, OpenApiErro
         return reject("only an `array` field can carry `items`");
     }
 
+    let mut schema = Map::new();
     match declared {
         None => {}
         Some("any") => {
@@ -862,23 +899,33 @@ fn type_schema(spec: &Value, at: &str) -> Result<Map<String, Value>, OpenApiErro
             schema.insert("type".to_owned(), published);
         }
     }
-    if let Some(fields) = fields {
-        let fields = fields
-            .as_array()
-            .ok_or_else(|| OpenApiError(format!("{at}: `fields` must be an array")))?;
-        let nested = object_schema(fields, None, None, at)?;
-        schema.insert("properties".to_owned(), nested["properties"].clone());
-        if let Some(required) = nested.get("required") {
-            schema.insert("required".to_owned(), required.clone());
+    match fields.map(Value::as_array) {
+        Some(None) => return reject("`fields` must be an array"),
+        Some(Some(fields)) if fields.is_empty() => {
+            return reject(
+                "an empty `fields` list closes the object. Omit it to keep the object open",
+            );
         }
-    } else if declared == Some("object") {
-        schema.insert("additionalProperties".to_owned(), json!(true));
+        Some(Some(fields)) => {
+            let nested = object_schema(fields, None, None, at)?;
+            schema.insert("properties".to_owned(), nested["properties"].clone());
+            if let Some(required) = nested.get("required") {
+                schema.insert("required".to_owned(), required.clone());
+            }
+        }
+        None if declared == Some("object") => {
+            schema.insert("additionalProperties".to_owned(), json!(true));
+        }
+        None => {}
     }
     if let Some(items) = items {
         if !items.is_object() {
             return reject("`items` must be an object");
         }
-        let item = type_schema(items, &format!("{at}[]"))?;
+        let mut item = type_schema(items, ITEM_KEYS, &format!("{at}[]"))?;
+        if let Some(text) = items["description"].as_str() {
+            item.insert("description".to_owned(), json!(text));
+        }
         schema.insert("items".to_owned(), Value::Object(item));
     }
     Ok(schema)
@@ -1282,6 +1329,110 @@ mod tests {
         let route = route_with_field(&json!({ "name": "f", "nullable": true }));
         let error = responses(&route).expect_err("nullable needs a type");
         assert!(error.to_string().contains("`nullable`"), "{error}");
+    }
+
+    /// The error text for a route whose one field is `field`.
+    fn field_error(field: &Value) -> String {
+        responses(&route_with_field(field))
+            .expect_err("the field is invalid")
+            .to_string()
+    }
+
+    /// issue #1616: `any` publishes a marker, not a type.
+    #[test]
+    fn an_any_field_publishes_the_open_marker() {
+        let field = published_field(&json!({ "name": "f", "type": "any" }));
+        assert_eq!(field["x-harvest-any"], true);
+        assert!(field.get("type").is_none());
+    }
+
+    /// issue #1616: a nullable bare object stays open and pairs with null.
+    #[test]
+    fn a_nullable_bare_object_stays_open() {
+        let field = published_field(&json!({ "name": "f", "type": "object", "nullable": true }));
+        assert_eq!(field["type"], json!(["object", "null"]));
+        assert_eq!(field["additionalProperties"], true);
+    }
+
+    /// issue #1616: `items` types the elements, with nested fields and text.
+    #[test]
+    fn array_items_publish_their_own_schema() {
+        let field = published_field(&json!({
+            "name": "f",
+            "type": "array",
+            "items": {
+                "type": "object",
+                "description": "One event.",
+                "fields": [{ "name": "type", "type": "string", "required": true }],
+            },
+        }));
+        assert_eq!(field["items"]["type"], "object");
+        assert_eq!(field["items"]["description"], "One event.");
+        assert_eq!(field["items"]["properties"]["type"]["type"], "string");
+    }
+
+    /// issue #1616: request-body fields pass the same checks.
+    #[test]
+    fn a_request_field_with_a_bad_type_is_rejected() {
+        let route = json!({
+            "method": "POST",
+            "path": "/x",
+            "request_body": {
+                "required": true,
+                "fields": [{ "name": "f", "type": "int" }],
+            },
+        });
+        let error = request_body(&route).expect_err("`int` is not a contract type");
+        assert!(error.to_string().contains("POST /x request.f"), "{error}");
+    }
+
+    /// issue #1616: each malformed field fails with a message that names it.
+    #[test]
+    fn malformed_fields_are_rejected() {
+        let cases = [
+            (json!({ "name": "f", "type": 3 }), "`type` must be a string"),
+            (
+                json!({ "name": "f", "type": "string", "nullable": "yes" }),
+                "`nullable` must be a boolean",
+            ),
+            (
+                json!({ "name": "f", "type": "any", "nullable": true }),
+                "`nullable` needs",
+            ),
+            (
+                json!({ "name": "f", "type": "object", "fields": {} }),
+                "`fields` must be an array",
+            ),
+            (
+                json!({ "name": "f", "type": "object", "fields": [] }),
+                "empty `fields`",
+            ),
+            (
+                json!({ "name": "f", "type": "string", "items": { "type": "string" } }),
+                "only an `array`",
+            ),
+            (
+                json!({ "name": "f", "type": "array", "items": "string" }),
+                "`items` must be an object",
+            ),
+            (
+                json!({ "name": "f", "type": "array", "items": { "name": "x", "type": "string" } }),
+                "unknown key `name`",
+            ),
+            (
+                json!({ "name": "f", "type": "string", "required": "true" }),
+                "`required` must be a boolean",
+            ),
+            (
+                json!({ "name": "f", "type": "string", "nulable": true }),
+                "unknown key `nulable`",
+            ),
+            (json!({ "type": "string" }), "no string `name`"),
+        ];
+        for (field, expected) in cases {
+            let error = field_error(&field);
+            assert!(error.contains(expected), "{field}: {error}");
+        }
     }
 
     #[test]

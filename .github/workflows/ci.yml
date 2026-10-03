@@ -1698,10 +1698,13 @@ jobs:
   typescript-client-package:
     name: Published TypeScript client builds from docs/openapi.json
     # Issue #1616. The release attaches this package, so a break must show
-    # here first. It needs no app and no database.
+    # here first. The job needs no app and no database.
+    # IMPORTANT -- not yet enforced. Branch protection matches required checks
+    # by name, so this job blocks nothing until a repository admin adds it to
+    # the required set.
     needs: changes
-    # Draft-skip (see lint) + docs-only skip via the `changes` guard. A
-    # contract or document change counts as code there.
+    # The job skips draft pull requests and docs-only changes. A contract or
+    # document change counts as code; see the `changes` job.
     if: >-
       (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
       needs.changes.outputs.code == 'true'
@@ -1711,11 +1714,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+      # The script retries each npm registry call once. A type or test error
+      # fails at once.
       - name: Generate, type-check, test, build and pack
-        run: |
-          # The registry is the one thing here that fails for unrelated
-          # reasons. Two tries, then it is real.
-          scripts/build-typescript-client.sh || (sleep 10 && scripts/build-typescript-client.sh)
+        run: scripts/build-typescript-client.sh
 
   scaffold-smoke:
     name: Scaffold builds and runs (harvest new)

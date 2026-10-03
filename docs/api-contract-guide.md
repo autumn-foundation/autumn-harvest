@@ -63,10 +63,10 @@ Each route entry:
 | `error_responses` | array | Documented error status codes and conditions |
 | `idempotency` | string | (Optional) Idempotency semantics for the route |
 
-### Response fields
+### Field lists
 
-A `fields` entry is a bare name or an object. The object form takes these
-keys (issue #1616):
+A `fields` entry is a bare name or an object. Request and response lists both
+use it. The object form takes these keys, and no others (issue #1616):
 
 | Key | Meaning |
 |---|---|
@@ -75,16 +75,20 @@ keys (issue #1616):
 | `nullable` | `true` when the value can be `null`. It needs a concrete `type`. |
 | `required` | `true` when the key is in every body. |
 | `fields` | The properties of an `object` field, in this same form. |
-| `items` | The element type of an `array` field: an object with `type`, and `fields` for objects. |
+| `items` | The element type of an `array` field: an object with `type`, and `nullable`, `fields`, `items` or `description` as needed. |
 | `description` | Text for the generated client. |
 
 Use `any` for a value the handler passes through, such as workflow input. The
 document marks it `x-harvest-any`, so a reader can tell it from a field with no
 type yet. A bare name has no type.
 
+The transform rejects an unknown key, a type outside the list, `nullable`
+without a concrete type, and a non-boolean `required` or `nullable`. It also
+rejects an empty `fields` list, because that closes the object.
+
 The routes in `autumn_harvest_plugin::openapi::CORE_CLIENT_ROUTES` must type
-every field. `tests/openapi_response_conformance.rs` checks each type against
-the live handler.
+every field, and every array element. `tests/openapi_response_conformance.rs`
+checks each type against the live handler.
 
 ---
 

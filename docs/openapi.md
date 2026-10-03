@@ -34,12 +34,13 @@ collides. Axum then rejects the duplicate `GET /openapi.json` at startup.
 
 ## Use the published TypeScript client
 
-Each GitHub release attaches `autumn-harvest-client`, a client built from
-[`docs/openapi.json`](openapi.json). You do not need a running Harvest to
-install it or to write code against it (issue #1616).
+Each GitHub release after 0.6.0 attaches `autumn-harvest-client`, a client
+built from [`docs/openapi.json`](openapi.json). You do not need a running
+Harvest to install it or to write code against it (issue #1616). Replace
+`<version>` with your server's version:
 
 ```sh
-npm install https://github.com/autumn-foundation/autumn-harvest/releases/download/v0.6.0/autumn-harvest-client-0.6.0.tgz
+npm install https://github.com/autumn-foundation/autumn-harvest/releases/download/v<version>/autumn-harvest-client-<version>.tgz
 ```
 
 The package version is the crate version. See
@@ -118,9 +119,10 @@ compiles the workspace, which is the slow part; the client steps take seconds.
 - **Most response properties are open.** The contract records field names, and
   sometimes a type, not full JSON Schemas. A generator therefore types most
   response properties as `unknown` / `any`. The core lifecycle routes are the
-  exception: every field has a type. The list is
-  `autumn_harvest_plugin::openapi::CORE_CLIENT_ROUTES`. A field that holds any
-  JSON value, such as workflow input, carries `x-harvest-any`. Per-workflow
+  exception: every field declares a type. The list is
+  `autumn_harvest_plugin::openapi::CORE_CLIENT_ROUTES`. On those routes, a
+  field that holds any JSON value, such as workflow input, carries
+  `x-harvest-any`. A client sees it as `unknown`. Per-workflow
   message schemas are a different contract; see
   `GET /workflows/registered/{name}/schema`.
 - **Streaming routes** declare `text/event-stream` with a string body. The
@@ -173,9 +175,10 @@ Six checks hold the chain together:
    reads a body parsed from raw `Bytes`. A type the audit cannot resolve
    fails the check.
 6. `openapi_response_conformance` drives each core lifecycle route against
-   Postgres. It checks every body against the published schema. An
-   undeclared key, a wrong type, an undeclared `null` or a missing required
-   key fails it. `openapi_spec::core_client_routes_type_every_response_field`
+   Postgres. It asserts the status of each response shape, and checks every
+   body against the published schema. An undeclared key, a wrong type, an
+   undeclared `null`, an array with no element type or a missing required key
+   fails it. `openapi_spec::core_client_routes_type_every_response_field`
    fails when a core route loses a type.
 
 ## Why the document is derived, not annotated

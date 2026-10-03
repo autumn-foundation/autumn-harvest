@@ -4,14 +4,20 @@
 //!
 //! The published TypeScript client trusts the types on
 //! `CORE_CLIENT_ROUTES`. This suite drives each of those routes against
-//! Postgres and checks every body against the published schema. The check
-//! is strict:
+//! Postgres. It checks every body against the published schema, and each
+//! step asserts the status it expects. The check is strict:
 //!
-//! * Each property in a body must be declared. An undeclared key fails, so a
-//!   contract that omits a field fails.
+//! * The schema must declare each key in a body. An undeclared key fails, so
+//!   a contract that omits a field fails.
 //! * Each declared property must carry a type, or `x-harvest-any`.
-//! * Each value must match its type. `null` must be declared.
+//! * An `array` must type its elements.
+//! * Each value must match its type. The schema must declare `null`.
 //! * Each `required` property must be present.
+//!
+//! The check is stricter than JSON Schema on purpose. JSON Schema treats an
+//! unset `additionalProperties` as open. This check treats it as closed,
+//! because an undeclared key means the contract is incomplete. Only an object
+//! with `additionalProperties: true` is open here.
 //!
 //! The suite uses `HARVEST_TEST_DATABASE_URL` when it is set. Otherwise it
 //! starts a testcontainers Postgres.
@@ -238,7 +244,11 @@ fn check(value: &Value, schema: &Value, at: &str, errors: &mut Vec<String>) {
             }
         }
     }
-    if let (Value::Array(items), Some(item_schema)) = (value, schema.get("items")) {
+    if let Value::Array(items) = value {
+        let Some(item_schema) = schema.get("items") else {
+            errors.push(format!("{at}: the array schema declares no `items`"));
+            return;
+        };
         for (index, item) in items.iter().enumerate() {
             check(item, item_schema, &format!("{at}[{index}]"), errors);
         }
@@ -253,13 +263,16 @@ struct Conformance {
 }
 
 impl Conformance {
-    /// Check one response against the published document.
-    fn record(&mut self, method: &str, route: &str, status: StatusCode, body: &Value) {
-        assert!(
-            status.is_success(),
-            "{method} {route}: expected a 2xx, got {status}: {body}"
-        );
+    /// Assert the expected status, then check the body against the document.
+    fn record(
+        &mut self,
+        method: &str,
+        route: &str,
+        expected: StatusCode,
+        (status, body): &(StatusCode, Value),
+    ) {
         let at = format!("{method} {route} {}", status.as_u16());
+        assert_eq!(*status, expected, "{at}: unexpected status. Body: {body}");
         let response = &openapi_document()["paths"][route][method.to_lowercase()]["responses"]
             [status.as_str()];
         assert!(response.is_object(), "{at}: the status is not documented");
@@ -287,6 +300,18 @@ async fn start(app: &axum::Router, workflow: &str, body: Value) -> (StatusCode, 
     .await
 }
 
+/// POST `body` to `/workflows/{id}/{action}`.
+async fn act(app: &axum::Router, id: &str, action: &str, body: Value) -> (StatusCode, Value) {
+    call(
+        app,
+        "POST",
+        &format!("/workflows/{id}/{action}"),
+        Some(body),
+        &[],
+    )
+    .await
+}
+
 #[tokio::test]
 async fn core_routes_match_their_published_schema() {
     let (url, _container) = setup_db().await;
@@ -294,22 +319,34 @@ async fn core_routes_match_their_published_schema() {
     let run = uuid::Uuid::new_v4();
     let mut seen = Conformance::default();
     let start_route = "/workflows/{workflow_name}/start";
+    let (ok, created, accepted) = (StatusCode::OK, StatusCode::CREATED, StatusCode::ACCEPTED);
 
-    let (status, body) = call(&app, "GET", "/health", None, &[]).await;
-    seen.record("GET", "/health", status, &body);
+    let health = call(&app, "GET", "/health", None, &[]).await;
+    seen.record("GET", "/health", ok, &health);
 
-    // A fresh start: 201.
-    let (status, started) = start(&app, PLAIN, json!({ "workflow_id": format!("a-{run}") })).await;
-    seen.record("POST", start_route, status, &started);
-    let exec_id = started["execution_id"]
+    // A fresh start. The timeout and SLA make the duration arrays non-null.
+    let body = json!({
+        "workflow_id": format!("a-{run}"),
+        "execution_timeout_secs": 3600,
+        "sla_secs": 600,
+    });
+    let started = start(&app, PLAIN, body).await;
+    seen.record("POST", start_route, created, &started);
+    let exec_id = started.1["execution_id"]
         .as_str()
         .expect("execution_id")
         .to_owned();
 
-    // An idempotent replay: 200 with `deduplicated`.
+    // Attach to the running run: 200 with `started_fresh: false`.
+    let body = json!({ "workflow_id": format!("a-{run}"), "conflict_policy": "use_existing" });
+    let attached = start(&app, PLAIN, body).await;
+    seen.record("POST", start_route, ok, &attached);
+    assert_eq!(attached.1["started_fresh"], false);
+
+    // An idempotency key: 201, then a 200 replay with `deduplicated`.
     let key = format!("key-{run}");
-    for _ in 0..2 {
-        let (status, body) = call(
+    for (expected, deduplicated) in [(created, false), (ok, true)] {
+        let response = call(
             &app,
             "POST",
             &format!("/workflows/{PLAIN}/start"),
@@ -317,91 +354,94 @@ async fn core_routes_match_their_published_schema() {
             &[("idempotency-key", key.as_str())],
         )
         .await;
-        seen.record("POST", start_route, status, &body);
+        seen.record("POST", start_route, expected, &response);
+        assert_eq!(response.1["deduplicated"], deduplicated);
     }
 
     // A pinned start echoes `shard_id`.
-    let (status, body) = start(
-        &app,
-        PLAIN,
-        json!({ "workflow_id": format!("c-{run}"), "shard_id": 0 }),
-    )
-    .await;
-    seen.record("POST", start_route, status, &body);
+    let body = json!({ "workflow_id": format!("c-{run}"), "shard_id": 0 });
+    let pinned = start(&app, PLAIN, body).await;
+    seen.record("POST", start_route, created, &pinned);
+    assert_eq!(pinned.1["shard_id"], 0);
 
-    // The deferred and batched shapes.
+    // The deferred and batched shapes, each with its discriminator. The
+    // throttle burst is one, so the second throttled start defers.
     let tenant = json!({ "tenant_id": format!("t-{run}") });
-    for workflow in [DEBOUNCED, BATCHED, FLUSHED, THROTTLED, THROTTLED] {
+    let shapes = [
+        (DEBOUNCED, accepted, "debounced"),
+        (BATCHED, accepted, "batched"),
+        (FLUSHED, created, "flushed"),
+        (THROTTLED, created, ""),
+        (THROTTLED, accepted, "throttled"),
+    ];
+    for (workflow, expected, flag) in shapes {
         let body = json!({ "workflow_id": uuid::Uuid::new_v4().to_string(), "input": tenant });
-        let (status, body) = start(&app, workflow, body).await;
-        seen.record("POST", start_route, status, &body);
+        let response = start(&app, workflow, body).await;
+        seen.record("POST", start_route, expected, &response);
+        if !flag.is_empty() {
+            assert_eq!(response.1[flag], true, "{workflow}: {}", response.1);
+        }
     }
 
-    let (status, body) = call(&app, "GET", &format!("/workflows/{exec_id}"), None, &[]).await;
-    seen.record("GET", "/workflows/{id}", status, &body);
+    let uri = format!("/workflows/{exec_id}");
+    let status = call(&app, "GET", &uri, None, &[]).await;
+    seen.record("GET", "/workflows/{id}", ok, &status);
+    assert!(status.1["execution"]["execution_timeout"].is_array());
+    assert!(status.1["execution"]["sla"].is_array());
 
     // A running execution has no result yet: 204.
-    let (status, body) = call(
-        &app,
+    let result_uri = format!("/workflows/{exec_id}/result");
+    let pending = call(&app, "GET", &result_uri, None, &[]).await;
+    seen.record(
         "GET",
-        &format!("/workflows/{exec_id}/result"),
-        None,
-        &[],
-    )
-    .await;
-    seen.record("GET", "/workflows/{id}/result", status, &body);
+        "/workflows/{id}/result",
+        StatusCode::NO_CONTENT,
+        &pending,
+    );
 
-    let (status, body) = call(
+    let signalled = act(
         &app,
-        "POST",
-        &format!("/workflows/{exec_id}/signal/go"),
-        Some(json!({ "payload": { "n": 1 } })),
-        &[],
+        &exec_id,
+        "signal/go",
+        json!({ "payload": { "n": 1 } }),
     )
     .await;
     seen.record(
         "POST",
         "/workflows/{id}/signal/{signal_name}",
-        status,
-        &body,
+        accepted,
+        &signalled,
     );
 
-    let (status, body) = call(
-        &app,
-        "POST",
-        &format!("/workflows/{exec_id}/cancel"),
-        Some(json!({ "reason": "conformance" })),
-        &[],
-    )
-    .await;
-    seen.record("POST", "/workflows/{id}/cancel", status, &body);
+    // Cancel twice: the second is an idempotent no-op with the same shape.
+    for newly in [true, false] {
+        let cancelled = act(&app, &exec_id, "cancel", json!({ "reason": "conformance" })).await;
+        seen.record("POST", "/workflows/{id}/cancel", accepted, &cancelled);
+        assert_eq!(cancelled.1["newly_cancelled"], newly);
+    }
 
     // A cancelled execution has a result: 200.
-    let (status, body) = call(
-        &app,
-        "GET",
-        &format!("/workflows/{exec_id}/result"),
-        None,
-        &[],
-    )
-    .await;
-    seen.record("GET", "/workflows/{id}/result", status, &body);
+    let outcome = call(&app, "GET", &result_uri, None, &[]).await;
+    seen.record("GET", "/workflows/{id}/result", ok, &outcome);
 
     // Status after cancel carries `completed_at` and history.
-    let (status, body) = call(&app, "GET", &format!("/workflows/{exec_id}"), None, &[]).await;
-    seen.record("GET", "/workflows/{id}", status, &body);
+    let status = call(&app, "GET", &uri, None, &[]).await;
+    seen.record("GET", "/workflows/{id}", ok, &status);
 
+    // Terminate twice: the second is an idempotent no-op.
     let (_, other) = start(&app, PLAIN, json!({ "workflow_id": format!("d-{run}") })).await;
     let other_id = other["execution_id"].as_str().expect("execution_id");
-    let (status, body) = call(
-        &app,
-        "POST",
-        &format!("/workflows/{other_id}/terminate"),
-        Some(json!({ "reason": "conformance" })),
-        &[],
-    )
-    .await;
-    seen.record("POST", "/workflows/{id}/terminate", status, &body);
+    for newly in [true, false] {
+        let terminated = act(
+            &app,
+            other_id,
+            "terminate",
+            json!({ "reason": "conformance" }),
+        )
+        .await;
+        seen.record("POST", "/workflows/{id}/terminate", accepted, &terminated);
+        assert_eq!(terminated.1["newly_terminated"], newly);
+    }
 
     for (method, route) in CORE_CLIENT_ROUTES {
         assert!(

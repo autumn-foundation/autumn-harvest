@@ -10,8 +10,8 @@ note only. It contains no code.
 
 ## 0. Planning record
 
-The work was planned with three techniques. The rejected rows are kept,
-because they explain the scope.
+Three techniques shape this plan. This note keeps the rejected rows, because
+they explain the scope.
 
 ### 0.1 Brainstorm — how can a non-Rust consumer get a client?
 
@@ -23,7 +23,7 @@ because they explain the scope.
 | B4 | Attach an `npm pack` tarball to the GitHub release. | **Adopted.** It needs no new secret. `npm install <url>` installs it. |
 | B5 | Check the generated `.ts` file into the tree. | Rejected. It doubles the drift surface. The build makes it from `docs/openapi.json`, which a test already pins. |
 | B6 | Ship clients for Python, Go and Java too. | Rejected for now. Each language adds a toolchain to CI. `docs/openapi.md` already shows the generator commands. |
-| B7 | Type every response field before the first release. | Rejected. That is 868 fields on 147 routes. A wrong type is worse than `unknown`, and each type needs proof. |
+| B7 | Type every response field before the first release. | Rejected. 868 top-level fields on 116 operations have no type. A wrong type is worse than `unknown`, and each type needs proof. |
 | B8 | Type the core lifecycle routes now, and prove each type against the real handler. | **Adopted.** See §1.1. |
 | B9 | Wrap `openapi-fetch` in a small `createHarvestClient` function. | **Adopted.** The package then gives a client, not only types. |
 
@@ -35,7 +35,7 @@ because they explain the scope.
 | R2 | Publish a client whose version does not match the server. | The package version must equal the crate version. `openapi_spec` pins this. The release job fails when the tag differs. |
 | R3 | Create the GitHub release, then fail to build the client. | The release job builds the client before it creates the release. |
 | R4 | Let the client build break without notice between releases. | The `typescript-client-package` CI job builds and tests it on each pull request. |
-| R5 | Add a type name that no generator knows (`int`, `str`). | The transform rejects a type outside the JSON Schema set. |
+| R5 | Add a type name that no generator knows (`int`, `str`), or misspell a key. | The transform rejects a type outside the contract set and an unknown field key. |
 | R6 | Remove a type from a core route later. | `openapi_spec::core_client_routes_type_every_response_field` fails. |
 | R7 | Publish under an npm name that the project does not own. | No registry publish. See B3. |
 | R8 | Make the client need a running app again. | The build reads `docs/openapi.json` only. The CI job has no service container. |
@@ -44,10 +44,10 @@ because they explain the scope.
 
 | Hat | Finding |
 |-----|---------|
-| White (facts) | 89 of 957 response properties had a type. #1411 typed every parameter. Request bodies already have types. The release pipeline makes a GitHub release only. It publishes no crate. |
+| White (facts) | Before this change, 89 of 957 top-level response properties have a type. #1411 typed every parameter. Request bodies list their fields, but most field values have no type. The release pipeline makes a GitHub release only. It publishes no crate. |
 | Red (feeling) | A client full of `unknown` feels unfinished. The first call a consumer makes (start, then status) must feel typed. |
 | Black (risk) | A wrong type is a silent bug in each consumer. Release-time code runs rarely, so a break there hides for weeks. |
-| Yellow (benefit) | Paths, methods, parameters and bodies are typed today. With typed core responses, a consumer writes a full start-and-poll loop with no casts. |
+| Yellow (benefit) | Paths, methods and parameters have types today. With typed core responses, a consumer writes a full start-and-poll loop with no casts. |
 | Green (ideas) | Allow `nullable` and nested `fields` in the contract, so `execution.state` gets a type. Grow the typed set route by route after this change. |
 | Blue (process) | Decide the typing question first, as the issue asks. Then TDD: red tests, green code, refactor. Part 2 stays a note. |
 
@@ -73,17 +73,26 @@ These routes get a type on every response field:
 | `GET /health` | Check that the server is ready. |
 
 Other routes keep open properties. A type moves into the set when a test can
-prove it. The list lives in `CORE_CLIENT_ROUTES` in `openapi_spec.rs`.
+prove it. The list is `CORE_CLIENT_ROUTES` in `autumn_harvest_plugin::openapi`
+(`src/openapi.rs`).
+
+A value that the handler passes through, such as workflow input, has the type
+`any`. A client sees it as `unknown`. No live test creates an external
+hand-off yet, so the elements of `external_handoffs` are `any` too.
 
 ### 1.2 Contract additions
 
-A response field object can now carry:
+A contract field object can now carry:
 
-- `type`: one of `string`, `integer`, `number`, `boolean`, `object`, `array`.
-  The transform rejects any other name.
+- `type`: one of `string`, `integer`, `number`, `boolean`, `object`, `array`
+  or `any`. `any` publishes `x-harvest-any`. The transform rejects any other
+  name.
 - `nullable: true`: the field can be JSON `null`. OpenAPI 3.1 writes this as
   `"type": ["string", "null"]`.
 - `fields`: the properties of an `object` field, in the same form.
+- `items`: the element type of an `array` field.
+
+The transform rejects an unknown key, so a typo fails the build.
 
 ### 1.3 Package and pipeline
 
@@ -98,7 +107,8 @@ A response field object can now carry:
 
 - **npm registry publish.** It needs a package name and an `NPM_TOKEN`
   secret. Add one step after `npm pack` when a maintainer decides both.
-- **Types for the other 140 routes.** Each one needs its own proof.
+- **Types for the other routes.** 797 top-level fields on 109 operations have
+  no type. Each one needs its own proof.
 
 ---
 
@@ -124,20 +134,22 @@ embedder's own `main`.
 
 | # | Option | Verdict |
 |---|--------|---------|
-| S1 | A prebuilt binary that loads workflows from a Rust `dylib`. | Rejected. Rust has no stable ABI. The `dylib` must use the same compiler and the same crate versions. That is a hidden build coupling, and a mismatch is undefined behavior. |
-| S2 | A prebuilt binary that runs workflows as WASM modules. | Rejected. `wasm-activities` (#965) sandboxes **activities**, not workflows. Replay needs deterministic workflow code in the engine. ADR 0002 keeps workflow authoring in Rust. |
+| S1 | A prebuilt binary that loads workflows from a Rust `dylib`. | Rejected. Rust has no stable ABI. The `dylib` must use the same compiler and the same crate versions. That is a hidden build coupling. A mismatch causes undefined behavior. The `hot-code-swap` spike (#967, §3) calls `dylib` hosting a permanent no-go. |
+| S2 | A prebuilt binary that runs workflows as WASM modules. | Rejected for now. `wasm-activities` (#965) runs activities only. The `hot-code-swap` spike (#967) runs WASM workflows. Its §9 verdict is a no-go for full `WorkflowContext` parity (T3). The sequential-shape tier (T2) is a conditional go, and only after WASM activities ship (T1). ADR 0002 keeps workflow authoring in Rust. |
 | S3 | A remote worker protocol for workflows in other languages. | Rejected by ADR 0002. |
-| S4 | A documented thin-binary pattern: the embedder writes a small `main` that registers workflows and calls `HarvestEmbedding`. | **Recommended.** `examples/standalone-runner` already is this binary. |
+| S4 | A documented thin-binary pattern: the embedder writes a small `main` that registers workflows and calls `HarvestEmbedding`. | **Recommended.** `HarvestEmbedding` wraps `HarvestRunner`, so this is the issue's "thin binary around `HarvestRunner`". `examples/standalone-runner` already is this binary. |
 | S5 | A `cargo generate` template made from S4. | Recommended as the next step. It gives a non-Rust shop one command to a buildable server crate. |
 
 ### 2.4 Recommendation
 
-Do not ship a prebuilt `harvest-server`. Workflows are Rust code, so the
-binary must be compiled with them. The embedder's binary is the server.
+Do not ship a prebuilt `harvest-server`. Workflows are Rust code, so the same
+build must compile the binary and the workflows. The embedder's binary is the
+server.
 
 Promote `examples/standalone-runner` as the reference server. The next issue
 makes a `cargo generate` template from it. The template removes the example
-`order` workflow and leaves one registration point. A non-Rust shop then
+`standalone_order` and `standalone_shipping` workflows and leaves one
+registration point. A non-Rust shop then
 writes Rust workflow functions only. It writes no web code and makes no
 `autumn-web` decision. It talks to the server through the published client.
 

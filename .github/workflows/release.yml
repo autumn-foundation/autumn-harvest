@@ -63,13 +63,18 @@ jobs:
             echo "::error::clients/typescript/package.json is ${version}, the tag is ${GITHUB_REF_NAME}"
             exit 1
           fi
-          tarball="$(scripts/build-typescript-client.sh | tail -n 1)"
-          test "$(basename "${tarball}")" = "autumn-harvest-client-${version}.tgz"
+          # The script logs to stderr. Its stdout is the tarball path only.
+          tarball="$(scripts/build-typescript-client.sh)"
+          if [ "$(basename "${tarball}")" != "autumn-harvest-client-${version}.tgz" ]; then
+            echo "::error::the client packed as $(basename "${tarball}"), not autumn-harvest-client-${version}.tgz"
+            exit 1
+          fi
           echo "tarball=${tarball}" >> "$GITHUB_OUTPUT"
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
           files: ${{ steps.client.outputs.tarball }}
+          fail_on_unmatched_files: true
           body_path: RELEASE_NOTES.md
           draft: false
           prerelease: ${{ contains(github.ref, '-alpha') || contains(github.ref, '-beta') || contains(github.ref, '-rc') }}

@@ -17,7 +17,7 @@
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
+      "default": "./dist/index.js"
     }
   },
   "files": [
@@ -27,8 +27,11 @@
   "sideEffects": false,
   "scripts": {
     "generate": "openapi-typescript ../../docs/openapi.json -o src/harvest-api.ts",
+    "pretypecheck": "npm run generate",
     "typecheck": "tsc --noEmit",
+    "pretest": "npm run generate",
     "test": "tsx --test test/*.test.ts",
+    "prebuild": "npm run generate",
     "build": "rm -rf dist && tsc -p tsconfig.build.json"
   },
   "dependencies": {

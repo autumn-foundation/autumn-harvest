@@ -508,7 +508,10 @@
                 "type": "array",
                 "nullable": true,
                 "required": true,
-                "description": "A duration as [seconds, nanoseconds]."
+                "description": "A duration as [seconds, nanoseconds].",
+                "items": {
+                  "type": "integer"
+                }
               },
               {
                 "name": "deadline_at",
@@ -522,7 +525,10 @@
                 "type": "array",
                 "nullable": true,
                 "required": true,
-                "description": "A duration as [seconds, nanoseconds]."
+                "description": "A duration as [seconds, nanoseconds].",
+                "items": {
+                  "type": "integer"
+                }
               },
               {
                 "name": "chain_deadline_at",
@@ -607,7 +613,10 @@
                 "type": "array",
                 "nullable": true,
                 "required": true,
-                "description": "A duration as [seconds, nanoseconds]."
+                "description": "A duration as [seconds, nanoseconds].",
+                "items": {
+                  "type": "integer"
+                }
               },
               {
                 "name": "sla_deadline_at",
@@ -814,7 +823,11 @@
             "name": "external_handoffs",
             "type": "array",
             "required": true,
-            "description": "Pending external activity hand-offs."
+            "description": "Pending external activity hand-offs.",
+            "items": {
+              "type": "any",
+              "description": "One pending hand-off. No live test creates one yet, so the shape stays open."
+            }
           },
           {
             "name": "last_completion_result",
@@ -1805,44 +1818,14 @@
             "description": "The execution state, such as `RUNNING`. Attach and dedup return the state of the existing run."
           },
           {
-            "name": "debounced",
-            "type": "boolean",
-            "description": "Debounce only. The 202 carries it, not this status."
-          },
-          {
-            "name": "debounce_key",
-            "type": "string",
-            "description": "Debounce only. The 202 carries it, not this status."
-          },
-          {
-            "name": "fire_at",
-            "type": "string",
-            "description": "Debounce and batch only. The 202 carries it, not this status."
-          },
-          {
-            "name": "pending_count",
-            "type": "integer",
-            "description": "Debounce and batch only. The 202 carries it, not this status."
-          },
-          {
             "name": "batched",
             "type": "boolean",
-            "description": "Present and true when a batch flushed at once. That is a 201."
+            "description": "Present and true when an event batch flushed at once."
           },
           {
             "name": "flushed",
             "type": "boolean",
-            "description": "Present and true when a batch flushed at once. That is a 201."
-          },
-          {
-            "name": "batch_key",
-            "type": "string",
-            "description": "Batch only. The 202 carries it, not this status."
-          },
-          {
-            "name": "max_size",
-            "type": "integer",
-            "description": "Batch only. The 202 carries it, not this status."
+            "description": "Present and true when an event batch flushed at once."
           },
           {
             "name": "started_fresh",
@@ -1889,46 +1872,6 @@
               "description": "The execution state, such as `RUNNING`. Attach and dedup return the state of the existing run."
             },
             {
-              "name": "debounced",
-              "type": "boolean",
-              "description": "Debounce only. The 202 carries it, not this status."
-            },
-            {
-              "name": "debounce_key",
-              "type": "string",
-              "description": "Debounce only. The 202 carries it, not this status."
-            },
-            {
-              "name": "fire_at",
-              "type": "string",
-              "description": "Debounce and batch only. The 202 carries it, not this status."
-            },
-            {
-              "name": "pending_count",
-              "type": "integer",
-              "description": "Debounce and batch only. The 202 carries it, not this status."
-            },
-            {
-              "name": "batched",
-              "type": "boolean",
-              "description": "Present and true when a batch flushed at once. That is a 201."
-            },
-            {
-              "name": "flushed",
-              "type": "boolean",
-              "description": "Present and true when a batch flushed at once. That is a 201."
-            },
-            {
-              "name": "batch_key",
-              "type": "string",
-              "description": "Batch only. The 202 carries it, not this status."
-            },
-            {
-              "name": "max_size",
-              "type": "integer",
-              "description": "Batch only. The 202 carries it, not this status."
-            },
-            {
               "name": "started_fresh",
               "type": "boolean",
               "description": "Present when the request sends `conflict_policy` or an idempotency key."
@@ -1972,12 +1915,14 @@
             {
               "name": "workflow_name",
               "type": "string",
-              "description": "The workflow type the deferred start names."
+              "description": "The workflow type the deferred start names.",
+              "required": true
             },
             {
               "name": "workflow_id",
               "type": "string",
-              "description": "The business id the deferred start reserved."
+              "description": "The business id the deferred start reserved.",
+              "required": true
             },
             {
               "name": "debounce_key",

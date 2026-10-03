@@ -839,25 +839,62 @@ async fn served_endpoint_returns_the_document() {
 /// The repository root, resolved from this crate.
 const REPO_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
 
-/// Read a file below the repository root.
+/// Read a file below the repository root, with CRLF normalized away.
+///
+/// A Windows checkout writes `.yml` files with CRLF, and `openapi_spec` runs
+/// on Windows too.
 fn repo_file(relative: &str) -> String {
     let path = format!("{REPO_ROOT}/{relative}");
-    std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {path}: {error}"))
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {path}: {error}"))
+        .replace("\r\n", "\n")
 }
 
 /// Collect each property path below `schema` that has no `type`. A field
-/// marked `x-harvest-any` is open by declaration, so it counts as typed.
+/// marked `x-harvest-any` is open by declaration, so it counts as typed. An
+/// `array` must also type its elements.
 fn untyped_properties(schema: &Value, prefix: &str, out: &mut Vec<String>) {
     for (name, property) in schema["properties"].as_object().into_iter().flatten() {
-        let path = format!("{prefix}.{name}");
-        if property.get("type").is_none() && property["x-harvest-any"] != true {
-            out.push(path.clone());
-        }
-        untyped_properties(property, &path, out);
-        if let Some(items) = property.get("items") {
-            untyped_properties(items, &format!("{path}[]"), out);
-        }
+        untyped_schema(property, &format!("{prefix}.{name}"), out);
     }
+}
+
+/// Check one property or element schema, then the schemas below it.
+fn untyped_schema(schema: &Value, path: &str, out: &mut Vec<String>) {
+    if schema["x-harvest-any"] == true {
+        return;
+    }
+    let Some(declared) = schema.get("type") else {
+        out.push(path.to_owned());
+        return;
+    };
+    let is_array = declared == "array"
+        || declared
+            .as_array()
+            .is_some_and(|t| t.contains(&"array".into()));
+    match schema.get("items") {
+        Some(items) => untyped_schema(items, &format!("{path}[]"), out),
+        None if is_array => out.push(format!("{path}[]")),
+        None => {}
+    }
+    untyped_properties(schema, path, out);
+}
+
+#[test]
+fn untyped_properties_flags_open_arrays_and_missing_types() {
+    let schema = serde_json::json!({
+        "properties": {
+            "ok": { "type": "string" },
+            "open": { "x-harvest-any": true },
+            "bare": {},
+            "list": { "type": ["array", "null"] },
+            "rows": { "type": "array", "items": { "type": "object", "properties": { "x": {} } } },
+        },
+    });
+    let mut out = Vec::new();
+    untyped_properties(&schema, "r", &mut out);
+    out.sort();
+    assert_eq!(out, ["r.bare", "r.list[]", "r.rows[].x"]);
 }
 
 /// Issue #1616: the published client types every success field of the core
@@ -883,6 +920,10 @@ fn core_client_routes_type_every_response_field() {
             if schema.is_null() {
                 continue;
             }
+            assert!(
+                schema["properties"].is_object(),
+                "{method} {path} {status}: the body has no field list, so it reaches clients as `unknown`"
+            );
             typed_success = true;
             untyped_properties(schema, &format!("{method} {path} {status}"), &mut untyped);
         }
@@ -929,13 +970,28 @@ fn job_block<'a>(yaml: &'a str, job: &str) -> &'a str {
 /// True when the first line of `rest` opens a top-level job.
 fn is_job_header(rest: &str) -> bool {
     let line = rest.lines().next().unwrap_or_default();
-    line.starts_with("  ") && !line.starts_with("   ") && line.trim_end().ends_with(':')
+    line.starts_with("  ")
+        && !line.starts_with("   ")
+        && !line.trim_start().starts_with('#')
+        && line.trim_end().ends_with(':')
+}
+
+/// `block` without its comment lines, so a comment cannot satisfy a check.
+fn without_comments(block: &str) -> String {
+    block
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[test]
 fn job_block_stops_at_the_next_job() {
-    let yaml = "jobs:\n  a:\n    steps:\n      - run: one\n  b:\n    steps:\n      - run: two\n";
-    assert_eq!(job_block(yaml, "a"), "  a:\n    steps:\n      - run: one\n");
+    let yaml = "jobs:\n  a:\n    steps:\n      - run: one\n  # note:\n  b:\n    steps:\n      - run: two\n";
+    assert_eq!(
+        job_block(yaml, "a"),
+        "  a:\n    steps:\n      - run: one\n  # note:\n"
+    );
     assert_eq!(job_block(yaml, "b"), "  b:\n    steps:\n      - run: two\n");
 }
 
@@ -944,7 +1000,7 @@ fn job_block_stops_at_the_next_job() {
 #[test]
 fn the_release_pipeline_builds_and_attaches_the_client() {
     let release = repo_file(".github/workflows/release.yml");
-    let job = job_block(&release, "release");
+    let job = without_comments(job_block(&release, "release"));
     let build = job
         .find("scripts/build-typescript-client.sh")
         .expect("the release job must run scripts/build-typescript-client.sh");
@@ -970,7 +1026,7 @@ fn the_release_pipeline_builds_and_attaches_the_client() {
 #[test]
 fn ci_builds_the_client_package() {
     let ci = repo_file(".github/workflows/ci.yml");
-    let job = job_block(&ci, "typescript-client-package");
+    let job = without_comments(job_block(&ci, "typescript-client-package"));
     assert!(job.contains("scripts/build-typescript-client.sh"));
     assert!(
         !job.contains("services:"),
