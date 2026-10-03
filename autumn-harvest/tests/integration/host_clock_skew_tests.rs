@@ -167,9 +167,10 @@ async fn record_heartbeat_stamps_the_database_clock() {
     assert_eq!(claimed.id, task);
     let claim = TaskClaim::of(&claimed).expect("claim");
 
-    queue::record_heartbeat(&mut conn, &claim, serde_json::json!({"step": 1}))
+    let write = queue::record_heartbeat(&mut conn, &claim, serde_json::json!({"step": 1}))
         .await
         .expect("heartbeat");
+    assert!(matches!(write, queue::ClaimWrite::Applied));
 
     let stamp = read_column(&mut conn, "last_heartbeat_at", task).await;
     assert_on_db_clock(&mut conn, "last_heartbeat_at", stamp).await;
@@ -203,9 +204,10 @@ async fn a_fresh_heartbeat_is_not_a_false_heartbeat_timeout() {
     );
 
     let claim = TaskClaim::of(&claimed).expect("claim");
-    queue::record_heartbeat(&mut conn, &claim, serde_json::json!({}))
+    let write = queue::record_heartbeat(&mut conn, &claim, serde_json::json!({}))
         .await
         .expect("heartbeat");
+    assert!(matches!(write, queue::ClaimWrite::Applied));
 
     assert_eq!(
         heartbeat_scan_hits(&mut conn, task).await,

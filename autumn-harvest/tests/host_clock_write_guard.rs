@@ -243,6 +243,10 @@ fn no_host_clock_write_to_timeout_scan_columns() {
     );
 }
 
+fn assert_clean(source: &str) {
+    assert_eq!(violations(source), Vec::<(usize, String)>::new());
+}
+
 #[test]
 fn scanner_flags_a_host_clock_heartbeat() {
     let source = "x.set(dsl::last_heartbeat_at.eq(Some(Utc::now())));";
@@ -258,27 +262,27 @@ fn scanner_flags_a_struct_field_write() {
 #[test]
 fn scanner_ignores_unrelated_columns() {
     let source = "x.set(dsl::completed_at.eq(Some(Utc::now())));";
-    assert!(violations(source).is_empty());
+    assert_clean(source);
 }
 
 #[test]
 fn scanner_accepts_a_marked_write() {
     let same_line = "dsl::scheduled_at.eq(Utc::now()) // host-clock-ok: demo";
     let line_above = "// host-clock-ok: demo\ndsl::scheduled_at.eq(Utc::now())";
-    assert!(violations(same_line).is_empty());
-    assert!(violations(line_above).is_empty());
+    assert_clean(same_line);
+    assert_clean(line_above);
 }
 
 #[test]
 fn scanner_skips_the_test_module() {
     let source = "#[cfg(test)]\nmod tests {\n    dsl::scheduled_at.eq(Utc::now());\n}";
-    assert!(violations(source).is_empty());
+    assert_clean(source);
 }
 
 #[test]
 fn scanner_accepts_a_database_clock_write() {
     let source = "dsl::last_heartbeat_at.eq(sql::<Nullable<Timestamptz>>(\"clock_timestamp()\"))";
-    assert!(violations(source).is_empty());
+    assert_clean(source);
 }
 
 #[test]
@@ -305,13 +309,13 @@ fn scanner_flags_a_qualified_path_and_a_local_binding() {
 
 #[test]
 fn scanner_ignores_a_longer_column_name() {
-    assert!(violations("let my_scheduled_at = Utc::now();").is_empty());
-    assert!(violations("if scheduled_at == Utc::now() {}").is_empty());
+    assert_clean("let my_scheduled_at = Utc::now();");
+    assert_clean("if scheduled_at == Utc::now() {}");
 }
 
 #[test]
 fn scanner_ignores_a_comment() {
-    assert!(violations("// scheduled_at: Utc::now() is wrong").is_empty());
+    assert_clean("// scheduled_at: Utc::now() is wrong");
 }
 
 #[test]
@@ -330,11 +334,11 @@ fn scanner_keeps_scanning_after_a_not_test_module() {
 fn scanner_skips_a_test_module_with_an_extra_attribute() {
     let source =
         "#[cfg(test)]\n#[allow(clippy::all)]\nmod tests {\n scheduled_at.eq(Utc::now());\n}";
-    assert!(violations(source).is_empty());
+    assert_clean(source);
 }
 
 #[test]
 fn scanner_accepts_a_marker_above_a_split_call() {
     let source = "// host-clock-ok: demo\ndsl::scheduled_at\n    .eq(Utc::now())";
-    assert!(violations(source).is_empty());
+    assert_clean(source);
 }
