@@ -14157,10 +14157,16 @@ pub struct StampedHeartbeat {
     /// The heartbeat payload.
     pub details: serde_json::Value,
     /// When the activity sent the heartbeat, by the monotonic clock. The
-    /// flusher orders heartbeats by it, because the wall clock can step back.
-    /// The flush writes the database clock minus the age of this time.
+    /// flush writes the database clock minus the age of this time.
     pub sent_order: std::time::Instant,
+    /// The stamp order. Each stamp takes the next value of one counter, so
+    /// two stamps never tie. The flusher keeps the heartbeat with the
+    /// highest value.
+    pub sequence: u64,
 }
+
+/// The next [`StampedHeartbeat::sequence`] (issue #1788).
+static NEXT_HEARTBEAT_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl StampedHeartbeat {
     /// Stamp `details` with the current time.
@@ -14169,6 +14175,7 @@ impl StampedHeartbeat {
         Self {
             details,
             sent_order: std::time::Instant::now(),
+            sequence: NEXT_HEARTBEAT_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
     }
 }

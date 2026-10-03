@@ -937,6 +937,31 @@ async fn an_idle_transaction_timeout_is_a_lost_connection() {
 }
 
 /// Insert a running workflow execution with a `WorkflowStarted` event.
+/// The session row that a failed acquire on worker `w-1` tried to insert.
+fn attempted_session_row(
+    session_id: autumn_harvest::types::SessionId,
+    exec_id: ExecutionId,
+    queue_name: &str,
+) -> autumn_harvest::worker::AttemptedSessionRow {
+    autumn_harvest::worker::AttemptedSessionRow {
+        session_id,
+        exec_id,
+        host_worker_id: "w-1".to_owned(),
+        queue_name: queue_name.to_owned(),
+    }
+}
+
+/// [`attempted_session_row`] for an execution that the test did not seed.
+fn unseeded_session_row(
+    session_id: autumn_harvest::types::SessionId,
+) -> autumn_harvest::worker::AttemptedSessionRow {
+    attempted_session_row(
+        session_id,
+        ExecutionId::new_for_shard(ShardId::new(0)),
+        "q-none",
+    )
+}
+
 async fn seed_execution(conn: &mut AsyncPgConnection, queue: &str) -> ExecutionId {
     use autumn_harvest::models::NewWorkflowExecution;
     use autumn_harvest::schema::harvest_workflow_executions;
@@ -2243,8 +2268,7 @@ async fn a_transient_session_acquire_keeps_the_slot_only_for_its_own_session() {
         autumn_harvest::worker::settle_session_slot_after_transient_error(
             &pool,
             &registry,
-            session_id,
-            "w-1",
+            &attempted_session_row(session_id, exec_id, &queue_name),
             &tokio_util::sync::CancellationToken::new(),
         )
         .await;
@@ -2254,6 +2278,76 @@ async fn a_transient_session_acquire_keeps_the_slot_only_for_its_own_session() {
             "{case}: wrong slot decision"
         );
     }
+}
+
+/// An acquire that lost its connection can still run its insert on the
+/// server (issue #1788). The re-check must wait for that insert. A plain
+/// read sees no row, releases the slot, and the insert then commits a
+/// session that this worker hosts but does not count.
+#[tokio::test]
+async fn a_session_recheck_waits_for_an_insert_in_progress() {
+    use autumn_harvest::sessions::{
+        new_session_slot_registry, session_slot_count, try_acquire_session_slot,
+    };
+    use autumn_harvest::types::SessionId;
+
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let queue_name = format!("q-ss-{}", &Uuid::new_v4().simple().to_string()[..12]);
+    let exec_id = seed_execution(&mut conn, &queue_name).await;
+    let pool = engine_pool(
+        url.clone(),
+        1,
+        DbRole::Hot,
+        &timeouts(5_000, SessionTimeouts::for_role(DbRole::Hot)),
+    )
+    .expect("engine pool");
+    let session_id = SessionId::new();
+    let registry = new_session_slot_registry();
+    assert!(try_acquire_session_slot(&registry, 4, session_id));
+
+    // The lost acquire: its insert runs, but has not committed yet.
+    let mut original = connect(&url).await;
+    diesel::sql_query("BEGIN")
+        .execute(&mut original)
+        .await
+        .expect("begin");
+    autumn_harvest::sessions::record_session_acquired(
+        &mut original,
+        session_id,
+        exec_id,
+        "w-1",
+        &queue_name,
+        Utc::now() + chrono::Duration::minutes(5),
+    )
+    .await
+    .expect("insert the session in an open transaction");
+    let commit = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        diesel::sql_query("COMMIT")
+            .execute(&mut original)
+            .await
+            .expect("commit");
+    });
+
+    autumn_harvest::worker::settle_session_slot_after_transient_error(
+        &pool,
+        &registry,
+        &autumn_harvest::worker::AttemptedSessionRow {
+            session_id,
+            exec_id,
+            host_worker_id: "w-1".to_owned(),
+            queue_name: queue_name.clone(),
+        },
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
+    commit.await.expect("the commit joins");
+    assert_eq!(
+        session_slot_count(&registry),
+        1,
+        "the re-check released the slot of a session that this worker hosts"
+    );
 }
 
 /// A kept slot is checked again once the database answers. Every first read
@@ -2283,8 +2377,7 @@ async fn a_kept_session_slot_is_released_once_the_row_proves_absent() {
     autumn_harvest::worker::settle_session_slot_after_transient_error(
         &pool,
         &registry,
-        session_id,
-        "w-1",
+        &unseeded_session_row(session_id),
         &tokio_util::sync::CancellationToken::new(),
     )
     .await;
@@ -2350,8 +2443,7 @@ async fn a_session_acquire_defers_while_its_slot_is_rechecked() {
     autumn_harvest::worker::settle_session_slot_after_transient_error(
         &starved,
         &registry,
-        session_id,
-        "w-1",
+        &unseeded_session_row(session_id),
         &tokio_util::sync::CancellationToken::new(),
     )
     .await;
@@ -2417,7 +2509,10 @@ async fn shutdown_stops_the_first_slot_recheck_round() {
     tokio::time::timeout(
         Duration::from_secs(30),
         autumn_harvest::worker::settle_session_slot_after_transient_error(
-            &starved, &registry, session_id, "w-1", &shutdown,
+            &starved,
+            &registry,
+            &unseeded_session_row(session_id),
+            &shutdown,
         ),
     )
     .await
@@ -2472,7 +2567,10 @@ async fn shutdown_stops_a_slot_recheck_that_gets_no_answer() {
     assert!(try_acquire_session_slot(&registry, 4, session_id));
     let shutdown = tokio_util::sync::CancellationToken::new();
     autumn_harvest::worker::settle_session_slot_after_transient_error(
-        &starved, &registry, session_id, "w-1", &shutdown,
+        &starved,
+        &registry,
+        &unseeded_session_row(session_id),
+        &shutdown,
     )
     .await;
 
@@ -2749,8 +2847,7 @@ async fn a_session_acquire_defers_during_the_first_recheck() {
             autumn_harvest::worker::settle_session_slot_after_transient_error(
                 &starved,
                 &registry,
-                session_id,
-                "w-1",
+                &unseeded_session_row(session_id),
                 &tokio_util::sync::CancellationToken::new(),
             )
             .await;

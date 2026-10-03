@@ -15975,15 +15975,14 @@ async fn handle_session_acquire(
                     || RecheckedSessionSlot::mark(session_slots_in_use, session_id),
                     SessionAcquireHold::into_recheck,
                 );
-                settle_session_slot_with_mark(
-                    pool,
-                    session_slots_in_use,
+                let row = AttemptedSessionRow {
                     session_id,
-                    worker_id,
-                    recheck,
-                    shutdown,
-                )
-                .await;
+                    exec_id,
+                    host_worker_id: worker_id.to_owned(),
+                    queue_name: task.queue_name.clone(),
+                };
+                settle_session_slot_with_mark(pool, session_slots_in_use, &row, recheck, shutdown)
+                    .await;
                 return Err(error);
             }
             crate::sessions::release_session_slot(session_slots_in_use, session_id);
@@ -16089,14 +16088,27 @@ async fn handle_session_release(
 pub async fn settle_session_slot_after_transient_error(
     pool: &DbPool,
     registry: &crate::sessions::SessionSlotRegistry,
-    session_id: crate::types::SessionId,
-    worker_id: &str,
+    row: &AttemptedSessionRow,
     shutdown: &CancellationToken,
 ) {
     // Mark before the first read. Those reads can take ten pool bounds, and an
     // orphan reclaim can retry the task on this worker in that time.
-    let recheck = RecheckedSessionSlot::mark(registry, session_id);
-    settle_session_slot_with_mark(pool, registry, session_id, worker_id, recheck, shutdown).await;
+    let recheck = RecheckedSessionSlot::mark(registry, row.session_id);
+    settle_session_slot_with_mark(pool, registry, row, recheck, shutdown).await;
+}
+
+/// The session row that a failed acquire tried to insert (issue #1788).
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct AttemptedSessionRow {
+    /// The session.
+    pub session_id: crate::types::SessionId,
+    /// The execution that acquires the session.
+    pub exec_id: ExecutionId,
+    /// The worker that tried to host the session.
+    pub host_worker_id: String,
+    /// The queue of the acquire task.
+    pub queue_name: String,
 }
 
 /// [`settle_session_slot_after_transient_error`] with a mark that the caller
@@ -16104,8 +16116,7 @@ pub async fn settle_session_slot_after_transient_error(
 async fn settle_session_slot_with_mark(
     pool: &DbPool,
     registry: &crate::sessions::SessionSlotRegistry,
-    session_id: crate::types::SessionId,
-    worker_id: &str,
+    row: &AttemptedSessionRow,
     recheck: RecheckedSessionSlot,
     shutdown: &CancellationToken,
 ) {
@@ -16115,23 +16126,23 @@ async fn settle_session_slot_with_mark(
     let settled = tokio::select! {
         biased;
         () = shutdown.cancelled() => return,
-        settled = settle_session_slot_once(pool, registry, session_id, worker_id) => settled,
+        settled = settle_session_slot_once(pool, registry, row) => settled,
     };
     if settled {
         return;
     }
     tracing::warn!(
-        session_id = %session_id,
+        session_id = %row.session_id,
         "could not read a session after a failed acquire; keeping its slot until a read succeeds"
     );
     let pool = pool.clone();
     let registry = std::sync::Arc::clone(registry);
-    let worker_id = worker_id.to_owned();
+    let row = row.clone();
     let shutdown = shutdown.clone();
     tokio::spawn(async move {
         let spacing = crate::pool::retry_spacing(&pool);
         retry_until_done(spacing, shutdown, || {
-            settle_session_slot_once(&pool, &registry, session_id, &worker_id)
+            settle_session_slot_once(&pool, &registry, &row)
         })
         .await;
         drop(recheck);
@@ -16280,30 +16291,78 @@ impl Drop for RecheckedSessionSlot {
 /// One round of [`settle_session_slot_after_transient_error`]: up to
 /// `FINALIZE_ACQUIRE_ATTEMPTS` reads, one pool bound apart. Returns whether a
 /// read succeeded and the slot is settled.
+/// Read the host and state of `row`'s session once no insert of it runs
+/// (issue #1788).
+///
+/// A failed acquire can lose its connection while the server still runs its
+/// insert. A plain read then sees no row, and the insert commits after it. The
+/// slot would go back for a session that this worker hosts. So this function
+/// first inserts the same row in a transaction that it always rolls back.
+/// Postgres makes that insert wait for any insert of the same key in
+/// progress. The read that follows sees the outcome of that insert.
+async fn read_session_after_inserts(
+    conn: &mut AsyncPgConnection,
+    row: &AttemptedSessionRow,
+) -> HarvestResult<Option<(String, String)>> {
+    use crate::schema::harvest_sessions::dsl;
+    use diesel::result::{DatabaseErrorKind, Error as DieselError};
+    use diesel_async::AsyncConnection as _;
+
+    let probe = crate::models::NewHarvestSession {
+        id: row.session_id.as_uuid(),
+        workflow_exec_id: row.exec_id.as_uuid(),
+        host_worker_id: &row.host_worker_id,
+        queue_name: &row.queue_name,
+        expires_at: chrono::Utc::now(),
+    };
+    let waited = conn
+        .transaction::<(), DieselError, _>(async |conn| {
+            diesel::insert_into(dsl::harvest_sessions)
+                .values(&probe)
+                .on_conflict(dsl::id)
+                .do_nothing()
+                .execute(conn)
+                .await?;
+            Err(DieselError::RollbackTransaction)
+        })
+        .await;
+    match waited {
+        // A missing execution means that no session row can exist either.
+        Ok(())
+        | Err(
+            DieselError::RollbackTransaction
+            | DieselError::DatabaseError(DatabaseErrorKind::ForeignKeyViolation, _),
+        ) => {}
+        Err(error) => return Err(crate::error::database_error(error)),
+    }
+    dsl::harvest_sessions
+        .find(row.session_id.as_uuid())
+        .select((dsl::host_worker_id, dsl::state))
+        .first::<(String, String)>(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)
+}
+
 async fn settle_session_slot_once(
     pool: &DbPool,
     registry: &crate::sessions::SessionSlotRegistry,
-    session_id: crate::types::SessionId,
-    worker_id: &str,
+    row: &AttemptedSessionRow,
 ) -> bool {
     use crate::schema::harvest_sessions::dsl;
 
+    let session_id = row.session_id;
     let spacing = crate::pool::retry_spacing(pool);
     for attempt in 1..=FINALIZE_ACQUIRE_ATTEMPTS {
         let started = tokio::time::Instant::now();
         let read = match crate::pool::acquire_within_pool_bound(pool).await {
-            Ok(mut conn) => dsl::harvest_sessions
-                .find(session_id.as_uuid())
-                .select((dsl::host_worker_id, dsl::state))
-                .first::<(String, String)>(&mut conn)
-                .await
-                .optional()
-                .map_err(crate::error::database_error),
+            Ok(mut conn) => read_session_after_inserts(&mut conn, row).await,
             Err(error) => Err(error),
         };
         match read {
-            Ok(row) => {
-                let ours = row.is_some_and(|(host, state)| host == worker_id && state == "ACTIVE");
+            Ok(found) => {
+                let ours = found
+                    .is_some_and(|(host, state)| host == row.host_worker_id && state == "ACTIVE");
                 if !ours {
                     release_session_slot_unless_acquiring(registry, session_id);
                 }

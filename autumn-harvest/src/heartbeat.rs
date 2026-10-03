@@ -310,8 +310,8 @@ struct Latest {
 struct SlotState {
     /// The newest heartbeat not yet taken.
     pending: Option<Pending>,
-    /// The send time of the newest heartbeat seen.
-    newest_sent: Option<std::time::Instant>,
+    /// The sequence of the newest heartbeat seen.
+    newest_sequence: Option<u64>,
     /// Set when the flush loop stops.
     closed: bool,
 }
@@ -327,22 +327,22 @@ impl Latest {
     /// when a flush already took the newer one. A write of it would move
     /// `last_heartbeat_at` backwards.
     ///
-    /// The order comes from the monotonic `sent_order`, not from the wall
-    /// clock. The wall clock can step back, for example after an NTP
-    /// correction. Every later heartbeat would then look older, and all of
-    /// them would be dropped.
+    /// The order comes from `sequence`, one counter for every stamp. Two
+    /// senders can read the same `Instant`, but never the same sequence. The
+    /// wall clock plays no part, because it can step back, for example after
+    /// an NTP correction.
     fn publish(&self, beat: StampedHeartbeat) -> bool {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if state.closed {
             return false;
         }
         if state
-            .newest_sent
-            .is_some_and(|newest| beat.sent_order < newest)
+            .newest_sequence
+            .is_some_and(|newest| beat.sequence < newest)
         {
             return true;
         }
-        state.newest_sent = Some(beat.sent_order);
+        state.newest_sequence = Some(beat.sequence);
         state.pending = Some(Pending {
             payload: beat.details,
             sent_order: beat.sent_order,
@@ -761,12 +761,37 @@ mod tests {
         static BASE: std::sync::LazyLock<std::time::Instant> =
             std::sync::LazyLock::new(std::time::Instant::now);
 
-        /// A beat sent `secs` seconds after `BASE`.
+        /// A beat sent `secs` seconds after `BASE`, stamped in that order.
         fn beat_at(secs: u64) -> StampedHeartbeat {
             StampedHeartbeat {
                 details: Value::Null,
                 sent_order: *BASE + Duration::from_secs(secs),
+                sequence: secs,
             }
+        }
+
+        /// Two senders can read the same `Instant` (issue #1788). The stamp
+        /// sequence still orders them, so the later stamp stays when the
+        /// earlier one is published after it.
+        #[test]
+        fn a_tied_send_time_keeps_the_later_stamp() {
+            let latest = Latest::default();
+            let later = StampedHeartbeat {
+                details: serde_json::json!({"step": 2}),
+                sent_order: *BASE,
+                sequence: 2,
+            };
+            let earlier = StampedHeartbeat {
+                details: serde_json::json!({"step": 1}),
+                sent_order: *BASE,
+                sequence: 1,
+            };
+            assert!(latest.publish(later));
+            assert!(latest.publish(earlier));
+            assert_eq!(
+                latest.take().map(|beat| beat.payload),
+                Some(serde_json::json!({"step": 2}))
+            );
         }
 
         /// A heartbeat sent while the loop waits after a blocked write ends
