@@ -739,7 +739,7 @@
       ],
       "prometheus": {
         "mode": "native-metric",
-        "notes": "Non-determinism signals a logic mismatch. harvest_workflow_non_determinism_total carries workflow and build_id labels (keep build_id low-cardinality); harvest_workflow_nondeterministic_block_total carries workflow and queue.",
+        "notes": "Non-determinism signals a logic mismatch. harvest_workflow_non_determinism_total carries workflow and build_id labels (keep build_id low-cardinality); harvest_workflow_nondeterministic_block_total carries workflow, queue and build_id (issue #1814, capped).",
         "expressions": [
           {
             "kind": "promql",

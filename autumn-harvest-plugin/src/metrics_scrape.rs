@@ -44,10 +44,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use autumn_harvest::telemetry::{
-    ActivityStatus, ConnectorOutcome, METRIC_LABEL_ACTIVITY, METRIC_LABEL_KIND, METRIC_LABEL_NAME,
-    METRIC_LABEL_OUTCOME, METRIC_LABEL_QUEUE, METRIC_LABEL_REASON, METRIC_LABEL_SHARD,
-    METRIC_LABEL_SLOT_TYPE, METRIC_LABEL_SOURCE, METRIC_LABEL_STATUS, METRIC_LABEL_WORKFLOW,
-    MetricsRecorder, PoisonReason, SlotType, WorkflowStatus,
+    ActivityStatus, BUILD_ID_LABEL_NONE, ConnectorOutcome, METRIC_LABEL_ACTIVITY,
+    METRIC_LABEL_BUILD_ID, METRIC_LABEL_KIND, METRIC_LABEL_NAME, METRIC_LABEL_OUTCOME,
+    METRIC_LABEL_QUEUE, METRIC_LABEL_REASON, METRIC_LABEL_SHARD, METRIC_LABEL_SLOT_TYPE,
+    METRIC_LABEL_SOURCE, METRIC_LABEL_STATUS, METRIC_LABEL_WORKFLOW, MetricsRecorder, PoisonReason,
+    SlotType, WorkflowStatus,
 };
 use autumn_web::actuator::{MetricFamily, MetricKind, MetricSample, MetricsSource};
 
@@ -310,10 +311,29 @@ impl MetricsRecorder for HarvestMetricsRecorder {
             .incr(vec![workflow_name.to_owned(), queue.to_owned()], 1);
     }
 
+    // Issue #1814: both duration families always carry `build_id`. A call
+    // with no build reports `none`, so every sample has the same label set.
     fn record_workflow_completed(
         &self,
         workflow_name: &str,
         queue: &str,
+        duration_secs: f64,
+        status: WorkflowStatus,
+    ) {
+        self.record_workflow_completed_for_build(
+            workflow_name,
+            queue,
+            BUILD_ID_LABEL_NONE,
+            duration_secs,
+            status,
+        );
+    }
+
+    fn record_workflow_completed_for_build(
+        &self,
+        workflow_name: &str,
+        queue: &str,
+        build_id: &str,
         duration_secs: f64,
         status: WorkflowStatus,
     ) {
@@ -322,6 +342,7 @@ impl MetricsRecorder for HarvestMetricsRecorder {
                 workflow_name.to_owned(),
                 queue.to_owned(),
                 status.as_str().to_owned(),
+                build_id.to_owned(),
             ],
             duration_secs,
         );
@@ -334,11 +355,31 @@ impl MetricsRecorder for HarvestMetricsRecorder {
         duration_secs: f64,
         status: ActivityStatus,
     ) {
+        self.record_activity_completed_for_build(
+            activity_name,
+            queue,
+            BUILD_ID_LABEL_NONE,
+            duration_secs,
+            status,
+            None,
+        );
+    }
+
+    fn record_activity_completed_for_build(
+        &self,
+        activity_name: &str,
+        queue: &str,
+        build_id: &str,
+        duration_secs: f64,
+        status: ActivityStatus,
+        _error_type: Option<&str>,
+    ) {
         self.0.activity_duration.observe(
             vec![
                 activity_name.to_owned(),
                 queue.to_owned(),
                 status.as_str().to_owned(),
+                build_id.to_owned(),
             ],
             duration_secs,
         );
@@ -600,6 +641,7 @@ fn push_catalogue_metrics(families: &mut Vec<MetricFamily>, inner: &Inner) {
             METRIC_LABEL_WORKFLOW,
             METRIC_LABEL_QUEUE,
             METRIC_LABEL_STATUS,
+            METRIC_LABEL_BUILD_ID,
         ],
         inner.workflow_duration.snapshot(),
     );
@@ -611,6 +653,7 @@ fn push_catalogue_metrics(families: &mut Vec<MetricFamily>, inner: &Inner) {
             METRIC_LABEL_ACTIVITY,
             METRIC_LABEL_QUEUE,
             METRIC_LABEL_STATUS,
+            METRIC_LABEL_BUILD_ID,
         ],
         inner.activity_duration.snapshot(),
     );
@@ -852,6 +895,7 @@ mod tests {
             ("workflow", "onboarding"),
             ("queue", "default"),
             ("status", "completed"),
+            ("build_id", "none"),
         ];
         assert_eq!(sample_value(count_f, &labels), 2.0);
         assert_eq!(sample_value(sum_f, &labels), 4.0);
@@ -874,6 +918,7 @@ mod tests {
             ("activity", "send_email"),
             ("queue", "email-workers"),
             ("status", "completed"),
+            ("build_id", "none"),
         ];
         assert_eq!(sample_value(count_f, &labels), 1.0);
         assert_eq!(sample_value(sum_f, &labels), 0.25);
@@ -1241,11 +1286,11 @@ mod tests {
         let text = recorder.render_prometheus();
         assert!(text.contains("# TYPE harvest_activity_duration_count counter\n"));
         assert!(text.contains(
-            "harvest_activity_duration_count{activity=\"send_email\",queue=\"default\",status=\"completed\"} 2\n"
+            "harvest_activity_duration_count{activity=\"send_email\",queue=\"default\",status=\"completed\",build_id=\"none\"} 2\n"
         ));
         assert!(text.contains("# TYPE harvest_activity_duration_sum counter\n"));
         assert!(text.contains(
-            "harvest_activity_duration_sum{activity=\"send_email\",queue=\"default\",status=\"completed\"} 4\n"
+            "harvest_activity_duration_sum{activity=\"send_email\",queue=\"default\",status=\"completed\",build_id=\"none\"} 4\n"
         ));
     }
 
@@ -1268,5 +1313,53 @@ mod tests {
         let recorder = HarvestMetricsRecorder::new();
         recorder.record_workflow_started("a\nb", "q");
         assert!(recorder.render_prometheus().contains("workflow=\"a\\nb\""));
+    }
+
+    // ── build_id label on the latency families (issue #1814) ─────────────
+
+    #[test]
+    fn duration_families_carry_the_build_id_label() {
+        let recorder = HarvestMetricsRecorder::new();
+        recorder.record_workflow_completed_for_build(
+            "onboarding",
+            "default",
+            "v2",
+            1.5,
+            WorkflowStatus::Failed,
+        );
+        recorder.record_activity_completed_for_build(
+            "send_email",
+            "default",
+            "v2",
+            0.25,
+            ActivityStatus::Failed,
+            Some("Timeout"),
+        );
+        recorder.record_workflow_completed("onboarding", "default", 2.0, WorkflowStatus::Completed);
+
+        let families = recorder.collect();
+        let wf = family(&families, "harvest_workflow_duration_count");
+        let v2 = [
+            ("workflow", "onboarding"),
+            ("queue", "default"),
+            ("status", "failed"),
+            ("build_id", "v2"),
+        ];
+        assert_eq!(sample_value(wf, &v2), 1.0);
+        let none = [
+            ("workflow", "onboarding"),
+            ("queue", "default"),
+            ("status", "completed"),
+            ("build_id", "none"),
+        ];
+        assert_eq!(sample_value(wf, &none), 1.0);
+        let act = family(&families, "harvest_activity_duration_sum");
+        let act_v2 = [
+            ("activity", "send_email"),
+            ("queue", "default"),
+            ("status", "failed"),
+            ("build_id", "v2"),
+        ];
+        assert_eq!(sample_value(act, &act_v2), 0.25);
     }
 }
