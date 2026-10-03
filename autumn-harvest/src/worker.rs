@@ -26013,7 +26013,7 @@ fn spawn_stranded_work_sampler(
                 // Build compatibility set for this shard (issue #171 routing).
                 // Used to honour the same required_build_id eligibility
                 // claim_task enforces. On load failure fall back to an empty set
-                // (exact-match / legacy-worker rules still apply).
+                // (the exact-match rule still applies).
                 let compat_set = {
                     // Selected against `cancel` (issue #1426); see the demands
                     // acquisition above.
@@ -26032,7 +26032,7 @@ fn spawn_stranded_work_sampler(
                 // A demand is covered when some covering worker polls its queue
                 // AND satisfies its required_capabilities (the same Exact/In
                 // label match claim_task applies) AND is build-eligible for its
-                // required_build_id (the same exact/compatible/legacy rule) AND,
+                // required_build_id (the same exact or compatible rule) AND,
                 // when the row is held by an unexpired sticky lease, *is* that
                 // lease's owner (only it can claim until the lease expires). All
                 // constraints are checked against the *same* worker so a task
@@ -30889,7 +30889,7 @@ impl Worker {
         let policies = match crate::build_routing::list_build_policies(conn).await {
             Ok(policies) => policies,
             Err(error) => {
-                tracing::debug!(error = %error, "build policy read for empty build_id check failed");
+                tracing::warn!(error = %error, "build policy read for empty build_id check failed");
                 return;
             }
         };

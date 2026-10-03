@@ -2891,6 +2891,7 @@ pub trait MetricsRecorder: Send + Sync {
 
     /// A worker with an empty `build_id` serves a queue that has a build
     /// policy (issue #1805). Emitted once at registration, value `1`.
+    /// The series is never cleared while the worker runs.
     ///
     /// Maps to the gauge `harvest_worker_empty_build_policy{queue}`.
     fn record_worker_empty_build_policy(&self, queue: &str) {

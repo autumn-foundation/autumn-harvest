@@ -661,6 +661,19 @@ workers are ineligible to claim them.
 > advance the build policy, run the entire old fleet with
 > `with_build_id("sha-old456")`. An empty-build worker on a queue with a
 > policy logs a warning and sets `harvest.worker.empty_build_policy`.
+>
+> **Stuck pinned runs.** After you upgrade, pinned rows that only
+> empty-build workers poll stay `PENDING`. List them with:
+>
+> ```sql
+> SELECT queue_name, required_build_id, count(*)
+> FROM harvest_task_queue
+> WHERE state = 'PENDING' AND required_build_id IS NOT NULL
+> GROUP BY 1, 2;
+> ```
+>
+> Start workers with the listed build, or declare compatibility for the
+> build your workers run.
 
 **Step 4 — Drain and retire old-build workers.**
 
@@ -945,7 +958,7 @@ Response fields:
 | Forgetting to declare compat in Scenario A | New workers skip old-build tasks; old-build executions stall |
 | Breaking deploy without a `ctx.patched()` / `ctx.version()` gate | New workers corrupt in-flight histories on replay; use a patched gate (or a version gate for >2 versions) |
 | Rollback without updating the build policy | New starts continue landing on the bad build; set policy back first |
-| Empty `build_id` on new workers | Legacy sentinel — the worker claims any task, bypassing all routing |
+| Empty `build_id` on new workers | The worker cannot claim pinned runs (issue #1805); set `with_build_id` on every worker |
 
 ---
 

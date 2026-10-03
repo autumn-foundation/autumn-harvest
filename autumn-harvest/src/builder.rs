@@ -4115,8 +4115,8 @@ impl WorkerConfig {
     /// Set the immutable build identifier for this worker (issue #171).
     ///
     /// Use a stable per-build token — a Git SHA, semver tag, or CI job ID.
-    /// Workers without a build ID (the default empty string) behave as legacy
-    /// workers and can claim any task regardless of build routing policy.
+    /// A worker without a build ID (the default empty string) cannot claim a
+    /// task pinned to a build (issue #1805).
     #[must_use]
     pub fn with_build_id(mut self, build_id: impl Into<String>) -> Self {
         self.build_id = build_id.into();

@@ -6867,8 +6867,8 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "harvest_worker_empty_build_policy",
-          "legendFormat": "{{queue}} @ {{instance}}",
+          "expr": "max by (queue) (harvest_worker_empty_build_policy)",
+          "legendFormat": "{{queue}}",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"

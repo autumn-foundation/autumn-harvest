@@ -1032,12 +1032,14 @@ pub const fn claim_task_query() -> &'static str {
                ) \
                AND ( \
                    required_build_id IS NULL \
-                                      OR required_build_id = $3 \
-                   OR EXISTS ( \
-                       SELECT 1 FROM harvest_build_compat \
-                       WHERE build_id = $3 \
-                         AND compatible_with = harvest_task_queue.required_build_id \
-                   ) \
+                   OR ($3 <> '' AND ( \
+                       required_build_id = $3 \
+                       OR EXISTS ( \
+                           SELECT 1 FROM harvest_build_compat \
+                           WHERE build_id = $3 \
+                             AND compatible_with = harvest_task_queue.required_build_id \
+                       ) \
+                   )) \
                ) \
                AND ( \
                    task_type <> 'workflow' \
@@ -7147,12 +7149,14 @@ pub fn claim_task_batched_candidates_query() -> &'static str {
                ) \
                AND ( \
                    required_build_id IS NULL \
-                                      OR required_build_id = $3 \
-                   OR EXISTS ( \
-                       SELECT 1 FROM harvest_build_compat \
-                       WHERE build_id = $3 \
-                         AND compatible_with = harvest_task_queue.required_build_id \
-                   ) \
+                   OR ($3 <> '' AND ( \
+                       required_build_id = $3 \
+                       OR EXISTS ( \
+                           SELECT 1 FROM harvest_build_compat \
+                           WHERE build_id = $3 \
+                             AND compatible_with = harvest_task_queue.required_build_id \
+                       ) \
+                   )) \
                ) \
                AND ( \
                    task_type <> 'workflow' \
@@ -7261,12 +7265,14 @@ fn build_and_capability_eligibility_predicate(
     format!(
         "( \
              {row_ref}required_build_id IS NULL \
-                          OR {row_ref}required_build_id = $10 \
-             OR EXISTS ( \
-                 SELECT 1 FROM harvest_build_compat \
-                 WHERE build_id = $10 \
-                   AND compatible_with = {compat_ref}required_build_id \
-             ) \
+             OR ($10 <> '' AND ( \
+                 {row_ref}required_build_id = $10 \
+                 OR EXISTS ( \
+                     SELECT 1 FROM harvest_build_compat \
+                     WHERE build_id = $10 \
+                       AND compatible_with = {compat_ref}required_build_id \
+                 ) \
+             )) \
          ) \
          AND ( \
              {row_ref}required_capabilities IS NULL \
@@ -8799,6 +8805,14 @@ mod tests {
         let queries = [
             ("claim_task_query", claim_task_query().to_string()),
             (
+                "claim_task_query_for_kind",
+                claim_task_query_for_kind(TaskType::Workflow, false).to_string(),
+            ),
+            (
+                "build_and_capability_eligibility_predicate",
+                build_and_capability_eligibility_predicate("", "harvest_task_queue.", "x"),
+            ),
+            (
                 "claim_task_query_fenced",
                 claim_task_query_fenced().to_string(),
             ),
@@ -8813,8 +8827,13 @@ mod tests {
         ];
         for (name, sql) in queries {
             assert!(
-                !sql.contains("= ''"),
+                !sql.contains("OR $3 = ''") && !sql.contains("OR $10 = ''"),
                 "{name} must not let an empty build_id claim pinned rows"
+            );
+            let worker_build = if sql.contains("$10 <>") { "$10" } else { "$3" };
+            assert!(
+                sql.contains(&format!("OR ({worker_build} <> '' AND (")),
+                "{name} must gate the build match on a non-empty worker build"
             );
         }
     }

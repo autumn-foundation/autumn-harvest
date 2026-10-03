@@ -14130,7 +14130,7 @@ fn local_build_id_from_workers(workers: &[WorkerRow], local_worker_id: Option<&s
 ///
 /// Queue coverage alone is not the claim predicate. `queue::claim_task` also
 /// enforces the task's `required_build_id` (exact, `harvest_build_compat`
-/// declared, or legacy empty-build worker), its `required_capabilities` (the
+/// declared; an empty build_id never matches), its `required_capabilities` (the
 /// same Exact/In label match), and its **session pin** -- so a task sitting on
 /// a well-covered queue can still be permanently unclaimable because no poller
 /// runs the right build, advertises the right labels, or *is* the session's
@@ -56676,14 +56676,14 @@ mod tests {
             &compat,
             ""
         ));
-        // A legacy worker (empty build_id) may claim anything.
+        // An empty-build worker cannot claim a pinned task (issue #1805).
         let legacy = vec![eligibility_worker(
             "w-legacy",
             &["default"],
             "",
             serde_json::json!({}),
         )];
-        assert!(task_has_eligible_worker(
+        assert!(!task_has_eligible_worker(
             &legacy,
             0,
             TaskClaimRequirements {
