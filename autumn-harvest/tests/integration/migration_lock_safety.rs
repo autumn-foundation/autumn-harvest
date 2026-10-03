@@ -203,15 +203,23 @@ struct History {
     indexes: BTreeMap<String, BTreeSet<String>>,
     /// Each table, mapped to the tables that its foreign keys reference.
     references: BTreeMap<String, BTreeSet<String>>,
+    /// Each partition of a hot table, without its schema. A partition takes
+    /// the live writes of its parent, so it is hot too.
+    partitions: BTreeSet<String>,
 }
 
 impl History {
+    /// Whether `table` is hot: a listed table, or a partition of a hot table.
+    fn is_hot(&self, table: &str) -> bool {
+        HOT_TABLES.contains(&base(table)) || self.partitions.contains(base(table))
+    }
+
     /// The table of index `name`. A hot table wins when the name is ambiguous.
     fn index_table(&self, name: &str) -> Option<String> {
         let tables = self.indexes.get(base(name))?;
         tables
             .iter()
-            .find(|t| HOT_TABLES.contains(&base(t)))
+            .find(|t| self.is_hot(t))
             .or_else(|| tables.iter().next())
             .cloned()
     }
@@ -336,15 +344,16 @@ fn index_cost(verb: &str) -> &'static str {
 ///
 /// A local value holds until the transaction ends. A session value outlives
 /// a commit, but a rollback restores the value from before the transaction.
-/// Diesel runs the whole file as one transaction, unless the file ends one
-/// itself.
+///
+/// Diesel sends the file as one batch, and the batch is always in a
+/// transaction. After a `COMMIT` or `ROLLBACK`, the next statement opens a new
+/// implicit block. A later `BEGIN` takes over that block and starts nothing
+/// new, so it needs no case of its own.
 fn timeout_in_force(timeouts: &[(usize, Timeout)], at: usize) -> bool {
     let mut session = false;
     let mut local = None;
-    // The session value when the current transaction began. Diesel sends the
-    // file as one batch, which is already a transaction, so it starts there.
+    // The session value when the current transaction began.
     let mut saved = false;
-    let mut in_transaction = true;
     for (_, change) in timeouts.iter().take_while(|(k, _)| *k < at) {
         match *change {
             Timeout::Set {
@@ -358,23 +367,13 @@ fn timeout_in_force(timeouts: &[(usize, Timeout)], at: usize) -> bool {
                 session = bounds;
                 local = None;
             }
-            // A `BEGIN` inside a transaction starts nothing new.
-            Timeout::Begin => {
-                if !in_transaction {
-                    saved = session;
-                }
-                in_transaction = true;
-            }
-            // `AND CHAIN` starts the next transaction at once.
-            Timeout::Commit { chain } => {
+            Timeout::Commit => {
                 saved = session;
                 local = None;
-                in_transaction = chain;
             }
-            Timeout::Rollback { chain } => {
+            Timeout::Rollback => {
                 session = saved;
                 local = None;
-                in_transaction = chain;
             }
             Timeout::RollbackToSavepoint => {
                 session = false;
@@ -390,14 +389,11 @@ fn timeout_in_force(timeouts: &[(usize, Timeout)], at: usize) -> bool {
 enum Timeout {
     /// A new value. `local` holds for the current transaction only.
     Set { bounds: bool, local: bool },
-    /// `BEGIN` or `START TRANSACTION`.
-    Begin,
-    /// `COMMIT` or `END`, which drops every local value. `chain` is set for
-    /// `AND CHAIN`, which opens a new transaction at once.
-    Commit { chain: bool },
+    /// `COMMIT` or `END`, which drops every local value.
+    Commit,
     /// `ROLLBACK` or `ABORT`, which also undoes every session change since
     /// the transaction began.
-    Rollback { chain: bool },
+    Rollback,
     /// `ROLLBACK TO SAVEPOINT`. The lint does not track savepoints, so it
     /// assumes no bound remains.
     RollbackToSavepoint,
@@ -847,11 +843,6 @@ impl<'a> Stmts<'a> {
         false
     }
 
-    /// Whether the statement at `k` ends with `AND CHAIN`, not `AND NO CHAIN`.
-    fn chains(&self, k: usize) -> bool {
-        (k..self.end(k)).any(|j| self.is(j, "and") && self.is(j + 1, "chain"))
-    }
-
     /// The index one past the last token of the statement that holds `k`.
     fn end(&self, k: usize) -> usize {
         (k..self.toks.len())
@@ -1055,7 +1046,14 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
             }
             Some("partition") if s.is(k + 1, "of") => {
                 let parent = s.qualified_name(k + 2).map(|(t, _)| t);
+                let child = s.statement_table(s.starts[k]);
+                learn_partition(history, parent.as_deref(), child.as_deref());
                 raws.push(Raw::lock(s.starts[k], "PARTITION OF", parent));
+            }
+            Some("attach") if s.is(k + 1, "partition") => {
+                let parent = s.statement_table(s.starts[k]);
+                let child = s.qualified_name(k + 2).map(|(t, _)| t);
+                learn_partition(history, parent.as_deref(), child.as_deref());
             }
             // A conditional setter cannot set a bound, but a conditional
             // clear may end one.
@@ -1144,10 +1142,7 @@ fn resolve(
         // later drop stricter.
         let sure =
             toks[raw.at].runs && unconditional[raw.at] && !s.has_pair(raw.at, "not", "exists");
-        let learn = sure
-            || table
-                .as_deref()
-                .is_some_and(|t| HOT_TABLES.contains(&base(t)));
+        let learn = sure || table.as_deref().is_some_and(|t| history.is_hot(t));
         if let (Some(index), Some(table), "CREATE INDEX", true) =
             (&raw.index, &table, raw.verb, learn)
         {
@@ -1166,7 +1161,7 @@ fn resolve(
             history.indexes.remove(base(index));
         }
         let hot = table.as_deref().is_none_or(|t| {
-            HOT_TABLES.contains(&base(t))
+            history.is_hot(t)
                 && new_tables
                     .get(t)
                     .is_none_or(|(from, to)| raw.at < *from || raw.at > *to)
@@ -1281,20 +1276,14 @@ fn timeout_change(s: &Stmts, k: usize) -> Option<Timeout> {
                 local: false,
             })
         }
-        "begin" if start && s.toks[k].depth == 0 => Some(Timeout::Begin),
-        "start" if start && s.toks[k].depth == 0 && s.is(k + 1, "transaction") => {
-            Some(Timeout::Begin)
-        }
-        "commit" | "end" if start && s.toks[k].depth == 0 => {
-            Some(Timeout::Commit { chain: s.chains(k) })
-        }
+        "commit" | "end" if start && s.toks[k].depth == 0 => Some(Timeout::Commit),
         "rollback" | "abort" if start && s.toks[k].depth == 0 => {
             // `ROLLBACK [WORK | TRANSACTION] TO [SAVEPOINT] s` restores the value
             // from the savepoint, which the lint does not track.
             if (k + 1..=k + 2).any(|j| s.is(j, "to")) {
                 Some(Timeout::RollbackToSavepoint)
             } else {
-                Some(Timeout::Rollback { chain: s.chains(k) })
+                Some(Timeout::Rollback)
             }
         }
         "set_config"
@@ -1439,6 +1428,9 @@ fn rename(s: &Stmts, k: usize, history: &mut History) {
         .entry(base(&new).to_string())
         .or_default()
         .extend(keys);
+    if history.partitions.contains(base(&old)) {
+        history.partitions.insert(base(&new).to_string());
+    }
     // An index on the old name now sits on the new one. A foreign key that
     // pointed at the old name now points at the new one.
     for tables in history
@@ -1449,6 +1441,19 @@ fn rename(s: &Stmts, k: usize, history: &mut History) {
         if tables.iter().any(|t| base(t) == base(&old)) {
             tables.insert(new.clone());
         }
+    }
+}
+
+/// Remember `child` as hot when its `parent` is hot.
+///
+/// The lint learns it even from a branch that may not run. A wrong guess only
+/// makes a later lock stricter. The history only grows, so a detach or a drop
+/// keeps the name hot.
+fn learn_partition(history: &mut History, parent: Option<&str>, child: Option<&str>) {
+    if let (Some(parent), Some(child)) = (parent, child)
+        && history.is_hot(parent)
+    {
+        history.partitions.insert(base(child).to_string());
     }
 }
 
@@ -2934,18 +2939,6 @@ fn renaming_a_referenced_table_moves_the_keys_that_point_at_it() {
 }
 
 #[test]
-fn a_chained_commit_or_rollback_stays_in_a_transaction() {
-    for end in ["COMMIT AND CHAIN", "ROLLBACK AND CHAIN"] {
-        let sql = format!(
-            "{end};\nSET lock_timeout = '5s';\nBEGIN;\nSET lock_timeout = '0';\nROLLBACK;\n\
-             ALTER TABLE harvest_events ADD COLUMN x INT;"
-        );
-        let findings = lint_with_history(&[], &sql, false);
-        assert_eq!(rules(&findings), [Rule::LockTimeout], "{end}: {findings:?}");
-    }
-}
-
-#[test]
 fn nulls_not_distinct_after_the_columns_is_still_a_plain_build() {
     let sql = "SET LOCAL lock_timeout = '5s';\n\
                CREATE UNIQUE INDEX idx_x ON harvest_events (id) NULLS NOT DISTINCT;";
@@ -2989,6 +2982,60 @@ fn a_sure_drop_forgets_the_index() {
 fn a_quoted_metadata_key_is_read() {
     assert!(!run_in_transaction("\"run_in_transaction\" = false\n"));
     assert!(!run_in_transaction("'run_in_transaction' = false\n"));
+}
+
+#[test]
+fn a_new_transaction_starts_after_a_commit_or_rollback() {
+    // The batch opens an implicit block at the next statement. A later
+    // `BEGIN` takes over that block, so its snapshot predates the `SET`.
+    for end in [
+        "COMMIT",
+        "ROLLBACK",
+        "END",
+        "COMMIT AND CHAIN",
+        "ROLLBACK AND CHAIN",
+    ] {
+        let sql = format!(
+            "{end};\nSET lock_timeout = '5s';\nBEGIN;\nSET lock_timeout = '0';\nROLLBACK;\n\
+             ALTER TABLE harvest_events ADD COLUMN x INT;"
+        );
+        let findings = lint_with_history(&[], &sql, false);
+        assert_eq!(rules(&findings), [Rule::LockTimeout], "{end}: {findings:?}");
+    }
+}
+
+#[test]
+fn a_partition_of_a_hot_table_is_hot() {
+    let sql = "CREATE INDEX idx_x ON events_p (id);";
+    let both = [Rule::LockTimeout, Rule::BlockingIndex];
+    for history in [
+        vec!["CREATE TABLE events_p PARTITION OF harvest_events FOR VALUES FROM (1) TO (2);"],
+        vec![
+            "CREATE TABLE events_p (LIKE harvest_events);",
+            "SET LOCAL lock_timeout = '5s';\n\
+             ALTER TABLE harvest_events ATTACH PARTITION events_p FOR VALUES FROM (1) TO (2);",
+        ],
+        // A partition of a partition is hot too.
+        vec![
+            "CREATE TABLE events_q PARTITION OF harvest_events FOR VALUES FROM (1) TO (2) \
+             PARTITION BY RANGE (id);",
+            "CREATE TABLE events_p PARTITION OF events_q FOR VALUES FROM (1) TO (2);",
+        ],
+        // A rename keeps the partition hot.
+        vec![
+            "CREATE TABLE events_q PARTITION OF harvest_events FOR VALUES FROM (1) TO (2);",
+            "ALTER TABLE events_q RENAME TO events_p;",
+        ],
+    ] {
+        let mut found = rules(&lint_with_history(&history, sql, true));
+        found.sort();
+        let mut want = both.to_vec();
+        want.sort();
+        assert_eq!(found, want, "{history:?}");
+    }
+    let cold = ["CREATE TABLE sched_p PARTITION OF harvest_schedules FOR VALUES FROM (1) TO (2);"];
+    let findings = lint_with_history(&cold, "CREATE INDEX idx_x ON sched_p (id);", true);
+    assert_eq!(findings, []);
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────

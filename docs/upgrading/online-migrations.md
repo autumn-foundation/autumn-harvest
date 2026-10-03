@@ -38,6 +38,10 @@ The exemption ends at a later `DROP TABLE`, `RENAME TO` or `ROLLBACK`, because
 the name can mean the hot table again.
 The lock must name the table exactly as the create does, schema included.
 
+A partition of a hot table is hot too, because it takes the live writes of its
+parent. The lint learns it from `PARTITION OF` or `ATTACH PARTITION` in an
+earlier migration. A detach or a drop does not make it cold again.
+
 ## 2. The rules
 
 | Rule | Fails when | Fix |
@@ -104,9 +108,10 @@ Diesel and `harvest migrate` send each `up.sql` as one batch. Postgres runs a
 multi-statement batch as one implicit transaction. `SET LOCAL` therefore holds
 for the whole file, even with `run_in_transaction = false`. An explicit `COMMIT`,
 `ROLLBACK` or `END` ends that transaction and its `SET LOCAL`. A `ROLLBACK` also
-undoes a plain `SET` made since the transaction began. The file itself is that
-transaction until its first `COMMIT`, so a `BEGIN` before the `ROLLBACK` does
-not protect an earlier `SET`.
+undoes a plain `SET` made since the transaction began. After a `COMMIT` or
+`ROLLBACK`, the next statement opens a new implicit transaction. A `BEGIN`
+takes over the open transaction, so it does not protect an earlier `SET` from
+a later `ROLLBACK`.
 
 ## 4. Build indexes with `CONCURRENTLY`
 
