@@ -22,13 +22,63 @@ const MARKER: &str = "host-clock-ok:";
 /// Upper bound on the bytes that one write expression may span.
 const STATEMENT_WINDOW: usize = 300;
 
-/// Blank out `//` comments so a comment cannot hide or fake a write.
+/// Blank out `//` and `/* */` comments, keeping string literals.
+///
+/// Comment bytes become spaces and line breaks stay, so offsets and line
+/// numbers do not move. A `//` inside a string, such as a URL, is not a comment.
 fn strip_comments(source: &str) -> String {
-    source
-        .lines()
-        .map(|line| line.find("//").map_or(line, |at| &line[..at]))
-        .collect::<Vec<_>>()
-        .join("\n")
+    let bytes = source.as_bytes();
+    let mut out = bytes.to_vec();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    out[index] = b' ';
+                    index += 1;
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                let end = source[index + 2..]
+                    .find("*/")
+                    .map_or(bytes.len(), |at| index + 2 + at + 2);
+                for byte in &mut out[index..end] {
+                    if *byte != b'\n' {
+                        *byte = b' ';
+                    }
+                }
+                index = end;
+            }
+            b'r' if raw_string_end(bytes, index).is_some() => {
+                index = raw_string_end(bytes, index).map_or(index, |end| end + 1);
+            }
+            b'"' => {
+                index += 1;
+                while index < bytes.len() && bytes[index] != b'"' {
+                    index += if bytes[index] == b'\\' { 2 } else { 1 };
+                }
+                index += 1;
+            }
+            b'\'' => index += char_literal_len(bytes, index),
+            _ => index += 1,
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| source.to_string())
+}
+
+/// Length of a character literal at `at`, or 1 for a lifetime tick.
+fn char_literal_len(bytes: &[u8], at: usize) -> usize {
+    if bytes.get(at + 1) == Some(&b'\\') {
+        return bytes[at + 2..]
+            .iter()
+            .position(|byte| *byte == b'\'')
+            .map_or(1, |close| close + 3);
+    }
+    if bytes.get(at + 2) == Some(&b'\'') {
+        3
+    } else {
+        1
+    }
 }
 
 /// Byte offset of the last byte of a raw string that starts at `at`.
@@ -322,6 +372,18 @@ fn scanner_ignores_a_comment() {
 fn scanner_keeps_scanning_after_a_test_module() {
     let source = "#[cfg(test)]\nmod tests {\n let s = \"}\";\n}\nx.scheduled_at.eq(Utc::now());";
     assert_eq!(violations(source).len(), 1);
+}
+
+#[test]
+fn scanner_keeps_a_url_string_out_of_the_comment_strip() {
+    let source =
+        "#[cfg(test)]\nmod tests {\n let u = \"http://x\";\n}\nx.scheduled_at.eq(Utc::now());";
+    assert_eq!(violations(source).len(), 1);
+}
+
+#[test]
+fn scanner_ignores_a_block_comment() {
+    assert_clean("/* scheduled_at: Utc::now() */");
 }
 
 #[test]
