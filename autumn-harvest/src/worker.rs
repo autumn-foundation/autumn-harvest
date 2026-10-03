@@ -16334,20 +16334,7 @@ async fn process_activity_task(
     // stay HalfOpen with `probe_in_flight = true` forever and short-circuit every
     // later dispatch. Only genuine handler outcomes feed the breaker as outcomes.
     probe_guard.disarm();
-    // A timeout can requeue the attempt before its handler returns (issue
-    // #1809). The enforcer already counted that timeout. A late result of the
-    // lost claim must not count again, and a late success must not clear the
-    // failure window. A self-committed activity completed its own row, so it
-    // keeps its `Success`. Only a breaker activity pays for the read.
-    let claim_lost = circuit_token.is_some()
-        && activity.circuit_breaker.is_some()
-        && !was_cancelled
-        && !committed_transactionally
-        && matches!(
-            queue::claim_is_current(&mut conn, &activity_claim).await,
-            Ok(false)
-        );
-    let circuit_outcome = if was_cancelled || claim_lost {
+    let circuit_outcome = if was_cancelled {
         if let Some(token) = circuit_token {
             circuit_breakers.on_cancelled(activity_name, token, std::time::Instant::now());
         }
@@ -16368,10 +16355,26 @@ async fn process_activity_task(
     };
     // `circuit_token` is always `Some` here: the short-circuit path returned
     // early above, so reaching this point means the attempt was dispatched.
+    //
+    // A timeout can requeue the attempt before its handler returns (issue
+    // #1809). The enforcer then marks the claim and counts the timeout. A
+    // late result of that claim must not count again, and a late success must
+    // not clear the failure window. `on_claim_result` checks the mark under
+    // the breaker lock, so the check cannot race the enforcer.
+    let claim_key = crate::circuit_breaker::ClaimKey {
+        task_id: activity_claim.task_id,
+        attempt: activity_claim.attempt,
+    };
     if let Some(transition) = circuit_token
         .zip(circuit_outcome)
         .and_then(|(token, outcome)| {
-            circuit_breakers.on_result(activity_name, outcome, token, std::time::Instant::now())
+            circuit_breakers.on_claim_result(
+                activity_name,
+                outcome,
+                token,
+                claim_key,
+                std::time::Instant::now(),
+            )
         })
     {
         match transition {

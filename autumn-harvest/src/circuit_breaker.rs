@@ -57,6 +57,7 @@ use crate::loom_sync::{Mutex, MutexGuard};
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+use uuid::Uuid;
 
 use crate::policy::CircuitBreakerPolicy;
 
@@ -105,6 +106,26 @@ impl DispatchToken {
         self.is_probe
     }
 }
+
+/// One claim of a task: the queue row and the attempt that the claim wrote.
+///
+/// The timeout enforcer marks a claim when it times out (issue #1809). The
+/// result of a marked claim does not move the breaker, because the enforcer
+/// already counted that attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ClaimKey {
+    /// The task queue row.
+    pub task_id: Uuid,
+    /// The row's `attempt` value that the claim wrote.
+    pub attempt: i32,
+}
+
+/// How long a timed-out claim stays marked. A handler that returns later than
+/// this counts as a normal result again.
+const TIMED_OUT_CLAIM_TTL: Duration = Duration::from_secs(3600);
+
+/// The most timed-out claims kept per activity. The oldest mark goes first.
+const MAX_TIMED_OUT_CLAIMS: usize = 4096;
 
 /// Outcome of consulting the breaker before dispatching an activity attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,6 +222,9 @@ struct BreakerState {
     /// (trip / close / force-open / force-close). A result whose dispatch token
     /// carries an older generation is a stale straggler and is fenced out.
     generation: u64,
+    /// Claims that the timeout enforcer timed out, with the mark time (issue
+    /// #1809). Their late results do not move the breaker.
+    timed_out_claims: HashMap<ClaimKey, Instant>,
 }
 
 impl Default for BreakerState {
@@ -213,6 +237,7 @@ impl Default for BreakerState {
             probe_in_flight: false,
             forced_open: false,
             generation: 0,
+            timed_out_claims: HashMap::new(),
         }
     }
 }
@@ -411,77 +436,58 @@ impl CircuitBreakerRegistry {
         let &policy = self.policies.get(activity_name)?;
         let mut states = self.lock();
         let st = states.entry(activity_name.to_string()).or_default();
+        apply_result(st, policy, outcome, token, now)
+    }
 
-        if st.forced_open {
-            // Operator-pinned: ignore organic results until force-closed.
+    /// Record the outcome of a dispatched attempt that holds `claim`.
+    ///
+    /// This is [`on_result`](Self::on_result) with one more fence. When the
+    /// timeout enforcer already timed out `claim`, the result does not move
+    /// the breaker (issue #1809). The enforcer counted that attempt, and a late
+    /// success must not clear the failure window. A timed-out probe releases
+    /// its slot as [`on_cancelled`](Self::on_cancelled) does. The check and the
+    /// update run under one lock, so they cannot race the enforcer.
+    pub fn on_claim_result(
+        &self,
+        activity_name: &str,
+        outcome: AttemptOutcome,
+        token: DispatchToken,
+        claim: ClaimKey,
+        now: Instant,
+    ) -> Option<CircuitTransition> {
+        let &policy = self.policies.get(activity_name)?;
+        let mut states = self.lock();
+        let st = states.entry(activity_name.to_string()).or_default();
+        if st.timed_out_claims.remove(&claim).is_some() {
+            apply_cancelled(st, token, now);
             return None;
         }
+        apply_result(st, policy, outcome, token, now)
+    }
 
-        // Generation fence: an attempt dispatched before the breaker's last
-        // state-resetting transition (trip / close / force-open / force-close)
-        // is stale and must not move the breaker. This subsumes the half-open
-        // straggler case AND the "pre-force-close failure re-trips the reset"
-        // case in one check.
-        if token.generation != st.generation {
-            return None;
+    /// Mark `claim` as timed out by the enforcer (issue #1809).
+    ///
+    /// A later [`on_claim_result`](Self::on_claim_result) for the claim then
+    /// leaves the breaker alone. A mark expires after an hour, and each
+    /// activity keeps at most a bounded number of marks.
+    pub fn mark_claim_timed_out(&self, activity_name: &str, claim: ClaimKey, now: Instant) {
+        if !self.policies.contains_key(activity_name) {
+            return;
         }
-
-        match st.phase {
-            CircuitPhase::Closed => match outcome {
-                // A success clears the rolling failure window.
-                AttemptOutcome::Success => {
-                    st.failures.clear();
-                    None
-                }
-                // A non-retryable (permanent per-request) error is excluded from
-                // trip counts entirely: it is neither downstream sickness nor
-                // proof of health, so it leaves the rolling window untouched.
-                AttemptOutcome::NonRetryableFailure => None,
-                AttemptOutcome::RetryableFailure => {
-                    st.failures.push_back(now);
-                    st.prune(now, policy.window);
-                    if st.failures.len() >= policy.failure_threshold as usize {
-                        st.trip(now);
-                        Some(CircuitTransition::Tripped)
-                    } else {
-                        None
-                    }
-                }
-            },
-            CircuitPhase::HalfOpen => {
-                // Only the admitted probe decides the half-open outcome. A
-                // same-generation non-probe (shouldn't normally happen, but be
-                // defensive) must not close the breaker early or restart cooldown.
-                if !token.is_probe {
-                    return None;
-                }
-                match outcome {
-                    // The probe reached the downstream and it answered: recovered.
-                    AttemptOutcome::Success => {
-                        st.close();
-                        Some(CircuitTransition::Closed)
-                    }
-                    // The probe failed transiently: the downstream is still down.
-                    AttemptOutcome::RetryableFailure => {
-                        st.trip(now);
-                        Some(CircuitTransition::Tripped)
-                    }
-                    // A non-retryable per-request error (e.g. bad input) does NOT
-                    // prove the downstream recovered — the error may have been
-                    // produced before the dependency was even touched. Treat the
-                    // probe as inconclusive: release the probe slot and re-arm the
-                    // cooldown so a fresh probe is admitted later, but emit no
-                    // transition (it is neither a recovery nor a downstream trip).
-                    AttemptOutcome::NonRetryableFailure => {
-                        st.trip(now);
-                        None
-                    }
-                }
-            }
-            // A result arriving while fully open (no probe admitted) is a
-            // stale straggler; leave the breaker untouched.
-            CircuitPhase::Open => None,
+        let mut states = self.lock();
+        let st = states.entry(activity_name.to_string()).or_default();
+        st.timed_out_claims
+            .retain(|_, at| now.saturating_duration_since(*at) < TIMED_OUT_CLAIM_TTL);
+        if st.timed_out_claims.len() >= MAX_TIMED_OUT_CLAIMS
+            && let Some(oldest) = st
+                .timed_out_claims
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(key, _)| *key)
+        {
+            st.timed_out_claims.remove(&oldest);
         }
+        st.timed_out_claims.insert(claim, now);
     }
 
     /// Record a retryable failure observed **out of band** — i.e. not from a
@@ -545,15 +551,7 @@ impl CircuitBreakerRegistry {
         }
         let mut states = self.lock();
         let st = states.entry(activity_name.to_string()).or_default();
-
-        if st.forced_open || token.generation != st.generation {
-            return;
-        }
-        // Only the in-flight half-open probe needs releasing; everything else
-        // (closed-state cancellation, fully-open straggler) is a no-op.
-        if token.is_probe && st.phase == CircuitPhase::HalfOpen && st.probe_in_flight {
-            st.trip(now);
-        }
+        apply_cancelled(st, token, now);
     }
 
     /// Operator action: pin the breaker open for manual incident response.
@@ -672,6 +670,98 @@ impl Default for CircuitBreakerRegistry {
 // Tests (red phase: written before the implementation above existed)
 // ---------------------------------------------------------------------------
 
+/// Apply one attempt outcome to an activity's breaker state.
+fn apply_result(
+    st: &mut BreakerState,
+    policy: CircuitBreakerPolicy,
+    outcome: AttemptOutcome,
+    token: DispatchToken,
+    now: Instant,
+) -> Option<CircuitTransition> {
+    if st.forced_open {
+        // Operator-pinned: ignore organic results until force-closed.
+        return None;
+    }
+
+    // Generation fence: an attempt dispatched before the breaker's last
+    // state-resetting transition (trip / close / force-open / force-close)
+    // is stale and must not move the breaker. This subsumes the half-open
+    // straggler case AND the "pre-force-close failure re-trips the reset"
+    // case in one check.
+    if token.generation != st.generation {
+        return None;
+    }
+
+    match st.phase {
+        CircuitPhase::Closed => match outcome {
+            // A success clears the rolling failure window.
+            AttemptOutcome::Success => {
+                st.failures.clear();
+                None
+            }
+            // A non-retryable (permanent per-request) error is excluded from
+            // trip counts entirely: it is neither downstream sickness nor
+            // proof of health, so it leaves the rolling window untouched.
+            AttemptOutcome::NonRetryableFailure => None,
+            AttemptOutcome::RetryableFailure => {
+                st.failures.push_back(now);
+                st.prune(now, policy.window);
+                if st.failures.len() >= policy.failure_threshold as usize {
+                    st.trip(now);
+                    Some(CircuitTransition::Tripped)
+                } else {
+                    None
+                }
+            }
+        },
+        CircuitPhase::HalfOpen => {
+            // Only the admitted probe decides the half-open outcome. A
+            // same-generation non-probe (shouldn't normally happen, but be
+            // defensive) must not close the breaker early or restart cooldown.
+            if !token.is_probe {
+                return None;
+            }
+            match outcome {
+                // The probe reached the downstream and it answered: recovered.
+                AttemptOutcome::Success => {
+                    st.close();
+                    Some(CircuitTransition::Closed)
+                }
+                // The probe failed transiently: the downstream is still down.
+                AttemptOutcome::RetryableFailure => {
+                    st.trip(now);
+                    Some(CircuitTransition::Tripped)
+                }
+                // A non-retryable per-request error (e.g. bad input) does NOT
+                // prove the downstream recovered — the error may have been
+                // produced before the dependency was even touched. Treat the
+                // probe as inconclusive: release the probe slot and re-arm the
+                // cooldown so a fresh probe is admitted later, but emit no
+                // transition (it is neither a recovery nor a downstream trip).
+                AttemptOutcome::NonRetryableFailure => {
+                    st.trip(now);
+                    None
+                }
+            }
+        }
+        // A result arriving while fully open (no probe admitted) is a
+        // stale straggler; leave the breaker untouched.
+        CircuitPhase::Open => None,
+    }
+}
+
+/// Release the breaker accounting of a cancelled or timed-out dispatch.
+fn apply_cancelled(st: &mut BreakerState, token: DispatchToken, now: Instant) {
+    if st.forced_open || token.generation != st.generation {
+        return;
+    }
+    // Only the in-flight half-open probe needs releasing; everything else
+    // (closed-state cancellation, fully-open straggler) is a no-op.
+    if token.is_probe && st.phase == CircuitPhase::HalfOpen && st.probe_in_flight {
+        st.trip(now);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -741,6 +831,95 @@ mod tests {
         );
         assert!(reg.snapshot("anything", now).is_none());
         assert!(reg.is_empty());
+    }
+
+    fn claim(attempt: i32) -> ClaimKey {
+        ClaimKey {
+            task_id: Uuid::from_u128(1809),
+            attempt,
+        }
+    }
+
+    fn rolling(reg: &CircuitBreakerRegistry, now: Instant) -> u32 {
+        reg.snapshot("send_email", now)
+            .expect("tracked")
+            .rolling_failure_count
+    }
+
+    /// Issue #1809: the enforcer marks the claim, then counts the timeout. A
+    /// late success of that claim must not clear the counted failure.
+    #[test]
+    fn late_success_of_a_timed_out_claim_keeps_the_failure() {
+        let reg = registry();
+        let t0 = Instant::now();
+        let token = dispatch(&reg, t0);
+        reg.mark_claim_timed_out("send_email", claim(1), t0);
+        let _ = reg.on_external_failure("send_email", t0);
+        assert_eq!(rolling(&reg, t0), 1);
+
+        let late = reg.on_claim_result("send_email", AttemptOutcome::Success, token, claim(1), t0);
+        assert_eq!(late, None);
+        assert_eq!(rolling(&reg, t0), 1, "the late success is fenced");
+
+        // The mark is used up. Another claim of the same task still counts.
+        let next = dispatch(&reg, t0);
+        let _ = reg.on_claim_result("send_email", AttemptOutcome::Success, next, claim(2), t0);
+        assert_eq!(rolling(&reg, t0), 0);
+    }
+
+    /// A result that lands before the mark counts as usual. The timeout then
+    /// counts too, so no order loses the timeout.
+    #[test]
+    fn result_before_the_mark_counts_and_the_timeout_still_counts() {
+        let reg = registry();
+        let t0 = Instant::now();
+        let token = dispatch(&reg, t0);
+        let _ = reg.on_claim_result("send_email", AttemptOutcome::Success, token, claim(1), t0);
+        reg.mark_claim_timed_out("send_email", claim(1), t0);
+        let _ = reg.on_external_failure("send_email", t0);
+        assert_eq!(rolling(&reg, t0), 1);
+    }
+
+    /// A timed-out probe releases its slot, so a later probe can run.
+    #[test]
+    fn timed_out_probe_releases_its_slot() {
+        let reg = registry();
+        let t0 = Instant::now();
+        for _ in 0..3 {
+            fail(&reg, t0);
+        }
+        let t1 = t0 + Duration::from_secs(61);
+        let probe = dispatch(&reg, t1);
+        assert!(probe.is_probe());
+        reg.mark_claim_timed_out("send_email", claim(1), t1);
+        let late = reg.on_claim_result("send_email", AttemptOutcome::Success, probe, claim(1), t1);
+        assert_eq!(late, None, "a timed-out probe does not close the breaker");
+        assert_eq!(
+            reg.snapshot("send_email", t1).expect("tracked").state,
+            "open"
+        );
+        let t2 = t1 + Duration::from_secs(61);
+        assert!(dispatch(&reg, t2).is_probe(), "a fresh probe is admitted");
+    }
+
+    /// A mark expires, so the mark set cannot grow without bound.
+    #[test]
+    fn timed_out_claim_marks_expire() {
+        let reg = registry();
+        let t0 = Instant::now();
+        reg.mark_claim_timed_out("send_email", claim(1), t0);
+        let later = t0 + TIMED_OUT_CLAIM_TTL + Duration::from_secs(1);
+        reg.mark_claim_timed_out("send_email", claim(2), later);
+        let token = dispatch(&reg, later);
+        fail(&reg, later);
+        let _ = reg.on_claim_result(
+            "send_email",
+            AttemptOutcome::Success,
+            token,
+            claim(1),
+            later,
+        );
+        assert_eq!(rolling(&reg, later), 0, "the expired mark no longer fences");
     }
 
     #[test]

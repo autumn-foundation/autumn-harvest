@@ -1617,6 +1617,20 @@ async fn enforce_activity_timeout(
     // neither did a `PENDING` task that timed out in the queue. Counting
     // them would let a backlog open the circuit and turn overload into
     // failure (#1785).
+    //
+    // Mark the claim first. The handler can still return after this point.
+    // Its late result then leaves the breaker alone, because this path
+    // counts the attempt.
+    if let Some(breakers) = circuit_breakers {
+        breakers.mark_claim_timed_out(
+            activity_name,
+            crate::circuit_breaker::ClaimKey {
+                task_id: task.id,
+                attempt: task.attempt,
+            },
+            std::time::Instant::now(),
+        );
+    }
     if enforced.handler_started
         && let Some(breakers) = circuit_breakers
         && breakers.on_external_failure(activity_name, std::time::Instant::now())
