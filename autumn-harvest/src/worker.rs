@@ -16349,8 +16349,6 @@ async fn settle_session_slot_once(
     registry: &crate::sessions::SessionSlotRegistry,
     row: &AttemptedSessionRow,
 ) -> bool {
-    use crate::schema::harvest_sessions::dsl;
-
     let session_id = row.session_id;
     let spacing = crate::pool::retry_spacing(pool);
     for attempt in 1..=FINALIZE_ACQUIRE_ATTEMPTS {
