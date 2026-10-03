@@ -246,8 +246,9 @@ pub struct HeartbeatFlushOptions {
 /// newer payload replaces it. A lost claim cancels `cancel` and stops the
 /// flusher.
 ///
-/// Each payload carries the time its sender stamped. The flush writes that
-/// time, so a payload that waits in the channel keeps its real age.
+/// Each payload carries the time its sender stamped. The flush writes the
+/// database clock minus the age of that time. A payload that waits in the
+/// channel thus keeps its real age.
 #[cfg(feature = "db")]
 #[must_use]
 pub fn spawn_heartbeat_flusher_with(
@@ -257,7 +258,7 @@ pub fn spawn_heartbeat_flusher_with(
     options: HeartbeatFlushOptions,
 ) -> mpsc::Sender<StampedHeartbeat> {
     let (tx, rx) = mpsc::channel(64);
-    let latest = Arc::new(Mutex::new(None));
+    let latest = LatestHeartbeat::default();
 
     tokio::spawn(keep_newest_heartbeat(
         rx,
@@ -271,7 +272,41 @@ pub fn spawn_heartbeat_flusher_with(
 
 /// The newest heartbeat not yet taken by the flush loop.
 #[cfg(feature = "db")]
-type LatestHeartbeat = Arc<Mutex<Option<Pending>>>;
+type LatestHeartbeat = Arc<Latest>;
+
+/// The slot that `keep_newest_heartbeat` fills and the flush loop takes.
+#[cfg(feature = "db")]
+#[derive(Default)]
+struct Latest {
+    slot: Mutex<Option<Pending>>,
+    /// Wakes a flush loop that waits after a blocked write.
+    published: tokio::sync::Notify,
+}
+
+#[cfg(feature = "db")]
+impl Latest {
+    /// Put `pending` in the slot and wake a waiting flush loop.
+    fn publish(&self, pending: Pending) {
+        *self.slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(pending);
+        self.published.notify_waiters();
+    }
+
+    /// Take the heartbeat from the slot.
+    fn take(&self) -> Option<Pending> {
+        self.slot
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
+
+    /// Whether a heartbeat waits in the slot.
+    fn is_full(&self) -> bool {
+        self.slot
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some()
+    }
+}
 
 /// Keep only the newest heartbeat for the flush loop (issue #1788).
 ///
@@ -307,7 +342,7 @@ async fn keep_newest_heartbeat(
             continue;
         }
         newest_sent = Some(beat.sent_order);
-        *latest.lock().unwrap_or_else(PoisonError::into_inner) = Some(Pending {
+        latest.publish(Pending {
             payload: beat.details,
             sent_order: beat.sent_order,
         });
@@ -400,30 +435,31 @@ async fn stamped_heartbeat_loop(
     // The newest payload not yet written, with its send time. A failed flush
     // puts it back here. A retry writes that time, not the retry time.
     let mut pending: Option<Pending> = None;
-    // Set when a write that blocked for an interval or more succeeds while a
-    // newer heartbeat waits. The loop then writes that heartbeat at once.
-    let mut flush_now = false;
+    // Set when a write that blocked for an interval or more succeeds. The
+    // next wait then ends as soon as a newer heartbeat is in the slot.
+    let mut after_blocked_write = false;
 
     loop {
         if cancel.is_cancelled() {
             tracing::debug!(task_id = %task_id, "heartbeat flusher cancelled");
             break;
         }
-        // Wait for either: a heartbeat arrives, the interval expires, or cancellation.
-        if !std::mem::take(&mut flush_now) {
+        // Wait for the interval, or for a newer heartbeat after a blocked write.
+        let waited = if std::mem::take(&mut after_blocked_write) {
+            wait_for_newer_heartbeat(&latest, flush_interval, &cancel).await
+        } else {
             tokio::select! {
-                () = cancel.cancelled() => {
-                    tracing::debug!(task_id = %task_id, "heartbeat flusher cancelled");
-                    break;
-                }
-                () = tokio::time::sleep(flush_interval) => {
-                    // Interval elapsed -- drain and flush.
-                }
+                () = cancel.cancelled() => false,
+                () = tokio::time::sleep(flush_interval) => true,
             }
+        };
+        if !waited {
+            tracing::debug!(task_id = %task_id, "heartbeat flusher cancelled");
+            break;
         }
 
         // Take the newest heartbeat. It replaces an unwritten older one.
-        let newest = latest.lock().unwrap_or_else(PoisonError::into_inner).take();
+        let newest = latest.take();
         if newest.is_some() {
             pending = newest;
         }
@@ -434,17 +470,10 @@ async fn stamped_heartbeat_loop(
             match flush(&pool, &claim, &beat, options.acquire_timeout).await {
                 Ok(ClaimWrite::Applied) => {
                     // A write that blocked leaves the row with an old send
-                    // time. A newer heartbeat that waits then goes at once,
-                    // so a timeout scanner does not see a live activity as
-                    // stale (issue #1788).
-                    flush_now = flushes_again_at_once(
-                        started.elapsed(),
-                        flush_interval,
-                        latest
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner)
-                            .is_some(),
-                    );
+                    // time. A newer heartbeat then goes at once, so a timeout
+                    // scanner does not see a live activity as stale
+                    // (issue #1788).
+                    after_blocked_write = write_blocked(started.elapsed(), flush_interval);
                 }
                 // The claim is no longer current (issue #1789). Stop the
                 // activity, so this stale attempt does no more work.
@@ -485,14 +514,45 @@ async fn stamped_heartbeat_loop(
     }
 }
 
-/// Whether the stamped flush loop writes a waiting heartbeat without the
+/// Whether the stamped flush loop writes the next heartbeat without the
 /// usual pause (issue #1788).
 ///
 /// Only a write that took `interval` or more qualifies. A quick write keeps
 /// the steady rate of one write per interval.
 #[cfg(feature = "db")]
-fn flushes_again_at_once(took: Duration, interval: Duration, newer_waits: bool) -> bool {
-    newer_waits && took >= interval
+fn write_blocked(took: Duration, interval: Duration) -> bool {
+    took >= interval
+}
+
+/// Wait for the next flush after a blocked write (issue #1788).
+///
+/// The wait ends at once when a heartbeat is in the slot. It also ends when
+/// `keep_newest_heartbeat` publishes one, or after `interval`. A heartbeat can
+/// still sit in the channel when the write ends, so one check of the slot is
+/// not enough.
+///
+/// Returns `false` when `cancel` fires.
+#[cfg(feature = "db")]
+async fn wait_for_newer_heartbeat(
+    latest: &Latest,
+    interval: Duration,
+    cancel: &CancellationToken,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + interval;
+    loop {
+        // Register before the check, so a publish between the two still wakes.
+        let published = latest.published.notified();
+        tokio::pin!(published);
+        published.as_mut().enable();
+        if latest.is_full() {
+            return true;
+        }
+        tokio::select! {
+            () = cancel.cancelled() => return false,
+            () = tokio::time::sleep_until(deadline) => return true,
+            () = &mut published => {}
+        }
+    }
 }
 
 /// The `site` label for a heartbeat flush acquire timeout.
@@ -595,7 +655,7 @@ mod tests {
             take_after: Option<usize>,
         ) -> Option<std::time::Instant> {
             let (tx, rx) = mpsc::channel(8);
-            let latest: LatestHeartbeat = Arc::new(Mutex::new(None));
+            let latest = LatestHeartbeat::default();
             let cancel = CancellationToken::new();
             let task = tokio::spawn(keep_newest_heartbeat(rx, Arc::clone(&latest), cancel));
             for (index, beat) in beats.into_iter().enumerate() {
@@ -605,13 +665,12 @@ mod tests {
                     tokio::task::yield_now().await;
                 }
                 if take_after == Some(index) {
-                    latest.lock().expect("lock").take();
+                    latest.take();
                 }
             }
             drop(tx);
             task.await.expect("join");
-            let slot = latest.lock().expect("lock");
-            slot.as_ref().map(|beat| beat.sent_order)
+            latest.take().map(|beat| beat.sent_order)
         }
 
         /// One process start, shared by every test beat, so their send
@@ -627,15 +686,41 @@ mod tests {
             }
         }
 
-        /// Only a write that blocked for an interval, with a newer heartbeat
-        /// waiting, skips the pause (issue #1788).
-        #[test]
-        fn only_a_blocked_write_flushes_again_at_once() {
+        /// A heartbeat can still sit in the channel when a blocked write
+        /// ends. Its later publish ends the wait at once (issue #1788).
+        #[tokio::test(start_paused = true)]
+        async fn a_publish_after_a_blocked_write_ends_the_wait() {
             let interval = Duration::from_secs(1);
-            assert!(flushes_again_at_once(interval * 3, interval, true));
-            assert!(flushes_again_at_once(interval, interval, true));
-            assert!(!flushes_again_at_once(interval * 3, interval, false));
-            assert!(!flushes_again_at_once(interval / 10, interval, true));
+            let latest = LatestHeartbeat::default();
+            let cancel = CancellationToken::new();
+            let start = tokio::time::Instant::now();
+            let waiter = {
+                let latest = Arc::clone(&latest);
+                tokio::spawn(
+                    async move { wait_for_newer_heartbeat(&latest, interval, &cancel).await },
+                )
+            };
+            tokio::time::sleep(interval / 10).await;
+            latest.publish(Pending {
+                payload: Value::Null,
+                sent_order: std::time::Instant::now(),
+            });
+            assert!(waiter.await.expect("join"));
+            assert!(
+                start.elapsed() < interval,
+                "the wait took {:?}; the publish must end it",
+                start.elapsed()
+            );
+        }
+
+        /// Only a write that took an interval or more skips the pause
+        /// (issue #1788).
+        #[test]
+        fn only_a_slow_write_counts_as_blocked() {
+            let interval = Duration::from_secs(1);
+            assert!(write_blocked(interval * 3, interval));
+            assert!(write_blocked(interval, interval));
+            assert!(!write_blocked(interval / 10, interval));
         }
 
         /// A heartbeat that arrives late keeps the newer one (issue #1788). Two
