@@ -57,6 +57,19 @@ struct CacheEntry {
     resident: Option<ResidentWorkflow>,
 }
 
+/// The entries that [`WorkflowCache::close`] removed (issue #1798).
+///
+/// Dropping the value drops each parked handler future and its context.
+pub(crate) struct ClosedEntries(#[allow(dead_code)] LruCache<Uuid, CacheEntry>);
+
+impl ClosedEntries {
+    /// The number of entries that the cache held.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
 /// LRU cache mapping workflow execution IDs to their cached replay state.
 ///
 /// Thread-safety: this cache is NOT `Sync` — it should be owned by a single
@@ -177,6 +190,19 @@ impl WorkflowCache {
         self.inner
             .pop(exec_id)
             .map(|entry| (entry.state, entry.resident))
+    }
+
+    /// Closes the cache when the worker stops (issue #1798).
+    ///
+    /// The method removes every entry and stops resident capture. A task
+    /// that outlives the shutdown drain then cannot park a future again. The
+    /// caller drops the returned entries outside the cache lock.
+    #[cfg_attr(not(feature = "db"), allow(dead_code))] // Only the db-gated worker closes the cache.
+    #[must_use = "drop the closed entries outside the cache lock"]
+    pub(crate) fn close(&mut self) -> ClosedEntries {
+        self.resident_enabled = false;
+        let empty = LruCache::new(self.inner.cap());
+        ClosedEntries(std::mem::replace(&mut self.inner, empty))
     }
 
     /// Look up a cached workflow state, marking it as recently used.
@@ -410,6 +436,25 @@ mod tests {
         assert_eq!(state.next_event_id, 7);
         assert!(live.is_some(), "the resident workflow comes with the entry");
         assert!(cache.take(&id).is_none(), "a take removes the entry");
+    }
+
+    #[tokio::test]
+    async fn close_releases_every_entry_and_stops_resident_capture() {
+        let mut cache = WorkflowCache::new(5);
+        cache.insert_resident(Uuid::new_v4(), make_state(3), Some(resident().await));
+        cache.insert(Uuid::new_v4(), make_state(5));
+
+        let closed = cache.close();
+        assert_eq!(closed.len(), 2, "close hands back every entry");
+        drop(closed);
+        assert!(cache.is_empty(), "a closed cache holds no entry");
+        assert!(!cache.resident_enabled());
+
+        // A task that outlives the shutdown drain cannot park a future again.
+        let id = Uuid::new_v4();
+        cache.insert_resident(id, make_state(7), Some(resident().await));
+        let (_, live) = cache.take(&id).expect("the snapshot is kept");
+        assert!(live.is_none(), "a closed cache keeps no resident workflow");
     }
 
     #[test]

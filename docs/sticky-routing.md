@@ -78,7 +78,7 @@ let worker = WorkerConfig::default().with_resident_workflows(false);
 A pin never blocks progress for longer than one sticky window.
 
 - **Crash.** The pin stays until `sticky_until` passes. A peer then claims the task. A wake re-arms the pin of a parked task, so each execution pinned to the dead worker waits up to one window at its next wake. With the default window, that is up to 5 s.
-- **Graceful shutdown.** The worker releases its pins when it starts to drain, and again after the drain (issue #1798). A wake during the drain does not re-arm a released pin. Peers can claim pending tasks at once, and a parked task as soon as it wakes. The release keeps the pins of worker sessions, because a session pin is a hard pin (issue #606).
+- **Graceful shutdown.** The worker releases its pins when it starts to drain, and again after the drain (issue #1798). A wake during the drain does not re-arm a released pin. Peers can claim pending tasks at once, and a parked task as soon as it wakes. The release keeps the pins of worker sessions, because a session pin is a hard pin (issue #606). After the drain the worker also empties its `WorkflowCache` and stops resident capture. A stopped `Worker` that a caller still holds then keeps no parked workflow in memory.
 
 The release is best effort. If it fails, the pins expire after one sticky window. A decision that still runs when the drain times out can pin its task again when it parks. That pin also expires after one window.
 

@@ -29129,6 +29129,7 @@ impl Worker {
         // A decision that parked during the drain pinned its task again.
         // Release once more. A task that outlived the drain keeps its pin.
         self.release_sticky_pins(pool, None).await;
+        self.close_workflow_cache().await;
 
         // All tasks complete — mark Stopped, then stop the heartbeat task.
         self.transition_fleet_status(pool, crate::workers::WorkerStatus::Stopped, None)
@@ -31268,6 +31269,7 @@ impl Worker {
         for (_, shard_pool) in shard_targets {
             self.release_sticky_pins(shard_pool, acquire_bound).await;
         }
+        self.close_workflow_cache().await;
     }
 
     /// Transition this worker's status in the fleet table.
@@ -32134,6 +32136,16 @@ impl Worker {
                 }
             }
         }
+    }
+
+    /// Releases the cached workflows once the in-flight drain ends (issue
+    /// #1798).
+    ///
+    /// A resident entry holds a parked handler future and its context. A
+    /// caller can keep the stopped `Worker`, so the cache must not keep them.
+    async fn close_workflow_cache(&self) {
+        let closed = self.workflow_cache.lock().await.close();
+        drop(closed);
     }
 
     /// Request graceful shutdown of this worker.
