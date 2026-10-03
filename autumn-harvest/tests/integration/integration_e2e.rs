@@ -1055,6 +1055,7 @@ pub(crate) fn runtime_config(
 ) -> WorkerRuntimeConfig {
     WorkerRuntimeConfig {
         codec_rotation_batch_size: 0,
+        scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
         dr: autumn_harvest::replication::DrConfig::default(),
         worker_id: worker_id.to_string(),
         queues: vec!["default".to_string()],
@@ -2101,6 +2102,7 @@ async fn worker_threads_execution_timeout_into_ctx_deadline() {
         Worker::new(
             WorkerRuntimeConfig {
                 codec_rotation_batch_size: 0,
+                scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
                 dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: "worker-deadline-echo".to_string(),
                 queues: vec!["default".to_string()],
@@ -2336,6 +2338,7 @@ async fn worker_surfaces_nominal_deadline_not_shifted_deadline_at() {
         Worker::new(
             WorkerRuntimeConfig {
                 codec_rotation_batch_size: 0,
+                scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
                 dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: "worker-deadline-echo-shifted".to_string(),
                 queues: vec!["default".to_string()],
@@ -2505,6 +2508,7 @@ async fn worker_completes_workflow_task_and_persists_result() {
         Worker::new(
             WorkerRuntimeConfig {
                 codec_rotation_batch_size: 0,
+                scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
                 dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: "worker-e2e-complete".to_string(),
                 queues: vec!["default".to_string()],
@@ -2646,6 +2650,7 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
         Worker::new(
             WorkerRuntimeConfig {
                 codec_rotation_batch_size: 0,
+                scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
                 dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: "worker-e2e-fail".to_string(),
                 queues: vec!["default".to_string()],
@@ -2821,6 +2826,7 @@ async fn worker_completes_workflow_with_activity_round_trip() {
         Worker::new(
             WorkerRuntimeConfig {
                 codec_rotation_batch_size: 0,
+                scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
                 dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: "worker-e2e-activity-round-trip".to_string(),
                 queues: vec!["default".to_string()],
@@ -3061,6 +3067,7 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
         Worker::new(
             WorkerRuntimeConfig {
                 codec_rotation_batch_size: 0,
+                scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
                 dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: "worker-e2e-activity-orphaned".to_string(),
                 queues: vec!["default".to_string()],
@@ -3326,6 +3333,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
         Worker::new(
             WorkerRuntimeConfig {
                 codec_rotation_batch_size: 0,
+                scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
                 dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: "worker-e2e-activity-timeout".to_string(),
                 queues: vec!["default".to_string()],
@@ -3516,6 +3524,7 @@ async fn worker_completes_workflow_with_timer_round_trip() {
         Worker::new(
             WorkerRuntimeConfig {
                 codec_rotation_batch_size: 0,
+                scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
                 dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: "worker-e2e-timer-round-trip".to_string(),
                 queues: vec!["default".to_string()],
@@ -8051,6 +8060,7 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
         Worker::new(
             WorkerRuntimeConfig {
                 codec_rotation_batch_size: 0,
+                scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
                 dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: "worker-sched-baseline".to_string(),
                 queues: vec!["default".to_string()],
@@ -8187,39 +8197,9 @@ async fn workflow_schedule_max_active_runs_enforced() {
     let worker = Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
-                codec_rotation_batch_size: 0,
-                dr: autumn_harvest::replication::DrConfig::default(),
-                worker_id: "worker-sched-maxruns".to_string(),
-                queues: vec!["default".to_string()],
-                notification_database_url: None,
-                max_concurrent_workflows: 4,
-                max_concurrent_activities: 4,
                 poll_interval: Duration::from_millis(100),
                 shutdown_timeout: Duration::from_secs(2),
-                cancellation_grace_period: Duration::from_secs(1),
-                sticky_timeout: Duration::from_secs(5),
-                max_local_activity_start_to_close: Duration::from_secs(60),
-                shard_assignments: vec![autumn_harvest::types::ShardId::new(0)],
-                worker_heartbeat_interval: Duration::from_secs(5),
-                build_id: String::new(),
-                deployment_name: None,
-                workflow_cache_size: 1000,
-                resident_workflows: true,
-                priority_aging_secs: None,
-                unknown_target_grace_window: Duration::from_secs(5),
-                poison_pill_threshold: 3,
-                capability_miss_max_redeliveries: 5,
-
-                workflow_task_timeout: std::time::Duration::from_secs(10),
-                workflow_panic_max_attempts: 3,
-                labels: std::collections::HashMap::new(),
-                queue_weights: std::collections::HashMap::new(),
-                max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
-                max_workflow_history_events: None,
-                shard_notification_database_urls: Vec::new(),
-                sharded_pool: None,
-                slot_tuner: None,
-                max_concurrent_sessions: 0,
+                ..runtime_config("worker-sched-maxruns", 4, 4, Duration::from_secs(10))
             },
             Arc::clone(&registry),
         )
@@ -8313,6 +8293,7 @@ async fn workflow_schedule_pause_and_resume() {
         Worker::new(
             WorkerRuntimeConfig {
                 codec_rotation_batch_size: 0,
+                scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
                 dr: autumn_harvest::replication::DrConfig::default(),
                 worker_id: "worker-sched-pause".to_string(),
                 queues: vec!["default".to_string()],

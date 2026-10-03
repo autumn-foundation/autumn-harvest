@@ -423,6 +423,10 @@ const HARVEST_WRITE_PRIVILEGE_REQUIREMENTS: &[(&str, &[&str])] = &[
         "harvest_audit_purge_watermark",
         &["SELECT", "INSERT", "UPDATE"],
     ),
+    // The timeout checker takes its per-shard lease here on every tick
+    // (issue #1795). A missing grant does not stop enforcement: the worker
+    // fails open and every replica runs every pass, as before the lease.
+    ("harvest_scanner_leases", &["SELECT", "INSERT", "UPDATE"]),
     // Claim-path gate tables. The claim CTE reads all four unconditionally on
     // every poll, so a storage role missing `SELECT` on any one of them makes
     // `claim_task` error and the worker claim *nothing* -- a missing grant
