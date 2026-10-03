@@ -2416,7 +2416,7 @@ impl HarvestBuilder {
     /// The plugin boot spawns the guard loop. A bare builder only stores the
     /// config, so call `ramp_guard::run_ramp_guard` without the plugin.
     #[must_use]
-    pub fn ramp_guard(mut self, config: crate::ramp_guard::RampGuardConfig) -> Self {
+    pub const fn ramp_guard(mut self, config: crate::ramp_guard::RampGuardConfig) -> Self {
         self.ramp_guard = config;
         self
     }

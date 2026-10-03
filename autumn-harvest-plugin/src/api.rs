@@ -1031,6 +1031,11 @@ impl HarvestApiState {
     }
 
     /// The build ramp guard settings (issue #1814).
+    ///
+    /// # Panics
+    ///
+    /// Panics if an internal mutex is poisoned.
+    #[must_use]
     pub fn ramp_guard_config(&self) -> autumn_harvest::ramp_guard::RampGuardConfig {
         *self
             .ramp_guard_config
@@ -1042,6 +1047,10 @@ impl HarvestApiState {
     ///
     /// The boot path reads them when it spawns the guard loop, so set them
     /// first.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an internal mutex is poisoned.
     pub fn set_ramp_guard_config(&self, config: autumn_harvest::ramp_guard::RampGuardConfig) {
         *self
             .ramp_guard_config

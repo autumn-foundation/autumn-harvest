@@ -507,7 +507,7 @@ async fn ramp_aborts_automatically_when_target_build_fails_every_run() {
     );
 
     // A second pass finds no ramp and writes nothing.
-    let again = guard_once(&[pool.clone()], &pool, &guard_config(), None).await;
+    let again = guard_once(std::slice::from_ref(&pool), &pool, &guard_config(), None).await;
     assert!(again.is_empty(), "no ramp is left to abort: {again:?}");
     assert_eq!(auto_abort_audit_rows(&mut conn).await, 1);
 }
@@ -531,7 +531,7 @@ async fn healthy_ramp_is_not_aborted() {
     wait_for_terminal(&mut conn, RUNS_A + RUNS_B).await;
     workers.stop().await;
 
-    let aborts = guard_once(&[pool.clone()], &pool, &guard_config(), None).await;
+    let aborts = guard_once(std::slice::from_ref(&pool), &pool, &guard_config(), None).await;
     assert!(aborts.is_empty(), "a healthy ramp must stay: {aborts:?}");
     let policy = get_build_policy(&mut conn, QUEUE)
         .await
@@ -562,7 +562,7 @@ async fn ramp_with_too_few_target_samples_is_not_aborted() {
     workers.stop().await;
 
     let strict = guard_config().with_min_samples(1_000);
-    let aborts = guard_once(&[pool.clone()], &pool, &strict, None).await;
+    let aborts = guard_once(std::slice::from_ref(&pool), &pool, &strict, None).await;
     assert!(
         aborts.is_empty(),
         "no verdict below min_samples: {aborts:?}"
@@ -693,7 +693,7 @@ async fn nd_blocked_target_runs_abort_on_nd_block_rate() {
         seed(&mut conn, true, "PAUSED", true).await;
     }
 
-    let aborts = guard_once(&[pool.clone()], &pool, &guard_config(), None).await;
+    let aborts = guard_once(std::slice::from_ref(&pool), &pool, &guard_config(), None).await;
     assert_eq!(aborts.len(), 1, "{aborts:?}");
     assert_eq!(aborts[0].reason, RampAbortReason::NdBlockRate);
     assert_eq!(
@@ -755,7 +755,7 @@ async fn only_current_step_non_canary_runs_count_and_timeouts_fail() {
         .expect("rename to canary");
     }
     assert!(
-        guard_once(&[pool.clone()], &pool, &guard_config(), None)
+        guard_once(std::slice::from_ref(&pool), &pool, &guard_config(), None)
             .await
             .is_empty(),
         "old-step and canary runs give no samples"
@@ -766,7 +766,7 @@ async fn only_current_step_non_canary_runs_count_and_timeouts_fail() {
     for _ in 0..5 {
         seed(&mut conn, true, "TIMED_OUT", false).await;
     }
-    let aborts = guard_once(&[pool.clone()], &pool, &guard_config(), None).await;
+    let aborts = guard_once(std::slice::from_ref(&pool), &pool, &guard_config(), None).await;
     assert_eq!(aborts.len(), 1, "{aborts:?}");
     assert_eq!(aborts[0].reason, RampAbortReason::FailureRate);
     assert_eq!(
@@ -825,10 +825,7 @@ async fn a_ramp_to_its_own_base_build_is_skipped() {
     for _ in 0..10 {
         seed(&mut conn, true, "FAILED", false).await;
     }
-    assert!(
-        guard_once(&[pool.clone()], &pool, &guard_config(), None)
-            .await
-            .is_empty()
-    );
+    let aborts = guard_once(std::slice::from_ref(&pool), &pool, &guard_config(), None).await;
+    assert!(aborts.is_empty(), "a promotion is not judged: {aborts:?}");
     assert!(ramp_is_active(&mut conn).await);
 }

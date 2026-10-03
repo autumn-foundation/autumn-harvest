@@ -84,7 +84,7 @@ impl RampGuardConfig {
     /// The setter clamps the value to `0.0..=1.0`. `NaN` keeps the current
     /// value. A value of 1 turns the failure check off.
     #[must_use]
-    pub fn with_max_failure_rate_increase(mut self, increase: f64) -> Self {
+    pub const fn with_max_failure_rate_increase(mut self, increase: f64) -> Self {
         self.max_failure_rate_increase = clamp_rate(increase, self.max_failure_rate_increase);
         self
     }
@@ -94,7 +94,7 @@ impl RampGuardConfig {
     /// The setter clamps the value to `0.0..=1.0`. `NaN` keeps the current
     /// value. A value of 1 turns the ND-block check off.
     #[must_use]
-    pub fn with_max_nd_block_rate_increase(mut self, increase: f64) -> Self {
+    pub const fn with_max_nd_block_rate_increase(mut self, increase: f64) -> Self {
         self.max_nd_block_rate_increase = clamp_rate(increase, self.max_nd_block_rate_increase);
         self
     }
@@ -131,7 +131,7 @@ impl RampGuardConfig {
 }
 
 /// `value` clamped to `0.0..=1.0`, or `current` when `value` is `NaN`.
-fn clamp_rate(value: f64, current: f64) -> f64 {
+const fn clamp_rate(value: f64, current: f64) -> f64 {
     if value.is_nan() {
         current
     } else {

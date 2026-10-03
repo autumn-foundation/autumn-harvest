@@ -952,9 +952,8 @@ mod ramp_guard_spawn_tests {
     #[tokio::test]
     async fn enabled_config_spawns_a_ramp_guard_that_stops_on_cancel() {
         let api_state = HarvestApiState::new();
-        api_state.set_ramp_guard_config(
-            RampGuardConfig::new().with_interval(Duration::from_secs(3600)),
-        );
+        api_state
+            .set_ramp_guard_config(RampGuardConfig::new().with_interval(Duration::from_secs(3600)));
         let cancel = CancellationToken::new();
         let handle = spawn_ramp_guard(&api_state, &lazy_pool(), &runtime(), cancel.clone())
             .expect("an enabled guard spawns");
