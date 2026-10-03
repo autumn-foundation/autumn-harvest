@@ -490,6 +490,18 @@ impl CircuitBreakerRegistry {
         st.timed_out_claims.insert(claim, now);
     }
 
+    /// Remove the mark of `claim`, when the enforcer did not time it out after
+    /// all (issue #1809). A result that already used the mark stays fenced.
+    pub fn unmark_claim_timed_out(&self, activity_name: &str, claim: ClaimKey) {
+        if !self.policies.contains_key(activity_name) {
+            return;
+        }
+        let mut states = self.lock();
+        if let Some(st) = states.get_mut(activity_name) {
+            st.timed_out_claims.remove(&claim);
+        }
+    }
+
     /// Record a retryable failure observed **out of band** — i.e. not from a
     /// handler return value with a dispatch token, but from an enforcement path
     /// such as an activity start-to-close / heartbeat timeout (issue #369).
@@ -900,6 +912,24 @@ mod tests {
         );
         let t2 = t1 + Duration::from_secs(61);
         assert!(dispatch(&reg, t2).is_probe(), "a fresh probe is admitted");
+    }
+
+    /// The enforcer marks before its transaction and unmarks when the
+    /// transaction does not time the claim out. The result then counts.
+    #[test]
+    fn unmarked_claim_counts_again() {
+        let reg = registry();
+        let t0 = Instant::now();
+        fail(&reg, t0);
+        let token = dispatch(&reg, t0);
+        reg.mark_claim_timed_out("send_email", claim(1), t0);
+        reg.unmark_claim_timed_out("send_email", claim(1));
+        let _ = reg.on_claim_result("send_email", AttemptOutcome::Success, token, claim(1), t0);
+        assert_eq!(
+            rolling(&reg, t0),
+            0,
+            "the success counts and clears the window"
+        );
     }
 
     /// A mark expires, so the mark set cannot grow without bound.
