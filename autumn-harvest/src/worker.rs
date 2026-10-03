@@ -656,7 +656,7 @@ pub struct HandlerRegistry {
     /// today's behaviour byte-for-byte.
     default_activity_retry_policy: Option<crate::policy::RetryPolicy>,
     /// Builder-level default activity `start_to_close` (issue #620). `None` = no
-    /// floor configured.
+    /// floor configured. `WorkerConfig` sets 10 minutes (issue #1808).
     default_activity_start_to_close: Option<Duration>,
     /// Ceiling on an author-supplied `Retry-After` delay hint (issue #744).
     /// Not opt-in — always applied. Mirrored from
@@ -1114,10 +1114,12 @@ impl HandlerRegistry {
 
     /// Install the builder-level default activity retry/timeout floor (issue #620).
     ///
-    /// Both are `None` by default — an unset floor is a pure no-op preserving
-    /// today's behaviour byte-for-byte. Resolved at schedule time as the
-    /// lowest-priority fallback: a call-site override or an activity's own
-    /// `#[activity(retry = …/start_to_close = …)]` default both win.
+    /// Both are `None` on a bare registry. `WorkerConfig::default()` passes a
+    /// 10-minute `start_to_close` (issue #1808). Resolved at schedule time as
+    /// the lowest-priority fallback: a call-site override or an activity's own
+    /// `#[activity(retry = …/start_to_close = …)]` default both win. The
+    /// `start_to_close` floor skips an activity with a `schedule_to_close` or
+    /// a `heartbeat_timeout`.
     #[must_use]
     pub fn with_activity_defaults(
         mut self,
@@ -10080,7 +10082,10 @@ fn build_activity_enqueue_plan(
         // Issue #620: call-site override → activity default → builder default.
         // Reserved session-internal activities skip the builder floor (see the
         // retry resolution above for the rationale).
-        let builder_stc_default = if is_reserved {
+        // Issue #1808: an activity that declares its own attempt bound also
+        // skips it. A `schedule_to_close` or a heartbeat timeout already stops
+        // a hung attempt, so a 10-minute cap must not cut a long one short.
+        let builder_stc_default = if is_reserved || activity.declares_attempt_bound() {
             None
         } else {
             registry.default_activity_start_to_close()

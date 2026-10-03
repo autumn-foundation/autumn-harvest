@@ -11917,6 +11917,48 @@ fn workflow_result_response(result: WorkflowResult) -> axum::response::Response 
     }
 }
 
+/// The `429` response for a start that load shedding refused (issue #1794).
+///
+/// `Retry-After` carries the policy delay in whole seconds. The body names the
+/// shed queue. The `429` status tells a caller that overload refused the
+/// start, not a manual gate.
+fn load_shed_response(
+    queue: &str,
+    oldest_pending_age_secs: u64,
+    retry_after_secs: u64,
+) -> axum::response::Response {
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(serde_json::json!({
+            "error": "load shed",
+            "queue": queue,
+            "oldest_pending_age_secs": oldest_pending_age_secs,
+            "retry_after_secs": retry_after_secs,
+        })),
+    )
+        .into_response();
+    response.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from(retry_after_secs),
+    );
+    response
+}
+
+/// Map a failed start to a response.
+///
+/// A shed start gets [`load_shed_response`]. `map_error` cannot set a header,
+/// so it would drop `Retry-After`. Every other error goes to `map_error`.
+fn start_error_response(error: HarvestError) -> axum::response::Response {
+    match error {
+        HarvestError::LoadShed {
+            queue,
+            oldest_pending_age_secs,
+            retry_after_secs,
+        } => load_shed_response(&queue, oldest_pending_age_secs, retry_after_secs),
+        other => map_error(other).into_response(),
+    }
+}
+
 fn workflow_result_pending_response() -> axum::response::Response {
     let mut response = StatusCode::NO_CONTENT.into_response();
     response.headers_mut().insert(
@@ -18927,7 +18969,9 @@ pub(crate) async fn start_workflow(
         // workflow resolves a throttle policy (the enclosing `if let`), so the
         // batch route's extra `workflow_resolving_throttle(...).is_some()` guard
         // is redundant here.
-        if let Some((gate_id, gate_reason, scope_kind)) = {
+        // Load shedding (issue #1794) follows the same rule. A deferred start
+        // never reaches the primitive's shed check, and its later fire is exempt.
+        let gate_hit = {
             let wf_owner = runtime
                 .registry
                 .workflows
@@ -18936,7 +18980,12 @@ pub(crate) async fn start_workflow(
             api_state
                 .gate_cache()
                 .check(&workflow_name, &queue_name, shard.as_i32(), wf_owner)
-        } {
+        };
+        let shed_hit = api_state
+            .gate_cache()
+            .load_shedder()
+            .check(&queue_name, std::time::Instant::now());
+        if gate_hit.is_some() || shed_hit.is_some() {
             // Idempotent-retry bypass (mirrors the batch route's bypasses). Only
             // meaningful for an explicit `workflow_id`: an auto-generated id varies
             // per retry and can never resolve to a prior run/row. The checks reuse
@@ -18989,7 +19038,7 @@ pub(crate) async fn start_workflow(
                     .await
                     .unwrap_or(false)
             };
-            if !is_idempotent_retry {
+            if !is_idempotent_retry && let Some((gate_id, gate_reason, scope_kind)) = gate_hit {
                 let reason_label = match gate_reason.char_indices().nth(64) {
                     Some((idx, _)) => &gate_reason[..idx],
                     None => &gate_reason,
@@ -19024,6 +19073,39 @@ pub(crate) async fn start_workflow(
                     })),
                 )
                     .into_response();
+            }
+            // The lookups above can outlast a sample, so re-check the shedder
+            // here rather than trust the decision taken before them.
+            if !is_idempotent_retry
+                && let Some(decision) = api_state
+                    .gate_cache()
+                    .load_shedder()
+                    .check(&queue_name, std::time::Instant::now())
+            {
+                runtime
+                    .registry
+                    .telemetry()
+                    .metrics
+                    .record_load_shed_rejected(&decision.queue);
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(workflow_name.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("load shed"),
+                    shard_id: Some(shard.as_i32()),
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+                return load_shed_response(
+                    &decision.queue,
+                    decision.oldest_pending_age_secs,
+                    decision.retry_after_secs,
+                );
             }
             // Idempotent retry: fall through to `reserve_or_defer`, which resolves
             // it to the existing execution / same pending row (no fresh admission).
@@ -19073,7 +19155,7 @@ pub(crate) async fn start_workflow(
             started_by: None,
         };
 
-        match autumn_harvest::throttle::reserve_or_defer(
+        match autumn_harvest::throttle::reserve_or_defer_or_shed(
             &mut conn,
             autumn_harvest::throttle::AdmitThrottleParams {
                 workflow_name: &workflow_name,
@@ -19147,6 +19229,32 @@ pub(crate) async fn start_workflow(
                 // Active execution already resolves this reuse policy as a
                 // no-op/immediate reject; no token reserved, fall through to
                 // the normal start below.
+            }
+            // The deferral point shed the start (issue #1794): answer 429 with
+            // `Retry-After`, like every other shed start.
+            Err(e @ HarvestError::LoadShed { .. }) => {
+                if let HarvestError::LoadShed { queue, .. } = &e {
+                    runtime
+                        .registry
+                        .telemetry()
+                        .metrics
+                        .record_load_shed_rejected(queue);
+                }
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(workflow_name.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("load shed"),
+                    shard_id: Some(shard.as_i32()),
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+                return start_error_response(e);
             }
             Err(e) => return map_error(e).into_response(),
         }
@@ -19414,7 +19522,7 @@ pub(crate) async fn start_workflow(
                     source: &source,
                 };
                 let _ = audit::insert_audit(&mut conn, &ar).await;
-                map_error(e).into_response()
+                start_error_response(e)
             }
         };
     }
@@ -19616,7 +19724,7 @@ pub(crate) async fn start_workflow(
                 source: &source,
             };
             let _ = audit::insert_audit(&mut conn, &ar).await;
-            map_error(e).into_response()
+            start_error_response(e)
         }
         Ok(start) => {
             // AC-a: a start that attached to an existing run (rather than
@@ -19941,6 +20049,11 @@ async fn batch_start_workflows(
     let mut shard_groups: std::collections::BTreeMap<ShardId, Vec<(usize, String)>> =
         std::collections::BTreeMap::new();
     let mut gate_rejected: Vec<BatchStartItemResult> = Vec::new();
+    // Load shedding (issue #1794). A throttle defer in Phase 2 skips the
+    // primitive's check, so each item is checked here. The first check per
+    // item is a hint. A fresh check after the idempotency lookups decides.
+    let mut shed_rejected = 0_usize;
+    let mut last_shed: Option<autumn_harvest::load_shed::ShedDecision> = None;
     for (idx, item) in request.items.iter().enumerate() {
         if pre_rejected_idxs.contains(&idx) {
             continue;
@@ -19959,12 +20072,17 @@ async fn batch_start_workflows(
             .workflows
             .get(&item.workflow_name)
             .and_then(|i| i.owner);
-        if let Some((gate_id, gate_reason, scope_kind)) = api_state.gate_cache().check(
+        let gate_hit = api_state.gate_cache().check(
             &item.workflow_name,
             item_queue,
             shard.as_i32(),
             item_owner,
-        ) {
+        );
+        let shed_hit = api_state
+            .gate_cache()
+            .load_shedder()
+            .check(item_queue, std::time::Instant::now());
+        if gate_hit.is_some() || shed_hit.is_some() {
             // Idempotent retry bypass: if the caller supplied an explicit
             // workflow_id, check whether an active (RUNNING/SUSPENDED) execution
             // already exists on this shard.  AllowDuplicate would return the
@@ -20056,25 +20174,58 @@ async fn batch_start_workflows(
                     .push((idx, workflow_id));
                 continue;
             }
-            let reason_label = match gate_reason.char_indices().nth(64) {
-                Some((idx2, _)) => &gate_reason[..idx2],
-                None => &gate_reason,
-            };
-            runtime
-                .registry
-                .telemetry()
-                .metrics
-                .record_admission_blocked(scope_kind, reason_label);
-            gate_rejected.push(BatchStartItemResult {
-                index: idx,
-                workflow_id: Some(workflow_id.clone()),
-                status: BatchStartItemStatus::Rejected,
-                execution_id: None,
-                error: Some(format!(
-                    "admission blocked by gate {gate_id}: {gate_reason}"
-                )),
-            });
-            continue;
+            if let Some((gate_id, gate_reason, scope_kind)) = gate_hit {
+                let reason_label = match gate_reason.char_indices().nth(64) {
+                    Some((idx2, _)) => &gate_reason[..idx2],
+                    None => &gate_reason,
+                };
+                runtime
+                    .registry
+                    .telemetry()
+                    .metrics
+                    .record_admission_blocked(scope_kind, reason_label);
+                gate_rejected.push(BatchStartItemResult {
+                    index: idx,
+                    workflow_id: Some(workflow_id.clone()),
+                    status: BatchStartItemStatus::Rejected,
+                    execution_id: None,
+                    error: Some(format!(
+                        "admission blocked by gate {gate_id}: {gate_reason}"
+                    )),
+                });
+                continue;
+            }
+            // `shed_hit` is only a hint. The lookups above can outlast a
+            // sample, so the decision comes from a fresh check, as on the
+            // single-start route. A cleared or stale state then fails open.
+            if let Some(decision) = api_state
+                .gate_cache()
+                .load_shedder()
+                .check(item_queue, std::time::Instant::now())
+            {
+                runtime
+                    .registry
+                    .telemetry()
+                    .metrics
+                    .record_load_shed_rejected(&decision.queue);
+                shed_rejected += 1;
+                gate_rejected.push(BatchStartItemResult {
+                    index: idx,
+                    workflow_id: Some(workflow_id.clone()),
+                    status: BatchStartItemStatus::Rejected,
+                    execution_id: None,
+                    error: Some(
+                        HarvestError::LoadShed {
+                            queue: decision.queue.clone(),
+                            oldest_pending_age_secs: decision.oldest_pending_age_secs,
+                            retry_after_secs: decision.retry_after_secs,
+                        }
+                        .to_string(),
+                    ),
+                });
+                last_shed = Some(decision);
+                continue;
+            }
         }
 
         shard_groups
@@ -20085,6 +20236,7 @@ async fn batch_start_workflows(
 
     // Atomic mode: if any item was gate-rejected, fail the whole batch.
     if request.atomic && !gate_rejected.is_empty() {
+        let only_shed = shed_rejected == gate_rejected.len();
         if let Ok(pool) = api_state.storage_pool()
             && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
         {
@@ -20097,11 +20249,37 @@ async fn batch_start_workflows(
                 request_id: request_id.as_deref(),
                 idempotency_key: None,
                 status: STATUS_FAILED,
-                error_summary: Some("atomic batch rejected: one or more items blocked by gate"),
+                error_summary: Some(if only_shed {
+                    "atomic batch rejected: one or more items shed"
+                } else {
+                    "atomic batch rejected: one or more items blocked by gate"
+                }),
                 shard_id: None,
                 source: &source,
             };
             let _ = audit::insert_audit(&mut conn, &ar).await;
+        }
+        // Only sheds: answer 429 with `Retry-After`, so the caller retries.
+        // A manual-gate block keeps the 409.
+        if let Some(decision) = last_shed.as_ref().filter(|_| only_shed) {
+            let mut response = (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(BatchStartRejectedResponse {
+                    message: format!(
+                        "{} of {} items shed on queue '{}'; no executions inserted (atomic=true)",
+                        gate_rejected.len(),
+                        request.items.len(),
+                        decision.queue
+                    ),
+                    rejected: gate_rejected,
+                }),
+            )
+                .into_response();
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from(decision.retry_after_secs),
+            );
+            return response;
         }
         return (
             StatusCode::CONFLICT,
@@ -20405,6 +20583,38 @@ async fn batch_start_workflows(
                         continue;
                     }
                 };
+                // The queue can trip after Phase 1 (issue #1794). A fresh row
+                // would defer past the primitive's check, so check here too.
+                // `skip_cap_check` marks an attach or a bypass, which is no
+                // fresh admission.
+                if !skip_cap_check
+                    && let Some(decision) = api_state
+                        .gate_cache()
+                        .load_shedder()
+                        .check(&queue_name, std::time::Instant::now())
+                {
+                    runtime
+                        .registry
+                        .telemetry()
+                        .metrics
+                        .record_load_shed_rejected(&decision.queue);
+                    rejected_count += 1;
+                    results.push(BatchStartItemResult {
+                        index: *idx,
+                        workflow_id: Some(workflow_id.clone()),
+                        status: BatchStartItemStatus::Rejected,
+                        execution_id: None,
+                        error: Some(
+                            HarvestError::LoadShed {
+                                queue: decision.queue,
+                                oldest_pending_age_secs: decision.oldest_pending_age_secs,
+                                retry_after_secs: decision.retry_after_secs,
+                            }
+                            .to_string(),
+                        ),
+                    });
+                    continue;
+                }
                 if !skip_cap_check && effective_wf_cap > 0 {
                     let observed = serde_json::to_string(&input).map_or(0u64, |s| s.len() as u64);
                     if observed > effective_wf_cap {
@@ -20460,7 +20670,7 @@ async fn batch_start_workflows(
                     start_source_ref: None,
                     started_by: Some(actor.clone()),
                 };
-                match autumn_harvest::throttle::reserve_or_defer(
+                match autumn_harvest::throttle::reserve_or_defer_or_shed(
                     &mut conn,
                     autumn_harvest::throttle::AdmitThrottleParams {
                         workflow_name: &item.workflow_name,
@@ -20501,6 +20711,15 @@ async fn batch_start_workflows(
                         // the normal start below.
                     }
                     Err(e) => {
+                        // A deferral-point shed (issue #1794) counts like any
+                        // other shed item.
+                        if let HarvestError::LoadShed { queue, .. } = &e {
+                            runtime
+                                .registry
+                                .telemetry()
+                                .metrics
+                                .record_load_shed_rejected(queue);
+                        }
                         rejected_count += 1;
                         results.push(BatchStartItemResult {
                             index: *idx,
@@ -20668,6 +20887,14 @@ async fn batch_start_workflows(
                     }
                     rejected_count += 1;
                     let err_str = e.to_string();
+                    // The queue can trip between Phase 1 and this start (issue
+                    // #1794). A shed keeps its 429 and `Retry-After` here too.
+                    let shed_retry_after = match &e {
+                        HarvestError::LoadShed {
+                            retry_after_secs, ..
+                        } => Some(*retry_after_secs),
+                        _ => None,
+                    };
                     results.push(BatchStartItemResult {
                         index: *idx,
                         workflow_id: Some(workflow_id.clone()),
@@ -20684,12 +20911,21 @@ async fn batch_start_workflows(
                             &source,
                             request_id.as_deref(),
                             route,
-                            "atomic batch rejected: start failure",
+                            if shed_retry_after.is_some() {
+                                "atomic batch rejected: item shed"
+                            } else {
+                                "atomic batch rejected: start failure"
+                            },
                         )
                         .await;
                         results.sort_by_key(|r| r.index);
-                        return (
-                            StatusCode::CONFLICT,
+                        let status = if shed_retry_after.is_some() {
+                            StatusCode::TOO_MANY_REQUESTS
+                        } else {
+                            StatusCode::CONFLICT
+                        };
+                        let mut response = (
+                            status,
                             Json(BatchStartRejectedResponse {
                                 message: format!(
                                     "atomic batch aborted: item {idx} failed: {err_str}"
@@ -20698,6 +20934,13 @@ async fn batch_start_workflows(
                             }),
                         )
                             .into_response();
+                        if let Some(secs) = shed_retry_after {
+                            response.headers_mut().insert(
+                                axum::http::header::RETRY_AFTER,
+                                axum::http::HeaderValue::from(secs),
+                            );
+                        }
+                        return response;
                     }
                 }
             }
@@ -21914,7 +22157,7 @@ pub(crate) async fn signal_with_start_workflow(
                 source: &source,
             };
             let _ = audit::insert_audit(&mut conn, &ar).await;
-            map_error(e).into_response()
+            start_error_response(e)
         }
         Ok(outcome) => {
             let exec_id_str = outcome.exec_id.to_string();
@@ -22746,7 +22989,7 @@ async fn update_with_start_workflow(
                 source: &source,
             };
             let _ = audit::insert_audit(&mut conn, &ar).await;
-            map_error(e).into_response()
+            start_error_response(e)
         }
         Ok(outcome) => {
             let exec_id_str = outcome.exec_id.to_string();
@@ -23679,7 +23922,7 @@ async fn rerun_workflow(
         Err(e) => {
             let msg = e.to_string();
             audit_rerun_failure_on(&mut conn, &audit_ctx, Some(&exec_id_str), &msg).await;
-            map_error(e).into_response()
+            start_error_response(e)
         }
     }
 }
@@ -44868,6 +45111,10 @@ pub(crate) fn map_error(error: HarvestError) -> AutumnError {
             details.insert("current".to_string(), vec![current.to_string()]);
             AutumnError::validation(details).with_status(axum::http::StatusCode::TOO_MANY_REQUESTS)
         }
+        // A route with no `start_error_response` arm still answers 429 for a
+        // shed start (issue #1794). It has no `Retry-After` header.
+        error @ HarvestError::LoadShed { .. } => AutumnError::bad_request_msg(error.to_string())
+            .with_status(axum::http::StatusCode::TOO_MANY_REQUESTS),
         HarvestError::Database(message) => AutumnError::service_unavailable_msg(message),
         // The run moved after the authorizer hook checked it (issue #1803).
         // Nothing was read or written on the new shard. The body is the

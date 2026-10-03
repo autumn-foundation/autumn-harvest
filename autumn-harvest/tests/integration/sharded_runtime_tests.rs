@@ -834,7 +834,7 @@ async fn shutdown_completes_when_a_shard_pool_is_exhausted_after_monitors_have_t
     // Let startup finish. Let every monitor loop, poll-interval (100ms)
     // and heartbeat-cadence (500ms) alike, tick at least once against a
     // healthy shard 0.
-    tokio::time::sleep(Duration::from_millis(3_000)).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
 
     // *Now* exhaust shard 0's pool: claim every connection it has, all at
     // once. The monitors have already had a chance to complete real
