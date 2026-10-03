@@ -1778,6 +1778,9 @@ from the benchmark are directly comparable.
   evidence for that measurement.
 * `autumn-harvest/scripts/claim_batched_seek_and_refine_perf_repro.sh` —
   regenerates that evidence from a clean checkout.
+* [`docs/performance-task-queue-hygiene.md`](performance-task-queue-hygiene.md) —
+  claim latency after 1M terminal task rows, before and after the
+  terminal-task janitor and table tuning (issue #1811).
 
 ### Other profiling notes
 
