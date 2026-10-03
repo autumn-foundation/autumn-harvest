@@ -7178,6 +7178,7 @@ impl WorkflowContext {
     /// # Panics
     ///
     /// Panics if the matcher mutex is poisoned.
+    #[cfg_attr(not(any(feature = "db", feature = "testing")), allow(dead_code))] // Resident paths need the worker or the test harness.
     pub(crate) fn begin_resident_cycle(&self, delta: &[WorkflowEvent]) {
         self.set_suspending(false);
         self.log_commands_queued

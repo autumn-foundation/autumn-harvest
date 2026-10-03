@@ -169,6 +169,7 @@ impl WorkflowCache {
     ///
     /// The worker takes the entry on a hit, so no other task can resume the
     /// same parked future.
+    #[cfg_attr(not(feature = "db"), allow(dead_code))] // Only the db-gated worker takes entries.
     pub(crate) fn take(
         &mut self,
         exec_id: &Uuid,

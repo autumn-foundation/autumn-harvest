@@ -2242,6 +2242,8 @@ pub(crate) struct DriveResult {
     /// The explicit context-local router, if any. See [`run_workflow_with_state`].
     pub(crate) router: Option<crate::shard::ShardRouter>,
     /// The suspended workflow, kept for the next decision (issue #1798).
+    #[cfg_attr(not(any(feature = "db", feature = "testing")), allow(dead_code))]
+    // Resident paths need the worker or the test harness.
     pub(crate) resident: Option<crate::resident::ResidentWorkflow>,
 }
 
@@ -2299,6 +2301,7 @@ pub(crate) async fn drive_workflow_keep(
 ///
 /// The caller has already sent the new result to the parked future. The span
 /// records `harvest.replay = false`, because the cycle replays nothing.
+#[cfg_attr(not(any(feature = "db", feature = "testing")), allow(dead_code))] // Resident paths need the worker or the test harness.
 pub(crate) async fn drive_resumed(
     ctx: std::sync::Arc<WorkflowContext>,
     future: OwnedHandlerFuture,
