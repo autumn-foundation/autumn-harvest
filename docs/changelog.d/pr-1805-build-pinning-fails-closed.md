@@ -10,7 +10,7 @@ warning at registration. It also sets the gauge
 `harvest.worker.empty_build_policy{queue}`.
 
 This change is breaking for workers with the default empty `build_id`.
-See `docs/upgrading/0.7.0.md` §1.2.
+See `docs/upgrading/0.7.0.md` §1.3.
 
 No migration. No `WorkflowEvent` variant. No replay impact.
 

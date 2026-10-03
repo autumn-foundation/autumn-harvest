@@ -230,6 +230,13 @@ pub const OP_QUEUE_RESUME: &str = "queue.resume";
 pub const OP_TOKEN_CREATE: &str = "token.create";
 /// Audit operation: revoked a scoped API token (issue #942).
 pub const OP_TOKEN_REVOKE: &str = "token.revoke";
+/// Audit operation: a queue started to shed new starts (issue #1794).
+///
+/// The load-shed sampler writes it, not a route. So no `ALL_MUTATION_ROUTES`
+/// entry exists for it.
+pub const OP_LOAD_SHED_TRIP: &str = "load_shed.trip";
+/// Audit operation: a queue stopped shedding new starts (issue #1794).
+pub const OP_LOAD_SHED_CLEAR: &str = "load_shed.clear";
 /// Audit operation: a token scope or the authorizer hook denied a request
 /// (issue #1803).
 ///
@@ -937,6 +944,10 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_QUEUE_RESUME,
     OP_TOKEN_CREATE,
     OP_TOKEN_REVOKE,
+    // Automatic load shedding (issue #1794). No route entry: the sampler
+    // writes these rows.
+    OP_LOAD_SHED_TRIP,
+    OP_LOAD_SHED_CLEAR,
 ];
 
 /// Routes explicitly excluded from audit.

@@ -474,6 +474,8 @@ pub mod webhook_trigger;
 #[cfg(feature = "db")]
 #[doc(hidden)]
 pub mod dlq;
+/// Automatic load shedding driven by backlog age (issue #1794).
+pub mod load_shed;
 #[cfg(feature = "db")]
 #[doc(hidden)]
 pub mod models;

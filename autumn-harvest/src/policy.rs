@@ -1554,8 +1554,8 @@ pub(crate) fn resolve_effective_retry(
 /// Resolve the effective activity `start_to_close` at schedule time (issue #620).
 ///
 /// Same precedence as [`resolve_effective_retry`]: call-site override →
-/// activity default → builder default. `None` when unset (no timeout enforced),
-/// preserving today's behaviour.
+/// activity default → builder default. `None` means that no timeout applies.
+/// `WorkerConfig` sets a 10-minute builder default (issue #1808).
 ///
 /// The sole non-test consumer is the `db`-gated worker dispatch path; unused
 /// under `--no-default-features` (the pure precedence is still test-covered).
