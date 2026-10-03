@@ -178,16 +178,698 @@ struct Finding {
 /// `index_tables` maps each index name to its table, from `index_tables()`.
 /// A `DROP INDEX` needs it, because the statement does not name the table.
 fn lint(
-    _sql: &str,
-    _run_in_transaction: bool,
-    _index_tables: &BTreeMap<String, String>,
+    sql: &str,
+    run_in_transaction: bool,
+    index_tables: &BTreeMap<String, String>,
 ) -> Vec<Finding> {
-    Vec::new()
+    let (toks, comments) = tokenize(sql);
+    let created = created_tables(&toks);
+    let is_hot = |table: Option<&str>| match table {
+        // An index that no migration creates has an unknown table. Fail closed.
+        None => true,
+        Some(t) => HOT_TABLES.contains(&t) && !created.contains(t),
+    };
+
+    let mut findings = Vec::new();
+    let mut first_lock: Option<&Hit> = None;
+    let hits = statements(&toks);
+    for hit in &hits {
+        let table = hit.table.as_deref().or_else(|| {
+            hit.index
+                .as_ref()
+                .and_then(|i| index_tables.get(i))
+                .map(String::as_str)
+        });
+        let hot = is_hot(table);
+        match hit.kind {
+            Kind::Index { concurrent: true } => {
+                if run_in_transaction {
+                    findings.push(Finding {
+                        rule: Rule::ConcurrentlyInTransaction,
+                        line: hit.line,
+                        detail: format!(
+                            "{} CONCURRENTLY cannot run in a transaction. Set \
+                             `run_in_transaction = false` in metadata.toml.",
+                            hit.verb
+                        ),
+                    });
+                }
+                continue;
+            }
+            Kind::Index { concurrent: false } if hot => findings.push(Finding {
+                rule: Rule::BlockingIndex,
+                line: hit.line,
+                detail: format!(
+                    "plain {} on {} blocks the table for the whole build",
+                    hit.verb,
+                    table.unwrap_or("an index that no migration creates")
+                ),
+            }),
+            _ => {}
+        }
+        if hot && first_lock.is_none_or(|first| hit.at < first.at) {
+            first_lock = Some(hit);
+        }
+    }
+
+    if let Some(lock) = first_lock {
+        if first_lock_timeout(&toks, run_in_transaction).is_none_or(|at| at > lock.at) {
+            findings.push(Finding {
+                rule: Rule::LockTimeout,
+                line: lock.line,
+                detail: format!(
+                    "{} locks {} with no non-zero lock_timeout set before it",
+                    hit_label(lock),
+                    lock.table
+                        .as_deref()
+                        .or_else(|| lock
+                            .index
+                            .as_ref()
+                            .and_then(|i| index_tables.get(i))
+                            .map(String::as_str))
+                        .unwrap_or("an unknown table")
+                ),
+            });
+        }
+    }
+
+    apply_annotations(sql, &comments, findings)
+}
+
+/// A short label for a statement in a failure message.
+fn hit_label(hit: &Hit) -> String {
+    match &hit.index {
+        Some(index) => format!("{} {index}", hit.verb),
+        None => hit.verb.to_string(),
+    }
 }
 
 /// Map each index that a migration creates to its table.
-fn index_tables<'a>(_sqls: impl IntoIterator<Item = &'a str>) -> BTreeMap<String, String> {
-    BTreeMap::new()
+fn index_tables<'a>(sqls: impl IntoIterator<Item = &'a str>) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    for sql in sqls {
+        let (toks, _) = tokenize(sql);
+        for hit in statements(&toks) {
+            if let (Some(index), Some(table)) = (hit.index, hit.table) {
+                map.insert(index, table);
+            }
+        }
+    }
+    map
+}
+
+// ── Annotations ──────────────────────────────────────────────────────────────
+
+/// A valid allow annotation.
+struct Annotation {
+    rule: Rule,
+    line: usize,
+    used: bool,
+}
+
+/// Parse one `--` comment as an annotation.
+///
+/// Returns `None` for an ordinary comment. The form is
+/// `lock-safety: allow <rule> #<issue> <reason>`.
+fn parse_annotation(comment: &str) -> Option<Result<Rule, String>> {
+    let body = comment.trim().strip_prefix(ANNOTATION_PREFIX)?;
+    let mut words = body.split_whitespace();
+    let parsed = (|| {
+        if words.next() != Some("allow") {
+            return Err("an annotation must start with `allow`".to_string());
+        }
+        let id = words.next().unwrap_or("");
+        let rule = Rule::from_id(id)
+            .filter(|rule| rule.allowable())
+            .ok_or_else(|| format!("`{id}` is not a rule an annotation can allow"))?;
+        let issue = words.next().unwrap_or("");
+        let digits = issue.strip_prefix('#').unwrap_or("");
+        if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+            return Err("an annotation must cite an issue as `#<number>`".to_string());
+        }
+        if words.next().is_none() {
+            return Err("an annotation must give a reason after the issue".to_string());
+        }
+        Ok(rule)
+    })();
+    Some(parsed)
+}
+
+/// Drop each finding that an annotation directly above it allows.
+///
+/// "Directly above" means only `--` comment lines sit between the annotation
+/// and the statement. A blank line or code line ends the search.
+fn apply_annotations(sql: &str, comments: &[Comment], findings: Vec<Finding>) -> Vec<Finding> {
+    let comment_lines: BTreeSet<usize> = sql
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| line.trim_start().starts_with("--"))
+        .map(|(i, _)| i + 1)
+        .collect();
+
+    let mut out = Vec::new();
+    let mut annotations = Vec::new();
+    for comment in comments {
+        match parse_annotation(&comment.text) {
+            None => {}
+            Some(Ok(rule)) => annotations.push(Annotation {
+                rule,
+                line: comment.line,
+                used: false,
+            }),
+            Some(Err(detail)) => out.push(Finding {
+                rule: Rule::BadAnnotation,
+                line: comment.line,
+                detail,
+            }),
+        }
+    }
+
+    for finding in findings {
+        let mut allowed = false;
+        let mut line = finding.line;
+        while line > 1 && comment_lines.contains(&(line - 1)) {
+            line -= 1;
+            for annotation in annotations
+                .iter_mut()
+                .filter(|a| a.line == line && a.rule == finding.rule)
+            {
+                annotation.used = true;
+                allowed = true;
+            }
+        }
+        if !allowed {
+            out.push(finding);
+        }
+    }
+
+    out.extend(annotations.iter().filter(|a| !a.used).map(|a| Finding {
+        rule: Rule::UnusedAnnotation,
+        line: a.line,
+        detail: format!(
+            "allows {} but the statement below needs no such allowance",
+            a.rule.id()
+        ),
+    }));
+    out.sort_by_key(|f| (f.line, f.rule));
+    out
+}
+
+// ── Lexer ────────────────────────────────────────────────────────────────────
+
+/// One lexical token of an `up.sql`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Tok {
+    /// A keyword or an identifier. An unquoted word is lowercased.
+    Word(String),
+    /// The value of a string literal.
+    Str(String),
+    /// Any other character.
+    Punct(char),
+}
+
+struct Token {
+    tok: Tok,
+    line: usize,
+}
+
+/// A `--` comment, without the dashes.
+struct Comment {
+    text: String,
+    line: usize,
+}
+
+/// Split `sql` into tokens and `--` comments.
+///
+/// Comments and string literals never become words, so prose cannot match a
+/// statement. A dollar-quoted body is scanned as code, because a `DO $$`
+/// block holds real DDL. That also scans a dollar-quoted string literal, which
+/// fails closed.
+fn tokenize(sql: &str) -> (Vec<Token>, Vec<Comment>) {
+    let chars: Vec<char> = sql.chars().collect();
+    let at = |i: usize| chars.get(i).copied();
+    let mut toks = Vec::new();
+    let mut comments = Vec::new();
+    let mut line = 1;
+    let mut i = 0;
+    while let Some(c) = at(i) {
+        let next = at(i + 1);
+        if c == '\n' {
+            line += 1;
+            i += 1;
+        } else if c.is_whitespace() {
+            i += 1;
+        } else if c == '-' && next == Some('-') {
+            let start = i + 2;
+            while at(i).is_some_and(|c| c != '\n') {
+                i += 1;
+            }
+            comments.push(Comment {
+                text: chars[start..i].iter().collect(),
+                line,
+            });
+        } else if c == '/' && next == Some('*') {
+            // Block comments nest in Postgres.
+            let mut depth = 0;
+            while let Some(c) = at(i) {
+                if c == '/' && at(i + 1) == Some('*') {
+                    depth += 1;
+                    i += 2;
+                } else if c == '*' && at(i + 1) == Some('/') {
+                    depth -= 1;
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    line += usize::from(c == '\n');
+                    i += 1;
+                }
+            }
+        } else if c == '\'' || (matches!(c, 'e' | 'E') && next == Some('\'')) {
+            // An `E'...'` string also takes backslash escapes.
+            let escapes = c != '\'';
+            let start_line = line;
+            i += if escapes { 2 } else { 1 };
+            let mut value = String::new();
+            while let Some(c) = at(i) {
+                line += usize::from(c == '\n');
+                if escapes && c == '\\' {
+                    if let Some(escaped) = at(i + 1) {
+                        line += usize::from(escaped == '\n');
+                        value.push(escaped);
+                    }
+                    i += 2;
+                } else if c == '\'' && at(i + 1) == Some('\'') {
+                    value.push('\'');
+                    i += 2;
+                } else if c == '\'' {
+                    i += 1;
+                    break;
+                } else {
+                    value.push(c);
+                    i += 1;
+                }
+            }
+            toks.push(Token {
+                tok: Tok::Str(value),
+                line: start_line,
+            });
+        } else if c == '"' {
+            // A quoted identifier keeps its case. `""` is an escaped quote.
+            i += 1;
+            let mut value = String::new();
+            while let Some(c) = at(i) {
+                if c == '"' && at(i + 1) == Some('"') {
+                    value.push('"');
+                    i += 2;
+                } else if c == '"' {
+                    i += 1;
+                    break;
+                } else {
+                    line += usize::from(c == '\n');
+                    value.push(c);
+                    i += 1;
+                }
+            }
+            toks.push(Token {
+                tok: Tok::Word(value),
+                line,
+            });
+        } else if let Some(len) = dollar_tag_len(&chars[i..]) {
+            i += len;
+        } else if c.is_alphanumeric() || c == '_' {
+            let start = i;
+            while at(i).is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '$') {
+                i += 1;
+            }
+            let word: String = chars[start..i].iter().collect();
+            toks.push(Token {
+                tok: Tok::Word(word.to_lowercase()),
+                line,
+            });
+        } else {
+            toks.push(Token {
+                tok: Tok::Punct(c),
+                line,
+            });
+            i += 1;
+        }
+    }
+    (toks, comments)
+}
+
+/// The length of a dollar-quote delimiter such as `$$` or `$body$`.
+///
+/// Returns `None` for anything else, such as a `$1` parameter.
+fn dollar_tag_len(rest: &[char]) -> Option<usize> {
+    if rest.first() != Some(&'$') {
+        return None;
+    }
+    let tag = rest[1..]
+        .iter()
+        .take_while(|c| c.is_ascii_alphanumeric() || **c == '_')
+        .count();
+    if tag > 0 && rest[1].is_ascii_digit() {
+        return None;
+    }
+    (rest.get(1 + tag) == Some(&'$')).then_some(tag + 2)
+}
+
+// ── Statement matching ───────────────────────────────────────────────────────
+
+/// What a matched statement does to its table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    /// `CREATE INDEX`, `DROP INDEX` or `REINDEX`.
+    Index { concurrent: bool },
+    /// Any other statement that takes a blocking lock.
+    Lock,
+}
+
+/// One statement that can lock a table.
+#[derive(Debug)]
+struct Hit {
+    /// The token index of the statement's first word.
+    at: usize,
+    line: usize,
+    verb: &'static str,
+    /// The index the statement names, if any.
+    index: Option<String>,
+    /// The table the statement names. `None` when only `index` is known.
+    table: Option<String>,
+    kind: Kind,
+}
+
+fn word(toks: &[Token], k: usize) -> Option<&str> {
+    match &toks.get(k)?.tok {
+        Tok::Word(w) => Some(w),
+        _ => None,
+    }
+}
+
+fn is_word(toks: &[Token], k: usize, expected: &str) -> bool {
+    word(toks, k) == Some(expected)
+}
+
+fn is_punct(toks: &[Token], k: usize, expected: char) -> bool {
+    toks.get(k).is_some_and(|t| t.tok == Tok::Punct(expected))
+}
+
+fn string(toks: &[Token], k: usize) -> Option<&str> {
+    match &toks.get(k)?.tok {
+        Tok::Str(s) => Some(s),
+        _ => None,
+    }
+}
+
+/// Read a name that may carry a schema. Return its last part and the next index.
+fn qualified_name(toks: &[Token], k: usize) -> Option<(String, usize)> {
+    let mut name = word(toks, k)?;
+    let mut k = k + 1;
+    while is_punct(toks, k, '.') {
+        let Some(part) = word(toks, k + 1) else {
+            break;
+        };
+        name = part;
+        k += 2;
+    }
+    Some((name.to_string(), k))
+}
+
+/// Read a comma-separated list of names. Each name may carry `ONLY`.
+fn name_list(toks: &[Token], mut k: usize) -> Vec<String> {
+    let mut names = Vec::new();
+    loop {
+        if is_word(toks, k, "only") {
+            k += 1;
+        }
+        let Some((name, next)) = qualified_name(toks, k) else {
+            break;
+        };
+        names.push(name);
+        if !is_punct(toks, next, ',') {
+            break;
+        }
+        k = next + 1;
+    }
+    names
+}
+
+/// Skip `IF EXISTS` or `IF NOT EXISTS` at `k`.
+fn skip_if_exists(toks: &[Token], k: usize) -> usize {
+    if !is_word(toks, k, "if") {
+        return k;
+    }
+    let j = if is_word(toks, k + 1, "not") {
+        k + 2
+    } else {
+        k + 1
+    };
+    if is_word(toks, j, "exists") { j + 1 } else { k }
+}
+
+/// Tables that `toks` creates. A lock on a brand-new table blocks no one.
+fn created_tables(toks: &[Token]) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for k in 0..toks.len() {
+        if !is_word(toks, k, "create") {
+            continue;
+        }
+        let mut j = k + 1;
+        if ["temp", "temporary", "unlogged"]
+            .iter()
+            .any(|w| is_word(toks, j, w))
+        {
+            j += 1;
+        }
+        if is_word(toks, j, "table") {
+            if let Some((name, _)) = qualified_name(toks, skip_if_exists(toks, j + 1)) {
+                out.insert(name);
+            }
+        }
+    }
+    out
+}
+
+/// Every statement in `toks` that can take a blocking table lock.
+fn statements(toks: &[Token]) -> Vec<Hit> {
+    let mut hits = Vec::new();
+    for k in 0..toks.len() {
+        let line = toks[k].line;
+        let lock = |verb, table: String| Hit {
+            at: k,
+            line,
+            verb,
+            index: None,
+            table: Some(table),
+            kind: Kind::Lock,
+        };
+        match word(toks, k) {
+            Some("create") => {
+                if let Some(hit) = create_index(toks, k) {
+                    hits.push(hit);
+                } else if let Some(table) = trigger_table(toks, k, k + 1) {
+                    hits.push(lock("CREATE TRIGGER", table));
+                }
+            }
+            Some("drop") if is_word(toks, k + 1, "index") => {
+                let mut j = k + 2;
+                let concurrent = is_word(toks, j, "concurrently");
+                j = skip_if_exists(toks, j + usize::from(concurrent));
+                for index in name_list(toks, j) {
+                    hits.push(Hit {
+                        at: k,
+                        line,
+                        verb: "DROP INDEX",
+                        index: Some(index),
+                        table: None,
+                        kind: Kind::Index { concurrent },
+                    });
+                }
+            }
+            Some("drop") if is_word(toks, k + 1, "table") => {
+                let j = skip_if_exists(toks, k + 2);
+                hits.extend(
+                    name_list(toks, j)
+                        .into_iter()
+                        .map(|t| lock("DROP TABLE", t)),
+                );
+            }
+            Some("drop") if is_word(toks, k + 1, "trigger") => {
+                if let Some(table) = trigger_table(toks, k, k + 1) {
+                    hits.push(lock("DROP TRIGGER", table));
+                }
+            }
+            Some("alter") if is_word(toks, k + 1, "table") => {
+                let mut j = skip_if_exists(toks, k + 2);
+                if is_word(toks, j, "only") {
+                    j += 1;
+                }
+                if let Some((table, _)) = qualified_name(toks, j) {
+                    hits.push(lock("ALTER TABLE", table));
+                }
+            }
+            Some(verb @ ("lock" | "truncate")) => {
+                let j = if is_word(toks, k + 1, "table") {
+                    k + 2
+                } else {
+                    k + 1
+                };
+                let verb = if verb == "lock" {
+                    "LOCK TABLE"
+                } else {
+                    "TRUNCATE"
+                };
+                hits.extend(name_list(toks, j).into_iter().map(|t| lock(verb, t)));
+            }
+            Some("references") => {
+                if let Some((table, _)) = qualified_name(toks, k + 1) {
+                    hits.push(lock("REFERENCES", table));
+                }
+            }
+            Some("reindex") => hits.extend(reindex(toks, k)),
+            _ => {}
+        }
+    }
+    hits
+}
+
+/// `CREATE [UNIQUE] INDEX [CONCURRENTLY] [IF NOT EXISTS] [name] ON [ONLY] table`.
+fn create_index(toks: &[Token], k: usize) -> Option<Hit> {
+    let mut j = k + 1;
+    if is_word(toks, j, "unique") {
+        j += 1;
+    }
+    if !is_word(toks, j, "index") {
+        return None;
+    }
+    j += 1;
+    let concurrent = is_word(toks, j, "concurrently");
+    j = skip_if_exists(toks, j + usize::from(concurrent));
+    let mut index = None;
+    if !is_word(toks, j, "on") {
+        let (name, next) = qualified_name(toks, j)?;
+        index = Some(name);
+        j = next;
+    }
+    if !is_word(toks, j, "on") {
+        return None;
+    }
+    j += 1;
+    if is_word(toks, j, "only") {
+        j += 1;
+    }
+    let (table, _) = qualified_name(toks, j)?;
+    Some(Hit {
+        at: k,
+        line: toks[k].line,
+        verb: "CREATE INDEX",
+        index,
+        table: Some(table),
+        kind: Kind::Index { concurrent },
+    })
+}
+
+/// The table of `CREATE [OR REPLACE] [CONSTRAINT] TRIGGER ... ON table` or
+/// `DROP TRIGGER [IF EXISTS] name ON table`. `j` is the index after the verb.
+fn trigger_table(toks: &[Token], k: usize, mut j: usize) -> Option<String> {
+    if is_word(toks, k, "create") {
+        if is_word(toks, j, "or") && is_word(toks, j + 1, "replace") {
+            j += 2;
+        }
+        if is_word(toks, j, "constraint") {
+            j += 1;
+        }
+    }
+    if !is_word(toks, j, "trigger") {
+        return None;
+    }
+    while j < toks.len() && !is_punct(toks, j, ';') {
+        if is_word(toks, j, "on") {
+            return qualified_name(toks, j + 1).map(|(table, _)| table);
+        }
+        j += 1;
+    }
+    None
+}
+
+/// `REINDEX [(options)] {INDEX | TABLE} [CONCURRENTLY] name`.
+fn reindex(toks: &[Token], k: usize) -> Option<Hit> {
+    let mut j = k + 1;
+    if is_punct(toks, j, '(') {
+        while j < toks.len() && !is_punct(toks, j, ')') {
+            j += 1;
+        }
+        j += 1;
+    }
+    let on_index = is_word(toks, j, "index");
+    if !on_index && !is_word(toks, j, "table") {
+        return None;
+    }
+    j += 1;
+    let concurrent = is_word(toks, j, "concurrently");
+    let (name, _) = qualified_name(toks, j + usize::from(concurrent))?;
+    let (index, table) = if on_index {
+        (Some(name), None)
+    } else {
+        (None, Some(name))
+    };
+    Some(Hit {
+        at: k,
+        line: toks[k].line,
+        verb: "REINDEX",
+        index,
+        table,
+        kind: Kind::Index { concurrent },
+    })
+}
+
+/// The token index of the first `lock_timeout` setting that bounds a wait.
+///
+/// Accepts `SET [LOCAL | SESSION] lock_timeout {= | TO} <value>` and
+/// `set_config('lock_timeout', <value>, <is_local>)`. A transaction-local
+/// setting does nothing outside a transaction, so it counts only inside one.
+fn first_lock_timeout(toks: &[Token], run_in_transaction: bool) -> Option<usize> {
+    (0..toks.len()).find(|&k| {
+        if is_word(toks, k, "set") {
+            let mut j = k + 1;
+            let local = is_word(toks, j, "local");
+            if local || is_word(toks, j, "session") {
+                j += 1;
+            }
+            if !is_word(toks, j, "lock_timeout") {
+                return false;
+            }
+            j += 1;
+            if is_punct(toks, j, '=') || is_word(toks, j, "to") {
+                j += 1;
+            }
+            (run_in_transaction || !local) && bounds_wait(toks, j)
+        } else if is_word(toks, k, "set_config")
+            && is_punct(toks, k + 1, '(')
+            && string(toks, k + 2) == Some("lock_timeout")
+            && is_punct(toks, k + 3, ',')
+        {
+            let local = is_word(toks, k + 6, "true");
+            (run_in_transaction || !local) && bounds_wait(toks, k + 4)
+        } else {
+            false
+        }
+    })
+}
+
+/// Whether the value at `k` is a non-zero timeout. `0` and `DEFAULT` disable it.
+fn bounds_wait(toks: &[Token], k: usize) -> bool {
+    let value = match toks.get(k).map(|t| &t.tok) {
+        Some(Tok::Str(s) | Tok::Word(s)) => s.trim(),
+        _ => return false,
+    };
+    let number: String = value
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    number.parse::<f64>().is_ok_and(|n| n > 0.0)
 }
 
 /// Read Diesel's `run_in_transaction` out of a `metadata.toml`.
@@ -268,8 +950,7 @@ fn read_migration(tree: &'static str, dir: &Path) -> OnDisk {
         .unwrap_or_else(|| panic!("migration directory name is not UTF-8: {}", dir.display()))
         .to_string();
     let up = dir.join("up.sql");
-    let sql =
-        std::fs::read_to_string(&up).unwrap_or_else(|e| panic!("read {}: {e}", up.display()));
+    let sql = std::fs::read_to_string(&up).unwrap_or_else(|e| panic!("read {}: {e}", up.display()));
     let metadata = dir.join("metadata.toml");
     let run_in_transaction = if metadata.is_file() {
         let text = std::fs::read_to_string(&metadata)
@@ -329,7 +1010,11 @@ fn every_create_index_spelling_is_recognised() {
     ] {
         let sql = format!("SET LOCAL lock_timeout = '5s';\n{sql}");
         let findings = lint_with_history(&[], &sql, true);
-        assert_eq!(rules(&findings), [Rule::BlockingIndex], "{sql}: {findings:?}");
+        assert_eq!(
+            rules(&findings),
+            [Rule::BlockingIndex],
+            "{sql}: {findings:?}"
+        );
     }
 }
 
@@ -357,8 +1042,10 @@ fn a_table_created_in_the_same_migration_is_not_hot_yet() {
 
 #[test]
 fn drop_index_resolves_its_table_from_earlier_migrations() {
-    let history = ["CREATE INDEX idx_hot ON harvest_workflow_executions (id);\n\
-                    CREATE INDEX idx_cold ON harvest_schedules (id);"];
+    let history = [
+        "CREATE INDEX idx_hot ON harvest_workflow_executions (id);\n\
+                    CREATE INDEX idx_cold ON harvest_schedules (id);",
+    ];
 
     let hot = "SET LOCAL lock_timeout = '5s';\nDROP INDEX IF EXISTS public.idx_hot;";
     assert_eq!(
@@ -513,8 +1200,12 @@ fn concurrently_needs_run_in_transaction_false() {
 fn metadata_toml_is_read_like_diesel_reads_it() {
     assert!(run_in_transaction(""));
     assert!(run_in_transaction("run_in_transaction = true\n"));
-    assert!(!run_in_transaction("# no transaction\nrun_in_transaction = false\n"));
-    assert!(!run_in_transaction("run_in_transaction=false # CONCURRENTLY\n"));
+    assert!(!run_in_transaction(
+        "# no transaction\nrun_in_transaction = false\n"
+    ));
+    assert!(!run_in_transaction(
+        "run_in_transaction=false # CONCURRENTLY\n"
+    ));
 }
 
 // ── The escape hatch ─────────────────────────────────────────────────────────
@@ -608,7 +1299,10 @@ fn the_20260915231809_index_rebuild_is_flagged_and_grandfathered() {
             .all(|f| f.detail.contains("harvest_workflow_executions")),
         "{index_findings:?}"
     );
-    assert!(rules(&findings).contains(&Rule::LockTimeout), "{findings:?}");
+    assert!(
+        rules(&findings).contains(&Rule::LockTimeout),
+        "{findings:?}"
+    );
 
     for rule in [Rule::BlockingIndex, Rule::LockTimeout] {
         assert!(
@@ -667,7 +1361,11 @@ fn grandfather_entries_are_shipped_in_scope_and_unique() {
             version <= GRANDFATHER_CEILING,
             "{name} is newer than {GRANDFATHER_CEILING}. Use the in-file annotation."
         );
-        assert!(rule.allowable(), "{name}: {} cannot be grandfathered", rule.id());
+        assert!(
+            rule.allowable(),
+            "{name}: {} cannot be grandfathered",
+            rule.id()
+        );
         assert!(!reason.trim().is_empty(), "{name}: give a reason");
         assert!(seen.insert((*name, *rule)), "{name}: duplicate entry");
     }
@@ -707,7 +1405,9 @@ fn the_lint_runs_in_the_ci_lint_job() {
     let at = block
         .find(FILTER)
         .unwrap_or_else(|| panic!("the lint job must run `{FILTER}`"));
-    let step_start = block[..at].rfind("\n      - ").expect("the run line is in a step");
+    let step_start = block[..at]
+        .rfind("\n      - ")
+        .expect("the run line is in a step");
     let step_end = block[at..]
         .find("\n      - ")
         .map_or(block.len(), |end| at + end);
@@ -722,10 +1422,13 @@ fn the_lint_runs_in_the_ci_lint_job() {
 #[test]
 fn the_author_guide_matches_the_lint() {
     let path = workspace_root().join("docs/upgrading/online-migrations.md");
-    let guide = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let guide =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     for table in HOT_TABLES {
-        assert!(guide.contains(&format!("`{table}`")), "the guide must list {table}");
+        assert!(
+            guide.contains(&format!("`{table}`")),
+            "the guide must list {table}"
+        );
     }
     for rule in Rule::ALL {
         assert!(
@@ -740,5 +1443,36 @@ fn the_author_guide_matches_the_lint() {
         LOCK_SAFETY_CUTOFF,
     ] {
         assert!(guide.contains(needle), "the guide must mention {needle}");
+    }
+}
+
+/// Every SQL example in the author guide passes the lint.
+///
+/// An example that runs `CONCURRENTLY` is linted with
+/// `run_in_transaction = false`, as the guide tells authors to write it. The
+/// annotation template is skipped.
+#[test]
+fn the_author_guide_examples_pass_the_lint() {
+    let path = workspace_root().join("docs/upgrading/online-migrations.md");
+    let guide =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let examples: Vec<&str> = guide
+        .split("```sql\n")
+        .skip(1)
+        .filter_map(|rest| rest.split_once("```").map(|(body, _)| body))
+        .filter(|body| !body.contains("<rule>"))
+        .collect();
+    assert!(examples.len() >= 3, "the guide lost its SQL examples");
+    for example in examples {
+        let concurrent = tokenize(example)
+            .0
+            .iter()
+            .any(|t| t.tok == Tok::Word("concurrently".to_string()));
+        let findings = lint_with_history(&[], example, !concurrent);
+        assert_eq!(
+            findings,
+            [],
+            "this guide example fails the lint:\n{example}"
+        );
     }
 }
