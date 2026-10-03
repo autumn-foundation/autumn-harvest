@@ -1753,3 +1753,94 @@ async fn moved_rows_count_against_their_new_reasons_limit() {
     );
     assert_eq!(moved, 2, "both moved rows must still be handed out");
 }
+
+/// Inserts a live RUNNING row in `queue` whose schedule-to-close deadline
+/// has passed.
+async fn insert_schedule_to_close_task(conn: &mut AsyncPgConnection, queue: &str) {
+    let id = insert_running_task(conn, queue, false, false).await;
+    diesel::sql_query(
+        "UPDATE harvest_task_queue SET schedule_to_close_at = NOW() - INTERVAL '1 hour' \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(id)
+    .execute(conn)
+    .await
+    .expect("expire schedule-to-close");
+}
+
+/// A row that moves to an earlier reason is not handed out by a later lane
+/// in the same pass.
+///
+/// The start-to-close lane queues the target. Before its batch loads, the
+/// target is started again, misses its heartbeat and passes its
+/// schedule-to-close deadline. The heartbeat lane has already passed it.
+/// The target moves to the heartbeat lane. The schedule-to-close lane then
+/// reads its page in the same pass.
+#[tokio::test]
+async fn a_moved_row_is_reserved_for_its_new_reason() {
+    let (url, _container) = setup_test_db_url().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.expect("connection");
+    let queue = "scanner-lease-reserved";
+    diesel::sql_query("DELETE FROM harvest_task_queue WHERE queue_name = $1")
+        .bind::<diesel::sql_types::Text, _>(queue)
+        .execute(&mut conn)
+        .await
+        .expect("clear queue");
+    // Page 1 at a batch of 1 holds 64 rows: 2 start-to-close rows, 3
+    // schedule-to-close rows and 59 live rows.
+    for _ in 0..2 {
+        insert_running_task(&mut conn, queue, false, true).await;
+    }
+    for _ in 0..3 {
+        insert_schedule_to_close_task(&mut conn, queue).await;
+    }
+    insert_live_tasks(&mut conn, queue, 59).await;
+    // Page 2 starts with a start-to-close row, then the target.
+    insert_running_task(&mut conn, queue, false, true).await;
+    let target = insert_running_task(&mut conn, queue, false, true).await;
+    insert_live_tasks(&mut conn, queue, 300).await;
+
+    // Passes 1 to 3: the start-to-close lane queues the target on pass 3.
+    let mut cursor = TimeoutScanCursor::default();
+    for _ in 0..3 {
+        let page = timeout::find_timed_out_tasks_batch(&mut conn, &mut cursor, 1)
+            .await
+            .expect("batch scan");
+        assert!(!page.iter().any(|(t, _)| t.id == target));
+    }
+    diesel::sql_query(
+        "UPDATE harvest_task_queue \
+         SET started_at = NOW(), \
+             last_heartbeat_at = NOW() - INTERVAL '1 hour', \
+             schedule_to_close_at = NOW() - INTERVAL '1 hour' \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(target)
+    .execute(&mut conn)
+    .await
+    .expect("move the target's deadlines");
+
+    let mut reasons = Vec::new();
+    for _ in 0..3 {
+        let page = timeout::find_timed_out_tasks_batch(&mut conn, &mut cursor, 1)
+            .await
+            .expect("batch scan");
+        reasons.extend(
+            page.into_iter()
+                .filter(|(t, _)| t.id == target)
+                .map(|(_, r)| r),
+        );
+    }
+
+    diesel::sql_query("DELETE FROM harvest_task_queue WHERE queue_name = $1")
+        .bind::<diesel::sql_types::Text, _>(queue)
+        .execute(&mut conn)
+        .await
+        .expect("clear queue");
+    assert_eq!(
+        reasons,
+        [TimeoutReason::Heartbeat],
+        "the target must go out once, under the reason it moved to"
+    );
+}

@@ -979,8 +979,12 @@ pub async fn find_timed_out_tasks_batch(
         // A row whose queued reason stopped matching can match another one
         // now. The other lanes may have left it to this reason. It moves to
         // the first one that matches, and counts against that lane's limit.
+        // The move is reserved for the rest of the pass, so no later lane
+        // hands the row out under its own reason.
         if !lapsed.is_empty() {
-            moves.extend(lapsed_moves(conn, index, lapsed).await?);
+            let reserved = lapsed_moves(conn, index, lapsed).await?;
+            seen.extend(reserved.iter().map(|(_, id)| *id));
+            moves.extend(reserved);
         }
     }
 
