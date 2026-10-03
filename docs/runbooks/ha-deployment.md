@@ -235,11 +235,11 @@ If the earlier lane has already passed the row, the later reason takes it.
 So the row does not wait for a whole sweep. A queued row keeps its reason,
 also when an earlier reason starts to match later.
 
-A row that fails to enforce is tried again on the next pass, next to the
-next batch. So one bad row does not block the rows behind it. A pass tries
-at most one batch of such rows per reason. The others wait for the next
-sweep. A leader that fails three passes in a row gives up its lease, and
-another replica tries. A replica that comes back from standby starts a new
+A row that fails to enforce is tried again first in the next batch, for at
+most three passes in a row. Retried and queued rows share the batch limit.
+After its third try, the row waits for the next sweep, so bad rows cannot
+block the rows behind them. A leader that fails three passes in a row gives
+up its lease, and another replica tries. A replica that comes back from standby starts a new
 sweep. A batch that fails to load stays queued.
 
 ### Jitter

@@ -649,33 +649,59 @@ struct TimeoutScanLane {
     as_of: Option<chrono::DateTime<chrono::Utc>>,
     /// Expired ids from the last refill, not yet handed out.
     queued: std::collections::VecDeque<uuid::Uuid>,
-    /// Ids that failed to enforce on the last pass. The next pass loads them
-    /// next to its batch, outside the batch limit.
-    retry: Vec<uuid::Uuid>,
+    /// Ids that failed to enforce, with the tries each has had. The next
+    /// batch loads them first.
+    retry: Vec<(uuid::Uuid, u32)>,
+    /// The retried ids of the last loaded batch, with their tries.
+    loaded_retries: Vec<(uuid::Uuid, u32)>,
 }
+
+/// Most passes in a row that try one failing row.
+///
+/// It matches the failed passes after which a leader gives up its lease.
+/// After that, the row waits for the next sweep. So rows that keep failing
+/// cannot hold the batch forever on a checker without a lease.
+const MAX_ROW_TRIES: u32 = 3;
 
 impl TimeoutScanLane {
     /// The ids of the next batch, without taking them.
     ///
-    /// It holds at most `limit` retried ids and `limit` queued ids. So the
-    /// load of a pass stays bounded, also when no leader gives up on failures.
+    /// Retried ids come first. Retried and queued ids share one `limit`, so
+    /// the load of a pass stays bounded.
     fn next_batch(&self, limit: usize) -> Vec<uuid::Uuid> {
-        self.retry
+        let (retries, queued) = self.batch_split(limit);
+        self.retry[..retries]
             .iter()
-            .take(limit)
-            .chain(self.queued.iter().take(limit))
-            .copied()
+            .map(|(id, _)| *id)
+            .chain(self.queued.iter().take(queued).copied())
             .collect()
     }
 
     /// Takes the ids of [`Self::next_batch`] after the batch loads.
     ///
-    /// Retried ids past the limit are dropped. A row that stays expired
-    /// comes back in the next sweep.
+    /// Ids that the batch did not load stay for the next pass.
     fn commit_batch(&mut self, limit: usize) {
-        self.retry.clear();
-        let take = limit.min(self.queued.len());
-        self.queued.drain(..take);
+        let (retries, queued) = self.batch_split(limit);
+        self.loaded_retries = self.retry.drain(..retries).collect();
+        self.queued.drain(..queued);
+    }
+
+    /// The retried and queued ids that a batch of `limit` takes.
+    fn batch_split(&self, limit: usize) -> (usize, usize) {
+        let retries = limit.min(self.retry.len());
+        (retries, (limit - retries).min(self.queued.len()))
+    }
+
+    /// Tries `id` again on the next pass, unless it has had its tries.
+    fn retry(&mut self, id: uuid::Uuid) {
+        let tries = self
+            .loaded_retries
+            .iter()
+            .find(|(loaded, _)| *loaded == id)
+            .map_or(1, |(_, tries)| tries + 1);
+        if tries < MAX_ROW_TRIES {
+            self.retry.push((id, tries));
+        }
     }
 }
 
@@ -698,10 +724,11 @@ impl TimeoutScanLane {
 /// Each refill reads at most one page of index entries, and each pass loads
 /// at most one batch. So the work of a pass does not grow with the backlog.
 ///
-/// A row that fails to enforce is tried again on the next pass, next to the
-/// next batch. So one bad row cannot block the rows behind it, and a leader
-/// that fails on it keeps failing until it gives up its lease. A replica that
-/// comes back from standby starts a new sweep.
+/// A row that fails to enforce is tried again first in the next batch, for
+/// at most three passes in a row. So a leader that fails on it keeps failing
+/// until it gives up its lease. After that, the row waits for the next sweep,
+/// so rows that keep failing cannot block the rows behind them. A replica
+/// that comes back from standby starts a new sweep.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TimeoutScanCursor {
     lanes: [TimeoutScanLane; 4],
@@ -710,7 +737,7 @@ pub struct TimeoutScanCursor {
 impl TimeoutScanCursor {
     /// Tries `id` again on the next pass, in the lane of `reason`.
     pub(crate) fn retry(&mut self, reason: &TimeoutReason, id: uuid::Uuid) {
-        self.lanes[timeout_lane(reason)].retry.push(id);
+        self.lanes[timeout_lane(reason)].retry(id);
     }
 
     /// Prepares the cursor for a tick that runs the pass.
@@ -827,12 +854,12 @@ pub async fn find_timed_out_tasks_batch(
         }
         lane_clocks.push(lane.as_of);
 
-        // Retried ids ride along outside the limit, so a row that keeps
-        // failing cannot stall the rows behind it. The lane gives up the ids
-        // only after the load, so a failed load loses none.
+        // The lane gives up the ids only after the load, so a failed load
+        // loses none.
         let take = usize::try_from(limit).unwrap_or(usize::MAX);
         let batch = lane.next_batch(take);
         if batch.is_empty() {
+            lane.commit_batch(take);
             continue;
         }
         let page: Vec<TaskQueueItem> = diesel::sql_query(timeout_batch_query(predicate))
@@ -6546,22 +6573,48 @@ mod tests {
     }
 
     #[test]
-    fn a_batch_holds_at_most_one_limit_of_retries() {
+    fn retries_and_queued_rows_share_one_batch_limit() {
+        let reason = TimeoutReason::StartToClose;
+        let lane = timeout_lane(&reason);
         let ids = |n| (0..n).map(|_| uuid::Uuid::new_v4()).collect::<Vec<_>>();
-        let mut lane = TimeoutScanLane {
-            queued: ids(5).into(),
-            retry: ids(7),
-            ..TimeoutScanLane::default()
-        };
-        let batch = lane.next_batch(3);
-        assert_eq!(batch[..3], lane.retry[..3]);
-        assert_eq!(
-            batch[3..],
-            lane.queued.iter().take(3).copied().collect::<Vec<_>>()[..]
-        );
-        lane.commit_batch(3);
-        assert_eq!(lane.retry, Vec::<uuid::Uuid>::new());
-        assert_eq!(lane.queued.len(), 2);
+        let mut cursor = TimeoutScanCursor::default();
+        let queued = ids(5);
+        cursor.lanes[lane].queued = queued.clone().into();
+        let failed = ids(2);
+        for id in &failed {
+            cursor.retry(&reason, *id);
+        }
+        // Retries come first and take slots from the same limit.
+        let batch = cursor.lanes[lane].next_batch(3);
+        assert_eq!(batch, [failed[0], failed[1], queued[0]]);
+        cursor.lanes[lane].commit_batch(3);
+        assert_eq!(cursor.lanes[lane].next_batch(3), queued[1..4]);
+
+        // More retries than the limit wait for the next pass.
+        let failed = ids(7);
+        for id in &failed {
+            cursor.retry(&reason, *id);
+        }
+        assert_eq!(cursor.lanes[lane].next_batch(3), failed[..3]);
+        cursor.lanes[lane].commit_batch(3);
+        assert_eq!(cursor.lanes[lane].next_batch(3), failed[3..6]);
+    }
+
+    #[test]
+    fn a_row_is_tried_at_most_three_passes_in_a_row() {
+        let reason = TimeoutReason::Heartbeat;
+        let lane = timeout_lane(&reason);
+        let id = uuid::Uuid::new_v4();
+        let mut cursor = TimeoutScanCursor::default();
+        // The first try failed. Two more tries follow, then the row waits
+        // for the next sweep, so it cannot hold a slot forever.
+        cursor.retry(&reason, id);
+        for _ in 0..2 {
+            assert_eq!(cursor.lanes[lane].next_batch(1), [id]);
+            cursor.lanes[lane].commit_batch(1);
+            cursor.retry(&reason, id);
+        }
+        assert_eq!(cursor.lanes[lane].next_batch(1), Vec::<uuid::Uuid>::new());
     }
 
     #[test]
@@ -6590,7 +6643,7 @@ mod tests {
     fn a_batch_stays_queued_until_it_loads() {
         let lane = TimeoutScanLane {
             queued: std::collections::VecDeque::from([uuid::Uuid::new_v4()]),
-            retry: vec![uuid::Uuid::new_v4()],
+            retry: vec![(uuid::Uuid::new_v4(), 1)],
             ..TimeoutScanLane::default()
         };
         let before = lane.clone();
@@ -6612,7 +6665,8 @@ mod tests {
             after: Some((chrono::Utc::now(), uuid::Uuid::new_v4())),
             as_of: Some(chrono::Utc::now()),
             queued: std::collections::VecDeque::from([uuid::Uuid::new_v4()]),
-            retry: vec![uuid::Uuid::new_v4()],
+            retry: vec![(uuid::Uuid::new_v4(), 1)],
+            loaded_retries: vec![(uuid::Uuid::new_v4(), 1)],
         };
         let mid_sweep = cursor.clone();
         // A leader that ran the last tick goes on with its sweep.
@@ -6628,7 +6682,7 @@ mod tests {
         let mut cursor = TimeoutScanCursor::default();
         let id = uuid::Uuid::new_v4();
         cursor.retry(&TimeoutReason::ScheduleToStart, id);
-        assert_eq!(cursor.lanes[2].retry, vec![id]);
+        assert_eq!(cursor.lanes[2].retry, vec![(id, 1)]);
         assert!(
             cursor
                 .lanes
