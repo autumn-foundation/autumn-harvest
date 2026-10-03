@@ -902,3 +902,102 @@ async fn move_workflow_to_dlq_for_history_cap_makes_no_terminal_decision_when_th
     );
     assert_thief_untouched(&url, exec_id, task.id, "RUNNING", "RUNNING").await;
 }
+
+// ---------------------------------------------------------------------------
+// Issue #1806: the guard must key on `attempt`, not only `crash_strikes`.
+// ---------------------------------------------------------------------------
+
+/// Claim the one workflow task on `queue_name` as `worker_id`.
+async fn claim_workflow_task(url: &str, queue_name: &str, worker_id: &str) -> TaskQueueItem {
+    let mut conn = connect(url).await;
+    queue::claim_task(
+        &mut conn,
+        &[queue_name.to_string()],
+        worker_id,
+        "",
+        None,
+        &[],
+        &[],
+    )
+    .await
+    .expect("claim")
+    .expect("the task is claimable")
+}
+
+/// Requeue the task as `poison_pill::requeue_stuck_task` does.
+///
+/// That function is private, and `reclaim_orphaned_tasks` scans every row in
+/// a shared test database. This helper runs the same row change on one row. It
+/// leaves `crash_strikes` and `attempt` alone.
+async fn requeue_as_stuck(url: &str, task_id: Uuid) {
+    let mut conn = connect(url).await;
+    let updated = diesel::sql_query(
+        "UPDATE harvest_task_queue \
+         SET state = 'PENDING', worker_id = NULL, started_at = NULL, \
+             sticky_worker_id = NULL, sticky_until = NULL, \
+             last_heartbeat_at = NULL, error = NULL, scheduled_at = NOW() \
+         WHERE id = $1 AND state = 'RUNNING'",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .execute(&mut conn)
+    .await
+    .expect("stuck requeue");
+    assert_eq!(updated, 1, "the stuck requeue must free the claimed row");
+}
+
+/// A stuck-task requeue keeps `crash_strikes`. The same worker then wins the
+/// row again. A persist from the first claim must not pass the guard.
+#[tokio::test]
+async fn persist_from_a_requeued_claim_of_the_same_worker_is_rejected_1806() {
+    let (url, _container) = setup_db().await;
+    let queue_name = format!("q1806-{}", Uuid::new_v4());
+    let exec_id = seed_workflow(
+        &mut connect(&url).await,
+        "issue1806_wf",
+        serde_json::json!({}),
+        &queue_name,
+    )
+    .await;
+
+    let stale = claim_workflow_task(&url, &queue_name, "same-worker").await;
+    requeue_as_stuck(&url, stale.id).await;
+    let current = claim_workflow_task(&url, &queue_name, "same-worker").await;
+    assert_eq!(current.id, stale.id);
+    assert_eq!(
+        current.crash_strikes, stale.crash_strikes,
+        "the stuck requeue must keep crash_strikes, so only attempt differs"
+    );
+    assert_eq!(current.attempt, stale.attempt + 1);
+
+    let mut conn = connect(&url).await;
+    let result = persist_workflow_completion(
+        &mut conn,
+        stale.id,
+        exec_id,
+        1,
+        "same-worker",
+        stale.crash_strikes,
+        serde_json::json!({"ok": true}),
+        None,
+        None,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+        &mut Vec::new(),
+    )
+    .await;
+
+    assert_eq!(
+        result
+            .expect_err("a persist from an earlier claim must not commit")
+            .terminal_write_claim_ambiguous(),
+        Some(stale.id),
+        "the sentinel must name the task whose claim moved"
+    );
+    let history = load_history(&url, exec_id).await;
+    assert!(
+        !history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::WorkflowCompleted { .. })),
+        "a stale claim must append no terminal event; got {history:?}"
+    );
+    assert_eq!(load_execution(&url, exec_id).await.state, "RUNNING");
+}
