@@ -26592,6 +26592,8 @@ pub struct Worker {
     /// This worker's rolling task outcomes (issue #1815). The liveness
     /// heartbeat publishes a snapshot for outlier detection.
     task_outcomes: Arc<crate::worker_outlier::TaskOutcomeWindow>,
+    /// The peer rows that this worker's shard heartbeats read (issue #1815).
+    outlier_peers: Arc<crate::workers::ShardPeerViews>,
     /// Each assigned shard's per-shard dispatch channel, captured once at
     /// construction (issue #1429 follow-up). See the capture site in
     /// [`Worker::new`] for why this is decided here rather than later, at
@@ -28233,6 +28235,7 @@ impl Worker {
             workflow_deadlock_strikes: Arc::default(),
             session_slots_in_use: crate::sessions::new_session_slot_registry(),
             task_outcomes: Arc::default(),
+            outlier_peers: Arc::default(),
             shard_dispatch,
             global_dispatch,
         })
@@ -28838,7 +28841,7 @@ impl Worker {
                     Arc::clone(&monitors.activity_slot_target),
                     heartbeat_cancel.clone(),
                     Arc::clone(pending),
-                    index == 0,
+                    index,
                 ))
             })
             .collect();
@@ -29305,7 +29308,7 @@ impl Worker {
             Arc::clone(&monitors.activity_slot_target),
             heartbeat_cancel.clone(),
             Arc::clone(&registration_pending),
-            true,
+            0,
         ));
 
         // The single-shard path resolves at most one shard target, and that
@@ -30190,10 +30193,10 @@ impl Worker {
         activity_slot_target: Arc<AtomicUsize>,
         heartbeat_cancel: CancellationToken,
         registration_pending: Arc<AtomicBool>,
-        // Issue #1815: whether this heartbeat compares the worker with its
-        // peers. Exactly one heartbeat per worker does: the single pool's, or
-        // the first shard's in `run_multi_shard`.
-        compare_outliers: bool,
+        // Issue #1815: this heartbeat's shard slot. Slot 0 compares the worker
+        // with its peers. Exactly one heartbeat per worker has it: the single
+        // pool's, or the first shard's in `run_multi_shard`.
+        shard_slot: usize,
     ) -> tokio::task::JoinHandle<()> {
         // Spawn the heartbeat background task with a dedicated cancel token so
         // that liveness updates continue during the Draining phase and only stop
@@ -30210,6 +30213,7 @@ impl Worker {
         let max_concurrency =
             i32::try_from(self.workflow_permit_total + self.activity_permit_total)
                 .unwrap_or(i32::MAX);
+        let compare_outliers = shard_slot == 0;
         crate::workers::spawn_worker_heartbeat(
             pool.clone(),
             crate::workers::WorkerRegistration {
@@ -30246,6 +30250,9 @@ impl Worker {
                     self.config.worker_heartbeat_interval,
                 ),
                 compare: compare_outliers,
+                slot: shard_slot,
+                shard_peers: Arc::clone(&self.outlier_peers),
+                process_flags: crate::workers::ProcessOutlierFlags::global(),
             },
         )
     }

@@ -490,6 +490,85 @@ pub async fn heartbeat_worker(
 /// older than this, so the table stays bounded by the live fleet.
 pub const WORKER_TASK_STATS_RETENTION: Duration = Duration::from_secs(3600);
 
+/// The live peer rows that each shard heartbeat of one worker read last
+/// (issue #1815).
+///
+/// A multi-shard worker compares itself on one heartbeat only. That heartbeat
+/// merges the rows every shard heartbeat stored here. So a peer that lives on
+/// another of the worker's shards still counts.
+#[derive(Debug, Default)]
+pub struct ShardPeerViews(Mutex<std::collections::BTreeMap<usize, Vec<LiveWorkerTaskStats>>>);
+
+impl ShardPeerViews {
+    /// Replace the rows that shard heartbeat `slot` read.
+    pub fn store(&self, slot: usize, rows: Vec<LiveWorkerTaskStats>) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(slot, rows);
+    }
+
+    /// The rows of every slot, one per worker. When two shards hold a row for
+    /// the same worker, the row with the most tasks wins.
+    #[must_use]
+    pub fn merged(&self) -> Vec<LiveWorkerTaskStats> {
+        let rows: Vec<LiveWorkerTaskStats> = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .flatten()
+            .cloned()
+            .collect();
+        let mut by_worker: std::collections::BTreeMap<String, LiveWorkerTaskStats> =
+            std::collections::BTreeMap::new();
+        for row in rows {
+            match by_worker.get(&row.worker_id) {
+                Some(kept) if kept.stats.tasks >= row.stats.tasks => {}
+                _ => {
+                    by_worker.insert(row.worker_id.clone(), row);
+                }
+            }
+        }
+        by_worker.into_values().collect()
+    }
+}
+
+/// The outlier verdicts of every worker in this process (issue #1815).
+///
+/// The gauge has no worker label, and two `Worker`s in one process share one
+/// recorder. The gauge therefore reports the OR of all local verdicts. A
+/// healthy worker's tick then cannot clear a sick worker's flag.
+#[derive(Debug, Default)]
+pub struct ProcessOutlierFlags(Mutex<std::collections::HashMap<String, Vec<OutlierDimension>>>);
+
+impl ProcessOutlierFlags {
+    /// The instance that every worker in this process shares.
+    #[must_use]
+    pub fn global() -> Arc<Self> {
+        static GLOBAL: std::sync::LazyLock<Arc<ProcessOutlierFlags>> =
+            std::sync::LazyLock::new(Arc::default);
+        Arc::clone(&GLOBAL)
+    }
+
+    /// Record `worker_id`'s verdict and return the dimensions on which any
+    /// local worker is an outlier.
+    #[must_use]
+    pub fn set(&self, worker_id: &str, flagged: &[OutlierDimension]) -> Vec<OutlierDimension> {
+        let mut verdicts = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        verdicts.insert(worker_id.to_owned(), flagged.to_vec());
+        let any: Vec<OutlierDimension> = OutlierDimension::ALL
+            .into_iter()
+            .filter(|d| verdicts.values().any(|v| v.contains(d)))
+            .collect();
+        drop(verdicts);
+        any
+    }
+}
+
 /// What the liveness heartbeat needs to publish task stats and to flag this
 /// worker as an outlier (issue #1815).
 #[derive(Clone)]
@@ -508,6 +587,13 @@ pub struct OutlierProbe {
     /// publishes the stats. Only one of them compares. The gauge has no shard
     /// label, so two comparisons with different peer sets would make it flap.
     pub compare: bool,
+    /// This heartbeat's slot in `shard_peers`, one slot per shard.
+    pub slot: usize,
+    /// The peer rows of all this worker's shard heartbeats.
+    pub shard_peers: Arc<ShardPeerViews>,
+    /// The verdicts of every worker in the process. Use
+    /// [`ProcessOutlierFlags::global`] outside tests.
+    pub process_flags: Arc<ProcessOutlierFlags>,
 }
 
 impl std::fmt::Debug for OutlierProbe {
@@ -516,20 +602,29 @@ impl std::fmt::Debug for OutlierProbe {
             .field("config", &self.config)
             .field("fleet_stale_secs", &self.fleet_stale_secs)
             .field("compare", &self.compare)
+            .field("slot", &self.slot)
             .finish_non_exhaustive()
     }
 }
 
 impl OutlierProbe {
-    /// Set the gauge to 0 on every dimension.
+    /// Record `flagged` as this worker's verdict and set the gauge to the OR
+    /// of every local worker's verdict.
+    fn publish(&self, worker_id: &str, flagged: &[OutlierDimension]) {
+        let any = self.process_flags.set(worker_id, flagged);
+        for dimension in OutlierDimension::ALL {
+            self.metrics
+                .record_worker_outlier(dimension, any.contains(&dimension));
+        }
+    }
+
+    /// Clear this worker's verdict and refresh the gauge.
     ///
     /// A tick that cannot compare calls this. An unknown state then reads as
     /// "not an outlier", and a stale 1 cannot keep an alert firing.
-    pub fn clear_gauge(&self) {
+    pub fn clear_gauge(&self, worker_id: &str) {
         if self.compare {
-            for dimension in OutlierDimension::ALL {
-                self.metrics.record_worker_outlier(dimension, false);
-            }
+            self.publish(worker_id, &[]);
         }
     }
 }
@@ -673,21 +768,24 @@ pub async fn load_live_worker_task_stats(
         .collect())
 }
 
-/// Publish this worker's task stats. Then, when `probe.compare` holds,
-/// compare the worker with its live peers and set the outlier gauge (issue
-/// #1815).
+/// Publish this worker's task stats and run one outlier tick (issue #1815).
 ///
-/// The comparison uses only peers in the worker's own queue cohort. It sets
-/// every dimension on each call, so a worker that heals reads 0 again. A
-/// draining worker, or a worker missing from the live set, reads 0. With
-/// metrics off, the tick publishes the stats and skips the peer read.
+/// The tick prunes old rows and reads the live peers into
+/// `probe.shard_peers`. When `probe.compare` holds, it then compares the
+/// worker with its peers and sets the outlier gauge.
+///
+/// The comparison merges the peer rows of all this worker's shards. It uses
+/// only peers in the worker's own queue cohort. A draining worker, or a worker
+/// missing from the live set, is not an outlier. The gauge reports the OR of
+/// every local worker's verdict, on every dimension. With metrics off, the
+/// tick publishes and prunes, and skips the peer read.
 ///
 /// Returns the dimensions on which this worker is an outlier.
 ///
 /// # Errors
 ///
 /// Returns [`HarvestError`] on database failure. The caller then clears the
-/// gauge with [`OutlierProbe::clear_gauge`].
+/// verdict with [`OutlierProbe::clear_gauge`].
 pub async fn run_outlier_tick(
     conn: &mut AsyncPgConnection,
     worker_id: &str,
@@ -696,14 +794,20 @@ pub async fn run_outlier_tick(
 ) -> HarvestResult<Vec<OutlierDimension>> {
     let own = probe.window.snapshot();
     upsert_worker_task_stats(conn, worker_id, &own).await?;
-    if !probe.compare || !probe.metrics.is_enabled() {
+    // Every shard heartbeat prunes its own database, whether it compares or not.
+    prune_worker_task_stats(conn).await?;
+    if !probe.metrics.is_enabled() {
         return Ok(Vec::new());
     }
-    prune_worker_task_stats(conn).await?;
+    let live = load_live_worker_task_stats(conn, probe.fleet_stale_secs).await?;
+    probe.shard_peers.store(probe.slot, live);
+    if !probe.compare {
+        return Ok(Vec::new());
+    }
     let flagged = if draining {
         Vec::new()
     } else {
-        let live = load_live_worker_task_stats(conn, probe.fleet_stale_secs).await?;
+        let live = probe.shard_peers.merged();
         live.iter()
             .find(|row| row.worker_id == worker_id)
             .map(|me| {
@@ -716,11 +820,7 @@ pub async fn run_outlier_tick(
             })
             .unwrap_or_default()
     };
-    for dimension in OutlierDimension::ALL {
-        probe
-            .metrics
-            .record_worker_outlier(dimension, flagged.contains(&dimension));
-    }
+    probe.publish(worker_id, &flagged);
     Ok(flagged)
 }
 
@@ -2016,7 +2116,7 @@ pub fn spawn_worker_heartbeat(
                             error = %error,
                             "worker task-stats tick failed; outlier gauge cleared"
                         );
-                        outliers.clear_gauge();
+                        outliers.clear_gauge(&registration.worker_id);
                     }
                 }
                 Err(error) => {
@@ -2025,7 +2125,7 @@ pub fn spawn_worker_heartbeat(
                         error = %error,
                         "worker heartbeat failed to get pool connection"
                     );
-                    outliers.clear_gauge();
+                    outliers.clear_gauge(&registration.worker_id);
                 }
             }
         }
@@ -2120,6 +2220,54 @@ pub fn local_hostname() -> String {
 
 #[cfg(test)]
 mod tests {
+    fn live(worker_id: &str, tasks: u32) -> super::LiveWorkerTaskStats {
+        super::LiveWorkerTaskStats {
+            worker_id: worker_id.to_owned(),
+            cohort: "[\"q\"]".to_owned(),
+            stats: crate::worker_outlier::WorkerTaskStats {
+                tasks,
+                failures: 0,
+                p99_latency_ms: Some(1),
+            },
+        }
+    }
+
+    /// Issue #1815: the comparing heartbeat sees peers from every shard, once
+    /// each, with the fullest snapshot of a worker that both shards hold.
+    #[test]
+    fn shard_peer_views_merge_every_slot_once_per_worker() {
+        let views = super::ShardPeerViews::default();
+        views.store(0, vec![live("me", 50), live("a", 10)]);
+        views.store(1, vec![live("me", 40), live("b", 30), live("a", 20)]);
+        let merged: Vec<(String, u32)> = views
+            .merged()
+            .into_iter()
+            .map(|r| (r.worker_id, r.stats.tasks))
+            .collect();
+        assert_eq!(
+            merged,
+            vec![("a".into(), 20), ("b".into(), 30), ("me".into(), 50)]
+        );
+        // A later read from one slot replaces that slot only.
+        views.store(1, vec![]);
+        assert_eq!(views.merged().len(), 2);
+    }
+
+    /// Issue #1815: a healthy worker in the same process cannot clear a sick
+    /// worker's flag, and clearing the sick worker's verdict clears the OR.
+    #[test]
+    fn process_outlier_flags_report_the_or_of_local_workers() {
+        use crate::worker_outlier::OutlierDimension::{FailureRatio, LatencyP99};
+        let flags = super::ProcessOutlierFlags::default();
+        assert_eq!(flags.set("sick", &[FailureRatio]), vec![FailureRatio]);
+        assert_eq!(flags.set("healthy", &[]), vec![FailureRatio]);
+        assert_eq!(
+            flags.set("slow", &[LatencyP99]),
+            vec![FailureRatio, LatencyP99]
+        );
+        assert_eq!(flags.set("sick", &[]), vec![LatencyP99]);
+    }
+
     /// The fleet lookup that gates the capability-miss redelivery budget
     /// (issue #804) must keep using the SAME liveness predicate as the
     /// poison-pill orphan reclaimer, and must scope to the task's own queue.

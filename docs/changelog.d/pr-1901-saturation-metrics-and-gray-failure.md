@@ -29,9 +29,11 @@ heartbeat check only. A worker that was alive but sick passed that check.
 - A failed activity attempt counts as a failure. A workflow task counts as a
   failure when it returns an error or times out. A release is not counted.
 - Every liveness heartbeat writes a snapshot to the new table
-  `harvest_worker_task_stats`. One heartbeat per worker then compares it.
-  A multi-shard worker compares on its first shard only, so the gauge does
-  not flap between peer sets.
+  `harvest_worker_task_stats` and reads the live peers of its shard. One
+  heartbeat per worker then compares the worker with the peers of all its
+  shards. So the gauge does not flap between peer sets.
+- Two workers in one process share the gauge, so it reports the OR of their
+  verdicts.
 - The peers are the live `Active` workers that poll the same queues, with
   fresh stats. A worker on a slow queue is not compared with a fast queue.
 - A worker is an outlier on failure ratio when its ratio is at least 20
@@ -44,8 +46,8 @@ heartbeat check only. A worker that was alive but sick passed that check.
 - A draining worker, or a tick that cannot compare, sets the gauge to 0.
 - No worker label is added. Each worker reports itself, and the scrape
   `instance` label tells them apart.
-- The tick deletes stats rows older than one hour, so orphan rows from
-  restarted workers do not pile up.
+- Every shard heartbeat deletes stats rows older than one hour, so orphan
+  rows from restarted workers do not pile up.
 
 **`GET /admin/status`.** The `workers` block gains `outliers`, the worst 20
 flagged workers with their stats and the peer medians. It also gains

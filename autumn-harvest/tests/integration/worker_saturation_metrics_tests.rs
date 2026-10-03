@@ -166,6 +166,10 @@ fn probe(window: Arc<TaskOutcomeWindow>, metrics: Arc<Recording>) -> OutlierProb
         config: OutlierConfig::default(),
         fleet_stale_secs: 60,
         compare: true,
+        slot: 0,
+        // Fresh boards keep each probe apart from other tests in the process.
+        shard_peers: Arc::default(),
+        process_flags: Arc::default(),
     }
 }
 
@@ -303,6 +307,58 @@ async fn outlier_tick_compares_only_within_the_queue_cohort() {
     let metrics = Arc::new(Recording::default());
     let flagged = tick(&mut conn, &sick, &probe(window(100, Some(2)), metrics)).await;
     assert_eq!(flagged, Vec::<OutlierDimension>::new());
+}
+
+/// Two workers in one process share the gauge. A healthy worker's tick keeps
+/// the sick worker's flag, because the gauge reports the OR of both verdicts.
+#[tokio::test]
+async fn a_healthy_local_worker_does_not_clear_a_sick_workers_flag() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+    let queue = unique_id("process-q");
+    let sick = unique_id("w-sick");
+    register(&mut conn, &sick, &queue).await;
+    let peers = healthy_peers(&mut conn, &queue, 3).await;
+
+    let shared = Arc::new(workers::ProcessOutlierFlags::default());
+    let metrics = Arc::new(Recording::default());
+    let mut sick_probe = probe(window(100, Some(2)), Arc::clone(&metrics));
+    sick_probe.process_flags = Arc::clone(&shared);
+    let mut peer_probe = probe(window(100, None), Arc::clone(&metrics));
+    peer_probe.process_flags = Arc::clone(&shared);
+
+    assert_eq!(
+        tick(&mut conn, &sick, &sick_probe).await,
+        vec![OutlierDimension::FailureRatio]
+    );
+    assert_eq!(
+        tick(&mut conn, &peers[0], &peer_probe).await,
+        Vec::<OutlierDimension>::new()
+    );
+    let last_failure_ratio = metrics
+        .samples()
+        .into_iter()
+        .filter_map(|s| match s {
+            Sample::Outlier {
+                dimension: OutlierDimension::FailureRatio,
+                flagged,
+            } => Some(flagged),
+            _ => None,
+        })
+        .next_back();
+    assert_eq!(last_failure_ratio, Some(true), "the OR keeps the sick flag");
+
+    sick_probe.clear_gauge(&sick);
+    assert!(metrics.samples().ends_with(&[
+        Sample::Outlier {
+            dimension: OutlierDimension::FailureRatio,
+            flagged: false
+        },
+        Sample::Outlier {
+            dimension: OutlierDimension::LatencyP99,
+            flagged: false
+        },
+    ]));
 }
 
 /// A draining worker reads 0. A heartbeat that does not compare publishes its

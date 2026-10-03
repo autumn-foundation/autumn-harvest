@@ -3383,8 +3383,10 @@ gray failure.
 Each worker keeps a window of its own task outcomes. The window holds the
 last 5 minutes and at most 1024 tasks. A busy worker therefore covers less
 than 5 minutes. The liveness heartbeat writes a snapshot to
-`harvest_worker_task_stats`. One heartbeat per worker then compares it with
-its peers, even on a worker that serves many shards.
+`harvest_worker_task_stats` on every shard. One heartbeat per worker then
+compares it with its peers. That heartbeat merges the peers from all the
+worker's shards. With two workers in one process, the gauge reads `1` when
+either worker is an outlier.
 
 The peers are the live, `Active` workers that poll the same queues. A worker
 on a slow queue is not compared with workers on a fast queue.
@@ -3402,7 +3404,8 @@ it is judged.
 
 1. Read `workers.outliers` from `GET /api/harvest/admin/status`. Each entry
    names the worker, the dimensions, its own stats and the peer medians.
-2. Match the alert `instance` label to that worker id and host.
+2. Match the alert `instance` label to that worker id and host. One process
+   can run more than one worker, so check every worker on that instance.
 3. On the dashboard, open **Database pool, queries & pollers → Worker
    outliers**. Compare the worker with its peers over the last hour.
 4. Read the worker's logs for `task execution failed` and for activity
