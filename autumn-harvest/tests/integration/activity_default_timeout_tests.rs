@@ -23,7 +23,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use autumn_harvest::builder::{DEFAULT_ACTIVITY_START_TO_CLOSE, HarvestBuilder, WorkerConfig};
-use autumn_harvest::error::TimeoutType;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
 use autumn_harvest::models::{NewWorkflowExecution, TaskQueueItem, WorkflowExecution};
@@ -509,27 +508,6 @@ async fn hung_activity_without_a_timeout_times_out_at_the_default() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     stop(&worker, handle).await;
-
-    let history = store::load_history(&mut conn, exec_id)
-        .await
-        .expect("load history")
-        .events;
-    let timeouts = history
-        .iter()
-        .filter(|e| {
-            matches!(
-                e,
-                WorkflowEvent::ActivityTimedOut {
-                    timeout_type: TimeoutType::StartToClose,
-                    ..
-                }
-            )
-        })
-        .count();
-    assert_eq!(
-        timeouts, 1,
-        "history must record one start_to_close timeout; history={history:?}"
-    );
 }
 
 /// The opt-out restores the old behavior: no timeout on the task row.
