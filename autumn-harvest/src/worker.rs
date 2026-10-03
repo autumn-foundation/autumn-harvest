@@ -15260,6 +15260,7 @@ async fn handle_session_acquire(
             crate::sessions::ACQUIRE_RETRY_BACKOFF_MIN,
             crate::sessions::ACQUIRE_RETRY_BACKOFF_MAX,
         );
+        // host-clock-ok: the deferral API takes an absolute time. See issue #1807 follow-ups.
         let scheduled_at = chrono::Utc::now()
             + chrono::Duration::from_std(backoff)
                 .unwrap_or_else(|_| chrono::Duration::milliseconds(200));
@@ -15578,6 +15579,7 @@ async fn process_activity_task(
                 .telemetry()
                 .metrics
                 .record_rate_limit_throttled(activity_name);
+            // host-clock-ok: the deferral API takes an absolute time. See issue #1807 follow-ups.
             let scheduled_at = chrono::Utc::now()
                 + chrono::Duration::from_std(refill_delay)
                     .unwrap_or_else(|_| chrono::Duration::seconds(5));

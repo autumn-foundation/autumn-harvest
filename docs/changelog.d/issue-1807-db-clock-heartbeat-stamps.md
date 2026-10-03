@@ -48,6 +48,9 @@ Each item needs its own design decision. Open a follow-up issue for each.
 - `worker.rs` and `execution.rs` stamp `deadline_at`, `sla_deadline_at`,
   `chain_deadline_at` and `child_sla_deadline_at` from the host at start,
   redrive and resume. Moving them to the database clock needs a replay review.
+- The rate-limit and session-acquire deferrals in `worker.rs` pass a host-clock
+  `scheduled_at` to `queue::defer_claimed_rate_limited_task`. The guard marks
+  both. A fix changes that public function to take a delay.
 - `primary_repend_workflow_task` binds a host-clock `scheduled_at`. Its
   backdate is part of the schedule-to-start latency floor.
 - The orphan and stuck-task scans compare a host-clock cutoff with database

@@ -31,29 +31,108 @@ fn strip_comments(source: &str) -> String {
         .join("\n")
 }
 
-/// Byte offset where non-test code ends, or the source length.
-fn production_end(source: &str) -> usize {
-    let lines: Vec<&str> = source.lines().collect();
-    let mut offset = 0;
+/// Byte offset of the last byte of a raw string that starts at `at`.
+fn raw_string_end(bytes: &[u8], at: usize) -> Option<usize> {
+    if at > 0 && (bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_') {
+        return None;
+    }
+    let mut cursor = at + 1;
+    let mut hashes = 0;
+    while bytes.get(cursor) == Some(&b'#') {
+        hashes += 1;
+        cursor += 1;
+    }
+    if bytes.get(cursor) != Some(&b'"') {
+        return None;
+    }
+    let mut closing = vec![b'"'];
+    closing.extend(std::iter::repeat_n(b'#', hashes));
+    let body = &bytes[cursor + 1..];
+    body.windows(closing.len())
+        .position(|window| window == closing.as_slice())
+        .map(|found| cursor + 1 + found + closing.len() - 1)
+}
+
+/// Byte offset of the `}` that closes the block opened at `open`.
+///
+/// It skips braces inside string, raw string and character literals.
+fn matching_brace(code: &str, open: usize) -> Option<usize> {
+    let bytes = code.as_bytes();
+    let mut depth = 0_usize;
+    let mut index = open;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'r' if raw_string_end(bytes, index).is_some() => {
+                index = raw_string_end(bytes, index).unwrap_or(index);
+            }
+            b'"' => {
+                index += 1;
+                while index < bytes.len() && bytes[index] != b'"' {
+                    index += if bytes[index] == b'\\' { 2 } else { 1 };
+                }
+            }
+            b'\'' if bytes.get(index + 2) == Some(&b'\'') => index += 2,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Replace each test-gated module with spaces, keeping line breaks.
+///
+/// Code after a test module stays visible to the scan.
+fn blank_test_modules(code: &str) -> String {
+    let lines: Vec<&str> = code.lines().collect();
     let mut starts = Vec::with_capacity(lines.len());
+    let mut offset = 0;
     for line in &lines {
         starts.push(offset);
         offset += line.len() + 1;
     }
+    let mut out = code.to_string();
     for (index, line) in lines.iter().enumerate() {
         if !line.trim_start().starts_with("mod ") {
             continue;
         }
         let first = index.saturating_sub(3);
-        let attr = lines[first..index].iter().position(|above| {
+        let gated = lines[first..index].iter().any(|above| {
             let above = above.trim();
             above.starts_with("#[cfg(") && above.contains("test") && !above.contains("not(test")
         });
-        if let Some(found) = attr {
-            return starts[first + found];
+        if !gated {
+            continue;
+        }
+        let from = starts[index];
+        let Some(open) = code[from..].find(['{', ';']).map(|at| from + at) else {
+            continue;
+        };
+        if code.as_bytes()[open] != b'{' {
+            continue;
+        }
+        let close = matching_brace(code, open).unwrap_or(code.len() - 1);
+        {
+            let blanked: String = code[from..=close]
+                .chars()
+                .map(|c| {
+                    if c == '\n' {
+                        "\n".to_string()
+                    } else {
+                        " ".repeat(c.len_utf8())
+                    }
+                })
+                .collect();
+            out.replace_range(from..=close, &blanked);
         }
     }
-    source.len()
+    out
 }
 
 fn line_of(source: &str, offset: usize) -> usize {
@@ -78,8 +157,7 @@ fn is_write_target(code: &str, column: &str, at: usize) -> bool {
 /// inside the same expression. The expression can span lines.
 fn violations(source: &str) -> Vec<(usize, String)> {
     let original: Vec<&str> = source.lines().collect();
-    let end = production_end(source);
-    let code = strip_comments(&source[..end]);
+    let code = blank_test_modules(&strip_comments(source));
     let mut found = Vec::new();
     for column in SCAN_COLUMNS {
         for (at, _) in code.match_indices(column) {
@@ -234,6 +312,12 @@ fn scanner_ignores_a_longer_column_name() {
 #[test]
 fn scanner_ignores_a_comment() {
     assert!(violations("// scheduled_at: Utc::now() is wrong").is_empty());
+}
+
+#[test]
+fn scanner_keeps_scanning_after_a_test_module() {
+    let source = "#[cfg(test)]\nmod tests {\n let s = \"}\";\n}\nx.scheduled_at.eq(Utc::now());";
+    assert_eq!(violations(source).len(), 1);
 }
 
 #[test]
