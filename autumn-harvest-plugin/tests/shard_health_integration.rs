@@ -597,6 +597,82 @@ async fn health_endpoint_enforces_unavailable_writable_shard_readiness() {
     assert_eq!(body["shard_readiness"]["overall_readiness"], "unavailable");
 }
 
+fn default_queue_runtime(router: ShardRouter) -> HarvestApiRuntime {
+    runtime_for(
+        &["default"],
+        None,
+        Vec::new(),
+        router,
+        SchedulerMonitor::offline(),
+    )
+}
+
+/// Issue #1812 AC2: a ready replica drops readiness on drain. Liveness stays 200.
+#[tokio::test]
+async fn ready_probe_passes_then_fails_on_drain() {
+    let (database_url, _container) = setup_database_url_with_migrations().await;
+    let state = api_state(
+        HarvestDbPool::from(build_test_pool(&database_url)),
+        default_queue_runtime(ShardRouter::single()),
+    );
+    let app = harvest_api_router(state.clone());
+
+    let (status, body) = get_json(&app, "/health/ready").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["ready"], true);
+    assert_eq!(body["database_reachable"], true);
+    assert_eq!(body["reasons"], serde_json::json!([]));
+
+    state.begin_draining();
+
+    let (status, body) = get_json(&app, "/health/ready").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["draining"], true);
+    assert_eq!(body["reasons"], serde_json::json!(["draining"]));
+
+    let (status, body) = get_json(&app, "/health/live").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["draining"], true);
+}
+
+/// Readiness honors `require_shard_readiness`, like `/health`.
+#[tokio::test]
+async fn ready_probe_applies_enforced_shard_readiness() {
+    let (database_url, _container) = setup_database_url_with_migrations().await;
+    let state = api_state(
+        HarvestDbPool::from(build_test_pool(&database_url)),
+        default_queue_runtime(ShardRouter::single()),
+    );
+    state.set_health_requires_shard_readiness(true);
+    let app = harvest_api_router(state);
+
+    let (status, body) = get_json(&app, "/health/ready").await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["database_reachable"], true);
+    assert_eq!(body["shard_readiness"]["overall_readiness"], "degraded");
+    assert_eq!(body["reasons"], serde_json::json!(["shard_not_ready"]));
+}
+
+/// Without enforcement, readiness probes only the default shard.
+/// One bad shard must not pull every replica out of the load balancer.
+#[tokio::test]
+async fn ready_probe_ignores_a_bad_non_default_shard_when_not_enforced() {
+    let (shard0_url, _container) = setup_database_url_with_migrations().await;
+    let pool = build_two_shard_pool(&shard0_url, "postgres://postgres:postgres@127.0.0.1:1/nope");
+    let router = ShardRouter::new(
+        vec![ShardId::new(0), ShardId::new(1)],
+        vec![ShardId::new(0), ShardId::new(1)],
+        ShardId::new(0),
+    );
+    let app = harvest_api_router(api_state(pool, default_queue_runtime(router)));
+
+    let (status, body) = get_json(&app, "/health/ready").await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["shard_readiness"], Value::Null);
+}
+
 #[tokio::test]
 async fn readable_only_candidate_without_workers_lists_promotion_blockers() {
     let ((shard0_url, shard1_url), _container) = setup_two_shards_with_migrations().await;

@@ -1222,6 +1222,15 @@ impl HarvestApiState {
             .expect("harvest api state lock poisoned") = required;
     }
 
+    /// Mark this replica as draining (issue #1812).
+    pub fn begin_draining(&self) {}
+
+    /// Report whether this replica is draining (issue #1812).
+    #[must_use]
+    pub fn is_draining(&self) -> bool {
+        false
+    }
+
     /// Returns `Some(days)` only when explicitly set via [`HarvestApiState::set_audit_retention_days`];
     /// `None` means "use the builder's retention config unchanged".
     pub(crate) fn audit_retention_days(&self) -> Option<i64> {
@@ -59455,5 +59464,172 @@ mod mutation_gate_tests {
         let status = start_status(true).await;
         assert_ne!(status, StatusCode::UNAUTHORIZED);
         assert_ne!(status, StatusCode::FORBIDDEN);
+    }
+}
+
+#[cfg(test)]
+mod health_probe_tests {
+    use super::*;
+    use tower::ServiceExt as _;
+
+    /// A runtime with no handlers. It needs no database.
+    fn empty_runtime() -> HarvestApiRuntime {
+        HarvestApiRuntime::new(
+            Arc::new(HandlerRegistry::new(vec![], vec![])),
+            Arc::new(DagCatalog::default()),
+            Arc::new(Vec::new()),
+            None,
+            vec!["default".to_string()],
+            SchedulerMonitor::offline(),
+            HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+            ShardRouter::single(),
+        )
+    }
+
+    /// A pool that cannot connect. Port 1 refuses at once.
+    fn unreachable_pool() -> HarvestDbPool {
+        let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+            AsyncPgConnection,
+        >::new("postgres://postgres:postgres@127.0.0.1:1/nope");
+        let pool = deadpool::managed::Pool::builder(manager)
+            .max_size(1)
+            .build()
+            .expect("build pool");
+        HarvestDbPool::single(pool)
+    }
+
+    async fn probe(api_state: &HarvestApiState, uri: &str) -> (StatusCode, serde_json::Value) {
+        let request = axum::http::Request::builder()
+            .uri(uri)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = harvest_api_router(api_state.clone())
+            .oneshot(request)
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, body)
+    }
+
+    fn reasons(body: &serde_json::Value) -> Vec<String> {
+        body["reasons"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Issue #1812 AC1: readiness fails before the runtime starts.
+    #[tokio::test]
+    async fn ready_is_503_before_the_runtime_starts() {
+        let api_state = HarvestApiState::new();
+        let (status, body) = probe(&api_state, "/health/ready").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["ready"], false);
+        assert_eq!(body["runtime_ready"], false);
+        assert_eq!(body["database_reachable"], serde_json::Value::Null);
+        assert_eq!(reasons(&body), vec!["runtime_not_started"]);
+    }
+
+    /// Issue #1812: `/health` keeps its old status for compatibility.
+    #[tokio::test]
+    async fn legacy_health_is_unchanged_before_the_runtime_starts() {
+        let api_state = HarvestApiState::new();
+        let (status, body) = probe(&api_state, "/health").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["runtime_ready"], false);
+    }
+
+    #[tokio::test]
+    async fn live_is_200_before_the_runtime_starts() {
+        let api_state = HarvestApiState::new();
+        let (status, body) = probe(&api_state, "/health/live").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["alive"], true);
+        assert_eq!(body["draining"], false);
+    }
+
+    /// Issue #1812 AC2: drain fails readiness and keeps liveness.
+    #[tokio::test]
+    async fn draining_drops_ready_but_not_live() {
+        let api_state = HarvestApiState::new();
+        api_state.install(empty_runtime());
+        api_state.begin_draining();
+
+        let (status, body) = probe(&api_state, "/health/ready").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["runtime_ready"], true);
+        assert_eq!(body["draining"], true);
+        assert_eq!(body["database_reachable"], serde_json::Value::Null);
+        assert_eq!(reasons(&body), vec!["draining"]);
+
+        let (status, body) = probe(&api_state, "/health/live").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["draining"], true);
+    }
+
+    /// A restart must not inherit the drain of the stopped runtime.
+    #[test]
+    fn install_ends_the_drain() {
+        let api_state = HarvestApiState::new();
+        api_state.begin_draining();
+        assert!(api_state.is_draining());
+        api_state.install(empty_runtime());
+        assert!(!api_state.is_draining());
+    }
+
+    /// The stopped state keeps reporting the drain.
+    #[test]
+    fn clear_keeps_the_drain() {
+        let api_state = HarvestApiState::new();
+        api_state.install(empty_runtime());
+        api_state.begin_draining();
+        api_state.clear();
+        assert!(api_state.is_draining());
+    }
+
+    #[tokio::test]
+    async fn ready_is_503_when_the_database_is_unreachable() {
+        let api_state = HarvestApiState::new();
+        api_state.install_storage_pool(unreachable_pool());
+        api_state.install(empty_runtime());
+
+        let (status, body) = probe(&api_state, "/health/ready").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["runtime_ready"], true);
+        assert_eq!(body["draining"], false);
+        assert_eq!(body["database_reachable"], false);
+        assert_eq!(reasons(&body), vec!["database_unreachable"]);
+    }
+
+    #[tokio::test]
+    async fn ready_is_503_when_no_storage_pool_is_installed() {
+        let api_state = HarvestApiState::new();
+        api_state.install(empty_runtime());
+
+        let (status, body) = probe(&api_state, "/health/ready").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["database_reachable"], false);
+        assert_eq!(reasons(&body), vec!["database_unreachable"]);
+    }
+
+    /// The probes are public, like `/health`.
+    #[test]
+    fn probes_are_public_safe() {
+        for path in ["/health/live", "/health/ready"] {
+            assert_eq!(
+                classify_route(&axum::http::Method::GET, path),
+                RouteClass::PublicSafe,
+                "{path}"
+            );
+        }
     }
 }
