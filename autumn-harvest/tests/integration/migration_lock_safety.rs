@@ -178,6 +178,9 @@ struct Finding {
     rule: Rule,
     /// The 1-based line of the statement or annotation.
     line: usize,
+    /// The token index where the statement starts. An annotation allows one
+    /// statement, so it binds to this.
+    stmt: usize,
     detail: String,
 }
 
@@ -245,6 +248,7 @@ fn lint(sql: &str, run_in_transaction: bool, history: &History) -> Vec<Finding> 
                 findings.push(Finding {
                     rule: Rule::ConcurrentlyInTransaction,
                     line: hit.line,
+                    stmt: hit.at,
                     detail: format!("{} CONCURRENTLY {reason}.", hit.verb),
                 });
             }
@@ -252,6 +256,7 @@ fn lint(sql: &str, run_in_transaction: bool, history: &History) -> Vec<Finding> 
             findings.push(Finding {
                 rule: Rule::BlockingIndex,
                 line: hit.line,
+                stmt: hit.at,
                 detail: format!(
                     "plain {} on {} {}",
                     hit.label(),
@@ -275,6 +280,7 @@ fn lint(sql: &str, run_in_transaction: bool, history: &History) -> Vec<Finding> 
         findings.push(Finding {
             rule: Rule::LockTimeout,
             line: lock.line,
+            stmt: lock.at,
             detail: format!(
                 "{} locks {} with no non-zero lock_timeout in force",
                 lock.label(),
@@ -296,13 +302,40 @@ fn index_cost(verb: &str) -> &'static str {
     }
 }
 
-/// Whether the last `lock_timeout` change before token `at` set a bound.
-fn timeout_in_force(timeouts: &[(usize, bool)], at: usize) -> bool {
-    timeouts
-        .iter()
-        .take_while(|(k, _)| *k < at)
-        .last()
-        .is_some_and(|(_, bounds)| *bounds)
+/// Whether a bound is in force at token `at`.
+///
+/// A local value holds until the transaction ends. A session value outlives
+/// it. Diesel runs the whole file as one transaction, unless the file ends
+/// one itself.
+fn timeout_in_force(timeouts: &[(usize, Timeout)], at: usize) -> bool {
+    let mut session = false;
+    let mut local = None;
+    for (_, change) in timeouts.iter().take_while(|(k, _)| *k < at) {
+        match *change {
+            Timeout::Set {
+                bounds,
+                local: true,
+            } => local = Some(bounds),
+            Timeout::Set {
+                bounds,
+                local: false,
+            } => {
+                session = bounds;
+                local = None;
+            }
+            Timeout::TransactionEnd => local = None,
+        }
+    }
+    local.unwrap_or(session)
+}
+
+/// One change to the session's `lock_timeout`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Timeout {
+    /// A new value. `local` holds for the current transaction only.
+    Set { bounds: bool, local: bool },
+    /// `COMMIT`, `ROLLBACK` or `END`, which drops every local value.
+    TransactionEnd,
 }
 
 // ── Annotations ──────────────────────────────────────────────────────────────
@@ -311,7 +344,8 @@ fn timeout_in_force(timeouts: &[(usize, bool)], at: usize) -> bool {
 struct Annotation {
     rule: Rule,
     line: usize,
-    used: bool,
+    /// The statement this annotation allows, once a finding has used it.
+    bound: Option<usize>,
 }
 
 /// Parse one `--` comment as an annotation.
@@ -362,11 +396,12 @@ fn apply_annotations(sql: &str, comments: &[Comment], findings: Vec<Finding>) ->
             Some(Ok(rule)) => annotations.push(Annotation {
                 rule,
                 line: comment.line,
-                used: false,
+                bound: None,
             }),
             Some(Err(detail)) => out.push(Finding {
                 rule: Rule::BadAnnotation,
                 line: comment.line,
+                stmt: 0,
                 detail,
             }),
         }
@@ -377,12 +412,15 @@ fn apply_annotations(sql: &str, comments: &[Comment], findings: Vec<Finding>) ->
         let mut line = finding.line;
         while line > 1 && comment_lines.contains(&(line - 1)) {
             line -= 1;
-            for annotation in annotations
-                .iter_mut()
-                .filter(|a| a.line == line && a.rule == finding.rule)
-            {
-                annotation.used = true;
+            let free = annotations.iter_mut().find(|a| {
+                a.line == line
+                    && a.rule == finding.rule
+                    && a.bound.is_none_or(|stmt| stmt == finding.stmt)
+            });
+            if let Some(annotation) = free {
+                annotation.bound = Some(finding.stmt);
                 allowed = true;
+                break;
             }
         }
         if !allowed {
@@ -390,14 +428,20 @@ fn apply_annotations(sql: &str, comments: &[Comment], findings: Vec<Finding>) ->
         }
     }
 
-    out.extend(annotations.iter().filter(|a| !a.used).map(|a| Finding {
-        rule: Rule::UnusedAnnotation,
-        line: a.line,
-        detail: format!(
-            "allows {} but the statement below needs no such allowance",
-            a.rule.id()
-        ),
-    }));
+    out.extend(
+        annotations
+            .iter()
+            .filter(|a| a.bound.is_none())
+            .map(|a| Finding {
+                rule: Rule::UnusedAnnotation,
+                line: a.line,
+                stmt: 0,
+                detail: format!(
+                    "allows {} but the statement below needs no such allowance",
+                    a.rule.id()
+                ),
+            }),
+    );
     out.sort_by_key(|f| (f.line, f.rule));
     out
 }
@@ -658,7 +702,7 @@ struct Analysis {
     comments: Vec<Comment>,
     hits: Vec<Hit>,
     /// Each `lock_timeout` change: its token index, and whether it sets a bound.
-    timeouts: Vec<(usize, bool)>,
+    timeouts: Vec<(usize, Timeout)>,
     /// The number of top-level statements.
     statement_count: usize,
 }
@@ -768,6 +812,8 @@ impl<'a> Stmts<'a> {
                 break;
             };
             names.push(name);
+            // `name *` asks for the descendant tables too, which is the default.
+            let next = next + usize::from(self.is_punct(next, '*'));
             if !self.is_punct(next, ',') {
                 break;
             }
@@ -936,8 +982,10 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
             // A conditional setter cannot set a bound, but a conditional
             // clear may end one.
             _ if tok.runs => {
-                let change = timeout_change(&s, k).filter(|bounds| !bounds || unconditional[k]);
-                timeouts.extend(change.map(|bounds| (k, bounds)));
+                let change = timeout_change(&s, k).filter(|change| {
+                    unconditional[k] || !matches!(change, Timeout::Set { bounds: true, .. })
+                });
+                timeouts.extend(change.map(|change| (k, change)));
             }
             _ => {}
         }
@@ -1042,12 +1090,13 @@ fn unconditional(s: &Stmts) -> Vec<bool> {
 /// `RESET lock_timeout`, `RESET ALL` and `set_config('lock_timeout', ...)`.
 /// `SET` and `RESET` count only at the start of a statement, so
 /// `ALTER ROLE ... SET` does not.
-fn timeout_change(s: &Stmts, k: usize) -> Option<bool> {
+fn timeout_change(s: &Stmts, k: usize) -> Option<Timeout> {
     let start = s.starts[k] == k;
     match s.word(k)? {
         "set" if start => {
             let mut j = k + 1;
-            if s.is(j, "local") || s.is(j, "session") {
+            let local = s.is(j, "local");
+            if local || s.is(j, "session") {
                 j += 1;
             }
             if !s.is(j, "lock_timeout") {
@@ -1057,9 +1106,20 @@ fn timeout_change(s: &Stmts, k: usize) -> Option<bool> {
             if s.is_punct(j, '=') || s.is(j, "to") {
                 j += 1;
             }
-            Some(bounds_wait(s, j))
+            Some(Timeout::Set {
+                bounds: bounds_wait(s, j),
+                local,
+            })
         }
-        "reset" if start && (s.is(k + 1, "lock_timeout") || s.is(k + 1, "all")) => Some(false),
+        "reset" if start && (s.is(k + 1, "lock_timeout") || s.is(k + 1, "all")) => {
+            Some(Timeout::Set {
+                bounds: false,
+                local: false,
+            })
+        }
+        "commit" | "rollback" | "end" if start && s.toks[k].depth == 0 => {
+            Some(Timeout::TransactionEnd)
+        }
         "set_config"
             if s.is_punct(k + 1, '(')
                 && s.string(k + 2) == Some("lock_timeout")
@@ -1069,7 +1129,10 @@ fn timeout_change(s: &Stmts, k: usize) -> Option<bool> {
             // A bound counts only from a bare `SELECT` or `PERFORM` of the
             // call. A clear counts anywhere.
             let bounds = bounds_wait(s, k + 4);
-            (!bounds || s.is_bare_call(k)).then_some(bounds)
+            let local = s.is(k + 6, "true")
+                || s.string(k + 6)
+                    .is_some_and(|v| ["true", "t", "on", "yes", "1"].contains(&v.trim()));
+            (!bounds || s.is_bare_call(k)).then_some(Timeout::Set { bounds, local })
         }
         _ => None,
     }
@@ -2129,6 +2192,48 @@ fn an_index_name_in_another_schema_cannot_hide_a_hot_index() {
     let sql = "SET LOCAL lock_timeout = '5s';\nDROP INDEX public.idx_shared;";
     let findings = lint_with_history(&history, sql, true);
     assert_eq!(rules(&findings), [Rule::BlockingIndex], "{findings:?}");
+}
+
+#[test]
+fn a_transaction_end_clears_a_local_timeout() {
+    for end in ["COMMIT", "ROLLBACK", "END"] {
+        let sql = format!(
+            "BEGIN;\nSET LOCAL lock_timeout = '5s';\n{end};\n\
+             ALTER TABLE harvest_events ADD COLUMN x INT;"
+        );
+        let findings = lint_with_history(&[], &sql, false);
+        assert_eq!(rules(&findings), [Rule::LockTimeout], "{end}: {findings:?}");
+    }
+    // A session-level timeout outlives the transaction.
+    let session = "BEGIN;\nSET lock_timeout = '5s';\nCOMMIT;\n\
+                   ALTER TABLE harvest_events ADD COLUMN x INT;";
+    assert_eq!(lint_with_history(&[], session, false), []);
+}
+
+#[test]
+fn an_annotation_allows_one_statement_only() {
+    let sql = "-- lock-safety: allow lock-timeout #1810 a reviewed reason\n\
+               ALTER TABLE harvest_events ADD COLUMN x INT; ALTER TABLE harvest_timers ADD COLUMN y INT;\n";
+    let findings = lint_with_history(&[], sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+    // One statement that drops two indexes needs one annotation, not two.
+    let history =
+        ["CREATE INDEX a ON harvest_events (id);\nCREATE INDEX b ON harvest_events (id);"];
+    let one = "SET LOCAL lock_timeout = '5s';\n\
+               -- lock-safety: allow blocking-index #1810 a reviewed reason\n\
+               DROP INDEX a, b;";
+    assert_eq!(lint_with_history(&history, one, true), []);
+}
+
+#[test]
+fn a_name_list_continues_past_an_inheritance_marker() {
+    for sql in [
+        "LOCK TABLE harvest_schedules *, harvest_events IN ACCESS EXCLUSIVE MODE;",
+        "TRUNCATE harvest_schedules *, harvest_timers;",
+    ] {
+        let findings = lint_with_history(&[], sql, true);
+        assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}: {findings:?}");
+    }
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────

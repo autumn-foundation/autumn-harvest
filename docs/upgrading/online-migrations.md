@@ -95,7 +95,8 @@ timeout fires, the migration fails and rolls back. Run it again.
 
 Diesel and `harvest migrate` send each `up.sql` as one batch. Postgres runs a
 multi-statement batch as one implicit transaction. `SET LOCAL` therefore holds
-for the whole file, even with `run_in_transaction = false`.
+for the whole file, even with `run_in_transaction = false`. An explicit `COMMIT`,
+`ROLLBACK` or `END` ends that transaction and its `SET LOCAL`.
 
 ## 4. Build indexes with `CONCURRENTLY`
 
