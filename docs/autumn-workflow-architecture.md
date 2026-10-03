@@ -985,11 +985,13 @@ CREATE TABLE harvest_events_p1 PARTITION OF harvest_events FOR VALUES WITH (MODU
 -- ... up to p15
 ```
 
-The `harvest_task_queue` table is also partitioned by `queue_name` using list partitioning, enabling queue-specific vacuum and index tuning.
+The `harvest_task_queue` table is **not** partitioned. It is one table with per-table autovacuum and fillfactor settings (issue #1811). Vacuum starts at 2% dead rows, and a fillfactor of 80 lets a heartbeat update stay on its page as a HOT update. The terminal-task janitor (§8.3) keeps the table small.
 
 ### 8.3 History Retention
 
-Harvest ships an opt-in retention janitor for completed workflow histories. Operators configure `RetentionConfig` on `HarvestBuilder`; default behavior for **workflow history** is disabled (`max_age = None`), so upgrading deletes no history until explicitly enabled. Two janitor passes ARE on by default: audit-log purging (`audit_retention_days`, 90 days) and the idle rate-limit-bucket GC (`rate_limit_bucket_retention_secs`, 7 days — issue #1127), the latter collecting only provably inert per-tenant token buckets.
+Harvest ships an opt-in retention janitor for completed workflow histories. Operators configure `RetentionConfig` on `HarvestBuilder`; default behavior for **workflow history** is disabled (`max_age = None`), so upgrading deletes no history until explicitly enabled. Three janitor passes ARE on by default: audit-log purging (`audit_retention_days`, 90 days), the idle rate-limit-bucket GC (`rate_limit_bucket_retention_secs`, 7 days — issue #1127), which collects only provably inert per-tenant token buckets, and the terminal-task janitor (`terminal_task_retention_secs`, 7 days — issue #1811).
+
+The terminal-task janitor deletes `harvest_task_queue` rows in `COMPLETED`, `FAILED` or `CANCELLED` state whose `completed_at` is older than the window. It never deletes a `PENDING` or `RUNNING` row. It keeps a terminal workflow-task row while its execution is live, because the concurrency supersede scan reads that row. It reads the partial index `idx_harvest_tq_terminal_completed_at` in `(completed_at, id)` order. It deletes in `batch_size` batches with `FOR UPDATE SKIP LOCKED`, at most 50 batches per shard per tick. `GET /admin/retention` reports its per-shard outcome as `terminal_task_gc`.
 
 When enabled, each tick selects terminal workflow executions older than `max_age` and deletes them transactionally. Rows in `harvest_events`, `harvest_task_queue`, `harvest_timers`, and `harvest_signals` are removed by `ON DELETE CASCADE`; `harvest_dead_letters` rows are deleted explicitly in the same retention transaction because `workflow_exec_id` is not a foreign key.
 

@@ -267,6 +267,8 @@ mod sticky_default_tests;
 mod sticky_routing_tests;
 mod telemetry_span_tests;
 #[cfg(feature = "db")]
+mod terminal_task_gc_tests;
+#[cfg(feature = "db")]
 mod terminal_write_ownership_tests;
 #[cfg(feature = "db")]
 mod throttle_bucket_prelock_batch_perf;

@@ -71,6 +71,23 @@ pub const DEFAULT_RATE_LIMIT_BUCKET_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
 /// ensure path having touched it, reopening the stranding race.
 pub const MIN_RATE_LIMIT_BUCKET_RETENTION: Duration = Duration::from_secs(60 * 60);
 
+/// Default age after which a terminal task row is deleted (issue #1811):
+/// 7 days.
+///
+/// The janitor is on by default. History retention is off by default, so
+/// without it finished `harvest_task_queue` rows stay forever. The engine
+/// reads no terminal task row that is more than a few minutes old.
+/// [`RetentionConfig::without_terminal_task_gc`] turns it off.
+pub const DEFAULT_TERMINAL_TASK_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Shortest configurable age for the terminal-task janitor (issue #1811):
+/// 1 hour.
+///
+/// A worker that lost its lease can still report on a row shortly after the
+/// row ends. Such a late report must find the row, so the floor stays well
+/// above any lease or timeout window.
+pub const MIN_TERMINAL_TASK_RETENTION: Duration = Duration::from_secs(60 * 60);
+
 /// Default byte cap for an opt-in captured summary payload (issue #752).
 ///
 /// A `result`/`error` value larger than this is replaced with a typed
@@ -386,6 +403,12 @@ pub struct RetentionConfig {
     /// `start-throttle:{workflow}:{key}`, issue #607) grew one row per tenant
     /// forever. Defaults to [`DEFAULT_RATE_LIMIT_BUCKET_RETENTION_SECS`].
     pub rate_limit_bucket_retention_secs: Option<u64>,
+    /// Age after which a terminal `harvest_task_queue` row is deleted (issue
+    /// #1811). `None` disables the janitor.
+    ///
+    /// It is independent of history retention, which is off by default.
+    /// Defaults to [`DEFAULT_TERMINAL_TASK_RETENTION_SECS`].
+    pub terminal_task_retention_secs: Option<u64>,
     /// Partition maintenance for the opt-in partitioned `harvest_events`
     /// layout (issue #958).
     ///
@@ -493,6 +516,7 @@ impl Default for RetentionConfig {
             archival_timeout_secs: DEFAULT_ARCHIVAL_TIMEOUT_SECS,
             summary: None,
             rate_limit_bucket_retention_secs: Some(DEFAULT_RATE_LIMIT_BUCKET_RETENTION_SECS),
+            terminal_task_retention_secs: Some(DEFAULT_TERMINAL_TASK_RETENTION_SECS),
             partitions: PartitionMaintenanceConfig::default(),
         }
     }
@@ -681,6 +705,39 @@ impl RetentionConfig {
         self.rate_limit_bucket_retention_secs.is_some()
     }
 
+    /// Set the age after which a terminal task row is deleted (issue #1811).
+    ///
+    /// `validate` rejects an age outside
+    /// [`MIN_TERMINAL_TASK_RETENTION`]`..=MAX_MAX_AGE`.
+    #[must_use]
+    pub const fn with_terminal_task_retention(mut self, age: Duration) -> Self {
+        self.terminal_task_retention_secs = Some(age.as_secs());
+        self
+    }
+
+    /// Disable the terminal-task janitor (issue #1811).
+    ///
+    /// Finished task rows then stay until history retention deletes their
+    /// execution. With history retention off, they stay forever.
+    #[must_use]
+    pub const fn without_terminal_task_gc(mut self) -> Self {
+        self.terminal_task_retention_secs = None;
+        self
+    }
+
+    /// The terminal-task janitor's age, or `None` when it is off (issue
+    /// #1811).
+    #[must_use]
+    pub fn terminal_task_retention(&self) -> Option<Duration> {
+        self.terminal_task_retention_secs.map(Duration::from_secs)
+    }
+
+    /// Whether the terminal-task janitor runs this tick (issue #1811).
+    #[must_use]
+    pub const fn terminal_task_gc_active(&self) -> bool {
+        self.terminal_task_retention_secs.is_some()
+    }
+
     /// Safely unpacks the raw configuration integer into a standard rust [`Duration`], gracefully
     /// handling systems where the feature is entirely turned off.
     #[must_use]
@@ -808,6 +865,17 @@ impl RetentionConfig {
                 MAX_MAX_AGE.as_secs()
             ));
         }
+        // The terminal-task janitor has its own floor (issue #1811). A late
+        // worker report must still find its row.
+        if let Some(age) = self.terminal_task_retention()
+            && !(MIN_TERMINAL_TASK_RETENTION..=MAX_MAX_AGE).contains(&age)
+        {
+            return Err(format!(
+                "terminal_task_retention must be between {}s and {}s",
+                MIN_TERMINAL_TASK_RETENTION.as_secs(),
+                MAX_MAX_AGE.as_secs()
+            ));
+        }
         // `EnableOptions::validate` (issue #958) rejects a zero lookahead at
         // enable time for exactly this reason: it leaves every append landing
         // in the DEFAULT partition. `PartitionMaintenanceConfig` must refuse
@@ -826,7 +894,8 @@ impl RetentionConfig {
     /// Returns `true` if any retention feature is enabled: workflow-history
     /// retention (global or per-type), audit-log purging, schedule-decision
     /// purging, bounded summary GC (issue #752), partition maintenance (issue
-    /// #958), or the idle rate-limit-bucket GC (issue #1127).
+    /// #958), the idle rate-limit-bucket GC (issue #1127), or the
+    /// terminal-task janitor (issue #1811).
     ///
     /// Per-workflow-type overrides count as enabling workflow-history retention
     /// even when the global `max_age` is unset (issue #737), so an
@@ -862,6 +931,8 @@ impl RetentionConfig {
             // while the runtime never spawned to honour it, and the table would
             // keep growing one row per tenant key.
             || self.rate_limit_bucket_gc_active()
+            // Issue #1811: the terminal-task janitor is work in its own right.
+            || self.terminal_task_gc_active()
     }
 }
 
@@ -919,6 +990,50 @@ pub struct RetentionTickResult {
     /// pipeline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit_bucket_gc: Option<RateLimitBucketGcOutcome>,
+    /// Terminal-task janitor outcome for this shard this tick (issue #1811).
+    ///
+    /// `None` means the janitor is off. `Some` with a zero count means it ran
+    /// and found nothing. `Some` with an `error` means it could not run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_task_gc: Option<TerminalTaskGcOutcome>,
+}
+
+/// One shard's terminal-task janitor result for one tick (issue #1811).
+#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
+pub struct TerminalTaskGcOutcome {
+    /// Rows deleted per task state. Under `dry_run`, rows the pass would
+    /// delete.
+    pub deleted_by_state: BTreeMap<String, u64>,
+    /// Total across states.
+    pub deleted: u64,
+    /// Whether this was a read-only `dry_run` preview.
+    pub dry_run: bool,
+    /// Why the pass did not run on this shard, when it did not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl TerminalTaskGcOutcome {
+    /// A completed pass, real or a `dry_run` preview.
+    #[must_use]
+    pub fn deleted(deleted_by_state: BTreeMap<String, u64>, dry_run: bool) -> Self {
+        Self {
+            deleted: deleted_by_state.values().sum(),
+            deleted_by_state,
+            dry_run,
+            error: None,
+        }
+    }
+
+    /// A pass that could not run on this shard.
+    #[must_use]
+    pub fn failed(error: String, dry_run: bool) -> Self {
+        Self {
+            error: Some(error),
+            dry_run,
+            ..Self::default()
+        }
+    }
 }
 
 /// One shard's idle rate-limit-bucket GC result for one tick (issue #1127).
@@ -1112,6 +1227,20 @@ impl RetentionMonitor {
             .find(|x| x.shard == u16::try_from(shard.as_i32()).unwrap_or(0))
         {
             existing.rate_limit_bucket_gc = Some(outcome);
+        }
+    }
+
+    /// Record this shard's terminal-task janitor outcome (issue #1811). It
+    /// runs outside the history-retention phase, as the bucket GC does.
+    #[cfg(feature = "db")]
+    fn update_terminal_tasks(&self, shard: ShardId, outcome: TerminalTaskGcOutcome) {
+        let mut guard = self.inner.lock().expect("retention monitor lock poisoned");
+        if let Some(existing) = guard
+            .per_shard
+            .iter_mut()
+            .find(|x| x.shard == u16::try_from(shard.as_i32()).unwrap_or(0))
+        {
+            existing.terminal_task_gc = Some(outcome);
         }
     }
 
@@ -1817,6 +1946,60 @@ impl RetentionRuntime {
                                 );
                             }
                         }
+                    }
+                }
+
+                // Terminal-task janitor (issue #1811). It is outside the
+                // history-retention gate, because history retention is off by
+                // default. Shard-local and best-effort: a failed shard is
+                // reported and retried next tick. Under `dry_run` it runs as
+                // a read-only preview.
+                if let Some(age) = config.terminal_task_retention()
+                    && let Ok(age) = chrono::Duration::from_std(age)
+                {
+                    let cutoff = Utc::now() - age;
+                    for (shard, pool) in pools.iter_shards() {
+                        let outcome = match pool.get().await {
+                            Ok(mut conn) => match crate::queue::sweep_terminal_tasks(
+                                &mut conn,
+                                cutoff,
+                                config.batch_size,
+                                config.dry_run,
+                            )
+                            .await
+                            {
+                                Ok(by_state) => {
+                                    // Real deletes only. A preview is a forecast.
+                                    if !config.dry_run {
+                                        for (state, count) in &by_state {
+                                            metrics.record_terminal_tasks_deleted(state, *count);
+                                        }
+                                    }
+                                    TerminalTaskGcOutcome::deleted(by_state, config.dry_run)
+                                }
+                                Err(err) => {
+                                    TerminalTaskGcOutcome::failed(err.to_string(), config.dry_run)
+                                }
+                            },
+                            Err(err) => {
+                                TerminalTaskGcOutcome::failed(err.to_string(), config.dry_run)
+                            }
+                        };
+                        if let Some(error) = &outcome.error {
+                            tracing::warn!(
+                                shard = %shard,
+                                error = %error,
+                                "harvest terminal-task janitor failed"
+                            );
+                        } else if outcome.deleted > 0 {
+                            tracing::info!(
+                                shard = %shard,
+                                deleted = outcome.deleted,
+                                dry_run = config.dry_run,
+                                "harvest terminal task rows deleted"
+                            );
+                        }
+                        monitor_task.update_terminal_tasks(shard, outcome);
                     }
                 }
 
@@ -4711,6 +4894,100 @@ mod tests {
 
         let off = config.without_rate_limit_bucket_gc();
         assert!(!off.enabled());
+    }
+
+    // -----------------------------------------------------------------------
+    // Terminal-task janitor config (issue #1811)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn terminal_task_gc_is_on_by_default_at_seven_days() {
+        let config = RetentionConfig::default();
+        assert_eq!(DEFAULT_TERMINAL_TASK_RETENTION_SECS, 7 * 24 * 60 * 60);
+        assert_eq!(
+            config.terminal_task_retention(),
+            Some(Duration::from_secs(DEFAULT_TERMINAL_TASK_RETENTION_SECS))
+        );
+        assert!(config.terminal_task_gc_active());
+        assert!(
+            !config.history_retention_active(),
+            "the janitor must not depend on history retention"
+        );
+    }
+
+    #[test]
+    fn terminal_task_gc_window_is_configurable_and_disablable() {
+        let six_hours = Duration::from_secs(6 * 60 * 60);
+        let config = RetentionConfig::default().with_terminal_task_retention(six_hours);
+        assert_eq!(config.terminal_task_retention(), Some(six_hours));
+
+        let off = RetentionConfig::default().without_terminal_task_gc();
+        assert_eq!(off.terminal_task_retention(), None);
+        assert!(!off.terminal_task_gc_active());
+    }
+
+    #[test]
+    fn terminal_task_gc_validate_bounds_the_window() {
+        let zero = RetentionConfig::default().with_terminal_task_retention(Duration::ZERO);
+        assert!(zero.terminal_task_gc_active(), "zero is not 'disabled'");
+        assert!(zero.validate().is_err());
+
+        let too_short = RetentionConfig::default().with_terminal_task_retention(
+            MIN_TERMINAL_TASK_RETENTION
+                .checked_sub(Duration::from_secs(1))
+                .expect("the floor is above 1s"),
+        );
+        assert!(too_short.validate().is_err());
+
+        let too_long = RetentionConfig::default()
+            .with_terminal_task_retention(MAX_MAX_AGE + Duration::from_secs(1));
+        assert!(too_long.validate().is_err());
+
+        assert!(
+            RetentionConfig::default()
+                .with_terminal_task_retention(MIN_TERMINAL_TASK_RETENTION)
+                .validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_terminal_task_gc_only_config_still_spawns_the_janitor() {
+        let config = RetentionConfig {
+            max_age_secs: None,
+            audit_retention_days: 0,
+            schedule_decision_retention_days: 0,
+            partitions: PartitionMaintenanceConfig {
+                enabled: false,
+                ..PartitionMaintenanceConfig::default()
+            },
+            ..RetentionConfig::default()
+        }
+        .without_rate_limit_bucket_gc();
+        assert!(
+            config.enabled(),
+            "the task janitor alone must spawn the runtime"
+        );
+        assert!(!config.without_terminal_task_gc().enabled());
+    }
+
+    #[test]
+    fn terminal_task_gc_outcome_totals_its_states() {
+        let mut by_state = BTreeMap::new();
+        by_state.insert("COMPLETED".to_string(), 7);
+        by_state.insert("FAILED".to_string(), 2);
+        let outcome = TerminalTaskGcOutcome::deleted(by_state, true);
+        assert_eq!(outcome.deleted, 9);
+        assert!(outcome.dry_run);
+        assert_eq!(outcome.error, None);
+
+        let failed = TerminalTaskGcOutcome::failed("boom".to_string(), true);
+        assert_eq!(failed.deleted, 0);
+        assert!(
+            failed.dry_run,
+            "a failed preview must still read as a preview"
+        );
+        assert_eq!(failed.error.as_deref(), Some("boom"));
     }
 
     #[test]
