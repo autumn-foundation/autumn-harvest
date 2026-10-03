@@ -26,6 +26,9 @@
 //!   cargo bench -p autumn-harvest --features db --bench task_queue_hygiene_bench
 //! ```
 //!
+//! The bench ends with the `harvest_task_queue` scan nodes of the claim query
+//! and the two timeout scans under each schema.
+//!
 //! The URL is an admin connection. The harness creates and migrates a fresh
 //! database. Without the URL it starts a Docker Postgres. With neither, it
 //! prints a skip notice and exits 0. `HARVEST_BENCH_TERMINAL_ROWS` sets the
@@ -173,6 +176,7 @@ async fn run() {
         print_row(arm, &state, &report);
     }
     sweep_note(sweep.as_ref());
+    explain_section(&mut conn).await;
 
     exec(
         &mut conn,
@@ -204,13 +208,15 @@ async fn prepare(
     if arm.terminal != Terminal::None {
         seed_terminal_rows(conn, rows).await;
     }
+    if arm.terminal == Terminal::Swept {
+        *sweep = Some(run_janitor(conn).await);
+    }
+    // Flush this backend's pending table counters before VACUUM. Otherwise
+    // they reach the stats view after VACUUM resets its dead-row count.
+    flush_stats(conn).await;
     match arm.terminal {
-        Terminal::None | Terminal::Vacuumed => {
-            exec(conn, "VACUUM (ANALYZE) harvest_task_queue").await;
-        }
         Terminal::Dead => exec(conn, "ANALYZE harvest_task_queue").await,
-        Terminal::Swept => {
-            *sweep = Some(run_janitor(conn).await);
+        Terminal::None | Terminal::Vacuumed | Terminal::Swept => {
             exec(conn, "VACUUM (ANALYZE) harvest_task_queue").await;
         }
     }
@@ -287,10 +293,7 @@ async fn table_state(conn: &mut AsyncPgConnection) -> TableState {
         #[diesel(sql_type = diesel::sql_types::Double)]
         index_mb: f64,
     }
-    // Wait for this backend's table counters to reach the stats view.
-    let _ = diesel::sql_query("SELECT pg_stat_force_next_flush()")
-        .execute(conn)
-        .await;
+    flush_stats(conn).await;
     let row: Row = diesel::sql_query(
         "SELECT \
              (SELECT COUNT(*) FROM harvest_task_queue) AS live, \
@@ -308,6 +311,15 @@ async fn table_state(conn: &mut AsyncPgConnection) -> TableState {
         heap_mb: row.heap_mb,
         index_mb: row.index_mb,
     }
+}
+
+/// Push this backend's pending table counters to the stats view.
+///
+/// The call schedules the flush for the end of the current statement. The
+/// next statement then reads the flushed counters.
+async fn flush_stats(conn: &mut AsyncPgConnection) {
+    exec(conn, "SELECT pg_stat_force_next_flush()").await;
+    exec(conn, "SELECT 1").await;
 }
 
 fn stats_cells(stats: LatencyStats) -> String {
@@ -349,6 +361,64 @@ fn sweep_note(sweep: Option<&SweepRun>) {
         sweep.secs,
     );
     println!("> `⚠` marks an arm cut short by the scenario wall-clock budget.");
+}
+
+/// Print the `harvest_task_queue` scan nodes of three hot queries under each
+/// schema. The migration replaces `idx_harvest_tq_running`, which the claim
+/// query and the timeout scans read as a RUNNING-row index. This shows that
+/// the replacement serves the same nodes.
+async fn explain_section(conn: &mut AsyncPgConnection) {
+    println!();
+    println!("## Plans: `harvest_task_queue` scan nodes");
+    for (label, schema_sql) in [("before", BEFORE_SQL), ("after", AFTER_SQL)] {
+        exec(conn, &format!("BEGIN; {schema_sql}; COMMIT;")).await;
+        exec(conn, "ANALYZE harvest_task_queue").await;
+        println!();
+        println!("### {label}");
+        println!();
+        println!("```text");
+        let claim = db::explain_claim(conn, headline_scenario()).await;
+        print_scan_nodes("claim_task", &claim);
+        for (name, sql) in [
+            (
+                "heartbeat_timeout",
+                autumn_harvest::timeout::heartbeat_timeout_query(),
+            ),
+            (
+                "start_to_close_timeout",
+                autumn_harvest::timeout::start_to_close_timeout_query(),
+            ),
+        ] {
+            print_scan_nodes(name, &explain(conn, sql).await);
+        }
+        println!("```");
+    }
+}
+
+fn print_scan_nodes(query: &str, plan: &str) {
+    for line in plan.lines() {
+        let node = line.trim().trim_start_matches("-> ").trim();
+        let task_queue_scan = node.contains("Scan") && node.contains("harvest_task_queue");
+        if task_queue_scan || node.starts_with("Bitmap Index Scan on idx_harvest_tq") {
+            println!("{query}: {node}");
+        }
+    }
+}
+
+async fn explain(conn: &mut AsyncPgConnection, sql: &str) -> String {
+    #[derive(QueryableByName)]
+    struct PlanRow {
+        #[diesel(sql_type = diesel::sql_types::Text, column_name = "QUERY PLAN")]
+        line: String,
+    }
+    diesel::sql_query(format!("EXPLAIN (COSTS OFF) {sql}"))
+        .load::<PlanRow>(conn)
+        .await
+        .expect("explain")
+        .into_iter()
+        .map(|r| r.line)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 async fn exec(conn: &mut AsyncPgConnection, sql: &str) {
