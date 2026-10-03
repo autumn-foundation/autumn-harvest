@@ -128,6 +128,8 @@ mod guardrail_catalog_tests;
 mod havoc_reentrancy;
 mod havoc_tests;
 mod history_ceiling_claim_tests;
+#[cfg(feature = "db")]
+mod history_default_caps_tests;
 mod host_clock_skew_tests;
 mod hot_code_swap_docs;
 #[cfg(all(feature = "hot-code-swap", feature = "testing"))]
