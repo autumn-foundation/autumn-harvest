@@ -401,6 +401,8 @@ pub mod replay_sample;
 pub mod replication;
 #[cfg(feature = "db")]
 pub mod reset;
+/// Resident workflow state between decisions (issue #1798).
+pub mod resident;
 pub mod retention;
 /// Per-activity-type retry budget that bounds retry load (issue #1793).
 pub mod retry_budget;

@@ -35,7 +35,9 @@ mod e2e_bench_support;
 use std::sync::{Arc, Mutex};
 
 use autumn_harvest::event::WorkflowEvent;
+use autumn_harvest::context::WorkflowCommand;
 use autumn_harvest::executor::{WorkflowOutcome, run_workflow};
+use autumn_harvest::resident::{self, ResidentWorkflow};
 use autumn_harvest::testing::WorkflowReplayer;
 use autumn_harvest::types::ExecutionId;
 use criterion::measurement::WallTime;
@@ -169,6 +171,91 @@ fn bench_decision_cost(c: &mut Criterion) {
     group.finish();
 }
 
+/// A resident workflow at `events` history events, and its next delta.
+///
+/// The cold decision replays the full history and schedules one more
+/// activity. The delta is that activity's `ActivityScheduled` and
+/// `ActivityCompleted`. Resuming with it schedules the next activity.
+fn warm_decision(
+    rt: &tokio::runtime::Runtime,
+    events: usize,
+) -> (ResidentWorkflow, Vec<WorkflowEvent>) {
+    let (exec_id, history, input) = decision_history(events / 2, 2);
+    let (outcome, resident) = rt.block_on(resident::start(
+        exec_id,
+        history,
+        sequential_workflow,
+        input,
+    ));
+    let WorkflowOutcome::Suspended { commands } = outcome else {
+        panic!("a live decision at {events} events must suspend: {outcome:?}");
+    };
+    let delta = commands
+        .iter()
+        .find_map(|cmd| match cmd {
+            WorkflowCommand::ScheduleActivity {
+                activity_id,
+                name,
+                input,
+                queue,
+                ..
+            } => Some(vec![
+                WorkflowEvent::ActivityScheduled {
+                    activity_id: *activity_id,
+                    name: name.clone(),
+                    input: input.clone(),
+                    queue: queue.clone(),
+                },
+                WorkflowEvent::ActivityCompleted {
+                    activity_id: *activity_id,
+                    output: serde_json::Value::Null,
+                },
+            ]),
+            _ => None,
+        })
+        .expect("the decision schedules an activity");
+    let resident = resident.expect("an activity suspension stays resident");
+    (resident, delta)
+}
+
+/// Measures one warm decision at 1k, 5k and 10k events (issue #1798).
+///
+/// A warm decision resumes the resident workflow with one new result. It
+/// does not replay history, so its cost must stay roughly constant across
+/// the three sizes. Compare with `decision_cost`, which grows linearly.
+fn bench_decision_cost_warm(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    // Each size must resume and suspend again, or the group times a decline.
+    for events in DECISION_COST_EVENTS {
+        let (resident, delta) = warm_decision(&rt, events);
+        let resumed = rt.block_on(resident.resume(&delta));
+        assert!(
+            matches!(
+                &resumed,
+                Ok((WorkflowOutcome::Suspended { .. }, Some(_)))
+            ),
+            "a warm decision at {events} events must resume and suspend: {resumed:?}"
+        );
+    }
+
+    let mut group = c.benchmark_group("decision_cost_warm");
+    for events in DECISION_COST_EVENTS {
+        group.bench_with_input(
+            BenchmarkId::from_parameter(events),
+            &events,
+            |b, &events| {
+                b.iter_batched(
+                    || warm_decision(&rt, events),
+                    |(resident, delta)| rt.block_on(resident.resume(&delta)),
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+    group.finish();
+}
+
 // ---------------------------------------------------------------------------
 // Span no-op overhead bench (issue #136 AC)
 // ---------------------------------------------------------------------------
@@ -241,6 +328,7 @@ criterion_group!(
     bench_replay_1k,
     bench_replay_10k,
     bench_decision_cost,
+    bench_decision_cost_warm,
     bench_span_noop_overhead
 );
 criterion_main!(benches);
