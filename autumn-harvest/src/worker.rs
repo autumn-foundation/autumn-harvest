@@ -20866,7 +20866,7 @@ enum HistoryCapBreach {
 
 impl HistoryCapBreach {
     /// The typed DLQ reason for this breach.
-    fn dead_letter_reason(self, workflow_type: String) -> DeadLetterReason {
+    const fn dead_letter_reason(self, workflow_type: String) -> DeadLetterReason {
         match self {
             Self::Events { count, cap } => DeadLetterReason::HistoryCapExceeded {
                 count,
@@ -21049,7 +21049,6 @@ async fn fail_workflow_for_history_cap(
     Ok(deferred)
 }
 
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 /// Stored history bytes below `prepared.next_event_id` (issue #1804).
 ///
 /// A warm decision adds only the events at or after the cached mark. A cold
@@ -21084,6 +21083,7 @@ async fn measure_history_bytes(
     })
 }
 
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn process_workflow_task(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,

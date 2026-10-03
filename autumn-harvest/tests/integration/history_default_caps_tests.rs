@@ -344,7 +344,7 @@ async fn wait_until<F>(
     done: F,
 ) -> WorkflowExecution
 where
-    F: Fn(&WorkflowExecution) -> bool,
+    F: Fn(&WorkflowExecution) -> bool + Send + Sync,
 {
     let polled = tokio::time::timeout(LARGE_HISTORY_WAIT, async {
         loop {
@@ -356,16 +356,14 @@ where
         }
     })
     .await;
-    match polled {
-        Ok(execution) => execution,
-        Err(_) => {
-            let execution = load_execution(database_url, exec_id).await;
-            panic!(
-                "timed out waiting for {what}; state={} error={:?}",
-                execution.state, execution.error
-            );
-        }
+    if let Ok(execution) = polled {
+        return execution;
     }
+    let execution = load_execution(database_url, exec_id).await;
+    panic!(
+        "timed out waiting for {what}; state={} error={:?}",
+        execution.state, execution.error
+    );
 }
 
 async fn signal_received_count(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> usize {
