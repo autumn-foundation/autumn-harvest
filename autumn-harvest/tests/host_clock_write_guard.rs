@@ -206,6 +206,8 @@ fn is_write_target(code: &str, column: &str, at: usize) -> bool {
 /// A write is a scan column followed by `.eq(`, `:` or `=`, with `Utc::now`
 /// inside the same expression. The expression can span lines.
 fn violations(source: &str) -> Vec<(usize, String)> {
+    // A Windows checkout uses CRLF. The offset arithmetic assumes one byte.
+    let source = &source.replace("\r\n", "\n");
     let original: Vec<&str> = source.lines().collect();
     let code = blank_test_modules(&strip_comments(source));
     let mut found = Vec::new();
@@ -379,6 +381,15 @@ fn scanner_keeps_a_url_string_out_of_the_comment_strip() {
     let source =
         "#[cfg(test)]\nmod tests {\n let u = \"http://x\";\n}\nx.scheduled_at.eq(Utc::now());";
     assert_eq!(violations(source).len(), 1);
+}
+
+#[test]
+fn scanner_handles_windows_line_endings() {
+    let source = "#[cfg(test)]\r\nmod tests {\r\n    x.scheduled_at.eq(Utc::now());\r\n}\r\ny.scheduled_at.eq(Utc::now());";
+    assert_eq!(
+        violations(source),
+        vec![(5, "y.scheduled_at.eq(Utc::now());".to_string())]
+    );
 }
 
 #[test]
