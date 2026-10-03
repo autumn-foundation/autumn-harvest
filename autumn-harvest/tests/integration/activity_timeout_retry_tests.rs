@@ -873,6 +873,21 @@ fn echo(_ctx: &autumn_harvest::ActivityContext, input: serde_json::Value) -> Box
     Box::pin(async move { Ok(input) })
 }
 
+/// Opens the gate of [`gated`].
+static GATE: std::sync::LazyLock<tokio::sync::Notify> =
+    std::sync::LazyLock::new(tokio::sync::Notify::new);
+/// Set when [`gated`] returns.
+static GATED_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Succeeds once the test opens [`GATE`].
+fn gated(_ctx: &autumn_harvest::ActivityContext, input: serde_json::Value) -> BoxFut<'_> {
+    Box::pin(async move {
+        GATE.notified().await;
+        GATED_DONE.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(input)
+    })
+}
+
 /// Calls the activity named in the input once, with no retries.
 fn wf_call(ctx: &WorkflowContext, input: serde_json::Value) -> BoxFut<'_> {
     Box::pin(async move {
@@ -919,6 +934,14 @@ fn wf_info() -> WorkflowInfo {
 }
 
 fn act_info(name: &'static str, policy: CircuitBreakerPolicy) -> ActivityInfo {
+    act_info_with(name, policy, echo)
+}
+
+fn act_info_with(
+    name: &'static str,
+    policy: CircuitBreakerPolicy,
+    handler: autumn_harvest::info::ActivityHandlerFn,
+) -> ActivityInfo {
     ActivityInfo {
         name,
         module: "activity_timeout_retry_tests",
@@ -939,7 +962,7 @@ fn act_info(name: &'static str, policy: CircuitBreakerPolicy) -> ActivityInfo {
         max_input_bytes: None,
         max_result_bytes: None,
         requires: None,
-        handler: echo,
+        handler,
     }
 }
 
@@ -1193,6 +1216,71 @@ async fn organically_open_breaker_defers_until_the_probe_closes_it() {
         "no attempt fails: {events:?}"
     );
     assert_eq!(breaker_state(&breakers, activity).0, "closed");
+}
+
+/// A late result of a timed-out attempt must not move the breaker (issue
+/// #1809). The timeout already counted. Before the fence, the late success
+/// cleared the failure window and erased the timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn late_result_of_a_timed_out_attempt_leaves_the_breaker_alone() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let queue = unique("t1809-late");
+    let activity = "t1809_late_result";
+    let policy = CircuitBreakerPolicy::new(2, Duration::from_secs(60), Duration::from_secs(60));
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![wf_info()],
+        vec![act_info_with(activity, policy, gated)],
+    ));
+    let breakers = registry.circuit_breakers();
+
+    let exec_id = seed_workflow(&mut conn, &queue, activity).await;
+    let worker = build_worker(&queue, Arc::clone(&registry));
+    let pool = build_pool(&url);
+    let runner = Arc::clone(&worker);
+    let handle = tokio::spawn(async move { runner.run(&pool).await });
+
+    wait_until("the activity starts", Duration::from_secs(20), || {
+        let url = url.clone();
+        async move {
+            let mut conn = connect(&url).await;
+            history(&mut conn, exec_id)
+                .await
+                .iter()
+                .any(|e| matches!(e, WorkflowEvent::ActivityStarted { .. }))
+        }
+    })
+    .await;
+    let task_id: Uuid = harvest_task_queue::table
+        .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid())))
+        .filter(harvest_task_queue::task_type.eq("activity"))
+        .select(harvest_task_queue::id)
+        .first(&mut conn)
+        .await
+        .expect("the activity task");
+    age_claim(&mut conn, task_id).await;
+    enforce(&mut conn, Some(&breakers)).await;
+    assert_eq!(breaker_state(&breakers, activity), ("closed", 1));
+
+    // The hung attempt now returns a success, after its claim is gone.
+    GATE.notify_one();
+    wait_until(
+        "the late handler returns",
+        Duration::from_secs(5),
+        || async {
+            std::sync::atomic::AtomicBool::load(&GATED_DONE, std::sync::atomic::Ordering::SeqCst)
+        },
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    worker.shutdown();
+    handle.await.expect("worker joins");
+
+    assert_eq!(
+        breaker_state(&breakers, activity),
+        ("closed", 1),
+        "a late success of a lost claim must not clear the counted timeout"
+    );
 }
 
 /// ADR 0004 §3: `FailFast` keeps the old behaviour. The open breaker fails

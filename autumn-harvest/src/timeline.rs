@@ -58,7 +58,8 @@
 //! to `1` for a first-try completion. `ActivityTimedOut` carries no `attempt`
 //! field. A retried timeout appends no event (issue #1809). So a timed-out
 //! step reports the number of its `ActivityStarted` events, or `1` when it
-//! never started.
+//! never started. That is a lower bound: an attempt that timed out before its
+//! handler started appends no `ActivityStarted`.
 //!
 //! ### signal_wait caveat
 //!
@@ -204,7 +205,9 @@ pub struct TimelineStep {
     /// `ActivityFailed`/`LocalActivityFailed`/`LocalActivityExhausted` events
     /// (default `1`). Success and timeout events carry no attempt field, so a
     /// succeeded-after-N-failures step reports `N`, not the true final `N+1` —
-    /// treat it as a **lower bound** on the final attempt number.
+    /// treat it as a **lower bound** on the final attempt number. A timed-out
+    /// step reports the number of its `ActivityStarted` events (issue #1809).
+    /// An attempt that timed out before its handler started is not counted.
     pub attempt: Option<i32>,
 }
 

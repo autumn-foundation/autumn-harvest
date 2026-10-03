@@ -16334,7 +16334,20 @@ async fn process_activity_task(
     // stay HalfOpen with `probe_in_flight = true` forever and short-circuit every
     // later dispatch. Only genuine handler outcomes feed the breaker as outcomes.
     probe_guard.disarm();
-    let circuit_outcome = if was_cancelled {
+    // A timeout can requeue the attempt before its handler returns (issue
+    // #1809). The enforcer already counted that timeout. A late result of the
+    // lost claim must not count again, and a late success must not clear the
+    // failure window. A self-committed activity completed its own row, so it
+    // keeps its `Success`. Only a breaker activity pays for the read.
+    let claim_lost = circuit_token.is_some()
+        && activity.circuit_breaker.is_some()
+        && !was_cancelled
+        && !committed_transactionally
+        && matches!(
+            queue::claim_is_current(&mut conn, &activity_claim).await,
+            Ok(false)
+        );
+    let circuit_outcome = if was_cancelled || claim_lost {
         if let Some(token) = circuit_token {
             circuit_breakers.on_cancelled(activity_name, token, std::time::Instant::now());
         }
