@@ -249,13 +249,16 @@ fn lint(sql: &str, run_in_transaction: bool, history: &History) -> Vec<Finding> 
         }
     }
 
-    // Every hot lock needs a bound in force. Report the first one without.
+    // Every hot lock needs a bound in force. Report each statement without
+    // one, so an annotation on one lock never covers another.
+    let mut reported = BTreeSet::new();
     let unbounded = analysis
         .hits
         .iter()
         .filter(|hit| hit.hot && hit.kind != (Kind::Index { concurrent: true }))
-        .find(|hit| !timeout_in_force(&analysis.timeouts, hit.at));
-    if let Some(lock) = unbounded {
+        .filter(|hit| !timeout_in_force(&analysis.timeouts, hit.at))
+        .filter(|hit| reported.insert(hit.at));
+    for lock in unbounded {
         findings.push(Finding {
             rule: Rule::LockTimeout,
             line: lock.line,
@@ -760,6 +763,27 @@ impl<'a> Stmts<'a> {
         (self.starts[k]..self.end(k)).any(|j| self.is(j, first) && self.is(j + 1, second))
     }
 
+    /// The comma-separated actions of the statement that starts at `k`, as
+    /// token ranges. A comma inside parentheses does not split an action.
+    fn actions(&self, k: usize) -> Vec<(usize, usize)> {
+        let end = self.end(k);
+        let mut out = Vec::new();
+        let mut from = k;
+        let mut parens = 0_usize;
+        for j in k..end {
+            if self.is_punct(j, '(') {
+                parens += 1;
+            } else if self.is_punct(j, ')') {
+                parens = parens.saturating_sub(1);
+            } else if parens == 0 && self.is_punct(j, ',') {
+                out.push((from, j));
+                from = j + 1;
+            }
+        }
+        out.push((from, end));
+        out
+    }
+
     /// The table a `CREATE TABLE` or `ALTER TABLE` statement at `start` names.
     fn statement_table(&self, start: usize) -> Option<String> {
         let mut j = start + 1;
@@ -1038,12 +1062,17 @@ fn alter(s: &Stmts, k: usize, history: &History, raws: &mut Vec<Raw>) {
                 return;
             };
             // A unique, primary-key or exclusion constraint builds its index
-            // under the ALTER TABLE lock, unless it adopts one with USING INDEX.
-            let builds_index = (k..s.end(k)).any(|j| {
-                s.is(j, "unique")
-                    || s.is(j, "exclude")
-                    || (s.is(j, "primary") && s.is(j + 1, "key"))
-            }) && !s.has_pair(k, "using", "index");
+            // under the ALTER TABLE lock. USING INDEX adopts an index instead,
+            // but only for the action that names it.
+            let builds_index = s.actions(k).into_iter().any(|(from, to)| {
+                let adopts = (from..to).any(|j| s.is(j, "using") && s.is(j + 1, "index"));
+                !adopts
+                    && (from..to).any(|j| {
+                        s.is(j, "unique")
+                            || s.is(j, "exclude")
+                            || (s.is(j, "primary") && s.is(j + 1, "key"))
+                    })
+            });
             if builds_index {
                 raws.push(Raw {
                     at: k,
@@ -1824,6 +1853,26 @@ fn a_timeout_set_inside_a_function_body_does_not_count() {
     let in_do = "DO $$\nBEGIN\n    PERFORM set_config('lock_timeout', '5s', true);\nEND $$;\n\
                  ALTER TABLE harvest_events ADD COLUMN x INT;\n";
     assert_eq!(lint_with_history(&[], in_do, true), []);
+}
+
+#[test]
+fn every_unbounded_lock_gets_its_own_finding() {
+    // An annotation on the first lock must not cover a later one.
+    let sql = "-- lock-safety: allow lock-timeout #1810 a reviewed reason\n\
+               ALTER TABLE harvest_events ADD COLUMN x INT;\n\
+               ALTER TABLE harvest_timers ADD COLUMN y INT;\n";
+    let findings = lint_with_history(&[], sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+    assert_eq!(findings[0].line, 3, "{findings:?}");
+}
+
+#[test]
+fn using_index_exempts_only_its_own_alter_action() {
+    let sql = "SET LOCAL lock_timeout = '5s';\n\
+               ALTER TABLE harvest_events ADD CONSTRAINT u UNIQUE (a), \
+               ADD CONSTRAINT p PRIMARY KEY USING INDEX idx_p;";
+    let findings = lint_with_history(&[], sql, true);
+    assert_eq!(rules(&findings), [Rule::BlockingIndex], "{findings:?}");
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────
