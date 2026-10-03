@@ -307,6 +307,7 @@ fn worker_config(queue: &str, shards: Vec<ShardId>) -> WorkerRuntimeConfig {
         build_id: String::new(),
         deployment_name: None,
         workflow_cache_size: 100,
+        resident_workflows: true,
         priority_aging_secs: None,
         unknown_target_grace_window: Duration::from_secs(5),
         poison_pill_threshold: 3,

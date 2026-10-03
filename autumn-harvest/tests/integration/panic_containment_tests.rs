@@ -186,6 +186,7 @@ fn build_worker(
                 build_id: String::new(),
                 deployment_name: None,
                 workflow_cache_size: 1000,
+                resident_workflows: true,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
