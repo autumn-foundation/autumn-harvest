@@ -158,8 +158,8 @@ pub struct WorkerConfigView {
     /// Builder-level default activity retry `max_attempts` (issue #620);
     /// `null` when no builder-default retry floor is configured.
     pub default_activity_retry_max_attempts: Option<u32>,
-    /// Builder-level default activity `start_to_close`, milliseconds (issue #620);
-    /// `null` when no builder-default timeout floor is configured.
+    /// Builder-level default activity `start_to_close`, milliseconds (issue #620).
+    /// Defaults to 600000 (issue #1808). `null` after `without_default_activity_start_to_close()`.
     pub default_activity_start_to_close_ms: Option<u64>,
     /// Ceiling on an author-supplied `Retry-After` delay hint, milliseconds
     /// (issue #744). Always present (not opt-in); default 15 minutes.
@@ -850,10 +850,23 @@ mod tests {
     }
 
     #[test]
+    fn default_activity_start_to_close_ms_surfaces_the_shipped_default_issue_1808() {
+        let view = WorkerConfigView::from_worker_config(
+            &WorkerConfig::default(),
+            Duration::from_millis(500),
+        );
+        assert_eq!(view.default_activity_start_to_close_ms, Some(600_000));
+
+        // The opt-out surfaces as null, so an operator can see it.
+        let off = WorkerConfig::default().without_default_activity_start_to_close();
+        let view = WorkerConfigView::from_worker_config(&off, Duration::from_millis(500));
+        assert_eq!(view.default_activity_start_to_close_ms, None);
+    }
+
+    #[test]
     fn retry_after_ceiling_ms_surfaces_the_configured_value_issue_744() {
-        // The ceiling is not opt-in (always present, unlike the sibling
-        // default_activity_* floors) -- confirm the default AND a configured
-        // override both surface through the introspection snapshot.
+        // The ceiling always applies. Confirm that the default and a
+        // configured override both surface through the snapshot.
         let default_view = WorkerConfigView::from_worker_config(
             &WorkerConfig::default(),
             Duration::from_millis(500),

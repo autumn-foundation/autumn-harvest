@@ -142,6 +142,7 @@ pub async fn record_external_task(
         "external task schedule to close",
     )?;
 
+    // host-clock-ok: the external-task timeout scan also compares with the host clock.
     let schedule_to_close_at = Utc::now().checked_add_signed(dur).ok_or_else(|| {
         crate::error::HarvestError::Database("Datetime addition overflow".to_string())
     })?;

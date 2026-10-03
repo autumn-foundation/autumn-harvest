@@ -13,11 +13,12 @@ use autumn_harvest::admission_gate::{
     set_global_admission_gate_cache, set_global_admission_metrics,
 };
 use autumn_harvest::telemetry::MetricsRecorder;
-use autumn_harvest::worker::DbPool;
+use autumn_harvest::worker::{DbPool, HandlerRegistry};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::api::{HarvestApiState, acquire_conn};
+use crate::api::{HarvestApiRuntime, HarvestApiState, acquire_conn};
+use crate::state::HarvestDbPool;
 
 /// Copy the limits of `built` into `api_state`.
 ///
@@ -61,6 +62,11 @@ pub fn mirror_built_config(api_state: &HarvestApiState, built: &mut BuiltHarvest
     api_state.set_usage_max_groups(built.usage_max_groups);
     // Batch start caps (issue #357).
     api_state.set_batch_start_config(&built.batch_start_config);
+    // Automatic load shedding (issue #1794). An empty config turns it off.
+    api_state
+        .gate_cache()
+        .load_shedder()
+        .configure(built.load_shed.clone());
     // Completion-callback SSRF policy (issue #605). The HTTP start route
     // validates a per-execution target against the allowlist that the scanner
     // uses at delivery time. `PreparedHarvestRuntime::build`, inside
@@ -109,17 +115,23 @@ pub async fn load_boot_admission_gates(api_state: &HarvestApiState, pool: &DbPoo
     }
 }
 
-/// The background loop that keeps the gate cache current (issue #377).
+/// The background loops that keep the gate cache current (issue #377).
+///
+/// The load-shed sampler (issue #1794) shares the shutdown token.
 pub struct GateRefreshRuntime {
     shutdown: CancellationToken,
     handle: JoinHandle<()>,
+    load_shed: Option<JoinHandle<()>>,
 }
 
 impl GateRefreshRuntime {
-    /// Cancel the loop and wait for it to end.
+    /// Cancel the loops and wait for them to end.
     pub async fn stop(self) {
         self.shutdown.cancel();
         let _ = self.handle.await;
+        if let Some(load_shed) = self.load_shed {
+            let _ = load_shed.await;
+        }
     }
 }
 
@@ -128,11 +140,22 @@ impl GateRefreshRuntime {
 /// The loop fails closed. When the gate table is unreadable, the cache
 /// becomes uninitialized, so `check()` blocks new starts. A stale open
 /// snapshot would admit them.
-pub fn spawn_gate_refresh(api_state: &HarvestApiState, pool: DbPool) -> GateRefreshRuntime {
-    let cache = api_state.gate_cache();
-    let api_state = api_state.clone();
+///
+/// It also spawns the load-shed sampler when a queue has a policy. The
+/// sampler takes its registry data from `runtime`, so a caller can spawn it
+/// before `api_state.install(runtime)`.
+pub fn spawn_gate_refresh(
+    api_state: &HarvestApiState,
+    pools: &HarvestDbPool,
+    runtime: &HarvestApiRuntime,
+) -> GateRefreshRuntime {
     let shutdown = CancellationToken::new();
     let cancel = shutdown.child_token();
+    let inputs = LoadShedSamplerInputs::from_registry(runtime.registry());
+    let load_shed = spawn_load_shed_sampler(api_state, pools, inputs, shutdown.child_token());
+    let pool = pools.clone_inner();
+    let cache = api_state.gate_cache();
+    let api_state = api_state.clone();
     let handle = tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -173,7 +196,101 @@ pub fn spawn_gate_refresh(api_state: &HarvestApiState, pool: DbPool) -> GateRefr
             }
         }
     });
-    GateRefreshRuntime { shutdown, handle }
+    GateRefreshRuntime {
+        shutdown,
+        handle,
+        load_shed,
+    }
+}
+
+/// The registry data that every load-shed sample reads (issue #1794).
+///
+/// The sampler takes this data once, at construction, from the registry of
+/// the runner. It does not resolve `HarvestApiState::runtime()` per tick.
+/// That accessor is empty until `install` runs, and both boot paths spawn
+/// the sampler before the install. On a multithreaded runtime the first
+/// tick can run in that window. A tick with an empty breaker list treats an
+/// old circuit-breaker activity behind an empty rate-limit bucket as
+/// unclaimable. The worker bypasses that bucket, so the queue would stay
+/// open until the next sample.
+pub struct LoadShedSamplerInputs {
+    /// The recorder for the `load_shed_active` gauge.
+    metrics: Arc<dyn MetricsRecorder>,
+    /// The activities that skip the claim-time rate-limit gate.
+    circuit_breaker_activities: Vec<String>,
+}
+
+impl LoadShedSamplerInputs {
+    /// Copy the sampler data out of `registry`.
+    pub fn from_registry(registry: &HandlerRegistry) -> Self {
+        Self {
+            metrics: Arc::clone(&registry.telemetry().metrics),
+            circuit_breaker_activities: registry
+                .circuit_breakers()
+                .tracked_activity_names()
+                .to_vec(),
+        }
+    }
+
+    /// The activities that skip the claim-time rate-limit gate.
+    pub fn circuit_breaker_activities(&self) -> &[String] {
+        &self.circuit_breaker_activities
+    }
+}
+
+/// Spawn the load-shed sampler of `api_state` (issue #1794).
+///
+/// Returns `None` when no queue has a policy, so a default deployment runs no
+/// sampler SQL. The sampler reads each physical pool once per tick. Each
+/// tick reads `inputs`, so the first tick sees the registry data whatever
+/// the install order.
+///
+/// `sample_once` bounds its own read and audit writes. Ticks keep a fixed
+/// period, so a slow sample does not push the next one out. An overdue tick
+/// fires at once. The staleness bound exceeds the read and audit bounds
+/// together by one interval. The shed state therefore stays fresh across a
+/// slow sample and the next read. The config clamps the interval to
+/// `MAX_SAMPLE_INTERVAL`, so the tick deadline is finite.
+fn spawn_load_shed_sampler(
+    api_state: &HarvestApiState,
+    pools: &HarvestDbPool,
+    inputs: LoadShedSamplerInputs,
+    cancel: CancellationToken,
+) -> Option<JoinHandle<()>> {
+    let shedder = Arc::clone(api_state.gate_cache().load_shedder());
+    let config = shedder.config();
+    if !config.is_enabled() {
+        return None;
+    }
+    let interval = config.sample_interval();
+    let shard_pools: Vec<DbPool> = pools
+        .sharded_pool()
+        .pool_groups()
+        .into_iter()
+        .map(|(pool, _)| pool.clone())
+        .collect();
+    let audit_pool = pools.clone_inner();
+    Some(tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(interval);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => return,
+                _ = ticks.tick() => {}
+            }
+            let sample = autumn_harvest::load_shed::sample_once(
+                &shedder,
+                &shard_pools,
+                &audit_pool,
+                Some(inputs.metrics.as_ref()),
+                inputs.circuit_breaker_activities(),
+            );
+            tokio::select! {
+                () = cancel.cancelled() => return,
+                _ = sample => {}
+            }
+        }
+    }))
 }
 
 /// Clear the admission globals that this runtime published.
@@ -531,5 +648,204 @@ mod admission_globals_guard_tests {
         );
         set_global_admission_gate_cache(None);
         set_global_admission_metrics(None);
+    }
+}
+
+#[cfg(test)]
+mod load_shed_sampler_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use autumn_harvest::info::ActivityInfo;
+    use autumn_harvest::load_shed::{LoadShedConfig, LoadShedPolicy, sample_once};
+    use autumn_harvest::policy::CircuitBreakerPolicy;
+    use autumn_harvest::scheduler::{DagCatalog, SchedulerMonitor};
+    use autumn_harvest::shard::ShardRouter;
+    use autumn_harvest::worker::{DbPool, HandlerRegistry};
+    use diesel::sql_types::Text;
+    use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+    use diesel_async::{AsyncPgConnection, RunQueryDsl};
+
+    use super::LoadShedSamplerInputs;
+    use crate::api::{HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime};
+    use crate::state::HarvestDbPool;
+
+    const QUEUE: &str = "ls_boot_queue";
+    const BREAKER_ACTIVITY: &str = "ls_boot_breaker_activity";
+    const BUCKET_KEY: &str = "ls_boot_empty_bucket";
+
+    /// An activity with a circuit breaker, so the registry tracks its name.
+    fn breaker_activity(name: &'static str) -> ActivityInfo {
+        ActivityInfo {
+            name,
+            module: "tests",
+            default_retry_policy: None,
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_schedule_to_close: None,
+            default_queue: None,
+            max_concurrent: None,
+            concurrency_key: None,
+            is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
+            rate_limit_key_expr: None,
+            circuit_breaker: Some(CircuitBreakerPolicy::new(
+                3,
+                Duration::from_secs(30),
+                Duration::from_secs(60),
+            )),
+            requires: None,
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        }
+    }
+
+    fn registry() -> Arc<HandlerRegistry> {
+        Arc::new(HandlerRegistry::new(
+            vec![],
+            vec![breaker_activity(BREAKER_ACTIVITY)],
+        ))
+    }
+
+    fn runtime(registry: Arc<HandlerRegistry>) -> HarvestApiRuntime {
+        HarvestApiRuntime::new(
+            registry,
+            Arc::new(DagCatalog::default()),
+            Arc::new(Vec::new()),
+            Some("ls-boot-test".to_owned()),
+            vec![],
+            SchedulerMonitor::offline(),
+            HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+            ShardRouter::default(),
+        )
+    }
+
+    /// Trip at 60 s with a 1 s sample interval, so the first tick decides.
+    fn config() -> LoadShedConfig {
+        let policy = LoadShedPolicy::new(
+            Duration::from_secs(60),
+            Duration::from_secs(10),
+            Duration::from_secs(7),
+        )
+        .expect("valid policy");
+        LoadShedConfig::new()
+            .with_sample_interval(Duration::from_secs(1))
+            .queue(QUEUE, policy)
+    }
+
+    /// The sampler inputs come from the registry, not from the installed
+    /// runtime, so the first tick sees the circuit-breaker list.
+    #[test]
+    fn sampler_inputs_carry_the_registry_breakers() {
+        let inputs = LoadShedSamplerInputs::from_registry(&registry());
+        assert_eq!(
+            inputs.circuit_breaker_activities(),
+            [BREAKER_ACTIVITY.to_owned()],
+            "the sampler must read the breaker list straight from the registry"
+        );
+    }
+
+    fn build_pool(url: &str) -> DbPool {
+        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
+        deadpool::managed::Pool::builder(manager)
+            .max_size(4)
+            .build()
+            .expect("pool build failed")
+    }
+
+    /// Remove the rows this test owns.
+    async fn scrub(conn: &mut AsyncPgConnection) {
+        diesel::sql_query("DELETE FROM harvest_task_queue WHERE queue_name = $1")
+            .bind::<Text, _>(QUEUE)
+            .execute(conn)
+            .await
+            .expect("scrub tasks");
+        diesel::sql_query("DELETE FROM harvest_rate_limit_buckets WHERE key = $1")
+            .bind::<Text, _>(BUCKET_KEY)
+            .execute(conn)
+            .await
+            .expect("scrub bucket");
+    }
+
+    /// One old circuit-breaker activity task behind an empty rate-limit
+    /// bucket. The worker bypasses the bucket for a breaker activity, so the
+    /// task is claimable. The age query counts it only when the activity is
+    /// in the breaker list.
+    async fn seed_old_breaker_task(conn: &mut AsyncPgConnection) {
+        diesel::sql_query(
+            "INSERT INTO harvest_rate_limit_buckets \
+                 (key, refill_rate, burst, tokens, last_refilled_at) \
+             VALUES ($1, 0, 1, 0, NOW())",
+        )
+        .bind::<Text, _>(BUCKET_KEY)
+        .execute(conn)
+        .await
+        .expect("insert bucket");
+        diesel::sql_query(
+            "INSERT INTO harvest_task_queue \
+                 (queue_name, task_type, activity_name, input, state, \
+                  scheduled_at, created_at, rate_limit_key) \
+             VALUES ($1, 'activity', $2, '{}'::jsonb, 'PENDING', \
+                     NOW() - INTERVAL '120 seconds', NOW() - INTERVAL '120 seconds', $3)",
+        )
+        .bind::<Text, _>(QUEUE)
+        .bind::<Text, _>(BREAKER_ACTIVITY)
+        .bind::<Text, _>(BUCKET_KEY)
+        .execute(conn)
+        .await
+        .expect("insert task");
+    }
+
+    /// The sampler spawned before `install` trips on its first tick.
+    ///
+    /// A sample with an empty breaker list sees no claimable task, so the
+    /// queue stays open. The spawned sampler reads the registry data from
+    /// the runtime it was given, so it trips without an install.
+    #[tokio::test]
+    async fn sampler_first_tick_sees_the_registry_before_install() {
+        let Ok(url) = std::env::var("HARVEST_TEST_DATABASE_URL") else {
+            eprintln!("SKIP: HARVEST_TEST_DATABASE_URL unset");
+            return;
+        };
+        let pool = build_pool(&url);
+        let mut conn = pool.get().await.expect("connect to test DB");
+        scrub(&mut conn).await;
+        seed_old_breaker_task(&mut conn).await;
+
+        let api_state = HarvestApiState::new();
+        let shedder = Arc::clone(api_state.gate_cache().load_shedder());
+        shedder.configure(config());
+
+        // The fallback the race used to take: no breaker list, no trip.
+        let ok = sample_once(&shedder, std::slice::from_ref(&pool), &pool, None, &[]).await;
+        assert!(ok, "the control sample must read the pool");
+        assert!(
+            shedder.check(QUEUE, std::time::Instant::now()).is_none(),
+            "an empty breaker list hides the task behind the empty bucket"
+        );
+
+        // No `api_state.install(...)` here: the sampler must not need it.
+        let runtime = runtime(registry());
+        let gate_refresh =
+            super::spawn_gate_refresh(&api_state, &HarvestDbPool::from(pool.clone()), &runtime);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut tripped = false;
+        while tokio::time::Instant::now() < deadline {
+            if shedder.check(QUEUE, std::time::Instant::now()).is_some() {
+                tripped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        gate_refresh.stop().await;
+        scrub(&mut conn).await;
+        assert!(
+            tripped,
+            "the sampler must trip on the old breaker task without an install"
+        );
     }
 }

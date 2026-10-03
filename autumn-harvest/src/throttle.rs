@@ -785,6 +785,43 @@ pub async fn reserve_or_defer(
     conn: &mut diesel_async::AsyncPgConnection,
     params: AdmitThrottleParams<'_>,
 ) -> crate::error::HarvestResult<ThrottleAdmission> {
+    admit(conn, params, false).await
+}
+
+/// [`reserve_or_defer`] for an HTTP start, which load shedding governs
+/// (issue #1794).
+///
+/// The steps are the same. A start that would write a fresh pending row is
+/// shed instead while its queue sheds. The check runs after every await of the
+/// admission and right before the write. A queue that trips during the
+/// admission therefore cannot defer a start past every shed check. A deferred
+/// row is exempt when it fires, so this is the last check it meets.
+///
+/// A bypass, an attach to a pending row and a reserved token are not shed
+/// here. A bypass and a reserved token continue to the start primitive, which
+/// sheds a fresh create itself.
+///
+/// Scheduler and backfill fires keep [`reserve_or_defer`]. They cannot act on
+/// `Retry-After`, so load shedding exempts them.
+///
+/// # Errors
+/// As [`reserve_or_defer`], plus [`crate::error::HarvestError::LoadShed`]
+/// when the queue sheds a fresh deferral.
+#[cfg(feature = "db")]
+pub async fn reserve_or_defer_or_shed(
+    conn: &mut diesel_async::AsyncPgConnection,
+    params: AdmitThrottleParams<'_>,
+) -> crate::error::HarvestResult<ThrottleAdmission> {
+    admit(conn, params, true).await
+}
+
+/// The shared body of [`reserve_or_defer`] and [`reserve_or_defer_or_shed`].
+#[cfg(feature = "db")]
+async fn admit(
+    conn: &mut diesel_async::AsyncPgConnection,
+    params: AdmitThrottleParams<'_>,
+    shed_fresh_deferral: bool,
+) -> crate::error::HarvestResult<ThrottleAdmission> {
     // Reject an empty id before any lookup, reservation, or persisted row
     // (issue #1353). A reserved token or deferred row with no id could only
     // be discarded on fire, not started.
@@ -868,6 +905,23 @@ pub async fn reserve_or_defer(
         && crate::queue::try_consume_rate_limit_token(conn, &key).await?
     {
         return Ok(ThrottleAdmission::Reserved { bucket_key: key });
+    }
+
+    // Load shedding (issue #1794): no await follows this check before the
+    // write, so the decision is the freshest the admission can take.
+    if shed_fresh_deferral
+        && let Some(decision) =
+            crate::admission_gate::global_admission_gate_cache().and_then(|cache| {
+                cache
+                    .load_shedder()
+                    .check(params.queue_name, std::time::Instant::now())
+            })
+    {
+        return Err(crate::error::HarvestError::LoadShed {
+            queue: decision.queue,
+            oldest_pending_age_secs: decision.oldest_pending_age_secs,
+            retry_after_secs: decision.retry_after_secs,
+        });
     }
 
     // Defer: durably persist the start before any WorkflowStarted event exists.
