@@ -970,6 +970,10 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
                         .into_iter()
                         .map(|t| Raw::lock(k, verb, Some(t))),
                 );
+                // CASCADE also truncates every table whose key reaches these.
+                if (k..s.end(k)).any(|j| s.is(j, "cascade")) {
+                    raws.push(Raw::lock(k, "TRUNCATE ... CASCADE", None));
+                }
             }
             Some("cluster") if start => {
                 let j = if s.is(k + 1, "verbose") { k + 2 } else { k + 1 };
@@ -1010,14 +1014,8 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
         }
     }
 
-    // A rollback may undo a `CREATE TABLE` before it, so a create followed
-    // by any rollback no longer exempts the table.
-    let rollbacks: Vec<usize> = (0..toks.len())
-        .filter(|&k| s.starts[k] == k && toks[k].depth == 0)
-        .filter(|&k| s.is(k, "rollback") || s.is(k, "abort"))
-        .collect();
-    created.retain(|_, made| !rollbacks.iter().any(|r| *r > *made));
-    let hits = resolve(raws, &s, &unconditional, &created, history);
+    let new_tables = new_table_spans(&s, &created);
+    let hits = resolve(raws, &s, &unconditional, &new_tables, history);
 
     let statement_count = (0..toks.len())
         .filter(|&k| s.starts[k] == k && toks[k].depth == 0 && !s.is_punct(k, ';'))
@@ -1030,6 +1028,43 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
     }
 }
 
+/// The token range in which each new table is exempt.
+///
+/// The range starts at the `CREATE TABLE`. It ends at the first later
+/// `DROP TABLE` or `ALTER TABLE ... RENAME TO` of that name, or at any later
+/// `ROLLBACK`, which may undo the create. After that the name can mean the
+/// hot table again.
+fn new_table_spans(
+    s: &Stmts,
+    created: &BTreeMap<String, usize>,
+) -> BTreeMap<String, (usize, usize)> {
+    let toks = s.toks;
+    let mut ends: Vec<(Option<String>, usize)> = Vec::new();
+    for k in (0..toks.len()).filter(|&k| s.starts[k] == k) {
+        if s.is(k, "rollback") || s.is(k, "abort") {
+            ends.push((None, k));
+        } else if s.is(k, "drop") && s.is(k + 1, "table") {
+            for name in s.name_list(s.skip_if_exists(k + 2)) {
+                ends.push((Some(name), k));
+            }
+        } else if s.is(k, "alter") && s.has_pair(k, "rename", "to") {
+            ends.push((s.statement_table(k), k));
+        }
+    }
+    created
+        .iter()
+        .map(|(name, &from)| {
+            let to = ends
+                .iter()
+                .filter(|(n, at)| *at > from && n.as_ref().is_none_or(|n| n == name))
+                .map(|(_, at)| *at)
+                .min()
+                .unwrap_or(usize::MAX);
+            (name.clone(), (from, to))
+        })
+        .collect()
+}
+
 /// Resolve each statement's table against the history, in source order.
 ///
 /// A `CREATE INDEX` that surely runs teaches the history its table.
@@ -1037,7 +1072,7 @@ fn resolve(
     mut raws: Vec<Raw>,
     s: &Stmts,
     unconditional: &[bool],
-    created: &BTreeMap<String, usize>,
+    new_tables: &BTreeMap<String, (usize, usize)>,
     history: &mut History,
 ) -> Vec<Hit> {
     let toks = s.toks;
@@ -1063,7 +1098,10 @@ fn resolve(
                 .insert(table.clone());
         }
         let hot = table.as_deref().is_none_or(|t| {
-            HOT_TABLES.contains(&base(t)) && created.get(t).is_none_or(|made| *made > raw.at)
+            HOT_TABLES.contains(&base(t))
+                && new_tables
+                    .get(t)
+                    .is_none_or(|(from, to)| raw.at < *from || raw.at > *to)
         });
         hits.push(Hit {
             at: raw.at,
@@ -1082,8 +1120,8 @@ fn resolve(
 
 /// Whether each token runs on every path through its `DO` body.
 ///
-/// A token inside an `IF`, `CASE` or `LOOP`, or after a `RETURN`, may not
-/// run. Nothing in a body with an `EXCEPTION` handler surely runs, because
+/// A token inside an `IF`, `CASE` or `LOOP`, or after a `RETURN`, `EXIT` or
+/// `CONTINUE`, may not run. Nothing in a body with an `EXCEPTION` handler surely runs, because
 /// the handler rolls the block back. A `CASE` expression that ends in a bare `END` leaves the rest of the
 /// body conditional, which fails closed. A top-level token always runs.
 fn unconditional(s: &Stmts) -> Vec<bool> {
@@ -1131,7 +1169,7 @@ fn unconditional(s: &Stmts) -> Vec<bool> {
             }
             Some("loop" | "case") if !after_end => *branches += 1,
             // An early exit, or a handler, makes the rest of the body conditional.
-            Some("return") => *skippable = true,
+            Some("return" | "exit" | "continue") => *skippable = true,
             Some("exception") if handler(k) => *skippable = true,
             _ => {}
         }
@@ -1283,6 +1321,10 @@ fn drop(s: &Stmts, k: usize, history: &History, raws: &mut Vec<Raw>) {
                     referenced(history, &table).map(|t| Raw::lock(k, "DROP TABLE", Some(t))),
                 );
                 raws.push(Raw::lock(k, "DROP TABLE", Some(table)));
+            }
+            // CASCADE also drops the foreign keys of every referencing table.
+            if (k..s.end(k)).any(|j| s.is(j, "cascade")) {
+                raws.push(Raw::lock(k, "DROP TABLE ... CASCADE", None));
             }
         }
         Some("trigger") => raws.push(Raw::lock(k, "DROP TRIGGER", s.name_after(k + 2, "on"))),
@@ -2513,6 +2555,58 @@ fn an_exception_handler_may_undo_its_whole_block() {
                   ALTER TABLE harvest_events ADD COLUMN x INT;";
     let findings = lint_with_history(&[], setter, true);
     assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+}
+
+#[test]
+fn cascade_reaches_unknown_tables() {
+    // CASCADE also locks every table whose foreign key reaches the target.
+    for sql in [
+        "TRUNCATE harvest_schedules CASCADE;",
+        "DROP TABLE harvest_schedules CASCADE;",
+    ] {
+        let findings = lint_with_history(&[], sql, true);
+        assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}: {findings:?}");
+    }
+}
+
+#[test]
+fn a_new_table_stops_being_new_once_it_is_dropped_or_renamed() {
+    for gone in [
+        "DROP TABLE harvest_events;",
+        "ALTER TABLE harvest_events RENAME TO staged_events;",
+    ] {
+        let sql = format!(
+            "CREATE TEMP TABLE harvest_events (id INT);\n{gone}\n\
+             ALTER TABLE harvest_events ADD COLUMN x INT;"
+        );
+        let findings = lint_with_history(&[], &sql, true);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule == Rule::LockTimeout && f.line == 3),
+            "{gone}: {findings:?}"
+        );
+    }
+}
+
+#[test]
+fn code_after_an_exit_does_not_surely_run() {
+    for exit in [
+        "EXIT blk WHEN random() > 0.5;",
+        "CONTINUE WHEN random() > 0.5;",
+    ] {
+        let sql = format!(
+            "DO $$\nBEGIN\n<<blk>>\nBEGIN\n{exit}\n\
+             PERFORM set_config('lock_timeout', '5s', true);\nEND;\nEND $$;\n\
+             ALTER TABLE harvest_events ADD COLUMN x INT;"
+        );
+        let findings = lint_with_history(&[], &sql, true);
+        assert_eq!(
+            rules(&findings),
+            [Rule::LockTimeout],
+            "{exit}: {findings:?}"
+        );
+    }
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────

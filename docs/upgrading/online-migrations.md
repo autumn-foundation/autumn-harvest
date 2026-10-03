@@ -33,8 +33,9 @@ A waiting `ACCESS EXCLUSIVE` lock on any of them stalls the fleet.
 
 A table that the same migration creates is not hot after its `CREATE TABLE`.
 No session can hold a lock on it yet. The exemption needs a create that surely
-runs: not `IF NOT EXISTS`, not inside a branch, not in a function body, and
-not followed by a `ROLLBACK`.
+runs: not `IF NOT EXISTS`, not inside a branch, and not in a function body.
+The exemption ends at a later `DROP TABLE`, `RENAME TO` or `ROLLBACK`, because
+the name can mean the hot table again.
 The lock must name the table exactly as the create does, schema included.
 
 ## 2. The rules
@@ -50,7 +51,9 @@ The lock must name the table exactly as the create does, schema included.
 These statements take a blocking lock for `lock-timeout`:
 
 - `ALTER TABLE`, in every form;
-- `LOCK TABLE`, `DROP TABLE`, `TRUNCATE`, `CLUSTER` and `VACUUM FULL`;
+- `LOCK TABLE`, `DROP TABLE`, `TRUNCATE`, `CLUSTER` and `VACUUM FULL`.
+  `CASCADE` also locks every table whose foreign key reaches the target, so
+  it counts as a lock on an unknown table;
 - `CREATE`, `ALTER` and `DROP TRIGGER`; `CREATE`, `ALTER` and `DROP POLICY`;
   `CREATE` and `DROP RULE`; `ALTER INDEX`;
 - `REFERENCES` on a hot table, in a new table or a new constraint. A foreign key
@@ -88,7 +91,7 @@ bare `SELECT` or `PERFORM` of the call. A query with a filter may never call
 the function, so it does not count. The same call in a
 function body does not count, because the body runs only when something calls
 the function. A setter inside an `IF`, `CASE` or `LOOP`, or after a `RETURN`,
-does not count either, because it may not run. Nothing in a block with an
+`EXIT` or `CONTINUE`, does not count either, because it may not run. Nothing in a block with an
 `EXCEPTION` handler counts, because the handler rolls the block back. A clear inside a
 branch does count, because the branch may run.
 
