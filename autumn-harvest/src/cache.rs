@@ -62,6 +62,8 @@ pub(crate) struct HistoryBytesMark {
 #[derive(Debug, Clone)]
 struct CacheEntry {
     state: CachedWorkflowState,
+    // Only the `db` worker reads the mark.
+    #[cfg_attr(not(feature = "db"), allow(dead_code))]
     history_bytes: Option<HistoryBytesMark>,
 }
 
@@ -129,6 +131,7 @@ impl WorkflowCache {
 
     /// Insert a cached state together with its stored-history byte mark
     /// (issue #1804).
+    #[cfg_attr(not(feature = "db"), allow(dead_code))]
     pub(crate) fn insert_with_history_bytes(
         &mut self,
         exec_id: Uuid,
@@ -149,6 +152,7 @@ impl WorkflowCache {
     /// Returns `None` when the entry is absent or carries no mark. Does not
     /// change the LRU order.
     #[must_use]
+    #[cfg_attr(not(feature = "db"), allow(dead_code))]
     pub(crate) fn history_bytes(&self, exec_id: &Uuid) -> Option<HistoryBytesMark> {
         self.inner
             .peek(exec_id)
