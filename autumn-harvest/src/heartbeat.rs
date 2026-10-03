@@ -365,13 +365,20 @@ pub async fn flush_heartbeat(
     payload: Value,
     acquire_timeout: Duration,
 ) -> HarvestResult<ClaimWrite> {
-    let pending = Pending {
+    let mut pending = Pending {
         payload,
         sent_order: std::time::Instant::now(),
     };
-    flush(pool, claim, &pending, acquire_timeout)
-        .await
-        .map_err(|failure| *failure.error)
+    flush(
+        pool,
+        claim,
+        &mut pending,
+        &Latest::default(),
+        acquire_timeout,
+        Duration::MAX,
+    )
+    .await
+    .map_err(|failure| *failure.error)
 }
 
 /// A failed flush and its `harvest.heartbeat.flush_failed` reason label.
@@ -391,13 +398,25 @@ struct Pending {
     sent_order: std::time::Instant,
 }
 
+/// Write `beat`, or a newer heartbeat from `latest`, on one connection.
+///
+/// A heartbeat can reach `latest` while the acquire waits. The flush writes
+/// that newer heartbeat instead (issue #1788). A write that blocks for
+/// `interval` or more is followed on the same connection by any newer
+/// heartbeat. A scanner that waits for the slot thus never reads the older
+/// send time. A quick write keeps the rate of one write per interval.
+///
+/// `beat` holds the last heartbeat written or tried.
 #[cfg(feature = "db")]
 async fn flush(
     pool: &Pool<AsyncPgConnection>,
     claim: &TaskClaim,
-    pending: &Pending,
+    beat: &mut Pending,
+    latest: &Latest,
     acquire_timeout: Duration,
+    interval: Duration,
 ) -> Result<ClaimWrite, FlushFailure> {
+    let mut started = tokio::time::Instant::now();
     let mut conn = crate::pool::acquire(pool, acquire_timeout)
         .await
         .map_err(|error| FlushFailure {
@@ -408,17 +427,29 @@ async fn flush(
             },
             error: Box::new(error),
         })?;
-    crate::queue::record_heartbeat_sent_ago(
-        &mut conn,
-        claim,
-        pending.payload.clone(),
-        pending.sent_order.elapsed(),
-    )
-    .await
-    .map_err(|error| FlushFailure {
-        reason: "write_error",
-        error: Box::new(error),
-    })
+    loop {
+        if let Some(newer) = latest.take() {
+            *beat = newer;
+        }
+        let write = crate::queue::record_heartbeat_sent_ago(
+            &mut conn,
+            claim,
+            beat.payload.clone(),
+            beat.sent_order.elapsed(),
+        )
+        .await
+        .map_err(|error| FlushFailure {
+            reason: "write_error",
+            error: Box::new(error),
+        })?;
+        if write != ClaimWrite::Applied
+            || !write_blocked(started.elapsed(), interval)
+            || !latest.is_full()
+        {
+            return Ok(write);
+        }
+        started = tokio::time::Instant::now();
+    }
 }
 
 /// The flush loop of [`spawn_heartbeat_flusher_with`].
@@ -465,9 +496,17 @@ async fn stamped_heartbeat_loop(
         }
 
         // If we got at least one heartbeat, flush to DB.
-        if let Some(beat) = pending.take() {
+        if let Some(mut beat) = pending.take() {
             let started = tokio::time::Instant::now();
-            let outcome = flush(&pool, &claim, &beat, options.acquire_timeout).await;
+            let outcome = flush(
+                &pool,
+                &claim,
+                &mut beat,
+                &latest,
+                options.acquire_timeout,
+                flush_interval,
+            )
+            .await;
             // A write that blocked leaves the row with an old send time,
             // whether it then succeeds or fails. A newer heartbeat then goes
             // at once, so a timeout scanner does not see a live activity as
