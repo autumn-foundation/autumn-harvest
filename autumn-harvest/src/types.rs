@@ -1296,12 +1296,10 @@ impl BuildId {
         Self(id.into())
     }
 
-    /// The legacy sentinel used by workers that pre-date build routing.
+    /// The sentinel for a worker with no build identity.
     ///
-    /// Legacy workers advertise an empty build id and are allowed to claim any
-    /// task, including those with an explicit `required_build_id`. This
-    /// preserves backward compatibility for operators who have not yet adopted
-    /// build-aware routing.
+    /// Such a worker advertises an empty build id. It claims unpinned tasks
+    /// only, never one with a `required_build_id` (issue #1805).
     #[must_use]
     pub const fn legacy() -> Self {
         Self(String::new())

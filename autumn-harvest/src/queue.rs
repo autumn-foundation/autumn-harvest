@@ -1032,8 +1032,7 @@ pub const fn claim_task_query() -> &'static str {
                ) \
                AND ( \
                    required_build_id IS NULL \
-                   OR $3 = '' \
-                   OR required_build_id = $3 \
+                                      OR required_build_id = $3 \
                    OR EXISTS ( \
                        SELECT 1 FROM harvest_build_compat \
                        WHERE build_id = $3 \
@@ -1365,8 +1364,8 @@ pub async fn claim_task_of_kind_on_shard(
     // scalar subquery fast: it only scans RUNNING rows with a non-NULL key.
     //
     // Build routing filter (issue #171): a task with required_build_id can only
-    // be claimed by a worker whose build_id matches, is declared compatible, OR
-    // the worker has an empty build_id (legacy worker — can claim anything).
+    // be claimed by a worker whose build_id matches or is declared compatible.
+    // An empty build_id matches nothing, so pinning fails closed (issue #1805).
     // When priority_aging_secs is Some(K), each task's effective priority is
     // boosted by floor(wait_seconds / K) to prevent indefinite starvation.
     // A NULL value (or 0, which the builder normalizes to None) disables aging.
@@ -7148,8 +7147,7 @@ pub fn claim_task_batched_candidates_query() -> &'static str {
                ) \
                AND ( \
                    required_build_id IS NULL \
-                   OR $3 = '' \
-                   OR required_build_id = $3 \
+                                      OR required_build_id = $3 \
                    OR EXISTS ( \
                        SELECT 1 FROM harvest_build_compat \
                        WHERE build_id = $3 \
@@ -7263,8 +7261,7 @@ fn build_and_capability_eligibility_predicate(
     format!(
         "( \
              {row_ref}required_build_id IS NULL \
-             OR $10 = '' \
-             OR {row_ref}required_build_id = $10 \
+                          OR {row_ref}required_build_id = $10 \
              OR EXISTS ( \
                  SELECT 1 FROM harvest_build_compat \
                  WHERE build_id = $10 \
@@ -8793,6 +8790,33 @@ mod tests {
             "last_refilled_at must never fall back to the frozen NOW(); \
              got:\n{sql}"
         );
+    }
+
+    /// Issue #1805: build pinning fails closed. No claim query may let an
+    /// empty-`build_id` worker bypass `required_build_id`.
+    #[test]
+    fn no_claim_query_lets_an_empty_build_worker_bypass_pinning() {
+        let queries = [
+            ("claim_task_query", claim_task_query().to_string()),
+            (
+                "claim_task_query_fenced",
+                claim_task_query_fenced().to_string(),
+            ),
+            (
+                "claim_task_batched_candidates_query",
+                claim_task_batched_candidates_query().to_string(),
+            ),
+            (
+                "claim_batched_candidate_attempt_query",
+                claim_batched_candidate_attempt_query().to_string(),
+            ),
+        ];
+        for (name, sql) in queries {
+            assert!(
+                !sql.contains("= ''"),
+                "{name} must not let an empty build_id claim pinned rows"
+            );
+        }
     }
 
     /// Regression test for a review finding on this PR. The batch scan's

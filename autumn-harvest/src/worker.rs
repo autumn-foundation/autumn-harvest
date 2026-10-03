@@ -30877,6 +30877,40 @@ impl Worker {
         }
     }
 
+    /// Warn and set a gauge for each served queue that has a build policy
+    /// while this worker has an empty `build_id` (issue #1805).
+    ///
+    /// Such a worker cannot claim pinned runs. A failed policy read is
+    /// logged and skipped, because the check is advisory.
+    async fn flag_empty_build_policy_queues(&self, conn: &mut diesel_async::AsyncPgConnection) {
+        if !self.config.build_id.is_empty() {
+            return;
+        }
+        let policies = match crate::build_routing::list_build_policies(conn).await {
+            Ok(policies) => policies,
+            Err(error) => {
+                tracing::debug!(error = %error, "build policy read for empty build_id check failed");
+                return;
+            }
+        };
+        for queue in crate::build_routing::empty_build_policy_queues(
+            &self.config.build_id,
+            &self.config.queues,
+            &policies,
+        ) {
+            tracing::warn!(
+                worker_id = %self.config.worker_id,
+                queue = %queue,
+                "worker has an empty build_id on a queue with a build policy; \
+                 it cannot claim pinned runs"
+            );
+            self.registry
+                .telemetry()
+                .metrics
+                .record_worker_empty_build_policy(&queue);
+        }
+    }
+
     /// Register or re-register this worker in the fleet table.
     ///
     /// Returns `true` when the atomic register+invalidate pair did **not**
@@ -30949,6 +30983,7 @@ impl Worker {
                             cleared_capability_miss_evidence = cleared,
                             "worker registered in fleet"
                         );
+                        self.flag_empty_build_policy_queues(&mut conn).await;
                         false
                     }
                     Err(error) => {
@@ -38919,7 +38954,7 @@ mod tests {
             "an unconstrained task keeps the whole live set"
         );
 
-        // A legacy worker (empty build_id) may claim anything (#171).
+        // An empty-build worker cannot claim a pinned task (#1805).
         let legacy = vec![crate::workers::LiveWorker::for_test(
             "legacy",
             "",
@@ -38927,7 +38962,7 @@ mod tests {
         )];
         assert_eq!(
             claim_eligible_workers(&legacy, &compat, Some("v2"), Some(&caps)),
-            ids(&["legacy"])
+            ids(&[])
         );
 
         // Unparseable capabilities must not silently exclude the whole fleet:

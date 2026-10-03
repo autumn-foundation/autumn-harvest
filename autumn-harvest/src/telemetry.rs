@@ -491,6 +491,11 @@ pub const METRIC_NOTIFY_QUEUE_USAGE: &str = "harvest.notify.queue_usage";
 /// alerts on a pause that was left on too long.
 pub const METRIC_QUEUE_PAUSED: &str = "harvest.queue.paused";
 
+/// Gauge: `1` per queue where this worker has an empty `build_id` and the
+/// queue has a build policy (issue #1805). Such a worker cannot claim pinned
+/// runs. Label: `queue`.
+pub const METRIC_WORKER_EMPTY_BUILD_POLICY: &str = "harvest.worker.empty_build_policy";
+
 /// Counter: incremented once per dead-letter entry processed by an operator
 /// redrive (issue #510). Labelled `{queue, outcome}` where `outcome` is one of
 /// `redriven` / `skipped` / `failed`.
@@ -2882,6 +2887,14 @@ pub trait MetricsRecorder: Send + Sync {
     /// Maps to the gauge `harvest_queue_paused{queue}`.
     fn record_queue_paused(&self, queue: &str, paused: bool) {
         let _ = (queue, paused);
+    }
+
+    /// A worker with an empty `build_id` serves a queue that has a build
+    /// policy (issue #1805). Emitted once at registration, value `1`.
+    ///
+    /// Maps to the gauge `harvest_worker_empty_build_policy{queue}`.
+    fn record_worker_empty_build_policy(&self, queue: &str) {
+        let _ = queue;
     }
 
     /// An operator paused or resumed dispatch for a whole activity type
