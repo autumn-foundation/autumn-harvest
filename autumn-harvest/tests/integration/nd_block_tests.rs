@@ -287,6 +287,18 @@ fn make_worker_with_activities(
     metrics: Arc<dyn MetricsRecorder + Send + Sync>,
     build_id: &str,
 ) -> Worker {
+    make_worker_with_sticky(workflows, activities, metrics, build_id, Duration::ZERO)
+}
+
+/// [`make_worker_with_activities`] with a sticky window. A non-zero window
+/// turns on the warm cache and resident workflows (issue #1798).
+fn make_worker_with_sticky(
+    workflows: Vec<WorkflowInfo>,
+    activities: Vec<ActivityInfo>,
+    metrics: Arc<dyn MetricsRecorder + Send + Sync>,
+    build_id: &str,
+    sticky_timeout: Duration,
+) -> Worker {
     let telemetry = Arc::new(TelemetryConfig::builder().metrics(metrics).build());
     let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
         workflows,
@@ -308,13 +320,14 @@ fn make_worker_with_activities(
             poll_interval: Duration::from_millis(50),
             shutdown_timeout: Duration::from_secs(2),
             cancellation_grace_period: Duration::from_secs(2),
-            sticky_timeout: Duration::ZERO,
+            sticky_timeout,
             max_local_activity_start_to_close: Duration::from_secs(60),
             shard_assignments: vec![ShardId::new(0)],
             worker_heartbeat_interval: Duration::from_secs(5),
             build_id: build_id.to_string(),
             deployment_name: None,
             workflow_cache_size: 100,
+            resident_workflows: true,
             priority_aging_secs: None,
             unknown_target_grace_window: Duration::from_secs(5),
             poison_pill_threshold: 3,
@@ -1806,4 +1819,153 @@ async fn early_signal_while_parked_does_not_block() {
     let _ = handle.await;
     assert_eq!(metrics.nd_block_count(), 0);
     assert_eq!(metrics.nd_detection_count(), 0);
+}
+
+// ── Resident workflows (issue #1798) ───────────────────────────────────────
+
+/// Body starts of `resident_v1_handler`. Only one test runs it.
+static RESIDENT_V1_STARTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// v1: waits for `go`, records a side effect, then waits for `next`.
+fn resident_v1_handler(
+    ctx: &WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + '_>> {
+    RESIDENT_V1_STARTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Box::pin(async move {
+        ctx.wait_for_signal("go").await.map_err(|e| e.to_string())?;
+        let _ = ctx.new_uuid();
+        ctx.wait_for_signal("next")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!("v1-completed"))
+    })
+}
+
+/// v2: schedules an activity where v1 recorded the side effect.
+fn resident_v2_handler(
+    ctx: &WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + '_>> {
+    Box::pin(async move {
+        ctx.wait_for_signal("go").await.map_err(|e| e.to_string())?;
+        ctx.execute_activity_raw("drift", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!("v2-completed"))
+    })
+}
+
+fn resident_worker(
+    handler: autumn_harvest::info::WorkflowHandlerFn,
+    metrics: Arc<RecordingMetrics>,
+    build_id: &str,
+) -> Worker {
+    make_worker_with_sticky(
+        vec![wf_info("resident_nd_wf", handler)],
+        vec![],
+        metrics,
+        build_id,
+        Duration::from_secs(5),
+    )
+}
+
+async fn send(conn: &mut AsyncPgConnection, exec_id: ExecutionId, name: &str) {
+    autumn_harvest::signal::send_signal(conn, exec_id, name, Value::Null)
+        .await
+        .expect("send signal");
+}
+
+/// Waits until the history holds a `SideEffectRecorded` event.
+async fn wait_for_side_effect(conn: &mut AsyncPgConnection, exec_id: ExecutionId) {
+    for _ in 0..400 {
+        let history = get_history(conn, exec_id).await;
+        if history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::SideEffectRecorded { .. }))
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("v1 did not record its side effect");
+}
+
+/// AC (issue #1798): with sticky routing and resident workflows on, a warm
+/// decision resumes the parked v1 future. A divergent v2 build still
+/// replays cold and ND-blocks, and a rollback to v1 completes the run.
+#[tokio::test]
+async fn resident_workflow_does_not_hide_drift_from_a_new_build() {
+    let (url, _c) = setup_env_or_container().await;
+    let mut conn = connect(&url).await;
+    let metrics = Arc::new(RecordingMetrics::default());
+    RESIDENT_V1_STARTS.store(0, std::sync::atomic::Ordering::SeqCst);
+
+    let exec_id = start_workflow(&mut conn, "resident_nd_wf", "nd-resident-001").await;
+
+    // v1 runs decision 1 cold and parks on `go`.
+    let (worker1, handle1) = spawn_worker(
+        resident_worker(resident_v1_handler, metrics.clone(), "v1"),
+        build_pool(&url),
+    );
+    for _ in 0..400 {
+        let (_, _, sticky, _) = get_workflow_task(&mut conn, exec_id).await;
+        if std::sync::atomic::AtomicU64::load(
+            &RESIDENT_V1_STARTS,
+            std::sync::atomic::Ordering::SeqCst,
+        ) == 1
+            && sticky.is_some()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Decision 2 is warm: it resumes the parked future.
+    send(&mut conn, exec_id, "go").await;
+    wait_for_side_effect(&mut conn, exec_id).await;
+    assert_eq!(
+        std::sync::atomic::AtomicU64::load(
+            &RESIDENT_V1_STARTS,
+            std::sync::atomic::Ordering::SeqCst
+        ),
+        1,
+        "the warm decision must resume the resident future"
+    );
+    worker1.shutdown();
+    let _ = handle1.await;
+
+    // v2 replays the v1 history cold and diverges at the side effect.
+    let (worker2, handle2) = spawn_worker(
+        resident_worker(resident_v2_handler, metrics.clone(), "v2"),
+        build_pool(&url),
+    );
+    send(&mut conn, exec_id, "next").await;
+    let (blocked, reason, _count, _attrs) = wait_for_nd_block(&mut conn, exec_id, 1).await;
+    worker2.shutdown();
+    let _ = handle2.await;
+    assert!(blocked, "the drifted build must ND-block the run");
+    assert!(
+        reason
+            .as_deref()
+            .is_some_and(|r| r.contains("non-deterministic replay")),
+        "the block must carry the divergence: {reason:?}"
+    );
+    assert_eq!(get_state(&mut conn, exec_id).await, "RUNNING");
+
+    // Rollback: v1 replays cold and completes.
+    make_task_claimable_now(&mut conn, exec_id).await;
+    let (worker3, handle3) = spawn_worker(
+        resident_worker(resident_v1_handler, metrics.clone(), "v1"),
+        build_pool(&url),
+    );
+    wait_for_state(&mut conn, exec_id, &["COMPLETED"]).await;
+    worker3.shutdown();
+    let _ = handle3.await;
+    let history = get_history(&mut conn, exec_id).await;
+    assert!(
+        !history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::WorkflowFailed { .. })),
+        "a blocked run must never fail"
+    );
 }

@@ -2191,6 +2191,7 @@ mod one_worker_process {
                     build_id: "host-1".to_string(),
                     deployment_name: None,
                     workflow_cache_size: 1000,
+                    resident_workflows: true,
                     priority_aging_secs: None,
                     unknown_target_grace_window: Duration::from_secs(5),
                     poison_pill_threshold: 3,

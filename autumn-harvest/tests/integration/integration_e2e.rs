@@ -1071,6 +1071,7 @@ pub(crate) fn runtime_config(
         build_id: String::new(),
         deployment_name: None,
         workflow_cache_size: 1000,
+        resident_workflows: true,
         priority_aging_secs: None,
         unknown_target_grace_window: Duration::from_secs(5),
         poison_pill_threshold: 3,
@@ -2116,6 +2117,7 @@ async fn worker_threads_execution_timeout_into_ctx_deadline() {
                 build_id: String::new(),
                 deployment_name: None,
                 workflow_cache_size: 1000,
+                resident_workflows: true,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
@@ -2350,6 +2352,7 @@ async fn worker_surfaces_nominal_deadline_not_shifted_deadline_at() {
                 build_id: String::new(),
                 deployment_name: None,
                 workflow_cache_size: 1000,
+                resident_workflows: true,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
@@ -2518,6 +2521,7 @@ async fn worker_completes_workflow_task_and_persists_result() {
                 build_id: String::new(),
                 deployment_name: None,
                 workflow_cache_size: 1000,
+                resident_workflows: true,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
@@ -2658,6 +2662,7 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
                 build_id: String::new(),
                 deployment_name: None,
                 workflow_cache_size: 1000,
+                resident_workflows: true,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
@@ -2832,6 +2837,7 @@ async fn worker_completes_workflow_with_activity_round_trip() {
                 build_id: String::new(),
                 deployment_name: None,
                 workflow_cache_size: 1000,
+                resident_workflows: true,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
@@ -3071,6 +3077,7 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
                 build_id: String::new(),
                 deployment_name: None,
                 workflow_cache_size: 1000,
+                resident_workflows: true,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
@@ -3335,6 +3342,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                 build_id: String::new(),
                 deployment_name: None,
                 workflow_cache_size: 1000,
+                resident_workflows: true,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
@@ -3524,6 +3532,7 @@ async fn worker_completes_workflow_with_timer_round_trip() {
                 build_id: String::new(),
                 deployment_name: None,
                 workflow_cache_size: 1000,
+                resident_workflows: true,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
@@ -8058,6 +8067,7 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
                 build_id: String::new(),
                 deployment_name: None,
                 workflow_cache_size: 1000,
+                resident_workflows: true,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
@@ -8121,6 +8131,7 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
 /// (b) `max_active_runs = 1` with a slow handler: the second cron firing must
 /// be skipped — the in-flight run count must never exceed 1.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)] // #1798: the `resident_workflows` field tips this literal-heavy test to 101 lines
 async fn workflow_schedule_max_active_runs_enforced() {
     let (database_url, _container) = setup_test_database_url().await;
 
@@ -8193,6 +8204,7 @@ async fn workflow_schedule_max_active_runs_enforced() {
                 build_id: String::new(),
                 deployment_name: None,
                 workflow_cache_size: 1000,
+                resident_workflows: true,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
@@ -8317,6 +8329,7 @@ async fn workflow_schedule_pause_and_resume() {
                 build_id: String::new(),
                 deployment_name: None,
                 workflow_cache_size: 1000,
+                resident_workflows: true,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
