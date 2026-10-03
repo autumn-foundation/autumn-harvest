@@ -30,16 +30,18 @@ full precedence, highest first:
 1. **call-site override** — `ctx.execute_activity_with_opts(..)` / the DAG opts path
 2. **activity's own default** — `#[activity(retry = …, start_to_close = …)]`
 3. **builder default** — the two `with_default_activity_*` methods above
-4. **implicit fallback** — today's behaviour when nothing is set anywhere
+4. **implicit fallback** — no retry floor, and no timeout after
+   `without_default_activity_start_to_close()`
 
 The retry floor is **opt-in**. The `start_to_close` floor is not: it
 defaults to `DEFAULT_ACTIVITY_START_TO_CLOSE` (10 minutes, issue #1808). A hung
-activity thus cannot hold a worker slot forever. Give a long activity its own
-`start_to_close`, or raise the floor. Call
+activity thus cannot hold a worker slot forever. The floor skips an activity
+that declares a `schedule_to_close` or a `heartbeat_timeout`, because each
+already bounds a running attempt. A timeout fails the activity call with no
+retry. Give a long activity its own `start_to_close`, or raise the floor. Call
 `without_default_activity_start_to_close()` to remove it. At build time,
 `HarvestBuilder::try_build` logs one warning that names each regular activity
-type with no `start_to_close`, no `schedule_to_close` and no
-`heartbeat_timeout`.
+type that the floor governs.
 
 With the retry floor unset, the implicit fallback is *not* "a single attempt" —
 a regular activity with no retry configured anywhere is still enqueued with the

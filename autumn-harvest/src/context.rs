@@ -3848,8 +3848,8 @@ impl WorkflowContext {
     /// Install the builder-level default activity retry/timeout floor (issue #620).
     ///
     /// Consumed by the LOCAL activity path (`execute_local_activity_with_opts`)
-    /// as the lowest-priority fallback. Both `None` (the default) preserves
-    /// today's behaviour. The regular/DAG activity path resolves the same floor
+    /// as the lowest-priority fallback. `None` sets no floor. The regular/DAG
+    /// activity path resolves the same floor
     /// worker-side in `persist_scheduled_activities`.
     #[must_use]
     pub fn with_activity_defaults(

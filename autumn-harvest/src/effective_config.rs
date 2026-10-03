@@ -159,7 +159,7 @@ pub struct WorkerConfigView {
     /// `null` when no builder-default retry floor is configured.
     pub default_activity_retry_max_attempts: Option<u32>,
     /// Builder-level default activity `start_to_close`, milliseconds (issue #620).
-    /// Defaults to 600000 (issue #1808). `null` when the default is removed.
+    /// Defaults to 600000 (issue #1808). `null` after `without_default_activity_start_to_close()`.
     pub default_activity_start_to_close_ms: Option<u64>,
     /// Ceiling on an author-supplied `Retry-After` delay hint, milliseconds
     /// (issue #744). Always present (not opt-in); default 15 minutes.

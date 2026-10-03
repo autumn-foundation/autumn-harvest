@@ -2495,8 +2495,8 @@ impl HarvestBuilder {
             }
         }
 
-        // Issue #1808: warn about each activity type that no timeout bounds.
-        // The runtime wall-clock ceiling bounds a WASM guest, so skip it.
+        // Issue #1808: warn about each activity type that has no timeout.
+        // A WASM guest has a runtime wall-clock ceiling. Skip WASM activity types.
         let unbounded = activities_without_timeout(&self.activities);
         #[cfg(feature = "wasm-activities")]
         let unbounded: Vec<&str> = unbounded
@@ -2825,19 +2825,20 @@ fn warn_if_heartbeat_outruns_fleet_liveness(interval: Duration) -> bool {
     true
 }
 
-/// Name each regular activity type with no timeout and no heartbeat (issue #1808).
+/// Name each regular activity type that declares no attempt bound (issue #1808).
 ///
-/// A `start_to_close`, a `schedule_to_close` or a `heartbeat_timeout` bounds a
-/// running attempt. The local cap always bounds a local activity.
+/// These are the types that the default `start_to_close` governs. See
+/// [`ActivityInfo::declares_attempt_bound`]. The local cap always bounds a
+/// local activity. The registry keeps the last registration of a name, so
+/// this function does too.
 fn activities_without_timeout(activities: &[ActivityInfo]) -> Vec<&'static str> {
-    activities
-        .iter()
-        .filter(|a| {
-            !a.is_local
-                && a.default_start_to_close.is_none()
-                && a.default_schedule_to_close.is_none()
-                && a.default_heartbeat_timeout.is_none()
-        })
+    let mut last: Vec<&ActivityInfo> = Vec::new();
+    for activity in activities {
+        last.retain(|seen| seen.name != activity.name);
+        last.push(activity);
+    }
+    last.into_iter()
+        .filter(|a| !a.is_local && !a.declares_attempt_bound())
         .map(|a| a.name)
         .collect()
 }
@@ -2852,20 +2853,22 @@ fn warn_on_activities_without_timeout(names: &[&str], default_start_to_close: Op
         return;
     }
     let activity_types = names.join(", ");
-    match default_start_to_close {
-        Some(default) => tracing::warn!(
+    if let Some(default) = default_start_to_close {
+        tracing::warn!(
             activity_types = %activity_types,
             default_activity_start_to_close = ?default,
             "harvest: these activity types declare no start_to_close, schedule_to_close or \
-             heartbeat_timeout (issue #1808). The default activity start_to_close stops each \
-             attempt. Declare a timeout on each type."
-        ),
-        None => tracing::warn!(
+             heartbeat_timeout (issue #1808). The default activity start_to_close fails each \
+             attempt that runs longer. Set #[activity(start_to_close = \"...\")] on each type."
+        );
+    } else {
+        tracing::warn!(
             activity_types = %activity_types,
             "harvest: these activity types declare no start_to_close, schedule_to_close or \
              heartbeat_timeout (issue #1808). The default activity start_to_close is off, so an \
-             attempt can run forever and hold a worker slot. Declare a timeout on each type."
-        ),
+             attempt can run forever and hold a worker slot. Set \
+             #[activity(start_to_close = \"...\")] on each type."
+        );
     }
 }
 
@@ -3574,9 +3577,10 @@ pub struct WorkerConfig {
     ///
     /// Same precedence as [`WorkerConfig::default_activity_retry_policy`]:
     /// call-site override → activity default → this builder default → no
-    /// timeout. Defaults to [`DEFAULT_ACTIVITY_START_TO_CLOSE`] (issue #1808),
-    /// so a hung activity cannot hold a worker slot forever. `None` removes
-    /// the bound. For *local* activities the
+    /// timeout. The default is [`DEFAULT_ACTIVITY_START_TO_CLOSE`] (issue #1808).
+    /// A hung activity then cannot hold a worker slot forever. The default
+    /// skips an activity that declares a `schedule_to_close` or a heartbeat
+    /// timeout. `None` removes the default. For *local* activities the
     /// resolved value is still clamped by
     /// [`WorkerConfig::max_local_activity_start_to_close`]. Set via
     /// [`WorkerConfig::with_default_activity_start_to_close`].
@@ -6357,7 +6361,7 @@ mod tests {
         assert_eq!(config.default_activity_start_to_close, None);
     }
 
-    /// One regular activity type per bound, plus two with no bound.
+    /// One regular activity type per bound, two with no bound, and one local type.
     fn timeout_matrix() -> Vec<ActivityInfo> {
         let mut stc = make_activity("has_stc", None, None);
         stc.default_start_to_close = Some(Duration::from_secs(30));
@@ -6377,11 +6381,26 @@ mod tests {
 
     #[test]
     fn activities_without_timeout_names_only_unbounded_regular_types() {
-        // A local activity is always bounded by the local cap.
+        // The local cap always bounds a local activity.
         assert_eq!(
             activities_without_timeout(&timeout_matrix()),
             vec!["bare_one", "bare_two"],
         );
+    }
+
+    #[test]
+    fn activities_without_timeout_uses_the_last_registration_of_a_name() {
+        let mut bounded = make_activity("twice", None, None);
+        bounded.default_start_to_close = Some(Duration::from_secs(30));
+        // The registry keeps the last registration, so the name is bounded.
+        let first_bare = vec![make_activity("twice", None, None), bounded];
+        assert_eq!(activities_without_timeout(&first_bare), Vec::<&str>::new());
+        // A name registered twice with no bound is listed once.
+        let both_bare = vec![
+            make_activity("twice", None, None),
+            make_activity("twice", None, None),
+        ];
+        assert_eq!(activities_without_timeout(&both_bare), vec!["twice"]);
     }
 
     /// A writer that keeps every formatted log line in memory.
@@ -6440,7 +6459,10 @@ mod tests {
             assert!(!line.contains(bounded), "{bounded} is bounded: {line}");
         }
         // The line names the default that bounds these types.
-        assert!(line.contains("default_activity_start_to_close=600s"), "{line}");
+        assert!(
+            line.contains("default_activity_start_to_close=600s"),
+            "{line}"
+        );
     }
 
     #[test]

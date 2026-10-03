@@ -10,12 +10,16 @@
 //! not wait 10 minutes. It moves `started_at` back in time and runs the
 //! timeout scanner, so it checks both sides of the boundary.
 //!
+//! The default applies only to an activity that declares no attempt bound.
+//! A `start_to_close`, a `schedule_to_close` or a heartbeat timeout is such a
+//! bound.
+//!
 //! Set `HARVEST_TEST_DATABASE_URL` to use a migrated Postgres. Otherwise the
 //! suite starts a testcontainers Postgres 16.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use autumn_harvest::builder::{DEFAULT_ACTIVITY_START_TO_CLOSE, HarvestBuilder, WorkerConfig};
@@ -29,7 +33,7 @@ use autumn_harvest::telemetry::NoOpMetrics;
 use autumn_harvest::timeout::{self, TimeoutReason, find_timed_out_tasks};
 use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
-use autumn_harvest::{RetryPolicy, WorkflowContext, store};
+use autumn_harvest::{WorkflowContext, store};
 
 use chrono::Utc;
 use diesel::prelude::*;
@@ -82,19 +86,51 @@ async fn connect(url: &str) -> AsyncPgConnection {
 type BoxFut<'a> =
     Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>>;
 
+/// Lifecycle events of `hang` futures, as `(activity name, event)` pairs.
+static EVENTS: Mutex<Option<HashSet<(String, &'static str)>>> = Mutex::new(None);
+
+fn record(name: &str, event: &'static str) {
+    let mut events = EVENTS.lock().unwrap();
+    events
+        .get_or_insert_with(HashSet::new)
+        .insert((name.to_string(), event));
+}
+
+fn seen(name: &str, event: &'static str) -> bool {
+    EVENTS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|e| e.contains(&(name.to_string(), event)))
+}
+
+/// Records `"dropped"` when the worker drops the `hang` future.
+struct DropFlag(String);
+
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        record(&self.0, "dropped");
+    }
+}
+
 /// An activity that never returns and never heartbeats.
-fn hang(_ctx: &autumn_harvest::ActivityContext, _input: serde_json::Value) -> BoxFut<'_> {
+fn hang(ctx: &autumn_harvest::ActivityContext, _input: serde_json::Value) -> BoxFut<'_> {
+    let flag = DropFlag(ctx.info().activity_type);
     Box::pin(async move {
+        record(&flag.0, "started");
         std::future::pending::<()>().await;
+        drop(flag);
         Ok(serde_json::Value::Null)
     })
 }
 
-/// A workflow that calls `hang` on its own queue with no call-site timeout.
+/// A workflow that calls the activity named in `input["activity"]` on its own
+/// queue, with no call-site timeout.
 fn wf_calls_hang(ctx: &WorkflowContext, input: serde_json::Value) -> BoxFut<'_> {
     Box::pin(async move {
         let queue = ctx.queue_name().to_string();
-        ctx.execute_activity_raw("hang", input, &queue)
+        let name = input["activity"].as_str().unwrap_or("hang").to_string();
+        ctx.execute_activity_raw(&name, input, &queue)
             .await
             .map_err(|e| e.to_string())
     })
@@ -128,17 +164,21 @@ fn wf_info() -> WorkflowInfo {
     }
 }
 
-/// `hang` declares no timeout and no heartbeat. One attempt makes the first
-/// timeout terminal, so the workflow fails and the test can end.
-fn hang_info() -> ActivityInfo {
+/// A `hang` activity type with the given bounds. Each `None` declares nothing.
+fn hang_info(
+    name: &'static str,
+    start_to_close: Option<Duration>,
+    schedule_to_close: Option<Duration>,
+    heartbeat_timeout: Option<Duration>,
+) -> ActivityInfo {
     ActivityInfo {
-        name: "hang",
+        name,
         module: "activity_default_timeout_tests",
-        default_retry_policy: Some(RetryPolicy::fixed(1, Duration::from_millis(10))),
-        default_start_to_close: None,
-        default_heartbeat_timeout: None,
+        default_retry_policy: None,
+        default_start_to_close: start_to_close,
+        default_heartbeat_timeout: heartbeat_timeout,
         default_schedule_to_start: None,
-        default_schedule_to_close: None,
+        default_schedule_to_close: schedule_to_close,
         default_queue: None,
         max_concurrent: None,
         concurrency_key: None,
@@ -160,10 +200,10 @@ fn hang_info() -> ActivityInfo {
 // ---------------------------------------------------------------------------
 
 /// Build the registry through `HarvestBuilder`, as production does.
-fn registry_from_builder(config: WorkerConfig) -> Arc<HandlerRegistry> {
+fn registry_from_builder(config: WorkerConfig, activity: ActivityInfo) -> Arc<HandlerRegistry> {
     let (registry, _dags, _schedules, _config) = HarvestBuilder::new()
         .workflows(vec![wf_info()])
-        .activities(vec![hang_info()])
+        .activities(vec![activity])
         .worker(config)
         .build()
         .into_worker_parts();
@@ -216,9 +256,9 @@ fn build_worker(worker_id: &str, queue: &str, registry: Arc<HandlerRegistry>) ->
 // Seed and read helpers.
 // ---------------------------------------------------------------------------
 
-async fn seed_workflow(conn: &mut AsyncPgConnection, queue: &str) -> ExecutionId {
+async fn seed_workflow(conn: &mut AsyncPgConnection, queue: &str, activity: &str) -> ExecutionId {
     let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
-    let input = serde_json::json!({"issue": 1808});
+    let input = serde_json::json!({"activity": activity});
     let row = NewWorkflowExecution {
         quota_key: None,
         id: exec_id.as_uuid(),
@@ -296,58 +336,74 @@ async fn load_execution(url: &str, exec_id: ExecutionId) -> WorkflowExecution {
         .expect("reload workflow execution")
 }
 
-/// Wait until a worker runs the `hang` task, then return its row.
-async fn wait_for_running_hang(url: &str, exec_id: ExecutionId) -> TaskQueueItem {
+/// Wait until a worker runs the `activity` handler, then return its task row.
+///
+/// The row is `RUNNING` from the claim on. The handler starts a little later.
+/// A timeout in that gap stops the task before the handler runs.
+async fn wait_for_running(url: &str, exec_id: ExecutionId, activity: &str) -> TaskQueueItem {
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let mut conn = connect(url).await;
             let rows: Vec<TaskQueueItem> = harvest_task_queue::table
                 .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid())))
-                .filter(harvest_task_queue::activity_name.eq(Some("hang".to_string())))
+                .filter(harvest_task_queue::activity_name.eq(Some(activity.to_string())))
                 .filter(harvest_task_queue::state.eq("RUNNING"))
                 .select(TaskQueueItem::as_select())
                 .load(&mut conn)
                 .await
                 .expect("reload task rows");
-            if let Some(row) = rows.into_iter().next() {
+            if let Some(row) = rows.into_iter().next()
+                && seen(activity, "started")
+            {
                 break row;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
     .await
-    .expect("the worker must claim the hang task within 30s")
+    .expect("the worker must claim the activity task within 30s")
 }
 
-/// Move `started_at` back so the attempt looks `secs` old.
-async fn backdate_start(conn: &mut AsyncPgConnection, task_id: Uuid, secs: i64) {
-    diesel::sql_query(
-        "UPDATE harvest_task_queue \
-         SET started_at = NOW() - ($2 * INTERVAL '1 second') \
-         WHERE id = $1",
-    )
-    .bind::<diesel::sql_types::Uuid, _>(task_id)
-    .bind::<diesel::sql_types::BigInt, _>(secs)
-    .execute(conn)
+/// Move `started_at` back so the attempt looks `secs` old. Return the scanner
+/// verdict for the task, or `None` if the task is in bounds.
+///
+/// The update and the scan run in one transaction. The worker runs its own
+/// timeout scanner, so it cannot act on the row before this scan reads it.
+async fn backdate_and_scan(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    secs: i64,
+) -> Option<TimeoutReason> {
+    conn.transaction::<_, autumn_harvest::error::HarvestError, _>(async |conn| {
+        diesel::sql_query(
+            "UPDATE harvest_task_queue \
+             SET started_at = NOW() - ($2 * INTERVAL '1 second') \
+             WHERE id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .bind::<diesel::sql_types::BigInt, _>(secs)
+        .execute(conn)
+        .await?;
+        Ok(find_timed_out_tasks(conn)
+            .await?
+            .into_iter()
+            .find(|(t, _)| t.id == task_id)
+            .map(|(_, reason)| reason))
+    })
     .await
-    .expect("backdate started_at");
+    .expect("backdate and scan")
 }
 
-/// The scanner verdict for one task, or `None` if the task is in bounds.
-async fn scanner_reason(conn: &mut AsyncPgConnection, task_id: Uuid) -> Option<TimeoutReason> {
-    find_timed_out_tasks(conn)
-        .await
-        .expect("timeout scan")
-        .into_iter()
-        .find(|(t, _)| t.id == task_id)
-        .map(|(_, reason)| reason)
+/// A queue name no earlier run used. A shared database can keep old rows.
+fn unique_queue(label: &str) -> String {
+    format!("q1808-{label}-{}", Uuid::new_v4().simple())
 }
 
 fn default_secs() -> i64 {
     i64::try_from(DEFAULT_ACTIVITY_START_TO_CLOSE.as_secs()).expect("fits in i64")
 }
 
-/// Stop the worker. The `hang` future never yields, so do not wait forever.
+/// Stop the worker. The `hang` future never completes, so do not wait forever.
 async fn stop(worker: &Worker, handle: tokio::task::JoinHandle<()>) {
     worker.shutdown();
     let _ = tokio::time::timeout(Duration::from_secs(10), handle).await;
@@ -361,12 +417,13 @@ async fn stop(worker: &Worker, handle: tokio::task::JoinHandle<()>) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hung_activity_without_a_timeout_times_out_at_the_default() {
     let (url, _container) = setup_db().await;
-    let queue = "q1808-default";
+    let queue = &unique_queue("default");
     let mut conn = connect(&url).await;
-    let exec_id = seed_workflow(&mut conn, queue).await;
+    let exec_id = seed_workflow(&mut conn, queue, "hang").await;
 
-    let registry = registry_from_builder(WorkerConfig::default());
-    let worker = build_worker("w1808-default", queue, registry);
+    let registry =
+        registry_from_builder(WorkerConfig::default(), hang_info("hang", None, None, None));
+    let worker = build_worker(queue, queue, registry);
     let pool = build_pool(&url);
     let runner = Arc::clone(&worker);
     let run_pool = pool.clone();
@@ -374,16 +431,17 @@ async fn hung_activity_without_a_timeout_times_out_at_the_default() {
         runner.run(&run_pool).await;
     });
 
-    let task = wait_for_running_hang(&url, exec_id).await;
+    let task = wait_for_running(&url, exec_id, "hang").await;
 
     // Ten seconds inside the window: the scanner leaves the task alone.
-    backdate_start(&mut conn, task.id, default_secs() - 10).await;
-    assert_eq!(scanner_reason(&mut conn, task.id).await, None);
+    assert_eq!(
+        backdate_and_scan(&mut conn, task.id, default_secs() - 10).await,
+        None
+    );
 
     // One second past the window: the scanner reclaims it.
-    backdate_start(&mut conn, task.id, default_secs() + 1).await;
     assert_eq!(
-        scanner_reason(&mut conn, task.id).await,
+        backdate_and_scan(&mut conn, task.id, default_secs() + 1).await,
         Some(TimeoutReason::StartToClose),
         "a hung activity must time out at the default, not run forever"
     );
@@ -407,12 +465,23 @@ async fn hung_activity_without_a_timeout_times_out_at_the_default() {
     .await
     .expect("timeout sweep");
 
-    // One attempt only, so the timeout fails the workflow.
+    // The timeout fails the activity call. It does not retry.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while load_execution(&url, exec_id).await.state != "FAILED" {
         assert!(
             tokio::time::Instant::now() < deadline,
             "the workflow must fail after the timeout"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // The worker drops the hung future, so the slot is free again. Check
+    // this before shutdown, because shutdown also drops it.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !seen("hang", "dropped") {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the worker must drop the hung activity future after the timeout"
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
@@ -422,29 +491,35 @@ async fn hung_activity_without_a_timeout_times_out_at_the_default() {
         .await
         .expect("load history")
         .events;
-    assert!(
-        history.iter().any(|e| matches!(
-            e,
-            WorkflowEvent::ActivityTimedOut {
-                timeout_type: TimeoutType::StartToClose,
-                ..
-            }
-        )),
-        "history must record a start_to_close timeout; history={history:?}"
+    let timeouts = history
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                WorkflowEvent::ActivityTimedOut {
+                    timeout_type: TimeoutType::StartToClose,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(
+        timeouts, 1,
+        "history must record one start_to_close timeout; history={history:?}"
     );
 }
 
-/// The opt-out restores the old behaviour: no timeout on the task row.
+/// The opt-out restores the old behavior: no timeout on the task row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn opted_out_default_leaves_a_hung_activity_unbounded() {
     let (url, _container) = setup_db().await;
-    let queue = "q1808-opt-out";
+    let queue = &unique_queue("opt-out");
     let mut conn = connect(&url).await;
-    let exec_id = seed_workflow(&mut conn, queue).await;
+    let exec_id = seed_workflow(&mut conn, queue, "hang_opt_out").await;
 
     let config = WorkerConfig::default().without_default_activity_start_to_close();
-    let registry = registry_from_builder(config);
-    let worker = build_worker("w1808-opt-out", queue, registry);
+    let registry = registry_from_builder(config, hang_info("hang_opt_out", None, None, None));
+    let worker = build_worker(queue, queue, registry);
     let pool = build_pool(&url);
     let runner = Arc::clone(&worker);
     let run_pool = pool.clone();
@@ -452,12 +527,64 @@ async fn opted_out_default_leaves_a_hung_activity_unbounded() {
         runner.run(&run_pool).await;
     });
 
-    let task = wait_for_running_hang(&url, exec_id).await;
+    let task = wait_for_running(&url, exec_id, "hang_opt_out").await;
     assert_eq!(task.start_to_close, None);
 
     // A day old and still in bounds: nothing bounds this attempt.
-    backdate_start(&mut conn, task.id, 24 * 3600).await;
-    assert_eq!(scanner_reason(&mut conn, task.id).await, None);
+    assert_eq!(backdate_and_scan(&mut conn, task.id, 24 * 3600).await, None);
 
     stop(&worker, handle).await;
+}
+
+/// Run `activity` through a default worker and return its task row.
+async fn running_row_under_default(activity: ActivityInfo) -> TaskQueueItem {
+    let (url, _container) = setup_db().await;
+    let name = activity.name;
+    let queue = unique_queue(name);
+    let mut conn = connect(&url).await;
+    let exec_id = seed_workflow(&mut conn, &queue, name).await;
+
+    let registry = registry_from_builder(WorkerConfig::default(), activity);
+    let worker = build_worker(&queue, &queue, registry);
+    let pool = build_pool(&url);
+    let runner = Arc::clone(&worker);
+    let run_pool = pool.clone();
+    let handle = tokio::spawn(async move {
+        runner.run(&run_pool).await;
+    });
+    let task = wait_for_running(&url, exec_id, name).await;
+    stop(&worker, handle).await;
+    task
+}
+
+/// An activity `start_to_close` wins over the default on the builder path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn declared_start_to_close_wins_over_the_default() {
+    let stc = Duration::from_secs(30);
+    let task = running_row_under_default(hang_info("hang_stc", Some(stc), None, None)).await;
+    assert_eq!(
+        task.start_to_close,
+        Some(chrono::Duration::from_std(stc).unwrap())
+    );
+}
+
+/// A heartbeat timeout is an attempt bound, so the default does not apply.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn heartbeat_timeout_activity_skips_the_default() {
+    let hb = Duration::from_secs(3600);
+    let task = running_row_under_default(hang_info("hang_hb", None, None, Some(hb))).await;
+    assert_eq!(task.start_to_close, None);
+    assert_eq!(
+        task.heartbeat_timeout,
+        Some(chrono::Duration::from_std(hb).unwrap())
+    );
+}
+
+/// A `schedule_to_close` is an attempt bound, so the default does not apply.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn schedule_to_close_activity_skips_the_default() {
+    let s2c = Duration::from_secs(2 * 3600);
+    let task = running_row_under_default(hang_info("hang_s2c", None, Some(s2c), None)).await;
+    assert_eq!(task.start_to_close, None);
+    assert!(task.schedule_to_close_at.is_some());
 }
