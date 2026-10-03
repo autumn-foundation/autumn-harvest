@@ -19160,7 +19160,7 @@ pub(crate) async fn start_workflow(
             started_by: None,
         };
 
-        match autumn_harvest::throttle::reserve_or_defer(
+        match autumn_harvest::throttle::reserve_or_defer_or_shed(
             &mut conn,
             autumn_harvest::throttle::AdmitThrottleParams {
                 workflow_name: &workflow_name,
@@ -19234,6 +19234,32 @@ pub(crate) async fn start_workflow(
                 // Active execution already resolves this reuse policy as a
                 // no-op/immediate reject; no token reserved, fall through to
                 // the normal start below.
+            }
+            // The deferral point shed the start (issue #1794): answer 429 with
+            // `Retry-After`, like every other shed start.
+            Err(e @ HarvestError::LoadShed { .. }) => {
+                if let HarvestError::LoadShed { queue, .. } = &e {
+                    runtime
+                        .registry
+                        .telemetry()
+                        .metrics
+                        .record_load_shed_rejected(queue);
+                }
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(workflow_name.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("load shed"),
+                    shard_id: Some(shard.as_i32()),
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+                return start_error_response(e);
             }
             Err(e) => return map_error(e).into_response(),
         }
@@ -20649,7 +20675,7 @@ async fn batch_start_workflows(
                     start_source_ref: None,
                     started_by: Some(actor.clone()),
                 };
-                match autumn_harvest::throttle::reserve_or_defer(
+                match autumn_harvest::throttle::reserve_or_defer_or_shed(
                     &mut conn,
                     autumn_harvest::throttle::AdmitThrottleParams {
                         workflow_name: &item.workflow_name,
@@ -20690,6 +20716,15 @@ async fn batch_start_workflows(
                         // the normal start below.
                     }
                     Err(e) => {
+                        // A deferral-point shed (issue #1794) counts like any
+                        // other shed item.
+                        if let HarvestError::LoadShed { queue, .. } = &e {
+                            runtime
+                                .registry
+                                .telemetry()
+                                .metrics
+                                .record_load_shed_rejected(queue);
+                        }
                         rejected_count += 1;
                         results.push(BatchStartItemResult {
                             index: *idx,

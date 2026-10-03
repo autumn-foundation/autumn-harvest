@@ -771,6 +771,104 @@ async fn hung_audit_write_keeps_the_committed_state() {
     assert_eq!(metrics.active(), [true, true, true, true]);
 }
 
+/// One throttle admission for `workflow_id` with refill 0 and burst 1.
+fn throttle_params(workflow_id: &str) -> autumn_harvest::throttle::AdmitThrottleParams<'_> {
+    autumn_harvest::throttle::AdmitThrottleParams {
+        workflow_name: THROTTLED_WF,
+        throttle_key: "",
+        workflow_id,
+        queue_name: QUEUE,
+        input: json!({}),
+        start_options: autumn_harvest::debounce::DebounceStartOptions::default(),
+        refill_per_sec: 0.0,
+        burst: 1.0,
+        schedule_to_start: None,
+        shard_id: 0,
+    }
+}
+
+/// The shed check sits at the throttle deferral point (issue #1794).
+///
+/// A start that would write a fresh pending row is shed there, after every
+/// await in the admission. A retry that attaches to a pending row is not shed.
+/// The plain `reserve_or_defer`, which scheduler fires use, stays exempt.
+#[tokio::test]
+async fn throttle_deferral_point_sheds_a_fresh_row() {
+    use autumn_harvest::throttle::{ThrottleAdmission, reserve_or_defer, reserve_or_defer_or_shed};
+    let Some(url) = db_url() else {
+        eprintln!("SKIP: HARVEST_TEST_DATABASE_URL unset");
+        return;
+    };
+    let _g = TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    let metrics = Arc::new(CapturingMetrics::default());
+    let (api_state, _app, _cache, _) = seed(&pool, &mut conn, &metrics).await;
+
+    // Spend the only token, then defer one start while the queue admits.
+    let warm = reserve_or_defer(&mut conn, throttle_params("thr-warm"))
+        .await
+        .unwrap();
+    assert!(
+        matches!(warm, ThrottleAdmission::Reserved { .. }),
+        "{warm:?}"
+    );
+    let pending = reserve_or_defer(&mut conn, throttle_params("thr-pending"))
+        .await
+        .unwrap();
+    assert!(
+        matches!(&pending, ThrottleAdmission::Deferred(o) if o.fresh),
+        "{pending:?}"
+    );
+
+    // The queue trips.
+    set_backlog_age(&mut conn, 120).await;
+    sample(&api_state, &pool, &metrics).await;
+
+    // A retry that attaches to its pending row is not shed.
+    let retry = reserve_or_defer_or_shed(&mut conn, throttle_params("thr-pending"))
+        .await
+        .unwrap();
+    assert!(
+        matches!(&retry, ThrottleAdmission::Deferred(o) if !o.fresh),
+        "{retry:?}"
+    );
+
+    // A fresh deferral is shed and writes no pending row.
+    let fresh = reserve_or_defer_or_shed(&mut conn, throttle_params("thr-new")).await;
+    match fresh {
+        Err(autumn_harvest::HarvestError::LoadShed {
+            queue,
+            retry_after_secs,
+            ..
+        }) => {
+            assert_eq!(queue, QUEUE);
+            assert_eq!(retry_after_secs, 7);
+        }
+        other => panic!("a fresh deferral must be shed: {other:?}"),
+    }
+    assert_eq!(
+        count(
+            &mut conn,
+            "SELECT COUNT(*) AS n FROM harvest_start_throttle WHERE workflow_id = 'thr-new'",
+        )
+        .await,
+        0,
+        "a shed deferral writes no pending row"
+    );
+
+    // The plain admission stays exempt, as for a scheduler fire.
+    let exempt = reserve_or_defer(&mut conn, throttle_params("thr-sched"))
+        .await
+        .unwrap();
+    assert!(
+        matches!(&exempt, ThrottleAdmission::Deferred(o) if o.fresh),
+        "{exempt:?}"
+    );
+}
+
 /// With no policy the shedder never sheds, whatever the backlog.
 #[tokio::test]
 async fn no_policy_never_sheds() {

@@ -21,8 +21,10 @@ Design decisions:
   sheds only a fresh create. Signals, updates, attaching starts, continuations
   and internal producers are exempt by construction.
 - A throttled start can defer with `202` before it reaches the primitive. The
-  start and batch routes therefore check the shedder before the throttle, with
-  the same idempotent-retry bypass as the manual gate.
+  start and batch routes therefore call `reserve_or_defer_or_shed`. It checks
+  the shedder right before it writes a fresh pending row, after every await of
+  the admission. Scheduler and backfill fires keep `reserve_or_defer` and stay
+  exempt.
 - An atomic batch whose only rejections are sheds answers `429` with
   `Retry-After`. A non-atomic batch reports each shed item as `rejected`.
 - The gate fails open. A failed or slow sample changes no state. The gate

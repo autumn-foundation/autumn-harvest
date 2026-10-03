@@ -71,8 +71,10 @@ point. At that point it decides to **create** a new execution. Only
 `GateMode::Check` callers reach this check. The gate sheds these requests:
 
 - `POST /workflows/{workflow_name}/start`: plain, keyed and auto-id starts.
-- The same route for a throttled workflow. The route checks the shedder
-  before the throttle can defer the start with `202`.
+- The same route for a throttled workflow. A deferred start never reaches
+  the start primitive, and its later fire is exempt. So the throttle checks
+  the shedder itself, right before it writes a fresh pending row. A retry
+  that attaches to its pending row is not shed.
 - `POST /workflows/{workflow_name}/signal-with-start` when no run exists.
 - `POST /workflows/{workflow_name}/update-with-start` when no run exists.
 - `POST /workflows/batch_start`. Each shed item is a per-item `rejected`
