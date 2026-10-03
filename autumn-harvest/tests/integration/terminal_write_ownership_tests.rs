@@ -279,6 +279,7 @@ async fn persist_workflow_completion_makes_no_terminal_decision_when_the_claim_m
         1,
         "dispatcher-a",
         task.crash_strikes,
+        task.attempt,
         serde_json::json!({"ok": true}),
         None,
         None,
@@ -323,6 +324,7 @@ async fn persist_workflow_failure_makes_no_terminal_decision_when_the_claim_move
         1,
         "dispatcher-a",
         task.crash_strikes,
+        task.attempt,
         "boom",
         None,
         None,
@@ -382,6 +384,7 @@ async fn persist_child_workflow_completion_makes_no_terminal_decision_when_the_c
         1,
         "dispatcher-a",
         task.crash_strikes,
+        task.attempt,
         parent_exec_id,
         serde_json::json!({"ok": true}),
         None,
@@ -432,6 +435,7 @@ async fn persist_child_workflow_failure_makes_no_terminal_decision_when_the_clai
         1,
         "dispatcher-a",
         task.crash_strikes,
+        task.attempt,
         parent_exec_id,
         "boom",
         None,
@@ -486,6 +490,7 @@ async fn check_paused_and_park_makes_no_terminal_decision_when_the_claim_moved()
         task.id,
         "dispatcher-a",
         task.crash_strikes,
+        task.attempt,
         Duration::ZERO,
     )
     .await;
@@ -708,6 +713,7 @@ async fn a_dispatcher_that_still_owns_the_claim_is_released_when_skip_locked_is_
                 1,
                 "dispatcher-a",
                 task.crash_strikes,
+                task.attempt,
                 "boom",
                 None,
                 None,
@@ -984,6 +990,7 @@ async fn persist_workflow_completion_rejects_a_stale_attempt_on_the_same_worker_
         1,
         "dispatcher-a",
         stale.crash_strikes,
+        stale.attempt,
         serde_json::json!({"ok": true}),
         None,
         None,
@@ -1008,4 +1015,28 @@ async fn persist_workflow_completion_rejects_a_stale_attempt_on_the_same_worker_
     let row = load_tasks(&url, exec_id).await.remove(0);
     assert_eq!(row.state, "RUNNING");
     assert_eq!(row.attempt, current.attempt);
+}
+
+#[tokio::test]
+async fn the_guard_matches_only_the_current_attempt_1806() {
+    let (url, _container) = setup_db().await;
+    let (_, stale, current) =
+        reclaim_after_stuck_requeue(&url, "q1806-guard", "dispatcher-a").await;
+    let mut conn = connect(&url).await;
+
+    for (attempt, expected, what) in [
+        (stale.attempt, false, "stale attempt"),
+        (current.attempt, true, "current attempt"),
+    ] {
+        let held = queue::claim_still_held_for_update(
+            &mut conn,
+            current.id,
+            "dispatcher-a",
+            current.crash_strikes,
+            attempt,
+        )
+        .await
+        .expect("guard");
+        assert_eq!(held, expected, "{what}");
+    }
 }
