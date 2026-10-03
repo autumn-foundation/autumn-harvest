@@ -21215,8 +21215,8 @@ fn incremental_history_bytes_base(
 ///   sums the full history first, so a stale overcount cannot fail a run.
 ///
 /// The caller passes plain values, not `&PreparedWorkflowTask`. That struct
-/// holds a resident workflow, which is not `Sync`, so a reference to it held
-/// across an `.await` would make the decision future not `Send`.
+/// holds a resident workflow, which is not `Sync`. A reference to it across
+/// an `.await` would make the decision future not `Send`.
 async fn measure_history_bytes(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
