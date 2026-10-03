@@ -917,6 +917,7 @@ async fn reclaim_after_stuck_requeue(
     queue_name: &str,
     worker_id: &str,
 ) -> (ExecutionId, TaskQueueItem, TaskQueueItem) {
+    let queue_name = &format!("{queue_name}-{}", Uuid::new_v4());
     let (exec_id, first) = seed_claimed_task(url, queue_name, worker_id).await;
     let mut conn = connect(url).await;
     diesel::sql_query(
@@ -928,6 +929,16 @@ async fn reclaim_after_stuck_requeue(
     .await
     .expect("age the claim");
     let first = load_tasks(url, exec_id).await.remove(0);
+    // A live worker keeps the orphan pass, which bumps `crash_strikes`, away.
+    diesel::sql_query(
+        "INSERT INTO harvest_workers (worker_id, last_heartbeat_at, max_concurrency, host) \
+         VALUES ($1, NOW(), 10, 'localhost') ON CONFLICT (worker_id) DO UPDATE \
+         SET last_heartbeat_at = NOW()",
+    )
+    .bind::<diesel::sql_types::Text, _>(worker_id)
+    .execute(&mut conn)
+    .await
+    .expect("register a live worker");
 
     let summary = autumn_harvest::poison_pill::reclaim_orphaned_tasks(
         &mut conn,
