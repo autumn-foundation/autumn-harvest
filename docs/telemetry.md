@@ -150,6 +150,17 @@ metrics_exporter_prometheus::PrometheusBuilder::new()
         LATENCY_BUCKETS,
     )
     .expect("valid bucket boundaries")
+    // Issue #1815: pool wait and DB op latency use the same seconds buckets.
+    .set_buckets_for_metric(
+        Matcher::Full("harvest_db_pool_wait_duration".into()),
+        LATENCY_BUCKETS,
+    )
+    .expect("valid bucket boundaries")
+    .set_buckets_for_metric(
+        Matcher::Full("harvest_db_query_duration".into()),
+        LATENCY_BUCKETS,
+    )
+    .expect("valid bucket boundaries")
     // history-size is a *count* histogram (durable events), not seconds — give
     // it its own boundaries so it stays usable for count dashboards/alerts.
     .set_buckets_for_metric(
@@ -348,6 +359,12 @@ metric is emitted in the source code.
 | `harvest.worker.slots_available` | Gauge | `worker.rs` — `spawn_worker_slot_sampler`, alongside `slots_in_use`. Invariant: `slots_in_use + slots_available == configured_max` per `slot_type` within one sampler interval (issue #531) |
 | `harvest.workflow.active` | Gauge | `worker.rs` — `spawn_workflow_active_sampler`, periodic (`poll_interval`, 5 s default). Shard-local `COUNT(*) … GROUP BY (workflow_name, state) WHERE state IN ('RUNNING','PAUSED')`, aggregated **across all shards** of the worker's `ShardedDbPool` (summed per `(workflow, state)`) so the population is fleet-wide, not default-shard-only. A read failure skips the whole tick so an outage never false-clears the gauge; drained `(workflow, state)` pairs are zero-filled (issue #770) |
 | `harvest.worker.slot_target` | Gauge | `slot_tuner.rs` — `spawn_slot_tuner_loop`, periodic (`poll_interval`). The adaptive slot tuner's current band-clamped resize target for one slot type; only emitted when `WorkerConfig::with_slot_tuner` is configured (issue #548) |
+| `harvest.db.pool.in_use` | Gauge | `worker.rs` — `spawn_db_pool_sampler`, periodic (`poll_interval`). Connections each shard pool lends out now, read from the deadpool status. No query runs (issue #1815) |
+| `harvest.db.pool.idle` | Gauge | `worker.rs` — `spawn_db_pool_sampler`, alongside `in_use`. Open connections that wait idle in the pool (issue #1815) |
+| `harvest.db.pool.wait_duration` | Histogram | `worker.rs` — `Worker::acquire_timed` on the claim path; `timeout.rs` — the timeout scanner's acquire (a single-pool scanner reports its assigned shard); `heartbeat.rs` — the activity heartbeat flush. Seconds to get a pooled connection, recorded on success and on failure (issue #1815) |
+| `harvest.db.query.duration` | Histogram | One sample per op (issue #1815): `claim` in `poll_once` and `consume_reference`; `persist` around the workflow-task persist transaction, COMMIT included; `scan` per `enforce_timeouts_once` pass; `heartbeat` per activity heartbeat write. A guard records a persist that a timeout cancels, too. Not `harvest.query.duration`, which times workflow query handlers |
+| `harvest.worker.pollers` | Gauge | `worker.rs` — `PollerGuard`, set when a poll loop starts and when it ends. One loop claims from all the worker's queues. The count covers every worker in the process, so a second worker's drain does not hide the first. A drained process reads 0 (issue #1815) |
+| `harvest.worker.outlier` | Gauge | `workers.rs` — `run_outlier_tick`, on one liveness heartbeat per worker (the first shard's). That heartbeat merges the peer rows of all the worker's shards. `1` when this worker is an outlier against the median of its live peers on the same queues, else `0`. A tick that cannot compare, or a draining worker, clears its verdict. The series has no worker label, so it reports the OR of every local worker's verdict. See `worker_outlier.rs` for the rules (issue #1815) |
 | `harvest.worker.tuner_decisions` | Counter | `slot_tuner.rs` — `spawn_slot_tuner_loop`, once per control-loop tick, with the decision that actually took effect after band clamping (issue #548) |
 | `harvest.schedule.runs` | Counter | `scheduler.rs` — `tick_one_workflow_schedule` / DAG tick, on successful dispatch |
 | `harvest.schedule.skipped` | Counter | `scheduler.rs` — `tick_one_workflow_schedule` / DAG tick, when a run is skipped |
@@ -421,6 +438,12 @@ metric is emitted in the source code.
 | `harvest.worker.slots_in_use` | `slot_type` (`workflow\|activity`) |
 | `harvest.worker.slots_available` | `slot_type` (`workflow\|activity`) |
 | `harvest.worker.slot_target` | `slot_type` (`workflow\|activity`) |
+| `harvest.db.pool.in_use` | `shard` |
+| `harvest.db.pool.idle` | `shard` |
+| `harvest.db.pool.wait_duration` | `shard` |
+| `harvest.db.query.duration` | `op` (`claim\|persist\|scan\|heartbeat`) |
+| `harvest.worker.pollers` | `queue` |
+| `harvest.worker.outlier` | `dimension` (`failure_ratio\|latency_p99`) |
 | `harvest.workflow.active` | `workflow`, `state` (`running\|paused`) |
 | `harvest.worker.tuner_decisions` | `slot_type` (`workflow\|activity`), `decision` (`grow\|shrink\|hold`) |
 | `harvest.schedule.runs` | `kind` (`workflow\|dag`), `name` |

@@ -415,6 +415,13 @@ const HARVEST_WRITE_PRIVILEGE_REQUIREMENTS: &[(&str, &[&str])] = &[
     ("harvest_dead_letters", &["SELECT", "INSERT", "DELETE"]),
     ("harvest_external_tasks", &["SELECT", "INSERT", "UPDATE"]),
     ("harvest_workers", &["SELECT", "INSERT", "UPDATE"]),
+    // Each worker heartbeat upserts its stats and prunes old rows (issue
+    // #1815). An upsert checks both INSERT and UPDATE. A missing grant turns
+    // the gray-failure signal off for the whole fleet.
+    (
+        "harvest_worker_task_stats",
+        &["SELECT", "INSERT", "UPDATE", "DELETE"],
+    ),
     ("harvest_batch_jobs", &["SELECT", "INSERT", "UPDATE"]),
     ("harvest_audit_log", &["SELECT", "INSERT", "DELETE"]),
     // The retention purge writes this table in the same statement as its
