@@ -67,7 +67,11 @@ harvest worker drain <worker-id> --deadline 2026-05-09T14:30:00Z
 ```
 
 When `--deadline` is omitted the server uses the configured
-`WorkerConfig::shutdown_timeout` (default 30 s from the current time).
+`WorkerConfig::shutdown_timeout` (default 25 s from the current time).
+
+At the deadline the worker cancels its running activities and releases the
+claim of each one that stops. See
+[What a drain does with its claims](../getting-started/10-operations.md#what-a-drain-does-with-its-claims).
 
 ### Drain outcome codes
 
@@ -147,7 +151,8 @@ and `request_id`.
 | Mistake | Fix |
 |---------|-----|
 | Terminating the process before `Stopped` | Poll with `--wait` or `worker get` until status is `Stopped` |
-| Forgetting `--deadline` on a slow worker | The default deadline is `shutdown_timeout` (30 s); set a longer deadline for workers with large in-flight batches |
+| Forgetting `--deadline` on a slow worker | The default deadline is `shutdown_timeout` (25 s); set a longer deadline for workers with large in-flight batches |
+| `shutdown_timeout` at or above the platform grace period | Keep it at least 5 s below `terminationGracePeriodSeconds`, or the platform kills the worker before the drain releases its claims |
 | Draining the wrong shard | Use `--shard-id` with `drain-preview` to scope the preview first |
 | Ignoring `unavailable_shards` in the response | The worker may be on an unreachable shard; retry after shard recovers |
 

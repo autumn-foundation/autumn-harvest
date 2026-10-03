@@ -15087,6 +15087,47 @@ async fn defer_retry_for_budget(
     Ok(write == queue::ClaimWrite::Applied)
 }
 
+/// The error a drain-released activity carries into its next attempt
+/// (issue #1813). `ActivityContext::previous_failure` reports it.
+const WORKER_SHUTDOWN_ERROR: &str = "worker shutdown: the drain cancelled the activity";
+
+/// Requeue an activity whose handler the drain cancelled and joined (issue
+/// #1813).
+///
+/// The retry is due at once. The attempt counts, so an old claim epoch never
+/// matches a later claim. The retry policy is not consulted, as for an orphan
+/// reclaim: a deploy must not fail an activity. A lost claim is a no-op.
+async fn release_drained_activity(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+) -> HarvestResult<()> {
+    let claim = claim_of_task(task)?;
+    let write = queue::requeue_claimed_task_for_retry(
+        conn,
+        &claim,
+        chrono::Duration::zero(),
+        WORKER_SHUTDOWN_ERROR,
+    )
+    .await?;
+    if write == queue::ClaimWrite::Applied {
+        tracing::info!(
+            task_id = %task.id,
+            worker_id = %claim.worker_id,
+            "drain released a cancelled activity for an immediate retry"
+        );
+    } else {
+        log_lease_lost(task, "drain release");
+    }
+    Ok(())
+}
+
+/// How a running activity's handler ended (issue #1813).
+struct ActivityRun {
+    result: Result<serde_json::Value, String>,
+    /// The drain cancelled the handler, and the handler then returned.
+    drained: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_activity_future_with_cancellation(
     activity_name: &str,
@@ -15097,13 +15138,52 @@ async fn execute_activity_future_with_cancellation(
          ),
     mut cancellation_observer: impl std::future::Future<Output = ()> + Send + Unpin,
     cancel: tokio_util::sync::CancellationToken,
+    drain_cancel: &CancellationToken,
     span: tracing::Span,
-) -> Result<serde_json::Value, String> {
+) -> ActivityRun {
     use tracing::Instrument;
     async {
         tokio::select! {
             biased;
-            result = &mut *activity_future => result,
+            result = &mut *activity_future => ActivityRun { result, drained: false },
+            () = drain_cancel.cancelled() => {
+                cancel.cancel();
+                tracing::info!(
+                    task_id = %task_id,
+                    activity = %activity_name,
+                    "drain deadline near; cancelling running activity"
+                );
+                // The drain never drops the handler. A handler that ignores
+                // the cancel keeps its claim (issue #1813).
+                tokio::select! {
+                    biased;
+                    result = &mut *activity_future => ActivityRun { result, drained: true },
+                    () = &mut cancellation_observer => {
+                        tracing::info!(
+                            task_id = %task_id,
+                            activity = %activity_name,
+                            grace_period_ms = %cancellation_grace_period.as_millis(),
+                            "cancellation or lost lease detected for running activity; \
+                             awaiting cooperative unwind"
+                        );
+                        let result = tokio::time::timeout(cancellation_grace_period, activity_future)
+                            .await
+                            .unwrap_or_else(|_| {
+                                tracing::warn!(
+                                    task_id = %task_id,
+                                    activity = %activity_name,
+                                    grace_period_ms = %cancellation_grace_period.as_millis(),
+                                    "activity ignored cancellation; hard-aborting handler"
+                                );
+                                Err(format!(
+                                    "workflow cancelled: activity '{activity_name}' exceeded {}ms cancellation grace period",
+                                    cancellation_grace_period.as_millis()
+                                ))
+                            });
+                        ActivityRun { result, drained: false }
+                    }
+                }
+            }
             () = &mut cancellation_observer => {
                 cancel.cancel();
                 tracing::info!(
@@ -15113,7 +15193,7 @@ async fn execute_activity_future_with_cancellation(
                     "cancellation or lost lease detected for running activity; \
                      awaiting cooperative unwind"
                 );
-                tokio::time::timeout(cancellation_grace_period, activity_future)
+                let result = tokio::time::timeout(cancellation_grace_period, activity_future)
                     .await
                     .unwrap_or_else(|_| {
                         tracing::warn!(
@@ -15126,7 +15206,8 @@ async fn execute_activity_future_with_cancellation(
                             "workflow cancelled: activity '{activity_name}' exceeded {}ms cancellation grace period",
                             cancellation_grace_period.as_millis()
                         ))
-                    })
+                    });
+                ActivityRun { result, drained: false }
             }
         }
     }
@@ -15463,6 +15544,7 @@ async fn process_activity_task(
     dispatched_at: std::time::Instant,
     max_concurrent_sessions: i32,
     session_slots_in_use: &crate::sessions::SessionSlotRegistry,
+    drain_cancel: &CancellationToken,
 ) -> HarvestResult<()> {
     let Some(exec_uuid) = task.workflow_exec_id else {
         let mut conn = pool.get().await.map_err(crate::error::database_error)?;
@@ -16071,13 +16153,17 @@ async fn process_activity_task(
     let cancellation_observer = observe_task_cancellation(pool, &activity_claim);
     tokio::pin!(cancellation_observer);
 
-    let activity_result = execute_activity_future_with_cancellation(
+    let ActivityRun {
+        result: activity_result,
+        drained,
+    } = execute_activity_future_with_cancellation(
         activity_name,
         task.id,
         cancellation_grace_period,
         &mut activity_future,
         cancellation_observer,
         cancel.clone(),
+        drain_cancel,
         span,
     )
     .await;
@@ -16263,6 +16349,13 @@ async fn process_activity_task(
             );
         }
         return Ok(());
+    }
+
+    // The drain cancelled the handler, and it returned an error. The handler
+    // is gone, so no peer can run beside it. Give the claim back for an
+    // immediate retry (issue #1813).
+    if drained && activity_result.is_err() {
+        return release_drained_activity(&mut conn, task).await;
     }
 
     // activity_result is already cap-normalized (oversized Ok → non-retryable Err);
@@ -23684,6 +23777,8 @@ async fn process_task(
     // capability-miss cleanup below. `None` on the activity path (never bounded
     // by it) and when `workflow_task_timeout` is zero.
     workflow_body_timeout: Option<Duration>,
+    // Issue #1813: the drain's cancel for running activities.
+    drain_cancel: &CancellationToken,
 ) -> HarvestResult<TaskDispatchOutcome> {
     // Issue #804 (Codex round-22 P2): the workflow path sets this when a
     // frontier reset commits, so the capability-miss interception below knows
@@ -23748,6 +23843,7 @@ async fn process_task(
                 dispatched_at,
                 max_concurrent_sessions,
                 session_slots_in_use,
+                drain_cancel,
             )
             .await;
             // Acquire only if we actually need to act on a capability miss or
@@ -26358,6 +26454,12 @@ pub struct Worker {
     monitoring_started: std::sync::atomic::AtomicBool,
     /// Cancellation token for graceful shutdown.
     shutdown: CancellationToken,
+    /// Fired by the drain one join window before its deadline (issue
+    /// #1813). Each running activity then sees its context cancelled.
+    drain_cancel: CancellationToken,
+    /// Every dispatch body (issue #1813). The drain waits for it, so a body
+    /// that releases a claim with no permit still counts as in flight.
+    dispatched: tokio_util::task::TaskTracker,
     /// Set (and refreshed on every heartbeat) by the heartbeat task while the
     /// worker is draining.  Holds the absolute deadline from the operator's
     /// `drain_deadline_at` so that `drain_in_flight` can honour an extended
@@ -27544,6 +27646,75 @@ impl Drop for DispatchReservation {
     }
 }
 
+/// What a dispatch needs to give back a claim it never started (issue #1813).
+struct UnstartedClaim {
+    claim: Option<queue::TaskClaim>,
+    /// The bucket the claim debited a rate-limit token from, if any.
+    refund_key: Option<String>,
+}
+
+impl UnstartedClaim {
+    fn of(task: &TaskQueueItem, registry: &HandlerRegistry) -> Self {
+        // A breaker-tracked activity takes no claim-time debit (issue #369).
+        let debited = !task
+            .activity_name
+            .as_deref()
+            .is_some_and(|name| registry.circuit_breakers().has_policy(name));
+        Self {
+            claim: queue::TaskClaim::of(task),
+            refund_key: task.rate_limit_key.clone().filter(|_| debited),
+        }
+    }
+
+    /// Release the claim and refund its rate-limit debit.
+    ///
+    /// The refund does not depend on the release. A lost claim still leaves
+    /// this dispatch's debit stranded. See
+    /// [`refund_capability_miss_rate_limit_token`].
+    async fn release(self, pool: &DbPool) {
+        let Some(claim) = self.claim else {
+            return;
+        };
+        let mut conn = match pool.get().await {
+            Ok(conn) => conn,
+            Err(error) => {
+                tracing::warn!(
+                    task_id = %claim.task_id,
+                    %error,
+                    "no connection to release a claim that never started; the lease recovers it"
+                );
+                return;
+            }
+        };
+        match queue::release_unstarted_claim(&mut conn, &claim).await {
+            Ok(queue::ClaimWrite::Applied) => tracing::info!(
+                task_id = %claim.task_id,
+                worker_id = %claim.worker_id,
+                "shutdown released a claimed task that never started"
+            ),
+            Ok(queue::ClaimWrite::LeaseLost) => tracing::debug!(
+                task_id = %claim.task_id,
+                "a claim that never started was already lost"
+            ),
+            Err(error) => tracing::warn!(
+                task_id = %claim.task_id,
+                %error,
+                "failed to release a claim that never started; the lease recovers it"
+            ),
+        }
+        if let Some(key) = self.refund_key.as_deref()
+            && let Err(error) = queue::refund_rate_limit_token(&mut conn, key).await
+        {
+            tracing::warn!(
+                task_id = %claim.task_id,
+                rate_limit_key = %key,
+                %error,
+                "failed to refund the rate-limit token of a claim that never started"
+            );
+        }
+    }
+}
+
 /// Owns a task handle and aborts the task when dropped (issue #1552).
 ///
 /// A bare `JoinHandle` detaches its task on drop. Cancelling the future that
@@ -28063,6 +28234,8 @@ impl Worker {
             gate_refused: Arc::new(GateRefused::default()),
             monitoring_started: std::sync::atomic::AtomicBool::new(false),
             shutdown: CancellationToken::new(),
+            drain_cancel: CancellationToken::new(),
+            dispatched: tokio_util::task::TaskTracker::new(),
             remote_drain_deadline: Arc::new(Mutex::new(None)),
             drain_deadline_max: Arc::new(Mutex::new(None)),
             workflow_cache,
@@ -31742,6 +31915,9 @@ impl Worker {
         // inside a dispatch buffering scope (issue #1312). Binding keeps the
         // body at the same nesting, so this change adds no reindentation to
         // the hottest file in the repo.
+        let shutdown = self.shutdown.clone();
+        let drain_cancel = self.drain_cancel.clone();
+        let unstarted = UnstartedClaim::of(&task, &self.registry);
         let task_body = async move {
             chaos_point!(WORKER_DISPATCH_BEFORE_START);
             // Acquire semaphore permit — blocks if at concurrency limit. A
@@ -31751,11 +31927,23 @@ impl Worker {
                 if let Some(permit) = held_permit {
                     permit
                 } else {
-                    let Ok(permit) = Arc::clone(&semaphore).acquire_owned().await else {
-                        tracing::error!(task_id = %task_id, "semaphore closed");
-                        return;
+                    // Shutdown ends the wait (issue #1813).
+                    let acquired = tokio::select! {
+                        biased;
+                        () = shutdown.cancelled() => None,
+                        acquired = Arc::clone(&semaphore).acquire_owned() => Some(acquired),
                     };
-                    permit
+                    match acquired {
+                        Some(Ok(permit)) => permit,
+                        Some(Err(_)) => {
+                            tracing::error!(task_id = %task_id, "semaphore closed");
+                            return;
+                        }
+                        None => {
+                            unstarted.release(&pool).await;
+                            return;
+                        }
+                    }
                 },
                 &capacity_freed,
             );
@@ -31763,6 +31951,12 @@ impl Worker {
             // reservation against it (issue #1312). The early return above
             // drops it too, so a closed semaphore cannot leak one.
             drop(reservation);
+            // A task that has not started when shutdown begins gives its
+            // claim back, so a peer runs it at once (issue #1813).
+            if shutdown.is_cancelled() {
+                unstarted.release(&pool).await;
+                return;
+            }
 
             // Feed the adaptive slot tuner's permit-wait signal (issue #548).
             // A lock-free fetch_max so concurrent dispatches never contend;
@@ -31828,6 +32022,7 @@ impl Worker {
                     workflow_task_deadline,
                     capability_miss_policy,
                     Some(workflow_task_timeout),
+                    &drain_cancel,
                 )
                 .await
                 {
@@ -32049,6 +32244,7 @@ impl Worker {
                     // Same reason: this arm is the "no timeout configured, or
                     // not a workflow task" path, which was never wrapped.
                     None,
+                    &drain_cancel,
                 )
                 .await
                 {
@@ -32091,7 +32287,8 @@ impl Worker {
         // not the live slot (issue #1431). Another runtime can replace the
         // slot after this worker starts.
         let bound_channel = self.bound_channel();
-        tokio::spawn(async move {
+        // The tracker keeps the body's handle for the drain (issue #1813).
+        self.dispatched.spawn(async move {
             // Every hint this task raises waits in the scope until the
             // transaction that raised it commits and a flush point publishes
             // it. This is the catch-all for a hint no flush point reached.
@@ -32117,14 +32314,19 @@ impl Worker {
 
     /// Wait for all in-flight tasks to finish (or the drain deadline expires).
     ///
-    /// We wait until all semaphore permits are available again, meaning all
-    /// spawned tasks have completed and dropped their permits.
+    /// We wait until every dispatch body has ended and all semaphore permits
+    /// are available again.
     ///
     /// The deadline is read from `remote_drain_deadline` (set by the heartbeat
     /// task) rather than being snapshotted once.  The heartbeat task refreshes
     /// that cell on every tick while draining, so an operator-extended deadline
     /// (via a second POST .../drain with a later `deadline_at`) is picked up
     /// here without restarting the worker.
+    ///
+    /// One join window before the deadline, the drain cancels running
+    /// activities (issue #1813). See [`drain_cancel_at`]. A handler that
+    /// returns gives its claim back. A handler that ignores the cancel keeps
+    /// its claim past the deadline, so no peer runs it at the same time.
     async fn drain_in_flight(&self) {
         // Uses the actual permit count behind each semaphore (issue #548):
         // equal to `config.max_concurrent_*` when no slot tuner is
@@ -32136,7 +32338,8 @@ impl Worker {
 
         // Fixed fallback for local (non-remote) shutdowns: computed once so that
         // the 1-second tick in the loop cannot keep sliding it forward.
-        let local_deadline = tokio::time::Instant::now() + self.config.shutdown_timeout;
+        let started = tokio::time::Instant::now();
+        let local_deadline = started + self.config.shutdown_timeout;
 
         // Returns the current deadline: remote (refreshable) when set, otherwise
         // the fixed local_deadline computed above.
@@ -32147,11 +32350,21 @@ impl Worker {
                 .and_then(|g| *g)
                 .map_or(local_deadline, tokio::time::Instant::from_std)
         };
+        let cancel_at =
+            |deadline| drain_cancel_at(started, deadline, self.config.cancellation_grace_period);
 
-        let sleep = tokio::time::sleep_until(snapshot_deadline());
+        let deadline = snapshot_deadline();
+        let sleep = tokio::time::sleep_until(deadline);
         tokio::pin!(sleep);
+        let cancel_sleep = tokio::time::sleep_until(cancel_at(deadline));
+        tokio::pin!(cancel_sleep);
 
+        // No body starts after this point, so the tracker can close.
+        self.dispatched.close();
         let drain = async {
+            // Every dispatch body has ended, including one that gives back a
+            // claim with no permit (issue #1813).
+            self.dispatched.wait().await;
             // Try to acquire ALL permits — when we can, all in-flight tasks are done.
             let _wf = self
                 .workflow_semaphore
@@ -32183,16 +32396,27 @@ impl Worker {
             tokio::select! {
                 biased;
                 () = &mut drain => return,
+                // Before the deadline arm, so a past deadline still cancels.
+                () = &mut cancel_sleep, if !self.drain_cancel.is_cancelled() => {
+                    tracing::info!(
+                        worker_id = %self.config.worker_id,
+                        "drain deadline near; cancelling running activities"
+                    );
+                    self.drain_cancel.cancel();
+                }
                 () = &mut sleep => {
                     tracing::warn!(
                         worker_id = %self.config.worker_id,
                         total_permits,
-                        "shutdown timeout elapsed — some tasks may still be running"
+                        "shutdown timeout elapsed — some tasks may still be running; \
+                         their claims stay held until the lease expires"
                     );
                     return;
                 }
                 _ = check.tick() => {
-                    sleep.as_mut().reset(snapshot_deadline());
+                    let deadline = snapshot_deadline();
+                    sleep.as_mut().reset(deadline);
+                    cancel_sleep.as_mut().reset(cancel_at(deadline));
                 }
             }
         }
@@ -32215,13 +32439,19 @@ impl Worker {
 }
 
 /// The instant at which a drain cancels its running activities (issue #1813).
-#[allow(dead_code)]
+///
+/// It is one join window before `deadline`. The join window is
+/// `join_window`, capped at half the drain, so most of the drain lets tasks
+/// finish on their own. The result is never before `started`.
 fn drain_cancel_at(
-    _started: tokio::time::Instant,
+    started: tokio::time::Instant,
     deadline: tokio::time::Instant,
-    _join_window: Duration,
+    join_window: Duration,
 ) -> tokio::time::Instant {
+    let drain = deadline.saturating_duration_since(started);
     deadline
+        .checked_sub(join_window.min(drain / 2))
+        .map_or(started, |at| at.max(started))
 }
 
 // ---------------------------------------------------------------------------

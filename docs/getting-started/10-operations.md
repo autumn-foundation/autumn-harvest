@@ -304,6 +304,29 @@ Drain requests are recorded in the audit log under the `worker.drain`
 operation, so you have a "who quiesced this node, when" record without
 correlating shell history across machines.
 
+### What a drain does with its claims
+
+A `SIGTERM` and a remote drain run the same drain (issue #1813):
+
+1. The worker stops claiming tasks.
+2. It gives back each claimed task that has not started. The task is
+   `PENDING` again at once and keeps its attempt count.
+3. It lets running tasks finish.
+4. One join window before the deadline, it cancels running activities. The
+   join window is `cancellation_grace_period`, capped at half the drain.
+5. It gives back the claim of each cancelled activity whose handler returns.
+   A peer retries it at once. The cancelled attempt counts toward
+   `max_attempts`, but the release itself never fails the activity.
+6. At the deadline it stops waiting. A handler that ignored the cancel keeps
+   its claim. The claim fence and the lease then recover the task, so no
+   peer runs it at the same time.
+
+The deadline is `WorkerConfig::shutdown_timeout`, or the remote drain
+deadline. The default is 25 s. Keep `shutdown_timeout` at least 5 s below
+the platform grace period. On Kubernetes that is
+`terminationGracePeriodSeconds`, 30 s by default. A larger value lets the
+platform kill the process before the drain gives back its claims.
+
 ## Reuse policies
 
 By default, starting a workflow with an existing `(name, workflow_id)` pair

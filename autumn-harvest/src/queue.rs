@@ -2953,6 +2953,78 @@ pub async fn defer_claimed_retry_for_budget(
     Ok(ClaimWrite::Applied)
 }
 
+/// Give back the claim of a task that never started (issue #1813). A stale
+/// claim changes nothing.
+///
+/// A draining worker calls this for a task it claimed but did not start. No
+/// handler ran, so the release restores `attempt`, as
+/// [`crate::queue_pause::release_claim`] does. No writer for this claim
+/// epoch exists, so a later claim cannot match a stale write.
+///
+/// The release keeps `scheduled_at`, so the row is due at once. It keeps
+/// `error`, `crash_strikes` and the capability-miss counters. A task that
+/// never started says nothing about them.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on update failure.
+pub async fn release_unstarted_claim(
+    conn: &mut AsyncPgConnection,
+    claim: &TaskClaim,
+) -> HarvestResult<ClaimWrite> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    let update = diesel::update(
+        dsl::harvest_task_queue
+            .find(claim.task_id)
+            .filter(dsl::state.eq("RUNNING")),
+    )
+    .set((
+        dsl::state.eq("PENDING"),
+        dsl::worker_id.eq(None::<String>),
+        dsl::started_at.eq(None::<DateTime<Utc>>),
+        dsl::last_heartbeat_at.eq(None::<DateTime<Utc>>),
+        // Undo the claim-time attempt increment. The task did not run.
+        dsl::attempt.eq(diesel::dsl::sql::<diesel::sql_types::Integer>(
+            "GREATEST(attempt - 1, 0)",
+        )),
+    ))
+    .into_boxed();
+    let Some((queue_name, priority, task_type, scheduled_at)) = fence(update, Some(claim))
+        .returning((
+            dsl::queue_name,
+            dsl::priority,
+            dsl::task_type,
+            dsl::scheduled_at,
+        ))
+        .get_result::<(String, i32, String, DateTime<Utc>)>(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?
+    else {
+        return Ok(ClaimWrite::LeaseLost);
+    };
+    // The UPDATE already committed. A failed wake must not report the
+    // release as unpersisted. The poll loop still finds the row.
+    if let Err(error) = announce_deferred_task(
+        conn,
+        claim.task_id,
+        &queue_name,
+        scheduled_at,
+        priority,
+        &task_type,
+    )
+    .await
+    {
+        tracing::warn!(
+            task_id = %claim.task_id,
+            %error,
+            "failed to announce a released claim; the poll loop still claims it"
+        );
+    }
+    Ok(ClaimWrite::Applied)
+}
+
 /// Mark a task as completed with the given output.
 ///
 /// Terminal completion clears any heartbeat checkpoint payload so it cannot be
