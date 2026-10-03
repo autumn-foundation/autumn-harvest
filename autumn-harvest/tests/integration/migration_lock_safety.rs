@@ -1049,7 +1049,10 @@ fn resolve(
             .or_else(|| raw.index.as_deref().and_then(|i| history.index_table(i)));
         // Learn an index only from a build that surely runs. The history only
         // grows, so a later build of the same name cannot hide a hot table.
-        let sure = toks[raw.at].runs && unconditional[raw.at];
+        // A build with `IF NOT EXISTS` may have done nothing.
+        // `IF NOT EXISTS` may have skipped the build, so it teaches nothing.
+        let sure =
+            toks[raw.at].runs && unconditional[raw.at] && !s.has_pair(raw.at, "not", "exists");
         if let (Some(index), Some(table), "CREATE INDEX", true) =
             (&raw.index, &table, raw.verb, sure)
         {
@@ -1079,35 +1082,60 @@ fn resolve(
 
 /// Whether each token runs on every path through its `DO` body.
 ///
-/// A token inside an `IF`, `CASE` or `LOOP`, after `EXCEPTION`, or after a
-/// `RETURN`, may not run. A `CASE` expression that ends in a bare `END` leaves the rest of the
+/// A token inside an `IF`, `CASE` or `LOOP`, or after a `RETURN`, may not
+/// run. Nothing in a body with an `EXCEPTION` handler surely runs, because
+/// the handler rolls the block back. A `CASE` expression that ends in a bare `END` leaves the rest of the
 /// body conditional, which fails closed. A top-level token always runs.
 fn unconditional(s: &Stmts) -> Vec<bool> {
-    let mut out = Vec::with_capacity(s.toks.len());
-    let mut depth = 0;
-    let mut branches = 0_usize;
-    // Set once an exception handler or an early exit makes the rest of the
-    // body conditional.
-    let mut skippable = false;
-    for (k, tok) in s.toks.iter().enumerate() {
-        if tok.depth != depth {
-            depth = tok.depth;
-            branches = 0;
-            skippable = false;
+    let toks = s.toks;
+    let handler = |j: usize| s.is(j, "exception") && !(j > 0 && s.is(j - 1, "raise"));
+    // A block with an exception handler runs as a subtransaction. An error
+    // rolls the whole block back, so nothing in the body surely happens.
+    let mut rolled_back = vec![false; toks.len()];
+    let mut from = 0;
+    while from < toks.len() {
+        if toks[from].depth == 0 {
+            from += 1;
+            continue;
         }
+        let to = (from..toks.len())
+            .find(|&j| toks[j].depth == 0)
+            .unwrap_or(toks.len());
+        if (from..to).any(handler) {
+            rolled_back[from..to].fill(true);
+        }
+        from = to;
+    }
+
+    // Branch state per dollar-quote depth. A nested string must not reset
+    // the state of the body around it.
+    let mut state = vec![(0_usize, false)];
+    let mut depth = 0;
+    let mut out = Vec::with_capacity(toks.len());
+    for (k, tok) in toks.iter().enumerate() {
+        if tok.depth > depth {
+            state.truncate(depth + 1);
+        }
+        depth = tok.depth;
+        if state.len() <= depth {
+            state.resize(depth + 1, (0, false));
+        }
+        let (branches, skippable) = &mut state[depth];
         let after_end = k > 0 && s.is(k - 1, "end");
         match s.word(k) {
             Some("end") if ["if", "loop", "case"].iter().any(|w| s.is(k + 1, w)) => {
-                branches = branches.saturating_sub(1);
+                *branches = branches.saturating_sub(1);
             }
             Some("if") if !after_end && !s.is(k + 1, "not") && !s.is(k + 1, "exists") => {
-                branches += 1;
+                *branches += 1;
             }
-            Some("loop" | "case") if !after_end => branches += 1,
-            Some("exception" | "return") => skippable = true,
+            Some("loop" | "case") if !after_end => *branches += 1,
+            // An early exit, or a handler, makes the rest of the body conditional.
+            Some("return") => *skippable = true,
+            Some("exception") if handler(k) => *skippable = true,
             _ => {}
         }
-        out.push(depth == 0 || (branches == 0 && !skippable));
+        out.push(depth == 0 || (*branches == 0 && !*skippable && !rolled_back[k]));
     }
     out
 }
@@ -1339,6 +1367,7 @@ fn alter(s: &Stmts, k: usize, history: &History, raws: &mut Vec<Raw>) {
         }
         Some("trigger") => raws.push(Raw::lock(k, "ALTER TRIGGER", s.name_after(k + 2, "on"))),
         Some("policy") => raws.push(Raw::lock(k, "ALTER POLICY", s.name_after(k + 2, "on"))),
+        Some("rule") => raws.push(Raw::lock(k, "ALTER RULE", s.name_after(k + 2, "on"))),
         Some("index") => {
             if let Some((index, _)) = s.qualified_name(s.skip_if_exists(k + 2)) {
                 raws.push(Raw {
@@ -1387,8 +1416,15 @@ fn vacuum_full(s: &Stmts, k: usize) -> Vec<Raw> {
     }
     // Each table may carry a column list: `VACUUM FULL t (a, b), u`.
     let mut names = Vec::new();
-    while let Some((name, mut next)) = s.qualified_name(j) {
+    loop {
+        if s.is(j, "only") {
+            j += 1;
+        }
+        let Some((name, mut next)) = s.qualified_name(j) else {
+            break;
+        };
         names.push(name);
+        next += usize::from(s.is_punct(next, '*'));
         if s.is_punct(next, '(') {
             while next < s.toks.len() && !s.is_punct(next, ')') {
                 next += 1;
@@ -2423,6 +2459,60 @@ fn the_app_database_keeps_its_own_index_history() {
     let all = lint_all(&[app, core]);
     // The core database never saw the app index, so its table is unknown.
     assert_eq!(rules(&all[1]), [Rule::BlockingIndex], "{all:?}");
+}
+
+#[test]
+fn alter_rule_locks_its_table() {
+    let findings = lint_with_history(&[], "ALTER RULE r ON harvest_events RENAME TO r2;", true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+}
+
+#[test]
+fn a_nested_dollar_string_keeps_the_branch_state() {
+    let sql = "DO $$\nBEGIN\nIF random() > 0.5 THEN\n    PERFORM $q$text$q$;\n    \
+               PERFORM set_config('lock_timeout', '5s', true);\nEND IF;\nEND $$;\n\
+               ALTER TABLE harvest_events ADD COLUMN x INT;";
+    let findings = lint_with_history(&[], sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+}
+
+#[test]
+fn a_guarded_create_index_teaches_nothing() {
+    // An index of that name may already exist on a hot table.
+    let history = ["CREATE INDEX IF NOT EXISTS idx_maybe ON harvest_schedules (id);"];
+    let sql = "SET LOCAL lock_timeout = '5s';\nDROP INDEX idx_maybe;";
+    let findings = lint_with_history(&history, sql, true);
+    assert_eq!(rules(&findings), [Rule::BlockingIndex], "{findings:?}");
+}
+
+#[test]
+fn vacuum_full_only_names_the_table_after_only() {
+    let findings = lint_with_history(&[], "VACUUM FULL ONLY harvest_events;", false);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+    assert!(
+        findings[0].detail.contains("harvest_events"),
+        "{findings:?}"
+    );
+}
+
+#[test]
+fn an_exception_handler_may_undo_its_whole_block() {
+    // The handler rolls back the block, so nothing in it surely happens.
+    let create = "DO $$\nBEGIN\n    CREATE TEMP TABLE harvest_events (id INT);\n    \
+                  PERFORM 1 / 0;\nEXCEPTION WHEN others THEN\n    NULL;\nEND $$;\n\
+                  ALTER TABLE harvest_events ADD COLUMN x INT;";
+    let findings = lint_with_history(&[], create, true);
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.rule == Rule::LockTimeout && f.line == 8),
+        "{findings:?}"
+    );
+    let setter = "DO $$\nBEGIN\n    PERFORM set_config('lock_timeout', '5s', true);\n    \
+                  PERFORM 1 / 0;\nEXCEPTION WHEN others THEN\n    NULL;\nEND $$;\n\
+                  ALTER TABLE harvest_events ADD COLUMN x INT;";
+    let findings = lint_with_history(&[], setter, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────
