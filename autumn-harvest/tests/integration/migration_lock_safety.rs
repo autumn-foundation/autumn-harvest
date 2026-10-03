@@ -708,18 +708,19 @@ impl<'a> Stmts<'a> {
             .unwrap_or(self.toks.len())
     }
 
-    /// Read a name that may carry a schema. Return its last part and the next index.
+    /// Read a name that may carry a schema. Return the name as written and the next index.
     fn qualified_name(&self, k: usize) -> Option<(String, usize)> {
-        let mut name = self.word(k)?;
+        let mut name = self.word(k)?.to_string();
         let mut k = k + 1;
         while self.is_punct(k, '.') {
             let Some(part) = self.word(k + 1) else {
                 break;
             };
-            name = part;
+            name.push('.');
+            name.push_str(part);
             k += 2;
         }
-        Some((name.to_string(), k))
+        Some((name, k))
     }
 
     /// Read a comma-separated list of names. Each name may carry `ONLY`.
@@ -805,6 +806,14 @@ impl<'a> Stmts<'a> {
     }
 }
 
+/// The last part of a name that may carry a schema.
+///
+/// The hot-table list and the history match on this part, so a schema never
+/// hides a hot table. A new-table exemption matches the whole name instead.
+fn base(name: &str) -> &str {
+    name.rsplit('.').next().unwrap_or(name)
+}
+
 /// A statement before the history and positional rules apply.
 struct Raw {
     at: usize,
@@ -835,8 +844,8 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
     // A table counts as new from its `CREATE TABLE` on. `IF NOT EXISTS` can
     // do nothing, so it does not count.
     let mut created: BTreeMap<String, usize> = BTreeMap::new();
-    // A function body never runs here, so it changes no state. Its locks
-    // still count, which fails closed.
+    // A function body, or a branch that may not run, cannot make a table new.
+    // Its locks still count, which fails closed.
     let mut not_run: BTreeMap<String, usize> = BTreeMap::new();
     let unconditional = unconditional(&s);
 
@@ -844,7 +853,8 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
         let start = s.starts[k] == k;
         match s.word(k) {
             Some("create") if start => {
-                let created = if tok.runs { &mut created } else { &mut not_run };
+                let sure = tok.runs && unconditional[k];
+                let created = if sure { &mut created } else { &mut not_run };
                 create(&s, k, &mut raws, created);
             }
             Some("drop") if start => drop(&s, k, history, &mut raws),
@@ -873,10 +883,12 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
             Some("references") => {
                 let owner = s.statement_table(s.starts[k]);
                 if let Some((target, _)) = s.qualified_name(k + 1) {
-                    if let Some(owner) = owner.filter(|_| tok.runs) {
+                    // A key that may never exist is remembered too, which
+                    // fails closed when its table is dropped later.
+                    if let Some(owner) = owner {
                         history
                             .references
-                            .entry(owner)
+                            .entry(base(&owner).to_string())
                             .or_default()
                             .insert(target.clone());
                     }
@@ -887,30 +899,63 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
                 let parent = s.qualified_name(k + 2).map(|(t, _)| t);
                 raws.push(Raw::lock(s.starts[k], "PARTITION OF", parent));
             }
-            _ if tok.runs && unconditional[k] => {
-                timeouts.extend(timeout_change(&s, k).map(|bounds| (k, bounds)));
+            // A conditional setter cannot set a bound, but a conditional
+            // clear may end one.
+            _ if tok.runs => {
+                let change = timeout_change(&s, k).filter(|bounds| !bounds || unconditional[k]);
+                timeouts.extend(change.map(|bounds| (k, bounds)));
             }
             _ => {}
         }
     }
 
+    let hits = resolve(raws, &s, &unconditional, &created, history);
+
+    let statement_count = (0..toks.len())
+        .filter(|&k| s.starts[k] == k && toks[k].depth == 0 && !s.is_punct(k, ';'))
+        .count();
+    Analysis {
+        comments,
+        hits,
+        timeouts,
+        statement_count,
+    }
+}
+
+/// Resolve each statement's table against the history, in source order.
+///
+/// A `CREATE INDEX` that surely runs teaches the history its table.
+fn resolve(
+    mut raws: Vec<Raw>,
+    s: &Stmts,
+    unconditional: &[bool],
+    created: &BTreeMap<String, usize>,
+    history: &mut History,
+) -> Vec<Hit> {
+    let toks = s.toks;
     raws.sort_by_key(|raw| raw.at);
     let mut hits = Vec::with_capacity(raws.len());
     for raw in raws {
         let table = raw.table.or_else(|| {
             raw.index
-                .as_ref()
-                .and_then(|i| history.indexes.get(i))
+                .as_deref()
+                .and_then(|i| history.indexes.get(base(i)))
                 .cloned()
         });
-        let runs = toks[raw.at].runs;
+        // Learn an index only from a build that surely runs. `IF NOT EXISTS`
+        // keeps an index that already has the name.
+        let sure = toks[raw.at].runs && unconditional[raw.at];
         if let (Some(index), Some(table), "CREATE INDEX", true) =
-            (&raw.index, &table, raw.verb, runs)
+            (&raw.index, &table, raw.verb, sure)
         {
-            history.indexes.insert(index.clone(), table.clone());
+            let key = base(index).to_string();
+            let guarded = s.has_pair(raw.at, "not", "exists");
+            if !(guarded && history.indexes.contains_key(&key)) {
+                history.indexes.insert(key, table.clone());
+            }
         }
         let hot = table.as_deref().is_none_or(|t| {
-            HOT_TABLES.contains(&t) && created.get(t).is_none_or(|made| *made > raw.at)
+            HOT_TABLES.contains(&base(t)) && created.get(t).is_none_or(|made| *made > raw.at)
         });
         hits.push(Hit {
             at: raw.at,
@@ -924,15 +969,7 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
         });
     }
 
-    let statement_count = (0..toks.len())
-        .filter(|&k| s.starts[k] == k && toks[k].depth == 0 && !s.is_punct(k, ';'))
-        .count();
-    Analysis {
-        comments,
-        hits,
-        timeouts,
-        statement_count,
-    }
+    hits
 }
 
 /// Whether each token runs on every path through its `DO` body.
@@ -1153,7 +1190,12 @@ fn alter(s: &Stmts, k: usize, history: &History, raws: &mut Vec<Raw>) {
 
 /// The tables that `table`'s foreign keys reference.
 fn referenced<'h>(history: &'h History, table: &str) -> impl Iterator<Item = String> + 'h {
-    history.references.get(table).into_iter().flatten().cloned()
+    history
+        .references
+        .get(base(table))
+        .into_iter()
+        .flatten()
+        .cloned()
 }
 
 /// `VACUUM FULL [name, ...]` or `VACUUM (FULL, ...) [name, ...]`.
@@ -1961,6 +2003,61 @@ fn a_timeout_set_on_a_conditional_path_does_not_count() {
          PERFORM set_config('lock_timeout', '5s', true);\nEND $$;{lock}"
     );
     assert_eq!(lint_with_history(&[], &after, true), []);
+}
+
+#[test]
+fn a_guarded_create_index_does_not_rewrite_index_history() {
+    // `IF NOT EXISTS` does nothing when the name exists, so the old table stays.
+    let history = ["CREATE INDEX idx_hot ON harvest_events (id);"];
+    let sql = "SET LOCAL lock_timeout = '5s';\n\
+               CREATE INDEX IF NOT EXISTS idx_hot ON harvest_schedules (id);\n\
+               DROP INDEX idx_hot;";
+    let findings = lint_with_history(&history, sql, true);
+    assert_eq!(rules(&findings), [Rule::BlockingIndex], "{findings:?}");
+    assert_eq!(findings[0].line, 3, "{findings:?}");
+}
+
+#[test]
+fn a_conditional_timeout_clear_ends_the_bound() {
+    let sql = "SET LOCAL lock_timeout = '5s';\n\
+               DO $$\nBEGIN\nIF random() > 0.5 THEN\n    \
+               PERFORM set_config('lock_timeout', '0', true);\nEND IF;\nEND $$;\n\
+               ALTER TABLE harvest_events ADD COLUMN x INT;\n";
+    let findings = lint_with_history(&[], sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+}
+
+#[test]
+fn a_conditional_create_table_does_not_make_a_table_new() {
+    let sql = "DO $$\nBEGIN\nIF random() > 0.5 THEN\n    \
+               CREATE TEMP TABLE harvest_events (id INT);\nEND IF;\nEND $$;\n\
+               ALTER TABLE harvest_events ADD COLUMN x INT;\n";
+    let findings = lint_with_history(&[], sql, true);
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.rule == Rule::LockTimeout && f.line == 7),
+        "{findings:?}"
+    );
+}
+
+#[test]
+fn a_new_table_in_another_schema_does_not_exempt_the_hot_table() {
+    let sql = "CREATE TABLE staging.harvest_events (id INT);\n\
+               ALTER TABLE public.harvest_events ADD COLUMN x INT;\n";
+    let findings = lint_with_history(&[], sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+    assert_eq!(findings[0].line, 2, "{findings:?}");
+}
+
+#[test]
+fn a_foreign_key_is_remembered_even_from_a_body_that_may_not_run() {
+    // Remembering a key that never ran fails closed: a later drop is flagged.
+    let history = ["DO $$\nBEGIN\nIF random() > 0.5 THEN\n    \
+                    CREATE TABLE harvest_child (e UUID REFERENCES harvest_events (id));\n\
+                    END IF;\nEND $$;"];
+    let findings = lint_with_history(&history, "DROP TABLE harvest_child;", true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────

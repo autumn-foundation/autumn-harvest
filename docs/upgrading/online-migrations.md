@@ -31,8 +31,10 @@ A waiting `ACCESS EXCLUSIVE` lock on any of them stalls the fleet.
 - `harvest_workflow_outbox`: the application writes it in its own
   transactions, in the application database.
 
-A table that the same migration creates is not hot for that migration. No
-session can hold a lock on it yet.
+A table that the same migration creates is not hot after its `CREATE TABLE`.
+No session can hold a lock on it yet. The exemption needs a create that surely
+runs: not `IF NOT EXISTS`, not inside a branch, and not in a function body.
+The lock must name the table exactly as the create does, schema included.
 
 ## 2. The rules
 
@@ -83,7 +85,8 @@ SET lock_timeout` does not change the current session. Inside a `DO` block,
 `PERFORM set_config('lock_timeout', '5s', true)` also counts. The same call in a
 function body does not count, because the body runs only when something calls
 the function. A setter inside an `IF`, `CASE`, `LOOP` or `EXCEPTION` branch
-does not count either, because the branch may not run.
+does not count either, because the branch may not run. A clear inside a
+branch does count, because the branch may run.
 
 `5s` is the bound that the existing lock-taking migrations use. When the
 timeout fires, the migration fails and rolls back. Run it again.
