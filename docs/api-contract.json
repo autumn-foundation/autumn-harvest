@@ -411,15 +411,441 @@
       "success_response": {
         "status": 200,
         "fields": [
-          "parent_id",
-          "execution",
-          "history",
-          "external_handoffs",
-          "last_completion_result",
-          "last_error",
-          "scheduled_time",
-          "history_truncated",
-          "history_endpoint"
+          {
+            "name": "parent_id",
+            "type": "string",
+            "nullable": true,
+            "required": true,
+            "description": "A UUID."
+          },
+          {
+            "name": "execution",
+            "type": "object",
+            "required": true,
+            "fields": [
+              {
+                "name": "id",
+                "type": "string",
+                "required": true,
+                "description": "A UUID."
+              },
+              {
+                "name": "workflow_name",
+                "type": "string",
+                "required": true
+              },
+              {
+                "name": "workflow_id",
+                "type": "string",
+                "required": true
+              },
+              {
+                "name": "run_id",
+                "type": "string",
+                "required": true,
+                "description": "A UUID."
+              },
+              {
+                "name": "shard_id",
+                "type": "integer",
+                "required": true
+              },
+              {
+                "name": "state",
+                "type": "string",
+                "required": true,
+                "description": "Upper-case state, such as `RUNNING` or `COMPLETED`."
+              },
+              {
+                "name": "input",
+                "type": "any",
+                "required": true
+              },
+              {
+                "name": "output",
+                "type": "any",
+                "required": true
+              },
+              {
+                "name": "error",
+                "type": "string",
+                "nullable": true,
+                "required": true
+              },
+              {
+                "name": "parent_id",
+                "type": "string",
+                "nullable": true,
+                "required": true,
+                "description": "A UUID."
+              },
+              {
+                "name": "sticky_worker_id",
+                "type": "string",
+                "nullable": true,
+                "required": true
+              },
+              {
+                "name": "queue_name",
+                "type": "string",
+                "required": true
+              },
+              {
+                "name": "started_at",
+                "type": "string",
+                "required": true,
+                "description": "RFC 3339 time."
+              },
+              {
+                "name": "completed_at",
+                "type": "string",
+                "nullable": true,
+                "required": true,
+                "description": "RFC 3339 time."
+              },
+              {
+                "name": "execution_timeout",
+                "type": "array",
+                "nullable": true,
+                "required": true,
+                "description": "A duration as [seconds, nanoseconds]."
+              },
+              {
+                "name": "deadline_at",
+                "type": "string",
+                "nullable": true,
+                "required": true,
+                "description": "RFC 3339 time."
+              },
+              {
+                "name": "chain_execution_timeout",
+                "type": "array",
+                "nullable": true,
+                "required": true,
+                "description": "A duration as [seconds, nanoseconds]."
+              },
+              {
+                "name": "chain_deadline_at",
+                "type": "string",
+                "nullable": true,
+                "required": true,
+                "description": "RFC 3339 time."
+              },
+              {
+                "name": "memo",
+                "type": "any",
+                "required": true
+              },
+              {
+                "name": "search_attrs",
+                "type": "any",
+                "required": true
+              },
+              {
+                "name": "created_at",
+                "type": "string",
+                "required": true,
+                "description": "RFC 3339 time."
+              },
+              {
+                "name": "assigned_build_id",
+                "type": "string",
+                "nullable": true,
+                "required": true
+              },
+              {
+                "name": "parent_close_policy",
+                "type": "string",
+                "nullable": true,
+                "required": true
+              },
+              {
+                "name": "owner",
+                "type": "string",
+                "nullable": true,
+                "required": true
+              },
+              {
+                "name": "runbook_url",
+                "type": "string",
+                "nullable": true,
+                "required": true
+              },
+              {
+                "name": "severity",
+                "type": "string",
+                "nullable": true,
+                "required": true
+              },
+              {
+                "name": "paused_at",
+                "type": "string",
+                "nullable": true,
+                "required": true,
+                "description": "RFC 3339 time."
+              },
+              {
+                "name": "pause_reason",
+                "type": "string",
+                "nullable": true,
+                "required": true
+              },
+              {
+                "name": "pause_actor",
+                "type": "string",
+                "nullable": true,
+                "required": true
+              },
+              {
+                "name": "current_details",
+                "type": "string",
+                "nullable": true,
+                "required": true
+              },
+              {
+                "name": "sla",
+                "type": "array",
+                "nullable": true,
+                "required": true,
+                "description": "A duration as [seconds, nanoseconds]."
+              },
+              {
+                "name": "sla_deadline_at",
+                "type": "string",
+                "nullable": true,
+                "required": true,
+                "description": "RFC 3339 time."
+              },
+              {
+                "name": "sla_breached",
+                "type": "boolean",
+                "required": true
+              },
+              {
+                "name": "sla_breached_at",
+                "type": "string",
+                "nullable": true,
+                "required": true,
+                "description": "RFC 3339 time."
+              },
+              {
+                "name": "schedule_id",
+                "type": "string",
+                "nullable": true,
+                "required": true,
+                "description": "A UUID."
+              },
+              {
+                "name": "scheduled_for",
+                "type": "string",
+                "nullable": true,
+                "required": true,
+                "description": "RFC 3339 time."
+              },
+              {
+                "name": "workflow_attempt",
+                "type": "integer",
+                "required": true
+              },
+              {
+                "name": "workflow_retry_policy",
+                "type": "any",
+                "required": true
+              },
+              {
+                "name": "retry_of_exec_id",
+                "type": "string",
+                "nullable": true,
+                "required": true,
+                "description": "A UUID."
+              },
+              {
+                "name": "origin",
+                "type": "string",
+                "nullable": true,
+                "required": true
+              },
+              {
+                "name": "nd_blocked_at",
+                "type": "string",
+                "nullable": true,
+                "required": true,
+                "description": "RFC 3339 time."
+              },
+              {
+                "name": "nd_block_reason",
+                "type": "string",
+                "nullable": true,
+                "required": true
+              },
+              {
+                "name": "nd_block_count",
+                "type": "integer",
+                "required": true
+              },
+              {
+                "name": "completion_callbacks",
+                "type": "any",
+                "required": true
+              },
+              {
+                "name": "continued_from_exec_id",
+                "type": "string",
+                "nullable": true,
+                "required": true,
+                "description": "A UUID."
+              },
+              {
+                "name": "first_exec_id",
+                "type": "string",
+                "nullable": true,
+                "required": true,
+                "description": "A UUID."
+              },
+              {
+                "name": "legal_hold_set_at",
+                "type": "string",
+                "nullable": true,
+                "required": true,
+                "description": "RFC 3339 time."
+              },
+              {
+                "name": "legal_hold_until",
+                "type": "string",
+                "nullable": true,
+                "required": true,
+                "description": "RFC 3339 time."
+              },
+              {
+                "name": "legal_hold_reason",
+                "type": "string",
+                "nullable": true,
+                "required": true
+              },
+              {
+                "name": "legal_hold_actor",
+                "type": "string",
+                "nullable": true,
+                "required": true
+              },
+              {
+                "name": "start_source",
+                "type": "string",
+                "required": true,
+                "description": "How the run started, such as `api` or `schedule`. `unknown` when not recorded."
+              },
+              {
+                "name": "start_source_ref",
+                "type": "string"
+              },
+              {
+                "name": "started_by",
+                "type": "string"
+              },
+              {
+                "name": "history_bloat_warned_at",
+                "type": "string",
+                "description": "RFC 3339 time."
+              },
+              {
+                "name": "triage_note",
+                "type": "string"
+              },
+              {
+                "name": "quota_key",
+                "type": "string"
+              },
+              {
+                "name": "migrated_to_shard",
+                "type": "integer"
+              },
+              {
+                "name": "migrated_at",
+                "type": "string",
+                "description": "RFC 3339 time."
+              },
+              {
+                "name": "migrated_from_shards",
+                "type": "any"
+              },
+              {
+                "name": "migrated_run_terminal_at",
+                "type": "string",
+                "description": "RFC 3339 time."
+              },
+              {
+                "name": "migrated_run_terminal_state",
+                "type": "string"
+              },
+              {
+                "name": "staging_vacated_state",
+                "type": "string"
+              },
+              {
+                "name": "staging_vacated_by",
+                "type": "string",
+                "description": "A UUID."
+              }
+            ],
+            "description": "The execution row."
+          },
+          {
+            "name": "history",
+            "type": "array",
+            "required": true,
+            "items": {
+              "type": "object",
+              "fields": [
+                {
+                  "name": "type",
+                  "type": "string",
+                  "required": true
+                },
+                {
+                  "name": "data",
+                  "type": "object",
+                  "required": true
+                }
+              ]
+            },
+            "description": "The first page of events, at most 100. Each event is `{type, data}`."
+          },
+          {
+            "name": "external_handoffs",
+            "type": "array",
+            "required": true,
+            "description": "Pending external activity hand-offs."
+          },
+          {
+            "name": "last_completion_result",
+            "type": "any"
+          },
+          {
+            "name": "last_error",
+            "type": "string"
+          },
+          {
+            "name": "scheduled_time",
+            "type": "string",
+            "description": "RFC 3339 time."
+          },
+          {
+            "name": "history_truncated",
+            "type": "boolean",
+            "required": true
+          },
+          {
+            "name": "history_endpoint",
+            "type": "string",
+            "required": true,
+            "description": "The path that pages through the full history."
+          },
+          {
+            "name": "legal_hold",
+            "type": "boolean",
+            "required": true,
+            "description": "True when a legal hold blocks erasure and retention."
+          }
         ]
       },
       "error_responses": [
@@ -531,10 +957,27 @@
         "status": 200,
         "note": "Returns 204 No Content with Retry-After: 1 when the execution is still running after the wait window. A CONTINUED_AS_NEW predecessor transparently resolves to the final successor's output rather than returning the sentinel state.",
         "fields": [
-          "state",
-          "output",
-          "error",
-          "completed_at"
+          {
+            "name": "state",
+            "type": "string",
+            "required": true,
+            "description": "Lower-case terminal state, such as `completed` or `failed`."
+          },
+          {
+            "name": "output",
+            "type": "any",
+            "description": "Present for `completed` and `continued_as_new`."
+          },
+          {
+            "name": "error",
+            "type": "string",
+            "description": "Present for a failed outcome that recorded an error."
+          },
+          {
+            "name": "completed_at",
+            "type": "string",
+            "description": "RFC 3339 time."
+          }
         ]
       },
       "additional_responses": [
@@ -1339,21 +1782,83 @@
         "status": 201,
         "note": "Returns 200 when an existing execution is returned via reuse_policy instead of creating a new one. Returns 200 when conflict_policy=use_existing attaches to an ACTIVE (RUNNING/PAUSED) prior (issue #685); returns 201 when conflict_policy=terminate_existing cancels the active prior and starts fresh. When the request sends a conflict_policy field (even 'unspecified'), the response includes started_fresh (true = created a new run, false = attached to the existing run); omitting conflict_policy omits started_fresh so the response is byte-for-byte identical to today. Returns 200 with {..., started_fresh: false, deduplicated: true} when an idempotency_key (issue #808) matched an earlier same-key start (no new execution created); a fresh idempotency_key start returns 201 with {..., started_fresh: true, deduplicated: false}. The `Idempotency-Key` header may supply the key out-of-band instead of the body field. Returns 202 Accepted with {debounced, workflow_name, workflow_id, debounce_key, fire_at, pending_count} (and no execution_id) when the workflow declares a debounce policy whose key resolves (issue #499). Returns 202 Accepted with {batched, flushed, workflow_name, workflow_id, batch_key, fire_at, pending_count, max_size} when the workflow declares a batch policy. When the request supplies an explicit shard_id or residency_key (issue #697), the response echoes the resolved shard_id so an operator can audit placement without decoding the execution_id UUID; unpinned starts omit the field.",
         "fields": [
-          "execution_id",
-          "workflow_name",
-          "workflow_id",
-          "state",
-          "debounced",
-          "debounce_key",
-          "fire_at",
-          "pending_count",
-          "batched",
-          "flushed",
-          "batch_key",
-          "max_size",
-          "started_fresh",
-          "deduplicated",
-          "shard_id"
+          {
+            "name": "execution_id",
+            "type": "string",
+            "required": true,
+            "description": "The execution id, a UUID."
+          },
+          {
+            "name": "workflow_name",
+            "type": "string",
+            "required": true
+          },
+          {
+            "name": "workflow_id",
+            "type": "string",
+            "required": true
+          },
+          {
+            "name": "state",
+            "type": "string",
+            "required": true,
+            "description": "The execution state, such as `RUNNING`. Attach and dedup return the state of the existing run."
+          },
+          {
+            "name": "debounced",
+            "type": "boolean",
+            "description": "Debounce only. The 202 carries it, not this status."
+          },
+          {
+            "name": "debounce_key",
+            "type": "string",
+            "description": "Debounce only. The 202 carries it, not this status."
+          },
+          {
+            "name": "fire_at",
+            "type": "string",
+            "description": "Debounce and batch only. The 202 carries it, not this status."
+          },
+          {
+            "name": "pending_count",
+            "type": "integer",
+            "description": "Debounce and batch only. The 202 carries it, not this status."
+          },
+          {
+            "name": "batched",
+            "type": "boolean",
+            "description": "Present and true when a batch flushed at once. That is a 201."
+          },
+          {
+            "name": "flushed",
+            "type": "boolean",
+            "description": "Present and true when a batch flushed at once. That is a 201."
+          },
+          {
+            "name": "batch_key",
+            "type": "string",
+            "description": "Batch only. The 202 carries it, not this status."
+          },
+          {
+            "name": "max_size",
+            "type": "integer",
+            "description": "Batch only. The 202 carries it, not this status."
+          },
+          {
+            "name": "started_fresh",
+            "type": "boolean",
+            "description": "Present when the request sends `conflict_policy` or an idempotency key."
+          },
+          {
+            "name": "deduplicated",
+            "type": "boolean",
+            "description": "Present on an idempotency-key start. True when an earlier start matched the key."
+          },
+          {
+            "name": "shard_id",
+            "type": "integer",
+            "description": "Present when the request pins `shard_id` or `residency_key`."
+          }
         ]
       },
       "additional_responses": [
@@ -1361,21 +1866,83 @@
           "status": 200,
           "description": "An existing execution was returned instead of a new one being created (reuse_policy, or conflict_policy use_existing).",
           "fields": [
-            "execution_id",
-            "workflow_name",
-            "workflow_id",
-            "state",
-            "debounced",
-            "debounce_key",
-            "fire_at",
-            "pending_count",
-            "batched",
-            "flushed",
-            "batch_key",
-            "max_size",
-            "started_fresh",
-            "deduplicated",
-            "shard_id"
+            {
+              "name": "execution_id",
+              "type": "string",
+              "required": true,
+              "description": "The execution id, a UUID."
+            },
+            {
+              "name": "workflow_name",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "workflow_id",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "state",
+              "type": "string",
+              "required": true,
+              "description": "The execution state, such as `RUNNING`. Attach and dedup return the state of the existing run."
+            },
+            {
+              "name": "debounced",
+              "type": "boolean",
+              "description": "Debounce only. The 202 carries it, not this status."
+            },
+            {
+              "name": "debounce_key",
+              "type": "string",
+              "description": "Debounce only. The 202 carries it, not this status."
+            },
+            {
+              "name": "fire_at",
+              "type": "string",
+              "description": "Debounce and batch only. The 202 carries it, not this status."
+            },
+            {
+              "name": "pending_count",
+              "type": "integer",
+              "description": "Debounce and batch only. The 202 carries it, not this status."
+            },
+            {
+              "name": "batched",
+              "type": "boolean",
+              "description": "Present and true when a batch flushed at once. That is a 201."
+            },
+            {
+              "name": "flushed",
+              "type": "boolean",
+              "description": "Present and true when a batch flushed at once. That is a 201."
+            },
+            {
+              "name": "batch_key",
+              "type": "string",
+              "description": "Batch only. The 202 carries it, not this status."
+            },
+            {
+              "name": "max_size",
+              "type": "integer",
+              "description": "Batch only. The 202 carries it, not this status."
+            },
+            {
+              "name": "started_fresh",
+              "type": "boolean",
+              "description": "Present when the request sends `conflict_policy` or an idempotency key."
+            },
+            {
+              "name": "deduplicated",
+              "type": "boolean",
+              "description": "Present on an idempotency-key start. True when an earlier start matched the key."
+            },
+            {
+              "name": "shard_id",
+              "type": "integer",
+              "description": "Present when the request pins `shard_id` or `residency_key`."
+            }
           ]
         },
         {
@@ -1893,12 +2460,37 @@
         "notes": "Issue #843: the addressed id names the logical run, so this operation is routed to the live attempt of the workflow-level retry chain (#523) -- the deepest execution reachable by following retry_of_exec_id successors from FAILED rows. For a workflow with no retry policy this resolves to the addressed id and is a strict no-op. The returned execution_id reports the attempt actually cancelled, which may differ from the addressed id.",
         "status": 200,
         "fields": [
-          "ok",
-          "execution_id",
-          "state",
-          "reason",
-          "newly_cancelled",
-          "failed_task_count"
+          {
+            "name": "ok",
+            "type": "boolean",
+            "required": true
+          },
+          {
+            "name": "execution_id",
+            "type": "string",
+            "required": true,
+            "description": "The attempt that was stopped. A UUID."
+          },
+          {
+            "name": "state",
+            "type": "string",
+            "required": true
+          },
+          {
+            "name": "reason",
+            "type": "string",
+            "required": true
+          },
+          {
+            "name": "newly_cancelled",
+            "type": "boolean",
+            "required": true
+          },
+          {
+            "name": "failed_task_count",
+            "type": "integer",
+            "required": true
+          }
         ]
       },
       "additional_responses": [
@@ -1906,12 +2498,37 @@
           "status": 202,
           "description": "The cancellation was recorded and the workflow will observe it at its next yield. Same fields as the 200.",
           "fields": [
-            "ok",
-            "execution_id",
-            "state",
-            "reason",
-            "newly_cancelled",
-            "failed_task_count"
+            {
+              "name": "ok",
+              "type": "boolean",
+              "required": true
+            },
+            {
+              "name": "execution_id",
+              "type": "string",
+              "required": true,
+              "description": "The attempt that was stopped. A UUID."
+            },
+            {
+              "name": "state",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "reason",
+              "type": "string",
+              "required": true
+            },
+            {
+              "name": "newly_cancelled",
+              "type": "boolean",
+              "required": true
+            },
+            {
+              "name": "failed_task_count",
+              "type": "integer",
+              "required": true
+            }
           ]
         }
       ],
@@ -1965,12 +2582,37 @@
         "notes": "Issue #843: the addressed id names the logical run, so this operation is routed to the live attempt of the workflow-level retry chain (#523) -- the deepest execution reachable by following retry_of_exec_id successors from FAILED rows. For a workflow with no retry policy this resolves to the addressed id and is a strict no-op. The returned execution_id reports the attempt actually sealed, which may differ from the addressed id.",
         "status": 202,
         "fields": [
-          "ok",
-          "execution_id",
-          "state",
-          "reason",
-          "newly_terminated",
-          "failed_task_count"
+          {
+            "name": "ok",
+            "type": "boolean",
+            "required": true
+          },
+          {
+            "name": "execution_id",
+            "type": "string",
+            "required": true,
+            "description": "The attempt that was stopped. A UUID."
+          },
+          {
+            "name": "state",
+            "type": "string",
+            "required": true
+          },
+          {
+            "name": "reason",
+            "type": "string",
+            "required": true
+          },
+          {
+            "name": "newly_terminated",
+            "type": "boolean",
+            "required": true
+          },
+          {
+            "name": "failed_task_count",
+            "type": "integer",
+            "required": true
+          }
         ]
       },
       "error_responses": [
@@ -2886,9 +3528,22 @@
       "success_response": {
         "status": 202,
         "fields": [
-          "ok",
-          "signal_delivered",
-          "routed_execution_id"
+          {
+            "name": "ok",
+            "type": "boolean",
+            "required": true
+          },
+          {
+            "name": "signal_delivered",
+            "type": "boolean",
+            "required": true,
+            "description": "False for a deduplicated retry."
+          },
+          {
+            "name": "routed_execution_id",
+            "type": "string",
+            "description": "Present when the signal landed on another retry attempt. A UUID."
+          }
         ],
         "notes": "routed_execution_id (issue #843) is present only when the addressed execution id differed from the live workflow-level-retry attempt the signal actually landed on; it is omitted when the signal landed on the addressed execution itself."
       },
@@ -5030,13 +5685,71 @@
       "success_response": {
         "status": 200,
         "fields": [
-          "runtime_ready",
-          "worker_id",
-          "queues",
-          "dag_count",
-          "scheduler",
-          "shard_readiness_enforced",
-          "shard_readiness"
+          {
+            "name": "runtime_ready",
+            "type": "boolean",
+            "required": true
+          },
+          {
+            "name": "worker_id",
+            "type": "string",
+            "nullable": true,
+            "required": true
+          },
+          {
+            "name": "queues",
+            "type": "array",
+            "required": true,
+            "items": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "dag_count",
+            "type": "integer",
+            "required": true
+          },
+          {
+            "name": "scheduler",
+            "type": "object",
+            "required": true,
+            "fields": [
+              {
+                "name": "running",
+                "type": "boolean",
+                "required": true
+              },
+              {
+                "name": "dag_count",
+                "type": "integer",
+                "required": true
+              },
+              {
+                "name": "tick_interval_ms",
+                "type": "integer",
+                "required": true
+              },
+              {
+                "name": "last_tick_at",
+                "type": "string",
+                "nullable": true,
+                "required": true,
+                "description": "RFC 3339 time."
+              }
+            ]
+          },
+          {
+            "name": "shard_readiness_enforced",
+            "type": "boolean",
+            "required": true
+          },
+          {
+            "name": "shard_readiness",
+            "type": "object",
+            "nullable": true,
+            "required": true,
+            "description": "Null when shard readiness is not enforced."
+          }
         ]
       },
       "additional_responses": [
@@ -5044,13 +5757,71 @@
           "status": 503,
           "description": "Shard readiness is enforced and at least one shard is not ready. Same body as the 200; read shard_readiness for the detail.",
           "fields": [
-            "runtime_ready",
-            "worker_id",
-            "queues",
-            "dag_count",
-            "scheduler",
-            "shard_readiness_enforced",
-            "shard_readiness"
+            {
+              "name": "runtime_ready",
+              "type": "boolean",
+              "required": true
+            },
+            {
+              "name": "worker_id",
+              "type": "string",
+              "nullable": true,
+              "required": true
+            },
+            {
+              "name": "queues",
+              "type": "array",
+              "required": true,
+              "items": {
+                "type": "string"
+              }
+            },
+            {
+              "name": "dag_count",
+              "type": "integer",
+              "required": true
+            },
+            {
+              "name": "scheduler",
+              "type": "object",
+              "required": true,
+              "fields": [
+                {
+                  "name": "running",
+                  "type": "boolean",
+                  "required": true
+                },
+                {
+                  "name": "dag_count",
+                  "type": "integer",
+                  "required": true
+                },
+                {
+                  "name": "tick_interval_ms",
+                  "type": "integer",
+                  "required": true
+                },
+                {
+                  "name": "last_tick_at",
+                  "type": "string",
+                  "nullable": true,
+                  "required": true,
+                  "description": "RFC 3339 time."
+                }
+              ]
+            },
+            {
+              "name": "shard_readiness_enforced",
+              "type": "boolean",
+              "required": true
+            },
+            {
+              "name": "shard_readiness",
+              "type": "object",
+              "nullable": true,
+              "required": true,
+              "description": "Null when shard readiness is not enforced."
+            }
           ]
         }
       ],

@@ -60,6 +60,20 @@ const SESSION_SCHEME: &str = "HarvestSessionCookie";
 /// `x-harvest-route-class` value for a route that needs no credential.
 const PUBLIC_SAFE: &str = "public_safe";
 
+/// Routes whose success fields all carry a type (issue #1616).
+///
+/// The published TypeScript client depends on these routes. Each type is
+/// proven against the live handler by `tests/openapi_response_conformance.rs`.
+pub const CORE_CLIENT_ROUTES: &[(&str, &str)] = &[
+    ("POST", "/workflows/{workflow_name}/start"),
+    ("GET", "/workflows/{id}"),
+    ("GET", "/workflows/{id}/result"),
+    ("POST", "/workflows/{id}/signal/{signal_name}"),
+    ("POST", "/workflows/{id}/cancel"),
+    ("POST", "/workflows/{id}/terminate"),
+    ("GET", "/health"),
+];
+
 /// A contract that cannot be transformed into a valid OpenAPI document.
 #[derive(Debug, thiserror::Error)]
 #[error("docs/api-contract.json is not transformable into OpenAPI 3.1: {0}")]
@@ -495,7 +509,12 @@ fn request_body(route: &Value) -> Result<Option<Value>, OpenApiError> {
                 .unwrap_or("Opaque JSON body. See the operation description for its shape."),
         })
     } else {
-        object_schema(fields, None, description)
+        object_schema(
+            fields,
+            None,
+            description,
+            &format!("{method} {path} request"),
+        )?
     };
 
     Ok(Some(json!({
@@ -532,7 +551,10 @@ fn responses(route: &Value) -> Result<Value, OpenApiError> {
         .or_default()
         .push(description_of(success, method, path)?);
     if !is_bodiless(status) {
-        bodies.insert(status, content_for(success));
+        bodies.insert(
+            status,
+            content_for(success, &format!("{method} {path} {status}"))?,
+        );
     }
     if let Some(declared) = response_headers(success) {
         headers.insert(status, declared);
@@ -564,7 +586,10 @@ fn responses(route: &Value) -> Result<Value, OpenApiError> {
                 )));
             }
             if documents_a_body && !is_bodiless(code) && !bodies.contains_key(&code) {
-                bodies.insert(code, content_for(response));
+                bodies.insert(
+                    code,
+                    content_for(response, &format!("{method} {path} {code}"))?,
+                );
             }
             if let Some(declared) = response_headers(response) {
                 headers.entry(code).or_insert(declared);
@@ -677,7 +702,7 @@ fn join_unique(parts: Vec<String>) -> String {
 /// `content_type` is a string, or a list when a route serves the same status in
 /// more than one representation. `GET /admin/queues/scaling-signal` returns
 /// Prometheus text for `format=prometheus` and JSON otherwise.
-fn content_for(response: &Value) -> Value {
+fn content_for(response: &Value, at: &str) -> Result<Value, OpenApiError> {
     let declared = &response["content_type"];
     let media_types: Vec<&str> = match declared {
         Value::String(one) => vec![one.as_str()],
@@ -688,41 +713,46 @@ fn content_for(response: &Value) -> Value {
     for media_type in media_types {
         out.insert(
             media_type.to_owned(),
-            json!({ "schema": success_schema(response, media_type) }),
+            json!({ "schema": success_schema(response, media_type, at)? }),
         );
     }
-    Value::Object(out)
+    Ok(Value::Object(out))
 }
 
 /// The body schema for one response entry.
 ///
 /// A stream response is a sequence of `text/event-stream` frames, not a JSON
 /// document, so it is typed as a string.
-fn success_schema(success: &Value, media_type: &str) -> Value {
+fn success_schema(success: &Value, media_type: &str, at: &str) -> Result<Value, OpenApiError> {
     if media_type.starts_with("text/event-stream") {
-        return json!({
+        return Ok(json!({
             "type": "string",
             "description": "Server-sent event frames. See the response description.",
-        });
+        }));
     }
     if media_type != DEFAULT_MEDIA_TYPE {
-        return json!({
+        return Ok(json!({
             "type": "string",
             "description": "Text body in the declared format. See the response description.",
-        });
+        }));
     }
     // `free_form` with fields is a documented shape plus room to grow. The
     // fields therefore still reach the client. The request side agrees.
     let fields = success["fields"].as_array();
     match fields {
         Some(fields) if !fields.is_empty() => {
-            object_schema(fields, success["field_notes"].as_object(), None)
+            object_schema(fields, success["field_notes"].as_object(), None, at)
         }
-        _ => json!({
+        _ => Ok(json!({
             "description": "Shape is documented in the response description, not as a schema.",
-        }),
+        })),
     }
 }
+
+/// Field types the contract may declare. `any` publishes an open schema.
+const FIELD_TYPES: &[&str] = &[
+    "string", "integer", "number", "boolean", "object", "array", "any",
+];
 
 /// An object schema built from a contract field list.
 ///
@@ -732,23 +762,25 @@ fn success_schema(success: &Value, media_type: &str) -> Value {
 /// additive response fields without a breaking change.
 ///
 /// A field is either a bare name or an object carrying `name`, `description`,
-/// `type` and `required`. Response lists use both forms; request lists use the
-/// object form only.
+/// `type`, `nullable`, `fields`, `items` and `required`. Response lists use
+/// both forms; request lists use the object form only. `at` names the list in
+/// an error.
 fn object_schema(
     fields: &[Value],
     field_notes: Option<&Map<String, Value>>,
     description: Option<&str>,
-) -> Value {
+    at: &str,
+) -> Result<Value, OpenApiError> {
     let mut properties = Map::new();
     let mut required = Vec::new();
     for field in fields {
         let Some(name) = field_name(field) else {
             continue;
         };
-        let mut property = Map::new();
-        if let Some(declared_type) = field["type"].as_str() {
-            property.insert("type".to_owned(), json!(declared_type));
-        }
+        let mut property = match field.as_object() {
+            Some(_) => type_schema(field, &format!("{at}.{name}"))?,
+            None => Map::new(),
+        };
         let note = field_notes
             .and_then(|notes| notes.get(name))
             .and_then(Value::as_str);
@@ -775,7 +807,81 @@ fn object_schema(
     if !required.is_empty() {
         schema.insert("required".to_owned(), Value::Array(required));
     }
-    Value::Object(schema)
+    Ok(Value::Object(schema))
+}
+
+/// The type keywords of one field, or of an array's `items`.
+///
+/// `any` publishes `x-harvest-any`, so a reader can tell a deliberately open
+/// field from one that has no type yet. A bare `object` publishes
+/// `additionalProperties: true`. Without it, `openapi-typescript` emits
+/// `Record<string, never>`, which says the object is empty.
+fn type_schema(spec: &Value, at: &str) -> Result<Map<String, Value>, OpenApiError> {
+    let mut schema = Map::new();
+    let declared = match spec.get("type") {
+        None => None,
+        Some(Value::String(name)) if FIELD_TYPES.contains(&name.as_str()) => Some(name.as_str()),
+        Some(other) => {
+            let shown = other
+                .as_str()
+                .map_or_else(|| other.to_string(), str::to_owned);
+            return Err(OpenApiError(format!(
+                "{at}: type `{shown}` is not one of {FIELD_TYPES:?}. Use `any` for an open value"
+            )));
+        }
+    };
+    let reject = |what: &str| Err(OpenApiError(format!("{at}: {what}")));
+    let nullable = match spec.get("nullable") {
+        None => false,
+        Some(Value::Bool(flag)) => *flag,
+        Some(_) => return reject("`nullable` must be a boolean"),
+    };
+    if nullable && matches!(declared, None | Some("any")) {
+        return reject("`nullable` needs a concrete `type` to pair with `null`");
+    }
+    let fields = spec.get("fields");
+    let items = spec.get("items");
+    if fields.is_some() && declared != Some("object") {
+        return reject("only an `object` field can carry `fields`");
+    }
+    if items.is_some() && declared != Some("array") {
+        return reject("only an `array` field can carry `items`");
+    }
+
+    match declared {
+        None => {}
+        Some("any") => {
+            schema.insert("x-harvest-any".to_owned(), json!(true));
+        }
+        Some(name) => {
+            let published = if nullable {
+                json!([name, "null"])
+            } else {
+                json!(name)
+            };
+            schema.insert("type".to_owned(), published);
+        }
+    }
+    if let Some(fields) = fields {
+        let fields = fields
+            .as_array()
+            .ok_or_else(|| OpenApiError(format!("{at}: `fields` must be an array")))?;
+        let nested = object_schema(fields, None, None, at)?;
+        schema.insert("properties".to_owned(), nested["properties"].clone());
+        if let Some(required) = nested.get("required") {
+            schema.insert("required".to_owned(), required.clone());
+        }
+    } else if declared == Some("object") {
+        schema.insert("additionalProperties".to_owned(), json!(true));
+    }
+    if let Some(items) = items {
+        if !items.is_object() {
+            return reject("`items` must be an object");
+        }
+        let item = type_schema(items, &format!("{at}[]"))?;
+        schema.insert("items".to_owned(), Value::Object(item));
+    }
+    Ok(schema)
 }
 
 /// The name of a contract field, in either of its two forms.
@@ -1090,7 +1196,7 @@ mod tests {
             "free_form": true,
             "content_type": "text/event-stream",
         });
-        let schema = success_schema(&success, "text/event-stream");
+        let schema = success_schema(&success, "text/event-stream", "test").expect("valid");
         assert_eq!(schema["type"], "string");
     }
 
@@ -1100,9 +1206,82 @@ mod tests {
             json!("worker_id"),
             json!({ "name": "queues", "type": "array" }),
         ];
-        let schema = object_schema(&fields, None, None);
+        let schema = object_schema(&fields, None, None, "test").expect("valid");
         assert!(schema["properties"]["worker_id"].is_object());
         assert_eq!(schema["properties"]["queues"]["type"], "array");
+    }
+
+    /// A route whose 200 body has one declared field.
+    fn route_with_field(field: &Value) -> Value {
+        json!({
+            "method": "GET",
+            "path": "/x",
+            "success_response": { "status": 200, "fields": [field] },
+            "error_responses": [],
+        })
+    }
+
+    /// The published schema of field `f` on [`route_with_field`].
+    fn published_field(field: &Value) -> Value {
+        let out = responses(&route_with_field(field)).expect("the field is valid");
+        out["200"]["content"][DEFAULT_MEDIA_TYPE]["schema"]["properties"]["f"].clone()
+    }
+
+    /// issue #1616: OpenAPI 3.1 writes a nullable field as a type pair.
+    #[test]
+    fn a_nullable_field_publishes_a_type_pair() {
+        let field = published_field(&json!({ "name": "f", "type": "string", "nullable": true }));
+        assert_eq!(field["type"], json!(["string", "null"]));
+    }
+
+    /// issue #1616: nested fields give an object field its own properties.
+    #[test]
+    fn an_object_field_publishes_its_nested_fields() {
+        let field = published_field(&json!({
+            "name": "f",
+            "type": "object",
+            "fields": [{ "name": "state", "type": "string", "required": true }],
+        }));
+        assert_eq!(field["type"], "object");
+        assert_eq!(field["properties"]["state"]["type"], "string");
+        assert_eq!(field["required"], json!(["state"]));
+    }
+
+    /// issue #1616: a bare `object` must stay open. Without
+    /// `additionalProperties`, `openapi-typescript` emits
+    /// `Record<string, never>`, which says the object is empty.
+    #[test]
+    fn an_object_field_without_fields_stays_open() {
+        let field = published_field(&json!({ "name": "f", "type": "object" }));
+        assert_eq!(field["additionalProperties"], true);
+    }
+
+    /// issue #1616: a type name outside JSON Schema fails the transform.
+    #[test]
+    fn an_unknown_field_type_is_rejected() {
+        let route = route_with_field(&json!({ "name": "f", "type": "int" }));
+        let error = responses(&route).expect_err("`int` is not a JSON Schema type");
+        assert!(error.to_string().contains("`int`"), "{error}");
+    }
+
+    /// issue #1616: only an `object` field can carry nested fields.
+    #[test]
+    fn nested_fields_on_a_non_object_are_rejected() {
+        let route = route_with_field(&json!({
+            "name": "f",
+            "type": "string",
+            "fields": [{ "name": "x", "type": "string" }],
+        }));
+        let error = responses(&route).expect_err("a string has no fields");
+        assert!(error.to_string().contains("`fields`"), "{error}");
+    }
+
+    /// issue #1616: `nullable` needs a type to pair with `null`.
+    #[test]
+    fn nullable_without_a_type_is_rejected() {
+        let route = route_with_field(&json!({ "name": "f", "nullable": true }));
+        let error = responses(&route).expect_err("nullable needs a type");
+        assert!(error.to_string().contains("`nullable`"), "{error}");
     }
 
     #[test]

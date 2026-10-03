@@ -7545,6 +7545,7 @@ pub const fn management_api_response_fields()
                 "scheduled_time",
                 "history_truncated",
                 "history_endpoint",
+                "legal_hold",
             ]),
         ),
         (

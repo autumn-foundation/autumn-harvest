@@ -835,3 +835,145 @@ async fn served_endpoint_returns_the_document() {
         "the endpoint serves the compiled-in bytes, unchanged"
     );
 }
+
+/// The repository root, resolved from this crate.
+const REPO_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
+
+/// Read a file below the repository root.
+fn repo_file(relative: &str) -> String {
+    let path = format!("{REPO_ROOT}/{relative}");
+    std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {path}: {error}"))
+}
+
+/// Collect each property path below `schema` that has no `type`. A field
+/// marked `x-harvest-any` is open by declaration, so it counts as typed.
+fn untyped_properties(schema: &Value, prefix: &str, out: &mut Vec<String>) {
+    for (name, property) in schema["properties"].as_object().into_iter().flatten() {
+        let path = format!("{prefix}.{name}");
+        if property.get("type").is_none() && property["x-harvest-any"] != true {
+            out.push(path.clone());
+        }
+        untyped_properties(property, &path, out);
+        if let Some(items) = property.get("items") {
+            untyped_properties(items, &format!("{path}[]"), out);
+        }
+    }
+}
+
+/// Issue #1616: the published client types every success field of the core
+/// routes. A field without a type would reach consumers as `unknown`.
+#[test]
+fn core_client_routes_type_every_response_field() {
+    use autumn_harvest_plugin::openapi::CORE_CLIENT_ROUTES;
+
+    let mut untyped = Vec::new();
+    for (method, path) in CORE_CLIENT_ROUTES {
+        let operation = &document()["paths"][*path][method.to_lowercase()];
+        assert!(
+            operation.is_object(),
+            "{method} {path} is not in the document"
+        );
+        let responses = operation["responses"].as_object().expect("responses");
+        let mut typed_success = false;
+        for (status, response) in responses {
+            if !status.starts_with('2') {
+                continue;
+            }
+            let schema = &response["content"]["application/json"]["schema"];
+            if schema.is_null() {
+                continue;
+            }
+            typed_success = true;
+            untyped_properties(schema, &format!("{method} {path} {status}"), &mut untyped);
+        }
+        assert!(typed_success, "{method} {path} has no JSON success body");
+    }
+    assert!(
+        untyped.is_empty(),
+        "core client routes need a `type` on every field:\n{untyped:#?}"
+    );
+}
+
+/// Issue #1616: the client package version is the crate version, so a
+/// consumer can match a client to a server.
+#[test]
+fn the_client_package_version_matches_the_crate() {
+    let manifest: Value = serde_json::from_str(&repo_file("clients/typescript/package.json"))
+        .expect("clients/typescript/package.json is JSON");
+    assert_eq!(
+        manifest["version"],
+        env!("CARGO_PKG_VERSION"),
+        "update `version` in clients/typescript/package.json with the crate version"
+    );
+    assert_eq!(manifest["name"], "autumn-harvest-client");
+}
+
+/// The block of workflow `yaml` that belongs to the top-level job `job`.
+///
+/// A check on the block, not the file, fails when a step moves to another job.
+fn job_block<'a>(yaml: &'a str, job: &str) -> &'a str {
+    let header = format!("\n  {job}:\n");
+    let start = yaml
+        .find(&header)
+        .unwrap_or_else(|| panic!("the workflow has no `{job}` job"))
+        + 1;
+    let body = start + header.len() - 1;
+    let end = yaml[body..]
+        .match_indices('\n')
+        .map(|(at, _)| body + at + 1)
+        .find(|&line| is_job_header(&yaml[line..]))
+        .unwrap_or(yaml.len());
+    &yaml[start..end]
+}
+
+/// True when the first line of `rest` opens a top-level job.
+fn is_job_header(rest: &str) -> bool {
+    let line = rest.lines().next().unwrap_or_default();
+    line.starts_with("  ") && !line.starts_with("   ") && line.trim_end().ends_with(':')
+}
+
+#[test]
+fn job_block_stops_at_the_next_job() {
+    let yaml = "jobs:\n  a:\n    steps:\n      - run: one\n  b:\n    steps:\n      - run: two\n";
+    assert_eq!(job_block(yaml, "a"), "  a:\n    steps:\n      - run: one\n");
+    assert_eq!(job_block(yaml, "b"), "  b:\n    steps:\n      - run: two\n");
+}
+
+/// Issue #1616: the release job builds the client before it creates the
+/// release, and attaches the tarball.
+#[test]
+fn the_release_pipeline_builds_and_attaches_the_client() {
+    let release = repo_file(".github/workflows/release.yml");
+    let job = job_block(&release, "release");
+    let build = job
+        .find("scripts/build-typescript-client.sh")
+        .expect("the release job must run scripts/build-typescript-client.sh");
+    let create = job
+        .find("softprops/action-gh-release")
+        .expect("the release job must create the GitHub release");
+    assert!(
+        build < create,
+        "the client must build before the release exists"
+    );
+    assert!(
+        job[create..].contains("files: ${{ steps.client.outputs.tarball }}"),
+        "the release step must attach the client tarball"
+    );
+    assert!(
+        job[..create].contains("autumn-harvest-client-${version}.tgz"),
+        "the release job must check the tarball name against the version"
+    );
+}
+
+/// Issue #1616: CI builds the client with no running app, so a break shows
+/// before the release.
+#[test]
+fn ci_builds_the_client_package() {
+    let ci = repo_file(".github/workflows/ci.yml");
+    let job = job_block(&ci, "typescript-client-package");
+    assert!(job.contains("scripts/build-typescript-client.sh"));
+    assert!(
+        !job.contains("services:"),
+        "the client build must need no database or app"
+    );
+}

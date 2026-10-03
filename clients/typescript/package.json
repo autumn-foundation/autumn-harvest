@@ -1,0 +1,43 @@
+{
+  "name": "autumn-harvest-client",
+  "version": "0.6.0",
+  "description": "Typed TypeScript client for the Harvest management API, generated from docs/openapi.json (issue #1616).",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/autumn-foundation/autumn-harvest.git",
+    "directory": "clients/typescript"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "generate": "openapi-typescript ../../docs/openapi.json -o src/harvest-api.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test test/*.test.ts",
+    "build": "rm -rf dist && tsc -p tsconfig.build.json"
+  },
+  "dependencies": {
+    "openapi-fetch": "^0.13.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.1",
+    "openapi-typescript": "^7.4.4",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
