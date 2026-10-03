@@ -64,7 +64,8 @@ These statements take a blocking lock for `lock-timeout`:
   takes `SHARE ROW EXCLUSIVE` on the table it references;
 - `DROP TABLE`, or `ALTER TABLE ... DROP CONSTRAINT`, on a table with a foreign
   key to a hot table. Postgres drops the key's triggers on the hot table too,
-  under `ACCESS EXCLUSIVE`;
+  under `ACCESS EXCLUSIVE`. `DROP COLUMN` and a column type change count too,
+  because they drop or rebuild the key;
 - `CREATE TABLE ... PARTITION OF` a hot table, which locks the parent;
 - a plain `CREATE INDEX` (`SHARE`), `DROP INDEX` (`ACCESS EXCLUSIVE`) or
   `REINDEX`.
@@ -235,7 +236,8 @@ that no longer matches a finding also fails the build.
 - The lint does not see SQL that `EXECUTE` builds from a string. For
   example, `20261001190405` drops an index on `harvest_audit_log` that way.
 - The lint scans a dollar-quoted string as code. A statement inside one can
-  fail the lint. That error is on the safe side.
+  fail the lint. That error is on the safe side. A single-quoted `DO` body is
+  code too.
 - Every `ALTER TABLE` form counts as a blocking lock. Some forms, such as
   `VALIDATE CONSTRAINT`, take a weaker lock. Set the timeout anyway.
 - The lint does not check the size of the timeout. Keep it near `5s`.

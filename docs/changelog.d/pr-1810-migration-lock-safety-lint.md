@@ -14,8 +14,9 @@ are the tables that the engine touches on every claim or workflow step, plus
   force. A later `RESET` or zero value ends the bound. Table DDL, `LOCK`,
   `TRUNCATE`, `CLUSTER`, `VACUUM FULL` and plain index DDL count. Trigger,
   policy, rule and `ALTER INDEX` DDL count. A foreign key `REFERENCES` and
-  `PARTITION OF` count. Dropping a table or constraint whose foreign key
-  references a hot table counts too.
+  `PARTITION OF` count. Dropping a table, constraint or column whose foreign
+  key references a hot table counts too, and so does a type change of that
+  column.
 - `blocking-index`: `CREATE INDEX`, `DROP INDEX` and `REINDEX` need
   `CONCURRENTLY`. An `ADD UNIQUE`, `PRIMARY KEY` or `EXCLUDE` constraint
   without `USING INDEX` builds an index, so it counts too.
@@ -25,8 +26,8 @@ a transactional migration, a `DO` block, or a file with a second statement.
 Diesel sends each file as one batch, and Postgres runs a batch as one
 implicit transaction.
 
-The lexer skips comments and string literals. It lexes each `DO $$` body on
-its own and scans it as code. The lint reads index and foreign-key history
+The lexer skips comments and string literals. It lexes each `DO` body on its
+own and scans it as code, in dollar quotes or in single quotes. The lint reads index and foreign-key history
 from earlier migrations. A table that the same migration creates is exempt
 from the `CREATE TABLE` on, unless the create has `IF NOT EXISTS`. An index
 that no migration creates counts as hot.

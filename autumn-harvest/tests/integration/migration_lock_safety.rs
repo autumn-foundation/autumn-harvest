@@ -609,7 +609,15 @@ fn lex(
                 if escapes && c == '\\' {
                     if let Some(escaped) = at(i + 1) {
                         line += usize::from(escaped == '\n');
-                        value.push(escaped);
+                        // A whitespace escape must still split words in a
+                        // `DO` body.
+                        value.push(match escaped {
+                            'n' => '\n',
+                            't' => '\t',
+                            'r' => '\r',
+                            'b' | 'f' => ' ',
+                            other => other,
+                        });
                     }
                     i += 2;
                 } else if c == '\'' && at(i + 1) == Some('\'') {
@@ -623,12 +631,18 @@ fn lex(
                     i += 1;
                 }
             }
-            toks.push(Token {
-                tok: Tok::Str(value),
-                line: start_line,
-                depth,
-                runs,
-            });
+            // A `DO` body may be a plain string, so it is code too.
+            if in_do_statement(toks, depth) {
+                let body: Vec<char> = value.chars().collect();
+                lex(&body, start_line, depth + 1, runs, toks, comments);
+            } else {
+                toks.push(Token {
+                    tok: Tok::Str(value),
+                    line: start_line,
+                    depth,
+                    runs,
+                });
+            }
         } else if c == '"' {
             // A quoted identifier keeps its case. `""` is an escaped quote.
             let start_line = line;
@@ -663,14 +677,7 @@ fn lex(
             let body = &chars[body_start..body_end];
             // Only a `DO` body runs now. Any other body, such as a
             // function body or a string, runs later or never.
-            let statement_head = toks
-                .iter()
-                .rev()
-                .filter(|t| t.depth == depth)
-                .take_while(|t| t.tok != Tok::Punct(';'))
-                .last();
-            let body_runs =
-                runs && statement_head.is_some_and(|t| t.tok == Tok::Word("do".to_string()));
+            let body_runs = runs && in_do_statement(toks, depth);
             lex(body, line, depth + 1, body_runs, toks, comments);
             line += body.iter().filter(|c| **c == '\n').count();
             i = (body_end + len).min(chars.len());
@@ -696,6 +703,16 @@ fn lex(
             i += 1;
         }
     }
+}
+
+/// Whether the open statement at `depth` starts with `DO`.
+fn in_do_statement(toks: &[Token], depth: usize) -> bool {
+    toks.iter()
+        .rev()
+        .filter(|t| t.depth == depth)
+        .take_while(|t| t.tok != Tok::Punct(';'))
+        .last()
+        .is_some_and(|t| t.tok == Tok::Word("do".to_string()))
 }
 
 /// The length of a dollar-quote delimiter such as `$$` or `$body$`.
@@ -1444,6 +1461,21 @@ fn rename(s: &Stmts, k: usize, history: &mut History) {
     }
 }
 
+/// Whether the `ALTER TABLE` at `k` may drop or rebuild a foreign key.
+///
+/// `DROP CONSTRAINT` drops one. `DROP [COLUMN]` drops the keys on the column.
+/// A column type change rebuilds them. Each form also changes the key's
+/// triggers on the referenced table.
+fn touches_a_foreign_key(s: &Stmts, k: usize) -> bool {
+    const KEEPS_KEYS: [&str; 4] = ["default", "not", "identity", "expression"];
+    (k..s.end(k)).any(|j| {
+        let drops = s.is(j, "drop") && !KEEPS_KEYS.iter().any(|w| s.is(j + 1, w));
+        let retypes = s.is(j, "type")
+            && (s.is(j - 1, "data") || s.is(j - 2, "column") || s.is(j - 2, "alter"));
+        drops || retypes
+    })
+}
+
 /// Remember `child` as hot when its `parent` is hot.
 ///
 /// The lint learns it even from a branch that may not run. A wrong guess only
@@ -1490,7 +1522,7 @@ fn alter(s: &Stmts, k: usize, history: &History, raws: &mut Vec<Raw>) {
                     kind: Kind::Index { concurrent: false },
                 });
             }
-            if s.has_pair(k, "drop", "constraint") {
+            if touches_a_foreign_key(s, k) {
                 raws.extend(
                     referenced(history, &table)
                         .map(|t| Raw::lock(k, "ALTER TABLE DROP CONSTRAINT", Some(t))),
@@ -2294,6 +2326,12 @@ fn dropping_a_foreign_key_locks_the_table_it_references() {
     for sql in [
         "DROP TABLE harvest_child;",
         "ALTER TABLE harvest_child DROP CONSTRAINT harvest_child_exec_id_fkey;",
+        // A dropped column takes its foreign key along. A type change rebuilds
+        // the key.
+        "ALTER TABLE harvest_child DROP COLUMN exec_id;",
+        "ALTER TABLE harvest_child DROP exec_id;",
+        "ALTER TABLE harvest_child ALTER COLUMN exec_id TYPE TEXT;",
+        "ALTER TABLE harvest_child ALTER exec_id SET DATA TYPE TEXT;",
     ] {
         let findings = lint_with_history(&history, sql, true);
         assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}: {findings:?}");
@@ -2307,6 +2345,9 @@ fn dropping_a_foreign_key_locks_the_table_it_references() {
         lint_with_history(&history, "DROP TABLE harvest_schedules;", true),
         []
     );
+    // A column default or nullability change leaves the key alone.
+    let sql = "ALTER TABLE harvest_child ALTER COLUMN exec_id DROP NOT NULL;";
+    assert_eq!(lint_with_history(&history, sql, true), []);
 }
 
 #[test]
@@ -3036,6 +3077,23 @@ fn a_partition_of_a_hot_table_is_hot() {
     let cold = ["CREATE TABLE sched_p PARTITION OF harvest_schedules FOR VALUES FROM (1) TO (2);"];
     let findings = lint_with_history(&cold, "CREATE INDEX idx_x ON sched_p (id);", true);
     assert_eq!(findings, []);
+}
+
+#[test]
+fn a_single_quoted_do_body_is_scanned_as_code() {
+    for sql in [
+        "DO 'BEGIN ALTER TABLE harvest_events ADD COLUMN note TEXT; END';",
+        "DO LANGUAGE plpgsql 'BEGIN ALTER TABLE harvest_events ADD COLUMN note TEXT; END';",
+        "DO E'BEGIN\\nALTER TABLE harvest_events ADD COLUMN note TEXT;\\nEND';",
+        // A doubled quote inside the body is one quote.
+        "DO 'BEGIN RAISE NOTICE ''x''; ALTER TABLE harvest_events ADD COLUMN note TEXT; END';",
+    ] {
+        let findings = lint_with_history(&[], sql, true);
+        assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}: {findings:?}");
+    }
+    // A string that is not a `DO` body stays a string.
+    let sql = "SELECT 'ALTER TABLE harvest_events ADD COLUMN note TEXT';";
+    assert_eq!(lint_with_history(&[], sql, true), []);
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────
