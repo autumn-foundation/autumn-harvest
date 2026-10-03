@@ -18,6 +18,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use autumn_harvest::partition::{LEGACY_PARTITION, PARTITION_PREFIX};
+
 use super::ci_run_coverage::{NO_FULL_RUN_FLAGS, SHELL_OPERATORS, parse_workflow, ungated};
 
 /// The last migration this lint does not bind, inclusive.
@@ -210,8 +212,15 @@ struct History {
 
 impl History {
     /// Whether `table` is hot: a listed table, or a partition of a hot table.
+    ///
+    /// The partition manager creates `harvest_events` partitions at run time,
+    /// so no migration names them. Their names come from `partition.rs`.
     fn is_hot(&self, table: &str) -> bool {
-        HOT_TABLES.contains(&base(table)) || self.partitions.contains(base(table))
+        let name = base(table);
+        HOT_TABLES.contains(&name)
+            || self.partitions.contains(name)
+            || name.starts_with(PARTITION_PREFIX)
+            || name == LEGACY_PARTITION
     }
 
     /// The table of index `name`. A hot table wins when the name is ambiguous.
@@ -949,12 +958,16 @@ impl<'a> Stmts<'a> {
     /// The table a `CREATE TABLE` or `ALTER TABLE` statement at `start` names.
     fn statement_table(&self, start: usize) -> Option<String> {
         let mut j = start + 1;
-        if self.is(start, "create")
-            && ["temp", "temporary", "unlogged"]
+        if self.is(start, "create") {
+            if self.is(j, "global") || self.is(j, "local") {
+                j += 1;
+            }
+            if ["temp", "temporary", "unlogged"]
                 .iter()
                 .any(|w| self.is(j, w))
-        {
-            j += 1;
+            {
+                j += 1;
+            }
         }
         if !(self.is(start, "create") || self.is(start, "alter")) || !self.is(j, "table") {
             return None;
@@ -1102,23 +1115,29 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
 ///
 /// The range starts at the `CREATE TABLE`. It ends at the first later
 /// `DROP TABLE` or `ALTER TABLE ... RENAME TO` of that name, or at any later
-/// `ROLLBACK`, which may undo the create. After that the name can mean the
-/// hot table again.
+/// `ROLLBACK`, which may undo the create. A `search_path` change ends the
+/// range of an unqualified name. After that the name can mean the hot table
+/// again.
 fn new_table_spans(
     s: &Stmts,
     created: &BTreeMap<String, usize>,
 ) -> BTreeMap<String, (usize, usize)> {
     let toks = s.toks;
-    let mut ends: Vec<(Option<String>, usize)> = Vec::new();
+    let mut ends: Vec<(SpanEnd, usize)> = Vec::new();
     for k in (0..toks.len()).filter(|&k| s.starts[k] == k) {
         if s.is(k, "rollback") || s.is(k, "abort") {
-            ends.push((None, k));
+            ends.push((SpanEnd::All, k));
         } else if s.is(k, "drop") && s.is(k + 1, "table") {
             for name in s.name_list(s.skip_if_exists(k + 2)) {
-                ends.push((Some(name), k));
+                ends.push((SpanEnd::Name(name), k));
             }
         } else if s.is(k, "alter") && s.has_pair(k, "rename", "to") {
-            ends.push((s.statement_table(k), k));
+            // A rename of anything but a table, such as a schema, may move
+            // every new table.
+            let end = s.statement_table(k).map_or(SpanEnd::All, SpanEnd::Name);
+            ends.push((end, k));
+        } else if changes_search_path(s, k) {
+            ends.push((SpanEnd::Unqualified, k));
         }
     }
     created
@@ -1126,13 +1145,48 @@ fn new_table_spans(
         .map(|(name, &from)| {
             let to = ends
                 .iter()
-                .filter(|(n, at)| *at > from && n.as_ref().is_none_or(|n| n == name))
+                .filter(|(end, at)| *at > from && end.ends(name))
                 .map(|(_, at)| *at)
                 .min()
                 .unwrap_or(usize::MAX);
             (name.clone(), (from, to))
         })
         .collect()
+}
+
+/// What a statement ends in `new_table_spans`.
+enum SpanEnd {
+    /// Every new table, as after a `ROLLBACK`.
+    All,
+    /// The new table of this exact name.
+    Name(String),
+    /// Every new table without a schema in its name.
+    Unqualified,
+}
+
+impl SpanEnd {
+    fn ends(&self, name: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Name(n) => n == name,
+            Self::Unqualified => !name.contains('.'),
+        }
+    }
+}
+
+/// Whether the statement at `k` may change `search_path`.
+///
+/// `SET`, `RESET` and a `set_config` call count, wherever they sit.
+fn changes_search_path(s: &Stmts, k: usize) -> bool {
+    let set = s.is(k, "set")
+        && (s.is(k + 1, "search_path")
+            || ((s.is(k + 1, "local") || s.is(k + 1, "session")) && s.is(k + 2, "search_path")));
+    let reset = s.is(k, "reset") && (s.is(k + 1, "search_path") || s.is(k + 1, "all"));
+    let call = (k..s.end(k)).any(|j| s.is(j, "set_config"))
+        && (k..s.end(k)).any(|j| {
+            matches!(&s.toks[j].tok, Tok::Str(v) if v.trim().eq_ignore_ascii_case("search_path"))
+        });
+    set || reset || call
 }
 
 /// Resolve each statement's table against the history, in source order.
@@ -1350,9 +1404,12 @@ fn create(s: &Stmts, k: usize, raws: &mut Vec<Raw>, created: &mut BTreeMap<Strin
         raws.push(Raw::lock(k, verb, s.name_after(j, keyword)));
         return;
     }
+    // A temporary table never counts. `ON COMMIT DROP` or the session end
+    // drops it, and the name then means the hot table again.
+    let temporary = (k + 1..=k + 2).any(|j| s.is(j, "temp") || s.is(j, "temporary"));
     if let Some(table) = s.statement_table(k) {
         let guarded = s.has_pair(k, "not", "exists");
-        if !guarded {
+        if !guarded && !temporary {
             created.entry(table).or_insert(k);
         }
     }
@@ -2414,7 +2471,7 @@ fn using_index_exempts_only_its_own_alter_action() {
 #[test]
 fn a_create_table_in_a_function_body_does_not_make_a_table_new() {
     let sql = "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$\n\
-               BEGIN\n    CREATE TEMP TABLE harvest_events (id INT);\nEND $$;\n\
+               BEGIN\n    CREATE TABLE harvest_events (id INT);\nEND $$;\n\
                ALTER TABLE harvest_events ADD COLUMN x INT;\n";
     let findings = lint_with_history(&[], sql, true);
     assert!(
@@ -2480,7 +2537,7 @@ fn a_conditional_timeout_clear_ends_the_bound() {
 #[test]
 fn a_conditional_create_table_does_not_make_a_table_new() {
     let sql = "DO $$\nBEGIN\nIF random() > 0.5 THEN\n    \
-               CREATE TEMP TABLE harvest_events (id INT);\nEND IF;\nEND $$;\n\
+               CREATE TABLE harvest_events (id INT);\nEND IF;\nEND $$;\n\
                ALTER TABLE harvest_events ADD COLUMN x INT;\n";
     let findings = lint_with_history(&[], sql, true);
     assert!(
@@ -2651,7 +2708,7 @@ fn attach_and_detach_partition_lock_the_partition() {
 fn a_rollback_undoes_a_new_table() {
     for undo in ["ROLLBACK;", "ROLLBACK TO SAVEPOINT s;"] {
         let sql = format!(
-            "BEGIN;\nSAVEPOINT s;\nCREATE TEMP TABLE harvest_events (id INT);\n{undo}\n\
+            "BEGIN;\nSAVEPOINT s;\nCREATE TABLE harvest_events (id INT);\n{undo}\n\
              ALTER TABLE harvest_events ADD COLUMN x INT;"
         );
         let findings = lint_with_history(&[], &sql, false);
@@ -2730,7 +2787,7 @@ fn vacuum_full_only_names_the_table_after_only() {
 #[test]
 fn an_exception_handler_may_undo_its_whole_block() {
     // The handler rolls back the block, so nothing in it surely happens.
-    let create = "DO $$\nBEGIN\n    CREATE TEMP TABLE harvest_events (id INT);\n    \
+    let create = "DO $$\nBEGIN\n    CREATE TABLE harvest_events (id INT);\n    \
                   PERFORM 1 / 0;\nEXCEPTION WHEN others THEN\n    NULL;\nEND $$;\n\
                   ALTER TABLE harvest_events ADD COLUMN x INT;";
     let findings = lint_with_history(&[], create, true);
@@ -2766,7 +2823,7 @@ fn a_new_table_stops_being_new_once_it_is_dropped_or_renamed() {
         "ALTER TABLE harvest_events RENAME TO staged_events;",
     ] {
         let sql = format!(
-            "CREATE TEMP TABLE harvest_events (id INT);\n{gone}\n\
+            "CREATE TABLE harvest_events (id INT);\n{gone}\n\
              ALTER TABLE harvest_events ADD COLUMN x INT;"
         );
         let findings = lint_with_history(&[], &sql, true);
@@ -3094,6 +3151,74 @@ fn a_single_quoted_do_body_is_scanned_as_code() {
     // A string that is not a `DO` body stays a string.
     let sql = "SELECT 'ALTER TABLE harvest_events ADD COLUMN note TEXT';";
     assert_eq!(lint_with_history(&[], sql, true), []);
+}
+
+#[test]
+fn a_runtime_partition_of_harvest_events_is_hot() {
+    // The partition manager creates these at run time, outside any migration.
+    for table in [
+        "harvest_events_p_default",
+        "harvest_events_p_20260901000000",
+        "harvest_events_legacy",
+    ] {
+        let sql = format!("CREATE INDEX idx_x ON {table} (id);");
+        let mut found = rules(&lint_with_history(&[], &sql, true));
+        found.sort();
+        assert_eq!(found, [Rule::LockTimeout, Rule::BlockingIndex], "{table}");
+    }
+}
+
+#[test]
+fn a_search_path_change_ends_an_unqualified_exemption() {
+    // After the change, the same unqualified name can mean the hot table.
+    for change in [
+        "SET search_path = public;",
+        "SET LOCAL search_path TO public;",
+        "RESET search_path;",
+        "RESET ALL;",
+        "SELECT set_config('search_path', 'public', false);",
+    ] {
+        let sql = format!(
+            "SET search_path = scratch;\nCREATE TABLE harvest_events (id INT);\n{change}\n\
+             ALTER TABLE harvest_events ADD COLUMN x INT;"
+        );
+        let findings = lint_with_history(&[], &sql, true);
+        assert_eq!(
+            rules(&findings),
+            [Rule::LockTimeout],
+            "{change}: {findings:?}"
+        );
+    }
+    // A schema-qualified name still names the new table.
+    let sql = "SET search_path = scratch;\nCREATE TABLE scratch.harvest_events (id INT);\n\
+               SET search_path = public;\nALTER TABLE scratch.harvest_events ADD COLUMN x INT;";
+    assert_eq!(lint_with_history(&[], sql, true), []);
+}
+
+#[test]
+fn a_temporary_table_is_never_new() {
+    // `ON COMMIT DROP` or the session end drops it. The name then means the
+    // hot table again.
+    for create in [
+        "CREATE TEMP TABLE harvest_events (id INT) ON COMMIT DROP;",
+        "CREATE TEMPORARY TABLE harvest_events (id INT);",
+        "CREATE GLOBAL TEMPORARY TABLE harvest_events (id INT);",
+        "CREATE LOCAL TEMP TABLE harvest_events (id INT);",
+    ] {
+        let sql = format!("{create}\nCOMMIT;\nALTER TABLE harvest_events ADD COLUMN x INT;");
+        let findings = lint_with_history(&[], &sql, false);
+        assert_eq!(
+            rules(&findings),
+            [Rule::LockTimeout],
+            "{create}: {findings:?}"
+        );
+    }
+    // A global temporary table still records its foreign keys.
+    let history = [
+        "CREATE GLOBAL TEMPORARY TABLE scratch (e UUID REFERENCES harvest_workflow_executions (id));",
+    ];
+    let findings = lint_with_history(&history, "DROP TABLE scratch;", true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────

@@ -34,13 +34,17 @@ A waiting `ACCESS EXCLUSIVE` lock on any of them stalls the fleet.
 A table that the same migration creates is not hot after its `CREATE TABLE`.
 No session can hold a lock on it yet. The exemption needs a create that surely
 runs: not `IF NOT EXISTS`, not inside a branch, and not in a function body.
-The exemption ends at a later `DROP TABLE`, `RENAME TO` or `ROLLBACK`, because
-the name can mean the hot table again.
+A temporary table never counts, because a commit or the session end can drop
+it. The exemption ends at a later `DROP TABLE`, `RENAME TO` or `ROLLBACK`,
+because the name can mean the hot table again. A `search_path` change ends it
+for a name without a schema.
 The lock must name the table exactly as the create does, schema included.
 
 A partition of a hot table is hot too, because it takes the live writes of its
 parent. The lint learns it from `PARTITION OF` or `ATTACH PARTITION` in an
-earlier migration. A detach or a drop does not make it cold again.
+earlier migration. A detach or a drop does not make it cold again. The
+partition manager creates `harvest_events_p_*` and `harvest_events_legacy` at
+run time, so the lint treats those names as hot.
 
 ## 2. The rules
 

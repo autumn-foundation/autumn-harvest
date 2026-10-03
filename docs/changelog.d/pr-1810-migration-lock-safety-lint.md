@@ -8,7 +8,8 @@ set `lock_timeout`. `20260915231809` drops and rebuilds a unique index on
 reads every `up.sql` after `20260914165542`, in the core tree and both plugin
 trees. It needs no database. It enforces two rules on the hot tables. These
 are the tables that the engine touches on every claim or workflow step, plus
-`harvest_audit_log` and `harvest_workflow_outbox`.
+`harvest_audit_log` and `harvest_workflow_outbox`. A partition of a hot table
+is hot too, including the `harvest_events` partitions made at run time.
 
 - `lock-timeout`: every blocking lock needs a non-zero `lock_timeout` in
   force. A later `RESET` or zero value ends the bound. Table DDL, `LOCK`,
@@ -29,7 +30,8 @@ implicit transaction.
 The lexer skips comments and string literals. It lexes each `DO` body on its
 own and scans it as code, in dollar quotes or in single quotes. The lint reads index and foreign-key history
 from earlier migrations. A table that the same migration creates is exempt
-from the `CREATE TABLE` on, unless the create has `IF NOT EXISTS`. An index
+from the `CREATE TABLE` on, unless the create has `IF NOT EXISTS` or makes a
+temporary table. An index
 that no migration creates counts as hot.
 
 **The escape hatch.** `-- lock-safety: allow <rule> #<issue> <reason>`,
