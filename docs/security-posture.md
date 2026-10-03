@@ -41,10 +41,13 @@ See [Fail-closed mutations](#fail-closed-mutations-issue-1802).
 
 ### PublicSafe routes
 
-`GET /health` is the only `PublicSafe` route. Kubernetes liveness/readiness
-probes and load-balancer health checks commonly require this path to be
-reachable without credentials. Exposing it is an explicit product decision; all
+The `PublicSafe` routes are `GET /health`, `GET /health/live`,
+`GET /health/ready` and `GET /openapi.json`. Kubernetes probes and
+load-balancer health checks must reach the health paths without credentials.
+Exposing them is an explicit product decision; all
 other routes should be behind your authentication boundary in production.
+The probe bodies hold only booleans and reason codes. See
+[`operations/kubernetes-probes.md`](operations/kubernetes-probes.md).
 
 ---
 
@@ -221,18 +224,21 @@ HarvestPlugin::new()
 Replace the static token comparison with your actual validation logic (JWT
 verification, database lookup, etc.).
 
-**Unauthenticated `/health` for probe traffic**
+**Unauthenticated health paths for probe traffic**
 
-The `health` handler is internal to the plugin and cannot be re-mounted
-separately. To let load-balancer probes reach `/health` without credentials,
-use a selective middleware that skips auth for that path:
+The health handlers are internal to the plugin and cannot be re-mounted
+separately. To let probes reach them without credentials, use a selective
+middleware that skips auth for those exact paths:
 
 ```rust
 async fn harvest_auth(req: Request, next: Next) -> Response {
     // Exact match — ends_with("/health") would also bypass /workers/health,
     // which is ReadOnly, not PublicSafe. Update the literal if you change
     // the HarvestPlugin mount point.
-    if req.uri().path() == "/api/harvest/health" {
+    if matches!(
+        req.uri().path(),
+        "/api/harvest/health" | "/api/harvest/health/live" | "/api/harvest/health/ready"
+    ) {
         return next.run(req).await;  // allow probe traffic through
     }
     // your bearer or session check here
@@ -245,7 +251,7 @@ HarvestPlugin::new()
 ```
 
 Alternatively, configure your reverse proxy or ingress controller to bypass
-authentication for `GET /api/harvest/health` at the infrastructure layer.
+authentication for the three health paths at the infrastructure layer.
 
 ---
 

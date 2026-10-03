@@ -214,7 +214,8 @@ under any path. It holds these routes:
   route.
 - The Vantage dashboard under `/ui`, unless you call `without_ui()`. Its
   start page is `/ui/workflows`.
-- `GET /openapi.json` and `GET /health`. They need no credential, by design.
+- `GET /openapi.json`, `GET /health`, `GET /health/live` and
+  `GET /health/ready`. They need no credential, by design.
 
 The admin guard is on selected high-impact routes only, for example
 `/workflows/{id}/cancel` and most `/admin` routes. Many routes have no
@@ -362,8 +363,8 @@ fn app(harvest: &HarvestEmbeddingRuntime) -> axum::Router {
 }
 ```
 
-This layer also gates `/health` and `/openapi.json`. Exempt them if a probe or
-a client needs them. The layer accepts only the exact `Bearer ` prefix, so it
+This layer also gates `/openapi.json` and the health paths. Exempt them if a
+probe or a client needs them. The layer accepts only the exact `Bearer ` prefix, so it
 rejects other spellings. To record the operator as the audit actor, set an
 actor extractor through `with_api_state`.
 
@@ -491,15 +492,23 @@ verification.
 
 ## Shut down
 
-Stop the HTTP server first, so that no request reaches a cleared API state.
+When SIGTERM arrives, call `HarvestApiState::begin_draining()` on the state
+you gave to `with_api_state`. `GET /health/ready` then returns `503`, so the
+load balancer stops new traffic while the server still answers.
+
+Stop the HTTP server next, so that no request reaches a cleared API state.
 Then call `HarvestEmbeddingRuntime::stop`. It does these steps, in order:
 
-1. It stops the gate refresh loop.
-2. It stops the runner, which drains the worker up to
+1. It sets the draining flag, if it is not set.
+2. It stops the gate refresh loop.
+3. It stops the runner, which drains the worker up to
    `WorkerConfig::shutdown_timeout`.
-3. It removes the admission globals.
-4. It clears the API state. The routes that need the runtime or the database
+4. It removes the admission globals.
+5. It clears the API state. The routes that need the runtime or the database
    then fail. `GET /health` reports `runtime_ready: false`.
+
+[`operations/kubernetes-probes.md`](operations/kubernetes-probes.md) gives
+the probe and `preStop` settings.
 
 A dropped runtime keeps its background tasks and its process globals. Always
 call `stop()`, also after a server error. A container runtime sends SIGTERM,

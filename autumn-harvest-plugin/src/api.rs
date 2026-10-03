@@ -365,6 +365,8 @@ pub struct HarvestApiState {
     admin_auth_session_key: Arc<Mutex<String>>,
     /// When enabled, `/health` returns 503 until writable shards are ready.
     health_requires_shard_readiness: Arc<Mutex<bool>>,
+    /// Set at shutdown. `/health/ready` then returns 503 (issue #1812).
+    draining: Arc<std::sync::atomic::AtomicBool>,
     /// Default drain deadline offset used when `POST /workers/{id}/drain` omits `deadline_at`.
     /// Set from `WorkerConfig::shutdown_timeout` at startup; defaults to 30 s.
     worker_shutdown_timeout: Arc<Mutex<std::time::Duration>>,
@@ -467,6 +469,7 @@ impl Default for HarvestApiState {
             allow_unauthenticated_mutations: Arc::new(Mutex::new(false)),
             admin_auth_session_key: Arc::new(Mutex::new("user_id".to_string())),
             health_requires_shard_readiness: Arc::new(Mutex::new(false)),
+            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             worker_shutdown_timeout: Arc::new(Mutex::new(std::time::Duration::from_secs(30))),
             workflow_result_notification_urls: Arc::default(),
             workflow_result_max_wait: Arc::new(Mutex::new(std::time::Duration::from_secs(30))),
@@ -1223,12 +1226,20 @@ impl HarvestApiState {
     }
 
     /// Mark this replica as draining (issue #1812).
-    pub fn begin_draining(&self) {}
+    ///
+    /// `GET /health/ready` then returns 503. `GET /health/live` stays 200.
+    /// Both stop paths call this first. An embedder can call it earlier, when
+    /// SIGTERM arrives. [`HarvestApiState::install`] ends the drain.
+    pub fn begin_draining(&self) {
+        self.draining
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
 
     /// Report whether this replica is draining (issue #1812).
     #[must_use]
     pub fn is_draining(&self) -> bool {
-        false
+        // The full path is necessary. Diesel `RunQueryDsl::load` shadows the method.
+        std::sync::atomic::AtomicBool::load(&self.draining, std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Returns `Some(days)` only when explicitly set via [`HarvestApiState::set_audit_retention_days`];
@@ -1410,6 +1421,8 @@ impl HarvestApiState {
 
     /// Install the currently running Harvest runtime snapshot.
     ///
+    /// This ends a drain, so a restarted runtime becomes ready again.
+    ///
     /// # Panics
     ///
     /// Panics if the internal API-state mutex is poisoned.
@@ -1418,6 +1431,8 @@ impl HarvestApiState {
             .runtime
             .lock()
             .expect("harvest api state lock poisoned") = Some(runtime);
+        self.draining
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Install the Harvest storage pool used by management routes.
@@ -5137,6 +5152,9 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
             post(redrive_dead_letters_handler).route_layer(require_admin.clone()),
         )
         .route("/health", get(health))
+        // Kubernetes probes (issue #1812). PublicSafe, like `/health`.
+        .route("/health/live", get(health_live))
+        .route("/health/ready", get(health_ready))
         // No admin gate: a client generator fetches this before it holds any
         // credential. An embedder's own auth middleware still gates it.
         .route("/openapi.json", get(crate::openapi::get_openapi_document))
@@ -6917,6 +6935,8 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("PATCH", "/tasks/{id}"),
         // ── health & admin ────────────────────────────────────────────────────
         ("GET", "/health"),
+        ("GET", "/health/live"),
+        ("GET", "/health/ready"),
         // The published OpenAPI 3.1 document for this router.
         ("GET", "/openapi.json"),
         ("GET", "/admin/preflight"),
@@ -8256,6 +8276,20 @@ pub const fn management_api_response_fields()
                 "scheduler",
                 "shard_readiness_enforced",
                 "shard_readiness",
+            ]),
+        ),
+        ("GET", "/health/live", Some(&["alive", "draining"])),
+        (
+            "GET",
+            "/health/ready",
+            Some(&[
+                "ready",
+                "runtime_ready",
+                "draining",
+                "database_reachable",
+                "shard_readiness_enforced",
+                "shard_readiness",
+                "reasons",
             ]),
         ),
         // The OpenAPI document itself, a free-form JSON object.
@@ -40796,6 +40830,127 @@ async fn health(Extension(api_state): Extension<HarvestApiState>) -> axum::respo
         }),
     )
         .into_response()
+}
+
+/// Upper bound on each readiness database check (issue #1812).
+///
+/// It is below the probe `timeoutSeconds` in
+/// `docs/operations/kubernetes-probes.md`. The replica then answers 503 before
+/// the kubelet stops waiting.
+const READY_DATABASE_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+
+const READY_REASON_RUNTIME_NOT_STARTED: &str = "runtime_not_started";
+const READY_REASON_DRAINING: &str = "draining";
+const READY_REASON_DATABASE_UNREACHABLE: &str = "database_unreachable";
+const READY_REASON_SHARD_NOT_READY: &str = "shard_not_ready";
+
+#[derive(Debug, Serialize)]
+struct HarvestLiveness {
+    alive: bool,
+    draining: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct HarvestReadiness {
+    ready: bool,
+    runtime_ready: bool,
+    draining: bool,
+    /// `None` when an earlier check failed and this check did not run.
+    database_reachable: Option<bool>,
+    shard_readiness_enforced: bool,
+    shard_readiness: Option<ShardHealthReport>,
+    reasons: Vec<&'static str>,
+}
+
+/// `GET /health/live` (issue #1812). It does no I/O and always returns 200.
+async fn health_live(Extension(api_state): Extension<HarvestApiState>) -> Json<HarvestLiveness> {
+    Json(HarvestLiveness {
+        alive: true,
+        draining: api_state.is_draining(),
+    })
+}
+
+/// `GET /health/ready` (issue #1812).
+///
+/// The checks run in order. A failed runtime or drain check skips the
+/// database checks, so a stopping replica does no extra I/O. The probe reads
+/// only the default shard. One bad non-default shard therefore does not
+/// remove every replica from the load balancer.
+async fn health_ready(
+    Extension(api_state): Extension<HarvestApiState>,
+) -> axum::response::Response {
+    let runtime_ready = api_state.runtime().is_ok();
+    let draining = api_state.is_draining();
+    let shard_readiness_enforced = api_state.health_requires_shard_readiness();
+    let mut reasons = Vec::new();
+    if !runtime_ready {
+        reasons.push(READY_REASON_RUNTIME_NOT_STARTED);
+    }
+    if draining {
+        reasons.push(READY_REASON_DRAINING);
+    }
+
+    let mut database_reachable = None;
+    let mut shard_readiness = None;
+    if reasons.is_empty() {
+        let reachable = default_shard_answers(&api_state).await;
+        database_reachable = Some(reachable);
+        if !reachable {
+            reasons.push(READY_REASON_DATABASE_UNREACHABLE);
+        } else if shard_readiness_enforced {
+            let report = tokio::time::timeout(
+                READY_DATABASE_BUDGET,
+                build_shard_health_report(&api_state, None),
+            )
+            .await
+            .ok();
+            if report
+                .as_ref()
+                .is_none_or(|report| report.overall_readiness != ShardReadiness::Ready)
+            {
+                reasons.push(READY_REASON_SHARD_NOT_READY);
+            }
+            shard_readiness = report;
+        }
+    }
+
+    let ready = reasons.is_empty();
+    let status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(HarvestReadiness {
+            ready,
+            runtime_ready,
+            draining,
+            database_reachable,
+            shard_readiness_enforced,
+            shard_readiness,
+            reasons,
+        }),
+    )
+        .into_response()
+}
+
+/// Run `SELECT 1` on the default shard within [`READY_DATABASE_BUDGET`].
+///
+/// The bound covers the pool checkout too. An exhausted pool otherwise
+/// blocks the probe with no limit.
+async fn default_shard_answers(api_state: &HarvestApiState) -> bool {
+    let Ok(pool) = api_state.storage_pool() else {
+        return false;
+    };
+    let check = async {
+        let mut conn = pool.default_pool().get().await.ok()?;
+        diesel::sql_query("SELECT 1").execute(&mut conn).await.ok()
+    };
+    matches!(
+        tokio::time::timeout(READY_DATABASE_BUDGET, check).await,
+        Ok(Some(_))
+    )
 }
 
 pub(crate) async fn load_execution(

@@ -331,12 +331,14 @@ impl HarvestEmbeddingRuntime {
 
     /// Stop the runtime and remove what it published.
     ///
-    /// The order is the `HarvestPlugin` order. The gate refresh stops first.
+    /// The order is the `HarvestPlugin` order. The draining flag is set first,
+    /// so `/health/ready` returns 503 (issue #1812). The gate refresh stops next.
     /// The runner then drains its worker, up to `WorkerConfig::shutdown_timeout`.
     /// The admission globals are cleared only after the runner stops. The API
     /// state is emptied last, so the routes that need the runtime or the
     /// database fail.
     pub async fn stop(self) {
+        self.api_state.begin_draining();
         let metrics = Arc::clone(&self.runner.api_runtime().registry().telemetry().metrics);
         self.gate_refresh.stop().await;
         self.runner.stop().await;

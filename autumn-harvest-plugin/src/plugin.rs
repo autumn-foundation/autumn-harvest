@@ -2264,6 +2264,8 @@ fn harvest_database_url(
 }
 
 async fn stop_harvest_runtime(slot: Arc<Mutex<HarvestRuntimeSlot>>, api_state: HarvestApiState) {
+    // Issue #1812: readiness fails before any in-flight work stops.
+    api_state.begin_draining();
     let runtime = { slot.lock().expect("harvest lock poisoned").runtime.take() };
 
     let Some(runtime) = runtime else {
