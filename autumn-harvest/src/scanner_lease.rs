@@ -310,7 +310,8 @@ pub fn effective_lease_ttl(ttl: Duration, interval: Duration, jitter: f64) -> Du
 /// The `scanner` column of a checker's lease row.
 ///
 /// A checker that scans exactly its lease shard uses the bare scanner name.
-/// Any other scope adds its sorted shard ids, for example `timeout:1,2`. An
+/// Any other scope adds its sorted shard ids, for example `timeout:1,2`. A
+/// long list becomes `timeout:sha256:<hex>`, so the key stays short. An
 /// empty scope counts as shard 0, because the checker then scans shard 0. Two
 /// checkers then share a lease only when they scan the same shards. This
 /// matters when workers share one pool but have different shard assignments.
@@ -321,6 +322,9 @@ pub fn lease_scanner_key(
     lease_shard: crate::types::ShardId,
     scope: &[crate::types::ShardId],
 ) -> String {
+    use sha2::{Digest as _, Sha256};
+    use std::fmt::Write as _;
+
     let mut ids: Vec<i32> = scope.iter().map(|s| s.as_i32()).collect();
     // An empty scope scans shard 0, so it is keyed as shard 0.
     if ids.is_empty() {
@@ -332,8 +336,24 @@ pub fn lease_scanner_key(
         return scanner.as_str().to_owned();
     }
     let ids: Vec<String> = ids.iter().map(i32::to_string).collect();
-    format!("{}:{}", scanner.as_str(), ids.join(","))
+    let ids = ids.join(",");
+    if ids.len() <= MAX_READABLE_SCOPE {
+        return format!("{}:{ids}", scanner.as_str());
+    }
+    // A long list could pass the index row limit, and then every lease
+    // insert fails. A digest keeps the key short and still one per scope.
+    let digest = Sha256::digest(ids.as_bytes());
+    let mut key = format!("{}:sha256:", scanner.as_str());
+    for byte in digest {
+        let _ = write!(key, "{byte:02x}");
+    }
+    key
 }
+
+/// Longest shard list that a lease key spells out (issue #1795).
+///
+/// A longer list is replaced by its SHA-256 digest.
+const MAX_READABLE_SCOPE: usize = 64;
 
 #[cfg(feature = "db")]
 pub use db::ScannerLease;
@@ -675,6 +695,27 @@ mod tests {
             lease_scanner_key(Scanner::Timeout, s(0), &[s(1)]),
             lease_scanner_key(Scanner::Timeout, s(0), &[s(2)]),
             "different scopes must not share a lease"
+        );
+    }
+
+    #[test]
+    fn a_large_scope_gets_a_short_key() {
+        use crate::scanner_health::Scanner;
+        use crate::types::ShardId;
+        let scope = |from: i32| (from..from + 1000).map(ShardId::new).collect::<Vec<_>>();
+        let key = lease_scanner_key(Scanner::Timeout, ShardId::new(0), &scope(1));
+        // The primary key index holds at most about 2.7 kB per row.
+        assert!(key.len() <= 128, "{} bytes", key.len());
+        // Distinct scopes keep distinct keys, and one scope keeps one key.
+        assert_ne!(
+            key,
+            lease_scanner_key(Scanner::Timeout, ShardId::new(0), &scope(2))
+        );
+        let mut reversed = scope(1);
+        reversed.reverse();
+        assert_eq!(
+            key,
+            lease_scanner_key(Scanner::Timeout, ShardId::new(0), &reversed)
         );
     }
 
