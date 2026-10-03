@@ -149,13 +149,28 @@ async fn poll_external_status(ctx: &ActivityContext, task_id: String) -> Result<
 
 An activity that never calls `heartbeat()` or `check_cancellation()` will not
 receive the cooperative cancellation signal.  The worker will wait for the
-configured `cancellation_grace_period` (default 30 s) after triggering the
+configured `cancellation_grace_period` (default 5 s) after triggering the
 cancellation token; if the activity has still not exited by then the worker
 hard-aborts the future.  The activity task is recorded as `FAILED` in the task
 queue.
 
 This means cooperative cancellation is *opt-in*: existing activities continue
 to work unchanged after upgrading.
+
+### Cancellation by a worker drain
+
+A worker drain also cancels running activities, one join window before its
+deadline (issue #1813). The same checks see it: `is_cancelled()` turns true,
+and `heartbeat()` returns `ActivityCancelled`. The drain never aborts the
+handler.
+
+- A handler that returns a retryable error goes back to `PENDING` at once,
+  and a peer runs the next attempt. `previous_failure()` then starts with
+  `worker shutdown:`. The heartbeat details stay, so the next attempt can
+  resume from the last checkpoint.
+- A handler that returns `Ok` completes as usual.
+- A handler that ignores the cancel keeps its claim until it returns or the
+  worker goes stale.
 
 ### `heartbeat_details` across a cancel signal
 
