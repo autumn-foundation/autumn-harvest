@@ -697,7 +697,7 @@ struct TimeoutScanLane {
     /// batch loads them first.
     retry: Vec<(uuid::Uuid, u32)>,
     /// The retried ids of the last loaded batch, with their tries.
-    loaded_retries: Vec<(uuid::Uuid, u32)>,
+    loaded_retries: std::collections::HashMap<uuid::Uuid, u32>,
 }
 
 /// Most passes in a row that try one failing row.
@@ -749,11 +749,7 @@ impl TimeoutScanLane {
 
     /// Tries `id` again on the next pass, unless it has had its tries.
     fn retry(&mut self, id: uuid::Uuid) {
-        let tries = self
-            .loaded_retries
-            .iter()
-            .find(|(loaded, _)| *loaded == id)
-            .map_or(1, |(_, tries)| tries + 1);
+        let tries = self.loaded_retries.get(&id).map_or(1, |tries| tries + 1);
         if tries < MAX_ROW_TRIES {
             self.retry.push((id, tries));
         }
@@ -901,6 +897,18 @@ async fn refill_lane(
     Ok(())
 }
 
+/// The ids of `batch` that its load did not return.
+///
+/// A set keeps this linear, also at a batch of 100,000.
+fn lapsed_ids(batch: &[uuid::Uuid], loaded: impl Iterator<Item = uuid::Uuid>) -> Vec<uuid::Uuid> {
+    let loaded: HashSet<uuid::Uuid> = loaded.collect();
+    batch
+        .iter()
+        .filter(|id| !loaded.contains(id))
+        .copied()
+        .collect()
+}
+
 /// The lanes of other reasons that match `lapsed` now, in scan order.
 ///
 /// `lapsed` holds the ids that stopped matching the reason of lane `index`.
@@ -921,7 +929,8 @@ async fn lapsed_moves(
             .load(conn)
             .await
             .map_err(crate::error::database_error)?;
-        lapsed.retain(|id| !matched.iter().any(|task| task.id == *id));
+        let matched_ids: HashSet<uuid::Uuid> = matched.iter().map(|task| task.id).collect();
+        lapsed.retain(|id| !matched_ids.contains(id));
         moves.extend(matched.iter().map(|task| (other, task.id)));
     }
     Ok(moves)
@@ -976,11 +985,7 @@ pub async fn find_timed_out_tasks_batch(
             .load(conn)
             .await
             .map_err(crate::error::database_error)?;
-        let lapsed: Vec<uuid::Uuid> = batch
-            .iter()
-            .filter(|id| !page.iter().any(|task| task.id == **id))
-            .copied()
-            .collect();
+        let lapsed = lapsed_ids(&batch, page.iter().map(|task| task.id));
         for task in page {
             if seen.insert(task.id) {
                 results.push((task, reason.clone()));
@@ -1004,10 +1009,22 @@ pub async fn find_timed_out_tasks_batch(
         lane.commit_batch(take);
     }
     // A moved row goes first in its new lane's next batch.
-    for (other, id) in moves.into_iter().rev() {
-        let lane = &mut cursor.lanes[other];
-        if !lane.queued.contains(&id) && !lane.retry.iter().any(|(r, _)| *r == id) {
-            lane.queued.push_front(id);
+    if !moves.is_empty() {
+        let mut held: Vec<HashSet<uuid::Uuid>> = cursor
+            .lanes
+            .iter()
+            .map(|lane| {
+                lane.queued
+                    .iter()
+                    .copied()
+                    .chain(lane.retry.iter().map(|(id, _)| *id))
+                    .collect()
+            })
+            .collect();
+        for (other, id) in moves.into_iter().rev() {
+            if held[other].insert(id) {
+                cursor.lanes[other].queued.push_front(id);
+            }
         }
     }
     Ok(results)
@@ -6818,6 +6835,21 @@ mod tests {
     }
 
     #[test]
+    fn lapsed_ids_stay_linear_at_the_largest_batch() {
+        let limit = usize::try_from(MAX_PAGE_ROWS).expect("fits");
+        let batch: Vec<uuid::Uuid> = (0..limit).map(|_| uuid::Uuid::new_v4()).collect();
+        let started = std::time::Instant::now();
+        assert_eq!(lapsed_ids(&batch, batch[1..].iter().copied()), batch[..1]);
+        // A scan of the page per id takes minutes here. A set takes far
+        // less than a second, even in a debug build.
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
     fn a_batch_stays_queued_until_it_loads() {
         let lane = TimeoutScanLane {
             queued: std::collections::VecDeque::from([uuid::Uuid::new_v4()]),
@@ -6844,7 +6876,7 @@ mod tests {
             as_of: Some(chrono::Utc::now()),
             queued: std::collections::VecDeque::from([uuid::Uuid::new_v4()]),
             retry: vec![(uuid::Uuid::new_v4(), 1)],
-            loaded_retries: vec![(uuid::Uuid::new_v4(), 1)],
+            loaded_retries: [(uuid::Uuid::new_v4(), 1)].into(),
         };
         let mid_sweep = cursor.clone();
         // A leader that ran the last tick goes on with its sweep.

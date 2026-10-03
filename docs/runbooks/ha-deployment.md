@@ -172,7 +172,7 @@ The replicas elect one timeout checker per shard with a lease row in
 
 | Column | Meaning |
 |--------|---------|
-| `shard_id`, `scanner` | Primary key. One row per shard and scanner kind. A checker whose shard scope is not just its lease shard adds the scope to the key, for example `timeout:1,2`. Workers on one pool with different `shard_assignments` then each lead their own scope. |
+| `shard_id`, `scanner` | Primary key. One row per shard and scanner kind. A checker whose shard scope is not just its lease shard adds the scope to the key, for example `timeout:1,2`. Workers on one pool with different `shard_assignments` then each lead their own scope. An empty scope counts as shard 0, the shard it scans. |
 | `holder` | The `worker_id` of the replica that runs the scanner now. |
 | `lease_until` | The holder renews this on each tick. After it passes, any replica can take the row. |
 | `epoch` | Counts changes of holder. A renewal by the same holder keeps it. |

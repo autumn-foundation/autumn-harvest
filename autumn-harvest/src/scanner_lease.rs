@@ -310,7 +310,8 @@ pub fn effective_lease_ttl(ttl: Duration, interval: Duration, jitter: f64) -> Du
 /// The `scanner` column of a checker's lease row.
 ///
 /// A checker that scans exactly its lease shard uses the bare scanner name.
-/// Any other scope adds its sorted shard ids, for example `timeout:1,2`. Two
+/// Any other scope adds its sorted shard ids, for example `timeout:1,2`. An
+/// empty scope counts as shard 0, because the checker then scans shard 0. Two
 /// checkers then share a lease only when they scan the same shards. This
 /// matters when workers share one pool but have different shard assignments.
 /// A shared lease there would leave the standbys' shards unscanned.
@@ -321,9 +322,13 @@ pub fn lease_scanner_key(
     scope: &[crate::types::ShardId],
 ) -> String {
     let mut ids: Vec<i32> = scope.iter().map(|s| s.as_i32()).collect();
+    // An empty scope scans shard 0, so it is keyed as shard 0.
+    if ids.is_empty() {
+        ids.push(0);
+    }
     ids.sort_unstable();
     ids.dedup();
-    if ids.is_empty() || ids == [lease_shard.as_i32()] {
+    if ids == [lease_shard.as_i32()] {
         return scanner.as_str().to_owned();
     }
     let ids: Vec<String> = ids.iter().map(i32::to_string).collect();
@@ -670,6 +675,23 @@ mod tests {
             lease_scanner_key(Scanner::Timeout, s(0), &[s(1)]),
             lease_scanner_key(Scanner::Timeout, s(0), &[s(2)]),
             "different scopes must not share a lease"
+        );
+    }
+
+    #[test]
+    fn an_empty_scope_is_keyed_as_the_shard_it_scans() {
+        use crate::scanner_health::Scanner;
+        use crate::types::ShardId;
+        let s = |n| ShardId::new(n);
+        // An empty assignment list scans shard 0, not the lease shard.
+        assert_ne!(
+            lease_scanner_key(Scanner::Timeout, s(5), &[]),
+            lease_scanner_key(Scanner::Timeout, s(5), &[s(5)]),
+            "an empty scope and a shard-5 scope do different work"
+        );
+        assert_eq!(
+            lease_scanner_key(Scanner::Timeout, s(5), &[]),
+            lease_scanner_key(Scanner::Timeout, s(5), &[s(0)])
         );
     }
 

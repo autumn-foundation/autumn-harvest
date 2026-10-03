@@ -120,6 +120,8 @@ Tests run in `scanner_lease_tests` against Postgres 16:
 - A row that moves to the heartbeat lane goes out once, as a heartbeat
   timeout (RED: the schedule-to-close lane also handed it out in the same
   pass).
+- The batch bookkeeping uses sets, so a batch of 100,000 stays linear (RED:
+  26 s to find the lapsed ids of one batch).
 
 Unit tests cover jitter bounds and clamping, the TTL floor and caps, the role
 table, the lease SQL shape, and the batched query shape.
