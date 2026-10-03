@@ -25930,9 +25930,9 @@ impl Drop for PollerGuard {
 
 /// Records one [`DbOp`]'s duration when it drops (issue #1815).
 ///
-/// A guard records an op that a timeout cancels, too. The slowest ops are the
-/// ones most likely to be cancelled, so a plain timer after the `await` would
-/// drop exactly the samples that show saturation.
+/// A guard records an op that a timeout cancels, too. A timeout cancels the
+/// slowest ops first. A plain timer after the `await` would then drop exactly
+/// the samples that show saturation.
 struct DbOpTimer {
     metrics: Arc<dyn crate::telemetry::MetricsRecorder>,
     op: DbOp,
