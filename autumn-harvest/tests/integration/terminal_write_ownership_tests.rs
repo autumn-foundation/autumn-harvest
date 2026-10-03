@@ -279,6 +279,7 @@ async fn persist_workflow_completion_makes_no_terminal_decision_when_the_claim_m
         1,
         "dispatcher-a",
         task.crash_strikes,
+        task.attempt,
         serde_json::json!({"ok": true}),
         None,
         None,
@@ -323,6 +324,7 @@ async fn persist_workflow_failure_makes_no_terminal_decision_when_the_claim_move
         1,
         "dispatcher-a",
         task.crash_strikes,
+        task.attempt,
         "boom",
         None,
         None,
@@ -382,6 +384,7 @@ async fn persist_child_workflow_completion_makes_no_terminal_decision_when_the_c
         1,
         "dispatcher-a",
         task.crash_strikes,
+        task.attempt,
         parent_exec_id,
         serde_json::json!({"ok": true}),
         None,
@@ -432,6 +435,7 @@ async fn persist_child_workflow_failure_makes_no_terminal_decision_when_the_clai
         1,
         "dispatcher-a",
         task.crash_strikes,
+        task.attempt,
         parent_exec_id,
         "boom",
         None,
@@ -486,6 +490,7 @@ async fn check_paused_and_park_makes_no_terminal_decision_when_the_claim_moved()
         task.id,
         "dispatcher-a",
         task.crash_strikes,
+        task.attempt,
         Duration::ZERO,
     )
     .await;
@@ -708,6 +713,7 @@ async fn a_dispatcher_that_still_owns_the_claim_is_released_when_skip_locked_is_
                 1,
                 "dispatcher-a",
                 task.crash_strikes,
+                task.attempt,
                 "boom",
                 None,
                 None,
@@ -731,8 +737,7 @@ async fn a_dispatcher_that_still_owns_the_claim_is_released_when_skip_locked_is_
             // the probe above.
             let released = queue::release_terminal_workflow_claim(
                 &mut conn,
-                ambiguous_task_id,
-                "dispatcher-a",
+                &queue::TaskClaim::new(ambiguous_task_id, "dispatcher-a", task.attempt),
                 task.crash_strikes,
             )
             .await?;
@@ -977,6 +982,7 @@ async fn persist_from_a_requeued_claim_of_the_same_worker_is_rejected_1806() {
         1,
         "same-worker",
         stale.crash_strikes,
+        stale.attempt,
         serde_json::json!({"ok": true}),
         None,
         None,

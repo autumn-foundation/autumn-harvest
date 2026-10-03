@@ -4474,7 +4474,7 @@ pub const fn release_task_for_capability_miss_query(
 /// of the same task and rolling back an `attempt` that belongs to the new
 /// dispatch. `crash_strikes` is the right discriminator because the requeue
 /// that creates the race is what bumps it; the terminal escalation guard
-/// ([`claim_still_held_for_update_query`]) already keys on it.
+/// ([`claim_still_held_for_update`]) already keys on it.
 ///
 /// # Errors
 ///
@@ -4735,19 +4735,6 @@ pub const fn read_capability_miss_state_query() -> &'static str {
        AND worker_id = $2"
 }
 
-/// SQL for [`claim_still_held_for_update`]. Extracted as a `const fn` so its
-/// shape is unit-testable without a database.
-#[must_use]
-pub const fn claim_still_held_for_update_query() -> &'static str {
-    "SELECT id \
-     FROM harvest_task_queue \
-     WHERE id = $1 \
-       AND state = 'RUNNING' \
-       AND worker_id = $2 \
-       AND crash_strikes = $3 \
-     FOR UPDATE SKIP LOCKED"
-}
-
 /// The task's capability-miss counters **as they stand now**, for the
 /// release-vs-escalate decision (issue #804, Codex round-27 P1).
 ///
@@ -4786,65 +4773,65 @@ pub async fn read_capability_miss_state(
         .map(|r| (r.capability_misses, r.capability_miss_workers)))
 }
 
-/// Whether `task_id` is still `RUNNING` under **this exact claim**, taking the
-/// row's lock so the answer stays true until the caller's transaction commits
-/// (issue #804, Codex round-31 P1).
+/// Whether `claim` is still current, with the row lock held until the caller's
+/// transaction ends (issue #804, Codex round-31 P1; issue #1806).
 ///
 /// # Why the claim, not just the worker
 ///
 /// A poison-pill requeue (`poison_pill::requeue_orphan`) sets the row back to
-/// `PENDING` with `worker_id = NULL` and a bumped `crash_strikes`, and dispatch
-/// is concurrent — so the **same** worker can re-claim the row while its
-/// escalation coroutine for the *previous* attempt is still in flight. A guard
-/// on `(state, worker_id)` alone passes in that case and terminally fails the
-/// NEW attempt's task on the OLD attempt's evidence. `crash_strikes` is the
-/// discriminator `poison_pill::quarantine_orphan` itself uses for exactly this,
-/// so the guard is a claim token rather than a worker token.
+/// `PENDING` with `worker_id = NULL` and a bumped `crash_strikes`. A stuck-task
+/// requeue (`requeue_stuck_task`) does the same without the bump. Dispatch is
+/// concurrent, so the **same** worker can re-claim the row while its work for
+/// the previous claim is still in flight. A guard on `(state, worker_id)` passes
+/// in that case and decides for the NEW claim on the OLD claim's evidence.
+///
+/// The guard therefore checks the claim epoch. [`claim_held`] checks
+/// `(state, worker_id, attempt)`, and every claim adds 1 to `attempt`. The
+/// guard also checks `crash_strikes`, the discriminator that
+/// `poison_pill::quarantine_orphan` uses. `docs/architecture.md`, section
+/// "Activity claim epoch", explains why `attempt` is the fencing token.
 ///
 /// # Why `SKIP LOCKED` rather than a blocking wait
 ///
-/// Deadlock avoidance, not throughput. This crate's `harvest_task_queue` lock
-/// order is **execution row → task row**, but `poison_pill::quarantine_orphan`
-/// takes the task row first and then reaches the execution row (through the
-/// dead-letter FK and `fail_owning_workflow`). A blocking `FOR UPDATE` here
-/// would let an escalating dispatcher hold the execution row while waiting for
-/// the task row that a quarantine already holds while waiting for the execution
-/// row — a genuine ABBA cycle, on precisely the pair of paths that race (a
-/// worker whose heartbeat has gone stale escalating a task the reclaimer is
-/// quarantining).
+/// Deadlock avoidance, not throughput. This crate locks `harvest_task_queue`
+/// rows in the order execution row, then task row. But
+/// `poison_pill::quarantine_orphan` takes the task row first and then reaches
+/// the execution row (through the dead-letter FK and `fail_owning_workflow`). A
+/// blocking `FOR UPDATE` here could close an ABBA cycle. An escalating
+/// dispatcher would hold the execution row and wait for the task row. A
+/// quarantine would hold the task row and wait for the execution row. These two
+/// paths do race: a worker whose heartbeat went stale escalates a task that the
+/// reclaimer is quarantining.
 ///
-/// `SKIP LOCKED` removes the waiting edge entirely: this transaction never
-/// blocks on the task row, so it can never be part of a lock cycle. A row
-/// another transaction holds simply reads as "not ours right now", which the
-/// caller treats exactly like a lost claim — it withdraws and releases, and the
-/// escalation is re-decided on the next redelivery. Withdrawing is always the
-/// safe direction.
+/// `SKIP LOCKED` removes the waiting edge. This transaction never blocks on the
+/// task row, so it cannot be part of a lock cycle. A row that another
+/// transaction holds reads as "not ours right now". The caller treats that
+/// exactly like a lost claim: it withdraws and releases, and the escalation is
+/// decided again on the next redelivery. Withdrawing is always the safe
+/// direction.
 ///
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] if the query fails.
 pub async fn claim_still_held_for_update(
     conn: &mut AsyncPgConnection,
-    task_id: Uuid,
-    worker_id: &str,
+    claim: &TaskClaim,
     crash_strikes: i32,
 ) -> HarvestResult<bool> {
-    // Only the row's *existence* matters -- the id is bound, not read back.
-    #[derive(diesel::QueryableByName)]
-    struct IdRow {
-        #[allow(dead_code)]
-        #[diesel(sql_type = diesel::sql_types::Uuid)]
-        id: Uuid,
-    }
+    use crate::schema::harvest_task_queue::dsl;
 
-    let rows: Vec<IdRow> = diesel::sql_query(claim_still_held_for_update_query())
-        .bind::<diesel::sql_types::Uuid, _>(task_id)
-        .bind::<diesel::sql_types::Text, _>(worker_id)
-        .bind::<diesel::sql_types::Integer, _>(crash_strikes)
-        .load(conn)
+    dsl::harvest_task_queue
+        .find(claim.task_id)
+        .filter(claim_held(&claim.worker_id, claim.attempt))
+        .filter(dsl::crash_strikes.eq(crash_strikes))
+        .select(dsl::id)
+        .for_update()
+        .skip_locked()
+        .first::<Uuid>(conn)
         .await
-        .map_err(crate::error::database_error)?;
-    Ok(!rows.is_empty())
+        .optional()
+        .map(|row| row.is_some())
+        .map_err(crate::error::database_error)
 }
 
 /// SQL for [`release_suspended_workflow_claim`]. Extracted as a `const fn` so
@@ -4900,6 +4887,10 @@ pub async fn claim_still_held_for_update(
 /// in place would let an unrelated, already-resolved crash history count
 /// against a task that just proved itself dispatchable.
 ///
+/// Also guards on `attempt = $4` (issue #1806). A stuck-task requeue keeps
+/// `crash_strikes`, so the same worker can re-claim the row with an equal
+/// strike count. Only `attempt` tells the new claim from the old one.
+///
 /// Also clears `timer_fires_at` (issue #1402). This release hands the
 /// row to a fresh dispatch attempt at the current instant, not to
 /// whatever timer last armed it. A stale marker must not outlive it.
@@ -4926,6 +4917,7 @@ const fn release_suspended_workflow_claim_query() -> &'static str {
        AND state = 'RUNNING' \
        AND worker_id = $2 \
        AND crash_strikes = $3 \
+       AND attempt = $4 \
      RETURNING id, queue_name, scheduled_at, priority, task_type"
 }
 
@@ -4964,9 +4956,8 @@ const fn release_suspended_workflow_claim_query() -> &'static str {
 /// Deliberately **not** `FOR UPDATE SKIP LOCKED`: a plain `UPDATE` blocks
 /// behind whatever transiently holds the row instead of skipping it, then
 /// re-evaluates its `WHERE` clause against the row's *post-commit* state. If
-/// ownership genuinely moved in the interim, the guard (`worker_id` +
-/// `crash_strikes`, the same claim token [`claim_still_held_for_update`]
-/// checks) no longer matches and this updates nothing -- the new owner keeps
+/// ownership genuinely moved in the interim, the guard (`worker_id`,
+/// `crash_strikes` and `attempt`, as [`claim_still_held_for_update`] checks) no longer matches and this updates nothing -- the new owner keeps
 /// the row, exactly as if this call were never made. If it did not move, the
 /// row is released, and `wake_requested` is cleared in the very same write so
 /// a wake that landed in the contention window is reconciled rather than
@@ -4986,11 +4977,10 @@ const fn release_suspended_workflow_claim_query() -> &'static str {
 /// Returns [`crate::error::HarvestError::Database`] if the query fails.
 pub async fn release_suspended_workflow_claim(
     conn: &mut AsyncPgConnection,
-    task_id: Uuid,
-    worker_id: &str,
+    claim: &TaskClaim,
     crash_strikes: i32,
 ) -> HarvestResult<bool> {
-    release_workflow_claim_inner(conn, task_id, worker_id, crash_strikes).await
+    release_workflow_claim_inner(conn, claim, crash_strikes).await
 }
 
 /// [`release_suspended_workflow_claim`] under a name that does not imply
@@ -5013,23 +5003,22 @@ pub async fn release_suspended_workflow_claim(
 /// Returns [`crate::error::HarvestError::Database`] if the query fails.
 pub async fn release_terminal_workflow_claim(
     conn: &mut AsyncPgConnection,
-    task_id: Uuid,
-    worker_id: &str,
+    claim: &TaskClaim,
     crash_strikes: i32,
 ) -> HarvestResult<bool> {
-    release_workflow_claim_inner(conn, task_id, worker_id, crash_strikes).await
+    release_workflow_claim_inner(conn, claim, crash_strikes).await
 }
 
 async fn release_workflow_claim_inner(
     conn: &mut AsyncPgConnection,
-    task_id: Uuid,
-    worker_id: &str,
+    claim: &TaskClaim,
     crash_strikes: i32,
 ) -> HarvestResult<bool> {
     let rows: Vec<PendingHintRow> = diesel::sql_query(release_suspended_workflow_claim_query())
-        .bind::<diesel::sql_types::Uuid, _>(task_id)
-        .bind::<diesel::sql_types::Text, _>(worker_id)
+        .bind::<diesel::sql_types::Uuid, _>(claim.task_id)
+        .bind::<diesel::sql_types::Text, _>(&claim.worker_id)
         .bind::<diesel::sql_types::Integer, _>(crash_strikes)
+        .bind::<diesel::sql_types::Integer, _>(claim.attempt)
         .get_results(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -9943,9 +9932,10 @@ mod tests {
             sql.contains("id = $1")
                 && sql.contains("state = 'RUNNING'")
                 && sql.contains("worker_id = $2")
-                && sql.contains("crash_strikes = $3"),
-            "must be guarded on the exact claim token (worker_id AND crash_strikes), \
-             the same pair claim_still_held_for_update checks",
+                && sql.contains("crash_strikes = $3")
+                && sql.contains("attempt = $4"),
+            "must be guarded on the exact claim (worker_id, crash_strikes AND \
+             attempt), as claim_still_held_for_update is (issue #1806)",
         );
         assert!(
             !sql.contains("SKIP LOCKED"),
@@ -10305,34 +10295,6 @@ mod tests {
         );
     }
 
-    /// The commit-boundary guard must hold the row's lock (an unlocked check
-    /// merely narrows the window before an unguarded `fail_task`), must key on
-    /// the CLAIM rather than the worker, and must never WAIT for the lock.
-    #[test]
-    fn commit_boundary_claim_guard_locks_without_waiting_and_keys_on_the_claim() {
-        let sql = claim_still_held_for_update_query();
-        assert!(
-            sql.contains("FOR UPDATE"),
-            "the guard must hold the lock through the caller's transaction, not \
-             just read: {sql}"
-        );
-        assert!(
-            sql.contains("SKIP LOCKED"),
-            "the guard must never WAIT on the task row: `poison_pill` takes task \
-             -> execution while this path takes execution -> task, so a blocking \
-             wait here closes an ABBA cycle: {sql}"
-        );
-        assert!(
-            sql.contains("state = 'RUNNING'") && sql.contains("worker_id = $2"),
-            "the guard must still be scoped to this worker's own claim: {sql}"
-        );
-        assert!(
-            sql.contains("crash_strikes = $3"),
-            "a poison-pill requeue lets the SAME worker re-claim the row, so \
-             (state, worker_id) alone does not identify this attempt: {sql}"
-        );
-    }
-
     #[test]
     fn park_queries_reset_the_capability_miss_counter() {
         // `capability_misses` counts CONSECUTIVE misses: a task a capable
@@ -10487,7 +10449,7 @@ mod tests {
     ///
     /// `crash_strikes` is the discriminator because the requeue that creates
     /// this race is the thing that bumps it. The terminal escalation guard
-    /// ([`claim_still_held_for_update_query`]) already keys on it for exactly
+    /// ([`claim_still_held_for_update`]) already keys on it for exactly
     /// this reason; the release is the far more common path and must match.
     #[test]
     fn capability_miss_release_is_guarded_on_the_claim_epoch() {

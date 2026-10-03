@@ -3053,8 +3053,7 @@ async fn a_dispatcher_that_still_owns_the_claim_is_released_when_skip_locked_is_
             // the probe above.
             let released = queue::release_suspended_workflow_claim(
                 &mut conn,
-                ambiguous_task_id,
-                "dispatcher-a",
+                &queue::TaskClaim::new(ambiguous_task_id, "dispatcher-a", task.attempt),
                 task.crash_strikes,
             )
             .await?;
@@ -3313,8 +3312,7 @@ async fn a_task_row_first_peer_touching_the_execution_row_never_deadlocks_the_re
             // at all while it blocks here.
             queue::release_suspended_workflow_claim(
                 &mut conn,
-                ambiguous_task_id,
-                "dispatcher-a",
+                &queue::TaskClaim::new(ambiguous_task_id, "dispatcher-a", task.attempt),
                 task.crash_strikes,
             )
             .await
