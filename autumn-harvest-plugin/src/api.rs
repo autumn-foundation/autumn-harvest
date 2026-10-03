@@ -40928,9 +40928,16 @@ async fn health_live(Extension(api_state): Extension<HarvestApiState>) -> Json<H
 async fn health_ready(
     Extension(api_state): Extension<HarvestApiState>,
 ) -> axum::response::Response {
+    let shard_readiness_enforced = api_state.health_requires_shard_readiness();
+    let verdict = if api_state.runtime().is_ok() && !api_state.is_draining() {
+        Some(ready_database_verdict(&api_state, shard_readiness_enforced).await)
+    } else {
+        None
+    };
+
+    // Read the state again. A drain or a stop can start during the database await.
     let runtime_ready = api_state.runtime().is_ok();
     let draining = api_state.is_draining();
-    let shard_readiness_enforced = api_state.health_requires_shard_readiness();
     let mut reasons = Vec::new();
     if !runtime_ready {
         reasons.push(READY_REASON_RUNTIME_NOT_STARTED);
@@ -40938,15 +40945,7 @@ async fn health_ready(
     if draining {
         reasons.push(READY_REASON_DRAINING);
     }
-
-    let mut database_reachable = None;
-    let mut shard_readiness = None;
-    if reasons.is_empty() {
-        let verdict = ready_database_verdict(&api_state, shard_readiness_enforced).await;
-        database_reachable = Some(verdict.database_reachable);
-        shard_readiness = verdict.shard_readiness;
-        reasons.extend(verdict.reason);
-    }
+    reasons.extend(verdict.and_then(|verdict| verdict.reason));
 
     let ready = reasons.is_empty();
     let status = if ready {
@@ -40960,9 +40959,9 @@ async fn health_ready(
             ready,
             runtime_ready,
             draining,
-            database_reachable,
+            database_reachable: verdict.map(|verdict| verdict.database_reachable),
             shard_readiness_enforced,
-            shard_readiness,
+            shard_readiness: verdict.and_then(|verdict| verdict.shard_readiness),
             reasons,
         }),
     )
@@ -59902,6 +59901,27 @@ mod health_probe_tests {
         assert!(started.elapsed() < std::time::Duration::from_millis(500));
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(reasons(&body), vec!["database_unreachable"]);
+    }
+
+    /// A drain that starts during the database check still fails the answer.
+    #[tokio::test]
+    async fn a_drain_during_the_database_check_fails_ready() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let api_state = HarvestApiState::new();
+        api_state.install_storage_pool(black_hole_pool(&listener));
+        api_state.install(empty_runtime());
+
+        let request = tokio::spawn({
+            let api_state = api_state.clone();
+            async move { probe(&api_state, "/health/ready").await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        api_state.begin_draining();
+
+        let (status, body) = request.await.unwrap();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["draining"], true, "{body}");
+        assert!(reasons(&body).contains(&"draining".to_string()), "{body}");
     }
 
     /// Liveness does no database I/O, so a hung database cannot slow it.
