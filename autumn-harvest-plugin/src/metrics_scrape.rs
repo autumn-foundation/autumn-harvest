@@ -44,11 +44,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use autumn_harvest::telemetry::{
-    ActivityStatus, ConnectorOutcome, METRIC_LABEL_ACTIVITY, METRIC_LABEL_KIND, METRIC_LABEL_NAME,
-    METRIC_LABEL_OUTCOME, METRIC_LABEL_QUEUE, METRIC_LABEL_REASON, METRIC_LABEL_SHARD,
-    METRIC_LABEL_SLOT_TYPE, METRIC_LABEL_SOURCE, METRIC_LABEL_STATUS, METRIC_LABEL_WORKFLOW,
-    MetricsRecorder, PoisonReason, SlotType, WorkflowStatus,
+    ActivityStatus, ConnectorOutcome, DbOp, METRIC_LABEL_ACTIVITY, METRIC_LABEL_DIMENSION,
+    METRIC_LABEL_KIND, METRIC_LABEL_NAME, METRIC_LABEL_OP, METRIC_LABEL_OUTCOME,
+    METRIC_LABEL_QUEUE, METRIC_LABEL_REASON, METRIC_LABEL_SHARD, METRIC_LABEL_SLOT_TYPE,
+    METRIC_LABEL_SOURCE, METRIC_LABEL_STATUS, METRIC_LABEL_WORKFLOW, MetricsRecorder, PoisonReason,
+    SlotType, WorkflowStatus,
 };
+use autumn_harvest::worker_outlier::OutlierDimension;
 use autumn_web::actuator::{MetricFamily, MetricKind, MetricSample, MetricsSource};
 
 /// Label values keyed to a stable position; label *names* are supplied by
@@ -188,6 +190,15 @@ struct Inner {
     // discards both of them.
     notify_send_failures: Gauge,
     notify_queue_usage: Gauge,
+    // Issue #1815: the DB-pool sampler runs under the same is_enabled() gate,
+    // so its gauges render here too. The poller, outlier and duration
+    // readings back the shipped saturation panels.
+    db_pool_in_use: Gauge,
+    db_pool_idle: Gauge,
+    db_pool_wait: Histogram,
+    db_query_duration: Histogram,
+    worker_pollers: Gauge,
+    worker_outlier: Gauge,
 }
 
 /// In-process aggregator for the built-in Prometheus scrape endpoint
@@ -430,6 +441,42 @@ impl MetricsRecorder for HarvestMetricsRecorder {
         self.0
             .worker_slots_available
             .set(vec![slot_type.as_str().to_owned()], available as f64);
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn record_db_pool(&self, shard: u16, in_use: u64, idle: u64) {
+        self.0
+            .db_pool_in_use
+            .set(vec![shard.to_string()], in_use as f64);
+        self.0
+            .db_pool_idle
+            .set(vec![shard.to_string()], idle as f64);
+    }
+
+    fn record_db_pool_wait(&self, shard: u16, seconds: f64) {
+        self.0
+            .db_pool_wait
+            .observe(vec![shard.to_string()], seconds);
+    }
+
+    fn record_db_query_duration(&self, op: DbOp, seconds: f64) {
+        self.0
+            .db_query_duration
+            .observe(vec![op.as_str().to_owned()], seconds);
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn record_worker_pollers(&self, queue: &str, pollers: u64) {
+        self.0
+            .worker_pollers
+            .set(vec![queue.to_owned()], pollers as f64);
+    }
+
+    fn record_worker_outlier(&self, dimension: OutlierDimension, flagged: bool) {
+        self.0.worker_outlier.set(
+            vec![dimension.as_str().to_owned()],
+            if flagged { 1.0 } else { 0.0 },
+        );
     }
 
     #[allow(clippy::cast_precision_loss)]
@@ -732,6 +779,48 @@ fn push_sampler_adjacent_metrics(families: &mut Vec<MetricFamily>, inner: &Inner
         &[],
         inner.notify_queue_usage.snapshot(),
     );
+    push_gauge(
+        families,
+        "harvest_db_pool_in_use",
+        "Database connections the worker pool lends out now, per shard",
+        &[METRIC_LABEL_SHARD],
+        inner.db_pool_in_use.snapshot(),
+    );
+    push_gauge(
+        families,
+        "harvest_db_pool_idle",
+        "Open database connections idle in the worker pool, per shard",
+        &[METRIC_LABEL_SHARD],
+        inner.db_pool_idle.snapshot(),
+    );
+    push_histogram(
+        families,
+        "harvest_db_pool_wait_duration",
+        "Seconds a caller waits for a pooled connection",
+        &[METRIC_LABEL_SHARD],
+        inner.db_pool_wait.snapshot(),
+    );
+    push_histogram(
+        families,
+        "harvest_db_query_duration",
+        "Seconds one database operation takes",
+        &[METRIC_LABEL_OP],
+        inner.db_query_duration.snapshot(),
+    );
+    push_gauge(
+        families,
+        "harvest_worker_pollers",
+        "Poll loops on this worker that claim from the queue",
+        &[METRIC_LABEL_QUEUE],
+        inner.worker_pollers.snapshot(),
+    );
+    push_gauge(
+        families,
+        "harvest_worker_outlier",
+        "1 when this worker is an outlier against its peers on the dimension",
+        &[METRIC_LABEL_DIMENSION],
+        inner.worker_outlier.snapshot(),
+    );
 }
 
 /// Broker-connector families (issue #944).
@@ -975,6 +1064,42 @@ mod tests {
         let f = family(&families, "harvest_queue_oldest_pending_age");
         assert_eq!(f.kind, MetricKind::Gauge);
         assert_eq!(sample_value(f, &[("queue", "default")]), 12.5);
+    }
+
+    /// Issue #1815: the DB-pool, poller and outlier readings render on the
+    /// built-in endpoint, the two durations as `_count` and `_sum` pairs.
+    #[test]
+    fn saturation_and_outlier_metrics_render_with_bounded_labels() {
+        let recorder = HarvestMetricsRecorder::new();
+        recorder.record_db_pool(2, 3, 5);
+        recorder.record_db_pool_wait(2, 0.5);
+        recorder.record_db_pool_wait(2, 0.25);
+        recorder.record_db_query_duration(DbOp::Claim, 0.125);
+        recorder.record_worker_pollers("email", 1);
+        recorder.record_worker_outlier(OutlierDimension::FailureRatio, true);
+        recorder.record_worker_outlier(OutlierDimension::LatencyP99, false);
+
+        let families = recorder.collect();
+        let in_use = family(&families, "harvest_db_pool_in_use");
+        assert_eq!(in_use.kind, MetricKind::Gauge);
+        assert_eq!(sample_value(in_use, &[("shard", "2")]), 3.0);
+        let idle = family(&families, "harvest_db_pool_idle");
+        assert_eq!(sample_value(idle, &[("shard", "2")]), 5.0);
+        let wait = family(&families, "harvest_db_pool_wait_duration_count");
+        assert_eq!(sample_value(wait, &[("shard", "2")]), 2.0);
+        let wait_sum = family(&families, "harvest_db_pool_wait_duration_sum");
+        assert_eq!(sample_value(wait_sum, &[("shard", "2")]), 0.75);
+        let query = family(&families, "harvest_db_query_duration_count");
+        assert_eq!(sample_value(query, &[("op", "claim")]), 1.0);
+        let pollers = family(&families, "harvest_worker_pollers");
+        assert_eq!(pollers.kind, MetricKind::Gauge);
+        assert_eq!(sample_value(pollers, &[("queue", "email")]), 1.0);
+        let outlier = family(&families, "harvest_worker_outlier");
+        assert_eq!(
+            sample_value(outlier, &[("dimension", "failure_ratio")]),
+            1.0
+        );
+        assert_eq!(sample_value(outlier, &[("dimension", "latency_p99")]), 0.0);
     }
 
     #[test]

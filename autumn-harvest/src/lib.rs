@@ -516,6 +516,8 @@ pub mod wasm_store;
 #[cfg(feature = "db")]
 #[doc(hidden)]
 pub mod worker;
+/// Per-worker outlier (gray-failure) detection (issue #1815).
+pub mod worker_outlier;
 #[cfg(feature = "db")]
 pub mod workers;
 

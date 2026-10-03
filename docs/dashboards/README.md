@@ -103,7 +103,9 @@ lifecycle; workflow health (timeouts / SLA / non-determinism); admission &
 pacing; activities; circuit breakers; queues & workers; timers; schedules &
 triggers; DLQ & quarantine; cache, retention & shards; concurrency & rate
 limits; payloads & offload; webhooks, sessions & queries; and a final
-readiness-checks row of text panels.
+readiness-checks row of text panels. Later rows cover newer subsystems. The
+**Database pool, queries & pollers** row (issue #1815) shows pool saturation,
+DB op latency, pollers per queue and the per-worker gray-failure signal.
 
 ## Alert ↔ Panel Mapping
 
@@ -129,6 +131,9 @@ panel finds the way back to the rule and its runbook section.
 | `harvest_dispatch_dropped_hints` | Cache, retention & shards | Dispatch dropped hints | [runbook](../runbooks/harvest-alerts.md#harvest_dispatch_dropped_hints) |
 | `harvest_notify_send_failures` | Cache, retention & shards | Notify send failures | [runbook](../runbooks/harvest-alerts.md#harvest_notify_send_failures) |
 | `harvest_notify_queue_usage_high` | Cache, retention & shards | Notify queue usage | [runbook](../runbooks/harvest-alerts.md#harvest_notify_queue_usage_high) |
+| `harvest_worker_gray_failure` | Database pool, queries & pollers | Worker outliers (gray failure) | [runbook](../runbooks/harvest-alerts.md#harvest_worker_gray_failure) |
+| `harvest_db_pool_wait_high` | Database pool, queries & pollers | DB pool acquire wait p99 (companion: DB pool connections in use / idle) | [runbook](../runbooks/harvest-alerts.md#harvest_db_pool_wait_high) |
+| `harvest_db_query_latency_high` | Database pool, queries & pollers | DB operation latency p99 by op | [runbook](../runbooks/harvest-alerts.md#harvest_db_query_latency_high) |
 | `harvest_no_compatible_worker` | Readiness checks | Readiness: Build-routing compatibility (text) | [runbook](../runbooks/harvest-alerts.md#harvest_no_compatible_worker) |
 | `harvest_schedule_ha_domination` | Schedules & triggers | Schedule HA fire attempts | [runbook](../runbooks/harvest-alerts.md#harvest_schedule_ha_domination) |
 | `harvest_workflow_failure_rate` | Overview | Workflow failure ratio | [runbook](../runbooks/harvest-alerts.md#harvest_workflow_failure_rate) |
@@ -174,7 +179,7 @@ the API result through your own probe with bounded labels) —
 | `$datasource` | datasource | your Prometheus datasources | every panel |
 | `$workflow` | query, multi + All | `label_values(harvest_workflow_started_total, workflow)` | series carrying a `workflow` label, including `harvest_retention_deleted` (issue #737); series labelled `workflow_type` (history size, continue-as-new, payload metrics) use `workflow_type=~"$workflow"` |
 | `$queue` | query, multi + All | `label_values(harvest_queue_depth, queue)` | series carrying a `queue` label |
-| `$shard` | query, multi + All | `label_values(harvest_dlq_entries, shard)` | **only** series that carry a `shard` label (e.g. `harvest_dlq_entries`, `harvest_shard_stranded_pending`, `harvest_shard_dispatched_total`, the cross-region DR series (`harvest_replication_lag_seconds`, `harvest_replication_lag_bytes`, `harvest_replication_standbys`, `harvest_replication_observable`, `harvest_replication_rpo_known`, `harvest_shard_generation`, `harvest_shard_fenced_total`), and the canary series) |
+| `$shard` | query, multi + All | `label_values(harvest_dlq_entries, shard)` | **only** series that carry a `shard` label (e.g. `harvest_dlq_entries`, `harvest_shard_stranded_pending`, `harvest_shard_dispatched_total`, the cross-region DR series (`harvest_replication_lag_seconds`, `harvest_replication_lag_bytes`, `harvest_replication_standbys`, `harvest_replication_observable`, `harvest_replication_rpo_known`, `harvest_shard_generation`, `harvest_shard_fenced_total`), the DB-pool series (`harvest_db_pool_in_use`, `harvest_db_pool_idle`, `harvest_db_pool_wait_duration_*`), and the canary series) |
 
 Variables are applied per-panel only where the series actually carries the
 label — applying `shard=~"$shard"` to an unlabelled series would silently
@@ -191,8 +196,11 @@ samples the same shared DB-derived value (`harvest_queue_depth`,
 `harvest_admission_gates_active`, `harvest_load_shed_active`, and the
 per-key concurrency / rate-limit gauges) — aggregate with `max`, never `sum`, to avoid replica
 double-counting. **Replica-local** gauges, where each replica owns its own
-value (`harvest_worker_slots_in_use` / `_available`), sum correctly across
-the fleet; the per-replica slot panels legend the `instance` label instead.
+value (`harvest_worker_slots_in_use` / `_available`, `harvest_db_pool_in_use`
+/ `_idle`, `harvest_worker_pollers`), sum correctly across the fleet; the
+per-replica slot panels legend the `instance` label instead.
+`harvest_worker_outlier` is per worker: each worker reports only itself, so
+its panel keeps the `instance` label and never sums it.
 
 ## Lint Validation
 

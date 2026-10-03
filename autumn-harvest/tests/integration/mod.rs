@@ -290,6 +290,8 @@ mod wasm_activities_tests;
 mod webhook_trigger_tests;
 #[cfg(feature = "db")]
 mod with_start_shared_tests;
+#[cfg(feature = "db")]
+mod worker_saturation_metrics_tests;
 mod worker_session_tests;
 mod workflow_backoff_requeue_tests;
 #[cfg(feature = "db")]

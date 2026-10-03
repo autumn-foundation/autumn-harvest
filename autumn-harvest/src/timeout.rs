@@ -4764,8 +4764,46 @@ pub async fn enforce_timeouts_once(
 /// [`crate::shard::connect_or_reuse`].
 // `&Option` because the body forwards `sharded_pool` to many public
 // scanners that take `&Option<ShardedDbPool>`.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::ref_option)]
+#[allow(clippy::too_many_arguments, clippy::ref_option)]
 pub(crate) async fn enforce_timeouts_once_on_conn_shard(
+    conn: &mut AsyncPgConnection,
+    conn_shard: Option<crate::types::ShardId>,
+    metrics: &(dyn MetricsRecorder + Send + Sync),
+    unknown_target_grace_window: Duration,
+    sharded_pool: &Option<crate::shard::ShardedDbPool>,
+    shard_assignments: &[crate::types::ShardId],
+    circuit_breakers: Option<&crate::circuit_breaker::CircuitBreakerRegistry>,
+    max_workflow_history_events: Option<u64>,
+    session_worker_stale_secs: i64,
+    payload_codecs: &crate::payload_codec::PayloadCodecs,
+    codec_rotation_batch_size: i64,
+) -> HarvestResult<usize> {
+    // Issue #1815: one pass is one `scan` op, whether it succeeds or fails.
+    let started = std::time::Instant::now();
+    let result = Box::pin(enforce_timeouts_pass(
+        conn,
+        conn_shard,
+        metrics,
+        unknown_target_grace_window,
+        sharded_pool,
+        shard_assignments,
+        circuit_breakers,
+        max_workflow_history_events,
+        session_worker_stale_secs,
+        payload_codecs,
+        codec_rotation_batch_size,
+    ))
+    .await;
+    metrics.record_db_query_duration(
+        crate::telemetry::DbOp::Scan,
+        started.elapsed().as_secs_f64(),
+    );
+    result
+}
+
+/// The body of one [`enforce_timeouts_once_on_conn_shard`] pass.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::ref_option)]
+async fn enforce_timeouts_pass(
     conn: &mut AsyncPgConnection,
     conn_shard: Option<crate::types::ShardId>,
     metrics: &(dyn MetricsRecorder + Send + Sync),
@@ -5204,6 +5242,7 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
             // bound above only limits a merely-slow acquisition. Without this
             // select, a shutdown request during that wait would still queue
             // behind the full `interval` before this loop noticed it.
+            let wait_started = std::time::Instant::now();
             let get_result = tokio::select! {
                 () = cancel.cancelled() => {
                     tracing::debug!("timeout checker cancelled while acquiring a connection");
@@ -5211,6 +5250,11 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
                 }
                 result = tokio::time::timeout(interval, pool.get()) => result,
             };
+            // Issue #1815: a wait that ends in an error or a timeout counts too.
+            telemetry.metrics.record_db_pool_wait(
+                pool_shard.map_or(0, crate::worker::shard_metric_label),
+                wait_started.elapsed().as_secs_f64(),
+            );
             match get_result {
                 Ok(Ok(mut conn)) => match enforce_timeouts_once_on_conn_shard(
                     &mut conn,

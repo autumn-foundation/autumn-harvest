@@ -20,7 +20,12 @@
 use std::collections::BTreeMap;
 
 use autumn_harvest::worker::DbPool;
-use autumn_harvest::workers::{WorkerFilters, WorkerHealth, WorkerRow, WorkerStatus, list_workers};
+use autumn_harvest::worker_outlier::{
+    OutlierConfig, OutlierDimension, WorkerOutlier, WorkerTaskStats, detect_outliers,
+};
+use autumn_harvest::workers::{
+    WorkerFilters, WorkerHealth, WorkerRow, WorkerStatus, list_workers, load_live_worker_task_stats,
+};
 use chrono::{DateTime, Utc};
 use diesel::sql_types::{BigInt, Nullable};
 use diesel_async::AsyncPgConnection;
@@ -39,6 +44,8 @@ use crate::shard_health::{
 
 const REASON_WORKER_NO_ACTIVE: &str = "worker_no_active";
 const REASON_WORKER_UNHEALTHY_FRACTION: &str = "worker_unhealthy_fraction";
+/// A live worker fails or slows far more than its peers (issue #1815).
+const REASON_WORKER_OUTLIER: &str = "worker_outlier";
 const REASON_DLQ_BACKLOG: &str = "dlq_backlog";
 const REASON_DLQ_RECENT_ENTRY: &str = "dlq_recent_entry";
 const REASON_QUEUE_BACKLOG: &str = "queue_backlog";
@@ -398,6 +405,8 @@ pub struct StatusBundleMerge {
     pub queue_max_backlog_queue: Option<String>,
     /// Stalled-execution count summed across shards (bounded per shard).
     pub stalled_count: i64,
+    /// Live workers that are outliers against their peers (issue #1815).
+    pub worker_outliers: Vec<WorkerOutlier>,
     /// `true` when at least one expected shard could not be inspected in the
     /// bundle pass — the non-shard subsystems cannot assert `healthy` on
     /// incomplete data.
@@ -414,6 +423,8 @@ struct ShardBundle {
     dlq_newest_age_secs: Option<i64>,
     by_queue: BTreeMap<String, i64>,
     stalled_count: i64,
+    /// Task stats of the live workers in this shard (issue #1815).
+    task_stats: Vec<(String, WorkerTaskStats)>,
 }
 
 /// Merge per-shard bundle observations into the cross-shard numbers (pure).
@@ -431,10 +442,19 @@ fn merge_bundle(observations: Vec<ShardObservation<ShardBundle>>) -> StatusBundl
     let mut dlq_newest: Option<i64> = None;
     let mut by_queue: BTreeMap<String, i64> = BTreeMap::new();
     let mut stalled_count = 0i64;
+    // One entry per worker. A multi-shard worker writes the same snapshot to
+    // each shard, so the entry with the most tasks wins.
+    let mut task_stats: BTreeMap<String, WorkerTaskStats> = BTreeMap::new();
 
     for observation in observations {
         for bundle in observation.rows {
             all_workers.extend(bundle.workers);
+            for (worker_id, stats) in bundle.task_stats {
+                let entry = task_stats.entry(worker_id).or_insert(stats);
+                if stats.tasks > entry.tasks {
+                    *entry = stats;
+                }
+            }
             dlq_total += bundle.dlq_total;
             if let Some(age) = bundle.dlq_newest_age_secs {
                 dlq_newest = Some(dlq_newest.map_or(age, |cur| cur.min(age)));
@@ -485,6 +505,9 @@ fn merge_bundle(observations: Vec<ShardObservation<ShardBundle>>) -> StatusBundl
         }
     }
 
+    let fleet: Vec<(String, WorkerTaskStats)> = task_stats.into_iter().collect();
+    let worker_outliers = detect_outliers(&fleet, &OutlierConfig::default());
+
     StatusBundleMerge {
         workers_active,
         workers_draining,
@@ -496,6 +519,7 @@ fn merge_bundle(observations: Vec<ShardObservation<ShardBundle>>) -> StatusBundl
         queue_max_backlog,
         queue_max_backlog_queue,
         stalled_count,
+        worker_outliers,
         incomplete,
         unavailable_shards,
     }
@@ -574,7 +598,7 @@ pub fn build_status_response(
     thresholds: &StatusThresholds,
 ) -> HealthSummaryReport {
     // workers
-    let (workers_status, workers_codes) = classify_workers(
+    let (mut workers_status, mut workers_codes) = classify_workers(
         bundle.workers_active,
         bundle.workers_supposed_running,
         bundle.workers_unhealthy,
@@ -582,6 +606,12 @@ pub fn build_status_response(
         bundle.queue_max_backlog,
         thresholds,
     );
+    // A gray failure (issue #1815) passes the heartbeat check, so it degrades
+    // the workers verdict on its own.
+    if !bundle.worker_outliers.is_empty() {
+        workers_status = worst_status([workers_status, SubsystemStatus::Degraded]);
+        workers_codes.push(REASON_WORKER_OUTLIER.to_string());
+    }
     let workers = make_subsystem(
         "workers",
         workers_status,
@@ -593,6 +623,7 @@ pub fn build_status_response(
             "draining": bundle.workers_draining,
             "unhealthy": bundle.workers_unhealthy,
             "total": bundle.workers_total,
+            "outliers": bundle.worker_outliers,
         }),
     );
 
@@ -801,12 +832,25 @@ async fn gather_bundle(
     let stalled_count =
         count_stalled_candidates(conn, thresholds.stalled_no_progress_minutes, cap).await?;
 
+    // Issue #1815. A failed read loses only the outlier signal, so the shard
+    // still counts as inspected.
+    let stale_secs = i64::try_from(stale_threshold.as_secs())
+        .unwrap_or(i64::MAX)
+        .saturating_add(i64::from(stale_threshold.subsec_nanos() > 0));
+    let task_stats = load_live_worker_task_stats(conn, stale_secs)
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(error = %error, "worker task stats unavailable; outliers skipped");
+            Vec::new()
+        });
+
     Ok(ShardBundle {
         workers,
         dlq_total,
         dlq_newest_age_secs,
         by_queue,
         stalled_count,
+        task_stats,
     })
 }
 
@@ -1014,9 +1058,122 @@ mod tests {
             queue_max_backlog: 0,
             queue_max_backlog_queue: None,
             stalled_count: 0,
+            worker_outliers: Vec::new(),
             incomplete: false,
             unavailable_shards: Vec::new(),
         }
+    }
+
+    // ── worker outliers (issue #1815) ────────────────────────────────────────
+
+    fn task_stats(tasks: u32, failures: u32) -> WorkerTaskStats {
+        WorkerTaskStats {
+            tasks,
+            failures,
+            p99_latency_ms: Some(25),
+        }
+    }
+
+    fn stats_bundle(task_stats: Vec<(String, WorkerTaskStats)>) -> ShardBundle {
+        ShardBundle {
+            workers: Vec::new(),
+            dlq_total: 0,
+            dlq_newest_age_secs: None,
+            by_queue: BTreeMap::new(),
+            stalled_count: 0,
+            task_stats,
+        }
+    }
+
+    /// The issue #1815 RED test for `status_summary`: one worker fails 50% of
+    /// its tasks while its peers fail none. The merge flags it once, even when
+    /// two shards report the same multi-shard worker.
+    #[test]
+    fn merge_bundle_flags_the_worker_failing_half_its_tasks() {
+        let ok = |id: &str| (id.to_string(), task_stats(100, 0));
+        let shard0 = stats_bundle(vec![
+            ("w-sick".to_string(), task_stats(100, 50)),
+            ok("w-1"),
+            ok("w-2"),
+        ]);
+        let shard1 = stats_bundle(vec![("w-sick".to_string(), task_stats(100, 50)), ok("w-3")]);
+        let merged = merge_bundle(vec![
+            ShardObservation {
+                shard_id: 0,
+                rows: vec![shard0],
+                error: None,
+            },
+            ShardObservation {
+                shard_id: 1,
+                rows: vec![shard1],
+                error: None,
+            },
+        ]);
+        assert_eq!(
+            merged.worker_outliers.len(),
+            1,
+            "{:?}",
+            merged.worker_outliers
+        );
+        let outlier = &merged.worker_outliers[0];
+        assert_eq!(outlier.worker_id, "w-sick");
+        assert_eq!(outlier.dimensions, vec![OutlierDimension::FailureRatio]);
+        assert_eq!(outlier.peer_median_failure_ratio, Some(0.0));
+    }
+
+    #[test]
+    fn build_status_response_degrades_workers_and_lists_outliers() {
+        let report = shard_report(
+            ShardReadiness::Ready,
+            vec![shard_row(0, ShardReadiness::Ready, true, &[])],
+        );
+        let mut bundle = healthy_bundle();
+        bundle.worker_outliers = vec![WorkerOutlier {
+            worker_id: "w-sick".to_string(),
+            dimensions: vec![OutlierDimension::FailureRatio],
+            stats: task_stats(100, 50),
+            peer_median_failure_ratio: Some(0.0),
+            peer_median_p99_latency_ms: Some(25),
+        }];
+        let resp = build_status_response(
+            Utc.timestamp_opt(2000, 0).unwrap(),
+            &report,
+            &bundle,
+            &thresholds(),
+        );
+        let workers = &resp.subsystems[0];
+        assert_eq!(workers.name, "workers");
+        assert_eq!(workers.status, SubsystemStatus::Degraded);
+        assert_eq!(
+            workers.reason_codes,
+            vec![REASON_WORKER_OUTLIER.to_string()]
+        );
+        assert_eq!(workers.drill_down.as_deref(), Some(DRILL_DOWN_WORKERS));
+        assert_eq!(workers.metrics["outliers"][0]["worker_id"], "w-sick");
+        assert_eq!(
+            workers.metrics["outliers"][0]["dimensions"],
+            serde_json::json!(["failure_ratio"])
+        );
+        assert_eq!(resp.status, SubsystemStatus::Degraded);
+    }
+
+    #[test]
+    fn build_status_response_without_outliers_reports_an_empty_list() {
+        let report = shard_report(
+            ShardReadiness::Ready,
+            vec![shard_row(0, ShardReadiness::Ready, true, &[])],
+        );
+        let resp = build_status_response(
+            Utc.timestamp_opt(2000, 0).unwrap(),
+            &report,
+            &healthy_bundle(),
+            &thresholds(),
+        );
+        assert_eq!(
+            resp.subsystems[0].metrics["outliers"],
+            serde_json::json!([])
+        );
+        assert_eq!(resp.subsystems[0].status, SubsystemStatus::Healthy);
     }
 
     // ── worst_status ─────────────────────────────────────────────────────────

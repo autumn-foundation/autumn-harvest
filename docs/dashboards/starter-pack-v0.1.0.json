@@ -6925,6 +6925,292 @@
         }
       ],
       "description": "A complete by-id fan-out found more than one live run of one business key (issue #1313). Evidence of a key pinned to one shard while an unpinned start of it hashed to another, or of a shard drained during a topology change while an unpinned start of the same key stayed live elsewhere -- neither requires the other. Not the race issue #1313 names, which is invisible to any single fan-out by construction; this is the observable proxy for its precondition."
+    },
+    {
+      "id": 461861,
+      "type": "row",
+      "title": "Database pool, queries & pollers (issue #1815)",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 199
+      },
+      "collapsed": true,
+      "panels": [
+        {
+          "id": 482935,
+          "type": "timeseries",
+          "title": "DB pool connections in use / idle",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 200
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (shard) (harvest_db_pool_in_use{shard=~\"$shard\"})",
+              "legendFormat": "in use shard {{shard}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "refId": "B",
+              "expr": "sum by (shard) (harvest_db_pool_idle{shard=~\"$shard\"})",
+              "legendFormat": "idle shard {{shard}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Connections each shard pool lends out and holds idle, summed over worker replicas (issue #1815). Each replica owns its pool, so sum is valid. Idle near 0 with rising acquire wait means the pool is too small. Colocated shards that share one pool show the same values."
+        },
+        {
+          "id": 376911,
+          "type": "timeseries",
+          "title": "DB pool acquire wait p99",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 200
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "histogram_quantile(0.99, sum by (le, shard) (rate(harvest_db_pool_wait_duration_bucket{shard=~\"$shard\"}[$__rate_interval])))",
+              "legendFormat": "p99 shard {{shard}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "refId": "B",
+              "expr": "sum by (shard) (rate(harvest_db_pool_wait_duration_sum{shard=~\"$shard\"}[$__rate_interval])) / sum by (shard) (rate(harvest_db_pool_wait_duration_count{shard=~\"$shard\"}[$__rate_interval]))",
+              "legendFormat": "avg shard {{shard}} (bucket-less fallback)",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Seconds a caller waits for a pooled connection on the claim path, the timeout scanner and the activity heartbeat flush (issue #1815). Alert: harvest_db_pool_wait_high (docs/runbooks/harvest-alerts.md#harvest_db_pool_wait_high). p99 needs set_buckets_for_metric; the avg fallback works on any install."
+        },
+        {
+          "id": 716897,
+          "type": "timeseries",
+          "title": "DB operation latency p99 by op",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 208
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "histogram_quantile(0.99, sum by (le, op) (rate(harvest_db_query_duration_bucket[$__rate_interval])))",
+              "legendFormat": "p99 {{op}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "refId": "B",
+              "expr": "sum by (op) (rate(harvest_db_query_duration_sum[$__rate_interval])) / sum by (op) (rate(harvest_db_query_duration_count[$__rate_interval]))",
+              "legendFormat": "avg {{op}} (bucket-less fallback)",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Seconds one database operation takes, by op: claim, persist, scan, heartbeat (issue #1815). Each op is one unit of work, not one SQL statement. Alert: harvest_db_query_latency_high (docs/runbooks/harvest-alerts.md#harvest_db_query_latency_high). Not the same as harvest_query_duration, which times workflow query handlers."
+        },
+        {
+          "id": 270529,
+          "type": "timeseries",
+          "title": "Pollers by queue",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 208
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (queue) (harvest_worker_pollers{queue=~\"$queue\"})",
+              "legendFormat": "{{queue}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Poll loops that claim from each queue, summed over worker replicas (issue #1815). One worker runs one poll loop over all its queues. A drained worker reports 0. A queue at 0 has no poller and its backlog grows."
+        },
+        {
+          "id": 872151,
+          "type": "timeseries",
+          "title": "Worker outliers (gray failure)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 216
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "max by (instance, dimension) (harvest_worker_outlier)",
+              "legendFormat": "{{instance}} {{dimension}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "1 when a worker fails a far higher share of tasks, or has a far higher p99 task latency, than the median of its live peers (issue #1815). The worker is alive and passes the heartbeat check, so worker health alone misses it. GET /admin/status lists the same workers under workers.outliers. Alert: harvest_worker_gray_failure (docs/runbooks/harvest-alerts.md#harvest_worker_gray_failure)."
+        }
+      ]
     }
   ]
 }

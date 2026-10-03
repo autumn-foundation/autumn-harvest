@@ -158,6 +158,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          typed_workflow_failure_tests
 linux        autumn-harvest         integration                      -                          usage_report_activity_lookback_tests
 linux        autumn-harvest         integration                      -                          with_start_shared_tests
+linux        autumn-harvest         integration                      -                          worker_saturation_metrics_tests
 linux        autumn-harvest         integration                      -                          workflow_backoff_requeue_tests
 linux        autumn-harvest         integration                      -                          workflow_handle_tests
 linux        autumn-harvest         integration                      -                          workflow_id_targeted_tests

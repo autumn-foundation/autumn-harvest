@@ -52,7 +52,7 @@ use crate::signal;
 use crate::store;
 use crate::telemetry::{
     ATTR_ACTIVITY_NAME, ATTR_ATTEMPT, ATTR_EXECUTION_ID, ATTR_QUEUE, ATTR_SHARD_ID,
-    ATTR_WORKFLOW_ID, ActivityStatus, SlotType, TraceContextCarrier, WorkflowStatus,
+    ATTR_WORKFLOW_ID, ActivityStatus, DbOp, SlotType, TraceContextCarrier, WorkflowStatus,
 };
 use crate::types::{
     ActivityExecId, ExecutionId, ExternalActivityToken, IdempotencyKey, ParentClosePolicy, ShardId,
@@ -15463,6 +15463,7 @@ async fn process_activity_task(
     dispatched_at: std::time::Instant,
     max_concurrent_sessions: i32,
     session_slots_in_use: &crate::sessions::SessionSlotRegistry,
+    task_outcomes: &crate::worker_outlier::TaskOutcomeWindow,
 ) -> HarvestResult<()> {
     let Some(exec_uuid) = task.workflow_exec_id else {
         let mut conn = pool.get().await.map_err(crate::error::database_error)?;
@@ -15776,10 +15777,12 @@ async fn process_activity_task(
 
     let cancel = CancellationToken::new();
     let activity_claim = claim_of_task(task)?;
-    let heartbeat_tx = crate::heartbeat::spawn_heartbeat_flusher(
+    let heartbeat_tx = crate::heartbeat::spawn_heartbeat_flusher_with_metrics(
         activity_claim.clone(),
         pool.clone(),
         cancel.clone(),
+        Arc::clone(&registry.telemetry().metrics),
+        shard_metric_label(exec_id.shard()),
     );
     let trace_carrier = task
         .trace_context
@@ -16131,12 +16134,15 @@ async fn process_activity_task(
     // flag is always false.
     let committed_transactionally = ctx.transactional_commit_occurred();
 
-    let duration_secs = attempt_clock_start.elapsed().as_secs_f64();
+    let attempt_elapsed = attempt_clock_start.elapsed();
+    let duration_secs = attempt_elapsed.as_secs_f64();
     let status = if committed_transactionally || activity_result.is_ok() {
         ActivityStatus::Completed
     } else {
         ActivityStatus::Failed
     };
+    // Issue #1815: the attempt feeds this worker's outlier window.
+    task_outcomes.record(status == ActivityStatus::Failed, attempt_elapsed);
     // Parse the structured payload once and reuse for both the histogram
     // and the per-failure counter (so the `error.type` attribute is
     // consistent across `harvest.activity.duration` and
@@ -23100,6 +23106,8 @@ async fn process_workflow_task(
     let execution_ref = &prepared.execution;
     let exec_uuid = prepared.exec_id.as_uuid();
 
+    // Issue #1815: the `persist` op spans the whole transaction, COMMIT included.
+    let persist_started = std::time::Instant::now();
     let persist_flow = Box::pin(conn.transaction::<WorkflowPersistFlow, HarvestError, _>(
         async |conn| {
             if check_paused_and_park(
@@ -23191,6 +23199,10 @@ async fn process_workflow_task(
         },
     ))
     .await;
+    registry
+        .telemetry()
+        .metrics
+        .record_db_query_duration(DbOp::Persist, persist_started.elapsed().as_secs_f64());
     // execute_span is moved into and dropped by the transaction closure above,
     // closing the OTel span after all producer spans have been emitted as its
     // children.
@@ -23684,6 +23696,8 @@ async fn process_task(
     // capability-miss cleanup below. `None` on the activity path (never bounded
     // by it) and when `workflow_task_timeout` is zero.
     workflow_body_timeout: Option<Duration>,
+    // Issue #1815: the activity path records each attempt here.
+    task_outcomes: &crate::worker_outlier::TaskOutcomeWindow,
 ) -> HarvestResult<TaskDispatchOutcome> {
     // Issue #804 (Codex round-22 P2): the workflow path sets this when a
     // frontier reset commits, so the capability-miss interception below knows
@@ -23748,6 +23762,7 @@ async fn process_task(
                 dispatched_at,
                 max_concurrent_sessions,
                 session_slots_in_use,
+                task_outcomes,
             )
             .await;
             // Acquire only if we actually need to act on a capability miss or
@@ -25819,6 +25834,100 @@ fn spawn_worker_slot_sampler(
     })
 }
 
+/// Spawn the DB-pool gauge sampler (issue #1815).
+///
+/// Each tick reads `Pool::status()` for every `(shard, pool)` pair. That read
+/// takes no connection and runs no query. A pool that two colocated shards
+/// share reports under both shard labels.
+fn spawn_db_pool_sampler(
+    pools: Vec<(u16, DbPool)>,
+    cancel: CancellationToken,
+    telemetry: Arc<crate::telemetry::TelemetryConfig>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => break,
+                () = tokio::time::sleep(interval) => {}
+            }
+            for (shard, pool) in &pools {
+                let (in_use, idle) = pool_occupancy(&pool.status());
+                telemetry.metrics.record_db_pool(*shard, in_use, idle);
+            }
+        }
+    })
+}
+
+/// Split a deadpool status into `(in_use, idle)` connections (issue #1815).
+///
+/// `size` counts open connections and `available` counts the idle ones. A
+/// negative `available` means callers wait, and no connection is idle.
+fn pool_occupancy(status: &deadpool::Status) -> (u64, u64) {
+    let idle = status.available.min(status.size);
+    let in_use = status.size - idle;
+    (in_use as u64, idle as u64)
+}
+
+/// Counts one running poll loop and keeps `harvest.worker.pollers` current
+/// (issue #1815).
+///
+/// The guard sets the gauge when its loop starts and again when the loop
+/// ends. So a drained worker reads 0 at once, with no wait for a sampler tick.
+struct PollerGuard {
+    count: Arc<AtomicUsize>,
+    queues: Vec<String>,
+    metrics: Arc<dyn crate::telemetry::MetricsRecorder>,
+}
+
+impl PollerGuard {
+    fn new(
+        count: &Arc<AtomicUsize>,
+        queues: &[String],
+        metrics: &Arc<dyn crate::telemetry::MetricsRecorder>,
+    ) -> Self {
+        let guard = Self {
+            count: Arc::clone(count),
+            queues: queues.to_vec(),
+            metrics: Arc::clone(metrics),
+        };
+        let pollers = count.fetch_add(1, Ordering::SeqCst) + 1;
+        guard.emit(pollers);
+        guard
+    }
+
+    fn emit(&self, pollers: usize) {
+        for queue in &self.queues {
+            self.metrics.record_worker_pollers(queue, pollers as u64);
+        }
+    }
+}
+
+impl Drop for PollerGuard {
+    fn drop(&mut self) {
+        let pollers = self.count.fetch_sub(1, Ordering::SeqCst).saturating_sub(1);
+        self.emit(pollers);
+    }
+}
+
+/// Record one workflow-task outcome in the worker's task window (issue #1815).
+///
+/// A completion is a success. An error or a body timeout is a failure. A
+/// release is neither, because the task did not run to a decision here.
+fn record_workflow_task_outcome(
+    window: &crate::worker_outlier::TaskOutcomeWindow,
+    outcome: &HarvestResult<TaskDispatchOutcome>,
+    dispatched_at: std::time::Instant,
+) {
+    let failed = match outcome {
+        Ok(TaskDispatchOutcome::Completed) => false,
+        Ok(TaskDispatchOutcome::BodyTimedOut) | Err(_) => true,
+        Ok(TaskDispatchOutcome::Released { .. }) => return,
+    };
+    window.record(failed, dispatched_at.elapsed());
+}
+
 /// Spawn the cross-region DR sampler (issue #954).
 ///
 /// One task, three jobs, all on the same cadence and all per shard:
@@ -26435,6 +26544,11 @@ pub struct Worker {
     /// `tokio::sync::Semaphore`/`OwnedSemaphorePermit` map -- see
     /// [`crate::sessions::SessionSlotRegistry`]'s doc comment for why.
     session_slots_in_use: crate::sessions::SessionSlotRegistry,
+    /// This worker's rolling task outcomes (issue #1815). The liveness
+    /// heartbeat publishes a snapshot for outlier detection.
+    task_outcomes: Arc<crate::worker_outlier::TaskOutcomeWindow>,
+    /// Running poll loops, behind `harvest.worker.pollers` (issue #1815).
+    active_pollers: Arc<AtomicUsize>,
     /// Each assigned shard's per-shard dispatch channel, captured once at
     /// construction (issue #1429 follow-up). See the capture site in
     /// [`Worker::new`] for why this is decided here rather than later, at
@@ -26481,6 +26595,8 @@ struct WorkerMonitoringHandles {
     /// no-ops when metrics are disabled.
     workflow_active_sampler: tokio::task::JoinHandle<()>,
     worker_slot_sampler: Option<tokio::task::JoinHandle<()>>,
+    /// DB-pool gauge sampler (issue #1815). Started only with metrics on.
+    db_pool_sampler: Option<tokio::task::JoinHandle<()>>,
     stranded_work_sampler: Option<tokio::task::JoinHandle<()>>,
     /// Cross-region DR sampler (issue #954): replication watermark beat,
     /// measured-RPO gauges, and this worker's periodic self-fence check.
@@ -28072,6 +28188,8 @@ impl Worker {
             workflow_panic_strikes: Arc::default(),
             workflow_deadlock_strikes: Arc::default(),
             session_slots_in_use: crate::sessions::new_session_slot_registry(),
+            task_outcomes: Arc::default(),
+            active_pollers: Arc::default(),
             shard_dispatch,
             global_dispatch,
         })
@@ -28762,6 +28880,7 @@ impl Worker {
         registration_pending_per_shard: &[Arc<AtomicBool>],
         shard_dispatch: &[Option<crate::dispatch::InstalledDispatch>],
     ) {
+        let _poller = self.poller_guard();
         let n = shard_targets.len();
         // Rotating start index prevents the first shard from being permanently
         // favoured when multiple shards have work (fix #4).
@@ -28980,6 +29099,11 @@ impl Worker {
             && let Err(error) = handle.await
         {
             tracing::warn!(error = %error, "worker slot sampler failed during shutdown");
+        }
+        if let Some(handle) = monitors.db_pool_sampler
+            && let Err(error) = handle.await
+        {
+            tracing::warn!(error = %error, "db pool sampler failed during shutdown");
         }
         if let Some(handle) = monitors.stranded_work_sampler
             && let Err(error) = handle.await
@@ -29857,6 +29981,33 @@ impl Worker {
             )
         });
 
+        // DB-pool gauges (issue #1815): an in-memory read of each shard pool's
+        // deadpool status. No query runs, so it shares the slot cadence.
+        #[cfg(feature = "db")]
+        let pool_shards: Vec<(u16, DbPool)> = self.config.sharded_pool.as_ref().map_or_else(
+            || {
+                // UFCS: diesel's `first` shadows the slice method here.
+                let shard = <[crate::types::ShardId]>::first(&self.config.shard_assignments)
+                    .map_or(0, |s| shard_metric_label(*s));
+                vec![(shard, pool.clone())]
+            },
+            |sp| {
+                sp.iter_shards()
+                    .map(|(shard, p)| (shard_metric_label(shard), p.clone()))
+                    .collect()
+            },
+        );
+        #[cfg(not(feature = "db"))]
+        let pool_shards: Vec<(u16, DbPool)> = vec![(0, pool.clone())];
+        let db_pool_sampler = self.registry.telemetry().metrics.is_enabled().then(|| {
+            spawn_db_pool_sampler(
+                pool_shards,
+                self.shutdown.clone(),
+                self.registry.telemetry().clone(),
+                self.config.poll_interval,
+            )
+        });
+
         // Cross-region DR sampler (issue #954): measured RPO + this worker's
         // periodic self-fence check. Only started when the operator opted into
         // `dr_fencing` AND a sharded pool is available; a deployment that has
@@ -29960,6 +30111,7 @@ impl Worker {
             history_oversized_sampler,
             workflow_active_sampler,
             worker_slot_sampler,
+            db_pool_sampler,
             stranded_work_sampler,
             replication_sampler,
             schedule_overdue_sampler,
@@ -30033,6 +30185,16 @@ impl Worker {
             Arc::clone(&self.session_slots_in_use),
             registration_pending,
             self.registry.payload_codecs().clone(),
+            crate::workers::OutlierProbe {
+                window: Arc::clone(&self.task_outcomes),
+                metrics: Arc::clone(&self.registry.telemetry().metrics),
+                config: crate::worker_outlier::OutlierConfig::default(),
+                // Peers are judged on the fleet-wide cadence, as the
+                // capability-miss lookup does, not on this worker's own.
+                fleet_stale_secs: capability_miss_fleet_stale_secs(
+                    self.config.worker_heartbeat_interval,
+                ),
+            },
         )
     }
 
@@ -30487,11 +30649,13 @@ impl Worker {
         reservation: Option<DispatchReservation>,
         shard_count: usize,
     ) -> ReferenceDisposition {
-        let mut conn = match acquire_shard_conn(
-            pool,
-            shard_acquire_bound(shard_count > 1, self.config.poll_interval),
-        )
-        .await
+        let mut conn = match self
+            .acquire_timed(
+                pool,
+                shard_acquire_bound(shard_count > 1, self.config.poll_interval),
+                shard,
+            )
+            .await
         {
             Ok(conn) => conn,
             Err(error) => {
@@ -30504,6 +30668,7 @@ impl Worker {
         };
 
         let circuit_breakers = self.registry.circuit_breakers();
+        let claim_started = std::time::Instant::now();
         let claimed = queue::claim_task_by_id_on_shard(
             &mut conn,
             lease.task_id,
@@ -30516,6 +30681,7 @@ impl Worker {
             shard,
         )
         .await;
+        self.record_db_op(DbOp::Claim, claim_started);
 
         match claimed {
             Ok(Some(task)) => {
@@ -30759,6 +30925,7 @@ impl Worker {
         registration_pending: &AtomicBool,
         dispatch_allowed: bool,
     ) {
+        let _poller = self.poller_guard();
         // Dispatch-channel state for this loop (issue #1312). All three are
         // inert when no channel is installed.
         let mut dispatch_state = DispatchLoopState::new();
@@ -31027,6 +31194,15 @@ impl Worker {
                 worker_id = %self.config.worker_id,
                 error = %error,
                 "worker slot sampler failed during shutdown"
+            );
+        }
+        if let Some(handle) = monitors.db_pool_sampler
+            && let Err(error) = handle.await
+        {
+            tracing::warn!(
+                worker_id = %self.config.worker_id,
+                error = %error,
+                "db pool sampler failed during shutdown"
             );
         }
         if let Some(handle) = monitors.stranded_work_sampler
@@ -31423,6 +31599,51 @@ impl Worker {
         }
     }
 
+    /// Get a pooled connection and record the wait (issue #1815).
+    ///
+    /// The claim path calls this, so `harvest.db.pool.wait_duration` shows
+    /// pool pressure where it costs throughput. A failed or timed-out wait is
+    /// recorded too, because the caller waited for it.
+    async fn acquire_timed(
+        &self,
+        pool: &DbPool,
+        acquire_bound: Option<Duration>,
+        shard: Option<crate::types::ShardId>,
+    ) -> Result<
+        deadpool::managed::Object<
+            diesel_async::pooled_connection::AsyncDieselConnectionManager<
+                diesel_async::AsyncPgConnection,
+            >,
+        >,
+        String,
+    > {
+        let started = std::time::Instant::now();
+        let result = acquire_shard_conn(pool, acquire_bound).await;
+        self.registry.telemetry().metrics.record_db_pool_wait(
+            shard.map_or(0, shard_metric_label),
+            started.elapsed().as_secs_f64(),
+        );
+        result
+    }
+
+    /// Count this poll loop until the guard drops (issue #1815).
+    fn poller_guard(&self) -> PollerGuard {
+        PollerGuard::new(
+            &self.active_pollers,
+            &self.config.queues,
+            &self.registry.telemetry().metrics,
+        )
+    }
+
+    /// Record the duration of one database op that began at `started`
+    /// (issue #1815).
+    fn record_db_op(&self, op: DbOp, started: std::time::Instant) {
+        self.registry
+            .telemetry()
+            .metrics
+            .record_db_query_duration(op, started.elapsed().as_secs_f64());
+    }
+
     /// Execute a single poll iteration.
     ///
     /// Claims one task of a kind with a free permit and dispatches it. Returns
@@ -31461,7 +31682,7 @@ impl Worker {
             PollAdmission::Only(kind) => Some(kind),
         };
 
-        let mut conn = match acquire_shard_conn(pool, acquire_bound).await {
+        let mut conn = match self.acquire_timed(pool, acquire_bound, shard).await {
             Ok(conn) => conn,
             Err(e) => {
                 tracing::error!(error = %e, "failed to get connection from pool");
@@ -31507,7 +31728,8 @@ impl Worker {
                 // permutation. A claim that succeeds on the first
                 // (typically highest-weight) queue never pays for the rest.
                 let single_queue = [(*queue_name).to_owned()];
-                match queue::claim_task_of_kind_on_shard(
+                let claim_started = std::time::Instant::now();
+                let claimed = queue::claim_task_of_kind_on_shard(
                     &mut conn,
                     &single_queue,
                     &self.config.worker_id,
@@ -31518,8 +31740,9 @@ impl Worker {
                     shard,
                     kind,
                 )
-                .await
-                {
+                .await;
+                self.record_db_op(DbOp::Claim, claim_started);
+                match claimed {
                     Ok(Some(task)) => {
                         tracing::debug!(
                             task_id = %task.id,
@@ -31551,7 +31774,8 @@ impl Worker {
         }
 
         // --- Default (unweighted) path: original single ANY($2) query ---
-        match queue::claim_task_of_kind_on_shard(
+        let claim_started = std::time::Instant::now();
+        let claimed = queue::claim_task_of_kind_on_shard(
             &mut conn,
             &self.config.queues,
             &self.config.worker_id,
@@ -31562,8 +31786,9 @@ impl Worker {
             shard,
             kind,
         )
-        .await
-        {
+        .await;
+        self.record_db_op(DbOp::Claim, claim_started);
+        match claimed {
             Ok(Some(task)) => {
                 tracing::debug!(
                     task_id = %task.id,
@@ -31729,6 +31954,7 @@ impl Worker {
         };
         let exec_id_for_timeout = task.workflow_exec_id;
         let telemetry = Arc::clone(&self.registry);
+        let task_outcomes = Arc::clone(&self.task_outcomes);
 
         // Monotonic instant captured the moment this worker received the claimed
         // task, before acquiring the local concurrency permit. The schedule-to-start
@@ -31808,7 +32034,7 @@ impl Worker {
                 // blameless cleanup cancelled — banking a timeout strike it did
                 // not earn and, at `poison_pill_threshold`, terminally failing
                 // an execution whose body had completed.
-                match process_task(
+                let outcome = process_task(
                     &pool,
                     Arc::clone(&registry),
                     task,
@@ -31827,9 +32053,11 @@ impl Worker {
                     workflow_task_deadline,
                     capability_miss_policy,
                     Some(workflow_task_timeout),
+                    &task_outcomes,
                 )
-                .await
-                {
+                .await;
+                record_workflow_task_outcome(&task_outcomes, &outcome, dispatched_at);
+                match outcome {
                     Ok(TaskDispatchOutcome::Completed) => {
                         // Success: clear the consecutive-timeout counter for
                         // this execution so a later transient timeout doesn't
@@ -32025,7 +32253,7 @@ impl Worker {
                 }
             } else {
                 // No timeout configured, or not a workflow task: run unbounded.
-                if let Err(error) = process_task(
+                let outcome = process_task(
                     &pool,
                     registry,
                     task,
@@ -32048,9 +32276,14 @@ impl Worker {
                     // Same reason: this arm is the "no timeout configured, or
                     // not a workflow task" path, which was never wrapped.
                     None,
+                    &task_outcomes,
                 )
-                .await
-                {
+                .await;
+                // An activity records its own attempt in `process_activity_task`.
+                if task_type == "workflow" {
+                    record_workflow_task_outcome(&task_outcomes, &outcome, dispatched_at);
+                }
+                if let Err(error) = outcome {
                     tracing::error!(
                         task_id = %task_id,
                         task_type = %task_type,

@@ -131,10 +131,32 @@ pub fn spawn_heartbeat_flusher(
     pool: Pool<AsyncPgConnection>,
     cancel: CancellationToken,
 ) -> mpsc::Sender<Value> {
+    spawn_heartbeat_flusher_with_metrics(
+        claim,
+        pool,
+        cancel,
+        std::sync::Arc::new(crate::telemetry::NoOpMetrics),
+        0,
+    )
+}
+
+/// [`spawn_heartbeat_flusher`] that also records each flush (issue #1815).
+///
+/// Each flush records its pool wait under `shard` and its write as the
+/// `heartbeat` op.
+#[cfg(feature = "db")]
+#[must_use]
+pub fn spawn_heartbeat_flusher_with_metrics(
+    claim: TaskClaim,
+    pool: Pool<AsyncPgConnection>,
+    cancel: CancellationToken,
+    metrics: std::sync::Arc<dyn crate::telemetry::MetricsRecorder>,
+    shard: u16,
+) -> mpsc::Sender<Value> {
     let (tx, rx) = mpsc::channel(64);
 
     // Plain tokio, not the shim: the `db` build never sets `--cfg shuttle`.
-    tokio::spawn(heartbeat_loop(claim, pool, rx, cancel));
+    tokio::spawn(heartbeat_loop(claim, pool, rx, cancel, metrics, shard));
 
     tx
 }
@@ -146,9 +168,16 @@ async fn heartbeat_loop(
     pool: Pool<AsyncPgConnection>,
     rx: mpsc::Receiver<Value>,
     cancel: CancellationToken,
+    metrics: std::sync::Arc<dyn crate::telemetry::MetricsRecorder>,
+    shard: u16,
 ) {
     let task_id = claim.task_id;
-    let sink = PgHeartbeatSink { claim, pool };
+    let sink = PgHeartbeatSink {
+        claim,
+        pool,
+        metrics,
+        shard,
+    };
     if run_heartbeat_flusher(rx, cancel, FLUSH_INTERVAL, sink).await == FlusherExit::Cancelled {
         tracing::debug!(task_id = %task_id, "heartbeat flusher cancelled");
     }
@@ -159,15 +188,27 @@ async fn heartbeat_loop(
 struct PgHeartbeatSink {
     claim: TaskClaim,
     pool: Pool<AsyncPgConnection>,
+    metrics: std::sync::Arc<dyn crate::telemetry::MetricsRecorder>,
+    shard: u16,
 }
 
 #[cfg(feature = "db")]
 impl HeartbeatSink for PgHeartbeatSink {
     async fn flush(&mut self, payload: Value) -> FlushOutcome {
         let task_id = self.claim.task_id;
-        match self.pool.get().await {
+        let wait_started = std::time::Instant::now();
+        let conn = self.pool.get().await;
+        self.metrics
+            .record_db_pool_wait(self.shard, wait_started.elapsed().as_secs_f64());
+        match conn {
             Ok(mut conn) => {
-                match crate::queue::record_heartbeat(&mut conn, &self.claim, payload).await {
+                let write_started = std::time::Instant::now();
+                let written = crate::queue::record_heartbeat(&mut conn, &self.claim, payload).await;
+                self.metrics.record_db_query_duration(
+                    crate::telemetry::DbOp::Heartbeat,
+                    write_started.elapsed().as_secs_f64(),
+                );
+                match written {
                     Ok(ClaimWrite::Applied) => FlushOutcome::Continue,
                     // The claim is no longer current (issue #1789). The loop
                     // then cancels the activity, so this stale attempt does
