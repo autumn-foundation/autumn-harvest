@@ -305,11 +305,14 @@ fn index_cost(verb: &str) -> &'static str {
 /// Whether a bound is in force at token `at`.
 ///
 /// A local value holds until the transaction ends. A session value outlives
-/// it. Diesel runs the whole file as one transaction, unless the file ends
-/// one itself.
+/// a commit, but a rollback restores the value from before the transaction.
+/// Diesel runs the whole file as one transaction, unless the file ends one
+/// itself.
 fn timeout_in_force(timeouts: &[(usize, Timeout)], at: usize) -> bool {
     let mut session = false;
     let mut local = None;
+    // The session value when the current transaction began.
+    let mut saved = false;
     for (_, change) in timeouts.iter().take_while(|(k, _)| *k < at) {
         match *change {
             Timeout::Set {
@@ -323,7 +326,14 @@ fn timeout_in_force(timeouts: &[(usize, Timeout)], at: usize) -> bool {
                 session = bounds;
                 local = None;
             }
-            Timeout::TransactionEnd => local = None,
+            Timeout::Begin | Timeout::Commit => {
+                saved = session;
+                local = None;
+            }
+            Timeout::Rollback => {
+                session = saved;
+                local = None;
+            }
         }
     }
     local.unwrap_or(session)
@@ -334,8 +344,13 @@ fn timeout_in_force(timeouts: &[(usize, Timeout)], at: usize) -> bool {
 enum Timeout {
     /// A new value. `local` holds for the current transaction only.
     Set { bounds: bool, local: bool },
-    /// `COMMIT`, `ROLLBACK` or `END`, which drops every local value.
-    TransactionEnd,
+    /// `BEGIN` or `START TRANSACTION`.
+    Begin,
+    /// `COMMIT` or `END`, which drops every local value.
+    Commit,
+    /// `ROLLBACK` or `ABORT`, which also undoes every session change since
+    /// the transaction began.
+    Rollback,
 }
 
 // ── Annotations ──────────────────────────────────────────────────────────────
@@ -939,6 +954,7 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
             }
             Some("drop") if start => drop(&s, k, history, &mut raws),
             Some("alter") if start => alter(&s, k, history, &mut raws),
+            Some("rename") if s.is(k + 1, "to") => rename(&s, k, history),
             Some(verb @ ("lock" | "truncate")) if start => {
                 let j = if s.is(k + 1, "table") { k + 2 } else { k + 1 };
                 let verb = if verb == "lock" {
@@ -1053,19 +1069,21 @@ fn resolve(
 
 /// Whether each token runs on every path through its `DO` body.
 ///
-/// A token inside an `IF`, `CASE` or `LOOP`, or after `EXCEPTION`, may not
-/// run. A `CASE` expression that ends in a bare `END` leaves the rest of the
+/// A token inside an `IF`, `CASE` or `LOOP`, after `EXCEPTION`, or after a
+/// `RETURN`, may not run. A `CASE` expression that ends in a bare `END` leaves the rest of the
 /// body conditional, which fails closed. A top-level token always runs.
 fn unconditional(s: &Stmts) -> Vec<bool> {
     let mut out = Vec::with_capacity(s.toks.len());
     let mut depth = 0;
     let mut branches = 0_usize;
-    let mut handler = false;
+    // Set once an exception handler or an early exit makes the rest of the
+    // body conditional.
+    let mut skippable = false;
     for (k, tok) in s.toks.iter().enumerate() {
         if tok.depth != depth {
             depth = tok.depth;
             branches = 0;
-            handler = false;
+            skippable = false;
         }
         let after_end = k > 0 && s.is(k - 1, "end");
         match s.word(k) {
@@ -1076,10 +1094,10 @@ fn unconditional(s: &Stmts) -> Vec<bool> {
                 branches += 1;
             }
             Some("loop" | "case") if !after_end => branches += 1,
-            Some("exception") => handler = true,
+            Some("exception" | "return") => skippable = true,
             _ => {}
         }
-        out.push(depth == 0 || (branches == 0 && !handler));
+        out.push(depth == 0 || (branches == 0 && !skippable));
     }
     out
 }
@@ -1117,9 +1135,12 @@ fn timeout_change(s: &Stmts, k: usize) -> Option<Timeout> {
                 local: false,
             })
         }
-        "commit" | "rollback" | "end" if start && s.toks[k].depth == 0 => {
-            Some(Timeout::TransactionEnd)
+        "begin" if start && s.toks[k].depth == 0 => Some(Timeout::Begin),
+        "start" if start && s.toks[k].depth == 0 && s.is(k + 1, "transaction") => {
+            Some(Timeout::Begin)
         }
+        "commit" | "end" if start && s.toks[k].depth == 0 => Some(Timeout::Commit),
+        "rollback" | "abort" if start && s.toks[k].depth == 0 => Some(Timeout::Rollback),
         "set_config"
             if s.is_punct(k + 1, '(')
                 && s.string(k + 2) == Some("lock_timeout")
@@ -1231,6 +1252,29 @@ fn drop(s: &Stmts, k: usize, history: &History, raws: &mut Vec<Raw>) {
         Some("rule") => raws.push(Raw::lock(k, "DROP RULE", s.name_after(k + 2, "on"))),
         _ => {}
     }
+}
+
+/// `ALTER TABLE old RENAME TO new` carries the foreign keys of `old` to `new`.
+///
+/// The old name keeps them too. Remembering a key that moved fails closed.
+fn rename(s: &Stmts, k: usize, history: &mut History) {
+    let start = s.starts[k];
+    if !(s.is(start, "alter") && s.is(start + 1, "table")) {
+        return;
+    }
+    let (Some(old), Some((new, _))) = (s.statement_table(start), s.qualified_name(k + 2)) else {
+        return;
+    };
+    let keys = history
+        .references
+        .get(base(&old))
+        .cloned()
+        .unwrap_or_default();
+    history
+        .references
+        .entry(base(&new).to_string())
+        .or_default()
+        .extend(keys);
 }
 
 /// The `ALTER` forms that lock a table.
@@ -2232,6 +2276,49 @@ fn a_name_list_continues_past_an_inheritance_marker() {
         "TRUNCATE harvest_schedules *, harvest_timers;",
     ] {
         let findings = lint_with_history(&[], sql, true);
+        assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}: {findings:?}");
+    }
+}
+
+#[test]
+fn a_rollback_restores_the_session_timeout_from_before_the_transaction() {
+    let sql = "BEGIN;\nSET lock_timeout = '5s';\nROLLBACK;\n\
+               ALTER TABLE harvest_events ADD COLUMN x INT;";
+    let findings = lint_with_history(&[], sql, false);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+    // A bound set before the transaction survives its rollback.
+    let before = "SET lock_timeout = '5s';\nBEGIN;\nSET lock_timeout = 0;\nROLLBACK;\n\
+                  ALTER TABLE harvest_events ADD COLUMN x INT;";
+    assert_eq!(lint_with_history(&[], before, false), []);
+}
+
+#[test]
+fn code_after_a_return_does_not_surely_run() {
+    for exit in ["IF random() > 0.5 THEN\n    RETURN;\nEND IF;", "RETURN;"] {
+        let sql = format!(
+            "DO $$\nBEGIN\n{exit}\nPERFORM set_config('lock_timeout', '5s', true);\nEND $$;\n\
+             ALTER TABLE harvest_events ADD COLUMN x INT;"
+        );
+        let findings = lint_with_history(&[], &sql, true);
+        assert_eq!(
+            rules(&findings),
+            [Rule::LockTimeout],
+            "{exit}: {findings:?}"
+        );
+    }
+}
+
+#[test]
+fn a_renamed_table_keeps_its_foreign_keys() {
+    let history = [
+        "CREATE TABLE harvest_child (e UUID REFERENCES harvest_events (id));",
+        "ALTER TABLE harvest_child RENAME TO renamed_child;",
+    ];
+    for sql in [
+        "DROP TABLE renamed_child;",
+        "ALTER TABLE renamed_child DROP CONSTRAINT harvest_child_e_fkey;",
+    ] {
+        let findings = lint_with_history(&history, sql, true);
         assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}: {findings:?}");
     }
 }

@@ -86,8 +86,8 @@ SET lock_timeout` does not change the current session. Inside a `DO` block,
 bare `SELECT` or `PERFORM` of the call. A query with a filter may never call
 the function, so it does not count. The same call in a
 function body does not count, because the body runs only when something calls
-the function. A setter inside an `IF`, `CASE`, `LOOP` or `EXCEPTION` branch
-does not count either, because the branch may not run. A clear inside a
+the function. A setter inside an `IF`, `CASE`, `LOOP` or `EXCEPTION` branch,
+or after a `RETURN`, does not count either, because it may not run. A clear inside a
 branch does count, because the branch may run.
 
 `5s` is the bound that the existing lock-taking migrations use. When the
@@ -96,7 +96,8 @@ timeout fires, the migration fails and rolls back. Run it again.
 Diesel and `harvest migrate` send each `up.sql` as one batch. Postgres runs a
 multi-statement batch as one implicit transaction. `SET LOCAL` therefore holds
 for the whole file, even with `run_in_transaction = false`. An explicit `COMMIT`,
-`ROLLBACK` or `END` ends that transaction and its `SET LOCAL`.
+`ROLLBACK` or `END` ends that transaction and its `SET LOCAL`. A `ROLLBACK` also
+undoes a plain `SET` made inside the transaction.
 
 ## 4. Build indexes with `CONCURRENTLY`
 
