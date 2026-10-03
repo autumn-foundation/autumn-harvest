@@ -20897,26 +20897,26 @@ async fn fail_workflow_for_history_cap(
 ) -> HarvestResult<Vec<crate::completion_trigger::DeferredTriggerStart>> {
     let terminal_count = u64::try_from(next_event_id).unwrap_or(0).saturating_add(1);
 
-    // Issue #704 (PR #1139 review, second round): decide the crossing from
-    // `terminal_count` -- the DURABLE post-failure event count, computed
-    // above from `next_event_id` (the running count of events actually
-    // appended so far this cycle) -- never from the `breach` count.
-    // That count is whatever value tripped the HARD cap at the call
-    // site, and for the `WorkflowOutcome::Suspended` preflight branch that
-    // value can be purely PROSPECTIVE: `suspended_command_event_count`
-    // predicts how many events a batch of still-pending commands (e.g. a
-    // large activity fan-out) WOULD produce if persisted, and this function
-    // never persists them -- the whole point of the hard-cap preflight is
-    // to reject the batch and fail terminally instead. A run sitting at 10
-    // durably recorded events that merely PROPOSED 90 more (against a cap
-    // of 100) would otherwise stamp a permanent crossing off a count that
-    // never lands in `harvest_events`, leaving a terminal execution the
-    // live (non-terminal) discovery query can never find. `terminal_count`
-    // is exactly what WILL be durably recorded once the `WorkflowFailed`
-    // event below is appended, so it is the only value this decision can
-    // correctly be based on -- at every other call site (a genuinely
-    // already-appended batch) `terminal_count` and the breach count coincide,
-    // so this is a strict correctness fix with no behavior change there.
+    // Issue #704: decide the crossing from `terminal_count`, never from the
+    // `breach` count. `terminal_count` is the durable post-failure event
+    // count. It comes from `next_event_id`, the count of events this cycle
+    // has really appended.
+    //
+    // The `breach` count is the value that tripped the cap at the call site.
+    // On the `WorkflowOutcome::Suspended` preflight branch it can be
+    // prospective. `suspended_command_event_count` predicts the events that
+    // pending commands would add, for example a large activity fan-out. This
+    // function never persists those commands. The preflight rejects the
+    // batch and fails the run instead.
+    //
+    // Example: a run has 10 durable events and proposes 90 more, against a
+    // cap of 100. A crossing decided from 100 would stamp a warning off
+    // events that never reach `harvest_events`. The live discovery query
+    // could then never find that terminal run.
+    //
+    // `terminal_count` is what is durable once `WorkflowFailed` lands below.
+    // At every other call site the batch is already appended, so the two
+    // counts are equal and behaviour does not change there.
     //
     // Issue #1804: a byte-cap breach can also cross the event warning, so
     // the check reads the event cap from the policy, not from `breach`.
