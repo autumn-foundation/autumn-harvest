@@ -61,6 +61,6 @@ registry through `HarvestBuilder` and runs a real worker:
 - A declared `start_to_close` wins over the default.
 - A `heartbeat_timeout` or a `schedule_to_close` type gets no default.
 
-Unit tests in `builder.rs` cover the default, the opt-out, the list of
-governed types, duplicate names and the warning text, with the default on and
-off. `effective_config.rs` covers the reported value.
+Unit tests in `builder.rs` cover the default, the opt-out and the list of
+governed types. They also cover duplicate names and the warning text, with the
+default on and off. `effective_config.rs` covers the reported value.

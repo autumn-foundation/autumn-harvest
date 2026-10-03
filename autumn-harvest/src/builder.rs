@@ -4617,6 +4617,7 @@ impl WorkerConfig {
     ///
     /// Same precedence as [`WorkerConfig::with_default_activity_retry_policy`].
     /// The value replaces [`DEFAULT_ACTIVITY_START_TO_CLOSE`] (issue #1808).
+    /// It skips an activity with a `schedule_to_close` or a `heartbeat_timeout`.
     /// For *local* activities the resolved value is still clamped by
     /// [`WorkerConfig::max_local_activity_start_to_close`].
     #[must_use]

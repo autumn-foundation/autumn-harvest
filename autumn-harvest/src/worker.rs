@@ -1114,10 +1114,12 @@ impl HandlerRegistry {
 
     /// Install the builder-level default activity retry/timeout floor (issue #620).
     ///
-    /// Both are `None` by default — an unset floor is a pure no-op preserving
-    /// today's behaviour byte-for-byte. Resolved at schedule time as the
-    /// lowest-priority fallback: a call-site override or an activity's own
-    /// `#[activity(retry = …/start_to_close = …)]` default both win.
+    /// Both are `None` on a bare registry. `WorkerConfig::default()` passes a
+    /// 10-minute `start_to_close` (issue #1808). Resolved at schedule time as
+    /// the lowest-priority fallback: a call-site override or an activity's own
+    /// `#[activity(retry = …/start_to_close = …)]` default both win. The
+    /// `start_to_close` floor skips an activity with a `schedule_to_close` or
+    /// a `heartbeat_timeout`.
     #[must_use]
     pub fn with_activity_defaults(
         mut self,
