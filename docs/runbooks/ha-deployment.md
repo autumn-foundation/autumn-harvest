@@ -229,9 +229,11 @@ one pass per 32,000 live rows. A timeout can be enforced that much later.
 If the index is missing, the scan still works, but each page can read many
 terminal rows.
 
-A row that matches two reasons gets the first one, in the order above. So
-the recorded timeout type does not depend on where each cursor is. A queued
-row keeps its reason, also when an earlier reason starts to match later.
+A row that matches two reasons gets the first one, in the order above, if
+that reason's sweep can still claim it. Each lane has its own sweep clock.
+If the earlier lane has already passed the row, the later reason takes it.
+So the row does not wait for a whole sweep. A queued row keeps its reason,
+also when an earlier reason starts to match later.
 
 A row that fails to enforce is tried again on the next pass, next to the
 next batch. So one bad row does not block the rows behind it. A pass tries
@@ -255,7 +257,7 @@ Set with `WorkerConfig::with_scanner_config(ScannerConfig { .. })`:
 | `elect` | `true` | `false` makes every replica run every pass, as before #1795. |
 | `lease_ttl` | 10 s | Failover bound after a crash. Capped at 300 s, then raised to at least three times the longest sleep. |
 | `jitter` | 0.2 | Random spread of each sleep, as a fraction of the interval. Clamped to `[0, 0.9]`. |
-| `timeout_interval` | `None` | Mean time between timeout-checker ticks. `None` uses the worker poll interval (500 ms). Kept within 10 ms and 4 h. |
+| `timeout_interval` | `None` | Mean time between timeout-checker ticks. `None` uses the worker poll interval (500 ms). At least 10 ms. With `elect`, at most 4 h. |
 | `timeout_batch_size` | 500 | Most rows per timeout reason that one pass enforces. Kept within 1 and 100,000. |
 
 `GET /admin/config` reports the configured values under `worker.scanner_*`

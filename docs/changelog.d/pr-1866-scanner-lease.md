@@ -39,8 +39,10 @@ size, so adding workers to clear a backlog added database load in proportion.
   reads newer rows, and they cannot stretch a sweep or displace older rows.
   Each predicate reads the page, not the table, so no predicate index can
   scan past it.
-  A row that matches two reasons gets the first one, as in the full scan. A
-  queued row keeps that reason when an earlier one starts to match. The four
+  A row that matches two reasons gets the first one, as in the full scan,
+  if that reason's sweep can still claim it. Otherwise the later reason
+  takes it. A queued row keeps its reason when an earlier one starts to
+  match. The four
   predicate consts are unchanged, so the backup drill's `UNION` still works.
   The public `enforce_timeouts_once` keeps its full scan.
 - **Jitter.** By default, each sleep is the interval times a factor in
@@ -50,8 +52,8 @@ size, so adding workers to clear a backlog added database load in proportion.
 - **Settings.** `WorkerConfig::with_scanner_config(ScannerConfig { elect,
   lease_ttl, jitter, timeout_interval, timeout_batch_size })`, reported by
   `GET /admin/config`. `timeout_interval: None` keeps the poll-interval
-  cadence. The interval is kept within 10 ms and 4 h, so the lease always
-  covers three of the longest sleeps. The batch size is kept within 1 and
+  cadence. The interval is at least 10 ms. A leased checker caps it at 4 h,
+  so the lease always covers three of the longest sleeps. The batch size is kept within 1 and
   100,000, so a refill never reads more than 100,000 rows. The worker uses its
   `worker_id` as the holder id.
 - **Metric.** `harvest.scanner.pass{scanner, shard, role}` with `role` one of
@@ -99,6 +101,9 @@ Tests run in `scanner_lease_tests` against Postgres 16:
   (RED: the batch load dropped it).
 - A batch whose load fails stays queued, and the next pass hands it out
   (RED: the pass skipped it).
+- A row that misses its heartbeat after the heartbeat lane passed it goes
+  to the start-to-close lane's new sweep (RED: it waited for the next
+  heartbeat sweep).
 
 Unit tests cover jitter bounds and clamping, the TTL floor and caps, the role
 table, the lease SQL shape, and the batched query shape.

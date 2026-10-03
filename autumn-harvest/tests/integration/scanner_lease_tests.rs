@@ -1343,3 +1343,116 @@ async fn a_failed_batch_load_keeps_its_ids() {
         "the row of the failed load must come next, not be skipped"
     );
 }
+
+/// An earlier reason excludes a row only when its lane can still claim it.
+///
+/// The heartbeat lane keeps an old clock while it walks a long sweep, and it
+/// has passed the row. The row misses its heartbeat after that clock. The
+/// start-to-close lane then starts a new sweep with a newer clock.
+#[tokio::test]
+async fn a_row_is_not_left_to_a_lane_that_already_passed_it() {
+    let (url, _container) = setup_test_db_url().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.expect("connection");
+    let queue = "scanner-lease-clock";
+    diesel::sql_query("DELETE FROM harvest_task_queue WHERE queue_name = $1")
+        .bind::<diesel::sql_types::Text, _>(queue)
+        .execute(&mut conn)
+        .await
+        .expect("clear queue");
+    // The target is live and not expired. It sorts before the 3 expired rows.
+    let target = uuid::Uuid::new_v4();
+    diesel::sql_query(
+        "INSERT INTO harvest_task_queue \
+         (id, queue_name, task_type, input, state, attempt, max_attempts, \
+          started_at, start_to_close, created_at) \
+         VALUES ($1, $2, 'activity', '{}'::jsonb, 'RUNNING', \
+                 1, 1, NOW(), INTERVAL '1 hour', NOW() - INTERVAL '1 second')",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(target)
+    .bind::<diesel::sql_types::Text, _>(queue)
+    .execute(&mut conn)
+    .await
+    .expect("insert target");
+    let expired: Vec<uuid::Uuid> = (0..3).map(|_| uuid::Uuid::new_v4()).collect();
+    for id in &expired {
+        diesel::sql_query(
+            "INSERT INTO harvest_task_queue \
+             (id, queue_name, task_type, input, state, attempt, max_attempts, \
+              started_at, start_to_close) \
+             VALUES ($1, $2, 'activity', '{}'::jsonb, 'RUNNING', \
+                     1, 1, NOW() - INTERVAL '1 minute', INTERVAL '1 second')",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(*id)
+        .bind::<diesel::sql_types::Text, _>(queue)
+        .execute(&mut conn)
+        .await
+        .expect("insert expired task");
+    }
+
+    // Pass 1: every sweep ends on one short page. The start-to-close lane
+    // queues the 3 expired rows, so it starts no new sweep for 3 passes.
+    let mut cursor = TimeoutScanCursor::default();
+    let first = timeout::find_timed_out_tasks_batch(&mut conn, &mut cursor, 1)
+        .await
+        .expect("batch scan");
+    assert_eq!(start_to_close_ids(&first), expired[..1]);
+
+    // 600 live rows make the heartbeat lane's next sweep about 10 passes long.
+    diesel::sql_query(
+        "INSERT INTO harvest_task_queue \
+         (id, queue_name, task_type, input, state, attempt, max_attempts, \
+          started_at, start_to_close) \
+         SELECT gen_random_uuid(), $1, 'activity', '{}'::jsonb, 'RUNNING', \
+                1, 1, NOW(), INTERVAL '1 hour' \
+         FROM generate_series(1, 600)",
+    )
+    .bind::<diesel::sql_types::Text, _>(queue)
+    .execute(&mut conn)
+    .await
+    .expect("insert live tasks");
+
+    // Pass 2: the heartbeat lane starts its long sweep and reads the target
+    // while it is still live.
+    let _ = timeout::find_timed_out_tasks_batch(&mut conn, &mut cursor, 1)
+        .await
+        .expect("batch scan");
+
+    // The target now misses both its heartbeat and its start-to-close
+    // deadline. Both happen after the heartbeat lane's clock.
+    diesel::sql_query(
+        "UPDATE harvest_task_queue \
+         SET heartbeat_timeout = INTERVAL '1 second', \
+             last_heartbeat_at = NOW() - INTERVAL '1 second', \
+             started_at = NOW() - INTERVAL '1 minute', \
+             start_to_close = INTERVAL '1 second' \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(target)
+    .execute(&mut conn)
+    .await
+    .expect("expire the target");
+
+    // The start-to-close lane starts its new sweep on pass 4. The heartbeat
+    // lane reaches the target again only after its long sweep ends.
+    let mut found_at = None;
+    for pass in 3..=6 {
+        let page = timeout::find_timed_out_tasks_batch(&mut conn, &mut cursor, 1)
+            .await
+            .expect("batch scan");
+        if page.iter().any(|(t, _)| t.id == target) {
+            found_at = Some(pass);
+            break;
+        }
+    }
+
+    diesel::sql_query("DELETE FROM harvest_task_queue WHERE queue_name = $1")
+        .bind::<diesel::sql_types::Text, _>(queue)
+        .execute(&mut conn)
+        .await
+        .expect("clear queue");
+    assert!(
+        found_at.is_some(),
+        "the start-to-close lane must take the row that the heartbeat lane passed"
+    );
+}

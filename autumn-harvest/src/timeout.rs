@@ -530,7 +530,8 @@ const LIVE_ROW_KEY: &str = "COALESCE(created_at, TIMESTAMPTZ '1970-01-01 00:00:0
 ///
 /// The page holds whole rows. Each predicate then reads the page, not the
 /// table, so no predicate can fall back to its own index and scan past the
-/// page. A row that also matches an earlier reason is left to that reason. The query returns the expired ids, oldest first. It also returns the
+/// page. A row is left to an earlier reason only when that reason's lane can
+/// still claim it. The query returns the expired ids, oldest first. It also returns the
 /// key and id of the last row of the page, and the number of rows read. So
 /// the work of a refill does not grow with the backlog. One sweep reads once
 /// each row that was live at its start.
@@ -540,26 +541,41 @@ const LIVE_ROW_KEY: &str = "COALESCE(created_at, TIMESTAMPTZ '1970-01-01 00:00:0
 /// consts stay plain, because the backup drill `UNION`s them.
 ///
 /// With `after`, `$1` and `$2` are the key and id of the last row of the
-/// previous page. Then `$3` is the page size and `$4` is the sweep's clock.
-/// Without it, `$1` is the page size and `$2` is the clock.
+/// previous page. Then `$3` is the page size, `$4` is the sweep's clock and
+/// `$5` holds the clocks of the earlier lanes. Without it, `$1` is the page
+/// size, `$2` is the clock and `$3` holds the earlier clocks.
+///
+/// An earlier lane claims in its current sweep each row that it matches at
+/// its own clock and that was created by then. So each earlier reason is
+/// tested at that lane's clock. A lane with no open sweep uses this lane's
+/// clock, because its next sweep starts later.
 fn timeout_refill_query(predicate: &str, higher: &[&str], after: bool) -> String {
     use std::fmt::Write as _;
 
-    let (keyset, limit, clock) = if after {
-        (format!(" AND ({LIVE_ROW_KEY}, id) > ($1, $2)"), "$3", "$4")
+    let (keyset, limit, clock, clocks) = if after {
+        (
+            format!(" AND ({LIVE_ROW_KEY}, id) > ($1, $2)"),
+            "$3",
+            "$4",
+            "$5",
+        )
     } else {
-        (String::new(), "$1", "$2")
+        (String::new(), "$1", "$2", "$3")
     };
-    let on_page = |sql: &str| on_refill_page(sql).replace("NOW()", clock);
+    let on_page = |sql: &str, at: &str| on_refill_page(sql).replace("NOW()", at);
     // `EXCEPT` leaves a row to an earlier reason. A set operation stays near
     // linear in the page. A correlated `NOT EXISTS` on the page can run as a
     // nested loop, because the planner cannot estimate the page's rows.
-    let mut expired = format!("SELECT q.id, q.row_key FROM ({}) q", on_page(predicate));
-    for earlier in higher {
+    let mut expired = format!(
+        "SELECT q.id, q.row_key FROM ({}) q",
+        on_page(predicate, clock)
+    );
+    for (index, earlier) in higher.iter().enumerate() {
+        let at = format!("({clocks})[{}]", index + 1);
         let _ = write!(
             expired,
-            " EXCEPT SELECT h.id, h.row_key FROM ({}) h",
-            on_page(earlier)
+            " EXCEPT SELECT h.id, h.row_key FROM ({}) h WHERE h.row_key <= {at}",
+            on_page(earlier, &at)
         );
     }
     format!(
@@ -756,6 +772,8 @@ pub async fn find_timed_out_tasks_batch(
 
     let scans = task_timeout_scans();
     let predicates = scans.clone().map(|(_, predicate)| predicate);
+    // The open sweep clock of each lane already done in this pass.
+    let mut lane_clocks: Vec<Option<chrono::DateTime<chrono::Utc>>> = Vec::with_capacity(4);
     for (index, (lane, (reason, predicate))) in cursor.lanes.iter_mut().zip(scans).enumerate() {
         let higher = &predicates[..index];
         if lane.queued.is_empty() && lane.after.is_none() {
@@ -769,6 +787,7 @@ pub async fn find_timed_out_tasks_batch(
         if lane.queued.is_empty()
             && let Some(as_of) = lane.as_of
         {
+            let earlier: Vec<_> = lane_clocks.iter().map(|c| c.unwrap_or(as_of)).collect();
             let refill: Vec<Refill> = match lane.after {
                 Some((after_key, after_id)) => {
                     diesel::sql_query(timeout_refill_query(predicate, higher, true))
@@ -776,6 +795,9 @@ pub async fn find_timed_out_tasks_batch(
                         .bind::<diesel::sql_types::Uuid, _>(after_id)
                         .bind::<diesel::sql_types::BigInt, _>(page_rows)
                         .bind::<diesel::sql_types::Timestamptz, _>(as_of)
+                        .bind::<diesel::sql_types::Array<diesel::sql_types::Timestamptz>, _>(
+                            &earlier,
+                        )
                         .load(conn)
                         .await
                 }
@@ -783,6 +805,9 @@ pub async fn find_timed_out_tasks_batch(
                     diesel::sql_query(timeout_refill_query(predicate, higher, false))
                         .bind::<diesel::sql_types::BigInt, _>(page_rows)
                         .bind::<diesel::sql_types::Timestamptz, _>(as_of)
+                        .bind::<diesel::sql_types::Array<diesel::sql_types::Timestamptz>, _>(
+                            &earlier,
+                        )
                         .load(conn)
                         .await
                 }
@@ -800,6 +825,7 @@ pub async fn find_timed_out_tasks_batch(
             lane.queued
                 .extend(refill.into_iter().flat_map(|r| r.expired));
         }
+        lane_clocks.push(lane.as_of);
 
         // Retried ids ride along outside the limit, so a row that keeps
         // failing cannot stall the rows behind it. The lane gives up the ids
@@ -5517,6 +5543,19 @@ pub fn spawn_coordinated_timeout_checker_for_shard(
     )
 }
 
+/// The tick interval of a timeout checker.
+///
+/// A zero interval would busy-spin and time out every checkout, so every
+/// checker gets the floor. Only a leased checker gets the cap, because the
+/// cap keeps three of its sleeps within the lease TTL.
+fn checker_interval(interval: Duration, leased: bool) -> Duration {
+    if leased {
+        crate::scanner_lease::scanner_interval(interval)
+    } else {
+        interval.max(crate::scanner_lease::MIN_SCANNER_INTERVAL)
+    }
+}
+
 /// [`spawn_timeout_checker_for_shard`] for a caller that knows `pool`'s shard.
 ///
 /// `pool_shard` must name the shard whose own pool `pool` is. `shard` stays
@@ -5551,8 +5590,7 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
 ) -> tokio::task::JoinHandle<()> {
     use crate::scanner_lease::{ScannerLease, ScannerRole};
 
-    // A zero interval would busy-spin and time out every checkout.
-    let interval = crate::scanner_lease::scanner_interval(interval);
+    let interval = checker_interval(interval, coordination.holder.is_some());
     let jitter = coordination.jitter;
     // Liveness judges the loop against its longest sleep, not its mean.
     let longest_sleep = crate::scanner_lease::max_jittered_interval(interval, jitter);
@@ -6487,8 +6525,11 @@ mod tests {
     fn refill_query_leaves_a_row_to_the_first_reason_it_matches() {
         let higher = heartbeat_timeout_query();
         let sql = timeout_refill_query(start_to_close_timeout_query(), &[higher], true);
-        let higher = on_refill_page(higher).replace("NOW()", "$4");
-        assert!(sql.contains(&format!(" EXCEPT SELECT h.id, h.row_key FROM ({higher}) h")));
+        // The earlier reason is tested at its own lane's clock.
+        let higher = on_refill_page(higher).replace("NOW()", "($5)[1]");
+        assert!(sql.contains(&format!(
+            " EXCEPT SELECT h.id, h.row_key FROM ({higher}) h WHERE h.row_key <= ($5)[1]"
+        )));
     }
 
     #[test]
@@ -6521,6 +6562,20 @@ mod tests {
         lane.commit_batch(3);
         assert_eq!(lane.retry, Vec::<uuid::Uuid>::new());
         assert_eq!(lane.queued.len(), 2);
+    }
+
+    #[test]
+    fn only_a_leased_checker_caps_its_interval() {
+        use crate::scanner_lease::{MAX_SCANNER_INTERVAL, MIN_SCANNER_INTERVAL};
+        let day = Duration::from_secs(24 * 3600);
+        assert_eq!(checker_interval(day, true), MAX_SCANNER_INTERVAL);
+        assert_eq!(checker_interval(day, false), day);
+        for leased in [true, false] {
+            assert_eq!(
+                checker_interval(Duration::ZERO, leased),
+                MIN_SCANNER_INTERVAL
+            );
+        }
     }
 
     #[test]

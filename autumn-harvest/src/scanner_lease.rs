@@ -159,8 +159,8 @@ pub struct ScannerConfig {
     /// to [`DEFAULT_SCANNER_JITTER`]. Clamped to `[0, MAX_SCANNER_JITTER]`.
     pub jitter: f64,
     /// Mean time between timeout-checker ticks. `None`, the default, uses the
-    /// worker poll interval (500 ms by default). Kept within
-    /// [`MIN_SCANNER_INTERVAL`] and [`MAX_SCANNER_INTERVAL`].
+    /// worker poll interval (500 ms by default). At least
+    /// [`MIN_SCANNER_INTERVAL`]. With `elect`, at most [`MAX_SCANNER_INTERVAL`].
     pub timeout_interval: Option<Duration>,
     /// Most rows per timeout reason that one timeout pass enforces. Defaults
     /// to [`DEFAULT_TIMEOUT_SCAN_BATCH_SIZE`]. Kept within 1 and 100,000.
