@@ -1171,7 +1171,9 @@ fn unconditional(s: &Stmts) -> Vec<bool> {
             Some("end") if ["if", "loop", "case"].iter().any(|w| s.is(k + 1, w)) => {
                 *branches = branches.saturating_sub(1);
             }
-            Some("if") if !after_end && !s.is(k + 1, "not") && !s.is(k + 1, "exists") => {
+            // A control-flow `IF` starts a statement. The `IF [NOT] EXISTS` of
+            // a DDL statement sits in the middle of one.
+            Some("if") if !after_end && s.starts[k] == k => {
                 *branches += 1;
             }
             Some("loop" | "case") if !after_end => *branches += 1,
@@ -2742,6 +2744,26 @@ fn a_renamed_table_keeps_its_indexes() {
     let sql = "SET LOCAL lock_timeout = '5s';\nDROP INDEX idx_replacement;";
     let findings = lint_with_history(&history, sql, true);
     assert_eq!(rules(&findings), [Rule::BlockingIndex], "{findings:?}");
+}
+
+#[test]
+fn if_not_and_if_exists_branches_are_conditional() {
+    for cond in [
+        "IF NOT ready THEN",
+        "IF EXISTS (SELECT 1 FROM harvest_schedules) THEN",
+    ] {
+        let sql = format!(
+            "DO $$\nDECLARE\n    ready boolean := true;\nBEGIN\n{cond}\n    \
+             PERFORM set_config('lock_timeout', '5s', true);\nEND IF;\nEND $$;\n\
+             ALTER TABLE harvest_events ADD COLUMN x INT;"
+        );
+        let findings = lint_with_history(&[], &sql, true);
+        assert_eq!(
+            rules(&findings),
+            [Rule::LockTimeout],
+            "{cond}: {findings:?}"
+        );
+    }
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────
