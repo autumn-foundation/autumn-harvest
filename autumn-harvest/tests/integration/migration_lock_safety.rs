@@ -835,11 +835,18 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
     // A table counts as new from its `CREATE TABLE` on. `IF NOT EXISTS` can
     // do nothing, so it does not count.
     let mut created: BTreeMap<String, usize> = BTreeMap::new();
+    // A function body never runs here, so it changes no state. Its locks
+    // still count, which fails closed.
+    let mut not_run: BTreeMap<String, usize> = BTreeMap::new();
+    let unconditional = unconditional(&s);
 
     for (k, tok) in toks.iter().enumerate() {
         let start = s.starts[k] == k;
         match s.word(k) {
-            Some("create") if start => create(&s, k, &mut raws, &mut created),
+            Some("create") if start => {
+                let created = if tok.runs { &mut created } else { &mut not_run };
+                create(&s, k, &mut raws, created);
+            }
             Some("drop") if start => drop(&s, k, history, &mut raws),
             Some("alter") if start => alter(&s, k, history, &mut raws),
             Some(verb @ ("lock" | "truncate")) if start => {
@@ -866,7 +873,7 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
             Some("references") => {
                 let owner = s.statement_table(s.starts[k]);
                 if let Some((target, _)) = s.qualified_name(k + 1) {
-                    if let Some(owner) = owner {
+                    if let Some(owner) = owner.filter(|_| tok.runs) {
                         history
                             .references
                             .entry(owner)
@@ -880,7 +887,7 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
                 let parent = s.qualified_name(k + 2).map(|(t, _)| t);
                 raws.push(Raw::lock(s.starts[k], "PARTITION OF", parent));
             }
-            _ if tok.runs => {
+            _ if tok.runs && unconditional[k] => {
                 timeouts.extend(timeout_change(&s, k).map(|bounds| (k, bounds)));
             }
             _ => {}
@@ -896,7 +903,10 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
                 .and_then(|i| history.indexes.get(i))
                 .cloned()
         });
-        if let (Some(index), Some(table), "CREATE INDEX") = (&raw.index, &table, raw.verb) {
+        let runs = toks[raw.at].runs;
+        if let (Some(index), Some(table), "CREATE INDEX", true) =
+            (&raw.index, &table, raw.verb, runs)
+        {
             history.indexes.insert(index.clone(), table.clone());
         }
         let hot = table.as_deref().is_none_or(|t| {
@@ -923,6 +933,39 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
         timeouts,
         statement_count,
     }
+}
+
+/// Whether each token runs on every path through its `DO` body.
+///
+/// A token inside an `IF`, `CASE` or `LOOP`, or after `EXCEPTION`, may not
+/// run. A `CASE` expression that ends in a bare `END` leaves the rest of the
+/// body conditional, which fails closed. A top-level token always runs.
+fn unconditional(s: &Stmts) -> Vec<bool> {
+    let mut out = Vec::with_capacity(s.toks.len());
+    let mut depth = 0;
+    let mut branches = 0_usize;
+    let mut handler = false;
+    for (k, tok) in s.toks.iter().enumerate() {
+        if tok.depth != depth {
+            depth = tok.depth;
+            branches = 0;
+            handler = false;
+        }
+        let after_end = k > 0 && s.is(k - 1, "end");
+        match s.word(k) {
+            Some("end") if ["if", "loop", "case"].iter().any(|w| s.is(k + 1, w)) => {
+                branches = branches.saturating_sub(1);
+            }
+            Some("if") if !after_end && !s.is(k + 1, "not") && !s.is(k + 1, "exists") => {
+                branches += 1;
+            }
+            Some("loop" | "case") if !after_end => branches += 1,
+            Some("exception") => handler = true,
+            _ => {}
+        }
+        out.push(depth == 0 || (branches == 0 && !handler));
+    }
+    out
 }
 
 /// The `lock_timeout` change at token `k`, if any: whether it sets a bound.
@@ -1050,6 +1093,7 @@ fn drop(s: &Stmts, k: usize, history: &History, raws: &mut Vec<Raw>) {
         }
         Some("trigger") => raws.push(Raw::lock(k, "DROP TRIGGER", s.name_after(k + 2, "on"))),
         Some("policy") => raws.push(Raw::lock(k, "DROP POLICY", s.name_after(k + 2, "on"))),
+        Some("rule") => raws.push(Raw::lock(k, "DROP RULE", s.name_after(k + 2, "on"))),
         _ => {}
     }
 }
@@ -1873,6 +1917,50 @@ fn using_index_exempts_only_its_own_alter_action() {
                ADD CONSTRAINT p PRIMARY KEY USING INDEX idx_p;";
     let findings = lint_with_history(&[], sql, true);
     assert_eq!(rules(&findings), [Rule::BlockingIndex], "{findings:?}");
+}
+
+#[test]
+fn a_create_table_in_a_function_body_does_not_make_a_table_new() {
+    let sql = "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$\n\
+               BEGIN\n    CREATE TEMP TABLE harvest_events (id INT);\nEND $$;\n\
+               ALTER TABLE harvest_events ADD COLUMN x INT;\n";
+    let findings = lint_with_history(&[], sql, true);
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.rule == Rule::LockTimeout && f.line == 5),
+        "{findings:?}"
+    );
+}
+
+#[test]
+fn drop_rule_locks_its_table() {
+    let findings = lint_with_history(&[], "DROP RULE IF EXISTS r ON harvest_events;", true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+}
+
+#[test]
+fn a_timeout_set_on_a_conditional_path_does_not_count() {
+    let lock = "\nALTER TABLE harvest_events ADD COLUMN x INT;\n";
+    for body in [
+        "IF false THEN\n    PERFORM set_config('lock_timeout', '5s', true);\nEND IF;",
+        "FOR i IN 1..0 LOOP\n    PERFORM set_config('lock_timeout', '5s', true);\nEND LOOP;",
+        "NULL;\nEXCEPTION WHEN others THEN\n    PERFORM set_config('lock_timeout', '5s', true);",
+    ] {
+        let sql = format!("DO $$\nBEGIN\n{body}\nEND $$;{lock}");
+        let findings = lint_with_history(&[], &sql, true);
+        assert_eq!(
+            rules(&findings),
+            [Rule::LockTimeout],
+            "{body}: {findings:?}"
+        );
+    }
+    // A setter after a closed branch runs on every path.
+    let after = format!(
+        "DO $$\nBEGIN\nIF false THEN\n    NULL;\nEND IF;\n\
+         PERFORM set_config('lock_timeout', '5s', true);\nEND $$;{lock}"
+    );
+    assert_eq!(lint_with_history(&[], &after, true), []);
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────

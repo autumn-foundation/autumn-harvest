@@ -49,7 +49,7 @@ These statements take a blocking lock for `lock-timeout`:
 - `ALTER TABLE`, in every form;
 - `LOCK TABLE`, `DROP TABLE`, `TRUNCATE`, `CLUSTER` and `VACUUM FULL`;
 - `CREATE`, `ALTER` and `DROP TRIGGER`; `CREATE`, `ALTER` and `DROP POLICY`;
-  `CREATE RULE`; `ALTER INDEX`;
+  `CREATE` and `DROP RULE`; `ALTER INDEX`;
 - `REFERENCES` on a hot table, in a new table or a new constraint. A foreign key
   takes `SHARE ROW EXCLUSIVE` on the table it references;
 - `DROP TABLE`, or `ALTER TABLE ... DROP CONSTRAINT`, on a table with a foreign
@@ -82,7 +82,8 @@ not accept it. `SET lock_timeout` must be its own statement. `ALTER ROLE ...
 SET lock_timeout` does not change the current session. Inside a `DO` block,
 `PERFORM set_config('lock_timeout', '5s', true)` also counts. The same call in a
 function body does not count, because the body runs only when something calls
-the function.
+the function. A setter inside an `IF`, `CASE`, `LOOP` or `EXCEPTION` branch
+does not count either, because the branch may not run.
 
 `5s` is the bound that the existing lock-taking migrations use. When the
 timeout fires, the migration fails and rolls back. Run it again.
