@@ -66,6 +66,9 @@ pub const DEFAULT_PAYLOAD_OFFLOAD_THRESHOLD: u64 = 256 * 1024;
 /// an error. Configurable via [`WorkerConfig::with_retry_after_ceiling`].
 pub const DEFAULT_RETRY_AFTER_CEILING: Duration = Duration::from_secs(15 * 60);
 
+/// Default activity `start_to_close` timeout (issue #1808): 10 minutes.
+pub const DEFAULT_ACTIVITY_START_TO_CLOSE: Duration = Duration::from_secs(10 * 60);
+
 /// Default sticky routing window (issue #1798): 5 seconds.
 ///
 /// A follow-up task of a suspended execution waits up to this long for the
@@ -144,6 +147,9 @@ pub struct HarvestBuilder {
     unknown_target_grace_window: Option<Duration>,
     /// Hard caps for `POST /workflows/batch_start` (issue #357).
     batch_start_config: BatchStartConfig,
+    /// Automatic per-queue load shedding (issue #1794). An empty config turns
+    /// it off.
+    load_shed: crate::load_shed::LoadShedConfig,
     /// Declarative completion triggers (issue #517).
     completion_triggers: Vec<crate::completion_trigger::CompletionTrigger>,
     /// Server-side ceiling on `workflow_attempt` (issue #523).
@@ -212,6 +218,7 @@ impl Default for HarvestBuilder {
             max_workflow_start_delay: None,
             unknown_target_grace_window: None,
             batch_start_config: BatchStartConfig::default(),
+            load_shed: crate::load_shed::LoadShedConfig::new(),
             completion_triggers: Vec::new(),
             max_workflow_attempts: None,
             usage_window_ceiling: None,
@@ -272,6 +279,7 @@ impl std::fmt::Debug for HarvestBuilder {
                 &self.unknown_target_grace_window,
             )
             .field("batch_start_config", &self.batch_start_config)
+            .field("load_shed", &self.load_shed)
             .field("max_workflow_attempts", &self.max_workflow_attempts)
             .field("usage_window_ceiling", &self.usage_window_ceiling)
             .field("usage_max_groups", &self.usage_max_groups)
@@ -341,6 +349,9 @@ pub struct BuiltHarvest {
     pub unknown_target_grace_window: Duration,
     /// Hard caps for `POST /workflows/batch_start` (issue #357).
     pub batch_start_config: BatchStartConfig,
+    /// Automatic per-queue load shedding (issue #1794). An empty config turns
+    /// it off.
+    pub load_shed: crate::load_shed::LoadShedConfig,
     /// Declarative completion triggers (issue #517).
     completion_triggers: Vec<crate::completion_trigger::CompletionTrigger>,
     /// Server-side ceiling on workflow retry attempts (issue #523). `None` = no ceiling.
@@ -427,6 +438,7 @@ impl std::fmt::Debug for BuiltHarvest {
                 &self.unknown_target_grace_window,
             )
             .field("batch_start_config", &self.batch_start_config)
+            .field("load_shed", &self.load_shed)
             .field("max_workflow_attempts", &self.max_workflow_attempts)
             .field("usage_window_ceiling", &self.usage_window_ceiling)
             .field("usage_max_groups", &self.usage_max_groups)
@@ -1310,7 +1322,8 @@ impl BuiltHarvest {
             self.worker_config.default_activity_retry_policy.clone(),
             self.worker_config.default_activity_start_to_close,
         )
-        .with_retry_after_ceiling(self.worker_config.retry_after_ceiling);
+        .with_retry_after_ceiling(self.worker_config.retry_after_ceiling)
+        .with_retry_budget(self.worker_config.retry_budget.clone());
         #[cfg(feature = "wasm-activities")]
         if let Some(store) = self.wasm_store {
             registry = registry.with_wasm_activities(
@@ -1410,7 +1423,8 @@ impl BuiltHarvest {
             self.worker_config.default_activity_retry_policy.clone(),
             self.worker_config.default_activity_start_to_close,
         )
-        .with_retry_after_ceiling(self.worker_config.retry_after_ceiling);
+        .with_retry_after_ceiling(self.worker_config.retry_after_ceiling)
+        .with_retry_budget(self.worker_config.retry_budget.clone());
         #[cfg(feature = "wasm-activities")]
         if let Some(store) = self.wasm_store {
             registry = registry.with_wasm_activities(
@@ -2374,6 +2388,17 @@ impl HarvestBuilder {
         self
     }
 
+    /// Turn on automatic load shedding for the queues in `config` (issue #1794).
+    ///
+    /// A queue with an old backlog then refuses new starts with `429` and
+    /// `Retry-After`. See `docs/operations/load-shedding.md`. The default
+    /// config is empty, so no queue sheds and no sampler runs.
+    #[must_use]
+    pub fn load_shed(mut self, config: crate::load_shed::LoadShedConfig) -> Self {
+        self.load_shed = config;
+        self
+    }
+
     /// Number of registered workflows (used in tests and diagnostics).
     #[must_use]
     pub const fn workflow_count(&self) -> usize {
@@ -2490,6 +2515,19 @@ impl HarvestBuilder {
             }
         }
 
+        // Issue #1808: warn about each activity type that has no timeout.
+        // A WASM guest has a runtime wall-clock ceiling. Skip WASM activity types.
+        let unbounded = activities_without_timeout(&self.activities);
+        #[cfg(feature = "wasm-activities")]
+        let unbounded: Vec<&str> = unbounded
+            .into_iter()
+            .filter(|name| !self.wasm_bindings.contains_key(*name))
+            .collect();
+        warn_on_activities_without_timeout(
+            &unbounded,
+            self.worker_config.default_activity_start_to_close,
+        );
+
         let mut worker_config = self.worker_config;
         let max_workflow_start_delay = self
             .max_workflow_start_delay
@@ -2546,6 +2584,7 @@ impl HarvestBuilder {
             max_workflow_start_delay,
             unknown_target_grace_window,
             batch_start_config: self.batch_start_config,
+            load_shed: self.load_shed,
             completion_triggers: self.completion_triggers,
             max_workflow_attempts: self.max_workflow_attempts,
             usage_window_ceiling,
@@ -2805,6 +2844,53 @@ fn warn_if_heartbeat_outruns_fleet_liveness(interval: Duration) -> bool {
          that the configured-total redelivery bound may fire early for this fleet."
     );
     true
+}
+
+/// Name each regular activity type that declares no attempt bound (issue #1808).
+///
+/// These are the types that the default `start_to_close` governs. See
+/// [`ActivityInfo::declares_attempt_bound`]. The local cap always bounds a
+/// local activity. The registry keeps the last registration of a name, so
+/// this function does too.
+fn activities_without_timeout(activities: &[ActivityInfo]) -> Vec<&'static str> {
+    let mut last: Vec<&ActivityInfo> = Vec::new();
+    for activity in activities {
+        last.retain(|seen| seen.name != activity.name);
+        last.push(activity);
+    }
+    last.into_iter()
+        .filter(|a| !a.is_local && !a.declares_attempt_bound())
+        .map(|a| a.name)
+        .collect()
+}
+
+/// Log one startup warning that names activity types with no bound (issue #1808).
+///
+/// With a default timeout, the default stops each attempt of these types. With
+/// no default, an attempt can run forever and hold a worker slot. The warning
+/// never blocks the build.
+fn warn_on_activities_without_timeout(names: &[&str], default_start_to_close: Option<Duration>) {
+    if names.is_empty() {
+        return;
+    }
+    let activity_types = names.join(", ");
+    if let Some(default) = default_start_to_close {
+        tracing::warn!(
+            activity_types = %activity_types,
+            default_activity_start_to_close = ?default,
+            "harvest: these activity types declare no start_to_close, schedule_to_close or \
+             heartbeat_timeout (issue #1808). The default activity start_to_close fails each \
+             attempt that runs longer. Set #[activity(start_to_close = \"...\")] on each type."
+        );
+    } else {
+        tracing::warn!(
+            activity_types = %activity_types,
+            "harvest: these activity types declare no start_to_close, schedule_to_close or \
+             heartbeat_timeout (issue #1808). The default activity start_to_close is off, so an \
+             attempt can run forever and hold a worker slot. Set \
+             #[activity(start_to_close = \"...\")] on each type."
+        );
+    }
 }
 
 /// Validates that every per-workflow-type retention override (issue #737)
@@ -3467,6 +3553,12 @@ pub struct WorkerConfig {
     pub shutdown_timeout: Duration,
     /// Maximum cached in-memory workflow states (LRU eviction).
     pub workflow_cache_size: usize,
+    /// Whether a cache entry keeps the suspended workflow resident, so a warm
+    /// decision skips replay (issue #1798).
+    ///
+    /// Default: `true`. It has no effect when sticky routing is off. See
+    /// [`Self::with_resident_workflows`].
+    pub resident_workflows: bool,
     /// How long to offer sticky tasks to the sticky worker before fallback.
     ///
     /// Default: [`DEFAULT_STICKY_TIMEOUT`] (5 s). Zero disables sticky
@@ -3512,7 +3604,10 @@ pub struct WorkerConfig {
     ///
     /// Same precedence as [`WorkerConfig::default_activity_retry_policy`]:
     /// call-site override → activity default → this builder default → no
-    /// timeout. `None` (the default) is opt-in. For *local* activities the
+    /// timeout. The default is [`DEFAULT_ACTIVITY_START_TO_CLOSE`] (issue #1808).
+    /// A hung activity then cannot hold a worker slot forever. The default
+    /// skips an activity that declares a `schedule_to_close` or a heartbeat
+    /// timeout. `None` removes the default. For *local* activities the
     /// resolved value is still clamped by
     /// [`WorkerConfig::max_local_activity_start_to_close`]. Set via
     /// [`WorkerConfig::with_default_activity_start_to_close`].
@@ -3524,9 +3619,8 @@ pub struct WorkerConfig {
     /// downstream's `Retry-After` response header). This ceiling bounds that
     /// hint so a misbehaving/malicious downstream cannot park a task for an
     /// unbounded duration — an over-ceiling hint is clamped down, never
-    /// rejected. Unlike the two builder-default floors above this is **not**
-    /// opt-in: it always applies, with the sane default
-    /// [`DEFAULT_RETRY_AFTER_CEILING`]. Set via
+    /// rejected. This ceiling always applies. It has no `None` form.
+    /// The default is [`DEFAULT_RETRY_AFTER_CEILING`]. Set via
     /// [`WorkerConfig::with_retry_after_ceiling`].
     pub retry_after_ceiling: Duration,
     /// How often the worker upserts its liveness row in `harvest_workers`.
@@ -3843,6 +3937,18 @@ pub struct WorkerConfig {
     /// keyed codec is registered, so this costs nothing on a deployment that has
     /// not adopted key rotation. Set via `with_codec_rotation_batch_size`.
     pub codec_rotation_batch_size: i64,
+    /// Per-activity-type retry budgets (issue #1793).
+    ///
+    /// **On by default.** Every activity type gets the default
+    /// [`RetryBudgetPolicy`](crate::policy::RetryBudgetPolicy). The default
+    /// has a 10 % ratio, 10 tokens of capacity and 1 refill token each second.
+    /// An empty budget defers a retry and never drops it. Use
+    /// [`RetryBudgetConfig::disabled`](crate::retry_budget::RetryBudgetConfig::disabled)
+    /// to turn it off. Set via `with_retry_budget`.
+    ///
+    /// The Postgres worker enforces the budget. Local activities and the
+    /// `autumn-harvest-sqlite` backend do not use it.
+    pub retry_budget: crate::retry_budget::RetryBudgetConfig,
 }
 
 /// Drop duplicate shard ids, preserving first-occurrence order (issue #797).
@@ -3958,12 +4064,13 @@ impl Default for WorkerConfig {
             max_concurrent_activities: 50,
             shutdown_timeout: Duration::from_secs(30),
             workflow_cache_size: 1000,
+            resident_workflows: true,
             sticky_timeout: DEFAULT_STICKY_TIMEOUT,
             cancellation_grace_period: Duration::from_secs(5),
             shard_assignments: Vec::new(),
             max_local_activity_start_to_close: Duration::from_secs(60),
             default_activity_retry_policy: None,
-            default_activity_start_to_close: None,
+            default_activity_start_to_close: Some(DEFAULT_ACTIVITY_START_TO_CLOSE),
             retry_after_ceiling: DEFAULT_RETRY_AFTER_CEILING,
             worker_heartbeat_interval: Duration::from_secs(5),
             build_id: String::new(),
@@ -3990,6 +4097,7 @@ impl Default for WorkerConfig {
             sharded_pool: None,
             max_concurrent_sessions: 0,
             codec_rotation_batch_size: crate::codec_rotation::CODEC_ROTATION_DEFAULT_BATCH,
+            retry_budget: crate::retry_budget::RetryBudgetConfig::default(),
         }
     }
 }
@@ -4421,6 +4529,35 @@ impl WorkerConfig {
         self
     }
 
+    /// Turn resident workflow state on or off (issue #1798).
+    ///
+    /// Resident state is **on by default**. A warm cache entry then keeps the
+    /// suspended workflow itself, not only its events. The next decision on
+    /// this worker sends the new result to the parked future. It does not
+    /// replay history, so its cost does not grow with history length.
+    ///
+    /// A resident entry also holds the parked future and its context, which
+    /// keeps a second copy of the history. Turn this off to save that memory.
+    ///
+    /// Only some suspensions stay resident, and any other delta falls back to
+    /// a cold replay. See `docs/sticky-routing.md`. Turn it off to replay
+    /// every decision while the event cache stays warm. It has no effect
+    /// when sticky routing is off.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use autumn_harvest::builder::WorkerConfig;
+    ///
+    /// let config = WorkerConfig::default().with_resident_workflows(false);
+    /// assert!(!config.resident_workflows);
+    /// ```
+    #[must_use]
+    pub const fn with_resident_workflows(mut self, enabled: bool) -> Self {
+        self.resident_workflows = enabled;
+        self
+    }
+
     /// Attach a key-value capability label (issue #382).
     #[must_use]
     pub fn with_label(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
@@ -4536,11 +4673,23 @@ impl WorkerConfig {
     /// Set the builder-level default activity `start_to_close` timeout (issue #620).
     ///
     /// Same precedence as [`WorkerConfig::with_default_activity_retry_policy`].
+    /// The value replaces [`DEFAULT_ACTIVITY_START_TO_CLOSE`] (issue #1808).
+    /// It skips an activity with a `schedule_to_close` or a `heartbeat_timeout`.
     /// For *local* activities the resolved value is still clamped by
     /// [`WorkerConfig::max_local_activity_start_to_close`].
     #[must_use]
     pub const fn with_default_activity_start_to_close(mut self, timeout: Duration) -> Self {
         self.default_activity_start_to_close = Some(timeout);
+        self
+    }
+
+    /// Remove the default activity `start_to_close` timeout (issue #1808).
+    ///
+    /// An activity with no timeout of its own can then run forever and hold a
+    /// worker slot. `try_build` logs a warning that names each such type.
+    #[must_use]
+    pub const fn without_default_activity_start_to_close(mut self) -> Self {
+        self.default_activity_start_to_close = None;
         self
     }
 
@@ -4550,6 +4699,14 @@ impl WorkerConfig {
     #[must_use]
     pub const fn with_retry_after_ceiling(mut self, ceiling: Duration) -> Self {
         self.retry_after_ceiling = ceiling;
+        self
+    }
+
+    /// Set the per-activity-type retry budgets (issue #1793). See
+    /// [`WorkerConfig::retry_budget`].
+    #[must_use]
+    pub fn with_retry_budget(mut self, config: crate::retry_budget::RetryBudgetConfig) -> Self {
+        self.retry_budget = config;
         self
     }
 }
@@ -5404,6 +5561,44 @@ mod tests {
         assert_eq!(registry.retry_after_ceiling, Duration::from_secs(77));
     }
 
+    /// The worker registry enforces the configured retry budget (issue #1793).
+    #[cfg(feature = "db")]
+    #[test]
+    fn harvest_builder_wires_retry_budget_into_worker_registry() {
+        use crate::policy::RetryBudgetPolicy;
+        use crate::retry_budget::RetryBudgetConfig;
+
+        let _guard = crate::start_idempotency::PURGE_WINDOW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let config = RetryBudgetConfig::default()
+            .with_activity("charge_card", Some(RetryBudgetPolicy::new(0.5, 3.0, 0.0)))
+            .with_activity("send_email", None);
+        let built = HarvestBuilder::new()
+            .worker(WorkerConfig::default().with_retry_budget(config.clone()))
+            .build();
+        let (registry, _dags, _schedules, _worker_config) = built.into_worker_parts();
+        assert_eq!(registry.retry_budgets().config(), &config);
+
+        let built = HarvestBuilder::new()
+            .worker(WorkerConfig::default().with_retry_budget(config.clone()))
+            .build();
+        let (registry, _dags, _schedules, _worker_config) =
+            built.into_worker_parts_with_extra_state(crate::context::SharedStateMap::new());
+        assert_eq!(registry.retry_budgets().config(), &config);
+    }
+
+    /// The retry budget is on by default (issue #1793).
+    #[test]
+    fn worker_config_retry_budget_is_on_by_default() {
+        let config = WorkerConfig::default();
+        assert_eq!(
+            config.retry_budget.default_policy(),
+            Some(crate::policy::RetryBudgetPolicy::default())
+        );
+    }
+
     #[test]
     fn harvest_builder_telemetry_override_is_propagated() {
         use crate::telemetry::{TelemetryConfig, TraceContextCarrier, TraceContextPropagator};
@@ -6183,9 +6378,11 @@ mod tests {
             config.default_activity_retry_policy.is_none(),
             "default activity retry policy must be unset by default (opt-in)"
         );
-        assert!(
-            config.default_activity_start_to_close.is_none(),
-            "default activity start_to_close must be unset by default (opt-in)"
+        // Issue #1808 replaces the opt-in start_to_close floor with a shipped
+        // default. The retry floor stays opt-in.
+        assert_eq!(
+            config.default_activity_start_to_close,
+            Some(DEFAULT_ACTIVITY_START_TO_CLOSE),
         );
 
         // The two builder methods set the floors and are chainable.
@@ -6203,6 +6400,154 @@ mod tests {
             configured.default_activity_start_to_close,
             Some(Duration::from_secs(300)),
         );
+    }
+
+    // ── Shipped activity start-to-close default (issue #1808) ─────────────
+
+    #[test]
+    fn worker_config_default_activity_start_to_close_is_ten_minutes() {
+        assert_eq!(DEFAULT_ACTIVITY_START_TO_CLOSE, Duration::from_secs(600));
+        assert_eq!(
+            WorkerConfig::default().default_activity_start_to_close,
+            Some(DEFAULT_ACTIVITY_START_TO_CLOSE),
+        );
+    }
+
+    #[test]
+    fn without_default_activity_start_to_close_clears_the_default() {
+        let config = WorkerConfig::default().without_default_activity_start_to_close();
+        assert_eq!(config.default_activity_start_to_close, None);
+    }
+
+    /// One regular activity type per bound, two with no bound, and one local type.
+    fn timeout_matrix() -> Vec<ActivityInfo> {
+        let mut stc = make_activity("has_stc", None, None);
+        stc.default_start_to_close = Some(Duration::from_secs(30));
+        let mut s2c = make_activity("has_s2c", None, None);
+        s2c.default_schedule_to_close = Some(Duration::from_secs(30));
+        let mut hb = make_activity("has_heartbeat", None, None);
+        hb.default_heartbeat_timeout = Some(Duration::from_secs(30));
+        vec![
+            make_activity("bare_one", None, None),
+            stc,
+            s2c,
+            hb,
+            make_local_activity("bare_local", None),
+            make_activity("bare_two", None, None),
+        ]
+    }
+
+    #[test]
+    fn activities_without_timeout_names_only_unbounded_regular_types() {
+        // The local cap always bounds a local activity.
+        assert_eq!(
+            activities_without_timeout(&timeout_matrix()),
+            vec!["bare_one", "bare_two"],
+        );
+    }
+
+    #[test]
+    fn activities_without_timeout_uses_the_last_registration_of_a_name() {
+        let mut bounded = make_activity("twice", None, None);
+        bounded.default_start_to_close = Some(Duration::from_secs(30));
+        // The registry keeps the last registration, so the name is bounded.
+        let first_bare = vec![make_activity("twice", None, None), bounded];
+        assert_eq!(activities_without_timeout(&first_bare), Vec::<&str>::new());
+        // A name registered twice with no bound is listed once.
+        let both_bare = vec![
+            make_activity("twice", None, None),
+            make_activity("twice", None, None),
+        ];
+        assert_eq!(activities_without_timeout(&both_bare), vec!["twice"]);
+    }
+
+    /// A writer that keeps every formatted log line in memory.
+    #[derive(Clone, Default)]
+    struct LogBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Run `f` and return the WARN lines that it logs.
+    fn capture_warnings(f: impl FnOnce()) -> String {
+        let buf = LogBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = buf.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    /// The log line that names the activity types with no bound.
+    fn timeout_warning(logs: &str) -> Option<&str> {
+        logs.lines().find(|l| l.contains("issue #1808"))
+    }
+
+    #[test]
+    fn startup_warning_lists_offending_activity_types() {
+        let logs = capture_warnings(|| {
+            HarvestBuilder::new()
+                .activities(timeout_matrix())
+                .try_build()
+                .expect("a missing timeout never blocks the build");
+        });
+        let line = timeout_warning(&logs).expect("try_build logs the warning");
+        assert!(line.contains("WARN"), "{line}");
+        assert!(line.contains("bare_one, bare_two"), "{line}");
+        for bounded in ["has_stc", "has_s2c", "has_heartbeat", "bare_local"] {
+            assert!(!line.contains(bounded), "{bounded} is bounded: {line}");
+        }
+        // The line names the default that bounds these types.
+        assert!(
+            line.contains("default_activity_start_to_close=600s"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn startup_warning_says_unbounded_when_the_default_is_off() {
+        let logs = capture_warnings(|| {
+            HarvestBuilder::new()
+                .activities(timeout_matrix())
+                .worker(WorkerConfig::default().without_default_activity_start_to_close())
+                .try_build()
+                .expect("a missing timeout never blocks the build");
+        });
+        let line = timeout_warning(&logs).expect("try_build logs the warning");
+        assert!(line.contains("bare_one, bare_two"), "{line}");
+        assert!(line.contains("can run forever"), "{line}");
+    }
+
+    #[test]
+    fn startup_warning_is_silent_when_every_activity_type_is_bounded() {
+        let mut matrix = timeout_matrix();
+        matrix.retain(|a| !a.name.starts_with("bare_") || a.is_local);
+        let logs = capture_warnings(|| {
+            HarvestBuilder::new()
+                .activities(matrix)
+                .try_build()
+                .expect("build");
+        });
+        assert_eq!(timeout_warning(&logs), None, "{logs}");
     }
 
     // ── Retry-After ceiling (issue #744) ───────────────────────────────────

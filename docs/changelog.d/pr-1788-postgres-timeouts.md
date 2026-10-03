@@ -38,8 +38,10 @@ restores the prior statement, lock and transaction limits before it returns.
 **Heartbeat flush.** Each flush has its own bounded acquire. The activity
 stamps each heartbeat when it sends it. A failed flush keeps its payload and
 that time for the next tick. Neither a retry nor a busy runtime can then make a
-stalled handler look alive. The flush writes through
-`queue::record_heartbeat` with the `TaskClaim` fence from issue #1789, so a late
+stalled handler look alive. The write takes the database clock minus the
+heartbeat age, so it keeps the database-clock stamp from issue #1807. The
+worker measures the age on its monotonic clock. The flush writes through
+`queue::record_heartbeat_sent_ago` with the `TaskClaim` fence from issue #1789, so a late
 heartbeat cannot reach a newer attempt. A payload with no matching claim is
 dropped. The
 executed activity's result write uses `pool::acquire_with_retries` (10 bounded

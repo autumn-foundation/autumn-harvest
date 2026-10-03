@@ -3848,8 +3848,8 @@ impl WorkflowContext {
     /// Install the builder-level default activity retry/timeout floor (issue #620).
     ///
     /// Consumed by the LOCAL activity path (`execute_local_activity_with_opts`)
-    /// as the lowest-priority fallback. Both `None` (the default) preserves
-    /// today's behaviour. The regular/DAG activity path resolves the same floor
+    /// as the lowest-priority fallback. `None` sets no floor. The regular/DAG
+    /// activity path resolves the same floor
     /// worker-side in `persist_scheduled_activities`.
     #[must_use]
     pub fn with_activity_defaults(
@@ -6073,7 +6073,7 @@ impl WorkflowContext {
         // so appending the builder default here yields the full precedence
         // (call → activity → builder). A direct `_raw` caller with `None`
         // (e.g. a DAG/raw local dispatch) falls straight through to the builder
-        // default. Both `None` = today's behaviour, byte-for-byte. The
+        // default. `None` sets no floor. The
         // regular/remote path resolves the same floor worker-side via the
         // shared `policy::resolve_effective_*` helpers.
         let retry_policy = retry_policy.or_else(|| self.default_activity_retry_policy.clone());
@@ -7089,6 +7089,120 @@ impl WorkflowContext {
     /// [`MutexGuard`]'s `Drop` to decide whether to withhold its release.
     pub(crate) fn is_suspending(&self) -> bool {
         self.suspending.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Returns why this context cannot stay resident, or `None` (issue #1798).
+    ///
+    /// A resident workflow resumes its parked future with one new result. A
+    /// warm decision must then equal a cold replay. Each state below can make
+    /// a cold replay read the new events in a way that a parked future cannot:
+    ///
+    /// - A held park token resolves only by a replay match.
+    /// - A push signal handler runs inside history matching.
+    /// - A held mutex depends on the suspension flag of each cycle.
+    /// - A cancel request, a non-determinism record or a strict, canary or
+    ///   test-clock context changes how replay reads events.
+    /// - Unread history means that the cursor is not at the live frontier.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an internal mutex is poisoned.
+    pub(crate) fn resident_blocker(&self) -> Option<&'static str> {
+        if self.parks.is_held() {
+            return Some("a park token is held");
+        }
+        if self.strict_replay || self.canary_mode {
+            return Some("strict or canary replay");
+        }
+        #[cfg(any(test, feature = "testing"))]
+        if self.timer_clock_elapsed_secs.is_some() {
+            return Some("the advancing test clock is on");
+        }
+        if self.cancellation_reason.is_some() {
+            return Some("the run is cancelled");
+        }
+        if !self
+            .signal_registry
+            .lock()
+            .expect("signal_registry lock poisoned")
+            .list_names()
+            .is_empty()
+        {
+            return Some("a push signal handler is registered");
+        }
+        if !self
+            .held_mutex_keys
+            .lock()
+            .expect("held_mutex_keys lock poisoned")
+            .is_empty()
+        {
+            return Some("a durable mutex is held");
+        }
+        if self
+            .nd_details
+            .lock()
+            .expect("nd_details lock poisoned")
+            .is_some()
+            || self
+                .deferred_nd_error
+                .lock()
+                .expect("deferred_nd_error lock poisoned")
+                .is_some()
+        {
+            return Some("a non-determinism record is set");
+        }
+        if self
+            .matcher
+            .lock()
+            .expect("matcher lock poisoned")
+            .has_buffered_history()
+        {
+            return Some("history is not fully read");
+        }
+        None
+    }
+
+    /// Starts the next cycle of a resident workflow (issue #1798).
+    ///
+    /// A cold cycle builds a new context. A resident cycle reuses this one,
+    /// so it resets the state that a new context starts with:
+    ///
+    /// - The suspension flag, so that a mutex guard drop releases again.
+    /// - The per-cycle log and progress counters.
+    ///
+    /// It also appends `delta` to the matcher as consumed events. The replay
+    /// position, the history length and the history scans then match a cold
+    /// replay. The call ordinals and sequence counters keep their values. A
+    /// replay from the top counts up to the same values.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the matcher mutex is poisoned.
+    #[cfg_attr(not(any(feature = "db", feature = "testing")), allow(dead_code))] // Resident paths need the worker or the test harness.
+    pub(crate) fn begin_resident_cycle(&self, delta: &[WorkflowEvent]) {
+        self.set_suspending(false);
+        self.log_commands_queued
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.progress_local_index
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.matcher
+            .lock()
+            .expect("matcher lock poisoned")
+            .append_consumed(delta);
+    }
+
+    /// Whether a non-blocking signal claim probed `signal_name` with a scan
+    /// that reached the end of history (issue #1798). A resident workflow
+    /// must not resume a wait for such a signal.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the matcher mutex is poisoned.
+    pub(crate) fn signal_probed_at_frontier(&self, signal_name: &str) -> bool {
+        self.matcher
+            .lock()
+            .expect("matcher lock poisoned")
+            .signal_probed_at_frontier(signal_name)
     }
 
     /// Cancel an author-controlled durable timer by id.
@@ -14042,11 +14156,9 @@ impl ActivityExecutionInfo {
 pub struct StampedHeartbeat {
     /// The heartbeat payload.
     pub details: serde_json::Value,
-    /// When the activity sent the heartbeat, by the wall clock. The flush
-    /// writes this time.
-    pub sent_at: chrono::DateTime<chrono::Utc>,
     /// When the activity sent the heartbeat, by the monotonic clock. The
     /// flusher orders heartbeats by it, because the wall clock can step back.
+    /// The flush writes the database clock minus the age of this time.
     pub sent_order: std::time::Instant,
 }
 
@@ -14056,7 +14168,6 @@ impl StampedHeartbeat {
     pub fn now(details: serde_json::Value) -> Self {
         Self {
             details,
-            sent_at: chrono::Utc::now(),
             sent_order: std::time::Instant::now(),
         }
     }

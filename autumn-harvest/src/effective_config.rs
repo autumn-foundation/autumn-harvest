@@ -145,6 +145,10 @@ pub struct WorkerConfigView {
     pub shutdown_timeout_ms: u64,
     /// In-memory workflow LRU cache size (entries).
     pub workflow_cache_size: usize,
+    /// Whether cache entries keep suspended workflows resident (issue #1798).
+    /// Reports the effective value, so it is `false` while sticky routing is
+    /// off.
+    pub resident_workflows: bool,
     /// Whether sticky cross-worker routing is enabled (`sticky_timeout > 0`).
     pub sticky_routing_enabled: bool,
     /// Sticky routing lease TTL, milliseconds (0 = disabled).
@@ -158,8 +162,8 @@ pub struct WorkerConfigView {
     /// Builder-level default activity retry `max_attempts` (issue #620);
     /// `null` when no builder-default retry floor is configured.
     pub default_activity_retry_max_attempts: Option<u32>,
-    /// Builder-level default activity `start_to_close`, milliseconds (issue #620);
-    /// `null` when no builder-default timeout floor is configured.
+    /// Builder-level default activity `start_to_close`, milliseconds (issue #620).
+    /// Defaults to 600000 (issue #1808). `null` after `without_default_activity_start_to_close()`.
     pub default_activity_start_to_close_ms: Option<u64>,
     /// Ceiling on an author-supplied `Retry-After` delay hint, milliseconds
     /// (issue #744). Always present (not opt-in); default 15 minutes.
@@ -243,6 +247,13 @@ pub struct WorkerConfigView {
     /// *identifiers* and per-key rows-remaining are served by
     /// `GET /admin/codec/rotation`.
     pub codec_rotation_batch_size: i64,
+    /// Retry budget policy for activity types without an override
+    /// (issue #1793). `null` = no default budget.
+    pub retry_budget_default: Option<crate::policy::RetryBudgetPolicy>,
+    /// Per-activity-type retry budget overrides (issue #1793). A `null`
+    /// policy turns the budget off for that type.
+    pub retry_budget_overrides:
+        std::collections::BTreeMap<String, Option<crate::policy::RetryBudgetPolicy>>,
     /// Max panic strikes before a panicking workflow task fails terminally
     /// (0 = terminal on first panic).
     pub workflow_panic_max_attempts: u32,
@@ -368,6 +379,7 @@ impl WorkerConfigView {
             max_concurrent_activities,
             shutdown_timeout,
             workflow_cache_size,
+            resident_workflows,
             sticky_timeout,
             cancellation_grace_period,
             shard_assignments,
@@ -401,6 +413,7 @@ impl WorkerConfigView {
             max_concurrent_sessions,
             workflow_panic_max_attempts,
             codec_rotation_batch_size,
+            retry_budget,
             // REDACTED — the registry holds live codec handles that may close
             // over key material. Only the operator-chosen key IDENTIFIERS are
             // safe to report, and those are served by
@@ -415,6 +428,7 @@ impl WorkerConfigView {
             poll_interval_ms: dur_ms(poll_interval),
             shutdown_timeout_ms: dur_ms(*shutdown_timeout),
             workflow_cache_size: *workflow_cache_size,
+            resident_workflows: *resident_workflows && !sticky_timeout.is_zero(),
             sticky_routing_enabled: !sticky_timeout.is_zero(),
             sticky_timeout_ms: dur_ms(*sticky_timeout),
             cancellation_grace_period_ms: dur_ms(*cancellation_grace_period),
@@ -463,6 +477,8 @@ impl WorkerConfigView {
             slot_tuner_enabled: slot_tuner.is_some(),
             max_concurrent_sessions: *max_concurrent_sessions,
             codec_rotation_batch_size: *codec_rotation_batch_size,
+            retry_budget_default: retry_budget.default_policy(),
+            retry_budget_overrides: retry_budget.overrides(),
             workflow_panic_max_attempts: *workflow_panic_max_attempts,
             notification_channel_configured: notification_database_url.is_some(),
             shard_notification_channels_configured: shard_notification_database_urls.len(),
@@ -820,10 +836,23 @@ mod tests {
     }
 
     #[test]
+    fn default_activity_start_to_close_ms_surfaces_the_shipped_default_issue_1808() {
+        let view = WorkerConfigView::from_worker_config(
+            &WorkerConfig::default(),
+            Duration::from_millis(500),
+        );
+        assert_eq!(view.default_activity_start_to_close_ms, Some(600_000));
+
+        // The opt-out surfaces as null, so an operator can see it.
+        let off = WorkerConfig::default().without_default_activity_start_to_close();
+        let view = WorkerConfigView::from_worker_config(&off, Duration::from_millis(500));
+        assert_eq!(view.default_activity_start_to_close_ms, None);
+    }
+
+    #[test]
     fn retry_after_ceiling_ms_surfaces_the_configured_value_issue_744() {
-        // The ceiling is not opt-in (always present, unlike the sibling
-        // default_activity_* floors) -- confirm the default AND a configured
-        // override both surface through the introspection snapshot.
+        // The ceiling always applies. Confirm that the default and a
+        // configured override both surface through the snapshot.
         let default_view = WorkerConfigView::from_worker_config(
             &WorkerConfig::default(),
             Duration::from_millis(500),
@@ -909,6 +938,10 @@ mod tests {
         );
         assert!(view.sticky_routing_enabled);
         assert_eq!(view.sticky_timeout_ms, 5_000);
+        assert!(
+            view.resident_workflows,
+            "resident workflows are on by default"
+        );
     }
 
     #[test]
@@ -922,6 +955,10 @@ mod tests {
         };
         let off_view = WorkerConfigView::from_worker_config(&off, Duration::from_millis(500));
         assert!(!off_view.sticky_routing_enabled);
+        assert!(
+            !off_view.resident_workflows,
+            "resident workflows need sticky routing"
+        );
         assert!(!off_view.poison_pill_quarantine_enabled);
         assert!(!off_view.slot_tuner_enabled);
 
@@ -934,7 +971,15 @@ mod tests {
         let on_view = WorkerConfigView::from_worker_config(&on, Duration::from_millis(500));
         assert!(on_view.sticky_routing_enabled);
         assert_eq!(on_view.sticky_timeout_ms, 15_000);
+        assert!(on_view.resident_workflows);
         assert!(on_view.poison_pill_quarantine_enabled);
+
+        // The resident switch alone turns resident workflows off.
+        let resident_off = WorkerConfig::default().with_resident_workflows(false);
+        let resident_off_view =
+            WorkerConfigView::from_worker_config(&resident_off, Duration::from_millis(500));
+        assert!(resident_off_view.sticky_routing_enabled);
+        assert!(!resident_off_view.resident_workflows);
     }
 
     #[test]

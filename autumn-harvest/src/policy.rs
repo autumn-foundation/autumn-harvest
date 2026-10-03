@@ -371,6 +371,75 @@ impl CircuitBreakerPolicy {
     }
 }
 
+/// Retry budget for one activity type (issue #1793).
+///
+/// The worker keeps one token bucket for each activity type. A first attempt
+/// deposits `ratio` tokens. A retry spends one token. Time adds
+/// `min_retries_per_sec` tokens each second. The bucket holds at most
+/// `max_tokens` and starts full.
+///
+/// An empty bucket defers the retry. It does not drop it. See
+/// [`crate::retry_budget`] for the full semantics.
+///
+/// ## Examples
+///
+/// ```rust
+/// use autumn_harvest::policy::RetryBudgetPolicy;
+///
+/// // Let retries add at most 20 % load, with a floor of 2 retries per second.
+/// let policy = RetryBudgetPolicy::new(0.2, 20.0, 2.0);
+/// assert_eq!(policy.ratio, 0.2);
+/// assert_eq!(RetryBudgetPolicy::default().ratio, 0.1);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct RetryBudgetPolicy {
+    /// Tokens that each first attempt deposits.
+    pub ratio: f64,
+    /// Bucket capacity and start level. At least 1.
+    pub max_tokens: f64,
+    /// Tokens that time adds each second. A value above 0 keeps retries
+    /// from starving. With 0, only first-attempt deposits refill the bucket.
+    pub min_retries_per_sec: f64,
+}
+
+impl RetryBudgetPolicy {
+    /// Default deposit for each first attempt: a 10 % retry budget.
+    pub const DEFAULT_RATIO: f64 = 0.1;
+    /// Default bucket capacity.
+    pub const DEFAULT_MAX_TOKENS: f64 = 10.0;
+    /// Default time refill, in tokens each second.
+    pub const DEFAULT_MIN_RETRIES_PER_SEC: f64 = 1.0;
+
+    /// Construct a retry budget policy.
+    ///
+    /// A negative or non-finite `ratio` or `min_retries_per_sec` becomes 0.
+    /// `max_tokens` becomes at least 1, so one retry can always run.
+    #[must_use]
+    pub fn new(ratio: f64, max_tokens: f64, min_retries_per_sec: f64) -> Self {
+        let rate = |v: f64| if v.is_finite() && v > 0.0 { v } else { 0.0 };
+        let cap = if max_tokens.is_finite() {
+            max_tokens.max(1.0)
+        } else {
+            1.0
+        };
+        Self {
+            ratio: rate(ratio),
+            max_tokens: cap,
+            min_retries_per_sec: rate(min_retries_per_sec),
+        }
+    }
+}
+
+impl Default for RetryBudgetPolicy {
+    fn default() -> Self {
+        Self::new(
+            Self::DEFAULT_RATIO,
+            Self::DEFAULT_MAX_TOKENS,
+            Self::DEFAULT_MIN_RETRIES_PER_SEC,
+        )
+    }
+}
+
 /// Failure semantics for mapped nodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -1485,8 +1554,8 @@ pub(crate) fn resolve_effective_retry(
 /// Resolve the effective activity `start_to_close` at schedule time (issue #620).
 ///
 /// Same precedence as [`resolve_effective_retry`]: call-site override →
-/// activity default → builder default. `None` when unset (no timeout enforced),
-/// preserving today's behaviour.
+/// activity default → builder default. `None` means that no timeout applies.
+/// `WorkerConfig` sets a 10-minute builder default (issue #1808).
 ///
 /// The sole non-test consumer is the `db`-gated worker dispatch path; unused
 /// under `--no-default-features` (the pure precedence is still test-covered).

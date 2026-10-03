@@ -40,6 +40,7 @@ autumn-harvest/          <- workspace root
       heartbeat.rs       <- Phase 2: batched heartbeat flusher
       timeout.rs         <- Phase 2: timeout enforcement scanner
       cache.rs           <- Phase 2: LRU workflow state cache
+      resident.rs        <- issue #1798: resident workflow state
       dlq.rs             <- Phase 2: dead letter queue
       pool.rs            <- Phase 2: separate pool config with shared ceiling
       testing.rs         <- Phase 3.5 (testing feature): WorkflowReplayer harness
@@ -187,11 +188,12 @@ The capability-miss release still keys on `(worker_id, crash_strikes)`. It runs 
 - Workflow-task writes: `requeue_claimed_workflow_task_after_deadlock` (issue #1797).
 - `lock_claim_for_update`. The start fence, both finalize paths, the in-worker schedule-to-close and session-acquire timeouts, and `run_transactional` take it after the execution row lock.
 - `claim_is_current` and `task_status_for_claim`. The cancellation observer and `ActivityContext::check_durable_cancellation` read them.
+- `claim_still_held_for_update`. The workflow-task terminal guard takes `claim_held` and adds `crash_strikes = $c` (issue #1806). The stuck-running requeue keeps `crash_strikes`, so only `attempt` tells a same-worker re-claim apart.
 - `claim_held_for_update_skip_locked`. For an activity row, `fail_task_and_execution_with_history` takes it before its `claim_still_held_for_update` guard. A later claim of the same worker returns `Ok` without a write. Any other miss returns `TerminalWriteClaimAmbiguous`, as the guard does.
 
 *Lease lost.* A path that gets `ClaimLock::Lost` appends no event and returns `Ok`. It must not return an error, because `fail_execution_on_error` would then fail the workflow. After `Held`, a `LeaseLost` write is a bug, and `require_applied` rolls the transaction back. A fenced write outside the lock returns `LeaseLost` when it matches 0 rows. The heartbeat flusher, the cancellation observer and `check_durable_cancellation` stop the activity.
 
-*Not fenced.* `complete_task`, `fail_task`, `requeue_for_retry` and `defer_rate_limited_task` stay unfenced. The timeout sweeper in `timeout.rs`, cancellation and operator actions use them on purpose: they act on a row whatever its claim. Workflow-task writes use `claim_still_held_for_update` (issues #804 and #1184).
+*Not fenced.* `complete_task`, `fail_task`, `requeue_for_retry` and `defer_rate_limited_task` stay unfenced. The timeout sweeper in `timeout.rs`, cancellation and operator actions use them on purpose: they act on a row whatever its claim. Workflow-task writes use `claim_still_held_for_update`, which also checks `attempt` (issues #804, #1184 and #1806).
 
 A formal model of this protocol is tracked in issue #1819.
 
@@ -227,6 +229,42 @@ Keep `workflow_task_timeout` above `DEADLOCK_TIMEOUT`. A shorter body budget can
 *Query replay.* `drive_query_replay` and `drive_query_replay_async` keep their own rule (issue #612). They stop at a foreign await instead of waiting for it.
 
 *Proof.* The `executor.rs` tests `suspension_outcome_does_not_depend_on_step_duration`, `a_parked_harvest_future_decides_the_cycle_not_the_step_duration`, `foreign_await_past_the_deadlock_timeout_fails_the_task_not_the_run`, `harvest_parks_suspend_without_waiting_on_the_clock`, `a_wake_during_the_poll_is_polled_again_before_suspending`, `a_long_finite_run_of_ready_futures_is_polled_to_the_end`, `a_self_waking_future_beside_a_park_fails_the_task`, `cpu_time_before_the_first_foreign_wait_does_not_count` and `single_step_suspension_decides_in_under_100_ms`. Against Postgres: `panic_containment_tests::deadlocked_workflow_task_is_re_pended_and_the_retry_completes_the_run`.
+
+**11. Retry budget per activity type (issue #1793)**
+
+A retry policy limits the retries of one task. A retry budget limits the retries of one activity type in aggregate. It stops retries from multiplying the load on a dependency during a brownout. `retry_budget.rs` holds the bucket. `process_activity_task` in `worker.rs` holds the gate.
+
+*Bucket.* Each worker process keeps one token bucket for each activity type. `RetryBudgetPolicy` sets three values:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `ratio` | `0.1` | Tokens that each first attempt deposits. |
+| `max_tokens` | `10.0` | Capacity. The bucket starts full. |
+| `min_retries_per_sec` | `1.0` | Tokens that time adds each second. |
+
+*Rules.*
+
+1. A claim with `attempt == 1` is a first attempt. It always runs. It deposits `ratio` tokens when it starts, that is when `ActivityStarted` is appended. Until then the deposit is pending, and no retry can spend it.
+2. A claim with `attempt > 1` is a retry. An orphan re-claim is a retry too. A retry runs only if it can spend one token.
+3. The bucket never holds more than `max_tokens`.
+4. The gate applies only to a real call. A `CircuitOpen` short-circuit spends nothing. A half-open probe that is a retry is never deferred, because it is the breaker's recovery signal. A probe that is a first attempt still deposits.
+5. An attempt that does not run settles its ticket without effect on the bound. A drop guard does this on every return before `ActivityStarted`: a rate-limit deferral, a no-op start or an error. A retry gets its token back, up to the cap. A pending deposit is dropped, because it never entered the bucket.
+
+So the retries that run in a window of `T` seconds are at most `max_tokens + ratio × first_attempts + min_retries_per_sec × T`, where `first_attempts` counts only first attempts that started. The bound holds at every instant, not only on average.
+
+*Deferral.* An empty bucket defers the retry. The worker calls `queue::defer_claimed_retry_for_budget`. That fenced write puts the row back to `PENDING`. It computes the new `scheduled_at` on the database clock, as the retry requeue does (issue #1389). It lowers `attempt` again and keeps `error` and `crash_strikes`. A deferral says nothing about crashes, so poison-pill quarantine still counts them. The write appends no event. A deferral of a rate-limited activity without a circuit breaker also refunds the claim-time rate-limit token.
+
+The first delay is the time to the next refill token. Each later deferral gets the next slot, one refill interval later. A slot more than 60 s away is not reserved. That retry gets a random delay from 30 s to 60 s instead, so a large backlog does not wake at one instant. No delay is shorter than 50 ms. The worker computes the delay just before the write, so time spent on a pool connection is taken off. A write that arrives after its slot gets a new slot. A deferral that is not persisted gives its slot back. Deferred retries are not served in order. The next retry that finds a token runs.
+
+*A deferred retry is never lost.* The row stays in the queue until a worker runs it. The deferral does not use an attempt and does not move the task to the DLQ. Only an activity timeout, or a cancel or reset of the owning run, can end a deferred retry. For example, a `schedule_to_close` deadline can pass during a deferral. The timeout scanner then records an ordinary `ActivityTimedOut` event.
+
+*Starvation.* With `min_retries_per_sec = 0`, only first-attempt deposits refill the bucket. If no first attempts arrive, deferred retries wait until a timeout ends them or a worker restart refills the bucket. Keep the floor above 0 unless that is the intent.
+
+*Configuration.* The budget is on by default. `WorkerConfig::with_retry_budget` takes a `RetryBudgetConfig`. `with_default` sets the policy for all types. `with_activity(name, policy)` overrides one type, and `None` turns the budget off for that type. `RetryBudgetConfig::disabled()` turns it off everywhere. An override for an unregistered name logs a warning. `GET /admin/config` reports the default policy and every override.
+
+*Scope.* The state is in process, like the circuit breaker. N workers allow up to N budgets. The budget never touches the event log, so replay is unaffected. Local activities retry inline, outside the queue, so the budget does not gate them. The SQLite backend has its own worker and does not use this gate.
+
+*Metrics.* The gauge `harvest.retry.budget.available{activity}` shows the tokens left. The registry publishes it under the bucket lock after every access, so a stale sample cannot overwrite a newer one. It does not follow the time refill between accesses. The counter `harvest.retry.budget.exhausted{activity}` counts deferrals. Prometheus exports the counter as `harvest_retry_budget_exhausted_total`. See [`telemetry.md`](telemetry.md#metric-catalogue-adr-0001-7).
 
 ### Sharding
 
@@ -280,13 +318,14 @@ Current implementation scope: `ExecutionId`/`ShardId` encoding, `ShardRouter`, `
 | `replay.rs` | 2 | Deterministic replay engine: `HistoryMatcher` walks event history, detects non-determinism |
 | `executor.rs` | 2 | Workflow executor: `run_workflow` drives replay + live execution, detects suspension by readiness (issue #1797) |
 | `queue.rs` | 2 | Postgres task queue: `enqueue`, `claim` (FOR UPDATE SKIP LOCKED), `complete`, `fail` |
-| `notify.rs` | 2 | LISTEN/NOTIFY wrapper: `Listener` (async stream), `Notifier` (pg_notify), channel naming. `sslmode=require` selects verified TLS (issue #1717). |
+| `notify.rs` | 2 | LISTEN/NOTIFY wrapper: `Listener` (async stream), `Notifier` (pg_notify), channel naming. `sslmode=require` selects verified TLS (issue #1717). Wakes for appends and enqueues go after commit, from a per-pool sender on its own connection (issue #1796). |
 | `dispatch.rs` | 3.x | Task dispatch channel seam (issue #1312): `TaskDispatch` trait (`publish`/`next`/`ack`/`release`/`maintain`), `DispatchHint` (task id, queue, `scheduled_at`, priority, shard), `DispatchLease`, `DispatchMaintenance`, `DispatchSettings` (`poll_interval`, `reconcile_interval`, `reconcile_batch`, `release_backoff_cap`) and the process-global `install`/`installed`/`uninstall`. The channel carries references to claimable `harvest_task_queue` rows; Postgres stays the source of truth, and a worker still claims the named row with the full claim predicate. It is a latency and throughput optimization, never a durability store: the worker's reconcile sweep republishes every due `PENDING` row the channel does not hold. No new event variant, no migration. The Redis Streams implementation lives in `autumn-harvest-redis`; see [`docs/operations/redis-dispatch.md`](operations/redis-dispatch.md). |
 | `worker.rs` | 2 | Worker runtime: poll loop, semaphore-bounded concurrent dispatch, graceful shutdown |
 | `workers.rs` | 4 | Worker fleet registry: `register_worker`, `heartbeat_worker`, `transition_status`, `list_workers`, `get_worker`, `fleet_health`, `spawn_worker_heartbeat` |
 | `heartbeat.rs` | 2 | Batched heartbeat flusher: debounced channel receiver, last-write-wins timestamp + checkpoint payload DB update. Issue #1788: each flush has a bounded pool acquire; a failed flush keeps its payload for the next tick and increments `harvest.heartbeat.flush_failed`. |
 | `timeout.rs` | 2 | Timeout enforcement scanner: start-to-close, schedule-to-start, heartbeat timeout queries, and workflow execution timeouts (`enforce_workflow_execution_timeouts`, issue #243) |
-| `cache.rs` | 2 | LRU workflow state cache: bounded capacity, access-order eviction. `CachedWorkflowState` holds `events: Vec<WorkflowEvent>` + `next_event_id: i32` for delta-load support (issue #235). |
+| `cache.rs` | 2 | LRU workflow state cache: bounded capacity, access-order eviction. `CachedWorkflowState` holds `events: Vec<WorkflowEvent>` + `next_event_id: i32` for delta-load support (issue #235). An entry can also hold a `ResidentWorkflow` (issue #1798). |
+| `resident.rs` | 3.x | Resident workflow state (issue #1798): keeps a suspended handler future and its context between decisions. A warm decision sends the one new result to the parked future instead of replaying history. Accepts only suspensions and deltas that it resolves exactly as a cold replay would; anything else declines to a cold replay. |
 | `dlq.rs` | 2 | Dead letter queue: `DeadLetterEntry` builder, move-to-DLQ on retry exhaustion |
 | `pool.rs` | 2 | Separate DB pool config: web pool + worker pool with shared ceiling, minimum guarantees. Issue #1788: `engine_pool` / `with_engine_timeouts` set deadpool timeouts and per-role (`DbRole`) Postgres session timeouts; `acquire` is a bounded acquire that returns `HarvestError::PoolAcquireTimeout`. See [`docs/operations/postgres-timeouts.md`](operations/postgres-timeouts.md). |
 | `erase.rs` | 3.30 | Targeted PII erasure (issue #495): `ERASURE_TOMBSTONE_KEY`, `erasure_tombstone()`, `tombstone_payload_fields(event_value)` (pure, no-DB), `is_terminal_state(state)`, `EraseOutcome`/`SkippedChild`/`EraseFailure`; DB-gated `erase_workflow_payloads(conn, exec_id, reason)`. **Sanctioned in-place mutation exception** to the append-only invariant (alongside heartbeat checkpoints): only `data` field contents are mutated, never event structure. Terminal-only, irreversible, idempotent, cascades to terminal children on the same shard. |
@@ -307,6 +346,7 @@ Current implementation scope: `ExecutionId`/`ShardId` encoding, `ShardRouter`, `
 | `metrics_rs_adapter.rs` | 4 | `metrics-rs` feature flag adapter: `MetricsRsRecorder` bridges `MetricsRecorder` → `metrics` crate global registry. See `docs/telemetry.md` for recipe. |
 | `poison_pill.rs` | 3.17 | Poison-pill task quarantine (issue #367): pure `quarantine_decision`/`ReclaimAction` (no DB dep), `orphaned_running_tasks_query` (worker-liveness reclaim, independent of per-task timeouts), `reclaim_orphaned_tasks` (increment `crash_strikes`, requeue-or-quarantine), `spawn_poison_pill_reclaimer`. Quarantine → `harvest_dead_letters` with `DeadLetterReason::PoisonPill` + terminal `WorkflowFailed` (no new event variant). `WorkerConfig::poison_pill_threshold` (default 3, 0 disables). Shard-local. |
 | `circuit_breaker.rs` | 3.18 | Per-activity circuit breaker (issue #369): `CircuitBreakerRegistry` (closed/open/half-open, rolling-window failure count, single half-open probe, `on_dispatch`/`on_result`, `force_open`/`force_close`, `snapshot`/`list`), `CircuitPhase`, `DispatchDecision`, `CircuitTransition`, `CircuitSnapshot`. Pure/in-process, per-shard; consulted by the worker before dispatch and shared with the management API via `HandlerRegistry::circuit_breakers()`. No new event variant, no migration. |
+| `retry_budget.rs` | 3.18 | Per-activity-type retry budget (issue #1793): `RetryBudgetConfig`, `RetryBudgetRegistry` (`admit`/`commit`/`release`/`cancel_deferral`/`wake_delay`/`available`), `Admission`, `BudgetTicket`, `SlotReservation`. In process, per worker. The worker consults it before dispatch and defers a retry when the bucket is empty. See design decision 11. No new event variant, no migration. |
 | `slot_tuner.rs` | 3.42 | Adaptive worker dispatch-slot tuner (issue #548): `SlotTuner` trait, `DefaultSlotTuner` (pool-pressure shrink / saturated-and-waiting grow / hold), `SlotTunerConfig { min_slots, max_slots, tuner }` (`::new`/`::with_tuner`), pure helpers `initial_target`/`apply_action`/`validate_band`/`tuned_available`, `TunedSlotRuntime` (owns withheld `OwnedSemaphorePermit`s; `resize_toward`/`release_all_withheld`), `spawn_slot_tuner_loop`. Opt-in via `WorkerConfig::with_slot_tuner`; `None` (default) is byte-identical to the pre-#548 fixed-concurrency semaphore. No new event variant, no migration, no replay surface — purely an in-process semaphore control constructed inside `worker.rs::spawn_monitoring_tasks` (never stored on `Worker` itself, to avoid clippy's significant-drop propagation into every `Worker`-holding test). See [`docs/operations/adaptive-slot-tuner.md`](operations/adaptive-slot-tuner.md). |
 | `migrations/` | 1 | SQL -- run with `diesel migration run` |
 
@@ -1147,7 +1187,7 @@ async fn compute_checksum(ctx: &ActivityContext, data: Vec<u8>) -> Result<String
 |---|---|---|
 | Execution location | Inline on the workflow worker | Dispatched to task queue / remote worker |
 | Typical duration | < 1 s | Any duration |
-| Hard timeout cap | `WorkerConfig::max_local_activity_start_to_close` (default 60 s) | No cap enforced by Harvest |
+| Hard timeout cap | `WorkerConfig::max_local_activity_start_to_close` (default 60 s) | No hard cap. `WorkerConfig::default_activity_start_to_close` (10 min) applies when the activity sets no attempt bound |
 | Heartbeating | **Not supported**; `ctx.heartbeat(...)` returns a runtime `Config` error and no heartbeat checkpoint is available | Supported; retry attempts can read the last flushed payload with `ctx.heartbeat_details::<T>()` |
 | `schedule_to_start` timeout | **Not supported** | Supported |
 | Custom task queue | **Not supported** | Supported |

@@ -1,6 +1,10 @@
 //! Small parsing helpers shared across the `#[workflow(...)]`, `#[update(...)]`,
 //! and sibling attribute-macro argument parsers.
 
+use proc_macro2::TokenStream;
+use quote::quote;
+use syn::ext::IdentExt as _;
+
 /// Compile-time validator for the runtime `task_duration()` string format
 /// (`"30s"`, `"5m"`, `"1h"`, `"1h30m"`, ...): digits followed by one of
 /// `s`/`m`/`h`/`d`, optionally space-separated, with no overflow and no
@@ -179,6 +183,63 @@ pub fn param_idents<'a>(params: &'a [&syn::FnArg]) -> Vec<&'a syn::Ident> {
         .collect()
 }
 
+/// Builds the body that decodes a handler's non-`ctx` arguments, calls it, and
+/// encodes the result as JSON.
+///
+/// Zero parameters take no input. One parameter decodes the whole `args_ident`
+/// value. Many parameters decode a JSON array by position. The array binds to
+/// `__args`. The builder adds leading underscores until neither a handler
+/// parameter nor the handler itself has that name. Neither can shadow the
+/// binding.
+///
+/// The caller supplies the call shape. `ctx_expr` is the context argument.
+/// `await_tokens` is empty or `.await`. `encode_err` is the closure that maps
+/// the handler error to a `String`.
+pub fn build_handler_dispatch(
+    fn_name: &syn::Ident,
+    param_names: &[&syn::Ident],
+    args_ident: &syn::Ident,
+    ctx_expr: &TokenStream,
+    await_tokens: &TokenStream,
+    encode_err: &TokenStream,
+) -> TokenStream {
+    let tail = quote! {
+        result.map_err(#encode_err)
+            .and_then(|v| {
+                ::autumn_harvest::serde_json::to_value(v).map_err(|e| e.to_string())
+            })
+    };
+    match param_names {
+        [] => quote! {
+            let result = #fn_name(#ctx_expr) #await_tokens;
+            #tail
+        },
+        [name] => quote! {
+            let #name = ::autumn_harvest::serde_json::from_value(#args_ident)
+                .map_err(|e| e.to_string())?;
+            let result = #fn_name(#ctx_expr, #name) #await_tokens;
+            #tail
+        },
+        names => {
+            let indices = (0..names.len()).map(syn::Index::from);
+            let mut binding = String::from("__args");
+            while fn_name.unraw() == binding || names.iter().any(|n| n.unraw() == binding) {
+                binding.insert(0, '_');
+            }
+            let binding = syn::Ident::new(&binding, proc_macro2::Span::call_site());
+            quote! {
+                let #binding: ::autumn_harvest::serde_json::Value = #args_ident;
+                #(
+                    let #names = ::autumn_harvest::serde_json::from_value(#binding[#indices].clone())
+                        .map_err(|e| e.to_string())?;
+                )*
+                let result = #fn_name(#ctx_expr, #(#names),*) #await_tokens;
+                #tail
+            }
+        }
+    }
+}
+
 /// First input parameter whose pattern is not a bare identifier.
 ///
 /// The generated dispatch code deserializes each input into a named binding,
@@ -284,6 +345,163 @@ mod arg_type_hint_tests {
         let owned = params_from("a: u32, b: bool");
         let refs: Vec<_> = owned.iter().collect();
         assert_eq!(arg_type_hint(&refs), "(u32, bool)");
+    }
+}
+
+#[cfg(test)]
+mod build_handler_dispatch_tests {
+    use super::build_handler_dispatch;
+    use proc_macro2::TokenStream;
+    use quote::{format_ident, quote};
+
+    fn dispatch(names: &[&str], ctx: &TokenStream, aw: &TokenStream) -> String {
+        let fn_name = format_ident!("handler");
+        let args = format_ident!("input");
+        let idents: Vec<_> = names.iter().map(|n| format_ident!("{}", n)).collect();
+        let refs: Vec<_> = idents.iter().collect();
+        let encode_err = quote! { |e| e.to_string() };
+        build_handler_dispatch(&fn_name, &refs, &args, ctx, aw, &encode_err).to_string()
+    }
+
+    #[test]
+    fn zero_params_call_the_handler_with_ctx_only() {
+        let out = dispatch(&[], &quote! { ctx }, &quote! {});
+        assert!(out.starts_with("let result = handler (ctx) ;"), "{out}");
+        assert!(!out.contains("from_value"), "{out}");
+    }
+
+    #[test]
+    fn one_param_decodes_the_whole_input() {
+        let out = dispatch(&["n"], &quote! { ctx }, &quote! {});
+        assert!(out.contains("from_value (input)"), "{out}");
+        assert!(out.contains("handler (ctx , n)"), "{out}");
+    }
+
+    #[test]
+    fn many_params_decode_by_position_from_a_hygienic_binding() {
+        let out = dispatch(&["a", "b"], &quote! { ctx }, &quote! {});
+        assert!(out.contains("let __args"), "{out}");
+        assert!(out.contains("(__args [0] . clone ())"), "{out}");
+        assert!(out.contains("(__args [1] . clone ())"), "{out}");
+        assert!(out.contains("handler (ctx , a , b)"), "{out}");
+    }
+
+    /// A parameter named `args` must not shadow the decode binding.
+    #[test]
+    fn many_params_survive_a_parameter_named_args() {
+        let out = dispatch(&["args", "b"], &quote! { ctx }, &quote! {});
+        assert!(out.contains("(__args [1] . clone ())"), "{out}");
+        assert_eq!(out.matches("input").count(), 1, "{out}");
+    }
+
+    /// The index must advance for every parameter, not repeat or skip.
+    /// A parameter named `__args` moves the binding to `___args`.
+    #[test]
+    fn many_params_survive_a_parameter_named_dunder_args() {
+        let out = dispatch(&["__args", "b"], &quote! { ctx }, &quote! {});
+        assert!(out.starts_with("let ___args :"), "{out}");
+        assert!(out.contains("(___args [1] . clone ())"), "{out}");
+    }
+
+    /// A handler named `__args` must stay callable after the decode binding.
+    #[test]
+    fn many_params_survive_a_handler_named_dunder_args() {
+        let fn_name = format_ident!("__args");
+        let args = format_ident!("input");
+        let a = format_ident!("a");
+        let b = format_ident!("b");
+        let out = build_handler_dispatch(
+            &fn_name,
+            &[&a, &b],
+            &args,
+            &quote! { ctx },
+            &quote! {},
+            &quote! { |e| e.to_string() },
+        )
+        .to_string();
+        assert!(out.starts_with("let ___args :"), "{out}");
+        assert!(out.contains("(___args [1] . clone ())"), "{out}");
+        assert!(out.contains("let result = __args (ctx , a , b) ;"), "{out}");
+    }
+
+    /// A raw identifier `r#__args` names the same variable as `__args`.
+    #[test]
+    fn many_params_survive_a_raw_identifier_named_dunder_args() {
+        let fn_name = format_ident!("handler");
+        let args = format_ident!("input");
+        let raw = format_ident!("r#__args");
+        let b = format_ident!("b");
+        let out = build_handler_dispatch(
+            &fn_name,
+            &[&raw, &b],
+            &args,
+            &quote! { ctx },
+            &quote! {},
+            &quote! { |e| e.to_string() },
+        )
+        .to_string();
+        assert!(out.starts_with("let ___args :"), "{out}");
+    }
+
+    #[test]
+    fn three_params_use_indices_zero_to_two() {
+        let out = dispatch(&["a", "b", "c"], &quote! { ctx }, &quote! {});
+        for i in 0..3 {
+            assert!(out.contains(&format!("(__args [{i}] . clone ())")), "{out}");
+        }
+        assert!(out.contains("handler (ctx , a , b , c)"), "{out}");
+    }
+
+    #[test]
+    fn a_single_param_named_like_the_input_binding_decodes_first() {
+        let out = dispatch(&["input"], &quote! { ctx }, &quote! {});
+        assert!(
+            out.starts_with("let input = :: autumn_harvest :: serde_json :: from_value (input)"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn no_await_tokens_emit_no_await() {
+        let out = dispatch(&["a", "b"], &quote! { ctx }, &quote! {});
+        assert!(!out.contains("await"), "{out}");
+    }
+
+    #[test]
+    fn every_arity_ends_with_the_json_encoding_tail() {
+        for names in [&[][..], &["a"][..], &["a", "b"][..]] {
+            let out = dispatch(names, &quote! { ctx }, &quote! {});
+            assert!(
+                out.ends_with("and_then (| v | { :: autumn_harvest :: serde_json :: to_value (v) . map_err (| e | e . to_string ()) })"),
+                "{out}"
+            );
+        }
+    }
+
+    #[test]
+    fn ctx_expression_and_await_are_interpolated() {
+        let out = dispatch(&["n"], &quote! { ctx . as_ref () }, &quote! { . await });
+        assert!(
+            out.contains("handler (ctx . as_ref () , n) . await ;"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn encode_err_is_passed_to_map_err() {
+        let fn_name = format_ident!("handler");
+        let args = format_ident!("input");
+        let encode_err = quote! { |e| custom (e) };
+        let out = build_handler_dispatch(
+            &fn_name,
+            &[],
+            &args,
+            &quote! { ctx },
+            &quote! {},
+            &encode_err,
+        )
+        .to_string();
+        assert!(out.contains("map_err (| e | custom (e))"), "{out}");
     }
 }
 

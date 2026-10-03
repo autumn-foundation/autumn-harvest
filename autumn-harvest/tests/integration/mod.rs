@@ -6,6 +6,8 @@ mod active_workflow_gauge_tests;
 mod activity_claim_epoch_tests;
 mod activity_default_floor_tests;
 #[cfg(feature = "db")]
+mod activity_default_timeout_tests;
+#[cfg(feature = "db")]
 mod activity_enqueue_batch_perf;
 mod activity_failure_tests;
 #[cfg(feature = "db")]
@@ -126,6 +128,7 @@ mod guardrail_catalog_tests;
 mod havoc_reentrancy;
 mod havoc_tests;
 mod history_ceiling_claim_tests;
+mod host_clock_skew_tests;
 mod hot_code_swap_docs;
 #[cfg(all(feature = "hot-code-swap", feature = "testing"))]
 mod hot_code_swap_tests;
@@ -159,6 +162,8 @@ mod mutex_lease_reclaim_perf;
 #[cfg(feature = "db")]
 mod mutex_tests;
 mod nd_block_tests;
+#[cfg(feature = "db")]
+mod notify_post_commit_tests;
 mod panic_containment_tests;
 #[cfg(feature = "db")]
 mod parent_close_cascade_unfinished_handlers_perf;
@@ -212,6 +217,7 @@ mod retention_overrides_tests;
 mod retention_reclaim_support;
 mod retention_summary_tests;
 mod retry_after_tests;
+mod retry_budget_tests;
 mod retry_chain_routing_tests;
 mod retry_clock_skew_tests;
 mod retry_now_tests;

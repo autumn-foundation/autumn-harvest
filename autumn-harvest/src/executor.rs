@@ -244,7 +244,6 @@ async fn run_workflow_handler_cycle(
     input: Value,
 ) -> HandlerCycleResult {
     use futures::FutureExt as _;
-    use std::task::Poll;
     // Issue #782 (PR #1012 review): contain a panic during future *construction*.
     // The `catch_unwind` below wraps only the future's poll; a hand-written
     // handler that does synchronous work before returning its boxed future would
@@ -254,13 +253,53 @@ async fn run_workflow_handler_cycle(
         Err(message) => return HandlerCycleResult::Panicked(message),
     };
     // Issue #691 (durable mutex): the handler future must outlive the
-    // `set_suspending(true)` call below. A `MutexGuard` held across the park
-    // reads that flag in its `Drop`. If the future dropped first, the guard
-    // would push a `ReleaseMutex` and free the lock under a parked holder.
-    // The poll loop therefore borrows `guarded`, and `guarded` drops only at
-    // the end of this function. A guard dropped mid-poll or at completion
-    // still sees `suspending == false` and releases normally.
+    // `set_suspending(true)` call in the poll loop. A `MutexGuard` held across
+    // the park reads that flag in its `Drop`. If the future dropped first, the
+    // guard would push a `ReleaseMutex` and free the lock under a parked
+    // holder. The poll loop therefore borrows `guarded`, and `guarded` drops
+    // only at the end of this function. A guard dropped mid-poll or at
+    // completion still sees `suspending == false` and releases normally.
     let mut guarded = std::pin::pin!(std::panic::AssertUnwindSafe(handler_fut).catch_unwind());
+    poll_handler_cycle(ctx, guarded.as_mut()).await
+}
+
+/// A handler future that owns its context, so it can outlive one cycle.
+///
+/// The worker keeps such a future resident between decisions (issue #1798).
+/// The output is the handler result, or the payload of a contained panic.
+pub(crate) type OwnedHandlerFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = std::thread::Result<Result<Value, String>>> + Send>,
+>;
+
+/// Builds an [`OwnedHandlerFuture`] for `handler` (issue #1798).
+///
+/// The `async move` block owns an `Arc` of the context and lends it to the
+/// handler, so the future is `'static` without `unsafe` code. The handler
+/// is constructed inside the first poll. A panic during construction is
+/// therefore caught by the same `catch_unwind` as a panic during a poll.
+pub(crate) fn owned_handler_future(
+    ctx: &std::sync::Arc<WorkflowContext>,
+    handler: WorkflowHandlerFn,
+    input: Value,
+) -> OwnedHandlerFuture {
+    use futures::FutureExt as _;
+    let ctx = std::sync::Arc::clone(ctx);
+    Box::pin(std::panic::AssertUnwindSafe(async move { handler(&ctx, input).await }).catch_unwind())
+}
+
+/// Polls a handler future for one cycle under the readiness rule of
+/// [`run_workflow_handler_cycle`].
+///
+/// The caller owns the future and must drop it only after this returns,
+/// because a suspension sets `ctx.set_suspending(true)` here (issue #691).
+async fn poll_handler_cycle<F>(
+    ctx: &WorkflowContext,
+    mut guarded: std::pin::Pin<&mut F>,
+) -> HandlerCycleResult
+where
+    F: std::future::Future<Output = std::thread::Result<Result<Value, String>>> + ?Sized,
+{
+    use std::task::Poll;
     // Armed at the first foreign wait, so CPU time before it does not count.
     let mut deadline = std::pin::pin!(tokio::time::sleep(DEADLOCK_TIMEOUT));
     let mut deadline_armed = false;
@@ -1997,6 +2036,85 @@ pub async fn run_workflow_with_state_history_policy_and_caps(
     tracing::Span,
     Option<crate::shard::ShardRouter>,
 ) {
+    let ctx = build_task_context(
+        exec_id,
+        history,
+        state,
+        history_policy,
+        span_meta,
+        declarative_query_handlers,
+        declarative_update_handlers,
+        workflow_name,
+        max_activity_input_bytes,
+        max_signal_payload_bytes,
+        max_workflow_input_bytes,
+        max_current_details_bytes,
+        workflow_log_policy,
+        context_headers,
+        payload_offload_threshold,
+        metrics,
+        default_activity_retry_policy,
+        default_activity_start_to_close,
+    );
+    drive_workflow(ctx, handler, input, span_meta).await
+}
+
+/// The context of [`run_workflow`]: default caps, state and policy.
+///
+/// [`crate::resident::start`] builds the same context, so the resident tests
+/// compare like with like.
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn default_task_context(
+    exec_id: ExecutionId,
+    history: Vec<WorkflowEvent>,
+) -> WorkflowContext {
+    build_task_context(
+        exec_id,
+        history,
+        empty_shared_state(),
+        WorkflowHistoryPolicy::default(),
+        None,
+        &[],
+        &[],
+        "",
+        crate::builder::DEFAULT_MAX_ACTIVITY_INPUT_BYTES,
+        crate::builder::DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
+        crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
+        crate::context::DEFAULT_CURRENT_DETAILS_CAP_BYTES,
+        None,
+        std::collections::HashMap::new(),
+        None,
+        std::sync::Arc::new(NoOpMetrics),
+        None,
+        None,
+    )
+}
+
+/// Builds the worker's [`WorkflowContext`] for one decision.
+///
+/// Shared by [`run_workflow_with_state_history_policy_and_caps`] and the
+/// worker's resident path (issue #1798), so both build the same context.
+#[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
+pub(crate) fn build_task_context(
+    exec_id: ExecutionId,
+    history: Vec<WorkflowEvent>,
+    state: SharedState,
+    history_policy: WorkflowHistoryPolicy,
+    span_meta: Option<&WorkflowExecuteSpanMeta>,
+    declarative_query_handlers: &[&QueryHandlerInfo],
+    declarative_update_handlers: &[&UpdateHandlerInfo],
+    workflow_name: &str,
+    max_activity_input_bytes: u64,
+    max_signal_payload_bytes: u64,
+    max_workflow_input_bytes: u64,
+    max_current_details_bytes: usize,
+    workflow_log_policy: Option<crate::context::WorkflowLogPolicy>,
+    context_headers: std::collections::HashMap<String, String>,
+    payload_offload_threshold: Option<u64>,
+    metrics: std::sync::Arc<dyn MetricsRecorder>,
+    default_activity_retry_policy: Option<crate::policy::RetryPolicy>,
+    default_activity_start_to_close: Option<std::time::Duration>,
+) -> WorkflowContext {
     let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
         exec_id,
         history,
@@ -2052,8 +2170,7 @@ pub async fn run_workflow_with_state_history_policy_and_caps(
     for h in declarative_update_handlers {
         ctx.register_declarative_update_handler(h);
     }
-
-    drive_workflow(ctx, handler, input, span_meta).await
+    ctx
 }
 
 /// Build the ND-block outcome for a cycle that skipped a recorded command
@@ -2114,11 +2231,39 @@ fn skipped_command_outcome(
     })
 }
 
+/// The result of one executor cycle on the worker path.
+pub(crate) struct DriveResult {
+    /// How the cycle ended.
+    pub(crate) outcome: WorkflowOutcome,
+    /// Commands drained with a terminal outcome. Empty for a suspension.
+    pub(crate) pending: Vec<WorkflowCommand>,
+    /// The open `harvest.workflow.execute` span. See [`run_workflow_with_state`].
+    pub(crate) span: tracing::Span,
+    /// The explicit context-local router, if any. See [`run_workflow_with_state`].
+    pub(crate) router: Option<crate::shard::ShardRouter>,
+    /// The suspended workflow, kept for the next decision (issue #1798).
+    #[cfg_attr(not(any(feature = "db", feature = "testing")), allow(dead_code))]
+    // Resident paths need the worker or the test harness.
+    pub(crate) resident: Option<crate::resident::ResidentWorkflow>,
+}
+
+impl DriveResult {
+    fn into_tuple(
+        self,
+    ) -> (
+        WorkflowOutcome,
+        Vec<WorkflowCommand>,
+        tracing::Span,
+        Option<crate::shard::ShardRouter>,
+    ) {
+        (self.outcome, self.pending, self.span, self.router)
+    }
+}
+
 /// Core executor body: emit the `OTel` span, run the handler cycle, and return
 /// the outcome.  Shared by all public entry points so the advancing-clock
 /// variant (`run_workflow_with_state_advancing_clock`) does not duplicate the
 /// span/cycle/drain logic.
-#[allow(clippy::too_many_lines)] // one linear span/cycle/drain orchestrator
 async fn drive_workflow(
     ctx: WorkflowContext,
     handler: WorkflowHandlerFn,
@@ -2130,8 +2275,50 @@ async fn drive_workflow(
     tracing::Span,
     Option<crate::shard::ShardRouter>,
 ) {
-    let exec_id = ctx.execution_id();
+    drive_workflow_keep(ctx, handler, input, span_meta, None)
+        .await
+        .into_tuple()
+}
 
+/// [`drive_workflow`] that can keep a suspended cycle resident (issue #1798).
+///
+/// With `keep` set, a suspension that the resident path accepts returns its
+/// future in [`DriveResult::resident`]. Everything else matches
+/// [`drive_workflow`].
+pub(crate) async fn drive_workflow_keep(
+    ctx: WorkflowContext,
+    handler: WorkflowHandlerFn,
+    input: Value,
+    span_meta: Option<&WorkflowExecuteSpanMeta>,
+    keep: Option<crate::resident::ResidentKey>,
+) -> DriveResult {
+    let ctx = std::sync::Arc::new(ctx);
+    let future = owned_handler_future(&ctx, handler, input);
+    drive_cycle(ctx, future, span_meta, None, keep).await
+}
+
+/// Runs the next cycle of a resident workflow (issue #1798).
+///
+/// The caller has already sent the new result to the parked future. The span
+/// records `harvest.replay = false`, because the cycle replays nothing.
+#[cfg_attr(not(any(feature = "db", feature = "testing")), allow(dead_code))] // Resident paths need the worker or the test harness.
+pub(crate) async fn drive_resumed(
+    ctx: std::sync::Arc<WorkflowContext>,
+    future: OwnedHandlerFuture,
+    span_meta: Option<&WorkflowExecuteSpanMeta>,
+    key: crate::resident::ResidentKey,
+) -> DriveResult {
+    drive_cycle(ctx, future, span_meta, Some(false), Some(key)).await
+}
+
+/// Opens the `harvest.workflow.execute` span of one cycle.
+///
+/// `replay` overrides the `harvest.replay` value of `span_meta`.
+fn execute_span(
+    exec_id: ExecutionId,
+    span_meta: Option<&WorkflowExecuteSpanMeta>,
+    replay: Option<bool>,
+) -> tracing::Span {
     // ADR-0001 §2.1: emit harvest.workflow.execute for every executor cycle.
     // harvest.replay defaults to false at span creation so subscribers that only
     // observe on_new_span (e.g. tests) see the correct value for callers that
@@ -2149,7 +2336,7 @@ async fn drive_workflow(
         "link.traceparent" = tracing::field::Empty,
     );
     if let Some(meta) = span_meta {
-        span.record(ATTR_REPLAY, meta.is_replay);
+        span.record(ATTR_REPLAY, replay.unwrap_or(meta.is_replay));
         span.record(ATTR_WORKFLOW_ID, meta.workflow_name.as_str());
         span.record(ATTR_SHARD_ID, meta.shard_id);
         span.record(ATTR_QUEUE, meta.queue_name.as_str());
@@ -2157,6 +2344,18 @@ async fn drive_workflow(
             span.record("link.traceparent", link);
         }
     }
+    span
+}
+
+/// Polls one cycle, classifies it, and keeps it resident when it can.
+async fn drive_cycle(
+    ctx: std::sync::Arc<WorkflowContext>,
+    mut future: OwnedHandlerFuture,
+    span_meta: Option<&WorkflowExecuteSpanMeta>,
+    replay: Option<bool>,
+    keep: Option<crate::resident::ResidentKey>,
+) -> DriveResult {
+    let span = execute_span(ctx.execution_id(), span_meta, replay);
 
     // Clone the span handle BEFORE passing ownership to .instrument().
     // The clone keeps the ref-count above zero after .instrument() exits so the
@@ -2166,163 +2365,21 @@ async fn drive_workflow(
     // the instrumented future has already completed.
     let span_handle = span.clone();
 
-    let (outcome, pending) = async {
-        // Run the handler until it returns or blocks (issue #1797). On a
-        // suspension, drain the accumulated commands.
-        //
-        // Issue #782: run with panic containment. A contained panic short-circuits
-        // to a typed HandlerPanic `Failed` outcome with NO pending commands — the
-        // panicked cycle's commands are untrustworthy and are discarded (R5), so
-        // `ctx.drain_commands()` is deliberately not called on this path.
-        let cycle_result = match run_workflow_handler_cycle(&ctx, handler, input).await {
-            HandlerCycleResult::Returned(result) => Ok(result),
-            HandlerCycleResult::Suspended => Err(()),
-            // Issue #1797: the cycle's commands are discarded, as on a panic.
-            HandlerCycleResult::Deadlocked => {
-                return (
-                    WorkflowOutcome::TaskFailed {
-                        error: deadlock_error(),
-                    },
-                    Vec::new(),
-                );
-            }
-            HandlerCycleResult::Panicked(message) => {
-                return (
-                    WorkflowOutcome::Failed {
-                        error: encode_workflow_panic(message),
-                        non_deterministic_details: None,
-                        handler_panic: true,
-                        unhandled_signals: std::collections::BTreeMap::new(),
-                    },
-                    Vec::new(),
-                );
-            }
-        };
-
-        match cycle_result {
-            // Handler returned.  Drain any commands
-            // emitted during live execution (e.g. RecordUpdateResult from
-            // execute_admitted_update) so the worker can persist them before the
-            // terminal WorkflowCompleted/WorkflowFailed event.
-            Ok(Ok(output)) => {
-                // Issue #546 post-ship hardening: flush any push-based signal
-                // handler whose target became claimable but was never picked
-                // up by a real cursor-advancing call this cycle (a workflow
-                // that registers a handler and then completes without ever
-                // awaiting an activity/timer/signal).
-                ctx.flush_pending_signal_handlers();
-                // Issue #684: snapshot the unconsumed signals (after the flush,
-                // so #546 push handlers claim first) and carry them out on the
-                // outcome; the WORKER emits from the map (see `unhandled_signals`
-                // docs — emission moved off the executor's pre-#603-gate path).
-                let unhandled_signals = ctx.unhandled_signals();
-                // A plain-value built-in primitive (system_now/new_uuid/random_*)
-                // may have absorbed a replay divergence and recorded it as a
-                // deferred non-determinism error (issue #384). Surface it as a
-                // failure rather than letting the workflow complete silently.
-                let outcome = if let Some(nd) = ctx.take_deferred_nd_error() {
-                    WorkflowOutcome::Failed {
-                        error: format!("non-deterministic replay: {nd}"),
-                        non_deterministic_details: ctx.take_nd_details(),
-                        handler_panic: false,
-                        unhandled_signals,
-                    }
-                } else {
-                    // Issue #1791: a return that skipped a recorded command is
-                    // drift, not completion.
-                    skipped_command_outcome(&ctx, "<workflow returned early>", &unhandled_signals)
-                        .unwrap_or(WorkflowOutcome::Completed {
-                            output,
-                            unhandled_signals,
-                        })
-                };
-                (outcome, ctx.drain_commands())
-            }
-            // A primitive may have drifted before the workflow returned Err from
-            // its own logic; prefer the non-determinism error (issue #384).
-            Ok(Err(error)) => {
-                // See the `Ok(Ok(output))` arm above (issue #546).
-                ctx.flush_pending_signal_handlers();
-                // Issue #684: same terminal-arm snapshot as the completed path.
-                let unhandled_signals = ctx.unhandled_signals();
-                let details = ctx.take_nd_details();
-                let outcome = ctx.take_deferred_nd_error().map_or(
-                    WorkflowOutcome::Failed {
-                        error,
-                        non_deterministic_details: details.clone(),
-                        handler_panic: false,
-                        unhandled_signals: unhandled_signals.clone(),
-                    },
-                    |nd| WorkflowOutcome::Failed {
-                        error: format!("non-deterministic replay: {nd}"),
-                        non_deterministic_details: details,
-                        handler_panic: false,
-                        unhandled_signals: unhandled_signals.clone(),
-                    },
-                );
-                (outcome, ctx.drain_commands())
-            }
-
-            // The handler is parked on a Harvest future (issue #1797).
-            // Drain the commands it emitted before suspending. RecordUpdateResult
-            // commands emitted in this cycle are included in the commands list and
-            // will be handled by the worker alongside the suspension side-effects.
-            Err(()) => {
-                // A plain-value built-in primitive (system_now/new_uuid/random_*)
-                // may have recorded a divergence before the workflow parked on an
-                // await point. Fail the execution now rather than suspending from
-                // a non-deterministic state (issue #384).
-                if let Some(nd) = ctx.take_deferred_nd_error() {
-                    let details = ctx.take_nd_details();
-                    return (
-                        WorkflowOutcome::Failed {
-                            error: format!("non-deterministic replay: {nd}"),
-                            non_deterministic_details: details,
-                            handler_panic: false,
-                            unhandled_signals: std::collections::BTreeMap::new(),
-                        },
-                        ctx.drain_commands(),
-                    );
-                }
-                // Issue #1791: a park that skipped a recorded command is drift.
-                // It can wait forever on an event that never comes. This runs
-                // before the continue-as-new check, as on the strict path.
-                if let Some(outcome) = skipped_command_outcome(
-                    &ctx,
-                    "<workflow suspended early>",
-                    &std::collections::BTreeMap::new(),
-                ) {
-                    return (outcome, ctx.drain_commands());
-                }
-                let mut commands = ctx.drain_commands();
-                // ContinueAsNew is terminal: when the workflow body parks on
-                // the dedicated suspension future, the latest command in the
-                // drain is the ContinueAsNew the user requested. Bookkeeping
-                // commands earlier in the drain (e.g. RecordMarker, side_effect)
-                // are returned as pending_cmds so the worker can still apply
-                // any UpsertSearchAttributes patches before sealing the execution.
-                if let Some(idx) = commands
-                    .iter()
-                    .rposition(|cmd| matches!(cmd, WorkflowCommand::ContinueAsNew { .. }))
-                    && let WorkflowCommand::ContinueAsNew {
-                        input,
-                        new_workflow_type,
-                    } = commands.swap_remove(idx)
-                {
-                    return (
-                        WorkflowOutcome::ContinuedAsNew {
-                            input,
-                            new_workflow_type,
-                        },
-                        commands,
-                    );
-                }
-                (WorkflowOutcome::Suspended { commands }, vec![])
-            }
+    // Run the handler until it returns or blocks (issue #1797).
+    let cycle_result = poll_handler_cycle(&ctx, future.as_mut())
+        .instrument(span)
+        .await;
+    // Only a suspension can stay resident. Any other future drops here, right
+    // after the cycle, as before issue #1798.
+    let keep = keep.filter(|_| matches!(cycle_result, HandlerCycleResult::Suspended));
+    let future = keep.is_some().then_some(future);
+    let (mut outcome, pending) = span_handle.in_scope(|| classify_cycle(&ctx, cycle_result));
+    let resident = match (future, keep) {
+        (Some(future), Some(key)) => {
+            crate::resident::ResidentWorkflow::capture(&ctx, future, &mut outcome, key)
         }
-    }
-    .instrument(span)
-    .await;
+        _ => None,
+    };
 
     // Issue #1263 items 11/15/17: carry the EXPLICIT context-local router
     // out to the caller, if this context installed one via
@@ -2332,12 +2389,173 @@ async fn drive_workflow(
     // when no context-local router was installed — the ordinary production
     // case. The persist layer then keeps asking the global fresh, exactly
     // as before this fix.
-    (
+    let router = ctx.resolved_placement_router();
+    DriveResult {
         outcome,
         pending,
-        span_handle,
-        ctx.resolved_placement_router(),
-    )
+        span: span_handle,
+        router,
+        resident,
+    }
+}
+
+/// Maps one cycle result to an outcome and the drained commands.
+///
+/// Issue #782: a contained panic short-circuits to a typed `HandlerPanic`
+/// `Failed` outcome with no pending commands. The panicked cycle's commands
+/// are untrustworthy and are discarded (R5), so `ctx.drain_commands()` is not
+/// called on that path.
+#[allow(clippy::too_many_lines)] // one linear outcome mapping
+fn classify_cycle(
+    ctx: &WorkflowContext,
+    cycle_result: HandlerCycleResult,
+) -> (WorkflowOutcome, Vec<WorkflowCommand>) {
+    let cycle_result = match cycle_result {
+        HandlerCycleResult::Returned(result) => Ok(result),
+        HandlerCycleResult::Suspended => Err(()),
+        // Issue #1797: the cycle's commands are discarded, as on a panic.
+        HandlerCycleResult::Deadlocked => {
+            return (
+                WorkflowOutcome::TaskFailed {
+                    error: deadlock_error(),
+                },
+                Vec::new(),
+            );
+        }
+        HandlerCycleResult::Panicked(message) => {
+            return (
+                WorkflowOutcome::Failed {
+                    error: encode_workflow_panic(message),
+                    non_deterministic_details: None,
+                    handler_panic: true,
+                    unhandled_signals: std::collections::BTreeMap::new(),
+                },
+                Vec::new(),
+            );
+        }
+    };
+
+    match cycle_result {
+        // Handler returned.  Drain any commands
+        // emitted during live execution (e.g. RecordUpdateResult from
+        // execute_admitted_update) so the worker can persist them before the
+        // terminal WorkflowCompleted/WorkflowFailed event.
+        Ok(Ok(output)) => {
+            // Issue #546 post-ship hardening: flush any push-based signal
+            // handler whose target became claimable but was never picked
+            // up by a real cursor-advancing call this cycle (a workflow
+            // that registers a handler and then completes without ever
+            // awaiting an activity/timer/signal).
+            ctx.flush_pending_signal_handlers();
+            // Issue #684: snapshot the unconsumed signals (after the flush,
+            // so #546 push handlers claim first) and carry them out on the
+            // outcome; the WORKER emits from the map (see `unhandled_signals`
+            // docs — emission moved off the executor's pre-#603-gate path).
+            let unhandled_signals = ctx.unhandled_signals();
+            // A plain-value built-in primitive (system_now/new_uuid/random_*)
+            // may have absorbed a replay divergence and recorded it as a
+            // deferred non-determinism error (issue #384). Surface it as a
+            // failure rather than letting the workflow complete silently.
+            let outcome = if let Some(nd) = ctx.take_deferred_nd_error() {
+                WorkflowOutcome::Failed {
+                    error: format!("non-deterministic replay: {nd}"),
+                    non_deterministic_details: ctx.take_nd_details(),
+                    handler_panic: false,
+                    unhandled_signals,
+                }
+            } else {
+                // Issue #1791: a return that skipped a recorded command is
+                // drift, not completion.
+                skipped_command_outcome(ctx, "<workflow returned early>", &unhandled_signals)
+                    .unwrap_or(WorkflowOutcome::Completed {
+                        output,
+                        unhandled_signals,
+                    })
+            };
+            (outcome, ctx.drain_commands())
+        }
+        // A primitive may have drifted before the workflow returned Err from
+        // its own logic; prefer the non-determinism error (issue #384).
+        Ok(Err(error)) => {
+            // See the `Ok(Ok(output))` arm above (issue #546).
+            ctx.flush_pending_signal_handlers();
+            // Issue #684: same terminal-arm snapshot as the completed path.
+            let unhandled_signals = ctx.unhandled_signals();
+            let details = ctx.take_nd_details();
+            let outcome = ctx.take_deferred_nd_error().map_or(
+                WorkflowOutcome::Failed {
+                    error,
+                    non_deterministic_details: details.clone(),
+                    handler_panic: false,
+                    unhandled_signals: unhandled_signals.clone(),
+                },
+                |nd| WorkflowOutcome::Failed {
+                    error: format!("non-deterministic replay: {nd}"),
+                    non_deterministic_details: details,
+                    handler_panic: false,
+                    unhandled_signals: unhandled_signals.clone(),
+                },
+            );
+            (outcome, ctx.drain_commands())
+        }
+
+        // The handler is parked on a Harvest future (issue #1797).
+        // Drain the commands it emitted before suspending. RecordUpdateResult
+        // commands emitted in this cycle are included in the commands list and
+        // will be handled by the worker alongside the suspension side-effects.
+        Err(()) => {
+            // A plain-value built-in primitive (system_now/new_uuid/random_*)
+            // may have recorded a divergence before the workflow parked on an
+            // await point. Fail the execution now rather than suspending from
+            // a non-deterministic state (issue #384).
+            if let Some(nd) = ctx.take_deferred_nd_error() {
+                let details = ctx.take_nd_details();
+                return (
+                    WorkflowOutcome::Failed {
+                        error: format!("non-deterministic replay: {nd}"),
+                        non_deterministic_details: details,
+                        handler_panic: false,
+                        unhandled_signals: std::collections::BTreeMap::new(),
+                    },
+                    ctx.drain_commands(),
+                );
+            }
+            // Issue #1791: a park that skipped a recorded command is drift.
+            // It can wait forever on an event that never comes. This runs
+            // before the continue-as-new check, as on the strict path.
+            if let Some(outcome) = skipped_command_outcome(
+                ctx,
+                "<workflow suspended early>",
+                &std::collections::BTreeMap::new(),
+            ) {
+                return (outcome, ctx.drain_commands());
+            }
+            let mut commands = ctx.drain_commands();
+            // ContinueAsNew is terminal: when the workflow body parks on
+            // the dedicated suspension future, the latest command in the
+            // drain is the ContinueAsNew the user requested. Bookkeeping
+            // commands earlier in the drain (e.g. RecordMarker, side_effect)
+            // are returned as pending_cmds so the worker can still apply
+            // any UpsertSearchAttributes patches before sealing the execution.
+            if let Some(idx) = commands
+                .iter()
+                .rposition(|cmd| matches!(cmd, WorkflowCommand::ContinueAsNew { .. }))
+                && let WorkflowCommand::ContinueAsNew {
+                    input,
+                    new_workflow_type,
+                } = commands.swap_remove(idx)
+            {
+                return (
+                    WorkflowOutcome::ContinuedAsNew {
+                        input,
+                        new_workflow_type,
+                    },
+                    commands,
+                );
+            }
+            (WorkflowOutcome::Suspended { commands }, vec![])
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -1847,8 +1847,8 @@ enum TokenCommand {
     Create {
         /// Human-readable label for the caller (CI job, dashboard, on-call, SDK).
         name: String,
-        /// Verb-level scope: `read` (read-only routes) or `mutate` (everything).
-        /// Defaults to `read` (least privilege).
+        /// Verb-level scope: `read` (read-only routes), `mutate` (all but token
+        /// mint and revoke) or `admin` (everything). Defaults to `read`.
         #[arg(long, default_value = "read")]
         scope: String,
         /// Optional RFC 3339 expiry after which the token is rejected 401.
@@ -1866,6 +1866,7 @@ enum TokenCommand {
     },
     /// Rotate a token: mint a replacement via the create route. Revoking the
     /// old token is a documented second step (`harvest token revoke <old-id>`).
+    /// Minting needs an `admin` token (issue #1803).
     Rotate {
         /// The existing token ID being rotated out (used to name the replacement).
         old_id: String,
@@ -1881,7 +1882,7 @@ enum TokenCommand {
     /// against your database — no API call and no DB connection is made.
     ///
     /// Standalone (tokens-only) deployments use this to mint their first
-    /// `mutate` token: with tokens as the only auth there is no admin caller
+    /// `admin` token. With tokens as the only auth, no admin caller exists
     /// yet to mint one via `POST /admin/tokens`. Run the printed SQL once (you
     /// already have DB access — the trust anchor), then mint every further
     /// token through the API. The printed SQL contains ONLY the hash; the
@@ -1890,9 +1891,10 @@ enum TokenCommand {
         /// Human-readable label for the seed token.
         #[arg(long, default_value = "bootstrap")]
         name: String,
-        /// Verb-level scope: `mutate` (can mint further tokens via the API) or
-        /// `read`. Defaults to `mutate` so the seed token can bootstrap the rest.
-        #[arg(long, default_value = "mutate", value_parser = ["read", "mutate"])]
+        /// Verb-level scope: `admin` (can mint further tokens via the API),
+        /// `mutate` or `read`. Defaults to `admin` so the seed token can mint
+        /// the rest (issue #1803).
+        #[arg(long, default_value = "admin", value_parser = ["read", "mutate", "admin"])]
         scope: String,
         /// Optional RFC 3339 expiry after which the token is rejected 401.
         #[arg(long)]
@@ -5906,18 +5908,18 @@ impl DrShardStatus {
     }
 }
 
+/// Connect for a DR command. [`autumn_harvest::pg_tls`] picks the transport
+/// from the `sslmode`, so a managed Postgres that refuses plaintext is
+/// reachable.
 async fn dr_connect(
     dsn: &str,
 ) -> Result<autumn_harvest::diesel_async::AsyncPgConnection, CliError> {
-    use autumn_harvest::diesel_async::AsyncConnection as _;
-    autumn_harvest::diesel_async::AsyncPgConnection::establish(dsn)
-        .await
-        .map_err(|e| {
-            CliError::InvalidInput(format!(
-                "cannot connect to {}: {e}",
-                autumn_harvest::backup_verify::redact_dsn(dsn)
-            ))
-        })
+    autumn_harvest::pg_tls::connect(dsn).await.map_err(|e| {
+        CliError::InvalidInput(format!(
+            "cannot connect to {}: {e}",
+            autumn_harvest::backup_verify::redact_dsn(dsn)
+        ))
+    })
 }
 
 /// Connect for a read-only DR command, with the session pinned read-only.
@@ -12267,7 +12269,7 @@ pub struct BootstrapToken {
     pub secret: String,
     /// `hex(SHA256(secret))` — the value embedded in the INSERT and stored.
     pub hash: String,
-    /// The token scope (`read` | `mutate`).
+    /// The token scope (`read` | `mutate` | `admin`).
     pub scope: String,
     /// The token label.
     pub name: String,
@@ -12372,10 +12374,16 @@ fn run_token_bootstrap(
     println!();
     println!("  3. Send the secret above as a bearer credential:");
     println!("       Authorization: Bearer <secret>");
-    println!(
-        "     A `{}`-scoped token can mint every further token via POST /admin/tokens.",
-        token.scope
-    );
+    if token.scope == "admin" {
+        println!(
+            "     An `admin`-scoped token can mint every further token via POST /admin/tokens."
+        );
+    } else {
+        println!(
+            "     A `{}`-scoped token cannot mint tokens. Only an `admin` token can.",
+            token.scope
+        );
+    }
     Ok(())
 }
 
@@ -16686,10 +16694,10 @@ mod token_bootstrap_tests {
         );
     }
 
-    /// `--scope` defaults to `mutate` (a seed must be able to mint others) and
+    /// `--scope` defaults to `admin` (a seed must be able to mint others) and
     /// `--created-by`/`--name` default to `bootstrap`.
     #[test]
-    fn bootstrap_defaults_scope_to_mutate() {
+    fn bootstrap_defaults_scope_to_admin() {
         let cli = Cli::try_parse_from(["harvest", "token", "bootstrap"])
             .expect("token bootstrap should parse with no flags");
         match cli.command {
@@ -16702,7 +16710,7 @@ mod token_bootstrap_tests {
                         created_by,
                     },
             } => {
-                assert_eq!(scope, "mutate", "default scope must be mutate");
+                assert_eq!(scope, "admin", "default scope must be admin");
                 assert_eq!(name, "bootstrap");
                 assert_eq!(created_by, "bootstrap");
                 assert_eq!(expires_at, None);
@@ -16711,11 +16719,13 @@ mod token_bootstrap_tests {
         }
     }
 
-    /// The `value_parser` rejects a scope outside {read, mutate}.
+    /// The `value_parser` rejects a scope outside {read, mutate, admin}.
     #[test]
     fn bootstrap_rejects_invalid_scope() {
-        let result = Cli::try_parse_from(["harvest", "token", "bootstrap", "--scope", "admin"]);
+        let result = Cli::try_parse_from(["harvest", "token", "bootstrap", "--scope", "root"]);
         assert!(result.is_err(), "an invalid --scope must fail to parse");
+        let admin = Cli::try_parse_from(["harvest", "token", "bootstrap", "--scope", "admin"]);
+        assert!(admin.is_ok(), "admin is a valid --scope (issue #1803)");
     }
 
     /// A `read`-scoped bootstrap flows the flag values through to the SQL.
@@ -18984,5 +18994,25 @@ mod migrate_cli_tests {
         );
         assert!(rendered.contains(&redacted), "{rendered}");
         assert_eq!(error.exit_code(), 1);
+    }
+}
+
+#[cfg(test)]
+mod pg_tls_feature_tests {
+    /// `harvest dr` and `harvest backup verify` connect through
+    /// `autumn_harvest::pg_tls`. A standalone CLI build must carry its TLS
+    /// connector, or a managed Postgres that needs TLS is unreachable.
+    #[test]
+    fn the_cli_build_has_tls_for_its_database_probes() {
+        let result = autumn_harvest::pg_tls::prepare("postgres://u@h/db?sslmode=require");
+        let unsupported = matches!(
+            &result,
+            Err(autumn_harvest::pg_tls::PgTlsError::Unsupported(m)) if m.contains("`tls` feature")
+        );
+        assert!(
+            !unsupported,
+            "the CLI must enable autumn-harvest/tls: {:?}",
+            result.err()
+        );
     }
 }

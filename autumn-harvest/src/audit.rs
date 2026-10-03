@@ -230,6 +230,19 @@ pub const OP_QUEUE_RESUME: &str = "queue.resume";
 pub const OP_TOKEN_CREATE: &str = "token.create";
 /// Audit operation: revoked a scoped API token (issue #942).
 pub const OP_TOKEN_REVOKE: &str = "token.revoke";
+/// Audit operation: a queue started to shed new starts (issue #1794).
+///
+/// The load-shed sampler writes it, not a route. So no `ALL_MUTATION_ROUTES`
+/// entry exists for it.
+pub const OP_LOAD_SHED_TRIP: &str = "load_shed.trip";
+/// Audit operation: a queue stopped shedding new starts (issue #1794).
+pub const OP_LOAD_SHED_CLEAR: &str = "load_shed.clear";
+/// Audit operation: a token scope or the authorizer hook denied a request
+/// (issue #1803).
+///
+/// The row has status `failed`, so the SIEM export marks it `ERROR`. The deny
+/// reason goes in `error_summary` and never into the response.
+pub const OP_AUTHZ_DENY: &str = "authz.deny";
 
 // ── Target type constants ─────────────────────────────────────────────────────
 
@@ -260,6 +273,8 @@ pub const TARGET_TOKEN: &str = "token";
 pub const TARGET_QUEUE: &str = "queue";
 /// Audit target type: a shard's audit-export cursor (issue #953).
 pub const TARGET_AUDIT_EXPORT: &str = "audit_export";
+/// Audit target type: a management API route that a deny refused (issue #1803).
+pub const TARGET_ROUTE: &str = "route";
 
 // ── Status constants ──────────────────────────────────────────────────────────
 
@@ -289,6 +304,12 @@ pub const HEADER_SOURCE: &str = "x-harvest-source";
 
 /// Out-of-band exactly-once delivery key for the standalone signal route.
 pub const HEADER_IDEMPOTENCY_KEY: &str = "idempotency-key";
+
+/// Caller-declared tenant key that the authorizer hook receives (issue #1803).
+///
+/// Harvest does not check this value. The authorizer decides if the principal
+/// may act for the tenant.
+pub const HEADER_TENANT: &str = "x-harvest-tenant";
 
 // ── Retention ─────────────────────────────────────────────────────────────────
 
@@ -810,6 +831,17 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ("DELETE /calendars/{name}", RouteClass::Mutating),
 ];
 
+/// Routes that only an `admin`-scoped API token can reach (issue #1803).
+///
+/// A `mutate` token reaches every other mutation. Token management is here
+/// because a token that mints tokens can copy itself. Each entry must also be
+/// a `Mutating` entry in [`CLASSIFIED_ROUTES`].
+///
+/// No management route publishes a workflow module today. A future publish
+/// route runs code, so it belongs here. A guard test fails if a mutating
+/// `/modules` route is missing from this list.
+pub const ADMIN_SCOPE_ROUTES: &[&str] = &["POST /admin/tokens", "DELETE /admin/tokens/{id}"];
+
 // ── Declarative route manifest ────────────────────────────────────────────────
 
 /// Every operation name covered by the audit trail.
@@ -894,6 +926,9 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     // Operator read-path payload decoding (issue #608). Read audit — no
     // ALL_MUTATION_ROUTES entry; see the doc comment on OP_PAYLOAD_DECODE_READ.
     OP_PAYLOAD_DECODE_READ,
+    // Issue #1803: a deny has no route of its own, so no
+    // ALL_MUTATION_ROUTES entry names it.
+    OP_AUTHZ_DENY,
     // Read-only operator role (issue #776): these four constants pre-existed
     // but had never been wired into a route manifest entry. Their handlers
     // already write audit rows under these ops; classifying the routes (below)
@@ -909,6 +944,10 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_QUEUE_RESUME,
     OP_TOKEN_CREATE,
     OP_TOKEN_REVOKE,
+    // Automatic load shedding (issue #1794). No route entry: the sampler
+    // writes these rows.
+    OP_LOAD_SHED_TRIP,
+    OP_LOAD_SHED_CLEAR,
 ];
 
 /// Routes explicitly excluded from audit.
@@ -2338,6 +2377,45 @@ mod tests {
             EXCLUDED_ROUTES.contains(&"GET /admin/tokens"),
             "GET /admin/tokens must be in EXCLUDED_ROUTES (read, no audit) (issue #942)"
         );
+    }
+
+    #[test]
+    fn admin_scope_routes_are_classified_mutations() {
+        // Issue #1803: a typo in the admin list must fail here, not open a route.
+        assert_ne!(ADMIN_SCOPE_ROUTES.len(), 0);
+        for route in ADMIN_SCOPE_ROUTES {
+            assert!(
+                CLASSIFIED_ROUTES
+                    .iter()
+                    .any(|(r, c)| r == route && *c == RouteClass::Mutating),
+                "{route} must be a classified Mutating route (issue #1803)"
+            );
+        }
+    }
+
+    #[test]
+    fn token_and_module_mutations_require_admin_scope() {
+        // Issue #1803: token management and module publishing are admin-only.
+        // A new route under either family must join ADMIN_SCOPE_ROUTES.
+        for (route, class) in CLASSIFIED_ROUTES {
+            let sensitive = route.contains("/admin/tokens") || route.contains("/modules");
+            if sensitive && *class == RouteClass::Mutating {
+                assert!(
+                    ADMIN_SCOPE_ROUTES.contains(route),
+                    "{route} must be in ADMIN_SCOPE_ROUTES (issue #1803)"
+                );
+            }
+        }
+        assert!(ADMIN_SCOPE_ROUTES.contains(&"POST /admin/tokens"));
+        assert!(ADMIN_SCOPE_ROUTES.contains(&"DELETE /admin/tokens/{id}"));
+    }
+
+    #[test]
+    fn authz_deny_is_an_audited_operation() {
+        assert_eq!(OP_AUTHZ_DENY, "authz.deny");
+        assert!(AUDITED_OPERATIONS.contains(&OP_AUTHZ_DENY));
+        assert_eq!(TARGET_ROUTE, "route");
+        assert_eq!(HEADER_TENANT, "x-harvest-tenant");
     }
 
     #[test]

@@ -174,6 +174,8 @@ out of scope for this role.
 - Fine-grained per-workflow-type, per-queue, or per-namespace RBAC.
 - Multi-tenant data isolation / row-level scoping.
 - Arbitrary custom per-route permission policies beyond the binary read/mutate
-  classification.
+  classification. Use the
+  [authorizer hook](./security-posture.md#authorizer-hook-issue-1803)
+  (issue #1803) for a per-route, per-tenant or per-shard policy.
 - Changing the default single-admin boundary or the `has_harvest_admin_access`
   semantics for existing callers.

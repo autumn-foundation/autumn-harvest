@@ -21,7 +21,7 @@ Key attribute options:
 
 | Attribute | Default | Notes |
 |---|---|---|
-| `start_to_close` | none (no limit) | Wall-clock cap for a single attempt. |
+| `start_to_close` | `WorkerConfig::default_activity_start_to_close` (10 min) | Wall-clock cap for a single attempt. The worker default applies only when the activity sets no `start_to_close`, `schedule_to_close` or `heartbeat_timeout` (issue #1808). |
 | `heartbeat_timeout` | none | Fail the attempt if no heartbeat arrives within this window. |
 | `schedule_to_start` | none | Fail if no worker claims the task within this window. |
 | `queue` | `"default"` | Route the task to a named worker pool. |
@@ -83,6 +83,10 @@ async fn transcode(ctx: &ActivityContext, job: Job) -> Result<(), String> {
 it to a named local (`let _hb = ...`); binding to `_` drops it immediately and
 stops the ticker. Manual `ctx.heartbeat(payload)` calls still work alongside it
 and take over the checkpoint payload.
+
+An activity with a `heartbeat_timeout` gets no default `start_to_close`
+(issue #1808). An auto-heartbeat keeps a stuck attempt alive, so the heartbeat
+timeout cannot stop it. Give such an activity its own `start_to_close`.
 
 ## Cooperative cancellation
 

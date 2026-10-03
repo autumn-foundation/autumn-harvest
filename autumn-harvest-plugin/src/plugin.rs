@@ -235,6 +235,9 @@ pub struct HarvestPlugin {
     /// [`Self::enable_api_tokens`]; installs the token verification + scope
     /// layer. Default off — the router is byte-for-byte unchanged (AC7).
     api_tokens_enabled: bool,
+    /// The authorizer hook (issue #1803). Set via [`Self::with_authorizer`].
+    /// `None` installs no layer, so the router is unchanged.
+    authorizer: Option<crate::authz::SharedAuthorizer>,
     /// Opt-out that opens mutating routes with no auth (issue #1802). Set
     /// true by [`Self::allow_unauthenticated_mutations`]. Default off.
     allow_unauthenticated_mutations: bool,
@@ -336,6 +339,7 @@ impl HarvestPlugin {
             decode_payloads_on_read: false,
             role_auth_enabled: false,
             api_tokens_enabled: false,
+            authorizer: None,
             allow_unauthenticated_mutations: false,
             status_thresholds: crate::status_summary::StatusThresholds::default(),
             canary_config: None,
@@ -409,6 +413,16 @@ impl HarvestPlugin {
     #[must_use]
     pub fn retention(mut self, config: autumn_harvest::retention::RetentionConfig) -> Self {
         self.builder = self.builder.retention(config);
+        self
+    }
+
+    /// Turn on automatic load shedding for the queues in `config` (issue #1794).
+    ///
+    /// A queue with an old backlog then refuses new starts with `429` and
+    /// `Retry-After`. See `docs/operations/load-shedding.md`.
+    #[must_use]
+    pub fn load_shed(mut self, config: autumn_harvest::load_shed::LoadShedConfig) -> Self {
+        self.builder = self.builder.load_shed(config);
         self
     }
 
@@ -583,6 +597,19 @@ impl HarvestPlugin {
     #[must_use]
     pub const fn enable_api_tokens(mut self) -> Self {
         self.api_tokens_enabled = true;
+        self
+    }
+
+    /// Install an authorizer hook on the management API (issue #1803).
+    ///
+    /// The hook sees each request after the token and read-only layers. It can
+    /// deny by principal, route class, tenant key or shard, and each deny is
+    /// audited. It cannot widen a token scope. See [`crate::authz`].
+    ///
+    /// Default off: with no hook the router is byte-for-byte unchanged.
+    #[must_use]
+    pub fn with_authorizer(mut self, authorizer: impl crate::authz::HarvestAuthorizer) -> Self {
+        self.authorizer = Some(crate::authz::SharedAuthorizer::new(authorizer));
         self
     }
 
@@ -1115,6 +1142,7 @@ impl Plugin for HarvestPlugin {
             decode_payloads_on_read,
             role_auth_enabled,
             api_tokens_enabled,
+            authorizer,
             allow_unauthenticated_mutations,
             status_thresholds,
             canary_config,
@@ -1513,8 +1541,11 @@ impl Plugin for HarvestPlugin {
             let mut router = crate::api::apply_admin_auth_layers(
                 router,
                 &api_state,
-                api_tokens_enabled,
-                role_auth_enabled,
+                &crate::api::AdminAuthLayers {
+                    api_tokens: api_tokens_enabled,
+                    read_only_role: role_auth_enabled,
+                    authorizer,
+                },
             );
             if let Some(mw) = api_middleware {
                 router = mw(router);
@@ -1525,7 +1556,7 @@ impl Plugin for HarvestPlugin {
             // extractor for it.
             app.nest(&path, router.with_state(()))
         } else {
-            let _ = api_tokens_enabled;
+            let _ = (api_tokens_enabled, authorizer);
             app
         }
     }
@@ -2101,9 +2132,13 @@ async fn start_harvest_runtime(
     // than an empty snapshot.
 
     // issue #377: spawn background gate-cache refresh (≤2 s p95 cross-replica propagation).
+    // The load-shed sampler takes its registry data from the runtime here, not
+    // from `api_state.install(...)` below, so its first tick cannot race the
+    // install (issue #1794).
     let gate_refresh = Some(crate::boot::spawn_gate_refresh(
         api_state,
-        harvest_db_pool.clone_inner(),
+        &harvest_db_pool,
+        &runner.api_runtime(),
     ));
 
     let outbox = app_pool.as_ref().and_then(|_| {
@@ -3513,6 +3548,26 @@ mod tests {
             .expect("valid retention config should build");
         assert_eq!(built.retention().max_age_secs, Some(42));
         assert_eq!(built.retention().tick_interval_secs, 7);
+    }
+
+    #[test]
+    fn harvest_plugin_forwards_load_shed_to_builder() {
+        // Issue #1794: the plugin owns its builder, so without this forwarder
+        // a plugin deployment cannot turn on load shedding.
+        let policy = autumn_harvest::load_shed::LoadShedPolicy::new(
+            std::time::Duration::from_secs(300),
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(5),
+        )
+        .expect("valid policy");
+        let config = autumn_harvest::load_shed::LoadShedConfig::new().queue("default", policy);
+        let plugin = HarvestPlugin::new().load_shed(config.clone());
+        let built = plugin
+            .builder
+            .try_build()
+            .expect("valid load-shed config should build");
+        assert_eq!(built.load_shed, config);
+        assert!(built.load_shed.is_enabled());
     }
 
     // ── Connector build-time validation (issue #944) ──────────────────────

@@ -411,6 +411,7 @@ impl EnqueueParams {
             max_attempts: 3,
             // Default immediate tasks slightly into the past to tolerate small
             // host/Postgres clock skew when workers claim with `scheduled_at <= NOW()`.
+            // host-clock-ok: the caller builds this value before any connection exists.
             scheduled_at: Utc::now() - IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE,
             heartbeat_timeout: None,
             start_to_close: None,
@@ -2779,7 +2780,7 @@ pub(crate) async fn claim_held_for_update_skip_locked(
 /// `crash_strikes` (issue #1789).
 ///
 /// Such a claim passes a guard on `(worker_id, crash_strikes)`, for example
-/// [`claim_still_held_for_update`], but it is not `claim`. The read takes no
+/// the capability-miss release, but it is not `claim`. The read takes no
 /// lock.
 ///
 /// # Errors
@@ -2871,6 +2872,85 @@ pub async fn defer_claimed_rate_limited_task(
     defer_rate_limited_task_inner(conn, claim.task_id, Some(claim), scheduled_at)
         .await
         .map(claim_write)
+}
+
+/// Defer the retry that `claim` holds because the retry budget is empty
+/// (issue #1793). A stale claim changes nothing.
+///
+/// The write is the rate-limit deferral with two differences:
+///
+/// - It keeps `crash_strikes`. An empty bucket says nothing about crashes. A
+///   reset would let a task that crashes workers escape poison-pill
+///   quarantine.
+/// - It computes `scheduled_at` as `clock_timestamp() + delay` in the
+///   statement (issue #1389). The claim checks `scheduled_at` on the same
+///   clock, so a host clock behind Postgres cannot make the row due at once.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on update failure.
+pub async fn defer_claimed_retry_for_budget(
+    conn: &mut AsyncPgConnection,
+    claim: &TaskClaim,
+    delay: Duration,
+) -> HarvestResult<ClaimWrite> {
+    use crate::schema::harvest_task_queue::dsl;
+    use diesel::dsl::sql;
+    use diesel::sql_types::{Double, Timestamptz};
+
+    let update = diesel::update(
+        dsl::harvest_task_queue
+            .find(claim.task_id)
+            .filter(dsl::state.eq("RUNNING")),
+    )
+    .set((
+        BudgetDeferralChangeset::new(),
+        dsl::scheduled_at.eq(
+            sql::<Timestamptz>("clock_timestamp() + make_interval(secs => ")
+                .bind::<Double, _>(delay_secs(delay))
+                .sql(")"),
+        ),
+        // Undo the claim-time attempt increment. A deferral is not an
+        // execution, so it must not use an attempt.
+        dsl::attempt.eq(diesel::dsl::sql::<diesel::sql_types::Integer>(
+            "GREATEST(attempt - 1, 0)",
+        )),
+    ))
+    .into_boxed();
+    let Some((queue_name, priority, task_type, scheduled_at)) = fence(update, Some(claim))
+        .returning((
+            dsl::queue_name,
+            dsl::priority,
+            dsl::task_type,
+            dsl::scheduled_at,
+        ))
+        .get_result::<(String, i32, String, chrono::DateTime<Utc>)>(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?
+    else {
+        return Ok(ClaimWrite::LeaseLost);
+    };
+    // The UPDATE already committed, so the row is durably deferred. The
+    // NOTIFY is best-effort, as for the retry requeue: a failed wake must not
+    // report the deferral as unpersisted. The poll loop still finds the row.
+    if let Err(error) = announce_deferred_task(
+        conn,
+        claim.task_id,
+        &queue_name,
+        scheduled_at,
+        priority,
+        &task_type,
+    )
+    .await
+    {
+        tracing::warn!(
+            task_id = %claim.task_id,
+            %error,
+            "failed to announce a retry-budget deferral; the poll loop still claims it"
+        );
+    }
+    Ok(ClaimWrite::Applied)
 }
 
 /// Mark a task as completed with the given output.
@@ -3283,8 +3363,22 @@ pub async fn oldest_pending_ages(
         .collect())
 }
 
+/// SQL expression for the live database clock.
+///
+/// Use it for every value that a timeout scan compares with `NOW()`. A host
+/// stamp breaks that comparison when the host clock differs from the database
+/// clock (issue #1807). `clock_timestamp()` reads the real time at execution.
+/// `NOW()` stays fixed at the start of the transaction.
+pub(crate) fn db_clock_stamp<T: diesel::sql_types::SingleValue>()
+-> diesel::expression::SqlLiteral<T> {
+    diesel::dsl::sql::<T>("clock_timestamp()")
+}
+
 /// Update the `last_heartbeat_at` timestamp and checkpoint payload of the
 /// task that `claim` holds.
+///
+/// The timestamp comes from the database clock, the same clock that the
+/// heartbeat-timeout scan uses (issue #1807).
 ///
 /// `claim` fences the write (issue #1789). A stale owner cannot refresh or
 /// overwrite the checkpoint of a later attempt. It gets
@@ -3298,29 +3392,36 @@ pub async fn record_heartbeat(
     claim: &TaskClaim,
     details: serde_json::Value,
 ) -> HarvestResult<ClaimWrite> {
-    record_heartbeat_received_at(conn, claim, details, Utc::now()).await
+    record_heartbeat_sent_ago(conn, claim, details, std::time::Duration::ZERO).await
 }
 
-/// [`record_heartbeat`] with the time the worker got the heartbeat
+/// [`record_heartbeat`] for a heartbeat that the activity sent `age` ago
 /// (issue #1788).
 ///
-/// A retry after a failed flush keeps the original time. A stalled handler
-/// then cannot look alive.
+/// The stamp is the database clock minus `age`. A retry after a failed flush
+/// passes the full age, so a stalled handler cannot look alive. The worker
+/// measures `age` on its monotonic clock. A host clock that differs from the
+/// database clock thus does not move the stamp (issue #1807).
 ///
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] on update failure.
-pub async fn record_heartbeat_received_at(
+pub async fn record_heartbeat_sent_ago(
     conn: &mut AsyncPgConnection,
     claim: &TaskClaim,
     details: serde_json::Value,
-    received_at: DateTime<Utc>,
+    age: std::time::Duration,
 ) -> HarvestResult<ClaimWrite> {
     use crate::schema::harvest_task_queue::dsl;
 
+    let stamp = diesel::dsl::sql::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>>(
+        "clock_timestamp() - make_interval(secs => ",
+    )
+    .bind::<diesel::sql_types::Double, _>(age.as_secs_f64())
+    .sql(")");
     let update = diesel::update(dsl::harvest_task_queue.find(claim.task_id))
         .set((
-            dsl::last_heartbeat_at.eq(Some(received_at)),
+            dsl::last_heartbeat_at.eq(stamp),
             dsl::heartbeat_details.eq(Some(details)),
         ))
         .into_boxed();
@@ -3457,18 +3558,10 @@ async fn requeue_for_retry_inner(
         crate::dispatch::DispatchKind::from(task_type.as_str()),
     );
 
-    // Notify is best-effort: the task is already durably PENDING after the
-    // UPDATE above and will be claimed on the next poll cycle even if
-    // pg_notify is unavailable. Callers that count retries should key on
-    // Ok(()) meaning "state update succeeded", not "notify succeeded".
-    if let Err(e) = crate::notify::notify_task_enqueued(conn, &queue_name, task_id).await {
-        tracing::warn!(
-            task_id = %task_id,
-            queue = %queue_name,
-            error = %e,
-            "pg_notify failed after retry requeue; task is PENDING and will be claimed on next poll"
-        );
-    }
+    // A failed send never fails this call (issue #1796). The poll loop still
+    // claims the task. An error here means the transaction has already
+    // failed, so the UPDATE above cannot commit and the caller must see it.
+    crate::notify::notify_task_enqueued(conn, &queue_name, task_id).await?;
 
     Ok(true)
 }
@@ -3790,10 +3883,10 @@ pub struct RetryActivityOutcome {
     pub task_id: Uuid,
     /// The queue this task belongs to.
     pub queue_name: String,
-    /// The effective `scheduled_at` after the operation (backdated by
-    /// `IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE` when `advanced` is `true` so it
-    /// passes the `scheduled_at <= NOW()` predicate in `claim_task` even under
-    /// host/Postgres clock skew; unchanged otherwise).
+    /// The effective `scheduled_at` after the operation. When `advanced` is
+    /// `true`, this is the database clock value that the update stored. It
+    /// passes the `scheduled_at <= NOW()` predicate in `claim_task` on the same
+    /// clock. Otherwise it is unchanged.
     pub scheduled_at: DateTime<Utc>,
     /// `true` when the task's eligibility was advanced (it was backing off);
     /// `false` when the task required no change (see `already_eligible`).
@@ -3811,8 +3904,9 @@ pub struct RetryActivityOutcome {
 ///
 /// A backing-off activity is a `PENDING` `harvest_task_queue` row whose
 /// `scheduled_at` is in the future (set by [`requeue_for_retry`]). This
-/// function advances that timestamp to `NOW()` and wakes an idle worker via
-/// `pg_notify` so dispatch happens within one poll interval.
+/// function sets that timestamp to the live database clock
+/// (`clock_timestamp()`, issue #1807). It also wakes an idle worker via
+/// `pg_notify`, so dispatch happens within one poll interval.
 ///
 /// # Semantics
 ///
@@ -3881,7 +3975,7 @@ pub async fn force_retry_activity_now(
         )));
     }
 
-    let now = Utc::now();
+    let now = db_clock_now(conn).await?;
 
     // Already eligible — idempotent no-op, nothing to advance.
     if row.scheduled_at <= now {
@@ -3894,25 +3988,23 @@ pub async fn force_retry_activity_now(
         });
     }
 
-    // Backdate by the skew allowance so the row passes `scheduled_at <= NOW()`
-    // in claim_task's Postgres-side predicate even when the host clock is
-    // slightly ahead of the Postgres server clock. This mirrors what
-    // EnqueueParams::new does for immediately-runnable tasks.
-    let claim_ready_at = now - IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE;
-
+    // Stamp the database clock. `claim_task` checks `scheduled_at <= NOW()` on
+    // that same clock. The row is claimable as soon as the next statement
+    // starts, so it needs no skew allowance (issue #1807).
+    //
     // Advance scheduled_at. Only update if still PENDING (guards a concurrent
     // claim race — a worker that claimed the row between our SELECT and this
     // UPDATE would have set state='RUNNING'; the WHERE clause then matches 0
     // rows and we return advanced=false rather than silently succeeding).
-    let updated_queue_name = diesel::update(
+    let advanced = diesel::update(
         dsl::harvest_task_queue
             .filter(dsl::id.eq(task_id))
             .filter(dsl::workflow_exec_id.eq(Some(workflow_exec_id)))
             .filter(dsl::state.eq("PENDING")),
     )
-    .set(dsl::scheduled_at.eq(claim_ready_at))
-    .returning(dsl::queue_name)
-    .get_result::<String>(conn)
+    .set(dsl::scheduled_at.eq(db_clock_stamp::<diesel::sql_types::Timestamptz>()))
+    .returning((dsl::queue_name, dsl::scheduled_at))
+    .get_result::<(String, DateTime<Utc>)>(conn)
     .await
     .optional()
     .map_err(crate::error::database_error)?;
@@ -3920,8 +4012,8 @@ pub async fn force_retry_activity_now(
     // If 0 rows were updated a concurrent claim raced us; the task is now
     // RUNNING and the caller's goal (retry it now) is effectively achieved.
     // already_eligible=false distinguishes this from the genuine no-op above.
-    let (actual_queue, actual_scheduled_at, actually_advanced) = match updated_queue_name {
-        Some(q) => (q, claim_ready_at, true),
+    let (actual_queue, actual_scheduled_at, actually_advanced) = match advanced {
+        Some((q, stamped_at)) => (q, stamped_at, true),
         None => (row.queue_name, row.scheduled_at, false),
     };
 
@@ -3980,6 +4072,33 @@ struct CleanContinuationChangeset {
     /// whether the streak was broken.
     capability_miss_workers: Vec<String>,
     scheduled_at: chrono::DateTime<Utc>,
+}
+
+/// [`CleanContinuationChangeset`] without `crash_strikes` and `scheduled_at`,
+/// for a retry-budget deferral (issue #1793). The caller sets `scheduled_at`
+/// on the database clock.
+#[derive(AsChangeset)]
+#[diesel(table_name = crate::schema::harvest_task_queue, treat_none_as_null = true)]
+struct BudgetDeferralChangeset {
+    state: &'static str,
+    worker_id: Option<String>,
+    started_at: Option<chrono::DateTime<Utc>>,
+    last_heartbeat_at: Option<chrono::DateTime<Utc>>,
+    capability_misses: i32,
+    capability_miss_workers: Vec<String>,
+}
+
+impl BudgetDeferralChangeset {
+    const fn new() -> Self {
+        Self {
+            state: "PENDING",
+            worker_id: None,
+            started_at: None,
+            last_heartbeat_at: None,
+            capability_misses: 0,
+            capability_miss_workers: Vec::new(),
+        }
+    }
 }
 
 impl CleanContinuationChangeset {
@@ -4116,17 +4235,38 @@ async fn defer_rate_limited_task_inner(
         return Ok(false);
     };
 
-    crate::notify::notify_task_enqueued(conn, &queue_name, task_id).await?;
-    // Dispatch hint (issue #1312).
-    record_pending_hint(
+    announce_deferred_task(
+        conn,
         task_id,
         &queue_name,
         scheduled_at,
         priority,
-        crate::dispatch::DispatchKind::from(task_type.as_str()),
-    );
-
+        &task_type,
+    )
+    .await?;
     Ok(true)
+}
+
+/// Notify listeners and record the dispatch hint for a row that a deferral
+/// put back to `PENDING`.
+async fn announce_deferred_task(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    queue_name: &str,
+    scheduled_at: chrono::DateTime<Utc>,
+    priority: i32,
+    task_type: &str,
+) -> HarvestResult<()> {
+    crate::notify::notify_task_enqueued(conn, queue_name, task_id).await?;
+    // Dispatch hint (issue #1312).
+    record_pending_hint(
+        task_id,
+        queue_name,
+        scheduled_at,
+        priority,
+        crate::dispatch::DispatchKind::from(task_type),
+    );
+    Ok(())
 }
 
 /// SQL for [`release_task_for_capability_miss`], exposed for no-DB shape tests
@@ -4373,7 +4513,7 @@ pub const fn release_task_for_capability_miss_query(
 /// of the same task and rolling back an `attempt` that belongs to the new
 /// dispatch. `crash_strikes` is the right discriminator because the requeue
 /// that creates the race is what bumps it; the terminal escalation guard
-/// ([`claim_still_held_for_update_query`]) already keys on it.
+/// ([`claim_still_held_for_update`]) already keys on it.
 ///
 /// # Errors
 ///
@@ -4634,19 +4774,6 @@ pub const fn read_capability_miss_state_query() -> &'static str {
        AND worker_id = $2"
 }
 
-/// SQL for [`claim_still_held_for_update`]. Extracted as a `const fn` so its
-/// shape is unit-testable without a database.
-#[must_use]
-pub const fn claim_still_held_for_update_query() -> &'static str {
-    "SELECT id \
-     FROM harvest_task_queue \
-     WHERE id = $1 \
-       AND state = 'RUNNING' \
-       AND worker_id = $2 \
-       AND crash_strikes = $3 \
-     FOR UPDATE SKIP LOCKED"
-}
-
 /// The task's capability-miss counters **as they stand now**, for the
 /// release-vs-escalate decision (issue #804, Codex round-27 P1).
 ///
@@ -4700,6 +4827,12 @@ pub async fn read_capability_miss_state(
 /// discriminator `poison_pill::quarantine_orphan` itself uses for exactly this,
 /// so the guard is a claim token rather than a worker token.
 ///
+/// The stuck-running requeue (`poison_pill::requeue_stuck_task`) leaves
+/// `crash_strikes` unchanged, so `crash_strikes` alone misses that path. The
+/// guard therefore also checks `attempt`, which `claim_task` increments on
+/// every claim. It does so through `claim_held`, the predicate that fences
+/// activity writes (issues #1789 and #1806).
+///
 /// # Why `SKIP LOCKED` rather than a blocking wait
 ///
 /// Deadlock avoidance, not throughput. This crate's `harvest_task_queue` lock
@@ -4727,23 +4860,23 @@ pub async fn claim_still_held_for_update(
     task_id: Uuid,
     worker_id: &str,
     crash_strikes: i32,
+    attempt: i32,
 ) -> HarvestResult<bool> {
-    // Only the row's *existence* matters -- the id is bound, not read back.
-    #[derive(diesel::QueryableByName)]
-    struct IdRow {
-        #[allow(dead_code)]
-        #[diesel(sql_type = diesel::sql_types::Uuid)]
-        id: Uuid,
-    }
+    use crate::schema::harvest_task_queue::dsl;
 
-    let rows: Vec<IdRow> = diesel::sql_query(claim_still_held_for_update_query())
-        .bind::<diesel::sql_types::Uuid, _>(task_id)
-        .bind::<diesel::sql_types::Text, _>(worker_id)
-        .bind::<diesel::sql_types::Integer, _>(crash_strikes)
-        .load(conn)
+    // `claim_held` is the claim-epoch predicate that activity writes use.
+    dsl::harvest_task_queue
+        .find(task_id)
+        .filter(claim_held(worker_id, attempt))
+        .filter(dsl::crash_strikes.eq(crash_strikes))
+        .select(dsl::id)
+        .for_update()
+        .skip_locked()
+        .first::<Uuid>(conn)
         .await
-        .map_err(crate::error::database_error)?;
-    Ok(!rows.is_empty())
+        .optional()
+        .map(|row| row.is_some())
+        .map_err(crate::error::database_error)
 }
 
 /// SQL for [`release_suspended_workflow_claim`]. Extracted as a `const fn` so
@@ -10204,34 +10337,6 @@ mod tests {
         );
     }
 
-    /// The commit-boundary guard must hold the row's lock (an unlocked check
-    /// merely narrows the window before an unguarded `fail_task`), must key on
-    /// the CLAIM rather than the worker, and must never WAIT for the lock.
-    #[test]
-    fn commit_boundary_claim_guard_locks_without_waiting_and_keys_on_the_claim() {
-        let sql = claim_still_held_for_update_query();
-        assert!(
-            sql.contains("FOR UPDATE"),
-            "the guard must hold the lock through the caller's transaction, not \
-             just read: {sql}"
-        );
-        assert!(
-            sql.contains("SKIP LOCKED"),
-            "the guard must never WAIT on the task row: `poison_pill` takes task \
-             -> execution while this path takes execution -> task, so a blocking \
-             wait here closes an ABBA cycle: {sql}"
-        );
-        assert!(
-            sql.contains("state = 'RUNNING'") && sql.contains("worker_id = $2"),
-            "the guard must still be scoped to this worker's own claim: {sql}"
-        );
-        assert!(
-            sql.contains("crash_strikes = $3"),
-            "a poison-pill requeue lets the SAME worker re-claim the row, so \
-             (state, worker_id) alone does not identify this attempt: {sql}"
-        );
-    }
-
     #[test]
     fn park_queries_reset_the_capability_miss_counter() {
         // `capability_misses` counts CONSECUTIVE misses: a task a capable
@@ -10386,7 +10491,7 @@ mod tests {
     ///
     /// `crash_strikes` is the discriminator because the requeue that creates
     /// this race is the thing that bumps it. The terminal escalation guard
-    /// ([`claim_still_held_for_update_query`]) already keys on it for exactly
+    /// ([`claim_still_held_for_update`]) already keys on it for exactly
     /// this reason; the release is the far more common path and must match.
     #[test]
     fn capability_miss_release_is_guarded_on_the_claim_epoch() {

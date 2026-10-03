@@ -266,7 +266,10 @@ impl HarvestEmbedding {
 
         let storage_pool = runner.storage_pool();
         api_state.install_storage_pool(storage_pool.clone());
-        let gate_refresh = boot::spawn_gate_refresh(&api_state, storage_pool.clone_inner());
+        // The load-shed sampler takes its registry data from the runtime here,
+        // not from the install below, so its first tick cannot race the install.
+        let gate_refresh =
+            boot::spawn_gate_refresh(&api_state, &storage_pool, &runner.api_runtime());
         api_state.install(runner.api_runtime());
         admission_guard.commit();
 
@@ -377,6 +380,17 @@ impl OperatorInputs {
             profile: ambient_profile(env),
         })
     }
+}
+
+/// The deployment profile that [`HarvestEmbedding::with_ambient_profile`]
+/// reads from the process environment.
+///
+/// Use it to make a decision before [`HarvestEmbedding::start`] on the same
+/// profile, for example to apply migrations only in `dev`. The name is
+/// normalized, so `development` gives `dev` (issue #1615).
+#[must_use]
+pub fn ambient_deployment_profile() -> Option<String> {
+    ambient_profile(&OsEnv)
 }
 
 /// The profile from `AUTUMN_ENV`, else `AUTUMN_PROFILE`, as autumn-web

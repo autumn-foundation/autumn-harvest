@@ -320,11 +320,15 @@ metric is emitted in the source code.
 | `harvest.activity.failed` | Counter | `worker.rs` — `dispatch_activity_handler`, on each failed attempt; richer labels than `harvest.activity.attempts` (`workflow.type`, `error.type`, `non_retryable`) |
 | `harvest.activity.attempts` | Counter | `worker.rs` — `dispatch_activity_handler`, once per attempt for **both** outcomes; use for success-rate SLOs: `rate(attempts{outcome="completed"}[5m]) / rate(attempts[5m])` (issue #528) |
 | `harvest.activity.retries` | Counter | `worker.rs` — `handle_activity_result`, once per retry actually scheduled (after the `schedule_to_close` deadline check); use for retry-storm detection (issue #528) |
+| `harvest.retry.budget.available` | Gauge | `retry_budget.rs` — `RetryBudgetRegistry`, after every bucket access, under the bucket lock, so samples follow the mutation order. Tokens left in one activity type's retry budget on this worker (issue #1793) |
+| `harvest.retry.budget.exhausted` | Counter | `worker.rs` — `process_activity_task`, once per retry that the retry budget deferred. Prometheus: `harvest_retry_budget_exhausted_total`. A deferred retry is not lost; it runs later (issue #1793) |
 | `harvest.activity.pause_actions` | Counter | `activity_pause.rs` — the `pause_activity` / `resume_activity` write path, once per operator action on a whole activity type (issue #807). **Gated on the action having genuinely changed state** (`ActivityPauseOutcome::newly_paused` / `ActivityResumeOutcome::newly_resumed`) so an idempotent retry after a lost response does not read as a second hold — the same gating `harvest.workflow.paused` uses (issue #383). Deliberately a counter, not a gauge: it records *actions*, so a flat line says nothing about whether a hold is currently in effect — `GET /api/harvest/activities` is the read model for the state. Contrast its sibling `harvest.queue.paused` (issue #619), a gauge, because there the alertable thing is the *duration* of the hold |
 | `harvest.timer.started` | Counter | `worker.rs` — `persist_timer_command`, when a durable timer is written |
 | `harvest.queue.depth` | Gauge | `worker.rs` — `spawn_queue_depth_sampler`, periodic (5 s default). Aggregated **across all shards** of the worker's `ShardedDbPool` (summed per queue) so multi-shard backlog is fleet-wide, not default-shard-only (issue #522) |
 | `harvest.queue.schedule_to_start` | Histogram | `worker.rs` — recorded at handler start in `process_workflow_task` / `process_activity_task`. The sample runs from eligibility, so it includes the `PENDING` wait behind a saturated worker (issue #1787); skew-discounted (issue #501) |
 | `harvest.queue.oldest_pending_age` | Gauge | `worker.rs` — `spawn_queue_depth_sampler`, alongside depth; excludes PAUSED executions, skew-discounted, periodic (5 s default) (issue #501). Aggregated across all shards as the **max** age per queue (the single oldest task fleet-wide) (issue #522) |
+| `harvest.load_shed.active` | Gauge | `load_shed.rs` — `sample_once`, the load-shed sampler. It writes 1 or 0 for every configured queue on every tick, also after a failed read (issue #1794) |
+| `harvest.load_shed.rejected` | Counter | `execution.rs` — `admit_fresh_start`, once per fresh start that load shedding refuses. The start and batch routes in `api.rs` (plugin) also count a throttled start that they shed before its defer (issue #1794) |
 | `harvest.queue.dispatched` | Counter | `worker.rs` — `dispatch_task`, once per dispatched task; lets operators confirm the live per-queue dispatch split matches `WorkerConfig::queue_weights` (issue #515) |
 | `harvest.dlq.entries` | Gauge | `worker.rs` — `spawn_dlq_depth_sampler`, periodic (5 s default) |
 | `harvest.shard.stranded_pending` | Gauge | `worker.rs` — `spawn_stranded_work_sampler`, periodic (`poll_interval`). Claimable pending tasks on a shard with **no covering live worker** (issue #522). Iterates **every** shard of the worker's `ShardedDbPool`, not just its assigned ones, so a writable shard nobody polls is still surfaced. Emits `0` for a covered shard so the gauge resets cleanly |
@@ -393,11 +397,15 @@ metric is emitted in the source code.
 | `harvest.activity.failed` | `activity`, `workflow.type`, `error.type`, `non_retryable` |
 | `harvest.activity.attempts` | `activity`, `queue`, `outcome` (`completed\|failed`) |
 | `harvest.activity.retries` | `activity`, `queue` |
+| `harvest.retry.budget.available` | `activity` |
+| `harvest.retry.budget.exhausted` | `activity` |
 | `harvest.activity.pause_actions` | `activity` (bounded **by bucketing**: the pause routes accept an unregistered name on purpose, so the raw value is caller-controlled free text — the emitter resolves it against the registered activity catalogue and substitutes `__unregistered__` when absent, exactly as the #684 update-name label does), `action` (`pause\|resume`, bounded by `ActivityPauseAction`) |
 | `harvest.timer.started` | _(none)_ |
 | `harvest.queue.depth` | `queue` |
 | `harvest.queue.schedule_to_start` | `queue` |
 | `harvest.queue.oldest_pending_age` | `queue` |
+| `harvest.load_shed.active` | `queue` — only queues with a load-shed policy (issue #1794) |
+| `harvest.load_shed.rejected` | `queue` — only queues with a load-shed policy (issue #1794) |
 | `harvest.dlq.entries` | `shard` |
 | `harvest.shard.stranded_pending` | `shard` |
 | `harvest.shard.dispatched` | `shard` |

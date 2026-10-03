@@ -162,7 +162,7 @@ impl DagRule for MissingTimeoutRule {
                 warnings.push(DagWarning {
                     rule_name: self.name().to_string(),
                     message: format!(
-                        "Task '{}' has no start_to_close timeout configured. If the activity hangs, the workflow will stall indefinitely.",
+                        "Task '{}' has no start_to_close timeout configured. If the activity hangs, only the worker default activity start_to_close stops it.",
                         task.activity_name
                     ),
                 });

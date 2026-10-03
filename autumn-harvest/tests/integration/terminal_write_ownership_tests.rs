@@ -279,6 +279,7 @@ async fn persist_workflow_completion_makes_no_terminal_decision_when_the_claim_m
         1,
         "dispatcher-a",
         task.crash_strikes,
+        task.attempt,
         serde_json::json!({"ok": true}),
         None,
         None,
@@ -323,6 +324,7 @@ async fn persist_workflow_failure_makes_no_terminal_decision_when_the_claim_move
         1,
         "dispatcher-a",
         task.crash_strikes,
+        task.attempt,
         "boom",
         None,
         None,
@@ -382,6 +384,7 @@ async fn persist_child_workflow_completion_makes_no_terminal_decision_when_the_c
         1,
         "dispatcher-a",
         task.crash_strikes,
+        task.attempt,
         parent_exec_id,
         serde_json::json!({"ok": true}),
         None,
@@ -432,6 +435,7 @@ async fn persist_child_workflow_failure_makes_no_terminal_decision_when_the_clai
         1,
         "dispatcher-a",
         task.crash_strikes,
+        task.attempt,
         parent_exec_id,
         "boom",
         None,
@@ -486,6 +490,7 @@ async fn check_paused_and_park_makes_no_terminal_decision_when_the_claim_moved()
         task.id,
         "dispatcher-a",
         task.crash_strikes,
+        task.attempt,
         Duration::ZERO,
     )
     .await;
@@ -708,6 +713,7 @@ async fn a_dispatcher_that_still_owns_the_claim_is_released_when_skip_locked_is_
                 1,
                 "dispatcher-a",
                 task.crash_strikes,
+                task.attempt,
                 "boom",
                 None,
                 None,
@@ -901,4 +907,285 @@ async fn move_workflow_to_dlq_for_history_cap_makes_no_terminal_decision_when_th
         "a dispatcher that lost the claim must append no terminal event; got {history:?}"
     );
     assert_thief_untouched(&url, exec_id, task.id, "RUNNING", "RUNNING").await;
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1806: the guard must key on `attempt`
+// ---------------------------------------------------------------------------
+
+/// The two claims of one task around a stuck-running requeue.
+struct Reclaimed {
+    exec_id: ExecutionId,
+    worker_id: String,
+    stale: TaskQueueItem,
+    current: TaskQueueItem,
+}
+
+/// Claim a task, requeue it as the stuck-running backstop does, and claim it
+/// again on the same worker id.
+///
+/// The backstop leaves `crash_strikes` and `attempt` unchanged. The next claim
+/// adds 1 to `attempt`, so only `attempt` tells the two claims apart. The queue and worker names are unique, so tests that
+/// share one database do not meet each other's rows.
+async fn reclaim_after_stuck_requeue(url: &str, name: &str) -> Reclaimed {
+    let suffix = Uuid::new_v4();
+    let queue_name = format!("{name}-{suffix}");
+    let worker_id = format!("dispatcher-{suffix}");
+    let (exec_id, first) = seed_claimed_task(url, &queue_name, &worker_id).await;
+    let mut conn = connect(url).await;
+    // Mirrors `poison_pill::requeue_stuck_task`, scoped to this row. The fleet
+    // sweep would also touch rows of tests that share one database.
+    // `poison_pill_tests` covers the sweep itself.
+    diesel::sql_query(
+        "UPDATE harvest_task_queue \
+         SET state = 'PENDING', worker_id = NULL, started_at = NULL, \
+             sticky_worker_id = NULL, sticky_until = NULL, last_heartbeat_at = NULL, \
+             error = NULL, scheduled_at = NOW() \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(first.id)
+    .execute(&mut conn)
+    .await
+    .expect("requeue the stuck task");
+    let stale = first;
+
+    let current = queue::claim_task(&mut conn, &[queue_name], &worker_id, "", None, &[], &[])
+        .await
+        .expect("claim")
+        .expect("the requeued row is claimable");
+    assert_eq!(current.id, stale.id);
+    assert_eq!(current.crash_strikes, stale.crash_strikes);
+    assert_eq!(current.attempt, stale.attempt + 1);
+    Reclaimed {
+        exec_id,
+        worker_id,
+        stale,
+        current,
+    }
+}
+
+/// The stale write must fail with the ambiguous-claim sentinel, append no
+/// event of the given kind, and leave the current claim untouched.
+async fn assert_stale_write_rejected<T: std::fmt::Debug>(
+    url: &str,
+    fx: &Reclaimed,
+    result: autumn_harvest::error::HarvestResult<T>,
+    terminal: fn(&WorkflowEvent) -> bool,
+) {
+    assert_eq!(
+        result
+            .expect_err("a write from an earlier attempt must not commit")
+            .terminal_write_claim_ambiguous(),
+        Some(fx.stale.id),
+    );
+    let history = load_history(url, fx.exec_id).await;
+    assert!(
+        !history.iter().any(terminal),
+        "the stale attempt must append no terminal event; got {history:?}"
+    );
+    let row = load_tasks(url, fx.exec_id).await.remove(0);
+    assert_eq!(row.state, "RUNNING");
+    assert_eq!(row.worker_id.as_deref(), Some(fx.worker_id.as_str()));
+    assert_eq!(row.attempt, fx.current.attempt);
+}
+
+const fn is_completed(event: &WorkflowEvent) -> bool {
+    matches!(event, WorkflowEvent::WorkflowCompleted { .. })
+}
+
+const fn is_failed(event: &WorkflowEvent) -> bool {
+    matches!(event, WorkflowEvent::WorkflowFailed { .. })
+}
+
+#[tokio::test]
+async fn persist_workflow_completion_rejects_a_stale_attempt_on_the_same_worker_1806() {
+    let (url, _container) = setup_db().await;
+    let fx = reclaim_after_stuck_requeue(&url, "q1806-completion").await;
+    let mut conn = connect(&url).await;
+    let result = persist_workflow_completion(
+        &mut conn,
+        fx.stale.id,
+        fx.exec_id,
+        1,
+        &fx.worker_id,
+        fx.stale.crash_strikes,
+        fx.stale.attempt,
+        serde_json::json!({"ok": true}),
+        None,
+        None,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+        &mut Vec::new(),
+    )
+    .await;
+    assert_stale_write_rejected(&url, &fx, result, is_completed).await;
+}
+
+#[tokio::test]
+async fn persist_workflow_failure_rejects_a_stale_attempt_on_the_same_worker_1806() {
+    let (url, _container) = setup_db().await;
+    let fx = reclaim_after_stuck_requeue(&url, "q1806-failure").await;
+    let mut conn = connect(&url).await;
+    let result = persist_workflow_failure(
+        &mut conn,
+        fx.stale.id,
+        fx.exec_id,
+        1,
+        &fx.worker_id,
+        fx.stale.crash_strikes,
+        fx.stale.attempt,
+        "boom",
+        None,
+        None,
+        None,
+        None,
+        None,
+        autumn_harvest::types::Priority::default(),
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+        &mut Vec::new(),
+    )
+    .await;
+    assert_stale_write_rejected(&url, &fx, result, is_failed).await;
+}
+
+#[tokio::test]
+async fn persist_child_workflow_completion_rejects_a_stale_attempt_on_the_same_worker_1806() {
+    let (url, _container) = setup_db().await;
+    let fx = reclaim_after_stuck_requeue(&url, "q1806-child-completion").await;
+    let mut conn = connect(&url).await;
+    let parent = seed_execution(&mut conn, "issue1806_parent_wf", serde_json::json!({})).await;
+    let result = persist_child_workflow_completion(
+        &mut conn,
+        fx.stale.id,
+        fx.exec_id,
+        1,
+        &fx.worker_id,
+        fx.stale.crash_strikes,
+        fx.stale.attempt,
+        parent,
+        serde_json::json!({"ok": true}),
+        None,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+        &mut Vec::new(),
+    )
+    .await;
+    assert_stale_write_rejected(&url, &fx, result, is_completed).await;
+}
+
+#[tokio::test]
+async fn persist_child_workflow_failure_rejects_a_stale_attempt_on_the_same_worker_1806() {
+    let (url, _container) = setup_db().await;
+    let fx = reclaim_after_stuck_requeue(&url, "q1806-child-failure").await;
+    let mut conn = connect(&url).await;
+    let parent = seed_execution(&mut conn, "issue1806_parent_wf", serde_json::json!({})).await;
+    let result = persist_child_workflow_failure(
+        &mut conn,
+        fx.stale.id,
+        fx.exec_id,
+        1,
+        &fx.worker_id,
+        fx.stale.crash_strikes,
+        fx.stale.attempt,
+        parent,
+        "boom",
+        None,
+        None,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+        &mut Vec::new(),
+    )
+    .await;
+    assert_stale_write_rejected(&url, &fx, result, is_failed).await;
+}
+
+#[tokio::test]
+async fn check_paused_and_park_rejects_a_stale_attempt_on_the_same_worker_1806() {
+    let (url, _container) = setup_db().await;
+    let fx = reclaim_after_stuck_requeue(&url, "q1806-park").await;
+    let mut conn = connect(&url).await;
+    diesel::update(harvest_workflow_executions::table.find(fx.exec_id.as_uuid()))
+        .set(harvest_workflow_executions::state.eq("PAUSED"))
+        .execute(&mut conn)
+        .await
+        .expect("pause execution");
+    let result = check_paused_and_park(
+        &mut conn,
+        fx.exec_id.as_uuid(),
+        fx.stale.id,
+        &fx.worker_id,
+        fx.stale.crash_strikes,
+        fx.stale.attempt,
+        Duration::ZERO,
+    )
+    .await;
+    assert_stale_write_rejected(&url, &fx, result, is_failed).await;
+}
+
+#[tokio::test]
+async fn fail_task_and_execution_with_history_rejects_a_stale_attempt_on_the_same_worker_1806() {
+    let (url, _container) = setup_db().await;
+    let fx = reclaim_after_stuck_requeue(&url, "q1806-no-exec").await;
+    let mut conn = connect(&url).await;
+    let result = fail_task_and_execution_with_history(
+        &mut conn,
+        &fx.stale,
+        &fx.worker_id,
+        "boom",
+        PreloadedFailureHistory::NoExecution,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+    )
+    .await;
+    assert_stale_write_rejected(&url, &fx, result, is_failed).await;
+}
+
+#[tokio::test]
+async fn the_guard_matches_only_the_current_attempt_1806() {
+    let (url, _container) = setup_db().await;
+    let fx = reclaim_after_stuck_requeue(&url, "q1806-guard").await;
+    let mut conn = connect(&url).await;
+
+    for (attempt, expected, what) in [
+        (fx.stale.attempt, false, "stale attempt"),
+        (fx.current.attempt, true, "current attempt"),
+    ] {
+        let held = queue::claim_still_held_for_update(
+            &mut conn,
+            fx.current.id,
+            &fx.worker_id,
+            fx.current.crash_strikes,
+            attempt,
+        )
+        .await
+        .expect("guard");
+        assert_eq!(held, expected, "{what}");
+    }
+}
+
+/// The guard must hold the row lock and must never wait for another lock.
+#[tokio::test]
+async fn the_guard_locks_the_row_and_skips_a_locked_row_1806() {
+    let (url, _container) = setup_db().await;
+    let fx = reclaim_after_stuck_requeue(&url, "q1806-lock").await;
+    let mut holder = connect(&url).await;
+    let mut other = connect(&url).await;
+    let (task_id, worker_id) = (fx.current.id, fx.worker_id.clone());
+    let (strikes, attempt) = (fx.current.crash_strikes, fx.current.attempt);
+
+    holder
+        .transaction::<(), autumn_harvest::error::HarvestError, _>(async |tx| {
+            let held =
+                queue::claim_still_held_for_update(tx, task_id, &worker_id, strikes, attempt)
+                    .await?;
+            assert!(held, "the holder owns the claim");
+            let skipped = tokio::time::timeout(
+                Duration::from_secs(5),
+                queue::claim_still_held_for_update(
+                    &mut other, task_id, &worker_id, strikes, attempt,
+                ),
+            )
+            .await
+            .expect("the guard must not wait for a locked row")?;
+            assert!(!skipped, "a locked row reads as not held");
+            Ok(())
+        })
+        .await
+        .expect("transaction");
 }

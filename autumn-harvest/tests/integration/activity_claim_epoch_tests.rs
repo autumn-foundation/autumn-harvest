@@ -749,7 +749,7 @@ async fn heartbeat_flusher_cancels_the_token_when_the_row_is_terminal() {
 // ---------------------------------------------------------------------------
 
 /// `crash_strikes` can return to an earlier value. Then a later claim of the
-/// same worker passes the `(worker_id, crash_strikes)` guard of the
+/// same worker passes the `(worker_id, crash_strikes)` checks of the
 /// execution failure path. The claim epoch must still stop the stale write.
 #[tokio::test]
 async fn stale_execution_failure_under_a_reused_strike_count_changes_nothing() {
@@ -930,6 +930,7 @@ fn e2e_worker(
                 build_id: String::new(),
                 deployment_name: None,
                 workflow_cache_size: 1000,
+                resident_workflows: true,
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,

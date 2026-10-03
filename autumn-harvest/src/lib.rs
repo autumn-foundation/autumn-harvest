@@ -361,6 +361,10 @@ pub mod mutex;
 pub mod partition;
 pub mod payload_codec;
 pub mod payload_store;
+/// The connection transport a DSN's `sslmode` selects, with TLS through
+/// rustls.
+#[cfg(feature = "db")]
+pub mod pg_tls;
 pub mod poison_pill;
 pub mod policy;
 pub mod pool;
@@ -397,7 +401,15 @@ pub mod replay_sample;
 pub mod replication;
 #[cfg(feature = "db")]
 pub mod reset;
+/// Resident workflow state between decisions (issue #1798).
+///
+/// Only the `testing` feature can create a [`resident::ResidentWorkflow`].
+/// Other builds hide the module from the docs.
+#[cfg_attr(not(feature = "testing"), doc(hidden))]
+pub mod resident;
 pub mod retention;
+/// Per-activity-type retry budget that bounds retry load (issue #1793).
+pub mod retry_budget;
 /// Continue-as-new run-chain assembly (issue #701).
 pub mod run_chain;
 pub mod saga;
@@ -412,6 +424,8 @@ pub mod schema_contract;
 /// Worker session fleet-side registry and pure decision functions (issue #606).
 pub mod sessions;
 pub mod shard;
+/// A task-local fence on the shards one request may reach (issue #1803).
+pub mod shard_fence;
 /// Shard rebalancing: migrating quiescent workflow executions across shards
 /// (issue #964).
 pub mod shard_rebalance;
@@ -466,6 +480,8 @@ pub mod webhook_trigger;
 #[cfg(feature = "db")]
 #[doc(hidden)]
 pub mod dlq;
+/// Automatic load shedding driven by backlog age (issue #1794).
+pub mod load_shed;
 #[cfg(feature = "db")]
 #[doc(hidden)]
 pub mod models;
@@ -633,8 +649,8 @@ pub use payload_store::{
 };
 pub use policy::validate_schedule;
 pub use policy::{
-    CatchupPolicy, JitterPolicy, MapFailurePolicy, OverlapPolicy, RetryPolicy, Schedule,
-    SkipPolicy, TaskStatus, TriggerRule, WorkflowSchedule,
+    CatchupPolicy, JitterPolicy, MapFailurePolicy, OverlapPolicy, RetryBudgetPolicy, RetryPolicy,
+    Schedule, SkipPolicy, TaskStatus, TriggerRule, WorkflowSchedule,
 };
 pub use pool::{HarvestPoolConfig, compute_pool_sizes};
 pub use query::QueryRegistry;
@@ -658,6 +674,7 @@ pub use retention::{
     RetentionMonitor, RetentionRuntime, RetentionStatus, RetentionTickResult, release_legal_hold,
     set_legal_hold,
 };
+pub use retry_budget::RetryBudgetConfig;
 pub use run_chain::{
     RunChainRecord, RunChainResponse, RunChainRow, assemble_run_chain, outcome_for_state,
 };

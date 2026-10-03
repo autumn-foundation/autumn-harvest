@@ -460,6 +460,22 @@ pub const METRIC_DLQ_ENTRIES: &str = "harvest.dlq.entries";
 /// the publisher queue is undersized for the enqueue rate.
 pub const METRIC_DISPATCH_DROPPED_HINTS: &str = "harvest.dispatch.dropped_hints";
 
+/// Gauge: cumulative notifications this process has lost to an error
+/// (issue #1796).
+///
+/// A failed send counts once for each merged wake. A dropped or rejected note
+/// counts once. A lost notification costs latency, not work. Polling finds
+/// the row.
+/// A sustained non-zero rate means the post-commit notify path is unhealthy.
+pub const METRIC_NOTIFY_SEND_FAILURES: &str = "harvest.notify.send_failures";
+
+/// Gauge: the largest `pg_notification_queue_usage()` that a live notify
+/// sender read last, from `0.0` to `1.0` (issue #1796).
+///
+/// Postgres rejects a `NOTIFY` when this queue is full. A value that stays
+/// high means a listener does not drain its notifications.
+pub const METRIC_NOTIFY_QUEUE_USAGE: &str = "harvest.notify.queue_usage";
+
 /// Gauge: `1` while a task queue is paused by an operator, `0` once it resumes
 /// (issue #619).
 ///
@@ -1209,6 +1225,20 @@ pub const METRIC_CODEC_REENCRYPTED: &str = "harvest.codec.reencrypted";
 /// `execution.id` is never a metric label.
 pub const METRIC_ADMISSION_BYPASSED: &str = "harvest.admission.bypassed";
 
+/// Gauge: 1 while a queue sheds new starts, 0 otherwise (issue #1794).
+///
+/// Label:
+///   - `"queue"` (= [`METRIC_LABEL_QUEUE`]) — a queue with a load-shed policy.
+///
+/// The sampler sets it for every configured queue on every successful sample.
+pub const METRIC_LOAD_SHED_ACTIVE: &str = "harvest.load_shed.active";
+
+/// Counter: one per new start that load shedding refused (issue #1794).
+///
+/// Label:
+///   - `"queue"` (= [`METRIC_LABEL_QUEUE`]) — the shed queue.
+pub const METRIC_LOAD_SHED_REJECTED: &str = "harvest.load_shed.rejected";
+
 /// Gauge: current available tokens in a rate limit bucket.
 pub const METRIC_RATE_LIMIT_TOKENS_AVAILABLE: &str = "harvest.rate_limit.tokens_available";
 
@@ -1217,6 +1247,19 @@ pub const METRIC_RATE_LIMIT_REFILL_RATE: &str = "harvest.rate_limit.refill_rate"
 
 /// Counter: incremented when a task claim is throttled/skipped due to rate limiting.
 pub const METRIC_RATE_LIMIT_THROTTLED: &str = "harvest.rate_limit.throttled";
+
+/// Gauge: tokens left in the retry budget of one activity type (issue #1793).
+///
+/// Labeled by `activity`. The budget registry sets it after every bucket
+/// access, under the bucket lock. It does not follow the time refill between
+/// accesses.
+pub const METRIC_RETRY_BUDGET_AVAILABLE: &str = "harvest.retry.budget.available";
+
+/// Counter: retries that the retry budget deferred (issue #1793).
+///
+/// Labeled by `activity`. Prometheus exports it as
+/// `harvest_retry_budget_exhausted_total`.
+pub const METRIC_RETRY_BUDGET_EXHAUSTED: &str = "harvest.retry.budget.exhausted";
 
 /// Counter: incremented on each scheduler tick-loop fire attempt for a due schedule slot.
 ///
@@ -2347,6 +2390,19 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = producer;
     }
 
+    /// The load-shed state of `queue` after one sample (issue #1794).
+    ///
+    /// `active` is `true` while the queue sheds new starts. The sampler calls
+    /// this for every configured queue on every successful sample.
+    fn record_load_shed_active(&self, queue: &str, active: bool) {
+        let _ = (queue, active);
+    }
+
+    /// Load shedding rejected one new start on `queue` (issue #1794).
+    fn record_load_shed_rejected(&self, queue: &str) {
+        let _ = queue;
+    }
+
     /// A fresh workflow start was rejected because its resolved per-tenant
     /// quota key is at or over a declared cap (issue #946).
     ///
@@ -2819,6 +2875,23 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = activity;
     }
 
+    /// Record the tokens left in the retry budget of one activity type
+    /// (issue #1793).
+    ///
+    /// Maps to the gauge `harvest.retry.budget.available{activity}`. The
+    /// `activity` argument is the registered activity name.
+    fn record_retry_budget_available(&self, activity: &str, tokens: f64) {
+        let _ = (activity, tokens);
+    }
+
+    /// Record one retry that the retry budget deferred (issue #1793).
+    ///
+    /// Maps to the counter `harvest.retry.budget.exhausted{activity}`. The
+    /// `activity` argument is the registered activity name.
+    fn record_retry_budget_exhausted(&self, activity: &str) {
+        let _ = activity;
+    }
+
     /// Current number of entries in the dead-letter queue on one shard.
     ///
     /// Emitted by a periodic background sampler on the same cadence as
@@ -2838,6 +2911,27 @@ pub trait MetricsRecorder: Send + Sync {
     /// the running total from [`crate::dispatch::dropped_hints`].
     fn record_dispatch_dropped_hints(&self, total: u64) {
         let _ = total;
+    }
+
+    /// Cumulative notifications this process has lost to an error
+    /// (issue #1796).
+    ///
+    /// Emitted by a periodic in-process sampler, no label. Maps to the gauge
+    /// `harvest_notify_send_failures`. Not incremental: each call carries the
+    /// running total from `crate::notify::send_failures`.
+    fn record_notify_send_failures(&self, total: u64) {
+        let _ = total;
+    }
+
+    /// The largest Postgres notification queue usage that a live notify
+    /// sender read last, from `0.0` to `1.0` (issue #1796).
+    ///
+    /// Emitted by a periodic in-process sampler, no label. Maps to the gauge
+    /// `harvest_notify_queue_usage`. The sampler skips the call until a
+    /// sender has read the queue usage. It reports `0.0` after the last live
+    /// sender stops.
+    fn record_notify_queue_usage(&self, ratio: f64) {
+        let _ = ratio;
     }
 
     /// Whether a task queue is currently held by an operator queue pause

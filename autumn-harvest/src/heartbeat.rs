@@ -309,7 +309,7 @@ async fn keep_newest_heartbeat(
         newest_sent = Some(beat.sent_order);
         *latest.lock().unwrap_or_else(PoisonError::into_inner) = Some(Pending {
             payload: beat.details,
-            sent_at: beat.sent_at,
+            sent_order: beat.sent_order,
         });
     }
 }
@@ -332,7 +332,7 @@ pub async fn flush_heartbeat(
 ) -> HarvestResult<ClaimWrite> {
     let pending = Pending {
         payload,
-        sent_at: chrono::Utc::now(),
+        sent_order: std::time::Instant::now(),
     };
     flush(pool, claim, &pending, acquire_timeout)
         .await
@@ -353,7 +353,7 @@ struct FlushFailure {
 #[cfg(feature = "db")]
 struct Pending {
     payload: Value,
-    sent_at: chrono::DateTime<chrono::Utc>,
+    sent_order: std::time::Instant,
 }
 
 #[cfg(feature = "db")]
@@ -373,11 +373,11 @@ async fn flush(
             },
             error: Box::new(error),
         })?;
-    crate::queue::record_heartbeat_received_at(
+    crate::queue::record_heartbeat_sent_ago(
         &mut conn,
         claim,
         pending.payload.clone(),
-        pending.sent_at,
+        pending.sent_order.elapsed(),
     )
     .await
     .map_err(|error| FlushFailure {
@@ -593,7 +593,7 @@ mod tests {
         async fn keep_newest_of(
             beats: Vec<StampedHeartbeat>,
             take_after: Option<usize>,
-        ) -> Option<chrono::DateTime<chrono::Utc>> {
+        ) -> Option<std::time::Instant> {
             let (tx, rx) = mpsc::channel(8);
             let latest: LatestHeartbeat = Arc::new(Mutex::new(None));
             let cancel = CancellationToken::new();
@@ -611,7 +611,7 @@ mod tests {
             drop(tx);
             task.await.expect("join");
             let slot = latest.lock().expect("lock");
-            slot.as_ref().map(|beat| beat.sent_at)
+            slot.as_ref().map(|beat| beat.sent_order)
         }
 
         /// One process start, shared by every test beat, so their send
@@ -619,34 +619,12 @@ mod tests {
         static BASE: std::sync::LazyLock<std::time::Instant> =
             std::sync::LazyLock::new(std::time::Instant::now);
 
-        /// A beat sent `order` seconds after `BASE`, with a wall clock that
-        /// read `wall` seconds.
-        fn beat_sent(order: u64, wall: i64) -> StampedHeartbeat {
+        /// A beat sent `secs` seconds after `BASE`.
+        fn beat_at(secs: u64) -> StampedHeartbeat {
             StampedHeartbeat {
                 details: Value::Null,
-                sent_at: chrono::DateTime::from_timestamp(wall, 0).expect("time"),
-                sent_order: *BASE + Duration::from_secs(order),
+                sent_order: *BASE + Duration::from_secs(secs),
             }
-        }
-
-        /// A beat whose wall clock agrees with its send order.
-        fn beat_at(secs: i64) -> StampedHeartbeat {
-            beat_sent(secs.unsigned_abs(), secs)
-        }
-
-        /// The wall clock can step back, after an NTP or VM correction. A
-        /// heartbeat sent after the step is still the newest (issue #1788).
-        /// Ordering by wall time would drop every heartbeat until the clock
-        /// caught up, and a timeout scanner could reclaim a live activity.
-        #[tokio::test]
-        async fn a_backward_clock_step_keeps_the_later_heartbeat() {
-            let before_step = beat_sent(1, 20);
-            let after_step = beat_sent(2, 10);
-            let newest = keep_newest_of(vec![before_step, after_step.clone()], None).await;
-            assert_eq!(newest, Some(after_step.sent_at));
-            let newest_after_flush =
-                keep_newest_of(vec![beat_sent(1, 20), after_step.clone()], Some(0)).await;
-            assert_eq!(newest_after_flush, Some(after_step.sent_at));
         }
 
         /// Only a write that blocked for an interval, with a newer heartbeat
@@ -665,7 +643,7 @@ mod tests {
         #[tokio::test]
         async fn an_older_heartbeat_does_not_replace_a_newer_one() {
             let newest = keep_newest_of(vec![beat_at(20), beat_at(10)], None).await;
-            assert_eq!(newest, Some(beat_at(20).sent_at));
+            assert_eq!(newest, Some(beat_at(20).sent_order));
         }
 
         /// An older heartbeat that arrives after a flush took the newer one is

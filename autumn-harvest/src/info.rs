@@ -1486,6 +1486,20 @@ fn wasm_activity_stub_handler(
     })
 }
 
+impl ActivityInfo {
+    /// Return `true` when the activity declares its own bound on a running attempt.
+    ///
+    /// A `start_to_close`, a `schedule_to_close` or a `heartbeat_timeout` is such
+    /// a bound. The builder default `start_to_close` applies only to an
+    /// activity with none of the three (issue #1808).
+    #[must_use]
+    pub const fn declares_attempt_bound(&self) -> bool {
+        self.default_start_to_close.is_some()
+            || self.default_schedule_to_close.is_some()
+            || self.default_heartbeat_timeout.is_some()
+    }
+}
+
 #[cfg(feature = "wasm-activities")]
 impl ActivityInfo {
     /// Build the placeholder [`ActivityInfo`] for a WASM activity (issue #965).

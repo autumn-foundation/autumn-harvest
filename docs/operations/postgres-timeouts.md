@@ -166,6 +166,9 @@ The retry writes the time that the activity sent the heartbeat, not the retry
 time. The activity stamps each heartbeat when it sends it, so a busy runtime or
 a blocked flush cannot move that time. A stalled handler then cannot look alive
 after an outage.
+The write stamps the database clock minus the heartbeat age, as measured on
+the worker's monotonic clock. Host clock skew thus does not move the stamp
+(issue #1807).
 `harvest.heartbeat.flush_failed{reason}` counts each failure. `reason` is
 `acquire_timeout`, `acquire_error` or `write_error`.
 
