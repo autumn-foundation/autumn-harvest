@@ -24,7 +24,8 @@ real time at execution. `NOW()` stays fixed at the start of the transaction.
 stamp and the claim predicate use the same clock. The eligibility check uses
 `db_clock_now`. `RetryActivityOutcome::scheduled_at` holds the stored value.
 The dispatch hint caps its due time at the host time. The dispatcher compares
-the due time with the host clock.
+the due time with the host clock. Both poison-pill requeues use
+`queue::record_immediate_hints` for the same reason.
 
 ### Tests
 
@@ -40,6 +41,9 @@ the due time with the host clock.
 
 Each item needs its own design decision. Open a follow-up issue for each.
 
+- The reconcile sweep republishes the stored `scheduled_at`. A dispatch channel
+  compares it with the host clock. A host behind the database parks that hint.
+  Polling still claims the row, so this adds latency only.
 - `EnqueueParams::new` backdates `scheduled_at` by 5 seconds on the host clock.
   The guard marks it. A host more than 5 seconds ahead delays a new task.
 - `worker.rs` writes `schedule_to_close_at` for an activity as host time plus
