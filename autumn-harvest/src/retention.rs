@@ -1043,7 +1043,6 @@ impl TerminalTaskGcOutcome {
     ///
     /// Takes `dry_run` from the config, so a failed preview still reads as a
     /// preview (issue #1316).
-    #[cfg(test)]
     #[must_use]
     fn failed(error: String, dry_run: bool) -> Self {
         Self {
@@ -1325,16 +1324,28 @@ async fn run_terminal_task_pass(
     let Some(age) = config.terminal_task_retention() else {
         return;
     };
-    // `validate` bounds the age. A config that skipped it must not panic the
-    // retention task, so an age out of range skips the pass.
-    let Some(cutoff) = chrono::Duration::from_std(age)
-        .ok()
-        .and_then(|age| Utc::now().checked_sub_signed(age))
-    else {
-        tracing::warn!(
-            age_secs = age.as_secs(),
-            "harvest terminal-task janitor skipped: the age is out of range"
+    // `spawn` does not call `validate`, so the pass checks the bounds itself.
+    // A sub-floor age would delete rows that finished moments ago. An age out
+    // of range skips the pass, and each shard reports why.
+    let cutoff = (MIN_TERMINAL_TASK_RETENTION..=MAX_MAX_AGE)
+        .contains(&age)
+        .then(|| chrono::Duration::from_std(age).ok())
+        .flatten()
+        .and_then(|age| Utc::now().checked_sub_signed(age));
+    let Some(cutoff) = cutoff else {
+        let error = format!(
+            "terminal_task_retention of {}s is out of range ({}s to {}s); the pass is skipped",
+            age.as_secs(),
+            MIN_TERMINAL_TASK_RETENTION.as_secs(),
+            MAX_MAX_AGE.as_secs()
         );
+        tracing::warn!(error = %error, "harvest terminal-task janitor skipped");
+        for shard in pools.shard_ids() {
+            monitor.update_terminal_tasks(
+                shard,
+                TerminalTaskGcOutcome::failed(error.clone(), config.dry_run),
+            );
+        }
         return;
     };
     // One pass per physical database. Aliased shards share one database, and

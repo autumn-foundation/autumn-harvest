@@ -28,7 +28,8 @@ shard. It is on by default and independent of history retention.
 - Under `dry_run`, it runs a read-only preview with the same predicates.
 
 **Config.** `RetentionConfig::terminal_task_retention_secs`, default 7 days,
-floor 1 hour. `with_terminal_task_retention(Duration)` changes it, and
+floor 1 hour. The pass checks the bounds itself, because `spawn` does not
+call `validate`. An age out of range skips the pass and reports the error. `with_terminal_task_retention(Duration)` changes it, and
 `without_terminal_task_gc()` turns it off. `RetentionConfig::enabled()` counts
 it, so the runtime spawns for it alone.
 
@@ -78,7 +79,7 @@ in `docs/performance-task-queue-hygiene.md`. CI compiles the bench.
 `trunk-dev`. It builds a `WorkerRuntimeConfig` literal without the
 `resident_workflows` field from #1798. The test now sets it.
 
-**Tests.** 13 unit tests pin the config, the outcome and the SQL shape. 17
+**Tests.** 13 unit tests pin the config, the outcome and the SQL shape. 18
 DB tests in `terminal_task_gc_tests.rs` cover the AC and the edges:
 
 - old terminal rows go, and `PENDING`/`RUNNING` rows stay at any age;
@@ -92,5 +93,6 @@ DB tests in `terminal_task_gc_tests.rs` cover the AC and the edges:
 - a dead letter keeps its execution's workflow row;
 - `dry_run` deletes nothing, and a disabled janitor reports `None`;
 - a role without `DELETE` reports the error;
+- an unvalidated sub-floor age deletes nothing and reports the error;
 - the migration sets the reloptions and indexes, round-trips through
   `down.sql`, and makes a heartbeat update HOT.

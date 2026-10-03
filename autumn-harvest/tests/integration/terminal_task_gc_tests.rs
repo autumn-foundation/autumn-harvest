@@ -451,6 +451,40 @@ async fn aliased_shards_on_one_database_are_swept_once_per_tick() {
 }
 
 #[tokio::test]
+async fn an_unvalidated_sub_floor_age_deletes_nothing() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    scrub(&mut conn).await;
+
+    // A row that finished a minute ago, well inside the 1-hour floor.
+    insert_activity_rows(
+        &mut conn,
+        "COMPLETED",
+        Some(Utc::now() - chrono::Duration::minutes(1)),
+        3,
+    )
+    .await;
+
+    // `spawn` does not call `validate`, so the pass must check the floor.
+    let config = task_gc_only(WEEK).with_terminal_task_retention(Duration::ZERO);
+    let result = run_one_tick(
+        build_pool(&url),
+        config,
+        Arc::new(CapturingMetrics::default()),
+    )
+    .await;
+
+    let gc = outcome(&result);
+    assert!(
+        gc.error
+            .as_deref()
+            .is_some_and(|e| e.contains("out of range")),
+        "an invalid age is reported, not swept: {gc:?}"
+    );
+    assert_eq!(counts_by_state(&mut conn).await.get("COMPLETED"), Some(&3));
+}
+
+#[tokio::test]
 async fn the_sweep_returns_per_state_counts_for_any_batch_size() {
     let (url, _container) = setup_db().await;
     let mut conn = connect(&url).await;
