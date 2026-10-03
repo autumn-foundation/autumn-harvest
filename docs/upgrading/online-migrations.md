@@ -43,7 +43,7 @@ The lock must name the table exactly as the create does, schema included.
 | Rule | Fails when | Fix |
 |---|---|---|
 | `lock-timeout` | A statement takes a blocking lock on a hot table, and no non-zero `lock_timeout` is in force. | Put `SET LOCAL lock_timeout = '5s';` first. |
-| `blocking-index` | A plain `CREATE INDEX`, `DROP INDEX` or `REINDEX` touches a hot table. So does `ALTER TABLE ... ADD` of a `UNIQUE`, `PRIMARY KEY` or `EXCLUDE` constraint without `USING INDEX`. | Use `CONCURRENTLY` (section 4), or the guarded build (section 5). |
+| `blocking-index` | A plain `CREATE INDEX`, `DROP INDEX` or `REINDEX` touches a hot table. So does `ALTER TABLE ... ADD` of a `UNIQUE`, `PRIMARY KEY` or `EXCLUDE` constraint without `USING INDEX`. | Use `CONCURRENTLY` (section 4), or the guarded build (section 5). On `harvest_events`, `CONCURRENTLY` also counts, because the partitioned layout cannot run it. |
 | `concurrently-in-transaction` | `CONCURRENTLY` runs in a transaction, shares its file with another statement, or sits in a `DO` block. | Put it alone in a file with `run_in_transaction = false` (section 4). |
 | `bad-annotation` | A `-- lock-safety:` comment does not parse. | Fix the annotation (section 6). |
 | `unused-annotation` | An annotation allows a rule that the statement below it does not break. | Remove the annotation. |
@@ -124,8 +124,8 @@ run_in_transaction = false
 `up.sql`:
 
 ```sql
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_harvest_events_example
-    ON harvest_events (workflow_exec_id, timestamp);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_harvest_tq_example
+    ON harvest_task_queue (queue_name, scheduled_at);
 ```
 
 The `CONCURRENTLY` statement must be the only statement in the file. Diesel
@@ -133,6 +133,15 @@ and `harvest migrate` send the file as one batch, and a batch of two or more
 statements runs as one implicit transaction. A `SET lock_timeout` beside it
 therefore breaks the migration. The lint flags it. `SHARE UPDATE EXCLUSIVE`
 does not block reads or writes, so this statement needs no `lock_timeout`.
+
+**`harvest_events` is different.** The opt-in partitioned layout turns it
+into a partitioned parent. Postgres does not build or drop an index
+`CONCURRENTLY` on a partitioned parent, so the lint flags both forms there as
+`blocking-index`. Build the index on each partition first, then on the parent.
+`docs/partitioned-events.md` and
+`20260905181020_harvest_usage_activity_lookback_index/up.sql` give the recipe.
+Then annotate the statement. The lint also flags a concurrent `DROP INDEX` of
+an index it cannot place, because that index may sit on the parent.
 
 A failed concurrent build leaves an `INVALID` index. `IF NOT EXISTS` then
 skips the build, and the invalid index stays. Before a retry, run

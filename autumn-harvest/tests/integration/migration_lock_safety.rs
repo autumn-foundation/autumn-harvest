@@ -53,6 +53,12 @@ const HOT_TABLES: &[&str] = &[
     "harvest_workflow_outbox",
 ];
 
+/// Hot tables that the opt-in partitioned layout turns into partitioned parents.
+///
+/// Postgres does not build or drop an index concurrently on a partitioned
+/// parent, so `CONCURRENTLY` is no fix for these tables.
+const PARTITIONED_TABLES: &[&str] = &["harvest_events"];
+
 /// Migration trees, relative to the workspace root.
 ///
 /// The plugin `harvest` tree runs against the same database as the core tree.
@@ -253,6 +259,27 @@ fn lint(sql: &str, run_in_transaction: bool, history: &History) -> Vec<Finding> 
                     line: hit.line,
                     stmt: hit.at,
                     detail: format!("{} CONCURRENTLY {reason}.", hit.verb),
+                });
+            }
+            // An unknown table may be the partitioned parent, so it fails closed.
+            // `REINDEX CONCURRENTLY` does run on a partitioned table.
+            let partitioned = hit.verb != "REINDEX"
+                && hit
+                    .table
+                    .as_deref()
+                    .is_none_or(|t| PARTITIONED_TABLES.contains(&base(t)));
+            if partitioned {
+                findings.push(Finding {
+                    rule: Rule::BlockingIndex,
+                    line: hit.line,
+                    stmt: hit.at,
+                    detail: format!(
+                        "{} CONCURRENTLY on {} fails on the partitioned layout, because \
+                         Postgres does not run it on a partitioned parent. Use the \
+                         per-partition recipe, then annotate the statement.",
+                        hit.label(),
+                        hit.table_name()
+                    ),
                 });
             }
         } else if hit.hot {
@@ -1130,6 +1157,14 @@ fn resolve(
                 .or_default()
                 .insert(table.clone());
         }
+        // A drop that surely runs removes the name. A later index of that name
+        // is then unknown, which fails closed.
+        if let (Some(index), "DROP INDEX") = (&raw.index, raw.verb)
+            && toks[raw.at].runs
+            && unconditional[raw.at]
+        {
+            history.indexes.remove(base(index));
+        }
         let hot = table.as_deref().is_none_or(|t| {
             HOT_TABLES.contains(&base(t))
                 && new_tables
@@ -1641,7 +1676,8 @@ fn run_in_transaction(metadata: &str) -> bool {
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
-        if key.trim() == "run_in_transaction" {
+        // TOML also allows a quoted key.
+        if key.trim().trim_matches(['"', '\'']) == "run_in_transaction" {
             return match value.trim() {
                 "true" => true,
                 "false" => false,
@@ -1809,7 +1845,7 @@ fn every_create_index_spelling_is_recognised() {
 
 #[test]
 fn concurrent_index_builds_and_cold_tables_pass() {
-    let concurrent = "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_x ON harvest_events (id);";
+    let concurrent = "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_x ON harvest_task_queue (id);";
     assert_eq!(lint_with_history(&[], concurrent, false), []);
 
     let cold = "CREATE INDEX idx_x ON harvest_schedules (id);";
@@ -1958,7 +1994,7 @@ fn statements_inside_a_dollar_quoted_block_are_scanned() {
 
 #[test]
 fn concurrently_needs_run_in_transaction_false() {
-    let sql = "CREATE INDEX CONCURRENTLY idx_x ON harvest_events (id);";
+    let sql = "CREATE INDEX CONCURRENTLY idx_x ON harvest_task_queue (id);";
     let findings = lint_with_history(&[], sql, true);
     assert_eq!(
         rules(&findings),
@@ -2191,7 +2227,8 @@ fn rule_policy_trigger_and_index_ddl_needs_a_lock_timeout() {
 #[test]
 fn concurrently_inside_a_do_block_is_flagged() {
     // Postgres rejects CONCURRENTLY inside a function or a DO block.
-    let sql = "DO $$\nBEGIN\n    CREATE INDEX CONCURRENTLY idx_x ON harvest_events (id);\nEND $$;";
+    let sql =
+        "DO $$\nBEGIN\n    CREATE INDEX CONCURRENTLY idx_x ON harvest_task_queue (id);\nEND $$;";
     let findings = lint_with_history(&[], sql, false);
     assert_eq!(
         rules(&findings),
@@ -2213,9 +2250,9 @@ fn a_transaction_local_timeout_counts_in_a_non_transactional_batch() {
 fn concurrently_must_be_alone_in_a_non_transactional_file() {
     for extra in [
         "SET lock_timeout = '5s';",
-        "CREATE INDEX CONCURRENTLY idx_y ON harvest_events (y);",
+        "CREATE INDEX CONCURRENTLY idx_y ON harvest_task_queue (y);",
     ] {
-        let sql = format!("{extra}\nCREATE INDEX CONCURRENTLY idx_x ON harvest_events (x);");
+        let sql = format!("{extra}\nCREATE INDEX CONCURRENTLY idx_x ON harvest_task_queue (x);");
         let findings = lint_with_history(&[], &sql, false);
         assert!(
             rules(&findings).contains(&Rule::ConcurrentlyInTransaction),
@@ -2914,6 +2951,44 @@ fn nulls_not_distinct_after_the_columns_is_still_a_plain_build() {
                CREATE UNIQUE INDEX idx_x ON harvest_events (id) NULLS NOT DISTINCT;";
     let findings = lint_with_history(&[], sql, true);
     assert_eq!(rules(&findings), [Rule::BlockingIndex], "{findings:?}");
+}
+
+#[test]
+fn concurrently_cannot_reach_a_partitioned_parent() {
+    // On the partitioned layout, `harvest_events` is a partitioned parent.
+    // Postgres runs neither form concurrently on a partitioned parent.
+    let history = ["CREATE INDEX idx_e ON harvest_events (id);"];
+    for sql in [
+        "CREATE INDEX CONCURRENTLY idx_x ON harvest_events (id);",
+        "DROP INDEX CONCURRENTLY idx_e;",
+    ] {
+        let findings = lint_with_history(&history, sql, false);
+        assert_eq!(
+            rules(&findings),
+            [Rule::BlockingIndex],
+            "{sql}: {findings:?}"
+        );
+        assert!(findings[0].detail.contains("partitioned"), "{findings:?}");
+    }
+    let other = "CREATE INDEX CONCURRENTLY idx_x ON harvest_task_queue (id);";
+    assert_eq!(lint_with_history(&[], other, false), []);
+}
+
+#[test]
+fn a_sure_drop_forgets_the_index() {
+    let history = [
+        "CREATE INDEX idx_shared ON harvest_schedules (id);",
+        "DROP INDEX idx_shared;",
+    ];
+    let sql = "SET LOCAL lock_timeout = '5s';\nDROP INDEX idx_shared;";
+    let findings = lint_with_history(&history, sql, true);
+    assert_eq!(rules(&findings), [Rule::BlockingIndex], "{findings:?}");
+}
+
+#[test]
+fn a_quoted_metadata_key_is_read() {
+    assert!(!run_in_transaction("\"run_in_transaction\" = false\n"));
+    assert!(!run_in_transaction("'run_in_transaction' = false\n"));
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────
