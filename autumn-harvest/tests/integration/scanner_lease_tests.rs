@@ -309,9 +309,13 @@ async fn insert_poisoned_task(conn: &mut AsyncPgConnection, queue: &str) -> uuid
     id
 }
 
-/// A row that fails to enforce is tried again on the next pass, next to the
-/// next batch. The other rows still drain. A leader that fails on it three
-/// passes in a row gives up the lease, so another replica can try.
+/// A row that fails to enforce is tried again first in the next batch. The
+/// other rows still drain. A leader that fails on it three passes in a row
+/// gives up the lease, so another replica can try.
+///
+/// A batch of 4 drains the 20 good rows in 5 passes. The leader gives up
+/// after about 8 passes. A slow runner can take 2 s for one pass, so the
+/// waits count in tens of seconds.
 #[tokio::test]
 async fn a_failed_row_is_retried_until_the_leader_gives_up() {
     let (url, _container) = setup_test_db_url().await;
@@ -327,16 +331,16 @@ async fn a_failed_row_is_retried_until_the_leader_gives_up() {
         Duration::from_millis(50),
         Duration::from_secs(10),
     );
-    spec.batch = 1;
+    spec.batch = 4;
     let checker = spawn_checker(&pool, spec);
     let metrics = checker.metrics.clone();
     wait_for(
         "the leader to give up its lease",
-        Duration::from_secs(10),
+        Duration::from_secs(30),
         || metrics.role("standby") > 0,
     )
     .await;
-    wait_for_running(&mut conn, &good, 0, Duration::from_secs(10)).await;
+    wait_for_running(&mut conn, &good, 0, Duration::from_secs(30)).await;
     stop_all(vec![checker]).await;
 
     let left = still_running(&mut conn, &[poisoned]).await;
