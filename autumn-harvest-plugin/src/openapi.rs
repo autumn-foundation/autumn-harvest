@@ -193,7 +193,7 @@ fn security_schemes() -> Value {
             "type": "http",
             "scheme": "bearer",
             "description": "Scoped Harvest API token (issue #942). Tokens carry an `hvst_` \
-                            prefix and a read or admin scope.",
+                            prefix and a `read`, `mutate` or `admin` scope.",
         },
         SESSION_SCHEME: {
             "type": "apiKey",
