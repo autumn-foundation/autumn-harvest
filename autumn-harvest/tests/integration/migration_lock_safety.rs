@@ -337,6 +337,10 @@ fn timeout_in_force(timeouts: &[(usize, Timeout)], at: usize) -> bool {
                 session = saved;
                 local = None;
             }
+            Timeout::RollbackToSavepoint => {
+                session = false;
+                local = None;
+            }
         }
     }
     local.unwrap_or(session)
@@ -354,6 +358,9 @@ enum Timeout {
     /// `ROLLBACK` or `ABORT`, which also undoes every session change since
     /// the transaction began.
     Rollback,
+    /// `ROLLBACK TO SAVEPOINT`. The lint does not track savepoints, so it
+    /// assumes no bound remains.
+    RollbackToSavepoint,
 }
 
 // ── Annotations ──────────────────────────────────────────────────────────────
@@ -1216,7 +1223,15 @@ fn timeout_change(s: &Stmts, k: usize) -> Option<Timeout> {
             Some(Timeout::Begin)
         }
         "commit" | "end" if start && s.toks[k].depth == 0 => Some(Timeout::Commit),
-        "rollback" | "abort" if start && s.toks[k].depth == 0 => Some(Timeout::Rollback),
+        "rollback" | "abort" if start && s.toks[k].depth == 0 => {
+            // `ROLLBACK [WORK | TRANSACTION] TO [SAVEPOINT] s` restores the value
+            // from the savepoint, which the lint does not track.
+            if (k + 1..=k + 2).any(|j| s.is(j, "to")) {
+                Some(Timeout::RollbackToSavepoint)
+            } else {
+                Some(Timeout::Rollback)
+            }
+        }
         "set_config"
             if s.is_punct(k + 1, '(')
                 && s.string(k + 2) == Some("lock_timeout")
@@ -1337,7 +1352,8 @@ fn drop(s: &Stmts, k: usize, history: &History, raws: &mut Vec<Raw>) {
     }
 }
 
-/// `ALTER TABLE old RENAME TO new` carries the foreign keys of `old` to `new`.
+/// `ALTER TABLE old RENAME TO new` carries the foreign keys and indexes of
+/// `old` to `new`.
 ///
 /// The old name keeps them too. Remembering a key that moved fails closed.
 fn rename(s: &Stmts, k: usize, history: &mut History) {
@@ -1358,6 +1374,12 @@ fn rename(s: &Stmts, k: usize, history: &mut History) {
         .entry(base(&new).to_string())
         .or_default()
         .extend(keys);
+    // An index on the old name now sits on the new one.
+    for tables in history.indexes.values_mut() {
+        if tables.iter().any(|t| base(t) == base(&old)) {
+            tables.insert(new.clone());
+        }
+    }
 }
 
 /// The `ALTER` forms that lock a table.
@@ -1400,12 +1422,18 @@ fn alter(s: &Stmts, k: usize, history: &History, raws: &mut Vec<Raw>) {
                 );
             }
             // ATTACH and DETACH PARTITION also lock the partition they name.
+            // INHERIT and NO INHERIT also lock the parent.
             for j in k..s.end(k) {
                 if (s.is(j, "attach") || s.is(j, "detach"))
                     && s.is(j + 1, "partition")
                     && let Some((partition, _)) = s.qualified_name(j + 2)
                 {
                     raws.push(Raw::lock(k, "ALTER TABLE ... PARTITION", Some(partition)));
+                }
+                if s.is(j, "inherit")
+                    && let Some((parent, _)) = s.qualified_name(j + 1)
+                {
+                    raws.push(Raw::lock(k, "ALTER TABLE ... INHERIT", Some(parent)));
                 }
             }
             raws.push(Raw::lock(k, "ALTER TABLE", Some(table)));
@@ -1538,17 +1566,30 @@ fn reindex(s: &Stmts, k: usize) -> Option<Raw> {
 /// Whether the value at `k` is a non-zero timeout.
 ///
 /// `0` turns the timeout off. `DEFAULT` restores the server default, which is
-/// usually `0`, so it does not count either.
+/// usually `0`, so it does not count either. Neither does a value under 1 ms.
 fn bounds_wait(s: &Stmts, k: usize) -> bool {
     let value = match s.toks.get(k).map(|t| &t.tok) {
         Some(Tok::Str(v) | Tok::Word(v)) => v.trim(),
         _ => return false,
     };
-    let number: String = value
-        .chars()
-        .take_while(|c| c.is_ascii_digit() || *c == '.')
-        .collect();
-    number.parse::<f64>().is_ok_and(|n| n > 0.0)
+    // Postgres stores the value as whole milliseconds, so a value under 1 ms
+    // can round to 0. An unknown unit does not count either.
+    let split = value
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(value.len());
+    let Ok(number) = value[..split].parse::<f64>() else {
+        return false;
+    };
+    let ms_per_unit = match value[split..].trim() {
+        "us" => 0.001,
+        "" | "ms" => 1.0,
+        "s" => 1_000.0,
+        "min" => 60_000.0,
+        "h" => 3_600_000.0,
+        "d" => 86_400_000.0,
+        _ => return false,
+    };
+    number * ms_per_unit >= 1.0
 }
 
 /// Read Diesel's `run_in_transaction` out of a `metadata.toml`.
@@ -2645,6 +2686,62 @@ fn reindex_concurrently_false_is_a_plain_reindex() {
     }
     let on = "REINDEX (CONCURRENTLY true) TABLE harvest_events;";
     assert_eq!(lint_with_history(&[], on, false), []);
+}
+
+#[test]
+fn rollback_to_a_savepoint_ends_the_bound() {
+    let sql = "SET lock_timeout = '5s';\nBEGIN;\nSET lock_timeout = 0;\nSAVEPOINT s;\n\
+               SET lock_timeout = '5s';\nROLLBACK TO SAVEPOINT s;\n\
+               ALTER TABLE harvest_events ADD COLUMN x INT;";
+    let findings = lint_with_history(&[], sql, false);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+}
+
+#[test]
+fn inherit_and_no_inherit_lock_the_parent() {
+    for sql in [
+        "ALTER TABLE harvest_schedules INHERIT harvest_events;",
+        "ALTER TABLE harvest_schedules NO INHERIT harvest_events;",
+    ] {
+        let findings = lint_with_history(&[], sql, true);
+        assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}: {findings:?}");
+        assert!(
+            findings[0].detail.contains("harvest_events"),
+            "{findings:?}"
+        );
+    }
+}
+
+#[test]
+fn a_timeout_that_rounds_to_zero_does_not_count() {
+    for value in ["'0.1ms'", "'0.0001s'", "'5 parsecs'"] {
+        let sql = format!(
+            "SET LOCAL lock_timeout = {value};\nALTER TABLE harvest_events ADD COLUMN x INT;"
+        );
+        let findings = lint_with_history(&[], &sql, true);
+        assert_eq!(
+            rules(&findings),
+            [Rule::LockTimeout],
+            "{value}: {findings:?}"
+        );
+    }
+    for value in ["'5s'", "'5 s'", "'1min'", "'250ms'", "5000", "'1h'"] {
+        let sql = format!(
+            "SET LOCAL lock_timeout = {value};\nALTER TABLE harvest_events ADD COLUMN x INT;"
+        );
+        assert_eq!(lint_with_history(&[], &sql, true), [], "{value}");
+    }
+}
+
+#[test]
+fn a_renamed_table_keeps_its_indexes() {
+    let history = [
+        "CREATE TABLE replacement (id INT);\nCREATE INDEX idx_replacement ON replacement (id);",
+        "ALTER TABLE replacement RENAME TO harvest_events;",
+    ];
+    let sql = "SET LOCAL lock_timeout = '5s';\nDROP INDEX idx_replacement;";
+    let findings = lint_with_history(&history, sql, true);
+    assert_eq!(rules(&findings), [Rule::BlockingIndex], "{findings:?}");
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────

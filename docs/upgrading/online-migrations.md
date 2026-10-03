@@ -82,7 +82,9 @@ ALTER TABLE harvest_workflow_executions
 
 Every lock on a hot table needs a bound in force when it runs. A timeout set
 after the lock does not count. A later `RESET lock_timeout`, `RESET ALL` or
-zero value ends the bound for the locks after it. `0` turns the timeout off.
+zero value ends the bound for the locks after it, and so does a
+`ROLLBACK TO SAVEPOINT`. `0` turns the timeout off, and so does a value under
+1 ms, because Postgres rounds it to 0.
 `DEFAULT` restores the server default, which is usually `0`, so the lint does
 not accept it. `SET lock_timeout` must be its own statement. `ALTER ROLE ...
 SET lock_timeout` does not change the current session. Inside a `DO` block,
