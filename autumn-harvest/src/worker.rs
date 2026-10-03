@@ -5497,10 +5497,12 @@ async fn lock_activity_claim(
 /// Check the claim epoch of an activity row under its lock (issue #1789).
 ///
 /// The guards in [`fail_task_and_execution_with_history`] key on
-/// `(worker_id, crash_strikes)`. A clean release resets `crash_strikes` to 0,
-/// so a later claim by the same worker can pass them. This check locks the
-/// row with the epoch in the same statement. The later guards then read a row
-/// that this transaction holds, so the epoch cannot move under them.
+/// `(worker_id, crash_strikes, attempt)`. A later claim of the same worker
+/// fails them with an ambiguity error. For an activity row, a lost lease must
+/// instead end as a no-op that returns `Ok`. This check locks the row with
+/// the epoch in the same statement, so the two cases stay apart. The later
+/// guards then read a row that this transaction holds, so the epoch cannot
+/// move under them.
 ///
 /// `SKIP LOCKED`, as in [`queue::claim_still_held_for_update`], keeps this
 /// transaction out of a lock cycle.
@@ -5524,7 +5526,7 @@ async fn activity_epoch_check(
 enum ActivityEpoch {
     /// The claim is current, and this transaction holds the row lock.
     Held,
-    /// A later claim of the same worker passes the `crash_strikes` guards.
+    /// A later claim of the same worker holds the row with equal `crash_strikes`.
     Reused,
     /// The claim is lost, or another transaction holds the row lock.
     Unconfirmed,

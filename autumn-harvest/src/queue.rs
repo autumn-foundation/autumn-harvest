@@ -2778,9 +2778,10 @@ pub(crate) async fn claim_held_for_update_skip_locked(
 /// Whether a later claim of the same worker holds the row with the same
 /// `crash_strikes` (issue #1789).
 ///
-/// Such a claim passes a guard on `(worker_id, crash_strikes)`, for example
-/// [`claim_still_held_for_update`], but it is not `claim`. The read takes no
-/// lock.
+/// Such a claim passes a guard that omits `attempt`, but it is not `claim`.
+/// [`claim_still_held_for_update`] checks `attempt` and rejects it (issue
+/// #1806). The caller uses this read to tell that case from any other miss.
+/// The read takes no lock.
 ///
 /// # Errors
 ///
@@ -4959,10 +4960,10 @@ const fn release_suspended_workflow_claim_query() -> &'static str {
 /// ownership genuinely moved in the interim, the guard no longer matches. The
 /// guard checks `worker_id`, `crash_strikes` and `attempt`, as
 /// [`claim_still_held_for_update`] does. This call then updates nothing, and
-/// the new owner keeps the row, exactly as if this call were never made. If it did not move, the
-/// row is released, and `wake_requested` is cleared in the very same write so
-/// a wake that landed in the contention window is reconciled rather than
-/// silently lost. This mirrors the established, doubly-reviewed
+/// the new owner keeps the row, exactly as if this call never ran. If
+/// ownership did not move, the row is released. The same write clears
+/// `wake_requested`, so a wake that landed in the contention window is
+/// reconciled rather than silently lost. This mirrors the established, doubly-reviewed
 /// [`release_task_for_capability_miss`] fallback -- the pattern this crate
 /// already relies on whenever a `SKIP LOCKED` guard's ambiguous "not ours"
 /// answer needs an authoritative, blocking follow-up -- but touches none of

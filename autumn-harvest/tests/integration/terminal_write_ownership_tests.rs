@@ -1056,3 +1056,93 @@ async fn release_from_a_requeued_claim_of_the_same_worker_is_a_no_op_1806() {
     .expect("release runs");
     assert!(released, "the current claim must still release");
 }
+
+/// The guard still checks `crash_strikes`. A poison-pill requeue bumps it,
+/// and the same worker can win the row again at the same `attempt`.
+#[tokio::test]
+async fn persist_after_a_crash_strike_bump_is_rejected_1806() {
+    let (url, _container) = setup_db().await;
+    let queue_name = format!("q1806-strikes-{}", Uuid::new_v4());
+    let exec_id = seed_workflow(
+        &mut connect(&url).await,
+        "issue1806_strikes_wf",
+        serde_json::json!({}),
+        &queue_name,
+    )
+    .await;
+    let claimed = claim_workflow_task(&url, &queue_name, "same-worker").await;
+
+    let mut conn = connect(&url).await;
+    diesel::sql_query(
+        "UPDATE harvest_task_queue SET crash_strikes = crash_strikes + 1 WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(claimed.id)
+    .execute(&mut conn)
+    .await
+    .expect("bump crash_strikes");
+
+    let result = persist_workflow_completion(
+        &mut conn,
+        claimed.id,
+        exec_id,
+        1,
+        "same-worker",
+        claimed.crash_strikes,
+        claimed.attempt,
+        serde_json::json!({"ok": true}),
+        None,
+        None,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+        &mut Vec::new(),
+    )
+    .await;
+
+    assert_eq!(
+        result
+            .expect_err("a persist with outdated crash_strikes must not commit")
+            .terminal_write_claim_ambiguous(),
+        Some(claimed.id)
+    );
+}
+
+/// The guard keeps the row lock until the caller's transaction ends. A second
+/// transaction then skips the row instead of waiting for it.
+#[tokio::test]
+async fn claim_guard_holds_the_row_lock_until_the_transaction_ends_1806() {
+    let (url, _container) = setup_db().await;
+    let queue_name = format!("q1806-lock-{}", Uuid::new_v4());
+    seed_workflow(
+        &mut connect(&url).await,
+        "issue1806_lock_wf",
+        serde_json::json!({}),
+        &queue_name,
+    )
+    .await;
+    let claimed = claim_workflow_task(&url, &queue_name, "same-worker").await;
+    let claim = queue::TaskClaim::new(claimed.id, "same-worker", claimed.attempt);
+
+    let mut holder = connect(&url).await;
+    holder.batch_execute("BEGIN").await.expect("begin");
+    assert!(
+        queue::claim_still_held_for_update(&mut holder, &claim, claimed.crash_strikes)
+            .await
+            .expect("guard runs"),
+        "the current claim must pass the guard"
+    );
+
+    let mut other = connect(&url).await;
+    assert!(
+        !queue::claim_still_held_for_update(&mut other, &claim, claimed.crash_strikes)
+            .await
+            .expect("guard runs"),
+        "a locked row must read as not ours, without waiting"
+    );
+
+    holder.batch_execute("COMMIT").await.expect("commit");
+    assert!(
+        queue::claim_still_held_for_update(&mut other, &claim, claimed.crash_strikes)
+            .await
+            .expect("guard runs"),
+        "the guard must pass again after the lock ends"
+    );
+}
