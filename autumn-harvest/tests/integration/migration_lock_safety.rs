@@ -314,8 +314,10 @@ fn index_cost(verb: &str) -> &'static str {
 fn timeout_in_force(timeouts: &[(usize, Timeout)], at: usize) -> bool {
     let mut session = false;
     let mut local = None;
-    // The session value when the current transaction began.
+    // The session value when the current transaction began. Diesel sends the
+    // file as one batch, which is already a transaction, so it starts there.
     let mut saved = false;
+    let mut in_transaction = true;
     for (_, change) in timeouts.iter().take_while(|(k, _)| *k < at) {
         match *change {
             Timeout::Set {
@@ -329,13 +331,22 @@ fn timeout_in_force(timeouts: &[(usize, Timeout)], at: usize) -> bool {
                 session = bounds;
                 local = None;
             }
-            Timeout::Begin | Timeout::Commit => {
+            // A `BEGIN` inside a transaction starts nothing new.
+            Timeout::Begin => {
+                if !in_transaction {
+                    saved = session;
+                }
+                in_transaction = true;
+            }
+            Timeout::Commit => {
                 saved = session;
                 local = None;
+                in_transaction = false;
             }
             Timeout::Rollback => {
                 session = saved;
                 local = None;
+                in_transaction = false;
             }
             Timeout::RollbackToSavepoint => {
                 session = false;
@@ -1609,6 +1620,10 @@ fn bounds_wait(s: &Stmts, k: usize) -> bool {
 fn run_in_transaction(metadata: &str) -> bool {
     for line in metadata.lines() {
         let line = line.split('#').next().unwrap_or("").trim();
+        // Diesel reads the key at top level only. A table header ends that.
+        if line.starts_with('[') {
+            break;
+        }
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
@@ -2477,10 +2492,16 @@ fn a_rollback_restores_the_session_timeout_from_before_the_transaction() {
                ALTER TABLE harvest_events ADD COLUMN x INT;";
     let findings = lint_with_history(&[], sql, false);
     assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
-    // A bound set before the transaction survives its rollback.
+    // The file runs as one implicit transaction, so a `BEGIN` inside it
+    // starts nothing new. The rollback also undoes the `SET` before it.
     let before = "SET lock_timeout = '5s';\nBEGIN;\nSET lock_timeout = 0;\nROLLBACK;\n\
                   ALTER TABLE harvest_events ADD COLUMN x INT;";
-    assert_eq!(lint_with_history(&[], before, false), []);
+    let findings = lint_with_history(&[], before, false);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+    // A bound set after a commit survives a later rollback.
+    let committed = "SET lock_timeout = '5s';\nCOMMIT;\nBEGIN;\nSET lock_timeout = 0;\n\
+                     ROLLBACK;\nALTER TABLE harvest_events ADD COLUMN x INT;";
+    assert_eq!(lint_with_history(&[], committed, false), []);
 }
 
 #[test]
@@ -2825,6 +2846,24 @@ fn a_guarded_build_on_a_hot_table_still_teaches_the_hot_table() {
     let sql = "SET LOCAL lock_timeout = '5s';\nDROP INDEX idx_shared;";
     let findings = lint_with_history(&history, sql, true);
     assert_eq!(rules(&findings), [Rule::BlockingIndex], "{findings:?}");
+}
+
+#[test]
+fn a_key_under_a_toml_table_is_not_top_level() {
+    assert!(run_in_transaction(
+        "[section]\nrun_in_transaction = false\n"
+    ));
+    assert!(!run_in_transaction(
+        "run_in_transaction = false\n[section]\nother = 1\n"
+    ));
+}
+
+#[test]
+fn a_repeated_begin_keeps_the_first_snapshot() {
+    let sql = "BEGIN;\nSET lock_timeout = '5s';\nBEGIN;\nSET lock_timeout = '0';\nROLLBACK;\n\
+               ALTER TABLE harvest_events ADD COLUMN x INT;";
+    let findings = lint_with_history(&[], sql, false);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────
