@@ -184,13 +184,26 @@ struct Finding {
 /// What earlier migrations created, as far as the lint needs to know.
 #[derive(Clone, Debug, Default)]
 struct History {
-    /// Each index name, mapped to its table.
-    indexes: BTreeMap<String, String>,
+    /// Each index name, mapped to the tables it may sit on.
+    /// The key is the index name without its schema. The value holds every
+    /// table that a build of that name has named, so a schema can never hide
+    /// a hot index.
+    indexes: BTreeMap<String, BTreeSet<String>>,
     /// Each table, mapped to the tables that its foreign keys reference.
     references: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl History {
+    /// The table of index `name`. A hot table wins when the name is ambiguous.
+    fn index_table(&self, name: &str) -> Option<String> {
+        let tables = self.indexes.get(base(name))?;
+        tables
+            .iter()
+            .find(|t| HOT_TABLES.contains(&base(t)))
+            .or_else(|| tables.iter().next())
+            .cloned()
+    }
+
     /// Build the history that `migrations` leave behind, in order.
     fn of<'a>(migrations: impl IntoIterator<Item = &'a str>) -> Self {
         let mut history = Self::default();
@@ -701,6 +714,27 @@ impl<'a> Stmts<'a> {
         }
     }
 
+    /// Whether the call at `k` is a whole statement: `SELECT f(...)` or
+    /// `PERFORM f(...)`, with nothing after the closing parenthesis.
+    fn is_bare_call(&self, k: usize) -> bool {
+        let start = self.starts[k];
+        if k != start + 1 || !(self.is(start, "select") || self.is(start, "perform")) {
+            return false;
+        }
+        let mut parens = 0_usize;
+        for j in k + 1..self.toks.len() {
+            if self.is_punct(j, '(') {
+                parens += 1;
+            } else if self.is_punct(j, ')') {
+                parens -= 1;
+                if parens == 0 {
+                    return j + 1 == self.end(k);
+                }
+            }
+        }
+        false
+    }
+
     /// The index one past the last token of the statement that holds `k`.
     fn end(&self, k: usize) -> usize {
         (k..self.toks.len())
@@ -936,23 +970,20 @@ fn resolve(
     raws.sort_by_key(|raw| raw.at);
     let mut hits = Vec::with_capacity(raws.len());
     for raw in raws {
-        let table = raw.table.or_else(|| {
-            raw.index
-                .as_deref()
-                .and_then(|i| history.indexes.get(base(i)))
-                .cloned()
-        });
-        // Learn an index only from a build that surely runs. `IF NOT EXISTS`
-        // keeps an index that already has the name.
+        let table = raw
+            .table
+            .or_else(|| raw.index.as_deref().and_then(|i| history.index_table(i)));
+        // Learn an index only from a build that surely runs. The history only
+        // grows, so a later build of the same name cannot hide a hot table.
         let sure = toks[raw.at].runs && unconditional[raw.at];
         if let (Some(index), Some(table), "CREATE INDEX", true) =
             (&raw.index, &table, raw.verb, sure)
         {
-            let key = base(index).to_string();
-            let guarded = s.has_pair(raw.at, "not", "exists");
-            if !(guarded && history.indexes.contains_key(&key)) {
-                history.indexes.insert(key, table.clone());
-            }
+            history
+                .indexes
+                .entry(base(index).to_string())
+                .or_default()
+                .insert(table.clone());
         }
         let hot = table.as_deref().is_none_or(|t| {
             HOT_TABLES.contains(&base(t)) && created.get(t).is_none_or(|made| *made > raw.at)
@@ -1034,7 +1065,11 @@ fn timeout_change(s: &Stmts, k: usize) -> Option<bool> {
                 && s.string(k + 2) == Some("lock_timeout")
                 && s.is_punct(k + 3, ',') =>
         {
-            Some(bounds_wait(s, k + 4))
+            // A query runs the function once per row, so a filter can skip it.
+            // A bound counts only from a bare `SELECT` or `PERFORM` of the
+            // call. A clear counts anywhere.
+            let bounds = bounds_wait(s, k + 4);
+            (!bounds || s.is_bare_call(k)).then_some(bounds)
         }
         _ => None,
     }
@@ -1139,6 +1174,11 @@ fn drop(s: &Stmts, k: usize, history: &History, raws: &mut Vec<Raw>) {
 fn alter(s: &Stmts, k: usize, history: &History, raws: &mut Vec<Raw>) {
     match s.word(k + 1) {
         Some("table") => {
+            // `ALTER TABLE ALL IN TABLESPACE` moves every table there.
+            if s.is(k + 2, "all") && s.is(k + 3, "in") {
+                raws.push(Raw::lock(k, "ALTER TABLE ALL IN TABLESPACE", None));
+                return;
+            }
             let Some(table) = s.statement_table(k) else {
                 return;
             };
@@ -2058,6 +2098,37 @@ fn a_foreign_key_is_remembered_even_from_a_body_that_may_not_run() {
                     END IF;\nEND $$;"];
     let findings = lint_with_history(&history, "DROP TABLE harvest_child;", true);
     assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+}
+
+#[test]
+fn a_set_config_in_a_filtered_query_does_not_count() {
+    // The function runs only when the query returns a row.
+    let lock = "\nALTER TABLE harvest_events ADD COLUMN x INT;";
+    for set in [
+        "SELECT set_config('lock_timeout', '5s', true) WHERE false;",
+        "SELECT set_config('lock_timeout', '5s', true) FROM harvest_schedules;",
+    ] {
+        let findings = lint_with_history(&[], &format!("{set}{lock}"), true);
+        assert_eq!(rules(&findings), [Rule::LockTimeout], "{set}: {findings:?}");
+    }
+}
+
+#[test]
+fn alter_table_all_in_tablespace_locks_an_unknown_table() {
+    let sql = "ALTER TABLE ALL IN TABLESPACE old SET TABLESPACE fast;";
+    let findings = lint_with_history(&[], sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+}
+
+#[test]
+fn an_index_name_in_another_schema_cannot_hide_a_hot_index() {
+    let history = [
+        "CREATE INDEX idx_shared ON public.harvest_events (id);",
+        "CREATE INDEX idx_shared ON staging.harvest_schedules (id);",
+    ];
+    let sql = "SET LOCAL lock_timeout = '5s';\nDROP INDEX public.idx_shared;";
+    let findings = lint_with_history(&history, sql, true);
+    assert_eq!(rules(&findings), [Rule::BlockingIndex], "{findings:?}");
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────
