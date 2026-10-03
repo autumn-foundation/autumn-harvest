@@ -40,6 +40,7 @@ autumn-harvest/          <- workspace root
       heartbeat.rs       <- Phase 2: batched heartbeat flusher
       timeout.rs         <- Phase 2: timeout enforcement scanner
       cache.rs           <- Phase 2: LRU workflow state cache
+      resident.rs        <- issue #1798: resident workflow state
       dlq.rs             <- Phase 2: dead letter queue
       pool.rs            <- Phase 2: separate pool config with shared ceiling
       testing.rs         <- Phase 3.5 (testing feature): WorkflowReplayer harness
@@ -323,7 +324,8 @@ Current implementation scope: `ExecutionId`/`ShardId` encoding, `ShardRouter`, `
 | `workers.rs` | 4 | Worker fleet registry: `register_worker`, `heartbeat_worker`, `transition_status`, `list_workers`, `get_worker`, `fleet_health`, `spawn_worker_heartbeat` |
 | `heartbeat.rs` | 2 | Batched heartbeat flusher: debounced channel receiver, last-write-wins timestamp + checkpoint payload DB update |
 | `timeout.rs` | 2 | Timeout enforcement scanner: start-to-close, schedule-to-start, heartbeat timeout queries, and workflow execution timeouts (`enforce_workflow_execution_timeouts`, issue #243) |
-| `cache.rs` | 2 | LRU workflow state cache: bounded capacity, access-order eviction. `CachedWorkflowState` holds `events: Vec<WorkflowEvent>` + `next_event_id: i32` for delta-load support (issue #235). |
+| `cache.rs` | 2 | LRU workflow state cache: bounded capacity, access-order eviction. `CachedWorkflowState` holds `events: Vec<WorkflowEvent>` + `next_event_id: i32` for delta-load support (issue #235). An entry can also hold a `ResidentWorkflow` (issue #1798). |
+| `resident.rs` | 3.x | Resident workflow state (issue #1798): keeps a suspended handler future and its context between decisions. A warm decision sends the one new result to the parked future instead of replaying history. Accepts only suspensions and deltas that it resolves exactly as a cold replay would; anything else declines to a cold replay. |
 | `dlq.rs` | 2 | Dead letter queue: `DeadLetterEntry` builder, move-to-DLQ on retry exhaustion |
 | `pool.rs` | 2 | Separate DB pool config: web pool + worker pool with shared ceiling, minimum guarantees |
 | `erase.rs` | 3.30 | Targeted PII erasure (issue #495): `ERASURE_TOMBSTONE_KEY`, `erasure_tombstone()`, `tombstone_payload_fields(event_value)` (pure, no-DB), `is_terminal_state(state)`, `EraseOutcome`/`SkippedChild`/`EraseFailure`; DB-gated `erase_workflow_payloads(conn, exec_id, reason)`. **Sanctioned in-place mutation exception** to the append-only invariant (alongside heartbeat checkpoints): only `data` field contents are mutated, never event structure. Terminal-only, irreversible, idempotent, cascades to terminal children on the same shard. |
