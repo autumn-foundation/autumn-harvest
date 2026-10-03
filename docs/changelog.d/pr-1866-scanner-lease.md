@@ -44,7 +44,8 @@ size, so adding workers to clear a backlog added database load in proportion.
   task payloads.
   A row that matches two reasons gets the first one, as in the full scan,
   if that reason's sweep can still claim it: the row is ahead of its cursor
-  or in its queue. Otherwise the later reason takes it. A lane keeps its
+  or in its queue. A row in its queue, moved list or retry list stays with
+  it, also after its sweep ends. Otherwise the later reason takes it. A lane keeps its
   clock until its last queue drains. A queued row keeps its reason when an
   earlier one starts to match. If its reason stops matching, it moves to the
   first other reason that still matches. It waits there in a moved list of

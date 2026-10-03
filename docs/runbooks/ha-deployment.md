@@ -231,7 +231,8 @@ terminal rows.
 
 A row that matches two reasons gets the first one, in the order above, if
 that reason's sweep can still claim it: the row is ahead of its cursor or in
-its queue. Each lane has its own sweep clock, and keeps it until the last
+its queue. A row in its queue, moved list or retry list stays with it, also
+after its sweep ends. Each lane has its own sweep clock, and keeps it until the last
 queue of its sweep drains. If the earlier lane has already passed the row,
 the later reason takes it. So the row does not wait for a whole sweep. A
 queued row keeps its reason, also when an earlier reason starts to match

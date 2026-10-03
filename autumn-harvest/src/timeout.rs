@@ -542,13 +542,14 @@ const LIVE_ROW_KEY: &str = "COALESCE(created_at, TIMESTAMPTZ '1970-01-01 00:00:0
 ///
 /// With `after`, `$1` and `$2` are the key and id of the last row of the
 /// previous page. Then `$3` is the page size and `$4` is the sweep's clock.
-/// Without it, `$1` is the page size and `$2` is the clock. The next five
+/// Without it, `$1` is the page size and `$2` is the clock. The next four
 /// params describe the earlier lanes. They hold the clocks, the cursor keys,
-/// the cursor ids, and the queued ids with their lane numbers.
+/// the cursor ids, and the ids that the lanes hold.
 ///
-/// An earlier lane matches each row at its own clock. It can still claim a
-/// row that it has yet to read or has queued. Only such a row is left to it.
-/// A row that it has already passed goes to this lane.
+/// An earlier lane matches each row at its own clock. A row ahead of its
+/// cursor is left to it. A row that it holds is left to it whatever it
+/// matches, because the row can have moved there after that clock. A row
+/// that it has already passed goes to this lane.
 fn timeout_refill_query(predicate: &str, higher: &[&str], after: bool) -> String {
     use std::fmt::Write as _;
 
@@ -562,8 +563,7 @@ fn timeout_refill_query(predicate: &str, higher: &[&str], after: bool) -> String
     } else {
         (String::new(), "$1", "$2", 3)
     };
-    let [clocks, keys, ids, lanes, queued] =
-        std::array::from_fn::<_, 5, _>(|i| format!("${}", first + i));
+    let [clocks, keys, ids, held] = std::array::from_fn::<_, 4, _>(|i| format!("${}", first + i));
     let on_page = |sql: &str, at: &str| on_refill_page(sql).replace("NOW()", at);
     // `EXCEPT` leaves a row to an earlier reason. A set operation stays near
     // linear in the page. A correlated `NOT EXISTS` on the page can run as a
@@ -578,10 +578,15 @@ fn timeout_refill_query(predicate: &str, higher: &[&str], after: bool) -> String
         let _ = write!(
             expired,
             " EXCEPT SELECT h.id, h.row_key FROM ({}) h WHERE h.row_key <= {at} \
-             AND (({keys})[{k}] IS NULL OR (h.row_key, h.id) > (({keys})[{k}], ({ids})[{k}]) \
-             OR h.id IN (SELECT u.id FROM unnest({lanes}, {queued}) AS u(lane, id) \
-             WHERE u.lane = {k}))",
+             AND (({keys})[{k}] IS NULL OR (h.row_key, h.id) > (({keys})[{k}], ({ids})[{k}]))",
             on_page(earlier, &at)
+        );
+    }
+    if !higher.is_empty() {
+        let _ = write!(
+            expired,
+            " EXCEPT SELECT p.id, p.row_key FROM page p \
+             WHERE p.id IN (SELECT u.id FROM unnest({held}) AS u(id))"
         );
     }
     format!(
@@ -636,15 +641,16 @@ fn timeout_batch_query(predicate: &str) -> String {
 /// What an earlier lane can still claim in its current sweep (issue #1795).
 ///
 /// A later lane leaves a row to this lane only if this lane can still claim
-/// it. The row is then ahead of the cursor of this lane, or in its queue.
+/// it. The row is then ahead of the cursor of this lane, or held by it.
 struct LaneClaim {
     /// The lane's sweep clock. `None` when its sweep is over, so its next
     /// sweep starts later with a newer clock.
     clock: Option<chrono::DateTime<chrono::Utc>>,
     /// The last row the lane has read. `None` means every row is ahead.
     read_to: Option<(chrono::DateTime<chrono::Utc>, uuid::Uuid)>,
-    /// The ids in the lane's queue, moved list and retry list.
-    queued: Vec<uuid::Uuid>,
+    /// The ids in the lane's queue, moved list and retry list. The lane
+    /// holds them also after its sweep is over.
+    held: Vec<uuid::Uuid>,
 }
 
 impl TimeoutScanLane {
@@ -652,23 +658,19 @@ impl TimeoutScanLane {
     fn claim(&self, limit: usize) -> LaneClaim {
         let (_, _, queued_taken) = self.batch_split(limit);
         let open = self.after.is_some() || self.queued.len() > queued_taken;
-        let over = LaneClaim {
-            clock: None,
-            read_to: None,
-            queued: Vec::new(),
-        };
-        self.as_of.filter(|_| open).map_or(over, |as_of| LaneClaim {
-            clock: Some(as_of),
+        let as_of = self.as_of.filter(|_| open);
+        LaneClaim {
+            clock: as_of,
             // A lane on its last page has read every row of its sweep.
-            read_to: Some(self.after.unwrap_or((as_of, uuid::Uuid::max()))),
-            queued: self
+            read_to: as_of.map(|as_of| self.after.unwrap_or((as_of, uuid::Uuid::max()))),
+            held: self
                 .queued
                 .iter()
                 .chain(&self.moved)
                 .copied()
                 .chain(self.retry.iter().map(|(id, _)| *id))
                 .collect(),
-        })
+        }
     }
 }
 
@@ -885,7 +887,7 @@ async fn refill_lane(
     claims: &[LaneClaim],
     page_rows: i64,
 ) -> HarvestResult<()> {
-    use diesel::sql_types::{Array, BigInt, Integer, Nullable, Timestamptz, Uuid};
+    use diesel::sql_types::{Array, BigInt, Nullable, Timestamptz, Uuid};
 
     let Some(as_of) = lane.as_of else {
         return Ok(());
@@ -893,11 +895,7 @@ async fn refill_lane(
     let clocks: Vec<_> = claims.iter().map(|c| c.clock.unwrap_or(as_of)).collect();
     let keys: Vec<_> = claims.iter().map(|c| c.read_to.map(|r| r.0)).collect();
     let ids: Vec<_> = claims.iter().map(|c| c.read_to.map(|r| r.1)).collect();
-    let (lanes, queued): (Vec<i32>, Vec<uuid::Uuid>) = claims
-        .iter()
-        .zip(1..)
-        .flat_map(|(c, k)| c.queued.iter().map(move |id| (k, *id)))
-        .unzip();
+    let held: Vec<uuid::Uuid> = claims.iter().flat_map(|c| c.held.iter().copied()).collect();
     let refill: Vec<Refill> = match lane.after {
         Some((after_key, after_id)) => {
             diesel::sql_query(timeout_refill_query(predicate, higher, true))
@@ -908,8 +906,7 @@ async fn refill_lane(
                 .bind::<Array<Timestamptz>, _>(&clocks)
                 .bind::<Array<Nullable<Timestamptz>>, _>(&keys)
                 .bind::<Array<Nullable<Uuid>>, _>(&ids)
-                .bind::<Array<Integer>, _>(&lanes)
-                .bind::<Array<Uuid>, _>(&queued)
+                .bind::<Array<Uuid>, _>(&held)
                 .load(conn)
                 .await
         }
@@ -920,8 +917,7 @@ async fn refill_lane(
                 .bind::<Array<Timestamptz>, _>(&clocks)
                 .bind::<Array<Nullable<Timestamptz>>, _>(&keys)
                 .bind::<Array<Nullable<Uuid>>, _>(&ids)
-                .bind::<Array<Integer>, _>(&lanes)
-                .bind::<Array<Uuid>, _>(&queued)
+                .bind::<Array<Uuid>, _>(&held)
                 .load(conn)
                 .await
         }
@@ -6813,13 +6809,43 @@ mod tests {
         let higher = heartbeat_timeout_query();
         let sql = timeout_refill_query(start_to_close_timeout_query(), &[higher], true);
         // The earlier reason is tested at its own lane's clock, and only for
-        // rows that lane can still claim.
+        // rows ahead of that lane's cursor.
         let higher = on_refill_page(higher).replace("NOW()", "($5)[1]");
         assert!(sql.contains(&format!(
             " EXCEPT SELECT h.id, h.row_key FROM ({higher}) h WHERE h.row_key <= ($5)[1] \
-             AND (($6)[1] IS NULL OR (h.row_key, h.id) > (($6)[1], ($7)[1]) \
-             OR h.id IN (SELECT u.id FROM unnest($8, $9) AS u(lane, id) WHERE u.lane = 1))"
+             AND (($6)[1] IS NULL OR (h.row_key, h.id) > (($6)[1], ($7)[1]))"
         )));
+        // A row that an earlier lane holds is left to it, whatever it matches.
+        assert!(sql.contains(
+            " EXCEPT SELECT p.id, p.row_key FROM page p \
+             WHERE p.id IN (SELECT u.id FROM unnest($8) AS u(id))"
+        ));
+        // A first lane has no earlier lane, so it binds no lane params.
+        let first = timeout_refill_query(heartbeat_timeout_query(), &[], true);
+        assert!(!first.contains("$5") && !first.contains("EXCEPT"));
+    }
+
+    #[test]
+    fn a_lane_holds_its_moved_and_retried_rows_after_its_sweep() {
+        let (moved, retried, queued) = (
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+        );
+        let lane = TimeoutScanLane {
+            as_of: Some(chrono::Utc::now()),
+            queued: [queued].into(),
+            retry: vec![(retried, 1)],
+            moved: [moved].into(),
+            ..TimeoutScanLane::default()
+        };
+        // A batch of two takes the retry and the queued row. The moved row
+        // waits, and the sweep is on its last page.
+        let claim = lane.claim(2);
+        assert_eq!(claim.clock, None);
+        // A later lane must still leave each held row to this lane.
+        let held: HashSet<_> = claim.held.into_iter().collect();
+        assert_eq!(held, HashSet::from([moved, retried, queued]));
     }
 
     #[test]
