@@ -3848,8 +3848,8 @@ impl WorkflowContext {
     /// Install the builder-level default activity retry/timeout floor (issue #620).
     ///
     /// Consumed by the LOCAL activity path (`execute_local_activity_with_opts`)
-    /// as the lowest-priority fallback. Both `None` (the default) preserves
-    /// today's behaviour. The regular/DAG activity path resolves the same floor
+    /// as the lowest-priority fallback. `None` sets no floor. The regular/DAG
+    /// activity path resolves the same floor
     /// worker-side in `persist_scheduled_activities`.
     #[must_use]
     pub fn with_activity_defaults(
@@ -6073,7 +6073,7 @@ impl WorkflowContext {
         // so appending the builder default here yields the full precedence
         // (call → activity → builder). A direct `_raw` caller with `None`
         // (e.g. a DAG/raw local dispatch) falls straight through to the builder
-        // default. Both `None` = today's behaviour, byte-for-byte. The
+        // default. `None` sets no floor. The
         // regular/remote path resolves the same floor worker-side via the
         // shared `policy::resolve_effective_*` helpers.
         let retry_policy = retry_policy.or_else(|| self.default_activity_retry_policy.clone());
