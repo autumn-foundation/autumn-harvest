@@ -1456,3 +1456,144 @@ async fn a_row_is_not_left_to_a_lane_that_already_passed_it() {
         "the start-to-close lane must take the row that the heartbeat lane passed"
     );
 }
+
+/// Inserts one live RUNNING row in `queue`.
+///
+/// `heartbeat_late` and `start_late` make the heartbeat and start-to-close
+/// deadlines already passed.
+async fn insert_running_task(
+    conn: &mut AsyncPgConnection,
+    queue: &str,
+    heartbeat_late: bool,
+    start_late: bool,
+) -> uuid::Uuid {
+    let id = uuid::Uuid::new_v4();
+    diesel::sql_query(
+        "INSERT INTO harvest_task_queue \
+         (id, queue_name, task_type, input, state, attempt, max_attempts, \
+          started_at, start_to_close, heartbeat_timeout, last_heartbeat_at) \
+         VALUES ($1, $2, 'activity', '{}'::jsonb, 'RUNNING', 1, 1, \
+                 NOW() - INTERVAL '1 minute', \
+                 CASE WHEN $4 THEN INTERVAL '1 second' ELSE INTERVAL '1 hour' END, \
+                 INTERVAL '1 second', \
+                 CASE WHEN $3 THEN NOW() - INTERVAL '1 minute' ELSE NOW() + INTERVAL '1 hour' END)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(id)
+    .bind::<diesel::sql_types::Text, _>(queue)
+    .bind::<diesel::sql_types::Bool, _>(heartbeat_late)
+    .bind::<diesel::sql_types::Bool, _>(start_late)
+    .execute(conn)
+    .await
+    .expect("insert running task");
+    id
+}
+
+/// A lane keeps its sweep clock until its last queue drains.
+///
+/// The heartbeat lane ends its sweep on a short page with five expired rows.
+/// It cannot read the target again until those five drain. So the
+/// start-to-close lane must not leave the target to it.
+#[tokio::test]
+async fn a_lane_keeps_its_clock_while_its_last_queue_drains() {
+    let (url, _container) = setup_test_db_url().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.expect("connection");
+    let queue = "scanner-lease-drain";
+    diesel::sql_query("DELETE FROM harvest_task_queue WHERE queue_name = $1")
+        .bind::<diesel::sql_types::Text, _>(queue)
+        .execute(&mut conn)
+        .await
+        .expect("clear queue");
+    for _ in 0..5 {
+        insert_running_task(&mut conn, queue, true, false).await;
+    }
+    let target = insert_running_task(&mut conn, queue, false, false).await;
+
+    let mut cursor = TimeoutScanCursor::default();
+    let _ = timeout::find_timed_out_tasks_batch(&mut conn, &mut cursor, 1)
+        .await
+        .expect("batch scan");
+
+    // The target now misses both deadlines, after the heartbeat lane's clock.
+    diesel::sql_query(
+        "UPDATE harvest_task_queue \
+         SET last_heartbeat_at = NOW() - INTERVAL '1 second', \
+             start_to_close = INTERVAL '1 second' \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(target)
+    .execute(&mut conn)
+    .await
+    .expect("expire the target");
+
+    let mut found = false;
+    for _ in 0..3 {
+        let page = timeout::find_timed_out_tasks_batch(&mut conn, &mut cursor, 1)
+            .await
+            .expect("batch scan");
+        found |= page.iter().any(|(t, _)| t.id == target);
+    }
+
+    diesel::sql_query("DELETE FROM harvest_task_queue WHERE queue_name = $1")
+        .bind::<diesel::sql_types::Text, _>(queue)
+        .execute(&mut conn)
+        .await
+        .expect("clear queue");
+    assert!(
+        found,
+        "the start-to-close lane must take the row while the heartbeat queue drains"
+    );
+}
+
+/// A queued row whose reason stops matching goes to a reason that still
+/// matches.
+///
+/// The target is queued for its heartbeat, so the start-to-close lane leaves
+/// it. A heartbeat then arrives before its batch loads. The row is still past
+/// its start-to-close deadline.
+#[tokio::test]
+async fn a_queued_row_whose_reason_lapses_moves_to_one_that_matches() {
+    let (url, _container) = setup_test_db_url().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.expect("connection");
+    let queue = "scanner-lease-lapse";
+    diesel::sql_query("DELETE FROM harvest_task_queue WHERE queue_name = $1")
+        .bind::<diesel::sql_types::Text, _>(queue)
+        .execute(&mut conn)
+        .await
+        .expect("clear queue");
+    // Three start-to-close rows keep that lane from a new sweep.
+    for _ in 0..3 {
+        insert_running_task(&mut conn, queue, false, true).await;
+    }
+    insert_running_task(&mut conn, queue, true, false).await;
+    let target = insert_running_task(&mut conn, queue, true, true).await;
+
+    let mut cursor = TimeoutScanCursor::default();
+    let first = timeout::find_timed_out_tasks_batch(&mut conn, &mut cursor, 1)
+        .await
+        .expect("batch scan");
+    assert!(!first.iter().any(|(t, _)| t.id == target));
+
+    diesel::sql_query("UPDATE harvest_task_queue SET last_heartbeat_at = NOW() WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(target)
+        .execute(&mut conn)
+        .await
+        .expect("heartbeat");
+
+    let second = timeout::find_timed_out_tasks_batch(&mut conn, &mut cursor, 1)
+        .await
+        .expect("batch scan");
+
+    diesel::sql_query("DELETE FROM harvest_task_queue WHERE queue_name = $1")
+        .bind::<diesel::sql_types::Text, _>(queue)
+        .execute(&mut conn)
+        .await
+        .expect("clear queue");
+    assert!(
+        second
+            .iter()
+            .any(|(t, r)| t.id == target && *r == TimeoutReason::StartToClose),
+        "the row must move to start-to-close when its heartbeat comes back"
+    );
+}

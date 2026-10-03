@@ -643,8 +643,8 @@ struct TimeoutScanLane {
     /// The key and id of the last row of the last full page. `None` starts
     /// the sweep from its first row.
     after: Option<(chrono::DateTime<chrono::Utc>, uuid::Uuid)>,
-    /// The database clock when the current sweep started. `None` means no
-    /// sweep is open. Refills read rows created by then, and test expiry
+    /// The database clock when the current sweep started. It stays until the
+    /// next sweep starts. Refills read rows created by then, and test expiry
     /// against it.
     as_of: Option<chrono::DateTime<chrono::Utc>>,
     /// Expired ids from the last refill, not yet handed out.
@@ -719,7 +719,8 @@ impl TimeoutScanLane {
 /// such row that had expired by its clock and still matches. A row created
 /// after the sweep starts, or that expires later, waits for the next sweep.
 /// So new rows cannot stretch a sweep or push an older row out of it. A
-/// queued row that stops matching is dropped when its batch loads.
+/// queued row that stops matching goes to the first other reason that
+/// matches when its batch loads. A row that matches none is dropped.
 ///
 /// Each refill reads at most one page of index entries, and each pass loads
 /// at most one batch. So the work of a pass does not grow with the backlog.
@@ -799,6 +800,7 @@ pub async fn find_timed_out_tasks_batch(
 
     let scans = task_timeout_scans();
     let predicates = scans.clone().map(|(_, predicate)| predicate);
+    let take = usize::try_from(limit).unwrap_or(usize::MAX);
     // The open sweep clock of each lane already done in this pass.
     let mut lane_clocks: Vec<Option<chrono::DateTime<chrono::Utc>>> = Vec::with_capacity(4);
     for (index, (lane, (reason, predicate))) in cursor.lanes.iter_mut().zip(scans).enumerate() {
@@ -846,20 +848,18 @@ pub async fn find_timed_out_tasks_batch(
                 .as_ref()
                 .filter(|r| r.rows_read >= page_rows)
                 .and_then(|r| r.last_key.zip(r.last_id));
-            if lane.after.is_none() {
-                lane.as_of = None;
-            }
             lane.queued
                 .extend(refill.into_iter().flat_map(|r| r.expired));
         }
-        lane_clocks.push(lane.as_of);
+        // The sweep can still claim rows while it has a page to read or a
+        // queue left after this batch. Then later lanes test this reason at
+        // its clock. Otherwise its next sweep starts later, with a newer one.
+        let (_, queued_taken) = lane.batch_split(take);
+        let sweep_open = lane.after.is_some() || lane.queued.len() > queued_taken;
+        lane_clocks.push(lane.as_of.filter(|_| sweep_open));
 
-        // The lane gives up the ids only after the load, so a failed load
-        // loses none.
-        let take = usize::try_from(limit).unwrap_or(usize::MAX);
         let batch = lane.next_batch(take);
         if batch.is_empty() {
-            lane.commit_batch(take);
             continue;
         }
         let page: Vec<TaskQueueItem> = diesel::sql_query(timeout_batch_query(predicate))
@@ -867,14 +867,42 @@ pub async fn find_timed_out_tasks_batch(
             .load(conn)
             .await
             .map_err(crate::error::database_error)?;
-        lane.commit_batch(take);
+        let mut lapsed: Vec<uuid::Uuid> = batch
+            .iter()
+            .filter(|id| !page.iter().any(|task| task.id == **id))
+            .copied()
+            .collect();
         for task in page {
             if seen.insert(task.id) {
                 results.push((task, reason.clone()));
             }
         }
+        // A row whose queued reason stopped matching can match another one
+        // now. The other lanes may have left it to this reason, so try them.
+        for (other, (other_reason, other_predicate)) in task_timeout_scans().into_iter().enumerate()
+        {
+            if other == index || lapsed.is_empty() {
+                continue;
+            }
+            let moved: Vec<TaskQueueItem> = diesel::sql_query(timeout_batch_query(other_predicate))
+                .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&lapsed)
+                .load(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+            lapsed.retain(|id| !moved.iter().any(|task| task.id == *id));
+            for task in moved {
+                if seen.insert(task.id) {
+                    results.push((task, other_reason.clone()));
+                }
+            }
+        }
     }
 
+    // The lanes give up their ids only after every load succeeds. So a
+    // failed load loses no id, in this lane or an earlier one.
+    for lane in &mut cursor.lanes {
+        lane.commit_batch(take);
+    }
     Ok(results)
 }
 

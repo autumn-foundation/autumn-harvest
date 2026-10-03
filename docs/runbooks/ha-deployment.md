@@ -232,8 +232,10 @@ terminal rows.
 A row that matches two reasons gets the first one, in the order above, if
 that reason's sweep can still claim it. Each lane has its own sweep clock.
 If the earlier lane has already passed the row, the later reason takes it.
-So the row does not wait for a whole sweep. A queued row keeps its reason,
-also when an earlier reason starts to match later.
+So the row does not wait for a whole sweep. A lane keeps its clock until
+the last queue of its sweep drains. A queued row keeps its reason, also when
+an earlier reason starts to match later. If its reason stops matching before
+it loads, it goes to the first other reason that still matches.
 
 A row that fails to enforce is tried again first in the next batch, for at
 most three passes in a row. Retried and queued rows share the batch limit.
