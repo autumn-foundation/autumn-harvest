@@ -744,13 +744,16 @@ impl<'a> Stmts<'a> {
         let mut starts = Vec::with_capacity(toks.len());
         let mut start = 0;
         for k in 0..toks.len() {
+            // `BEGIN`, `THEN`, `ELSE` and `LOOP` open a statement only inside a
+            // PL/pgSQL body. At top level they belong to SQL, such as `CASE`.
             let boundary = k == 0
                 || toks[k].depth != toks[k - 1].depth
                 || toks[k - 1].tok == Tok::Punct(';')
-                || matches!(
-                    &toks[k - 1].tok,
-                    Tok::Word(w) if ["begin", "then", "else", "loop"].contains(&w.as_str())
-                );
+                || (toks[k].depth > 0
+                    && matches!(
+                        &toks[k - 1].tok,
+                        Tok::Word(w) if ["begin", "then", "else", "loop"].contains(&w.as_str())
+                    ));
             if boundary {
                 start = k;
             }
@@ -1089,14 +1092,19 @@ fn resolve(
         let table = raw
             .table
             .or_else(|| raw.index.as_deref().and_then(|i| history.index_table(i)));
-        // Learn an index only from a build that surely runs. The history only
-        // grows, so a later build of the same name cannot hide a hot table.
-        // A build with `IF NOT EXISTS` may have done nothing.
-        // `IF NOT EXISTS` may have skipped the build, so it teaches nothing.
+        // The history only grows, so a later build of the same name cannot
+        // hide a hot table. A cold table is learnt only from a build that
+        // surely runs: not conditional, and not `IF NOT EXISTS`, which may do
+        // nothing. A hot table is always learnt, because it can only make a
+        // later drop stricter.
         let sure =
             toks[raw.at].runs && unconditional[raw.at] && !s.has_pair(raw.at, "not", "exists");
+        let learn = sure
+            || table
+                .as_deref()
+                .is_some_and(|t| HOT_TABLES.contains(&base(t)));
         if let (Some(index), Some(table), "CREATE INDEX", true) =
-            (&raw.index, &table, raw.verb, sure)
+            (&raw.index, &table, raw.verb, learn)
         {
             history
                 .indexes
@@ -1691,23 +1699,34 @@ fn read_migration(tree: &'static str, dir: &Path) -> OnDisk {
 
 /// Lint every migration on disk, each against the history before it.
 ///
-/// The app tree targets its own database, so it keeps its own history.
+/// Migrations run in the order their database applies them. On a dedicated
+/// Harvest database, every core migration runs before any plugin one. The
+/// app tree targets its own database, so it keeps its own history.
 fn lint_all(migrations: &[OnDisk]) -> Vec<Vec<Finding>> {
+    let rank = |m: &OnDisk| match m.tree {
+        "autumn-harvest/migrations" => 0,
+        APP_TREE => 2,
+        _ => 1,
+    };
+    let mut order: Vec<usize> = (0..migrations.len()).collect();
+    order.sort_by(|&a, &b| {
+        let (a, b) = (&migrations[a], &migrations[b]);
+        (rank(a), &a.name).cmp(&(rank(b), &b.name))
+    });
     let mut harvest = History::default();
     let mut app = History::default();
-    migrations
-        .iter()
-        .map(|m| {
-            let history = if m.tree == APP_TREE {
-                &mut app
-            } else {
-                &mut harvest
-            };
-            let findings = lint(&m.sql, m.run_in_transaction, history);
-            analyse(&m.sql, history);
-            findings
-        })
-        .collect()
+    let mut out = vec![Vec::new(); migrations.len()];
+    for i in order {
+        let m = &migrations[i];
+        let history = if m.tree == APP_TREE {
+            &mut app
+        } else {
+            &mut harvest
+        };
+        out[i] = lint(&m.sql, m.run_in_transaction, history);
+        analyse(&m.sql, history);
+    }
+    out
 }
 
 fn grandfathered(name: &str, rule: Rule) -> bool {
@@ -2764,6 +2783,48 @@ fn if_not_and_if_exists_branches_are_conditional() {
             "{cond}: {findings:?}"
         );
     }
+}
+
+#[test]
+fn core_migrations_never_learn_from_plugin_migrations() {
+    // Core runs first on a dedicated database, so an older plugin index has
+    // not run yet when a core migration drops a same-named index.
+    let plugin = OnDisk {
+        tree: "autumn-harvest-plugin/migrations/harvest",
+        name: "20260101000000_plugin".to_string(),
+        sql: "CREATE INDEX idx_shared ON harvest_schedules (id);".to_string(),
+        run_in_transaction: true,
+    };
+    let core = OnDisk {
+        tree: "autumn-harvest/migrations",
+        name: "20260102000000_core".to_string(),
+        sql: "SET LOCAL lock_timeout = '5s';\nDROP INDEX idx_shared;".to_string(),
+        run_in_transaction: true,
+    };
+    let all = lint_all(&[plugin, core]);
+    assert_eq!(rules(&all[1]), [Rule::BlockingIndex], "{all:?}");
+}
+
+#[test]
+fn a_case_expression_does_not_split_a_statement() {
+    let sql = "SET LOCAL lock_timeout = '5s';\n\
+               ALTER TABLE harvest_events ADD CHECK (CASE WHEN x THEN true ELSE false END), \
+               ADD UNIQUE (event_id);";
+    let findings = lint_with_history(&[], sql, true);
+    assert_eq!(rules(&findings), [Rule::BlockingIndex], "{findings:?}");
+}
+
+#[test]
+fn a_guarded_build_on_a_hot_table_still_teaches_the_hot_table() {
+    let history = [
+        "CREATE INDEX idx_shared ON harvest_schedules (id);\nDROP INDEX idx_shared;",
+        "SET LOCAL lock_timeout = '5s';\n\
+         -- lock-safety: allow blocking-index #1810 a reviewed reason\n\
+         CREATE INDEX IF NOT EXISTS idx_shared ON harvest_events (id);",
+    ];
+    let sql = "SET LOCAL lock_timeout = '5s';\nDROP INDEX idx_shared;";
+    let findings = lint_with_history(&history, sql, true);
+    assert_eq!(rules(&findings), [Rule::BlockingIndex], "{findings:?}");
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────
