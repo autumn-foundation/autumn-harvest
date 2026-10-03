@@ -42,6 +42,10 @@ Design decisions:
   event-id bound, so a concurrent append is never counted twice. A cold
   decision reads the sum from its full history load, so it scans no extra
   rows.
+- A codec rotation rewrites rows in place and can change their size, so a
+  warm mark can drift. Every 64 warm decisions the worker sums the full
+  history again. An incremental sum at or above the cap never fails a run
+  alone: the worker sums the full history first.
 - A failed byte measure skips the byte check for that decision only. It
   logs a warning and does not fail the task.
 - The history-bloat `COUNT(*)` now runs only when the in-memory prospective
@@ -83,6 +87,8 @@ against Postgres:
 - A signal loop reaches a 64 KiB cap on the warm path and on the cold path.
   The reason carries exactly the stored bytes. Small signals in between
   prove the sum does not double-count.
+- A stale warm mark at or above the cap does not fail a run whose stored
+  bytes are below it.
 - A run over the byte cap runs no inline local activity.
 - A run over the byte cap can still `continue_as_new`.
 - Explicit `unlimited` caps keep a run past 50,000 events and 50 MiB alive.

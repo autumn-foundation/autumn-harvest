@@ -56,6 +56,9 @@ pub(crate) struct HistoryBytesMark {
     pub(crate) bytes: u64,
     /// First event id that `bytes` does not include.
     pub(crate) through: i32,
+    /// Incremental sums since the last full sum. The worker re-sums the
+    /// full history when this reaches its interval.
+    pub(crate) warm_steps: u32,
 }
 
 /// One cache slot: the replay snapshot and its optional byte mark.
@@ -312,6 +315,7 @@ mod tests {
         let mark = HistoryBytesMark {
             bytes: 1_234,
             through: 7,
+            warm_steps: 0,
         };
 
         cache.insert_with_history_bytes(id, make_state(7), mark);

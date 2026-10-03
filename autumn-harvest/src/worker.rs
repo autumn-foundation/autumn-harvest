@@ -21112,20 +21112,47 @@ const fn history_bytes_breach(
     }
 }
 
+/// Warm decisions between two full sums of the stored history bytes
+/// (issue #1804).
+///
+/// A codec rotation rewrites stored rows in place and can change their size.
+/// An incremental mark can then drift. A full sum at this interval bounds how
+/// long an undercount lasts. It costs one full sum per 64 warm decisions.
+const HISTORY_BYTES_FULL_SUM_INTERVAL: u32 = 64;
+
+/// The cached mark to extend with an incremental sum, or `None` when the
+/// decision must sum the full history (issue #1804).
+fn incremental_history_bytes_base(
+    cached: Option<crate::cache::HistoryBytesMark>,
+    through: i32,
+) -> Option<crate::cache::HistoryBytesMark> {
+    cached
+        .filter(|mark| mark.through <= through && mark.warm_steps < HISTORY_BYTES_FULL_SUM_INTERVAL)
+}
+
 /// Stored history bytes below `prepared.next_event_id` (issue #1804).
 ///
 /// A cold decision reuses the sum from its full load. A warm decision adds
 /// only the events at or after the cached mark. A codec rotation can change
-/// stored sizes in place, so a mark can drift until the cache evicts its
-/// entry.
+/// stored sizes in place, so a mark can drift. Two rules bound the drift:
+///
+/// - Every [`HISTORY_BYTES_FULL_SUM_INTERVAL`] warm decisions, the worker
+///   sums the full history again.
+/// - An incremental sum at or above `cap` never fails a run alone. The worker
+///   sums the full history first, so a stale overcount cannot fail a run.
 async fn measure_history_bytes(
     conn: &mut AsyncPgConnection,
     workflow_cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
     prepared: &PreparedWorkflowTask,
+    cap: u64,
 ) -> HarvestResult<crate::cache::HistoryBytesMark> {
     let through = prepared.next_event_id;
     if let Some(bytes) = prepared.cold_history_bytes {
-        return Ok(crate::cache::HistoryBytesMark { bytes, through });
+        return Ok(crate::cache::HistoryBytesMark {
+            bytes,
+            through,
+            warm_steps: 0,
+        });
     }
     let cached = if prepared.was_cache_hit {
         workflow_cache
@@ -21135,18 +21162,23 @@ async fn measure_history_bytes(
     } else {
         None
     };
-    let base =
-        cached
-            .filter(|mark| mark.through <= through)
-            .unwrap_or(crate::cache::HistoryBytesMark {
-                bytes: 0,
-                through: 0,
+    if let Some(base) = incremental_history_bytes_base(cached, through) {
+        let delta =
+            store::sum_history_bytes_between(conn, prepared.exec_id, base.through, through).await?;
+        let bytes = base.bytes.saturating_add(delta);
+        if bytes < cap {
+            return Ok(crate::cache::HistoryBytesMark {
+                bytes,
+                through,
+                warm_steps: base.warm_steps.saturating_add(1),
             });
-    let delta =
-        store::sum_history_bytes_between(conn, prepared.exec_id, base.through, through).await?;
+        }
+    }
+    let bytes = store::sum_history_bytes_between(conn, prepared.exec_id, 0, through).await?;
     Ok(crate::cache::HistoryBytesMark {
-        bytes: base.bytes.saturating_add(delta),
+        bytes,
         through,
+        warm_steps: 0,
     })
 }
 
@@ -21269,8 +21301,8 @@ async fn process_workflow_task(
     // Issue #1804: stored history bytes at the start of this decision. The
     // byte cap stops inline local activities and the hard-cap preflight below.
     // A failed measure skips the byte check for this decision only.
-    let history_bytes = if registry.history_policy().byte_hard_cap().is_some() {
-        match measure_history_bytes(conn, &workflow_cache, &prepared).await {
+    let history_bytes = if let Some(cap) = registry.history_policy().byte_hard_cap() {
+        match measure_history_bytes(conn, &workflow_cache, &prepared, cap).await {
             Ok(mark) => Some(mark),
             Err(error) => {
                 tracing::warn!(
@@ -33482,7 +33514,13 @@ mod tests {
     #[test]
     fn history_bytes_breach_fires_at_and_above_the_cap() {
         use crate::cache::HistoryBytesMark;
-        let mark = |bytes| Some(HistoryBytesMark { bytes, through: 3 });
+        let mark = |bytes| {
+            Some(HistoryBytesMark {
+                bytes,
+                through: 3,
+                warm_steps: 0,
+            })
+        };
         assert_eq!(history_bytes_breach(Some(100), mark(99)), None);
         assert_eq!(
             history_bytes_breach(Some(100), mark(100)),
@@ -33493,6 +33531,34 @@ mod tests {
         );
         assert_eq!(history_bytes_breach(None, mark(u64::MAX)), None);
         assert_eq!(history_bytes_breach(Some(0), None), None);
+    }
+
+    #[test]
+    fn incremental_history_bytes_base_falls_back_to_a_full_sum() {
+        use crate::cache::HistoryBytesMark;
+        let mark = |through, warm_steps| HistoryBytesMark {
+            bytes: 10,
+            through,
+            warm_steps,
+        };
+        // No mark: full sum.
+        assert_eq!(incremental_history_bytes_base(None, 5), None);
+        // A fresh mark below `through`: extend it.
+        assert_eq!(
+            incremental_history_bytes_base(Some(mark(3, 0)), 5),
+            Some(mark(3, 0))
+        );
+        // A mark past `through` cannot be extended.
+        assert_eq!(incremental_history_bytes_base(Some(mark(6, 0)), 5), None);
+        // A mark at the interval forces a full sum.
+        assert_eq!(
+            incremental_history_bytes_base(Some(mark(3, HISTORY_BYTES_FULL_SUM_INTERVAL - 1)), 5),
+            Some(mark(3, HISTORY_BYTES_FULL_SUM_INTERVAL - 1))
+        );
+        assert_eq!(
+            incremental_history_bytes_base(Some(mark(3, HISTORY_BYTES_FULL_SUM_INTERVAL)), 5),
+            None
+        );
     }
 
     #[test]

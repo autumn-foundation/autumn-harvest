@@ -944,6 +944,69 @@ async fn byte_cap_lets_a_run_continue_as_new() {
     assert!(dead_letter_reason(&mut conn, exec_id).await.is_none());
 }
 
+/// A codec rotation rewrites stored rows in place and can change their size.
+/// The warm cache then holds a stale byte mark. A stale mark at or above the
+/// cap must not fail the run: the worker re-sums the full history first.
+///
+/// The test shrinks an old row in place to stand in for the rotation sweep.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn byte_cap_rechecks_a_stale_warm_mark_before_failing() {
+    const CAP: u64 = 64 * 1024;
+    let (database_url, _container) = setup_db().await;
+    let mut conn = AsyncPgConnection::establish(&database_url)
+        .await
+        .expect("connect");
+
+    let exec_id = seed_execution(&mut conn, GROWER).await;
+    enqueue_workflow_task(&mut conn, exec_id).await;
+
+    let metrics = Arc::new(RecordingMetrics::default());
+    let policy = WorkflowHistoryPolicy::default().with_byte_hard_cap(CAP);
+    let worker = build_worker(
+        "history-byte-cap-stale-mark",
+        registry(policy, Arc::clone(&metrics)),
+        WARM,
+    );
+    let running = RunningWorker::start(&database_url, worker);
+    wait_for_idle(&mut conn, exec_id).await;
+
+    // The warm mark now counts about 40 KiB for this signal.
+    send_grow(&mut conn, exec_id, incompressible_payload(40 * 1024), 1).await;
+
+    // Shrink that row in place, as a rotation sweep could.
+    let small = serde_json::to_value(WorkflowEvent::SignalReceived {
+        signal_name: "grow".into(),
+        payload: serde_json::json!({}),
+    })
+    .expect("serialize small signal");
+    diesel::sql_query(
+        "UPDATE harvest_events SET event_data = $2 \
+         WHERE workflow_exec_id = $1 AND event_type = 'SignalReceived'",
+    )
+    .bind::<SqlUuid, _>(exec_id.as_uuid())
+    .bind::<Jsonb, _>(small)
+    .execute(&mut conn)
+    .await
+    .expect("shrink the stored signal");
+
+    // Stale mark: about 40 + 30 = 70 KiB. True stored bytes: about 30 KiB.
+    send_grow(&mut conn, exec_id, incompressible_payload(30 * 1024), 2).await;
+    let execution = load_execution(&database_url, exec_id).await;
+    running.stop().await;
+
+    assert!(
+        metrics.hits() >= 1,
+        "the second decision must take the warm cache path"
+    );
+    assert_eq!(
+        execution.state, "RUNNING",
+        "a stale mark must not fail a run whose stored bytes are below the cap; \
+         error={:?}",
+        execution.error
+    );
+    assert!(dead_letter_reason(&mut conn, exec_id).await.is_none());
+}
+
 // ---------------------------------------------------------------------------
 // Unlimited
 // ---------------------------------------------------------------------------
