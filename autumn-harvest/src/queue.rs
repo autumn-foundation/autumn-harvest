@@ -2965,6 +2965,10 @@ pub async fn defer_claimed_retry_for_budget(
 /// `error`, `crash_strikes` and the capability-miss counters. A task that
 /// never started says nothing about them.
 ///
+/// The release also clears a sticky pin, as [`release_worker_sticky_pins`]
+/// does. A pin to the draining worker would hold the row back from its
+/// peers. A session row keeps its pin.
+///
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] on update failure.
@@ -2973,6 +2977,8 @@ pub async fn release_unstarted_claim(
     claim: &TaskClaim,
 ) -> HarvestResult<ClaimWrite> {
     use crate::schema::harvest_task_queue::dsl;
+    use diesel::dsl::sql;
+    use diesel::sql_types::{Integer, Interval, Nullable, Text, Timestamptz};
 
     let update = diesel::update(
         dsl::harvest_task_queue
@@ -2985,8 +2991,15 @@ pub async fn release_unstarted_claim(
         dsl::started_at.eq(None::<DateTime<Utc>>),
         dsl::last_heartbeat_at.eq(None::<DateTime<Utc>>),
         // Undo the claim-time attempt increment. The task did not run.
-        dsl::attempt.eq(diesel::dsl::sql::<diesel::sql_types::Integer>(
-            "GREATEST(attempt - 1, 0)",
+        dsl::attempt.eq(sql::<Integer>("GREATEST(attempt - 1, 0)")),
+        dsl::sticky_worker_id.eq(sql::<Nullable<Text>>(
+            "CASE WHEN session_id IS NULL THEN NULL ELSE sticky_worker_id END",
+        )),
+        dsl::sticky_until.eq(sql::<Nullable<Timestamptz>>(
+            "CASE WHEN session_id IS NULL THEN NULL ELSE sticky_until END",
+        )),
+        dsl::sticky_timeout.eq(sql::<Nullable<Interval>>(
+            "CASE WHEN session_id IS NULL THEN NULL ELSE sticky_timeout END",
         )),
     ))
     .into_boxed();

@@ -799,9 +799,9 @@ On SIGTERM/SIGINT, or on a remote drain (issue #1813):
 1. Stop claiming tasks.
 2. Release each claimed task that has not started. It is `PENDING` again at once, with its `attempt` restored.
 3. Wait for in-flight tasks to complete, up to `shutdown_timeout` (default: 25 seconds) or the remote drain deadline.
-4. One join window before the deadline, cancel running activities. The join window is `cancellation_grace_period`, capped at half the drain.
-5. Release the claim of each cancelled activity whose handler returns. The row is `PENDING` again with the error `worker shutdown`, so a peer retries it at once.
-6. At the deadline, stop waiting. A handler that ignored the cancel keeps its claim. The claim-epoch fence (#1789) and the lease recover it.
+4. One join window before the deadline, cancel running activities. The join window is `cancellation_grace_period`, capped at half the drain. Running workflow tasks are not cancelled. `workflow_task_timeout` bounds them.
+5. Release the claim of each cancelled activity whose handler returns a retryable error. The row is `PENDING` again with an error that starts with `worker shutdown:`, so a peer retries it at once.
+6. At the deadline, stop waiting. A handler that ignored the cancel keeps its claim. The claim-epoch fence (#1789) rejects its stale writes. Orphan reclaim requeues the task once the worker stops heartbeating.
 
 A claim is released only when no handler for it can still run. Keep `shutdown_timeout` at least 5 seconds below the platform grace period, for example Kubernetes `terminationGracePeriodSeconds` (default: 30 seconds).
 

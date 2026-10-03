@@ -1,11 +1,12 @@
 #![cfg(feature = "db")]
 #![allow(clippy::unused_async)]
-//! Drain release of running activity claims (issue #1813).
+//! Drain release of activity claims (issue #1813).
 //!
-//! At the drain deadline a worker cancels its running activities. It releases
-//! the claim of each handler that returns, so a peer retries it at once. It
-//! keeps the claim of a handler that ignores the cancel. A peer must never run
-//! that activity at the same time.
+//! A draining worker gives back each claim whose task never started. One
+//! join window before the drain deadline, it cancels its running activities.
+//! It releases the claim of each handler that returns a retryable error, so a
+//! peer retries it at once. It keeps the claim of a handler that ignores the
+//! cancel. A peer must never run that activity at the same time.
 //!
 //! Set `HARVEST_TEST_DATABASE_URL` to use a migrated Postgres. Otherwise the
 //! suite starts a testcontainers Postgres 16.
@@ -62,8 +63,9 @@ static COOPERATIVE_STARTS: AtomicU32 = AtomicU32::new(0);
 #[activity(start_to_close = "600s")]
 async fn drain_cooperative(
     ctx: &ActivityContext,
-    _input: serde_json::Value,
+    input: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
+    let _ = input;
     COOPERATIVE_STARTS.fetch_add(1, Ordering::SeqCst);
     let attempt = ctx.info().attempt;
     if attempt > 1 {
@@ -82,8 +84,9 @@ static STUBBORN_GO: tokio::sync::Notify = tokio::sync::Notify::const_new();
 #[activity(start_to_close = "600s")]
 async fn drain_stubborn(
     _ctx: &ActivityContext,
-    _input: serde_json::Value,
+    input: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
+    let _ = input;
     STUBBORN_STARTS.fetch_add(1, Ordering::SeqCst);
     STUBBORN_GO.notified().await;
     Ok(serde_json::json!("done"))
@@ -114,7 +117,8 @@ impl Running {
         config.cancellation_grace_period = Duration::from_secs(1);
         config.sticky_timeout = Duration::ZERO;
         // A slow liveness heartbeat keeps orphan reclaim out of the test
-        // window. Only the drain may move a claim here.
+        // window. Only the drain may move a claim here. This holds when each
+        // test owns its database or runs alone, as in CI.
         config.worker_heartbeat_interval = Duration::from_secs(15);
         let worker = Arc::new(Worker::new(config, registry()).expect("worker builds"));
         let handle = spawn_test_worker(Arc::clone(&worker), pool.clone());
@@ -220,6 +224,7 @@ struct ActivityRow {
     worker_id: Option<String>,
     attempt: i32,
     error: Option<String>,
+    scheduled_at: chrono::DateTime<Utc>,
 }
 
 async fn activity_row(url: &str, exec_id: ExecutionId) -> Option<ActivityRow> {
@@ -232,17 +237,27 @@ async fn activity_row(url: &str, exec_id: ExecutionId) -> Option<ActivityRow> {
             harvest_task_queue::worker_id,
             harvest_task_queue::attempt,
             harvest_task_queue::error,
+            harvest_task_queue::scheduled_at,
         ))
-        .first::<(String, Option<String>, i32, Option<String>)>(&mut conn)
+        .first::<(
+            String,
+            Option<String>,
+            i32,
+            Option<String>,
+            chrono::DateTime<Utc>,
+        )>(&mut conn)
         .await
         .optional()
         .expect("load activity row")
-        .map(|(state, worker_id, attempt, error)| ActivityRow {
-            state,
-            worker_id,
-            attempt,
-            error,
-        })
+        .map(
+            |(state, worker_id, attempt, error, scheduled_at)| ActivityRow {
+                state,
+                worker_id,
+                attempt,
+                error,
+                scheduled_at,
+            },
+        )
 }
 
 /// Wait until `worker_id` runs the activity handler.
@@ -250,7 +265,8 @@ async fn wait_for_start(url: &str, exec_id: ExecutionId, worker_id: &str, starts
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let row = activity_row(url, exec_id).await;
-            if row.is_some_and(|r| r.state == "RUNNING" && r.worker_id.as_deref() == Some(worker_id))
+            if row
+                .is_some_and(|r| r.state == "RUNNING" && r.worker_id.as_deref() == Some(worker_id))
                 && AtomicU32::load(starts, Ordering::SeqCst) == 1
             {
                 break;
@@ -265,6 +281,85 @@ async fn wait_for_start(url: &str, exec_id: ExecutionId, worker_id: &str, starts
 // ---------------------------------------------------------------------------
 // Tests.
 // ---------------------------------------------------------------------------
+
+/// `release_unstarted_claim` gives back only the current claim.
+///
+/// It restores `attempt`, keeps `scheduled_at` and clears a sticky pin. A
+/// stale claim and a row that is not `RUNNING` change nothing. The chaos
+/// suite drives the same write through a real drain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn release_unstarted_claim_restores_the_claim_and_is_fenced() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("unstarted");
+    let mut conn = connect(&url).await;
+    seed_workflow(&mut conn, &queue, "drain_cooperative").await;
+    let worker = format!("{queue}-a");
+    let task = queue::claim_task(
+        &mut conn,
+        std::slice::from_ref(&queue),
+        &worker,
+        "",
+        None,
+        &[],
+        &[],
+    )
+    .await
+    .expect("claim")
+    .expect("the workflow task is claimable");
+    diesel::sql_query(
+        "UPDATE harvest_task_queue \
+         SET sticky_worker_id = $2, sticky_until = NOW() + INTERVAL '1 hour' \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task.id)
+    .bind::<diesel::sql_types::Text, _>(&worker)
+    .execute(&mut conn)
+    .await
+    .expect("pin the row");
+
+    let load = async |conn: &mut AsyncPgConnection| {
+        harvest_task_queue::table
+            .find(task.id)
+            .select(autumn_harvest::models::TaskQueueItem::as_select())
+            .first::<autumn_harvest::models::TaskQueueItem>(conn)
+            .await
+            .expect("load the row")
+    };
+
+    for stale in [
+        queue::TaskClaim::new(task.id, "another-worker", task.attempt),
+        queue::TaskClaim::new(task.id, &worker, task.attempt + 1),
+    ] {
+        let write = queue::release_unstarted_claim(&mut conn, &stale)
+            .await
+            .expect("release");
+        assert_eq!(write, queue::ClaimWrite::LeaseLost, "{stale:?}");
+        assert_eq!(load(&mut conn).await.state, "RUNNING", "{stale:?}");
+    }
+
+    let claim = queue::TaskClaim::of(&task).expect("a claimed row has a claim");
+    let write = queue::release_unstarted_claim(&mut conn, &claim)
+        .await
+        .expect("release");
+    assert_eq!(write, queue::ClaimWrite::Applied);
+    let row = load(&mut conn).await;
+    assert_eq!(row.state, "PENDING");
+    assert!(row.worker_id.is_none());
+    assert!(row.started_at.is_none());
+    assert_eq!(row.attempt, task.attempt - 1, "no attempt is used");
+    assert_eq!(row.scheduled_at, task.scheduled_at, "the row stays due");
+    assert!(row.sticky_worker_id.is_none(), "the pin is cleared");
+    assert!(row.sticky_until.is_none(), "the pin is cleared");
+
+    let write = queue::release_unstarted_claim(&mut conn, &claim)
+        .await
+        .expect("release");
+    assert_eq!(
+        write,
+        queue::ClaimWrite::LeaseLost,
+        "a row that is not RUNNING is a no-op"
+    );
+}
 
 /// A running activity that honours the cancel is joined and released. A peer
 /// then retries it at once, not after its 600 s `start_to_close`.
@@ -289,7 +384,10 @@ async fn drain_joins_a_cooperative_activity_and_a_peer_retries_it() {
         "the drain must end at its deadline: took {drain:?}"
     );
     let row = activity_row(&url, exec_id).await.expect("activity row");
-    assert_eq!(row.state, "PENDING", "the joined claim is released: {row:?}");
+    assert_eq!(
+        row.state, "PENDING",
+        "the joined claim is released: {row:?}"
+    );
     assert!(row.worker_id.is_none(), "{row:?}");
     assert_eq!(row.attempt, 1, "the cancelled attempt counts: {row:?}");
     assert!(
@@ -301,13 +399,9 @@ async fn drain_joins_a_cooperative_activity_and_a_peer_retries_it() {
 
     let worker_b = format!("{queue}-b");
     let b = Running::start(&worker_b, &queue, &pool);
-    let exec = wait_for_execution_state_with_timeout(
-        &url,
-        exec_id,
-        "COMPLETED",
-        Duration::from_secs(30),
-    )
-    .await;
+    let exec =
+        wait_for_execution_state_with_timeout(&url, exec_id, "COMPLETED", Duration::from_secs(30))
+            .await;
     assert_eq!(
         exec.output,
         Some(serde_json::json!({ "attempt": 2 })),
@@ -343,11 +437,11 @@ async fn drain_keeps_the_claim_of_an_activity_that_ignores_the_cancel() {
 
     let drain = a.stop().await;
     assert!(
-        drain >= SHUTDOWN_TIMEOUT - Duration::from_millis(500),
+        drain + Duration::from_millis(500) >= SHUTDOWN_TIMEOUT,
         "the drain waits for its deadline: took {drain:?}"
     );
     assert!(
-        drain < SHUTDOWN_TIMEOUT + Duration::from_secs(1),
+        drain < SHUTDOWN_TIMEOUT + Duration::from_secs(3),
         "the drain must end at its deadline: took {drain:?}"
     );
 

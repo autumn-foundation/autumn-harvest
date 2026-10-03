@@ -3584,8 +3584,8 @@ pub struct WorkerConfig {
     /// or call [`crate::context::ActivityContext::heartbeat`], but an uncooperative handler must
     /// not block a worker slot indefinitely.
     ///
-    /// It is also the drain's join window (issue #1813). See
-    /// [`Self::shutdown_timeout`].
+    /// It is also the drain's join window (issue #1813). A drain never aborts
+    /// the handler. See [`Self::shutdown_timeout`].
     pub cancellation_grace_period: Duration,
     /// Shards this worker is responsible for polling.
     ///
@@ -4194,8 +4194,8 @@ impl WorkerConfig {
     /// running at the end of the grace period the worker aborts the handler
     /// task and marks the activity as cancelled.
     ///
-    /// It also sets the drain's join window. See
-    /// [`WorkerConfig::shutdown_timeout`].
+    /// It also sets the drain's join window. A drain never aborts the
+    /// handler. See [`WorkerConfig::shutdown_timeout`].
     #[must_use]
     pub const fn with_cancellation_grace_period(mut self, grace_period: Duration) -> Self {
         self.cancellation_grace_period = grace_period;

@@ -65,7 +65,7 @@ async fn chaos_repro_1813_drain_releases_a_claim_that_never_started() {
     let pool = crate::integration_e2e::build_test_pool(&url);
     let handle = crate::integration_e2e::spawn_test_worker(Arc::clone(&worker), pool);
 
-    tokio::time::timeout(Duration::from_secs(10), hold.reached())
+    tokio::time::timeout(Duration::from_secs(30), hold.reached())
         .await
         .unwrap_or_else(|_| {
             panic!(

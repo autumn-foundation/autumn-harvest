@@ -276,7 +276,7 @@ harvest worker health                     # rollup: active / draining / stale
 When you need to roll a node — deploy, autoscale-down, drain a host before
 maintenance — request a remote drain instead of sending `SIGTERM`. The
 worker stops claiming new tasks within two heartbeat intervals and finishes
-its in-flight work before exiting:
+or gives back its in-flight work before exiting:
 
 ```bash
 # Dry run first: who would be affected, what's in-flight, on which shards.
@@ -310,16 +310,24 @@ A `SIGTERM` and a remote drain run the same drain (issue #1813):
 
 1. The worker stops claiming tasks.
 2. It gives back each claimed task that has not started. The task is
-   `PENDING` again at once and keeps its attempt count.
+   `PENDING` again at once and does not use an attempt.
 3. It lets running tasks finish.
 4. One join window before the deadline, it cancels running activities. The
    join window is `cancellation_grace_period`, capped at half the drain.
-5. It gives back the claim of each cancelled activity whose handler returns.
-   A peer retries it at once. The cancelled attempt counts toward
-   `max_attempts`, but the release itself never fails the activity.
+   Running workflow tasks are not cancelled. `workflow_task_timeout` bounds
+   them.
+5. It gives back the claim of each cancelled activity whose handler returns
+   a retryable error. A peer retries it at once. The cancelled attempt
+   raises `attempt`, and the peer runs the next attempt even past
+   `max_attempts`. A handler that returns `Ok` completes as usual. A
+   non-retryable error fails the activity as usual.
 6. At the deadline it stops waiting. A handler that ignored the cancel keeps
-   its claim. The claim fence and the lease then recover the task, so no
-   peer runs it at the same time.
+   its claim, so no peer takes the task while the worker lives. The claim
+   fence (#1789) rejects its stale writes. Orphan reclaim recovers the task
+   after the worker stops heartbeating.
+
+A cancel cannot be undone. A later remote deadline does not give the
+activities back.
 
 The deadline is `WorkerConfig::shutdown_timeout`, or the remote drain
 deadline. The default is 25 s. Keep `shutdown_timeout` at least 5 s below

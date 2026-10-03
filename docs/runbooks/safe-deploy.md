@@ -56,9 +56,9 @@ Drain a specific worker:
 harvest worker drain <worker-id>
 ```
 
-The server sets the worker's status to `Draining`. The worker will finish its
-current tasks and then transition to `Stopped` within one heartbeat interval
-(default: 5 s) after quiescing.
+The server sets the worker's status to `Draining`. The worker finishes or
+gives back its current tasks. It then transitions to `Stopped` within one
+heartbeat interval (default: 5 s) after quiescing.
 
 To specify an explicit deadline (RFC 3339):
 
@@ -69,8 +69,9 @@ harvest worker drain <worker-id> --deadline 2026-05-09T14:30:00Z
 When `--deadline` is omitted the server uses the configured
 `WorkerConfig::shutdown_timeout` (default 25 s from the current time).
 
-At the deadline the worker cancels its running activities and releases the
-claim of each one that stops. See
+One join window before the deadline, the worker cancels its running
+activities. It releases the claim of each one whose handler returns a
+retryable error. A handler that ignores the cancel keeps its claim. See
 [What a drain does with its claims](../getting-started/10-operations.md#what-a-drain-does-with-its-claims).
 
 ### Drain outcome codes

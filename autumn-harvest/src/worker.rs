@@ -15087,28 +15087,28 @@ async fn defer_retry_for_budget(
     Ok(write == queue::ClaimWrite::Applied)
 }
 
-/// The error a drain-released activity carries into its next attempt
-/// (issue #1813). `ActivityContext::previous_failure` reports it.
-const WORKER_SHUTDOWN_ERROR: &str = "worker shutdown: the drain cancelled the activity";
+/// The prefix of the error a drain-released activity carries into its next
+/// attempt (issue #1813). `ActivityContext::previous_failure` reports it.
+const WORKER_SHUTDOWN_ERROR: &str = "worker shutdown";
 
 /// Requeue an activity whose handler the drain cancelled and joined (issue
 /// #1813).
 ///
 /// The retry is due at once. The attempt counts, so an old claim epoch never
-/// matches a later claim. The retry policy is not consulted, as for an orphan
-/// reclaim: a deploy must not fail an activity. A lost claim is a no-op.
+/// matches a later claim. The release skips the retry delay and the attempt
+/// cap, as orphan reclaim does. A deploy must not fail an activity. A lost
+/// claim is a no-op.
 async fn release_drained_activity(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
+    payload: &str,
 ) -> HarvestResult<()> {
     let claim = claim_of_task(task)?;
-    let write = queue::requeue_claimed_task_for_retry(
-        conn,
-        &claim,
-        chrono::Duration::zero(),
-        WORKER_SHUTDOWN_ERROR,
-    )
-    .await?;
+    let message = crate::failure::parse_error_payload_full(payload).message;
+    let error = format!("{WORKER_SHUTDOWN_ERROR}: {message}");
+    let write =
+        queue::requeue_claimed_task_for_retry(conn, &claim, chrono::Duration::zero(), &error)
+            .await?;
     if write == queue::ClaimWrite::Applied {
         tracing::info!(
             task_id = %task.id,
@@ -15128,6 +15128,41 @@ struct ActivityRun {
     drained: bool,
 }
 
+/// Give a handler whose claim is no longer current its grace period to
+/// return, then drop it.
+async fn unwind_cancelled_activity(
+    activity_name: &str,
+    task_id: uuid::Uuid,
+    cancellation_grace_period: Duration,
+    activity_future: &mut (
+             dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + Unpin
+         ),
+    cancel: &CancellationToken,
+) -> Result<serde_json::Value, String> {
+    cancel.cancel();
+    tracing::info!(
+        task_id = %task_id,
+        activity = %activity_name,
+        grace_period_ms = %cancellation_grace_period.as_millis(),
+        "cancellation or lost lease detected for running activity; \
+         awaiting cooperative unwind"
+    );
+    tokio::time::timeout(cancellation_grace_period, activity_future)
+        .await
+        .unwrap_or_else(|_| {
+            tracing::warn!(
+                task_id = %task_id,
+                activity = %activity_name,
+                grace_period_ms = %cancellation_grace_period.as_millis(),
+                "activity ignored cancellation; hard-aborting handler"
+            );
+            Err(format!(
+                "workflow cancelled: activity '{activity_name}' exceeded {}ms cancellation grace period",
+                cancellation_grace_period.as_millis()
+            ))
+        })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_activity_future_with_cancellation(
     activity_name: &str,
@@ -15142,6 +15177,15 @@ async fn execute_activity_future_with_cancellation(
     span: tracing::Span,
 ) -> ActivityRun {
     use tracing::Instrument;
+    let unwind = |activity_future| {
+        unwind_cancelled_activity(
+            activity_name,
+            task_id,
+            cancellation_grace_period,
+            activity_future,
+            &cancel,
+        )
+    };
     async {
         tokio::select! {
             biased;
@@ -15158,57 +15202,16 @@ async fn execute_activity_future_with_cancellation(
                 tokio::select! {
                     biased;
                     result = &mut *activity_future => ActivityRun { result, drained: true },
-                    () = &mut cancellation_observer => {
-                        tracing::info!(
-                            task_id = %task_id,
-                            activity = %activity_name,
-                            grace_period_ms = %cancellation_grace_period.as_millis(),
-                            "cancellation or lost lease detected for running activity; \
-                             awaiting cooperative unwind"
-                        );
-                        let result = tokio::time::timeout(cancellation_grace_period, activity_future)
-                            .await
-                            .unwrap_or_else(|_| {
-                                tracing::warn!(
-                                    task_id = %task_id,
-                                    activity = %activity_name,
-                                    grace_period_ms = %cancellation_grace_period.as_millis(),
-                                    "activity ignored cancellation; hard-aborting handler"
-                                );
-                                Err(format!(
-                                    "workflow cancelled: activity '{activity_name}' exceeded {}ms cancellation grace period",
-                                    cancellation_grace_period.as_millis()
-                                ))
-                            });
-                        ActivityRun { result, drained: false }
-                    }
+                    () = &mut cancellation_observer => ActivityRun {
+                        result: unwind(activity_future).await,
+                        drained: false,
+                    },
                 }
             }
-            () = &mut cancellation_observer => {
-                cancel.cancel();
-                tracing::info!(
-                    task_id = %task_id,
-                    activity = %activity_name,
-                    grace_period_ms = %cancellation_grace_period.as_millis(),
-                    "cancellation or lost lease detected for running activity; \
-                     awaiting cooperative unwind"
-                );
-                let result = tokio::time::timeout(cancellation_grace_period, activity_future)
-                    .await
-                    .unwrap_or_else(|_| {
-                        tracing::warn!(
-                            task_id = %task_id,
-                            activity = %activity_name,
-                            grace_period_ms = %cancellation_grace_period.as_millis(),
-                            "activity ignored cancellation; hard-aborting handler"
-                        );
-                        Err(format!(
-                            "workflow cancelled: activity '{activity_name}' exceeded {}ms cancellation grace period",
-                            cancellation_grace_period.as_millis()
-                        ))
-                    });
-                ActivityRun { result, drained: false }
-            }
+            () = &mut cancellation_observer => ActivityRun {
+                result: unwind(activity_future).await,
+                drained: false,
+            },
         }
     }
     .instrument(span)
@@ -15856,12 +15859,16 @@ async fn process_activity_task(
         .await;
     }
 
-    let cancel = CancellationToken::new();
+    // The context token is a child of the flusher token. A lost lease
+    // cancels both. A drain cancels the context alone, so a handler that
+    // ignores it keeps its heartbeat and its claim (issue #1813).
+    let heartbeat_stop = CancellationToken::new();
+    let cancel = heartbeat_stop.child_token();
     let activity_claim = claim_of_task(task)?;
     let heartbeat_tx = crate::heartbeat::spawn_heartbeat_flusher(
         activity_claim.clone(),
         pool.clone(),
-        cancel.clone(),
+        heartbeat_stop.clone(),
     );
     let trace_carrier = task
         .trace_context
@@ -16171,7 +16178,7 @@ async fn process_activity_task(
     // token when the workflow/task is cancelled mid-flight. A cancellation is
     // not evidence the downstream is unhealthy, so it must not count toward the
     // circuit breaker (issue #369 review). Captured before the unconditional
-    // `cancel.cancel()` below.
+    // `heartbeat_stop.cancel()` below.
     let was_cancelled = cancel.is_cancelled();
 
     // Pre-normalize oversized results to non-retryable failures BEFORE emitting
@@ -16259,7 +16266,7 @@ async fn process_activity_task(
             .metrics
             .record_activity_failed(activity_name, "", error_type, *non_retryable);
     }
-    cancel.cancel();
+    heartbeat_stop.cancel();
     drop(activity_future);
 
     // Finalization phase: re-acquire a connection now that the handler is done.
@@ -16351,11 +16358,15 @@ async fn process_activity_task(
         return Ok(());
     }
 
-    // The drain cancelled the handler, and it returned an error. The handler
-    // is gone, so no peer can run beside it. Give the claim back for an
-    // immediate retry (issue #1813).
-    if drained && activity_result.is_err() {
-        return release_drained_activity(&mut conn, task).await;
+    // The drain cancelled the handler, and it returned a retryable error.
+    // The handler is gone, so no peer can run beside it. Give the claim back
+    // for an immediate retry (issue #1813). A non-retryable error takes the
+    // normal path below.
+    if drained
+        && let Err(payload) = &activity_result
+        && !failure_is_non_retryable(payload, retry_policy.as_ref())
+    {
+        return release_drained_activity(&mut conn, task, payload).await;
     }
 
     // activity_result is already cap-normalized (oversized Ok → non-retryable Err);
@@ -24164,16 +24175,21 @@ async fn read_live_fleet_or_degrade(
 /// on ownership would stop at `T-2` — a permanent leak on a `refill_rate = 0`
 /// bucket, and the direction that starves the capable peer.
 ///
-/// The refund is safe to make unconditional because it is exactly one refund
-/// per claim-time debit: `claim_task` debits every rate-limited claim it grants
-/// (bar the breaker-tracked ones, unreachable here — see above), this is the
-/// only site that returns a claim-time debit, and it runs once per dispatch. No
-/// other path — retry requeue, orphan reclaim, timeout, cancel — refunds, so a
+/// The refund is safe to make unconditional because each claim-time debit
+/// gets at most one refund. `claim_task` debits every rate-limited claim it
+/// grants (bar the breaker-tracked ones, unreachable here — see above). Three
+/// sites return a claim-time debit: this one and the two named below. Each
+/// runs at most once per dispatch, and no two share a dispatch. No other
+/// path — retry requeue, orphan reclaim, timeout, cancel — refunds, so a
 /// second credit for one debit cannot arise.
 ///
 /// A retry-budget deferral (issue #1793) also refunds a claim-time debit. It
 /// runs only after the handler lookup succeeds, so it never shares a dispatch
 /// with a capability miss.
+///
+/// A drain release of a task that never started (issue #1813) also refunds.
+/// It ends the dispatch before the handler lookup, so it never shares a
+/// dispatch with a capability miss either.
 ///
 /// Pinned by `stale_dispatcher_refund_leaves_one_debit_for_the_live_claim` in
 /// `capability_miss_tests`, which drives the exact interleaving above and
@@ -28239,9 +28255,7 @@ impl Worker {
             remote_drain_deadline: Arc::new(Mutex::new(None)),
             drain_deadline_max: Arc::new(Mutex::new(None)),
             workflow_cache,
-            workflow_task_timeout_strikes: Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            workflow_task_timeout_strikes: Arc::default(),
             workflow_panic_strikes: Arc::default(),
             workflow_deadlock_strikes: Arc::default(),
             session_slots_in_use: crate::sessions::new_session_slot_registry(),
@@ -32314,8 +32328,8 @@ impl Worker {
 
     /// Wait for all in-flight tasks to finish (or the drain deadline expires).
     ///
-    /// We wait until every dispatch body has ended and all semaphore permits
-    /// are available again.
+    /// The drain waits until every dispatch body ends and every semaphore
+    /// permit is free again.
     ///
     /// The deadline is read from `remote_drain_deadline` (set by the heartbeat
     /// task) rather than being snapshotted once.  The heartbeat task refreshes
@@ -32325,8 +32339,9 @@ impl Worker {
     ///
     /// One join window before the deadline, the drain cancels running
     /// activities (issue #1813). See [`drain_cancel_at`]. A handler that
-    /// returns gives its claim back. A handler that ignores the cancel keeps
-    /// its claim past the deadline, so no peer runs it at the same time.
+    /// returns a retryable error gives its claim back. A handler that ignores
+    /// the cancel keeps its claim past the deadline. No peer takes the task
+    /// until orphan reclaim finds the worker stale.
     async fn drain_in_flight(&self) {
         // Uses the actual permit count behind each semaphore (issue #548):
         // equal to `config.max_concurrent_*` when no slot tuner is
@@ -32409,7 +32424,8 @@ impl Worker {
                         worker_id = %self.config.worker_id,
                         total_permits,
                         "shutdown timeout elapsed — some tasks may still be running; \
-                         their claims stay held until the lease expires"
+                         their claims stay held until each handler returns or orphan \
+                         reclaim recovers the task"
                     );
                     return;
                 }
@@ -32440,9 +32456,9 @@ impl Worker {
 
 /// The instant at which a drain cancels its running activities (issue #1813).
 ///
-/// It is one join window before `deadline`. The join window is
-/// `join_window`, capped at half the drain, so most of the drain lets tasks
-/// finish on their own. The result is never before `started`.
+/// It is `join_window` before `deadline`, capped at half the drain. At least
+/// half the drain then lets tasks finish on their own. The result is never
+/// before `started`.
 fn drain_cancel_at(
     started: tokio::time::Instant,
     deadline: tokio::time::Instant,
