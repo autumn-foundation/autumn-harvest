@@ -35,15 +35,17 @@ A retried timeout follows the same rules as a retried handler failure:
   and `non_retryable_errors` apply.
 - A write fenced by the claim epoch (#1789) puts the row back to `PENDING`.
   The write appends no event and keeps the heartbeat details.
-- The retry budget (#1793) gates the next claim, because its `attempt` is
-  above 1.
+- The retry budget (#1793) gates the next dispatch, because its `attempt`
+  is above 1.
 - The timeout is not retried when the next attempt would start after
   `schedule_to_close`. A paused execution is the exception, because a pause
   stops that clock. The task then fails with its own timeout type.
 - The last attempt appends `ActivityTimedOut` with its timeout type, as
   before. The workflow sees only that final outcome.
 
-To keep a timeout terminal, set `max_attempts = 1` on the retry policy.
+To keep a timeout terminal, set `max_attempts = 1` on the retry policy. A
+timeout error has no typed error class, so `non_retryable_errors` matches its
+full text, for example `timeout: StartToClose for charge_card`.
 
 ### 2. The breaker counts only attempts that started
 
@@ -62,23 +64,43 @@ Timeouts of a `PENDING` task never feed the breaker. No handler ran.
 - `CircuitOpenMode::Defer` (default). The worker puts the claimed task back
   to `PENDING`. The delay is the time until the next probe, clamped, plus
   jitter. The write lowers `attempt` again, keeps `error` and
-  `crash_strikes`, and appends no event. The deferral uses no attempt.
+  `crash_strikes`, and appends no event. The deferral uses no attempt. The
+  `harvest.activity.circuit.deferred` counter counts each deferral.
 - `CircuitOpenMode::FailFast`. The behaviour before this ADR: a
   non-retryable `CircuitOpen` failure.
+
+In defer mode, a half-open probe that never reports would defer the work
+forever. So the worker releases an admitted probe on every early return,
+including an error.
 
 ## Consequences
 
 - An activity must be idempotent. A timed-out attempt can still run when
   its retry starts. The claim-epoch fence (#1789) rejects the writes of the
-  old attempt, and its heartbeat cancels it.
+  old attempt. The cancellation observer and the heartbeat flusher then stop
+  it.
+- A fleet that mixes 0.6 and 0.7 workers must keep timeouts terminal until
+  every 0.6 worker is gone. A 0.6 worker has no claim-epoch fence, so its
+  late writes can land on the retry.
 - Final failure comes later. The worst case is `max_attempts` times
-  `start_to_close`, plus backoff. Set `schedule_to_close` to bound it.
+  `start_to_close`, plus backoff. Set `schedule_to_close`, together with an
+  explicit `start_to_close`, to bound it.
+- A timeout acts only on the claim that the scanner saw. If a later claim
+  holds the row, the scanner leaves it alone.
 - In defer mode, work waits while the breaker is open. With no
   `schedule_to_close`, a breaker that an operator forced open holds the
   work until `force-close`. Use `FailFast` when a workflow needs the fast
   failure, for example to run a Saga compensation.
 - No new `WorkflowEvent` variant. Replay is unaffected. Histories written
   before this change replay unchanged.
+- A timeout before the handler starts still uses an attempt. Only the
+  breaker ignores it. The sweeper is not the claim owner, so it must not
+  lower `attempt`: a lower value would let a later claim reuse a stale
+  claim epoch. Since #1787 a claim waits for a free local permit, so this
+  gap is short.
+- A timeout retry keeps `crash_strikes`. A timeout does not prove that the
+  attempt ended without a crash, so poison-pill quarantine (#367) still
+  counts.
 - The SQLite backend keeps terminal timeouts and has no breaker feed. It
   is out of scope.
 

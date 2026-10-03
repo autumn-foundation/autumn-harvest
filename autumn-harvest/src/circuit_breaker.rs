@@ -33,12 +33,12 @@
 //! ## Scope and durability
 //!
 //! State is tracked **in-process and per-shard** (`Mutex<HashMap>`). It never
-//! touches the workflow event log: a deferral appends no event, and a
-//! fail-fast short circuit records an ordinary `ActivityFailed` event with a
-//! typed `"CircuitOpen"` payload, so the append-only contract and
-//! deterministic replay are both unaffected. Each
-//! shard / worker process tracks its own breaker; an outage that hits every
-//! shard trips each independently, matching the per-shard ACID model.
+//! touches the workflow event log. A deferral appends no event. A fail-fast
+//! short circuit records an ordinary `ActivityFailed` event with a typed
+//! `"CircuitOpen"` payload. So the append-only contract and deterministic
+//! replay are both unaffected. Each shard / worker process tracks its own
+//! breaker. An outage that hits every shard trips each independently,
+//! matching the per-shard ACID model.
 
 // Each public method intentionally holds the state lock for its whole body: it
 // reads and mutates the same `BreakerState` and returns a value derived from
@@ -177,6 +177,9 @@ pub struct CircuitSnapshot {
     pub window_secs: f64,
     /// Configured cooldown, in seconds.
     pub cooldown_secs: f64,
+    /// What a dispatch does while the breaker is open: `"defer"` or
+    /// `"fail_fast"` (issue #1809).
+    pub open_mode: crate::policy::CircuitOpenMode,
 }
 
 #[derive(Debug)]
@@ -654,6 +657,7 @@ impl CircuitBreakerRegistry {
             failure_threshold: policy.failure_threshold,
             window_secs: policy.window.as_secs_f64(),
             cooldown_secs: policy.cooldown.as_secs_f64(),
+            open_mode: policy.open_mode,
         }
     }
 }

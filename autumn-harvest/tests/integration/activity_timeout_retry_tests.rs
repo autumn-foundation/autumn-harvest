@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use autumn_harvest::circuit_breaker::CircuitBreakerRegistry;
@@ -24,11 +24,11 @@ use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
 use autumn_harvest::models::{NewWorkflowExecution, TaskQueueItem, WorkflowExecution};
 use autumn_harvest::payload_codec::PayloadCodecs;
-use autumn_harvest::policy::{CircuitBreakerPolicy, CircuitOpenMode};
+use autumn_harvest::policy::{CircuitBreakerPolicy, CircuitOpenMode, JitterPolicy};
 use autumn_harvest::queue::{self, EnqueueParams, TaskType};
 use autumn_harvest::schema::{harvest_task_queue, harvest_workflow_executions};
-use autumn_harvest::telemetry::NoOpMetrics;
-use autumn_harvest::timeout;
+use autumn_harvest::telemetry::{MetricsRecorder, NoOpMetrics};
+use autumn_harvest::timeout::{self, TimeoutReason};
 use autumn_harvest::types::{ActivityExecId, ExecutionId, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{RetryPolicy, WorkflowContext, store};
@@ -242,9 +242,17 @@ async fn age_claim(conn: &mut AsyncPgConnection, task_id: Uuid) {
 }
 
 async fn enforce(conn: &mut AsyncPgConnection, breakers: Option<&CircuitBreakerRegistry>) {
+    enforce_with(conn, breakers, &NoOpMetrics).await;
+}
+
+async fn enforce_with(
+    conn: &mut AsyncPgConnection,
+    breakers: Option<&CircuitBreakerRegistry>,
+    metrics: &(dyn MetricsRecorder + Send + Sync),
+) {
     timeout::enforce_timeouts_once(
         conn,
-        &NoOpMetrics,
+        metrics,
         Duration::from_secs(60),
         &None,
         &[],
@@ -256,6 +264,72 @@ async fn enforce(conn: &mut AsyncPgConnection, breakers: Option<&CircuitBreakerR
     )
     .await
     .expect("enforce_timeouts_once");
+}
+
+/// Counts `harvest.activity.retries` for each activity.
+#[derive(Default)]
+struct RetryCounter(Mutex<HashMap<String, u32>>);
+
+impl RetryCounter {
+    fn count(&self, activity: &str) -> u32 {
+        self.0.lock().unwrap().get(activity).copied().unwrap_or(0)
+    }
+}
+
+impl MetricsRecorder for RetryCounter {
+    fn record_activity_retried(&self, activity_name: &str, _queue: &str) {
+        *self
+            .0
+            .lock()
+            .unwrap()
+            .entry(activity_name.to_owned())
+            .or_default() += 1;
+    }
+}
+
+/// Set a column of one task row from SQL.
+async fn set_task(conn: &mut AsyncPgConnection, task_id: Uuid, assignment: &str) {
+    diesel::sql_query(format!(
+        "UPDATE harvest_task_queue SET {assignment} WHERE id = $1"
+    ))
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .execute(conn)
+    .await
+    .expect("update the task row");
+}
+
+/// A retry policy with a fixed backoff and no jitter.
+fn fixed_policy(max_attempts: u32, interval: Duration) -> serde_json::Value {
+    let mut policy = RetryPolicy::fixed(max_attempts, interval);
+    policy.jitter = JitterPolicy::None;
+    serde_json::to_value(policy).expect("policy json")
+}
+
+async fn set_policy(conn: &mut AsyncPgConnection, task_id: Uuid, policy: serde_json::Value) {
+    diesel::sql_query("UPDATE harvest_task_queue SET retry_policy = $2 WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .bind::<diesel::sql_types::Jsonb, _>(policy)
+        .execute(conn)
+        .await
+        .expect("set the retry policy");
+}
+
+/// Seconds from the database clock to the row's `scheduled_at`.
+async fn secs_until_scheduled(conn: &mut AsyncPgConnection, task_id: Uuid) -> f64 {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Double)]
+        secs: f64,
+    }
+    diesel::sql_query(
+        "SELECT EXTRACT(EPOCH FROM scheduled_at - clock_timestamp())::float8 AS secs \
+         FROM harvest_task_queue WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(task_id)
+    .get_result::<Row>(conn)
+    .await
+    .expect("read scheduled_at")
+    .secs
 }
 
 async fn task_row(conn: &mut AsyncPgConnection, task_id: Uuid) -> TaskQueueItem {
@@ -284,6 +358,40 @@ fn timed_out(history: &[WorkflowEvent]) -> Vec<TimeoutType> {
         .collect()
 }
 
+/// Start the attempt that `claimed` holds, as the worker does.
+async fn start(
+    conn: &mut AsyncPgConnection,
+    claimed: &TaskQueueItem,
+    exec_id: ExecutionId,
+    activity: &str,
+) {
+    let started = autumn_harvest::worker::append_activity_started_for_test(
+        conn,
+        claimed,
+        exec_id,
+        activity,
+        claimed.worker_id.as_deref().expect("a claimed task"),
+        &PayloadCodecs::default(),
+    )
+    .await
+    .expect("start the attempt");
+    assert!(started.is_some(), "the attempt starts");
+}
+
+/// The number of workflow tasks of `exec_id`. A retried timeout must not
+/// wake the workflow.
+async fn workflow_task_count(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> usize {
+    harvest_task_queue::table
+        .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid())))
+        .filter(harvest_task_queue::task_type.eq("workflow"))
+        .filter(harvest_task_queue::state.eq("PENDING"))
+        .count()
+        .get_result::<i64>(conn)
+        .await
+        .map(|n| usize::try_from(n).expect("count fits"))
+        .expect("count workflow tasks")
+}
+
 // ---------------------------------------------------------------------------
 // Timeout retries
 // ---------------------------------------------------------------------------
@@ -296,18 +404,21 @@ async fn start_to_close_timeout_retries_until_max_attempts() {
     let (url, _container) = setup_db().await;
     let mut conn = connect(&url).await;
     let queue = unique("t1809-s2c");
+    let activity = "t1809_s2c";
     let timeouts = Timeouts {
         start_to_close: Some(Duration::from_secs(1)),
         ..Timeouts::default()
     };
-    let (exec_id, task_id) = seed_activity(&mut conn, &queue, "t1809_s2c", 3, timeouts).await;
+    let (exec_id, task_id) = seed_activity(&mut conn, &queue, activity, 3, timeouts).await;
+    set_policy(&mut conn, task_id, fixed_policy(3, Duration::from_secs(2))).await;
+    let metrics = RetryCounter::default();
 
     for attempt in 1..=3 {
         let claimed = claim(&mut conn, &queue, "w-s2c").await;
         assert_eq!(claimed.id, task_id);
         assert_eq!(claimed.attempt, attempt);
         age_claim(&mut conn, task_id).await;
-        enforce(&mut conn, None).await;
+        enforce_with(&mut conn, None, &metrics).await;
 
         let row = task_row(&mut conn, task_id).await;
         let events = history(&mut conn, exec_id).await;
@@ -326,15 +437,35 @@ async fn start_to_close_timeout_retries_until_max_attempts() {
                 timed_out(&events).is_empty(),
                 "a retried attempt appends no ActivityTimedOut"
             );
+            let wait = secs_until_scheduled(&mut conn, task_id).await;
+            assert!(wait > 1.0, "the retry waits for the backoff: {wait}s");
+            assert_eq!(
+                workflow_task_count(&mut conn, exec_id).await,
+                0,
+                "a retried timeout does not wake the workflow"
+            );
+            assert_eq!(metrics.count(activity), u32::try_from(attempt).unwrap());
+            // Skip the backoff, so the next claim is due.
+            set_task(
+                &mut conn,
+                task_id,
+                "scheduled_at = NOW() - INTERVAL '1 second'",
+            )
+            .await;
         } else {
             assert_eq!(row.state, "FAILED", "the last attempt fails");
             assert_eq!(timed_out(&events), vec![TimeoutType::StartToClose]);
+            assert_eq!(
+                metrics.count(activity),
+                2,
+                "a terminal timeout is not a retry"
+            );
         }
     }
 }
 
 /// ADR 0004 §1: a heartbeat timeout retries like a start-to-close timeout.
-/// The retry keeps the heartbeat details for the next attempt.
+/// The retry keeps the heartbeat details and the crash strikes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn heartbeat_timeout_retries_and_keeps_heartbeat_details() {
     let (url, _container) = setup_db().await;
@@ -347,15 +478,13 @@ async fn heartbeat_timeout_retries_and_keeps_heartbeat_details() {
     let (exec_id, task_id) = seed_activity(&mut conn, &queue, "t1809_hb", 2, timeouts).await;
 
     claim(&mut conn, &queue, "w-hb").await;
-    diesel::sql_query(
-        "UPDATE harvest_task_queue \
-         SET heartbeat_details = '{\"cursor\": 7}'::jsonb, last_heartbeat_at = NOW() \
-         WHERE id = $1",
+    set_task(
+        &mut conn,
+        task_id,
+        "heartbeat_details = '{\"cursor\": 7}'::jsonb, last_heartbeat_at = NOW(), \
+         crash_strikes = 2",
     )
-    .bind::<diesel::sql_types::Uuid, _>(task_id)
-    .execute(&mut conn)
-    .await
-    .expect("record a heartbeat");
+    .await;
     age_claim(&mut conn, task_id).await;
     enforce(&mut conn, None).await;
 
@@ -366,7 +495,18 @@ async fn heartbeat_timeout_retries_and_keeps_heartbeat_details() {
         Some(serde_json::json!({ "cursor": 7 })),
         "the retry keeps the heartbeat checkpoint"
     );
-    assert!(timed_out(&history(&mut conn, exec_id).await).is_empty());
+    assert!(
+        row.last_heartbeat_at.is_none() && row.started_at.is_none(),
+        "the next attempt starts a fresh heartbeat clock"
+    );
+    assert_eq!(
+        row.crash_strikes, 2,
+        "a timeout does not prove the attempt ended without a crash"
+    );
+    assert_eq!(
+        timed_out(&history(&mut conn, exec_id).await),
+        Vec::<TimeoutType>::new()
+    );
 
     claim(&mut conn, &queue, "w-hb").await;
     age_claim(&mut conn, task_id).await;
@@ -378,6 +518,101 @@ async fn heartbeat_timeout_retries_and_keeps_heartbeat_details() {
         timed_out(&history(&mut conn, exec_id).await),
         vec![TimeoutType::Heartbeat]
     );
+}
+
+/// A heartbeat that lands after the scan, before the row lock, cancels the
+/// heartbeat timeout. The sweeper re-checks the deadline under the lock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn heartbeat_after_the_scan_cancels_the_timeout() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let queue = unique("t1809-hb-late");
+    let timeouts = Timeouts {
+        heartbeat: Some(Duration::from_secs(60)),
+        ..Timeouts::default()
+    };
+    let (_exec_id, task_id) = seed_activity(&mut conn, &queue, "t1809_hb_late", 2, timeouts).await;
+    claim(&mut conn, &queue, "w-hb-late").await;
+    set_task(
+        &mut conn,
+        task_id,
+        "last_heartbeat_at = NOW() - INTERVAL '10 minutes'",
+    )
+    .await;
+    let scanned = task_row(&mut conn, task_id).await;
+
+    // The activity heartbeats after the scan.
+    set_task(&mut conn, task_id, "last_heartbeat_at = NOW()").await;
+    timeout::enforce_activity_timeout_for_test(
+        &mut conn,
+        &scanned,
+        &TimeoutReason::Heartbeat,
+        None,
+        &PayloadCodecs::default(),
+    )
+    .await
+    .expect("enforce");
+
+    let row = task_row(&mut conn, task_id).await;
+    assert_eq!(row.state, "RUNNING", "a live heartbeat keeps the attempt");
+    assert_eq!(row.attempt, scanned.attempt);
+}
+
+/// A stale scan snapshot must not act on a later claim of the row. A
+/// deferral before the handler lowers `attempt`, so the later claim reuses
+/// the `(worker_id, attempt)` pair. Only `started_at` tells them apart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_scan_snapshot_leaves_a_later_claim_alone() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let queue = unique("t1809-stale");
+    let activity = "t1809_stale";
+    let timeouts = Timeouts {
+        start_to_close: Some(Duration::from_secs(1)),
+        ..Timeouts::default()
+    };
+    let (exec_id, task_id) = seed_activity(&mut conn, &queue, activity, 3, timeouts).await;
+    let breakers = trip_on_first(activity);
+
+    let first = claim(&mut conn, &queue, "w-stale").await;
+    age_claim(&mut conn, task_id).await;
+    let stale = task_row(&mut conn, task_id).await;
+
+    // The owner defers before its handler starts, then claims again.
+    let deferred = queue::defer_claimed_retry_for_budget(
+        &mut conn,
+        &queue::TaskClaim::of(&first).expect("claimed"),
+        chrono::Duration::zero(),
+    )
+    .await
+    .expect("defer");
+    assert_eq!(deferred, queue::ClaimWrite::Applied);
+    let second = claim(&mut conn, &queue, "w-stale").await;
+    assert_eq!(
+        (second.worker_id.as_deref(), second.attempt),
+        (stale.worker_id.as_deref(), stale.attempt),
+        "the later claim reuses the claim pair"
+    );
+    start(&mut conn, &second, exec_id, activity).await;
+
+    timeout::enforce_activity_timeout_for_test(
+        &mut conn,
+        &stale,
+        &TimeoutReason::StartToClose,
+        Some(&breakers),
+        &PayloadCodecs::default(),
+    )
+    .await
+    .expect("enforce");
+
+    let row = task_row(&mut conn, task_id).await;
+    assert_eq!(row.state, "RUNNING", "the later claim keeps running");
+    assert_eq!(row.started_at, second.started_at);
+    assert_eq!(
+        timed_out(&history(&mut conn, exec_id).await),
+        Vec::<TimeoutType>::new()
+    );
+    assert_eq!(breaker_state(&breakers, activity), ("closed", 0));
 }
 
 /// ADR 0004 §1: no retry starts after `schedule_to_close`. The task fails
@@ -396,23 +631,14 @@ async fn timeout_retry_stops_at_the_schedule_to_close_deadline() {
 
     claim(&mut conn, &queue, "w-deadline").await;
     age_claim(&mut conn, task_id).await;
-    // The next attempt cannot start before this deadline passes.
-    diesel::sql_query(
-        "UPDATE harvest_task_queue SET schedule_to_close_at = clock_timestamp() + INTERVAL '50 milliseconds' \
-         WHERE id = $1",
+    // The deadline is ahead, but the 60 s backoff would end after it.
+    set_task(
+        &mut conn,
+        task_id,
+        "schedule_to_close_at = clock_timestamp() + INTERVAL '30 seconds'",
     )
-    .bind::<diesel::sql_types::Uuid, _>(task_id)
-    .execute(&mut conn)
-    .await
-    .expect("move the deadline close");
-    diesel::sql_query("UPDATE harvest_task_queue SET retry_policy = $2 WHERE id = $1")
-        .bind::<diesel::sql_types::Uuid, _>(task_id)
-        .bind::<diesel::sql_types::Jsonb, _>(
-            serde_json::to_value(RetryPolicy::fixed(3, Duration::from_secs(60))).expect("json"),
-        )
-        .execute(&mut conn)
-        .await
-        .expect("use a long backoff");
+    .await;
+    set_policy(&mut conn, task_id, fixed_policy(3, Duration::from_secs(60))).await;
     enforce(&mut conn, None).await;
 
     let row = task_row(&mut conn, task_id).await;
@@ -423,24 +649,62 @@ async fn timeout_retry_stops_at_the_schedule_to_close_deadline() {
     );
 }
 
-/// ADR 0004 §1: schedule-to-start is not retried.
+/// ADR 0004 §1: a pause stops the `schedule_to_close` clock, so the deadline
+/// does not stop the retry of a paused execution.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn paused_execution_retries_past_the_deadline() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let queue = unique("t1809-paused");
+    let timeouts = Timeouts {
+        start_to_close: Some(Duration::from_secs(1)),
+        schedule_to_close: Some(Duration::from_secs(3600)),
+        ..Timeouts::default()
+    };
+    let (exec_id, task_id) = seed_activity(&mut conn, &queue, "t1809_paused", 3, timeouts).await;
+
+    claim(&mut conn, &queue, "w-paused").await;
+    age_claim(&mut conn, task_id).await;
+    set_task(
+        &mut conn,
+        task_id,
+        "schedule_to_close_at = clock_timestamp() + INTERVAL '30 seconds'",
+    )
+    .await;
+    set_policy(&mut conn, task_id, fixed_policy(3, Duration::from_secs(60))).await;
+    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+        .set(harvest_workflow_executions::state.eq("PAUSED"))
+        .execute(&mut conn)
+        .await
+        .expect("pause the execution");
+    enforce(&mut conn, None).await;
+
+    let row = task_row(&mut conn, task_id).await;
+    assert_eq!(row.state, "PENDING", "a paused run keeps its retry");
+    assert_eq!(
+        timed_out(&history(&mut conn, exec_id).await),
+        Vec::<TimeoutType>::new()
+    );
+}
+
+/// ADR 0004 §1: schedule-to-start is not retried, and a task that never left
+/// the queue never feeds the breaker.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn schedule_to_start_timeout_stays_terminal() {
     let (url, _container) = setup_db().await;
     let mut conn = connect(&url).await;
     let queue = unique("t1809-s2s");
+    let activity = "t1809_s2s";
     let (exec_id, task_id) =
-        seed_activity(&mut conn, &queue, "t1809_s2s", 3, Timeouts::default()).await;
-    diesel::sql_query(
-        "UPDATE harvest_task_queue \
-         SET schedule_to_start = INTERVAL '1 second', scheduled_at = NOW() - INTERVAL '10 minutes' \
-         WHERE id = $1",
+        seed_activity(&mut conn, &queue, activity, 3, Timeouts::default()).await;
+    set_task(
+        &mut conn,
+        task_id,
+        "schedule_to_start = INTERVAL '1 second', scheduled_at = NOW() - INTERVAL '10 minutes'",
     )
-    .bind::<diesel::sql_types::Uuid, _>(task_id)
-    .execute(&mut conn)
-    .await
-    .expect("expire schedule-to-start");
-    enforce(&mut conn, None).await;
+    .await;
+    let breakers = trip_on_first(activity);
+    enforce(&mut conn, Some(&breakers)).await;
 
     let row = task_row(&mut conn, task_id).await;
     assert_eq!(row.state, "FAILED");
@@ -448,6 +712,45 @@ async fn schedule_to_start_timeout_stays_terminal() {
         timed_out(&history(&mut conn, exec_id).await),
         vec![TimeoutType::ScheduleToStart]
     );
+    assert_eq!(breaker_state(&breakers, activity), ("closed", 0));
+}
+
+/// ADR 0004 §2: a `PENDING` task that passes `schedule_to_close` in the queue
+/// never feeds the breaker, even after an earlier attempt started.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_schedule_to_close_timeout_does_not_feed_the_breaker() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let queue = unique("t1809-s2c-pending");
+    let activity = "t1809_s2c_pending";
+    let timeouts = Timeouts {
+        start_to_close: Some(Duration::from_secs(1)),
+        ..Timeouts::default()
+    };
+    let (exec_id, task_id) = seed_activity(&mut conn, &queue, activity, 3, timeouts).await;
+
+    // Attempt 1 starts and times out, so the row is PENDING with a marker.
+    let first = claim(&mut conn, &queue, "w-s2c-pending").await;
+    start(&mut conn, &first, exec_id, activity).await;
+    age_claim(&mut conn, task_id).await;
+    enforce(&mut conn, None).await;
+    assert_eq!(task_row(&mut conn, task_id).await.state, "PENDING");
+
+    set_task(
+        &mut conn,
+        task_id,
+        "schedule_to_close_at = NOW() - INTERVAL '1 second'",
+    )
+    .await;
+    let breakers = trip_on_first(activity);
+    enforce(&mut conn, Some(&breakers)).await;
+
+    assert_eq!(task_row(&mut conn, task_id).await.state, "FAILED");
+    assert_eq!(
+        timed_out(&history(&mut conn, exec_id).await),
+        vec![TimeoutType::ScheduleToClose]
+    );
+    assert_eq!(breaker_state(&breakers, activity), ("closed", 0));
 }
 
 // ---------------------------------------------------------------------------
@@ -456,7 +759,13 @@ async fn schedule_to_start_timeout_stays_terminal() {
 
 /// A breaker that trips on the first counted failure.
 fn trip_on_first(activity: &str) -> CircuitBreakerRegistry {
-    let policy = CircuitBreakerPolicy::new(1, Duration::from_secs(60), Duration::from_secs(60));
+    trip_on(activity, 1)
+}
+
+/// A breaker that trips on the `threshold`-th counted failure.
+fn trip_on(activity: &str, threshold: u32) -> CircuitBreakerRegistry {
+    let policy =
+        CircuitBreakerPolicy::new(threshold, Duration::from_secs(60), Duration::from_secs(60));
     CircuitBreakerRegistry::new(HashMap::from([(activity.to_string(), policy)]))
 }
 
@@ -510,27 +819,18 @@ async fn started_timeout_feeds_the_breaker() {
     let breakers = trip_on_first(activity);
 
     let claimed = claim(&mut conn, &queue, "w-started").await;
-    let started = autumn_harvest::worker::append_activity_started_for_test(
-        &mut conn,
-        &claimed,
-        exec_id,
-        activity,
-        "w-started",
-        &PayloadCodecs::default(),
-    )
-    .await
-    .expect("start the attempt");
-    assert!(started.is_some(), "the attempt starts");
+    start(&mut conn, &claimed, exec_id, activity).await;
     age_claim(&mut conn, task_id).await;
     enforce(&mut conn, Some(&breakers)).await;
 
     assert_eq!(breaker_state(&breakers, activity).0, "open");
 }
 
-/// ADR 0004 §2: a retried claim is a new attempt. A start of an earlier
-/// attempt does not mark the new claim as started.
+/// ADR 0004 §2, on the retry path: a retried timeout of a started attempt
+/// feeds the breaker. A later claim is a new attempt, so the start of an
+/// earlier attempt does not mark it started.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn earlier_start_does_not_mark_a_later_claim_started() {
+async fn only_started_attempts_feed_the_breaker_across_retries() {
     let (url, _container) = setup_db().await;
     let mut conn = connect(&url).await;
     let queue = unique("t1809-later");
@@ -539,32 +839,25 @@ async fn earlier_start_does_not_mark_a_later_claim_started() {
         start_to_close: Some(Duration::from_secs(1)),
         ..Timeouts::default()
     };
-    let (exec_id, task_id) = seed_activity(&mut conn, &queue, activity, 2, timeouts).await;
+    let (exec_id, task_id) = seed_activity(&mut conn, &queue, activity, 3, timeouts).await;
+    let breakers = trip_on(activity, 2);
 
-    // Attempt 1 starts and times out. Without a breaker, it only retries.
+    // Attempt 1 starts and times out: it retries and counts once.
     let first = claim(&mut conn, &queue, "w-later").await;
-    autumn_harvest::worker::append_activity_started_for_test(
-        &mut conn,
-        &first,
-        exec_id,
-        activity,
-        "w-later",
-        &PayloadCodecs::default(),
-    )
-    .await
-    .expect("start attempt 1");
-    age_claim(&mut conn, task_id).await;
-    enforce(&mut conn, None).await;
-    assert_eq!(task_row(&mut conn, task_id).await.state, "PENDING");
-
-    // Attempt 2 is claimed by the same worker but never starts.
-    let breakers = trip_on_first(activity);
-    claim(&mut conn, &queue, "w-later").await;
+    start(&mut conn, &first, exec_id, activity).await;
     age_claim(&mut conn, task_id).await;
     enforce(&mut conn, Some(&breakers)).await;
+    assert_eq!(task_row(&mut conn, task_id).await.state, "PENDING");
+    assert_eq!(breaker_state(&breakers, activity), ("closed", 1));
 
-    assert_eq!(task_row(&mut conn, task_id).await.state, "FAILED");
-    assert_eq!(breaker_state(&breakers, activity), ("closed", 0));
+    // Attempts 2 and 3 are claimed by the same worker but never start.
+    for expected in ["PENDING", "FAILED"] {
+        claim(&mut conn, &queue, "w-later").await;
+        age_claim(&mut conn, task_id).await;
+        enforce(&mut conn, Some(&breakers)).await;
+        assert_eq!(task_row(&mut conn, task_id).await.state, expected);
+        assert_eq!(breaker_state(&breakers, activity), ("closed", 1));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -731,15 +1024,43 @@ where
     .unwrap_or_else(|_| panic!("timed out after {timeout:?} waiting for {what}"));
 }
 
-/// The activity task rows of `exec_id`.
-async fn activity_rows(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> Vec<TaskQueueItem> {
-    harvest_task_queue::table
-        .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid())))
-        .filter(harvest_task_queue::task_type.eq("activity"))
-        .select(TaskQueueItem::as_select())
-        .load(conn)
-        .await
-        .expect("load activity rows")
+/// The activity task row of `exec_id`, read on the database clock.
+struct ActivityRowState {
+    state: String,
+    attempt: i32,
+    /// `PENDING` with `scheduled_at` ahead of the database clock.
+    deferred: bool,
+}
+
+async fn activity_row_state(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> Option<ActivityRowState> {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        state: String,
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        attempt: i32,
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        deferred: bool,
+    }
+    diesel::sql_query(
+        "SELECT state, attempt, \
+             (state = 'PENDING' AND scheduled_at > clock_timestamp()) AS deferred \
+         FROM harvest_task_queue \
+         WHERE workflow_exec_id = $1 AND task_type = 'activity'",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .get_result::<Row>(conn)
+    .await
+    .optional()
+    .expect("read the activity row")
+    .map(|row| ActivityRowState {
+        state: row.state,
+        attempt: row.attempt,
+        deferred: row.deferred,
+    })
 }
 
 /// ADR 0004 §3: an open breaker defers work and does not fail it. When the
@@ -764,20 +1085,36 @@ async fn open_breaker_defers_work_by_default() {
     let runner = Arc::clone(&worker);
     let handle = tokio::spawn(async move { runner.run(&pool).await });
 
-    // Wait until the activity task exists and the worker has seen it.
+    // Wait until the worker has deferred the activity task at least once.
     wait_until("a deferred activity", Duration::from_secs(20), || {
         let url = url.clone();
         async move {
             let mut conn = connect(&url).await;
-            activity_rows(&mut conn, exec_id)
+            activity_row_state(&mut conn, exec_id)
                 .await
-                .iter()
-                .any(|row| row.state == "PENDING" && row.scheduled_at > Utc::now())
+                .is_some_and(|row| row.deferred)
         }
     })
     .await;
-    // Give a fail-fast worker time to fail the run.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Let the worker run several deferral cycles. A fail-fast worker would
+    // fail the run in this window.
+    for _ in 0..30 {
+        let row = activity_row_state(&mut conn, exec_id)
+            .await
+            .expect("the activity task exists");
+        assert!(
+            row.attempt <= 1,
+            "a deferral uses no attempt: attempt {}",
+            row.attempt
+        );
+        assert!(
+            row.state != "PENDING" || row.attempt == 0,
+            "a deferred row keeps attempt 0: {} at attempt {}",
+            row.state,
+            row.attempt
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     let events = history(&mut conn, exec_id).await;
     assert!(
@@ -793,9 +1130,6 @@ async fn open_breaker_defers_work_by_default() {
         "a deferral appends no ActivityStarted"
     );
     assert_eq!(execution_state(&mut conn, exec_id).await, "RUNNING");
-    let rows = activity_rows(&mut conn, exec_id).await;
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].attempt, 0, "a deferral uses no attempt");
 
     breakers.force_close(activity);
     wait_until("the workflow completes", Duration::from_secs(20), || {
@@ -809,6 +1143,56 @@ async fn open_breaker_defers_work_by_default() {
 
     worker.shutdown();
     handle.await.expect("worker joins");
+}
+
+/// ADR 0004 §3: a breaker that tripped on its own defers work until its
+/// cooldown admits a probe. The deferred task runs as that probe, succeeds
+/// and closes the breaker. No operator action is needed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn organically_open_breaker_defers_until_the_probe_closes_it() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    let queue = unique("t1809-organic");
+    let activity = "t1809_organic";
+    let policy = CircuitBreakerPolicy::new(1, Duration::from_secs(60), Duration::from_secs(1));
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![wf_info()],
+        vec![act_info(activity, policy)],
+    ));
+    let breakers = registry.circuit_breakers();
+    let _ = breakers.on_external_failure(activity, Instant::now());
+    assert_eq!(breaker_state(&breakers, activity).0, "open");
+
+    let exec_id = seed_workflow(&mut conn, &queue, activity).await;
+    let worker = build_worker(&queue, Arc::clone(&registry));
+    let pool = build_pool(&url);
+    let runner = Arc::clone(&worker);
+    let handle = tokio::spawn(async move { runner.run(&pool).await });
+
+    wait_until("the workflow completes", Duration::from_secs(20), || {
+        let url = url.clone();
+        async move {
+            let mut conn = connect(&url).await;
+            execution_state(&mut conn, exec_id).await == "COMPLETED"
+        }
+    })
+    .await;
+    worker.shutdown();
+    handle.await.expect("worker joins");
+
+    let events = history(&mut conn, exec_id).await;
+    let started = events
+        .iter()
+        .filter(|e| matches!(e, WorkflowEvent::ActivityStarted { .. }))
+        .count();
+    assert_eq!(started, 1, "only the probe runs: {events:?}");
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::ActivityFailed { .. })),
+        "no attempt fails: {events:?}"
+    );
+    assert_eq!(breaker_state(&breakers, activity).0, "closed");
 }
 
 /// ADR 0004 §3: `FailFast` keeps the old behaviour. The open breaker fails

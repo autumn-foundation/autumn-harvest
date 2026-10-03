@@ -86,9 +86,10 @@
 //!   indicator).
 //! - [`Degraded`](ExecutionHealth::Degraded) — will move on its own, but not
 //!   toward success: an organically-tripped circuit breaker (issue #1193).
-//!   The cooldown admits a recovery probe with no human involved, but every
-//!   dispatch fast-fails **non-retryably** until then (issue #369), so the
-//!   activity is heading for a terminal failure, not progress. Distinct from
+//!   The cooldown admits a recovery probe with no human involved, but no
+//!   dispatch runs until then. By default each one waits in `PENDING` (issue
+//!   #1809). In fail-fast mode each one fails **non-retryably** (issue #369).
+//!   Neither is progress. Distinct from
 //!   `Stalled` (which stays reserved for the operator-forced open, where a
 //!   human genuinely must `force-close` it) and from `Healthy` (an operator
 //!   must not be told "healthy" about a run heading for a terminal
@@ -122,10 +123,11 @@ pub enum ExecutionHealth {
     /// **Will move forward without a human, but not toward success.** Issue
     /// #1193's third case, distinct from both neighbors on purpose:
     ///
-    /// - Not [`Self::Healthy`], because dispatch of the blocking activity
-    ///   fast-fails **non-retryably** on every attempt until the condition
-    ///   clears (issue #369's `ActivityFailure::circuit_open`) — the activity
-    ///   is heading for a terminal `ActivityFailed`, not toward progress. An
+    /// - Not [`Self::Healthy`], because no dispatch of the blocking activity
+    ///   runs until the condition clears. By default each one waits in
+    ///   `PENDING` (issue #1809). In fail-fast mode each one fails
+    ///   **non-retryably** (issue #369's `ActivityFailure::circuit_open`), and
+    ///   the activity heads for a terminal `ActivityFailed`. An
     ///   operator reading `healthy` here would not know to expect that.
     ///   `NonRetryableFailure` is terminal for the *activity*, not the whole
     ///   run: the workflow itself keeps running and can still catch the
@@ -229,7 +231,8 @@ pub enum BlockedOn {
         activity_name: Option<String>,
     },
     /// The activity's per-activity circuit breaker is open (or half-open), so
-    /// dispatch fast-fails until it recovers.
+    /// dispatch short-circuits until it recovers. It defers by default, or
+    /// fails in fail-fast mode (issue #1809).
     ActivityCircuitOpen {
         /// The activity whose breaker is tripped.
         activity_name: String,
@@ -520,7 +523,7 @@ impl BlockedOn {
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum BlockingCircuitPhase {
-    /// Tripped: dispatch fast-fails until the cooldown elapses.
+    /// Tripped: dispatch short-circuits until the cooldown elapses.
     Open,
     /// Cooldown elapsed: a single probe dispatch is admitted.
     HalfOpen,
@@ -1737,6 +1740,11 @@ fn activity_phrase(activity_name: Option<&String>) -> String {
 ///
 /// Split out purely so [`summarize`] stays within the function-length lint
 /// budget; the two together are exhaustive over [`BlockedOn`].
+/// What an organically open breaker does to dispatch until its cooldown ends.
+const CIRCUIT_OPEN_EFFECT: &str = "no dispatch of this activity runs until then -- by \
+     default each one waits in PENDING (issue #1809), and in fail-fast mode each one fails \
+     as non-retryable (issue #369) -- so this is not progress";
+
 fn summarize_activity_cause(blocked: &BlockedOn) -> Option<String> {
     Some(match blocked {
         BlockedOn::ActivityRetrying {
@@ -1805,18 +1813,14 @@ fn summarize_activity_cause(blocked: &BlockedOn) -> Option<String> {
                     "the circuit breaker for activity '{activity_name}' is open and will \
                          automatically admit a recovery probe once its cooldown elapses -- no \
                          operator action needed to clear it faster (its exact deadline could \
-                         not be computed); but every dispatch of this activity fast-fails \
-                         non-retryably until then (issue #369), so it is heading for a terminal \
-                         failure, not progress"
+                         not be computed); but {CIRCUIT_OPEN_EFFECT}"
                 )
             },
             |until| {
                 format!(
                     "the circuit breaker for activity '{activity_name}' is open and will \
                          automatically admit a recovery probe at {until} -- no operator action \
-                         needed to clear it faster; but every dispatch of this activity \
-                         fast-fails non-retryably until then (issue #369), so it is heading for \
-                         a terminal failure, not progress"
+                         needed to clear it faster; but {CIRCUIT_OPEN_EFFECT}"
                 )
             },
         ),

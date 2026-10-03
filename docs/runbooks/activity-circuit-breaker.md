@@ -38,7 +38,7 @@ behaviour exactly (no breaker; the full retry policy applies).
 
 - **Closed** (normal): dispatches proceed unchanged.
 - **Open** (tripped): in defer mode, each new dispatch goes back to
-  `PENDING`. It waits for the time until the next probe, plus up to 25 %
+  `PENDING`. It waits for the time until the next probe, plus up to 25%
   jitter. When no probe time is known (a forced-open breaker, or a probe in
   flight), it waits for the cooldown. The wait is clamped to 100 ms – 30 s.
   In fail-fast mode, new dispatches fail with
@@ -91,8 +91,8 @@ The four knobs are:
 > transient/downstream-style retryable failures move the breaker toward open.
 >
 > **Only timeouts of started attempts count (issue #1809).** A start-to-close,
-> heartbeat or running schedule-to-close timeout counts as a retryable failure
-> only when the attempt's handler started. A task that waited after its claim,
+> heartbeat or running schedule-to-close timeout counts only when the attempt's
+> handler started. It then counts as a retryable failure. A task that waited after its claim,
 > or never left the queue, made no downstream call, so a backlog cannot trip
 > the breaker.
 >
@@ -199,10 +199,12 @@ per-shard ACID model; an outage that hits every shard trips each independently).
 |---|---|---|---|
 | `harvest.activity.circuit.tripped` | counter | `activity.name` | Breaker trips closed→open, or re-opens after a failed half-open probe. |
 | `harvest.activity.circuit.closed` | counter | `activity.name` | Breaker recovers to closed after a successful half-open probe. |
+| `harvest.activity.circuit.deferred` | counter | `activity.name` | An open breaker in defer mode puts a claimed task back to `PENDING` (issue #1809). |
 
 Existing alerting (#176 rules, #355 Prometheus) picks these up for free. A useful
 alert: `increase(harvest_activity_circuit_tripped_total[5m]) > 0` — a trip means
-a downstream is down and workflows are taking their failure path.
+a downstream is down. Work waits in `PENDING` (defer mode) or takes its failure
+path (fail-fast mode).
 
 ### Management API
 
@@ -215,7 +217,8 @@ a downstream is down and workflows are taking their failure path.
 
 Each response carries `state` (`closed`/`open`/`half_open`), `forced_open`,
 `last_trip`, `rolling_failure_count`, `time_until_probe_secs`, and the configured
-`failure_threshold` / `window_secs` / `cooldown_secs`.
+`failure_threshold` / `window_secs` / `cooldown_secs` / `open_mode` (`defer` or
+`fail_fast`).
 
 > The breaker state is in-process. The management API reflects the breaker state
 > of the worker process serving the request. In a split web/worker deployment,

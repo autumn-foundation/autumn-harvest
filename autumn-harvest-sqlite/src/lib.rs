@@ -364,7 +364,9 @@
 //!     attempt cap; the WHOLE policy also reaches the worker per-dispatch via the
 //!     command's `retry_policy_override` (backoff timing + non-retryable classification).
 //!   - `default_start_to_close` — honored via the command's `start_to_close_override`
-//!     (a per-attempt post-execution `ActivityTimedOut { StartToClose }`).
+//!     (a per-attempt post-execution `ActivityTimedOut { StartToClose }`). The
+//!     timeout is terminal here. Postgres retries it per the retry policy (issue
+//!     #1809, ADR 0004).
 //!   - `default_queue` — recorded on the task row (single-writer routing is a no-op).
 //! - **REJECTED (a dispatch-admission / cross-worker semantic with no single-writer
 //!   analog, or a cap raiser that would otherwise silently apply the STRICTER global

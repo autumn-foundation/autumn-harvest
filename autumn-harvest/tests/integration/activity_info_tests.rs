@@ -1320,9 +1320,10 @@ async fn checkpointing_activity_loses_zero_completed_work() {
 
     // --- Negative control: same work, no deadline guard. ---
     //
-    // Without the guard the attempt is killed by the `start_to_close` scanner,
-    // which is terminal (non-retryable), so the run fails with strictly fewer
-    // than TOTAL_ITEMS processed. This is what makes the guarded result above
+    // Without the guard the attempt is killed by the `start_to_close` scanner.
+    // The control allows one attempt, so the timeout is terminal (ADR 0004,
+    // issue #1809), and the run fails with strictly fewer than TOTAL_ITEMS
+    // processed. This is what makes the guarded result above
     // attributable to `ctx.is_expiring_within` rather than to luck.
     let (exec2, _) = seed_workflow(&mut conn, "unguarded_wf", serde_json::json!({})).await;
     let (registry2, observed2) = build_registry(
@@ -1331,7 +1332,7 @@ async fn checkpointing_activity_loses_zero_completed_work() {
             "unguarded_activity",
             unguarded_activity,
             ATTEMPT_BUDGET,
-            RetryPolicy::fixed(5, Duration::from_millis(50)),
+            RetryPolicy::fixed(1, Duration::from_millis(50)),
         )],
     );
     let worker2 = build_worker("w-info-f2", registry2);

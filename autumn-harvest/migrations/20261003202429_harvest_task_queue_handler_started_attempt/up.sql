@@ -11,8 +11,8 @@
 --
 -- A nullable column with no default changes only the catalog. The ALTER
 -- still takes an ACCESS EXCLUSIVE lock on a hot table, so it waits at most
--- 5 s, as the other lock-taking migrations in this tree do. A failed
--- migration retries.
+-- 5 s for that lock. Then the migration fails, and the operator runs it
+-- again. Traffic does not queue behind a blocked ALTER.
 SELECT set_config('lock_timeout', '5s', true);
 
 ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS handler_started_attempt INT4;

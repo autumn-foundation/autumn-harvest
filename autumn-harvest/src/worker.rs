@@ -5643,8 +5643,8 @@ async fn append_activity_started_if_pending(
             if lock_activity_claim(conn, task).await? != queue::ClaimLock::Held {
                 return Ok(None);
             }
-            // The handler of this claim starts now (issue #1809). Only such an
-            // attempt can time out against the downstream, so only its
+            // This claim appends `ActivityStarted` now (issue #1809). Only such
+            // an attempt can time out against the downstream, so only its
             // timeout feeds the circuit breaker.
             queue::mark_claim_handler_started(conn, &claim_of_task(task)?)
                 .await?
@@ -15166,12 +15166,56 @@ async fn execute_activity_future_with_cancellation(
     .await
 }
 
+/// Releases an admitted half-open probe unless the attempt reports its result
+/// (issue #1809).
+///
+/// `on_dispatch` sets `probe_in_flight`. Only `on_result` or `on_cancelled`
+/// clears it. An early return that calls neither leaves the breaker half-open
+/// for good. Every later dispatch then short-circuits, and in defer mode the
+/// work waits forever. The drop calls `on_cancelled`, which re-arms the
+/// cooldown. A repeat call after an explicit release is a no-op, because the
+/// release bumps the breaker generation.
+struct CircuitProbeGuard<'a> {
+    breakers: &'a crate::circuit_breaker::CircuitBreakerRegistry,
+    activity_name: &'a str,
+    token: Option<crate::circuit_breaker::DispatchToken>,
+}
+
+impl<'a> CircuitProbeGuard<'a> {
+    const fn new(
+        breakers: &'a crate::circuit_breaker::CircuitBreakerRegistry,
+        activity_name: &'a str,
+        token: Option<crate::circuit_breaker::DispatchToken>,
+    ) -> Self {
+        Self {
+            breakers,
+            activity_name,
+            token,
+        }
+    }
+
+    /// The attempt now reports its own outcome to the breaker.
+    const fn disarm(&mut self) {
+        self.token = None;
+    }
+}
+
+impl Drop for CircuitProbeGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() {
+            self.breakers
+                .on_cancelled(self.activity_name, token, std::time::Instant::now());
+        }
+    }
+}
+
 /// Lower clamp on an open-circuit deferral, so a probe that is due at once
 /// cannot spin the claim loop hot (issue #1809).
 const CIRCUIT_DEFER_MIN: Duration = Duration::from_millis(100);
 /// Upper clamp on an open-circuit deferral (issue #1809). A forced-open
-/// breaker or a probe in flight gives no time to the next probe. The task
-/// then checks again at least this often, so it runs soon after a recovery.
+/// breaker, or a probe in flight, reports no time until the next probe. The
+/// task then checks again at least this often, so it runs soon after a
+/// recovery.
 const CIRCUIT_DEFER_MAX: Duration = Duration::from_secs(30);
 
 /// The delay of a task that an open breaker defers (issue #1809).
@@ -15589,6 +15633,9 @@ async fn process_activity_task(
         crate::circuit_breaker::DispatchDecision::Allow { token } => Some(token),
         crate::circuit_breaker::DispatchDecision::ShortCircuit { .. } => None,
     };
+    // Releases a half-open probe on every early return, `?` included (issue
+    // #1809). In defer mode a leaked probe would defer this activity forever.
+    let mut probe_guard = CircuitProbeGuard::new(&circuit_breakers, activity_name, circuit_token);
 
     // Defer mode (issue #1809): an open breaker puts the task back to
     // PENDING until the next probe. The deferral runs before
@@ -15601,11 +15648,14 @@ async fn process_activity_task(
     {
         let delay = circuit_defer_delay(retry_after, policy.cooldown, task);
         let mut conn = pool.get().await.map_err(crate::error::database_error)?;
-        if queue::defer_claimed_task_for_open_circuit(&mut conn, &claim_of_task(task)?, delay)
+        match queue::defer_claimed_task_for_open_circuit(&mut conn, &claim_of_task(task)?, delay)
             .await?
-            == queue::ClaimWrite::LeaseLost
         {
-            log_lease_lost(task, "open-circuit deferral");
+            queue::ClaimWrite::Applied => registry
+                .telemetry()
+                .metrics
+                .record_circuit_deferred(activity_name),
+            queue::ClaimWrite::LeaseLost => log_lease_lost(task, "open-circuit deferral"),
         }
         return Ok(());
     }
@@ -15722,8 +15772,9 @@ async fn process_activity_task(
     // slot is free before the handler runs (prevents a deadlock when
     // `run_transactional` needs a second slot while max_size connections are held
     // by concurrent activity tasks). Appended AFTER the rate-limit reservation so
-    // a deferred task never records a start it did not run; serves both the
-    // short-circuit path (start + CircuitOpen failure) and the real-call path.
+    // a deferred task never records a start it did not run. It serves the
+    // fail-fast short-circuit path (start + CircuitOpen failure) and the
+    // real-call path.
     let started = {
         let mut conn = pool.get().await.map_err(crate::error::database_error)?;
         let started_result = append_activity_started_if_pending(
@@ -16282,6 +16333,7 @@ async fn process_activity_task(
     // its slot must still be released via `on_cancelled`, or the breaker would
     // stay HalfOpen with `probe_in_flight = true` forever and short-circuit every
     // later dispatch. Only genuine handler outcomes feed the breaker as outcomes.
+    probe_guard.disarm();
     let circuit_outcome = if was_cancelled {
         if let Some(token) = circuit_token {
             circuit_breakers.on_cancelled(activity_name, token, std::time::Instant::now());

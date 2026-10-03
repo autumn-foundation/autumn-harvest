@@ -754,42 +754,77 @@ struct LockedTask {
     /// ([`pause_suppresses_timeout_enforcement`]) and the retry deadline
     /// check (issue #1809) read it, not the scan-time snapshot.
     schedule_to_close_at: Option<chrono::DateTime<Utc>>,
+    /// The row-current poison-pill count. A timeout retry keeps it.
+    crash_strikes: i32,
+    /// The row is `RUNNING` under the claim that the scan saw (issue #1809).
+    scanned_claim: bool,
     /// The handler of the scanned claim started (issue #1809).
     handler_started: bool,
+    /// The heartbeat deadline has passed on the row-current values.
+    heartbeat_expired: bool,
+}
+
+/// SQL for [`lock_task_for_timeout`].
+///
+/// `clock_timestamp()`, not `NOW()`: this transaction can wait on row locks,
+/// and `NOW()` is frozen at its start.
+const LOCK_TASK_FOR_TIMEOUT_SQL: &str = "SELECT state, schedule_to_close_at, crash_strikes, \
+         worker_id, attempt, started_at, handler_started_attempt, \
+         COALESCE(heartbeat_timeout IS NOT NULL \
+             AND COALESCE(last_heartbeat_at, started_at) + heartbeat_timeout \
+                 < clock_timestamp(), false) AS heartbeat_expired \
+     FROM harvest_task_queue WHERE id = $1 FOR UPDATE";
+
+#[derive(diesel::QueryableByName)]
+struct LockedTaskRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    state: String,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
+    schedule_to_close_at: Option<chrono::DateTime<Utc>>,
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    crash_strikes: i32,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    worker_id: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    attempt: i32,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
+    started_at: Option<chrono::DateTime<Utc>>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
+    handler_started_attempt: Option<i32>,
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    heartbeat_expired: bool,
 }
 
 /// Locked (`FOR UPDATE`) read of a task row for [`enforce_activity_timeout`].
 ///
-/// `handler_started` is true only while the row is `RUNNING` under the
-/// claim of `task` and that claim started its handler.
+/// A claim is the pair `(worker_id, attempt)`, but a self-release before the
+/// handler lets a later claim reuse the pair. `started_at` tells the two
+/// claims apart, so `scanned_claim` compares all three with the scan
+/// snapshot `task`.
 async fn lock_task_for_timeout(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
 ) -> HarvestResult<Option<LockedTask>> {
-    use crate::schema::harvest_task_queue::dsl;
-
-    let row = dsl::harvest_task_queue
-        .find(task.id)
-        .for_update()
-        .select((
-            dsl::state,
-            dsl::schedule_to_close_at,
-            dsl::attempt,
-            dsl::handler_started_attempt,
-        ))
-        .first::<(String, Option<chrono::DateTime<Utc>>, i32, Option<i32>)>(conn)
+    let row = diesel::sql_query(LOCK_TASK_FOR_TIMEOUT_SQL)
+        .bind::<diesel::sql_types::Uuid, _>(task.id)
+        .get_result::<LockedTaskRow>(conn)
         .await
         .optional()
         .map_err(crate::error::database_error)?;
-    Ok(row.map(
-        |(state, schedule_to_close_at, attempt, handler_started_attempt)| LockedTask {
-            handler_started: state == "RUNNING"
-                && attempt == task.attempt
-                && handler_started_attempt == Some(attempt),
-            state,
-            schedule_to_close_at,
-        },
-    ))
+    Ok(row.map(|row| {
+        let scanned_claim = row.state == "RUNNING"
+            && row.worker_id == task.worker_id
+            && row.attempt == task.attempt
+            && row.started_at == task.started_at;
+        LockedTask {
+            handler_started: scanned_claim && row.handler_started_attempt == Some(row.attempt),
+            scanned_claim,
+            heartbeat_expired: row.heartbeat_expired,
+            crash_strikes: row.crash_strikes,
+            state: row.state,
+            schedule_to_close_at: row.schedule_to_close_at,
+        }
+    }))
 }
 
 /// The result of [`enforce_activity_timeout`]'s transaction. `None` means
@@ -1416,11 +1451,20 @@ async fn enforce_activity_timeout(
             if !expected_task_states_for_timeout(reason).contains(&locked.state.as_str()) {
                 return Ok(None);
             }
-            // Authoritative `schedule_to_start` deadline re-read (round-18 review),
-            // now placed here — after the execution row lock above and while this
-            // transaction already holds the task row from
-            // `lock_task_for_timeout` — so it preserves the
-            // execution-row -> task-row order (round-22 review). The unlocked
+            // A start-to-close or heartbeat timeout judges one claim (issue
+            // #1809). When a later claim holds the row, the scan snapshot is
+            // stale and the new attempt has its own clock. A heartbeat that
+            // landed after the scan also cancels the timeout.
+            if reason.retries_per_policy()
+                && (!locked.scanned_claim
+                    || (matches!(reason, TimeoutReason::Heartbeat) && !locked.heartbeat_expired))
+            {
+                return Ok(None);
+            }
+            // Authoritative `schedule_to_start` deadline re-read. It runs here,
+            // after the execution row lock above. The transaction already holds
+            // the task row from `lock_task_for_timeout`. So the read keeps the
+            // execution-row -> task-row lock order. The unlocked
             // fast-path check near the top of this transaction is advisory; this is
             // the one that must be trusted, because only a lock held across the
             // resume's own `scheduled_at` shift can serialize against it.
@@ -1502,9 +1546,11 @@ async fn enforce_activity_timeout(
             };
             // Timeout retry (issue #1809, ADR 0004). A start-to-close or
             // heartbeat timeout retries per the retry policy, as a handler
-            // failure does. The requeue is fenced by the scanned claim, so a
-            // later claim of the row is never requeued. It appends no event:
-            // the workflow sees only the final outcome.
+            // failure does. The check above confirmed the scanned claim, and
+            // the requeue is fenced by it too. It appends no event: the
+            // workflow sees only the final outcome. It keeps `crash_strikes`,
+            // because a timeout does not prove that the attempt ended without
+            // a crash.
             //
             // No retry starts after `schedule_to_close`. A paused execution
             // is the exception, because a pause stops that clock. Resume then
@@ -1521,8 +1567,14 @@ async fn enforce_activity_timeout(
                     );
                 if !past_deadline {
                     return Ok(
-                        match queue::requeue_claimed_task_for_retry(conn, &claim, delay, &error)
-                            .await?
+                        match queue::requeue_claimed_task_after_timeout(
+                            conn,
+                            &claim,
+                            delay,
+                            &error,
+                            locked.crash_strikes,
+                        )
+                        .await?
                         {
                             queue::ClaimWrite::Applied => outcome(true),
                             queue::ClaimWrite::LeaseLost => None,
@@ -1555,11 +1607,10 @@ async fn enforce_activity_timeout(
         metrics.record_activity_retried(activity_name, &task.queue_name);
     }
 
-    // Circuit breaker (issues #369, #1809): a timeout against a protected
-    // downstream is a retryable, downstream-style failure that the
-    // handler-result path never sees (the worker may be gone). Record it out
-    // of band so a hanging downstream trips the breaker, as an explicit error
-    // would.
+    // Circuit breaker (issues #369, #1809). A timeout against a protected
+    // downstream is a retryable, downstream-style failure. The handler-result
+    // path never sees it, because the worker may be gone. Record it out of
+    // band, so a hanging downstream trips the breaker as an explicit error does.
     //
     // Only an attempt whose handler started can say anything about the
     // downstream. A task that waited after its claim made no call, and
@@ -1574,6 +1625,38 @@ async fn enforce_activity_timeout(
         metrics.record_circuit_tripped(activity_name);
     }
     Ok(())
+}
+
+/// Test seam for the activity timeout enforcer (issue #1809).
+///
+/// [`enforce_timeouts_once`] scans and enforces in one call, so a test cannot
+/// hand it a stale scan snapshot. This enforces `reason` for `task` as the
+/// scanner would.
+///
+/// # Errors
+///
+/// Returns the error of the enforcement transaction.
+#[doc(hidden)]
+pub async fn enforce_activity_timeout_for_test(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    reason: &TimeoutReason,
+    circuit_breakers: Option<&crate::circuit_breaker::CircuitBreakerRegistry>,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<()> {
+    let exec_uuid = task.workflow_exec_id.ok_or_else(|| {
+        HarvestError::NotFound(format!("task queue item {} has no execution", task.id))
+    })?;
+    enforce_activity_timeout(
+        conn,
+        task,
+        execution_id_from_uuid(exec_uuid),
+        reason,
+        circuit_breakers,
+        &crate::telemetry::NoOpMetrics,
+        codecs,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------

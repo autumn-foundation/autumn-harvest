@@ -1237,8 +1237,9 @@ self-resolves within one evaluation window is expected.
 
 1. If a downstream outage is confirmed, force-open the failing activity's
    circuit breaker (`POST /api/harvest/admin/circuits/{activity}/force-open`)
-   so new sagas fail fast at the first step instead of committing work they
-   will immediately unwind.
+   so new sagas stop at the first step instead of committing work they will
+   immediately unwind. In defer mode they wait in `PENDING`. In fail-fast mode
+   they fail at once.
 2. Pause the schedules or gate the admissions that feed the affected workflow
    type until the downstream recovers.
 3. Let in-flight unwinds run — compensations are idempotent by contract and
