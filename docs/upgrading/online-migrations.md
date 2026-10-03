@@ -80,7 +80,9 @@ zero value ends the bound for the locks after it. `0` turns the timeout off.
 `DEFAULT` restores the server default, which is usually `0`, so the lint does
 not accept it. `SET lock_timeout` must be its own statement. `ALTER ROLE ...
 SET lock_timeout` does not change the current session. Inside a `DO` block,
-`PERFORM set_config('lock_timeout', '5s', true)` also counts.
+`PERFORM set_config('lock_timeout', '5s', true)` also counts. The same call in a
+function body does not count, because the body runs only when something calls
+the function.
 
 `5s` is the bound that the existing lock-taking migrations use. When the
 timeout fires, the migration fails and rolls back. Run it again.

@@ -404,6 +404,9 @@ struct Token {
     line: usize,
     /// How many dollar-quoted bodies enclose the token. Zero is top level.
     depth: usize,
+    /// Whether the token runs when the migration runs. A function body does
+    /// not, because it runs only when something calls the function.
+    runs: bool,
 }
 
 /// A `--` comment, without the dashes.
@@ -422,16 +425,19 @@ fn tokenize(sql: &str) -> (Vec<Token>, Vec<Comment>) {
     let chars: Vec<char> = sql.chars().collect();
     let mut toks = Vec::new();
     let mut comments = Vec::new();
-    lex(&chars, 1, 0, &mut toks, &mut comments);
+    lex(&chars, 1, 0, true, &mut toks, &mut comments);
     (toks, comments)
 }
 
 /// Lex `chars`, which start on line `line` inside `depth` dollar bodies.
+///
+/// `runs` says whether these tokens run when the migration runs.
 #[allow(clippy::too_many_lines)]
 fn lex(
     chars: &[char],
     mut line: usize,
     depth: usize,
+    runs: bool,
     toks: &mut Vec<Token>,
     comments: &mut Vec<Comment>,
 ) {
@@ -500,6 +506,7 @@ fn lex(
                 tok: Tok::Str(value),
                 line: start_line,
                 depth,
+                runs,
             });
         } else if c == '"' {
             // A quoted identifier keeps its case. `""` is an escaped quote.
@@ -523,6 +530,7 @@ fn lex(
                 tok: Tok::Word(value),
                 line: start_line,
                 depth,
+                runs,
             });
         } else if let Some(len) = dollar_tag_len(&chars[i..]) {
             // Find the matching close first, then lex only the body.
@@ -532,7 +540,17 @@ fn lex(
                 .find(|&j| chars[j..].starts_with(tag))
                 .unwrap_or(chars.len());
             let body = &chars[body_start..body_end];
-            lex(body, line, depth + 1, toks, comments);
+            // Only a `DO` body runs now. Any other body, such as a
+            // function body or a string, runs later or never.
+            let statement_head = toks
+                .iter()
+                .rev()
+                .filter(|t| t.depth == depth)
+                .take_while(|t| t.tok != Tok::Punct(';'))
+                .last();
+            let body_runs =
+                runs && statement_head.is_some_and(|t| t.tok == Tok::Word("do".to_string()));
+            lex(body, line, depth + 1, body_runs, toks, comments);
             line += body.iter().filter(|c| **c == '\n').count();
             i = (body_end + len).min(chars.len());
         } else if c.is_alphanumeric() || c == '_' {
@@ -545,12 +563,14 @@ fn lex(
                 tok: Tok::Word(word.to_lowercase()),
                 line,
                 depth,
+                runs,
             });
         } else {
             toks.push(Token {
                 tok: Tok::Punct(c),
                 line: line,
                 depth,
+                runs,
             });
             i += 1;
         }
@@ -792,7 +812,7 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
     // do nothing, so it does not count.
     let mut created: BTreeMap<String, usize> = BTreeMap::new();
 
-    for k in 0..toks.len() {
+    for (k, tok) in toks.iter().enumerate() {
         let start = s.starts[k] == k;
         match s.word(k) {
             Some("create") if start => create(&s, k, &mut raws, &mut created),
@@ -836,7 +856,10 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
                 let parent = s.qualified_name(k + 2).map(|(t, _)| t);
                 raws.push(Raw::lock(s.starts[k], "PARTITION OF", parent));
             }
-            _ => timeouts.extend(timeout_change(&s, k).map(|bounds| (k, bounds))),
+            _ if tok.runs => {
+                timeouts.extend(timeout_change(&s, k).map(|bounds| (k, bounds)));
+            }
+            _ => {}
         }
     }
 
@@ -1787,6 +1810,20 @@ fn a_partition_of_a_hot_table_locks_the_parent() {
                FOR VALUES FROM (1) TO (2);";
     let findings = lint_with_history(&[], sql, true);
     assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+}
+
+#[test]
+fn a_timeout_set_inside_a_function_body_does_not_count() {
+    // A function body runs only when someone calls the function.
+    let sql = "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$\n\
+               BEGIN\n    PERFORM set_config('lock_timeout', '5s', true);\nEND $$;\n\
+               ALTER TABLE harvest_events ADD COLUMN x INT;\n";
+    let findings = lint_with_history(&[], sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+
+    let in_do = "DO $$\nBEGIN\n    PERFORM set_config('lock_timeout', '5s', true);\nEND $$;\n\
+                 ALTER TABLE harvest_events ADD COLUMN x INT;\n";
+    assert_eq!(lint_with_history(&[], in_do, true), []);
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────
