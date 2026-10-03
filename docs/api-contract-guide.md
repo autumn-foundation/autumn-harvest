@@ -63,6 +63,29 @@ Each route entry:
 | `error_responses` | array | Documented error status codes and conditions |
 | `idempotency` | string | (Optional) Idempotency semantics for the route |
 
+### Response fields
+
+A `fields` entry is a bare name or an object. The object form takes these
+keys (issue #1616):
+
+| Key | Meaning |
+|---|---|
+| `name` | The JSON key. |
+| `type` | `string`, `integer`, `number`, `boolean`, `object`, `array`, or `any`. The transform rejects other names. |
+| `nullable` | `true` when the value can be `null`. It needs a concrete `type`. |
+| `required` | `true` when the key is in every body. |
+| `fields` | The properties of an `object` field, in this same form. |
+| `items` | The element type of an `array` field: an object with `type`, and `fields` for objects. |
+| `description` | Text for the generated client. |
+
+Use `any` for a value the handler passes through, such as workflow input. The
+document marks it `x-harvest-any`, so a reader can tell it from a field with no
+type yet. A bare name has no type.
+
+The routes in `autumn_harvest_plugin::openapi::CORE_CLIENT_ROUTES` must type
+every field. `tests/openapi_response_conformance.rs` checks each type against
+the live handler.
+
 ---
 
 ## Compatibility rules

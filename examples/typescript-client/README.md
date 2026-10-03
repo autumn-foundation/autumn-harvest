@@ -49,8 +49,14 @@ build output and is not checked in. `src/start-and-poll.ts` imports its `paths`
 type and passes it to [`openapi-fetch`](https://openapi-ts.dev/openapi-fetch/),
 so a wrong path, method, parameter or body fails `npm run typecheck`.
 
-Response property types are `unknown` because the contract records field names,
-not full JSON Schemas. See [`docs/openapi.md`](../../docs/openapi.md).
+The start, status, result, signal, cancel, terminate and health responses
+have a type on every field. Other response properties are `unknown`. See
+[`docs/openapi.md`](../../docs/openapi.md).
+
+You do not need this generate step to write a client. Each release attaches
+a prebuilt package; see [`clients/typescript`](../../clients/typescript/README.md).
+This example generates from the served document, so CI also proves that the
+endpoint answers a real generator.
 
 ## Against an authenticated deployment
 
