@@ -467,14 +467,14 @@ async fn stamped_heartbeat_loop(
         // If we got at least one heartbeat, flush to DB.
         if let Some(beat) = pending.take() {
             let started = tokio::time::Instant::now();
-            match flush(&pool, &claim, &beat, options.acquire_timeout).await {
-                Ok(ClaimWrite::Applied) => {
-                    // A write that blocked leaves the row with an old send
-                    // time. A newer heartbeat then goes at once, so a timeout
-                    // scanner does not see a live activity as stale
-                    // (issue #1788).
-                    after_blocked_write = write_blocked(started.elapsed(), flush_interval);
-                }
+            let outcome = flush(&pool, &claim, &beat, options.acquire_timeout).await;
+            // A write that blocked leaves the row with an old send time,
+            // whether it then succeeds or fails. A newer heartbeat then goes
+            // at once, so a timeout scanner does not see a live activity as
+            // stale (issue #1788).
+            let blocked = write_blocked(started.elapsed(), flush_interval);
+            match outcome {
+                Ok(ClaimWrite::Applied) => after_blocked_write = blocked,
                 // The claim is no longer current (issue #1789). Stop the
                 // activity, so this stale attempt does no more work.
                 Ok(ClaimWrite::LeaseLost) => {
@@ -502,6 +502,7 @@ async fn stamped_heartbeat_loop(
                         error = %failure.error,
                         "failed to flush heartbeat to database; retrying on the next tick"
                     );
+                    after_blocked_write = blocked;
                     pending = Some(beat);
                 }
             }
@@ -795,6 +796,60 @@ mod tests {
                 started.elapsed() < Duration::from_secs(2),
                 "{:?}",
                 started.elapsed()
+            );
+        }
+
+        /// Records when each flush failure happens.
+        #[derive(Default)]
+        struct FailureTimes(Mutex<Vec<Instant>>);
+
+        impl crate::telemetry::MetricsRecorder for FailureTimes {
+            fn record_heartbeat_flush_failed(&self, _reason: &str) {
+                self.0.lock().expect("lock").push(Instant::now());
+            }
+        }
+
+        /// A flush that blocks for an interval and then fails is followed at
+        /// once by a newer heartbeat (issue #1788). The old row is stale by
+        /// then, so a further pause could let a scanner reclaim the activity.
+        #[tokio::test]
+        async fn a_newer_heartbeat_follows_a_blocked_failed_flush_at_once() {
+            let (_listener, pool) = silent_pool().await;
+            let failures = Arc::new(FailureTimes::default());
+            let cancel = CancellationToken::new();
+            let bound = Duration::from_millis(1500);
+            let tx = spawn_heartbeat_flusher_with(
+                TaskClaim::new(uuid::Uuid::new_v4(), "w-1", 1),
+                pool,
+                cancel.clone(),
+                HeartbeatFlushOptions {
+                    acquire_timeout: bound,
+                    metrics: Arc::clone(&failures) as Arc<dyn crate::telemetry::MetricsRecorder>,
+                },
+            );
+            tx.send(serde_json::json!({"p": 1}).into())
+                .await
+                .expect("send");
+            // The first flush starts after one interval and blocks for `bound`.
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            tx.send(serde_json::json!({"p": 2}).into())
+                .await
+                .expect("send");
+
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let times = loop {
+                let times = failures.0.lock().expect("lock").clone();
+                if times.len() >= 2 {
+                    break times;
+                }
+                assert!(Instant::now() < deadline, "failures seen: {}", times.len());
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            };
+            cancel.cancel();
+            let gap = times[1] - times[0];
+            assert!(
+                gap < bound + Duration::from_millis(700),
+                "the retry came {gap:?} after the blocked failure; it must not wait an interval"
             );
         }
 
