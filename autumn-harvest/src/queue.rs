@@ -3881,8 +3881,9 @@ pub struct RetryActivityOutcome {
 ///
 /// A backing-off activity is a `PENDING` `harvest_task_queue` row whose
 /// `scheduled_at` is in the future (set by [`requeue_for_retry`]). This
-/// function advances that timestamp to `NOW()` and wakes an idle worker via
-/// `pg_notify` so dispatch happens within one poll interval.
+/// function sets that timestamp to the live database clock
+/// (`clock_timestamp()`, issue #1807). It also wakes an idle worker via
+/// `pg_notify`, so dispatch happens within one poll interval.
 ///
 /// # Semantics
 ///
@@ -3965,8 +3966,9 @@ pub async fn force_retry_activity_now(
     }
 
     // Stamp the database clock. `claim_task` checks `scheduled_at <= NOW()` on
-    // that same clock, so the row is claimable at once and needs no skew
-    // allowance (issue #1807).
+    // that same clock. The row is claimable as soon as the next statement
+    // starts, so it needs no skew allowance (issue #1807).
+    //
     // Advance scheduled_at. Only update if still PENDING (guards a concurrent
     // claim race — a worker that claimed the row between our SELECT and this
     // UPDATE would have set state='RUNNING'; the WHERE clause then matches 0
@@ -3996,10 +3998,12 @@ pub async fn force_retry_activity_now(
         crate::notify::notify_task_enqueued(conn, &actual_queue, task_id).await?;
         // Dispatch hint (issue #1312). Only when the row actually advanced: an
         // already-eligible row was hinted when it was first made `PENDING`.
+        // The dispatcher compares `due` with the host clock. Cap it at the
+        // host time so a host behind the database does not hold the hint.
         record_pending_hint(
             task_id,
             &actual_queue,
-            actual_scheduled_at,
+            actual_scheduled_at.min(Utc::now()),
             row.priority,
             crate::dispatch::DispatchKind::Activity,
         );

@@ -179,7 +179,9 @@ pub const fn stuck_running_tasks_query() -> &'static str {
 /// count the caller observed at scan time. `$4` = the new crash-strike
 /// count to record. `$5` = the worker-stale threshold in seconds. `$6` =
 /// the current time, bound by the caller rather than read via SQL `NOW()`
-/// -- see [`requeue_orphan`]'s call site for why.
+/// -- see [`requeue_orphan`]'s call site for why. Only the liveness check
+/// uses `$6`. The new `scheduled_at` is `clock_timestamp()`, the database
+/// clock that `claim_task` reads (issue #1807).
 ///
 /// Returns the row's id if it was actually transitioned. Returns no row
 /// otherwise: state/worker/strikes no longer match what the scan
@@ -195,7 +197,7 @@ pub const fn requeue_orphan_stmt() -> &'static str {
          last_heartbeat_at = NULL, \
          error = NULL, \
          crash_strikes = $4, \
-         scheduled_at = $6 \
+         scheduled_at = clock_timestamp() \
      WHERE id = $1 \
        AND state = 'RUNNING' \
        AND worker_id = $2 \

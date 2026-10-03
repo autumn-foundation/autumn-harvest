@@ -19,38 +19,119 @@ const SCAN_COLUMNS: &[&str] = &["last_heartbeat_at", "scheduled_at", "schedule_t
 
 const MARKER: &str = "host-clock-ok:";
 
-/// Return `(line, text)` for each violating line in `source`.
-fn violations(source: &str) -> Vec<(usize, String)> {
+/// Upper bound on the bytes that one write expression may span.
+const STATEMENT_WINDOW: usize = 300;
+
+/// Blank out `//` comments so a comment cannot hide or fake a write.
+fn strip_comments(source: &str) -> String {
+    source
+        .lines()
+        .map(|line| line.find("//").map_or(line, |at| &line[..at]))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Byte offset where non-test code ends, or the source length.
+fn production_end(source: &str) -> usize {
     let lines: Vec<&str> = source.lines().collect();
-    let mut found = Vec::new();
+    let mut offset = 0;
+    let mut starts = Vec::with_capacity(lines.len());
+    for line in &lines {
+        starts.push(offset);
+        offset += line.len() + 1;
+    }
     for (index, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-        let test_cfg = trimmed.starts_with("#[cfg(") && trimmed.contains("test");
-        if test_cfg
-            && lines
-                .get(index + 1)
-                .is_some_and(|next| next.trim_start().starts_with("mod "))
-        {
-            break;
-        }
-        if line.trim_start().starts_with("//") || !line.contains("Utc::now") {
+        if !line.trim_start().starts_with("mod ") {
             continue;
         }
-        let allowed = line.contains(MARKER)
-            || index
-                .checked_sub(1)
-                .is_some_and(|prev| lines[prev].contains(MARKER));
-        if allowed {
-            continue;
-        }
-        let hits_column = SCAN_COLUMNS.iter().any(|column| {
-            line.contains(&format!("{column}.eq(")) || line.contains(&format!("{column}:"))
+        let first = index.saturating_sub(3);
+        let attr = lines[first..index].iter().position(|above| {
+            let above = above.trim();
+            above.starts_with("#[cfg(") && above.contains("test") && !above.contains("not(test")
         });
-        if hits_column {
-            found.push((index + 1, (*line).to_string()));
+        if let Some(found) = attr {
+            return starts[first + found];
         }
     }
+    source.len()
+}
+
+fn line_of(source: &str, offset: usize) -> usize {
+    source[..offset].matches('\n').count() + 1
+}
+
+/// Whether `column` at `at` is a write target: `.eq(`, `:` or `=`.
+fn is_write_target(code: &str, column: &str, at: usize) -> bool {
+    let before = code[..at].chars().next_back();
+    if before.is_some_and(|c| c.is_alphanumeric() || c == '_') {
+        return false;
+    }
+    let rest = code[at + column.len()..].trim_start();
+    rest.starts_with(".eq(")
+        || (rest.starts_with(':') && !rest.starts_with("::"))
+        || (rest.starts_with('=') && !rest.starts_with("==") && !rest.starts_with("=>"))
+}
+
+/// Return `(line, text)` for each violating write in `source`.
+///
+/// A write is a scan column followed by `.eq(`, `:` or `=`, with `Utc::now`
+/// inside the same expression. The expression can span lines.
+fn violations(source: &str) -> Vec<(usize, String)> {
+    let original: Vec<&str> = source.lines().collect();
+    let end = production_end(source);
+    let code = strip_comments(&source[..end]);
+    let mut found = Vec::new();
+    for column in SCAN_COLUMNS {
+        for (at, _) in code.match_indices(column) {
+            if !is_write_target(&code, column, at) {
+                continue;
+            }
+            let window = expression_after(&code, at + column.len());
+            if !window.contains("Utc::now") {
+                continue;
+            }
+            let first = line_of(&code, at);
+            let last = first + window.matches('\n').count();
+            let marked = (first.saturating_sub(1)..=last)
+                .filter(|line| *line >= 1)
+                .any(|line| {
+                    original
+                        .get(line - 1)
+                        .is_some_and(|text| text.contains(MARKER))
+                });
+            if !marked {
+                found.push((first, original[first - 1].to_string()));
+            }
+        }
+    }
+    found.sort_unstable();
+    found.dedup();
     found
+}
+
+/// The expression that follows a column name.
+///
+/// It ends at a `,` or `;` outside brackets, at a closing bracket that has no
+/// opener, or after `STATEMENT_WINDOW` bytes.
+fn expression_after(code: &str, from: usize) -> &str {
+    let mut depth = 0_i32;
+    for (offset, ch) in code[from..].char_indices() {
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => {
+                depth -= 1;
+                if depth < 0 {
+                    return &code[from..from + offset];
+                }
+            }
+            ',' | ';' if depth == 0 => return &code[from..from + offset],
+            _ => {}
+        }
+        if offset >= STATEMENT_WINDOW {
+            return &code[from..from + offset];
+        }
+    }
+    &code[from..]
 }
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -119,5 +200,57 @@ fn scanner_skips_the_test_module() {
 #[test]
 fn scanner_accepts_a_database_clock_write() {
     let source = "dsl::last_heartbeat_at.eq(sql::<Nullable<Timestamptz>>(\"clock_timestamp()\"))";
+    assert!(violations(source).is_empty());
+}
+
+#[test]
+fn scanner_flags_a_call_split_across_lines() {
+    let source = "dsl::scheduled_at\n    .eq(Utc::now()),";
+    assert_eq!(violations(source).len(), 1);
+}
+
+#[test]
+fn scanner_flags_a_qualified_path_and_a_local_binding() {
+    assert_eq!(
+        violations("x.eq(chrono::Utc::now()); let scheduled_at = 1;").len(),
+        0
+    );
+    assert_eq!(
+        violations("dsl::scheduled_at.eq(chrono::Utc::now())").len(),
+        1
+    );
+    assert_eq!(
+        violations("let schedule_to_close_at = Utc::now() + d;").len(),
+        1
+    );
+}
+
+#[test]
+fn scanner_ignores_a_longer_column_name() {
+    assert!(violations("let my_scheduled_at = Utc::now();").is_empty());
+    assert!(violations("if scheduled_at == Utc::now() {}").is_empty());
+}
+
+#[test]
+fn scanner_ignores_a_comment() {
+    assert!(violations("// scheduled_at: Utc::now() is wrong").is_empty());
+}
+
+#[test]
+fn scanner_keeps_scanning_after_a_not_test_module() {
+    let source = "#[cfg(not(test))]\nmod real {}\nx.scheduled_at.eq(Utc::now());";
+    assert_eq!(violations(source).len(), 1);
+}
+
+#[test]
+fn scanner_skips_a_test_module_with_an_extra_attribute() {
+    let source =
+        "#[cfg(test)]\n#[allow(clippy::all)]\nmod tests {\n scheduled_at.eq(Utc::now());\n}";
+    assert!(violations(source).is_empty());
+}
+
+#[test]
+fn scanner_accepts_a_marker_above_a_split_call() {
+    let source = "// host-clock-ok: demo\ndsl::scheduled_at\n    .eq(Utc::now())";
     assert!(violations(source).is_empty());
 }
