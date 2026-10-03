@@ -213,6 +213,16 @@ pub mod points {
         caps: CAP_KILL | CAP_DELAY,
     };
 
+    /// In the worker's dispatch task, after the claim and before the task
+    /// starts.
+    ///
+    /// Race window for issue #1813. A shutdown in this window finds a claimed
+    /// task that never started. The drain must give the claim back.
+    pub const WORKER_DISPATCH_BEFORE_START: ChaosPoint = ChaosPoint {
+        name: "worker.dispatch.before_start",
+        caps: CAP_KILL | CAP_DELAY,
+    };
+
     /// Every catalogue point, in a stable order.
     pub const ALL: &[ChaosPoint] = &[
         QUEUE_PARK_BEFORE_UPDATE,
@@ -224,6 +234,7 @@ pub mod points {
         POISON_RECLAIM_BEFORE_LOAD,
         NOTIFY_TASK_ENQUEUED,
         DISPATCH_AFTER_CLAIM_BEFORE_ACK,
+        WORKER_DISPATCH_BEFORE_START,
     ];
 
     /// Ratchet on the catalogue size. Bump deliberately when adding points.

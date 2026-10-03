@@ -6402,6 +6402,21 @@ mod tests {
         );
     }
 
+    // ── Shutdown timeout default (issue #1813) ────────────────────────────
+
+    /// The default drain ends before the Kubernetes default grace period. The
+    /// headroom lets the worker mark itself stopped before a `SIGKILL`.
+    #[test]
+    fn default_shutdown_timeout_ends_before_the_kubernetes_grace_period() {
+        let kubernetes_grace_period = Duration::from_secs(30);
+        let headroom = Duration::from_secs(5);
+        assert!(
+            WorkerConfig::default().shutdown_timeout + headroom <= kubernetes_grace_period,
+            "shutdown_timeout {:?} leaves less than {headroom:?} before SIGKILL",
+            WorkerConfig::default().shutdown_timeout,
+        );
+    }
+
     // ── Shipped activity start-to-close default (issue #1808) ─────────────
 
     #[test]

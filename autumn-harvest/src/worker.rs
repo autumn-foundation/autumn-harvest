@@ -31743,6 +31743,7 @@ impl Worker {
         // body at the same nesting, so this change adds no reindentation to
         // the hottest file in the repo.
         let task_body = async move {
+            chaos_point!(WORKER_DISPATCH_BEFORE_START);
             // Acquire semaphore permit — blocks if at concurrency limit. A
             // poll-path claim already holds one (issue #1787).
             // The release wakes a saturated poll loop (issue #1787).
@@ -32211,6 +32212,16 @@ impl Worker {
     pub fn shutdown(&self) {
         self.shutdown.cancel();
     }
+}
+
+/// The instant at which a drain cancels its running activities (issue #1813).
+#[allow(dead_code)]
+fn drain_cancel_at(
+    _started: tokio::time::Instant,
+    deadline: tokio::time::Instant,
+    _join_window: Duration,
+) -> tokio::time::Instant {
+    deadline
 }
 
 // ---------------------------------------------------------------------------
@@ -36083,6 +36094,40 @@ mod tests {
         worker.shutdown();
         assert!(worker.shutdown.is_cancelled());
         Ok(())
+    }
+
+    /// The drain cancels running activities one join window before its
+    /// deadline (issue #1813).
+    #[test]
+    fn drain_cancel_at_leaves_the_join_window_before_the_deadline() {
+        let start = tokio::time::Instant::now();
+        let deadline = start + Duration::from_secs(25);
+        assert_eq!(
+            drain_cancel_at(start, deadline, Duration::from_secs(5)),
+            start + Duration::from_secs(20),
+        );
+    }
+
+    /// A short drain keeps at least half of its budget for tasks to finish.
+    #[test]
+    fn drain_cancel_at_caps_the_join_window_at_half_the_drain() {
+        let start = tokio::time::Instant::now();
+        let deadline = start + Duration::from_secs(2);
+        assert_eq!(
+            drain_cancel_at(start, deadline, Duration::from_secs(5)),
+            start + Duration::from_secs(1),
+        );
+    }
+
+    /// A remote deadline in the past cancels at once.
+    #[test]
+    fn drain_cancel_at_is_never_before_the_drain_started() {
+        let start = tokio::time::Instant::now() + Duration::from_secs(10);
+        let deadline = start - Duration::from_secs(3);
+        assert_eq!(
+            drain_cancel_at(start, deadline, Duration::from_secs(5)),
+            start
+        );
     }
 
     #[test]

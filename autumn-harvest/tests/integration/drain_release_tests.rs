@@ -1,0 +1,371 @@
+#![cfg(feature = "db")]
+#![allow(clippy::unused_async)]
+//! Drain release of running activity claims (issue #1813).
+//!
+//! At the drain deadline a worker cancels its running activities. It releases
+//! the claim of each handler that returns, so a peer retries it at once. It
+//! keeps the claim of a handler that ignores the cancel. A peer must never run
+//! that activity at the same time.
+//!
+//! Set `HARVEST_TEST_DATABASE_URL` to use a migrated Postgres. Otherwise the
+//! suite starts a testcontainers Postgres 16.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
+
+use autumn_harvest::event::WorkflowEvent;
+use autumn_harvest::models::NewWorkflowExecution;
+use autumn_harvest::prelude::*;
+use autumn_harvest::queue::{self, EnqueueParams, TaskType};
+use autumn_harvest::schema::{harvest_task_queue, harvest_workflow_executions};
+use autumn_harvest::store;
+use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker};
+use autumn_harvest::{ExecutionId, ShardId};
+
+use chrono::Utc;
+use diesel::prelude::*;
+use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use uuid::Uuid;
+
+use crate::integration_e2e::{
+    build_test_pool, runtime_config, setup_test_database_url_or_env, spawn_test_worker,
+    wait_for_execution_state_with_timeout,
+};
+
+/// The drain budget of the worker under test.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(4);
+
+// ---------------------------------------------------------------------------
+// Handlers.
+// ---------------------------------------------------------------------------
+
+/// Calls the activity named in `input["activity"]` on its own queue.
+#[workflow]
+async fn drain_wf(
+    ctx: &WorkflowContext,
+    input: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let name = input["activity"]
+        .as_str()
+        .ok_or("missing activity")?
+        .to_string();
+    let queue = ctx.queue_name().to_string();
+    ctx.execute_activity_raw(&name, serde_json::json!({}), &queue)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+static COOPERATIVE_STARTS: AtomicU32 = AtomicU32::new(0);
+
+/// Attempt 1 runs until cancelled, then fails. A later attempt succeeds.
+#[activity(start_to_close = "600s")]
+async fn drain_cooperative(
+    ctx: &ActivityContext,
+    _input: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    COOPERATIVE_STARTS.fetch_add(1, Ordering::SeqCst);
+    let attempt = ctx.info().attempt;
+    if attempt > 1 {
+        return Ok(serde_json::json!({ "attempt": attempt }));
+    }
+    while !ctx.is_cancelled() {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Err("cancelled".to_string())
+}
+
+static STUBBORN_STARTS: AtomicU32 = AtomicU32::new(0);
+static STUBBORN_GO: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Ignores cancellation. Returns only when the test lets it go.
+#[activity(start_to_close = "600s")]
+async fn drain_stubborn(
+    _ctx: &ActivityContext,
+    _input: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    STUBBORN_STARTS.fetch_add(1, Ordering::SeqCst);
+    STUBBORN_GO.notified().await;
+    Ok(serde_json::json!("done"))
+}
+
+// ---------------------------------------------------------------------------
+// Helpers.
+// ---------------------------------------------------------------------------
+
+fn registry() -> Arc<HandlerRegistry> {
+    Arc::new(HandlerRegistry::new(
+        vec![drain_wf_info()],
+        activities![drain_cooperative, drain_stubborn],
+    ))
+}
+
+/// A running worker and the task that runs it.
+struct Running {
+    worker: Arc<Worker>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Running {
+    fn start(worker_id: &str, queue: &str, pool: &DbPool) -> Self {
+        let mut config = runtime_config(worker_id, 2, 2, Duration::from_secs(10));
+        config.queues = vec![queue.to_string()];
+        config.shutdown_timeout = SHUTDOWN_TIMEOUT;
+        config.cancellation_grace_period = Duration::from_secs(1);
+        config.sticky_timeout = Duration::ZERO;
+        // A slow liveness heartbeat keeps orphan reclaim out of the test
+        // window. Only the drain may move a claim here.
+        config.worker_heartbeat_interval = Duration::from_secs(15);
+        let worker = Arc::new(Worker::new(config, registry()).expect("worker builds"));
+        let handle = spawn_test_worker(Arc::clone(&worker), pool.clone());
+        Self { worker, handle }
+    }
+
+    /// Request shutdown and return how long the drain took.
+    async fn stop(self) -> Duration {
+        let started = Instant::now();
+        self.worker.shutdown();
+        tokio::time::timeout(SHUTDOWN_TIMEOUT * 3, self.handle)
+            .await
+            .expect("the worker must stop")
+            .expect("the worker task must not panic");
+        started.elapsed()
+    }
+}
+
+/// A queue name no earlier run used. A shared database can keep old rows.
+fn unique(label: &str) -> String {
+    format!("q1813-{label}-{}", Uuid::new_v4().simple())
+}
+
+async fn connect(url: &str) -> AsyncPgConnection {
+    AsyncPgConnection::establish(url)
+        .await
+        .expect("connect to Postgres")
+}
+
+/// Start a `drain_wf` run on `queue` that calls `activity`.
+async fn seed_workflow(conn: &mut AsyncPgConnection, queue: &str, activity: &str) -> ExecutionId {
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let input = serde_json::json!({ "activity": activity });
+    let row = NewWorkflowExecution {
+        quota_key: None,
+        id: exec_id.as_uuid(),
+        workflow_name: "drain_wf",
+        workflow_id: &format!("wf-{}", exec_id.as_uuid()),
+        run_id: Uuid::new_v4(),
+        shard_id: 0,
+        input: input.clone().into(),
+        parent_id: None,
+        queue_name: queue,
+        execution_timeout: None,
+        deadline_at: None,
+        chain_execution_timeout: None,
+        chain_deadline_at: None,
+        memo: None,
+        search_attrs: None,
+        assigned_build_id: None,
+        parent_close_policy: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        context_headers: None,
+        sla: None,
+        sla_deadline_at: None,
+        schedule_id: None,
+        scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
+        origin: None,
+        completion_callbacks: None,
+        continued_from_exec_id: None,
+        first_exec_id: None,
+        start_source: None,
+        start_source_ref: None,
+        started_by: None,
+    };
+    diesel::insert_into(harvest_workflow_executions::table)
+        .values(&row)
+        .execute(conn)
+        .await
+        .expect("insert workflow execution");
+    store::append_events(
+        conn,
+        exec_id,
+        &[WorkflowEvent::WorkflowStarted {
+            input: input.clone(),
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        }],
+        0,
+    )
+    .await
+    .expect("append WorkflowStarted");
+    let mut params = EnqueueParams::new(queue, TaskType::Workflow, input);
+    params.workflow_exec_id = Some(exec_id.as_uuid());
+    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    queue::enqueue(conn, &params)
+        .await
+        .expect("enqueue workflow task");
+    exec_id
+}
+
+/// The activity task row of `exec_id`.
+#[derive(Debug)]
+struct ActivityRow {
+    state: String,
+    worker_id: Option<String>,
+    attempt: i32,
+    error: Option<String>,
+}
+
+async fn activity_row(url: &str, exec_id: ExecutionId) -> Option<ActivityRow> {
+    let mut conn = connect(url).await;
+    harvest_task_queue::table
+        .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid())))
+        .filter(harvest_task_queue::task_type.eq("activity"))
+        .select((
+            harvest_task_queue::state,
+            harvest_task_queue::worker_id,
+            harvest_task_queue::attempt,
+            harvest_task_queue::error,
+        ))
+        .first::<(String, Option<String>, i32, Option<String>)>(&mut conn)
+        .await
+        .optional()
+        .expect("load activity row")
+        .map(|(state, worker_id, attempt, error)| ActivityRow {
+            state,
+            worker_id,
+            attempt,
+            error,
+        })
+}
+
+/// Wait until `worker_id` runs the activity handler.
+async fn wait_for_start(url: &str, exec_id: ExecutionId, worker_id: &str, starts: &AtomicU32) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let row = activity_row(url, exec_id).await;
+            if row.is_some_and(|r| r.state == "RUNNING" && r.worker_id.as_deref() == Some(worker_id))
+                && AtomicU32::load(starts, Ordering::SeqCst) == 1
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the worker must start the activity within 30 s");
+}
+
+// ---------------------------------------------------------------------------
+// Tests.
+// ---------------------------------------------------------------------------
+
+/// A running activity that honours the cancel is joined and released. A peer
+/// then retries it at once, not after its 600 s `start_to_close`.
+///
+/// RED: before the fix the drain never cancels the handler. The row stays
+/// `RUNNING` under the stopped worker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drain_joins_a_cooperative_activity_and_a_peer_retries_it() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("coop");
+    let mut conn = connect(&url).await;
+    let exec_id = seed_workflow(&mut conn, &queue, "drain_cooperative").await;
+    let pool = build_test_pool(&url);
+
+    let worker_a = format!("{queue}-a");
+    let a = Running::start(&worker_a, &queue, &pool);
+    wait_for_start(&url, exec_id, &worker_a, &COOPERATIVE_STARTS).await;
+
+    let drain = a.stop().await;
+    assert!(
+        drain < SHUTDOWN_TIMEOUT + Duration::from_secs(1),
+        "the drain must end at its deadline: took {drain:?}"
+    );
+    let row = activity_row(&url, exec_id).await.expect("activity row");
+    assert_eq!(row.state, "PENDING", "the joined claim is released: {row:?}");
+    assert!(row.worker_id.is_none(), "{row:?}");
+    assert_eq!(row.attempt, 1, "the cancelled attempt counts: {row:?}");
+    assert!(
+        row.error
+            .as_deref()
+            .is_some_and(|e| e.contains("worker shutdown")),
+        "the release names a retryable shutdown reason: {row:?}"
+    );
+
+    let worker_b = format!("{queue}-b");
+    let b = Running::start(&worker_b, &queue, &pool);
+    let exec = wait_for_execution_state_with_timeout(
+        &url,
+        exec_id,
+        "COMPLETED",
+        Duration::from_secs(30),
+    )
+    .await;
+    assert_eq!(
+        exec.output,
+        Some(serde_json::json!({ "attempt": 2 })),
+        "the peer runs attempt 2"
+    );
+    assert_eq!(AtomicU32::load(&COOPERATIVE_STARTS, Ordering::SeqCst), 2);
+    let row = activity_row(&url, exec_id).await.expect("activity row");
+    assert_eq!(row.state, "COMPLETED", "{row:?}");
+    b.stop().await;
+}
+
+/// A running activity that ignores the cancel keeps its claim.
+///
+/// The drain ends at its deadline. The row stays `RUNNING` under the drained
+/// worker, so a live peer never starts a second copy. The handler's late
+/// result still lands through the claim fence.
+///
+/// This guard passes before the fix too. It fails if a fix releases a claim
+/// whose handler did not join.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drain_keeps_the_claim_of_an_activity_that_ignores_the_cancel() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("stubborn");
+    let mut conn = connect(&url).await;
+    let exec_id = seed_workflow(&mut conn, &queue, "drain_stubborn").await;
+    let pool = build_test_pool(&url);
+
+    let worker_a = format!("{queue}-a");
+    let a = Running::start(&worker_a, &queue, &pool);
+    wait_for_start(&url, exec_id, &worker_a, &STUBBORN_STARTS).await;
+    let worker_b = format!("{queue}-b");
+    let b = Running::start(&worker_b, &queue, &pool);
+
+    let drain = a.stop().await;
+    assert!(
+        drain >= SHUTDOWN_TIMEOUT - Duration::from_millis(500),
+        "the drain waits for its deadline: took {drain:?}"
+    );
+    assert!(
+        drain < SHUTDOWN_TIMEOUT + Duration::from_secs(1),
+        "the drain must end at its deadline: took {drain:?}"
+    );
+
+    // Give the live peer time to poll. It must not take the claim.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let row = activity_row(&url, exec_id).await.expect("activity row");
+    assert_eq!(row.state, "RUNNING", "the claim stays held: {row:?}");
+    assert_eq!(row.worker_id.as_deref(), Some(worker_a.as_str()), "{row:?}");
+    assert_eq!(row.attempt, 1, "{row:?}");
+    assert_eq!(
+        AtomicU32::load(&STUBBORN_STARTS, Ordering::SeqCst),
+        1,
+        "no peer may run the activity while its handler runs"
+    );
+
+    STUBBORN_GO.notify_one();
+    wait_for_execution_state_with_timeout(&url, exec_id, "COMPLETED", Duration::from_secs(30))
+        .await;
+    assert_eq!(AtomicU32::load(&STUBBORN_STARTS, Ordering::SeqCst), 1);
+    b.stop().await;
+}
