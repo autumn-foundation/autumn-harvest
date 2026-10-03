@@ -921,11 +921,11 @@ struct Reclaimed {
     current: TaskQueueItem,
 }
 
-/// Claim a task, requeue it with the stuck-running backstop, and claim it
+/// Claim a task, requeue it as the stuck-running backstop does, and claim it
 /// again on the same worker id.
 ///
-/// The backstop leaves `crash_strikes` unchanged, so only `attempt` tells the
-/// two claims apart. The queue and worker names are unique, so tests that
+/// The backstop leaves `crash_strikes` and `attempt` unchanged. The next claim
+/// adds 1 to `attempt`, so only `attempt` tells the two claims apart. The queue and worker names are unique, so tests that
 /// share one database do not meet each other's rows.
 async fn reclaim_after_stuck_requeue(url: &str, name: &str) -> Reclaimed {
     let suffix = Uuid::new_v4();
@@ -933,36 +933,21 @@ async fn reclaim_after_stuck_requeue(url: &str, name: &str) -> Reclaimed {
     let worker_id = format!("dispatcher-{suffix}");
     let (exec_id, first) = seed_claimed_task(url, &queue_name, &worker_id).await;
     let mut conn = connect(url).await;
+    // Mirrors `poison_pill::requeue_stuck_task`, scoped to this row. The fleet
+    // sweep would also touch rows of tests that share one database.
+    // `poison_pill_tests` covers the sweep itself.
     diesel::sql_query(
         "UPDATE harvest_task_queue \
-         SET attempt = attempt + 1, started_at = NOW() - INTERVAL '1 hour' WHERE id = $1",
+         SET state = 'PENDING', worker_id = NULL, started_at = NULL, \
+             sticky_worker_id = NULL, sticky_until = NULL, last_heartbeat_at = NULL, \
+             error = NULL, scheduled_at = NOW() \
+         WHERE id = $1",
     )
     .bind::<diesel::sql_types::Uuid, _>(first.id)
     .execute(&mut conn)
     .await
-    .expect("age the claim");
-    let stale = load_tasks(url, exec_id).await.remove(0);
-    // A live worker keeps the orphan pass, which bumps `crash_strikes`, away.
-    diesel::sql_query(
-        "INSERT INTO harvest_workers (worker_id, last_heartbeat_at, max_concurrency, host) \
-         VALUES ($1, NOW(), 10, 'localhost')",
-    )
-    .bind::<diesel::sql_types::Text, _>(&worker_id)
-    .execute(&mut conn)
-    .await
-    .expect("register a live worker");
-
-    // The count is not asserted: the scan covers the whole shared database.
-    autumn_harvest::poison_pill::reclaim_orphaned_tasks(
-        &mut conn,
-        3,
-        3600,
-        Some(60),
-        &autumn_harvest::telemetry::NoOpMetrics,
-        &autumn_harvest::payload_codec::PayloadCodecs::default(),
-    )
-    .await
-    .expect("reclaim");
+    .expect("requeue the stuck task");
+    let stale = first;
 
     let current = queue::claim_task(&mut conn, &[queue_name], &worker_id, "", None, &[], &[])
         .await
