@@ -718,7 +718,7 @@ impl AuditExportBuilderConfig {
 /// Bound on acquiring a shard's connection inside the scanner (issue #953,
 /// Codex review P1).
 ///
-/// `pool.get()` is an **unbounded** wait — Harvest configures no deadpool
+/// `pool.get()` can be an **unbounded** wait — a pool may have no deadpool
 /// `Timeouts`. The scanner is already holding a connection when it runs (the
 /// timeout checker checks one out before calling `enforce_timeouts_once`), and
 /// for a per-shard checker that connection comes from the very pool this

@@ -6925,6 +6925,117 @@
         }
       ],
       "description": "A complete by-id fan-out found more than one live run of one business key (issue #1313). Evidence of a key pinned to one shard while an unpinned start of it hashed to another, or of a shard drained during a topology change while an unpinned start of the same key stayed live elsewhere -- neither requires the other. Not the race issue #1313 names, which is invisible to any single fan-out by construction; this is the observable proxy for its precondition."
+    },
+    {
+      "id": 177984,
+      "type": "row",
+      "title": "Database pool & Postgres timeouts (issue #1788)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 199
+      },
+      "panels": []
+    },
+    {
+      "id": 428323,
+      "type": "timeseries",
+      "title": "Pool acquire timeouts",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 200
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "lineWidth": 1
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (site) (rate(harvest_db_pool_acquire_timeout_total[$__rate_interval]))",
+          "legendFormat": "{{site}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Rate of pool acquires that hit their bound, per site (claim or heartbeat_flush). The bound is the pool's deadpool wait timeout, or 30 s when the pool has none. A steady rate means the pool is too small or a connection is stuck. See docs/operations/postgres-timeouts.md."
+    },
+    {
+      "id": 422004,
+      "type": "timeseries",
+      "title": "Heartbeat flush failures",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 200
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "lineWidth": 1
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (reason) (rate(harvest_heartbeat_flush_failed_total[$__rate_interval]))",
+          "legendFormat": "{{reason}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Rate of activity heartbeat flushes that failed, per reason. The flusher keeps the payload and tries again on the next tick. A run of failures longer than heartbeat_timeout fails a healthy activity. See docs/operations/postgres-timeouts.md."
     }
   ]
 }

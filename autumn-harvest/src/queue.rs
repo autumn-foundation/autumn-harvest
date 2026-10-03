@@ -3392,13 +3392,36 @@ pub async fn record_heartbeat(
     claim: &TaskClaim,
     details: serde_json::Value,
 ) -> HarvestResult<ClaimWrite> {
+    record_heartbeat_sent_ago(conn, claim, details, std::time::Duration::ZERO).await
+}
+
+/// [`record_heartbeat`] for a heartbeat that the activity sent `age` ago
+/// (issue #1788).
+///
+/// The stamp is the database clock minus `age`. A retry after a failed flush
+/// passes the full age, so a stalled handler cannot look alive. The worker
+/// measures `age` on its monotonic clock. A host clock that differs from the
+/// database clock thus does not move the stamp (issue #1807).
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on update failure.
+pub async fn record_heartbeat_sent_ago(
+    conn: &mut AsyncPgConnection,
+    claim: &TaskClaim,
+    details: serde_json::Value,
+    age: std::time::Duration,
+) -> HarvestResult<ClaimWrite> {
     use crate::schema::harvest_task_queue::dsl;
 
+    let stamp = diesel::dsl::sql::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>>(
+        "clock_timestamp() - make_interval(secs => ",
+    )
+    .bind::<diesel::sql_types::Double, _>(age.as_secs_f64())
+    .sql(")");
     let update = diesel::update(dsl::harvest_task_queue.find(claim.task_id))
         .set((
-            dsl::last_heartbeat_at.eq(db_clock_stamp::<
-                diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>,
-            >()),
+            dsl::last_heartbeat_at.eq(stamp),
             dsl::heartbeat_details.eq(Some(details)),
         ))
         .into_boxed();
