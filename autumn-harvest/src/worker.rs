@@ -8123,10 +8123,12 @@ pub async fn check_paused_and_park(
     // before parking: a stale dispatcher must not misdirect a row a new
     // owner is now driving by re-parking it under its own now-invalid claim.
     if !queue::claim_still_held_for_update(
-                conn,
-                &queue::TaskClaim::new(task_id, worker_id, attempt),
-                crash_strikes,
-            ).await? {
+        conn,
+        &queue::TaskClaim::new(task_id, worker_id, attempt),
+        crash_strikes,
+    )
+    .await?
+    {
         return Err(HarvestError::TerminalWriteClaimAmbiguous { task_id });
     }
     let sticky = if sticky_timeout.is_zero() {
@@ -8336,7 +8338,9 @@ pub async fn persist_workflow_completion(
                 conn,
                 &queue::TaskClaim::new(task_id, worker_id, attempt),
                 crash_strikes,
-            ).await? {
+            )
+            .await?
+            {
                 return Err(HarvestError::TerminalWriteClaimAmbiguous { task_id });
             }
             store::append_events_offloaded_with_codecs(
@@ -13370,11 +13374,11 @@ pub async fn fail_task_and_execution_with_history(
         let (exec_id, next_event_id) = match preloaded {
             PreloadedFailureHistory::NoExecution => {
                 if !queue::claim_still_held_for_update(
-                conn,
-                &queue::TaskClaim::new(task_id, worker_id, attempt),
-                crash_strikes,
-            )
-                    .await?
+                    conn,
+                    &queue::TaskClaim::new(task_id, worker_id, attempt),
+                    crash_strikes,
+                )
+                .await?
                 {
                     return Err(HarvestError::TerminalWriteClaimAmbiguous { task_id });
                 }
@@ -13382,11 +13386,11 @@ pub async fn fail_task_and_execution_with_history(
             }
             PreloadedFailureHistory::Unavailable { exec_id } => {
                 if !queue::claim_still_held_for_update(
-                conn,
-                &queue::TaskClaim::new(task_id, worker_id, attempt),
-                crash_strikes,
-            )
-                    .await?
+                    conn,
+                    &queue::TaskClaim::new(task_id, worker_id, attempt),
+                    crash_strikes,
+                )
+                .await?
                 {
                     return Err(HarvestError::TerminalWriteClaimAmbiguous { task_id });
                 }
@@ -13945,7 +13949,9 @@ pub async fn persist_child_workflow_completion(
                 conn,
                 &queue::TaskClaim::new(task_id, worker_id, attempt),
                 crash_strikes,
-            ).await? {
+            )
+            .await?
+            {
                 return Err(HarvestError::TerminalWriteClaimAmbiguous { task_id });
             }
             store::append_events_with_codecs(conn, exec_id, &[event], next_event_id, codecs)
@@ -14030,7 +14036,9 @@ pub async fn persist_child_workflow_failure(
                 conn,
                 &queue::TaskClaim::new(task_id, worker_id, attempt),
                 crash_strikes,
-            ).await? {
+            )
+            .await?
+            {
                 return Err(HarvestError::TerminalWriteClaimAmbiguous { task_id });
             }
             store::append_events_with_codecs(
@@ -19390,10 +19398,12 @@ async fn persist_workflow_continue_as_new_with_verdict(
         // shape as `persist_workflow_completion`'s gap, found while auditing
         // this call chain. Guard it the same way before anything is written.
         if !queue::claim_still_held_for_update(
-                conn,
-                &queue::TaskClaim::new(task_id, worker_id, attempt),
-                crash_strikes,
-            ).await? {
+            conn,
+            &queue::TaskClaim::new(task_id, worker_id, attempt),
+            crash_strikes,
+        )
+        .await?
+        {
             return Err(HarvestError::TerminalWriteClaimAmbiguous { task_id });
         }
         // Append the terminal continued-as-new marker to the old run.
@@ -20635,7 +20645,7 @@ pub async fn move_workflow_to_dlq_for_history_cap(
                 &queue::TaskClaim::new(task.id, worker_id, task.attempt),
                 task.crash_strikes,
             )
-                .await?
+            .await?
             {
                 return Err(HarvestError::TerminalWriteClaimAmbiguous { task_id: task.id });
             }
@@ -23448,17 +23458,16 @@ async fn handle_ambiguous_suspended_claim(
     error: &HarvestError,
 ) -> Option<HarvestResult<TaskDispatchOutcome>> {
     let task_id = error.suspended_claim_ambiguous()?;
-    let released =
-        match queue::release_suspended_workflow_claim(
-            conn,
-            &queue::TaskClaim::new(task_id, worker_id, task.attempt),
-            task.crash_strikes,
-        )
-        .await
-        {
-            Ok(released) => released,
-            Err(err) => return Some(Err(err)),
-        };
+    let released = match queue::release_suspended_workflow_claim(
+        conn,
+        &queue::TaskClaim::new(task_id, worker_id, task.attempt),
+        task.crash_strikes,
+    )
+    .await
+    {
+        Ok(released) => released,
+        Err(err) => return Some(Err(err)),
+    };
     tracing::info!(
         task_id = %task_id,
         queue = %task.queue_name,
@@ -23493,17 +23502,16 @@ async fn handle_ambiguous_terminal_write_claim(
     error: &HarvestError,
 ) -> Option<HarvestResult<TaskDispatchOutcome>> {
     let task_id = error.terminal_write_claim_ambiguous()?;
-    let released =
-        match queue::release_terminal_workflow_claim(
-            conn,
-            &queue::TaskClaim::new(task_id, worker_id, task.attempt),
-            task.crash_strikes,
-        )
-        .await
-        {
-            Ok(released) => released,
-            Err(err) => return Some(Err(err)),
-        };
+    let released = match queue::release_terminal_workflow_claim(
+        conn,
+        &queue::TaskClaim::new(task_id, worker_id, task.attempt),
+        task.crash_strikes,
+    )
+    .await
+    {
+        Ok(released) => released,
+        Err(err) => return Some(Err(err)),
+    };
     tracing::info!(
         task_id = %task_id,
         queue = %task.queue_name,
@@ -24715,7 +24723,7 @@ where
                 &queue::TaskClaim::new(task.id, worker_id, task.attempt),
                 task.crash_strikes,
             )
-                .await?
+            .await?
             {
                 return Ok(TerminalWriteOutcome::ClaimLost);
             }

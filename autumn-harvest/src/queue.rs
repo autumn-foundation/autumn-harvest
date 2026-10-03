@@ -4774,7 +4774,7 @@ pub async fn read_capability_miss_state(
 }
 
 /// Whether `claim` is still current, with the row lock held until the caller's
-/// transaction ends (issue #804, Codex round-31 P1; issue #1806).
+/// transaction ends (issues #804 and #1806).
 ///
 /// # Why the claim, not just the worker
 ///
@@ -4956,9 +4956,10 @@ const fn release_suspended_workflow_claim_query() -> &'static str {
 /// Deliberately **not** `FOR UPDATE SKIP LOCKED`: a plain `UPDATE` blocks
 /// behind whatever transiently holds the row instead of skipping it, then
 /// re-evaluates its `WHERE` clause against the row's *post-commit* state. If
-/// ownership genuinely moved in the interim, the guard (`worker_id`,
-/// `crash_strikes` and `attempt`, as [`claim_still_held_for_update`] checks) no longer matches and this updates nothing -- the new owner keeps
-/// the row, exactly as if this call were never made. If it did not move, the
+/// ownership genuinely moved in the interim, the guard no longer matches. The
+/// guard checks `worker_id`, `crash_strikes` and `attempt`, as
+/// [`claim_still_held_for_update`] does. This call then updates nothing, and
+/// the new owner keeps the row, exactly as if this call were never made. If it did not move, the
 /// row is released, and `wake_requested` is cleared in the very same write so
 /// a wake that landed in the contention window is reconciled rather than
 /// silently lost. This mirrors the established, doubly-reviewed
