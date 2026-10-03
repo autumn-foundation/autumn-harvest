@@ -773,9 +773,10 @@ follow-up start lands on the base build on its very next attempt. Ramping to
 re-declaring `target_build_id`); `clear` removes it entirely.
 
 > **Automatic abort (issue #1814).** Turn on the ramp guard with
-> `HarvestPlugin::ramp_guard(RampGuardConfig::new())`. It clears the ramp with
-> no operator action when the target build fails or ND-blocks more runs than
-> the base build, and it writes a `build_routing.ramp.auto_abort` audit row.
+> `HarvestPlugin::ramp_guard(RampGuardConfig::new())`. The target build can
+> fail or ND-block more runs than the base build. The guard then clears the
+> ramp with no operator action and writes a `build_routing.ramp.auto_abort`
+> audit row.
 > See [`docs/operations/build-ramp-guard.md`](../operations/build-ramp-guard.md).
 
 **Step 4 — Promote to full cutover.**
