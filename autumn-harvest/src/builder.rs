@@ -144,6 +144,9 @@ pub struct HarvestBuilder {
     unknown_target_grace_window: Option<Duration>,
     /// Hard caps for `POST /workflows/batch_start` (issue #357).
     batch_start_config: BatchStartConfig,
+    /// Automatic per-queue load shedding (issue #1794). An empty config turns
+    /// it off.
+    load_shed: crate::load_shed::LoadShedConfig,
     /// Declarative completion triggers (issue #517).
     completion_triggers: Vec<crate::completion_trigger::CompletionTrigger>,
     /// Server-side ceiling on `workflow_attempt` (issue #523).
@@ -212,6 +215,7 @@ impl Default for HarvestBuilder {
             max_workflow_start_delay: None,
             unknown_target_grace_window: None,
             batch_start_config: BatchStartConfig::default(),
+            load_shed: crate::load_shed::LoadShedConfig::new(),
             completion_triggers: Vec::new(),
             max_workflow_attempts: None,
             usage_window_ceiling: None,
@@ -272,6 +276,7 @@ impl std::fmt::Debug for HarvestBuilder {
                 &self.unknown_target_grace_window,
             )
             .field("batch_start_config", &self.batch_start_config)
+            .field("load_shed", &self.load_shed)
             .field("max_workflow_attempts", &self.max_workflow_attempts)
             .field("usage_window_ceiling", &self.usage_window_ceiling)
             .field("usage_max_groups", &self.usage_max_groups)
@@ -341,6 +346,9 @@ pub struct BuiltHarvest {
     pub unknown_target_grace_window: Duration,
     /// Hard caps for `POST /workflows/batch_start` (issue #357).
     pub batch_start_config: BatchStartConfig,
+    /// Automatic per-queue load shedding (issue #1794). An empty config turns
+    /// it off.
+    pub load_shed: crate::load_shed::LoadShedConfig,
     /// Declarative completion triggers (issue #517).
     completion_triggers: Vec<crate::completion_trigger::CompletionTrigger>,
     /// Server-side ceiling on workflow retry attempts (issue #523). `None` = no ceiling.
@@ -427,6 +435,7 @@ impl std::fmt::Debug for BuiltHarvest {
                 &self.unknown_target_grace_window,
             )
             .field("batch_start_config", &self.batch_start_config)
+            .field("load_shed", &self.load_shed)
             .field("max_workflow_attempts", &self.max_workflow_attempts)
             .field("usage_window_ceiling", &self.usage_window_ceiling)
             .field("usage_max_groups", &self.usage_max_groups)
@@ -2376,6 +2385,17 @@ impl HarvestBuilder {
         self
     }
 
+    /// Turn on automatic load shedding for the queues in `config` (issue #1794).
+    ///
+    /// A queue with an old backlog then refuses new starts with `429` and
+    /// `Retry-After`. See `docs/operations/load-shedding.md`. The default
+    /// config is empty, so no queue sheds and no sampler runs.
+    #[must_use]
+    pub fn load_shed(mut self, config: crate::load_shed::LoadShedConfig) -> Self {
+        self.load_shed = config;
+        self
+    }
+
     /// Number of registered workflows (used in tests and diagnostics).
     #[must_use]
     pub const fn workflow_count(&self) -> usize {
@@ -2548,6 +2568,7 @@ impl HarvestBuilder {
             max_workflow_start_delay,
             unknown_target_grace_window,
             batch_start_config: self.batch_start_config,
+            load_shed: self.load_shed,
             completion_triggers: self.completion_triggers,
             max_workflow_attempts: self.max_workflow_attempts,
             usage_window_ceiling,

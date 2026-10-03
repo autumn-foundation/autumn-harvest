@@ -9,6 +9,9 @@ every start it relays on `harvest.admission.bypassed`). The gate governs new
 admissions — it deliberately does not halt in-flight continuation (see
 [Out of scope](#out-of-scope--in-flight-continuation-not-new-admission)).
 
+An automatic, backlog-driven gate also exists (issue #1794). It sheds new
+starts with `429` and `Retry-After`. See [load shedding](load-shedding.md).
+
 The contract is discoverable at runtime: `GET /admin/gates` returns a
 `producers` block (in addition to the active `gates`) enumerating each producer
 and whether it is **gated**, **gated-at-admission**, **gated-at-relay**, or
