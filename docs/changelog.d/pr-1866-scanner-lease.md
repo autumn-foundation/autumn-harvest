@@ -21,9 +21,9 @@ size, so adding workers to clear a backlog added database load in proportion.
   tried again first in the next batch, so its failures run in a row. It
   shares the batch limit, and it gets at most three passes in a row. Then it
   waits for the next sweep, and the other rows drain. A batch that fails to
-  load stays queued. A tick in
-  any other role ends the run, and a replica back from standby starts a new
-  sweep.
+  load stays queued. A tick in any other role, or without a connection,
+  ends the run. A replica back from standby, or back from a tick without a
+  connection, starts a new sweep.
 - **Not a fence.** Two holders for a short time are safe, because every
   sub-pass is already safe with concurrent runners.
 - **Bounded scans.** The checker enforces at most one batch per timeout

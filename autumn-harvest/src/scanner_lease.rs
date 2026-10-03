@@ -209,8 +209,9 @@ pub enum ScannerRole {
 
 /// Failed leader passes in a row (issue #1795).
 ///
-/// The count covers consecutive leader passes only. A tick in any other role
-/// ends the run, because the lease may have moved away and back. See
+/// The count covers consecutive leader passes only. A tick in any other role,
+/// or without a connection, ends the run. The lease may have moved away and
+/// back. See
 /// [`ABDICATE_AFTER_FAILED_PASSES`].
 #[cfg(feature = "db")]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]

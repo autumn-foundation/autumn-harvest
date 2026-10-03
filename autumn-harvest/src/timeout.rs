@@ -774,7 +774,8 @@ impl TimeoutScanLane {
 /// at most three passes in a row. So a leader that fails on it keeps failing
 /// until it gives up its lease. After that, the row waits for the next sweep,
 /// so rows that keep failing cannot block the rows behind them. A replica
-/// that comes back from standby starts a new sweep.
+/// starts a new sweep after a tick without a pass, as a standby or without
+/// a connection.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TimeoutScanCursor {
     lanes: [TimeoutScanLane; 4],
@@ -5690,6 +5691,15 @@ pub fn spawn_coordinated_timeout_checker_for_shard(
     )
 }
 
+/// Records a checker tick that got no connection (issue #1795).
+///
+/// The tick ran no pass, so the next pass starts a new sweep. The lease can
+/// move during the gap, so the run of failed leader passes ends too.
+fn skip_tick(ran_last_tick: &mut bool, leader_failures: &mut crate::scanner_lease::LeaderFailures) {
+    *ran_last_tick = false;
+    *leader_failures = crate::scanner_lease::LeaderFailures::default();
+}
+
 /// The tick interval of a timeout checker.
 ///
 /// A zero interval would busy-spin and time out every checkout, so every
@@ -5955,12 +5965,14 @@ pub(crate) fn spawn_timeout_checker_on_shard_pool(
                 }
                 Ok(Err(e)) => {
                     tracing::error!(error = %e, "failed to acquire DB connection for timeout check");
+                    skip_tick(&mut ran_last_tick, &mut leader_failures);
                 }
                 Err(_elapsed) => {
                     tracing::error!(
                         ?interval,
                         "pool acquisition exceeded the tick interval; skipping this tick"
                     );
+                    skip_tick(&mut ran_last_tick, &mut leader_failures);
                 }
             }
 
@@ -6738,6 +6750,22 @@ mod tests {
             cursor.retry(&reason, id);
         }
         assert_eq!(cursor.lanes[lane].next_batch(1), Vec::<uuid::Uuid>::new());
+    }
+
+    #[test]
+    fn a_tick_without_a_connection_ends_the_run() {
+        use crate::scanner_lease::{LeaderFailures, ScannerRole};
+        let mut ran_last_tick = true;
+        let mut failures = LeaderFailures::default();
+        assert!(!failures.record(ScannerRole::Leader, true));
+        assert!(!failures.record(ScannerRole::Leader, true));
+        skip_tick(&mut ran_last_tick, &mut failures);
+        // The next pass starts a new sweep. The lease may have moved during
+        // the gap, so the run of failed passes starts again too.
+        assert!(!ran_last_tick);
+        assert!(!failures.record(ScannerRole::Leader, true));
+        assert!(!failures.record(ScannerRole::Leader, true));
+        assert!(failures.record(ScannerRole::Leader, true));
     }
 
     #[test]
