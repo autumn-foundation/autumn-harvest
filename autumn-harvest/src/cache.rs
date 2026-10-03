@@ -16,6 +16,11 @@
 //! next task to fall back to a full history load (cold path), which is always
 //! correct — it is just slower.
 //!
+//! An entry can also hold the suspended workflow itself (issue #1798). A warm
+//! task then resumes the parked future with the delta events and does not
+//! replay history. See [`crate::resident`]. The worker takes an entry on a
+//! hit and puts it back only after a suspension commits.
+//!
 //! This module is pure data structure logic and does NOT require the `db` feature.
 
 use lru::LruCache;
@@ -23,6 +28,7 @@ use std::num::NonZeroUsize;
 use uuid::Uuid;
 
 use crate::event::WorkflowEvent;
+use crate::resident::ResidentWorkflow;
 
 /// Cached state for a suspended workflow execution.
 ///
@@ -45,12 +51,32 @@ pub struct CachedWorkflowState {
     pub next_event_id: i32,
 }
 
+/// One cache entry: the event snapshot, and the resident workflow if any.
+struct CacheEntry {
+    state: CachedWorkflowState,
+    resident: Option<ResidentWorkflow>,
+}
+
+/// The entries that [`WorkflowCache::close`] removed (issue #1798).
+///
+/// Dropping the value drops each parked handler future and its context.
+pub(crate) struct ClosedEntries(#[allow(dead_code)] LruCache<Uuid, CacheEntry>);
+
+impl ClosedEntries {
+    /// The number of entries that the cache held.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
 /// LRU cache mapping workflow execution IDs to their cached replay state.
 ///
 /// Thread-safety: this cache is NOT `Sync` — it should be owned by a single
 /// worker task (or wrapped in a `Mutex` if shared).
 pub struct WorkflowCache {
-    inner: LruCache<Uuid, CachedWorkflowState>,
+    inner: LruCache<Uuid, CacheEntry>,
+    resident_enabled: bool,
 }
 
 impl WorkflowCache {
@@ -80,7 +106,31 @@ impl WorkflowCache {
         let cap = NonZeroUsize::new(safe_size).expect("clamp ensures size >= 1");
         Self {
             inner: LruCache::new(cap),
+            resident_enabled: true,
         }
+    }
+
+    /// Sets whether entries keep the suspended workflow resident (issue
+    /// #1798). On by default.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use autumn_harvest::cache::WorkflowCache;
+    ///
+    /// let cache = WorkflowCache::new(10).with_resident(false);
+    /// assert!(!cache.resident_enabled());
+    /// ```
+    #[must_use]
+    pub const fn with_resident(mut self, enabled: bool) -> Self {
+        self.resident_enabled = enabled;
+        self
+    }
+
+    /// Whether entries keep the suspended workflow resident (issue #1798).
+    #[must_use]
+    pub const fn resident_enabled(&self) -> bool {
+        self.resident_enabled
     }
 
     /// Insert or update a cached workflow state.
@@ -98,7 +148,61 @@ impl WorkflowCache {
     /// cache.insert(Uuid::new_v4(), state);
     /// ```
     pub fn insert(&mut self, exec_id: Uuid, state: CachedWorkflowState) {
-        self.inner.put(exec_id, state);
+        let _displaced = self.insert_resident(exec_id, state, None);
+    }
+
+    /// Inserts a snapshot with the resident workflow of its suspension
+    /// (issue #1798).
+    ///
+    /// When resident state is off, `resident` is not stored. An existing
+    /// entry with a later `next_event_id` stays, because a later decision
+    /// wrote it. Returns the entry that this call displaced or refused, or
+    /// the evicted LRU entry, so the caller can drop it outside any lock.
+    pub(crate) fn insert_resident(
+        &mut self,
+        exec_id: Uuid,
+        state: CachedWorkflowState,
+        resident: Option<ResidentWorkflow>,
+    ) -> Option<(CachedWorkflowState, Option<ResidentWorkflow>)> {
+        let resident = resident.filter(|_| self.resident_enabled);
+        if self
+            .inner
+            .peek(&exec_id)
+            .is_some_and(|existing| existing.state.next_event_id > state.next_event_id)
+        {
+            return Some((state, resident));
+        }
+        self.inner
+            .push(exec_id, CacheEntry { state, resident })
+            .map(|(_, entry)| (entry.state, entry.resident))
+    }
+
+    /// Removes an entry and returns its snapshot and resident workflow
+    /// (issue #1798).
+    ///
+    /// The worker takes the entry on a hit, so no other task can resume the
+    /// same parked future.
+    #[cfg_attr(not(feature = "db"), allow(dead_code))] // Only the db-gated worker takes entries.
+    pub(crate) fn take(
+        &mut self,
+        exec_id: &Uuid,
+    ) -> Option<(CachedWorkflowState, Option<ResidentWorkflow>)> {
+        self.inner
+            .pop(exec_id)
+            .map(|entry| (entry.state, entry.resident))
+    }
+
+    /// Closes the cache when the worker stops (issue #1798).
+    ///
+    /// The method removes every entry and stops resident capture. A task
+    /// that outlives the shutdown drain then cannot park a future again. The
+    /// caller drops the returned entries outside the cache lock.
+    #[cfg_attr(not(feature = "db"), allow(dead_code))] // Only the db-gated worker closes the cache.
+    #[must_use = "drop the closed entries outside the cache lock"]
+    pub(crate) fn close(&mut self) -> ClosedEntries {
+        self.resident_enabled = false;
+        let empty = LruCache::new(self.inner.cap());
+        ClosedEntries(std::mem::replace(&mut self.inner, empty))
     }
 
     /// Look up a cached workflow state, marking it as recently used.
@@ -116,7 +220,7 @@ impl WorkflowCache {
     /// ```
     #[must_use]
     pub fn get(&mut self, exec_id: &Uuid) -> Option<&CachedWorkflowState> {
-        self.inner.get(exec_id)
+        self.inner.get(exec_id).map(|entry| &entry.state)
     }
 
     /// Remove a cached workflow state, returning it if present.
@@ -132,7 +236,7 @@ impl WorkflowCache {
     /// assert!(cache.remove(&id).is_none());
     /// ```
     pub fn remove(&mut self, exec_id: &Uuid) -> Option<CachedWorkflowState> {
-        self.inner.pop(exec_id)
+        self.inner.pop(exec_id).map(|entry| entry.state)
     }
 
     /// Returns the number of entries currently in the cache.
@@ -171,6 +275,7 @@ impl std::fmt::Debug for WorkflowCache {
         f.debug_struct("WorkflowCache")
             .field("len", &self.inner.len())
             .field("cap", &self.inner.cap())
+            .field("resident_enabled", &self.resident_enabled)
             .finish()
     }
 }
@@ -290,6 +395,91 @@ mod tests {
             "id2 should have been evicted (LRU)"
         );
         assert!(cache.get(&id3).is_some(), "id3 should be present");
+    }
+
+    /// Waits for one signal.
+    fn signal_workflow(
+        ctx: &crate::context::WorkflowContext,
+        _input: serde_json::Value,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + '_>,
+    > {
+        Box::pin(async move { ctx.wait_for_signal("go").await.map_err(|e| e.to_string()) })
+    }
+
+    /// A resident workflow parked on a signal wait.
+    async fn resident() -> ResidentWorkflow {
+        let history = vec![WorkflowEvent::WorkflowStarted {
+            input: serde_json::Value::Null,
+            timestamp: chrono::Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        }];
+        let (_outcome, resident) = crate::resident::start(
+            crate::types::ExecutionId::new(),
+            history,
+            signal_workflow,
+            serde_json::Value::Null,
+        )
+        .await;
+        resident.expect("a signal wait stays resident")
+    }
+
+    #[tokio::test]
+    async fn take_removes_the_entry_with_its_resident_workflow() {
+        let mut cache = WorkflowCache::new(5);
+        let id = Uuid::new_v4();
+        cache.insert_resident(id, make_state(7), Some(resident().await));
+
+        let (state, live) = cache.take(&id).expect("entry is present");
+        assert_eq!(state.next_event_id, 7);
+        assert!(live.is_some(), "the resident workflow comes with the entry");
+        assert!(cache.take(&id).is_none(), "a take removes the entry");
+    }
+
+    #[tokio::test]
+    async fn close_releases_every_entry_and_stops_resident_capture() {
+        let mut cache = WorkflowCache::new(5);
+        cache.insert_resident(Uuid::new_v4(), make_state(3), Some(resident().await));
+        cache.insert(Uuid::new_v4(), make_state(5));
+
+        let closed = cache.close();
+        assert_eq!(closed.len(), 2, "close hands back every entry");
+        drop(closed);
+        assert!(cache.is_empty(), "a closed cache holds no entry");
+        assert!(!cache.resident_enabled());
+
+        // A task that outlives the shutdown drain cannot park a future again.
+        let id = Uuid::new_v4();
+        cache.insert_resident(id, make_state(7), Some(resident().await));
+        let (_, live) = cache.take(&id).expect("the snapshot is kept");
+        assert!(live.is_none(), "a closed cache keeps no resident workflow");
+    }
+
+    #[test]
+    fn a_later_snapshot_is_not_replaced_by_an_earlier_one() {
+        let mut cache = WorkflowCache::new(5);
+        let id = Uuid::new_v4();
+        cache.insert(id, make_state(9));
+        let refused = cache.insert_resident(id, make_state(4), None);
+
+        assert_eq!(refused.map(|(state, _)| state.next_event_id), Some(4));
+        assert_eq!(cache.get(&id).map(|state| state.next_event_id), Some(9));
+    }
+
+    #[tokio::test]
+    async fn disabled_resident_state_keeps_only_the_snapshot() {
+        let mut cache = WorkflowCache::new(5).with_resident(false);
+        let id = Uuid::new_v4();
+        cache.insert_resident(id, make_state(7), Some(resident().await));
+
+        let (state, live) = cache.take(&id).expect("entry is present");
+        assert_eq!(state.next_event_id, 7);
+        assert!(
+            live.is_none(),
+            "a disabled cache must drop the resident workflow"
+        );
     }
 
     #[test]

@@ -145,6 +145,10 @@ pub struct WorkerConfigView {
     pub shutdown_timeout_ms: u64,
     /// In-memory workflow LRU cache size (entries).
     pub workflow_cache_size: usize,
+    /// Whether cache entries keep suspended workflows resident (issue #1798).
+    /// Reports the effective value, so it is `false` while sticky routing is
+    /// off.
+    pub resident_workflows: bool,
     /// Whether sticky cross-worker routing is enabled (`sticky_timeout > 0`).
     pub sticky_routing_enabled: bool,
     /// Sticky routing lease TTL, milliseconds (0 = disabled).
@@ -375,6 +379,7 @@ impl WorkerConfigView {
             max_concurrent_activities,
             shutdown_timeout,
             workflow_cache_size,
+            resident_workflows,
             sticky_timeout,
             cancellation_grace_period,
             shard_assignments,
@@ -423,6 +428,7 @@ impl WorkerConfigView {
             poll_interval_ms: dur_ms(poll_interval),
             shutdown_timeout_ms: dur_ms(*shutdown_timeout),
             workflow_cache_size: *workflow_cache_size,
+            resident_workflows: *resident_workflows && !sticky_timeout.is_zero(),
             sticky_routing_enabled: !sticky_timeout.is_zero(),
             sticky_timeout_ms: dur_ms(*sticky_timeout),
             cancellation_grace_period_ms: dur_ms(*cancellation_grace_period),
@@ -932,6 +938,10 @@ mod tests {
         );
         assert!(view.sticky_routing_enabled);
         assert_eq!(view.sticky_timeout_ms, 5_000);
+        assert!(
+            view.resident_workflows,
+            "resident workflows are on by default"
+        );
     }
 
     #[test]
@@ -945,6 +955,10 @@ mod tests {
         };
         let off_view = WorkerConfigView::from_worker_config(&off, Duration::from_millis(500));
         assert!(!off_view.sticky_routing_enabled);
+        assert!(
+            !off_view.resident_workflows,
+            "resident workflows need sticky routing"
+        );
         assert!(!off_view.poison_pill_quarantine_enabled);
         assert!(!off_view.slot_tuner_enabled);
 
@@ -957,7 +971,15 @@ mod tests {
         let on_view = WorkerConfigView::from_worker_config(&on, Duration::from_millis(500));
         assert!(on_view.sticky_routing_enabled);
         assert_eq!(on_view.sticky_timeout_ms, 15_000);
+        assert!(on_view.resident_workflows);
         assert!(on_view.poison_pill_quarantine_enabled);
+
+        // The resident switch alone turns resident workflows off.
+        let resident_off = WorkerConfig::default().with_resident_workflows(false);
+        let resident_off_view =
+            WorkerConfigView::from_worker_config(&resident_off, Duration::from_millis(500));
+        assert!(resident_off_view.sticky_routing_enabled);
+        assert!(!resident_off_view.resident_workflows);
     }
 
     #[test]
