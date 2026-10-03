@@ -188,8 +188,8 @@ Multi-replica note: **replica-global** sampler gauges — every worker replica
 samples the same shared DB-derived value (`harvest_queue_depth`,
 `harvest_queue_oldest_pending_age`, `harvest_dlq_entries`,
 `harvest_shard_stranded_pending`, `harvest_workflow_history_oversized`,
-`harvest_admission_gates_active`, and the per-key concurrency / rate-limit
-gauges) — aggregate with `max`, never `sum`, to avoid replica
+`harvest_admission_gates_active`, `harvest_load_shed_active`, and the
+per-key concurrency / rate-limit gauges) — aggregate with `max`, never `sum`, to avoid replica
 double-counting. **Replica-local** gauges, where each replica owns its own
 value (`harvest_worker_slots_in_use` / `_available`), sum correctly across
 the fleet; the per-replica slot panels legend the `instance` label instead.

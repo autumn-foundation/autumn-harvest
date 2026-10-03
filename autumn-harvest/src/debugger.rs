@@ -1384,6 +1384,8 @@ impl ReplayDebugger {
     /// [`WorkerConfig::with_default_activity_retry_policy`](crate::worker::WorkerConfig::with_default_activity_retry_policy)
     /// and
     /// [`WorkerConfig::with_default_activity_start_to_close`](crate::worker::WorkerConfig::with_default_activity_start_to_close).
+    /// Both are `None` here by default. A worker on `WorkerConfig::default()`
+    /// uses `Some(DEFAULT_ACTIVITY_START_TO_CLOSE)` (issue #1808).
     #[must_use]
     pub fn activity_defaults(
         mut self,

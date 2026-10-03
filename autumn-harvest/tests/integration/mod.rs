@@ -6,6 +6,8 @@ mod active_workflow_gauge_tests;
 mod activity_claim_epoch_tests;
 mod activity_default_floor_tests;
 #[cfg(feature = "db")]
+mod activity_default_timeout_tests;
+#[cfg(feature = "db")]
 mod activity_enqueue_batch_perf;
 mod activity_failure_tests;
 #[cfg(feature = "db")]
@@ -128,6 +130,7 @@ mod havoc_tests;
 mod history_ceiling_claim_tests;
 #[cfg(feature = "db")]
 mod history_default_caps_tests;
+mod host_clock_skew_tests;
 mod hot_code_swap_docs;
 #[cfg(all(feature = "hot-code-swap", feature = "testing"))]
 mod hot_code_swap_tests;
