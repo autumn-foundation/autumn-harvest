@@ -933,7 +933,7 @@ mod scanner {
                         // Dispatch hint (issue #1312). The orphan is `PENDING`
                         // again and its inner transaction has committed, so the
                         // channel gets a reference to it.
-                        crate::queue::record_immediate_hints(conn, &[task.id]).await;
+                        crate::queue::record_pending_hints(conn, &[task.id]).await;
                     }
                 }
             }
@@ -949,7 +949,7 @@ mod scanner {
             for task in stuck {
                 if requeue_stuck_task(conn, &task, stuck_running_secs).await? {
                     summary.stuck_requeued += 1;
-                    crate::queue::record_immediate_hints(conn, &[task.id]).await;
+                    crate::queue::record_pending_hints(conn, &[task.id]).await;
                 }
             }
         }

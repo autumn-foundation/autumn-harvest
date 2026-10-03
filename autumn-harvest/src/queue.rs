@@ -2258,20 +2258,6 @@ pub(crate) fn record_pending_hint(
 /// can thaw a backlog of any size, and one statement carrying every id would
 /// build an array bound only by that backlog.
 pub(crate) async fn record_pending_hints(conn: &mut AsyncPgConnection, ids: &[Uuid]) {
-    record_hints_by_id(conn, ids, false).await;
-}
-
-/// Like [`record_pending_hints`], for rows a write made due at once.
-///
-/// The row's `scheduled_at` is a database-clock stamp (issue #1807). A dispatch
-/// channel compares the due time with the host clock. A host behind the
-/// database would park the hint until its clock catches up. This caps each due
-/// time at the host time, so the hint is due at once.
-pub(crate) async fn record_immediate_hints(conn: &mut AsyncPgConnection, ids: &[Uuid]) {
-    record_hints_by_id(conn, ids, true).await;
-}
-
-async fn record_hints_by_id(conn: &mut AsyncPgConnection, ids: &[Uuid], cap_at_host_now: bool) {
     if ids.is_empty() || !crate::dispatch::hints_wanted() {
         return;
     }
@@ -2282,17 +2268,8 @@ async fn record_hints_by_id(conn: &mut AsyncPgConnection, ids: &[Uuid], cap_at_h
             .await;
         match rows {
             Ok(rows) => {
-                let host_now = Utc::now();
                 crate::dispatch::record_hints(
-                    rows.into_iter()
-                        .map(PendingHintRow::into_hint)
-                        .map(|mut hint| {
-                            if cap_at_host_now {
-                                hint.scheduled_at = hint.scheduled_at.min(host_now);
-                            }
-                            hint
-                        })
-                        .collect(),
+                    rows.into_iter().map(PendingHintRow::into_hint).collect(),
                 );
             }
             Err(error) => {
@@ -4021,12 +3998,10 @@ pub async fn force_retry_activity_now(
         crate::notify::notify_task_enqueued(conn, &actual_queue, task_id).await?;
         // Dispatch hint (issue #1312). Only when the row actually advanced: an
         // already-eligible row was hinted when it was first made `PENDING`.
-        // The dispatcher compares `due` with the host clock. Cap it at the
-        // host time so a host behind the database does not hold the hint.
         record_pending_hint(
             task_id,
             &actual_queue,
-            actual_scheduled_at.min(Utc::now()),
+            actual_scheduled_at,
             row.priority,
             crate::dispatch::DispatchKind::Activity,
         );
