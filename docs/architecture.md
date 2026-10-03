@@ -1184,7 +1184,7 @@ async fn compute_checksum(ctx: &ActivityContext, data: Vec<u8>) -> Result<String
 |---|---|---|
 | Execution location | Inline on the workflow worker | Dispatched to task queue / remote worker |
 | Typical duration | < 1 s | Any duration |
-| Hard timeout cap | `WorkerConfig::max_local_activity_start_to_close` (default 60 s) | No cap enforced by Harvest |
+| Hard timeout cap | `WorkerConfig::max_local_activity_start_to_close` (default 60 s) | No cap; `WorkerConfig::default_activity_start_to_close` (default 10 min) applies when the activity sets no `start_to_close` |
 | Heartbeating | **Not supported**; `ctx.heartbeat(...)` returns a runtime `Config` error and no heartbeat checkpoint is available | Supported; retry attempts can read the last flushed payload with `ctx.heartbeat_details::<T>()` |
 | `schedule_to_start` timeout | **Not supported** | Supported |
 | Custom task queue | **Not supported** | Supported |

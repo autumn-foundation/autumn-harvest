@@ -66,6 +66,9 @@ pub const DEFAULT_PAYLOAD_OFFLOAD_THRESHOLD: u64 = 256 * 1024;
 /// an error. Configurable via [`WorkerConfig::with_retry_after_ceiling`].
 pub const DEFAULT_RETRY_AFTER_CEILING: Duration = Duration::from_secs(15 * 60);
 
+/// Default activity `start_to_close` timeout (issue #1808): 10 minutes.
+pub const DEFAULT_ACTIVITY_START_TO_CLOSE: Duration = Duration::from_secs(10 * 60);
+
 /// Default sticky routing window (issue #1798): 5 seconds.
 ///
 /// A follow-up task of a suspended execution waits up to this long for the
@@ -2492,6 +2495,19 @@ impl HarvestBuilder {
             }
         }
 
+        // Issue #1808: warn about each activity type that no timeout bounds.
+        // The runtime wall-clock ceiling bounds a WASM guest, so skip it.
+        let unbounded = activities_without_timeout(&self.activities);
+        #[cfg(feature = "wasm-activities")]
+        let unbounded: Vec<&str> = unbounded
+            .into_iter()
+            .filter(|name| !self.wasm_bindings.contains_key(*name))
+            .collect();
+        warn_on_activities_without_timeout(
+            &unbounded,
+            self.worker_config.default_activity_start_to_close,
+        );
+
         let mut worker_config = self.worker_config;
         let max_workflow_start_delay = self
             .max_workflow_start_delay
@@ -2807,6 +2823,50 @@ fn warn_if_heartbeat_outruns_fleet_liveness(interval: Duration) -> bool {
          that the configured-total redelivery bound may fire early for this fleet."
     );
     true
+}
+
+/// Name each regular activity type with no timeout and no heartbeat (issue #1808).
+///
+/// A `start_to_close`, a `schedule_to_close` or a `heartbeat_timeout` bounds a
+/// running attempt. The local cap always bounds a local activity.
+fn activities_without_timeout(activities: &[ActivityInfo]) -> Vec<&'static str> {
+    activities
+        .iter()
+        .filter(|a| {
+            !a.is_local
+                && a.default_start_to_close.is_none()
+                && a.default_schedule_to_close.is_none()
+                && a.default_heartbeat_timeout.is_none()
+        })
+        .map(|a| a.name)
+        .collect()
+}
+
+/// Log one startup warning that names activity types with no bound (issue #1808).
+///
+/// With a default timeout, the default stops each attempt of these types. With
+/// no default, an attempt can run forever and hold a worker slot. The warning
+/// never blocks the build.
+fn warn_on_activities_without_timeout(names: &[&str], default_start_to_close: Option<Duration>) {
+    if names.is_empty() {
+        return;
+    }
+    let activity_types = names.join(", ");
+    match default_start_to_close {
+        Some(default) => tracing::warn!(
+            activity_types = %activity_types,
+            default_activity_start_to_close = ?default,
+            "harvest: these activity types declare no start_to_close, schedule_to_close or \
+             heartbeat_timeout (issue #1808). The default activity start_to_close stops each \
+             attempt. Declare a timeout on each type."
+        ),
+        None => tracing::warn!(
+            activity_types = %activity_types,
+            "harvest: these activity types declare no start_to_close, schedule_to_close or \
+             heartbeat_timeout (issue #1808). The default activity start_to_close is off, so an \
+             attempt can run forever and hold a worker slot. Declare a timeout on each type."
+        ),
+    }
 }
 
 /// Validates that every per-workflow-type retention override (issue #737)
@@ -3514,7 +3574,9 @@ pub struct WorkerConfig {
     ///
     /// Same precedence as [`WorkerConfig::default_activity_retry_policy`]:
     /// call-site override → activity default → this builder default → no
-    /// timeout. `None` (the default) is opt-in. For *local* activities the
+    /// timeout. Defaults to [`DEFAULT_ACTIVITY_START_TO_CLOSE`] (issue #1808),
+    /// so a hung activity cannot hold a worker slot forever. `None` removes
+    /// the bound. For *local* activities the
     /// resolved value is still clamped by
     /// [`WorkerConfig::max_local_activity_start_to_close`]. Set via
     /// [`WorkerConfig::with_default_activity_start_to_close`].
@@ -3526,9 +3588,8 @@ pub struct WorkerConfig {
     /// downstream's `Retry-After` response header). This ceiling bounds that
     /// hint so a misbehaving/malicious downstream cannot park a task for an
     /// unbounded duration — an over-ceiling hint is clamped down, never
-    /// rejected. Unlike the two builder-default floors above this is **not**
-    /// opt-in: it always applies, with the sane default
-    /// [`DEFAULT_RETRY_AFTER_CEILING`]. Set via
+    /// rejected. This ceiling always applies. It has no `None` form.
+    /// The default is [`DEFAULT_RETRY_AFTER_CEILING`]. Set via
     /// [`WorkerConfig::with_retry_after_ceiling`].
     pub retry_after_ceiling: Duration,
     /// How often the worker upserts its liveness row in `harvest_workers`.
@@ -3977,7 +4038,7 @@ impl Default for WorkerConfig {
             shard_assignments: Vec::new(),
             max_local_activity_start_to_close: Duration::from_secs(60),
             default_activity_retry_policy: None,
-            default_activity_start_to_close: None,
+            default_activity_start_to_close: Some(DEFAULT_ACTIVITY_START_TO_CLOSE),
             retry_after_ceiling: DEFAULT_RETRY_AFTER_CEILING,
             worker_heartbeat_interval: Duration::from_secs(5),
             build_id: String::new(),
@@ -4551,11 +4612,22 @@ impl WorkerConfig {
     /// Set the builder-level default activity `start_to_close` timeout (issue #620).
     ///
     /// Same precedence as [`WorkerConfig::with_default_activity_retry_policy`].
+    /// The value replaces [`DEFAULT_ACTIVITY_START_TO_CLOSE`] (issue #1808).
     /// For *local* activities the resolved value is still clamped by
     /// [`WorkerConfig::max_local_activity_start_to_close`].
     #[must_use]
     pub const fn with_default_activity_start_to_close(mut self, timeout: Duration) -> Self {
         self.default_activity_start_to_close = Some(timeout);
+        self
+    }
+
+    /// Remove the default activity `start_to_close` timeout (issue #1808).
+    ///
+    /// An activity with no timeout of its own can then run forever and hold a
+    /// worker slot. `try_build` logs a warning that names each such type.
+    #[must_use]
+    pub const fn without_default_activity_start_to_close(mut self) -> Self {
+        self.default_activity_start_to_close = None;
         self
     }
 
@@ -6244,9 +6316,11 @@ mod tests {
             config.default_activity_retry_policy.is_none(),
             "default activity retry policy must be unset by default (opt-in)"
         );
-        assert!(
-            config.default_activity_start_to_close.is_none(),
-            "default activity start_to_close must be unset by default (opt-in)"
+        // Issue #1808 replaces the opt-in start_to_close floor with a shipped
+        // default. The retry floor stays opt-in.
+        assert_eq!(
+            config.default_activity_start_to_close,
+            Some(DEFAULT_ACTIVITY_START_TO_CLOSE),
         );
 
         // The two builder methods set the floors and are chainable.
@@ -6264,6 +6338,136 @@ mod tests {
             configured.default_activity_start_to_close,
             Some(Duration::from_secs(300)),
         );
+    }
+
+    // ── Shipped activity start-to-close default (issue #1808) ─────────────
+
+    #[test]
+    fn worker_config_default_activity_start_to_close_is_ten_minutes() {
+        assert_eq!(DEFAULT_ACTIVITY_START_TO_CLOSE, Duration::from_secs(600));
+        assert_eq!(
+            WorkerConfig::default().default_activity_start_to_close,
+            Some(DEFAULT_ACTIVITY_START_TO_CLOSE),
+        );
+    }
+
+    #[test]
+    fn without_default_activity_start_to_close_clears_the_default() {
+        let config = WorkerConfig::default().without_default_activity_start_to_close();
+        assert_eq!(config.default_activity_start_to_close, None);
+    }
+
+    /// One regular activity type per bound, plus two with no bound.
+    fn timeout_matrix() -> Vec<ActivityInfo> {
+        let mut stc = make_activity("has_stc", None, None);
+        stc.default_start_to_close = Some(Duration::from_secs(30));
+        let mut s2c = make_activity("has_s2c", None, None);
+        s2c.default_schedule_to_close = Some(Duration::from_secs(30));
+        let mut hb = make_activity("has_heartbeat", None, None);
+        hb.default_heartbeat_timeout = Some(Duration::from_secs(30));
+        vec![
+            make_activity("bare_one", None, None),
+            stc,
+            s2c,
+            hb,
+            make_local_activity("bare_local", None),
+            make_activity("bare_two", None, None),
+        ]
+    }
+
+    #[test]
+    fn activities_without_timeout_names_only_unbounded_regular_types() {
+        // A local activity is always bounded by the local cap.
+        assert_eq!(
+            activities_without_timeout(&timeout_matrix()),
+            vec!["bare_one", "bare_two"],
+        );
+    }
+
+    /// A writer that keeps every formatted log line in memory.
+    #[derive(Clone, Default)]
+    struct LogBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Run `f` and return the WARN lines that it logs.
+    fn capture_warnings(f: impl FnOnce()) -> String {
+        let buf = LogBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = buf.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    /// The log line that names the activity types with no bound.
+    fn timeout_warning(logs: &str) -> Option<&str> {
+        logs.lines().find(|l| l.contains("issue #1808"))
+    }
+
+    #[test]
+    fn startup_warning_lists_offending_activity_types() {
+        let logs = capture_warnings(|| {
+            HarvestBuilder::new()
+                .activities(timeout_matrix())
+                .try_build()
+                .expect("a missing timeout never blocks the build");
+        });
+        let line = timeout_warning(&logs).expect("try_build logs the warning");
+        assert!(line.contains("WARN"), "{line}");
+        assert!(line.contains("bare_one, bare_two"), "{line}");
+        for bounded in ["has_stc", "has_s2c", "has_heartbeat", "bare_local"] {
+            assert!(!line.contains(bounded), "{bounded} is bounded: {line}");
+        }
+        // The line names the default that bounds these types.
+        assert!(line.contains("default_activity_start_to_close=600s"), "{line}");
+    }
+
+    #[test]
+    fn startup_warning_says_unbounded_when_the_default_is_off() {
+        let logs = capture_warnings(|| {
+            HarvestBuilder::new()
+                .activities(timeout_matrix())
+                .worker(WorkerConfig::default().without_default_activity_start_to_close())
+                .try_build()
+                .expect("a missing timeout never blocks the build");
+        });
+        let line = timeout_warning(&logs).expect("try_build logs the warning");
+        assert!(line.contains("bare_one, bare_two"), "{line}");
+        assert!(line.contains("can run forever"), "{line}");
+    }
+
+    #[test]
+    fn startup_warning_is_silent_when_every_activity_type_is_bounded() {
+        let mut matrix = timeout_matrix();
+        matrix.retain(|a| !a.name.starts_with("bare_") || a.is_local);
+        let logs = capture_warnings(|| {
+            HarvestBuilder::new()
+                .activities(matrix)
+                .try_build()
+                .expect("build");
+        });
+        assert_eq!(timeout_warning(&logs), None, "{logs}");
     }
 
     // ── Retry-After ceiling (issue #744) ───────────────────────────────────

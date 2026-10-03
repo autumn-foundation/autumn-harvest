@@ -21,7 +21,7 @@ Key attribute options:
 
 | Attribute | Default | Notes |
 |---|---|---|
-| `start_to_close` | none (no limit) | Wall-clock cap for a single attempt. |
+| `start_to_close` | `WorkerConfig::default_activity_start_to_close` (10 min) | Wall-clock cap for a single attempt. The worker default applies when the activity sets none (issue #1808). |
 | `heartbeat_timeout` | none | Fail the attempt if no heartbeat arrives within this window. |
 | `schedule_to_start` | none | Fail if no worker claims the task within this window. |
 | `queue` | `"default"` | Route the task to a named worker pool. |

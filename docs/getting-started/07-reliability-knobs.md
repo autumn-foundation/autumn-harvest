@@ -32,8 +32,16 @@ full precedence, highest first:
 3. **builder default** — the two `with_default_activity_*` methods above
 4. **implicit fallback** — today's behaviour when nothing is set anywhere
 
-It is **opt-in**: leave both unset and every activity behaves byte-for-byte as
-it does today. In particular the implicit fallback is *not* "a single attempt" —
+The retry floor is **opt-in**. The `start_to_close` floor is not: it
+defaults to `DEFAULT_ACTIVITY_START_TO_CLOSE` (10 minutes, issue #1808). A hung
+activity thus cannot hold a worker slot forever. Give a long activity its own
+`start_to_close`, or raise the floor. Call
+`without_default_activity_start_to_close()` to remove it. At build time,
+`HarvestBuilder::try_build` logs one warning that names each regular activity
+type with no `start_to_close`, no `schedule_to_close` and no
+`heartbeat_timeout`.
+
+With the retry floor unset, the implicit fallback is *not* "a single attempt" —
 a regular activity with no retry configured anywhere is still enqueued with the
 engine's default `max_attempts = 3` (a local activity's implicit fallback is a
 single attempt). The floor only raises the bar for activities that declared
