@@ -305,7 +305,7 @@ fn non_empty<T>(values: Vec<T>) -> Option<Vec<T>> {
 fn median_f64(mut values: Vec<f64>) -> f64 {
     values.sort_unstable_by(f64::total_cmp);
     let mid = values.len() / 2;
-    if values.len() % 2 == 0 {
+    if values.len().is_multiple_of(2) {
         f64::midpoint(values[mid - 1], values[mid])
     } else {
         values[mid]
@@ -317,7 +317,7 @@ fn median_f64(mut values: Vec<f64>) -> f64 {
 fn median_u64(mut values: Vec<u64>) -> u64 {
     values.sort_unstable();
     let mid = values.len() / 2;
-    if values.len() % 2 == 0 {
+    if values.len().is_multiple_of(2) {
         u64::midpoint(values[mid - 1], values[mid])
     } else {
         values[mid]
@@ -342,6 +342,8 @@ fn saturating_u32(n: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const NONE: Vec<OutlierDimension> = Vec::new();
 
     fn stats(tasks: u32, failures: u32, p99_latency_ms: u64) -> WorkerTaskStats {
         WorkerTaskStats {
@@ -396,7 +398,10 @@ mod tests {
             outlier_dimensions(&stats(100, 50, 40), &peers, &config),
             vec![OutlierDimension::FailureRatio]
         );
-        assert!(outlier_dimensions(&stats(100, 0, 40), &peers, &config).is_empty());
+        assert_eq!(
+            outlier_dimensions(&stats(100, 0, 40), &peers, &config),
+            NONE
+        );
     }
 
     #[test]
@@ -479,7 +484,10 @@ mod tests {
         let config = OutlierConfig::default();
         let peers = [stats(100, 30, 40), stats(100, 30, 40)];
         // +25 points over a 30% median is under 2x the median.
-        assert!(outlier_dimensions(&stats(100, 55, 40), &peers, &config).is_empty());
+        assert_eq!(
+            outlier_dimensions(&stats(100, 55, 40), &peers, &config),
+            NONE
+        );
         // 70% clears both rules.
         assert_eq!(
             outlier_dimensions(&stats(100, 70, 40), &peers, &config),

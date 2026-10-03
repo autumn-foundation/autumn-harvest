@@ -234,7 +234,7 @@ async fn outlier_tick_flags_the_worker_failing_half_its_tasks() {
     )
     .await
     .expect("peer tick");
-    assert!(flagged.is_empty());
+    assert_eq!(flagged, Vec::<OutlierDimension>::new());
     assert!(again.has(&Sample::Outlier {
         dimension: OutlierDimension::FailureRatio,
         flagged: false
@@ -314,11 +314,6 @@ async fn live_stats_skip_draining_workers_and_follow_worker_deletes() {
         .execute(&mut conn)
         .await
         .expect("delete worker");
-    #[derive(diesel::QueryableByName)]
-    struct Count {
-        #[diesel(sql_type = diesel::sql_types::BigInt)]
-        n: i64,
-    }
     let left: Count = diesel::sql_query(
         "SELECT COUNT(*) AS n FROM harvest_worker_task_stats WHERE worker_id = $1",
     )
@@ -497,6 +492,12 @@ fn start_params<'a>(
 }
 
 #[derive(diesel::QueryableByName)]
+struct Count {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    n: i64,
+}
+
+#[derive(diesel::QueryableByName)]
 struct StatsRow {
     #[diesel(sql_type = diesel::sql_types::Integer)]
     window_tasks: i32,
@@ -599,7 +600,7 @@ async fn running_worker_emits_saturation_metrics_and_publishes_task_stats() {
             Sample::Pollers { queue: q, pollers } if q == queue => Some(pollers),
             _ => None,
         })
-        .last();
+        .next_back();
     assert_eq!(last_pollers, Some(0), "pollers read 0 after the drain");
 }
 

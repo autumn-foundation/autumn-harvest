@@ -28009,6 +28009,7 @@ impl Worker {
     /// returns it if a dispatch channel is installed but a multi-shard span
     /// it needs does not have full per-shard coverage. That includes a
     /// shard whose channel a racing install has since replaced.
+    #[allow(clippy::too_many_lines)]
     pub fn new_with_expected_shard_generations(
         config: WorkerRuntimeConfig,
         registry: Arc<HandlerRegistry>,

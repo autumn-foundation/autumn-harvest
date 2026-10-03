@@ -2355,6 +2355,7 @@ mod tests {
     /// Issue #1815: the saturation and outlier bridges register the documented
     /// names and bounded labels, and pass each value through unchanged.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn bridges_saturation_and_outlier_metrics_with_bounded_labels_and_values() {
         type Sample = (String, Vec<(String, String)>, f64);
         type Sink = std::sync::Arc<std::sync::Mutex<Vec<Sample>>>;

@@ -779,6 +779,10 @@ fn push_sampler_adjacent_metrics(families: &mut Vec<MetricFamily>, inner: &Inner
         &[],
         inner.notify_queue_usage.snapshot(),
     );
+}
+
+/// DB-pool, DB op, poller and outlier families (issue #1815).
+fn push_saturation_metrics(families: &mut Vec<MetricFamily>, inner: &Inner) {
     push_gauge(
         families,
         "harvest_db_pool_in_use",
@@ -865,6 +869,7 @@ impl MetricsSource for HarvestMetricsRecorder {
         let mut families = Vec::new();
         push_catalogue_metrics(&mut families, &self.0);
         push_sampler_adjacent_metrics(&mut families, &self.0);
+        push_saturation_metrics(&mut families, &self.0);
         push_connector_metrics(&mut families, &self.0);
         families
     }

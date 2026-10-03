@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 
 use autumn_harvest::worker::DbPool;
 use autumn_harvest::worker_outlier::{
-    OutlierConfig, OutlierDimension, WorkerOutlier, WorkerTaskStats, detect_outliers,
+    OutlierConfig, WorkerOutlier, WorkerTaskStats, detect_outliers,
 };
 use autumn_harvest::workers::{
     WorkerFilters, WorkerHealth, WorkerRow, WorkerStatus, list_workers, load_live_worker_task_stats,
@@ -981,6 +981,7 @@ mod tests {
         DlqSummary, QueueDepthSummary, ShardHealthReport, ShardHealthRow, ShardReadiness,
         ShardSchedulerCoverage, ShardSchemaHealth,
     };
+    use autumn_harvest::worker_outlier::OutlierDimension;
     use chrono::{TimeZone as _, Utc};
     use std::collections::BTreeMap;
 
