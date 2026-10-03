@@ -563,9 +563,9 @@ async fn record_abort(audit_pool: &crate::worker::DbPool, abort: &RampAbort, err
 /// and its step counts, then aborts each ramp with an abort verdict. The reads
 /// share one bound of one interval. A failed or slow read aborts nothing.
 ///
-/// For each ramp that this pass cleared on at least one pool, the pass writes
-/// one audit row to `audit_pool`, counts the abort on `metrics` and logs a
-/// warning. Returns those aborts.
+/// An abort counts only when this pass cleared the ramp on one pool or more.
+/// For each such abort, the pass writes one audit row to `audit_pool`. It also
+/// counts the abort on `metrics` and logs a warning. Returns those aborts.
 #[cfg(feature = "db")]
 pub async fn guard_once(
     pools: &[crate::worker::DbPool],
