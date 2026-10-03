@@ -1585,9 +1585,10 @@ async fn a_queued_row_whose_reason_lapses_moves_to_one_that_matches() {
         .await
         .expect("heartbeat");
 
-    // The row moves on this pass and is handed out on the next one.
+    // The row moves on this pass. It waits behind the last queued
+    // start-to-close row, so it goes out on the third pass.
     let mut moved = false;
-    for _ in 0..2 {
+    for _ in 0..3 {
         let page = timeout::find_timed_out_tasks_batch(&mut conn, &mut cursor, 1)
             .await
             .expect("batch scan");

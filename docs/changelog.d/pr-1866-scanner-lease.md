@@ -46,7 +46,7 @@ size, so adding workers to clear a backlog added database load in proportion.
   or in its queue. Otherwise the later reason takes it. A lane keeps its
   clock until its last queue drains. A queued row keeps its reason when an
   earlier one starts to match. If its reason stops matching, it moves to the
-  first other reason that still matches, within that reason's limit. No
+  back of the queue of the first other reason that still matches. No
   later lane hands it out under its own reason in the same pass. The
   lanes give up their batch ids only after every load of the pass succeeds. The four
   predicate consts are unchanged, so the backup drill's `UNION` still works.

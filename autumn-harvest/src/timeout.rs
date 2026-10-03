@@ -771,7 +771,7 @@ impl TimeoutScanLane {
 /// after the sweep starts, or that expires later, waits for the next sweep.
 /// So new rows cannot stretch a sweep or push an older row out of it. A
 /// queued row that stops matching moves to the first other reason that
-/// matches when its batch loads. It goes first in that lane's next batch. A
+/// matches when its batch loads. It joins the back of that lane's queue. A
 /// row that matches none is dropped.
 ///
 /// Each refill reads at most one page of index entries, and each pass loads
@@ -1008,26 +1008,34 @@ pub async fn find_timed_out_tasks_batch(
     for lane in &mut cursor.lanes {
         lane.commit_batch(take);
     }
-    // A moved row goes first in its new lane's next batch.
-    if !moves.is_empty() {
-        let mut held: Vec<HashSet<uuid::Uuid>> = cursor
-            .lanes
-            .iter()
-            .map(|lane| {
-                lane.queued
-                    .iter()
-                    .copied()
-                    .chain(lane.retry.iter().map(|(id, _)| *id))
-                    .collect()
-            })
-            .collect();
-        for (other, id) in moves.into_iter().rev() {
-            if held[other].insert(id) {
-                cursor.lanes[other].queued.push_front(id);
-            }
+    admit_moves(&mut cursor.lanes, moves);
+    Ok(results)
+}
+
+/// Queues each moved row in the lane of its new reason.
+///
+/// A moved row waits behind the rows already queued there. So a steady
+/// stream of moves cannot starve that queue. A row already queued or
+/// waiting for a retry in that lane is skipped.
+fn admit_moves(lanes: &mut [TimeoutScanLane; 4], moves: Vec<(usize, uuid::Uuid)>) {
+    if moves.is_empty() {
+        return;
+    }
+    let mut held: Vec<HashSet<uuid::Uuid>> = lanes
+        .iter()
+        .map(|lane| {
+            lane.queued
+                .iter()
+                .copied()
+                .chain(lane.retry.iter().map(|(id, _)| *id))
+                .collect()
+        })
+        .collect();
+    for (other, id) in moves {
+        if held[other].insert(id) {
+            lanes[other].queued.push_back(id);
         }
     }
-    Ok(results)
 }
 
 /// Which task-timeout scan one pass runs (issue #1795).
@@ -6847,6 +6855,19 @@ mod tests {
             "took {:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn moved_rows_wait_behind_the_rows_already_queued() {
+        let ids = |n| (0..n).map(|_| uuid::Uuid::new_v4()).collect::<Vec<_>>();
+        let waiting = ids(2);
+        let moved = ids(2);
+        let mut lanes: [TimeoutScanLane; 4] = Default::default();
+        lanes[3].queued = waiting.clone().into();
+        admit_moves(&mut lanes, moved.iter().map(|id| (3, *id)).collect());
+        // First in, first out: a stream of moves cannot starve the queue.
+        let order: Vec<_> = lanes[3].queued.iter().copied().collect();
+        assert_eq!(order, [waiting, moved].concat());
     }
 
     #[test]

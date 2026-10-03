@@ -236,8 +236,9 @@ queue of its sweep drains. If the earlier lane has already passed the row,
 the later reason takes it. So the row does not wait for a whole sweep. A
 queued row keeps its reason, also when an earlier reason starts to match
 later. If its reason stops matching before it loads, it moves to the first
-other reason that still matches. It goes first in that reason's next batch,
-within that reason's limit. No other reason hands it out in the meantime.
+other reason that still matches. It joins the back of that reason's queue,
+so it counts against that reason's limit and cannot starve the rows already
+there. No other reason hands it out in the meantime.
 
 A row that fails to enforce is tried again first in the next batch, for at
 most three passes in a row. Retried and queued rows share the batch limit.
