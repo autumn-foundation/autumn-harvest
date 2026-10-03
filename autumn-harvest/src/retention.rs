@@ -891,10 +891,12 @@ impl RetentionConfig {
         Ok(())
     }
 
-    /// Returns `true` if any retention feature is enabled: workflow-history
-    /// retention (global or per-type), audit-log purging, schedule-decision
-    /// purging, bounded summary GC (issue #752), partition maintenance (issue
-    /// #958), the idle rate-limit-bucket GC (issue #1127), or the
+    /// Returns `true` if any retention feature is enabled.
+    ///
+    /// The features are: workflow-history retention (global or per-type),
+    /// audit-log purging, and schedule-decision purging. They also include
+    /// bounded summary GC (issue #752) and partition maintenance (issue #958).
+    /// The last two are the idle rate-limit-bucket GC (issue #1127) and the
     /// terminal-task janitor (issue #1811).
     ///
     /// Per-workflow-type overrides count as enabling workflow-history retention
