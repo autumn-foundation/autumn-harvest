@@ -1404,8 +1404,8 @@ fn rename(s: &Stmts, k: usize, history: &mut History) {
         .entry(base(&new).to_string())
         .or_default()
         .extend(keys);
-    // An index on the old name now sits on the new one, and a foreign key
-    // that pointed at the old name now points at the new one.
+    // An index on the old name now sits on the new one. A foreign key that
+    // pointed at the old name now points at the new one.
     for tables in history
         .indexes
         .values_mut()
