@@ -415,6 +415,9 @@ pub struct HarvestApiState {
     /// Cap on distinct groups `GET /admin/usage` will return before failing
     /// loudly with `413` (issue #596). Defaults to 10,000.
     usage_max_groups: Arc<Mutex<usize>>,
+    /// Build ramp guard settings (issue #1814), mirrored from
+    /// `BuiltHarvest::ramp_guard` at startup. The default is disabled.
+    ramp_guard_config: Arc<Mutex<autumn_harvest::ramp_guard::RampGuardConfig>>,
     /// SSRF policy for completion-callback targets (issue #605), mirrored
     /// from `BuiltHarvest::completion_callback_config()` at startup so the
     /// HTTP start route can validate a per-execution target the same way
@@ -489,6 +492,9 @@ impl Default for HarvestApiState {
             )),
             usage_max_groups: Arc::new(Mutex::new(
                 autumn_harvest::usage::default_usage_max_groups(),
+            )),
+            ramp_guard_config: Arc::new(Mutex::new(
+                autumn_harvest::ramp_guard::RampGuardConfig::default(),
             )),
             completion_callback_ssrf_policy: Arc::new(Mutex::new(
                 autumn_harvest::completion_callback::SsrfPolicy::default(),
@@ -1022,6 +1028,25 @@ impl HarvestApiState {
             .usage_max_groups
             .lock()
             .expect("harvest api state lock poisoned") = cap;
+    }
+
+    /// The build ramp guard settings (issue #1814).
+    pub fn ramp_guard_config(&self) -> autumn_harvest::ramp_guard::RampGuardConfig {
+        *self
+            .ramp_guard_config
+            .lock()
+            .expect("harvest api state lock poisoned")
+    }
+
+    /// Set the build ramp guard settings (issue #1814).
+    ///
+    /// The boot path reads them when it spawns the guard loop, so set them
+    /// first.
+    pub fn set_ramp_guard_config(&self, config: autumn_harvest::ramp_guard::RampGuardConfig) {
+        *self
+            .ramp_guard_config
+            .lock()
+            .expect("harvest api state lock poisoned") = config;
     }
 
     /// Set the hard caps for `POST /workflows/batch_start` (issue #357).

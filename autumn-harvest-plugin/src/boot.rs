@@ -67,6 +67,8 @@ pub fn mirror_built_config(api_state: &HarvestApiState, built: &mut BuiltHarvest
         .gate_cache()
         .load_shedder()
         .configure(built.load_shed.clone());
+    // Build ramp guard (issue #1814). The default config is disabled.
+    api_state.set_ramp_guard_config(built.ramp_guard);
     // Completion-callback SSRF policy (issue #605). The HTTP start route
     // validates a per-execution target against the allowlist that the scanner
     // uses at delivery time. `PreparedHarvestRuntime::build`, inside
@@ -122,6 +124,7 @@ pub struct GateRefreshRuntime {
     shutdown: CancellationToken,
     handle: JoinHandle<()>,
     load_shed: Option<JoinHandle<()>>,
+    ramp_guard: Option<JoinHandle<()>>,
 }
 
 impl GateRefreshRuntime {
@@ -131,6 +134,9 @@ impl GateRefreshRuntime {
         let _ = self.handle.await;
         if let Some(load_shed) = self.load_shed {
             let _ = load_shed.await;
+        }
+        if let Some(ramp_guard) = self.ramp_guard {
+            let _ = ramp_guard.await;
         }
     }
 }
@@ -153,6 +159,7 @@ pub fn spawn_gate_refresh(
     let cancel = shutdown.child_token();
     let inputs = LoadShedSamplerInputs::from_registry(runtime.registry());
     let load_shed = spawn_load_shed_sampler(api_state, pools, inputs, shutdown.child_token());
+    let ramp_guard = spawn_ramp_guard(api_state, pools, runtime, shutdown.child_token());
     let pool = pools.clone_inner();
     let cache = api_state.gate_cache();
     let api_state = api_state.clone();
@@ -200,7 +207,40 @@ pub fn spawn_gate_refresh(
         shutdown,
         handle,
         load_shed,
+        ramp_guard,
     }
+}
+
+/// Spawn the build ramp guard of `api_state` (issue #1814).
+///
+/// Returns `None` when the guard is disabled, so a default deployment runs no
+/// guard SQL. The guard reads each physical pool once per pass and writes its
+/// audit rows to the default pool. It takes the metrics recorder from
+/// `runtime`, so a caller can spawn it before `api_state.install(runtime)`.
+fn spawn_ramp_guard(
+    api_state: &HarvestApiState,
+    pools: &HarvestDbPool,
+    runtime: &HarvestApiRuntime,
+    cancel: CancellationToken,
+) -> Option<JoinHandle<()>> {
+    let config = api_state.ramp_guard_config();
+    if !config.is_enabled() {
+        return None;
+    }
+    let shard_pools: Vec<DbPool> = pools
+        .sharded_pool()
+        .pool_groups()
+        .into_iter()
+        .map(|(pool, _)| pool.clone())
+        .collect();
+    let metrics = Arc::clone(&runtime.registry().telemetry().metrics);
+    Some(tokio::spawn(autumn_harvest::ramp_guard::run_ramp_guard(
+        shard_pools,
+        pools.clone_inner(),
+        config,
+        metrics,
+        cancel,
+    )))
 }
 
 /// The registry data that every load-shed sample reads (issue #1794).

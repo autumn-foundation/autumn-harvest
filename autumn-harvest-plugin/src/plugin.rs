@@ -426,6 +426,17 @@ impl HarvestPlugin {
         self
     }
 
+    /// Turn on the build ramp guard (issue #1814).
+    ///
+    /// The guard aborts a build ramp when the target build fails or ND-blocks
+    /// more runs than the base build. See
+    /// `docs/operations/build-ramp-guard.md`.
+    #[must_use]
+    pub fn ramp_guard(mut self, config: autumn_harvest::ramp_guard::RampGuardConfig) -> Self {
+        self.builder = self.builder.ramp_guard(config);
+        self
+    }
+
     /// How long a keyed workflow start's idempotency claim is retained
     /// (issue #808; default 24 h).
     ///
@@ -3568,6 +3579,25 @@ mod tests {
             .expect("valid load-shed config should build");
         assert_eq!(built.load_shed, config);
         assert!(built.load_shed.is_enabled());
+    }
+
+    #[test]
+    fn harvest_plugin_forwards_ramp_guard_to_builder() {
+        // Issue #1814: the plugin owns its builder, so without this forwarder
+        // a plugin deployment cannot turn on the ramp guard.
+        let config = autumn_harvest::ramp_guard::RampGuardConfig::new().with_min_samples(7);
+        let built = HarvestPlugin::new()
+            .ramp_guard(config)
+            .builder
+            .try_build()
+            .expect("valid ramp-guard config should build");
+        assert_eq!(built.ramp_guard, config);
+        assert!(built.ramp_guard.is_enabled());
+        let default = HarvestPlugin::new()
+            .builder
+            .try_build()
+            .expect("default build");
+        assert!(!default.ramp_guard.is_enabled(), "the guard is opt-in");
     }
 
     // ── Connector build-time validation (issue #944) ──────────────────────

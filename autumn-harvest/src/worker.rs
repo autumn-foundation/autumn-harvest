@@ -8238,7 +8238,11 @@ async fn block_workflow_for_non_determinism(
 
     telemetry
         .metrics
-        .record_workflow_nondeterministic_block(&execution.workflow_name, &task.queue_name);
+        .record_workflow_nondeterministic_block_for_build(
+            &execution.workflow_name,
+            &task.queue_name,
+            crate::telemetry::build_id_label(build_id),
+        );
     tracing::warn!(
         execution_id = %exec_id,
         workflow = %execution.workflow_name,
@@ -15459,6 +15463,7 @@ async fn process_activity_task(
     registry: &HandlerRegistry,
     task: &TaskQueueItem,
     worker_id: &str,
+    build_id: &str,
     cancellation_grace_period: Duration,
     dispatched_at: std::time::Instant,
     max_concurrent_sessions: i32,
@@ -15728,9 +15733,11 @@ async fn process_activity_task(
             crate::failure::ActivityFailure::circuit_open(activity_name, opened_at, retry_after)
                 .into_error_payload();
         let telemetry = registry.telemetry().clone();
-        telemetry.metrics.record_activity_completed_with_error_type(
+        let build_label = crate::telemetry::build_id_label(build_id);
+        telemetry.metrics.record_activity_completed_for_build(
             activity_name,
             &task.queue_name,
+            build_label,
             0.0,
             ActivityStatus::Failed,
             Some(crate::failure::ERROR_TYPE_CIRCUIT_OPEN),
@@ -15741,9 +15748,10 @@ async fn process_activity_task(
             crate::failure::ERROR_TYPE_CIRCUIT_OPEN,
             true,
         );
-        telemetry.metrics.record_activity_attempt(
+        telemetry.metrics.record_activity_attempt_for_build(
             activity_name,
             &task.queue_name,
+            build_label,
             ActivityStatus::Failed,
         );
         let mut conn = pool.get().await.map_err(crate::error::database_error)?;
@@ -16150,9 +16158,12 @@ async fn process_activity_task(
             .err()
             .map(|payload| parse_error_payload(payload))
     };
-    telemetry.metrics.record_activity_completed_with_error_type(
+    // Issue #1814: label the outcome and latency with this worker's build.
+    let build_label = crate::telemetry::build_id_label(build_id);
+    telemetry.metrics.record_activity_completed_for_build(
         activity_name,
         &task.queue_name,
+        build_label,
         duration_secs,
         status,
         failure_info.as_ref().map(|(et, _, _)| et.as_str()),
@@ -16160,9 +16171,12 @@ async fn process_activity_task(
     // AC1 (issue #528): single-family attempt counter for success-rate SLOs.
     // Fires for both outcomes so `completed / (completed + failed)` is one
     // metric family — the activity-level mirror of harvest.workflow.terminal.
-    telemetry
-        .metrics
-        .record_activity_attempt(activity_name, &task.queue_name, status);
+    telemetry.metrics.record_activity_attempt_for_build(
+        activity_name,
+        &task.queue_name,
+        build_label,
+        status,
+    );
     if let Some((error_type, non_retryable, _)) = failure_info.as_ref() {
         // `workflow.type` is intentionally empty here: looking it up requires
         // an extra `harvest_workflow_executions` query per failure, and the
@@ -19942,10 +19956,13 @@ fn emit_pending_workflow_metrics(
     build_id: &str,
     pending: &PendingWorkflowMetrics,
 ) {
+    // Issue #1814: label the outcome and latency with this worker's build.
+    let build_label = crate::telemetry::build_id_label(build_id);
     if !pending.is_canary {
-        telemetry.metrics.record_workflow_completed(
+        telemetry.metrics.record_workflow_completed_for_build(
             &execution.workflow_name,
             queue_name,
+            build_label,
             pending.duration_secs,
             pending.status,
         );
@@ -19981,10 +19998,11 @@ fn emit_pending_workflow_metrics(
                     pending.canary_roundtrip_secs.unwrap_or(0.0),
                 );
             } else {
-                crate::telemetry::emit_workflow_terminal(
+                crate::telemetry::emit_workflow_terminal_for_build(
                     &*telemetry.metrics,
                     &execution.workflow_name,
                     queue_name,
+                    build_label,
                     WorkflowStatus::Completed,
                 );
             }
@@ -20011,10 +20029,11 @@ fn emit_pending_workflow_metrics(
                     .metrics
                     .record_canary_failure(queue_name, pending.canary_shard);
             } else {
-                crate::telemetry::emit_workflow_terminal(
+                crate::telemetry::emit_workflow_terminal_for_build(
                     &*telemetry.metrics,
                     &execution.workflow_name,
                     queue_name,
+                    build_label,
                     WorkflowStatus::Failed,
                 );
             }
@@ -20022,10 +20041,11 @@ fn emit_pending_workflow_metrics(
         TerminalMetricsKind::ContinuedAsNew => {
             // A canary never continues-as-new; the choke point skips it anyway
             // (AC8), so this is effectively unreachable for a canary.
-            crate::telemetry::emit_workflow_terminal(
+            crate::telemetry::emit_workflow_terminal_for_build(
                 &*telemetry.metrics,
                 &execution.workflow_name,
                 queue_name,
+                build_label,
                 WorkflowStatus::ContinuedAsNew,
             );
         }
@@ -20967,6 +20987,7 @@ async fn fail_workflow_for_history_cap(
     exec_id: ExecutionId,
     next_event_id: i32,
     worker_id: &str,
+    build_id: &str,
     started_at: std::time::Instant,
     event_count: u64,
     cap: u64,
@@ -21046,19 +21067,23 @@ async fn fail_workflow_for_history_cap(
     // completion-trigger latest-wins supersede counters this call's inline
     // same-shard trigger start may have collected.
     crate::execution::emit_start_cancel_metrics(&*telemetry.metrics, &pending_cancel_metrics);
-    telemetry.metrics.record_workflow_completed(
+    // Issue #1814: label the outcome and latency with this worker's build.
+    let build_label = crate::telemetry::build_id_label(build_id);
+    telemetry.metrics.record_workflow_completed_for_build(
         &execution.workflow_name,
         &task.queue_name,
+        build_label,
         duration_secs,
         WorkflowStatus::Failed,
     );
     telemetry
         .metrics
         .record_workflow_history_size(&execution.workflow_name, terminal_count);
-    crate::telemetry::emit_workflow_terminal(
+    crate::telemetry::emit_workflow_terminal_for_build(
         &*telemetry.metrics,
         &execution.workflow_name,
         &task.queue_name,
+        build_label,
         WorkflowStatus::Failed,
     );
 
@@ -21757,6 +21782,7 @@ async fn process_workflow_task(
                                 prepared.exec_id,
                                 next_event_id,
                                 worker_id,
+                                build_id,
                                 started_at,
                                 current_history_event_count,
                                 cap,
@@ -21889,6 +21915,7 @@ async fn process_workflow_task(
                             prepared.exec_id,
                             next_event_id,
                             worker_id,
+                            build_id,
                             started_at,
                             event_count,
                             registry
@@ -21938,6 +21965,7 @@ async fn process_workflow_task(
                         prepared.exec_id,
                         next_event_id,
                         worker_id,
+                        build_id,
                         started_at,
                         current_history_event_count,
                         cap,
@@ -22103,6 +22131,7 @@ async fn process_workflow_task(
                         prepared.exec_id,
                         next_event_id,
                         worker_id,
+                        build_id,
                         started_at,
                         current_history_event_count,
                         cap,
@@ -22386,6 +22415,7 @@ async fn process_workflow_task(
                         prepared.exec_id,
                         next_event_id,
                         worker_id,
+                        build_id,
                         started_at,
                         current_history_event_count,
                         cap,
@@ -22847,6 +22877,7 @@ async fn process_workflow_task(
             prepared.exec_id,
             next_event_id,
             worker_id,
+            build_id,
             started_at,
             current_history_event_count,
             cap,
@@ -23744,6 +23775,7 @@ async fn process_task(
                 registry.as_ref(),
                 &task,
                 worker_id,
+                build_id,
                 cancellation_grace_period,
                 dispatched_at,
                 max_concurrent_sessions,

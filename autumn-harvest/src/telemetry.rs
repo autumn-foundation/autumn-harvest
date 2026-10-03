@@ -1239,6 +1239,14 @@ pub const METRIC_LOAD_SHED_ACTIVE: &str = "harvest.load_shed.active";
 ///   - `"queue"` (= [`METRIC_LABEL_QUEUE`]) — the shed queue.
 pub const METRIC_LOAD_SHED_REJECTED: &str = "harvest.load_shed.rejected";
 
+/// Counter: one per build ramp that the ramp guard aborted (issue #1814).
+///
+/// Labels:
+///   - `"queue"` (= [`METRIC_LABEL_QUEUE`]) — the queue of the ramp.
+///   - `"reason"` (= [`METRIC_LABEL_REASON`]) — `"failure_rate"` or
+///     `"nd_block_rate"`, from `ramp_guard::RampAbortReason::as_str`.
+pub const METRIC_BUILD_RAMP_ABORTED: &str = "harvest.build.ramp_aborted";
+
 /// Gauge: current available tokens in a rate limit bucket.
 pub const METRIC_RATE_LIMIT_TOKENS_AVAILABLE: &str = "harvest.rate_limit.tokens_available";
 
@@ -1859,7 +1867,27 @@ pub const METRIC_LABEL_SCOPE: &str = "scope";
 /// Metric label: the in-process start producer (issue #618).
 pub const METRIC_LABEL_PRODUCER: &str = "producer";
 /// Metric label: the build ID of the worker.
+///
+/// A value always goes through [`build_id_label`], which caps the cardinality
+/// (issue #1814).
 pub const METRIC_LABEL_BUILD_ID: &str = "build_id";
+/// `build_id` label value when the build is not known or is empty
+/// (issue #1814).
+pub const BUILD_ID_LABEL_NONE: &str = "none";
+/// `build_id` label value for a build over the cap (issue #1814).
+///
+/// [`build_id_label`] uses it for a build after the first
+/// [`MAX_BUILD_ID_LABELS`] distinct builds, and for a build id longer than
+/// [`MAX_BUILD_ID_LABEL_LEN`] bytes.
+pub const BUILD_ID_LABEL_OTHER: &str = "__other__";
+/// The maximum number of distinct `build_id` label values in one process
+/// (issue #1814).
+///
+/// A worker process normally reports one build, its own. The cap is a safety
+/// limit for a process that reports many builds.
+pub const MAX_BUILD_ID_LABELS: usize = 16;
+/// The maximum byte length of a `build_id` label value (issue #1814).
+pub const MAX_BUILD_ID_LABEL_LEN: usize = 128;
 /// Metric label: worker dispatch-slot type (`"workflow"` or `"activity"`).
 pub const METRIC_LABEL_SLOT_TYPE: &str = "slot_type";
 /// Metric label: adaptive slot-tuner decision (`"grow"` / `"shrink"` / `"hold"`,
@@ -1885,6 +1913,80 @@ pub const METRIC_LABEL_SCANNER: &str = "scanner";
 /// [`METRIC_SCANNER_TICK`] series carries the same label set — a family with a
 /// sometimes-present label is awkward to query and easy to mis-aggregate.
 pub const SCANNER_SHARD_LABEL_NONE: &str = "none";
+
+// ---------------------------------------------------------------------------
+// Bounded `build_id` label (issue #1814)
+// ---------------------------------------------------------------------------
+
+/// A cap on the distinct `build_id` label values (issue #1814).
+///
+/// The cap admits the first `max` distinct build ids. A later build id gets
+/// [`BUILD_ID_LABEL_OTHER`].
+#[derive(Debug)]
+pub struct BuildIdLabelCap {
+    max: usize,
+    admitted: std::sync::RwLock<std::collections::HashSet<Box<str>>>,
+}
+
+impl BuildIdLabelCap {
+    /// Make a cap that admits `max` distinct build ids.
+    #[must_use]
+    pub fn new(max: usize) -> Self {
+        Self {
+            max,
+            admitted: std::sync::RwLock::default(),
+        }
+    }
+
+    /// Return the label value for `raw`.
+    ///
+    /// An empty `raw` gets [`BUILD_ID_LABEL_NONE`]. A `raw` longer than
+    /// [`MAX_BUILD_ID_LABEL_LEN`] bytes gets [`BUILD_ID_LABEL_OTHER`]. A
+    /// sentinel value maps to itself and uses no slot, so a second cap of a
+    /// label is safe.
+    #[must_use]
+    pub fn label<'a>(&self, raw: &'a str) -> &'a str {
+        if raw.is_empty() || raw == BUILD_ID_LABEL_NONE {
+            return BUILD_ID_LABEL_NONE;
+        }
+        if raw == BUILD_ID_LABEL_OTHER || raw.len() > MAX_BUILD_ID_LABEL_LEN {
+            return BUILD_ID_LABEL_OTHER;
+        }
+        let admitted = self
+            .admitted
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(raw);
+        if admitted {
+            return raw;
+        }
+        let mut set = self
+            .admitted
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Check again under the write lock: another thread can admit `raw`
+        // between the two locks.
+        if set.contains(raw) {
+            return raw;
+        }
+        if set.len() >= self.max {
+            return BUILD_ID_LABEL_OTHER;
+        }
+        set.insert(raw.into());
+        raw
+    }
+}
+
+/// Return the capped `build_id` label value for `raw` (issue #1814).
+///
+/// One process-wide [`BuildIdLabelCap`] of [`MAX_BUILD_ID_LABELS`] holds the
+/// admitted values.
+#[must_use]
+pub fn build_id_label(raw: &str) -> &str {
+    static CAP: std::sync::LazyLock<BuildIdLabelCap> =
+        std::sync::LazyLock::new(|| BuildIdLabelCap::new(MAX_BUILD_ID_LABELS));
+    CAP.label(raw)
+}
 
 // ---------------------------------------------------------------------------
 // Custom (user) metric constants and validation (issue #532)
@@ -2384,6 +2486,14 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = queue;
     }
 
+    /// The ramp guard aborted the build ramp of `queue` (issue #1814).
+    ///
+    /// Maps to [`METRIC_BUILD_RAMP_ABORTED`]. `reason` is
+    /// `ramp_guard::RampAbortReason::as_str`.
+    fn record_build_ramp_aborted(&self, queue: &str, reason: &str) {
+        let _ = (queue, reason);
+    }
+
     /// A fresh workflow start was rejected because its resolved per-tenant
     /// quota key is at or over a declared cap (issue #946).
     ///
@@ -2457,6 +2567,38 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (workflow_name, queue, outcome);
     }
 
+    /// [`record_workflow_terminal`](Self::record_workflow_terminal) with the
+    /// build of the worker that ran the task (issue #1814).
+    ///
+    /// `build_id` is a value from [`build_id_label`]. The default drops it, so
+    /// an existing recorder stays correct with no change.
+    fn record_workflow_terminal_for_build(
+        &self,
+        workflow_name: &str,
+        queue: &str,
+        build_id: &str,
+        outcome: WorkflowStatus,
+    ) {
+        let _ = build_id;
+        self.record_workflow_terminal(workflow_name, queue, outcome);
+    }
+
+    /// [`record_workflow_completed`](Self::record_workflow_completed) with the
+    /// build of the worker that ran the task (issue #1814).
+    ///
+    /// The default drops `build_id`.
+    fn record_workflow_completed_for_build(
+        &self,
+        workflow_name: &str,
+        queue: &str,
+        build_id: &str,
+        duration_secs: f64,
+        status: WorkflowStatus,
+    ) {
+        let _ = build_id;
+        self.record_workflow_completed(workflow_name, queue, duration_secs, status);
+    }
+
     /// A workflow execution rotated using continue-as-new.
     fn record_workflow_continue_as_new(&self, workflow_name: &str) {
         let _ = workflow_name;
@@ -2476,6 +2618,20 @@ pub trait MetricsRecorder: Send + Sync {
     /// Per ADR-0001 §7, `execution.id` must never be a label here.
     fn record_workflow_nondeterministic_block(&self, workflow_name: &str, queue: &str) {
         let _ = (workflow_name, queue);
+    }
+
+    /// [`record_workflow_nondeterministic_block`](Self::record_workflow_nondeterministic_block)
+    /// with the build of the worker that hit the divergence (issue #1814).
+    ///
+    /// The default drops `build_id`.
+    fn record_workflow_nondeterministic_block_for_build(
+        &self,
+        workflow_name: &str,
+        queue: &str,
+        build_id: &str,
+    ) {
+        let _ = build_id;
+        self.record_workflow_nondeterministic_block(workflow_name, queue);
     }
 
     /// An activity handler panicked (unwound) and the engine contained the
@@ -2598,6 +2754,44 @@ pub trait MetricsRecorder: Send + Sync {
     /// by construction.
     fn record_activity_attempt(&self, activity_name: &str, queue: &str, outcome: ActivityStatus) {
         let _ = (activity_name, queue, outcome);
+    }
+
+    /// [`record_activity_attempt`](Self::record_activity_attempt) with the
+    /// build of the worker that ran the attempt (issue #1814).
+    ///
+    /// The default drops `build_id`.
+    fn record_activity_attempt_for_build(
+        &self,
+        activity_name: &str,
+        queue: &str,
+        build_id: &str,
+        outcome: ActivityStatus,
+    ) {
+        let _ = build_id;
+        self.record_activity_attempt(activity_name, queue, outcome);
+    }
+
+    /// [`record_activity_completed_with_error_type`](Self::record_activity_completed_with_error_type)
+    /// with the build of the worker that ran the attempt (issue #1814).
+    ///
+    /// The default drops `build_id`.
+    fn record_activity_completed_for_build(
+        &self,
+        activity_name: &str,
+        queue: &str,
+        build_id: &str,
+        duration_secs: f64,
+        status: ActivityStatus,
+        error_type: Option<&str>,
+    ) {
+        let _ = build_id;
+        self.record_activity_completed_with_error_type(
+            activity_name,
+            queue,
+            duration_secs,
+            status,
+            error_type,
+        );
     }
 
     /// A retry was scheduled for an activity (one per retry actually enqueued).
@@ -3804,6 +3998,24 @@ pub fn emit_workflow_terminal<M: MetricsRecorder + ?Sized>(
         return;
     }
     metrics.record_workflow_terminal(workflow_name, queue, outcome);
+}
+
+/// [`emit_workflow_terminal`] with the build of the worker that ran the task
+/// (issue #1814).
+///
+/// It skips canary probes in the same way. `build_id` is a value from
+/// [`build_id_label`].
+pub fn emit_workflow_terminal_for_build<M: MetricsRecorder + ?Sized>(
+    metrics: &M,
+    workflow_name: &str,
+    queue: &str,
+    build_id: &str,
+    outcome: WorkflowStatus,
+) {
+    if crate::canary::is_canary_workflow(workflow_name) {
+        return;
+    }
+    metrics.record_workflow_terminal_for_build(workflow_name, queue, build_id, outcome);
 }
 
 /// Emit [`METRIC_CONCURRENCY_SUPERSEDED`] once per superseded run (issue #811).
@@ -5566,5 +5778,151 @@ mod tests {
         // construction.
         let rec: Arc<dyn MetricsRecorder> = Arc::new(NoOpMetrics);
         rec.record_task_capability_miss("default", "workflow", "released");
+    }
+
+    // ── Bounded build_id label (issue #1814) ────────────────────────────
+
+    #[test]
+    fn build_id_label_cap_admits_up_to_max_then_buckets() {
+        let cap = BuildIdLabelCap::new(2);
+        assert_eq!(cap.label("a"), "a");
+        assert_eq!(cap.label("b"), "b");
+        assert_eq!(cap.label("c"), BUILD_ID_LABEL_OTHER, "over the cap");
+        assert_eq!(cap.label("a"), "a", "an admitted build stays admitted");
+        assert_eq!(cap.label("b"), "b");
+    }
+
+    #[test]
+    fn build_id_label_cap_maps_empty_to_none_and_long_to_other() {
+        let cap = BuildIdLabelCap::new(4);
+        assert_eq!(cap.label(""), BUILD_ID_LABEL_NONE);
+        let long = "x".repeat(MAX_BUILD_ID_LABEL_LEN + 1);
+        assert_eq!(cap.label(&long), BUILD_ID_LABEL_OTHER);
+        let edge = "y".repeat(MAX_BUILD_ID_LABEL_LEN);
+        assert_eq!(
+            cap.label(&edge),
+            edge.as_str(),
+            "the length bound is inclusive"
+        );
+        // Neither sentinel uses an admission slot.
+        for build in ["p", "q", "r"] {
+            assert_eq!(cap.label(build), build);
+        }
+    }
+
+    #[test]
+    fn build_id_label_cap_keeps_sentinels_without_a_slot() {
+        let cap = BuildIdLabelCap::new(1);
+        assert_eq!(cap.label(BUILD_ID_LABEL_NONE), BUILD_ID_LABEL_NONE);
+        assert_eq!(cap.label(BUILD_ID_LABEL_OTHER), BUILD_ID_LABEL_OTHER);
+        assert_eq!(cap.label("v1"), "v1", "the one slot is still free");
+    }
+
+    #[test]
+    fn build_id_label_cap_of_zero_buckets_every_build() {
+        let cap = BuildIdLabelCap::new(0);
+        assert_eq!(cap.label("v1"), BUILD_ID_LABEL_OTHER);
+        assert_eq!(cap.label(""), BUILD_ID_LABEL_NONE);
+    }
+
+    #[test]
+    fn global_build_id_label_is_bounded() {
+        assert_eq!(build_id_label(""), BUILD_ID_LABEL_NONE);
+        for i in 0..(MAX_BUILD_ID_LABELS * 2) {
+            let raw = format!("global-cap-test-{i}");
+            let label = build_id_label(&raw);
+            assert!(label == raw || label == BUILD_ID_LABEL_OTHER, "{label}");
+        }
+        assert_eq!(
+            build_id_label("global-cap-test-overflow-probe"),
+            BUILD_ID_LABEL_OTHER,
+            "the global cap is full after 2x MAX distinct builds"
+        );
+    }
+
+    #[test]
+    fn build_labelled_defaults_forward_to_the_unlabelled_methods() {
+        #[derive(Default)]
+        struct Rec(std::sync::Mutex<Vec<&'static str>>);
+        impl MetricsRecorder for Rec {
+            fn record_workflow_terminal(&self, _: &str, _: &str, _: WorkflowStatus) {
+                self.0.lock().unwrap().push("terminal");
+            }
+            fn record_workflow_completed(&self, _: &str, _: &str, _: f64, _: WorkflowStatus) {
+                self.0.lock().unwrap().push("wf_duration");
+            }
+            fn record_workflow_nondeterministic_block(&self, _: &str, _: &str) {
+                self.0.lock().unwrap().push("nd_block");
+            }
+            fn record_activity_attempt(&self, _: &str, _: &str, _: ActivityStatus) {
+                self.0.lock().unwrap().push("attempt");
+            }
+            fn record_activity_completed(&self, _: &str, _: &str, _: f64, _: ActivityStatus) {
+                self.0.lock().unwrap().push("act_duration");
+            }
+        }
+        let rec = Rec::default();
+        rec.record_workflow_terminal_for_build("wf", "q", "b", WorkflowStatus::Failed);
+        rec.record_workflow_completed_for_build("wf", "q", "b", 1.0, WorkflowStatus::Completed);
+        rec.record_workflow_nondeterministic_block_for_build("wf", "q", "b");
+        rec.record_activity_attempt_for_build("a", "q", "b", ActivityStatus::Failed);
+        rec.record_activity_completed_for_build("a", "q", "b", 1.0, ActivityStatus::Failed, None);
+        rec.record_build_ramp_aborted("q", "failure_rate");
+        assert_eq!(
+            rec.0.lock().unwrap().as_slice(),
+            &[
+                "terminal",
+                "wf_duration",
+                "nd_block",
+                "attempt",
+                "act_duration"
+            ]
+        );
+    }
+
+    #[test]
+    fn emit_workflow_terminal_for_build_skips_canary_and_caps_the_label() {
+        #[derive(Default)]
+        struct Rec(std::sync::Mutex<Vec<(String, String)>>);
+        impl MetricsRecorder for Rec {
+            fn record_workflow_terminal_for_build(
+                &self,
+                wf: &str,
+                _: &str,
+                build_id: &str,
+                _: WorkflowStatus,
+            ) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((wf.to_owned(), build_id.to_owned()));
+            }
+        }
+        let rec = Rec::default();
+        emit_workflow_terminal_for_build(
+            &rec,
+            "__harvest_canary_probe__default",
+            "default",
+            "b1",
+            WorkflowStatus::Completed,
+        );
+        emit_workflow_terminal_for_build(
+            &rec,
+            "orders",
+            "default",
+            build_id_label(""),
+            WorkflowStatus::Failed,
+        );
+        assert_eq!(
+            rec.0.lock().unwrap().as_slice(),
+            &[("orders".to_owned(), BUILD_ID_LABEL_NONE.to_owned())]
+        );
+    }
+
+    #[test]
+    fn metric_build_ramp_aborted_name_is_stable() {
+        assert_eq!(METRIC_BUILD_RAMP_ABORTED, "harvest.build.ramp_aborted");
+        assert_eq!(BUILD_ID_LABEL_NONE, "none");
+        assert_eq!(BUILD_ID_LABEL_OTHER, "__other__");
     }
 }
