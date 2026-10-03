@@ -26029,12 +26029,13 @@ fn spawn_stranded_work_sampler(
                         .unwrap_or_default()
                 };
 
-                // A demand is covered when some covering worker polls its queue
-                // AND satisfies its required_capabilities (the same Exact/In
-                // label match claim_task applies) AND is build-eligible for its
-                // required_build_id (the same exact or compatible rule) AND,
-                // when the row is held by an unexpired sticky lease, *is* that
-                // lease's owner (only it can claim until the lease expires). All
+                // A demand is covered when some covering worker polls its queue.
+                // That worker also satisfies its required_capabilities (the
+                // same Exact/In label match claim_task applies). It is
+                // build-eligible for its required_build_id (the same exact or
+                // compatible rule). When an unexpired sticky lease holds the
+                // row, it *is* the lease owner, because only the owner can
+                // claim until the lease expires. All
                 // constraints are checked against the *same* worker so a task
                 // needing several is not falsely covered by different workers
                 // each satisfying only one. No requirement ⇒ that dimension is
