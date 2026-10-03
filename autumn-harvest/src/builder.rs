@@ -3553,6 +3553,12 @@ pub struct WorkerConfig {
     pub shutdown_timeout: Duration,
     /// Maximum cached in-memory workflow states (LRU eviction).
     pub workflow_cache_size: usize,
+    /// Whether a cache entry keeps the suspended workflow resident, so a warm
+    /// decision skips replay (issue #1798).
+    ///
+    /// Default: `true`. It has no effect when sticky routing is off. See
+    /// [`Self::with_resident_workflows`].
+    pub resident_workflows: bool,
     /// How long to offer sticky tasks to the sticky worker before fallback.
     ///
     /// Default: [`DEFAULT_STICKY_TIMEOUT`] (5 s). Zero disables sticky
@@ -4058,6 +4064,7 @@ impl Default for WorkerConfig {
             max_concurrent_activities: 50,
             shutdown_timeout: Duration::from_secs(30),
             workflow_cache_size: 1000,
+            resident_workflows: true,
             sticky_timeout: DEFAULT_STICKY_TIMEOUT,
             cancellation_grace_period: Duration::from_secs(5),
             shard_assignments: Vec::new(),
@@ -4519,6 +4526,35 @@ impl WorkerConfig {
     #[must_use]
     pub const fn with_sticky_routing(mut self, config: StickyRoutingConfig) -> Self {
         self.sticky_timeout = config.lease_ttl;
+        self
+    }
+
+    /// Turn resident workflow state on or off (issue #1798).
+    ///
+    /// Resident state is **on by default**. A warm cache entry then keeps the
+    /// suspended workflow itself, not only its events. The next decision on
+    /// this worker sends the new result to the parked future. It does not
+    /// replay history, so its cost does not grow with history length.
+    ///
+    /// A resident entry also holds the parked future and its context, which
+    /// keeps a second copy of the history. Turn this off to save that memory.
+    ///
+    /// Only some suspensions stay resident, and any other delta falls back to
+    /// a cold replay. See `docs/sticky-routing.md`. Turn it off to replay
+    /// every decision while the event cache stays warm. It has no effect
+    /// when sticky routing is off.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use autumn_harvest::builder::WorkerConfig;
+    ///
+    /// let config = WorkerConfig::default().with_resident_workflows(false);
+    /// assert!(!config.resident_workflows);
+    /// ```
+    #[must_use]
+    pub const fn with_resident_workflows(mut self, enabled: bool) -> Self {
+        self.resident_workflows = enabled;
         self
     }
 
