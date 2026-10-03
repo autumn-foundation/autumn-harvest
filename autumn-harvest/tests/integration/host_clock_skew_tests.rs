@@ -6,8 +6,8 @@
 //! heartbeat scan then times out a healthy activity. Each write now takes its
 //! value from `clock_timestamp()` in SQL, so the host clock does not matter.
 //!
-//! The suite checks two things. A stored stamp must match the database clock
-//! within `TOLERANCE_MS`. The heartbeat scan must not select a task that has
+//! The suite checks two things. A stored stamp must lie between two database
+//! clock readings, one before the write and one after it. The heartbeat scan must not select a task that has
 //! just heartbeated. To reproduce a real skew, run the built test binary under
 //! `faketime -f -60s`.
 //!
@@ -28,8 +28,8 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use uuid::Uuid;
 
-/// Round-trip allowance for the queries around each write. A 60 s skew fails.
-const TOLERANCE_MS: i64 = 750;
+/// Slack for a sub-millisecond clock step. A 60 s skew is far outside it.
+const SLACK_MS: i64 = 50;
 
 // ── DB setup ─────────────────────────────────────────────────────────────────
 
@@ -120,13 +120,22 @@ async fn read_column(conn: &mut AsyncPgConnection, column: &str, id: Uuid) -> Da
     .at
 }
 
-/// Assert that `stamp` lies within `TOLERANCE_MS` of the database clock.
-async fn assert_on_db_clock(conn: &mut AsyncPgConnection, what: &str, stamp: DateTime<Utc>) {
-    let now = db_now(conn).await;
-    let drift = (now - stamp).num_milliseconds().abs();
+/// Assert that `stamp` lies between `before` and a fresh database reading.
+///
+/// `before` is read before the write. The second reading comes after it. A
+/// stamp from the database clock always lies between them, however long the
+/// test process pauses. A stamp from a skewed host clock does not.
+async fn assert_on_db_clock(
+    conn: &mut AsyncPgConnection,
+    what: &str,
+    before: DateTime<Utc>,
+    stamp: DateTime<Utc>,
+) {
+    let after = db_now(conn).await;
+    let slack = Duration::milliseconds(SLACK_MS);
     assert!(
-        drift <= TOLERANCE_MS,
-        "{what} ({stamp}) is {drift}ms from the database clock ({now}); \
+        stamp >= before - slack && stamp <= after + slack,
+        "{what} ({stamp}) is outside the database clock window [{before}, {after}]; \
          the write used the host clock"
     );
 }
@@ -167,13 +176,14 @@ async fn record_heartbeat_stamps_the_database_clock() {
     assert_eq!(claimed.id, task);
     let claim = TaskClaim::of(&claimed).expect("claim");
 
+    let before = db_now(&mut conn).await;
     let write = queue::record_heartbeat(&mut conn, &claim, serde_json::json!({"step": 1}))
         .await
         .expect("heartbeat");
     assert!(matches!(write, queue::ClaimWrite::Applied));
 
     let stamp = read_column(&mut conn, "last_heartbeat_at", task).await;
-    assert_on_db_clock(&mut conn, "last_heartbeat_at", stamp).await;
+    assert_on_db_clock(&mut conn, "last_heartbeat_at", before, stamp).await;
 }
 
 /// A fresh heartbeat must keep a long-running task out of the timeout scan.
@@ -230,6 +240,7 @@ async fn record_heartbeat_uses_the_live_clock_inside_a_transaction() {
         .expect("claimable");
     let claim = TaskClaim::of(&claimed).expect("claim");
 
+    let before = db_now(&mut conn).await;
     Box::pin(
         conn.transaction::<(), autumn_harvest::error::HarvestError, _>(async |conn| {
             diesel::sql_query("SELECT pg_sleep(1)")
@@ -245,7 +256,7 @@ async fn record_heartbeat_uses_the_live_clock_inside_a_transaction() {
     .expect("heartbeat in transaction");
 
     let stamp = read_column(&mut conn, "last_heartbeat_at", task).await;
-    assert_on_db_clock(&mut conn, "last_heartbeat_at", stamp).await;
+    assert_on_db_clock(&mut conn, "last_heartbeat_at", before, stamp).await;
 }
 
 /// The stuck-running backstop re-pends a workflow task. Its new
@@ -279,6 +290,7 @@ async fn stuck_task_requeue_stamps_scheduled_at_on_the_database_clock() {
     .await
     .expect("insert stuck task");
 
+    let before = db_now(&mut conn).await;
     let summary = reclaim_orphaned_tasks(
         &mut conn,
         3,
@@ -292,7 +304,7 @@ async fn stuck_task_requeue_stamps_scheduled_at_on_the_database_clock() {
     assert_eq!(summary.stuck_requeued, 1, "setup: the backstop must fire");
 
     let stamp = read_column(&mut conn, "scheduled_at", task).await;
-    assert_on_db_clock(&mut conn, "scheduled_at", stamp).await;
+    assert_on_db_clock(&mut conn, "scheduled_at", before, stamp).await;
 }
 
 /// `force_retry_activity_now` moves a backing-off row to immediate
@@ -324,13 +336,14 @@ async fn force_retry_stamps_scheduled_at_on_the_database_clock() {
             .workflow_exec_id
     };
 
+    let before = db_now(&mut conn).await;
     let outcome = queue::force_retry_activity_now(&mut conn, exec_id, task)
         .await
         .expect("force retry");
     assert!(outcome.advanced, "setup: the row must advance");
 
     let stamp = read_column(&mut conn, "scheduled_at", task).await;
-    assert_on_db_clock(&mut conn, "scheduled_at", stamp).await;
+    assert_on_db_clock(&mut conn, "scheduled_at", before, stamp).await;
     assert_eq!(
         outcome.scheduled_at, stamp,
         "outcome reports the stored value"
