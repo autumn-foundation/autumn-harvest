@@ -989,11 +989,11 @@ async fn assert_stale_write_rejected<T: std::fmt::Debug>(
     assert_eq!(row.attempt, fx.current.attempt);
 }
 
-fn is_completed(event: &WorkflowEvent) -> bool {
+const fn is_completed(event: &WorkflowEvent) -> bool {
     matches!(event, WorkflowEvent::WorkflowCompleted { .. })
 }
 
-fn is_failed(event: &WorkflowEvent) -> bool {
+const fn is_failed(event: &WorkflowEvent) -> bool {
     matches!(event, WorkflowEvent::WorkflowFailed { .. })
 }
 
