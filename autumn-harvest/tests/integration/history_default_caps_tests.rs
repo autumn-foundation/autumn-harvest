@@ -441,17 +441,23 @@ struct Count {
     n: i64,
 }
 
-/// Stored bytes of the run's events, without the terminal `WorkflowFailed`.
+/// Stored bytes of the run's events, without the events of `appended_types`.
 ///
-/// The failing decision measures before it appends `WorkflowFailed`, so this
-/// is the exact value the typed reason must carry.
-async fn stored_bytes_before_failure(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> u64 {
+/// The failing decision measures before it appends those events, so this is
+/// the exact value the typed reason must carry.
+async fn stored_bytes_before_failure(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    appended_types: &[&str],
+) -> u64 {
+    let appended: Vec<String> = appended_types.iter().map(|t| (*t).to_owned()).collect();
     let row: Count = diesel::sql_query(
         "SELECT COALESCE(SUM(pg_column_size(event_data)), 0)::bigint AS n \
          FROM harvest_events \
-         WHERE workflow_exec_id = $1 AND event_type <> 'WorkflowFailed'",
+         WHERE workflow_exec_id = $1 AND NOT (event_type = ANY($2))",
     )
     .bind::<SqlUuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Array<Text>, _>(appended)
     .get_result(conn)
     .await
     .expect("sum stored history bytes");
@@ -582,13 +588,17 @@ async fn dead_letter_reason(
 
 /// Assert the run failed with a typed byte-cap reason that carries exactly
 /// the stored bytes and `cap`.
+///
+/// `appended_types` names the events the failing decision appends after it
+/// measures: always `WorkflowFailed`, plus any prefix events.
 async fn assert_byte_cap_failure(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     expected_cap: u64,
     workflow: &str,
+    appended_types: &[&str],
 ) {
-    let stored = stored_bytes_before_failure(conn, exec_id).await;
+    let stored = stored_bytes_before_failure(conn, exec_id, appended_types).await;
     match dead_letter_reason(conn, exec_id).await {
         Some(DeadLetterReason::HistoryBytesCapExceeded {
             bytes,
@@ -761,7 +771,14 @@ async fn default_byte_cap_fails_a_run_at_fifty_mib() {
     running.stop().await;
 
     assert_eq!(execution.state, "FAILED");
-    assert_byte_cap_failure(&mut conn, exec_id, DEFAULT_HISTORY_BYTE_HARD_CAP, GROWER).await;
+    assert_byte_cap_failure(
+        &mut conn,
+        exec_id,
+        DEFAULT_HISTORY_BYTE_HARD_CAP,
+        GROWER,
+        &["WorkflowFailed"],
+    )
+    .await;
 }
 
 /// A signal loop reaches a 64 KiB byte cap. The signals arrive one at a
@@ -818,7 +835,7 @@ async fn byte_cap_signal_loop(sticky_timeout: Duration) -> Arc<RecordingMetrics>
     running.stop().await;
 
     assert_eq!(execution.state, "FAILED");
-    assert_byte_cap_failure(&mut conn, exec_id, CAP, GROWER).await;
+    assert_byte_cap_failure(&mut conn, exec_id, CAP, GROWER, &["WorkflowFailed"]).await;
     // Report whether the crossing decision itself was a cache hit.
     metrics
         .cache_hits
@@ -879,7 +896,16 @@ async fn byte_cap_stops_a_run_before_an_inline_local_activity() {
         0,
         "the local activity must not run once the run is over the byte cap"
     );
-    assert_byte_cap_failure(&mut conn, exec_id, CAP, LOCAL_RUNNER).await;
+    // The decision appends `LocalActivityScheduled` before the gate, as the
+    // event-cap gate does, then `WorkflowFailed`.
+    assert_byte_cap_failure(
+        &mut conn,
+        exec_id,
+        CAP,
+        LOCAL_RUNNER,
+        &["LocalActivityScheduled", "WorkflowFailed"],
+    )
+    .await;
 }
 
 /// A run over the byte cap can still rotate. `continue_as_new` moves it onto
