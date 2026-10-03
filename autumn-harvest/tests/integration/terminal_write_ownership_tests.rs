@@ -1007,3 +1007,52 @@ async fn persist_from_a_requeued_claim_of_the_same_worker_is_rejected_1806() {
     );
     assert_eq!(load_execution(&url, exec_id).await.state, "RUNNING");
 }
+
+/// The ambiguous-claim release is a plain `UPDATE`. It must not free a later
+/// claim of the same worker that has the same `crash_strikes`.
+#[tokio::test]
+async fn release_from_a_requeued_claim_of_the_same_worker_is_a_no_op_1806() {
+    let (url, _container) = setup_db().await;
+    let queue_name = format!("q1806-release-{}", Uuid::new_v4());
+    let exec_id = seed_workflow(
+        &mut connect(&url).await,
+        "issue1806_release_wf",
+        serde_json::json!({}),
+        &queue_name,
+    )
+    .await;
+
+    let stale = claim_workflow_task(&url, &queue_name, "same-worker").await;
+    requeue_as_stuck(&url, stale.id).await;
+    let current = claim_workflow_task(&url, &queue_name, "same-worker").await;
+    assert_eq!(current.crash_strikes, stale.crash_strikes);
+
+    let mut conn = connect(&url).await;
+    let released = queue::release_terminal_workflow_claim(
+        &mut conn,
+        &queue::TaskClaim::new(stale.id, "same-worker", stale.attempt),
+        stale.crash_strikes,
+    )
+    .await
+    .expect("release runs");
+    assert!(!released, "a stale release must not free the later claim");
+
+    let reloaded = load_tasks(&url, exec_id)
+        .await
+        .into_iter()
+        .find(|t| t.id == stale.id)
+        .expect("the task row");
+    assert_eq!(
+        (reloaded.state.as_str(), reloaded.attempt),
+        ("RUNNING", current.attempt)
+    );
+
+    let released = queue::release_terminal_workflow_claim(
+        &mut conn,
+        &queue::TaskClaim::new(current.id, "same-worker", current.attempt),
+        current.crash_strikes,
+    )
+    .await
+    .expect("release runs");
+    assert!(released, "the current claim must still release");
+}
