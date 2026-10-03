@@ -338,15 +338,16 @@ fn timeout_in_force(timeouts: &[(usize, Timeout)], at: usize) -> bool {
                 }
                 in_transaction = true;
             }
-            Timeout::Commit => {
+            // `AND CHAIN` starts the next transaction at once.
+            Timeout::Commit { chain } => {
                 saved = session;
                 local = None;
-                in_transaction = false;
+                in_transaction = chain;
             }
-            Timeout::Rollback => {
+            Timeout::Rollback { chain } => {
                 session = saved;
                 local = None;
-                in_transaction = false;
+                in_transaction = chain;
             }
             Timeout::RollbackToSavepoint => {
                 session = false;
@@ -364,11 +365,12 @@ enum Timeout {
     Set { bounds: bool, local: bool },
     /// `BEGIN` or `START TRANSACTION`.
     Begin,
-    /// `COMMIT` or `END`, which drops every local value.
-    Commit,
+    /// `COMMIT` or `END`, which drops every local value. `chain` is set for
+    /// `AND CHAIN`, which opens a new transaction at once.
+    Commit { chain: bool },
     /// `ROLLBACK` or `ABORT`, which also undoes every session change since
     /// the transaction began.
-    Rollback,
+    Rollback { chain: bool },
     /// `ROLLBACK TO SAVEPOINT`. The lint does not track savepoints, so it
     /// assumes no bound remains.
     RollbackToSavepoint,
@@ -818,6 +820,11 @@ impl<'a> Stmts<'a> {
         false
     }
 
+    /// Whether the statement at `k` ends with `AND CHAIN`, not `AND NO CHAIN`.
+    fn chains(&self, k: usize) -> bool {
+        (k..self.end(k)).any(|j| self.is(j, "and") && self.is(j + 1, "chain"))
+    }
+
     /// The index one past the last token of the statement that holds `k`.
     fn end(&self, k: usize) -> usize {
         (k..self.toks.len())
@@ -1243,14 +1250,16 @@ fn timeout_change(s: &Stmts, k: usize) -> Option<Timeout> {
         "start" if start && s.toks[k].depth == 0 && s.is(k + 1, "transaction") => {
             Some(Timeout::Begin)
         }
-        "commit" | "end" if start && s.toks[k].depth == 0 => Some(Timeout::Commit),
+        "commit" | "end" if start && s.toks[k].depth == 0 => {
+            Some(Timeout::Commit { chain: s.chains(k) })
+        }
         "rollback" | "abort" if start && s.toks[k].depth == 0 => {
             // `ROLLBACK [WORK | TRANSACTION] TO [SAVEPOINT] s` restores the value
             // from the savepoint, which the lint does not track.
             if (k + 1..=k + 2).any(|j| s.is(j, "to")) {
                 Some(Timeout::RollbackToSavepoint)
             } else {
-                Some(Timeout::Rollback)
+                Some(Timeout::Rollback { chain: s.chains(k) })
             }
         }
         "set_config"
@@ -1395,8 +1404,13 @@ fn rename(s: &Stmts, k: usize, history: &mut History) {
         .entry(base(&new).to_string())
         .or_default()
         .extend(keys);
-    // An index on the old name now sits on the new one.
-    for tables in history.indexes.values_mut() {
+    // An index on the old name now sits on the new one, and a foreign key
+    // that pointed at the old name now points at the new one.
+    for tables in history
+        .indexes
+        .values_mut()
+        .chain(history.references.values_mut())
+    {
         if tables.iter().any(|t| base(t) == base(&old)) {
             tables.insert(new.clone());
         }
@@ -2864,6 +2878,42 @@ fn a_repeated_begin_keeps_the_first_snapshot() {
                ALTER TABLE harvest_events ADD COLUMN x INT;";
     let findings = lint_with_history(&[], sql, false);
     assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+}
+
+#[test]
+fn renaming_a_referenced_table_moves_the_keys_that_point_at_it() {
+    let history = [
+        "CREATE TABLE replacement (id INT PRIMARY KEY);\n\
+         CREATE TABLE child (r INT REFERENCES replacement (id));",
+        "ALTER TABLE harvest_events RENAME TO old_events;\n\
+         ALTER TABLE replacement RENAME TO harvest_events;",
+    ];
+    let findings = lint_with_history(&history, "DROP TABLE child;", true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+    assert!(
+        findings[0].detail.contains("harvest_events"),
+        "{findings:?}"
+    );
+}
+
+#[test]
+fn a_chained_commit_or_rollback_stays_in_a_transaction() {
+    for end in ["COMMIT AND CHAIN", "ROLLBACK AND CHAIN"] {
+        let sql = format!(
+            "{end};\nSET lock_timeout = '5s';\nBEGIN;\nSET lock_timeout = '0';\nROLLBACK;\n\
+             ALTER TABLE harvest_events ADD COLUMN x INT;"
+        );
+        let findings = lint_with_history(&[], &sql, false);
+        assert_eq!(rules(&findings), [Rule::LockTimeout], "{end}: {findings:?}");
+    }
+}
+
+#[test]
+fn nulls_not_distinct_after_the_columns_is_still_a_plain_build() {
+    let sql = "SET LOCAL lock_timeout = '5s';\n\
+               CREATE UNIQUE INDEX idx_x ON harvest_events (id) NULLS NOT DISTINCT;";
+    let findings = lint_with_history(&[], sql, true);
+    assert_eq!(rules(&findings), [Rule::BlockingIndex], "{findings:?}");
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────
