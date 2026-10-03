@@ -15,7 +15,7 @@ An embedder auth layer still applies. See
 
 ## Liveness
 
-`/health/live` always returns `200`. It reads one in-memory flag and does no
+`/health/live` always returns `200`. It reads in-memory flags and does no
 I/O. A liveness probe that touches the database restarts every pod during a
 database outage. A restart does not fix the database.
 
@@ -29,16 +29,23 @@ database outage. A restart does not fix the database.
 
 1. The Harvest runtime has started.
 2. The replica is not draining.
-3. The default shard answers `SELECT 1` within 1 second.
-4. The shard readiness report is `ready`. This check applies only when
+3. The default shard answers `SELECT 1`.
+4. The shard readiness verdict is `ready`. This check applies only when
    `[harvest.readiness] require_shard_readiness = true`.
 
 Otherwise it returns `503`. The checks run in this order. A failed check 1 or
 2 skips the database checks, so a stopping replica does no extra I/O.
 
-The probe reads only the default shard. One bad non-default shard therefore
-does not remove every replica from the load balancer. To gate on every
-writable shard, set `require_shard_readiness`.
+Checks 3 and 4 share one 1 second budget. The pool checkout counts against
+the budget, so an exhausted pool gives `503`, not a hung probe.
+
+The replica caches the result of checks 3 and 4 for 1 second. Concurrent
+requests wait for one check. The probe is public, so the cache limits its
+database load. Checks 1 and 2 are not cached, so a drain shows at once.
+
+Without `require_shard_readiness`, the probe reads only the default shard.
+One bad non-default shard therefore does not remove every replica from the
+load balancer.
 
 ```json
 {
@@ -59,18 +66,28 @@ writable shard, set `require_shard_readiness`.
 | `draining` | The replica is shutting down. |
 | `database_reachable` | The default-shard result. `null` when the check did not run. |
 | `shard_readiness_enforced` | The value of `require_shard_readiness`. |
-| `shard_readiness` | The shard report. `null` when not enforced or not run. |
-| `reasons` | Machine codes: `runtime_not_started`, `draining`, `database_unreachable`, `shard_not_ready`. Empty when ready. |
+| `shard_readiness` | `ready`, `degraded` or `unavailable`. `null` when the check did not run or timed out. |
+| `reasons` | Machine codes. Empty when ready. |
+
+The reason codes are `runtime_not_started`, `draining`,
+`database_unreachable`, `shard_not_ready` and `shard_report_timeout`.
+
+The body holds the shard verdict only. The full report is on the
+admin-gated `GET /admin/shards/health`.
 
 ## Draining
 
-Shutdown sets the draining flag first. `HarvestPlugin` sets it at the start
-of its shutdown hook. `HarvestEmbeddingRuntime::stop` sets it at the start of
-`stop()`. Readiness then fails before the worker stops in-flight work.
+The draining flag makes readiness fail before in-flight work stops.
 
-An embedder can set the flag earlier. Call
-`HarvestApiState::begin_draining()` when SIGTERM arrives. A new runtime
-`install()` clears the flag.
+- **`HarvestPlugin`.** autumn-web marks its own probe state at SIGTERM.
+  Harvest reads that state, so `/health/ready` returns `503` at once. The
+  Harvest shutdown hook also sets the flag.
+- **`HarvestEmbedding`.** `HarvestEmbeddingRuntime::stop` sets the flag
+  first. Call `HarvestApiState::begin_draining()` earlier, when SIGTERM
+  arrives, if the server is still answering. See
+  [`docs/embedding.md`](../embedding.md#shut-down).
+
+The next runtime start clears the flag.
 
 A remote drain (`POST /workers/{id}/drain`) does not change readiness. It
 stops the worker, not the HTTP routes. See
@@ -79,7 +96,8 @@ stops the worker, not the HTTP routes. See
 ## `/health`
 
 `GET /health` stays for compatibility. Its status and body do not change. It
-returns `200` before the runtime starts. Use `/health/ready` for readiness.
+returns `200` before the runtime starts and during a drain. Use
+`/health/ready` for readiness.
 
 ## Pod spec
 
@@ -90,7 +108,7 @@ spec:
     - name: app
       ports:
         - name: http
-          containerPort: 8080
+          containerPort: 3000 # Your server port. 3000 is the autumn-web default.
       livenessProbe:
         httpGet: { path: /api/harvest/health/live, port: http }
         periodSeconds: 10
@@ -128,24 +146,39 @@ still arrive. The `preStop` sleep keeps the process serving until they stop.
 ### `terminationGracePeriodSeconds`
 
 The kubelet sends SIGKILL when the grace period ends. The period covers the
-`preStop` sleep and the full shutdown. Use this lower bound:
+`preStop` sleep and the full shutdown. A shorter period kills in-flight
+tasks. Their leases then expire, and another worker retries them.
+
+For `HarvestPlugin`, autumn-web runs the shutdown in two phases. It first
+waits `[server] prestop_grace_secs` (default 5). Then the request drain and
+the shutdown hooks share one `[server] shutdown_timeout_secs` budget
+(default 30). The Harvest worker drain runs in a shutdown hook. Use this
+lower bound:
 
 ```text
 terminationGracePeriodSeconds >= preStop sleep
-                                + WorkerConfig::shutdown_timeout
+                                + prestop_grace_secs
+                                + shutdown_timeout_secs
                                 + 10 s margin
 ```
 
-The default `shutdown_timeout` is 30 seconds. With a 10 second `preStop`, use
-at least 50 seconds. A shorter period kills in-flight tasks. Their leases then
-expire and another worker retries them.
+Set `shutdown_timeout_secs` above `WorkerConfig::shutdown_timeout` (default
+30 seconds). Otherwise autumn-web stops the worker drain before it ends. With
+a 10 second `preStop`, `shutdown_timeout_secs = 45` and the other defaults,
+use at least 70 seconds.
 
-## Shutdown sequence
+For `HarvestEmbedding`, use the server drain time of your process in place
+of the two autumn-web values.
+
+## Shutdown sequence (`HarvestPlugin`)
 
 1. Kubernetes marks the pod `Terminating` and removes it from endpoints.
 2. The `preStop` sleep runs. The process still serves requests.
 3. Kubernetes sends SIGTERM.
-4. Harvest sets the draining flag. `/health/ready` returns `503`.
-5. The worker stops claiming tasks. It waits for in-flight tasks up to
-   `shutdown_timeout`.
-6. The API state clears. The process exits.
+4. autumn-web marks its probe state. `/health/ready` returns `503`.
+5. autumn-web waits `prestop_grace_secs`. It then closes the listener and
+   drains in-flight requests.
+6. The Harvest shutdown hook stops the connectors and the outbox relay.
+7. The worker stops claiming tasks. It waits for in-flight tasks up to
+   `shutdown_timeout`. A remote drain `deadline_at` replaces this bound.
+8. The API state clears. The process exits.

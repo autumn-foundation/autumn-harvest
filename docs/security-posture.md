@@ -44,9 +44,12 @@ See [Fail-closed mutations](#fail-closed-mutations-issue-1802).
 The `PublicSafe` routes are `GET /health`, `GET /health/live`,
 `GET /health/ready` and `GET /openapi.json`. Kubernetes probes and
 load-balancer health checks must reach the health paths without credentials.
-Exposing them is an explicit product decision; all
-other routes should be behind your authentication boundary in production.
-The probe bodies hold only booleans and reason codes. See
+Exposing them is an explicit product decision. Put all other routes behind
+your authentication boundary in production.
+
+The `/health/live` and `/health/ready` bodies hold only booleans, the shard
+verdict and reason codes. Under `require_shard_readiness`, `GET /health` also
+returns the full shard report, which includes database error text. See
 [`operations/kubernetes-probes.md`](operations/kubernetes-probes.md).
 
 ---
@@ -228,16 +231,17 @@ verification, database lookup, etc.).
 
 The health handlers are internal to the plugin and cannot be re-mounted
 separately. To let probes reach them without credentials, use a selective
-middleware that skips auth for those exact paths:
+middleware that skips auth for those exact paths. `api_with_auth` applies
+the layer inside the nest, so the layer sees the path without the mount
+prefix:
 
 ```rust
 async fn harvest_auth(req: Request, next: Next) -> Response {
     // Exact match — ends_with("/health") would also bypass /workers/health,
-    // which is ReadOnly, not PublicSafe. Update the literal if you change
-    // the HarvestPlugin mount point.
+    // which is ReadOnly, not PublicSafe. The path has no mount prefix here.
     if matches!(
         req.uri().path(),
-        "/api/harvest/health" | "/api/harvest/health/live" | "/api/harvest/health/ready"
+        "/health" | "/health/live" | "/health/ready"
     ) {
         return next.run(req).await;  // allow probe traffic through
     }

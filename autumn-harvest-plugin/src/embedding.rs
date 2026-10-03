@@ -186,6 +186,8 @@ impl HarvestEmbedding {
     ) -> impl Future<Output = autumn_web::AutumnResult<HarvestEmbeddingRuntime>> + Send {
         // The startup future is large, so it lives on the heap. A caller's own
         // future then stays small (`clippy::large_futures`).
+        // Issue #1812: a new start ends an old drain.
+        self.api_state.end_draining();
         Box::pin(async move {
             // Read the environment before the first await. `&dyn Env` is not
             // `Sync`, so holding it would make this future not `Send`.

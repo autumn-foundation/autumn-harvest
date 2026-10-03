@@ -650,7 +650,8 @@ async fn ready_probe_applies_enforced_shard_readiness() {
 
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(body["database_reachable"], true);
-    assert_eq!(body["shard_readiness"]["overall_readiness"], "degraded");
+    // The public body has the verdict only, not the admin report.
+    assert_eq!(body["shard_readiness"], "degraded");
     assert_eq!(body["reasons"], serde_json::json!(["shard_not_ready"]));
 }
 

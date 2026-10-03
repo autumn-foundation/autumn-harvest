@@ -145,7 +145,8 @@ pub async fn run() -> Result<(), BoxError> {
     let serve = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             shutdown_signal().await;
-            // Readiness fails first, so in-flight responses see the drain.
+            // Mark the drain before the listener closes. A probe in flight
+            // then sees 503. The pod `preStop` sleep covers new traffic.
             drain_state.begin_draining();
             notify.notify_one();
         })

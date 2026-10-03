@@ -5121,7 +5121,7 @@
       "path": "/health/ready",
       "category": "health",
       "read_only": true,
-      "description": "Readiness probe (issue #1812). Returns 200 when the runtime has started, the replica is not draining and the default shard answers SELECT 1 within 1 second. With require_shard_readiness, the shard report must also be ready. reasons names each failed check. See docs/operations/kubernetes-probes.md.",
+      "description": "Readiness probe (issue #1812). Returns 200 when the runtime has started, the replica is not draining and the default shard answers SELECT 1. With require_shard_readiness, the shard verdict must also be ready. The database checks share a 1 second budget, and their result is cached for 1 second. shard_readiness is the verdict string only; GET /admin/shards/health has the detail. reasons names each failed check. See docs/operations/kubernetes-probes.md.",
       "params": [],
       "request_body": null,
       "success_response": {
@@ -5139,7 +5139,7 @@
       "additional_responses": [
         {
           "status": 503,
-          "description": "The replica is not ready. Same body as the 200. reasons holds one or more of runtime_not_started, draining, database_unreachable, shard_not_ready. database_reachable is null when an earlier check failed.",
+          "description": "The replica is not ready. Same body as the 200. reasons holds one or more of runtime_not_started, draining, database_unreachable, shard_not_ready, shard_report_timeout. database_reachable is null when an earlier check failed.",
           "fields": [
             "ready",
             "runtime_ready",

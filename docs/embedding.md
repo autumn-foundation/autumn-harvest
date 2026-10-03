@@ -492,9 +492,10 @@ verification.
 
 ## Shut down
 
-When SIGTERM arrives, call `HarvestApiState::begin_draining()` on the state
-you gave to `with_api_state`. `GET /health/ready` then returns `503`, so the
-load balancer stops new traffic while the server still answers.
+When SIGTERM arrives, call `begin_draining()` on `harvest.api_state()`.
+`GET /health/ready` then returns `503`. Keep the server up for at least one
+readiness period, or rely on a Kubernetes `preStop` sleep. The load balancer
+then stops new traffic while the server still answers.
 
 Stop the HTTP server next, so that no request reaches a cleared API state.
 Then call `HarvestEmbeddingRuntime::stop`. It does these steps, in order:

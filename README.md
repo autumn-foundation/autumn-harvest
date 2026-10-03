@@ -1147,7 +1147,8 @@ reports `degraded` or `unavailable`. Only after the candidate row reports
 workflows drain on their original shard.
 
 For Kubernetes, probe `/api/harvest/health/live` and
-`/api/harvest/health/ready`. See
+`/api/harvest/health/ready`. The readiness probe also honors the setting
+below. See
 [`docs/operations/kubernetes-probes.md`](docs/operations/kubernetes-probes.md).
 
 By default `/api/harvest/health` stays a cheap liveness check for local

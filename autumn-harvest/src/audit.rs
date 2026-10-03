@@ -399,7 +399,7 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     // Kubernetes liveness/readiness probes and load-balancer health checks
     // require /health to be reachable without credentials.
     ("GET /health", RouteClass::PublicSafe),
-    // The probe split of /health (issue #1812). Booleans and reason codes only.
+    // The probe split of /health (issue #1812). No worker ids, queues or shard detail.
     ("GET /health/live", RouteClass::PublicSafe),
     ("GET /health/ready", RouteClass::PublicSafe),
     // The published OpenAPI document. Route surface only, no execution state,

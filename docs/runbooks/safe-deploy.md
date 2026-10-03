@@ -118,6 +118,9 @@ Once the worker is `Stopped` you can safely send SIGTERM (or SIGKILL) to the
 process, redeploy the binary, or decommission the host. No in-flight tasks will
 be lost.
 
+For Kubernetes probes, `preStop` and the grace period, see
+[`../operations/kubernetes-probes.md`](../operations/kubernetes-probes.md).
+
 ---
 
 ## Degraded mode: unavailable shards

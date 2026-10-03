@@ -92,9 +92,9 @@ compiles the workspace, which is the slow part; the client steps take seconds.
   `HarvestBearerToken` (scoped API tokens, issue #942) and
   `HarvestSessionCookie` (the embedding application session). The top-level
   `security` list also carries an empty requirement, because enforcement is
-  the embedder's choice (issue #174). The `public_safe` routes
-  (`GET /health`, `GET /health/live`, `GET /health/ready`, `GET /openapi.json`)
-  override it with `security: []`, which
+  the embedder's choice (issue #174). The `public_safe` routes are
+  `GET /health`, `GET /health/live`, `GET /health/ready` and
+  `GET /openapi.json`. They override it with `security: []`, which
   says positively that Harvest itself asks for no credential there. An embedder
   that wraps the router with `HarvestPlugin::api_with_auth` gates every route,
   the document included, so a generator then needs a credential to read it. See

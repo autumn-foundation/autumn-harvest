@@ -68,8 +68,8 @@ Routes:
 - `GET /`: runner health.
 - `GET /api/harvest/health`: Harvest health.
 - `GET /api/harvest/health/live`: liveness probe.
-- `GET /api/harvest/health/ready`: readiness probe. It returns `503` while
-  the runner drains.
+- `GET /api/harvest/health/ready`: readiness probe. It returns `503` before
+  the runtime starts and after SIGTERM.
 - `GET /api/harvest/ui`: the Vantage dashboard.
 - `POST /api/harvest/workflows/standalone_order/start`: start an order.
 - `GET /metrics`: Prometheus text.
