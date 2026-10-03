@@ -156,7 +156,13 @@ The guard fails safe: when it cannot read, it does not abort.
 - A pass with any failed shard read changes nothing.
 - All reads of one pass must end within one bound. The bound is the interval
   or 60 s (`MAX_READ_TIMEOUT`), whichever is less.
-- Each clear and each audit write has the same bound.
+- Each clear and each audit write has the same bound. A clear runs with a
+  server-side `lock_timeout` and `statement_timeout`, so a slow clear fails
+  and rolls back on the server. It cannot commit after the guard gave up.
+- The client waits twice the bound for a clear. When the client still gives
+  up, the outcome is unknown. A retry that then finds the row changed counts
+  the change as the guard's own clear and reports it. An extra audit row is
+  better than an abort with none.
 - A cancel stops a pass during its read. A pass that has started to clear
   runs to its end, so a clear and its audit row are not split.
 - A clear that fails on one pool stays pending. The next pass of the same
@@ -165,6 +171,12 @@ The guard fails safe: when it cannot read, it does not abort.
 - When no clear of a pass succeeds, the guard reports nothing yet. It reports
   the abort when a retry clears a pool.
 - A failed audit write logs a warning and does not undo the clear.
+- A guard keeps its pending clears in memory. After a restart, the guard
+  finds a split ramp: one pool holds the ramp, and another pool has the same
+  queue and base build with no ramp. When the audit log holds an abort of
+  that ramp since its step, the guard clears the other pools with no new
+  verdict and no new audit row. A split ramp with no such row stays, and the
+  guard judges it as usual.
 
 ## `build_id` metric label
 

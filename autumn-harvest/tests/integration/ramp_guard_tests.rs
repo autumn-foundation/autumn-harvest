@@ -47,6 +47,7 @@ const BUILD_B: &str = "ramp-b";
 const RAMP_PERCENT: i32 = 10;
 const RUNS_A: usize = 30;
 const RUNS_B: usize = 10;
+const CLEAR_BOUND: Duration = Duration::from_secs(5);
 
 // ── Handlers ────────────────────────────────────────────────────────────────
 
@@ -584,9 +585,16 @@ async fn abort_does_not_clear_a_ramp_that_moved_to_another_target() {
         .await
         .expect("set ramp");
 
-    let cleared = abort_ramp(&mut conn, QUEUE, BUILD_A, BUILD_B, ramp.updated_at)
-        .await
-        .expect("abort_ramp");
+    let cleared = abort_ramp(
+        &mut conn,
+        QUEUE,
+        BUILD_A,
+        BUILD_B,
+        ramp.updated_at,
+        CLEAR_BOUND,
+    )
+    .await
+    .expect("abort_ramp");
     assert!(!cleared, "a ramp to another target must stay");
     let policy = get_build_policy(&mut conn, QUEUE)
         .await
@@ -616,13 +624,13 @@ async fn abort_does_not_clear_a_new_step_of_the_same_ramp() {
     assert_ne!(old_step, new_step);
 
     assert!(
-        !abort_ramp(&mut conn, QUEUE, BUILD_A, BUILD_B, old_step)
+        !abort_ramp(&mut conn, QUEUE, BUILD_A, BUILD_B, old_step, CLEAR_BOUND)
             .await
             .expect("abort_ramp"),
         "the old step must not clear the new one"
     );
     assert!(
-        abort_ramp(&mut conn, QUEUE, BUILD_A, BUILD_B, new_step)
+        abort_ramp(&mut conn, QUEUE, BUILD_A, BUILD_B, new_step, CLEAR_BOUND)
             .await
             .expect("abort_ramp"),
         "the current step clears"
@@ -828,4 +836,154 @@ async fn a_ramp_to_its_own_base_build_is_skipped() {
     let aborts = guard_once(std::slice::from_ref(&pool), &pool, &guard_config(), None).await;
     assert!(aborts.is_empty(), "a promotion is not judged: {aborts:?}");
     assert!(ramp_is_active(&mut conn).await);
+}
+
+/// The server bounds a clear. A clear that waits on a row lock fails on the
+/// server and rolls back, so it cannot commit after the guard gave up.
+#[tokio::test]
+async fn a_blocked_clear_fails_on_the_server_and_changes_nothing() {
+    use diesel_async::AsyncConnection as _;
+
+    let (url, _container) = setup().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let mut locker = AsyncPgConnection::establish(&url)
+        .await
+        .expect("connect locker");
+    set_build_policy(&mut conn, QUEUE, BUILD_A, None)
+        .await
+        .expect("set base policy");
+    let step = set_build_ramp(&mut conn, QUEUE, BUILD_B, RAMP_PERCENT)
+        .await
+        .expect("set ramp")
+        .updated_at;
+
+    // Hold the policy row lock for longer than the clear bound.
+    diesel::sql_query("BEGIN")
+        .execute(&mut locker)
+        .await
+        .expect("begin");
+    diesel::sql_query("SELECT 1 FROM harvest_build_policies WHERE queue_name = $1 FOR UPDATE")
+        .bind::<Text, _>(QUEUE)
+        .execute(&mut locker)
+        .await
+        .expect("lock policy row");
+
+    let started = std::time::Instant::now();
+    let result = abort_ramp(
+        &mut conn,
+        QUEUE,
+        BUILD_A,
+        BUILD_B,
+        step,
+        Duration::from_millis(300),
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "the server stops a blocked clear: {result:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the server bound applies, not a client wait"
+    );
+
+    diesel::sql_query("ROLLBACK")
+        .execute(&mut locker)
+        .await
+        .expect("rollback");
+    assert!(
+        ramp_is_active(&mut conn).await,
+        "the failed clear rolled back"
+    );
+}
+
+/// Insert the audit row that a guard writes when it aborts the test ramp.
+async fn record_auto_abort(conn: &mut AsyncPgConnection) {
+    diesel::sql_query(
+        "INSERT INTO harvest_audit_log \
+             (id, actor, operation, target_type, target_id, route_or_command, status, \
+              error_summary, source) \
+         VALUES ($1, 'system', 'build_routing.ramp.auto_abort', 'build_routing', $2, \
+                 'background.ramp_guard', 'failed', $3, 'api')",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(uuid::Uuid::new_v4())
+    .bind::<Text, _>(QUEUE)
+    .bind::<Text, _>(format!(
+        "reason=failure_rate target_build={BUILD_B} base_build={BUILD_A} ramp_percent=10; \
+         clear pending on pools 1"
+    ))
+    .execute(conn)
+    .await
+    .expect("insert audit row");
+}
+
+/// After a restart, a ramp that one pool still holds from a recorded abort is
+/// cleared with no new verdict and no new audit row.
+#[tokio::test]
+async fn a_restarted_guard_finishes_a_recorded_partial_abort() {
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
+    let mut conn_1 = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect 1");
+    let mut conn_2 = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect 2");
+    set_ramp(&mut conn_1).await;
+    set_ramp(&mut conn_2).await;
+
+    // The old guard cleared pool 1, audited the abort, then stopped.
+    let step_1 = get_build_policy(&mut conn_1, QUEUE)
+        .await
+        .expect("read policy")
+        .expect("policy exists")
+        .updated_at;
+    assert!(
+        abort_ramp(&mut conn_1, QUEUE, BUILD_A, BUILD_B, step_1, CLEAR_BOUND)
+            .await
+            .expect("clear pool 1")
+    );
+    record_auto_abort(&mut conn_1).await;
+
+    // Pool 2 alone has no runs, so a verdict is impossible. A new guard
+    // still finishes the clear from the audit row.
+    let pools = [pool_1.clone(), pool_2.clone()];
+    let aborts = guard_once(&pools, &pool_1, &guard_config(), None).await;
+    assert!(
+        aborts.is_empty(),
+        "the abort was already reported: {aborts:?}"
+    );
+    assert!(!ramp_is_active(&mut conn_2).await, "pool 2 is cleared");
+    assert_eq!(
+        auto_abort_audit_rows(&mut conn_1).await,
+        1,
+        "no new audit row"
+    );
+}
+
+/// A split ramp with no recorded abort is not cleared.
+#[tokio::test]
+async fn a_split_ramp_without_a_recorded_abort_stays() {
+    let (url_1, _c1) = setup().await;
+    let (url_2, _c2) = setup().await;
+    let (pool_1, pool_2) = (build_pool(&url_1), build_pool(&url_2));
+    let mut conn_1 = AsyncPgConnection::establish(&url_1)
+        .await
+        .expect("connect 1");
+    let mut conn_2 = AsyncPgConnection::establish(&url_2)
+        .await
+        .expect("connect 2");
+    set_build_policy(&mut conn_1, QUEUE, BUILD_A, None)
+        .await
+        .expect("set base policy 1");
+    set_ramp(&mut conn_2).await;
+
+    let pools = [pool_1.clone(), pool_2.clone()];
+    let aborts = guard_once(&pools, &pool_1, &guard_config(), None).await;
+    assert!(aborts.is_empty(), "{aborts:?}");
+    assert!(
+        ramp_is_active(&mut conn_2).await,
+        "no audit row, so the ramp stays"
+    );
 }

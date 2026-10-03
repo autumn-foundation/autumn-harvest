@@ -391,9 +391,15 @@ pub const fn abort_ramp_query() -> &'static str {
 /// another base build or a new step stays. Returns `true` when this call
 /// cleared the ramp.
 ///
+/// The clear runs in one transaction with `lock_timeout` and
+/// `statement_timeout` set to `bound`. A clear that waits too long therefore
+/// fails on the server and rolls back. It cannot commit later, after the
+/// caller has given up on it.
+///
 /// # Errors
 ///
-/// Returns `HarvestError::Database` on failure.
+/// Returns `HarvestError::Database` on failure, also when the server stops
+/// the clear at `bound`.
 #[cfg(feature = "db")]
 pub async fn abort_ramp(
     conn: &mut diesel_async::AsyncPgConnection,
@@ -401,19 +407,30 @@ pub async fn abort_ramp(
     base: &str,
     target: &str,
     step: chrono::DateTime<chrono::Utc>,
+    bound: Duration,
 ) -> crate::error::HarvestResult<bool> {
     use diesel::sql_types::{Text, Timestamptz};
-    use diesel_async::RunQueryDsl;
+    use diesel_async::{AsyncConnection, RunQueryDsl};
 
-    let changed = diesel::sql_query(abort_ramp_query())
-        .bind::<Text, _>(queue)
-        .bind::<Text, _>(base)
-        .bind::<Text, _>(target)
-        .bind::<Timestamptz, _>(step)
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error)?;
-    Ok(changed > 0)
+    let timeout_ms = bound.as_millis().max(1);
+    conn.transaction(async |conn| -> crate::error::HarvestResult<bool> {
+        for setting in ["lock_timeout", "statement_timeout"] {
+            diesel::sql_query(format!("SET LOCAL {setting} = {timeout_ms}"))
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+        }
+        let changed = diesel::sql_query(abort_ramp_query())
+            .bind::<Text, _>(queue)
+            .bind::<Text, _>(base)
+            .bind::<Text, _>(target)
+            .bind::<Timestamptz, _>(step)
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+        Ok(changed > 0)
+    })
+    .await
 }
 
 /// The identity of one ramp: queue, base build and target build.
@@ -441,7 +458,15 @@ struct ObservedRamp {
     /// The pool index and the step of each pool that holds the ramp, in
     /// pool order.
     steps: Vec<(usize, chrono::DateTime<chrono::Utc>)>,
+    /// `true` when another pool has the same queue and base build with no
+    /// ramp. That is the trace of a partial clear.
+    split: bool,
 }
+
+/// What one pool holds: its active ramps, and the queue and base build of
+/// each policy with no ramp.
+#[cfg(feature = "db")]
+type PoolRead = (Vec<PoolRamp>, Vec<(String, String)>);
 
 /// Read the outcome counts of the two builds of one ramp step on one pool.
 #[cfg(feature = "db")]
@@ -505,24 +530,26 @@ async fn read_step_stats(
 async fn read_pool_ramps(
     pool: &crate::worker::DbPool,
     bound: Duration,
-) -> crate::error::HarvestResult<Vec<PoolRamp>> {
+) -> crate::error::HarvestResult<PoolRead> {
     use diesel_async::RunQueryDsl;
 
     let mut conn = pool.get().await.map_err(crate::error::database_error)?;
     let timeout_ms = bound.as_millis().max(1);
     conn.build_transaction()
         .read_only()
-        .run(async |conn| -> crate::error::HarvestResult<Vec<PoolRamp>> {
+        .run(async |conn| -> crate::error::HarvestResult<PoolRead> {
             diesel::sql_query(format!("SET LOCAL statement_timeout = {timeout_ms}"))
                 .execute(conn)
                 .await
                 .map_err(crate::error::database_error)?;
             let policies = crate::build_routing::list_build_policies(conn).await?;
             let mut ramps = Vec::new();
+            let mut unramped = Vec::new();
             for policy in policies {
                 let (Some(target), Some(percent)) =
                     (policy.target_build_id.clone(), policy.ramp_percent)
                 else {
+                    unramped.push((policy.queue_name.clone(), policy.build_id.clone()));
                     continue;
                 };
                 if percent <= 0 || target == policy.build_id {
@@ -537,7 +564,7 @@ async fn read_pool_ramps(
                     target: target_stats,
                 });
             }
-            Ok(ramps)
+            Ok((ramps, unramped))
         })
         .await
 }
@@ -545,7 +572,8 @@ async fn read_pool_ramps(
 /// Read every active ramp on every pool and merge the counts per ramp.
 ///
 /// The pools are read at the same time. Returns `None` when any read fails,
-/// so a pass never decides on part of the fleet.
+/// so a pass never decides on part of the fleet. A ramp is `split` when
+/// another pool has its queue and base build with no ramp.
 #[cfg(feature = "db")]
 async fn read_ramps(
     pools: &[crate::worker::DbPool],
@@ -554,13 +582,15 @@ async fn read_ramps(
     let reads = pools.iter().map(|pool| read_pool_ramps(pool, bound));
     let mut merged: std::collections::BTreeMap<RampKey, ObservedRamp> =
         std::collections::BTreeMap::new();
+    let mut unramped: std::collections::BTreeSet<(String, String)> =
+        std::collections::BTreeSet::new();
     for (index, result) in futures::future::join_all(reads)
         .await
         .into_iter()
         .enumerate()
     {
-        let ramps = match result {
-            Ok(ramps) => ramps,
+        let (ramps, pool_unramped) = match result {
+            Ok(read) => read,
             Err(error) => {
                 tracing::warn!(pool = index, error = %error, "ramp guard read failed; no verdict this pass");
                 return None;
@@ -573,6 +603,10 @@ async fn read_ramps(
             slot.target = slot.target.plus(ramp.target);
             slot.steps.push((index, ramp.step));
         }
+        unramped.extend(pool_unramped);
+    }
+    for ((queue, base, _), ramp) in &mut merged {
+        ramp.split = unramped.contains(&(queue.clone(), base.clone()));
     }
     Some(merged)
 }
@@ -585,11 +619,19 @@ enum ClearOutcome {
     Cleared,
     /// The row changed first, so nothing was cleared.
     Lost,
-    /// The clear failed or timed out. The guard retries it.
+    /// The server failed or stopped the clear, so nothing changed. The guard
+    /// retries it.
     Failed,
+    /// The client gave up before the server answered. The clear can still
+    /// have committed. The guard retries it, and it counts a lost retry as
+    /// its own clear.
+    Ambiguous,
 }
 
-/// Clear one ramp step on one pool, within `bound`.
+/// Clear one ramp step on one pool.
+///
+/// The server stops the clear at `bound`. The client waits twice as long, so
+/// a client timeout means that the server did not answer at all.
 #[cfg(feature = "db")]
 async fn clear_on_pool(
     pool: &crate::worker::DbPool,
@@ -601,11 +643,11 @@ async fn clear_on_pool(
     let (queue, base, target) = key;
     let clear = async {
         let mut conn = pool.get().await.map_err(|e| e.to_string())?;
-        abort_ramp(&mut conn, queue, base, target, step)
+        abort_ramp(&mut conn, queue, base, target, step, bound)
             .await
             .map_err(|e| e.to_string())
     };
-    match tokio::time::timeout(bound, clear).await {
+    match tokio::time::timeout(bound.saturating_mul(2), clear).await {
         Ok(Ok(true)) => ClearOutcome::Cleared,
         Ok(Ok(false)) => ClearOutcome::Lost,
         Ok(Err(error)) => {
@@ -613,8 +655,70 @@ async fn clear_on_pool(
             ClearOutcome::Failed
         }
         Err(_) => {
-            tracing::warn!(queue = %queue, pool = index, "ramp guard clear timed out");
-            ClearOutcome::Failed
+            tracing::warn!(queue = %queue, pool = index, "ramp guard clear timed out; outcome unknown");
+            ClearOutcome::Ambiguous
+        }
+    }
+}
+
+/// The part of an abort's audit summary that names its two builds.
+///
+/// [`abort_recorded_since`] finds an abort row by this text, so both use this
+/// one function.
+#[cfg(feature = "db")]
+fn abort_summary_tag(target: &str, base: &str) -> String {
+    format!("target_build={target} base_build={base} ")
+}
+
+/// `true` when the audit log holds an abort of the ramp `key` since `since`.
+///
+/// A failed or slow read returns `false`, so the guard then judges the ramp
+/// as usual.
+#[cfg(feature = "db")]
+async fn abort_recorded_since(
+    audit_pool: &crate::worker::DbPool,
+    key: &RampKey,
+    since: chrono::DateTime<chrono::Utc>,
+    bound: Duration,
+) -> bool {
+    use diesel::sql_types::{Bool, Text, Timestamptz};
+    use diesel_async::RunQueryDsl;
+
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = Bool)]
+        found: bool,
+    }
+
+    let (queue, base, target) = key;
+    let read = async {
+        let mut conn = audit_pool.get().await.map_err(|e| e.to_string())?;
+        diesel::sql_query(
+            "SELECT EXISTS ( \
+                 SELECT 1 FROM harvest_audit_log \
+                 WHERE target_type = $1 AND target_id = $2 AND operation = $3 \
+                   AND occurred_at >= $4 \
+                   AND position($5 IN COALESCE(error_summary, '')) > 0 \
+             ) AS found",
+        )
+        .bind::<Text, _>(crate::audit::TARGET_BUILD_ROUTING)
+        .bind::<Text, _>(queue)
+        .bind::<Text, _>(crate::audit::OP_BUILD_RAMP_AUTO_ABORT)
+        .bind::<Timestamptz, _>(since)
+        .bind::<Text, _>(abort_summary_tag(target, base))
+        .get_result::<Row>(&mut conn)
+        .await
+        .map_err(|e| e.to_string())
+    };
+    match tokio::time::timeout(bound, read).await {
+        Ok(Ok(row)) => row.found,
+        Ok(Err(error)) => {
+            tracing::warn!(queue = %queue, error = %error, "ramp guard audit lookup failed");
+            false
+        }
+        Err(_) => {
+            tracing::warn!(queue = %queue, "ramp guard audit lookup timed out");
+            false
         }
     }
 }
@@ -632,12 +736,11 @@ async fn record_abort(
     bound: Duration,
 ) {
     let mut summary = format!(
-        "reason={} target_build={} base_build={} ramp_percent={} \
+        "reason={} {}ramp_percent={} \
          target_rate={:.4} target_lower_bound={:.4} base_rate={:.4} \
          target_started={} target_settled={} base_started={} base_settled={}",
         abort.reason.as_str(),
-        abort.target_build_id,
-        abort.base_build_id,
+        abort_summary_tag(&abort.target_build_id, &abort.base_build_id),
         abort.ramp_percent,
         abort.target_rate,
         abort.target_lower_bound,
@@ -714,7 +817,9 @@ fn disposition(outcomes: &[ClearOutcome], first_attempt: bool) -> Disposition {
         Disposition::Drop
     } else if outcomes.contains(&ClearOutcome::Cleared) {
         Disposition::Report
-    } else if outcomes.contains(&ClearOutcome::Failed) {
+    } else if outcomes.contains(&ClearOutcome::Failed)
+        || outcomes.contains(&ClearOutcome::Ambiguous)
+    {
         Disposition::Defer
     } else {
         Disposition::Drop
@@ -747,12 +852,31 @@ async fn report_abort(
     record_abort(audit_pool, abort, failed_pools, bound).await;
 }
 
+/// One pool clear to retry: the pool index, the step, and `true` when an
+/// earlier attempt was ambiguous.
+#[cfg(feature = "db")]
+type PendingStep = (usize, chrono::DateTime<chrono::Utc>, bool);
+
+/// The outcome of a retry, given whether an earlier attempt was ambiguous.
+///
+/// An ambiguous attempt can have committed after the client gave up. A retry
+/// then finds the row changed. The change can be this guard's own, so a lost
+/// retry after an ambiguous attempt counts as a clear. A report is better
+/// than an abort with no audit row.
+#[cfg(feature = "db")]
+const fn retry_outcome(outcome: ClearOutcome, was_ambiguous: bool) -> ClearOutcome {
+    match outcome {
+        ClearOutcome::Lost if was_ambiguous => ClearOutcome::Cleared,
+        other => other,
+    }
+}
+
 /// The pool clears that an abort still needs.
 #[cfg(feature = "db")]
 #[derive(Debug)]
 struct PendingAbort {
-    /// The pool index and the step of each pool that did not clear.
-    steps: Vec<(usize, chrono::DateTime<chrono::Utc>)>,
+    /// The pools that did not clear.
+    steps: Vec<PendingStep>,
     /// The abort, while no clear of this guard has succeeded yet. The guard
     /// reports it when a retry clears a pool.
     unreported: Option<RampAbort>,
@@ -833,6 +957,13 @@ impl RampGuard {
             if self.pending.contains_key(&key) {
                 continue;
             }
+            if ramp.split
+                && self
+                    .finish_recorded_abort(pools, audit_pool, &key, &ramp, bound)
+                    .await
+            {
+                continue;
+            }
             let RampVerdict::Abort {
                 reason,
                 base_rate,
@@ -879,11 +1010,11 @@ impl RampGuard {
         bound: Duration,
     ) -> Option<RampAbort> {
         let mut outcomes = Vec::with_capacity(steps.len());
-        let mut failed = Vec::new();
+        let mut failed: Vec<PendingStep> = Vec::new();
         for &(index, step) in steps {
             let outcome = clear_on_pool(&pools[index], index, &key, step, bound).await;
-            if outcome == ClearOutcome::Failed {
-                failed.push((index, step));
+            if matches!(outcome, ClearOutcome::Failed | ClearOutcome::Ambiguous) {
+                failed.push((index, step, outcome == ClearOutcome::Ambiguous));
             }
             outcomes.push(outcome);
         }
@@ -902,9 +1033,56 @@ impl RampGuard {
         if decision != Disposition::Report {
             return None;
         }
-        let failed_pools: Vec<usize> = failed.iter().map(|&(index, _)| index).collect();
+        let failed_pools: Vec<usize> = failed.iter().map(|&(index, _, _)| index).collect();
         report_abort(&abort, audit_pool, metrics, &failed_pools, bound).await;
         Some(abort)
+    }
+
+    /// Finish a partial clear that the audit log records, with no new verdict.
+    ///
+    /// A guard can stop after it cleared some pools of an abort, for example
+    /// in a restart. The other pools then still hold the ramp, and their own
+    /// counts can be too few for a verdict. The audit row of the abort is
+    /// durable. When it exists for this ramp since the step, the guard clears
+    /// the other pools too and writes no new audit row. Returns `true` when
+    /// such a row exists.
+    async fn finish_recorded_abort(
+        &mut self,
+        pools: &[crate::worker::DbPool],
+        audit_pool: &crate::worker::DbPool,
+        key: &RampKey,
+        ramp: &ObservedRamp,
+        bound: Duration,
+    ) -> bool {
+        let Some(since) = ramp.steps.iter().map(|&(_, step)| step).min() else {
+            return false;
+        };
+        if !abort_recorded_since(audit_pool, key, since, bound).await {
+            return false;
+        }
+        let mut failed: Vec<PendingStep> = Vec::new();
+        for &(index, step) in &ramp.steps {
+            let outcome = clear_on_pool(&pools[index], index, key, step, bound).await;
+            match outcome {
+                ClearOutcome::Cleared => {
+                    tracing::info!(queue = %key.0, pool = index, "ramp guard finished a recorded abort");
+                }
+                ClearOutcome::Lost => {}
+                ClearOutcome::Failed | ClearOutcome::Ambiguous => {
+                    failed.push((index, step, outcome == ClearOutcome::Ambiguous));
+                }
+            }
+        }
+        if !failed.is_empty() {
+            self.pending.insert(
+                key.clone(),
+                PendingAbort {
+                    steps: failed,
+                    unreported: None,
+                },
+            );
+        }
+        true
     }
 
     /// Retry the clears that an earlier pass could not finish.
@@ -923,18 +1101,23 @@ impl RampGuard {
         let pending = std::mem::take(&mut self.pending);
         for (key, entry) in pending {
             let mut outcomes = Vec::with_capacity(entry.steps.len());
-            let mut still_failed = Vec::new();
-            for (index, step) in entry.steps {
+            let mut still_failed: Vec<PendingStep> = Vec::new();
+            for (index, step, was_ambiguous) in entry.steps {
                 let Some(pool) = pools.get(index) else {
                     continue;
                 };
-                let outcome = clear_on_pool(pool, index, &key, step, bound).await;
+                let raw = clear_on_pool(pool, index, &key, step, bound).await;
+                let outcome = retry_outcome(raw, was_ambiguous);
                 match outcome {
                     ClearOutcome::Cleared => {
                         tracing::info!(queue = %key.0, pool = index, "ramp guard finished a pending clear");
                     }
                     ClearOutcome::Lost => {}
-                    ClearOutcome::Failed => still_failed.push((index, step)),
+                    ClearOutcome::Failed | ClearOutcome::Ambiguous => still_failed.push((
+                        index,
+                        step,
+                        was_ambiguous || outcome == ClearOutcome::Ambiguous,
+                    )),
                 }
                 outcomes.push(outcome);
             }
@@ -944,7 +1127,7 @@ impl RampGuard {
                     Disposition::Report => {
                         abort.incomplete = !still_failed.is_empty();
                         let failed_pools: Vec<usize> =
-                            still_failed.iter().map(|&(index, _)| index).collect();
+                            still_failed.iter().map(|&(index, _, _)| index).collect();
                         report_abort(&abort, audit_pool, metrics, &failed_pools, bound).await;
                         reported.push(abort);
                     }
@@ -1265,6 +1448,36 @@ mod tests {
         assert_eq!(disposition(&[Lost, Cleared], false), Disposition::Report);
         assert_eq!(disposition(&[Lost], false), Disposition::Drop);
         assert_eq!(disposition(&[Failed], false), Disposition::Defer);
+        // A client timeout is unknown, so it defers like a failure.
+        assert_eq!(
+            disposition(&[ClearOutcome::Ambiguous], true),
+            Disposition::Defer
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn a_lost_retry_after_an_ambiguous_clear_counts_as_this_guards_clear() {
+        use ClearOutcome::{Ambiguous, Cleared, Failed, Lost};
+        assert_eq!(retry_outcome(Lost, true), Cleared);
+        assert_eq!(retry_outcome(Lost, false), Lost);
+        for outcome in [Cleared, Failed, Ambiguous] {
+            assert_eq!(retry_outcome(outcome, true), outcome);
+        }
+        // So an unreported abort is reported, not dropped.
+        assert_eq!(
+            disposition(&[retry_outcome(Lost, true)], false),
+            Disposition::Report
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn abort_summary_tag_names_both_builds() {
+        assert_eq!(
+            abort_summary_tag("b2", "b1"),
+            "target_build=b2 base_build=b1 "
+        );
     }
 
     #[test]
