@@ -1,0 +1,45 @@
+# Task-queue hygiene benchmark (issue #1811)
+
+machine: linux / 4 logical CPUs
+postgres: PostgreSQL 16.14 (Ubuntu 16.14-0ubuntu0.24.04.1) on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit
+claim scenario: 10000 pending / 8 claimers / 4 queues; terminal rows: 1000000
+
+| arm | live rows | dead rows | heap MB | index MB | n | p50 ms | p99 ms | max ms | claims/s |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| baseline | 10000 | 0 | 2.4 | 2.2 | 720 | 302.68 | 438.41 | 492.00 | 26 |
+| before-dead | 1010000 | 999866 | 349.8 | 186.5 | 720 | 595.72 | 824.80 | 883.69 | 13 |
+| before-vacuumed | 1010000 | 0 | 349.8 | 185.8 | 720 | 356.48 | 515.64 | 543.93 | 22 |
+| after-swept | 10000 | 0 | 2.4 | 241.7 | 720 | 304.16 | 416.07 | 467.94 | 26 |
+
+> Janitor in `after-swept`: deleted 1000000 rows in 21 passes (1000 rows per batch, up to 50 batches per pass) in 12.2 s.
+> `⚠` marks an arm cut short by the scenario wall-clock budget.
+
+## Plans: `harvest_task_queue` scan nodes
+
+### before
+
+```text
+claim_task: Seq Scan on harvest_task_queue (never executed)
+claim_task: Index Scan using harvest_task_queue_concurrency_key_running on harvest_task_queue t (never executed)
+claim_task: Index Scan using idx_harvest_tq_poll on harvest_task_queue harvest_task_queue_1 (actual rows=9200 loops=1)
+claim_task: Index Scan using harvest_task_queue_concurrency_key_running on harvest_task_queue recheck (never executed)
+claim_task: Index Scan using harvest_task_queue_pkey on harvest_task_queue harvest_task_queue_2 (actual rows=1 loops=1)
+heartbeat_timeout: Bitmap Heap Scan on harvest_task_queue
+heartbeat_timeout: Bitmap Index Scan on idx_harvest_tq_running
+start_to_close_timeout: Bitmap Heap Scan on harvest_task_queue
+start_to_close_timeout: Bitmap Index Scan on idx_harvest_tq_running
+```
+
+### after
+
+```text
+claim_task: Seq Scan on harvest_task_queue (never executed)
+claim_task: Index Scan using harvest_task_queue_concurrency_key_running on harvest_task_queue t (never executed)
+claim_task: Index Scan using idx_harvest_tq_poll on harvest_task_queue harvest_task_queue_1 (actual rows=9200 loops=1)
+claim_task: Index Scan using harvest_task_queue_concurrency_key_running on harvest_task_queue recheck (never executed)
+claim_task: Index Scan using harvest_task_queue_pkey on harvest_task_queue harvest_task_queue_2 (actual rows=1 loops=1)
+heartbeat_timeout: Bitmap Heap Scan on harvest_task_queue
+heartbeat_timeout: Bitmap Index Scan on idx_harvest_tq_running_started
+start_to_close_timeout: Bitmap Heap Scan on harvest_task_queue
+start_to_close_timeout: Bitmap Index Scan on idx_harvest_tq_running_started
+```
