@@ -889,3 +889,79 @@ mod load_shed_sampler_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod ramp_guard_spawn_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use autumn_harvest::ramp_guard::RampGuardConfig;
+    use autumn_harvest::scheduler::{DagCatalog, SchedulerMonitor};
+    use autumn_harvest::shard::ShardRouter;
+    use autumn_harvest::worker::{DbPool, HandlerRegistry};
+    use diesel_async::AsyncPgConnection;
+    use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+    use tokio_util::sync::CancellationToken;
+
+    use super::spawn_ramp_guard;
+    use crate::api::{HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime};
+    use crate::state::HarvestDbPool;
+
+    /// A pool that never connects: the pool is lazy, and the tests do not
+    /// need a database.
+    fn lazy_pool() -> HarvestDbPool {
+        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+            "postgres://nobody@127.0.0.1:1/none",
+        );
+        let pool: DbPool = deadpool::managed::Pool::builder(manager)
+            .max_size(1)
+            .build()
+            .expect("lazy pool");
+        HarvestDbPool::from(pool)
+    }
+
+    fn runtime() -> HarvestApiRuntime {
+        HarvestApiRuntime::new(
+            Arc::new(HandlerRegistry::new(vec![], vec![])),
+            Arc::new(DagCatalog::default()),
+            Arc::new(Vec::new()),
+            Some("ramp-guard-boot-test".to_owned()),
+            vec![],
+            SchedulerMonitor::offline(),
+            HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+            ShardRouter::default(),
+        )
+    }
+
+    /// Issue #1814: the default config spawns no guard, so a default
+    /// deployment runs no guard SQL.
+    #[tokio::test]
+    async fn default_config_spawns_no_ramp_guard() {
+        let api_state = HarvestApiState::new();
+        let handle = spawn_ramp_guard(
+            &api_state,
+            &lazy_pool(),
+            &runtime(),
+            CancellationToken::new(),
+        );
+        assert!(handle.is_none());
+    }
+
+    /// Issue #1814: an enabled config spawns the guard loop, and a cancel
+    /// stops it.
+    #[tokio::test]
+    async fn enabled_config_spawns_a_ramp_guard_that_stops_on_cancel() {
+        let api_state = HarvestApiState::new();
+        api_state.set_ramp_guard_config(
+            RampGuardConfig::new().with_interval(Duration::from_secs(3600)),
+        );
+        let cancel = CancellationToken::new();
+        let handle = spawn_ramp_guard(&api_state, &lazy_pool(), &runtime(), cancel.clone())
+            .expect("an enabled guard spawns");
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(10), handle)
+            .await
+            .expect("the guard stops on cancel")
+            .expect("the guard task does not panic");
+    }
+}

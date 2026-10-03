@@ -1868,8 +1868,9 @@ pub const METRIC_LABEL_SCOPE: &str = "scope";
 pub const METRIC_LABEL_PRODUCER: &str = "producer";
 /// Metric label: the build ID of the worker.
 ///
-/// A value always goes through [`build_id_label`], which caps the cardinality
-/// (issue #1814).
+/// The worker passes each value through [`build_id_label`], which caps the
+/// cardinality (issue #1814). A custom recorder that forwards to another
+/// recorder must forward the `*_for_build` methods too, or the build is lost.
 pub const METRIC_LABEL_BUILD_ID: &str = "build_id";
 /// `build_id` label value when the build is not known or is empty
 /// (issue #1814).
@@ -5826,18 +5827,13 @@ mod tests {
     }
 
     #[test]
-    fn global_build_id_label_is_bounded() {
+    fn global_build_id_label_applies_the_sentinel_rules() {
+        // This test admits no build, so it cannot fill the process-wide cap
+        // that other tests in this binary share.
         assert_eq!(build_id_label(""), BUILD_ID_LABEL_NONE);
-        for i in 0..(MAX_BUILD_ID_LABELS * 2) {
-            let raw = format!("global-cap-test-{i}");
-            let label = build_id_label(&raw);
-            assert!(label == raw || label == BUILD_ID_LABEL_OTHER, "{label}");
-        }
-        assert_eq!(
-            build_id_label("global-cap-test-overflow-probe"),
-            BUILD_ID_LABEL_OTHER,
-            "the global cap is full after 2x MAX distinct builds"
-        );
+        assert_eq!(build_id_label(BUILD_ID_LABEL_OTHER), BUILD_ID_LABEL_OTHER);
+        let long = "z".repeat(MAX_BUILD_ID_LABEL_LEN + 1);
+        assert_eq!(build_id_label(&long), BUILD_ID_LABEL_OTHER);
     }
 
     #[test]
@@ -5881,7 +5877,7 @@ mod tests {
     }
 
     #[test]
-    fn emit_workflow_terminal_for_build_skips_canary_and_caps_the_label() {
+    fn emit_workflow_terminal_for_build_skips_canary_and_passes_the_label() {
         #[derive(Default)]
         struct Rec(std::sync::Mutex<Vec<(String, String)>>);
         impl MetricsRecorder for Rec {

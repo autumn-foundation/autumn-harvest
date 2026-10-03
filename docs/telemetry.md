@@ -472,17 +472,22 @@ Five families carry a `build_id` label (issue #1814):
 `harvest.workflow.terminal`, `harvest.activity.attempts`,
 `harvest.workflow.nondeterministic_block`, `harvest.workflow.duration` and
 `harvest.activity.duration`. The value is the build of the worker that ran the
-task. A path with no worker, such as the timeout scanner, reports `none`.
+task. An outcome that no worker code produced reports `none`. Examples are the
+timeout scanner, a cancel through a signal and a race-loser cancel.
 
 `telemetry::build_id_label` caps the values. A process admits the first 16
-distinct builds (`MAX_BUILD_ID_LABELS`). A later build, or a build id longer
-than 128 bytes, reports `__other__`. A worker process normally reports only its
-own build.
+distinct builds that it sees (`MAX_BUILD_ID_LABELS`), and it never evicts one.
+A later build, or a build id longer than 128 bytes, reports `__other__`. A
+worker process normally reports only its own build.
+`harvest.workflow.non_determinism` goes through the same cap.
 
 A custom recorder gets the build through the `*_for_build` methods of
 `MetricsRecorder`. Their defaults drop the build and call the method without
-it, so an existing recorder needs no change. The ramp guard uses the same
-per-build comparison. See `docs/operations/build-ramp-guard.md`.
+it, so an existing recorder needs no change. A recorder that forwards to
+another recorder must forward these methods too, or the build is lost.
+
+The ramp guard does not read these metrics. It counts runs in the database by
+`assigned_build_id`. See `docs/operations/build-ramp-guard.md`.
 
 ### Saga compensation metrics (issue #801)
 

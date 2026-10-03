@@ -8216,9 +8216,10 @@ async fn block_workflow_for_non_determinism(
     // fires speculatively before its pause-guarded transaction even opens
     // (an accepted "best-effort, may over-count in a rare pause race"
     // pattern already established in this codebase).
-    telemetry
-        .metrics
-        .record_workflow_non_determinism(&execution.workflow_name, build_id);
+    telemetry.metrics.record_workflow_non_determinism(
+        &execution.workflow_name,
+        crate::telemetry::build_id_label(build_id),
+    );
 
     if parked_paused {
         // The nd_blocked_at/reason/count columns were never actually
@@ -20020,9 +20021,10 @@ fn emit_pending_workflow_metrics(
                  process_workflow_task, before terminal metrics are recorded"
             );
             if *had_nd_details {
-                telemetry
-                    .metrics
-                    .record_workflow_non_determinism(&execution.workflow_name, build_id);
+                telemetry.metrics.record_workflow_non_determinism(
+                    &execution.workflow_name,
+                    crate::telemetry::build_id_label(build_id),
+                );
             }
             if pending.is_canary {
                 telemetry
@@ -32020,11 +32022,12 @@ impl Worker {
                                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                                         .remove(&exec_id);
                                 }
-                                quarantine_workflow_task_timeout(
+                                quarantine_workflow_task_timeout_for_build(
                                     &pool,
                                     task_id,
                                     exec_id_for_timeout,
                                     &worker_id,
+                                    &build_id,
                                     new_strikes,
                                     timeout_secs,
                                     &workflow_name_str,
@@ -32280,7 +32283,9 @@ async fn workflow_task_timeout_metric_names(
 ///
 /// Called when the consecutive in-memory timeout counter reaches
 /// `poison_pill_threshold` (issue #494). Errors are logged and swallowed.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+/// The terminal metric reports `build_id="none"`. The worker calls the
+/// crate-private variant that reports its own build (issue #1814).
+#[allow(clippy::too_many_arguments)]
 pub async fn quarantine_workflow_task_timeout(
     pool: &DbPool,
     task_id: uuid::Uuid,
@@ -32293,6 +32298,38 @@ pub async fn quarantine_workflow_task_timeout(
     metrics: &dyn crate::telemetry::MetricsRecorder,
     // Issue #1243: the configured payload-codec registry, so this write
     // encodes under the same codecs replay decodes with.
+    codecs: &crate::payload_codec::PayloadCodecs,
+) {
+    quarantine_workflow_task_timeout_for_build(
+        pool,
+        task_id,
+        exec_id_opt,
+        worker_id,
+        "",
+        new_strikes,
+        timeout_secs,
+        workflow_name,
+        queue_name,
+        metrics,
+        codecs,
+    )
+    .await;
+}
+
+/// [`quarantine_workflow_task_timeout`] with the build of the worker that ran
+/// the task, for the `build_id` label of the terminal metric (issue #1814).
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub(crate) async fn quarantine_workflow_task_timeout_for_build(
+    pool: &DbPool,
+    task_id: uuid::Uuid,
+    exec_id_opt: Option<uuid::Uuid>,
+    worker_id: &str,
+    build_id: &str,
+    new_strikes: i32,
+    timeout_secs: u64,
+    workflow_name: &str,
+    queue_name: &str,
+    metrics: &dyn crate::telemetry::MetricsRecorder,
     codecs: &crate::payload_codec::PayloadCodecs,
 ) {
     use crate::schema::harvest_task_queue::dsl as task_dsl;
@@ -32565,10 +32602,11 @@ pub async fn quarantine_workflow_task_timeout(
             // actually committed.
             crate::execution::emit_start_cancel_metrics(metrics, &pending_cancel_metrics);
             if let Some(q) = queue_used {
-                crate::telemetry::emit_workflow_terminal(
+                crate::telemetry::emit_workflow_terminal_for_build(
                     metrics,
                     workflow_name,
                     &q,
+                    crate::telemetry::build_id_label(build_id),
                     crate::telemetry::WorkflowStatus::Failed,
                 );
                 if let Some(exec_uuid) = exec_id_opt {

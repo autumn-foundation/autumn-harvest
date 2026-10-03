@@ -744,8 +744,9 @@ The response's `policies` array carries `build_id`, `target_build_id`, and
 `ramp_percent` per queue, alongside the existing cross-shard `reachability`
 snapshot. Watch the canary build's failure rate, DLQ entries
 (`harvest dlq aggregate --group-by workflow_name,failure_signature`), and
-`harvest.workflow.terminal{outcome=...}` / `harvest.activity.failed` metrics
-segmented by `assigned_build_id` before deciding to ramp up.
+`harvest.workflow.terminal{outcome=...}` / `harvest.activity.attempts`
+metrics before deciding to ramp up. Both carry a `build_id` label (issue
+#1814), so `sum by (build_id)` compares the target build with the base build.
 
 **Step 3 — Ramp up, or abort.**
 
@@ -770,6 +771,12 @@ Either form immediately stops new starts from reaching the target build; a
 follow-up start lands on the base build on its very next attempt. Ramping to
 `0` keeps the ramp record around (useful if you want to retry later without
 re-declaring `target_build_id`); `clear` removes it entirely.
+
+> **Automatic abort (issue #1814).** Turn on the ramp guard with
+> `HarvestPlugin::ramp_guard(RampGuardConfig::new())`. It clears the ramp with
+> no operator action when the target build fails or ND-blocks more runs than
+> the base build, and it writes a `build_routing.ramp.auto_abort` audit row.
+> See [`docs/operations/build-ramp-guard.md`](../operations/build-ramp-guard.md).
 
 **Step 4 — Promote to full cutover.**
 

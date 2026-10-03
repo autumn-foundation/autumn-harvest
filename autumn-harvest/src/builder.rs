@@ -2412,8 +2412,9 @@ impl HarvestBuilder {
     ///
     /// The guard aborts a build ramp when the target build fails or ND-blocks
     /// more runs than the base build. See
-    /// `docs/operations/build-ramp-guard.md`. The default config is disabled,
-    /// so no guard runs.
+    /// `docs/operations/build-ramp-guard.md`. The default config is disabled.
+    /// The plugin boot spawns the guard loop. A bare builder only stores the
+    /// config, so call `ramp_guard::run_ramp_guard` without the plugin.
     #[must_use]
     pub fn ramp_guard(mut self, config: crate::ramp_guard::RampGuardConfig) -> Self {
         self.ramp_guard = config;
