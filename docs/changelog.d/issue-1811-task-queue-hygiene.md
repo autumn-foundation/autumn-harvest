@@ -20,8 +20,11 @@ shard. It is on by default and independent of history retention.
 - It deletes in `batch_size` batches, capped at 10,000 rows per statement,
   with `FOR UPDATE SKIP LOCKED` and `DELETE ... USING`. It runs at most 50
   batches per shard per tick.
+- It sweeps each physical database once per tick. Shards aliased to one
+  database share the pass and its budget, and each reports the outcome.
 - A pass that fails after some batches committed still reports and meters
-  those rows. Shutdown takes effect at the next shard boundary.
+  those rows. Shutdown takes effect at the next database boundary, or
+  during a connection checkout.
 - Under `dry_run`, it runs a read-only preview with the same predicates.
 
 **Config.** `RetentionConfig::terminal_task_retention_secs`, default 7 days,
@@ -75,12 +78,13 @@ in `docs/performance-task-queue-hygiene.md`. CI compiles the bench.
 `trunk-dev`. It builds a `WorkerRuntimeConfig` literal without the
 `resident_workflows` field from #1798. The test now sets it.
 
-**Tests.** 13 unit tests pin the config, the outcome and the SQL shape. 16
+**Tests.** 13 unit tests pin the config, the outcome and the SQL shape. 17
 DB tests in `terminal_task_gc_tests.rs` cover the AC and the edges:
 
 - old terminal rows go, and `PENDING`/`RUNNING` rows stay at any age;
 - each statement deletes at most one batch, one tick runs at most 50
   statements, and the next tick continues;
+- two shards aliased to one database share one pass per tick;
 - no live row is locked, and a locked terminal row is skipped;
 - a batch size above the cap is clamped;
 - a NULL `completed_at` and a row at the cutoff stay;

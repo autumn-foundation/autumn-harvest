@@ -392,6 +392,65 @@ async fn one_tick_deletes_in_bounded_batches_and_the_next_tick_continues() {
 }
 
 #[tokio::test]
+async fn aliased_shards_on_one_database_are_swept_once_per_tick() {
+    let (url, _container) = setup_db().await;
+    let mut conn = connect(&url).await;
+    scrub(&mut conn).await;
+
+    let batch = 10_usize;
+    let budget = i64::try_from(batch * MAX_TERMINAL_TASK_SWEEP_BATCHES_PER_TICK).unwrap();
+    insert_activity_rows(&mut conn, "COMPLETED", Some(days_ago(30)), budget + 25).await;
+
+    // Two logical shards on one physical pool, as in a pre-split rollout.
+    let pool = build_pool(&url);
+    let pools = ShardedDbPool::from_map(
+        BTreeMap::from([
+            (autumn_harvest::types::ShardId::new(0), pool.clone()),
+            (autumn_harvest::types::ShardId::new(1), pool),
+        ]),
+        autumn_harvest::types::ShardId::new(0),
+    );
+    let metrics = Arc::new(CapturingMetrics::default());
+    let runtime = RetentionRuntime::spawn(
+        pools,
+        RetentionConfig {
+            batch_size: batch,
+            ..task_gc_only(WEEK)
+        },
+        Arc::clone(&metrics) as Arc<dyn MetricsRecorder>,
+        None,
+        None,
+    )
+    .expect("the runtime spawns");
+    runtime.run_now();
+    let mut snapshot = Vec::new();
+    for _ in 0..400 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if runtime.monitor().iterations_completed() > 0 {
+            snapshot = runtime.monitor().snapshot().per_shard;
+            break;
+        }
+    }
+    runtime.shutdown();
+
+    let budget = u64::try_from(budget).unwrap();
+    assert_eq!(
+        counts_by_state(&mut conn).await.get("COMPLETED"),
+        Some(&25),
+        "one tick spends one budget on the shared database"
+    );
+    assert_eq!(metrics.by_state().get("COMPLETED"), Some(&budget));
+    assert_eq!(snapshot.len(), 2);
+    for shard in &snapshot {
+        assert_eq!(
+            outcome(shard).deleted,
+            budget,
+            "each alias reports the one database-wide pass"
+        );
+    }
+}
+
+#[tokio::test]
 async fn the_sweep_returns_per_state_counts_for_any_batch_size() {
     let (url, _container) = setup_db().await;
     let mut conn = connect(&url).await;

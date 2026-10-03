@@ -1001,6 +1001,7 @@ pub struct RetentionTickResult {
     /// Terminal-task janitor outcome for this shard this tick (issue #1811).
     ///
     /// `None` means the janitor is off or has not run on this shard yet.
+    /// Shards that share one database report the same database-wide pass.
     /// `Some` with a zero count means it ran and found nothing. `Some` with an
     /// `error` means the pass failed; the counts are the rows deleted before
     /// the failure.
@@ -1305,13 +1306,14 @@ struct PartitionSweepCursor {
     catch_up_target: Option<DateTime<Utc>>,
 }
 
-/// One terminal-task janitor pass over every shard (issue #1811).
+/// One terminal-task janitor pass over every database (issue #1811).
 ///
-/// The pass is shard-local and best-effort. A failed shard is reported and
+/// The pass is best-effort per database. A failed database is reported and
 /// retried next tick. Under `dry_run`, the pass is a read-only preview and
-/// records no metric. A pass that fails after some batches committed still reports and
-/// meters those rows. Shutdown takes effect at the next shard boundary, where
-/// no statement is open.
+/// records no metric. A pass that fails after some batches committed still
+/// reports and meters those rows. Shutdown takes effect at the next database
+/// boundary, or during a connection checkout. No statement is open at either
+/// point.
 #[cfg(feature = "db")]
 async fn run_terminal_task_pass(
     pools: &ShardedDbPool,
@@ -1335,12 +1337,22 @@ async fn run_terminal_task_pass(
         );
         return;
     };
-    for (shard, pool) in pools.iter_shards() {
+    // One pass per physical database. Aliased shards share one database, and
+    // `harvest_task_queue` has no shard column, so a pass per alias would
+    // spend the budget once per alias.
+    for (pool, shards) in pools.pool_groups() {
         if shutdown.is_cancelled() {
             return;
         }
         let mut by_state = BTreeMap::new();
-        let result = match pool.get().await {
+        // Deadpool has no acquire timeout. Race the checkout against shutdown,
+        // so a saturated pool cannot hold shutdown open. No statement is open
+        // yet, so returning here abandons nothing.
+        let checkout = tokio::select! {
+            () = shutdown.cancelled() => return,
+            result = pool.get() => result,
+        };
+        let result = match checkout {
             Ok(mut conn) => crate::queue::sweep_terminal_tasks_into(
                 &mut conn,
                 cutoff,
@@ -1364,20 +1376,23 @@ async fn run_terminal_task_pass(
         };
         if let Some(error) = &outcome.error {
             tracing::warn!(
-                shard = %shard,
+                shards = ?shards,
                 deleted = outcome.deleted,
                 error = %error,
                 "harvest terminal-task janitor failed"
             );
         } else if outcome.deleted > 0 {
             tracing::info!(
-                shard = %shard,
+                shards = ?shards,
                 rows = outcome.deleted,
                 dry_run = config.dry_run,
                 "harvest terminal-task janitor pass"
             );
         }
-        monitor.update_terminal_tasks(shard, outcome);
+        // Each alias reports the one database-wide pass.
+        for shard in shards {
+            monitor.update_terminal_tasks(shard, outcome.clone());
+        }
     }
 }
 
