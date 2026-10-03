@@ -19,15 +19,17 @@ source is `autumn-harvest/tests/integration/migration_lock_safety.rs`.
 
 ## 1. Hot tables
 
-Every workflow step reads or writes these tables:
+The engine reads or writes these tables on every task claim or workflow step.
+A waiting `ACCESS EXCLUSIVE` lock on any of them stalls the fleet.
 
-- `harvest_audit_log`
-- `harvest_events`
-- `harvest_signals`
-- `harvest_task_queue`
-- `harvest_timers`
-- `harvest_workflow_executions`
-- `harvest_workflow_outbox` (application database)
+- `harvest_task_queue`, `harvest_events`, `harvest_workflow_executions`,
+  `harvest_timers` and `harvest_signals`: the workflow step path.
+- `harvest_workers`, `harvest_queue_pauses`, `harvest_activity_pauses`,
+  `harvest_shard_generation` and `harvest_rate_limit_buckets`: every claim
+  reads them.
+- `harvest_audit_log`: each operator action writes it.
+- `harvest_workflow_outbox`: the application writes it in its own
+  transactions, in the application database.
 
 A table that the same migration creates is not hot for that migration. No
 session can hold a lock on it yet.
@@ -36,24 +38,32 @@ session can hold a lock on it yet.
 
 | Rule | Fails when | Fix |
 |---|---|---|
-| `lock-timeout` | A statement takes a blocking lock on a hot table, and no non-zero `lock_timeout` comes before it. | Put `SET LOCAL lock_timeout = '5s';` first. |
-| `blocking-index` | A plain `CREATE INDEX`, `DROP INDEX` or `REINDEX` touches a hot table. | Use `CONCURRENTLY` (section 4), or the guarded build (section 5). |
-| `concurrently-in-transaction` | `CONCURRENTLY` appears in a migration that runs in a transaction. | Add `metadata.toml` with `run_in_transaction = false`. |
+| `lock-timeout` | A statement takes a blocking lock on a hot table, and no non-zero `lock_timeout` is in force. | Put `SET LOCAL lock_timeout = '5s';` first. |
+| `blocking-index` | A plain `CREATE INDEX`, `DROP INDEX` or `REINDEX` touches a hot table. So does `ALTER TABLE ... ADD` of a `UNIQUE`, `PRIMARY KEY` or `EXCLUDE` constraint without `USING INDEX`. | Use `CONCURRENTLY` (section 4), or the guarded build (section 5). |
+| `concurrently-in-transaction` | `CONCURRENTLY` runs in a transaction, shares its file with another statement, or sits in a `DO` block. | Put it alone in a file with `run_in_transaction = false` (section 4). |
 | `bad-annotation` | A `-- lock-safety:` comment does not parse. | Fix the annotation (section 6). |
 | `unused-annotation` | An annotation allows a rule that the statement below it does not break. | Remove the annotation. |
 
 These statements take a blocking lock for `lock-timeout`:
 
 - `ALTER TABLE`, in every form;
-- `LOCK TABLE`, `DROP TABLE` and `TRUNCATE`;
-- `CREATE TRIGGER` and `DROP TRIGGER`;
+- `LOCK TABLE`, `DROP TABLE`, `TRUNCATE`, `CLUSTER` and `VACUUM FULL`;
+- `CREATE`, `ALTER` and `DROP TRIGGER`; `CREATE`, `ALTER` and `DROP POLICY`;
+  `CREATE RULE`; `ALTER INDEX`;
 - `REFERENCES` on a hot table, in a new table or a new constraint. A foreign key
   takes `SHARE ROW EXCLUSIVE` on the table it references;
+- `DROP TABLE`, or `ALTER TABLE ... DROP CONSTRAINT`, on a table with a foreign
+  key to a hot table. Postgres drops the key's triggers on the hot table too,
+  under `ACCESS EXCLUSIVE`;
+- `CREATE TABLE ... PARTITION OF` a hot table, which locks the parent;
 - a plain `CREATE INDEX` (`SHARE`), `DROP INDEX` (`ACCESS EXCLUSIVE`) or
   `REINDEX`.
 
-The lint finds a `DROP INDEX` table from the migration that created the index.
-An index that no migration creates counts as hot.
+The lint reads the history of earlier migrations. It finds the table of a
+`DROP INDEX` from the migration that created the index. It finds the foreign
+keys of a table from the migrations that added them. An index that no migration
+creates counts as hot. So does a `REINDEX` of a schema, a database or the
+system catalogs.
 
 ## 3. Bound the lock wait
 
@@ -64,25 +74,27 @@ ALTER TABLE harvest_workflow_executions
     ADD COLUMN IF NOT EXISTS example_note TEXT NULL;
 ```
 
-Set the timeout before the first lock. A timeout set after the lock does not
-count. A value of `0` or `DEFAULT` turns the timeout off, so it does not count.
-Inside a `DO` block, `PERFORM set_config('lock_timeout', '5s', true)` also
-counts.
+Every lock on a hot table needs a bound in force when it runs. A timeout set
+after the lock does not count. A later `RESET lock_timeout`, `RESET ALL` or
+zero value ends the bound for the locks after it. `0` turns the timeout off.
+`DEFAULT` restores the server default, which is usually `0`, so the lint does
+not accept it. `SET lock_timeout` must be its own statement. `ALTER ROLE ...
+SET lock_timeout` does not change the current session. Inside a `DO` block,
+`PERFORM set_config('lock_timeout', '5s', true)` also counts.
 
 `5s` is the bound that the existing lock-taking migrations use. When the
 timeout fires, the migration fails and rolls back. Run it again.
 
-`SET LOCAL` and `set_config(..., true)` do nothing outside a transaction. In a
-migration with `run_in_transaction = false`, use `SET lock_timeout` instead.
-End that migration with `RESET lock_timeout`, because the setting stays on the
-connection.
+Diesel and `harvest migrate` send each `up.sql` as one batch. Postgres runs a
+multi-statement batch as one implicit transaction. `SET LOCAL` therefore holds
+for the whole file, even with `run_in_transaction = false`.
 
 ## 4. Build indexes with `CONCURRENTLY`
 
 `CREATE INDEX CONCURRENTLY` and `DROP INDEX CONCURRENTLY` take
 `SHARE UPDATE EXCLUSIVE`. Reads and writes continue during the build. Postgres
-rejects both inside a transaction block, so the migration must opt out of
-Diesel's transaction.
+rejects both inside a transaction block, a function or a `DO` block, so the
+migration must opt out of Diesel's transaction.
 
 `metadata.toml`, beside `up.sql`:
 
@@ -97,8 +109,11 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_harvest_events_example
     ON harvest_events (workflow_exec_id, timestamp);
 ```
 
-Diesel and `harvest migrate` apply such a migration without a transaction.
-Keep one statement in it. Nothing rolls back after a failure.
+The `CONCURRENTLY` statement must be the only statement in the file. Diesel
+and `harvest migrate` send the file as one batch, and a batch of two or more
+statements runs as one implicit transaction. A `SET lock_timeout` beside it
+therefore breaks the migration. The lint flags it. `SHARE UPDATE EXCLUSIVE`
+does not block reads or writes, so this statement needs no `lock_timeout`.
 
 A failed concurrent build leaves an `INVALID` index. `IF NOT EXISTS` then
 skips the build, and the invalid index stays. Before a retry, run
@@ -112,28 +127,39 @@ guarded build in section 5.
 
 ## 5. The guarded build
 
-This is the pattern that most index migrations in this tree use. The migration
-checks for a valid index with the same definition. It builds the index only
-when the index is absent, and it fails when a different index has the name.
-Operators with a large table prebuild the index out of band with
-`CREATE INDEX CONCURRENTLY`, and the migration then does nothing.
+This is the pattern that most index migrations in this tree use. Operators
+with a large table prebuild the index out of band with
+`CREATE INDEX CONCURRENTLY`. The migration builds the index only when it is
+absent. It fails when the existing index is `INVALID`, which is what a failed
+concurrent build leaves.
 
-`20261001192155_harvest_quota_reconcile_name_id_index/up.sql` is a full
-example. A new guarded build bounds its lock wait and annotates the plain
-build:
+A new guarded build bounds its lock wait and annotates the plain build. This
+short form checks validity only:
 
 ```sql
 SET LOCAL lock_timeout = '5s';
 
 DO $$
+DECLARE
+    valid boolean;
 BEGIN
-    IF to_regclass('idx_harvest_events_example') IS NULL THEN
+    SELECT i.indisvalid INTO valid
+      FROM pg_index i
+     WHERE i.indexrelid = to_regclass('idx_harvest_events_example');
+    IF valid IS NULL THEN
         -- lock-safety: allow blocking-index #1234 operators prebuild it CONCURRENTLY
         CREATE INDEX idx_harvest_events_example
             ON harvest_events (workflow_exec_id, timestamp);
+    ELSIF NOT valid THEN
+        RAISE EXCEPTION 'idx_harvest_events_example is INVALID. Drop it and rebuild it.';
     END IF;
 END $$;
 ```
+
+A real migration also compares the definition, so that an unrelated index
+with the same name fails the migration.
+`20261001192155_harvest_quota_reconcile_name_id_index/up.sql` shows that
+check.
 
 Put the out-of-band recipe in the migration header and in the upgrade guide
 row for the migration.
@@ -173,12 +199,17 @@ that no longer matches a finding also fails the build.
 
 ## 8. Known limits
 
-- The lint does not see SQL that `EXECUTE` builds from a string.
+- The lint does not see SQL that `EXECUTE` builds from a string. For
+  example, `20261001190405` drops an index on `harvest_audit_log` that way.
 - The lint scans a dollar-quoted string as code. A statement inside one can
   fail the lint. That error is on the safe side.
 - Every `ALTER TABLE` form counts as a blocking lock. Some forms, such as
   `VALIDATE CONSTRAINT`, take a weaker lock. Set the timeout anyway.
 - The lint does not check the size of the timeout. Keep it near `5s`.
+- `lock_timeout` bounds the wait for a lock, not the time the lock is held.
+  `ADD CHECK` without `NOT VALID`, `SET NOT NULL` and a column type change
+  hold `ACCESS EXCLUSIVE` for a full scan or rewrite. Add a constraint as
+  `NOT VALID`, then run `VALIDATE CONSTRAINT`, as `20260902131705` does.
 
 ## Related
 

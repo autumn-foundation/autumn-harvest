@@ -5,11 +5,11 @@
 //! `LOCK_SAFETY_CUTOFF` and enforces two rules on the hot tables:
 //!
 //!   1. `lock-timeout`: a statement that takes a blocking lock on a hot table
-//!      must come after a non-zero `lock_timeout`. Without one, the statement
-//!      waits behind a long transaction, and every write queues behind it.
+//!      needs a non-zero `lock_timeout` in force. Without one, the statement
+//!      waits behind a long transaction, and every later query queues behind it.
 //!   2. `blocking-index`: `CREATE INDEX`, `DROP INDEX` and `REINDEX` on a hot
-//!      table must use `CONCURRENTLY`. The plain forms block writes, or all
-//!      access, for the whole build.
+//!      table must use `CONCURRENTLY`. A plain build blocks writes until it
+//!      ends. A plain drop needs `ACCESS EXCLUSIVE`, which queues all access.
 //!
 //! An in-file annotation is the reviewed escape hatch. Shipped migrations
 //! cannot change, so they are grandfathered by name in `GRANDFATHERED`.
@@ -17,6 +17,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+
+use super::ci_run_coverage::{NO_FULL_RUN_FLAGS, SHELL_OPERATORS, parse_workflow, ungated};
 
 /// The last migration this lint does not bind, inclusive.
 ///
@@ -30,17 +32,23 @@ const LOCK_SAFETY_CUTOFF: &str = "20260914165542";
 /// migration cannot be grandfathered, so it uses the in-file annotation.
 const GRANDFATHER_CEILING: &str = "20261002033903";
 
-/// Tables that every workflow step reads or writes.
+/// Tables that the engine reads or writes on every claim or workflow step.
 ///
-/// A blocking lock on one of them stalls the engine, not one feature.
-/// `harvest_workflow_outbox` lives in the application database, and the
-/// application writes it in its own transactions.
+/// A blocking lock on one of them stalls the engine, not one feature. Each
+/// operator action writes `harvest_audit_log`. `harvest_workflow_outbox` lives
+/// in the application database, and the application writes it in its own
+/// transactions.
 const HOT_TABLES: &[&str] = &[
+    "harvest_activity_pauses",
     "harvest_audit_log",
     "harvest_events",
+    "harvest_queue_pauses",
+    "harvest_rate_limit_buckets",
+    "harvest_shard_generation",
     "harvest_signals",
     "harvest_task_queue",
     "harvest_timers",
+    "harvest_workers",
     "harvest_workflow_executions",
     "harvest_workflow_outbox",
 ];
@@ -173,103 +181,112 @@ struct Finding {
     detail: String,
 }
 
-/// Lint one `up.sql`.
-///
-/// `index_tables` maps each index name to its table, from `index_tables()`.
-/// A `DROP INDEX` needs it, because the statement does not name the table.
-fn lint(
-    sql: &str,
-    run_in_transaction: bool,
-    index_tables: &BTreeMap<String, String>,
-) -> Vec<Finding> {
-    let (toks, comments) = tokenize(sql);
-    let created = created_tables(&toks);
-    let is_hot = |table: Option<&str>| match table {
-        // An index that no migration creates has an unknown table. Fail closed.
-        None => true,
-        Some(t) => HOT_TABLES.contains(&t) && !created.contains(t),
-    };
+/// What earlier migrations created, as far as the lint needs to know.
+#[derive(Clone, Debug, Default)]
+struct History {
+    /// Each index name, mapped to its table.
+    indexes: BTreeMap<String, String>,
+    /// Each table, mapped to the tables that its foreign keys reference.
+    references: BTreeMap<String, BTreeSet<String>>,
+}
 
+impl History {
+    /// Build the history that `migrations` leave behind, in order.
+    fn of<'a>(migrations: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut history = Self::default();
+        for sql in migrations {
+            analyse(sql, &mut history);
+        }
+        history
+    }
+}
+
+/// Lint one `up.sql` against the history of the migrations before it.
+///
+/// A `DROP INDEX` does not name its table, so the lint reads the table from
+/// the history. A definition later in the same file does not count.
+fn lint(sql: &str, run_in_transaction: bool, history: &History) -> Vec<Finding> {
+    let analysis = analyse(sql, &mut history.clone());
     let mut findings = Vec::new();
-    // `statements` returns hits in source order, so the first hot hit is the
-    // first lock.
-    let mut first_lock: Option<(&Hit, &str)> = None;
-    let hits = statements(&toks);
-    for hit in &hits {
-        let table = hit.table.as_deref().or_else(|| {
-            hit.index
-                .as_ref()
-                .and_then(|i| index_tables.get(i))
-                .map(String::as_str)
-        });
-        let hot = is_hot(table);
-        let table = table.unwrap_or("an index that no migration creates");
-        match hit.kind {
-            Kind::Index { concurrent: true } => {
-                if run_in_transaction {
-                    findings.push(Finding {
-                        rule: Rule::ConcurrentlyInTransaction,
-                        line: hit.line,
-                        detail: format!(
-                            "{} CONCURRENTLY cannot run in a transaction. Set \
-                             `run_in_transaction = false` in metadata.toml.",
-                            hit.verb
-                        ),
-                    });
-                }
-                continue;
+
+    for hit in &analysis.hits {
+        let Kind::Index { concurrent } = hit.kind else {
+            continue;
+        };
+        if concurrent {
+            let reason = if hit.in_body {
+                Some("cannot run inside a DO block or a function")
+            } else if run_in_transaction {
+                Some(
+                    "cannot run in a transaction. Set `run_in_transaction = false` in metadata.toml",
+                )
+            } else if analysis.statement_count > 1 {
+                Some(
+                    "must be the only statement in its file. Diesel sends the file as one \
+                     batch, and Postgres runs a batch as one transaction",
+                )
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                findings.push(Finding {
+                    rule: Rule::ConcurrentlyInTransaction,
+                    line: hit.line,
+                    detail: format!("{} CONCURRENTLY {reason}.", hit.verb),
+                });
             }
-            Kind::Index { concurrent: false } if hot => findings.push(Finding {
+        } else if hit.hot {
+            findings.push(Finding {
                 rule: Rule::BlockingIndex,
                 line: hit.line,
                 detail: format!(
-                    "plain {} on {table} blocks the table for the whole build",
-                    hit_label(hit)
-                ),
-            }),
-            _ => {}
-        }
-        if hot && first_lock.is_none() {
-            first_lock = Some((hit, table));
-        }
-    }
-
-    if let Some((lock, table)) = first_lock {
-        if first_lock_timeout(&toks, run_in_transaction).is_none_or(|at| at > lock.at) {
-            findings.push(Finding {
-                rule: Rule::LockTimeout,
-                line: lock.line,
-                detail: format!(
-                    "{} locks {table} with no non-zero lock_timeout set before it",
-                    hit_label(lock)
+                    "plain {} on {} {}",
+                    hit.label(),
+                    hit.table_name(),
+                    index_cost(hit.verb)
                 ),
             });
         }
     }
 
-    apply_annotations(sql, &comments, findings)
+    // Every hot lock needs a bound in force. Report the first one without.
+    let unbounded = analysis
+        .hits
+        .iter()
+        .filter(|hit| hit.hot && hit.kind != (Kind::Index { concurrent: true }))
+        .find(|hit| !timeout_in_force(&analysis.timeouts, hit.at));
+    if let Some(lock) = unbounded {
+        findings.push(Finding {
+            rule: Rule::LockTimeout,
+            line: lock.line,
+            detail: format!(
+                "{} locks {} with no non-zero lock_timeout in force",
+                lock.label(),
+                lock.table_name()
+            ),
+        });
+    }
+
+    apply_annotations(sql, &analysis.comments, findings)
 }
 
-/// A short label for a statement in a failure message.
-fn hit_label(hit: &Hit) -> String {
-    match &hit.index {
-        Some(index) => format!("{} {index}", hit.verb),
-        None => hit.verb.to_string(),
+/// What a plain form of an index statement costs a hot table.
+fn index_cost(verb: &str) -> &'static str {
+    match verb {
+        "CREATE INDEX" => "holds SHARE, which blocks writes, for the whole build",
+        "DROP INDEX" => "needs ACCESS EXCLUSIVE, which queues every read and write",
+        "REINDEX" => "blocks writes for the whole rebuild",
+        _ => "builds an index under ACCESS EXCLUSIVE",
     }
 }
 
-/// Map each index that a migration creates to its table.
-fn index_tables<'a>(sqls: impl IntoIterator<Item = &'a str>) -> BTreeMap<String, String> {
-    let mut map = BTreeMap::new();
-    for sql in sqls {
-        let (toks, _) = tokenize(sql);
-        for hit in statements(&toks) {
-            if let (Some(index), Some(table)) = (hit.index, hit.table) {
-                map.insert(index, table);
-            }
-        }
-    }
-    map
+/// Whether the last `lock_timeout` change before token `at` set a bound.
+fn timeout_in_force(timeouts: &[(usize, bool)], at: usize) -> bool {
+    timeouts
+        .iter()
+        .take_while(|(k, _)| *k < at)
+        .last()
+        .is_some_and(|(_, bounds)| *bounds)
 }
 
 // ── Annotations ──────────────────────────────────────────────────────────────
@@ -385,6 +402,8 @@ enum Tok {
 struct Token {
     tok: Tok,
     line: usize,
+    /// How many dollar-quoted bodies enclose the token. Zero is top level.
+    depth: usize,
 }
 
 /// A `--` comment, without the dashes.
@@ -396,15 +415,27 @@ struct Comment {
 /// Split `sql` into tokens and `--` comments.
 ///
 /// Comments and string literals never become words, so prose cannot match a
-/// statement. A dollar-quoted body is scanned as code, because a `DO $$`
-/// block holds real DDL. That also scans a dollar-quoted string literal, which
-/// fails closed.
+/// statement. A dollar-quoted body is lexed on its own and scanned as code,
+/// because a `DO $$` block holds real DDL. Lexer state never leaks past the
+/// closing delimiter.
 fn tokenize(sql: &str) -> (Vec<Token>, Vec<Comment>) {
     let chars: Vec<char> = sql.chars().collect();
-    let at = |i: usize| chars.get(i).copied();
     let mut toks = Vec::new();
     let mut comments = Vec::new();
-    let mut line = 1;
+    lex(&chars, 1, 0, &mut toks, &mut comments);
+    (toks, comments)
+}
+
+/// Lex `chars`, which start on line `line` inside `depth` dollar bodies.
+#[allow(clippy::too_many_lines)]
+fn lex(
+    chars: &[char],
+    mut line: usize,
+    depth: usize,
+    toks: &mut Vec<Token>,
+    comments: &mut Vec<Comment>,
+) {
+    let at = |i: usize| chars.get(i).copied();
     let mut i = 0;
     while let Some(c) = at(i) {
         let next = at(i + 1);
@@ -424,15 +455,15 @@ fn tokenize(sql: &str) -> (Vec<Token>, Vec<Comment>) {
             });
         } else if c == '/' && next == Some('*') {
             // Block comments nest in Postgres.
-            let mut depth = 0;
+            let mut nesting = 0;
             while let Some(c) = at(i) {
                 if c == '/' && at(i + 1) == Some('*') {
-                    depth += 1;
+                    nesting += 1;
                     i += 2;
                 } else if c == '*' && at(i + 1) == Some('/') {
-                    depth -= 1;
+                    nesting -= 1;
                     i += 2;
-                    if depth == 0 {
+                    if nesting == 0 {
                         break;
                     }
                 } else {
@@ -468,9 +499,11 @@ fn tokenize(sql: &str) -> (Vec<Token>, Vec<Comment>) {
             toks.push(Token {
                 tok: Tok::Str(value),
                 line: start_line,
+                depth,
             });
         } else if c == '"' {
             // A quoted identifier keeps its case. `""` is an escaped quote.
+            let start_line = line;
             i += 1;
             let mut value = String::new();
             while let Some(c) = at(i) {
@@ -488,10 +521,20 @@ fn tokenize(sql: &str) -> (Vec<Token>, Vec<Comment>) {
             }
             toks.push(Token {
                 tok: Tok::Word(value),
-                line,
+                line: start_line,
+                depth,
             });
         } else if let Some(len) = dollar_tag_len(&chars[i..]) {
-            i += len;
+            // Find the matching close first, then lex only the body.
+            let tag = &chars[i..i + len];
+            let body_start = i + len;
+            let body_end = (body_start..chars.len())
+                .find(|&j| chars[j..].starts_with(tag))
+                .unwrap_or(chars.len());
+            let body = &chars[body_start..body_end];
+            lex(body, line, depth + 1, toks, comments);
+            line += body.iter().filter(|c| **c == '\n').count();
+            i = (body_end + len).min(chars.len());
         } else if c.is_alphanumeric() || c == '_' {
             let start = i;
             while at(i).is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '$') {
@@ -501,16 +544,17 @@ fn tokenize(sql: &str) -> (Vec<Token>, Vec<Comment>) {
             toks.push(Token {
                 tok: Tok::Word(word.to_lowercase()),
                 line,
+                depth,
             });
         } else {
             toks.push(Token {
                 tok: Tok::Punct(c),
-                line,
+                line: line,
+                depth,
             });
             i += 1;
         }
     }
-    (toks, comments)
 }
 
 /// The length of a dollar-quote delimiter such as `$$` or `$body$`.
@@ -535,7 +579,7 @@ fn dollar_tag_len(rest: &[char]) -> Option<usize> {
 /// What a matched statement does to its table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
-    /// `CREATE INDEX`, `DROP INDEX` or `REINDEX`.
+    /// An index build, drop or rebuild.
     Index { concurrent: bool },
     /// Any other statement that takes a blocking lock.
     Lock,
@@ -544,220 +588,387 @@ enum Kind {
 /// One statement that can lock a table.
 #[derive(Debug)]
 struct Hit {
-    /// The token index of the statement's first word.
+    /// The token index where the statement starts.
     at: usize,
     line: usize,
     verb: &'static str,
     /// The index the statement names, if any.
     index: Option<String>,
-    /// The table the statement names. `None` when only `index` is known.
+    /// The table the statement locks. `None` when the lint cannot tell.
+    table: Option<String>,
+    kind: Kind,
+    /// Whether the statement sits inside a dollar-quoted body.
+    in_body: bool,
+    /// Whether the table is hot here. An unknown table counts as hot.
+    hot: bool,
+}
+
+impl Hit {
+    /// A short label for a failure message.
+    fn label(&self) -> String {
+        self.index.as_ref().map_or_else(
+            || self.verb.to_string(),
+            |index| format!("{} {index}", self.verb),
+        )
+    }
+
+    fn table_name(&self) -> &str {
+        self.table.as_deref().unwrap_or("an unknown table")
+    }
+}
+
+/// The tokens, comments and lock-taking statements of one `up.sql`.
+struct Analysis {
+    comments: Vec<Comment>,
+    hits: Vec<Hit>,
+    /// Each `lock_timeout` change: its token index, and whether it sets a bound.
+    timeouts: Vec<(usize, bool)>,
+    /// The number of top-level statements.
+    statement_count: usize,
+}
+
+/// A view of the tokens with statement boundaries.
+struct Stmts<'a> {
+    toks: &'a [Token],
+    /// For each token, the index of the first token of its statement.
+    starts: Vec<usize>,
+}
+
+impl<'a> Stmts<'a> {
+    fn new(toks: &'a [Token]) -> Self {
+        let mut starts = Vec::with_capacity(toks.len());
+        let mut start = 0;
+        for k in 0..toks.len() {
+            let boundary = k == 0
+                || toks[k].depth != toks[k - 1].depth
+                || toks[k - 1].tok == Tok::Punct(';')
+                || matches!(
+                    &toks[k - 1].tok,
+                    Tok::Word(w) if ["begin", "then", "else", "loop"].contains(&w.as_str())
+                );
+            if boundary {
+                start = k;
+            }
+            starts.push(start);
+        }
+        Self { toks, starts }
+    }
+
+    fn word(&self, k: usize) -> Option<&'a str> {
+        match &self.toks.get(k)?.tok {
+            Tok::Word(w) => Some(w),
+            _ => None,
+        }
+    }
+
+    fn is(&self, k: usize, expected: &str) -> bool {
+        self.word(k) == Some(expected)
+    }
+
+    fn is_punct(&self, k: usize, expected: char) -> bool {
+        self.toks
+            .get(k)
+            .is_some_and(|t| t.tok == Tok::Punct(expected))
+    }
+
+    fn string(&self, k: usize) -> Option<&'a str> {
+        match &self.toks.get(k)?.tok {
+            Tok::Str(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// The index one past the last token of the statement that holds `k`.
+    fn end(&self, k: usize) -> usize {
+        (k..self.toks.len())
+            .find(|&j| self.starts[j] != self.starts[k] || self.is_punct(j, ';'))
+            .unwrap_or(self.toks.len())
+    }
+
+    /// Read a name that may carry a schema. Return its last part and the next index.
+    fn qualified_name(&self, k: usize) -> Option<(String, usize)> {
+        let mut name = self.word(k)?;
+        let mut k = k + 1;
+        while self.is_punct(k, '.') {
+            let Some(part) = self.word(k + 1) else {
+                break;
+            };
+            name = part;
+            k += 2;
+        }
+        Some((name.to_string(), k))
+    }
+
+    /// Read a comma-separated list of names. Each name may carry `ONLY`.
+    fn name_list(&self, mut k: usize) -> Vec<String> {
+        let mut names = Vec::new();
+        loop {
+            if self.is(k, "only") {
+                k += 1;
+            }
+            let Some((name, next)) = self.qualified_name(k) else {
+                break;
+            };
+            names.push(name);
+            if !self.is_punct(next, ',') {
+                break;
+            }
+            k = next + 1;
+        }
+        names
+    }
+
+    /// Skip `IF EXISTS` or `IF NOT EXISTS` at `k`.
+    fn skip_if_exists(&self, k: usize) -> usize {
+        if !self.is(k, "if") {
+            return k;
+        }
+        let j = if self.is(k + 1, "not") { k + 2 } else { k + 1 };
+        if self.is(j, "exists") { j + 1 } else { k }
+    }
+
+    /// The name after the first `keyword` in the statement that holds `k`.
+    fn name_after(&self, k: usize, keyword: &str) -> Option<String> {
+        (k..self.end(k))
+            .find(|&j| self.is(j, keyword))
+            .and_then(|j| self.qualified_name(j + 1))
+            .map(|(name, _)| name)
+    }
+
+    /// Whether the statement that holds `k` has `first` directly before `second`.
+    fn has_pair(&self, k: usize, first: &str, second: &str) -> bool {
+        (self.starts[k]..self.end(k)).any(|j| self.is(j, first) && self.is(j + 1, second))
+    }
+
+    /// The table a `CREATE TABLE` or `ALTER TABLE` statement at `start` names.
+    fn statement_table(&self, start: usize) -> Option<String> {
+        let mut j = start + 1;
+        if self.is(start, "create")
+            && ["temp", "temporary", "unlogged"]
+                .iter()
+                .any(|w| self.is(j, w))
+        {
+            j += 1;
+        }
+        if !(self.is(start, "create") || self.is(start, "alter")) || !self.is(j, "table") {
+            return None;
+        }
+        let mut j = self.skip_if_exists(j + 1);
+        if self.is(j, "only") {
+            j += 1;
+        }
+        self.qualified_name(j).map(|(name, _)| name)
+    }
+}
+
+/// A statement before the history and positional rules apply.
+struct Raw {
+    at: usize,
+    verb: &'static str,
+    index: Option<String>,
     table: Option<String>,
     kind: Kind,
 }
 
-fn word(toks: &[Token], k: usize) -> Option<&str> {
-    match &toks.get(k)?.tok {
-        Tok::Word(w) => Some(w),
-        _ => None,
-    }
-}
-
-fn is_word(toks: &[Token], k: usize, expected: &str) -> bool {
-    word(toks, k) == Some(expected)
-}
-
-fn is_punct(toks: &[Token], k: usize, expected: char) -> bool {
-    toks.get(k).is_some_and(|t| t.tok == Tok::Punct(expected))
-}
-
-fn string(toks: &[Token], k: usize) -> Option<&str> {
-    match &toks.get(k)?.tok {
-        Tok::Str(s) => Some(s),
-        _ => None,
-    }
-}
-
-/// Read a name that may carry a schema. Return its last part and the next index.
-fn qualified_name(toks: &[Token], k: usize) -> Option<(String, usize)> {
-    let mut name = word(toks, k)?;
-    let mut k = k + 1;
-    while is_punct(toks, k, '.') {
-        let Some(part) = word(toks, k + 1) else {
-            break;
-        };
-        name = part;
-        k += 2;
-    }
-    Some((name.to_string(), k))
-}
-
-/// Read a comma-separated list of names. Each name may carry `ONLY`.
-fn name_list(toks: &[Token], mut k: usize) -> Vec<String> {
-    let mut names = Vec::new();
-    loop {
-        if is_word(toks, k, "only") {
-            k += 1;
-        }
-        let Some((name, next)) = qualified_name(toks, k) else {
-            break;
-        };
-        names.push(name);
-        if !is_punct(toks, next, ',') {
-            break;
-        }
-        k = next + 1;
-    }
-    names
-}
-
-/// Skip `IF EXISTS` or `IF NOT EXISTS` at `k`.
-fn skip_if_exists(toks: &[Token], k: usize) -> usize {
-    if !is_word(toks, k, "if") {
-        return k;
-    }
-    let j = if is_word(toks, k + 1, "not") {
-        k + 2
-    } else {
-        k + 1
-    };
-    if is_word(toks, j, "exists") { j + 1 } else { k }
-}
-
-/// Tables that `toks` creates. A lock on a brand-new table blocks no one.
-fn created_tables(toks: &[Token]) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    for k in 0..toks.len() {
-        if !is_word(toks, k, "create") {
-            continue;
-        }
-        let mut j = k + 1;
-        if ["temp", "temporary", "unlogged"]
-            .iter()
-            .any(|w| is_word(toks, j, w))
-        {
-            j += 1;
-        }
-        if is_word(toks, j, "table") {
-            if let Some((name, _)) = qualified_name(toks, skip_if_exists(toks, j + 1)) {
-                out.insert(name);
-            }
-        }
-    }
-    out
-}
-
-/// Every statement in `toks` that can take a blocking table lock.
-fn statements(toks: &[Token]) -> Vec<Hit> {
-    let mut hits = Vec::new();
-    for k in 0..toks.len() {
-        let line = toks[k].line;
-        let lock = |verb, table: String| Hit {
-            at: k,
-            line,
+impl Raw {
+    const fn lock(at: usize, verb: &'static str, table: Option<String>) -> Self {
+        Self {
+            at,
             verb,
             index: None,
-            table: Some(table),
+            table,
             kind: Kind::Lock,
-        };
-        match word(toks, k) {
-            Some("create") => {
-                if let Some(hit) = create_index(toks, k) {
-                    hits.push(hit);
-                } else if let Some(table) = trigger_table(toks, k, k + 1) {
-                    hits.push(lock("CREATE TRIGGER", table));
-                }
-            }
-            Some("drop") if is_word(toks, k + 1, "index") => {
-                let mut j = k + 2;
-                let concurrent = is_word(toks, j, "concurrently");
-                j = skip_if_exists(toks, j + usize::from(concurrent));
-                for index in name_list(toks, j) {
-                    hits.push(Hit {
-                        at: k,
-                        line,
-                        verb: "DROP INDEX",
-                        index: Some(index),
-                        table: None,
-                        kind: Kind::Index { concurrent },
-                    });
-                }
-            }
-            Some("drop") if is_word(toks, k + 1, "table") => {
-                let j = skip_if_exists(toks, k + 2);
-                hits.extend(
-                    name_list(toks, j)
-                        .into_iter()
-                        .map(|t| lock("DROP TABLE", t)),
-                );
-            }
-            Some("drop") if is_word(toks, k + 1, "trigger") => {
-                if let Some(table) = trigger_table(toks, k, k + 1) {
-                    hits.push(lock("DROP TRIGGER", table));
-                }
-            }
-            Some("alter") if is_word(toks, k + 1, "table") => {
-                let mut j = skip_if_exists(toks, k + 2);
-                if is_word(toks, j, "only") {
-                    j += 1;
-                }
-                if let Some((table, _)) = qualified_name(toks, j) {
-                    hits.push(lock("ALTER TABLE", table));
-                }
-            }
-            Some(verb @ ("lock" | "truncate")) => {
-                let j = if is_word(toks, k + 1, "table") {
-                    k + 2
-                } else {
-                    k + 1
-                };
+        }
+    }
+}
+
+/// Analyse one `up.sql`, and add what it creates to `history`.
+fn analyse(sql: &str, history: &mut History) -> Analysis {
+    let (toks, comments) = tokenize(sql);
+    let s = Stmts::new(&toks);
+    let mut raws: Vec<Raw> = Vec::new();
+    let mut timeouts = Vec::new();
+    // A table counts as new from its `CREATE TABLE` on. `IF NOT EXISTS` can
+    // do nothing, so it does not count.
+    let mut created: BTreeMap<String, usize> = BTreeMap::new();
+
+    for k in 0..toks.len() {
+        let start = s.starts[k] == k;
+        match s.word(k) {
+            Some("create") if start => create(&s, k, &mut raws, &mut created),
+            Some("drop") if start => drop(&s, k, history, &mut raws),
+            Some("alter") if start => alter(&s, k, history, &mut raws),
+            Some(verb @ ("lock" | "truncate")) if start => {
+                let j = if s.is(k + 1, "table") { k + 2 } else { k + 1 };
                 let verb = if verb == "lock" {
                     "LOCK TABLE"
                 } else {
                     "TRUNCATE"
                 };
-                hits.extend(name_list(toks, j).into_iter().map(|t| lock(verb, t)));
+                raws.extend(
+                    s.name_list(j)
+                        .into_iter()
+                        .map(|t| Raw::lock(k, verb, Some(t))),
+                );
             }
+            Some("cluster") if start => {
+                let j = if s.is(k + 1, "verbose") { k + 2 } else { k + 1 };
+                // A bare `CLUSTER` rewrites every clustered table.
+                let table = s.qualified_name(j).map(|(t, _)| t);
+                raws.push(Raw::lock(k, "CLUSTER", table));
+            }
+            Some("vacuum") if start => raws.extend(vacuum_full(&s, k)),
+            Some("reindex") if start => raws.extend(reindex(&s, k)),
             Some("references") => {
-                if let Some((table, _)) = qualified_name(toks, k + 1) {
-                    hits.push(lock("REFERENCES", table));
+                let owner = s.statement_table(s.starts[k]);
+                if let Some((target, _)) = s.qualified_name(k + 1) {
+                    if let Some(owner) = owner {
+                        history
+                            .references
+                            .entry(owner)
+                            .or_default()
+                            .insert(target.clone());
+                    }
+                    raws.push(Raw::lock(s.starts[k], "REFERENCES", Some(target)));
                 }
             }
-            Some("reindex") => hits.extend(reindex(toks, k)),
-            _ => {}
+            Some("partition") if s.is(k + 1, "of") => {
+                let parent = s.qualified_name(k + 2).map(|(t, _)| t);
+                raws.push(Raw::lock(s.starts[k], "PARTITION OF", parent));
+            }
+            _ => timeouts.extend(timeout_change(&s, k).map(|bounds| (k, bounds))),
         }
     }
-    hits
+
+    raws.sort_by_key(|raw| raw.at);
+    let mut hits = Vec::with_capacity(raws.len());
+    for raw in raws {
+        let table = raw.table.or_else(|| {
+            raw.index
+                .as_ref()
+                .and_then(|i| history.indexes.get(i))
+                .cloned()
+        });
+        if let (Some(index), Some(table), "CREATE INDEX") = (&raw.index, &table, raw.verb) {
+            history.indexes.insert(index.clone(), table.clone());
+        }
+        let hot = table.as_deref().is_none_or(|t| {
+            HOT_TABLES.contains(&t) && created.get(t).is_none_or(|made| *made > raw.at)
+        });
+        hits.push(Hit {
+            at: raw.at,
+            line: toks[raw.at].line,
+            verb: raw.verb,
+            index: raw.index,
+            table,
+            kind: raw.kind,
+            in_body: toks[raw.at].depth > 0,
+            hot,
+        });
+    }
+
+    let statement_count = (0..toks.len())
+        .filter(|&k| s.starts[k] == k && toks[k].depth == 0 && !s.is_punct(k, ';'))
+        .count();
+    Analysis {
+        comments,
+        hits,
+        timeouts,
+        statement_count,
+    }
+}
+
+/// The `lock_timeout` change at token `k`, if any: whether it sets a bound.
+///
+/// Matches `SET [LOCAL | SESSION] lock_timeout {= | TO} <value>`,
+/// `RESET lock_timeout`, `RESET ALL` and `set_config('lock_timeout', ...)`.
+/// `SET` and `RESET` count only at the start of a statement, so
+/// `ALTER ROLE ... SET` does not.
+fn timeout_change(s: &Stmts, k: usize) -> Option<bool> {
+    let start = s.starts[k] == k;
+    match s.word(k)? {
+        "set" if start => {
+            let mut j = k + 1;
+            if s.is(j, "local") || s.is(j, "session") {
+                j += 1;
+            }
+            if !s.is(j, "lock_timeout") {
+                return None;
+            }
+            j += 1;
+            if s.is_punct(j, '=') || s.is(j, "to") {
+                j += 1;
+            }
+            Some(bounds_wait(s, j))
+        }
+        "reset" if start && (s.is(k + 1, "lock_timeout") || s.is(k + 1, "all")) => Some(false),
+        "set_config"
+            if s.is_punct(k + 1, '(')
+                && s.string(k + 2) == Some("lock_timeout")
+                && s.is_punct(k + 3, ',') =>
+        {
+            Some(bounds_wait(s, k + 4))
+        }
+        _ => None,
+    }
+}
+
+/// `CREATE INDEX`, `CREATE TABLE`, and the trigger, rule and policy forms.
+fn create(s: &Stmts, k: usize, raws: &mut Vec<Raw>, created: &mut BTreeMap<String, usize>) {
+    let mut j = k + 1;
+    if s.is(j, "or") && s.is(j + 1, "replace") {
+        j += 2;
+    }
+    if s.is(j, "unique") {
+        j += 1;
+    }
+    if s.is(j, "index") {
+        raws.extend(create_index(s, k, j + 1));
+        return;
+    }
+    if s.is(j, "constraint") {
+        j += 1;
+    }
+    let target = match s.word(j) {
+        Some("trigger") => Some(("CREATE TRIGGER", "on")),
+        Some("policy") => Some(("CREATE POLICY", "on")),
+        Some("rule") => Some(("CREATE RULE", "to")),
+        _ => None,
+    };
+    if let Some((verb, keyword)) = target {
+        raws.push(Raw::lock(k, verb, s.name_after(j, keyword)));
+        return;
+    }
+    if let Some(table) = s.statement_table(k) {
+        let guarded = s.has_pair(k, "not", "exists");
+        if !guarded {
+            created.entry(table).or_insert(k);
+        }
+    }
 }
 
 /// `CREATE [UNIQUE] INDEX [CONCURRENTLY] [IF NOT EXISTS] [name] ON [ONLY] table`.
-fn create_index(toks: &[Token], k: usize) -> Option<Hit> {
-    let mut j = k + 1;
-    if is_word(toks, j, "unique") {
-        j += 1;
-    }
-    if !is_word(toks, j, "index") {
-        return None;
-    }
-    j += 1;
-    let concurrent = is_word(toks, j, "concurrently");
-    j = skip_if_exists(toks, j + usize::from(concurrent));
+///
+/// `j` is the token after `INDEX`.
+fn create_index(s: &Stmts, k: usize, mut j: usize) -> Option<Raw> {
+    let concurrent = s.is(j, "concurrently");
+    j = s.skip_if_exists(j + usize::from(concurrent));
     let mut index = None;
-    if !is_word(toks, j, "on") {
-        let (name, next) = qualified_name(toks, j)?;
+    if !s.is(j, "on") {
+        let (name, next) = s.qualified_name(j)?;
         index = Some(name);
         j = next;
     }
-    if !is_word(toks, j, "on") {
+    if !s.is(j, "on") {
         return None;
     }
     j += 1;
-    if is_word(toks, j, "only") {
+    if s.is(j, "only") {
         j += 1;
     }
-    let (table, _) = qualified_name(toks, j)?;
-    Some(Hit {
+    let (table, _) = s.qualified_name(j)?;
+    Some(Raw {
         at: k,
-        line: toks[k].line,
         verb: "CREATE INDEX",
         index,
         table: Some(table),
@@ -765,53 +976,152 @@ fn create_index(toks: &[Token], k: usize) -> Option<Hit> {
     })
 }
 
-/// The table of `CREATE [OR REPLACE] [CONSTRAINT] TRIGGER ... ON table` or
-/// `DROP TRIGGER [IF EXISTS] name ON table`. `j` is the index after the verb.
-fn trigger_table(toks: &[Token], k: usize, mut j: usize) -> Option<String> {
-    if is_word(toks, k, "create") {
-        if is_word(toks, j, "or") && is_word(toks, j + 1, "replace") {
-            j += 2;
+/// The `DROP` forms that lock a table.
+///
+/// Dropping a table also drops the foreign-key triggers on each table it
+/// references. That takes ACCESS EXCLUSIVE on the referenced tables.
+fn drop(s: &Stmts, k: usize, history: &History, raws: &mut Vec<Raw>) {
+    match s.word(k + 1) {
+        Some("index") => {
+            let concurrent = s.is(k + 2, "concurrently");
+            let j = s.skip_if_exists(k + 2 + usize::from(concurrent));
+            raws.extend(s.name_list(j).into_iter().map(|index| Raw {
+                at: k,
+                verb: "DROP INDEX",
+                index: Some(index),
+                table: None,
+                kind: Kind::Index { concurrent },
+            }));
         }
-        if is_word(toks, j, "constraint") {
-            j += 1;
+        Some("table") => {
+            for table in s.name_list(s.skip_if_exists(k + 2)) {
+                raws.extend(
+                    referenced(history, &table).map(|t| Raw::lock(k, "DROP TABLE", Some(t))),
+                );
+                raws.push(Raw::lock(k, "DROP TABLE", Some(table)));
+            }
         }
+        Some("trigger") => raws.push(Raw::lock(k, "DROP TRIGGER", s.name_after(k + 2, "on"))),
+        Some("policy") => raws.push(Raw::lock(k, "DROP POLICY", s.name_after(k + 2, "on"))),
+        _ => {}
     }
-    if !is_word(toks, j, "trigger") {
-        return None;
-    }
-    while j < toks.len() && !is_punct(toks, j, ';') {
-        if is_word(toks, j, "on") {
-            return qualified_name(toks, j + 1).map(|(table, _)| table);
-        }
-        j += 1;
-    }
-    None
 }
 
-/// `REINDEX [(options)] {INDEX | TABLE} [CONCURRENTLY] name`.
-fn reindex(toks: &[Token], k: usize) -> Option<Hit> {
+/// The `ALTER` forms that lock a table.
+fn alter(s: &Stmts, k: usize, history: &History, raws: &mut Vec<Raw>) {
+    match s.word(k + 1) {
+        Some("table") => {
+            let Some(table) = s.statement_table(k) else {
+                return;
+            };
+            // A unique, primary-key or exclusion constraint builds its index
+            // under the ALTER TABLE lock, unless it adopts one with USING INDEX.
+            let builds_index = (k..s.end(k)).any(|j| {
+                s.is(j, "unique")
+                    || s.is(j, "exclude")
+                    || (s.is(j, "primary") && s.is(j + 1, "key"))
+            }) && !s.has_pair(k, "using", "index");
+            if builds_index {
+                raws.push(Raw {
+                    at: k,
+                    verb: "ALTER TABLE ADD UNIQUE, PRIMARY KEY or EXCLUDE",
+                    index: None,
+                    table: Some(table.clone()),
+                    kind: Kind::Index { concurrent: false },
+                });
+            }
+            if s.has_pair(k, "drop", "constraint") {
+                raws.extend(
+                    referenced(history, &table)
+                        .map(|t| Raw::lock(k, "ALTER TABLE DROP CONSTRAINT", Some(t))),
+                );
+            }
+            raws.push(Raw::lock(k, "ALTER TABLE", Some(table)));
+        }
+        Some("trigger") => raws.push(Raw::lock(k, "ALTER TRIGGER", s.name_after(k + 2, "on"))),
+        Some("policy") => raws.push(Raw::lock(k, "ALTER POLICY", s.name_after(k + 2, "on"))),
+        Some("index") => {
+            if let Some((index, _)) = s.qualified_name(s.skip_if_exists(k + 2)) {
+                raws.push(Raw {
+                    at: k,
+                    verb: "ALTER INDEX",
+                    index: Some(index),
+                    table: None,
+                    kind: Kind::Lock,
+                });
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The tables that `table`'s foreign keys reference.
+fn referenced<'h>(history: &'h History, table: &str) -> impl Iterator<Item = String> + 'h {
+    history.references.get(table).into_iter().flatten().cloned()
+}
+
+/// `VACUUM FULL [name, ...]` or `VACUUM (FULL, ...) [name, ...]`.
+///
+/// A bare `VACUUM FULL` rewrites every table, so its table is unknown.
+fn vacuum_full(s: &Stmts, k: usize) -> Vec<Raw> {
     let mut j = k + 1;
-    if is_punct(toks, j, '(') {
-        while j < toks.len() && !is_punct(toks, j, ')') {
+    let mut full = false;
+    if s.is_punct(j, '(') {
+        while j < s.toks.len() && !s.is_punct(j, ')') {
+            full |= s.is(j, "full");
+            j += 1;
+        }
+        j += 1;
+    } else {
+        while let Some(option @ ("full" | "freeze" | "verbose" | "analyze")) = s.word(j) {
+            full |= option == "full";
+            j += 1;
+        }
+    }
+    if !full {
+        return Vec::new();
+    }
+    let names = s.name_list(j);
+    if names.is_empty() {
+        return vec![Raw::lock(k, "VACUUM FULL", None)];
+    }
+    names
+        .into_iter()
+        .map(|t| Raw::lock(k, "VACUUM FULL", Some(t)))
+        .collect()
+}
+
+/// `REINDEX [(options)] {INDEX | TABLE | SCHEMA | DATABASE | SYSTEM} [CONCURRENTLY] name`.
+///
+/// The schema, database and system forms reach every table, so their table
+/// is unknown.
+fn reindex(s: &Stmts, k: usize) -> Option<Raw> {
+    let mut j = k + 1;
+    let mut concurrent = false;
+    if s.is_punct(j, '(') {
+        while j < s.toks.len() && !s.is_punct(j, ')') {
+            concurrent |= s.is(j, "concurrently");
             j += 1;
         }
         j += 1;
     }
-    let on_index = is_word(toks, j, "index");
-    if !on_index && !is_word(toks, j, "table") {
+    let scope = s.word(j)?;
+    if !["index", "table", "schema", "database", "system"].contains(&scope) {
         return None;
     }
     j += 1;
-    let concurrent = is_word(toks, j, "concurrently");
-    let (name, _) = qualified_name(toks, j + usize::from(concurrent))?;
-    let (index, table) = if on_index {
-        (Some(name), None)
-    } else {
-        (None, Some(name))
+    if s.is(j, "concurrently") {
+        concurrent = true;
+        j += 1;
+    }
+    let name = s.qualified_name(j).map(|(name, _)| name);
+    let (index, table) = match scope {
+        "index" => (name, None),
+        "table" => (None, name),
+        _ => (None, None),
     };
-    Some(Hit {
+    Some(Raw {
         at: k,
-        line: toks[k].line,
         verb: "REINDEX",
         index,
         table,
@@ -819,44 +1129,13 @@ fn reindex(toks: &[Token], k: usize) -> Option<Hit> {
     })
 }
 
-/// The token index of the first `lock_timeout` setting that bounds a wait.
+/// Whether the value at `k` is a non-zero timeout.
 ///
-/// Accepts `SET [LOCAL | SESSION] lock_timeout {= | TO} <value>` and
-/// `set_config('lock_timeout', <value>, <is_local>)`. A transaction-local
-/// setting does nothing outside a transaction, so it counts only inside one.
-fn first_lock_timeout(toks: &[Token], run_in_transaction: bool) -> Option<usize> {
-    (0..toks.len()).find(|&k| {
-        if is_word(toks, k, "set") {
-            let mut j = k + 1;
-            let local = is_word(toks, j, "local");
-            if local || is_word(toks, j, "session") {
-                j += 1;
-            }
-            if !is_word(toks, j, "lock_timeout") {
-                return false;
-            }
-            j += 1;
-            if is_punct(toks, j, '=') || is_word(toks, j, "to") {
-                j += 1;
-            }
-            (run_in_transaction || !local) && bounds_wait(toks, j)
-        } else if is_word(toks, k, "set_config")
-            && is_punct(toks, k + 1, '(')
-            && string(toks, k + 2) == Some("lock_timeout")
-            && is_punct(toks, k + 3, ',')
-        {
-            let local = is_word(toks, k + 6, "true");
-            (run_in_transaction || !local) && bounds_wait(toks, k + 4)
-        } else {
-            false
-        }
-    })
-}
-
-/// Whether the value at `k` is a non-zero timeout. `0` and `DEFAULT` disable it.
-fn bounds_wait(toks: &[Token], k: usize) -> bool {
-    let value = match toks.get(k).map(|t| &t.tok) {
-        Some(Tok::Str(s) | Tok::Word(s)) => s.trim(),
+/// `0` turns the timeout off. `DEFAULT` restores the server default, which is
+/// usually `0`, so it does not count either.
+fn bounds_wait(s: &Stmts, k: usize) -> bool {
+    let value = match s.toks.get(k).map(|t| &t.tok) {
+        Some(Tok::Str(v) | Tok::Word(v)) => v.trim(),
         _ => return false,
     };
     let number: String = value
@@ -961,9 +1240,17 @@ fn read_migration(tree: &'static str, dir: &Path) -> OnDisk {
     }
 }
 
-/// The index map for the real trees.
-fn real_index_tables(migrations: &[OnDisk]) -> BTreeMap<String, String> {
-    index_tables(migrations.iter().map(|m| m.sql.as_str()))
+/// Lint every migration on disk, each against the history before it.
+fn lint_all(migrations: &[OnDisk]) -> Vec<Vec<Finding>> {
+    let mut history = History::default();
+    migrations
+        .iter()
+        .map(|m| {
+            let findings = lint(&m.sql, m.run_in_transaction, &history);
+            analyse(&m.sql, &mut history);
+            findings
+        })
+        .collect()
 }
 
 fn grandfathered(name: &str, rule: Rule) -> bool {
@@ -972,10 +1259,13 @@ fn grandfathered(name: &str, rule: Rule) -> bool {
         .any(|(entry, entry_rule, _)| *entry == name && *entry_rule == rule)
 }
 
-/// Lint a synthetic migration with an index map built from `history` and it.
+/// Lint a synthetic migration after the synthetic migrations in `history`.
 fn lint_with_history(history: &[&str], sql: &str, run_in_transaction: bool) -> Vec<Finding> {
-    let map = index_tables(history.iter().copied().chain([sql]));
-    lint(sql, run_in_transaction, &map)
+    lint(
+        sql,
+        run_in_transaction,
+        &History::of(history.iter().copied()),
+    )
 }
 
 fn rules(findings: &[Finding]) -> Vec<Rule> {
@@ -1028,7 +1318,7 @@ fn concurrent_index_builds_and_cold_tables_pass() {
 #[test]
 fn a_table_created_in_the_same_migration_is_not_hot_yet() {
     // No session can hold a lock on a table that does not exist yet.
-    let sql = "CREATE TABLE IF NOT EXISTS harvest_signals (id BIGINT);\n\
+    let sql = "CREATE TABLE harvest_signals (id BIGINT);\n\
                CREATE INDEX idx_x ON harvest_signals (id);\n\
                ALTER TABLE harvest_signals ADD COLUMN y INT;\n";
     assert_eq!(lint_with_history(&[], sql, true), []);
@@ -1138,23 +1428,6 @@ fn a_zero_or_default_lock_timeout_does_not_count() {
 }
 
 #[test]
-fn a_transaction_local_timeout_does_not_count_outside_a_transaction() {
-    // `SET LOCAL` outside a transaction block only raises a warning.
-    for set in [
-        "SET LOCAL lock_timeout = '5s';",
-        "SELECT set_config('lock_timeout', '5s', true);",
-    ] {
-        let sql = format!("{set}\nALTER TABLE harvest_events ADD COLUMN x INT;");
-        let findings = lint_with_history(&[], &sql, false);
-        assert_eq!(rules(&findings), [Rule::LockTimeout], "{set}: {findings:?}");
-    }
-    let session = "SET lock_timeout = '5s';\nALTER TABLE harvest_events ADD COLUMN x INT;";
-    assert_eq!(lint_with_history(&[], session, false), []);
-}
-
-// ── Lexing ───────────────────────────────────────────────────────────────────
-
-#[test]
 fn comments_and_string_literals_are_not_statements() {
     let sql = "-- CREATE INDEX idx_x ON harvest_events (id);\n\
                /* ALTER TABLE harvest_events ADD COLUMN x INT; /* nested */ */\n\
@@ -1259,6 +1532,263 @@ fn an_annotation_that_allows_nothing_is_flagged() {
     assert_eq!(findings[0].line, 1);
 }
 
+// ── Edge cases ───────────────────────────────────────────────────────────────
+
+#[test]
+fn a_create_table_exempts_only_the_statements_after_it() {
+    // A table swap locks the live table before the new one exists.
+    for sql in [
+        "ALTER TABLE harvest_events RENAME TO harvest_events_old;\n\
+         CREATE TABLE harvest_events (id INT);",
+        "DROP TABLE harvest_events;\nCREATE TABLE harvest_events (id INT);",
+    ] {
+        let findings = lint_with_history(&[], sql, true);
+        assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}: {findings:?}");
+    }
+}
+
+#[test]
+fn create_table_if_not_exists_does_not_make_a_table_new() {
+    // The statement does nothing when the table already exists.
+    let sql = "CREATE TABLE IF NOT EXISTS harvest_events (id INT);\n\
+               ALTER TABLE harvest_events ADD COLUMN x INT;";
+    let findings = lint_with_history(&[], sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+}
+
+#[test]
+fn a_dollar_quoted_string_cannot_hide_the_sql_after_it() {
+    for body in ["it's a table", "a -- b", "see /* here"] {
+        let sql = format!(
+            "COMMENT ON TABLE harvest_schedules IS $${body}$$;\n\
+             ALTER TABLE harvest_events ADD COLUMN x INT;"
+        );
+        let findings = lint_with_history(&[], &sql, true);
+        assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}: {findings:?}");
+        assert_eq!(findings[0].line, 2, "{findings:?}");
+    }
+}
+
+#[test]
+fn a_lock_timeout_that_is_turned_off_again_does_not_count() {
+    for off in [
+        "SET LOCAL lock_timeout = 0;",
+        "SET lock_timeout TO DEFAULT;",
+        "RESET lock_timeout;",
+        "RESET ALL;",
+        "SELECT set_config('lock_timeout', '0', true);",
+    ] {
+        let sql = format!(
+            "SET LOCAL lock_timeout = '5s';\n{off}\nALTER TABLE harvest_events ADD COLUMN x INT;"
+        );
+        let findings = lint_with_history(&[], &sql, true);
+        assert_eq!(rules(&findings), [Rule::LockTimeout], "{off}: {findings:?}");
+    }
+    // Every lock needs the bound, not only the first one.
+    let sql = "SET LOCAL lock_timeout = '5s';\n\
+               ALTER TABLE harvest_events ADD COLUMN x INT;\n\
+               RESET lock_timeout;\n\
+               ALTER TABLE harvest_timers ADD COLUMN y INT;\n";
+    let findings = lint_with_history(&[], sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+    assert_eq!(findings[0].line, 4, "{findings:?}");
+}
+
+#[test]
+fn a_foreign_key_finding_names_the_line_where_its_statement_starts() {
+    let sql = "ALTER TABLE harvest_schedules\n    ADD CONSTRAINT fk FOREIGN KEY (e)\n    \
+               REFERENCES harvest_events (id);";
+    let findings = lint_with_history(&[], sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+    assert_eq!(findings[0].line, 1, "{findings:?}");
+
+    let annotated = format!("-- lock-safety: allow lock-timeout #1810 a reviewed reason\n{sql}");
+    assert_eq!(lint_with_history(&[], &annotated, true), []);
+}
+
+#[test]
+fn table_rewrites_and_wide_reindexes_are_flagged() {
+    for (sql, in_transaction) in [
+        ("CLUSTER harvest_events USING idx_x;", true),
+        ("CLUSTER;", true),
+        ("VACUUM FULL harvest_events;", false),
+        ("VACUUM (FULL, ANALYZE) harvest_events;", false),
+    ] {
+        let findings = lint_with_history(&[], sql, in_transaction);
+        assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}: {findings:?}");
+    }
+    assert_eq!(
+        lint_with_history(&[], "VACUUM ANALYZE harvest_events;", false),
+        []
+    );
+    for scope in ["SCHEMA public", "DATABASE app", "SYSTEM app"] {
+        let sql = format!("SET LOCAL lock_timeout = '5s';\nREINDEX {scope};");
+        let findings = lint_with_history(&[], &sql, true);
+        assert_eq!(
+            rules(&findings),
+            [Rule::BlockingIndex],
+            "{sql}: {findings:?}"
+        );
+    }
+}
+
+#[test]
+fn the_reindex_concurrently_option_form_is_concurrent() {
+    let sql = "REINDEX (CONCURRENTLY, VERBOSE) TABLE harvest_events;";
+    assert_eq!(lint_with_history(&[], sql, false), []);
+    assert_eq!(
+        rules(&lint_with_history(&[], sql, true)),
+        [Rule::ConcurrentlyInTransaction]
+    );
+}
+
+#[test]
+fn only_a_set_statement_sets_the_session_timeout() {
+    for set in [
+        "ALTER DATABASE app SET lock_timeout = '5s';",
+        "ALTER ROLE app SET lock_timeout = '5s';",
+    ] {
+        let sql = format!("{set}\nALTER TABLE harvest_events ADD COLUMN x INT;");
+        let findings = lint_with_history(&[], &sql, true);
+        assert_eq!(rules(&findings), [Rule::LockTimeout], "{set}: {findings:?}");
+    }
+    let in_block = "DO $$\nBEGIN\n    SET LOCAL lock_timeout = '5s';\n    \
+                    ALTER TABLE harvest_events ADD COLUMN x INT;\nEND $$;";
+    assert_eq!(lint_with_history(&[], in_block, true), []);
+}
+
+#[test]
+fn drop_index_resolves_against_earlier_definitions_only() {
+    let history = ["CREATE INDEX idx_a ON harvest_events (id);"];
+    let sql = "SET LOCAL lock_timeout = '5s';\nDROP INDEX idx_a;\n\
+               CREATE INDEX idx_a ON harvest_schedules (id);";
+    let findings = lint_with_history(&history, sql, true);
+    assert_eq!(rules(&findings), [Rule::BlockingIndex], "{findings:?}");
+    assert_eq!(findings[0].line, 2);
+}
+
+#[test]
+fn rule_policy_trigger_and_index_ddl_needs_a_lock_timeout() {
+    let history = ["CREATE INDEX idx_hot ON harvest_events (id);"];
+    for sql in [
+        "CREATE RULE r AS ON INSERT TO harvest_events DO INSTEAD NOTHING;",
+        "CREATE POLICY p ON harvest_events USING (true);",
+        "ALTER POLICY p ON harvest_events USING (true);",
+        "DROP POLICY IF EXISTS p ON harvest_events;",
+        "ALTER TRIGGER t ON harvest_events RENAME TO u;",
+        "ALTER INDEX idx_hot SET TABLESPACE fast;",
+    ] {
+        let findings = lint_with_history(&history, sql, true);
+        assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}: {findings:?}");
+    }
+}
+
+#[test]
+fn concurrently_inside_a_do_block_is_flagged() {
+    // Postgres rejects CONCURRENTLY inside a function or a DO block.
+    let sql = "DO $$\nBEGIN\n    CREATE INDEX CONCURRENTLY idx_x ON harvest_events (id);\nEND $$;";
+    let findings = lint_with_history(&[], sql, false);
+    assert_eq!(
+        rules(&findings),
+        [Rule::ConcurrentlyInTransaction],
+        "{findings:?}"
+    );
+    assert_eq!(findings[0].line, 3);
+}
+
+#[test]
+fn a_transaction_local_timeout_counts_in_a_non_transactional_batch() {
+    // Diesel sends the file as one batch, and Postgres runs a batch as one
+    // implicit transaction. `SET LOCAL` therefore holds until the batch ends.
+    let sql = "SET LOCAL lock_timeout = '5s';\nALTER TABLE harvest_events ADD COLUMN x INT;";
+    assert_eq!(lint_with_history(&[], sql, false), []);
+}
+
+#[test]
+fn concurrently_must_be_alone_in_a_non_transactional_file() {
+    for extra in [
+        "SET lock_timeout = '5s';",
+        "CREATE INDEX CONCURRENTLY idx_y ON harvest_events (y);",
+    ] {
+        let sql = format!("{extra}\nCREATE INDEX CONCURRENTLY idx_x ON harvest_events (x);");
+        let findings = lint_with_history(&[], &sql, false);
+        assert!(
+            rules(&findings).contains(&Rule::ConcurrentlyInTransaction),
+            "{sql}: {findings:?}"
+        );
+    }
+}
+
+#[test]
+fn the_claim_path_tables_are_hot() {
+    // Every claim reads these, so a waiting ACCESS EXCLUSIVE stalls claims.
+    for table in [
+        "harvest_activity_pauses",
+        "harvest_queue_pauses",
+        "harvest_rate_limit_buckets",
+        "harvest_shard_generation",
+        "harvest_workers",
+    ] {
+        let sql = format!("ALTER TABLE {table} ADD COLUMN x INT;");
+        let findings = lint_with_history(&[], &sql, true);
+        assert_eq!(
+            rules(&findings),
+            [Rule::LockTimeout],
+            "{table}: {findings:?}"
+        );
+    }
+}
+
+#[test]
+fn dropping_a_foreign_key_locks_the_table_it_references() {
+    // Postgres drops the foreign-key triggers on the referenced table too.
+    let history =
+        ["CREATE TABLE harvest_child (exec_id UUID REFERENCES harvest_workflow_executions (id));"];
+    for sql in [
+        "DROP TABLE harvest_child;",
+        "ALTER TABLE harvest_child DROP CONSTRAINT harvest_child_exec_id_fkey;",
+    ] {
+        let findings = lint_with_history(&history, sql, true);
+        assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}: {findings:?}");
+        assert!(
+            findings[0].detail.contains("harvest_workflow_executions"),
+            "{findings:?}"
+        );
+    }
+    // A table with no foreign key to a hot table locks nothing hot.
+    assert_eq!(
+        lint_with_history(&history, "DROP TABLE harvest_schedules;", true),
+        []
+    );
+}
+
+#[test]
+fn a_unique_constraint_on_a_hot_table_is_a_blocking_index_build() {
+    let set = "SET LOCAL lock_timeout = '5s';\n";
+    for add in [
+        "ALTER TABLE harvest_events ADD CONSTRAINT u UNIQUE (id);",
+        "ALTER TABLE harvest_events ADD PRIMARY KEY (id);",
+        "ALTER TABLE harvest_events ADD COLUMN k INT UNIQUE;",
+    ] {
+        let findings = lint_with_history(&[], &format!("{set}{add}"), true);
+        assert_eq!(
+            rules(&findings),
+            [Rule::BlockingIndex],
+            "{add}: {findings:?}"
+        );
+    }
+    let adopt = "ALTER TABLE harvest_events ADD CONSTRAINT u UNIQUE USING INDEX idx_u;";
+    assert_eq!(lint_with_history(&[], &format!("{set}{adopt}"), true), []);
+}
+
+#[test]
+fn a_partition_of_a_hot_table_locks_the_parent() {
+    let sql = "CREATE TABLE harvest_events_p1 PARTITION OF harvest_events \
+               FOR VALUES FROM (1) TO (2);";
+    let findings = lint_with_history(&[], sql, true);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+}
+
 // ── The real trees ───────────────────────────────────────────────────────────
 
 /// RED for issue #1810: the lint flags the index rebuild in `20260915231809`.
@@ -1270,14 +1800,17 @@ fn an_annotation_that_allows_nothing_is_flagged() {
 fn the_20260915231809_index_rebuild_is_flagged_and_grandfathered() {
     const NAME: &str = "20260915231809_harvest_migrated_seal_terminal_at";
     let migrations = load_migrations();
-    let map = real_index_tables(&migrations);
-    let migration = migrations
+    let all = lint_all(&migrations);
+    let at = migrations
         .iter()
-        .find(|m| m.name == NAME)
+        .position(|m| m.name == NAME)
         .expect("the migration issue #1810 names is on disk");
-    assert!(migration.in_scope(), "{NAME} must stay inside the cutoff");
+    assert!(
+        migrations[at].in_scope(),
+        "{NAME} must stay inside the cutoff"
+    );
 
-    let findings = lint(&migration.sql, migration.run_in_transaction, &map);
+    let findings = &all[at];
     let index_findings: Vec<&Finding> = findings
         .iter()
         .filter(|f| f.rule == Rule::BlockingIndex)
@@ -1293,10 +1826,7 @@ fn the_20260915231809_index_rebuild_is_flagged_and_grandfathered() {
             .all(|f| f.detail.contains("harvest_workflow_executions")),
         "{index_findings:?}"
     );
-    assert!(
-        rules(&findings).contains(&Rule::LockTimeout),
-        "{findings:?}"
-    );
+    assert!(rules(findings).contains(&Rule::LockTimeout), "{findings:?}");
 
     for rule in [Rule::BlockingIndex, Rule::LockTimeout] {
         assert!(
@@ -1312,10 +1842,10 @@ fn the_20260915231809_index_rebuild_is_flagged_and_grandfathered() {
 #[test]
 fn migrations_after_the_cutoff_are_lock_safe() {
     let migrations = load_migrations();
-    let map = real_index_tables(&migrations);
+    let all = lint_all(&migrations);
     let mut failures = Vec::new();
-    for m in migrations.iter().filter(|m| m.in_scope()) {
-        for f in lint(&m.sql, m.run_in_transaction, &map) {
+    for (m, findings) in migrations.iter().zip(all).filter(|(m, _)| m.in_scope()) {
+        for f in findings {
             if !grandfathered(&m.name, f.rule) {
                 failures.push(format!(
                     "{}/{}/up.sql:{}: [{}] {}",
@@ -1368,15 +1898,14 @@ fn grandfather_entries_are_shipped_in_scope_and_unique() {
 #[test]
 fn grandfather_entries_are_not_stale() {
     let migrations = load_migrations();
-    let map = real_index_tables(&migrations);
+    let all = lint_all(&migrations);
     for (name, rule, _) in GRANDFATHERED {
-        let m = migrations
+        let at = migrations
             .iter()
-            .find(|m| m.name == *name)
+            .position(|m| m.name == *name)
             .unwrap_or_else(|| panic!("{name} is not on disk"));
-        let findings = lint(&m.sql, m.run_in_transaction, &map);
         assert!(
-            rules(&findings).contains(rule),
+            rules(&all[at]).contains(rule),
             "{name} no longer breaks {}. Remove its GRANDFATHERED entry.",
             rule.id()
         );
@@ -1385,39 +1914,53 @@ fn grandfather_entries_are_not_stale() {
 
 // ── CI wiring and docs ───────────────────────────────────────────────────────
 
-/// The lint must run in the ungated `lint` job, with no `if:` condition.
+/// The lint must run in an ungated step of the `lint` job.
+///
+/// The step must be one plain `cargo test` of the whole module. A gated,
+/// soft-failing, chained or partial run does not count.
 #[test]
 fn the_lint_runs_in_the_ci_lint_job() {
-    const FILTER: &str = "--test integration migration_lock_safety::";
-    let workflow = std::fs::read_to_string(workspace_root().join(".github/workflows/ci.yml"))
-        .expect("ci.yml is readable")
-        .replace("\r\n", "\n");
-    let lint_start = workflow.find("\n  lint:").expect("ci.yml has a lint job");
-    let test_start = workflow.find("\n  test:").expect("ci.yml has a test job");
-    let block = &workflow[lint_start..test_start];
-
-    let at = block
-        .find(FILTER)
-        .unwrap_or_else(|| panic!("the lint job must run `{FILTER}`"));
-    let step_start = block[..at]
-        .rfind("\n      - ")
-        .expect("the run line is in a step");
-    let step_end = block[at..]
-        .find("\n      - ")
-        .map_or(block.len(), |end| at + end);
-    let stanza = &block[step_start..step_end];
+    let doc = parse_workflow(".github/workflows/ci.yml");
+    let steps = doc
+        .get("jobs")
+        .and_then(|jobs| jobs.get("lint"))
+        .and_then(|lint| lint.get("steps"))
+        .and_then(serde_yaml::Value::as_sequence)
+        .expect("ci.yml has a lint job with steps");
+    let runs = steps
+        .iter()
+        .filter(|step| ungated(step))
+        .filter_map(|step| step.get("run").and_then(serde_yaml::Value::as_str))
+        .any(|run| {
+            let words: Vec<&str> = run.split_whitespace().collect();
+            run.trim_start().starts_with("cargo test ")
+                && words
+                    .windows(3)
+                    .any(|w| w == ["--test", "integration", "migration_lock_safety::"])
+                && !SHELL_OPERATORS.iter().any(|op| run.trim().contains(op))
+                && !words
+                    .iter()
+                    .any(|word| NO_FULL_RUN_FLAGS.iter().any(|flag| word.starts_with(flag)))
+        });
     assert!(
-        !stanza.contains("\n        if:"),
-        "the lock-safety step must run unconditionally:\n{stanza}"
+        runs,
+        "an ungated step of the lint job must run \
+         `cargo test ... --test integration migration_lock_safety::`"
     );
+}
+
+/// The author guide, with line endings normalised for a Windows checkout.
+fn read_guide() -> String {
+    let path = workspace_root().join("docs/upgrading/online-migrations.md");
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+        .replace("\r\n", "\n")
 }
 
 /// The author guide names every hot table and every rule the lint enforces.
 #[test]
 fn the_author_guide_matches_the_lint() {
-    let path = workspace_root().join("docs/upgrading/online-migrations.md");
-    let guide =
-        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let guide = read_guide();
     for table in HOT_TABLES {
         assert!(
             guide.contains(&format!("`{table}`")),
@@ -1447,9 +1990,7 @@ fn the_author_guide_matches_the_lint() {
 /// annotation template is skipped.
 #[test]
 fn the_author_guide_examples_pass_the_lint() {
-    let path = workspace_root().join("docs/upgrading/online-migrations.md");
-    let guide =
-        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let guide = read_guide();
     let examples: Vec<&str> = guide
         .split("```sql\n")
         .skip(1)
