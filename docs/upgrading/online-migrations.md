@@ -33,7 +33,8 @@ A waiting `ACCESS EXCLUSIVE` lock on any of them stalls the fleet.
 
 A table that the same migration creates is not hot after its `CREATE TABLE`.
 No session can hold a lock on it yet. The exemption needs a create that surely
-runs: not `IF NOT EXISTS`, not inside a branch, and not in a function body.
+runs: not `IF NOT EXISTS`, not inside a branch, not in a function body, and
+not followed by a `ROLLBACK`.
 The lock must name the table exactly as the create does, schema included.
 
 ## 2. The rules

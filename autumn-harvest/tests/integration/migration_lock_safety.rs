@@ -60,8 +60,11 @@ const HOT_TABLES: &[&str] = &[
 const MIGRATION_TREES: &[&str] = &[
     "autumn-harvest/migrations",
     "autumn-harvest-plugin/migrations/harvest",
-    "autumn-harvest-plugin/migrations/app",
+    APP_TREE,
 ];
+
+/// The one tree that targets the application database, not the Harvest one.
+const APP_TREE: &str = "autumn-harvest-plugin/migrations/app";
 
 /// The comment prefix of an allow annotation.
 const ANNOTATION_PREFIX: &str = "lock-safety:";
@@ -1007,6 +1010,13 @@ fn analyse(sql: &str, history: &mut History) -> Analysis {
         }
     }
 
+    // A rollback may undo a `CREATE TABLE` before it, so a create followed
+    // by any rollback no longer exempts the table.
+    let rollbacks: Vec<usize> = (0..toks.len())
+        .filter(|&k| s.starts[k] == k && toks[k].depth == 0)
+        .filter(|&k| s.is(k, "rollback") || s.is(k, "abort"))
+        .collect();
+    created.retain(|_, made| !rollbacks.iter().any(|r| *r > *made));
     let hits = resolve(raws, &s, &unconditional, &created, history);
 
     let statement_count = (0..toks.len())
@@ -1316,6 +1326,15 @@ fn alter(s: &Stmts, k: usize, history: &History, raws: &mut Vec<Raw>) {
                         .map(|t| Raw::lock(k, "ALTER TABLE DROP CONSTRAINT", Some(t))),
                 );
             }
+            // ATTACH and DETACH PARTITION also lock the partition they name.
+            for j in k..s.end(k) {
+                if (s.is(j, "attach") || s.is(j, "detach"))
+                    && s.is(j + 1, "partition")
+                    && let Some((partition, _)) = s.qualified_name(j + 2)
+                {
+                    raws.push(Raw::lock(k, "ALTER TABLE ... PARTITION", Some(partition)));
+                }
+            }
             raws.push(Raw::lock(k, "ALTER TABLE", Some(table)));
         }
         Some("trigger") => raws.push(Raw::lock(k, "ALTER TRIGGER", s.name_after(k + 2, "on"))),
@@ -1366,7 +1385,21 @@ fn vacuum_full(s: &Stmts, k: usize) -> Vec<Raw> {
     if !full {
         return Vec::new();
     }
-    let names = s.name_list(j);
+    // Each table may carry a column list: `VACUUM FULL t (a, b), u`.
+    let mut names = Vec::new();
+    while let Some((name, mut next)) = s.qualified_name(j) {
+        names.push(name);
+        if s.is_punct(next, '(') {
+            while next < s.toks.len() && !s.is_punct(next, ')') {
+                next += 1;
+            }
+            next += 1;
+        }
+        if !s.is_punct(next, ',') {
+            break;
+        }
+        j = next + 1;
+    }
     if names.is_empty() {
         return vec![Raw::lock(k, "VACUUM FULL", None)];
     }
@@ -1526,13 +1559,21 @@ fn read_migration(tree: &'static str, dir: &Path) -> OnDisk {
 }
 
 /// Lint every migration on disk, each against the history before it.
+///
+/// The app tree targets its own database, so it keeps its own history.
 fn lint_all(migrations: &[OnDisk]) -> Vec<Vec<Finding>> {
-    let mut history = History::default();
+    let mut harvest = History::default();
+    let mut app = History::default();
     migrations
         .iter()
         .map(|m| {
-            let findings = lint(&m.sql, m.run_in_transaction, &history);
-            analyse(&m.sql, &mut history);
+            let history = if m.tree == APP_TREE {
+                &mut app
+            } else {
+                &mut harvest
+            };
+            let findings = lint(&m.sql, m.run_in_transaction, history);
+            analyse(&m.sql, history);
             findings
         })
         .collect()
@@ -2321,6 +2362,67 @@ fn a_renamed_table_keeps_its_foreign_keys() {
         let findings = lint_with_history(&history, sql, true);
         assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}: {findings:?}");
     }
+}
+
+#[test]
+fn attach_and_detach_partition_lock_the_partition() {
+    for sql in [
+        "ALTER TABLE harvest_schedules ATTACH PARTITION harvest_events FOR VALUES FROM (1) TO (2);",
+        "ALTER TABLE harvest_schedules DETACH PARTITION harvest_events;",
+    ] {
+        let findings = lint_with_history(&[], sql, true);
+        assert_eq!(rules(&findings), [Rule::LockTimeout], "{sql}: {findings:?}");
+        assert!(
+            findings[0].detail.contains("harvest_events"),
+            "{findings:?}"
+        );
+    }
+}
+
+#[test]
+fn a_rollback_undoes_a_new_table() {
+    for undo in ["ROLLBACK;", "ROLLBACK TO SAVEPOINT s;"] {
+        let sql = format!(
+            "BEGIN;\nSAVEPOINT s;\nCREATE TEMP TABLE harvest_events (id INT);\n{undo}\n\
+             ALTER TABLE harvest_events ADD COLUMN x INT;"
+        );
+        let findings = lint_with_history(&[], &sql, false);
+        assert_eq!(
+            rules(&findings),
+            [Rule::LockTimeout],
+            "{undo}: {findings:?}"
+        );
+    }
+}
+
+#[test]
+fn a_vacuum_list_continues_past_a_column_list() {
+    let sql = "VACUUM FULL harvest_schedules (id, name), harvest_events;";
+    let findings = lint_with_history(&[], sql, false);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+    assert!(
+        findings[0].detail.contains("harvest_events"),
+        "{findings:?}"
+    );
+}
+
+#[test]
+fn the_app_database_keeps_its_own_index_history() {
+    let app = OnDisk {
+        tree: APP_TREE,
+        name: "20260101000000_app".to_string(),
+        sql: "CREATE INDEX idx_shared ON harvest_schedules (id);".to_string(),
+        run_in_transaction: true,
+    };
+    let core = OnDisk {
+        tree: "autumn-harvest/migrations",
+        name: "20260102000000_core".to_string(),
+        sql: "SET LOCAL lock_timeout = '5s';\nDROP INDEX idx_shared;".to_string(),
+        run_in_transaction: true,
+    };
+    let all = lint_all(&[app, core]);
+    // The core database never saw the app index, so its table is unknown.
+    assert_eq!(rules(&all[1]), [Rule::BlockingIndex], "{all:?}");
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────
