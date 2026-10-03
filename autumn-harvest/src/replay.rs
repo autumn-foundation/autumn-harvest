@@ -745,6 +745,14 @@ pub struct HistoryMatcher {
     /// a `WorkflowRedriven` (#510) is not a tail — that case keeps its own,
     /// redrive-anchored transparency rule.
     terminal_failure_tail: Option<usize>,
+    /// Signal names that a non-blocking claim probed while no unconsumed
+    /// command event bounded its scan (issue #1798).
+    ///
+    /// Such a probe sees every signal recorded up to the end of history. A
+    /// cold replay of a longer history lets the same probe see later signals
+    /// too. A resident workflow therefore must not resume a wait for one of
+    /// these names, because the probe could read the new signal differently.
+    frontier_probed_signals: HashSet<String>,
 }
 
 impl HistoryMatcher {
@@ -871,6 +879,38 @@ impl HistoryMatcher {
             patch_ids_recorded_this_cycle: HashSet::new(),
             timer_scan_stopped_at_command: false,
             terminal_failure_tail,
+            frontier_probed_signals: HashSet::new(),
+        }
+    }
+
+    /// Appends events that a resident workflow consumed live (issue #1798).
+    ///
+    /// A warm decision sends the new result to the parked future instead of
+    /// replaying it. The matcher still records the events as consumed and
+    /// moves its cursor past them. Its position, event count and history
+    /// scans then match a cold replay of the full history.
+    pub(crate) fn append_consumed(&mut self, events: &[WorkflowEvent]) {
+        for event in events {
+            self.consumed_out_of_order_events.insert(self.events.len());
+            self.events.push(event.clone());
+        }
+        self.cursor = self.events.len();
+    }
+
+    /// Whether a non-blocking claim probed `signal_name` with a scan window
+    /// that reached the end of history (issue #1798).
+    #[must_use]
+    pub(crate) fn signal_probed_at_frontier(&self, signal_name: &str) -> bool {
+        self.frontier_probed_signals.contains(signal_name)
+    }
+
+    /// Records a non-blocking probe of `signal_name` when no unconsumed
+    /// command event bounds its scan window (issue #1798).
+    fn note_signal_probe(&mut self, signal_name: &str) {
+        let bounded = (self.cursor..self.events.len())
+            .any(|index| !self.is_consumed(index) && Self::is_command_event(&self.events[index]));
+        if !bounded {
+            self.frontier_probed_signals.insert(signal_name.to_string());
         }
     }
 
@@ -4450,6 +4490,7 @@ impl HistoryMatcher {
     /// handler names, not just within one name.
     pub(crate) fn claim_pending_signal(&mut self, signal_name: &str) -> Vec<(usize, Value)> {
         self.prepare_match();
+        self.note_signal_probe(signal_name);
 
         let (matched, remaining): (VecDeque<_>, VecDeque<_>) =
             std::mem::take(&mut self.pending_signals)
@@ -4498,6 +4539,7 @@ impl HistoryMatcher {
     /// versa) will not re-deliver it.
     pub(crate) fn try_claim_pending_signal(&mut self, signal_name: &str) -> Option<Value> {
         self.prepare_match();
+        self.note_signal_probe(signal_name);
         let index = self.pending_signals.iter().position(|(name, _, idx)| {
             name == signal_name && !self.race_reserved_signal_events.contains(idx)
         })?;

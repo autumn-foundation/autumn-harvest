@@ -402,6 +402,10 @@ pub mod replication;
 #[cfg(feature = "db")]
 pub mod reset;
 /// Resident workflow state between decisions (issue #1798).
+///
+/// Only the `testing` feature can create a [`resident::ResidentWorkflow`].
+/// Other builds hide the module from the docs.
+#[cfg_attr(not(feature = "testing"), doc(hidden))]
 pub mod resident;
 pub mod retention;
 /// Per-activity-type retry budget that bounds retry load (issue #1793).

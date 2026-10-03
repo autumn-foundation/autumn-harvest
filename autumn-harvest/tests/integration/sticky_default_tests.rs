@@ -17,6 +17,10 @@
 //! 7. A delta that the resident path cannot read falls back to a cold
 //!    replay, and the run still completes.
 //! 8. With sticky routing off, every decision replays from the top.
+//! 9. With resident workflows off, the cache still hits, but every decision
+//!    replays from the top.
+//! 10. LRU eviction drops the resident workflow. The next decision is a miss
+//!     and replays cold.
 //!
 //! A queue-level test also proves which rows the shutdown release touches.
 //! Each test uses its own queue and worker ids, so the tests can share one
@@ -256,6 +260,34 @@ fn cold_workflow<'a>(
     two_signal_workflow(ctx, input)
 }
 
+const OFF_WORKFLOW: &str = "sticky_default_off_wf";
+
+/// Body starts of `off_workflow`. Only one test runs it.
+static OFF_BODY_STARTS: AtomicU64 = AtomicU64::new(0);
+
+/// `two_signal_workflow` with a body-start counter, for the switch test.
+fn off_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    OFF_BODY_STARTS.fetch_add(1, Ordering::SeqCst);
+    two_signal_workflow(ctx, input)
+}
+
+const EVICT_WORKFLOW: &str = "sticky_default_evict_wf";
+
+/// Body starts of `evict_workflow`. Only one test runs it.
+static EVICT_BODY_STARTS: AtomicU64 = AtomicU64::new(0);
+
+/// `two_signal_workflow` with a body-start counter, for the eviction test.
+fn evict_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    EVICT_BODY_STARTS.fetch_add(1, Ordering::SeqCst);
+    two_signal_workflow(ctx, input)
+}
+
 fn echo_activity<'a>(
     _ctx: &'a ActivityContext,
     input: serde_json::Value,
@@ -326,6 +358,8 @@ fn build_worker(
             info_for(RESIDENT_WORKFLOW, resident_workflow),
             info_for(COUNTED_WORKFLOW, counted_workflow),
             info_for(COLD_WORKFLOW, cold_workflow),
+            info_for(OFF_WORKFLOW, off_workflow),
+            info_for(EVICT_WORKFLOW, evict_workflow),
         ])
         .activities(vec![slow_activity_info(), echo_activity_info()])
         .telemetry(TelemetryConfig {
@@ -1085,4 +1119,121 @@ async fn wait_unclaimed_after(
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+}
+
+/// `with_resident_workflows(false)` keeps the event cache but replays every
+/// decision (issue #1798).
+#[tokio::test]
+async fn resident_workflows_off_keeps_the_cache_but_replays_every_decision() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let mut conn = connect(&url).await;
+    let queue = unique_id("off-q");
+    OFF_BODY_STARTS.store(0, Ordering::SeqCst);
+
+    let counts = Arc::new(CacheCounts::default());
+    let config = WorkerConfig::default().with_resident_workflows(false);
+    let worker = build_worker(&queue, &unique_id("off-a"), Arc::clone(&counts), config);
+    let handle = spawn(&worker, &pool);
+
+    let exec_id = ExecutionId::new();
+    let workflow_id = unique_id("off-wf");
+    start_or_load_workflow_execution(
+        &mut conn,
+        start_workflow(
+            OFF_WORKFLOW,
+            exec_id,
+            &workflow_id,
+            &queue,
+            serde_json::json!({}),
+        ),
+        None,
+    )
+    .await
+    .expect("start workflow");
+    wait_parked_after(&mut conn, exec_id, &counts, 1).await;
+    signal(&mut conn, exec_id, "first").await;
+    wait_parked_after(&mut conn, exec_id, &counts, 2).await;
+    signal(&mut conn, exec_id, "second").await;
+    wait_for_execution_state_with_timeout(&url, exec_id, "COMPLETED", Duration::from_secs(30))
+        .await;
+
+    assert_eq!(counts.misses(), 1, "only decision 1 is a cold load");
+    assert_eq!(counts.hits(), 2, "the event cache still hits");
+    assert_eq!(
+        AtomicU64::load(&OFF_BODY_STARTS, Ordering::SeqCst),
+        3,
+        "with resident workflows off, every decision replays the body"
+    );
+
+    worker.shutdown();
+    let _ = tokio::time::timeout(Duration::from_secs(10), handle).await;
+}
+
+/// LRU pressure evicts an entry with its resident workflow. The next decision
+/// of that run is a miss and replays cold, as `docs/sticky-routing.md` says.
+#[tokio::test]
+async fn lru_eviction_drops_the_resident_workflow_and_counts_a_miss() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let mut conn = connect(&url).await;
+    let queue = unique_id("evict-q");
+    EVICT_BODY_STARTS.store(0, Ordering::SeqCst);
+
+    let counts = Arc::new(CacheCounts::default());
+    let config = WorkerConfig {
+        workflow_cache_size: 1,
+        ..WorkerConfig::default()
+    };
+    let worker = build_worker(&queue, &unique_id("evict-a"), Arc::clone(&counts), config);
+    let handle = spawn(&worker, &pool);
+
+    // A parks first, then B. The one-entry cache then holds only B.
+    let a = ExecutionId::new();
+    let a_id = unique_id("evict-a-wf");
+    start_or_load_workflow_execution(
+        &mut conn,
+        start_workflow(EVICT_WORKFLOW, a, &a_id, &queue, serde_json::json!({})),
+        None,
+    )
+    .await
+    .expect("start A");
+    wait_parked_after(&mut conn, a, &counts, 1).await;
+    let b = ExecutionId::new();
+    let b_id = unique_id("evict-b-wf");
+    start_or_load_workflow_execution(
+        &mut conn,
+        start_workflow(EVICT_WORKFLOW, b, &b_id, &queue, serde_json::json!({})),
+        None,
+    )
+    .await
+    .expect("start B");
+    wait_parked_after(&mut conn, b, &counts, 2).await;
+    assert_eq!(counts.misses(), 2, "both first decisions are cold loads");
+
+    // Each run's next decision finds the other run in the cache.
+    for exec_id in [a, b] {
+        signal(&mut conn, exec_id, "first").await;
+        let decisions = counts.decisions() + 1;
+        wait_parked_after(&mut conn, exec_id, &counts, decisions).await;
+        signal(&mut conn, exec_id, "second").await;
+        wait_for_execution_state_with_timeout(&url, exec_id, "COMPLETED", Duration::from_secs(30))
+            .await;
+    }
+
+    // A: miss, miss (evicted by B), hit. B: miss, miss (evicted by A), hit.
+    assert_eq!(
+        counts.misses(),
+        4,
+        "each first decision and each eviction is a miss"
+    );
+    assert_eq!(counts.hits(), 2, "each final decision is a warm hit");
+    assert_eq!(
+        AtomicU64::load(&EVICT_BODY_STARTS, Ordering::SeqCst),
+        4,
+        "an evicted run replays cold once, then resumes warm"
+    );
+
+    worker.shutdown();
+    let _ = tokio::time::timeout(Duration::from_secs(10), handle).await;
 }
