@@ -191,7 +191,9 @@ fn lint(
     };
 
     let mut findings = Vec::new();
-    let mut first_lock: Option<&Hit> = None;
+    // `statements` returns hits in source order, so the first hot hit is the
+    // first lock.
+    let mut first_lock: Option<(&Hit, &str)> = None;
     let hits = statements(&toks);
     for hit in &hits {
         let table = hit.table.as_deref().or_else(|| {
@@ -201,6 +203,7 @@ fn lint(
                 .map(String::as_str)
         });
         let hot = is_hot(table);
+        let table = table.unwrap_or("an index that no migration creates");
         match hit.kind {
             Kind::Index { concurrent: true } => {
                 if run_in_transaction {
@@ -220,34 +223,25 @@ fn lint(
                 rule: Rule::BlockingIndex,
                 line: hit.line,
                 detail: format!(
-                    "plain {} on {} blocks the table for the whole build",
-                    hit.verb,
-                    table.unwrap_or("an index that no migration creates")
+                    "plain {} on {table} blocks the table for the whole build",
+                    hit_label(hit)
                 ),
             }),
             _ => {}
         }
-        if hot && first_lock.is_none_or(|first| hit.at < first.at) {
-            first_lock = Some(hit);
+        if hot && first_lock.is_none() {
+            first_lock = Some((hit, table));
         }
     }
 
-    if let Some(lock) = first_lock {
+    if let Some((lock, table)) = first_lock {
         if first_lock_timeout(&toks, run_in_transaction).is_none_or(|at| at > lock.at) {
             findings.push(Finding {
                 rule: Rule::LockTimeout,
                 line: lock.line,
                 detail: format!(
-                    "{} locks {} with no non-zero lock_timeout set before it",
-                    hit_label(lock),
-                    lock.table
-                        .as_deref()
-                        .or_else(|| lock
-                            .index
-                            .as_ref()
-                            .and_then(|i| index_tables.get(i))
-                            .map(String::as_str))
-                        .unwrap_or("an unknown table")
+                    "{} locks {table} with no non-zero lock_timeout set before it",
+                    hit_label(lock)
                 ),
             });
         }
