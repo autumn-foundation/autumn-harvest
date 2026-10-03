@@ -143,9 +143,11 @@ After the clear, the guard does these steps once per abort:
 - It increments `harvest.build.ramp_aborted{queue, reason}`.
 - It logs a warning.
 
-Many replicas can run the guard. A replica audits an abort only when it did
-not lose the clear on the first pool that holds the ramp. Of many replicas,
-only that winner audits.
+Many replicas can run the guard. A replica reports an abort only after it
+cleared a pool itself, so a failed clear never reports a change that did not
+happen. A replica that lost the clear on the first pool that holds the ramp
+does not report, because another replica owns that report. Normally one
+replica audits each abort.
 
 ## Failure behaviour
 
@@ -158,9 +160,10 @@ The guard fails safe: when it cannot read, it does not abort.
 - A cancel stops a pass during its read. A pass that has started to clear
   runs to its end, so a clear and its audit row are not split.
 - A clear that fails on one pool stays pending. The next pass of the same
-  guard retries it with no new verdict and writes no new audit row. The audit
-  row of such an abort has status `failed` and names the pending pools by
-  index.
+  guard retries it with no new verdict. The audit row of such an abort has
+  status `failed` and names the pending pools by index.
+- When no clear of a pass succeeds, the guard reports nothing yet. It reports
+  the abort when a retry clears a pool.
 - A failed audit write logs a warning and does not undo the clear.
 
 ## `build_id` metric label

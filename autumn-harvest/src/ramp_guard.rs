@@ -687,6 +687,77 @@ async fn record_abort(
     }
 }
 
+/// What a guard pass does with an abort after its clears.
+#[cfg(feature = "db")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Disposition {
+    /// This guard cleared a pool, so it reports the abort now.
+    Report,
+    /// No pool cleared yet, but a clear failed. The guard reports the abort
+    /// when a retry clears a pool.
+    Defer,
+    /// Another replica or an operator changed the ramp first. This guard
+    /// does not report the abort.
+    Drop,
+}
+
+/// Decide what to do with an abort from the outcomes of its clears.
+///
+/// `outcomes` is in pool order. On a first attempt, a lost clear on the
+/// first pool means that another replica owns the report. A guard reports
+/// an abort only when it cleared a pool itself. A failed clear therefore
+/// never reports a change that did not happen.
+#[cfg(feature = "db")]
+fn disposition(outcomes: &[ClearOutcome], first_attempt: bool) -> Disposition {
+    let lost_first = outcomes.first() == Some(&ClearOutcome::Lost);
+    if first_attempt && lost_first {
+        Disposition::Drop
+    } else if outcomes.contains(&ClearOutcome::Cleared) {
+        Disposition::Report
+    } else if outcomes.contains(&ClearOutcome::Failed) {
+        Disposition::Defer
+    } else {
+        Disposition::Drop
+    }
+}
+
+/// Log, count and audit one abort.
+#[cfg(feature = "db")]
+async fn report_abort(
+    abort: &RampAbort,
+    audit_pool: &crate::worker::DbPool,
+    metrics: Option<&dyn crate::telemetry::MetricsRecorder>,
+    failed_pools: &[usize],
+    bound: Duration,
+) {
+    tracing::warn!(
+        queue = %abort.queue,
+        base_build = %abort.base_build_id,
+        target_build = %abort.target_build_id,
+        reason = abort.reason.as_str(),
+        target_rate = abort.target_rate,
+        target_lower_bound = abort.target_lower_bound,
+        base_rate = abort.base_rate,
+        incomplete = abort.incomplete,
+        "ramp guard aborted a build ramp"
+    );
+    if let Some(m) = metrics {
+        m.record_build_ramp_aborted(&abort.queue, abort.reason.as_str());
+    }
+    record_abort(audit_pool, abort, failed_pools, bound).await;
+}
+
+/// The pool clears that an abort still needs.
+#[cfg(feature = "db")]
+#[derive(Debug)]
+struct PendingAbort {
+    /// The pool index and the step of each pool that did not clear.
+    steps: Vec<(usize, chrono::DateTime<chrono::Utc>)>,
+    /// The abort, while no clear of this guard has succeeded yet. The guard
+    /// reports it when a retry clears a pool.
+    unreported: Option<RampAbort>,
+}
+
 /// The build ramp guard, with the clears that it must still retry.
 ///
 /// [`run_ramp_guard`] keeps one guard for its whole life. Use
@@ -695,8 +766,8 @@ async fn record_abort(
 #[derive(Debug)]
 pub struct RampGuard {
     config: RampGuardConfig,
-    /// Aborted ramps with a pool that did not clear, by pool index and step.
-    pending: std::collections::BTreeMap<RampKey, Vec<(usize, chrono::DateTime<chrono::Utc>)>>,
+    /// Aborted ramps with a pool that did not clear.
+    pending: std::collections::BTreeMap<RampKey, PendingAbort>,
 }
 
 #[cfg(feature = "db")]
@@ -725,17 +796,17 @@ impl RampGuard {
     ///
     /// `pools` holds one pool per physical database, in a fixed order. The
     /// pass first retries the clears that an earlier pass could not finish.
-    /// A retry needs no new verdict, and it writes no new audit row.
+    /// A retry needs no new verdict.
     ///
     /// The pass then reads every ramp and its step counts, and it aborts each
     /// ramp with an abort verdict. All reads of one pass must end within the
     /// bound. A failed, slow or cancelled read aborts nothing.
     ///
-    /// The pass audits an abort only when it did not lose the clear on the
-    /// first pool that holds the ramp. Of many replicas, only that winner
-    /// audits. For each audited abort, the pass writes one audit row to
-    /// `audit_pool`. It also counts the abort on `metrics` and logs a warning.
-    /// Returns the audited aborts.
+    /// The guard reports an abort only after it cleared a pool itself. It
+    /// does not report when it lost the clear on the first pool that holds
+    /// the ramp, because another replica owns that report. A report writes
+    /// one audit row to `audit_pool`, counts the abort on `metrics` and logs a
+    /// warning. Returns the aborts that this pass reported.
     pub async fn pass(
         &mut self,
         pools: &[crate::worker::DbPool],
@@ -744,21 +815,20 @@ impl RampGuard {
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Vec<RampAbort> {
         let bound = self.bound();
-        self.retry_pending(pools, bound).await;
+        let mut aborts = self.retry_pending(pools, audit_pool, metrics, bound).await;
 
         let read = tokio::select! {
-            () = cancel.cancelled() => return Vec::new(),
+            () = cancel.cancelled() => return aborts,
             read = tokio::time::timeout(bound, read_ramps(pools, bound)) => read,
         };
         let Ok(read) = read else {
             tracing::warn!("ramp guard read timed out; no verdict this pass");
-            return Vec::new();
+            return aborts;
         };
         let Some(ramps) = read else {
-            return Vec::new();
+            return aborts;
         };
 
-        let mut aborts = Vec::new();
         for (key, ramp) in ramps {
             if self.pending.contains_key(&key) {
                 continue;
@@ -772,16 +842,22 @@ impl RampGuard {
             else {
                 continue;
             };
+            let (queue, base_build_id, target_build_id) = key.clone();
+            let abort = RampAbort {
+                queue,
+                base_build_id,
+                target_build_id,
+                ramp_percent: ramp.ramp_percent,
+                reason,
+                base_rate,
+                target_rate,
+                target_lower_bound,
+                base: ramp.base,
+                target: ramp.target,
+                incomplete: false,
+            };
             if let Some(abort) = self
-                .abort(
-                    pools,
-                    audit_pool,
-                    metrics,
-                    key,
-                    ramp,
-                    (reason, base_rate, target_rate, target_lower_bound),
-                    bound,
-                )
+                .abort(pools, audit_pool, metrics, key, &ramp.steps, abort, bound)
                 .await
             {
                 aborts.push(abort);
@@ -798,91 +874,95 @@ impl RampGuard {
         audit_pool: &crate::worker::DbPool,
         metrics: Option<&dyn crate::telemetry::MetricsRecorder>,
         key: RampKey,
-        ramp: ObservedRamp,
-        verdict: (RampAbortReason, f64, f64, f64),
+        steps: &[(usize, chrono::DateTime<chrono::Utc>)],
+        mut abort: RampAbort,
         bound: Duration,
     ) -> Option<RampAbort> {
-        let (reason, base_rate, target_rate, target_lower_bound) = verdict;
-        let mut outcomes = Vec::with_capacity(ramp.steps.len());
-        for &(index, step) in &ramp.steps {
+        let mut outcomes = Vec::with_capacity(steps.len());
+        let mut failed = Vec::new();
+        for &(index, step) in steps {
             let outcome = clear_on_pool(&pools[index], index, &key, step, bound).await;
-            outcomes.push((index, step, outcome));
+            if outcome == ClearOutcome::Failed {
+                failed.push((index, step));
+            }
+            outcomes.push(outcome);
         }
-        let failed: Vec<(usize, chrono::DateTime<chrono::Utc>)> = outcomes
-            .iter()
-            .filter(|(_, _, outcome)| *outcome == ClearOutcome::Failed)
-            .map(|&(index, step, _)| (index, step))
-            .collect();
+        abort.incomplete = !failed.is_empty();
+        let decision = disposition(&outcomes, true);
         if !failed.is_empty() {
-            self.pending.insert(key.clone(), failed.clone());
+            let unreported = (decision == Disposition::Defer).then(|| abort.clone());
+            self.pending.insert(
+                key,
+                PendingAbort {
+                    steps: failed.clone(),
+                    unreported,
+                },
+            );
         }
-        let cleared = outcomes
-            .iter()
-            .any(|(_, _, outcome)| *outcome == ClearOutcome::Cleared);
-        let lost_first = outcomes
-            .first()
-            .is_some_and(|(_, _, outcome)| *outcome == ClearOutcome::Lost);
-        if lost_first || (!cleared && failed.is_empty()) {
-            // Another replica or an operator changed the ramp first.
+        if decision != Disposition::Report {
             return None;
         }
-
-        let (queue, base_build_id, target_build_id) = key;
-        let abort = RampAbort {
-            queue,
-            base_build_id,
-            target_build_id,
-            ramp_percent: ramp.ramp_percent,
-            reason,
-            base_rate,
-            target_rate,
-            target_lower_bound,
-            base: ramp.base,
-            target: ramp.target,
-            incomplete: !failed.is_empty(),
-        };
-        tracing::warn!(
-            queue = %abort.queue,
-            base_build = %abort.base_build_id,
-            target_build = %abort.target_build_id,
-            reason = abort.reason.as_str(),
-            target_rate = abort.target_rate,
-            target_lower_bound = abort.target_lower_bound,
-            base_rate = abort.base_rate,
-            incomplete = abort.incomplete,
-            "ramp guard aborted a build ramp"
-        );
-        if let Some(m) = metrics {
-            m.record_build_ramp_aborted(&abort.queue, abort.reason.as_str());
-        }
         let failed_pools: Vec<usize> = failed.iter().map(|&(index, _)| index).collect();
-        record_abort(audit_pool, &abort, &failed_pools, bound).await;
+        report_abort(&abort, audit_pool, metrics, &failed_pools, bound).await;
         Some(abort)
     }
 
     /// Retry the clears that an earlier pass could not finish.
     ///
     /// A pool leaves the list when its clear succeeds or when its row changed.
-    async fn retry_pending(&mut self, pools: &[crate::worker::DbPool], bound: Duration) {
+    /// An abort that no clear of this guard had changed yet is reported once a
+    /// retry clears a pool. Returns those reports.
+    async fn retry_pending(
+        &mut self,
+        pools: &[crate::worker::DbPool],
+        audit_pool: &crate::worker::DbPool,
+        metrics: Option<&dyn crate::telemetry::MetricsRecorder>,
+        bound: Duration,
+    ) -> Vec<RampAbort> {
+        let mut reported = Vec::new();
         let pending = std::mem::take(&mut self.pending);
-        for (key, steps) in pending {
+        for (key, entry) in pending {
+            let mut outcomes = Vec::with_capacity(entry.steps.len());
             let mut still_failed = Vec::new();
-            for (index, step) in steps {
+            for (index, step) in entry.steps {
                 let Some(pool) = pools.get(index) else {
                     continue;
                 };
-                match clear_on_pool(pool, index, &key, step, bound).await {
+                let outcome = clear_on_pool(pool, index, &key, step, bound).await;
+                match outcome {
                     ClearOutcome::Cleared => {
                         tracing::info!(queue = %key.0, pool = index, "ramp guard finished a pending clear");
                     }
                     ClearOutcome::Lost => {}
                     ClearOutcome::Failed => still_failed.push((index, step)),
                 }
+                outcomes.push(outcome);
+            }
+            let mut unreported = entry.unreported;
+            if let Some(mut abort) = unreported.take() {
+                match disposition(&outcomes, false) {
+                    Disposition::Report => {
+                        abort.incomplete = !still_failed.is_empty();
+                        let failed_pools: Vec<usize> =
+                            still_failed.iter().map(|&(index, _)| index).collect();
+                        report_abort(&abort, audit_pool, metrics, &failed_pools, bound).await;
+                        reported.push(abort);
+                    }
+                    Disposition::Defer => unreported = Some(abort),
+                    Disposition::Drop => {}
+                }
             }
             if !still_failed.is_empty() {
-                self.pending.insert(key, still_failed);
+                self.pending.insert(
+                    key,
+                    PendingAbort {
+                        steps: still_failed,
+                        unreported,
+                    },
+                );
             }
         }
+        reported
     }
 }
 
@@ -1163,6 +1243,28 @@ mod tests {
             "the clear pins the step"
         );
         assert!(abort_sql.contains("target_build_id = $3"));
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn disposition_reports_only_after_this_guard_cleared_a_pool() {
+        use ClearOutcome::{Cleared, Failed, Lost};
+        // A clear on any pool, with the first pool not lost: report.
+        assert_eq!(disposition(&[Cleared, Failed], true), Disposition::Report);
+        assert_eq!(disposition(&[Failed, Cleared], true), Disposition::Report);
+        // The first pool was lost to another replica: it owns the report.
+        assert_eq!(disposition(&[Lost, Cleared], true), Disposition::Drop);
+        // Nothing cleared, but a clear failed: wait for a retry. This covers
+        // a failed first pool with a lost later pool.
+        assert_eq!(disposition(&[Failed, Lost], true), Disposition::Defer);
+        assert_eq!(disposition(&[Failed, Failed], true), Disposition::Defer);
+        // Every clear lost: report nothing.
+        assert_eq!(disposition(&[Lost, Lost], true), Disposition::Drop);
+        assert_eq!(disposition(&[], true), Disposition::Drop);
+        // A retry reports once it clears a pool, whatever pool comes first.
+        assert_eq!(disposition(&[Lost, Cleared], false), Disposition::Report);
+        assert_eq!(disposition(&[Lost], false), Disposition::Drop);
+        assert_eq!(disposition(&[Failed], false), Disposition::Defer);
     }
 
     #[test]

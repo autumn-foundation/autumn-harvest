@@ -27,7 +27,8 @@ Design decisions:
 - The abort is a compare-and-swap on the queue, both builds and the step, on
   every shard pool. It cannot clear a newer ramp or a newer step. A failed
   pool clear stays pending, and the next pass retries it with no new verdict.
-- Only the replica that did not lose the first pool's clear audits the abort.
+- A replica reports an abort only after it cleared a pool itself, and not
+  when it lost the first pool's clear to another replica.
 - The guard fails safe. A failed or slow read aborts nothing. Every read and
   write has a bound, and each read has a server-side `statement_timeout`.
 
