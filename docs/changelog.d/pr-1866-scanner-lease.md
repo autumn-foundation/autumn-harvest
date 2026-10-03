@@ -41,10 +41,11 @@ size, so adding workers to clear a backlog added database load in proportion.
   Each predicate reads the page, not the table, so no predicate index can
   scan past it.
   A row that matches two reasons gets the first one, as in the full scan,
-  if that reason's sweep can still claim it. Otherwise the later reason
-  takes it. A lane keeps its clock until its last queue drains. A queued
-  row keeps its reason when an earlier one starts to match. If its reason
-  stops matching, it goes to the first other reason that still matches. The
+  if that reason's sweep can still claim it: the row is ahead of its cursor
+  or in its queue. Otherwise the later reason takes it. A lane keeps its
+  clock until its last queue drains. A queued row keeps its reason when an
+  earlier one starts to match. If its reason stops matching, it moves to the
+  first other reason that still matches, within that reason's limit. The
   lanes give up their batch ids only after every load of the pass succeeds. The four
   predicate consts are unchanged, so the backup drill's `UNION` still works.
   The public `enforce_timeouts_once` keeps its full scan.
@@ -109,7 +110,11 @@ Tests run in `scanner_lease_tests` against Postgres 16:
   heartbeat sweep). The same holds while the heartbeat lane drains the
   queue of its last page (RED: it waited for the drain).
 - A row queued for its heartbeat that heartbeats again before its batch
-  loads goes to start-to-close (RED: it was dropped).
+  loads goes to start-to-close (RED: it was dropped). Moved rows count
+  against the limit of their new reason (RED: 4 start-to-close rows in one
+  pass at a limit of 2).
+- A row that gets a missed heartbeat timeout after the heartbeat lane read
+  it goes to start-to-close (RED: it waited for the next heartbeat sweep).
 
 Unit tests cover jitter bounds and clamping, the TTL floor and caps, the role
 table, the lease SQL shape, and the batched query shape.

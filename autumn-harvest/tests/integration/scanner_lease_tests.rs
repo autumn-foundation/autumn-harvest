@@ -1585,9 +1585,14 @@ async fn a_queued_row_whose_reason_lapses_moves_to_one_that_matches() {
         .await
         .expect("heartbeat");
 
-    let second = timeout::find_timed_out_tasks_batch(&mut conn, &mut cursor, 1)
-        .await
-        .expect("batch scan");
+    // The row moves on this pass and is handed out on the next one.
+    let mut moved = false;
+    for _ in 0..2 {
+        let page = timeout::find_timed_out_tasks_batch(&mut conn, &mut cursor, 1)
+            .await
+            .expect("batch scan");
+        moved |= start_to_close_ids(&page).contains(&target);
+    }
 
     diesel::sql_query("DELETE FROM harvest_task_queue WHERE queue_name = $1")
         .bind::<diesel::sql_types::Text, _>(queue)
@@ -1595,9 +1600,156 @@ async fn a_queued_row_whose_reason_lapses_moves_to_one_that_matches() {
         .await
         .expect("clear queue");
     assert!(
-        second
-            .iter()
-            .any(|(t, r)| t.id == target && *r == TimeoutReason::StartToClose),
+        moved,
         "the row must move to start-to-close when its heartbeat comes back"
     );
+}
+
+/// Inserts `n` live rows in `queue` that match no timeout reason.
+async fn insert_live_tasks(conn: &mut AsyncPgConnection, queue: &str, n: i32) {
+    diesel::sql_query(
+        "INSERT INTO harvest_task_queue \
+         (id, queue_name, task_type, input, state, attempt, max_attempts, \
+          started_at, start_to_close) \
+         SELECT gen_random_uuid(), $1, 'activity', '{}'::jsonb, 'RUNNING', \
+                1, 1, NOW(), INTERVAL '1 hour' \
+         FROM generate_series(1, $2)",
+    )
+    .bind::<diesel::sql_types::Text, _>(queue)
+    .bind::<diesel::sql_types::Integer, _>(n)
+    .execute(conn)
+    .await
+    .expect("insert live tasks");
+}
+
+/// A row behind an earlier lane's cursor is not left to that lane.
+///
+/// The heartbeat lane reads the target while it has no heartbeat timeout.
+/// The target then gets one that its old clock already counts as missed.
+/// The heartbeat lane cannot read it again in this sweep.
+#[tokio::test]
+async fn a_row_behind_an_earlier_cursor_is_not_left_to_it() {
+    let (url, _container) = setup_test_db_url().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.expect("connection");
+    let queue = "scanner-lease-cursor";
+    diesel::sql_query("DELETE FROM harvest_task_queue WHERE queue_name = $1")
+        .bind::<diesel::sql_types::Text, _>(queue)
+        .execute(&mut conn)
+        .await
+        .expect("clear queue");
+    // Page 1 at a batch of 1 holds 64 rows: 3 expired rows and live ones.
+    // The target is on page 2. 600 more live rows keep the heartbeat sweep
+    // open for about 10 passes.
+    for _ in 0..3 {
+        insert_running_task(&mut conn, queue, false, true).await;
+    }
+    insert_live_tasks(&mut conn, queue, 100).await;
+    let target = insert_running_task(&mut conn, queue, false, true).await;
+    diesel::sql_query("UPDATE harvest_task_queue SET heartbeat_timeout = NULL WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(target)
+        .execute(&mut conn)
+        .await
+        .expect("no heartbeat timeout");
+    insert_live_tasks(&mut conn, queue, 600).await;
+
+    // Pass 1: both lanes read page 1. Pass 2: the heartbeat lane reads page
+    // 2, while the start-to-close lane still drains page 1.
+    let mut cursor = TimeoutScanCursor::default();
+    for _ in 0..2 {
+        let page = timeout::find_timed_out_tasks_batch(&mut conn, &mut cursor, 1)
+            .await
+            .expect("batch scan");
+        assert!(!page.iter().any(|(t, _)| t.id == target));
+    }
+    diesel::sql_query(
+        "UPDATE harvest_task_queue \
+         SET heartbeat_timeout = INTERVAL '1 second', \
+             last_heartbeat_at = NOW() - INTERVAL '1 hour' \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(target)
+    .execute(&mut conn)
+    .await
+    .expect("add a missed heartbeat timeout");
+
+    // The start-to-close lane reads page 2 on pass 4.
+    let mut found = false;
+    for _ in 0..4 {
+        let page = timeout::find_timed_out_tasks_batch(&mut conn, &mut cursor, 1)
+            .await
+            .expect("batch scan");
+        found |= page.iter().any(|(t, _)| t.id == target);
+    }
+
+    diesel::sql_query("DELETE FROM harvest_task_queue WHERE queue_name = $1")
+        .bind::<diesel::sql_types::Text, _>(queue)
+        .execute(&mut conn)
+        .await
+        .expect("clear queue");
+    assert!(
+        found,
+        "the start-to-close lane must take the row the heartbeat lane passed"
+    );
+}
+
+/// Rows that move to another reason count against that reason's limit.
+#[tokio::test]
+async fn moved_rows_count_against_their_new_reasons_limit() {
+    let (url, _container) = setup_test_db_url().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.expect("connection");
+    let queue = "scanner-lease-moved";
+    diesel::sql_query("DELETE FROM harvest_task_queue WHERE queue_name = $1")
+        .bind::<diesel::sql_types::Text, _>(queue)
+        .execute(&mut conn)
+        .await
+        .expect("clear queue");
+    // The heartbeat lane queues 2 heartbeat-only rows, then 2 rows that
+    // also miss start-to-close. The start-to-close lane queues 5 rows.
+    for _ in 0..2 {
+        insert_running_task(&mut conn, queue, true, false).await;
+    }
+    let both = [
+        insert_running_task(&mut conn, queue, true, true).await,
+        insert_running_task(&mut conn, queue, true, true).await,
+    ];
+    for _ in 0..5 {
+        insert_running_task(&mut conn, queue, false, true).await;
+    }
+
+    let mut cursor = TimeoutScanCursor::default();
+    let _ = timeout::find_timed_out_tasks_batch(&mut conn, &mut cursor, 2)
+        .await
+        .expect("batch scan");
+    // Both rows heartbeat again before their batch loads.
+    diesel::sql_query("UPDATE harvest_task_queue SET last_heartbeat_at = NOW() WHERE id = ANY($1)")
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&both[..])
+        .execute(&mut conn)
+        .await
+        .expect("heartbeat");
+
+    let mut most = 0;
+    let mut moved = 0;
+    for _ in 0..3 {
+        let page = timeout::find_timed_out_tasks_batch(&mut conn, &mut cursor, 2)
+            .await
+            .expect("batch scan");
+        most = most.max(start_to_close_ids(&page).len());
+        moved += start_to_close_ids(&page)
+            .iter()
+            .filter(|id| both.contains(id))
+            .count();
+    }
+
+    diesel::sql_query("DELETE FROM harvest_task_queue WHERE queue_name = $1")
+        .bind::<diesel::sql_types::Text, _>(queue)
+        .execute(&mut conn)
+        .await
+        .expect("clear queue");
+    assert!(
+        most <= 2,
+        "a pass handed out {most} start-to-close rows at a limit of 2"
+    );
+    assert_eq!(moved, 2, "both moved rows must still be handed out");
 }
