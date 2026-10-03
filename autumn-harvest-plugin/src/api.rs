@@ -14130,7 +14130,7 @@ fn local_build_id_from_workers(workers: &[WorkerRow], local_worker_id: Option<&s
 ///
 /// Queue coverage alone is not the claim predicate. `queue::claim_task` also
 /// enforces three more rules. The first is the task's `required_build_id`: an
-/// exact or `harvest_build_compat` match, never an empty build_id. The second
+/// exact or `harvest_build_compat` match, never an empty `build_id`. The second
 /// is its `required_capabilities`, the same Exact/In label match. The third is
 /// its **session pin**.
 ///
