@@ -1151,3 +1151,195 @@ async fn a_standby_still_refreshes_its_codec_key() {
     .await;
     stop_all(checkers).await;
 }
+
+/// A renewal that waits for the row lock still returns a live lease. The
+/// expiry counts from the moment the lock is free, not from the start of the
+/// transaction.
+#[tokio::test]
+async fn a_renewal_after_a_lock_wait_returns_a_live_lease() {
+    use diesel_async::AsyncConnection;
+
+    let (url, _container) = setup_test_db_url().await;
+    let pool = build_pool(&url);
+    let shard = ShardId::new(17_960);
+    let ttl = Duration::from_millis(100);
+    let lease = autumn_harvest::scanner_lease::ScannerLease::new(shard, "timeout", "waiter", ttl);
+    let mut conn = pool.get().await.expect("connection");
+    assert!(
+        lease
+            .try_acquire(&mut conn)
+            .await
+            .expect("acquire")
+            .is_some(),
+        "the first acquire takes the lease"
+    );
+
+    // Another session holds the lease row lock for longer than the TTL.
+    let mut blocker = pool.get().await.expect("connection");
+    let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+    let hold = tokio::spawn(async move {
+        blocker
+            .transaction::<(), diesel::result::Error, _>(async |c| {
+                diesel::sql_query(
+                    "SELECT 1 FROM harvest_scanner_leases \
+                     WHERE shard_id = $1 AND scanner = 'timeout' FOR UPDATE",
+                )
+                .bind::<diesel::sql_types::Integer, _>(shard.as_i32())
+                .execute(c)
+                .await?;
+                let _ = locked_tx.send(());
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                Ok(())
+            })
+            .await
+            .expect("hold the row lock");
+    });
+    locked_rx.await.expect("lock taken");
+
+    let renewed = lease.try_acquire(&mut conn).await.expect("renew");
+    hold.await.expect("lock holder");
+    let row = lease_row(&pool, shard).await.expect("lease row");
+    assert!(renewed.is_some(), "the holder renews its own lease");
+    assert!(
+        row.live,
+        "a renewal after a {ttl:?} lease waited 400 ms for the lock must still be live"
+    );
+}
+
+/// A row queued for a later reason stays in its batch when an earlier reason
+/// starts to match it. The earlier lane may have passed the row already.
+#[tokio::test]
+async fn a_queued_row_keeps_its_reason_when_an_earlier_one_starts_to_match() {
+    let (url, _container) = setup_test_db_url().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.expect("connection");
+    let queue = "scanner-lease-reason";
+    // Three expired rows, then 200 live rows created after them. At a batch
+    // of 1, a page holds 64 rows, so every lane is still mid-sweep after the
+    // first pass.
+    let ours = insert_expired_running_tasks(&mut conn, queue, 3).await;
+    diesel::sql_query(
+        "INSERT INTO harvest_task_queue \
+         (id, queue_name, task_type, input, state, attempt, max_attempts, \
+          started_at, start_to_close) \
+         SELECT gen_random_uuid(), $1, 'activity', '{}'::jsonb, 'RUNNING', \
+                1, 1, NOW(), INTERVAL '1 hour' \
+         FROM generate_series(1, 200)",
+    )
+    .bind::<diesel::sql_types::Text, _>(queue)
+    .execute(&mut conn)
+    .await
+    .expect("insert live tasks");
+
+    let mut cursor = TimeoutScanCursor::default();
+    let first = timeout::find_timed_out_tasks_batch(&mut conn, &mut cursor, 1)
+        .await
+        .expect("batch scan");
+    assert_eq!(start_to_close_ids(&first), ours[..1]);
+
+    // The second row now also misses its heartbeat. The heartbeat lane has
+    // already passed it in this sweep.
+    diesel::sql_query(
+        "UPDATE harvest_task_queue \
+         SET heartbeat_timeout = INTERVAL '1 second', \
+             last_heartbeat_at = NOW() - INTERVAL '1 minute' \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(ours[1])
+    .execute(&mut conn)
+    .await
+    .expect("expire the heartbeat");
+
+    let mut found = false;
+    for _ in 0..2 {
+        let page = timeout::find_timed_out_tasks_batch(&mut conn, &mut cursor, 1)
+            .await
+            .expect("batch scan");
+        found |= page.iter().any(|(t, _)| t.id == ours[1]);
+    }
+
+    diesel::sql_query("DELETE FROM harvest_task_queue WHERE queue_name = $1")
+        .bind::<diesel::sql_types::Text, _>(queue)
+        .execute(&mut conn)
+        .await
+        .expect("clear queue");
+    assert!(
+        found,
+        "the queued row must be handed out in this sweep, not dropped"
+    );
+}
+
+/// A batch that fails to load keeps its ids. The next pass loads them again.
+#[tokio::test]
+async fn a_failed_batch_load_keeps_its_ids() {
+    #[derive(QueryableByName)]
+    struct Pid {
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        pid: i32,
+    }
+
+    let (url, _container) = setup_test_db_url().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.expect("connection");
+    let queue = "scanner-lease-reload";
+    let ours = insert_expired_running_tasks(&mut conn, queue, 3).await;
+    // Make them heartbeat rows, so the heartbeat lane, which runs first,
+    // holds them in its queue.
+    diesel::sql_query(
+        "UPDATE harvest_task_queue \
+         SET heartbeat_timeout = INTERVAL '1 second', \
+             last_heartbeat_at = NOW() - INTERVAL '1 minute' \
+         WHERE queue_name = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(queue)
+    .execute(&mut conn)
+    .await
+    .expect("expire the heartbeats");
+    let heartbeat = |page: &[(autumn_harvest::models::TaskQueueItem, TimeoutReason)]| {
+        page.iter()
+            .filter(|(t, r)| *r == TimeoutReason::Heartbeat && ours.contains(&t.id))
+            .map(|(t, _)| t.id)
+            .collect::<Vec<_>>()
+    };
+
+    let mut scan_conn = pool.get().await.expect("connection");
+    let mut cursor = TimeoutScanCursor::default();
+    let first = timeout::find_timed_out_tasks_batch(&mut scan_conn, &mut cursor, 1)
+        .await
+        .expect("batch scan");
+    assert_eq!(heartbeat(&first), ours[..1]);
+
+    // Kill the scan connection, so the next pass fails at its first query:
+    // the heartbeat lane's batch load.
+    let pid: Vec<Pid> = diesel::sql_query("SELECT pg_backend_pid() AS pid")
+        .load(&mut scan_conn)
+        .await
+        .expect("backend pid");
+    diesel::sql_query("SELECT pg_terminate_backend($1)")
+        .bind::<diesel::sql_types::Integer, _>(pid[0].pid)
+        .execute(&mut conn)
+        .await
+        .expect("terminate the scan backend");
+    assert!(
+        timeout::find_timed_out_tasks_batch(&mut scan_conn, &mut cursor, 1)
+            .await
+            .is_err(),
+        "a pass on a dead connection fails"
+    );
+
+    let mut fresh = pool.get().await.expect("connection");
+    let next = timeout::find_timed_out_tasks_batch(&mut fresh, &mut cursor, 1)
+        .await
+        .expect("batch scan");
+
+    diesel::sql_query("DELETE FROM harvest_task_queue WHERE queue_name = $1")
+        .bind::<diesel::sql_types::Text, _>(queue)
+        .execute(&mut conn)
+        .await
+        .expect("clear queue");
+    assert_eq!(
+        heartbeat(&next),
+        ours[1..2],
+        "the row of the failed load must come next, not be skipped"
+    );
+}

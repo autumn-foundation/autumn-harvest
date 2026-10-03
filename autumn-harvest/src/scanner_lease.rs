@@ -349,19 +349,24 @@ mod db {
     /// holder or an expired lease. Postgres serializes upserts on the row,
     /// so one holder wins. `RETURNING` gives a row only to the winner.
     ///
-    /// `NOW()` is the database clock, which every replica shares. Replica
-    /// clock skew cannot give two holders a live lease.
+    /// `clock_timestamp()` is the database clock, which every replica
+    /// shares. Replica clock skew cannot give two holders a live lease.
+    ///
+    /// The update reads the clock after it takes the row lock. `NOW()` and
+    /// `EXCLUDED` hold the time before the lock wait. A renewal that waited
+    /// longer than the TTL would then return an expired lease.
     const ACQUIRE_SQL: &str = "INSERT INTO harvest_scanner_leases AS l \
              (shard_id, scanner, holder, epoch, lease_until, acquired_at) \
-         VALUES ($1, $2, $3, 1, NOW() + make_interval(secs => $4), NOW()) \
+         VALUES ($1, $2, $3, 1, clock_timestamp() + make_interval(secs => $4), \
+                 clock_timestamp()) \
          ON CONFLICT (shard_id, scanner) DO UPDATE SET \
              holder = EXCLUDED.holder, \
              epoch = CASE WHEN l.holder = EXCLUDED.holder \
                           THEN l.epoch ELSE l.epoch + 1 END, \
-             lease_until = EXCLUDED.lease_until, \
+             lease_until = clock_timestamp() + make_interval(secs => $4), \
              acquired_at = CASE WHEN l.holder = EXCLUDED.holder \
-                                THEN l.acquired_at ELSE NOW() END \
-         WHERE l.holder = EXCLUDED.holder OR l.lease_until <= NOW() \
+                                THEN l.acquired_at ELSE clock_timestamp() END \
+         WHERE l.holder = EXCLUDED.holder OR l.lease_until <= clock_timestamp() \
          RETURNING l.epoch";
 
     /// Bound on the wait for the lease row lock.
@@ -483,10 +488,19 @@ mod db {
         #[test]
         fn acquire_admits_only_the_same_holder_or_an_expired_lease() {
             assert!(ACQUIRE_SQL.contains("ON CONFLICT (shard_id, scanner) DO UPDATE"));
-            assert!(
-                ACQUIRE_SQL.contains("WHERE l.holder = EXCLUDED.holder OR l.lease_until <= NOW()")
-            );
+            assert!(ACQUIRE_SQL.contains(
+                "WHERE l.holder = EXCLUDED.holder OR l.lease_until <= clock_timestamp()"
+            ));
             assert!(ACQUIRE_SQL.contains("RETURNING l.epoch"));
+        }
+
+        #[test]
+        fn acquire_reads_the_clock_after_the_lock_wait() {
+            assert!(!ACQUIRE_SQL.contains("NOW()"));
+            assert!(!ACQUIRE_SQL.contains("EXCLUDED.lease_until"));
+            assert!(
+                ACQUIRE_SQL.contains("lease_until = clock_timestamp() + make_interval(secs => $4)")
+            );
         }
 
         #[test]

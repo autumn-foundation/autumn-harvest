@@ -512,25 +512,6 @@ const fn task_timeout_scans() -> [(TimeoutReason, &'static str); 4] {
     ]
 }
 
-/// The ` AND NOT EXISTS` clauses that leave a row to an earlier reason.
-///
-/// `higher` holds the predicates of the reasons that come first. A row that
-/// also matches one of them is left to that reason. So a row always gets the
-/// first reason it matches, as in [`find_timed_out_tasks`]. `bound` narrows
-/// each one the same way as the main predicate.
-fn higher_reason_exclusions(higher: &[&str], bound: &str) -> String {
-    use std::fmt::Write as _;
-
-    let mut sql = String::new();
-    for earlier in higher {
-        let _ = write!(
-            sql,
-            " AND NOT EXISTS (SELECT 1 FROM ({earlier}{bound}) h WHERE h.id = q.id)"
-        );
-    }
-    sql
-}
-
 /// The sort key of a live row in a timeout sweep (issue #1795).
 ///
 /// It is the row's creation time. Rows enqueued before migration
@@ -610,12 +591,14 @@ const TIMEOUT_SWEEP_START_SQL: &str = "SELECT NOW() AS as_of";
 /// The rows of one batch of queued ids (issue #1795).
 ///
 /// `$1` is the batch of ids. A primary-key lookup finds them, so the work is
-/// bounded by the batch. The predicate and the earlier-reason exclusions are
-/// checked again, because a queued row can stop matching before its turn.
-fn timeout_batch_query(predicate: &str, higher: &[&str]) -> String {
-    let bound = " AND id = ANY($1)";
-    let exclusions = higher_reason_exclusions(higher, bound);
-    format!("SELECT q.* FROM ({predicate}{bound} OFFSET 0) q WHERE TRUE{exclusions} ORDER BY q.id")
+/// bounded by the batch. The predicate is checked again, because a queued
+/// row can stop matching before its turn.
+///
+/// The batch keeps the reason that the refill gave each row. An earlier
+/// reason that starts to match later does not drop the row. That reason's
+/// sweep has already passed it, so the row would wait for the next sweep.
+fn timeout_batch_query(predicate: &str) -> String {
+    format!("SELECT q.* FROM ({predicate} AND id = ANY($1) OFFSET 0) q ORDER BY q.id")
 }
 
 /// Batches of live rows that one refill reads, per timeout reason.
@@ -643,6 +626,31 @@ struct TimeoutScanLane {
     /// Ids that failed to enforce on the last pass. The next pass loads them
     /// next to its batch, outside the batch limit.
     retry: Vec<uuid::Uuid>,
+}
+
+impl TimeoutScanLane {
+    /// The ids of the next batch, without taking them.
+    ///
+    /// It holds at most `limit` retried ids and `limit` queued ids. So the
+    /// load of a pass stays bounded, also when no leader gives up on failures.
+    fn next_batch(&self, limit: usize) -> Vec<uuid::Uuid> {
+        self.retry
+            .iter()
+            .take(limit)
+            .chain(self.queued.iter().take(limit))
+            .copied()
+            .collect()
+    }
+
+    /// Takes the ids of [`Self::next_batch`] after the batch loads.
+    ///
+    /// Retried ids past the limit are dropped. A row that stays expired
+    /// comes back in the next sweep.
+    fn commit_batch(&mut self, limit: usize) {
+        self.retry.clear();
+        let take = limit.min(self.queued.len());
+        self.queued.drain(..take);
+    }
 }
 
 /// Where the next batched task-timeout scan starts (issue #1795).
@@ -787,21 +795,20 @@ pub async fn find_timed_out_tasks_batch(
                 .extend(refill.into_iter().flat_map(|r| r.expired));
         }
 
-        let take = usize::try_from(limit)
-            .unwrap_or(usize::MAX)
-            .min(lane.queued.len());
         // Retried ids ride along outside the limit, so a row that keeps
-        // failing cannot stall the rows behind it.
-        let mut batch = std::mem::take(&mut lane.retry);
-        batch.extend(lane.queued.drain(..take));
+        // failing cannot stall the rows behind it. The lane gives up the ids
+        // only after the load, so a failed load loses none.
+        let take = usize::try_from(limit).unwrap_or(usize::MAX);
+        let batch = lane.next_batch(take);
         if batch.is_empty() {
             continue;
         }
-        let page: Vec<TaskQueueItem> = diesel::sql_query(timeout_batch_query(predicate, higher))
+        let page: Vec<TaskQueueItem> = diesel::sql_query(timeout_batch_query(predicate))
             .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&batch)
             .load(conn)
             .await
             .map_err(crate::error::database_error)?;
+        lane.commit_batch(take);
         for task in page {
             if seen.insert(task.id) {
                 results.push((task, reason.clone()));
@@ -6481,15 +6488,45 @@ mod tests {
     #[test]
     fn batch_query_loads_by_id_and_checks_the_predicate_again() {
         let predicate = start_to_close_timeout_query();
-        let higher = heartbeat_timeout_query();
-        let sql = timeout_batch_query(predicate, &[higher]);
+        let sql = timeout_batch_query(predicate);
         assert!(sql.starts_with(&format!(
             "SELECT q.* FROM ({predicate} AND id = ANY($1) OFFSET 0) q"
         )));
-        assert!(sql.contains(&format!(
-            "AND NOT EXISTS (SELECT 1 FROM ({higher} AND id = ANY($1)) h WHERE h.id = q.id)"
-        )));
+        // The batch keeps the reason of the refill. See the integration test
+        // `a_queued_row_keeps_its_reason_when_an_earlier_one_starts_to_match`.
+        assert!(!sql.contains("NOT EXISTS"));
         assert!(!sql.contains("LIMIT"));
+    }
+
+    #[test]
+    fn a_batch_holds_at_most_one_limit_of_retries() {
+        let ids = |n| (0..n).map(|_| uuid::Uuid::new_v4()).collect::<Vec<_>>();
+        let mut lane = TimeoutScanLane {
+            queued: ids(5).into(),
+            retry: ids(7),
+            ..TimeoutScanLane::default()
+        };
+        let batch = lane.next_batch(3);
+        assert_eq!(batch[..3], lane.retry[..3]);
+        assert_eq!(
+            batch[3..],
+            lane.queued.iter().take(3).copied().collect::<Vec<_>>()[..]
+        );
+        lane.commit_batch(3);
+        assert_eq!(lane.retry, Vec::<uuid::Uuid>::new());
+        assert_eq!(lane.queued.len(), 2);
+    }
+
+    #[test]
+    fn a_batch_stays_queued_until_it_loads() {
+        let lane = TimeoutScanLane {
+            queued: std::collections::VecDeque::from([uuid::Uuid::new_v4()]),
+            retry: vec![uuid::Uuid::new_v4()],
+            ..TimeoutScanLane::default()
+        };
+        let before = lane.clone();
+        let _ = lane.next_batch(1);
+        assert_eq!(lane, before);
     }
 
     #[test]

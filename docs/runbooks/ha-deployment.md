@@ -185,8 +185,9 @@ Then:
   because codec key retirement counts on every live process to do that once
   per tick.
 
-The lease uses the database clock (`NOW()`). Clock skew between replicas
-cannot give two replicas a live lease.
+The lease uses the database clock (`clock_timestamp()`). Clock skew between
+replicas cannot give two replicas a live lease. The upsert reads the clock
+after its row-lock wait, so a renewal never returns an expired lease.
 
 The lease is a load control, not a safety fence. Two replicas can both run a
 pass for a short time, for example when a slow pass outlives its lease. That
@@ -229,12 +230,15 @@ If the index is missing, the scan still works, but each page can read many
 terminal rows.
 
 A row that matches two reasons gets the first one, in the order above. So
-the recorded timeout type does not depend on where each cursor is.
+the recorded timeout type does not depend on where each cursor is. A queued
+row keeps its reason, also when an earlier reason starts to match later.
 
 A row that fails to enforce is tried again on the next pass, next to the
-next batch. So one bad row does not block the rows behind it. A leader that
-fails three passes in a row gives up its lease, and another replica tries.
-A replica that comes back from standby starts a new sweep.
+next batch. So one bad row does not block the rows behind it. A pass tries
+at most one batch of such rows per reason. The others wait for the next
+sweep. A leader that fails three passes in a row gives up its lease, and
+another replica tries. A replica that comes back from standby starts a new
+sweep. A batch that fails to load stays queued.
 
 ### Jitter
 

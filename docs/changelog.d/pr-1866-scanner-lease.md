@@ -7,7 +7,8 @@ size, so adding workers to clear a backlog added database load in proportion.
 - **Lease.** New table `harvest_scanner_leases`, one row per
   `(shard_id, scanner)` (migration `20261001191830_harvest_scanner_leases`).
   Each tick takes or renews the `timeout` lease with one atomic upsert on the
-  database clock, under a 1 s `lock_timeout`. Only the holder runs the pass.
+  database clock, under a 1 s `lock_timeout`. The upsert reads the clock
+  after its row-lock wait. Only the holder runs the pass.
   A standby still refreshes its active codec key, because codec key
   retirement counts on every process to do that once per tick. A graceful
   stop expires the lease at once. After a crash, a standby takes over within
@@ -18,8 +19,10 @@ size, so adding workers to clear a backlog added database load in proportion.
   lease and stands by for one TTL. A pass can fail on one replica alone, for
   example on a codec only that replica lacks. A row that fails to enforce is
   tried again on the next pass, next to the next batch, so its failures run
-  in a row while the other rows still drain. A tick in any other role ends
-  the run, and a replica back from standby starts a new sweep.
+  in a row while the other rows still drain. A pass tries at most one batch
+  of such rows per reason. A batch that fails to load stays queued. A tick in
+  any other role ends the run, and a replica back from standby starts a new
+  sweep.
 - **Not a fence.** Two holders for a short time are safe, because every
   sub-pass is already safe with concurrent runners.
 - **Bounded scans.** The checker enforces at most one batch per timeout
@@ -36,7 +39,8 @@ size, so adding workers to clear a backlog added database load in proportion.
   reads newer rows, and they cannot stretch a sweep or displace older rows.
   Each predicate reads the page, not the table, so no predicate index can
   scan past it.
-  A row that matches two reasons gets the first one, as in the full scan. The four
+  A row that matches two reasons gets the first one, as in the full scan. A
+  queued row keeps that reason when an earlier one starts to match. The four
   predicate consts are unchanged, so the backup drill's `UNION` still works.
   The public `enforce_timeouts_once` keeps its full scan.
 - **Jitter.** By default, each sleep is the interval times a factor in
@@ -88,6 +92,12 @@ Tests run in `scanner_lease_tests` against Postgres 16:
   lease, and a standby leads on its next tick (RED: no lease taken).
 - A failed lease query fails open, and a standby picks up a new active codec
   key.
+- A renewal that waits 400 ms for the row lock on a 100 ms lease returns a
+  live lease (RED: the lease had expired).
+- A queued row that an earlier reason starts to match is still handed out
+  (RED: the batch load dropped it).
+- A batch whose load fails stays queued, and the next pass hands it out
+  (RED: the pass skipped it).
 
 Unit tests cover jitter bounds and clamping, the TTL floor and caps, the role
 table, the lease SQL shape, and the batched query shape.
