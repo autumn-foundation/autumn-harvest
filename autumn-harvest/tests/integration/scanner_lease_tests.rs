@@ -81,6 +81,21 @@ async fn setup_test_db_url() -> (String, Option<ContainerAsync<Postgres>>) {
     )
 }
 
+/// Opens connections in `pool` and returns them idle.
+///
+/// The checker bounds its checkout by its tick. Opening a connection can
+/// take longer than a 50 ms tick on a slow runner, and then every tick
+/// skips its pass. Each spawned checker, and the test itself, then finds
+/// an open connection.
+async fn warm_pool(pool: &DbPool) {
+    let mut held = Vec::new();
+    for _ in 0..5 {
+        held.push(pool.get().await.expect("connection"));
+    }
+    // All five are open at once, so the pool keeps five idle on drop.
+    assert_eq!(held.len(), 5);
+}
+
 fn build_pool(url: &str) -> DbPool {
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
     DbPool::builder(manager)
@@ -320,6 +335,7 @@ async fn insert_poisoned_task(conn: &mut AsyncPgConnection, queue: &str) -> uuid
 async fn a_failed_row_is_retried_until_the_leader_gives_up() {
     let (url, _container) = setup_test_db_url().await;
     let pool = build_pool(&url);
+    warm_pool(&pool).await;
     let mut conn = pool.get().await.expect("connection");
     let queue = "scanner-lease-poison";
     let good = insert_expired_running_tasks(&mut conn, queue, 20).await;
@@ -427,6 +443,7 @@ async fn wait_for<F: Fn() -> bool>(what: &str, limit: Duration, done: F) {
 async fn three_checkers_on_one_shard_run_about_one_pass_per_tick() {
     let (url, _container) = setup_test_db_url().await;
     let pool = build_pool(&url);
+    warm_pool(&pool).await;
     let shard = ShardId::new(17_951);
     let interval = Duration::from_millis(100);
 
@@ -881,6 +898,7 @@ async fn a_refill_reads_one_bounded_page_of_live_rows() {
 async fn spawned_checker_enforces_one_batch_per_pass() {
     let (url, _container) = setup_test_db_url().await;
     let pool = build_pool(&url);
+    warm_pool(&pool).await;
     let queue = "scanner-lease-spawned";
     let ours = {
         let mut conn = pool.get().await.expect("connection");
@@ -925,6 +943,7 @@ async fn spawned_checker_enforces_one_batch_per_pass() {
 async fn standby_takes_over_within_lease_ttl() {
     let (url, _container) = setup_test_db_url().await;
     let pool = build_pool(&url);
+    warm_pool(&pool).await;
     let shard = ShardId::new(17_953);
     let interval = Duration::from_millis(100);
     let ttl = Duration::from_secs(2);
@@ -1024,6 +1043,7 @@ async fn standby_takes_over_within_lease_ttl() {
 async fn checkers_with_different_scopes_each_lead() {
     let (url, _container) = setup_test_db_url().await;
     let pool = build_pool(&url);
+    warm_pool(&pool).await;
     let shard = ShardId::new(17_956);
     let interval = Duration::from_millis(100);
 
@@ -1119,6 +1139,7 @@ fn two_key_registry() -> PayloadCodecs {
 async fn a_standby_still_refreshes_its_codec_key() {
     let (url, _container) = setup_test_db_url().await;
     let pool = build_pool(&url);
+    warm_pool(&pool).await;
     let shard = ShardId::new(17_955);
     let interval = Duration::from_millis(100);
 
