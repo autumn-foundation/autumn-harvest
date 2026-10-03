@@ -1226,9 +1226,12 @@ fn timeout_change(s: &Stmts, k: usize) -> Option<Timeout> {
             // A bound counts only from a bare `SELECT` or `PERFORM` of the
             // call. A clear counts anywhere.
             let bounds = bounds_wait(s, k + 4);
-            let local = s.is(k + 6, "true")
-                || s.string(k + 6)
-                    .is_some_and(|v| ["true", "t", "on", "yes", "1"].contains(&v.trim()));
+            // Only a literal false is session-level. Any other third argument
+            // may be true, and a local value ends with the transaction.
+            let is_false = |v: &str| ["false", "f", "off", "no", "0"].contains(&v.trim());
+            let session = s.word(k + 6).is_some_and(is_false) && s.is_punct(k + 7, ')')
+                || s.string(k + 6).is_some_and(is_false) && s.is_punct(k + 7, ')');
+            let local = !session;
             (!bounds || s.is_bare_call(k)).then_some(Timeout::Set { bounds, local })
         }
         _ => None,
@@ -1496,7 +1499,14 @@ fn reindex(s: &Stmts, k: usize) -> Option<Raw> {
     let mut concurrent = false;
     if s.is_punct(j, '(') {
         while j < s.toks.len() && !s.is_punct(j, ')') {
-            concurrent |= s.is(j, "concurrently");
+            // `CONCURRENTLY` alone, or with a true value, turns it on. Any
+            // other value turns it off or is unknown, which fails closed.
+            if s.is(j, "concurrently") {
+                let on = s.is_punct(j + 1, ',')
+                    || s.is_punct(j + 1, ')')
+                    || ["true", "on", "1"].iter().any(|v| s.is(j + 1, v));
+                concurrent = on;
+            }
             j += 1;
         }
         j += 1;
@@ -2607,6 +2617,34 @@ fn code_after_an_exit_does_not_surely_run() {
             "{exit}: {findings:?}"
         );
     }
+}
+
+#[test]
+fn a_set_config_with_an_unknown_scope_counts_as_local() {
+    let sql = "BEGIN;\nSELECT set_config('lock_timeout', '5s', NOT false);\nCOMMIT;\n\
+               ALTER TABLE harvest_events ADD COLUMN x INT;";
+    let findings = lint_with_history(&[], sql, false);
+    assert_eq!(rules(&findings), [Rule::LockTimeout], "{findings:?}");
+    // A literal false is a session-level setting, which outlives the commit.
+    let session = "BEGIN;\nSELECT set_config('lock_timeout', '5s', false);\nCOMMIT;\n\
+                   ALTER TABLE harvest_events ADD COLUMN x INT;";
+    assert_eq!(lint_with_history(&[], session, false), []);
+}
+
+#[test]
+fn reindex_concurrently_false_is_a_plain_reindex() {
+    for option in ["CONCURRENTLY false", "CONCURRENTLY off", "CONCURRENTLY 0"] {
+        let sql =
+            format!("SET LOCAL lock_timeout = '5s';\nREINDEX ({option}) TABLE harvest_events;");
+        let findings = lint_with_history(&[], &sql, true);
+        assert_eq!(
+            rules(&findings),
+            [Rule::BlockingIndex],
+            "{option}: {findings:?}"
+        );
+    }
+    let on = "REINDEX (CONCURRENTLY true) TABLE harvest_events;";
+    assert_eq!(lint_with_history(&[], on, false), []);
 }
 
 // ── The real trees ───────────────────────────────────────────────────────────
