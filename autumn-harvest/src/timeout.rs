@@ -736,6 +736,17 @@ impl TimeoutScanLane {
         (retries, (limit - retries).min(self.queued.len()))
     }
 
+    /// Queues the expired ids of a refill.
+    ///
+    /// An id that waits for a retry is left out. A second, queued copy would
+    /// count as a first try, so the row could hold the batch past
+    /// [`MAX_ROW_TRIES`].
+    fn queue_refill(&mut self, expired: impl IntoIterator<Item = uuid::Uuid>) {
+        let retried: HashSet<uuid::Uuid> = self.retry.iter().map(|(id, _)| *id).collect();
+        self.queued
+            .extend(expired.into_iter().filter(|id| !retried.contains(id)));
+    }
+
     /// Tries `id` again on the next pass, unless it has had its tries.
     fn retry(&mut self, id: uuid::Uuid) {
         let tries = self
@@ -886,8 +897,7 @@ async fn refill_lane(
         .as_ref()
         .filter(|r| r.rows_read >= page_rows)
         .and_then(|r| r.last_key.zip(r.last_id));
-    lane.queued
-        .extend(refill.into_iter().flat_map(|r| r.expired));
+    lane.queue_refill(refill.into_iter().flat_map(|r| r.expired));
     Ok(())
 }
 
@@ -995,9 +1005,9 @@ pub async fn find_timed_out_tasks_batch(
     }
     // A moved row goes first in its new lane's next batch.
     for (other, id) in moves.into_iter().rev() {
-        let queued = &mut cursor.lanes[other].queued;
-        if !queued.contains(&id) {
-            queued.push_front(id);
+        let lane = &mut cursor.lanes[other];
+        if !lane.queued.contains(&id) && !lane.retry.iter().any(|(r, _)| *r == id) {
+            lane.queued.push_front(id);
         }
     }
     Ok(results)
@@ -6792,6 +6802,19 @@ mod tests {
         assert_eq!(timeout_scan_bounds(500), (500, 500 * REFILL_BATCHES));
         let (limit, page_rows) = timeout_scan_bounds(i64::from(u32::MAX));
         assert_eq!((limit, page_rows), (MAX_PAGE_ROWS, MAX_PAGE_ROWS));
+    }
+
+    #[test]
+    fn a_refill_skips_rows_that_wait_for_a_retry() {
+        let (failing, other) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let mut lane = TimeoutScanLane {
+            retry: vec![(failing, 1)],
+            ..TimeoutScanLane::default()
+        };
+        // A new sweep reads the failing row again. A second, queued copy
+        // would count as a first try and reset the cap on tries in a row.
+        lane.queue_refill([failing, other]);
+        assert_eq!(lane.queued, [other]);
     }
 
     #[test]

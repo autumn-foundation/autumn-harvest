@@ -242,7 +242,8 @@ within that reason's limit. No other reason hands it out in the meantime.
 A row that fails to enforce is tried again first in the next batch, for at
 most three passes in a row. Retried and queued rows share the batch limit.
 After its third try, the row waits for the next sweep, so bad rows cannot
-block the rows behind them. A leader that fails three passes in a row gives
+block the rows behind them. A refill does not queue a row that waits for a
+retry, so a new sweep cannot reset its tries. A leader that fails three passes in a row gives
 up its lease, and another replica tries. A replica that comes back from
 standby starts a new sweep. So does a replica after a tick without a
 database connection, and that tick also ends its run of failed passes. A

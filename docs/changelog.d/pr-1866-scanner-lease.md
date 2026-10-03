@@ -19,8 +19,9 @@ size, so adding workers to clear a backlog added database load in proportion.
   lease and stands by for one TTL. A pass can fail on one replica alone, for
   example on a codec only that replica lacks. A row that fails to enforce is
   tried again first in the next batch, so its failures run in a row. It
-  shares the batch limit, and it gets at most three passes in a row. Then it
-  waits for the next sweep, and the other rows drain. A batch that fails to
+  shares the batch limit, and it gets at most three passes in a row. A
+  refill does not queue it again meanwhile. Then it waits for the next
+  sweep, and the other rows drain. A batch that fails to
   load stays queued. A tick in any other role, or without a connection,
   ends the run. A replica back from standby, or back from a tick without a
   connection, starts a new sweep.
